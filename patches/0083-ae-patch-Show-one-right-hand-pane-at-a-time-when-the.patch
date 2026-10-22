@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 17:16:49 -0700
+Subject: [PATCH 083/148] [ae-patch] Show one right-hand pane at a time when
+ the session rail and a panel do not both fit
+
+With the session rail and the workspace panel both open in a window too
+narrow for both, the rail floated over the workspace panel and hid its
+right half.
+
+When the open rail would float over an open workspace, files or logs
+panel, the pane opened last now stays and the other closes. Opening the
+rail closes the push panels and, through the shell's own toggle, the
+workspace panel. Opening a panel, narrowing the window, widening the
+sidebar or switching to a session whose workspace panel is open closes
+the rail instead and marks it closedForPanel, saved with the rail's
+layout; the rail reopens as it was once no panel needs the room, and a
+rail the user opens or closes clears the mark. The check runs in a
+layout effect, so the overlap never paints.
+---
+ web/src/lib/aeSessionRail.test.ts    |  43 ++++++++-
+ web/src/lib/aeSessionRail.ts         |  29 +++++--
+ web/src/shell/AeSessionRail.test.tsx | 125 ++++++++++++++++++++-------
+ web/src/shell/AeSessionRail.tsx      |  50 ++++++++++-
+ web/src/shell/AppShell.tsx           |   4 +
+ 5 files changed, 213 insertions(+), 38 deletions(-)
+
+diff --git a/web/src/lib/aeSessionRail.test.ts b/web/src/lib/aeSessionRail.test.ts
+index ef31f512c9a1502a73d9ad979004a8471413c288..e62416d77f0efb9aa6ab9e3ca8a5315541983461 100644
+--- a/web/src/lib/aeSessionRail.test.ts
++++ b/web/src/lib/aeSessionRail.test.ts
+@@ -16,6 +16,7 @@ beforeEach(() => {
+   window.localStorage.clear();
+   useAeSessionRailStore.setState({
+     open: false,
++    closedForPanel: false,
+     sheetOpen: false,
+     order: [...AE_RAIL_SECTIONS],
+     folded: { connectors: true },
+@@ -94,6 +95,26 @@ describe("focusSection", () => {
+   });
+ });
+ 
++describe("closing for a panel", () => {
++  it("reopens on its own call, and the user opening or closing the rail forgets it", () => {
++    const store = useAeSessionRailStore.getState();
++    store.setOpen(true);
++    store.setClosedForPanel(true);
++    expect(useAeSessionRailStore.getState()).toMatchObject({ open: false, closedForPanel: true });
++    store.setClosedForPanel(false);
++    expect(useAeSessionRailStore.getState()).toMatchObject({ open: true, closedForPanel: false });
++    store.setClosedForPanel(true);
++    store.toggle();
++    expect(useAeSessionRailStore.getState()).toMatchObject({ open: true, closedForPanel: false });
++    store.setClosedForPanel(true);
++    store.setOpen(false);
++    expect(useAeSessionRailStore.getState().closedForPanel).toBe(false);
++    store.setClosedForPanel(true);
++    store.focusSection("usage");
++    expect(useAeSessionRailStore.getState()).toMatchObject({ open: true, closedForPanel: false });
++  });
++});
++
+ describe("persistence", () => {
+   it("saves open state, order and folds, but not the phone sheet", () => {
+     const store = useAeSessionRailStore.getState();
+@@ -101,11 +122,14 @@ describe("persistence", () => {
+     store.moveToTop("usage");
+     store.setFolded("agents", true);
+     store.setSheetOpen(true);
+-    const saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "{}");
++    let saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "{}");
+     expect(saved.open).toBe(true);
+     expect(saved.order[0]).toBe("usage");
+     expect(saved.folded.agents).toBe(true);
+     expect(saved).not.toHaveProperty("sheetOpen");
++    store.setClosedForPanel(true);
++    saved = JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? "{}");
++    expect(saved).toMatchObject({ open: false, closedForPanel: true });
+   });
+ 
+   it("reads a saved layout back, ignoring unknown ids", async () => {
+@@ -126,6 +150,23 @@ describe("persistence", () => {
+     expect(state.folded).toEqual({ connectors: true, triage: true });
+   });
+ 
++  it("reads a rail waiting for room back, but drops the mark on an open rail", async () => {
++    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ open: false, closedForPanel: true }));
++    vi.resetModules();
++    let fresh = await import("./aeSessionRail");
++    expect(fresh.useAeSessionRailStore.getState()).toMatchObject({
++      open: false,
++      closedForPanel: true,
++    });
++    window.localStorage.setItem(STORAGE_KEY, JSON.stringify({ open: true, closedForPanel: true }));
++    vi.resetModules();
++    fresh = await import("./aeSessionRail");
++    expect(fresh.useAeSessionRailStore.getState()).toMatchObject({
++      open: true,
++      closedForPanel: false,
++    });
++  });
++
+   it("works with defaults when storage is blocked", async () => {
+     vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+       throw new Error("blocked");
+diff --git a/web/src/lib/aeSessionRail.ts b/web/src/lib/aeSessionRail.ts
+index 9c396e75d59d05f31fd9689d2b6a9bf056cc37c0..5cb6d3d7bb6c092ea294307c45903a6f2a89f0b3 100644
+--- a/web/src/lib/aeSessionRail.ts
++++ b/web/src/lib/aeSessionRail.ts
+@@ -47,6 +47,8 @@ const STORAGE_KEY = "ae.sessionRail.v1";
+ 
+ interface Persisted {
+   open: boolean;
++  /** The rail closed to make room for a panel, not by the user; it reopens once the room is back. */
++  closedForPanel: boolean;
+   order: AeRailSectionId[];
+   folded: Partial<Record<AeRailSectionId, boolean>>;
+ }
+@@ -69,6 +71,7 @@ function defaultFolded(): Partial<Record<AeRailSectionId, boolean>> {
+ function readPersisted(): Persisted {
+   const fallback: Persisted = {
+     open: false,
++    closedForPanel: false,
+     order: [...AE_RAIL_SECTIONS],
+     folded: defaultFolded(),
+   };
+@@ -82,7 +85,13 @@ function readPersisted(): Persisted {
+         if (isSectionId(id) && typeof value === "boolean") folded[id] = value;
+       }
+     }
+-    return { open: parsed.open === true, order: normalizeOrder(parsed.order), folded };
++    return {
++      open: parsed.open === true,
++      // Only a closed rail can be waiting for room.
++      closedForPanel: parsed.closedForPanel === true && parsed.open !== true,
++      order: normalizeOrder(parsed.order),
++      folded,
++    };
+   } catch {
+     return fallback;
+   }
+@@ -108,6 +117,8 @@ interface AeSessionRailState extends Persisted {
+   focus: AeRailFocus | null;
+   setOpen: (open: boolean) => void;
+   toggle: () => void;
++  /** Close the rail for a panel that needs the room (true), or reopen it once the room is back (false). */
++  setClosedForPanel: (closed: boolean) => void;
+   setSheetOpen: (open: boolean) => void;
+   setFolded: (id: AeRailSectionId, folded: boolean) => void;
+   /** Move a section to an index in the current order (drag and drop). */
+@@ -124,8 +135,10 @@ export const useAeSessionRailStore = create<AeSessionRailState>((set, get) => ({
+   ...readPersisted(),
+   sheetOpen: false,
+   focus: null,
+-  setOpen: (open) => set({ open }),
+-  toggle: () => set({ open: !get().open }),
++  // The user opening or closing the rail ends any wait for room.
++  setOpen: (open) => set({ open, closedForPanel: false }),
++  toggle: () => set({ open: !get().open, closedForPanel: false }),
++  setClosedForPanel: (closed) => set({ open: !closed, closedForPanel: closed }),
+   setSheetOpen: (sheetOpen) => set({ sheetOpen }),
+   setFolded: (id, folded) => set({ folded: { ...get().folded, [id]: folded } }),
+   moveTo: (id, index) => {
+@@ -143,7 +156,7 @@ export const useAeSessionRailStore = create<AeSessionRailState>((set, get) => ({
+   resetOrder: () => set({ order: [...AE_RAIL_SECTIONS] }),
+   focusSection: (id, opts) =>
+     set((state) => ({
+-      ...(opts?.sheet ? { sheetOpen: true } : { open: true }),
++      ...(opts?.sheet ? { sheetOpen: true } : { open: true, closedForPanel: false }),
+       folded: { ...state.folded, [id]: false },
+       focus: { id, seq: (state.focus?.seq ?? 0) + 1 },
+     })),
+@@ -152,10 +165,16 @@ export const useAeSessionRailStore = create<AeSessionRailState>((set, get) => ({
+ useAeSessionRailStore.subscribe((state, previous) => {
+   if (
+     state.open !== previous.open ||
++    state.closedForPanel !== previous.closedForPanel ||
+     state.order !== previous.order ||
+     state.folded !== previous.folded
+   ) {
+-    writePersisted({ open: state.open, order: state.order, folded: state.folded });
++    writePersisted({
++      open: state.open,
++      closedForPanel: state.closedForPanel,
++      order: state.order,
++      folded: state.folded,
++    });
+   }
+ });
+ 
+diff --git a/web/src/shell/AeSessionRail.test.tsx b/web/src/shell/AeSessionRail.test.tsx
+index c465d961db68ad5d7fe63cf81f98bfc5e8400aca..1319cff3ec1317eeee7edd9848fbcb3d5234d6cc 100644
+--- a/web/src/shell/AeSessionRail.test.tsx
++++ b/web/src/shell/AeSessionRail.test.tsx
+@@ -40,9 +40,29 @@ function sectionOrder(): string[] {
+   );
+ }
+ 
++function workspace(open: boolean, available = true) {
++  return {
++    open,
++    available,
++    toggle: vi.fn(),
++    showTab: vi.fn(),
++    mobile: { changes: vi.fn(), subagents: vi.fn() },
++  };
++}
++
++const jsdomInnerWidth = Object.getOwnPropertyDescriptor(window, "innerWidth");
++
++function resizeTo(value: number) {
++  act(() => {
++    Object.defineProperty(window, "innerWidth", { configurable: true, value });
++    window.dispatchEvent(new Event("resize"));
++  });
++}
++
+ beforeEach(() => {
+   useAeSessionRailStore.setState({
+     open: true,
++    closedForPanel: false,
+     sheetOpen: false,
+     order: [...AE_RAIL_SECTIONS],
+     folded: {},
+@@ -53,6 +73,9 @@ beforeEach(() => {
+ afterEach(() => {
+   cleanup();
+   isMobileMock.mockReturnValue(false);
++  // Put jsdom's own property back, accessor or not, for the tests after this one.
++  if (jsdomInnerWidth) Object.defineProperty(window, "innerWidth", jsdomInnerWidth);
++  else delete (window as { innerWidth?: number }).innerWidth;
+ });
+ 
+ describe("AeSessionRail", () => {
+@@ -128,9 +151,11 @@ describe("AeSessionRail", () => {
+     // Closed: jsdom's 1024 px window leaves the chat 720 px, so the rail docks.
+     const { rerender } = render(<AeSessionRail sessionId="s-1" />);
+     expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
+-    // Open at its default half of the window (512 px), 208 px are left: float.
++    // Open at its default half of the window (512 px), 208 px are left: the rail makes way.
+     rerender(<AeSessionRail sessionId="s-1" pushPanelOpen />);
+-    expect(screen.getByTestId("ae-session-rail")).toHaveAttribute("data-floating", "true");
++    expect(screen.queryByTestId("ae-session-rail")).toBeNull();
++    rerender(<AeSessionRail sessionId="s-1" />);
++    expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
+   });
+ 
+   it("docks in jsdom's 1024 px window with the sidebar closed", () => {
+@@ -138,34 +163,82 @@ describe("AeSessionRail", () => {
+     expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
+   });
+ 
+-  it("floats once the sidebar and workspace panel leave the chat too little room", () => {
++  it("closes for a panel opened beside it without room, and reopens once the panel closes", () => {
+     // 1024 - 220 - 304 leaves the chat 500 px: dock.
+     const { rerender } = render(<AeSessionRail sessionId="s-1" sidebarWidth={220} />);
+     expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
+-    // A 240 px workspace panel and its 8 px gap cut that to 252 px: float.
++    // A 240 px workspace panel and its 8 px gap cut that to 252 px: the rail makes way.
++    rerender(<AeSessionRail sessionId="s-1" sidebarWidth={220} workspacePanelWidth={240} />);
++    expect(screen.queryByTestId("ae-session-rail")).toBeNull();
++    expect(useAeSessionRailStore.getState().closedForPanel).toBe(true);
++    rerender(<AeSessionRail sessionId="s-1" sidebarWidth={220} />);
++    expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
++    // Closed by the user, it stays closed after the next panel comes and goes.
++    act(() => useAeSessionRailStore.getState().toggle());
+     rerender(<AeSessionRail sessionId="s-1" sidebarWidth={220} workspacePanelWidth={240} />);
+-    expect(screen.getByTestId("ae-session-rail")).toHaveAttribute("data-floating", "true");
++    rerender(<AeSessionRail sessionId="s-1" sidebarWidth={220} />);
++    expect(screen.queryByTestId("ae-session-rail")).toBeNull();
++  });
++
++  it("opened over a panel, closes the push panels and the workspace", () => {
++    useAeSessionRailStore.setState({ open: false });
++    const shell = workspace(true);
++    const closePushPanels = vi.fn();
++    const { rerender } = render(
++      <AeSessionRail
++        sessionId="s-1"
++        sidebarWidth={220}
++        workspacePanelWidth={240}
++        workspace={shell}
++        closePushPanels={closePushPanels}
++      />,
++    );
++    act(() => useAeSessionRailStore.getState().toggle());
++    expect(shell.toggle).toHaveBeenCalledTimes(1);
++    expect(closePushPanels).toHaveBeenCalledTimes(1);
++    // Once the shell has closed them, the rail docks and nothing closes again.
++    rerender(
++      <AeSessionRail
++        sessionId="s-1"
++        sidebarWidth={220}
++        workspace={{ ...shell, open: false }}
++        closePushPanels={closePushPanels}
++      />,
++    );
++    expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
++    expect(shell.toggle).toHaveBeenCalledTimes(1);
++  });
++
++  it("waits on a phone and behind a maximized panel, then makes way beside the panel", () => {
++    const { rerender } = render(<AeSessionRail sessionId="s-1" workspacePanelWidth={900} hidden />);
++    expect(useAeSessionRailStore.getState().open).toBe(true);
++    isMobileMock.mockReturnValue(true);
++    rerender(<AeSessionRail sessionId="s-1" workspacePanelWidth={900} />);
++    expect(useAeSessionRailStore.getState().open).toBe(true);
++    // Back on a desktop beside the restored panel, the panel counts as opened last.
++    isMobileMock.mockReturnValue(false);
++    rerender(<AeSessionRail sessionId="s-1" workspacePanelWidth={900} />);
++    expect(useAeSessionRailStore.getState()).toMatchObject({ open: false, closedForPanel: true });
+   });
+ 
+   it("re-decides when the window is resized", () => {
+-    const own = Object.getOwnPropertyDescriptor(window, "innerWidth");
+-    const resizeTo = (value: number) =>
+-      act(() => {
+-        Object.defineProperty(window, "innerWidth", { configurable: true, value });
+-        window.dispatchEvent(new Event("resize"));
+-      });
+     render(<AeSessionRail sessionId="s-1" sidebarWidth={320} />);
+     const rail = () => screen.getByTestId("ae-session-rail");
+-    try {
+-      resizeTo(900);
+-      expect(rail()).toHaveAttribute("data-floating", "true");
+-      resizeTo(1400);
+-      expect(rail()).not.toHaveAttribute("data-floating");
+-    } finally {
+-      // Put jsdom's own property back, accessor or not, for the tests after this one.
+-      if (own) Object.defineProperty(window, "innerWidth", own);
+-      else delete (window as { innerWidth?: number }).innerWidth;
+-    }
++    resizeTo(900);
++    expect(rail()).toHaveAttribute("data-floating", "true");
++    resizeTo(1400);
++    expect(rail()).not.toHaveAttribute("data-floating");
++  });
++
++  it("closes when the window narrows beside a panel, and reopens once it fits", () => {
++    resizeTo(1400);
++    // 1400 - 248 (a 240 px workspace panel and its gap) - 304 leaves the chat 848 px: dock.
++    render(<AeSessionRail sessionId="s-1" workspacePanelWidth={240} />);
++    expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
++    resizeTo(900);
++    expect(screen.queryByTestId("ae-session-rail")).toBeNull();
++    resizeTo(1400);
++    expect(screen.getByTestId("ae-session-rail")).not.toHaveAttribute("data-floating");
+   });
+ 
+   it("floating, closes from its header button and from Escape", () => {
+@@ -195,16 +268,6 @@ describe("AeSessionRail", () => {
+ });
+ 
+ describe("workspaceTabOpener", () => {
+-  function workspace(open: boolean, available = true) {
+-    return {
+-      open,
+-      available,
+-      toggle: vi.fn(),
+-      showTab: vi.fn(),
+-      mobile: { changes: vi.fn(), subagents: vi.fn() },
+-    };
+-  }
+-
+   it("opens a closed panel on the tab, and only switches tabs when it is open", () => {
+     const closed = workspace(false);
+     workspaceTabOpener(closed, false, vi.fn())?.("changes");
+diff --git a/web/src/shell/AeSessionRail.tsx b/web/src/shell/AeSessionRail.tsx
+index b748092f992b26062cbcee7c6d6ace11beef4613..31060158b8d6da6d4882269f437725ea17bd80c6 100644
+--- a/web/src/shell/AeSessionRail.tsx
++++ b/web/src/shell/AeSessionRail.tsx
+@@ -1,6 +1,7 @@
+ // The session rail's container: the sections in the saved order, sortable by
+ // their grips. Desktop docks it as a 304 px column (or floats it over the
+-// chat's right edge when docking would squeeze the chat); a phone shows it as a sheet.
++// chat's right edge when docking would squeeze the chat, but never over an open
++// panel); a phone shows it as a sheet.
+ 
+ import {
+   type Announcements,
+@@ -25,6 +26,7 @@ import {
+   type RefObject,
+   useCallback,
+   useEffect,
++  useLayoutEffect,
+   useMemo,
+   useRef,
+   useState,
+@@ -70,6 +72,38 @@ function useRailFloats(reservedWidth: number): boolean {
+   return useSyncExternalStore(subscribeToResize, getSnapshot, () => false);
+ }
+ 
++/**
++ * One pane at a time: when the open rail would float over an open panel, the one
++ * opened last stays and the other closes. A rail closed this way reopens once no
++ * panel needs the room (as it was, floating or not); one the user closed stays closed.
++ */
++function useOnePaneAtATime(
++  active: boolean,
++  panelOpen: boolean,
++  floating: boolean,
++  closePanels: () => void,
++) {
++  const open = useAeSessionRailStore((s) => s.open);
++  const closedForPanel = useAeSessionRailStore((s) => s.closedForPanel);
++  const setClosedForPanel = useAeSessionRailStore((s) => s.setClosedForPanel);
++  const previous = useRef({ open, panelOpen });
++  // A layout effect settles the overlap before the browser paints it.
++  useLayoutEffect(() => {
++    const was = previous.current;
++    previous.current = { open, panelOpen };
++    if (!active) return;
++    const clash = panelOpen && floating;
++    if (open && clash) {
++      if (!was.open && was.panelOpen) closePanels();
++      else setClosedForPanel(true);
++    } else if (!open && closedForPanel && !clash) {
++      setClosedForPanel(false);
++      // Reopening on its own is not the user opening the rail over a panel.
++      previous.current = { open: true, panelOpen };
++    }
++  });
++}
++
+ function prefersReducedMotion(): boolean {
+   return window.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
+ }
+@@ -99,6 +133,7 @@ export function AeSessionRail({
+   pushPanelOpen = false,
+   hidden = false,
+   workspace,
++  closePushPanels,
+ }: {
+   /** A real (server) session id; the shell skips the rail for `temp:` ids. */
+   sessionId: string;
+@@ -112,6 +147,8 @@ export function AeSessionRail({
+   hidden?: boolean;
+   /** Lets the Changes and Agents rows open their workspace tabs. */
+   workspace?: AeRailWorkspace;
++  /** Closes the files and logs push panels. */
++  closePushPanels?: () => void;
+ }) {
+   const isMobile = useIsMobileViewport();
+   // Push panels share one width store; this reads the width they open at.
+@@ -122,6 +159,17 @@ export function AeSessionRail({
+   const open = useAeSessionRailStore((s) => s.open);
+   const sheetOpen = useAeSessionRailStore((s) => s.sheetOpen);
+   const setSheetOpen = useAeSessionRailStore((s) => s.setSheetOpen);
++  // The workspace closes through its own toggle even while a push panel hides it;
++  // left open, it would reappear over the rail once the push panel closed.
++  useOnePaneAtATime(
++    !isMobile && !hidden,
++    workspacePanelWidth > 0 || pushPanelOpen,
++    floating,
++    () => {
++      closePushPanels?.();
++      if (workspace?.open) workspace.toggle();
++    },
++  );
+ 
+   // A sheet left open while the window widens past the phone layout closes.
+   useEffect(() => {
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 4dae3d5075ac3551d94574c51c13ccfcd304ee47..8ba238df105ab804cb0e96f401ac1aa62a15c13e 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -2716,6 +2716,10 @@ export function AppShell() {
+                   sidebarWidth={sidebarOpen ? sidebarWidth : 0}
+                   workspacePanelWidth={workspacePanelVisible ? inlinePanelWidth : 0}
+                   pushPanelOpen={executionLogsOpen || (showFilesPanel && filesPanelOpen)}
++                  closePushPanels={() => {
++                    setExecutionLogsKey(null);
++                    setFilesPanelOpen(false);
++                  }}
+                   hidden={rightPanelMaximized}
+                   workspace={{
+                     open: rightPanelOpen,

@@ -1,0 +1,554 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 19:20:22 -0700
+Subject: [PATCH 130/148] [ae-patch] Show a failed subagent under its own
+ Failed group in the rail and the Agents tab
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A Claude Code subagent that failed read as finished. The child list built
+each row's status only from the in-memory status cache, so after a server
+restart a failed child read idle although its row's live_status still said
+failed; the summary now falls back to that persisted failure on a cache miss.
+On the web, splitAgentSections returns failed rows in their own list; the
+Agents tab and the rail's Agents section both show them in an always-open
+Failed group with Tabler's alert-triangle icon, and the rail summary reads
+"1 running · 1 failed · 2 finished", leaving out zero parts. The rail now
+reads its subagent rows from the same live child list as the Agents tab
+(useChildSessions, kept current by the session stream) instead of its own
+60 s poll, so the two agree. Elapsed time still counts from the first
+launch: a resume leaves no trace in the child's items or summary.
+---
+ omnigent/server/routes/_sessions/helpers.py   |  2 +
+ .../routes/test_ae_subagent_liveness.py       | 27 ++++++++
+ .../components/aeRail/AeRailAgents.test.tsx   | 63 ++++++++++++++++++-
+ web/src/components/aeRail/AeRailAgents.tsx    | 62 +++++++++++++++---
+ web/src/components/aeSessionContext.ts        |  2 +-
+ web/src/hooks/useChildSessions.ts             |  7 ++-
+ web/src/shell/AeAgentsSections.test.tsx       | 21 +++++++
+ web/src/shell/AeAgentsSections.tsx            | 45 ++++++++-----
+ web/src/shell/aeAgentsPaneModel.test.ts       |  5 +-
+ web/src/shell/aeAgentsPaneModel.ts            | 22 +++++--
+ 10 files changed, 219 insertions(+), 37 deletions(-)
+
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index b5461f3c69c87d91d1773fc7ad30d756fb939e94..3fb6eb7af01ca3f9b2c4185559a16d9d1ea35e24 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -10895,6 +10895,8 @@ def _child_session_summary_from_conversation(
+     # Derive busy from the relay-fed cache; tasks table is gone.
+     if cached_status is None:
+         cached_status = _session_status_cache.get(conv.id)
++    if cached_status is None and conv.live_status == "failed":
++        cached_status = "failed"  # AE: a restart empties the cache; the row keeps the failure.
+     if cached_status in ("running", "waiting"):
+         busy = True
+     else:
+diff --git a/tests/server/routes/test_ae_subagent_liveness.py b/tests/server/routes/test_ae_subagent_liveness.py
+index ba38a676d7e24445b6f0d612e45d3a8d60e5c7d6..209534bfaffcbae307a97e232c2da7ebed51f4b9 100644
+--- a/tests/server/routes/test_ae_subagent_liveness.py
++++ b/tests/server/routes/test_ae_subagent_liveness.py
+@@ -365,3 +365,30 @@ async def test_startup_sweep_warns_without_a_sql_store(
+ ) -> None:
+     assert await ae_subagent_liveness.sweep_stale_claude_subagents(Mock(spec=[])) == 0
+     assert "conversation store has no _session" in caplog.text
++
++
++@pytest.mark.parametrize(
++    ("live_status", "task_status"),
++    [("failed", "failed"), ("idle", None), ("running", None)],
++)
++def test_child_summary_keeps_a_persisted_failure_after_a_restart(
++    db_uri: str, live_status: str, task_status: str | None
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    parent_id, child_id = _claude_child(store)
++    # After a restart the status cache is empty; only the row remembers the end.
++    store.set_session_live_status(child_id, live_status)
++    common._session_status_cache.pop(child_id, None)
++    conv = store.get_conversation(child_id)
++    assert conv is not None and conv.live_status == live_status
++    summary = _child_session_summary_from_conversation(conv, parent_id, None)
++    assert summary.current_task_status == task_status
++    assert summary.busy is False
++    # A live edge still wins over the row.
++    common._session_status_cache[child_id] = "running"
++    try:
++        live = _child_session_summary_from_conversation(conv, parent_id, None)
++        assert live.current_task_status == "in_progress"
++        assert live.busy is True
++    finally:
++        common._session_status_cache.pop(child_id, None)
+diff --git a/web/src/components/aeRail/AeRailAgents.test.tsx b/web/src/components/aeRail/AeRailAgents.test.tsx
+index 15ef4b68ddaa426169cdc4349f9c2b955e4c2b6a..4ce1c213073a9bee3b28009e494302ef421a66ec 100644
+--- a/web/src/components/aeRail/AeRailAgents.test.tsx
++++ b/web/src/components/aeRail/AeRailAgents.test.tsx
+@@ -1,6 +1,7 @@
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { type ReactElement, type ReactNode, useState } from "react";
+ import {
++  act,
+   cleanup,
+   fireEvent,
+   render as rtlRender,
+@@ -14,7 +15,7 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+ 
+ import { authenticatedFetch } from "@/lib/identity";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
+-import { AeRailAgents } from "./AeRailAgents";
++import { AeRailAgents, aeRailAgentsSummary } from "./AeRailAgents";
+ 
+ /** A fresh QueryClient per render, retries off, as the app's provider supplies one. */
+ function QueryWrapper({ children }: { children: ReactNode }) {
+@@ -97,7 +98,7 @@ describe("AeRailAgents", () => {
+     );
+     render(<AeRailAgents sessionId="conv_root" />);
+     await waitFor(() => expect(screen.getAllByTestId("ae-rail-agent")).toHaveLength(3));
+-    expect(screen.getByText("4 running")).toBeTruthy();
++    await waitFor(() => expect(screen.getByText("4 running · 1 finished")).toBeTruthy());
+     const rows = screen.getAllByTestId("ae-rail-agent").map((row) => row.textContent);
+     expect(rows).toEqual([
+       "Review the diffCodex · gpt-6-astra22%",
+@@ -280,3 +281,61 @@ describe("AeRailAgents", () => {
+     expect(authenticatedFetch).not.toHaveBeenCalled();
+   });
+ });
++
++describe("AeRailAgents failed subagents", () => {
++  it("lists a failed subagent under its own open Failed group, never under Finished", async () => {
++    const now = Math.floor(Date.now() / 1000);
++    route([
++      child("conv_live", { tool: "Build the grid", labels: SUBAGENT, created_at: now - 60 }),
++      child("conv_dead", {
++        tool: "Build the redesign",
++        labels: SUBAGENT,
++        busy: false,
++        current_task_status: "failed",
++        created_at: now - 900,
++        updated_at: now - 600,
++      }),
++      child("conv_done1", {
++        tool: "Screenshot it",
++        labels: SUBAGENT,
++        busy: false,
++        current_task_status: "completed",
++      }),
++      child("conv_done2", {
++        tool: "Read the docs",
++        labels: SUBAGENT,
++        busy: false,
++        current_task_status: "completed",
++      }),
++    ]);
++    render(<AeRailAgents sessionId="conv_root" />);
++    await waitFor(() =>
++      expect(screen.getByText("1 running · 1 failed · 2 finished")).toBeTruthy(),
++    );
++    const group = screen.getByTestId("ae-rail-agents-failed");
++    const failedRows = within(group).getAllByTestId("ae-rail-subagent");
++    expect(failedRows.map((row) => row.getAttribute("data-session"))).toEqual(["conv_dead"]);
++    expect(failedRows[0].getAttribute("data-activity")).toBe("failed");
++    expect(failedRows[0].textContent).toContain("Failed");
++    // The Finished toggle counts only the two that simply ended.
++    expect(screen.getByTestId("ae-rail-agents-finished-toggle").textContent).toContain("2");
++    expect(screen.queryByText("Nothing running now.")).toBeNull();
++  });
++
++  it("keeps the counts in the summary after the section is folded", async () => {
++    route([
++      child("conv_dead", { labels: SUBAGENT, busy: false, current_task_status: "failed" }),
++    ]);
++    render(<AeRailAgents sessionId="conv_root" />);
++    await waitFor(() => expect(screen.getByText("1 failed")).toBeTruthy());
++    act(() => useAeSessionRailStore.setState({ folded: { agents: true } }));
++    expect(screen.getByText("1 failed")).toBeTruthy();
++  });
++
++  it("builds the summary from the non-zero parts only", () => {
++    expect(aeRailAgentsSummary(1, 1, 2)).toBe("1 running · 1 failed · 2 finished");
++    expect(aeRailAgentsSummary(0, 1, 2)).toBe("1 failed · 2 finished");
++    expect(aeRailAgentsSummary(2, 0, 0)).toBe("2 running");
++    expect(aeRailAgentsSummary(0, 0, 0)).toBeUndefined();
++  });
++});
+diff --git a/web/src/components/aeRail/AeRailAgents.tsx b/web/src/components/aeRail/AeRailAgents.tsx
+index 5cb1ff50ed20868c40a91052b30833a2c146b029..f9fc8cd651436af6358d8e7fec61e94ca5081bc6 100644
+--- a/web/src/components/aeRail/AeRailAgents.tsx
++++ b/web/src/components/aeRail/AeRailAgents.tsx
+@@ -1,10 +1,12 @@
+ // The rail's Agents section: each collaborator's own context window (never
+ // summed), then Claude Code's subagents: running ones with a one-line note on
+-// what each is doing (its newest step), finished ones under their own Finished group.
++// what each is doing (its newest step), failed ones always shown under Failed,
++// finished ones under their own Finished group. Rows come from the same live
++// child list the Agents tab reads, so the two always agree.
+ 
+ import { useState } from "react";
+ import { RunningDot } from "@/components/RunningDot";
+-import type { ChildSessionInfo } from "@/hooks/useChildSessions";
++import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+ import { type AeRailSectionProps, useAeRailSectionActive } from "@/lib/aeSessionRail";
+ import { cn } from "@/lib/utils";
+ import {
+@@ -23,6 +25,7 @@ import {
+   type AeContextEntry,
+   aeModelName,
+   buildCollaboratorContext,
++  isNativeSubagent,
+   useAeSessionContexts,
+ } from "../aeSessionContext";
+ import { AeRailSection } from "./AeRailSection";
+@@ -89,6 +92,9 @@ function rowTime(child: ChildSessionInfo, nowMs: number): string {
+ function SubagentDot({ child }: { child: ChildSessionInfo }) {
+   const { activity } = childStatus(child);
+   if (activity === "working") return <RunningDot className="mt-0.5" />;
++  if (activity === "failed") {
++    return <AeRailIcon name="warning" className="mt-0.5 size-3 text-destructive" />;
++  }
+   return (
+     <span
+       aria-hidden
+@@ -180,6 +186,20 @@ function SubagentRow({
+   );
+ }
+ 
++/** "1 running · 1 failed · 2 finished", leaving out zero parts; none when all are zero. */
++export function aeRailAgentsSummary(
++  running: number,
++  failed: number,
++  finished: number,
++): string | undefined {
++  const parts = [
++    running > 0 ? `${running} running` : null,
++    failed > 0 ? `${failed} failed` : null,
++    finished > 0 ? `${finished} finished` : null,
++  ].filter(Boolean);
++  return parts.length > 0 ? parts.join(" · ") : undefined;
++}
++
+ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+   const harness = useChatStore((s) => (s.conversationId === sessionId ? s.sessionHarness : null));
+   const model = useChatStore((s) => (s.conversationId === sessionId ? s.llmModel : null));
+@@ -192,6 +212,9 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+   );
+   // Claude Code collaborators report their window through the limits relay's status lines.
+   const statusLines = useAeLimits(active, sessionId).data?.harnesses.claude?.contexts;
++  // The Agents tab's own list, kept live by the session stream between polls.
++  // Folded, it only reads the cached list, so the folded summary keeps its counts.
++  const { children } = useChildSessions(sessionId, POLL_MS, active);
+   const [finishedOpen, setFinishedOpen] = useState(readFinishedOpen);
+   const openTab = useAeRailOpenWorkspaceTab();
+   const openAgents = openTab ? () => openTab("subagents") : undefined;
+@@ -202,27 +225,31 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+     entry: buildCollaboratorContext(c, statusLines, now),
+   }));
+   // Rows cleared in the Agents tab stay cleared here too.
+-  const split = splitAgentSections(sessions.subagentRows ?? [], readAeAgentsClearedAt(sessionId));
++  const split = splitAgentSections(
++    children.filter(isNativeSubagent),
++    readAeAgentsClearedAt(sessionId),
++  );
+   const runningSubagents = split.running;
+   const steps = useAeSubagentSteps(
+     active,
+     runningSubagents.map((c) => c.id),
+   );
+-  // Newest finish first.
+-  const finishedSubagents = [...split.finished].sort(
+-    (a, b) => (b.updated_at ?? b.created_at ?? 0) - (a.updated_at ?? a.created_at ?? 0),
+-  );
++  // Newest end first.
++  const newestFirst = (a: ChildSessionInfo, b: ChildSessionInfo) =>
++    (b.updated_at ?? b.created_at ?? 0) - (a.updated_at ?? a.created_at ?? 0);
++  const failedSubagents = [...split.failed].sort(newestFirst);
++  const finishedSubagents = [...split.finished].sort(newestFirst);
+   const running = rows.filter((r) => r.running).length + runningSubagents.length;
+   const finished = rows.length - rows.filter((r) => r.running).length + finishedSubagents.length;
+   const hidden = sessions.hidden ?? 0;
+-  const subagentCount = runningSubagents.length + finishedSubagents.length;
++  const failed = failedSubagents.length;
++  const subagentCount = runningSubagents.length + failed + finishedSubagents.length;
+   const empty = rows.length === 0 && subagentCount === 0;
+   const toggleFinished = () => {
+     writeFinishedOpen(!finishedOpen);
+     setFinishedOpen(!finishedOpen);
+   };
+-  const summary =
+-    running > 0 ? `${running} running` : finished > 0 ? `${finished} finished` : undefined;
++  const summary = aeRailAgentsSummary(running, failed, finished);
+   return (
+     <AeRailSection id="agents" summary={summary}>
+       <div className="flex flex-col gap-2 text-sm" data-testid="ae-rail-agents">
+@@ -271,6 +298,21 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+             ))}
+           </div>
+         )}
++        {failed > 0 && (
++          <div
++            className="flex flex-col border-t border-border/60 pt-1"
++            data-testid="ae-rail-agents-failed"
++          >
++            <div className="flex min-h-7 items-center gap-1">
++              <AeRailIcon name="warning" className="size-3.5 text-destructive" />
++              <span className="flex-1">Failed</span>
++              <span className="text-xs tabular-nums text-muted-foreground">{failed}</span>
++            </div>
++            {failedSubagents.map((child) => (
++              <SubagentRow key={child.id} child={child} nowMs={now} onOpen={openAgents} />
++            ))}
++          </div>
++        )}
+         {finishedSubagents.length > 0 && (
+           <div className="flex flex-col border-t border-border/60 pt-1">
+             <button
+diff --git a/web/src/components/aeSessionContext.ts b/web/src/components/aeSessionContext.ts
+index 9042f2ee16b5a728de54ab9ea62173fd21ef4948..fc5e0350f379316826fe5c4a98ef1fb656eb8531 100644
+--- a/web/src/components/aeSessionContext.ts
++++ b/web/src/components/aeSessionContext.ts
+@@ -278,7 +278,7 @@ function toSnapshot(session: Session): AeSessionSnapshot {
+ /** Claude Code's own subagents run inside its process and report no context of their own. */
+ const NATIVE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent";
+ 
+-function isNativeSubagent(child: ChildSessionInfo): boolean {
++export function isNativeSubagent(child: ChildSessionInfo): boolean {
+   return child.labels?.["omnigent.wrapper"] === NATIVE_SUBAGENT_WRAPPER;
+ }
+ 
+diff --git a/web/src/hooks/useChildSessions.ts b/web/src/hooks/useChildSessions.ts
+index 8ab8ceb459f40fc876a05580a4b753e6416d9f45..60631348f37abe93993105f76c06c9c3c9167832 100644
+--- a/web/src/hooks/useChildSessions.ts
++++ b/web/src/hooks/useChildSessions.ts
+@@ -256,10 +256,13 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
+  *     tab is backgrounded). The execution-logs panel passes a value
+  *     here so the dropdown updates when new sub-agents spawn;
+  *     callers that just need a snapshot (the rail card) can omit it.
++ * @param enabled - False reads only the cached list and fetches nothing,
++ *     e.g. while the rail's Agents section is folded.
+  */
+ export function useChildSessions(
+   conversationId: string | null,
+   pollMs?: number | null,
++  enabled = true,
+ ): UseChildSessionsResult {
+   const sessionId = isTempConvId(conversationId) ? null : conversationId;
+   const { data, isLoading, error } = useQuery({
+@@ -268,11 +271,11 @@ export function useChildSessions(
+         ? ["conversation", null, "child_sessions"]
+         : childSessionsQueryKey(sessionId),
+     queryFn: () => fetchChildSessions(sessionId as string),
+-    enabled: sessionId !== null,
++    enabled: sessionId !== null && enabled,
+     staleTime: 60_000,
+     retry: false,
+     refetchOnMount: false,
+-    refetchInterval: pollMs ?? false,
++    refetchInterval: enabled ? (pollMs ?? false) : false,
+   });
+   return {
+     children: data ?? [],
+diff --git a/web/src/shell/AeAgentsSections.test.tsx b/web/src/shell/AeAgentsSections.test.tsx
+index fd0b15936d8cd229aa01614c50dd81041beee82a..51751e5530a9daa6e248f7b3aad678a884885123 100644
+--- a/web/src/shell/AeAgentsSections.test.tsx
++++ b/web/src/shell/AeAgentsSections.test.tsx
+@@ -80,6 +80,27 @@ describe("AeAgentsSections", () => {
+     expect(window.localStorage.getItem("ae.agentsPane.finishedOpen")).toBe("1");
+   });
+ 
++  it("shows failed agents in their own open Failed section, never counted as finished", () => {
++    renderSections([
++      child({ id: "a" }),
++      running("b"),
++      child({ id: "dead", current_task_status: "failed" }),
++      child({ id: "c" }),
++    ]);
++    expect(screen.getByTestId("agents-failed-section")).toHaveTextContent("Failed1");
++    expect(screen.getByTestId("agents-finished-toggle")).toHaveTextContent("Finished2");
++    // Failed rows show while Finished stays folded.
++    expect(rowIds()).toEqual(["b", "dead"]);
++  });
++
++  it("clears a failed-only list from the Failed header", () => {
++    renderSections([running("b"), child({ id: "dead", current_task_status: "failed" })]);
++    expect(screen.queryByTestId("agents-finished-section")).toBeNull();
++    fireEvent.click(screen.getByTestId("agents-clear-finished"));
++    expect(rowIds()).toEqual(["b"]);
++    expect(screen.queryByTestId("agents-failed-section")).toBeNull();
++  });
++
+   it("clears finished agents from the view and brings them back", () => {
+     window.localStorage.setItem("ae.agentsPane.finishedOpen", "1");
+     const { rerender } = renderSections([child({ id: "a" }), running("b")]);
+diff --git a/web/src/shell/AeAgentsSections.tsx b/web/src/shell/AeAgentsSections.tsx
+index 62472af867e4c0be33e70fccd1873829bde35383..3996866d8ff18dd893397d5e87fe0b33aa82bf5f 100644
+--- a/web/src/shell/AeAgentsSections.tsx
++++ b/web/src/shell/AeAgentsSections.tsx
+@@ -16,6 +16,7 @@ import {
+   AE_ICON_TRASH,
+ } from "@/lib/aeAgentsIcons";
+ import { interrupt } from "@/lib/sessionsApi";
++import { AE_RAIL_ICONS } from "@/components/aeRail/aeRailIcons";
+ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
+ import { TodoPanel } from "./TodoPanel";
+@@ -132,8 +133,8 @@ function AgentsSectionsForRoot({ rootSessionId, agents, renderRow }: AeAgentsSec
+     readAeAgentsClearedAt(rootSessionId),
+   );
+   const [finishedOpen, setFinishedOpen] = useState(() => readStorage(FINISHED_OPEN_KEY) === "1");
+-  const { running, finished, clearedCount } = splitAgentSections(agents, clearedAt);
+-  const cutoff = clearCutoff(finished, clearedAt);
++  const { running, failed, finished, clearedCount } = splitAgentSections(agents, clearedAt);
++  const cutoff = clearCutoff([...failed, ...finished], clearedAt);
+ 
+   if (agents.length === 0) return null;
+ 
+@@ -148,6 +149,19 @@ function AgentsSectionsForRoot({ rootSessionId, agents, renderRow }: AeAgentsSec
+     writeStorage(clearedKey(rootSessionId), String(cutoff));
+     setClearedAt(cutoff);
+   };
++  const clearButton =
++    cutoff !== null ? (
++      <button
++        type="button"
++        onClick={clearFinished}
++        className={ICON_BUTTON}
++        aria-label="Clear finished agents from this list"
++        title="Clear finished"
++        data-testid="agents-clear-finished"
++      >
++        <AeTablerSvg node={AE_ICON_TRASH} className="size-4" />
++      </button>
++    ) : null;
+   const restoreCleared = () => {
+     writeStorage(clearedKey(rootSessionId), null);
+     setClearedAt(null);
+@@ -165,6 +179,20 @@ function AgentsSectionsForRoot({ rootSessionId, agents, renderRow }: AeAgentsSec
+       )}
+       {running.length > 0 && <ColumnHeader withStop />}
+       {running.map(renderRow)}
++      {failed.length > 0 && (
++        <li data-testid="agents-failed-section" className="mt-1 border-t border-border/60">
++          <SectionHeader>
++            <AeTablerSvg node={AE_RAIL_ICONS.warning} className="size-3.5 shrink-0 text-destructive" />
++            <span>Failed</span>
++            <span className="tabular-nums">{failed.length}</span>
++            <span className="flex-1" />
++            {/* With no Finished header, Clear lives here so failed-only lists can be cleared. */}
++            {finished.length === 0 && clearButton}
++          </SectionHeader>
++        </li>
++      )}
++      {failed.length > 0 && <ColumnHeader withStop={false} />}
++      {failed.map(renderRow)}
+       {(finished.length > 0 || clearedCount > 0) && (
+         <li data-testid="agents-finished-section" className="mt-1 border-t border-border/60">
+           <SectionHeader>
+@@ -194,18 +222,7 @@ function AgentsSectionsForRoot({ rootSessionId, agents, renderRow }: AeAgentsSec
+                 <AeTablerSvg node={AE_ICON_RESTORE} className="size-4" />
+               </button>
+             )}
+-            {finished.length > 0 && cutoff !== null && (
+-              <button
+-                type="button"
+-                onClick={clearFinished}
+-                className={ICON_BUTTON}
+-                aria-label="Clear finished agents from this list"
+-                title="Clear finished"
+-                data-testid="agents-clear-finished"
+-              >
+-                <AeTablerSvg node={AE_ICON_TRASH} className="size-4" />
+-              </button>
+-            )}
++            {finished.length > 0 && clearButton}
+           </SectionHeader>
+         </li>
+       )}
+diff --git a/web/src/shell/aeAgentsPaneModel.test.ts b/web/src/shell/aeAgentsPaneModel.test.ts
+index 7fa7b764430c594536bc205cdb9c8a2534ba13a0..d998e8c9d41821ecff3a1e1331a63d17c1e9999e 100644
+--- a/web/src/shell/aeAgentsPaneModel.test.ts
++++ b/web/src/shell/aeAgentsPaneModel.test.ts
+@@ -33,7 +33,7 @@ const running = (id: string, extra: Partial<ChildSessionInfo> = {}) =>
+ const claudeTask = { labels: { "omnigent.wrapper": "claude-code-native-ui-subagent" } };
+ 
+ describe("splitAgentSections", () => {
+-  it("puts live agents under Running and settled or failed ones under Finished", () => {
++  it("puts live agents under Running, failed ones under Failed and settled ones under Finished", () => {
+     const sections = splitAgentSections(
+       [
+         child({ id: "done" }),
+@@ -44,7 +44,8 @@ describe("splitAgentSections", () => {
+       null,
+     );
+     expect(sections.running.map((c) => c.id)).toEqual(["busy", "asking"]);
+-    expect(sections.finished.map((c) => c.id)).toEqual(["done", "failed"]);
++    expect(sections.finished.map((c) => c.id)).toEqual(["done"]);
++    expect(sections.failed.map((c) => c.id)).toEqual(["failed"]);
+     expect(sections.clearedCount).toBe(0);
+   });
+ 
+diff --git a/web/src/shell/aeAgentsPaneModel.ts b/web/src/shell/aeAgentsPaneModel.ts
+index 749cdac024664321cce4ba4be1d64b8e6a862b8a..a0fe2e23427e3779142d3565c59d045b37c19fd8 100644
+--- a/web/src/shell/aeAgentsPaneModel.ts
++++ b/web/src/shell/aeAgentsPaneModel.ts
+@@ -8,9 +8,9 @@ import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/na
+ import { childStatus, type AgentActivity } from "./subagentStatus";
+ 
+ /**
+- * Activities that keep a row under Running. Everything else folds into
+- * Finished: done, idle, failed, a dropped runner, and a stopped task
+- * (`cancelled`, which `childStatus` reports as `other`).
++ * Activities that keep a row under Running. Everything else has ended:
++ * `failed` gets its own Failed section, and the rest fold into Finished
++ * (done, idle, a dropped runner, a stopped task).
+  */
+ const RUNNING_ACTIVITIES: ReadonlySet<AgentActivity> = new Set([
+   "working",
+@@ -22,16 +22,23 @@ export function isChildFinished(child: ChildSessionInfo): boolean {
+   return !RUNNING_ACTIVITIES.has(childStatus(child).activity);
+ }
+ 
++/** True for a row whose run failed; never counted as finished. */
++export function isChildFailed(child: ChildSessionInfo): boolean {
++  return childStatus(child).activity === "failed";
++}
++
+ export interface AgentSections {
+   running: ChildSessionInfo[];
++  /** Ended rows whose run failed (not a dropped runner), kept out of `finished`. */
++  failed: ChildSessionInfo[];
+   finished: ChildSessionInfo[];
+   /** Finished rows hidden by the pane's Clear button. */
+   clearedCount: number;
+ }
+ 
+ /**
+- * Split the root's children into Running and Finished, in server order,
+- * dropping finished rows last updated at or before `clearedAt`.
++ * Split the root's children into Running, Failed and Finished, in server
++ * order, dropping ended rows last updated at or before `clearedAt`.
+  *
+  * @param children - The root session's child rows, in server order.
+  * @param clearedAt - Epoch seconds of the last Clear, or `null` when never cleared.
+@@ -41,6 +48,7 @@ export function splitAgentSections(
+   clearedAt: number | null,
+ ): AgentSections {
+   const running: ChildSessionInfo[] = [];
++  const failed: ChildSessionInfo[] = [];
+   const finished: ChildSessionInfo[] = [];
+   let clearedCount = 0;
+   for (const child of children) {
+@@ -48,11 +56,13 @@ export function splitAgentSections(
+       running.push(child);
+     } else if (clearedAt !== null && (child.updated_at ?? 0) <= clearedAt) {
+       clearedCount += 1;
++    } else if (isChildFailed(child)) {
++      failed.push(child);
+     } else {
+       finished.push(child);
+     }
+   }
+-  return { running, finished, clearedCount };
++  return { running, failed, finished, clearedCount };
+ }
+ 
+ /**

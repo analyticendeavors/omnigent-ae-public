@@ -1,0 +1,872 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:43:18 -0700
+Subject: [PATCH 095/148] [ae-patch] Edit a global policy's parameters on the
+ Global Policies page
+
+Each stored global policy whose registry entry is a factory with parameters
+gets an Edit button (Tabler pencil) beside its switch. It opens the add
+dialog in an edit mode: no picker, the name fixed, every parameter prefilled
+from the stored factory_params, and Save sends PATCH /v1/policies/{id} with
+the new params, which the previous patch checks and builds before saving.
+
+The form's strings cannot carry every stored value back (an empty list,
+numbers or objects in a list, an item with a comma), so a field the admin did
+not change keeps its stored value exactly, as do stored keys the form does
+not show. A changed field takes the dialog's value, and a cleared one is left
+out, so the factory's default applies. The add, update and delete hooks throw
+the server's reason through apiErrorFromResponse, so the dialog shows why a
+save or an add was refused.
+
+The logic lives in new files (web/src/lib/aePolicyEdit.ts for the form values,
+the saved params and the editable rule; web/src/components/AePolicyEditButton.tsx);
+the page gains an optional `editing` prop on AddDefaultPolicyDialog, and
+useUpdateDefaultPolicy sends only the fields it is given, so the switch still
+sends exactly {enabled}.
+---
+ web/src/components/AePolicyEditButton.tsx     |  35 +++
+ .../hooks/useDefaultPolicies.aeEdit.test.ts   |  89 ++++++
+ web/src/hooks/useDefaultPolicies.ts           |  20 +-
+ web/src/lib/aePolicyEdit.test.ts              | 119 ++++++++
+ web/src/lib/aePolicyEdit.ts                   |  67 +++++
+ web/src/pages/PoliciesPage.aeEdit.test.tsx    | 259 ++++++++++++++++++
+ web/src/pages/PoliciesPage.tsx                |  59 +++-
+ 7 files changed, 630 insertions(+), 18 deletions(-)
+ create mode 100644 web/src/components/AePolicyEditButton.tsx
+ create mode 100644 web/src/hooks/useDefaultPolicies.aeEdit.test.ts
+ create mode 100644 web/src/lib/aePolicyEdit.test.ts
+ create mode 100644 web/src/lib/aePolicyEdit.ts
+ create mode 100644 web/src/pages/PoliciesPage.aeEdit.test.tsx
+
+diff --git a/web/src/components/AePolicyEditButton.tsx b/web/src/components/AePolicyEditButton.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f4dc34cc45001a429714611311526501d1ff5b0a
+--- /dev/null
++++ b/web/src/components/AePolicyEditButton.tsx
+@@ -0,0 +1,35 @@
++/**
++ * The Edit button on a Global Policies card (AE patch). Rendered only for a
++ * stored policy whose registry entry has parameters to edit.
++ */
++
++import { Button } from "@/components/ui/button";
++import type { DefaultPolicy } from "@/hooks/useDefaultPolicies";
++import type { PolicyRegistryEntry } from "@/hooks/usePolicies";
++import { AE_PENCIL_ICON, aePolicyEditable } from "@/lib/aePolicyEdit";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++
++export function AePolicyEditButton({
++  policy,
++  entry,
++  onEdit,
++}: {
++  policy: DefaultPolicy;
++  entry?: PolicyRegistryEntry;
++  onEdit: (policy: DefaultPolicy) => void;
++}) {
++  if (!aePolicyEditable(policy, entry)) return null;
++  return (
++    <Button
++      variant="ghost"
++      size="icon"
++      className="size-8 text-muted-foreground hover:text-foreground"
++      title="Edit policy"
++      aria-label={`Edit ${policy.name}`}
++      componentId="settings.policies.edit"
++      onClick={() => onEdit(policy)}
++    >
++      <AeTablerSvg node={AE_PENCIL_ICON} className="size-3.5" />
++    </Button>
++  );
++}
+diff --git a/web/src/hooks/useDefaultPolicies.aeEdit.test.ts b/web/src/hooks/useDefaultPolicies.aeEdit.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d781873df882ad79879b8546b879f46bd5947e85
+--- /dev/null
++++ b/web/src/hooks/useDefaultPolicies.aeEdit.test.ts
+@@ -0,0 +1,89 @@
++// The PATCH contract for editing a global policy's params (AE patch): the
++// body carries only the fields given, and a refusal surfaces the server's
++// reason instead of the bare status line.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { renderHook, waitFor } from "@testing-library/react";
++import { createElement, type ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { useAddDefaultPolicy, useUpdateDefaultPolicy } from "./useDefaultPolicies";
++
++function mockResponse(body: unknown, init?: { ok?: boolean; status?: number }): Response {
++  return {
++    ok: init?.ok ?? true,
++    status: init?.status ?? 200,
++    statusText: init?.ok === false ? "Bad Request" : "OK",
++    json: async () => body,
++  } as unknown as Response;
++}
++
++const fetchMock = vi.fn();
++
++beforeEach(() => {
++  fetchMock.mockReset();
++  vi.stubGlobal("fetch", fetchMock);
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++function renderMutation<T>(hook: () => T) {
++  const queryClient = new QueryClient({ defaultOptions: { mutations: { retry: false } } });
++  const wrapper = ({ children }: { children: ReactNode }) =>
++    createElement(QueryClientProvider, { client: queryClient }, children);
++  return renderHook(hook, { wrapper });
++}
++
++const renderUpdate = () => renderMutation(useUpdateDefaultPolicy);
++
++describe("useUpdateDefaultPolicy with factory_params", () => {
++  it("PATCHes the new params and nothing else", async () => {
++    fetchMock.mockResolvedValueOnce(mockResponse({ id: "r1" }));
++    const { result } = renderUpdate();
++    result.current.mutate({ policyId: "r1", factory_params: { hours: 4, turns: 80 } });
++    await waitFor(() => expect(result.current.isSuccess).toBe(true));
++
++    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
++    expect(url).toBe("/v1/policies/r1");
++    expect(init.method).toBe("PATCH");
++    expect(JSON.parse(init.body as string)).toEqual({ factory_params: { hours: 4, turns: 80 } });
++  });
++
++  it("throws the server's reason when the params are refused", async () => {
++    fetchMock.mockResolvedValueOnce(
++      mockResponse(
++        { error: { message: "Policy 'ae_slot_cap' rejected these params: bad mode." } },
++        { ok: false, status: 400 },
++      ),
++    );
++    const { result } = renderUpdate();
++    result.current.mutate({ policyId: "s1", factory_params: { mode: "nope" } });
++    await waitFor(() => expect(result.current.isError).toBe(true));
++    expect(result.current.error?.message).toBe(
++      "Policy 'ae_slot_cap' rejected these params: bad mode.",
++    );
++  });
++});
++
++describe("useAddDefaultPolicy", () => {
++  it("throws the server's reason too, since the dialog shows both", async () => {
++    fetchMock.mockResolvedValueOnce(
++      mockResponse(
++        { error: { message: "Policy 'budget' rejected these params: max_cost_usd must be > 0." } },
++        { ok: false, status: 400 },
++      ),
++    );
++    const { result } = renderMutation(useAddDefaultPolicy);
++    result.current.mutate({
++      name: "budget",
++      type: "python",
++      handler: "omnigent.policies.builtins.cost.cost_budget",
++      factory_params: { max_cost_usd: -1 },
++    });
++    await waitFor(() => expect(result.current.isError).toBe(true));
++    expect(result.current.error?.message).toBe(
++      "Policy 'budget' rejected these params: max_cost_usd must be > 0.",
++    );
++  });
++});
+diff --git a/web/src/hooks/useDefaultPolicies.ts b/web/src/hooks/useDefaultPolicies.ts
+index 23bd4b7d3be33cf1cf0ee4b4002b7994570734b4..e0490006d6583c4bda890665d3dc8059348b13e8 100644
+--- a/web/src/hooks/useDefaultPolicies.ts
++++ b/web/src/hooks/useDefaultPolicies.ts
+@@ -1,5 +1,6 @@
+ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+ import { authenticatedFetch } from "@/lib/identity";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
+ 
+ /** A server-wide default policy returned by the admin CRUD API. */
+ export interface DefaultPolicy {
+@@ -54,7 +55,7 @@ export function useAddDefaultPolicy() {
+         headers: { "Content-Type": "application/json" },
+         body: JSON.stringify(payload),
+       });
+-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
++      if (!res.ok) throw await apiErrorFromResponse(res);
+       return (await res.json()) as DefaultPolicy;
+     },
+     onSuccess: () => {
+@@ -63,17 +64,24 @@ export function useAddDefaultPolicy() {
+   });
+ }
+ 
+-/** PATCH /v1/policies/{id} — toggle enabled state. */
++/** PATCH /v1/policies/{id}: toggle enabled state, or replace the factory params. */
+ export function useUpdateDefaultPolicy() {
+   const queryClient = useQueryClient();
+   return useMutation({
+-    mutationFn: async ({ policyId, enabled }: { policyId: string; enabled: boolean }) => {
++    mutationFn: async ({
++      policyId,
++      ...fields
++    }: {
++      policyId: string;
++      enabled?: boolean;
++      factory_params?: Record<string, unknown> | null;
++    }) => {
+       const res = await authenticatedFetch(`/v1/policies/${encodeURIComponent(policyId)}`, {
+         method: "PATCH",
+         headers: { "Content-Type": "application/json" },
+-        body: JSON.stringify({ enabled }),
++        body: JSON.stringify(fields),
+       });
+-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
++      if (!res.ok) throw await apiErrorFromResponse(res);
+       return (await res.json()) as DefaultPolicy;
+     },
+     onSuccess: () => {
+@@ -90,7 +98,7 @@ export function useDeleteDefaultPolicy() {
+       const res = await authenticatedFetch(`/v1/policies/${encodeURIComponent(policyId)}`, {
+         method: "DELETE",
+       });
+-      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
++      if (!res.ok) throw await apiErrorFromResponse(res);
+     },
+     onSuccess: () => {
+       void queryClient.invalidateQueries({ queryKey: QUERY_KEY });
+diff --git a/web/src/lib/aePolicyEdit.test.ts b/web/src/lib/aePolicyEdit.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eda5d9f9e871b10ed8f29708a718e124836bb3b0
+--- /dev/null
++++ b/web/src/lib/aePolicyEdit.test.ts
+@@ -0,0 +1,119 @@
++import { describe, expect, it } from "vitest";
++import type { DefaultPolicy } from "@/hooks/useDefaultPolicies";
++import type { PolicyRegistryEntry } from "@/hooks/usePolicies";
++import { aeEditedParams, aePolicyEditable, aePolicyFormValues } from "./aePolicyEdit";
++
++function stored(overrides: Partial<DefaultPolicy> = {}): DefaultPolicy {
++  return {
++    id: "p1",
++    object: "default_policy",
++    name: "ae_rabbit_hole",
++    type: "python",
++    handler: "ae_omni_policies.rabbit_hole.rabbit_hole",
++    factory_params: { hours: 4, turns: 60 },
++    enabled: true,
++    created_at: 1,
++    updated_at: null,
++    created_by: null,
++    ...overrides,
++  };
++}
++
++const FACTORY: PolicyRegistryEntry = {
++  handler: "ae_omni_policies.rabbit_hole.rabbit_hole",
++  kind: "factory",
++  name: "AE Rabbit Hole",
++  description: "",
++  params_schema: { type: "object", properties: { hours: { type: "number" } } },
++};
++
++describe("aePolicyFormValues", () => {
++  it("turns stored params into the dialog's strings", () => {
++    expect(
++      aePolicyFormValues({
++        hours: 4,
++        annotate_prompt: false,
++        mode: "warn",
++        models: ["opus", "sonnet"],
++        tool_points: { web_search: 10 },
++        unset: null,
++      }),
++    ).toEqual({
++      hours: "4",
++      annotate_prompt: "false",
++      mode: "warn",
++      models: "opus,sonnet",
++      tool_points: '{"web_search":10}',
++    });
++  });
++
++  it("shows objects inside a list as JSON", () => {
++    expect(aePolicyFormValues({ write_paths: [{ path: "/tmp", mode: "rw" }] })).toEqual({
++      write_paths: '{"path":"/tmp","mode":"rw"}',
++    });
++  });
++
++  it("gives an empty form for no params", () => {
++    expect(aePolicyFormValues(null)).toEqual({});
++    expect(aePolicyFormValues(undefined)).toEqual({});
++  });
++});
++
++describe("aePolicyEditable", () => {
++  it("allows a stored factory policy with parameters", () => {
++    expect(aePolicyEditable(stored(), FACTORY)).toBe(true);
++  });
++
++  it("refuses a callable, an unknown handler, or a schema without parameters", () => {
++    expect(aePolicyEditable(stored(), { ...FACTORY, kind: "callable", params_schema: null })).toBe(
++      false,
++    );
++    expect(aePolicyEditable(stored(), undefined)).toBe(false);
++    expect(aePolicyEditable(stored(), { ...FACTORY, params_schema: { properties: {} } })).toBe(
++      false,
++    );
++  });
++
++  it("refuses a config-file policy and a row without an id", () => {
++    expect(aePolicyEditable(stored({ id: null, source: "config" }), FACTORY)).toBe(false);
++    expect(aePolicyEditable(stored({ id: null }), FACTORY)).toBe(false);
++  });
++});
++
++describe("aeEditedParams", () => {
++  // Values the dialog's strings cannot carry back: an empty list, numbers and
++  // objects in a list, an item with a comma, and a key the schema no longer lists.
++  const STORED = {
++    hours: 4,
++    write_paths: [],
++    ask_thresholds_usd: [1, 2.5],
++    tags: ["a,b"],
++    mounts: [{ path: "/tmp" }],
++    retired_key: "kept",
++  };
++
++  it("keeps every untouched value exactly as stored", () => {
++    const form = aePolicyFormValues(STORED);
++    expect(aeEditedParams(STORED, form, { hours: 4, tags: ["a", "b"] })).toEqual(STORED);
++  });
++
++  it("takes a changed field from the dialog and leaves the rest", () => {
++    const form = { ...aePolicyFormValues(STORED), hours: "6" };
++    expect(aeEditedParams(STORED, form, { hours: 6, tags: ["a", "b"] })).toEqual({
++      ...STORED,
++      hours: 6,
++    });
++  });
++
++  it("leaves a cleared field out so the factory default applies", () => {
++    const form = { ...aePolicyFormValues(STORED), hours: "" };
++    const { hours: _cleared, ...rest } = STORED;
++    expect(aeEditedParams(STORED, form, { tags: ["a", "b"] })).toEqual(rest);
++  });
++
++  it("adds a field the stored params did not have", () => {
++    expect(
++      aeEditedParams({ hours: 4 }, { hours: "4", turns: "80" }, { hours: 4, turns: 80 }),
++    ).toEqual({ hours: 4, turns: 80 });
++  });
++});
+diff --git a/web/src/lib/aePolicyEdit.ts b/web/src/lib/aePolicyEdit.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..90c753a8c7bd2a020aea0f82c4088229f7597fed
+--- /dev/null
++++ b/web/src/lib/aePolicyEdit.ts
+@@ -0,0 +1,67 @@
++/**
++ * Editing a global policy's parameters on the Global Policies page (AE patch).
++ *
++ * The add dialog holds every parameter as a string; these helpers turn a stored
++ * policy's `factory_params` back into those strings and decide which policies
++ * have parameters to edit.
++ */
++
++import type { DefaultPolicy } from "@/hooks/useDefaultPolicies";
++import type { PolicyRegistryEntry } from "@/hooks/usePolicies";
++import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
++
++/** Tabler's `pencil` (@tabler/icons 3.46.0), inlined for the Edit button. */
++export const AE_PENCIL_ICON: AeTablerIconNode = [
++  ["path", { d: "M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" }],
++  ["path", { d: "M13.5 6.5l4 4" }],
++];
++
++function formText(value: unknown): string {
++  return typeof value === "object" && value !== null ? JSON.stringify(value) : String(value);
++}
++
++/**
++ * A stored policy's params as the dialog's form strings. Arrays join with ","
++ * and no space, because the multi-select chips split on "," without trimming;
++ * objects become JSON, as the object field expects.
++ */
++export function aePolicyFormValues(
++  params: Record<string, unknown> | null | undefined,
++): Record<string, string> {
++  const values: Record<string, string> = {};
++  for (const [key, value] of Object.entries(params ?? {})) {
++    if (value === null || value === undefined) continue;
++    values[key] = Array.isArray(value) ? value.map(formText).join(",") : formText(value);
++  }
++  return values;
++}
++
++/**
++ * The params an edit saves. The form strings cannot carry every stored value
++ * back (an empty list, numbers in a list, an item with a comma), so a field
++ * whose text still matches its prefill keeps the stored value exactly, as do
++ * stored keys the form does not show. A changed field takes the dialog's
++ * coerced value, and a cleared one is left out, so the factory's default applies.
++ */
++export function aeEditedParams(
++  stored: Record<string, unknown> | null | undefined,
++  form: Record<string, string>,
++  coerced: Record<string, unknown>,
++): Record<string, unknown> {
++  const prefill = aePolicyFormValues(stored);
++  const params: Record<string, unknown> = {};
++  for (const [key, value] of Object.entries(stored ?? {})) {
++    if (form[key] === prefill[key]) params[key] = value;
++  }
++  for (const [key, value] of Object.entries(coerced)) {
++    if (form[key] !== prefill[key]) params[key] = value;
++  }
++  return params;
++}
++
++/** Whether a card offers Edit: a stored factory policy whose schema has parameters. */
++export function aePolicyEditable(policy: DefaultPolicy, entry?: PolicyRegistryEntry): boolean {
++  if (policy.id === null || policy.source === "config" || entry?.kind !== "factory") return false;
++  const schema = entry.params_schema as { properties?: Record<string, unknown> } | null;
++  return Object.keys(schema?.properties ?? {}).length > 0;
++}
+diff --git a/web/src/pages/PoliciesPage.aeEdit.test.tsx b/web/src/pages/PoliciesPage.aeEdit.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fcae098631cfb8b3bc04550f2114487d9fe8145
+--- /dev/null
++++ b/web/src/pages/PoliciesPage.aeEdit.test.tsx
+@@ -0,0 +1,259 @@
++// Editing a global policy's parameters on the PoliciesPage (AE patch): the
++// pencil on stored factory policies, the add dialog in edit mode prefilled
++// from factory_params, and the PATCH it sends. Same mocking as
++// PoliciesPage.test.tsx: the identity probe and the react-query hooks.
++
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { PoliciesPage } from "./PoliciesPage";
++import * as identity from "@/lib/identity";
++import * as defaultPolicies from "@/hooks/useDefaultPolicies";
++import * as policies from "@/hooks/usePolicies";
++
++vi.mock("@/lib/CapabilitiesContext", () => ({
++  useServerInfo: () => ({
++    accounts_enabled: true,
++    login_url: null,
++    server_version: "0.3.0.dev0",
++    single_user: false,
++  }),
++}));
++vi.mock("@/lib/identity", () => ({
++  resolveIdentity: vi.fn(),
++  getCurrentIsAdmin: vi.fn(),
++}));
++vi.mock("@/hooks/useDefaultPolicies", () => ({
++  useDefaultPolicies: vi.fn(),
++  useAddDefaultPolicy: vi.fn(),
++  useUpdateDefaultPolicy: vi.fn(),
++  useDeleteDefaultPolicy: vi.fn(),
++}));
++vi.mock("@/hooks/usePolicies", () => ({ usePolicyRegistry: vi.fn() }));
++
++const addMutate = vi.fn();
++const updateMutate = vi.fn();
++const deleteMutate = vi.fn();
++
++const RABBIT_HOLE = {
++  handler: "ae_omni_policies.rabbit_hole.rabbit_hole",
++  kind: "factory",
++  name: "AE Rabbit Hole",
++  description: "One ASK per session past `hours` or `turns`.",
++  params_schema: {
++    type: "object",
++    properties: {
++      hours: { type: "number", default: 4, minimum: 0, description: "Hours before the ask." },
++      turns: { type: "integer", default: 60, minimum: 0, description: "Prompts before it." },
++    },
++  },
++};
++const SLOT_CAP = {
++  handler: "ae_omni_policies.slot_cap.slot_cap",
++  kind: "factory",
++  name: "AE Slot Cap",
++  description: "The slot rule.",
++  params_schema: {
++    type: "object",
++    properties: {
++      limit: { type: "integer", default: 3, minimum: 1, description: "Leave unset." },
++      mode: { type: "string", enum: ["warn", "block"], default: "warn" },
++      lot_url: { type: "string" },
++    },
++  },
++};
++const HURRY = {
++  handler: "ae_omni_policies.hurry.hurry_modes",
++  kind: "callable",
++  name: "AE Hurry Modes",
++  description: "",
++  params_schema: null,
++};
++
++function policy(overrides: Record<string, unknown>) {
++  return {
++    id: "p1",
++    object: "default_policy",
++    name: "p",
++    type: "python",
++    handler: "h",
++    factory_params: null,
++    enabled: true,
++    created_at: 1,
++    updated_at: null,
++    created_by: null,
++    ...overrides,
++  };
++}
++
++const POLICIES = [
++  policy({
++    id: "r1",
++    name: "ae_rabbit_hole",
++    handler: RABBIT_HOLE.handler,
++    factory_params: { hours: 4, turns: 60 },
++  }),
++  policy({
++    id: "s1",
++    name: "ae_slot_cap",
++    handler: SLOT_CAP.handler,
++    factory_params: { mode: "warn", lot_url: "/lot" },
++  }),
++  policy({ id: "h1", name: "ae_hurry_modes", handler: HURRY.handler }),
++  policy({
++    id: null,
++    source: "config",
++    name: "from_config",
++    handler: RABBIT_HOLE.handler,
++    factory_params: { hours: 1 },
++  }),
++];
++
++function mutationStub(mutate: ReturnType<typeof vi.fn>) {
++  mutate.mockImplementation((_arg: unknown, opts?: { onSuccess?: () => void }) =>
++    opts?.onSuccess?.(),
++  );
++  return { mutate, isPending: false, isError: false, error: null };
++}
++
++function renderPage() {
++  return render(
++    <MemoryRouter>
++      <PoliciesPage />
++    </MemoryRouter>,
++  );
++}
++
++async function openEdit(name: string) {
++  renderPage();
++  fireEvent.click(await screen.findByRole("button", { name: `Edit ${name}` }));
++  await screen.findByText("Edit Global Policy");
++}
++
++beforeEach(() => {
++  vi.mocked(identity.resolveIdentity).mockResolvedValue("admin");
++  vi.mocked(identity.getCurrentIsAdmin).mockReturnValue(true);
++  vi.mocked(defaultPolicies.useDefaultPolicies).mockReturnValue({
++    data: POLICIES,
++    refetch: vi.fn(),
++  } as never);
++  vi.mocked(policies.usePolicyRegistry).mockReturnValue({
++    data: [RABBIT_HOLE, SLOT_CAP, HURRY],
++  } as never);
++  vi.mocked(defaultPolicies.useAddDefaultPolicy).mockReturnValue(mutationStub(addMutate) as never);
++  vi.mocked(defaultPolicies.useUpdateDefaultPolicy).mockReturnValue(
++    mutationStub(updateMutate) as never,
++  );
++  vi.mocked(defaultPolicies.useDeleteDefaultPolicy).mockReturnValue(
++    mutationStub(deleteMutate) as never,
++  );
++});
++
++afterEach(() => {
++  cleanup();
++  vi.clearAllMocks();
++});
++
++describe("PoliciesPage editing a policy's parameters", () => {
++  it("offers Edit only on stored policies that have parameters", async () => {
++    renderPage();
++    expect(await screen.findByRole("button", { name: "Edit ae_rabbit_hole" })).toBeInTheDocument();
++    expect(screen.getByRole("button", { name: "Edit ae_slot_cap" })).toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Edit ae_hurry_modes" })).toBeNull();
++    expect(screen.queryByRole("button", { name: "Edit from_config" })).toBeNull();
++  });
++
++  it("opens the dialog prefilled, with no picker and no Change link", async () => {
++    await openEdit("ae_rabbit_hole");
++    expect(screen.getByDisplayValue("4")).toBeInTheDocument();
++    expect(screen.getByDisplayValue("60")).toBeInTheDocument();
++    expect(screen.getByDisplayValue("ae_rabbit_hole")).toBeDisabled();
++    expect(screen.queryByPlaceholderText("Filter policies...")).toBeNull();
++    expect(screen.queryByRole("button", { name: "Change" })).toBeNull();
++    expect(screen.getByRole("button", { name: "Save" })).toBeInTheDocument();
++  });
++
++  it("saves the edited params as a PATCH and closes", async () => {
++    await openEdit("ae_rabbit_hole");
++    fireEvent.change(screen.getByDisplayValue("60"), { target: { value: "80" } });
++    fireEvent.click(screen.getByRole("button", { name: "Save" }));
++    expect(updateMutate).toHaveBeenCalledWith(
++      { policyId: "r1", factory_params: { hours: 4, turns: 80 } },
++      expect.anything(),
++    );
++    await waitFor(() => expect(screen.queryByText("Edit Global Policy")).toBeNull());
++    expect(addMutate).not.toHaveBeenCalled();
++  });
++
++  it("leaves a blank slot cap limit out of the params", async () => {
++    await openEdit("ae_slot_cap");
++    fireEvent.change(screen.getByDisplayValue("warn"), { target: { value: "block" } });
++    fireEvent.click(screen.getByRole("button", { name: "Save" }));
++    expect(updateMutate).toHaveBeenCalledWith(
++      { policyId: "s1", factory_params: { mode: "block", lot_url: "/lot" } },
++      expect.anything(),
++    );
++  });
++
++  it("saves untouched values exactly as stored", async () => {
++    // An empty list and a key the schema no longer lists cannot round-trip
++    // through the form's strings; editing another field must keep them.
++    const sandbox = {
++      ...POLICIES[0],
++      id: "x1",
++      name: "sandbox",
++      handler: "omnigent.policies.sandbox",
++      factory_params: { hours: 4, write_paths: [], retired: "kept" },
++    };
++    vi.mocked(defaultPolicies.useDefaultPolicies).mockReturnValue({
++      data: [sandbox],
++      refetch: vi.fn(),
++    } as never);
++    vi.mocked(policies.usePolicyRegistry).mockReturnValue({
++      data: [
++        {
++          ...RABBIT_HOLE,
++          handler: "omnigent.policies.sandbox",
++          params_schema: {
++            type: "object",
++            properties: {
++              hours: { type: "number" },
++              write_paths: { type: "array", items: { type: "string" } },
++            },
++          },
++        },
++      ],
++    } as never);
++    await openEdit("sandbox");
++    fireEvent.change(screen.getByDisplayValue("4"), { target: { value: "6" } });
++    fireEvent.click(screen.getByRole("button", { name: "Save" }));
++    expect(updateMutate).toHaveBeenCalledWith(
++      { policyId: "x1", factory_params: { hours: 6, write_paths: [], retired: "kept" } },
++      expect.anything(),
++    );
++  });
++
++  it("closes on Cancel without saving", async () => {
++    await openEdit("ae_rabbit_hole");
++    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
++    await waitFor(() => expect(screen.queryByText("Edit Global Policy")).toBeNull());
++    expect(updateMutate).not.toHaveBeenCalled();
++  });
++
++  it("shows the server's reason when the save is refused", async () => {
++    vi.mocked(defaultPolicies.useUpdateDefaultPolicy).mockReturnValue({
++      mutate: updateMutate,
++      isPending: false,
++      isError: true,
++      error: new Error("Policy 'ae_rabbit_hole' rejected these params: hours must be >= 0."),
++    } as never);
++    await openEdit("ae_rabbit_hole");
++    expect(screen.getByRole("alert")).toHaveTextContent("hours must be >= 0");
++  });
++
++  it("keeps the switch sending only the enabled flag", async () => {
++    renderPage();
++    fireEvent.click(await screen.findByRole("switch", { name: "Toggle ae_rabbit_hole" }));
++    expect(updateMutate).toHaveBeenCalledWith({ policyId: "r1", enabled: false });
++  });
++});
+diff --git a/web/src/pages/PoliciesPage.tsx b/web/src/pages/PoliciesPage.tsx
+index e8cfe81c51acc734578465c6b9c8a2ee939df039..e1c7a9d3f0a1a29e1de6cad102d7d3d224b44ea9 100644
+--- a/web/src/pages/PoliciesPage.tsx
++++ b/web/src/pages/PoliciesPage.tsx
+@@ -2,7 +2,7 @@
+  * Admin default-policies management page (``/settings/policies``; the legacy
+  * ``/policies`` path redirects here). Rendered as a Settings sub-category.
+  *
+- * Lists every global default policy and lets admins add, toggle,
++ * Lists every global default policy and lets admins add, toggle, edit
+  * and remove them. The add-policy dialog reuses the same registry-
+  * driven picker as the per-session policy UI in AgentInfo.
+  *
+@@ -14,6 +14,7 @@
+ import { useCallback, useEffect, useMemo, useState } from "react";
+ import { PlusIcon, RefreshCwIcon, ShieldCheckIcon, TrashIcon, XIcon } from "lucide-react";
+ import { PageScroll } from "@/components/PageScroll";
++import { AePolicyEditButton } from "@/components/AePolicyEditButton";
+ import { ModelValueCombobox } from "@/components/ModelValueCombobox";
+ import { SettingsLabel } from "@/components/SettingsLabel";
+ import { Button } from "@/components/ui/button";
+@@ -34,6 +35,7 @@ import {
+   type DefaultPolicy,
+ } from "@/hooks/useDefaultPolicies";
+ import { usePolicyRegistry, type PolicyRegistryEntry } from "@/hooks/usePolicies";
++import { aeEditedParams, aePolicyFormValues } from "@/lib/aePolicyEdit";
+ import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+ import { getCurrentIsAdmin, resolveIdentity } from "@/lib/identity";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+@@ -48,17 +50,24 @@ function AddDefaultPolicyDialog({
+   registry,
+   open,
+   onOpenChange,
++  editing,
+ }: {
+   registry: PolicyRegistryEntry[];
+   open: boolean;
+   onOpenChange: (open: boolean) => void;
++  /** A stored policy whose params this dialog edits instead of adding one. */
++  editing?: DefaultPolicy;
+ }) {
+-  const [selected, setSelected] = useState<string>("");
++  const [selected, setSelected] = useState<string>(editing?.handler ?? "");
+   const [filter, setFilter] = useState("");
+-  const [policyName, setPolicyName] = useState<string>("");
+-  const [factoryParams, setFactoryParams] = useState<Record<string, string>>({});
++  const [policyName, setPolicyName] = useState<string>(editing?.name ?? "");
++  const [factoryParams, setFactoryParams] = useState<Record<string, string>>(() =>
++    aePolicyFormValues(editing?.factory_params),
++  );
+   const [paramError, setParamError] = useState<string | null>(null);
+   const addPolicy = useAddDefaultPolicy();
++  const updatePolicy = useUpdateDefaultPolicy();
++  const submit = editing ? updatePolicy : addPolicy;
+ 
+   const entry = registry.find((r) => r.handler === selected);
+   const rawSchema = entry?.params_schema as
+@@ -115,6 +124,15 @@ function AddDefaultPolicyDialog({
+       parsedParams = result.params;
+     }
+     setParamError(null);
++    if (editing) {
++      if (!editing.id) return;
++      const params = aeEditedParams(editing.factory_params, factoryParams, parsedParams ?? {});
++      updatePolicy.mutate(
++        { policyId: editing.id, factory_params: params },
++        { onSuccess: () => onOpenChange(false) },
++      );
++      return;
++    }
+     const includeFactoryParams =
+       entry.kind === "factory" ? { factory_params: parsedParams ?? {} } : {};
+     addPolicy.mutate(
+@@ -151,8 +169,12 @@ function AddDefaultPolicyDialog({
+     >
+       <DialogContent className="max-h-[80vh] overflow-y-auto sm:max-w-lg">
+         <DialogHeader>
+-          <DialogTitle>Add Global Policy</DialogTitle>
+-          <DialogDescription>Choose a policy to apply globally to all sessions.</DialogDescription>
++          <DialogTitle>{editing ? "Edit Global Policy" : "Add Global Policy"}</DialogTitle>
++          <DialogDescription>
++            {editing
++              ? "Change this policy's parameters for all sessions."
++              : "Choose a policy to apply globally to all sessions."}
++          </DialogDescription>
+         </DialogHeader>
+         <div className="min-w-0 space-y-3 pt-1">
+           {!selected &&
+@@ -206,6 +228,7 @@ function AddDefaultPolicyDialog({
+                 <span className="text-ui font-medium">{entry.name}</span>
+                 <button
+                   type="button"
++                  hidden={editing !== undefined}
+                   onClick={() => {
+                     setSelected("");
+                     setPolicyName("");
+@@ -231,7 +254,8 @@ function AddDefaultPolicyDialog({
+                 type="text"
+                 value={policyName}
+                 onChange={(e) => setPolicyName(e.target.value)}
+-                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui"
++                disabled={editing !== undefined}
++                className="mt-0.5 w-full rounded border border-border bg-background px-2 py-1.5 text-ui disabled:cursor-not-allowed disabled:text-muted-foreground"
+               />
+             </div>
+           )}
+@@ -378,12 +402,12 @@ function AddDefaultPolicyDialog({
+               })}
+             </div>
+           )}
+-          {(paramError || addPolicy.isError) && (
++          {(paramError || submit.isError) && (
+             <div
+               role="alert"
+               className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-ui text-destructive"
+             >
+-              {paramError ?? addPolicy.error?.message}
++              {paramError ?? submit.error?.message}
+             </div>
+           )}
+           <div className="flex justify-end gap-2 pt-1">
+@@ -393,7 +417,7 @@ function AddDefaultPolicyDialog({
+               onClick={() => {
+                 // With a policy selected, Cancel steps back to the list so the
+                 // user can pick another; only close the dialog from the list.
+-                if (selected) {
++                if (selected && !editing) {
+                   setSelected("");
+                   setFactoryParams({});
+                   setParamError(null);
+@@ -407,10 +431,10 @@ function AddDefaultPolicyDialog({
+             <Button
+               type="button"
+               onClick={handleAdd}
+-              loading={addPolicy.isPending}
++              loading={submit.isPending}
+               disabled={!selected}
+             >
+-              Add
++              {editing ? "Save" : "Add"}
+             </Button>
+           </div>
+         </div>
+@@ -435,6 +459,7 @@ export function PoliciesPage() {
+   const updatePolicy = useUpdateDefaultPolicy();
+   const deletePolicy = useDeleteDefaultPolicy();
+   const [addOpen, setAddOpen] = useState(false);
++  const [editing, setEditing] = useState<DefaultPolicy | null>(null);
+   const [deleteCandidate, setDeleteCandidate] = useState<DefaultPolicy | null>(null);
+   const [pendingAction, setPendingAction] = useState(false);
+   const [actionError, setActionError] = useState<string | null>(null);
+@@ -547,6 +572,7 @@ export function PoliciesPage() {
+                   <div className="flex shrink-0 items-center gap-2">
+                     {p.source !== "config" ? (
+                       <>
++                        <AePolicyEditButton policy={p} entry={registryEntry} onEdit={setEditing} />
+                         <Switch
+                           checked={p.enabled}
+                           onCheckedChange={(checked) =>
+@@ -608,6 +634,15 @@ export function PoliciesPage() {
+       </div>
+ 
+       <AddDefaultPolicyDialog registry={registry} open={addOpen} onOpenChange={setAddOpen} />
++      {editing && (
++        <AddDefaultPolicyDialog
++          key={editing.id ?? editing.name}
++          registry={registry}
++          editing={editing}
++          open
++          onOpenChange={(open) => !open && setEditing(null)}
++        />
++      )}
+ 
+       {/* Delete confirmation */}
+       <Dialog

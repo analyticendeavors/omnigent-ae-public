@@ -1,0 +1,1268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 06:29:57 -0700
+Subject: [PATCH 067/148] [ae-patch] Compact account controls and refresh
+ session settings on handoff
+
+---
+ omnigent/harnesses/claude_native/main.py      |   6 +-
+ omnigent/harnesses/codex_native/forwarder.py  |  26 ++--
+ omnigent/host/connect.py                      |  33 ++++-
+ omnigent/onboarding/claude_accounts.py        |  43 ++++--
+ omnigent/runner/native/orchestration.py       |  13 +-
+ omnigent/server/routes/_sessions/helpers.py   |   6 +
+ .../codex_native/forwarder/test_settings.py   |  42 ++++++
+ tests/host/test_connect.py                    |  34 +++++
+ tests/onboarding/test_claude_accounts.py      |  47 +++++++
+ web/src/pages/ChatPage.composer.test.tsx      | 100 ++++++++++++--
+ web/src/pages/ChatPage.tsx                    | 124 ++++++++++++++----
+ web/src/shell/ClaudeAccounts.test.tsx         |  37 ++++++
+ web/src/shell/ClaudeAccounts.tsx              |  95 +++++++++-----
+ web/src/shell/NewChatDialog.tsx               |   4 +-
+ web/src/store/chatStore.test.ts               | 106 ++++++++++++++-
+ web/src/store/chatStore.ts                    |  14 +-
+ 16 files changed, 629 insertions(+), 101 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index 7a9ad1f6f9a68912866a618714ffe478d2f7330b..f0bdc28a352fa8f4a41952b1743e710a7a55c284 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -1510,6 +1510,8 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
+ 
+ def build_native_claude_terminal_env(
+     claude_config: ClaudeNativeUcodeConfig | None,
++    *,
++    account_name: str | None = None,
+ ) -> dict[str, str]:
+     """
+     Build env overrides for a native Claude Code terminal process.
+@@ -1547,10 +1549,12 @@ def build_native_claude_terminal_env(
+                 f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
+                 "Claude Code via the helper, not the environment."
+             )
++    if account_name is not None and claude_config is not None:
++        raise RuntimeError("Claude account selection conflicts with provider authentication.")
+     if claude_config is None:
+         from omnigent.onboarding.claude_accounts import account_env_for_launch
+ 
+-        terminal_env.update(account_env_for_launch(terminal_env))
++        terminal_env.update(account_env_for_launch(terminal_env, account_name=account_name))
+     return terminal_env
+ 
+ 
+diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
+index e13966450cebf5f5c2142b1e2bd31df9c9bf2e0c..8b1ca9e1b8d4500582e7dcb17cb6aada1c2a0d84 100644
+--- a/omnigent/harnesses/codex_native/forwarder.py
++++ b/omnigent/harnesses/codex_native/forwarder.py
+@@ -371,6 +371,8 @@ class _CodexForwarderState:
+         against sending ``null`` before the first successful config read).
+     :param effort: Latest known Codex reasoning effort for this thread, e.g.
+         ``"medium"``. ``None`` means Codex is using its model/default effort.
++    :param effort_known: Whether Codex or its config explicitly supplied an
++        effort value, including ``None`` for a default-effort clear.
+     :param posted_effort: Last reasoning effort already mirrored to Omnigent
+         via ``external_reasoning_effort_change``. ``None`` is a valid mirrored
+         value, so ``posted_effort_known`` tracks whether the baseline has been
+@@ -452,6 +454,7 @@ class _CodexForwarderState:
+     developer_instructions: str | None = None
+     developer_instructions_known: bool = False
+     effort: str | None = None
++    effort_known: bool = False
+     posted_effort: str | None = None
+     posted_effort_known: bool = False
+     # The config.toml effort as of the last _refresh_effort_from_config read,
+@@ -512,6 +515,7 @@ class _CodexForwarderState:
+         if not isinstance(result, dict):
+             return
+         self._note_model_fields(result)
++        self._note_effort_fields(result)
+         self._note_approval_mode_fields(result)
+         # Do NOT seed ``posted_model`` here. Omnigent must learn the session's
+         # ACTUAL model — including the spawn default — because the cost-budget
+@@ -916,6 +920,7 @@ class _CodexForwarderState:
+             effort = payload[key]
+             if effort is None or (isinstance(effort, str) and effort):
+                 self.effort = effort
++                self.effort_known = True
+             return
+ 
+     def _note_collaboration_mode_fields(self, payload: _JsonObject) -> None:
+@@ -2673,12 +2678,9 @@ async def _subscribe_until_ready_inner(
+             # starts, so that turn's ``turn/started`` is missed: mirror the
+             # config.toml effort here too (an in-TUI ``/model`` effort change
+             # before the first turn would otherwise never reach the composer).
+-            # Gated on a seen config effort: without one the unseeded baseline
+-            # would mirror a spurious ``None`` on every session. On a fresh
+-            # session this first sync posts the launch effort itself — a
+-            # redundant-but-harmless mirror of the value Omnigent launched
+-            # with, not a terminal change.
+-            if forwarder_state.last_config_effort is not None:
++            # Sync only an observed effort; an absent value must not clear the
++            # session's persisted choice.
++            if forwarder_state.effort_known:
+                 await _sync_reasoning_effort_change(
+                     ap_client, session_id=session_id, forwarder_state=forwarder_state
+                 )
+@@ -3377,6 +3379,7 @@ def _refresh_effort_from_config(bridge_dir: Path, forwarder_state: _CodexForward
+     # "unchanged" and the live B wins. Narrow race; the next real change heals it.
+     if config_effort != forwarder_state.last_config_effort:
+         forwarder_state.effort = config_effort
++        forwarder_state.effort_known = True
+     forwarder_state.last_config_effort = config_effort
+ 
+ 
+@@ -3460,6 +3463,8 @@ async def _sync_reasoning_effort_change(
+     :returns: None.
+     """
+     effort = forwarder_state.effort
++    if effort is None and not forwarder_state.effort_known:
++        return
+     if forwarder_state.posted_effort_known and effort == forwarder_state.posted_effort:
+         return
+     response = await _post_session_event(
+@@ -3719,12 +3724,9 @@ async def _maybe_handle_turn_event(
+                 await _sync_model_change(
+                     client, session_id=session_id, forwarder_state=forwarder_state
+                 )
+-                # Only sync once config.toml has revealed an effort: without one the
+-                # unseeded baseline would mirror a spurious ``None`` on every session.
+-                # A fresh session's first turn/started posts the launch effort itself
+-                # (baseline ``None`` → changed) — redundant but harmless, not the
+-                # terminal-change path.
+-                if forwarder_state.last_config_effort is not None:
++                # An absent config value is not a clear; wait for an observed
++                # effort before mirroring into the session.
++                if forwarder_state.effort_known:
+                     await _sync_reasoning_effort_change(
+                         client,
+                         session_id=session_id,
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index b6a01b7a4184fb524dc133ff68e1ff9081393520..25de1f7ea472d82ad5ae3caab41de155793d0912 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -3192,15 +3192,44 @@ class HostProcess:
+         :param frame: The detect request (carries only a request id).
+         :returns: Result frame with the non-secret credential descriptors.
+         """
+-        from omnigent.onboarding.claude_accounts import account_descriptors
++        from omnigent.onboarding.claude_accounts import (
++            CLAUDE_PROVIDER_ENV_KEYS,
++            account_descriptors,
++        )
+ 
+         detected = detect_adoptable_credentials()
++        provider_env_descriptors: list[dict[str, str | None]] = [
++            {"family": "claude-provider-env", "source": key, "env_var": key}
++            for key in CLAUDE_PROVIDER_ENV_KEYS
++            if os.environ.get(key)
++        ]
++        from omnigent.harnesses.claude_native.main import resolve_native_claude_config
++
++        try:
++            provider_bound = (
++                resolve_native_claude_config(spec=None, refresh_models=False) is not None
++            )
++        except Exception:  # noqa: BLE001 - Detection fails closed for provider configuration errors.
++            provider_bound = True
++        provider_config_descriptors: list[dict[str, str | None]] = (
++            [
++                {
++                    "family": "claude-provider-config",
++                    "source": "Configured provider",
++                    "env_var": None,
++                }
++            ]
++            if provider_bound
++            else []
++        )
+         return HostDetectCredentialsResultFrame(
+             request_id=frame.request_id,
+             credentials=[
+                 {"family": d.family, "source": d.source, "env_var": d.env_var} for d in detected
+             ]
+-            + account_descriptors(),
++            + account_descriptors()
++            + provider_env_descriptors
++            + provider_config_descriptors,
+         )
+ 
+     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+index ad8c391c2caee6e842efe4357aa3cf7c14ffe2e0..c9d9fe0c63c687775d3c47685d501eee8753f3fe 100644
+--- a/omnigent/onboarding/claude_accounts.py
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -12,6 +12,15 @@ from omnigent.onboarding import secrets
+ from omnigent.onboarding.harness_auth import StoreCredentialResult
+ from omnigent.onboarding.provider_config import _config_path
+ 
++CLAUDE_ACCOUNT_LABEL_KEY = "omnigent.claude_native.account"
++CLAUDE_PROVIDER_ENV_KEYS = (
++    "ANTHROPIC_BASE_URL",
++    "ANTHROPIC_API_KEY",
++    "ANTHROPIC_AUTH_TOKEN",
++    "CLAUDE_CODE_USE_BEDROCK",
++    "CLAUDE_CODE_USE_VERTEX",
++)
++
+ 
+ def _path() -> Path:
+     return Path(_config_path()).with_name("claude-accounts.json")
+@@ -53,13 +62,20 @@ def account_descriptors() -> list[dict[str, str | None]]:
+         state = _read()
+     except RuntimeError:
+         return []
++    available = []
++    for name in state["accounts"]:
++        try:
++            if secrets.load_secret(f"claude-oauth-{name}"):
++                available.append(name)
++        except Exception:
++            continue
+     return [
+         {
+             "family": "claude-oauth-active" if name == state["active"] else "claude-oauth",
+             "source": state.get("labels", {}).get(name, name or "Default CLI account"),
+             "env_var": name,
+         }
+-        for name in ["", *state["accounts"]]
++        for name in ["", *available]
+     ]
+ 
+ 
+@@ -126,10 +142,14 @@ def _change_account(
+         )
+ 
+ 
+-def account_env() -> dict[str, str]:
+-    name = _read()["active"]
++def account_env(name: str | None = None) -> dict[str, str]:
++    state = _read()
++    if name is None:
++        name = state["active"]
+     if not name:
+         return {}
++    if name not in state["accounts"]:
++        raise RuntimeError("The selected Claude account is unavailable on this host.")
+     token = secrets.load_secret(f"claude-oauth-{name}")
+     if not token:
+         raise RuntimeError(
+@@ -138,15 +158,12 @@ def account_env() -> dict[str, str]:
+     return {"CLAUDE_CODE_OAUTH_TOKEN": token, "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
+ 
+ 
+-def account_env_for_launch(env: dict[str, str]) -> dict[str, str]:
++def account_env_for_launch(
++    env: dict[str, str], *, account_name: str | None = None
++) -> dict[str, str]:
+     """Apply subscription choice only when no explicit provider owns authentication."""
+-    provider_keys = (
+-        "ANTHROPIC_BASE_URL",
+-        "ANTHROPIC_API_KEY",
+-        "ANTHROPIC_AUTH_TOKEN",
+-        "CLAUDE_CODE_USE_BEDROCK",
+-        "CLAUDE_CODE_USE_VERTEX",
+-    )
+-    if any(env.get(key, os.environ.get(key)) for key in provider_keys):
++    if any(env.get(key, os.environ.get(key)) for key in CLAUDE_PROVIDER_ENV_KEYS):
++        if account_name is not None:
++            raise RuntimeError("Claude account selection conflicts with provider authentication.")
+         return {}
+-    return account_env()
++    return account_env(account_name)
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index e2cac5e78114bf08c64549da71e49530c9326142..f71e68137f27f2c12ceec24e716a392a1845edb9 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -7482,6 +7482,7 @@ def _build_claude_native_base_args(
+ 
+ def _claude_terminal_env_unset(
+     claude_config: ClaudeNativeUcodeConfig | None,
++    account_name: str | None = None,
+ ) -> list[str]:
+     """
+     Env vars to strip from a native Claude terminal child.
+@@ -7503,6 +7504,8 @@ def _claude_terminal_env_unset(
+         ``["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE", "ANTHROPIC_API_KEY"]``.
+     """
+     env_unset = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
++    if account_name == "":
++        env_unset.append("CLAUDE_CODE_OAUTH_TOKEN")
+     if claude_config is not None and claude_config.api_key_helper:
+         env_unset.append("ANTHROPIC_API_KEY")
+     return env_unset
+@@ -8053,6 +8056,7 @@ class _ClaudeSessionLaunchMetadata:
+     external_session_id: str | None = None
+     fork_source_external_id: str | None = None
+     fork_carry_history: bool = False
++    claude_account: str | None = None
+     #: Both routing fields come from ``routing_class_from_snapshot``, so an
+     #: auto-harness session always reads as routing-enabled too. Deriving them
+     #: separately was the bug: a sub-agent child of a routed parent carries the
+@@ -8075,6 +8079,7 @@ def _claude_launch_metadata_from_envelope(
+     session_init: RunnerSessionInitEnvelope,
+ ) -> _ClaudeSessionLaunchMetadata:
+     """Project Claude launch metadata without server callbacks."""
++    from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.runner.subagent_routing import routing_class_from_snapshot
+     from omnigent.stores.conversation_store import (
+         FORK_CARRY_HISTORY_LABEL_KEY,
+@@ -8100,6 +8105,7 @@ def _claude_launch_metadata_from_envelope(
+             fork_source if isinstance(fork_source, str) and fork_source else None
+         ),
+         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
++        claude_account=snapshot.labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
+     )
+ 
+ 
+@@ -8108,6 +8114,7 @@ async def _load_legacy_claude_launch_metadata(
+     session_id: str,
+ ) -> _ClaudeSessionLaunchMetadata:
+     """Fetch Claude launch metadata for servers predating the init envelope."""
++    from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.runner.subagent_routing import routing_class_from_snapshot
+     from omnigent.stores.conversation_store import (
+         FORK_CARRY_HISTORY_LABEL_KEY,
+@@ -8166,6 +8173,7 @@ async def _load_legacy_claude_launch_metadata(
+             fork_source if isinstance(fork_source, str) and fork_source else None
+         ),
+         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
++        claude_account=labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
+     )
+     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
+     _logger.info(
+@@ -8462,6 +8470,7 @@ async def _auto_create_claude_terminal(
+     session_external_id = launch_metadata.external_session_id
+     fork_source_external_id = launch_metadata.fork_source_external_id
+     fork_carry_history = launch_metadata.fork_carry_history
++    claude_account = launch_metadata.claude_account
+ 
+     # The server GET may miss the external_session_id binding when the
+     # reconnect request arrives without a workspace-scoped context (the
+@@ -9001,7 +9010,7 @@ async def _auto_create_claude_terminal(
+     if resolved_claude is not None:
+         validate_claude_hook_interpreter_compatibility(resolved_claude)
+ 
+-    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config)
++    claude_terminal_env_unset = _claude_terminal_env_unset(claude_config, claude_account)
+ 
+     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+@@ -9020,7 +9029,7 @@ async def _auto_create_claude_terminal(
+         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
+         # etc.) when derived. Empty provider config still forces
+         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
+-        env=build_native_claude_terminal_env(claude_config),
++        env=build_native_claude_terminal_env(claude_config, account_name=claude_account),
+         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+         # inherit this env and several build ``WorkspaceClient`` without pinning
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 60f2fa0e839518ed368844a8d261b6f15325af35..e1e67f796c1ab1b35e56a43ba18c30bf88e40fcb 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -10273,6 +10273,7 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+     """
+     if not labels:
+         return
++    from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+     from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
+ 
+@@ -10288,6 +10289,11 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
+             f"label {WORKTREE_ROOT_LABEL_KEY!r} is server-internal and cannot be set by clients",
+             code=ErrorCode.INVALID_INPUT,
+         )
++    if CLAUDE_ACCOUNT_LABEL_KEY in labels:
++        raise OmnigentError(
++            f"label {CLAUDE_ACCOUNT_LABEL_KEY!r} is server-internal and cannot be set by clients",
++            code=ErrorCode.INVALID_INPUT,
++        )
+     if _TURN_ACTOR_LABEL in labels:
+         raise OmnigentError(
+             f"label {_TURN_ACTOR_LABEL!r} is server-internal and cannot be set by clients",
+diff --git a/tests/harnesses/codex_native/forwarder/test_settings.py b/tests/harnesses/codex_native/forwarder/test_settings.py
+index 5796bf5c712624a17da5e91d3e5f1db5b3d060a1..35b02f9d88a78c3ac54d2b9123321e8e175d4dac 100644
+--- a/tests/harnesses/codex_native/forwarder/test_settings.py
++++ b/tests/harnesses/codex_native/forwarder/test_settings.py
+@@ -468,6 +468,7 @@ async def test_sync_reasoning_effort_change_posts_clear() -> None:
+     client = _RecordingClient()
+     state = fwd._CodexForwarderState(
+         effort=None,
++        effort_known=True,
+         posted_effort="high",
+         posted_effort_known=True,
+     )
+@@ -601,3 +602,44 @@ def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
+         "-c",
+         'approvals_reviewer="user"',
+     ]
++
++
++def test_resume_response_records_explicit_effort() -> None:
++    state = fwd._CodexForwarderState()
++
++    state.note_resume_response({"result": {"model": "gpt-5.4", "effort": "high"}})
++
++    assert state.effort == "high"
++    assert state.effort_known is True
++
++
++@pytest.mark.asyncio
++async def test_settings_without_effort_does_not_clear_session_effort() -> None:
++    client = _RecordingClient()
++    state = fwd._CodexForwarderState()
++    state.note_thread_settings_updated({"threadSettings": {"model": "gpt-5.4"}})
++
++    await fwd._sync_reasoning_effort_change(client, session_id="conv_x", forwarder_state=state)
++
++    assert client.posts == []
++    assert state.posted_effort_known is False
++
++
++@pytest.mark.asyncio
++async def test_explicit_null_effort_still_clears_session_effort() -> None:
++    client = _RecordingClient()
++    state = fwd._CodexForwarderState()
++    state.note_thread_settings_updated({"threadSettings": {"effort": None}})
++
++    await fwd._sync_reasoning_effort_change(client, session_id="conv_x", forwarder_state=state)
++
++    assert client.posts == [
++        (
++            "/v1/sessions/conv_x/events",
++            {
++                "type": "external_reasoning_effort_change",
++                "data": {"reasoning_effort": None},
++            },
++        )
++    ]
++    assert state.posted_effort_known is True
+diff --git a/tests/host/test_connect.py b/tests/host/test_connect.py
+index 04c66cf78397483146b0f089e8d7272ae5770c56..70929103b03a1bbd908e47ab67484efca74d5316 100644
+--- a/tests/host/test_connect.py
++++ b/tests/host/test_connect.py
+@@ -5049,11 +5049,16 @@ def test_handle_store_secret_surfaces_core_failure(monkeypatch: pytest.MonkeyPat
+ 
+ def test_handle_detect_credentials_returns_non_secret_descriptors(
+     monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
+ ) -> None:
+     """The detect handler returns the core's descriptors as plain dicts."""
+     import omnigent.host.connect as connect
++    from omnigent.harnesses.claude_native import main as claude_main
+     from omnigent.onboarding.harness_auth import DetectedCredential
+ 
++    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
++    monkeypatch.setattr(claude_main, "resolve_native_claude_config", lambda **kwargs: None)
++
+     monkeypatch.setattr(
+         connect,
+         "detect_adoptable_credentials",
+@@ -5068,6 +5073,35 @@ def test_handle_detect_credentials_returns_non_secret_descriptors(
+     ]
+ 
+ 
++def test_detect_credentials_reports_provider_env_without_value(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://private.example.invalid/token")
++    host = _make_host_process()
++    result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d2"))
++    assert {
++        "family": "claude-provider-env",
++        "source": "ANTHROPIC_BASE_URL",
++        "env_var": "ANTHROPIC_BASE_URL",
++    } in result.credentials
++    assert "private.example.invalid" not in repr(result.credentials)
++
++
++def test_detect_credentials_reports_configured_provider_without_secret(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from omnigent.harnesses.claude_native import main as claude_main
++
++    monkeypatch.setattr(claude_main, "resolve_native_claude_config", lambda **kwargs: object())
++    host = _make_host_process()
++    result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d3"))
++    assert {
++        "family": "claude-provider-config",
++        "source": "Configured provider",
++        "env_var": None,
++    } in result.credentials
++
++
+ # --- Fail-loud on permanent tunnel failures ----------------------------
+ #
+ # Before the fix, HostProcess.run() caught every connection exception and
+diff --git a/tests/onboarding/test_claude_accounts.py b/tests/onboarding/test_claude_accounts.py
+index 3272413e49abbc6af50591802dedd83ecd6f9791..746b9392fd58f8f3011b84e8827e0b1866534cec 100644
+--- a/tests/onboarding/test_claude_accounts.py
++++ b/tests/onboarding/test_claude_accounts.py
+@@ -43,6 +43,53 @@ def test_native_subscription_env_uses_selected_account():
+     assert env["ANTHROPIC_API_KEY"] == ""
+ 
+ 
++def test_session_account_choice_does_not_change_host_active_account(monkeypatch):
++    from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
++    from omnigent.runner.native.orchestration import _claude_terminal_env_unset
++
++    monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
++    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
++    monkeypatch.delenv("CLAUDE_CODE_USE_BEDROCK", raising=False)
++    monkeypatch.delenv("CLAUDE_CODE_USE_VERTEX", raising=False)
++    assert change_account("claude-oauth-add", "Work", "sk-ant-oat-work").stored
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    assert (
++        build_native_claude_terminal_env(None, account_name="Work")["CLAUDE_CODE_OAUTH_TOKEN"]
++        == "sk-ant-oat-work"
++    )
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++    assert "CLAUDE_CODE_OAUTH_TOKEN" in _claude_terminal_env_unset(None, "")
++    assert "CLAUDE_CODE_OAUTH_TOKEN" not in _claude_terminal_env_unset(None, "Work")
++    assert "CLAUDE_CODE_OAUTH_TOKEN" not in build_native_claude_terminal_env(None, account_name="")
++    inherited = {"CLAUDE_CODE_OAUTH_TOKEN": "inherited"}
++    inherited.update(build_native_claude_terminal_env(None, account_name=""))
++    for key in _claude_terminal_env_unset(None, ""):
++        inherited.pop(key, None)
++    assert "CLAUDE_CODE_OAUTH_TOKEN" not in inherited
++
++
++def test_session_account_missing_at_launch_fails(monkeypatch):
++    from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
++
++    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++    with pytest.raises(RuntimeError, match="unavailable"):
++        build_native_claude_terminal_env(None, account_name="Missing")
++
++
++def test_discovery_omits_account_when_secret_is_missing(monkeypatch):
++    from omnigent.onboarding import secrets
++
++    assert change_account("claude-oauth-add", "Work", "sk-ant-oat-work").stored
++    original = secrets.load_secret
++    monkeypatch.setattr(
++        secrets,
++        "load_secret",
++        lambda name: None if name == "claude-oauth-Work" else original(name),
++    )
++    assert all(row["env_var"] != "Work" for row in account_descriptors())
++
++
+ def test_frame_roundtrip_preserves_account_name():
+     from omnigent.host.frames import HostStoreSecretFrame, decode_host_frame, encode_host_frame
+ 
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index dd6c335cbdfef2bc521b25d8b02004074df14a88..e20ac03bda30bd23cfd4472c6cbdce0f19d3a3a5 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -1965,7 +1965,7 @@ describe("Composer model/effort label", () => {
+     expect(screen.getByTestId("composer-agent-effort-high")).toBeVisible();
+   });
+ 
+-  it("keeps Claude family aliases up front and puts extra variants under More models", async () => {
++  it("keeps the newest Claude versions in the grid and older versions under More models", async () => {
+     useChatStore.setState({ llmModel: "sonnet" });
+     renderWithTooltips(
+       <Composer
+@@ -1979,34 +1979,106 @@ describe("Composer model/effort label", () => {
+     await openSessionModels();
+     const models = screen.getByTestId("composer-agent-models");
+     expect(models.querySelector(".grid-cols-2")).toBeTruthy();
+-    expect(within(models).getByTestId("composer-agent-model-sonnet")).toHaveAttribute(
++    expect(within(models).getByTestId("composer-agent-model-sonnet_5")).toHaveTextContent(
++      "Sonnet 5",
++    );
++    expect(screen.queryByTestId("composer-agent-model-sonnet")).toBeNull();
++    fireEvent.keyDown(screen.getByTestId("composer-agent-more-models"), { key: "ArrowRight" });
++    expect(screen.getByTestId("composer-agent-model-sonnet")).toHaveTextContent("Sonnet 4.6");
++    expect(screen.getByTestId("composer-agent-model-sonnet")).toHaveAttribute(
+       "aria-checked",
+       "true",
+     );
+-    expect(screen.queryByTestId("composer-agent-model-sonnet_5")).toBeNull();
+-    fireEvent.keyDown(screen.getByTestId("composer-agent-more-models"), { key: "ArrowRight" });
+-    expect(screen.getByTestId("composer-agent-model-sonnet_5")).toHaveTextContent("Sonnet 5");
+   });
+ 
+-  it("keeps a selected extra variant visible in the primary grid", async () => {
+-    useChatStore.setState({ llmModel: "sonnet_5" });
++  it("resolves alias labels from shuffled host versions and keeps a selected old model in More", async () => {
++    useChatStore.setState({ llmModel: "opus-4-10" });
+     renderWithTooltips(
+       <Composer
+         {...composerProps({
+           showModels: true,
+           modelPickerKind: "claude",
+-          codexModelOptions: CLAUDE_MODEL_OPTIONS,
++          codexModelOptions: [
++            { id: "opus-4-10", model: "claude-opus-4-10", displayName: "Opus 4.10" },
++            { id: "opus-5-5", model: "claude-opus-5-5", displayName: "Opus 5.5" },
++            { id: "haiku-4-5", model: "claude-haiku-4-5", displayName: "Haiku 4.5" },
++            { id: "sonnet", model: "claude-sonnet-5-5", displayName: "Sonnet" },
++            { id: "opus", model: "claude-opus-5-5", displayName: "Opus" },
++            {
++              id: "opus[1m]",
++              model: "claude-opus-5-5[1m]",
++              displayName: "Opus 5.5 (1M context)",
++            },
++            { id: "sonnet-4-6", model: "claude-sonnet-4-6", displayName: "Sonnet 4.6" },
++            { id: "haiku", model: "claude-haiku-5-5", displayName: "Haiku" },
++          ],
+         })}
+       />,
+     );
+     await openSessionModels();
+-    expect(
+-      within(screen.getByTestId("composer-agent-models")).getByTestId(
+-        "composer-agent-model-sonnet_5",
+-      ),
+-    ).toHaveAttribute("aria-checked", "true");
++    const models = within(screen.getByTestId("composer-agent-models"));
++    for (const family of ["Opus", "Sonnet", "Haiku"])
++      expect(models.getByTestId(`composer-agent-model-${family.toLowerCase()}`)).toHaveTextContent(
++        `${family} 5.5`,
++      );
++    expect(screen.queryByTestId("composer-agent-model-opus-5-5")).toBeNull();
++    expect(models.getByTestId("composer-agent-model-opus[1m]")).toHaveTextContent(
++      "Opus 5.5 (1M context)",
++    );
++    expect(screen.queryByTestId("composer-agent-model-opus-4-10")).toBeNull();
++    fireEvent.keyDown(screen.getByTestId("composer-agent-more-models"), { key: "ArrowRight" });
++    expect(screen.getByTestId("composer-agent-model-opus-4-10")).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++    expect(screen.getByTestId("composer-agent-model-haiku-4-5")).toBeVisible();
++    expect(screen.getByTestId("composer-agent-model-sonnet-4-6")).toBeVisible();
+   });
+ 
++  it.each([null, "opus"])(
++    "keeps an unresolved selected alias separate from numbered choices (%s)",
++    async (selectedModel) => {
++      useChatStore.setState({ llmModel: selectedModel });
++      renderWithTooltips(
++        <Composer
++          {...composerProps({
++            showModels: true,
++            modelPickerKind: "claude",
++            codexModelOptions: [
++              { id: "opus", displayName: "Opus" },
++              { id: "opus-4-10", model: "claude-opus-4-10", displayName: "Opus 4.10" },
++              { id: "fable", displayName: "Fable" },
++              { id: "opus-5-5", model: "claude-opus-5-5", displayName: "Opus 5.5" },
++            ],
++          })}
++        />,
++      );
++      await openSessionModels();
++      const models = within(screen.getByTestId("composer-agent-models"));
++      expect(models.getByTestId("composer-agent-model-opus-5-5")).toHaveTextContent("Opus 5.5");
++      expect(models.getByTestId("composer-agent-model-opus-5-5")).toHaveAttribute(
++        "aria-checked",
++        "false",
++      );
++      expect(models.getByTestId("composer-agent-model-fable")).toHaveTextContent("Fable");
++      expect(screen.queryByTestId("composer-agent-model-opus")).toBeNull();
++      if (selectedModel) {
++        expect(models.getByTestId("composer-agent-current-model")).toHaveTextContent(
++          "Opus (current, version unknown)",
++        );
++        expect(models.getByTestId("composer-agent-current-model")).toHaveAttribute(
++          "aria-checked",
++          "true",
++        );
++      } else {
++        expect(models.queryByTestId("composer-agent-current-model")).toBeNull();
++      }
++      fireEvent.keyDown(screen.getByTestId("composer-agent-more-models"), { key: "ArrowRight" });
++      expect(screen.getByTestId("composer-agent-model-opus-4-10")).toBeVisible();
++      expect(screen.queryByTestId("composer-agent-model-opus")).toBeNull();
++    },
++  );
++
+   it.each([null, "gpt-5.6-sol"])(
+     "keeps newest Codex family rows primary with selected older model %s",
+     async (selectedModel) => {
+@@ -5481,7 +5553,7 @@ describe("Composer config gear", () => {
+       await openSessionModels();
+       const menu = within(screen.getByTestId("composer-agent-config-menu"));
+       const picks = () => [
+-        ...["fable", "opus", "sonnet", "haiku"].map((id) =>
++        ...["fable", "opus", "sonnet_5", "haiku"].map((id) =>
+           menu.getByTestId(`composer-agent-model-${id}`),
+         ),
+       ];
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 938940e48c266052876ade9b9c4cf01e0c3a6c4a..d8a1e0b0742575ac88345dfdb8a8b86906173ea0 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -4508,16 +4508,98 @@ function hasSessionConfig({
+   return showModels || showEffort;
+ }
+ 
++function claudeVersion(value: string) {
++  const match = /(?:^|[-_.])(fable|opus|sonnet|haiku)[-_ ](\d+)(?:[-_.](\d+))?(?=$|[-_[\s])/i.exec(
++    value,
++  );
++  return match
++    ? {
++        family: match[1].toLowerCase(),
++        major: Number(match[2]),
++        minor: Number(match[3] ?? 0),
++        minorText: match[3] ?? null,
++      }
++    : null;
++}
++
+ function compactModelChoices(
+   choices: ComposerConfigChoice[],
+   kind: NativeModelPickerKind | null,
+-): { primary: ComposerConfigChoice[]; more: ComposerConfigChoice[] } {
++): {
++  primary: ComposerConfigChoice[];
++  more: ComposerConfigChoice[];
++  unresolvedCurrent?: ComposerConfigChoice;
++} {
++  const claudeChoiceVersion = (choice: ComposerConfigChoice) =>
++    claudeVersion(choice.data?.["data-model-wire"] ?? "") ??
++    claudeVersion(choice.data?.["data-model-id"] ?? choice.key) ??
++    (typeof choice.label === "string" ? claudeVersion(choice.label) : null);
+   const codexModel = (id: string) =>
+     /^gpt-(\d+)(?:\.(\d+))?(?:-(codex|mini|nano|luna|sol|spark|astra))?(?:$|-)/i.exec(id);
+   const primary: ComposerConfigChoice[] = [];
+   const more: ComposerConfigChoice[] = [];
+   const seen = new Set<string>();
+   const latestCodexByFamily = new Map<string, { id: string; major: number; minor: number }>();
++  const latestClaudeByFamily = new Map<string, { major: number; minor: number }>();
++  if (kind === "claude") {
++    let unresolvedCurrent: ComposerConfigChoice | undefined;
++    for (const choice of choices) {
++      const version = claudeChoiceVersion(choice);
++      if (!version) continue;
++      const latest = latestClaudeByFamily.get(version.family);
++      if (
++        !latest ||
++        version.major > latest.major ||
++        (version.major === latest.major && version.minor > latest.minor)
++      )
++        latestClaudeByFamily.set(version.family, version);
++    }
++    const primaryIndex = new Map<string, number>();
++    for (const choice of choices) {
++      const id = choice.data?.["data-model-id"] ?? choice.key;
++      const version = claudeChoiceVersion(choice);
++      const alias = /^(fable|opus|sonnet|haiku)$/i.exec(id)?.[1]?.toLowerCase();
++      const latest = latestClaudeByFamily.get(version?.family ?? alias ?? "");
++      if (
++        version &&
++        latest &&
++        (version.major < latest.major ||
++          (version.major === latest.major && version.minor < latest.minor))
++      ) {
++        more.push(choice);
++        continue;
++      }
++      // An unversioned alias cannot claim the newest version when the catalog has a versioned row.
++      if (!version && alias && latest) {
++        if (choice.checked)
++          unresolvedCurrent = {
++            ...choice,
++            label: <>{choice.label} (current, version unknown)</>,
++            disabled: true,
++            testId: "composer-agent-current-model",
++          };
++        continue;
++      }
++      const variant = /\[[^\]]+\]/.exec(id)?.[0] ?? "";
++      const key = version && `${version.family}:${version.major}.${version.minor}:${variant}`;
++      const existingIndex = key ? primaryIndex.get(key) : undefined;
++      if (existingIndex !== undefined) {
++        const existing = primary[existingIndex];
++        const existingId = existing.data?.["data-model-id"] ?? existing.key;
++        if (
++          (choice.checked && !existing.checked) ||
++          (choice.checked === existing.checked &&
++            alias &&
++            !/^(fable|opus|sonnet|haiku)$/i.test(existingId))
++        )
++          primary[existingIndex] = choice;
++        continue;
++      }
++      if (key) primaryIndex.set(key, primary.length);
++      primary.push(choice);
++    }
++    return { primary, more, unresolvedCurrent };
++  }
+   if (kind === "codex") {
+     for (const choice of choices) {
+       const id = choice.data?.["data-model-id"] ?? choice.key;
+@@ -4531,28 +4613,13 @@ function compactModelChoices(
+         latestCodexByFamily.set(family, { id, major, minor });
+     }
+   }
+-  const claudeAliases = new Set(
+-    choices
+-      .map((choice) => choice.data?.["data-model-id"] ?? choice.key)
+-      .filter((id) => /^(fable|opus|sonnet|haiku)$/i.test(id)),
+-  );
+   for (const choice of choices) {
+     const id = choice.data?.["data-model-id"] ?? choice.key;
+-    const claudeFamily =
+-      kind === "claude" ? /(?:^|[-_])(fable|opus|sonnet|haiku)(?:$|[-_])/i.exec(id)?.[1] : null;
+     const codexFamily = kind === "codex" ? codexModel(id) : null;
+-    const family = claudeFamily
+-      ? `claude:${claudeFamily.toLowerCase()}`
+-      : codexFamily
+-        ? `codex:${codexFamily[1] ?? "base"}`
+-        : id;
+-    const hasAlias = kind === "claude" && claudeAliases.has(claudeFamily ?? "");
++    const family = codexFamily ? `codex:${codexFamily[1] ?? "base"}` : id;
+     const latestCodex =
+       codexFamily !== null && latestCodexByFamily.get(codexFamily[3] ?? "base")?.id === id;
+-    if (
+-      choice.checked ||
+-      (codexFamily ? latestCodex : (!hasAlias || id === claudeFamily) && !seen.has(family))
+-    ) {
++    if (choice.checked || (codexFamily ? latestCodex : !seen.has(family))) {
+       primary.push(choice);
+       seen.add(family);
+     } else {
+@@ -4587,13 +4654,14 @@ function CompactSessionChoices({
+   efforts?: { label: string; choices: ComposerConfigChoice[] };
+   kind: NativeModelPickerKind | null;
+ }) {
+-  const { primary, more } = compactModelChoices(models?.choices ?? [], kind);
++  const { primary, more, unresolvedCurrent } = compactModelChoices(models?.choices ?? [], kind);
+   return (
+     <>
+       {models && (
+         <div data-testid="composer-agent-models">
+           <PickerSectionHeader>Models</PickerSectionHeader>
+           {models.leading}
++          {unresolvedCurrent && <CompactConfigChoice choice={unresolvedCurrent} />}
+           <div className="grid grid-cols-2 gap-0.5 max-[480px]:grid-cols-1">
+             {primary.map((choice) => (
+               <CompactConfigChoice key={choice.key} choice={choice} />
+@@ -4804,7 +4872,7 @@ function SessionHarnessPicker({
+     });
+   const configContent = (
+     <>
+-      {showClaudeAccounts && <ClaudeAccounts host={accountHost} />}
++      {showClaudeAccounts && <ClaudeAccounts host={accountHost} compact />}
+       {costRoutingEligible && showModels && (
+         <>
+           <DropdownMenuItem
+@@ -4849,7 +4917,19 @@ function SessionHarnessPicker({
+                     : []),
+                   ...modelOptions.map((model) => ({
+                     key: model.id,
+-                    label: nativeModelLabel(model),
++                    label: (() => {
++                      const modelLabelText = nativeModelLabel(model);
++                      if (modelPickerKind !== "claude") return modelLabelText;
++                      const version = claudeVersion(model.model ?? "") ?? claudeVersion(model.id);
++                      if (
++                        !version ||
++                        !/^(fable|opus|sonnet|haiku)(?:[\s_-]\d+(?:[.\-_]\d+)?)?$/i.test(
++                          modelLabelText,
++                        )
++                      )
++                        return modelLabelText;
++                      return `${version.family[0].toUpperCase()}${version.family.slice(1)} ${version.major}${version.minorText !== null ? `.${version.minorText}` : ""}`;
++                    })(),
+                     checked:
+                       !routingOn &&
+                       (composerFusion !== undefined && model.id === composerFusionOption?.id
+@@ -4862,7 +4942,7 @@ function SessionHarnessPicker({
+                         : selectModel(supportsModelReset && model.isDefault ? null : model.id),
+                     testId: `composer-agent-model-${model.id}`,
+                     className: "whitespace-normal break-words",
+-                    data: { "data-model-id": model.id },
++                    data: { "data-model-id": model.id, "data-model-wire": model.model },
+                   })),
+                   ...(pickerSelectedModel &&
+                   !isFusionModelUid(pickerSelectedModel) &&
+diff --git a/web/src/shell/ClaudeAccounts.test.tsx b/web/src/shell/ClaudeAccounts.test.tsx
+index c1354b85a341835870df48c6ff8eac4d18486e1f..b2e2c1df597bd9f51e0e60616661a838ee42c36e 100644
+--- a/web/src/shell/ClaudeAccounts.test.tsx
++++ b/web/src/shell/ClaudeAccounts.test.tsx
+@@ -23,6 +23,43 @@ beforeEach(() => {
+   isPending = false;
+ });
+ describe("ClaudeAccounts", () => {
++  it("shows only compact account choices with the new-chat default identified", () => {
++    rows = [...rows, { family: "claude-oauth", source: "Personal", env_var: "Personal" }];
++    render(<ClaudeAccounts host={host} compact />);
++
++    const picker = screen.getByTestId("claude-accounts");
++    expect(picker.querySelector(".grid-cols-2")).toBeTruthy();
++    expect(screen.getAllByRole("button")).toHaveLength(3);
++    expect(screen.queryByText("Claude subscription account")).toBeNull();
++    expect(screen.queryByText(/Used for new Claude subscription chats/)).toBeNull();
++    expect(screen.queryByRole("button", { name: /Rename/ })).toBeNull();
++    expect(screen.queryByRole("button", { name: "Add Claude account" })).toBeNull();
++    expect(screen.getByRole("button", { name: "Default CLI account (selected)" })).toHaveAttribute(
++      "aria-pressed",
++      "true",
++    );
++    expect(screen.getByRole("button", { name: "Default CLI account (selected)" })).toHaveAttribute(
++      "title",
++      "Default CLI account: current new-chat default",
++    );
++    fireEvent.click(screen.getByRole("button", { name: "Personal" }));
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-select",
++      account_name: "Personal",
++    });
++    act(() => mutate.mock.calls[0][1].onError(new Error("Selection failed.")));
++    expect(screen.getByRole("alert")).toHaveTextContent("Selection failed.");
++  });
++
++  it("keeps account management and explanation in the default view", () => {
++    render(<ClaudeAccounts host={host} />);
++    expect(screen.getByText("Claude subscription account")).toBeTruthy();
++    expect(screen.getByText(/Used for new Claude subscription chats/)).toBeTruthy();
++    expect(screen.getByRole("button", { name: "Rename Backup" })).toBeTruthy();
++    expect(screen.getByRole("button", { name: "Add Claude account" })).toBeTruthy();
++  });
++
+   it("selects the backup account without a token", () => {
+     render(<ClaudeAccounts host={host} />);
+     fireEvent.click(screen.getByText("Backup"));
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+index f9f229a0b8aa5c3a92eadfcbbf1f835016db212f..affde710a7a3219b19541dea2bff90499a3754e0 100644
+--- a/web/src/shell/ClaudeAccounts.tsx
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -5,7 +5,13 @@ import { Input } from "@/components/ui/input";
+ import { useDetectedCredentials, useStoreCredential, type Host } from "@/hooks/useHosts";
+ 
+ /** Host-owned subscription choices; no token is returned by the discovery API. */
+-export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
++export function ClaudeAccounts({
++  host,
++  compact = false,
++}: {
++  host: Host | null | undefined;
++  compact?: boolean;
++}) {
+   const [name, setName] = useState("");
+   const [token, setToken] = useState("");
+   const [adding, setAdding] = useState(false);
+@@ -43,32 +49,55 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+   const rows = (accounts.data ?? []).filter((row) => row.family.startsWith("claude-oauth"));
+   return (
+     <div
+-      className="flex min-w-0 max-w-full flex-col gap-2 whitespace-normal [overflow-wrap:anywhere] border-t px-3 py-3"
++      className={
++        compact
++          ? "flex min-w-0 max-w-full flex-col gap-2"
++          : "flex min-w-0 max-w-full flex-col gap-2 whitespace-normal [overflow-wrap:anywhere] border-t px-3 py-3"
++      }
+       data-testid="claude-accounts"
+     >
+-      <span className="text-sm font-medium">Claude subscription account</span>
+-      <p className="text-xs text-muted-foreground">
+-        Used for new Claude subscription chats on {host.name}, including team members. Start a new
+-        chat to switch a running conversation. Gateway connections keep their own credentials.
+-      </p>
++      {!compact && (
++        <>
++          <span className="text-sm font-medium">Claude subscription account</span>
++          <p className="text-xs text-muted-foreground">
++            Used for new Claude subscription chats on {host.name}, including team members. Start a
++            new chat to switch a running conversation. Gateway connections keep their own
++            credentials.
++          </p>
++        </>
++      )}
+       {(accounts.isError || (accounts.isSuccess && rows.length === 0)) && (
+         <p role="alert">Could not load Claude accounts. Check the host account configuration.</p>
+       )}
+-      <div className="flex min-w-0 flex-wrap gap-2">
++      <div className={compact ? "grid min-w-0 grid-cols-2 gap-1" : "flex min-w-0 flex-wrap gap-2"}>
+         {rows.map((row) => {
+           const accountId = row.env_var ?? "";
+           const displayLabel = row.source;
+           return (
+             <div
+               key={accountId}
+-              className="flex min-w-[10rem] flex-[1_1_10rem] flex-col gap-1 rounded border p-2"
++              className={
++                compact
++                  ? "min-w-0"
++                  : "flex min-w-[10rem] flex-[1_1_10rem] flex-col gap-1 rounded border p-2"
++              }
+             >
+-              <div className="flex min-w-0 flex-wrap items-center gap-1">
++              <div className={compact ? "min-w-0" : "flex min-w-0 flex-wrap items-center gap-1"}>
+                 <Button
+                   type="button"
+-                  variant="ghost"
++                  variant={compact && row.family === "claude-oauth-active" ? "secondary" : "ghost"}
+                   size="sm"
+-                  className="h-auto min-h-8 min-w-0 flex-1 whitespace-normal break-words"
++                  className={
++                    compact
++                      ? "h-8 w-full min-w-0 justify-start overflow-hidden text-ellipsis whitespace-nowrap px-2"
++                      : "h-auto min-h-8 min-w-0 flex-1 whitespace-normal break-words"
++                  }
++                  aria-pressed={compact ? row.family === "claude-oauth-active" : undefined}
++                  title={
++                    compact
++                      ? `${displayLabel}: ${row.family === "claude-oauth-active" ? "current" : "select as"} new-chat default`
++                      : undefined
++                  }
+                   disabled={store.isPending || row.family === "claude-oauth-active"}
+                   onClick={() =>
+                     store.mutate(
+@@ -93,22 +122,24 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+                   {displayLabel}
+                   {row.family === "claude-oauth-active" ? " (selected)" : ""}
+                 </Button>
+-                <Button
+-                  type="button"
+-                  variant="outline"
+-                  size="sm"
+-                  aria-label={`Rename ${displayLabel}`}
+-                  disabled={store.isPending}
+-                  onClick={() => {
+-                    setEditingId(accountId);
+-                    setAccountLabel(displayLabel);
+-                    setMessage("");
+-                  }}
+-                >
+-                  Rename
+-                </Button>
++                {!compact && (
++                  <Button
++                    type="button"
++                    variant="outline"
++                    size="sm"
++                    aria-label={`Rename ${displayLabel}`}
++                    disabled={store.isPending}
++                    onClick={() => {
++                      setEditingId(accountId);
++                      setAccountLabel(displayLabel);
++                      setMessage("");
++                    }}
++                  >
++                    Rename
++                  </Button>
++                )}
+               </div>
+-              {editingId === accountId && (
++              {!compact && editingId === accountId && (
+                 <div className="flex min-w-0 flex-wrap gap-1">
+                   <Input
+                     aria-label={`Account label for ${displayLabel}`}
+@@ -164,10 +195,12 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+           );
+         })}
+       </div>
+-      <Button type="button" variant="outline" size="sm" onClick={() => setAdding(!adding)}>
+-        Add Claude account
+-      </Button>
+-      {adding && (
++      {!compact && (
++        <Button type="button" variant="outline" size="sm" onClick={() => setAdding(!adding)}>
++          Add Claude account
++        </Button>
++      )}
++      {!compact && adding && (
+         <div className="flex min-w-0 flex-col gap-2">
+           <Input
+             aria-label="Claude account name"
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 8fabb60dc5b7f9d8b79d78ea2913f0502c11f30e..42cd258e75e8ce7c79723d29549c62ba03e91d69 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -3784,7 +3784,9 @@ export function NewChatLandingScreen() {
+   const selectedConfigContent =
+     selectedAgent && isEntryConfigurable(selectedAgent) ? (
+       <>
+-        {selectedNativeHarness === "claude-native" && <ClaudeAccounts host={harnessWarningHost} />}
++        {selectedNativeHarness === "claude-native" && (
++          <ClaudeAccounts host={harnessWarningHost} compact />
++        )}
+         {smartRoutingEligible && (
+           <>
+             <DropdownMenuCheckboxItem
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 2b2f3e257f86b73ebe49bdda69370142adc2fdce..fc38a2a1c51aab7cfffa8d74d45b0ff961544a02 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -33,7 +33,11 @@ import type {
+ import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
+ import { itemsToBlocks } from "@/lib/itemsToBlocks";
+ import { buildBubbles } from "@/lib/renderItems";
+-import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
++import {
++  getSessionSlim,
++  INITIAL_WINDOW_ITEMS,
++  SESSION_HISTORY_PAGE_SIZE,
++} from "@/lib/sessionsApi";
+ import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
+ import { serializeReplyDraft, type StoredReplyDraft } from "@/lib/replyDraft";
+ import {
+@@ -6424,6 +6428,106 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
+       });
+     }
+ 
++    it("replaces the previous provider's model and effort after an in-place switch", async () => {
++      seedSession("conv_sw", []);
++      await useChatStore.getState().switchTo("conv_sw");
++      useChatStore.setState({
++        llmModel: "gpt-6-astra",
++        sessionModelOverride: "gpt-6-astra",
++        sessionReasoningEffort: "xhigh",
++        sessionModelSeeded: true,
++        sessionHarness: "codex-native",
++      });
++      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++        const url = typeof input === "string" ? input : input.toString();
++        if (url.split("?")[0] === "/v1/sessions/conv_sw" && (init?.method ?? "GET") === "GET") {
++          return mockResponse({
++            id: "conv_sw",
++            agent_id: "ag_claude",
++            agent_name: "Claude Code",
++            status: "idle",
++            created_at: 0,
++            items: [],
++            labels: { "omnigent.wrapper": "claude-code-native-ui" },
++            harness: "claude-native",
++            llm_model: "claude-opus-4-6",
++            model_override: null,
++            reasoning_effort: "medium",
++          });
++        }
++        return defaultFetchHandler(input, init);
++      });
++
++      handleSessionEvent({
++        type: "session_agent_changed",
++        conversationId: "conv_sw",
++        agentId: "ag_claude",
++        agentName: "Claude Code",
++      });
++      expect(useChatStore.getState()).toMatchObject({
++        llmModel: null,
++        sessionModelOverride: null,
++        sessionReasoningEffort: null,
++        sessionModelSeeded: false,
++      });
++      await vi.waitFor(() => {
++        expect(useChatStore.getState()).toMatchObject({
++          llmModel: "claude-opus-4-6",
++          sessionModelOverride: null,
++          sessionReasoningEffort: "medium",
++          sessionHarness: "claude-native",
++        });
++      });
++
++      useChatStore.setState({ llmModel: "gpt-6-astra", sessionReasoningEffort: "xhigh" });
++      await useChatStore.getState().refreshSessionState("conv_sw");
++      expect(useChatStore.getState()).toMatchObject({
++        llmModel: "claude-opus-4-6",
++        sessionReasoningEffort: "medium",
++      });
++    });
++
++    it("drops a Codex model seed when a direct refresh finds a different bound agent", async () => {
++      seedSession("conv_sw", []);
++      await useChatStore.getState().switchTo("conv_sw");
++      useChatStore.setState({
++        boundAgentId: "ag_codex",
++        llmModel: "gpt-6-astra",
++        sessionModelOverride: "gpt-6-astra",
++        sessionReasoningEffort: "xhigh",
++        sessionModelSeeded: true,
++      });
++      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
++        const url = typeof input === "string" ? input : input.toString();
++        if (url.split("?")[0] === "/v1/sessions/conv_sw" && (init?.method ?? "GET") === "GET") {
++          return mockResponse({
++            id: "conv_sw",
++            agent_id: "ag_claude",
++            agent_name: "Claude Code",
++            status: "idle",
++            created_at: 0,
++            items: [],
++            labels: { "omnigent.wrapper": "claude-code-native-ui" },
++            harness: "claude-native",
++            llm_model: null,
++            model_override: null,
++            reasoning_effort: null,
++          });
++        }
++        return defaultFetchHandler(input, init);
++      });
++
++      await useChatStore.getState().refreshSessionState("conv_sw");
++
++      expect(useChatStore.getState()).toMatchObject({
++        boundAgentId: "ag_claude",
++        llmModel: null,
++        sessionModelOverride: null,
++        sessionReasoningEffort: null,
++        sessionModelSeeded: false,
++      });
++    });
++
+     it("sdk→native switch: refreshed binding stops idle from clearing the optimistic bubble (first-message regression)", async () => {
+       // The reported bug: a session bound while on an SDK agent (debby,
+       // isNativeTerminalSession=false) is switched in place to a native
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 8ee0c507f7cc6637761a97705a62ead97d0c03e6..31521acdb0fd9cc3b6ca0a426e59fbcc08ee8d7f 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -4126,7 +4126,7 @@ function sessionBindingPatch(
+   session: Session,
+   state: Pick<
+     ConversationState,
+-    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride"
++    "mcpStartupLaunch" | "sessionModelSeeded" | "llmModel" | "sessionModelOverride" | "boundAgentId"
+   >,
+   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+ ): Pick<
+@@ -4139,6 +4139,7 @@ function sessionBindingPatch(
+   | "llmModel"
+   | "pendingModelChange"
+   | "sessionModelOverride"
++  | "sessionReasoningEffort"
+   | "sessionHarness"
+   | "subAgentName"
+   | "costControlModeOverride"
+@@ -4154,7 +4155,10 @@ function sessionBindingPatch(
+   | "mcpStartup"
+   | "mcpStartupLaunch"
+ > {
+-  const retainModelSeed = state.sessionModelSeeded && session.llmModel == null;
++  const retainModelSeed =
++    state.sessionModelSeeded &&
++    session.llmModel == null &&
++    (state.boundAgentId == null || state.boundAgentId === session.agentId);
+   return {
+     isNativeTerminalSession: isNativeTerminalSessionFn(session),
+     // Native wrapper whose model lives in the vendor TUI (no Omnigent picker):
+@@ -4170,6 +4174,9 @@ function sessionBindingPatch(
+     sessionModelOverride: retainModelSeed
+       ? state.sessionModelOverride
+       : (session.modelOverride ?? null),
++    sessionReasoningEffort: supportsEffortControl(session)
++      ? (session.reasoningEffort ?? null)
++      : null,
+     sessionHarness: session.harness ?? null,
+     subAgentName: session.subAgentName ?? null,
+     costControlModeOverride: session.costControlModeOverride ?? null,
+@@ -7272,6 +7279,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+         contextWindow: null,
+         tokensUsed: null,
+         llmModel: null,
++        sessionModelOverride: null,
++        sessionReasoningEffort: null,
++        sessionModelSeeded: false,
+         sessionHarness: null,
+       });
+       void refreshSessionBinding(event.conversationId);

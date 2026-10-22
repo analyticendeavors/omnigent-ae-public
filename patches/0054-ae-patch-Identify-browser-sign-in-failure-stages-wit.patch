@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:13:01 -0700
+Subject: [PATCH 054/148] [ae-patch] Identify browser sign-in failure stages
+ without exposing secrets.
+
+---
+ omnigent/onboarding/claude_browser_login.py   | 50 +++++++++++++++++--
+ tests/onboarding/test_claude_browser_login.py | 37 +++++++++++++-
+ 2 files changed, 81 insertions(+), 6 deletions(-)
+
+diff --git a/omnigent/onboarding/claude_browser_login.py b/omnigent/onboarding/claude_browser_login.py
+index 2213f4f470fe80fdcaedf25efe27dcb804f4e9f2..6677830a38376216121e84dbdcf74c691a46fd62 100644
+--- a/omnigent/onboarding/claude_browser_login.py
++++ b/omnigent/onboarding/claude_browser_login.py
+@@ -2,6 +2,7 @@
+ 
+ from __future__ import annotations
+ 
++import logging
+ import os
+ import re
+ import shutil
+@@ -20,6 +21,17 @@ _URL = re.compile(r"https://[^\s\x1b\x07]+(?=[\s\x1b\x07])")
+ _TOKEN = re.compile(r"sk-ant-oat[\w-]{20,}(?=[\s\x1b\x07])")
+ _LOCK = threading.RLock()
+ _JOBS: dict[str, Login] = {}
++_logger = logging.getLogger(__name__)
++
++
++def _result_markers(output: str) -> tuple[bool, bool, bool]:
++    """Classify terminal output without retaining or logging credentials."""
++    clean = _ANSI.sub("", output)
++    return (
++        "authentication token created successfully" in clean,
++        "sk-ant-oat" in clean,
++        "OAuth error:" in clean or "Invalid code." in clean,
++    )
+ 
+ 
+ @dataclass
+@@ -58,6 +70,9 @@ def authorization_url(output: str) -> str | None:
+ def _run(job: Login) -> None:
+     # Import only on supported hosts; a missing CLI/PTY dependency is a visible failure.
+     process = None
++    output = ""
++    submitted = False
++    ended = False
+     try:
+         import pexpect
+ 
+@@ -89,7 +104,6 @@ def _run(job: Login) -> None:
+                 dimensions=(40, 4096),
+                 echo=False,
+             )
+-            output = ""
+             while not job.cancel.is_set() and time.monotonic() - job.created < _TTL:
+                 with _LOCK:
+                     code, job.code = job.code, ""
+@@ -99,6 +113,8 @@ def _run(job: Login) -> None:
+                     if job.cancel.wait(0.3):
+                         break
+                     process.send("\r")
++                    submitted = True
++                    _logger.info("Browser login %s: code submitted", job.id)
+                 ended = False
+                 try:
+                     output = (output + process.read_nonblocking(8192, timeout=0.25))[-131072:]
+@@ -134,10 +150,34 @@ def _run(job: Login) -> None:
+                     break
+             with _LOCK:
+                 job.status = "cancelled" if job.cancel.is_set() else "failed"
+-                job.error = (
+-                    ""
+-                    if job.cancel.is_set()
+-                    else "Claude sign-in ended or expired. Try signing in again."
++                success, token_seen, provider_error = _result_markers(output)
++                if job.cancel.is_set():
++                    job.error = ""
++                elif success or token_seen:
++                    job.error = "Omnigent could not read the returned token. Account not saved."
++                elif provider_error:
++                    job.error = "Claude reported an authorization error. Account not saved."
++                elif ended:
++                    job.error = "Sign-in process exited without a token. Account not saved."
++                elif submitted:
++                    job.error = (
++                        "No token received within 10 minutes of starting sign-in. "
++                        "Account not saved."
++                    )
++                else:
++                    job.error = "Sign-in expired before code submission. Start sign-in again."
++                _logger.info(
++                    "Browser login %s: status=%s submitted=%s eof=%s success_marker=%s "
++                    "token_marker=%s provider_error=%s elapsed_s=%d output_chars=%d",
++                    job.id,
++                    job.status,
++                    submitted,
++                    ended,
++                    success,
++                    token_seen,
++                    provider_error,
++                    int(time.monotonic() - job.created),
++                    len(output),
+                 )
+     except Exception:
+         with _LOCK:
+diff --git a/tests/onboarding/test_claude_browser_login.py b/tests/onboarding/test_claude_browser_login.py
+index 24340a141b67874de7b2210d2376660570dcc69e..f0b0484a3fa1c9493ddf6e2625af149631bbc908 100644
+--- a/tests/onboarding/test_claude_browser_login.py
++++ b/tests/onboarding/test_claude_browser_login.py
+@@ -106,7 +106,7 @@ def test_code_submitted_with_enter(monkeypatch):
+     import pexpect
+ 
+     process = Mock()
+-    process.read_nonblocking.side_effect = pexpect.EOF
++    process.read_nonblocking.side_effect = pexpect.EOF("closed")
+     monkeypatch.setattr(pexpect, "spawn", Mock(return_value=process))
+     monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
+     job = login.Login("Backup", code="dummy#state")
+@@ -127,3 +127,38 @@ def test_cli_oauth_error_is_reported_without_secrets(monkeypatch):
+     assert job.status == "failed"
+     assert "rejected" in job.error
+     assert "secret-provider-detail" not in repr(job.public())
++
++
++@pytest.mark.parametrize(
++    ("output", "message"),
++    [
++        ("", "process exited"),
++        ("authentication token created successfully!", "could not read the returned token"),
++        ("sk-ant-oat", "could not read the returned token"),
++        ("Invalid code. secret-value", "authorization error"),
++    ],
++)
++def test_incomplete_result_identifies_stage_without_logging_secrets(
++    monkeypatch, caplog, output, message
++):
++    import logging
++
++    import pexpect
++
++    process = Mock()
++    process.read_nonblocking.side_effect = [output, pexpect.EOF("closed")]
++    monkeypatch.setattr(pexpect, "spawn", Mock(return_value=process))
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    job = login.Login("Private label", code="private-code#private-state")
++    with caplog.at_level(logging.INFO, logger=login.__name__):
++        login._run(job)
++    assert message in job.error
++    assert "submitted=True eof=True" in caplog.text
++    for private in [
++        "Private label",
++        "private-code",
++        "private-state",
++        "secret-value",
++        "sk-ant-oat",
++    ]:
++        assert private not in caplog.text

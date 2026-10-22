@@ -1,0 +1,194 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 15:05:58 -0700
+Subject: [PATCH 050/148] [ae-patch] Submit Claude authorization codes with
+ Enter and report progress.
+
+---
+ omnigent/onboarding/claude_browser_login.py   | 16 ++++++++---
+ tests/onboarding/test_claude_browser_login.py | 28 +++++++++++++++++++
+ web/src/shell/ClaudeBrowserLogin.test.tsx     |  5 +++-
+ web/src/shell/ClaudeBrowserLogin.tsx          | 21 ++++++++------
+ 4 files changed, 57 insertions(+), 13 deletions(-)
+
+diff --git a/omnigent/onboarding/claude_browser_login.py b/omnigent/onboarding/claude_browser_login.py
+index c2fa8645f65cf7d71834c3571b936a7c3c4fb349..c9fa531455adacc8368c3bdf2e987880015eca4c 100644
+--- a/omnigent/onboarding/claude_browser_login.py
++++ b/omnigent/onboarding/claude_browser_login.py
+@@ -94,7 +94,7 @@ def _run(job: Login) -> None:
+                 with _LOCK:
+                     code, job.code = job.code, ""
+                 if code:
+-                    process.sendline(code)
++                    process.send(code + "\r")
+                 ended = False
+                 try:
+                     output = (output + process.read_nonblocking(8192, timeout=0.25))[-131072:]
+@@ -108,6 +108,13 @@ def _run(job: Login) -> None:
+                         job.url, job.status = url, "waiting"
+                 clean = _ANSI.sub("", output)
+                 token = _TOKEN.search(clean)
++                if "OAuth error:" in clean:
++                    job.status = "failed"
++                    job.error = (
++                        "Claude rejected the authorization code. "
++                        "Start sign-in again and use the new code."
++                    )
++                    return
+                 if token:
+                     with _LOCK:
+                         if job.cancel.is_set():
+@@ -155,13 +162,13 @@ def login_action(kind: str, name_or_id: str, code: str = "") -> dict[str, str]:
+             if name_or_id in _read()["accounts"]:
+                 raise ValueError("That account label already exists. Choose another label.")
+             if any(
+-                j.name == name_or_id and j.status in {"starting", "waiting"}
++                j.name == name_or_id and j.status in {"starting", "waiting", "exchanging"}
+                 for j in _JOBS.values()
+             ):
+                 raise ValueError(
+                     "Sign-in for that label is already open. Finish or cancel it first."
+                 )
+-            if sum(j.status in {"starting", "waiting"} for j in _JOBS.values()) >= 3:
++            if sum(j.status in {"starting", "waiting", "exchanging"} for j in _JOBS.values()) >= 3:
+                 raise ValueError("Finish or cancel an existing sign-in before starting another.")
+             job = Login(name_or_id)
+             _JOBS[job.id] = job
+@@ -172,7 +179,7 @@ def login_action(kind: str, name_or_id: str, code: str = "") -> dict[str, str]:
+             raise ValueError("Sign-in expired or the host restarted. Start sign-in again.")
+         if kind == "claude-login-cancel":
+             job.cancel.set()
+-            if job.status in {"starting", "waiting"}:
++            if job.status in {"starting", "waiting", "exchanging"}:
+                 job.status = "cancelled"
+         elif kind == "claude-login-code":
+             if (
+@@ -183,6 +190,7 @@ def login_action(kind: str, name_or_id: str, code: str = "") -> dict[str, str]:
+             ):
+                 raise ValueError("Paste the one-time authorization code shown by Claude.")
+             job.code = code
++            job.status = "exchanging"
+         elif kind != "claude-login-poll":
+             raise ValueError("Unknown sign-in action.")
+         return job.public()
+diff --git a/tests/onboarding/test_claude_browser_login.py b/tests/onboarding/test_claude_browser_login.py
+index 7a3ff644493a70d8c39ff97a1f96d9bacc697806..cf77c6f1c8963ab6a520d20852ea15337516d89d 100644
+--- a/tests/onboarding/test_claude_browser_login.py
++++ b/tests/onboarding/test_claude_browser_login.py
+@@ -41,6 +41,7 @@ def test_start_validation_cancel_and_expiry(monkeypatch):
+         login.login_action("claude-login-code", job.id, "code\ncommand")
+     login.login_action("claude-login-code", job.id, "one-time-code#state")
+     assert job.code == "one-time-code#state"
++    assert job.status == "exchanging"
+     assert "one-time-code" not in repr(job.public())
+     assert login.login_action("claude-login-cancel", job.id)["login_status"] == "cancelled"
+     assert job.cancel.is_set()
+@@ -99,3 +100,30 @@ def test_login_frame_roundtrip():
+         login_url="https://claude.com/oauth/authorize?state=test",
+     )
+     assert decode_host_frame(encode_host_frame(frame)) == frame
++
++
++def test_code_submitted_with_enter(monkeypatch):
++    import pexpect
++
++    process = Mock()
++    process.read_nonblocking.side_effect = pexpect.EOF
++    monkeypatch.setattr(pexpect, "spawn", Mock(return_value=process))
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    job = login.Login("Backup", code="dummy#state")
++    login._run(job)
++    process.send.assert_called_once_with("dummy#state\r")
++    process.sendline.assert_not_called()
++
++
++def test_cli_oauth_error_is_reported_without_secrets(monkeypatch):
++    import pexpect
++
++    process = Mock()
++    process.read_nonblocking.return_value = "OAuth error: secret-provider-detail"
++    monkeypatch.setattr(pexpect, "spawn", Mock(return_value=process))
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    job = login.Login("Backup")
++    login._run(job)
++    assert job.status == "failed"
++    assert "rejected" in job.error
++    assert "secret-provider-detail" not in repr(job.public())
+diff --git a/web/src/shell/ClaudeBrowserLogin.test.tsx b/web/src/shell/ClaudeBrowserLogin.test.tsx
+index 1daf02a3ba7220dc3872574e688c3e22313bd25f..e78c6807db9b914e016ead5f93f1cd1e8821e87d 100644
+--- a/web/src/shell/ClaudeBrowserLogin.test.tsx
++++ b/web/src/shell/ClaudeBrowserLogin.test.tsx
+@@ -15,7 +15,9 @@ const waiting = {
+ };
+ describe("Claude browser login", () => {
+   it("starts login on the chosen host and submits only the one-time code", async () => {
+-    mutateAsync.mockResolvedValue(waiting);
++    mutateAsync
++      .mockResolvedValueOnce(waiting)
++      .mockResolvedValue({ ...waiting, login_status: "exchanging" });
+     render(<ClaudeBrowserLogin hostId="host" name="Backup" onComplete={() => {}} />);
+     fireEvent.click(screen.getByText("Sign in with Claude"));
+     await screen.findByText("Open Claude sign-in");
+@@ -29,6 +31,7 @@ describe("Claude browser login", () => {
+       target: { value: "code#state" },
+     });
+     fireEvent.click(screen.getByText("Complete sign-in"));
++    await screen.findByText("Completing sign-in with Claude…");
+     await waitFor(() =>
+       expect(mutateAsync).toHaveBeenCalledWith({
+         harness: "claude-native",
+diff --git a/web/src/shell/ClaudeBrowserLogin.tsx b/web/src/shell/ClaudeBrowserLogin.tsx
+index 12461a6040ed2262bc39f33c70585fffe38c8b9a..ca74eec7d8f12ed74a741e661fbc398b55d7e810 100644
+--- a/web/src/shell/ClaudeBrowserLogin.tsx
++++ b/web/src/shell/ClaudeBrowserLogin.tsx
+@@ -34,7 +34,10 @@ export function ClaudeBrowserLogin({
+   const completed = useRef(false);
+   const done = useRef(onComplete);
+   done.current = onComplete;
+-  const active = login?.login_status === "starting" || login?.login_status === "waiting";
++  const active =
++    login?.login_status === "starting" ||
++    login?.login_status === "waiting" ||
++    login?.login_status === "exchanging";
+   const action = async (
+     kind: "claude-login-start" | "claude-login-code" | "claude-login-cancel",
+   ) => {
+@@ -101,9 +104,11 @@ export function ClaudeBrowserLogin({
+       {active && (
+         <>
+           <p role="status" className="text-xs text-muted-foreground">
+-            {url
+-              ? "Open Claude and authorize your second subscription account. Your password stays on Claude's site."
+-              : "Preparing secure sign-in on the host…"}
++            {login?.login_status === "exchanging"
++              ? "Completing sign-in with Claude…"
++              : url
++                ? "Open Claude and authorize your second subscription account. Your password stays on Claude's site."
++                : "Preparing secure sign-in on the host…"}
+           </p>
+           {url && (
+             <a className="text-sm underline" href={url} target="_blank" rel="noopener noreferrer">
+@@ -113,19 +118,19 @@ export function ClaudeBrowserLogin({
+           {url && (
+             <>
+               <p className="text-xs text-muted-foreground">
+-                If Claude shows a one-time code, paste it here. If it opens your primary account,
+-                switch to the second account before authorizing.
++                Paste the full authorization code from Claude here, even if it is long. If it opens
++                your primary account, switch to the second account before authorizing.
+               </p>
+               <Input
+                 aria-label="Claude authorization code"
+-                placeholder="One-time authorization code"
++                placeholder="Authorization code (paste the full code)"
+                 autoComplete="off"
+                 value={code}
+                 onChange={(e) => setCode(e.target.value)}
+               />
+               <Button
+                 type="button"
+-                disabled={!code.trim() || store.isPending}
++                disabled={!code.trim() || store.isPending || login?.login_status === "exchanging"}
+                 onClick={() => void action("claude-login-code")}
+               >
+                 Complete sign-in

@@ -1,0 +1,563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 11:40:56 -0700
+Subject: [PATCH 112/148] [ae-patch] Keep a Claude Code subagent running until
+ its parent records its return
+
+A transcript lull no longer reads as completion: the subagent.status idle is held for a Claude Code subagent child until the parent records its completion marker, republishing the child's busy status with the lull's response, blocked and background fields. The newly recorded completion publishes the child's terminal status (failed for a failure, idle otherwise); a replayed one only settles a child with no cached status. A held child whose conversation stays quiet for 60 minutes is settled idle by a server-side timer, for children a host restart left without a completion.
+---
+ omnigent/server/ae_subagent_liveness.py       | 177 +++++++++++++++
+ .../server/routes/sessions/routes_events.py   |  10 +
+ omnigent/server/subagent_activity.py          |   3 +
+ .../routes/test_ae_subagent_liveness.py       | 214 ++++++++++++++++++
+ tests/server/routes/test_subagent_status.py   |  65 +++++-
+ 5 files changed, 468 insertions(+), 1 deletion(-)
+ create mode 100644 omnigent/server/ae_subagent_liveness.py
+ create mode 100644 tests/server/routes/test_ae_subagent_liveness.py
+
+diff --git a/omnigent/server/ae_subagent_liveness.py b/omnigent/server/ae_subagent_liveness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..bea20517da05502e945a8431aedaf555245da84a
+--- /dev/null
++++ b/omnigent/server/ae_subagent_liveness.py
+@@ -0,0 +1,177 @@
++"""Keep a Claude Code subagent child running until its parent records its return.
++
++The claude-native forwarder reports ``subagent.status`` idle after any short
++transcript lull, so a live subagent would flicker between busy and completed.
++The parent's completion marker is the reliable end signal; a lull before it is
++held, the marker itself publishes the terminal status, and a child that never
++gets one (its host restarted) is settled idle once its transcript goes quiet.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import time
++
++from omnigent.entities import Conversation
++from omnigent.server.schemas import BackgroundTaskInfo
++from omnigent.stores import ConversationStore
++
++_logger = logging.getLogger(__name__)
++
++CLAUDE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent"
++_NATIVE_ID_LABELS = ("omnigent.claude_native.subagent_id", "omnigent.claude_native.tool_use_id")
++# A running Claude subagent with no transcript update for this long is presumed
++# dead (no completion will ever arrive) and is settled idle.
++CLAUDE_SUBAGENT_STALE_AFTER_S = 60 * 60
++
++_stale_timers: dict[str, asyncio.TimerHandle] = {}
++_stale_checks: set[asyncio.Task[bool]] = set()
++
++
++def is_claude_subagent_child(conv: Conversation) -> bool:
++    """Return whether ``conv`` mirrors a Claude Code subagent a marker can match."""
++    return (
++        conv.kind == "sub_agent"
++        and conv.labels.get("omnigent.wrapper") == CLAUDE_SUBAGENT_WRAPPER
++        and any(conv.labels.get(label) for label in _NATIVE_ID_LABELS)
++    )
++
++
++async def _completion_recorded(conv: Conversation, store: ConversationStore) -> bool:
++    if conv.parent_conversation_id is None:
++        return False
++    from omnigent.server.subagent_activity import _recorded_completion_status
++
++    return await _recorded_completion_status(conv.parent_conversation_id, conv, store) is not None
++
++
++async def hold_premature_lull_idle(
++    conv: Conversation,
++    store: ConversationStore,
++    *,
++    response_id: str | None,
++    background_task_count: int | None,
++    background_tasks: list[BackgroundTaskInfo] | None,
++    blocked_on: str | None,
++) -> bool:
++    """Keep a Claude subagent running through a ``subagent.status`` idle lull.
++
++    The lull's other fields still apply, so a live child republishes its busy
++    status with them; a cached ``idle`` or ``failed`` is left as it is.
++
++    :param conv: The child session the idle observation targets.
++    :param store: Conversation store holding the parent's completion markers.
++    :returns: ``True`` when the idle was held; ``False`` when the caller
++        should publish it as before.
++    """
++    if (
++        not is_claude_subagent_child(conv)
++        or conv.parent_conversation_id is None
++        or await _completion_recorded(conv, store)
++    ):
++        return False
++    from omnigent.server.routes._sessions.common import _session_status_cache
++    from omnigent.server.routes._sessions.helpers import _publish_status
++
++    cached = _session_status_cache.get(conv.id)
++    fields = {
++        "response_id": response_id,
++        "background_task_count": background_task_count,
++        "background_tasks": background_tasks,
++        "blocked_on": blocked_on,
++    }
++    if cached == "waiting":
++        _publish_status(conv.id, "waiting", **fields)
++    elif cached in (None, "running"):
++        _publish_status(conv.id, "running", **fields)
++    arm_stale_timer(conv.id, store)
++    return True
++
++
++def publish_claude_subagent_end(
++    child: Conversation, status: str | None, *, replayed: bool = False
++) -> None:
++    """Publish a Claude subagent's terminal status once its parent records the return.
++
++    :param child: The returned child session.
++    :param status: Recorded completion status, e.g. ``"completed"``,
++        ``"failed"`` or ``"cancelled"``.
++    :param replayed: The returned edge was already persisted. A replay only
++        settles a child with no cached status, so it cannot end a resumed child.
++    """
++    if status is None or not is_claude_subagent_child(child):
++        return
++    from omnigent.server.routes._sessions.common import _session_status_cache
++    from omnigent.server.routes._sessions.helpers import _publish_status
++
++    if replayed and _session_status_cache.get(child.id) is not None:
++        return
++    cancel_stale_timer(child.id)
++    # A stopped subagent ended on purpose; only a real failure reads failed.
++    if status == "failed":
++        _publish_status(child.id, "failed", failure_origin="claude_subagent_returned")
++    else:
++        _publish_status(child.id, "idle")
++
++
++def arm_stale_timer(
++    child_id: str, store: ConversationStore, delay: float = CLAUDE_SUBAGENT_STALE_AFTER_S
++) -> None:
++    """(Re)arm the staleness check for ``child_id`` after ``delay`` seconds."""
++    cancel_stale_timer(child_id)
++    loop = asyncio.get_running_loop()
++    _stale_timers[child_id] = loop.call_later(delay, _start_stale_check, child_id, store)
++
++
++def cancel_stale_timer(child_id: str) -> None:
++    """Drop any pending staleness check for ``child_id``."""
++    timer = _stale_timers.pop(child_id, None)
++    if timer is not None:
++        timer.cancel()
++
++
++def _start_stale_check(child_id: str, store: ConversationStore) -> None:
++    _stale_timers.pop(child_id, None)
++    task = asyncio.ensure_future(settle_stale_claude_subagent(child_id, store))
++    _stale_checks.add(task)
++    task.add_done_callback(_stale_checks.discard)
++
++
++async def settle_stale_claude_subagent(
++    child_id: str, store: ConversationStore, *, now: float | None = None
++) -> bool:
++    """Publish idle for a running Claude subagent quiet past the staleness cap.
++
++    A child whose transcript moved since the timer was armed is re-armed for
++    the time remaining.
++
++    :param child_id: Child session to check.
++    :param store: Conversation store holding the child and its parent.
++    :param now: Current epoch seconds; defaults to the wall clock.
++    :returns: Whether the child was settled idle.
++    """
++    from omnigent.server.routes._sessions.common import _session_status_cache
++    from omnigent.server.routes._sessions.helpers import _publish_status
++
++    try:
++        if _session_status_cache.get(child_id) != "running":
++            return False
++        conv = await asyncio.to_thread(store.get_conversation, child_id)
++        if (
++            conv is None
++            or not is_claude_subagent_child(conv)
++            or await _completion_recorded(conv, store)
++        ):
++            return False
++        quiet = (time.time() if now is None else now) - conv.updated_at
++        if quiet < CLAUDE_SUBAGENT_STALE_AFTER_S:
++            arm_stale_timer(child_id, store, CLAUDE_SUBAGENT_STALE_AFTER_S - quiet)
++            return False
++        if _session_status_cache.get(child_id) != "running":
++            return False
++        _publish_status(child_id, "idle")
++        return True
++    except Exception:  # noqa: BLE001 — a best-effort sweep must not crash the loop
++        _logger.warning("Could not settle stale Claude subagent %s", child_id, exc_info=True)
++        return False
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index c93bf9e1879e760f6b2c18a2bc8690e560468ff2..a47d37dabc2d0d408fc7d87bc76973336e79807e 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -77,6 +77,7 @@ from omnigent.server._elicitation_registry import (
+     _ParkedHarnessElicitation,
+     _PreResolvedHarnessElicitation,
+ )
++from omnigent.server.ae_subagent_liveness import hold_premature_lull_idle
+ from omnigent.server.auth import (
+     LEVEL_EDIT,
+     LEVEL_OWNER,
+@@ -1931,6 +1932,15 @@ def register_events_routes(
+                 raw_blocked_on if isinstance(raw_blocked_on, str) and raw_blocked_on else None
+             )
+             if body.type == _SUBAGENT_STATUS_TYPE:
++                if await hold_premature_lull_idle(
++                    conv,
++                    conversation_store,
++                    response_id=response_id,
++                    background_task_count=bg_count,
++                    background_tasks=bg_tasks,
++                    blocked_on=blocked_on,
++                ):
++                    return {"queued": False}
+                 # A transcript lull publishes idle but is not a runner completion.
+                 _publish_status(
+                     session_id,
+diff --git a/omnigent/server/subagent_activity.py b/omnigent/server/subagent_activity.py
+index 34bbaf3a3747d5f5f3c662061663553c1da51fe8..b65c264551c1d6899627511898c8f5ce81f98d49 100644
+--- a/omnigent/server/subagent_activity.py
++++ b/omnigent/server/subagent_activity.py
+@@ -20,6 +20,7 @@ from omnigent.entities import (
+ from omnigent.harness_aliases import is_native_harness
+ from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+ from omnigent.runtime import session_stream
++from omnigent.server.ae_subagent_liveness import publish_claude_subagent_end
+ from omnigent.server.schemas import OutputItemDoneEvent
+ from omnigent.stores import ConversationStore
+ 
+@@ -243,6 +244,8 @@ async def record_subagent_activity(
+                 type="response.output_item.done", item=persisted.to_api_dict()
+             )
+             session_stream.publish(parent_id, event.model_dump())
++        if phase == "returned":
++            publish_claude_subagent_end(child, status, replayed=persisted.deduplicated)
+         if phase == "delegated" and any(
+             child.labels.get(label)
+             for label in (
+diff --git a/tests/server/routes/test_ae_subagent_liveness.py b/tests/server/routes/test_ae_subagent_liveness.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2eba6039af132c820dfa59bc8e764924b359db95
+--- /dev/null
++++ b/tests/server/routes/test_ae_subagent_liveness.py
+@@ -0,0 +1,214 @@
++"""A Claude Code subagent child stays running until its parent records the return."""
++
++from __future__ import annotations
++
++import asyncio
++from unittest.mock import Mock
++
++import pytest
++
++from omnigent.entities import (
++    FunctionCallOutputData,
++    MessageData,
++    NewConversationItem,
++)
++from omnigent.server import ae_subagent_liveness
++from omnigent.server.ae_subagent_liveness import CLAUDE_SUBAGENT_STALE_AFTER_S
++from omnigent.server.routes._sessions import common
++from omnigent.server.routes._sessions.helpers import _child_session_summary_from_conversation
++from omnigent.server.subagent_activity import (
++    _completion_marker,
++    record_claude_subagent_return,
++    record_subagent_activity,
++)
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++
++_CLAUDE_WRAPPER = "claude-code-native-ui-subagent"
++
++
++@pytest.mark.parametrize(
++    ("status", "expected"),
++    [("completed", "idle"), ("failed", "failed"), ("killed", "idle")],
++)
++@pytest.mark.parametrize("late", [False, True], ids=["discovered-first", "returned-first"])
++async def test_recorded_completion_ends_claude_subagent(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch, status: str, expected: str, late: bool
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    parent = store.create_conversation()
++    child = store.create_conversation(
++        kind="sub_agent",
++        parent_conversation_id=parent.id,
++        title="Explore:agent-1",
++        labels={
++            "omnigent.wrapper": _CLAUDE_WRAPPER,
++            "omnigent.claude_native.subagent_id": "agent-1",
++            "omnigent.claude_native.tool_use_id": "tool-1",
++        },
++    )
++    monkeypatch.setattr("omnigent.server.subagent_activity.session_stream.publish", Mock())
++    common._session_status_cache[child.id] = "running"
++    if status == "completed":
++        notification = NewConversationItem(
++            type="function_call_output",
++            response_id="parent-turn",
++            data=FunctionCallOutputData(
++                call_id="tool-1", output="Done", subagent_return_id="agent-1"
++            ),
++        )
++    else:
++        text = (
++            "<task-notification><task-id>agent-1</task-id>"
++            f"<status>{status}</status></task-notification>"
++        )
++        notification = NewConversationItem(
++            type="message",
++            response_id="parent-turn",
++            data=MessageData(
++                role="user", is_meta=True, content=[{"type": "input_text", "text": text}]
++            ),
++        )
++    try:
++        if late:
++            # The result lands before child discovery: the delegated edge replays it.
++            store.append(
++                parent.id,
++                [
++                    _completion_marker(
++                        "task", "agent-1", "cancelled" if status == "killed" else status
++                    )
++                ],
++            )
++            await record_subagent_activity(child.id, "delegated", store)
++        else:
++            await record_subagent_activity(child.id, "delegated", store)
++            assert common._session_status_cache[child.id] == "running"
++            await record_claude_subagent_return(parent.id, notification, store)
++        assert common._session_status_cache[child.id] == expected
++        conv = store.get_conversation(child.id)
++        assert conv is not None
++        summary = _child_session_summary_from_conversation(conv, parent.id, None)
++        assert summary.busy is False
++        assert summary.current_task_status == ("completed" if expected == "idle" else "failed")
++    finally:
++        common._session_status_cache.pop(child.id, None)
++        common._session_active_response_cache.pop(child.id, None)
++
++
++def _claude_child(store: SqlAlchemyConversationStore) -> tuple[str, str]:
++    parent = store.create_conversation()
++    child = store.create_conversation(
++        kind="sub_agent",
++        parent_conversation_id=parent.id,
++        title="Explore:agent-1",
++        labels={
++            "omnigent.wrapper": _CLAUDE_WRAPPER,
++            "omnigent.claude_native.subagent_id": "agent-1",
++        },
++    )
++    return parent.id, child.id
++
++
++@pytest.fixture
++def published(monkeypatch: pytest.MonkeyPatch) -> Mock:
++    publish = Mock()
++    monkeypatch.setattr("omnigent.server.subagent_activity.session_stream.publish", publish)
++    return publish
++
++
++def _statuses(published: Mock, session_id: str) -> list[str]:
++    return [
++        c.args[1]["status"]
++        for c in published.call_args_list
++        if c.args[0] == session_id and c.args[1].get("type") == "session.status"
++    ]
++
++
++async def test_stale_timer_settles_quiet_subagent_idle(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch, published: Mock
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    _, child_id = _claude_child(store)
++    common._session_status_cache[child_id] = "running"
++    monkeypatch.setattr(ae_subagent_liveness, "CLAUDE_SUBAGENT_STALE_AFTER_S", 0)
++    try:
++        ae_subagent_liveness.arm_stale_timer(child_id, store, 0.01)
++        assert child_id in ae_subagent_liveness._stale_timers
++        for _ in range(100):
++            if ae_subagent_liveness._stale_checks or child_id not in (
++                ae_subagent_liveness._stale_timers
++            ):
++                break
++            await asyncio.sleep(0.01)
++        await asyncio.gather(*ae_subagent_liveness._stale_checks)
++        assert common._session_status_cache[child_id] == "idle"
++        assert _statuses(published, child_id) == ["idle"]
++        assert child_id not in ae_subagent_liveness._stale_timers
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++        common._session_status_cache.pop(child_id, None)
++
++
++@pytest.mark.parametrize(
++    ("quiet_s", "completion", "settled"),
++    [
++        pytest.param(CLAUDE_SUBAGENT_STALE_AFTER_S + 1, None, True, id="quiet-past-cap"),
++        pytest.param(600, None, False, id="transcript-moved"),
++        pytest.param(CLAUDE_SUBAGENT_STALE_AFTER_S + 1, "completed", False, id="returned"),
++    ],
++)
++async def test_stale_check_settles_or_rearms(
++    db_uri: str, published: Mock, quiet_s: int, completion: str | None, settled: bool
++) -> None:
++    assert CLAUDE_SUBAGENT_STALE_AFTER_S == 60 * 60
++    store = SqlAlchemyConversationStore(db_uri)
++    parent_id, child_id = _claude_child(store)
++    if completion is not None:
++        store.append(parent_id, [_completion_marker("task", "agent-1", completion)])
++    conv = store.get_conversation(child_id)
++    assert conv is not None
++    common._session_status_cache[child_id] = "running"
++    try:
++        result = await ae_subagent_liveness.settle_stale_claude_subagent(
++            child_id, store, now=conv.updated_at + quiet_s
++        )
++        assert result is settled
++        assert common._session_status_cache[child_id] == ("idle" if settled else "running")
++        assert _statuses(published, child_id) == (["idle"] if settled else [])
++        timer = ae_subagent_liveness._stale_timers.get(child_id)
++        if quiet_s < CLAUDE_SUBAGENT_STALE_AFTER_S:
++            assert timer is not None
++            remaining = timer.when() - asyncio.get_running_loop().time()
++            assert abs(remaining - (CLAUDE_SUBAGENT_STALE_AFTER_S - quiet_s)) < 5
++        else:
++            assert timer is None
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++        common._session_status_cache.pop(child_id, None)
++
++
++async def test_replayed_return_only_settles_an_empty_cache(db_uri: str, published: Mock) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    _, child_id = _claude_child(store)
++
++    async def returned() -> None:
++        await record_subagent_activity(
++            child_id, "returned", store, turn_id="tool-1", status="completed"
++        )
++
++    try:
++        common._session_status_cache[child_id] = "running"
++        await returned()
++        assert common._session_status_cache[child_id] == "idle"
++        # A resumed child must not be ended by a replay of its earlier return.
++        common._session_status_cache[child_id] = "running"
++        await returned()
++        assert common._session_status_cache[child_id] == "running"
++        # After a server restart the cache is empty, and the replay settles it.
++        common._session_status_cache.pop(child_id)
++        await returned()
++        assert common._session_status_cache[child_id] == "idle"
++        assert _statuses(published, child_id) == ["idle", "idle"]
++    finally:
++        common._session_status_cache.pop(child_id, None)
++        common._session_active_response_cache.pop(child_id, None)
+diff --git a/tests/server/routes/test_subagent_status.py b/tests/server/routes/test_subagent_status.py
+index b9e407a3d5333918eb70b29fc183a397bff698c8..b123392dfaddaf48ecd032362fb218ff64feacf2 100644
+--- a/tests/server/routes/test_subagent_status.py
++++ b/tests/server/routes/test_subagent_status.py
+@@ -19,11 +19,12 @@ from fastapi.responses import JSONResponse
+ from omnigent.entities import MessageData, NewConversationItem, SlashCommandData
+ from omnigent.errors import OmnigentError
+ from omnigent.runtime import session_stream
+-from omnigent.server import session_live_state, session_metadata_logging
++from omnigent.server import ae_subagent_liveness, session_live_state, session_metadata_logging
+ from omnigent.server.routes import sessions
+ from omnigent.server.routes._sessions import common
+ from omnigent.server.routes.sessions import routes_events
+ from omnigent.server.schemas import BackgroundTaskInfo, ErrorDetail
++from omnigent.server.subagent_activity import _completion_marker
+ from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+ from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+@@ -31,6 +32,7 @@ from tests.debug_log_helpers import capture_debug_rows
+ from tests.server.routes.test_sessions_runner_relay import _ScriptedRunnerClient
+ 
+ _BACKGROUND_TASK = BackgroundTaskInfo(status="running", description="Wait for CI")
++_CLAUDE_SUBAGENT = "claude-code-native-ui-subagent"
+ 
+ 
+ async def _flush_live_state() -> None:
+@@ -296,6 +298,67 @@ async def test_offline_sweep_refreshes_child_status_after_idle_observation(
+     )
+ 
+ 
++@pytest.mark.parametrize(
++    ("wrapper", "native_id", "completion", "expected"),
++    [
++        pytest.param(_CLAUDE_SUBAGENT, True, None, "running", id="claude-lull-held"),
++        pytest.param(_CLAUDE_SUBAGENT, True, "completed", "idle", id="claude-after-return"),
++        pytest.param(_CLAUDE_SUBAGENT, False, None, "idle", id="claude-no-native-id"),
++        pytest.param(None, False, None, "idle", id="unlabelled-child"),
++        pytest.param("codex-native-ui-subagent", True, None, "idle", id="codex-child"),
++    ],
++)
++async def test_subagent_idle_waits_for_claude_completion(
++    status_route: _StatusRoute,
++    wrapper: str | None,
++    native_id: bool,
++    completion: str | None,
++    expected: str,
++) -> None:
++    route = status_route
++    sid = route.child_id
++    labels = {"omnigent.wrapper": wrapper} if wrapper else {}
++    if native_id:
++        labels["omnigent.claude_native.subagent_id"] = "agent-1"
++    route.store.set_labels(sid, labels)
++    if completion is not None:
++        route.store.append(route.parent_id, [_completion_marker("task", "agent-1", completion)])
++    route.published.reset_mock()
++    fields = {
++        "response_id": "resp_turn",
++        "background_task_count": 1,
++        "background_tasks": [_BACKGROUND_TASK.model_dump()],
++        "blocked_on": "permission",
++    }
++
++    try:
++        response = await route.client.post(
++            f"/v1/sessions/{sid}/events",
++            json={"type": "subagent.status", "data": {"idle": True, **fields}},
++        )
++        assert response.status_code == 202, response.text
++        assert response.json() == {"queued": False}
++        await _flush_live_state()
++
++        assert common._session_status_cache[sid] == expected
++        conv = route.store.get_conversation(sid)
++        assert conv is not None and conv.live_status == expected
++        assert common._session_background_task_count_cache[sid] == 1
++        child_events = [c.args[1] for c in route.published.call_args_list if c.args[0] == sid]
++        assert [event["status"] for event in child_events] == [expected]
++        if expected == "running":
++            # A held lull still carries its turn, blocked state and background tally.
++            assert child_events[0].items() >= fields.items()
++            assert common._session_active_response_cache[sid] == "resp_turn"
++            assert common._session_blocked_on_cache[sid] == "permission"
++            assert sid in ae_subagent_liveness._stale_timers
++        else:
++            assert sid not in ae_subagent_liveness._stale_timers
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(sid)
++        common._session_blocked_on_cache.pop(sid, None)
++
++
+ async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute) -> None:
+     route = status_route
+     sid = route.child_id

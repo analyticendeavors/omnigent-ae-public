@@ -1,0 +1,803 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:05:59 -0700
+Subject: [PATCH 029/148] [ae-patch] Add keep_runs to scheduled tasks and a
+ post-fire observer seam
+
+Every firing of a scheduled task starts a new session and nothing removes
+the old ones: the two weekday AE tasks leave about ten sessions a week in
+the sidebar. Reid decided on 2026-10-13 to keep each task's newest N run
+sessions (default 5) and delete older ones after each firing.
+
+This patch is the mechanism; what to delete is decided by an observer the
+AE layer registers (ae_omni_policies.retention), so without one the server
+keeps every session as before.
+
+- keep_runs on ScheduledTask and on /v1/scheduled-tasks create, patch,
+  get and list (1 to 1000, null keeps every run session), plus the
+  sys_scheduled_task_create/update tool schemas and dispatch allowlists.
+  It lives in its own table, ae_scheduled_task_retention, created on first
+  use, so no Alembic revision is needed; a task never set reads 5.
+- omnigent/server/scheduled/retention.py (new): the setting, the fire
+  observer registry (awaited after a fire is created, granted, launched and
+  recorded, inside the fire's background task so the per-task in-flight
+  guard covers it; errors are logged, never raised), and
+  delete_session_server_side, the server-owned part of
+  DELETE /v1/sessions/{id} for a caller with no request. It refuses a
+  session with a git worktree.
+- fire.py gains two lines (import and call); the routes file resolves and
+  stores the setting beside each existing store call.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ omnigent/entities/scheduled_task.py           |   8 +
+ omnigent/runner/tool_dispatch.py              |   2 +
+ omnigent/server/routes/scheduled_tasks.py     |  17 +-
+ omnigent/server/scheduled/fire.py             |   2 +
+ omnigent/server/scheduled/retention.py        | 301 ++++++++++++++++++
+ omnigent/tools/builtins/scheduled_tasks.py    |  14 +
+ .../test_scheduled_tasks_routes.py            |  67 ++++
+ tests/server/scheduled/test_retention.py      | 175 ++++++++++
+ 8 files changed, 585 insertions(+), 1 deletion(-)
+ create mode 100644 omnigent/server/scheduled/retention.py
+ create mode 100644 tests/server/scheduled/test_retention.py
+
+diff --git a/omnigent/entities/scheduled_task.py b/omnigent/entities/scheduled_task.py
+index 91cde8834bd50c9a7b85179b0bdba32c340b440e..db9f6d6b032dd007190ef8201293c8c7941ac7df 100644
+--- a/omnigent/entities/scheduled_task.py
++++ b/omnigent/entities/scheduled_task.py
+@@ -20,6 +20,10 @@ from __future__ import annotations
+ 
+ from dataclasses import dataclass
+ 
++# Run sessions a task keeps after each firing (newest first); the fire path's
++# retention observers delete older ones. See omnigent/server/scheduled/retention.py.
++DEFAULT_KEEP_RUNS = 5
++
+ 
+ @dataclass
+ class ScheduledTask:
+@@ -71,6 +75,9 @@ class ScheduledTask:
+         firing, or ``None``.
+     :param updated_at: Unix epoch seconds of the last write, or ``None`` if the
+         row has never been updated.
++    :param keep_runs: How many of the task's newest run sessions survive a
++        firing; ``None`` keeps them all. Not a ``scheduled_tasks`` column: it is
++        resolved from :mod:`omnigent.server.scheduled.retention`.
+     """
+ 
+     id: str
+@@ -95,6 +102,7 @@ class ScheduledTask:
+     last_run_conversation_id: str | None = None
+     updated_at: int | None = None
+     account_generation: str | None = None
++    keep_runs: int | None = DEFAULT_KEEP_RUNS
+ 
+ 
+ @dataclass
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index 667346514ae765abcd58748ccbe507b74a52c633..51667db7b5b5b1f74ba84231fcd6800cbba5eca2 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -4630,6 +4630,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
+     "model_override",
+     "reasoning_effort",
+     "permission_mode",
++    "keep_runs",
+     "workspace",
+     "host_id",
+     "execution_target",
+@@ -4645,6 +4646,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
+     "reasoning_effort",
+     "permission_mode",
+     "max_cost_usd",
++    "keep_runs",
+     "workspace",
+     "host_id",
+     "execution_target",
+diff --git a/omnigent/server/routes/scheduled_tasks.py b/omnigent/server/routes/scheduled_tasks.py
+index 772ce0cd7f3bc9c2c67e8825c5d290df2401d577..e2239ee462b36dba378e64145166011d90f2f619 100644
+--- a/omnigent/server/routes/scheduled_tasks.py
++++ b/omnigent/server/routes/scheduled_tasks.py
+@@ -36,6 +36,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_model_metadata,
+     validate_session_permission_mode,
+ )
++from omnigent.server.scheduled import retention
+ from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+@@ -69,6 +70,8 @@ class CreateScheduledTaskRequest(BaseModel):
+     # path derives the runner's --permission-mode launch arg from it.
+     permission_mode: str | None = None
+     max_cost_usd: float | None = Field(default=None, gt=0)
++    # Run sessions kept after each firing, newest first; null keeps them all.
++    keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)
+     # Optional: no PINNED host/workspace. When both are unset the fire path
+     # resolves the owner's online host at fire time and defaults the workspace to
+     # that host's home directory (a failed run is recorded if none is online) —
+@@ -110,6 +113,7 @@ class UpdateScheduledTaskRequest(BaseModel):
+     reasoning_effort: str | None = None
+     permission_mode: str | None = None
+     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
++    keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)  # null keeps all
+     workspace: str | None = Field(default=None, min_length=1)
+     host_id: str | None = Field(default=None, min_length=1)
+     execution_target: str | None = Field(default=None, min_length=1)
+@@ -170,6 +174,7 @@ def _to_response(
+         "reasoning_effort": task.reasoning_effort,
+         "permission_mode": task.permission_mode,
+         "max_cost_usd": task.max_cost_usd,
++        "keep_runs": task.keep_runs,
+         "workspace": task.workspace,
+         "host_id": task.host_id,
+         "execution_target": task.execution_target,
+@@ -407,6 +412,9 @@ def create_scheduled_tasks_router(
+             if bound.id != agent.id:
+                 agent_store.delete(bound.id)
+             raise
++        if "keep_runs" in body.model_fields_set:
++            retention.set_keep_runs(store, task.id, body.keep_runs)
++        task = retention.with_keep_runs(store, [task])[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.add(task)
+@@ -433,6 +441,7 @@ def create_scheduled_tasks_router(
+         owner = _owner(request)
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+         tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
++        tasks = retention.with_keep_runs(store, tasks)
+         task_ids = [t.id for t in tasks]
+         running = store.list_running_runs_for_tasks(task_ids)
+         # Force-fail stale orphans FIRST so the completion badge below reports a
+@@ -459,7 +468,7 @@ def create_scheduled_tasks_router(
+         """Fetch one of the caller's scheduled tasks."""
+         owner = _owner(request)
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+-        task = _require_owned(scheduled_task_id, owner_id)
++        task = retention.with_keep_runs(store, [_require_owned(scheduled_task_id, owner_id)])[0]
+         running = store.list_running_runs_for_tasks([task.id])
+         force_fail_stale_runs(store, running)
+         latest_status = store.list_latest_run_status_for_tasks([task.id])
+@@ -566,6 +575,8 @@ def create_scheduled_tasks_router(
+         if body.timezone is not None:
+             _validate_timezone_or_400(body.timezone)
+         fields = body.model_dump(exclude_unset=True)
++        keep_runs_set = "keep_runs" in fields
++        keep_runs = fields.pop("keep_runs", None)
+         target_agent_id = fields.get("agent_id") or existing.agent_id
+         agent_changed = target_agent_id != existing.agent_id
+         new_copy: Agent | None = None
+@@ -659,6 +670,9 @@ def create_scheduled_tasks_router(
+             if new_copy is not None:
+                 agent_store.delete(new_copy.id)
+             raise
++        if keep_runs_set:
++            retention.set_keep_runs(store, updated.id, keep_runs)
++        updated = retention.with_keep_runs(store, [updated])[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.update(updated)
+@@ -679,6 +693,7 @@ def create_scheduled_tasks_router(
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+         _require_owned(scheduled_task_id, owner_id)
+         store.delete(scheduled_task_id)
++        retention.forget_keep_runs(store, scheduled_task_id)
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.remove(scheduled_task_id)
+diff --git a/omnigent/server/scheduled/fire.py b/omnigent/server/scheduled/fire.py
+index 5370bcd47dbc10def0b04ea4b28e1f403c182aa2..44602a7635657cba98beb3dcd5a7bfed3fbdf6e2 100644
+--- a/omnigent/server/scheduled/fire.py
++++ b/omnigent/server/scheduled/fire.py
+@@ -67,6 +67,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_model_metadata,
+     validate_session_permission_mode,
+ )
++from omnigent.server.scheduled.retention import notify_fire_observers
+ from omnigent.server.schemas import SessionEventInput
+ 
+ _logger = logging.getLogger(__name__)
+@@ -548,6 +549,7 @@ async def _run_fire_for_task(
+ 
+         await _record_run(deps, task, conv.id, scheduled_at, status="running")
+         _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
++        await notify_fire_observers(deps, task, conv.id)
+     except Exception:
+         _logger.exception("scheduled fire: task %s failed", task.id)
+ 
+diff --git a/omnigent/server/scheduled/retention.py b/omnigent/server/scheduled/retention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..66cf0cf1cd7b07bd8f053425e5fd827b9c940b20
+--- /dev/null
++++ b/omnigent/server/scheduled/retention.py
+@@ -0,0 +1,301 @@
++"""Run-session retention for scheduled tasks: the setting, the seam, the delete.
++
++Every firing of a scheduled task creates a new session, so a task that fires
++on weekdays leaves five sessions a week behind it and nothing removes them.
++This module carries the three pieces retention needs; what to delete is left
++to whoever registers an observer, so the server keeps every session until a
++deployment says which ones it may drop.
++
++- **The setting.** ``keep_runs`` is how many of a task's newest run sessions
++  survive a firing (``None`` keeps them all, a task never set keeps
++  :data:`~omnigent.entities.scheduled_task.DEFAULT_KEEP_RUNS`). It is stored
++  beside ``scheduled_tasks`` in its own table rather than as a column, so
++  carrying it needs no Alembic revision: the table is created on first use,
++  and a build without this module leaves it unread.
++- **The seam.** :func:`notify_fire_observers` runs after a fire has created,
++  granted, launched and recorded its session. Observers are awaited in order
++  inside the fire's own background task, so the per-task in-flight guard in
++  :mod:`omnigent.server.scheduled.fire` also keeps two prunes of one task
++  apart. Whatever an observer raises is logged and dropped: retention must
++  never fail a fire.
++- **The delete.** :func:`delete_session_server_side` is the server-owned part
++  of ``DELETE /v1/sessions/{id}`` (``routes/sessions/routes_events.py``) for a
++  caller with no request: stop, runner-side cleanup, session files, the row,
++  and the per-session caches. It refuses a session with a git worktree, which
++  a scheduled run never has, rather than copying the route's worktree path.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import logging
++import threading
++from collections.abc import Awaitable, Callable, Iterable
++from dataclasses import dataclass, replace
++from typing import TYPE_CHECKING, Any
++
++from sqlalchemy import Column, Integer, MetaData, String, Table, delete, select
++from sqlalchemy.engine import Engine
++
++from omnigent.db.db_models import current_workspace_id
++from omnigent.db.query_context import query_name_scope
++from omnigent.entities.scheduled_task import DEFAULT_KEEP_RUNS, ScheduledTask
++
++if TYPE_CHECKING:
++    from omnigent.server.scheduled.fire import FireDeps
++
++_logger = logging.getLogger(__name__)
++
++#: The largest ``keep_runs`` the API accepts.
++MAX_KEEP_RUNS = 1000
++
++_metadata = MetaData()
++_retention_table = Table(
++    "ae_scheduled_task_retention",
++    _metadata,
++    Column("workspace_id", Integer, primary_key=True),
++    Column("scheduled_task_id", String(32), primary_key=True),
++    # NULL means "keep every run session" (retention off for this task).
++    Column("keep_runs", Integer, nullable=True),
++)
++_ready_engines: set[int] = set()
++_ready_lock = threading.Lock()
++# Stores without a database (test fakes) keep the setting in memory, keyed by
++# store identity, workspace and task.
++_memory: dict[tuple[int, int, str], int | None] = {}
++
++
++def _engine_for(store: Any) -> Engine | None:
++    """The store's database engine with the retention table created, or ``None``."""
++    location = getattr(store, "storage_location", None)
++    if not isinstance(location, str) or "://" not in location:
++        return None
++    from omnigent.db.utils import get_or_create_engine
++
++    engine = get_or_create_engine(location)
++    with _ready_lock:
++        if id(engine) not in _ready_engines:
++            with query_name_scope("omnigent.scheduled_task_retention.create_table"):
++                _metadata.create_all(engine, tables=[_retention_table], checkfirst=True)
++            _ready_engines.add(id(engine))
++    return engine
++
++
++def keep_runs_for(store: Any, task_ids: Iterable[str]) -> dict[str, int | None]:
++    """Each task's ``keep_runs`` in the current workspace, the default when never set.
++
++    :param store: The scheduled-task store the tasks live in.
++    :param task_ids: The tasks to resolve.
++    :returns: ``{task_id: keep_runs}`` for every id given.
++    """
++    ids = list(dict.fromkeys(task_ids))
++    workspace = current_workspace_id()
++    found: dict[str, int | None] = {}
++    engine = _engine_for(store)
++    if engine is None:
++        for task_id in ids:
++            key = (id(store), workspace, task_id)
++            if key in _memory:
++                found[task_id] = _memory[key]
++    elif ids:
++        stmt = select(_retention_table.c.scheduled_task_id, _retention_table.c.keep_runs).where(
++            _retention_table.c.workspace_id == workspace,
++            _retention_table.c.scheduled_task_id.in_(ids),
++        )
++        with (
++            query_name_scope("omnigent.scheduled_task_retention.select"),
++            engine.connect() as conn,
++        ):
++            found = {row[0]: row[1] for row in conn.execute(stmt)}
++    return {task_id: found.get(task_id, DEFAULT_KEEP_RUNS) for task_id in ids}
++
++
++def with_keep_runs(store: Any, tasks: list[ScheduledTask]) -> list[ScheduledTask]:
++    """*tasks* with ``keep_runs`` filled in from the retention table."""
++    resolved = keep_runs_for(store, (task.id for task in tasks))
++    return [replace(task, keep_runs=resolved[task.id]) for task in tasks]
++
++
++def set_keep_runs(store: Any, task_id: str, keep_runs: int | None) -> int | None:
++    """Store *keep_runs* for *task_id* in the current workspace and return it.
++
++    :raises ValueError: When *keep_runs* is outside 1 to :data:`MAX_KEEP_RUNS`.
++    """
++    if keep_runs is not None and not 1 <= keep_runs <= MAX_KEEP_RUNS:
++        raise ValueError(f"keep_runs must be 1 to {MAX_KEEP_RUNS} or null; got {keep_runs}")
++    workspace = current_workspace_id()
++    engine = _engine_for(store)
++    if engine is None:
++        _memory[(id(store), workspace, task_id)] = keep_runs
++        return keep_runs
++    key = (
++        _retention_table.c.workspace_id == workspace,
++        _retention_table.c.scheduled_task_id == task_id,
++    )
++    with query_name_scope("omnigent.scheduled_task_retention.upsert"), engine.begin() as conn:
++        conn.execute(delete(_retention_table).where(*key))
++        conn.execute(
++            _retention_table.insert().values(
++                workspace_id=workspace, scheduled_task_id=task_id, keep_runs=keep_runs
++            )
++        )
++    return keep_runs
++
++
++def forget_keep_runs(store: Any, task_id: str) -> None:
++    """Drop *task_id*'s setting (the task was deleted)."""
++    workspace = current_workspace_id()
++    engine = _engine_for(store)
++    if engine is None:
++        _memory.pop((id(store), workspace, task_id), None)
++        return
++    with query_name_scope("omnigent.scheduled_task_retention.delete"), engine.begin() as conn:
++        conn.execute(
++            delete(_retention_table).where(
++                _retention_table.c.workspace_id == workspace,
++                _retention_table.c.scheduled_task_id == task_id,
++            )
++        )
++
++
++# ── The seam ─────────────────────────────────────────────────────────────
++
++
++@dataclass(frozen=True)
++class FireEvent:
++    """One successful firing, as fire observers see it.
++
++    :param task: The task as it fired, ``keep_runs`` resolved.
++    :param conversation_id: The session this firing created.
++    :param deps: The fire path's server dependencies (stores and registries).
++    """
++
++    task: ScheduledTask
++    conversation_id: str
++    deps: FireDeps
++
++
++FireObserver = Callable[[FireEvent], Awaitable[None]]
++
++_observers: list[FireObserver] = []
++
++
++def register_fire_observer(fn: FireObserver) -> None:
++    """Add async *fn* to the observers awaited after every successful fire (idempotent)."""
++    if fn not in _observers:
++        _observers.append(fn)
++
++
++def unregister_fire_observer(fn: FireObserver) -> None:
++    """Remove *fn*; an unknown callable is ignored."""
++    if fn in _observers:
++        _observers.remove(fn)
++
++
++def registered_fire_observers() -> list[FireObserver]:
++    """The observers currently registered, in registration order (a copy)."""
++    return list(_observers)
++
++
++async def notify_fire_observers(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
++    """Await every observer for a fire that created *conversation_id*; never raises."""
++    if not _observers:
++        return
++    try:
++        resolved = await asyncio.to_thread(with_keep_runs, deps.scheduled_task_store, [task])
++    except Exception:
++        _logger.exception("scheduled fire: could not read keep_runs for task %s", task.id)
++        return
++    event = FireEvent(task=resolved[0], conversation_id=conversation_id, deps=deps)
++    for observer in list(_observers):
++        try:
++            await observer(event)
++        except Exception:
++            name = getattr(observer, "__qualname__", None) or repr(observer)
++            _logger.exception("fire observer %s failed for task %s", name, task.id)
++
++
++# ── The delete ───────────────────────────────────────────────────────────
++
++
++async def delete_session_server_side(deps: FireDeps, session_id: str) -> bool:
++    """Delete *session_id* the way ``DELETE /v1/sessions/{id}`` does, minus the request.
++
++    No permission check: the caller owns that decision. A session with a git
++    worktree is refused, since cleaning one up needs the route's host round
++    trip. Runner-side and file cleanup are best-effort, as in the route.
++
++    :returns: ``True`` when the row was deleted.
++    """
++    from omnigent.server.routes._sessions.common import (
++        _intentional_stop_sessions,
++        _interrupt_fenced_sessions,
++        _pushed_model_options_cache,
++        _session_mcp_startup_cache,
++        _session_sandbox_status_cache,
++    )
++    from omnigent.server.routes._sessions.helpers import (
++        _get_runner_client_for_resource_access,
++        _prune_session_read_state,
++    )
++    from omnigent.server.routes._sessions.orchestration import _best_effort_stop
++
++    store = deps.conversation_store
++    conv = await asyncio.to_thread(store.get_conversation, session_id)
++    if conv is None:
++        return False
++    if conv.git_branch is not None:
++        _logger.info("retention: %s has a git worktree; left for a manual delete", session_id)
++        return False
++    await _best_effort_stop(session_id, store, deps.runner_router)
++    runner_client = None
++    with contextlib.suppress(Exception):
++        runner_client = await _get_runner_client_for_resource_access(session_id)
++    if runner_client is not None:
++        try:
++            await runner_client.delete(f"/v1/sessions/{session_id}", timeout=60.0)
++        except Exception:  # noqa: BLE001 — the runner may be long gone
++            _logger.info("retention: runner cleanup failed for %s", session_id, exc_info=True)
++    else:
++        from omnigent.runtime import get_terminal_registry
++
++        with contextlib.suppress(RuntimeError):
++            await get_terminal_registry().cleanup_conversation(session_id)
++    if deps.file_store is not None and deps.artifact_store is not None:
++        orphaned = await asyncio.to_thread(deps.file_store.delete_all_for_session, session_id)
++        for blob_key in orphaned:
++            await asyncio.to_thread(deps.artifact_store.delete, blob_key)
++    _interrupt_fenced_sessions.discard(session_id)
++    _intentional_stop_sessions.pop(session_id, None)
++    if not await store.delete_conversation(session_id):
++        return False
++    _session_sandbox_status_cache.pop(session_id, None)
++    _session_mcp_startup_cache.pop(session_id, None)
++    _pushed_model_options_cache.pop(session_id, None)
++    _prune_session_read_state(session_id)
++    if deps.managed_launches is not None:
++        deps.managed_launches.finish(session_id)
++    if conv.host_id is not None and deps.host_store is not None:
++        host = await asyncio.to_thread(deps.host_store.get_host, conv.host_id)
++        if host is not None and host.sandbox_provider is not None:
++            from omnigent.server.managed_hosts import terminate_managed_host
++
++            await terminate_managed_host(host, deps.host_store, deps.sandbox_config)
++    return True
++
++
++__all__ = [
++    "MAX_KEEP_RUNS",
++    "FireEvent",
++    "FireObserver",
++    "delete_session_server_side",
++    "forget_keep_runs",
++    "keep_runs_for",
++    "notify_fire_observers",
++    "register_fire_observer",
++    "registered_fire_observers",
++    "set_keep_runs",
++    "unregister_fire_observer",
++    "with_keep_runs",
++]
+diff --git a/omnigent/tools/builtins/scheduled_tasks.py b/omnigent/tools/builtins/scheduled_tasks.py
+index 2ed9de75f05c2d6d01f71dd567dd684cb3f9f751..13b5646ea57d5660724010741fabc56bdcdd50bb 100644
+--- a/omnigent/tools/builtins/scheduled_tasks.py
++++ b/omnigent/tools/builtins/scheduled_tasks.py
+@@ -112,6 +112,13 @@ class SysScheduledTaskCreateTool(Tool):
+                                 "blocked once the limit is reached. Omit for no cap."
+                             ),
+                         },
++                        "keep_runs": {
++                            "type": "integer",
++                            "description": (
++                                "Run sessions kept after each firing, newest first; older "
++                                "idle ones are deleted. Omit for 5; null keeps them all."
++                            ),
++                        },
+                         "workspace": {
+                             "type": "string",
+                             "description": (
+@@ -243,6 +250,13 @@ class SysScheduledTaskUpdateTool(Tool):
+                                 "New per-firing cost budget in USD. Null clears the cap."
+                             ),
+                         },
++                        "keep_runs": {
++                            "type": "integer",
++                            "description": (
++                                "New number of run sessions kept after each firing. "
++                                "Null keeps them all."
++                            ),
++                        },
+                         "workspace": {
+                             "type": "string",
+                             "description": "New existing absolute runner start path.",
+diff --git a/tests/server/integration/test_scheduled_tasks_routes.py b/tests/server/integration/test_scheduled_tasks_routes.py
+index fc87fa324df257f8697fa29002fb4d3c9b44850e..fa08fc1c95ffd7085224c21b79dfe5442de61644 100644
+--- a/tests/server/integration/test_scheduled_tasks_routes.py
++++ b/tests/server/integration/test_scheduled_tasks_routes.py
+@@ -1749,3 +1749,70 @@ async def test_run_now_503_when_scheduler_not_running(
+     auth_app.state.scheduled_task_run_now = None
+     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
+     assert resp.status_code == 503, resp.text
++
++
++# ── keep_runs ────────────────────────────────────────────────────────────
++
++
++async def test_keep_runs_defaults_and_round_trips(
++    auth_client: httpx.AsyncClient, db_uri: str
++) -> None:
++    _make_user(db_uri)
++    created = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
++    )
++    assert created.status_code == 200, created.text
++    task_id = created.json()["id"]
++    assert created.json()["keep_runs"] == 5
++
++    patched = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"keep_runs": 2}, headers=_headers()
++    )
++    assert patched.status_code == 200, patched.text
++    assert patched.json()["keep_runs"] == 2
++
++    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
++    assert got.json()["keep_runs"] == 2
++    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
++    [row] = [t for t in listed.json()["scheduled_tasks"] if t["id"] == task_id]
++    assert row["keep_runs"] == 2
++
++    # Patching another field leaves keep_runs alone; null turns retention off.
++    renamed = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
++    )
++    assert renamed.json()["keep_runs"] == 2
++    off = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"keep_runs": None}, headers=_headers()
++    )
++    assert off.status_code == 200, off.text
++    assert off.json()["keep_runs"] is None
++
++
++async def test_keep_runs_set_at_create_and_forgotten_on_delete(
++    auth_client: httpx.AsyncClient, db_uri: str
++) -> None:
++    from omnigent.server.scheduled import retention
++
++    _make_user(db_uri)
++    created = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(keep_runs=9), headers=_headers()
++    )
++    assert created.status_code == 200, created.text
++    task_id = created.json()["id"]
++    assert created.json()["keep_runs"] == 9
++
++    deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
++    assert deleted.status_code == 200
++    store = SqlAlchemyScheduledTaskStore(db_uri)
++    assert retention.keep_runs_for(store, [task_id]) == {task_id: 5}
++
++
++async def test_keep_runs_out_of_range_is_rejected(
++    auth_client: httpx.AsyncClient, db_uri: str
++) -> None:
++    _make_user(db_uri)
++    zero = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(keep_runs=0), headers=_headers()
++    )
++    assert zero.status_code in (400, 422), zero.text
+diff --git a/tests/server/scheduled/test_retention.py b/tests/server/scheduled/test_retention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..58aef352d6f1d3cc4ca82d35d1ed30a515d24adc
+--- /dev/null
++++ b/tests/server/scheduled/test_retention.py
+@@ -0,0 +1,175 @@
++"""Tests for :mod:`omnigent.server.scheduled.retention`.
++
++The ``keep_runs`` setting (its own table, the default when never set), the
++fire-observer seam (awaited after a successful fire only, never failing it),
++and the request-free session delete.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import pytest
++
++from omnigent.entities.scheduled_task import DEFAULT_KEEP_RUNS
++from omnigent.server.scheduled import retention
++from omnigent.server.scheduled.fire import build_on_fire
++from tests.server.scheduled.test_fire import (
++    FakeScheduledTaskStore,
++    _deps,
++    _drain,
++    _task,
++)
++
++
++@pytest.fixture(autouse=True)
++def _no_observers() -> Any:
++    saved = retention.registered_fire_observers()
++    for fn in saved:
++        retention.unregister_fire_observer(fn)
++    yield
++    for fn in retention.registered_fire_observers():
++        retention.unregister_fire_observer(fn)
++    for fn in saved:
++        retention.register_fire_observer(fn)
++
++
++# ── The setting ──────────────────────────────────────────────────────────
++
++
++def test_keep_runs_defaults_round_trips_and_forgets_in_sqlite(db_uri: str) -> None:
++    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
++        SqlAlchemyScheduledTaskStore,
++    )
++
++    store = SqlAlchemyScheduledTaskStore(db_uri)
++    assert retention.keep_runs_for(store, ["a", "b"]) == {
++        "a": DEFAULT_KEEP_RUNS,
++        "b": DEFAULT_KEEP_RUNS,
++    }
++    retention.set_keep_runs(store, "a", 2)
++    retention.set_keep_runs(store, "b", None)
++    retention.set_keep_runs(store, "a", 3)
++    assert retention.keep_runs_for(store, ["a", "b"]) == {"a": 3, "b": None}
++    retention.forget_keep_runs(store, "a")
++    assert retention.keep_runs_for(store, ["a"]) == {"a": DEFAULT_KEEP_RUNS}
++
++
++def test_set_keep_runs_rejects_out_of_range() -> None:
++    store = FakeScheduledTaskStore()
++    with pytest.raises(ValueError, match="keep_runs"):
++        retention.set_keep_runs(store, "a", 0)
++    with pytest.raises(ValueError, match="keep_runs"):
++        retention.set_keep_runs(store, "a", retention.MAX_KEEP_RUNS + 1)
++
++
++def test_with_keep_runs_fills_the_entity() -> None:
++    store = FakeScheduledTaskStore()
++    retention.set_keep_runs(store, "task_1", 7)
++    [task] = retention.with_keep_runs(store, [_task()])
++    assert task.keep_runs == 7
++
++
++# ── The seam ─────────────────────────────────────────────────────────────
++
++
++@pytest.mark.asyncio
++async def test_observer_awaited_after_a_successful_fire_with_keep_runs() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    retention.set_keep_runs(store, "task_1", 2)
++    seen: list[retention.FireEvent] = []
++
++    async def _observer(event: retention.FireEvent) -> None:
++        seen.append(event)
++
++    async def _launch(conv: Any, task: Any) -> None:
++        return None
++
++    retention.register_fire_observer(_observer)
++    on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
++    await on_fire(0, "task_1")
++    await _drain()
++
++    assert [(e.task.id, e.conversation_id, e.task.keep_runs) for e in seen] == [
++        ("task_1", "conv_1", 2)
++    ]
++    # The run was recorded before observers ran.
++    assert store.runs and store.runs[-1]["status"] == "running"
++
++
++@pytest.mark.asyncio
++async def test_observer_not_called_when_the_fire_fails() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    seen: list[Any] = []
++
++    async def _observer(event: retention.FireEvent) -> None:
++        seen.append(event)
++
++    async def _launch(conv: Any, task: Any) -> None:
++        raise RuntimeError("host went away")
++
++    retention.register_fire_observer(_observer)
++    on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
++    await on_fire(0, "task_1")
++    await _drain()
++
++    assert seen == []
++    assert store.runs[-1]["status"] == "failed"
++
++
++@pytest.mark.asyncio
++async def test_a_failing_observer_does_not_stop_the_next_one() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    seen: list[str] = []
++
++    async def _broken(event: retention.FireEvent) -> None:
++        raise RuntimeError("boom")
++
++    async def _after(event: retention.FireEvent) -> None:
++        seen.append(event.conversation_id)
++
++    async def _launch(conv: Any, task: Any) -> None:
++        return None
++
++    retention.register_fire_observer(_broken)
++    retention.register_fire_observer(_after)
++    retention.register_fire_observer(_after)  # idempotent
++    on_fire = build_on_fire(_deps(store), launch_dispatch=_launch)
++    await on_fire(0, "task_1")
++    await _drain()
++
++    assert seen == ["conv_1"]
++
++
++# ── The delete ───────────────────────────────────────────────────────────
++
++
++@pytest.mark.asyncio
++async def test_delete_session_server_side_removes_the_row(db_uri: str) -> None:
++    from omnigent.stores.conversation_store.sqlalchemy_store import (
++        SqlAlchemyConversationStore,
++    )
++
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv = conv_store.create_conversation(title="nightly")
++    deps = _deps(FakeScheduledTaskStore(), conversation_store=conv_store)
++
++    assert await retention.delete_session_server_side(deps, conv.id) is True
++    assert conv_store.get_conversation(conv.id) is None
++    assert await retention.delete_session_server_side(deps, conv.id) is False
++
++
++@pytest.mark.asyncio
++async def test_delete_session_server_side_refuses_a_worktree_session(db_uri: str) -> None:
++    from omnigent.stores.conversation_store.sqlalchemy_store import (
++        SqlAlchemyConversationStore,
++    )
++
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv = conv_store.create_conversation(
++        title="nightly", workspace="/repo/wt", git_branch="topic"
++    )
++    deps = _deps(FakeScheduledTaskStore(), conversation_store=conv_store)
++
++    assert await retention.delete_session_server_side(deps, conv.id) is False
++    assert conv_store.get_conversation(conv.id) is not None

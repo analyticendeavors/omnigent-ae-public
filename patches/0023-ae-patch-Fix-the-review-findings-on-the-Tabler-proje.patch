@@ -1,0 +1,634 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 06:18:54 -0700
+Subject: [PATCH 023/148] [ae-patch] Fix the review findings on the Tabler
+ project icons and the merge card
+
+Post-merge review of https://github.com/analyticendeavors/omnigent-ae/pull/43
+(patch 0015) and https://github.com/analyticendeavors/omnigent-ae/pull/53
+(patches 0021 and 0022).
+
+- useAeTablerIcons subscribes to the loader, so every icon that saw a failed
+  load redraws once any later load succeeds (the picker's Try again).
+- aeTablerIconData fetches the two JSON files as assets through an eager
+  ?url glob instead of import(), and a retry adds retry=N to the URL: Safari
+  caches a failed dynamic import, so retrying the same import() never worked.
+- Icon lookups check own keys (Object.hasOwn), so tabler:constructor draws the
+  folder instead of throwing and taking the Sidebar down.
+- PROJECT_ICON_MAX_LENGTH goes from 16 to 48, which covers the longest
+  tabler: value in @tabler/icons 3.46 (41 characters).
+- Enter in an empty icon search picks nothing, so the landing tile no longer
+  saves the first suggestion over the current icon.
+- The icon picker focuses its search box on open, so the rename popover's
+  auto-focus no longer lands on Remove icon.
+- The inline PR card has a set width (w-xl, capped at the bubble), so the
+  chat's w-fit bubble cannot shrink it to the message text.
+- The merge method segments are disabled while the merge is pending.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ web/src/components/AePrCards.test.tsx         | 26 ++++++
+ web/src/components/AePrCards.tsx              |  7 +-
+ .../components/AeTablerIconPicker.test.tsx    | 36 +++++++++
+ web/src/components/AeTablerIconPicker.tsx     |  9 ++-
+ web/src/extensions/services/projects.test.ts  | 18 ++++-
+ web/src/extensions/services/projects.ts       |  3 +-
+ web/src/lib/aeTablerIcon.test.tsx             | 73 +++++++++++++++--
+ web/src/lib/aeTablerIcon.tsx                  | 32 ++++++--
+ web/src/lib/aeTablerIconData.test.ts          | 56 ++++++++++++-
+ web/src/lib/aeTablerIconData.ts               | 80 ++++++++++++++-----
+ 10 files changed, 295 insertions(+), 45 deletions(-)
+
+diff --git a/web/src/components/AePrCards.test.tsx b/web/src/components/AePrCards.test.tsx
+index a84636c4273d10b0e13b65413d57e0354333d891..3410b1af8535fa157e1ef9c78529ab813e1130b8 100644
+--- a/web/src/components/AePrCards.test.tsx
++++ b/web/src/components/AePrCards.test.tsx
+@@ -256,6 +256,32 @@ describe("AePrCards", () => {
+     expect(children[2].textContent).toBe("Cancel");
+   });
+ 
++  it("locks the method while the merge is in flight", async () => {
++    let finish: (response: Response) => void = () => undefined;
++    serve((path) =>
++      path.endsWith("/merge")
++        ? new Promise<Response>((resolve) => {
++            finish = resolve;
++          })
++        : json(card(18)),
++    );
++    renderCards([{ url: url(18) }]);
++    fireEvent.click(await screen.findByRole("button", { name: "Merge" }));
++    const group = screen.getByRole("radiogroup", { name: "Merge method" });
++    fireEvent.click(screen.getByRole("button", { name: "Confirm merge" }));
++    await waitFor(() =>
++      expect(within(group).getByRole("radio", { name: "Merge commit" })).toBeDisabled(),
++    );
++    expect(within(group).getByRole("radio", { name: "Squash" })).toBeDisabled();
++    fireEvent.click(within(group).getByRole("radio", { name: "Merge commit" }));
++    expect(within(group).getByRole("radio", { name: "Squash" })).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++    finish(new Response(JSON.stringify({ error: { message: "stop" } }), { status: 409 }));
++    await waitFor(() => expect(within(group).getByRole("radio", { name: "Squash" })).toBeEnabled());
++  });
++
+   it("hides the method choice when the repository allows one method", async () => {
+     serve(() => json(card(16, { merge: { ...card(16).merge, methods: ["squash"] } })));
+     renderCards([{ url: url(16) }]);
+diff --git a/web/src/components/AePrCards.tsx b/web/src/components/AePrCards.tsx
+index 563c4b9ae07ca59a9fcad19efe77a1beec2e462c..f4ea4a0e2efdb999972acbcb89088ee2d4d0ac3d 100644
+--- a/web/src/components/AePrCards.tsx
++++ b/web/src/components/AePrCards.tsx
+@@ -224,8 +224,9 @@ function ConfirmMerge({
+                   type="button"
+                   role="radio"
+                   aria-checked={checked}
++                  disabled={merge.isPending}
+                   className={cn(
+-                    "inline-flex h-11 min-w-0 flex-auto cursor-pointer items-center justify-center gap-1 rounded-md px-1.5 text-ui whitespace-nowrap @[30rem]/aepr:px-2.5 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 md:h-[1.625rem]",
++                    "inline-flex h-11 min-w-0 flex-auto cursor-pointer items-center justify-center gap-1 rounded-md px-1.5 text-ui whitespace-nowrap @[30rem]/aepr:px-2.5 outline-none focus-visible:ring-3 focus-visible:ring-ring/50 disabled:cursor-default disabled:opacity-50 md:h-[1.625rem]",
+                     checked
+                       ? "bg-background font-semibold text-foreground shadow-sm ring-1 ring-foreground/20 dark:bg-foreground/20"
+                       : "font-medium text-muted-foreground hover:text-foreground",
+@@ -320,7 +321,9 @@ export function AePrCardView({
+       data-pr={url}
+       className={cn(
+         "@container/aepr flex flex-col gap-1.5 rounded-lg border border-border bg-background p-2",
+-        inline && "mt-2 max-w-xl",
++        // A set width, not max-w only: the container ignores its content, so
++        // the chat's w-fit bubble would shrink the card to the message text.
++        inline && "mt-2 w-xl max-w-full",
+       )}
+     >
+       <div className="flex min-w-0 items-center gap-2">
+diff --git a/web/src/components/AeTablerIconPicker.test.tsx b/web/src/components/AeTablerIconPicker.test.tsx
+index 4887898126a0fa9482b9d9980251a20c6c8f3cdf..ec1799bfb967b3d98f9f174b3aac097afc6bc12f 100644
+--- a/web/src/components/AeTablerIconPicker.test.tsx
++++ b/web/src/components/AeTablerIconPicker.test.tsx
+@@ -2,8 +2,10 @@
+ // tag, pick by click or keyboard, and `onSelect` gets `tabler:<name>`.
+ 
+ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { useState } from "react";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { AeTablerIconPicker, searchAeTablerIcons } from "./AeTablerIconPicker";
++import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ 
+ vi.mock("@/lib/aeTablerIconData", () => {
+   const path = [["path", { d: "M4 4h16v16h-16z" }]];
+@@ -20,6 +22,7 @@ vi.mock("@/lib/aeTablerIconData", () => {
+   return {
+     aeTablerIconsIfLoaded: () => null,
+     loadAeTablerIcons: () => Promise.resolve(Object.fromEntries(names.map((n) => [n, path]))),
++    subscribeAeTablerIcons: () => () => undefined,
+     loadAeTablerIconTags: () =>
+       Promise.resolve({
+         rocket: { category: "Map", tags: ["galaxy", "spaceship"] },
+@@ -100,6 +103,39 @@ describe("AeTablerIconPicker", () => {
+     expect(onSelect).toHaveBeenCalledWith("tabler:code");
+   });
+ 
++  it("picks nothing with Enter in an empty search box", async () => {
++    const onSelect = await renderPicker();
++    const search = screen.getByTestId("ae-tabler-search");
++    fireEvent.keyDown(search, { key: "Enter" });
++    fireEvent.change(search, { target: { value: "   " } });
++    fireEvent.keyDown(search, { key: "Enter" });
++    expect(onSelect).not.toHaveBeenCalled();
++  });
++
++  it("focuses the search box when opened in a popover with a button above it", async () => {
++    // The rename popover's shape: "Remove icon" first, then the picker.
++    function Harness() {
++      const [open, setOpen] = useState(false);
++      return (
++        <Popover open={open} onOpenChange={setOpen}>
++          <PopoverTrigger asChild>
++            <button type="button">Change project icon</button>
++          </PopoverTrigger>
++          <PopoverContent>
++            <button type="button">Remove icon</button>
++            <AeTablerIconPicker onSelect={vi.fn()} />
++          </PopoverContent>
++        </Popover>
++      );
++    }
++    render(<Harness />);
++    fireEvent.click(screen.getByRole("button", { name: "Change project icon" }));
++    const search = await screen.findByTestId("ae-tabler-search");
++    await screen.findByTestId("ae-tabler-icon-rocket");
++    expect(search).toHaveFocus();
++    expect(screen.getByRole("button", { name: "Remove icon" })).not.toHaveFocus();
++  });
++
+   it("moves through the grid with the arrow keys and back to the search box", async () => {
+     await renderPicker();
+     const search = screen.getByTestId("ae-tabler-search");
+diff --git a/web/src/components/AeTablerIconPicker.tsx b/web/src/components/AeTablerIconPicker.tsx
+index d8d15ab112333767620d43fdf45423f6034e3c0d..3f79108df963531983d6e552bb07634f0b43c4bd 100644
+--- a/web/src/components/AeTablerIconPicker.tsx
++++ b/web/src/components/AeTablerIconPicker.tsx
+@@ -94,6 +94,11 @@ function PickerBody({
+   const gridRef = useRef<HTMLDivElement>(null);
+   const focusPending = useRef(false);
+ 
++  // The search box takes focus on open, as emoji-mart's autoFocus did; this
++  // runs before the popover's own open auto-focus, which then leaves it there
++  // instead of landing on a button above the picker such as "Remove icon".
++  useEffect(() => inputRef.current?.focus({ preventScroll: true }), []);
++
+   useEffect(() => {
+     let live = true;
+     // Tags only widen the search; names still match while they load or if they fail.
+@@ -140,7 +145,9 @@ function PickerBody({
+     if (e.key === "ArrowDown" && results.length > 0) {
+       e.preventDefault();
+       focusCell(0);
+-    } else if (e.key === "Enter" && results.length > 0) {
++    } else if (e.key === "Enter" && query.trim() && results.length > 0) {
++      // Only a typed search picks: the landing tile saves on select, so Enter
++      // in an empty box must not overwrite the icon with the first suggestion.
+       e.preventDefault();
+       pick(results[0]);
+     }
+diff --git a/web/src/extensions/services/projects.test.ts b/web/src/extensions/services/projects.test.ts
+index ede47931bcbccacc1d2cd7556cb08d274eefb6c6..b4f67ea6db43da1f8acd64ce09efb3f52071448a 100644
+--- a/web/src/extensions/services/projects.test.ts
++++ b/web/src/extensions/services/projects.test.ts
+@@ -1,3 +1,4 @@
++import { readFileSync } from "node:fs";
+ import { QueryClient } from "@tanstack/react-query";
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import {
+@@ -5,6 +6,7 @@ import {
+   createProjectSummary,
+   listProjectSummaries,
+   parseCreateProjectParams,
++  PROJECT_ICON_MAX_LENGTH,
+   projectSummary,
+ } from "./projects";
+ 
+@@ -20,13 +22,25 @@ describe("projectSummary", () => {
+       name: "n".repeat(300),
+       user_id: "private@example.com",
+       created_at: 1,
+-      config: { icon: "🔥".repeat(20) },
++      config: { icon: "🔥".repeat(40) },
+     });
+     expect(Object.keys(summary).sort()).toEqual(["icon", "id", "name"]);
+     expect(summary.name).toHaveLength(100);
+-    expect(summary.icon).toHaveLength(16);
++    expect(summary.icon).toHaveLength(PROJECT_ICON_MAX_LENGTH);
+     expect(projectSummary({ id: "proj_2", name: "Plain" }).icon).toBeNull();
+   });
++
++  it("passes the longest tabler icon name through intact", () => {
++    const icon = "tabler:device-ipad-horizontal-exclamation";
++    expect(projectSummary({ id: "proj_3", name: "Long", config: { icon } }).icon).toBe(icon);
++  });
++
++  it("fits every name in the installed @tabler/icons", () => {
++    const file = "node_modules/@tabler/icons/tabler-nodes-outline.json";
++    const names = Object.keys(JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>);
++    const longest = Math.max(...names.map((name) => name.length));
++    expect("tabler:".length + longest).toBeLessThanOrEqual(PROJECT_ICON_MAX_LENGTH);
++  });
+ });
+ 
+ describe("cachedProjectSummaries", () => {
+diff --git a/web/src/extensions/services/projects.ts b/web/src/extensions/services/projects.ts
+index 55ef8facbd410e354139403130503b818b4caa94..a4868d06351bb9fe1a85878a8a2e2d095efb4a0d 100644
+--- a/web/src/extensions/services/projects.ts
++++ b/web/src/extensions/services/projects.ts
+@@ -5,7 +5,8 @@ import type { ExtensionProjectSummary } from "../types";
+ import { ExtensionHostServiceError } from "./errors";
+ 
+ export const PROJECT_NAME_MAX_LENGTH = 100;
+-export const PROJECT_ICON_MAX_LENGTH = 16;
++// Room for a `tabler:<name>` project icon: 41 characters at most in @tabler/icons 3.46.
++export const PROJECT_ICON_MAX_LENGTH = 48;
+ const PROJECT_ID_MAX_LENGTH = 256;
+ const PROJECT_ERROR_MAX_LENGTH = 200;
+ 
+diff --git a/web/src/lib/aeTablerIcon.test.tsx b/web/src/lib/aeTablerIcon.test.tsx
+index 9297ec0d8898de331ba1b707a23ae33e7af1c91e..374ce43112f783aecb16b82f5431c0c3e81b1b0c 100644
+--- a/web/src/lib/aeTablerIcon.test.tsx
++++ b/web/src/lib/aeTablerIcon.test.tsx
+@@ -3,19 +3,38 @@
+ // no icon and an unknown name both fall back to the folder.
+ 
+ import { cleanup, render, screen } from "@testing-library/react";
+-import { afterEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { AE_TABLER_PREFIX, AeProjectIconGlyph, aeTablerName, aeTablerValue } from "./aeTablerIcon";
+ import { ProjectRowIcon } from "@/shell/ProjectPicker";
+ 
+ const ROCKET_D = "M4 13a8 8 0 0 1 7 7";
+ 
+-vi.mock("@/lib/aeTablerIconData", () => {
+-  const set = { rocket: [["path", { d: "M4 13a8 8 0 0 1 7 7" }]] };
+-  return {
+-    aeTablerIconsIfLoaded: () => null,
+-    loadAeTablerIcons: () => Promise.resolve(set),
+-    loadAeTablerIconTags: () => Promise.resolve({}),
+-  };
++// A loader that can fail on demand and tells subscribers on success, like the real one.
++const data = vi.hoisted(() => ({
++  set: { rocket: [["path", { d: "M4 13a8 8 0 0 1 7 7" }]] },
++  loaded: null as object | null,
++  failing: false,
++  listeners: new Set<(set: object) => void>(),
++}));
++
++vi.mock("@/lib/aeTablerIconData", () => ({
++  aeTablerIconsIfLoaded: () => data.loaded,
++  loadAeTablerIcons: () => {
++    if (data.failing) return Promise.reject(new Error("offline"));
++    data.loaded = data.set;
++    for (const listener of [...data.listeners]) listener(data.set);
++    return Promise.resolve(data.set);
++  },
++  subscribeAeTablerIcons: (listener: (set: object) => void) => {
++    data.listeners.add(listener);
++    return () => data.listeners.delete(listener);
++  },
++  loadAeTablerIconTags: () => Promise.resolve({}),
++}));
++
++beforeEach(() => {
++  data.loaded = null;
++  data.failing = false;
+ });
+ 
+ afterEach(cleanup);
+@@ -78,3 +97,41 @@ describe("AeProjectIconGlyph", () => {
+     expect(container.querySelector("svg")?.getAttribute("class")).toContain("size-[1em]");
+   });
+ });
++
++describe("icon names that are Object.prototype keys", () => {
++  it("draws the folder for tabler:constructor and tabler:__proto__ instead of throwing", async () => {
++    const { container } = render(
++      <>
++        <ProjectRowIcon icon="tabler:constructor" />
++        <ProjectRowIcon icon="tabler:__proto__" />
++        <AeProjectIconGlyph icon="tabler:constructor" />
++      </>,
++    );
++    await vi.waitFor(() => expect(container.querySelectorAll("svg.lucide-folder")).toHaveLength(2));
++    expect(container.querySelector("[data-tabler-icon]")).toBeNull();
++  });
++});
++
++describe("recovery after a failed load", () => {
++  it("redraws icons that saw the failure once a later load succeeds", async () => {
++    data.failing = true;
++    const rows = render(
++      <>
++        <ProjectRowIcon icon="tabler:rocket" />
++        <ProjectRowIcon icon="tabler:rocket" />
++      </>,
++    );
++    await vi.waitFor(() =>
++      expect(rows.container.querySelectorAll("svg.lucide-folder")).toHaveLength(2),
++    );
++    // The picker's Try again: another hook instance loads, this time successfully.
++    data.failing = false;
++    render(<AeProjectIconGlyph icon="tabler:rocket" />);
++    await vi.waitFor(() =>
++      expect(rows.container.querySelectorAll('[data-tabler-icon="rocket"] svg path')).toHaveLength(
++        2,
++      ),
++    );
++    expect(rows.container.querySelector("svg.lucide-folder")).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeTablerIcon.tsx b/web/src/lib/aeTablerIcon.tsx
+index 42e8cbe23572108d5692ce328a76823365bdde78..f45eac2f0675fe8af4d323b75b7de13e1030a69f 100644
+--- a/web/src/lib/aeTablerIcon.tsx
++++ b/web/src/lib/aeTablerIcon.tsx
+@@ -11,6 +11,7 @@ import {
+   type AeTablerIconSet,
+   aeTablerIconsIfLoaded,
+   loadAeTablerIcons,
++  subscribeAeTablerIcons,
+ } from "@/lib/aeTablerIconData";
+ import { cn } from "@/lib/utils";
+ 
+@@ -29,23 +30,38 @@ export function aeTablerValue(name: string): string {
+   return `${AE_TABLER_PREFIX}${name}`;
+ }
+ 
+-/** The outline set once loaded; `"error"` when the chunk failed to load. */
++/**
++ * The outline set once loaded; `"error"` when the load failed, until any later
++ * load (the picker's Try again) succeeds.
++ */
+ export function useAeTablerIcons(): AeTablerIconSet | "error" | null {
+   const [set, setSet] = useState<AeTablerIconSet | "error" | null>(aeTablerIconsIfLoaded);
+   useEffect(() => {
+-    if (set !== null) return undefined;
++    if (set !== null && set !== "error") return undefined;
+     let live = true;
+-    loadAeTablerIcons().then(
+-      (loaded) => live && setSet(loaded),
+-      () => live && setSet("error"),
+-    );
++    const unsubscribe = subscribeAeTablerIcons((loaded) => live && setSet(loaded));
++    // A load that succeeded between the failure and this subscription.
++    const already = aeTablerIconsIfLoaded();
++    if (already) setSet(already);
++    else if (set === null) {
++      loadAeTablerIcons().then(
++        (loaded) => live && setSet(loaded),
++        () => live && setSet("error"),
++      );
++    }
+     return () => {
+       live = false;
++      unsubscribe();
+     };
+   }, [set]);
+   return set;
+ }
+ 
++/** The icon's paths, or `undefined`; an own-key check, so `constructor` is not an icon. */
++function iconNode(set: AeTablerIconSet | "error" | null, name: string | null) {
++  return name && set && set !== "error" && Object.hasOwn(set, name) ? set[name] : undefined;
++}
++
+ /** One Tabler outline icon as an inline SVG, drawn in `currentColor`. */
+ export function AeTablerSvg({ node, className }: { node: AeTablerIconNode; className?: string }) {
+   return (
+@@ -82,7 +98,7 @@ export function AeTablerSvg({ node, className }: { node: AeTablerIconNode; class
+ export function AeTablerRowIcon({ icon, className }: { icon: string; className?: string }) {
+   const set = useAeTablerIcons();
+   const name = aeTablerName(icon);
+-  const node = name && set && set !== "error" ? set[name] : undefined;
++  const node = iconNode(set, name);
+   if (set === "error" || (set && !node)) {
+     return (
+       <FolderIcon
+@@ -119,7 +135,7 @@ export function AeProjectIconGlyph({ icon }: { icon: string }) {
+ 
+ function AeTablerGlyph({ name }: { name: string }) {
+   const set = useAeTablerIcons();
+-  const node = set && set !== "error" ? set[name] : undefined;
++  const node = iconNode(set, name);
+   if (set === "error" || (set && !node)) {
+     return <FolderIcon aria-hidden="true" className="size-[1em]" />;
+   }
+diff --git a/web/src/lib/aeTablerIconData.test.ts b/web/src/lib/aeTablerIconData.test.ts
+index 1ae588e3181ab0cf7c698f0aaba2aa97b5331708..2187fd8c422f934a68f779223c0c56828ed1fba4 100644
+--- a/web/src/lib/aeTablerIconData.test.ts
++++ b/web/src/lib/aeTablerIconData.test.ts
+@@ -1,26 +1,74 @@
+-// The real lazy chunks: the glob on the installed `@tabler/icons` path must
++// The real JSON assets: the glob on the installed `@tabler/icons` path must
+ // find both files, or every `tabler:` icon silently degrades to the folder.
++// `fetch` is served from disk, so the URLs the loaders ask for are checked too.
+ 
+-import { describe, expect, it } from "vitest";
++import { readFileSync } from "node:fs";
++import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+ import {
+   aeTablerIconsIfLoaded,
+   loadAeTablerIcons,
+   loadAeTablerIconTags,
++  subscribeAeTablerIcons,
+ } from "@/lib/aeTablerIconData";
+ 
++const requested: string[] = [];
++let failNext = false;
++
++beforeAll(() => {
++  vi.stubGlobal(
++    "fetch",
++    vi.fn((input: RequestInfo | URL) => {
++      const url = String(input);
++      requested.push(url);
++      if (failNext) {
++        failNext = false;
++        // Safari's wording for a dropped connection.
++        return Promise.reject(new TypeError("Load failed"));
++      }
++      // Vite's dev URL: `/@fs/<absolute path>` outside the root, else root-relative.
++      const path = url.split("?")[0];
++      const file = path.startsWith("/@fs/") ? path.slice("/@fs".length) : `.${path}`;
++      return Promise.resolve(new Response(readFileSync(file)));
++    }),
++  );
++});
++
++afterAll(() => {
++  vi.unstubAllGlobals();
++});
++
+ describe("aeTablerIconData", () => {
+-  it("loads the outline set once and caches it", async () => {
++  it("retries a failed load under a new URL, then loads once and caches", async () => {
++    const heard = vi.fn();
++    const unsubscribe = subscribeAeTablerIcons(heard);
++    failNext = true;
++    await expect(loadAeTablerIcons()).rejects.toThrow("Load failed");
+     expect(aeTablerIconsIfLoaded()).toBeNull();
++    expect(heard).not.toHaveBeenCalled();
++
+     const set = await loadAeTablerIcons();
++    expect(requested).toHaveLength(2);
++    expect(requested[0]).toMatch(/tabler-nodes-outline\.json$/);
++    // Not the same URL again: a browser that cached the failure must refetch.
++    expect(requested[1]).toBe(`${requested[0]}?retry=1`);
++    expect(heard).toHaveBeenCalledWith(set);
++    unsubscribe();
++
+     expect(Object.keys(set).length).toBeGreaterThan(4000);
+     expect(set.rocket[0][0]).toBe("path");
+     expect(typeof set.rocket[0][1].d).toBe("string");
+     expect(aeTablerIconsIfLoaded()).toBe(set);
+     expect(await loadAeTablerIcons()).toBe(set);
++    expect(requested).toHaveLength(2);
+   });
+ 
+-  it("loads the search tags", async () => {
++  it("loads the search tags, retrying under a new URL", async () => {
++    requested.length = 0;
++    failNext = true;
++    await expect(loadAeTablerIconTags()).rejects.toThrow("Load failed");
+     const tags = await loadAeTablerIconTags();
++    expect(requested[0]).toMatch(/icons\.json$/);
++    expect(requested[1]).toBe(`${requested[0]}?retry=1`);
+     expect(tags.rocket.tags).toContain("space");
+   });
+ });
+diff --git a/web/src/lib/aeTablerIconData.ts b/web/src/lib/aeTablerIconData.ts
+index 746e4726e81306aa14a04f6eb615d2cee072faf7..7ba6fd414dcbcd3ec950399b2d4385be70de3509 100644
+--- a/web/src/lib/aeTablerIconData.ts
++++ b/web/src/lib/aeTablerIconData.ts
+@@ -1,10 +1,16 @@
+ // The Tabler icon set behind project icons (omnigent-ae, 2026-09-24). Two lazy
+-// chunks from `@tabler/icons`, never in the main bundle: the outline shapes of
+-// every icon (about 240 KB gzipped, fetched the first time a `tabler:` icon
++// JSON files from `@tabler/icons`, never in the main bundle: the outline shapes
++// of every icon (about 240 KB gzipped, fetched the first time a `tabler:` icon
+ // renders or the picker opens) and the search tags (about 200 KB gzipped,
+ // fetched by the picker only). Both files sit outside the package's `exports`
+ // map, so they are reached with a glob on the installed path; that also keeps
+ // tsc from typing two megabytes of JSON.
++//
++// Fetched as JSON assets rather than `import()`ed chunks (2026-09-27): Safari
++// caches a failed dynamic import, so retrying the same `import()` never
++// succeeds there. The eager `?url` glob bundles only each file's URL (relative
++// to `import.meta.url`, so any base path works); a retry adds `retry=N`, which
++// the static server ignores and every cache treats as a new URL.
+ 
+ /** One outline icon: its `<path>` elements and their attributes. */
+ export type AeTablerIconNode = [tag: string, attrs: Record<string, string>][];
+@@ -12,53 +18,89 @@ export type AeTablerIconSet = Record<string, AeTablerIconNode>;
+ /** Icon name to its category and tags, from the package's `icons.json`. */
+ export type AeTablerIconTags = Record<string, { category?: string; tags?: (string | number)[] }>;
+ 
+-const nodeFiles = import.meta.glob<AeTablerIconSet>(
++const nodeFiles = import.meta.glob<string>(
+   "/node_modules/@tabler/icons/tabler-nodes-outline.json",
+-  { import: "default" },
++  {
++    query: "?url",
++    import: "default",
++    eager: true,
++  },
+ );
+-const tagFiles = import.meta.glob<AeTablerIconTags>("/node_modules/@tabler/icons/icons.json", {
++const tagFiles = import.meta.glob<string>("/node_modules/@tabler/icons/icons.json", {
++  query: "?url",
+   import: "default",
++  eager: true,
+ });
+ 
+-function loadOne<T>(files: Record<string, () => Promise<T>>, what: string): Promise<T> {
+-  const load = Object.values(files)[0];
+-  if (!load) {
+-    return Promise.reject(
+-      new Error(`@tabler/icons ${what} is missing; run pnpm install in web/ and rebuild`),
+-    );
++async function loadOne<T>(files: Record<string, string>, what: string, retry: number): Promise<T> {
++  const url = Object.values(files)[0];
++  if (!url) {
++    throw new Error(`@tabler/icons ${what} is missing; run pnpm install in web/ and rebuild`);
+   }
+-  return load();
++  const target = retry > 0 ? `${url}${url.includes("?") ? "&" : "?"}retry=${retry}` : url;
++  // A static asset of this bundle, not a server API route: the host transport
++  // (authenticatedFetch) is for API paths, so a plain fetch is the right call.
++  // oxlint-disable-next-line no-restricted-globals
++  const response = await fetch(target);
++  if (!response.ok) {
++    throw new Error(`@tabler/icons ${what} failed to load (HTTP ${response.status}); try again`);
++  }
++  return (await response.json()) as T;
+ }
+ 
+ let iconSet: AeTablerIconSet | null = null;
+ let iconSetPromise: Promise<AeTablerIconSet> | null = null;
+ let iconTagsPromise: Promise<AeTablerIconTags> | null = null;
++let iconSetFailures = 0;
++let iconTagsFailures = 0;
++const iconSetListeners = new Set<(set: AeTablerIconSet) => void>();
+ 
+ /** The loaded set, or `null` until `loadAeTablerIcons` has resolved once. */
+ export function aeTablerIconsIfLoaded(): AeTablerIconSet | null {
+   return iconSet;
+ }
+ 
+-/** Fetch the outline set once; a failed fetch is retried on the next call. */
++/**
++ * Call `listener` when the outline set loads, whoever asked for it, so an icon
++ * that saw a failed load draws itself once a later retry succeeds. Returns the
++ * unsubscribe.
++ */
++export function subscribeAeTablerIcons(listener: (set: AeTablerIconSet) => void): () => void {
++  iconSetListeners.add(listener);
++  return () => {
++    iconSetListeners.delete(listener);
++  };
++}
++
++/** Fetch the outline set once; after a failure the next call fetches again under a new URL. */
+ export function loadAeTablerIcons(): Promise<AeTablerIconSet> {
+-  iconSetPromise ??= loadOne(nodeFiles, "tabler-nodes-outline.json").then(
++  iconSetPromise ??= loadOne<AeTablerIconSet>(
++    nodeFiles,
++    "tabler-nodes-outline.json",
++    iconSetFailures,
++  ).then(
+     (set) => {
+       iconSet = set;
++      for (const listener of [...iconSetListeners]) listener(set);
+       return set;
+     },
+     (err: unknown) => {
+       iconSetPromise = null;
++      iconSetFailures += 1;
+       throw err;
+     },
+   );
+   return iconSetPromise;
+ }
+ 
+-/** Fetch the search tags once; a failed fetch is retried on the next call. */
++/** Fetch the search tags once; after a failure the next call fetches again under a new URL. */
+ export function loadAeTablerIconTags(): Promise<AeTablerIconTags> {
+-  iconTagsPromise ??= loadOne(tagFiles, "icons.json").catch((err: unknown) => {
+-    iconTagsPromise = null;
+-    throw err;
+-  });
++  iconTagsPromise ??= loadOne<AeTablerIconTags>(tagFiles, "icons.json", iconTagsFailures).catch(
++    (err: unknown) => {
++      iconTagsPromise = null;
++      iconTagsFailures += 1;
++      throw err;
++    },
++  );
+   return iconTagsPromise;
+ }

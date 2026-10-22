@@ -1,0 +1,418 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 24 Sep 2026 20:40:38 +0000
+Subject: [PATCH 007/148] [ae-patch] Name the slots row Dashboard and show the
+ slots in the session header
+
+The sidebar's Slots n/3 row becomes Dashboard n/3, the one nav entry for
+omnigent-ae's Dashboard extension, active on its routes. A new chip in the
+session header shows the session's ae.status and the slot count and opens the
+Dashboard, so the count is visible on every session, the phone included.
+Upstream edit: two lines in web/src/shell/ChatHeader.tsx.
+---
+ web/src/components/AeSessionChip.test.tsx | 90 +++++++++++++++++++++++
+ web/src/components/AeSessionChip.tsx      | 74 +++++++++++++++++++
+ web/src/components/AeSlotsPill.test.tsx   | 30 +++++---
+ web/src/components/AeSlotsPill.tsx        | 24 ++++--
+ web/src/lib/aeLabels.ts                   |  3 +
+ web/src/shell/ChatHeader.tsx              |  2 +
+ web/src/shell/Sidebar.aeStatus.test.tsx   | 10 +--
+ 7 files changed, 212 insertions(+), 21 deletions(-)
+ create mode 100644 web/src/components/AeSessionChip.test.tsx
+ create mode 100644 web/src/components/AeSessionChip.tsx
+
+diff --git a/web/src/components/AeSessionChip.test.tsx b/web/src/components/AeSessionChip.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7254d8f744c99bcd0e1659cd791c6a32aa2ef806
+--- /dev/null
++++ b/web/src/components/AeSessionChip.test.tsx
+@@ -0,0 +1,90 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, render, screen } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, describe, expect, it } from "vitest";
++import type { Conversation } from "@/hooks/useConversations";
++import { AE_PARKING_LOT_PATH } from "@/lib/aeLabels";
++import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
++import { AeSessionChip, readAeSessionStatus } from "./AeSessionChip";
++
++afterEach(cleanup);
++
++function row(id: string, extra: Partial<Conversation> = {}): Conversation {
++  return {
++    id,
++    object: "conversation",
++    title: id,
++    created_at: 1,
++    updated_at: 1,
++    labels: { "ae.status": "working" },
++    permission_level: null,
++    ...extra,
++  };
++}
++
++function pages(rows: Conversation[]): ConversationsInfiniteData {
++  return {
++    pages: [
++      {
++        data: rows,
++        first_id: rows[0]?.id ?? null,
++        last_id: rows.at(-1)?.id ?? null,
++        has_more: false,
++      },
++    ],
++    pageParams: [undefined],
++  };
++}
++
++function renderChip(qc: QueryClient, id: string) {
++  return render(
++    <QueryClientProvider client={qc}>
++      <MemoryRouter>
++        <AeSessionChip conversationId={id} />
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++}
++
++describe("readAeSessionStatus", () => {
++  it("finds the row in any conversations list and derives blocked", () => {
++    const qc = new QueryClient();
++    qc.setQueryData(
++      ["conversations", "", true],
++      pages([row("w", { pending_elicitations_count: 1 })]),
++    );
++    expect(readAeSessionStatus(qc, "w")).toBe("blocked");
++    expect(readAeSessionStatus(qc, "missing")).toBeNull();
++  });
++});
++
++describe("AeSessionChip", () => {
++  it("shows the session's status and the slot count, and opens the Dashboard", () => {
++    const qc = new QueryClient();
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([row("a"), row("p", { labels: { "ae.status": "parked" } })]),
++    );
++    renderChip(qc, "p");
++    const chip = screen.getByTestId("ae-session-chip");
++    expect(chip).toHaveAccessibleName("Parked; slots 1 of 3; open the Dashboard");
++    expect(chip).toHaveAttribute("href", AE_PARKING_LOT_PATH);
++    expect(chip).toHaveTextContent("1/3");
++    expect(chip).toHaveAttribute("data-full", "false");
++  });
++
++  it("turns red at the limit and shows the count alone for an unknown session", () => {
++    const qc = new QueryClient();
++    renderChip(qc, "elsewhere");
++    expect(screen.getByTestId("ae-session-chip")).toHaveAccessibleName(
++      "slots 0 of 3; open the Dashboard",
++    );
++    act(() => {
++      qc.setQueryData(["conversations", "", false], pages([row("a"), row("b"), row("c")]));
++    });
++    const chip = screen.getByTestId("ae-session-chip");
++    expect(chip).toHaveTextContent("3/3");
++    expect(chip).toHaveAttribute("data-full", "true");
++    expect(chip).toHaveClass("text-destructive");
++  });
++});
+diff --git a/web/src/components/AeSessionChip.tsx b/web/src/components/AeSessionChip.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c1db42cb6045171b64ebd2abead4d1f63cb27eb2
+--- /dev/null
++++ b/web/src/components/AeSessionChip.tsx
+@@ -0,0 +1,74 @@
++// The session header's slots chip (omnigent-ae, 2026-09-24): the session's
++// own `ae.status` icon and the slot count, "n/3", red at the limit; a tap
++// opens the Dashboard. Reid asked for the slot count on every session and on
++// the phone, where the sidebar (and its "Dashboard n/3" row) is a closed
++// drawer, so the header was the only place a session could show it.
++//
++// Both numbers come from the `["conversations"]` query cache the sidebar
++// already keeps warm (the row for this session, and the same count the
++// sidebar row reads), so the chip costs no request. A session the cache does
++// not hold shows the count alone.
++
++import { type QueryClient, useQueryClient } from "@tanstack/react-query";
++import { useCallback, useSyncExternalStore } from "react";
++import type { Conversation } from "@/hooks/useConversations";
++import { AE_PARKING_LOT_PATH, AE_SLOT_LIMIT, aeDisplayStatus, type AeStatus } from "@/lib/aeLabels";
++import { Link } from "@/lib/routing";
++import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
++import { cn } from "@/lib/utils";
++import { AE_STATUS_ICONS, AE_STATUS_WORDS } from "./AeStatusIcon";
++import { useAeSlotCount } from "./AeSlotsPill";
++
++/** This session's displayed status from any cached `["conversations", ...]` list. */
++export function readAeSessionStatus(queryClient: QueryClient, id: string): AeStatus | null {
++  for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
++    queryKey: ["conversations"],
++  })) {
++    for (const page of data?.pages ?? []) {
++      const row = page.data.find((conversation: Conversation) => conversation.id === id);
++      if (row) return aeDisplayStatus(row);
++    }
++  }
++  return null;
++}
++
++function useAeSessionStatus(id: string): AeStatus | null {
++  const queryClient = useQueryClient();
++  const subscribe = useCallback(
++    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
++    [queryClient],
++  );
++  const read = useCallback(() => readAeSessionStatus(queryClient, id), [queryClient, id]);
++  return useSyncExternalStore(subscribe, read, read);
++}
++
++export function AeSessionChip({ conversationId }: { conversationId: string }) {
++  const status = useAeSessionStatus(conversationId);
++  const count = useAeSlotCount();
++  const full = count >= AE_SLOT_LIMIT;
++  const Icon = status ? AE_STATUS_ICONS[status] : null;
++  // The link's label carries the status word, so the icon is decorative (no
++  // AeStatusIcon tooltip nested inside a link).
++  const label = `${status ? `${AE_STATUS_WORDS[status]}; ` : ""}slots ${count} of ${AE_SLOT_LIMIT}; open the Dashboard`;
++  return (
++    <Link
++      to={AE_PARKING_LOT_PATH}
++      componentId="chat.header.ae-session-chip"
++      data-testid="ae-session-chip"
++      data-full={full ? "true" : "false"}
++      aria-label={label}
++      title={label}
++      className={cn(
++        "inline-flex h-7 items-center gap-1 rounded-full border px-2 text-xs tabular-nums max-md:h-11 max-md:border-0 max-md:px-3",
++        full
++          ? "border-destructive/40 font-semibold text-destructive"
++          : "border-border text-muted-foreground hover:text-foreground",
++      )}
++    >
++      {Icon && <Icon aria-hidden="true" className="size-3.5 max-md:size-4" />}
++      <span>
++        {count}/{AE_SLOT_LIMIT}
++      </span>
++    </Link>
++  );
++}
+diff --git a/web/src/components/AeSlotsPill.test.tsx b/web/src/components/AeSlotsPill.test.tsx
+index da82cbf40f560f884abcb612431ac369530e1c85..a7672af95f33c00ca23349b17ce4626d4c0b87c4 100644
+--- a/web/src/components/AeSlotsPill.test.tsx
++++ b/web/src/components/AeSlotsPill.test.tsx
+@@ -36,10 +36,10 @@ function pages(rows: Conversation[]): ConversationsInfiniteData {
+   };
+ }
+ 
+-function renderPill(qc: QueryClient) {
++function renderPill(qc: QueryClient, path = "/") {
+   return render(
+     <QueryClientProvider client={qc}>
+-      <MemoryRouter>
++      <MemoryRouter initialEntries={[path]}>
+         <AeSlotsPill />
+       </MemoryRouter>
+     </QueryClientProvider>,
+@@ -71,11 +71,11 @@ describe("readAeSlotCount", () => {
+ });
+ 
+ describe("AeSlotsPill", () => {
+-  it("reads Slots n/3 and links to the Parking Lot page", () => {
++  it("reads Dashboard n/3 and links to the Dashboard", () => {
+     const qc = new QueryClient();
+     qc.setQueryData(["conversations", "", false], pages([row("a")]));
+     renderPill(qc);
+-    const link = screen.getByRole("link", { name: "Slots 1/3" });
++    const link = screen.getByRole("link", { name: "Dashboard 1/3" });
+     expect(link).toHaveAttribute("href", AE_PARKING_LOT_PATH);
+     expect(screen.getByTestId("ae-slots-count")).toHaveAttribute("data-full", "false");
+     expect(screen.getByTestId("ae-slots-count")).not.toHaveClass("text-destructive");
+@@ -85,7 +85,7 @@ describe("AeSlotsPill", () => {
+     const qc = new QueryClient();
+     qc.setQueryData(["conversations", "", false], pages([row("a"), row("b"), row("c")]));
+     renderPill(qc);
+-    expect(screen.getByRole("link", { name: "Slots 3/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 3/3" })).toBeInTheDocument();
+     expect(screen.getByTestId("ae-slots-count")).toHaveAttribute("data-full", "true");
+     expect(screen.getByTestId("ae-slots-count")).toHaveClass("text-destructive");
+ 
+@@ -95,19 +95,19 @@ describe("AeSlotsPill", () => {
+         pages([row("a"), row("b"), row("c"), row("d")]),
+       );
+     });
+-    expect(screen.getByRole("link", { name: "Slots 4/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 4/3" })).toBeInTheDocument();
+     expect(screen.getByTestId("ae-slots-count")).toHaveAttribute("data-full", "true");
+   });
+ 
+   it("repaints when the cache changes", () => {
+     const qc = new QueryClient();
+     renderPill(qc);
+-    expect(screen.getByRole("link", { name: "Slots 0/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 0/3" })).toBeInTheDocument();
+ 
+     act(() => {
+       qc.setQueryData(["conversations", "", false], pages([row("a"), row("b")]));
+     });
+-    expect(screen.getByRole("link", { name: "Slots 2/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 2/3" })).toBeInTheDocument();
+ 
+     act(() => {
+       qc.setQueryData(
+@@ -115,6 +115,18 @@ describe("AeSlotsPill", () => {
+         pages([row("a", { labels: { "ae.status": "parked" } })]),
+       );
+     });
+-    expect(screen.getByRole("link", { name: "Slots 0/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 0/3" })).toBeInTheDocument();
++  });
++
++  it("is the active row on either Dashboard route and nowhere else", () => {
++    const qc = new QueryClient();
++    renderPill(qc, "/extensions/analyticendeavors.parking-lot/your-move");
++    expect(screen.getByRole("link", { name: "Dashboard 0/3" })).toHaveAttribute(
++      "aria-current",
++      "page",
++    );
++    cleanup();
++    renderPill(qc, "/c/abc");
++    expect(screen.getByRole("link", { name: "Dashboard 0/3" })).not.toHaveAttribute("aria-current");
+   });
+ });
+diff --git a/web/src/components/AeSlotsPill.tsx b/web/src/components/AeSlotsPill.tsx
+index b02ad0c7a549fdf92db3d9ffb2aee555550bd70e..d20ff8b76c26ed601e0ab937a61b43d1b89d29a2 100644
+--- a/web/src/components/AeSlotsPill.tsx
++++ b/web/src/components/AeSlotsPill.tsx
+@@ -1,4 +1,7 @@
+-// The "Slots n/3" pill in the sidebar's primary navigation: how many sessions
++// The "Dashboard n/3" row in the sidebar's primary navigation (the "Slots
++// n/3" pill until 2026-09-24, when omnigent-ae merged its Parking Lot and Your
++// move pages into one Dashboard and this row became the one nav entry for it,
++// docs/design/dashboard-review.md in omnigent-ae): how many sessions
+ // hold a slot (`ae.status=working`, top-level, not archived), read from the
+ // `["conversations"]` query cache the sidebar already keeps warm, so it costs
+ // no request and repaints with every list delta. Red at the limit. Links to
+@@ -9,10 +12,16 @@
+ // (`ae_omni_policies.slot_cap`, and `GET /v1/ae/capacity`) is the authority;
+ // this pill is the glanceable copy of it.
+ 
+-import { GaugeIcon } from "lucide-react";
++import { LayoutDashboardIcon } from "lucide-react";
+ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+ import { type MouseEvent, useCallback, useSyncExternalStore } from "react";
+-import { AE_PARKING_LOT_PATH, AE_SLOT_LIMIT, countAeSlots } from "@/lib/aeLabels";
++import {
++  AE_DASHBOARD_PREFIX,
++  AE_PARKING_LOT_PATH,
++  AE_SLOT_LIMIT,
++  countAeSlots,
++} from "@/lib/aeLabels";
++import { useLocation } from "@/lib/routing";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+ import { cn } from "@/lib/utils";
+ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+@@ -43,17 +52,18 @@ export interface AeSlotsPillProps {
+ export function AeSlotsPill({ onNavigate }: AeSlotsPillProps) {
+   const count = useAeSlotCount();
+   const full = count >= AE_SLOT_LIMIT;
++  const { pathname } = useLocation();
+   return (
+     <PrimaryNavLink
+       to={AE_PARKING_LOT_PATH}
+-      label="Slots"
+-      icon={GaugeIcon}
+-      active={false}
++      label="Dashboard"
++      icon={LayoutDashboardIcon}
++      active={pathname.startsWith(AE_DASHBOARD_PREFIX)}
+       onClick={onNavigate}
+       componentId="sidebar.ae-slots"
+       testId="ae-slots-pill"
+       trailing={
+-        // The space keeps the link's accessible name reading "Slots n/3";
++        // The space keeps the link's accessible name reading "Dashboard n/3";
+         // a bare text node in the flex row takes no room.
+         <>
+           {" "}
+diff --git a/web/src/lib/aeLabels.ts b/web/src/lib/aeLabels.ts
+index e0eb94641c3852f1f94e9314b9b91e14444ad6aa..61007329a347dc5ea5d5997269fc7cb93851025f 100644
+--- a/web/src/lib/aeLabels.ts
++++ b/web/src/lib/aeLabels.ts
+@@ -35,6 +35,9 @@ export const AE_SLOT_LIMIT = 3;
+ /** Where the slots pill links: the Parking Lot page (an extension, Phase 3). */
+ export const AE_PARKING_LOT_PATH = "/extensions/analyticendeavors.parking-lot/lot";
+ 
++/** Every route of the Dashboard extension (both its pages render the Dashboard). */
++export const AE_DASHBOARD_PREFIX = "/extensions/analyticendeavors.parking-lot/";
++
+ /**
+  * The legacy session-title glyphs from the branch-discipline rules, one per
+  * status. Imported Claude Code sessions carry them; nothing here ever writes
+diff --git a/web/src/shell/ChatHeader.tsx b/web/src/shell/ChatHeader.tsx
+index c200f889afd8460d73c708819dcf1224d4103f57..db9bdd72d9b6dcab9c86f1cdeaa95f78e10938fb 100644
+--- a/web/src/shell/ChatHeader.tsx
++++ b/web/src/shell/ChatHeader.tsx
+@@ -48,6 +48,7 @@ import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+ import { TAB_BADGE_BASE } from "./railTabs";
+ import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
+ import { SidebarOpenButton } from "./SidebarOpenButton";
++import { AeSessionChip } from "@/components/AeSessionChip";
+ 
+ const RIGHT_PANEL_KEYS = [MOD_KEY, ALT_KEY, "]"] as const;
+ 
+@@ -605,6 +606,7 @@ export function ChatHeader({
+       </div>
+ 
+       <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
++        {conversationId && <AeSessionChip conversationId={conversationId} />}
+         {/* Other users currently viewing this session (presence).
+             Self-contained — reads the chat store directly, renders
+             nothing when the user is alone. */}
+diff --git a/web/src/shell/Sidebar.aeStatus.test.tsx b/web/src/shell/Sidebar.aeStatus.test.tsx
+index b55858fbc66640a1395640796f50169e550f1685..7b92c86a5e74ca6580477114301ae02b9042473e 100644
+--- a/web/src/shell/Sidebar.aeStatus.test.tsx
++++ b/web/src/shell/Sidebar.aeStatus.test.tsx
+@@ -350,13 +350,13 @@ describe("ae.status icon on session rows", () => {
+ });
+ 
+ describe("slots pill", () => {
+-  it("sits in the primary navigation and links to the Parking Lot page", () => {
++  it("sits in the primary navigation as Dashboard n/3 and links to the Dashboard", () => {
+     renderSidebar();
+     const nav = screen.getByTestId("sidebar-primary-nav");
+     // `asChild` merges the test id onto the anchor itself.
+     const pill = within(nav).getByTestId("ae-slots-pill");
+     expect(pill.tagName).toBe("A");
+-    expect(pill).toHaveAccessibleName("Slots 0/3");
++    expect(pill).toHaveAccessibleName("Dashboard 0/3");
+     expect(pill).toHaveAttribute("href", "/extensions/analyticendeavors.parking-lot/lot");
+     expect(within(pill).getByTestId("ae-slots-count")).toHaveAttribute("data-full", "false");
+   });
+@@ -369,7 +369,7 @@ describe("slots pill", () => {
+       conv("sub", { labels: { "ae.status": "working" }, parent_session_id: "a" }),
+       conv("old", { labels: { "ae.status": "working" }, archived: true }),
+     ]);
+-    expect(screen.getByRole("link", { name: "Slots 2/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 2/3" })).toBeInTheDocument();
+     expect(screen.getByTestId("ae-slots-count")).not.toHaveClass("text-destructive");
+   });
+ 
+@@ -379,7 +379,7 @@ describe("slots pill", () => {
+       conv("b", { labels: { "ae.status": "working" } }),
+       conv("c", { labels: { "ae.status": "working" } }),
+     ]);
+-    expect(screen.getByRole("link", { name: "Slots 3/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 3/3" })).toBeInTheDocument();
+     const count = screen.getByTestId("ae-slots-count");
+     expect(count).toHaveAttribute("data-full", "true");
+     expect(count).toHaveClass("text-destructive");
+@@ -389,7 +389,7 @@ describe("slots pill", () => {
+     mocks.isMobile = true;
+     mockConversations([conv("w", { labels: { "ae.status": "working" } })]);
+     renderSidebar([conv("w", { labels: { "ae.status": "working" } })]);
+-    expect(screen.getByRole("link", { name: "Slots 1/3" })).toBeInTheDocument();
++    expect(screen.getByRole("link", { name: "Dashboard 1/3" })).toBeInTheDocument();
+     const row = screen.getByRole("link", { name: /Session w/ });
+     expect(within(row).getByRole("img", { name: "Working" })).toBeInTheDocument();
+   });

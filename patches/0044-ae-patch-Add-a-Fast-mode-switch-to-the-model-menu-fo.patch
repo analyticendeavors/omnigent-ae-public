@@ -1,0 +1,1868 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 11:03:37 -0700
+Subject: [PATCH 044/148] [ae-patch] Add a Fast mode switch to the model menu
+ for Claude sessions
+
+Reid asked on 2026-10-14 for a fast mode toggle in the model menu when a
+session runs Claude, like Claude Desktop's. Claude Code's fast mode (faster
+Opus output, billed to usage credits) is switched with `/fast on` or
+`/fast off`, and the statusLine payload carries a `fast_mode` boolean.
+
+- The model menu of a claude-native session gets a "Fast mode" row, a
+  switch with the hint "Faster Opus output; bills usage credits". It is
+  enabled only on Opus 5.5, Opus 5 and Opus 4.8 ("Opus only" otherwise),
+  reads the session's state each time the menu opens ("Unknown until the
+  session replies" before the first status line), shows "Turning fast mode
+  on..." while it waits, and reverts with the reason when the change fails.
+- GET and PUT `/v1/sessions/{id}/fast-mode` (routes_ae_fast_mode.py, same
+  access rules as the model change) forward a `fast_mode_status` or
+  `fast_mode_change` event to the runner.
+- The runner (ae_fast_mode.py) handles them for claude-native sessions
+  only: it types `/fast on` or `/fast off` into the Claude Code terminal (an
+  explicit argument opens no dialog) and replies once the statusLine
+  snapshot reports the new state, or answers 409 or 503 with the reason
+  (another harness, no terminal, a prompt pending, no confirmation in 10
+  seconds). It types nothing when the snapshot already shows the state.
+- The claude-native status writer now keeps `fast_mode` in `context.json`.
+
+The box sets `fastModePerSessionOptIn`, so every session starts with fast
+mode off and the switch never changes another session's default.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ omnigent/harnesses/claude_native/status.py    |   3 +
+ omnigent/runner/ae_fast_mode.py               | 198 ++++++++++
+ omnigent/runner/app.py                        |  14 +
+ omnigent/runner/native_controls.py            |   3 +
+ omnigent/server/routes/sessions/__init__.py   |  10 +
+ .../routes/sessions/routes_ae_fast_mode.py    | 147 ++++++++
+ tests/runner/test_ae_fast_mode.py             | 340 ++++++++++++++++++
+ .../server/routes/test_ae_fast_mode_routes.py | 290 +++++++++++++++
+ web/src/components/AeFastMode.test.tsx        | 239 ++++++++++++
+ web/src/components/AeFastMode.tsx             | 129 +++++++
+ web/src/lib/aeFastMode.test.ts                | 142 ++++++++
+ web/src/lib/aeFastMode.ts                     | 143 ++++++++
+ web/src/pages/ChatPage.composer.test.tsx      |   8 +-
+ web/src/pages/ChatPage.tsx                    |   7 +
+ 14 files changed, 1669 insertions(+), 4 deletions(-)
+ create mode 100644 omnigent/runner/ae_fast_mode.py
+ create mode 100644 omnigent/server/routes/sessions/routes_ae_fast_mode.py
+ create mode 100644 tests/runner/test_ae_fast_mode.py
+ create mode 100644 tests/server/routes/test_ae_fast_mode_routes.py
+ create mode 100644 web/src/components/AeFastMode.test.tsx
+ create mode 100644 web/src/components/AeFastMode.tsx
+ create mode 100644 web/src/lib/aeFastMode.test.ts
+ create mode 100644 web/src/lib/aeFastMode.ts
+
+diff --git a/omnigent/harnesses/claude_native/status.py b/omnigent/harnesses/claude_native/status.py
+index a3e414c0686fa38c882de566674282c612fdc089..a20e72c998f01674ac8db52369ae4cfb1b7d11f2 100644
+--- a/omnigent/harnesses/claude_native/status.py
++++ b/omnigent/harnesses/claude_native/status.py
+@@ -71,6 +71,9 @@ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] |
+         model_id = model.strip()
+     if model_id is not None:
+         record["model"] = model_id
++    # 2026-10-14: kept so the web's fast mode switch can read and confirm it.
++    if isinstance(payload.get("fast_mode"), bool):
++        record["fast_mode"] = payload["fast_mode"]
+     return record
+ 
+ 
+diff --git a/omnigent/runner/ae_fast_mode.py b/omnigent/runner/ae_fast_mode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..42c3eda05d12153140d15b8126203198f039ed03
+--- /dev/null
++++ b/omnigent/runner/ae_fast_mode.py
+@@ -0,0 +1,198 @@
++"""Fast mode for claude-native sessions: the runner side of the web's switch.
++
++Reid asked on 2026-10-14 for Claude Desktop's fast mode switch in the
++composer's model menu, per session. Claude Code toggles it in a running TUI
++with ``/fast on`` or ``/fast off``: with an explicit argument there is no
++confirm dialog, and the command runs even while a turn streams (the running
++turn keeps its speed). Bare ``/fast`` opens a picker, so it is never sent.
++Claude Code reruns the statusLine whenever fast mode changes, and its stdin
++carries a top-level ``fast_mode`` boolean that the forwarder keeps in
++``context.json`` (``omnigent/harnesses/claude_native/status.py``).
++
++Two control events reach :func:`handle_fast_mode_event` from the runner's
++``POST /v1/sessions/{id}/events`` dispatch:
++
++``{"type": "fast_mode_status"}``
++    ``200 {"enabled": bool | null}`` read from the snapshot; ``null`` means
++    no statusLine render has reported fast mode yet. Never touches the pane.
++``{"type": "fast_mode_change", "enabled": bool}``
++    Types ``/fast on`` or ``/fast off`` and answers ``200 {"enabled": bool}``
++    only once the snapshot shows the new state.
++
++Failures answer non-2xx with ``{"error": <code>, "detail": <sentence>}``.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import time
++from collections.abc import Awaitable, Callable
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++from fastapi.responses import JSONResponse, Response
++
++if TYPE_CHECKING:
++    import httpx
++
++_logger = logging.getLogger(__name__)
++
++CHANGE_EVENT = "fast_mode_change"
++
++# The statusLine snapshot the forwarder writes (status.py's ``_CONTEXT_FILE``).
++_CONTEXT_FILE = "context.json"
++_CLAUDE_NATIVE = "claude-native"
++
++# The statusLine reruns within about 300 ms of a change and the forwarder
++# normalizes it every 250 ms; the budget also covers PreModelSwitch hooks.
++FAST_MODE_CONFIRM_TIMEOUT_S = 10.0
++FAST_MODE_CONFIRM_POLL_S = 0.25
++
++PreparePane = Callable[[str, Path], Awaitable[None]]
++
++
++def read_claude_fast_mode(bridge_dir: Path) -> bool | None:
++    """
++    Read fast mode from the statusLine snapshot ``context.json``.
++
++    :param bridge_dir: Bridge directory shared with the forwarder, e.g.
++        ``/tmp/omnigent-1000/claude-native/<digest>``.
++    :returns: ``True`` or ``False`` as Claude Code last reported it, or
++        ``None`` when the file is missing, unreadable, or has no boolean
++        ``fast_mode`` (no render since the key was recorded).
++    """
++    try:
++        parsed = json.loads((bridge_dir / _CONTEXT_FILE).read_text(encoding="utf-8"))
++    except (OSError, json.JSONDecodeError):
++        return None
++    value = parsed.get("fast_mode") if isinstance(parsed, dict) else None
++    return value if isinstance(value, bool) else None
++
++
++def _error(status_code: int, code: str, detail: str) -> JSONResponse:
++    """Build the runner's error body, the shape the server relays."""
++    return JSONResponse(status_code=status_code, content={"error": code, "detail": detail})
++
++
++async def handle_fast_mode_event(
++    conversation_id: str,
++    body: object,
++    *,
++    harness: str | None,
++    server_client: httpx.AsyncClient,
++    prepare_pane: PreparePane,
++) -> Response:
++    """
++    Answer a ``fast_mode_status`` or ``fast_mode_change`` control event.
++
++    :param conversation_id: Session id, e.g. ``"conv_abc123"``.
++    :param body: The decoded ``/events`` body, e.g.
++        ``{"type": "fast_mode_change", "enabled": True}``.
++    :param harness: The session's canonical harness, e.g. ``"claude-native"``,
++        or ``None`` when the runner has not loaded the session.
++    :param server_client: Client for the Omnigent server, used to resolve the
++        session's bridge id label.
++    :param prepare_pane: The runner's heal step for a dead Claude pane, run
++        before typing (the same one the model change uses).
++    :returns: ``200`` with ``{"enabled": ...}``, or an error response.
++    """
++    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
++    from omnigent.runner.native import _claude_native_bridge_id_for_session
++
++    payload = body if isinstance(body, dict) else {}
++    is_change = payload.get("type") == CHANGE_EVENT
++    enabled = payload.get("enabled")
++    if is_change and not isinstance(enabled, bool):
++        return _error(400, "invalid_input", "Body 'enabled' must be a boolean.")
++    if harness is None:
++        if not is_change:
++            return JSONResponse({"enabled": None})
++        return _error(
++            503,
++            "session_not_loaded",
++            "The runner has not loaded this session yet. Send a message to start "
++            "it, then switch fast mode.",
++        )
++    if harness != _CLAUDE_NATIVE:
++        return _error(
++            409,
++            "fast_mode_unsupported",
++            f"Fast mode is a Claude Code setting; this session runs {harness}.",
++        )
++    bridge_id = await _claude_native_bridge_id_for_session(
++        server_client=server_client,
++        session_id=conversation_id,
++    )
++    bridge_dir = bridge_dir_for_bridge_id(bridge_id)
++    if not is_change:
++        current = await asyncio.to_thread(read_claude_fast_mode, bridge_dir)
++        return JSONResponse({"enabled": current})
++    assert isinstance(enabled, bool)
++    return await _change_fast_mode(conversation_id, bridge_dir, enabled, prepare_pane)
++
++
++async def _change_fast_mode(
++    conversation_id: str,
++    bridge_dir: Path,
++    enabled: bool,
++    prepare_pane: PreparePane,
++) -> Response:
++    """Type ``/fast on|off`` and wait for the snapshot to report it."""
++    from omnigent.harnesses.claude_native.bridge import (
++        ClaudeUserPromptPending,
++        inject_slash_command,
++    )
++    from omnigent.process_logging import process_log_reference
++
++    state = "on" if enabled else "off"
++    await prepare_pane(conversation_id, bridge_dir)
++    if not bridge_dir.is_dir():
++        return _error(
++            503,
++            "claude_native_bridge_missing",
++            "This session has no Claude Code terminal right now. Send a message to "
++            "start it, then switch fast mode.",
++        )
++    if await asyncio.to_thread(read_claude_fast_mode, bridge_dir) is enabled:
++        # Already there: typing the command again would only add a transcript line.
++        return JSONResponse({"enabled": enabled})
++    command = f"/fast {state}"
++    try:
++        # No auto_confirm: an explicit on or off opens no dialog (2.1.299 checked).
++        await asyncio.to_thread(inject_slash_command, bridge_dir, command=command, timeout_s=1.0)
++    except ClaudeUserPromptPending as exc:
++        return _error(409, "claude_native_prompt_pending", str(exc))
++    except (RuntimeError, ValueError) as exc:
++        _logger.warning(
++            "claude-native fast mode change failed for session=%s",
++            conversation_id,
++            exc_info=exc,
++            extra={"session_id": conversation_id},
++        )
++        return _error(
++            503,
++            "claude_native_fast_mode_failed",
++            f"Claude Code did not take {command}; see the runner log for details: "
++            f"{process_log_reference('runner')}",
++        )
++    deadline = time.monotonic() + FAST_MODE_CONFIRM_TIMEOUT_S
++    while True:
++        if await asyncio.to_thread(read_claude_fast_mode, bridge_dir) is enabled:
++            return JSONResponse({"enabled": enabled})
++        if time.monotonic() >= deadline:
++            break
++        await asyncio.sleep(FAST_MODE_CONFIRM_POLL_S)
++    _logger.warning(
++        "claude-native fast mode %s for session=%s was not confirmed by the statusLine",
++        state,
++        conversation_id,
++        extra={"session_id": conversation_id},
++    )
++    return _error(
++        503,
++        "claude_native_fast_mode_unconfirmed",
++        f"Claude Code did not confirm the change within {FAST_MODE_CONFIRM_TIMEOUT_S:.0f}s; "
++        "run /fast in the terminal to see why.",
++    )
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index b54365efa21307d67b4bd6f796389db3105578ab..3047f01262380d94bf33b736aa4df55040fe6438 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -6772,6 +6772,17 @@ def create_runner_app(
+                 )
+             return Response(status_code=204)
+ 
++        if body_type in ("fast_mode_status", "fast_mode_change"):
++            from omnigent.runner.ae_fast_mode import handle_fast_mode_event
++
++            return await handle_fast_mode_event(
++                conversation_id,
++                body,
++                harness=_session_harness_name(conversation_id),
++                server_client=server_client,
++                prepare_pane=_prepare_claude_native_pane_for_injection,
++            )
++
+         if body_type == "plan_mode_change":
+             harness = _session_harness_name(conversation_id)
+             if harness == "codex-native":
+@@ -7166,6 +7177,9 @@ def create_runner_app(
+         server_client=server_client,
+     )
+     _codex_native_model_options = _native_controls.codex_native_model_options
++    _prepare_claude_native_pane_for_injection = (
++        _native_controls.prepare_claude_native_pane_for_injection
++    )
+     _handle_claude_native_btw_dismiss = _native_controls.handle_claude_native_btw_dismiss
+     _handle_claude_native_compact = _native_controls.handle_claude_native_compact
+     _handle_claude_native_cost_popup = _native_controls.handle_claude_native_cost_popup
+diff --git a/omnigent/runner/native_controls.py b/omnigent/runner/native_controls.py
+index 76de40cf1432a160cb67c222a5283516b4c9f34f..e4fae9047597aba7cea6cbbf2990787fc946fd27 100644
+--- a/omnigent/runner/native_controls.py
++++ b/omnigent/runner/native_controls.py
+@@ -218,6 +218,8 @@ class NativeControls:
+     is_sdk_compact_body: Callable[[dict[str, Any]], bool]
+     opencode_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
+     teardown_session_terminals: Callable[[str], Coroutine[Any, Any, None]]
++    # The runner's fast mode dispatch types /fast into the same healed pane.
++    prepare_claude_native_pane_for_injection: Callable[[str, Path], Coroutine[Any, Any, None]]
+ 
+ 
+ def build_native_controls(
+@@ -2134,4 +2136,5 @@ def build_native_controls(
+         is_sdk_compact_body=_is_sdk_compact_body,
+         opencode_native_model_options=_opencode_native_model_options,
+         teardown_session_terminals=_teardown_session_terminals,
++        prepare_claude_native_pane_for_injection=_prepare_claude_native_pane_for_injection,
+     )
+diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
+index 3137771450206de216832792cee1c8d151327bf4..bb5b07217438412ee4e1663810d5b304fc5afeb9 100644
+--- a/omnigent/server/routes/sessions/__init__.py
++++ b/omnigent/server/routes/sessions/__init__.py
+@@ -994,4 +994,14 @@ def create_sessions_router(
+         host_registry=host_registry,
+     )
+ 
++    from omnigent.server.routes.sessions.routes_ae_fast_mode import register_ae_fast_mode_routes
++
++    register_ae_fast_mode_routes(
++        router,
++        conversation_store=conversation_store,
++        runner_router=runner_router,
++        auth_provider=auth_provider,
++        permission_store=permission_store,
++    )
++
+     return router
+diff --git a/omnigent/server/routes/sessions/routes_ae_fast_mode.py b/omnigent/server/routes/sessions/routes_ae_fast_mode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7ea6e02297d6ad4c1a95b126399b9ef6bfa21f65
+--- /dev/null
++++ b/omnigent/server/routes/sessions/routes_ae_fast_mode.py
+@@ -0,0 +1,147 @@
++"""Fast mode routes: how the web's switch reaches a claude-native runner.
++
++Reid asked on 2026-10-14 for Claude Desktop's fast mode switch in the
++composer's model menu, per session. Fast mode lives only in the running
++Claude Code TUI (``fastModePerSessionOptIn`` keeps it out of settings), so
++nothing is persisted here: both routes forward a control event to the bound
++runner the way the model change does (``_forward_session_change_to_runner``),
++and ``omnigent/runner/ae_fast_mode.py`` reads or flips the TUI.
++
++``GET /v1/sessions/{id}/fast-mode``
++    ``{"enabled": bool | null}``; ``null`` (unknown) when no runner answers
++    or Claude Code has not reported fast mode yet. Read access.
++``PUT /v1/sessions/{id}/fast-mode`` with ``{"enabled": bool}``
++    ``{"enabled": bool}`` once the TUI confirmed it. Edit access, the level a
++    model change needs, and a JSON body like every other control write.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++
++from fastapi import APIRouter, Depends, Request
++from pydantic import BaseModel, ConfigDict, StrictBool
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.runner.routing import RunnerRouter
++from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ, AuthProvider
++from omnigent.server.routes._auth_helpers import get_user_id, require_access
++from omnigent.server.routes._content_type import require_json_content_type
++from omnigent.server.routes._errors import session_not_found
++from omnigent.server.routes._sessions.helpers import (
++    _forward_session_change_to_runner,
++    _RunnerForwardResult,
++)
++from omnigent.stores import ConversationStore
++from omnigent.stores.permission_store import PermissionStore
++
++# The runner types the command, then polls for up to 10 s; typing alone can
++# take about 16 s in the worst case, past the 20 s budget the model change uses.
++FAST_MODE_FORWARD_TIMEOUT_S = 30.0
++
++_RUNNER_STATUS_CODES = {400: ErrorCode.INVALID_INPUT, 409: ErrorCode.CONFLICT}
++
++
++class FastModeState(BaseModel):
++    """The session's fast mode; ``None`` until Claude Code reports it."""
++
++    enabled: bool | None
++
++
++class FastModeChangeRequest(BaseModel):
++    """Body of ``PUT /v1/sessions/{id}/fast-mode``."""
++
++    model_config = ConfigDict(extra="forbid")
++
++    enabled: StrictBool
++
++
++def _runner_detail(result: _RunnerForwardResult) -> str:
++    """Return the runner's own sentence for a failure, else its status code."""
++    try:
++        payload = json.loads(result.body)
++    except (TypeError, ValueError):
++        payload = None
++    detail = payload.get("detail") if isinstance(payload, dict) else None
++    if isinstance(detail, str) and detail.strip():
++        return detail.strip()
++    return f"the runner returned status {result.status_code}."
++
++
++def _state_from_runner(result: _RunnerForwardResult, *, action: str) -> FastModeState:
++    """Map the runner's answer to the route's response, raising on a refusal."""
++    if not 200 <= result.status_code < 300:
++        raise OmnigentError(
++            f"Could not {action}: {_runner_detail(result)}",
++            code=_RUNNER_STATUS_CODES.get(result.status_code, ErrorCode.RUNNER_UNAVAILABLE),
++        )
++    try:
++        payload = json.loads(result.body)
++    except (TypeError, ValueError):
++        payload = None
++    enabled = payload.get("enabled") if isinstance(payload, dict) else None
++    return FastModeState(enabled=enabled if isinstance(enabled, bool) else None)
++
++
++def register_ae_fast_mode_routes(
++    router: APIRouter,
++    *,
++    conversation_store: ConversationStore,
++    runner_router: RunnerRouter | None,
++    auth_provider: AuthProvider | None,
++    permission_store: PermissionStore | None,
++) -> None:
++    """
++    Add the fast mode routes to the sessions router.
++
++    :param router: The sessions router, mounted under ``/v1``.
++    :param conversation_store: Store used for the access check and lookup.
++    :param runner_router: Resolves the session's bound runner.
++    :param auth_provider: Auth provider, or ``None`` when auth is off.
++    :param permission_store: Permission store, or ``None`` when checks are off.
++    """
++
++    async def _authorized(request: Request, session_id: str, level: int) -> None:
++        user_id = get_user_id(request, auth_provider)
++        await require_access(user_id, session_id, level, permission_store, conversation_store)
++        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
++        if conv is None or conv.agent_id is None:
++            raise session_not_found()
++
++    @router.get("/sessions/{session_id}/fast-mode")
++    async def get_session_fast_mode(request: Request, session_id: str) -> FastModeState:
++        """Read the session's fast mode from its Claude Code terminal."""
++        await _authorized(request, session_id, LEVEL_READ)
++        result = await _forward_session_change_to_runner(
++            session_id, runner_router, {"type": "fast_mode_status"}
++        )
++        if result is None:
++            return FastModeState(enabled=None)
++        return _state_from_runner(result, action="read fast mode")
++
++    @router.put(
++        "/sessions/{session_id}/fast-mode",
++        dependencies=[Depends(require_json_content_type)],
++    )
++    async def put_session_fast_mode(
++        request: Request,
++        session_id: str,
++        body: FastModeChangeRequest,
++    ) -> FastModeState:
++        """Turn fast mode on or off in the session's Claude Code terminal."""
++        await _authorized(request, session_id, LEVEL_EDIT)
++        action = f"turn fast mode {'on' if body.enabled else 'off'}"
++        result = await _forward_session_change_to_runner(
++            session_id,
++            runner_router,
++            {"type": "fast_mode_change", "enabled": body.enabled},
++            timeout_s=FAST_MODE_FORWARD_TIMEOUT_S,
++        )
++        if result is None:
++            raise OmnigentError(
++                f"Could not {action}: no live runner is serving this session. "
++                "Send a message to wake it, then try again.",
++                code=ErrorCode.RUNNER_UNAVAILABLE,
++            )
++        return _state_from_runner(result, action=action)
+diff --git a/tests/runner/test_ae_fast_mode.py b/tests/runner/test_ae_fast_mode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..75b41973c339c3ad82c8794dc326e922b6dca5e0
+--- /dev/null
++++ b/tests/runner/test_ae_fast_mode.py
+@@ -0,0 +1,340 @@
++"""Tests for the claude-native fast mode events and the snapshot they read.
++
++The pane is never real here: ``inject_slash_command`` is stubbed, and the stub
++plays Claude Code plus the forwarder by writing ``context.json`` the way the
++statusLine wrapper does, so the reader under test is the real one.
++"""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from omnigent.harnesses.claude_native import bridge as claude_native_bridge
++from omnigent.harnesses.claude_native import status as claude_native_status
++from omnigent.runner import ae_fast_mode, create_runner_app
++from omnigent.runner.ae_fast_mode import handle_fast_mode_event, read_claude_fast_mode
++from omnigent.spec.types import AgentSpec, ExecutorSpec
++from tests.runner.conftest import _FakeProcessManager, _runner_client, _ScriptedHarnessClient
++from tests.runner.helpers import NullServerClient
++
++SESSION_ID = "5f1e0c3a9b7d4e2fa6c8b0d1e3f5a7c9"
++AGENT_ID = "880b5afda28ad55ff74cbeb9b5fc67fb"
++
++
++def _write_snapshot(bridge_dir: Path, **fields: object) -> None:
++    """Write a ``context.json`` record through the wrapper's own normalizer."""
++    raw = {"context_window": {"context_window_size": 200_000}, **fields}
++    record = claude_native_status.normalize_status_payload(raw)
++    assert record is not None
++    bridge_dir.mkdir(parents=True, exist_ok=True)
++    (bridge_dir / "context.json").write_text(json.dumps(record), encoding="utf-8")
++
++
++class _Pane:
++    """Stub for ``inject_slash_command`` that records commands and flips the snapshot."""
++
++    def __init__(self, bridge_dir: Path, *, applies: bool = True) -> None:
++        self.bridge_dir = bridge_dir
++        self.applies = applies
++        self.calls: list[dict[str, Any]] = []
++
++    def __call__(self, bridge_dir: Path, *, command: str, **kwargs: Any) -> None:
++        self.calls.append({"bridge_dir": bridge_dir, "command": command, **kwargs})
++        if self.applies:
++            _write_snapshot(bridge_dir, fast_mode=command == "/fast on")
++
++
++@pytest.fixture
++def bridge_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """Point every bridge id at a temp dir and keep the confirm loop fast."""
++    root = tmp_path / "bridges"
++    monkeypatch.setattr(claude_native_bridge, "bridge_dir_for_bridge_id", lambda bid: root / bid)
++    monkeypatch.setattr(ae_fast_mode, "FAST_MODE_CONFIRM_TIMEOUT_S", 0.2)
++    monkeypatch.setattr(ae_fast_mode, "FAST_MODE_CONFIRM_POLL_S", 0.01)
++    return root / SESSION_ID
++
++
++async def _no_heal(conversation_id: str, bridge_dir: Path) -> None:
++    del conversation_id, bridge_dir
++
++
++async def _event(body: dict[str, Any], *, harness: str | None = "claude-native") -> Any:
++    response = await handle_fast_mode_event(
++        SESSION_ID,
++        body,
++        harness=harness,
++        server_client=NullServerClient(),  # type: ignore[arg-type]
++        prepare_pane=_no_heal,
++    )
++    return response.status_code, json.loads(bytes(response.body)) if response.body else None
++
++
++# The snapshot: status.py keeps the key, the reader returns it.
++
++
++@pytest.mark.parametrize("value", [True, False])
++def test_normalize_keeps_fast_mode(value: bool) -> None:
++    record = claude_native_status.normalize_status_payload(
++        {"context_window": {"context_window_size": 200_000}, "fast_mode": value}
++    )
++    assert record is not None
++    assert record["fast_mode"] is value
++
++
++def test_normalize_drops_a_non_boolean_fast_mode() -> None:
++    record = claude_native_status.normalize_status_payload(
++        {"context_window": {"context_window_size": 200_000}, "fast_mode": "true"}
++    )
++    assert record is not None
++    assert "fast_mode" not in record
++
++
++def test_raw_capture_round_trips_to_the_reader(tmp_path: Path) -> None:
++    """The shim's raw capture, normalized by the forwarder, reads back as on."""
++    raw = {
++        "context_window": {"context_window_size": 1_000_000},
++        "model": {"id": "claude-opus-5-5"},
++        "fast_mode": True,
++    }
++    (tmp_path / claude_native_status.CONTEXT_RAW_FILE).write_text(json.dumps(raw))
++    claude_native_status.sync_raw_status_context(tmp_path, None)
++    assert read_claude_fast_mode(tmp_path) is True
++
++
++@pytest.mark.parametrize(
++    "content",
++    [None, "{not json", json.dumps(["list"]), json.dumps({"model": "x"}), '{"fast_mode": 1}'],
++)
++def test_reader_answers_unknown_without_a_boolean(tmp_path: Path, content: str | None) -> None:
++    if content is not None:
++        (tmp_path / "context.json").write_text(content)
++    assert read_claude_fast_mode(tmp_path) is None
++
++
++# The handler, called directly.
++
++
++async def test_status_reads_the_snapshot(bridge_dir: Path) -> None:
++    _write_snapshot(bridge_dir, fast_mode=True)
++    assert await _event({"type": "fast_mode_status"}) == (200, {"enabled": True})
++
++
++async def test_status_is_unknown_without_a_snapshot(bridge_dir: Path) -> None:
++    assert await _event({"type": "fast_mode_status"}) == (200, {"enabled": None})
++
++
++async def test_status_is_unknown_before_the_runner_loads_the_session(bridge_dir: Path) -> None:
++    assert await _event({"type": "fast_mode_status"}, harness=None) == (200, {"enabled": None})
++
++
++async def test_change_types_fast_on_and_confirms(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write_snapshot(bridge_dir, fast_mode=False)
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    assert await _event({"type": "fast_mode_change", "enabled": True}) == (200, {"enabled": True})
++    assert [call["command"] for call in pane.calls] == ["/fast on"]
++    # An explicit argument opens no dialog, so nothing may answer one blind.
++    assert "auto_confirm" not in pane.calls[0]
++
++
++async def test_change_types_fast_off_and_confirms(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write_snapshot(bridge_dir, fast_mode=True)
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    assert await _event({"type": "fast_mode_change", "enabled": False}) == (
++        200,
++        {"enabled": False},
++    )
++    assert [call["command"] for call in pane.calls] == ["/fast off"]
++
++
++async def test_change_from_unknown_confirms_once_the_snapshot_reports(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    bridge_dir.mkdir(parents=True)
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    assert await _event({"type": "fast_mode_change", "enabled": True}) == (200, {"enabled": True})
++    assert len(pane.calls) == 1
++
++
++async def test_change_already_in_place_types_nothing(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write_snapshot(bridge_dir, fast_mode=True)
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    assert await _event({"type": "fast_mode_change", "enabled": True}) == (200, {"enabled": True})
++    assert pane.calls == []
++
++
++async def test_change_that_never_shows_answers_503(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write_snapshot(bridge_dir, fast_mode=False)
++    pane = _Pane(bridge_dir, applies=False)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    status, body = await _event({"type": "fast_mode_change", "enabled": True})
++    assert status == 503
++    assert body["error"] == "claude_native_fast_mode_unconfirmed"
++    assert "did not confirm the change" in body["detail"]
++    assert "/fast" in body["detail"]
++
++
++async def test_change_with_a_failed_injection_answers_503_without_the_path(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    bridge_dir.mkdir(parents=True)
++
++    def _fail(bridge_dir: Path, **kwargs: Any) -> None:
++        raise RuntimeError(f"tmux target is not advertised in {bridge_dir}")
++
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fail)
++
++    status, body = await _event({"type": "fast_mode_change", "enabled": True})
++    assert status == 503
++    assert body["error"] == "claude_native_fast_mode_failed"
++    assert str(bridge_dir) not in body["detail"]
++    assert "/fast on" in body["detail"]
++
++
++async def test_change_with_a_pending_question_answers_409(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    bridge_dir.mkdir(parents=True)
++
++    def _pending(bridge_dir: Path, **kwargs: Any) -> None:
++        raise claude_native_bridge.ClaudeUserPromptPending(
++            "Answer the pending Claude question or permission request before changing settings."
++        )
++
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _pending)
++
++    status, body = await _event({"type": "fast_mode_change", "enabled": True})
++    assert status == 409
++    assert body["error"] == "claude_native_prompt_pending"
++    assert body["detail"].startswith("Answer the pending Claude question")
++
++
++async def test_change_without_a_bridge_answers_503_after_the_heal(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++    healed: list[tuple[str, Path]] = []
++
++    async def _heal(conversation_id: str, bridge: Path) -> None:
++        healed.append((conversation_id, bridge))
++
++    response = await handle_fast_mode_event(
++        SESSION_ID,
++        {"type": "fast_mode_change", "enabled": True},
++        harness="claude-native",
++        server_client=NullServerClient(),  # type: ignore[arg-type]
++        prepare_pane=_heal,
++    )
++    body = json.loads(bytes(response.body))
++    assert response.status_code == 503
++    assert body["error"] == "claude_native_bridge_missing"
++    assert healed == [(SESSION_ID, bridge_dir)]
++    assert pane.calls == []
++
++
++@pytest.mark.parametrize("enabled", [None, "on", 1])
++async def test_change_rejects_a_non_boolean(bridge_dir: Path, enabled: object) -> None:
++    status, body = await _event({"type": "fast_mode_change", "enabled": enabled})
++    assert status == 400
++    assert body["error"] == "invalid_input"
++
++
++async def test_change_before_the_runner_loads_the_session_answers_503(bridge_dir: Path) -> None:
++    status, body = await _event({"type": "fast_mode_change", "enabled": True}, harness=None)
++    assert status == 503
++    assert body["error"] == "session_not_loaded"
++
++
++@pytest.mark.parametrize("event", ["fast_mode_status", "fast_mode_change"])
++async def test_other_harnesses_answer_409(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch, event: str
++) -> None:
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    status, body = await _event({"type": event, "enabled": True}, harness="codex-native")
++    assert status == 409
++    assert body["error"] == "fast_mode_unsupported"
++    assert "codex-native" in body["detail"]
++    assert pane.calls == []
++
++
++# The dispatch lines in the runner's /events route.
++
++
++async def _post_events(harness: str, *bodies: dict[str, Any]) -> list[Any]:
++    spec = AgentSpec(
++        spec_version=1,
++        name="t",
++        executor=ExecutorSpec(type="omnigent", config={"harness": harness}),
++    )
++
++    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
++        del agent_id, session_id
++        return spec
++
++    app = create_runner_app(
++        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
++        spec_resolver=_resolver,
++        server_client=NullServerClient(),  # type: ignore[arg-type]
++    )
++    async with _runner_client(app) as client:
++        created = await client.post(
++            "/v1/sessions", json={"session_id": SESSION_ID, "agent_id": AGENT_ID}
++        )
++        assert created.status_code == 201, created.text
++        return [
++            await client.post(f"/v1/sessions/{SESSION_ID}/events", json=body) for body in bodies
++        ]
++
++
++async def test_runner_routes_both_events_for_a_claude_session(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _write_snapshot(bridge_dir, fast_mode=False)
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    before, change, after = await _post_events(
++        "claude-native",
++        {"type": "fast_mode_status"},
++        {"type": "fast_mode_change", "enabled": True},
++        {"type": "fast_mode_status"},
++    )
++    assert (before.status_code, before.json()) == (200, {"enabled": False})
++    assert (change.status_code, change.json()) == (200, {"enabled": True})
++    assert (after.status_code, after.json()) == (200, {"enabled": True})
++    assert [call["command"] for call in pane.calls] == ["/fast on"]
++
++
++async def test_runner_refuses_fast_mode_for_a_non_claude_session(
++    bridge_dir: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    pane = _Pane(bridge_dir)
++    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", pane)
++
++    (response,) = await _post_events("codex-native", {"type": "fast_mode_change", "enabled": True})
++    assert response.status_code == 409, response.text
++    assert response.json()["error"] == "fast_mode_unsupported"
++    assert pane.calls == []
+diff --git a/tests/server/routes/test_ae_fast_mode_routes.py b/tests/server/routes/test_ae_fast_mode_routes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..76a6193a048c891809436748adf07cfdf2dc09b5
+--- /dev/null
++++ b/tests/server/routes/test_ae_fast_mode_routes.py
+@@ -0,0 +1,290 @@
++"""Tests for ``GET`` and ``PUT /v1/sessions/{id}/fast-mode``.
++
++The routes only authorize and forward: the runner answers, so the forward is
++stubbed on the sessions facade (the seam the model change tests use too) and
++each test checks what was sent and how the runner's answer comes back.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++import httpx
++import pytest
++from fastapi import FastAPI, Request
++from fastapi.responses import JSONResponse
++from fastapi.testclient import TestClient
++
++from omnigent.errors import OmnigentError
++from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
++from omnigent.server.routes import sessions as sessions_facade
++from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
++from omnigent.server.routes.sessions import create_sessions_router
++from omnigent.server.routes.sessions.routes_ae_fast_mode import FAST_MODE_FORWARD_TIMEOUT_S
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
++from tests.server.helpers import create_test_agent
++
++OWNER = "reid@example.com"
++VIEWER = "viewer@example.com"
++AGENT_ID = "6f0c2b7e9a4d4c1e8b3a5d7f9e1c3a5b"
++
++
++class _Runner:
++    """Stands in for the bound runner behind ``_forward_session_change_to_runner``."""
++
++    def __init__(self, result: _RunnerForwardResult | None) -> None:
++        self.result = result
++        self.calls: list[tuple[str, dict[str, Any], float | None]] = []
++
++    async def __call__(
++        self,
++        session_id: str,
++        runner_router: Any,
++        event: dict[str, Any],
++        timeout_s: float | None = None,
++    ) -> _RunnerForwardResult | None:
++        del runner_router
++        self.calls.append((session_id, event, timeout_s))
++        return self.result
++
++
++def _app(db_uri: str) -> FastAPI:
++    app = FastAPI()
++
++    @app.exception_handler(OmnigentError)
++    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
++        del request
++        return JSONResponse(
++            status_code=exc.http_status,
++            content={"error": {"code": exc.code, "message": exc.message}},
++        )
++
++    app.include_router(
++        create_sessions_router(
++            conversation_store=SqlAlchemyConversationStore(db_uri),
++            agent_store=SqlAlchemyAgentStore(db_uri),
++            auth_provider=UnifiedAuthProvider(source="header"),
++            permission_store=SqlAlchemyPermissionStore(db_uri),
++        ),
++        prefix="/v1",
++    )
++    return app
++
++
++def _seed_session(db_uri: str) -> str:
++    """A session the owner owns and the viewer may only read."""
++    agents = SqlAlchemyAgentStore(db_uri)
++    if agents.get(AGENT_ID) is None:
++        agents.create(agent_id=AGENT_ID, name="claude", bundle_location=f"{AGENT_ID}/bundle")
++    conv = SqlAlchemyConversationStore(db_uri).create_conversation(title="t", agent_id=AGENT_ID)
++    perms = SqlAlchemyPermissionStore(db_uri)
++    for user in (OWNER, VIEWER):
++        perms.ensure_user(user)
++    perms.grant(OWNER, conv.id, LEVEL_OWNER)
++    perms.grant(VIEWER, conv.id, LEVEL_READ)
++    return conv.id
++
++
++@pytest.fixture
++def setup(db_uri: str) -> tuple[TestClient, str]:
++    return TestClient(_app(db_uri)), _seed_session(db_uri)
++
++
++def _runner(monkeypatch: pytest.MonkeyPatch, status: int | None, body: str = "") -> _Runner:
++    result = None if status is None else _RunnerForwardResult(status_code=status, body=body)
++    runner = _Runner(result)
++    monkeypatch.setattr(sessions_facade, "_forward_session_change_to_runner", runner)
++    return runner
++
++
++def _as(user: str) -> dict[str, str]:
++    return {"X-Forwarded-Email": user}
++
++
++@pytest.mark.parametrize("enabled", [True, False, None])
++def test_get_returns_what_the_runner_reads(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch, enabled: bool | None
++) -> None:
++    client, sid = setup
++    runner = _runner(
++        monkeypatch, 200, f'{{"enabled": {"null" if enabled is None else str(enabled).lower()}}}'
++    )
++
++    response = client.get(f"/v1/sessions/{sid}/fast-mode", headers=_as(OWNER))
++
++    assert response.status_code == 200, response.text
++    assert response.json() == {"enabled": enabled}
++    assert runner.calls == [(sid, {"type": "fast_mode_status"}, None)]
++
++
++def test_get_without_a_runner_is_unknown(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    client, sid = setup
++    _runner(monkeypatch, None)
++
++    response = client.get(f"/v1/sessions/{sid}/fast-mode", headers=_as(VIEWER))
++
++    assert response.status_code == 200, response.text
++    assert response.json() == {"enabled": None}
++
++
++def test_get_relays_a_runner_refusal(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    client, sid = setup
++    _runner(
++        monkeypatch,
++        409,
++        '{"error": "fast_mode_unsupported", '
++        '"detail": "Fast mode is a Claude Code setting; this session runs codex-native."}',
++    )
++
++    response = client.get(f"/v1/sessions/{sid}/fast-mode", headers=_as(OWNER))
++
++    assert response.status_code == 409
++    assert response.json()["error"]["message"] == (
++        "Could not read fast mode: Fast mode is a Claude Code setting; "
++        "this session runs codex-native."
++    )
++
++
++@pytest.mark.parametrize("enabled", [True, False])
++def test_put_forwards_the_change_and_returns_the_confirmed_state(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch, enabled: bool
++) -> None:
++    client, sid = setup
++    runner = _runner(monkeypatch, 200, f'{{"enabled": {str(enabled).lower()}}}')
++
++    response = client.put(
++        f"/v1/sessions/{sid}/fast-mode", json={"enabled": enabled}, headers=_as(OWNER)
++    )
++
++    assert response.status_code == 200, response.text
++    assert response.json() == {"enabled": enabled}
++    assert runner.calls == [
++        (sid, {"type": "fast_mode_change", "enabled": enabled}, FAST_MODE_FORWARD_TIMEOUT_S)
++    ]
++
++
++def test_put_relays_the_runner_detail_on_failure(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    client, sid = setup
++    _runner(
++        monkeypatch,
++        503,
++        '{"error": "claude_native_fast_mode_unconfirmed", '
++        '"detail": "Claude Code did not confirm the change within 10s."}',
++    )
++
++    response = client.put(
++        f"/v1/sessions/{sid}/fast-mode", json={"enabled": True}, headers=_as(OWNER)
++    )
++
++    assert response.status_code == 503
++    error = response.json()["error"]
++    assert error["code"] == "runner_unavailable"
++    assert error["message"] == (
++        "Could not turn fast mode on: Claude Code did not confirm the change within 10s."
++    )
++
++
++def test_put_without_a_runner_says_how_to_recover(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    client, sid = setup
++    _runner(monkeypatch, None)
++
++    response = client.put(
++        f"/v1/sessions/{sid}/fast-mode", json={"enabled": False}, headers=_as(OWNER)
++    )
++
++    assert response.status_code == 503
++    message = response.json()["error"]["message"]
++    assert message.startswith("Could not turn fast mode off: no live runner")
++    assert "Send a message to wake it" in message
++
++
++def test_put_needs_edit_access(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    client, sid = setup
++    runner = _runner(monkeypatch, 200, '{"enabled": true}')
++
++    response = client.put(
++        f"/v1/sessions/{sid}/fast-mode", json={"enabled": True}, headers=_as(VIEWER)
++    )
++
++    assert response.status_code == 403
++    assert runner.calls == []
++
++
++@pytest.mark.parametrize(
++    "body", [{"enabled": "true"}, {"enabled": 1}, {}, {"enabled": True, "model": "opus"}]
++)
++def test_put_takes_only_a_boolean(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
++) -> None:
++    client, sid = setup
++    runner = _runner(monkeypatch, 200, '{"enabled": true}')
++
++    response = client.put(f"/v1/sessions/{sid}/fast-mode", json=body, headers=_as(OWNER))
++
++    assert response.status_code == 422
++    assert runner.calls == []
++
++
++def test_put_rejects_a_non_json_body(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    client, sid = setup
++    runner = _runner(monkeypatch, 200, '{"enabled": true}')
++
++    response = client.put(
++        f"/v1/sessions/{sid}/fast-mode",
++        content='{"enabled": true}',
++        headers={**_as(OWNER), "Content-Type": "text/plain"},
++    )
++
++    assert response.status_code == 415
++    assert runner.calls == []
++
++
++@pytest.mark.parametrize("method", ["get", "put"])
++def test_unknown_session_is_404(
++    setup: tuple[TestClient, str], monkeypatch: pytest.MonkeyPatch, method: str
++) -> None:
++    client, _sid = setup
++    runner = _runner(monkeypatch, 200, '{"enabled": true}')
++    kwargs: dict[str, Any] = {"json": {"enabled": True}} if method == "put" else {}
++
++    response = getattr(client, method)(
++        "/v1/sessions/0123456789abcdef0123456789abcdef/fast-mode", headers=_as(OWNER), **kwargs
++    )
++
++    assert response.status_code == 404
++    assert runner.calls == []
++
++
++async def test_the_full_app_serves_both_routes(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """No earlier route in ``create_app`` shadows the two paths."""
++    runner = _runner(monkeypatch, 200, '{"enabled": true}')
++    agent = await create_test_agent(client)
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert created.status_code == 201, created.text
++    sid = created.json()["id"]
++
++    read = await client.get(f"/v1/sessions/{sid}/fast-mode")
++    change = await client.put(f"/v1/sessions/{sid}/fast-mode", json={"enabled": True})
++
++    assert (read.status_code, read.json()) == (200, {"enabled": True})
++    assert (change.status_code, change.json()) == (200, {"enabled": True})
++    assert [event for _sid, event, _timeout in runner.calls] == [
++        {"type": "fast_mode_status"},
++        {"type": "fast_mode_change", "enabled": True},
++    ]
+diff --git a/web/src/components/AeFastMode.test.tsx b/web/src/components/AeFastMode.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd2775fa697b74fa9b6fab7b0e0925558f6b73e9
+--- /dev/null
++++ b/web/src/components/AeFastMode.test.tsx
+@@ -0,0 +1,239 @@
++// Tests for the fast mode switch in the composer's model menu (omnigent-ae,
++// 2026-10-14): shown for claude-native sessions only, usable on fast mode
++// Opus releases only, pending while the terminal confirms, reverted with the
++// reason when it does not.
++
++import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
++import { resetAeFastModeStore } from "@/lib/aeFastMode";
++import { useChatStore } from "@/store/chatStore";
++import { AE_FAST_MODE_HINT, AeFastModeSection } from "./AeFastMode";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++
++const PATH = "/v1/sessions/conv-1/fast-mode";
++
++function json(status: number, body: unknown): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++}
++
++/** Answer GETs with `state`; PUTs go to `put` so a test can hold or fail them. */
++function serve(state: boolean | null, put: (body: unknown) => Promise<Response>) {
++  mocks.fetch.mockImplementation((_path: string, init: RequestInit) =>
++    init.method === "PUT"
++      ? put(JSON.parse(String(init.body)))
++      : Promise.resolve(json(200, { enabled: state })),
++  );
++}
++
++function deferred<T>() {
++  let resolve!: (value: T) => void;
++  const promise = new Promise<T>((done) => {
++    resolve = done;
++  });
++  return { promise, resolve };
++}
++
++function renderSection(
++  props: Partial<Parameters<typeof AeFastModeSection>[0]> = {},
++): ReturnType<typeof render> {
++  return render(
++    <DropdownMenu open>
++      <DropdownMenuContent>
++        <AeFastModeSection
++          pickerKind="claude"
++          model="claude-opus-5-5"
++          modelLabel="Opus 5.5"
++          {...props}
++        />
++      </DropdownMenuContent>
++    </DropdownMenu>,
++  );
++}
++
++const fastSwitch = () => screen.getByRole("menuitemcheckbox", { name: "Fast mode" });
++const note = () => screen.queryByTestId("composer-fast-mode-note");
++const puts = () => mocks.fetch.mock.calls.filter(([, init]) => init.method === "PUT");
++
++beforeEach(() => {
++  mocks.fetch.mockReset();
++  resetAeFastModeStore();
++  useChatStore.setState({ conversationId: "conv-1", pendingModelChange: null });
++});
++afterEach(cleanup);
++
++describe("AeFastModeSection", () => {
++  it("shows for a claude-native session with its label and hint, and reads the state", async () => {
++    serve(true, () => Promise.reject(new Error("no PUT expected")));
++    renderSection();
++
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "true"));
++    expect(screen.getByText(AE_FAST_MODE_HINT)).toBeInTheDocument();
++    expect(fastSwitch()).toHaveAccessibleDescription(AE_FAST_MODE_HINT);
++    expect(note()).toBeNull();
++    expect(mocks.fetch).toHaveBeenCalledWith(PATH, { method: "GET" });
++  });
++
++  it.each(["codex", "cursor", "pi", null])("stays hidden for picker kind %s", (kind) => {
++    serve(true, () => Promise.reject(new Error("no PUT expected")));
++    renderSection({ pickerKind: kind });
++
++    expect(screen.queryByTestId("composer-fast-mode")).toBeNull();
++    expect(mocks.fetch).not.toHaveBeenCalled();
++  });
++
++  it("draws an unreported state off and says it is unknown", async () => {
++    serve(null, () => Promise.reject(new Error("no PUT expected")));
++    renderSection();
++
++    await waitFor(() => expect(note()).toHaveTextContent("Unknown until the session replies"));
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "false");
++    expect(fastSwitch()).not.toHaveAttribute("data-disabled");
++  });
++
++  it("shows no note while the first read runs", async () => {
++    const answer = deferred<Response>();
++    mocks.fetch.mockReturnValue(answer.promise);
++    renderSection();
++
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "false");
++    expect(note()).toBeNull();
++    await act(async () => answer.resolve(json(200, { enabled: null })));
++    expect(note()).toHaveTextContent("Unknown until the session replies");
++  });
++
++  it("treats a failed read as unknown", async () => {
++    mocks.fetch.mockResolvedValue(json(503, { error: { message: "runner asleep" } }));
++    renderSection();
++
++    await waitFor(() => expect(note()).toHaveTextContent("Unknown until the session replies"));
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "false");
++  });
++
++  it.each([
++    ["claude-sonnet-5", "Sonnet 5"],
++    ["claude-haiku-4-5", "Haiku 4.5"],
++    ["claude-opus-4-1", "Opus 4.1"],
++    [null, null],
++  ])("is disabled with the reason for %s", async (model, modelLabel) => {
++    serve(false, () => Promise.resolve(json(200, { enabled: true })));
++    renderSection({ model, modelLabel });
++
++    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(1));
++    expect(fastSwitch()).toHaveAttribute("data-disabled");
++    expect(note()).toHaveTextContent("Opus only");
++    fireEvent.click(fastSwitch());
++    expect(puts()).toHaveLength(0);
++  });
++
++  it.each([
++    ["claude-opus-5-5[1m]", null],
++    ["claude-opus-5", null],
++    ["claude-opus-4-8", null],
++    ["opus", "Opus 4.8 (1M context)"],
++  ])("is usable on %s", async (model, modelLabel) => {
++    serve(false, () => Promise.resolve(json(200, { enabled: true })));
++    renderSection({ model, modelLabel });
++
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "false"));
++    expect(fastSwitch()).not.toHaveAttribute("data-disabled");
++    expect(note()).toBeNull();
++  });
++
++  it("is disabled while another configuration change runs", async () => {
++    serve(false, () => Promise.resolve(json(200, { enabled: true })));
++    renderSection({ busy: true });
++
++    await waitFor(() => expect(mocks.fetch).toHaveBeenCalledTimes(1));
++    expect(fastSwitch()).toHaveAttribute("data-disabled");
++    useChatStore.setState({ pendingModelChange: "claude-opus-4-8" });
++    cleanup();
++    renderSection();
++    expect(fastSwitch()).toHaveAttribute("data-disabled");
++  });
++
++  it("is pending while the terminal confirms, then shows the confirmed state", async () => {
++    const answer = deferred<Response>();
++    const sent: unknown[] = [];
++    serve(false, (body) => {
++      sent.push(body);
++      return answer.promise;
++    });
++    renderSection();
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "false"));
++
++    fireEvent.click(fastSwitch());
++
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "true");
++    expect(fastSwitch()).toHaveAttribute("data-disabled");
++    expect(fastSwitch()).toHaveAttribute("aria-busy", "true");
++    expect(note()).toHaveTextContent("Turning fast mode on…");
++    expect(sent).toEqual([{ enabled: true }]);
++    expect(puts()[0]).toEqual([
++      PATH,
++      {
++        method: "PUT",
++        headers: { "Content-Type": "application/json" },
++        body: JSON.stringify({ enabled: true }),
++      },
++    ]);
++    // The menu stays open so the result is seen where it was asked for.
++    expect(screen.getByTestId("composer-fast-mode")).toBeInTheDocument();
++
++    await act(async () => answer.resolve(json(200, { enabled: true })));
++
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "true");
++    expect(fastSwitch()).not.toHaveAttribute("data-disabled");
++    expect(note()).toBeNull();
++  });
++
++  it("turns it off the same way", async () => {
++    serve(true, () => Promise.resolve(json(200, { enabled: false })));
++    renderSection();
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "true"));
++
++    fireEvent.click(fastSwitch());
++
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "false"));
++    expect(JSON.parse(String(puts()[0][1].body))).toEqual({ enabled: false });
++  });
++
++  it("reverts and says why when the terminal does not confirm", async () => {
++    const reason =
++      "Could not turn fast mode on: Claude Code did not confirm the change within 10s.";
++    serve(false, () =>
++      Promise.resolve(json(503, { error: { code: "runner_unavailable", message: reason } })),
++    );
++    renderSection();
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "false"));
++
++    fireEvent.click(fastSwitch());
++
++    await waitFor(() => expect(note()).toHaveTextContent(reason));
++    expect(note()).toHaveClass("text-destructive");
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "false");
++    expect(fastSwitch()).not.toHaveAttribute("data-disabled");
++  });
++
++  it("keeps a running change pending when the menu opens again", async () => {
++    const answer = deferred<Response>();
++    serve(false, () => answer.promise);
++    renderSection();
++    await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "false"));
++    fireEvent.click(fastSwitch());
++    cleanup();
++
++    renderSection();
++
++    expect(note()).toHaveTextContent("Turning fast mode on…");
++    // No read while the change runs: it would race the confirmation.
++    expect(mocks.fetch).toHaveBeenCalledTimes(2);
++    await act(async () => answer.resolve(json(200, { enabled: true })));
++    expect(fastSwitch()).toHaveAttribute("aria-checked", "true");
++  });
++});
+diff --git a/web/src/components/AeFastMode.tsx b/web/src/components/AeFastMode.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca9f6f1187df980502d933ac59dd6b5882fde1f4
+--- /dev/null
++++ b/web/src/components/AeFastMode.tsx
+@@ -0,0 +1,129 @@
++// The fast mode switch at the bottom of the composer's model menu
++// (omnigent-ae, 2026-10-14). Reid asked for Claude Desktop's fast mode switch
++// "if I'm ever connected to a Claude session", per session. Claude Code takes
++// `/fast on|off` mid-session and reports the state in its status line; this
++// row reads and changes it through `@/lib/aeFastMode`.
++//
++// Shown for claude-native sessions only, and usable only on the Opus releases
++// that have fast mode. The switch never guesses: until the session reports
++// its state it is drawn off with a note saying so.
++
++import { useEffect, useId } from "react";
++import * as DropdownMenuPrimitive from "radix-ui/dropdown-menu";
++import { DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
++import { MenuItem } from "@/components/ui/menu-item";
++import {
++  aeFastModeModelSupported,
++  changeAeFastMode,
++  refreshAeFastMode,
++  useAeFastMode,
++} from "@/lib/aeFastMode";
++import { cn } from "@/lib/utils";
++import { useChatStore } from "@/store/chatStore";
++
++export const AE_FAST_MODE_HINT = "Faster Opus output; bills usage credits";
++
++/** The design system's Switch, drawn without a button: the menu item is the control. */
++function SwitchTrack({ checked, disabled }: { checked: boolean; disabled: boolean }) {
++  return (
++    <span
++      aria-hidden="true"
++      data-state={checked ? "checked" : "unchecked"}
++      className={cn(
++        "inline-flex h-[18.4px] w-[32px] shrink-0 items-center rounded-full border border-transparent transition-all",
++        checked ? "bg-primary" : "bg-input dark:bg-input/80",
++        disabled && "opacity-50",
++      )}
++    >
++      <span
++        className={cn(
++          "block size-4 rounded-full bg-background transition-transform",
++          checked
++            ? "translate-x-[calc(100%-2px)] dark:bg-primary-foreground"
++            : "dark:bg-foreground",
++        )}
++      />
++    </span>
++  );
++}
++
++export function AeFastModeSection({
++  pickerKind,
++  model,
++  modelLabel,
++  busy = false,
++}: {
++  /** The composer's model picker kind; the row shows only for "claude". */
++  pickerKind: string | null;
++  /** The session's model id as reported, e.g. "claude-opus-5-5". */
++  model: string | null;
++  /** The chip's label for it, e.g. "Opus 5.5", for ids that carry no version. */
++  modelLabel: string | null;
++  /** Another configuration change is running. */
++  busy?: boolean;
++}) {
++  const sessionId = useChatStore((state) => state.conversationId);
++  const modelChangePending = useChatStore((state) => state.pendingModelChange !== null);
++  const shown = pickerKind === "claude" && sessionId !== null;
++  const state = useAeFastMode(shown ? sessionId : null);
++  const labelId = useId();
++  const hintId = useId();
++  const noteId = useId();
++  useEffect(() => {
++    if (shown && sessionId) void refreshAeFastMode(sessionId);
++  }, [shown, sessionId]);
++  if (!shown || sessionId === null) return null;
++
++  const supported = aeFastModeModelSupported(model, modelLabel);
++  const pending = state.pending !== null;
++  const checked = state.pending ?? state.enabled ?? false;
++  const disabled = !supported || pending || busy || modelChangePending;
++  const failed = !pending && supported && state.error !== null;
++  const note = pending
++    ? `Turning fast mode ${state.pending ? "on" : "off"}…`
++    : !supported
++      ? "Opus only"
++      : (state.error ??
++        (state.enabled === null && state.settled ? "Unknown until the session replies" : null));
++
++  return (
++    <div data-testid="composer-fast-mode">
++      <DropdownMenuSeparator />
++      {/* The composer menu pads checkbox rows for a check mark; this row draws a switch. */}
++      <MenuItem asChild density="none" interactive={!disabled} className="pr-2!">
++        <DropdownMenuPrimitive.CheckboxItem
++          checked={checked}
++          disabled={disabled}
++          aria-labelledby={labelId}
++          aria-describedby={note ? `${hintId} ${noteId}` : hintId}
++          aria-busy={pending || undefined}
++          data-testid="composer-fast-mode-switch"
++          onSelect={(event) => event.preventDefault()}
++          onCheckedChange={(next) => void changeAeFastMode(sessionId, next === true)}
++        >
++          <span className="flex min-w-0 flex-1 flex-col whitespace-normal break-words">
++            <span id={labelId} className={cn("leading-5", disabled && "text-muted-foreground")}>
++              Fast mode
++            </span>
++            <span id={hintId} className="text-xs leading-4 text-muted-foreground">
++              {AE_FAST_MODE_HINT}
++            </span>
++            {note && (
++              <span
++                id={noteId}
++                data-testid="composer-fast-mode-note"
++                className={cn(
++                  "mt-0.5 text-xs leading-4",
++                  failed ? "text-destructive" : "text-muted-foreground",
++                )}
++              >
++                {note}
++              </span>
++            )}
++          </span>
++          <SwitchTrack checked={checked} disabled={disabled} />
++        </DropdownMenuPrimitive.CheckboxItem>
++      </MenuItem>
++    </div>
++  );
++}
+diff --git a/web/src/lib/aeFastMode.test.ts b/web/src/lib/aeFastMode.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..517a9c64e576ae1edbefdffea6375fb71a9dfba2
+--- /dev/null
++++ b/web/src/lib/aeFastMode.test.ts
+@@ -0,0 +1,142 @@
++// Tests for the fast mode store and model gate (omnigent-ae, 2026-10-14).
++
++import { renderHook } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++
++import {
++  aeFastModeModelSupported,
++  aeFastModePath,
++  changeAeFastMode,
++  fetchAeFastMode,
++  opusVersion,
++  putAeFastMode,
++  refreshAeFastMode,
++  resetAeFastModeStore,
++  useAeFastMode,
++} from "./aeFastMode";
++
++function json(status: number, body: unknown): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    headers: { "Content-Type": "application/json" },
++  });
++}
++
++beforeEach(() => {
++  mocks.fetch.mockReset();
++  resetAeFastModeStore();
++});
++afterEach(() => vi.useRealTimers());
++
++describe("opusVersion", () => {
++  it.each([
++    ["claude-opus-5-5", "5.5"],
++    ["claude-opus-5-5[1m]", "5.5"],
++    ["claude-opus-5", "5"],
++    ["claude-opus-5-20261001", "5"],
++    ["claude-opus-4-8", "4.8"],
++    ["us.anthropic.claude-opus-4-8-v1:0", "4.8"],
++    ["claude-opus-4-1", "4.1"],
++    ["Opus 5.5", "5.5"],
++    ["Opus 4.8 (1M context)", "4.8"],
++    ["Claude Opus 5", "5"],
++    ["claude-3-opus-20240229", "20240229"],
++    ["opus", null],
++    ["claude-sonnet-5", null],
++    ["default", null],
++    ["", null],
++    [null, null],
++  ])("reads %s as %s", (value, version) => {
++    expect(opusVersion(value)).toBe(version);
++  });
++});
++
++describe("aeFastModeModelSupported", () => {
++  it("takes Opus 5.5, 5 and 4.8 from any spelling", () => {
++    expect(aeFastModeModelSupported("claude-opus-5-5")).toBe(true);
++    expect(aeFastModeModelSupported("claude-opus-5")).toBe(true);
++    expect(aeFastModeModelSupported("claude-opus-4-8[1m]")).toBe(true);
++    expect(aeFastModeModelSupported("opus", "Opus 5.5")).toBe(true);
++  });
++
++  it("refuses everything else", () => {
++    expect(aeFastModeModelSupported("claude-opus-4-1", "Opus 4.1")).toBe(false);
++    expect(aeFastModeModelSupported("claude-sonnet-5", "Sonnet 5")).toBe(false);
++    expect(aeFastModeModelSupported("opus", null)).toBe(false);
++    expect(aeFastModeModelSupported(null, undefined)).toBe(false);
++  });
++});
++
++describe("requests", () => {
++  it("encodes the session id into the path", () => {
++    expect(aeFastModePath("conv 1/2")).toBe("/v1/sessions/conv%201%2F2/fast-mode");
++  });
++
++  it("reads null as unknown and throws the server's reason", async () => {
++    mocks.fetch.mockResolvedValueOnce(json(200, { enabled: null }));
++    await expect(fetchAeFastMode("c")).resolves.toBeNull();
++    mocks.fetch.mockResolvedValueOnce(json(409, { error: { message: "not Claude" } }));
++    await expect(fetchAeFastMode("c")).rejects.toThrow("not Claude");
++  });
++
++  it("refuses a change answer without a state", async () => {
++    mocks.fetch.mockResolvedValueOnce(json(200, {}));
++    await expect(putAeFastMode("c", true)).rejects.toThrow("without a fast mode state");
++  });
++});
++
++describe("store", () => {
++  it("drops a read that started before a change", async () => {
++    let answerRead!: (response: Response) => void;
++    mocks.fetch.mockImplementation((_path: string, init: RequestInit) =>
++      init.method === "PUT"
++        ? Promise.resolve(json(200, { enabled: true }))
++        : new Promise<Response>((resolve) => {
++            answerRead = resolve;
++          }),
++    );
++    const { result } = renderHook(() => useAeFastMode("c"));
++
++    const read = refreshAeFastMode("c");
++    await changeAeFastMode("c", true);
++    answerRead(json(200, { enabled: false }));
++    await read;
++
++    expect(result.current).toEqual({ enabled: true, pending: null, error: null, settled: true });
++  });
++
++  it("keeps sessions apart and ignores a second change while one runs", async () => {
++    let finish!: (response: Response) => void;
++    mocks.fetch.mockImplementation(
++      () =>
++        new Promise<Response>((resolve) => {
++          finish = resolve;
++        }),
++    );
++    const first = changeAeFastMode("a", true);
++    await changeAeFastMode("a", false);
++    expect(mocks.fetch).toHaveBeenCalledTimes(1);
++
++    const { result } = renderHook(() => [useAeFastMode("a"), useAeFastMode("b")]);
++    expect(result.current[0].pending).toBe(true);
++    expect(result.current[1]).toEqual({
++      enabled: null,
++      pending: null,
++      error: null,
++      settled: false,
++    });
++    finish(json(200, { enabled: true }));
++    await first;
++  });
++
++  it("falls back to a plain reason when the failure has none", async () => {
++    mocks.fetch.mockRejectedValueOnce(new Error(""));
++    await changeAeFastMode("c", false);
++    const { result } = renderHook(() => useAeFastMode("c"));
++    expect(result.current.error).toBe("Could not turn fast mode off.");
++    expect(result.current.pending).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeFastMode.ts b/web/src/lib/aeFastMode.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9377b7da6e0832fbe763b53e80895e899e687a5f
+--- /dev/null
++++ b/web/src/lib/aeFastMode.ts
+@@ -0,0 +1,143 @@
++// Fast mode for claude-native sessions (omnigent-ae, 2026-10-14). Reid asked
++// for Claude Desktop's fast mode switch in the composer's model menu, per
++// session. `GET /v1/sessions/{id}/fast-mode` reads it from the session's
++// Claude Code status line (null until the session reports it) and `PUT` types
++// `/fast on` or `/fast off` into the terminal, answering only once Claude Code
++// shows the new state (omnigent/runner/ae_fast_mode.py).
++//
++// The state lives in this small store, keyed by session, rather than in the
++// menu: the menu unmounts when it closes, and a change still running must keep
++// the switch pending (and its failure reason) when the menu opens again.
++
++import { useSyncExternalStore } from "react";
++import { authenticatedFetch } from "@/lib/identity";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
++
++export interface AeFastModeState {
++  /** What Claude Code last confirmed; null until the session reports it. */
++  enabled: boolean | null;
++  /** The state a running change asks for; null when no change is running. */
++  pending: boolean | null;
++  /** Why the last change failed, shown in the menu until the next change. */
++  error: string | null;
++  /** A read or a change has answered, so a null `enabled` means unreported, not loading. */
++  settled: boolean;
++}
++
++const UNKNOWN: AeFastModeState = Object.freeze({
++  enabled: null,
++  pending: null,
++  error: null,
++  settled: false,
++});
++
++/** Opus releases with fast mode, as `major.minor` (Claude Code docs, 2026-10-14). */
++const FAST_MODE_OPUS_VERSIONS = new Set(["5.5", "5", "4.8"]);
++
++const states = new Map<string, AeFastModeState>();
++// Bumped by every change, so a read that started before it is dropped.
++const generations = new Map<string, number>();
++const listeners = new Set<() => void>();
++
++export function aeFastModePath(sessionId: string): string {
++  return `/v1/sessions/${encodeURIComponent(sessionId)}/fast-mode`;
++}
++
++/**
++ * The Opus version a model id or label names, e.g. "5.5" for
++ * `claude-opus-5-5[1m]` or "Opus 5.5", "5" for `claude-opus-5-20261001`.
++ */
++export function opusVersion(value: string | null | undefined): string | null {
++  const match = /opus[-\s](\d+)(?:[-.](\d{1,2}))?(?!\d)/.exec((value ?? "").toLowerCase());
++  if (!match) return null;
++  const [, major, minor] = match;
++  return minor === undefined || minor === "0" ? major : `${major}.${minor}`;
++}
++
++/** Whether any of the model's spellings (id, alias, label) is an Opus with fast mode. */
++export function aeFastModeModelSupported(...spellings: (string | null | undefined)[]): boolean {
++  return spellings.some((spelling) => FAST_MODE_OPUS_VERSIONS.has(opusVersion(spelling) ?? ""));
++}
++
++function readState(sessionId: string | null): AeFastModeState {
++  return (sessionId && states.get(sessionId)) || UNKNOWN;
++}
++
++function writeState(sessionId: string, patch: Partial<AeFastModeState>): void {
++  states.set(sessionId, { ...readState(sessionId), ...patch });
++  for (const listener of listeners) listener();
++}
++
++function subscribe(listener: () => void): () => void {
++  listeners.add(listener);
++  return () => listeners.delete(listener);
++}
++
++/** The session's fast mode as this tab last learned it. */
++export function useAeFastMode(sessionId: string | null): AeFastModeState {
++  return useSyncExternalStore(subscribe, () => readState(sessionId));
++}
++
++function enabledFrom(body: unknown): boolean | null {
++  const enabled = (body as { enabled?: unknown } | null)?.enabled;
++  return typeof enabled === "boolean" ? enabled : null;
++}
++
++/** Ask the server; null when the session has not reported fast mode yet. */
++export async function fetchAeFastMode(sessionId: string): Promise<boolean | null> {
++  const res = await authenticatedFetch(aeFastModePath(sessionId), { method: "GET" });
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  return enabledFrom(await res.json());
++}
++
++/** Turn fast mode on or off; resolves with the state Claude Code confirmed. */
++export async function putAeFastMode(sessionId: string, enabled: boolean): Promise<boolean> {
++  const res = await authenticatedFetch(aeFastModePath(sessionId), {
++    method: "PUT",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ enabled }),
++  });
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  const confirmed = enabledFrom(await res.json());
++  if (confirmed === null) throw new Error("The server answered without a fast mode state.");
++  return confirmed;
++}
++
++/** Re-read the session's fast mode, unless a change is running. Unknown on failure. */
++export async function refreshAeFastMode(sessionId: string): Promise<void> {
++  if (readState(sessionId).pending !== null) return;
++  const generation = generations.get(sessionId) ?? 0;
++  let enabled: boolean | null;
++  try {
++    enabled = await fetchAeFastMode(sessionId);
++  } catch {
++    enabled = null;
++  }
++  if ((generations.get(sessionId) ?? 0) !== generation) return;
++  writeState(sessionId, { enabled, settled: true });
++}
++
++/** Ask for a change: pending while it runs, the confirmed state after, reverted on failure. */
++export async function changeAeFastMode(sessionId: string, enabled: boolean): Promise<void> {
++  if (readState(sessionId).pending !== null) return;
++  generations.set(sessionId, (generations.get(sessionId) ?? 0) + 1);
++  writeState(sessionId, { pending: enabled, error: null });
++  try {
++    const confirmed = await putAeFastMode(sessionId, enabled);
++    writeState(sessionId, { enabled: confirmed, pending: null, settled: true });
++  } catch (failure) {
++    const reason = failure instanceof Error && failure.message ? failure.message : null;
++    // `enabled` was never moved while pending, so clearing `pending` is the revert.
++    writeState(sessionId, {
++      pending: null,
++      error: reason ?? `Could not turn fast mode ${enabled ? "on" : "off"}.`,
++    });
++  }
++}
++
++/** Forget every session's state; for tests. */
++export function resetAeFastModeStore(): void {
++  states.clear();
++  generations.clear();
++  for (const listener of listeners) listener();
++}
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 12b5c498154a644ecacae9eb42661e5f233f850a..f494c9bc633a9a5787cd5653398bfab7c5d77553 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -5276,8 +5276,8 @@ describe("Composer config gear", () => {
+       await openSessionModels();
+       expect(screen.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
+       const configMenu = within(screen.getByTestId("composer-agent-config-menu"));
+-      // Only the Models | Effort divider remains.
+-      expect(configMenu.queryAllByRole("separator")).toHaveLength(showModels ? 1 : 0);
++      // Only the Models | Effort divider remains, plus Effort | Fast mode.
++      expect(configMenu.queryAllByRole("separator")).toHaveLength((showModels ? 1 : 0) + 1);
+       expect(configMenu.getByTestId("composer-agent-efforts")).toBeVisible();
+     },
+   );
+@@ -5304,8 +5304,8 @@ describe("Composer config gear", () => {
+       expect(menu.getByRole("menuitem", { name: "Smart Routing" })).not.toHaveAttribute(
+         "data-disabled",
+       );
+-      // Smart Routing | Models, then Models | Effort.
+-      expect(menu.getAllByRole("separator")).toHaveLength(2);
++      // Smart Routing | Models, Models | Effort, then Effort | Fast mode.
++      expect(menu.getAllByRole("separator")).toHaveLength(3);
+       expect(useChatStore.getState().costControlModeOverride).toBe(costControlModeOverride);
+       if (costControlModeOverride === "on") {
+         for (const choice of menu.getAllByRole("menuitemcheckbox")) {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 75881175f4335f479a74390b6befd2563ffbb2b5..ce21b59e56d185a6747117aed3b475090054023d 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -59,6 +59,7 @@ import {
+ } from "@/hooks/useNativeServerSwitcher";
+ import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+ import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
++import { AeFastModeSection } from "@/components/AeFastMode";
+ import { AePlanLimitsPopover } from "@/components/AePlanLimits";
+ import { AeTeamControl } from "@/components/AeTeamControl";
+ import { agentDisplayLabel } from "@/components/AgentInfo";
+@@ -4764,6 +4765,12 @@ function SessionHarnessPicker({
+             : undefined
+         }
+       />
++      <AeFastModeSection
++        pickerKind={modelPickerKind}
++        model={effectiveModel}
++        modelLabel={modelSummary}
++        busy={busy}
++      />
+     </>
+   );
+   return (

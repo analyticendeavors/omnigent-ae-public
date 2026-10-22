@@ -1,0 +1,2054 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 24 Sep 2026 20:56:51 +0000
+Subject: [PATCH 010/148] [ae-patch] Add layout presets, two-axis dividers and
+ pane swapping to the split view
+
+The split view (patch 0005) only laid panes side by side. This adds a layout
+picker to its top bar with seven presets: 2 side by side, 2 stacked, 2+1 and
+its mirror, a 2x2 grid, 3 and 4 side by side. Dividers resize columns and the
+panes stacked in a column, by pointer or arrow keys. A grip on each pane swaps
+it with another by drag and drop or arrow keys. Adding a pane past the preset's
+slots grows to the next preset that fits; closing one shrinks to the preset of
+what is left.
+
+Panes are positioned absolutely from the layout's rectangles and rendered in a
+fixed key order, so a preset change or a swap never moves an iframe in the DOM
+(a moved iframe reloads and drops the pane's stream and draft).
+
+The layout persists under the same localStorage key, ae.splitView.v1, now as
+version 2 ({v: 2, preset, panes, cols, rows}); a version 1 value ({panes,
+sizes}) migrates to the side by side preset with its widths. The URL adds
+&l=<preset> only when the preset is not side by side, so older links keep
+their meaning.
+
+Only files patch 0005 created change; no upstream file is touched.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01TAJwmwSVGzNYar6o1BsndR
+---
+ web/src/lib/aeSplitLayout.test.ts  | 398 ++++++++++++++++++--
+ web/src/lib/aeSplitLayout.ts       | 402 ++++++++++++++++++---
+ web/src/pages/AeSplitPage.test.tsx | 285 ++++++++++++++-
+ web/src/pages/AeSplitPage.tsx      | 558 +++++++++++++++++++++++------
+ web/src/shell/AeSplitMenuItem.tsx  |   5 +-
+ 5 files changed, 1442 insertions(+), 206 deletions(-)
+
+diff --git a/web/src/lib/aeSplitLayout.test.ts b/web/src/lib/aeSplitLayout.test.ts
+index 7bad88a25f4552e81343db5be40efd47ff5a61a2..bd3f3eab985561f3ad524cef6b2cc4b7e281f4a8 100644
+--- a/web/src/lib/aeSplitLayout.test.ts
++++ b/web/src/lib/aeSplitLayout.test.ts
+@@ -1,27 +1,53 @@
+-// Tests for the split view's layout helpers (omnigent-ae patch P5): the URL
+-// round trip, the remembered layout, "Open in split view"'s merge rule, the
+-// divider math and the pane-frame check.
++// Tests for the split view's layout helpers (omnigent-ae patches P5 and P10):
++// the URL round trip, the remembered layout and its migration from version 1,
++// "Open in split view"'s merge rule, the presets (slot rectangles, growing,
++// shrinking, switching, swapping), the divider math in both axes and the
++// pane-frame check.
+ 
+ import { beforeEach, describe, expect, it } from "vitest";
+ import {
+   AE_SPLIT_MAX_PANES,
+   AE_SPLIT_MIN_FRACTION,
++  AE_SPLIT_PRESETS,
+   AE_SPLIT_STORAGE_KEY,
++  type AeSplitLayout,
++  type AeSplitPresetId,
+   addEmptyPane,
++  addPane,
++  addedSlot,
++  applyPreset,
+   cleanPanes,
++  defaultPreset,
++  formatLayoutParam,
+   formatSplitParam,
+   isAeSplitPane,
++  keptSlots,
+   layoutWithSession,
++  makeLayout,
++  migrateStoredLayout,
++  nextPreset,
+   normalizeSizes,
+   paneSessionFromPath,
++  parseLayoutParam,
+   parseSplitParam,
+   readStoredLayout,
+   removePane,
+   resizeAt,
++  resizeColumn,
++  resizeRow,
++  slotCount,
++  slotRects,
+   splitHref,
++  swapPanes,
+   writeStoredLayout,
+ } from "./aeSplitLayout";
+ 
++/** Two side by side at the given widths. */
++function row(panes: (string | null)[], cols?: number[]): AeSplitLayout {
++  const layout = makeLayout(panes);
++  return cols ? { ...layout, cols } : layout;
++}
++
+ beforeEach(() => {
+   window.localStorage.clear();
+ });
+@@ -46,6 +72,20 @@ describe("split URL", () => {
+     expect(parseSplitParam(formatSplitParam(["x", null, "y"]))).toEqual(["x", null, "y"]);
+   });
+ 
++  it("carries the preset in `l` only when it is not side by side", () => {
++    expect(splitHref(["a", "b"], "cols2")).toBe("/split?s=a,b");
++    expect(splitHref(["a", "b"], "rows2")).toBe("/split?s=a,b&l=rows2");
++    expect(formatLayoutParam("grid", 4)).toBe("grid");
++    expect(formatLayoutParam("cols4", 4)).toBeNull();
++  });
++
++  it("reads `l` only when it names a preset for that many panes", () => {
++    expect(parseLayoutParam("stack-right", 3)).toBe("stack-right");
++    expect(parseLayoutParam("stack-right", 2)).toBeNull();
++    expect(parseLayoutParam("spiral", 2)).toBeNull();
++    expect(parseLayoutParam(null, 2)).toBeNull();
++  });
++
+   it("keeps empty panes but not duplicate sessions", () => {
+     expect(cleanPanes([null, null, "a", "a"])).toEqual([null, null, "a"]);
+   });
+@@ -65,17 +105,78 @@ describe("pane paths", () => {
+ });
+ 
+ describe("remembered layout", () => {
+-  it("writes and reads back panes and sizes", () => {
+-    writeStoredLayout({ panes: ["a", "b"], sizes: [0.3, 0.7] });
+-    expect(readStoredLayout()).toEqual({ panes: ["a", "b"], sizes: [0.3, 0.7] });
++  it("writes version 2 under the version 1 key and reads it back", () => {
++    const layout: AeSplitLayout = {
++      preset: "stack-left",
++      panes: ["a", "b", "c"],
++      cols: [0.6, 0.4],
++      rows: [[0.3, 0.7], [1]],
++    };
++    writeStoredLayout(layout);
++    const raw = JSON.parse(window.localStorage.getItem(AE_SPLIT_STORAGE_KEY)!);
++    expect(raw.v).toBe(2);
++    expect(readStoredLayout()).toEqual(layout);
++  });
++
++  it("migrates a version 1 row to side by side with its widths", () => {
++    window.localStorage.setItem(
++      AE_SPLIT_STORAGE_KEY,
++      JSON.stringify({ panes: ["a", "b"], sizes: [0.3, 0.7] }),
++    );
++    expect(readStoredLayout()).toEqual({
++      preset: "cols2",
++      panes: ["a", "b"],
++      cols: [0.3, 0.7],
++      rows: [[1], [1]],
++    });
+   });
+ 
+-  it("repairs sizes that do not fit the panes", () => {
++  it("migrates version 1 layouts of one, three and four panes", () => {
++    expect(migrateStoredLayout({ panes: ["a"], sizes: [1] })?.preset).toBe("one");
++    expect(migrateStoredLayout({ panes: ["a", null, "c"], sizes: [1, 1, 2] })).toEqual({
++      preset: "cols3",
++      panes: ["a", null, "c"],
++      cols: [0.25, 0.25, 0.5],
++      rows: [[1], [1], [1]],
++    });
++    expect(migrateStoredLayout({ panes: ["a", "b", "c", "d"] })?.preset).toBe("cols4");
++  });
++
++  it("repairs version 1 sizes that do not fit the panes", () => {
+     window.localStorage.setItem(
+       AE_SPLIT_STORAGE_KEY,
+       JSON.stringify({ panes: ["a", "b"], sizes: [1] }),
+     );
+-    expect(readStoredLayout()?.sizes).toEqual([0.5, 0.5]);
++    expect(readStoredLayout()?.cols).toEqual([0.5, 0.5]);
++  });
++
++  it("falls back to side by side when a version 2 preset does not fit its panes", () => {
++    expect(
++      migrateStoredLayout({ v: 2, preset: "grid", panes: ["a", "b"], cols: [0.5, 0.5] }),
++    ).toEqual({ preset: "cols2", panes: ["a", "b"], cols: [0.5, 0.5], rows: [[1], [1]] });
++    expect(migrateStoredLayout({ v: 2, preset: "bogus", panes: ["a", "b", "c"] })?.preset).toBe(
++      "cols3",
++    );
++  });
++
++  it("repairs version 2 sizes per column", () => {
++    expect(
++      migrateStoredLayout({
++        v: 2,
++        preset: "grid",
++        panes: ["a", "b", "c", "d"],
++        cols: [1, 3],
++        rows: [[1, 1, 1], "x"],
++      }),
++    ).toEqual({
++      preset: "grid",
++      panes: ["a", "b", "c", "d"],
++      cols: [0.25, 0.75],
++      rows: [
++        [0.5, 0.5],
++        [0.5, 0.5],
++      ],
++    });
+   });
+ 
+   it("ignores garbage", () => {
+@@ -83,27 +184,269 @@ describe("remembered layout", () => {
+     expect(readStoredLayout()).toBeNull();
+     window.localStorage.setItem(AE_SPLIT_STORAGE_KEY, JSON.stringify({ panes: [] }));
+     expect(readStoredLayout()).toBeNull();
++    expect(migrateStoredLayout(null)).toBeNull();
++    expect(migrateStoredLayout("a,b")).toBeNull();
+   });
+ });
+ 
+ describe("layoutWithSession", () => {
+   it("seeds with the session being viewed when nothing is remembered", () => {
+-    expect(layoutWithSession(null, "b", "a").panes).toEqual(["a", "b"]);
++    expect(layoutWithSession(null, "b", "a")).toEqual(makeLayout(["a", "b"]));
+   });
+ 
+   it("opens the session alone when nothing is remembered or viewed", () => {
+-    expect(layoutWithSession(null, "b", null).panes).toEqual(["b"]);
++    expect(layoutWithSession(null, "b", null)).toEqual(makeLayout(["b"]));
+   });
+ 
+   it("appends to the remembered panes and keeps a session already there in place", () => {
+-    const stored = { panes: ["a", "b"], sizes: [0.4, 0.6] };
++    const stored = row(["a", "b"], [0.4, 0.6]);
+     expect(layoutWithSession(stored, "c", "x").panes).toEqual(["a", "b", "c"]);
+-    expect(layoutWithSession(stored, "a", "x")).toEqual(stored);
++    expect(layoutWithSession(stored, "a", "x")).toBe(stored);
++  });
++
++  it("grows the remembered preset the way Add pane does", () => {
++    const stacked = makeLayout(["a", "b"], "rows2");
++    expect(layoutWithSession(stacked, "c", null)).toMatchObject({
++      preset: "stack-left",
++      panes: ["a", "b", "c"],
++    });
++  });
++
++  it("replaces the last pane at the maximum, keeping the preset", () => {
++    const stored = makeLayout(["a", "b", "c", "d"], "grid");
++    expect(layoutWithSession(stored, "e", null)).toMatchObject({
++      preset: "grid",
++      panes: ["a", "b", "c", "e"],
++    });
++  });
++});
++
++describe("presets", () => {
++  it("offers the seven arrangements, each holding two to four panes", () => {
++    expect(AE_SPLIT_PRESETS.map((p) => p.id)).toEqual([
++      "cols2",
++      "rows2",
++      "stack-left",
++      "stack-right",
++      "grid",
++      "cols3",
++      "cols4",
++    ]);
++    expect(AE_SPLIT_PRESETS.map((p) => slotCount(p.id))).toEqual([2, 2, 3, 3, 4, 3, 4]);
++    expect(slotCount("one")).toBe(1);
++  });
++
++  it("defaults to side by side for a pane count", () => {
++    expect([1, 2, 3, 4].map(defaultPreset)).toEqual(["one", "cols2", "cols3", "cols4"]);
++  });
++
++  it("lays out every preset's slots column by column, covering the area once", () => {
++    const expected: Record<string, [number, number, number, number][]> = {
++      cols2: [
++        [0, 0, 0.5, 1],
++        [0.5, 0, 0.5, 1],
++      ],
++      rows2: [
++        [0, 0, 1, 0.5],
++        [0, 0.5, 1, 0.5],
++      ],
++      "stack-left": [
++        [0, 0, 0.5, 0.5],
++        [0, 0.5, 0.5, 0.5],
++        [0.5, 0, 0.5, 1],
++      ],
++      "stack-right": [
++        [0, 0, 0.5, 1],
++        [0.5, 0, 0.5, 0.5],
++        [0.5, 0.5, 0.5, 0.5],
++      ],
++      grid: [
++        [0, 0, 0.5, 0.5],
++        [0, 0.5, 0.5, 0.5],
++        [0.5, 0, 0.5, 0.5],
++        [0.5, 0.5, 0.5, 0.5],
++      ],
++    };
++    for (const [id, rects] of Object.entries(expected)) {
++      const layout = makeLayout(
++        Array.from({ length: rects.length }, (_, i) => `p${i}`),
++        id as AeSplitPresetId,
++      );
++      expect(slotRects(layout).map((r) => [r.x, r.y, r.w, r.h])).toEqual(rects);
++    }
++    for (const preset of AE_SPLIT_PRESETS) {
++      const layout = makeLayout(
++        Array.from({ length: slotCount(preset.id) }, () => null),
++        preset.id,
++      );
++      const area = slotRects(layout).reduce((a, r) => a + r.w * r.h, 0);
++      expect(area).toBeCloseTo(1);
++    }
++  });
++
++  it("follows resized columns and rows", () => {
++    const layout: AeSplitLayout = {
++      preset: "stack-right",
++      panes: ["a", "b", "c"],
++      cols: [0.3, 0.7],
++      rows: [[1], [0.25, 0.75]],
++    };
++    expect(slotRects(layout).map((r) => [r.x, r.y, r.w, r.h])).toEqual([
++      [0, 0, 0.3, 1],
++      [0.3, 0, 0.7, 0.25],
++      [0.3, 0.25, 0.7, 0.75],
++    ]);
++  });
++
++  it("makes a layout in the preset asked, or the default when it does not fit", () => {
++    expect(makeLayout(["a", "b"], "rows2")).toEqual({
++      preset: "rows2",
++      panes: ["a", "b"],
++      cols: [1],
++      rows: [[0.5, 0.5]],
++    });
++    expect(makeLayout(["a", "b"], "grid").preset).toBe("cols2");
++  });
++});
++
++describe("adding a pane", () => {
++  it("switches to the next preset that fits, keeping the arrangement's character", () => {
++    const grown: Record<string, AeSplitPresetId | null> = {
++      one: "cols2",
++      cols2: "cols3",
++      rows2: "stack-left",
++      "stack-left": "grid",
++      "stack-right": "grid",
++      cols3: "cols4",
++      grid: null,
++      cols4: null,
++    };
++    for (const [from, to] of Object.entries(grown)) {
++      expect(nextPreset(from as AeSplitPresetId)).toBe(to);
++    }
++  });
++
++  it("puts the new pane where the grown preset adds a slot, so open panes stay put", () => {
++    // 2 stacked -> 2+1: the new pane is the lone one on the right.
++    expect(addPane(makeLayout(["a", "b"], "rows2"))).toMatchObject({
++      preset: "stack-left",
++      panes: ["a", "b", null],
++    });
++    // 1+2 -> grid: the new pane goes under the left one.
++    const mirror = makeLayout(["a", "b", "c"], "stack-right");
++    expect(addedSlot(mirror)).toBe(1);
++    expect(addPane(mirror, "d")).toMatchObject({ preset: "grid", panes: ["a", "d", "b", "c"] });
++    // 2+1 -> grid: the new pane goes under the right one.
++    expect(addPane(makeLayout(["a", "b", "c"], "stack-left"), "d").panes).toEqual([
++      "a",
++      "b",
++      "c",
++      "d",
++    ]);
++  });
++
++  it("adds an empty pane with equal sizes, and is a no-op when full", () => {
++    expect(addEmptyPane(row(["a"]))).toEqual(makeLayout(["a", null]));
++    const wide = row(["a", "b"], [0.7, 0.3]);
++    expect(addEmptyPane(wide).cols).toEqual([1 / 3, 1 / 3, 1 / 3]);
++    const full = makeLayout(["a", "b", "c", "d"], "grid");
++    expect(addEmptyPane(full)).toBe(full);
++    expect(addedSlot(full)).toBe(-1);
++    expect(addEmptyPane(makeLayout(["a", "b", "c", "d"]))).toEqual(
++      makeLayout(["a", "b", "c", "d"]),
++    );
++  });
++});
++
++describe("closing a pane", () => {
++  it("gives a closed pane's width to the survivors", () => {
++    expect(removePane(row(["a", "b", "c"], [0.5, 0.25, 0.25]), 0)).toEqual({
++      preset: "cols2",
++      panes: ["b", "c"],
++      cols: [0.5, 0.5],
++      rows: [[1], [1]],
++    });
++  });
++
++  it("shrinks to the preset of the shape that is left", () => {
++    const grid = makeLayout(["a", "b", "c", "d"], "grid");
++    expect(removePane(grid, 0)).toMatchObject({ preset: "stack-right", panes: ["b", "c", "d"] });
++    expect(removePane(grid, 3)).toMatchObject({ preset: "stack-left", panes: ["a", "b", "c"] });
++    const twoOne = makeLayout(["a", "b", "c"], "stack-left");
++    expect(removePane(twoOne, 2)).toMatchObject({ preset: "rows2", panes: ["a", "b"] });
++    expect(removePane(twoOne, 0)).toMatchObject({ preset: "cols2", panes: ["b", "c"] });
++    expect(removePane(makeLayout(["a", "b"], "rows2"), 1)).toMatchObject({
++      preset: "one",
++      panes: ["a"],
++    });
++  });
++
++  it("keeps the surviving rows' proportions", () => {
++    const layout: AeSplitLayout = {
++      preset: "stack-right",
++      panes: ["a", "b", "c"],
++      cols: [0.4, 0.6],
++      rows: [[1], [0.3, 0.7]],
++    };
++    expect(removePane(layout, 0)).toEqual({
++      preset: "rows2",
++      panes: ["b", "c"],
++      cols: [1],
++      rows: [[0.3, 0.7]],
++    });
++  });
++
++  it("never removes the last pane", () => {
++    const one = makeLayout(["a"]);
++    expect(removePane(one, 0)).toBe(one);
++  });
++});
++
++describe("switching presets", () => {
++  it("keeps sessions in slot order and opens extra slots on the new-session page", () => {
++    expect(applyPreset(makeLayout(["a", "b"]), "grid")).toEqual({
++      preset: "grid",
++      panes: ["a", "b", null, null],
++      cols: [0.5, 0.5],
++      rows: [
++        [0.5, 0.5],
++        [0.5, 0.5],
++      ],
++    });
++    expect(applyPreset(makeLayout(["a", "b"]), "rows2")).toMatchObject({
++      preset: "rows2",
++      panes: ["a", "b"],
++    });
++  });
++
++  it("drops empty panes first, then the last sessions", () => {
++    expect(keptSlots(["a", null, "b", null], 2)).toEqual([0, 2]);
++    expect(keptSlots(["a", "b", "c", "d"], 2)).toEqual([0, 1]);
++    expect(keptSlots(["a", null, "b", "c"], 2)).toEqual([0, 2]);
++    expect(applyPreset(makeLayout(["a", null, "b", "c"], "grid"), "stack-left").panes).toEqual([
++      "a",
++      "b",
++      "c",
++    ]);
++  });
++});
++
++describe("swapping panes", () => {
++  it("swaps two slots' sessions and keeps the slots' sizes", () => {
++    const layout: AeSplitLayout = {
++      preset: "stack-left",
++      panes: ["a", "b", "c"],
++      cols: [0.3, 0.7],
++      rows: [[0.4, 0.6], [1]],
++    };
++    expect(swapPanes(layout, 0, 2)).toEqual({ ...layout, panes: ["c", "b", "a"] });
+   });
+ 
+-  it("replaces the last pane at the maximum", () => {
+-    const stored = { panes: ["a", "b", "c", "d"], sizes: [0.25, 0.25, 0.25, 0.25] };
+-    expect(layoutWithSession(stored, "e", null).panes).toEqual(["a", "b", "c", "e"]);
++  it("ignores a swap with itself or outside the layout", () => {
++    const layout = makeLayout(["a", "b"]);
++    expect(swapPanes(layout, 1, 1)).toBe(layout);
++    expect(swapPanes(layout, 1, 2)).toBe(layout);
++    expect(swapPanes(layout, -1, 0)).toBe(layout);
+   });
+ });
+ 
+@@ -111,6 +454,7 @@ describe("sizes", () => {
+   it("normalizes to fractions summing to one", () => {
+     expect(normalizeSizes([1, 3], 2)).toEqual([0.25, 0.75]);
+     expect(normalizeSizes([0, 1], 2)).toEqual([0.5, 0.5]);
++    expect(normalizeSizes(["x", 1], 2)).toEqual([0.5, 0.5]);
+   });
+ 
+   it("moves one divider and clamps at the minimum width", () => {
+@@ -123,20 +467,16 @@ describe("sizes", () => {
+     expect(clamped[1]).toBeCloseTo(1 - AE_SPLIT_MIN_FRACTION);
+   });
+ 
+-  it("gives a closed pane's width to the survivors", () => {
+-    expect(removePane({ panes: ["a", "b", "c"], sizes: [0.5, 0.25, 0.25] }, 0)).toEqual({
+-      panes: ["b", "c"],
+-      sizes: [0.5, 0.5],
+-    });
+-  });
+-
+-  it("adds an empty pane with equal widths, up to the maximum", () => {
+-    expect(addEmptyPane({ panes: ["a"], sizes: [1] })).toEqual({
+-      panes: ["a", null],
+-      sizes: [0.5, 0.5],
+-    });
+-    const full = { panes: ["a", "b", "c", "d"], sizes: [0.25, 0.25, 0.25, 0.25] };
+-    expect(addEmptyPane(full)).toBe(full);
++  it("resizes columns and the stacked panes of one column independently", () => {
++    const grid = makeLayout(["a", "b", "c", "d"], "grid");
++    const wider = resizeColumn(grid, 0, 0.1);
++    expect(wider.cols[0]).toBeCloseTo(0.6);
++    expect(wider.rows).toEqual(grid.rows);
++    const taller = resizeRow(grid, 1, 0, 0.2);
++    expect(taller.rows[0]).toEqual([0.5, 0.5]);
++    expect(taller.rows[1]![0]).toBeCloseTo(0.7);
++    expect(taller.rows[1]![1]).toBeCloseTo(0.3);
++    expect(resizeRow(grid, 1, 0, 0.9).rows[1]![1]).toBeCloseTo(AE_SPLIT_MIN_FRACTION);
+   });
+ });
+ 
+diff --git a/web/src/lib/aeSplitLayout.ts b/web/src/lib/aeSplitLayout.ts
+index 582fc48e4458dfcba4ac6f4bad07329e0373cf79..fd4a09c3ee09e981c1dcb630f2f53b7cdf4c27a0 100644
+--- a/web/src/lib/aeSplitLayout.ts
++++ b/web/src/lib/aeSplitLayout.ts
+@@ -1,6 +1,8 @@
+-// Layout state for the split view (omnigent-ae patch P5): which sessions sit in
+-// which pane, how wide each pane is, and how that round-trips through the URL
+-// (`/split?s=a,b`) and local storage. Pure helpers, no React, so the page, the
++// Layout state for the split view (omnigent-ae patches P5 and P10): which
++// sessions sit in which pane, which preset arranges them (P10, 2026-09-24: side
++// by side, stacked, 2+1 and its mirror, a 2x2 grid), how big each column and
++// stacked pane is, and how that round-trips through the URL
++// (`/split?s=a,b&l=rows2`) and local storage. Pure helpers, no React, so the page, the
+ // sidebar menu item and the shell's pane check share one definition.
+ //
+ // Each pane is an iframe of the ordinary `/c/:id` route. The chat store is a
+@@ -29,13 +31,99 @@ const NEW_PANE_TOKEN = "new";
+ /** One pane: a session id, or `null` for a pane still on the new-session page. */
+ export type AeSplitPane = string | null;
+ 
++/**
++ * The arrangements the picker offers (2026-09-24, after the Claude Code desktop
++ * app's layouts), plus `one` for a lone pane. A preset is a list of columns,
++ * each holding one or two panes stacked; panes fill the slots column by column,
++ * top to bottom.
++ */
++export type AeSplitPresetId =
++  "one" | "cols2" | "rows2" | "stack-left" | "stack-right" | "grid" | "cols3" | "cols4";
++
++export interface AeSplitPreset {
++  id: AeSplitPresetId;
++  /** The picker's tooltip and accessible name. */
++  label: string;
++  /** Panes per column, left to right. */
++  shape: readonly number[];
++}
++
++/** Every preset in the order the picker shows them; `one` is not offered there. */
++export const AE_SPLIT_PRESETS: readonly AeSplitPreset[] = [
++  { id: "cols2", label: "2 side by side", shape: [1, 1] },
++  { id: "rows2", label: "2 stacked", shape: [2] },
++  { id: "stack-left", label: "2 stacked, 1 beside them", shape: [2, 1] },
++  { id: "stack-right", label: "1, then 2 stacked beside it", shape: [1, 2] },
++  { id: "grid", label: "2 by 2 grid", shape: [2, 2] },
++  { id: "cols3", label: "3 side by side", shape: [1, 1, 1] },
++  { id: "cols4", label: "4 side by side", shape: [1, 1, 1, 1] },
++];
++
++const ONE: AeSplitPreset = { id: "one", label: "1 pane", shape: [1] };
++
++/** The preset for *id*; unknown ids are `undefined`. */
++export function presetById(id: unknown): AeSplitPreset | undefined {
++  if (id === ONE.id) return ONE;
++  return AE_SPLIT_PRESETS.find((p) => p.id === id);
++}
++
++/** How many panes *preset* holds. */
++export function slotCount(preset: AeSplitPresetId): number {
++  return (presetById(preset) ?? ONE).shape.reduce((a, b) => a + b, 0);
++}
++
++/** The preset whose shape is *shape*, if any. */
++function presetForShape(shape: readonly number[]): AeSplitPreset | undefined {
++  const key = shape.join(",");
++  if (key === ONE.shape.join(",")) return ONE;
++  return AE_SPLIT_PRESETS.find((p) => p.shape.join(",") === key);
++}
++
++/**
++ * The preset a pane count opens with when nothing says otherwise: side by
++ * side, which is what the split view did before presets. The URL leaves out a
++ * layout that is this default, so a link from before presets means the same.
++ */
++export function defaultPreset(count: number): AeSplitPresetId {
++  if (count <= 1) return "one";
++  if (count === 2) return "cols2";
++  if (count === 3) return "cols3";
++  return "cols4";
++}
++
++/**
++ * Where a new pane goes when a pane is added past *preset*'s slots: the next
++ * preset that fits, keeping the arrangement's character (stacked stays
++ * stacked, side by side stays side by side), and the column that gains the
++ * slot. `null` at four panes.
++ */
++const GROW: Record<AeSplitPresetId, { to: AeSplitPresetId; column: number } | null> = {
++  one: { to: "cols2", column: 1 },
++  cols2: { to: "cols3", column: 2 },
++  rows2: { to: "stack-left", column: 1 },
++  "stack-left": { to: "grid", column: 1 },
++  "stack-right": { to: "grid", column: 0 },
++  cols3: { to: "cols4", column: 3 },
++  grid: null,
++  cols4: null,
++};
++
++/** The preset adding a pane to *preset* switches to, or `null` when it is full. */
++export function nextPreset(preset: AeSplitPresetId): AeSplitPresetId | null {
++  return GROW[preset]?.to ?? null;
++}
++
+ export interface AeSplitLayout {
++  preset: AeSplitPresetId;
++  /** Sessions in slot order: column by column, top to bottom. As many as the preset has slots. */
+   panes: AeSplitPane[];
+-  /** Fractions of the row, one per pane, summing to 1. */
+-  sizes: number[];
++  /** Column widths, fractions of the row summing to 1. */
++  cols: number[];
++  /** Per column, the heights of its panes, fractions of the column summing to 1. */
++  rows: number[][];
+ }
+ 
+-/** Equal widths for *count* panes. */
++/** Equal fractions for *count* parts. */
+ export function equalSizes(count: number): number[] {
+   if (count <= 0) return [];
+   return Array.from({ length: count }, () => 1 / count);
+@@ -43,13 +131,81 @@ export function equalSizes(count: number): number[] {
+ 
+ /**
+  * Coerce *sizes* to *count* positive fractions summing to 1; anything that
+- * does not fit (wrong length, a zero, NaN) becomes equal widths.
++ * does not fit (wrong length, a zero, NaN) becomes equal parts.
+  */
+-export function normalizeSizes(sizes: readonly number[] | undefined, count: number): number[] {
+-  if (!sizes || sizes.length !== count || count === 0) return equalSizes(count);
+-  if (sizes.some((s) => !Number.isFinite(s) || s <= 0)) return equalSizes(count);
+-  const total = sizes.reduce((a, b) => a + b, 0);
+-  return sizes.map((s) => s / total);
++export function normalizeSizes(sizes: readonly unknown[] | undefined, count: number): number[] {
++  if (!Array.isArray(sizes) || sizes.length !== count || count === 0) return equalSizes(count);
++  if (sizes.some((s) => typeof s !== "number" || !Number.isFinite(s) || s <= 0)) {
++    return equalSizes(count);
++  }
++  const nums = sizes as number[];
++  const total = nums.reduce((a, b) => a + b, 0);
++  return nums.map((s) => s / total);
++}
++
++/** Equal columns and rows for *preset*. */
++export function equalGrid(preset: AeSplitPresetId): Pick<AeSplitLayout, "cols" | "rows"> {
++  const shape = (presetById(preset) ?? ONE).shape;
++  return { cols: equalSizes(shape.length), rows: shape.map((n) => equalSizes(n)) };
++}
++
++/** A layout of *panes* in *preset* (the default for their count when omitted), equal sizes. */
++export function makeLayout(panes: AeSplitPane[], preset?: AeSplitPresetId): AeSplitLayout {
++  const id = preset && slotCount(preset) === panes.length ? preset : defaultPreset(panes.length);
++  return { preset: id, panes, ...equalGrid(id) };
++}
++
++/** *cols* and *rows* coerced to fit *preset*; what does not fit becomes equal. */
++function fitGrid(
++  preset: AeSplitPresetId,
++  cols: readonly unknown[] | undefined,
++  rows: readonly unknown[] | undefined,
++): Pick<AeSplitLayout, "cols" | "rows"> {
++  const shape = (presetById(preset) ?? ONE).shape;
++  return {
++    cols: normalizeSizes(cols, shape.length),
++    rows: shape.map((n, c) => normalizeSizes(Array.isArray(rows) ? rows[c] : undefined, n)),
++  };
++}
++
++/** *layout* with its sizes coerced to fit its preset (what does not fit becomes equal). */
++export function fitLayout(layout: AeSplitLayout): AeSplitLayout {
++  return { ...layout, ...fitGrid(layout.preset, layout.cols, layout.rows) };
++}
++
++/** Where each slot sits, as fractions of the page's pane area. */
++export interface AeSplitRect {
++  x: number;
++  y: number;
++  w: number;
++  h: number;
++  /** The slot's column and its row within that column. */
++  column: number;
++  row: number;
++}
++
++/** One rectangle per slot of *layout*, in slot order. */
++export function slotRects(layout: AeSplitLayout): AeSplitRect[] {
++  const shape = (presetById(layout.preset) ?? ONE).shape;
++  const out: AeSplitRect[] = [];
++  let x = 0;
++  shape.forEach((n, c) => {
++    const w = layout.cols[c] ?? 0;
++    let y = 0;
++    for (let r = 0; r < n; r++) {
++      const h = layout.rows[c]?.[r] ?? 0;
++      out.push({ x, y, w, h, column: c, row: r });
++      y += h;
++    }
++    x += w;
++  });
++  return out;
++}
++
++/** The slot index of *column*'s first pane. */
++export function columnStart(preset: AeSplitPresetId, column: number): number {
++  const shape = (presetById(preset) ?? ONE).shape;
++  return shape.slice(0, column).reduce((a, b) => a + b, 0);
+ }
+ 
+ /**
+@@ -87,9 +243,24 @@ export function formatSplitParam(panes: readonly AeSplitPane[]): string {
+   return panes.map((p) => p ?? NEW_PANE_TOKEN).join(",");
+ }
+ 
+-/** The split route for *panes*, e.g. `/split?s=conv_a,conv_b`. */
+-export function splitHref(panes: readonly AeSplitPane[]): string {
+-  return `/split?s=${formatSplitParam(panes)}`;
++/**
++ * The `l` parameter's value for *preset* with *count* panes: the preset id,
++ * or `null` when it is the default for that count (the URL then has no `l`).
++ */
++export function formatLayoutParam(preset: AeSplitPresetId, count: number): string | null {
++  return preset === defaultPreset(count) ? null : preset;
++}
++
++/** The `l` parameter back to a preset, when it names one that holds *count* panes. */
++export function parseLayoutParam(value: string | null, count: number): AeSplitPresetId | null {
++  const preset = presetById(value);
++  return preset && slotCount(preset.id) === count ? preset.id : null;
++}
++
++/** The split route for *panes* in *preset*, e.g. `/split?s=a,b` or `/split?s=a,b&l=rows2`. */
++export function splitHref(panes: readonly AeSplitPane[], preset?: AeSplitPresetId): string {
++  const l = preset ? formatLayoutParam(preset, panes.length) : null;
++  return `/split?s=${formatSplitParam(panes)}${l ? `&l=${l}` : ""}`;
+ }
+ 
+ /** The session a pane frame is showing, from its pathname; `undefined` for any non-chat page. */
+@@ -104,6 +275,35 @@ export function paneSrc(pane: AeSplitPane): string {
+   return pane === null ? "/" : `/c/${encodeURIComponent(pane)}`;
+ }
+ 
++/**
++ * A stored value to a layout. Version 2 (2026-09-24, layout presets) is
++ * `{v: 2, preset, panes, cols, rows}`. Version 1, from before presets, is
++ * `{panes, sizes}` with one width per pane in a row; it reads as the side by
++ * side preset for its pane count with those widths, so a remembered layout
++ * survives the upgrade. Anything else is `null`.
++ */
++export function migrateStoredLayout(parsed: unknown): AeSplitLayout | null {
++  if (typeof parsed !== "object" || parsed === null) return null;
++  const value = parsed as Record<string, unknown>;
++  if (!Array.isArray(value.panes)) return null;
++  const panes = cleanPanes(
++    value.panes.filter((p): p is AeSplitPane => p === null || typeof p === "string"),
++  );
++  if (panes.length === 0) return null;
++  if (value.v === 2) {
++    const stored = presetById(value.preset);
++    const preset =
++      stored && slotCount(stored.id) === panes.length ? stored.id : defaultPreset(panes.length);
++    const cols = Array.isArray(value.cols) ? value.cols : undefined;
++    const rows = Array.isArray(value.rows) ? value.rows : undefined;
++    return { preset, panes, ...fitGrid(preset, cols, rows) };
++  }
++  // Version 1: a row of panes, one width each.
++  const preset = defaultPreset(panes.length);
++  const sizes = Array.isArray(value.sizes) ? value.sizes : undefined;
++  return { preset, panes, ...fitGrid(preset, sizes, undefined) };
++}
++
+ /** The remembered layout, or `null` when there is none or storage is unreadable. */
+ export function readStoredLayout(
+   storage: Storage | undefined = safeStorage(),
+@@ -112,26 +312,24 @@ export function readStoredLayout(
+   try {
+     const raw = storage.getItem(AE_SPLIT_STORAGE_KEY);
+     if (!raw) return null;
+-    const parsed = JSON.parse(raw) as Partial<AeSplitLayout>;
+-    if (!Array.isArray(parsed.panes)) return null;
+-    const panes = cleanPanes(
+-      parsed.panes.filter((p): p is AeSplitPane => p === null || typeof p === "string"),
+-    );
+-    if (panes.length === 0) return null;
+-    return { panes, sizes: normalizeSizes(parsed.sizes, panes.length) };
++    return migrateStoredLayout(JSON.parse(raw));
+   } catch {
+     return null;
+   }
+ }
+ 
+-/** Remember *layout*; a full or blocked storage is not an error worth surfacing. */
++/**
++ * Remember *layout* (always as version 2, under the key version 1 used, so the
++ * upgrade needs no second key); a full or blocked storage is not an error
++ * worth surfacing.
++ */
+ export function writeStoredLayout(
+   layout: AeSplitLayout,
+   storage: Storage | undefined = safeStorage(),
+ ): void {
+   if (!storage) return;
+   try {
+-    storage.setItem(AE_SPLIT_STORAGE_KEY, JSON.stringify(layout));
++    storage.setItem(AE_SPLIT_STORAGE_KEY, JSON.stringify({ v: 2, ...layout }));
+   } catch {
+     // Quota or privacy mode: the URL still carries the panes.
+   }
+@@ -145,34 +343,137 @@ function safeStorage(): Storage | undefined {
+   }
+ }
+ 
++/**
++ * *layout* in *preset*. Sessions keep their slots in order; extra slots open on
++ * the new-session page; with fewer slots, empty panes go first, then the last
++ * sessions (their sessions keep running). Sizes become equal.
++ */
++export function applyPreset(layout: AeSplitLayout, preset: AeSplitPresetId): AeSplitLayout {
++  const want = slotCount(preset);
++  const panes = keptSlots(layout.panes, want).map((i): AeSplitPane => layout.panes[i] ?? null);
++  while (panes.length < want) panes.push(null);
++  return { preset, panes, ...equalGrid(preset) };
++}
++
++/**
++ * Which of *panes* survive a preset with *want* slots, as their indices in
++ * order: all of them when they fit, else empty panes are dropped last first,
++ * then the last sessions. The page keeps its frame keys with the same list.
++ */
++export function keptSlots(panes: readonly AeSplitPane[], want: number): number[] {
++  const kept = panes.map((_, i) => i);
++  while (kept.length > want) {
++    let drop = -1;
++    for (let k = kept.length - 1; k >= 0; k--) {
++      if (panes[kept[k]!] === null) {
++        drop = k;
++        break;
++      }
++    }
++    kept.splice(drop === -1 ? kept.length - 1 : drop, 1);
++  }
++  return kept;
++}
++
++/**
++ * Add *pane* past the current preset's slots: the layout switches to the next
++ * preset that fits (see `nextPreset`) and the pane goes to the slot that preset
++ * adds, so the panes already open stay where they are on screen. A no-op at
++ * the maximum. Sizes become equal.
++ */
++export function addPane(layout: AeSplitLayout, pane: AeSplitPane = null): AeSplitLayout {
++  const at = addedSlot(layout);
++  const to = GROW[layout.preset]?.to;
++  if (at < 0 || !to) return layout;
++  const panes = [...layout.panes];
++  panes.splice(at, 0, pane);
++  return { preset: to, panes, ...equalGrid(to) };
++}
++
++/** The slot index *addPane* puts a new pane at, or -1 when the layout is full. */
++export function addedSlot(layout: AeSplitLayout): number {
++  const grow = GROW[layout.preset];
++  if (!grow || layout.panes.length >= AE_SPLIT_MAX_PANES) return -1;
++  const shape = (presetById(grow.to) ?? ONE).shape;
++  return columnStart(grow.to, grow.column) + shape[grow.column]! - 1;
++}
++
++/** Append an empty pane (the new-session page); kept for P5's callers. */
++export function addEmptyPane(layout: AeSplitLayout): AeSplitLayout {
++  return addPane(layout, null);
++}
++
++/**
++ * Remove pane *index*. Its column loses a slot (or goes, when that was its
++ * only pane) and the layout becomes the preset of the shape that is left: a
++ * grid minus one is a 2+1, a 2+1 minus its lone pane is 2 stacked. Survivors
++ * keep their proportions. The last pane is never removed.
++ */
++export function removePane(layout: AeSplitLayout, index: number): AeSplitLayout {
++  if (layout.panes.length <= 1 || index < 0 || index >= layout.panes.length) return layout;
++  const rect = slotRects(layout)[index];
++  if (!rect) return layout;
++  const shape = [...(presetById(layout.preset) ?? ONE).shape];
++  let cols = [...layout.cols];
++  let rows = layout.rows.map((r) => [...r]);
++  shape[rect.column]! -= 1;
++  if (shape[rect.column] === 0) {
++    shape.splice(rect.column, 1);
++    cols.splice(rect.column, 1);
++    rows.splice(rect.column, 1);
++  } else {
++    rows[rect.column]!.splice(rect.row, 1);
++  }
++  const preset = presetForShape(shape)?.id ?? defaultPreset(layout.panes.length - 1);
++  cols = normalizeSizes(cols, cols.length);
++  rows = rows.map((r) => normalizeSizes(r, r.length));
++  return {
++    preset,
++    panes: layout.panes.filter((_, i) => i !== index),
++    ...fitGrid(preset, cols, rows),
++  };
++}
++
++/** Swap the sessions in slots *a* and *b*; the slots keep their sizes. */
++export function swapPanes(layout: AeSplitLayout, a: number, b: number): AeSplitLayout {
++  const n = layout.panes.length;
++  if (a === b || a < 0 || b < 0 || a >= n || b >= n) return layout;
++  const panes = [...layout.panes];
++  [panes[a], panes[b]] = [panes[b]!, panes[a]!];
++  return { ...layout, panes };
++}
++
+ /**
+  * The layout to open when the user picks "Open in split view" on *sessionId*:
+  * the remembered panes (or, with none, the session being viewed), plus the
+- * chosen one. Already present, it stays where it is; at the maximum, it
+- * replaces the last pane.
++ * chosen one, which grows the preset as "Add pane" does. Already present, it
++ * stays where it is; at the maximum, it replaces the last pane.
+  */
+ export function layoutWithSession(
+   stored: AeSplitLayout | null,
+   sessionId: string,
+   currentSessionId: string | null,
+ ): AeSplitLayout {
+-  let panes: AeSplitPane[] = stored?.panes.length
+-    ? [...stored.panes]
++  const layout: AeSplitLayout | null = stored?.panes.length
++    ? stored
+     : currentSessionId
+-      ? [currentSessionId]
+-      : [];
+-  if (!panes.includes(sessionId)) {
+-    if (panes.length >= AE_SPLIT_MAX_PANES) panes = panes.slice(0, AE_SPLIT_MAX_PANES - 1);
+-    panes.push(sessionId);
++      ? makeLayout([currentSessionId])
++      : null;
++  if (!layout) return makeLayout([sessionId]);
++  if (layout.panes.includes(sessionId)) return layout;
++  if (layout.panes.length >= AE_SPLIT_MAX_PANES) {
++    const panes = [...layout.panes];
++    panes[panes.length - 1] = sessionId;
++    return { ...layout, panes: cleanPanes(panes) };
+   }
+-  panes = cleanPanes(panes);
+-  const keepSizes = stored !== null && stored.panes.length === panes.length;
+-  return { panes, sizes: normalizeSizes(keepSizes ? stored.sizes : undefined, panes.length) };
++  return addPane(layout, sessionId);
+ }
+ 
+ /**
+- * Move the divider after pane *index* by *delta* (a fraction of the row),
+- * clamped so neither neighbour shrinks below *min*. Other panes keep their width.
++ * Move the divider after part *index* of *sizes* by *delta* (a fraction of
++ * the row or column), clamped so neither neighbour shrinks below *min*. The
++ * other parts keep their size. Used for both axes: column widths and the
++ * heights of the panes stacked in one column.
+  */
+ export function resizeAt(
+   sizes: readonly number[],
+@@ -191,21 +492,20 @@ export function resizeAt(
+   return out;
+ }
+ 
+-/** Remove pane *index*; its width goes to the survivors in proportion. */
+-export function removePane(layout: AeSplitLayout, index: number): AeSplitLayout {
+-  const panes = layout.panes.filter((_, i) => i !== index);
+-  const sizes = normalizeSizes(
+-    layout.sizes.filter((_, i) => i !== index),
+-    panes.length,
+-  );
+-  return { panes, sizes };
++/** Move the divider after column *index* by *delta* of the row's width. */
++export function resizeColumn(layout: AeSplitLayout, index: number, delta: number): AeSplitLayout {
++  return { ...layout, cols: resizeAt(layout.cols, index, delta) };
+ }
+ 
+-/** Append an empty pane (the new-session page), equal widths; a no-op at the maximum. */
+-export function addEmptyPane(layout: AeSplitLayout): AeSplitLayout {
+-  if (layout.panes.length >= AE_SPLIT_MAX_PANES) return layout;
+-  const panes = [...layout.panes, null];
+-  return { panes, sizes: equalSizes(panes.length) };
++/** Move the divider after row *index* of *column* by *delta* of the column's height. */
++export function resizeRow(
++  layout: AeSplitLayout,
++  column: number,
++  index: number,
++  delta: number,
++): AeSplitLayout {
++  const rows = layout.rows.map((r, c) => (c === column ? resizeAt(r, index, delta) : r));
++  return { ...layout, rows };
+ }
+ 
+ /**
+diff --git a/web/src/pages/AeSplitPage.test.tsx b/web/src/pages/AeSplitPage.test.tsx
+index e584dd167360b2ce725f1ca47b561f233b7156cf..a7667126221693f63fe0578e43e1533c50d8ae87 100644
+--- a/web/src/pages/AeSplitPage.test.tsx
++++ b/web/src/pages/AeSplitPage.test.tsx
+@@ -1,7 +1,9 @@
+-// Tests for the split view (omnigent-ae patch P5): panes from the URL or the
+-// remembered layout, one frame per session, close / add / pick, the divider,
+-// following a frame that moves to another session, and the single-session
+-// fallback below 1024px.
++// Tests for the split view (omnigent-ae patches P5 and P10): panes from the URL
++// or the remembered layout, one frame per session, close / add / pick, the
++// dividers in both axes, following a frame that moves to another session, the
++// single-session fallback below 1024px, and every layout preset: the picker,
++// where each preset puts its panes, growing on add, shrinking on close,
++// swapping panes, and a version 1 layout restored after the upgrade.
+ 
+ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
+ import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
+@@ -127,7 +129,7 @@ describe("AeSplitPage", () => {
+     fireEvent.keyDown(divider, { key: "ArrowRight" });
+     fireEvent.keyDown(divider, { key: "ArrowRight" });
+     expect(divider.getAttribute("aria-valuenow")).toBe("54");
+-    const sizes = readStoredLayout()!.sizes;
++    const sizes = readStoredLayout()!.cols;
+     expect(sizes[0]).toBeCloseTo(0.54);
+     expect(sizes[1]).toBeCloseTo(0.46);
+   });
+@@ -176,6 +178,277 @@ describe("AeSplitPage", () => {
+ 
+   it("ignores a stored layout that is not JSON", () => {
+     window.localStorage.setItem(AE_SPLIT_STORAGE_KEY, "nope");
+-    expect(initialLayout(null, readStoredLayout())).toEqual({ panes: [null], sizes: [1] });
++    expect(initialLayout(null, readStoredLayout())).toEqual({
++      preset: "one",
++      panes: [null],
++      cols: [1],
++      rows: [[1]],
++    });
++  });
++});
++
++/** Each pane's slot rectangle as its inline style reads, in slot order: [left, top, width, height]. */
++function placements() {
++  return screen
++    .getAllByTestId("ae-split-pane")
++    .sort((a, b) => Number(a.dataset.slot) - Number(b.dataset.slot))
++    .map((p) => [p.style.left, p.style.top, p.style.width, p.style.height]);
++}
++
++function sessionsBySlot() {
++  return screen
++    .getAllByTestId("ae-split-pane")
++    .sort((a, b) => Number(a.dataset.slot) - Number(b.dataset.slot))
++    .map((p) => p.dataset.session);
++}
++
++describe("AeSplitPage layout presets", () => {
++  it("shows the seven presets in the top bar with the current one pressed", () => {
++    renderAt("/split?s=a,b");
++    const group = screen.getByRole("group", { name: "Layout" });
++    const buttons = Array.from(group.querySelectorAll("button"));
++    expect(buttons.map((b) => b.getAttribute("aria-label"))).toEqual([
++      "2 side by side",
++      "2 stacked",
++      "2 stacked, 1 beside them",
++      "1, then 2 stacked beside it",
++      "2 by 2 grid",
++      "3 side by side",
++      "4 side by side",
++    ]);
++    expect(buttons.filter((b) => b.getAttribute("aria-pressed") === "true")).toEqual([
++      screen.getByTestId("ae-split-preset-cols2"),
++    ]);
++    // Each button draws its preset: one rectangle per pane.
++    expect(screen.getByTestId("ae-split-preset-grid").querySelectorAll("rect")).toHaveLength(4);
++  });
++
++  it("2 side by side: two columns, one vertical divider", () => {
++    renderAt("/split?s=a,b");
++    expect(placements()).toEqual([
++      ["0%", "0%", "calc(50% - 3px)", "100%"],
++      ["calc(50% + 3px)", "0%", "calc(50% - 3px)", "100%"],
++    ]);
++    const dividers = screen.getAllByTestId("ae-split-divider");
++    expect(dividers.map((d) => d.getAttribute("aria-orientation"))).toEqual(["vertical"]);
++  });
++
++  it("2 stacked: one column, one horizontal divider that takes the up and down arrows", () => {
++    renderAt("/split?s=a,b&l=rows2");
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("rows2");
++    expect(placements()).toEqual([
++      ["0%", "0%", "100%", "calc(50% - 3px)"],
++      ["0%", "calc(50% + 3px)", "100%", "calc(50% - 3px)"],
++    ]);
++    const divider = screen.getByTestId("ae-split-divider");
++    expect(divider.getAttribute("aria-orientation")).toBe("horizontal");
++    fireEvent.keyDown(divider, { key: "ArrowLeft" });
++    expect(divider.getAttribute("aria-valuenow")).toBe("50");
++    fireEvent.keyDown(divider, { key: "ArrowDown" });
++    fireEvent.keyDown(divider, { key: "ArrowDown" });
++    fireEvent.keyDown(divider, { key: "ArrowUp" });
++    expect(divider.getAttribute("aria-valuenow")).toBe("52");
++    expect(readStoredLayout()!.rows[0]![0]).toBeCloseTo(0.52);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b&l=rows2");
++  });
++
++  it("2+1: two stacked on the left, one beside them", () => {
++    renderAt("/split?s=a,b,c&l=stack-left");
++    expect(placements()).toEqual([
++      ["0%", "0%", "calc(50% - 3px)", "calc(50% - 3px)"],
++      ["0%", "calc(50% + 3px)", "calc(50% - 3px)", "calc(50% - 3px)"],
++      ["calc(50% + 3px)", "0%", "calc(50% - 3px)", "100%"],
++    ]);
++    expect(
++      screen.getAllByTestId("ae-split-divider").map((d) => d.getAttribute("aria-orientation")),
++    ).toEqual(["vertical", "horizontal"]);
++  });
++
++  it("1+2: one on the left, two stacked beside it", () => {
++    renderAt("/split?s=a,b,c&l=stack-right");
++    expect(placements()).toEqual([
++      ["0%", "0%", "calc(50% - 3px)", "100%"],
++      ["calc(50% + 3px)", "0%", "calc(50% - 3px)", "calc(50% - 3px)"],
++      ["calc(50% + 3px)", "calc(50% + 3px)", "calc(50% - 3px)", "calc(50% - 3px)"],
++    ]);
++  });
++
++  it("2x2 grid: two columns of two, one vertical and two horizontal dividers", () => {
++    renderAt("/split?s=a,b,c,d&l=grid");
++    expect(placements()).toHaveLength(4);
++    expect(placements()[3]).toEqual([
++      "calc(50% + 3px)",
++      "calc(50% + 3px)",
++      "calc(50% - 3px)",
++      "calc(50% - 3px)",
++    ]);
++    const dividers = screen.getAllByTestId("ae-split-divider");
++    expect(dividers.map((d) => d.getAttribute("aria-orientation"))).toEqual([
++      "vertical",
++      "horizontal",
++      "horizontal",
++    ]);
++    // The columns' stacks resize independently.
++    fireEvent.keyDown(dividers[2]!, { key: "ArrowDown" });
++    const rows = readStoredLayout()!.rows;
++    expect(rows[0]).toEqual([0.5, 0.5]);
++    expect(rows[1]![0]).toBeCloseTo(0.52);
++  });
++
++  it("3 and 4 side by side: columns only", () => {
++    renderAt("/split?s=a,b,c");
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("cols3");
++    expect(screen.getAllByTestId("ae-split-divider")).toHaveLength(2);
++    cleanup();
++    renderAt("/split?s=a,b,c,d");
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("cols4");
++    expect(
++      screen.getAllByTestId("ae-split-divider").map((d) => d.getAttribute("aria-orientation")),
++    ).toEqual(["vertical", "vertical", "vertical"]);
++  });
++
++  it("switching preset moves the frames without reloading them and mirrors it in the URL", () => {
++    renderAt("/split?s=a,b");
++    const before = frames();
++    fireEvent.click(screen.getByTestId("ae-split-preset-rows2"));
++    expect(frames()).toEqual(before);
++    expect(screen.getByTestId("ae-split-preset-rows2")).toHaveAttribute("aria-pressed", "true");
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b&l=rows2");
++    expect(readStoredLayout()).toMatchObject({ preset: "rows2", panes: ["a", "b"] });
++  });
++
++  it("a bigger preset opens its extra slots on the new-session page", () => {
++    renderAt("/split?s=a,b");
++    fireEvent.click(screen.getByTestId("ae-split-preset-grid"));
++    expect(sessionsBySlot()).toEqual(["a", "b", "", ""]);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b,new,new&l=grid");
++    expect(screen.getByTestId("ae-split-add")).toBeDisabled();
++  });
++
++  it("a smaller preset keeps the first sessions, dropping empty panes first", () => {
++    renderAt("/split?s=a,new,b,c&l=grid");
++    expect(screen.getByTestId("ae-split-preset-cols2")).toHaveAttribute(
++      "title",
++      expect.stringContaining("keeps the first 2 sessions; the other 1 close here"),
++    );
++    fireEvent.click(screen.getByTestId("ae-split-preset-cols2"));
++    expect(sessionsBySlot()).toEqual(["a", "b"]);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b");
++  });
++
++  it("adding a pane past the preset's slots switches to the next preset that fits", () => {
++    renderAt("/split?s=a,b&l=rows2");
++    expect(screen.getByTestId("ae-split-add")).toHaveAttribute(
++      "title",
++      expect.stringContaining("2 stacked, 1 beside them"),
++    );
++    fireEvent.click(screen.getByTestId("ae-split-add"));
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("stack-left");
++    expect(sessionsBySlot()).toEqual(["a", "b", ""]);
++    fireEvent.click(screen.getByTestId("ae-split-add"));
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("grid");
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b,new,new&l=grid");
++  });
++
++  it("closing a pane shrinks to the preset of what is left", () => {
++    renderAt("/split?s=a,b,c,d&l=grid");
++    const survivors = frames().filter((f) => f.getAttribute("src") !== "/c/d");
++    const closeD = screen
++      .getAllByTestId("ae-split-pane")
++      .find((p) => p.dataset.session === "d")!
++      .querySelector('[data-testid="ae-split-close"]')!;
++    fireEvent.click(closeD);
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("stack-left");
++    expect(frames()).toEqual(survivors);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b,c&l=stack-left");
++  });
++
++  it("the last pane cannot be closed", () => {
++    renderAt("/split?s=a");
++    expect(screen.getByTestId("ae-split-close")).toBeDisabled();
++  });
++
++  it("swaps two panes by dragging one's grip onto the other, without reloading either", () => {
++    renderAt("/split?s=a,b,c&l=stack-left");
++    const before = frames();
++    const grips = screen.getAllByTestId("ae-split-grip");
++    const panes = screen.getAllByTestId("ae-split-pane");
++    fireEvent.dragStart(grips[0]!);
++    // While a pane is moving the frames let the page keep the pointer.
++    expect(frames()[0]!.className).toContain("pointer-events-none");
++    fireEvent.dragOver(panes[2]!);
++    expect(panes[2]!.className).toContain("ring-2");
++    fireEvent.drop(panes[2]!);
++    expect(sessionsBySlot()).toEqual(["c", "b", "a"]);
++    expect(frames()).toEqual(before);
++    expect(frames().map((f) => f.getAttribute("src"))).toEqual(["/c/a", "/c/b", "/c/c"]);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=c,b,a&l=stack-left");
++    expect(frames()[0]!.className).not.toContain("pointer-events-none");
++  });
++
++  it("moves a pane one slot with the arrow keys on its grip", () => {
++    renderAt("/split?s=a,b,c");
++    const gripA = screen.getAllByTestId("ae-split-grip")[0]!;
++    fireEvent.keyDown(gripA, { key: "ArrowRight" });
++    expect(sessionsBySlot()).toEqual(["b", "a", "c"]);
++    fireEvent.keyDown(gripA, { key: "ArrowDown" });
++    expect(sessionsBySlot()).toEqual(["b", "c", "a"]);
++    fireEvent.keyDown(gripA, { key: "ArrowRight" });
++    expect(sessionsBySlot()).toEqual(["b", "c", "a"]);
++    fireEvent.keyDown(gripA, { key: "ArrowUp" });
++    expect(sessionsBySlot()).toEqual(["b", "a", "c"]);
++  });
++
++  it("follows a frame that navigates after its pane was swapped", () => {
++    vi.useFakeTimers();
++    renderAt("/split?s=a,b");
++    const frameA = frames()[0]!;
++    fireEvent.keyDown(screen.getAllByTestId("ae-split-grip")[0]!, { key: "ArrowRight" });
++    Object.defineProperty(frameA, "contentWindow", {
++      configurable: true,
++      value: { location: { pathname: "/c/c" }, document: { title: "Gamma" } },
++    });
++    act(() => {
++      vi.advanceTimersByTime(AE_SPLIT_FRAME_POLL_MS);
++    });
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=b,c");
++  });
++
++  it("restores a version 1 layout from before presets as side by side with its widths", () => {
++    window.localStorage.setItem(
++      AE_SPLIT_STORAGE_KEY,
++      JSON.stringify({ panes: ["a", "b"], sizes: [0.3, 0.7] }),
++    );
++    renderAt("/split");
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("cols2");
++    expect(screen.getByTestId("ae-split-divider").getAttribute("aria-valuenow")).toBe("30");
++    expect(JSON.parse(window.localStorage.getItem(AE_SPLIT_STORAGE_KEY)!)).toMatchObject({
++      v: 2,
++      preset: "cols2",
++      cols: [0.3, 0.7],
++    });
++  });
++
++  it("keeps remembered sizes when the URL names the same preset and pane count", () => {
++    const stored = {
++      v: 2,
++      preset: "rows2",
++      panes: ["x", "y"],
++      cols: [1],
++      rows: [[0.7, 0.3]],
++    };
++    window.localStorage.setItem(AE_SPLIT_STORAGE_KEY, JSON.stringify(stored));
++    renderAt("/split?s=a,b&l=rows2");
++    expect(screen.getByTestId("ae-split-divider").getAttribute("aria-valuenow")).toBe("70");
++    cleanup();
++    renderAt("/split?s=a,b");
++    expect(screen.getByTestId("ae-split-divider").getAttribute("aria-valuenow")).toBe("50");
++  });
++
++  it("ignores an `l` that does not fit the panes", () => {
++    renderAt("/split?s=a,b&l=grid");
++    expect(screen.getByTestId("ae-split-row").dataset.preset).toBe("cols2");
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b");
++    expect(screen.getByTestId("where").textContent).not.toContain("l=");
+   });
+ });
+diff --git a/web/src/pages/AeSplitPage.tsx b/web/src/pages/AeSplitPage.tsx
+index a9f0ebd61921aa52d07b2fb4fc51fd1c85c743af..0077ff4037c9950a186b33554661e97fe4efb648 100644
+--- a/web/src/pages/AeSplitPage.tsx
++++ b/web/src/pages/AeSplitPage.tsx
+@@ -1,14 +1,31 @@
+-// The split view (omnigent-ae patch P5, 2026-09-24): two to four sessions side
+-// by side in one window, like the Claude desktop app's multi-panel layout.
+-// `/split?s=a,b` renders one pane per session in a resizable row; each pane is
+-// a frame of the ordinary `/c/:id` route (see `lib/aeSplitLayout.ts` for why a
+-// frame), with a strip carrying its title, a session switcher, "open alone"
+-// and close. The layout is remembered in local storage; with no `s` parameter
+-// the remembered one opens. Desktop only: below 1024px the route falls back to
+-// the first pane's session on its own.
+-
+-import { Columns2Icon, Maximize2Icon, PlusIcon, SquareIcon, XIcon } from "lucide-react";
++// The split view (omnigent-ae patch P5, 2026-09-24): two to four sessions in
++// one window, like the Claude desktop app's multi-panel layout. `/split?s=a,b`
++// renders one pane per session; each pane is a frame of the ordinary `/c/:id`
++// route (see `lib/aeSplitLayout.ts` for why a frame), with a strip carrying a
++// grip to move it, a session switcher, "open alone" and close. The layout is
++// remembered in local storage; with no `s` parameter the remembered one opens.
++// Desktop only: below 1024px the route falls back to the first pane's session
++// on its own.
++//
++// Layout presets (patch P10, 2026-09-24): the top bar's picker arranges the
++// panes side by side, stacked, 2+1 or its mirror, or in a 2x2 grid (`&l=` in
++// the URL when not side by side). Dividers resize columns and stacked panes;
++// a pane's grip swaps it with another by drag or arrow keys. Panes are laid out
++// absolutely from the layout's rectangles and rendered in a fixed order, so a
++// preset change or a swap moves a frame on screen without moving it in the
++// DOM: a moved iframe reloads, which would drop a pane's stream and draft.
++
++import {
++  GripVerticalIcon,
++  LayoutGridIcon,
++  Maximize2Icon,
++  PlusIcon,
++  SquareIcon,
++  XIcon,
++} from "lucide-react";
+ import {
++  type CSSProperties,
++  type DragEvent as ReactDragEvent,
+   type KeyboardEvent as ReactKeyboardEvent,
+   type PointerEvent as ReactPointerEvent,
+   useCallback,
+@@ -25,19 +42,35 @@ import {
+   AE_SPLIT_MAX_PANES,
+   AE_SPLIT_MIN_VIEWPORT_PX,
+   AE_SPLIT_PANE_NAME_PREFIX,
++  AE_SPLIT_PRESETS,
+   type AeSplitLayout,
+   type AeSplitPane,
+-  addEmptyPane,
+-  equalSizes,
++  type AeSplitPreset,
++  type AeSplitPresetId,
++  type AeSplitRect,
++  addPane,
++  addedSlot,
++  applyPreset,
++  equalGrid,
++  fitLayout,
++  formatLayoutParam,
+   formatSplitParam,
+   isAeSplitPane,
+-  normalizeSizes,
++  keptSlots,
++  makeLayout,
++  nextPreset,
+   paneSessionFromPath,
+   paneSrc,
++  parseLayoutParam,
+   parseSplitParam,
++  presetById,
+   readStoredLayout,
+   removePane,
+-  resizeAt,
++  resizeColumn,
++  resizeRow,
++  slotCount,
++  slotRects,
++  swapPanes,
+   writeStoredLayout,
+ } from "@/lib/aeSplitLayout";
+ import { useNavigate, useSearchParams } from "@/lib/routing";
+@@ -45,9 +78,13 @@ import { useNavigate, useSearchParams } from "@/lib/routing";
+ /** How often the page reads each frame's location and title (a frame's SPA navigation fires no event). */
+ export const AE_SPLIT_FRAME_POLL_MS = 1000;
+ 
+-/** One arrow-key press on a divider moves it by this fraction of the row. */
++/** One arrow-key press on a divider moves it by this fraction of the row or column. */
+ const KEYBOARD_STEP = 0.02;
+ 
++/** The gap between panes, in pixels; the divider fills it. */
++const GAP_PX = 6;
++const HALF_GAP = GAP_PX / 2;
++
+ const DESKTOP_QUERY = `(min-width: ${AE_SPLIT_MIN_VIEWPORT_PX}px)`;
+ 
+ function subscribeDesktop(onChange: () => void): () => void {
+@@ -68,15 +105,33 @@ export function useIsSplitViewport(): boolean {
+   return useSyncExternalStore(subscribeDesktop, getDesktop, () => true);
+ }
+ 
+-/** The layout the page opens with: the URL's panes, else the remembered ones, else one empty pane. */
+-export function initialLayout(param: string | null, stored: AeSplitLayout | null): AeSplitLayout {
++/**
++ * The layout the page opens with: the URL's panes in the URL's preset (`l`,
++ * side by side when absent), keeping the remembered sizes when the remembered
++ * layout has the same preset and pane count; else the remembered layout; else
++ * one empty pane.
++ */
++export function initialLayout(
++  param: string | null,
++  stored: AeSplitLayout | null,
++  layoutParam: string | null = null,
++): AeSplitLayout {
+   const fromUrl = parseSplitParam(param);
+   if (fromUrl) {
+-    const keep = stored && stored.panes.length === fromUrl.length ? stored.sizes : undefined;
+-    return { panes: fromUrl, sizes: normalizeSizes(keep, fromUrl.length) };
++    const layout = makeLayout(fromUrl, parseLayoutParam(layoutParam, fromUrl.length) ?? undefined);
++    if (stored && stored.preset === layout.preset && stored.panes.length === fromUrl.length) {
++      return fitLayout({ ...layout, cols: stored.cols, rows: stored.rows });
++    }
++    return layout;
+   }
+   if (stored) return stored;
+-  return { panes: [null], sizes: [1] };
++  return makeLayout([null]);
++}
++
++/** The split route's query for *layout*: `s=` always, `&l=` when not the default preset. */
++function layoutQuery(layout: AeSplitLayout): string {
++  const l = formatLayoutParam(layout.preset, layout.panes.length);
++  return `s=${formatSplitParam(layout.panes)}${l ? `&l=${l}` : ""}`;
+ }
+ 
+ function sessionLabel(
+@@ -91,35 +146,110 @@ function sessionLabel(
+   return pane;
+ }
+ 
++/** A CSS length at *fraction* of the pane area, shifted by *px*. */
++function at(fraction: number, px = 0): string {
++  if (px === 0) return `${fraction * 100}%`;
++  return `calc(${fraction * 100}% ${px < 0 ? "-" : "+"} ${Math.abs(px)}px)`;
++}
++
++/** Absolute placement for a slot, leaving half the gap on every inner edge. */
++function rectStyle(rect: AeSplitRect, columns: number, rowsInColumn: number): CSSProperties {
++  const left = rect.column === 0 ? 0 : HALF_GAP;
++  const right = rect.column === columns - 1 ? 0 : HALF_GAP;
++  const top = rect.row === 0 ? 0 : HALF_GAP;
++  const bottom = rect.row === rowsInColumn - 1 ? 0 : HALF_GAP;
++  return {
++    position: "absolute",
++    left: at(rect.x, left),
++    width: at(rect.w, -(left + right)),
++    top: at(rect.y, top),
++    height: at(rect.h, -(top + bottom)),
++  };
++}
++
++/** The preset's shape drawn small: one rectangle per pane, for the picker. */
++function PresetIcon({ preset }: { preset: AeSplitPreset }) {
++  const W = 18;
++  const H = 14;
++  const g = 1.5;
++  const cols = preset.shape.length;
++  const cw = (W - g * (cols - 1)) / cols;
++  const rects: { id: string; x: number; y: number; w: number; h: number }[] = [];
++  preset.shape.forEach((n, c) => {
++    const rh = (H - g * (n - 1)) / n;
++    for (let r = 0; r < n; r++) {
++      rects.push({ id: `${c}-${r}`, x: c * (cw + g), y: r * (rh + g), w: cw, h: rh });
++    }
++  });
++  return (
++    <svg width={W} height={H} viewBox={`0 0 ${W} ${H}`} aria-hidden="true" className="shrink-0">
++      {rects.map((r) => (
++        <rect
++          key={r.id}
++          x={r.x + 0.5}
++          y={r.y + 0.5}
++          width={r.w - 1}
++          height={r.h - 1}
++          rx={1}
++          fill="currentColor"
++          fillOpacity={0.2}
++          stroke="currentColor"
++          strokeWidth={1}
++        />
++      ))}
++    </svg>
++  );
++}
++
++/** Panes and the frame key of each slot; the keys follow their panes through every change. */
++interface SplitState {
++  layout: AeSplitLayout;
++  keys: number[];
++}
++
+ export function AeSplitPage() {
+   const [searchParams] = useSearchParams();
+   const navigate = useNavigate();
+   const desktop = useIsSplitViewport();
+   const param = searchParams.get("s");
+-  const [layout, setLayout] = useState<AeSplitLayout>(() =>
+-    initialLayout(param, readStoredLayout()),
+-  );
+-  const [frameTitles, setFrameTitles] = useState<Record<number, string>>({});
+-  const [dragging, setDragging] = useState(false);
+-  const rowRef = useRef<HTMLDivElement>(null);
+-  const frameRefs = useRef<(HTMLIFrameElement | null)[]>([]);
+-  // Frames are keyed by a per-pane serial, not by index or session: closing a
++  const layoutParam = searchParams.get("l");
++  // Frames are keyed by a per-pane serial, not by slot or session: closing a
+   // pane must not reload its neighbours, and a pane that navigates inside its
+   // own frame must not be remounted by the layout catching up with it.
+   const serial = useRef(0);
+-  const [keys, setKeys] = useState<number[]>(() => layout.panes.map(() => serial.current++));
++  const [state, setState] = useState<SplitState>(() => {
++    const layout = initialLayout(param, readStoredLayout(), layoutParam);
++    return { layout, keys: layout.panes.map(() => serial.current++) };
++  });
++  const { layout, keys } = state;
++  const [frameTitles, setFrameTitles] = useState<Record<number, string>>({});
++  const [dragging, setDragging] = useState(false);
++  const [moving, setMoving] = useState<number | null>(null);
++  const [dropTarget, setDropTarget] = useState<number | null>(null);
++  const areaRef = useRef<HTMLDivElement>(null);
++  const frameRefs = useRef(new Map<number, HTMLIFrameElement>());
++  const keysRef = useRef(keys);
++  keysRef.current = keys;
++
++  const setLayout = useCallback((next: (prev: AeSplitLayout) => AeSplitLayout) => {
++    setState((prev) => {
++      const nextLayout = next(prev.layout);
++      return nextLayout === prev.layout ? prev : { ...prev, layout: nextLayout };
++    });
++  }, []);
+ 
+   const { data } = useConversations("", false, { enabled: desktop });
+   const conversations = useMemo(() => data?.pages.flatMap((p) => p.data) ?? [], [data]);
+   const byId = useMemo(() => new Map(conversations.map((c) => [c.id, c])), [conversations]);
+ 
+   // Remember the layout and keep the URL on it, so a reload or a copied link
+-  // lands on the same panes.
++  // lands on the same panes in the same arrangement.
+   useEffect(() => {
+     writeStoredLayout(layout);
+-    const next = formatSplitParam(layout.panes);
+-    if (next !== param) navigate(`/split?s=${next}`, { replace: true });
+-  }, [layout, navigate, param]);
++    const next = layoutQuery(layout);
++    const current = `s=${param ?? ""}${layoutParam ? `&l=${layoutParam}` : ""}`;
++    if (next !== current) navigate(`/split?${next}`, { replace: true });
++  }, [layout, navigate, param, layoutParam]);
+ 
+   useEffect(() => {
+     document.title = `Split view (${layout.panes.length})`;
+@@ -131,13 +261,13 @@ export function AeSplitPage() {
+     const timer = window.setInterval(() => {
+       const titles: Record<number, string> = {};
+       const seen: (AeSplitPane | undefined)[] = [];
+-      frameRefs.current.forEach((frame, i) => {
++      keysRef.current.forEach((key, i) => {
+         try {
+-          const win = frame?.contentWindow;
++          const win = frameRefs.current.get(key)?.contentWindow;
+           if (!win) return;
+           seen[i] = paneSessionFromPath(win.location.pathname);
+           const title = win.document.title;
+-          if (title) titles[i] = title;
++          if (title) titles[key] = title;
+         } catch {
+           // A frame mid-navigation, or one that left the origin; skip a beat.
+         }
+@@ -158,56 +288,121 @@ export function AeSplitPage() {
+       });
+     }, AE_SPLIT_FRAME_POLL_MS);
+     return () => window.clearInterval(timer);
+-  }, []);
++  }, [setLayout]);
+ 
+   const setPaneSession = useCallback((index: number, session: AeSplitPane) => {
+-    setLayout((prev) => {
+-      if (session !== null && prev.panes.some((p, i) => p === session && i !== index)) return prev;
+-      const panes = [...prev.panes];
++    setState((prev) => {
++      if (session !== null && prev.layout.panes.some((p, i) => p === session && i !== index)) {
++        return prev;
++      }
++      const panes = [...prev.layout.panes];
+       panes[index] = session;
+-      return { ...prev, panes };
++      // A picked session is a new document in that frame.
++      const nextKeys = prev.keys.map((k, i) => (i === index ? serial.current++ : k));
++      return { layout: { ...prev.layout, panes }, keys: nextKeys };
+     });
+-    // A picked session is a new document in that frame.
+-    setKeys((prev) => prev.map((k, i) => (i === index ? serial.current++ : k)));
+   }, []);
+ 
+   const closePane = useCallback((index: number) => {
+-    setLayout((prev) => removePane(prev, index));
+-    setKeys((prev) => prev.filter((_, i) => i !== index));
++    setState((prev) => {
++      const nextLayout = removePane(prev.layout, index);
++      if (nextLayout === prev.layout) return prev;
++      return { layout: nextLayout, keys: prev.keys.filter((_, i) => i !== index) };
++    });
+   }, []);
+ 
+-  const addPane = useCallback(() => {
+-    setLayout((prev) => addEmptyPane(prev));
+-    setKeys((prev) => (prev.length >= AE_SPLIT_MAX_PANES ? prev : [...prev, serial.current++]));
++  const onAddPane = useCallback(() => {
++    setState((prev) => {
++      const slot = addedSlot(prev.layout);
++      if (slot < 0) return prev;
++      const nextKeys = [...prev.keys];
++      nextKeys.splice(slot, 0, serial.current++);
++      return { layout: addPane(prev.layout), keys: nextKeys };
++    });
+   }, []);
+ 
+-  const startDrag = useCallback((index: number, event: ReactPointerEvent<HTMLDivElement>) => {
+-    const row = rowRef.current;
+-    if (!row) return;
+-    event.preventDefault();
+-    const width = row.getBoundingClientRect().width || 1;
+-    let lastX = event.clientX;
+-    setDragging(true);
+-    const onMove = (e: PointerEvent) => {
+-      const delta = (e.clientX - lastX) / width;
+-      lastX = e.clientX;
+-      setLayout((prev) => ({ ...prev, sizes: resizeAt(prev.sizes, index, delta) }));
+-    };
+-    const onUp = () => {
+-      setDragging(false);
+-      window.removeEventListener("pointermove", onMove);
+-      window.removeEventListener("pointerup", onUp);
+-    };
+-    window.addEventListener("pointermove", onMove);
+-    window.addEventListener("pointerup", onUp);
++  const pickPreset = useCallback((preset: AeSplitPresetId) => {
++    setState((prev) => {
++      if (prev.layout.preset === preset) return prev;
++      const kept = keptSlots(prev.layout.panes, slotCount(preset)).map((i) => prev.keys[i]!);
++      while (kept.length < slotCount(preset)) kept.push(serial.current++);
++      return { layout: applyPreset(prev.layout, preset), keys: kept };
++    });
+   }, []);
+ 
+-  const nudge = useCallback((index: number, event: ReactKeyboardEvent<HTMLDivElement>) => {
+-    const step =
+-      event.key === "ArrowLeft" ? -KEYBOARD_STEP : event.key === "ArrowRight" ? KEYBOARD_STEP : 0;
+-    if (step === 0) return;
+-    event.preventDefault();
+-    setLayout((prev) => ({ ...prev, sizes: resizeAt(prev.sizes, index, step) }));
++  const swap = useCallback((a: number, b: number) => {
++    setState((prev) => {
++      const nextLayout = swapPanes(prev.layout, a, b);
++      if (nextLayout === prev.layout) return prev;
++      const nextKeys = [...prev.keys];
++      [nextKeys[a], nextKeys[b]] = [nextKeys[b]!, nextKeys[a]!];
++      return { layout: nextLayout, keys: nextKeys };
++    });
++  }, []);
++
++  const startDrag = useCallback(
++    (
++      axis: "x" | "y",
++      apply: (prev: AeSplitLayout, delta: number) => AeSplitLayout,
++      event: ReactPointerEvent<HTMLDivElement>,
++    ) => {
++      const area = areaRef.current;
++      if (!area) return;
++      event.preventDefault();
++      const box = area.getBoundingClientRect();
++      const span = (axis === "x" ? box.width : box.height) || 1;
++      let last = axis === "x" ? event.clientX : event.clientY;
++      setDragging(true);
++      const onMove = (e: PointerEvent) => {
++        const now = axis === "x" ? e.clientX : e.clientY;
++        const delta = (now - last) / span;
++        last = now;
++        setLayout((prev) => apply(prev, delta));
++      };
++      const onUp = () => {
++        setDragging(false);
++        window.removeEventListener("pointermove", onMove);
++        window.removeEventListener("pointerup", onUp);
++      };
++      window.addEventListener("pointermove", onMove);
++      window.addEventListener("pointerup", onUp);
++    },
++    [setLayout],
++  );
++
++  const nudge = useCallback(
++    (
++      axis: "x" | "y",
++      apply: (prev: AeSplitLayout, delta: number) => AeSplitLayout,
++      event: ReactKeyboardEvent<HTMLDivElement>,
++    ) => {
++      const [back, forward] = axis === "x" ? ["ArrowLeft", "ArrowRight"] : ["ArrowUp", "ArrowDown"];
++      const step = event.key === back ? -KEYBOARD_STEP : event.key === forward ? KEYBOARD_STEP : 0;
++      if (step === 0) return;
++      event.preventDefault();
++      setLayout((prev) => apply(prev, step));
++    },
++    [setLayout],
++  );
++
++  const moveByKey = useCallback(
++    (index: number, event: ReactKeyboardEvent<HTMLButtonElement>) => {
++      const step =
++        event.key === "ArrowLeft" || event.key === "ArrowUp"
++          ? -1
++          : event.key === "ArrowRight" || event.key === "ArrowDown"
++            ? 1
++            : 0;
++      if (step === 0) return;
++      event.preventDefault();
++      swap(index, index + step);
++    },
++    [swap],
++  );
++
++  const endMove = useCallback(() => {
++    setMoving(null);
++    setDropTarget(null);
+   }, []);
+ 
+   // A split page inside a pane would nest frames without end; show the session instead.
+@@ -216,33 +411,81 @@ export function AeSplitPage() {
+     return <Navigate to={paneSrc(layout.panes.find((p) => p !== null) ?? null)} replace />;
+ 
+   const first = layout.panes.find((p) => p !== null) ?? null;
++  const shape = presetById(layout.preset)?.shape ?? [1];
++  const rects = slotRects(layout);
++  const grows = nextPreset(layout.preset);
++  const sessions = layout.panes.filter((p) => p !== null).length;
++  // Render in key order, which never changes for a live frame (see the header).
++  const order = keys.map((key, slot) => ({ key, slot })).sort((a, b) => a.key - b.key);
++  const frozen = dragging || moving !== null;
++  // A divider after every column but the last, and under every stacked pane but a column's last.
++  const colDividers = rects
++    .filter((r) => r.row === 0 && r.column < shape.length - 1)
++    .map((r) => ({ id: `col-${r.column}`, column: r.column, x: r.x + r.w }));
++  const rowDividers = rects
++    .filter((r) => r.row < (shape[r.column] ?? 1) - 1)
++    .map((r) => ({ id: `row-${r.column}-${r.row}`, rect: r }));
+ 
+   return (
+     <div className="flex h-dvh flex-col bg-sidebar text-foreground" data-testid="ae-split-page">
+       <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border px-3">
+-        <Columns2Icon className="size-4 text-muted-foreground" aria-hidden="true" />
++        <LayoutGridIcon className="size-4 text-muted-foreground" aria-hidden="true" />
+         <h1 className="text-sm font-medium">Split view</h1>
+         <span className="text-xs text-muted-foreground" data-testid="ae-split-count">
+           {layout.panes.length} of {AE_SPLIT_MAX_PANES} panes
+         </span>
++        <div
++          role="group"
++          aria-label="Layout"
++          className="ml-3 flex items-center gap-0.5 rounded-md border border-border p-0.5"
++          data-testid="ae-split-presets"
++        >
++          {AE_SPLIT_PRESETS.map((preset) => {
++            const active = preset.id === layout.preset;
++            const slots = slotCount(preset.id);
++            const drops = sessions - slots;
++            const title =
++              drops > 0
++                ? `${preset.label}: keeps the first ${slots} sessions; the other ${drops} close here and keep running`
++                : preset.label;
++            return (
++              <button
++                key={preset.id}
++                type="button"
++                aria-label={preset.label}
++                aria-pressed={active}
++                title={title}
++                onClick={() => pickPreset(preset.id)}
++                className={`flex h-6 w-7 items-center justify-center rounded-sm outline-none focus-visible:ring-2 focus-visible:ring-ring ${
++                  active
++                    ? "bg-accent text-foreground ring-1 ring-border"
++                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground"
++                }`}
++                data-testid={`ae-split-preset-${preset.id}`}
++              >
++                <PresetIcon preset={preset} />
++              </button>
++            );
++          })}
++        </div>
+         <div className="ml-auto flex items-center gap-1">
+           <Button
+             variant="ghost"
+             size="sm"
+-            onClick={() => setLayout((prev) => ({ ...prev, sizes: equalSizes(prev.panes.length) }))}
++            onClick={() => setLayout((prev) => ({ ...prev, ...equalGrid(prev.preset) }))}
+             data-testid="ae-split-equalize"
+           >
+-            Equal widths
++            Equal sizes
+           </Button>
+           <Button
+             variant="ghost"
+             size="sm"
+-            onClick={addPane}
+-            disabled={layout.panes.length >= AE_SPLIT_MAX_PANES}
++            onClick={onAddPane}
++            disabled={grows === null}
+             title={
+-              layout.panes.length >= AE_SPLIT_MAX_PANES
++              grows === null
+                 ? `A split view holds at most ${AE_SPLIT_MAX_PANES} panes; close one first`
+-                : "Add a pane with a new session"
++                : `Add a pane with a new session (layout: ${presetById(grows)?.label})`
+             }
+             data-testid="ae-split-add"
+           >
+@@ -261,41 +504,63 @@ export function AeSplitPage() {
+           </Button>
+         </div>
+       </header>
+-      <div ref={rowRef} className="flex min-h-0 flex-1" data-testid="ae-split-row">
+-        {layout.panes.length === 0 && (
+-          <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
+-            <p>Every pane is closed.</p>
+-            <Button variant="outline" size="sm" onClick={addPane}>
+-              <PlusIcon className="size-3.5" />
+-              Add pane
+-            </Button>
+-          </div>
+-        )}
+-        {layout.panes.map((pane, i) => (
+-          <div key={keys[i]} className="contents">
+-            {i > 0 && (
+-              <div
+-                role="separator"
+-                aria-orientation="vertical"
+-                aria-label={`Resize panes ${i} and ${i + 1}`}
+-                aria-valuenow={Math.round((layout.sizes[i - 1] ?? 0) * 100)}
+-                aria-valuemin={0}
+-                aria-valuemax={100}
+-                tabIndex={0}
+-                className="w-1.5 shrink-0 cursor-col-resize bg-border/60 outline-none hover:bg-primary/40 focus-visible:bg-primary/60"
+-                onPointerDown={(e) => startDrag(i - 1, e)}
+-                onKeyDown={(e) => nudge(i - 1, e)}
+-                data-testid="ae-split-divider"
+-              />
+-            )}
++      <div
++        ref={areaRef}
++        className="relative min-h-0 flex-1"
++        data-testid="ae-split-row"
++        data-preset={layout.preset}
++      >
++        {order.map(({ key, slot: i }) => {
++          const pane = layout.panes[i] ?? null;
++          const rect = rects[i];
++          if (!rect) return null;
++          const label = sessionLabel(pane, frameTitles[key], byId);
++          const target = moving !== null && dropTarget === i && moving !== i;
++          return (
+             <section
+-              className="flex min-w-0 flex-col bg-background"
+-              style={{ flexBasis: 0, flexGrow: layout.sizes[i] ?? 1 }}
+-              aria-label={sessionLabel(pane, frameTitles[i], byId)}
++              key={key}
++              className={`flex min-w-0 flex-col overflow-hidden bg-background ${
++                target ? "ring-2 ring-primary ring-inset" : ""
++              }`}
++              style={rectStyle(rect, shape.length, shape[rect.column] ?? 1)}
++              aria-label={label}
+               data-testid="ae-split-pane"
++              data-slot={i}
+               data-session={pane ?? ""}
++              onDragOver={(e: ReactDragEvent<HTMLElement>) => {
++                if (moving === null) return;
++                e.preventDefault();
++                if (dropTarget !== i) setDropTarget(i);
++              }}
++              onDrop={(e: ReactDragEvent<HTMLElement>) => {
++                if (moving === null) return;
++                e.preventDefault();
++                swap(moving, i);
++                endMove();
++              }}
+             >
+               <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border px-2">
++                <button
++                  type="button"
++                  draggable
++                  aria-label={`Move pane ${i + 1}: drag onto another pane, or use the arrow keys`}
++                  title="Drag onto another pane to swap, or focus and use the arrow keys"
++                  className="flex h-6 w-4 shrink-0 cursor-grab items-center justify-center rounded text-muted-foreground outline-none hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring active:cursor-grabbing"
++                  onKeyDown={(e) => moveByKey(i, e)}
++                  onDragStart={(e) => {
++                    try {
++                      e.dataTransfer?.setData("text/plain", String(i));
++                      if (e.dataTransfer) e.dataTransfer.effectAllowed = "move";
++                    } catch {
++                      // Some engines refuse data on a synthetic drag; the index lives in state.
++                    }
++                    setMoving(i);
++                  }}
++                  onDragEnd={endMove}
++                  data-testid="ae-split-grip"
++                >
++                  <GripVerticalIcon className="size-3.5" />
++                </button>
+                 <select
+                   className="h-6 min-w-0 flex-1 rounded border border-border bg-background px-1 text-xs"
+                   aria-label={`Session in pane ${i + 1}`}
+@@ -329,7 +594,12 @@ export function AeSplitPage() {
+                   variant="ghost"
+                   size="icon-xs"
+                   aria-label="Close pane"
+-                  title="Close pane (the session keeps running)"
++                  title={
++                    layout.panes.length <= 1
++                      ? "The last pane stays; use Single view to leave the split view"
++                      : "Close pane (the session keeps running)"
++                  }
++                  disabled={layout.panes.length <= 1}
+                   onClick={() => closePane(i)}
+                   data-testid="ae-split-close"
+                 >
+@@ -342,20 +612,72 @@ export function AeSplitPage() {
+               {/* oxlint-disable-next-line react/iframe-missing-sandbox */}
+               <iframe
+                 ref={(el) => {
+-                  frameRefs.current[i] = el;
++                  if (el) frameRefs.current.set(key, el);
++                  else frameRefs.current.delete(key);
+                 }}
+-                name={`${AE_SPLIT_PANE_NAME_PREFIX}-${keys[i]}`}
+-                title={sessionLabel(pane, frameTitles[i], byId)}
++                name={`${AE_SPLIT_PANE_NAME_PREFIX}-${key}`}
++                title={label}
+                 src={paneSrc(pane)}
+                 allow="clipboard-read; clipboard-write; microphone"
+-                // While a divider is dragged the frames would swallow the
+-                // pointer; let the page keep it.
+-                className={`min-h-0 w-full flex-1 border-0 ${dragging ? "pointer-events-none" : ""}`}
++                // While a divider is dragged or a pane is moved the frames
++                // would swallow the pointer; let the page keep it.
++                className={`min-h-0 w-full flex-1 border-0 ${frozen ? "pointer-events-none" : ""}`}
+                 data-testid="ae-split-frame"
+               />
+             </section>
+-          </div>
++          );
++        })}
++        {colDividers.map(({ id, column: c, x }) => (
++          <div
++            key={id}
++            role="separator"
++            aria-orientation="vertical"
++            aria-label={`Resize columns ${c + 1} and ${c + 2}`}
++            aria-valuenow={Math.round((layout.cols[c] ?? 0) * 100)}
++            aria-valuemin={0}
++            aria-valuemax={100}
++            tabIndex={0}
++            className="absolute top-0 bottom-0 cursor-col-resize bg-border/60 outline-none hover:bg-primary/40 focus-visible:bg-primary/60"
++            style={{ left: at(x, -HALF_GAP), width: GAP_PX }}
++            onPointerDown={(e) => startDrag("x", (prev, d) => resizeColumn(prev, c, d), e)}
++            onKeyDown={(e) => nudge("x", (prev, d) => resizeColumn(prev, c, d), e)}
++            data-testid="ae-split-divider"
++            data-axis="x"
++          />
+         ))}
++        {rowDividers.map(({ id, rect }) => {
++          const c = rect.column;
++          const r = rect.row;
++          const left = c === 0 ? 0 : HALF_GAP;
++          const right = c === shape.length - 1 ? 0 : HALF_GAP;
++          return (
++            <div
++              key={id}
++              role="separator"
++              aria-orientation="horizontal"
++              aria-label={
++                shape.length > 1
++                  ? `Resize the stacked panes in column ${c + 1}`
++                  : "Resize the stacked panes"
++              }
++              aria-valuenow={Math.round((layout.rows[c]?.[r] ?? 0) * 100)}
++              aria-valuemin={0}
++              aria-valuemax={100}
++              tabIndex={0}
++              className="absolute cursor-row-resize bg-border/60 outline-none hover:bg-primary/40 focus-visible:bg-primary/60"
++              style={{
++                left: at(rect.x, left),
++                width: at(rect.w, -(left + right)),
++                top: at(rect.y + rect.h, -HALF_GAP),
++                height: GAP_PX,
++              }}
++              onPointerDown={(e) => startDrag("y", (prev, d) => resizeRow(prev, c, r, d), e)}
++              onKeyDown={(e) => nudge("y", (prev, d) => resizeRow(prev, c, r, d), e)}
++              data-testid="ae-split-divider"
++              data-axis="y"
++            />
++          );
++        })}
+       </div>
+     </div>
+   );
+diff --git a/web/src/shell/AeSplitMenuItem.tsx b/web/src/shell/AeSplitMenuItem.tsx
+index 20e0d879e48877caa0b2e02bbe039743986a90fb..fdb580c46aef6cbff5062a1c28c291db1dddfab3 100644
+--- a/web/src/shell/AeSplitMenuItem.tsx
++++ b/web/src/shell/AeSplitMenuItem.tsx
+@@ -1,6 +1,7 @@
+ // "Open in split view" on a sidebar session's action menu (omnigent-ae patch
+ // P5, 2026-09-24): adds the session to the remembered split layout (seeded
+-// with the session being viewed when there is none) and opens `/split`.
++// with the session being viewed when there is none) and opens `/split`. With
++// layout presets (P10), adding grows the remembered preset as "Add pane" does.
+ // Desktop only; the split route itself falls back to one session below
+ // 1024px, so the item is not offered there, nor inside a pane.
+ 
+@@ -51,7 +52,7 @@ export function AeSplitMenuItem({
+         );
+         writeStoredLayout(layout);
+         onDone();
+-        navigate(splitHref(layout.panes));
++        navigate(splitHref(layout.panes, layout.preset));
+       }}
+     >
+       <Columns2Icon className="size-3.5" />

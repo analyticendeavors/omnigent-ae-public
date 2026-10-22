@@ -1,0 +1,2299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:07:56 -0700
+Subject: [PATCH 128/148] [ae-patch] Predict the next prompt in every session,
+ on named Claude accounts and in Codex
+
+The side call that 0123 added now serves every session. A Claude session on a
+named account (its bridge dir's claude_account names one) calls on that
+account's token, resolved with claude_accounts.account_env exactly as the
+terminal launch resolves it and passed only as CLAUDE_CODE_OAUTH_TOKEN in the
+call's environment; an empty file keeps the default login and a name that
+cannot be resolved skips. The Codex forwarder notes each turn's userMessage and
+agentMessage and, on the live turn/completed that posts the idle edge, makes
+the same call on the host's active Claude account, with the same skips, cancel,
+clear and external_session_suggestion event. The shared parts moved to
+harnesses/ae_prompt_suggest_core.py.
+---
+ omnigent/harnesses/ae_prompt_suggest_core.py  | 517 +++++++++++++++++
+ .../claude_native/ae_prompt_suggest.py        | 549 ++++--------------
+ .../codex_native/ae_prompt_suggest.py         | 280 +++++++++
+ omnigent/harnesses/codex_native/forwarder.py  |  23 +-
+ .../forwarder/test_ae_prompt_suggest.py       | 189 +++++-
+ .../forwarder/test_ae_prompt_suggest.py       | 479 +++++++++++++++
+ 6 files changed, 1582 insertions(+), 455 deletions(-)
+ create mode 100644 omnigent/harnesses/ae_prompt_suggest_core.py
+ create mode 100644 omnigent/harnesses/codex_native/ae_prompt_suggest.py
+ create mode 100644 tests/harnesses/codex_native/forwarder/test_ae_prompt_suggest.py
+
+diff --git a/omnigent/harnesses/ae_prompt_suggest_core.py b/omnigent/harnesses/ae_prompt_suggest_core.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d42b3eaa0af2c7d4404d2f398eed56eaec80d71
+--- /dev/null
++++ b/omnigent/harnesses/ae_prompt_suggest_core.py
+@@ -0,0 +1,517 @@
++"""
++The prompt-suggestion side call every native harness shares.
++
++After a finished turn a harness forwarder hands this module the turn's last
++user prompt and last reply; it makes one small side call
++(``claude -p --model haiku``) and posts the one-line answer as a transient
++``external_session_suggestion`` event that the web composer shows as ghost
++text. The Claude forwarder (``claude_native/ae_prompt_suggest.py``) and the
++Codex forwarder (``codex_native/ae_prompt_suggest.py``) each own only how they
++see a turn end and read its text; the call, its isolation, its login, the trim
++to one line, cancel and the event post live here once.
++
++The side call is isolated from everything the session itself uses: no hooks
++(a ``Stop`` hook firing from it would start another call, for ever), no
++settings files, no MCP servers, no tools, no session transcript, no OmniGent
++environment, and a temporary cwd and Claude config dir of its own, so it never
++writes the user's ``~/.claude.json``. It runs as a background task so
++forwarding never waits on it, at most one per session; a newer turn, a typed
++prompt and the forwarder's own exit all cancel a call still in flight and kill
++its process group. It runs only on Claude's own login (no gateway, Bedrock or
++Vertex): the host's default login, or for a Claude session on a named account,
++that account's token, passed in the environment only. Off unless
++``AE_PROMPT_SUGGESTIONS=1``.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import logging
++import os
++import shutil
++import signal
++import tempfile
++import time
++from collections.abc import Iterator, Mapping
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Final
++
++import httpx
++
++from omnigent.util.ae_session_suggestion import (
++    EXTERNAL_SESSION_SUGGESTION_TYPE,
++    MAX_SUGGESTION_CHARS,
++)
++
++_logger = logging.getLogger(__name__)
++
++ENABLE_ENV_VAR: Final = "AE_PROMPT_SUGGESTIONS"
++CLAUDE_PATH_ENV_VAR: Final = "OMNIGENT_CLAUDE_PATH"
++SIDE_CALL_MODEL: Final = "haiku"
++SIDE_CALL_TIMEOUT_S: Final = 15.0
++# Characters of conversation the side call sees: the prompt's head, the reply's tail.
++MAX_CONTEXT_CHARS: Final = 2000
++MAX_PROMPT_CHARS: Final = 600
++# A turn end older than this (a forwarder catching up after a restart) is not
++# a turn the user is looking at now.
++MAX_TURN_AGE_S: Final = 120.0
++NONE_REPLY: Final = "NONE"
++# A copied login must stay valid this long, so the side call never refreshes
++# it (a refresh would rotate the token the user's own sessions hold).
++MIN_TOKEN_LIFETIME_S: Final = 600.0
++
++SYSTEM_PROMPT: Final = (
++    "You predict the next message a user will type to their coding assistant. "
++    "You get the user's last message and the assistant's reply. Answer with the "
++    "user's most likely next message, in the user's own voice and style, as one "
++    f"line of at most {MAX_SUGGESTION_CHARS} characters, with no quotes and no "
++    f"explanation. If no next message is clearly likely, answer {NONE_REPLY}."
++)
++
++# Environment the side call must not inherit: OmniGent's runner wiring and
++# tokens, and Claude Code's own session and suggestion switches.
++_DROPPED_ENV_PREFIXES: Final = ("OMNIGENT_", "RUNNER_", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
++_DROPPED_ENV_NAMES: Final = frozenset(
++    {"CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_SESSION_ID"}
++)
++_WORKDIR_PREFIX: Final = "omnigent-ae-prompt-suggest-"
++_OAUTH_TOKEN_ENV_VAR: Final = "CLAUDE_CODE_OAUTH_TOKEN"
++_CREDENTIALS_FILE: Final = ".credentials.json"
++# Any of these routes Claude somewhere other than Anthropic's API on the
++# user's own login (a gateway, Bedrock, Vertex, Foundry).
++# A raw ANTHROPIC_API_KEY bills the API instead of the login, so it skips too.
++_PROVIDER_ENV_KEYS: Final = (
++    "ANTHROPIC_API_KEY",
++    "ANTHROPIC_BASE_URL",
++    "ANTHROPIC_AUTH_TOKEN",
++    "ANTHROPIC_BEDROCK_BASE_URL",
++    "ANTHROPIC_VERTEX_BASE_URL",
++    "CLAUDE_CODE_USE_BEDROCK",
++    "CLAUDE_CODE_USE_VERTEX",
++    "CLAUDE_CODE_USE_FOUNDRY",
++)
++# A Claude session's own settings file in its bridge dir (claude_native/bridge.py).
++_BRIDGE_SETTINGS_FILE: Final = "claude-settings.json"
++
++
++@dataclass
++class SuggestionState:
++    """
++    Per-forwarder state for the prompt-suggestion side call.
++
++    :param task: The in-flight side call, or ``None`` when none runs.
++    :param is_child: Per session id, whether it is a sub-agent session (cached
++        after one lookup; sub-agent sessions get no suggestions).
++    :param shown: Session id whose composer may still show a posted
++        suggestion, so a typed prompt can clear it.
++    :param provider_ok: The cached :func:`uses_default_provider` verdict,
++        ``None`` until first checked.
++    :param account: The cached account name the call runs on (``None`` for the
++        host's active account, ``""`` for the default login).
++    :param account_key: What the cached account was read from (a Claude
++        session's ``claude_account`` file stamp), so a change re-reads it.
++    """
++
++    task: asyncio.Task[None] | None = None
++    is_child: dict[str, bool] = field(default_factory=dict)
++    shown: str | None = None
++    provider_ok: bool | None = None
++    account: str | None = None
++    account_key: object = None
++
++
++@dataclass(frozen=True)
++class TurnContext:
++    """
++    What the side call sees of the finished turn.
++
++    :param user_prompt: The user's last message, e.g. ``"fix the failing test"``,
++        or ``""`` when the forwarder did not see it.
++    :param assistant_text: The assistant's last reply text.
++    """
++
++    user_prompt: str
++    assistant_text: str
++
++
++def suggestions_enabled(env: Mapping[str, str] | None = None) -> bool:
++    """Whether ``AE_PROMPT_SUGGESTIONS`` switches the feature on (``1``, ``true`` or ``yes``)."""
++    value = (os.environ if env is None else env).get(ENABLE_ENV_VAR, "")
++    return value.strip().lower() in {"1", "true", "yes"}
++
++
++def build_side_call_prompt(context: TurnContext) -> str:
++    """
++    The side call's user message: the prompt's head and the reply's tail.
++
++    The whole message stays within :data:`MAX_CONTEXT_CHARS` of conversation.
++    """
++    prompt = context.user_prompt[:MAX_PROMPT_CHARS]
++    reply_budget = MAX_CONTEXT_CHARS - len(prompt)
++    reply = context.assistant_text[-reply_budget:]
++    return (
++        f"<user_message>\n{prompt}\n</user_message>\n\n"
++        f"<assistant_reply>\n{reply}\n</assistant_reply>\n\n"
++        "The user's next message:"
++    )
++
++
++def clean_suggestion(raw: str) -> str | None:
++    """
++    The suggestion to show, from the side call's raw output.
++
++    :param raw: Everything the side call printed.
++    :returns: The first non-empty line without wrapping quotes, cut at a word
++        boundary to :data:`MAX_SUGGESTION_CHARS`; ``None`` for ``NONE`` or
++        empty output.
++    """
++    line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
++    line = line.strip("\"'`“”‘’").strip()
++    if not line or line.rstrip(".").upper() == NONE_REPLY:
++        return None
++    if len(line) > MAX_SUGGESTION_CHARS:
++        cut = line[:MAX_SUGGESTION_CHARS]
++        space = cut.rfind(" ")
++        line = (cut[:space] if space > MAX_SUGGESTION_CHARS // 2 else cut).rstrip(" ,;:")
++    return line or None
++
++
++def side_call_argv(claude_bin: str) -> list[str]:
++    """
++    The side call's command line. Each flag checked against ``claude --help``
++    (Claude Code 2.1.305, 2026-10-20).
++
++    ``--safe-mode`` drops hooks, MCP servers, CLAUDE.md, skills, plugins and
++    auto-memory while keeping the OAuth login; ``--setting-sources ""`` loads
++    no user, project or local settings, and ``disableAllHooks`` stops any hook
++    a remaining source could add. ``--no-session-persistence`` writes no
++    transcript. The prompt arrives on stdin.
++    """
++    return [
++        claude_bin,
++        "-p",
++        "--model",
++        SIDE_CALL_MODEL,
++        "--safe-mode",
++        "--setting-sources",
++        "",
++        "--settings",
++        '{"disableAllHooks": true}',
++        "--strict-mcp-config",
++        "--tools",
++        "",
++        "--disable-slash-commands",
++        "--no-session-persistence",
++        "--output-format",
++        "text",
++        "--system-prompt",
++        SYSTEM_PROMPT,
++    ]
++
++
++def side_call_env(
++    base: Mapping[str, str] | None = None, *, config_dir: Path | None = None
++) -> dict[str, str]:
++    """
++    The side call's environment: this process's, minus OmniGent and Claude
++    session wiring, with ``CLAUDE_CONFIG_DIR`` pointed at ``config_dir``.
++
++    Claude Code rewrites ``.claude.json`` in its config dir on every run (a
++    measured run on 2026-10-20 changed ``~/.claude.json`` and left a backup);
++    a private dir keeps that write away from the user's live sessions.
++    """
++    source = os.environ if base is None else base
++    env = {
++        key: value
++        for key, value in source.items()
++        if not key.startswith(_DROPPED_ENV_PREFIXES) and key not in _DROPPED_ENV_NAMES
++    }
++    if config_dir is not None:
++        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
++    return env
++
++
++def _login_config_dir(env: Mapping[str, str]) -> Path:
++    """The user's Claude config dir: ``CLAUDE_CONFIG_DIR`` when set, else ``~/.claude``."""
++    configured = env.get("CLAUDE_CONFIG_DIR", "").strip()
++    return Path(configured) if configured else Path.home() / ".claude"
++
++
++def copy_login(config_dir: Path, env: Mapping[str, str] | None = None) -> bool:
++    """
++    Give the private config dir the login the side call needs, and only that.
++
++    With ``CLAUDE_CODE_OAUTH_TOKEN`` in the environment the token travels there
++    and nothing is copied. Otherwise only the ``claudeAiOauth`` entry of the
++    user's credentials file is copied, and only while its access token stays
++    valid for :data:`MIN_TOKEN_LIFETIME_S`, so the side call never refreshes it.
++
++    :param config_dir: The private config dir.
++    :param env: Environment to read (the process's own by default).
++    :returns: Whether the side call has a login to use.
++    """
++    source = os.environ if env is None else env
++    if source.get(_OAUTH_TOKEN_ENV_VAR, "").strip():
++        return True
++    try:
++        data = json.loads((_login_config_dir(source) / _CREDENTIALS_FILE).read_text("utf-8"))
++    except (OSError, ValueError):
++        return False
++    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
++    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
++        return False
++    expires_at = oauth.get("expiresAt")
++    if not isinstance(expires_at, (int, float)):
++        return False
++    if expires_at / 1000 - time.time() < MIN_TOKEN_LIFETIME_S:
++        return False
++    target = config_dir / _CREDENTIALS_FILE
++    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    with os.fdopen(fd, "w", encoding="utf-8") as handle:
++        json.dump({"claudeAiOauth": oauth}, handle)
++    return True
++
++
++def account_login_env(account: str | None) -> dict[str, str] | None:
++    """
++    The environment that puts the side call on a Claude account.
++
++    Resolved through :func:`omnigent.onboarding.claude_accounts.account_env_for_launch`,
++    the call the terminal launch makes (``claude_native/main.py``), so the side
++    call gets what a terminal launched now would get, provider-conflict check
++    included: a host account's token from this host's secrets, a shared
++    account's (``shared:<name>``) from the server. The token stays in the
++    returned mapping, which the caller hands to the side call's environment
++    only; it is never logged and never written to a file.
++
++    :param account: The account name, e.g. ``"AE Backup"``; ``""`` for the
++        CLI's own default login; ``None`` for the host's active account (what a
++        terminal launched without a choice gets).
++    :returns: ``{}`` for the default login, the account's environment
++        (``CLAUDE_CODE_OAUTH_TOKEN`` with ``ANTHROPIC_API_KEY`` and
++        ``ANTHROPIC_AUTH_TOKEN`` blanked) for a named one, or ``None`` when the
++        account cannot be resolved.
++    """
++    try:
++        from omnigent.onboarding.claude_accounts import account_env_for_launch
++
++        resolved = account_env_for_launch(dict(os.environ), account_name=account)
++    except Exception as exc:  # noqa: BLE001 - an unresolvable account skips the call
++        # The type only: an account error never carries the token, but say nothing more.
++        _logger.debug(
++            "prompt suggestion skipped: Claude account %r is unavailable (%s)",
++            account,
++            type(exc).__name__,
++        )
++        return None
++    if resolved and not resolved.get(_OAUTH_TOKEN_ENV_VAR, "").strip():
++        _logger.debug("prompt suggestion skipped: Claude account %r has no token", account)
++        return None
++    return resolved
++
++
++@contextlib.contextmanager
++def _side_call_dirs() -> Iterator[tuple[Path, Path]]:
++    """A fresh ``(cwd, config_dir)`` pair for one call, removed afterwards."""
++    root = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX))
++    try:
++        cwd, config_dir = root / "cwd", root / "config"
++        cwd.mkdir()
++        config_dir.mkdir(mode=0o700)
++        yield cwd, config_dir
++    finally:
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def _claude_binary() -> str | None:
++    """The Claude CLI: ``OMNIGENT_CLAUDE_PATH`` when set, else ``claude`` on PATH."""
++    configured = os.environ.get(CLAUDE_PATH_ENV_VAR, "").strip()
++    return configured or shutil.which("claude")
++
++
++def _kill_group(proc: asyncio.subprocess.Process) -> None:
++    """SIGKILL the side call's whole process group (it leads its own session)."""
++    with contextlib.suppress(ProcessLookupError, PermissionError):
++        os.killpg(proc.pid, signal.SIGKILL)
++
++
++async def run_side_call(
++    prompt: str,
++    *,
++    timeout_s: float = SIDE_CALL_TIMEOUT_S,
++    login_env: Mapping[str, str] | None = None,
++) -> str | None:
++    """
++    Run one isolated ``claude -p`` call and return its cleaned answer.
++
++    :param prompt: The side call's user message.
++    :param timeout_s: Seconds before the call is killed.
++    :param login_env: The account's login environment from
++        :func:`account_login_env`, layered over this process's; ``None`` or
++        ``{}`` keeps the default login.
++    :returns: The suggestion, or ``None`` on ``NONE``, a failure, a timeout or
++        no usable login.
++    :raises asyncio.CancelledError: When a newer turn cancels the call; the
++        process group is killed first.
++    """
++    claude_bin = _claude_binary()
++    if claude_bin is None:
++        _logger.debug("prompt suggestion skipped: no claude binary on PATH")
++        return None
++    base = {**os.environ, **(login_env or {})}
++    with _side_call_dirs() as (cwd, config_dir):
++        if not copy_login(config_dir, env=base):
++            _logger.debug("prompt suggestion skipped: no login valid for the next 10 minutes")
++            return None
++        proc = await asyncio.create_subprocess_exec(
++            *side_call_argv(claude_bin),
++            stdin=asyncio.subprocess.PIPE,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.DEVNULL,
++            cwd=cwd,
++            env=side_call_env(base, config_dir=config_dir),
++            start_new_session=True,
++        )
++        try:
++            stdout, _ = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout_s)
++        except BaseException as exc:
++            _kill_group(proc)
++            with contextlib.suppress(Exception):
++                await proc.wait()
++            if isinstance(exc, TimeoutError):
++                _logger.debug("prompt suggestion side call timed out after %.0fs", timeout_s)
++                return None
++            raise
++    if proc.returncode != 0:
++        _logger.debug("prompt suggestion side call exited %s", proc.returncode)
++        return None
++    return clean_suggestion(stdout.decode("utf-8", errors="replace"))
++
++
++def uses_default_provider(bridge_dir: Path | None, env: Mapping[str, str] | None = None) -> bool:
++    """
++    Whether the side call would run on Claude's own login against Anthropic's API.
++
++    False when this process's environment or a Claude session's settings file
++    names a gateway, Bedrock, Vertex or Foundry, or an ``apiKeyHelper``, or
++    when the host's claude-native launch config or managed settings resolve
++    one; then the side call would bill or reach somewhere else.
++
++    :param bridge_dir: A Claude session's bridge dir, when known (``None`` for
++        other harnesses, which have no Claude settings file).
++    :param env: Environment to read (the process's own by default).
++    :returns: ``True`` only when every check finds the default provider.
++    """
++    source = os.environ if env is None else env
++    if any(source.get(key, "").strip() for key in _PROVIDER_ENV_KEYS):
++        return False
++    if bridge_dir is not None:
++        try:
++            settings = json.loads((bridge_dir / _BRIDGE_SETTINGS_FILE).read_text("utf-8"))
++        except FileNotFoundError:
++            settings = {}
++        except (OSError, ValueError):
++            return False
++        if not isinstance(settings, dict) or settings.get("apiKeyHelper"):
++            return False
++        settings_env = settings.get("env")
++        if isinstance(settings_env, dict) and any(settings_env.get(k) for k in _PROVIDER_ENV_KEYS):
++            return False
++    try:
++        from omnigent.harnesses.claude_native.main import (
++            managed_claude_gateway_signal,
++            resolve_native_claude_config,
++        )
++
++        if resolve_native_claude_config(spec=None, refresh_models=False) is not None:
++            return False
++        managed_base_url, _ = managed_claude_gateway_signal()
++    except Exception:  # noqa: BLE001 - an unreadable config is not the default provider
++        return False
++    return managed_base_url is None
++
++
++async def is_child_session(
++    client: httpx.AsyncClient, session_id: str, state: SuggestionState
++) -> bool | None:
++    """Whether the session is a sub-agent session; ``None`` when the lookup failed."""
++    if session_id in state.is_child:
++        return state.is_child[session_id]
++    try:
++        resp = await client.get(
++            f"/v1/sessions/{session_id}",
++            params={"include_items": "false", "include_usage": "false"},
++        )
++        resp.raise_for_status()
++        is_child = resp.json().get("parent_session_id") is not None
++    except (httpx.HTTPError, ValueError, AttributeError):
++        return None
++    state.is_child[session_id] = is_child
++    return is_child
++
++
++async def post_suggestion(
++    client: httpx.AsyncClient, *, session_id: str, suggestion: str | None
++) -> None:
++    """
++    Post one transient ``external_session_suggestion`` event.
++
++    :param client: Omnigent HTTP client.
++    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
++    :param suggestion: The predicted prompt, or ``None`` to clear it.
++    :raises httpx.HTTPError: If the request fails or is rejected.
++    """
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": EXTERNAL_SESSION_SUGGESTION_TYPE, "data": {"suggestion": suggestion}},
++    )
++    resp.raise_for_status()
++
++
++async def suggest_and_post(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    context: TurnContext,
++    state: SuggestionState,
++    login_env: Mapping[str, str] | None = None,
++) -> None:
++    """
++    Run the side call for one turn and post its answer, if any.
++
++    The caller has applied its own skip rules. Raises only on cancel or a
++    failed post; each harness's task wrapper logs the latter.
++    """
++    suggestion = await run_side_call(build_side_call_prompt(context), login_env=login_env)
++    if suggestion is None or client.is_closed:
++        return
++    # Marked first, so a cancel while the POST is in flight still gets its clear.
++    state.shown = session_id
++    await post_suggestion(client, session_id=session_id, suggestion=suggestion)
++
++
++def cancel_prompt_suggestion(state: SuggestionState) -> None:
++    """Cancel the in-flight side call, if any (a newer turn, a rotation, the forwarder's exit)."""
++    task, state.task = state.task, None
++    if task is not None and not task.done():
++        task.cancel()
++
++
++async def clear_prompt_suggestion(client: httpx.AsyncClient, *, state: SuggestionState) -> None:
++    """
++    A prompt was typed: cancel any call in flight and clear a posted suggestion.
++
++    The web also clears on the turn's ``running`` edge; this covers a prompt
++    typed in the terminal before that edge lands. Best effort, never raises.
++    """
++    cancel_prompt_suggestion(state)
++    session_id, state.shown = state.shown, None
++    if session_id is None or client.is_closed:
++        return
++    try:
++        await post_suggestion(client, session_id=session_id, suggestion=None)
++    except httpx.HTTPError:
++        _logger.debug("prompt suggestion clear failed; session=%s", session_id, exc_info=True)
+diff --git a/omnigent/harnesses/claude_native/ae_prompt_suggest.py b/omnigent/harnesses/claude_native/ae_prompt_suggest.py
+index 404c40b7464ad2dff71d0d220d7f96a83742cb87..ece271c25fa7ae08789a5f3c657f3d0c0be8b274 100644
+--- a/omnigent/harnesses/claude_native/ae_prompt_suggest.py
++++ b/omnigent/harnesses/claude_native/ae_prompt_suggest.py
+@@ -4,139 +4,94 @@ Predict the user's next prompt after each finished Claude turn.
+ Claude Code has its own prompt suggestions, but only in print/SDK mode; the
+ interactive TUI that OmniGent runs in tmux never draws one on screen or
+ writes one to the transcript, so there is nothing to relay. Instead, when the
+-forwarder sees a turn's ``Stop`` hook, this module makes one small side call
+-(``claude -p --model haiku``) with the turn's last user prompt and last reply,
+-and posts the one-line answer as a transient ``external_session_suggestion``
+-event that the web composer shows as ghost text.
+-
+-The side call is isolated from everything the session itself uses: no hooks
+-(a ``Stop`` hook firing from it would start another call, for ever), no
+-settings files, no MCP servers, no tools, no session transcript, no OmniGent
+-environment, and a temporary cwd and Claude config dir of its own, so it never
+-writes the user's ``~/.claude.json``. It runs as a background task so
+-transcript forwarding never waits on it, at most one per session; a newer
+-turn, a prompt typed in the terminal and the forwarder's own exit all cancel a
+-call still in flight and kill its process group. It runs only for sessions on
+-Claude's own login (no gateway, Bedrock or Vertex). Off unless
++forwarder sees a turn's ``Stop`` hook, this module reads the turn's last user
++prompt and last reply and hands them to the shared side call
++(:mod:`omnigent.harnesses.ae_prompt_suggest_core`), which posts the one-line
++answer as a transient ``external_session_suggestion`` event.
++
++The call runs on the account the session's terminal runs on: the host's
++default login, or a named account's token, resolved as the launch resolves it
++and passed in the call's environment only. Sessions on a gateway, Bedrock or
++Vertex, sub-agent sessions and turns waiting on the user get none. Off unless
+ ``AE_PROMPT_SUGGESTIONS=1``.
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+-import contextlib
+ import json
+ import logging
+ import os
+-import shutil
+-import signal
+-import tempfile
+ import time
+-from collections.abc import Iterator, Mapping
+-from dataclasses import dataclass, field
++from collections.abc import Mapping
+ from pathlib import Path
+ from typing import Final
+ 
+ import httpx
+ 
+-from omnigent.harnesses.claude_native.transcript_filters import is_request_log_record
+-from omnigent.util.ae_session_suggestion import (
+-    EXTERNAL_SESSION_SUGGESTION_TYPE,
+-    MAX_SUGGESTION_CHARS,
++from omnigent.harnesses.ae_prompt_suggest_core import (
++    _WORKDIR_PREFIX,
++    CLAUDE_PATH_ENV_VAR,
++    ENABLE_ENV_VAR,
++    MAX_CONTEXT_CHARS,
++    MAX_PROMPT_CHARS,
++    MAX_TURN_AGE_S,
++    SuggestionState,
++    TurnContext,
++    account_login_env,
++    build_side_call_prompt,
++    cancel_prompt_suggestion,
++    clean_suggestion,
++    clear_prompt_suggestion,
++    copy_login,
++    is_child_session,
++    post_suggestion,
++    run_side_call,
++    side_call_argv,
++    side_call_env,
++    suggest_and_post,
++    suggestions_enabled,
++    uses_default_provider,
+ )
++from omnigent.harnesses.claude_native.transcript_filters import is_request_log_record
++from omnigent.util.ae_session_suggestion import MAX_SUGGESTION_CHARS
++
++__all__ = [
++    "CLAUDE_PATH_ENV_VAR",
++    "ENABLE_ENV_VAR",
++    "MAX_CONTEXT_CHARS",
++    "MAX_PROMPT_CHARS",
++    "MAX_SUGGESTION_CHARS",
++    "MAX_TURN_AGE_S",
++    "_WORKDIR_PREFIX",
++    "SuggestionState",
++    "TurnContext",
++    "build_side_call_prompt",
++    "cancel_prompt_suggestion",
++    "clean_suggestion",
++    "clear_prompt_suggestion",
++    "copy_login",
++    "post_suggestion",
++    "read_turn_context",
++    "run_side_call",
++    "schedule_prompt_suggestion",
++    "session_login_env",
++    "side_call_argv",
++    "side_call_env",
++    "suggestions_enabled",
++    "uses_default_provider",
++]
+ 
+ _logger = logging.getLogger(__name__)
+ 
+-ENABLE_ENV_VAR: Final = "AE_PROMPT_SUGGESTIONS"
+-CLAUDE_PATH_ENV_VAR: Final = "OMNIGENT_CLAUDE_PATH"
+-SIDE_CALL_MODEL: Final = "haiku"
+-SIDE_CALL_TIMEOUT_S: Final = 15.0
+-# Characters of conversation the side call sees: the prompt's head, the reply's tail.
+-MAX_CONTEXT_CHARS: Final = 2000
+-MAX_PROMPT_CHARS: Final = 600
+-# A Stop hook older than this (a forwarder catching up after a restart) is not
+-# a turn the user is looking at now.
+-MAX_TURN_AGE_S: Final = 120.0
+ # Only the transcript's tail is read; one turn's prompt and reply fit in it.
+ TAIL_BYTES: Final = 512 * 1024
+-NONE_REPLY: Final = "NONE"
+-# A copied login must stay valid this long, so the side call never refreshes
+-# it (a refresh would rotate the token the user's own sessions hold).
+-MIN_TOKEN_LIFETIME_S: Final = 600.0
+-
+-SYSTEM_PROMPT: Final = (
+-    "You predict the next message a user will type to their coding assistant. "
+-    "You get the user's last message and the assistant's reply. Answer with the "
+-    "user's most likely next message, in the user's own voice and style, as one "
+-    f"line of at most {MAX_SUGGESTION_CHARS} characters, with no quotes and no "
+-    f"explanation. If no next message is clearly likely, answer {NONE_REPLY}."
+-)
+-
+-# Environment the side call must not inherit: OmniGent's runner wiring and
+-# tokens, and Claude Code's own session and suggestion switches.
+-_DROPPED_ENV_PREFIXES: Final = ("OMNIGENT_", "RUNNER_", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
+-_DROPPED_ENV_NAMES: Final = frozenset(
+-    {"CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_SESSION_ID"}
+-)
+-_WORKDIR_PREFIX: Final = "omnigent-ae-prompt-suggest-"
+-_OAUTH_TOKEN_ENV_VAR: Final = "CLAUDE_CODE_OAUTH_TOKEN"
+-_CREDENTIALS_FILE: Final = ".credentials.json"
+-# Any of these routes Claude somewhere other than Anthropic's API on the
+-# user's own login (a gateway, Bedrock, Vertex, Foundry).
+-_PROVIDER_ENV_KEYS: Final = (
+-    "ANTHROPIC_BASE_URL",
+-    "ANTHROPIC_AUTH_TOKEN",
+-    "ANTHROPIC_BEDROCK_BASE_URL",
+-    "ANTHROPIC_VERTEX_BASE_URL",
+-    "CLAUDE_CODE_USE_BEDROCK",
+-    "CLAUDE_CODE_USE_VERTEX",
+-    "CLAUDE_CODE_USE_FOUNDRY",
+-)
+-# The session's own settings file in its bridge dir (bridge.py writes it).
+-_BRIDGE_SETTINGS_FILE: Final = "claude-settings.json"
+ # The account sidecar the session's statusLine shim writes from the terminal's
+ # own OMNIGENT_CLAUDE_ACCOUNT on every render: empty for the default login, the
+ # account name for a named one (status.CLAUDE_ACCOUNT_FILE).
+ _BRIDGE_ACCOUNT_FILE: Final = "claude_account"
+ 
+ 
+-@dataclass
+-class SuggestionState:
+-    """
+-    Per-forwarder state for the prompt-suggestion side call.
+-
+-    :param task: The in-flight side call, or ``None`` when none runs.
+-    :param is_child: Per session id, whether it is a sub-agent session (cached
+-        after one lookup; sub-agent sessions get no suggestions).
+-    :param shown: Session id whose composer may still show a posted
+-        suggestion, so a prompt typed in the terminal can clear it.
+-    """
+-
+-    task: asyncio.Task[None] | None = None
+-    is_child: dict[str, bool] = field(default_factory=dict)
+-    shown: str | None = None
+-
+-
+-@dataclass(frozen=True)
+-class TurnContext:
+-    """
+-    What the side call sees of the finished turn.
+-
+-    :param user_prompt: The user's last message, e.g. ``"fix the failing test"``,
+-        or ``""`` when the transcript does not hold it yet.
+-    :param assistant_text: The assistant's last reply text.
+-    """
+-
+-    user_prompt: str
+-    assistant_text: str
+-
+-
+-def suggestions_enabled(env: Mapping[str, str] | None = None) -> bool:
+-    """Whether ``AE_PROMPT_SUGGESTIONS`` switches the feature on (``1``, ``true`` or ``yes``)."""
+-    value = (os.environ if env is None else env).get(ENABLE_ENV_VAR, "")
+-    return value.strip().lower() in {"1", "true", "yes"}
+-
+-
+ def _user_prompt_text(content: object) -> str | None:
+     """The typed text of a user transcript entry, or ``None`` for tool results and markers."""
+     if isinstance(content, str):
+@@ -244,309 +199,68 @@ def read_turn_context(
+     return TurnContext(user_prompt=user_prompt, assistant_text=assistant_text)
+ 
+ 
+-def build_side_call_prompt(context: TurnContext) -> str:
++def session_account(bridge_dir: Path | None) -> str | None:
+     """
+-    The side call's user message: the prompt's head and the reply's tail.
+-
+-    The whole message stays within :data:`MAX_CONTEXT_CHARS` of conversation.
+-    """
+-    prompt = context.user_prompt[:MAX_PROMPT_CHARS]
+-    reply_budget = MAX_CONTEXT_CHARS - len(prompt)
+-    reply = context.assistant_text[-reply_budget:]
+-    return (
+-        f"<user_message>\n{prompt}\n</user_message>\n\n"
+-        f"<assistant_reply>\n{reply}\n</assistant_reply>\n\n"
+-        "The user's next message:"
+-    )
++    The Claude account the session's terminal runs on.
+ 
++    The terminal's statusLine shim records its own ``OMNIGENT_CLAUDE_ACCOUNT``
++    in the bridge dir's ``claude_account`` before every render, so the file
++    names the account the running terminal uses. The forwarder's environment
++    cannot say: the launch blanks the inherited name and sets the account in
++    the terminal's environment only.
+ 
+-def clean_suggestion(raw: str) -> str | None:
+-    """
+-    The suggestion to show, from the side call's raw output.
+-
+-    :param raw: Everything the side call printed.
+-    :returns: The first non-empty line without wrapping quotes, cut at a word
+-        boundary to :data:`MAX_SUGGESTION_CHARS`; ``None`` for ``NONE`` or
+-        empty output.
++    :param bridge_dir: The session's bridge dir, when known.
++    :returns: ``""`` for the default login, the account name (e.g.
++        ``"AE Backup"`` or ``"shared:Team"``), or ``None`` when the file is
++        missing (no render yet) or unreadable.
+     """
+-    line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
+-    line = line.strip("\"'`“”‘’").strip()
+-    if not line or line.rstrip(".").upper() == NONE_REPLY:
++    if bridge_dir is None:
+         return None
+-    if len(line) > MAX_SUGGESTION_CHARS:
+-        cut = line[:MAX_SUGGESTION_CHARS]
+-        space = cut.rfind(" ")
+-        line = (cut[:space] if space > MAX_SUGGESTION_CHARS // 2 else cut).rstrip(" ,;:")
+-    return line or None
+-
+-
+-def side_call_argv(claude_bin: str) -> list[str]:
+-    """
+-    The side call's command line. Each flag checked against ``claude --help``
+-    (Claude Code 2.1.305, 2026-10-20).
+-
+-    ``--safe-mode`` drops hooks, MCP servers, CLAUDE.md, skills, plugins and
+-    auto-memory while keeping the OAuth login; ``--setting-sources ""`` loads
+-    no user, project or local settings, and ``disableAllHooks`` stops any hook
+-    a remaining source could add. ``--no-session-persistence`` writes no
+-    transcript. The prompt arrives on stdin.
+-    """
+-    return [
+-        claude_bin,
+-        "-p",
+-        "--model",
+-        SIDE_CALL_MODEL,
+-        "--safe-mode",
+-        "--setting-sources",
+-        "",
+-        "--settings",
+-        '{"disableAllHooks": true}',
+-        "--strict-mcp-config",
+-        "--tools",
+-        "",
+-        "--disable-slash-commands",
+-        "--no-session-persistence",
+-        "--output-format",
+-        "text",
+-        "--system-prompt",
+-        SYSTEM_PROMPT,
+-    ]
+-
+-
+-def side_call_env(
+-    base: Mapping[str, str] | None = None, *, config_dir: Path | None = None
+-) -> dict[str, str]:
+-    """
+-    The side call's environment: this process's, minus OmniGent and Claude
+-    session wiring, with ``CLAUDE_CONFIG_DIR`` pointed at ``config_dir``.
+-
+-    Claude Code rewrites ``.claude.json`` in its config dir on every run (a
+-    measured run on 2026-10-20 changed ``~/.claude.json`` and left a backup);
+-    a private dir keeps that write away from the user's live sessions.
+-    """
+-    source = os.environ if base is None else base
+-    env = {
+-        key: value
+-        for key, value in source.items()
+-        if not key.startswith(_DROPPED_ENV_PREFIXES) and key not in _DROPPED_ENV_NAMES
+-    }
+-    if config_dir is not None:
+-        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
+-    return env
+-
+-
+-def _login_config_dir(env: Mapping[str, str]) -> Path:
+-    """The user's Claude config dir: ``CLAUDE_CONFIG_DIR`` when set, else ``~/.claude``."""
+-    configured = env.get("CLAUDE_CONFIG_DIR", "").strip()
+-    return Path(configured) if configured else Path.home() / ".claude"
+-
+-
+-def copy_login(config_dir: Path, env: Mapping[str, str] | None = None) -> bool:
+-    """
+-    Give the private config dir the login the side call needs, and only that.
+-
+-    With ``CLAUDE_CODE_OAUTH_TOKEN`` in the environment the token travels there
+-    and nothing is copied. Otherwise only the ``claudeAiOauth`` entry of the
+-    user's credentials file is copied, and only while its access token stays
+-    valid for :data:`MIN_TOKEN_LIFETIME_S`, so the side call never refreshes it.
+-
+-    :param config_dir: The private config dir.
+-    :param env: Environment to read (the process's own by default).
+-    :returns: Whether the side call has a login to use.
+-    """
+-    source = os.environ if env is None else env
+-    if source.get(_OAUTH_TOKEN_ENV_VAR, "").strip():
+-        return True
+     try:
+-        data = json.loads((_login_config_dir(source) / _CREDENTIALS_FILE).read_text("utf-8"))
+-    except (OSError, ValueError):
+-        return False
+-    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
+-    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
+-        return False
+-    expires_at = oauth.get("expiresAt")
+-    if not isinstance(expires_at, (int, float)):
+-        return False
+-    if expires_at / 1000 - time.time() < MIN_TOKEN_LIFETIME_S:
+-        return False
+-    target = config_dir / _CREDENTIALS_FILE
+-    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+-        json.dump({"claudeAiOauth": oauth}, handle)
+-    return True
+-
+-
+-@contextlib.contextmanager
+-def _side_call_dirs() -> Iterator[tuple[Path, Path]]:
+-    """A fresh ``(cwd, config_dir)`` pair for one call, removed afterwards."""
+-    root = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX))
+-    try:
+-        cwd, config_dir = root / "cwd", root / "config"
+-        cwd.mkdir()
+-        config_dir.mkdir(mode=0o700)
+-        yield cwd, config_dir
+-    finally:
+-        shutil.rmtree(root, ignore_errors=True)
+-
+-
+-def _claude_binary() -> str | None:
+-    """The Claude CLI: ``OMNIGENT_CLAUDE_PATH`` when set, else ``claude`` on PATH."""
+-    configured = os.environ.get(CLAUDE_PATH_ENV_VAR, "").strip()
+-    return configured or shutil.which("claude")
+-
+-
+-def _kill_group(proc: asyncio.subprocess.Process) -> None:
+-    """SIGKILL the side call's whole process group (it leads its own session)."""
+-    with contextlib.suppress(ProcessLookupError, PermissionError):
+-        os.killpg(proc.pid, signal.SIGKILL)
+-
+-
+-async def run_side_call(prompt: str, *, timeout_s: float = SIDE_CALL_TIMEOUT_S) -> str | None:
+-    """
+-    Run one isolated ``claude -p`` call and return its cleaned answer.
+-
+-    :param prompt: The side call's user message.
+-    :param timeout_s: Seconds before the call is killed.
+-    :returns: The suggestion, or ``None`` on ``NONE``, a failure, a timeout or
+-        no usable login.
+-    :raises asyncio.CancelledError: When a newer turn cancels the call; the
+-        process group is killed first.
+-    """
+-    claude_bin = _claude_binary()
+-    if claude_bin is None:
+-        _logger.debug("prompt suggestion skipped: no claude binary on PATH")
+-        return None
+-    with _side_call_dirs() as (cwd, config_dir):
+-        if not copy_login(config_dir):
+-            _logger.debug("prompt suggestion skipped: no login valid for the next 10 minutes")
+-            return None
+-        proc = await asyncio.create_subprocess_exec(
+-            *side_call_argv(claude_bin),
+-            stdin=asyncio.subprocess.PIPE,
+-            stdout=asyncio.subprocess.PIPE,
+-            stderr=asyncio.subprocess.DEVNULL,
+-            cwd=cwd,
+-            env=side_call_env(config_dir=config_dir),
+-            start_new_session=True,
+-        )
+-        try:
+-            stdout, _ = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout_s)
+-        except BaseException as exc:
+-            _kill_group(proc)
+-            with contextlib.suppress(Exception):
+-                await proc.wait()
+-            if isinstance(exc, TimeoutError):
+-                _logger.debug("prompt suggestion side call timed out after %.0fs", timeout_s)
+-                return None
+-            raise
+-    if proc.returncode != 0:
+-        _logger.debug("prompt suggestion side call exited %s", proc.returncode)
++        return (bridge_dir / _BRIDGE_ACCOUNT_FILE).read_text("utf-8").strip()
++    except OSError:
+         return None
+-    return clean_suggestion(stdout.decode("utf-8", errors="replace"))
+-
+-
+-def uses_default_provider(bridge_dir: Path | None, env: Mapping[str, str] | None = None) -> bool:
+-    """
+-    Whether the session runs on Claude's own login against Anthropic's API.
+-
+-    False when this process's environment or the session's settings file
+-    names a gateway, Bedrock, Vertex or Foundry, or an ``apiKeyHelper``, or
+-    when the host's claude-native launch config or managed settings resolve
+-    one; then the side call would bill or reach somewhere else.
+-
+-    :param bridge_dir: The session's bridge dir, when known.
+-    :param env: Environment to read (the process's own by default).
+-    :returns: ``True`` only when every check finds the default provider.
+-    """
+-    source = os.environ if env is None else env
+-    if any(source.get(key, "").strip() for key in _PROVIDER_ENV_KEYS):
+-        return False
+-    if bridge_dir is not None:
+-        try:
+-            settings = json.loads((bridge_dir / _BRIDGE_SETTINGS_FILE).read_text("utf-8"))
+-        except FileNotFoundError:
+-            settings = {}
+-        except (OSError, ValueError):
+-            return False
+-        if not isinstance(settings, dict) or settings.get("apiKeyHelper"):
+-            return False
+-        settings_env = settings.get("env")
+-        if isinstance(settings_env, dict) and any(settings_env.get(k) for k in _PROVIDER_ENV_KEYS):
+-            return False
+-    try:
+-        from omnigent.harnesses.claude_native.main import (
+-            managed_claude_gateway_signal,
+-            resolve_native_claude_config,
+-        )
+ 
+-        if resolve_native_claude_config(spec=None, refresh_models=False) is not None:
+-            return False
+-        managed_base_url, _ = managed_claude_gateway_signal()
+-    except Exception:  # noqa: BLE001 - an unreadable config is not the default provider
+-        return False
+-    return managed_base_url is None
+ 
+-
+-def uses_default_account(bridge_dir: Path | None) -> bool:
+-    """
+-    Whether the session's terminal runs on the host's default Claude login.
+-
+-    A named account reaches only the terminal (its token in the terminal's
+-    environment), so a side call from the forwarder would bill the default
+-    login instead; such sessions get no call, and no account token is ever
+-    copied into one. The terminal's statusLine shim records its own
+-    ``OMNIGENT_CLAUDE_ACCOUNT`` in the bridge dir's ``claude_account`` before
+-    every render, so the file names the account the running terminal uses.
+-    The forwarder's environment cannot say: the launch blanks the inherited
+-    name and sets the account in the terminal's environment only.
+-
+-    :param bridge_dir: The session's bridge dir, when known.
+-    :returns: ``True`` only when the file exists and is empty; a missing file
+-        (no render yet) or any name reads as not the default.
+-    """
++def _account_file_stamp(bridge_dir: Path | None) -> tuple[int, int, int] | None:
++    """The ``claude_account`` file's identity and change time, or ``None`` when missing."""
+     if bridge_dir is None:
+-        return False
++        return None
+     try:
+-        return not (bridge_dir / _BRIDGE_ACCOUNT_FILE).read_text("utf-8").strip()
++        st = (bridge_dir / _BRIDGE_ACCOUNT_FILE).stat()
+     except OSError:
+-        return False
+-
+-
+-async def _is_child_session(
+-    client: httpx.AsyncClient, session_id: str, state: SuggestionState
+-) -> bool | None:
+-    """Whether the session is a sub-agent session; ``None`` when the lookup failed."""
+-    if session_id in state.is_child:
+-        return state.is_child[session_id]
+-    try:
+-        resp = await client.get(
+-            f"/v1/sessions/{session_id}",
+-            params={"include_items": "false", "include_usage": "false"},
+-        )
+-        resp.raise_for_status()
+-        is_child = resp.json().get("parent_session_id") is not None
+-    except (httpx.HTTPError, ValueError, AttributeError):
+         return None
+-    state.is_child[session_id] = is_child
+-    return is_child
++    return (st.st_ino, st.st_mtime_ns, st.st_size)
+ 
+ 
+-async def post_suggestion(
+-    client: httpx.AsyncClient, *, session_id: str, suggestion: str | None
+-) -> None:
++def session_login_env(
++    bridge_dir: Path | None, state: SuggestionState | None = None
++) -> dict[str, str] | None:
+     """
+-    Post one transient ``external_session_suggestion`` event.
++    The side call's login environment for this session's account.
++
++    The account name and the provider verdict are read once per forwarder and
++    again only when the ``claude_account`` file changes (cached on ``state``);
++    the token itself is resolved on every call and never cached.
+ 
+-    :param client: Omnigent HTTP client.
+-    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+-    :param suggestion: The predicted prompt, or ``None`` to clear it.
+-    :raises httpx.HTTPError: If the request fails or is rejected.
++    :param bridge_dir: The session's bridge dir, when known.
++    :param state: Per-forwarder suggestion state holding the cache, if any.
++    :returns: ``{}`` for the default login, the named account's token
++        environment (:func:`account_login_env`), or ``None`` to skip: the
++        account is unknown yet or cannot be resolved on this host.
+     """
+-    resp = await client.post(
+-        f"/v1/sessions/{session_id}/events",
+-        json={"type": EXTERNAL_SESSION_SUGGESTION_TYPE, "data": {"suggestion": suggestion}},
+-    )
+-    resp.raise_for_status()
++    stamp = _account_file_stamp(bridge_dir)
++    if state is not None and stamp is not None and state.account_key == stamp:
++        account = state.account
++    else:
++        account = session_account(bridge_dir)
++        if state is not None:
++            state.account, state.account_key = account, stamp
++            state.provider_ok = None  # the account changed: check the provider again
++    if account is None:
++        _logger.debug("prompt suggestion skipped: the session's Claude account is not known yet")
++        return None
++    return account_login_env(account)
+ 
+ 
+ async def _suggest(
+@@ -560,26 +274,27 @@ async def _suggest(
+ ) -> None:
+     """The background task: skip rules, side call, post. Never raises but on cancel."""
+     try:
+-        if await _is_child_session(client, session_id, state) is not False:
+-            return
+-        if not await asyncio.to_thread(uses_default_account, bridge_dir):
+-            _logger.debug("prompt suggestion skipped: session runs on a named Claude account")
+-            return
+-        if not await asyncio.to_thread(uses_default_provider, bridge_dir):
+-            _logger.debug(
+-                "prompt suggestion skipped: session is not on the default Anthropic provider"
+-            )
++        if await is_child_session(client, session_id, state) is not False:
+             return
+         context = await asyncio.to_thread(
+             read_turn_context, transcript_path, last_assistant_message
+         )
+         if context is None:
+             return
+-        suggestion = await run_side_call(build_side_call_prompt(context))
+-        if suggestion is None or client.is_closed:
++        # A shared account's token comes from the server, so resolve off the loop.
++        login_env = await asyncio.to_thread(session_login_env, bridge_dir, state)
++        if login_env is None:
++            return
++        if state.provider_ok is None:
++            state.provider_ok = await asyncio.to_thread(uses_default_provider, bridge_dir)
++        if not state.provider_ok:
++            _logger.debug(
++                "prompt suggestion skipped: session is not on the default Anthropic provider"
++            )
+             return
+-        await post_suggestion(client, session_id=session_id, suggestion=suggestion)
+-        state.shown = session_id
++        await suggest_and_post(
++            client, session_id=session_id, context=context, state=state, login_env=login_env
++        )
+     except asyncio.CancelledError:
+         raise
+     except Exception:  # noqa: BLE001 - a suggestion is best effort and must not hurt forwarding
+@@ -591,30 +306,6 @@ async def _suggest(
+         )
+ 
+ 
+-def cancel_prompt_suggestion(state: SuggestionState) -> None:
+-    """Cancel the in-flight side call, if any (a newer turn, a rotation, the forwarder's exit)."""
+-    task, state.task = state.task, None
+-    if task is not None and not task.done():
+-        task.cancel()
+-
+-
+-async def clear_prompt_suggestion(client: httpx.AsyncClient, *, state: SuggestionState) -> None:
+-    """
+-    A prompt was typed: cancel any call in flight and clear a posted suggestion.
+-
+-    The web also clears on the turn's ``running`` edge; this covers a prompt
+-    typed in the terminal before that edge lands. Best effort, never raises.
+-    """
+-    cancel_prompt_suggestion(state)
+-    session_id, state.shown = state.shown, None
+-    if session_id is None or client.is_closed:
+-        return
+-    try:
+-        await post_suggestion(client, session_id=session_id, suggestion=None)
+-    except httpx.HTTPError:
+-        _logger.debug("prompt suggestion clear failed; session=%s", session_id, exc_info=True)
+-
+-
+ def schedule_prompt_suggestion(
+     client: httpx.AsyncClient,
+     *,
+@@ -639,7 +330,7 @@ def schedule_prompt_suggestion(
+     :param recorded_at: Unix time the hook was recorded, when known.
+     :param state: Per-forwarder suggestion state; mutated in place.
+     :param last_assistant_message: The ``Stop`` payload's reply text, when sent.
+-    :param bridge_dir: The session's bridge dir, for the provider check.
++    :param bridge_dir: The session's bridge dir, for the provider and account checks.
+     :param env: Environment to read the switch from (the process's own by default).
+     """
+     if not suggestions_enabled(env):
+diff --git a/omnigent/harnesses/codex_native/ae_prompt_suggest.py b/omnigent/harnesses/codex_native/ae_prompt_suggest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2cc5451781de92b9ca3a0d5301d2b9c2c564d9d3
+--- /dev/null
++++ b/omnigent/harnesses/codex_native/ae_prompt_suggest.py
+@@ -0,0 +1,280 @@
++"""
++Predict the user's next prompt after each finished Codex turn.
++
++The Codex half of the prompt suggestions the Claude forwarder already makes
++(``claude_native/ae_prompt_suggest.py``). The forwarder notes each turn's
++``userMessage`` and ``agentMessage`` text as their ``item/completed`` events
++pass (Codex sends every item of a turn before its ``turn/completed``, on the
++same ordered stream), and on the live ``turn/completed`` that posts the
++session's ``idle`` edge it hands the turn's last prompt and last reply to the
++shared side call (:mod:`omnigent.harnesses.ae_prompt_suggest_core`): Claude
++Haiku on the host's active Claude account (what a Claude terminal launched
++without a choice would get), whatever model the Codex session runs. The
++answer reaches the composer as the same ``external_session_suggestion`` event,
++so the web needs nothing new.
++
++Skipped: sub-agent threads and sessions, interrupted or failed turns, a turn
++whose reply asks the user questions, a Plan turn whose implementation prompt
++is about to ask the user, and hosts whose Claude runs on a gateway, Bedrock or
++Vertex. A new turn, a ``/clear`` rotation and the forwarder's exit cancel a
++call in flight (a new turn's ``running`` edge clears the composer). Off unless
++``AE_PROMPT_SUGGESTIONS=1``.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import time
++from collections.abc import Mapping
++from dataclasses import dataclass, field
++from typing import Final, Protocol
++
++import httpx
++
++from omnigent.harnesses.ae_prompt_suggest_core import (
++    MAX_CONTEXT_CHARS,
++    MAX_PROMPT_CHARS,
++    MAX_TURN_AGE_S,
++    SuggestionState,
++    TurnContext,
++    account_login_env,
++    cancel_prompt_suggestion,
++    clear_prompt_suggestion,
++    is_child_session,
++    suggest_and_post,
++    suggestions_enabled,
++    uses_default_provider,
++)
++
++__all__ = [
++    "CodexSuggestionState",
++    "cancel_prompt_suggestion",
++    "clear_prompt_suggestion",
++    "note_turn_item",
++    "reset_prompt_suggestion",
++    "schedule_codex_prompt_suggestion",
++]
++
++_logger = logging.getLogger(__name__)
++
++_TURN_COMPLETED: Final = "turn/completed"
++
++
++@dataclass
++class _TurnText:
++    """The latest typed prompt and reply seen for one turn."""
++
++    turn_id: str
++    user_prompt: str = ""
++    assistant_text: str = ""
++    asks_user: bool = False
++
++
++@dataclass
++class CodexSuggestionState(SuggestionState):
++    """
++    :class:`SuggestionState` plus the text of each session's current turn.
++
++    :param turns: Per Omnigent session id, the latest turn's text, e.g.
++        ``{"conv_a": _TurnText("turn_1", "fix it", "Fixed.")}``. One entry per
++        session; a newer turn replaces it.
++    """
++
++    turns: dict[str, _TurnText] = field(default_factory=dict)
++
++
++class _ForwarderState(Protocol):
++    """The parts of the Codex forwarder's state this module reads."""
++
++    ae_prompt_suggest: CodexSuggestionState
++    parent_session_id: str | None
++
++    def plan_prompt_context(self, turn_id: str) -> tuple[str, str] | None: ...
++
++
++def _turn_id(params: Mapping[str, object]) -> str | None:
++    """The turn id of an ``item/completed`` or ``turn/completed`` payload."""
++    turn = params.get("turn")
++    if isinstance(turn, Mapping) and isinstance(turn.get("id"), str) and turn["id"]:
++        return str(turn["id"])
++    turn_id = params.get("turnId")
++    return turn_id if isinstance(turn_id, str) and turn_id else None
++
++
++def _record(text: _TurnText, item: Mapping[str, object]) -> None:
++    """Fold one completed item into its turn's text."""
++    # The forwarder's own readers, so a prompt reads here as it is mirrored.
++    from omnigent.harnesses.codex_native.forwarder import (
++        _is_codex_skill_wrapper,
++        _user_message_text,
++    )
++
++    item_type = item.get("type")
++    if item_type == "userMessage":
++        prompt = _user_message_text(dict(item)).strip()
++        if prompt and not _is_codex_skill_wrapper(prompt):
++            text.user_prompt = prompt[:MAX_PROMPT_CHARS]
++    elif item_type == "agentMessage":
++        reply = item.get("text")
++        questions = item.get("questions")
++        text.asks_user = isinstance(questions, list) and bool(questions)
++        if isinstance(reply, str) and reply.strip():
++            # Only the tail reaches the side call, so only the tail is kept.
++            text.assistant_text = reply.strip()[-MAX_CONTEXT_CHARS:]
++
++
++def note_turn_item(
++    forwarder_state: _ForwarderState | None,
++    session_id: str,
++    params: Mapping[str, object],
++    item: Mapping[str, object],
++) -> None:
++    """
++    Remember a parent session's completed ``userMessage`` or ``agentMessage``.
++
++    Called by the forwarder for every completed item it sees (live, replayed
++    or recovered); a child session's items and anything else are ignored.
++
++    :param forwarder_state: The forwarder's state, ``None`` in callers
++        without one.
++    :param session_id: The Omnigent session the item routes to.
++    :param params: The ``item/completed`` params, carrying ``turnId``.
++    :param item: The Codex item.
++    """
++    if forwarder_state is None or item.get("type") not in {"userMessage", "agentMessage"}:
++        return
++    parent = forwarder_state.parent_session_id
++    if parent is not None and session_id != parent:
++        return  # a sub-agent thread's child session never gets a suggestion
++    state = forwarder_state.ae_prompt_suggest
++    turn_id = _turn_id(params)
++    if turn_id is None:
++        return
++    text = state.turns.get(session_id)
++    if text is None or text.turn_id != turn_id:
++        text = state.turns[session_id] = _TurnText(turn_id)
++    _record(text, item)
++
++
++def reset_prompt_suggestion(state: CodexSuggestionState) -> None:
++    """A ``/clear`` rotation: cancel the call in flight and forget the noted turns."""
++    cancel_prompt_suggestion(state)
++    state.turns.clear()
++
++
++def _turn_context(
++    state: CodexSuggestionState, session_id: str, turn_id: str, turn: Mapping[str, object]
++) -> TurnContext | None:
++    """
++    The finished turn's prompt and reply, or ``None`` when there is no reply
++    or the reply asks the user something.
++
++    The noted items come first; a ``turn.items`` list the notification carries
++    (Codex fills it per its ``itemsView``) fills in what was missed.
++    """
++    noted = state.turns.get(session_id)
++    text = noted if noted is not None and noted.turn_id == turn_id else _TurnText(turn_id)
++    if not text.assistant_text or not text.user_prompt:
++        items = turn.get("items")
++        if isinstance(items, list):
++            backfill = _TurnText(turn_id)
++            for item in items:
++                if isinstance(item, Mapping):
++                    _record(backfill, item)
++            text = _TurnText(
++                turn_id,
++                user_prompt=text.user_prompt or backfill.user_prompt,
++                assistant_text=text.assistant_text or backfill.assistant_text,
++                asks_user=text.asks_user if text.assistant_text else backfill.asks_user,
++            )
++    if not text.assistant_text or text.asks_user:
++        return None
++    return TurnContext(user_prompt=text.user_prompt, assistant_text=text.assistant_text)
++
++
++async def _suggest(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    context: TurnContext,
++    state: CodexSuggestionState,
++) -> None:
++    """The background task: skip rules, side call, post. Never raises but on cancel."""
++    try:
++        if await is_child_session(client, session_id, state) is not False:
++            return
++        if state.provider_ok is None:
++            state.provider_ok = await asyncio.to_thread(uses_default_provider, None)
++        if not state.provider_ok:
++            _logger.debug("prompt suggestion skipped: host Claude is not on the default provider")
++            return
++        # The host's active account, as a Claude terminal launched now would get it.
++        login_env = await asyncio.to_thread(account_login_env, None)
++        if login_env is None:
++            return
++        await suggest_and_post(
++            client, session_id=session_id, context=context, state=state, login_env=login_env
++        )
++    except asyncio.CancelledError:
++        raise
++    except Exception:  # noqa: BLE001 - a suggestion is best effort and must not hurt forwarding
++        _logger.debug(
++            "prompt suggestion failed; session=%s",
++            session_id,
++            exc_info=True,
++            extra={"session_id": session_id},
++        )
++
++
++def schedule_codex_prompt_suggestion(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    method: str,
++    params: Mapping[str, object],
++    status: str,
++    turn_id: str | None,
++    forwarder_state: _ForwarderState,
++    env: Mapping[str, str] | None = None,
++) -> None:
++    """
++    Start the side call for a Codex turn that just ended, in the background.
++
++    Called on the forwarder's hot path once a parent thread's terminal turn
++    event has posted its status edge, so it only checks the switch and the
++    turn and creates a task; any older call still running is cancelled first.
++
++    :param client: Omnigent HTTP client the forwarder posts with.
++    :param session_id: Omnigent session/conversation id.
++    :param method: Codex method, e.g. ``"turn/completed"``.
++    :param params: The terminal event's params.
++    :param status: The Omnigent status edge just posted, e.g. ``"idle"``.
++    :param turn_id: That edge's Codex turn id, e.g. ``"turn_123"``.
++    :param forwarder_state: The forwarder's state: its suggestion state
++        (mutated in place), and whether a Plan implementation prompt is about
++        to wait on the user.
++    :param env: Environment to read the switch from (the process's own by default).
++    """
++    if not suggestions_enabled(env):
++        return
++    state = forwarder_state.ae_prompt_suggest
++    cancel_prompt_suggestion(state)
++    turn = params.get("turn")
++    turn = turn if isinstance(turn, Mapping) else {}
++    if method != _TURN_COMPLETED or status != "idle" or turn_id is None:
++        return
++    if turn.get("status") not in (None, "completed"):
++        return  # interrupted: the user stopped it and is typing already
++    completed_at = turn.get("completedAt")
++    if isinstance(completed_at, (int, float)) and time.time() - completed_at > MAX_TURN_AGE_S:
++        return
++    if forwarder_state.plan_prompt_context(turn_id) is not None:
++        return
++    context = _turn_context(state, session_id, turn_id, turn)
++    if context is None:
++        return
++    state.task = asyncio.create_task(
++        _suggest(client, session_id=session_id, context=context, state=state),
++        name=f"ae-prompt-suggest-{session_id}",
++    )
+diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
+index 8b1ca9e1b8d4500582e7dcb17cb6aada1c2a0d84..7ffc6ada6b26725746065902b96db995420ace07 100644
+--- a/omnigent/harnesses/codex_native/forwarder.py
++++ b/omnigent/harnesses/codex_native/forwarder.py
+@@ -24,7 +24,7 @@ from omnigent.harnesses.codex_egress import (
+     certificate_failure_message,
+     is_connection_retry,
+ )
+-from omnigent.harnesses.codex_native import side_chat
++from omnigent.harnesses.codex_native import ae_prompt_suggest, side_chat
+ from omnigent.harnesses.codex_native.app_server import (
+     CodexAppServerClient,
+     CodexAppServerResponseError,
+@@ -498,6 +498,9 @@ class _CodexForwarderState:
+     # the block finalizes when the turn's assistant message arrives.
+     reasoning_stream_item_id: str | None = None
+     turn_diff_by_turn: dict[str, str] = field(default_factory=dict)
++    ae_prompt_suggest: ae_prompt_suggest.CodexSuggestionState = field(
++        default_factory=ae_prompt_suggest.CodexSuggestionState
++    )
+     # Whether model output has already settled the synthesized MCP startup
+     # round. The round is seeded once per forwarder connection (never on
+     # thread rotation), so a settled round stays settled and later items
+@@ -2179,6 +2182,9 @@ async def supervise_forwarder(
+                     )
+                     if rotated:
+                         forwarder_state.note_parent_rotation(target.session_id)
++                        ae_prompt_suggest.reset_prompt_suggestion(
++                            forwarder_state.ae_prompt_suggest
++                        )
+                         subscribe_task.cancel()
+                         with contextlib.suppress(asyncio.CancelledError):
+                             await subscribe_task
+@@ -2231,6 +2237,7 @@ async def supervise_forwarder(
+                 except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
+                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
+         finally:
++            ae_prompt_suggest.cancel_prompt_suggestion(forwarder_state.ae_prompt_suggest)
+             if mcp_settle_timer is not None:
+                 mcp_settle_timer.cancel()
+                 with contextlib.suppress(asyncio.CancelledError):
+@@ -3711,6 +3718,7 @@ async def _maybe_handle_turn_event(
+                 await delta_coalescer.flush()
+             await _handle_turn_started(client, session_id, bridge_dir, params)
+             if forwarder_state is not None:
++                ae_prompt_suggest.cancel_prompt_suggestion(forwarder_state.ae_prompt_suggest)
+                 # A new turn opens a fresh reasoning block: the next reasoning
+                 # delta must emit ``response.reasoning.started`` again.
+                 forwarder_state.reasoning_stream_item_id = None
+@@ -4003,6 +4011,16 @@ async def _handle_terminal_turn_boundary_inner(
+     handled = terminal.handled
+     if terminal.edge is not None:
+         await _post_turn_status_edge(client, session_id, terminal.edge)
++        if forwarder_state is not None:
++            ae_prompt_suggest.schedule_codex_prompt_suggestion(
++                client,
++                session_id=session_id,
++                method=method,
++                params=params,
++                status=terminal.edge.status,
++                turn_id=terminal.edge.turn_id,
++                forwarder_state=forwarder_state,
++            )
+     if handled:
+         await elicitation_tracker.resolve_by_terminal_turn_event(
+             client,
+@@ -5169,6 +5187,8 @@ async def _handle_completed_item_inner(
+     if not isinstance(item, dict):
+         return
+     item_type = item.get("type")
++    if forwarder_state is not None:
++        ae_prompt_suggest.note_turn_item(forwarder_state, session_id, params, item)
+     turn_id = _turn_id_from_payload(params)
+     if item_type in {"agentMessage", "plan"} and forwarder_state is not None and turn_id:
+         item_id = item.get("id")
+@@ -6142,6 +6162,7 @@ async def _ensure_user_message_posted(
+         "turnId": turn_id,
+         "item": user_item,
+     }
++    ae_prompt_suggest.note_turn_item(forwarder_state, session_id, recovered_params, user_item)
+     source_id = _claim_completed_item(recovered_params, user_item, forwarder_state)
+     if source_id is None:
+         return
+diff --git a/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py b/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+index f6b1a1bfabf078e901cca93e28975e38505826c9..0f6b2dca5a411b0197c115a58661ef169bd9c2f9 100644
+--- a/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
++++ b/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+@@ -13,14 +13,15 @@ from typing import Any
+ import httpx
+ import pytest
+ 
++import omnigent.harnesses.ae_prompt_suggest_core as core
+ import omnigent.harnesses.claude_native.ae_prompt_suggest as suggest
+ import omnigent.harnesses.claude_native.forwarder as forwarder
+ from omnigent.harnesses.claude_native.bridge import record_hook_event
+ from tests.harnesses.claude_native.forwarder._support import _start_recording_server
+ 
+ ON = {suggest.ENABLE_ENV_VAR: "1"}
+-# The on_path fixture stubs the account check; the account tests put this back.
+-_REAL_USES_DEFAULT_ACCOUNT = suggest.uses_default_account
++# The on_path fixture stubs the account lookup; the account tests put this back.
++_REAL_SESSION_LOGIN_ENV = suggest.session_login_env
+ 
+ 
+ def _user(text: str) -> dict[str, Any]:
+@@ -76,8 +77,10 @@ def _fake_claude(tmp_path: Path, body: str) -> Path:
+         "import json, os, sys, time\n"
+         "stdin = sys.stdin.read()\n"
+         f"with open({str(log)!r}, 'a') as f:\n"
++        "    cfg = os.environ.get('CLAUDE_CONFIG_DIR', '')\n"
++        "    files = sorted(os.listdir(cfg)) if cfg and os.path.isdir(cfg) else []\n"
+         "    f.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid(),\n"
+-        "        'env': dict(os.environ), 'stdin': stdin}) + '\\n')\n"
++        "        'env': dict(os.environ), 'stdin': stdin, 'config_files': files}) + '\\n')\n"
+         f"{body}\n",
+         encoding="utf-8",
+     )
+@@ -97,10 +100,10 @@ def on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+     monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
+     monkeypatch.delenv(suggest.CLAUDE_PATH_ENV_VAR, raising=False)
+     monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
+-    monkeypatch.setattr(suggest.tempfile, "tempdir", str(tmp_path / "tmp"))
++    monkeypatch.setattr(core.tempfile, "tempdir", str(tmp_path / "tmp"))
+     (tmp_path / "tmp").mkdir()
+     monkeypatch.setattr(suggest, "uses_default_provider", lambda bridge_dir, env=None: True)
+-    monkeypatch.setattr(suggest, "uses_default_account", lambda bridge_dir: True)
++    monkeypatch.setattr(suggest, "session_login_env", lambda bridge_dir, state=None: {})
+     return tmp_path
+ 
+ 
+@@ -404,6 +407,7 @@ def test_default_provider_runs(tmp_path: Path) -> None:
+     ("env", "settings"),
+     [
+         ({"ANTHROPIC_BASE_URL": "https://gateway.example"}, {}),
++        ({"ANTHROPIC_API_KEY": "sk-ant-api-raw"}, {}),
+         ({"CLAUDE_CODE_USE_BEDROCK": "1"}, {}),
+         ({"CLAUDE_CODE_USE_VERTEX": "1"}, {}),
+         ({}, {"apiKeyHelper": "print-token"}),
+@@ -707,6 +711,41 @@ async def test_a_typed_prompt_clears_a_shown_suggestion(on_path: Path, tmp_path:
+     ]
+ 
+ 
++@pytest.mark.asyncio
++async def test_a_cancel_mid_post_still_gets_its_clear(
++    on_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A new prompt landing while the suggestion's POST is in flight still clears it."""
++    _fake_claude(on_path, "print('Open a draft PR')")
++    posting = asyncio.Event()
++    real_post = core.post_suggestion
++
++    async def slow_post(client: httpx.AsyncClient, *, session_id: str, suggestion: Any) -> None:
++        if suggestion is not None:
++            posting.set()
++            await asyncio.sleep(60)
++        await real_post(client, session_id=session_id, suggestion=suggestion)
++
++    monkeypatch.setattr(core, "post_suggestion", slow_post)
++    server = _Server()
++    state = suggest.SuggestionState()
++    async with server.client() as client:
++        task = asyncio.create_task(
++            core.suggest_and_post(
++                client,
++                session_id="conv_a",
++                context=suggest.TurnContext("fix it", "Fixed."),
++                state=state,
++            )
++        )
++        state.task = task
++        await asyncio.wait_for(posting.wait(), 10)
++        await suggest.clear_prompt_suggestion(client, state=state)
++        with pytest.raises(asyncio.CancelledError):
++            await task
++    assert server.posts == [{"type": "external_session_suggestion", "data": {"suggestion": None}}]
++
++
+ @pytest.mark.asyncio
+ async def test_no_post_after_the_client_closed(on_path: Path, tmp_path: Path) -> None:
+     _fake_claude(on_path, "time.sleep(1); print('late')")
+@@ -782,28 +821,62 @@ async def test_the_forwarder_exit_cancels_the_side_call(
+ 
+ # ── Named Claude accounts ──────────────────────────────────────────
+ 
++_ACCOUNT_TOKEN = "sk-ant-oat-account-token-for-tests"
++
+ 
+-def test_default_account_runs_and_named_or_unknown_skips(tmp_path: Path) -> None:
++@pytest.fixture
++def host_accounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    """A host with one named account, "AE Backup", whose token sits in this host's secrets."""
++    from omnigent.onboarding import claude_accounts
++
++    store = tmp_path / "claude-accounts.json"
++    store.write_text(json.dumps({"accounts": ["AE Backup"], "active": ""}))
++    monkeypatch.setattr(claude_accounts, "_path", lambda: store)
++    monkeypatch.setattr(
++        claude_accounts.secrets,
++        "load_secret",
++        lambda name: _ACCOUNT_TOKEN if name == "claude-oauth-AE Backup" else None,
++    )
++    monkeypatch.setattr(suggest, "session_login_env", _REAL_SESSION_LOGIN_ENV)
++
++
++def test_session_account_reads_the_status_line_sidecar(tmp_path: Path) -> None:
+     """The statusLine shim writes "" for the default login and the name otherwise."""
+-    assert not suggest.uses_default_account(None)
+-    assert not suggest.uses_default_account(tmp_path)  # no render yet: unknown
++    assert suggest.session_account(None) is None
++    assert suggest.session_account(tmp_path) is None  # no render yet: unknown
+     (tmp_path / "claude_account").write_text("")
+-    assert suggest.uses_default_account(tmp_path)
+-    (tmp_path / "claude_account").write_text("AE Backup")
+-    assert not suggest.uses_default_account(tmp_path)
++    assert suggest.session_account(tmp_path) == ""
++    (tmp_path / "claude_account").write_text("AE Backup\n")
++    assert suggest.session_account(tmp_path) == "AE Backup"
+ 
+ 
+-@pytest.mark.asyncio
+-@pytest.mark.parametrize(("account", "calls"), [("", 1), ("AE Backup", 0)])
+-async def test_a_named_account_session_makes_no_call(
+-    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, account: str, calls: int
++def test_the_account_login_resolves_as_the_launch_does(
++    host_accounts: None, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+-    monkeypatch.setattr(suggest, "uses_default_account", _REAL_USES_DEFAULT_ACCOUNT)
+-    log = _fake_claude(on_path, "print('Open a draft PR')")
+-    bridge_dir = tmp_path / "bridge"
+-    bridge_dir.mkdir()
+-    (bridge_dir / "claude_account").write_text(account)
+-    server = _Server()
++    """Same environment the terminal launch gets from account_env_for_launch."""
++    from omnigent.onboarding.claude_accounts import account_env_for_launch
++
++    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++    assert core.account_login_env("") == {}
++    assert core.account_login_env(None) == {}  # the host's active account is the default
++    login = core.account_login_env("AE Backup")
++    assert login == account_env_for_launch({}, account_name="AE Backup")
++    assert login is not None and login["CLAUDE_CODE_OAUTH_TOKEN"] == _ACCOUNT_TOKEN
++    assert login["ANTHROPIC_API_KEY"] == "" and login["ANTHROPIC_AUTH_TOKEN"] == ""
++    assert core.account_login_env("Gone") is None  # not on this host
++    # The launch's provider-conflict check holds: a raw API key and a named account.
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-raw")
++    assert core.account_login_env("AE Backup") is None
++    # None follows the host's active account.
++    (tmp_path / "claude-accounts.json").write_text(
++        json.dumps({"accounts": ["AE Backup"], "active": "AE Backup"})
++    )
++    monkeypatch.delenv("ANTHROPIC_API_KEY")
++    active = core.account_login_env(None)
++    assert active is not None and active["CLAUDE_CODE_OAUTH_TOKEN"] == _ACCOUNT_TOKEN
++
++
++async def _schedule_in(server: _Server, tmp_path: Path, bridge_dir: Path) -> None:
+     state = suggest.SuggestionState()
+     async with server.client() as client:
+         suggest.schedule_prompt_suggestion(
+@@ -817,7 +890,73 @@ async def test_a_named_account_session_makes_no_call(
+         )
+         assert state.task is not None
+         await state.task
+-    assert len(_calls(log)) == calls
+-    assert len(server.posts) == calls
+-    for call in _calls(log):
+-        assert call["env"].get("CLAUDE_CODE_OAUTH_TOKEN") == "test-token"  # no account token
++
++
++@pytest.mark.asyncio
++async def test_a_named_account_session_calls_on_that_account_via_env_only(
++    on_path: Path,
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    host_accounts: None,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    # The host's default login is a fresh credentials file; it must not be copied.
++    home = tmp_path / "home"
++    _credentials(home, 3600)
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
++    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
++    log = _fake_claude(on_path, "print('Open a draft PR')")
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    (bridge_dir / "claude_account").write_text("AE Backup")
++    server = _Server()
++    caplog.set_level("DEBUG")
++    await _schedule_in(server, tmp_path, bridge_dir)
++    (call,) = _calls(log)
++    assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == _ACCOUNT_TOKEN
++    assert call["env"]["ANTHROPIC_API_KEY"] == ""  # blanked, as the launch does
++    assert call["config_files"] == []  # no login file copied into the private dir
++    assert "OMNIGENT_CLAUDE_ACCOUNT" not in call["env"]
++    assert server.posts == [
++        {"type": "external_session_suggestion", "data": {"suggestion": "Open a draft PR"}}
++    ]
++    assert _ACCOUNT_TOKEN not in caplog.text
++    assert _leftover_dirs(on_path) == []
++
++
++@pytest.mark.asyncio
++async def test_the_default_account_session_keeps_the_default_login(
++    on_path: Path, tmp_path: Path, host_accounts: None
++) -> None:
++    log = _fake_claude(on_path, "print('Open a draft PR')")
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    (bridge_dir / "claude_account").write_text("")
++    server = _Server()
++    await _schedule_in(server, tmp_path, bridge_dir)
++    (call,) = _calls(log)
++    assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "test-token"  # the host default
++    assert len(server.posts) == 1
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("account", ["Gone", None])
++async def test_an_unresolvable_or_unknown_account_skips(
++    on_path: Path,
++    tmp_path: Path,
++    host_accounts: None,
++    account: str | None,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    if account is not None:
++        (bridge_dir / "claude_account").write_text(account)
++    server = _Server()
++    caplog.set_level("DEBUG")
++    await _schedule_in(server, tmp_path, bridge_dir)
++    assert _calls(log) == []
++    assert server.posts == []
++    assert "prompt suggestion skipped" in caplog.text
+diff --git a/tests/harnesses/codex_native/forwarder/test_ae_prompt_suggest.py b/tests/harnesses/codex_native/forwarder/test_ae_prompt_suggest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..881e90f8058e01d442380fc7869a781198832bd2
+--- /dev/null
++++ b/tests/harnesses/codex_native/forwarder/test_ae_prompt_suggest.py
+@@ -0,0 +1,479 @@
++"""Tests for the next-prompt side call after a finished Codex turn."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import stat
++import time
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++
++import omnigent.harnesses.ae_prompt_suggest_core as core
++import omnigent.harnesses.codex_native.ae_prompt_suggest as codex_suggest
++from omnigent.harnesses.codex_native import forwarder as fwd
++from omnigent.harnesses.codex_native.bridge import CodexNativeBridgeState, write_bridge_state
++
++ON = {core.ENABLE_ENV_VAR: "1"}
++_SUGGESTION_POST = "external_session_suggestion"
++
++
++def _fake_claude(tmp_path: Path, body: str) -> Path:
++    """A ``claude`` on PATH that records its argv, env and stdin, then runs ``body``."""
++    bin_dir = tmp_path / "bin"
++    bin_dir.mkdir(exist_ok=True)
++    log = tmp_path / "calls.jsonl"
++    script = bin_dir / "claude"
++    script.write_text(
++        "#!/usr/bin/env python3\n"
++        "import json, os, sys, time\n"
++        "stdin = sys.stdin.read()\n"
++        f"with open({str(log)!r}, 'a') as f:\n"
++        "    f.write(json.dumps({'argv': sys.argv[1:], 'pid': os.getpid(),\n"
++        "        'env': dict(os.environ), 'stdin': stdin}) + '\\n')\n"
++        f"{body}\n",
++        encoding="utf-8",
++    )
++    script.chmod(script.stat().st_mode | stat.S_IEXEC)
++    return log
++
++
++def _calls(log: Path) -> list[dict[str, Any]]:
++    if not log.exists():
++        return []
++    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
++
++
++@pytest.fixture
++def on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """The fake ``claude`` first on PATH, a default login, the switch on, temp dirs here."""
++    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
++    monkeypatch.delenv(core.CLAUDE_PATH_ENV_VAR, raising=False)
++    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "host-default-token")
++    monkeypatch.setenv(core.ENABLE_ENV_VAR, "1")
++    monkeypatch.setattr(core.tempfile, "tempdir", str(tmp_path / "tmp"))
++    (tmp_path / "tmp").mkdir()
++    monkeypatch.setattr(codex_suggest, "uses_default_provider", lambda bridge_dir, env=None: True)
++    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
++    _host_accounts(tmp_path, monkeypatch, active="")
++    return tmp_path
++
++
++_ACCOUNT_TOKEN = "sk-ant-oat-active-account-token-for-tests"
++
++
++def _host_accounts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, active: str) -> None:
++    """This host's Claude accounts: one named "AE Backup", ``active`` selected."""
++    from omnigent.onboarding import claude_accounts
++
++    store = tmp_path / "claude-accounts.json"
++    store.write_text(json.dumps({"accounts": ["AE Backup"], "active": active}))
++    monkeypatch.setattr(claude_accounts, "_path", lambda: store)
++    monkeypatch.setattr(
++        claude_accounts.secrets,
++        "load_secret",
++        lambda name: _ACCOUNT_TOKEN if name == "claude-oauth-AE Backup" else None,
++    )
++
++
++class _Server:
++    """A MockTransport stand-in for the OmniGent server."""
++
++    def __init__(self, *, parent_session_id: str | None = None) -> None:
++        self.posts: list[dict[str, Any]] = []
++        self.parent_session_id = parent_session_id
++
++    def handler(self, request: httpx.Request) -> httpx.Response:
++        if request.method == "GET":
++            return httpx.Response(
++                200, json={"id": "conv_x", "parent_session_id": self.parent_session_id}
++            )
++        self.posts.append(json.loads(request.content.decode("utf-8")))
++        return httpx.Response(200, json={})
++
++    def client(self) -> httpx.AsyncClient:
++        return httpx.AsyncClient(transport=httpx.MockTransport(self.handler), base_url="http://ap")
++
++    def suggestions(self) -> list[str | None]:
++        return [p["data"]["suggestion"] for p in self.posts if p["type"] == _SUGGESTION_POST]
++
++
++def _seed_bridge(bridge_dir: Path) -> None:
++    write_bridge_state(
++        bridge_dir,
++        CodexNativeBridgeState(
++            session_id="conv_x",
++            socket_path=str(bridge_dir / "app-server.sock"),
++            thread_id="thread_1",
++            codex_home=str(bridge_dir / "codex-home"),
++        ),
++    )
++
++
++def _turn_events(
++    turn_id: str,
++    *,
++    prompt: str = "fix the failing test",
++    reply: dict[str, Any] | None = None,
++    status: str = "completed",
++    completed_at: float | None = None,
++) -> list[dict[str, Any]]:
++    """One whole Codex turn as the app-server streams it."""
++    agent = reply or {"type": "agentMessage", "id": f"{turn_id}-a", "text": "Fixed. 12 pass."}
++    return [
++        {"method": "turn/started", "params": {"threadId": "thread_1", "turn": {"id": turn_id}}},
++        {
++            "method": "item/completed",
++            "params": {
++                "threadId": "thread_1",
++                "turnId": turn_id,
++                "item": {
++                    "type": "userMessage",
++                    "id": f"{turn_id}-u",
++                    "content": [{"type": "text", "text": prompt}],
++                },
++            },
++        },
++        {
++            "method": "item/completed",
++            "params": {"threadId": "thread_1", "turnId": turn_id, "item": agent},
++        },
++        {
++            "method": "turn/completed",
++            "params": {
++                "threadId": "thread_1",
++                "turn": {
++                    "id": turn_id,
++                    "status": status,
++                    "items": [],
++                    "completedAt": int(completed_at if completed_at is not None else time.time()),
++                },
++            },
++        },
++    ]
++
++
++async def _feed(
++    client: httpx.AsyncClient,
++    bridge_dir: Path,
++    state: fwd._CodexForwarderState,
++    events: list[dict[str, Any]],
++) -> None:
++    usage = fwd._SessionUsageCoalescer(client, "conv_x")
++    tracker = fwd._CodexElicitationTaskTracker()
++    for event in events:
++        await fwd._handle_event(
++            client,
++            session_id="conv_x",
++            bridge_dir=bridge_dir,
++            event=event,
++            usage_coalescer=usage,
++            elicitation_tracker=tracker,
++            expected_thread_id="thread_1",
++            forwarder_state=state,
++        )
++
++
++async def _run_turn(
++    server: _Server, bridge_dir: Path, events: list[dict[str, Any]]
++) -> fwd._CodexForwarderState:
++    _seed_bridge(bridge_dir)
++    state = fwd._CodexForwarderState(parent_session_id="conv_x")
++    async with server.client() as client:
++        await _feed(client, bridge_dir, state, events)
++        task = state.ae_prompt_suggest.task
++        if task is not None:
++            await task
++    return state
++
++
++@pytest.mark.asyncio
++async def test_a_codex_turn_end_makes_one_call_and_posts_the_event(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    log = _fake_claude(on_path, "print('Open a draft PR')")
++    monkeypatch.setenv("OMNIGENT_TOKEN", "runner-secret")
++    server = _Server()
++    await _run_turn(server, tmp_path / "bridge", _turn_events("turn_1"))
++    (call,) = _calls(log)
++    assert call["argv"][:3] == ["-p", "--model", "haiku"]
++    assert "fix the failing test" in call["stdin"] and "Fixed. 12 pass." in call["stdin"]
++    assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "host-default-token"
++    assert "OMNIGENT_TOKEN" not in call["env"]
++    assert server.suggestions() == ["Open a draft PR"]
++    # The event lands after the turn's idle edge, as on the Claude side.
++    statuses = [p["data"].get("status") for p in server.posts]
++    assert statuses.index("idle") < len(statuses) - 1
++
++
++@pytest.mark.asyncio
++async def test_the_reply_comes_from_turn_items_when_the_live_item_was_missed(
++    on_path: Path, tmp_path: Path
++) -> None:
++    log = _fake_claude(on_path, "print('Ship it')")
++    events = _turn_events("turn_1")
++    del events[2]  # the live agentMessage never arrived
++    events[-1]["params"]["turn"]["items"] = [
++        {"type": "agentMessage", "id": "a", "text": "Done; all green."}
++    ]
++    server = _Server()
++    await _run_turn(server, tmp_path / "bridge", events)
++    (call,) = _calls(log)
++    assert "Done; all green." in call["stdin"]
++    assert server.suggestions() == ["Ship it"]
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "case",
++    ["sub-agent session", "interrupted", "asks the user", "stale", "no reply", "switched off"],
++)
++async def test_skip_rules_make_no_call(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, case: str
++) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    server = _Server(parent_session_id="conv_parent" if case == "sub-agent session" else None)
++    events = _turn_events(
++        "turn_1",
++        status="interrupted" if case == "interrupted" else "completed",
++        completed_at=time.time() - 3600 if case == "stale" else None,
++        reply=(
++            {"type": "agentMessage", "id": "a", "text": "Which?", "questions": [{"title": "A?"}]}
++            if case == "asks the user"
++            else {"type": "agentMessage", "id": "a", "text": ""}
++            if case == "no reply"
++            else None
++        ),
++    )
++    if case == "switched off":
++        monkeypatch.delenv(core.ENABLE_ENV_VAR)
++    await _run_turn(server, tmp_path / "bridge", events)
++    assert _calls(log) == []
++    assert server.suggestions() == []
++
++
++@pytest.mark.asyncio
++async def test_a_plan_turn_waiting_on_the_implement_prompt_makes_no_call(
++    on_path: Path, tmp_path: Path
++) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    state = fwd._CodexForwarderState(parent_session_id="conv_x")
++    state.completed_plan_text_by_turn["turn_1"] = "1. Do it"
++    state.plan_thread_by_turn["turn_1"] = "thread_1"
++    params = _turn_events("turn_1")[-1]["params"]
++    params["turn"]["items"] = [{"type": "agentMessage", "id": "a", "text": "Plan ready."}]
++    server = _Server()
++    async with server.client() as client:
++        codex_suggest.schedule_codex_prompt_suggestion(
++            client,
++            session_id="conv_x",
++            method="turn/completed",
++            params=params,
++            status="idle",
++            turn_id="turn_1",
++            forwarder_state=state,
++        )
++    assert state.ae_prompt_suggest.task is None
++    assert _calls(log) == []
++
++
++@pytest.mark.asyncio
++async def test_a_child_thread_turn_end_makes_no_call(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A Codex sub-agent thread's turn routes to its child session and is never suggested."""
++    monkeypatch.chdir(tmp_path)  # child turn events get bridge_dir=Path(), the cwd
++    log = _fake_claude(on_path, "print('x')")
++    bridge_dir = tmp_path / "bridge"
++    _seed_bridge(bridge_dir)
++    state = fwd._CodexForwarderState(parent_session_id="conv_x")
++    state.note_child_thread("thread_child", "conv_child")
++    events = [
++        {**e, "params": {**e["params"], "threadId": "thread_child"}}
++        for e in _turn_events("turn_c")
++    ]
++    server = _Server()
++    async with server.client() as client:
++        await _feed(client, bridge_dir, state, events)
++    assert state.ae_prompt_suggest.task is None
++    assert _calls(log) == []
++
++
++@pytest.mark.asyncio
++async def test_a_new_prompt_cancels_the_call_in_flight(on_path: Path, tmp_path: Path) -> None:
++    log = _fake_claude(on_path, "time.sleep(30)\nprint('late')")
++    bridge_dir = tmp_path / "bridge"
++    _seed_bridge(bridge_dir)
++    state = fwd._CodexForwarderState(parent_session_id="conv_x")
++    server = _Server()
++    async with server.client() as client:
++        await _feed(client, bridge_dir, state, _turn_events("turn_1"))
++        task = state.ae_prompt_suggest.task
++        assert task is not None
++        for _ in range(200):
++            if _calls(log):
++                break
++            await asyncio.sleep(0.02)
++        (call,) = _calls(log)
++        await _feed(client, bridge_dir, state, _turn_events("turn_2")[:1])  # turn/started
++        with pytest.raises(asyncio.CancelledError):
++            await task
++    assert server.suggestions() == []
++    for _ in range(100):
++        try:
++            os.kill(call["pid"], 0)
++        except ProcessLookupError:
++            break
++        await asyncio.sleep(0.02)
++    else:
++        pytest.fail("the side call outlived the new prompt")
++
++
++@pytest.mark.asyncio
++async def test_a_new_prompt_leaves_the_clear_to_the_running_edge(
++    on_path: Path, tmp_path: Path
++) -> None:
++    """The web drops a shown suggestion on the running edge; no extra null POST."""
++    _fake_claude(on_path, "print('Open a draft PR')")
++    bridge_dir = tmp_path / "bridge"
++    server = _Server()
++    state = await _run_turn(server, bridge_dir, _turn_events("turn_1"))
++    assert server.suggestions() == ["Open a draft PR"]
++    async with server.client() as client:
++        await _feed(client, bridge_dir, state, _turn_events("turn_2")[:1])
++    assert server.suggestions() == ["Open a draft PR"]
++    assert server.posts[-1]["data"]["status"] == "running"
++
++
++@pytest.mark.asyncio
++async def test_the_call_runs_on_the_hosts_active_account(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """What a Claude terminal launched without a choice gets, not always ~/.claude."""
++    _host_accounts(tmp_path, monkeypatch, active="AE Backup")
++    log = _fake_claude(on_path, "print('Open a draft PR')")
++    server = _Server()
++    await _run_turn(server, tmp_path / "bridge", _turn_events("turn_1"))
++    (call,) = _calls(log)
++    assert call["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == _ACCOUNT_TOKEN
++    assert server.suggestions() == ["Open a draft PR"]
++
++
++@pytest.mark.asyncio
++async def test_a_raw_api_key_on_the_host_skips(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(codex_suggest, "uses_default_provider", core.uses_default_provider)
++    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-api-raw")
++    log = _fake_claude(on_path, "print('x')")
++    server = _Server()
++    await _run_turn(server, tmp_path / "bridge", _turn_events("turn_1"))
++    assert _calls(log) == []
++    assert server.suggestions() == []
++
++
++def _state() -> fwd._CodexForwarderState:
++    return fwd._CodexForwarderState(parent_session_id="conv_x")
++
++
++def _user_item(text: str) -> dict[str, Any]:
++    return {"type": "userMessage", "content": [{"type": "text", "text": text}]}
++
++
++def test_a_skill_block_with_typed_text_keeps_the_text_and_a_bare_one_is_dropped() -> None:
++    state = _state()
++    params = {"turnId": "turn_1"}
++    codex_suggest.note_turn_item(state, "conv_x", params, _user_item("<skill>\nx\n</skill>"))
++    assert state.ae_prompt_suggest.turns["conv_x"].user_prompt == ""
++    typed = "<skill>\nx\n</skill>\n\nnow fix the test"
++    codex_suggest.note_turn_item(state, "conv_x", params, _user_item(typed))
++    assert state.ae_prompt_suggest.turns["conv_x"].user_prompt.endswith("now fix the test")
++
++
++def test_child_items_are_not_noted_and_a_rotation_forgets_the_turns() -> None:
++    state = _state()
++    params = {"turnId": "turn_1"}
++    codex_suggest.note_turn_item(state, "conv_child", params, _user_item("child prompt"))
++    assert state.ae_prompt_suggest.turns == {}
++    codex_suggest.note_turn_item(state, "conv_x", params, _user_item("parent prompt"))
++    assert list(state.ae_prompt_suggest.turns) == ["conv_x"]
++    codex_suggest.reset_prompt_suggestion(state.ae_prompt_suggest)
++    assert state.ae_prompt_suggest.turns == {}
++
++
++def test_only_the_replys_tail_is_kept() -> None:
++    state = _state()
++    reply = "head " + "x" * (core.MAX_CONTEXT_CHARS * 3) + " the end"
++    codex_suggest.note_turn_item(
++        state, "conv_x", {"turnId": "turn_1"}, {"type": "agentMessage", "text": reply}
++    )
++    kept = state.ae_prompt_suggest.turns["conv_x"].assistant_text
++    assert len(kept) == core.MAX_CONTEXT_CHARS and kept.endswith(" the end")
++
++
++class _FakeCodexClient:
++    """An app-server client that streams ``events`` and then stays open."""
++
++    def __init__(self, events: list[dict[str, Any]]) -> None:
++        self.events = events
++        self.closed = False
++
++    async def connect(self) -> None:
++        return None
++
++    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
++        return {"result": {"thread": {"id": "thread_1"}}}
++
++    async def iter_events(self) -> Any:
++        for event in self.events:
++            yield event
++        await asyncio.sleep(3600)
++
++    async def close(self) -> None:
++        self.closed = True
++
++
++@pytest.mark.asyncio
++async def test_the_forwarder_exit_cancels_the_side_call(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Cancelling the Codex forwarder (session teardown) leaves no call behind."""
++    started = asyncio.Event()
++    cancelled = asyncio.Event()
++
++    async def hanging_suggest(*args: Any, **kwargs: Any) -> None:
++        started.set()
++        try:
++            await asyncio.sleep(60)
++        except asyncio.CancelledError:
++            cancelled.set()
++            raise
++
++    monkeypatch.setattr(codex_suggest, "_suggest", hanging_suggest)
++    monkeypatch.setenv(core.ENABLE_ENV_VAR, "1")
++    bridge_dir = tmp_path / "bridge"
++    _seed_bridge(bridge_dir)
++    server = _Server()
++    task = asyncio.create_task(
++        fwd.supervise_forwarder(
++            base_url="http://ap",
++            headers={},
++            session_id="conv_x",
++            bridge_dir=bridge_dir,
++            app_server_url=str(bridge_dir / "app-server.sock"),
++            thread_id="thread_1",
++            client=_FakeCodexClient(_turn_events("turn_1")),  # type: ignore[arg-type]
++            ap_transport=httpx.MockTransport(server.handler),
++        )
++    )
++    try:
++        await asyncio.wait_for(started.wait(), 10)
++    finally:
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++    await asyncio.wait_for(cancelled.wait(), 2)

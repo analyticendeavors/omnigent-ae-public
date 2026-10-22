@@ -1,0 +1,93 @@
+# omnigent-ae: the deployment overlay on upstream's compose file (Phase 6,
+# 2026-09-23). Upstream's file is never edited; this one is layered on it:
+#
+#   AE_SERVER_SETTINGS=$PWD/config/server.env AE_SERVER_SECRETS=/secure/env/omnigent-ae.env \
+#   docker compose --env-file config/server.env --env-file /secure/env/omnigent-ae.env \
+#     -f upstream/deploy/docker/docker-compose.yaml -f deploy/docker-compose.override.yml up -d
+#
+# deploy/compose.sh is that command with the paths filled in; the systemd unit
+# and the backup script call it, and so should a person at the keyboard.
+#
+# What changes against upstream, and why:
+#
+# - image: the published AE build, the package the operator's own
+#   .github/workflows/image.yml pushes on an `ae-v*` tag (ghcr.io/<owner>/<repo>;
+#   the line below names AE's, ghcr.io/analyticendeavors/omnigent-ae) instead of upstream's
+#   server image, which lacks the AE layer and the UI patches. The tag is
+#   required, never `latest`: a deploy is pinned to what was tested.
+# - build: reset, so `docker compose up --build` on the box cannot rebuild
+#   upstream's unpatched image over the published one. `!reset` needs Compose
+#   2.24 or newer, the same requirement upstream's own https overlay carries.
+# - env_file: config/server.env (settings, copied from config/server.env.example,
+#   gitignored) and /secure/env/omnigent-ae.env (secrets, written by
+#   deploy/pull-secrets.sh, 640 root:reid on the TPM-unlocked volume). Compose
+#   interpolates the same two files for POSTGRES_PASSWORD, OMNIGENT_IMAGE_TAG and
+#   OMNIGENT_PORT, which is why compose.sh passes them as --env-file too.
+# - ports: loopback only, host port OMNIGENT_PORT (8010: the handoff said 8000,
+#   but Analytic Endeavors' box runs the business Graphiti MCP on :8000 and the personal
+#   one on :8001). The container keeps 8000. `!override` replaces upstream's
+#   list instead of appending a second, all-interfaces publish to it.
+#   `tailscale serve --bg --https 8010 http://localhost:8010` exposes it to the
+#   tailnet with the ts.net certificate (deploy/README.md, step 7).
+# - extra_hosts: host.docker.internal resolves to the box, so the optional
+#   classifier model in config/server.yaml can reach Ollama on :11434.
+# - volumes: bind mounts under /secure instead of upstream's named volumes, for
+#   two reasons. /secure is the encrypted volume (home-server/secure-volume in
+#   agents-and-automation), so the artifacts, the persisted cookie secret and
+#   the database are covered at rest; and the nightly restic run backs up paths,
+#   not Docker volumes, so a bind mount is what it can see. /data holds
+#   config.yaml, agents/, artifacts and the accounts state; the Postgres data
+#   directory is a live database, so restic should NOT read it directly (a
+#   file-level copy of a running Postgres is not restorable): ae-omnigent-dump
+#   writes a consistent pg_dump into /secure/omnigent/backups every night, and
+#   that directory plus /secure/omnigent/data are what belong in backup.sh.
+#
+# - networks: the server also joins one internal network per containerised
+#   user host (omnigent-host-<user>, 2026-10-20), so that host reaches it as
+#   http://omnigent:8000 and reaches nothing else of the stack (deploy/README.md,
+#   "Second user's host (container)").
+#
+# Postgres itself stays upstream's service (postgres:16-alpine, credentials
+# from POSTGRES_PASSWORD, health-checked before the server starts). The
+# official image starts as root, takes ownership of the data directory and
+# drops to the postgres user, so the bind mount needs no manual chown.
+
+services:
+  postgres:
+    volumes:
+      - /secure/omnigent/postgres:/var/lib/postgresql/data
+
+  omnigent:
+    image: ghcr.io/analyticendeavors/omnigent-ae:${OMNIGENT_IMAGE_TAG:?set OMNIGENT_IMAGE_TAG in config/server.env}
+    build: !reset null
+    env_file:
+      - ${AE_SERVER_SETTINGS:?run through deploy/compose.sh, which sets AE_SERVER_SETTINGS}
+      - ${AE_SERVER_SECRETS:?run through deploy/compose.sh, which sets AE_SERVER_SECRETS}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports: !override
+      - "127.0.0.1:${OMNIGENT_PORT:-8010}:8000"
+    volumes:
+      - /secure/omnigent/data:/data
+    # default keeps Postgres and the outbound route; each host-<user> network
+    # is shared with that user's host container only (deploy/host-container/).
+    networks:
+      default: {}
+      host-steve: {}
+
+# One internal network per containerised user host (2026-10-20, deploy/README.md
+# "Second user's host (container)"). Owned here, not by the host's project, so
+# the server never fails to start for want of a network some other project
+# should have made; internal, so it carries no route off the box, and Postgres
+# is not on it, and the bridge has no address on the box (below). A new user is one network here, one line under the server's
+# networks above, and deploy/host-container.sh <user> up -d.
+networks:
+  host-steve:
+    name: omnigent-host-steve
+    internal: true
+    # No address on the box's side of the bridge. Docker gives an internal
+    # network a gateway address on the box anyway, and a container can open
+    # any port the box serves on a wildcard address (ssh :22 answered, checked
+    # 2026-10-20); with no bridge address there is nothing to connect to.
+    driver_opts:
+      com.docker.network.bridge.inhibit_ipv4: "true"

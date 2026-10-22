@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:38:48 -0700
+Subject: [PATCH 056/148] [ae-patch] Parse browser sign-in results as terminal
+ screens.
+
+---
+ omnigent/onboarding/claude_browser_login.py   | 34 ++++++++++++++++---
+ tests/onboarding/test_claude_browser_login.py | 34 +++++++++++++++++--
+ 2 files changed, 61 insertions(+), 7 deletions(-)
+
+diff --git a/omnigent/onboarding/claude_browser_login.py b/omnigent/onboarding/claude_browser_login.py
+index 6677830a38376216121e84dbdcf74c691a46fd62..54d6222cb409731013b7359755f38abe8938c180 100644
+--- a/omnigent/onboarding/claude_browser_login.py
++++ b/omnigent/onboarding/claude_browser_login.py
+@@ -75,6 +75,11 @@ def _run(job: Login) -> None:
+     ended = False
+     try:
+         import pexpect
++        import pyte
++
++        screen = pyte.Screen(4096, 40)
++        stream = pyte.Stream(screen)
++        clean = ""
+ 
+         binary = shutil.which("claude")
+         if binary is None:
+@@ -117,7 +122,9 @@ def _run(job: Login) -> None:
+                     _logger.info("Browser login %s: code submitted", job.id)
+                 ended = False
+                 try:
+-                    output = (output + process.read_nonblocking(8192, timeout=0.25))[-131072:]
++                    chunk = process.read_nonblocking(8192, timeout=0.25)
++                    output = (output + chunk)[-131072:]
++                    stream.feed(chunk)
+                 except pexpect.TIMEOUT:
+                     continue
+                 except pexpect.EOF:
+@@ -126,16 +133,25 @@ def _run(job: Login) -> None:
+                 with _LOCK:
+                     if url and not job.url:
+                         job.url, job.status = url, "waiting"
+-                clean = _ANSI.sub("", output)
++                clean = "\n".join(screen.display)
+                 token = _TOKEN.search(clean)
+-                if "OAuth error:" in clean:
++                if "Your account is on hold" in clean:
++                    job.status = "failed"
++                    job.error = (
++                        "Claude reports this account is on hold. "
++                        "Review the account at https://claude.ai/restricted. Account not saved."
++                    )
++                    return
++                if "OAuth error:" in clean or "Invalid code." in clean:
+                     job.status = "failed"
+                     job.error = (
+                         "Claude rejected the authorization code. "
+                         "Start sign-in again and use the new code."
+                     )
+                     return
+-                if token:
++                # A screen pads incomplete chunks with spaces. Wait for the footer
++                # or EOF before treating a displayed token as complete.
++                if token and (ended or "Store this token securely" in clean):
+                     with _LOCK:
+                         if job.cancel.is_set():
+                             break
+@@ -150,7 +166,15 @@ def _run(job: Login) -> None:
+                     break
+             with _LOCK:
+                 job.status = "cancelled" if job.cancel.is_set() else "failed"
+-                success, token_seen, provider_error = _result_markers(output)
++                success, token_seen, provider_error = _result_markers(clean)
++                if ended:
++                    process.close()
++                    _logger.info(
++                        "Browser login %s: exit_code=%s signal=%s",
++                        job.id,
++                        process.exitstatus,
++                        process.signalstatus,
++                    )
+                 if job.cancel.is_set():
+                     job.error = ""
+                 elif success or token_seen:
+diff --git a/tests/onboarding/test_claude_browser_login.py b/tests/onboarding/test_claude_browser_login.py
+index f0b0484a3fa1c9493ddf6e2625af149631bbc908..20f27af17e9756f5674099aab152e575884a038c 100644
+--- a/tests/onboarding/test_claude_browser_login.py
++++ b/tests/onboarding/test_claude_browser_login.py
+@@ -57,7 +57,7 @@ def test_cli_token_saved_but_never_returned(monkeypatch):
+     process = Mock()
+     process.read_nonblocking.side_effect = [
+         "\x1b]8;;https://claude.com/oauth/authorize?state=abc\x07",
+-        f"\n{token}\r\n",
++        f"\n{token}\r\nStore this token securely\r\n",
+     ]
+     spawn = Mock(return_value=process)
+     monkeypatch.setattr(pexpect, "spawn", spawn)
+@@ -102,6 +102,37 @@ def test_login_frame_roundtrip():
+     assert decode_host_frame(encode_host_frame(frame)) == frame
+ 
+ 
++def test_cursor_redraw_and_split_token_are_saved_completely(monkeypatch):
++    import pexpect
++
++    token = "sk-ant-oat01-" + "x" * 70
++    process = Mock()
++    process.read_nonblocking.side_effect = [
++        "\x1b[1;1Hsk-ant-oat01-" + "x" * 35,
++        "x" * 35 + "\r\nStore\x1b[7Gthis\x1b[12Gtoken\x1b[18Gsecurely",
++    ]
++    monkeypatch.setattr(pexpect, "spawn", Mock(return_value=process))
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    job = login.Login("Backup")
++    login._run(job)
++    assert job.status == "complete"
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == token
++    assert process.read_nonblocking.call_count == 2
++
++
++def test_provider_hold_with_cursor_positioned_spaces(monkeypatch):
++    import pexpect
++
++    process = Mock()
++    process.read_nonblocking.return_value = "Your\x1b[6Gaccount\x1b[14Gis\x1b[17Gon\x1b[20Ghold"
++    monkeypatch.setattr(pexpect, "spawn", Mock(return_value=process))
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    job = login.Login("Backup")
++    login._run(job)
++    assert job.status == "failed"
++    assert "account is on hold" in job.error
++
++
+ def test_code_submitted_with_enter(monkeypatch):
+     import pexpect
+ 
+@@ -135,7 +166,6 @@ def test_cli_oauth_error_is_reported_without_secrets(monkeypatch):
+         ("", "process exited"),
+         ("authentication token created successfully!", "could not read the returned token"),
+         ("sk-ant-oat", "could not read the returned token"),
+-        ("Invalid code. secret-value", "authorization error"),
+     ],
+ )
+ def test_incomplete_result_identifies_stage_without_logging_secrets(

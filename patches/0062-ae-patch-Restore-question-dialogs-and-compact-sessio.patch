@@ -1,0 +1,1513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:52:58 -0700
+Subject: [PATCH 062/148] [ae-patch] Restore question dialogs and compact
+ session controls with harness handoff
+
+---
+ omnigent/entities/conversation.py             |   1 +
+ omnigent/harnesses/codex_native/forwarder.py  |  41 +++-
+ openapi.json                                  |  15 ++
+ .../codex_native/forwarder/test_delivery.py   |  34 +++
+ web/src/components/AeFastMode.test.tsx        |   7 +-
+ web/src/components/AeFastMode.tsx             |   5 +-
+ .../chat/CodexQuestionCard.test.tsx           |  92 ++++++++
+ web/src/components/chat/CodexQuestionCard.tsx | 171 ++++++++++++++
+ .../chat/Transcript.activeTurn.test.ts        |  28 ++-
+ web/src/components/chat/Transcript.tsx        |  35 +++
+ web/src/components/composer/HarnessPicker.tsx |   7 +-
+ web/src/lib/blockStream.test.ts               |  31 +++
+ web/src/lib/blockStream.ts                    |  19 +-
+ web/src/lib/blocks.ts                         |  22 ++
+ web/src/lib/conversationItems.ts              |   3 +-
+ web/src/lib/events.ts                         |   2 +
+ web/src/lib/itemsToBlocks.test.ts             |   7 +
+ web/src/lib/itemsToBlocks.ts                  |   4 +
+ web/src/lib/sse.test.ts                       |  15 ++
+ web/src/lib/sse.ts                            |   4 +
+ web/src/pages/ChatPage.composer.test.tsx      | 156 ++++++++++++-
+ web/src/pages/ChatPage.tsx                    | 209 ++++++++++++++++--
+ web/src/store/chatStore.test.ts               |   4 +-
+ web/src/store/chatStore.ts                    |   1 +
+ 24 files changed, 857 insertions(+), 56 deletions(-)
+ create mode 100644 web/src/components/chat/CodexQuestionCard.test.tsx
+ create mode 100644 web/src/components/chat/CodexQuestionCard.tsx
+
+diff --git a/omnigent/entities/conversation.py b/omnigent/entities/conversation.py
+index 2291c480f0f88d6e128e39b888f9de2d5461c4bf..e203252cac87dc44fb1d0a195c0bf7031ad33631 100644
+--- a/omnigent/entities/conversation.py
++++ b/omnigent/entities/conversation.py
+@@ -316,6 +316,7 @@ class MessageData(BaseModel):
+     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
+     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
+     stream_message_id: str | None = None
++    codex_questions: list[dict[str, Any]] | None = None
+ 
+     @field_validator("content")
+     @classmethod
+diff --git a/omnigent/harnesses/codex_native/forwarder.py b/omnigent/harnesses/codex_native/forwarder.py
+index 9bb0e09d29f17baba1371b20a4af88bac07685f1..e13966450cebf5f5c2142b1e2bd31df9c9bf2e0c 100644
+--- a/omnigent/harnesses/codex_native/forwarder.py
++++ b/omnigent/harnesses/codex_native/forwarder.py
+@@ -6256,17 +6256,46 @@ async def _post_agent_message(
+     :returns: Whether the item was accepted by the server.
+     """
+     text = item.get("text")
+-    if not isinstance(text, str) or not text:
++    questions = item.get("questions")
++    valid_questions = (
++        [
++            {
++                "title": question["title"],
++                **(
++                    {"options": question["options"]} if question.get("options") is not None else {}
++                ),
++            }
++            for question in questions
++            if isinstance(question, dict)
++            and isinstance(question.get("title"), str)
++            and question["title"].strip()
++            and (
++                question.get("options") is None
++                or (
++                    isinstance(question["options"], list)
++                    and all(isinstance(option, str) for option in question["options"])
++                )
++            )
++        ]
++        if isinstance(questions, list)
++        else []
++    )
++    if (not isinstance(text, str) or not text) and not valid_questions:
+         return False
++    item_data: _JsonObject = {
++        "role": "assistant",
++        "agent": _AGENT_NAME,
++        "content": (
++            [{"type": "output_text", "text": text}] if isinstance(text, str) and text else []
++        ),
++    }
++    if valid_questions:
++        item_data["codex_questions"] = valid_questions
+     return await _post_external_item(
+         client,
+         session_id,
+         item_type="message",
+-        item_data={
+-            "role": "assistant",
+-            "agent": _AGENT_NAME,
+-            "content": [{"type": "output_text", "text": text}],
+-        },
++        item_data=item_data,
+         response_id=_response_id(params),
+         message_id=_completed_streaming_message_id(params, item, "agentMessage"),
+         source_id=source_id or _source_id(params, item),
+diff --git a/openapi.json b/openapi.json
+index 814d5e985dafc694355e79d1985372863353e026..47ad4d1970fdc967c7bfb6a563fce91411f98e6c 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -3782,6 +3782,21 @@
+       "MessageData": {
+         "description": "Data for a message item (user or assistant).\n\n**Parameters**\n\n- `agent` \u2014 Agent name (required for assistant messages, absent for user). Serialized as `\"model\"` in JSON.",
+         "properties": {
++          "codex_questions": {
++            "anyOf": [
++              {
++                "items": {
++                  "additionalProperties": true,
++                  "type": "object"
++                },
++                "type": "array"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Codex Questions"
++          },
+           "content": {
+             "description": "Heterogeneous content blocks, e.g. `[{\"type\": \"input_text\", \"text\": \"Hello\"}]`.",
+             "items": {
+diff --git a/tests/harnesses/codex_native/forwarder/test_delivery.py b/tests/harnesses/codex_native/forwarder/test_delivery.py
+index 351784a6f81480e4d6f832afc2d8cae5542b3c27..272772c8e98cef59ecd2fc55e1b547da94d2f802 100644
+--- a/tests/harnesses/codex_native/forwarder/test_delivery.py
++++ b/tests/harnesses/codex_native/forwarder/test_delivery.py
+@@ -618,3 +618,37 @@ async def test_post_session_event_records_connectivity_failure_for_watchdog(
+         assert "No route to host" in detail
+     finally:
+         health.clear()
++
++
++@pytest.mark.asyncio
++async def test_agent_message_preserves_async_questions(monkeypatch) -> None:
++    post = AsyncMock(return_value=True)
++    monkeypatch.setattr(fwd, "_post_external_item", post)
++    item = {
++        "type": "agentMessage",
++        "id": "item_question",
++        "text": "Choose a path.",
++        "questions": [{"title": "Which path?", "options": ["A", "B"]}],
++    }
++
++    assert await fwd._post_agent_message(None, "conv_1", {"turnId": "turn_1"}, item)
++    assert post.await_args.kwargs["item_data"] == {
++        "role": "assistant",
++        "agent": fwd._AGENT_NAME,
++        "content": [{"type": "output_text", "text": "Choose a path."}],
++        "codex_questions": [{"title": "Which path?", "options": ["A", "B"]}],
++    }
++
++    post.reset_mock()
++    assert await fwd._post_agent_message(
++        None,
++        "conv_1",
++        {"turnId": "turn_2"},
++        {
++            "type": "agentMessage",
++            "id": "item_2",
++            "text": "",
++            "questions": [{"title": "Explain?", "options": None}],
++        },
++    )
++    assert post.await_args.kwargs["item_data"]["codex_questions"] == [{"title": "Explain?"}]
+diff --git a/web/src/components/AeFastMode.test.tsx b/web/src/components/AeFastMode.test.tsx
+index 7dae5e3ddc6a46bdd53a6b13c33206ec1a4ef7ce..8e532777163a3cb4bb90b460fc070627175bda37 100644
+--- a/web/src/components/AeFastMode.test.tsx
++++ b/web/src/components/AeFastMode.test.tsx
+@@ -89,7 +89,8 @@ describe("AeFastModeSection", () => {
+     renderSection();
+ 
+     await waitFor(() => expect(fastSwitch()).toHaveAttribute("aria-checked", "true"));
+-    expect(screen.getByText(AE_FAST_MODE_HINT)).toBeInTheDocument();
++    expect(screen.getByText(AE_FAST_MODE_HINT)).toHaveClass("sr-only");
++    expect(fastSwitch()).toHaveAttribute("title", AE_FAST_MODE_HINT);
+     expect(fastSwitch()).toHaveAccessibleDescription(AE_FAST_MODE_HINT);
+     expect(note()).toBeNull();
+     expect(mocks.fetch).toHaveBeenCalledWith(PATH, { method: "GET" });
+@@ -140,7 +141,7 @@ describe("AeFastModeSection", () => {
+     serve(false, () => Promise.resolve(json(200, { enabled: true })));
+     renderSection({ model, modelLabel });
+ 
+-    await waitFor(() => expect(note()).toHaveTextContent("Opus only"));
++    await waitFor(() => expect(note()).toHaveTextContent("Choose a supported Opus model"));
+     expect(fastSwitch()).toHaveAttribute("data-disabled");
+     fireEvent.click(fastSwitch());
+     expect(puts()).toHaveLength(0);
+@@ -152,7 +153,7 @@ describe("AeFastModeSection", () => {
+   ])("can be turned off on a model without fast mode while %s", async (_label, state) => {
+     serve(state, () => Promise.resolve(json(200, { enabled: false })));
+     renderSection({ model: "claude-sonnet-5", modelLabel: "Sonnet 5" });
+-    await waitFor(() => expect(note()).toHaveTextContent("Opus only"));
++    await waitFor(() => expect(note()).toHaveTextContent("Choose a supported Opus model"));
+     expect(fastSwitch()).toHaveAttribute("aria-checked", state ? "true" : "false");
+     expect(fastSwitch()).not.toHaveAttribute("data-disabled");
+ 
+diff --git a/web/src/components/AeFastMode.tsx b/web/src/components/AeFastMode.tsx
+index 8d0b9949d030c05ffa22de07b21db7fedf34e9b7..7ce99a7f3e5fba57394cbdfe9d5ae43ddddd8d70 100644
+--- a/web/src/components/AeFastMode.tsx
++++ b/web/src/components/AeFastMode.tsx
+@@ -89,7 +89,7 @@ export function AeFastModeSection({
+   const checked = state.pending ?? state.enabled ?? false;
+   // Why turning it on is unavailable; off stays allowed while it is on or unknown.
+   const onBlocked = !aeFastModeModelSupported(model, modelLabel)
+-    ? "Opus only"
++    ? "Choose a supported Opus model to turn on fast mode"
+     : state.perSession === false
+       ? AE_FAST_MODE_NEEDS_PER_SESSION
+       : null;
+@@ -112,6 +112,7 @@ export function AeFastModeSection({
+           disabled={disabled}
+           aria-labelledby={labelId}
+           aria-describedby={note ? `${hintId} ${noteId}` : hintId}
++          title={AE_FAST_MODE_HINT}
+           aria-busy={pending || undefined}
+           data-testid="composer-fast-mode-switch"
+           onSelect={(event) => event.preventDefault()}
+@@ -123,7 +124,7 @@ export function AeFastModeSection({
+             <span id={labelId} className={cn("leading-5", disabled && "text-muted-foreground")}>
+               Fast mode
+             </span>
+-            <span id={hintId} className="text-xs leading-4 text-muted-foreground">
++            <span id={hintId} className="sr-only">
+               {AE_FAST_MODE_HINT}
+             </span>
+             {note && (
+diff --git a/web/src/components/chat/CodexQuestionCard.test.tsx b/web/src/components/chat/CodexQuestionCard.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..5fd4477eb8bbca687c0479ead832a73f7fbb8de0
+--- /dev/null
++++ b/web/src/components/chat/CodexQuestionCard.test.tsx
+@@ -0,0 +1,92 @@
++import { fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { CodexQuestionCard } from "./CodexQuestionCard";
++
++const send = vi.fn();
++vi.mock("@/store/chatStore", () => ({
++  useChatStore: { getState: () => ({ conversationId: "conv_1", boundAgentId: "codex", send }) },
++}));
++
++beforeEach(() => {
++  send.mockReset();
++  localStorage.clear();
++  vi.stubGlobal("crypto", {
++    subtle: { digest: vi.fn(async () => new Uint8Array(32).fill(7).buffer) },
++  });
++});
++
++describe("CodexQuestionCard", () => {
++  it("sends one normal user answer and stays answered after reload", async () => {
++    send.mockResolvedValue(undefined);
++    const props = {
++      conversationId: "conv_1",
++      itemId: "item_1",
++      questions: [{ title: "Which path?", options: ["A", "B"] }],
++    };
++    const view = render(<CodexQuestionCard {...props} />);
++    fireEvent.click(screen.getByRole("button", { name: "B" }));
++    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
++    expect(screen.getByRole("button", { name: "Sending..." })).toBeDisabled();
++    await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
++    expect(send.mock.calls[0][0]).toBe("Answer to Codex questions:\nWhich path?: B");
++    expect(send.mock.calls[0][3]).toMatchObject({
++      pinnedConversationId: "conv_1",
++      stableId: "07070707070707070707070707070707",
++    });
++    await waitFor(() => expect(screen.queryByRole("button", { name: "Send answer" })).toBeNull());
++    view.unmount();
++    render(<CodexQuestionCard {...props} />);
++    expect(screen.queryByRole("button", { name: "Send answer" })).toBeNull();
++  });
++
++  it("accepts free text and leaves failed answers available to retry", async () => {
++    send.mockImplementation(async (_text, _agent, _files, opts) => opts.onError("Offline"));
++    render(
++      <CodexQuestionCard
++        conversationId="conv_1"
++        itemId="item_2"
++        questions={[{ title: "Describe it" }]}
++      />,
++    );
++    fireEvent.change(screen.getByRole("textbox", { name: "Free text answer for Describe it" }), {
++      target: { value: "My answer" },
++    });
++    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
++    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Offline"));
++    expect(screen.getByRole("button", { name: "Send answer" })).toBeEnabled();
++    expect(localStorage.getItem("codex-question:conv_1:item_2:sent")).toBeNull();
++  });
++
++  it("reopens a dismissed prompt without answering it", () => {
++    render(
++      <CodexQuestionCard
++        conversationId="conv_1"
++        itemId="item_3"
++        questions={[{ title: "Describe it" }]}
++      />,
++    );
++    expect(screen.getByRole("dialog", { name: "Codex has questions" })).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Close" }));
++    expect(screen.queryByRole("dialog")).toBeNull();
++    fireEvent.click(screen.getByRole("button", { name: "Answer Codex questions" }));
++    expect(screen.getByRole("dialog", { name: "Codex has questions" })).toBeTruthy();
++    expect(send).not.toHaveBeenCalled();
++  });
++
++  it("opens when an older pending prompt becomes newest", () => {
++    const props = {
++      conversationId: "conv_1",
++      itemId: "item_4",
++      questions: [{ title: "What next?" }],
++    };
++    const view = render(<CodexQuestionCard {...props} autoOpen={false} />);
++    expect(screen.queryByRole("dialog")).toBeNull();
++    view.rerender(<CodexQuestionCard {...props} autoOpen />);
++    expect(screen.getByRole("dialog", { name: "Codex has questions" })).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Close" }));
++    view.unmount();
++    render(<CodexQuestionCard {...props} autoOpen />);
++    expect(screen.queryByRole("dialog")).toBeNull();
++    expect(screen.getByRole("button", { name: "Answer Codex questions" })).toBeTruthy();
++  });
++});
+diff --git a/web/src/components/chat/CodexQuestionCard.tsx b/web/src/components/chat/CodexQuestionCard.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..06f9c6c15b0e96c901d8431e21bab98946305613
+--- /dev/null
++++ b/web/src/components/chat/CodexQuestionCard.tsx
+@@ -0,0 +1,171 @@
++import { useEffect, useRef, useState } from "react";
++import { Button } from "@/components/ui/button";
++import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
++import { Input } from "@/components/ui/input";
++import type { CodexQuestion } from "@/lib/blocks";
++import { useChatStore } from "@/store/chatStore";
++
++export function isCodexQuestionAnswer(text: string, questions: CodexQuestion[]): boolean {
++  return (
++    text.startsWith("Answer to Codex questions:\n") &&
++    questions.every((question) => text.includes(`\n${question.title}: `))
++  );
++}
++
++export function CodexQuestionCard({
++  conversationId,
++  itemId,
++  questions,
++  autoOpen = true,
++}: {
++  conversationId: string;
++  itemId: string;
++  questions: CodexQuestion[];
++  autoOpen?: boolean;
++}) {
++  const storageKey = `codex-question:${conversationId}:${itemId}`;
++  const [answers, setAnswers] = useState(() => questions.map(() => ""));
++  const [pending, setPending] = useState(false);
++  const [error, setError] = useState("");
++  const [sent, setSent] = useState(() => localStorage.getItem(`${storageKey}:sent`) === "1");
++  const [open, setOpen] = useState(
++    () => autoOpen && localStorage.getItem(`${storageKey}:dismissed`) !== "1",
++  );
++  const submitting = useRef(false);
++
++  useEffect(() => {
++    setOpen(autoOpen && localStorage.getItem(`${storageKey}:dismissed`) !== "1");
++  }, [autoOpen, storageKey]);
++
++  if (sent) return null;
++
++  const submit = async () => {
++    if (submitting.current || answers.some((answer) => !answer.trim())) return;
++    const chat = useChatStore.getState();
++    if (chat.conversationId !== conversationId || !chat.boundAgentId) {
++      setError("Open this session to answer the question.");
++      return;
++    }
++    submitting.current = true;
++    setPending(true);
++    setError("");
++    let failed = false;
++    try {
++      let stableId = localStorage.getItem(`${storageKey}:send-id`);
++      if (!stableId) {
++        const digest = await crypto.subtle.digest(
++          "SHA-256",
++          new TextEncoder().encode(`${conversationId}:${itemId}`),
++        );
++        stableId = Array.from(new Uint8Array(digest).slice(0, 16), (byte) =>
++          byte.toString(16).padStart(2, "0"),
++        ).join("");
++        localStorage.setItem(`${storageKey}:send-id`, stableId);
++      }
++      const answer = [
++        "Answer to Codex questions:",
++        ...questions.map((question, index) => `${question.title}: ${answers[index]!.trim()}`),
++      ].join("\n");
++      await chat.send(answer, chat.boundAgentId, undefined, {
++        stableId,
++        pinnedConversationId: conversationId,
++        onError: (message) => {
++          failed = true;
++          setError(message);
++        },
++      });
++      if (!failed) {
++        localStorage.setItem(`${storageKey}:sent`, "1");
++        setSent(true);
++      }
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : "Could not send answer.");
++    } finally {
++      submitting.current = false;
++      setPending(false);
++    }
++  };
++
++  return (
++    <>
++      <Button
++        type="button"
++        variant="outline"
++        size="sm"
++        onClick={() => {
++          localStorage.removeItem(`${storageKey}:dismissed`);
++          setOpen(true);
++        }}
++      >
++        Answer Codex questions
++      </Button>
++      <Dialog
++        open={open}
++        onOpenChange={(next) => {
++          if (pending) return;
++          setOpen(next);
++          if (!next) localStorage.setItem(`${storageKey}:dismissed`, "1");
++        }}
++      >
++        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
++          <DialogHeader>
++            <DialogTitle>Codex has questions</DialogTitle>
++          </DialogHeader>
++          {questions.map((question, index) => (
++            <div
++              className="mb-3 space-y-2"
++              key={`${question.title}:${question.options?.join("|") ?? ""}`}
++            >
++              <p className="text-sm">{question.title}</p>
++              {!!question.options?.length && (
++                <div className="flex flex-wrap gap-2">
++                  {question.options.map((option) => (
++                    <Button
++                      type="button"
++                      variant={answers[index] === option ? "default" : "outline"}
++                      size="sm"
++                      key={option}
++                      disabled={pending}
++                      aria-pressed={answers[index] === option}
++                      onClick={() =>
++                        setAnswers((current) =>
++                          current.map((value, i) => (i === index ? option : value)),
++                        )
++                      }
++                    >
++                      {option}
++                    </Button>
++                  ))}
++                </div>
++              )}
++              <Input
++                aria-label={`Free text answer for ${question.title}`}
++                placeholder="Or type an answer"
++                value={answers[index]}
++                disabled={pending}
++                onChange={(event) =>
++                  setAnswers((current) =>
++                    current.map((value, i) => (i === index ? event.target.value : value)),
++                  )
++                }
++              />
++            </div>
++          ))}
++          {error && (
++            <p role="alert" className="mb-2 text-sm text-destructive">
++              {error}
++            </p>
++          )}
++          <Button
++            type="button"
++            size="sm"
++            disabled={pending || answers.some((answer) => !answer.trim())}
++            onClick={() => void submit()}
++          >
++            {pending ? "Sending..." : "Send answer"}
++          </Button>
++        </DialogContent>
++      </Dialog>
++    </>
++  );
++}
+diff --git a/web/src/components/chat/Transcript.activeTurn.test.ts b/web/src/components/chat/Transcript.activeTurn.test.ts
+index 58ef2d2b52f6845a4d9346d174abfed09bc471fe..c0ae8a0d5f930e9a6926e4d1732133edc83031ec 100644
+--- a/web/src/components/chat/Transcript.activeTurn.test.ts
++++ b/web/src/components/chat/Transcript.activeTurn.test.ts
+@@ -6,7 +6,33 @@
+ 
+ import { describe, expect, it } from "vitest";
+ import type { Bubble } from "@/lib/renderItems";
+-import { activeTurnIdAtBubbleIndex } from "./Transcript";
++import type { ConversationItem } from "@/lib/conversationItems";
++import { itemsToBlocks } from "@/lib/itemsToBlocks";
++import { activeTurnIdAtBubbleIndex, pendingCodexQuestions } from "./Transcript";
++
++it("keeps a repeated Codex question pending after an earlier answer", () => {
++  const question = (id: string): ConversationItem => ({
++    id,
++    type: "message",
++    response_id: id,
++    status: "completed",
++    role: "assistant",
++    model: "codex",
++    content: [{ type: "output_text", text: "Choose" }],
++    codex_questions: [{ title: "Which path?", options: ["A", "B"] }],
++  });
++  const answer: ConversationItem = {
++    id: "answer_1",
++    type: "message",
++    response_id: "answer_1",
++    status: "completed",
++    role: "user",
++    content: [{ type: "input_text", text: "Answer to Codex questions:\nWhich path?: A" }],
++  };
++  expect(pendingCodexQuestions(itemsToBlocks([question("q_1"), answer, question("q_2")]))).toEqual([
++    { itemId: "q_2", questions: [{ title: "Which path?", options: ["A", "B"] }] },
++  ]);
++});
+ 
+ function user(itemId: string): Extract<Bubble, { kind: "user" }> {
+   return { kind: "user", itemId, content: [{ type: "input_text", text: `msg ${itemId}` }] };
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index ebbb2bc1e67764589d13fa8b6b449d3c1998eddd..04e7e451e9fb95e18742a57c0a0fa706337c2872 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -10,6 +10,7 @@ import {
+ } from "@/components/ai-elements/conversation";
+ import { Message, MessageContent } from "@/components/ai-elements/message";
+ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
++import { CodexQuestionCard, isCodexQuestionAnswer } from "./CodexQuestionCard";
+ import { cn } from "@/lib/utils";
+ import { getCurrentAuthorId } from "@/lib/identity";
+ import { hasCommandModifier } from "@/lib/hotkeys";
+@@ -23,6 +24,7 @@ import {
+   liveCandidateAssistantIndex,
+ } from "@/lib/renderItems";
+ import { useChatStore } from "@/store/chatStore";
++import type { AnyBlock, CodexQuestion } from "@/lib/blocks";
+ import { TranscriptScrollbar } from "@/pages/TranscriptScrollbar";
+ import { TurnRail, type Turn } from "@/pages/TurnRail";
+ import { StreamBudgetBanner } from "@/components/StreamBudgetBanner";
+@@ -84,6 +86,25 @@ export interface TranscriptProps {
+   spacerMeasureRef: React.RefObject<(() => void) | null>;
+ }
+ 
++export function pendingCodexQuestions(
++  blocks: AnyBlock[],
++): { itemId: string; questions: CodexQuestion[] }[] {
++  return blocks.flatMap((block, index) => {
++    if (block.type !== "text_done" || !block.ctx.itemId || !block.codexQuestions?.length) return [];
++    const answered = blocks
++      .slice(index + 1)
++      .some(
++        (later) =>
++          later.type === "user_message" &&
++          later.content.some(
++            (part) =>
++              part.type === "input_text" && isCodexQuestionAnswer(part.text, block.codexQuestions!),
++          ),
++      );
++    return answered ? [] : [{ itemId: block.ctx.itemId, questions: block.codexQuestions }];
++  });
++}
++
+ export function isNativeFindShortcut(
+   event: Pick<
+     globalThis.KeyboardEvent,
+@@ -164,6 +185,7 @@ function TranscriptImpl({
+   ]);
+ 
+   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
++  const codexQuestions = useMemo(() => pendingCodexQuestions(blocks), [blocks]);
+   const streamBubbles = useMemo(
+     () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+     [bubbles, pendingElicitations.length],
+@@ -400,6 +422,19 @@ function TranscriptImpl({
+                     </MessageContent>
+                   </Message>
+                 ))}
++                {display.conversationId &&
++                  codexQuestions.map(({ itemId, questions }, index) => (
++                    <Message key={itemId} from="assistant" className="max-w-full">
++                      <MessageContent className="w-full">
++                        <CodexQuestionCard
++                          conversationId={display.conversationId!}
++                          itemId={itemId}
++                          questions={questions}
++                          autoOpen={index === codexQuestions.length - 1}
++                        />
++                      </MessageContent>
++                    </Message>
++                  ))}
+                 {/* Working… shimmer, lit for the whole busy turn. */}
+                 {showWorkingIndicator && <WorkingIndicator />}
+                 {/* Managed-sandbox stage cue; only when Working is absent. */}
+diff --git a/web/src/components/composer/HarnessPicker.tsx b/web/src/components/composer/HarnessPicker.tsx
+index 7537db2699740e93c5c2d0cc6baf70579a2ad426..5a6e9b306b90c94ec5965ff1c0cb5aeaa411ce01 100644
+--- a/web/src/components/composer/HarnessPicker.tsx
++++ b/web/src/components/composer/HarnessPicker.tsx
+@@ -503,6 +503,7 @@ export function HarnessPickerConfigRow({
+   testId,
+   valueTestId,
+   configTestId,
++  configClassName,
+   children,
+ }: {
+   label: string;
+@@ -514,6 +515,7 @@ export function HarnessPickerConfigRow({
+   testId: string;
+   valueTestId?: string;
+   configTestId: string;
++  configClassName?: string;
+   children: ReactNode;
+ }) {
+   const content = (
+@@ -564,7 +566,10 @@ export function HarnessPickerConfigRow({
+         {content}
+       </DropdownMenuSubTrigger>
+       <HarnessPickerSubContent
+-        className="composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2"
++        className={cn(
++          "composer-agent-menu composer-agent-config-menu max-h-[var(--radix-dropdown-menu-content-available-height)] w-[13.75rem] max-w-[calc(100vw-2rem)] overflow-y-auto p-2",
++          configClassName,
++        )}
+         sideOffset={-4}
+         data-testid={configTestId}
+         onFocusOutside={(event) => {
+diff --git a/web/src/lib/blockStream.test.ts b/web/src/lib/blockStream.test.ts
+index e575606c07db78979b6b5d5672e9108323beb20f..d4931c7df2e26cc16f4147455acc8e0768ce1338 100644
+--- a/web/src/lib/blockStream.test.ts
++++ b/web/src/lib/blockStream.test.ts
+@@ -46,6 +46,37 @@ function blockTypes(blocks: AnyBlock[]): string[] {
+ }
+ 
+ describe("BlockStream — response_start", () => {
++  it("preserves questions when a text message was already streamed", () => {
++    const blocks = reduce([
++      { type: "text_delta", delta: "Choose" },
++      {
++        type: "message_done",
++        itemId: "q_1",
++        responseId: "resp_1",
++        content: [{ type: "output_text", text: "Choose" }],
++        codexQuestions: [{ title: "Which path?", options: ["A", "B"] }],
++      },
++    ]);
++    expect(blocks.find((block) => block.type === "text_done")).toMatchObject({
++      ctx: { itemId: "q_1" },
++      codexQuestions: [{ title: "Which path?", options: ["A", "B"] }],
++    });
++  });
++  it("renders a question-only agent message", () => {
++    const blocks = reduce([
++      {
++        type: "message_done",
++        itemId: "q_2",
++        responseId: "resp_2",
++        content: [],
++        codexQuestions: [{ title: "Explain?" }],
++      },
++    ]);
++    expect(blocks.find((block) => block.type === "text_done")).toMatchObject({
++      ctx: { itemId: "q_2" },
++      codexQuestions: [{ title: "Explain?" }],
++    });
++  });
+   it("populates conversationId from response.created", () => {
+     const blocks = reduce([
+       {
+diff --git a/web/src/lib/blockStream.ts b/web/src/lib/blockStream.ts
+index 0a3c673ffd8a78dc3cb17c7c23f7483931cbbdcd..1277379e78d24a3a0aeb71dd189325697bf97ab8 100644
+--- a/web/src/lib/blockStream.ts
++++ b/web/src/lib/blockStream.ts
+@@ -261,7 +261,11 @@ function* closeReasoning(state: ReducerState): Generator<AnyBlock> {
+  * non-message boundary (tool call, terminal event without a preceding
+  * message_done).
+  */
+-function* closeText(state: ReducerState, itemId: string | null = null): Generator<AnyBlock> {
++function* closeText(
++  state: ReducerState,
++  itemId: string | null = null,
++  codexQuestions?: TextDone["codexQuestions"],
++): Generator<AnyBlock> {
+   if (!state.inText) return;
+   if (state.accumulated) {
+     yield {
+@@ -276,6 +280,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
+     ctx: ctx(state, itemId),
+     fullText: state.fullText,
+     hasCodeBlocks: state.fullText.includes("```"),
++    ...(codexQuestions?.length ? { codexQuestions } : {}),
+   } satisfies TextDone;
+   state.inText = false;
+   state.fullText = "";
+@@ -706,13 +711,18 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
+       // either empty or carries the previous turn's id, so isResponseSwitch
+       // spuriously fires for an in-fact same-response message_done.
+       const accumulatedFromDeltas = state.fullText;
++      const text = outputTextFromMessageContent(event.content);
+ 
+       // Close prior blocks under the OLD responseId before stamping the new one.
+       yield* closeReasoning(state);
+       if (hadOpenText) {
+         // On a response switch, event.itemId belongs to the new message — don't
+         // attach it to the old text block being closed.
+-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
++        yield* closeText(
++          state,
++          !isResponseSwitch || text === accumulatedFromDeltas ? event.itemId || null : null,
++          !isResponseSwitch || text === accumulatedFromDeltas ? event.codexQuestions : undefined,
++        );
+       }
+ 
+       // A message_done with a new id is a genuine turn transition (the
+@@ -732,8 +742,6 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
+       // avoid duplication. Response-switch: emit event.content as the new body.
+       if (hadOpenText && !isResponseSwitch) return;
+ 
+-      const text = outputTextFromMessageContent(event.content);
+-
+       // Race-safe dedup: even on a perceived response switch, if the deltas
+       // that just closed accumulated EXACTLY the text in ``event.content``,
+       // both belong to the same response and emitting a second ``text_done``
+@@ -742,12 +750,13 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
+       // race against fresh subscribe registration).
+       if (hadOpenText && text === accumulatedFromDeltas) return;
+ 
+-      if (text) {
++      if (text || event.codexQuestions?.length) {
+         yield {
+           type: "text_done",
+           ctx: ctx(state, event.itemId || null),
+           fullText: text,
+           hasCodeBlocks: text.includes("```"),
++          ...(event.codexQuestions?.length ? { codexQuestions: event.codexQuestions } : {}),
+         } satisfies TextDone;
+       }
+       return;
+diff --git a/web/src/lib/blocks.ts b/web/src/lib/blocks.ts
+index 50eefd2f1dea7ad49ebbfdf7643b6afbc0aa63e2..d5ade8c41dde9a6375a482ec444f52f76f7e8452 100644
+--- a/web/src/lib/blocks.ts
++++ b/web/src/lib/blocks.ts
+@@ -79,6 +79,27 @@ export type MessageContentBlock =
+   | { type: "input_file"; file_id?: string; filename?: string }
+   | { type: "output_text"; text: string };
+ 
++export interface CodexQuestion {
++  title: string;
++  options?: string[];
++}
++
++export function codexQuestionsFrom(value: unknown): CodexQuestion[] {
++  if (!Array.isArray(value)) return [];
++  return value.flatMap((raw): CodexQuestion[] => {
++    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return [];
++    const question = raw as Record<string, unknown>;
++    if (typeof question.title !== "string" || !question.title.trim()) return [];
++    if (
++      question.options !== undefined &&
++      (!Array.isArray(question.options) ||
++        !question.options.every((option): option is string => typeof option === "string"))
++    )
++      return [];
++    return [{ title: question.title, ...(question.options ? { options: question.options } : {}) }];
++  });
++}
++
+ /** Marks an attachment whose upload has not returned a file id yet. Shared so
+  * the writer that mints the sentinel and the readers that strip it can't drift. */
+ export const PENDING_FILE_PREFIX = "pending:";
+@@ -384,6 +405,7 @@ export interface TextDone {
+   ctx: BlockContext;
+   fullText: string;
+   hasCodeBlocks: boolean;
++  codexQuestions?: CodexQuestion[];
+   /** True when this persisted assistant text came from an interrupted turn. */
+   interrupted?: boolean;
+   /** UI-only marker for a provisional native preview with missing live output. */
+diff --git a/web/src/lib/conversationItems.ts b/web/src/lib/conversationItems.ts
+index 9ba1103e97b50bfae5879d408d4bdcac1cbe4681..ed35b4523b35f06e26a7ce7ec7a5d0559849c84f 100644
+--- a/web/src/lib/conversationItems.ts
++++ b/web/src/lib/conversationItems.ts
+@@ -12,7 +12,7 @@
+ // passed through silently as `BaseItem & Record<string, unknown>` so the
+ // translator can skip them without crashing.
+ 
+-import type { MessageContentBlock } from "./blocks";
++import type { CodexQuestion, MessageContentBlock } from "./blocks";
+ 
+ export interface BaseItem {
+   id: string;
+@@ -40,6 +40,7 @@ export interface MessageItem extends BaseItem {
+   interrupted?: boolean;
+   /** Native live-preview stream finalized by this persisted assistant message. */
+   stream_message_id?: string;
++  codex_questions?: CodexQuestion[];
+ }
+ 
+ export interface FunctionCallItem extends BaseItem {
+diff --git a/web/src/lib/events.ts b/web/src/lib/events.ts
+index bfcbf34792e24874f4430827c3c30b1f8ba9ae47..9a3da8eb46d6c81518a798f47ba36130d86f3cf6 100644
+--- a/web/src/lib/events.ts
++++ b/web/src/lib/events.ts
+@@ -9,6 +9,7 @@
+ // Python class name lowercased (e.g. ResponseCreated → "response_created").
+ 
+ import type { RoutingDecisionExtras } from "./routingDecision";
++import type { CodexQuestion } from "./blocks";
+ import type {
+   BackgroundTaskInfo,
+   CodexPersistMode,
+@@ -322,6 +323,7 @@ export interface NativeToolCall {
+ export interface MessageDone {
+   type: "message_done";
+   content: Record<string, unknown>[];
++  codexQuestions?: CodexQuestion[];
+   itemId: string;
+   responseId: string;
+   /** Native live-preview stream finalized by this item. */
+diff --git a/web/src/lib/itemsToBlocks.test.ts b/web/src/lib/itemsToBlocks.test.ts
+index 9fcb38224420b2583bcd0a63e79c4be1b59b4318..a184d511c9b2bb46f72ea154a3aa35c867fa8ef3 100644
+--- a/web/src/lib/itemsToBlocks.test.ts
++++ b/web/src/lib/itemsToBlocks.test.ts
+@@ -84,6 +84,13 @@ function functionCallOutput(
+ }
+ 
+ describe("itemsToBlocks — flat shape", () => {
++  it("keeps Codex questions on a history message", () => {
++    const item = {
++      ...assistantMessage("resp_1", "Pick one", "question_1"),
++      codex_questions: [{ title: "Which path?", options: ["A", "B"] }],
++    };
++    expect((itemsToBlocks([item])[0] as TextDone).codexQuestions).toEqual(item.codex_questions);
++  });
+   it("skips meta messages so hidden skill context is not rendered on reload", () => {
+     const items: ConversationItem[] = [
+       {
+diff --git a/web/src/lib/itemsToBlocks.ts b/web/src/lib/itemsToBlocks.ts
+index 1067b1481a84d9011f7a99a5d782bb6cebd8e40c..7920a72a057a95a71d9f411ba7f70882797cd339 100644
+--- a/web/src/lib/itemsToBlocks.ts
++++ b/web/src/lib/itemsToBlocks.ts
+@@ -30,6 +30,7 @@ import {
+   type ToolGroup,
+   type ToolResultBlock,
+   type UserMessageBlock,
++  codexQuestionsFrom,
+   answeredElicitationItemId,
+   slashCommandEchoItemId,
+   slashCommandEchoText,
+@@ -359,6 +360,9 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
+     ctx: ctxFor(item),
+     fullText: text,
+     hasCodeBlocks: text.includes("```"),
++    ...(item.codex_questions?.length
++      ? { codexQuestions: codexQuestionsFrom(item.codex_questions) }
++      : {}),
+     ...(item.interrupted === true ? { interrupted: true } : {}),
+   };
+ }
+diff --git a/web/src/lib/sse.test.ts b/web/src/lib/sse.test.ts
+index bfd842ba9cc62dc1d9ae11a6aae291922388773e..4494dbcee20fd9bb9203c0cea106068184bd61ce 100644
+--- a/web/src/lib/sse.test.ts
++++ b/web/src/lib/sse.test.ts
+@@ -164,6 +164,21 @@ describe("parseEvent — response.output_text.delta", () => {
+ });
+ 
+ describe("parseEvent — response.output_item.done (message)", () => {
++  it("keeps structured Codex questions on the live message", () => {
++    const ev = parseEvent("response.output_item.done", {
++      item: {
++        id: "q_1",
++        type: "message",
++        response_id: "resp_1",
++        content: [],
++        codex_questions: [{ title: "Which path?", options: ["A", "B"] }],
++      },
++    });
++    expect(ev).toMatchObject({
++      type: "message_done",
++      codexQuestions: [{ title: "Which path?", options: ["A", "B"] }],
++    });
++  });
+   it("carries the native preview id finalized by the item", () => {
+     const ev = parseEvent("response.output_item.done", {
+       message_id: "codex:thread_1:turn_1:agentMessage:item_1",
+diff --git a/web/src/lib/sse.ts b/web/src/lib/sse.ts
+index ae9a34e5d1ba922b8ab523ec05cf3488a854fd52..d88c3ebe7c420d533a77bb1fe1be6b0bb6248dda 100644
+--- a/web/src/lib/sse.ts
++++ b/web/src/lib/sse.ts
+@@ -9,6 +9,7 @@
+ // catch — please add an SSE-parser test when you touch this.
+ 
+ import { readSubagentActivity } from "./subagentActivity";
++import { codexQuestionsFrom } from "./blocks";
+ import type {
+   BrowserActionRequestEvent,
+   ClientTaskCancel,
+@@ -1211,6 +1212,9 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
+     return {
+       type: "message_done",
+       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
++      ...(codexQuestionsFrom(rec.codex_questions).length
++        ? { codexQuestions: codexQuestionsFrom(rec.codex_questions) }
++        : {}),
+       itemId,
+       responseId,
+       ...(messageId !== undefined ? { messageId } : {}),
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 6157956cb11f8acf6c411cbc837e897dba3c3bdf..dd6c335cbdfef2bc521b25d8b02004074df14a88 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -39,6 +39,13 @@ import { composerContextToLabels } from "@/lib/composerContextAdapters";
+ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+ 
+ vi.mock("@/shell/ClaudeAccounts", () => ({ ClaudeAccounts: () => null }));
++// Switch harness opens AppShell's fork dialog; the composer renders without AppShell here.
++const forkDialog = vi.hoisted(() => ({
++  canFork: true,
++  disabledReason: undefined as string | undefined,
++  openForkDialog: vi.fn(),
++}));
++vi.mock("@/shell/ForkDialogContext", () => ({ useForkDialog: () => forkDialog }));
+ 
+ // Composer reads workspace files via a TanStack query hook (for "@"-file
+ // mentions). These slash-command tests don't exercise that, so stub the hook
+@@ -223,6 +230,7 @@ async function openSessionEfforts() {
+   if (!screen.queryByTestId("composer-agent-menu")) openSessionConfig();
+   fireEvent.click(screen.getByTestId("composer-agent-edit"));
+   await screen.findByTestId("composer-agent-efforts");
++  fireEvent.keyDown(screen.getByTestId("composer-agent-effort-trigger"), { key: "ArrowRight" });
+ }
+ 
+ function openSessionConfig() {
+@@ -1953,9 +1961,126 @@ describe("Composer model/effort label", () => {
+     fireEvent.keyDown(row, { key: "ArrowRight" });
+     expect(screen.getByTestId("composer-agent-model-opus")).toHaveTextContent("Opus");
+     expect(screen.getByTestId("composer-agent-efforts")).toBeVisible();
++    fireEvent.keyDown(screen.getByTestId("composer-agent-effort-trigger"), { key: "ArrowRight" });
+     expect(screen.getByTestId("composer-agent-effort-high")).toBeVisible();
+   });
+ 
++  it("keeps Claude family aliases up front and puts extra variants under More models", async () => {
++    useChatStore.setState({ llmModel: "sonnet" });
++    renderWithTooltips(
++      <Composer
++        {...composerProps({
++          showModels: true,
++          modelPickerKind: "claude",
++          codexModelOptions: CLAUDE_MODEL_OPTIONS,
++        })}
++      />,
++    );
++    await openSessionModels();
++    const models = screen.getByTestId("composer-agent-models");
++    expect(models.querySelector(".grid-cols-2")).toBeTruthy();
++    expect(within(models).getByTestId("composer-agent-model-sonnet")).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++    expect(screen.queryByTestId("composer-agent-model-sonnet_5")).toBeNull();
++    fireEvent.keyDown(screen.getByTestId("composer-agent-more-models"), { key: "ArrowRight" });
++    expect(screen.getByTestId("composer-agent-model-sonnet_5")).toHaveTextContent("Sonnet 5");
++  });
++
++  it("keeps a selected extra variant visible in the primary grid", async () => {
++    useChatStore.setState({ llmModel: "sonnet_5" });
++    renderWithTooltips(
++      <Composer
++        {...composerProps({
++          showModels: true,
++          modelPickerKind: "claude",
++          codexModelOptions: CLAUDE_MODEL_OPTIONS,
++        })}
++      />,
++    );
++    await openSessionModels();
++    expect(
++      within(screen.getByTestId("composer-agent-models")).getByTestId(
++        "composer-agent-model-sonnet_5",
++      ),
++    ).toHaveAttribute("aria-checked", "true");
++  });
++
++  it.each([null, "gpt-5.6-sol"])(
++    "keeps newest Codex family rows primary with selected older model %s",
++    async (selectedModel) => {
++      useChatStore.setState({ llmModel: selectedModel, sessionHarness: "codex-native" });
++      renderWithTooltips(
++        <Composer
++          {...composerProps({
++            showModels: true,
++            modelPickerKind: "codex",
++            codexModelOptions: [
++              { id: "gpt-5.6-sol", displayName: "GPT-5.6-Sol" },
++              { id: "gpt-5.5-luna", displayName: "GPT-5.5-Luna" },
++              { id: "gpt-5.6-astra", displayName: "GPT-5.6-Astra" },
++              { id: "gpt-6-sol", displayName: "GPT-6-Sol" },
++              { id: "gpt-6-luna", displayName: "GPT-6-Luna" },
++              { id: "gpt-6-astra", displayName: "GPT-6-Astra" },
++            ],
++          })}
++        />,
++      );
++      await openSessionModels();
++      const models = within(screen.getByTestId("composer-agent-models"));
++      for (const id of ["gpt-6-sol", "gpt-6-luna", "gpt-6-astra"])
++        expect(models.getByTestId(`composer-agent-model-${id}`)).toBeVisible();
++      if (selectedModel) {
++        expect(models.getByTestId(`composer-agent-model-${selectedModel}`)).toHaveAttribute(
++          "aria-checked",
++          "true",
++        );
++      } else {
++        expect(screen.queryByTestId("composer-agent-model-gpt-5.6-sol")).toBeNull();
++      }
++      fireEvent.keyDown(screen.getByTestId("composer-agent-more-models"), {
++        key: "ArrowRight",
++      });
++      expect(screen.getByTestId("composer-agent-model-gpt-5.5-luna")).toBeVisible();
++      expect(screen.getByTestId("composer-agent-model-gpt-5.6-astra")).toBeVisible();
++    },
++  );
++
++  it("opens the fork dialog from Switch harness and disables it for a sub-agent", async () => {
++    renderWithTooltips(
++      <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
++    );
++    await openSessionModels();
++    fireEvent.click(screen.getByTestId("composer-switch-harness"));
++    expect(forkDialog.openForkDialog).toHaveBeenCalledWith({ sourceSessionId: "conv_test" });
++    cleanup();
++
++    useChatStore.setState({ subAgentName: "worker" });
++    renderWithTooltips(
++      <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
++    );
++    await openSessionModels();
++    expect(screen.getByTestId("composer-switch-harness")).toHaveAttribute("data-disabled");
++  });
++
++  it("disables Switch harness with the reason when the session cannot be forked", async () => {
++    forkDialog.canFork = false;
++    forkDialog.disabledReason = "Only editors can fork this session";
++    try {
++      renderWithTooltips(
++        <Composer {...composerProps({ showModels: true, modelPickerKind: "claude" })} />,
++      );
++      await openSessionModels();
++      const item = screen.getByTestId("composer-switch-harness");
++      expect(item).toHaveAttribute("data-disabled");
++      expect(item).toHaveAttribute("title", "Only editors can fork this session");
++    } finally {
++      forkDialog.canFork = true;
++      forkDialog.disabledReason = undefined;
++    }
++  });
++
+   it("shows the model in the foreground and effort muted", () => {
+     // The chip renders the harness's reported model (`llmModel`), never the
+     // sticky preference or the request.
+@@ -2379,9 +2504,8 @@ describe("Composer model/effort label", () => {
+     expect(screen.queryByTestId("composer-config-modal")).toBeNull();
+   });
+ 
+-  it("keeps the harness identity visible in a disabled shared trigger", () => {
+-    // SDK/bundle identity fallback with no config surface: there's no modal
+-    // to open, no button in the pill, and thus no hover highlight to honor.
++  it("keeps the harness identity visible when only switch action is available", () => {
++    // The gear opens Switch harness; the model label remains plain text.
+     useChatStore.setState({
+       sessionModelOverride: null,
+       sessionReasoningEffort: null,
+@@ -2400,7 +2524,7 @@ describe("Composer model/effort label", () => {
+       />,
+     );
+ 
+-    expect(screen.getByTestId("composer-config-gear")).toBeDisabled();
++    expect(screen.getByTestId("composer-config-gear")).not.toBeDisabled();
+     expect(label().tagName).toBe("SPAN");
+   });
+ });
+@@ -5165,14 +5289,16 @@ describe("Composer config gear", () => {
+     expect(gear()).not.toBeNull();
+   });
+ 
+-  it("keeps the shared trigger disabled when there is nothing to configure", () => {
+-    // No models, no effort, not routable → nothing to configure.
++  it("offers switching on a session with no model or effort controls", () => {
+     renderWithTooltips(
+       <Composer
+         {...composerProps({ showEffort: false, showModels: false, costRoutingEligible: false })}
+       />,
+     );
+-    expect(gear()).toBeDisabled();
++    expect(gear()).not.toBeDisabled();
++    openSessionConfig();
++    fireEvent.keyDown(screen.getByTestId("composer-agent-edit"), { key: "ArrowRight" });
++    expect(screen.getByTestId("composer-switch-harness")).toBeVisible();
+   });
+ 
+   it("soft-disables the gear on a read-only session (aria-disabled, click no-ops)", () => {
+@@ -5299,7 +5425,7 @@ describe("Composer config gear", () => {
+       expect(screen.queryByRole("menuitem", { name: "Smart Routing" })).toBeNull();
+       const configMenu = within(screen.getByTestId("composer-agent-config-menu"));
+       // Only the Models | Effort divider remains, plus Effort | Fast mode.
+-      expect(configMenu.queryAllByRole("separator")).toHaveLength((showModels ? 1 : 0) + 1);
++      expect(configMenu.queryAllByRole("separator")).toHaveLength((showModels ? 1 : 0) + 2);
+       expect(configMenu.getByTestId("composer-agent-efforts")).toBeVisible();
+     },
+   );
+@@ -5327,7 +5453,7 @@ describe("Composer config gear", () => {
+         "data-disabled",
+       );
+       // Smart Routing | Models, Models | Effort, then Effort | Fast mode.
+-      expect(menu.getAllByRole("separator")).toHaveLength(3);
++      expect(menu.getAllByRole("separator")).toHaveLength(4);
+       expect(useChatStore.getState().costControlModeOverride).toBe(costControlModeOverride);
+       if (costControlModeOverride === "on") {
+         for (const choice of menu.getAllByRole("menuitemcheckbox")) {
+@@ -5355,9 +5481,8 @@ describe("Composer config gear", () => {
+       await openSessionModels();
+       const menu = within(screen.getByTestId("composer-agent-config-menu"));
+       const picks = () => [
+-        ...CLAUDE_MODEL_OPTIONS.map(({ id }) => menu.getByTestId(`composer-agent-model-${id}`)),
+-        ...["low", "medium", "high"].map((level) =>
+-          menu.getByTestId(`composer-agent-effort-${level}`),
++        ...["fable", "opus", "sonnet", "haiku"].map((id) =>
++          menu.getByTestId(`composer-agent-model-${id}`),
+         ),
+       ];
+       for (const pick of picks()) expect(pick).not.toHaveAttribute("data-disabled");
+@@ -5365,6 +5490,12 @@ describe("Composer config gear", () => {
+       act(() => void changeAeFastMode("conv_test", false));
+ 
+       for (const pick of picks()) expect(pick).toHaveAttribute("data-disabled");
++      fireEvent.keyDown(menu.getByTestId("composer-agent-effort-trigger"), { key: "ArrowRight" });
++      for (const level of ["low", "medium", "high"]) {
++        expect(screen.getByTestId(`composer-agent-effort-${level}`)).toHaveAttribute(
++          "data-disabled",
++        );
++      }
+       // The menu stays open on the pending switch.
+       expect(menu.getByTestId("composer-fast-mode-switch")).toHaveAttribute("aria-busy", "true");
+     } finally {
+@@ -5452,6 +5583,7 @@ describe("Composer config gear", () => {
+     fireEvent.keyDown(screen.getByTestId("composer-config-gear"), { key: "ArrowDown" });
+     fireEvent.keyDown(screen.getByTestId("composer-agent-edit"), { key: "ArrowRight" });
+     expect(await screen.findByTestId("composer-agent-models")).toBeVisible();
++    fireEvent.keyDown(screen.getByTestId("composer-agent-effort-trigger"), { key: "ArrowRight" });
+     expect(await screen.findByTestId("composer-agent-effort-xhigh")).toHaveAttribute(
+       "aria-checked",
+       "true",
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index e36a188cdb8d5158e944a36bb4a558b1264c5719..938940e48c266052876ade9b9c4cf01e0c3a6c4a 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -14,6 +14,7 @@ import {
+   type ChangeEvent,
+   type FormEvent,
+   type KeyboardEvent,
++  type ReactNode,
+   forwardRef,
+   memo,
+   useCallback,
+@@ -49,7 +50,14 @@ import {
+   ComposerPermissionPicker,
+   ComposerConfigTooltipRows,
+ } from "@/components/composer/ComposerControls";
+-import { DropdownMenuItem, DropdownMenuSeparator } from "@/components/ui/dropdown-menu";
++import {
++  DropdownMenuCheckboxItem,
++  DropdownMenuItem,
++  DropdownMenuSeparator,
++  DropdownMenuSub,
++  DropdownMenuSubContent,
++  DropdownMenuSubTrigger,
++} from "@/components/ui/dropdown-menu";
+ import { useAppName } from "@/lib/branding";
+ import { cn } from "@/lib/utils";
+ import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+@@ -226,7 +234,11 @@ import {
+ } from "@/lib/smartRoutingAvailability";
+ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+ import { nativeModelLabel } from "@/components/HarnessConfigControls";
+-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
++import {
++  ComposerConfigSections,
++  type ComposerConfigChoice,
++} from "@/components/composer/ComposerConfigSections";
++import { PickerSectionHeader } from "@/components/composer/HarnessMenuRow";
+ import { buildFusionSections } from "@/components/composer/fusionSections";
+ import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
+ import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
+@@ -267,6 +279,7 @@ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { ConnectionIndicator } from "./ChatIndicators";
+ import { Transcript } from "@/components/chat/Transcript";
++import { useForkDialog } from "@/shell/ForkDialogContext";
+ 
+ /** Server-info as consumers see it: the probe's result, or "loading". */
+ type ServerInfoValue = ServerInfo | "loading";
+@@ -4484,11 +4497,7 @@ export function shouldShowPollyCodexGoalControl(
+   );
+ }
+ 
+-/**
+- * Whether the session surfaces any run-config the gear modal can edit. Shared
+- * render guard for the config gear and click-to-open gate for the model/effort
+- * label half of the composer's split pill, so both halves stay in lockstep.
+- */
++/** Whether the session offers model or effort controls. */
+ function hasSessionConfig({
+   showModels,
+   showEffort,
+@@ -4499,6 +4508,130 @@ function hasSessionConfig({
+   return showModels || showEffort;
+ }
+ 
++function compactModelChoices(
++  choices: ComposerConfigChoice[],
++  kind: NativeModelPickerKind | null,
++): { primary: ComposerConfigChoice[]; more: ComposerConfigChoice[] } {
++  const codexModel = (id: string) =>
++    /^gpt-(\d+)(?:\.(\d+))?(?:-(codex|mini|nano|luna|sol|spark|astra))?(?:$|-)/i.exec(id);
++  const primary: ComposerConfigChoice[] = [];
++  const more: ComposerConfigChoice[] = [];
++  const seen = new Set<string>();
++  const latestCodexByFamily = new Map<string, { id: string; major: number; minor: number }>();
++  if (kind === "codex") {
++    for (const choice of choices) {
++      const id = choice.data?.["data-model-id"] ?? choice.key;
++      const match = codexModel(id);
++      if (!match) continue;
++      const family = match[3] ?? "base";
++      const major = Number(match[1]);
++      const minor = Number(match[2] ?? 0);
++      const latest = latestCodexByFamily.get(family);
++      if (!latest || major > latest.major || (major === latest.major && minor > latest.minor))
++        latestCodexByFamily.set(family, { id, major, minor });
++    }
++  }
++  const claudeAliases = new Set(
++    choices
++      .map((choice) => choice.data?.["data-model-id"] ?? choice.key)
++      .filter((id) => /^(fable|opus|sonnet|haiku)$/i.test(id)),
++  );
++  for (const choice of choices) {
++    const id = choice.data?.["data-model-id"] ?? choice.key;
++    const claudeFamily =
++      kind === "claude" ? /(?:^|[-_])(fable|opus|sonnet|haiku)(?:$|[-_])/i.exec(id)?.[1] : null;
++    const codexFamily = kind === "codex" ? codexModel(id) : null;
++    const family = claudeFamily
++      ? `claude:${claudeFamily.toLowerCase()}`
++      : codexFamily
++        ? `codex:${codexFamily[1] ?? "base"}`
++        : id;
++    const hasAlias = kind === "claude" && claudeAliases.has(claudeFamily ?? "");
++    const latestCodex =
++      codexFamily !== null && latestCodexByFamily.get(codexFamily[3] ?? "base")?.id === id;
++    if (
++      choice.checked ||
++      (codexFamily ? latestCodex : (!hasAlias || id === claudeFamily) && !seen.has(family))
++    ) {
++      primary.push(choice);
++      seen.add(family);
++    } else {
++      more.push(choice);
++    }
++  }
++  return { primary, more };
++}
++
++function CompactConfigChoice({ choice }: { choice: ComposerConfigChoice }) {
++  return (
++    <DropdownMenuCheckboxItem
++      checked={choice.checked}
++      disabled={choice.disabled}
++      onSelect={(event) => event.preventDefault()}
++      onCheckedChange={choice.onSelect}
++      data-testid={choice.testId}
++      className={cn("min-h-8 whitespace-normal break-words", choice.className)}
++      {...choice.data}
++    >
++      {choice.label}
++    </DropdownMenuCheckboxItem>
++  );
++}
++
++function CompactSessionChoices({
++  models,
++  efforts,
++  kind,
++}: {
++  models?: { leading?: ReactNode; choices: ComposerConfigChoice[] };
++  efforts?: { label: string; choices: ComposerConfigChoice[] };
++  kind: NativeModelPickerKind | null;
++}) {
++  const { primary, more } = compactModelChoices(models?.choices ?? [], kind);
++  return (
++    <>
++      {models && (
++        <div data-testid="composer-agent-models">
++          <PickerSectionHeader>Models</PickerSectionHeader>
++          {models.leading}
++          <div className="grid grid-cols-2 gap-0.5 max-[480px]:grid-cols-1">
++            {primary.map((choice) => (
++              <CompactConfigChoice key={choice.key} choice={choice} />
++            ))}
++          </div>
++          {more.length > 0 && (
++            <DropdownMenuSub>
++              <DropdownMenuSubTrigger data-testid="composer-agent-more-models">
++                More models
++              </DropdownMenuSubTrigger>
++              <DropdownMenuSubContent className="max-h-[70vh] max-w-[calc(100vw-2rem)] overflow-y-auto">
++                {more.map((choice) => (
++                  <CompactConfigChoice key={choice.key} choice={choice} />
++                ))}
++              </DropdownMenuSubContent>
++            </DropdownMenuSub>
++          )}
++        </div>
++      )}
++      {efforts && (
++        <div data-testid="composer-agent-efforts">
++          {models && <DropdownMenuSeparator />}
++          <DropdownMenuSub>
++            <DropdownMenuSubTrigger data-testid="composer-agent-effort-trigger">
++              {efforts.label}
++            </DropdownMenuSubTrigger>
++            <DropdownMenuSubContent className="max-h-[70vh] overflow-y-auto">
++              {efforts.choices.map((choice) => (
++                <CompactConfigChoice key={choice.key} choice={choice} />
++              ))}
++            </DropdownMenuSubContent>
++          </DropdownMenuSub>
++        </div>
++      )}
++    </>
++  );
++}
++
+ function SessionHarnessPicker({
+   busy,
+   busyRef,
+@@ -4548,6 +4681,8 @@ function SessionHarnessPicker({
+   const pendingModelChange = useChatStore((state) => state.pendingModelChange);
+   // A pending fast mode flip blocks model and effort picks, not the menu itself.
+   const picksBusy = useAeFastModePending(conversationId) || busy;
++  // Switching harness forks the session; in-place agent switching is not available.
++  const forkDialog = useForkDialog();
+   const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
+   const selectedEffort = useSessionEffort();
+   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
+@@ -4594,7 +4729,8 @@ function SessionHarnessPicker({
+     hasSessionConfig({
+       showModels,
+       showEffort,
+-    });
++    }) ||
++    (conversationId !== null && subAgentName === null);
+   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+   const label = routingOn
+     ? SMART_ROUTING_LABEL
+@@ -4685,12 +4821,11 @@ function SessionHarnessPicker({
+           <DropdownMenuSeparator />
+         </>
+       )}
+-      <ComposerConfigSections
++      <CompactSessionChoices
++        kind={modelPickerKind}
+         models={
+           showModels
+             ? {
+-                testId: "composer-agent-models",
+-                header: "Models",
+                 leading:
+                   (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
+                     <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
+@@ -4750,8 +4885,7 @@ function SessionHarnessPicker({
+         efforts={
+           showEffort && availableEfforts.length > 0
+             ? {
+-                testId: "composer-agent-efforts",
+-                header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
++                label: `${modelPickerKind === "pi" ? "Thinking level" : "Effort"}${effortLabel ? `: ${effortLabel}` : ""}`,
+                 choices: availableEfforts.map((effort) => ({
+                   key: effort,
+                   label: formatStatusEffortLabel(effort) ?? effort,
+@@ -4764,24 +4898,50 @@ function SessionHarnessPicker({
+               }
+             : undefined
+         }
+-        extra={
+-          composerFusion !== undefined && fusionSelected && !routingOn
+-            ? buildFusionSections({
+-                descriptor: composerFusion,
+-                modelUid: pickerSelectedModel ?? composerFusion.default,
+-                testIdPrefix: "composer-agent",
+-                onChange: selectFusionModel,
+-                disabled: busy || pendingModelChange !== null,
+-              })
+-            : undefined
+-        }
+       />
++      {composerFusion !== undefined && fusionSelected && !routingOn && (
++        <>
++          <DropdownMenuSeparator />
++          <ComposerConfigSections
++            extra={buildFusionSections({
++              descriptor: composerFusion,
++              modelUid: pickerSelectedModel ?? composerFusion.default,
++              testIdPrefix: "composer-agent",
++              onChange: selectFusionModel,
++              disabled: busy || pendingModelChange !== null,
++            })}
++          />
++        </>
++      )}
+       <AeFastModeSection
+         pickerKind={modelPickerKind}
+         model={effectiveModel}
+         modelLabel={modelSummary}
+         busy={busy}
+       />
++      {conversationId && forkDialog && (
++        <>
++          {(showClaudeAccounts || showModels || (showEffort && availableEfforts.length > 0)) && (
++            <DropdownMenuSeparator />
++          )}
++          <DropdownMenuItem
++            data-testid="composer-switch-harness"
++            disabled={
++              !forkDialog.canFork ||
++              picksBusy ||
++              pendingModelChange !== null ||
++              subAgentName !== null
++            }
++            title={forkDialog.disabledReason}
++            onSelect={() => {
++              setMenuOpen(false);
++              forkDialog.openForkDialog({ sourceSessionId: conversationId });
++            }}
++          >
++            Switch harness…
++          </DropdownMenuItem>
++        </>
++      )}
+     </>
+   );
+   return (
+@@ -4829,6 +4989,7 @@ function SessionHarnessPicker({
+           valueTestId="composer-agent-model-summary"
+           testId="composer-agent-edit"
+           configTestId="composer-agent-config-menu"
++          configClassName="w-[19rem]"
+         >
+           {configContent}
+         </HarnessPickerConfigRow>
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 606274a637300630a89a83930698c9a2af47594a..2b2f3e257f86b73ebe49bdda69370142adc2fdce 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -3060,7 +3060,9 @@ describe("chatStore — send (first-send ordering)", () => {
+       return defaultFetchHandler(input, init);
+     });
+ 
+-    await useChatStore.getState().send("blocked by policy", "agent_xyz");
++    const onError = vi.fn();
++    await useChatStore.getState().send("blocked by policy", "agent_xyz", undefined, { onError });
++    expect(onError).toHaveBeenCalledWith("Message was denied by policy.");
+ 
+     const state = useChatStore.getState();
+     // A denied INPUT policy does not persist the user message, so no
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index c2fd9df70ee27eda28fe803e5660e16da1cf3c6d..8ee0c507f7cc6637761a97705a62ead97d0c03e6 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -2492,6 +2492,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+       // bubble. Settle local state from the POST response instead of
+       // depending on the live stream being connected.
+       if (postResult.denied) {
++        opts?.onError?.("Message was denied by policy.");
+         // Target the session this send posted to: the user may have navigated
+         // away while the POST was open, and settling the VISIBLE conversation
+         // would clobber an unrelated chat's composer state.

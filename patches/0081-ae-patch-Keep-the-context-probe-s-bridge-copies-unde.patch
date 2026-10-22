@@ -1,0 +1,139 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 13:08:15 -0700
+Subject: [PATCH 081/148] [ae-patch] Keep the context probe's bridge copies
+ under the claude-native bridge root
+
+The probe copied bridge.json into the system temp dir, where the bridge's allowed-root check rejected the copy, so the probe's omnigent MCP server failed to start and the session rail showed omnigent as failed.
+---
+ omnigent/runner/ae_context_usage.py   | 20 ++++++-
+ tests/runner/test_ae_context_usage.py | 77 +++++++++++++++++++++++++++
+ 2 files changed, 96 insertions(+), 1 deletion(-)
+
+diff --git a/omnigent/runner/ae_context_usage.py b/omnigent/runner/ae_context_usage.py
+index a97b72732eefd09eb74c135d1ac609cd9c245a27..347629ab1aa967c22313f9a90988dad2005a6469 100644
+--- a/omnigent/runner/ae_context_usage.py
++++ b/omnigent/runner/ae_context_usage.py
+@@ -273,8 +273,26 @@ def isolated_command(command: list[str], cwd: str, scratch: Path) -> list[str]:
+     return result
+ 
+ 
++def _scratch_parent() -> Path:
++    """Return the claude-native bridge root, created owner-only, to hold probe copies.
++
++    The bridge refuses any ``--bridge-dir`` outside its allowed roots, so copies in the
++    system temp dir make the probe's omnigent MCP server fail to start. The orphan
++    sweep skips children without an ``owner.pid`` marker, which the copies lack.
++    """
++    from omnigent.harnesses.claude_native.bridge import (
++        bridge_dir_for_bridge_id,
++        ensure_secure_dir,
++    )
++
++    root = bridge_dir_for_bridge_id("ae-context-probe").parent
++    ensure_secure_dir(root)
++    return root
++
++
+ async def probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str, Any]:
+-    with tempfile.TemporaryDirectory(prefix="ae-context-") as scratch:
++    parent = await asyncio.to_thread(_scratch_parent)
++    with tempfile.TemporaryDirectory(prefix="ae-context-", dir=parent) as scratch:
+         isolated = await asyncio.to_thread(isolated_command, command, cwd, Path(scratch))
+         return await _probe(isolated, env, cwd)
+ 
+diff --git a/tests/runner/test_ae_context_usage.py b/tests/runner/test_ae_context_usage.py
+index 0e18018d092111508b7bee61c994403460e22047..4ba9af5e9df25cf7401f468233d485cc4104961f 100644
+--- a/tests/runner/test_ae_context_usage.py
++++ b/tests/runner/test_ae_context_usage.py
+@@ -7,9 +7,22 @@ from unittest.mock import AsyncMock
+ 
+ import pytest
+ 
++from omnigent.harnesses.claude_native import bridge as claude_bridge
+ from omnigent.runner import ae_context_usage as usage
+ 
+ 
++@pytest.fixture(autouse=True)
++def claude_bridge_root(tmp_path, monkeypatch):
++    """Point the claude-native bridge root at a temp tree, the way bridge tests do."""
++    trusted = tmp_path / "trusted"
++    trusted.mkdir()
++    root = trusted / "omnigent-test" / "claude-native"
++    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", trusted)
++    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT_PARENT", root.parent)
++    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", root)
++    return root
++
++
+ @pytest.mark.parametrize(
+     "categories",
+     [
+@@ -329,3 +342,67 @@ for line in sys.stdin:
+     ]
+     assert result["complete"] is False
+     assert "secret-cmd" not in json.dumps(result)
++
++
++def _bridge_config(live):
++    return {
++        "mcpServers": {
++            "omnigent": {
++                "args": [
++                    "-m",
++                    "omnigent.harnesses.claude_native.bridge",
++                    "serve-mcp",
++                    "--bridge-dir",
++                    str(live),
++                ]
++            }
++        }
++    }
++
++
++@pytest.mark.asyncio
++async def test_probe_copies_land_under_claude_bridge_root(tmp_path, claude_bridge_root):
++    """The bridge rejects a --bridge-dir outside its allowed roots (2026-10-17 regression)."""
++    live = tmp_path / "live"
++    live.mkdir()
++    (live / "bridge.json").write_text('{"token":"private"}')
++    seen = tmp_path / "seen.txt"
++    script = tmp_path / "cli.py"
++    script.write_text(f"""import json,sys
++config=json.loads(sys.argv[sys.argv.index('--mcp-config')+1])
++args=config['mcpServers']['omnigent']['args']
++open({str(seen)!r},'w').write(args[args.index('--bridge-dir')+1])
++for line in sys.stdin:
++ r=json.loads(line); kind=r['request']['subtype']
++ if kind=='get_context_usage':
++  body={{'categories':[{{'name':'Messages','tokens':50,'kind':'used'}}],
++        'maxTokens':200000,'totalTokens':50}}
++ else: body={{}}
++ print(json.dumps({{'type':'control_response','response':{{'subtype':'success','request_id':r['request_id'],'response':body}}}}),flush=True)
++""")
++    command = [sys.executable, str(script), "--mcp-config", json.dumps(_bridge_config(live))]
++    await usage.probe(command, {}, str(tmp_path))
++    copy = type(live)(seen.read_text())
++    assert copy.parent.parent == claude_bridge_root
++    assert copy.parent.name.startswith("ae-context-")
++    assert not copy.parent.exists()
++
++
++def test_isolated_copy_passes_bridge_allowed_root_check(tmp_path, claude_bridge_root):
++    live = tmp_path / "live"
++    live.mkdir()
++    (live / "bridge.json").write_text('{"token":"private"}')
++    parent = usage._scratch_parent()
++    assert parent == claude_bridge_root
++    scratch = parent / "ae-context-check"
++    scratch.mkdir(mode=0o700)
++    command = usage.isolated_command(
++        ["claude", "--mcp-config", json.dumps(_bridge_config(live))], str(tmp_path), scratch
++    )
++    copy = type(live)(json.loads(command[2])["mcpServers"]["omnigent"]["args"][-1])
++    assert claude_bridge._trusted_parent_for_bridge_dir(copy) == claude_bridge._TRUSTED_PARENT
++    claude_bridge.ensure_secure_dir(copy)
++    claude_bridge._write_json_file(copy / "server.json", {"pid": 1})
++    # The old location is rejected, which is the failure this guards against.
++    with pytest.raises(RuntimeError, match="not under an allowed bridge root"):
++        claude_bridge.ensure_secure_dir(tmp_path / "ae-context-elsewhere" / "0-0")

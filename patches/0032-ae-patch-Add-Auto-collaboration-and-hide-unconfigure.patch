@@ -1,0 +1,2045 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 10:33:06 -0700
+Subject: [PATCH 032/148] [ae-patch] Add Auto collaboration and hide
+ unconfigured agents.
+
+---
+ omnigent/inner/ae_team.py                    |  30 +-
+ tests/e2e_ui/visual/test_ae_collaboration.py |  16 +-
+ tests/inner/test_ae_team.py                  |  32 +-
+ tests/server/integration/test_ae_team.py     |  14 +-
+ web/src/components/AeTeamControl.stories.tsx | 126 ++++-
+ web/src/components/AeTeamControl.test.tsx    | 494 ++++++++++++++++---
+ web/src/components/AeTeamControl.tsx         | 245 ++++++---
+ web/src/lib/aeTeam.test.ts                   | 113 ++++-
+ web/src/lib/aeTeam.ts                        |  53 +-
+ web/src/lib/aeTeamOptions.test.ts            | 250 ++++++++++
+ web/src/lib/aeTeamOptions.ts                 | 144 ++++++
+ 11 files changed, 1318 insertions(+), 199 deletions(-)
+ create mode 100644 web/src/lib/aeTeamOptions.test.ts
+ create mode 100644 web/src/lib/aeTeamOptions.ts
+
+diff --git a/omnigent/inner/ae_team.py b/omnigent/inner/ae_team.py
+index 7c96d7dab449fd247205074d1981b19fef3db0f4..4fd47afe7411faa253c44820cac3c3c7a4f7c5ae 100644
+--- a/omnigent/inner/ae_team.py
++++ b/omnigent/inner/ae_team.py
+@@ -29,7 +29,9 @@ def codex_team_context(content: object) -> dict[str, object] | None:
+ def team_notice(conv: Conversation, store: ConversationStore) -> dict[str, object] | None:
+     """Resolve roster ids against direct children; never trust a label as access control."""
+     raw = conv.labels.get(TEAM_LABEL)
+-    if not raw or len(raw) > 16_384:
++    if not raw:
++        return {"ae_team": {"mode": "auto", "members": []}}
++    if len(raw) > 16_384:
+         return None
+     try:
+         config = json.loads(raw)
+@@ -38,8 +40,8 @@ def team_notice(conv: Conversation, store: ConversationStore) -> dict[str, objec
+     if not isinstance(config, dict) or config.get("version") != 1:
+         return None
+     mode = config.get("mode")
+-    if mode == "solo":
+-        return {"ae_team": {"mode": "solo", "members": []}}
++    if mode in ("auto", "solo"):
++        return {"ae_team": {"mode": mode, "members": []}}
+     members = config.get("members")
+     if mode != "team" or not isinstance(members, list) or len(members) > TEAM_LIMIT:
+         return None
+@@ -62,17 +64,33 @@ def render_team_notice(metadata: Any) -> str | None:
+     if not isinstance(metadata, dict) or not isinstance(metadata.get("ae_team"), dict):
+         return None
+     roster = metadata["ae_team"]
++    if roster.get("mode") == "auto":
++        return (
++            "Auto collaboration is enabled for this message. You are the lead and give one "
++            "integrated answer. Decide whether to work yourself, use your native in-harness "
++            "subagents, or bring in another configured agent. Use the smallest useful group; "
++            "routine work does not need a team. Before starting cross-agent work, inspect the "
++            "available agents and host readiness and use only configured, reachable agents. "
++            "Reuse suitable existing child sessions where possible. Delegate bounded tasks "
++            "with the relevant context, coordinate file ownership, and inspect the results. "
++            "If cross-agent tools are unavailable, use your normal native helpers and say "
++            "what you could actually use. Do not claim a collaborator or model worked "
++            "unless you invoked it. Follow the user's permissions and limits."
++        )
+     if roster.get("mode") == "solo":
+         return (
+-            "The user selected Solo for this message. Handle this request yourself; "
+-            "do not delegate new work to previously selected collaborators. "
++            "The user selected Solo for this message: use this lead agent and its native "
++            "in-harness subagents when helpful. Native helpers remain available. "
++            "Do not start additional cross-agent collaborations or delegate new work to "
++            "previously selected team sessions. "
+             "Existing work is not cancelled by this preference."
+         )
+     if roster.get("mode") != "team":
+         return None
+     return (
+         "The user selected Team for this message. You are the lead and give the user "
+-        "one integrated answer. These are existing direct child sessions selected "
++        "one integrated answer. Your native in-harness subagents remain available too. "
++        "These are existing direct child sessions selected "
+         "by the user (JSON data): "
+         + json.dumps(roster.get("members", []), ensure_ascii=True)
+         + ". Delegate useful, bounded tasks to these sessions with sys_session_send "
+diff --git a/tests/e2e_ui/visual/test_ae_collaboration.py b/tests/e2e_ui/visual/test_ae_collaboration.py
+index a09c3e0e68d6b88679390553af8c7487d4ee7b77..f12b5a38beef976524cfd78734edc07a294f5973 100644
+--- a/tests/e2e_ui/visual/test_ae_collaboration.py
++++ b/tests/e2e_ui/visual/test_ae_collaboration.py
+@@ -4,6 +4,7 @@ Run against a built Storybook, or set AE_UI_STORYBOOK_URL to its local dev URL.
+ """
+ 
+ import os
++import re
+ import threading
+ from collections.abc import Iterator
+ from functools import partial
+@@ -48,12 +49,17 @@ def test_team_selection_and_model_choices(
+     expect(page.get_by_role("checkbox", name="Claude")).to_be_checked()
+     page.get_by_role("combobox", name="Model for Codex").select_option("example-model")
+     expect(page.get_by_role("combobox", name="Model for Codex")).to_have_value("example-model")
+-    expect(
+-        page.get_by_role("checkbox", name="Another agent Authentication required")
+-    ).to_be_disabled()
+-    page.get_by_role("button", name="Solo One agent handles the work").click()
++    expect(page.get_by_role("checkbox", name="Another agent")).to_have_count(0)
++    page.get_by_role("button", name=re.compile("Show agents needing setup")).click()
++    expect(page.get_by_role("checkbox", name="Another agent")).to_be_disabled()
++    page.get_by_role("button", name=re.compile("Hide agents needing setup")).click()
++    page.get_by_role("button", name="Solo", exact=True).click()
+     expect(page.get_by_role("checkbox")).to_have_count(0)
+-    page.get_by_role("button", name="Team A lead with collaborators").click()
++    expect(page.get_by_text("Native subagents remain available in every mode.")).to_be_visible()
++    page.get_by_role("button", name="Auto Recommended", exact=True).click()
++    expect(page.get_by_role("checkbox")).to_have_count(0)
++    expect(page.get_by_text("The lead chooses useful collaborators", exact=False)).to_be_visible()
++    page.get_by_role("button", name="Team", exact=True).click()
+     expect(page.get_by_role("checkbox", name="Claude")).to_be_checked()
+     assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+ 
+diff --git a/tests/inner/test_ae_team.py b/tests/inner/test_ae_team.py
+index 52f6b00b64ff7cfdf54137743b197a71aaa261af..10a0e54142f80c3bd92afff1c7b3656dc27cfc0e 100644
+--- a/tests/inner/test_ae_team.py
++++ b/tests/inner/test_ae_team.py
+@@ -52,12 +52,40 @@ def test_malformed_rosters_do_not_break_messages(raw: str) -> None:
+     store.get_conversation.assert_not_called()
+ 
+ 
+-def test_solo_tells_lead_to_stop_new_delegation_without_querying_children() -> None:
++def test_unset_preference_delivers_auto_without_resolving_children() -> None:
++    store = Mock()
++    notice = team_notice(conversation("parent"), store)
++    assert notice == {"ae_team": {"mode": "auto", "members": []}}
++    assert "Auto collaboration" in (render_team_notice(notice) or "")
++    store.get_conversation.assert_not_called()
++
++
++def test_solo_preserves_native_helpers_without_resolving_old_team_sessions() -> None:
+     store = Mock()
+     notice = team_notice(
+         conversation("parent", labels={TEAM_LABEL: '{"version":1,"mode":"solo"}'}), store
+     )
+-    assert "do not delegate new work" in (render_team_notice(notice) or "")
++    text = render_team_notice(notice) or ""
++    assert "native in-harness subagents" in text
++    assert "Native helpers remain available" in text
++    assert "Do not start additional cross-agent collaborations" in text
++    store.get_conversation.assert_not_called()
++
++
++def test_auto_discards_old_roster_and_uses_available_agents_as_needed() -> None:
++    store = Mock()
++    notice = team_notice(
++        conversation(
++            "parent",
++            labels={TEAM_LABEL: '{"version":1,"mode":"auto","members":[{"sessionId":"old"}]}'},
++        ),
++        store,
++    )
++    assert notice == {"ae_team": {"mode": "auto", "members": []}}
++    text = render_team_notice(notice) or ""
++    assert "configured, reachable agents" in text
++    assert "native in-harness subagents" in text
++    assert "old" not in text
+     store.get_conversation.assert_not_called()
+ 
+ 
+diff --git a/tests/server/integration/test_ae_team.py b/tests/server/integration/test_ae_team.py
+index e805ae5ec1b0e61156455c061dc520fe3fb62c58..1a2c8f6cd40531a373142ac4da18f3f3addf2ec9 100644
+--- a/tests/server/integration/test_ae_team.py
++++ b/tests/server/integration/test_ae_team.py
+@@ -14,8 +14,9 @@ from tests.server.helpers import create_test_agent
+ 
+ 
+ @pytest.mark.parametrize("native", [False, True])
++@pytest.mark.parametrize("mode", [None, "auto", "solo", "team"])
+ async def test_team_forward_preserves_authored_message(
+-    client: httpx.AsyncClient, db_uri: str, native: bool
++    client: httpx.AsyncClient, db_uri: str, native: bool, mode: str | None
+ ) -> None:
+     agent = await create_test_agent(client, name="team-lead")
+     created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
+@@ -31,13 +32,15 @@ async def test_team_forward_preserves_authored_message(
+         TEAM_LABEL: json.dumps(
+             {
+                 "version": 1,
+-                "mode": "team",
++                "mode": mode,
+                 "members": [
+                     {"sessionId": child.id},
+                 ],
+             }
+         )
+     }
++    if mode is None:
++        labels = {}
+     if native:
+         labels.update({"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"})
+     store.set_labels(parent_id, labels)
+@@ -67,7 +70,12 @@ async def test_team_forward_preserves_authored_message(
+     assert event.data["content"] == content
+     forwarded = sent[-1]["content"]
+     assert forwarded[0] == content[0]
+-    assert child.id in framework_notices(forwarded)[0]
++    notice = framework_notices(forwarded)[0]
++    if mode == "team":
++        assert child.id in notice
++    else:
++        assert child.id not in notice
++        assert "native in-harness subagents" in notice
+     items = store.list_items(parent_id).data
+     if native:
+         assert not items  # Native transcript forwarder remains the single writer.
+diff --git a/web/src/components/AeTeamControl.stories.tsx b/web/src/components/AeTeamControl.stories.tsx
+index dd40022af4b4d82829b8ca60400927c009bd0ac7..de9d9d77c4b217ba845c8451c25559a8d175b7dd 100644
+--- a/web/src/components/AeTeamControl.stories.tsx
++++ b/web/src/components/AeTeamControl.stories.tsx
+@@ -4,6 +4,7 @@ import type { Meta, StoryObj } from "@storybook/react-vite";
+ import type { AvailableAgent } from "@/hooks/useAvailableAgents";
+ import type { Host } from "@/hooks/useHosts";
+ import type { AeTeam } from "@/lib/aeTeam";
++import { aeTeamLeadName, type AeTeamLead } from "@/lib/aeTeamOptions";
+ import { AeTeamEditor } from "./AeTeamControl";
+ 
+ const agents: AvailableAgent[] = [
+@@ -14,6 +15,7 @@ const agents: AvailableAgent[] = [
+     description: null,
+     harness: "codex-native",
+     skills: [],
++    builtin: true,
+   },
+   {
+     id: "claude",
+@@ -22,6 +24,7 @@ const agents: AvailableAgent[] = [
+     description: null,
+     harness: "claude-native",
+     skills: [],
++    builtin: true,
+   },
+   {
+     id: "other",
+@@ -30,6 +33,16 @@ const agents: AvailableAgent[] = [
+     description: null,
+     harness: "other",
+     skills: [],
++    builtin: true,
++  },
++  {
++    id: "orchestrator",
++    name: "orchestrator",
++    display_name: "Orchestrator",
++    description: "A general planning agent.",
++    harness: "claude-sdk",
++    skills: [],
++    builtin: true,
+   },
+ ];
+ const host: Host = {
+@@ -37,34 +50,89 @@ const host: Host = {
+   name: "Workstation",
+   owner: "demo",
+   status: "online",
+-  configured_harnesses: { "codex-native": true, "claude-native": true, other: "needs-auth" },
++  configured_harnesses: {
++    "codex-native": true,
++    "claude-native": true,
++    "claude-sdk": true,
++    other: "needs-auth",
++  },
++};
++const lead: AeTeamLead = {
++  agentId: "codex",
++  agentName: "codex",
++  harness: "codex-native",
++  labels: {},
+ };
+-function TeamDemo() {
++const memberFor = (agent: AvailableAgent) => ({
++  agentId: agent.id,
++  agentName: agent.name,
++  displayName: agent.display_name,
++  model: null,
++});
++const mixedTeam: AeTeam = { version: 1, mode: "team", members: agents.slice(0, 2).map(memberFor) };
++const automatic: AeTeam = { version: 1, mode: "auto", members: [] };
++const aliases: AvailableAgent[] = [
++  ...agents,
++  {
++    ...agents[0],
++    id: "work",
++    name: "codex-work",
++    description: "A configured agent for implementation.",
++    builtin: false,
++  },
++  {
++    ...agents[0],
++    id: "review",
++    name: "codex-review",
++    description: "A configured agent for review.",
++    builtin: false,
++  },
++  {
++    ...agents[3],
++    id: "custom",
++    name: "product-reviewer",
++    display_name: "Product reviewer",
++    builtin: false,
++  },
++];
++function TeamDemo({
++  initialDraft = automatic,
++  availableAgents = agents,
++  selectedHost = host,
++  selectedLead = lead,
++}: {
++  initialDraft?: AeTeam;
++  availableAgents?: AvailableAgent[];
++  selectedHost?: Host;
++  selectedLead?: AeTeamLead;
++}) {
+   const [client] = useState(() => {
+     const query = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+-    for (const agent of agents)
++    for (const agent of availableAgents)
+       query.setQueryData(
+-        ["host-model-options", "demo", agent.harness],
++        ["host-model-options", selectedHost.host_id, agent.harness],
+         [{ id: "example-model", displayName: "Available model", isDefault: true }],
+       );
+     return query;
+   });
+-  const [draft, setDraft] = useState<AeTeam>({
+-    version: 1,
+-    mode: "team",
+-    members: agents
+-      .slice(0, 2)
+-      .map((a) => ({ agentId: a.id, agentName: a.name, displayName: a.display_name, model: null })),
+-  });
++  const [draft, setDraft] = useState(initialDraft);
+   return (
+     <QueryClientProvider client={client}>
+       <div className="w-full max-w-md space-y-4 rounded-xl border bg-popover p-4 text-popover-foreground shadow-md">
+         <h2 className="text-lg font-semibold">Who works on this?</h2>
+         <div className="rounded-xl bg-muted/50 p-3">
+           <p className="text-xs text-muted-foreground">Lead / orchestrator</p>
+-          <p className="text-sm font-medium">Codex</p>
++          <p className="break-words text-sm font-medium">
++            {aeTeamLeadName(selectedLead, availableAgents)}
++          </p>
+         </div>
+-        <AeTeamEditor draft={draft} onChange={setDraft} agents={agents} host={host} />
++        <AeTeamEditor
++          draft={draft}
++          onChange={setDraft}
++          agents={availableAgents}
++          host={selectedHost}
++          lead={selectedLead}
++        />
+         <p className="text-xs text-muted-foreground">Applies to your next message.</p>
+       </div>
+     </QueryClientProvider>
+@@ -74,4 +142,34 @@ export default { title: "Components/AeTeamControl", component: TeamDemo } satisf
+   typeof TeamDemo
+ >;
+ type Story = StoryObj<typeof TeamDemo>;
+-export const MixedTeam: Story = {};
++export const Auto: Story = {};
++export const Solo: Story = { args: { initialDraft: { version: 1, mode: "solo", members: [] } } };
++export const MixedTeam: Story = { args: { initialDraft: mixedTeam } };
++export const CustomAgentAliases: Story = {
++  args: {
++    availableAgents: aliases,
++    initialDraft: { version: 1, mode: "team", members: aliases.slice(4, 6).map(memberFor) },
++    selectedLead: { ...lead, agentId: "work", agentName: "codex-work" },
++  },
++};
++export const SelectedUnavailable: Story = {
++  args: {
++    initialDraft: {
++      version: 1,
++      mode: "team",
++      members: [
++        memberFor(agents[1]),
++        memberFor(agents[2]),
++        {
++          agentId: "removed",
++          agentName: "former-reviewer",
++          displayName: "Former reviewer",
++          model: null,
++        },
++      ],
++    },
++  },
++};
++export const ReadinessUnavailable: Story = {
++  args: { initialDraft: mixedTeam, selectedHost: { ...host, configured_harnesses: {} } },
++};
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+index 02fdee561c36fd1b950d5ef442d8692f2cc10b71..94882d40d501f8223775df9e423b3050e6273b66 100644
+--- a/web/src/components/AeTeamControl.test.tsx
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -1,11 +1,22 @@
+-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { useState } from "react";
++import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { AeTeamControl } from "./AeTeamControl";
+-import { saveAeTeam } from "@/lib/aeTeam";
++import type { AvailableAgent } from "@/hooks/useAvailableAgents";
++import type { Host } from "@/hooks/useHosts";
++import { childSessionsQueryKey } from "@/hooks/useChildSessions";
++import {
++  AE_TEAM_LABEL,
++  AE_TEAM_LIMIT,
++  saveAeTeam,
++  type AeTeam,
++  type AeTeamMember,
++} from "@/lib/aeTeam";
+ import type * as AeTeamModule from "@/lib/aeTeam";
+ import type { Session } from "@/lib/types";
++import { AeTeamControl, AeTeamEditor } from "./AeTeamControl";
+ 
++const mocks = vi.hoisted(() => ({ agents: vi.fn(), hosts: vi.fn(), models: vi.fn() }));
+ vi.mock("@/lib/aeTeam", async (original) => ({
+   ...(await original<typeof AeTeamModule>()),
+   saveAeTeam: vi.fn(),
+@@ -13,113 +24,452 @@ vi.mock("@/lib/aeTeam", async (original) => ({
+ // Change lead opens AppShell's fork dialog; the control renders without AppShell here.
+ const forkDialog = vi.hoisted(() => ({ canFork: true, openForkDialog: vi.fn() }));
+ vi.mock("@/shell/ForkDialogContext", () => ({ useForkDialog: () => forkDialog }));
+-vi.mock("@/hooks/useAvailableAgents", () => ({
+-  useAvailableAgents: () => ({
+-    data: [
+-      { id: "codex", name: "codex", display_name: "Codex", harness: "codex-native", skills: [] },
+-      {
+-        id: "claude",
+-        name: "claude",
+-        display_name: "Claude",
+-        harness: "claude-native",
+-        skills: [],
+-      },
+-      {
+-        id: "other",
+-        name: "other",
+-        display_name: "Other agent",
+-        harness: "unavailable",
+-        skills: [],
+-      },
+-    ],
+-  }),
+-}));
+-vi.mock("@/hooks/useHosts", () => ({
+-  useHosts: () => ({
+-    data: [
+-      {
+-        host_id: "host",
+-        status: "online",
+-        configured_harnesses: {
+-          "codex-native": true,
+-          "claude-native": true,
+-          unavailable: "needs-auth",
+-        },
+-      },
+-    ],
+-  }),
+-  useHostModelOptions: () => ({ data: [{ id: "test-model", displayName: "Available model" }] }),
+-}));
++vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: mocks.agents }));
++vi.mock("@/hooks/useHosts", () => ({ useHosts: mocks.hosts, useHostModelOptions: mocks.models }));
+ 
+-const session = { id: "parent", agentName: "Codex", hostId: "host", labels: {} } as Session;
++const codex: AvailableAgent = {
++  id: "codex",
++  name: "codex-native-ui",
++  display_name: "Codex",
++  harness: "codex-native",
++  description: null,
++  skills: [],
++  builtin: true,
++};
++const claude: AvailableAgent = {
++  ...codex,
++  id: "claude",
++  name: "claude-native-ui",
++  display_name: "Claude Code",
++  harness: "claude-native",
++};
++const unavailable: AvailableAgent = {
++  ...codex,
++  id: "other",
++  name: "other",
++  display_name: "Another agent",
++  harness: "unavailable",
++};
++const generic: AvailableAgent = {
++  ...codex,
++  id: "orchestrator",
++  name: "orchestrator",
++  display_name: "Orchestrator",
++  harness: "claude-sdk",
++};
++const custom: AvailableAgent = {
++  ...generic,
++  id: "reviewer",
++  name: "product-reviewer",
++  display_name: "Product reviewer",
++  builtin: false,
++};
++const agents = [generic, unavailable, codex, claude, custom];
++const host: Host = {
++  host_id: "host",
++  name: "Workstation",
++  owner: "test",
++  status: "online",
++  configured_harnesses: {
++    "codex-native": true,
++    "claude-native": true,
++    "claude-sdk": true,
++    unavailable: "needs-auth",
++  },
++};
++const session = {
++  id: "parent",
++  agentId: "codex",
++  agentName: codex.name,
++  harness: codex.harness,
++  hostId: "host",
++  labels: {},
++} as Session;
++const memberFor = (agent: AvailableAgent, overrides: Partial<AeTeamMember> = {}): AeTeamMember => ({
++  agentId: agent.id,
++  agentName: agent.name,
++  displayName: agent.display_name,
++  model: null,
++  ...overrides,
++});
++const sessionWithTeam = (members: AeTeamMember[], overrides: Partial<AeTeam> = {}): Session => ({
++  ...session,
++  labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "team", members, ...overrides }) },
++});
+ function mount(props: Partial<Parameters<typeof AeTeamControl>[0]> = {}) {
+   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+-  return render(
++  const view = (next = {}) => (
+     <QueryClientProvider client={client}>
+-      <AeTeamControl session={session} {...props} />
+-    </QueryClientProvider>,
++      <AeTeamControl session={session} {...props} {...next} />
++    </QueryClientProvider>
+   );
++  const rendered = render(view());
++  return {
++    client,
++    rerender: (next: Partial<Parameters<typeof AeTeamControl>[0]> = {}) =>
++      rendered.rerender(view(next)),
++  };
++}
++function openPicker() {
++  fireEvent.click(screen.getByRole("button", { name: /^(Collaboration:|Team:)/ }));
+ }
+-beforeEach(() => vi.resetAllMocks());
++function chooseTeam() {
++  openPicker();
++  fireEvent.click(screen.getByRole("button", { name: "Team" }));
++}
++const saveButton = () => screen.getByRole("button", { name: "Save selection" });
++
++beforeEach(() => {
++  vi.resetAllMocks();
++  mocks.agents.mockReturnValue({ data: agents, isLoading: false, isError: false });
++  mocks.hosts.mockReturnValue({ data: [host] });
++  mocks.models.mockReturnValue({ data: [{ id: "test-model", displayName: "Available model" }] });
++  vi.mocked(saveAeTeam).mockResolvedValue(session);
++});
+ afterEach(cleanup);
+ 
+ describe("composer team picker", () => {
+-  it("opens and cancels without creating or saving a team", () => {
++  it("defaults to Auto and explains native helpers in every mode without saving", () => {
+     mount();
+-    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
+-    fireEvent.click(screen.getByRole("button", { name: /A lead with collaborators/ }));
+-    fireEvent.click(screen.getByRole("checkbox", { name: "Claude" }));
++    expect(screen.getByRole("button", { name: "Collaboration: Auto" })).toHaveTextContent("Auto");
++    openPicker();
++    expect(screen.getByRole("button", { name: "Auto Recommended" })).toHaveAttribute(
++      "aria-pressed",
++      "true",
++    );
++    expect(screen.getByText(/The lead chooses useful collaborators/)).toBeInTheDocument();
++    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
++    fireEvent.click(screen.getByRole("button", { name: "Solo" }));
++    expect(screen.getByText(/The lead works with its native helpers/)).toBeInTheDocument();
++    expect(
++      screen.getByText("Native subagents remain available in every mode."),
++    ).toBeInTheDocument();
++    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
++    expect(saveAeTeam).not.toHaveBeenCalled();
++  });
++
++  it("retains a draft across modes and discards it on cancel", () => {
++    mount();
++    chooseTeam();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
++    fireEvent.change(screen.getByRole("combobox", { name: "Model for Claude Code" }), {
++      target: { value: "test-model" },
++    });
++    for (const mode of ["Solo", "Auto Recommended"]) {
++      fireEvent.click(screen.getByRole("button", { name: mode }));
++      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
++      fireEvent.click(screen.getByRole("button", { name: "Team" }));
++      expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeChecked();
++      expect(screen.getByRole("combobox", { name: "Model for Claude Code" })).toHaveValue(
++        "test-model",
++      );
++    }
+     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+     expect(saveAeTeam).not.toHaveBeenCalled();
++    chooseTeam();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).not.toBeChecked();
++    expect(saveButton()).toBeDisabled();
++  });
++
++  it("shows native coding and custom agents first, with a different-provider recommendation", () => {
++    mount();
++    chooseTeam();
++    expect(
++      screen.getAllByRole("checkbox").map((input) => input.getAttribute("aria-label")),
++    ).toEqual(["Claude Code", "Codex", "Product reviewer"]);
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toHaveAccessibleDescription(
++      "Recommended: different provider for independent review.",
++    );
++    expect(
++      screen.getByText("Each collaborator uses its configured account and its own context."),
++    ).toBeInTheDocument();
++    expect(screen.queryByText(/own account allowance|separate accounts/i)).not.toBeInTheDocument();
++    expect(screen.queryByRole("checkbox", { name: "Orchestrator" })).not.toBeInTheDocument();
++    const disclosure = screen.getByRole("button", { name: /Other connected agents/ });
++    expect(disclosure).toHaveAttribute("aria-expanded", "false");
++    fireEvent.click(disclosure);
++    expect(screen.getByRole("checkbox", { name: "Orchestrator" })).toBeEnabled();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Orchestrator" }));
++    fireEvent.click(screen.getByRole("button", { name: "Solo" }));
++    fireEvent.click(screen.getByRole("button", { name: "Team" }));
++    expect(screen.getByRole("checkbox", { name: "Orchestrator" })).toBeChecked();
+   });
+ 
+-  it("saves both collaborators with their selected models", async () => {
+-    vi.mocked(saveAeTeam).mockResolvedValue(session);
++  it("keeps agents needing setup hidden until disclosed and then disabled", () => {
+     mount();
+-    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
+-    fireEvent.click(screen.getByRole("button", { name: /A lead with collaborators/ }));
+-    expect(screen.getByRole("button", { name: "Save selection" })).toBeDisabled();
++    chooseTeam();
++    expect(screen.queryByRole("checkbox", { name: "Another agent" })).not.toBeInTheDocument();
++    const disclosure = screen.getByRole("button", { name: /Show agents needing setup/ });
++    expect(disclosure).toHaveAttribute("aria-expanded", "false");
++    fireEvent.click(disclosure);
++    expect(screen.getByRole("checkbox", { name: "Another agent" })).toBeDisabled();
++    expect(screen.getByRole("checkbox", { name: "Another agent" })).toHaveAccessibleDescription(
++      /Authentication required/,
++    );
++    fireEvent.click(screen.getByRole("button", { name: /Hide agents needing setup/ }));
++    expect(screen.queryByRole("checkbox", { name: "Another agent" })).not.toBeInTheDocument();
++  });
++
++  it("saves both collaborators and their models without reordering on model edits", async () => {
++    const { client } = mount();
++    const invalidate = vi.spyOn(client, "invalidateQueries");
++    chooseTeam();
++    expect(saveButton()).toBeDisabled();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Codex" }));
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
+     fireEvent.change(screen.getByRole("combobox", { name: "Model for Codex" }), {
+       target: { value: "test-model" },
+     });
+-    fireEvent.click(screen.getByRole("checkbox", { name: "Claude" }));
+-    expect(screen.getByRole("checkbox", { name: /Other agent/ })).toBeDisabled();
+-    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
++    fireEvent.click(saveButton());
++    await waitFor(() =>
++      expect(saveAeTeam).toHaveBeenCalledWith("parent", {
++        version: 1,
++        mode: "team",
++        members: [memberFor(codex, { model: "test-model" }), memberFor(claude)],
++      }),
++    );
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++    expect(client.getQueryData(["session", "parent"])).toEqual(session);
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("parent") });
++  });
++
++  it.each(["Auto Recommended", "Solo"])(
++    "saves %s without requiring ready collaborators",
++    async (mode) => {
++      mocks.agents.mockReturnValue({ data: [] });
++      mocks.hosts.mockReturnValue({ data: [] });
++      mount({ session: sessionWithTeam([memberFor(unavailable)], { routingBeforeTeam: "on" }) });
++      openPicker();
++      expect(saveButton()).toBeDisabled();
++      fireEvent.click(screen.getByRole("button", { name: mode }));
++      expect(saveButton()).toBeEnabled();
++      fireEvent.click(saveButton());
++      await waitFor(() =>
++        expect(saveAeTeam).toHaveBeenCalledWith(
++          "parent",
++          expect.objectContaining({
++            mode: mode === "Solo" ? "solo" : "auto",
++            routingBeforeTeam: "on",
++          }),
++        ),
++      );
++      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++    },
++  );
++
++  it("preserves custom aliases and independent model choices by agent id", async () => {
++    const work = { ...codex, id: "work", name: "codex-work", builtin: false };
++    const personal = { ...codex, id: "personal", name: "codex-personal", builtin: false };
++    mocks.agents.mockReturnValue({ data: [codex, work, personal] });
++    mount({ session: { ...session, agentId: work.id, agentName: work.name } });
++    chooseTeam();
++    fireEvent.click(screen.getByRole("checkbox", { name: "codex-work" }));
++    fireEvent.click(screen.getByRole("checkbox", { name: "codex-personal" }));
++    fireEvent.change(screen.getByRole("combobox", { name: "Model for codex-work" }), {
++      target: { value: "test-model" },
++    });
++    expect(screen.getByRole("combobox", { name: "Model for codex-personal" })).toHaveValue("");
++    expect(mocks.agents).toHaveBeenLastCalledWith({ enabled: true, pinnedAgentIds: ["work"] });
++    fireEvent.click(saveButton());
+     await waitFor(() =>
+       expect(saveAeTeam).toHaveBeenCalledWith("parent", {
+         version: 1,
+         mode: "team",
+         members: [
+-          expect.objectContaining({ agentId: "codex", model: "test-model" }),
+-          expect.objectContaining({ agentId: "claude", model: null }),
++          memberFor(work, { displayName: "codex-work", model: "test-model" }),
++          memberFor(personal, { displayName: "codex-personal" }),
+         ],
+       }),
+     );
+     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+   });
+ 
+-  it("keeps failed saves visible and preserves the selection for retry", async () => {
+-    vi.mocked(saveAeTeam).mockRejectedValue(new Error("Host offline"));
++  it("keeps selected setup-required and missing agents visible and removable", async () => {
++    const missing = memberFor({
++      ...codex,
++      id: "deleted",
++      name: "former-reviewer",
++      display_name: "Former reviewer",
++    });
++    mount({ session: sessionWithTeam([memberFor(claude), memberFor(unavailable), missing]) });
++    openPicker();
++    expect(screen.getByRole("checkbox", { name: "Another agent" })).toBeChecked();
++    expect(screen.getByRole("checkbox", { name: "Another agent" })).toBeEnabled();
++    expect(screen.getByRole("checkbox", { name: "Another agent" })).toHaveAccessibleDescription(
++      /Remove this collaborator or wait until it is ready/,
++    );
++    expect(
++      screen.queryByRole("combobox", { name: "Model for Another agent" }),
++    ).not.toBeInTheDocument();
++    expect(screen.getByText("Former reviewer · Unavailable")).toBeInTheDocument();
++    expect(saveButton()).toBeDisabled();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Another agent" }));
++    expect(screen.queryByRole("checkbox", { name: "Another agent" })).not.toBeInTheDocument();
++    expect(saveButton()).toBeDisabled();
++    fireEvent.click(screen.getByRole("button", { name: "Remove Former reviewer" }));
++    expect(saveButton()).toBeEnabled();
++    fireEvent.click(saveButton());
++    await waitFor(() =>
++      expect(saveAeTeam).toHaveBeenCalledWith("parent", {
++        version: 1,
++        mode: "team",
++        members: [memberFor(claude)],
++      }),
++    );
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++  });
++
++  it("keeps selected agents removable if the host goes offline", () => {
++    const view = mount({ session: sessionWithTeam([memberFor(claude)]) });
++    openPicker();
++    expect(saveButton()).toBeEnabled();
++    mocks.hosts.mockReturnValue({ data: [{ ...host, status: "offline" }] });
++    view.rerender();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeChecked();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeEnabled();
++    expect(saveButton()).toBeDisabled();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
++    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
++    expect(screen.getByText("No collaborators are ready on this host yet.")).toBeInTheDocument();
++  });
++
++  it.each([undefined, {}])(
++    "hides unverified choices with readiness map %j while allowing removal",
++    (configured_harnesses) => {
++      mocks.hosts.mockReturnValue({ data: [{ ...host, configured_harnesses }] });
++      mount({ session: sessionWithTeam([memberFor(claude)]) });
++      openPicker();
++      expect(screen.getAllByRole("checkbox")).toHaveLength(1);
++      expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeEnabled();
++      expect(screen.getByRole("checkbox", { name: "Claude Code" })).toHaveAccessibleDescription(
++        /Readiness unavailable/,
++      );
++      expect(
++        screen.queryByRole("button", { name: /Other connected agents/ }),
++      ).not.toBeInTheDocument();
++      expect(saveButton()).toBeDisabled();
++      fireEvent.click(screen.getByRole("button", { name: /Show agents needing setup/ }));
++      expect(screen.getByRole("checkbox", { name: "Codex" })).toBeDisabled();
++      expect(screen.getByRole("checkbox", { name: "Codex" })).toHaveAccessibleDescription(
++        /Readiness unavailable/,
++      );
++      fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
++      expect(screen.getByRole("checkbox", { name: "Claude Code" })).not.toBeChecked();
++      expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
++    },
++  );
++
++  it("preserves a saved model absent from the catalog and offers the default after a catalog failure", async () => {
++    mocks.models.mockReturnValue({ data: [], isError: true });
++    mount({ session: sessionWithTeam([memberFor(claude, { model: "previous-model" })]) });
++    openPicker();
++    const model = screen.getByRole("combobox", { name: "Model for Claude Code" });
++    expect(model).toHaveValue("previous-model");
++    expect(
++      screen.getByText("Model list unavailable. The agent default is still available."),
++    ).toBeInTheDocument();
++    fireEvent.change(model, { target: { value: "" } });
++    fireEvent.click(saveButton());
++    await waitFor(() =>
++      expect(saveAeTeam).toHaveBeenCalledWith("parent", {
++        version: 1,
++        mode: "team",
++        members: [memberFor(claude)],
++      }),
++    );
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++  });
++
++  it("keeps failed saves visible and retries with the same selection", async () => {
++    vi.mocked(saveAeTeam).mockRejectedValueOnce(new Error("Host offline"));
+     mount();
+-    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
+-    fireEvent.click(screen.getByRole("button", { name: /A lead with collaborators/ }));
+-    fireEvent.click(screen.getByRole("checkbox", { name: "Claude" }));
+-    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
++    chooseTeam();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
++    fireEvent.click(saveButton());
+     expect(await screen.findByRole("alert")).toHaveTextContent("Host offline");
+-    expect(screen.getByRole("checkbox", { name: "Claude" })).toBeChecked();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeChecked();
++    expect(saveButton()).toBeEnabled();
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++    expect(vi.mocked(saveAeTeam).mock.calls[1]).toEqual(vi.mocked(saveAeTeam).mock.calls[0]);
+   });
+ 
+-  it("allows lead switching only when the turn has finished", () => {
+-    mount({ working: true });
+-    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++  it("prevents duplicate saves and editing while a save is pending", async () => {
++    let resolveSave!: (updated: Session) => void;
++    vi.mocked(saveAeTeam).mockReturnValue(
++      new Promise((resolve) => {
++        resolveSave = resolve;
++      }),
++    );
++    mount();
++    chooseTeam();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
++    fireEvent.click(saveButton());
++    expect(saveButton()).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
+     expect(screen.getByRole("button", { name: "Change lead" })).toBeDisabled();
++    fireEvent.click(saveButton());
++    fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
++    expect(screen.getByRole("dialog")).toBeInTheDocument();
++    expect(saveAeTeam).toHaveBeenCalledTimes(1);
++    await act(async () => resolveSave(session));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+   });
+ 
+-  it("opens the existing history-preserving lead switcher", () => {
+-    mount();
+-    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++  it("allows saving and lead switching only when the current turn has finished", () => {
++    const view = mount({ working: true });
++    openPicker();
++    expect(saveButton()).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Change lead" })).toBeDisabled();
++    expect(screen.getByText(/after this turn finishes/)).toBeInTheDocument();
++    view.rerender({ working: false });
++    expect(saveButton()).toBeEnabled();
+     fireEvent.click(screen.getByRole("button", { name: "Change lead" }));
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+     expect(forkDialog.openForkDialog).toHaveBeenCalledWith({ sourceSessionId: "parent" });
+   });
++
++  it("disables a read-only picker", () => {
++    mount({ disabled: true });
++    expect(screen.getByRole("button", { name: "Collaboration: Auto" })).toBeDisabled();
++    openPicker();
++    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++  });
++
++  it("reports agent loading failures and keeps an empty Team unsavable", () => {
++    mocks.agents.mockReturnValue({ data: [], isError: true });
++    mount();
++    chooseTeam();
++    expect(screen.getByRole("alert")).toHaveTextContent("Could not load available agents.");
++    expect(saveButton()).toBeDisabled();
++  });
++});
++
++describe("team editor", () => {
++  it("enforces the member limit while still allowing removal and model changes", () => {
++    const choices = Array.from({ length: AE_TEAM_LIMIT + 1 }, (_, index) => ({
++      ...custom,
++      id: `custom-${index}`,
++      name: `Custom ${index}`,
++      display_name: `Custom ${index}`,
++    }));
++    function Editor() {
++      const [draft, setDraft] = useState<AeTeam>({
++        version: 1,
++        mode: "team",
++        members: choices.slice(0, AE_TEAM_LIMIT).map((agent) => memberFor(agent)),
++      });
++      return <AeTeamEditor draft={draft} onChange={setDraft} agents={choices} host={host} />;
++    }
++    render(<Editor />);
++    expect(screen.getByText(`${AE_TEAM_LIMIT}/${AE_TEAM_LIMIT}`)).toBeInTheDocument();
++    expect(screen.getByRole("checkbox", { name: `Custom ${AE_TEAM_LIMIT}` })).toBeDisabled();
++    expect(screen.getByRole("combobox", { name: "Model for Custom 0" })).toBeEnabled();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Custom 0" }));
++    expect(screen.getByRole("checkbox", { name: `Custom ${AE_TEAM_LIMIT}` })).toBeEnabled();
++    fireEvent.click(screen.getByRole("checkbox", { name: `Custom ${AE_TEAM_LIMIT}` }));
++    expect(screen.getByRole("checkbox", { name: "Custom 0" })).toBeDisabled();
++  });
+ });
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+index bb2c0046d952332590bd36c2335ecec2ebe06e62..f6ed7ee6378b209bc2b69ed5de16599b6c00a7c7 100644
+--- a/web/src/components/AeTeamControl.tsx
++++ b/web/src/components/AeTeamControl.tsx
+@@ -1,10 +1,17 @@
+-import { useState } from "react";
+-import { UsersRound } from "lucide-react";
++import { useId, useState } from "react";
++import { ChevronDown, UsersRound } from "lucide-react";
+ import { useQueryClient } from "@tanstack/react-query";
+ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+ import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+ import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+-import { harnessReadinessOnHost } from "@/lib/harnessSetup";
++import {
++  aeTeamAgentName,
++  aeTeamLeadName,
++  aeTeamOptions,
++  aeTeamReadiness,
++  type AeTeamLead,
++  type AeTeamOption,
++} from "@/lib/aeTeamOptions";
+ import {
+   readAeTeam,
+   saveAeTeam,
+@@ -25,19 +32,20 @@ import {
+ } from "./ui/dialog";
+ 
+ function MemberChoice({
+-  agent,
++  option,
+   host,
+   member,
+   disabled,
+   onChange,
+ }: {
+-  agent: AvailableAgent;
++  option: AeTeamOption;
+   host: Host | null;
+   member: AeTeamMember | undefined;
+   disabled: boolean;
+   onChange: (member: AeTeamMember | null) => void;
+ }) {
+-  const readiness = harnessReadinessOnHost(agent.harness, host);
++  const { agent, name, readiness, recommendation } = option;
++  const descriptionId = useId();
+   const catalog = useHostModelOptions(
+     host?.host_id ?? null,
+     agent.harness ?? "",
+@@ -48,36 +56,48 @@ function MemberChoice({
+     onChange({
+       agentId: agent.id,
+       agentName: agent.name,
+-      displayName: agent.display_name,
++      displayName: name,
+       model,
+     });
+   return (
+     <div
+       className={`rounded-xl border p-3 ${member ? "border-primary/50 bg-primary/5" : "border-border"}`}
+     >
+-      <label className="flex cursor-pointer items-center gap-3">
++      <label className="flex items-start gap-3">
+         <input
+           type="checkbox"
+-          className="size-4 accent-primary"
++          aria-label={name}
++          aria-describedby={descriptionId}
++          className="mt-0.5 size-4 shrink-0 accent-primary"
+           checked={!!member}
+           disabled={disabled || (!member && !readiness.selectable)}
+           onChange={(e) => (e.target.checked ? choose(null) : onChange(null))}
+         />
+-        <span className="min-w-0 flex-1 text-sm font-medium">{agent.display_name}</span>
++        <span className="min-w-0 flex-1 break-words text-sm font-medium">{name}</span>
++      </label>
++      <div id={descriptionId} className="ml-7 space-y-1 text-xs text-muted-foreground">
++        {recommendation && <p className="mt-1 text-primary">{recommendation}</p>}
++        {agent.description && <p className="mt-1 line-clamp-2 break-words">{agent.description}</p>}
+         {readiness.explanation && (
+-          <span className="text-xs text-muted-foreground">{readiness.explanation.label}</span>
++          <p className="mt-1">
++            <span className="font-medium">{readiness.explanation.label}. </span>
++            {readiness.explanation.description}
++            {member &&
++              !readiness.selectable &&
++              " Remove this collaborator or wait until it is ready before saving this team."}
++          </p>
+         )}
+-      </label>
+-      {member && (
++      </div>
++      {member && readiness.selectable && (
+         <div className="mt-3 space-y-2">
+           <label className="block text-xs text-muted-foreground">
+-            Model for {agent.display_name}
++            Model for {name}
+             <select
+-              aria-label={`Model for ${agent.display_name}`}
++              aria-label={`Model for ${name}`}
+               value={member.model ?? ""}
+               disabled={disabled}
+               onChange={(e) => choose(e.target.value || null)}
+-              className="mt-1 w-full rounded-md border border-input bg-background px-2 py-2 text-sm text-foreground"
++              className="mt-1 w-full min-w-0 rounded-md border border-input bg-background px-2 py-2 text-sm text-foreground"
+             >
+               <option value="">Agent default</option>
+               {member.model && !models.some((m) => m.id === member.model) && (
+@@ -96,9 +116,6 @@ function MemberChoice({
+               Model list unavailable. The agent default is still available.
+             </p>
+           )}
+-          {readiness.explanation && (
+-            <p className="text-xs text-muted-foreground">{readiness.explanation.description}</p>
+-          )}
+         </div>
+       )}
+     </div>
+@@ -110,33 +127,85 @@ export function AeTeamEditor({
+   onChange,
+   agents,
+   host,
++  lead,
+   disabled = false,
+ }: {
+   draft: AeTeam;
+   onChange: (draft: AeTeam) => void;
+   agents: AvailableAgent[];
+   host: Host | null;
++  lead?: AeTeamLead;
+   disabled?: boolean;
+ }) {
++  const [showSetup, setShowSetup] = useState(false);
++  const [showOther, setShowOther] = useState(false);
++  const setupId = useId();
++  const otherId = useId();
++  const options = aeTeamOptions(agents, host, lead);
++  const visible = options.filter(
++    ({ agent, readiness, primary }) =>
++      (readiness.selectable && primary) || draft.members.some((m) => m.agentId === agent.id),
++  );
++  const otherConnected = options.filter(
++    (option) => option.readiness.selectable && !visible.includes(option),
++  );
++  const needingSetup = options.filter(
++    (option) => !option.readiness.selectable && !visible.includes(option),
++  );
++  const renderChoice = (option: AeTeamOption) => {
++    const member = draft.members.find((m) => m.agentId === option.agent.id);
++    return (
++      <MemberChoice
++        key={option.agent.id}
++        option={option}
++        host={host}
++        member={member}
++        disabled={disabled || (!member && draft.members.length >= AE_TEAM_LIMIT)}
++        onChange={(next) =>
++          onChange({
++            ...draft,
++            members: next
++              ? member
++                ? draft.members.map((m) => (m.agentId === option.agent.id ? next : m))
++                : [...draft.members, next]
++              : draft.members.filter((m) => m.agentId !== option.agent.id),
++          })
++        }
++      />
++    );
++  };
+   return (
+     <div className="space-y-4">
+-      <div className="grid grid-cols-2 gap-2" role="group" aria-label="Collaboration mode">
+-        {(["solo", "team"] as const).map((mode) => (
++      <div className="grid grid-cols-3 gap-2" role="group" aria-label="Collaboration mode">
++        {(["auto", "solo", "team"] as const).map((mode) => (
+           <button
+             key={mode}
+             type="button"
++            aria-label={mode === "auto" ? "Auto Recommended" : mode === "solo" ? "Solo" : "Team"}
+             aria-pressed={draft.mode === mode}
+             disabled={disabled}
+             onClick={() => onChange({ ...draft, mode })}
+-            className={`rounded-xl border px-3 py-3 text-left ${draft.mode === mode ? "border-primary bg-primary/5" : "border-border"}`}
++            className={`min-w-0 rounded-xl border px-2 py-3 text-center disabled:opacity-50 ${draft.mode === mode ? "border-primary bg-primary/5" : "border-border"}`}
+           >
+-            <span className="block text-sm font-medium">{mode === "solo" ? "Solo" : "Team"}</span>
+-            <span className="text-xs text-muted-foreground">
+-              {mode === "solo" ? "One agent handles the work" : "A lead with collaborators"}
++            <span className="block text-sm font-medium">
++              {mode === "auto" ? "Auto" : mode === "solo" ? "Solo" : "Team"}
+             </span>
++            {mode === "auto" && (
++              <span className="block text-[10px] text-muted-foreground">Recommended</span>
++            )}
+           </button>
+         ))}
+       </div>
++      <div className="space-y-2 text-xs text-muted-foreground">
++        <p aria-live="polite">
++          {draft.mode === "auto"
++            ? "The lead chooses useful collaborators from your connected agents as needed."
++            : draft.mode === "solo"
++              ? "The lead works with its native helpers, without an added cross-agent team."
++              : "You choose collaborators. The lead assigns tasks and brings their results together."}
++        </p>
++        <p>Native subagents remain available in every mode.</p>
++      </div>
+       {draft.mode === "team" && (
+         <div className="space-y-2">
+           <p className="text-sm font-medium">
+@@ -146,43 +215,38 @@ export function AeTeamEditor({
+             </span>
+           </p>
+           <p className="text-xs text-muted-foreground">
+-            The lead assigns tasks and brings their results together. Each collaborator uses its own
+-            context and account allowance.
++            Each collaborator uses its configured account and its own context.
+           </p>
+-          {agents.length === 0 && (
+-            <p className="text-sm text-muted-foreground">No agents available yet.</p>
++          {!options.some((option) => option.readiness.selectable) && (
++            <p className="text-sm text-muted-foreground">
++              No collaborators are ready on this host yet.
++            </p>
+           )}
+-          {agents.map((agent) => {
+-            const member = draft.members.find((m) => m.agentId === agent.id);
+-            return (
+-              <MemberChoice
+-                key={agent.id}
+-                agent={agent}
+-                host={host}
+-                member={member}
+-                disabled={disabled || (!member && draft.members.length >= AE_TEAM_LIMIT)}
+-                onChange={(next) =>
+-                  onChange({
+-                    ...draft,
+-                    members: [
+-                      ...draft.members.filter((m) => m.agentId !== agent.id),
+-                      ...(next ? [next] : []),
+-                    ],
+-                  })
+-                }
+-              />
+-            );
+-          })}
++          {visible.map(renderChoice)}
+           {draft.members
+             .filter((m) => !agents.some((a) => a.id === m.agentId))
+             .map((member) => (
+               <div
+                 key={member.agentId}
+-                className="flex items-center justify-between gap-2 rounded-md border p-3 text-sm"
++                className="flex items-start justify-between gap-2 rounded-xl border p-3 text-sm"
+               >
+-                <span>{member.displayName} · Unavailable</span>
++                <div className="min-w-0 space-y-1 break-words">
++                  <p className="font-medium">
++                    {aeTeamAgentName({
++                      name: member.agentName,
++                      display_name: member.displayName,
++                      harness: null,
++                    })}
++                    {" · Unavailable"}
++                  </p>
++                  <p className="text-xs text-muted-foreground">
++                    This agent is no longer available. Remove it or choose another collaborator to
++                    save this team.
++                  </p>
++                </div>
+                 <Button
+                   variant="ghost"
++                  aria-label={`Remove ${member.displayName}`}
+                   disabled={disabled}
+                   onClick={() =>
+                     onChange({
+@@ -195,6 +259,42 @@ export function AeTeamEditor({
+                 </Button>
+               </div>
+             ))}
++          {otherConnected.length > 0 && (
++            <div className="space-y-2 pt-1">
++              <button
++                type="button"
++                aria-expanded={showOther}
++                aria-controls={otherId}
++                onClick={() => setShowOther((show) => !show)}
++                className="flex w-full items-center gap-2 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
++              >
++                <ChevronDown className={`size-4 shrink-0 ${showOther ? "rotate-180" : ""}`} />
++                Other connected agents
++                <span>({otherConnected.length})</span>
++              </button>
++              <div id={otherId} hidden={!showOther} className="space-y-2">
++                {showOther && otherConnected.map(renderChoice)}
++              </div>
++            </div>
++          )}
++          {needingSetup.length > 0 && (
++            <div className="space-y-2 pt-1">
++              <button
++                type="button"
++                aria-expanded={showSetup}
++                aria-controls={setupId}
++                onClick={() => setShowSetup((show) => !show)}
++                className="flex w-full items-center gap-2 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
++              >
++                <ChevronDown className={`size-4 shrink-0 ${showSetup ? "rotate-180" : ""}`} />
++                {showSetup ? "Hide agents needing setup" : "Show agents needing setup"}
++                <span>({needingSetup.length})</span>
++              </button>
++              <div id={setupId} hidden={!showSetup} className="space-y-2">
++                {showSetup && needingSetup.map(renderChoice)}
++              </div>
++            </div>
++          )}
+         </div>
+       )}
+     </div>
+@@ -219,7 +319,14 @@ export function AeTeamControl({
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const saved = readAeTeam(session.labels);
+-  const { data: agents = [], isLoading, isError } = useAvailableAgents({ enabled: open });
++  const {
++    data: agents = [],
++    isLoading,
++    isError,
++  } = useAvailableAgents({
++    enabled: open,
++    pinnedAgentIds: [session.agentId, ...saved.members.map((member) => member.agentId)],
++  });
+   const { data: hosts = [] } = useHosts({ enabled: open, includeSandbox: true });
+   const host = hosts.find((h) => h.host_id === session.hostId) ?? null;
+   const invalid =
+@@ -227,7 +334,7 @@ export function AeTeamControl({
+     (!draft.members.length ||
+       draft.members.some((m) => {
+         const agent = agents.find((a) => a.id === m.agentId);
+-        return !agent || !harnessReadinessOnHost(agent.harness, host).selectable;
++        return !agent || !aeTeamReadiness(agent.harness, host).selectable;
+       }));
+   function changeOpen(next: boolean) {
+     if (saving) return;
+@@ -253,18 +360,23 @@ export function AeTeamControl({
+     }
+   }
+   const team = saved.mode === "team";
++  const modeName = saved.mode === "auto" ? "Auto" : saved.mode === "solo" ? "Solo" : "Team";
+   return (
+     <>
+       <button
+         type="button"
+-        aria-label={team ? `Team: ${saved.members.length} collaborators` : "Collaboration: Solo"}
+-        title={team ? saved.members.map((m) => m.displayName).join(", ") : "Choose solo or a team"}
++        aria-label={
++          team ? `Team: ${saved.members.length} collaborators` : `Collaboration: ${modeName}`
++        }
++        title={
++          team ? saved.members.map((m) => m.displayName).join(", ") : "Choose Auto, Solo, or Team"
++        }
+         disabled={disabled}
+         onClick={() => changeOpen(true)}
+         className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
+       >
+         <UsersRound className="size-4" />
+-        <span>{team ? `Team · ${saved.members.length}` : "Solo"}</span>
++        <span>{team ? `Team · ${saved.members.length}` : modeName}</span>
+       </button>
+       <Dialog open={open} onOpenChange={changeOpen}>
+         <DialogContent
+@@ -273,21 +385,18 @@ export function AeTeamControl({
+         >
+           <DialogHeader>
+             <DialogTitle>Who works on this?</DialogTitle>
+-            <DialogDescription>
+-              Choose a lead and the collaborators you want involved.
+-            </DialogDescription>
++            <DialogDescription>Choose how your lead works with collaborators.</DialogDescription>
+           </DialogHeader>
+           <div className="min-h-0 space-y-4 overflow-y-auto px-1 pb-1">
+             <div className="flex items-center justify-between gap-3 rounded-xl bg-muted/50 p-3">
+               <div className="min-w-0">
+                 <p className="text-xs text-muted-foreground">Lead / orchestrator</p>
+-                <p className="truncate text-sm font-medium">
+-                  {session.agentName ?? session.harness ?? "Current agent"}
+-                </p>
++                <p className="truncate text-sm font-medium">{aeTeamLeadName(session, agents)}</p>
+               </div>
+               <Button
+                 variant="outline"
+                 size="sm"
++                className="shrink-0"
+                 disabled={saving || working || disabled || !forkDialog?.canFork}
+                 title={forkDialog?.disabledReason}
+                 onClick={() => {
+@@ -314,16 +423,11 @@ export function AeTeamControl({
+               onChange={setDraft}
+               agents={agents}
+               host={host}
++              lead={session}
+               disabled={saving || disabled}
+             />
+-            {draft.mode === "team" && (
+-              <p className="text-xs text-muted-foreground">
+-                Team uses your selected agents and models. Automatic collaborator routing will be
+-                turned off.
+-              </p>
+-            )}
+             <p className="text-xs text-muted-foreground">
+-              Applies to your next message. Existing work can finish when you switch to Solo.
++              Applies to your next message. Existing work can finish when you change modes.
+             </p>
+             {error && (
+               <p role="alert" className="text-sm text-destructive">
+@@ -336,6 +440,7 @@ export function AeTeamControl({
+               Cancel
+             </Button>
+             <Button
++              aria-label="Save selection"
+               loading={saving}
+               disabled={disabled || invalid || saving || working}
+               onClick={() => void save()}
+diff --git a/web/src/lib/aeTeam.test.ts b/web/src/lib/aeTeam.test.ts
+index 55ebaa3e1b13b3592623f6ec8942835de81a3bed..9d175be6eab60d17580ef2251bad41a36d3b1745 100644
+--- a/web/src/lib/aeTeam.test.ts
++++ b/web/src/lib/aeTeam.test.ts
+@@ -29,24 +29,34 @@ const claude: AeTeamMember = {
+   displayName: "Claude",
+   model: null,
+ };
++const parent: Awaited<ReturnType<typeof getSessionSlim>> = {
++  id: "parent",
++  agentId: "ag_codex",
++  agentName: "codex-native",
++  status: "idle",
++  createdAt: 0,
++  title: null,
++  items: [],
++  permissionLevel: 4,
++  parentSessionId: null,
++  subAgentName: null,
++  kind: "default",
++  subagentRoutingOverride: "off",
++};
+ 
+ describe("team persistence", () => {
+   beforeEach(() => {
+     vi.resetAllMocks();
+     vi.mocked(fetchChildSessions).mockResolvedValue([]);
+-    vi.mocked(getSessionSlim).mockResolvedValue({ subagentRoutingOverride: "off" } as Awaited<
+-      ReturnType<typeof getSessionSlim>
+-    >);
+-    vi.mocked(createSession).mockResolvedValue({ id: "new-child" } as Awaited<
+-      ReturnType<typeof createSession>
+-    >);
++    vi.mocked(getSessionSlim).mockResolvedValue(parent);
++    vi.mocked(createSession).mockResolvedValue({ ...parent, id: "new-child", kind: "sub_agent" });
+   });
+ 
+   it("ignores malformed and oversized rosters", () => {
+     for (const raw of ["{", "null", JSON.stringify({ version: 9 }), " ".repeat(20_000)]) {
+       expect(readAeTeam({ [AE_TEAM_LABEL]: raw })).toEqual({
+         version: 1,
+-        mode: "solo",
++        mode: "auto",
+         members: [],
+       });
+     }
+@@ -70,6 +80,7 @@ describe("team persistence", () => {
+           version: 1,
+           mode: "team",
+           members: [{ ...codex, sessionId: "new-child" }],
++          routingBeforeTeam: "off",
+         }),
+       },
+     });
+@@ -111,19 +122,91 @@ describe("team persistence", () => {
+     expect(updateSession).not.toHaveBeenCalled();
+   });
+ 
+-  it("switches to Solo without starting or deleting children", async () => {
+-    await saveAeTeam("parent", { version: 1, mode: "solo", members: [codex] });
++  it.each(["auto", "solo"] as const)("saves %s without provisioning children", async (mode) => {
++    await saveAeTeam("parent", { version: 1, mode, members: [codex] });
+     expect(fetchChildSessions).not.toHaveBeenCalled();
+     expect(createSession).not.toHaveBeenCalled();
+     expect(updateSession).toHaveBeenCalledWith("parent", {
+-      labels: { [AE_TEAM_LABEL]: '{"version":1,"mode":"solo","members":[]}' },
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode, members: [] }) },
++    });
++  });
++
++  it("defaults to Auto while retaining an explicitly saved Solo preference", () => {
++    expect(readAeTeam().mode).toBe("auto");
++    expect(readAeTeam({ [AE_TEAM_LABEL]: '{"version":1,"mode":"solo","members":[]}' }).mode).toBe(
++      "solo",
++    );
++  });
++
++  it.each(["auto", "solo"] as const)(
++    "restores the original routing when leaving a selected team for %s",
++    async (mode) => {
++      vi.mocked(getSessionSlim).mockResolvedValue({
++        ...parent,
++        subagentRoutingOverride: "off",
++        labels: {
++          [AE_TEAM_LABEL]: JSON.stringify({
++            version: 1,
++            mode: "team",
++            members: [codex],
++            routingBeforeTeam: "on",
++          }),
++        },
++      });
++      await saveAeTeam("parent", { version: 1, mode, members: [] });
++      expect(createSession).not.toHaveBeenCalled();
++      expect(updateSession).toHaveBeenCalledExactlyOnceWith("parent", {
++        subagentRoutingOverride: "on",
++        labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode, members: [] }) },
++      });
++    },
++  );
++
++  it("preserves the original routing across edits to an existing team", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({
++      ...parent,
++      subagentRoutingOverride: "off",
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({
++          version: 1,
++          mode: "team",
++          members: [codex],
++          routingBeforeTeam: "on",
++        }),
++      },
++    });
++    await saveAeTeam("parent", { version: 1, mode: "team", members: [claude] });
++    const saved = readAeTeam(vi.mocked(updateSession).mock.calls.at(-1)![1].labels!);
++    expect(saved.routingBeforeTeam).toBe("on");
++  });
++
++  it("clears the legacy Team routing override when returning to Auto", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({
++      ...parent,
++      subagentRoutingOverride: "off",
++      labels: { [AE_TEAM_LABEL]: '{"version":1,"mode":"team","members":[]}' },
++    });
++    await saveAeTeam("parent", { version: 1, mode: "auto", members: [] });
++    expect(updateSession).toHaveBeenCalledWith(
++      "parent",
++      expect.objectContaining({ subagentRoutingOverride: null }),
++    );
++  });
++
++  it("keeps a manual routing change made after selecting Team", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({
++      ...parent,
++      subagentRoutingOverride: "on",
++      labels: { [AE_TEAM_LABEL]: '{"version":1,"mode":"team","members":[]}' },
++    });
++    await saveAeTeam("parent", { version: 1, mode: "auto", members: [] });
++    expect(updateSession).toHaveBeenCalledWith("parent", {
++      labels: { [AE_TEAM_LABEL]: '{"version":1,"mode":"auto","members":[]}' },
+     });
+   });
+ 
+   it("turns off automatic collaborator routing before creating pinned teammates", async () => {
+-    vi.mocked(getSessionSlim).mockResolvedValue({ subagentRoutingOverride: "on" } as Awaited<
+-      ReturnType<typeof getSessionSlim>
+-    >);
++    vi.mocked(getSessionSlim).mockResolvedValue({ ...parent, subagentRoutingOverride: "on" });
+     await saveAeTeam("parent", { version: 1, mode: "team", members: [codex] });
+     expect(updateSession).toHaveBeenNthCalledWith(1, "parent", { subagentRoutingOverride: "off" });
+     expect(vi.mocked(updateSession).mock.invocationCallOrder[0]).toBeLessThan(
+@@ -132,9 +215,7 @@ describe("team persistence", () => {
+   });
+ 
+   it("restores routing if a team cannot be provisioned", async () => {
+-    vi.mocked(getSessionSlim).mockResolvedValue({ subagentRoutingOverride: "on" } as Awaited<
+-      ReturnType<typeof getSessionSlim>
+-    >);
++    vi.mocked(getSessionSlim).mockResolvedValue({ ...parent, subagentRoutingOverride: "on" });
+     vi.mocked(createSession).mockRejectedValue(new Error("Unavailable"));
+     await expect(
+       saveAeTeam("parent", { version: 1, mode: "team", members: [codex] }),
+diff --git a/web/src/lib/aeTeam.ts b/web/src/lib/aeTeam.ts
+index 85d9903573b9475beedd43d9a80c56e892a506ce..afb5b07b7311d5509cb7a8e3708c1a529029bc88 100644
+--- a/web/src/lib/aeTeam.ts
++++ b/web/src/lib/aeTeam.ts
+@@ -15,18 +15,20 @@ export interface AeTeamMember {
+ 
+ export interface AeTeam {
+   version: 1;
+-  mode: "solo" | "team";
++  mode: "auto" | "solo" | "team";
+   members: AeTeamMember[];
++  routingBeforeTeam?: "on" | "off" | null;
+ }
+ 
+ export function readAeTeam(labels?: Record<string, string>): AeTeam {
+-  const solo: AeTeam = { version: 1, mode: "solo", members: [] };
++  const automatic: AeTeam = { version: 1, mode: "auto", members: [] };
+   const raw = labels?.[AE_TEAM_LABEL];
+-  if (!raw || raw.length > 16_384) return solo;
++  if (!raw || raw.length > 16_384) return automatic;
+   try {
+     const value = JSON.parse(raw) as Partial<AeTeam>;
+-    if (value?.version !== 1 || !["solo", "team"].includes(value.mode ?? "")) return solo;
+-    if (!Array.isArray(value.members) || value.members.length > AE_TEAM_LIMIT) return solo;
++    if (value?.version !== 1 || !["auto", "solo", "team"].includes(value.mode ?? ""))
++      return automatic;
++    if (!Array.isArray(value.members) || value.members.length > AE_TEAM_LIMIT) return automatic;
+     const members = value.members.filter(
+       (m): m is AeTeamMember =>
+         !!m &&
+@@ -37,9 +39,18 @@ export function readAeTeam(labels?: Record<string, string>): AeTeam {
+         (m.model === null || typeof m.model === "string") &&
+         (m.sessionId === undefined || typeof m.sessionId === "string"),
+     );
+-    return { version: 1, mode: value.mode as AeTeam["mode"], members };
++    return {
++      version: 1,
++      mode: value.mode as AeTeam["mode"],
++      members,
++      ...(value.routingBeforeTeam === "on" ||
++      value.routingBeforeTeam === "off" ||
++      value.routingBeforeTeam === null
++        ? { routingBeforeTeam: value.routingBeforeTeam }
++        : {}),
++    };
+   } catch {
+-    return solo;
++    return automatic;
+   }
+ }
+ 
+@@ -47,7 +58,7 @@ export function aeTeamMemberKey(member: AeTeamMember): string {
+   return JSON.stringify([member.agentId, member.model]);
+ }
+ 
+-/** Provision idle children first; publish the roster only when all are ready.
++/** Save a collaboration preference, provisioning idle children only for Team.
+  * Retry reuses children by their durable label, including a partially saved team.
+  * No prompts are sent here. The lead sees the roster on its next message.
+  */
+@@ -55,13 +66,26 @@ export async function saveAeTeam(sessionId: string, draft: AeTeam) {
+   if (draft.mode === "team" && (!draft.members.length || draft.members.length > AE_TEAM_LIMIT)) {
+     throw new Error(`Choose between 1 and ${AE_TEAM_LIMIT} collaborators.`);
+   }
+-  if (draft.mode === "solo") return persistAeTeam(sessionId, draft);
+   const parent = await getSessionSlim(sessionId);
++  const saved = readAeTeam(parent.labels);
+   const routing = parent.subagentRoutingOverride ?? null;
++  if (draft.mode !== "team") {
++    return updateSession(sessionId, {
++      // Restore only the override this picker owns; preserve later manual changes.
++      ...(saved.mode === "team" && routing === "off"
++        ? { subagentRoutingOverride: saved.routingBeforeTeam ?? null }
++        : {}),
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: draft.mode, members: [] }),
++      },
++    });
++  }
++  const routingBeforeTeam =
++    saved.mode === "team" && routing === "off" ? (saved.routingBeforeTeam ?? null) : routing;
+   // Manual model choices must not be replaced by the parent's spawn router.
+   if (routing !== "off") await updateSession(sessionId, { subagentRoutingOverride: "off" });
+   try {
+-    return await persistAeTeam(sessionId, draft);
++    return await persistAeTeam(sessionId, { ...draft, routingBeforeTeam });
+   } catch (error) {
+     if (routing !== "off") {
+       try {
+@@ -106,6 +130,13 @@ async function persistAeTeam(sessionId: string, draft: AeTeam) {
+   }
+   return updateSession(sessionId, {
+     ...(draft.mode === "team" ? { subagentRoutingOverride: "off" as const } : {}),
+-    labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: draft.mode, members }) },
++    labels: {
++      [AE_TEAM_LABEL]: JSON.stringify({
++        version: 1,
++        mode: draft.mode,
++        members,
++        routingBeforeTeam: draft.routingBeforeTeam,
++      }),
++    },
+   });
+ }
+diff --git a/web/src/lib/aeTeamOptions.test.ts b/web/src/lib/aeTeamOptions.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3b1c38bfd539a6100df20e539cc9eeffc34e6963
+--- /dev/null
++++ b/web/src/lib/aeTeamOptions.test.ts
+@@ -0,0 +1,250 @@
++import { describe, expect, it } from "vitest";
++import type { AvailableAgent } from "@/hooks/useAvailableAgents";
++import type { Host } from "@/hooks/useHosts";
++import {
++  aeTeamAgentName,
++  aeTeamLeadName,
++  aeTeamOptions,
++  aeTeamReadiness,
++  type AeTeamLead,
++} from "./aeTeamOptions";
++
++const codex: AvailableAgent = {
++  id: "codex",
++  name: "codex-native-ui",
++  display_name: "Codex",
++  harness: "codex-native",
++  description: null,
++  skills: [],
++  builtin: true,
++};
++const claude: AvailableAgent = {
++  ...codex,
++  id: "claude",
++  name: "claude-native-ui",
++  display_name: "Claude Code",
++  harness: "claude-native",
++};
++const host: Host = {
++  host_id: "host",
++  name: "Workstation",
++  owner: "test",
++  status: "online",
++  configured_harnesses: {
++    "codex-native": true,
++    "claude-native": true,
++    "claude-sdk": true,
++    "pi-native": true,
++  },
++};
++const leadFor = (agent: AvailableAgent): AeTeamLead => ({
++  agentId: agent.id,
++  agentName: agent.name,
++  harness: agent.harness,
++  labels: {},
++});
++
++describe("team agent names", () => {
++  it("preserves distinct agent aliases without collapsing a shared native harness", () => {
++    const work = { ...claude, id: "work", name: "claude-work", builtin: false };
++    const personal = { ...claude, id: "personal", name: "claude-personal", builtin: false };
++    expect(
++      aeTeamOptions([work, personal, claude], host).map(({ agent, name }) => [agent.id, name]),
++    ).toEqual([
++      ["claude", "Claude Code"],
++      ["personal", "claude-personal"],
++      ["work", "claude-work"],
++    ]);
++    expect(aeTeamAgentName({ ...work, display_name: "Work reviewer" })).toBe("Work reviewer");
++  });
++
++  it("normalizes built-in clone names and preserves custom clone aliases", () => {
++    expect(aeTeamAgentName({ ...codex, name: "codex-native-ui (fork ag_a) (switch ag_b)" })).toBe(
++      "Codex",
++    );
++    expect(
++      aeTeamAgentName({ ...codex, name: "project-reviewer (fork ag_a)", builtin: false }),
++    ).toBe("project-reviewer");
++    expect(aeTeamAgentName({ ...codex, name: "reviewer", harness: null, display_name: "" })).toBe(
++      "reviewer",
++    );
++  });
++
++  it("resolves lead aliases by id and never borrows a different id's display name", () => {
++    const first = {
++      ...codex,
++      id: "first",
++      name: "reviewer",
++      display_name: "First reviewer",
++      builtin: false,
++    };
++    const second = { ...first, id: "second", display_name: "Second reviewer" };
++    expect(aeTeamLeadName(leadFor(second), [first, second])).toBe("Second reviewer");
++    expect(aeTeamLeadName({ ...leadFor(second), agentId: "missing" }, [first])).toBe("reviewer");
++    expect(
++      aeTeamLeadName({ ...leadFor(codex), agentName: "codex-native-ui (fork ag_a)" }, []),
++    ).toBe("Codex");
++    expect(
++      aeTeamLeadName({ agentId: "missing", agentName: null, harness: null, labels: {} }, []),
++    ).toBe("Current agent");
++  });
++});
++
++describe("team readiness", () => {
++  it.each([undefined, null, {}])(
++    "does not advertise an unverified catalog as connected with map %j",
++    (configured_harnesses) => {
++      const unknownHost = { ...host, configured_harnesses };
++      const options = aeTeamOptions([codex, claude], unknownHost, leadFor(codex));
++      for (const option of options) {
++        expect(option.readiness).toMatchObject({
++          state: "unavailable",
++          reason: "readiness-unknown",
++          selectable: false,
++          explanation: { label: "Readiness unavailable" },
++        });
++        expect(option.recommendation).toBeNull();
++      }
++    },
++  );
++
++  it("does not treat a missing key in a partial map as ready", () => {
++    expect(aeTeamReadiness("missing-harness", host)).toMatchObject({
++      selectable: false,
++      reason: "readiness-unknown",
++      explanation: { label: "Readiness unavailable" },
++    });
++  });
++
++  it.each([false, "needs-auth", "binary-missing", "version-too-low", "unexpected-error"])(
++    "rejects explicit not-ready status %s",
++    (status) => {
++      expect(
++        aeTeamReadiness("codex-native", {
++          ...host,
++          configured_harnesses: { "codex-native": status },
++        }).selectable,
++      ).toBe(false);
++    },
++  );
++
++  it("requires verified SDK readiness too", () => {
++    expect(
++      aeTeamReadiness("claude-sdk", {
++        ...host,
++        configured_harnesses: { "claude-sdk": "needs-auth" },
++      }),
++    ).toMatchObject({
++      selectable: false,
++      state: "setup-required",
++      reason: "needs-auth",
++    });
++  });
++
++  it("uses canonical alias readiness but keeps an explicit alias failure authoritative", () => {
++    expect(aeTeamReadiness("native-pi", host)).toMatchObject({ selectable: true, reason: "ready" });
++    expect(
++      aeTeamReadiness("native-pi", {
++        ...host,
++        configured_harnesses: { "pi-native": true, "native-pi": "needs-auth" },
++      }),
++    ).toMatchObject({ selectable: false, reason: "needs-auth" });
++  });
++
++  it("does not offer missing harnesses or unavailable hosts", () => {
++    expect(aeTeamReadiness(null, host)).toMatchObject({
++      selectable: false,
++      reason: "harness-unavailable",
++    });
++    expect(aeTeamReadiness("codex-native", null)).toMatchObject({
++      selectable: false,
++      reason: "host-unavailable",
++    });
++    expect(aeTeamReadiness("codex-native", { ...host, status: "offline" })).toMatchObject({
++      selectable: false,
++      reason: "host-unavailable",
++    });
++  });
++});
++
++describe("team option ranking and recommendations", () => {
++  it("prioritizes ready native coding and explicit custom agents over generic connected roles", () => {
++    const generic = {
++      ...codex,
++      id: "generic",
++      name: "orchestrator",
++      display_name: "Orchestrator",
++      harness: "claude-sdk",
++    };
++    const custom = {
++      ...generic,
++      id: "custom",
++      name: "reviewer",
++      display_name: "Reviewer",
++      builtin: false,
++    };
++    const unavailable = {
++      ...claude,
++      id: "unavailable",
++      name: "offline",
++      harness: "missing-harness",
++    };
++    const options = aeTeamOptions([unavailable, generic, custom, codex], host);
++    expect(options.map(({ agent }) => agent.id)).toEqual([
++      "codex",
++      "custom",
++      "generic",
++      "unavailable",
++    ]);
++    expect(options.slice(0, 3).map(({ primary }) => primary)).toEqual([true, true, false]);
++  });
++
++  it.each([
++    [codex, claude],
++    [claude, codex],
++  ])("recommends a ready different-provider coding partner for $0.name", (lead, partner) => {
++    const options = aeTeamOptions([lead, partner], host, leadFor(lead));
++    expect(options[0]).toMatchObject({
++      agent: { id: partner.id },
++      recommendation: "Recommended: different provider for independent review.",
++    });
++    expect(options.filter(({ recommendation }) => recommendation)).toHaveLength(1);
++  });
++
++  it("honors authoritative wrapper metadata when the lead's transport harness differs", () => {
++    const lead = {
++      ...leadFor(codex),
++      harness: "claude-sdk",
++      labels: { "omnigent.wrapper": "codex-native-ui" },
++    };
++    expect(aeTeamOptions([codex, claude], host, lead)[0].agent.id).toBe("claude");
++  });
++
++  it("does not recommend unavailable, same-provider, self, or unknown-provider partners", () => {
++    const pi = {
++      ...codex,
++      id: "pi",
++      name: "pi-native-ui",
++      display_name: "Pi",
++      harness: "pi-native",
++    };
++    const alias = { ...codex, id: "work", name: "codex-work", builtin: false };
++    const notReady = {
++      ...host,
++      configured_harnesses: { ...host.configured_harnesses, "claude-native": "needs-auth" },
++    };
++    expect(
++      aeTeamOptions([codex, alias, claude, pi], notReady, leadFor(codex)).every(
++        (option) => option.recommendation === null,
++      ),
++    ).toBe(true);
++    expect(
++      aeTeamOptions([codex, claude, pi], host, leadFor(pi)).every(
++        (option) => option.recommendation === null,
++      ),
++    ).toBe(true);
++    expect(
++      aeTeamOptions([claude], host, { ...leadFor(codex), agentId: claude.id })[0].recommendation,
++    ).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeTeamOptions.ts b/web/src/lib/aeTeamOptions.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8563e24579e5b4512219557e57a530e1977c38c
+--- /dev/null
++++ b/web/src/lib/aeTeamOptions.ts
+@@ -0,0 +1,144 @@
++import type { AvailableAgent } from "@/hooks/useAvailableAgents";
++import type { Host } from "@/hooks/useHosts";
++import { agentRootName } from "./forkHarness";
++import { harnessReadinessOnHost, type HarnessReadiness } from "./harnessSetup";
++import {
++  nativeCodingAgentForAgentName,
++  nativeCodingAgentForAvailableAgent,
++  nativeCodingAgentForHarness,
++  nativeCodingAgentForSession,
++} from "./nativeCodingAgents";
++import type { Session } from "./types";
++
++export type AeTeamLead = Pick<Session, "agentId" | "agentName" | "harness" | "labels">;
++
++/** Keep configured agent aliases even when discovery supplies a vendor display name. */
++export function aeTeamAgentName(
++  agent: Pick<AvailableAgent, "name" | "display_name" | "harness" | "builtin">,
++) {
++  const native = nativeCodingAgentForAvailableAgent(agent);
++  if (!native) return agent.display_name || agent.name;
++  const name = agentRootName(agent.name);
++  const standardNames = [native.agentName, native.harness, native.key];
++  if (
++    agent.display_name === native.displayName &&
++    (agent.builtin === false || !standardNames.includes(name))
++  )
++    return name;
++  if (!agent.display_name || standardNames.includes(agent.display_name)) {
++    return standardNames.includes(name) ? native.displayName : name;
++  }
++  return agent.display_name;
++}
++
++export function aeTeamLeadName(lead: AeTeamLead, agents: AvailableAgent[]) {
++  const agent = agents.find((a) =>
++    lead.agentId ? a.id === lead.agentId : a.name === lead.agentName,
++  );
++  if (agent) return aeTeamAgentName(agent);
++  const name = lead.agentName ? agentRootName(lead.agentName) : null;
++  return (
++    nativeCodingAgentForAgentName(name)?.displayName ??
++    name ??
++    nativeCodingAgentForSession(lead)?.displayName ??
++    "Current agent"
++  );
++}
++
++/** Only verified readiness qualifies an agent as connected in the team picker. */
++export function aeTeamReadiness(harness: string | null, host: Host | null): HarnessReadiness {
++  const canonical = nativeCodingAgentForHarness(harness)?.harness;
++  const resolvedHarness =
++    harness &&
++    host?.configured_harnesses?.[harness] === undefined &&
++    canonical &&
++    host?.configured_harnesses?.[canonical] !== undefined
++      ? canonical
++      : harness;
++  const readiness = harnessReadinessOnHost(resolvedHarness, host);
++  if (readiness.reason === "readiness-unknown") {
++    return {
++      ...readiness,
++      state: "unavailable",
++      selectable: false,
++      explanation: {
++        label: "Readiness unavailable",
++        description:
++          "This host has not reported whether this agent is ready. Wait for readiness to update before adding it to your team.",
++      },
++    };
++  }
++  if (readiness.reason === "needs-auth") {
++    return { ...readiness, state: "setup-required", selectable: false };
++  }
++  return readiness;
++}
++
++export interface AeTeamOption {
++  agent: AvailableAgent;
++  name: string;
++  readiness: HarnessReadiness;
++  recommendation: string | null;
++  primary: boolean;
++}
++
++// Multi-provider harnesses do not establish a different provider by themselves.
++function codingProvider(harness: string | null | undefined): string | null {
++  const key = nativeCodingAgentForHarness(harness)?.key;
++  if (
++    key === "claude" ||
++    harness === "claude" ||
++    harness === "claude-sdk" ||
++    harness === "claude_sdk"
++  )
++    return "anthropic";
++  if (key === "codex" || harness === "codex") return "openai";
++  return null;
++}
++
++export function aeTeamOptions(
++  agents: AvailableAgent[],
++  host: Host | null,
++  lead?: AeTeamLead,
++): AeTeamOption[] {
++  const options: AeTeamOption[] = agents.map((agent) => ({
++    agent,
++    name: aeTeamAgentName(agent),
++    readiness: aeTeamReadiness(agent.harness, host),
++    recommendation: null,
++    primary: !!nativeCodingAgentForAvailableAgent(agent) || agent.builtin === false,
++  }));
++  const rank = (option: AeTeamOption) => {
++    if (!option.readiness.selectable) return 3;
++    if (nativeCodingAgentForAvailableAgent(option.agent)) return 0;
++    return option.primary ? 1 : 2;
++  };
++  options.sort((a, b) => rank(a) - rank(b) || a.name.localeCompare(b.name));
++  const leadAgent = lead
++    ? agents.find((a) => (lead.agentId ? a.id === lead.agentId : a.name === lead.agentName))
++    : undefined;
++  const leadProvider = codingProvider(
++    nativeCodingAgentForSession(lead)?.harness ??
++      lead?.harness ??
++      leadAgent?.harness ??
++      nativeCodingAgentForAgentName(lead?.agentName ? agentRootName(lead.agentName) : null)
++        ?.harness,
++  );
++  const suggested = options.find((option) => {
++    const provider = codingProvider(option.agent.harness);
++    return (
++      leadProvider &&
++      provider &&
++      provider !== leadProvider &&
++      option.agent.id !== lead?.agentId &&
++      nativeCodingAgentForAvailableAgent(option.agent) &&
++      option.readiness.reason === "ready"
++    );
++  });
++  if (suggested) {
++    suggested.recommendation = "Recommended: different provider for independent review.";
++    options.splice(options.indexOf(suggested), 1);
++    options.unshift(suggested);
++  }
++  return options;
++}

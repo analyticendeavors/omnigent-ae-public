@@ -1,0 +1,336 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:34:17 -0700
+Subject: [PATCH 133/148] [ae-patch] Stop counting a closed subagent toward its
+ parent's waiting badge
+
+A sidebar row's hourglass count (active_child_count, patch 0074) counts a
+direct child while the status cache reads running or waiting. Closing a
+subagent with sys_session_close archives it, and a child still marked running
+when that happened kept the mark: its runner was gone, so no idle edge ever
+came, the parent's badge stayed lit for hours and GET /v1/sessions/{id} kept
+reading running. Two parts. The session list and the updates stream now ask
+list_child_conversation_ids_by_parent for unarchived children only (a new
+include_archived keyword, default True, so recovery and the stop sweep still
+see every child); the archived flag is on the row that query already reads,
+so it costs no extra query and holds on every replica and across restarts.
+settle_archived_session in ae_session_activity, called from _archive_stop
+after the best-effort stop, publishes idle for a session still marked running
+or waiting (the cache, or the stored live_status after a restart), which also
+persists the stored status and cancels patch 0125's staleness timer; failed is
+left alone.
+---
+ .../routes/_sessions/ae_session_activity.py   | 46 ++++++++-
+ .../server/routes/_sessions/orchestration.py  |  2 +
+ .../server/routes/sessions/routes_core.py     |  3 +
+ .../stores/conversation_store/__init__.py     |  4 +
+ .../conversation_store/sqlalchemy_store.py    | 15 ++-
+ .../server/routes/test_ae_session_activity.py | 98 +++++++++++++++++++
+ 6 files changed, 163 insertions(+), 5 deletions(-)
+
+diff --git a/omnigent/server/routes/_sessions/ae_session_activity.py b/omnigent/server/routes/_sessions/ae_session_activity.py
+index e733b2689fe94a9f6856441af283d971a2f33eaf..190c67f5c7d267317731b8c3be1b00855f61c74a 100644
+--- a/omnigent/server/routes/_sessions/ae_session_activity.py
++++ b/omnigent/server/routes/_sessions/ae_session_activity.py
+@@ -13,10 +13,19 @@ extra I/O: the child ids come from the one batched
+ ``list_child_conversation_ids_by_parent`` query the list builder already
+ makes. Like the existing child status roll-up, the counts are as fresh as
+ this replica's relay caches.
++
++A closed (archived) child never counts. ``sys_session_close`` archives the
++child, and a child still marked running when that happened used to keep its
++parent's badge lit for hours. The list builders now ask
++``list_child_conversation_ids_by_parent`` to leave archived children out (the
++flag sits on the row that query already reads), and ``settle_archived_session``
++drops a closed session's busy status, cache and stored ``live_status``, once
++the archive teardown runs.
+ """
+ 
+ from __future__ import annotations
+ 
++import logging
+ from typing import Literal
+ 
+ from omnigent.runtime import pending_elicitations
+@@ -26,12 +35,46 @@ from omnigent.server.routes._sessions.common import (
+     _session_status_cache,
+ )
+ 
++_logger = logging.getLogger(__name__)
++
+ # Relay statuses that mean a child is still doing work; ``waiting`` covers a
+ # child parked on an approval. A child still booting has no relay status yet,
+ # so it counts from its first ``running`` edge, a few seconds later.
+ _BUSY_CHILD_STATUSES = frozenset({"running", "waiting"})
+ 
+ 
++def settle_archived_session(session_id: str, persisted_status: str | None = None) -> bool:
++    """
++    Publish idle for an archived session that is still marked running or waiting.
++
++    Runs from the archive teardown, after the best-effort stop, so the stop
++    had its chance to end the turn the normal way. A closed sub-agent whose
++    runner is gone never sends that idle edge, and its busy mark would
++    otherwise count toward the parent's badge and read ``running`` on
++    ``GET /v1/sessions/{id}`` for good. ``failed`` is left alone, and the
++    Claude subagent staleness check (patch 0125) is cancelled, since the
++    session is settled here.
++
++    :param session_id: Archived session/conversation identifier.
++    :param persisted_status: The row's stored ``live_status``, read when this
++        replica's cache has no entry (a restart emptied it), e.g. ``"running"``.
++    :returns: Whether an idle edge was published. Best-effort: a failure
++        logs and returns ``False``, so the rest of the teardown still runs.
++    """
++    from omnigent.server.ae_subagent_liveness import cancel_stale_timer
++    from omnigent.server.routes._sessions.helpers import _publish_status
++
++    try:
++        if _session_status_cache.get(session_id, persisted_status) not in _BUSY_CHILD_STATUSES:
++            return False
++        cancel_stale_timer(session_id)
++        _publish_status(session_id, "idle")
++        return True
++    except Exception:  # noqa: BLE001 (archive teardown steps are all best-effort)
++        _logger.warning("Could not settle archived session %s", session_id, exc_info=True)
++        return False
++
++
+ def session_background_task_count(session_id: str) -> int:
+     """
+     Return the background shells still running for a session.
+@@ -49,7 +92,8 @@ def session_active_child_count(child_session_ids: list[str]) -> int:
+ 
+     A child counts while its relay status is running or waiting, or while it
+     has an approval prompt outstanding (a prompt can land before the child's
+-    status edge does). A failed child never counts.
++    status edge does). A failed child never counts. Archived (closed)
++    children are left out by the caller's child-id query.
+ 
+     :param child_session_ids: Direct child ids of one session, e.g.
+         ``["conv_child1", "conv_child2"]``.
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 385a76e1a2d6adc64feb8f119beed3e76cd07567..e6660d486dfd4a6b9117258b6c9bfede0de5b146 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -173,6 +173,7 @@ from omnigent.server.routes._sessions.ae_session_activity import (
+     session_background_task_count,
+     session_blocked_on,
+     session_turn_active,
++    settle_archived_session,
+ )
+ 
+ # Shared constants, state, and small dataclasses live in the _sessions.common
+@@ -971,6 +972,7 @@ async def _archive_stop(
+                 exc_info=True,
+                 extra={"session_id": session_id},
+             )
++    settle_archived_session(session_id, conv.live_status)
+     # Runs after the runner teardown so the agent isn't left in a deleted cwd.
+     if delete_worktree and conv.git_branch and conv.workspace and conv.host_id:
+         from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 6a9198a9ae5800b6bd87f8ad4c425fd19a310c7d..838a6df994785e07cc83484cbecd3a564e13ba2d 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -1581,6 +1581,7 @@ def register_core_routes(
+                 asyncio.to_thread(
+                     conversation_store.list_child_conversation_ids_by_parent,
+                     conv_ids,
++                    include_archived=False,
+                 ),
+             )
+             user_is_admin = (
+@@ -1594,6 +1595,7 @@ def register_core_routes(
+                 asyncio.to_thread(
+                     conversation_store.list_child_conversation_ids_by_parent,
+                     conv_ids,
++                    include_archived=False,
+                 ),
+             )
+             perms_by_conv = {}
+@@ -1788,6 +1790,7 @@ def register_core_routes(
+             asyncio.to_thread(
+                 conversation_store.list_child_conversation_ids_by_parent,
+                 conv_ids,
++                include_archived=False,
+             ),
+             _comments_fingerprints_for(conv_ids),
+         )
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index eb80ffa9560ce8c88f1a63127d78e4ef04aa547b..85016526be793f055c7d0b66ea39ca9048dd8db8 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -624,6 +624,8 @@ class ConversationStore(ABC):
+     def list_child_conversation_ids_by_parent(
+         self,
+         parent_conversation_ids: list[str],
++        *,
++        include_archived: bool = True,
+     ) -> dict[str, list[str]]:
+         """
+         Return direct sub-agent child ids grouped by parent conversation.
+@@ -637,6 +639,8 @@ class ConversationStore(ABC):
+         :param parent_conversation_ids: Parent conversation ids to
+             inspect, e.g. ``["conv_parent1", "conv_parent2"]``.
+             Duplicates are tolerated.
++        :param include_archived: ``False`` leaves archived (closed)
++            children out, as the sidebar's busy-child count needs.
+         :returns: Mapping from every unique input parent id to the
+             matching direct child ids. Parents with no direct sub-agent
+             children, or ids that do not exist, map to an empty list.
+diff --git a/omnigent/stores/conversation_store/sqlalchemy_store.py b/omnigent/stores/conversation_store/sqlalchemy_store.py
+index 90469966fda11357d27c855efd7aa32c8abe3356..eb1ac747774db9e66483797388be9230db747543 100644
+--- a/omnigent/stores/conversation_store/sqlalchemy_store.py
++++ b/omnigent/stores/conversation_store/sqlalchemy_store.py
+@@ -1413,6 +1413,8 @@ class SqlAlchemyConversationStore(ConversationStore):
+     def list_child_conversation_ids_by_parent(
+         self,
+         parent_conversation_ids: list[str],
++        *,
++        include_archived: bool = True,
+     ) -> dict[str, list[str]]:
+         """
+         Return direct sub-agent child ids grouped by parent conversation.
+@@ -1428,6 +1430,7 @@ class SqlAlchemyConversationStore(ConversationStore):
+         :param parent_conversation_ids: Parent conversation ids to
+             inspect, e.g. ``["conv_parent1", "conv_parent2"]``.
+             Duplicates are tolerated.
++        :param include_archived: ``False`` leaves archived children out.
+         :returns: Mapping from every unique input parent id to direct
+             child ids. Parents with no direct sub-agent children, or ids
+             that do not exist, map to an empty list.
+@@ -1437,12 +1440,16 @@ class SqlAlchemyConversationStore(ConversationStore):
+         if not unique_ids:
+             return result
+ 
++        statement = (
++            select(SqlConversation.parent_conversation_id, SqlConversation.id)
++            .where(SqlConversation.workspace_id == current_workspace_id())
++            .where(SqlConversation.parent_conversation_id.in_(unique_ids))
++        )
++        if not include_archived:
++            statement = statement.where(SqlConversation.archived.is_(False))
+         with self._conv_session("list_child_conversation_ids_by_parent") as ap_sess:
+             rows = ap_sess.execute(
+-                select(SqlConversation.parent_conversation_id, SqlConversation.id)
+-                .where(SqlConversation.workspace_id == current_workspace_id())
+-                .where(SqlConversation.parent_conversation_id.in_(unique_ids))
+-                .order_by(
++                statement.order_by(
+                     SqlConversation.parent_conversation_id,
+                     desc(SqlConversation.created_at),
+                     desc(self._tiebreaker_col),
+diff --git a/tests/server/routes/test_ae_session_activity.py b/tests/server/routes/test_ae_session_activity.py
+index 8218d9b328b7878d21791b90ffc445dbc8ce69a9..7cf872f5b986d8a5291a445e31dc38804b4bf4b2 100644
+--- a/tests/server/routes/test_ae_session_activity.py
++++ b/tests/server/routes/test_ae_session_activity.py
+@@ -27,6 +27,7 @@ from omnigent.server.routes._sessions.ae_session_activity import (
+     session_active_child_count,
+     session_background_task_count,
+     session_blocked_on,
++    settle_archived_session,
+ )
+ from omnigent.server.routes._sessions.common import _session_blocked_on_cache
+ from omnigent.server.routes.sessions import create_sessions_router
+@@ -348,3 +349,100 @@ def test_updates_stream_pushes_change_when_background_count_moves(
+ 
+         sessions_routes._session_background_task_count_cache.pop(parent_id, None)
+         assert _recv_parent_change(ws, parent_id)["background_task_count"] == 0
++
++
++def test_closed_child_stops_counting_while_open_sibling_still_counts(
++    app: FastAPI, stores: Stores, touched, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Archiving a running child (``sys_session_close``) drops it from the badge at once."""
++    # Keep the deferred teardown from firing; it is covered on its own below.
++    monkeypatch.setattr(sessions_routes, "_ARCHIVE_STOP_UNDO_GRACE_S", 3600.0)
++    parent_id = _seed_parent(stores, touched, "parent")
++    closed = _seed_child(stores, touched, parent_id, "running")
++    _seed_child(stores, touched, parent_id, "running")
++    client = TestClient(app)
++    assert _list_rows(app)[parent_id]["active_child_count"] == 2
++
++    resp = client.patch(f"/v1/sessions/{closed}", json={"archived": True}, headers=_HEADERS)
++    assert resp.status_code == 200, resp.text
++    assert _list_rows(app)[parent_id]["active_child_count"] == 1
++
++    # An Undo brings a still-running child back into the count.
++    resp = client.patch(f"/v1/sessions/{closed}", json={"archived": False}, headers=_HEADERS)
++    assert resp.status_code == 200, resp.text
++    assert _list_rows(app)[parent_id]["active_child_count"] == 2
++
++
++def test_archived_child_with_outstanding_approval_does_not_count(
++    app: FastAPI, stores: Stores, touched
++) -> None:
++    """A closed child is left out even with an approval and a busy cached status."""
++    parent_id = _seed_parent(stores, touched, "parent")
++    child = _seed_child(stores, touched, parent_id, "waiting")
++    pending_elicitations.record_publish(
++        child, {"type": "response.elicitation_request", "elicitation_id": "elicit_closed"}
++    )
++    assert _list_rows(app)[parent_id]["active_child_count"] == 1
++
++    stores[0].update_conversation(child, archived=True)
++
++    assert _list_rows(app)[parent_id]["active_child_count"] == 0
++
++
++def test_child_id_query_leaves_archived_children_out_only_when_asked(
++    stores: Stores, touched
++) -> None:
++    """The default keeps archived children, for recovery and the stop sweep."""
++    conversation_store = stores[0]
++    parent_id = _seed_parent(stores, touched, "parent")
++    closed = _seed_child(stores, touched, parent_id, None)
++    open_child = _seed_child(stores, touched, parent_id, None)
++    conversation_store.update_conversation(closed, archived=True)
++
++    every = conversation_store.list_child_conversation_ids_by_parent([parent_id])
++    unarchived = conversation_store.list_child_conversation_ids_by_parent(
++        [parent_id], include_archived=False
++    )
++
++    assert set(every[parent_id]) == {closed, open_child}
++    assert unarchived[parent_id] == [open_child]
++
++
++def test_settle_archived_session_publishes_idle_only_for_busy(stores: Stores, touched) -> None:
++    """Running, waiting and a stored running settle idle; idle and failed stay put."""
++    parent_id = _seed_parent(stores, touched, "parent")
++    running = _seed_child(stores, touched, parent_id, "running")
++    waiting = _seed_child(stores, touched, parent_id, "waiting")
++    failed = _seed_child(stores, touched, parent_id, "failed")
++    idle = _seed_child(stores, touched, parent_id, "idle")
++    restarted = _seed_child(stores, touched, parent_id, None)
++
++    assert settle_archived_session(running) is True
++    assert settle_archived_session(waiting) is True
++    assert settle_archived_session(failed) is False
++    assert settle_archived_session(idle) is False
++    assert settle_archived_session(restarted, "running") is True
++
++    cache = sessions_routes._session_status_cache
++    assert [cache.get(c) for c in (running, waiting, failed, idle, restarted)] == [
++        "idle",
++        "idle",
++        "failed",
++        "idle",
++        "idle",
++    ]
++
++
++def test_archive_teardown_settles_a_closed_child_still_marked_running(
++    stores: Stores, touched
++) -> None:
++    """The deferred archive stop leaves a closed child idle, not running for good."""
++    conversation_store = stores[0]
++    parent_id = _seed_parent(stores, touched, "parent")
++    child = _seed_child(stores, touched, parent_id, "running")
++    conversation_store.update_conversation(child, archived=True)
++
++    asyncio.run(orchestration._archive_stop(child, conversation_store, None, None))
++
++    assert sessions_routes._session_status_cache.get(child) == "idle"
++    assert session_active_child_count([child]) == 0

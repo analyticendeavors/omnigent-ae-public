@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 23:20:04 -0700
+Subject: [PATCH 110/148] [ae-patch] Read a dead permission hook's
+ approval-wait marker as stale before the TTL
+
+A deploy SIGTERMs the runner while a PreToolUse permission hook is parked,
+and the hook dies before its cleanup clears its marker. The next runner then
+read the marker as a pending Claude prompt for the whole 420 s TTL and
+refused every send with "Answer the pending Claude question or permission
+request before sending a message". A live hook refreshes its marker every
+60 s, so once a marker is older than APPROVAL_WAIT_ORPHAN_GRACE_S (90 s)
+approval_wait_is_fresh probes the pid in its name with process_alive and
+treats a gone or zombie process as stale. Younger markers are never probed,
+so a hook whose pid reads differently here (a launcher's pid namespace) is
+never misjudged, and the probe is Windows-safe. The TTL stays the backstop
+for a reused pid or a name with no pid.
+---
+ omnigent/harnesses/claude_native/bridge.py    | 37 ++++++++-
+ .../test_claude_native_bridge.py              | 76 +++++++++++++++++++
+ 2 files changed, 109 insertions(+), 4 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 7dfee7e61df41a63558c1e13f5f4c6f35f8f8059..0a5233a4d5d55ee5859ea399ac709bcf16c4a428 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -203,6 +203,11 @@ APPROVAL_WAIT_MARKER_REFRESH_S = 60.0
+ # Several refresh intervals of slack, so a hook that is slow to wake never
+ # reads stale; a hook killed mid-wait leaves a marker that expires on its own.
+ APPROVAL_WAIT_MARKER_TTL_S = 420.0
++# Past this age a live hook has missed a refresh, so the marker's pid is
++# probed and a dead one makes the marker stale before the TTL (a deploy kills
++# a parked hook before its cleanup). Younger markers are never probed, so a
++# hook whose pid reads differently here (a launcher's pid namespace) is safe.
++APPROVAL_WAIT_ORPHAN_GRACE_S = APPROVAL_WAIT_MARKER_REFRESH_S + 30.0
+ _CONFIG_FILE = "bridge.json"
+ _SERVER_FILE = "server.json"
+ # Control socket of one ``serve-mcp`` process under the harness socket root,
+@@ -1533,6 +1538,26 @@ def touch_approval_wait_marker(marker: Path) -> None:
+         _logger.debug("Could not touch approval-wait marker", exc_info=True)
+ 
+ 
++def _approval_wait_owner_alive(marker: Path) -> bool:
++    """
++    Whether the hook that wrote *marker* is still running.
++
++    The hook names its marker ``<digest>.<pid>.wait`` on this host
++    (:func:`approval_wait_marker_path`).
++
++    :param marker: Marker path from :func:`approval_wait_marker_path`.
++    :returns: ``False`` only when the pid parses and that process is gone or a
++        zombie; ``True`` otherwise, leaving the TTL to decide.
++    """
++    from omnigent.inner._proc import process_alive
++
++    try:
++        pid = int(marker.name.split(".")[-2])
++    except (IndexError, ValueError):
++        return True
++    return pid <= 0 or process_alive(pid)
++
++
+ def clear_approval_wait_marker(marker: Path) -> None:
+     """
+     Remove an approval-wait marker.
+@@ -1559,8 +1584,9 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
+         ``"conv_abc123"``.
+     :param bridge_dir: Derive the marker root from this bridge, matching the hook writer.
+     :returns: ``True`` when any marker was touched within
+-        :data:`APPROVAL_WAIT_MARKER_TTL_S`; ``False`` when none exists, all
+-        are stale, or the root is unreadable.
++        :data:`APPROVAL_WAIT_ORPHAN_GRACE_S`, or within
++        :data:`APPROVAL_WAIT_MARKER_TTL_S` by a hook still running; ``False``
++        when none exists, all are stale or orphaned, or the root is unreadable.
+     """
+     root = bridge_dir.parent / _APPROVAL_WAIT_DIR_NAME if bridge_dir else _APPROVAL_WAIT_ROOT
+     try:
+@@ -1574,7 +1600,10 @@ def approval_wait_is_fresh(session_id: str, *, bridge_dir: Path | None = None) -
+             touched_at = marker.stat().st_mtime
+         except OSError:
+             continue
+-        if now - touched_at < APPROVAL_WAIT_MARKER_TTL_S:
++        age = now - touched_at
++        if age < APPROVAL_WAIT_ORPHAN_GRACE_S or (
++            age < APPROVAL_WAIT_MARKER_TTL_S and _approval_wait_owner_alive(marker)
++        ):
+             fresh = True
+         else:
+             clear_approval_wait_marker(marker)
+@@ -1592,7 +1621,7 @@ def hold_approval_wait_marker(marker: Path) -> Iterator[None]:
+     wait) reads as parked exactly like one a gateway severs every few
+     minutes. The refresher is stopped before the marker is cleared so a late
+     touch cannot resurrect it; a hook killed mid-wait takes the thread with
+-    it and its marker simply expires.
++    it, and its marker reads stale once it misses a refresh and its pid is gone.
+ 
+     :param marker: Marker path from :func:`approval_wait_marker_path`.
+     :returns: ``None`` for the duration of the block.
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 5c6744990a3dc27daa7fa83eb9c4c2d56216498c..6e08bc47bb9497cb70353264081825cab77eb14b 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -12893,6 +12893,82 @@ def test_http_ingress_authenticates_before_draining_a_bounded_body(tmp_path: Pat
+         httpd.server_close()
+ 
+ 
++@pytest.mark.parametrize(
++    ("age_s", "owner_alive", "fresh"),
++    [
++        # Young: never probed, so a live hook in another pid namespace is safe.
++        (30.0, False, True),
++        # Missed a refresh and its hook is gone (a deploy killed it mid-wait).
++        (100.0, False, False),
++        # Missed a refresh but its hook still runs (slow to wake): the TTL decides.
++        (100.0, True, True),
++        # Past the TTL, alive or not.
++        (500.0, True, False),
++    ],
++)
++def test_approval_wait_marker_of_a_dead_hook_reads_stale_before_the_ttl(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    age_s: float,
++    owner_alive: bool,
++    fresh: bool,
++) -> None:
++    """
++    A deploy SIGTERMs a parked permission hook before its cleanup, and the next
++    runner refused every send as a pending Claude prompt for the whole TTL.
++    """
++    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT_PARENT", tmp_path / "omnigent-test"
++    )
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT",
++        tmp_path / "omnigent-test" / "approval-parent" / "approval-waits",
++    )
++    probed: list[int] = []
++
++    def fake_alive(pid: int) -> bool:
++        probed.append(pid)
++        return owner_alive
++
++    monkeypatch.setattr("omnigent.inner._proc.process_alive", fake_alive)
++    marker = claude_native_bridge.approval_wait_marker_path("conv_wait")
++    marker.parent.mkdir(parents=True, exist_ok=True)
++    claude_native_bridge.touch_approval_wait_marker(marker)
++    touched = time.time() - age_s
++    os.utime(marker, (touched, touched))
++
++    assert claude_native_bridge.approval_wait_is_fresh("conv_wait") is fresh
++    assert marker.exists() is fresh
++    if age_s < claude_native_bridge.APPROVAL_WAIT_ORPHAN_GRACE_S:
++        assert probed == []
++    elif age_s < claude_native_bridge.APPROVAL_WAIT_MARKER_TTL_S:
++        assert probed == [os.getpid()]
++
++
++def test_approval_wait_marker_without_a_pid_falls_back_to_the_ttl(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A marker name with no pid is never judged dead; only the TTL expires it."""
++    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT_PARENT", tmp_path / "omnigent-test"
++    )
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.bridge._APPROVAL_WAIT_ROOT",
++        tmp_path / "omnigent-test" / "approval-parent" / "approval-waits",
++    )
++    monkeypatch.setattr("omnigent.inner._proc.process_alive", lambda _pid: False)
++    marker = claude_native_bridge.approval_wait_marker_path("conv_wait")
++    odd = marker.with_name(f"{marker.name.split('.')[0]}.x.wait")
++    odd.parent.mkdir(parents=True, exist_ok=True)
++    claude_native_bridge.touch_approval_wait_marker(odd)
++    touched = time.time() - 100.0
++    os.utime(odd, (touched, touched))
++    assert claude_native_bridge.approval_wait_is_fresh("conv_wait")
++
++
+ def test_approval_wait_marker_tracks_a_parked_permission_hook(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,

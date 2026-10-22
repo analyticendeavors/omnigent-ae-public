@@ -1,0 +1,1201 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 24 Sep 2026 15:20:13 +0000
+Subject: [PATCH 005/148] [ae-patch] Add a split view that shows up to four
+ sessions side by side
+
+omnigent-ae patch P5 (2026-09-24). "Open in split view" on a sidebar
+session's menu (kebab or right-click, any row, desktop only) opens
+/split?s=a,b with the session being viewed and the chosen one. Up to four
+panes, each a full session with its composer, a session switcher, an
+"open alone" button and a close button. Dividers drag or take the arrow
+keys; the layout is kept in local storage and a bare /split restores it.
+Below 1024px the route shows the first pane's session on its own.
+
+Each pane is a frame of the ordinary /c/:id route. The chat store is a
+module-scope singleton with one foreground conversation, so ChatPage
+cannot render twice in one React tree; a frame gives each pane its own
+store, streams and keyboard focus without touching the store. The page
+polls each frame's location once a second so a pane that opens another
+session inside itself keeps the layout in step.
+
+Logic lives in three new files (lib/aeSplitLayout.ts, pages/AeSplitPage.tsx,
+shell/AeSplitMenuItem.tsx). The upstream edits are ten lines: the /split
+route outside AppShell in App.tsx, the item after P4's Status submenu in
+Sidebar.tsx, and one condition in AppShell's initialSidebarOpen so a pane
+starts with its sidebar closed. Tests: aeSplitLayout.test.ts,
+AeSplitPage.test.tsx and three cases in Sidebar.aeStatus.test.tsx.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014Nm9UQHgUeVcuDrQdwg8mY
+---
+ web/src/App.tsx                         |   2 +
+ web/src/lib/aeSplitLayout.test.ts       | 154 ++++++++++
+ web/src/lib/aeSplitLayout.ts            | 223 ++++++++++++++
+ web/src/pages/AeSplitPage.test.tsx      | 181 ++++++++++++
+ web/src/pages/AeSplitPage.tsx           | 368 ++++++++++++++++++++++++
+ web/src/shell/AeSplitMenuItem.tsx       |  61 ++++
+ web/src/shell/AppShell.tsx              |   3 +-
+ web/src/shell/Sidebar.aeStatus.test.tsx |  51 ++++
+ web/src/shell/Sidebar.tsx               |   6 +
+ 9 files changed, 1048 insertions(+), 1 deletion(-)
+ create mode 100644 web/src/lib/aeSplitLayout.test.ts
+ create mode 100644 web/src/lib/aeSplitLayout.ts
+ create mode 100644 web/src/pages/AeSplitPage.test.tsx
+ create mode 100644 web/src/pages/AeSplitPage.tsx
+ create mode 100644 web/src/shell/AeSplitMenuItem.tsx
+
+diff --git a/web/src/App.tsx b/web/src/App.tsx
+index e4b0959a8e195115c48a395ddf364a926e68dd6e..e6fd56c2561c8322f0d33935946fd0d957d7dbe1 100644
+--- a/web/src/App.tsx
++++ b/web/src/App.tsx
+@@ -10,6 +10,7 @@ import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { AppShell } from "@/shell/AppShell";
+ import { ExtensionPageRoute } from "@/extensions/ExtensionPageRoute";
++import { AeSplitPage } from "@/pages/AeSplitPage";
+ 
+ // Bind a page component to its analytics page-view id. Declaring the id here,
+ // beside the component, keeps the route table clean and means no route ships
+@@ -165,6 +166,7 @@ function AppRoutes({ basename }: AppProps) {
+           </>
+         )}
+         <Route path={`${prefix}/approve/:sessionId/:elicitationId`} element={<ApprovePage />} />
++        <Route path={`${prefix}/split`} element={<AeSplitPage />} />
+         <Route element={<AppShell />}>
+           <Route path={prefix || "/"} element={<ChatPage />} />
+           <Route path={`${prefix}/c/:conversationId`} element={<ChatPage />} />
+diff --git a/web/src/lib/aeSplitLayout.test.ts b/web/src/lib/aeSplitLayout.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bad88a25f4552e81343db5be40efd47ff5a61a2
+--- /dev/null
++++ b/web/src/lib/aeSplitLayout.test.ts
+@@ -0,0 +1,154 @@
++// Tests for the split view's layout helpers (omnigent-ae patch P5): the URL
++// round trip, the remembered layout, "Open in split view"'s merge rule, the
++// divider math and the pane-frame check.
++
++import { beforeEach, describe, expect, it } from "vitest";
++import {
++  AE_SPLIT_MAX_PANES,
++  AE_SPLIT_MIN_FRACTION,
++  AE_SPLIT_STORAGE_KEY,
++  addEmptyPane,
++  cleanPanes,
++  formatSplitParam,
++  isAeSplitPane,
++  layoutWithSession,
++  normalizeSizes,
++  paneSessionFromPath,
++  parseSplitParam,
++  readStoredLayout,
++  removePane,
++  resizeAt,
++  splitHref,
++  writeStoredLayout,
++} from "./aeSplitLayout";
++
++beforeEach(() => {
++  window.localStorage.clear();
++});
++
++describe("split URL", () => {
++  it("parses sessions and the new-pane token, dropping duplicates and blanks", () => {
++    expect(parseSplitParam("a,new,b,a,,")).toEqual(["a", null, "b"]);
++  });
++
++  it("caps at the maximum pane count", () => {
++    expect(parseSplitParam("a,b,c,d,e")).toHaveLength(AE_SPLIT_MAX_PANES);
++  });
++
++  it("treats an absent or empty parameter as no layout", () => {
++    expect(parseSplitParam(null)).toBeNull();
++    expect(parseSplitParam(" , ")).toBeNull();
++  });
++
++  it("round-trips through formatSplitParam and splitHref", () => {
++    expect(formatSplitParam(["a", null])).toBe("a,new");
++    expect(splitHref(["a", "b"])).toBe("/split?s=a,b");
++    expect(parseSplitParam(formatSplitParam(["x", null, "y"]))).toEqual(["x", null, "y"]);
++  });
++
++  it("keeps empty panes but not duplicate sessions", () => {
++    expect(cleanPanes([null, null, "a", "a"])).toEqual([null, null, "a"]);
++  });
++});
++
++describe("pane paths", () => {
++  it("reads the session from a chat path and null from the landing page", () => {
++    expect(paneSessionFromPath("/c/conv_1")).toBe("conv_1");
++    expect(paneSessionFromPath("/c/conv_1/")).toBe("conv_1");
++    expect(paneSessionFromPath("/")).toBeNull();
++  });
++
++  it("returns undefined for pages that are not a session", () => {
++    expect(paneSessionFromPath("/settings/general")).toBeUndefined();
++    expect(paneSessionFromPath("/inbox")).toBeUndefined();
++  });
++});
++
++describe("remembered layout", () => {
++  it("writes and reads back panes and sizes", () => {
++    writeStoredLayout({ panes: ["a", "b"], sizes: [0.3, 0.7] });
++    expect(readStoredLayout()).toEqual({ panes: ["a", "b"], sizes: [0.3, 0.7] });
++  });
++
++  it("repairs sizes that do not fit the panes", () => {
++    window.localStorage.setItem(
++      AE_SPLIT_STORAGE_KEY,
++      JSON.stringify({ panes: ["a", "b"], sizes: [1] }),
++    );
++    expect(readStoredLayout()?.sizes).toEqual([0.5, 0.5]);
++  });
++
++  it("ignores garbage", () => {
++    window.localStorage.setItem(AE_SPLIT_STORAGE_KEY, "{not json");
++    expect(readStoredLayout()).toBeNull();
++    window.localStorage.setItem(AE_SPLIT_STORAGE_KEY, JSON.stringify({ panes: [] }));
++    expect(readStoredLayout()).toBeNull();
++  });
++});
++
++describe("layoutWithSession", () => {
++  it("seeds with the session being viewed when nothing is remembered", () => {
++    expect(layoutWithSession(null, "b", "a").panes).toEqual(["a", "b"]);
++  });
++
++  it("opens the session alone when nothing is remembered or viewed", () => {
++    expect(layoutWithSession(null, "b", null).panes).toEqual(["b"]);
++  });
++
++  it("appends to the remembered panes and keeps a session already there in place", () => {
++    const stored = { panes: ["a", "b"], sizes: [0.4, 0.6] };
++    expect(layoutWithSession(stored, "c", "x").panes).toEqual(["a", "b", "c"]);
++    expect(layoutWithSession(stored, "a", "x")).toEqual(stored);
++  });
++
++  it("replaces the last pane at the maximum", () => {
++    const stored = { panes: ["a", "b", "c", "d"], sizes: [0.25, 0.25, 0.25, 0.25] };
++    expect(layoutWithSession(stored, "e", null).panes).toEqual(["a", "b", "c", "e"]);
++  });
++});
++
++describe("sizes", () => {
++  it("normalizes to fractions summing to one", () => {
++    expect(normalizeSizes([1, 3], 2)).toEqual([0.25, 0.75]);
++    expect(normalizeSizes([0, 1], 2)).toEqual([0.5, 0.5]);
++  });
++
++  it("moves one divider and clamps at the minimum width", () => {
++    const [a, b, c] = resizeAt([0.5, 0.25, 0.25], 1, 0.1);
++    expect(a).toBe(0.5);
++    expect(b).toBeCloseTo(0.35);
++    expect(c).toBeCloseTo(0.15);
++    const clamped = resizeAt([0.5, 0.5], 0, -0.9);
++    expect(clamped[0]).toBeCloseTo(AE_SPLIT_MIN_FRACTION);
++    expect(clamped[1]).toBeCloseTo(1 - AE_SPLIT_MIN_FRACTION);
++  });
++
++  it("gives a closed pane's width to the survivors", () => {
++    expect(removePane({ panes: ["a", "b", "c"], sizes: [0.5, 0.25, 0.25] }, 0)).toEqual({
++      panes: ["b", "c"],
++      sizes: [0.5, 0.5],
++    });
++  });
++
++  it("adds an empty pane with equal widths, up to the maximum", () => {
++    expect(addEmptyPane({ panes: ["a"], sizes: [1] })).toEqual({
++      panes: ["a", null],
++      sizes: [0.5, 0.5],
++    });
++    const full = { panes: ["a", "b", "c", "d"], sizes: [0.25, 0.25, 0.25, 0.25] };
++    expect(addEmptyPane(full)).toBe(full);
++  });
++});
++
++describe("isAeSplitPane", () => {
++  it("is true only for a framed window whose name carries the prefix", () => {
++    const top = { name: "ae-split-pane-1" } as Window;
++    (top as { parent: Window }).parent = top;
++    expect(isAeSplitPane(top)).toBe(false);
++    const framed = { name: "ae-split-pane-1", parent: {} } as unknown as Window;
++    expect(isAeSplitPane(framed)).toBe(true);
++    const other = { name: "preview", parent: {} } as unknown as Window;
++    expect(isAeSplitPane(other)).toBe(false);
++    expect(isAeSplitPane(window)).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeSplitLayout.ts b/web/src/lib/aeSplitLayout.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..582fc48e4458dfcba4ac6f4bad07329e0373cf79
+--- /dev/null
++++ b/web/src/lib/aeSplitLayout.ts
+@@ -0,0 +1,223 @@
++// Layout state for the split view (omnigent-ae patch P5): which sessions sit in
++// which pane, how wide each pane is, and how that round-trips through the URL
++// (`/split?s=a,b`) and local storage. Pure helpers, no React, so the page, the
++// sidebar menu item and the shell's pane check share one definition.
++//
++// Each pane is an iframe of the ordinary `/c/:id` route. The chat store is a
++// module-scope singleton with one foreground conversation, so ChatPage cannot
++// render twice in one React tree; a frame gives every pane its own store,
++// streams and keyboard focus without touching upstream's store.
++
++/** At most this many panes; the Claude desktop app's multi-panel layout tops out at four. */
++export const AE_SPLIT_MAX_PANES = 4;
++
++/** Below this viewport width the split route falls back to a single session. */
++export const AE_SPLIT_MIN_VIEWPORT_PX = 1024;
++
++/** No pane may be narrower than this fraction of the row while resizing. */
++export const AE_SPLIT_MIN_FRACTION = 0.15;
++
++/** Local storage key for the remembered layout. */
++export const AE_SPLIT_STORAGE_KEY = "ae.splitView.v1";
++
++/** Every pane frame's window name starts with this, so the shell can tell it is one. */
++export const AE_SPLIT_PANE_NAME_PREFIX = "ae-split-pane";
++
++/** The URL token for a pane with no session yet (it shows the new-session page). */
++const NEW_PANE_TOKEN = "new";
++
++/** One pane: a session id, or `null` for a pane still on the new-session page. */
++export type AeSplitPane = string | null;
++
++export interface AeSplitLayout {
++  panes: AeSplitPane[];
++  /** Fractions of the row, one per pane, summing to 1. */
++  sizes: number[];
++}
++
++/** Equal widths for *count* panes. */
++export function equalSizes(count: number): number[] {
++  if (count <= 0) return [];
++  return Array.from({ length: count }, () => 1 / count);
++}
++
++/**
++ * Coerce *sizes* to *count* positive fractions summing to 1; anything that
++ * does not fit (wrong length, a zero, NaN) becomes equal widths.
++ */
++export function normalizeSizes(sizes: readonly number[] | undefined, count: number): number[] {
++  if (!sizes || sizes.length !== count || count === 0) return equalSizes(count);
++  if (sizes.some((s) => !Number.isFinite(s) || s <= 0)) return equalSizes(count);
++  const total = sizes.reduce((a, b) => a + b, 0);
++  return sizes.map((s) => s / total);
++}
++
++/**
++ * Drop duplicate sessions and cap at the maximum. Empty panes are kept (each
++ * is its own new-session page), duplicates of a session are not: two frames on
++ * one session would race each other's composer.
++ */
++export function cleanPanes(panes: readonly AeSplitPane[]): AeSplitPane[] {
++  const seen = new Set<string>();
++  const out: AeSplitPane[] = [];
++  for (const pane of panes) {
++    if (pane !== null) {
++      if (seen.has(pane)) continue;
++      seen.add(pane);
++    }
++    out.push(pane);
++    if (out.length === AE_SPLIT_MAX_PANES) break;
++  }
++  return out;
++}
++
++/** `?s=a,new,b` to panes; `null` when the parameter is absent or empty. */
++export function parseSplitParam(value: string | null): AeSplitPane[] | null {
++  if (value === null) return null;
++  const tokens = value
++    .split(",")
++    .map((t) => t.trim())
++    .filter((t) => t !== "");
++  if (tokens.length === 0) return null;
++  return cleanPanes(tokens.map((t) => (t === NEW_PANE_TOKEN ? null : t)));
++}
++
++/** Panes to the `s` parameter's value. */
++export function formatSplitParam(panes: readonly AeSplitPane[]): string {
++  return panes.map((p) => p ?? NEW_PANE_TOKEN).join(",");
++}
++
++/** The split route for *panes*, e.g. `/split?s=conv_a,conv_b`. */
++export function splitHref(panes: readonly AeSplitPane[]): string {
++  return `/split?s=${formatSplitParam(panes)}`;
++}
++
++/** The session a pane frame is showing, from its pathname; `undefined` for any non-chat page. */
++export function paneSessionFromPath(pathname: string): AeSplitPane | undefined {
++  if (pathname === "/" || pathname === "") return null;
++  const match = /\/c\/([^/?#]+)\/?$/.exec(pathname);
++  return match ? decodeURIComponent(match[1]!) : undefined;
++}
++
++/** The URL a pane frame loads. */
++export function paneSrc(pane: AeSplitPane): string {
++  return pane === null ? "/" : `/c/${encodeURIComponent(pane)}`;
++}
++
++/** The remembered layout, or `null` when there is none or storage is unreadable. */
++export function readStoredLayout(
++  storage: Storage | undefined = safeStorage(),
++): AeSplitLayout | null {
++  if (!storage) return null;
++  try {
++    const raw = storage.getItem(AE_SPLIT_STORAGE_KEY);
++    if (!raw) return null;
++    const parsed = JSON.parse(raw) as Partial<AeSplitLayout>;
++    if (!Array.isArray(parsed.panes)) return null;
++    const panes = cleanPanes(
++      parsed.panes.filter((p): p is AeSplitPane => p === null || typeof p === "string"),
++    );
++    if (panes.length === 0) return null;
++    return { panes, sizes: normalizeSizes(parsed.sizes, panes.length) };
++  } catch {
++    return null;
++  }
++}
++
++/** Remember *layout*; a full or blocked storage is not an error worth surfacing. */
++export function writeStoredLayout(
++  layout: AeSplitLayout,
++  storage: Storage | undefined = safeStorage(),
++): void {
++  if (!storage) return;
++  try {
++    storage.setItem(AE_SPLIT_STORAGE_KEY, JSON.stringify(layout));
++  } catch {
++    // Quota or privacy mode: the URL still carries the panes.
++  }
++}
++
++function safeStorage(): Storage | undefined {
++  try {
++    return typeof window === "undefined" ? undefined : window.localStorage;
++  } catch {
++    return undefined;
++  }
++}
++
++/**
++ * The layout to open when the user picks "Open in split view" on *sessionId*:
++ * the remembered panes (or, with none, the session being viewed), plus the
++ * chosen one. Already present, it stays where it is; at the maximum, it
++ * replaces the last pane.
++ */
++export function layoutWithSession(
++  stored: AeSplitLayout | null,
++  sessionId: string,
++  currentSessionId: string | null,
++): AeSplitLayout {
++  let panes: AeSplitPane[] = stored?.panes.length
++    ? [...stored.panes]
++    : currentSessionId
++      ? [currentSessionId]
++      : [];
++  if (!panes.includes(sessionId)) {
++    if (panes.length >= AE_SPLIT_MAX_PANES) panes = panes.slice(0, AE_SPLIT_MAX_PANES - 1);
++    panes.push(sessionId);
++  }
++  panes = cleanPanes(panes);
++  const keepSizes = stored !== null && stored.panes.length === panes.length;
++  return { panes, sizes: normalizeSizes(keepSizes ? stored.sizes : undefined, panes.length) };
++}
++
++/**
++ * Move the divider after pane *index* by *delta* (a fraction of the row),
++ * clamped so neither neighbour shrinks below *min*. Other panes keep their width.
++ */
++export function resizeAt(
++  sizes: readonly number[],
++  index: number,
++  delta: number,
++  min: number = AE_SPLIT_MIN_FRACTION,
++): number[] {
++  const left = sizes[index];
++  const right = sizes[index + 1];
++  if (left === undefined || right === undefined) return [...sizes];
++  const pair = left + right;
++  const nextLeft = Math.min(Math.max(left + delta, min), pair - min);
++  const out = [...sizes];
++  out[index] = nextLeft;
++  out[index + 1] = pair - nextLeft;
++  return out;
++}
++
++/** Remove pane *index*; its width goes to the survivors in proportion. */
++export function removePane(layout: AeSplitLayout, index: number): AeSplitLayout {
++  const panes = layout.panes.filter((_, i) => i !== index);
++  const sizes = normalizeSizes(
++    layout.sizes.filter((_, i) => i !== index),
++    panes.length,
++  );
++  return { panes, sizes };
++}
++
++/** Append an empty pane (the new-session page), equal widths; a no-op at the maximum. */
++export function addEmptyPane(layout: AeSplitLayout): AeSplitLayout {
++  if (layout.panes.length >= AE_SPLIT_MAX_PANES) return layout;
++  const panes = [...layout.panes, null];
++  return { panes, sizes: equalSizes(panes.length) };
++}
++
++/**
++ * True inside a split-view pane frame. The frame's window name survives
++ * navigation inside it, so this stays true after the pane moves to another
++ * session. The shell reads it to start with its sidebar closed.
++ */
++export function isAeSplitPane(win: Window | undefined = globalThis.window): boolean {
++  if (!win) return false;
++  try {
++    return win.parent !== win && win.name.startsWith(AE_SPLIT_PANE_NAME_PREFIX);
++  } catch {
++    return false;
++  }
++}
+diff --git a/web/src/pages/AeSplitPage.test.tsx b/web/src/pages/AeSplitPage.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..e584dd167360b2ce725f1ca47b561f233b7156cf
+--- /dev/null
++++ b/web/src/pages/AeSplitPage.test.tsx
+@@ -0,0 +1,181 @@
++// Tests for the split view (omnigent-ae patch P5): panes from the URL or the
++// remembered layout, one frame per session, close / add / pick, the divider,
++// following a frame that moves to another session, and the single-session
++// fallback below 1024px.
++
++import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { AE_SPLIT_STORAGE_KEY, readStoredLayout } from "@/lib/aeSplitLayout";
++
++const mocks = vi.hoisted(() => ({
++  conversations: [] as { id: string; title: string | null }[],
++}));
++
++vi.mock("@/hooks/useConversations", () => ({
++  useConversations: () => ({
++    data: { pages: [{ data: mocks.conversations }], pageParams: [undefined] },
++  }),
++}));
++
++import { AE_SPLIT_FRAME_POLL_MS, AeSplitPage, initialLayout } from "./AeSplitPage";
++
++let wide = true;
++
++function setViewport(isWide: boolean) {
++  wide = isWide;
++  window.matchMedia = ((query: string) => ({
++    matches: wide,
++    media: query,
++    onchange: null,
++    addListener: () => {},
++    removeListener: () => {},
++    addEventListener: () => {},
++    removeEventListener: () => {},
++    dispatchEvent: () => false,
++  })) as unknown as typeof window.matchMedia;
++}
++
++function Where() {
++  const location = useLocation();
++  return <output data-testid="where">{location.pathname + location.search}</output>;
++}
++
++function renderAt(url: string) {
++  return render(
++    <MemoryRouter initialEntries={[url]}>
++      <Routes>
++        <Route path="/split" element={<AeSplitPage />} />
++        <Route path="*" element={<p>single</p>} />
++      </Routes>
++      <Where />
++    </MemoryRouter>,
++  );
++}
++
++function frames() {
++  return screen.getAllByTestId("ae-split-frame") as HTMLIFrameElement[];
++}
++
++beforeEach(() => {
++  window.localStorage.clear();
++  mocks.conversations = [
++    { id: "a", title: "Alpha" },
++    { id: "b", title: "Beta" },
++    { id: "c", title: "Gamma" },
++  ];
++  setViewport(true);
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++});
++
++describe("AeSplitPage", () => {
++  it("renders one frame per session in the URL, titled from the session list", () => {
++    renderAt("/split?s=a,b");
++    expect(frames().map((f) => f.getAttribute("src"))).toEqual(["/c/a", "/c/b"]);
++    expect(screen.getAllByTestId("ae-split-pane").map((p) => p.getAttribute("aria-label"))).toEqual(
++      ["Alpha", "Beta"],
++    );
++    expect(screen.getAllByTestId("ae-split-divider")).toHaveLength(1);
++    expect(screen.getByTestId("ae-split-count")).toHaveTextContent("2 of 4 panes");
++    expect(frames()[0]!.name).toMatch(/^ae-split-pane-/);
++  });
++
++  it("remembers the layout and restores it when the URL carries none", () => {
++    renderAt("/split?s=a,b");
++    expect(readStoredLayout()?.panes).toEqual(["a", "b"]);
++    cleanup();
++    renderAt("/split");
++    expect(frames().map((f) => f.getAttribute("src"))).toEqual(["/c/a", "/c/b"]);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b");
++  });
++
++  it("closes a pane without reloading its neighbour", () => {
++    renderAt("/split?s=a,b,c");
++    const survivor = frames()[2];
++    fireEvent.click(screen.getAllByTestId("ae-split-close")[1]!);
++    expect(frames().map((f) => f.getAttribute("src"))).toEqual(["/c/a", "/c/c"]);
++    expect(frames()[1]).toBe(survivor);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,c");
++    expect(readStoredLayout()?.panes).toEqual(["a", "c"]);
++  });
++
++  it("adds an empty pane on the new-session page, up to four", () => {
++    renderAt("/split?s=a,b,c");
++    fireEvent.click(screen.getByTestId("ae-split-add"));
++    expect(frames().map((f) => f.getAttribute("src"))).toEqual(["/c/a", "/c/b", "/c/c", "/"]);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b,c,new");
++    expect(screen.getByTestId("ae-split-add")).toBeDisabled();
++  });
++
++  it("switches a pane's session from its picker and disables sessions open elsewhere", () => {
++    renderAt("/split?s=a,b");
++    const picker = screen.getAllByTestId("ae-split-picker")[1] as HTMLSelectElement;
++    const optionA = Array.from(picker.options).find((o) => o.value === "a")!;
++    expect(optionA.disabled).toBe(true);
++    fireEvent.change(picker, { target: { value: "c" } });
++    expect(frames().map((f) => f.getAttribute("src"))).toEqual(["/c/a", "/c/c"]);
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,c");
++  });
++
++  it("moves a divider with the arrow keys and remembers the widths", () => {
++    renderAt("/split?s=a,b");
++    const divider = screen.getByTestId("ae-split-divider");
++    fireEvent.keyDown(divider, { key: "ArrowRight" });
++    fireEvent.keyDown(divider, { key: "ArrowRight" });
++    expect(divider.getAttribute("aria-valuenow")).toBe("54");
++    const sizes = readStoredLayout()!.sizes;
++    expect(sizes[0]).toBeCloseTo(0.54);
++    expect(sizes[1]).toBeCloseTo(0.46);
++  });
++
++  it("follows a frame that opens another session inside it", () => {
++    vi.useFakeTimers();
++    renderAt("/split?s=a,new");
++    const frame = frames()[1]!;
++    Object.defineProperty(frame, "contentWindow", {
++      configurable: true,
++      value: { location: { pathname: "/c/c" }, document: { title: "Gamma" } },
++    });
++    act(() => {
++      vi.advanceTimersByTime(AE_SPLIT_FRAME_POLL_MS);
++    });
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,c");
++    // The frame already shows that session; it is not reloaded.
++    expect(frames()[1]).toBe(frame);
++  });
++
++  it("ignores a frame that moves onto a session another pane holds", () => {
++    vi.useFakeTimers();
++    renderAt("/split?s=a,b");
++    Object.defineProperty(frames()[1]!, "contentWindow", {
++      configurable: true,
++      value: { location: { pathname: "/c/a" }, document: { title: "" } },
++    });
++    act(() => {
++      vi.advanceTimersByTime(AE_SPLIT_FRAME_POLL_MS);
++    });
++    expect(screen.getByTestId("where")).toHaveTextContent("/split?s=a,b");
++  });
++
++  it("falls back to the first session alone below 1024px", () => {
++    setViewport(false);
++    renderAt("/split?s=b,a");
++    expect(screen.getByText("single")).toBeInTheDocument();
++    expect(screen.getByTestId("where")).toHaveTextContent("/c/b");
++  });
++
++  it("leaves for the first pane's session from Single view", () => {
++    renderAt("/split?s=new,b");
++    fireEvent.click(screen.getByTestId("ae-split-exit"));
++    expect(screen.getByTestId("where")).toHaveTextContent("/c/b");
++  });
++
++  it("ignores a stored layout that is not JSON", () => {
++    window.localStorage.setItem(AE_SPLIT_STORAGE_KEY, "nope");
++    expect(initialLayout(null, readStoredLayout())).toEqual({ panes: [null], sizes: [1] });
++  });
++});
+diff --git a/web/src/pages/AeSplitPage.tsx b/web/src/pages/AeSplitPage.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9f0ebd61921aa52d07b2fb4fc51fd1c85c743af
+--- /dev/null
++++ b/web/src/pages/AeSplitPage.tsx
+@@ -0,0 +1,368 @@
++// The split view (omnigent-ae patch P5, 2026-09-24): two to four sessions side
++// by side in one window, like the Claude desktop app's multi-panel layout.
++// `/split?s=a,b` renders one pane per session in a resizable row; each pane is
++// a frame of the ordinary `/c/:id` route (see `lib/aeSplitLayout.ts` for why a
++// frame), with a strip carrying its title, a session switcher, "open alone"
++// and close. The layout is remembered in local storage; with no `s` parameter
++// the remembered one opens. Desktop only: below 1024px the route falls back to
++// the first pane's session on its own.
++
++import { Columns2Icon, Maximize2Icon, PlusIcon, SquareIcon, XIcon } from "lucide-react";
++import {
++  type KeyboardEvent as ReactKeyboardEvent,
++  type PointerEvent as ReactPointerEvent,
++  useCallback,
++  useEffect,
++  useMemo,
++  useRef,
++  useState,
++  useSyncExternalStore,
++} from "react";
++import { Navigate } from "react-router-dom";
++import { Button } from "@/components/ui/button";
++import { type Conversation, useConversations } from "@/hooks/useConversations";
++import {
++  AE_SPLIT_MAX_PANES,
++  AE_SPLIT_MIN_VIEWPORT_PX,
++  AE_SPLIT_PANE_NAME_PREFIX,
++  type AeSplitLayout,
++  type AeSplitPane,
++  addEmptyPane,
++  equalSizes,
++  formatSplitParam,
++  isAeSplitPane,
++  normalizeSizes,
++  paneSessionFromPath,
++  paneSrc,
++  parseSplitParam,
++  readStoredLayout,
++  removePane,
++  resizeAt,
++  writeStoredLayout,
++} from "@/lib/aeSplitLayout";
++import { useNavigate, useSearchParams } from "@/lib/routing";
++
++/** How often the page reads each frame's location and title (a frame's SPA navigation fires no event). */
++export const AE_SPLIT_FRAME_POLL_MS = 1000;
++
++/** One arrow-key press on a divider moves it by this fraction of the row. */
++const KEYBOARD_STEP = 0.02;
++
++const DESKTOP_QUERY = `(min-width: ${AE_SPLIT_MIN_VIEWPORT_PX}px)`;
++
++function subscribeDesktop(onChange: () => void): () => void {
++  if (typeof window === "undefined" || typeof window.matchMedia !== "function") return () => {};
++  const mql = window.matchMedia(DESKTOP_QUERY);
++  mql.addEventListener("change", onChange);
++  return () => mql.removeEventListener("change", onChange);
++}
++
++function getDesktop(): boolean {
++  if (typeof window === "undefined") return true;
++  if (typeof window.matchMedia === "function") return window.matchMedia(DESKTOP_QUERY).matches;
++  return window.innerWidth >= AE_SPLIT_MIN_VIEWPORT_PX;
++}
++
++/** True when the viewport is wide enough for panes (1024px and up). */
++export function useIsSplitViewport(): boolean {
++  return useSyncExternalStore(subscribeDesktop, getDesktop, () => true);
++}
++
++/** The layout the page opens with: the URL's panes, else the remembered ones, else one empty pane. */
++export function initialLayout(param: string | null, stored: AeSplitLayout | null): AeSplitLayout {
++  const fromUrl = parseSplitParam(param);
++  if (fromUrl) {
++    const keep = stored && stored.panes.length === fromUrl.length ? stored.sizes : undefined;
++    return { panes: fromUrl, sizes: normalizeSizes(keep, fromUrl.length) };
++  }
++  if (stored) return stored;
++  return { panes: [null], sizes: [1] };
++}
++
++function sessionLabel(
++  pane: AeSplitPane,
++  frameTitle: string | undefined,
++  byId: Map<string, Conversation>,
++): string {
++  if (pane === null) return "New session";
++  const title = byId.get(pane)?.title?.trim();
++  if (title) return title;
++  if (frameTitle) return frameTitle;
++  return pane;
++}
++
++export function AeSplitPage() {
++  const [searchParams] = useSearchParams();
++  const navigate = useNavigate();
++  const desktop = useIsSplitViewport();
++  const param = searchParams.get("s");
++  const [layout, setLayout] = useState<AeSplitLayout>(() =>
++    initialLayout(param, readStoredLayout()),
++  );
++  const [frameTitles, setFrameTitles] = useState<Record<number, string>>({});
++  const [dragging, setDragging] = useState(false);
++  const rowRef = useRef<HTMLDivElement>(null);
++  const frameRefs = useRef<(HTMLIFrameElement | null)[]>([]);
++  // Frames are keyed by a per-pane serial, not by index or session: closing a
++  // pane must not reload its neighbours, and a pane that navigates inside its
++  // own frame must not be remounted by the layout catching up with it.
++  const serial = useRef(0);
++  const [keys, setKeys] = useState<number[]>(() => layout.panes.map(() => serial.current++));
++
++  const { data } = useConversations("", false, { enabled: desktop });
++  const conversations = useMemo(() => data?.pages.flatMap((p) => p.data) ?? [], [data]);
++  const byId = useMemo(() => new Map(conversations.map((c) => [c.id, c])), [conversations]);
++
++  // Remember the layout and keep the URL on it, so a reload or a copied link
++  // lands on the same panes.
++  useEffect(() => {
++    writeStoredLayout(layout);
++    const next = formatSplitParam(layout.panes);
++    if (next !== param) navigate(`/split?s=${next}`, { replace: true });
++  }, [layout, navigate, param]);
++
++  useEffect(() => {
++    document.title = `Split view (${layout.panes.length})`;
++  }, [layout.panes.length]);
++
++  // Follow each frame: when the user opens another session (or creates one)
++  // inside a pane, the pane now holds that session.
++  useEffect(() => {
++    const timer = window.setInterval(() => {
++      const titles: Record<number, string> = {};
++      const seen: (AeSplitPane | undefined)[] = [];
++      frameRefs.current.forEach((frame, i) => {
++        try {
++          const win = frame?.contentWindow;
++          if (!win) return;
++          seen[i] = paneSessionFromPath(win.location.pathname);
++          const title = win.document.title;
++          if (title) titles[i] = title;
++        } catch {
++          // A frame mid-navigation, or one that left the origin; skip a beat.
++        }
++      });
++      setFrameTitles((prev) => (sameTitles(prev, titles) ? prev : titles));
++      setLayout((prev) => {
++        let changed = false;
++        const panes = prev.panes.map((pane, i) => {
++          const now = seen[i];
++          if (now === undefined || now === pane) return pane;
++          // Never let two panes hold one session; the frame that moved onto
++          // a session already open elsewhere keeps its old slot value.
++          if (now !== null && prev.panes.includes(now)) return pane;
++          changed = true;
++          return now;
++        });
++        return changed ? { ...prev, panes } : prev;
++      });
++    }, AE_SPLIT_FRAME_POLL_MS);
++    return () => window.clearInterval(timer);
++  }, []);
++
++  const setPaneSession = useCallback((index: number, session: AeSplitPane) => {
++    setLayout((prev) => {
++      if (session !== null && prev.panes.some((p, i) => p === session && i !== index)) return prev;
++      const panes = [...prev.panes];
++      panes[index] = session;
++      return { ...prev, panes };
++    });
++    // A picked session is a new document in that frame.
++    setKeys((prev) => prev.map((k, i) => (i === index ? serial.current++ : k)));
++  }, []);
++
++  const closePane = useCallback((index: number) => {
++    setLayout((prev) => removePane(prev, index));
++    setKeys((prev) => prev.filter((_, i) => i !== index));
++  }, []);
++
++  const addPane = useCallback(() => {
++    setLayout((prev) => addEmptyPane(prev));
++    setKeys((prev) => (prev.length >= AE_SPLIT_MAX_PANES ? prev : [...prev, serial.current++]));
++  }, []);
++
++  const startDrag = useCallback((index: number, event: ReactPointerEvent<HTMLDivElement>) => {
++    const row = rowRef.current;
++    if (!row) return;
++    event.preventDefault();
++    const width = row.getBoundingClientRect().width || 1;
++    let lastX = event.clientX;
++    setDragging(true);
++    const onMove = (e: PointerEvent) => {
++      const delta = (e.clientX - lastX) / width;
++      lastX = e.clientX;
++      setLayout((prev) => ({ ...prev, sizes: resizeAt(prev.sizes, index, delta) }));
++    };
++    const onUp = () => {
++      setDragging(false);
++      window.removeEventListener("pointermove", onMove);
++      window.removeEventListener("pointerup", onUp);
++    };
++    window.addEventListener("pointermove", onMove);
++    window.addEventListener("pointerup", onUp);
++  }, []);
++
++  const nudge = useCallback((index: number, event: ReactKeyboardEvent<HTMLDivElement>) => {
++    const step =
++      event.key === "ArrowLeft" ? -KEYBOARD_STEP : event.key === "ArrowRight" ? KEYBOARD_STEP : 0;
++    if (step === 0) return;
++    event.preventDefault();
++    setLayout((prev) => ({ ...prev, sizes: resizeAt(prev.sizes, index, step) }));
++  }, []);
++
++  // A split page inside a pane would nest frames without end; show the session instead.
++  if (isAeSplitPane()) return <Navigate to={paneSrc(layout.panes[0] ?? null)} replace />;
++  if (!desktop)
++    return <Navigate to={paneSrc(layout.panes.find((p) => p !== null) ?? null)} replace />;
++
++  const first = layout.panes.find((p) => p !== null) ?? null;
++
++  return (
++    <div className="flex h-dvh flex-col bg-sidebar text-foreground" data-testid="ae-split-page">
++      <header className="flex h-10 shrink-0 items-center gap-2 border-b border-border px-3">
++        <Columns2Icon className="size-4 text-muted-foreground" aria-hidden="true" />
++        <h1 className="text-sm font-medium">Split view</h1>
++        <span className="text-xs text-muted-foreground" data-testid="ae-split-count">
++          {layout.panes.length} of {AE_SPLIT_MAX_PANES} panes
++        </span>
++        <div className="ml-auto flex items-center gap-1">
++          <Button
++            variant="ghost"
++            size="sm"
++            onClick={() => setLayout((prev) => ({ ...prev, sizes: equalSizes(prev.panes.length) }))}
++            data-testid="ae-split-equalize"
++          >
++            Equal widths
++          </Button>
++          <Button
++            variant="ghost"
++            size="sm"
++            onClick={addPane}
++            disabled={layout.panes.length >= AE_SPLIT_MAX_PANES}
++            title={
++              layout.panes.length >= AE_SPLIT_MAX_PANES
++                ? `A split view holds at most ${AE_SPLIT_MAX_PANES} panes; close one first`
++                : "Add a pane with a new session"
++            }
++            data-testid="ae-split-add"
++          >
++            <PlusIcon className="size-3.5" />
++            Add pane
++          </Button>
++          <Button
++            variant="outline"
++            size="sm"
++            onClick={() => navigate(paneSrc(first))}
++            title="Leave the split view and show the first pane's session on its own"
++            data-testid="ae-split-exit"
++          >
++            <SquareIcon className="size-3.5" />
++            Single view
++          </Button>
++        </div>
++      </header>
++      <div ref={rowRef} className="flex min-h-0 flex-1" data-testid="ae-split-row">
++        {layout.panes.length === 0 && (
++          <div className="flex flex-1 flex-col items-center justify-center gap-3 text-sm text-muted-foreground">
++            <p>Every pane is closed.</p>
++            <Button variant="outline" size="sm" onClick={addPane}>
++              <PlusIcon className="size-3.5" />
++              Add pane
++            </Button>
++          </div>
++        )}
++        {layout.panes.map((pane, i) => (
++          <div key={keys[i]} className="contents">
++            {i > 0 && (
++              <div
++                role="separator"
++                aria-orientation="vertical"
++                aria-label={`Resize panes ${i} and ${i + 1}`}
++                aria-valuenow={Math.round((layout.sizes[i - 1] ?? 0) * 100)}
++                aria-valuemin={0}
++                aria-valuemax={100}
++                tabIndex={0}
++                className="w-1.5 shrink-0 cursor-col-resize bg-border/60 outline-none hover:bg-primary/40 focus-visible:bg-primary/60"
++                onPointerDown={(e) => startDrag(i - 1, e)}
++                onKeyDown={(e) => nudge(i - 1, e)}
++                data-testid="ae-split-divider"
++              />
++            )}
++            <section
++              className="flex min-w-0 flex-col bg-background"
++              style={{ flexBasis: 0, flexGrow: layout.sizes[i] ?? 1 }}
++              aria-label={sessionLabel(pane, frameTitles[i], byId)}
++              data-testid="ae-split-pane"
++              data-session={pane ?? ""}
++            >
++              <div className="flex h-8 shrink-0 items-center gap-1 border-b border-border px-2">
++                <select
++                  className="h-6 min-w-0 flex-1 rounded border border-border bg-background px-1 text-xs"
++                  aria-label={`Session in pane ${i + 1}`}
++                  value={pane ?? ""}
++                  onChange={(e) => setPaneSession(i, e.target.value === "" ? null : e.target.value)}
++                  data-testid="ae-split-picker"
++                >
++                  <option value="">New session</option>
++                  {pane !== null && !byId.has(pane) && <option value={pane}>{pane}</option>}
++                  {conversations.map((c) => (
++                    <option
++                      key={c.id}
++                      value={c.id}
++                      disabled={c.id !== pane && layout.panes.includes(c.id)}
++                    >
++                      {c.title?.trim() || c.id}
++                    </option>
++                  ))}
++                </select>
++                <Button
++                  variant="ghost"
++                  size="icon-xs"
++                  aria-label="Open this session alone"
++                  title="Open this session alone"
++                  onClick={() => navigate(paneSrc(pane))}
++                  data-testid="ae-split-maximize"
++                >
++                  <Maximize2Icon className="size-3.5" />
++                </Button>
++                <Button
++                  variant="ghost"
++                  size="icon-xs"
++                  aria-label="Close pane"
++                  title="Close pane (the session keeps running)"
++                  onClick={() => closePane(i)}
++                  data-testid="ae-split-close"
++                >
++                  <XIcon className="size-3.5" />
++                </Button>
++              </div>
++              {/* No sandbox: the pane is this app on this origin, so it needs
++                  scripts and same-origin together, which a sandbox cannot
++                  constrain anyway (the lint rule's own reason). */}
++              {/* oxlint-disable-next-line react/iframe-missing-sandbox */}
++              <iframe
++                ref={(el) => {
++                  frameRefs.current[i] = el;
++                }}
++                name={`${AE_SPLIT_PANE_NAME_PREFIX}-${keys[i]}`}
++                title={sessionLabel(pane, frameTitles[i], byId)}
++                src={paneSrc(pane)}
++                allow="clipboard-read; clipboard-write; microphone"
++                // While a divider is dragged the frames would swallow the
++                // pointer; let the page keep it.
++                className={`min-h-0 w-full flex-1 border-0 ${dragging ? "pointer-events-none" : ""}`}
++                data-testid="ae-split-frame"
++              />
++            </section>
++          </div>
++        ))}
++      </div>
++    </div>
++  );
++}
++
++function sameTitles(a: Record<number, string>, b: Record<number, string>): boolean {
++  const ka = Object.keys(a);
++  if (ka.length !== Object.keys(b).length) return false;
++  return ka.every((k) => a[Number(k)] === b[Number(k)]);
++}
+diff --git a/web/src/shell/AeSplitMenuItem.tsx b/web/src/shell/AeSplitMenuItem.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..20e0d879e48877caa0b2e02bbe039743986a90fb
+--- /dev/null
++++ b/web/src/shell/AeSplitMenuItem.tsx
+@@ -0,0 +1,61 @@
++// "Open in split view" on a sidebar session's action menu (omnigent-ae patch
++// P5, 2026-09-24): adds the session to the remembered split layout (seeded
++// with the session being viewed when there is none) and opens `/split`.
++// Desktop only; the split route itself falls back to one session below
++// 1024px, so the item is not offered there, nor inside a pane.
++
++import { Columns2Icon } from "lucide-react";
++import type { ComponentType, ReactNode } from "react";
++import {
++  isAeSplitPane,
++  layoutWithSession,
++  paneSessionFromPath,
++  readStoredLayout,
++  splitHref,
++  writeStoredLayout,
++} from "@/lib/aeSplitLayout";
++import { useLocation, useNavigate } from "@/lib/routing";
++import { useIsSplitViewport } from "@/pages/AeSplitPage";
++
++// The one piece of the sidebar's menu-component bundle this item renders,
++// typed structurally so the dropdown and the context-menu families both fit.
++interface AeSplitItemComponents {
++  Item: ComponentType<{
++    children?: ReactNode;
++    onSelect?: (event: Event) => void;
++    "data-testid"?: string;
++  }>;
++}
++
++export function AeSplitMenuItem({
++  components: C,
++  sessionId,
++  onDone,
++}: {
++  components: AeSplitItemComponents;
++  sessionId: string;
++  onDone: () => void;
++}) {
++  const navigate = useNavigate();
++  const { pathname } = useLocation();
++  const desktop = useIsSplitViewport();
++  if (!desktop || isAeSplitPane()) return null;
++  return (
++    <C.Item
++      data-testid="ae-split-open"
++      onSelect={() => {
++        const layout = layoutWithSession(
++          readStoredLayout(),
++          sessionId,
++          paneSessionFromPath(pathname) ?? null,
++        );
++        writeStoredLayout(layout);
++        onDone();
++        navigate(splitHref(layout.panes));
++      }}
++    >
++      <Columns2Icon className="size-3.5" />
++      Open in split view
++    </C.Item>
++  );
++}
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 0245cf3652c1106d49f5161a3a65edb794feaab3..d49600643f842c2ce8b9d5ad28d269b0b82a88b9 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -147,6 +147,7 @@ import { resolveDefaultShell } from "./preferredShell";
+ import { WorkspacePanel } from "./WorkspacePanel";
+ import { SessionRail } from "./SessionRail";
+ import type { RightRailTab } from "./railTabs";
++import { isAeSplitPane } from "@/lib/aeSplitLayout";
+ 
+ // Dev-only preview; lazy so the sample data never ships in production bundles.
+ const ImportContextPreview = import.meta.env.DEV
+@@ -2832,6 +2833,6 @@ export function AppShell() {
+  * classes.
+  */
+ function initialSidebarOpen(): boolean {
+-  if (typeof window === "undefined") return false;
++  if (typeof window === "undefined" || isAeSplitPane()) return false;
+   return window.matchMedia("(min-width: 768px)").matches;
+ }
+diff --git a/web/src/shell/Sidebar.aeStatus.test.tsx b/web/src/shell/Sidebar.aeStatus.test.tsx
+index 12c5cdd0f212c13a9ec40122c32cc2e893fd0778..b55858fbc66640a1395640796f50169e550f1685 100644
+--- a/web/src/shell/Sidebar.aeStatus.test.tsx
++++ b/web/src/shell/Sidebar.aeStatus.test.tsx
+@@ -9,6 +9,8 @@
+ //      turns red at the limit.
+ //   4. The row's kebab and right-click menus carry the Status submenu
+ //      (`AeStatusMenu`, patch P4) for the owner, and not for a shared row.
++//   5. The same menus carry "Open in split view" (`AeSplitMenuItem`, patch
++//      P5) on a desktop viewport, for any row, and not below 1024px.
+ // The mock scaffold is the one `Sidebar.rowActions.test.tsx` uses, so the
+ // sidebar renders with the same stubs.
+ 
+@@ -25,6 +27,7 @@ import { cleanup, fireEvent, render, screen, within } from "@testing-library/rea
+ import { MemoryRouter } from "react-router-dom";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import type * as IdentityModule from "@/lib/identity";
++import { readStoredLayout } from "@/lib/aeSplitLayout";
+ 
+ // Controllable rename mutation so the double-click test can assert the
+ // committed title was forwarded to the PATCH. `isMobile` toggles the mocked
+@@ -446,3 +449,51 @@ describe("Status submenu in the row menus", () => {
+     expect(screen.queryByTestId("ae-status-menu")).toBeNull();
+   });
+ });
++
++describe("Open in split view in the row menus", () => {
++  const realMatchMedia = window.matchMedia;
++  function setWide(wide: boolean) {
++    window.matchMedia = ((query: string) => ({
++      ...realMatchMedia(query),
++      matches: wide,
++    })) as typeof window.matchMedia;
++  }
++  afterEach(() => {
++    window.matchMedia = realMatchMedia;
++    window.localStorage.clear();
++  });
++
++  it("opens the session in the split layout from the kebab", () => {
++    setWide(true);
++    mockConversations([conv("w")]);
++    renderSidebar();
++    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
++    const item = screen.getByTestId("ae-split-open");
++    expect(item).toHaveTextContent("Open in split view");
++    fireEvent.click(item);
++    expect(readStoredLayout()?.panes).toEqual(["w"]);
++  });
++
++  it("sits in the right-click menu of a shared row too", () => {
++    setWide(true);
++    mockConversations([conv("s", { owner: "other@example.com" })]);
++    renderSidebar();
++    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
++      button: 0,
++      ctrlKey: false,
++      pointerType: "mouse",
++    });
++    fireEvent.click(screen.getByTestId("session-filter-shared"));
++    fireEvent.contextMenu(screen.getByRole("link", { name: /Session s/ }));
++    expect(screen.getByTestId("ae-split-open")).toBeInTheDocument();
++  });
++
++  it("is not offered below 1024px", () => {
++    setWide(false);
++    mockConversations([conv("w")]);
++    renderSidebar();
++    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
++    expect(screen.getByTestId("fork-conversation")).toBeInTheDocument();
++    expect(screen.queryByTestId("ae-split-open")).toBeNull();
++  });
++});
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index f288ceb8796d40e96f42473d29d7efe4dbae41b8..ec837a7bd77c5bef5dcbf17d0a1b9f6c2d6aa246 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -234,6 +234,7 @@ import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigat
+ import { AeConversationStatusIcon } from "@/components/AeStatusIcon";
+ import { AeSlotsPill } from "@/components/AeSlotsPill";
+ import { AeStatusMenu } from "@/shell/AeStatusMenu";
++import { AeSplitMenuItem } from "@/shell/AeSplitMenuItem";
+ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+ import { useViewerId } from "@/hooks/useViewerId";
+ import { useExtensions } from "@/extensions/ExtensionProvider";
+@@ -4077,6 +4078,11 @@ function ConversationMenuItems({
+           onDone={() => setMenuOpen(false)}
+         />
+       )}
++      <AeSplitMenuItem
++        components={C}
++        sessionId={conversation.id}
++        onDone={() => setMenuOpen(false)}
++      />
+       {/* Stop / Archive / Delete are grouped at the bottom, below a
+           divider: lifecycle-ending actions separated from the everyday
+           ones above. */}

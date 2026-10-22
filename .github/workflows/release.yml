@@ -1,0 +1,192 @@
+# ============================================================
+# omnigent-ae release tagging (2026-09-24)
+#
+# Makes a merge to main the whole release. Before this, the box deployed any
+# new ae-v* tag by itself (deploy/auto-update.sh) but the tag still needed a
+# human with git; Reid travels from 2026-09-25 for three weeks with a laptop
+# that is often closed, and Claude web sessions can push only their own branch.
+#
+# When CI finishes green on a push to main, this workflow:
+#   1. checks out main with every tag and asks scripts/next-release-tag.sh
+#      whether that run's commit gets a tag: only if it is still the tip of
+#      main, carries no ae-v* tag yet (a tag pushed by hand wins), and changed
+#      something that ships since the last tag (packages/, config/, agents/,
+#      deploy/Dockerfile, patches/, upstream.lock, the upstream pointer);
+#   2. pushes the next ae-v<upstream>.<N> tag (N restarts at 1 when the pin
+#      moves);
+#   3. dispatches image.yml on that tag with push=true, which builds, smokes
+#      and publishes ghcr.io/analyticendeavors/omnigent-ae:<tag>; the box's
+#      timer then deploys it within ten minutes.
+#
+# Why a dispatch and not the tag push: events caused by GITHUB_TOKEN start no
+# workflow run, except workflow_dispatch and repository_dispatch
+# (https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow).
+# So the tag this job pushes does not fire image.yml's `push: tags` trigger,
+# and image.yml's existing dispatch path (push input honoured only on an ae-v*
+# tag ref) publishes it unchanged. A reusable workflow_call was the other
+# option; it would run image.yml with main as github.ref, so image.yml would
+# need a tag input threaded through its checkout and its tag decision. The
+# dispatch also leaves one "Image" run per tag, the same as a hand-pushed tag.
+#
+# workflow_dispatch (run from main): the same decision on the tip of main,
+# after checking that CI passed on it. `force: true` skips the shipping-path
+# check, to ship a docs-only change or re-ship; a commit that already carries
+# an ae-v* tag is still never tagged twice.
+#
+# The job runs only in analyticendeavors/omnigent-ae (2026-10-21, before the
+# public repo), so a fork or the public copy never tags itself or dispatches a
+# publish. A fork that releases its own image changes that condition.
+# ============================================================
+
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Tag the tip of main even if nothing that ships changed (still never tags a commit twice)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# One release decision at a time, never cancelled half way: two merges landing
+# together cannot both compute the same N. A queued run is replaced by a newer
+# one, which is fine; only the tip of main is ever tagged.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  tag:
+    name: Tag the tip of main and publish its image
+    # workflow_run fires on every CI completion on main; only a green push run
+    # releases (a workflow_dispatch of CI on main is not a merge). Only AE's
+    # own repository releases (header).
+    if: >-
+      github.repository == 'analyticendeavors/omnigent-ae' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' &&
+        github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write   # push the tag
+      actions: write    # dispatch image.yml; read CI runs
+    steps:
+      - name: Checkout main with every tag
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+          fetch-tags: true
+
+      # The event is read once, here, into env; later steps carry no expression
+      # in their bodies.
+      - name: Pick the commit to release
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          FORCE_INPUT: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet --force --tags origin '+refs/heads/main:refs/remotes/origin/main'
+          force=false
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            if [ "$REF" != "refs/heads/main" ]; then
+              echo "::error::run the release workflow from main (it was started on $REF); releases are tagged on main only."
+              exit 1
+            fi
+            sha="$(git rev-parse origin/main)"
+            source="workflow_dispatch on main"
+            if [ "$FORCE_INPUT" = "true" ]; then
+              force=true
+            fi
+          else
+            sha="$RUN_SHA"
+            source="CI run $RUN_URL"
+          fi
+          {
+            echo "SHA=$sha"
+            echo "FORCE=$force"
+            echo "SOURCE=$source"
+          } >> "$GITHUB_ENV"
+          echo "candidate ${sha:0:12} from $source (force=$force)"
+
+      # A dispatch has no CI run attached, so it must find a green CI push run
+      # on the same commit before it tags; workflow_run already carries one.
+      - name: CI passed on the commit
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          green="$(gh run list --workflow ci.yml --commit "$SHA" --event push --status success --limit 1 --json databaseId --jq 'length')"
+          if [ "$green" = "0" ]; then
+            echo "::error::no successful CI push run on ${SHA:0:12}; wait for CI on main to go green (or fix it), then run this again."
+            exit 1
+          fi
+          echo "CI is green on ${SHA:0:12}"
+
+      - name: Decide the tag
+        id: decide
+        run: |
+          set -euo pipefail
+          args=(--tip origin/main)
+          if [ "$FORCE" = "true" ]; then
+            args+=(--force)
+          fi
+          scripts/next-release-tag.sh "${args[@]}" "$SHA" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Push the tag
+        if: steps.decide.outputs.decision == 'tag'
+        env:
+          TAG: ${{ steps.decide.outputs.tag }}
+          REASON: ${{ steps.decide.outputs.reason }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$SHA" -m "Release $TAG" -m "Tagged by the release workflow from $SOURCE ($REASON)."
+          if ! git push origin "refs/tags/$TAG"; then
+            echo "::error::pushing $TAG failed. Someone may have pushed that tag first (git ls-remote --tags origin '$TAG'), or a tag ruleset blocks github-actions; re-run once resolved."
+            exit 1
+          fi
+          echo "pushed $TAG on ${SHA:0:12}"
+
+      - name: Publish the image for the tag
+        if: steps.decide.outputs.decision == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.decide.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if ! gh workflow run image.yml --ref "$TAG" -f push=true; then
+            echo "::error::$TAG is pushed but image.yml was not dispatched, so nothing is published and the box will wait. Run the Image workflow on tag $TAG with push on."
+            exit 1
+          fi
+          {
+            echo "## Released $TAG"
+            echo
+            echo "Commit \`$SHA\` from $SOURCE."
+            echo
+            echo "image.yml is dispatched on the tag with push on; once it publishes, the box's auto-update timer deploys it within ten minutes (deploy/README.md, Automatic updates)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Nothing to release
+        if: steps.decide.outputs.decision != 'tag'
+        env:
+          REASON: ${{ steps.decide.outputs.reason }}
+        run: |
+          set -euo pipefail
+          echo "no tag: $REASON"
+          echo "No release: $REASON" >> "$GITHUB_STEP_SUMMARY"

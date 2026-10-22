@@ -1,0 +1,433 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 21:19:00 -0700
+Subject: [PATCH 135/148] [ae-patch] Remove a personal Claude login from
+ Settings
+
+Settings, Claude accounts could rename an extra Claude login but never remove
+it: no delete existed at any layer. A new credential kind, claude-oauth-delete,
+runs through the same seams as rename (the server allowlist, the host frame
+handler, the account logic, the web kind union). It refuses the default CLI
+login and shared accounts, drops the name, its label and its token, and falls
+back to the default login when the removed account was the one new chats used.
+Running chats keep the token they launched with. The full Settings view shows
+Remove beside Rename on every personal login, asking once; the compact picker
+and the default CLI login get no Remove.
+---
+ omnigent/host/connect.py                 |  7 ++-
+ omnigent/onboarding/claude_accounts.py   | 34 ++++++++++-
+ omnigent/server/routes/hosts.py          |  1 +
+ tests/onboarding/test_claude_accounts.py | 65 ++++++++++++++++++--
+ web/src/hooks/useHosts.ts                |  1 +
+ web/src/shell/AeClaudeAccountRemove.tsx  | 78 ++++++++++++++++++++++++
+ web/src/shell/ClaudeAccounts.test.tsx    | 47 ++++++++++++++
+ web/src/shell/ClaudeAccounts.tsx         | 33 ++++++++++
+ 8 files changed, 260 insertions(+), 6 deletions(-)
+ create mode 100644 web/src/shell/AeClaudeAccountRemove.tsx
+
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index 25de1f7ea472d82ad5ae3caab41de155793d0912..ec4955db35c121923b534e5800e2645d70918832 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -3100,7 +3100,12 @@ class HostProcess:
+                 else None,
+             )
+ 
+-        if frame.kind in ("claude-oauth-add", "claude-oauth-select", "claude-oauth-rename"):
++        if frame.kind in (
++            "claude-oauth-add",
++            "claude-oauth-select",
++            "claude-oauth-rename",
++            "claude-oauth-delete",
++        ):
+             from omnigent.onboarding.claude_accounts import change_account
+ 
+             if install_key != ANTHROPIC_FAMILY:
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+index 90847075b881304f8cecf95112c6e45f21d40a3d..a43735b344574fd1bc641defc29e1b0f3d670b29 100644
+--- a/omnigent/onboarding/claude_accounts.py
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -112,6 +112,7 @@ def _change_account(
+         return StoreCredentialResult(
+             False, None, "Enter a name and the OAuth token from claude setup-token."
+         )
++    delete_token: str | None = None
+     try:
+         state = _read()
+         if kind == "claude-oauth-rename":
+@@ -136,11 +137,24 @@ def _change_account(
+                 )
+             secrets.store_secret(f"claude-oauth-{name}", token.strip())
+             state["accounts"].append(name)
++        elif kind == "claude-oauth-delete":
++            if not name:
++                return StoreCredentialResult(
++                    False, None, "The default CLI login cannot be removed."
++                )
++            if name not in state["accounts"]:
++                return StoreCredentialResult(False, None, "Unknown Claude account.")
++            # Running chats keep the token they launched with; new ones cannot pick it.
++            delete_token = f"claude-oauth-{name}"
++            state["accounts"].remove(name)
++            state.get("labels", {}).pop(name, None)
++            if state["active"] == name:
++                state["active"] = ""
+         elif kind != "claude-oauth-select" or (
+             name and name not in state["accounts"] and not is_shared(name)
+         ):
+             return StoreCredentialResult(False, None, "Unknown Claude account.")
+-        if kind != "claude-oauth-rename":
++        if kind not in ("claude-oauth-rename", "claude-oauth-delete"):
+             state["active"] = name
+         path = _path()
+         path.parent.mkdir(parents=True, exist_ok=True)
+@@ -148,6 +162,15 @@ def _change_account(
+         with temporary.open("w") as handle:
+             os.chmod(temporary, 0o600)
+             json.dump(state, handle)
++        if delete_token and not _delete_token(delete_token):
++            # The record stays until the token is confirmed gone: a locked keyring
++            # makes delete_secret fall back to the file and leave the token behind.
++            temporary.unlink(missing_ok=True)
++            return StoreCredentialResult(
++                False,
++                None,
++                "Could not remove the token on this host. Check its keyring and try again.",
++            )
+         temporary.replace(path)
+         return StoreCredentialResult(True, name, None)
+     except Exception:
+@@ -156,6 +179,15 @@ def _change_account(
+         )
+ 
+ 
++def _delete_token(secret_name: str) -> bool:
++    """Delete a login's token and report whether it is gone."""
++    secrets.delete_secret(secret_name)
++    try:
++        return not secrets.load_secret(secret_name)
++    except Exception:
++        return False
++
++
+ def account_env(name: str | None = None) -> dict[str, str]:
+     state = _read()
+     if name is None:
+diff --git a/omnigent/server/routes/hosts.py b/omnigent/server/routes/hosts.py
+index 9c106b45d965196ffac77f893a6413f5d2cdea13..f9a3950e1e1520064b510f7f36c48a6ade0b49a3 100644
+--- a/omnigent/server/routes/hosts.py
++++ b/omnigent/server/routes/hosts.py
+@@ -1618,6 +1618,7 @@ def create_hosts_router(
+             "claude-oauth-add",
+             "claude-oauth-select",
+             "claude-oauth-rename",
++            "claude-oauth-delete",
+             "claude-login-start",
+             "claude-login-poll",
+             "claude-login-code",
+diff --git a/tests/onboarding/test_claude_accounts.py b/tests/onboarding/test_claude_accounts.py
+index 6d45a5ff1c415e8f03992ec15b8be330662da688..05f7c36367ee49325b785495fd874e1696aa4b0c 100644
+--- a/tests/onboarding/test_claude_accounts.py
++++ b/tests/onboarding/test_claude_accounts.py
+@@ -1,7 +1,9 @@
++import json
+ from pathlib import Path
+ 
+ import pytest
+ 
++from omnigent.onboarding import claude_accounts, secrets
+ from omnigent.onboarding.claude_accounts import account_descriptors, account_env, change_account
+ 
+ 
+@@ -202,15 +204,70 @@ def test_rename_rejects_duplicate_invalid_and_missing_labels():
+     assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
+ 
+ 
+-def test_rename_frame_roundtrip():
++def test_delete_removes_the_account_its_label_and_token_and_keeps_the_rest():
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    assert change_account("claude-oauth-add", "Work", "sk-ant-oat-work").stored
++    assert change_account("claude-oauth-rename", "Backup", label="Personal").stored
++    assert change_account("claude-oauth-select", "Work").stored
++
++    result = change_account("claude-oauth-delete", "Backup")
++
++    assert result.stored
++    rows = account_descriptors()
++    assert [(r["source"], r["env_var"]) for r in rows] == [
++        ("Default CLI account", ""),
++        ("Work", "Work"),
++    ]
++    assert rows[1]["family"] == "claude-oauth-active"
++    assert secrets.load_secret("claude-oauth-Backup") is None
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-work"
++    assert "Backup" not in json.loads(claude_accounts._path().read_text()).get("labels", {})
++
++
++def test_delete_of_the_active_account_falls_back_to_the_default_login():
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++
++    assert change_account("claude-oauth-delete", "Backup").stored
++
++    assert account_env() == {}
++    assert [r["env_var"] for r in account_descriptors()] == [""]
++
++
++def test_delete_refuses_the_default_login_unknown_and_shared_accounts():
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    default = change_account("claude-oauth-delete", "")
++    assert not default.stored and "default CLI login" in (default.reason or "")
++    assert not change_account("claude-oauth-delete", "missing").stored
++    shared = change_account("claude-oauth-delete", "shared:Team")
++    assert not shared.stored and "Admin Center" in (shared.reason or "")
++    assert account_env("Backup")["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++
++
++def test_delete_keeps_the_account_when_the_token_cannot_be_removed(monkeypatch):
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    monkeypatch.setattr(secrets, "delete_secret", lambda name: None)
++
++    result = change_account("claude-oauth-delete", "Backup")
++
++    assert not result.stored and "Could not remove the token" in (result.reason or "")
++    assert [r["env_var"] for r in account_descriptors()] == ["", "Backup"]
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++
++
++@pytest.mark.parametrize(
++    ("kind", "account_name", "account_label"),
++    [("claude-oauth-rename", "", "Primary"), ("claude-oauth-delete", "Backup", None)],
++)
++def test_account_frame_roundtrip(kind, account_name, account_label):
+     from omnigent.host.frames import HostStoreSecretFrame, decode_host_frame, encode_host_frame
+ 
+     frame = HostStoreSecretFrame(
+         request_id="request",
+         harness="claude-native",
+-        kind="claude-oauth-rename",
+-        account_name="",
+-        account_label="Primary",
++        kind=kind,
++        account_name=account_name,
++        account_label=account_label,
+     )
+     assert decode_host_frame(encode_host_frame(frame)) == frame
+ 
+diff --git a/web/src/hooks/useHosts.ts b/web/src/hooks/useHosts.ts
+index fa300ec9de7a5869ff52d07ef156d3abfebc58c8..9587db50f424470821d22dd5d74ff549c35aa528 100644
+--- a/web/src/hooks/useHosts.ts
++++ b/web/src/hooks/useHosts.ts
+@@ -273,6 +273,7 @@ export interface StoreCredentialInput {
+     | "claude-oauth-add"
+     | "claude-oauth-select"
+     | "claude-oauth-rename"
++    | "claude-oauth-delete"
+     | "claude-login-start"
+     | "claude-login-poll"
+     | "claude-login-code"
+diff --git a/web/src/shell/AeClaudeAccountRemove.tsx b/web/src/shell/AeClaudeAccountRemove.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c53c267a924d4f7c72e765b04f8aba172ea338f9
+--- /dev/null
++++ b/web/src/shell/AeClaudeAccountRemove.tsx
+@@ -0,0 +1,78 @@
++// Remove a personal Claude login from Settings (omnigent-ae, 2026-10-20): the
++// Remove button beside Rename and the one-line confirm it opens. The delete is
++// the host's `claude-oauth-delete` write; `ClaudeAccounts.tsx` only holds which
++// row is confirming.
++
++import { Button } from "@/components/ui/button";
++import type { useStoreCredential } from "@/hooks/useHosts";
++
++export function AeClaudeAccountRemoveButton({
++  label,
++  disabled,
++  onClick,
++}: {
++  label: string;
++  disabled: boolean;
++  onClick: () => void;
++}) {
++  return (
++    <Button
++      type="button"
++      variant="outline"
++      size="sm"
++      className="text-destructive"
++      aria-label={`Remove ${label}`}
++      disabled={disabled}
++      onClick={onClick}
++    >
++      Remove
++    </Button>
++  );
++}
++
++export function AeClaudeAccountRemoveConfirm({
++  hostName,
++  accountId,
++  label,
++  selected,
++  store,
++  onDone,
++  onFail,
++  onCancel,
++}: {
++  hostName: string;
++  accountId: string;
++  label: string;
++  /** The login new chats start with today; removing it hands them the default CLI login. */
++  selected: boolean;
++  store: ReturnType<typeof useStoreCredential>;
++  onDone: () => void;
++  onFail: (error: Error) => void;
++  onCancel: () => void;
++}) {
++  return (
++    <div className="flex min-w-0 flex-wrap items-center gap-1">
++      <span className="min-w-0 flex-1 text-xs">
++        Removes {label} and its token from {hostName}. Running chats keep their token until
++        they restart.{selected ? " New chats use the Default CLI account." : ""}
++      </span>
++      <Button
++        type="button"
++        variant="destructive"
++        size="sm"
++        disabled={store.isPending}
++        onClick={() =>
++          store.mutate(
++            { harness: "claude-native", kind: "claude-oauth-delete", account_name: accountId },
++            { onSuccess: onDone, onError: onFail },
++          )
++        }
++      >
++        Remove account
++      </Button>
++      <Button type="button" variant="ghost" size="sm" disabled={store.isPending} onClick={onCancel}>
++        Cancel
++      </Button>
++    </div>
++  );
++}
+diff --git a/web/src/shell/ClaudeAccounts.test.tsx b/web/src/shell/ClaudeAccounts.test.tsx
+index 8e5da6fdf9801b644cc7e8b710c5dfb3451c67e6..87ab745adbc58ff2c058b71ba9313d2d60ae184f 100644
+--- a/web/src/shell/ClaudeAccounts.test.tsx
++++ b/web/src/shell/ClaudeAccounts.test.tsx
+@@ -104,6 +104,53 @@ describe("ClaudeAccounts", () => {
+       secret: "sk-ant-oat-example",
+     });
+   });
++  it("offers Remove on a personal login, not on the default CLI login nor in the picker", () => {
++    const view = render(<ClaudeAccounts host={host} />);
++    expect(screen.getByRole("button", { name: "Remove Backup" })).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Remove Default CLI account" })).toBeNull();
++    view.unmount();
++    render(<ClaudeAccounts host={host} compact />);
++    expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
++  });
++  it("removes a login after one confirm, through the delete kind", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Remove Backup" }));
++    expect(mutate).not.toHaveBeenCalled();
++    expect(screen.getByText(/Removes Backup and its token from Laptop/)).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Remove account" }));
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-delete",
++      account_name: "Backup",
++    });
++    act(() => mutate.mock.calls[0][1].onSuccess());
++    expect(screen.getByText("Account removed.")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Remove account" })).toBeNull();
++  });
++  it("closes the remove confirm when Rename opens, and names the fallback for the selected login", () => {
++    rows = [
++      { family: "claude-oauth", source: "Default CLI account", env_var: "" },
++      { family: "claude-oauth-active", source: "Backup", env_var: "Backup" },
++    ];
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Remove Backup" }));
++    expect(screen.getByText(/New chats use the Default CLI account/)).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Rename Backup" }));
++    expect(screen.queryByRole("button", { name: "Remove account" })).toBeNull();
++    expect(screen.getByRole("textbox", { name: "Account label for Backup" })).toBeTruthy();
++  });
++  it("cancels a remove without sending anything, and shows a refusal", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Remove Backup" }));
++    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
++    expect(mutate).not.toHaveBeenCalled();
++    expect(screen.queryByRole("button", { name: "Remove account" })).toBeNull();
++    fireEvent.click(screen.getByRole("button", { name: "Remove Backup" }));
++    fireEvent.click(screen.getByRole("button", { name: "Remove account" }));
++    act(() => mutate.mock.calls[0][1].onError(new Error("Host offline")));
++    expect(screen.getByRole("button", { name: "Remove account" })).toBeTruthy();
++    expect(screen.getByText("Host offline")).toBeTruthy();
++  });
+   it("renames the default account using its empty stable ID", () => {
+     render(<ClaudeAccounts host={host} />);
+     fireEvent.click(screen.getByRole("button", { name: "Rename Default CLI account" }));
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+index ce5570153a690c10880e70206ba32e6e1d6d5f3b..59a01772255e22d4f5ef4f1935aa3434ca109db3 100644
+--- a/web/src/shell/ClaudeAccounts.tsx
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -1,3 +1,4 @@
++import { AeClaudeAccountRemoveButton, AeClaudeAccountRemoveConfirm } from "./AeClaudeAccountRemove";
+ import { AeSharedClaudeAccountsGroup } from "./AeSharedClaudeAccountsGroup";
+ import { ClaudeBrowserLogin } from "./ClaudeBrowserLogin";
+ import { useState } from "react";
+@@ -20,6 +21,7 @@ export function ClaudeAccounts({
+   const [message, setMessage] = useState("");
+   const [messageIsError, setMessageIsError] = useState(false);
+   const [editingId, setEditingId] = useState<string | null>(null);
++  const [removingId, setRemovingId] = useState<string | null>(null);
+   const [accountLabel, setAccountLabel] = useState("");
+   const accounts = useDetectedCredentials(host?.host_id, !!host);
+   const store = useStoreCredential(host?.host_id ?? "");
+@@ -136,6 +138,7 @@ export function ClaudeAccounts({
+                     disabled={store.isPending}
+                     onClick={() => {
+                       setEditingId(accountId);
++                      setRemovingId(null);
+                       setAccountLabel(displayLabel);
+                       setMessage("");
+                     }}
+@@ -143,7 +146,37 @@ export function ClaudeAccounts({
+                     Rename
+                   </Button>
+                 )}
++                {!compact && !shared && accountId && (
++                  <AeClaudeAccountRemoveButton
++                    label={displayLabel}
++                    disabled={store.isPending}
++                    onClick={() => {
++                      setRemovingId(accountId);
++                      setEditingId(null);
++                      setMessage("");
++                    }}
++                  />
++                )}
+               </div>
++              {!compact && removingId === accountId && (
++                <AeClaudeAccountRemoveConfirm
++                  hostName={host.name}
++                  accountId={accountId}
++                  label={displayLabel}
++                  selected={row.family === "claude-oauth-active"}
++                  store={store}
++                  onDone={() => {
++                    setRemovingId(null);
++                    setMessageIsError(false);
++                    setMessage("Account removed.");
++                  }}
++                  onFail={(error) => {
++                    setMessageIsError(true);
++                    setMessage(error.message);
++                  }}
++                  onCancel={() => setRemovingId(null)}
++                />
++              )}
+               {!compact && editingId === accountId && (
+                 <div className="flex min-w-0 flex-wrap gap-1">
+                   <Input

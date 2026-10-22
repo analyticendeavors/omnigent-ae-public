@@ -1,0 +1,860 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 12:56:34 -0700
+Subject: [PATCH 117/148] [ae-patch] List the admin's shared Claude accounts in
+ every account picker and fetch a shared token at launch
+
+So a second AE user's host can use company-paid Claude accounts that the
+admin manages, without copying tokens between hosts (omnigent-ae, 2026-10-20).
+
+A shared account is known to a host only by its id, shared:<name>; host
+account names cannot hold a colon, so the two never collide. Selecting one
+stores just the id as the host's active account. At launch account_env()
+asks the server's GET /v1/ae/claude-accounts/shared/<name>/token with the
+runner's own server credential and puts the token in the launch
+environment only; OMNIGENT_CLAUDE_ACCOUNT carries the id for the status
+line. Claude login detection counts a shared pick without fetching. A fork
+may pick a shared account the source host does not list, checked against
+the server's store through a resolver the omnigent-ae package registers.
+
+Web: useDetectedCredentials adds the server's shared accounts after the
+host's own logins; the account picker and the fork dialog mark them with a
+Shared tag (Tabler users-group) and offer no rename.
+---
+ omnigent/inner/claude_sdk_executor.py         |   3 +-
+ .../onboarding/ae_shared_claude_accounts.py   | 141 ++++++++++++++++++
+ omnigent/onboarding/ambient.py                |   5 +-
+ omnigent/onboarding/claude_accounts.py        |  26 +++-
+ .../routes/sessions/ae_fork_claude_account.py |   4 +-
+ .../test_ae_shared_claude_accounts.py         | 138 +++++++++++++++++
+ .../routes/test_ae_fork_claude_account.py     |  25 ++++
+ web/src/hooks/useHosts.ts                     |  11 +-
+ web/src/lib/aeSharedClaudeAccounts.test.tsx   |  97 ++++++++++++
+ web/src/lib/aeSharedClaudeAccounts.tsx        |  98 ++++++++++++
+ web/src/shell/AeForkClaudeAccount.test.tsx    |  22 +++
+ web/src/shell/AeForkClaudeAccount.tsx         |   2 +
+ web/src/shell/ClaudeAccounts.test.tsx         |  23 +++
+ web/src/shell/ClaudeAccounts.tsx              |   5 +-
+ 14 files changed, 589 insertions(+), 11 deletions(-)
+ create mode 100644 omnigent/onboarding/ae_shared_claude_accounts.py
+ create mode 100644 tests/onboarding/test_ae_shared_claude_accounts.py
+ create mode 100644 web/src/lib/aeSharedClaudeAccounts.test.tsx
+ create mode 100644 web/src/lib/aeSharedClaudeAccounts.tsx
+
+diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
+index 2160f3e5832f6214c286282bcace7c7fafbf8025..111b2feabfbd0e2c80ee799a831f76810fd1bf40 100644
+--- a/omnigent/inner/claude_sdk_executor.py
++++ b/omnigent/inner/claude_sdk_executor.py
+@@ -2600,7 +2600,8 @@ class ClaudeSDKExecutor(Executor):
+         if not env.get(_CLAUDE_API_KEY_HELPER_ENV_KEY):
+             from omnigent.onboarding.claude_accounts import account_env_for_launch
+ 
+-            env.update(account_env_for_launch(env))
++            # Off the event loop: a shared account asks the server for its token.
++            env.update(await run_sync_on_thread(account_env_for_launch, env))
+         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+         # Teach Claude Code this gateway's spellings so no model surface routes
+         # to an id the gateway rejects: pins for the family aliases, rewrites
+diff --git a/omnigent/onboarding/ae_shared_claude_accounts.py b/omnigent/onboarding/ae_shared_claude_accounts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c324982f050f666f8cc07044c2e3d8971f326a08
+--- /dev/null
++++ b/omnigent/onboarding/ae_shared_claude_accounts.py
+@@ -0,0 +1,141 @@
++"""Shared Claude accounts: subscription logins the server's admin keeps for every user.
++
++Added 2026-10-20 by omnigent-ae, so a second user's host can use company-paid
++Claude accounts that the admin manages, without copying tokens between hosts.
++A host account lives in ``claude-accounts.json`` and its token in this host's
++secrets (``claude_accounts.py``). A shared account lives on the server (the
++omnigent-ae package ``ae_omni_policies.shared_accounts``), and a host knows it
++only by its id, ``shared:<name>``. Host names cannot hold a colon, so a shared
++id never collides with a host account of the same name.
++
++Selecting one stores only the id as the host's active account. At launch,
++:func:`shared_account_env` asks the server for the token with the runner's own
++server credential (the bearer the host gave it, the session owner's identity),
++and the token goes into the launch environment and nowhere else: never this
++host's disk, never a cache.
++
++The server half registers :func:`set_server_resolver` so a fork may pick a
++shared account its source host does not list itself.
++"""
++
++from __future__ import annotations
++
++import os
++import re
++from collections.abc import Callable
++from urllib.parse import quote
++
++PREFIX = "shared:"
++_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,63}")
++_TIMEOUT_S = 10.0
++_server_resolver: Callable[[str], bool] | None = None
++
++
++def is_shared(account: str | None) -> bool:
++    """Whether *account* is a shared account id (``shared:<name>``) with a valid name."""
++    return (
++        isinstance(account, str)
++        and account.startswith(PREFIX)
++        and bool(_NAME.fullmatch(account[len(PREFIX) :]))
++    )
++
++
++def shared_label(account: str) -> str:
++    """What this host calls a shared account without asking the server: ``Team (shared)``."""
++    return f"{account[len(PREFIX) :]} (shared)"
++
++
++def descriptor(account: str, active: bool) -> dict[str, str | None]:
++    """The non-secret descriptor ``host.detect_credentials`` reports for a selected shared id."""
++    return {
++        "family": "claude-oauth-active" if active else "claude-oauth",
++        "source": shared_label(account),
++        "env_var": account,
++    }
++
++
++def _server_url() -> str:
++    url = (
++        os.environ.get("RUNNER_SERVER_URL") or os.environ.get("OMNIGENT_SERVER_URL") or ""
++    ).strip()
++    if not url:
++        raise RuntimeError(
++            "The shared Claude account needs the OmniGent server, and this launch does not "
++            "know it. Start the chat from a host connected to the server, or select a host "
++            "account."
++        )
++    return url.rstrip("/")
++
++
++def fetch_shared_token(account: str) -> tuple[str, str]:
++    """Ask the server for shared *account*'s token, for one launch.
++
++    :returns: ``(token, label)``.
++    :raises RuntimeError: Saying what failed and what to do, never with the token.
++    """
++    import httpx
++
++    from omnigent.cli_auth import databricks_request_headers
++    from omnigent.runner._entry import _make_auth_token_factory
++
++    if not is_shared(account):
++        raise RuntimeError("The selected Claude account is not a shared account.")
++    name = account[len(PREFIX) :]
++    server = _server_url()
++    factory = _make_auth_token_factory(server)
++    bearer = factory() if factory is not None else None
++    headers = databricks_request_headers(server, bearer_token=bearer)
++    url = f"{server}/v1/ae/claude-accounts/shared/{quote(name, safe='')}/token"
++    try:
++        response = httpx.get(url, headers=headers, timeout=_TIMEOUT_S, follow_redirects=False)
++    except httpx.HTTPError as exc:
++        raise RuntimeError(
++            f"Could not reach the server for shared Claude account {name!r} "
++            f"({type(exc).__name__}). Check the host's connection and start the chat again."
++        ) from None
++    if response.status_code != 200:
++        try:
++            detail = response.json()["error"]["message"]
++        except (ValueError, KeyError, TypeError):
++            detail = f"HTTP {response.status_code}"
++        raise RuntimeError(
++            f"The server did not hand over shared Claude account {name!r}: {detail} "
++            "Select another account, or ask the admin to check it in Admin Center."
++        )
++    try:
++        body = response.json()
++        token, label = body["token"], body["label"]
++    except (ValueError, KeyError, TypeError):
++        raise RuntimeError(
++            f"The server's answer for shared Claude account {name!r} was not understood."
++        ) from None
++    if not isinstance(token, str) or not token.startswith("sk-ant-oat"):
++        raise RuntimeError(f"The server holds no usable token for shared Claude account {name!r}.")
++    return token, label if isinstance(label, str) else name
++
++
++def shared_account_env(account: str) -> dict[str, str]:
++    """The launch environment for shared *account*, fetched now and held only in it."""
++    token, _label = fetch_shared_token(account)
++    return {
++        "CLAUDE_CODE_OAUTH_TOKEN": token,
++        "ANTHROPIC_API_KEY": "",
++        "ANTHROPIC_AUTH_TOKEN": "",
++        "OMNIGENT_CLAUDE_ACCOUNT": account,
++    }
++
++
++def set_server_resolver(resolver: Callable[[str], bool] | None) -> None:
++    """Install the server's "is this a shared account id" check (``None`` removes it)."""
++    global _server_resolver
++    _server_resolver = resolver
++
++
++def known_on_server(account: str) -> bool:
++    """Whether the server in this process holds shared *account*; ``False`` without one."""
++    if _server_resolver is None or not is_shared(account):
++        return False
++    try:
++        return bool(_server_resolver(account))
++    except Exception:  # An unreadable store answers "not known", never a 500.
++        return False
+diff --git a/omnigent/onboarding/ambient.py b/omnigent/onboarding/ambient.py
+index 0656ccce0cfe272a8c106661da0baaca4b60f6b6..77497300ecded3083c295eb9dec8a3eedbdc8eb3 100644
+--- a/omnigent/onboarding/ambient.py
++++ b/omnigent/onboarding/ambient.py
+@@ -625,10 +625,11 @@ def _claude_login_detected() -> bool:
+         the credentials file on any platform, or via the macOS Keychain through
+         the CLI status fallback; ``False`` otherwise.
+     """
+-    from omnigent.onboarding.claude_accounts import account_env
++    from omnigent.onboarding.claude_accounts import _read, account_env, is_shared
+ 
+     try:
+-        if account_env():
++        # A selected shared account counts without fetching its token from the server.
++        if is_shared(_read()["active"]) or account_env():
+             return True
+     except (OSError, ValueError, RuntimeError):
+         pass
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+index 7e5feacc81b3e69174f990e270667e75d2315cd0..90847075b881304f8cecf95112c6e45f21d40a3d 100644
+--- a/omnigent/onboarding/claude_accounts.py
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -9,6 +9,12 @@ import threading
+ from pathlib import Path
+ 
+ from omnigent.onboarding import secrets
++from omnigent.onboarding.ae_shared_claude_accounts import (
++    descriptor,
++    is_shared,
++    shared_account_env,
++    shared_label,
++)
+ from omnigent.onboarding.harness_auth import StoreCredentialResult
+ from omnigent.onboarding.provider_config import _config_path
+ 
+@@ -41,7 +47,11 @@ def _read() -> dict:
+         or not isinstance(state.get("active"), str)
+         or any(not isinstance(name, str) or not _valid_name(name) for name in state["accounts"])
+         or len(set(state["accounts"])) != len(state["accounts"])
+-        or (state["active"] and state["active"] not in state["accounts"])
++        or (
++            state["active"]
++            and state["active"] not in state["accounts"]
++            and not is_shared(state["active"])
++        )
+     ):
+         raise RuntimeError("Invalid Claude accounts. Repair claude-accounts.json on this host.")
+     labels = state.get("labels", {})
+@@ -76,7 +86,7 @@ def account_descriptors() -> list[dict[str, str | None]]:
+             "env_var": name,
+         }
+         for name in ["", *available]
+-    ]
++    ] + ([descriptor(state["active"], True)] if is_shared(state["active"]) else [])
+ 
+ 
+ _ACCOUNT_LOCK = threading.RLock()
+@@ -92,7 +102,9 @@ def change_account(
+ def _change_account(
+     kind: str, name: str, token: str = "", *, label: str | None = None
+ ) -> StoreCredentialResult:
+-    if name and not _valid_name(name):
++    if is_shared(name) and kind != "claude-oauth-select":
++        return StoreCredentialResult(False, None, "Shared accounts are managed in Admin Center.")
++    if name and not _valid_name(name) and not is_shared(name):
+         return StoreCredentialResult(
+             False, None, "Use a name of up to 64 letters, digits, spaces, - or _."
+         )
+@@ -124,7 +136,9 @@ def _change_account(
+                 )
+             secrets.store_secret(f"claude-oauth-{name}", token.strip())
+             state["accounts"].append(name)
+-        elif kind != "claude-oauth-select" or (name and name not in state["accounts"]):
++        elif kind != "claude-oauth-select" or (
++            name and name not in state["accounts"] and not is_shared(name)
++        ):
+             return StoreCredentialResult(False, None, "Unknown Claude account.")
+         if kind != "claude-oauth-rename":
+             state["active"] = name
+@@ -148,6 +162,8 @@ def account_env(name: str | None = None) -> dict[str, str]:
+         name = state["active"]
+     if not name:
+         return {}
++    if is_shared(name):
++        return shared_account_env(name)
+     if name not in state["accounts"]:
+         raise RuntimeError("The selected Claude account is unavailable on this host.")
+     token = secrets.load_secret(f"claude-oauth-{name}")
+@@ -167,6 +183,8 @@ def account_env(name: str | None = None) -> dict[str, str]:
+ 
+ def account_label(name: str) -> str:
+     """Return the editable label for *name*, or *name* itself; never loads secrets."""
++    if is_shared(name):
++        return shared_label(name)
+     try:
+         label = _read().get("labels", {}).get(name)
+     except Exception:
+diff --git a/omnigent/server/routes/sessions/ae_fork_claude_account.py b/omnigent/server/routes/sessions/ae_fork_claude_account.py
+index e5d297c94f0c6da0f30d147bfd6cc2d3e7b59b7e..36fed0531d5cbcddfe5898e9cc876a5c3f42b7ae 100644
+--- a/omnigent/server/routes/sessions/ae_fork_claude_account.py
++++ b/omnigent/server/routes/sessions/ae_fork_claude_account.py
+@@ -18,6 +18,7 @@ from typing import Any
+ from fastapi import Request
+ 
+ from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.onboarding.ae_shared_claude_accounts import known_on_server
+ from omnigent.onboarding.claude_accounts import CLAUDE_PROVIDER_ENV_KEYS
+ 
+ _PROVIDER_FAMILIES = frozenset({"claude-provider-env", "claude-provider-config"})
+@@ -110,5 +111,6 @@ async def validate_fork_claude_account(
+         for item in credentials
+         if item.get("family") in _ACCOUNT_FAMILIES
+     }
+-    if account not in available:
++    # A shared account (omnigent-ae) lives on this server, not on the host.
++    if account not in available and not known_on_server(account):
+         raise _invalid("Selected Claude account is unavailable on this host.")
+diff --git a/tests/onboarding/test_ae_shared_claude_accounts.py b/tests/onboarding/test_ae_shared_claude_accounts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..56276b2fcbbf1b77f96c8709c0ae844dbd62ed0c
+--- /dev/null
++++ b/tests/onboarding/test_ae_shared_claude_accounts.py
+@@ -0,0 +1,138 @@
++"""Shared Claude accounts on a host: picked by id, fetched from the server at launch only."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++
++from omnigent.onboarding import ae_shared_claude_accounts as shared
++from omnigent.onboarding.claude_accounts import (
++    account_descriptors,
++    account_env,
++    account_label,
++    change_account,
++)
++
++TOKEN = "sk-ant-oat01-shared-" + "x" * 20
++
++
++@pytest.fixture(autouse=True)
++def isolated(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
++    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
++    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
++    monkeypatch.setenv("RUNNER_SERVER_URL", "https://omni.test/")
++
++
++@pytest.fixture()
++def server(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
++    """The server's token route, answered in process; records each request."""
++    calls: list[dict[str, Any]] = []
++    answers = {"Team": {"name": "Team", "label": "Company Max", "token": TOKEN}}
++
++    def get(url: str, *, headers: dict[str, str], **kwargs: Any) -> httpx.Response:
++        calls.append({"url": url, "headers": headers})
++        name = url.rsplit("/", 2)[-2]
++        request = httpx.Request("GET", url)
++        if name in answers:
++            return httpx.Response(200, json=answers[name], request=request)
++        body = {"error": {"code": "shared_account_not_found", "message": "No such account."}}
++        return httpx.Response(404, json=body, request=request)
++
++    monkeypatch.setattr(httpx, "get", get)
++
++    def factory(server_url: str | None = None, **_kwargs: Any) -> Any:
++        # The host's model-catalog probe has no RUNNER_SERVER_URL; only an explicit
++        # URL finds the stored login, so a call without one gets no credential.
++        return (lambda: "runner-jwt") if server_url else None
++
++    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", factory)
++    return calls
++
++
++def _files(root: Path) -> str:
++    return "".join(path.read_text(errors="ignore") for path in root.rglob("*") if path.is_file())
++
++
++def test_selecting_a_shared_account_keeps_only_its_id(tmp_path: Path) -> None:
++    assert change_account("claude-oauth-add", "Team", "sk-ant-oat-local-one").stored
++    assert change_account("claude-oauth-select", "shared:Team").stored
++    descriptors = account_descriptors()
++    # The host's own "Team" and the shared one are two rows with distinct ids.
++    assert [(row["env_var"], row["family"]) for row in descriptors] == [
++        ("", "claude-oauth"),
++        ("Team", "claude-oauth"),
++        ("shared:Team", "claude-oauth-active"),
++    ]
++    assert descriptors[-1]["source"] == "Team (shared)"
++    assert account_label("shared:Team") == "Team (shared)"
++    assert TOKEN not in _files(tmp_path)
++
++
++def test_a_shared_account_cannot_be_added_or_renamed_on_a_host() -> None:
++    added = change_account("claude-oauth-add", "shared:Team", "sk-ant-oat-x")
++    assert (added.stored, added.reason) == (False, "Shared accounts are managed in Admin Center.")
++    assert not change_account("claude-oauth-rename", "shared:Team", label="Mine").stored
++    assert not change_account("claude-oauth-select", "shared:../x").stored
++
++
++def test_launch_fetches_the_token_with_the_runner_credential(
++    server: list[dict[str, Any]], tmp_path: Path
++) -> None:
++    assert change_account("claude-oauth-select", "shared:Team").stored
++    env = account_env()
++    assert env == {
++        "CLAUDE_CODE_OAUTH_TOKEN": TOKEN,
++        "ANTHROPIC_API_KEY": "",
++        "ANTHROPIC_AUTH_TOKEN": "",
++        "OMNIGENT_CLAUDE_ACCOUNT": "shared:Team",
++    }
++    assert server[0]["url"] == "https://omni.test/v1/ae/claude-accounts/shared/Team/token"
++    assert server[0]["headers"]["Authorization"] == "Bearer runner-jwt"
++    # Fetched for this launch only: nothing on disk, and the next launch asks again.
++    assert TOKEN not in _files(tmp_path)
++    account_env()
++    assert len(server) == 2
++
++
++def test_the_native_terminal_gets_the_shared_token(server: list[dict[str, Any]]) -> None:
++    from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
++
++    env = build_native_claude_terminal_env(None, account_name="shared:Team")
++    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == TOKEN
++    assert env["OMNIGENT_CLAUDE_ACCOUNT"] == "shared:Team"
++
++
++def test_a_refusal_says_what_failed(server: list[dict[str, Any]]) -> None:
++    with pytest.raises(RuntimeError, match="No such account") as error:
++        account_env("shared:Gone")
++    assert "Admin Center" in str(error.value)
++
++
++def test_no_server_url_fails_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.delenv("RUNNER_SERVER_URL")
++    monkeypatch.delenv("OMNIGENT_SERVER_URL", raising=False)
++    with pytest.raises(RuntimeError, match="needs the OmniGent server"):
++        account_env("shared:Team")
++
++
++def test_detection_counts_a_shared_pick_without_fetching(monkeypatch: pytest.MonkeyPatch) -> None:
++    from omnigent.onboarding import ambient
++
++    def refuse(*args: Any, **kwargs: Any) -> httpx.Response:
++        raise AssertionError("detection must not fetch the token")
++
++    monkeypatch.setattr(httpx, "get", refuse)
++    monkeypatch.setattr(ambient, "claude_auth_has_credential", lambda path: False)
++    assert change_account("claude-oauth-select", "shared:Team").stored
++    assert ambient._claude_login_detected()
++
++
++def test_the_server_resolver_answers_for_a_fork(monkeypatch: pytest.MonkeyPatch) -> None:
++    assert not shared.known_on_server("shared:Team")
++    monkeypatch.setattr(shared, "_server_resolver", lambda account: account == "shared:Team")
++    assert shared.known_on_server("shared:Team")
++    assert not shared.known_on_server("shared:Other")
++    assert not shared.known_on_server("Team")
+diff --git a/tests/server/routes/test_ae_fork_claude_account.py b/tests/server/routes/test_ae_fork_claude_account.py
+index 3dce1b68f86aa48810d61ad5a41d0179271125cc..4e8a50fd122ef6c2c074973f014a1a8a2e316816 100644
+--- a/tests/server/routes/test_ae_fork_claude_account.py
++++ b/tests/server/routes/test_ae_fork_claude_account.py
+@@ -126,6 +126,31 @@ async def test_validates_the_account_against_the_source_host(
+     assert error.value.code == expected
+ 
+ 
++@pytest.mark.parametrize(("account", "ok"), [("shared:Team", True), ("shared:Gone", False)])
++async def test_a_shared_account_is_checked_against_this_server(
++    monkeypatch: pytest.MonkeyPatch, detected: list[dict[str, Any]], account: str, ok: bool
++) -> None:
++    from omnigent.onboarding import ae_shared_claude_accounts
++
++    _use_spec(monkeypatch, _Spec("claude-native"))
++    monkeypatch.setattr(
++        ae_shared_claude_accounts, "_server_resolver", lambda name: name == "shared:Team"
++    )
++    check = ae_fork_claude_account.validate_fork_claude_account(
++        _request(connected=True, owner="local"),
++        account=account,
++        agent=SimpleNamespace(id="agent", bundle_location="bundle"),
++        source=SimpleNamespace(host_id="host-local", inference_snapshot=None),
++        user_id=None,
++        host_type="external",
++    )
++    if ok:
++        await check
++        return
++    with pytest.raises(OmnigentError, match="unavailable"):
++        await check
++
++
+ @pytest.mark.parametrize("binding", ["session", "auth", "env", "host"])
+ async def test_refuses_provider_credentials_before_signing_in(
+     monkeypatch: pytest.MonkeyPatch, detected: list[dict[str, Any]], binding: str
+diff --git a/web/src/hooks/useHosts.ts b/web/src/hooks/useHosts.ts
+index 1891a69c4275904ebc98d4cb843ca699f4567d36..9300f73ef38042dc385b113753615582fb31ff75 100644
+--- a/web/src/hooks/useHosts.ts
++++ b/web/src/hooks/useHosts.ts
+@@ -7,6 +7,10 @@ import {
+ } from "@tanstack/react-query";
+ import { useEffect, useLayoutEffect, useRef } from "react";
+ import { authenticatedFetch } from "@/lib/identity";
++import {
++  aeFetchSharedClaudeAccounts,
++  aeMergeSharedClaudeAccounts,
++} from "@/lib/aeSharedClaudeAccounts";
+ import { ApiError } from "@/lib/sessionsApi";
+ import type { NativeModelOption } from "@/lib/types";
+ 
+@@ -371,12 +375,15 @@ export function useDetectedCredentials(hostId: string | null | undefined, enable
+   return useQuery({
+     queryKey: ["detected-credentials", hostId],
+     queryFn: async (): Promise<DetectedCredential[]> => {
+-      const res = await authenticatedFetch(
++      const detected = authenticatedFetch(
+         `/v1/hosts/${encodeURIComponent(hostId ?? "")}/credentials/detected`,
+       );
++      const shared = aeFetchSharedClaudeAccounts();
++      const res = await detected;
+       if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+       const body = (await res.json()) as { credentials?: DetectedCredential[] };
+-      return Array.isArray(body.credentials) ? body.credentials : [];
++      const rows = Array.isArray(body.credentials) ? body.credentials : [];
++      return aeMergeSharedClaudeAccounts(rows, await shared);
+     },
+     enabled: enabled && !!hostId,
+     staleTime: 30_000,
+diff --git a/web/src/lib/aeSharedClaudeAccounts.test.tsx b/web/src/lib/aeSharedClaudeAccounts.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3aeac7f607032fb5aad8a2198814b23d19996e4
+--- /dev/null
++++ b/web/src/lib/aeSharedClaudeAccounts.test.tsx
+@@ -0,0 +1,97 @@
++import { render, screen } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { DetectedCredential } from "@/hooks/useHosts";
++import {
++  AeSharedAccountMarker,
++  aeFetchSharedClaudeAccounts,
++  aeIsSharedAccount,
++  aeMergeSharedClaudeAccounts,
++} from "./aeSharedClaudeAccounts";
++
++const fetchMock = vi.fn();
++beforeEach(() => {
++  fetchMock.mockReset();
++  vi.stubGlobal("fetch", fetchMock);
++});
++
++const DEFAULT: DetectedCredential = { family: "claude-oauth", source: "Default", env_var: "" };
++const TEAM_LOCAL: DetectedCredential = { family: "claude-oauth", source: "Team", env_var: "Team" };
++const TEAM = { name: "Team", account: "shared:Team", label: "Company Max" };
++
++describe("aeIsSharedAccount", () => {
++  it("knows a shared id from a host name", () => {
++    expect(aeIsSharedAccount("shared:Team")).toBe(true);
++    expect(aeIsSharedAccount("Team")).toBe(false);
++    expect(aeIsSharedAccount("")).toBe(false);
++    expect(aeIsSharedAccount(null)).toBe(false);
++  });
++});
++
++describe("aeMergeSharedClaudeAccounts", () => {
++  it("lists shared accounts after the host's own, a same-named host login kept apart", () => {
++    expect(aeMergeSharedClaudeAccounts([DEFAULT, TEAM_LOCAL], [TEAM])).toEqual([
++      DEFAULT,
++      TEAM_LOCAL,
++      { family: "claude-oauth", source: "Company Max", env_var: "shared:Team" },
++    ]);
++  });
++
++  it("keeps the host's selection of a shared account under the server's label", () => {
++    const selected = {
++      family: "claude-oauth-active",
++      source: "Team (shared)",
++      env_var: "shared:Team",
++    };
++    expect(aeMergeSharedClaudeAccounts([DEFAULT, selected], [TEAM])).toEqual([
++      DEFAULT,
++      { family: "claude-oauth-active", source: "Company Max", env_var: "shared:Team" },
++    ]);
++  });
++
++  it("keeps a selected shared account the server no longer lists", () => {
++    const gone = { family: "claude-oauth-active", source: "Old (shared)", env_var: "shared:Old" };
++    expect(aeMergeSharedClaudeAccounts([DEFAULT, gone], [TEAM])).toEqual([
++      DEFAULT,
++      gone,
++      { family: "claude-oauth", source: "Company Max", env_var: "shared:Team" },
++    ]);
++  });
++
++  it("adds nothing to a host that lists no Claude logins", () => {
++    const other = { family: "openai", source: "$OPENAI_API_KEY", env_var: "OPENAI_API_KEY" };
++    expect(aeMergeSharedClaudeAccounts([other], [TEAM])).toEqual([other]);
++    expect(aeMergeSharedClaudeAccounts([], [TEAM])).toEqual([]);
++  });
++});
++
++describe("aeFetchSharedClaudeAccounts", () => {
++  it("reads names and labels from the server, dropping anything malformed", async () => {
++    fetchMock.mockResolvedValueOnce(
++      new Response(
++        JSON.stringify({
++          accounts: [TEAM, { name: "x", account: "x", label: "No prefix" }, null],
++          can_manage: false,
++        }),
++        { status: 200, headers: { "Content-Type": "application/json" } },
++      ),
++    );
++    await expect(aeFetchSharedClaudeAccounts()).resolves.toEqual([TEAM]);
++    expect(String(fetchMock.mock.calls[0][0])).toContain("/v1/ae/claude-accounts/shared");
++  });
++
++  it("is empty when the server refuses or cannot be reached", async () => {
++    fetchMock.mockResolvedValueOnce(new Response("{}", { status: 404 }));
++    await expect(aeFetchSharedClaudeAccounts()).resolves.toEqual([]);
++    fetchMock.mockRejectedValueOnce(new TypeError("offline"));
++    await expect(aeFetchSharedClaudeAccounts()).resolves.toEqual([]);
++  });
++});
++
++describe("AeSharedAccountMarker", () => {
++  it("shows the word Shared beside a Tabler icon", () => {
++    render(<AeSharedAccountMarker />);
++    const marker = screen.getByTestId("ae-shared-account-marker");
++    expect(marker).toHaveTextContent(/^Shared$/);
++    expect(marker.querySelector("svg")?.getAttribute("aria-hidden")).toBe("true");
++  });
++});
+diff --git a/web/src/lib/aeSharedClaudeAccounts.tsx b/web/src/lib/aeSharedClaudeAccounts.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..11681bcacc75dcc46691cf04e4bc5673c7fa17b8
+--- /dev/null
++++ b/web/src/lib/aeSharedClaudeAccounts.tsx
+@@ -0,0 +1,98 @@
++// Shared Claude accounts (omnigent-ae): subscription logins the server's admin
++// keeps for every user. A host lists its own logins; the server lists the
++// shared ones (GET /v1/ae/claude-accounts/shared, names and labels only), and
++// the picker shows both, the shared ones marked. A shared account's id is
++// `shared:<name>`, which no host login can be (host names have no colon).
++
++import type { DetectedCredential } from "@/hooks/useHosts";
++import { authenticatedFetch } from "@/lib/identity";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
++
++export const AE_SHARED_ACCOUNT_PREFIX = "shared:";
++const SHARED_ACCOUNTS_PATH = "/v1/ae/claude-accounts/shared";
++
++export interface AeSharedClaudeAccount {
++  name: string;
++  /** The id a host selects and a fork sends: `shared:<name>`. */
++  account: string;
++  label: string;
++}
++
++/** Whether an account id names a shared account. */
++export function aeIsSharedAccount(account: string | null | undefined): boolean {
++  return typeof account === "string" && account.startsWith(AE_SHARED_ACCOUNT_PREFIX);
++}
++
++/** The server's shared accounts; empty when the server has none or does not offer them. */
++export async function aeFetchSharedClaudeAccounts(): Promise<AeSharedClaudeAccount[]> {
++  try {
++    const res = await authenticatedFetch(SHARED_ACCOUNTS_PATH);
++    if (!res.ok) return [];
++    const body = (await res.json()) as { accounts?: unknown };
++    if (!Array.isArray(body.accounts)) return [];
++    return body.accounts.filter(
++      (row): row is AeSharedClaudeAccount =>
++        !!row &&
++        typeof row === "object" &&
++        typeof (row as AeSharedClaudeAccount).name === "string" &&
++        aeIsSharedAccount((row as AeSharedClaudeAccount).account) &&
++        typeof (row as AeSharedClaudeAccount).label === "string",
++    );
++  } catch {
++    return [];
++  }
++}
++
++/**
++ * The host's rows with the shared accounts after its own logins. A host that
++ * reports no Claude login rows gets none added (its accounts failed to load).
++ * The host reports a selected shared account by id only; the server's label
++ * replaces it, and a selection the server no longer lists keeps the host's row.
++ */
++export function aeMergeSharedClaudeAccounts(
++  rows: readonly DetectedCredential[],
++  shared: readonly AeSharedClaudeAccount[],
++): DetectedCredential[] {
++  if (!rows.some((row) => row.family.startsWith("claude-oauth"))) return [...rows];
++  const listed = new Set(shared.map((account) => account.account));
++  const active = new Set(
++    rows
++      .filter((row) => row.family === "claude-oauth-active" && aeIsSharedAccount(row.env_var))
++      .map((row) => row.env_var),
++  );
++  const kept = rows.filter(
++    (row) => !(row.family.startsWith("claude-oauth") && listed.has(row.env_var ?? "")),
++  );
++  return [
++    ...kept,
++    ...shared.map((account) => ({
++      family: active.has(account.account) ? "claude-oauth-active" : "claude-oauth",
++      source: account.label,
++      env_var: account.account,
++    })),
++  ];
++}
++
++/** Tabler `users-group` (outline, @tabler/icons 3.46.0), inlined. */
++const USERS_GROUP: AeTablerIconNode = [
++  ["path", { d: "M10 13a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" }],
++  ["path", { d: "M8 21v-1a2 2 0 0 1 2 -2h4a2 2 0 0 1 2 2v1" }],
++  ["path", { d: "M15 5a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" }],
++  ["path", { d: "M17 10h2a2 2 0 0 1 2 2v1" }],
++  ["path", { d: "M5 5a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" }],
++  ["path", { d: "M3 13v-1a2 2 0 0 1 2 -2h2" }],
++];
++
++/** The visible "Shared" marker beside a shared account's label. */
++export function AeSharedAccountMarker() {
++  return (
++    <span
++      className="ml-1 inline-flex shrink-0 items-center gap-0.5 rounded border px-1 text-[10px] font-medium text-muted-foreground"
++      data-testid="ae-shared-account-marker"
++    >
++      <AeTablerSvg node={USERS_GROUP} className="size-3" />
++      Shared
++    </span>
++  );
++}
+diff --git a/web/src/shell/AeForkClaudeAccount.test.tsx b/web/src/shell/AeForkClaudeAccount.test.tsx
+index 1ff9b53f175152e25bf2d5a00d9454de4b50ef25..c0570d6973c833eced4a3517532890d7db91714f 100644
+--- a/web/src/shell/AeForkClaudeAccount.test.tsx
++++ b/web/src/shell/AeForkClaudeAccount.test.tsx
+@@ -90,6 +90,28 @@ describe("AeForkClaudeAccount", () => {
+     expect(onChange).toHaveBeenLastCalledWith("Work");
+   });
+ 
++  it("marks a shared account and reports its id", () => {
++    rows.value = [
++      WORK,
++      DEFAULT,
++      { family: "claude-oauth", source: "Company", env_var: "shared:Team" },
++    ];
++    const onChange = vi.fn();
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount={undefined}
++        value={undefined}
++        onChange={onChange}
++      />,
++    );
++    openSelect();
++    const option = screen.getByRole("option", { name: /Company/ });
++    expect(option).toHaveTextContent("Shared");
++    fireEvent.click(option);
++    expect(onChange).toHaveBeenLastCalledWith("shared:Team");
++  });
++
+   it("goes back to the source's account", () => {
+     rows.value = [WORK, DEFAULT];
+     const onChange = vi.fn();
+diff --git a/web/src/shell/AeForkClaudeAccount.tsx b/web/src/shell/AeForkClaudeAccount.tsx
+index 06ccd11d148e18269a67ef17498e53cba3432463..f41e6f5fb69f4463598f267d3d32ca6e12d64488 100644
+--- a/web/src/shell/AeForkClaudeAccount.tsx
++++ b/web/src/shell/AeForkClaudeAccount.tsx
+@@ -12,6 +12,7 @@ import {
+   SelectValue,
+ } from "@/components/ui/select";
+ import { type DetectedCredential, useDetectedCredentials } from "@/hooks/useHosts";
++import { AeSharedAccountMarker, aeIsSharedAccount } from "@/lib/aeSharedClaudeAccounts";
+ 
+ /** The session label the runner reads at Claude launch (server-internal). */
+ export const AE_CLAUDE_ACCOUNT_LABEL = "omnigent.claude_native.account";
+@@ -110,6 +111,7 @@ export function AeForkClaudeAccount({
+               value={choice.account === "" ? DEFAULT_LOGIN : choice.account}
+             >
+               {choice.label}
++              {aeIsSharedAccount(choice.account) && <AeSharedAccountMarker />}
+             </SelectItem>
+           ))}
+         </SelectContent>
+diff --git a/web/src/shell/ClaudeAccounts.test.tsx b/web/src/shell/ClaudeAccounts.test.tsx
+index b2e2c1df597bd9f51e0e60616661a838ee42c36e..a572edebdcc17260f2f3dee5f87c5a2c63745b0f 100644
+--- a/web/src/shell/ClaudeAccounts.test.tsx
++++ b/web/src/shell/ClaudeAccounts.test.tsx
+@@ -147,6 +147,29 @@ describe("ClaudeAccounts", () => {
+     expect(screen.getByRole("alert").textContent).toBe("Could not save account name.");
+     expect(screen.getByRole("textbox", { name: "Account label for Backup" })).toBeTruthy();
+   });
++  it("marks shared accounts, selects them by id and offers no rename", () => {
++    rows = [
++      ...rows,
++      { family: "claude-oauth", source: "Company Max", env_var: "shared:Team" },
++      { family: "claude-oauth", source: "Team", env_var: "Team" },
++    ];
++    render(<ClaudeAccounts host={host} />);
++    const markers = screen.getAllByTestId("ae-shared-account-marker");
++    expect(markers).toHaveLength(1);
++    expect(markers[0]).toHaveTextContent("Shared");
++    expect(markers[0].querySelector("svg")).toBeTruthy();
++    const shared = screen.getByRole("button", { name: /Company Max/ });
++    expect(shared).toContainElement(markers[0]);
++    // The host's own "Team" keeps its rename; the shared account has none.
++    expect(screen.getByRole("button", { name: "Rename Team" })).toBeTruthy();
++    expect(screen.queryByRole("button", { name: /Rename Company Max/ })).toBeNull();
++    fireEvent.click(shared);
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-select",
++      account_name: "shared:Team",
++    });
++  });
+   it("disables account actions while a rename is pending", () => {
+     const view = render(<ClaudeAccounts host={host} />);
+     fireEvent.click(screen.getByRole("button", { name: "Rename Backup" }));
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+index affde710a7a3219b19541dea2bff90499a3754e0..bd15c83d0678b0a8b2bc3732c4116d61958a1037 100644
+--- a/web/src/shell/ClaudeAccounts.tsx
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -3,6 +3,7 @@ import { useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { useDetectedCredentials, useStoreCredential, type Host } from "@/hooks/useHosts";
++import { AeSharedAccountMarker, aeIsSharedAccount } from "@/lib/aeSharedClaudeAccounts";
+ 
+ /** Host-owned subscription choices; no token is returned by the discovery API. */
+ export function ClaudeAccounts({
+@@ -73,6 +74,7 @@ export function ClaudeAccounts({
+         {rows.map((row) => {
+           const accountId = row.env_var ?? "";
+           const displayLabel = row.source;
++          const shared = aeIsSharedAccount(accountId);
+           return (
+             <div
+               key={accountId}
+@@ -120,9 +122,10 @@ export function ClaudeAccounts({
+                   }
+                 >
+                   {displayLabel}
++                  {shared && <AeSharedAccountMarker />}
+                   {row.family === "claude-oauth-active" ? " (selected)" : ""}
+                 </Button>
+-                {!compact && (
++                {!compact && !shared && (
+                   <Button
+                     type="button"
+                     variant="outline"

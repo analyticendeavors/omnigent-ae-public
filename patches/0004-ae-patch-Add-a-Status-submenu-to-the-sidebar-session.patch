@@ -1,0 +1,833 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Thu, 24 Sep 2026 03:52:46 +0000
+Subject: [PATCH 004/148] [ae-patch] Add a Status submenu to the sidebar
+ session menu that sets ae.status
+
+omnigent-ae patch P4 (2026-09-24). Right-clicking a session, or opening its
+kebab, now shows Status with Working, Blocked, Review, Parked and Reference,
+the stored ae.status checked (menuitemradio, aria-checked). The extension SDK
+has no menu contribution point, so this is a core patch.
+
+It writes exactly what the Parking Lot page's status buttons write: one
+ae.status label through upstream's own PATCH /v1/sessions/{id}, the route the
+AE stdio MCP server's omni_set_status uses. The page's Park is label-only (the
+note is filed from its Park form), so Parked here is label-only too and its
+tooltip says nothing is filed to the task-store; Review is the page's Done.
+
+The labels PATCH does not consult the slot cap, which runs at prompt time, so
+Working asks GET /v1/ae/capacity first and refuses at the limit with the
+server's count and the working titles; when that route cannot answer, the
+count comes from the sidebar's own cache, the same rows the Slots pill counts.
+Nothing overrides the cap: "ride unparked" in a prompt stays the only way to
+run a fourth. A failed PATCH is a toast carrying the server's detail. A
+successful one is painted onto every cached copy of the row in place, as
+upstream's pin and archive overlays do.
+
+Logic lives in the new web/src/shell/AeStatusMenu.tsx; the upstream edit is
+eight lines in Sidebar.tsx (an import and the owner-gated submenu above the
+lifecycle actions). On mobile the items render inline under a Status heading,
+since the sidebar's menus have no room for a side flyout there. Tests: the
+new AeStatusMenu suite and four cases in Sidebar.aeStatus.test.tsx.
+
+Co-Authored-By: Claude <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_0184jVW4MpPtzoZNQUAhcGoG
+---
+ web/src/shell/AeStatusMenu.test.tsx     | 328 ++++++++++++++++++++++
+ web/src/shell/AeStatusMenu.tsx          | 352 ++++++++++++++++++++++++
+ web/src/shell/Sidebar.aeStatus.test.tsx |  57 ++++
+ web/src/shell/Sidebar.tsx               |   8 +
+ 4 files changed, 745 insertions(+)
+ create mode 100644 web/src/shell/AeStatusMenu.test.tsx
+ create mode 100644 web/src/shell/AeStatusMenu.tsx
+
+diff --git a/web/src/shell/AeStatusMenu.test.tsx b/web/src/shell/AeStatusMenu.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8c4a04260abd4f9bd1af573d0255409a02630931
+--- /dev/null
++++ b/web/src/shell/AeStatusMenu.test.tsx
+@@ -0,0 +1,328 @@
++// Tests for the sidebar's Status submenu (omnigent-ae patch P4): the five
++// items with the stored status checked, the labels PATCH, the slot check
++// before Working (server answer first, the sidebar cache when the route
++// cannot answer), the error toasts, and the cache overlay.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuSub,
++  DropdownMenuSubContent,
++  DropdownMenuSubTrigger,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import type { Conversation } from "@/hooks/useConversations";
++import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
++
++const mocks = vi.hoisted(() => ({
++  fetch: vi.fn(),
++  toast: vi.fn(),
++  isMobile: false,
++}));
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++vi.mock("@/components/ui/toast", () => ({ showToast: mocks.toast }));
++vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mocks.isMobile }));
++
++import {
++  AE_STATUS_HINTS,
++  type AeMenuComponents,
++  AeStatusMenu,
++  applyAeStatus,
++  checkAeSlotRoom,
++  overlayAeStatusIntoCaches,
++} from "./AeStatusMenu";
++
++function conv(id: string, extra: Partial<Conversation> = {}): Conversation {
++  return {
++    id,
++    object: "conversation",
++    title: id,
++    created_at: 1,
++    updated_at: 1,
++    labels: {},
++    permission_level: null,
++    ...extra,
++  };
++}
++
++function pages(rows: Conversation[]): ConversationsInfiniteData {
++  return {
++    pages: [
++      {
++        data: rows,
++        first_id: rows[0]?.id ?? null,
++        last_id: rows.at(-1)?.id ?? null,
++        has_more: false,
++      },
++    ],
++    pageParams: [undefined],
++  };
++}
++
++function json(status: number, body: unknown, statusText = ""): Response {
++  return new Response(JSON.stringify(body), {
++    status,
++    statusText,
++    headers: { "Content-Type": "application/json" },
++  });
++}
++
++/** Route the mocked fetch: the capacity GET and the labels PATCH. */
++function serve({
++  capacity = json(404, { detail: "Not Found" }, "Not Found"),
++  patch = json(200, {}),
++}: { capacity?: Response | Error; patch?: Response } = {}) {
++  mocks.fetch.mockImplementation(async (path: string, init?: RequestInit) => {
++    if (path === "/v1/ae/capacity") {
++      if (capacity instanceof Error) throw capacity;
++      return capacity;
++    }
++    if (init?.method === "PATCH") return patch;
++    throw new Error(`unexpected ${init?.method ?? "GET"} ${path}`);
++  });
++}
++
++function patchCalls() {
++  return mocks.fetch.mock.calls.filter(([, init]) => init?.method === "PATCH");
++}
++
++const openSub = ({ children }: { children?: ReactNode }) => (
++  <DropdownMenuSub open>{children}</DropdownMenuSub>
++);
++
++const bundle: AeMenuComponents = {
++  Item: DropdownMenuItem,
++  Sub: openSub,
++  SubTrigger: DropdownMenuSubTrigger,
++  SubContent: DropdownMenuSubContent,
++};
++
++function renderMenu(conversation: Conversation, qc = new QueryClient(), onDone = vi.fn()) {
++  render(
++    <QueryClientProvider client={qc}>
++      <TooltipProvider>
++        <DropdownMenu open>
++          <DropdownMenuTrigger>menu</DropdownMenuTrigger>
++          <DropdownMenuContent>
++            <AeStatusMenu components={bundle} conversation={conversation} onDone={onDone} />
++          </DropdownMenuContent>
++        </DropdownMenu>
++      </TooltipProvider>
++    </QueryClientProvider>,
++  );
++  return { qc, onDone };
++}
++
++beforeEach(() => {
++  mocks.fetch.mockReset();
++  mocks.toast.mockReset();
++  mocks.isMobile = false;
++});
++afterEach(cleanup);
++
++describe("AeStatusMenu", () => {
++  it("offers a Status submenu with the five values and the stored one checked", () => {
++    renderMenu(conv("s1", { labels: { "ae.status": "review" } }));
++    expect(screen.getByTestId("ae-status-menu")).toHaveTextContent("Status");
++    const items = screen.getAllByTestId("ae-status-item");
++    expect(items.map((item) => item.textContent)).toEqual([
++      "Working",
++      "Blocked",
++      "Review",
++      "Parked",
++      "Reference",
++    ]);
++    expect(items.map((item) => item.getAttribute("role"))).toEqual(Array(5).fill("menuitemradio"));
++    expect(items.map((item) => item.getAttribute("aria-checked"))).toEqual([
++      "false",
++      "false",
++      "true",
++      "false",
++      "false",
++    ]);
++  });
++
++  it("checks nothing for a session without a status", () => {
++    renderMenu(conv("s1"));
++    const checked = screen
++      .getAllByTestId("ae-status-item")
++      .filter((item) => item.getAttribute("aria-checked") === "true");
++    expect(checked).toHaveLength(0);
++  });
++
++  it("renders the items inline under a heading on mobile", () => {
++    mocks.isMobile = true;
++    renderMenu(conv("s1", { labels: { "ae.status": "parked" } }));
++    expect(screen.queryByTestId("ae-status-menu")).toBeNull();
++    expect(screen.getByText("Status")).toBeInTheDocument();
++    expect(screen.getAllByTestId("ae-status-item")).toHaveLength(5);
++  });
++
++  it("writes the label through the session PATCH and paints the row", async () => {
++    serve();
++    const qc = new QueryClient();
++    qc.setQueryData(["conversations", "", false], pages([conv("s1")]));
++    const { onDone } = renderMenu(conv("s1"), qc);
++    fireEvent.click(screen.getByRole("menuitemradio", { name: /Parked/ }));
++    await waitFor(() => expect(patchCalls()).toHaveLength(1));
++    const [path, init] = patchCalls()[0];
++    expect(path).toBe("/v1/sessions/s1");
++    expect(JSON.parse(init.body as string)).toEqual({ labels: { "ae.status": "parked" } });
++    expect(onDone).toHaveBeenCalled();
++    await waitFor(() =>
++      expect(
++        qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])?.pages[0].data[0]
++          .labels,
++      ).toEqual({ "ae.status": "parked" }),
++    );
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++
++  it("says in the Parked hint that it files nothing to the task-store", () => {
++    expect(AE_STATUS_HINTS.parked).toMatch(/Label only/);
++    expect(AE_STATUS_HINTS.parked).toMatch(/nothing is filed to the task-store/);
++    expect(AE_STATUS_HINTS.review).toMatch(/Done/);
++  });
++});
++
++describe("applyAeStatus", () => {
++  it("does nothing when the session already holds the status", async () => {
++    serve();
++    const wrote = await applyAeStatus(
++      new QueryClient(),
++      conv("s1", { labels: { "ae.status": "parked" } }),
++      "parked",
++    );
++    expect(wrote).toBe(false);
++    expect(mocks.fetch).not.toHaveBeenCalled();
++  });
++
++  it("refuses Working when the server says every slot is taken", async () => {
++    serve({
++      capacity: json(200, {
++        limit: 3,
++        slots_used: 3,
++        working: [
++          { id: "a", title: "Alpha" },
++          { id: "b", title: "Beta" },
++          { id: "c", title: "Gamma" },
++        ],
++      }),
++    });
++    const wrote = await applyAeStatus(
++      new QueryClient(),
++      conv("s1", { labels: { "ae.status": "parked" } }),
++      "working",
++    );
++    expect(wrote).toBe(false);
++    expect(patchCalls()).toHaveLength(0);
++    const message = mocks.toast.mock.calls[0][0] as string;
++    expect(message).toContain("all 3 slots are working (Alpha, Beta, Gamma)");
++    expect(message).toContain("ride unparked");
++    expect(message).not.toContain("sidebar");
++  });
++
++  it("writes Working when the server has a free slot", async () => {
++    serve({
++      capacity: json(200, { limit: 3, slots_used: 2, working: [{ id: "a" }, { id: "b" }] }),
++    });
++    const wrote = await applyAeStatus(new QueryClient(), conv("s1"), "working");
++    expect(wrote).toBe(true);
++    expect(JSON.parse(patchCalls()[0][1].body as string)).toEqual({
++      labels: { "ae.status": "working" },
++    });
++  });
++
++  it("falls back to the sidebar's count when the capacity route cannot answer", async () => {
++    serve({ capacity: new TypeError("Failed to fetch") });
++    const qc = new QueryClient();
++    const working = { "ae.status": "working" };
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([
++        conv("a", { labels: working }),
++        conv("b", { labels: working }),
++        conv("c", { labels: working }),
++        conv("s1"),
++      ]),
++    );
++    expect(await applyAeStatus(qc, conv("s1"), "working")).toBe(false);
++    expect(mocks.toast.mock.calls[0][0]).toContain("by the sidebar's count");
++    expect(patchCalls()).toHaveLength(0);
++  });
++
++  it("does not count archived or sub-agent rows in the fallback", async () => {
++    serve();
++    const qc = new QueryClient();
++    const working = { "ae.status": "working" };
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([
++        conv("a", { labels: working }),
++        conv("b", { labels: working }),
++        conv("c", { labels: working, archived: true }),
++        conv("d", { labels: working, parent_session_id: "a" }),
++      ]),
++    );
++    expect(await checkAeSlotRoom(qc, "s1")).toEqual({ ok: true });
++  });
++
++  it("surfaces the server's refusal of the PATCH and leaves the cache alone", async () => {
++    serve({ patch: json(403, { detail: "Only the owner can edit labels" }, "Forbidden") });
++    const qc = new QueryClient();
++    qc.setQueryData(["conversations", "", false], pages([conv("s1")]));
++    expect(await applyAeStatus(qc, conv("s1"), "review")).toBe(false);
++    const message = mocks.toast.mock.calls[0][0] as string;
++    expect(message).toContain("Could not set the status to Review");
++    expect(message).toContain("403 Forbidden: Only the owner can edit labels");
++    expect(
++      qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false])?.pages[0].data[0]
++        .labels,
++    ).toEqual({});
++  });
++});
++
++describe("overlayAeStatusIntoCaches", () => {
++  it("paints every cached copy of the row and keeps its other labels", () => {
++    const qc = new QueryClient();
++    const row = conv("s1", { labels: { "ae.status": "working", "ae.next": "ship it" } });
++    const other = conv("s2", { labels: { "ae.status": "working" } });
++    qc.setQueryData(["conversations", "", false], pages([row, other]));
++    qc.setQueryData(["project-sessions", "Sprint"], pages([row]));
++    qc.setQueryData(["pinned-conversations"], { conversations: [row], filterHonored: true });
++    qc.setQueryData(["conversation-backfill", "s1"], row);
++
++    overlayAeStatusIntoCaches(qc, "s1", "parked");
++
++    const expected = { "ae.status": "parked", "ae.next": "ship it" };
++    const flat = qc.getQueryData<ConversationsInfiniteData>(["conversations", "", false]);
++    expect(flat?.pages[0].data[0].labels).toEqual(expected);
++    expect(flat?.pages[0].data[1].labels).toEqual({ "ae.status": "working" });
++    expect(
++      qc.getQueryData<ConversationsInfiniteData>(["project-sessions", "Sprint"])?.pages[0].data[0]
++        .labels,
++    ).toEqual(expected);
++    expect(
++      qc.getQueryData<{ conversations: Conversation[] }>(["pinned-conversations"])?.conversations[0]
++        .labels,
++    ).toEqual(expected);
++    expect(qc.getQueryData<Conversation>(["conversation-backfill", "s1"])?.labels).toEqual(
++      expected,
++    );
++  });
++
++  it("leaves a cache without the row untouched", () => {
++    const qc = new QueryClient();
++    const data = pages([conv("s2")]);
++    qc.setQueryData(["conversations", "", false], data);
++    overlayAeStatusIntoCaches(qc, "s1", "parked");
++    expect(qc.getQueryData(["conversations", "", false])).toBe(data);
++  });
++});
+diff --git a/web/src/shell/AeStatusMenu.tsx b/web/src/shell/AeStatusMenu.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..ade6f5bfc65b6d1d36f4587c23c3d05b06574c4d
+--- /dev/null
++++ b/web/src/shell/AeStatusMenu.tsx
+@@ -0,0 +1,352 @@
++// The Status submenu on a sidebar session's action menu: the five `ae.status`
++// values with the stored one checked. It writes what the Parking Lot page's
++// status buttons write (omnigent-ae `capacity.ts`): one label through
++// `PATCH /v1/sessions/{id}`. Parked is label-only there, so it is here; the
++// labels PATCH does not consult the slot cap, so Working asks
++// `GET /v1/ae/capacity` first and refuses at the limit (omnigent-ae patch P4).
++
++import type { QueryClient } from "@tanstack/react-query";
++import { useQueryClient } from "@tanstack/react-query";
++import { CheckIcon, CircleDotIcon } from "lucide-react";
++import type { ComponentType, ReactNode } from "react";
++import { AE_STATUS_ICONS, AE_STATUS_WORDS } from "@/components/AeStatusIcon";
++import { showToast } from "@/components/ui/toast";
++import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
++import type { Conversation } from "@/hooks/useConversations";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import {
++  AE_SLOT_LIMIT,
++  AE_STATUS_KEY,
++  AE_STATUS_VALUES,
++  type AeStatus,
++  aeStatusOf,
++  isAeSlot,
++} from "@/lib/aeLabels";
++import { authenticatedFetch } from "@/lib/identity";
++import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
++
++/** What each item writes, mirroring the Parking Lot page's button titles. */
++export const AE_STATUS_HINTS: Record<AeStatus, string> = {
++  working: "Set ae.status to working (takes a slot; refused when all slots are working)",
++  blocked: "Set ae.status to blocked (waiting on someone; holds no slot)",
++  review: "Set ae.status to review (the Parking Lot's Done)",
++  parked:
++    "Set ae.status to parked and free the slot. Label only: nothing is filed to the " +
++    "task-store; file the note from the Parking Lot page's Park form",
++  reference: "Set ae.status to reference (closed, lookup only; never takes a slot)",
++};
++
++// The subset of the sidebar's menu-component bundle this menu renders, typed
++// structurally so both the dropdown and the context-menu families satisfy it.
++interface AeMenuItemProps {
++  children?: ReactNode;
++  className?: string;
++  textValue?: string;
++  role?: string;
++  "aria-checked"?: boolean;
++  onSelect?: (event: Event) => void;
++  "data-testid"?: string;
++  "data-status"?: string;
++}
++
++export interface AeMenuComponents {
++  Item: ComponentType<AeMenuItemProps>;
++  Sub: ComponentType<{ children?: ReactNode }>;
++  SubTrigger: ComponentType<{
++    children?: ReactNode;
++    className?: string;
++    "data-testid"?: string;
++  }>;
++  SubContent: ComponentType<{ children?: ReactNode; className?: string }>;
++}
++
++type Row = Pick<Conversation, "id" | "labels">;
++
++// ── the write ────────────────────────────────────────────────────────────
++
++/** A failed response as one sentence: the status line plus the server's `detail`. */
++async function describeFailure(res: Response): Promise<string> {
++  let detail = "";
++  try {
++    const body = (await res.json()) as { detail?: unknown };
++    if (typeof body.detail === "string") detail = body.detail;
++    else if (body.detail !== undefined) detail = JSON.stringify(body.detail);
++  } catch {
++    // No JSON body; the status line is all there is.
++  }
++  const status = `${res.status} ${res.statusText}`.trim();
++  return detail ? `${status}: ${detail}` : status;
++}
++
++/** Write `ae.status` through upstream's labels PATCH; throws with the server's answer. */
++export async function patchAeStatus(sessionId: string, status: AeStatus): Promise<void> {
++  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
++    method: "PATCH",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ labels: { [AE_STATUS_KEY]: status } }),
++  });
++  if (!res.ok) throw new Error(await describeFailure(res));
++}
++
++// ── the slot check ───────────────────────────────────────────────────────
++
++export type AeSlotRoom =
++  | { ok: true }
++  | { ok: false; used: number; limit: number; titles: string[]; source: "server" | "sidebar" };
++
++interface CapacityRow {
++  id: string;
++  title?: string | null;
++}
++
++interface CapacityAnswer {
++  limit?: number;
++  slots_used?: number;
++  working?: CapacityRow[];
++}
++
++function cachedRows(queryClient: QueryClient): Conversation[] {
++  const rows: Conversation[] = [];
++  for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
++    queryKey: ["conversations"],
++  })) {
++    for (const page of data?.pages ?? []) rows.push(...page.data);
++  }
++  return rows;
++}
++
++/**
++ * Whether `sessionId` may become working: the server's `/v1/ae/capacity`
++ * count when it answers, else the sidebar cache's (each session once).
++ */
++export async function checkAeSlotRoom(
++  queryClient: QueryClient,
++  sessionId: string,
++): Promise<AeSlotRoom> {
++  try {
++    const res = await authenticatedFetch("/v1/ae/capacity", { method: "GET" });
++    if (res.ok) {
++      const answer = (await res.json()) as CapacityAnswer;
++      const working = (answer.working ?? []).filter((row) => row.id !== sessionId);
++      const limit = answer.limit ?? AE_SLOT_LIMIT;
++      const used = working.length;
++      if (used < limit) return { ok: true };
++      return {
++        ok: false,
++        used,
++        limit,
++        titles: working.map((row) => row.title || row.id),
++        source: "server",
++      };
++    }
++  } catch {
++    // Fall through to the sidebar's own count.
++  }
++  const seen = new Set<string>([sessionId]);
++  const working: Conversation[] = [];
++  for (const row of cachedRows(queryClient)) {
++    if (seen.has(row.id)) continue;
++    seen.add(row.id);
++    if (isAeSlot(row)) working.push(row);
++  }
++  if (working.length < AE_SLOT_LIMIT) return { ok: true };
++  return {
++    ok: false,
++    used: working.length,
++    limit: AE_SLOT_LIMIT,
++    titles: working.map((row) => row.title || row.id),
++    source: "sidebar",
++  };
++}
++
++/** The refusal as the toast shows it: the count, who holds the slots, the way out. */
++export function slotsFullMessage(room: Extract<AeSlotRoom, { ok: false }>): string {
++  const who = room.titles.length > 0 ? ` (${room.titles.join(", ")})` : "";
++  const counted = room.source === "server" ? "" : " by the sidebar's count";
++  return (
++    `Status not changed: all ${room.limit} slots are working${counted}${who}. ` +
++    `Park or finish one first, or start the next prompt in this session with ` +
++    `"ride unparked" to run it as a fourth.`
++  );
++}
++
++// ── the cache overlay ────────────────────────────────────────────────────
++
++function withStatus<T extends Row>(row: T, status: AeStatus): T {
++  return { ...row, labels: { ...(row.labels ?? {}), [AE_STATUS_KEY]: status } };
++}
++
++function overlayPages(
++  data: ConversationsInfiniteData | undefined,
++  id: string,
++  status: AeStatus,
++): ConversationsInfiniteData | undefined {
++  if (!data || !data.pages.some((page) => page.data.some((row) => row.id === id))) return data;
++  return {
++    ...data,
++    pages: data.pages.map((page) =>
++      page.data.some((row) => row.id === id)
++        ? { ...page, data: page.data.map((row) => (row.id === id ? withStatus(row, status) : row)) }
++        : page,
++    ),
++  };
++}
++
++/**
++ * Paint the new status onto every cached copy of the row (the flat lists, the
++ * project folders, the pinned list, the pinned-row backfill), in place rather
++ * than by refetch: upstream's pin and archive overlays explain why, since the
++ * list route can lag a PATCH and an immediate refetch bounces the row back.
++ * The server's push converges it afterwards.
++ */
++export function overlayAeStatusIntoCaches(
++  queryClient: QueryClient,
++  id: string,
++  status: AeStatus,
++): void {
++  for (const queryKey of [["conversations"], ["project-sessions"]]) {
++    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
++      queryKey,
++    })) {
++      const next = overlayPages(data, id, status);
++      if (next !== data) queryClient.setQueryData(key, next);
++    }
++  }
++  // `PINNED_CONVERSATIONS_KEY` in useConversations, spelled out so the sidebar
++  // suites that mock that module need not stub one more export.
++  queryClient.setQueryData<{ conversations: Conversation[] } | undefined>(
++    ["pinned-conversations"],
++    (old) =>
++      old && old.conversations.some((row) => row.id === id)
++        ? {
++            ...old,
++            conversations: old.conversations.map((row) =>
++              row.id === id ? withStatus(row, status) : row,
++            ),
++          }
++        : old,
++  );
++  queryClient.setQueryData<Conversation | null | undefined>(["conversation-backfill", id], (old) =>
++    old ? withStatus(old, status) : old,
++  );
++}
++
++// ── the action ───────────────────────────────────────────────────────────
++
++/**
++ * Set a session's `ae.status` the way the menu does: nothing when it already
++ * holds that value, the slot check before working, the PATCH, then the
++ * overlay. Every failure is a toast that says what failed and what to do.
++ * Returns whether the label was written.
++ */
++export async function applyAeStatus(
++  queryClient: QueryClient,
++  conversation: Row,
++  status: AeStatus,
++): Promise<boolean> {
++  if (aeStatusOf(conversation.labels) === status) return false;
++  if (status === "working") {
++    const room = await checkAeSlotRoom(queryClient, conversation.id);
++    if (!room.ok) {
++      showToast(slotsFullMessage(room));
++      return false;
++    }
++  }
++  try {
++    await patchAeStatus(conversation.id, status);
++  } catch (error) {
++    const reason = error instanceof Error ? error.message : String(error);
++    showToast(
++      `Could not set the status to ${AE_STATUS_WORDS[status]}: ${reason}. ` +
++        `Reload the page and try again, or set it from the Parking Lot page.`,
++    );
++    return false;
++  }
++  overlayAeStatusIntoCaches(queryClient, conversation.id, status);
++  return true;
++}
++
++// ── the menu ─────────────────────────────────────────────────────────────
++
++function StatusItems({
++  components: C,
++  conversation,
++  onDone,
++}: {
++  components: AeMenuComponents;
++  conversation: Row;
++  onDone?: () => void;
++}) {
++  const queryClient = useQueryClient();
++  const current = aeStatusOf(conversation.labels);
++  return (
++    <>
++      {AE_STATUS_VALUES.map((status) => {
++        const Icon = AE_STATUS_ICONS[status];
++        const checked = current === status;
++        return (
++          <Tooltip key={status}>
++            <TooltipTrigger asChild>
++              <C.Item
++                data-testid="ae-status-item"
++                data-status={status}
++                role="menuitemradio"
++                aria-checked={checked}
++                textValue={AE_STATUS_WORDS[status]}
++                onSelect={() => {
++                  onDone?.();
++                  void applyAeStatus(queryClient, conversation, status);
++                }}
++              >
++                <Icon className="size-3.5" aria-hidden="true" />
++                <span className="flex-1 text-left">{AE_STATUS_WORDS[status]}</span>
++                {checked && (
++                  <CheckIcon className="size-3.5 shrink-0 text-primary" aria-hidden="true" />
++                )}
++              </C.Item>
++            </TooltipTrigger>
++            <TooltipContent side="left" className="max-w-64">
++              {AE_STATUS_HINTS[status]}
++            </TooltipContent>
++          </Tooltip>
++        );
++      })}
++    </>
++  );
++}
++
++/**
++ * The Status submenu: a side flyout on desktop; inline under a "Status"
++ * heading on mobile, where the sidebar's menus have no room to fly out (the
++ * same reason upstream swaps its project picker in place there).
++ */
++export function AeStatusMenu({
++  components: C,
++  conversation,
++  onDone,
++}: {
++  components: AeMenuComponents;
++  conversation: Row;
++  onDone?: () => void;
++}) {
++  const isMobile = useIsMobileViewport();
++  if (isMobile) {
++    return (
++      <>
++        <p className="px-2 pt-1.5 pb-0.5 text-xs text-muted-foreground">Status</p>
++        <StatusItems components={C} conversation={conversation} onDone={onDone} />
++      </>
++    );
++  }
++  return (
++    <C.Sub>
++      <C.SubTrigger data-testid="ae-status-menu" className="whitespace-nowrap">
++        <CircleDotIcon className="size-3.5" />
++        Status
++      </C.SubTrigger>
++      <C.SubContent className="min-w-40">
++        <StatusItems components={C} conversation={conversation} onDone={onDone} />
++      </C.SubContent>
++    </C.Sub>
++  );
++}
+diff --git a/web/src/shell/Sidebar.aeStatus.test.tsx b/web/src/shell/Sidebar.aeStatus.test.tsx
+index 1456b51aa0900adf4e427f25f7d5e6b5a2dc74f1..12c5cdd0f212c13a9ec40122c32cc2e893fd0778 100644
+--- a/web/src/shell/Sidebar.aeStatus.test.tsx
++++ b/web/src/shell/Sidebar.aeStatus.test.tsx
+@@ -7,6 +7,8 @@
+ //   3. `AeSlotsPill` sits in the primary navigation beside the extension
+ //      slot, counts the working rows in the `["conversations"]` cache, and
+ //      turns red at the limit.
++//   4. The row's kebab and right-click menus carry the Status submenu
++//      (`AeStatusMenu`, patch P4) for the owner, and not for a shared row.
+ // The mock scaffold is the one `Sidebar.rowActions.test.tsx` uses, so the
+ // sidebar renders with the same stubs.
+ 
+@@ -389,3 +391,58 @@ describe("slots pill", () => {
+     expect(within(row).getByRole("img", { name: "Working" })).toBeInTheDocument();
+   });
+ });
++
++describe("Status submenu in the row menus", () => {
++  it("sits in the owner's kebab before the lifecycle actions", () => {
++    mockConversations([conv("w", { labels: { "ae.status": "working" } })]);
++    renderSidebar();
++    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
++    const trigger = screen.getByTestId("ae-status-menu");
++    expect(trigger).toHaveTextContent("Status");
++    expect(trigger).toHaveAttribute("aria-haspopup", "menu");
++    const archive = screen.getByTestId("archive-conversation");
++    expect(
++      trigger.compareDocumentPosition(archive) & Node.DOCUMENT_POSITION_FOLLOWING,
++    ).toBeTruthy();
++  });
++
++  it("sits in the right-click menu too", () => {
++    mockConversations([conv("w", { labels: { "ae.status": "working" } })]);
++    renderSidebar();
++    fireEvent.contextMenu(screen.getByRole("link", { name: /Session w/ }));
++    expect(screen.getByTestId("ae-status-menu")).toBeInTheDocument();
++  });
++
++  it("lists the five values inline with the stored one checked on mobile", () => {
++    mocks.isMobile = true;
++    mockConversations([conv("p", { labels: { "ae.status": "parked" } })]);
++    renderSidebar();
++    fireEvent.pointerDown(screen.getByTestId("conversation-actions"), { button: 0 });
++    const items = screen.getAllByRole("menuitemradio");
++    expect(items.map((item) => item.textContent)).toEqual([
++      "Working",
++      "Blocked",
++      "Review",
++      "Parked",
++      "Reference",
++    ]);
++    expect(screen.getByRole("menuitemradio", { name: /Parked/ })).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++  });
++
++  it("is not offered on a session shared with the viewer", () => {
++    mockConversations([conv("s", { owner: "other@example.com" })]);
++    renderSidebar();
++    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
++      button: 0,
++      ctrlKey: false,
++      pointerType: "mouse",
++    });
++    fireEvent.click(screen.getByTestId("session-filter-shared"));
++    fireEvent.contextMenu(screen.getByRole("link", { name: /Session s/ }));
++    expect(screen.getByTestId("fork-conversation")).toBeInTheDocument();
++    expect(screen.queryByTestId("ae-status-menu")).toBeNull();
++  });
++});
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index ceee204b7f04a7225091be3f8d6c246e3b887058..f288ceb8796d40e96f42473d29d7efe4dbae41b8 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -233,6 +233,7 @@ import {
+ import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+ import { AeConversationStatusIcon } from "@/components/AeStatusIcon";
+ import { AeSlotsPill } from "@/components/AeSlotsPill";
++import { AeStatusMenu } from "@/shell/AeStatusMenu";
+ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+ import { useViewerId } from "@/hooks/useViewerId";
+ import { useExtensions } from "@/extensions/ExtensionProvider";
+@@ -4069,6 +4070,13 @@ function ConversationMenuItems({
+             </C.SubContent>
+           </C.Sub>
+         ))}
++      {isOwner && (
++        <AeStatusMenu
++          components={C}
++          conversation={conversation}
++          onDone={() => setMenuOpen(false)}
++        />
++      )}
+       {/* Stop / Archive / Delete are grouped at the bottom, below a
+           divider: lifecycle-ending actions separated from the everyday
+           ones above. */}

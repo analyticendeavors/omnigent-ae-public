@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 15:35:55 -0700
+Subject: [PATCH 053/148] [ae-patch] Keep Claude request-log records and
+ system-queued commands out of the chat.
+
+---
+ omnigent/harnesses/claude_native/bridge.py    |   5 +
+ .../claude_native/transcript_filters.py       |  61 +++++++
+ .../test_claude_native_bridge.py              | 165 ++++++++++++++++++
+ 3 files changed, 231 insertions(+)
+ create mode 100644 omnigent/harnesses/claude_native/transcript_filters.py
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 86b8f717a50a314c4d475580daa80b1f9ca22bde..9e8a0fad4bfbec4d8c4318def88ef8faba788339 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -69,6 +69,7 @@ from filelock import Timeout as FileLockTimeout
+ 
+ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+ from omnigent.harnesses.claude_native import delivery_diagnostics
++from omnigent.harnesses.claude_native import transcript_filters
+ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+ from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+ from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+@@ -7971,6 +7972,8 @@ def _transcript_items_from_entry(
+         the file shape.
+     :returns: Updated active response id and parsed items.
+     """
++    if transcript_filters.is_request_log_record(entry):
++        return current_response_id, []
+     if not include_sidechains and entry.get("isSidechain") is True:
+         return current_response_id, []
+     if entry.get("type") == "attachment":
+@@ -8066,6 +8069,8 @@ def _attachment_transcript_items_from_entry(
+         return current_response_id, []
+     if _is_trusted_agent_notification_text(prompt, origin=attachment.get("origin")):
+         return current_response_id, []
++    if transcript_filters.is_system_queued_command(attachment):
++        return current_response_id, []
+     source_key = _transcript_source_key(entry, line_number, record_offset)
+     item = ClaudeTranscriptItem(
+         source_id=_source_id(source_key, 0, "message"),
+diff --git a/omnigent/harnesses/claude_native/transcript_filters.py b/omnigent/harnesses/claude_native/transcript_filters.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be2510f7b54d019426a2c95697472be69500587f
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/transcript_filters.py
+@@ -0,0 +1,61 @@
++"""Claude transcript records that must never reach the Omnigent chat.
++
++Claude Code writes bookkeeping into the session transcript next to the
++conversation itself. Two kinds look enough like chat to slip through the
++bridge's role-based dispatch:
++
++* Request-log records (``type`` starting with ``api-request``, such as
++  ``api-request-blob``, added in Claude Code 2.1.300). They copy the raw
++  request text the model saw, ``<system-reminder>`` wrappers, skill
++  bodies and repeated prompts included, under a ``message.role`` of
++  ``user``, ``assistant`` or ``system`` and with no ``uuid``.
++* Prompt-mode ``queued_command`` attachments that Claude Code queued on
++  its own: messages from another agent (``origin.kind == "peer"``, with
++  ``origin.handback`` set for a subagent's final report), background
++  task notifications, and anything marked ``isMeta``. None of them is
++  user input.
++
++The bridge calls these predicates before it turns a record into items.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Mapping
++
++_REQUEST_LOG_TYPE_PREFIX = "api-request"
++_SYSTEM_ORIGIN_KINDS = frozenset({"peer", "task-notification"})
++
++
++def is_request_log_record(entry: Mapping[str, object]) -> bool:
++    """
++    Return whether a transcript record is one of Claude's request logs.
++
++    :param entry: Decoded JSON object from one transcript line.
++    :returns: ``True`` when ``entry["type"]`` starts with
++        ``api-request``.
++    """
++    record_type = entry.get("type")
++    return isinstance(record_type, str) and record_type.startswith(_REQUEST_LOG_TYPE_PREFIX)
++
++
++def is_system_queued_command(attachment: Mapping[str, object]) -> bool:
++    """
++    Return whether a ``queued_command`` attachment was queued by Claude.
++
++    Claude Code stores the markers on the attachment itself:
++    ``isMeta`` at its top level, and ``kind`` and ``handback`` inside its
++    ``origin`` object.
++
++    :param attachment: The ``attachment`` object of a transcript record.
++    :returns: ``True`` when the attachment is marked ``isMeta``, its
++        origin kind is ``peer`` or ``task-notification``, or its origin
++        carries ``handback: true``.
++    """
++    if attachment.get("isMeta") is True:
++        return True
++    origin = attachment.get("origin")
++    if not isinstance(origin, Mapping):
++        return False
++    if origin.get("kind") in _SYSTEM_ORIGIN_KINDS:
++        return True
++    return origin.get("handback") is True
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 2391f17c1e001b4ef795cd8b05ea3e2955727df3..a19d677b109e645c3c21a74d8cd8be1ed630e818 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -68,6 +68,10 @@ from omnigent.harnesses.claude_native.bridge import (
+     stop_hook_seen_since,
+     write_tmux_target,
+ )
++from omnigent.harnesses.claude_native.transcript_filters import (
++    is_request_log_record,
++    is_system_queued_command,
++)
+ from omnigent.inner.datamodel import (
+     CredentialProxyEntry,
+     CredentialProxySpec,
+@@ -1409,6 +1413,167 @@ def test_native_agent_tool_result_carries_only_completion_provenance(
+     assert response_id == "active"
+ 
+ 
++def test_read_transcript_items_since_skips_request_log_records(tmp_path: Path) -> None:
++    """
++    ``api-request-blob`` records never become chat items.
++
++    Claude Code 2.1.300 and later log the raw request text the model saw
++    as ``type: "api-request-blob"`` records with a ``message.role`` of
++    ``user``, ``assistant`` or ``system`` and no ``uuid``. Dispatching on
++    the role alone mirrored them into the chat as duplicate bubbles. A
++    real task notification in the same file must still come out as a
++    meta user message.
++    """
++    task_notification = (
++        "<task-notification>\n"
++        "<task-id>b1mhekpmy</task-id>\n"
++        "<summary>Background command finished</summary>\n"
++        "</task-notification>"
++    )
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text(
++        "\n".join(
++            [
++                json.dumps(
++                    {
++                        "type": "api-request-blob",
++                        "hash": "blob-user",
++                        "sessionId": "session-1",
++                        "message": {
++                            "role": "user",
++                            "content": [
++                                {
++                                    "type": "text",
++                                    "text": "<system-reminder>request log copy</system-reminder>",
++                                }
++                            ],
++                        },
++                    }
++                ),
++                json.dumps(
++                    {
++                        "type": "api-request-blob",
++                        "hash": "blob-assistant",
++                        "sessionId": "session-1",
++                        "message": {
++                            "role": "assistant",
++                            "content": [{"type": "text", "text": "request log reply"}],
++                        },
++                    }
++                ),
++                json.dumps(
++                    {
++                        "type": "user",
++                        "uuid": "task-notification-1",
++                        "message": {"role": "user", "content": task_notification},
++                    }
++                ),
++            ]
++        )
++        + "\n",
++        encoding="utf-8",
++    )
++
++    _cursor, current_response_id, items = read_transcript_items_since(
++        transcript_path,
++        0,
++        agent_name="claude-native-ui",
++    )
++
++    assert current_response_id is None
++    assert [item.item_type for item in items] == ["message"]
++    assert items[0].data == {
++        "role": "user",
++        "is_meta": True,
++        "content": [{"type": "input_text", "text": task_notification}],
++    }
++
++
++def test_read_transcript_items_since_skips_system_queued_commands(tmp_path: Path) -> None:
++    """
++    Queued commands Claude Code delivered on its own stay out of the chat.
++
++    A subagent's hand-back report arrives as a prompt-mode
++    ``queued_command`` attachment marked ``isMeta`` with an ``origin`` of
++    kind ``peer`` and ``handback`` set. It is not user input, so it must
++    not render as a user bubble, while a prompt the user queued still
++    does.
++    """
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text(
++        "\n".join(
++            [
++                json.dumps(
++                    {
++                        "type": "attachment",
++                        "uuid": "queued-handback",
++                        "attachment": {
++                            "type": "queued_command",
++                            "prompt": "Subagent report text",
++                            "commandMode": "prompt",
++                            "isMeta": True,
++                            "origin": {"kind": "peer", "from": "agent-1", "handback": True},
++                        },
++                    }
++                ),
++                json.dumps(
++                    {
++                        "type": "attachment",
++                        "uuid": "queued-peer",
++                        "attachment": {
++                            "type": "queued_command",
++                            "prompt": "Peer message text",
++                            "commandMode": "prompt",
++                            "origin": {"kind": "peer", "from": "agent-2"},
++                        },
++                    }
++                ),
++                json.dumps(
++                    {
++                        "type": "attachment",
++                        "uuid": "queued-stop",
++                        "attachment": {
++                            "type": "queued_command",
++                            "prompt": "STOP",
++                            "commandMode": "prompt",
++                        },
++                    }
++                ),
++            ]
++        )
++        + "\n",
++        encoding="utf-8",
++    )
++
++    _cursor, _current_response_id, items = read_transcript_items_since(
++        transcript_path,
++        0,
++        agent_name="claude-native-ui",
++    )
++
++    assert [item.source_id for item in items] == ["queued-stop:0:message"]
++    assert items[0].data == {
++        "role": "user",
++        "content": [{"type": "input_text", "text": "STOP"}],
++    }
++
++
++def test_system_queued_command_predicate() -> None:
++    """
++    Each marker on its own flags a queued command as system-delivered.
++    """
++    assert is_system_queued_command({"isMeta": True})
++    assert is_system_queued_command({"origin": {"kind": "peer"}})
++    assert is_system_queued_command({"origin": {"kind": "task-notification"}})
++    assert is_system_queued_command({"origin": {"kind": "other", "handback": True}})
++    assert not is_system_queued_command({"prompt": "STOP", "commandMode": "prompt"})
++    assert not is_system_queued_command({"isMeta": False, "origin": {"kind": "user"}})
++    assert is_request_log_record({"type": "api-request-blob"})
++    assert is_request_log_record({"type": "api-request"})
++    assert not is_request_log_record({"type": "user"})
++    assert not is_request_log_record({"message": {"role": "user"}})
++
++
+ def test_read_transcript_items_since_flags_compact_summary(tmp_path: Path) -> None:
+     """
+     An ``isCompactSummary`` user record is flagged, not rendered as a bubble.

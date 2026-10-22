@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 20:20:45 -0700
+Subject: [PATCH 094/148] [ae-patch] Check a global policy's factory_params by
+ building its factory once, and accept them on PATCH /v1/policies/{id}
+
+The Global Policies page could switch and delete a global policy but not
+change its parameters: UpdateDefaultPolicyRequest took only name, handler
+and enabled. It now takes factory_params, which replace the stored ones whole
+(omitted leaves them, null or {} clears them).
+
+The new omnigent/server/routes/ae_default_policy_params.py checks params the
+way the create route does (registry schema) and then builds the factory once,
+because the schema covers key names and JSON types only and a stored policy
+whose factory raises breaks policy evaluation for every session. The create
+route runs the same check, and a PATCH that changes only the handler checks
+the stored params against the new one, so neither path can store params the
+factory rejects. update_default gains the field behind a sentinel, so callers
+that leave it out keep today's behavior. openapi.json regenerated.
+---
+ .../server/routes/ae_default_policy_params.py |  83 ++++++++++
+ omnigent/server/routes/default_policies.py    |   7 +
+ omnigent/server/schemas.py                    |   3 +
+ omnigent/stores/policy_store/__init__.py      |   7 +
+ .../stores/policy_store/sqlalchemy_store.py   |   8 +-
+ openapi.json                                  |  13 ++
+ .../routes/test_ae_default_policy_params.py   | 156 ++++++++++++++++++
+ .../test_ae_update_default_factory_params.py  |  49 ++++++
+ 8 files changed, 325 insertions(+), 1 deletion(-)
+ create mode 100644 omnigent/server/routes/ae_default_policy_params.py
+ create mode 100644 tests/server/routes/test_ae_default_policy_params.py
+ create mode 100644 tests/stores/test_ae_update_default_factory_params.py
+
+diff --git a/omnigent/server/routes/ae_default_policy_params.py b/omnigent/server/routes/ae_default_policy_params.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..456f6019490791ac235b85f55afbe503e3ec8bbd
+--- /dev/null
++++ b/omnigent/server/routes/ae_default_policy_params.py
+@@ -0,0 +1,83 @@
++"""Factory params on the global policy routes (AE patch).
++
++The Global Policies page edits a global policy's parameters. Params are checked
++against the registry schema and the factory is then built once, on create and
++on update: the schema covers key names and JSON types only, and a stored policy
++whose factory raises breaks policy evaluation for every session.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.policies.function import resolve_function_policy
++from omnigent.policies.registry import is_registered_handler, validate_factory_params
++from omnigent.server.schemas import UpdateDefaultPolicyRequest
++from omnigent.spec.types import FunctionPolicySpec, FunctionRef
++from omnigent.stores.policy_store import PolicyStore
++
++
++def ae_check_factory_params(name: str, handler: str, params: dict[str, Any] | None) -> None:
++    """Raise 400 unless the schema accepts *params* and the factory builds with them.
++
++    :param name: The policy's name, for the error.
++    :param handler: The registered handler the params are for.
++    :param params: The params as they will be stored (``None`` for none).
++    :raises OmnigentError: 400 naming what is wrong and what to do.
++    """
++    problem = validate_factory_params(handler, params)
++    if problem is not None:
++        raise OmnigentError(
++            f"{problem}. Change the params and save again.", code=ErrorCode.INVALID_INPUT
++        )
++    spec = FunctionPolicySpec(
++        name=name, on=None, function=FunctionRef(path=handler, arguments=params)
++    )
++    try:
++        resolve_function_policy(spec)
++    except Exception as exc:
++        raise OmnigentError(
++            f"Policy '{name}' rejected these params: {exc}. Change them and save again.",
++            code=ErrorCode.INVALID_INPUT,
++        ) from exc
++
++
++def ae_patch_factory_params(
++    store: PolicyStore, policy_id: str, body: UpdateDefaultPolicyRequest
++) -> dict[str, Any]:
++    """Check the params a PATCH leaves the policy with; return any new ones.
++
++    A new ``handler`` is checked against the stored params as well, so a
++    handler change cannot leave params its factory rejects.
++
++    :param store: The default policy store.
++    :param policy_id: The policy being updated.
++    :param body: The PATCH body.
++    :returns: ``{"factory_params": params}`` when the body sets them, else ``{}``.
++    :raises OmnigentError: 404 when the policy is missing; 400 when the
++        params do not fit its handler or its factory rejects them.
++    """
++    params_sent = "factory_params" in body.model_fields_set
++    if not params_sent and body.handler is None:
++        return {}
++    existing = store.get_default(policy_id)
++    if existing is None:
++        raise OmnigentError("Policy not found", code=ErrorCode.NOT_FOUND)
++    if existing.type != "python":
++        if params_sent:
++            raise OmnigentError(
++                "factory_params apply to python policies only; remove the field.",
++                code=ErrorCode.INVALID_INPUT,
++            )
++        return {}
++    handler = body.handler or existing.handler
++    params = (body.factory_params or None) if params_sent else existing.factory_params
++    if not is_registered_handler(handler):
++        raise OmnigentError(
++            f"Policy handler '{handler}' is not registered, so its params cannot be "
++            "checked. Add the module that declares it to the server's 'policy_modules'.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    ae_check_factory_params(existing.name, handler, params)
++    return {"factory_params": params} if params_sent else {}
+diff --git a/omnigent/server/routes/default_policies.py b/omnigent/server/routes/default_policies.py
+index e75f7f2d9aa1ff4f10c1d6632b043dc2cb906bf0..ec05540cc099b274ff251b3fc603bacba1838225 100644
+--- a/omnigent/server/routes/default_policies.py
++++ b/omnigent/server/routes/default_policies.py
+@@ -30,6 +30,10 @@ from omnigent.runtime import get_caps
+ from omnigent.runtime.policies.builder import invalidate_default_policy_specs_cache
+ from omnigent.server.auth import AuthProvider
+ from omnigent.server.routes._auth_helpers import get_user_id
++from omnigent.server.routes.ae_default_policy_params import (
++    ae_check_factory_params,
++    ae_patch_factory_params,
++)
+ from omnigent.server.schemas import (
+     _DOTTED_PATH_RE,
+     CreateDefaultPolicyRequest,
+@@ -213,6 +217,7 @@ def create_default_policies_router(
+         validation_error = validate_factory_params(body.handler, body.factory_params)
+         if validation_error:
+             raise OmnigentError(validation_error, code=ErrorCode.INVALID_INPUT)
++        ae_check_factory_params(body.name, body.handler, body.factory_params or None)
+         policy_id = _generate_default_policy_id()
+         try:
+             policy = store.create_default(
+@@ -352,12 +357,14 @@ def create_default_policies_router(
+                         f"config so it appears in the policy registry.",
+                         code=ErrorCode.INVALID_INPUT,
+                     )
++        params_update = ae_patch_factory_params(store, policy_id, body)
+         try:
+             policy = store.update_default(
+                 policy_id,
+                 name=body.name,
+                 handler=body.handler,
+                 enabled=body.enabled,
++                **params_update,
+             )
+         except IntegrityError as exc:
+             raise OmnigentError(
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index f860316928b6f1b196066be41e9ec78dd6c40412..892c84e14efd8070c308299343e14d5022b2f6e3 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -533,6 +533,8 @@ class UpdateDefaultPolicyRequest(BaseModel):
+         unchanged.
+     :param enabled: New enabled flag. ``None`` leaves it
+         unchanged.
++    :param factory_params: New factory params, replacing the old ones
++        whole. Omitted leaves them unchanged; ``null`` or ``{}`` clears them.
+     """
+ 
+     model_config = ConfigDict(extra="forbid")
+@@ -540,6 +542,7 @@ class UpdateDefaultPolicyRequest(BaseModel):
+     name: str | None = None
+     handler: str | None = None
+     enabled: bool | None = None
++    factory_params: dict[str, Any] | None = None
+ 
+ 
+ # ── Files ───────────────────────────────────────────────────────
+diff --git a/omnigent/stores/policy_store/__init__.py b/omnigent/stores/policy_store/__init__.py
+index 998a7b85fadd88f0a39d3548fe54855c8eef9717..e7618ae509ecf36f5ee15f38c66254d1fa51f4c5 100644
+--- a/omnigent/stores/policy_store/__init__.py
++++ b/omnigent/stores/policy_store/__init__.py
+@@ -9,6 +9,10 @@ from typing import Any
+ 
+ from omnigent.entities import Policy
+ 
++# Sentinel meaning "caller did not supply this argument; leave the column unchanged."
++# Distinct from None, which means "set the column to NULL."
++_UNSET: Any = object()
++
+ 
+ class PolicyStore(ABC):
+     """
+@@ -199,6 +203,7 @@ class PolicyStore(ABC):
+         name: str | None = None,
+         handler: str | None = None,
+         enabled: bool | None = None,
++        factory_params: dict[str, Any] | None = _UNSET,
+     ) -> Policy | None:
+         """
+         Update mutable fields of a default policy. ``type`` is
+@@ -208,6 +213,8 @@ class PolicyStore(ABC):
+         :param name: New name.
+         :param handler: New handler path or URL.
+         :param enabled: New enabled flag.
++        :param factory_params: New factory params, replacing the old
++            ones; ``None`` or ``{}`` clears them, omitted leaves them.
+         :returns: The updated :class:`Policy`, or ``None``.
+         """
+         ...
+diff --git a/omnigent/stores/policy_store/sqlalchemy_store.py b/omnigent/stores/policy_store/sqlalchemy_store.py
+index 3ff506745dd22dcd28980ddf84f2645a822e9e6a..84f93a4b9cd1e10a118bb6818afb1a971735fa3b 100644
+--- a/omnigent/stores/policy_store/sqlalchemy_store.py
++++ b/omnigent/stores/policy_store/sqlalchemy_store.py
+@@ -28,7 +28,7 @@ from omnigent.db.utils import (
+     run_write_transaction,
+ )
+ from omnigent.entities import Policy
+-from omnigent.stores.policy_store import PolicyStore
++from omnigent.stores.policy_store import _UNSET, PolicyStore
+ 
+ 
+ def _to_entity(row: SqlPolicy) -> Policy:
+@@ -330,6 +330,7 @@ class SqlAlchemyPolicyStore(PolicyStore):
+         name: str | None = None,
+         handler: str | None = None,
+         enabled: bool | None = None,
++        factory_params: dict[str, Any] | None = _UNSET,
+     ) -> Policy | None:
+         """
+         Update mutable fields of a default policy. Returns ``None``
+@@ -373,6 +374,11 @@ class SqlAlchemyPolicyStore(PolicyStore):
+             if enabled is not None and bool(row.enabled) != enabled:
+                 row.enabled = enabled
+                 changed = True
++            if factory_params is not _UNSET:
++                encoded_params = json.dumps(factory_params) if factory_params else None
++                if row.factory_params != encoded_params:
++                    row.factory_params = encoded_params
++                    changed = True
+             if changed:
+                 row.updated_at = updated_at
+             session.flush()
+diff --git a/openapi.json b/openapi.json
+index 2c64c5e111d98f723dd90312af149069e127c0e5..ca1170a261a05940c29d7e89ee2a241dfc4bd89a 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -9286,6 +9286,19 @@
+             "description": "New enabled flag. `None` leaves it unchanged.",
+             "title": "Enabled"
+           },
++          "factory_params": {
++            "anyOf": [
++              {
++                "additionalProperties": true,
++                "type": "object"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "New factory params, replacing the old ones whole. Omitted leaves them unchanged; `null` or `{}` clears them.",
++            "title": "Factory Params"
++          },
+           "handler": {
+             "anyOf": [
+               {
+diff --git a/tests/server/routes/test_ae_default_policy_params.py b/tests/server/routes/test_ae_default_policy_params.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..43019132339af6944229793a939676b9a5114eb9
+--- /dev/null
++++ b/tests/server/routes/test_ae_default_policy_params.py
+@@ -0,0 +1,156 @@
++"""``PATCH /v1/policies/{policy_id}`` with ``factory_params`` (AE patch).
++
++The Global Policies page saves a policy's edited parameters here. Params are
++checked against the handler's registry schema, and the factory is built once,
++because the schema passes values a factory rejects (``max_cost_usd: -1``).
++"""
++
++from __future__ import annotations
++
++from collections.abc import AsyncIterator
++from pathlib import Path
++
++import httpx
++import pytest
++import pytest_asyncio
++from fastapi import FastAPI
++
++from omnigent.runtime.agent_cache import AgentCache
++from omnigent.server.app import create_app
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.artifact_store.local import LocalArtifactStore
++from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
++from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
++
++_BUDGET = "omnigent.policies.builtins.cost.cost_budget"
++_CALLABLE = "omnigent.policies.builtins.safety.ask_on_os_tools"
++
++
++@pytest.fixture()
++def policy_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
++    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
++    return create_app(
++        agent_store=SqlAlchemyAgentStore(db_uri),
++        file_store=SqlAlchemyFileStore(db_uri),
++        conversation_store=SqlAlchemyConversationStore(db_uri),
++        artifact_store=artifact_store,
++        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
++        comment_store=SqlAlchemyCommentStore(db_uri),
++        policy_store=SqlAlchemyPolicyStore(db_uri),
++    )
++
++
++@pytest_asyncio.fixture()
++async def client(policy_app: FastAPI) -> AsyncIterator[httpx.AsyncClient]:
++    transport = httpx.ASGITransport(app=policy_app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
++        yield c
++
++
++async def _create(client: httpx.AsyncClient, handler: str, params: dict | None) -> str:
++    body: dict = {"name": "budget", "type": "python", "handler": handler}
++    if params is not None:
++        body["factory_params"] = params
++    resp = await client.post("/v1/policies", json=body)
++    assert resp.status_code == 200, resp.text
++    return resp.json()["id"]
++
++
++async def _params(client: httpx.AsyncClient, policy_id: str) -> dict | None:
++    resp = await client.get(f"/v1/policies/{policy_id}")
++    assert resp.status_code == 200
++    return resp.json().get("factory_params")
++
++
++async def test_new_params_replace_the_old(client: httpx.AsyncClient) -> None:
++    pid = await _create(client, _BUDGET, {"max_cost_usd": 5})
++    resp = await client.patch(f"/v1/policies/{pid}", json={"factory_params": {"max_cost_usd": 10}})
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["factory_params"] == {"max_cost_usd": 10}
++    assert await _params(client, pid) == {"max_cost_usd": 10}
++
++
++@pytest.mark.parametrize(
++    ("params", "message"),
++    [
++        ({"max_cost_usd": -1}, "rejected these params"),
++        ({"max_cost_usd": "ten"}, "must be number"),
++        ({"bogus": 1}, "Unknown params"),
++        ({}, "rejected these params"),
++    ],
++    ids=["factory rejects", "wrong type", "unknown key", "cleared but required"],
++)
++async def test_params_that_do_not_fit_are_refused(
++    client: httpx.AsyncClient, params: dict, message: str
++) -> None:
++    pid = await _create(client, _BUDGET, {"max_cost_usd": 5})
++    resp = await client.patch(f"/v1/policies/{pid}", json={"factory_params": params})
++    assert resp.status_code == 400, resp.text
++    assert message in resp.text
++    assert await _params(client, pid) == {"max_cost_usd": 5}
++
++
++async def test_a_callable_takes_no_params(client: httpx.AsyncClient) -> None:
++    pid = await _create(client, _CALLABLE, None)
++    resp = await client.patch(f"/v1/policies/{pid}", json={"factory_params": {"x": 1}})
++    assert resp.status_code == 400
++    assert "does not accept factory_params" in resp.text
++
++
++async def test_a_toggle_leaves_the_params(client: httpx.AsyncClient) -> None:
++    pid = await _create(client, _BUDGET, {"max_cost_usd": 5})
++    resp = await client.patch(f"/v1/policies/{pid}", json={"enabled": False})
++    assert resp.status_code == 200
++    assert resp.json()["enabled"] is False
++    assert await _params(client, pid) == {"max_cost_usd": 5}
++
++
++async def test_params_for_a_missing_policy_are_404(client: httpx.AsyncClient) -> None:
++    resp = await client.patch(
++        "/v1/policies/0d2c1f4b7a9e4e8c9b3a5d6f7e8a9b0c",
++        json={"factory_params": {"max_cost_usd": 10}},
++    )
++    assert resp.status_code == 404
++
++
++async def test_unknown_fields_are_still_422(client: httpx.AsyncClient) -> None:
++    pid = await _create(client, _BUDGET, {"max_cost_usd": 5})
++    resp = await client.patch(f"/v1/policies/{pid}", json={"type": "url"})
++    assert resp.status_code == 422
++
++
++async def test_create_refuses_params_the_factory_rejects(client: httpx.AsyncClient) -> None:
++    resp = await client.post(
++        "/v1/policies",
++        json={
++            "name": "budget",
++            "type": "python",
++            "handler": _BUDGET,
++            "factory_params": {"max_cost_usd": -1},
++        },
++    )
++    assert resp.status_code == 400, resp.text
++    assert "rejected these params" in resp.text
++    assert (await client.get("/v1/policies")).json()["data"] == []
++
++
++async def test_a_new_handler_is_checked_against_the_stored_params(
++    client: httpx.AsyncClient,
++) -> None:
++    pid = await _create(client, _BUDGET, {"max_cost_usd": 5})
++    resp = await client.patch(f"/v1/policies/{pid}", json={"handler": _CALLABLE})
++    assert resp.status_code == 400, resp.text
++    assert "does not accept factory_params" in resp.text
++    assert (await client.get(f"/v1/policies/{pid}")).json()["handler"] == _BUDGET
++
++
++async def test_a_new_handler_with_cleared_params_is_saved(client: httpx.AsyncClient) -> None:
++    pid = await _create(client, _BUDGET, {"max_cost_usd": 5})
++    resp = await client.patch(
++        f"/v1/policies/{pid}", json={"handler": _CALLABLE, "factory_params": None}
++    )
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["handler"] == _CALLABLE
++    assert await _params(client, pid) is None
+diff --git a/tests/stores/test_ae_update_default_factory_params.py b/tests/stores/test_ae_update_default_factory_params.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..121d68194b5de10139e0c04313069bf921b7b6d4
+--- /dev/null
++++ b/tests/stores/test_ae_update_default_factory_params.py
+@@ -0,0 +1,49 @@
++"""``update_default(factory_params=...)`` on :class:`SqlAlchemyPolicyStore` (AE patch)."""
++
++from __future__ import annotations
++
++import pytest
++
++from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
++
++_ID = "5e0b9a7c2f4d4c1b8a6e3d2f1c0b9a87"
++
++
++@pytest.fixture()
++def store(db_uri: str) -> SqlAlchemyPolicyStore:
++    store = SqlAlchemyPolicyStore(db_uri)
++    store.create_default(
++        policy_id=_ID,
++        name="rabbit_hole",
++        type="python",
++        handler="mod.factory",
++        factory_params={"hours": 4, "turns": 60},
++    )
++    return store
++
++
++def test_omitting_factory_params_leaves_them(store: SqlAlchemyPolicyStore) -> None:
++    updated = store.update_default(_ID, enabled=False)
++    assert updated is not None
++    assert updated.factory_params == {"hours": 4, "turns": 60}
++
++
++def test_factory_params_are_replaced_whole(store: SqlAlchemyPolicyStore) -> None:
++    updated = store.update_default(_ID, factory_params={"turns": 80})
++    assert updated is not None
++    assert updated.factory_params == {"turns": 80}
++    assert updated.updated_at is not None
++    assert store.get_default(_ID).factory_params == {"turns": 80}
++
++
++@pytest.mark.parametrize("cleared", [None, {}])
++def test_none_or_empty_clears_them(store: SqlAlchemyPolicyStore, cleared: dict | None) -> None:
++    updated = store.update_default(_ID, factory_params=cleared)
++    assert updated is not None
++    assert updated.factory_params is None
++
++
++def test_the_same_params_change_nothing(store: SqlAlchemyPolicyStore) -> None:
++    updated = store.update_default(_ID, factory_params={"hours": 4, "turns": 60})
++    assert updated is not None
++    assert updated.updated_at is None

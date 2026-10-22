@@ -1,0 +1,570 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 17:45:37 -0700
+Subject: [PATCH 060/148] [ae-patch] Add editable account labels and responsive
+ account controls.
+
+---
+ omnigent/host/connect.py                 |   9 +-
+ omnigent/host/frames.py                  |   3 +
+ omnigent/onboarding/claude_accounts.py   |  38 +++++-
+ omnigent/server/routes/hosts.py          |   3 +
+ openapi.json                             |  11 ++
+ tests/onboarding/test_claude_accounts.py |  36 ++++++
+ web/src/hooks/useHosts.ts                |   2 +
+ web/src/shell/ClaudeAccounts.test.tsx    |  95 +++++++++++++--
+ web/src/shell/ClaudeAccounts.tsx         | 148 ++++++++++++++++++-----
+ 9 files changed, 300 insertions(+), 45 deletions(-)
+
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index 1919bf57440ce49fc11ea98b38bccf7109bb5f92..b6a01b7a4184fb524dc133ff68e1ff9081393520 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -3100,7 +3100,7 @@ class HostProcess:
+                 else None,
+             )
+ 
+-        if frame.kind in ("claude-oauth-add", "claude-oauth-select"):
++        if frame.kind in ("claude-oauth-add", "claude-oauth-select", "claude-oauth-rename"):
+             from omnigent.onboarding.claude_accounts import change_account
+ 
+             if install_key != ANTHROPIC_FAMILY:
+@@ -3109,7 +3109,12 @@ class HostProcess:
+                     status="failed",
+                     error="OAuth accounts require Claude.",
+                 )
+-            result = change_account(frame.kind, frame.account_name or "", frame.secret_value or "")
++            result = change_account(
++                frame.kind,
++                frame.account_name or "",
++                frame.secret_value or "",
++                label=frame.account_label,
++            )
+         elif frame.kind == "adopt":
+             if not frame.env_var:
+                 return HostStoreSecretResultFrame(
+diff --git a/omnigent/host/frames.py b/omnigent/host/frames.py
+index 3c5a0d60a68088b07326f5bd2dab339d879f3eca..06893a94d3b9e83eb0599952734c8f3f23f0289a 100644
+--- a/omnigent/host/frames.py
++++ b/omnigent/host/frames.py
+@@ -838,6 +838,7 @@ class HostStoreSecretFrame:
+     wire_api: str | None = None
+     env_var: str | None = None
+     account_name: str | None = None
++    account_label: str | None = None
+ 
+ 
+ @dataclass
+@@ -1609,6 +1610,7 @@ def encode_host_frame(frame: HostFrame) -> str:
+                 "wire_api": frame.wire_api,
+                 "env_var": frame.env_var,
+                 "account_name": frame.account_name,
++                "account_label": frame.account_label,
+             }
+         )
+     if isinstance(frame, HostStoreSecretResultFrame):
+@@ -2645,6 +2647,7 @@ def _decode_store_secret(msg: _JsonObject) -> HostStoreSecretFrame:
+         wire_api=_optional_nullable_str(msg, "wire_api"),
+         env_var=_optional_nullable_str(msg, "env_var"),
+         account_name=_optional_nullable_str(msg, "account_name"),
++        account_label=_optional_nullable_str(msg, "account_label"),
+     )
+ 
+ 
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+index e219a9215f0c79628de427bef777d1ea655712a1..ad8c391c2caee6e842efe4357aa3cf7c14ffe2e0 100644
+--- a/omnigent/onboarding/claude_accounts.py
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -35,6 +35,12 @@ def _read() -> dict:
+         or (state["active"] and state["active"] not in state["accounts"])
+     ):
+         raise RuntimeError("Invalid Claude accounts. Repair claude-accounts.json on this host.")
++    labels = state.get("labels", {})
++    if not isinstance(labels, dict) or any(
++        key not in ["", *state["accounts"]] or not isinstance(label, str) or not _valid_name(label)
++        for key, label in labels.items()
++    ):
++        raise RuntimeError("Invalid Claude account labels on this host.")
+     return state
+ 
+ 
+@@ -50,7 +56,7 @@ def account_descriptors() -> list[dict[str, str | None]]:
+     return [
+         {
+             "family": "claude-oauth-active" if name == state["active"] else "claude-oauth",
+-            "source": name or "Default CLI account",
++            "source": state.get("labels", {}).get(name, name or "Default CLI account"),
+             "env_var": name,
+         }
+         for name in ["", *state["accounts"]]
+@@ -60,12 +66,16 @@ def account_descriptors() -> list[dict[str, str | None]]:
+ _ACCOUNT_LOCK = threading.RLock()
+ 
+ 
+-def change_account(kind: str, name: str, token: str = "") -> StoreCredentialResult:
++def change_account(
++    kind: str, name: str, token: str = "", *, label: str | None = None
++) -> StoreCredentialResult:
+     with _ACCOUNT_LOCK:
+-        return _change_account(kind, name, token)
++        return _change_account(kind, name, token, label=label)
+ 
+ 
+-def _change_account(kind: str, name: str, token: str = "") -> StoreCredentialResult:
++def _change_account(
++    kind: str, name: str, token: str = "", *, label: str | None = None
++) -> StoreCredentialResult:
+     if name and not _valid_name(name):
+         return StoreCredentialResult(
+             False, None, "Use a name of up to 64 letters, digits, spaces, - or _."
+@@ -76,7 +86,22 @@ def _change_account(kind: str, name: str, token: str = "") -> StoreCredentialRes
+         )
+     try:
+         state = _read()
+-        if kind == "claude-oauth-add":
++        if kind == "claude-oauth-rename":
++            if name and name not in state["accounts"]:
++                return StoreCredentialResult(False, None, "Unknown Claude account.")
++            label = (label or "").strip()
++            if not _valid_name(label):
++                return StoreCredentialResult(
++                    False, None, "Use a label of up to 64 letters, digits, spaces, - or _."
++                )
++            labels = state.setdefault("labels", {})
++            if any(
++                other != name and labels.get(other, other or "Default CLI account") == label
++                for other in ["", *state["accounts"]]
++            ):
++                return StoreCredentialResult(False, None, "That account label already exists.")
++            labels[name] = label
++        elif kind == "claude-oauth-add":
+             if name in state["accounts"]:
+                 return StoreCredentialResult(
+                     False, None, "That account name already exists. Choose another name."
+@@ -85,7 +110,8 @@ def _change_account(kind: str, name: str, token: str = "") -> StoreCredentialRes
+             state["accounts"].append(name)
+         elif kind != "claude-oauth-select" or (name and name not in state["accounts"]):
+             return StoreCredentialResult(False, None, "Unknown Claude account.")
+-        state["active"] = name
++        if kind != "claude-oauth-rename":
++            state["active"] = name
+         path = _path()
+         path.parent.mkdir(parents=True, exist_ok=True)
+         temporary = path.with_suffix(".tmp")
+diff --git a/omnigent/server/routes/hosts.py b/omnigent/server/routes/hosts.py
+index 7871f2bb98a3c13cd80522f5e84fd16409032928..9c106b45d965196ffac77f893a6413f5d2cdea13 100644
+--- a/omnigent/server/routes/hosts.py
++++ b/omnigent/server/routes/hosts.py
+@@ -538,6 +538,7 @@ class StoreHarnessCredentialRequest(BaseModel):
+     wire_api: str | None = None
+     env_var: str | None = None
+     account_name: str | None = None
++    account_label: str | None = None
+ 
+ 
+ class HostModelOptionsResponse(BaseModel):
+@@ -1616,6 +1617,7 @@ def create_hosts_router(
+             "adopt",
+             "claude-oauth-add",
+             "claude-oauth-select",
++            "claude-oauth-rename",
+             "claude-login-start",
+             "claude-login-poll",
+             "claude-login-code",
+@@ -1646,6 +1648,7 @@ def create_hosts_router(
+             wire_api=body.wire_api,
+             env_var=body.env_var,
+             account_name=body.account_name,
++            account_label=body.account_label,
+         )
+         # Serialize credential writes to this host: the daemon's write is a
+         # non-atomic load→merge→save of config.yaml (twice — entry, then
+diff --git a/openapi.json b/openapi.json
+index f5a3ee7ac594fa9dd0e1f4899734dd6397cd5ad1..814d5e985dafc694355e79d1985372863353e026 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -8718,6 +8718,17 @@
+       "StoreHarnessCredentialRequest": {
+         "description": "Request body for `POST /v1/hosts/{id}/harnesses/{harness}/credential`.\n\nCarries the credential in the body (never the URL). The secret field is\noptional so the `adopt` kind \u2014 which references an existing host env var\nby name rather than sending a value \u2014 can omit it.",
+         "properties": {
++          "account_label": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Account Label"
++          },
+           "account_name": {
+             "anyOf": [
+               {
+diff --git a/tests/onboarding/test_claude_accounts.py b/tests/onboarding/test_claude_accounts.py
+index 9d6cbd45e8a748617fc6f776567fc44867dc6eb8..3272413e49abbc6af50591802dedd83ecd6f9791 100644
+--- a/tests/onboarding/test_claude_accounts.py
++++ b/tests/onboarding/test_claude_accounts.py
+@@ -111,3 +111,39 @@ async def test_sdk_launch_subscription_and_explicit_key(monkeypatch, explicit_ke
+         assert "CLAUDE_CODE_OAUTH_TOKEN" not in captured
+     else:
+         assert captured["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++
++
++def test_rename_labels_preserves_credentials_and_active_account():
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    assert change_account("claude-oauth-rename", "", label="Primary").stored
++    assert change_account("claude-oauth-rename", "Backup", label="Personal").stored
++    rows = account_descriptors()
++    assert [(r["source"], r["env_var"]) for r in rows] == [("Primary", ""), ("Personal", "Backup")]
++    assert rows[1]["family"] == "claude-oauth-active"
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++    assert change_account("claude-oauth-select", "").stored
++    assert account_env() == {}
++    assert change_account("claude-oauth-select", "Backup").stored
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++
++
++def test_rename_rejects_duplicate_invalid_and_missing_labels():
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    for label in [None, "", " ", "x" * 65, "../secret", "Default CLI account"]:
++        assert not change_account("claude-oauth-rename", "Backup", label=label).stored
++    assert not change_account("claude-oauth-rename", "missing", label="Personal").stored
++    assert change_account("claude-oauth-rename", "Backup", label="Backup").stored
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++
++
++def test_rename_frame_roundtrip():
++    from omnigent.host.frames import HostStoreSecretFrame, decode_host_frame, encode_host_frame
++
++    frame = HostStoreSecretFrame(
++        request_id="request",
++        harness="claude-native",
++        kind="claude-oauth-rename",
++        account_name="",
++        account_label="Primary",
++    )
++    assert decode_host_frame(encode_host_frame(frame)) == frame
+diff --git a/web/src/hooks/useHosts.ts b/web/src/hooks/useHosts.ts
+index 13bf8a80b9195ff94a28067f0ba7c80c31b95da1..1891a69c4275904ebc98d4cb843ca699f4567d36 100644
+--- a/web/src/hooks/useHosts.ts
++++ b/web/src/hooks/useHosts.ts
+@@ -268,11 +268,13 @@ export interface StoreCredentialInput {
+     | "adopt"
+     | "claude-oauth-add"
+     | "claude-oauth-select"
++    | "claude-oauth-rename"
+     | "claude-login-start"
+     | "claude-login-poll"
+     | "claude-login-code"
+     | "claude-login-cancel";
+   account_name?: string;
++  account_label?: string;
+   /** The API key / gateway token for `key` / `gateway`; omitted for `adopt`. */
+   secret?: string;
+   /** Gateway base URL (required for `kind: "gateway"`). */
+diff --git a/web/src/shell/ClaudeAccounts.test.tsx b/web/src/shell/ClaudeAccounts.test.tsx
+index 492005c6b098959b81d2a7e3bb3997d9ae4d3a54..c1354b85a341835870df48c6ff8eac4d18486e1f 100644
+--- a/web/src/shell/ClaudeAccounts.test.tsx
++++ b/web/src/shell/ClaudeAccounts.test.tsx
+@@ -1,20 +1,27 @@
+-import { fireEvent, render, screen } from "@testing-library/react";
++import { act, fireEvent, render, screen } from "@testing-library/react";
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { ClaudeAccounts } from "./ClaudeAccounts";
+ import type { Host } from "@/hooks/useHosts";
+ 
+ const mutate = vi.fn();
++let rows = [
++  { family: "claude-oauth-active", source: "Default CLI account", env_var: "" },
++  { family: "claude-oauth", source: "Backup", env_var: "Backup" },
++];
++let isPending = false;
+ vi.mock("@/hooks/useHosts", () => ({
+-  useDetectedCredentials: () => ({
+-    data: [
+-      { family: "claude-oauth-active", source: "Default CLI account", env_var: "" },
+-      { family: "claude-oauth", source: "Backup", env_var: "Backup" },
+-    ],
+-  }),
+-  useStoreCredential: () => ({ mutate, isPending: false }),
++  useDetectedCredentials: () => ({ data: rows }),
++  useStoreCredential: () => ({ mutate, isPending }),
+ }));
+ const host = { host_id: "host", name: "Laptop" } as Host;
+-beforeEach(() => mutate.mockReset());
++beforeEach(() => {
++  mutate.mockReset();
++  rows = [
++    { family: "claude-oauth-active", source: "Default CLI account", env_var: "" },
++    { family: "claude-oauth", source: "Backup", env_var: "Backup" },
++  ];
++  isPending = false;
++});
+ describe("ClaudeAccounts", () => {
+   it("selects the backup account without a token", () => {
+     render(<ClaudeAccounts host={host} />);
+@@ -43,4 +50,74 @@ describe("ClaudeAccounts", () => {
+       secret: "sk-ant-oat-example",
+     });
+   });
++  it("renames the default account using its empty stable ID", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Rename Default CLI account" }));
++    fireEvent.change(
++      screen.getByRole("textbox", { name: "Account label for Default CLI account" }),
++      {
++        target: { value: "  Main  " },
++      },
++    );
++    fireEvent.click(screen.getByRole("button", { name: "Save name" }));
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-rename",
++      account_name: "",
++      account_label: "Main",
++    });
++  });
++  it("keeps the backup stable ID for selection after its label changes", () => {
++    const view = render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Rename Backup" }));
++    fireEvent.change(screen.getByRole("textbox", { name: "Account label for Backup" }), {
++      target: { value: "Work" },
++    });
++    fireEvent.click(screen.getByRole("button", { name: "Save name" }));
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-rename",
++      account_name: "Backup",
++      account_label: "Work",
++    });
++    act(() => mutate.mock.calls[0][1].onSuccess());
++    rows = [rows[0], { ...rows[1], source: "Work" }];
++    view.rerender(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Work" }));
++    expect(mutate.mock.calls[1][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-select",
++      account_name: "Backup",
++    });
++    expect(screen.getByRole("button", { name: "Default CLI account (selected)" })).toBeDisabled();
++  });
++  it("cancels a rename without sending a mutation", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Rename Backup" }));
++    fireEvent.change(screen.getByRole("textbox", { name: "Account label for Backup" }), {
++      target: { value: "Work" },
++    });
++    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
++    expect(screen.queryByRole("textbox", { name: "Account label for Backup" })).toBeNull();
++    expect(screen.getByRole("button", { name: "Backup" })).toBeTruthy();
++    expect(mutate).not.toHaveBeenCalled();
++  });
++  it("keeps the editor open and shows a rename failure", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Rename Backup" }));
++    fireEvent.click(screen.getByRole("button", { name: "Save name" }));
++    act(() => mutate.mock.calls[0][1].onError(new Error("Could not save account name.")));
++    expect(screen.getByRole("alert").textContent).toBe("Could not save account name.");
++    expect(screen.getByRole("textbox", { name: "Account label for Backup" })).toBeTruthy();
++  });
++  it("disables account actions while a rename is pending", () => {
++    const view = render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByRole("button", { name: "Rename Backup" }));
++    isPending = true;
++    view.rerender(<ClaudeAccounts host={host} />);
++    expect(screen.getByRole("button", { name: "Save name" })).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
++    expect(screen.getByRole("textbox", { name: "Account label for Backup" })).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Rename Default CLI account" })).toBeDisabled();
++  });
+ });
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+index 84e2c2f3d1163dc093bcda0f07b5f1f5deb0f672..f9f229a0b8aa5c3a92eadfcbbf1f835016db212f 100644
+--- a/web/src/shell/ClaudeAccounts.tsx
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -10,6 +10,9 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+   const [token, setToken] = useState("");
+   const [adding, setAdding] = useState(false);
+   const [message, setMessage] = useState("");
++  const [messageIsError, setMessageIsError] = useState(false);
++  const [editingId, setEditingId] = useState<string | null>(null);
++  const [accountLabel, setAccountLabel] = useState("");
+   const accounts = useDetectedCredentials(host?.host_id, !!host);
+   const store = useStoreCredential(host?.host_id ?? "");
+   const addAccount = () => {
+@@ -26,9 +29,13 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+           setToken("");
+           setName("");
+           setAdding(false);
++          setMessageIsError(false);
+           setMessage("Account saved and selected for new chats.");
+         },
+-        onError: (error) => setMessage(error.message),
++        onError: (error) => {
++          setMessageIsError(true);
++          setMessage(error.message);
++        },
+       },
+     );
+   };
+@@ -47,32 +54,116 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+       {(accounts.isError || (accounts.isSuccess && rows.length === 0)) && (
+         <p role="alert">Could not load Claude accounts. Check the host account configuration.</p>
+       )}
+-      {rows.map((row) => (
+-        <Button
+-          type="button"
+-          key={row.env_var ?? ""}
+-          variant="ghost"
+-          size="sm"
+-          className="h-auto min-h-8 w-full whitespace-normal break-words"
+-          disabled={store.isPending || row.family === "claude-oauth-active"}
+-          onClick={() =>
+-            store.mutate(
+-              {
+-                harness: "claude-native",
+-                kind: "claude-oauth-select",
+-                account_name: row.env_var ?? "",
+-              },
+-              {
+-                onSuccess: () => setMessage("Account selected for new chats."),
+-                onError: (error) => setMessage(error.message),
+-              },
+-            )
+-          }
+-        >
+-          {row.source}
+-          {row.family === "claude-oauth-active" ? " (selected)" : ""}
+-        </Button>
+-      ))}
++      <div className="flex min-w-0 flex-wrap gap-2">
++        {rows.map((row) => {
++          const accountId = row.env_var ?? "";
++          const displayLabel = row.source;
++          return (
++            <div
++              key={accountId}
++              className="flex min-w-[10rem] flex-[1_1_10rem] flex-col gap-1 rounded border p-2"
++            >
++              <div className="flex min-w-0 flex-wrap items-center gap-1">
++                <Button
++                  type="button"
++                  variant="ghost"
++                  size="sm"
++                  className="h-auto min-h-8 min-w-0 flex-1 whitespace-normal break-words"
++                  disabled={store.isPending || row.family === "claude-oauth-active"}
++                  onClick={() =>
++                    store.mutate(
++                      {
++                        harness: "claude-native",
++                        kind: "claude-oauth-select",
++                        account_name: accountId,
++                      },
++                      {
++                        onSuccess: () => {
++                          setMessageIsError(false);
++                          setMessage("Account selected for new chats.");
++                        },
++                        onError: (error) => {
++                          setMessageIsError(true);
++                          setMessage(error.message);
++                        },
++                      },
++                    )
++                  }
++                >
++                  {displayLabel}
++                  {row.family === "claude-oauth-active" ? " (selected)" : ""}
++                </Button>
++                <Button
++                  type="button"
++                  variant="outline"
++                  size="sm"
++                  aria-label={`Rename ${displayLabel}`}
++                  disabled={store.isPending}
++                  onClick={() => {
++                    setEditingId(accountId);
++                    setAccountLabel(displayLabel);
++                    setMessage("");
++                  }}
++                >
++                  Rename
++                </Button>
++              </div>
++              {editingId === accountId && (
++                <div className="flex min-w-0 flex-wrap gap-1">
++                  <Input
++                    aria-label={`Account label for ${displayLabel}`}
++                    className="min-w-0 flex-1"
++                    value={accountLabel}
++                    maxLength={64}
++                    disabled={store.isPending}
++                    onChange={(event) => setAccountLabel(event.target.value)}
++                  />
++                  <Button
++                    type="button"
++                    size="sm"
++                    disabled={store.isPending || !accountLabel.trim()}
++                    onClick={() =>
++                      store.mutate(
++                        {
++                          harness: "claude-native",
++                          kind: "claude-oauth-rename",
++                          account_name: accountId,
++                          account_label: accountLabel.trim(),
++                        },
++                        {
++                          onSuccess: () => {
++                            setEditingId(null);
++                            setMessageIsError(false);
++                            setMessage("Account name saved.");
++                          },
++                          onError: (error) => {
++                            setMessageIsError(true);
++                            setMessage(error.message);
++                          },
++                        },
++                      )
++                    }
++                  >
++                    Save name
++                  </Button>
++                  <Button
++                    type="button"
++                    variant="ghost"
++                    size="sm"
++                    disabled={store.isPending}
++                    onClick={() => {
++                      setEditingId(null);
++                      setMessage("");
++                    }}
++                  >
++                    Cancel
++                  </Button>
++                </div>
++              )}
++            </div>
++          );
++        })}
++      </div>
+       <Button type="button" variant="outline" size="sm" onClick={() => setAdding(!adding)}>
+         Add Claude account
+       </Button>
+@@ -92,6 +183,7 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+               setName("");
+               setToken("");
+               setAdding(false);
++              setMessageIsError(false);
+               setMessage("Account saved and selected for new chats.");
+             }}
+           />
+@@ -136,7 +228,7 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+         </div>
+       )}
+       {message && (
+-        <p role="status" className="text-xs">
++        <p role={messageIsError ? "alert" : "status"} className="text-xs">
+           {message}
+         </p>
+       )}

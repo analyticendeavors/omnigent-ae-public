@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 16:23:18 -0700
+Subject: [PATCH 124/148] [ae-patch] Read Claude Code's per-model effort levels
+ for the default effort
+
+Claude Code 2.1.304 keeps effort per model, as modelSettings[<model id>]
+.effortLevel in settings.json, so a file with no top-level effortLevel made
+every session's label "none" and the Effort menu said "Claude default"
+while Opus ran at high. The runner now records the top-level level under
+"*" and each model's own level under its id, as a small JSON label, and the
+menu picks the entry for the session's current model.
+---
+ omnigent/runner/ae_launch_effort.py   | 86 +++++++++++++++++++--------
+ tests/runner/test_ae_launch_effort.py | 79 ++++++++++++++++++------
+ web/src/lib/aeEffortDefault.test.ts   | 56 ++++++++++++++++-
+ web/src/lib/aeEffortDefault.ts        | 76 +++++++++++++++++++----
+ web/src/lib/codexNativeModels.ts      |  2 +-
+ web/src/pages/ChatPage.tsx            |  9 ++-
+ 6 files changed, 251 insertions(+), 57 deletions(-)
+
+diff --git a/omnigent/runner/ae_launch_effort.py b/omnigent/runner/ae_launch_effort.py
+index 910d622836779e3dc4b4b47a950fc15d350147ee..00978519725e79d3df9b080955937c87d1d423fb 100644
+--- a/omnigent/runner/ae_launch_effort.py
++++ b/omnigent/runner/ae_launch_effort.py
+@@ -1,14 +1,14 @@
+ """Record the effort a claude-native session runs at when none was picked.
+ 
+-Reid, 2026-10-20: the composer's Effort menu showed no level and no check on a
+-web-created Claude session, so he could not tell the effort before changing
+-it. With no pick the runner passes no ``--effort`` and Claude Code takes
++With no pick the runner passes no ``--effort`` and Claude Code takes
+ ``effortLevel`` from its settings, which only the host can read. At each
+-launch the runner writes that level to the session label
+-:data:`EFFORT_DEFAULT_LABEL` (:data:`NO_LEVEL` when no settings file names
+-one), and the web shows it as the default. A label, not ``reasoning_effort``:
+-that field is the user's pick, and saving the default there would pin it as
+-``--effort`` on every relaunch and could overwrite a pick made mid-launch.
++launch the runner writes those levels to the session label
++:data:`EFFORT_DEFAULT_LABEL` as compact JSON, the top-level level under
++:data:`ANY_MODEL` and each ``modelSettings[<model id>].effortLevel`` under its
++id (``{"*": "medium", "claude-opus-5-5": "high"}``), or :data:`NO_LEVEL` when
++no settings file names one; the web shows the entry for the session's model.
++A label, not ``reasoning_effort``: that field is the user's pick, and saving
++the default there would pin it as ``--effort`` on every relaunch.
+ """
+ 
+ from __future__ import annotations
+@@ -28,46 +28,83 @@ _logger = logging.getLogger(__name__)
+ 
+ EFFORT_DEFAULT_LABEL = "ae.claude_effort_default"
+ NO_LEVEL = "none"
++# The key for the level that applies to any model without its own.
++ANY_MODEL = "*"
++# The server cuts label values at this length (``LABEL_VALUE_MAX_LEN``).
++_LABEL_MAX_LEN = 256
+ # Claude Code's managed policy file on Linux; it outranks every other source.
+ _MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
+ 
+ 
+-def _settings_level(path: Path) -> str | None:
++def _valid(level: object) -> str | None:
++    return level if isinstance(level, str) and level in CLAUDE_EFFORTS else None
++
++
++def _settings_levels(path: Path) -> dict[str, str]:
+     try:
+         parsed = json.loads(path.read_text(encoding="utf-8"))
+     except (OSError, ValueError):
+-        return None
+-    effort = parsed.get("effortLevel") if isinstance(parsed, dict) else None
+-    return effort if isinstance(effort, str) and effort in CLAUDE_EFFORTS else None
+-
+-
+-def claude_settings_effort(env: Mapping[str, str], cwd: Path) -> str | None:
++        return {}
++    if not isinstance(parsed, dict):
++        return {}
++    levels: dict[str, str] = {}
++    top = _valid(parsed.get("effortLevel"))
++    if top is not None:
++        levels[ANY_MODEL] = top
++    per_model = parsed.get("modelSettings")
++    if isinstance(per_model, dict):
++        for model, settings in per_model.items():
++            level = _valid(settings.get("effortLevel")) if isinstance(settings, dict) else None
++            if isinstance(model, str) and model and level is not None:
++                levels[model] = level
++    return levels
++
++
++def claude_settings_efforts(env: Mapping[str, str], cwd: Path) -> dict[str, str]:
+     """
+-    Return the ``effortLevel`` Claude Code applies for a launch env and workspace.
++    Return the effort levels Claude Code applies for a launch env and workspace.
+ 
+     Sources in Claude's precedence: managed policy, the workspace's
+     ``.claude/settings.local.json`` and ``.claude/settings.json``, then the user
+     settings in ``CLAUDE_CONFIG_DIR`` (else ``$HOME/.claude``), so the
+-    session's Claude account counts.
++    session's Claude account counts. Each key takes its value from the first
++    source that sets it: the top-level ``effortLevel`` under :data:`ANY_MODEL`
++    and each ``modelSettings[<model id>].effortLevel`` under that id.
+ 
+     :param env: The Claude pane's launch environment, e.g.
+         ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/home/user/.claude-acct2"}``.
+     :param cwd: The pane's working directory, e.g. ``Path("/home/user/repo")``.
+-    :returns: A Claude effort, e.g. ``"high"``; ``None`` when no file names a
+-        valid level.
++    :returns: Levels by model, e.g. ``{"*": "medium", "claude-opus-5-5": "high"}``;
++        empty when no file names a valid level.
+     """
+     config_dir = env.get("CLAUDE_CONFIG_DIR")
+     user_dir = Path(config_dir) if config_dir else Path(env.get("HOME") or Path.home()) / ".claude"
++    levels: dict[str, str] = {}
+     for path in (
+         _MANAGED_SETTINGS,
+         cwd / ".claude" / "settings.local.json",
+         cwd / ".claude" / "settings.json",
+         user_dir / "settings.json",
+     ):
+-        level = _settings_level(path)
+-        if level is not None:
+-            return level
+-    return None
++        for model, level in _settings_levels(path).items():
++            levels.setdefault(model, level)
++    return levels
++
++
++def label_value(levels: Mapping[str, str]) -> str:
++    """
++    Encode levels for the label, dropping per-model entries until it fits.
++
++    :param levels: Levels by model, e.g. ``{"*": "medium", "claude-opus-5-5": "high"}``.
++    :returns: Compact JSON within the server's label length, or :data:`NO_LEVEL`.
++    """
++    kept = dict(sorted(levels.items(), key=lambda item: (item[0] != ANY_MODEL, item[0])))
++    while kept:
++        value = json.dumps(kept, sort_keys=True, separators=(",", ":"))
++        if len(value) <= _LABEL_MAX_LEN:
++            return value
++        kept.popitem()
++    return NO_LEVEL
+ 
+ 
+ def _effort_in_args(args: Sequence[str]) -> bool:
+@@ -96,7 +133,8 @@ async def record_launch_effort(
+     """
+     if _effort_in_args(args):
+         return
+-    level = await asyncio.to_thread(claude_settings_effort, env, cwd) or NO_LEVEL
++    levels = await asyncio.to_thread(claude_settings_efforts, env, cwd)
++    level = label_value(levels)
+     try:
+         resp = await server_client.patch(
+             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+diff --git a/tests/runner/test_ae_launch_effort.py b/tests/runner/test_ae_launch_effort.py
+index ce8558a476e513a9b0e21c1038912a811c0fd564..4304dd2fdce2f67b1b5444cc1d5745ab7f2c71e4 100644
+--- a/tests/runner/test_ae_launch_effort.py
++++ b/tests/runner/test_ae_launch_effort.py
+@@ -10,9 +10,11 @@ import pytest
+ 
+ from omnigent.runner import ae_launch_effort
+ from omnigent.runner.ae_launch_effort import (
++    ANY_MODEL,
+     EFFORT_DEFAULT_LABEL,
+     NO_LEVEL,
+-    claude_settings_effort,
++    claude_settings_efforts,
++    label_value,
+     record_launch_effort,
+ )
+ 
+@@ -32,41 +34,69 @@ def test_reads_the_launch_accounts_config_dir_over_home(tmp_path: Path) -> None:
+     _settings(tmp_path / "acct2" / "settings.json", {"effortLevel": "low"})
+     home = str(tmp_path / "home")
+     cwd = tmp_path / "repo"
+-    assert claude_settings_effort({"HOME": home}, cwd) == "high"
+-    assert (
+-        claude_settings_effort({"HOME": home, "CLAUDE_CONFIG_DIR": str(tmp_path / "acct2")}, cwd)
+-        == "low"
++    assert claude_settings_efforts({"HOME": home}, cwd) == {ANY_MODEL: "high"}
++    assert claude_settings_efforts(
++        {"HOME": home, "CLAUDE_CONFIG_DIR": str(tmp_path / "acct2")}, cwd
++    ) == {ANY_MODEL: "low"}
++
++
++def test_reads_each_models_own_level(tmp_path: Path) -> None:
++    # Claude Code 2.1.304 writes the effort a /effort or picker change sets per model.
++    _settings(
++        tmp_path / "settings.json",
++        {
++            "modelSettings": {
++                "claude-opus-5-5": {"effortLevel": "high"},
++                "claude-sonnet-5-5": {"effortLevel": "turbo"},
++                "claude-haiku-5-5": {"fastMode": True},
++                "claude-fable-5-1": "low",
++            }
++        },
+     )
++    env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
++    assert claude_settings_efforts(env, tmp_path / "repo") == {"claude-opus-5-5": "high"}
+ 
+ 
+ def test_follows_claudes_precedence(tmp_path: Path) -> None:
+     env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "user")}
+     cwd = tmp_path / "repo"
+-    _settings(tmp_path / "user" / "settings.json", {"effortLevel": "low"})
+-    assert claude_settings_effort(env, cwd) == "low"
++    opus = "claude-opus-5-5"
++    _settings(
++        tmp_path / "user" / "settings.json",
++        {"effortLevel": "low", "modelSettings": {opus: {"effortLevel": "low"}}},
++    )
++    assert claude_settings_efforts(env, cwd) == {ANY_MODEL: "low", opus: "low"}
+     _settings(cwd / ".claude" / "settings.json", {"effortLevel": "medium"})
+-    assert claude_settings_effort(env, cwd) == "medium"
+-    _settings(cwd / ".claude" / "settings.local.json", {"effortLevel": "high"})
+-    assert claude_settings_effort(env, cwd) == "high"
++    assert claude_settings_efforts(env, cwd) == {ANY_MODEL: "medium", opus: "low"}
++    _settings(
++        cwd / ".claude" / "settings.local.json", {"modelSettings": {opus: {"effortLevel": "high"}}}
++    )
++    assert claude_settings_efforts(env, cwd) == {ANY_MODEL: "medium", opus: "high"}
+     _settings(tmp_path / "managed.json", {"effortLevel": "max"})
+-    assert claude_settings_effort(env, cwd) == "max"
++    assert claude_settings_efforts(env, cwd) == {ANY_MODEL: "max", opus: "high"}
+ 
+ 
+-@pytest.mark.parametrize("body", [{}, {"effortLevel": "turbo"}, {"effortLevel": 3}, ["high"]])
+-def test_no_valid_level_gives_none(tmp_path: Path, body: object) -> None:
++@pytest.mark.parametrize(
++    "body",
++    [{}, {"effortLevel": "turbo"}, {"effortLevel": 3}, ["high"], {"modelSettings": ["high"]}],
++)
++def test_no_valid_level_gives_nothing(tmp_path: Path, body: object) -> None:
+     _settings(tmp_path / "settings.json", body)
+-    assert claude_settings_effort({"CLAUDE_CONFIG_DIR": str(tmp_path)}, tmp_path / "repo") is None
++    assert claude_settings_efforts({"CLAUDE_CONFIG_DIR": str(tmp_path)}, tmp_path / "repo") == {}
+ 
+ 
+-def test_missing_or_broken_settings_give_none(tmp_path: Path) -> None:
++def test_missing_or_broken_settings_give_nothing(tmp_path: Path) -> None:
+     env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
+-    assert claude_settings_effort(env, tmp_path / "repo") is None
++    assert claude_settings_efforts(env, tmp_path / "repo") == {}
+     (tmp_path / "settings.json").write_text("{not json", encoding="utf-8")
+-    assert claude_settings_effort(env, tmp_path / "repo") is None
++    assert claude_settings_efforts(env, tmp_path / "repo") == {}
+ 
+ 
+ async def test_labels_the_session_and_swallows_a_server_error(tmp_path: Path) -> None:
+-    _settings(tmp_path / "settings.json", {"effortLevel": "xhigh"})
++    _settings(
++        tmp_path / "settings.json",
++        {"effortLevel": "xhigh", "modelSettings": {"claude-opus-5-5": {"effortLevel": "high"}}},
++    )
+     seen: list[httpx.Request] = []
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+@@ -87,7 +117,8 @@ async def test_labels_the_session_and_swallows_a_server_error(tmp_path: Path) ->
+     assert len(seen) == 3
+     assert seen[0].method == "PATCH"
+     assert seen[0].url.path == "/v1/sessions/conv_abc"
+-    assert json.loads(seen[0].content) == {"labels": {EFFORT_DEFAULT_LABEL: "xhigh"}}
++    label = json.loads(seen[0].content)["labels"][EFFORT_DEFAULT_LABEL]
++    assert json.loads(label) == {ANY_MODEL: "xhigh", "claude-opus-5-5": "high"}
+     assert json.loads(seen[2].content) == {"labels": {EFFORT_DEFAULT_LABEL: NO_LEVEL}}
+ 
+ 
+@@ -106,3 +137,13 @@ async def test_an_explicit_effort_argument_is_left_alone(tmp_path: Path, args: l
+         await record_launch_effort(
+             client, "conv_abc", env={"CLAUDE_CONFIG_DIR": str(tmp_path)}, cwd=tmp_path, args=args
+         )
++
++
++def test_the_label_fits_the_servers_length_and_keeps_the_any_model_level() -> None:
++    levels = {ANY_MODEL: "medium"} | {f"claude-model-{n:02d}-5-5": "high" for n in range(20)}
++    value = label_value(levels)
++    assert len(value) <= 256
++    parsed = json.loads(value)
++    assert parsed[ANY_MODEL] == "medium"
++    assert 1 < len(parsed) < len(levels)
++    assert label_value({}) == NO_LEVEL
+diff --git a/web/src/lib/aeEffortDefault.test.ts b/web/src/lib/aeEffortDefault.test.ts
+index e831d958b648315a70d9c0bd9dd4dc72a747ef42..97054a8f54011108fa3f308ab0379afa95af916e 100644
+--- a/web/src/lib/aeEffortDefault.test.ts
++++ b/web/src/lib/aeEffortDefault.test.ts
+@@ -1,6 +1,6 @@
+ import { QueryClient } from "@tanstack/react-query";
+ import { describe, expect, it } from "vitest";
+-import { aeEffortDefaultSuffix, readAeEffortDefault } from "./aeEffortDefault";
++import { aeEffortDefaultFor, aeEffortDefaultSuffix, readAeEffortDefault } from "./aeEffortDefault";
+ 
+ function cacheWith(labels: Record<string, string>) {
+   const qc = new QueryClient();
+@@ -27,6 +27,60 @@ describe("readAeEffortDefault", () => {
+   });
+ });
+ 
++describe("aeEffortDefaultFor", () => {
++  const levels = JSON.stringify({ "*": "medium", "claude-opus-5-5": "high" });
++
++  it("picks the current model's own level, else the any-model level", () => {
++    expect(aeEffortDefaultFor(levels, "claude-opus-5-5")).toBe("high");
++    expect(aeEffortDefaultFor(levels, "claude-sonnet-5-5")).toBe("medium");
++    expect(aeEffortDefaultFor(levels, null)).toBe("medium");
++  });
++
++  it("matches a suffixed id or a picker alias to the model's entry", () => {
++    expect(aeEffortDefaultFor(levels, "claude-opus-5-5[1m]")).toBe("high");
++    expect(aeEffortDefaultFor(levels, "opus", [{ id: "opus", model: "claude-opus-5-5" }])).toBe(
++      "high",
++    );
++  });
++
++  it("gives null with no entry for the model and no any-model level", () => {
++    const opusOnly = JSON.stringify({ "claude-opus-5-5": "high" });
++    expect(aeEffortDefaultFor(opusOnly, "claude-haiku-5-5")).toBe(null);
++    expect(aeEffortDefaultFor(null, "claude-opus-5-5")).toBe(null);
++    expect(aeEffortDefaultFor("{broken", "claude-opus-5-5")).toBe(null);
++  });
++
++  it("matches an alias with a suffix, and stored keys written as an alias or with a suffix", () => {
++    const options = [
++      { id: "opus[1m]", model: "claude-opus-5-5[1m]" },
++      { id: "sonnet", model: "claude-sonnet-5-5", isDefault: true },
++    ];
++    expect(aeEffortDefaultFor(levels, "opus[1m]", options)).toBe("high");
++    expect(
++      aeEffortDefaultFor(JSON.stringify({ "opus[1m]": "low" }), "claude-opus-5-5", options),
++    ).toBe("low");
++    expect(
++      aeEffortDefaultFor(JSON.stringify({ "claude-sonnet-5-5[1m]": "max" }), "sonnet", options),
++    ).toBe("max");
++  });
++
++  it("uses the picker's default model before the session reports one", () => {
++    const options = [{ id: "opus", model: "claude-opus-5-5", isDefault: true }];
++    expect(aeEffortDefaultFor(JSON.stringify({ "claude-opus-5-5": "high" }), null, options)).toBe(
++      "high",
++    );
++  });
++
++  it("ignores values that are not Claude efforts", () => {
++    expect(aeEffortDefaultFor(JSON.stringify({ "*": "turbo" }), "claude-opus-5-5")).toBe(null);
++    expect(aeEffortDefaultFor("hig", "claude-opus-5-5")).toBe(null);
++  });
++
++  it("reads a plain level from the first release as any model's", () => {
++    expect(aeEffortDefaultFor("high", "claude-haiku-5-5")).toBe("high");
++  });
++});
++
+ describe("aeEffortDefaultSuffix", () => {
+   it("names the recorded level as the default", () => {
+     expect(aeEffortDefaultSuffix("claude", false, "high")).toBe(": High (default)");
+diff --git a/web/src/lib/aeEffortDefault.ts b/web/src/lib/aeEffortDefault.ts
+index d970bca57f6680947483e6af294ccad7e707ab6b..7e2ae41f2c184044a7de9433250c1cac42668c4c 100644
+--- a/web/src/lib/aeEffortDefault.ts
++++ b/web/src/lib/aeEffortDefault.ts
+@@ -1,21 +1,21 @@
+-// The Effort row's value when a Claude session has no pick. At each launch the
+-// runner labels the session with the level Claude Code takes from its settings
+-// (omnigent/runner/ae_launch_effort.py), "none" when no file names one. The
+-// menu shows that level with "(default)" and checks it, or "Claude default"
+-// when there is none, so the effort is visible before a change (Reid,
+-// 2026-10-20). The label comes from the `["conversations"]` cache the sidebar
+-// keeps warm, as the session chip's status does, so it costs no request.
++// The Effort row's value when a Claude session has no pick: the level Claude
++// Code takes from its settings, which the runner records per model in a session
++// label (omnigent/runner/ae_launch_effort.py). Read from the sidebar's
++// `["conversations"]` cache, so it costs no request.
+ 
+ import { type QueryClient, QueryClientContext } from "@tanstack/react-query";
+ import { useCallback, useContext, useSyncExternalStore } from "react";
+ import type { Conversation } from "@/hooks/useConversations";
++import { comparableModelId } from "@/lib/codexNativeModels";
+ import { formatStatusEffortLabel } from "@/lib/composerModelLabel";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+ 
+ export const AE_EFFORT_DEFAULT_LABEL = "ae.claude_effort_default";
+ const NO_LEVEL = "none";
++const ANY_MODEL = "*";
++const CLAUDE_EFFORTS = new Set(["low", "medium", "high", "xhigh", "max"]);
+ 
+-/** The recorded default level of a cached session, e.g. `"high"`; null when none. */
++/** The label's raw value for a cached session; null when it has none. */
+ export function readAeEffortDefault(queryClient: QueryClient, id: string): string | null {
+   for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+     queryKey: ["conversations"],
+@@ -23,8 +23,8 @@ export function readAeEffortDefault(queryClient: QueryClient, id: string): strin
+     for (const page of data?.pages ?? []) {
+       const row = page.data.find((conversation: Conversation) => conversation.id === id);
+       if (row) {
+-        const level = row.labels?.[AE_EFFORT_DEFAULT_LABEL];
+-        return level && level !== NO_LEVEL ? level : null;
++        const raw = row.labels?.[AE_EFFORT_DEFAULT_LABEL];
++        return raw && raw !== NO_LEVEL ? raw : null;
+       }
+     }
+   }
+@@ -45,6 +45,62 @@ export function useAeEffortDefault(id: string | null): string | null {
+   return useSyncExternalStore(subscribe, read, read);
+ }
+ 
++interface ModelOption {
++  id: string;
++  model?: string;
++  isDefault?: boolean;
++}
++
++// A plain level (the label's first format) applies to any model.
++function parseLevels(raw: string): [string, string][] {
++  let entries: [string, unknown][] = [[ANY_MODEL, raw]];
++  if (raw.startsWith("{")) {
++    try {
++      const parsed: unknown = JSON.parse(raw);
++      entries = parsed && typeof parsed === "object" ? Object.entries(parsed) : [];
++    } catch {
++      entries = [];
++    }
++  }
++  return entries.filter(
++    (entry): entry is [string, string] =>
++      typeof entry[1] === "string" && CLAUDE_EFFORTS.has(entry[1]),
++  );
++}
++
++/** A model id or picker alias as a comparable wire id: `opus[1m]` -> `claude-opus-5-5`. */
++function canonicalModel(id: string, options: readonly ModelOption[]): string {
++  const target = comparableModelId(id);
++  const option = options.find(
++    (candidate) => candidate.id === id || comparableModelId(candidate.id) === target,
++  );
++  return comparableModelId(option?.model ?? id);
++}
++
++/**
++ * The default level for the session's model, e.g. `"high"`: the model's own
++ * entry, matched on comparable wire ids so aliases and `[1m]` suffixes agree on
++ * either side, else the any-model entry; null when neither exists. With no
++ * model reported yet, the picker's default model stands in.
++ */
++export function aeEffortDefaultFor(
++  raw: string | null,
++  model: string | null | undefined,
++  options: readonly ModelOption[] = [],
++): string | null {
++  if (!raw) return null;
++  const levels = parseLevels(raw);
++  const current = model || options.find((option) => option.isDefault)?.id;
++  if (current) {
++    const target = canonicalModel(current, options);
++    const own = levels.find(
++      ([key]) => key !== ANY_MODEL && canonicalModel(key, options) === target,
++    );
++    if (own) return own[1];
++  }
++  return levels.find(([key]) => key === ANY_MODEL)?.[1] ?? null;
++}
++
+ /** The Effort row's suffix for a Claude session with no pick, else `""`. */
+ export function aeEffortDefaultSuffix(
+   pickerKind: string | null | undefined,
+diff --git a/web/src/lib/codexNativeModels.ts b/web/src/lib/codexNativeModels.ts
+index ae46b1d770a3f32074f94015313a5f3c1f916baa..07a6ced8b2748665ee8f91de4ff1065664500d2d 100644
+--- a/web/src/lib/codexNativeModels.ts
++++ b/web/src/lib/codexNativeModels.ts
+@@ -12,7 +12,7 @@ const CATALOG_PREFIXES = ["databricks-", "system.ai."] as const;
+  * spelling in both ``id`` and ``model``. Mirrors the server's
+  * ``comparable_model_id``.
+  */
+-function comparableModelId(model: string | null | undefined): string {
++export function comparableModelId(model: string | null | undefined): string {
+   // Null-safe: a picker row may carry a null ``model`` (cursor rows have
+   // only ``id`` + ``displayName``), and folding it must not throw. An empty
+   // fold never equals a real (non-empty) target, so it simply never matches.
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index e5ff2f97ef6bb164fd660b61f0b7afff7881429b..45330e16a51d764427525cfbdbcec0194fae37cd 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -70,7 +70,11 @@ import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "
+ import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
+ import { AeFastModeSection } from "@/components/AeFastMode";
+ import { useAeFastModePending } from "@/lib/aeFastMode";
+-import { aeEffortDefaultSuffix, useAeEffortDefault } from "@/lib/aeEffortDefault";
++import {
++  aeEffortDefaultFor,
++  aeEffortDefaultSuffix,
++  useAeEffortDefault,
++} from "@/lib/aeEffortDefault";
+ import { aeClaudeVersion, aeSplitPreviousBy, useAeClaudeVersions } from "@/lib/aeClaudeModels";
+ import { AePlanLimitsPopover } from "@/components/AePlanLimits";
+ import { AeTokenDefrag } from "@/components/AeTokenDefrag";
+@@ -4758,7 +4762,7 @@ function SessionHarnessPicker({
+   const forkDialog = useForkDialog();
+   const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
+   const selectedEffort = useSessionEffort();
+-  const effortDefault = useAeEffortDefault(modelPickerKind === "claude" ? conversationId : null);
++  const effortDefaults = useAeEffortDefault(modelPickerKind === "claude" ? conversationId : null);
+   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
+   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+   const {
+@@ -4774,6 +4778,7 @@ function SessionHarnessPicker({
+     modelLabelOptions,
+     modelLabelHostId,
+   );
++  const effortDefault = aeEffortDefaultFor(effortDefaults, effectiveModel, modelOptions);
+   const modelSummary = modelLabelLoading
+     ? "Loading model…"
+     : modelLabelUnavailable

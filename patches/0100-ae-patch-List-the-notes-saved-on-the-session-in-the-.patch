@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 12:07:57 -0700
+Subject: [PATCH 100/148] [ae-patch] List the notes saved on the session in the
+ rail's Triage card, so an old Absorbed or Unfiled note stays readable
+
+The card counted Absorbed: and UNFILED lines from the ae.absorbed and ae.unfiled
+labels but found their text only in the messages the chat had loaded, so a note
+in an older message showed as "The lines are in older messages not loaded here."
+The AE observer now saves each counted line as a label of its own (ae.absorbed.1
+and on). The card lists those notes first, in order, then any loaded line not
+saved yet (one counted before notes were saved, or past the observer's cap of 20),
+each loaded line matched against the saved notes once. A loaded line is cut the
+way the observer's Python cuts it (code points, Python's whitespace), so a saved
+note and its loaded line always match. AE files only.
+---
+ .../components/aeRail/AeRailTriage.test.tsx   | 18 ++++++
+ web/src/components/aeRail/AeRailTriage.tsx    | 10 ++-
+ web/src/lib/aeRailTriage.test.ts              | 45 +++++++++++++
+ web/src/lib/aeRailTriage.ts                   | 63 ++++++++++++++++++-
+ 4 files changed, 132 insertions(+), 4 deletions(-)
+
+diff --git a/web/src/components/aeRail/AeRailTriage.test.tsx b/web/src/components/aeRail/AeRailTriage.test.tsx
+index afc8233f1b2e5e6570862aff3db0874167b9eb49..7b9de2fdb80e880b17521e3559c8d2e533a07837 100644
+--- a/web/src/components/aeRail/AeRailTriage.test.tsx
++++ b/web/src/components/aeRail/AeRailTriage.test.tsx
+@@ -220,6 +220,24 @@ describe("AeRailTriage", () => {
+     expect(screen.getByText("Unfiled")).toBeInTheDocument();
+   });
+ 
++  it("lists the notes saved on the session when their messages are not loaded", () => {
++    // The observer saves each counted line, so an old note stays readable.
++    show(
++      {
++        "ae.absorbed": "2",
++        "ae.absorbed.1": "Rename the field, it blocked the build",
++        "ae.absorbed.2": "Phone frame for the popover, same mockup",
++      },
++      [said("Absorbed: Phone frame for the popover, same mockup")],
++    );
++    fireEvent.click(screen.getByRole("button", { name: /Absorbed/ }));
++    expect(screen.getByRole("list", { name: "Absorbed" })).toHaveTextContent(
++      "Rename the field, it blocked the build",
++    );
++    expect(screen.getAllByText("Phone frame for the popover, same mockup")).toHaveLength(1);
++    expect(screen.queryByText(/older messages not loaded here/)).toBeNull();
++  });
++
+   it("lists one count's lines at a time below the shared row", () => {
+     show({ "ae.absorbed": "1", "ae.unfiled": "1" }, [
+       said("Absorbed: Tabler icon for the rail button, same file"),
+diff --git a/web/src/components/aeRail/AeRailTriage.tsx b/web/src/components/aeRail/AeRailTriage.tsx
+index 37188678f5711a7867f8289489f2954fa5f15a08..7f5a4226894ecf797d5ac01821da22f45a9e8c9a 100644
+--- a/web/src/components/aeRail/AeRailTriage.tsx
++++ b/web/src/components/aeRail/AeRailTriage.tsx
+@@ -1,7 +1,8 @@
+ // The rail's Triage section: the session's `ae.*` labels as controls. The
+ // status switch writes what the sidebar's Status menu writes, an open gate
+ // offers the Dashboard's four answers, and the absorbed and unfiled counts
+-// share a row and fold open to the lines the loaded messages carry.
++// share a row and fold open to their lines: the notes saved on the session,
++// then any the loaded messages carry that are not saved yet.
+ 
+ import { useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useEffect, useId, useState } from "react";
+@@ -30,6 +31,7 @@ import {
+   countAeUserTurns,
+   fetchAeLotTasks,
+   parseAeStarted,
++  aeTriageLinesWithNotes,
+   replyAeGate,
+   scanAeTriageLines,
+ } from "@/lib/aeRailTriage";
+@@ -74,7 +76,11 @@ function AeTriageBody({ sessionId, labels }: { sessionId: string; labels: AeLabe
+   const startedLine = aeStartedLine(started, now, turns, loaded?.moreHistory ?? false);
+   const overflow = aeLabel(known, AE_OVERFLOW_KEY) === "1" ? aeOverflowTag(limit) : null;
+   const triageMode = aeLabel(known, AE_TRIAGE_KEY);
+-  const lines = loaded ? scanAeTriageLines(loaded.blocks) : { absorbed: [], unfiled: [] };
++  // Saved notes list even when their message is too old to be loaded.
++  const lines = aeTriageLinesWithNotes(
++    known,
++    loaded ? scanAeTriageLines(loaded.blocks) : { absorbed: [], unfiled: [] },
++  );
+   const next = aeLabel(known, AE_NEXT_KEY);
+   const task = aeLabel(known, AE_TASK_KEY);
+ 
+diff --git a/web/src/lib/aeRailTriage.test.ts b/web/src/lib/aeRailTriage.test.ts
+index 2b49780b541af9738bd2b6ea0f9ea8f7d2c1cf21..89e6006360fa65a5962a73f3092388af9cddcda0 100644
+--- a/web/src/lib/aeRailTriage.test.ts
++++ b/web/src/lib/aeRailTriage.test.ts
+@@ -8,9 +8,12 @@ const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
+ 
+ import {
++  aeNoteText,
+   aeOrdinal,
+   aeOverflowTag,
++  aeSavedNotes,
+   aeStartedLine,
++  aeTriageLinesWithNotes,
+   countAeUserTurns,
+   fetchAeLotTasks,
+   formatAeAge,
+@@ -66,6 +69,48 @@ describe("scanAeTriageLines", () => {
+   });
+ });
+ 
++describe("the notes saved on the session", () => {
++  it("orders them by number and leaves out blanks and other keys", () => {
++    const labels = {
++      "ae.absorbed": "10",
++      "ae.absorbed.10": "ten",
++      "ae.absorbed.2": "two",
++      "ae.absorbed.3": " ",
++      "ae.absorbed.x": "not a note",
++      "ae.unfiled.1": "unfiled",
++    };
++    expect(aeSavedNotes(labels, "ae.absorbed")).toEqual(["two", "ten"]);
++    expect(aeSavedNotes(labels, "ae.unfiled")).toEqual(["unfiled"]);
++  });
++
++  it("cuts a line the way the observer saves it", () => {
++    expect(aeNoteText("  a\n  b\tc ")).toBe("a b c");
++    // Python splits on \x1c but not on \ufeff; JavaScript's \s does the opposite.
++    expect(aeNoteText("a\x1cb\ufeffc")).toBe("a b\ufeffc");
++    const long = aeNoteText("x".repeat(300));
++    expect(long).toHaveLength(200);
++    expect(long.endsWith("...")).toBe(true);
++    // One code point, two UTF-16 units: cut where Python's labels.clip cuts.
++    const emoji = "\u{1F600}";
++    const cut = aeNoteText(`${"x".repeat(196)}${emoji}${"y".repeat(10)}`);
++    expect(cut).toBe(`${"x".repeat(196)}${emoji}...`);
++    expect(Array.from(cut)).toHaveLength(200);
++  });
++
++  it("lists the saved notes, then each loaded line not saved, matching a line once", () => {
++    const cut = `${"x".repeat(197)}...`;
++    const labels = { "ae.absorbed.1": "old note", "ae.absorbed.2": "same", "ae.absorbed.3": cut };
++    const loaded = {
++      absorbed: ["same", "same", "x".repeat(250)],
++      unfiled: ["(target unreachable), file this yourself"],
++    };
++    expect(aeTriageLinesWithNotes(labels, loaded)).toEqual({
++      absorbed: ["old note", "same", cut, "same"],
++      unfiled: ["(target unreachable), file this yourself"],
++    });
++  });
++});
++
+ describe("countAeUserTurns", () => {
+   it("counts user messages and leaves out system markers", () => {
+     expect(countAeUserTurns([asked("one"), said("reply"), asked("two")])).toBe(2);
+diff --git a/web/src/lib/aeRailTriage.ts b/web/src/lib/aeRailTriage.ts
+index c5ca126f74d638344697f8a59e67e7c23b08432b..143db3e4121c92ce482fb052c703469a22b668bc 100644
+--- a/web/src/lib/aeRailTriage.ts
++++ b/web/src/lib/aeRailTriage.ts
+@@ -1,7 +1,8 @@
+ // The session rail's Triage section, the pure parts: the absorbed and unfiled
+-// lines in the loaded assistant messages, the user turns, the "started" age,
+-// and the gate reply the Dashboard's buttons send.
++// lines, saved on the session or in the loaded assistant messages, the user
++// turns, the "started" age, and the gate reply the Dashboard's buttons send.
+ 
++import { AE_ABSORBED_KEY, AE_UNFILED_KEY } from "@/lib/aeLabels";
+ import type { AnyBlock } from "@/lib/blocks";
+ import { authenticatedFetch } from "@/lib/identity";
+ import { isSystemUserContent } from "@/lib/systemMessage";
+@@ -38,6 +39,64 @@ export function scanAeTriageLines(blocks: readonly AnyBlock[]): AeTriageLines {
+   return { absorbed, unfiled };
+ }
+ 
++// The observer saves each counted line as a label of its own (`ae.absorbed.1` and
++// on), cut the way `labels.clip` in ae_omni_policies cuts it.
++const NOTE_CHARS = 200;
++// Python's str.split() whitespace, which differs from JavaScript's \s; it
++// includes the \x1c-\x1f separators on purpose.
++// oxlint-disable-next-line no-control-regex
++const PY_SPACE = /[\t\n\v\f\r\x1c-\x1f \x85\xa0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+/;
++
++/** A line the way the observer saves it: one line, at most 200 characters. */
++export function aeNoteText(line: string): string {
++  const flat = line.split(PY_SPACE).filter(Boolean).join(" ");
++  // Counted in code points, as Python counts a str, so an emoji near the cut matches.
++  const chars = Array.from(flat);
++  if (chars.length <= NOTE_CHARS) return flat;
++  // Only spaces are left to trim once split; trimEnd() would also eat \ufeff.
++  return `${chars
++    .slice(0, NOTE_CHARS - 3)
++    .join("")
++    .replace(/ +$/, "")}...`;
++}
++
++/** The notes saved under `<counter>.<n>`, in order of n, blank ones left out. */
++export function aeSavedNotes(labels: Readonly<Record<string, string>>, counter: string): string[] {
++  const prefix = `${counter}.`;
++  return Object.entries(labels)
++    .flatMap(([key, value]) => {
++      const n = key.startsWith(prefix) ? key.slice(prefix.length) : "";
++      return /^\d+$/.test(n) && value.trim() ? [[Number(n), value.trim()] as const] : [];
++    })
++    .sort((a, b) => a[0] - b[0])
++    .map(([, value]) => value);
++}
++
++/**
++ * The lines the Triage card lists: the saved notes, then each loaded line not
++ * saved yet (counted before notes were saved, or past the observer's cap).
++ */
++export function aeTriageLinesWithNotes(
++  labels: Readonly<Record<string, string>>,
++  loaded: AeTriageLines,
++): AeTriageLines {
++  const merge = (counter: string, lines: string[]): string[] => {
++    const saved = aeSavedNotes(labels, counter);
++    const unmatched = [...saved];
++    const extra = lines.filter((line) => {
++      const at = unmatched.indexOf(aeNoteText(line));
++      if (at < 0) return true;
++      unmatched.splice(at, 1);
++      return false;
++    });
++    return [...saved, ...extra];
++  };
++  return {
++    absorbed: merge(AE_ABSORBED_KEY, loaded.absorbed),
++    unfiled: merge(AE_UNFILED_KEY, loaded.unfiled),
++  };
++}
++
+ /** The user messages loaded for the session, leaving out runtime `[System: ...]` markers. */
+ export function countAeUserTurns(blocks: readonly AnyBlock[]): number {
+   let turns = 0;

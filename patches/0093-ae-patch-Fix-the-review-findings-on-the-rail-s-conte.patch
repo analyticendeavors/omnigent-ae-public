@@ -1,0 +1,639 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:33:29 -0700
+Subject: [PATCH 093/148] [ae-patch] Fix the review findings on the rail's
+ context loading: fresh reads past the runner cache, real pending reasons,
+ retries only for pending
+
+A turn end, Refresh and Try again now read with fresh=true, which the route forwards and the runner uses to skip its three-minute snapshot cache, so a turn's new context replaces the pre-turn snapshot. Pending answers carry the actual not-ready reason, shown once the quiet window ends, and a spent window is not reopened by the automatic reload, only by a status change, Refresh or Try again. Only pending answers retry quietly; a plain unavailable answer shows at once. The last watcher leaving an entry clears pending with its retry state.
+---
+ omnigent/runner/ae_context_usage.py           |  19 ++-
+ omnigent/runner/app.py                        |   1 +
+ .../sessions/routes_ae_context_usage.py       |   7 +-
+ openapi.json                                  |  10 ++
+ tests/runner/test_ae_context_usage.py         |  44 +++++-
+ .../routes/test_ae_context_usage_routes.py    |  20 +++
+ web/src/components/aeContextUsage.test.tsx    | 139 +++++++++++++++---
+ web/src/components/aeContextUsage.ts          |  65 +++++---
+ .../components/aeRail/AeRailContext.test.tsx  |  21 ++-
+ 9 files changed, 273 insertions(+), 53 deletions(-)
+
+diff --git a/omnigent/runner/ae_context_usage.py b/omnigent/runner/ae_context_usage.py
+index a8990e71c0125c2ce16a01b0ebcbeac5e06fb923..cc156d9049bfeeb2a9ae47dc96e8f8e41e2e5630 100644
+--- a/omnigent/runner/ae_context_usage.py
++++ b/omnigent/runner/ae_context_usage.py
+@@ -397,7 +397,9 @@ async def _probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str,
+         await proc.wait()
+ 
+ 
+-_PENDING = {"available": False, "pending": True, "reason": "Claude is starting."}
++def _pending(reason: str) -> dict[str, Any]:
++    """The web shows a loading line while it retries, then this reason if it never clears."""
++    return {"available": False, "pending": True, "reason": reason}
+ 
+ 
+ def _log_detail(exc: BaseException) -> str:
+@@ -408,14 +410,19 @@ def _log_detail(exc: BaseException) -> str:
+ 
+ 
+ async def handle_context_usage(
+-    conversation_id: str, *, harness: str | None, server_client: httpx.AsyncClient
++    conversation_id: str,
++    *,
++    harness: str | None,
++    server_client: httpx.AsyncClient,
++    fresh: bool = False,
+ ) -> JSONResponse:
++    """``fresh`` skips the snapshot cache: a turn end or a user's refresh wants a new read."""
+     from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+     from omnigent.runner.native import _claude_native_bridge_id_for_session
+ 
+     if harness is None:
+         # The runner has not loaded this session's spec yet: starting, not final.
+-        return JSONResponse(_PENDING)
++        return JSONResponse(_pending("The runner has not loaded this session yet."))
+     if harness != "claude-native":
+         return JSONResponse(
+             {
+@@ -441,7 +448,7 @@ async def handle_context_usage(
+             model = command[command.index("--model") + 1] if "--model" in command else ""
+             key = f"{conversation_id}:{session_id}:{model}"
+             cached = _cache.get(key)
+-            if cached and time.monotonic() - cached[0] < TTL:
++            if cached and not fresh and time.monotonic() - cached[0] < TTL:
+                 return JSONResponse(cached[1])
+             answer = await probe(command, env, cwd)
+             now = time.monotonic()
+@@ -451,9 +458,9 @@ async def handle_context_usage(
+             _failures.pop(conversation_id, None)
+             _cache[key] = (now, answer)
+             return JSONResponse(answer)
+-        except ContextNotReady:
++        except ContextNotReady as exc:
+             # Claude is still starting (or not running): not a failure, so no backoff.
+-            return JSONResponse(_PENDING)
++            return JSONResponse(_pending(str(exc)))
+         except ContextUnsupported as exc:
+             return JSONResponse({"available": False, "final": True, "reason": str(exc)})
+         except (
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index 3c73c6a366d625fbf124b7c27926b2c0be518893..5397ef4e027b5f6d9e27908e5af1342b6f56c1f1 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -6779,6 +6779,7 @@ def create_runner_app(
+                 conversation_id,
+                 harness=_session_harness_name(conversation_id),
+                 server_client=server_client,
++                fresh=body.get("fresh") is True,
+             )
+ 
+         if body_type in ("fast_mode_status", "fast_mode_change"):
+diff --git a/omnigent/server/routes/sessions/routes_ae_context_usage.py b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+index e6454312dd67fa3462ff58dac4c7ade000bee17d..24c7b0bfc8c7ae015652e4ecf3094eb8551db2fe 100644
+--- a/omnigent/server/routes/sessions/routes_ae_context_usage.py
++++ b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+@@ -22,7 +22,9 @@ def register_context_usage_routes(
+     permission_store: PermissionStore | None,
+ ) -> None:
+     @router.get("/sessions/{session_id}/context-usage")
+-    async def context_usage(request: Request, session_id: str) -> dict[str, object]:
++    async def context_usage(
++        request: Request, session_id: str, fresh: bool = False
++    ) -> dict[str, object]:
+         await require_access(
+             get_user_id(request, auth_provider),
+             session_id,
+@@ -33,7 +35,8 @@ def register_context_usage_routes(
+         result = await _forward_session_change_to_runner(
+             session_id,
+             runner_router,
+-            {"type": "context_usage"},
++            # `fresh` asks the runner to skip its snapshot cache (turn end, refresh).
++            {"type": "context_usage", "fresh": True} if fresh else {"type": "context_usage"},
+             timeout_s=35,
+         )
+         if result is None:
+diff --git a/openapi.json b/openapi.json
+index 97cf9dfef625de0ef830d53dbf4b66b8d66494cc..2c64c5e111d98f723dd90312af149069e127c0e5 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -14001,6 +14001,16 @@
+               "title": "Session Id",
+               "type": "string"
+             }
++          },
++          {
++            "in": "query",
++            "name": "fresh",
++            "required": false,
++            "schema": {
++              "default": false,
++              "title": "Fresh",
++              "type": "boolean"
++            }
+           }
+         ],
+         "responses": {
+diff --git a/tests/runner/test_ae_context_usage.py b/tests/runner/test_ae_context_usage.py
+index 45e6cde90204c1c7ff70fa0ce457fd5bf510ea82..f973e4effce6a3b0a4dd3738f1a87b70da02c16d 100644
+--- a/tests/runner/test_ae_context_usage.py
++++ b/tests/runner/test_ae_context_usage.py
+@@ -106,6 +106,7 @@ async def test_unknown_harness_is_pending_not_final(monkeypatch):
+     response = await usage.handle_context_usage("session", harness=None, server_client=None)
+     body = json.loads(response.body)
+     assert body["pending"] is True
++    assert body["reason"] == "The runner has not loaded this session yet."
+     assert "final" not in body
+     probe.assert_not_called()
+ 
+@@ -450,8 +451,17 @@ def _route_to_bridge(monkeypatch, bridge):
+ 
+ 
+ @pytest.mark.asyncio
+-@pytest.mark.parametrize("raw", [None, {"model": {"id": "m"}}, {"session_id": "live"}])
+-async def test_claude_still_starting_answers_pending_without_backoff(tmp_path, monkeypatch, raw):
++@pytest.mark.parametrize(
++    "raw,reason",
++    [
++        (None, "first status reading"),
++        ({"model": {"id": "m"}}, "No Claude session reading yet"),
++        ({"session_id": "live"}, "No live Claude process"),
++    ],
++)
++async def test_claude_still_starting_answers_pending_without_backoff(
++    tmp_path, monkeypatch, raw, reason
++):
+     """No reading yet, no session id yet, or no live process: pending, never a failure."""
+     bridge = tmp_path / "bridge"
+     bridge.mkdir()
+@@ -467,6 +477,8 @@ async def test_claude_still_starting_answers_pending_without_backoff(tmp_path, m
+     body = json.loads(response.body)
+     assert body["available"] is False
+     assert body["pending"] is True
++    # The real not-ready reason, shown if the web's quiet retries run out.
++    assert reason in body["reason"]
+     assert "starting" not in usage._failures
+     probe.assert_not_called()
+ 
+@@ -494,3 +506,31 @@ async def test_real_probe_failure_answers_error_and_starts_backoff(monkeypatch,
+     assert "broken" in usage._failures
+     assert "ValueError" in caplog.text
+     assert "/srv/a/b" not in caplog.text
++
++
++@pytest.mark.asyncio
++async def test_fresh_read_skips_the_snapshot_cache(monkeypatch):
++    """A turn end or a refresh must not get the pre-turn snapshot back from the cache."""
++    import omnigent.runner.native as native
++
++    monkeypatch.setattr(
++        native, "_claude_native_bridge_id_for_session", AsyncMock(return_value="bridge")
++    )
++    monkeypatch.setattr(usage, "launch_config", lambda _: (["claude"], {}, "/tmp", "fresh-id"))
++    probe = AsyncMock(side_effect=[{"available": True, "n": 1}, {"available": True, "n": 2}])
++    monkeypatch.setattr(usage, "probe", probe)
++    usage._cache.clear()
++    usage._failures.clear()
++
++    async def read(**kwargs):
++        response = await usage.handle_context_usage(
++            "fresh", harness="claude-native", server_client=None, **kwargs
++        )
++        return json.loads(response.body)["n"]
++
++    assert await read() == 1
++    assert await read() == 1
++    assert await read(fresh=True) == 2
++    # The fresh answer replaces the cached one.
++    assert await read() == 2
++    assert probe.await_count == 2
+diff --git a/tests/server/routes/test_ae_context_usage_routes.py b/tests/server/routes/test_ae_context_usage_routes.py
+index f222f22f77c808e7ac47bc3c835ff483e6be6ad4..0ce2c07a6c3655b2955df7db06aa4f60ffc3038e 100644
+--- a/tests/server/routes/test_ae_context_usage_routes.py
++++ b/tests/server/routes/test_ae_context_usage_routes.py
+@@ -41,3 +41,23 @@ def test_offline_runner_answers_offline(db_uri, monkeypatch):
+     body = response.json()
+     assert body["available"] is False
+     assert body["offline"] is True
++
++
++@pytest.mark.parametrize(
++    "query,payload",
++    [("", {"type": "context_usage"}), ("?fresh=true", {"type": "context_usage", "fresh": True})],
++)
++def test_fresh_query_reaches_the_runner(db_uri, monkeypatch, query, payload):
++    session = _seed_session(db_uri)
++    forward = AsyncMock(
++        return_value=_RunnerForwardResult(
++            status_code=200, body=json.dumps({"available": True}).encode()
++        )
++    )
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    with TestClient(_app(db_uri)) as client:
++        response = client.get(
++            f"/v1/sessions/{session}/context-usage{query}", headers={"X-Forwarded-Email": OWNER}
++        )
++    assert response.status_code == 200
++    assert forward.await_args.args[2] == payload
+diff --git a/web/src/components/aeContextUsage.test.tsx b/web/src/components/aeContextUsage.test.tsx
+index a2d58bdd296acc99a365d09e132ceb950f9b1c05..44b0bfc8d06c7c2227ffffbf8ac3952cd92b59cb 100644
+--- a/web/src/components/aeContextUsage.test.tsx
++++ b/web/src/components/aeContextUsage.test.tsx
+@@ -1,4 +1,4 @@
+-import { act, renderHook, waitFor } from "@testing-library/react";
++import { act, cleanup, renderHook, waitFor } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { authenticatedFetch } from "@/lib/identity";
+ import { useChatStore } from "@/store/chatStore";
+@@ -116,24 +116,28 @@ describe("shared context snapshot", () => {
+ 
+   it("refresh asks again at once but never doubles a request in flight", async () => {
+     let resolve!: (response: Response) => void;
+-    vi.mocked(authenticatedFetch).mockImplementationOnce(
+-      () =>
+-        new Promise<Response>((r) => {
+-          resolve = r;
+-        }),
+-    );
++    vi.mocked(authenticatedFetch)
++      .mockImplementationOnce(
++        () =>
++          new Promise<Response>((r) => {
++            resolve = r;
++          }),
++      )
++      .mockImplementation(() => ok());
+     const { result } = renderHook(() => useTwo(true));
+     expect(result.current.rail.loading).toBe(true);
+     act(() => result.current.rail.refresh());
++    act(() => result.current.popover.refresh());
+     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+     await act(async () => {
+       resolve(new Response(JSON.stringify({ available: true, observedAt: "x" })));
+     });
++    // The refreshes made in flight become one follow-up read, never a parallel one.
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
+     await waitFor(() => expect(result.current.rail.loading).toBe(false));
+-    vi.mocked(authenticatedFetch).mockImplementation(() => ok());
+     act(() => result.current.rail.refresh());
+     expect(result.current.popover.loading).toBe(true);
+-    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(3));
+   });
+ 
+   it("keeps the entry it just created when more than twenty sessions were watched", async () => {
+@@ -161,6 +165,7 @@ describe("while Claude starts", () => {
+     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+   });
+   afterEach(() => {
++    cleanup();
+     useChatStore.setState({ conversationId: null, sessionStatus: "idle" });
+   });
+ 
+@@ -193,7 +198,7 @@ describe("while Claude starts", () => {
+     expect(authenticatedFetch).toHaveBeenCalledTimes(3);
+   });
+ 
+-  it("treats any unavailable answer that is not offline as not ready yet", async () => {
++  it("shows a plain unavailable answer at once and retries only pending ones", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() =>
+       ok({ available: false, reason: "Could not read Claude context." }),
+     );
+@@ -201,9 +206,85 @@ describe("while Claude starts", () => {
+       useAeContextSnapshot("conv_a", { enabled: true, identity }),
+     );
+     await advance(0);
++    expect(result.current.pending).toBe(false);
++    expect(result.current.loading).toBe(false);
++    expect(result.current.data?.reason).toBe("Could not read Claude context.");
++    await advance(60_000);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("keeps the settled reason through later automatic reloads once the window ends", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => ok(PENDING));
++    useChatStore.setState({ conversationId: "conv_window", sessionStatus: "idle" });
++    const { result } = renderHook(() =>
++      useAeContextSnapshot("conv_window", { enabled: true, identity }),
++    );
++    await advance(120_000);
++    expect(result.current.pending).toBe(false);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(8);
++    // The three-minute reload answers pending again but opens no new quiet window.
++    await advance(AE_CONTEXT_SNAPSHOT_TTL_MS);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(9);
++    expect(result.current.pending).toBe(false);
++    await advance(30_000);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(9);
++    // A status change opens a new window for the next pending answer.
++    act(() => useChatStore.setState({ sessionStatus: "running" }));
++    await advance(AE_CONTEXT_SNAPSHOT_TTL_MS - 30_000);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(10);
++    expect(result.current.pending).toBe(true);
++  });
++
++  it("opens a new quiet window on refresh after the last one ran out", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => ok(PENDING));
++    const { result } = renderHook(() =>
++      useAeContextSnapshot("conv_a", { enabled: true, identity }),
++    );
++    await advance(120_000);
++    expect(result.current.pending).toBe(false);
++    act(() => result.current.refresh());
++    await advance(0);
+     expect(result.current.pending).toBe(true);
+-    await advance(AE_CONTEXT_RETRY_DELAYS_MS[0]);
+-    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
++  });
++
++  it("drops pending when the last watcher goes, so a disabled view stops loading", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => ok(PENDING));
++    const { result, rerender } = renderHook(
++      ({ on }) => useAeContextSnapshot("conv_a", { enabled: on, identity }),
++      { initialProps: { on: true } },
++    );
++    await advance(0);
++    expect(result.current.pending).toBe(true);
++    rerender({ on: false });
++    expect(result.current.pending).toBe(false);
++    expect(result.current.loading).toBe(false);
++    await advance(60_000);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("asks past the runner's cache on refresh, even while a plain read is in flight", async () => {
++    let resolve!: (response: Response) => void;
++    vi.mocked(authenticatedFetch)
++      .mockImplementationOnce(
++        () =>
++          new Promise<Response>((r) => {
++            resolve = r;
++          }),
++      )
++      .mockImplementation(() => ok());
++    const { result } = renderHook(() =>
++      useAeContextSnapshot("conv_a", { enabled: true, identity }),
++    );
++    act(() => result.current.refresh());
++    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
++    await act(async () => {
++      resolve(new Response(JSON.stringify({ available: true, observedAt: "x" })));
++    });
++    await advance(0);
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
++      "/v1/sessions/conv_a/context-usage",
++      "/v1/sessions/conv_a/context-usage?fresh=true",
++    ]);
+   });
+ 
+   it("stops retrying after about two minutes and lets the reason show", async () => {
+@@ -270,15 +351,39 @@ describe("while Claude starts", () => {
+     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+   });
+ 
++  it("reads anew once per turn end, however many sections watch the session", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => ok());
++    useChatStore.setState({ conversationId: "conv_shared", sessionStatus: "running" });
++    const { result } = renderHook(() => useTwo(true, "conv_shared"));
++    await vi.waitFor(() => expect(result.current.rail.data?.available).toBe(true));
++    const fresh = () =>
++      vi.mocked(authenticatedFetch).mock.calls.filter(([url]) => String(url).includes("fresh"))
++        .length;
++    act(() => useChatStore.setState({ sessionStatus: "idle" }));
++    await vi.waitFor(() => expect(fresh()).toBe(1));
++    await advance(5000);
++    expect(fresh()).toBe(1);
++    // A later turn is a newer edge and reads anew once more.
++    act(() => useChatStore.setState({ sessionStatus: "running" }));
++    act(() => useChatStore.setState({ sessionStatus: "idle" }));
++    await vi.waitFor(() => expect(fresh()).toBe(2));
++    await advance(5000);
++    expect(fresh()).toBe(2);
++  });
++
+   it("asks again when the session's turn ends", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() => ok());
+-    useChatStore.setState({ conversationId: "conv_a", sessionStatus: "running" });
+-    renderHook(() => useAeContextSnapshot("conv_a", { enabled: true, identity }));
+-    await advance(0);
++    useChatStore.setState({ conversationId: "conv_turn", sessionStatus: "running" });
++    const { result } = renderHook(() =>
++      useAeContextSnapshot("conv_turn", { enabled: true, identity }),
++    );
++    await vi.waitFor(() => expect(result.current.data?.available).toBe(true));
+     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+     act(() => useChatStore.setState({ sessionStatus: "idle" }));
+-    await advance(0);
+-    expect(authenticatedFetch).toHaveBeenCalledTimes(2);
++    await vi.waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
++    expect(vi.mocked(authenticatedFetch).mock.calls[1][0]).toBe(
++      "/v1/sessions/conv_turn/context-usage?fresh=true",
++    );
+     // Another session's turn, or no turn at all, asks nothing.
+     act(() => useChatStore.setState({ conversationId: "conv_b", sessionStatus: "running" }));
+     act(() => useChatStore.setState({ sessionStatus: "idle" }));
+diff --git a/web/src/components/aeContextUsage.ts b/web/src/components/aeContextUsage.ts
+index 50891a7d64f44c7cc71d003d123b7722459d4fe3..4b43ecaef13432fbc72b807a50e4f854ebe05847 100644
+--- a/web/src/components/aeContextUsage.ts
++++ b/web/src/components/aeContextUsage.ts
+@@ -3,10 +3,10 @@
+ // Claude process on the runner, so one request per session and identity is in
+ // flight at a time and a result is reused for three minutes.
+ //
+-// A `pending` or other unavailable answer is retried quietly for about two
+-// minutes; `offline` and `final` answers show at once. Each turn end asks again.
++// A `pending` answer is retried quietly for about two minutes, then its reason
++// shows; every other answer shows at once. A turn end or a refresh reads anew.
+ 
+-import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
++import { useCallback, useEffect, useSyncExternalStore } from "react";
+ import { authenticatedFetch } from "@/lib/identity";
+ import { isTempConvId } from "@/lib/tempConversationId";
+ import { useChatStore } from "@/store/chatStore";
+@@ -98,6 +98,12 @@ interface Entry {
+   retryAttempt: number;
+   /** The wait before the scheduled quiet retry. */
+   retryDelay?: number;
++  /** The quiet window ran out; only a turn end, a status change or a refresh opens another. */
++  retryExhausted?: boolean;
++  /** A runner-cache-skipping read was asked for while another request was in flight. */
++  wantFresh?: boolean;
++  /** The session status last handled for this entry, so every subscriber acts on an edge once. */
++  lastStatus?: string | null;
+ }
+ 
+ const entries = new Map<string, Entry>();
+@@ -166,10 +172,10 @@ function schedule(entry: Entry): void {
+   entry.timer = setTimeout(() => load(entry), wait);
+ }
+ 
+-/** Store an answer; a not-ready one schedules a quiet retry until the window ends. */
++/** Store an answer; a pending one schedules a quiet retry until the window ends. */
+ function settle(entry: Entry, data: ContextUsage): void {
+   const now = Date.now();
+-  if (data.available || data.offline || data.final) {
++  if (!data.pending) {
+     resetRetry(entry);
+     update(entry, { data, error: undefined, receivedAt: now, inFlight: false, pending: false });
+     return;
+@@ -177,11 +183,15 @@ function settle(entry: Entry, data: ContextUsage): void {
+   entry.retryStartedAt ??= now;
+   const delays = AE_CONTEXT_RETRY_DELAYS_MS;
+   const delay = delays[Math.min(entry.retryAttempt, delays.length - 1)];
+-  const retry = now + delay - entry.retryStartedAt <= AE_CONTEXT_RETRY_WINDOW_MS;
++  const retry =
++    entry.watchers > 0 &&
++    !entry.retryExhausted &&
++    now + delay - entry.retryStartedAt <= AE_CONTEXT_RETRY_WINDOW_MS;
+   if (retry) {
+     entry.retryAttempt += 1;
+     entry.retryDelay = delay;
+   } else {
++    if (entry.watchers > 0) entry.retryExhausted = true;
+     resetRetry(entry);
+   }
+   // A real snapshot already shown stays until a newer real one replaces it.
+@@ -189,9 +199,9 @@ function settle(entry: Entry, data: ContextUsage): void {
+   update(entry, { ...shown, error: undefined, inFlight: false, pending: retry });
+ }
+ 
+-async function readSnapshot(sessionId: string): Promise<ContextUsage> {
++async function readSnapshot(sessionId: string, fresh: boolean): Promise<ContextUsage> {
+   const response = await authenticatedFetch(
+-    `/v1/sessions/${encodeURIComponent(sessionId)}/context-usage`,
++    `/v1/sessions/${encodeURIComponent(sessionId)}/context-usage${fresh ? "?fresh=true" : ""}`,
+   );
+   if (!response.ok) {
+     throw new Error(
+@@ -201,10 +211,15 @@ async function readSnapshot(sessionId: string): Promise<ContextUsage> {
+   return (await response.json()) as ContextUsage;
+ }
+ 
+-function load(entry: Entry): void {
+-  if (entry.value.inFlight) return;
++/** `fresh` skips the runner's own three-minute cache. */
++function load(entry: Entry, fresh = false): void {
++  if (entry.value.inFlight) {
++    if (fresh) entry.wantFresh = true;
++    return;
++  }
++  entry.wantFresh = false;
+   update(entry, { inFlight: true });
+-  readSnapshot(entry.sessionId)
++  readSnapshot(entry.sessionId, fresh)
+     .then(
+       (data) => settle(entry, data),
+       (error: unknown) => {
+@@ -222,6 +237,7 @@ function load(entry: Entry): void {
+     .finally(() => {
+       entry.settledAt = Date.now();
+       schedule(entry);
++      if (entry.wantFresh) load(entry, true);
+     });
+ }
+ 
+@@ -237,14 +253,17 @@ function watch(entry: Entry): () => void {
+     if (entry.watchers === 0) {
+       schedule(entry);
+       resetRetry(entry);
++      if (entry.value.pending) update(entry, { pending: false });
++      entry.lastStatus = undefined;
+     }
+   };
+ }
+ 
+-/** Ask again now with a new retry window: the refresh button and each turn end. */
++/** Read anew past the runner's cache, with a new retry window: refresh and turn end. */
+ function reload(entry: Entry): void {
+   resetRetry(entry);
+-  load(entry);
++  entry.retryExhausted = false;
++  load(entry, true);
+ }
+ 
+ /** Drops every cached snapshot and timer; tests call it between cases. */
+@@ -282,19 +301,21 @@ export function useAeContextSnapshot(
+     if (!enabled || !id) return undefined;
+     return watch(entryFor(id, identity));
+   }, [enabled, id, identity]);
+-  // A turn ending changes the context, and a session's first turn is when Claude is up.
++  // A status change may end a spent quiet window; a turn ending also reads anew.
+   const status = useChatStore((s) =>
+     id !== null && s.conversationId === id ? s.sessionStatus : null,
+   );
+-  const turnActive = status === "running" || status === "waiting";
+-  const previous = useRef({ id, turnActive });
+   useEffect(() => {
+-    const before = previous.current;
+-    previous.current = { id, turnActive };
+-    const ended =
+-      before.id === id && before.turnActive && (status === "idle" || status === "failed");
+-    if (ended && enabled && id) reload(entryFor(id, identity));
+-  }, [enabled, id, identity, status, turnActive]);
++    if (!enabled || !id) return;
++    const entry = entryFor(id, identity);
++    const before = entry.lastStatus;
++    if (before === status) return;
++    entry.lastStatus = status;
++    if (before === undefined) return;
++    entry.retryExhausted = false;
++    const wasActive = before === "running" || before === "waiting";
++    if (wasActive && (status === "idle" || status === "failed")) reload(entry);
++  }, [enabled, id, identity, status]);
+   const refresh = useCallback(() => {
+     if (id) reload(entryFor(id, identity));
+   }, [id, identity]);
+diff --git a/web/src/components/aeRail/AeRailContext.test.tsx b/web/src/components/aeRail/AeRailContext.test.tsx
+index 4226dbd62a8c020989960bd1104e46c7df2a04bf..3bc980f50568d6c303a09d28ae97de61a9c0d107 100644
+--- a/web/src/components/aeRail/AeRailContext.test.tsx
++++ b/web/src/components/aeRail/AeRailContext.test.tsx
+@@ -16,9 +16,10 @@ const snapshotNow = () => ({
+   ...SNAPSHOT,
+   observedAt: new Date(Date.now() - 60_000).toISOString(),
+ });
+-const PENDING = { available: false, pending: true, reason: "Claude is starting." };
++const STOPPED = "No live Claude process for this session. Resume it and try again.";
++const PENDING = { available: false, pending: true, reason: STOPPED };
+ const contextCalls = () =>
+-  vi.mocked(authenticatedFetch).mock.calls.filter(([url]) => String(url).endsWith("/context-usage"))
++  vi.mocked(authenticatedFetch).mock.calls.filter(([url]) => String(url).includes("/context-usage"))
+     .length;
+ 
+ const realCompact = useChatStore.getState().compact;
+@@ -122,6 +123,17 @@ describe("AeRailContext", () => {
+     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+   });
+ 
++  it("shows a real probe failure at once, with Try again", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ available: false, reason: "Could not read Claude context." }),
++    );
++    setSession("claude-native");
++    render(<AeRailContext sessionId={sessionId} />);
++    expect(await screen.findByText("Could not read Claude context.")).toBeTruthy();
++    expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
++    expect(contextCalls()).toBe(1);
++  });
++
+   it("shows a final answer's reason at once with no Try again", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() =>
+       json({ available: false, final: true, reason: "Not a Claude Code session." }),
+@@ -145,7 +157,7 @@ describe("AeRailContext", () => {
+     });
+     expect(screen.getByText("Reading context categories…")).toBeTruthy();
+     expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
+-    expect(screen.queryByText("Claude is starting.")).toBeNull();
++    expect(screen.queryByText(STOPPED)).toBeNull();
+     // The live figure still shows meanwhile.
+     expect(screen.getByText("30% used")).toBeTruthy();
+     await act(async () => {
+@@ -166,7 +178,8 @@ describe("AeRailContext", () => {
+     await act(async () => {
+       await vi.advanceTimersByTimeAsync(1000);
+     });
+-    expect(screen.getByText("Claude is starting.")).toBeTruthy();
++    // The runner's own reason, not a generic "starting" line.
++    expect(screen.getByText(STOPPED)).toBeTruthy();
+     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+   });
+ 

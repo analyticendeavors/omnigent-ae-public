@@ -1,0 +1,1068 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 25 Sep 2026 00:39:41 +0000
+Subject: [PATCH 013/148] [ae-patch] Fix Run on chat code blocks: paste timing,
+ shell kind, transcripts, streaming, focus
+
+Six bugs in the Run button (patch 0011), found in review after it merged:
+
+- A Run pasted as soon as the terminal's WebSocket opened, before the shell's
+  first output was parsed, so xterm did not yet know the shell wanted
+  bracketed paste. Every newline went as Enter: the lines of a block held back
+  for an open heredoc ran anyway, and a password prompt could read the next
+  line. A sink is now ready only once the shell has drawn and gone quiet, and
+  a multi-line block is never pasted unbracketed (nothing is sent; a toast
+  says why).
+- A powershell block was pasted into bash on a Linux host. Blocks now run only
+  in a shell of their kind (read from the terminal's spec name); a powershell
+  block shows Run only when the session declares a PowerShell shell.
+- A `$ ` line anywhere in a bash block (say inside a heredoc body) turned the
+  block into a transcript and only that line was sent; a prompted heredoc lost
+  its body; a console block with no `$ ` prompt sent its output lines as
+  commands. Only a console fence or a prompted first line makes a transcript,
+  the lines a prompted command leaves open are kept (their `> ` prompt
+  stripped), and a console block without a prompt gets no Run.
+- Run showed on a block still streaming, so a partial command could be
+  confirmed. It now waits for the message to finish (Streamdown's own context
+  carries the mode).
+- After a Run the focus did not reach the terminal, so a sudo password typed
+  straight away went nowhere. The terminal is focused once the sheet closes.
+- On a phone the confirm sheet could grow past the screen with the Run button
+  out of reach. It now scrolls inside 85vh, like upstream's other dialogs.
+
+TerminalSession's Run hooks change shape (aeOnOutput, aeBracketedPaste,
+aeWrite replace aePaste); the logic stays in the AE files.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Ssds9ZvoVVqiDZnZQnZCSP
+---
+ web/src/components/AeRunCodeButton.test.tsx  | 138 ++++++++++++++++---
+ web/src/components/AeRunCodeButton.tsx       |  43 +++++-
+ web/src/components/blocks/TerminalSession.ts |  14 +-
+ web/src/lib/aeRunCommand.test.ts             |  38 ++++-
+ web/src/lib/aeRunCommand.ts                  |  70 +++++++---
+ web/src/lib/aeTerminalInput.test.ts          | 110 +++++++++++++--
+ web/src/lib/aeTerminalInput.ts               | 119 +++++++++++++---
+ web/src/shell/useAeRunInTerminal.ts          |  48 +++++--
+ 8 files changed, 494 insertions(+), 86 deletions(-)
+
+diff --git a/web/src/components/AeRunCodeButton.test.tsx b/web/src/components/AeRunCodeButton.test.tsx
+index 39eb36e44b5abdb0a140aa82e6a91a58d5c73118..093c29228a31c6ca2f1f5579f2da75322aa81878 100644
+--- a/web/src/components/AeRunCodeButton.test.tsx
++++ b/web/src/components/AeRunCodeButton.test.tsx
+@@ -14,6 +14,9 @@ import { resetAeTerminalInputForTests, setAeRunTarget } from "@/lib/aeTerminalIn
+ import type { TerminalInfo } from "@/lib/terminals";
+ import { pickRunShell, useAeRunInTerminal } from "@/shell/useAeRunInTerminal";
+ 
++const toast = vi.hoisted(() => vi.fn());
++vi.mock("@/components/ui/toast", () => ({ showToast: toast }));
++
+ class FakeWebSocket {
+   static CONNECTING = 0;
+   static OPEN = 1;
+@@ -65,12 +68,16 @@ class FakeResizeObserver {
+ }
+ 
+ const SHELL: TerminalInfo = { id: "terminal_bash_u1", name: "bash", session: "u1", running: true };
++const PWSH: TerminalInfo = { id: "terminal_pwsh_u2", name: "pwsh", session: "u2", running: true };
+ const ONE_SHELL = [SHELL];
++const BASH_ONLY = ["bash"];
++/** What a shell prints when it is ready: bracketed paste on, then its prompt. */
++const PROMPT = "\x1b[?2004h$ ";
+ 
+-function assistantBlock(markdown: string): ReactNode {
++function assistantBlock(markdown: string, mode: "static" | "streaming" = "static"): ReactNode {
+   return (
+     <div data-testid="assistant-text-section">
+-      <MessageResponse mode="static">{markdown}</MessageResponse>
++      <MessageResponse mode={mode}>{markdown}</MessageResponse>
+     </div>
+   );
+ }
+@@ -79,14 +86,18 @@ function assistantBlock(markdown: string): ReactNode {
+ function SessionPage({
+   markdown,
+   terminals = ONE_SHELL,
++  declaredShells = BASH_ONLY,
++  initiallyOpen = null,
+ }: {
+   markdown: string;
+   terminals?: TerminalInfo[];
++  declaredShells?: string[];
++  initiallyOpen?: string | null;
+ }) {
+-  const [openKey, setOpenKey] = useState<string | null>(null);
++  const [openKey, setOpenKey] = useState<string | null>(initiallyOpen);
+   useAeRunInTerminal("conv_run", {
+     canRun: true,
+-    declaredShells: ["bash"],
++    declaredShells,
+     terminals,
+     selectedTerminalKey: null,
+     openTerminalTab: setOpenKey,
+@@ -95,20 +106,20 @@ function SessionPage({
+   return (
+     <>
+       {assistantBlock(markdown)}
+-      {openKey === "terminal:terminal_bash_u1" && (
+-        <div data-testid="shell-tab">
+-          <TerminalView sessionId="conv_run" terminalId="terminal_bash_u1" />
++      {openKey !== null && (
++        <div data-testid="shell-tab" data-key={openKey}>
++          <TerminalView sessionId="conv_run" terminalId={openKey.replace(/^terminal:/, "")} />
+         </div>
+       )}
+     </>
+   );
+ }
+ 
+-function renderPage(markdown: string) {
++function renderPage(markdown: string, page: Partial<Parameters<typeof SessionPage>[0]> = {}) {
+   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   return render(
+     <QueryClientProvider client={client}>
+-      <SessionPage markdown={markdown} />
++      <SessionPage markdown={markdown} {...page} />
+     </QueryClientProvider>,
+   );
+ }
+@@ -121,6 +132,7 @@ async function openAndConnect(): Promise<FakeWebSocket> {
+ }
+ 
+ beforeEach(() => {
++  toast.mockReset();
+   FakeWebSocket.instances = [];
+   vi.stubGlobal("WebSocket", FakeWebSocket);
+   vi.stubGlobal("ResizeObserver", FakeResizeObserver);
+@@ -133,7 +145,7 @@ afterEach(() => {
+ });
+ 
+ describe("Run on a chat code block", () => {
+-  it("sends the exact bytes of a multi-line block as one paste, then Enter", async () => {
++  it("sends the exact bytes of a multi-line block as one bracketed paste, then Enter", async () => {
+     renderPage("```bash\ncd /secure/omnigent\ndocker compose ps\n```");
+ 
+     fireEvent.click(await screen.findByTestId("ae-run-button"));
+@@ -143,20 +155,40 @@ describe("Run on a chat code block", () => {
+     fireEvent.click(screen.getByTestId("ae-run-confirm"));
+ 
+     const socket = await openAndConnect();
+-    await waitFor(() => expect(socket.input()).toBe("cd /secure/omnigent\rdocker compose ps\r"));
++    act(() => socket.message(PROMPT));
++    await waitFor(() =>
++      expect(socket.input()).toBe("\x1b[200~cd /secure/omnigent\rdocker compose ps\x1b[201~\r"),
++    );
+     expect(screen.getByTestId("shell-tab")).toBeTruthy();
+   });
+ 
+-  it("wraps the paste in bracketed-paste markers when the shell asked for them", async () => {
++  it("holds the paste until the shell has drawn, not just until the socket opens", async () => {
+     renderPage("```bash\necho one\necho two\n```");
+     fireEvent.click(await screen.findByTestId("ae-run-button"));
+     fireEvent.click(screen.getByTestId("ae-run-confirm"));
+     const socket = await openAndConnect();
+-    // Hold the Run until the shell's own bracketed-paste request is parsed.
+-    act(() => socket.message("\x1b[?2004h"));
++    // Nothing from the shell yet: xterm cannot know it wants bracketed paste,
++    // so an early paste would run each line on its own.
++    await act(async () => {
++      await new Promise((resolve) => {
++        setTimeout(resolve, 600);
++      });
++    });
++    expect(socket.input()).toBe("");
++    act(() => socket.message(PROMPT));
+     await waitFor(() => expect(socket.input()).toBe("\x1b[200~echo one\recho two\x1b[201~\r"));
+   });
+ 
++  it("sends nothing multi-line to a shell without bracketed paste, and says so", async () => {
++    renderPage("```bash\nrm -rf build\ncat > notes <<EOF\nkey=1\n```");
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    fireEvent.click(screen.getByTestId("ae-run-confirm"));
++    const socket = await openAndConnect();
++    act(() => socket.message("$ "));
++    await waitFor(() => expect(toast).toHaveBeenCalledWith(expect.stringMatching(/bracketed/)));
++    expect(socket.input()).toBe("");
++  });
++
+   it("pastes an open heredoc without Enter and says why", async () => {
+     renderPage("```bash\nsudo tee /etc/ae.conf <<EOF\nkey=1\n```");
+     fireEvent.click(await screen.findByTestId("ae-run-button"));
+@@ -166,7 +198,66 @@ describe("Run on a chat code block", () => {
+     ).toMatch(/password/);
+     fireEvent.click(screen.getByTestId("ae-run-confirm"));
+     const socket = await openAndConnect();
+-    await waitFor(() => expect(socket.input()).toBe("sudo tee /etc/ae.conf <<EOF\rkey=1"));
++    act(() => socket.message(PROMPT));
++    await waitFor(() =>
++      expect(socket.input()).toBe("\x1b[200~sudo tee /etc/ae.conf <<EOF\rkey=1\x1b[201~"),
++    );
++  });
++
++  it("moves the focus to the terminal after a Run, so a password can be typed", async () => {
++    // The shell is already open and connected; the user is reading the chat.
++    renderPage("```bash\nsudo apt update\n```", { initiallyOpen: "terminal:terminal_bash_u1" });
++    const socket = await openAndConnect();
++    act(() => socket.message(PROMPT));
++    // A browser focuses a clicked button.
++    const run = await screen.findByTestId("ae-run-button");
++    run.focus();
++    fireEvent.click(run);
++    fireEvent.click(screen.getByTestId("ae-run-confirm"));
++    await waitFor(() => expect(socket.input()).toBe("\x1b[200~sudo apt update\x1b[201~\r"));
++    await waitFor(() => expect(screen.queryByTestId("ae-run-sheet")).toBeNull());
++    await waitFor(() =>
++      expect(screen.getByTestId("shell-tab").contains(document.activeElement)).toBe(true),
++    );
++  });
++
++  it("sends once on a double tap", async () => {
++    renderPage("```bash\nuptime\n```");
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    const confirm = screen.getByTestId("ae-run-confirm");
++    fireEvent.click(confirm);
++    fireEvent.click(confirm);
++    const socket = await openAndConnect();
++    act(() => socket.message(PROMPT));
++    await waitFor(() => expect(socket.input()).toBe("\x1b[200~uptime\x1b[201~\r"));
++    await act(async () => {
++      await new Promise((resolve) => {
++        setTimeout(resolve, 600);
++      });
++    });
++    expect(socket.input()).toBe("\x1b[200~uptime\x1b[201~\r");
++    expect(FakeWebSocket.instances).toHaveLength(1);
++  });
++
++  it("scrolls the sheet inside the screen on a phone", async () => {
++    renderPage("```bash\nsudo rm -rf /tmp/x\n```");
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    const sheet = screen.getByTestId("ae-run-sheet");
++    expect(sheet.className).toMatch(/max-h-\[85vh\]/);
++    expect(sheet.className).toMatch(/overflow-y-auto/);
++  });
++
++  it("runs a powershell block in the session's PowerShell shell, never in bash", async () => {
++    renderPage("```powershell\nGet-Process\n```", {
++      terminals: [SHELL, PWSH],
++      declaredShells: ["bash", "pwsh"],
++    });
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    fireEvent.click(screen.getByTestId("ae-run-confirm"));
++    const socket = await openAndConnect();
++    expect(screen.getByTestId("shell-tab").dataset.key).toBe("terminal:terminal_pwsh_u2");
++    act(() => socket.message(PROMPT));
++    await waitFor(() => expect(socket.input()).toBe("\x1b[200~Get-Process\x1b[201~\r"));
+   });
+ 
+   it("sends nothing on Cancel", async () => {
+@@ -189,7 +280,7 @@ describe("Run on a chat code block", () => {
+ });
+ 
+ describe("where Run shows", () => {
+-  const target = { conversationId: "conv_run", run: vi.fn() };
++  const target = { conversationId: "conv_run", shells: new Set(["posix" as const]), run: vi.fn() };
+ 
+   it("shows on shell fences and command-like untagged blocks in assistant text", async () => {
+     setAeRunTarget(target);
+@@ -210,6 +301,21 @@ describe("where Run shows", () => {
+     expect(screen.queryByTestId("ae-run-button")).toBeNull();
+   });
+ 
++  it("hides on a powershell block when the session has no PowerShell shell", async () => {
++    renderPage("```powershell\nGet-Process\n```\n\n```bash\nls\n```");
++    await waitFor(() =>
++      expect(screen.getAllByRole("button", { name: "Copy Code" })).toHaveLength(2),
++    );
++    expect(screen.getAllByTestId("ae-run-button")).toHaveLength(1);
++  });
++
++  it("hides while the message is still streaming (the block may be a partial command)", async () => {
++    setAeRunTarget(target);
++    render(assistantBlock("```bash\nrm -rf ./bu", "streaming"));
++    await screen.findByRole("button", { name: "Copy Code" });
++    expect(screen.queryByTestId("ae-run-button")).toBeNull();
++  });
++
+   it("hides in a user message and in a side chat", async () => {
+     setAeRunTarget(target);
+     render(
+diff --git a/web/src/components/AeRunCodeButton.tsx b/web/src/components/AeRunCodeButton.tsx
+index b203f46782e5d549cff06c72cbf22ee418b0b952..ea587bef2384ebcfbd60bb75e2801dfc06c3edae 100644
+--- a/web/src/components/AeRunCodeButton.tsx
++++ b/web/src/components/AeRunCodeButton.tsx
+@@ -8,7 +8,15 @@
+ //   - the block sits in an assistant text section of the main chat (not a
+ //     user bubble, not a side chat, not a plan or a PR body),
+ //   - the block is a shell fence or an untagged block that reads as commands
+-//     (`aeRunCommand.ts`).
++//     (`aeRunCommand.ts`), and the session declares a shell of its kind (a
++//     powershell block needs a PowerShell shell; hosts are Linux, macOS, WSL),
++//   - the message has finished streaming (Streamdown's own context carries the
++//     mode upstream's MessageResponse passes): a block still arriving is a
++//     partial command.
++//
++// After a Run the terminal gets the focus once the sheet has closed (while it
++// is open its focus trap would take it back), so a sudo password prompt can be
++// answered by typing.
+ //
+ // Nothing is sent until the sheet's Run: the sheet shows the exact text, says
+ // plainly when the block uses sudo, rm -rf, curl | sh or dd, and says when
+@@ -17,6 +25,7 @@
+ import { PlayIcon, TriangleAlertIcon } from "lucide-react";
+ import { isValidElement, useContext, useLayoutEffect, useRef, useState } from "react";
+ import type { ReactNode } from "react";
++import { StreamdownContext } from "streamdown";
+ import { ConversationScopeContext } from "@/components/chat/conversationScope";
+ import { Button } from "@/components/ui/button";
+ import {
+@@ -28,7 +37,13 @@ import {
+   DialogTitle,
+ } from "@/components/ui/dialog";
+ import { showToast } from "@/components/ui/toast";
+-import { codeBlockLanguage, isRunnableBlock, planRun, type AeRunPlan } from "@/lib/aeRunCommand";
++import {
++  blockShellKind,
++  codeBlockLanguage,
++  isRunnableBlock,
++  planRun,
++  type AeRunPlan,
++} from "@/lib/aeRunCommand";
+ import { useAeRunTarget } from "@/lib/aeTerminalInput";
+ 
+ /** Marker upstream's BlockRenderer puts on every assistant text section. */
+@@ -46,6 +61,8 @@ export function AeRunCodeButton({ block, code }: { block: ReactNode; code: strin
+   const [inAssistantText, setInAssistantText] = useState(false);
+   const [plan, setPlan] = useState<AeRunPlan | null>(null);
+   const [running, setRunning] = useState(false);
++  const focusAfterClose = useRef<(() => void) | null>(null);
++  const streaming = useContext(StreamdownContext).mode === "streaming";
+   const language = blockLanguage(block);
+ 
+   useLayoutEffect(() => {
+@@ -53,12 +70,18 @@ export function AeRunCodeButton({ block, code }: { block: ReactNode; code: strin
+   }, []);
+ 
+   const visible =
+-    target !== null && !inSideChat && inAssistantText && isRunnableBlock(language, code);
++    target !== null &&
++    !streaming &&
++    !inSideChat &&
++    inAssistantText &&
++    target.shells.has(blockShellKind(language)) &&
++    isRunnableBlock(language, code);
+ 
+   const confirm = async () => {
+     if (!plan || !target) return;
+     setRunning(true);
+-    const result = await target.run(plan.text, plan.submit);
++    const result = await target.run(plan.text, plan.submit, plan.shell);
++    focusAfterClose.current = result.ok ? result.focus : null;
+     setRunning(false);
+     setPlan(null);
+     if (!result.ok) showToast(result.error);
+@@ -85,7 +108,17 @@ export function AeRunCodeButton({ block, code }: { block: ReactNode; code: strin
+       )}
+       <Dialog open={plan !== null} onOpenChange={(open) => !open && !running && setPlan(null)}>
+         {plan && (
+-          <DialogContent className="sm:max-w-lg" data-testid="ae-run-sheet">
++          <DialogContent
++            className="max-h-[85vh] overflow-y-auto sm:max-w-lg"
++            data-testid="ae-run-sheet"
++            onCloseAutoFocus={(event) => {
++              const focus = focusAfterClose.current;
++              focusAfterClose.current = null;
++              if (focus === null) return;
++              event.preventDefault();
++              focus();
++            }}
++          >
+             <DialogHeader>
+               <DialogTitle>Run in the terminal?</DialogTitle>
+               <DialogDescription>
+diff --git a/web/src/components/blocks/TerminalSession.ts b/web/src/components/blocks/TerminalSession.ts
+index 9f6f6a726941485d78e0c0ee19760a4d88abcdae..8512c782b93d99384711a878da8eb07b834528cc 100644
+--- a/web/src/components/blocks/TerminalSession.ts
++++ b/web/src/components/blocks/TerminalSession.ts
+@@ -987,17 +987,23 @@ export class TerminalSession {
+     this.term.focus();
+   }
+ 
+-  /** [ae] Run-on-box input state and paste; see `lib/aeTerminalInput.ts`. */
++  /** [ae] Run-on-box input hooks; see `lib/aeTerminalInput.ts`. */
+   aeInputState(): "open" | "connecting" | "gone" {
+     if (this.disposed || this.ws.readyState > WebSocket.OPEN) return "gone";
+     return this.ws.readyState === WebSocket.OPEN ? "open" : "connecting";
+   }
+ 
+-  aePaste(text: string, submit: boolean): boolean {
+-    if (this.aeInputState() !== "open") return false;
++  aeOnOutput(listener: () => void): { dispose: () => void } {
++    return this.term.onWriteParsed(listener);
++  }
++
++  aeBracketedPaste(): boolean {
++    return this.term.modes.bracketedPasteMode;
++  }
++
++  aeWrite(text: string, submit: boolean): void {
+     this.term.paste(text);
+     if (submit) this.term.input("\r", true);
+-    return true;
+   }
+ 
+   /**
+diff --git a/web/src/lib/aeRunCommand.test.ts b/web/src/lib/aeRunCommand.test.ts
+index 87da90fc902478ae8d94a5c970e6b98c22d55b78..9af6529fcbee1d15da647f6c864df341ab1b4e48 100644
+--- a/web/src/lib/aeRunCommand.test.ts
++++ b/web/src/lib/aeRunCommand.test.ts
+@@ -9,6 +9,7 @@ import {
+   openPowerShellConstruct,
+   openShellConstruct,
+   planRun,
++  terminalShellKind,
+ } from "./aeRunCommand";
+ 
+ describe("codeBlockLanguage", () => {
+@@ -21,7 +22,7 @@ describe("codeBlockLanguage", () => {
+ });
+ 
+ describe("isRunnableBlock", () => {
+-  it.each(["bash", "sh", "shell", "zsh", "console", "powershell"])("runs a %s fence", (lang) => {
++  it.each(["bash", "sh", "shell", "zsh", "powershell"])("runs a %s fence", (lang) => {
+     expect(isRunnableBlock(lang, "anything at all")).toBe(true);
+   });
+ 
+@@ -29,6 +30,13 @@ describe("isRunnableBlock", () => {
+     expect(isRunnableBlock(lang, "ls -la")).toBe(false);
+   });
+ 
++  it("never runs a console block without a `$ ` prompt (output cannot be told apart)", () => {
++    expect(isRunnableBlock("console", "# apt-get update\nReading package lists... Done")).toBe(
++      false,
++    );
++    expect(isRunnableBlock("console", "$ uptime\n 10:00 up 3 days")).toBe(true);
++  });
++
+   it("never runs an empty block", () => {
+     expect(isRunnableBlock("bash", "  \n")).toBe(false);
+   });
+@@ -74,6 +82,18 @@ describe("commandText", () => {
+     expect(commandText(transcript)).toBe("df -h\nfree -m");
+   });
+ 
++  it("never treats a script as a transcript because of a `$ ` line in a heredoc", () => {
++    const script = "cat > NOTES <<'EOF'\nTo build:\n$ make\nEOF";
++    expect(commandText(script, "bash")).toBe(script);
++  });
++
++  it("keeps the heredoc body of a prompted command, with or without `> ` prompts", () => {
++    expect(commandText("$ cat <<EOF\n> one\n> EOF\n$ ls\nfile", "console")).toBe(
++      "cat <<EOF\none\nEOF\nls",
++    );
++    expect(commandText("$ cat <<EOF\none\nEOF\none", "console")).toBe("cat <<EOF\none\nEOF");
++  });
++
+   it("keeps the continuation lines of a prompted command", () => {
+     expect(commandText("$ docker run \\\n  --rm hello\nHello from Docker")).toBe(
+       "docker run \\\n  --rm hello",
+@@ -196,6 +216,7 @@ describe("stripHiddenChars", () => {
+ describe("planRun", () => {
+   it("submits a closed block", () => {
+     expect(planRun("ls -la\n", "bash")).toEqual({
++      shell: "posix",
+       text: "ls -la",
+       removedHidden: 0,
+       submit: true,
+@@ -222,4 +243,19 @@ describe("planRun", () => {
+     expect(planRun("Write-Host 'it''s'", "bash").submit).toBe(true);
+     expect(planRun("$s = @'\nx", "powershell").submit).toBe(false);
+   });
++
++  it("marks a powershell fence for a PowerShell shell and everything else for POSIX", () => {
++    expect(planRun("Get-Process", "powershell").shell).toBe("powershell");
++    expect(planRun("ls", "bash").shell).toBe("posix");
++    expect(planRun("ls", null).shell).toBe("posix");
++  });
++});
++
++describe("terminalShellKind", () => {
++  it("reads PowerShell from the terminal's spec name only", () => {
++    expect(terminalShellKind("pwsh")).toBe("powershell");
++    expect(terminalShellKind("PowerShell")).toBe("powershell");
++    expect(terminalShellKind("bash")).toBe("posix");
++    expect(terminalShellKind("shell")).toBe("posix");
++  });
+ });
+diff --git a/web/src/lib/aeRunCommand.ts b/web/src/lib/aeRunCommand.ts
+index 4f718c649172ef2ee66f7c6781774259969446d1..c598b9d5c7f840bfaf9ce232a51d2b26a4d9a7a1 100644
+--- a/web/src/lib/aeRunCommand.ts
++++ b/web/src/lib/aeRunCommand.ts
+@@ -191,33 +191,65 @@ function lineStartsWithCommand(line: string): boolean {
+   return COMMAND_WORDS.has(word);
+ }
+ 
++/** Which kind of shell a block is written for. */
++export type AeShellKind = "posix" | "powershell";
++
++/** The shell kind a fence language asks for: PowerShell only for a powershell fence. */
++export function blockShellKind(language: string | null): AeShellKind {
++  return language === "powershell" ? "powershell" : "posix";
++}
++
++/**
++ * The shell kind of a declared terminal, from its spec name (`bash`, `shell`,
++ * `pwsh`, ...). Hosts are Linux, macOS or WSL, so everything that is not named
++ * for PowerShell is a POSIX shell.
++ */
++export function terminalShellKind(name: string): AeShellKind {
++  return /pwsh|powershell/i.test(name) ? "powershell" : "posix";
++}
++
++/**
++ * Whether a block reads as a transcript (commands behind `$ ` prompts, output
++ * between them): a `console` fence, or a block whose first line is prompted.
++ * Only the first line decides for other fences, so a `$ ` line inside a
++ * heredoc body or an echo never turns a script into a transcript.
++ */
++function isTranscript(lines: readonly string[], language: string | null): boolean {
++  if (language === "console") return true;
++  const first = lines.find((line) => line.trim() !== "");
++  return first !== undefined && first.startsWith("$ ");
++}
++
+ /** Whether a code block gets a Run button: a shell fence, or untagged and command-like. */
+ export function isRunnableBlock(language: string | null, code: string): boolean {
+   if (code.trim() === "") return false;
+-  if (language !== null) return AE_RUN_SHELL_LANGUAGES.has(language);
++  if (language !== null) {
++    if (!AE_RUN_SHELL_LANGUAGES.has(language)) return false;
++    // A console block with no `$ ` prompt cannot tell commands from output.
++    return language !== "console" || commandText(code, language) !== "";
++  }
+   return looksLikeCommand(code);
+ }
+ 
+ /**
+  * The exact text Run sends. Trailing whitespace goes (Enter is sent
+- * separately). When a block is a transcript (`console`, or lines prompted
+- * with `$ `), only the prompted lines and their `\` continuations are kept,
+- * without the prompt, so output lines are never replayed as commands.
++ * separately). When a block is a transcript, only the prompted lines are kept,
++ * without the prompt, so output lines are never replayed as commands; the
++ * lines after a prompted command that leaves a heredoc, a quote or a `\`
++ * continuation open are kept too (their `> ` prompt stripped), up to where it
++ * closes.
+  */
+-export function commandText(code: string): string {
++export function commandText(code: string, language: string | null = null): string {
+   const trimmed = code.replace(/\s+$/, "");
+   const lines = trimmed.split("\n");
+-  if (!lines.some((line) => line.startsWith("$ "))) return trimmed;
++  if (!isTranscript(lines, language)) return trimmed;
+   const kept: string[] = [];
+-  let continued = false;
++  let open = false;
+   for (const line of lines) {
+-    if (line.startsWith("$ ")) {
+-      kept.push(line.slice(2));
+-      continued = line.endsWith("\\");
+-    } else if (continued) {
+-      kept.push(line);
+-      continued = line.endsWith("\\");
+-    }
++    if (open) kept.push(line.startsWith("> ") ? line.slice(2) : line === ">" ? "" : line);
++    else if (line.startsWith("$ ")) kept.push(line.slice(2));
++    else continue;
++    open = openShellConstruct(kept.join("\n")) !== null;
+   }
+   return kept.join("\n");
+ }
+@@ -508,6 +540,8 @@ export function stripHiddenChars(code: string): { text: string; removed: number
+ 
+ /** Everything the confirm sheet shows and the Run sends. */
+ export interface AeRunPlan {
++  /** The kind of shell the text is pasted into. */
++  shell: AeShellKind;
+   /** The exact text pasted into the terminal. */
+   text: string;
+   /** How many hidden characters were removed from the block before sending. */
+@@ -522,9 +556,13 @@ export interface AeRunPlan {
+ /** Build the plan for one code block. */
+ export function planRun(code: string, language: string | null): AeRunPlan {
+   const { text: visible, removed } = stripHiddenChars(code);
+-  const text = commandText(visible);
+-  const open = language === "powershell" ? openPowerShellConstruct(text) : openShellConstruct(text);
++  const text = commandText(visible, language);
++  const open =
++    blockShellKind(language) === "powershell"
++      ? openPowerShellConstruct(text)
++      : openShellConstruct(text);
+   return {
++    shell: blockShellKind(language),
+     text,
+     removedHidden: removed,
+     submit: open === null,
+diff --git a/web/src/lib/aeTerminalInput.test.ts b/web/src/lib/aeTerminalInput.test.ts
+index 45e95213de1b478f2ddc9a54793ddc4025520bc3..c96f6e96908e029ad0af057f794906c7a609b331 100644
+--- a/web/src/lib/aeTerminalInput.test.ts
++++ b/web/src/lib/aeTerminalInput.test.ts
+@@ -1,34 +1,66 @@
+-import { afterEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
++  AE_SINK_BUSY_MS,
++  AE_SINK_QUIET_MS,
+   type AeTerminalSink,
+   findAeTerminalSink,
+   getAeRunTarget,
++  pasteIntoAeTerminal,
+   registerAeTerminalInput,
+   resetAeTerminalInputForTests,
+   setAeRunTarget,
+   waitForAeTerminalSink,
+ } from "./aeTerminalInput";
+ 
+-function sink(state: "open" | "connecting" | "gone"): AeTerminalSink & { state: typeof state } {
+-  const s = {
++type FakeSink = AeTerminalSink & {
++  state: "open" | "connecting" | "gone";
++  bracketed: boolean;
++  draw: () => void;
++};
++
++function sink(state: FakeSink["state"]): FakeSink {
++  const listeners = new Set<() => void>();
++  const s: FakeSink = {
+     state,
++    bracketed: true,
+     aeInputState: () => s.state,
+-    aePaste: vi.fn(() => s.state === "open"),
++    aeOnOutput: (listener) => {
++      listeners.add(listener);
++      return { dispose: () => listeners.delete(listener) };
++    },
++    aeBracketedPaste: () => s.bracketed,
++    aeWrite: vi.fn(),
++    focus: vi.fn(),
++    draw: () => {
++      for (const listener of listeners) listener();
++    },
+   };
+   return s;
+ }
+ 
++/** Register, draw, and let the shell go quiet. */
++function registerDrawn(session: string, terminal: string, s: FakeSink): () => void {
++  const unregister = registerAeTerminalInput(session, terminal, s);
++  s.draw();
++  vi.advanceTimersByTime(AE_SINK_QUIET_MS);
++  return unregister;
++}
++
++beforeEach(() => {
++  vi.useFakeTimers();
++});
++
+ afterEach(() => {
+   resetAeTerminalInputForTests();
+   vi.useRealTimers();
+ });
+ 
+ describe("terminal input sinks", () => {
+-  it("finds the newest open sink for the session and terminal", () => {
++  it("finds the newest ready sink for the session and terminal", () => {
+     const older = sink("open");
+     const newer = sink("open");
+-    registerAeTerminalInput("s1", "t1", older);
+-    registerAeTerminalInput("s1", "t1", newer);
++    registerDrawn("s1", "t1", older);
++    registerDrawn("s1", "t1", newer);
+     expect(findAeTerminalSink("s1", "t1")).toBe(newer);
+     expect(findAeTerminalSink("s1", "t2")).toBeNull();
+     expect(findAeTerminalSink("s2", "t1")).toBeNull();
+@@ -37,8 +69,8 @@ describe("terminal input sinks", () => {
+   it("skips connecting and gone sinks, and unregister removes one", () => {
+     const open = sink("open");
+     const connecting = sink("connecting");
+-    registerAeTerminalInput("s1", "t1", open);
+-    const unregister = registerAeTerminalInput("s1", "t1", connecting);
++    registerDrawn("s1", "t1", open);
++    const unregister = registerDrawn("s1", "t1", connecting);
+     expect(findAeTerminalSink("s1", "t1")).toBe(open);
+     open.state = "gone";
+     expect(findAeTerminalSink("s1", "t1")).toBeNull();
+@@ -48,14 +80,36 @@ describe("terminal input sinks", () => {
+     expect(findAeTerminalSink("s1", "t1")).toBeNull();
+   });
+ 
+-  it("waits for a sink to connect, and gives up after the timeout", async () => {
+-    vi.useFakeTimers();
++  it("is not ready on the WebSocket's open, only once the shell has drawn and gone quiet", () => {
++    const s = sink("open");
++    registerAeTerminalInput("s1", "t1", s);
++    expect(findAeTerminalSink("s1", "t1")).toBeNull();
++    s.draw();
++    expect(findAeTerminalSink("s1", "t1")).toBeNull();
++    vi.advanceTimersByTime(AE_SINK_QUIET_MS);
++    expect(findAeTerminalSink("s1", "t1")).toBe(s);
++  });
++
++  it("writes to a shell that keeps printing once it has had time to draw", () => {
++    const s = sink("open");
++    registerAeTerminalInput("s1", "t1", s);
++    for (let elapsed = 0; elapsed < AE_SINK_BUSY_MS; elapsed += 100) {
++      s.draw();
++      expect(findAeTerminalSink("s1", "t1")).toBeNull();
++      vi.advanceTimersByTime(100);
++    }
++    s.draw();
++    expect(findAeTerminalSink("s1", "t1")).toBe(s);
++  });
++
++  it("waits for a sink to connect and draw, and gives up after the timeout", async () => {
+     const late = sink("connecting");
+     registerAeTerminalInput("s1", "t1", late);
+-    const found = waitForAeTerminalSink("s1", "t1", 1000, 100);
++    const found = waitForAeTerminalSink("s1", "t1", 2000, 100);
+     await vi.advanceTimersByTimeAsync(300);
+     late.state = "open";
+-    await vi.advanceTimersByTimeAsync(100);
++    late.draw();
++    await vi.advanceTimersByTimeAsync(AE_SINK_QUIET_MS + 100);
+     await expect(found).resolves.toBe(late);
+ 
+     const never = waitForAeTerminalSink("s1", "missing", 1000, 100);
+@@ -64,9 +118,37 @@ describe("terminal input sinks", () => {
+   });
+ });
+ 
++describe("pasteIntoAeTerminal", () => {
++  it("pastes a single line whatever the paste mode", () => {
++    const s = sink("open");
++    s.bracketed = false;
++    expect(pasteIntoAeTerminal(s, "ls -la", true)).toMatchObject({ ok: true, submitted: true });
++    expect(s.aeWrite).toHaveBeenCalledWith("ls -la", true);
++  });
++
++  it("sends nothing multi-line unless the shell turned on bracketed paste", () => {
++    const s = sink("open");
++    s.bracketed = false;
++    const result = pasteIntoAeTerminal(s, "rm -rf build\ncat <<EOF", false);
++    expect(result.ok).toBe(false);
++    expect(s.aeWrite).not.toHaveBeenCalled();
++    s.bracketed = true;
++    expect(pasteIntoAeTerminal(s, "rm -rf build\ncat <<EOF", false)).toMatchObject({
++      ok: true,
++      submitted: false,
++    });
++  });
++
++  it("sends nothing to a shell that disconnected", () => {
++    const s = sink("gone");
++    expect(pasteIntoAeTerminal(s, "ls", true).ok).toBe(false);
++    expect(s.aeWrite).not.toHaveBeenCalled();
++  });
++});
++
+ describe("run target", () => {
+   it("publishes and clears the target", () => {
+-    const target = { conversationId: "c1", run: vi.fn() };
++    const target = { conversationId: "c1", shells: new Set(["posix" as const]), run: vi.fn() };
+     setAeRunTarget(target);
+     expect(getAeRunTarget()).toBe(target);
+     setAeRunTarget(null);
+diff --git a/web/src/lib/aeTerminalInput.ts b/web/src/lib/aeTerminalInput.ts
+index df564d50b374b3ca8dbe8817c6a870d6a619902f..c9b7438f7c09dcbd8489778200bca7320418ded6 100644
+--- a/web/src/lib/aeTerminalInput.ts
++++ b/web/src/lib/aeTerminalInput.ts
+@@ -5,31 +5,54 @@
+ //
+ //   - Input sinks. Every writable `TerminalView` registers its live
+ //     `TerminalSession` here under (session id, terminal id). A Run writes
+-//     through `TerminalSession.aePaste`, which is xterm's own paste followed
++//     through `TerminalSession.aeWrite`, which is xterm's own paste followed
+ //     by an Enter keystroke: the bytes take the same `term.onData` path, and
+ //     the same WebSocket, as the keyboard. No new server endpoint.
++//
++//     A sink is ready only once the shell has drawn and gone quiet. xterm
++//     brackets a paste only after it has parsed the shell's own request for
++//     bracketed paste (ESC[?2004h), which arrives with the shell's first
++//     output, not with the WebSocket's open. Pasted unbracketed, every newline
++//     is an Enter: the lines of a block held back for an open heredoc would
++//     run anyway, and a password prompt would read the next line. So a
++//     multi-line block is never pasted unbracketed.
+ //   - The run target. AppShell publishes one while the viewer owns a session
+ //     whose agent declares shells (`useAeRunInTerminal`); code blocks show Run
+ //     only while it is set.
+ 
+ import { useSyncExternalStore } from "react";
++import type { AeShellKind } from "./aeRunCommand";
+ 
+ /** What a `TerminalSession` exposes to a Run. */
+ export interface AeTerminalSink {
+   /** `open` once the WebSocket is up; `gone` after dispose or close. */
+   aeInputState: () => "open" | "connecting" | "gone";
+-  /** Paste through the keyboard path, then Enter when `submit`. False when not open. */
+-  aePaste: (text: string, submit: boolean) => boolean;
++  /** Subscribe to the terminal finishing parsing a chunk of output. */
++  aeOnOutput: (listener: () => void) => { dispose: () => void };
++  /** Whether the shell has turned on bracketed paste. */
++  aeBracketedPaste: () => boolean;
++  /** Paste through the keyboard path, then press Enter when `submit`. */
++  aeWrite: (text: string, submit: boolean) => void;
++  /** Give the terminal the keyboard focus. */
++  focus: () => void;
++}
++
++interface SinkEntry {
++  sink: AeTerminalSink;
++  /** `performance.now()` of the first and the latest parsed output, or null. */
++  firstOutputAt: number | null;
++  lastOutputAt: number | null;
++  output: { dispose: () => void };
+ }
+ 
+-const sinks = new Map<string, AeTerminalSink[]>();
++const sinks = new Map<string, SinkEntry[]>();
+ 
+ function sinkKey(sessionId: string, terminalId: string): string {
+   return `${sessionId}\u0000${terminalId}`;
+ }
+ 
+-function liveSinks(key: string): AeTerminalSink[] {
+-  const list = (sinks.get(key) ?? []).filter((sink) => sink.aeInputState() !== "gone");
++function liveSinks(key: string): SinkEntry[] {
++  const list = (sinks.get(key) ?? []).filter((e) => e.sink.aeInputState() !== "gone");
+   if (list.length === 0) sinks.delete(key);
+   else sinks.set(key, list);
+   return list;
+@@ -45,28 +68,55 @@ export function registerAeTerminalInput(
+   sink: AeTerminalSink,
+ ): () => void {
+   const key = sinkKey(sessionId, terminalId);
+-  sinks.set(key, [...liveSinks(key), sink]);
++  const entry: SinkEntry = {
++    sink,
++    firstOutputAt: null,
++    lastOutputAt: null,
++    output: { dispose: () => {} },
++  };
++  entry.output = sink.aeOnOutput(() => {
++    const now = performance.now();
++    entry.firstOutputAt ??= now;
++    entry.lastOutputAt = now;
++  });
++  sinks.set(key, [...liveSinks(key), entry]);
+   return () => {
+-    const rest = (sinks.get(key) ?? []).filter((s) => s !== sink);
++    entry.output.dispose();
++    const rest = (sinks.get(key) ?? []).filter((e) => e !== entry);
+     if (rest.length === 0) sinks.delete(key);
+     else sinks.set(key, rest);
+   };
+ }
+ 
+-/** The most recently attached open sink for a terminal, or null. */
+-export function findAeTerminalSink(sessionId: string, terminalId: string): AeTerminalSink | null {
+-  const open = liveSinks(sinkKey(sessionId, terminalId)).filter(
+-    (sink) => sink.aeInputState() === "open",
++/** Quiet after the shell's last output before a Run pastes. */
++export const AE_SINK_QUIET_MS = 400;
++/** A shell that keeps printing is written to this long after its first output. */
++export const AE_SINK_BUSY_MS = 2_000;
++
++function isReady(entry: SinkEntry, now: number): boolean {
++  if (entry.sink.aeInputState() !== "open") return false;
++  if (entry.firstOutputAt === null || entry.lastOutputAt === null) return false;
++  return (
++    now - entry.lastOutputAt >= AE_SINK_QUIET_MS || now - entry.firstOutputAt >= AE_SINK_BUSY_MS
+   );
+-  return open.length > 0 ? open[open.length - 1] : null;
++}
++
++/**
++ * The most recently attached sink for a terminal that is ready for a paste
++ * (connected, its shell drawn and quiet), or null.
++ */
++export function findAeTerminalSink(sessionId: string, terminalId: string): AeTerminalSink | null {
++  const now = performance.now();
++  const ready = liveSinks(sinkKey(sessionId, terminalId)).filter((e) => isReady(e, now));
++  return ready.length > 0 ? ready[ready.length - 1].sink : null;
+ }
+ 
+ /** How long a Run waits for the shell it opened to connect. */
+ export const AE_SINK_WAIT_MS = 20_000;
+ 
+ /**
+- * Resolve with the terminal's open sink as soon as one exists (the view it was
+- * just opened in connects asynchronously), or null after `timeoutMs`.
++ * Resolve with the terminal's ready sink as soon as one exists (the view it
++ * was just opened in connects asynchronously), or null after `timeoutMs`.
+  */
+ export function waitForAeTerminalSink(
+   sessionId: string,
+@@ -92,13 +142,48 @@ export function waitForAeTerminalSink(
+   });
+ }
+ 
++/**
++ * Paste a Run's text into a ready sink. A multi-line block needs bracketed
++ * paste (see the header); without it nothing is sent.
++ */
++export function pasteIntoAeTerminal(
++  sink: AeTerminalSink,
++  text: string,
++  submit: boolean,
++): AeRunResult {
++  if (sink.aeInputState() !== "open") {
++    return {
++      ok: false,
++      error: "The shell disconnected before the paste. Nothing was sent; run it again.",
++    };
++  }
++  if (text.includes("\n") && !sink.aeBracketedPaste()) {
++    return {
++      ok: false,
++      error:
++        "This shell has not turned on bracketed paste, so the lines would run one by one. Nothing was sent; copy the block into the terminal instead.",
++    };
++  }
++  sink.aeWrite(text, submit);
++  return { ok: true, submitted: submit, focus: () => sink.focus() };
++}
++
+ /** Result of one Run. */
+-export type AeRunResult = { ok: true; submitted: boolean } | { ok: false; error: string };
++export type AeRunResult =
++  | {
++      ok: true;
++      submitted: boolean;
++      /** Focus the terminal it went to; called once the confirm sheet has closed. */
++      focus: () => void;
++    }
++  | { ok: false; error: string };
+ 
+ /** What AppShell publishes while code blocks may show Run. */
+ export interface AeRunTarget {
+   conversationId: string;
+-  run: (text: string, submit: boolean) => Promise<AeRunResult>;
++  /** The shell kinds the session declares; a block runs only in its own kind. */
++  shells: ReadonlySet<AeShellKind>;
++  run: (text: string, submit: boolean, shell: AeShellKind) => Promise<AeRunResult>;
+ }
+ 
+ let runTarget: AeRunTarget | null = null;
+diff --git a/web/src/shell/useAeRunInTerminal.ts b/web/src/shell/useAeRunInTerminal.ts
+index b3fa3010cd026c025e5a36a617e1318e3ab58421..c22327057f8733bb83976432f1780f05a855facf 100644
+--- a/web/src/shell/useAeRunInTerminal.ts
++++ b/web/src/shell/useAeRunInTerminal.ts
+@@ -4,22 +4,26 @@
+ // upstream's "+ New shell" uses), this publishes the run target the code
+ // blocks read. A Run then:
+ //
+-//   1. picks the shell: the rail's selected shell when it is live, else the
+-//      newest live shell, else a new one of the default type through
+-//      upstream's own create route (the same call as "+ New shell");
++//   1. picks the shell, of the block's kind only (a powershell block never
++//      lands in bash, a bash block never in pwsh): the rail's selected shell
++//      when it is live, else the newest live shell, else a new one of the
++//      default type through upstream's own create route (the same call as
++//      "+ New shell");
+ //   2. opens it where the user sees it: a rail tab on desktop, the full-screen
+ //      terminal view on a phone (the Shells drawer's Expand path);
+ //   3. waits for that view's WebSocket and pastes through it
+ //      (`aeTerminalInput.ts`).
+ 
+-import { useEffect, useRef } from "react";
++import { useEffect, useMemo, useRef } from "react";
+ import { useCreateTerminal, AGENT_TERMINAL_IDS, terminalTabKey } from "@/hooks/useTerminals";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import type { TerminalInfo } from "@/lib/terminals";
++import { type AeShellKind, terminalShellKind } from "@/lib/aeRunCommand";
+ import {
+   type AeRunResult,
+   type AeRunTarget,
+   getAeRunTarget,
++  pasteIntoAeTerminal,
+   setAeRunTarget,
+   waitForAeTerminalSink,
+ } from "@/lib/aeTerminalInput";
+@@ -40,12 +44,15 @@ export interface AeRunInTerminalOptions {
+   openTerminalsPanel: (key: string) => void;
+ }
+ 
+-/** The live user shell a Run should target, or null when one must be created. */
++/** The live user shell of `kind` a Run should target, or null when one must be created. */
+ export function pickRunShell(
+   terminals: readonly TerminalInfo[],
+   selectedTerminalKey: string | null,
++  kind: AeShellKind = "posix",
+ ): TerminalInfo | null {
+-  const shells = terminals.filter((t) => t.running && !AGENT_TERMINAL_IDS.has(t.id));
++  const shells = terminals.filter(
++    (t) => t.running && !AGENT_TERMINAL_IDS.has(t.id) && terminalShellKind(t.name) === kind,
++  );
+   const selected = shells.find((t) => terminalTabKey(t) === selectedTerminalKey);
+   return selected ?? shells[shells.length - 1] ?? null;
+ }
+@@ -61,17 +68,32 @@ export function useAeRunInTerminal(
+   const latest = useRef({ ...options, isMobile, create });
+   latest.current = { ...options, isMobile, create };
+   const enabled = !!conversationId && options.canRun && options.declaredShells.length > 0;
++  const kindsKey = [...new Set(options.declaredShells.map(terminalShellKind))].sort().join(",");
++  const shells = useMemo(
++    () => new Set(kindsKey.split(",").filter(Boolean) as AeShellKind[]),
++    [kindsKey],
++  );
+ 
+   useEffect(() => {
+     if (!enabled || !conversationId) return undefined;
+     const target: AeRunTarget = {
+       conversationId,
+-      async run(text: string, submit: boolean): Promise<AeRunResult> {
++      shells,
++      async run(text: string, submit: boolean, kind: AeShellKind): Promise<AeRunResult> {
+         const now = latest.current;
+-        let shell = pickRunShell(now.terminals, now.selectedTerminalKey);
++        let shell = pickRunShell(now.terminals, now.selectedTerminalKey, kind);
+         if (shell === null) {
+-          const name = resolveDefaultShell(now.declaredShells);
+-          if (name === null) return { ok: false, error: "This session declares no shell." };
++          const declared = now.declaredShells.filter((name) => terminalShellKind(name) === kind);
++          const name = resolveDefaultShell(declared);
++          if (name === null) {
++            return {
++              ok: false,
++              error:
++                kind === "powershell"
++                  ? "This session has no PowerShell shell. Nothing was sent."
++                  : "This session declares no shell. Nothing was sent.",
++            };
++          }
+           try {
+             shell = await now.create.mutateAsync(name);
+           } catch (error) {
+@@ -86,19 +108,19 @@ export function useAeRunInTerminal(
+         if (latest.current.isMobile) latest.current.openTerminalsPanel(key);
+         else latest.current.openTerminalTab(key);
+         const sink = await waitForAeTerminalSink(conversationId, shell.id);
+-        if (sink === null || !sink.aePaste(text, submit)) {
++        if (sink === null) {
+           return {
+             ok: false,
+             error:
+               "The shell did not connect within 20 seconds. Nothing was sent; open the shell and run it again.",
+           };
+         }
+-        return { ok: true, submitted: submit };
++        return pasteIntoAeTerminal(sink, text, submit);
+       },
+     };
+     setAeRunTarget(target);
+     return () => {
+       if (getAeRunTarget() === target) setAeRunTarget(null);
+     };
+-  }, [enabled, conversationId]);
++  }, [enabled, conversationId, shells]);
+ }

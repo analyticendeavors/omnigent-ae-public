@@ -1,0 +1,1214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 11:13:21 -0700
+Subject: [PATCH 142/148] [ae-patch] Show a usage limit item in the action dock
+ at 90% of the account's window
+
+When the account a chat runs on reaches 90% of its 5-hour or weekly
+window, the action dock shows a limit item with Switch model, Switch
+account (a full fork through the fork dialog's account row) and New chat.
+Sending stays open; a dismissal lasts until that window resets. The gate
+is a pure module, lib/aeLimitGate.ts, fed by the session's own
+GET /v1/ae/limits?session_id= answer.
+---
+ web/src/components/AeActionDock.test.tsx | 192 ++++++++++++++++++++-
+ web/src/components/AeActionDock.tsx      | 190 ++++++++++++++++++--
+ web/src/hooks/useAeActionDockItems.ts    |   4 +
+ web/src/hooks/useAeLimitGate.ts          |  93 ++++++++++
+ web/src/lib/aeActionDock.ts              |  22 ++-
+ web/src/lib/aeActionDockIcons.ts         |  30 ++++
+ web/src/lib/aeLimitGate.test.ts          | 207 ++++++++++++++++++++++
+ web/src/lib/aeLimitGate.ts               | 211 +++++++++++++++++++++++
+ web/src/pages/ChatPage.tsx               |  10 +-
+ 9 files changed, 935 insertions(+), 24 deletions(-)
+ create mode 100644 web/src/hooks/useAeLimitGate.ts
+ create mode 100644 web/src/lib/aeLimitGate.test.ts
+ create mode 100644 web/src/lib/aeLimitGate.ts
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index b98d41782322d777a78dce6e7fc49d686bea9e67..0cf55f6893a227e14abdfb1a1b7af0c43f82ed31 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -1,6 +1,6 @@
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+-import { MemoryRouter } from "react-router-dom";
++import { MemoryRouter, useLocation } from "react-router-dom";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+@@ -9,6 +9,7 @@ import { useAePublishDockQuestions } from "@/hooks/useAeActionDockItems";
+ import type { AnyBlock } from "@/lib/blocks";
+ import { authenticatedFetch } from "@/lib/identity";
+ import type { AePrCard } from "@/lib/aePrs";
++import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
+ import { useChatStore } from "@/store/chatStore";
+ import { AeActionDock } from "./AeActionDock";
+ import { ComposerWorkspaceBar } from "./composer/ComposerControls";
+@@ -467,3 +468,192 @@ describe("AeActionDock", () => {
+     expect(screen.getByTestId("ae-dock-lead").textContent).not.toContain("more");
+   });
+ });
++
++// ── the usage gate ─────────────────────────────────────────────────────
++
++const RESETS = new Date(Date.now() + 2 * 86_400_000).toISOString();
++
++function limitsAnswer(used: number, harness: "claude" | "codex" = "claude", resets = RESETS) {
++  return {
++    now: new Date().toISOString(),
++    harnesses: {
++      [harness]: {
++        harness,
++        source: "statusline",
++        observed_at: new Date().toISOString(),
++        plan: null,
++        note: null,
++        account: null,
++        account_label: "AE Default",
++        windows: [
++          {
++            id: "five_hour",
++            label: "5-hour limit",
++            used_percent: 20,
++            resets_at: RESETS,
++            window_minutes: 300,
++          },
++          {
++            id: "seven_day",
++            label: "Weekly",
++            used_percent: used,
++            resets_at: resets,
++            window_minutes: 10080,
++          },
++        ],
++      },
++    },
++  };
++}
++
++const TWO_LOGINS = [
++  { family: "claude-oauth-active", source: "AE Default", env_var: "" },
++  { family: "claude-oauth", source: "Personal", env_var: "personal" },
++];
++
++function serveLimits(answer: () => unknown, logins: unknown[] = TWO_LOGINS) {
++  vi.mocked(authenticatedFetch).mockImplementation((input: URL | RequestInfo) => {
++    const path = String(input);
++    if (path.startsWith("/v1/ae/limits")) return json(answer());
++    if (path.includes("/credentials/detected")) return json({ credentials: logins });
++    return json({ error: { message: "nope" } }, 404);
++  });
++}
++
++function Where() {
++  return <span data-testid="where">{useLocation().pathname}</span>;
++}
++
++function renderLimitDock({
++  harness = "claude-native",
++  canFork = true,
++  disabledReason,
++  noModelMenu = false,
++  onSwitchModel = vi.fn(),
++  openForkDialog = vi.fn(),
++}: {
++  harness?: string;
++  canFork?: boolean;
++  disabledReason?: string;
++  noModelMenu?: boolean;
++  onSwitchModel?: () => void;
++  openForkDialog?: () => void;
++} = {}) {
++  useChatStore.setState({ conversationId: "s1", blocks: [], sessionHarness: harness });
++  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  qc.setQueryData(["session", "s1"], { id: "s1", hostId: "h1", labels: {} });
++  render(
++    <QueryClientProvider client={qc}>
++      <MemoryRouter initialEntries={["/c/s1"]}>
++        <ForkDialogContextProvider
++          value={{ currentSessionId: "s1", canFork, disabledReason, openForkDialog }}
++        >
++          <Where />
++          <ComposerWorkspaceBar data-testid="composer-workspace-controls">
++            <AeActionDock sessionId="s1" onSwitchModel={noModelMenu ? undefined : onSwitchModel} />
++          </ComposerWorkspaceBar>
++        </ForkDialogContextProvider>
++      </MemoryRouter>
++    </QueryClientProvider>,
++  );
++  return { onSwitchModel, openForkDialog };
++}
++
++describe("AeActionDock usage gate", () => {
++  afterEach(() => useChatStore.setState({ sessionHarness: null }));
++
++  it("leads with the limit and its three buttons", async () => {
++    serveLimits(() => limitsAnswer(92));
++    renderLimitDock();
++    const lead = await screen.findByTestId("ae-dock-lead");
++    expect(lead.textContent).toContain("AE Default is at 92% of its weekly limit, resets");
++    expect(within(lead).getByTestId("ae-dock-limit-model")).toBeTruthy();
++    expect(await within(lead).findByTestId("ae-dock-limit-account")).toBeTruthy();
++    expect(within(lead).getByTestId("ae-dock-limit-new")).toBeTruthy();
++    expect(within(lead).getByTestId("ae-dock-dismiss")).toBeTruthy();
++  });
++
++  it("draws nothing below 90 percent", async () => {
++    serveLimits(() => limitsAnswer(89));
++    renderLimitDock();
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
++    expect(screen.queryByTestId("ae-action-dock")).toBeNull();
++  });
++
++  it("each button calls its handler", async () => {
++    serveLimits(() => limitsAnswer(95));
++    const { onSwitchModel, openForkDialog } = renderLimitDock();
++    fireEvent.click(await screen.findByTestId("ae-dock-limit-model"));
++    expect(onSwitchModel).toHaveBeenCalledTimes(1);
++    fireEvent.click(await screen.findByTestId("ae-dock-limit-account"));
++    expect(openForkDialog).toHaveBeenCalledTimes(1);
++    expect(screen.getByTestId("where").textContent).toBe("/c/s1");
++    fireEvent.click(screen.getByTestId("ae-dock-limit-new"));
++    expect(screen.getByTestId("where").textContent).toBe("/");
++  });
++
++  it("hides Switch account with no other login", async () => {
++    serveLimits(() => limitsAnswer(95), [TWO_LOGINS[0]]);
++    renderLimitDock();
++    await screen.findByTestId("ae-dock-limit-new");
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        expect.stringContaining("/credentials/detected"),
++      ),
++    );
++    expect(screen.queryByTestId("ae-dock-limit-account")).toBeNull();
++  });
++
++  it("hides Switch account on Codex", async () => {
++    serveLimits(() => limitsAnswer(95, "codex"));
++    renderLimitDock({ harness: "codex-native" });
++    expect(await screen.findByTestId("ae-dock-limit-new")).toBeTruthy();
++    expect(screen.getByTestId("ae-dock-lead").textContent).toContain("95% of its weekly limit");
++    expect(screen.queryByTestId("ae-dock-limit-account")).toBeNull();
++  });
++
++  for (const [why, opts] of [
++    ["cannot be forked", { canFork: false }],
++    ["has a fork restriction", { disabledReason: "Forking is off for this session." }],
++  ] as const) {
++    it(`hides Switch account when the session ${why}`, async () => {
++      serveLimits(() => limitsAnswer(95));
++      renderLimitDock(opts);
++      await screen.findByTestId("ae-dock-limit-new");
++      await waitFor(() =>
++        expect(authenticatedFetch).toHaveBeenCalledWith(
++          expect.stringContaining("/credentials/detected"),
++        ),
++      );
++      expect(screen.queryByTestId("ae-dock-limit-account")).toBeNull();
++    });
++  }
++
++  it("Switch model is absent without a model menu to open", async () => {
++    serveLimits(() => limitsAnswer(95));
++    renderLimitDock({ noModelMenu: true });
++    await screen.findByTestId("ae-dock-limit-new");
++    expect(screen.queryByTestId("ae-dock-limit-model")).toBeNull();
++  });
++
++  it("a dismissal holds across a remount until the window resets", async () => {
++    let resets = RESETS;
++    serveLimits(() => limitsAnswer(93, "claude", resets));
++    renderLimitDock();
++    fireEvent.click(await screen.findByTestId("ae-dock-dismiss"));
++    expect(screen.queryByTestId("ae-action-dock")).toBeNull();
++    cleanup();
++    renderLimitDock();
++    const limitReads = () =>
++      vi
++        .mocked(authenticatedFetch)
++        .mock.calls.filter(([path]) => String(path).startsWith("/v1/ae/limits")).length;
++    await waitFor(() => expect(limitReads()).toBe(2));
++    await act(async () => {});
++    expect(screen.queryByTestId("ae-action-dock")).toBeNull();
++    cleanup();
++    resets = new Date(Date.now() + 9 * 86_400_000).toISOString();
++    renderLimitDock();
++    expect(await screen.findByTestId("ae-dock-limit-new")).toBeTruthy();
++  });
++});
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index 930060db3c527571dea37fedb4e246a0b973d743..cae03632f953654b79375f9da9ab90a1681bbbb9 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -1,6 +1,6 @@
+ // The action dock: what waits on the user in this chat (a question, a pull
+ // request ready to merge, a merge on its way to the box), inside the composer's
+-// workspace bar. The most urgent item sits after the folder and PR chips with
++// workspace bar, and an account near its usage limit. The most urgent item sits after the folder and PR chips with
+ // its button, a badge per other kind sits before the bar's right cluster, and
+ // the caret opens a list as a tray above the bar (designs E1 and D3b). An item
+ // hides while its own card is on screen. Nothing waiting draws nothing.
+@@ -22,30 +22,44 @@ import {
+ import {
+   AE_ICON_ARROW_DOWN,
+   AE_ICON_CHEVRON_UP,
++  AE_ICON_GAUGE,
+   AE_ICON_HELP_CIRCLE,
++  AE_ICON_MESSAGE_PLUS,
+   AE_ICON_ROCKET,
++  AE_ICON_SPARKLES,
++  AE_ICON_USER_SHARE,
+   AE_ICON_X,
+ } from "@/lib/aeActionDockIcons";
+ import { AE_ICON_CHEVRON_DOWN } from "@/lib/aeAgentsIcons";
+ import { AE_ICON_CHECK, AE_ICON_MERGE, AE_ICON_PR_OPEN } from "@/lib/aePrIcons";
++import { aeLimitGateShort, aeLimitGateText } from "@/lib/aeLimitGate";
+ import { AE_ADMIN_CENTER_PATH } from "@/lib/aePrDeploy";
+ import { aeCiText } from "@/lib/aePrs";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+-import { Link } from "@/lib/routing";
++import { Link, useNavigate } from "@/lib/routing";
+ import { cn } from "@/lib/utils";
++import { useForkDialog } from "@/shell/ForkDialogContext";
+ 
+ const GREEN = "text-emerald-600 dark:text-emerald-400";
+ const AMBER = "text-amber-600 dark:text-amber-400";
++const RED = "text-red-600 dark:text-red-400";
+ 
+ const KIND_STYLE: Record<AeDockKind, { icon: AeTablerIconNode; tone: string; tint: string }> = {
+   question: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
++  limit: { icon: AE_ICON_GAUGE, tone: RED, tint: "bg-red-500/15" },
+   merge: { icon: AE_ICON_PR_OPEN, tone: GREEN, tint: "bg-emerald-500/15" },
+   deploy: { icon: AE_ICON_ROCKET, tone: MERGED_TEXT, tint: "bg-purple-500/15" },
+ };
+ 
+ const ACTION = "h-6 shrink-0 px-2 text-xs";
+ 
++/** What the limit item's buttons do; ChatPage supplies the model menu opener. */
++export interface AeLimitActions {
++  onSwitchModel?: () => void;
++  onSwitchAccount?: () => void;
++}
++
+ /** Scroll the feed to the pending question's card. */
+ function jumpTo(anchor: string) {
+   const card = [...document.querySelectorAll("[data-ae-question]")].find(
+@@ -65,8 +79,27 @@ function ItemIcon({ item }: { item: AeDockItem }) {
+   );
+ }
+ 
+-/** The words after the icon: the question, or the number and its state. */
++/** The words after the icon: the question, the limit, or the number and its state. */
+ function ItemBody({ item, now, expanded }: { item: AeDockItem; now: number; expanded: boolean }) {
++  if (item.kind === "limit") {
++    const text = aeLimitGateText(item.gate, now);
++    return (
++      <>
++        <span
++          className={cn("min-w-0 truncate", !expanded && "hidden md:inline")}
++          title={text}
++          data-ae-lead-text=""
++        >
++          {text}
++        </span>
++        {!expanded && (
++          <span className="shrink-0 font-semibold whitespace-nowrap md:hidden" title={text}>
++            {aeLimitGateShort(item.gate)}
++          </span>
++        )}
++      </>
++    );
++  }
+   if (item.kind === "question") {
+     return (
+       <span className="min-w-0 truncate" title={item.text} data-ae-lead-text="">
+@@ -102,18 +135,130 @@ function ItemBody({ item, now, expanded }: { item: AeDockItem; now: number; expa
+   );
+ }
+ 
++function DismissButton({
++  label,
++  onClick,
++  className = "flex",
++}: {
++  label: string;
++  onClick: () => void;
++  className?: string;
++}) {
++  return (
++    <button
++      type="button"
++      className={cn(
++        "size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground",
++        className,
++      )}
++      aria-label={label}
++      title={label}
++      onClick={onClick}
++      data-testid="ae-dock-dismiss"
++    >
++      <AeTablerSvg node={AE_ICON_X} className="size-3.5" />
++    </button>
++  );
++}
++
++/**
++ * Icon and label from md up, the icon alone on a phone. The strip shows the
++ * short label so the limit's own words keep their room; the list the full one.
++ */
++/** Its own component so only a shown limit item needs a router (composer tests render without one). */
++function NewChatButton({ inList }: { inList: boolean }) {
++  const navigate = useNavigate();
++  return (
++    <LimitButton
++      icon={AE_ICON_MESSAGE_PLUS}
++      label="New chat"
++      short="New chat"
++      inList={inList}
++      onClick={() => navigate("/")}
++      testId="ae-dock-limit-new"
++    />
++  );
++}
++
++function LimitButton({
++  icon,
++  label,
++  short,
++  inList,
++  onClick,
++  testId,
++}: {
++  icon: AeTablerIconNode;
++  label: string;
++  short: string;
++  inList: boolean;
++  onClick: () => void;
++  testId: string;
++}) {
++  return (
++    <Button
++      variant="outline"
++      className={cn(ACTION, "w-6 px-0 md:w-auto md:px-2")}
++      aria-label={label}
++      title={label}
++      onClick={onClick}
++      data-testid={testId}
++    >
++      <AeTablerSvg node={icon} className="size-3" />
++      <span className="hidden md:inline">{inList ? label : short}</span>
++    </Button>
++  );
++}
++
+ function ItemActions({
+   item,
+   confirming,
+   onMerge,
+   onDismiss,
++  limitActions,
++  inList,
+ }: {
+   item: AeDockItem;
+   confirming: boolean;
+   onMerge: () => void;
+   onDismiss: () => void;
++  limitActions: AeLimitActions;
++  /** A line of the opened list, not the strip. */
++  inList: boolean;
+ }) {
+   switch (item.kind) {
++    case "limit":
++      return (
++        <>
++          {limitActions.onSwitchModel && (
++            <LimitButton
++              icon={AE_ICON_SPARKLES}
++              label="Switch model"
++              short="Model"
++              inList={inList}
++              onClick={limitActions.onSwitchModel}
++              testId="ae-dock-limit-model"
++            />
++          )}
++          {item.canSwitchAccount && limitActions.onSwitchAccount && (
++            <LimitButton
++              icon={AE_ICON_USER_SHARE}
++              label="Switch account"
++              short="Account"
++              inList={inList}
++              onClick={limitActions.onSwitchAccount}
++              testId="ae-dock-limit-account"
++            />
++          )}
++          <NewChatButton inList={inList} />
++          {/* A phone strip has no room for it; the opened list has. */}
++          <DismissButton
++            label="Dismiss until this limit resets"
++            onClick={onDismiss}
++            className={inList ? "flex" : "hidden md:flex"}
++          />
++        </>
++      );
+     case "question":
+       return (
+         <Button
+@@ -150,15 +295,7 @@ function ItemActions({
+               </Link>
+             </Button>
+           )}
+-          <button
+-            type="button"
+-            className="flex size-6 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
+-            aria-label={`Dismiss #${item.number}`}
+-            onClick={onDismiss}
+-            data-testid="ae-dock-dismiss"
+-          >
+-            <AeTablerSvg node={AE_ICON_X} className="size-3.5" />
+-          </button>
++          <DismissButton label={`Dismiss #${item.number}`} onClick={onDismiss} />
+         </>
+       );
+   }
+@@ -256,11 +393,26 @@ function useAeBadgeCompaction(
+ }
+ 
+ /** Nothing outside a query client (isolated composer tests render without one). */
+-export function AeActionDock({ sessionId }: { sessionId?: string }) {
+-  return useContext(QueryClientContext) ? <Dock sessionId={sessionId} /> : null;
++export function AeActionDock({
++  sessionId,
++  onSwitchModel,
++}: {
++  sessionId?: string;
++  /** Opens the composer's model menu (the limit item's Switch model). */
++  onSwitchModel?: () => void;
++}) {
++  return useContext(QueryClientContext) ? (
++    <Dock sessionId={sessionId} onSwitchModel={onSwitchModel} />
++  ) : null;
+ }
+ 
+-function Dock({ sessionId }: { sessionId?: string }) {
++function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?: () => void }) {
++  const forkDialog = useForkDialog();
++  const limitActions: AeLimitActions = {
++    onSwitchModel,
++    // A full clone of this session, history included; the dialog's account row picks the login.
++    onSwitchAccount: forkDialog ? () => forkDialog.openForkDialog() : undefined,
++  };
+   const onScreen = useAeCardsOnScreen();
+   const { items, dismiss } = useAeActionDockItems(sessionId, onScreen);
+   // Always starts closed: an open tray left over from an earlier visit would
+@@ -337,9 +489,10 @@ function Dock({ sessionId }: { sessionId?: string }) {
+         }}
+       />
+     ) : null;
+-  const actions = (item: AeDockItem) => (
++  const actions = (item: AeDockItem, inList: boolean) => (
+     <ItemActions
+       item={item}
++      inList={inList}
+       confirming={confirming === item.key}
+       onMerge={() => {
+         // The strip has no room for the confirm step: it opens in the list.
+@@ -352,6 +505,7 @@ function Dock({ sessionId }: { sessionId?: string }) {
+         setConfirming((key) => (key === item.key ? null : item.key));
+       }}
+       onDismiss={() => dismiss(item.anchor)}
++      limitActions={limitActions}
+     />
+   );
+   const { lead } = summary;
+@@ -386,7 +540,7 @@ function Dock({ sessionId }: { sessionId?: string }) {
+           >
+             <ItemIcon item={lead} />
+             <ItemBody item={lead} now={now} expanded={liveNotice} />
+-            {actions(lead)}
++            {actions(lead, false)}
+             {summary.more > 0 && (
+               <span className="shrink-0 whitespace-nowrap text-muted-foreground">
+                 +{summary.more}
+@@ -455,7 +609,7 @@ function Dock({ sessionId }: { sessionId?: string }) {
+                   <ItemIcon item={item} />
+                   <ItemBody item={item} now={now} expanded />
+                   <span className="flex-1" />
+-                  {actions(item)}
++                  {actions(item, true)}
+                 </div>
+                 {confirmFor(item)}
+               </li>
+diff --git a/web/src/hooks/useAeActionDockItems.ts b/web/src/hooks/useAeActionDockItems.ts
+index 5d6d1e02a9fef78f1c306bdcd9a41ace4d165e82..fc51b89fc1ad06022614862948476b350e4c5a63 100644
+--- a/web/src/hooks/useAeActionDockItems.ts
++++ b/web/src/hooks/useAeActionDockItems.ts
+@@ -6,6 +6,7 @@
+ import { useQueries, useQuery } from "@tanstack/react-query";
+ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+ import { AE_PR_POLL_MS } from "@/components/AePrCards";
++import { useAeLimitGate } from "@/hooks/useAeLimitGate";
+ import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+ import {
+   type AeDeployTrack,
+@@ -237,9 +238,11 @@ export function useAeActionDockItems(
+   }, [track, now]);
+ 
+   const questions = useDockQuestions(sessionId);
++  const limit = useAeLimitGate(sessionId);
+   const items = aeDockArrange(
+     [
+       ...aeDockQuestions(questions),
++      ...(limit.item ? [limit.item] : []),
+       ...aeDockMerges(withCards),
+       ...aeDockDeploys(withCards, deploys, track, dismissedDeploys, now),
+     ],
+@@ -248,6 +251,7 @@ export function useAeActionDockItems(
+   return {
+     items,
+     dismiss: (anchor) => {
++      if (anchor === limit.item?.anchor) return limit.dismiss();
+       dismissedDeploys.add(anchor);
+       setDismissals((n) => n + 1);
+     },
+diff --git a/web/src/hooks/useAeLimitGate.ts b/web/src/hooks/useAeLimitGate.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd6b7f586e4f0d8bb6b07a06e99bc4524a91b9c3
+--- /dev/null
++++ b/web/src/hooks/useAeLimitGate.ts
+@@ -0,0 +1,93 @@
++// The action dock's usage gate item: the session's own limits answer (one
++// shared query per session, refetched each minute), the gate over it, and
++// dismissals that last until that window resets. omnigent-ae, 2026-10-21.
++
++import { useState } from "react";
++import { useAeLimits } from "@/components/AePlanLimits";
++import { aeLimitsHarnessFor } from "@/components/aeSessionContext";
++import { useDetectedCredentials } from "@/hooks/useHosts";
++import { useSession } from "@/hooks/useSession";
++import type { AeDockLimit } from "@/lib/aeActionDock";
++import {
++  type AeLimitDismissal,
++  aeHasOtherClaudeAccount,
++  aeLimitGate,
++  aeLimitGateDismiss,
++} from "@/lib/aeLimitGate";
++import { AE_CLAUDE_ACCOUNT_LABEL } from "@/shell/AeForkClaudeAccount";
++import { useForkDialog } from "@/shell/ForkDialogContext";
++import { useChatStore } from "@/store/chatStore";
++
++/**
++ * One list for every chat: the window is the account's, so a dismissal in one
++ * chat holds in the others on that account. Bounded by AE_LIMIT_GATE_DISMISS_KEEP.
++ */
++const DISMISSED_KEY = "ae-action-dock:limit-dismissed";
++
++function readDismissed(): AeLimitDismissal[] | null {
++  try {
++    const raw: unknown = JSON.parse(window.localStorage.getItem(DISMISSED_KEY) ?? "[]");
++    if (!Array.isArray(raw)) return [];
++    return raw.filter(
++      (d): d is AeLimitDismissal =>
++        !!d &&
++        typeof d === "object" &&
++        typeof (d as AeLimitDismissal).window === "string" &&
++        (typeof (d as AeLimitDismissal).resets === "number" ||
++          (d as AeLimitDismissal).resets === null),
++    );
++  } catch {
++    return null;
++  }
++}
++
++function writeDismissed(dismissed: readonly AeLimitDismissal[]) {
++  try {
++    window.localStorage.setItem(DISMISSED_KEY, JSON.stringify(dismissed));
++  } catch {
++    // Storage off: the dismissal lasts until the page reloads.
++  }
++}
++
++export function useAeLimitGate(sessionId: string | undefined): {
++  item: AeDockLimit | null;
++  dismiss: () => void;
++} {
++  const harness = useChatStore((s) =>
++    sessionId && s.conversationId === sessionId ? aeLimitsHarnessFor(s.sessionHarness) : null,
++  );
++  const { data } = useAeLimits(Boolean(sessionId && harness), sessionId);
++  const [dismissed, setDismissed] = useState(() => readDismissed() ?? []);
++  const gate = aeLimitGate(data, harness, Date.now(), dismissed);
++  const claude = gate?.harness === "claude";
++  // Read only while a Claude gate shows: the host's logins and the session's own.
++  const { session } = useSession(claude ? sessionId : null);
++  const credentials = useDetectedCredentials(session?.hostId, claude);
++  const forkDialog = useForkDialog();
++  if (!gate) return { item: null, dismiss: () => {} };
++  // The opener forks the shell's own session and does nothing while a reason blocks it.
++  const forkable =
++    Boolean(forkDialog?.canFork) &&
++    !forkDialog?.disabledReason &&
++    forkDialog?.currentSessionId === sessionId;
++  const canSwitchAccount =
++    claude &&
++    forkable &&
++    aeHasOtherClaudeAccount(credentials.data ?? [], session?.labels?.[AE_CLAUDE_ACCOUNT_LABEL]);
++  return {
++    item: {
++      kind: "limit",
++      key: `limit:${gate.windowKey}`,
++      anchor: `limit:${gate.windowKey}`,
++      order: 0,
++      gate,
++      canSwitchAccount,
++    },
++    dismiss: () => {
++      // Another chat may have dismissed since this one mounted: start from storage.
++      const next = aeLimitGateDismiss(readDismissed() ?? dismissed, gate);
++      writeDismissed(next);
++      setDismissed(next);
++    },
++  };
++}
+diff --git a/web/src/lib/aeActionDock.ts b/web/src/lib/aeActionDock.ts
+index 99277bd9841165a683601407021a905d025fb813..67258988b784d6f603b3638ae589119428e2a06a 100644
+--- a/web/src/lib/aeActionDock.ts
++++ b/web/src/lib/aeActionDock.ts
+@@ -2,13 +2,17 @@
+ // first. Pure, so ordering, badges, hiding and the deploy lifecycle are
+ // unit-tested (aeActionDock.test.ts). omnigent-ae, 2026-10-20.
+ 
++import { type AeLimitGate, aeLimitGateShort } from "@/lib/aeLimitGate";
+ import { type AePrDeploy, aeHasDeployState } from "@/lib/aePrDeploy";
+ import { type AePrCard, aeCiText, aeReadyToMerge } from "@/lib/aePrs";
+ 
+-export type AeDockKind = "question" | "merge" | "deploy";
++export type AeDockKind = "question" | "limit" | "merge" | "deploy";
+ 
+-/** Urgency: a question blocks the agent, a merge waits on a click, a deploy only on time. */
+-export const AE_DOCK_KINDS: readonly AeDockKind[] = ["question", "merge", "deploy"];
++/**
++ * Urgency: a question blocks the agent, a usage limit is about to, a merge
++ * waits on a click, a deploy only on time.
++ */
++export const AE_DOCK_KINDS: readonly AeDockKind[] = ["question", "limit", "merge", "deploy"];
+ 
+ /** A deploy item that went live stays this long, then clears. */
+ export const AE_DOCK_LIVE_MS = 60_000;
+@@ -45,7 +49,15 @@ export interface AeDockDeploy extends ItemBase {
+   liveAt: number | null;
+ }
+ 
+-export type AeDockItem = AeDockQuestion | AeDockMerge | AeDockDeploy;
++/** The account's 5-hour or weekly window at or past the gate (aeLimitGate.ts). */
++export interface AeDockLimit extends ItemBase {
++  kind: "limit";
++  gate: AeLimitGate;
++  /** A fork onto another account is possible: a Claude session, another login, fork allowed. */
++  canSwitchAccount: boolean;
++}
++
++export type AeDockItem = AeDockQuestion | AeDockLimit | AeDockMerge | AeDockDeploy;
+ 
+ /** "owner/repo#123", the inline card's and merged row's `data-ae-pr`. */
+ export function aeDockPrAnchor(repo: string, number: number): string {
+@@ -215,6 +227,8 @@ export function aeDockBadgeLabel(
+   switch (first.kind) {
+     case "question":
+       return many ? `${items.length} questions` : "Question waiting";
++    case "limit":
++      return aeLimitGateShort(first.gate);
+     case "merge":
+       return many ? `${items.length} to merge` : `#${first.number} ready`;
+     case "deploy": {
+diff --git a/web/src/lib/aeActionDockIcons.ts b/web/src/lib/aeActionDockIcons.ts
+index 77f259cf0f964df2a67ae7a7938d6fa19338bae7..f961a052d66ea106da31043ec5a378fbebb84d7c 100644
+--- a/web/src/lib/aeActionDockIcons.ts
++++ b/web/src/lib/aeActionDockIcons.ts
+@@ -24,3 +24,33 @@ export const AE_ICON_X = paths("M18 6l-12 12", "M6 6l12 12");
+ export const AE_ICON_CHEVRON_UP = paths("M6 15l6 -6l6 6");
+ 
+ export const AE_ICON_ARROW_DOWN = paths("M12 5l0 14", "M18 13l-6 6", "M6 13l6 6");
++
++/** `gauge`: an account near its usage limit. */
++export const AE_ICON_GAUGE = paths(
++  "M3 12a9 9 0 1 0 18 0a9 9 0 1 0 -18 0",
++  "M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0",
++  "M13.41 10.59l2.59 -2.59",
++  "M7 12a5 5 0 0 1 5 -5",
++);
++
++/** `sparkles`: switch model. */
++export const AE_ICON_SPARKLES = paths(
++  "M16 18a2 2 0 0 1 2 2a2 2 0 0 1 2 -2a2 2 0 0 1 -2 -2a2 2 0 0 1 -2 2m0 -12a2 2 0 0 1 2 2a2 2 0 0 1 2 -2a2 2 0 0 1 -2 -2a2 2 0 0 1 -2 2m-7 12a6 6 0 0 1 6 -6a6 6 0 0 1 -6 -6a6 6 0 0 1 -6 6a6 6 0 0 1 6 6",
++);
++
++/** `user-share`: switch account. */
++export const AE_ICON_USER_SHARE = paths(
++  "M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0",
++  "M6 21v-2a4 4 0 0 1 4 -4h3",
++  "M16 22l5 -5",
++  "M21 21.5v-4.5h-4.5",
++);
++
++/** `message-plus`: a new chat. */
++export const AE_ICON_MESSAGE_PLUS = paths(
++  "M8 9h8",
++  "M8 13h6",
++  "M12.01 18.594l-4.01 2.406v-3h-2a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v5.5",
++  "M16 19h6",
++  "M19 16v6",
++);
+diff --git a/web/src/lib/aeLimitGate.test.ts b/web/src/lib/aeLimitGate.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..73d973351ea0674f0ae5c2681ac9d01a3e74d253
+--- /dev/null
++++ b/web/src/lib/aeLimitGate.test.ts
+@@ -0,0 +1,207 @@
++import { describe, expect, it } from "vitest";
++import type { AeLimitWindow, AeLimitsAnswer } from "@/components/AePlanLimits";
++import {
++  AE_LIMIT_GATE_PERCENT,
++  aeHasOtherClaudeAccount,
++  aeHeadlineWindows,
++  aeLimitGate,
++  aeLimitGateShort,
++  AE_LIMIT_GATE_DISMISS_KEEP,
++  type AeLimitDismissal,
++  aeLimitDismissed,
++  aeLimitGateDismiss,
++  aeLimitGateText,
++} from "./aeLimitGate";
++
++const NOW = Date.parse("2026-10-21T12:00:00Z");
++const IN_2H = "2026-10-21T14:00:00Z";
++const IN_2D = "2026-10-23T09:00:00Z";
++const NEXT_WEEK = "2026-10-30T09:00:00Z";
++
++function win(id: string, used: number, resets: string | null, minutes: number | null) {
++  return {
++    id,
++    label: id,
++    used_percent: used,
++    resets_at: resets,
++    window_minutes: minutes,
++  } satisfies AeLimitWindow;
++}
++
++const five = (used: number, resets: string | null = IN_2H) => win("five_hour", used, resets, 300);
++const week = (used: number, resets: string | null = IN_2D) => win("seven_day", used, resets, 10080);
++
++function answer(
++  windows: AeLimitWindow[],
++  over: { account?: string | null; account_label?: string | null } = {},
++): AeLimitsAnswer {
++  return {
++    now: new Date(NOW).toISOString(),
++    harnesses: {
++      claude: {
++        harness: "claude",
++        source: "statusline",
++        observed_at: new Date(NOW).toISOString(),
++        plan: null,
++        windows,
++        note: null,
++        ...over,
++      },
++    },
++  };
++}
++
++describe("aeLimitGate", () => {
++  it("is 90 percent", () => {
++    expect(AE_LIMIT_GATE_PERCENT).toBe(90);
++  });
++
++  for (const [name, make] of [
++    ["5-hour", (used: number) => [five(used), week(10)]],
++    ["weekly", (used: number) => [five(10), week(used)]],
++  ] as const) {
++    it(`${name}: none below 90, a gate at and above it`, () => {
++      expect(aeLimitGate(answer(make(89.9)), "claude", NOW)).toBeNull();
++      const at = aeLimitGate(answer(make(90)), "claude", NOW);
++      expect(at).toMatchObject({ span: name, percent: 90 });
++      const above = aeLimitGate(answer(make(97.6)), "claude", NOW);
++      expect(above).toMatchObject({ span: name, percent: 98 });
++    });
++  }
++
++  it("the fullest window wins", () => {
++    expect(aeLimitGate(answer([five(95), week(92)]), "claude", NOW)?.span).toBe("5-hour");
++    expect(aeLimitGate(answer([five(91), week(96)]), "claude", NOW)?.span).toBe("weekly");
++  });
++
++  it("a tie goes to the window that resets later", () => {
++    expect(aeLimitGate(answer([five(93), week(93)]), "claude", NOW)?.span).toBe("weekly");
++  });
++
++  it("no windows, no answer or no harness gives no gate", () => {
++    expect(aeLimitGate(answer([]), "claude", NOW)).toBeNull();
++    expect(aeLimitGate(undefined, "claude", NOW)).toBeNull();
++    expect(aeLimitGate(answer([five(99)]), null, NOW)).toBeNull();
++    expect(aeLimitGate(answer([five(99)]), "codex", NOW)).toBeNull();
++  });
++
++  it("ignores per-model weekly rows and a window that already reset", () => {
++    const opus = win("seven_day.model.opus", 99, IN_2D, 10080);
++    expect(aeLimitGate(answer([five(10), week(10), opus]), "claude", NOW)).toBeNull();
++    expect(aeLimitGate(answer([five(99, "2026-10-21T11:00:00Z")]), "claude", NOW)).toBeNull();
++  });
++
++  it("picks Codex's windows by length and names the account", () => {
++    const codex: AeLimitsAnswer = {
++      now: new Date(NOW).toISOString(),
++      harnesses: {
++        codex: {
++          harness: "codex",
++          source: "codex",
++          observed_at: new Date(NOW).toISOString(),
++          plan: null,
++          note: null,
++          windows: [win("codex.primary", 40, IN_2H, 300), win("codex.secondary", 91, IN_2D, 10080)],
++        },
++      },
++    };
++    expect(aeHeadlineWindows(codex.harnesses.codex!.windows).week?.id).toBe("codex.secondary");
++    expect(aeLimitGate(codex, "codex", NOW)).toMatchObject({ label: "Codex", span: "weekly" });
++  });
++
++  it("labels the account", () => {
++    const named = aeLimitGate(
++      answer([week(92)], { account: "ae", account_label: "AE Default" }),
++      "claude",
++      NOW,
++    );
++    expect(named?.label).toBe("AE Default");
++    expect(aeLimitGate(answer([week(92)]), "claude", NOW)?.label).toBe("Default CLI account");
++  });
++
++  it("reads like the brief", () => {
++    const gate = aeLimitGate(answer([week(92.4)], { account_label: "AE Default" }), "claude", NOW)!;
++    expect(aeLimitGateText(gate, NOW, () => "Thu 09:00")).toBe(
++      "AE Default is at 92% of its weekly limit, resets Thu 09:00",
++    );
++    expect(aeLimitGateShort(gate)).toBe("92% weekly");
++    const noReset = aeLimitGate(answer([week(92, null)]), "claude", NOW)!;
++    expect(aeLimitGateText(noReset, NOW)).toBe("Default CLI account is at 92% of its weekly limit");
++  });
++});
++
++describe("dismiss", () => {
++  const gateOf = (windows: AeLimitWindow[], dismissed: AeLimitDismissal[] = []) =>
++    aeLimitGate(answer(windows), "claude", NOW, dismissed);
++
++  it("holds until resets_at changes, then the gate returns", () => {
++    const first = gateOf([week(92)])!;
++    const dismissed = aeLimitGateDismiss([], first);
++    expect(gateOf([week(92)], dismissed)).toBeNull();
++    // Later readings of the same window, seconds apart and fuller, across the half hour too.
++    expect(gateOf([week(95, "2026-10-23T09:00:07Z")], dismissed)).toBeNull();
++    const halfHour = aeLimitGateDismiss([], gateOf([week(92, "2026-10-23T09:29:58Z")])!);
++    expect(gateOf([week(93, "2026-10-23T09:30:01Z")], halfHour)).toBeNull();
++    // The next window.
++    expect(gateOf([week(91, NEXT_WEEK)], dismissed)?.span).toBe("weekly");
++  });
++
++  it("a dismissed fuller window does not hide the other one", () => {
++    const fiveHour = gateOf([five(95), week(91)])!;
++    expect(fiveHour.span).toBe("5-hour");
++    const dismissed = aeLimitGateDismiss([], fiveHour);
++    expect(gateOf([five(95), week(91)], dismissed)?.span).toBe("weekly");
++  });
++
++  it("dismissing one window keeps the other's dismissal", () => {
++    let dismissed = aeLimitGateDismiss([], gateOf([five(92), week(20)])!);
++    dismissed = aeLimitGateDismiss(dismissed, gateOf([five(92), week(93)], dismissed)!);
++    expect(gateOf([five(94), week(93)], dismissed)).toBeNull();
++  });
++
++  it("a dismissal is the account's, not another account's", () => {
++    const dismissed = aeLimitGateDismiss([], gateOf([week(92)])!);
++    const other = aeLimitGate(
++      answer([week(92)], { account: "personal" }),
++      "claude",
++      NOW,
++      dismissed,
++    );
++    expect(other?.account).toBe("personal");
++  });
++
++  it("keeps the newest dismissals only, one per window", () => {
++    let dismissed: AeLimitDismissal[] = [];
++    for (let i = 0; i < AE_LIMIT_GATE_DISMISS_KEEP + 3; i++) {
++      const gate = aeLimitGate(answer([week(92)], { account: `a${i}` }), "claude", NOW)!;
++      dismissed = aeLimitGateDismiss(dismissed, gate);
++    }
++    const last = aeLimitGate(answer([week(92)], { account: "a10" }), "claude", NOW)!;
++    dismissed = aeLimitGateDismiss(dismissed, last);
++    expect(dismissed).toHaveLength(AE_LIMIT_GATE_DISMISS_KEEP);
++    expect(dismissed.at(-1)?.window).toBe(last.windowKey);
++    expect(dismissed.filter((d) => d.window === last.windowKey)).toHaveLength(1);
++    expect(aeLimitDismissed(dismissed, "claude|a0|seven_day", IN_2D)).toBe(false);
++  });
++});
++
++describe("aeHasOtherClaudeAccount", () => {
++  const rows = [
++    { family: "claude-oauth-active", env_var: "" },
++    { family: "claude-oauth", env_var: "personal" },
++  ];
++
++  it("is true when the host has a login other than the session's", () => {
++    expect(aeHasOtherClaudeAccount(rows, undefined)).toBe(true);
++    expect(aeHasOtherClaudeAccount(rows, "personal")).toBe(true);
++  });
++
++  it("is false with one login, or on provider credentials", () => {
++    expect(aeHasOtherClaudeAccount([rows[0]!], undefined)).toBe(false);
++    expect(aeHasOtherClaudeAccount([rows[0]!], "")).toBe(false);
++    expect(aeHasOtherClaudeAccount([...rows, { family: "claude-provider-bedrock" }], "")).toBe(
++      false,
++    );
++    expect(aeHasOtherClaudeAccount([], undefined)).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeLimitGate.ts b/web/src/lib/aeLimitGate.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b00c2a9a21be8a076e9b359e23e0ab2f297c737e
+--- /dev/null
++++ b/web/src/lib/aeLimitGate.ts
+@@ -0,0 +1,211 @@
++// The usage gate: when the account a chat runs on reaches
++// AE_LIMIT_GATE_PERCENT of its 5-hour or weekly window, the action dock offers
++// a way out (another model, another account, a new chat) before the session
++// runs into the limit. It never blocks sending. Pure, so the threshold, the
++// window pick and the dismiss rule are unit-tested (aeLimitGate.test.ts).
++// Fed by the session's own `GET /v1/ae/limits?session_id=` answer, which
++// already carries the windows of the account that session runs on.
++// omnigent-ae, 2026-10-21.
++
++import type { AeHarness, AeLimitWindow, AeLimitsAnswer } from "@/components/AePlanLimits";
++
++/** The gate's one step: either headline window at or past this percent. */
++export const AE_LIMIT_GATE_PERCENT = 90;
++
++const FIVE_HOUR_MINUTES = 300;
++const WEEK_MINUTES = 7 * 24 * 60;
++const HOUR_MS = 3_600_000;
++
++/** What the server calls the default CLI login when it has no label for it. */
++export const AE_DEFAULT_ACCOUNT_LABEL = "Default CLI account";
++
++export type AeLimitSpan = "5-hour" | "weekly";
++
++export interface AeLimitGate {
++  harness: AeHarness;
++  /** The backup account name; null is the default login (or Codex's one login). */
++  account: string | null;
++  /** "AE Default", "Default CLI account", "Codex". */
++  label: string;
++  windowId: string;
++  /** The window across sessions: harness, account and window id. */
++  windowKey: string;
++  span: AeLimitSpan;
++  /** Whole percent, rounded as the usage popover rounds it. */
++  percent: number;
++  resetsAt: string | null;
++}
++
++/** One dismissed window and the reset it was dismissed for. */
++export interface AeLimitDismissal {
++  window: string;
++  resets: number | null;
++}
++
++/**
++ * The 5-hour and the weekly window, as the server's `headline_windows` picks
++ * them: Claude's by id (`five_hour`, `seven_day`; never a per-model weekly
++ * row), Codex's by length, the first of each.
++ */
++export function aeHeadlineWindows(windows: readonly AeLimitWindow[]): {
++  five: AeLimitWindow | null;
++  week: AeLimitWindow | null;
++} {
++  const five =
++    windows.find((w) => w.id === "five_hour") ??
++    windows.find((w) => w.window_minutes === FIVE_HOUR_MINUTES) ??
++    null;
++  const week =
++    windows.find((w) => w.id === "seven_day") ??
++    windows.find((w) => w.window_minutes === WEEK_MINUTES && !w.id.startsWith("seven_day")) ??
++    null;
++  return { five, week };
++}
++
++function resetMs(resetsAt: string | null): number | null {
++  const at = resetsAt ? Date.parse(resetsAt) : Number.NaN;
++  return Number.isFinite(at) ? at : null;
++}
++
++export function aeLimitWindowKey(
++  harness: AeHarness,
++  account: string | null,
++  windowId: string,
++): string {
++  return [harness, account ?? "", windowId].join("|");
++}
++
++/**
++ * Whether this window's reading falls under a standing dismissal. Readings
++ * of one window differ by seconds; the next window resets at least five
++ * hours later, so a reset within the hour is the same window.
++ */
++export function aeLimitDismissed(
++  dismissed: readonly AeLimitDismissal[],
++  windowKey: string,
++  resetsAt: string | null,
++): boolean {
++  const at = resetMs(resetsAt);
++  return dismissed.some(
++    (d) =>
++      d.window === windowKey &&
++      (d.resets === null || at === null ? d.resets === at : Math.abs(d.resets - at) < HOUR_MS),
++  );
++}
++
++/** Dismissals kept: both windows of a few accounts. */
++export const AE_LIMIT_GATE_DISMISS_KEEP = 8;
++
++/** The dismissals after one more; a window keeps only its newest. */
++export function aeLimitGateDismiss(
++  dismissed: readonly AeLimitDismissal[],
++  gate: AeLimitGate,
++): AeLimitDismissal[] {
++  return [
++    ...dismissed.filter((d) => d.window !== gate.windowKey),
++    { window: gate.windowKey, resets: resetMs(gate.resetsAt) },
++  ].slice(-AE_LIMIT_GATE_DISMISS_KEEP);
++}
++
++/**
++ * The gate for one session's limits answer, or null when no window is at
++ * the threshold and not dismissed. The fullest of those windows wins, so a
++ * dismissed 5-hour gate never hides a weekly one; on a tie, the one that
++ * resets later (the longer wait). A window whose reset has passed waits for
++ * a new reading.
++ */
++export function aeLimitGate(
++  answer: AeLimitsAnswer | null | undefined,
++  harness: AeHarness | null,
++  now: number,
++  dismissed: readonly AeLimitDismissal[] = [],
++  threshold: number = AE_LIMIT_GATE_PERCENT,
++): AeLimitGate | null {
++  if (!harness) return null;
++  const snapshot = answer?.harnesses?.[harness];
++  if (!snapshot || !Array.isArray(snapshot.windows)) return null;
++  const account = snapshot.account ?? null;
++  const { five, week } = aeHeadlineWindows(snapshot.windows);
++  let pick: { window: AeLimitWindow; span: AeLimitSpan } | null = null;
++  for (const [window, span] of [
++    [five, "5-hour"],
++    [week, "weekly"],
++  ] as const) {
++    if (!window || !Number.isFinite(window.used_percent)) continue;
++    if (window.used_percent < threshold) continue;
++    const at = resetMs(window.resets_at);
++    if (at !== null && at <= now) continue;
++    if (
++      aeLimitDismissed(dismissed, aeLimitWindowKey(harness, account, window.id), window.resets_at)
++    )
++      continue;
++    const laterReset = pick !== null && (at ?? 0) > (resetMs(pick.window.resets_at) ?? 0);
++    if (
++      !pick ||
++      window.used_percent > pick.window.used_percent ||
++      (window.used_percent === pick.window.used_percent && laterReset)
++    ) {
++      pick = { window, span };
++    }
++  }
++  if (!pick) return null;
++  const fallback = harness === "codex" ? "Codex" : (account ?? AE_DEFAULT_ACCOUNT_LABEL);
++  return {
++    harness,
++    account,
++    label: snapshot.account_label?.trim() || fallback,
++    windowId: pick.window.id,
++    windowKey: aeLimitWindowKey(harness, account, pick.window.id),
++    span: pick.span,
++    percent: Math.round(pick.window.used_percent),
++    resetsAt: pick.window.resets_at,
++  };
++}
++
++/** "9:00 AM" today, "Thu 9:00 AM" on another day, in the viewer's clock. */
++export function aeLimitResetClock(iso: string, now: number): string {
++  const date = new Date(iso);
++  const clock = date.toLocaleTimeString(undefined, { hour: "numeric", minute: "2-digit" });
++  if (new Date(now).toDateString() === date.toDateString()) return clock;
++  return `${date.toLocaleDateString(undefined, { weekday: "short" })} ${clock}`;
++}
++
++/** "AE Default is at 92% of its weekly limit, resets Thu 09:00". */
++export function aeLimitGateText(
++  gate: AeLimitGate,
++  now: number,
++  clock: (iso: string, now: number) => string = aeLimitResetClock,
++): string {
++  const head = `${gate.label} is at ${gate.percent}% of its ${gate.span} limit`;
++  const at = gate.resetsAt ? Date.parse(gate.resetsAt) : Number.NaN;
++  return Number.isFinite(at) ? `${head}, resets ${clock(gate.resetsAt!, now)}` : head;
++}
++
++/** The phone line and the badge: "92% weekly". */
++export function aeLimitGateShort(gate: AeLimitGate): string {
++  return `${gate.percent}% ${gate.span}`;
++}
++
++/** The fields of a detected credential row the account check reads. */
++export interface AeLimitCredentialRow {
++  family: string;
++  env_var?: string | null;
++}
++
++/**
++ * Whether the host offers a Claude login other than the one this session
++ * runs on, so a fork onto another account has somewhere to go. Mirrors the
++ * fork dialog's account row: none on a host signed in with provider
++ * credentials. `currentAccount` is the session's account label; without
++ * one the session runs on the host's active login.
++ */
++export function aeHasOtherClaudeAccount(
++  rows: readonly AeLimitCredentialRow[],
++  currentAccount: string | null | undefined,
++): boolean {
++  if (rows.some((row) => row.family.startsWith("claude-provider"))) return false;
++  const logins = rows.filter((row) => row.family.startsWith("claude-oauth"));
++  const active = logins.find((row) => row.family === "claude-oauth-active");
++  const current = currentAccount ?? active?.env_var ?? "";
++  return logins.some((row) => (row.env_var ?? "") !== current);
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 695c1acab6792ada8491578831446c31681a138c..d2d579795f70e8448588e591a2e4cf1c25182664 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3602,7 +3602,15 @@ function ComposerImpl(
+             onOpen={openComposerGithubTab}
+           />
+           <AeTokenDefrag key={conversationId} />
+-          <AeActionDock key={`ae-dock:${conversationId}`} sessionId={conversationId ?? undefined} />
++          <AeActionDock
++            key={`ae-dock:${conversationId}`}
++            sessionId={conversationId ?? undefined}
++            onSwitchModel={
++              showModels && codexModelOptions.length > 0 && !isReadOnly && !unreachable
++                ? () => setPickerOpenNonce((n) => n + 1)
++                : undefined
++            }
++          />
+           <div className="ml-auto flex min-w-0 shrink-0 items-center gap-1">
+             <div
+               data-testid="composer-task-indicators"

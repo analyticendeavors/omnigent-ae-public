@@ -1,0 +1,2340 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 11:16:16 -0700
+Subject: [PATCH 077/148] [ae-patch] Show a native Claude session's live
+ progress line in the chat's Working row
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+While Claude Code streams one long tool call (a Write of a 400-line file,
+say), it writes nothing to the transcript until the call finishes, so the web
+chat showed only a generic "Working" row while the terminal showed a live
+spinner such as "Crunching... (4m 42s, 24.5k tokens)". The "last activity"
+aside also read "just now" because usage, status and cost posts stamped it.
+
+The forwarder now parses the spinner line from the pane capture it already
+takes every two seconds (ae_pane_progress) and posts a transient
+external_session_progress event when the line changes, plus one clear when it
+goes away. The server validates it (label up to 40 characters, elapsed up to
+20, tokens up to 30) and publishes it as a transient session.progress SSE
+event; nothing is persisted.
+
+The chat store keeps the latest line per conversation and clears it when an
+item or tool row lands, when the session stops running, and on a rebind. The
+Working row shows "Crunching · 4m 42s · 24.5k tokens" when no tool step is
+known, and "no output yet; a long step may be writing" after a minute with no
+content. "Last activity" now counts only content events (text, reasoning,
+items, tool output), not usage, status, model, presence or progress events.
+
+Review fixes folded in:
+- A line no post refreshed for 30 seconds is dropped from the row, so a
+  stalled forwarder or a dropped host never leaves a frozen line.
+- The relay posts when the label or token count changes, otherwise at most
+  every 10 seconds, and sends elapsed_s; the row ticks the elapsed time
+  locally in the terminal's format.
+- The pane parse finds the input box with the same opening-rule logic as
+  the composer check (now _composer_opening_rule), so a short pane with an
+  earlier rule still finds the spinner.
+- A failed capture, a pane with no input box, or a visible /btw overlay
+  reads as unknown: nothing is posted or cleared.
+- A /clear or /fork rotation clears the line it left on the old session,
+  and session.superseded clears it in the web.
+- The switch to running stamps last activity, so a turn starting after a
+  long idle does not read as quiet; the no-output hint dates from the later
+  of the last content and the turn start.
+- The type string and field bounds live in omnigent/util/ae_session_progress
+  and are shared by the forwarder and the route.
+---
+ .../claude_native/ae_pane_progress.py         | 258 ++++++++++++++
+ omnigent/harnesses/claude_native/bridge.py    |  38 +-
+ omnigent/harnesses/claude_native/forwarder.py |  16 +
+ .../routes/_sessions/ae_session_progress.py   | 100 ++++++
+ omnigent/server/routes/_sessions/common.py    |   4 +
+ .../server/routes/sessions/routes_events.py   |  13 +
+ omnigent/server/schemas.py                    |  30 ++
+ omnigent/util/ae_session_progress.py          |  20 ++
+ openapi.json                                  |  92 +++++
+ .../integration/test_ae_session_progress.py   | 125 +++++++
+ tests/test_ae_pane_progress.py                | 330 ++++++++++++++++++
+ web/src/components/AeSessionActivity.tsx      |  60 +++-
+ web/src/components/AeSessionProgress.test.tsx | 138 ++++++++
+ web/src/hooks/aeSessionActivityHooks.ts       |   5 +
+ web/src/lib/aeSessionProgress.test.ts         | 145 ++++++++
+ web/src/lib/aeSessionProgress.ts              | 158 +++++++++
+ web/src/lib/aeStreamObserver.ts               |  38 ++
+ web/src/lib/events.ts                         |   2 +
+ web/src/lib/sse.ts                            |   2 +
+ web/src/store/aeLastEventAt.test.ts           |  19 +-
+ web/src/store/aeSessionProgress.test.ts       | 211 +++++++++++
+ web/src/store/chatStore.ts                    |  11 +-
+ web/src/store/conversationState.ts            |   2 +
+ 23 files changed, 1799 insertions(+), 18 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_pane_progress.py
+ create mode 100644 omnigent/server/routes/_sessions/ae_session_progress.py
+ create mode 100644 omnigent/util/ae_session_progress.py
+ create mode 100644 tests/server/integration/test_ae_session_progress.py
+ create mode 100644 tests/test_ae_pane_progress.py
+ create mode 100644 web/src/components/AeSessionProgress.test.tsx
+ create mode 100644 web/src/lib/aeSessionProgress.test.ts
+ create mode 100644 web/src/lib/aeSessionProgress.ts
+ create mode 100644 web/src/lib/aeStreamObserver.ts
+ create mode 100644 web/src/store/aeSessionProgress.test.ts
+
+diff --git a/omnigent/harnesses/claude_native/ae_pane_progress.py b/omnigent/harnesses/claude_native/ae_pane_progress.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..57e0c067b8fe7a7b294c0ebc890f2d8d45210552
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_pane_progress.py
+@@ -0,0 +1,258 @@
++"""
++Relay Claude Code's live spinner line to the web chat.
++
++While Claude streams one long tool call (a Write of a 400-line file, say), the
++transcript stays silent until the call finishes, so the web chat had nothing to
++show but a generic "Working" row. The terminal meanwhile shows a spinner line
++such as ``✻ Crunching… (4m 42s · ↓ 24.5k tokens)``. The forwarder already
++captures the pane every couple of seconds; this module parses that line from
++the capture and posts it as a transient ``external_session_progress`` event.
++"""
++
++from __future__ import annotations
++
++import logging
++import re
++import time
++from collections.abc import Callable
++from dataclasses import dataclass
++from typing import Final, Literal
++
++import httpx
++
++from omnigent.util.ae_session_progress import (
++    EXTERNAL_SESSION_PROGRESS_TYPE,
++    MAX_ELAPSED_CHARS,
++    MAX_ELAPSED_S,
++    MAX_LABEL_CHARS,
++    MAX_TOKENS_CHARS,
++)
++
++_logger = logging.getLogger(__name__)
++
++# A steady spinner is re-posted this often so the web knows it is still live
++# (the web drops a line that has not been refreshed for 30 seconds).
++PROGRESS_REFRESH_S: Final = 10.0
++
++# How far above the input box the spinner may sit (todo rows render under it).
++_SCAN_LINES_ABOVE_BOX = 25
++
++# Claude Code's spinner, drawn at column 0: one glyph, one capitalized word
++# ending in an ellipsis, then a parenthesized group that opens with the elapsed
++# time. Transcript text is indented, so an echoed spinner line cannot match.
++SPINNER_LINE_RE = re.compile(
++    r"^[·✢✳✶✻✽*∗] "
++    r"(?P<label>[A-Z][a-z]+(?:-[a-z]+)*'?)(?:…|\.\.\.) "
++    r"\((?P<elapsed>(?:(?P<h>\d+)h(?: (?P<hm>\d+)m)?(?: (?P<hs>\d+)s)?)"
++    r"|(?:(?P<m>\d+)m(?: (?P<ms>\d+)s)?)|(?:(?P<s>\d+)s))"
++    r"(?P<rest>(?: · [^()]*)?)\)"
++)
++_TOKENS_SEGMENT_RE = re.compile(r"^(?:[↑↓] ?)?(?P<tokens>\d[\d,]*(?:\.\d+)?[kKmM]? tokens)$")
++
++
++@dataclass(frozen=True)
++class PaneProgress:
++    """
++    The live spinner line Claude Code draws while a turn is generating.
++
++    :param label: The spinner's verb, e.g. ``"Crunching"``.
++    :param elapsed: Elapsed text as drawn, e.g. ``"4m 42s"``.
++    :param elapsed_s: The same elapsed time in seconds, e.g. ``282``.
++    :param tokens: Token text without its arrow, e.g. ``"24.5k tokens"``, or
++        ``None`` when the line shows no count.
++    """
++
++    label: str
++    elapsed: str
++    elapsed_s: int
++    tokens: str | None = None
++
++
++# The capture could not tell whether a spinner shows (it failed, no input box
++# is on screen, or the /btw overlay covers the region). Never posted or cleared.
++PROGRESS_UNKNOWN: Final = "unknown"
++PaneProgressRead = PaneProgress | Literal["unknown"] | None
++
++
++def _group_int(match: re.Match[str], *names: str) -> int:
++    """Sum of the named numeric groups that matched, e.g. hours or minutes."""
++    return sum(int(match.group(name)) for name in names if match.group(name) is not None)
++
++
++def progress_from_line(line: str) -> PaneProgress | None:
++    """
++    Parse one pane line as a Claude Code spinner line.
++
++    :param line: A single captured pane line, e.g.
++        ``"✻ Crunching… (4m 42s · ↓ 24.5k tokens)"``.
++    :returns: The parsed progress, or ``None`` for any other wording.
++    """
++    match = SPINNER_LINE_RE.match(line.rstrip())
++    if match is None:
++        return None
++    label = match.group("label")
++    elapsed = match.group("elapsed")
++    elapsed_s = (
++        _group_int(match, "h") * 3600
++        + _group_int(match, "hm", "m") * 60
++        + _group_int(match, "hs", "ms", "s")
++    )
++    if len(label) > MAX_LABEL_CHARS or len(elapsed) > MAX_ELAPSED_CHARS:
++        return None
++    if elapsed_s > MAX_ELAPSED_S:
++        return None
++    tokens: str | None = None
++    for segment in match.group("rest").split(" · "):
++        found = _TOKENS_SEGMENT_RE.match(segment.strip())
++        if found is not None and len(found.group("tokens")) <= MAX_TOKENS_CHARS:
++            tokens = found.group("tokens")
++            break
++    return PaneProgress(label=label, elapsed=elapsed, elapsed_s=elapsed_s, tokens=tokens)
++
++
++def progress_from_pane(
++    pane: str,
++    *,
++    find_box_opener: Callable[[list[str]], int | None],
++    btw_overlay_shown: Callable[[str], bool],
++) -> PaneProgressRead:
++    """
++    Find the live spinner line in a captured pane.
++
++    The spinner sits just above the input box, so the scan starts at the box's
++    opening rule and walks up a bounded window.
++
++    :param pane: Captured pane text; ``""`` when the capture failed.
++    :param find_box_opener: The bridge's input-box locator, given the pane's
++        non-blank lines.
++    :param btw_overlay_shown: The bridge's ``/btw`` overlay test.
++    :returns: The newest spinner line's progress, ``None`` when no spinner
++        shows, or :data:`PROGRESS_UNKNOWN` when the pane cannot tell.
++    """
++    if not pane.strip() or btw_overlay_shown(pane):
++        return PROGRESS_UNKNOWN
++    lines = [line for line in pane.splitlines() if line.strip()]
++    end = find_box_opener(lines)
++    if end is None:
++        return PROGRESS_UNKNOWN
++    for line in reversed(lines[max(0, end - _SCAN_LINES_ABOVE_BOX) : end]):
++        progress = progress_from_line(line)
++        if progress is not None:
++            return progress
++    return None
++
++
++@dataclass
++class ProgressRelayState:
++    """
++    What the relay last delivered for one session.
++
++    :param posted: The last progress posted, or ``None`` when nothing is shown
++        (never posted, or the clear was delivered).
++    :param posted_at: Monotonic time of that post, ``0.0`` before any.
++    """
++
++    posted: PaneProgress | None = None
++    posted_at: float = 0.0
++
++
++async def post_external_session_progress(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    progress: PaneProgress | None,
++) -> None:
++    """
++    Post one transient ``external_session_progress`` event.
++
++    :param client: Omnigent HTTP client.
++    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
++    :param progress: The spinner to show, or ``None`` to clear it.
++    :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
++    """
++    data: dict[str, str | int | None]
++    if progress is None:
++        data = {"label": None}
++    else:
++        data = {
++            "label": progress.label,
++            "elapsed": progress.elapsed,
++            "elapsed_s": progress.elapsed_s,
++            "tokens": progress.tokens,
++        }
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": EXTERNAL_SESSION_PROGRESS_TYPE, "data": data},
++    )
++    resp.raise_for_status()
++
++
++def _is_due(progress: PaneProgress | None, state: ProgressRelayState, now: float) -> bool:
++    """Whether this read differs from the last post, or a steady line needs a refresh."""
++    posted = state.posted
++    if progress is None or posted is None:
++        return progress != posted
++    if (progress.label, progress.tokens) != (posted.label, posted.tokens):
++        return True
++    return progress != posted and now - state.posted_at >= PROGRESS_REFRESH_S
++
++
++async def relay_progress(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    progress: PaneProgressRead,
++    state: ProgressRelayState,
++) -> None:
++    """
++    Post the pane's spinner line when it changed, or refresh a steady one.
++
++    A new label or token count posts at once; an elapsed-only change posts at
++    most every :data:`PROGRESS_REFRESH_S`, since the web ticks the elapsed time
++    itself. A spinner that disappears posts one clear; an unknown read posts
++    nothing. Best effort: a failed POST leaves ``state`` untouched so the next
++    poll retries, and never raises.
++
++    :param client: Omnigent HTTP client.
++    :param session_id: Omnigent session/conversation id.
++    :param progress: This poll's read of the pane.
++    :param state: Per-session relay state; mutated in place.
++    """
++    if progress == PROGRESS_UNKNOWN:
++        return
++    now = time.monotonic()
++    if not _is_due(progress, state, now):
++        return
++    try:
++        await post_external_session_progress(client, session_id=session_id, progress=progress)
++    except httpx.HTTPError:
++        _logger.debug(
++            "external_session_progress post failed; session=%s",
++            session_id,
++            exc_info=True,
++            extra={"session_id": session_id},
++        )
++        return
++    state.posted = progress
++    state.posted_at = now
++
++
++async def clear_progress_on_rotation(
++    client: httpx.AsyncClient,
++    *,
++    old_session_id: str,
++    state: ProgressRelayState,
++) -> None:
++    """
++    Clear a spinner line left on a session that ``/clear`` or ``/fork`` rotated away.
++
++    The forwarder drops its dedupe state on rotation, so without this the old
++    conversation would keep the last line it was sent. Best effort, never raises.
++
++    :param client: Omnigent HTTP client.
++    :param old_session_id: The superseded session/conversation id.
++    :param state: The old session's relay state.
++    """
++    if state.posted is None:
++        return
++    await relay_progress(client, session_id=old_session_id, progress=None, state=state)
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 9e8a0fad4bfbec4d8c4318def88ef8faba788339..eb6bd3e179010648913148ad6cdfed07313bb238 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -71,6 +71,11 @@ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
+ from omnigent.harnesses.claude_native import delivery_diagnostics
+ from omnigent.harnesses.claude_native import transcript_filters
+ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
++from omnigent.harnesses.claude_native.ae_pane_progress import (
++    PROGRESS_UNKNOWN,
++    PaneProgressRead,
++    progress_from_pane,
++)
+ from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+ from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
+ from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+@@ -4879,10 +4884,13 @@ class PaneSignals:
+         ``"auto"``, or ``None`` when no mode footer is visible.
+     :param btw_overlay: A settled ``/btw`` side-chat overlay, or ``None``
+         when none is shown / it is still generating.
++    :param progress: The live spinner line, ``None`` when none is drawn, or
++        :data:`PROGRESS_UNKNOWN` when the capture cannot tell.
+     """
+ 
+     permission_mode: str | None = None
+     btw_overlay: BtwOverlay | None = None
++    progress: PaneProgressRead = PROGRESS_UNKNOWN
+ 
+ 
+ def _btw_overlay_from_pane(pane: str) -> BtwOverlay | None:
+@@ -5836,17 +5844,28 @@ def _composer_row(pane: str) -> str | None:
+         mode, or ``None`` when no input box is on screen.
+     """
+     non_empty = [line for line in pane.splitlines() if line.strip()]
++    opening = _composer_opening_rule(non_empty)
++    return None if opening is None else non_empty[opening + 1]
++
++
++def _composer_opening_rule(non_empty: list[str]) -> int | None:
++    """
++    Index of the input box's opening rule among a pane's non-blank lines.
++
++    See :func:`_composer_row` for why the opening rule is the second-lowest
++    rule, or the lowest when the pane is too short to show the closing one.
++
++    :param non_empty: The pane's non-blank lines, top to bottom.
++    :returns: The opening rule's index, or ``None`` when no input box shows.
++    """
+     rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+     if not rules:
+         return None
+-    candidates = [rules[-2] + 1] if len(rules) >= 2 else []
+-    candidates.append(rules[-1] + 1)
++    candidates = [rules[-2]] if len(rules) >= 2 else []
++    candidates.append(rules[-1])
+     for idx in candidates:
+-        if idx >= len(non_empty):
+-            continue
+-        row = non_empty[idx]
+-        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
+-            return row
++        if idx + 1 < len(non_empty) and non_empty[idx + 1].strip()[:1] in _COMPOSER_MODE_GLYPHS:
++            return idx
+     return None
+ 
+ 
+@@ -7750,6 +7769,11 @@ def read_pane_signals(bridge_dir: Path) -> PaneSignals:
+     return PaneSignals(
+         permission_mode=_permission_mode_from_pane(pane),
+         btw_overlay=_btw_overlay_from_pane(pane),
++        progress=progress_from_pane(
++            pane,
++            find_box_opener=_composer_opening_rule,
++            btw_overlay_shown=_btw_overlay_present,
++        ),
+     )
+ 
+ 
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index c18f67010bca85e49f03d79ebd72e8ea7a8fed57..0cea1d1f7b003cf76dd40fe09eea6904d0b500c4 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -21,6 +21,11 @@ import httpx
+ from omnigent.debug_logging import debug_event
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.errors import ErrorCode
++from omnigent.harnesses.claude_native.ae_pane_progress import (
++    ProgressRelayState,
++    clear_progress_on_rotation,
++    relay_progress,
++)
+ from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
+ from omnigent.harnesses.claude_native.bridge import (
+     BRIDGE_ID_LABEL_KEY,
+@@ -907,6 +912,8 @@ class _ForwardDedupeState:
+     # Session already logged as moved off this runner, so the notice is not
+     # repeated for every item dropped afterwards.
+     session_not_bound_logged_for: str | None = None
++    # Live spinner line last relayed as ``external_session_progress``.
++    progress_relay: ProgressRelayState = field(default_factory=ProgressRelayState)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -1348,6 +1355,9 @@ async def forward_claude_transcript_to_session(
+                             new_session_id=rotation,
+                             agent_name=agent_name,
+                         )
++                        await clear_progress_on_rotation(
++                            client, old_session_id=session_id, state=dedupe.progress_relay
++                        )
+                         session_id = rotation
+                         state = None
+                         hook_state = None
+@@ -1389,6 +1399,9 @@ async def forward_claude_transcript_to_session(
+                     if rotation is not None:
+                         await _cancel_subagent_forward_task(subagent_task)
+                         subagent_task = None
++                        await clear_progress_on_rotation(
++                            client, old_session_id=session_id, state=dedupe.progress_relay
++                        )
+                         session_id = rotation
+                         state = None
+                         hook_state = None
+@@ -5759,6 +5772,9 @@ async def _forward_pane_signals(
+     await _relay_btw_overlay(
+         client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
+     )
++    await relay_progress(
++        client, session_id=session_id, progress=signals.progress, state=dedupe.progress_relay
++    )
+ 
+ 
+ async def _relay_permission_mode(
+diff --git a/omnigent/server/routes/_sessions/ae_session_progress.py b/omnigent/server/routes/_sessions/ae_session_progress.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b0c070a6d3b908d8dd368fb093495e461e8e2a47
+--- /dev/null
++++ b/omnigent/server/routes/_sessions/ae_session_progress.py
+@@ -0,0 +1,100 @@
++"""
++Publish a terminal agent's live spinner line to the session stream.
++
++The claude-native forwarder posts ``external_session_progress`` with the
++spinner Claude Code draws while a turn generates (``✻ Crunching… (4m 42s ·
++↓ 24.5k tokens)``). This validates the payload and broadcasts it as a
++transient ``session.progress`` event; nothing is persisted. The type string
++and bounds come from :mod:`omnigent.util.ae_session_progress`, which the
++forwarder shares.
++"""
++
++from __future__ import annotations
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.server.routes._sessions.common import session_stream
++from omnigent.server.schemas import SessionEventInput, SessionProgressEvent
++from omnigent.util.ae_session_progress import (
++    EXTERNAL_SESSION_PROGRESS_TYPE,
++    MAX_ELAPSED_CHARS,
++    MAX_ELAPSED_S,
++    MAX_LABEL_CHARS,
++    MAX_TOKENS_CHARS,
++    SESSION_PROGRESS_SSE_TYPE,
++)
++
++__all__ = ["EXTERNAL_SESSION_PROGRESS_TYPE", "publish_external_session_progress"]
++
++_FIELD_LIMITS: dict[str, int] = {
++    "label": MAX_LABEL_CHARS,
++    "elapsed": MAX_ELAPSED_CHARS,
++    "tokens": MAX_TOKENS_CHARS,
++}
++
++
++def _invalid(message: str) -> OmnigentError:
++    """Build the route's 400 for a malformed progress payload."""
++    return OmnigentError(
++        f"{EXTERNAL_SESSION_PROGRESS_TYPE} {message}", code=ErrorCode.INVALID_INPUT
++    )
++
++
++def _bounded_text(body: SessionEventInput, key: str, *, required: bool) -> str | None:
++    """
++    Read one optional or required bounded string field from ``body.data``.
++
++    :param body: ``POST /events`` body.
++    :param key: Field name, e.g. ``"elapsed"``.
++    :param required: Whether ``None`` (or absence) is rejected.
++    :returns: The stripped value, or ``None`` when absent and allowed.
++    :raises OmnigentError: When the value is not a non-empty string within its limit.
++    """
++    value = body.data.get(key)
++    if value is None and not required:
++        return None
++    limit = _FIELD_LIMITS[key]
++    if not isinstance(value, str) or not value.strip() or len(value) > limit:
++        raise _invalid(f"data.{key} must be a non-empty string of at most {limit} characters")
++    return value.strip()
++
++
++def _elapsed_seconds(body: SessionEventInput) -> int | None:
++    """
++    Read the optional ``data.elapsed_s`` field.
++
++    :param body: ``POST /events`` body.
++    :returns: Whole seconds, or ``None`` when absent.
++    :raises OmnigentError: When it is not an integer between 0 and a week.
++    """
++    value = body.data.get("elapsed_s")
++    if value is None:
++        return None
++    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= MAX_ELAPSED_S:
++        raise _invalid(f"data.elapsed_s must be an integer from 0 to {MAX_ELAPSED_S}")
++    return value
++
++
++def publish_external_session_progress(session_id: str, body: SessionEventInput) -> None:
++    """
++    Broadcast a terminal-observed spinner line, or its clear.
++
++    ``data.label`` ``None`` clears the line; otherwise ``label`` and
++    ``elapsed`` are required and ``elapsed_s`` and ``tokens`` are optional.
++
++    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
++    :param body: ``POST /events`` body whose type is
++        :data:`EXTERNAL_SESSION_PROGRESS_TYPE`.
++    :raises OmnigentError: When a field has the wrong type or bounds.
++    """
++    if body.data.get("label") is None:
++        event = SessionProgressEvent(type=SESSION_PROGRESS_SSE_TYPE, conversation_id=session_id)
++    else:
++        event = SessionProgressEvent(
++            type=SESSION_PROGRESS_SSE_TYPE,
++            conversation_id=session_id,
++            label=_bounded_text(body, "label", required=True),
++            elapsed=_bounded_text(body, "elapsed", required=True),
++            elapsed_s=_elapsed_seconds(body),
++            tokens=_bounded_text(body, "tokens", required=False),
++        )
++    session_stream.publish(session_id, event.model_dump())
+diff --git a/omnigent/server/routes/_sessions/common.py b/omnigent/server/routes/_sessions/common.py
+index 523c433d46c9a86a13cff07cb83c5a48ecf3a8bf..88a0b1772bd6f5c656372701e28280606b9f1a74 100644
+--- a/omnigent/server/routes/_sessions/common.py
++++ b/omnigent/server/routes/_sessions/common.py
+@@ -57,6 +57,7 @@ from omnigent.spec.types import (
+     StateUpdate,
+ )
+ from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
++from omnigent.util.ae_session_progress import EXTERNAL_SESSION_PROGRESS_TYPE
+ 
+ # Pinned to the historical module path so log records keep landing on the
+ # ``omnigent.server.routes.sessions`` logger after the split into this package.
+@@ -117,6 +118,8 @@ _EXTERNAL_ELICITATION_RESOLVED_TYPE: str = "external_elicitation_resolved"
+ 
+ 
+ _EXTERNAL_SESSION_STATUS_TYPE: str = "external_session_status"
++# The terminal's live spinner line; see ae_session_progress.
++_EXTERNAL_SESSION_PROGRESS_TYPE: str = EXTERNAL_SESSION_PROGRESS_TYPE
+ 
+ 
+ _SUBAGENT_STATUS_TYPE: str = "subagent.status"
+@@ -569,6 +572,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
+     _EXTERNAL_BTW_DISMISS_TYPE,
+     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+     _EXTERNAL_SESSION_STATUS_TYPE,
++    _EXTERNAL_SESSION_PROGRESS_TYPE,
+     _SUBAGENT_STATUS_TYPE,
+     _EXTERNAL_SESSION_USAGE_TYPE,
+     _EXTERNAL_COMPACTION_STATUS_TYPE,
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 05e8cbbeb6d14785a9d77d942a24c24d5020e9cf..c93bf9e1879e760f6b2c18a2bc8690e560468ff2 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -107,6 +107,10 @@ from omnigent.server.routes._auth_helpers import (
+     require_user as _require_user,
+ )
+ from omnigent.server.routes._errors import session_not_found as _session_not_found
++from omnigent.server.routes._sessions.ae_session_progress import (
++    EXTERNAL_SESSION_PROGRESS_TYPE,
++    publish_external_session_progress,
++)
+ from omnigent.server.routes._sessions.common import (
+     _ALLOWED_EVENT_TYPES,
+     _APPROVAL_TYPE,
+@@ -318,6 +322,7 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
+         _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
+         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+         _EXTERNAL_SESSION_USAGE_TYPE,
++        EXTERNAL_SESSION_PROGRESS_TYPE,
+     }
+ )
+ 
+@@ -922,6 +927,10 @@ def register_events_routes(
+         - ``"external_session_status"`` publishes a terminal-observed
+           ``session.status`` edge without persisting an item or
+           starting/steering a task.
++        - ``"external_session_progress"`` publishes a transient
++          ``session.progress`` event carrying the terminal's live spinner
++          line (``label``, ``elapsed``, ``tokens``; ``label`` null clears
++          it), without persisting an item or starting / steering a task.
+         - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
+           for transcript inactivity without forwarding a completion
+           to the runner.
+@@ -1052,6 +1061,7 @@ def register_events_routes(
+             _EXTERNAL_BTW_DISMISS_TYPE,
+             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+             _EXTERNAL_SESSION_STATUS_TYPE,
++            EXTERNAL_SESSION_PROGRESS_TYPE,
+             _SUBAGENT_STATUS_TYPE,
+             _EXTERNAL_SESSION_USAGE_TYPE,
+             _EXTERNAL_COMPACTION_STATUS_TYPE,
+@@ -1814,6 +1824,9 @@ def register_events_routes(
+         if body.type == _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE:
+             _publish_external_tool_output_delta(session_id, body)
+             return {"queued": False}
++        if body.type == EXTERNAL_SESSION_PROGRESS_TYPE:
++            publish_external_session_progress(session_id, body)
++            return {"queued": False}
+         if body.type == _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE:
+             _publish_external_output_reasoning_delta(session_id, body)
+             return {"queued": False}
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index fbfef74ba4606262163240873f12a24cdd4872e5..0564ba180b6af0940c2e381099f76a105281689d 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -3770,6 +3770,35 @@ class SessionBtwSidechatEvent(_SSEEventBase):
+     truncated: bool = False
+ 
+ 
++class SessionProgressEvent(_SSEEventBase):
++    """
++    The live spinner line a terminal-backed agent is drawing.
++
++    Claude Code writes a tool call to its transcript only after it finishes
++    streaming, so a long call leaves the chat with nothing to show. The
++    claude-native forwarder reads the pane's spinner line (``✻ Crunching…
++    (4m 42s · ↓ 24.5k tokens)``) and relays it so the Working row can show it.
++
++    Category: **transient** (SSE-only). Nothing is persisted and there is no
++    replay. ``label`` is ``None`` when the spinner went away.
++
++    :param type: Always ``"session.progress"``.
++    :param conversation_id: The conversation whose stream this rides.
++    :param label: The spinner verb, e.g. ``"Crunching"``, or ``None`` to clear.
++    :param elapsed: Elapsed text as drawn, e.g. ``"4m 42s"``.
++    :param elapsed_s: The same elapsed time in seconds, e.g. ``282``, so a
++        client can tick it between posts.
++    :param tokens: Token text, e.g. ``"24.5k tokens"``.
++    """
++
++    type: Literal["session.progress"]
++    conversation_id: str
++    label: str | None = None
++    elapsed: str | None = None
++    elapsed_s: int | None = None
++    tokens: str | None = None
++
++
+ # ── Response pass-through events (response.*) ──────────────────────
+ 
+ 
+@@ -4766,6 +4795,7 @@ ServerStreamEvent = Annotated[
+     | SessionCreatedEvent
+     | SessionSupersededEvent
+     | SessionBtwSidechatEvent
++    | SessionProgressEvent
+     | SessionPresenceEvent
+     # ── Transient (SSE-only) — session resource lifecycle ─────
+     | SessionResourceCreatedEvent
+diff --git a/omnigent/util/ae_session_progress.py b/omnigent/util/ae_session_progress.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..697c558318963dac360dbb64ffdf98c021d9533f
+--- /dev/null
++++ b/omnigent/util/ae_session_progress.py
+@@ -0,0 +1,20 @@
++"""
++The wire contract for a terminal agent's live spinner line.
++
++Shared by the claude-native forwarder (which posts the event) and the
++sessions route (which validates and publishes it), so the type string and
++field bounds cannot drift apart.
++"""
++
++from __future__ import annotations
++
++from typing import Final
++
++EXTERNAL_SESSION_PROGRESS_TYPE: Final = "external_session_progress"
++SESSION_PROGRESS_SSE_TYPE: Final = "session.progress"
++
++MAX_LABEL_CHARS: Final = 40
++MAX_ELAPSED_CHARS: Final = 20
++MAX_TOKENS_CHARS: Final = 30
++# A week; anything longer is a parse error, not a turn.
++MAX_ELAPSED_S: Final = 7 * 24 * 3600
+diff --git a/openapi.json b/openapi.json
+index 94c25776f15ccea32ff9db83896f12dc40d7cecf..b7565fa873796189a9c0bb76b24ae3f47f8eb7b2 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -5632,6 +5632,7 @@
+             "session.model_options": "#/components/schemas/SessionModelOptionsEvent",
+             "session.permission_mode": "#/components/schemas/SessionPermissionModeEvent",
+             "session.presence": "#/components/schemas/SessionPresenceEvent",
++            "session.progress": "#/components/schemas/SessionProgressEvent",
+             "session.reasoning_effort": "#/components/schemas/SessionReasoningEffortEvent",
+             "session.resource.created": "#/components/schemas/SessionResourceCreatedEvent",
+             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
+@@ -5708,6 +5709,9 @@
+           {
+             "$ref": "#/components/schemas/SessionBtwSidechatEvent"
+           },
++          {
++            "$ref": "#/components/schemas/SessionProgressEvent"
++          },
+           {
+             "$ref": "#/components/schemas/SessionPresenceEvent"
+           },
+@@ -7102,6 +7106,94 @@
+         "title": "SessionPresenceEvent",
+         "type": "object"
+       },
++      "SessionProgressEvent": {
++        "description": "The live spinner line a terminal-backed agent is drawing.\n\nClaude Code writes a tool call to its transcript only after it finishes\nstreaming, so a long call leaves the chat with nothing to show. The\nclaude-native forwarder reads the pane's spinner line (`\u273b Crunching\u2026 (4m 42s \u00b7 \u2193 24.5k tokens)`) and relays it so the Working row can show it.\n\nCategory: **transient** (SSE-only). Nothing is persisted and there is no\nreplay. `label` is `None` when the spinner went away.",
++        "properties": {
++          "conversation_id": {
++            "description": "The conversation whose stream this rides.",
++            "title": "Conversation Id",
++            "type": "string"
++          },
++          "elapsed": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "description": "Elapsed text as drawn, e.g. `\"4m 42s\"`.",
++            "title": "Elapsed"
++          },
++          "elapsed_s": {
++            "anyOf": [
++              {
++                "format": "int64",
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "description": "The same elapsed time in seconds, e.g. `282`, so a client can tick it between posts.",
++            "title": "Elapsed S"
++          },
++          "label": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "description": "The spinner verb, e.g. `\"Crunching\"`, or `None` to clear.",
++            "title": "Label"
++          },
++          "sequence_number": {
++            "anyOf": [
++              {
++                "format": "int64",
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Sequence Number"
++          },
++          "tokens": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "description": "Token text, e.g. `\"24.5k tokens\"`.",
++            "title": "Tokens"
++          },
++          "type": {
++            "const": "session.progress",
++            "description": "Always `\"session.progress\"`.",
++            "title": "Type",
++            "type": "string"
++          }
++        },
++        "required": [
++          "type",
++          "conversation_id"
++        ],
++        "title": "SessionProgressEvent",
++        "type": "object"
++      },
+       "SessionProjectSummary": {
+         "description": "One entry of `GET /v1/sessions/projects` \u2014 a sidebar project folder.\n\nDual-read union of first-class projects and legacy `omni_project`\nlabel-projects, keyed by name.",
+         "properties": {
+diff --git a/tests/server/integration/test_ae_session_progress.py b/tests/server/integration/test_ae_session_progress.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5aaad363fb2167dd29e0b54c30e66d3e836ad8e9
+--- /dev/null
++++ b/tests/server/integration/test_ae_session_progress.py
+@@ -0,0 +1,125 @@
++"""Tests for the transient ``external_session_progress`` session event."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import httpx
++import pytest
++
++from tests.server.helpers import create_test_agent
++
++pytestmark = pytest.mark.asyncio
++
++
++async def _session_with_capture(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
++    """Create a session and capture what the route publishes to its stream."""
++    published: list[tuple[str, dict[str, Any]]] = []
++    monkeypatch.setattr(
++        "omnigent.server.routes.sessions.session_stream.publish",
++        lambda session_id, event: published.append((session_id, event)),
++    )
++    agent = await create_test_agent(client)
++    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert resp.status_code == 201, resp.text
++    return resp.json()["id"], published
++
++
++async def test_progress_is_published_as_a_transient_session_progress(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The spinner line reaches the stream as ``session.progress`` and nothing persists."""
++    session_id, published = await _session_with_capture(client, monkeypatch)
++
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={
++            "type": "external_session_progress",
++            "data": {
++                "label": "Crunching",
++                "elapsed": "4m 42s",
++                "elapsed_s": 282,
++                "tokens": "24.5k tokens",
++            },
++        },
++    )
++    assert resp.status_code == 202, resp.text
++    assert resp.json() == {"queued": False}
++    assert published == [
++        (
++            session_id,
++            {
++                "type": "session.progress",
++                "sequence_number": None,
++                "conversation_id": session_id,
++                "label": "Crunching",
++                "elapsed": "4m 42s",
++                "elapsed_s": 282,
++                "tokens": "24.5k tokens",
++            },
++        )
++    ]
++    items = await client.get(f"/v1/sessions/{session_id}/items")
++    assert items.status_code == 200, items.text
++    assert items.json()["data"] == []
++
++
++async def test_progress_clear_and_optional_tokens(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A null label clears the line, and tokens may be left out."""
++    session_id, published = await _session_with_capture(client, monkeypatch)
++
++    for data in ({"label": "Thinking", "elapsed": "12s"}, {"label": None}):
++        resp = await client.post(
++            f"/v1/sessions/{session_id}/events",
++            json={"type": "external_session_progress", "data": data},
++        )
++        assert resp.status_code == 202, resp.text
++
++    assert [(e["label"], e["elapsed"], e["elapsed_s"], e["tokens"]) for _, e in published] == [
++        ("Thinking", "12s", None, None),
++        (None, None, None, None),
++    ]
++
++
++@pytest.mark.parametrize(
++    "data",
++    [
++        {"label": "Crunching"},
++        {"label": 7, "elapsed": "12s"},
++        {"label": "", "elapsed": "12s"},
++        {"label": "x" * 41, "elapsed": "12s"},
++        {"label": "Crunching", "elapsed": "1" * 21},
++        {"label": "Crunching", "elapsed": "12s", "tokens": "9" * 31},
++        {"label": "Crunching", "elapsed": "12s", "tokens": 12},
++        {"label": "Crunching", "elapsed": "12s", "elapsed_s": -1},
++        {"label": "Crunching", "elapsed": "12s", "elapsed_s": "12"},
++        {"label": "Crunching", "elapsed": "12s", "elapsed_s": True},
++        {"label": "Crunching", "elapsed": "12s", "elapsed_s": 7 * 24 * 3600 + 1},
++    ],
++)
++async def test_progress_rejects_bad_shapes(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]
++) -> None:
++    """A missing, mistyped or overlong field is a 400 and publishes nothing."""
++    session_id, published = await _session_with_capture(client, monkeypatch)
++
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": "external_session_progress", "data": data},
++    )
++    assert resp.status_code == 400, resp.text
++    assert "external_session_progress" in resp.text
++    assert published == []
++
++
++async def test_progress_for_an_unknown_session_is_not_found(client: httpx.AsyncClient) -> None:
++    """The event goes through the same session lookup as its siblings."""
++    resp = await client.post(
++        "/v1/sessions/conv_does_not_exist/events",
++        json={"type": "external_session_progress", "data": {"label": None}},
++    )
++    assert resp.status_code == 404, resp.text
+diff --git a/tests/test_ae_pane_progress.py b/tests/test_ae_pane_progress.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b1d5792e7e3e7ceb41cc75f8ab3cf72b74326060
+--- /dev/null
++++ b/tests/test_ae_pane_progress.py
+@@ -0,0 +1,330 @@
++"""Tests for the claude-native live spinner parse and its relay."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++
++from omnigent.harnesses.claude_native import ae_pane_progress, forwarder
++from omnigent.harnesses.claude_native import bridge as claude_native_bridge
++from omnigent.harnesses.claude_native.ae_pane_progress import (
++    PROGRESS_REFRESH_S,
++    PROGRESS_UNKNOWN,
++    PaneProgress,
++    PaneProgressRead,
++    ProgressRelayState,
++    clear_progress_on_rotation,
++    progress_from_line,
++    progress_from_pane,
++    relay_progress,
++)
++from omnigent.harnesses.claude_native.bridge import PaneSignals
++from omnigent.server.routes._sessions import ae_session_progress as route_module
++from omnigent.util import ae_session_progress as contract
++
++_RULE = "────────────────────────────────"
++CRUNCHING = PaneProgress("Crunching", "4m 42s", 282, "24.5k tokens")
++
++
++def _pane(*above_box: str) -> str:
++    """Build a pane with transcript rows, the given rows, then input box and footer."""
++    return "\n".join(
++        [
++            "● Writing the report now.",
++            "",
++            *above_box,
++            "",
++            _RULE,
++            "❯ ",
++            _RULE,
++            "  ⏵⏵ auto mode on (shift+tab to cycle)",
++        ]
++    )
++
++
++def _read(pane: str) -> PaneProgressRead:
++    """Run the pane parse with the bridge's own box and /btw detectors."""
++    return progress_from_pane(
++        pane,
++        find_box_opener=claude_native_bridge._composer_opening_rule,
++        btw_overlay_shown=claude_native_bridge._btw_overlay_present,
++    )
++
++
++@pytest.mark.parametrize(
++    ("line", "expected"),
++    [
++        ("✻ Crunching… (4m 42s · ↓ 24.5k tokens)", CRUNCHING),
++        ("· Thinking… (12s · esc to interrupt)", PaneProgress("Thinking", "12s", 12, None)),
++        (
++            "✶ Pondering… (38s · ↑ 1.2k tokens · esc to interrupt)",
++            PaneProgress("Pondering", "38s", 38, "1.2k tokens"),
++        ),
++        (
++            "✽ Catapulting… (6m 47s · ↓ 37.7k tokens · esc to interrupt)",
++            PaneProgress("Catapulting", "6m 47s", 407, "37.7k tokens"),
++        ),
++        ("✢ Moonwalking... (1h 3m)", PaneProgress("Moonwalking", "1h 3m", 3780, None)),
++        (
++            "* Topsy-turvying… (2s · 312 tokens)",
++            PaneProgress("Topsy-turvying", "2s", 2, "312 tokens"),
++        ),
++    ],
++)
++def test_progress_from_line_parses_the_spinner_shapes(line: str, expected: PaneProgress) -> None:
++    """Every spinner shape Claude Code draws yields its verb, elapsed and tokens."""
++    assert progress_from_line(line) == expected
++
++
++@pytest.mark.parametrize(
++    "line",
++    [
++        "✻ Worked for 4m 42s",
++        "✻ Waiting for 1 background agent to finish",
++        "✻ Crunching…",
++        "✻ Crunching… (esc to interrupt)",
++        "  ✻ Crunching… (4m 42s · ↓ 24.5k tokens)",
++        "● ✻ Crunching… (4m 42s · ↓ 24.5k tokens)",
++        "✻ crunching… (4m 42s)",
++        "✻ Two words… (4m 42s)",
++        "✻ Crunching (4m 42s)",
++        "✻ Crunching… (soon)",
++        "✻ Crunching… (9999h)",
++        "",
++    ],
++)
++def test_progress_from_line_rejects_other_wording(line: str) -> None:
++    """Completion lines, indented echoes, unknown wording and absurd times are not progress."""
++    assert progress_from_line(line) is None
++
++
++def test_progress_from_pane_reads_the_spinner_above_the_input_box() -> None:
++    """The spinner above the box is found even with todo rows under it."""
++    pane = _pane(
++        "✻ Crunching… (4m 42s · ↓ 24.5k tokens)",
++        "  ⎿  ☐ Write the report",
++        "     ☐ Run the tests",
++    )
++    assert _read(pane) == CRUNCHING
++
++
++def test_progress_from_pane_finds_the_box_in_a_short_pane() -> None:
++    """An earlier unrelated rule cannot pass for the box when the closing rule is cut off."""
++    pane = "\n".join(
++        [
++            "  | col |",
++            _RULE,
++            "  table body",
++            "✻ Crunching… (4m 42s · ↓ 24.5k tokens)",
++            "",
++            _RULE,
++            "❯ a long draft",
++        ]
++    )
++    assert _read(pane) == CRUNCHING
++
++
++def test_progress_from_pane_returns_none_when_no_spinner_shows() -> None:
++    """An idle pane, or a spinner echoed in the transcript, reads as no progress."""
++    assert _read(_pane("✻ Worked for 3m 2s")) is None
++    assert _read(_pane("  ✻ Crunching… (4m 42s · ↓ 24.5k tokens)")) is None
++
++
++def test_progress_from_pane_is_unknown_when_it_cannot_tell() -> None:
++    """A failed capture, a pane with no input box, or the /btw overlay reads as unknown."""
++    assert _read("") == PROGRESS_UNKNOWN
++    assert _read("   \n  \n") == PROGRESS_UNKNOWN
++    assert _read("✻ Crunching… (4m 42s)\nloading…") == PROGRESS_UNKNOWN
++    btw = "\n".join(
++        [
++            _pane("✻ Crunching… (4m 42s · ↓ 24.5k tokens)"),
++            "▔" * 30,
++            "    /btw is this safe?",
++            "✻ Answering… (3s)",
++            "    ←/→ to switch · x to clear history · Esc to close",
++        ]
++    )
++    assert _read(btw) == PROGRESS_UNKNOWN
++
++
++def test_read_pane_signals_carries_progress(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The one shared capture yields the progress beside the permission mode."""
++    (tmp_path / "tmux.json").write_text(
++        json.dumps({"socket_path": "/tmp/sock", "tmux_target": "main"}), encoding="utf-8"
++    )
++    monkeypatch.setattr(
++        claude_native_bridge,
++        "_capture_pane",
++        lambda *_a, **_k: _pane("✻ Crunching… (4m 42s · ↓ 24.5k tokens)"),
++    )
++    signals = claude_native_bridge.read_pane_signals(tmp_path)
++    assert signals.permission_mode == "auto"
++    assert signals.progress == CRUNCHING
++
++
++def test_read_pane_signals_failed_capture_is_unknown(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """``capture-pane`` failing returns ``""``, which must not read as "spinner gone"."""
++    (tmp_path / "tmux.json").write_text(
++        json.dumps({"socket_path": "/tmp/sock", "tmux_target": "main"}), encoding="utf-8"
++    )
++    monkeypatch.setattr(claude_native_bridge, "_capture_pane", lambda *_a, **_k: "")
++    assert claude_native_bridge.read_pane_signals(tmp_path).progress == PROGRESS_UNKNOWN
++    assert PaneSignals().progress == PROGRESS_UNKNOWN
++
++
++def test_forwarder_and_route_share_one_contract() -> None:
++    """The type string and bounds come from one module on both sides."""
++    assert (
++        ae_pane_progress.EXTERNAL_SESSION_PROGRESS_TYPE is contract.EXTERNAL_SESSION_PROGRESS_TYPE
++    )
++    assert route_module.EXTERNAL_SESSION_PROGRESS_TYPE is contract.EXTERNAL_SESSION_PROGRESS_TYPE
++    assert route_module._FIELD_LIMITS == {
++        "label": contract.MAX_LABEL_CHARS,
++        "elapsed": contract.MAX_ELAPSED_CHARS,
++        "tokens": contract.MAX_TOKENS_CHARS,
++    }
++
++
++def _recording_client(status: int = 202) -> tuple[list[dict[str, Any]], httpx.MockTransport]:
++    """Return a list of posted bodies and a transport that records into it."""
++    posts: list[dict[str, Any]] = []
++
++    def _handle(request: httpx.Request) -> httpx.Response:
++        """Record the POST body and answer with ``status``."""
++        posts.append(json.loads(request.content.decode("utf-8")))
++        return httpx.Response(status, json={})
++
++    return posts, httpx.MockTransport(_handle)
++
++
++class _Clock:
++    """A settable stand-in for ``time.monotonic``."""
++
++    def __init__(self) -> None:
++        self.now = 1000.0
++
++    def __call__(self) -> float:
++        return self.now
++
++
++@pytest.fixture
++def clock(monkeypatch: pytest.MonkeyPatch) -> _Clock:
++    """Drive the relay's refresh timer by hand."""
++    fake = _Clock()
++    monkeypatch.setattr(ae_pane_progress.time, "monotonic", fake)
++    return fake
++
++
++def _data(progress: PaneProgress) -> dict[str, Any]:
++    """The POST data the relay sends for ``progress``."""
++    return {
++        "label": progress.label,
++        "elapsed": progress.elapsed,
++        "elapsed_s": progress.elapsed_s,
++        "tokens": progress.tokens,
++    }
++
++
++@pytest.mark.asyncio
++async def test_relay_progress_posts_changes_refreshes_and_clears(clock: _Clock) -> None:
++    """
++    A new token count posts at once, an elapsed-only change waits for the
++    refresh window, unknown reads post nothing, and the end posts one clear.
++    """
++    state = ProgressRelayState()
++    posts, transport = _recording_client()
++    tick_2s = PaneProgress("Crunching", "4m 44s", 284, "24.5k tokens")
++    tick_10s = PaneProgress("Crunching", "4m 52s", 292, "24.5k tokens")
++    more_tokens = PaneProgress("Crunching", "4m 54s", 294, "25.1k tokens")
++    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
++
++        async def relay(progress: PaneProgressRead, advance: float = 2.0) -> None:
++            clock.now += advance
++            await relay_progress(client, session_id="conv1", progress=progress, state=state)
++
++        await relay(None)
++        await relay(CRUNCHING)
++        await relay(tick_2s)
++        await relay(PROGRESS_UNKNOWN)
++        await relay(tick_10s, advance=PROGRESS_REFRESH_S - 2.0)
++        await relay(more_tokens)
++        await relay(PROGRESS_UNKNOWN)
++        await relay(None)
++        await relay(None)
++
++    assert [p["data"] for p in posts] == [
++        _data(CRUNCHING),
++        _data(tick_10s),
++        _data(more_tokens),
++        {"label": None},
++    ]
++    assert all(p["type"] == "external_session_progress" for p in posts)
++    assert state.posted is None
++
++
++@pytest.mark.asyncio
++async def test_relay_progress_retries_a_failed_post_and_never_raises(clock: _Clock) -> None:
++    """A rejected POST leaves the state alone so the next poll posts again."""
++    state = ProgressRelayState()
++    progress = PaneProgress("Thinking", "12s", 12)
++    failing_posts, failing = _recording_client(status=503)
++    async with httpx.AsyncClient(transport=failing, base_url="http://ap") as client:
++        await relay_progress(client, session_id="conv1", progress=progress, state=state)
++    assert len(failing_posts) == 1
++    assert state.posted is None
++
++    posts, transport = _recording_client()
++    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
++        await relay_progress(client, session_id="conv1", progress=progress, state=state)
++    assert posts[0]["data"] == _data(progress)
++    assert state.posted == progress
++
++
++@pytest.mark.asyncio
++async def test_clear_progress_on_rotation_clears_the_old_session_once(clock: _Clock) -> None:
++    """A /clear or /fork rotation clears the line it left on the old conversation."""
++    state = ProgressRelayState()
++    posts, transport = _recording_client()
++    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
++        await clear_progress_on_rotation(client, old_session_id="conv_old", state=state)
++        await relay_progress(client, session_id="conv_old", progress=CRUNCHING, state=state)
++        await clear_progress_on_rotation(client, old_session_id="conv_old", state=state)
++
++    assert [(p["data"]["label"]) for p in posts] == ["Crunching", None]
++    assert state.posted is None
++
++
++@pytest.mark.asyncio
++async def test_forward_pane_signals_relays_progress(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """The shared pane capture hands its spinner to the progress relay."""
++    snapshots = iter(
++        [
++            PaneSignals(progress=CRUNCHING),
++            PaneSignals(progress=CRUNCHING),
++            PaneSignals(),
++            PaneSignals(progress=None),
++        ]
++    )
++    monkeypatch.setattr(forwarder, "read_pane_signals", lambda _bridge_dir: next(snapshots))
++    monkeypatch.setattr(forwarder, "_PANE_POLL_INTERVAL_S", 0.0)
++    dedupe = forwarder._ForwardDedupeState()
++    posts, transport = _recording_client()
++    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
++        for _ in range(4):
++            await forwarder._forward_pane_signals(
++                client, session_id="conv1", bridge_dir=tmp_path, dedupe=dedupe
++            )
++
++    progress_posts = [p["data"] for p in posts if p["type"] == "external_session_progress"]
++    assert progress_posts == [_data(CRUNCHING), {"label": None}]
++    assert dedupe.progress_relay.posted is None
+diff --git a/web/src/components/AeSessionActivity.tsx b/web/src/components/AeSessionActivity.tsx
+index f11f1351eaedf76c9147cc649e8c96132465f892..9bf48db0893e979f623b5c3540d529617518af2d 100644
+--- a/web/src/components/AeSessionActivity.tsx
++++ b/web/src/components/AeSessionActivity.tsx
+@@ -30,6 +30,12 @@ import {
+   type AeSessionState,
+   type AeStep,
+ } from "@/lib/aeSessionActivity";
++import {
++  AE_NO_OUTPUT_HINT,
++  aeProgressText,
++  aeShowsNoOutputHint,
++  type AeSessionProgress,
++} from "@/lib/aeSessionProgress";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+ import type { BackgroundTaskInfo } from "@/lib/types";
+@@ -158,6 +164,48 @@ function StepText({ step, now, lead }: { step: AeStep; now: number; lead: "Now"
+   );
+ }
+ 
++function ProgressText({ progress, now }: { progress: AeSessionProgress; now: number }) {
++  return (
++    <div data-testid="ae-activity-progress" className="truncate text-xs text-muted-foreground">
++      {aeProgressText(progress, now)}
++    </div>
++  );
++}
++
++/** The later of two optional epoch-ms times; a turn that just started is not silent. */
++function aeLatest(a: number | null, b: number | null): number | null {
++  if (a === null) return b;
++  return b === null ? a : Math.max(a, b);
++}
++
++/** Under "Working": the running tool, else the terminal's spinner, else a hint after a silent minute. */
++function WorkingDetail({
++  step,
++  progress,
++  lastContentAt,
++  now,
++}: {
++  step: AeStep | null;
++  progress: AeSessionProgress | null;
++  lastContentAt: number | null;
++  now: number;
++}) {
++  if (step?.running) {
++    return (
++      <div className="truncate text-xs text-muted-foreground">
++        <StepText step={step} now={now} lead="Now" />
++      </div>
++    );
++  }
++  if (progress) return <ProgressText progress={progress} now={now} />;
++  if (!aeShowsNoOutputHint(lastContentAt, now)) return null;
++  return (
++    <div data-testid="ae-activity-no-output" className="text-xs text-muted-foreground">
++      {AE_NO_OUTPUT_HINT}
++    </div>
++  );
++}
++
+ /** "Working", or why the turn is parked (a terminal dialog, say). */
+ function WorkingLabel({ blockedOn }: { blockedOn: string | null }) {
+   return (
+@@ -296,11 +344,12 @@ export function AeSessionActivityLine({ showsWorking }: { showsWorking: boolean
+             <WorkingLabel blockedOn={data.blockedOn} />
+             {elapsed && <span className="text-sm text-muted-foreground">· {elapsed}</span>}
+           </div>
+-          {data.step?.running && (
+-            <div className="truncate text-xs text-muted-foreground">
+-              <StepText step={data.step} now={now} lead="Now" />
+-            </div>
+-          )}
++          <WorkingDetail
++            step={data.step}
++            progress={data.progress}
++            lastContentAt={aeLatest(data.lastEventAt, data.turnStartedAt)}
++            now={now}
++          />
+         </StatusRow>
+       </>
+     );
+@@ -329,6 +378,7 @@ export function AeSessionActivityLine({ showsWorking }: { showsWorking: boolean
+               · no new output for {aeDuration(activity.quietForMs, true)}
+             </span>
+           </div>
++          {data.progress && <ProgressText progress={data.progress} now={now} />}
+           <div className="text-xs text-muted-foreground">
+             {data.step && (
+               <>
+diff --git a/web/src/components/AeSessionProgress.test.tsx b/web/src/components/AeSessionProgress.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c7f904532b1b002d219073913df1ea32f4ac4661
+--- /dev/null
++++ b/web/src/components/AeSessionProgress.test.tsx
+@@ -0,0 +1,138 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, render, screen } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { AE_ACTIVITY_SCHEDULED_KEY } from "@/hooks/aeSessionActivityHooks";
++import { childSessionsQueryKey } from "@/hooks/useChildSessions";
++import type { AnyBlock } from "@/lib/blocks";
++import { useChatStore } from "@/store/chatStore";
++import { createInitialConversationState } from "@/store/conversationState";
++import { AeSessionActivityLine } from "./AeSessionActivity";
++
++const NOW = new Date(2026, 9, 17, 8, 30, 0).getTime();
++const CONV = "conv_ae_progress";
++const CRUNCHING = {
++  label: "Crunching",
++  elapsed: "4m 42s",
++  elapsedS: 282,
++  tokens: "24.5k tokens",
++  receivedAt: NOW,
++};
++
++const userMessage = (atMs: number) =>
++  ({
++    type: "user_message",
++    ctx: {
++      agent: null,
++      depth: 0,
++      turn: 0,
++      timestamp: 0,
++      responseId: "r",
++      itemId: null,
++      clientCreatedAtS: atMs / 1000,
++    },
++    content: [],
++  }) as AnyBlock;
++
++let qc: QueryClient;
++
++function setup(state: Partial<ReturnType<typeof useChatStore.getState>>) {
++  useChatStore.setState({
++    ...createInitialConversationState(),
++    conversationId: CONV,
++    sessionStatus: "running",
++    ...state,
++  });
++  qc.setQueryData(childSessionsQueryKey(CONV), []);
++  qc.setQueryData(AE_ACTIVITY_SCHEDULED_KEY, []);
++  return render(
++    <QueryClientProvider client={qc}>
++      <TooltipProvider>
++        <AeSessionActivityLine showsWorking />
++      </TooltipProvider>
++    </QueryClientProvider>,
++  );
++}
++
++beforeEach(() => {
++  vi.useFakeTimers();
++  vi.setSystemTime(NOW);
++  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("[]", { headers: { "content-type": "application/json" } })),
++  );
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++  useChatStore.setState({ ...createInitialConversationState(), conversationId: null });
++});
++
++describe("Working row progress", () => {
++  it("shows the terminal's spinner line while no tool step is known", () => {
++    setup({
++      blocks: [userMessage(NOW - 300_000)],
++      lastEventAt: NOW - 282_000,
++      aeProgress: CRUNCHING,
++    });
++    const row = screen.getByTestId("working-indicator");
++    expect(row).toHaveAttribute("data-ae-activity", "working");
++    expect(screen.getByTestId("ae-activity-progress")).toHaveTextContent(
++      "Crunching · 4m 42s · 24.5k tokens",
++    );
++    expect(row).toHaveTextContent("last activity 4m ago");
++    expect(screen.queryByTestId("ae-activity-no-output")).toBeNull();
++  });
++
++  it("ticks the elapsed time between posts and drops a line no post refreshed", () => {
++    setup({
++      blocks: [userMessage(NOW - 300_000)],
++      lastEventAt: NOW - 40_000,
++      aeProgress: CRUNCHING,
++    });
++    act(() => {
++      vi.advanceTimersByTime(5_000);
++    });
++    expect(screen.getByTestId("ae-activity-progress")).toHaveTextContent(
++      "Crunching · 4m 47s · 24.5k tokens",
++    );
++
++    act(() => {
++      vi.advanceTimersByTime(26_000);
++    });
++    expect(screen.queryByTestId("ae-activity-progress")).toBeNull();
++    expect(screen.getByTestId("ae-activity-no-output")).toBeInTheDocument();
++  });
++
++  it("does not hint at a turn that just started after an idle stretch", () => {
++    setup({ lastEventAt: NOW - 2 * 60_000, aeRunningSince: NOW - 5_000 });
++    expect(screen.getByTestId("working-indicator")).toHaveAttribute("data-ae-activity", "working");
++    expect(screen.queryByTestId("ae-activity-no-output")).toBeNull();
++  });
++
++  it("hints at a silent step once a minute passes with no content", () => {
++    setup({ blocks: [userMessage(NOW - 30_000)] });
++    expect(screen.queryByTestId("ae-activity-no-output")).toBeNull();
++
++    act(() => {
++      vi.advanceTimersByTime(31_000);
++    });
++    expect(screen.getByTestId("ae-activity-no-output")).toHaveTextContent(
++      "no output yet; a long step may be writing",
++    );
++  });
++
++  it("drops the hint when a spinner line arrives", () => {
++    setup({ blocks: [userMessage(NOW - 90_000)] });
++    expect(screen.getByTestId("ae-activity-no-output")).toBeInTheDocument();
++
++    act(() => {
++      useChatStore.setState({ aeProgress: { ...CRUNCHING, receivedAt: Date.now() } });
++    });
++    expect(screen.queryByTestId("ae-activity-no-output")).toBeNull();
++    expect(screen.getByTestId("ae-activity-progress")).toBeInTheDocument();
++  });
++});
+diff --git a/web/src/hooks/aeSessionActivityHooks.ts b/web/src/hooks/aeSessionActivityHooks.ts
+index e4b667fea1fcefc105aed2b4c0d0d58ff99eaa4b..aa06ac62b5a7ecae448a142b1e40669de94ccddd 100644
+--- a/web/src/hooks/aeSessionActivityHooks.ts
++++ b/web/src/hooks/aeSessionActivityHooks.ts
+@@ -20,6 +20,7 @@ import {
+   type AeNextRun,
+   type AeStep,
+ } from "@/lib/aeSessionActivity";
++import { aeLiveProgress, type AeSessionProgress } from "@/lib/aeSessionProgress";
+ import { listScheduledTasks, type ScheduledTask } from "@/lib/scheduledTasksApi";
+ import type { AnyBlock } from "@/lib/blocks";
+ import type { BackgroundTaskInfo } from "@/lib/types";
+@@ -383,6 +384,8 @@ export interface AeChatActivity {
+   step: AeStep | null;
+   turnStartedAt: number | null;
+   lastEventAt: number | null;
++  /** The terminal's live spinner line, while one shows and is being refreshed. */
++  progress: AeSessionProgress | null;
+   agents: AeAgentChip[];
+   shells: BackgroundTaskInfo[];
+   nextRun: AeNextRun | null;
+@@ -411,6 +414,7 @@ export function useAeChatActivity(showsWorking: boolean): AeChatActivity {
+   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+   const bgTasks = useChatStore((s) => s.backgroundTasks);
+   const storeLastEventAt = useChatStore((s) => s.lastEventAt);
++  const storeProgress = useChatStore((s) => s.aeProgress);
+   const runningSince = useChatStore((s) => s.aeRunningSince);
+   const pendingMessages = useChatStore((s) => s.pendingUserMessages);
+   const { children } = useChildSessions(conversationId);
+@@ -462,6 +466,7 @@ export function useAeChatActivity(showsWorking: boolean): AeChatActivity {
+     step,
+     turnStartedAt,
+     lastEventAt,
++    progress: aeLiveProgress(storeProgress, now),
+     agents,
+     shells: showsWorking ? bgTasks.slice(0, bgCount) : [],
+     nextRun,
+diff --git a/web/src/lib/aeSessionProgress.test.ts b/web/src/lib/aeSessionProgress.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a17ae240e620fbbbcad3fa400b266711022fbed
+--- /dev/null
++++ b/web/src/lib/aeSessionProgress.test.ts
+@@ -0,0 +1,145 @@
++import { describe, expect, it } from "vitest";
++import type { StreamEvent } from "@/lib/events";
++import { parseEvent } from "@/lib/sse";
++import {
++  AE_NO_OUTPUT_HINT_AFTER_MS,
++  AE_PROGRESS_STALE_MS,
++  aeIsContentEvent,
++  aeLiveProgress,
++  aeNextProgress,
++  aeParseSessionProgress,
++  aeProgressText,
++  aeShowsNoOutputHint,
++  aeTuiElapsed,
++} from "./aeSessionProgress";
++
++const LINE = { label: "Crunching", elapsed: "4m 42s", elapsedS: 282, tokens: "24.5k tokens" };
++const WIRE = { label: "Crunching", elapsed: "4m 42s", elapsed_s: 282, tokens: "24.5k tokens" };
++
++describe("aeParseSessionProgress", () => {
++  it("parses a line, a line without seconds or tokens, and a clear", () => {
++    expect(aeParseSessionProgress({ conversation_id: "c", ...WIRE })).toEqual({
++      type: "session_progress",
++      conversationId: "c",
++      progress: LINE,
++    });
++    expect(
++      aeParseSessionProgress({ conversation_id: "c", label: "Thinking", elapsed: "12s" }),
++    ).toEqual({
++      type: "session_progress",
++      conversationId: "c",
++      progress: { label: "Thinking", elapsed: "12s", elapsedS: null, tokens: null },
++    });
++    expect(aeParseSessionProgress({ conversation_id: "c", label: null })).toEqual({
++      type: "session_progress",
++      conversationId: "c",
++      progress: null,
++    });
++  });
++
++  it("rejects a payload without a conversation or elapsed time, and ignores bad seconds", () => {
++    expect(aeParseSessionProgress({ label: "Crunching", elapsed: "1s" })).toBeNull();
++    expect(aeParseSessionProgress({ conversation_id: "c", label: "Crunching" })).toBeNull();
++    expect(aeParseSessionProgress({ conversation_id: "c", label: 3, elapsed: "1s" })).toBeNull();
++    expect(
++      aeParseSessionProgress({ conversation_id: "c", label: "A", elapsed: "1s", elapsed_s: -4 })
++        ?.progress?.elapsedS,
++    ).toBeNull();
++  });
++
++  it("is what the SSE parser returns for session.progress", () => {
++    expect(parseEvent("session.progress", { conversation_id: "c", ...WIRE })).toEqual({
++      type: "session_progress",
++      conversationId: "c",
++      progress: LINE,
++    });
++  });
++});
++
++describe("aeProgressText", () => {
++  it("ticks the elapsed time from when the line arrived, in the terminal's format", () => {
++    const progress = { ...LINE, receivedAt: 1_000_000 };
++    expect(aeProgressText(progress, 1_000_000)).toBe("Crunching · 4m 42s · 24.5k tokens");
++    expect(aeProgressText(progress, 1_007_900)).toBe("Crunching · 4m 49s · 24.5k tokens");
++    expect(aeProgressText(progress, 999_000)).toBe("Crunching · 4m 42s · 24.5k tokens");
++  });
++
++  it("falls back to the drawn text without seconds", () => {
++    const progress = { ...LINE, elapsedS: null, tokens: null, receivedAt: 0 };
++    expect(aeProgressText(progress, 90_000)).toBe("Crunching · 4m 42s");
++  });
++
++  it("formats like the TUI", () => {
++    expect([aeTuiElapsed(12), aeTuiElapsed(282), aeTuiElapsed(3780)]).toEqual([
++      "12s",
++      "4m 42s",
++      "1h 3m",
++    ]);
++  });
++});
++
++describe("aeLiveProgress", () => {
++  it("drops a line no update refreshed for 30 seconds", () => {
++    const progress = { ...LINE, receivedAt: 1_000_000 };
++    expect(aeLiveProgress(progress, 1_000_000 + AE_PROGRESS_STALE_MS)).toBe(progress);
++    expect(aeLiveProgress(progress, 1_000_001 + AE_PROGRESS_STALE_MS)).toBeNull();
++    expect(aeLiveProgress(null, 0)).toBeNull();
++  });
++});
++
++describe("aeIsContentEvent", () => {
++  it("counts output and items, not bookkeeping", () => {
++    const content: StreamEvent[] = [
++      { type: "text_delta", delta: "hi" } as StreamEvent,
++      { type: "tool_call", name: "Write" } as StreamEvent,
++      { type: "tool_output_delta" } as StreamEvent,
++      { type: "message_done", content: [] } as unknown as StreamEvent,
++    ];
++    const bookkeeping: StreamEvent[] = [
++      { type: "session_status", conversationId: "c", status: "running" },
++      { type: "session_usage" } as unknown as StreamEvent,
++      { type: "session_model", conversationId: "c", model: "m" },
++      { type: "session_terminal_activity" } as unknown as StreamEvent,
++      { type: "session_progress", conversationId: "c", progress: LINE },
++    ];
++    expect(content.map(aeIsContentEvent)).toEqual([true, true, true, true]);
++    expect(bookkeeping.map(aeIsContentEvent)).toEqual([false, false, false, false, false]);
++  });
++});
++
++describe("aeNextProgress", () => {
++  it("sets, clears on items, supersession and non-running status, and leaves the rest", () => {
++    const progress: StreamEvent = { type: "session_progress", conversationId: "c", progress: LINE };
++    expect(aeNextProgress(progress, "c")).toEqual(LINE);
++    expect(aeNextProgress(progress, "other")).toBeUndefined();
++    expect(aeNextProgress({ type: "tool_result" } as StreamEvent, "c")).toBeNull();
++    expect(
++      aeNextProgress(
++        {
++          type: "session_superseded",
++          conversationId: "c",
++          targetConversationId: "d",
++          reason: "clear",
++        },
++        "c",
++      ),
++    ).toBeNull();
++    expect(
++      aeNextProgress({ type: "session_status", conversationId: "c", status: "idle" }, "c"),
++    ).toBeNull();
++    expect(
++      aeNextProgress({ type: "session_status", conversationId: "c", status: "running" }, "c"),
++    ).toBeUndefined();
++    expect(aeNextProgress({ type: "text_delta", delta: "x" } as StreamEvent, "c")).toBeUndefined();
++  });
++});
++
++describe("aeShowsNoOutputHint", () => {
++  it("hints after a silent minute only", () => {
++    const now = 1_000_000;
++    const quiet = now - AE_NO_OUTPUT_HINT_AFTER_MS;
++    expect(aeShowsNoOutputHint(quiet, now)).toBe(true);
++    expect(aeShowsNoOutputHint(quiet + 1, now)).toBe(false);
++    expect(aeShowsNoOutputHint(null, now)).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeSessionProgress.ts b/web/src/lib/aeSessionProgress.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..71da80bc15189daa59f6807e401c038db89d1c7b
+--- /dev/null
++++ b/web/src/lib/aeSessionProgress.ts
+@@ -0,0 +1,158 @@
++// A terminal agent's live spinner line ("✻ Crunching… (4m 42s · ↓ 24.5k
++// tokens)"), relayed as `session.progress`, plus the rule for which stream
++// events count as real activity for "last activity".
++
++import type { StreamEvent } from "@/lib/events";
++
++/** A spinner line as the server relays it. */
++export interface AeProgressLine {
++  /** The spinner verb, e.g. "Crunching". */
++  label: string;
++  /** Elapsed text as the terminal drew it, e.g. "4m 42s". */
++  elapsed: string;
++  /** The same elapsed time in seconds, when sent, so the row can tick it. */
++  elapsedS: number | null;
++  /** Token text, e.g. "24.5k tokens", when the line shows one. */
++  tokens: string | null;
++}
++
++/** A relayed line plus when it arrived (epoch ms). */
++export interface AeSessionProgress extends AeProgressLine {
++  receivedAt: number;
++}
++
++/**
++ * `session.progress`: transient, never persisted. `progress` is `null` when
++ * the spinner went away.
++ */
++export interface AeSessionProgressEvent {
++  type: "session_progress";
++  conversationId: string;
++  progress: AeProgressLine | null;
++}
++
++/** After this long with no content event, a working row hints at a silent step. */
++export const AE_NO_OUTPUT_HINT_AFTER_MS = 60_000;
++export const AE_NO_OUTPUT_HINT = "no output yet; a long step may be writing";
++/**
++ * The forwarder refreshes a steady line every 10 s; one not refreshed for this
++ * long belongs to a stalled forwarder or a dropped host and is not shown.
++ */
++export const AE_PROGRESS_STALE_MS = 30_000;
++
++function text(value: unknown): string | null {
++  return typeof value === "string" && value.trim() ? value.trim() : null;
++}
++
++function seconds(value: unknown): number | null {
++  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
++}
++
++/** Parse a `session.progress` SSE payload, or `null` when it is malformed. */
++export function aeParseSessionProgress(
++  data: Record<string, unknown>,
++): AeSessionProgressEvent | null {
++  const conversationId = text(data.conversation_id);
++  if (conversationId === null) return null;
++  if (data.label === null || data.label === undefined) {
++    return { type: "session_progress", conversationId, progress: null };
++  }
++  const label = text(data.label);
++  const elapsed = text(data.elapsed);
++  if (label === null || elapsed === null) return null;
++  return {
++    type: "session_progress",
++    conversationId,
++    progress: { label, elapsed, elapsedS: seconds(data.elapsed_s), tokens: text(data.tokens) },
++  };
++}
++
++/** Seconds the way Claude Code's spinner draws them: "12s", "4m 42s", "1h 3m". */
++export function aeTuiElapsed(totalSeconds: number): string {
++  const s = Math.max(0, Math.floor(totalSeconds));
++  if (s < 60) return `${s}s`;
++  if (s < 3600) return `${Math.floor(s / 60)}m ${s % 60}s`;
++  return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
++}
++
++/** The line while it is still being refreshed, else `null`. */
++export function aeLiveProgress(
++  progress: AeSessionProgress | null,
++  now: number,
++): AeSessionProgress | null {
++  if (progress === null || now - progress.receivedAt > AE_PROGRESS_STALE_MS) return null;
++  return progress;
++}
++
++/**
++ * One line for the Working row: "Crunching · 4m 42s · 24.5k tokens", with the
++ * elapsed time ticked forward from when the line arrived.
++ */
++export function aeProgressText(progress: AeSessionProgress, now: number): string {
++  const elapsed =
++    progress.elapsedS === null
++      ? progress.elapsed
++      : aeTuiElapsed(progress.elapsedS + Math.max(0, now - progress.receivedAt) / 1000);
++  return [progress.label, elapsed, progress.tokens].filter(Boolean).join(" · ");
++}
++
++// Assistant text, reasoning, items and tool output. Status, usage, cost, model,
++// presence and progress events are bookkeeping and never count as activity.
++const CONTENT_EVENT_TYPES: ReadonlySet<StreamEvent["type"]> = new Set<StreamEvent["type"]>([
++  "text_delta",
++  "reasoning_started",
++  "reasoning_delta",
++  "reasoning_summary_delta",
++  "reasoning_done",
++  "message_done",
++  "tool_call",
++  "tool_result",
++  "tool_output_delta",
++  "native_tool_call",
++  "slash_command",
++  "terminal_command",
++  "output_file_done",
++  "elicitation_request",
++  "compaction_completed",
++  "session_input_consumed",
++]);
++
++// A new item or tool row supersedes the spinner it was drawing.
++const CLEARS_PROGRESS_TYPES: ReadonlySet<StreamEvent["type"]> = new Set<StreamEvent["type"]>([
++  "message_done",
++  "reasoning_done",
++  "tool_call",
++  "tool_result",
++  "native_tool_call",
++  "session_input_consumed",
++  "session_superseded",
++]);
++
++/** Whether an event is real output, the only kind "last activity" counts. */
++export function aeIsContentEvent(event: StreamEvent): boolean {
++  return CONTENT_EVENT_TYPES.has(event.type);
++}
++
++/**
++ * The progress a conversation should hold after `event`: the relayed line, or
++ * `null` once an item lands or the session stops running. `undefined` leaves
++ * it as is.
++ */
++export function aeNextProgress(
++  event: StreamEvent,
++  conversationId: string,
++): AeProgressLine | null | undefined {
++  if (event.type === "session_progress") {
++    return event.conversationId === conversationId ? event.progress : undefined;
++  }
++  if (event.type === "session_status") {
++    if (event.conversationId !== conversationId) return undefined;
++    return event.status === "running" ? undefined : null;
++  }
++  return CLEARS_PROGRESS_TYPES.has(event.type) ? null : undefined;
++}
++
++/** Whether the Working row should hint at a silent step: no content for a minute. */
++export function aeShowsNoOutputHint(lastContentAt: number | null, now: number): boolean {
++  return lastContentAt !== null && now - lastContentAt >= AE_NO_OUTPUT_HINT_AFTER_MS;
++}
+diff --git a/web/src/lib/aeStreamObserver.ts b/web/src/lib/aeStreamObserver.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..861d9eceaa3586392c9829f74c5974190c733098
+--- /dev/null
++++ b/web/src/lib/aeStreamObserver.ts
+@@ -0,0 +1,38 @@
++// The chat store's per-event hook for the AE activity line. Kept apart from
++// `aeSessionProgress` so the SSE parser's import of that module stays acyclic.
++
++import { aeStampLastEvent } from "@/lib/aeSessionActivity";
++import { aeIsContentEvent, aeNextProgress, type AeSessionProgress } from "@/lib/aeSessionProgress";
++import type { StreamEvent } from "@/lib/events";
++
++export interface AeObservedState {
++  aeProgress: AeSessionProgress | null;
++  sessionStatus: string;
++}
++
++/**
++ * Per stream event: stamp "last activity" for content events and for the
++ * switch to running (a turn starting is activity, repeated running posts are
++ * not), and keep the conversation's progress line current.
++ */
++export function aeObserveStreamEvent(
++  event: StreamEvent,
++  conversationId: string,
++  write: (patch: { lastEventAt?: number; aeProgress?: AeSessionProgress | null }) => void,
++  read: () => AeObservedState | null,
++): void {
++  const state = read();
++  const startsRunning =
++    event.type === "session_status" &&
++    event.conversationId === conversationId &&
++    event.status === "running" &&
++    state?.sessionStatus !== "running";
++  if (aeIsContentEvent(event) || startsRunning) aeStampLastEvent(conversationId, write);
++  const next = aeNextProgress(event, conversationId);
++  if (next === undefined) return;
++  if (next === null) {
++    if ((state?.aeProgress ?? null) !== null) write({ aeProgress: null });
++    return;
++  }
++  write({ aeProgress: { ...next, receivedAt: Date.now() } });
++}
+diff --git a/web/src/lib/events.ts b/web/src/lib/events.ts
+index 9a3da8eb46d6c81518a798f47ba36130d86f3cf6..151eb612beecbf6c88dd698f39c2c9aad44119ea 100644
+--- a/web/src/lib/events.ts
++++ b/web/src/lib/events.ts
+@@ -10,6 +10,7 @@
+ 
+ import type { RoutingDecisionExtras } from "./routingDecision";
+ import type { CodexQuestion } from "./blocks";
++import type { AeSessionProgressEvent } from "./aeSessionProgress";
+ import type {
+   BackgroundTaskInfo,
+   CodexPersistMode,
+@@ -1034,4 +1035,5 @@ export type StreamEvent =
+   | SessionModelOptionsEvent
+   | SessionPresenceEvent
+   | SessionBtwSidechatEvent
++  | AeSessionProgressEvent
+   | BrowserActionRequestEvent;
+diff --git a/web/src/lib/sse.ts b/web/src/lib/sse.ts
+index d88c3ebe7c420d533a77bb1fe1be6b0bb6248dda..1d92dbebfbecc973475dab9179c410cddf982cb1 100644
+--- a/web/src/lib/sse.ts
++++ b/web/src/lib/sse.ts
+@@ -9,6 +9,7 @@
+ // catch — please add an SSE-parser test when you touch this.
+ 
+ import { readSubagentActivity } from "./subagentActivity";
++import { aeParseSessionProgress } from "./aeSessionProgress";
+ import { codexQuestionsFrom } from "./blocks";
+ import type {
+   BrowserActionRequestEvent,
+@@ -880,6 +881,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
+       reason: "clear",
+     } satisfies SessionSupersededEvent;
+   }
++  if (eventType === "session.progress") return aeParseSessionProgress(data);
+   if (eventType === "session.btw_sidechat") {
+     const conversationId = data.conversation_id;
+     const question = data.question;
+diff --git a/web/src/store/aeLastEventAt.test.ts b/web/src/store/aeLastEventAt.test.ts
+index 841f3ce608f4a523d3b0c850b2055576e75ef5f4..f5bc0f3ed49e7b98cf109e6a442a779ff5cf9cf9 100644
+--- a/web/src/store/aeLastEventAt.test.ts
++++ b/web/src/store/aeLastEventAt.test.ts
+@@ -48,7 +48,7 @@ afterEach(() => {
+ });
+ 
+ describe("chat store lastEventAt", () => {
+-  it("starts empty and stamps each session event, at most once a second", async () => {
++  it("starts empty and stamps each content event, at most once a second", async () => {
+     const { set, get } = bindConversationForTest("conv_last_a");
+     expect(useChatStore.getState().lastEventAt).toBeNull();
+     const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
+@@ -56,7 +56,7 @@ describe("chat store lastEventAt", () => {
+     const controller = new AbortController();
+     void pumpStreamEvents("conv_last_a", sink.stream, controller, set, get, immediate);
+ 
+-    sink.push("response.created", { id: "resp_1", status: "in_progress", output: [] });
++    sink.push("response.output_text.delta", { delta: "Hello", item_id: "m1", output_index: 0 });
+     await tick();
+     expect(useChatStore.getState().lastEventAt).toBe(1_000_000);
+ 
+@@ -78,7 +78,7 @@ describe("chat store lastEventAt", () => {
+     const sink = pushableStream();
+     const controller = new AbortController();
+     void pumpStreamEvents("conv_last_b", sink.stream, controller, a.set, a.get, immediate);
+-    sink.push("response.created", { id: "resp_2", status: "in_progress", output: [] });
++    sink.push("response.output_text.delta", { delta: "Hi", item_id: "m2", output_index: 0 });
+     await tick();
+     expect(useChatStore.getState().lastEventAt).toBe(2_000_000);
+ 
+@@ -111,7 +111,16 @@ describe("chat store lastEventAt", () => {
+     });
+     vi.stubGlobal("fetch", fetchMock);
+     // An entry whose stream is gone: the next send rebinds it.
+-    bindConversationForTest("conv_last_rebind", { lastEventAt: 1000 });
++    bindConversationForTest("conv_last_rebind", {
++      lastEventAt: 1000,
++      aeProgress: {
++        label: "Crunching",
++        elapsed: "4m 42s",
++        elapsedS: 282,
++        tokens: null,
++        receivedAt: 1000,
++      },
++    });
+     vi.spyOn(Date, "now").mockReturnValue(9_000_000);
+     const sent = useChatStore.getState().send("hello", "agent_xyz");
+     expect(useChatStore.getState().lastEventAt).toBe(9_000_000);
+@@ -121,6 +130,8 @@ describe("chat store lastEventAt", () => {
+     );
+     // The chat line then dates activity by the snapshot's blocks and the unsent message.
+     await vi.waitFor(() => expect(useChatStore.getState().lastEventAt).toBeNull());
++    // A spinner line from the earlier visit is stale too.
++    expect(useChatStore.getState().aeProgress).toBeNull();
+   });
+ });
+ 
+diff --git a/web/src/store/aeSessionProgress.test.ts b/web/src/store/aeSessionProgress.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1bce99f71e7d38234fca1044e7ca9a069dc86f2e
+--- /dev/null
++++ b/web/src/store/aeSessionProgress.test.ts
+@@ -0,0 +1,211 @@
++import { QueryClient } from "@tanstack/react-query";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { aeResetLastEventStamps } from "@/lib/aeSessionActivity";
++import {
++  bindConversationForTest,
++  initChatStore,
++  pumpStreamEvents,
++  useChatStore,
++} from "./chatStore";
++import { conversationRegistry } from "./conversationRegistry";
++
++function pushableStream() {
++  let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null;
++  const enc = new TextEncoder();
++  const stream = new ReadableStream<Uint8Array>({
++    start(c) {
++      ctrl = c;
++    },
++  });
++  return {
++    stream,
++    push: (event: string, data: Record<string, unknown>) =>
++      ctrl!.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)),
++  };
++}
++
++const tick = () =>
++  new Promise<void>((resolve) => {
++    setTimeout(resolve, 0);
++  });
++const immediate = { schedule: (fn: () => void) => fn(), cancel: () => {} };
++
++const CRUNCHING = { label: "Crunching", elapsed: "4m 42s", elapsed_s: 282, tokens: "24.5k tokens" };
++const RECEIVED_AT = 1_000_000;
++const STORED = {
++  label: "Crunching",
++  elapsed: "4m 42s",
++  elapsedS: 282,
++  tokens: "24.5k tokens",
++  receivedAt: RECEIVED_AT,
++};
++
++function bindPumped(conversationId: string, sessionStatus: "running" | "idle" = "running") {
++  const { set, get } = bindConversationForTest(conversationId, { sessionStatus });
++  const sink = pushableStream();
++  const controller = new AbortController();
++  void pumpStreamEvents(conversationId, sink.stream, controller, set, get, immediate);
++  return { sink, controller };
++}
++
++beforeEach(() => {
++  initChatStore(new QueryClient({ defaultOptions: { queries: { retry: false } } }));
++  aeResetLastEventStamps();
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("{}", { headers: { "content-type": "application/json" } })),
++  );
++});
++
++afterEach(() => {
++  conversationRegistry.clear();
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++
++describe("chat store aeProgress", () => {
++  beforeEach(() => {
++    vi.spyOn(Date, "now").mockReturnValue(RECEIVED_AT);
++  });
++
++  it("keeps the latest spinner line with its arrival time and drops it on a clear", async () => {
++    const { sink, controller } = bindPumped("conv_prog_a");
++    expect(useChatStore.getState().aeProgress).toBeNull();
++
++    sink.push("session.progress", { conversation_id: "conv_prog_a", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toEqual(STORED);
++
++    sink.push("session.progress", {
++      conversation_id: "conv_prog_a",
++      label: "Crunching",
++      elapsed: "4m 44s",
++      tokens: null,
++    });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toEqual({
++      label: "Crunching",
++      elapsed: "4m 44s",
++      elapsedS: null,
++      tokens: null,
++      receivedAt: RECEIVED_AT,
++    });
++
++    sink.push("session.progress", { conversation_id: "conv_prog_a", label: null });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toBeNull();
++    controller.abort();
++  });
++
++  it("clears when a new item lands", async () => {
++    const { sink, controller } = bindPumped("conv_prog_b");
++    sink.push("session.progress", { conversation_id: "conv_prog_b", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toEqual(STORED);
++
++    sink.push("response.output_item.done", {
++      item: {
++        type: "function_call",
++        id: "fc_1",
++        response_id: "resp_1",
++        name: "Write",
++        arguments: "{}",
++        call_id: "call_1",
++        status: "completed",
++      },
++    });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toBeNull();
++    controller.abort();
++  });
++
++  it("clears when the session goes idle, and ignores another session's line", async () => {
++    const { sink, controller } = bindPumped("conv_prog_c");
++    sink.push("session.progress", { conversation_id: "conv_other", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toBeNull();
++
++    sink.push("session.progress", { conversation_id: "conv_prog_c", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toEqual(STORED);
++
++    sink.push("session.status", { conversation_id: "conv_prog_c", status: "idle" });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toBeNull();
++    controller.abort();
++  });
++
++  it("clears when the session is superseded by /clear", async () => {
++    const { sink, controller } = bindPumped("conv_prog_s");
++    sink.push("session.progress", { conversation_id: "conv_prog_s", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toEqual(STORED);
++
++    sink.push("session.superseded", {
++      conversation_id: "conv_prog_s",
++      target_conversation_id: "conv_prog_new",
++    });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toBeNull();
++    controller.abort();
++  });
++
++  it("does not carry a line over to another conversation", async () => {
++    const { sink, controller } = bindPumped("conv_prog_d");
++    sink.push("session.progress", { conversation_id: "conv_prog_d", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().aeProgress).toEqual(STORED);
++
++    bindConversationForTest("conv_prog_e");
++    expect(useChatStore.getState().aeProgress).toBeNull();
++    controller.abort();
++  });
++});
++
++describe("chat store lastEventAt counts content and turn starts only", () => {
++  it("stamps the switch to running once, not repeated running, usage or model posts", async () => {
++    const now = vi.spyOn(Date, "now").mockReturnValue(2_000_000);
++    const { sink, controller } = bindPumped("conv_prog_g", "idle");
++
++    sink.push("session.status", { conversation_id: "conv_prog_g", status: "running" });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(2_000_000);
++
++    now.mockReturnValue(2_005_000);
++    sink.push("session.status", { conversation_id: "conv_prog_g", status: "running" });
++    sink.push("session.model", { conversation_id: "conv_prog_g", model: "model-x" });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(2_000_000);
++    controller.abort();
++  });
++
++  it("ignores status, model and progress events while already running", async () => {
++    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
++    const { sink, controller } = bindPumped("conv_prog_f");
++
++    sink.push("session.status", { conversation_id: "conv_prog_f", status: "running" });
++    sink.push("session.model", { conversation_id: "conv_prog_f", model: "model-x" });
++    sink.push("session.progress", { conversation_id: "conv_prog_f", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBeNull();
++
++    now.mockReturnValue(1_005_000);
++    sink.push("response.output_item.done", {
++      item: {
++        type: "message",
++        id: "msg_1",
++        response_id: "resp_1",
++        role: "assistant",
++        content: [{ type: "output_text", text: "Done." }],
++      },
++    });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(1_005_000);
++
++    now.mockReturnValue(1_009_000);
++    sink.push("session.progress", { conversation_id: "conv_prog_f", ...CRUNCHING });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(1_005_000);
++    controller.abort();
++  });
++});
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index b3e423b69961236df64a945638c1af031f7b4fb2..ecd9bcd47e979b6dd980ff24dd7d1cce6455ae9c 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -83,7 +83,8 @@ import type {
+   StreamEvent,
+ } from "@/lib/events";
+ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
+-import { aeStampLastEvent } from "@/lib/aeSessionActivity";
++import type { AeSessionProgress } from "@/lib/aeSessionProgress";
++import { aeObserveStreamEvent } from "@/lib/aeStreamObserver";
+ import { randomUUID } from "@/lib/randomUUID";
+ import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
+ import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+@@ -688,6 +689,8 @@ export interface ConversationState {
+   lastEventAt: number | null;
+   /** Epoch ms `sessionStatus` last switched to running, or `null` when not seen. */
+   aeRunningSince: number | null;
++  /** The terminal's live spinner line (`session.progress`), or `null` when none shows. */
++  aeProgress: AeSessionProgress | null;
+   /**
+    * Whether the active session is a native-terminal wrapper
+    * (claude-native / codex-native), derived from the `omnigent.wrapper`
+@@ -1881,6 +1884,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+   blockedOn: null,
+   lastEventAt: null,
+   aeRunningSince: null,
++  aeProgress: null,
+   isNativeTerminalSession: false,
+   nativeVendorOwnsModel: false,
+   boundAgentId: null,
+@@ -4534,6 +4538,7 @@ async function bindStream(
+         blockedOn: null,
+         // Events seen on an earlier visit are stale; the snapshot's blocks date it.
+         lastEventAt: null,
++        aeProgress: null,
+         // This conversation's own effective effort, which is what a warm switch
+         // back re-projects (it does not re-bind, so it cannot recompute it).
+         sessionReasoningEffort: effectiveEffort,
+@@ -8198,7 +8203,9 @@ async function* tapSessionEvents(
+   for await (const event of events) {
+     if (!isConversationDisposed(conversationId)) {
+       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+-      aeStampLastEvent(conversationId, setterFor(conversationId));
++      aeObserveStreamEvent(event, conversationId, setterFor(conversationId), () =>
++        setterForState(conversationId),
++      );
+     }
+     if (event.type === "session_status" || event.type === "session_interrupted") {
+       beforeTurnEdge?.();
+diff --git a/web/src/store/conversationState.ts b/web/src/store/conversationState.ts
+index 9d7ff8523788a4ea278b5475d5b3fa1049829e36..9c170e039e5fc81c44a0776e2208a202ff1dbcba 100644
+--- a/web/src/store/conversationState.ts
++++ b/web/src/store/conversationState.ts
+@@ -25,6 +25,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
+   blockedOn: true,
+   lastEventAt: true,
+   aeRunningSince: true,
++  aeProgress: true,
+   isNativeTerminalSession: true,
+   nativeVendorOwnsModel: true,
+   boundAgentId: true,
+@@ -95,6 +96,7 @@ export function createInitialConversationState(): ConversationState {
+     blockedOn: null,
+     lastEventAt: null,
+     aeRunningSince: null,
++    aeProgress: null,
+     isNativeTerminalSession: false,
+     nativeVendorOwnsModel: false,
+     boundAgentId: null,

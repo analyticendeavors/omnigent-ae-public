@@ -1,0 +1,3175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 08:34:21 -0700
+Subject: [PATCH 030/148] [ae-patch] Add composer teams and separate model
+ context usage
+
+---
+ omnigent/inner/ae_team.py                     |  85 +++++
+ omnigent/inner/codex_native_executor.py       |  12 +
+ omnigent/inner/native_attachments.py          |   5 +-
+ omnigent/server/item_observers.py             |   1 +
+ .../server/routes/_sessions/orchestration.py  |  19 +
+ omnigent/server/scheduled/retention.py        |   2 +
+ .../stores/conversation_store/__init__.py     |   2 +
+ tests/e2e_ui/visual/test_ae_collaboration.py  |  82 ++++
+ tests/inner/test_ae_team.py                   |  72 ++++
+ tests/inner/test_codex_native_executor.py     |  51 +++
+ tests/server/integration/test_ae_team.py      |  75 ++++
+ web/src/components/AePlanLimits.stories.tsx   | 189 +++++++++
+ web/src/components/AePlanLimits.test.tsx      | 360 +++++++++++++++++-
+ web/src/components/AePlanLimits.tsx           | 254 +++++++++---
+ web/src/components/AeTeamControl.stories.tsx  |  77 ++++
+ web/src/components/AeTeamControl.test.tsx     | 125 ++++++
+ web/src/components/AeTeamControl.tsx          | 350 +++++++++++++++++
+ web/src/components/aeSessionContext.test.ts   | 233 ++++++++++++
+ web/src/components/aeSessionContext.ts        | 339 +++++++++++++++++
+ web/src/lib/aeTeam.test.ts                    | 144 +++++++
+ web/src/lib/aeTeam.ts                         | 111 ++++++
+ web/src/lib/sessionsApi.ts                    |   6 +
+ web/src/pages/ChatPage.tsx                    |   9 +
+ web/src/store/chatStore.test.ts               |  12 +-
+ web/src/store/chatStore.ts                    |   5 +
+ 25 files changed, 2546 insertions(+), 74 deletions(-)
+ create mode 100644 omnigent/inner/ae_team.py
+ create mode 100644 tests/e2e_ui/visual/test_ae_collaboration.py
+ create mode 100644 tests/inner/test_ae_team.py
+ create mode 100644 tests/server/integration/test_ae_team.py
+ create mode 100644 web/src/components/AePlanLimits.stories.tsx
+ create mode 100644 web/src/components/AeTeamControl.stories.tsx
+ create mode 100644 web/src/components/AeTeamControl.test.tsx
+ create mode 100644 web/src/components/AeTeamControl.tsx
+ create mode 100644 web/src/components/aeSessionContext.test.ts
+ create mode 100644 web/src/components/aeSessionContext.ts
+ create mode 100644 web/src/lib/aeTeam.test.ts
+ create mode 100644 web/src/lib/aeTeam.ts
+
+diff --git a/omnigent/inner/ae_team.py b/omnigent/inner/ae_team.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7c96d7dab449fd247205074d1981b19fef3db0f4
+--- /dev/null
++++ b/omnigent/inner/ae_team.py
+@@ -0,0 +1,85 @@
++"""User-selected collaboration rosters, delivered as transient turn context."""
++
++from __future__ import annotations
++
++import json
++from typing import TYPE_CHECKING, Any
++
++if TYPE_CHECKING:
++    from omnigent.entities.conversation import Conversation
++    from omnigent.stores.conversation_store import ConversationStore
++
++TEAM_LABEL = "ae.team"
++TEAM_LIMIT = 6
++
++
++def codex_team_context(content: object) -> dict[str, object] | None:
++    """Transport the team preference separately from visible Codex user input."""
++    if not isinstance(content, list):
++        return None
++    for block in reversed(content):
++        if not isinstance(block, dict) or block.get("type") != "_omnigent_framework_notice":
++            continue
++        text = render_team_notice(block.get("source_metadata"))
++        if text:
++            return {"omnigent.team": {"kind": "application", "value": text}}
++    return None
++
++
++def team_notice(conv: Conversation, store: ConversationStore) -> dict[str, object] | None:
++    """Resolve roster ids against direct children; never trust a label as access control."""
++    raw = conv.labels.get(TEAM_LABEL)
++    if not raw or len(raw) > 16_384:
++        return None
++    try:
++        config = json.loads(raw)
++    except (TypeError, ValueError):
++        return None
++    if not isinstance(config, dict) or config.get("version") != 1:
++        return None
++    mode = config.get("mode")
++    if mode == "solo":
++        return {"ae_team": {"mode": "solo", "members": []}}
++    members = config.get("members")
++    if mode != "team" or not isinstance(members, list) or len(members) > TEAM_LIMIT:
++        return None
++    resolved: list[dict[str, str | None]] = []
++    seen: set[str] = set()
++    for member in members:
++        session_id = member.get("sessionId") if isinstance(member, dict) else None
++        if not isinstance(session_id, str) or not session_id or session_id in seen:
++            continue
++        child = store.get_conversation(session_id)
++        if child is None or child.parent_conversation_id != conv.id:
++            continue
++        seen.add(session_id)
++        resolved.append({"session_id": child.id, "agent_id": child.agent_id})
++    return {"ae_team": {"mode": "team", "members": resolved}}
++
++
++def render_team_notice(metadata: Any) -> str | None:
++    """Canonical wording shared by SDK and native framework-notice transports."""
++    if not isinstance(metadata, dict) or not isinstance(metadata.get("ae_team"), dict):
++        return None
++    roster = metadata["ae_team"]
++    if roster.get("mode") == "solo":
++        return (
++            "The user selected Solo for this message. Handle this request yourself; "
++            "do not delegate new work to previously selected collaborators. "
++            "Existing work is not cancelled by this preference."
++        )
++    if roster.get("mode") != "team":
++        return None
++    return (
++        "The user selected Team for this message. You are the lead and give the user "
++        "one integrated answer. These are existing direct child sessions selected "
++        "by the user (JSON data): "
++        + json.dumps(roster.get("members", []), ensure_ascii=True)
++        + ". Delegate useful, bounded tasks to these sessions with sys_session_send "
++        "when available, or ae.post_message and ae.omni_transcript. Give each "
++        "collaborator the relevant context; their context windows are independent. "
++        "Coordinate file ownership for edits, then inspect and integrate their results. "
++        "If delegation tools or a selected session are unavailable, tell the user; "
++        "do not claim collaboration occurred. This preference does not authorize "
++        "extra external actions beyond the user's request."
++    )
+diff --git a/omnigent/inner/codex_native_executor.py b/omnigent/inner/codex_native_executor.py
+index 4d19564cc2a2394073cab53e8a3b0b6ba58c74b4..0313fa926859386c036cc3045d7173db7100fd25 100644
+--- a/omnigent/inner/codex_native_executor.py
++++ b/omnigent/inner/codex_native_executor.py
+@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_native.bridge import (
+     read_unmirrored_codex_settings,
+     update_active_turn_id,
+ )
++from omnigent.inner.ae_team import codex_team_context
+ from omnigent.inner.codex_goal_command import (
+     goal_objective_from_content,
+     goal_objective_length_error,
+@@ -327,6 +328,7 @@ async def _start_codex_turn(
+     state: CodexNativeBridgeState,
+     input_items: list[dict[str, object]],
+     settings_overrides: Mapping[str, object],
++    additional_context: dict[str, object] | None = None,
+ ) -> None:
+     """Apply optional settings and start one Codex turn on an idle thread."""
+     settings_overrides = dict(settings_overrides)
+@@ -380,6 +382,7 @@ async def _start_codex_turn(
+         {
+             "threadId": state.thread_id,
+             "input": input_items,
++            **({"additionalContext": additional_context} if additional_context else {}),
+             "environments": [
+                 {
+                     "environmentId": "local",
+@@ -404,6 +407,7 @@ async def _steer_codex_turn(
+     bridge_dir: Path,
+     state: CodexNativeBridgeState,
+     input_items: list[dict[str, object]],
++    additional_context: dict[str, object] | None = None,
+ ) -> None:
+     """Steer one bridge-recorded active Codex turn."""
+     assert state.active_turn_id is not None
+@@ -414,6 +418,7 @@ async def _steer_codex_turn(
+             "threadId": state.thread_id,
+             "expectedTurnId": state.active_turn_id,
+             "input": input_items,
++            **({"additionalContext": additional_context} if additional_context else {}),
+         },
+         state,
+         bridge_dir=bridge_dir,
+@@ -432,6 +437,7 @@ async def _inject_codex_turn(
+     state: CodexNativeBridgeState,
+     input_items: list[dict[str, object]],
+     settings_overrides: Mapping[str, object],
++    additional_context: dict[str, object] | None = None,
+ ) -> None:
+     """Steer an active turn or start one, recovering one proven stale steer."""
+     if state.active_turn_id is None:
+@@ -441,6 +447,7 @@ async def _inject_codex_turn(
+             state=state,
+             input_items=input_items,
+             settings_overrides=settings_overrides,
++            additional_context=additional_context,
+         )
+         return
+ 
+@@ -451,6 +458,7 @@ async def _inject_codex_turn(
+             bridge_dir=bridge_dir,
+             state=state,
+             input_items=input_items,
++            additional_context=additional_context,
+         )
+         return
+     except CodexAppServerResponseError as error:
+@@ -474,6 +482,7 @@ async def _inject_codex_turn(
+             bridge_dir=bridge_dir,
+             state=recovered_state,
+             input_items=input_items,
++            additional_context=additional_context,
+         )
+         return
+     _logger.info("Codex native reconciled completed stale turn: turn_id=%s", expected_turn_id)
+@@ -483,6 +492,7 @@ async def _inject_codex_turn(
+         state=recovered_state,
+         input_items=input_items,
+         settings_overrides=settings_overrides,
++        additional_context=additional_context,
+     )
+ 
+ 
+@@ -550,6 +560,7 @@ class CodexNativeExecutor(Executor):
+                     state=state,
+                     input_items=input_items,
+                     settings_overrides={},
++                    additional_context=codex_team_context(content),
+                 )
+             except Exception as exc:  # noqa: BLE001 - steering is best-effort from the runner facade.
+                 _logger.warning(
+@@ -809,6 +820,7 @@ class CodexNativeExecutor(Executor):
+                                 state=state,
+                                 input_items=input_items,
+                                 settings_overrides=settings_overrides,
++                                additional_context=codex_team_context(latest_user_content),
+                             )
+                     except Exception as exc:
+                         if isinstance(exc, _CodexNativeInputUndelivered):
+diff --git a/omnigent/inner/native_attachments.py b/omnigent/inner/native_attachments.py
+index de32b5091897eaaf9f20587f6e852beae7dd83c8..c8a8bb498afcb9d6fe057cd717a8c4d34832c5d5 100644
+--- a/omnigent/inner/native_attachments.py
++++ b/omnigent/inner/native_attachments.py
+@@ -478,7 +478,10 @@ def framework_notices(content: object) -> list[str]:
+     for block in content:
+         if not isinstance(block, dict) or block.get("type") != FRAMEWORK_NOTICE_BLOCK_TYPE:
+             continue
+-        text = resize_notice(block.get("source_metadata"))
++        from omnigent.inner.ae_team import render_team_notice
++
++        metadata = block.get("source_metadata")
++        text = render_team_notice(metadata) or resize_notice(metadata)
+         if text:
+             notices.append(text)
+     return notices
+diff --git a/omnigent/server/item_observers.py b/omnigent/server/item_observers.py
+index a4737c483ba7dab41c8804f3a10c10c7341c36dc..3d1a73baff5733523a6364db450e341b6c35370d 100644
+--- a/omnigent/server/item_observers.py
++++ b/omnigent/server/item_observers.py
+@@ -35,6 +35,7 @@ ItemObserver = Callable[[str, Sequence[ConversationItem]], Any]
+ _observers: list[ItemObserver] = []
+ # Strong references to in-flight observer tasks: the loop keeps only weak
+ # ones, so a task referenced nowhere else could be collected mid-flight.
++# custom-lint: disable-next=workspace-scoped-cache -- task objects are globally unique
+ _pending: set[asyncio.Task[None]] = set()
+ 
+ 
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 846a3f44dfc56fa68d8d79773d819b98f49772ef..2b36f82fcb87a1a6b1e690d053a5fb898ee4bfc1 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -5733,6 +5733,7 @@ async def _forward_native_terminal_message(
+     artifact_store: ArtifactStore | None = None,
+     model_override: str | None = None,
+     input_delivery: Mapping[str, object] | None = None,
++    conversation_store: ConversationStore | None = None,
+ ) -> None:
+     """
+     Forward one Omnigent web-chat message to the native terminal harness.
+@@ -5772,6 +5773,13 @@ async def _forward_native_terminal_message(
+         attributes=input_attributes(input_delivery),
+         harness=harness,
+     )
++    if conversation_store is not None:
++        from omnigent.inner.ae_team import team_notice
++        from omnigent.inner.native_attachments import framework_notice_block
++
++        notice = await asyncio.to_thread(team_notice, conv, conversation_store)
++        if notice is not None:
++            event["content"] = [*event["content"], framework_notice_block(notice)]
+     _logger.info(
+         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
+         display_name,
+@@ -6408,6 +6416,16 @@ async def _forward_event_to_runner(
+     # harness don't have access to the server's file store — the
+     # LLM endpoint needs the actual content, not an internal ID.
+     forwarded_data = dict(body.data)
++    if body.type == "message" and body.data.get("role") == "user":
++        from omnigent.inner.ae_team import team_notice
++        from omnigent.inner.native_attachments import framework_notice_block
++
++        notice = await asyncio.to_thread(team_notice, conv, conversation_store)
++        if notice is not None:
++            forwarded_data["content"] = [
++                *forwarded_data.get("content", []),
++                framework_notice_block(notice),
++            ]
+     if (
+         file_store is not None
+         and artifact_store is not None
+@@ -7562,6 +7580,7 @@ async def _dispatch_session_event_to_runner_impl(
+                     _native_routed_model if _native_applied_model is not None else None
+                 ),
+                 input_delivery=input_delivery,
++                conversation_store=conversation_store,
+             )
+             forwarded = True
+             if pending_id is not None:
+diff --git a/omnigent/server/scheduled/retention.py b/omnigent/server/scheduled/retention.py
+index 66cf0cf1cd7b07bd8f053425e5fd827b9c940b20..bcdb229ce4c482c735a1c7a3a4a1b89f32127f73 100644
+--- a/omnigent/server/scheduled/retention.py
++++ b/omnigent/server/scheduled/retention.py
+@@ -59,10 +59,12 @@ _retention_table = Table(
+     # NULL means "keep every run session" (retention off for this task).
+     Column("keep_runs", Integer, nullable=True),
+ )
++# custom-lint: disable-next=workspace-scoped-cache -- schema readiness is shared per engine
+ _ready_engines: set[int] = set()
+ _ready_lock = threading.Lock()
+ # Stores without a database (test fakes) keep the setting in memory, keyed by
+ # store identity, workspace and task.
++# custom-lint: disable-next=workspace-scoped-cache -- each key includes the workspace id
+ _memory: dict[tuple[int, int, str], int | None] = {}
+ 
+ 
+diff --git a/omnigent/stores/conversation_store/__init__.py b/omnigent/stores/conversation_store/__init__.py
+index ae583f2b5d3c12f9fb9661c25b22fa11b1b85e57..eb80ffa9560ce8c88f1a63127d78e4ef04aa547b 100644
+--- a/omnigent/stores/conversation_store/__init__.py
++++ b/omnigent/stores/conversation_store/__init__.py
+@@ -217,6 +217,8 @@ _INSTANCE_SCOPED_LABEL_KEYS = frozenset(
+ # fails loudly here.
+ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
+ _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
++    "ae.team",
++    "ae.team.member",
+     ARCHIVED_AT_LABEL_KEY,
+     SIDE_CHAT_LABEL_KEY,
+     SIDE_CHAT_SOURCE_LABEL_KEY,
+diff --git a/tests/e2e_ui/visual/test_ae_collaboration.py b/tests/e2e_ui/visual/test_ae_collaboration.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a09c3e0e68d6b88679390553af8c7487d4ee7b77
+--- /dev/null
++++ b/tests/e2e_ui/visual/test_ae_collaboration.py
+@@ -0,0 +1,82 @@
++"""Responsive collaboration controls and separate context meters in a browser.
++
++Run against a built Storybook, or set AE_UI_STORYBOOK_URL to its local dev URL.
++"""
++
++import os
++import threading
++from collections.abc import Iterator
++from functools import partial
++from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
++from pathlib import Path
++
++import pytest
++from playwright.sync_api import Page, expect
++
++pytestmark = pytest.mark.visual
++
++
++@pytest.fixture(scope="module")
++def collaboration_storybook() -> Iterator[str]:
++    external = os.environ.get("AE_UI_STORYBOOK_URL")
++    if external:
++        yield external.rstrip("/")
++        return
++    root = Path(__file__).resolve().parents[3] / "web" / "storybook-static"
++    if not (root / "index.html").is_file():
++        pytest.skip("Build Storybook or set AE_UI_STORYBOOK_URL to run browser checks.")
++    server = ThreadingHTTPServer(
++        ("127.0.0.1", 0), partial(SimpleHTTPRequestHandler, directory=root)
++    )
++    thread = threading.Thread(target=server.serve_forever, daemon=True)
++    thread.start()
++    try:
++        yield f"http://127.0.0.1:{server.server_port}"
++    finally:
++        server.shutdown()
++        server.server_close()
++        thread.join()
++
++
++@pytest.mark.parametrize("width", [390, 1280])
++def test_team_selection_and_model_choices(
++    page: Page, collaboration_storybook: str, width: int
++) -> None:
++    page.set_viewport_size({"width": width, "height": 844})
++    page.goto(f"{collaboration_storybook}/iframe.html?id=components-aeteamcontrol--mixed-team")
++    expect(page.get_by_role("checkbox", name="Codex")).to_be_checked()
++    expect(page.get_by_role("checkbox", name="Claude")).to_be_checked()
++    page.get_by_role("combobox", name="Model for Codex").select_option("example-model")
++    expect(page.get_by_role("combobox", name="Model for Codex")).to_have_value("example-model")
++    expect(
++        page.get_by_role("checkbox", name="Another agent Authentication required")
++    ).to_be_disabled()
++    page.get_by_role("button", name="Solo One agent handles the work").click()
++    expect(page.get_by_role("checkbox")).to_have_count(0)
++    page.get_by_role("button", name="Team A lead with collaborators").click()
++    expect(page.get_by_role("checkbox", name="Claude")).to_be_checked()
++    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
++
++
++def test_codex_and_claude_have_separate_context_rows(
++    page: Page, collaboration_storybook: str
++) -> None:
++    page.set_viewport_size({"width": 390, "height": 844})
++    page.goto(
++        f"{collaboration_storybook}/iframe.html?id=components-aeplanlimitspanel--with-collaborators"
++    )
++    expect(page.get_by_test_id("ae-context-active")).to_contain_text("Codex")
++    expect(page.get_by_test_id("ae-context-collaborators")).to_contain_text("Claude")
++    expect(page.get_by_test_id("ae-context-active").get_by_role("progressbar")).to_have_attribute(
++        "aria-valuenow", "30"
++    )
++    expect(page.get_by_test_id("ae-limits-plans")).to_contain_text("Weekly limit")
++    assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
++
++
++def test_unknown_context_is_not_zero_usage(page: Page, collaboration_storybook: str) -> None:
++    page.goto(
++        f"{collaboration_storybook}/iframe.html?id=components-aeplanlimitspanel--missing-telemetry"
++    )
++    expect(page.get_by_test_id("ae-context-active").get_by_role("progressbar")).to_have_count(0)
++    expect(page.get_by_test_id("ae-context-unavailable")).to_contain_text("not reported")
+diff --git a/tests/inner/test_ae_team.py b/tests/inner/test_ae_team.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..52f6b00b64ff7cfdf54137743b197a71aaa261af
+--- /dev/null
++++ b/tests/inner/test_ae_team.py
+@@ -0,0 +1,72 @@
++"""Team selection is bounded, parent-scoped and invisible in authored messages."""
++
++import json
++from unittest.mock import Mock
++
++import pytest
++
++from omnigent.entities.conversation import Conversation, MessageData
++from omnigent.inner.ae_team import TEAM_LABEL, render_team_notice, team_notice
++from omnigent.inner.native_attachments import expand_framework_notices, framework_notice_block
++
++
++def conversation(id: str, **kwargs: object) -> Conversation:
++    return Conversation(id=id, root_conversation_id=id, created_at=0, updated_at=0, **kwargs)
++
++
++def test_roster_only_resolves_existing_direct_children() -> None:
++    parent = conversation(
++        "parent",
++        labels={
++            TEAM_LABEL: json.dumps(
++                {
++                    "version": 1,
++                    "mode": "team",
++                    "members": [
++                        {"sessionId": "child"},
++                        {"sessionId": "unrelated"},
++                        {"sessionId": "missing"},
++                        {"sessionId": "child"},
++                        {"sessionId": 42},
++                    ],
++                }
++            )
++        },
++    )
++    child = conversation("child", parent_conversation_id="parent", agent_id="codex")
++    store = Mock()
++    store.get_conversation.side_effect = lambda id: {
++        "child": child,
++        "unrelated": conversation("unrelated"),
++    }.get(id)
++    notice = team_notice(parent, store)
++    assert notice == {
++        "ae_team": {"mode": "team", "members": [{"session_id": "child", "agent_id": "codex"}]}
++    }
++
++
++@pytest.mark.parametrize("raw", ["null", "{", '{"version":2}', "x" * 20_000])
++def test_malformed_rosters_do_not_break_messages(raw: str) -> None:
++    store = Mock()
++    assert team_notice(conversation("parent", labels={TEAM_LABEL: raw}), store) is None
++    store.get_conversation.assert_not_called()
++
++
++def test_solo_tells_lead_to_stop_new_delegation_without_querying_children() -> None:
++    store = Mock()
++    notice = team_notice(
++        conversation("parent", labels={TEAM_LABEL: '{"version":1,"mode":"solo"}'}), store
++    )
++    assert "do not delegate new work" in (render_team_notice(notice) or "")
++    store.get_conversation.assert_not_called()
++
++
++def test_notice_is_transient_and_cannot_be_authored_by_clients() -> None:
++    block = framework_notice_block({"ae_team": {"mode": "team", "members": []}})
++    content = [{"type": "input_text", "text": "Help with my demo"}, block]
++    expanded = expand_framework_notices([{"role": "user", "content": content}])
++    assert expanded[0]["role"] == "system"
++    assert "sys_session_send" in expanded[0]["content"][0]["text"]
++    assert expanded[1] == {"role": "user", "content": content[:1]}
++    with pytest.raises(ValueError, match="reserved"):
++        MessageData(role="user", content=content)
+diff --git a/tests/inner/test_codex_native_executor.py b/tests/inner/test_codex_native_executor.py
+index 642a2474ef13d2c9d90d527fd123d72487cf5c69..9aba5d26e4463ebc8c90a567f327ed6f3c83e38b 100644
+--- a/tests/inner/test_codex_native_executor.py
++++ b/tests/inner/test_codex_native_executor.py
+@@ -910,6 +910,57 @@ def test_image_block_is_sent_as_local_image_not_inline_base64(
+     )
+ 
+ 
++@pytest.mark.parametrize("active", [False, True])
++def test_team_roster_is_sent_as_application_context(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, active: bool
++) -> None:
++    """Both start and steer carry the roster without changing the user bubble."""
++    from omnigent.inner.native_attachments import framework_notice_block
++
++    _FakeCodexNativeClient.requests = []
++    monkeypatch.setattr(
++        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
++        _FakeCodexNativeClient,
++    )
++    _start_state(tmp_path)
++    if active:
++        codex_native_executor.update_active_turn_id(tmp_path, "running-turn")
++    executor = CodexNativeExecutor(bridge_dir=tmp_path)
++
++    async def run() -> None:
++        async for _ in executor.run_turn(
++            [
++                {
++                    "role": "user",
++                    "content": [
++                        {"type": "input_text", "text": "Build the demo"},
++                        framework_notice_block(
++                            {
++                                "ae_team": {
++                                    "mode": "team",
++                                    "members": [
++                                        {"session_id": "child", "agent_id": "claude"},
++                                    ],
++                                }
++                            }
++                        ),
++                    ],
++                }
++            ],
++            [],
++            "",
++        ):
++            pass
++
++    asyncio.run(run())
++    method, params = _FakeCodexNativeClient.requests[-1]
++    assert method == ("turn/steer" if active else "turn/start")
++    assert params["input"] == [{"type": "text", "text": "Build the demo"}]
++    context = params["additionalContext"]["omnigent.team"]
++    assert context["kind"] == "application"
++    assert '"session_id": "child"' in context["value"]
++
++
+ def test_resize_notice_is_encoded_in_model_visible_image_path(
+     monkeypatch: pytest.MonkeyPatch,
+     tmp_path: Path,
+diff --git a/tests/server/integration/test_ae_team.py b/tests/server/integration/test_ae_team.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e805ae5ec1b0e61156455c061dc520fe3fb62c58
+--- /dev/null
++++ b/tests/server/integration/test_ae_team.py
+@@ -0,0 +1,75 @@
++"""Selected team context reaches native and SDK runners without polluting history."""
++
++import json
++
++import httpx
++import pytest
++
++from omnigent.inner.ae_team import TEAM_LABEL
++from omnigent.inner.native_attachments import framework_notices
++from omnigent.server.routes._sessions import orchestration
++from omnigent.server.schemas import SessionEventInput
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from tests.server.helpers import create_test_agent
++
++
++@pytest.mark.parametrize("native", [False, True])
++async def test_team_forward_preserves_authored_message(
++    client: httpx.AsyncClient, db_uri: str, native: bool
++) -> None:
++    agent = await create_test_agent(client, name="team-lead")
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert created.status_code == 201
++    parent_id = created.json()["id"]
++    store = SqlAlchemyConversationStore(db_uri)
++    child = store.create_conversation(
++        kind="sub_agent",
++        parent_conversation_id=parent_id,
++        agent_id=agent["id"],
++    )
++    labels = {
++        TEAM_LABEL: json.dumps(
++            {
++                "version": 1,
++                "mode": "team",
++                "members": [
++                    {"sessionId": child.id},
++                ],
++            }
++        )
++    }
++    if native:
++        labels.update({"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"})
++    store.set_labels(parent_id, labels)
++    parent = store.get_conversation(parent_id)
++    assert parent is not None
++    content = [{"type": "input_text", "text": "Build the demo"}]
++    event = SessionEventInput(type="message", data={"role": "user", "content": content})
++    sent: list[dict] = []
++
++    def capture(request: httpx.Request) -> httpx.Response:
++        sent.append(json.loads(request.content))
++        return httpx.Response(202, json={"queued": True})
++
++    async with httpx.AsyncClient(
++        base_url="http://runner.test", transport=httpx.MockTransport(capture)
++    ) as runner:
++        if native:
++            await orchestration._forward_native_terminal_message(
++                runner,
++                parent_id,
++                parent,
++                event,
++                conversation_store=store,
++            )
++        else:
++            await orchestration._forward_event_to_runner(parent_id, parent, event, store, runner)
++    assert event.data["content"] == content
++    forwarded = sent[-1]["content"]
++    assert forwarded[0] == content[0]
++    assert child.id in framework_notices(forwarded)[0]
++    items = store.list_items(parent_id).data
++    if native:
++        assert not items  # Native transcript forwarder remains the single writer.
++    else:
++        assert items[0].data.content == content
+diff --git a/web/src/components/AePlanLimits.stories.tsx b/web/src/components/AePlanLimits.stories.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..01a7a0fd4b0533205dd3c09937217ff7bb89dce8
+--- /dev/null
++++ b/web/src/components/AePlanLimits.stories.tsx
+@@ -0,0 +1,189 @@
++import type { Decorator, Meta, StoryObj } from "@storybook/react-vite";
++import type { ComponentProps } from "react";
++import { type AeLimitsAnswer, AePlanLimitsPanel } from "./AePlanLimits";
++
++const NOW = Date.parse("2026-10-13T16:00:00Z");
++const iso = (ms: number) => new Date(ms).toISOString();
++
++const LIMITS: AeLimitsAnswer = {
++  now: iso(NOW),
++  harnesses: {
++    claude: {
++      harness: "claude",
++      source: "statusline+usage",
++      observed_at: iso(NOW - 60_000),
++      plan: "Max 20x",
++      windows: [
++        {
++          id: "five_hour",
++          label: "5-hour limit",
++          used_percent: 41,
++          resets_at: iso(NOW + 2 * 3_600_000),
++          window_minutes: 300,
++        },
++        {
++          id: "seven_day",
++          label: "Weekly, all models",
++          used_percent: 63,
++          resets_at: iso(NOW + 3 * 86_400_000),
++          window_minutes: 10080,
++        },
++      ],
++      note: null,
++      contexts: [
++        {
++          conversation_id: "conv_claude",
++          observed_at: iso(NOW - 2 * 60_000),
++          model: "Fable",
++          window_size: 1_000_000,
++          used_tokens: 216_800,
++          input_tokens: 5_000,
++          cache_write_tokens: 1_800,
++          cache_read_tokens: 210_000,
++        },
++        {
++          conversation_id: "conv_reviewer",
++          observed_at: iso(NOW - 3 * 3_600_000),
++          model: "Fable",
++          window_size: 1_000_000,
++          used_tokens: 88_000,
++          input_tokens: 2_000,
++          cache_write_tokens: 0,
++          cache_read_tokens: 86_000,
++        },
++      ],
++    },
++    codex: {
++      harness: "codex",
++      source: "app-server",
++      observed_at: iso(NOW - 4 * 60_000),
++      plan: "Pro",
++      windows: [
++        {
++          id: "weekly",
++          label: "Weekly limit",
++          used_percent: 30,
++          resets_at: iso(NOW + 86_400_000),
++          window_minutes: 10080,
++        },
++      ],
++      note: null,
++    },
++  },
++};
++
++/** The popover's own frame: 20rem wide, capped height, scrolling body. */
++const PopoverFrame: Decorator = (Story) => (
++  <div className="max-h-[32rem] w-full max-w-80 overflow-y-auto rounded-md border bg-popover p-4 text-sm text-popover-foreground shadow-md">
++    <Story />
++  </div>
++);
++
++/** A 375px phone with the popover's 1rem gutters and a short visible height. */
++const PhoneFrame: Decorator = (Story) => (
++  <div className="w-full max-w-[375px] bg-background px-4 py-6" data-testid="ae-phone-frame">
++    <div className="max-h-[26rem] w-full overflow-y-auto rounded-md border bg-popover p-4 text-sm text-popover-foreground shadow-md">
++      <Story />
++    </div>
++  </div>
++);
++
++const meta = {
++  title: "Components/AePlanLimitsPanel",
++  component: AePlanLimitsPanel,
++  args: { data: LIMITS, now: NOW },
++} satisfies Meta<typeof AePlanLimitsPanel>;
++
++export default meta;
++type Story = StoryObj<typeof meta>;
++
++export const CodexActive: Story = {
++  decorators: [PopoverFrame],
++  args: {
++    conversationId: "conv_codex",
++    harness: "codex-native",
++    model: "gpt-5.5",
++    contextWindow: 400_000,
++    tokensUsed: 120_000,
++  },
++};
++
++export const ClaudeActive: Story = {
++  decorators: [PopoverFrame],
++  args: {
++    conversationId: "conv_claude",
++    harness: "claude-native",
++    model: "claude-fable-5-1",
++    contextWindow: 1_000_000,
++    tokensUsed: 216_800,
++  },
++};
++
++const TEAM: Partial<ComponentProps<typeof AePlanLimitsPanel>> = {
++  conversationId: "conv_codex",
++  harness: "codex-native",
++  model: "gpt-5.5",
++  contextWindow: 400_000,
++  tokensUsed: 120_000,
++  sessions: {
++    self: {
++      harness: "codex-native",
++      llmModel: "gpt-5.5",
++      contextWindow: 400_000,
++      lastTotalTokens: 120_000,
++    },
++    collaborators: [
++      {
++        id: "conv_reviewer",
++        name: "Review the context meter change",
++        snapshot: {
++          harness: "claude-native",
++          llmModel: "claude-fable-5-1",
++          contextWindow: null,
++          lastTotalTokens: null,
++        },
++      },
++      {
++        id: "conv_tests",
++        name: "Write the popover tests",
++        snapshot: {
++          harness: "pi",
++          llmModel: "gemini-3-pro",
++          contextWindow: 1_000_000,
++          lastTotalTokens: 640_000,
++        },
++      },
++      {
++        id: "conv_docs",
++        name: "Draft the release note",
++        snapshot: {
++          harness: "codex-native",
++          llmModel: null,
++          contextWindow: null,
++          lastTotalTokens: null,
++        },
++      },
++    ],
++    hidden: 1,
++  },
++};
++
++/** Codex leads with three collaborators: one live, one stale status line, one silent. */
++export const WithCollaborators: Story = { decorators: [PopoverFrame], args: TEAM };
++
++/** No session yet and no limits reading: every row says unavailable, none reads 0%. */
++export const MissingTelemetry: Story = {
++  decorators: [PopoverFrame],
++  args: {
++    data: { now: iso(NOW), harnesses: {} },
++    harness: "codex-native",
++    conversationId: "conv_waiting_for_context",
++  },
++};
++
++/** Responsive screenshot target: the team view in a 375px phone frame, scrolling. */
++export const PhoneWidth: Story = {
++  args: TEAM,
++  decorators: [PhoneFrame],
++  parameters: { layout: "fullscreen" },
++};
+diff --git a/web/src/components/AePlanLimits.test.tsx b/web/src/components/AePlanLimits.test.tsx
+index 70163821dbe412244ad7833d7129cb6e259b1542..6df5acabb4d2b2318ba2c04158cd936f2452e6eb 100644
+--- a/web/src/components/AePlanLimits.test.tsx
++++ b/web/src/components/AePlanLimits.test.tsx
+@@ -18,6 +18,7 @@ import {
+   formatTokens,
+   limitTone,
+ } from "./AePlanLimits";
++import type { AeSessionContextsState } from "./aeSessionContext";
+ 
+ const NOW = Date.parse("2026-09-24T16:00:00Z");
+ const iso = (ms: number) => new Date(ms).toISOString().replace(".000Z", "Z");
+@@ -183,11 +184,13 @@ describe("AePlanLimitsPanel", () => {
+         conversationId="conv_a"
+         contextWindow={1_000_000}
+         tokensUsed={216_800}
++        harness="claude-native"
++        model="claude-fable-5-1"
+       />,
+     );
+     const bars = screen.getAllByRole("progressbar");
+     expect(bars.map((bar) => bar.getAttribute("aria-label"))).toEqual([
+-      "Context window: 22% used",
++      "This session context (Claude Code): 22% used",
+       "5-hour limit: 41% used",
+       "Weekly, all models: 63% used",
+       "Weekly · Fable: 22% used",
+@@ -217,7 +220,9 @@ describe("AePlanLimitsPanel", () => {
+   });
+ 
+   it("captions the prompt cache bar and gives each part its own colour", () => {
+-    render(<AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_a" />);
++    render(
++      <AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_a" harness="claude-native" />,
++    );
+     const breakdown = screen.getByTestId("ae-context-breakdown");
+     const caption = within(breakdown).getByTestId("ae-context-breakdown-caption");
+     expect(caption.textContent).toBe("How those tokens were billed (prompt cache)");
+@@ -234,15 +239,29 @@ describe("AePlanLimitsPanel", () => {
+   });
+ 
+   it("shows another session's breakdown only for that session", () => {
+-    render(<AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_other" />);
++    render(
++      <AePlanLimitsPanel
++        data={FULL}
++        now={NOW}
++        conversationId="conv_other"
++        harness="claude-native"
++      />,
++    );
+     expect(screen.queryByTestId("ae-context-breakdown")).toBeNull();
+-    // No live ring figures and no capture for this session: no context row at all.
+-    expect(screen.queryByTestId("ae-limits-context")).toBeNull();
++    // No live ring figures and no capture for this session: unavailable, never a 0% bar.
++    const context = screen.getByTestId("ae-limits-context");
++    expect(within(context).queryByRole("progressbar")).toBeNull();
++    expect(within(context).getByTestId("ae-context-unavailable").textContent).toContain(
++      "Claude Code has not reported context usage",
++    );
+   });
+ 
+   it("falls back to the session's status line when the ring has no figures", () => {
+-    render(<AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_a" />);
++    render(
++      <AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_a" harness="claude-native" />,
++    );
+     expect(screen.getByText("216.8k / 1M · 22%")).toBeTruthy();
++    expect(screen.getByText("From Claude Code's status line, 2m ago")).toBeTruthy();
+   });
+ 
+   it("shows the hint when the login lacks the profile scope, and credits turned off", () => {
+@@ -273,12 +292,260 @@ describe("AePlanLimitsPanel", () => {
+   });
+ });
+ 
++describe("AePlanLimitsPanel session contexts", () => {
++  // FULL's status line for conv_a, plus Claude limits and a Codex weekly window.
++  const WITH_CODEX: AeLimitsAnswer = {
++    now: iso(NOW),
++    harnesses: {
++      claude: FULL.harnesses.claude,
++      codex: {
++        harness: "codex",
++        source: "app-server",
++        observed_at: iso(NOW - 60_000),
++        plan: "Pro",
++        windows: [
++          {
++            id: "weekly",
++            label: "Weekly limit",
++            used_percent: 30,
++            resets_at: iso(NOW + 86_400_000),
++            window_minutes: 10080,
++          },
++        ],
++        note: null,
++      },
++    },
++  };
++  const contextLabels = () =>
++    within(screen.getByTestId("ae-limits-context"))
++      .queryAllByRole("progressbar")
++      .map((bar) => bar.getAttribute("aria-label"));
++  const planOrder = () =>
++    screen.getAllByTestId("ae-limits-harness").map((block) => block.getAttribute("data-harness"));
++
++  it("labels a Codex session's context and puts the Codex plan first", () => {
++    render(
++      <AePlanLimitsPanel
++        data={WITH_CODEX}
++        now={NOW}
++        conversationId="conv_codex"
++        harness="codex-native"
++        model="gpt-5.5"
++        contextWindow={400_000}
++        tokensUsed={120_000}
++      />,
++    );
++    expect(contextLabels()).toEqual(["This session context (Codex): 30% used"]);
++    const active = screen.getByTestId("ae-context-active");
++    expect(within(active).getByTestId("ae-usage-who").textContent).toBe("Codex · gpt-5.5");
++    expect(planOrder()).toEqual(["codex", "claude"]);
++    const inUse = screen.getByTestId("ae-limits-in-use");
++    expect(inUse.closest("[data-harness]")?.getAttribute("data-harness")).toBe("codex");
++    // Context and plan limits are separate sections.
++    expect(
++      within(screen.getByTestId("ae-limits-plans")).queryByText(/This session context/),
++    ).toBeNull();
++  });
++
++  it("never shows a Claude status line for a Codex session, even on the same id", () => {
++    render(
++      <AePlanLimitsPanel
++        data={WITH_CODEX}
++        now={NOW}
++        conversationId="conv_a"
++        harness="codex-native"
++      />,
++    );
++    expect(contextLabels()).toEqual([]);
++    expect(screen.queryByTestId("ae-context-breakdown")).toBeNull();
++    expect(screen.getByTestId("ae-context-unavailable").textContent).toContain(
++      "Codex has not reported context usage for this session yet",
++    );
++  });
++
++  it("labels a Claude Code session and keeps its cache breakdown", () => {
++    render(
++      <AePlanLimitsPanel
++        data={WITH_CODEX}
++        now={NOW}
++        conversationId="conv_a"
++        harness="claude-native"
++        model="claude-fable-5-1"
++        contextWindow={1_000_000}
++        tokensUsed={216_800}
++      />,
++    );
++    expect(contextLabels()).toEqual(["This session context (Claude Code): 22% used"]);
++    expect(screen.getByTestId("ae-context-breakdown")).toBeTruthy();
++    expect(planOrder()).toEqual(["claude", "codex"]);
++    expect(
++      screen
++        .getByTestId("ae-limits-in-use")
++        .closest("[data-harness]")
++        ?.getAttribute("data-harness"),
++    ).toBe("claude");
++  });
++
++  it("gives each collaborator its own row and never sums them", () => {
++    const sessions: AeSessionContextsState = {
++      self: {
++        harness: "codex-native",
++        llmModel: "gpt-5.5",
++        contextWindow: 400_000,
++        lastTotalTokens: 80_000,
++      },
++      collaborators: [
++        {
++          id: "conv_a",
++          name: "Review the diff",
++          // A Claude Code child with no snapshot figures: its status line speaks for it.
++          snapshot: {
++            harness: "claude-native",
++            llmModel: null,
++            contextWindow: null,
++            lastTotalTokens: null,
++          },
++        },
++        {
++          id: "conv_pi",
++          name: "Write tests",
++          snapshot: {
++            harness: "pi",
++            llmModel: "gemini-3-pro",
++            contextWindow: 1_000_000,
++            lastTotalTokens: 100_000,
++          },
++        },
++        {
++          id: "conv_quiet",
++          name: "Draft docs",
++          snapshot: {
++            harness: "codex-native",
++            llmModel: null,
++            contextWindow: null,
++            lastTotalTokens: null,
++          },
++        },
++        { id: "conv_gone", name: "Lost child", snapshot: null, error: "404 Not Found" },
++      ],
++      hidden: 2,
++    };
++    render(
++      <AePlanLimitsPanel
++        data={WITH_CODEX}
++        now={NOW}
++        conversationId="conv_codex"
++        harness="codex-native"
++        model="gpt-5.5"
++        contextWindow={400_000}
++        tokensUsed={120_000}
++        sessions={sessions}
++      />,
++    );
++    // Live store figures win over the snapshot for the active row.
++    expect(contextLabels()).toEqual([
++      "This session context (Codex): 30% used",
++      "Review the diff context (Claude Code): 22% used",
++      "Write tests context (Pi): 10% used",
++    ]);
++    const collaborators = screen.getByTestId("ae-context-collaborators");
++    const missing = within(collaborators).getAllByTestId("ae-context-unavailable");
++    expect(missing.map((row) => row.getAttribute("data-session"))).toEqual([
++      "conv_quiet",
++      "conv_gone",
++    ]);
++    expect(missing[1].textContent).toContain("Could not load this session (404 Not Found)");
++    expect(collaborators.textContent).toContain("2 more collaborators not shown.");
++    // No row reads a combined total of the windows above.
++    expect(screen.queryByText(/2\.4M|336\.8k/)).toBeNull();
++  });
++
++  it("marks an old status line as possibly out of date", () => {
++    render(
++      <AePlanLimitsPanel
++        data={FULL}
++        now={NOW + 3 * 3_600_000}
++        conversationId="conv_a"
++        harness="claude-native"
++      />,
++    );
++    expect(screen.getByText(/status line, 3h 2m ago \(may be out of date\)$/)).toBeTruthy();
++    const bar = within(screen.getByTestId("ae-limits-context")).getByRole("progressbar");
++    expect((bar.firstChild as HTMLElement).className).toContain("bg-foreground/25");
++  });
++
++  it("says unavailable before the session exists rather than showing zero", () => {
++    render(<AePlanLimitsPanel data={WITH_CODEX} now={NOW} harness="codex-native" />);
++    expect(contextLabels()).toEqual([]);
++    expect(screen.getByTestId("ae-context-unavailable").textContent).toContain(
++      "No session yet; the reading appears after the first reply.",
++    );
++  });
++
++  it("trusts the session snapshot when the store still holds the previous agent", () => {
++    // The agent moved from Claude Code to Codex; the store has not rebound yet.
++    render(
++      <AePlanLimitsPanel
++        data={WITH_CODEX}
++        now={NOW}
++        conversationId="conv_a"
++        harness="claude-native"
++        model="claude-fable-5-1"
++        contextWindow={1_000_000}
++        tokensUsed={216_800}
++        sessions={{
++          self: {
++            harness: "codex-native",
++            llmModel: "gpt-5.5",
++            contextWindow: null,
++            lastTotalTokens: null,
++          },
++          collaborators: [],
++        }}
++      />,
++    );
++    expect(contextLabels()).toEqual([]);
++    expect(screen.queryByTestId("ae-context-breakdown")).toBeNull();
++    const active = screen.getByTestId("ae-context-active");
++    expect(within(active).getByTestId("ae-usage-who").textContent).toBe("Codex · gpt-5.5");
++    expect(planOrder()).toEqual(["codex", "claude"]);
++  });
++});
++
++/** Answers the popover's requests by path: limits, session snapshots, child lists. */
++function routeFetch(
++  limits: AeLimitsAnswer,
++  sessions: Record<string, Record<string, unknown>> = {},
++  children: Record<string, Record<string, unknown>[]> = {},
++) {
++  vi.mocked(authenticatedFetch).mockImplementation((input) => {
++    const url = String(input);
++    const json = (body: unknown, status = 200) =>
++      Promise.resolve(new Response(JSON.stringify(body), { status }));
++    if (url === "/v1/ae/limits") return json(limits);
++    const childList = url.match(/^\/v1\/sessions\/([^/?]+)\/child_sessions$/);
++    if (childList) return json({ object: "list", data: children[childList[1]] ?? [] });
++    const snapshot = url.match(/^\/v1\/sessions\/([^/?]+)\?/);
++    const wire = snapshot ? sessions[snapshot[1]] : undefined;
++    if (wire) return json({ agent_id: "agent", status: "idle", created_at: 0, ...wire });
++    return json({ detail: "not found" }, 404);
++  });
++}
++
+ describe("AePlanLimitsPopover", () => {
+   beforeEach(() => {
+     vi.mocked(authenticatedFetch).mockReset();
+-    vi.mocked(authenticatedFetch).mockImplementation(() =>
+-      Promise.resolve(new Response(JSON.stringify(ANSWER), { status: 200 })),
+-    );
++    routeFetch(ANSWER);
++  });
++
++  afterEach(() => {
++    useChatStore.setState({
++      conversationId: null,
++      contextWindow: null,
++      tokensUsed: null,
++      sessionHarness: null,
++      llmModel: null,
++    });
+   });
+ 
+   // Upstream's ring, unchanged, with the popover mounted beside it the way
+@@ -342,15 +609,80 @@ describe("AePlanLimitsPopover", () => {
+   });
+ 
+   it("shows this session's context from the chat store", async () => {
+-    vi.mocked(authenticatedFetch).mockImplementation(() =>
+-      Promise.resolve(new Response(JSON.stringify(FULL), { status: 200 })),
+-    );
+-    useChatStore.setState({ conversationId: "conv_a", contextWindow: 100_000, tokensUsed: 12_000 });
++    routeFetch(FULL, { conv_a: { id: "conv_a", harness: "claude-native" } });
++    useChatStore.setState({
++      conversationId: "conv_a",
++      contextWindow: 100_000,
++      tokensUsed: 12_000,
++      sessionHarness: "claude-native",
++    });
+     renderRing();
+     fireEvent.click(screen.getByTestId("composer-context-ring"));
+     await waitFor(() => expect(screen.getByTestId("ae-context-breakdown")).toBeTruthy());
+     expect(screen.getByText("12k / 100k · 12%")).toBeTruthy();
+-    useChatStore.setState({ conversationId: null, contextWindow: null, tokensUsed: null });
++  });
++
++  it("lists collaborators' own windows only while open", async () => {
++    routeFetch(
++      ANSWER,
++      {
++        conv_codex: { id: "conv_codex", harness: "codex-native", llm_model: "gpt-5.5" },
++        conv_kid: {
++          id: "conv_kid",
++          harness: "claude-native",
++          llm_model: "claude-fable-5-1",
++          context_window: 1_000_000,
++          last_total_tokens: 50_000,
++        },
++      },
++      {
++        conv_codex: [
++          {
++            id: "conv_kid",
++            title: "claude_code:review",
++            task_summary: "Review the diff",
++            tool: null,
++            session_name: null,
++            current_task_status: null,
++            busy: false,
++          },
++        ],
++      },
++    );
++    useChatStore.setState({
++      conversationId: "conv_codex",
++      contextWindow: 400_000,
++      tokensUsed: 100_000,
++      sessionHarness: "codex-native",
++      llmModel: "gpt-5.5",
++    });
++    renderRing();
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++    fireEvent.click(screen.getByTestId("composer-context-ring"));
++    await waitFor(() => expect(screen.getByTestId("ae-context-collaborators")).toBeTruthy());
++    const context = screen.getByTestId("ae-limits-context");
++    expect(
++      within(context)
++        .getAllByRole("progressbar")
++        .map((bar) => bar.getAttribute("aria-label")),
++    ).toEqual([
++      "This session context (Codex): 25% used",
++      "Review the diff context (Claude Code): 5% used",
++    ]);
++    expect(
++      screen
++        .getByTestId("ae-limits-in-use")
++        .closest("[data-harness]")
++        ?.getAttribute("data-harness"),
++    ).toBe("codex");
++    // Closing stops the polling: no request lands after the popover is gone.
++    fireEvent.keyDown(document.activeElement ?? document.body, { key: "Escape" });
++    await waitFor(() => expect(screen.queryByText("Usage")).toBeNull());
++    const calls = vi.mocked(authenticatedFetch).mock.calls.length;
++    await new Promise((resolve) => {
++      setTimeout(resolve, 20);
++    });
++    expect(vi.mocked(authenticatedFetch).mock.calls.length).toBe(calls);
+   });
+ 
+   it("ignores clicks anywhere else", () => {
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index 98fb689caf19dadc271ab744f20db1ab5de0717f..dcfc70a118eb94d051d7e335cff970d98569cd8d 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -15,6 +15,15 @@ import { type AeTone, contextTone } from "@/lib/aeContextTone";
+ import { authenticatedFetch } from "@/lib/identity";
+ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
++import {
++  type AeContextEntry,
++  type AeContextReading,
++  type AeSessionContextsState,
++  aeLimitsHarnessFor,
++  buildActiveContext,
++  buildCollaboratorContext,
++  useAeSessionContexts,
++} from "./aeSessionContext";
+ 
+ export const AE_LIMITS_PATH = "/v1/ae/limits";
+ 
+@@ -163,6 +172,8 @@ function UsageRow({
+   value,
+   pct,
+   detail,
++  sublabel,
++  ariaLabel = label,
+   muted = false,
+   tone = limitTone(pct),
+   children,
+@@ -172,6 +183,9 @@ function UsageRow({
+   value: string;
+   pct: number;
+   detail?: string | null;
++  /** Second line under the label: which agent and model the bar belongs to. */
++  sublabel?: string | null;
++  ariaLabel?: string;
+   muted?: boolean;
+   /** Defaults to the plan limit steps; the context row passes `contextTone`. */
+   tone?: AeTone;
+@@ -186,10 +200,15 @@ function UsageRow({
+           {value}
+         </span>
+       </div>
++      {sublabel && (
++        <span className="-mt-1 truncate text-xs text-muted-foreground" data-testid="ae-usage-who">
++          {sublabel}
++        </span>
++      )}
+       <div
+         className="h-1.5 w-full overflow-hidden rounded-full bg-foreground/10"
+         role="progressbar"
+-        aria-label={`${label}: ${rounded}% used`}
++        aria-label={`${ariaLabel}: ${rounded}% used`}
+         aria-valuemin={0}
+         aria-valuemax={100}
+         aria-valuenow={Math.min(rounded, 100)}
+@@ -305,35 +324,101 @@ function ContextBreakdown({ context, now }: { context: AeSessionContext; now: nu
+   );
+ }
+ 
+-/** Context window: the ring's live numbers, else the session's last status line. */
+-function ContextRow({
+-  contextWindow,
+-  tokensUsed,
+-  context,
++function readingDetail(reading: AeContextReading, now: number): string | null {
++  if (reading.source === "live") return null;
++  if (reading.source === "snapshot") return "As of the session's last reply";
++  const ago = reading.observedAt ? formatAgo(reading.observedAt, now) : "earlier";
++  return `From Claude Code's status line, ${ago}${reading.stale ? " (may be out of date)" : ""}`;
++}
++
++/** One session's own context window, or a plain "unavailable" in place of a bar. */
++function ContextEntryRow({ entry, now }: { entry: AeContextEntry; now: number }) {
++  const who = [entry.agent, entry.model].filter(Boolean).join(" · ") || null;
++  const ariaLabel = `${entry.name} context${entry.agent ? ` (${entry.agent})` : ""}`;
++  const { reading } = entry;
++  if (!reading) {
++    return (
++      <li
++        className="flex flex-col gap-1"
++        data-testid="ae-context-unavailable"
++        data-session={entry.key}
++        data-role={entry.role}
++      >
++        <div className="flex items-baseline justify-between gap-2">
++          <span className="min-w-0 truncate">{entry.name}</span>
++          <span className="shrink-0 text-xs text-muted-foreground">Unavailable</span>
++        </div>
++        {who && (
++          <span className="-mt-1 truncate text-xs text-muted-foreground" data-testid="ae-usage-who">
++            {who}
++          </span>
++        )}
++        <span className="text-xs text-muted-foreground">{entry.unavailable}</span>
++      </li>
++    );
++  }
++  const pct = (reading.used / reading.size) * 100;
++  return (
++    <UsageRow
++      id={`context:${entry.key}`}
++      label={entry.name}
++      sublabel={who}
++      ariaLabel={ariaLabel}
++      value={`${formatTokens(reading.used)} / ${formatTokens(reading.size)} · ${Math.round(pct)}%`}
++      pct={pct}
++      tone={contextTone(pct)}
++      muted={reading.stale}
++      detail={readingDetail(reading, now)}
++    >
++      {entry.breakdown && <ContextBreakdown context={entry.breakdown} now={now} />}
++    </UsageRow>
++  );
++}
++
++/** Context windows: this session first, then each collaborator, never summed. */
++function ContextSection({
++  active,
++  collaborators,
++  hidden = 0,
++  error,
+   now,
+ }: {
+-  contextWindow?: number | null;
+-  tokensUsed?: number | null;
+-  context?: AeSessionContext;
++  active: AeContextEntry;
++  collaborators: AeContextEntry[];
++  hidden?: number;
++  error?: string | null;
+   now: number;
+ }) {
+-  const live = contextWindow != null && contextWindow > 0 && tokensUsed != null;
+-  const size = live ? contextWindow : context?.window_size;
+-  const used = live ? tokensUsed : context?.used_tokens;
+-  if (!size || used == null) return null;
+-  const pct = (used / size) * 100;
+   return (
+-    <ul className="flex flex-col" data-testid="ae-limits-context">
+-      <UsageRow
+-        id="context"
+-        label="Context window"
+-        value={`${formatTokens(used)} / ${formatTokens(size)} · ${Math.round(pct)}%`}
+-        pct={pct}
+-        tone={contextTone(pct)}
+-      >
+-        {context && <ContextBreakdown context={context} now={now} />}
+-      </UsageRow>
+-    </ul>
++    <section className="flex flex-col gap-2" data-testid="ae-limits-context">
++      <div className="flex flex-col">
++        <h3 className="font-medium">Context window</h3>
++        <span className="text-xs text-muted-foreground">
++          Per session and model; one session's window does not include another's.
++        </span>
++      </div>
++      <ul className="flex flex-col gap-2" data-testid="ae-context-active">
++        <ContextEntryRow entry={active} now={now} />
++      </ul>
++      {(collaborators.length > 0 || error || hidden > 0) && (
++        <div className="flex flex-col gap-2" data-testid="ae-context-collaborators">
++          <h4 className="text-xs font-medium text-muted-foreground">Collaborators</h4>
++          <ul className="flex flex-col gap-2">
++            {collaborators.map((c) => (
++              <ContextEntryRow key={c.key} entry={c} now={now} />
++            ))}
++          </ul>
++          {hidden > 0 && (
++            <p className="text-xs text-muted-foreground">
++              {hidden} more {hidden === 1 ? "collaborator" : "collaborators"} not shown.
++            </p>
++          )}
++          {error && (
++            <p className="text-xs text-muted-foreground">Could not list collaborators ({error}).</p>
++          )}
++        </div>
++      )}
++    </section>
+   );
+ }
+ 
+@@ -352,15 +437,23 @@ function HarnessBlock({
+   harness,
+   snapshot,
+   now,
++  inUse = false,
+ }: {
+   harness: AeHarness;
+   snapshot: AeLimitSnapshot | null | undefined;
+   now: number;
++  /** This session runs on this harness's plan. */
++  inUse?: boolean;
+ }) {
+   return (
+-    <section className="flex flex-col gap-2" data-testid="ae-limits-harness" data-harness={harness}>
++    <section
++      className="flex flex-col gap-2"
++      data-testid="ae-limits-harness"
++      data-harness={harness}
++      data-in-use={inUse || undefined}
++    >
+       <div className="flex items-baseline justify-between gap-2">
+-        <h3 className="font-medium">
++        <h3 className="min-w-0 font-medium">
+           {AE_HARNESS_NAMES[harness]}
+           {snapshot?.plan && (
+             <span
+@@ -370,6 +463,14 @@ function HarnessBlock({
+               {snapshot.plan}
+             </span>
+           )}
++          {inUse && (
++            <span
++              className="ml-1.5 rounded bg-foreground/10 px-1 text-xs font-normal"
++              data-testid="ae-limits-in-use"
++            >
++              This session
++            </span>
++          )}
+         </h3>
+         {snapshot && (
+           <span
+@@ -404,53 +505,84 @@ function HarnessBlock({
+   );
+ }
+ 
++const NO_SESSIONS: AeSessionContextsState = { collaborators: [] };
++
+ /** The popover body; exported so tests and stories render it without a click. */
+ export function AePlanLimitsPanel({
+   data,
+   error,
+   loading,
+   now = Date.now(),
+-  conversationId,
+-  contextWindow,
+-  tokensUsed,
++  conversationId = null,
++  contextWindow = null,
++  tokensUsed = null,
++  harness = null,
++  model = null,
++  sessions = NO_SESSIONS,
+ }: {
+   data?: AeLimitsAnswer;
+   error?: unknown;
+   loading?: boolean;
+   now?: number;
+   conversationId?: string | null;
++  /** The store's live ring figures for the active session. */
+   contextWindow?: number | null;
+   tokensUsed?: number | null;
++  /** The active session's harness and model, e.g. `"codex-native"`, `"gpt-5.5"`. */
++  harness?: string | null;
++  model?: string | null;
++  /** This session's snapshot and its collaborators', from `useAeSessionContexts`. */
++  sessions?: AeSessionContextsState;
+ }) {
+-  const context = conversationId
+-    ? data?.harnesses.claude?.contexts?.find((c) => c.conversation_id === conversationId)
+-    : undefined;
++  const statusLines = data?.harnesses.claude?.contexts;
++  const active = buildActiveContext(
++    { conversationId, harness, model, contextWindow, tokensUsed },
++    sessions.self,
++    statusLines,
++    now,
++  );
++  const collaborators = sessions.collaborators.map((c) =>
++    buildCollaboratorContext(c, statusLines, now),
++  );
++  // The active row's harness, so a stale store harness cannot pick the block.
++  const inUse = aeLimitsHarnessFor(active.harness);
++  const order: AeHarness[] = inUse === "codex" ? ["codex", "claude"] : ["claude", "codex"];
+   return (
+     <div className="flex flex-col gap-3" data-testid="ae-plan-limits">
+       <div className="font-medium">Usage</div>
+-      <ContextRow
+-        contextWindow={contextWindow}
+-        tokensUsed={tokensUsed}
+-        context={context}
++      <ContextSection
++        active={active}
++        collaborators={collaborators}
++        hidden={sessions.hidden}
++        error={sessions.error}
+         now={now}
+       />
+-      {error ? (
+-        <p className="text-xs text-destructive">
+-          Could not load plan limits ({error instanceof Error ? error.message : String(error)}). The
+-          /v1/ae/limits route belongs to omnigent-ae; check the server is on a current tag.
+-        </p>
+-      ) : loading && !data ? (
+-        <p className="text-xs text-muted-foreground">Loading…</p>
+-      ) : (
+-        (["claude", "codex"] as const).map((harness) => (
+-          <HarnessBlock
+-            key={harness}
+-            harness={harness}
+-            snapshot={data?.harnesses[harness]}
+-            now={now}
+-          />
+-        ))
+-      )}
++      <div className="flex flex-col gap-3 border-t pt-3" data-testid="ae-limits-plans">
++        <div className="flex flex-col">
++          <h3 className="font-medium">Plan limits</h3>
++          <span className="text-xs text-muted-foreground">
++            Account-wide; shared by every session on that plan.
++          </span>
++        </div>
++        {error ? (
++          <p className="text-xs text-destructive">
++            Could not load plan limits ({error instanceof Error ? error.message : String(error)}).
++            The /v1/ae/limits route belongs to omnigent-ae; check the server is on a current tag.
++          </p>
++        ) : loading && !data ? (
++          <p className="text-xs text-muted-foreground">Loading…</p>
++        ) : (
++          order.map((h) => (
++            <HarnessBlock
++              key={h}
++              harness={h}
++              snapshot={data?.harnesses[h]}
++              now={now}
++              inUse={inUse === h}
++            />
++          ))
++        )}
++      </div>
+     </div>
+   );
+ }
+@@ -508,17 +640,20 @@ export const AE_CONTEXT_RING_SELECTOR = '[data-testid="composer-context-ring"]';
+  * Escape in another pane left the popover open; a window blur is what that
+  * click produces here (found 2026-09-24).
+  *
+- * The context row reads the same chat store fields the ring does
+- * (`contextWindow`, `tokensUsed`) and the session id, so ChatPage.tsx passes
+- * nothing and the patch stays two lines there.
++ * The context rows read the same chat store fields the ring does
++ * (`contextWindow`, `tokensUsed`, harness, model) and the session id, so
++ * ChatPage.tsx passes nothing and the patch stays two lines there.
+  */
+ export function AePlanLimitsPopover() {
+   const conversationId = useChatStore((s) => s.conversationId);
+   const contextWindow = useChatStore((s) => s.contextWindow);
+   const tokensUsed = useChatStore((s) => s.tokensUsed);
++  const harness = useChatStore((s) => s.sessionHarness);
++  const model = useChatStore((s) => s.llmModel);
+   const [anchor, setAnchor] = useState<HTMLElement | null>(null);
+   const open = anchor !== null;
+   const { data, error, loading } = useAeLimits(open);
++  const sessions = useAeSessionContexts(open, conversationId, 60_000, `${harness}:${model}`);
+   useEffect(() => {
+     const onClick = (event: MouseEvent) => {
+       const target = event.target instanceof Element ? event.target : null;
+@@ -553,7 +688,7 @@ export function AePlanLimitsPopover() {
+       <PopoverContent
+         side="top"
+         align="end"
+-        // Nine rows outgrow a phone: cap at the room Radix measured and scroll.
++        // Context rows plus plan limits outgrow a phone: cap at the room Radix measured and scroll.
+         className="max-h-(--radix-popover-content-available-height) w-80 max-w-[calc(100vw-2rem)] overflow-y-auto"
+         onInteractOutside={keepOpenOnRing}
+         onCloseAutoFocus={(event) => {
+@@ -570,6 +705,9 @@ export function AePlanLimitsPopover() {
+           conversationId={conversationId}
+           contextWindow={contextWindow}
+           tokensUsed={tokensUsed}
++          harness={harness}
++          model={model}
++          sessions={sessions}
+         />
+       </PopoverContent>
+     </Popover>
+diff --git a/web/src/components/AeTeamControl.stories.tsx b/web/src/components/AeTeamControl.stories.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..dd40022af4b4d82829b8ca60400927c009bd0ac7
+--- /dev/null
++++ b/web/src/components/AeTeamControl.stories.tsx
+@@ -0,0 +1,77 @@
++import { useState } from "react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import type { Meta, StoryObj } from "@storybook/react-vite";
++import type { AvailableAgent } from "@/hooks/useAvailableAgents";
++import type { Host } from "@/hooks/useHosts";
++import type { AeTeam } from "@/lib/aeTeam";
++import { AeTeamEditor } from "./AeTeamControl";
++
++const agents: AvailableAgent[] = [
++  {
++    id: "codex",
++    name: "codex",
++    display_name: "Codex",
++    description: null,
++    harness: "codex-native",
++    skills: [],
++  },
++  {
++    id: "claude",
++    name: "claude",
++    display_name: "Claude",
++    description: null,
++    harness: "claude-native",
++    skills: [],
++  },
++  {
++    id: "other",
++    name: "other",
++    display_name: "Another agent",
++    description: null,
++    harness: "other",
++    skills: [],
++  },
++];
++const host: Host = {
++  host_id: "demo",
++  name: "Workstation",
++  owner: "demo",
++  status: "online",
++  configured_harnesses: { "codex-native": true, "claude-native": true, other: "needs-auth" },
++};
++function TeamDemo() {
++  const [client] = useState(() => {
++    const query = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    for (const agent of agents)
++      query.setQueryData(
++        ["host-model-options", "demo", agent.harness],
++        [{ id: "example-model", displayName: "Available model", isDefault: true }],
++      );
++    return query;
++  });
++  const [draft, setDraft] = useState<AeTeam>({
++    version: 1,
++    mode: "team",
++    members: agents
++      .slice(0, 2)
++      .map((a) => ({ agentId: a.id, agentName: a.name, displayName: a.display_name, model: null })),
++  });
++  return (
++    <QueryClientProvider client={client}>
++      <div className="w-full max-w-md space-y-4 rounded-xl border bg-popover p-4 text-popover-foreground shadow-md">
++        <h2 className="text-lg font-semibold">Who works on this?</h2>
++        <div className="rounded-xl bg-muted/50 p-3">
++          <p className="text-xs text-muted-foreground">Lead / orchestrator</p>
++          <p className="text-sm font-medium">Codex</p>
++        </div>
++        <AeTeamEditor draft={draft} onChange={setDraft} agents={agents} host={host} />
++        <p className="text-xs text-muted-foreground">Applies to your next message.</p>
++      </div>
++    </QueryClientProvider>
++  );
++}
++export default { title: "Components/AeTeamControl", component: TeamDemo } satisfies Meta<
++  typeof TeamDemo
++>;
++type Story = StoryObj<typeof TeamDemo>;
++export const MixedTeam: Story = {};
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..02fdee561c36fd1b950d5ef442d8692f2cc10b71
+--- /dev/null
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -0,0 +1,125 @@
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { AeTeamControl } from "./AeTeamControl";
++import { saveAeTeam } from "@/lib/aeTeam";
++import type * as AeTeamModule from "@/lib/aeTeam";
++import type { Session } from "@/lib/types";
++
++vi.mock("@/lib/aeTeam", async (original) => ({
++  ...(await original<typeof AeTeamModule>()),
++  saveAeTeam: vi.fn(),
++}));
++// Change lead opens AppShell's fork dialog; the control renders without AppShell here.
++const forkDialog = vi.hoisted(() => ({ canFork: true, openForkDialog: vi.fn() }));
++vi.mock("@/shell/ForkDialogContext", () => ({ useForkDialog: () => forkDialog }));
++vi.mock("@/hooks/useAvailableAgents", () => ({
++  useAvailableAgents: () => ({
++    data: [
++      { id: "codex", name: "codex", display_name: "Codex", harness: "codex-native", skills: [] },
++      {
++        id: "claude",
++        name: "claude",
++        display_name: "Claude",
++        harness: "claude-native",
++        skills: [],
++      },
++      {
++        id: "other",
++        name: "other",
++        display_name: "Other agent",
++        harness: "unavailable",
++        skills: [],
++      },
++    ],
++  }),
++}));
++vi.mock("@/hooks/useHosts", () => ({
++  useHosts: () => ({
++    data: [
++      {
++        host_id: "host",
++        status: "online",
++        configured_harnesses: {
++          "codex-native": true,
++          "claude-native": true,
++          unavailable: "needs-auth",
++        },
++      },
++    ],
++  }),
++  useHostModelOptions: () => ({ data: [{ id: "test-model", displayName: "Available model" }] }),
++}));
++
++const session = { id: "parent", agentName: "Codex", hostId: "host", labels: {} } as Session;
++function mount(props: Partial<Parameters<typeof AeTeamControl>[0]> = {}) {
++  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  return render(
++    <QueryClientProvider client={client}>
++      <AeTeamControl session={session} {...props} />
++    </QueryClientProvider>,
++  );
++}
++beforeEach(() => vi.resetAllMocks());
++afterEach(cleanup);
++
++describe("composer team picker", () => {
++  it("opens and cancels without creating or saving a team", () => {
++    mount();
++    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++    fireEvent.click(screen.getByRole("button", { name: /A lead with collaborators/ }));
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude" }));
++    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
++    expect(saveAeTeam).not.toHaveBeenCalled();
++  });
++
++  it("saves both collaborators with their selected models", async () => {
++    vi.mocked(saveAeTeam).mockResolvedValue(session);
++    mount();
++    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++    fireEvent.click(screen.getByRole("button", { name: /A lead with collaborators/ }));
++    expect(screen.getByRole("button", { name: "Save selection" })).toBeDisabled();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Codex" }));
++    fireEvent.change(screen.getByRole("combobox", { name: "Model for Codex" }), {
++      target: { value: "test-model" },
++    });
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude" }));
++    expect(screen.getByRole("checkbox", { name: /Other agent/ })).toBeDisabled();
++    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
++    await waitFor(() =>
++      expect(saveAeTeam).toHaveBeenCalledWith("parent", {
++        version: 1,
++        mode: "team",
++        members: [
++          expect.objectContaining({ agentId: "codex", model: "test-model" }),
++          expect.objectContaining({ agentId: "claude", model: null }),
++        ],
++      }),
++    );
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++  });
++
++  it("keeps failed saves visible and preserves the selection for retry", async () => {
++    vi.mocked(saveAeTeam).mockRejectedValue(new Error("Host offline"));
++    mount();
++    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++    fireEvent.click(screen.getByRole("button", { name: /A lead with collaborators/ }));
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude" }));
++    fireEvent.click(screen.getByRole("button", { name: "Save selection" }));
++    expect(await screen.findByRole("alert")).toHaveTextContent("Host offline");
++    expect(screen.getByRole("checkbox", { name: "Claude" })).toBeChecked();
++  });
++
++  it("allows lead switching only when the turn has finished", () => {
++    mount({ working: true });
++    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++    expect(screen.getByRole("button", { name: "Change lead" })).toBeDisabled();
++  });
++
++  it("opens the existing history-preserving lead switcher", () => {
++    mount();
++    fireEvent.click(screen.getByRole("button", { name: "Collaboration: Solo" }));
++    fireEvent.click(screen.getByRole("button", { name: "Change lead" }));
++    expect(forkDialog.openForkDialog).toHaveBeenCalledWith({ sourceSessionId: "parent" });
++  });
++});
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb2c0046d952332590bd36c2335ecec2ebe06e62
+--- /dev/null
++++ b/web/src/components/AeTeamControl.tsx
+@@ -0,0 +1,350 @@
++import { useState } from "react";
++import { UsersRound } from "lucide-react";
++import { useQueryClient } from "@tanstack/react-query";
++import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
++import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
++import { childSessionsQueryKey } from "@/hooks/useChildSessions";
++import { harnessReadinessOnHost } from "@/lib/harnessSetup";
++import {
++  readAeTeam,
++  saveAeTeam,
++  AE_TEAM_LIMIT,
++  type AeTeam,
++  type AeTeamMember,
++} from "@/lib/aeTeam";
++import type { Session } from "@/lib/types";
++import { useForkDialog } from "@/shell/ForkDialogContext";
++import { Button } from "./ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "./ui/dialog";
++
++function MemberChoice({
++  agent,
++  host,
++  member,
++  disabled,
++  onChange,
++}: {
++  agent: AvailableAgent;
++  host: Host | null;
++  member: AeTeamMember | undefined;
++  disabled: boolean;
++  onChange: (member: AeTeamMember | null) => void;
++}) {
++  const readiness = harnessReadinessOnHost(agent.harness, host);
++  const catalog = useHostModelOptions(
++    host?.host_id ?? null,
++    agent.harness ?? "",
++    !!member && readiness.selectable,
++  );
++  const models = catalog.data ?? [];
++  const choose = (model: string | null) =>
++    onChange({
++      agentId: agent.id,
++      agentName: agent.name,
++      displayName: agent.display_name,
++      model,
++    });
++  return (
++    <div
++      className={`rounded-xl border p-3 ${member ? "border-primary/50 bg-primary/5" : "border-border"}`}
++    >
++      <label className="flex cursor-pointer items-center gap-3">
++        <input
++          type="checkbox"
++          className="size-4 accent-primary"
++          checked={!!member}
++          disabled={disabled || (!member && !readiness.selectable)}
++          onChange={(e) => (e.target.checked ? choose(null) : onChange(null))}
++        />
++        <span className="min-w-0 flex-1 text-sm font-medium">{agent.display_name}</span>
++        {readiness.explanation && (
++          <span className="text-xs text-muted-foreground">{readiness.explanation.label}</span>
++        )}
++      </label>
++      {member && (
++        <div className="mt-3 space-y-2">
++          <label className="block text-xs text-muted-foreground">
++            Model for {agent.display_name}
++            <select
++              aria-label={`Model for ${agent.display_name}`}
++              value={member.model ?? ""}
++              disabled={disabled}
++              onChange={(e) => choose(e.target.value || null)}
++              className="mt-1 w-full rounded-md border border-input bg-background px-2 py-2 text-sm text-foreground"
++            >
++              <option value="">Agent default</option>
++              {member.model && !models.some((m) => m.id === member.model) && (
++                <option value={member.model}>{member.model}</option>
++              )}
++              {models.map((model) => (
++                <option key={model.id} value={model.id}>
++                  {model.displayName ?? model.id}
++                </option>
++              ))}
++            </select>
++          </label>
++          {catalog.isFetching && <p className="text-xs text-muted-foreground">Loading models…</p>}
++          {catalog.isError && (
++            <p className="text-xs text-muted-foreground">
++              Model list unavailable. The agent default is still available.
++            </p>
++          )}
++          {readiness.explanation && (
++            <p className="text-xs text-muted-foreground">{readiness.explanation.description}</p>
++          )}
++        </div>
++      )}
++    </div>
++  );
++}
++
++export function AeTeamEditor({
++  draft,
++  onChange,
++  agents,
++  host,
++  disabled = false,
++}: {
++  draft: AeTeam;
++  onChange: (draft: AeTeam) => void;
++  agents: AvailableAgent[];
++  host: Host | null;
++  disabled?: boolean;
++}) {
++  return (
++    <div className="space-y-4">
++      <div className="grid grid-cols-2 gap-2" role="group" aria-label="Collaboration mode">
++        {(["solo", "team"] as const).map((mode) => (
++          <button
++            key={mode}
++            type="button"
++            aria-pressed={draft.mode === mode}
++            disabled={disabled}
++            onClick={() => onChange({ ...draft, mode })}
++            className={`rounded-xl border px-3 py-3 text-left ${draft.mode === mode ? "border-primary bg-primary/5" : "border-border"}`}
++          >
++            <span className="block text-sm font-medium">{mode === "solo" ? "Solo" : "Team"}</span>
++            <span className="text-xs text-muted-foreground">
++              {mode === "solo" ? "One agent handles the work" : "A lead with collaborators"}
++            </span>
++          </button>
++        ))}
++      </div>
++      {draft.mode === "team" && (
++        <div className="space-y-2">
++          <p className="text-sm font-medium">
++            Collaborators{" "}
++            <span className="text-muted-foreground">
++              {draft.members.length}/{AE_TEAM_LIMIT}
++            </span>
++          </p>
++          <p className="text-xs text-muted-foreground">
++            The lead assigns tasks and brings their results together. Each collaborator uses its own
++            context and account allowance.
++          </p>
++          {agents.length === 0 && (
++            <p className="text-sm text-muted-foreground">No agents available yet.</p>
++          )}
++          {agents.map((agent) => {
++            const member = draft.members.find((m) => m.agentId === agent.id);
++            return (
++              <MemberChoice
++                key={agent.id}
++                agent={agent}
++                host={host}
++                member={member}
++                disabled={disabled || (!member && draft.members.length >= AE_TEAM_LIMIT)}
++                onChange={(next) =>
++                  onChange({
++                    ...draft,
++                    members: [
++                      ...draft.members.filter((m) => m.agentId !== agent.id),
++                      ...(next ? [next] : []),
++                    ],
++                  })
++                }
++              />
++            );
++          })}
++          {draft.members
++            .filter((m) => !agents.some((a) => a.id === m.agentId))
++            .map((member) => (
++              <div
++                key={member.agentId}
++                className="flex items-center justify-between gap-2 rounded-md border p-3 text-sm"
++              >
++                <span>{member.displayName} · Unavailable</span>
++                <Button
++                  variant="ghost"
++                  disabled={disabled}
++                  onClick={() =>
++                    onChange({
++                      ...draft,
++                      members: draft.members.filter((m) => m.agentId !== member.agentId),
++                    })
++                  }
++                >
++                  Remove
++                </Button>
++              </div>
++            ))}
++        </div>
++      )}
++    </div>
++  );
++}
++
++/** Composer-level collaboration preferences; opening the picker never starts work. */
++export function AeTeamControl({
++  session,
++  disabled = false,
++  working = false,
++}: {
++  session: Session;
++  disabled?: boolean;
++  working?: boolean;
++}) {
++  const queryClient = useQueryClient();
++  const [open, setOpen] = useState(false);
++  // A new lead forks the session; in-place agent switching is not available.
++  const forkDialog = useForkDialog();
++  const [draft, setDraft] = useState<AeTeam>(() => readAeTeam(session.labels));
++  const [saving, setSaving] = useState(false);
++  const [error, setError] = useState<string | null>(null);
++  const saved = readAeTeam(session.labels);
++  const { data: agents = [], isLoading, isError } = useAvailableAgents({ enabled: open });
++  const { data: hosts = [] } = useHosts({ enabled: open, includeSandbox: true });
++  const host = hosts.find((h) => h.host_id === session.hostId) ?? null;
++  const invalid =
++    draft.mode === "team" &&
++    (!draft.members.length ||
++      draft.members.some((m) => {
++        const agent = agents.find((a) => a.id === m.agentId);
++        return !agent || !harnessReadinessOnHost(agent.harness, host).selectable;
++      }));
++  function changeOpen(next: boolean) {
++    if (saving) return;
++    if (next) {
++      setDraft(readAeTeam(session.labels));
++      setError(null);
++    }
++    setOpen(next);
++  }
++  async function save() {
++    if (disabled || invalid || saving || working) return;
++    setSaving(true);
++    setError(null);
++    try {
++      const updated = await saveAeTeam(session.id, draft);
++      queryClient.setQueryData(["session", session.id], updated);
++      await queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(session.id) });
++      setOpen(false);
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : "Could not save the team. Try again.");
++    } finally {
++      setSaving(false);
++    }
++  }
++  const team = saved.mode === "team";
++  return (
++    <>
++      <button
++        type="button"
++        aria-label={team ? `Team: ${saved.members.length} collaborators` : "Collaboration: Solo"}
++        title={team ? saved.members.map((m) => m.displayName).join(", ") : "Choose solo or a team"}
++        disabled={disabled}
++        onClick={() => changeOpen(true)}
++        className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
++      >
++        <UsersRound className="size-4" />
++        <span>{team ? `Team · ${saved.members.length}` : "Solo"}</span>
++      </button>
++      <Dialog open={open} onOpenChange={changeOpen}>
++        <DialogContent
++          className="flex max-h-[85dvh] flex-col gap-4 sm:max-w-lg"
++          data-testid="ae-team-dialog"
++        >
++          <DialogHeader>
++            <DialogTitle>Who works on this?</DialogTitle>
++            <DialogDescription>
++              Choose a lead and the collaborators you want involved.
++            </DialogDescription>
++          </DialogHeader>
++          <div className="min-h-0 space-y-4 overflow-y-auto px-1 pb-1">
++            <div className="flex items-center justify-between gap-3 rounded-xl bg-muted/50 p-3">
++              <div className="min-w-0">
++                <p className="text-xs text-muted-foreground">Lead / orchestrator</p>
++                <p className="truncate text-sm font-medium">
++                  {session.agentName ?? session.harness ?? "Current agent"}
++                </p>
++              </div>
++              <Button
++                variant="outline"
++                size="sm"
++                disabled={saving || working || disabled || !forkDialog?.canFork}
++                title={forkDialog?.disabledReason}
++                onClick={() => {
++                  setOpen(false);
++                  forkDialog?.openForkDialog({ sourceSessionId: session.id });
++                }}
++              >
++                Change lead
++              </Button>
++            </div>
++            {working && (
++              <p className="text-xs text-muted-foreground">
++                You can save collaboration changes after this turn finishes.
++              </p>
++            )}
++            {isLoading && <p className="text-sm text-muted-foreground">Loading agents…</p>}
++            {isError && (
++              <p role="alert" className="text-sm text-destructive">
++                Could not load available agents. Close and reopen to retry.
++              </p>
++            )}
++            <AeTeamEditor
++              draft={draft}
++              onChange={setDraft}
++              agents={agents}
++              host={host}
++              disabled={saving || disabled}
++            />
++            {draft.mode === "team" && (
++              <p className="text-xs text-muted-foreground">
++                Team uses your selected agents and models. Automatic collaborator routing will be
++                turned off.
++              </p>
++            )}
++            <p className="text-xs text-muted-foreground">
++              Applies to your next message. Existing work can finish when you switch to Solo.
++            </p>
++            {error && (
++              <p role="alert" className="text-sm text-destructive">
++                {error}
++              </p>
++            )}
++          </div>
++          <DialogFooter>
++            <Button variant="ghost" disabled={saving} onClick={() => changeOpen(false)}>
++              Cancel
++            </Button>
++            <Button
++              loading={saving}
++              disabled={disabled || invalid || saving || working}
++              onClick={() => void save()}
++            >
++              Save selection
++            </Button>
++          </DialogFooter>
++        </DialogContent>
++      </Dialog>
++    </>
++  );
++}
+diff --git a/web/src/components/aeSessionContext.test.ts b/web/src/components/aeSessionContext.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3a822cd7e6c7d68751917c9a9ccf9e2c7c549ec
+--- /dev/null
++++ b/web/src/components/aeSessionContext.test.ts
+@@ -0,0 +1,233 @@
++import { renderHook, waitFor } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++
++import { authenticatedFetch } from "@/lib/identity";
++import type { AeSessionContext } from "./AePlanLimits";
++import {
++  AE_MAX_COLLABORATORS,
++  aeAgentLabel,
++  aeLimitsHarnessFor,
++  buildActiveContext,
++  buildCollaboratorContext,
++  fetchAeSessionContexts,
++  useAeSessionContexts,
++  usesClaudeStatusLine,
++} from "./aeSessionContext";
++
++const NOW = Date.parse("2026-10-13T16:00:00Z");
++
++const STATUS_LINE: AeSessionContext = {
++  conversation_id: "conv_a",
++  observed_at: new Date(NOW - 60_000).toISOString(),
++  model: "Fable",
++  window_size: 1_000_000,
++  used_tokens: 200_000,
++  input_tokens: 0,
++  cache_write_tokens: 0,
++  cache_read_tokens: 200_000,
++};
++
++const json = (body: unknown, status = 200) =>
++  Promise.resolve(new Response(JSON.stringify(body), { status }));
++
++function child(id: string) {
++  return {
++    id,
++    title: `claude_code:${id}`,
++    task_summary: null,
++    tool: null,
++    session_name: null,
++    current_task_status: null,
++    busy: false,
++  };
++}
++
++function wire(id: string, harness: string, extra: Record<string, unknown> = {}) {
++  return { id, agent_id: "agent", status: "idle", created_at: 0, harness, ...extra };
++}
++
++describe("provider gating", () => {
++  it("lets only Claude Code sessions use the Claude status line", () => {
++    expect(usesClaudeStatusLine("claude-native", null)).toBe(true);
++    expect(usesClaudeStatusLine("native-claude", null)).toBe(true);
++    expect(usesClaudeStatusLine("codex-native", "claude-fable-5-1")).toBe(false);
++    expect(usesClaudeStatusLine("claude-sdk", null)).toBe(false);
++    // Harness not known yet: the model decides.
++    expect(usesClaudeStatusLine(null, "claude-fable-5-1")).toBe(true);
++    expect(usesClaudeStatusLine(null, "gpt-5.5")).toBe(false);
++    expect(usesClaudeStatusLine(null, null)).toBe(false);
++  });
++
++  it("maps harnesses to plan-limit blocks and labels", () => {
++    expect(aeLimitsHarnessFor("claude-native")).toBe("claude");
++    expect(aeLimitsHarnessFor("codex-native")).toBe("codex");
++    expect(aeLimitsHarnessFor("native-codex")).toBe("codex");
++    expect(aeLimitsHarnessFor("codex")).toBe("codex");
++    expect(aeLimitsHarnessFor("pi")).toBeNull();
++    expect(aeAgentLabel("codex-native")).toBe("Codex");
++    expect(aeAgentLabel("native-claude")).toBe("Claude Code");
++    expect(aeAgentLabel("claude-sdk")).toBe("Claude SDK");
++    expect(aeAgentLabel("mystery-harness")).toBe("mystery-harness");
++    expect(aeAgentLabel(null)).toBeNull();
++  });
++});
++
++describe("buildActiveContext", () => {
++  const input = {
++    conversationId: "conv_a",
++    harness: "claude-native",
++    model: "claude-fable-5-1",
++    contextWindow: null,
++    tokensUsed: null,
++  };
++
++  it("prefers live figures, then the snapshot, then the status line", () => {
++    const live = buildActiveContext(
++      { ...input, contextWindow: 1_000_000, tokensUsed: 10 },
++      null,
++      [STATUS_LINE],
++      NOW,
++    );
++    expect(live.reading).toMatchObject({ source: "live", used: 10 });
++    const snap = buildActiveContext(
++      input,
++      { harness: "claude-native", llmModel: null, contextWindow: 1_000_000, lastTotalTokens: 20 },
++      [STATUS_LINE],
++      NOW,
++    );
++    expect(snap.reading).toMatchObject({ source: "snapshot", used: 20 });
++    const line = buildActiveContext(input, null, [STATUS_LINE], NOW);
++    expect(line.reading).toMatchObject({ source: "statusline", used: 200_000, stale: false });
++  });
++
++  it("does not report a zero when the store has a window but no tokens", () => {
++    const entry = buildActiveContext(
++      { ...input, harness: "codex-native", contextWindow: 400_000 },
++      null,
++      [STATUS_LINE],
++      NOW,
++    );
++    expect(entry.reading).toBeNull();
++    expect(entry.unavailable).toContain("Codex has not reported");
++  });
++
++  it("drops the store's figures when the snapshot shows a different agent", () => {
++    const entry = buildActiveContext(
++      { ...input, contextWindow: 1_000_000, tokensUsed: 216_800 },
++      { harness: "codex-native", llmModel: "gpt-5.5", contextWindow: 400_000, lastTotalTokens: 0 },
++      [STATUS_LINE],
++      NOW,
++    );
++    expect(entry).toMatchObject({ harness: "codex-native", agent: "Codex", model: "gpt-5.5" });
++    // A fresh Codex session that reports 0 tokens is a real reading, not the old Claude one.
++    expect(entry.reading).toMatchObject({ source: "snapshot", used: 0, size: 400_000 });
++    expect(entry.breakdown).toBeNull();
++  });
++});
++
++describe("buildCollaboratorContext", () => {
++  it("uses the router's model when the snapshot names none", () => {
++    const entry = buildCollaboratorContext(
++      {
++        id: "conv_x",
++        name: "Child",
++        routedModel: "databricks-claude-sonnet-5",
++        snapshot: {
++          harness: "claude-sdk",
++          llmModel: null,
++          contextWindow: null,
++          lastTotalTokens: null,
++        },
++      },
++      [STATUS_LINE],
++      NOW,
++    );
++    expect(entry.model).toBe("databricks-claude-sonnet-5");
++    expect(entry.reading).toBeNull();
++  });
++});
++
++describe("fetchAeSessionContexts", () => {
++  beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
++
++  it("fetches each child's snapshot, caps the list and keeps a failed child visible", async () => {
++    const ids = Array.from({ length: AE_MAX_COLLABORATORS + 2 }, (_, i) => `conv_c${i}`);
++    vi.mocked(authenticatedFetch).mockImplementation((url) => {
++      const path = String(url);
++      if (path === "/v1/sessions/conv_root/child_sessions") {
++        return json({ object: "list", data: ids.map(child) });
++      }
++      if (path.startsWith("/v1/sessions/conv_root?"))
++        return json(wire("conv_root", "codex-native"));
++      if (path.startsWith("/v1/sessions/conv_c1?")) return json({ detail: "gone" }, 404);
++      const id = path.match(/^\/v1\/sessions\/([^/?]+)\?/)?.[1] ?? "";
++      return json(wire(id, "claude-native", { context_window: 200_000, last_total_tokens: 1 }));
++    });
++    const state = await fetchAeSessionContexts("conv_root");
++    expect(state.self?.harness).toBe("codex-native");
++    expect(state.collaborators.map((c) => c.id)).toEqual(ids.slice(0, AE_MAX_COLLABORATORS));
++    expect(state.hidden).toBe(2);
++    expect(state.collaborators[1]).toMatchObject({ snapshot: null });
++    expect(state.collaborators[0].snapshot).toMatchObject({ contextWindow: 200_000 });
++    expect(state.error).toBeNull();
++  });
++
++  it("reports a failed child list without failing the whole read", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation((url) =>
++      String(url).endsWith("/child_sessions")
++        ? json({ detail: "boom" }, 500)
++        : json(wire("conv_root", "claude-native")),
++    );
++    const state = await fetchAeSessionContexts("conv_root");
++    expect(state.collaborators).toEqual([]);
++    expect(state.error).toMatch(/^500/);
++    expect(state.self?.harness).toBe("claude-native");
++  });
++});
++
++describe("useAeSessionContexts", () => {
++  beforeEach(() => {
++    vi.mocked(authenticatedFetch).mockReset();
++    vi.mocked(authenticatedFetch).mockImplementation((url) => {
++      const path = String(url);
++      if (path.endsWith("/child_sessions")) return json({ object: "list", data: [] });
++      const id = path.match(/^\/v1\/sessions\/([^/?]+)\?/)?.[1] ?? "";
++      return json(wire(id, id === "conv_b" ? "codex-native" : "claude-native"));
++    });
++  });
++
++  it("fetches nothing while closed or for a draft session", () => {
++    renderHook(() => useAeSessionContexts(false, "conv_a"));
++    renderHook(() => useAeSessionContexts(true, null));
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++  });
++
++  it("drops the previous session's rows when the session changes", async () => {
++    const { result, rerender } = renderHook(({ id }) => useAeSessionContexts(true, id), {
++      initialProps: { id: "conv_a" },
++    });
++    await waitFor(() => expect(result.current.self?.harness).toBe("claude-native"));
++    rerender({ id: "conv_b" });
++    // Never conv_a's snapshot under conv_b, not even for one render.
++    expect(result.current.self).toBeUndefined();
++    await waitFor(() => expect(result.current.self?.harness).toBe("codex-native"));
++  });
++
++  it("discards old snapshots immediately when the model binding changes in place", async () => {
++    const { result, rerender } = renderHook(
++      ({ binding }) => useAeSessionContexts(true, "conv_a", 60_000, binding),
++      { initialProps: { binding: "claude-native:old-model" } },
++    );
++    await waitFor(() => expect(result.current.self?.harness).toBe("claude-native"));
++    vi.mocked(authenticatedFetch).mockImplementation((url) =>
++      String(url).endsWith("/child_sessions")
++        ? json({ object: "list", data: [] })
++        : json(wire("conv_a", "codex-native")),
++    );
++    rerender({ binding: "codex-native:new-model" });
++    expect(result.current.self).toBeUndefined();
++    await waitFor(() => expect(result.current.self?.harness).toBe("codex-native"));
++  });
++});
+diff --git a/web/src/components/aeSessionContext.ts b/web/src/components/aeSessionContext.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..499be9a87f5016cabb773451aa9ed0ff6e542502
+--- /dev/null
++++ b/web/src/components/aeSessionContext.ts
+@@ -0,0 +1,339 @@
++// Context windows for the usage popover, one row per session: the session the
++// composer is on, then each collaborator (child session) it spawned. Every row
++// is that session's own window; rows are never added together, because two
++// sessions on different models share no window.
++//
++// Sources, in order of trust: the chat store's live ring figures (active row
++// only), the session snapshot (`context_window` / `last_total_tokens`), then
++// the Claude Code status line the limits relay captured for that conversation.
++// The status line is used only for a Claude Code session, so a conversation
++// that moved to Codex never shows its old Claude reading.
++
++import { useEffect, useState } from "react";
++import { type ChildSessionInfo, fetchChildSessions } from "@/hooks/useChildSessions";
++import { BRAIN_HARNESS_LABELS } from "@/lib/agentLabels";
++import type { harnessFamily } from "@/lib/forkHarness";
++import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
++import { getSessionSlim } from "@/lib/sessionsApi";
++import { isTempConvId } from "@/lib/tempConversationId";
++import type { Session } from "@/lib/types";
++import type { AeHarness, AeSessionContext } from "./AePlanLimits";
++
++/** A status line reading older than this is shown, but marked as possibly out of date. */
++export const AE_STATUSLINE_STALE_MS = 60 * 60_000;
++
++/** Collaborator snapshots fetched per open; the rest are counted, not shown. */
++export const AE_MAX_COLLABORATORS = 6;
++
++/** The fields of a session snapshot the context rows read. */
++export interface AeSessionSnapshot {
++  harness: string | null;
++  llmModel: string | null;
++  contextWindow: number | null;
++  lastTotalTokens: number | null;
++}
++
++export interface AeCollaboratorInput {
++  id: string;
++  /** Rail name: task summary, else title, else the child's id. */
++  name: string;
++  /** The child's snapshot; `null` when it failed to load. */
++  snapshot: AeSessionSnapshot | null;
++  /** Router pick from the child list, used when the snapshot names no model. */
++  routedModel?: string | null;
++  error?: string | null;
++}
++
++/** What the popover fetched for the session it was opened on. */
++export interface AeSessionContextsState {
++  /** This session's snapshot, the check on the store's live (possibly stale) fields. */
++  self?: AeSessionSnapshot | null;
++  collaborators: AeCollaboratorInput[];
++  /** Children past `AE_MAX_COLLABORATORS`. */
++  hidden?: number;
++  loading?: boolean;
++  error?: string | null;
++}
++
++export type AeContextSource = "live" | "snapshot" | "statusline";
++
++export interface AeContextReading {
++  source: AeContextSource;
++  used: number;
++  size: number;
++  /** When the reading was taken; only the status line carries a time. */
++  observedAt: string | null;
++  stale: boolean;
++}
++
++export interface AeContextEntry {
++  key: string;
++  role: "active" | "collaborator";
++  name: string;
++  /** Harness id the row resolved to, e.g. `"codex-native"`. */
++  harness: string | null;
++  /** "Codex", "Claude Code", "Claude SDK"; null when the harness is unknown. */
++  agent: string | null;
++  model: string | null;
++  reading: AeContextReading | null;
++  /** Why there is no reading; set exactly when `reading` is null. */
++  unavailable: string | null;
++  /** Prompt cache split from the Claude Code status line, when it is this session's. */
++  breakdown: AeSessionContext | null;
++}
++
++/** Display name for a harness id: "codex-native" → "Codex". */
++export function aeAgentLabel(harness: string | null | undefined): string | null {
++  if (!harness) return null;
++  if (isClaudeCodeHarness(harness)) return "Claude Code";
++  return (
++    nativeCodingAgentForHarness(harness)?.displayName ?? BRAIN_HARNESS_LABELS[harness] ?? harness
++  );
++}
++
++function isClaudeCodeHarness(harness: string): boolean {
++  return harness === "claude-native" || harness === "native-claude";
++}
++
++function modelFamily(model: string | null | undefined): ReturnType<typeof harnessFamily> {
++  const m = (model ?? "").toLowerCase();
++  if (/claude|anthropic|opus|sonnet|haiku|fable/.test(m)) return "anthropic";
++  if (/gpt|codex|openai|\bo[134]\b/.test(m)) return "openai";
++  if (/gemini/.test(m)) return "gemini";
++  return null;
++}
++
++/**
++ * Whether the relay's Claude Code status line can speak for this session: a
++ * Claude Code harness, or (harness not known yet) a Claude model.
++ */
++export function usesClaudeStatusLine(harness: string | null, model: string | null): boolean {
++  if (harness) return isClaudeCodeHarness(harness);
++  return modelFamily(model) === "anthropic";
++}
++
++/** The plan-limit block (`/v1/ae/limits` harness) a session draws on, if any. */
++export function aeLimitsHarnessFor(harness: string | null | undefined): AeHarness | null {
++  if (!harness) return null;
++  if (isClaudeCodeHarness(harness)) return "claude";
++  const codex =
++    harness === "codex" ||
++    harness === "native-codex" ||
++    nativeCodingAgentForHarness(harness)?.key === "codex";
++  return codex ? "codex" : null;
++}
++
++function fromStatusLine(
++  contexts: AeSessionContext[] | undefined,
++  sessionId: string | null,
++  harness: string | null,
++  model: string | null,
++): AeSessionContext | null {
++  if (!sessionId || !usesClaudeStatusLine(harness, model)) return null;
++  return contexts?.find((c) => c.conversation_id === sessionId) ?? null;
++}
++
++function statusLineReading(context: AeSessionContext, now: number): AeContextReading | null {
++  if (!(context.window_size > 0)) return null;
++  const age = now - Date.parse(context.observed_at);
++  return {
++    source: "statusline",
++    used: context.used_tokens,
++    size: context.window_size,
++    observedAt: context.observed_at,
++    stale: Number.isFinite(age) && age > AE_STATUSLINE_STALE_MS,
++  };
++}
++
++function snapshotReading(snapshot: AeSessionSnapshot | null | undefined): AeContextReading | null {
++  if (!snapshot?.contextWindow || snapshot.contextWindow <= 0) return null;
++  if (snapshot.lastTotalTokens == null) return null;
++  return {
++    source: "snapshot",
++    used: snapshot.lastTotalTokens,
++    size: snapshot.contextWindow,
++    observedAt: null,
++    stale: false,
++  };
++}
++
++function missingText(agent: string | null, what: string): string {
++  return `${agent ?? "This agent"} has not reported ${what} yet; no reading to show.`;
++}
++
++export interface AeActiveSessionInput {
++  conversationId: string | null;
++  harness: string | null;
++  model: string | null;
++  contextWindow: number | null;
++  tokensUsed: number | null;
++}
++
++/**
++ * The active session's row. The store's ring figures win unless this
++ * session's own snapshot names a different harness (the agent was switched
++ * and the store has not rebound yet): then the snapshot speaks for it.
++ */
++export function buildActiveContext(
++  input: AeActiveSessionInput,
++  self: AeSessionSnapshot | null | undefined,
++  statusLines: AeSessionContext[] | undefined,
++  now: number,
++): AeContextEntry {
++  const storeStale = Boolean(self?.harness && input.harness && self.harness !== input.harness);
++  const harness = storeStale ? (self?.harness ?? null) : (input.harness ?? self?.harness ?? null);
++  const model = storeStale ? (self?.llmModel ?? null) : (input.model ?? self?.llmModel ?? null);
++  const agent = aeAgentLabel(harness);
++  const statusLine = fromStatusLine(statusLines, input.conversationId, harness, model);
++  const live =
++    !storeStale &&
++    input.contextWindow != null &&
++    input.contextWindow > 0 &&
++    input.tokensUsed != null
++      ? {
++          source: "live" as const,
++          used: input.tokensUsed,
++          size: input.contextWindow,
++          observedAt: null,
++          stale: false,
++        }
++      : null;
++  const reading =
++    live ?? snapshotReading(self) ?? (statusLine ? statusLineReading(statusLine, now) : null);
++  return {
++    key: input.conversationId ?? "active",
++    role: "active",
++    name: "This session",
++    harness,
++    agent,
++    model,
++    reading,
++    unavailable: reading
++      ? null
++      : input.conversationId
++        ? missingText(agent, "context usage for this session")
++        : "No session yet; the reading appears after the first reply.",
++    breakdown: statusLine,
++  };
++}
++
++export function buildCollaboratorContext(
++  input: AeCollaboratorInput,
++  statusLines: AeSessionContext[] | undefined,
++  now: number,
++): AeContextEntry {
++  const harness = input.snapshot?.harness ?? null;
++  const model = input.snapshot?.llmModel ?? input.routedModel ?? null;
++  const agent = aeAgentLabel(harness);
++  const statusLine = input.snapshot ? fromStatusLine(statusLines, input.id, harness, model) : null;
++  const reading =
++    snapshotReading(input.snapshot) ?? (statusLine ? statusLineReading(statusLine, now) : null);
++  return {
++    key: input.id,
++    role: "collaborator",
++    name: input.name,
++    harness,
++    agent,
++    model,
++    reading,
++    unavailable: reading
++      ? null
++      : input.snapshot
++        ? missingText(agent, "context usage for this session")
++        : `Could not load this session${input.error ? ` (${input.error})` : ""}.`,
++    breakdown: statusLine,
++  };
++}
++
++function toSnapshot(session: Session): AeSessionSnapshot {
++  return {
++    harness: session.harness ?? null,
++    llmModel: session.llmModel ?? null,
++    contextWindow: session.contextWindow ?? null,
++    lastTotalTokens: session.lastTotalTokens ?? null,
++  };
++}
++
++function childName(child: ChildSessionInfo): string {
++  return child.task_summary || child.title || child.session_name || child.id;
++}
++
++function errorText(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++/** One fetch of this session's snapshot, its children and theirs. */
++export async function fetchAeSessionContexts(
++  sessionId: string,
++  signal?: AbortSignal,
++): Promise<AeSessionContextsState> {
++  const [self, children] = await Promise.all([
++    getSessionSlim(sessionId, { signal }).then(toSnapshot, () => null),
++    fetchChildSessions(sessionId).then(
++      (rows) => ({ rows, error: null }),
++      (error: unknown) => ({ rows: [] as ChildSessionInfo[], error: errorText(error) }),
++    ),
++  ]);
++  const shown = children.rows.slice(0, AE_MAX_COLLABORATORS);
++  const collaborators = await Promise.all(
++    shown.map(async (child): Promise<AeCollaboratorInput> => {
++      const base = { id: child.id, name: childName(child), routedModel: child.routed_model };
++      try {
++        return { ...base, snapshot: toSnapshot(await getSessionSlim(child.id, { signal })) };
++      } catch (error) {
++        return { ...base, snapshot: null, error: errorText(error) };
++      }
++    }),
++  );
++  return {
++    self,
++    collaborators,
++    hidden: children.rows.length - shown.length,
++    error: children.error,
++  };
++}
++
++/**
++ * This session's and its collaborators' snapshots while `active` (the popover
++ * is open), refreshed once a minute; nothing is fetched while it is closed.
++ * A new session id drops the previous session's rows at once.
++ */
++export function useAeSessionContexts(
++  active: boolean,
++  sessionId: string | null,
++  refreshMs = 60_000,
++  binding = "",
++): AeSessionContextsState {
++  const id = sessionId && !isTempConvId(sessionId) ? sessionId : null;
++  const key = JSON.stringify([id, binding]);
++  const [state, setState] = useState<{ id: string | null; value: AeSessionContextsState }>({
++    id: null,
++    value: { collaborators: [] },
++  });
++  useEffect(() => {
++    if (!active || !id) return undefined;
++    const controller = new AbortController();
++    const load = () => {
++      setState((prev) =>
++        prev.id === key
++          ? { id: key, value: { ...prev.value, loading: true } }
++          : { id: key, value: { collaborators: [], loading: true } },
++      );
++      fetchAeSessionContexts(id, controller.signal)
++        .then((value) => !controller.signal.aborted && setState({ id: key, value }))
++        .catch(
++          (error: unknown) =>
++            !controller.signal.aborted &&
++            setState({ id: key, value: { collaborators: [], error: errorText(error) } }),
++        );
++    };
++    load();
++    const timer = window.setInterval(load, refreshMs);
++    return () => {
++      controller.abort();
++      window.clearInterval(timer);
++    };
++  }, [active, id, key, refreshMs]);
++  if (!id || state.id !== key) return { collaborators: [], loading: active && id !== null };
++  return state.value;
++}
+diff --git a/web/src/lib/aeTeam.test.ts b/web/src/lib/aeTeam.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..55ebaa3e1b13b3592623f6ec8942835de81a3bed
+--- /dev/null
++++ b/web/src/lib/aeTeam.test.ts
+@@ -0,0 +1,144 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  AE_TEAM_LABEL,
++  AE_TEAM_MEMBER_LABEL,
++  aeTeamMemberKey,
++  readAeTeam,
++  saveAeTeam,
++  type AeTeamMember,
++} from "./aeTeam";
++import { createSession, getSessionSlim, updateSession } from "./sessionsApi";
++import { fetchChildSessions } from "@/hooks/useChildSessions";
++
++vi.mock("./sessionsApi", () => ({
++  createSession: vi.fn(),
++  updateSession: vi.fn(),
++  getSessionSlim: vi.fn(),
++}));
++vi.mock("@/hooks/useChildSessions", () => ({ fetchChildSessions: vi.fn() }));
++
++const codex: AeTeamMember = {
++  agentId: "ag_codex",
++  agentName: "codex-native",
++  displayName: "Codex",
++  model: "test-codex-model",
++};
++const claude: AeTeamMember = {
++  agentId: "ag_claude",
++  agentName: "claude-native",
++  displayName: "Claude",
++  model: null,
++};
++
++describe("team persistence", () => {
++  beforeEach(() => {
++    vi.resetAllMocks();
++    vi.mocked(fetchChildSessions).mockResolvedValue([]);
++    vi.mocked(getSessionSlim).mockResolvedValue({ subagentRoutingOverride: "off" } as Awaited<
++      ReturnType<typeof getSessionSlim>
++    >);
++    vi.mocked(createSession).mockResolvedValue({ id: "new-child" } as Awaited<
++      ReturnType<typeof createSession>
++    >);
++  });
++
++  it("ignores malformed and oversized rosters", () => {
++    for (const raw of ["{", "null", JSON.stringify({ version: 9 }), " ".repeat(20_000)]) {
++      expect(readAeTeam({ [AE_TEAM_LABEL]: raw })).toEqual({
++        version: 1,
++        mode: "solo",
++        members: [],
++      });
++    }
++  });
++
++  it("creates an idle child with the selected model before publishing the roster", async () => {
++    await saveAeTeam("parent", { version: 1, mode: "team", members: [codex] });
++    expect(createSession).toHaveBeenCalledWith(
++      "ag_codex",
++      [],
++      expect.objectContaining({
++        parentSessionId: "parent",
++        modelOverride: "test-codex-model",
++        labels: { [AE_TEAM_MEMBER_LABEL]: aeTeamMemberKey(codex) },
++      }),
++    );
++    expect(updateSession).toHaveBeenCalledWith("parent", {
++      subagentRoutingOverride: "off",
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({
++          version: 1,
++          mode: "team",
++          members: [{ ...codex, sessionId: "new-child" }],
++        }),
++      },
++    });
++  });
++
++  it("reuses a partially provisioned child when saving is retried", async () => {
++    vi.mocked(fetchChildSessions).mockResolvedValue([
++      {
++        id: "existing",
++        labels: { [AE_TEAM_MEMBER_LABEL]: aeTeamMemberKey(codex) },
++        title: null,
++        task_summary: null,
++        tool: null,
++        session_name: null,
++        current_task_status: null,
++        busy: false,
++        last_message_preview: null,
++        pending_elicitations_count: 0,
++      },
++    ]);
++    await saveAeTeam("parent", { version: 1, mode: "team", members: [codex, claude] });
++    expect(createSession).toHaveBeenCalledTimes(1);
++    expect(createSession).toHaveBeenCalledWith(
++      "ag_claude",
++      [],
++      expect.not.objectContaining({ modelOverride: expect.anything() }),
++    );
++    expect(
++      JSON.parse(vi.mocked(updateSession).mock.calls[0][1].labels![AE_TEAM_LABEL]).members[0]
++        .sessionId,
++    ).toBe("existing");
++  });
++
++  it("keeps the old roster if creating any selected member fails", async () => {
++    vi.mocked(createSession).mockRejectedValueOnce(new Error("Host offline"));
++    await expect(
++      saveAeTeam("parent", { version: 1, mode: "team", members: [codex] }),
++    ).rejects.toThrow("Host offline");
++    expect(updateSession).not.toHaveBeenCalled();
++  });
++
++  it("switches to Solo without starting or deleting children", async () => {
++    await saveAeTeam("parent", { version: 1, mode: "solo", members: [codex] });
++    expect(fetchChildSessions).not.toHaveBeenCalled();
++    expect(createSession).not.toHaveBeenCalled();
++    expect(updateSession).toHaveBeenCalledWith("parent", {
++      labels: { [AE_TEAM_LABEL]: '{"version":1,"mode":"solo","members":[]}' },
++    });
++  });
++
++  it("turns off automatic collaborator routing before creating pinned teammates", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({ subagentRoutingOverride: "on" } as Awaited<
++      ReturnType<typeof getSessionSlim>
++    >);
++    await saveAeTeam("parent", { version: 1, mode: "team", members: [codex] });
++    expect(updateSession).toHaveBeenNthCalledWith(1, "parent", { subagentRoutingOverride: "off" });
++    expect(vi.mocked(updateSession).mock.invocationCallOrder[0]).toBeLessThan(
++      vi.mocked(createSession).mock.invocationCallOrder[0],
++    );
++  });
++
++  it("restores routing if a team cannot be provisioned", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({ subagentRoutingOverride: "on" } as Awaited<
++      ReturnType<typeof getSessionSlim>
++    >);
++    vi.mocked(createSession).mockRejectedValue(new Error("Unavailable"));
++    await expect(
++      saveAeTeam("parent", { version: 1, mode: "team", members: [codex] }),
++    ).rejects.toThrow("Unavailable");
++    expect(updateSession).toHaveBeenLastCalledWith("parent", { subagentRoutingOverride: "on" });
++  });
++});
+diff --git a/web/src/lib/aeTeam.ts b/web/src/lib/aeTeam.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..85d9903573b9475beedd43d9a80c56e892a506ce
+--- /dev/null
++++ b/web/src/lib/aeTeam.ts
+@@ -0,0 +1,111 @@
++import { fetchChildSessions } from "@/hooks/useChildSessions";
++import { createSession, getSessionSlim, updateSession } from "./sessionsApi";
++
++export const AE_TEAM_LABEL = "ae.team";
++export const AE_TEAM_MEMBER_LABEL = "ae.team.member";
++export const AE_TEAM_LIMIT = 6;
++
++export interface AeTeamMember {
++  agentId: string;
++  agentName: string;
++  displayName: string;
++  model: string | null;
++  sessionId?: string;
++}
++
++export interface AeTeam {
++  version: 1;
++  mode: "solo" | "team";
++  members: AeTeamMember[];
++}
++
++export function readAeTeam(labels?: Record<string, string>): AeTeam {
++  const solo: AeTeam = { version: 1, mode: "solo", members: [] };
++  const raw = labels?.[AE_TEAM_LABEL];
++  if (!raw || raw.length > 16_384) return solo;
++  try {
++    const value = JSON.parse(raw) as Partial<AeTeam>;
++    if (value?.version !== 1 || !["solo", "team"].includes(value.mode ?? "")) return solo;
++    if (!Array.isArray(value.members) || value.members.length > AE_TEAM_LIMIT) return solo;
++    const members = value.members.filter(
++      (m): m is AeTeamMember =>
++        !!m &&
++        typeof m.agentId === "string" &&
++        !!m.agentId &&
++        typeof m.agentName === "string" &&
++        typeof m.displayName === "string" &&
++        (m.model === null || typeof m.model === "string") &&
++        (m.sessionId === undefined || typeof m.sessionId === "string"),
++    );
++    return { version: 1, mode: value.mode as AeTeam["mode"], members };
++  } catch {
++    return solo;
++  }
++}
++
++export function aeTeamMemberKey(member: AeTeamMember): string {
++  return JSON.stringify([member.agentId, member.model]);
++}
++
++/** Provision idle children first; publish the roster only when all are ready.
++ * Retry reuses children by their durable label, including a partially saved team.
++ * No prompts are sent here. The lead sees the roster on its next message.
++ */
++export async function saveAeTeam(sessionId: string, draft: AeTeam) {
++  if (draft.mode === "team" && (!draft.members.length || draft.members.length > AE_TEAM_LIMIT)) {
++    throw new Error(`Choose between 1 and ${AE_TEAM_LIMIT} collaborators.`);
++  }
++  if (draft.mode === "solo") return persistAeTeam(sessionId, draft);
++  const parent = await getSessionSlim(sessionId);
++  const routing = parent.subagentRoutingOverride ?? null;
++  // Manual model choices must not be replaced by the parent's spawn router.
++  if (routing !== "off") await updateSession(sessionId, { subagentRoutingOverride: "off" });
++  try {
++    return await persistAeTeam(sessionId, draft);
++  } catch (error) {
++    if (routing !== "off") {
++      try {
++        await updateSession(sessionId, { subagentRoutingOverride: routing });
++      } catch {
++        throw new Error(
++          "Could not save the team or restore automatic routing. Automatic collaborator routing remains off; reopen the picker to retry.",
++        );
++      }
++    }
++    throw error;
++  }
++}
++
++async function persistAeTeam(sessionId: string, draft: AeTeam) {
++  const members: AeTeamMember[] = [];
++  if (draft.mode === "team") {
++    const children = await fetchChildSessions(sessionId);
++    // Sequential creation keeps retries bounded and avoids launching a burst of runners.
++    /* oxlint-disable no-await-in-loop */
++    for (const member of draft.members) {
++      const key = aeTeamMemberKey(member);
++      const existing = children.find((c) => c.labels?.[AE_TEAM_MEMBER_LABEL] === key);
++      if (existing) {
++        members.push({ ...member, sessionId: existing.id });
++        continue;
++      }
++      const child = await createSession(member.agentId, [], {
++        parentSessionId: sessionId,
++        subAgentName: null,
++        title:
++          `ui:${member.agentName.slice(0, 60)}:${member.displayName} · ${member.model ?? "default"}`.slice(
++            0,
++            200,
++          ),
++        ...(member.model ? { modelOverride: member.model } : {}),
++        labels: { [AE_TEAM_MEMBER_LABEL]: key },
++      });
++      members.push({ ...member, sessionId: child.id });
++    }
++    /* oxlint-enable no-await-in-loop */
++  }
++  return updateSession(sessionId, {
++    ...(draft.mode === "team" ? { subagentRoutingOverride: "off" as const } : {}),
++    labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: draft.mode, members }) },
++  });
++}
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index c624703b71d7f825e1835343ce07b3ae10f2a635..79d7f1d5b262a6bf77d538b8b46f4c52383fbe17 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -498,6 +498,8 @@ export async function createSession(
+     parentSessionId?: string;
+     subAgentName?: string | null;
+     title?: string;
++    modelOverride?: string;
++    labels?: Record<string, string>;
+   } = {},
+ ): Promise<Session> {
+   const body: {
+@@ -506,6 +508,8 @@ export async function createSession(
+     parent_session_id?: string;
+     sub_agent_name?: string | null;
+     title?: string;
++    model_override?: string;
++    labels?: Record<string, string>;
+   } = { agent_id: agentId, initial_items: initialItems };
+   if (options.parentSessionId !== undefined) {
+     body.parent_session_id = options.parentSessionId;
+@@ -516,6 +520,8 @@ export async function createSession(
+   if (options.title !== undefined) {
+     body.title = options.title;
+   }
++  if (options.modelOverride !== undefined) body.model_override = options.modelOverride;
++  if (options.labels !== undefined) body.labels = options.labels;
+   const res = await authenticatedFetch("/v1/sessions", {
+     method: "POST",
+     headers: {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index f3049723c46227f623162b4e80d6b69ab18371bc..75881175f4335f479a74390b6befd2563ffbb2b5 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -60,6 +60,7 @@ import {
+ import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "@/lib/nativeBridge";
+ import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
+ import { AePlanLimitsPopover } from "@/components/AePlanLimits";
++import { AeTeamControl } from "@/components/AeTeamControl";
+ import { agentDisplayLabel } from "@/components/AgentInfo";
+ import {
+   BRAIN_HARNESS_LABELS,
+@@ -3851,6 +3852,14 @@ function ComposerImpl(
+           ),
+           trailing: (
+             <>
++              {composerSession && (
++                <AeTeamControl
++                  key={composerSession.id}
++                  session={composerSession}
++                  disabled={isReadOnly || unreachable || configBusy}
++                  working={isWorking}
++                />
++              )}
+               <div className="flex min-w-0 items-center rounded-lg">
+                 <SessionHarnessPicker
+                   busy={configBusy}
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 5f5f0aa8737c5094af32ead74fb7a6662d868bd7..606274a637300630a89a83930698c9a2af47594a 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -6481,7 +6481,13 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
+       const pending = [
+         { tempId: "pend_keep", content: [{ type: "input_text" as const, text: "queued" }] },
+       ];
+-      useChatStore.setState({ pendingUserMessages: pending });
++      useChatStore.setState({
++        pendingUserMessages: pending,
++        contextWindow: 258_400,
++        tokensUsed: 189_600,
++        llmModel: "previous-model",
++        sessionHarness: "codex-native",
++      });
+       const spy = vi.spyOn(client, "invalidateQueries");
+ 
+       serveNativeSnapshot();
+@@ -6496,6 +6502,10 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
+       // header to show the new agent.
+       expect(useChatStore.getState().boundAgentId).toBe("ag_clone");
+       expect(useChatStore.getState().boundAgentName).toBe("Claude Code (switch ag_clone)");
++      expect(useChatStore.getState().contextWindow).toBeNull();
++      expect(useChatStore.getState().tokensUsed).toBeNull();
++      expect(useChatStore.getState().llmModel).toBeNull();
++      expect(useChatStore.getState().sessionHarness).toBeNull();
+       // Observers (other tabs/users) learn about the switch only via this
+       // event — the header card and sidebar row must refetch.
+       expect(spy).toHaveBeenCalledWith({ queryKey: ["session-agent", "conv_sw"] });
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 771b4a351f1c413eea9ae4b48550fad7d521c317..c2fd9df70ee27eda28fe803e5660e16da1cf3c6d 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -7267,6 +7267,11 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+       applyToNamedConversation(event.conversationId, {
+         boundAgentId: event.agentId,
+         boundAgentName: event.agentName,
++        // The previous agent's context is not a reading for the new provider.
++        contextWindow: null,
++        tokensUsed: null,
++        llmModel: null,
++        sessionHarness: null,
+       });
+       void refreshSessionBinding(event.conversationId);
+       // Refresh the header's agent card and the sidebar row for every

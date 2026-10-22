@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:45:32 -0700
+Subject: [PATCH 058/148] [ae-patch] Reject malformed context summaries and
+ bound snapshot refreshes.
+
+---
+ omnigent/runner/ae_context_usage.py   | 25 ++++++++++++++++-----
+ tests/runner/test_ae_context_usage.py | 32 +++++++++++++++++++++++++++
+ web/src/components/AePlanLimits.tsx   |  2 +-
+ web/src/components/aeContextUsage.ts  | 11 +++++++--
+ 4 files changed, 61 insertions(+), 9 deletions(-)
+
+diff --git a/omnigent/runner/ae_context_usage.py b/omnigent/runner/ae_context_usage.py
+index a3326f2b0f1e9cd1de85ae6fe3b634a9a69970d6..306f5c733b7a0c66d074c43cc5ffe33bd47f26f6 100644
+--- a/omnigent/runner/ae_context_usage.py
++++ b/omnigent/runner/ae_context_usage.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import asyncio
+ import contextlib
+ import json
++import math
+ import os
+ import signal
+ import tempfile
+@@ -130,9 +131,12 @@ def normalize(body: dict[str, Any], *, complete: bool) -> dict[str, Any]:
+     total = body.get("totalTokens")
+     if (
+         not isinstance(categories, list)
++        or not categories
+         or not isinstance(maximum, (int, float))
++        or not math.isfinite(maximum)
+         or maximum <= 0
+         or not isinstance(total, (int, float))
++        or not math.isfinite(total)
+         or total < 0
+     ):
+         raise ValueError(
+@@ -146,14 +150,15 @@ def normalize(body: dict[str, Any], *, complete: bool) -> dict[str, Any]:
+             "buffer",
+             "deferred",
+         ):
+-            continue
++            raise ValueError("Claude returned an unsupported context category.")
+         tokens = row.get("tokens")
+         if (
+             not isinstance(tokens, (int, float))
++            or not math.isfinite(tokens)
+             or tokens < 0
+             or not isinstance(row.get("name"), str)
+         ):
+-            continue
++            raise ValueError("Claude returned an unsupported context category.")
+         clean.append({"name": row["name"], "tokens": tokens, "kind": row["kind"]})
+     threshold = body.get("autoCompactThreshold")
+     return {
+@@ -162,7 +167,7 @@ def normalize(body: dict[str, Any], *, complete: bool) -> dict[str, Any]:
+         "totalTokens": total,
+         "maxTokens": maximum,
+         "autoCompactThreshold": threshold
+-        if isinstance(threshold, (int, float)) and threshold > 0
++        if isinstance(threshold, (int, float)) and math.isfinite(threshold) and threshold > 0
+         else None,
+         "isAutoCompactEnabled": body.get("isAutoCompactEnabled") is True,
+         "observedAt": datetime.now(UTC).isoformat(),
+@@ -196,7 +201,7 @@ def _rows(rows: object, names: tuple[str, ...]) -> list[dict[str, Any]]:
+             continue
+         name = next((row[n] for n in names if isinstance(row.get(n), str)), None)
+         tokens = row.get("tokens")
+-        if name and isinstance(tokens, (int, float)) and tokens >= 0:
++        if name and isinstance(tokens, (int, float)) and math.isfinite(tokens) and tokens >= 0:
+             result.append({"name": name, "tokens": tokens})
+     return result
+ 
+@@ -217,9 +222,14 @@ def isolated_command(command: list[str], cwd: str, scratch: Path) -> list[str]:
+                 if value.lstrip().startswith("{")
+                 else json.loads((Path(cwd) / value).read_text())
+             )
+-            for server in config.get("mcpServers", {}).values():
++            for number, server in enumerate(config.get("mcpServers", {}).values()):
+                 args = server.get("args", [])
+                 if "omnigent.harnesses.claude_native.bridge" not in args:
++                    if any(
++                        "bridge-dir" in str(arg) or "claude_native.bridge" in str(arg)
++                        for arg in args
++                    ):
++                        raise ValueError("Unrecognized bridge launch; cannot isolate safely")
+                     continue
+                 if "--bridge-dir" not in args:
+                     raise ValueError("Unsupported bridge launch configuration")
+@@ -227,7 +237,7 @@ def isolated_command(command: list[str], cwd: str, scratch: Path) -> list[str]:
+                 live = Path(args[position])
+                 if not live.is_absolute():
+                     live = Path(cwd) / live
+-                copy = scratch / str(index)
++                copy = scratch / f"{index}-{number}"
+                 copy.mkdir(mode=0o700, exist_ok=True)
+                 for name in ("bridge.json", "tool_relay.json"):
+                     source = live / name
+@@ -332,6 +342,9 @@ async def handle_context_usage(
+     lock = _locks.setdefault(conversation_id, asyncio.Lock())
+     async with lock:
+         try:
++            for expired in list(_failures):
++                if time.monotonic() - _failures[expired] >= 30:
++                    _failures.pop(expired, None)
+             if time.monotonic() - _failures.get(conversation_id, float("-inf")) < 30:
+                 raise ValueError("Recent probe failure")
+             bridge_id = await _claude_native_bridge_id_for_session(
+diff --git a/tests/runner/test_ae_context_usage.py b/tests/runner/test_ae_context_usage.py
+index bb59066e6556439411c464bdd4a632699535dab0..b1a5dd2cfdbacf8cf3a4c0f645a45bc4db6849f6 100644
+--- a/tests/runner/test_ae_context_usage.py
++++ b/tests/runner/test_ae_context_usage.py
+@@ -10,6 +10,24 @@ import pytest
+ from omnigent.runner import ae_context_usage as usage
+ 
+ 
++@pytest.mark.parametrize(
++    "categories",
++    [
++        [],
++        [None],
++        [{"name": "Unknown", "tokens": 1, "kind": "unknown"}],
++        [{"name": "Messages", "tokens": -1, "kind": "used"}],
++        [{"name": "Messages", "tokens": float("nan"), "kind": "used"}],
++    ],
++)
++def test_normalize_rejects_incomplete_category_data(categories):
++    with pytest.raises(ValueError):
++        usage.normalize(
++            {"categories": categories, "totalTokens": 123, "maxTokens": 200000},
++            complete=True,
++        )
++
++
+ def test_normalize_excludes_config_and_keeps_deferred():
+     result = usage.normalize(
+         {
+@@ -218,3 +236,17 @@ async def test_malformed_protocol_is_rejected(tmp_path, payload):
+     script.write_text(f"import sys\nsys.stdin.readline()\nprint({payload!r}, flush=True)\n")
+     with pytest.raises(ValueError):
+         await usage.probe([sys.executable, str(script)], {}, str(tmp_path))
++
++
++@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
++def test_nonfinite_totals_rejected(bad):
++    with pytest.raises(ValueError):
++        usage.normalize({"categories": [], "totalTokens": bad, "maxTokens": 200000}, complete=True)
++
++
++def test_unknown_bridge_launch_rejected(tmp_path):
++    config = {"mcpServers": {"bridge": {"command": "wrapper", "args": ["--bridge-dir", "/live"]}}}
++    with pytest.raises(ValueError, match="Unrecognized bridge"):
++        usage.isolated_command(
++            ["claude", "--mcp-config", json.dumps(config)], str(tmp_path), tmp_path
++        )
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index f2f16a570127ba5100e338cc52a3138685d56f36..96979102ad5d572f0f16dd8d378dd40c3a4809a4 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -841,7 +841,7 @@ export function AePlanLimitsPanel({
+     `${active.harness}:${active.model}`,
+   );
+   const categories =
+-    context.data?.available && now - Date.parse(context.data.observedAt) < 180_000
++    context.data?.available && now - Date.parse(context.data.observedAt) < 240_000
+       ? context.data
+       : undefined;
+   const collaborators = sessions.collaborators.map((c) =>
+diff --git a/web/src/components/aeContextUsage.ts b/web/src/components/aeContextUsage.ts
+index 4f4d9448f26a36c47c2ff29d02af8bbcb76e49ee..64684abb1e8819954f1f6539ea796c926fcc5cef 100644
+--- a/web/src/components/aeContextUsage.ts
++++ b/web/src/components/aeContextUsage.ts
+@@ -28,8 +28,11 @@ export function useContextUsage(session: string | null, enabled: boolean, identi
+     if (!enabled || !session) return;
+     let cancelled = false;
+     setState({ key });
+-    const refresh = () =>
+-      authenticatedFetch(`/v1/sessions/${encodeURIComponent(session)}/context-usage`)
++    let inFlight = false;
++    const refresh = () => {
++      if (inFlight) return;
++      inFlight = true;
++      return authenticatedFetch(`/v1/sessions/${encodeURIComponent(session)}/context-usage`)
+         .then(async (response) => {
+           if (!response.ok)
+             throw new Error("Could not load context. Close and reopen the breakdown to retry.");
+@@ -44,7 +47,11 @@ export function useContextUsage(session: string | null, enabled: boolean, identi
+               key,
+               error: error instanceof Error ? error.message : "Context unavailable",
+             });
++        })
++        .finally(() => {
++          inFlight = false;
+         });
++    };
+     void refresh();
+     const timer = setInterval(refresh, 180_000);
+     return () => {

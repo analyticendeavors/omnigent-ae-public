@@ -1,0 +1,3610 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 09:19:57 -0700
+Subject: [PATCH 074/148] [ae-patch] Show when a session is working, quiet,
+ waiting or scheduled
+
+A session row showed a spinner only while its turn ran, so a session whose
+turn had ended while agents, a background shell or a check-in were still
+going looked finished, and a long silent step looked frozen.
+
+Each session list row and websocket update now carries
+background_task_count and active_child_count, from the server's existing
+background-shell cache and the child ids the list already loads. The
+sidebar adds three row states: waiting (a pulsing hourglass with the
+count), quiet (an amber spinner once a running session has had no update
+for five minutes) and scheduled (an alarm with the next check-in time).
+Above the composer, a status line shows the elapsed time, the current step
+and the last activity while working, the agents and shells still running
+while waiting, and when a check-in will wake the session.
+---
+ .../routes/_sessions/ae_session_activity.py   |  63 +++
+ .../server/routes/_sessions/orchestration.py  |   6 +
+ omnigent/server/schemas.py                    |   4 +
+ openapi.json                                  |  24 +
+ .../server/routes/test_ae_session_activity.py | 243 +++++++++
+ .../components/AeSessionActivity.stories.tsx  | 218 ++++++++
+ web/src/components/AeSessionActivity.test.tsx | 453 +++++++++++++++++
+ web/src/components/AeSessionActivity.tsx      | 395 +++++++++++++++
+ web/src/components/SessionStateBadge.tsx      |   3 +
+ web/src/components/chat/Transcript.tsx        |   6 +-
+ .../composer/BackgroundTaskIndicator.tsx      |   4 +-
+ web/src/hooks/aeSessionActivityHooks.test.ts  | 324 ++++++++++++
+ web/src/hooks/aeSessionActivityHooks.ts       | 470 ++++++++++++++++++
+ web/src/hooks/useConversations.ts             |   6 +
+ web/src/hooks/useSessionState.ts              |   4 +-
+ web/src/lib/aeSessionActivity.test.ts         | 411 +++++++++++++++
+ web/src/lib/aeSessionActivity.ts              | 329 ++++++++++++
+ web/src/shell/Sidebar.test.tsx                |   8 +-
+ web/src/shell/Sidebar.tsx                     |  38 +-
+ web/src/shell/aeAgentsPaneModel.ts            |  16 +-
+ web/src/store/aeLastEventAt.test.ts           | 148 ++++++
+ web/src/store/chatStore.ts                    |  14 +
+ web/src/store/conversationState.ts            |   4 +
+ 23 files changed, 3167 insertions(+), 24 deletions(-)
+ create mode 100644 omnigent/server/routes/_sessions/ae_session_activity.py
+ create mode 100644 tests/server/routes/test_ae_session_activity.py
+ create mode 100644 web/src/components/AeSessionActivity.stories.tsx
+ create mode 100644 web/src/components/AeSessionActivity.test.tsx
+ create mode 100644 web/src/components/AeSessionActivity.tsx
+ create mode 100644 web/src/hooks/aeSessionActivityHooks.test.ts
+ create mode 100644 web/src/hooks/aeSessionActivityHooks.ts
+ create mode 100644 web/src/lib/aeSessionActivity.test.ts
+ create mode 100644 web/src/lib/aeSessionActivity.ts
+ create mode 100644 web/src/store/aeLastEventAt.test.ts
+
+diff --git a/omnigent/server/routes/_sessions/ae_session_activity.py b/omnigent/server/routes/_sessions/ae_session_activity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ed027c93e84cbfc71b45cf7ca0dda2f5e3207ed
+--- /dev/null
++++ b/omnigent/server/routes/_sessions/ae_session_activity.py
+@@ -0,0 +1,63 @@
++"""
++Background activity counts for a sidebar session row.
++
++A row's ``status`` reads ``running`` only while a turn runs (or a direct
++child is busy). Once the turn ends, a session still waiting on background
++shells or on child sessions looks the same as a finished one. These two
++counts let the sidebar show that "waiting on background work" state.
++
++Both read in-memory indexes only, so building a full page of rows costs no
++extra I/O: the child ids come from the one batched
++``list_child_conversation_ids_by_parent`` query the list builder already
++makes. Like the existing child status roll-up, the counts are as fresh as
++this replica's relay caches.
++"""
++
++from __future__ import annotations
++
++from omnigent.runtime import pending_elicitations
++from omnigent.server.routes._sessions.common import (
++    _session_background_task_count_cache,
++    _session_status_cache,
++)
++
++# Relay statuses that mean a child is still doing work; ``waiting`` covers a
++# child parked on an approval. A child still booting has no relay status yet,
++# so it counts from its first ``running`` edge, a few seconds later.
++_BUSY_CHILD_STATUSES = frozenset({"running", "waiting"})
++
++
++def session_background_task_count(session_id: str) -> int:
++    """
++    Return the background shells still running for a session.
++
++    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
++    :returns: The tally from the last authoritative ``Stop`` hook report,
++        ``0`` when none is running or none was reported.
++    """
++    return _session_background_task_count_cache.get(session_id, 0)
++
++
++def session_active_child_count(child_session_ids: list[str]) -> int:
++    """
++    Count a session's direct children that are still busy.
++
++    A child counts while its relay status is running or waiting, or while it
++    has an approval prompt outstanding (a prompt can land before the child's
++    status edge does). A failed child never counts.
++
++    :param child_session_ids: Direct child ids of one session, e.g.
++        ``["conv_child1", "conv_child2"]``.
++    :returns: Number of busy direct children, ``0`` when there are none.
++    """
++    if not child_session_ids:
++        return 0
++    approvals = pending_elicitations.counts_for(child_session_ids)
++    busy = 0
++    for child_id in child_session_ids:
++        status = _session_status_cache.get(child_id)
++        if status in _BUSY_CHILD_STATUSES or (
++            status != "failed" and approvals.get(child_id, 0) > 0
++        ):
++            busy += 1
++    return busy
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index d1a5723d51d8a1029b6f87cfdab73820d7f977fa..b3d5246e11b0e7d5b6ebcacadd98b754a6b9b0f4 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -168,6 +168,10 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_agent,
+     validate_session_model_metadata,
+ )
++from omnigent.server.routes._sessions.ae_session_activity import (
++    session_active_child_count,
++    session_background_task_count,
++)
+ 
+ # Shared constants, state, and small dataclasses live in the _sessions.common
+ # leaf module; import them here so this module and its re-exporters see the same
+@@ -1231,6 +1235,8 @@ def _build_session_list_item(
+         search_snippet=conv.search_snippet,
+         parent_session_id=conv.parent_conversation_id,
+         project_id=conv.project_id,
++        background_task_count=session_background_task_count(conv.id),
++        active_child_count=session_active_child_count(child_session_ids),
+     )
+ 
+ 
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index a0189fc71a158dda2e0c8474bb638a7e90eaa398..fbfef74ba4606262163240873f12a24cdd4872e5 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -2840,6 +2840,10 @@ class SessionListItem(BaseModel):
+     # unfiled. Lets the sidebar group sessions by project without a follow-up
+     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
+     project_id: str | None = None
++    # Background shells and busy direct children, so a row whose turn ended
++    # can still read as waiting on work. See ae_session_activity.
++    background_task_count: int | None = None
++    active_child_count: int | None = None
+ 
+ 
+ class SessionList(BaseModel):
+diff --git a/openapi.json b/openapi.json
+index bfffbca4bb77b997935e39629296d91239d5b565..94c25776f15ccea32ff9db83896f12dc40d7cecf 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -6590,6 +6590,18 @@
+       "SessionListItem": {
+         "description": "Lightweight session summary for `GET /v1/sessions` list responses.\n\nSame shape as `SessionResponse` minus `items`.",
+         "properties": {
++          "active_child_count": {
++            "anyOf": [
++              {
++                "format": "int64",
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Active Child Count"
++          },
+           "agent_id": {
+             "description": "Durable identifier of the bound agent.",
+             "title": "Agent Id",
+@@ -6613,6 +6625,18 @@
+             "title": "Archived",
+             "type": "boolean"
+           },
++          "background_task_count": {
++            "anyOf": [
++              {
++                "format": "int64",
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Background Task Count"
++          },
+           "comments_count": {
+             "default": 0,
+             "description": "Total number of review comments (any status) on this session. Together with `comments_updated_at` it forms a change fingerprint: an add or edit bumps the timestamp, a delete changes the count, so the web client can invalidate its cached comment list when either field changes in a `WS /v1/sessions/updates` frame. `0` when the session has no comments or the server has no comment store wired.",
+diff --git a/tests/server/routes/test_ae_session_activity.py b/tests/server/routes/test_ae_session_activity.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0fe2ee768e6edc716ba00f4ac42788cc132dfad3
+--- /dev/null
++++ b/tests/server/routes/test_ae_session_activity.py
+@@ -0,0 +1,243 @@
++"""Session-row activity counts on ``GET /v1/sessions`` and ``WS /v1/sessions/updates``.
++
++A row whose turn ended can still be waiting on background shells or on busy
++child sessions. Every list row carries ``background_task_count`` and
++``active_child_count`` so the sidebar can show that state, and the updates
++stream pushes a ``changed`` frame for the parent when either count moves.
++"""
++
++from __future__ import annotations
++
++import json
++from collections.abc import Iterator
++
++import pytest
++from fastapi import FastAPI
++from fastapi.testclient import TestClient
++
++import omnigent.server.routes.sessions as sessions_routes
++from omnigent.runtime import pending_elicitations
++from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
++from omnigent.server.routes._sessions.ae_session_activity import (
++    session_active_child_count,
++    session_background_task_count,
++)
++from omnigent.server.routes.sessions import create_sessions_router
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
++
++ALICE = "alice@example.com"
++_AGENT_ID = "087b7cb7ac30abf4debfaa578d052ec6"
++_HEADERS = {"X-Forwarded-Email": ALICE}
++
++Stores = tuple[SqlAlchemyConversationStore, SqlAlchemyAgentStore, SqlAlchemyPermissionStore]
++
++
++@pytest.fixture
++def stores(db_uri: str) -> Stores:
++    """File-backed stores so test-thread writes are visible to the WS thread."""
++    return (
++        SqlAlchemyConversationStore(db_uri),
++        SqlAlchemyAgentStore(db_uri),
++        SqlAlchemyPermissionStore(db_uri),
++    )
++
++
++@pytest.fixture
++def app(stores: Stores) -> FastAPI:
++    """Sessions router with header auth and a real permission store."""
++    conversation_store, agent_store, permission_store = stores
++    app = FastAPI()
++    app.include_router(
++        create_sessions_router(
++            conversation_store=conversation_store,
++            agent_store=agent_store,
++            auth_provider=UnifiedAuthProvider(source="header"),
++            permission_store=permission_store,
++        ),
++        prefix="/v1",
++    )
++    return app
++
++
++@pytest.fixture
++def touched() -> Iterator[list[str]]:
++    """Session ids whose relay caches a test seeds, cleared afterwards."""
++    ids: list[str] = []
++    yield ids
++    for sid in ids:
++        sessions_routes._session_status_cache.pop(sid, None)
++        sessions_routes._session_background_task_count_cache.pop(sid, None)
++        sessions_routes._session_background_tasks_cache.pop(sid, None)
++        for elicitation_id in [
++            e.get("elicitation_id") for e in pending_elicitations.snapshot_for(sid)
++        ]:
++            if isinstance(elicitation_id, str):
++                pending_elicitations.resolve(sid, elicitation_id)
++
++
++@pytest.fixture
++def fast_rescan(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Shrink the updates-stream rescan so ``changed`` frames land promptly."""
++    monkeypatch.setattr(sessions_routes, "_SESSION_UPDATES_RESCAN_INTERVAL_S", 0.05)
++    monkeypatch.setattr(sessions_routes, "_SESSION_UPDATES_HEARTBEAT_INTERVAL_S", 0.1)
++
++
++def _seed_parent(stores: Stores, touched: list[str], title: str) -> str:
++    """Create an owned top-level session and return its id."""
++    conversation_store, agent_store, permission_store = stores
++    if agent_store.get(_AGENT_ID) is None:
++        agent_store.create(agent_id=_AGENT_ID, name="test-agent", bundle_location=f"{_AGENT_ID}/b")
++    conv = conversation_store.create_conversation(title=title, agent_id=_AGENT_ID)
++    permission_store.ensure_user(ALICE)
++    permission_store.grant(ALICE, conv.id, LEVEL_OWNER)
++    touched.append(conv.id)
++    return conv.id
++
++
++def _seed_child(stores: Stores, touched: list[str], parent_id: str, status: str | None) -> str:
++    """Create a direct child session with the given relay status (``None`` for none)."""
++    child = stores[0].create_conversation(
++        kind="sub_agent",
++        title=f"coder:task{len(touched)}",
++        parent_conversation_id=parent_id,
++        agent_id=_AGENT_ID,
++    )
++    touched.append(child.id)
++    if status is not None:
++        sessions_routes._session_status_cache[child.id] = status
++    return child.id
++
++
++def _list_rows(app: FastAPI) -> dict[str, dict[str, object]]:
++    """Fetch the top-level session list keyed by id."""
++    resp = TestClient(app).get("/v1/sessions", headers=_HEADERS)
++    assert resp.status_code == 200
++    return {item["id"]: item for item in resp.json()["data"]}
++
++
++def _recv_until(ws: object, wanted: set[str], *, max_frames: int = 50) -> dict[str, object]:
++    """Read frames until one whose ``type`` is in ``wanted`` arrives."""
++    for _ in range(max_frames):
++        frame = json.loads(ws.receive_text())  # type: ignore[attr-defined]
++        if frame.get("type") in wanted:
++            return frame
++    raise AssertionError(f"no frame in {wanted} after {max_frames} frames")
++
++
++def _recv_parent_change(ws: object, parent_id: str) -> dict[str, object]:
++    """Return the parent's row from the next ``changed`` frame that carries it."""
++    for _ in range(50):
++        frame = _recv_until(ws, {"changed"})
++        for item in frame["items"]:  # type: ignore[union-attr]
++            if item["id"] == parent_id:
++                return item
++    raise AssertionError(f"no changed frame for {parent_id}")
++
++
++def test_list_row_with_no_activity_reports_zero(app: FastAPI, stores: Stores, touched) -> None:
++    """A quiet session carries both counts as explicit zeros."""
++    parent_id = _seed_parent(stores, touched, "quiet")
++
++    row = _list_rows(app)[parent_id]
++
++    assert row["background_task_count"] == 0
++    assert row["active_child_count"] == 0
++    assert row["status"] == "idle"
++
++
++def test_list_row_counts_only_busy_children(app: FastAPI, stores: Stores, touched) -> None:
++    """Running and approval-blocked children count; idle, failed and unreported do not."""
++    parent_id = _seed_parent(stores, touched, "parent")
++    _seed_child(stores, touched, parent_id, "running")
++    _seed_child(stores, touched, parent_id, "waiting")
++    _seed_child(stores, touched, parent_id, "idle")
++    _seed_child(stores, touched, parent_id, "failed")
++    _seed_child(stores, touched, parent_id, None)
++
++    row = _list_rows(app)[parent_id]
++
++    assert row["active_child_count"] == 2
++    # The parent's own turn is over; the counts carry the waiting state.
++    assert row["background_task_count"] == 0
++
++
++def test_list_row_counts_child_with_outstanding_approval(
++    app: FastAPI, stores: Stores, touched
++) -> None:
++    """A child whose approval prompt landed before its status edge still counts."""
++    parent_id = _seed_parent(stores, touched, "parent")
++    asking = _seed_child(stores, touched, parent_id, None)
++    _seed_child(stores, touched, parent_id, "idle")
++    pending_elicitations.record_publish(
++        asking, {"type": "response.elicitation_request", "elicitation_id": "elicit_ask"}
++    )
++
++    assert _list_rows(app)[parent_id]["active_child_count"] == 1
++
++    pending_elicitations.resolve(asking, "elicit_ask")
++    assert _list_rows(app)[parent_id]["active_child_count"] == 0
++
++
++def test_list_row_reads_background_count_from_cache(app: FastAPI, stores: Stores, touched) -> None:
++    """The background-shell tally the Stop hook reported rides on the row."""
++    parent_id = _seed_parent(stores, touched, "shells")
++    sessions_routes._session_background_task_count_cache[parent_id] = 2
++
++    row = _list_rows(app)[parent_id]
++
++    assert row["background_task_count"] == 2
++    # Background shells never make the row itself read as running.
++    assert row["status"] == "idle"
++
++
++def test_failed_child_with_stale_approval_does_not_count(stores: Stores, touched) -> None:
++    """A failed child is done even if an approval entry lingers in the index."""
++    parent_id = _seed_parent(stores, touched, "parent")
++    child = _seed_child(stores, touched, parent_id, "failed")
++    pending_elicitations.record_publish(
++        child, {"type": "response.elicitation_request", "elicitation_id": "elicit_stale"}
++    )
++
++    assert session_active_child_count([child]) == 0
++    assert session_active_child_count([]) == 0
++    assert session_background_task_count(parent_id) == 0
++
++
++def test_updates_stream_pushes_parent_change_when_child_status_moves(
++    app: FastAPI, stores: Stores, touched, fast_rescan: None
++) -> None:
++    """A child starting and finishing pushes ``changed`` frames for the watched parent."""
++    parent_id = _seed_parent(stores, touched, "parent")
++    child_id = _seed_child(stores, touched, parent_id, None)
++
++    with TestClient(app).websocket_connect("/v1/sessions/updates", headers=_HEADERS) as ws:
++        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
++        snapshot = _recv_until(ws, {"snapshot"})
++        first = snapshot["items"][0]  # type: ignore[index]
++        assert first["active_child_count"] == 0
++        assert first["background_task_count"] == 0
++
++        sessions_routes._session_status_cache[child_id] = "running"
++        assert _recv_parent_change(ws, parent_id)["active_child_count"] == 1
++
++        sessions_routes._session_status_cache[child_id] = "idle"
++        assert _recv_parent_change(ws, parent_id)["active_child_count"] == 0
++
++
++def test_updates_stream_pushes_change_when_background_count_moves(
++    app: FastAPI, stores: Stores, touched, fast_rescan: None
++) -> None:
++    """A new background-shell tally, and its clearing, push ``changed`` frames."""
++    parent_id = _seed_parent(stores, touched, "shells")
++
++    with TestClient(app).websocket_connect("/v1/sessions/updates", headers=_HEADERS) as ws:
++        ws.send_text(json.dumps({"type": "watch", "session_ids": [parent_id]}))
++        _recv_until(ws, {"snapshot"})
++
++        sessions_routes._session_background_task_count_cache[parent_id] = 3
++        assert _recv_parent_change(ws, parent_id)["background_task_count"] == 3
++
++        sessions_routes._session_background_task_count_cache.pop(parent_id, None)
++        assert _recv_parent_change(ws, parent_id)["background_task_count"] == 0
+diff --git a/web/src/components/AeSessionActivity.stories.tsx b/web/src/components/AeSessionActivity.stories.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8e0ccd8fe74e00369b64b31122400241342ae200
+--- /dev/null
++++ b/web/src/components/AeSessionActivity.stories.tsx
+@@ -0,0 +1,218 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import type { Meta, StoryObj } from "@storybook/react-vite";
++import { type ReactNode, useEffect, useState } from "react";
++import { SessionStateBadge } from "@/components/SessionStateBadge";
++import { AeSessionActivityLine } from "@/components/AeSessionActivity";
++import { AE_ACTIVITY_SCHEDULED_KEY } from "@/hooks/aeSessionActivityHooks";
++import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
++import type { SessionState } from "@/hooks/useSessionState";
++import type { AnyBlock } from "@/lib/blocks";
++import type { ScheduledTask } from "@/lib/scheduledTasksApi";
++import { useChatStore } from "@/store/chatStore";
++import { createInitialConversationState } from "@/store/conversationState";
++
++// Illustrative data only: every session name, command and agent task is made up.
++// `Date.now` is pinned to 08:30 on 2026-10-17 while a story is mounted, so the
++// elapsed times and the "9:00" wake-up match the approved mockup.
++const NOW = new Date(2026, 9, 17, 8, 30, 0).getTime();
++const NINE = new Date(2026, 9, 17, 9, 0, 0).getTime();
++const CONV = "conv_activity_story";
++
++function useFrozenNow() {
++  useState(() => {
++    Date.now = () => NOW;
++    return null;
++  });
++  const realNow = useState(() => Date.now)[0];
++  useEffect(
++    () => () => {
++      Date.now = realNow;
++    },
++    [realNow],
++  );
++}
++
++const ctx = (atMs?: number) => ({
++  agent: null,
++  depth: 0,
++  turn: 0,
++  timestamp: 0,
++  responseId: "r",
++  itemId: null,
++  ...(atMs === undefined ? {} : { clientCreatedAtS: atMs / 1000 }),
++});
++
++const userMessage = (atMs: number) =>
++  ({ type: "user_message", ctx: ctx(atMs), content: [] }) as AnyBlock;
++
++const runningShell = (atMs: number) =>
++  ({
++    type: "tool_group",
++    ctx: ctx(atMs),
++    iteration: 0,
++    executions: [
++      {
++        name: "Bash",
++        arguments: { command: "pnpm vitest run" },
++        argsSummary: "pnpm vitest run",
++        callId: "call_1",
++        agentName: "main",
++        executedBy: "client",
++        output: null,
++      },
++    ],
++  }) as AnyBlock;
++
++function child(id: string, summary: string, startedS: number): ChildSessionInfo {
++  return {
++    id,
++    title: null,
++    task_summary: summary,
++    tool: "worker",
++    session_name: id,
++    current_task_status: "in_progress",
++    busy: true,
++    last_message_preview: null,
++    pending_elicitations_count: 0,
++    created_at: startedS,
++  };
++}
++
++const checkin = (): ScheduledTask => ({
++  id: "a".repeat(32),
++  name: "AE orchestrator check-in",
++  prompt: `Check in on ${CONV}`,
++  rrule: "FREQ=HOURLY",
++  ownerUserId: null,
++  agentId: "ag",
++  timezone: "UTC",
++  createdAt: 0,
++  updatedAt: 0,
++  modelOverride: null,
++  reasoningEffort: null,
++  permissionMode: null,
++  workspace: null,
++  hostId: null,
++  executionTarget: "connected_host",
++  state: "active",
++  lastRunAt: null,
++  lastRunStatus: null,
++  lastRunConversationId: null,
++  nextRunAt: new Date(NINE).toISOString(),
++});
++
++type LineKind = "working" | "quiet" | "waiting" | "scheduled";
++
++/** Seeds the chat store and the query cache once per mount, then renders the line. */
++function SeededLine({ kind, children }: { kind: LineKind; children: ReactNode }) {
++  useFrozenNow();
++  const [client] = useState(() => {
++    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    let state: Partial<ReturnType<typeof useChatStore.getState>>;
++    let kids: ChildSessionInfo[] = [];
++    let tasks: ScheduledTask[] = [];
++    if (kind === "working") {
++      state = {
++        sessionStatus: "running",
++        lastEventAt: NOW - 4000,
++        blocks: [userMessage(NOW - 192_000), runningShell(NOW - 42_000)],
++      };
++    } else if (kind === "quiet") {
++      state = {
++        sessionStatus: "running",
++        lastEventAt: NOW - 6 * 60_000,
++        blocks: [userMessage(NOW - 7 * 60_000), runningShell(NOW - 6 * 60_000)],
++      };
++    } else if (kind === "waiting") {
++      state = {
++        sessionStatus: "idle",
++        lastEventAt: NOW - 120_000,
++        backgroundTaskCount: 1,
++        backgroundTasks: [{ id: "s1", command: "gh pr checks 112 --watch" }],
++      };
++      kids = [
++        child("c1", "Build rail container", NOW / 1000 - 480),
++        child("c2", "Build popover", NOW / 1000 - 360),
++      ];
++    } else {
++      state = { sessionStatus: "idle" };
++      tasks = [checkin()];
++    }
++    useChatStore.setState({ ...createInitialConversationState(), conversationId: CONV, ...state });
++    qc.setQueryData(childSessionsQueryKey(CONV), kids);
++    qc.setQueryData(AE_ACTIVITY_SCHEDULED_KEY, tasks);
++    return qc;
++  });
++  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
++}
++
++const meta = {
++  title: "Components/AeSessionActivity",
++  parameters: { layout: "padded" },
++} satisfies Meta;
++
++export default meta;
++type Story = StoryObj<typeof meta>;
++
++interface Row {
++  name: string;
++  state: SessionState;
++  selected?: boolean;
++}
++
++const ROWS: Row[] = [
++  { name: "Session rail build", state: { kind: "running" }, selected: true },
++  { name: "Fabric Admin Menu", state: { kind: "waiting", agents: 2, sinceEventMs: 0 } },
++  { name: "MSFT Decision Model", state: { kind: "quiet", quietForMs: 6 * 60_000 } },
++  { name: "Halcyon close-out", state: { kind: "awaiting", count: 1 } },
++  {
++    name: "Fabric Ecosystem Game",
++    state: { kind: "scheduled", at: NINE, waker: "the hourly check-in" },
++  },
++  { name: "PR markdown cards", state: { kind: "unseen" } },
++];
++
++/** One sidebar row per state, drawn with the real `SessionStateBadge`. */
++export const SidebarRows: Story = {
++  render: function Render() {
++    useFrozenNow();
++    return (
++      <div
++        data-testid="activity-rows"
++        className="w-70 rounded-xl border border-border bg-sidebar p-2 text-sm text-foreground"
++      >
++        <h3 className="mx-2 mt-0.5 mb-1.5 text-xs font-medium text-muted-foreground">Sessions</h3>
++        {ROWS.map((row) => (
++          <div
++            key={row.name}
++            className={`flex items-center gap-2 rounded-md px-2 py-1.5 ${row.selected ? "bg-brand-accent/15 text-brand-accent" : ""}`}
++          >
++            <span className="min-w-0 flex-1 truncate">{row.name}</span>
++            <SessionStateBadge state={row.state} />
++          </div>
++        ))}
++      </div>
++    );
++  },
++};
++
++function lineStory(kind: LineKind): Story {
++  return {
++    render: () => (
++      <SeededLine kind={kind}>
++        <div data-testid="activity-line-frame" className="bg-background p-4">
++          <AeSessionActivityLine showsWorking={kind !== "scheduled"} />
++        </div>
++      </SeededLine>
++    ),
++  };
++}
++
++/** Chat status line while a turn runs: elapsed time, current step, last activity. */
++export const LineWorking: Story = lineStory("working");
++/** Working but silent for six minutes: amber, with the reassurance text. */
++export const LineQuiet: Story = lineStory("quiet");
++/** The turn ended while two agents and a shell still run: chips for each. */
++export const LineWaiting: Story = lineStory("waiting");
++/** Nothing running; the hourly check-in wakes the session at 9:00 AM. */
++export const LineScheduled: Story = lineStory("scheduled");
+diff --git a/web/src/components/AeSessionActivity.test.tsx b/web/src/components/AeSessionActivity.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..66d447d1a81cff0c966104d4553e362b5534b1ea
+--- /dev/null
++++ b/web/src/components/AeSessionActivity.test.tsx
+@@ -0,0 +1,453 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { SessionStateBadge } from "@/components/SessionStateBadge";
++import { BackgroundTaskIndicator } from "@/components/composer/BackgroundTaskIndicator";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { AE_ACTIVITY_SCHEDULED_KEY } from "@/hooks/aeSessionActivityHooks";
++import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSessions";
++import type { AnyBlock } from "@/lib/blocks";
++import type { ScheduledTask } from "@/lib/scheduledTasksApi";
++import { useChatStore } from "@/store/chatStore";
++import { createInitialConversationState } from "@/store/conversationState";
++import { AeSessionActivityLine, aeIsWideMarker, aeWideMarkerReserve } from "./AeSessionActivity";
++
++const NOW = new Date(2026, 9, 17, 8, 30, 0).getTime();
++const NINE = new Date(2026, 9, 17, 9, 0, 0).getTime();
++const NINE_AM = new Date(NINE).toLocaleTimeString(undefined, {
++  hour: "numeric",
++  minute: "2-digit",
++});
++const CONV = "conv_ae_activity";
++
++const ctx = (atMs?: number) => ({
++  agent: null,
++  depth: 0,
++  turn: 0,
++  timestamp: 0,
++  responseId: "r",
++  itemId: null,
++  ...(atMs === undefined ? {} : { clientCreatedAtS: atMs / 1000 }),
++});
++
++const userMessage = (atMs: number) =>
++  ({ type: "user_message", ctx: ctx(atMs), content: [] }) as AnyBlock;
++
++const runningShell = (atMs: number) =>
++  ({
++    type: "tool_group",
++    ctx: ctx(atMs),
++    iteration: 0,
++    executions: [
++      {
++        name: "Bash",
++        arguments: { command: "pnpm vitest run" },
++        argsSummary: "pnpm vitest run",
++        callId: "call_1",
++        agentName: "main",
++        executedBy: "client",
++        output: null,
++      },
++    ],
++  }) as AnyBlock;
++
++const codexQuestion = {
++  type: "text_done",
++  ctx: { ...ctx(), itemId: "it_q" },
++  fullText: "Which path?",
++  codexQuestions: [{ title: "Which path?", options: ["A", "B"] }],
++} as unknown as AnyBlock;
++
++const pendingQuestion = {
++  type: "elicitation",
++  ctx: ctx(),
++  status: "pending",
++  elicitationId: "el_1",
++} as unknown as AnyBlock;
++
++function child(id: string, summary: string, startedS: number): ChildSessionInfo {
++  return {
++    id,
++    title: null,
++    task_summary: summary,
++    tool: "worker",
++    session_name: id,
++    current_task_status: "in_progress",
++    busy: true,
++    last_message_preview: null,
++    pending_elicitations_count: 0,
++    created_at: startedS,
++  };
++}
++
++function checkin(): ScheduledTask {
++  return {
++    id: "a".repeat(32),
++    name: "AE orchestrator check-in",
++    prompt: `Check in on ${CONV}`,
++    rrule: "FREQ=HOURLY",
++    ownerUserId: null,
++    agentId: "ag",
++    timezone: "UTC",
++    createdAt: 0,
++    updatedAt: 0,
++    modelOverride: null,
++    reasoningEffort: null,
++    permissionMode: null,
++    workspace: null,
++    hostId: null,
++    executionTarget: "connected_host",
++    state: "active",
++    lastRunAt: null,
++    lastRunStatus: null,
++    lastRunConversationId: null,
++    nextRunAt: new Date(NINE).toISOString(),
++  };
++}
++
++let qc: QueryClient;
++
++function setup(
++  state: Partial<ReturnType<typeof useChatStore.getState>>,
++  extra: { children?: ChildSessionInfo[]; tasks?: ScheduledTask[] } = {},
++) {
++  useChatStore.setState({
++    ...createInitialConversationState(),
++    conversationId: CONV,
++    ...state,
++  });
++  qc.setQueryData(childSessionsQueryKey(CONV), extra.children ?? []);
++  qc.setQueryData(AE_ACTIVITY_SCHEDULED_KEY, extra.tasks ?? []);
++}
++
++function wrap(node: ReactNode) {
++  return render(
++    <QueryClientProvider client={qc}>
++      <TooltipProvider>{node}</TooltipProvider>
++    </QueryClientProvider>,
++  );
++}
++
++beforeEach(() => {
++  vi.useFakeTimers({ toFake: ["Date"] });
++  vi.setSystemTime(NOW);
++  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("[]", { headers: { "content-type": "application/json" } })),
++  );
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++  useChatStore.setState({ ...createInitialConversationState(), conversationId: null });
++});
++
++describe("sidebar badge", () => {
++  it("shows waiting as a pulsing hourglass with the agent count", () => {
++    wrap(<SessionStateBadge state={{ kind: "waiting", agents: 2, sinceEventMs: 120_000 }} />);
++    const badge = screen.getByTestId("session-state-badge");
++    expect(badge).toHaveAttribute("data-state", "waiting");
++    expect(badge).toHaveAttribute("aria-label", "Waiting on 2 agents");
++    expect(badge).toHaveTextContent("2");
++    expect(badge.querySelector("svg")).toHaveClass("motion-safe:animate-pulse");
++  });
++
++  it("shows quiet as a slow amber spinner with the minutes", () => {
++    wrap(<SessionStateBadge state={{ kind: "quiet", quietForMs: 6 * 60_000 }} />);
++    const badge = screen.getByTestId("session-state-badge");
++    // Still a running turn to upstream styling; the inner mark tells it apart.
++    expect(badge).toHaveAttribute("data-state", "running");
++    expect(badge).toHaveAttribute("aria-label", "Working, but no new output for 6m");
++    expect(badge.querySelector("[data-ae-activity='quiet']")).toHaveClass("text-warning");
++    expect(badge).toHaveTextContent("6m");
++    expect(badge.querySelector("svg")).toHaveClass("motion-safe:animate-spin");
++  });
++
++  it("shows scheduled as an alarm and the short time", () => {
++    wrap(
++      <SessionStateBadge state={{ kind: "scheduled", at: NINE, waker: "the hourly check-in" }} />,
++    );
++    const badge = screen.getByTestId("session-state-badge");
++    expect(badge).toHaveAttribute("data-state", "scheduled");
++    expect(badge).toHaveAttribute(
++      "aria-label",
++      `Paused; the hourly check-in wakes it at ${NINE_AM}`,
++    );
++    // The locale words the hour itself, day period included ("9 AM").
++    expect(badge.textContent).toBe(
++      new Date(NINE).toLocaleTimeString(undefined, { hour: "numeric" }),
++    );
++  });
++
++  it("leaves a plain running row on the upstream spinner", () => {
++    wrap(<SessionStateBadge state={{ kind: "running" }} />);
++    expect(screen.getByTestId("running-dot")).toBeInTheDocument();
++  });
++
++  it("gives the activity badges a wide slot", () => {
++    expect(aeIsWideMarker({ kind: "running" })).toBe(false);
++    expect(aeIsWideMarker({ kind: "unseen" })).toBe(false);
++    expect(aeIsWideMarker(null)).toBe(false);
++    expect(aeIsWideMarker({ kind: "quiet" })).toBe(true);
++    expect(aeIsWideMarker({ kind: "waiting" })).toBe(true);
++    expect(aeIsWideMarker({ kind: "scheduled" })).toBe(true);
++  });
++
++  it("keeps the title clear of a scheduled time with its day period", () => {
++    expect(aeWideMarkerReserve({ kind: "scheduled" }, false)).toBe("pr-20");
++    expect(aeWideMarkerReserve({ kind: "scheduled" }, true)).toBe("pr-26");
++    expect(aeWideMarkerReserve({ kind: "quiet" }, false)).toBe("pr-14");
++  });
++});
++
++describe("chat status line", () => {
++  it("shows working with the turn time, the current step and the last activity", () => {
++    setup({
++      sessionStatus: "running",
++      lastEventAt: NOW - 4000,
++      blocks: [userMessage(NOW - 192_000), runningShell(NOW - 42_000)],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    const line = screen.getByTestId("working-indicator");
++    expect(line).toHaveAttribute("data-ae-activity", "working");
++    expect(line).toHaveTextContent("Working· 3m 12s");
++    expect(line).toHaveTextContent("Now: running pnpm vitest run for 42s");
++    expect(line).toHaveTextContent("last activity 4s ago");
++    expect(screen.getByRole("status")).toHaveTextContent("Working…");
++  });
++
++  it("keeps the blocked-on label", () => {
++    setup({ sessionStatus: "running", blockedOn: "permission prompt", lastEventAt: NOW });
++    wrap(<AeSessionActivityLine showsWorking />);
++    expect(screen.getByTestId("working-indicator")).toHaveTextContent(
++      "Blocked on: permission prompt",
++    );
++  });
++
++  it("keeps the blocked message however long the dialog stays open", () => {
++    setup({
++      sessionStatus: "running",
++      blockedOn: "dialog open",
++      lastEventAt: NOW - 20 * 60_000,
++      blocks: [userMessage(NOW - 25 * 60_000)],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    const line = screen.getByTestId("working-indicator");
++    expect(line).toHaveAttribute("data-ae-activity", "working");
++    expect(line).toHaveTextContent(
++      "Waiting on a dialog in the terminal. Open the terminal tab to respond.",
++    );
++  });
++
++  it("dates the last activity by the newer of the store stamp and the newest block", () => {
++    setup({
++      sessionStatus: "running",
++      lastEventAt: NOW - 20 * 60_000,
++      blocks: [userMessage(NOW - 30_000)],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    const line = screen.getByTestId("working-indicator");
++    expect(line).toHaveAttribute("data-ae-activity", "working");
++    expect(line).toHaveTextContent("last activity 30s ago");
++  });
++
++  it("counts the turn from the switch to running when no new user message started it", () => {
++    setup({
++      sessionStatus: "running",
++      lastEventAt: NOW,
++      aeRunningSince: NOW - 42_000,
++      blocks: [userMessage(NOW - 2 * 3_600_000)],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Working· 42s");
++  });
++
++  it("counts the turn and the last activity from a message still on its way", () => {
++    // A rebind cleared the store's stamp; the old transcript must not read as quiet.
++    setup({
++      sessionStatus: "running",
++      lastEventAt: null,
++      blocks: [userMessage(NOW - 2 * 3_600_000)],
++      pendingUserMessages: [{ tempId: "pend_1", content: [], createdAtS: (NOW - 10_000) / 1000 }],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    const line = screen.getByTestId("working-indicator");
++    expect(line).toHaveAttribute("data-ae-activity", "working");
++    expect(line).toHaveTextContent("Working· 10s");
++    expect(line).toHaveTextContent("last activity 10s ago");
++  });
++
++  it("never shows an earlier turn's unanswered call as the current step", () => {
++    setup({
++      sessionStatus: "running",
++      lastEventAt: NOW,
++      blocks: [runningShell(NOW - 3_600_000), userMessage(NOW - 60_000)],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    expect(screen.getByTestId("working-indicator")).not.toHaveTextContent("Now:");
++  });
++
++  it("turns quiet after five minutes without an event", () => {
++    setup({
++      sessionStatus: "running",
++      lastEventAt: NOW - 6 * 60_000,
++      blocks: [userMessage(NOW - 7 * 60_000), runningShell(NOW - 6 * 60_000)],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    const line = screen.getByTestId("working-indicator");
++    expect(line).toHaveAttribute("data-ae-activity", "quiet");
++    expect(line).toHaveTextContent("Still working· no new output for 6m");
++    expect(line).toHaveTextContent("Last step: running pnpm vitest run (6m).");
++    expect(line).toHaveTextContent("Long runs are often quiet; the Stop button still works.");
++    expect(line).toHaveTextContent("last activity 6m ago");
++  });
++
++  it("ticks the times each second while working", () => {
++    setup({ sessionStatus: "running", lastEventAt: NOW - 4000 });
++    vi.useFakeTimers({ toFake: ["Date", "setInterval", "clearInterval"] });
++    vi.setSystemTime(NOW);
++    wrap(<AeSessionActivityLine showsWorking />);
++    expect(screen.getByTestId("working-indicator")).toHaveTextContent("last activity 4s ago");
++    act(() => {
++      vi.advanceTimersByTime(3000);
++    });
++    expect(screen.getByTestId("working-indicator")).toHaveTextContent("last activity 7s ago");
++    // The label stays "Working" rather than rotating.
++    act(() => {
++      vi.advanceTimersByTime(12_000);
++    });
++    expect(screen.getByTestId("working-indicator")).toHaveTextContent(
++      /^Workinglast activity 19s ago$/,
++    );
++  });
++
++  it("waits on agents and shells after the turn, with a chip for each", () => {
++    setup(
++      {
++        sessionStatus: "idle",
++        lastEventAt: NOW - 120_000,
++        backgroundTaskCount: 1,
++        backgroundTasks: [{ id: "s1", command: "gh pr checks 112 --watch" }],
++      },
++      {
++        children: [
++          child("c1", "Build rail container", NOW / 1000 - 480),
++          child("c2", "Build popover", NOW / 1000 - 360),
++        ],
++      },
++    );
++    wrap(
++      <>
++        <AeSessionActivityLine showsWorking />
++        <BackgroundTaskIndicator />
++      </>,
++    );
++    const line = screen.getByTestId("ae-activity-line");
++    expect(line).toHaveAttribute("data-ae-activity", "waiting");
++    expect(line).toHaveTextContent("Waiting on 2 agents and 1 background shell");
++    expect(line).toHaveTextContent("The session picks up when they report. Last update 2m ago.");
++    const agents = screen.getAllByTestId("ae-activity-agent-chip");
++    expect(agents.map((chip) => chip.textContent)).toEqual([
++      "Build rail container8m",
++      "Build popover6m",
++    ]);
++    expect(screen.getByTestId("ae-activity-shell-chip")).toHaveTextContent(
++      "gh pr checks 112 --watch",
++    );
++    // The line lists the shells, so the composer pill steps aside.
++    expect(screen.queryByTestId("background-task-pill")).toBeNull();
++  });
++
++  it("opens a shell chip's details", () => {
++    setup({
++      backgroundTaskCount: 1,
++      backgroundTasks: [{ id: "s1", description: "Wait for CI", command: "sleep 120" }],
++    });
++    wrap(<AeSessionActivityLine showsWorking />);
++    fireEvent.click(screen.getByTestId("ae-activity-shell-chip"));
++    expect(screen.getByText("sleep 120")).toBeInTheDocument();
++  });
++
++  it("keeps the composer pill beside the working line", () => {
++    setup({
++      sessionStatus: "running",
++      lastEventAt: NOW,
++      backgroundTaskCount: 1,
++      backgroundTasks: [{ id: "s1", command: "sleep 120" }],
++    });
++    wrap(
++      <>
++        <AeSessionActivityLine showsWorking />
++        <BackgroundTaskIndicator />
++      </>,
++    );
++    expect(screen.getByTestId("background-task-pill")).toBeInTheDocument();
++  });
++
++  it("waits on running children even when the page shows no work", () => {
++    setup({ sessionStatus: "idle" }, { children: [child("c1", "Research", NOW / 1000 - 60)] });
++    wrap(<AeSessionActivityLine showsWorking={false} />);
++    expect(screen.getByTestId("ae-activity-line")).toHaveTextContent("Waiting on 1 agent");
++  });
++
++  it("counts a child held on an approval, as the sidebar does", () => {
++    const held = { ...child("c1", "Deploy check", NOW / 1000 - 60), pending_elicitations_count: 1 };
++    setup({ sessionStatus: "idle" }, { children: [held] });
++    wrap(<AeSessionActivityLine showsWorking={false} />);
++    expect(screen.getByTestId("ae-activity-line")).toHaveTextContent("Waiting on 1 agent");
++    const chip = screen.getByTestId("ae-activity-agent-chip");
++    expect(chip).toHaveTextContent("Deploy checkneeds approval");
++    expect(chip).toHaveAttribute("data-needs-approval", "true");
++  });
++
++  it("renders nothing while a Codex question waits, until a reply is on its way", () => {
++    setup(
++      { sessionStatus: "idle", blocks: [codexQuestion] },
++      { children: [child("c1", "Research", NOW / 1000 - 60)], tasks: [checkin()] },
++    );
++    const { container } = wrap(<AeSessionActivityLine showsWorking={false} />);
++    expect(container).toBeEmptyDOMElement();
++    act(() => {
++      useChatStore.setState({
++        pendingUserMessages: [{ tempId: "pend_1", content: [], createdAtS: NOW / 1000 }],
++      });
++    });
++    expect(screen.getByTestId("ae-activity-line")).toHaveTextContent("Waiting on 1 agent");
++  });
++
++  it("ignores shells the page hides (a known-offline runner)", () => {
++    setup({ backgroundTaskCount: 2 });
++    const { container } = wrap(<AeSessionActivityLine showsWorking={false} />);
++    expect(container).toBeEmptyDOMElement();
++  });
++
++  it("says when a schedule will wake an idle session", () => {
++    setup({ sessionStatus: "idle" }, { tasks: [checkin()] });
++    wrap(<AeSessionActivityLine showsWorking={false} />);
++    const line = screen.getByTestId("ae-activity-line");
++    expect(line).toHaveAttribute("data-ae-activity", "scheduled");
++    expect(line).toHaveTextContent(`Paused until ${NINE_AM}`);
++    expect(line).toHaveTextContent(
++      "The hourly check-in wakes this session; pause it from the session rail's Scheduled section.",
++    );
++  });
++
++  it("renders nothing while a question waits for the user", () => {
++    setup(
++      { sessionStatus: "running", blocks: [pendingQuestion], backgroundTaskCount: 1 },
++      { tasks: [checkin()] },
++    );
++    const { container } = wrap(<AeSessionActivityLine showsWorking={false} />);
++    expect(container).toBeEmptyDOMElement();
++  });
++
++  it("renders nothing when idle", () => {
++    setup({ sessionStatus: "idle" });
++    const { container } = wrap(<AeSessionActivityLine showsWorking={false} />);
++    expect(container).toBeEmptyDOMElement();
++  });
++});
+diff --git a/web/src/components/AeSessionActivity.tsx b/web/src/components/AeSessionActivity.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f11f1351eaedf76c9147cc649e8c96132465f892
+--- /dev/null
++++ b/web/src/components/AeSessionActivity.tsx
+@@ -0,0 +1,395 @@
++// What the session is doing, drawn twice: a compact sidebar badge (quiet,
++// waiting, scheduled) and the chat status line above the composer (working,
++// quiet, waiting, scheduled). Both read the same derivation in
++// `@/lib/aeSessionActivity`, so they never disagree.
++
++import type { ReactElement, ReactNode } from "react";
++import { AE_RAIL_ICONS } from "@/components/aeRail/aeRailIcons";
++import { Message, MessageContent } from "@/components/ai-elements/message";
++import { Shimmer } from "@/components/ai-elements/shimmer";
++import { BrandLogo } from "@/components/BrandLogo";
++import { workingIndicatorLabel } from "@/components/chat/chatBubbleParts";
++import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
++import {
++  useAeChatActivity,
++  useAeRegisterWaitingLine,
++  type AeAgentChip,
++} from "@/hooks/aeSessionActivityHooks";
++import {
++  aeDuration,
++  aeFormatAgo,
++  aeQuietLabel,
++  aeScheduledDetail,
++  aeScheduledHeadline,
++  aeScheduledTooltip,
++  aeShortRunTime,
++  aeStepBody,
++  aeStepVerb,
++  aeWaitingLabel,
++  isAeSessionState,
++  type AeSessionState,
++  type AeStep,
++} from "@/lib/aeSessionActivity";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
++import type { BackgroundTaskInfo } from "@/lib/types";
++import { cn } from "@/lib/utils";
++
++/** Tabler outline nodes (tabler.io/icons); hourglass and terminal-2 copied from @tabler/icons. */
++export const AE_ACTIVITY_ICONS = {
++  hourglass: [
++    ["path", { d: "M6.5 7h11" }],
++    ["path", { d: "M6.5 17h11" }],
++    ["path", { d: "M6 20v-2a6 6 0 1 1 12 0v2a1 1 0 0 1 -1 1h-10a1 1 0 0 1 -1 -1" }],
++    ["path", { d: "M6 4v2a6 6 0 1 0 12 0v-2a1 1 0 0 0 -1 -1h-10a1 1 0 0 0 -1 1" }],
++  ],
++  terminal: [
++    ["path", { d: "M8 9l3 3l-3 3" }],
++    ["path", { d: "M13 15l3 0" }],
++    [
++      "path",
++      { d: "M3 6a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2l0 -12" },
++    ],
++  ],
++  robot: AE_RAIL_ICONS.robot,
++  alarm: AE_RAIL_ICONS.alarm,
++  loader: AE_RAIL_ICONS.loader,
++} satisfies Record<string, AeTablerIconNode>;
++
++const PULSE = "motion-safe:animate-pulse [animation-duration:2.4s]";
++const SLOW_SPIN = "motion-safe:animate-spin [animation-duration:1.8s]";
++
++// ── Sidebar badge ────────────────────────────────────────────────────
++
++/** The activity badges carry a number or time beside the icon, so they need more than a dot slot. */
++export function aeIsWideMarker(state: { kind: string } | null): boolean {
++  return state !== null && isAeSessionState(state);
++}
++
++/**
++ * Title padding a row keeps clear of a wide badge. A scheduled time ("9:30 PM",
++ * or a longer locale's day period) needs more than a count or "12m" does.
++ */
++export function aeWideMarkerReserve(state: { kind: string } | null, shared: boolean): string {
++  if (state?.kind === "scheduled") return shared ? "pr-26" : "pr-20";
++  return shared ? "pr-20" : "pr-14";
++}
++
++export interface AeBadgeVisual {
++  /** Quiet reports `running`: it is still a running turn to upstream styling and tests. */
++  kind: Exclude<AeSessionState["kind"], "quiet"> | "running";
++  ariaLabel: string;
++  tooltip: string;
++  render: () => ReactElement;
++}
++
++/** The sidebar visual for an activity state; see `SessionStateBadge`. */
++export function aeDescribeSessionState(state: AeSessionState, now = Date.now()): AeBadgeVisual {
++  if (state.kind === "waiting") {
++    const label = aeWaitingLabel(state.agents, 0);
++    const tooltip =
++      state.sinceEventMs === null
++        ? label
++        : `${label} · last update ${aeFormatAgo(state.sinceEventMs)}`;
++    return {
++      kind: state.kind,
++      ariaLabel: label,
++      tooltip,
++      render: () => (
++        <span data-ae-activity="waiting" className="inline-flex items-center gap-1">
++          <AeTablerSvg
++            node={AE_ACTIVITY_ICONS.hourglass}
++            className={cn("size-3.5 text-info", PULSE)}
++          />
++          <span className="inline-grid h-4 min-w-4 place-items-center rounded-full bg-muted px-1 text-[10px] leading-none text-foreground tabular-nums">
++            {state.agents}
++          </span>
++        </span>
++      ),
++    };
++  }
++  if (state.kind === "scheduled") {
++    const next = { at: state.at, waker: state.waker };
++    const tooltip = aeScheduledTooltip(next, now);
++    return {
++      kind: state.kind,
++      ariaLabel: tooltip,
++      tooltip,
++      render: () => (
++        <span
++          data-ae-activity="scheduled"
++          className="inline-flex items-center gap-1 text-[11px] whitespace-nowrap text-muted-foreground tabular-nums"
++        >
++          <AeTablerSvg node={AE_ACTIVITY_ICONS.alarm} className="size-3.5 shrink-0" />
++          {aeShortRunTime(state.at, now)}
++        </span>
++      ),
++    };
++  }
++  const tooltip = aeQuietLabel(state.quietForMs);
++  return {
++    kind: "running",
++    ariaLabel: tooltip,
++    tooltip,
++    render: () => (
++      <span
++        data-ae-activity="quiet"
++        className="inline-flex items-center gap-1 text-[11px] text-warning tabular-nums"
++      >
++        <AeTablerSvg node={AE_ACTIVITY_ICONS.loader} className={cn("size-3 shrink-0", SLOW_SPIN)} />
++        {aeDuration(state.quietForMs, true)}
++      </span>
++    ),
++  };
++}
++
++// ── Chat status line ─────────────────────────────────────────────────
++
++function StepText({ step, now, lead }: { step: AeStep; now: number; lead: "Now" | "Last step" }) {
++  const elapsed = step.startedAt === null ? null : aeDuration(now - step.startedAt, lead !== "Now");
++  return (
++    <>
++      {lead}: {aeStepVerb(step.title)}{" "}
++      <code className="inline-block max-w-[22ch] truncate rounded bg-muted px-1 align-bottom font-mono text-xs sm:max-w-[48ch]">
++        {aeStepBody(step.title)}
++      </code>
++      {elapsed !== null && (lead === "Now" ? ` for ${elapsed}` : ` (${elapsed})`)}
++    </>
++  );
++}
++
++/** "Working", or why the turn is parked (a terminal dialog, say). */
++function WorkingLabel({ blockedOn }: { blockedOn: string | null }) {
++  return (
++    <Shimmer className="font-mono text-sm" duration={1.5}>
++      {blockedOn ? workingIndicatorLabel(0, blockedOn) : "Working"}
++    </Shimmer>
++  );
++}
++
++function StatusRow({
++  icon,
++  children,
++  aside,
++  testId,
++  state,
++}: {
++  icon: ReactElement;
++  children: ReactNode;
++  aside?: string | null;
++  testId: string;
++  state: string;
++}) {
++  return (
++    <Message from="assistant" data-testid={testId} data-ae-activity={state}>
++      <MessageContent className="w-full">
++        <div className="flex w-full flex-wrap items-start gap-x-3 gap-y-0.5 py-0.5">
++          <div className="flex min-w-0 grow basis-64 items-start gap-1.5">
++            <span className="mt-0.5 flex h-4 shrink-0 items-center">{icon}</span>
++            <div className="min-w-0 flex-1">{children}</div>
++          </div>
++          {aside && (
++            <span className="ml-auto shrink-0 text-xs text-muted-foreground tabular-nums">
++              {aside}
++            </span>
++          )}
++        </div>
++      </MessageContent>
++    </Message>
++  );
++}
++
++function AgentChip({ agent, now }: { agent: AeAgentChip; now: number }) {
++  return (
++    <span
++      data-testid="ae-activity-agent-chip"
++      data-needs-approval={agent.needsApproval || undefined}
++      title={agent.needsApproval ? `${agent.label} (needs approval)` : agent.label}
++      className={cn(
++        "inline-flex max-w-full items-center gap-1.5 rounded-md border px-2 py-0.5 text-xs",
++        agent.needsApproval ? "border-warning/60" : "border-border",
++      )}
++    >
++      <AeTablerSvg node={AE_ACTIVITY_ICONS.robot} className="size-3.5 shrink-0" />
++      <span className="truncate">{agent.label}</span>
++      {agent.needsApproval ? (
++        <span className="shrink-0 font-medium text-warning">needs approval</span>
++      ) : (
++        agent.startedAt !== null && (
++          <span className="shrink-0 text-muted-foreground tabular-nums">
++            {aeDuration(now - agent.startedAt, true)}
++          </span>
++        )
++      )}
++    </span>
++  );
++}
++
++function shellLabel(task: BackgroundTaskInfo): string {
++  return task.description?.trim() || task.command?.trim() || "Background shell";
++}
++
++/** A shell chip opens the full description and command, as the composer pill did. */
++function ShellChip({ task }: { task: BackgroundTaskInfo }) {
++  const label = shellLabel(task);
++  const command = task.command?.trim();
++  return (
++    <Popover modal={false}>
++      <PopoverTrigger asChild>
++        <button
++          type="button"
++          data-testid="ae-activity-shell-chip"
++          className="inline-flex max-w-full items-center gap-1.5 rounded-md border border-border px-2 py-0.5 text-xs hover:bg-muted"
++        >
++          <AeTablerSvg node={AE_ACTIVITY_ICONS.terminal} className="size-3.5 shrink-0" />
++          <span className="truncate">{label}</span>
++        </button>
++      </PopoverTrigger>
++      <PopoverContent
++        side="top"
++        align="start"
++        collisionPadding={8}
++        className="w-80 max-w-[90vw] p-3"
++      >
++        <div className="flex flex-col gap-1">
++          <span className="text-sm text-foreground [overflow-wrap:anywhere]">{label}</span>
++          {command && command !== label && (
++            <span className="whitespace-pre-wrap font-mono text-xs text-muted-foreground [overflow-wrap:anywhere]">
++              {command}
++            </span>
++          )}
++          {task.status && <span className="text-xs text-muted-foreground">{task.status}</span>}
++        </div>
++      </PopoverContent>
++    </Popover>
++  );
++}
++
++/**
++ * The status line at the foot of the transcript. `showsWorking` is the page's
++ * working gate; needs-a-response states render nothing here (the question
++ * card owns them).
++ */
++export function AeSessionActivityLine({ showsWorking }: { showsWorking: boolean }) {
++  const data = useAeChatActivity(showsWorking);
++  const { activity, now } = data;
++  useAeRegisterWaitingLine(
++    data.conversationId,
++    activity.kind === "waiting" && data.shells.length > 0,
++  );
++  const ago = data.lastEventAt === null ? null : aeFormatAgo(Math.max(0, now - data.lastEventAt));
++
++  if (activity.kind === "working") {
++    const elapsed = data.turnStartedAt === null ? null : aeDuration(now - data.turnStartedAt);
++    return (
++      <>
++        <span role="status" aria-live="polite" className="sr-only">
++          Working…
++        </span>
++        <StatusRow
++          testId="working-indicator"
++          state="working"
++          aside={ago && `last activity ${ago}`}
++          icon={<BrandLogo variant="icon" className="otto-working h-4 w-auto shrink-0" />}
++        >
++          <div className="flex flex-wrap items-baseline gap-x-1.5" aria-hidden="true">
++            <WorkingLabel blockedOn={data.blockedOn} />
++            {elapsed && <span className="text-sm text-muted-foreground">· {elapsed}</span>}
++          </div>
++          {data.step?.running && (
++            <div className="truncate text-xs text-muted-foreground">
++              <StepText step={data.step} now={now} lead="Now" />
++            </div>
++          )}
++        </StatusRow>
++      </>
++    );
++  }
++
++  if (activity.kind === "quiet") {
++    return (
++      <>
++        <span role="status" aria-live="polite" className="sr-only">
++          Still working, no new output
++        </span>
++        <StatusRow
++          testId="working-indicator"
++          state="quiet"
++          aside={ago && `last activity ${ago}`}
++          icon={
++            <AeTablerSvg
++              node={AE_ACTIVITY_ICONS.loader}
++              className={cn("size-3.5 text-warning", SLOW_SPIN)}
++            />
++          }
++        >
++          <div className="flex flex-wrap items-baseline gap-x-1.5 text-sm">
++            <span className="font-medium text-warning">Still working</span>
++            <span className="text-muted-foreground">
++              · no new output for {aeDuration(activity.quietForMs, true)}
++            </span>
++          </div>
++          <div className="text-xs text-muted-foreground">
++            {data.step && (
++              <>
++                <StepText step={data.step} now={now} lead="Last step" />.{" "}
++              </>
++            )}
++            Long runs are often quiet; the Stop button still works.
++          </div>
++        </StatusRow>
++      </>
++    );
++  }
++
++  if (activity.kind === "waiting") {
++    return (
++      <StatusRow
++        testId="ae-activity-line"
++        state="waiting"
++        icon={
++          <AeTablerSvg
++            node={AE_ACTIVITY_ICONS.hourglass}
++            className={cn("size-3.5 text-info", PULSE)}
++          />
++        }
++      >
++        <div className="text-sm font-medium" role="status">
++          {activity.label}
++        </div>
++        <div className="text-xs text-muted-foreground">
++          The session picks up when they report.
++          {ago && ` Last update ${ago}.`}
++        </div>
++        {data.agents.length + data.shells.length > 0 && (
++          <div className="mt-1.5 flex flex-wrap gap-1.5">
++            {data.agents.map((agent) => (
++              <AgentChip key={agent.id} agent={agent} now={now} />
++            ))}
++            {data.shells.map((task, i) => (
++              <ShellChip key={task.id ?? `shell-${i}`} task={task} />
++            ))}
++          </div>
++        )}
++      </StatusRow>
++    );
++  }
++
++  if (activity.kind === "scheduled") {
++    const next = { at: activity.at, waker: activity.waker };
++    return (
++      <StatusRow
++        testId="ae-activity-line"
++        state="scheduled"
++        icon={
++          <AeTablerSvg node={AE_ACTIVITY_ICONS.alarm} className="size-3.5 text-muted-foreground" />
++        }
++      >
++        <div className="text-sm font-medium">{aeScheduledHeadline(next, now)}</div>
++        <div className="text-xs text-muted-foreground">{aeScheduledDetail(next)}</div>
++      </StatusRow>
++    );
++  }
++
++  return null;
++}
+diff --git a/web/src/components/SessionStateBadge.tsx b/web/src/components/SessionStateBadge.tsx
+index 97e37c2fdbedb08635f6b8071e3d4f50f76a57bd..2bd1da3c2e29e115a3a5227c649ca13be3deed0f 100644
+--- a/web/src/components/SessionStateBadge.tsx
++++ b/web/src/components/SessionStateBadge.tsx
+@@ -9,6 +9,8 @@ import type { SessionState } from "@/hooks/useSessionState";
+ import { cn } from "@/lib/utils";
+ import type { ReactElement } from "react";
+ import { CircleAlertIcon } from "lucide-react";
++import { aeDescribeSessionState } from "@/components/AeSessionActivity";
++import { isAeSessionState } from "@/lib/aeSessionActivity";
+ 
+ export interface SessionStateBadgeProps {
+   state: SessionState;
+@@ -22,6 +24,7 @@ interface Visual {
+ }
+ 
+ function describe(state: SessionState): Visual {
++  if (isAeSessionState(state)) return aeDescribeSessionState(state);
+   switch (state.kind) {
+     case "awaiting": {
+       const tooltip =
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index beda5b08e0c3870ef5702e558e3e451a96bae288..b0108fbb95e03f685662813a69bbd36dda2b1fec 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -11,6 +11,7 @@ import {
+ import { Message, MessageContent } from "@/components/ai-elements/message";
+ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+ import { aePendingCodexQuestions } from "./aeCodexQuestions";
++import { AeSessionActivityLine } from "@/components/AeSessionActivity";
+ import { CodexQuestionCard } from "./CodexQuestionCard";
+ import { cn } from "@/lib/utils";
+ import { getCurrentAuthorId } from "@/lib/identity";
+@@ -48,7 +49,6 @@ import {
+   KeepBottomOnViewportResize,
+   LatestTurnSpacer,
+   ScrollToBottomOnSend,
+-  WorkingIndicator,
+   bubbleKey,
+   buildPendingBubbles,
+   collectPendingElicitations,
+@@ -426,8 +426,8 @@ function TranscriptImpl({
+                       </MessageContent>
+                     </Message>
+                   ))}
+-                {/* Working… shimmer, lit for the whole busy turn. */}
+-                {showWorkingIndicator && <WorkingIndicator />}
++                {/* Status line: working, quiet, waiting, or paused for a schedule. */}
++                <AeSessionActivityLine showsWorking={showWorkingIndicator} />
+                 {/* Managed-sandbox stage cue; only when Working is absent. */}
+                 {!showWorkingIndicator && <RunnerStartingIndicator variant="row" />}
+                 {/* MCP-server startup band (codex-native); clears once the
+diff --git a/web/src/components/composer/BackgroundTaskIndicator.tsx b/web/src/components/composer/BackgroundTaskIndicator.tsx
+index e74346a69e35a71d412abf5dcdebd7997ab8a9c8..a8d9adef36bc46c457e0c3ec36560dd5c074d407 100644
+--- a/web/src/components/composer/BackgroundTaskIndicator.tsx
++++ b/web/src/components/composer/BackgroundTaskIndicator.tsx
+@@ -6,6 +6,7 @@ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover
+ import type { BackgroundTaskInfo } from "@/lib/types";
+ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
++import { useAeWaitingLineShown } from "@/hooks/aeSessionActivityHooks";
+ 
+ function taskLabel(task: BackgroundTaskInfo): string {
+   const description = task.description?.trim();
+@@ -77,6 +78,7 @@ export function BackgroundTaskIndicator() {
+   const bgCount = useChatStore((s) => s.backgroundTaskCount);
+   const bgTasks = useChatStore((s) => s.backgroundTasks);
+   const conversationId = useChatStore((s) => s.conversationId);
++  const listedInStatusLine = useAeWaitingLineShown(conversationId);
+   const [open, setOpen] = useState(false);
+   const triggerRef = useRef<HTMLButtonElement>(null);
+   // Escape returns to the trigger; session switches must never move focus.
+@@ -102,7 +104,7 @@ export function BackgroundTaskIndicator() {
+     setOpen(next);
+   };
+ 
+-  if (bgCount <= 0) return null;
++  if (bgCount <= 0 || listedInStatusLine) return null;
+ 
+   const countLabel = `${bgCount} background task${bgCount === 1 ? "" : "s"}`;
+   // The count is authoritative in both directions: an over-long detail list
+diff --git a/web/src/hooks/aeSessionActivityHooks.test.ts b/web/src/hooks/aeSessionActivityHooks.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..62b14cf76bb4ce232e9026bb8bf24219b051f5bf
+--- /dev/null
++++ b/web/src/hooks/aeSessionActivityHooks.test.ts
+@@ -0,0 +1,324 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { renderHook } from "@testing-library/react";
++import { createElement, type ReactNode } from "react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type { AnyBlock } from "@/lib/blocks";
++import type { ScheduledTask } from "@/lib/scheduledTasksApi";
++import {
++  AE_ACTIVITY_SCHEDULED_KEY,
++  AE_AFTER_RUN_REFETCH_MS,
++  aePendingQuestionCount,
++  aeProjectMarker,
++  aeRowState,
++  aeRunningAgentChips,
++  aeSoonestRunAt,
++  useAeScheduledTasks,
++} from "./aeSessionActivityHooks";
++import type { Conversation } from "./useConversations";
++import type { ChildSessionInfo } from "./useChildSessions";
++
++const NOW = new Date(2026, 9, 17, 8, 30, 0).getTime();
++const NOW_S = Math.floor(NOW / 1000);
++const NINE = new Date(2026, 9, 17, 9, 0, 0).getTime();
++
++// Rows still arrive with the server's shell count; the sidebar must ignore it.
++type Row = Parameters<typeof aeRowState>[0] & Pick<Conversation, "background_task_count">;
++
++function row(extra: Partial<Row> = {}): Row {
++  return { id: "conv_a", status: "idle", updated_at: NOW_S, ...extra };
++}
++
++const base = { now: NOW, nextRun: null, lastEventAt: null, turnIdle: false };
++
++function checkin(sessionId: string, at = NINE): ScheduledTask {
++  return {
++    id: "a".repeat(32),
++    name: "AE orchestrator check-in",
++    prompt: `Check in on ${sessionId}`,
++    rrule: "FREQ=HOURLY",
++    ownerUserId: null,
++    agentId: "ag",
++    timezone: "UTC",
++    createdAt: 0,
++    updatedAt: 0,
++    modelOverride: null,
++    reasoningEffort: null,
++    permissionMode: null,
++    workspace: null,
++    hostId: null,
++    executionTarget: "connected_host",
++    state: "active",
++    lastRunAt: null,
++    lastRunStatus: null,
++    lastRunConversationId: null,
++    nextRunAt: new Date(at).toISOString(),
++  };
++}
++
++describe("aeRowState", () => {
++  it("keeps a running row with fresh output as running", () => {
++    expect(aeRowState(row({ status: "running" }), { kind: "running" }, base).state).toEqual({
++      kind: "running",
++    });
++  });
++
++  it("turns a running row quiet after five silent minutes", () => {
++    const stale = row({ status: "running", updated_at: NOW_S - 6 * 60 });
++    expect(aeRowState(stale, { kind: "running" }, base).state).toEqual({
++      kind: "quiet",
++      quietForMs: 6 * 60_000,
++    });
++  });
++
++  it("never turns a row quiet while the open chat is parked on a dialog", () => {
++    const stale = row({ status: "running", updated_at: NOW_S - 20 * 60 });
++    const options = { ...base, blockedOn: "dialog open" };
++    expect(aeRowState(stale, { kind: "running" }, options).state).toEqual({ kind: "running" });
++  });
++
++  it("uses the newer of the open chat's last event and the row's update time", () => {
++    const stale = row({ status: "running", updated_at: NOW_S - 6 * 60 });
++    const state = aeRowState(stale, { kind: "running" }, { ...base, lastEventAt: NOW - 1000 });
++    expect(state.state).toEqual({ kind: "running" });
++    // A stamp from an earlier visit never makes a fresh row quiet.
++    const fresh = row({ status: "running", updated_at: NOW_S - 10 });
++    const old = { ...base, lastEventAt: NOW - 20 * 60_000 };
++    expect(aeRowState(fresh, { kind: "running" }, old).state).toEqual({ kind: "running" });
++  });
++
++  it("never calls a parent quiet while its children run", () => {
++    const stale = row({ status: "running", updated_at: NOW_S - 600, active_child_count: 1 });
++    expect(aeRowState(stale, { kind: "running" }, base).state).toEqual({ kind: "running" });
++  });
++
++  it("reads a running parent as waiting when the open chat says its own turn ended", () => {
++    const parent = row({ status: "running", active_child_count: 2 });
++    expect(aeRowState(parent, { kind: "running" }, { ...base, turnIdle: true }).state).toEqual({
++      kind: "waiting",
++      agents: 2,
++      sinceEventMs: null,
++    });
++  });
++
++  it("reads an idle row with children as waiting", () => {
++    const state = aeRowState(
++      row({ background_task_count: 1, active_child_count: 2, updated_at: NOW_S - 120 }),
++      null,
++      base,
++    );
++    expect(state).toEqual({
++      state: { kind: "waiting", agents: 2, sinceEventMs: 120_000 },
++      scheduled: null,
++    });
++  });
++
++  it("ignores the shell count, which goes stale once a shell exits after the turn", () => {
++    const shellOnly = row({ background_task_count: 2 });
++    expect(aeRowState(shellOnly, null, base)).toEqual({ state: null, scheduled: null });
++    const parent = row({ status: "running", background_task_count: 1 });
++    expect(aeRowState(parent, { kind: "running" }, { ...base, turnIdle: true }).state).toEqual({
++      kind: "running",
++    });
++  });
++
++  it("reads missing counts as none", () => {
++    expect(aeRowState(row(), null, base)).toEqual({ state: null, scheduled: null });
++  });
++
++  it("leaves awaiting, error and disconnected rows alone", () => {
++    const busy = row({ background_task_count: 3 });
++    for (const upstream of [
++      { kind: "awaiting", count: 1 } as const,
++      { kind: "error" } as const,
++      { kind: "disconnected" } as const,
++    ]) {
++      expect(aeRowState(busy, upstream, base).state).toEqual(upstream);
++    }
++  });
++
++  it("offers a schedule only as the fallback below unseen", () => {
++    const next = { at: NINE, waker: "the hourly check-in" };
++    expect(aeRowState(row(), null, { ...base, nextRun: next })).toEqual({
++      state: null,
++      scheduled: { kind: "scheduled", at: NINE, waker: "the hourly check-in" },
++    });
++    // Waiting outranks the schedule; a stale shell count does not.
++    expect(
++      aeRowState(row({ active_child_count: 1 }), null, { ...base, nextRun: next }).scheduled,
++    ).toBeNull();
++    expect(
++      aeRowState(row({ background_task_count: 1 }), null, { ...base, nextRun: next }).scheduled,
++    ).not.toBeNull();
++  });
++});
++
++describe("aeProjectMarker", () => {
++  const opts = { now: NOW, tasks: undefined };
++
++  it("turns a running marker quiet only when every running row is quiet", () => {
++    const quiet = row({ id: "q", status: "running", updated_at: NOW_S - 600 });
++    const quieter = row({ id: "r", status: "running", updated_at: NOW_S - 900 });
++    const fresh = row({ id: "f", status: "running" });
++    expect(aeProjectMarker({ kind: "running" }, [quiet, quieter], opts)).toEqual({
++      kind: "quiet",
++      quietForMs: 600_000,
++    });
++    expect(aeProjectMarker({ kind: "running" }, [quiet, fresh], opts)).toEqual({
++      kind: "running",
++    });
++  });
++
++  it("puts waiting above unseen and blank, and sums the agents", () => {
++    const rows = [
++      row({ id: "a", background_task_count: 1, active_child_count: 1 }),
++      row({ id: "b", active_child_count: 2 }),
++    ];
++    const waiting = { kind: "waiting", agents: 3, sinceEventMs: null };
++    expect(aeProjectMarker(null, rows, opts)).toEqual(waiting);
++    expect(aeProjectMarker({ kind: "unseen" }, rows, opts)).toEqual(waiting);
++  });
++
++  it("keeps awaiting, starting, error and disconnected above waiting", () => {
++    const rows = [row({ active_child_count: 1 })];
++    for (const marker of [
++      { kind: "awaiting", count: 1 } as const,
++      { kind: "starting" } as const,
++      { kind: "error" } as const,
++      { kind: "disconnected" } as const,
++    ]) {
++      expect(aeProjectMarker(marker, rows, opts)).toEqual(marker);
++    }
++  });
++
++  it("shows the soonest schedule only on an otherwise blank marker", () => {
++    const tasks = [checkin("a", NINE + 3_600_000), { ...checkin("b"), id: "b".repeat(32) }];
++    const rows = [row({ id: "a" }), row({ id: "b" })];
++    expect(aeProjectMarker(null, rows, { now: NOW, tasks })).toEqual({
++      kind: "scheduled",
++      at: NINE,
++      waker: "the hourly check-in",
++    });
++    expect(aeProjectMarker({ kind: "unseen" }, rows, { now: NOW, tasks })).toEqual({
++      kind: "unseen",
++    });
++  });
++});
++
++describe("aeRunningAgentChips", () => {
++  const child = (extra: Partial<ChildSessionInfo>): ChildSessionInfo => ({
++    id: "c",
++    title: "worker:auth",
++    task_summary: null,
++    tool: "worker",
++    session_name: "auth",
++    current_task_status: null,
++    busy: false,
++    last_message_preview: null,
++    pending_elicitations_count: 0,
++    ...extra,
++  });
++
++  it("lists working, launching and approval-held children, as the server counts them", () => {
++    const chips = aeRunningAgentChips([
++      child({ id: "1", busy: true, task_summary: "Build rail container", created_at: 100 }),
++      child({ id: "2", current_task_status: "launching" }),
++      child({ id: "3", current_task_status: "completed" }),
++      child({ id: "4", busy: true, pending_elicitations_count: 1 }),
++    ]);
++    expect(chips).toEqual([
++      { id: "1", label: "Build rail container", startedAt: 100_000, needsApproval: false },
++      { id: "2", label: "auth", startedAt: null, needsApproval: false },
++      { id: "4", label: "auth", startedAt: null, needsApproval: true },
++    ]);
++  });
++});
++
++describe("aePendingQuestionCount", () => {
++  const ctx = { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "r", itemId: "it_q" };
++  const codexQuestion = {
++    type: "text_done",
++    ctx,
++    fullText: "Which path?",
++    codexQuestions: [{ title: "Which path?", options: ["A", "B"] }],
++  } as unknown as AnyBlock;
++  const elicitation = (target?: string) =>
++    ({
++      type: "elicitation",
++      ctx,
++      status: "pending",
++      elicitationId: "el",
++      ...(target ? { targetSessionId: target } : {}),
++    }) as unknown as AnyBlock;
++
++  it("counts elicitations aimed at this session and unanswered Codex questions", () => {
++    expect(
++      aePendingQuestionCount([elicitation(), elicitation("conv_child")], "conv_a", false),
++    ).toBe(1);
++    expect(aePendingQuestionCount([codexQuestion], "conv_a", false)).toBe(1);
++  });
++
++  it("treats a reply on its way as the Codex answer", () => {
++    expect(aePendingQuestionCount([codexQuestion], "conv_a", true)).toBe(0);
++    const answered = [codexQuestion, { type: "user_message", ctx, content: [] } as AnyBlock];
++    expect(aePendingQuestionCount(answered, "conv_a", false)).toBe(0);
++  });
++});
++
++describe("scheduled list refetch after a run fires", () => {
++  afterEach(() => {
++    vi.useRealTimers();
++    vi.unstubAllGlobals();
++  });
++
++  function mount(tasks: ScheduledTask[]) {
++    vi.useFakeTimers({ toFake: ["Date", "setTimeout", "clearTimeout"] });
++    vi.setSystemTime(NOW);
++    const fetchMock = vi.fn(
++      async (_url: RequestInfo | URL) =>
++        new Response(JSON.stringify({ scheduled_tasks: [] }), {
++          headers: { "content-type": "application/json" },
++        }),
++    );
++    vi.stubGlobal("fetch", fetchMock);
++    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    qc.setQueryData(AE_ACTIVITY_SCHEDULED_KEY, tasks);
++    const wrapper = ({ children }: { children: ReactNode }) =>
++      createElement(QueryClientProvider, { client: qc }, children);
++    // Two rows share one timer.
++    const first = renderHook(() => useAeScheduledTasks(), { wrapper });
++    const second = renderHook(() => useAeScheduledTasks(), { wrapper });
++    const calls = () =>
++      fetchMock.mock.calls.filter(([url]) => String(url).includes("/v1/scheduled-tasks")).length;
++    return { first, second, calls };
++  }
++
++  it("picks the soonest active run still ahead", () => {
++    const tasks = [
++      checkin("a", NINE + 60_000),
++      { ...checkin("b", NINE), id: "b".repeat(32) },
++      { ...checkin("c", NOW + 1000), id: "c".repeat(32), state: "paused" as const },
++      { ...checkin("d", NOW - 1000), id: "d".repeat(32) },
++    ];
++    expect(aeSoonestRunAt(tasks, NOW)).toBe(NINE);
++    expect(aeSoonestRunAt(undefined, NOW)).toBeNull();
++  });
++
++  it("refetches once, a few seconds after the soonest run", async () => {
++    const { calls } = mount([checkin("a", NOW + 60_000)]);
++    await vi.advanceTimersByTimeAsync(60_000 + AE_AFTER_RUN_REFETCH_MS - 10);
++    expect(calls()).toBe(0);
++    await vi.advanceTimersByTimeAsync(20);
++    expect(calls()).toBe(1);
++    // The refetched list has no future run, so nothing else is scheduled.
++    await vi.advanceTimersByTimeAsync(10 * 60_000);
++    expect(calls()).toBe(1);
++  });
++
++  it("clears the timer once every reader unmounts", async () => {
++    const { first, second, calls } = mount([checkin("a", NOW + 60_000)]);
++    first.unmount();
++    second.unmount();
++    await vi.advanceTimersByTimeAsync(120_000);
++    expect(calls()).toBe(0);
++  });
++});
+diff --git a/web/src/hooks/aeSessionActivityHooks.ts b/web/src/hooks/aeSessionActivityHooks.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e4b667fea1fcefc105aed2b4c0d0d58ff99eaa4b
+--- /dev/null
++++ b/web/src/hooks/aeSessionActivityHooks.ts
+@@ -0,0 +1,470 @@
++// React glue for the session activity state: the sidebar's per-row and
++// collapsed-project states, the chat status line's inputs, one scheduled-tasks
++// query for the whole sidebar, and the clock that keeps the times current.
++
++import { useQuery, useQueryClient } from "@tanstack/react-query";
++import { useEffect, useMemo, useState, useSyncExternalStore } from "react";
++import { aePendingCodexQuestions } from "@/components/chat/aeCodexQuestions";
++import { computeIsWorking, isBackgroundTasksOnly } from "@/components/chat/chatBubbleParts";
++import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
++import type { Conversation } from "@/hooks/useConversations";
++import type { SessionState } from "@/hooks/useSessionState";
++import { createdScheduleIds } from "@/lib/aeRailScheduled";
++import {
++  aeCurrentStep,
++  aeNewestBlockAt,
++  aeNextScheduledRun,
++  aeTurnStartedAt,
++  deriveAeActivity,
++  type AeActivity,
++  type AeNextRun,
++  type AeStep,
++} from "@/lib/aeSessionActivity";
++import { listScheduledTasks, type ScheduledTask } from "@/lib/scheduledTasksApi";
++import type { AnyBlock } from "@/lib/blocks";
++import type { BackgroundTaskInfo } from "@/lib/types";
++import { childStatus } from "@/shell/subagentStatus";
++import { useChatStore } from "@/store/chatStore";
++
++/**
++ * The sidebar's own scheduled-tasks list. It sits under the Tasks page key so
++ * every task mutation's invalidation refreshes it, but it never polls: focus,
++ * a few minutes of staleness and one refetch just after each run fires are
++ * enough for a "next run" hint.
++ */
++export const AE_ACTIVITY_SCHEDULED_KEY = ["scheduled-tasks", "ae-session-activity"] as const;
++const SCHEDULED_STALE_MS = 3 * 60_000;
++const ROW_TICK_MS = 30_000;
++const NO_IDS: ReadonlySet<string> = new Set();
++/** The server moves `next_run_at` on once the run fires; give it this long. */
++export const AE_AFTER_RUN_REFETCH_MS = 5000;
++// setTimeout overflows past this and would fire at once.
++const MAX_TIMER_MS = 2_147_483_647;
++
++/** Epoch ms of the soonest active run still ahead, or `null`. */
++export function aeSoonestRunAt(
++  tasks: readonly ScheduledTask[] | undefined,
++  now: number,
++): number | null {
++  let soonest: number | null = null;
++  for (const task of tasks ?? []) {
++    if (task.state !== "active" || !task.nextRunAt) continue;
++    const at = Date.parse(task.nextRunAt);
++    if (Number.isNaN(at) || at <= now) continue;
++    if (soonest === null || at < soonest) soonest = at;
++  }
++  return soonest;
++}
++
++// Every row reads the same list, so the rows share one timer per fire time.
++const afterRunTimers = new Map<number, { timer: ReturnType<typeof setTimeout>; users: number }>();
++
++function useRefetchAfterSoonestRun(tasks: readonly ScheduledTask[] | undefined): void {
++  const queryClient = useQueryClient();
++  const runAt = useMemo(() => aeSoonestRunAt(tasks, Date.now()), [tasks]);
++  useEffect(() => {
++    if (runAt === null) return;
++    const delay = runAt - Date.now() + AE_AFTER_RUN_REFETCH_MS;
++    if (delay > MAX_TIMER_MS) return;
++    let entry = afterRunTimers.get(runAt);
++    if (entry === undefined) {
++      const timer = setTimeout(
++        () => {
++          afterRunTimers.delete(runAt);
++          void queryClient.refetchQueries({ queryKey: AE_ACTIVITY_SCHEDULED_KEY, exact: true });
++        },
++        Math.max(0, delay),
++      );
++      entry = { timer, users: 0 };
++      afterRunTimers.set(runAt, entry);
++    }
++    entry.users += 1;
++    return () => {
++      const current = afterRunTimers.get(runAt);
++      if (current === undefined) return;
++      current.users -= 1;
++      if (current.users > 0) return;
++      clearTimeout(current.timer);
++      afterRunTimers.delete(runAt);
++    };
++  }, [queryClient, runAt]);
++}
++
++export function useAeScheduledTasks(): ScheduledTask[] | undefined {
++  const tasks = useQuery<ScheduledTask[]>({
++    queryKey: AE_ACTIVITY_SCHEDULED_KEY,
++    queryFn: listScheduledTasks,
++    staleTime: SCHEDULED_STALE_MS,
++    refetchOnWindowFocus: true,
++    retry: false,
++  }).data;
++  useRefetchAfterSoonestRun(tasks);
++  return tasks;
++}
++
++/** Wall-clock ms, refreshed every `intervalMs` while it is set. */
++export function useAeNow(intervalMs: number | null): number {
++  const [now, setNow] = useState(() => Date.now());
++  useEffect(() => {
++    if (intervalMs === null) return;
++    setNow(Date.now());
++    const timer = setInterval(() => setNow(Date.now()), intervalMs);
++    return () => clearInterval(timer);
++  }, [intervalMs]);
++  return now;
++}
++
++// Rows ignore `background_task_count`: it refreshes only at the next turn end,
++// so a shell that exited after the turn would keep the row waiting.
++function rowAgents(row: Pick<Conversation, "active_child_count">): number {
++  return row.active_child_count ?? 0;
++}
++
++/** Whether the open chat says its own turn is over (children may still run). */
++function useBoundTurnIdle(conversationId: string): boolean {
++  return useChatStore(
++    (s) =>
++      s.conversationId === conversationId &&
++      !s.loadingConversation &&
++      s.status === "idle" &&
++      !computeIsWorking(s.sessionStatus),
++  );
++}
++
++function useBoundLastEventAt(conversationId: string): number | null {
++  return useChatStore((s) => (s.conversationId === conversationId ? s.lastEventAt : null));
++}
++
++function useBoundBlockedOn(conversationId: string): string | null {
++  return useChatStore((s) => (s.conversationId === conversationId ? s.blockedOn : null));
++}
++
++type RowInput = Pick<Conversation, "id" | "status" | "updated_at" | "active_child_count">;
++
++/**
++ * Refine one row's upstream state: running turns quiet after five silent
++ * minutes (never while parked on a dialog), an idle row with agents left
++ * reads as waiting, and an idle row a schedule will wake gets `scheduled`
++ * (shown below the unseen dot).
++ */
++export function aeRowState(
++  row: RowInput,
++  upstream: SessionState | null,
++  options: {
++    now: number;
++    nextRun: AeNextRun | null;
++    lastEventAt: number | null;
++    turnIdle: boolean;
++    blockedOn?: string | null;
++  },
++): { state: SessionState | null; scheduled: SessionState | null } {
++  const agents = rowAgents(row);
++  const lastEventAt = Math.max(options.lastEventAt ?? 0, row.updated_at * 1000);
++  if (upstream?.kind === "running") {
++    // A busy child keeps the parent row running; the open chat knows when
++    // the parent's own turn is over and the row is only waiting.
++    if (options.turnIdle && agents > 0) {
++      return { state: { kind: "waiting", agents, sinceEventMs: null }, scheduled: null };
++    }
++    // Running children keep a parent busy without its own output.
++    if (agents > 0) return { state: upstream, scheduled: null };
++    const activity = deriveAeActivity({
++      working: true,
++      blockedOn: options.blockedOn,
++      pendingQuestions: 0,
++      lastEventAt,
++      nextRun: null,
++      now: options.now,
++    });
++    return {
++      state:
++        activity.kind === "quiet" ? { kind: "quiet", quietForMs: activity.quietForMs } : upstream,
++      scheduled: null,
++    };
++  }
++  if (upstream !== null) return { state: upstream, scheduled: null };
++  const activity = deriveAeActivity({
++    working: false,
++    pendingQuestions: 0,
++    runningChildren: agents,
++    lastEventAt,
++    nextRun: options.nextRun,
++    now: options.now,
++  });
++  if (activity.kind === "waiting") {
++    return {
++      state: { kind: "waiting", agents: activity.agents, sinceEventMs: activity.sinceEventMs },
++      scheduled: null,
++    };
++  }
++  if (activity.kind === "scheduled") {
++    return {
++      state: null,
++      scheduled: { kind: "scheduled", at: activity.at, waker: activity.waker },
++    };
++  }
++  return { state: null, scheduled: null };
++}
++
++/** A sidebar row's state with the activity refinements; see {@link aeRowState}. */
++export function useAeSessionRowState(
++  conversation: Conversation,
++  upstream: SessionState | null,
++): { state: SessionState | null; scheduled: SessionState | null } {
++  const tasks = useAeScheduledTasks();
++  const turnIdle = useBoundTurnIdle(conversation.id);
++  const lastEventAt = useBoundLastEventAt(conversation.id);
++  const blockedOn = useBoundBlockedOn(conversation.id);
++  const [roughNow] = useState(() => Date.now());
++  const candidate = useMemo(
++    () => aeNextScheduledRun(tasks, conversation.id, NO_IDS, roughNow),
++    [tasks, conversation.id, roughNow],
++  );
++  const ticks = upstream?.kind === "running" || rowAgents(conversation) > 0 || candidate !== null;
++  const now = useAeNow(ticks ? ROW_TICK_MS : null);
++  const nextRun = useMemo(
++    () => aeNextScheduledRun(tasks, conversation.id, NO_IDS, now),
++    [tasks, conversation.id, now],
++  );
++  return aeRowState(conversation, upstream, { now, nextRun, lastEventAt, turnIdle, blockedOn });
++}
++
++/**
++ * Roll the activity states into a collapsed project's marker, keeping the
++ * upstream order: a running marker turns quiet only when every running row
++ * is quiet, waiting outranks unseen, and a schedule shows only on an
++ * otherwise blank marker.
++ */
++export function aeProjectMarker(
++  marker: SessionState | null,
++  rows: readonly RowInput[],
++  options: { now: number; tasks: readonly ScheduledTask[] | undefined },
++): SessionState | null {
++  if (marker?.kind === "running") {
++    let quietest: number | null = null;
++    for (const row of rows) {
++      if (row.status !== "running") continue;
++      const { state } = aeRowState(
++        row,
++        { kind: "running" },
++        {
++          now: options.now,
++          nextRun: null,
++          lastEventAt: null,
++          turnIdle: false,
++        },
++      );
++      if (state?.kind !== "quiet") return marker;
++      quietest = quietest === null ? state.quietForMs : Math.min(quietest, state.quietForMs);
++    }
++    return quietest === null ? marker : { kind: "quiet", quietForMs: quietest };
++  }
++  if (marker !== null && marker.kind !== "unseen") return marker;
++  let agents = 0;
++  let next: AeNextRun | null = null;
++  for (const row of rows) {
++    if (row.status === "running") continue;
++    agents += rowAgents(row);
++    const run = aeNextScheduledRun(options.tasks, row.id, NO_IDS, options.now);
++    if (run && (next === null || run.at < next.at)) next = run;
++  }
++  if (agents > 0) return { kind: "waiting", agents, sinceEventMs: null };
++  if (marker === null && next !== null)
++    return { kind: "scheduled", at: next.at, waker: next.waker };
++  return marker;
++}
++
++/** A collapsed project's marker with the activity states; see {@link aeProjectMarker}. */
++export function useAeProjectMarker(
++  marker: SessionState | null,
++  rows: readonly RowInput[],
++): SessionState | null {
++  const tasks = useAeScheduledTasks();
++  const ticks = marker === null || marker.kind === "running" || marker.kind === "unseen";
++  const now = useAeNow(ticks ? ROW_TICK_MS : null);
++  return aeProjectMarker(marker, rows, { now, tasks });
++}
++
++// The chat line's waiting variant lists the shells itself, so the composer's
++// background-task pill steps aside while that variant is on screen.
++const waitingLines = new Map<string, number>();
++const waitingListeners = new Set<() => void>();
++
++function subscribeWaitingLines(listener: () => void): () => void {
++  waitingListeners.add(listener);
++  return () => waitingListeners.delete(listener);
++}
++
++export function useAeRegisterWaitingLine(conversationId: string | null, shown: boolean): void {
++  useEffect(() => {
++    if (!shown || conversationId === null) return;
++    waitingLines.set(conversationId, (waitingLines.get(conversationId) ?? 0) + 1);
++    for (const listener of waitingListeners) listener();
++    return () => {
++      const left = (waitingLines.get(conversationId) ?? 1) - 1;
++      if (left > 0) waitingLines.set(conversationId, left);
++      else waitingLines.delete(conversationId);
++      for (const listener of waitingListeners) listener();
++    };
++  }, [conversationId, shown]);
++}
++
++export function useAeWaitingLineShown(conversationId: string | null): boolean {
++  return useSyncExternalStore(subscribeWaitingLines, () =>
++    conversationId === null ? false : waitingLines.has(conversationId),
++  );
++}
++
++export interface AeAgentChip {
++  id: string;
++  label: string;
++  /** Epoch ms the child started, when known. */
++  startedAt: number | null;
++  /** The child is held on an approval; the server's row count includes it too. */
++  needsApproval: boolean;
++}
++
++function childLabel(child: ChildSessionInfo): string {
++  return (
++    child.task_summary?.trim() || child.session_name?.trim() || child.title?.trim() || "Sub-agent"
++  );
++}
++
++const CHIP_ACTIVITIES: ReadonlySet<string> = new Set(["working", "launching", "awaiting"]);
++
++export function aeRunningAgentChips(children: readonly ChildSessionInfo[]): AeAgentChip[] {
++  const chips: AeAgentChip[] = [];
++  for (const child of children) {
++    const activity = childStatus(child).activity;
++    if (!CHIP_ACTIVITIES.has(activity)) continue;
++    chips.push({
++      id: child.id,
++      label: childLabel(child),
++      startedAt: typeof child.created_at === "number" ? child.created_at * 1000 : null,
++      needsApproval: activity === "awaiting",
++    });
++  }
++  return chips;
++}
++
++function aeNewest(times: readonly (number | null)[]): number | null {
++  let newest: number | null = null;
++  for (const at of times) if (at !== null && (newest === null || at > newest)) newest = at;
++  return newest;
++}
++
++/** Open questions in the chat: elicitations aimed here plus unanswered Codex questions. */
++export function aePendingQuestionCount(
++  blocks: AnyBlock[],
++  conversationId: string | null,
++  hasPendingReply: boolean,
++): number {
++  let count = 0;
++  for (const b of blocks) {
++    if (
++      b.type === "elicitation" &&
++      b.status === "pending" &&
++      (b.targetSessionId == null || b.targetSessionId === conversationId)
++    ) {
++      count += 1;
++    }
++  }
++  // A reply on its way answers the Codex question, as the transcript reads it.
++  if (!hasPendingReply) {
++    for (const set of aePendingCodexQuestions(blocks)) count += set.questions.length;
++  }
++  return count;
++}
++
++export interface AeChatActivity {
++  conversationId: string | null;
++  activity: AeActivity;
++  blockedOn: string | null;
++  step: AeStep | null;
++  turnStartedAt: number | null;
++  lastEventAt: number | null;
++  agents: AeAgentChip[];
++  shells: BackgroundTaskInfo[];
++  nextRun: AeNextRun | null;
++  now: number;
++}
++
++const TICK_MS: Record<AeActivity["kind"], number | null> = {
++  working: 1000,
++  quiet: 1000,
++  waiting: 5000,
++  scheduled: 30_000,
++  needs_response: null,
++  idle: null,
++};
++
++/**
++ * The open chat's activity. `showsWorking` is the page's own working gate
++ * (it already folds in pending prompts, runner liveness and background shells).
++ */
++export function useAeChatActivity(showsWorking: boolean): AeChatActivity {
++  const conversationId = useChatStore((s) => s.conversationId);
++  const blocks = useChatStore((s) => s.blocks);
++  const sessionStatus = useChatStore((s) => s.sessionStatus);
++  const sending = useChatStore((s) => s.status === "streaming");
++  const blockedOn = useChatStore((s) => s.blockedOn);
++  const bgCount = useChatStore((s) => s.backgroundTaskCount);
++  const bgTasks = useChatStore((s) => s.backgroundTasks);
++  const storeLastEventAt = useChatStore((s) => s.lastEventAt);
++  const runningSince = useChatStore((s) => s.aeRunningSince);
++  const pendingMessages = useChatStore((s) => s.pendingUserMessages);
++  const { children } = useChildSessions(conversationId);
++  const tasks = useAeScheduledTasks();
++  const agents = useMemo(() => aeRunningAgentChips(children), [children]);
++  const pendingQuestions = useMemo(
++    () => aePendingQuestionCount(blocks, conversationId, pendingMessages.length > 0),
++    [blocks, conversationId, pendingMessages.length],
++  );
++  const createdIds = useMemo(() => createdScheduleIds(blocks), [blocks]);
++  const step = useMemo(() => aeCurrentStep(blocks), [blocks]);
++  const pendingSentAt = useMemo(
++    () => pendingMessages.map((p) => (p.createdAtS === undefined ? null : p.createdAtS * 1000)),
++    [pendingMessages],
++  );
++  const turnStartedAt = useMemo(
++    () => aeTurnStartedAt(blocks, [runningSince, ...pendingSentAt]),
++    [blocks, runningSince, pendingSentAt],
++  );
++  const newestBlockAt = useMemo(() => aeNewestBlockAt(blocks), [blocks]);
++  // The store only stamps while bound and a rebind clears it, so the newest
++  // block and an unsent message date the activity too.
++  const lastEventAt = aeNewest([storeLastEventAt, newestBlockAt, ...pendingSentAt]);
++  const agentTurnActive = computeIsWorking(sessionStatus) || sending;
++  const working = showsWorking && !isBackgroundTasksOnly(bgCount, blockedOn, agentTurnActive);
++
++  const [kindForTick, setKindForTick] = useState<AeActivity["kind"]>("idle");
++  const now = useAeNow(TICK_MS[kindForTick]);
++  const nextRun = useMemo(
++    () => (conversationId ? aeNextScheduledRun(tasks, conversationId, createdIds, now) : null),
++    [tasks, conversationId, createdIds, now],
++  );
++  const activity = deriveAeActivity({
++    working,
++    blockedOn,
++    pendingQuestions,
++    // Shells count only while the page shows them (a known-offline runner hides them).
++    backgroundShells: showsWorking ? bgCount : 0,
++    runningChildren: agents.length,
++    lastEventAt,
++    nextRun,
++    now,
++  });
++  useEffect(() => setKindForTick(activity.kind), [activity.kind]);
++  return {
++    conversationId,
++    activity,
++    blockedOn,
++    step,
++    turnStartedAt,
++    lastEventAt,
++    agents,
++    shells: showsWorking ? bgTasks.slice(0, bgCount) : [],
++    nextRun,
++    now,
++  };
++}
+diff --git a/web/src/hooks/useConversations.ts b/web/src/hooks/useConversations.ts
+index 36260296446038418a2f90c4ac340a40df8a9d78..ad9ba8f479642b30b9753a70c65319ee14940745 100644
+--- a/web/src/hooks/useConversations.ts
++++ b/web/src/hooks/useConversations.ts
+@@ -171,6 +171,10 @@ export interface Conversation {
+   agent_name?: string | null;
+   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
+   pending_elicitations_count?: number;
++  /** Running background shells; absent on older servers (read as none). */
++  background_task_count?: number | null;
++  /** Running child sessions (subagents, collaborators); absent on older servers. */
++  active_child_count?: number | null;
+   status?: "idle" | "running" | "failed";
+   /**
+    * Whether the session's runner is reachable, matching `GET /health`.
+@@ -495,6 +499,8 @@ export async function fetchConversationById(id: string): Promise<Conversation |
+     agent_id: wire.agent_id,
+     agent_name: wire.agent_name ?? null,
+     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
++    background_task_count: wire.background_task_count ?? undefined,
++    active_child_count: wire.active_child_count ?? undefined,
+     status: wire.status ?? "idle",
+     runner_online: wire.runner_online ?? undefined,
+     host_online: wire.host_online ?? undefined,
+diff --git a/web/src/hooks/useSessionState.ts b/web/src/hooks/useSessionState.ts
+index 30c6a0527a561e2ba5f78a24da9bca37efec355e..6da3dd8ae6b512683421ede9cd95effa43c8ab82 100644
+--- a/web/src/hooks/useSessionState.ts
++++ b/web/src/hooks/useSessionState.ts
+@@ -11,6 +11,7 @@
+ 
+ import type { Conversation } from "@/hooks/useConversations";
+ import type { LatestSessionError } from "@/lib/sessionError";
++import type { AeSessionState } from "@/lib/aeSessionActivity";
+ 
+ export type SessionState =
+   | { kind: "awaiting"; count: number }
+@@ -22,7 +23,8 @@ export type SessionState =
+   // being created before the server confirms `running`. Not derivable from a
+   // conversation row (it reads the chat store), so `getSessionState` never
+   // returns it; the sidebar row folds it in for the bound session only.
+-  | { kind: "starting" };
++  | { kind: "starting" }
++  | AeSessionState;
+ 
+ export function getSessionState(
+   conversation: Pick<Conversation, "status" | "pending_elicitations_count"> | undefined | null,
+diff --git a/web/src/lib/aeSessionActivity.test.ts b/web/src/lib/aeSessionActivity.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b437fb0bd635ce1bc13b90969d99067f60bb4501
+--- /dev/null
++++ b/web/src/lib/aeSessionActivity.test.ts
+@@ -0,0 +1,411 @@
++import { afterEach, describe, expect, it } from "vitest";
++import type { AnyBlock } from "@/lib/blocks";
++import type { ScheduledTask } from "@/lib/scheduledTasksApi";
++import {
++  AE_QUIET_AFTER_MS,
++  aeCurrentStep,
++  aeDuration,
++  aeFormatAgo,
++  aeNewestBlockAt,
++  aeNextScheduledRun,
++  aeQuietLabel,
++  aeResetLastEventStamps,
++  aeScheduleWaker,
++  aeScheduledDetail,
++  aeScheduledHeadline,
++  aeScheduledTooltip,
++  aeShortRunTime,
++  aeStampLastEvent,
++  aeStepBody,
++  aeStepVerb,
++  aeTurnStartedAt,
++  aeWaitingLabel,
++  deriveAeActivity,
++  isAeSessionState,
++  type AeActivityInput,
++} from "./aeSessionActivity";
++
++const NOW = new Date(2026, 9, 17, 8, 30, 0).getTime();
++const NINE = new Date(2026, 9, 17, 9, 0, 0).getTime();
++
++function input(extra: Partial<AeActivityInput> = {}): AeActivityInput {
++  return {
++    working: false,
++    pendingQuestions: 0,
++    backgroundShells: 0,
++    runningChildren: 0,
++    lastEventAt: null,
++    nextRun: null,
++    now: NOW,
++    ...extra,
++  };
++}
++
++const ctx = (createdAtS?: number) => ({
++  agent: null,
++  depth: 0,
++  turn: 0,
++  timestamp: 0,
++  responseId: "r",
++  itemId: null,
++  ...(createdAtS === undefined ? {} : { clientCreatedAtS: createdAtS }),
++});
++
++function toolGroup(callId: string, command: string, atS?: number): AnyBlock {
++  return {
++    type: "tool_group",
++    ctx: ctx(atS),
++    iteration: 0,
++    executions: [
++      {
++        name: "Bash",
++        arguments: { command },
++        argsSummary: command,
++        callId,
++        agentName: "main",
++        executedBy: "client",
++        output: null,
++      },
++    ],
++  } as AnyBlock;
++}
++
++function toolResult(callId: string): AnyBlock {
++  return {
++    type: "tool_result",
++    ctx: ctx(),
++    name: "Bash",
++    callId,
++    agentName: "main",
++    output: "ok",
++  } as AnyBlock;
++}
++
++function userMessage(atS: number): AnyBlock {
++  return { type: "user_message", ctx: ctx(atS), content: [] } as AnyBlock;
++}
++
++function task(extra: Partial<ScheduledTask>): ScheduledTask {
++  return {
++    id: "a".repeat(32),
++    name: "AE orchestrator check-in",
++    prompt: "Check in on conv_target",
++    rrule: "FREQ=HOURLY;INTERVAL=1",
++    ownerUserId: null,
++    agentId: "ag",
++    timezone: "UTC",
++    createdAt: 0,
++    updatedAt: 0,
++    modelOverride: null,
++    reasoningEffort: null,
++    permissionMode: null,
++    workspace: null,
++    hostId: null,
++    executionTarget: "connected_host",
++    state: "active",
++    lastRunAt: null,
++    lastRunStatus: null,
++    lastRunConversationId: null,
++    nextRunAt: new Date(NINE).toISOString(),
++    ...extra,
++  };
++}
++
++describe("deriveAeActivity", () => {
++  it("is idle with nothing going on", () => {
++    expect(deriveAeActivity(input())).toEqual({ kind: "idle" });
++  });
++
++  it("puts an open question above everything else", () => {
++    const activity = deriveAeActivity(
++      input({
++        pendingQuestions: 2,
++        working: true,
++        backgroundShells: 3,
++        nextRun: { at: NINE, waker: "the hourly check-in" },
++      }),
++    );
++    expect(activity).toEqual({ kind: "needs_response", count: 2 });
++  });
++
++  it("is working while the turn runs, with the time since the last event", () => {
++    const activity = deriveAeActivity(input({ working: true, lastEventAt: NOW - 4000 }));
++    expect(activity).toEqual({ kind: "working", sinceEventMs: 4000 });
++  });
++
++  it("stays working just under the quiet threshold and turns quiet at it", () => {
++    const under = deriveAeActivity(
++      input({ working: true, lastEventAt: NOW - AE_QUIET_AFTER_MS + 1 }),
++    );
++    expect(under.kind).toBe("working");
++    const at = deriveAeActivity(input({ working: true, lastEventAt: NOW - AE_QUIET_AFTER_MS }));
++    expect(at).toEqual({ kind: "quiet", quietForMs: AE_QUIET_AFTER_MS });
++  });
++
++  it("never turns quiet while the turn is parked on a dialog", () => {
++    for (const blockedOn of ["dialog open", "permission prompt"]) {
++      const activity = deriveAeActivity(
++        input({ working: true, blockedOn, lastEventAt: NOW - 20 * 60_000 }),
++      );
++      expect(activity).toEqual({ kind: "working", sinceEventMs: 20 * 60_000 });
++    }
++  });
++
++  it("never reads an unknown last event as quiet", () => {
++    expect(deriveAeActivity(input({ working: true, lastEventAt: null }))).toEqual({
++      kind: "working",
++      sinceEventMs: null,
++    });
++  });
++
++  it("clamps a last event in the future to zero", () => {
++    const activity = deriveAeActivity(input({ working: true, lastEventAt: NOW + 5000 }));
++    expect(activity).toEqual({ kind: "working", sinceEventMs: 0 });
++  });
++
++  it("puts working above waiting and scheduled", () => {
++    const activity = deriveAeActivity(
++      input({
++        working: true,
++        backgroundShells: 1,
++        runningChildren: 2,
++        nextRun: { at: NINE, waker: "x" },
++      }),
++    );
++    expect(activity.kind).toBe("working");
++  });
++
++  it("waits on agents and shells once the turn ends", () => {
++    const activity = deriveAeActivity(
++      input({ runningChildren: 2, backgroundShells: 1, lastEventAt: NOW - 120_000 }),
++    );
++    expect(activity).toEqual({
++      kind: "waiting",
++      agents: 2,
++      shells: 1,
++      total: 3,
++      label: "Waiting on 2 agents and 1 background shell",
++      sinceEventMs: 120_000,
++    });
++  });
++
++  it("puts waiting above a pending schedule", () => {
++    const activity = deriveAeActivity(
++      input({ backgroundShells: 1, nextRun: { at: NINE, waker: "the hourly check-in" } }),
++    );
++    expect(activity.kind).toBe("waiting");
++  });
++
++  it("reads missing counts as none", () => {
++    expect(deriveAeActivity(input({ backgroundShells: null, runningChildren: undefined }))).toEqual(
++      { kind: "idle" },
++    );
++    expect(deriveAeActivity(input({ backgroundShells: Number.NaN, runningChildren: -2 }))).toEqual({
++      kind: "idle",
++    });
++  });
++
++  it("is scheduled when idle with a future run aimed at it", () => {
++    const activity = deriveAeActivity(
++      input({ nextRun: { at: NINE, waker: "the hourly check-in" } }),
++    );
++    expect(activity).toEqual({ kind: "scheduled", at: NINE, waker: "the hourly check-in" });
++  });
++
++  it("ignores a run that is already due or past", () => {
++    expect(deriveAeActivity(input({ nextRun: { at: NOW, waker: "x" } }))).toEqual({
++      kind: "idle",
++    });
++  });
++});
++
++describe("labels", () => {
++  it("names agents and shells with singular and plural forms", () => {
++    expect(aeWaitingLabel(1, 0)).toBe("Waiting on 1 agent");
++    expect(aeWaitingLabel(0, 3)).toBe("Waiting on 3 background shells");
++    expect(aeWaitingLabel(2, 1)).toBe("Waiting on 2 agents and 1 background shell");
++    expect(aeWaitingLabel(0, 0)).toBe("Waiting");
++  });
++
++  it("formats durations the way the Agents pane does, long and compact", () => {
++    expect(aeDuration(42_000)).toBe("42s");
++    expect(aeDuration(192_000)).toBe("3m 12s");
++    expect(aeDuration(185_000)).toBe("3m 05s");
++    expect(aeDuration(192_000, true)).toBe("3m");
++    expect(aeDuration(3_900_000)).toBe("1h 05m");
++    expect(aeDuration(3_900_000, true)).toBe("1h");
++    expect(aeDuration(-5)).toBe("0s");
++  });
++
++  it("formats time ago", () => {
++    expect(aeFormatAgo(500)).toBe("just now");
++    expect(aeFormatAgo(4000)).toBe("4s ago");
++    expect(aeFormatAgo(125_000)).toBe("2m ago");
++  });
++
++  it("words quiet and scheduled states", () => {
++    expect(aeQuietLabel(6 * 60_000)).toBe("Working, but no new output for 6m");
++    const next = { at: NINE, waker: "the hourly check-in" };
++    const nineAm = new Date(NINE).toLocaleTimeString(undefined, {
++      hour: "numeric",
++      minute: "2-digit",
++    });
++    expect(aeScheduledTooltip(next, NOW)).toBe(`Paused; the hourly check-in wakes it at ${nineAm}`);
++    expect(aeScheduledHeadline(next, NOW)).toBe(`Paused until ${nineAm}`);
++    expect(aeScheduledDetail(next)).toBe(
++      "The hourly check-in wakes this session; pause it from the session rail's Scheduled section.",
++    );
++  });
++
++  it("drops 'at' for a run on another day", () => {
++    const tomorrow = NINE + 86_400_000;
++    expect(aeScheduledTooltip({ at: tomorrow, waker: "x" }, NOW)).toMatch(
++      /^Paused; x wakes it tomorrow /,
++    );
++  });
++
++  it("shortens the run time for a sidebar row, keeping the day period", () => {
++    const hourOnly = new Intl.DateTimeFormat(undefined, { hour: "numeric" });
++    expect(aeShortRunTime(NINE, NOW)).toBe(hourOnly.format(NINE));
++    const halfPastNinePm = new Date(2026, 9, 17, 21, 30).getTime();
++    const withMinutes = new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" });
++    expect(aeShortRunTime(halfPastNinePm, NOW)).toBe(withMinutes.format(halfPastNinePm));
++    // A 12-hour locale keeps its AM or PM.
++    const period = withMinutes
++      .formatToParts(halfPastNinePm)
++      .find((part) => part.type === "dayPeriod");
++    if (period) {
++      expect(aeShortRunTime(halfPastNinePm, NOW)).toContain(period.value);
++      expect(aeShortRunTime(NINE, NOW)).not.toMatch(/[:.]00/);
++    }
++    expect(aeShortRunTime(NINE + 2 * 86_400_000, NOW)).toBe(
++      new Date(NINE + 2 * 86_400_000).toLocaleDateString(undefined, { weekday: "short" }),
++    );
++  });
++
++  it("names what wakes the session", () => {
++    expect(aeScheduleWaker({ name: "AE orchestrator check-in", rrule: "FREQ=HOURLY" })).toBe(
++      "the hourly check-in",
++    );
++    expect(
++      aeScheduleWaker({ name: "AE orchestrator check-in", rrule: "FREQ=HOURLY;INTERVAL=2" }),
++    ).toBe("the check-in every 2 hours");
++    expect(aeScheduleWaker({ name: "AE orchestrator check-in", rrule: "FREQ=SECONDLY" })).toBe(
++      "the check-in",
++    );
++    expect(aeScheduleWaker({ name: "Nightly report", rrule: "FREQ=DAILY" })).toBe(
++      'the "Nightly report" schedule',
++    );
++  });
++});
++
++describe("aeNextScheduledRun", () => {
++  it("picks the soonest active future run whose prompt names the session", () => {
++    const tasks = [
++      task({ id: "1".repeat(32), nextRunAt: new Date(NINE + 3_600_000).toISOString() }),
++      task({ id: "2".repeat(32) }),
++      task({
++        id: "3".repeat(32),
++        prompt: "other session",
++        nextRunAt: new Date(NOW + 1000).toISOString(),
++      }),
++      task({ id: "4".repeat(32), state: "paused", nextRunAt: new Date(NOW + 1000).toISOString() }),
++      task({ id: "5".repeat(32), nextRunAt: new Date(NOW - 1000).toISOString() }),
++      task({ id: "6".repeat(32), nextRunAt: null }),
++    ];
++    expect(aeNextScheduledRun(tasks, "conv_target", new Set(), NOW)).toEqual({
++      at: NINE,
++      waker: "the hourly check-in",
++    });
++  });
++
++  it("includes tasks the session created", () => {
++    const created = task({ id: "b".repeat(32), name: "Ping", prompt: "no id here" });
++    expect(aeNextScheduledRun([created], "conv_target", new Set(["b".repeat(32)]), NOW)).toEqual({
++      at: NINE,
++      waker: 'the "Ping" schedule',
++    });
++  });
++
++  it("is null with no tasks loaded", () => {
++    expect(aeNextScheduledRun(undefined, "conv_target", new Set(), NOW)).toBeNull();
++    expect(aeNextScheduledRun([], "conv_target", new Set(), NOW)).toBeNull();
++  });
++});
++
++describe("block readers", () => {
++  it("finds the newest running tool call", () => {
++    const blocks = [
++      userMessage(100),
++      toolGroup("c1", "ls", 101),
++      toolResult("c1"),
++      toolGroup("c2", "pnpm vitest run", 110),
++    ];
++    const step = aeCurrentStep(blocks);
++    expect(step).toMatchObject({ running: true, startedAt: 110_000 });
++    expect(aeStepVerb(step!.title)).toBe("running");
++    expect(aeStepBody(step!.title)).toBe("pnpm vitest run");
++  });
++
++  it("stops at the current turn, so an earlier turn's unanswered call never reads as running", () => {
++    const orphan = toolGroup("c0", "sleep 600", 90);
++    expect(aeCurrentStep([orphan, userMessage(100)])).toBeNull();
++    const blocks = [orphan, userMessage(100), toolGroup("c1", "ls", 101), toolResult("c1")];
++    expect(aeCurrentStep(blocks)).toMatchObject({ running: false, startedAt: 101_000 });
++  });
++
++  it("falls back to the newest finished call", () => {
++    const blocks = [toolGroup("c1", "ls", 101), toolResult("c1")];
++    expect(aeCurrentStep(blocks)).toMatchObject({ running: false });
++    expect(aeCurrentStep([userMessage(1)])).toBeNull();
++  });
++
++  it("words a tool with its own verb", () => {
++    expect(aeStepVerb({ verb: "Web search:", body: '"x"' })).toBe("web search");
++    expect(aeStepBody({ verb: null, body: "a\n  b".padEnd(100, "c") }, 10)).toBe("a bcccccc…");
++  });
++
++  it("reads the turn start and newest stamp", () => {
++    const blocks = [userMessage(100), toolGroup("c1", "ls", 105), toolGroup("c2", "ls")];
++    expect(aeTurnStartedAt(blocks)).toBe(100_000);
++    expect(aeNewestBlockAt(blocks)).toBe(105_000);
++    expect(aeTurnStartedAt([])).toBeNull();
++    // A later start the caller knows (an unsent message, the switch to running) wins.
++    expect(aeTurnStartedAt(blocks, [150_000, null, undefined])).toBe(150_000);
++    expect(aeTurnStartedAt(blocks, [50_000])).toBe(100_000);
++    expect(aeTurnStartedAt([], [null, 7000])).toBe(7000);
++    expect(aeNewestBlockAt([toolGroup("c3", "ls")])).toBeNull();
++  });
++});
++
++describe("aeStampLastEvent", () => {
++  afterEach(aeResetLastEventStamps);
++
++  it("writes at most once a second per session", () => {
++    const writes: number[] = [];
++    const write = (patch: { lastEventAt: number }) => writes.push(patch.lastEventAt);
++    aeStampLastEvent("a", write, 1000);
++    aeStampLastEvent("a", write, 1500);
++    aeStampLastEvent("b", write, 1500);
++    aeStampLastEvent("a", write, 2000);
++    expect(writes).toEqual([1000, 1500, 2000]);
++  });
++
++  it("writes again when the clock goes backwards", () => {
++    const writes: number[] = [];
++    const write = (patch: { lastEventAt: number }) => writes.push(patch.lastEventAt);
++    aeStampLastEvent("a", write, 5000);
++    aeStampLastEvent("a", write, 4000);
++    expect(writes).toEqual([5000, 4000]);
++  });
++});
++
++describe("isAeSessionState", () => {
++  it("tells the activity states from the upstream ones", () => {
++    expect(isAeSessionState({ kind: "running" })).toBe(false);
++    expect(isAeSessionState({ kind: "quiet" })).toBe(true);
++    expect(isAeSessionState({ kind: "waiting" })).toBe(true);
++    expect(isAeSessionState({ kind: "scheduled" })).toBe(true);
++    expect(isAeSessionState({ kind: "unseen" })).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeSessionActivity.ts b/web/src/lib/aeSessionActivity.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c20471838e244760fb1f39a129ca00d4676ee99f
+--- /dev/null
++++ b/web/src/lib/aeSessionActivity.ts
+@@ -0,0 +1,329 @@
++// What a session is doing right now, as one state the sidebar row and the chat
++// status line both read: needs a response, working, quiet (working but silent),
++// waiting on agents or background shells, paused until a schedule wakes it,
++// or idle. Pure: every clock reading and count comes in as an input.
++
++import type { AnyBlock, ToolGroup } from "@/lib/blocks";
++import {
++  formatNextRun,
++  isAeCheckin,
++  parseAeRrule,
++  schedulesForSession,
++} from "@/lib/aeRailScheduled";
++import type { ScheduledTask } from "@/lib/scheduledTasksApi";
++import { formatToolTitle, type ToolTitle } from "@/lib/toolTitle";
++import { formatElapsed } from "@/shell/aeAgentsPaneModel";
++
++/** A working session with no event for this long reads as quiet. */
++export const AE_QUIET_AFTER_MS = 5 * 60_000;
++
++/** The next scheduled run aimed at a session. */
++export interface AeNextRun {
++  /** Epoch ms of the fire. */
++  at: number;
++  /** What fires, as a phrase: "the hourly check-in". */
++  waker: string;
++}
++
++export interface AeActivityInput {
++  /** The session's own turn is in progress. */
++  working: boolean;
++  /** Why a working turn is parked (a terminal dialog, say); it never reads as quiet. */
++  blockedOn?: string | null;
++  /** Open approval or question prompts. */
++  pendingQuestions: number;
++  /** Running background shells; a missing count reads as none. */
++  backgroundShells?: number | null;
++  /** Running child sessions (subagents, collaborators); a missing count reads as none. */
++  runningChildren?: number | null;
++  /** Epoch ms of the newest session event, or `null` when none is known. */
++  lastEventAt: number | null;
++  nextRun: AeNextRun | null;
++  now: number;
++}
++
++export type AeActivity =
++  | { kind: "needs_response"; count: number }
++  | { kind: "working"; sinceEventMs: number | null }
++  | { kind: "quiet"; quietForMs: number }
++  | {
++      kind: "waiting";
++      agents: number;
++      shells: number;
++      total: number;
++      label: string;
++      sinceEventMs: number | null;
++    }
++  | { kind: "scheduled"; at: number; waker: string }
++  | { kind: "idle" };
++
++function count(value: number | null | undefined): number {
++  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
++}
++
++/** The one state for a session, highest priority first. */
++export function deriveAeActivity(input: AeActivityInput): AeActivity {
++  const pending = count(input.pendingQuestions);
++  if (pending > 0) return { kind: "needs_response", count: pending };
++  const sinceEventMs =
++    input.lastEventAt === null ? null : Math.max(0, input.now - input.lastEventAt);
++  if (input.working) {
++    if (!input.blockedOn && sinceEventMs !== null && sinceEventMs >= AE_QUIET_AFTER_MS) {
++      return { kind: "quiet", quietForMs: sinceEventMs };
++    }
++    return { kind: "working", sinceEventMs };
++  }
++  const agents = count(input.runningChildren);
++  const shells = count(input.backgroundShells);
++  if (agents + shells > 0) {
++    return {
++      kind: "waiting",
++      agents,
++      shells,
++      total: agents + shells,
++      label: aeWaitingLabel(agents, shells),
++      sinceEventMs,
++    };
++  }
++  if (input.nextRun && input.nextRun.at > input.now) {
++    return { kind: "scheduled", at: input.nextRun.at, waker: input.nextRun.waker };
++  }
++  return { kind: "idle" };
++}
++
++function plural(n: number, one: string, many: string): string {
++  return `${n} ${n === 1 ? one : many}`;
++}
++
++/** "Waiting on 2 agents and 1 background shell". */
++export function aeWaitingLabel(agents: number, shells: number): string {
++  const parts: string[] = [];
++  if (agents > 0) parts.push(plural(agents, "agent", "agents"));
++  if (shells > 0) parts.push(plural(shells, "background shell", "background shells"));
++  return parts.length === 0 ? "Waiting" : `Waiting on ${parts.join(" and ")}`;
++}
++
++/** A span in ms as the Agents pane prints it: "3m 05s", or "3m" when `compact`. */
++export function aeDuration(ms: number, compact = false): string {
++  return formatElapsed(Math.max(0, Math.floor(ms / 1000)), { compact });
++}
++
++/** "just now", "4s ago", "2m ago". */
++export function aeFormatAgo(ms: number): string {
++  if (ms < 2000) return "just now";
++  return `${aeDuration(ms, true)} ago`;
++}
++
++/** "Working, but no new output for 6m". */
++export function aeQuietLabel(quietForMs: number): string {
++  return `Working, but no new output for ${aeDuration(quietForMs, true)}`;
++}
++
++/** "9 AM" or "9:30 PM" today (as the locale words it), "Tue" within the week, else "Oct 20". */
++export function aeShortRunTime(at: number, now: number): string {
++  const next = new Date(at);
++  const today = new Date(now);
++  if (next.toDateString() === today.toDateString()) {
++    return next.toLocaleTimeString(
++      undefined,
++      next.getMinutes() === 0 ? { hour: "numeric" } : { hour: "numeric", minute: "2-digit" },
++    );
++  }
++  const days = (at - now) / 86_400_000;
++  if (days > 0 && days < 6) return next.toLocaleDateString(undefined, { weekday: "short" });
++  return next.toLocaleDateString(undefined, { month: "short", day: "numeric" });
++}
++
++/** "9:00 AM", "tomorrow 9:00 AM", "Tue 9:00 AM". */
++export function aeRunWhen(at: number, now: number): string {
++  return formatNextRun(new Date(at), new Date(now));
++}
++
++function wakesAt(at: number, now: number): string {
++  const when = aeRunWhen(at, now);
++  return /^\d/.test(when) ? `at ${when}` : when;
++}
++
++function capitalize(text: string): string {
++  return text.charAt(0).toUpperCase() + text.slice(1);
++}
++
++/** "Paused; the hourly check-in wakes it at 9:00 AM". */
++export function aeScheduledTooltip(next: AeNextRun, now: number): string {
++  return `Paused; ${next.waker} wakes it ${wakesAt(next.at, now)}`;
++}
++
++/** "Paused until 9:00 AM". */
++export function aeScheduledHeadline(next: AeNextRun, now: number): string {
++  return `Paused until ${aeRunWhen(next.at, now)}`;
++}
++
++/** "The hourly check-in wakes this session; pause it from the session rail's Scheduled section." */
++export function aeScheduledDetail(next: AeNextRun): string {
++  return `${capitalize(next.waker)} wakes this session; pause it from the session rail's Scheduled section.`;
++}
++
++const CHECKIN_FREQ: Record<string, [single: string, unit: string]> = {
++  HOURLY: ["hourly", "hours"],
++  DAILY: ["daily", "days"],
++  WEEKLY: ["weekly", "weeks"],
++  MONTHLY: ["monthly", "months"],
++};
++
++/** "the hourly check-in", "the check-in every 2 hours", or `the "Nightly report" schedule`. */
++export function aeScheduleWaker(task: Pick<ScheduledTask, "name" | "rrule">): string {
++  if (!isAeCheckin(task)) return `the "${task.name}" schedule`;
++  const rule = parseAeRrule(task.rrule);
++  const freq = rule.freq ? CHECKIN_FREQ[rule.freq] : undefined;
++  if (!freq) return "the check-in";
++  return rule.interval === 1
++    ? `the ${freq[0]} check-in`
++    : `the check-in every ${rule.interval} ${freq[1]}`;
++}
++
++/** The soonest active schedule aimed at the session that still lies ahead. */
++export function aeNextScheduledRun(
++  tasks: readonly ScheduledTask[] | undefined,
++  sessionId: string,
++  createdIds: ReadonlySet<string>,
++  now: number,
++): AeNextRun | null {
++  if (!tasks || tasks.length === 0) return null;
++  let best: AeNextRun | null = null;
++  for (const task of schedulesForSession(tasks, sessionId, createdIds)) {
++    if (task.state !== "active" || !task.nextRunAt) continue;
++    const at = Date.parse(task.nextRunAt);
++    if (Number.isNaN(at) || at <= now) continue;
++    if (best === null || at < best.at) best = { at, waker: aeScheduleWaker(task) };
++  }
++  return best;
++}
++
++/** Epoch ms a block was created, when it carries a wall-clock stamp. */
++export function aeBlockAt(block: AnyBlock): number | null {
++  const s = block.ctx.createdAtS ?? block.ctx.clientCreatedAtS;
++  return typeof s === "number" ? s * 1000 : null;
++}
++
++/** Epoch ms of the newest stamped block. */
++export function aeNewestBlockAt(blocks: readonly AnyBlock[]): number | null {
++  for (let i = blocks.length - 1; i >= 0; i--) {
++    const at = aeBlockAt(blocks[i]!);
++    if (at !== null) return at;
++  }
++  return null;
++}
++
++/**
++ * Epoch ms the current turn started: the newest of the newest user message and
++ * the `others` the caller knows (an unsent message, the switch to running).
++ */
++export function aeTurnStartedAt(
++  blocks: readonly AnyBlock[],
++  others: readonly (number | null | undefined)[] = [],
++): number | null {
++  let start: number | null = null;
++  for (let i = blocks.length - 1; i >= 0; i--) {
++    const block = blocks[i]!;
++    if (block.type === "user_message") {
++      start = aeBlockAt(block);
++      break;
++    }
++  }
++  for (const at of others) {
++    if (typeof at === "number" && (start === null || at > start)) start = at;
++  }
++  return start;
++}
++
++export interface AeStep {
++  title: ToolTitle;
++  /** Epoch ms the call started, when known. */
++  startedAt: number | null;
++  /** No result has arrived for the call yet. */
++  running: boolean;
++}
++
++/**
++ * The current turn's newest tool call, preferring one still waiting on its
++ * result. The search stops at the turn's user message, so a call an earlier,
++ * interrupted turn never answered does not read as running.
++ */
++export function aeCurrentStep(blocks: readonly AnyBlock[]): AeStep | null {
++  const done = new Set<string>();
++  let latest: AeStep | null = null;
++  for (let i = blocks.length - 1; i >= 0; i--) {
++    const block = blocks[i]!;
++    if (block.type === "user_message") break;
++    if (block.type === "tool_result") {
++      done.add(block.callId);
++      continue;
++    }
++    if (block.type !== "tool_group") continue;
++    const group = block as ToolGroup;
++    for (let j = group.executions.length - 1; j >= 0; j--) {
++      const execution = group.executions[j]!;
++      const step: AeStep = {
++        title: formatToolTitle(execution.name, execution.arguments, execution.argsSummary),
++        startedAt: aeBlockAt(group),
++        running: !done.has(execution.callId),
++      };
++      if (step.running) return step;
++      latest ??= step;
++    }
++  }
++  return latest;
++}
++
++/** The step as words before its code part: "running", "search", "edit". */
++export function aeStepVerb(title: ToolTitle): string {
++  if (title.verb === null) return "running";
++  const verb = title.verb.replace(/:$/, "").trim();
++  return verb.charAt(0).toLowerCase() + verb.slice(1);
++}
++
++/** Collapse whitespace and clip a step's code part for one line. */
++export function aeStepBody(title: ToolTitle, max = 80): string {
++  const flat = title.body.replace(/\s+/g, " ").trim();
++  return flat.length > max ? `${flat.slice(0, max - 1)}…` : flat;
++}
++
++// Session events can arrive many times a second; one store write a second is
++// plenty for "last activity 4s ago" and the five minute quiet threshold.
++const AE_LAST_EVENT_THROTTLE_MS = 1000;
++const lastStamped = new Map<string, number>();
++
++/** Record that a session event arrived, at most once a second per session. */
++export function aeStampLastEvent(
++  conversationId: string,
++  write: (patch: { lastEventAt: number }) => void,
++  now: number = Date.now(),
++): void {
++  const previous = lastStamped.get(conversationId);
++  if (previous !== undefined && now - previous < AE_LAST_EVENT_THROTTLE_MS && now >= previous) {
++    return;
++  }
++  lastStamped.set(conversationId, now);
++  write({ lastEventAt: now });
++}
++
++/** Test helper: forget the throttle. */
++export function aeResetLastEventStamps(): void {
++  lastStamped.clear();
++}
++
++/**
++ * Sidebar states beside the upstream ones (see `SessionState`). A row waits
++ * on agents only: the list's shell count refreshes at the next turn end, so a
++ * shell that exited after the turn would leave the row waiting.
++ */
++export type AeSessionState =
++  | { kind: "quiet"; quietForMs: number }
++  | { kind: "waiting"; agents: number; sinceEventMs: number | null }
++  | { kind: "scheduled"; at: number; waker: string };
++
++const AE_SESSION_STATE_KINDS: ReadonlySet<string> = new Set(["quiet", "waiting", "scheduled"]);
++
++export function isAeSessionState(state: { kind: string }): state is AeSessionState {
++  return AE_SESSION_STATE_KINDS.has(state.kind);
++}
+diff --git a/web/src/shell/Sidebar.test.tsx b/web/src/shell/Sidebar.test.tsx
+index c015b28cd6068d7a4bba9530a25748312f219e70..6a722ba3b2c64cfe82c5467d3e95d094fafc5e2e 100644
+--- a/web/src/shell/Sidebar.test.tsx
++++ b/web/src/shell/Sidebar.test.tsx
+@@ -672,7 +672,12 @@ describe("Sidebar session list", () => {
+     // The row dot and the collapsed-project dot share this geometry so they
+     // line up vertically; keep the row side pinned here.
+     mockConversations([
+-      conv("conv_running", "Claude Code", { title: "Running row", status: "running" }),
++      conv("conv_running", "Claude Code", {
++        title: "Running row",
++        status: "running",
++        // Fresh output, so the row is plainly running rather than quiet.
++        updated_at: Math.floor(Date.now() / 1000),
++      }),
+     ]);
+     renderSidebar();
+ 
+@@ -2703,6 +2708,7 @@ describe("Sidebar collapsed project marker", () => {
+       conv("conv_running", "Claude Code", {
+         labels: { omni_project: "Customer X" },
+         status: "running",
++        updated_at: Math.floor(Date.now() / 1000),
+       }),
+     ]);
+     renderSidebar();
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index 77f5123e5f15ae7830b19df8681f9c8d534e4a03..3cab2f469a30ca5f810d8a1a639681a854e1adf2 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -233,6 +233,8 @@ import {
+ } from "@/lib/sidebarViewPreferences";
+ import { ExtensionPrimaryNavigation } from "@/extensions/ExtensionPrimaryNavigation";
+ import { AeConversationStatusIcon } from "@/components/AeStatusIcon";
++import { aeIsWideMarker, aeWideMarkerReserve } from "@/components/AeSessionActivity";
++import { useAeProjectMarker, useAeSessionRowState } from "@/hooks/aeSessionActivityHooks";
+ import { AeSlotsPill } from "@/components/AeSlotsPill";
+ import { AeStatusMenu } from "@/shell/AeStatusMenu";
+ import { AeSplitMenuItem } from "@/shell/AeSplitMenuItem";
+@@ -310,7 +312,7 @@ const SESSION_STATE_SLOT_CLASS =
+ // "awaiting" pill keeps its natural width — a fixed box would clip its "Needs
+ // response" label.
+ function isDotMarker(state: SessionState | null): boolean {
+-  return state === null || state.kind !== "awaiting";
++  return state === null || (state.kind !== "awaiting" && !aeIsWideMarker(state));
+ }
+ const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
+ 
+@@ -1511,7 +1513,10 @@ function ProjectFolder({
+   const startingConversationId = useChatStore((s) =>
+     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
+   );
+-  const marker = projectMarkerState(conversations, errors, startingConversationId);
++  const marker = useAeProjectMarker(
++    projectMarkerState(conversations, errors, startingConversationId),
++    conversations,
++  );
+ 
+   // Publish the folder's rendered rows upward so projects-scope bulk selection
+   // resolves them (the parent sources its action set from these, not the global
+@@ -4670,7 +4675,8 @@ function ConversationRowImpl({
+   // Approvals and failures outrank the unread dot without clearing read state.
+   const errorConversations = useMemo(() => [conversation], [conversation]);
+   const [latestError] = useSessionErrorStates(errorConversations);
+-  const derivedState = getSessionState(conversation, latestError);
++  const aeState = useAeSessionRowState(conversation, getSessionState(conversation, latestError));
++  const derivedState = aeState.state;
+   // The bound session's launch/relaunch window: a send is in flight (local
+   // status "streaming") or the runner is auto-creating the PTY
+   // (`terminalPending`), but the server hasn't confirmed `running` yet — a
+@@ -4682,11 +4688,13 @@ function ConversationRowImpl({
+     (s) => s.conversationId === conversation.id && (s.status === "streaming" || s.terminalPending),
+   );
+   const sessionState =
+-    derivedState?.kind === "awaiting" || derivedState?.kind === "running"
++    derivedState?.kind === "awaiting" ||
++    derivedState?.kind === "running" ||
++    derivedState?.kind === "quiet"
+       ? derivedState
+       : isStartingUp
+         ? { kind: "starting" as const }
+-        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : null));
++        : (derivedState ?? (hasUnseenMessages ? { kind: "unseen" as const } : aeState.scheduled));
+   // Drafts share the row's trailing indicator slot, but the active session's
+   // composer already makes its draft visible. Live session state wins while
+   // present; otherwise only an inactive row needs the draft marker.
+@@ -4920,15 +4928,17 @@ function ConversationRowImpl({
+             ? showSharedIndicator
+               ? "pr-36"
+               : "pr-29"
+-            : showUpdated
+-              ? showSharedIndicator
+-                ? "pr-18"
+-                : "pr-11"
+-              : hasSessionIndicator && showSharedIndicator
+-                ? "pr-14"
+-                : hasTrailingIndicator
+-                  ? "pr-8"
+-                  : "pr-2"),
++            : aeIsWideMarker(sessionState)
++              ? aeWideMarkerReserve(sessionState, showSharedIndicator)
++              : showUpdated
++                ? showSharedIndicator
++                  ? "pr-18"
++                  : "pr-11"
++                : hasSessionIndicator && showSharedIndicator
++                  ? "pr-14"
++                  : hasTrailingIndicator
++                    ? "pr-8"
++                    : "pr-2"),
+         // The narrowed reserve must track exactly when the trailing controls
+         // appear and the state marker fades — both keyed on `:focus-visible`.
+         // `focus-within` also fires for a plain click, which shrank the reserve
+diff --git a/web/src/shell/aeAgentsPaneModel.ts b/web/src/shell/aeAgentsPaneModel.ts
+index 691432e448a5ff1e36fffe82ccc26e7899743db6..749cdac024664321cce4ba4be1d64b8e6a862b8a 100644
+--- a/web/src/shell/aeAgentsPaneModel.ts
++++ b/web/src/shell/aeAgentsPaneModel.ts
+@@ -75,14 +75,22 @@ export function childElapsedSeconds(child: ChildSessionInfo, nowMs: number): num
+   return Math.max(0, Math.floor(end - child.created_at));
+ }
+ 
+-/** `42s`, `3m 05s`, `1h 07m`: the elapsed time the way Claude Desktop prints it. */
+-export function formatElapsed(seconds: number | null): string {
++/**
++ * `42s`, `3m 05s`, `1h 07m`: the elapsed time the way Claude Desktop prints it.
++ * `compact` keeps the larger unit only (`3m`, `1h`) for tight spots.
++ */
++export function formatElapsed(
++  seconds: number | null,
++  { compact = false }: { compact?: boolean } = {},
++): string {
+   if (seconds === null) return "";
+   if (seconds < 60) return `${seconds}s`;
+   const minutes = Math.floor(seconds / 60);
+-  if (minutes < 60) return `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
++  if (minutes < 60) {
++    return compact ? `${minutes}m` : `${minutes}m ${String(seconds % 60).padStart(2, "0")}s`;
++  }
+   const hours = Math.floor(minutes / 60);
+-  return `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
++  return compact ? `${hours}h` : `${hours}h ${String(minutes % 60).padStart(2, "0")}m`;
+ }
+ 
+ /** True for a mirror of a coding agent's own subagent (a Claude Code Task, say). */
+diff --git a/web/src/store/aeLastEventAt.test.ts b/web/src/store/aeLastEventAt.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..841f3ce608f4a523d3b0c850b2055576e75ef5f4
+--- /dev/null
++++ b/web/src/store/aeLastEventAt.test.ts
+@@ -0,0 +1,148 @@
++import { QueryClient } from "@tanstack/react-query";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { aeResetLastEventStamps } from "@/lib/aeSessionActivity";
++import {
++  bindConversationForTest,
++  handleSessionEvent,
++  initChatStore,
++  pumpStreamEvents,
++  useChatStore,
++} from "./chatStore";
++import { conversationRegistry } from "./conversationRegistry";
++
++function pushableStream() {
++  let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null;
++  const enc = new TextEncoder();
++  const stream = new ReadableStream<Uint8Array>({
++    start(c) {
++      ctrl = c;
++    },
++  });
++  return {
++    stream,
++    push: (event: string, data: Record<string, unknown>) =>
++      ctrl!.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)),
++    close: () => ctrl!.close(),
++  };
++}
++
++const tick = () =>
++  new Promise<void>((resolve) => {
++    setTimeout(resolve, 0);
++  });
++const immediate = { schedule: (fn: () => void) => fn(), cancel: () => {} };
++
++beforeEach(() => {
++  initChatStore(new QueryClient({ defaultOptions: { queries: { retry: false } } }));
++  aeResetLastEventStamps();
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("{}", { headers: { "content-type": "application/json" } })),
++  );
++});
++
++afterEach(() => {
++  conversationRegistry.clear();
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++
++describe("chat store lastEventAt", () => {
++  it("starts empty and stamps each session event, at most once a second", async () => {
++    const { set, get } = bindConversationForTest("conv_last_a");
++    expect(useChatStore.getState().lastEventAt).toBeNull();
++    const now = vi.spyOn(Date, "now").mockReturnValue(1_000_000);
++    const sink = pushableStream();
++    const controller = new AbortController();
++    void pumpStreamEvents("conv_last_a", sink.stream, controller, set, get, immediate);
++
++    sink.push("response.created", { id: "resp_1", status: "in_progress", output: [] });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(1_000_000);
++
++    now.mockReturnValue(1_000_400);
++    sink.push("response.output_text.delta", { delta: "hi", item_id: "m1", output_index: 0 });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(1_000_000);
++
++    now.mockReturnValue(1_002_000);
++    sink.push("response.output_text.delta", { delta: " there", item_id: "m1", output_index: 0 });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(1_002_000);
++    controller.abort();
++  });
++
++  it("keeps each session's own value across a switch", async () => {
++    const a = bindConversationForTest("conv_last_b");
++    vi.spyOn(Date, "now").mockReturnValue(2_000_000);
++    const sink = pushableStream();
++    const controller = new AbortController();
++    void pumpStreamEvents("conv_last_b", sink.stream, controller, a.set, a.get, immediate);
++    sink.push("response.created", { id: "resp_2", status: "in_progress", output: [] });
++    await tick();
++    expect(useChatStore.getState().lastEventAt).toBe(2_000_000);
++
++    // A fresh session starts with no last event.
++    bindConversationForTest("conv_last_c");
++    expect(useChatStore.getState().lastEventAt).toBeNull();
++    controller.abort();
++  });
++
++  it("stamps the moment the user sends, so a send after a long gap never reads as quiet", () => {
++    bindConversationForTest("conv_last_send", { lastEventAt: 1000 });
++    vi.spyOn(Date, "now").mockReturnValue(9_000_000);
++    void useChatStore.getState().send("hello", "agent_xyz");
++    expect(useChatStore.getState().lastEventAt).toBe(9_000_000);
++  });
++
++  it("forgets an earlier stamp when a rebind hydrates the snapshot", async () => {
++    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
++      const url = String(input);
++      const json = (body: unknown) =>
++        new Response(JSON.stringify(body), { headers: { "content-type": "application/json" } });
++      if (/\/stream(\?|$)/.test(url)) return new Response(new ReadableStream());
++      if (/\/items(\?|$)/.test(url)) {
++        return json({ object: "list", data: [], first_id: null, last_id: null, has_more: false });
++      }
++      if (/^\/v1\/sessions\/conv_last_rebind(\?|$)/.test(url)) {
++        return json({ id: "conv_last_rebind", agent_id: "agent_xyz", status: "running" });
++      }
++      return json({ queued: true, item_id: "ci_1" });
++    });
++    vi.stubGlobal("fetch", fetchMock);
++    // An entry whose stream is gone: the next send rebinds it.
++    bindConversationForTest("conv_last_rebind", { lastEventAt: 1000 });
++    vi.spyOn(Date, "now").mockReturnValue(9_000_000);
++    const sent = useChatStore.getState().send("hello", "agent_xyz");
++    expect(useChatStore.getState().lastEventAt).toBe(9_000_000);
++    await sent;
++    await vi.waitFor(() =>
++      expect(fetchMock.mock.calls.some(([u]) => String(u).includes("/items"))).toBe(true),
++    );
++    // The chat line then dates activity by the snapshot's blocks and the unsent message.
++    await vi.waitFor(() => expect(useChatStore.getState().lastEventAt).toBeNull());
++  });
++});
++
++describe("chat store aeRunningSince", () => {
++  it("records when the session switches to running, not on repeated running edges", () => {
++    bindConversationForTest("conv_running_since");
++    expect(useChatStore.getState().aeRunningSince).toBeNull();
++    const now = vi.spyOn(Date, "now").mockReturnValue(5_000_000);
++    const running = {
++      type: "session_status",
++      conversationId: "conv_running_since",
++      status: "running",
++    } as const;
++    handleSessionEvent(running);
++    expect(useChatStore.getState().aeRunningSince).toBe(5_000_000);
++    now.mockReturnValue(5_060_000);
++    handleSessionEvent(running);
++    expect(useChatStore.getState().aeRunningSince).toBe(5_000_000);
++    // A check-in wakes it after the turn ended: a new start.
++    handleSessionEvent({ ...running, status: "idle" });
++    now.mockReturnValue(9_000_000);
++    handleSessionEvent(running);
++    expect(useChatStore.getState().aeRunningSince).toBe(9_000_000);
++  });
++});
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 31521acdb0fd9cc3b6ca0a426e59fbcc08ee8d7f..b3e423b69961236df64a945638c1af031f7b4fb2 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -83,6 +83,7 @@ import type {
+   StreamEvent,
+ } from "@/lib/events";
+ import { createPresenceIdleTracker } from "@/lib/presenceIdle";
++import { aeStampLastEvent } from "@/lib/aeSessionActivity";
+ import { randomUUID } from "@/lib/randomUUID";
+ import { conversationRegistry, type ConversationEntry } from "./conversationRegistry";
+ import { createInitialConversationState, isConversationStateKey } from "./conversationState";
+@@ -683,6 +684,10 @@ export interface ConversationState {
+    * no explanation. `null` whenever the session is not parked.
+    */
+   blockedOn: string | null;
++  /** Epoch ms the newest session event arrived (throttled to 1 s), or `null` before any. */
++  lastEventAt: number | null;
++  /** Epoch ms `sessionStatus` last switched to running, or `null` when not seen. */
++  aeRunningSince: number | null;
+   /**
+    * Whether the active session is a native-terminal wrapper
+    * (claude-native / codex-native), derived from the `omnigent.wrapper`
+@@ -1874,6 +1879,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+   backgroundTaskCount: 0,
+   backgroundTasks: [],
+   blockedOn: null,
++  lastEventAt: null,
++  aeRunningSince: null,
+   isNativeTerminalSession: false,
+   nativeVendorOwnsModel: false,
+   boundAgentId: null,
+@@ -2393,6 +2400,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+         // authoritatively. Only the parked-dialog reason clears — a fresh send is
+         // not parked on a dialog.
+         blockedOn: null,
++        lastEventAt: Date.now(),
+       }));
+     }
+ 
+@@ -4524,6 +4532,8 @@ async function bindStream(
+         backgroundTaskCount: session.backgroundTaskCount ?? 0,
+         backgroundTasks: session.backgroundTasks ?? [],
+         blockedOn: null,
++        // Events seen on an earlier visit are stale; the snapshot's blocks date it.
++        lastEventAt: null,
+         // This conversation's own effective effort, which is what a warm switch
+         // back re-projects (it does not re-bind, so it cannot recompute it).
+         sessionReasoningEffort: effectiveEffort,
+@@ -7372,6 +7382,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+           // so an absent one means "no longer parked".
+           blockedOn: event.blockedOn ?? null,
+         };
++        if (event.status === "running" && s.sessionStatus !== "running") {
++          patch.aeRunningSince = Date.now();
++        }
+         // The background-shell tally is STICKY. Only the Stop-hook-derived
+         // status carries an authoritative count (the forwarder relabels its
+         // `idle` to `waiting` and attaches `background_task_count`); the
+@@ -8185,6 +8198,7 @@ async function* tapSessionEvents(
+   for await (const event of events) {
+     if (!isConversationDisposed(conversationId)) {
+       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
++      aeStampLastEvent(conversationId, setterFor(conversationId));
+     }
+     if (event.type === "session_status" || event.type === "session_interrupted") {
+       beforeTurnEdge?.();
+diff --git a/web/src/store/conversationState.ts b/web/src/store/conversationState.ts
+index 74946d0d228b90c671e5cda5c0c61a07436b6ca5..9d7ff8523788a4ea278b5475d5b3fa1049829e36 100644
+--- a/web/src/store/conversationState.ts
++++ b/web/src/store/conversationState.ts
+@@ -23,6 +23,8 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
+   backgroundTaskCount: true,
+   backgroundTasks: true,
+   blockedOn: true,
++  lastEventAt: true,
++  aeRunningSince: true,
+   isNativeTerminalSession: true,
+   nativeVendorOwnsModel: true,
+   boundAgentId: true,
+@@ -91,6 +93,8 @@ export function createInitialConversationState(): ConversationState {
+     backgroundTaskCount: 0,
+     backgroundTasks: [],
+     blockedOn: null,
++    lastEventAt: null,
++    aeRunningSince: null,
+     isNativeTerminalSession: false,
+     nativeVendorOwnsModel: false,
+     boundAgentId: null,

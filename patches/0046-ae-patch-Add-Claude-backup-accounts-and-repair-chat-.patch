@@ -1,0 +1,1537 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 10:37:55 -0700
+Subject: [PATCH 046/148] [ae-patch] Add Claude backup accounts and repair chat
+ team and approval controls.
+
+---
+ omnigent/codex_approval_modes.py              |  11 +-
+ omnigent/harnesses/claude_native/main.py      |   4 +
+ .../harnesses/codex_native/permissions.py     |  86 ++++++++++++
+ omnigent/host/connect.py                      |  17 ++-
+ omnigent/host/frames.py                       |   3 +
+ omnigent/inner/claude_sdk_executor.py         |   4 +
+ omnigent/onboarding/ambient.py                |   7 +
+ omnigent/onboarding/claude_accounts.py        | 117 +++++++++++++++++
+ omnigent/runner/native_controls.py            |  43 +++++-
+ .../server/routes/_sessions/orchestration.py  |  22 ++++
+ .../routes/_sessions/team_permissions.py      |  52 ++++++++
+ omnigent/server/routes/hosts.py               |   4 +-
+ openapi.json                                  |  11 ++
+ tests/host/test_connect.py                    |   3 +-
+ tests/onboarding/test_claude_accounts.py      | 113 ++++++++++++++++
+ .../integration/test_sessions_add_agent.py    |  51 ++++++++
+ tests/server/test_team_permissions.py         |  39 ++++++
+ tests/test_codex_native_permissions.py        | 109 ++++++++++++++++
+ web/src/components/AeTeamControl.test.tsx     |  31 ++++-
+ web/src/components/AeTeamControl.tsx          |  33 +++++
+ web/src/hooks/useHosts.ts                     |   3 +-
+ web/src/hooks/useSession.test.tsx             |  28 ++++
+ web/src/hooks/useSession.ts                   |  10 +-
+ web/src/pages/ChatPage.composer.test.tsx      |  23 +++-
+ web/src/pages/ChatPage.mention.test.tsx       |   2 +-
+ web/src/pages/ChatPage.statusLine.test.tsx    |   2 +-
+ web/src/pages/ChatPage.tsx                    |  26 ++--
+ web/src/shell/AppShell.test.tsx               |  14 +-
+ web/src/shell/ClaudeAccounts.test.tsx         |  46 +++++++
+ web/src/shell/ClaudeAccounts.tsx              | 123 ++++++++++++++++++
+ web/src/shell/NewChatDialog.flow.test.tsx     |   2 +
+ web/src/shell/NewChatDialog.tsx               |   3 +
+ 32 files changed, 1005 insertions(+), 37 deletions(-)
+ create mode 100644 omnigent/harnesses/codex_native/permissions.py
+ create mode 100644 omnigent/onboarding/claude_accounts.py
+ create mode 100644 omnigent/server/routes/_sessions/team_permissions.py
+ create mode 100644 tests/onboarding/test_claude_accounts.py
+ create mode 100644 tests/server/test_team_permissions.py
+ create mode 100644 tests/test_codex_native_permissions.py
+ create mode 100644 web/src/shell/ClaudeAccounts.test.tsx
+ create mode 100644 web/src/shell/ClaudeAccounts.tsx
+
+diff --git a/omnigent/codex_approval_modes.py b/omnigent/codex_approval_modes.py
+index 2332eb1579f76a31fab22978f26ffe0c6f93556f..5652cf7d4fc1a42f2f39d64e19e745c4406ca890 100644
+--- a/omnigent/codex_approval_modes.py
++++ b/omnigent/codex_approval_modes.py
+@@ -1,11 +1,10 @@
+ """Codex-native runtime approval presets — mirrors Codex's ``/permissions`` popup.
+ 
+-The interactive ``codex`` TUI switches approval stance through its own
+-``/permissions`` popup, NOT through the app-server ``thread/settings/update``
+-RPC (that path drives model/effort but is a no-op for approval). So Omnigent's
+-running-session switcher drives the popup by keystroke: type ``/permissions``,
+-then the option's menu digit (position-independent, unlike arrow navigation),
+-then confirm the sub-dialog for the ones that ask.
++Current Codex builds accept permission changes through ``thread/settings/update``.
++Older builds use the interactive ``/permissions`` popup as a compatibility path:
++type ``/permissions``, then the option's menu digit, then confirm the sub-dialog
++for the ones that ask (``needs_confirm``). Both paths must confirm the applied
++settings before the web picker reports success.
+ 
+ These presets use the popup's labels. Menu digits are discovered from the
+ rendered popup because row positions vary by platform and configuration.
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index 8f270da6b56ef9e822a281978b1114719584ae69..7a9ad1f6f9a68912866a618714ffe478d2f7330b 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -1547,6 +1547,10 @@ def build_native_claude_terminal_env(
+                 f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
+                 "Claude Code via the helper, not the environment."
+             )
++    if claude_config is None:
++        from omnigent.onboarding.claude_accounts import account_env_for_launch
++
++        terminal_env.update(account_env_for_launch(terminal_env))
+     return terminal_env
+ 
+ 
+diff --git a/omnigent/harnesses/codex_native/permissions.py b/omnigent/harnesses/codex_native/permissions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3d93a97c7b565238936384956b6d6aaaffb0fd4
+--- /dev/null
++++ b/omnigent/harnesses/codex_native/permissions.py
+@@ -0,0 +1,86 @@
++"""Apply live permission presets through Codex's typed settings protocol."""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++
++from omnigent.harnesses.codex_native.app_server import client_for_transport
++
++
++def permission_settings(mode: str) -> dict[str, str]:
++    """Return the explicit policy, reviewer and profile for a built-in preset."""
++    profiles = {
++        "ask-for-approval": ":workspace",
++        "approve-for-me": ":workspace",
++        "full-access": ":danger-full-access",
++        "read-only": ":read-only",
++    }
++    if mode not in profiles:
++        raise ValueError(f"Unknown Codex approval mode {mode!r}")
++    return {
++        "approvalPolicy": "never" if mode == "full-access" else "on-request",
++        "approvalsReviewer": "auto_review" if mode == "approve-for-me" else "user",
++        "permissions": profiles[mode],
++    }
++
++
++def _matches(settings: object, mode: str) -> bool:
++    if not isinstance(settings, dict):
++        return False
++    expected = permission_settings(mode)
++    if any(settings.get(key) != expected[key] for key in ("approvalPolicy", "approvalsReviewer")):
++        return False
++    profile = settings.get("activePermissionProfile")
++    if isinstance(profile, dict):
++        return profile.get("id") == expected["permissions"]
++    sandbox = settings.get("sandboxPolicy")
++    expected_type = {
++        "ask-for-approval": "workspaceWrite",
++        "approve-for-me": "workspaceWrite",
++        "full-access": "dangerFullAccess",
++        "read-only": "readOnly",
++    }[mode]
++    return isinstance(sandbox, dict) and sandbox.get("type") == expected_type
++
++
++async def apply_permission_mode(
++    transport: str,
++    thread_id: str,
++    mode: str,
++    *,
++    timeout_s: float = 10.0,
++) -> bool:
++    """Apply and verify a preset; return false when an older server silently ignores it.
++
++    Resume subscribes this connection to settings notifications without supplying
++    overrides. An RPC acknowledgement alone is insufficient on older Codex builds.
++    """
++    settings = permission_settings(mode)
++    client = client_for_transport(transport, client_name="omnigent-codex-permissions")
++    try:
++        async with asyncio.timeout(timeout_s):
++            await client.connect()
++            response = await client.request(
++                "thread/resume", {"threadId": thread_id, "excludeTurns": True}
++            )
++            result = response.get("result")
++            if isinstance(result, dict):
++                current = {**result, "sandboxPolicy": result.get("sandbox")}
++                if _matches(current, mode):
++                    return True
++            await client.request("thread/settings/update", {"threadId": thread_id, **settings})
++            async for event in client.iter_events():
++                if event.get("method") != "thread/settings/updated":
++                    continue
++                params = event.get("params")
++                if not isinstance(params, dict) or params.get("threadId") != thread_id:
++                    continue
++                if _matches(params.get("threadSettings"), mode):
++                    return True
++    except TimeoutError:
++        return False
++    finally:
++        with contextlib.suppress(Exception):
++            await client.close()
++    return False
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index 6ceea98804b8a62d5c3820af26ed490c72c4b58a..061fa41a6756859c78c7331595b52b87cf092a8e 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -3061,7 +3061,17 @@ class HostProcess:
+                 error=f"harness {frame.harness!r} is not configurable from the UI",
+             )
+ 
+-        if frame.kind == "adopt":
++        if frame.kind in ("claude-oauth-add", "claude-oauth-select"):
++            from omnigent.onboarding.claude_accounts import change_account
++
++            if install_key != ANTHROPIC_FAMILY:
++                return HostStoreSecretResultFrame(
++                    request_id=frame.request_id,
++                    status="failed",
++                    error="OAuth accounts require Claude.",
++                )
++            result = change_account(frame.kind, frame.account_name or "", frame.secret_value or "")
++        elif frame.kind == "adopt":
+             if not frame.env_var:
+                 return HostStoreSecretResultFrame(
+                     request_id=frame.request_id,
+@@ -3138,12 +3148,15 @@ class HostProcess:
+         :param frame: The detect request (carries only a request id).
+         :returns: Result frame with the non-secret credential descriptors.
+         """
++        from omnigent.onboarding.claude_accounts import account_descriptors
++
+         detected = detect_adoptable_credentials()
+         return HostDetectCredentialsResultFrame(
+             request_id=frame.request_id,
+             credentials=[
+                 {"family": d.family, "source": d.source, "env_var": d.env_var} for d in detected
+-            ],
++            ]
++            + account_descriptors(),
+         )
+ 
+     def _handle_fs_request(self, frame: HostFsRequestFrame) -> HostFsResultFrame:
+diff --git a/omnigent/host/frames.py b/omnigent/host/frames.py
+index 87be87d2b9fef63271fa11d5cdc6318ce3907089..22578e48a0831bac7df51c20a5a4bc07f3997c4b 100644
+--- a/omnigent/host/frames.py
++++ b/omnigent/host/frames.py
+@@ -837,6 +837,7 @@ class HostStoreSecretFrame:
+     default_model: str | None = None
+     wire_api: str | None = None
+     env_var: str | None = None
++    account_name: str | None = None
+ 
+ 
+ @dataclass
+@@ -1604,6 +1605,7 @@ def encode_host_frame(frame: HostFrame) -> str:
+                 "default_model": frame.default_model,
+                 "wire_api": frame.wire_api,
+                 "env_var": frame.env_var,
++                "account_name": frame.account_name,
+             }
+         )
+     if isinstance(frame, HostStoreSecretResultFrame):
+@@ -2636,6 +2638,7 @@ def _decode_store_secret(msg: _JsonObject) -> HostStoreSecretFrame:
+         default_model=_optional_nullable_str(msg, "default_model"),
+         wire_api=_optional_nullable_str(msg, "wire_api"),
+         env_var=_optional_nullable_str(msg, "env_var"),
++        account_name=_optional_nullable_str(msg, "account_name"),
+     )
+ 
+ 
+diff --git a/omnigent/inner/claude_sdk_executor.py b/omnigent/inner/claude_sdk_executor.py
+index de016814000db42d1b90390c08a07efcb24fbc40..2160f3e5832f6214c286282bcace7c7fafbf8025 100644
+--- a/omnigent/inner/claude_sdk_executor.py
++++ b/omnigent/inner/claude_sdk_executor.py
+@@ -2597,6 +2597,10 @@ class ClaudeSDKExecutor(Executor):
+         # ``_get_or_create_client`` via ``_unset_env_var`` — setting it to
+         # ``""`` here would still leave an empty key in the child env.
+         env = dict(self._extra_env)
++        if not env.get(_CLAUDE_API_KEY_HELPER_ENV_KEY):
++            from omnigent.onboarding.claude_accounts import account_env_for_launch
++
++            env.update(account_env_for_launch(env))
+         api_key_helper = env.pop(_CLAUDE_API_KEY_HELPER_ENV_KEY, None)
+         # Teach Claude Code this gateway's spellings so no model surface routes
+         # to an id the gateway rejects: pins for the family aliases, rewrites
+diff --git a/omnigent/onboarding/ambient.py b/omnigent/onboarding/ambient.py
+index a5103a6de6ebe267ff0ab8167c8efd2d5b6f9709..0656ccce0cfe272a8c106661da0baaca4b60f6b6 100644
+--- a/omnigent/onboarding/ambient.py
++++ b/omnigent/onboarding/ambient.py
+@@ -625,6 +625,13 @@ def _claude_login_detected() -> bool:
+         the credentials file on any platform, or via the macOS Keychain through
+         the CLI status fallback; ``False`` otherwise.
+     """
++    from omnigent.onboarding.claude_accounts import account_env
++
++    try:
++        if account_env():
++            return True
++    except (OSError, ValueError, RuntimeError):
++        pass
+     if claude_auth_has_credential(_claude_credentials_path()):
+         return True
+     if sys.platform == "darwin":
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d6e6d1a4fcd142555850ac37773acf099f24c1e
+--- /dev/null
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -0,0 +1,117 @@
++"""Named Claude subscription tokens, separate from the CLI's primary login."""
++
++from __future__ import annotations
++
++import json
++import os
++import re
++from pathlib import Path
++
++from omnigent.onboarding import secrets
++from omnigent.onboarding.harness_auth import StoreCredentialResult
++from omnigent.onboarding.provider_config import _config_path
++
++
++def _path() -> Path:
++    return Path(_config_path()).with_name("claude-accounts.json")
++
++
++def _read() -> dict:
++    try:
++        state = json.loads(_path().read_text())
++    except FileNotFoundError:
++        return {"accounts": [], "active": ""}
++    except (OSError, ValueError) as exc:
++        raise RuntimeError(
++            "Could not read Claude accounts. Repair claude-accounts.json on this host."
++        ) from exc
++    if (
++        not isinstance(state, dict)
++        or not isinstance(state.get("accounts"), list)
++        or not isinstance(state.get("active"), str)
++        or any(not isinstance(name, str) or not _valid_name(name) for name in state["accounts"])
++        or len(set(state["accounts"])) != len(state["accounts"])
++        or (state["active"] and state["active"] not in state["accounts"])
++    ):
++        raise RuntimeError("Invalid Claude accounts. Repair claude-accounts.json on this host.")
++    return state
++
++
++def _valid_name(name: str) -> bool:
++    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 _-]{0,63}", name))
++
++
++def account_descriptors() -> list[dict[str, str | None]]:
++    try:
++        state = _read()
++    except RuntimeError:
++        return []
++    return [
++        {
++            "family": "claude-oauth-active" if name == state["active"] else "claude-oauth",
++            "source": name or "Default CLI account",
++            "env_var": name,
++        }
++        for name in ["", *state["accounts"]]
++    ]
++
++
++def change_account(kind: str, name: str, token: str = "") -> StoreCredentialResult:
++    if name and not _valid_name(name):
++        return StoreCredentialResult(
++            False, None, "Use a name of up to 64 letters, digits, spaces, - or _."
++        )
++    if kind == "claude-oauth-add" and (not name or not token.startswith("sk-ant-oat")):
++        return StoreCredentialResult(
++            False, None, "Enter a name and the OAuth token from claude setup-token."
++        )
++    try:
++        state = _read()
++        if kind == "claude-oauth-add":
++            if name in state["accounts"]:
++                return StoreCredentialResult(
++                    False, None, "That account name already exists. Choose another name."
++                )
++            secrets.store_secret(f"claude-oauth-{name}", token.strip())
++            state["accounts"].append(name)
++        elif kind != "claude-oauth-select" or (name and name not in state["accounts"]):
++            return StoreCredentialResult(False, None, "Unknown Claude account.")
++        state["active"] = name
++        path = _path()
++        path.parent.mkdir(parents=True, exist_ok=True)
++        temporary = path.with_suffix(".tmp")
++        with temporary.open("w") as handle:
++            os.chmod(temporary, 0o600)
++            json.dump(state, handle)
++        temporary.replace(path)
++        return StoreCredentialResult(True, name, None)
++    except Exception:
++        return StoreCredentialResult(
++            False, None, "Could not save the Claude account on this host."
++        )
++
++
++def account_env() -> dict[str, str]:
++    name = _read()["active"]
++    if not name:
++        return {}
++    token = secrets.load_secret(f"claude-oauth-{name}")
++    if not token:
++        raise RuntimeError(
++            "The selected Claude account token is unavailable. Select another account."
++        )
++    return {"CLAUDE_CODE_OAUTH_TOKEN": token, "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
++
++
++def account_env_for_launch(env: dict[str, str]) -> dict[str, str]:
++    """Apply subscription choice only when no explicit provider owns authentication."""
++    provider_keys = (
++        "ANTHROPIC_BASE_URL",
++        "ANTHROPIC_API_KEY",
++        "ANTHROPIC_AUTH_TOKEN",
++        "CLAUDE_CODE_USE_BEDROCK",
++        "CLAUDE_CODE_USE_VERTEX",
++    )
++    if any(env.get(key, os.environ.get(key)) for key in provider_keys):
++        return {}
++    return account_env()
+diff --git a/omnigent/runner/native_controls.py b/omnigent/runner/native_controls.py
+index e4fae9047597aba7cea6cbbf2990787fc946fd27..56fca0613423603a39121313185396fa35b5269d 100644
+--- a/omnigent/runner/native_controls.py
++++ b/omnigent/runner/native_controls.py
+@@ -595,13 +595,9 @@ def build_native_controls(
+         conv_id: str,
+         mode: str,
+     ) -> Response:
+-        # Codex switches approval stance through its own /permissions popup, not
+-        # thread/settings/update (that RPC drives model/effort but no-ops for
+-        # approval). So drive the popup by keystroke into the codex tmux pane —
+-        # the same channel /compact uses — reading the popup to find the preset's
+-        # menu digit (row positions vary by codex build/platform, so we discover
+-        # it rather than hardcode it) and confirming Codex echoed the switch.
+         from omnigent.codex_approval_modes import codex_permission_preset
++        from omnigent.harnesses.codex_native.app_server import CodexAppServerResponseError
++        from omnigent.harnesses.codex_native.permissions import apply_permission_mode
+ 
+         preset = codex_permission_preset(mode)
+         if preset is None:
+@@ -612,6 +608,41 @@ def build_native_controls(
+                     "detail": f"Unknown codex approval mode {mode!r}",
+                 },
+             )
++        state = await _codex_native_bridge_state_for_session(
++            conv_id, action="approval-mode update"
++        )
++        if state is not None:
++            try:
++                if await apply_permission_mode(state.socket_path, state.thread_id, mode):
++                    return JSONResponse(status_code=200, content={"approval_mode": preset.value})
++            except CodexAppServerResponseError as exc:
++                # Older protocols and a new thread without a rollout still need
++                # the terminal menu. Policy rejections must not use a fallback.
++                if exc.code != -32601 and "no rollout found for thread id" not in (
++                    exc.message or ""
++                ):
++                    return JSONResponse(
++                        status_code=503,
++                        content={
++                            "error": "codex_native_approval_mode_failed",
++                            "detail": _client_safe_error_detail(
++                                exc, context="codex-native approval mode change"
++                            ),
++                        },
++                    )
++            except Exception as exc:  # noqa: BLE001 - return transport failures to the picker.
++                return JSONResponse(
++                    status_code=503,
++                    content={
++                        "error": "codex_native_approval_mode_failed",
++                        "detail": _client_safe_error_detail(
++                            exc, context="codex-native approval mode change"
++                        ),
++                    },
++                )
++        # Compatibility path for Codex builds without live permission settings:
++        # drive the /permissions popup by keystroke into the codex tmux pane,
++        # reading its menu digit from the pane and confirming Codex echoed it.
+         registry = resource_registry.terminal_registry
+         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
+         if instance is None or not instance.running:
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index c69c76c4c7d6f1c529d1432397064df2c7780f4b..d1a5723d51d8a1029b6f87cfdab73820d7f977fa 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -11024,6 +11024,28 @@ async def _create_session_from_existing_agent(
+         if repl_labels:
+             initial_labels.update(repl_labels)
+ 
++    if (
++        body.parent_session_id is not None
++        and body.sub_agent_name is None
++        and body.terminal_launch_args is None
++        and validated_launch_args is None
++        and not (
++            own_spec is not None
++            and any(
++                key in own_spec.executor.config for key in ("permission_mode", "exec_mode", "yolo")
++            )
++        )
++    ):
++        from omnigent.server.routes._sessions.team_permissions import (
++            inherited_team_permission_args,
++        )
++
++        permission_parent = conversation_store.get_conversation(body.parent_session_id)
++        if permission_parent is not None:
++            validated_launch_args = inherited_team_permission_args(
++                permission_parent.labels, initial_labels.get("omnigent.wrapper")
++            )
++
+     if harness_override == "auto" or _native_smart_routing:
+         from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
+ 
+diff --git a/omnigent/server/routes/_sessions/team_permissions.py b/omnigent/server/routes/_sessions/team_permissions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..58736ae19c990c1f4750ae25b677c3be8ce5c8c1
+--- /dev/null
++++ b/omnigent/server/routes/_sessions/team_permissions.py
+@@ -0,0 +1,52 @@
++"""Permission defaults for user-added native team members."""
++
++from collections.abc import Mapping
++
++from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
++
++
++def inherited_team_permission_args(
++    parent_labels: Mapping[str, str], child_wrapper: str | None
++) -> list[str] | None:
++    """Translate the parent's observed mode without copying unrelated CLI options."""
++    parent_wrapper = parent_labels.get("omnigent.wrapper")
++    claude_mode = None
++    codex_mode = None
++    if parent_wrapper == CLAUDE_NATIVE_CODING_AGENT.wrapper_label:
++        claude_mode = parent_labels.get("omnigent.claude_native.permission_mode")
++        codex_mode = {
++            "default": "ask-for-approval",
++            "auto": "approve-for-me",
++            "bypassPermissions": "full-access",
++        }.get(claude_mode or "")
++    elif parent_wrapper == CODEX_NATIVE_CODING_AGENT.wrapper_label:
++        codex_mode = parent_labels.get("omnigent.codex_native.approval_mode")
++        claude_mode = {
++            "ask-for-approval": "default",
++            "approve-for-me": "auto",
++            "full-access": "bypassPermissions",
++        }.get(codex_mode or "")
++    if child_wrapper == CLAUDE_NATIVE_CODING_AGENT.wrapper_label and claude_mode in {
++        "default",
++        "auto",
++        "acceptEdits",
++        "plan",
++        "bypassPermissions",
++        "dontAsk",
++    }:
++        return ["--permission-mode", claude_mode]
++    if child_wrapper == CODEX_NATIVE_CODING_AGENT.wrapper_label:
++        if codex_mode == "full-access":
++            return ["--dangerously-bypass-approvals-and-sandbox"]
++        if codex_mode in {"ask-for-approval", "approve-for-me", "read-only"}:
++            return [
++                "--sandbox",
++                "read-only" if codex_mode == "read-only" else "workspace-write",
++                "--ask-for-approval",
++                "on-request",
++                "-c",
++                'approvals_reviewer="auto_review"'
++                if codex_mode == "approve-for-me"
++                else 'approvals_reviewer="user"',
++            ]
++    return None
+diff --git a/omnigent/server/routes/hosts.py b/omnigent/server/routes/hosts.py
+index d48f16a6116a4ed45fd9e46672fee0d2674eb477..943c08591510b00dd6f8ef7c1965b2b28bed7446 100644
+--- a/omnigent/server/routes/hosts.py
++++ b/omnigent/server/routes/hosts.py
+@@ -537,6 +537,7 @@ class StoreHarnessCredentialRequest(BaseModel):
+     default_model: str | None = None
+     wire_api: str | None = None
+     env_var: str | None = None
++    account_name: str | None = None
+ 
+ 
+ class HostModelOptionsResponse(BaseModel):
+@@ -1609,7 +1610,7 @@ def create_hosts_router(
+                 status_code=400,
+                 detail=f"harness {harness!r} is not configurable from the UI",
+             )
+-        if body.kind not in ("key", "gateway", "adopt"):
++        if body.kind not in ("key", "gateway", "adopt", "claude-oauth-add", "claude-oauth-select"):
+             raise HTTPException(status_code=400, detail=f"unknown credential kind {body.kind!r}")
+ 
+         user_id = require_user(request, auth_provider)
+@@ -1634,6 +1635,7 @@ def create_hosts_router(
+             default_model=body.default_model,
+             wire_api=body.wire_api,
+             env_var=body.env_var,
++            account_name=body.account_name,
+         )
+         # Serialize credential writes to this host: the daemon's write is a
+         # non-atomic load→merge→save of config.yaml (twice — entry, then
+diff --git a/openapi.json b/openapi.json
+index c8ffa7f482b48c01e481da287e295b347ef81c3f..902d1f032c26e60b9edf10d902720d271965a89e 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -8718,6 +8718,17 @@
+       "StoreHarnessCredentialRequest": {
+         "description": "Request body for `POST /v1/hosts/{id}/harnesses/{harness}/credential`.\n\nCarries the credential in the body (never the URL). The secret field is\noptional so the `adopt` kind \u2014 which references an existing host env var\nby name rather than sending a value \u2014 can omit it.",
+         "properties": {
++          "account_name": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "title": "Account Name"
++          },
+           "base_url": {
+             "anyOf": [
+               {
+diff --git a/tests/host/test_connect.py b/tests/host/test_connect.py
+index 780c16d80c028384e472e1fb60fac3b21bbbfb75..04c66cf78397483146b0f089e8d7272ae5770c56 100644
+--- a/tests/host/test_connect.py
++++ b/tests/host/test_connect.py
+@@ -5063,7 +5063,8 @@ def test_handle_detect_credentials_returns_non_secret_descriptors(
+     result = host._handle_detect_credentials(HostDetectCredentialsFrame(request_id="d1"))
+     assert isinstance(result, HostDetectCredentialsResultFrame)
+     assert result.credentials == [
+-        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"}
++        {"family": "anthropic", "source": "$ANTHROPIC_API_KEY", "env_var": "ANTHROPIC_API_KEY"},
++        {"family": "claude-oauth-active", "source": "Default CLI account", "env_var": ""},
+     ]
+ 
+ 
+diff --git a/tests/onboarding/test_claude_accounts.py b/tests/onboarding/test_claude_accounts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9d6cbd45e8a748617fc6f776567fc44867dc6eb8
+--- /dev/null
++++ b/tests/onboarding/test_claude_accounts.py
+@@ -0,0 +1,113 @@
++from pathlib import Path
++
++import pytest
++
++from omnigent.onboarding.claude_accounts import account_descriptors, account_env, change_account
++
++
++@pytest.fixture(autouse=True)
++def isolated(monkeypatch, tmp_path):
++    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
++    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
++
++
++def test_independent_accounts_and_original_login(tmp_path: Path):
++    assert account_env() == {}
++    assert change_account("claude-oauth-add", "Work", "sk-ant-oat-test-one").stored
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-test-two").stored
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-test-two"
++    assert change_account("claude-oauth-select", "Work").stored
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-test-one"
++    assert change_account("claude-oauth-select", "").stored
++    assert account_env() == {}
++    assert "sk-ant-oat" not in (tmp_path / "claude-accounts.json").read_text()
++    assert "sk-ant-oat" not in repr(account_descriptors())
++    assert len(account_descriptors()) == 3
++
++
++def test_reject_duplicate_and_invalid_account():
++    assert change_account("claude-oauth-add", "Work", "sk-ant-oat-first").stored
++    assert not change_account("claude-oauth-add", "Work", "sk-ant-oat-second").stored
++    assert not change_account("claude-oauth-add", "../secret", "sk-ant-oat-second").stored
++    assert not change_account("claude-oauth-select", "Missing").stored
++    assert not change_account("claude-oauth-add", "API", "sk-ant-api-key").stored
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-first"
++
++
++def test_native_subscription_env_uses_selected_account():
++    from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
++
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    env = build_native_claude_terminal_env(None)
++    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
++    assert env["ANTHROPIC_API_KEY"] == ""
++
++
++def test_frame_roundtrip_preserves_account_name():
++    from omnigent.host.frames import HostStoreSecretFrame, decode_host_frame, encode_host_frame
++
++    frame = HostStoreSecretFrame(
++        request_id="request",
++        harness="claude-native",
++        kind="claude-oauth-select",
++        account_name="Backup",
++    )
++    assert decode_host_frame(encode_host_frame(frame)).account_name == "Backup"
++
++
++@pytest.mark.parametrize(
++    "contents",
++    ["{", "[]", '{"accounts": [2], "active": ""}', '{"accounts": [], "active": "missing"}'],
++)
++def test_bad_metadata_does_not_break_discovery_or_silently_change_account(tmp_path, contents):
++    (tmp_path / "claude-accounts.json").write_text(contents)
++    assert account_descriptors() == []
++    with pytest.raises(RuntimeError, match="Claude accounts"):
++        account_env()
++
++
++@pytest.mark.parametrize(
++    "key",
++    ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_USE_BEDROCK"],
++)
++def test_explicit_provider_environment_wins(monkeypatch, key):
++    from omnigent.onboarding.claude_accounts import account_env_for_launch
++
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    assert account_env_for_launch({key: "configured"}) == {}
++    monkeypatch.setenv(key, "inherited")
++    assert account_env_for_launch({}) == {}
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("explicit_key", [False, True])
++async def test_sdk_launch_subscription_and_explicit_key(monkeypatch, explicit_key):
++    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
++
++    for key in (
++        "ANTHROPIC_BASE_URL",
++        "ANTHROPIC_API_KEY",
++        "ANTHROPIC_AUTH_TOKEN",
++        "CLAUDE_CODE_USE_BEDROCK",
++        "CLAUDE_CODE_USE_VERTEX",
++    ):
++        monkeypatch.delenv(key, raising=False)
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    executor = ClaudeSDKExecutor()
++    if explicit_key:
++        executor._extra_env["ANTHROPIC_API_KEY"] = "explicit-key"
++    captured = {}
++
++    async def capture(sdk, *, session_key, options, model):
++        captured.update(options.env)
++        raise RuntimeError("captured env")
++
++    monkeypatch.setattr(executor, "_get_or_create_client", capture)
++    with pytest.raises(RuntimeError, match="captured env"):
++        async for _ in executor.run_turn([{"role": "user", "content": "hello"}], [], ""):
++            pass
++    if explicit_key:
++        assert captured["ANTHROPIC_API_KEY"] == "explicit-key"
++        assert "CLAUDE_CODE_OAUTH_TOKEN" not in captured
++    else:
++        assert captured["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
+diff --git a/tests/server/integration/test_sessions_add_agent.py b/tests/server/integration/test_sessions_add_agent.py
+index ac4f90ff01c28d2f809aafa757e9b5a6ef9ff527..a83e8e6852a1290d514e118d5b61794e2c507d80 100644
+--- a/tests/server/integration/test_sessions_add_agent.py
++++ b/tests/server/integration/test_sessions_add_agent.py
+@@ -237,6 +237,57 @@ async def test_add_agent_child_preserves_body_terminal_launch_args(
+ # ── Targeted message scoping ─────────────────────────────
+ 
+ 
++@pytest.mark.parametrize(
++    ("child_name", "explicit_args", "expected_args"),
++    [
++        (
++            "codex-native-ui",
++            None,
++            [
++                "--sandbox",
++                "workspace-write",
++                "--ask-for-approval",
++                "on-request",
++                "-c",
++                'approvals_reviewer="auto_review"',
++            ],
++        ),
++        ("claude-native-ui", None, ["--permission-mode", "auto"]),
++        ("codex-native-ui", ["--sandbox", "read-only"], ["--sandbox", "read-only"]),
++        ("codex-native-ui", [], []),
++    ],
++)
++async def test_added_team_member_inherits_parent_permission_unless_overridden(
++    client: httpx.AsyncClient,
++    child_name: str,
++    explicit_args: list[str] | None,
++    expected_args: list[str],
++) -> None:
++    parent_agent = await create_test_agent(client, name="codex-native-ui")
++    parent = await client.post(
++        "/v1/sessions",
++        json={
++            "agent_id": parent_agent["id"],
++            "labels": {"omnigent.codex_native.approval_mode": "approve-for-me"},
++        },
++    )
++    assert parent.status_code == 201, parent.text
++    child_agent = (
++        parent_agent
++        if child_name == "codex-native-ui"
++        else await create_test_agent(client, name=child_name)
++    )
++    child = await _add_child_agent(
++        client,
++        parent_session_id=parent.json()["id"],
++        child_agent_id=child_agent["id"],
++        title="team:member",
++        terminal_launch_args=explicit_args,
++    )
++    assert child.status_code == 201, child.text
++    assert child.json()["terminal_launch_args"] == expected_args
++
++
+ async def test_initial_task_is_scoped_to_the_added_child(
+     client: httpx.AsyncClient,
+ ) -> None:
+diff --git a/tests/server/test_team_permissions.py b/tests/server/test_team_permissions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..eddabd3db619bd4c8380240e3302da85a4f3260d
+--- /dev/null
++++ b/tests/server/test_team_permissions.py
+@@ -0,0 +1,39 @@
++"""Native team permission translations preserve supported presets."""
++
++import pytest
++
++from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT, CODEX_NATIVE_CODING_AGENT
++from omnigent.server.routes._sessions.team_permissions import inherited_team_permission_args
++
++
++@pytest.mark.parametrize(
++    ("parent", "mode_key", "mode", "child"),
++    [
++        (CODEX_NATIVE_CODING_AGENT, "approval_mode", "read-only", CLAUDE_NATIVE_CODING_AGENT),
++        (CLAUDE_NATIVE_CODING_AGENT, "permission_mode", "plan", CODEX_NATIVE_CODING_AGENT),
++        (CLAUDE_NATIVE_CODING_AGENT, "permission_mode", "acceptEdits", CODEX_NATIVE_CODING_AGENT),
++        (CODEX_NATIVE_CODING_AGENT, "approval_mode", "unknown", CODEX_NATIVE_CODING_AGENT),
++    ],
++)
++def test_unsupported_cross_harness_mode_is_not_translated(parent, mode_key, mode, child) -> None:
++    vendor = "codex" if parent == CODEX_NATIVE_CODING_AGENT else "claude"
++    labels = {
++        "omnigent.wrapper": parent.wrapper_label,
++        f"omnigent.{vendor}_native.{mode_key}": mode,
++    }
++    assert inherited_team_permission_args(labels, child.wrapper_label) is None
++
++
++def test_read_only_codex_team_member_keeps_read_only_sandbox() -> None:
++    labels = {
++        "omnigent.wrapper": CODEX_NATIVE_CODING_AGENT.wrapper_label,
++        "omnigent.codex_native.approval_mode": "read-only",
++    }
++    assert inherited_team_permission_args(labels, CODEX_NATIVE_CODING_AGENT.wrapper_label) == [
++        "--sandbox",
++        "read-only",
++        "--ask-for-approval",
++        "on-request",
++        "-c",
++        'approvals_reviewer="user"',
++    ]
+diff --git a/tests/test_codex_native_permissions.py b/tests/test_codex_native_permissions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bdf8ea0949bd27949498b652429ccd0470d2714
+--- /dev/null
++++ b/tests/test_codex_native_permissions.py
+@@ -0,0 +1,109 @@
++"""Live approval updates must be verified against the target Codex thread."""
++
++from __future__ import annotations
++
++import asyncio
++from unittest.mock import AsyncMock
++
++import pytest
++
++from omnigent.harnesses.codex_native import permissions
++
++
++class Client:
++    def __init__(self, *, current=None, events=(), error=None):
++        self.connect = AsyncMock()
++        self.close = AsyncMock()
++        self.request = AsyncMock(side_effect=error or [{"result": current or {}}, {"result": {}}])
++        self.events = events
++
++    async def iter_events(self):
++        for event in self.events:
++            yield event
++        await asyncio.Future()
++
++
++def changed(mode, thread_id="thread"):
++    request = permissions.permission_settings(mode)
++    return {
++        "method": "thread/settings/updated",
++        "params": {
++            "threadId": thread_id,
++            "threadSettings": {
++                "approvalPolicy": request["approvalPolicy"],
++                "approvalsReviewer": request["approvalsReviewer"],
++                "activePermissionProfile": {"id": request["permissions"]},
++            },
++        },
++    }
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "mode", ["approve-for-me", "ask-for-approval", "full-access", "read-only"]
++)
++async def test_applies_and_confirms_each_preset(monkeypatch, mode):
++    client = Client(events=[changed(mode, "another-thread"), changed(mode)])
++    monkeypatch.setattr(permissions, "client_for_transport", lambda *a, **kw: client)
++    assert await permissions.apply_permission_mode("/tmp/test.sock", "thread", mode)
++    assert client.request.call_args_list[0].args == (
++        "thread/resume",
++        {"threadId": "thread", "excludeTurns": True},
++    )
++    assert client.request.call_args_list[1].args == (
++        "thread/settings/update",
++        {"threadId": "thread", **permissions.permission_settings(mode)},
++    )
++    client.close.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "events", [[], [changed("full-access")], [changed("approve-for-me", "other")]]
++)
++async def test_rpc_ack_or_wrong_settings_are_not_success(monkeypatch, events):
++    client = Client(events=events)
++    monkeypatch.setattr(permissions, "client_for_transport", lambda *a, **kw: client)
++    assert not await permissions.apply_permission_mode(
++        "sock", "thread", "approve-for-me", timeout_s=0.01
++    )
++    client.close.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_already_active_mode_is_idempotent(monkeypatch):
++    client = Client(current=changed("approve-for-me")["params"]["threadSettings"])
++    monkeypatch.setattr(permissions, "client_for_transport", lambda *a, **kw: client)
++    assert await permissions.apply_permission_mode("sock", "thread", "approve-for-me")
++    assert client.request.await_count == 1
++    client.close.assert_awaited_once()
++
++
++@pytest.mark.asyncio
++async def test_policy_error_propagates_and_closes(monkeypatch):
++    client = Client(error=RuntimeError("disallowed by managed policy"))
++    monkeypatch.setattr(permissions, "client_for_transport", lambda *a, **kw: client)
++    with pytest.raises(RuntimeError, match="managed policy"):
++        await permissions.apply_permission_mode("sock", "thread", "full-access")
++    client.close.assert_awaited_once()
++
++
++def test_switching_back_resets_auto_reviewer():
++    assert permissions.permission_settings("ask-for-approval")["approvalsReviewer"] == "user"
++    with pytest.raises(ValueError):
++        permissions.permission_settings("unknown")
++
++
++@pytest.mark.asyncio
++async def test_never_policy_in_read_only_sandbox_is_not_full_access(monkeypatch):
++    client = Client(
++        current={
++            "approvalPolicy": "never",
++            "approvalsReviewer": "user",
++            "sandbox": {"type": "readOnly"},
++        },
++        events=[changed("full-access")],
++    )
++    monkeypatch.setattr(permissions, "client_for_transport", lambda *a, **kw: client)
++    assert await permissions.apply_permission_mode("sock", "thread", "full-access")
++    assert client.request.await_count == 2
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+index 94882d40d501f8223775df9e423b3050e6273b66..2aeaada9da7dca0e2a32ae2a69b35c0fc676d3f7 100644
+--- a/web/src/components/AeTeamControl.test.tsx
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -14,9 +14,15 @@ import {
+ } from "@/lib/aeTeam";
+ import type * as AeTeamModule from "@/lib/aeTeam";
+ import type { Session } from "@/lib/types";
+-import { AeTeamControl, AeTeamEditor } from "./AeTeamControl";
++import { AeTeamControl, AeTeamEditor, SessionTeamControl } from "./AeTeamControl";
+ 
+-const mocks = vi.hoisted(() => ({ agents: vi.fn(), hosts: vi.fn(), models: vi.fn() }));
++const mocks = vi.hoisted(() => ({
++  agents: vi.fn(),
++  hosts: vi.fn(),
++  models: vi.fn(),
++  session: vi.fn(),
++}));
++vi.mock("@/hooks/useSession", () => ({ useSession: mocks.session }));
+ vi.mock("@/lib/aeTeam", async (original) => ({
+   ...(await original<typeof AeTeamModule>()),
+   saveAeTeam: vi.fn(),
+@@ -129,6 +135,27 @@ beforeEach(() => {
+ afterEach(cleanup);
+ 
+ describe("composer team picker", () => {
++  it("keeps a loading entry point and lets failed metadata be retried", () => {
++    const client = new QueryClient();
++    const invalidate = vi.spyOn(client, "invalidateQueries");
++    mocks.session.mockReturnValue({ session: null, isLoading: true, error: null });
++    const view = () => (
++      <QueryClientProvider client={client}>
++        <SessionTeamControl sessionId="parent" />
++      </QueryClientProvider>
++    );
++    const rendered = render(view());
++    expect(screen.getByRole("button", { name: "Loading team configuration" })).toBeDisabled();
++    mocks.session.mockReturnValue({ session: null, isLoading: false, error: new Error("Offline") });
++    rendered.rerender(view());
++    fireEvent.click(screen.getByRole("button", { name: "Retry team configuration" }));
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "parent"] });
++    mocks.session.mockReturnValue({ session, isLoading: false, error: null });
++    rendered.rerender(view());
++    openPicker();
++    expect(screen.getByText("Lead / orchestrator")).toBeInTheDocument();
++  });
++
+   it("defaults to Auto and explains native helpers in every mode without saving", () => {
+     mount();
+     expect(screen.getByRole("button", { name: "Collaboration: Auto" })).toHaveTextContent("Auto");
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+index f6ed7ee6378b209bc2b69ed5de16599b6c00a7c7..581fd9d5bec8c857dc946b30d2064ddc9213cdcb 100644
+--- a/web/src/components/AeTeamControl.tsx
++++ b/web/src/components/AeTeamControl.tsx
+@@ -4,6 +4,7 @@ import { useQueryClient } from "@tanstack/react-query";
+ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+ import { useHostModelOptions, useHosts, type Host } from "@/hooks/useHosts";
+ import { childSessionsQueryKey } from "@/hooks/useChildSessions";
++import { useSession } from "@/hooks/useSession";
+ import {
+   aeTeamAgentName,
+   aeTeamLeadName,
+@@ -301,6 +302,38 @@ export function AeTeamEditor({
+   );
+ }
+ 
++/** Keep the configuration entry point visible while session metadata recovers. */
++export function SessionTeamControl({
++  sessionId,
++  disabled = false,
++  working = false,
++}: {
++  sessionId: string;
++  disabled?: boolean;
++  working?: boolean;
++}) {
++  const { session, error, isLoading } = useSession(sessionId);
++  const queryClient = useQueryClient();
++  if (session) return <AeTeamControl session={session} disabled={disabled} working={working} />;
++  return (
++    <button
++      type="button"
++      aria-label={error ? "Retry team configuration" : "Loading team configuration"}
++      title={
++        error
++          ? "Could not load team and lead settings. Click to retry."
++          : "Loading team and lead settings…"
++      }
++      disabled={disabled || isLoading || !error}
++      onClick={() => void queryClient.invalidateQueries({ queryKey: ["session", sessionId] })}
++      className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
++    >
++      <UsersRound className="size-4" />
++      <span>{error ? "Retry team" : "Team…"}</span>
++    </button>
++  );
++}
++
+ /** Composer-level collaboration preferences; opening the picker never starts work. */
+ export function AeTeamControl({
+   session,
+diff --git a/web/src/hooks/useHosts.ts b/web/src/hooks/useHosts.ts
+index 72483a6f942626d2fee0c38ade0c16cdedd976ac..328df8b811648ecea7d2614ec93f7a3c51218088 100644
+--- a/web/src/hooks/useHosts.ts
++++ b/web/src/hooks/useHosts.ts
+@@ -262,7 +262,8 @@ export function useInstallingHarnesses(hostId: string): ReadonlySet<string> {
+ /** Payload for {@link useStoreCredential}: an API key, a gateway, or adopt. */
+ export interface StoreCredentialInput {
+   harness: string;
+-  kind: "key" | "gateway" | "adopt";
++  kind: "key" | "gateway" | "adopt" | "claude-oauth-add" | "claude-oauth-select";
++  account_name?: string;
+   /** The API key / gateway token for `key` / `gateway`; omitted for `adopt`. */
+   secret?: string;
+   /** Gateway base URL (required for `kind: "gateway"`). */
+diff --git a/web/src/hooks/useSession.test.tsx b/web/src/hooks/useSession.test.tsx
+index 2d2de152e55aec62dbff32f6fe27add26a9b5c58..3a9c5e392ebcc49679555ceec6dc0eec2de59f79 100644
+--- a/web/src/hooks/useSession.test.tsx
++++ b/web/src/hooks/useSession.test.tsx
+@@ -57,6 +57,34 @@ afterEach(() => {
+ });
+ 
+ describe("useSession — refresh_state", () => {
++  it("keeps durable team metadata available when runner refresh fails", async () => {
++    const saved = { ...session("conv_1"), labels: { "ae.team": "saved-team" } };
++    getSessionSlimMock.mockRejectedValueOnce(new Error("Runner reconnecting"));
++    getSessionSlimMock.mockResolvedValueOnce(saved);
++    const { Wrapper } = harness();
++    const { result } = renderHook(() => useSession("conv_1"), { wrapper: Wrapper });
++    await flush();
++    expect(refreshFlags()).toEqual([true, false]);
++    expect(result.current.session).toEqual(saved);
++    expect(result.current.error).toBeNull();
++  });
++
++  it("allows retry after both metadata requests fail", async () => {
++    getSessionSlimMock.mockRejectedValueOnce(new Error("Runner reconnecting"));
++    getSessionSlimMock.mockRejectedValueOnce(new Error("Host unavailable"));
++    const { client, Wrapper } = harness();
++    const { result } = renderHook(() => useSession("conv_1"), { wrapper: Wrapper });
++    await flush();
++    expect(result.current.session).toBeNull();
++    expect(result.current.error?.message).toBe("Host unavailable");
++    await act(async () => {
++      await client.invalidateQueries({ queryKey: ["session", "conv_1"] });
++    });
++    await flush();
++    expect(result.current.session?.id).toBe("conv_1");
++    expect(result.current.error).toBeNull();
++  });
++
+   it("asks for a state refresh on the initial fetch", async () => {
+     const { Wrapper } = harness();
+     renderHook(() => useSession("conv_1"), { wrapper: Wrapper });
+diff --git a/web/src/hooks/useSession.ts b/web/src/hooks/useSession.ts
+index e5b57e2093dbacf52fe88aec9a453c6255c1ddcd..20bb95b80412fac29c483e38534f80f742c518e0 100644
+--- a/web/src/hooks/useSession.ts
++++ b/web/src/hooks/useSession.ts
+@@ -66,7 +66,15 @@ export function useSession(conversationId: string | null | undefined): UseSessio
+   const serverId = isTempConvId(conversationId) ? null : (conversationId ?? null);
+   const { data, isLoading, error } = useQuery({
+     queryKey: serverId ? ["session", serverId] : ["session", null],
+-    queryFn: () => getSessionSlim(serverId as string, { refreshState: true }),
++    queryFn: async () => {
++      try {
++        return await getSessionSlim(serverId as string, { refreshState: true });
++      } catch {
++        // Team/lead configuration needs durable metadata even when the runner
++        // cannot refresh its live capabilities during startup or reconnect.
++        return getSessionSlim(serverId as string);
++      }
++    },
+     enabled: serverId !== null,
+     staleTime: Infinity,
+     retry: false,
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 2abce8451c993a2db93925c51a34ee9bea0a526d..6157956cb11f8acf6c411cbc837e897dba3c3bdf 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -38,6 +38,8 @@ import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "@/lib/composerSendShortcutPr
+ import { composerContextToLabels } from "@/lib/composerContextAdapters";
+ import { CHAT_COLUMN_WIDTH } from "./chatLayout";
+ 
++vi.mock("@/shell/ClaudeAccounts", () => ({ ClaudeAccounts: () => null }));
++
+ // Composer reads workspace files via a TanStack query hook (for "@"-file
+ // mentions). These slash-command tests don't exercise that, so stub the hook
+ // to avoid needing a QueryClientProvider around every bare render.
+@@ -143,7 +145,7 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
+ }));
+ // 2026-10-14: that session mounts AeTeamControl, which needs a query client and
+ // the sidebar's data; stub it like the other provider-backed pieces.
+-vi.mock("@/components/AeTeamControl", () => ({ AeTeamControl: () => null }));
++vi.mock("@/components/AeTeamControl", () => ({ SessionTeamControl: () => null }));
+ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseHostsModule>()),
+   useHosts: () => ({ data: [] }),
+@@ -2704,6 +2706,25 @@ describe("Composer shared visible controls", () => {
+     expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
+     expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
+   });
++
++  it("clears a permission failure after a successful retry", async () => {
++    useChatStore.setState({
++      conversationId: "permission-retry",
++      codexApprovalMode: "ask-for-approval",
++    });
++    const setApproval = vi
++      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
++      .mockRejectedValueOnce(new Error("Could not switch permissions"))
++      .mockResolvedValueOnce(undefined);
++    renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
++    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
++    fireEvent.click(screen.getByTestId("composer-permission-option-approve-for-me"));
++    await screen.findByText("Could not switch permissions");
++    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
++    fireEvent.click(screen.getByTestId("composer-permission-option-approve-for-me"));
++    await waitFor(() => expect(setApproval).toHaveBeenCalledTimes(2));
++    await waitFor(() => expect(screen.queryByText("Could not switch permissions")).toBeNull());
++  });
+ });
+ 
+ describe("Composer background tasks", () => {
+diff --git a/web/src/pages/ChatPage.mention.test.tsx b/web/src/pages/ChatPage.mention.test.tsx
+index 5dda76fd6a8b8141e420565831fe394bba19d43c..abf862777ba8889a1343a47e0f5546b6dd7a923d 100644
+--- a/web/src/pages/ChatPage.mention.test.tsx
++++ b/web/src/pages/ChatPage.mention.test.tsx
+@@ -79,7 +79,7 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
+ }));
+ // 2026-10-14: that session mounts AeTeamControl, which needs a query client and
+ // the sidebar's data; stub it like the other provider-backed pieces.
+-vi.mock("@/components/AeTeamControl", () => ({ AeTeamControl: () => null }));
++vi.mock("@/components/AeTeamControl", () => ({ SessionTeamControl: () => null }));
+ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseHostsModule>()),
+   useHosts: () => ({ data: [] }),
+diff --git a/web/src/pages/ChatPage.statusLine.test.tsx b/web/src/pages/ChatPage.statusLine.test.tsx
+index cce44f1e55f7c9a09db784e5e0a8d202ec7cd8e6..771bbc6e5beca5575a98a3c4bc0b50e63223337f 100644
+--- a/web/src/pages/ChatPage.statusLine.test.tsx
++++ b/web/src/pages/ChatPage.statusLine.test.tsx
+@@ -92,7 +92,7 @@ vi.mock("@/hooks/useSession", async (importOriginal) => ({
+ }));
+ // 2026-10-14: that session mounts AeTeamControl, which needs a query client and
+ // the sidebar's data; stub it like the other provider-backed pieces.
+-vi.mock("@/components/AeTeamControl", () => ({ AeTeamControl: () => null }));
++vi.mock("@/components/AeTeamControl", () => ({ SessionTeamControl: () => null }));
+ vi.mock("@/hooks/useHosts", async (importOriginal) => ({
+   ...(await importOriginal<typeof UseHostsModule>()),
+   useHosts: (opts: unknown) => useHostsMock(opts),
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index bd5c9af3a879cf4c64667ac40fdbf45ce0a89e55..e36a188cdb8d5158e944a36bb4a558b1264c5719 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -62,7 +62,8 @@ import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
+ import { AeFastModeSection } from "@/components/AeFastMode";
+ import { useAeFastModePending } from "@/lib/aeFastMode";
+ import { AePlanLimitsPopover } from "@/components/AePlanLimits";
+-import { AeTeamControl } from "@/components/AeTeamControl";
++import { SessionTeamControl } from "@/components/AeTeamControl";
++import { ClaudeAccounts } from "@/shell/ClaudeAccounts";
+ import { agentDisplayLabel } from "@/components/AgentInfo";
+ import {
+   BRAIN_HARNESS_LABELS,
+@@ -2472,6 +2473,7 @@ function ComposerImpl(
+       const store = useChatStore.getState();
+       if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
+       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
++      if (useChatStore.getState().conversationId === sourceSessionId) setCommandError(null);
+     } catch (error) {
+       if (useChatStore.getState().conversationId === sourceSessionId)
+         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");
+@@ -3854,10 +3856,10 @@ function ComposerImpl(
+           ),
+           trailing: (
+             <>
+-              {composerSession && (
+-                <AeTeamControl
+-                  key={composerSession.id}
+-                  session={composerSession}
++              {composerSessionId && (
++                <SessionTeamControl
++                  key={composerSessionId}
++                  sessionId={composerSessionId}
+                   disabled={isReadOnly || unreachable || configBusy}
+                   working={isWorking}
+                 />
+@@ -4571,6 +4573,9 @@ function SessionHarnessPicker({
+   const nativeAgent =
+     nativeCodingAgentForHarness(sessionHarness) ??
+     (modelPickerKind ? nativeCodingAgentForHarness(modelPickerKind + "-native") : undefined);
++  const showClaudeAccounts = nativeAgent?.harness === "claude-native";
++  const { data: configHosts = [] } = useHosts({ enabled: menuOpen && showClaudeAccounts });
++  const accountHost = configHosts.find((host) => host.host_id === modelLabelHostId);
+   const iconAgent = {
+     name: nativeAgent?.agentName ?? agentName ?? subAgentName ?? "",
+     harness: nativeAgent?.harness ?? sessionHarness,
+@@ -4584,10 +4589,12 @@ function SessionHarnessPicker({
+     modelLabel: modelSummary,
+     costRoutingEligible,
+   });
+-  const configurable = hasSessionConfig({
+-    showModels,
+-    showEffort,
+-  });
++  const configurable =
++    showClaudeAccounts ||
++    hasSessionConfig({
++      showModels,
++      showEffort,
++    });
+   const effortLabel = showEffort && !routingOn ? formatStatusEffortLabel(selectedEffort) : null;
+   const label = routingOn
+     ? SMART_ROUTING_LABEL
+@@ -4661,6 +4668,7 @@ function SessionHarnessPicker({
+     });
+   const configContent = (
+     <>
++      {showClaudeAccounts && <ClaudeAccounts host={accountHost} />}
+       {costRoutingEligible && showModels && (
+         <>
+           <DropdownMenuItem
+diff --git a/web/src/shell/AppShell.test.tsx b/web/src/shell/AppShell.test.tsx
+index bbf27d8a7fe6a29e81c7abfeca8817fe1ce61336..248611f687d96ef595dfd23b4bcc2871182261f7 100644
+--- a/web/src/shell/AppShell.test.tsx
++++ b/web/src/shell/AppShell.test.tsx
+@@ -4425,9 +4425,11 @@ describe("AppShell clone/fork action", () => {
+ 
+     await waitFor(() => expect(screen.queryByTestId("fork-session-dialog")).toBeNull());
+     expect(await screen.findByText("Couldn't load the session to fork. Try again.")).toBeVisible();
+-    expect(getSessionSlimMock.mock.calls.filter(([id]) => id === "conv_side_child")).toHaveLength(
+-      1,
+-    );
++    // omnigent-ae: useSession retries a failed refreshState read once without it.
++    expect(getSessionSlimMock.mock.calls.filter(([id]) => id === "conv_side_child")).toEqual([
++      ["conv_side_child", { refreshState: true }],
++      ["conv_side_child"],
++    ]);
+   });
+ 
+   it("retries an errored scoped source only when the same fork is reopened", async () => {
+@@ -4448,10 +4450,12 @@ describe("AppShell clone/fork action", () => {
+       data: [{ host_id: "host_a", name: "Host A", owner: "owner", status: "online" }],
+     } as ReturnType<typeof useHosts>);
+     useSessionMock.mockImplementation(realUseSession.hook);
+-    getSessionSlimMock.mockImplementation((sessionId) => {
++    getSessionSlimMock.mockImplementation((sessionId, options) => {
+       if (sessionId === "conv_parent") return Promise.resolve(parent);
+       if (sessionId === "conv_side_child") {
+-        sourceAttempts += 1;
++        // omnigent-ae: a failed refreshState read is retried once without it;
++        // that fallback belongs to the same attempt.
++        if (options?.refreshState) sourceAttempts += 1;
+         return sourceAttempts === 1 ? firstRequest.promise : retryRequest.promise;
+       }
+       return Promise.reject(new Error(`unexpected session ${sessionId}`));
+diff --git a/web/src/shell/ClaudeAccounts.test.tsx b/web/src/shell/ClaudeAccounts.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..492005c6b098959b81d2a7e3bb3997d9ae4d3a54
+--- /dev/null
++++ b/web/src/shell/ClaudeAccounts.test.tsx
+@@ -0,0 +1,46 @@
++import { fireEvent, render, screen } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { ClaudeAccounts } from "./ClaudeAccounts";
++import type { Host } from "@/hooks/useHosts";
++
++const mutate = vi.fn();
++vi.mock("@/hooks/useHosts", () => ({
++  useDetectedCredentials: () => ({
++    data: [
++      { family: "claude-oauth-active", source: "Default CLI account", env_var: "" },
++      { family: "claude-oauth", source: "Backup", env_var: "Backup" },
++    ],
++  }),
++  useStoreCredential: () => ({ mutate, isPending: false }),
++}));
++const host = { host_id: "host", name: "Laptop" } as Host;
++beforeEach(() => mutate.mockReset());
++describe("ClaudeAccounts", () => {
++  it("selects the backup account without a token", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByText("Backup"));
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-select",
++      account_name: "Backup",
++    });
++    expect(screen.getByText(/Start a new chat/)).toBeTruthy();
++  });
++  it("adds a named OAuth token through the credential endpoint", () => {
++    render(<ClaudeAccounts host={host} />);
++    fireEvent.click(screen.getByText("Add Claude account"));
++    fireEvent.change(screen.getByLabelText("Claude account name"), {
++      target: { value: "Personal" },
++    });
++    fireEvent.change(screen.getByLabelText("Claude OAuth token"), {
++      target: { value: "sk-ant-oat-example" },
++    });
++    fireEvent.click(screen.getByText("Save account"));
++    expect(mutate.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-oauth-add",
++      account_name: "Personal",
++      secret: "sk-ant-oat-example",
++    });
++  });
++});
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..872169bbfdba50279289e06218cd1b8f1d9fc234
+--- /dev/null
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -0,0 +1,123 @@
++import { useState } from "react";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { useDetectedCredentials, useStoreCredential, type Host } from "@/hooks/useHosts";
++
++/** Host-owned subscription choices; no token is returned by the discovery API. */
++export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
++  const [name, setName] = useState("");
++  const [token, setToken] = useState("");
++  const [adding, setAdding] = useState(false);
++  const [message, setMessage] = useState("");
++  const accounts = useDetectedCredentials(host?.host_id, !!host);
++  const store = useStoreCredential(host?.host_id ?? "");
++  const addAccount = () => {
++    if (store.isPending || !name.trim() || !token.trim()) return;
++    store.mutate(
++      {
++        harness: "claude-native",
++        kind: "claude-oauth-add",
++        account_name: name.trim(),
++        secret: token.trim(),
++      },
++      {
++        onSuccess: () => {
++          setToken("");
++          setName("");
++          setAdding(false);
++          setMessage("Account saved and selected for new chats.");
++        },
++        onError: (error) => setMessage(error.message),
++      },
++    );
++  };
++  if (!host) return null;
++  const rows = (accounts.data ?? []).filter((row) => row.family.startsWith("claude-oauth"));
++  return (
++    <div className="flex flex-col gap-2 border-t px-3 py-3" data-testid="claude-accounts">
++      <span className="text-sm font-medium">Claude subscription account</span>
++      <p className="text-xs text-muted-foreground">
++        Used for new Claude subscription chats on {host.name}, including team members. Start a new
++        chat to switch a running conversation. Gateway connections keep their own credentials.
++      </p>
++      {(accounts.isError || (accounts.isSuccess && rows.length === 0)) && (
++        <p role="alert">Could not load Claude accounts. Check the host account configuration.</p>
++      )}
++      {rows.map((row) => (
++        <Button
++          type="button"
++          key={row.env_var ?? ""}
++          variant="ghost"
++          size="sm"
++          disabled={store.isPending || row.family === "claude-oauth-active"}
++          onClick={() =>
++            store.mutate(
++              {
++                harness: "claude-native",
++                kind: "claude-oauth-select",
++                account_name: row.env_var ?? "",
++              },
++              {
++                onSuccess: () => setMessage("Account selected for new chats."),
++                onError: (error) => setMessage(error.message),
++              },
++            )
++          }
++        >
++          {row.source}
++          {row.family === "claude-oauth-active" ? " (selected)" : ""}
++        </Button>
++      ))}
++      <Button type="button" variant="outline" size="sm" onClick={() => setAdding(!adding)}>
++        Add Claude account
++      </Button>
++      {adding && (
++        <div
++          className="flex flex-col gap-2"
++          onKeyDown={(event) => {
++            if (event.key === "Enter") {
++              event.preventDefault();
++              event.stopPropagation();
++              addAccount();
++            }
++          }}
++        >
++          <p className="text-xs text-muted-foreground">
++            Run <code>CLAUDE_CONFIG_DIR=~/.claude-backup claude setup-token</code> on your computer
++            and sign in with the second account in the browser. Paste the generated OAuth token
++            here. Your original CLI login is preserved. When this token expires, add a fresh token
++            under a new name.
++          </p>
++          <Input
++            aria-label="Claude account name"
++            placeholder="Account name"
++            value={name}
++            maxLength={64}
++            onChange={(event) => setName(event.target.value)}
++          />
++          <Input
++            aria-label="Claude OAuth token"
++            placeholder="OAuth token"
++            type="password"
++            autoComplete="off"
++            value={token}
++            onChange={(event) => setToken(event.target.value)}
++          />
++          <Button
++            type="button"
++            onClick={addAccount}
++            size="sm"
++            disabled={store.isPending || !name.trim() || !token.trim()}
++          >
++            Save account
++          </Button>
++        </div>
++      )}
++      {message && (
++        <p role="status" className="text-xs">
++          {message}
++        </p>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/shell/NewChatDialog.flow.test.tsx b/web/src/shell/NewChatDialog.flow.test.tsx
+index 802f3d9ae58413ba06dd011613b7bf3b0a924803..007cf4e677e99747c72f7ba1ea375a538106dce6 100644
+--- a/web/src/shell/NewChatDialog.flow.test.tsx
++++ b/web/src/shell/NewChatDialog.flow.test.tsx
+@@ -125,6 +125,8 @@ vi.mock("@/lib/identity", () => ({
+ }));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: vi.fn(),
++  useDetectedCredentials: vi.fn(() => ({ data: [], isError: false })),
++  useStoreCredential: vi.fn(() => ({ mutate: vi.fn(), isPending: false })),
+   useHostModelOptions: vi.fn(() => ({
+     data: [
+       { id: "opus", displayName: "Opus" },
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index ffa1f9d85d95d87123ebe2a184a6cfe0ec09f56b..0f633ffa27dfc863d3e338014cf0721e9ec11be1 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -1,6 +1,7 @@
+ import { useLoadedConversations } from "@/hooks/useSidebarData";
+ import { useComposerContext } from "@/hooks/useComposerContext";
+ import { useSlashCompletion } from "@/hooks/useSlashCompletion";
++import { ClaudeAccounts } from "./ClaudeAccounts";
+ import {
+   HarnessPicker,
+   HarnessPickerEntry,
+@@ -3324,6 +3325,7 @@ export function NewChatLandingScreen() {
+     return rest;
+   }, [brainHarnessLabelsAll, brainRoutable]);
+   const isEntryConfigurable = (agent: AvailableAgent) =>
++    nativeCodingAgentForAvailableAgent(agent)?.harness === "claude-native" ||
+     (sandboxHasModelCatalog && agent.id === effectiveAgentId) ||
+     agentHasModelSettings(agent) ||
+     agentHasAdvancedSettings(agent, brainHarnessLabelsAll);
+@@ -3782,6 +3784,7 @@ export function NewChatLandingScreen() {
+   const selectedConfigContent =
+     selectedAgent && isEntryConfigurable(selectedAgent) ? (
+       <>
++        {selectedNativeHarness === "claude-native" && <ClaudeAccounts host={harnessWarningHost} />}
+         {smartRoutingEligible && (
+           <>
+             <DropdownMenuCheckboxItem

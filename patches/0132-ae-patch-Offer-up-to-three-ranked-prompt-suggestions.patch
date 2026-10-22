@@ -1,0 +1,2163 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 20:34:47 -0700
+Subject: [PATCH 132/148] [ae-patch] Offer up to three ranked prompt
+ suggestions and step through them with rebindable keys
+
+The prompt-suggestion side call now asks Haiku for up to three clearly
+different next messages, best first, in the same single call. Near
+duplicates are dropped. session.suggestion carries the ranked list in
+suggestions and keeps suggestion as the top guess, so a page loaded
+before the change still shows one.
+
+The composer shows a 1/3 counter on the Tab chip. Alt+] and Alt+[ step
+through the guesses (matched on the physical key, so Option on a Mac
+works), a tap on the counter does the same on a phone, and long guesses
+wrap instead of truncating. Settings > Chat gains Suggestion keys to
+record other combos, saved per browser.
+---
+ omnigent/harnesses/ae_prompt_suggest_core.py  | 128 +++++---
+ .../claude_native/ae_prompt_suggest.py        |   4 +-
+ .../routes/_sessions/ae_session_suggestion.py |  87 ++++--
+ omnigent/server/schemas.py                    |  13 +-
+ omnigent/util/ae_session_suggestion.py        |   4 +-
+ openapi.json                                  |  20 +-
+ .../forwarder/test_ae_prompt_suggest.py       |  78 +++--
+ .../integration/test_ae_session_suggestion.py |  27 +-
+ .../components/composer/AeSuggestionGhost.tsx |  93 +++++-
+ .../ChatComposer.aeSuggestion.test.tsx        |  80 ++++-
+ web/src/components/composer/ChatComposer.tsx  |  50 ++-
+ web/src/lib/aeStreamObserver.ts               |   8 +-
+ web/src/lib/aeSuggestion.test.ts              |  65 +++-
+ web/src/lib/aeSuggestion.ts                   | 103 +++++--
+ web/src/lib/aeSuggestionKeys.test.ts          | 101 +++++++
+ web/src/lib/aeSuggestionKeys.ts               | 284 ++++++++++++++++++
+ .../pages/settings/AeChatSettingsSection.tsx  |   2 +
+ .../settings/AeSuggestionKeysSetting.test.tsx |  96 ++++++
+ .../settings/AeSuggestionKeysSetting.tsx      | 141 +++++++++
+ web/src/store/aeSuggestion.test.ts            |  16 +-
+ web/src/store/chatStore.ts                    |   4 +-
+ 21 files changed, 1219 insertions(+), 185 deletions(-)
+ create mode 100644 web/src/lib/aeSuggestionKeys.test.ts
+ create mode 100644 web/src/lib/aeSuggestionKeys.ts
+ create mode 100644 web/src/pages/settings/AeSuggestionKeysSetting.test.tsx
+ create mode 100644 web/src/pages/settings/AeSuggestionKeysSetting.tsx
+
+diff --git a/omnigent/harnesses/ae_prompt_suggest_core.py b/omnigent/harnesses/ae_prompt_suggest_core.py
+index 9d42b3eaa0af2c7d4404d2f398eed56eaec80d71..4a5967cd697d929a5ab6bafbf5da4c7cef89115c 100644
+--- a/omnigent/harnesses/ae_prompt_suggest_core.py
++++ b/omnigent/harnesses/ae_prompt_suggest_core.py
+@@ -3,12 +3,12 @@ The prompt-suggestion side call every native harness shares.
+ 
+ After a finished turn a harness forwarder hands this module the turn's last
+ user prompt and last reply; it makes one small side call
+-(``claude -p --model haiku``) and posts the one-line answer as a transient
+-``external_session_suggestion`` event that the web composer shows as ghost
+-text. The Claude forwarder (``claude_native/ae_prompt_suggest.py``) and the
++(``claude -p --model haiku``) and posts up to three ranked one-line answers as
++a transient ``external_session_suggestion`` event that the web composer shows
++as ghost text, best first. The Claude forwarder (``claude_native/ae_prompt_suggest.py``) and the
+ Codex forwarder (``codex_native/ae_prompt_suggest.py``) each own only how they
+ see a turn end and read its text; the call, its isolation, its login, the trim
+-to one line, cancel and the event post live here once.
++to clean lines, cancel and the event post live here once.
+ 
+ The side call is isolated from everything the session itself uses: no hooks
+ (a ``Stop`` hook firing from it would start another call, for ever), no
+@@ -27,9 +27,11 @@ from __future__ import annotations
+ 
+ import asyncio
+ import contextlib
++import difflib
+ import json
+ import logging
+ import os
++import re
+ import shutil
+ import signal
+ import tempfile
+@@ -44,6 +46,7 @@ import httpx
+ from omnigent.util.ae_session_suggestion import (
+     EXTERNAL_SESSION_SUGGESTION_TYPE,
+     MAX_SUGGESTION_CHARS,
++    MAX_SUGGESTIONS,
+ )
+ 
+ _logger = logging.getLogger(__name__)
+@@ -65,11 +68,19 @@ MIN_TOKEN_LIFETIME_S: Final = 600.0
+ 
+ SYSTEM_PROMPT: Final = (
+     "You predict the next message a user will type to their coding assistant. "
+-    "You get the user's last message and the assistant's reply. Answer with the "
+-    "user's most likely next message, in the user's own voice and style, as one "
+-    f"line of at most {MAX_SUGGESTION_CHARS} characters, with no quotes and no "
+-    f"explanation. If no next message is clearly likely, answer {NONE_REPLY}."
++    "You get the user's last message and the assistant's reply. Answer with up to "
++    f"{MAX_SUGGESTIONS} clearly different likely next messages, most likely first, "
++    "one per line, each in the user's own voice and style and at most "
++    f"{MAX_SUGGESTION_CHARS} characters, with no numbering, no quotes and no "
++    "explanation. Give fewer lines rather than weak ones. If no next message is "
++    f"clearly likely, answer {NONE_REPLY}."
+ )
++# Two guesses this alike (difflib ratio, case-folded) count as one, unless the
++# words they differ in carry a digit or an identifier ("PR 121" vs "PR 122").
++DUPLICATE_RATIO: Final = 0.85
++_IDENTIFIER_RE: Final = re.compile(r"[\d_./]")
++# A list marker the model may add despite the prompt: "1.", "2)", "-", "*", "•".
++_LIST_MARKER_RE: Final = re.compile(r"^(?:\d+[.)]|[-*•])\s+")
+ 
+ # Environment the side call must not inherit: OmniGent's runner wiring and
+ # tokens, and Claude Code's own session and suggestion switches.
+@@ -159,18 +170,16 @@ def build_side_call_prompt(context: TurnContext) -> str:
+     )
+ 
+ 
+-def clean_suggestion(raw: str) -> str | None:
+-    """
+-    The suggestion to show, from the side call's raw output.
++def _is_none(raw: str) -> bool:
++    return raw.strip().strip("\"'`“”‘’").rstrip(".").upper() == NONE_REPLY
+ 
+-    :param raw: Everything the side call printed.
+-    :returns: The first non-empty line without wrapping quotes, cut at a word
+-        boundary to :data:`MAX_SUGGESTION_CHARS`; ``None`` for ``NONE`` or
+-        empty output.
+-    """
+-    line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
++
++def _clean_line(raw: str) -> str | None:
++    """One output line without list marker or wrapping quotes, cut at a word to the bound."""
++    line = _LIST_MARKER_RE.sub("", raw.strip())
+     line = line.strip("\"'`“”‘’").strip()
+-    if not line or line.rstrip(".").upper() == NONE_REPLY:
++    # A bracketed aside is the model explaining itself, not a guess.
++    if not line or line.startswith(("(", "[")):
+         return None
+     if len(line) > MAX_SUGGESTION_CHARS:
+         cut = line[:MAX_SUGGESTION_CHARS]
+@@ -179,6 +188,43 @@ def clean_suggestion(raw: str) -> str | None:
+     return line or None
+ 
+ 
++def _is_near_duplicate(line: str, kept: list[str]) -> bool:
++    folded = line.casefold()
++    words = set(folded.rstrip(".!?").split())
++    for other in kept:
++        other_folded = other.casefold()
++        if difflib.SequenceMatcher(None, folded, other_folded).ratio() < DUPLICATE_RATIO:
++            continue
++        differing = words ^ set(other_folded.rstrip(".!?").split())
++        if not any(_IDENTIFIER_RE.search(word) for word in differing):
++            return True
++    return False
++
++
++def clean_suggestions(raw: str) -> list[str]:
++    """
++    The ranked suggestions to show, from the side call's raw output.
++
++    :param raw: Everything the side call printed, one guess per line.
++    :returns: Up to :data:`MAX_SUGGESTIONS` lines in the model's order, each
++        without list marker or wrapping quotes and cut at a word boundary to
++        :data:`MAX_SUGGESTION_CHARS`; near duplicates of an earlier line and
++        bracketed asides dropped. Reading stops at a ``NONE`` line, so ``NONE``
++        first, or empty output, gives none.
++    """
++    kept: list[str] = []
++    for raw_line in raw.splitlines():
++        if _is_none(raw_line):
++            break
++        line = _clean_line(raw_line)
++        if line is None or _is_near_duplicate(line, kept):
++            continue
++        kept.append(line)
++        if len(kept) == MAX_SUGGESTIONS:
++            break
++    return kept
++
++
+ def side_call_argv(claude_bin: str) -> list[str]:
+     """
+     The side call's command line. Each flag checked against ``claude --help``
+@@ -343,29 +389,29 @@ async def run_side_call(
+     *,
+     timeout_s: float = SIDE_CALL_TIMEOUT_S,
+     login_env: Mapping[str, str] | None = None,
+-) -> str | None:
++) -> list[str]:
+     """
+-    Run one isolated ``claude -p`` call and return its cleaned answer.
++    Run one isolated ``claude -p`` call and return its cleaned answers.
+ 
+     :param prompt: The side call's user message.
+     :param timeout_s: Seconds before the call is killed.
+     :param login_env: The account's login environment from
+         :func:`account_login_env`, layered over this process's; ``None`` or
+         ``{}`` keeps the default login.
+-    :returns: The suggestion, or ``None`` on ``NONE``, a failure, a timeout or
+-        no usable login.
++    :returns: The ranked suggestions, or ``[]`` on ``NONE``, a failure, a
++        timeout or no usable login.
+     :raises asyncio.CancelledError: When a newer turn cancels the call; the
+         process group is killed first.
+     """
+     claude_bin = _claude_binary()
+     if claude_bin is None:
+         _logger.debug("prompt suggestion skipped: no claude binary on PATH")
+-        return None
++        return []
+     base = {**os.environ, **(login_env or {})}
+     with _side_call_dirs() as (cwd, config_dir):
+         if not copy_login(config_dir, env=base):
+             _logger.debug("prompt suggestion skipped: no login valid for the next 10 minutes")
+-            return None
++            return []
+         proc = await asyncio.create_subprocess_exec(
+             *side_call_argv(claude_bin),
+             stdin=asyncio.subprocess.PIPE,
+@@ -383,12 +429,12 @@ async def run_side_call(
+                 await proc.wait()
+             if isinstance(exc, TimeoutError):
+                 _logger.debug("prompt suggestion side call timed out after %.0fs", timeout_s)
+-                return None
++                return []
+             raise
+     if proc.returncode != 0:
+         _logger.debug("prompt suggestion side call exited %s", proc.returncode)
+-        return None
+-    return clean_suggestion(stdout.decode("utf-8", errors="replace"))
++        return []
++    return clean_suggestions(stdout.decode("utf-8", errors="replace"))
+ 
+ 
+ def uses_default_provider(bridge_dir: Path | None, env: Mapping[str, str] | None = None) -> bool:
+@@ -454,19 +500,31 @@ async def is_child_session(
+ 
+ 
+ async def post_suggestion(
+-    client: httpx.AsyncClient, *, session_id: str, suggestion: str | None
++    client: httpx.AsyncClient, *, session_id: str, suggestions: list[str] | None
+ ) -> None:
+     """
+     Post one transient ``external_session_suggestion`` event.
+ 
++    ``data.suggestion`` repeats the top guess, so a page loaded before the
++    list existed still shows it.
++
+     :param client: Omnigent HTTP client.
+     :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
+-    :param suggestion: The predicted prompt, or ``None`` to clear it.
++    :param suggestions: The ranked predicted prompts, best first, or ``None``
++        to clear them.
+     :raises httpx.HTTPError: If the request fails or is rejected.
+     """
++    data = (
++        {"suggestion": suggestions[0], "suggestions": suggestions}
++        if suggestions
++        else {
++            "suggestion": None,
++            "suggestions": None,
++        }
++    )
+     resp = await client.post(
+         f"/v1/sessions/{session_id}/events",
+-        json={"type": EXTERNAL_SESSION_SUGGESTION_TYPE, "data": {"suggestion": suggestion}},
++        json={"type": EXTERNAL_SESSION_SUGGESTION_TYPE, "data": data},
+     )
+     resp.raise_for_status()
+ 
+@@ -480,17 +538,17 @@ async def suggest_and_post(
+     login_env: Mapping[str, str] | None = None,
+ ) -> None:
+     """
+-    Run the side call for one turn and post its answer, if any.
++    Run the side call for one turn and post its answers, if any.
+ 
+     The caller has applied its own skip rules. Raises only on cancel or a
+     failed post; each harness's task wrapper logs the latter.
+     """
+-    suggestion = await run_side_call(build_side_call_prompt(context), login_env=login_env)
+-    if suggestion is None or client.is_closed:
++    suggestions = await run_side_call(build_side_call_prompt(context), login_env=login_env)
++    if not suggestions or client.is_closed:
+         return
+     # Marked first, so a cancel while the POST is in flight still gets its clear.
+     state.shown = session_id
+-    await post_suggestion(client, session_id=session_id, suggestion=suggestion)
++    await post_suggestion(client, session_id=session_id, suggestions=suggestions)
+ 
+ 
+ def cancel_prompt_suggestion(state: SuggestionState) -> None:
+@@ -512,6 +570,6 @@ async def clear_prompt_suggestion(client: httpx.AsyncClient, *, state: Suggestio
+     if session_id is None or client.is_closed:
+         return
+     try:
+-        await post_suggestion(client, session_id=session_id, suggestion=None)
++        await post_suggestion(client, session_id=session_id, suggestions=None)
+     except httpx.HTTPError:
+         _logger.debug("prompt suggestion clear failed; session=%s", session_id, exc_info=True)
+diff --git a/omnigent/harnesses/claude_native/ae_prompt_suggest.py b/omnigent/harnesses/claude_native/ae_prompt_suggest.py
+index ece271c25fa7ae08789a5f3c657f3d0c0be8b274..9ea80f2a2abac61d62bb866557dd9ba6db0d99ea 100644
+--- a/omnigent/harnesses/claude_native/ae_prompt_suggest.py
++++ b/omnigent/harnesses/claude_native/ae_prompt_suggest.py
+@@ -41,7 +41,7 @@ from omnigent.harnesses.ae_prompt_suggest_core import (
+     account_login_env,
+     build_side_call_prompt,
+     cancel_prompt_suggestion,
+-    clean_suggestion,
++    clean_suggestions,
+     clear_prompt_suggestion,
+     copy_login,
+     is_child_session,
+@@ -68,7 +68,7 @@ __all__ = [
+     "TurnContext",
+     "build_side_call_prompt",
+     "cancel_prompt_suggestion",
+-    "clean_suggestion",
++    "clean_suggestions",
+     "clear_prompt_suggestion",
+     "copy_login",
+     "post_suggestion",
+diff --git a/omnigent/server/routes/_sessions/ae_session_suggestion.py b/omnigent/server/routes/_sessions/ae_session_suggestion.py
+index 8bab0f5880dcfe3646c742c905158f8e4a8e574d..cdaa4c29004101b8ea7d6e4af5a7d926f16b2890 100644
+--- a/omnigent/server/routes/_sessions/ae_session_suggestion.py
++++ b/omnigent/server/routes/_sessions/ae_session_suggestion.py
+@@ -1,12 +1,13 @@
+ """
+-Publish a predicted next prompt to the session stream.
+-
+-After each finished turn the claude-native forwarder may post
+-``external_session_suggestion`` with a one-line guess at the user's next
+-message (see ``harnesses/claude_native/ae_prompt_suggest.py``). This validates
+-the payload and broadcasts it as a transient ``session.suggestion`` event for
+-the composer's ghost text; nothing is persisted. The type string and bound come
+-from :mod:`omnigent.util.ae_session_suggestion`, which the forwarder shares.
++Publish the predicted next prompts to the session stream.
++
++After each finished turn a native forwarder may post
++``external_session_suggestion`` with up to three ranked one-line guesses at the
++user's next message (see ``harnesses/ae_prompt_suggest_core.py``). This
++validates the payload and broadcasts it as a transient ``session.suggestion``
++event for the composer's ghost text; nothing is persisted. The type string and
++bounds come from :mod:`omnigent.util.ae_session_suggestion`, which the
++forwarder shares.
+ """
+ 
+ from __future__ import annotations
+@@ -17,39 +18,67 @@ from omnigent.server.schemas import SessionEventInput, SessionSuggestionEvent
+ from omnigent.util.ae_session_suggestion import (
+     EXTERNAL_SESSION_SUGGESTION_TYPE,
+     MAX_SUGGESTION_CHARS,
++    MAX_SUGGESTIONS,
+     SESSION_SUGGESTION_SSE_TYPE,
+ )
+ 
+ __all__ = ["EXTERNAL_SESSION_SUGGESTION_TYPE", "publish_external_session_suggestion"]
+ 
+ 
++def _is_one_line(value: object) -> bool:
++    return (
++        isinstance(value, str)
++        and bool(value.strip())
++        and len(value) <= MAX_SUGGESTION_CHARS
++        and "\n" not in value
++        and "\r" not in value
++    )
++
++
++def _ranked_suggestions(data: dict[str, object]) -> list[str] | None:
++    """
++    The ranked list from ``data.suggestions``, or one from ``data.suggestion``.
++
++    :raises OmnigentError: When a guess is not a non-empty single line within
++        :data:`MAX_SUGGESTION_CHARS`, or the list is empty or longer than
++        :data:`MAX_SUGGESTIONS`.
++    """
++    values = data.get("suggestions")
++    if values is None:
++        single = data.get("suggestion")
++        values = None if single is None else [single]
++    if values is None:
++        return None
++    if (
++        not isinstance(values, list)
++        or not 1 <= len(values) <= MAX_SUGGESTIONS
++        or not all(_is_one_line(v) for v in values)
++    ):
++        raise OmnigentError(
++            f"{EXTERNAL_SESSION_SUGGESTION_TYPE} data.suggestions must list 1 to "
++            f"{MAX_SUGGESTIONS} non-empty lines of at most {MAX_SUGGESTION_CHARS} "
++            "characters each (or data.suggestion one such line), or be null to clear them",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    return [v.strip() for v in values]
++
++
+ def publish_external_session_suggestion(session_id: str, body: SessionEventInput) -> None:
+     """
+-    Broadcast a predicted next prompt, or its clear.
++    Broadcast the ranked predicted next prompts, or their clear.
+ 
+     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+     :param body: ``POST /events`` body whose type is
+-        :data:`EXTERNAL_SESSION_SUGGESTION_TYPE`; ``data.suggestion`` is one
+-        line of text, or ``None`` to clear.
+-    :raises OmnigentError: When the suggestion is not a non-empty single line
+-        within :data:`MAX_SUGGESTION_CHARS`.
++        :data:`EXTERNAL_SESSION_SUGGESTION_TYPE`; ``data.suggestions`` lists
++        the guesses best first (``data.suggestion`` alone is read as a list of
++        one), or both are ``None`` to clear.
++    :raises OmnigentError: When the payload breaks the bounds above.
+     """
+-    value = body.data.get("suggestion")
+-    if value is not None:
+-        if (
+-            not isinstance(value, str)
+-            or not value.strip()
+-            or len(value) > MAX_SUGGESTION_CHARS
+-            or "\n" in value
+-            or "\r" in value
+-        ):
+-            raise OmnigentError(
+-                f"{EXTERNAL_SESSION_SUGGESTION_TYPE} data.suggestion must be one non-empty "
+-                f"line of at most {MAX_SUGGESTION_CHARS} characters, or null to clear it",
+-                code=ErrorCode.INVALID_INPUT,
+-            )
+-        value = value.strip()
++    suggestions = _ranked_suggestions(body.data)
+     event = SessionSuggestionEvent(
+-        type=SESSION_SUGGESTION_SSE_TYPE, conversation_id=session_id, suggestion=value
++        type=SESSION_SUGGESTION_SSE_TYPE,
++        conversation_id=session_id,
++        suggestion=suggestions[0] if suggestions else None,
++        suggestions=suggestions,
+     )
+     session_stream.publish(session_id, event.model_dump())
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index b0ade01a8794949778d1771fa47f32aff06e5523..5b19c31d16f72a04eaebdbd43e6c0a2da8e93cf3 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -3813,22 +3813,25 @@ class SessionProgressEvent(_SSEEventBase):
+ 
+ class SessionSuggestionEvent(_SSEEventBase):
+     """
+-    A predicted next prompt for the composer to show as ghost text.
++    Predicted next prompts for the composer to show as ghost text.
+ 
+-    After a finished turn the claude-native forwarder asks a small model for
+-    the user's likely next message and relays the one-line answer.
++    After a finished turn a native forwarder asks a small model for the user's
++    likely next messages and relays up to three one-line answers, best first.
+ 
+     Category: **transient** (SSE-only). Nothing is persisted and there is no
+-    replay. ``suggestion`` is ``None`` to clear it.
++    replay. ``suggestion`` and ``suggestions`` are ``None`` to clear them.
+ 
+     :param type: Always ``"session.suggestion"``.
+     :param conversation_id: The conversation whose stream this rides.
+-    :param suggestion: The predicted prompt, e.g. ``"Run the tests"``, or ``None``.
++    :param suggestion: The top guess, e.g. ``"Run the tests"``, or ``None``.
++    :param suggestions: Every guess best first, e.g. ``["Run the tests",
++        "Open a PR"]``, or ``None``.
+     """
+ 
+     type: Literal["session.suggestion"]
+     conversation_id: str
+     suggestion: str | None = None
++    suggestions: list[str] | None = None
+ 
+ 
+ # ── Response pass-through events (response.*) ──────────────────────
+diff --git a/omnigent/util/ae_session_suggestion.py b/omnigent/util/ae_session_suggestion.py
+index a2c4b46abfe6dc31e08ca0dc1da7b18c73c55a2e..ac71bf61cd5137065fab0c87c49dd28d0c2a04ad 100644
+--- a/omnigent/util/ae_session_suggestion.py
++++ b/omnigent/util/ae_session_suggestion.py
+@@ -1,5 +1,5 @@
+ """
+-The wire contract for a predicted next prompt (the composer's ghost text).
++The wire contract for the predicted next prompts (the composer's ghost text).
+ 
+ Shared by the claude-native forwarder (which posts the event) and the
+ sessions route (which validates and publishes it), so the type string and
+@@ -15,3 +15,5 @@ SESSION_SUGGESTION_SSE_TYPE: Final = "session.suggestion"
+ 
+ # One line in the composer; the side call is told to stay inside it.
+ MAX_SUGGESTION_CHARS: Final = 120
++# Ranked alternatives the composer cycles through, best first.
++MAX_SUGGESTIONS: Final = 3
+diff --git a/openapi.json b/openapi.json
+index 9c4a273024f5c4ee259227ae3aa71da97b767882..379f8a5c78e28926964e9321436d1b2005830979 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -8237,7 +8237,7 @@
+         "type": "object"
+       },
+       "SessionSuggestionEvent": {
+-        "description": "A predicted next prompt for the composer to show as ghost text.\n\nAfter a finished turn the claude-native forwarder asks a small model for\nthe user's likely next message and relays the one-line answer.\n\nCategory: **transient** (SSE-only). Nothing is persisted and there is no\nreplay. `suggestion` is `None` to clear it.",
++        "description": "Predicted next prompts for the composer to show as ghost text.\n\nAfter a finished turn a native forwarder asks a small model for the user's\nlikely next messages and relays up to three one-line answers, best first.\n\nCategory: **transient** (SSE-only). Nothing is persisted and there is no\nreplay. `suggestion` and `suggestions` are `None` to clear them.",
+         "properties": {
+           "conversation_id": {
+             "description": "The conversation whose stream this rides.",
+@@ -8267,9 +8267,25 @@
+               }
+             ],
+             "default": null,
+-            "description": "The predicted prompt, e.g. `\"Run the tests\"`, or `None`.",
++            "description": "The top guess, e.g. `\"Run the tests\"`, or `None`.",
+             "title": "Suggestion"
+           },
++          "suggestions": {
++            "anyOf": [
++              {
++                "items": {
++                  "type": "string"
++                },
++                "type": "array"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "description": "Every guess best first, e.g. `[\"Run the tests\", \"Open a PR\"]`, or `None`.",
++            "title": "Suggestions"
++          },
+           "type": {
+             "const": "session.suggestion",
+             "description": "Always `\"session.suggestion\"`.",
+diff --git a/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py b/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+index 0f6b2dca5a411b0197c115a58661ef169bd9c2f9..b6479f96dcd535ebbf4ebb68f2a26fad59a3d980 100644
+--- a/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
++++ b/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+@@ -182,21 +182,31 @@ def test_side_call_prompt_stays_within_the_budget() -> None:
+ @pytest.mark.parametrize(
+     ("raw", "expected"),
+     [
+-        ("Run the tests again\n", "Run the tests again"),
+-        ('"Open a draft PR"', "Open a draft PR"),
+-        ("\n\nNONE\n", None),
+-        ("none.", None),
+-        ("", None),
+-        ("first line\nsecond line", "first line"),
++        ("Run the tests again\n", ["Run the tests again"]),
++        ('"Open a draft PR"', ["Open a draft PR"]),
++        ("\n\nNONE\n", []),
++        ("none.", []),
++        ("", []),
++        ("first line\n\nsecond line", ["first line", "second line"]),
++        ("1. Run the tests\n2) Open a PR\n- Ship it", ["Run the tests", "Open a PR", "Ship it"]),
++        ("a\nb\nc\nd", ["a", "b", "c"]),
++        (
++            "Run the tests again\nrun the tests again.\nOpen a PR",
++            ["Run the tests again", "Open a PR"],
++        ),
++        ("Open a PR\nNONE", ["Open a PR"]),
++        ("NONE\nThere is no clearly likely next message.", []),
++        ("Run the tests\n(The user will likely want to verify)", ["Run the tests"]),
++        ("Merge PR 121\nMerge PR 122", ["Merge PR 121", "Merge PR 122"]),
++        ("Run test_a.py\nRun test_b.py", ["Run test_a.py", "Run test_b.py"]),
+     ],
+ )
+-def test_clean_suggestion(raw: str, expected: str | None) -> None:
+-    assert suggest.clean_suggestion(raw) == expected
++def test_clean_suggestions(raw: str, expected: list[str]) -> None:
++    assert suggest.clean_suggestions(raw) == expected
+ 
+ 
+-def test_clean_suggestion_cuts_long_lines_at_a_word() -> None:
+-    cleaned = suggest.clean_suggestion("word " * 60)
+-    assert cleaned is not None
++def test_clean_suggestions_cuts_long_lines_at_a_word() -> None:
++    (cleaned,) = suggest.clean_suggestions("word " * 60)
+     assert len(cleaned) <= suggest.MAX_SUGGESTION_CHARS
+     assert cleaned.endswith("word")
+ 
+@@ -252,7 +262,7 @@ async def test_side_call_runs_the_fake_claude_isolated(
+     log = _fake_claude(on_path, "print('Run the tests again')")
+     monkeypatch.setenv("OMNIGENT_TOKEN", "secret")
+     result = await suggest.run_side_call("the prompt")
+-    assert result == "Run the tests again"
++    assert result == ["Run the tests again"]
+     (call,) = _calls(log)
+     assert call["argv"][:3] == ["-p", "--model", "haiku"]
+     assert "--no-session-persistence" in call["argv"]
+@@ -267,16 +277,16 @@ async def test_side_call_runs_the_fake_claude_isolated(
+ @pytest.mark.asyncio
+ async def test_side_call_none_and_failure_read_as_no_suggestion(on_path: Path) -> None:
+     _fake_claude(on_path, "print('NONE')")
+-    assert await suggest.run_side_call("p") is None
++    assert await suggest.run_side_call("p") == []
+     _fake_claude(on_path, "print('boom'); sys.exit(3)")
+-    assert await suggest.run_side_call("p") is None
++    assert await suggest.run_side_call("p") == []
+ 
+ 
+ @pytest.mark.asyncio
+ async def test_side_call_times_out_and_is_killed(on_path: Path) -> None:
+     log = _fake_claude(on_path, "time.sleep(30); print('late')")
+     started = time.monotonic()
+-    assert await suggest.run_side_call("p", timeout_s=1.0) is None
++    assert await suggest.run_side_call("p", timeout_s=1.0) == []
+     assert time.monotonic() - started < 10
+     (call,) = _calls(log)
+     with pytest.raises(ProcessLookupError):
+@@ -294,7 +304,7 @@ async def test_timeout_kills_the_whole_process_group(on_path: Path) -> None:
+         f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+         "time.sleep(30)",
+     )
+-    assert await suggest.run_side_call("p", timeout_s=1.5) is None
++    assert await suggest.run_side_call("p", timeout_s=1.5) == []
+     grandchild = int(pid_file.read_text())
+     for _ in range(50):
+         try:
+@@ -327,7 +337,7 @@ async def test_the_call_writes_claude_json_only_in_its_private_dir(
+         "open(target, 'w').write('{\"numStartups\": 2}')\n"
+         "print('ok')",
+     )
+-    assert await suggest.run_side_call("p") == "ok"
++    assert await suggest.run_side_call("p") == ["ok"]
+     assert (home / ".claude.json").read_text() == "{}"
+     assert _calls(log)[0]["env"]["CLAUDE_CONFIG_DIR"] != str(home / ".claude")
+ 
+@@ -378,7 +388,7 @@ async def test_no_login_means_no_call(on_path: Path, monkeypatch: pytest.MonkeyP
+     log = _fake_claude(on_path, "print('x')")
+     monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
+     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(on_path / "nowhere"))
+-    assert await suggest.run_side_call("p") is None
++    assert await suggest.run_side_call("p") == []
+     assert _calls(log) == []
+     assert _leftover_dirs(on_path) == []
+ 
+@@ -462,7 +472,10 @@ async def test_finished_turn_posts_one_transient_suggestion(on_path: Path, tmp_p
+     server = _Server()
+     await _schedule(server, _finished_turn(tmp_path), suggest.SuggestionState())
+     assert server.posts == [
+-        {"type": "external_session_suggestion", "data": {"suggestion": "Open a draft PR"}}
++        {
++            "type": "external_session_suggestion",
++            "data": {"suggestion": "Open a draft PR", "suggestions": ["Open a draft PR"]},
++        }
+     ]
+     assert len(_calls(log)) == 1
+     assert "fix the failing test" in _calls(log)[0]["stdin"]
+@@ -552,7 +565,10 @@ async def test_a_newer_turn_cancels_the_older_call(on_path: Path, tmp_path: Path
+         with pytest.raises(asyncio.CancelledError):
+             await older
+     assert server.posts == [
+-        {"type": "external_session_suggestion", "data": {"suggestion": "second answer"}}
++        {
++            "type": "external_session_suggestion",
++            "data": {"suggestion": "second answer", "suggestions": ["second answer"]},
++        }
+     ]
+     first_call = _calls(log)[0]
+     with pytest.raises(ProcessLookupError):
+@@ -679,7 +695,10 @@ async def test_the_hook_reply_reaches_the_side_call(on_path: Path, tmp_path: Pat
+         server, half, suggest.SuggestionState(), last_assistant_message="Deployed to staging."
+     )
+     assert server.posts == [
+-        {"type": "external_session_suggestion", "data": {"suggestion": "Ship it"}}
++        {
++            "type": "external_session_suggestion",
++            "data": {"suggestion": "Ship it", "suggestions": ["Ship it"]},
++        }
+     ]
+     assert "Deployed to staging." in _calls(log)[0]["stdin"]
+ 
+@@ -707,7 +726,7 @@ async def test_a_typed_prompt_clears_a_shown_suggestion(on_path: Path, tmp_path:
+         await suggest.clear_prompt_suggestion(client, state=state)
+         await suggest.clear_prompt_suggestion(client, state=state)  # nothing shown: no post
+     assert server.posts[1:] == [
+-        {"type": "external_session_suggestion", "data": {"suggestion": None}}
++        {"type": "external_session_suggestion", "data": {"suggestion": None, "suggestions": None}}
+     ]
+ 
+ 
+@@ -720,11 +739,11 @@ async def test_a_cancel_mid_post_still_gets_its_clear(
+     posting = asyncio.Event()
+     real_post = core.post_suggestion
+ 
+-    async def slow_post(client: httpx.AsyncClient, *, session_id: str, suggestion: Any) -> None:
+-        if suggestion is not None:
++    async def slow_post(client: httpx.AsyncClient, *, session_id: str, suggestions: Any) -> None:
++        if suggestions is not None:
+             posting.set()
+             await asyncio.sleep(60)
+-        await real_post(client, session_id=session_id, suggestion=suggestion)
++        await real_post(client, session_id=session_id, suggestions=suggestions)
+ 
+     monkeypatch.setattr(core, "post_suggestion", slow_post)
+     server = _Server()
+@@ -743,7 +762,9 @@ async def test_a_cancel_mid_post_still_gets_its_clear(
+         await suggest.clear_prompt_suggestion(client, state=state)
+         with pytest.raises(asyncio.CancelledError):
+             await task
+-    assert server.posts == [{"type": "external_session_suggestion", "data": {"suggestion": None}}]
++    assert server.posts == [
++        {"type": "external_session_suggestion", "data": {"suggestion": None, "suggestions": None}}
++    ]
+ 
+ 
+ @pytest.mark.asyncio
+@@ -919,7 +940,10 @@ async def test_a_named_account_session_calls_on_that_account_via_env_only(
+     assert call["config_files"] == []  # no login file copied into the private dir
+     assert "OMNIGENT_CLAUDE_ACCOUNT" not in call["env"]
+     assert server.posts == [
+-        {"type": "external_session_suggestion", "data": {"suggestion": "Open a draft PR"}}
++        {
++            "type": "external_session_suggestion",
++            "data": {"suggestion": "Open a draft PR", "suggestions": ["Open a draft PR"]},
++        }
+     ]
+     assert _ACCOUNT_TOKEN not in caplog.text
+     assert _leftover_dirs(on_path) == []
+diff --git a/tests/server/integration/test_ae_session_suggestion.py b/tests/server/integration/test_ae_session_suggestion.py
+index 56f11f424c4c2ccbb0f73432f9935e801fc4904a..0eb0aa6ad0de03823683d2679d5bfc8e9edcee9b 100644
+--- a/tests/server/integration/test_ae_session_suggestion.py
++++ b/tests/server/integration/test_ae_session_suggestion.py
+@@ -30,10 +30,14 @@ async def _session_with_capture(
+ async def test_suggestion_is_published_as_a_transient_session_suggestion(
+     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+-    """The predicted prompt reaches the stream as ``session.suggestion`` and nothing persists."""
++    """The ranked prompts reach the stream as ``session.suggestion`` and nothing persists."""
+     session_id, published = await _session_with_capture(client, monkeypatch)
+ 
+-    for data in ({"suggestion": "  Open a draft PR "}, {"suggestion": None}):
++    for data in (
++        {"suggestion": "  Open a draft PR ", "suggestions": ["  Open a draft PR ", "Ship it"]},
++        {"suggestion": "Run the tests"},
++        {"suggestion": None, "suggestions": None},
++    ):
+         resp = await client.post(
+             f"/v1/sessions/{session_id}/events",
+             json={"type": "external_session_suggestion", "data": data},
+@@ -49,6 +53,17 @@ async def test_suggestion_is_published_as_a_transient_session_suggestion(
+                 "sequence_number": None,
+                 "conversation_id": session_id,
+                 "suggestion": "Open a draft PR",
++                "suggestions": ["Open a draft PR", "Ship it"],
++            },
++        ),
++        (
++            session_id,
++            {
++                "type": "session.suggestion",
++                "sequence_number": None,
++                "conversation_id": session_id,
++                "suggestion": "Run the tests",
++                "suggestions": ["Run the tests"],
+             },
+         ),
+         (
+@@ -58,6 +73,7 @@ async def test_suggestion_is_published_as_a_transient_session_suggestion(
+                 "sequence_number": None,
+                 "conversation_id": session_id,
+                 "suggestion": None,
++                "suggestions": None,
+             },
+         ),
+     ]
+@@ -74,12 +90,17 @@ async def test_suggestion_is_published_as_a_transient_session_suggestion(
+         {"suggestion": 7},
+         {"suggestion": "x" * 121},
+         {"suggestion": "two\nlines"},
++        {"suggestions": []},
++        {"suggestions": "Open a PR"},
++        {"suggestions": ["a", "b", "c", "d"]},
++        {"suggestions": ["Open a PR", "x" * 121]},
++        {"suggestions": ["Open a PR", "  "]},
+     ],
+ )
+ async def test_suggestion_rejects_bad_shapes(
+     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]
+ ) -> None:
+-    """An empty, mistyped, overlong or multi-line suggestion is a 400 and publishes nothing."""
++    """A bad guess (empty, mistyped, overlong, two lines) or list is a 400; nothing publishes."""
+     session_id, published = await _session_with_capture(client, monkeypatch)
+ 
+     resp = await client.post(
+diff --git a/web/src/components/composer/AeSuggestionGhost.tsx b/web/src/components/composer/AeSuggestionGhost.tsx
+index f256acd3607cc1885c8eef4ec5d8fdf72b6329e8..0413e02df8f25bfa0e2411c73b77aa1b7f755f94 100644
+--- a/web/src/components/composer/AeSuggestionGhost.tsx
++++ b/web/src/components/composer/AeSuggestionGhost.tsx
+@@ -1,26 +1,68 @@
+ // The predicted next prompt drawn as grey ghost text over the empty composer,
+-// with a "Tab to use" chip ("Tap to use" on narrow screens). The text lets
+-// taps through to the box; only the chip fills it in. Nothing is sent here.
++// with a "Tab to use" chip ("Tap to use" on narrow screens). With more than one
++// guess the chip adds a "1/3" counter that steps to the next one, as the cycle
++// keys do. The text wraps, and the textarea grows to fit it; it lets taps
++// through to the box, and only the chip fills it in. Nothing is sent here.
+ 
+-import { useRef, type MouseEvent } from "react";
++import { useLayoutEffect, useRef, type MouseEvent } from "react";
+ import { cn } from "@/lib/utils";
+ import { useAeSuggestionHint } from "@/lib/aeSuggestion";
++import { aeChordLabel, useAeSuggestionKeys } from "@/lib/aeSuggestionKeys";
+ 
+ export function AeSuggestionGhost({
+   text,
++  index = 0,
++  count = 1,
++  onCycle,
+   onAccept,
+ }: {
+   text: string;
++  /** Which guess `text` is (0-based) out of `count`. */
++  index?: number;
++  count?: number;
++  onCycle?: (step: 1 | -1) => void;
+   /** Fill `text` into this textarea (the composer's own, found beside the ghost). */
+   onAccept: (textarea: HTMLTextAreaElement) => void;
+ }) {
+   const hint = useAeSuggestionHint();
++  const keys = useAeSuggestionKeys();
+   const rootRef = useRef<HTMLDivElement>(null);
++  const textRef = useRef<HTMLSpanElement>(null);
++  const textarea = () => rootRef.current?.parentElement?.querySelector("textarea") ?? null;
+   const accept = (event: MouseEvent) => {
+     event.preventDefault();
+-    const textarea = rootRef.current?.parentElement?.querySelector("textarea");
+-    if (textarea) onAccept(textarea);
++    const el = textarea();
++    if (el) onAccept(el);
+   };
++  const cycle = (event: MouseEvent) => {
++    event.preventDefault();
++    onCycle?.(1);
++  };
++
++  // The ghost floats over the empty textarea, so hold the textarea at least as
++  // tall as the wrapped text; the hold goes when the ghost does.
++  useLayoutEffect(() => {
++    const el = textarea();
++    const span = textRef.current;
++    if (!el || !span) return;
++    // The textarea's own floor (a class), read before the inline hold hides it.
++    const floor = parseFloat(getComputedStyle(el).minHeight) || 0;
++    const fit = () => {
++      const bottom = span.getBoundingClientRect().bottom - el.getBoundingClientRect().top;
++      const padding = parseFloat(getComputedStyle(el).paddingBottom) || 0;
++      el.style.minHeight = `${Math.max(floor, Math.ceil(bottom + padding))}px`;
++    };
++    fit();
++    const observer = typeof ResizeObserver === "undefined" ? null : new ResizeObserver(fit);
++    observer?.observe(span);
++    return () => {
++      observer?.disconnect();
++      el.style.minHeight = "";
++    };
++  }, []);
++
++  const many = count > 1 && onCycle;
++  const counter = `${index + 1}/${count}`;
+   return (
+     // The row and the grey text let clicks through, so a tap anywhere but the
+     // chip focuses the textarea; the chip keeps its own space at the end.
+@@ -30,26 +72,45 @@ export function AeSuggestionGhost({
+       className="pointer-events-none absolute inset-x-3 top-3 flex items-start gap-2"
+     >
+       <span
++        ref={textRef}
+         aria-hidden
+         data-testid="ae-suggestion-text"
+-        className="composer-input-text min-w-0 truncate text-ui text-foreground/40"
++        className="composer-input-text min-w-0 flex-1 whitespace-normal break-words text-ui text-foreground/40"
+       >
+         {text}
+       </span>
+-      <button
+-        type="button"
+-        tabIndex={-1}
+-        data-testid="ae-suggestion-hint"
+-        aria-label={`${hint}: ${text}`}
+-        onMouseDown={(event) => event.preventDefault()}
+-        onClick={accept}
++      <span
+         className={cn(
+-          "pointer-events-auto ml-auto shrink-0 rounded-md border border-current px-1.5 text-[11px] leading-[18px]",
++          "pointer-events-auto ml-auto flex shrink-0 items-stretch rounded-md border border-current text-[11px] leading-[18px]",
+           "text-muted-foreground opacity-70 hover:opacity-100",
+         )}
+       >
+-        {hint}
+-      </button>
++        <button
++          type="button"
++          tabIndex={-1}
++          data-testid="ae-suggestion-hint"
++          aria-label={`${hint}: ${text}`}
++          onMouseDown={(event) => event.preventDefault()}
++          onClick={accept}
++          className="px-1.5"
++        >
++          {hint}
++        </button>
++        {many && (
++          <button
++            type="button"
++            tabIndex={-1}
++            data-testid="ae-suggestion-next"
++            aria-label={`Suggestion ${counter}, show the next one`}
++            title={`Next suggestion (${aeChordLabel(keys.next)}), previous (${aeChordLabel(keys.previous)})`}
++            onMouseDown={(event) => event.preventDefault()}
++            onClick={cycle}
++            className="border-l border-current px-1.5 tabular-nums"
++          >
++            {counter} ›
++          </button>
++        )}
++      </span>
+     </div>
+   );
+ }
+diff --git a/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx b/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx
+index 54ff6bb8d35ab6ea1a23aec8543ca1e08518abe9..4a9d7fc532256a1bf7580291e3b18c7e79262fb9 100644
+--- a/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx
++++ b/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx
+@@ -1,9 +1,12 @@
+ import { useState } from "react";
+ import { fireEvent, render, screen } from "@testing-library/react";
+ import { afterEach, describe, expect, it, vi } from "vitest";
++import { AE_SUGGESTION_KEYS_STORAGE_KEY, writeAeSuggestionKey } from "@/lib/aeSuggestionKeys";
+ import { ChatComposer } from "./ChatComposer";
+ 
+-function renderComposer(suggestion: string | null, initial = "") {
++function renderComposer(suggestion: string | readonly string[] | null, initial = "") {
++  // One list for the whole render, as the store holds it.
++  const suggestions = typeof suggestion === "string" ? [suggestion] : suggestion;
+   const onKeyDown = vi.fn();
+   const onSubmit = vi.fn();
+   function Editor() {
+@@ -12,7 +15,7 @@ function renderComposer(suggestion: string | null, initial = "") {
+       <form onSubmit={onSubmit}>
+         <ChatComposer
+           keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+-          aeSuggestion={suggestion}
++          aeSuggestion={suggestions}
+           input={{
+             "aria-label": "Draft",
+             placeholder: "Send a message…",
+@@ -47,6 +50,8 @@ function mockWidth(narrow: boolean) {
+ 
+ afterEach(() => {
+   vi.unstubAllGlobals();
++  writeAeSuggestionKey("next", null);
++  writeAeSuggestionKey("previous", null);
+ });
+ 
+ describe("ChatComposer prompt suggestion", () => {
+@@ -126,13 +131,13 @@ describe("ChatComposer prompt suggestion", () => {
+     const onKeyDown = vi.fn();
+     function Editor() {
+       const [value, setValue] = useState("");
+-      const [suggestion, setSuggestion] = useState<string | null>("Open a draft PR");
++      const [suggestion, setSuggestion] = useState<string[] | null>(["Open a draft PR"]);
+       return (
+         <>
+           <button type="button" onClick={() => setSuggestion(null)}>
+             turn starts
+           </button>
+-          <button type="button" onClick={() => setSuggestion("Open a draft PR")}>
++          <button type="button" onClick={() => setSuggestion(["Open a draft PR"])}>
+             turn ends
+           </button>
+           <ChatComposer
+@@ -165,6 +170,73 @@ describe("ChatComposer prompt suggestion", () => {
+     expect(input).toHaveValue("Open a draft PR");
+   });
+ 
++  it("shows no counter for a single guess, and Alt+] then types as usual", () => {
++    const { input, onKeyDown } = renderComposer("Open a draft PR");
++    expect(screen.queryByTestId("ae-suggestion-next")).toBeNull();
++    expect(fireEvent.keyDown(input, { key: "]", code: "BracketRight", altKey: true })).toBe(true);
++    expect(onKeyDown).toHaveBeenCalledTimes(1);
++  });
++
++  it("Alt+] and Alt+[ step through the guesses, wrapping, and Tab takes the one shown", () => {
++    const { input, onKeyDown } = renderComposer(["Open a PR", "Run the tests", "Ship it"]);
++    const text = () => screen.getByTestId("ae-suggestion-text");
++    const counter = () => screen.getByTestId("ae-suggestion-next");
++    expect(text()).toHaveTextContent("Open a PR");
++    expect(counter()).toHaveTextContent("1/3");
++    // On a Mac, Option+] reports "‘" as the key; the physical key is what counts.
++    expect(fireEvent.keyDown(input, { key: "‘", code: "BracketRight", altKey: true })).toBe(false);
++    expect(text()).toHaveTextContent("Run the tests");
++    expect(counter()).toHaveTextContent("2/3");
++    fireEvent.keyDown(input, { key: "[", code: "BracketLeft", altKey: true });
++    fireEvent.keyDown(input, { key: "[", code: "BracketLeft", altKey: true });
++    expect(text()).toHaveTextContent("Ship it");
++    expect(onKeyDown).not.toHaveBeenCalled();
++    // The step is the composer's alone: a window hotkey on the same keys never sees it.
++    const appHotkey = vi.fn();
++    window.addEventListener("keydown", appHotkey);
++    fireEvent.keyDown(input, { key: "]", code: "BracketRight", altKey: true });
++    window.removeEventListener("keydown", appHotkey);
++    expect(appHotkey).not.toHaveBeenCalled();
++    expect(text()).toHaveTextContent("Open a PR");
++    fireEvent.keyDown(input, { key: "[", code: "BracketLeft", altKey: true });
++    fireEvent.keyDown(input, { key: "Tab" });
++    expect(input).toHaveValue("Ship it");
++  });
++
++  it("a tap on the counter shows the next guess without filling the box", () => {
++    const { input } = renderComposer(["Open a PR", "Run the tests"]);
++    fireEvent.click(screen.getByTestId("ae-suggestion-next"));
++    expect(screen.getByTestId("ae-suggestion-text")).toHaveTextContent("Run the tests");
++    expect(screen.getByTestId("ae-suggestion-next")).toHaveTextContent("2/2");
++    expect(input).toHaveValue("");
++    fireEvent.click(screen.getByTestId("ae-suggestion-hint"));
++    expect(input).toHaveValue("Run the tests");
++  });
++
++  it("uses the keys saved in Settings instead of the defaults", () => {
++    writeAeSuggestionKey("next", {
++      code: "KeyJ",
++      alt: false,
++      ctrl: true,
++      meta: false,
++      shift: false,
++    });
++    expect(window.localStorage.getItem(AE_SUGGESTION_KEYS_STORAGE_KEY)).toContain("KeyJ");
++    const { input, onKeyDown } = renderComposer(["Open a PR", "Run the tests"]);
++    fireEvent.keyDown(input, { key: "]", code: "BracketRight", altKey: true });
++    expect(screen.getByTestId("ae-suggestion-text")).toHaveTextContent("Open a PR");
++    expect(onKeyDown).toHaveBeenCalledTimes(1);
++    fireEvent.keyDown(input, { key: "j", code: "KeyJ", ctrlKey: true });
++    expect(screen.getByTestId("ae-suggestion-text")).toHaveTextContent("Run the tests");
++  });
++
++  it("wraps a long guess instead of cutting it off", () => {
++    renderComposer("word ".repeat(24).trim());
++    const text = screen.getByTestId("ae-suggestion-text");
++    expect(text).not.toHaveClass("truncate");
++    expect(text).toHaveClass("whitespace-normal");
++  });
++
+   it("says Tap to use below 640 px wide", () => {
+     mockWidth(true);
+     renderComposer("Open a draft PR");
+diff --git a/web/src/components/composer/ChatComposer.tsx b/web/src/components/composer/ChatComposer.tsx
+index 4adaec9ad65ede7da475103e33e07acf535baaef..eb3d5f42bcdd314f6a927f832f793b35ce2901a8 100644
+--- a/web/src/components/composer/ChatComposer.tsx
++++ b/web/src/components/composer/ChatComposer.tsx
+@@ -19,7 +19,12 @@ import {
+   isComposerSteerAllKey,
+ } from "@/lib/composerSendShortcutPreferences";
+ import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
+-import { aeIsSuggestionAcceptKey, aeShownSuggestion } from "@/lib/aeSuggestion";
++import {
++  aeIsSuggestionAcceptKey,
++  aeShownSuggestion,
++  useAeSuggestionCycle,
++} from "@/lib/aeSuggestion";
++import { aeSuggestionCycleStep } from "@/lib/aeSuggestionKeys";
+ import { AeSuggestionGhost } from "./AeSuggestionGhost";
+ 
+ export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
+@@ -95,18 +100,21 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
+     leadingTestId?: string;
+     trailingTestId?: string;
+   };
+-  /** A predicted next prompt, drawn as ghost text while the box is empty. */
+-  aeSuggestion?: string | null;
++  /** The predicted next prompts, best first, drawn as ghost text while the box is empty. */
++  aeSuggestion?: readonly string[] | null;
+ }
+ 
+ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
+   { className, input, keyboard, slots, actions, aeSuggestion, ...props },
+   ref,
+ ) {
+-  // Esc hides the suggestion until the next one (a new turn clears the old first).
+-  const [aeDismissed, setAeDismissed] = useState<string | null>(null);
++  // Esc hides the suggestions until the next ones (a new turn clears the old first).
++  const [aeDismissed, setAeDismissed] = useState<readonly string[] | null>(null);
+   if (aeDismissed !== null && aeDismissed !== aeSuggestion) setAeDismissed(null);
+-  const aeGhost = aeDismissed ? null : aeShownSuggestion(aeSuggestion, input.value);
++  const aeCycle = useAeSuggestionCycle(
++    aeDismissed ? null : aeShownSuggestion(aeSuggestion, input.value),
++  );
++  const aeGhost = aeCycle.text;
+   const actionRowRef = useRef<HTMLDivElement>(null);
+   const actionWidthRef = useRef<HTMLDivElement>(null);
+   const leadingRef = useRef<HTMLDivElement>(null);
+@@ -132,10 +140,17 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
+           input={input}
+           keyboard={keyboard}
+           aeSuggestion={aeGhost}
+-          onAeDismiss={() => setAeDismissed(aeGhost)}
++          onAeDismiss={() => setAeDismissed(aeSuggestion ?? null)}
++          onAeCycle={aeCycle.count > 1 ? aeCycle.cycle : undefined}
+         />
+         {aeGhost && (
+-          <AeSuggestionGhost text={aeGhost} onAccept={(el) => aeFillSuggestion(el, aeGhost)} />
++          <AeSuggestionGhost
++            text={aeGhost}
++            index={aeCycle.index}
++            count={aeCycle.count}
++            onCycle={aeCycle.cycle}
++            onAccept={(el) => aeFillSuggestion(el, aeGhost)}
++          />
+         )}
+         {slots?.inputHint}
+       </ComposerInputArea>
+@@ -281,14 +296,19 @@ export function ComposerTextInput({
+   keyboard,
+   aeSuggestion,
+   onAeDismiss,
+-}: Pick<ChatComposerProps, "input" | "keyboard" | "aeSuggestion"> & { onAeDismiss?: () => void }) {
++  onAeCycle,
++}: Pick<ChatComposerProps, "input" | "keyboard"> & {
++  aeSuggestion?: string | null;
++  onAeDismiss?: () => void;
++  onAeCycle?: (step: 1 | -1) => void;
++}) {
+   return (
+     <ComposerTextarea
+       {...input}
+       placeholder={aeSuggestion ? "" : input.placeholder}
+       onKeyDown={(event) => {
+-        // Tab takes a shown suggestion and Esc hides it; with none shown, or
+-        // mid-composition, both keys are untouched.
++        // Tab takes a shown suggestion, Esc hides it and the cycle keys step
++        // through the others; with none shown, or mid-composition, all are untouched.
+         if (aeSuggestion && !event.nativeEvent.isComposing) {
+           if (aeIsSuggestionAcceptKey(event)) {
+             event.preventDefault();
+@@ -300,6 +320,14 @@ export function ComposerTextInput({
+             onAeDismiss();
+             return;
+           }
++          const step = onAeCycle ? aeSuggestionCycleStep(event) : 0;
++          if (step) {
++            // Ours alone: no app hotkey on the same keys fires as well.
++            event.preventDefault();
++            event.stopPropagation();
++            onAeCycle?.(step);
++            return;
++          }
+         }
+         // A newline in every mode and on touch devices; completion menus never see it.
+         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+diff --git a/web/src/lib/aeStreamObserver.ts b/web/src/lib/aeStreamObserver.ts
+index 56bf6b71d3c3da1663f1e9c5ab6509d4993104e4..06d58d0d5ca5c7e9425f912e5462f69949e896a1 100644
+--- a/web/src/lib/aeStreamObserver.ts
++++ b/web/src/lib/aeStreamObserver.ts
+@@ -4,12 +4,12 @@
+ import { aeStampLastEvent } from "@/lib/aeSessionActivity";
+ import { aeIsContentEvent, aeNextProgress, type AeSessionProgress } from "@/lib/aeSessionProgress";
+ import type { StreamEvent } from "@/lib/events";
+-import { aeNextSuggestion } from "@/lib/aeSuggestion";
++import { aeNextSuggestion, aeSameSuggestions, type AeSuggestions } from "@/lib/aeSuggestion";
+ import { aeNoteCompactionFailed, aeNoteCompactionTotals } from "@/lib/aeTokenDefrag";
+ 
+ export interface AeObservedState {
+   aeProgress: AeSessionProgress | null;
+-  aeSuggestion?: string | null;
++  aeSuggestion?: AeSuggestions | null;
+   sessionStatus: string;
+   tokensUsed?: number | null;
+ }
+@@ -25,7 +25,7 @@ export function aeObserveStreamEvent(
+   write: (patch: {
+     lastEventAt?: number;
+     aeProgress?: AeSessionProgress | null;
+-    aeSuggestion?: string | null;
++    aeSuggestion?: AeSuggestions | null;
+   }) => void,
+   read: () => AeObservedState | null,
+ ): void {
+@@ -42,7 +42,7 @@ export function aeObserveStreamEvent(
+     state?.sessionStatus !== "running";
+   if (aeIsContentEvent(event) || startsRunning) aeStampLastEvent(conversationId, write);
+   const suggestion = aeNextSuggestion(event, conversationId, state?.sessionStatus);
+-  if (suggestion !== undefined && suggestion !== (state?.aeSuggestion ?? null)) {
++  if (suggestion !== undefined && !aeSameSuggestions(suggestion, state?.aeSuggestion)) {
+     write({ aeSuggestion: suggestion });
+   }
+   const next = aeNextProgress(event, conversationId);
+diff --git a/web/src/lib/aeSuggestion.test.ts b/web/src/lib/aeSuggestion.test.ts
+index a8158920a9faa59a3f827e9de6b2313ec8bda986..acc3f691f0a93fb5d2e6414e7dce2a2ee86739a0 100644
+--- a/web/src/lib/aeSuggestion.test.ts
++++ b/web/src/lib/aeSuggestion.test.ts
+@@ -5,36 +5,72 @@ import {
+   aeIsSuggestionAcceptKey,
+   aeNextSuggestion,
+   aeParseSessionSuggestion,
++  aeSameSuggestions,
+   aeShownSuggestion,
+ } from "./aeSuggestion";
+ 
+ const KEY = { shiftKey: false, altKey: false, ctrlKey: false, metaKey: false };
+ 
+ function suggestion(text: string | null, conversationId = "conv_a"): StreamEvent {
+-  return { type: "session_suggestion", conversationId, suggestion: text };
++  return { type: "session_suggestion", conversationId, suggestions: text === null ? null : [text] };
+ }
+ 
+ describe("aeParseSessionSuggestion", () => {
+-  it("reads a suggestion, a clear, and collapses whitespace", () => {
++  it("reads a ranked list, a clear, and collapses whitespace", () => {
+     expect(
+-      aeParseSessionSuggestion({ conversation_id: "c", suggestion: " Run\nthe  tests " }),
+-    ).toEqual({ type: "session_suggestion", conversationId: "c", suggestion: "Run the tests" });
+-    expect(aeParseSessionSuggestion({ conversation_id: "c", suggestion: null })).toEqual({
++      aeParseSessionSuggestion({
++        conversation_id: "c",
++        suggestion: "Run the tests",
++        suggestions: [" Run\nthe  tests ", "Open a PR"],
++      }),
++    ).toEqual({
+       type: "session_suggestion",
+       conversationId: "c",
+-      suggestion: null,
++      suggestions: ["Run the tests", "Open a PR"],
+     });
++    expect(
++      aeParseSessionSuggestion({ conversation_id: "c", suggestion: null, suggestions: null }),
++    ).toEqual({ type: "session_suggestion", conversationId: "c", suggestions: null });
++  });
++
++  it("reads a lone suggestion from a server that predates the list", () => {
++    expect(aeParseSessionSuggestion({ conversation_id: "c", suggestion: "Ship it" })).toEqual({
++      type: "session_suggestion",
++      conversationId: "c",
++      suggestions: ["Ship it"],
++    });
++  });
++
++  it("keeps at most three and drops blank guesses", () => {
++    expect(
++      aeParseSessionSuggestion({ conversation_id: "c", suggestions: ["a", " ", "b", "c", "d"] })
++        ?.suggestions,
++    ).toEqual(["a", "b", "c"]);
++    expect(
++      aeParseSessionSuggestion({ conversation_id: "c", suggestions: ["  "] })?.suggestions,
++    ).toBeNull();
+   });
+ 
+-  it("rejects a payload without a conversation or with a non-string suggestion", () => {
++  it("rejects a payload without a conversation or with a non-string guess", () => {
+     expect(aeParseSessionSuggestion({ suggestion: "x" })).toBeNull();
+     expect(aeParseSessionSuggestion({ conversation_id: "c", suggestion: 7 })).toBeNull();
++    expect(aeParseSessionSuggestion({ conversation_id: "c", suggestions: ["a", 7] })).toBeNull();
++    expect(aeParseSessionSuggestion({ conversation_id: "c", suggestions: "a" })).toBeNull();
++  });
++});
++
++describe("aeSameSuggestions", () => {
++  it("compares by content", () => {
++    expect(aeSameSuggestions(["a", "b"], ["a", "b"])).toBe(true);
++    expect(aeSameSuggestions(["a", "b"], ["b", "a"])).toBe(false);
++    expect(aeSameSuggestions(null, undefined)).toBe(true);
++    expect(aeSameSuggestions(["a"], null)).toBe(false);
+   });
+ });
+ 
+ describe("aeNextSuggestion", () => {
+   it("keeps this conversation's suggestion while idle and ignores another's", () => {
+-    expect(aeNextSuggestion(suggestion("Open a PR"), "conv_a", "idle")).toBe("Open a PR");
++    expect(aeNextSuggestion(suggestion("Open a PR"), "conv_a", "idle")).toEqual(["Open a PR"]);
+     expect(aeNextSuggestion(suggestion("Open a PR", "conv_b"), "conv_a", "idle")).toBeUndefined();
+   });
+ 
+@@ -63,15 +99,18 @@ describe("aeNextSuggestion", () => {
+ 
+ describe("composer visibility", () => {
+   it("shows only when idle and the box accepts input", () => {
+-    expect(aeComposerSuggestion("Go", { busy: false, blocked: false })).toBe("Go");
+-    expect(aeComposerSuggestion("Go", { busy: true, blocked: false })).toBeNull();
+-    expect(aeComposerSuggestion("Go", { busy: false, blocked: true })).toBeNull();
++    const go = ["Go", "Stop"];
++    expect(aeComposerSuggestion(go, { busy: false, blocked: false })).toBe(go);
++    expect(aeComposerSuggestion(go, { busy: true, blocked: false })).toBeNull();
++    expect(aeComposerSuggestion(go, { busy: false, blocked: true })).toBeNull();
+   });
+ 
+   it("draws the ghost only over an empty box", () => {
+-    expect(aeShownSuggestion("Go", "")).toBe("Go");
+-    expect(aeShownSuggestion("Go", "h")).toBeNull();
++    const go = ["Go"];
++    expect(aeShownSuggestion(go, "")).toBe(go);
++    expect(aeShownSuggestion(go, "h")).toBeNull();
+     expect(aeShownSuggestion(null, "")).toBeNull();
++    expect(aeShownSuggestion([], "")).toBeNull();
+   });
+ 
+   it("takes plain Tab only", () => {
+diff --git a/web/src/lib/aeSuggestion.ts b/web/src/lib/aeSuggestion.ts
+index 9e5fef39773ab87bf0196a6ab5c73fc6e48fea3a..3f99d284e16d33feaaf9431e80d6c690d36c1db8 100644
+--- a/web/src/lib/aeSuggestion.ts
++++ b/web/src/lib/aeSuggestion.ts
+@@ -1,15 +1,25 @@
+-// A predicted next prompt, relayed as `session.suggestion` after a finished
+-// Claude turn (the forwarder's `ae_prompt_suggest` side call), and the rules
+-// for when the composer shows it as ghost text.
++// The predicted next prompts (up to three, best first), relayed as
++// `session.suggestion` after a finished turn (the forwarder's
++// `ae_prompt_suggest` side call), and the rules for when the composer shows
++// them as ghost text.
+ 
+-import { useSyncExternalStore } from "react";
++import { useState, useSyncExternalStore } from "react";
+ import type { StreamEvent } from "@/lib/events";
+ 
+-/** `session.suggestion`: transient, never persisted. `suggestion` is `null` to clear. */
++/** The ranked guesses a conversation holds, best first; never empty. */
++export type AeSuggestions = readonly string[];
++
++/** `session.suggestion`: transient, never persisted. `suggestions` is `null` to clear. */
+ export interface AeSessionSuggestionEvent {
+   type: "session_suggestion";
+   conversationId: string;
+-  suggestion: string | null;
++  suggestions: AeSuggestions | null;
++}
++
++const MAX_SUGGESTIONS = 3;
++
++function oneLine(raw: unknown): string {
++  return typeof raw === "string" ? raw.replace(/\s+/g, " ").trim() : "";
+ }
+ 
+ /** Parse a `session.suggestion` SSE payload, or `null` when it is malformed. */
+@@ -18,13 +28,25 @@ export function aeParseSessionSuggestion(
+ ): AeSessionSuggestionEvent | null {
+   const conversationId = data.conversation_id;
+   if (typeof conversationId !== "string" || !conversationId) return null;
+-  const raw = data.suggestion;
+-  if (raw === null || raw === undefined) {
+-    return { type: "session_suggestion", conversationId, suggestion: null };
+-  }
+-  if (typeof raw !== "string") return null;
+-  const suggestion = raw.replace(/\s+/g, " ").trim();
+-  return { type: "session_suggestion", conversationId, suggestion: suggestion || null };
++  // `suggestions` is the ranked list; a server from before it sends `suggestion` alone.
++  const raw = data.suggestions ?? (data.suggestion == null ? null : [data.suggestion]);
++  if (raw === null) return { type: "session_suggestion", conversationId, suggestions: null };
++  if (!Array.isArray(raw) || raw.some((s) => typeof s !== "string")) return null;
++  const suggestions = raw.map(oneLine).filter(Boolean).slice(0, MAX_SUGGESTIONS);
++  return {
++    type: "session_suggestion",
++    conversationId,
++    suggestions: suggestions.length ? suggestions : null,
++  };
++}
++
++/** Whether two held lists show the same guesses (the store skips a no-op write). */
++export function aeSameSuggestions(
++  a: AeSuggestions | null | undefined,
++  b: AeSuggestions | null | undefined,
++): boolean {
++  if (!a || !b) return (a ?? null) === (b ?? null);
++  return a.length === b.length && a.every((s, i) => s === b[i]);
+ }
+ 
+ // A new turn or a rotated session makes the last guess stale.
+@@ -34,19 +56,19 @@ const CLEARS_SUGGESTION_TYPES: ReadonlySet<StreamEvent["type"]> = new Set<Stream
+ ]);
+ 
+ /**
+- * The suggestion a conversation should hold after `event`: the relayed one,
+- * or `null` once a turn starts. A suggestion that arrives while a turn runs
+- * belongs to the turn before it and is dropped. `undefined` leaves it as is.
++ * The suggestions a conversation should hold after `event`: the relayed ones,
++ * or `null` once a turn starts. Suggestions that arrive while a turn runs
++ * belong to the turn before it and are dropped. `undefined` leaves them as is.
+  */
+ export function aeNextSuggestion(
+   event: StreamEvent,
+   conversationId: string,
+   sessionStatus: string | undefined,
+-): string | null | undefined {
++): AeSuggestions | null | undefined {
+   if (event.type === "session_suggestion") {
+     if (event.conversationId !== conversationId) return undefined;
+-    if (event.suggestion !== null && sessionStatus === "running") return undefined;
+-    return event.suggestion;
++    if (event.suggestions !== null && sessionStatus === "running") return undefined;
++    return event.suggestions;
+   }
+   if (event.type === "session_status") {
+     if (event.conversationId !== conversationId) return undefined;
+@@ -56,23 +78,46 @@ export function aeNextSuggestion(
+ }
+ 
+ /**
+- * What the composer may show: the suggestion only while no turn runs and the
+- * box accepts input; the composer itself also hides it once anything is typed.
++ * What the composer may show: the suggestions only while no turn runs and the
++ * box accepts input; the composer itself also hides them once anything is typed.
+  */
+ export function aeComposerSuggestion(
+-  suggestion: string | null,
++  suggestions: AeSuggestions | null,
+   { busy, blocked }: { busy: boolean; blocked: boolean },
+-): string | null {
+-  return busy || blocked ? null : suggestion;
++): AeSuggestions | null {
++  return busy || blocked ? null : suggestions;
+ }
+ 
+-/** The ghost text to draw over the textarea: only over an empty box. */
++/** The guesses to draw as ghost text over the textarea: only over an empty box. */
+ export function aeShownSuggestion(
+-  suggestion: string | null | undefined,
++  suggestions: AeSuggestions | null | undefined,
+   value: unknown,
+-): string | null {
+-  if (!suggestion) return null;
+-  return value === undefined || value === "" ? suggestion : null;
++): AeSuggestions | null {
++  if (!suggestions?.length) return null;
++  return value === undefined || value === "" ? suggestions : null;
++}
++
++/**
++ * The guess the ghost shows out of `list`, and a step to the next or previous
++ * one (wrapping). New guesses start at the top; clearing typed text brings
++ * back the same guesses at the same place.
++ */
++export function useAeSuggestionCycle(list: AeSuggestions | null): {
++  text: string | null;
++  index: number;
++  count: number;
++  cycle: (step: 1 | -1) => void;
++} {
++  const [pick, setPick] = useState<{ list: AeSuggestions | null; index: number }>({
++    list: null,
++    index: 0,
++  });
++  const count = list?.length ?? 0;
++  const index = pick.list === list && pick.index < count ? pick.index : 0;
++  const cycle = (step: 1 | -1) => {
++    if (count > 1) setPick({ list, index: (index + step + count) % count });
++  };
++  return { text: list?.[index] ?? null, index, count, cycle };
+ }
+ 
+ // Tailwind's `sm` line: below it there is no Tab key to offer.
+diff --git a/web/src/lib/aeSuggestionKeys.test.ts b/web/src/lib/aeSuggestionKeys.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5cfe498df137ee548f4d8eb84c505de162db858f
+--- /dev/null
++++ b/web/src/lib/aeSuggestionKeys.test.ts
+@@ -0,0 +1,101 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  AE_DEFAULT_SUGGESTION_KEYS,
++  AE_SUGGESTION_KEYS_STORAGE_KEY,
++  aeChordLabel,
++  aeChordProblem,
++  aeSuggestionCycleStep,
++  parseAeSuggestionKeys,
++  readAeSuggestionKeys,
++  writeAeSuggestionKey,
++  type AeKeyChord,
++} from "./aeSuggestionKeys";
++
++const chord = (code: string, mods: Partial<AeKeyChord> = {}): AeKeyChord => ({
++  code,
++  alt: false,
++  ctrl: false,
++  meta: false,
++  shift: false,
++  ...mods,
++});
++
++afterEach(() => {
++  vi.restoreAllMocks();
++  writeAeSuggestionKey("next", null);
++  writeAeSuggestionKey("previous", null);
++});
++
++describe("aeChordProblem", () => {
++  const keys = AE_DEFAULT_SUGGESTION_KEYS;
++
++  it("blocks the voice dictation combo on every platform", () => {
++    expect(aeChordProblem(chord("KeyV", { ctrl: true, alt: true }), "next", keys, false)).toMatch(
++      /Already used/,
++    );
++    expect(aeChordProblem(chord("KeyV", { meta: true, alt: true }), "next", keys, true)).toMatch(
++      /Already used/,
++    );
++  });
++
++  it("blocks the app's other hotkeys and paste", () => {
++    for (const taken of [
++      chord("KeyK", { ctrl: true }),
++      chord("KeyV", { ctrl: true }),
++      chord("Digit3", { ctrl: true, alt: true }),
++      chord("KeyM", { ctrl: true, shift: true }),
++      chord("BracketLeft", { ctrl: true, alt: true }),
++      chord("Enter", { alt: true }),
++    ]) {
++      expect(aeChordProblem(taken, "next", keys, false)).not.toBeNull();
++    }
++  });
++
++  it("allows free combos, including the platform's other modifier", () => {
++    expect(aeChordProblem(chord("KeyJ", { ctrl: true }), "next", keys, false)).toBeNull();
++    // Ctrl+K is not the command palette on a Mac (that is ⌘K).
++    expect(aeChordProblem(chord("Period", { alt: true }), "next", keys, true)).toBeNull();
++    expect(aeChordProblem(chord("KeyV", { ctrl: true, alt: true }), "next", keys, true)).toBeNull();
++  });
++});
++
++describe("saved keys", () => {
++  it("a reset that would collide puts the other action back too", () => {
++    writeAeSuggestionKey("next", chord("KeyJ", { ctrl: true }));
++    writeAeSuggestionKey("previous", chord("BracketRight", { alt: true }));
++    writeAeSuggestionKey("next", null);
++    expect(readAeSuggestionKeys()).toEqual(AE_DEFAULT_SUGGESTION_KEYS);
++    expect(
++      aeSuggestionCycleStep({
++        code: "BracketLeft",
++        altKey: true,
++        ctrlKey: false,
++        metaKey: false,
++        shiftKey: false,
++      }),
++    ).toBe(-1);
++  });
++
++  it("holds a change in memory when storage is blocked", () => {
++    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
++      throw new Error("blocked");
++    });
++    writeAeSuggestionKey("next", chord("KeyJ", { ctrl: true }));
++    expect(readAeSuggestionKeys().next.code).toBe("KeyJ");
++    window.dispatchEvent(new StorageEvent("storage", { key: AE_SUGGESTION_KEYS_STORAGE_KEY }));
++    expect(readAeSuggestionKeys().next.code).toBe("KeyJ");
++  });
++
++  it("falls back per action on a damaged value", () => {
++    expect(parseAeSuggestionKeys("{nope")).toEqual(AE_DEFAULT_SUGGESTION_KEYS);
++    expect(parseAeSuggestionKeys(JSON.stringify({ next: chord("KeyJ", { ctrl: true }) }))).toEqual({
++      next: chord("KeyJ", { ctrl: true }),
++      previous: AE_DEFAULT_SUGGESTION_KEYS.previous,
++    });
++  });
++
++  it("labels chords per platform", () => {
++    expect(aeChordLabel(AE_DEFAULT_SUGGESTION_KEYS.next, false)).toBe("Alt+]");
++    expect(aeChordLabel(AE_DEFAULT_SUGGESTION_KEYS.next, true)).toBe("⌥]");
++  });
++});
+diff --git a/web/src/lib/aeSuggestionKeys.ts b/web/src/lib/aeSuggestionKeys.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0f16f413fb70e4e986b83dc99563bb3aad5d9077
+--- /dev/null
++++ b/web/src/lib/aeSuggestionKeys.ts
+@@ -0,0 +1,284 @@
++// The keys that step through the composer's suggestion alternatives, set in
++// Settings > Chat and saved in this browser. Matched on the physical key
++// (`event.code`): ⌥ on a Mac turns "[" and "]" into quote characters.
++
++import { useSyncExternalStore } from "react";
++import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
++
++export interface AeKeyChord {
++  /** `KeyboardEvent.code`, e.g. `"BracketRight"`. */
++  code: string;
++  alt: boolean;
++  ctrl: boolean;
++  meta: boolean;
++  shift: boolean;
++}
++
++export type AeSuggestionKeyAction = "next" | "previous";
++
++export type AeSuggestionKeys = Record<AeSuggestionKeyAction, AeKeyChord>;
++
++export const AE_SUGGESTION_KEYS_STORAGE_KEY = "omnigent:ae-suggestion-keys";
++
++const altChord = (code: string): AeKeyChord => ({
++  code,
++  alt: true,
++  ctrl: false,
++  meta: false,
++  shift: false,
++});
++
++/** Alt+] and Alt+[, the keys Copilot uses to cycle its suggestions. */
++export const AE_DEFAULT_SUGGESTION_KEYS: AeSuggestionKeys = {
++  next: altChord("BracketRight"),
++  previous: altChord("BracketLeft"),
++};
++
++interface ChordEvent {
++  code: string;
++  altKey: boolean;
++  ctrlKey: boolean;
++  metaKey: boolean;
++  shiftKey: boolean;
++}
++
++const DIGITS = Array.from({ length: 10 }, (_, i) => `Digit${i}`);
++
++const MODIFIER_CODE = /^(Shift|Control|Alt|Meta|OS|CapsLock|Fn)/;
++
++/** The chord a keydown makes, or `null` for a modifier pressed on its own. */
++export function aeChordFromEvent(event: ChordEvent): AeKeyChord | null {
++  if (!event.code || MODIFIER_CODE.test(event.code)) return null;
++  return {
++    code: event.code,
++    alt: event.altKey,
++    ctrl: event.ctrlKey,
++    meta: event.metaKey,
++    shift: event.shiftKey,
++  };
++}
++
++export function aeSameChord(a: AeKeyChord, b: AeKeyChord): boolean {
++  return (
++    a.code === b.code &&
++    a.alt === b.alt &&
++    a.ctrl === b.ctrl &&
++    a.meta === b.meta &&
++    a.shift === b.shift
++  );
++}
++
++function parseChord(value: unknown): AeKeyChord | null {
++  if (!value || typeof value !== "object") return null;
++  const v = value as Record<string, unknown>;
++  if (typeof v.code !== "string" || !v.code) return null;
++  const flags = [v.alt, v.ctrl, v.meta, v.shift];
++  if (!flags.every((f) => typeof f === "boolean")) return null;
++  return {
++    code: v.code,
++    alt: v.alt as boolean,
++    ctrl: v.ctrl as boolean,
++    meta: v.meta as boolean,
++    shift: v.shift as boolean,
++  };
++}
++
++/** Saved keys over the defaults; anything unreadable falls back per action. */
++export function parseAeSuggestionKeys(raw: string | null): AeSuggestionKeys {
++  if (!raw) return AE_DEFAULT_SUGGESTION_KEYS;
++  let saved: Record<string, unknown>;
++  try {
++    const parsed: unknown = JSON.parse(raw);
++    if (!parsed || typeof parsed !== "object") return AE_DEFAULT_SUGGESTION_KEYS;
++    saved = parsed as Record<string, unknown>;
++  } catch {
++    return AE_DEFAULT_SUGGESTION_KEYS;
++  }
++  return {
++    next: parseChord(saved.next) ?? AE_DEFAULT_SUGGESTION_KEYS.next,
++    previous: parseChord(saved.previous) ?? AE_DEFAULT_SUGGESTION_KEYS.previous,
++  };
++}
++
++// Held in memory when storage is blocked, so a change lasts until reload.
++let override: AeSuggestionKeys | null = null;
++let cached: AeSuggestionKeys | null = null;
++const listeners = new Set<() => void>();
++
++function readStorage(): string | null {
++  if (typeof window === "undefined") return null;
++  try {
++    return window.localStorage.getItem(AE_SUGGESTION_KEYS_STORAGE_KEY);
++  } catch {
++    return null;
++  }
++}
++
++/** The keys in force now (read once, then cached until a change). */
++export function readAeSuggestionKeys(): AeSuggestionKeys {
++  cached ??= override ?? parseAeSuggestionKeys(readStorage());
++  return cached;
++}
++
++function changed() {
++  cached = null;
++  for (const listener of listeners) listener();
++}
++
++function save(keys: AeSuggestionKeys) {
++  const isDefault =
++    aeSameChord(keys.next, AE_DEFAULT_SUGGESTION_KEYS.next) &&
++    aeSameChord(keys.previous, AE_DEFAULT_SUGGESTION_KEYS.previous);
++  try {
++    if (isDefault) window.localStorage.removeItem(AE_SUGGESTION_KEYS_STORAGE_KEY);
++    else window.localStorage.setItem(AE_SUGGESTION_KEYS_STORAGE_KEY, JSON.stringify(keys));
++    override = null;
++  } catch {
++    override = keys;
++  }
++  changed();
++}
++
++/**
++ * Save one action's chord, or `null` to put it back to its default. A reset
++ * whose default the other action now holds resets that one too, so the two
++ * never share a chord.
++ */
++export function writeAeSuggestionKey(action: AeSuggestionKeyAction, chord: AeKeyChord | null) {
++  const keys = { ...readAeSuggestionKeys(), [action]: chord ?? AE_DEFAULT_SUGGESTION_KEYS[action] };
++  if (chord === null && aeSameChord(keys.next, keys.previous)) {
++    const other: AeSuggestionKeyAction = action === "next" ? "previous" : "next";
++    keys[other] = AE_DEFAULT_SUGGESTION_KEYS[other];
++  }
++  save(keys);
++}
++
++// One storage listener for every subscriber: another tab saving new keys.
++function onStorage(event: StorageEvent) {
++  if (event.key === AE_SUGGESTION_KEYS_STORAGE_KEY) changed();
++}
++
++function subscribe(listener: () => void): () => void {
++  if (listeners.size === 0 && typeof window !== "undefined") {
++    window.addEventListener("storage", onStorage);
++  }
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++    if (listeners.size === 0 && typeof window !== "undefined") {
++      window.removeEventListener("storage", onStorage);
++    }
++  };
++}
++
++export function useAeSuggestionKeys(): AeSuggestionKeys {
++  return useSyncExternalStore(subscribe, readAeSuggestionKeys, () => AE_DEFAULT_SUGGESTION_KEYS);
++}
++
++/** +1 for the next suggestion, -1 for the previous, 0 for any other key. */
++export function aeSuggestionCycleStep(
++  event: ChordEvent,
++  keys: AeSuggestionKeys = readAeSuggestionKeys(),
++): 1 | -1 | 0 {
++  const chord = aeChordFromEvent(event);
++  if (!chord) return 0;
++  if (aeSameChord(chord, keys.next)) return 1;
++  if (aeSameChord(chord, keys.previous)) return -1;
++  return 0;
++}
++
++// The app's own hotkeys (hooks/use*Hotkey.ts, the shortcuts dialog) and the
++// text-editing keys a composer needs, by modifier set. "cmd" is ⌘ on a Mac and
++// Ctrl elsewhere; "ctrl" is the literal Control key.
++const RESERVED: { mods: "cmd" | "cmd+alt" | "ctrl+shift"; codes: string[]; what: string }[] = [
++  { mods: "cmd", codes: ["BracketLeft", "BracketRight"], what: "switch sessions" },
++  { mods: "cmd", codes: ["KeyK"], what: "open the command palette" },
++  { mods: "cmd", codes: ["Enter", "Slash"], what: "approve and show shortcuts" },
++  { mods: "cmd", codes: DIGITS, what: "open pinned sessions" },
++  { mods: "cmd", codes: ["KeyA", "KeyC", "KeyV", "KeyX", "KeyY", "KeyZ"], what: "edit text" },
++  { mods: "cmd+alt", codes: ["BracketLeft", "BracketRight"], what: "open and close the sidebars" },
++  { mods: "cmd+alt", codes: DIGITS, what: "open pinned sessions" },
++  {
++    mods: "cmd+alt",
++    codes: ["KeyS", "KeyB", "KeyN", "KeyT", "KeyV"],
++    what: "run another app shortcut",
++  },
++  { mods: "cmd+alt", codes: ["Comma", "Backslash"], what: "run another app shortcut" },
++  { mods: "ctrl+shift", codes: ["KeyL", "KeyM"], what: "focus the composer or pick a model" },
++];
++
++function modsOf(chord: AeKeyChord, isMac: boolean): string | null {
++  const command = hasCommandModifier({ metaKey: chord.meta, ctrlKey: chord.ctrl }, isMac);
++  if (command && !chord.shift) return chord.alt ? "cmd+alt" : "cmd";
++  if (chord.ctrl && chord.shift && !chord.alt && !chord.meta) return "ctrl+shift";
++  return null;
++}
++
++/**
++ * Why a chord cannot be used for `action`, or `null` when it can. A chord
++ * needs Alt, Ctrl or ⌘ (a bare key would type into the box) and must not be
++ * the other action's chord or one the app already binds.
++ */
++export function aeChordProblem(
++  chord: AeKeyChord,
++  action: AeSuggestionKeyAction,
++  keys: AeSuggestionKeys,
++  isMac: boolean = isMacPlatform(),
++): string | null {
++  if (!chord.alt && !chord.ctrl && !chord.meta) {
++    return `Use ${isMac ? "⌥, ⌃ or ⌘" : "Alt or Ctrl"} with the key, or it would type into the box.`;
++  }
++  if (["Tab", "Escape", "Enter", "NumpadEnter"].includes(chord.code)) {
++    return "Tab, Esc and Enter keep their own jobs in the composer.";
++  }
++  const other = action === "next" ? keys.previous : keys.next;
++  if (aeSameChord(chord, other)) {
++    return `Already used for ${action === "next" ? "previous" : "next"} suggestion.`;
++  }
++  const mods = modsOf(chord, isMac);
++  const taken = RESERVED.find((r) => r.mods === mods && r.codes.includes(chord.code));
++  return taken ? `Already used to ${taken.what}.` : null;
++}
++
++const CODE_LABELS: Record<string, string> = {
++  BracketLeft: "[",
++  BracketRight: "]",
++  Backslash: "\\",
++  Backquote: "`",
++  Comma: ",",
++  Period: ".",
++  Slash: "/",
++  Semicolon: ";",
++  Quote: "'",
++  Minus: "-",
++  Equal: "=",
++  Space: "Space",
++  ArrowUp: "↑",
++  ArrowDown: "↓",
++  ArrowLeft: "←",
++  ArrowRight: "→",
++};
++
++function codeLabel(code: string): string {
++  if (CODE_LABELS[code]) return CODE_LABELS[code];
++  if (/^Key[A-Z]$/.test(code)) return code.slice(3);
++  if (/^Digit\d$/.test(code)) return code.slice(5);
++  if (/^Numpad\d$/.test(code)) return `Num ${code.slice(6)}`;
++  return code;
++}
++
++/** The chord as key caps, e.g. `["Alt", "]"]` or `["⌥", "]"]` on a Mac. */
++export function aeChordKeys(chord: AeKeyChord, isMac: boolean = isMacPlatform()): string[] {
++  const keys: string[] = [];
++  if (chord.ctrl) keys.push(isMac ? "⌃" : "Ctrl");
++  if (chord.alt) keys.push(isMac ? "⌥" : "Alt");
++  if (chord.shift) keys.push(isMac ? "⇧" : "Shift");
++  if (chord.meta) keys.push(isMac ? "⌘" : "Win");
++  keys.push(codeLabel(chord.code));
++  return keys;
++}
++
++/** The chord as one string for a tooltip, e.g. `"Alt+]"` or `"⌥]"`. */
++export function aeChordLabel(chord: AeKeyChord, isMac: boolean = isMacPlatform()): string {
++  return aeChordKeys(chord, isMac).join(isMac ? "" : "+");
++}
+diff --git a/web/src/pages/settings/AeChatSettingsSection.tsx b/web/src/pages/settings/AeChatSettingsSection.tsx
+index 33d243d63a10bd9e3f0e65b8ce85ee6a084e9b51..611030ef974da5530e99e448536bbcc2e4f2ceea 100644
+--- a/web/src/pages/settings/AeChatSettingsSection.tsx
++++ b/web/src/pages/settings/AeChatSettingsSection.tsx
+@@ -6,6 +6,7 @@ import { useId } from "react";
+ import { AeTokenDefragSetting } from "@/components/AeTokenDefrag";
+ import { Switch } from "@/components/ui/switch";
+ import { AeSessionListSetting } from "./AeSessionListSetting";
++import { AeSuggestionKeysSetting } from "./AeSuggestionKeysSetting";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
+ 
+ /** The title and description SettingsPage's `Section` shell gives this section. */
+@@ -46,6 +47,7 @@ export function AeChatSettingsSection() {
+     <div data-testid="ae-chat-settings" className="flex flex-col gap-6">
+       <OpenRailInEverySessionControl />
+       <AeTokenDefragSetting />
++      <AeSuggestionKeysSetting />
+       <AeSessionListSetting />
+     </div>
+   );
+diff --git a/web/src/pages/settings/AeSuggestionKeysSetting.test.tsx b/web/src/pages/settings/AeSuggestionKeysSetting.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a707f1751725a068f7c0d7ddca74510849d06ab
+--- /dev/null
++++ b/web/src/pages/settings/AeSuggestionKeysSetting.test.tsx
+@@ -0,0 +1,96 @@
++import { fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  AE_SUGGESTION_KEYS_STORAGE_KEY,
++  readAeSuggestionKeys,
++  writeAeSuggestionKey,
++} from "@/lib/aeSuggestionKeys";
++import { AeSuggestionKeysSetting } from "./AeSuggestionKeysSetting";
++
++afterEach(() => {
++  writeAeSuggestionKey("next", null);
++  writeAeSuggestionKey("previous", null);
++});
++
++const caps = (action: string) =>
++  Array.from(screen.getByTestId(`ae-suggestion-key-${action}`).querySelectorAll("kbd")).map(
++    (k) => k.textContent,
++  );
++
++describe("AeSuggestionKeysSetting", () => {
++  it("shows Alt+] and Alt+[ by default, with no Reset", () => {
++    render(<AeSuggestionKeysSetting />);
++    expect(caps("next")).toEqual(["Alt", "]"]);
++    expect(caps("previous")).toEqual(["Alt", "["]);
++    expect(screen.queryByTestId("ae-suggestion-key-next-reset")).toBeNull();
++  });
++
++  it("records the next combo pressed after Change, saves it, and Reset puts the default back", () => {
++    render(<AeSuggestionKeysSetting />);
++    const change = screen.getByTestId("ae-suggestion-key-next-change");
++    fireEvent.click(change);
++    expect(change).toHaveTextContent("Cancel");
++    // A modifier alone is still waiting for its key.
++    fireEvent.keyDown(change, { key: "Control", code: "ControlLeft", ctrlKey: true });
++    expect(change).toHaveTextContent("Cancel");
++    fireEvent.keyDown(change, { key: "j", code: "KeyJ", ctrlKey: true });
++    expect(caps("next")).toEqual(["Ctrl", "J"]);
++    expect(readAeSuggestionKeys().next).toMatchObject({ code: "KeyJ", ctrl: true, alt: false });
++    expect(window.localStorage.getItem(AE_SUGGESTION_KEYS_STORAGE_KEY)).toContain("KeyJ");
++
++    fireEvent.click(screen.getByTestId("ae-suggestion-key-next-reset"));
++    expect(caps("next")).toEqual(["Alt", "]"]);
++    expect(window.localStorage.getItem(AE_SUGGESTION_KEYS_STORAGE_KEY)).toBeNull();
++  });
++
++  it("refuses a bare key, the other action's combo and an app hotkey, and keeps listening", () => {
++    render(<AeSuggestionKeysSetting />);
++    const change = screen.getByTestId("ae-suggestion-key-next-change");
++    fireEvent.click(change);
++    fireEvent.keyDown(change, { key: "j", code: "KeyJ" });
++    expect(screen.getByRole("alert")).toHaveTextContent("would type into the box");
++    fireEvent.keyDown(change, { key: "[", code: "BracketLeft", altKey: true });
++    expect(screen.getByRole("alert")).toHaveTextContent("previous suggestion");
++    fireEvent.keyDown(change, { key: "]", code: "BracketRight", ctrlKey: true });
++    expect(screen.getByRole("alert")).toHaveTextContent("switch sessions");
++    expect(change).toHaveTextContent("Cancel");
++    expect(readAeSuggestionKeys().next).toMatchObject({ code: "BracketRight", alt: true });
++  });
++
++  it("blocks Ctrl+Alt+V (voice dictation) on save, and the press reaches no app hotkey", () => {
++    const appHotkey = vi.fn();
++    window.addEventListener("keydown", appHotkey);
++    render(<AeSuggestionKeysSetting />);
++    const change = screen.getByTestId("ae-suggestion-key-next-change");
++    fireEvent.click(change);
++    fireEvent.keyDown(document.body, { key: "v", code: "KeyV", ctrlKey: true, altKey: true });
++    window.removeEventListener("keydown", appHotkey);
++    expect(screen.getByRole("alert")).toHaveTextContent("Already used");
++    expect(appHotkey).not.toHaveBeenCalled();
++    expect(readAeSuggestionKeys().next).toMatchObject({ code: "BracketRight", alt: true });
++  });
++
++  it("hears the combo with focus elsewhere (Safari leaves a clicked button unfocused)", () => {
++    render(<AeSuggestionKeysSetting />);
++    fireEvent.click(screen.getByTestId("ae-suggestion-key-next-change"));
++    fireEvent.keyDown(document.body, { key: "j", code: "KeyJ", ctrlKey: true });
++    expect(caps("next")).toEqual(["Ctrl", "J"]);
++  });
++
++  it("a click elsewhere cancels", () => {
++    render(<AeSuggestionKeysSetting />);
++    const change = screen.getByTestId("ae-suggestion-key-next-change");
++    fireEvent.click(change);
++    fireEvent.pointerDown(document.body);
++    expect(change).toHaveTextContent("Change");
++  });
++
++  it("Esc cancels without saving", () => {
++    render(<AeSuggestionKeysSetting />);
++    const change = screen.getByTestId("ae-suggestion-key-previous-change");
++    fireEvent.click(change);
++    fireEvent.keyDown(change, { key: "Escape", code: "Escape" });
++    expect(change).toHaveTextContent("Change");
++    expect(caps("previous")).toEqual(["Alt", "["]);
++  });
++});
+diff --git a/web/src/pages/settings/AeSuggestionKeysSetting.tsx b/web/src/pages/settings/AeSuggestionKeysSetting.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d6d0a199168cc8126ce20d78a9b2ed542818c03
+--- /dev/null
++++ b/web/src/pages/settings/AeSuggestionKeysSetting.tsx
+@@ -0,0 +1,141 @@
++// Settings > Chat: the keys that step through the composer's suggestion
++// alternatives. Change records the next key combo pressed anywhere on the page
++// (Safari does not focus a clicked button, so the button cannot listen); Esc or
++// clicking elsewhere cancels. Saved in this browser (lib/aeSuggestionKeys.ts).
++
++import { useEffect, useId, useRef, useState } from "react";
++import { Kbd } from "@/components/KeyboardShortcut";
++import { Button } from "@/components/ui/button";
++import {
++  AE_DEFAULT_SUGGESTION_KEYS,
++  aeChordFromEvent,
++  aeChordKeys,
++  aeChordProblem,
++  aeSameChord,
++  readAeSuggestionKeys,
++  useAeSuggestionKeys,
++  writeAeSuggestionKey,
++  type AeSuggestionKeyAction,
++} from "@/lib/aeSuggestionKeys";
++
++const ROWS: { action: AeSuggestionKeyAction; label: string }[] = [
++  { action: "next", label: "Next suggestion" },
++  { action: "previous", label: "Previous suggestion" },
++];
++
++function KeyRow({ action, label }: { action: AeSuggestionKeyAction; label: string }) {
++  const keys = useAeSuggestionKeys();
++  const [recording, setRecording] = useState(false);
++  const [problem, setProblem] = useState<string | null>(null);
++  const chord = keys[action];
++  const isDefault = aeSameChord(chord, AE_DEFAULT_SUGGESTION_KEYS[action]);
++
++  const buttonRef = useRef<HTMLButtonElement>(null);
++
++  const stop = () => {
++    setRecording(false);
++    setProblem(null);
++  };
++
++  useEffect(() => {
++    if (!recording) return;
++    const done = () => {
++      setRecording(false);
++      setProblem(null);
++    };
++    // Capture phase on the window: the combo reaches no app hotkey while recording.
++    const onKeyDown = (event: KeyboardEvent) => {
++      event.preventDefault();
++      event.stopPropagation();
++      if (event.key === "Escape" && !event.altKey && !event.ctrlKey && !event.metaKey) {
++        done();
++        return;
++      }
++      const pressed = aeChordFromEvent(event);
++      if (!pressed) return;
++      const why = aeChordProblem(pressed, action, readAeSuggestionKeys());
++      if (why) {
++        setProblem(why);
++        return;
++      }
++      writeAeSuggestionKey(action, pressed);
++      done();
++    };
++    const onPointerDown = (event: PointerEvent) => {
++      if (!buttonRef.current?.contains(event.target as Node)) done();
++    };
++    window.addEventListener("keydown", onKeyDown, true);
++    window.addEventListener("pointerdown", onPointerDown, true);
++    return () => {
++      window.removeEventListener("keydown", onKeyDown, true);
++      window.removeEventListener("pointerdown", onPointerDown, true);
++    };
++  }, [recording, action]);
++
++  return (
++    <div className="flex flex-col gap-1">
++      <div className="flex items-center justify-between gap-3">
++        <span className="text-ui">{label}</span>
++        <div className="flex items-center gap-2">
++          {recording ? (
++            <span className="text-ui text-muted-foreground">Press a key combo, Esc to cancel</span>
++          ) : (
++            <span className="flex items-center gap-1" data-testid={`ae-suggestion-key-${action}`}>
++              {aeChordKeys(chord).map((key) => (
++                <Kbd key={key}>{key}</Kbd>
++              ))}
++            </span>
++          )}
++          <Button
++            type="button"
++            size="sm"
++            variant="outline"
++            aria-pressed={recording}
++            data-testid={`ae-suggestion-key-${action}-change`}
++            ref={buttonRef}
++            componentId={`settings.chat.ae_suggestion_key_${action}`}
++            onClick={() => (recording ? stop() : setRecording(true))}
++          >
++            {recording ? "Cancel" : "Change"}
++          </Button>
++          {!isDefault && !recording && (
++            <Button
++              type="button"
++              size="sm"
++              variant="ghost"
++              data-testid={`ae-suggestion-key-${action}-reset`}
++              onClick={() => writeAeSuggestionKey(action, null)}
++            >
++              Reset
++            </Button>
++          )}
++        </div>
++      </div>
++      {problem && (
++        <span role="alert" className="text-ui text-destructive">
++          {problem}
++        </span>
++      )}
++    </div>
++  );
++}
++
++export function AeSuggestionKeysSetting() {
++  const labelId = useId();
++  return (
++    <div className="flex flex-col gap-3" aria-labelledby={labelId} role="group">
++      <div className="flex min-w-0 flex-col">
++        <span id={labelId} className="text-ui font-medium">
++          Suggestion keys
++        </span>
++        <span className="text-ui text-muted-foreground">
++          When the composer offers more than one suggestion, these keys step through them; Tab still
++          takes the one shown. Saved in this browser.
++        </span>
++      </div>
++      {ROWS.map((row) => (
++        <KeyRow key={row.action} {...row} />
++      ))}
++    </div>
++  );
++}
+diff --git a/web/src/store/aeSuggestion.test.ts b/web/src/store/aeSuggestion.test.ts
+index 7a4b23951aa914e5dca9a7517715561278d2ce8a..267f251db2b8ce7385a562c076586e8208bf7178 100644
+--- a/web/src/store/aeSuggestion.test.ts
++++ b/web/src/store/aeSuggestion.test.ts
+@@ -60,7 +60,7 @@ describe("chat store aeSuggestion", () => {
+ 
+     sink.push("session.suggestion", { conversation_id: "conv_sug_a", suggestion: "Open a PR" });
+     await tick();
+-    expect(useChatStore.getState().aeSuggestion).toBe("Open a PR");
++    expect(useChatStore.getState().aeSuggestion).toEqual(["Open a PR"]);
+ 
+     sink.push("session.status", { conversation_id: "conv_sug_a", status: "running" });
+     await tick();
+@@ -68,6 +68,18 @@ describe("chat store aeSuggestion", () => {
+     controller.abort();
+   });
+ 
++  it("holds the ranked list in order", async () => {
++    const { sink, controller } = bindPumped("conv_sug_e");
++    sink.push("session.suggestion", {
++      conversation_id: "conv_sug_e",
++      suggestion: "Open a PR",
++      suggestions: ["Open a PR", "Run the tests", "Ship it"],
++    });
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toEqual(["Open a PR", "Run the tests", "Ship it"]);
++    controller.abort();
++  });
++
+   it("drops a suggestion that lands while a turn runs, and another session's", async () => {
+     const { sink, controller } = bindPumped("conv_sug_b", "running");
+     sink.push("session.suggestion", { conversation_id: "conv_sug_b", suggestion: "stale" });
+@@ -81,7 +93,7 @@ describe("chat store aeSuggestion", () => {
+     const { sink, controller } = bindPumped("conv_sug_c");
+     sink.push("session.suggestion", { conversation_id: "conv_sug_c", suggestion: "Ship it" });
+     await tick();
+-    expect(useChatStore.getState().aeSuggestion).toBe("Ship it");
++    expect(useChatStore.getState().aeSuggestion).toEqual(["Ship it"]);
+     sink.push("session.suggestion", { conversation_id: "conv_sug_c", suggestion: null });
+     await tick();
+     expect(useChatStore.getState().aeSuggestion).toBeNull();
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 48334edc92ebf140b5959596caddee3702a6d247..98d0c8aa9f62fa783eb601c86e2313eaa2ce669f 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -693,8 +693,8 @@ export interface ConversationState {
+   aeRunningSince: number | null;
+   /** The terminal's live spinner line (`session.progress`), or `null` when none shows. */
+   aeProgress: AeSessionProgress | null;
+-  /** The predicted next prompt (`session.suggestion`) for the composer's ghost text. */
+-  aeSuggestion: string | null;
++  /** The predicted next prompts, best first (`session.suggestion`), for the composer's ghost text. */
++  aeSuggestion: readonly string[] | null;
+   /**
+    * Whether the active session is a native-terminal wrapper
+    * (claude-native / codex-native), derived from the `omnigent.wrapper`

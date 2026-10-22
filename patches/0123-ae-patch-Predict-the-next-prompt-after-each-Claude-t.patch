@@ -1,0 +1,2850 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 14:24:47 -0700
+Subject: [PATCH 123/148] [ae-patch] Predict the next prompt after each Claude
+ turn and show it as ghost text in the composer
+
+On a parent session's Stop hook the claude-native forwarder starts one
+background side call, claude -p --model haiku, with the turn's last prompt
+and last reply, isolated from hooks, settings, MCP servers, tools and session
+persistence. Its one-line answer is posted as the transient
+external_session_suggestion event, relayed as session.suggestion, and the
+web composer draws it as grey ghost text over the empty box: Tab or a tap
+fills it in without sending. Off unless AE_PROMPT_SUGGESTIONS=1.
+---
+ .../claude_native/ae_prompt_suggest.py        | 662 ++++++++++++++
+ omnigent/harnesses/claude_native/bridge.py    |   6 +
+ omnigent/harnesses/claude_native/forwarder.py |  23 +
+ .../routes/_sessions/ae_session_suggestion.py |  55 ++
+ omnigent/server/routes/_sessions/common.py    |   2 +
+ .../server/routes/sessions/routes_events.py   |  12 +
+ omnigent/server/schemas.py                    |  21 +
+ omnigent/util/ae_session_suggestion.py        |  17 +
+ openapi.json                                  |  52 ++
+ .../forwarder/test_ae_prompt_suggest.py       | 823 ++++++++++++++++++
+ .../integration/test_ae_session_suggestion.py | 100 +++
+ .../components/composer/AeSuggestionGhost.tsx |  55 ++
+ .../ChatComposer.aeSuggestion.test.tsx        | 179 ++++
+ web/src/components/composer/ChatComposer.tsx  |  46 +-
+ web/src/lib/aeStreamObserver.ts               |  12 +-
+ web/src/lib/aeSuggestion.test.ts              |  82 ++
+ web/src/lib/aeSuggestion.ts                   | 110 +++
+ web/src/lib/events.ts                         |   2 +
+ web/src/lib/sse.ts                            |   2 +
+ web/src/pages/ChatPage.tsx                    |  12 +
+ web/src/store/aeSuggestion.test.ts            |  95 ++
+ web/src/store/chatStore.ts                    |   4 +
+ web/src/store/conversationState.ts            |   2 +
+ 23 files changed, 2370 insertions(+), 4 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_prompt_suggest.py
+ create mode 100644 omnigent/server/routes/_sessions/ae_session_suggestion.py
+ create mode 100644 omnigent/util/ae_session_suggestion.py
+ create mode 100644 tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+ create mode 100644 tests/server/integration/test_ae_session_suggestion.py
+ create mode 100644 web/src/components/composer/AeSuggestionGhost.tsx
+ create mode 100644 web/src/components/composer/ChatComposer.aeSuggestion.test.tsx
+ create mode 100644 web/src/lib/aeSuggestion.test.ts
+ create mode 100644 web/src/lib/aeSuggestion.ts
+ create mode 100644 web/src/store/aeSuggestion.test.ts
+
+diff --git a/omnigent/harnesses/claude_native/ae_prompt_suggest.py b/omnigent/harnesses/claude_native/ae_prompt_suggest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..404c40b7464ad2dff71d0d220d7f96a83742cb87
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_prompt_suggest.py
+@@ -0,0 +1,662 @@
++"""
++Predict the user's next prompt after each finished Claude turn.
++
++Claude Code has its own prompt suggestions, but only in print/SDK mode; the
++interactive TUI that OmniGent runs in tmux never draws one on screen or
++writes one to the transcript, so there is nothing to relay. Instead, when the
++forwarder sees a turn's ``Stop`` hook, this module makes one small side call
++(``claude -p --model haiku``) with the turn's last user prompt and last reply,
++and posts the one-line answer as a transient ``external_session_suggestion``
++event that the web composer shows as ghost text.
++
++The side call is isolated from everything the session itself uses: no hooks
++(a ``Stop`` hook firing from it would start another call, for ever), no
++settings files, no MCP servers, no tools, no session transcript, no OmniGent
++environment, and a temporary cwd and Claude config dir of its own, so it never
++writes the user's ``~/.claude.json``. It runs as a background task so
++transcript forwarding never waits on it, at most one per session; a newer
++turn, a prompt typed in the terminal and the forwarder's own exit all cancel a
++call still in flight and kill its process group. It runs only for sessions on
++Claude's own login (no gateway, Bedrock or Vertex). Off unless
++``AE_PROMPT_SUGGESTIONS=1``.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import logging
++import os
++import shutil
++import signal
++import tempfile
++import time
++from collections.abc import Iterator, Mapping
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Final
++
++import httpx
++
++from omnigent.harnesses.claude_native.transcript_filters import is_request_log_record
++from omnigent.util.ae_session_suggestion import (
++    EXTERNAL_SESSION_SUGGESTION_TYPE,
++    MAX_SUGGESTION_CHARS,
++)
++
++_logger = logging.getLogger(__name__)
++
++ENABLE_ENV_VAR: Final = "AE_PROMPT_SUGGESTIONS"
++CLAUDE_PATH_ENV_VAR: Final = "OMNIGENT_CLAUDE_PATH"
++SIDE_CALL_MODEL: Final = "haiku"
++SIDE_CALL_TIMEOUT_S: Final = 15.0
++# Characters of conversation the side call sees: the prompt's head, the reply's tail.
++MAX_CONTEXT_CHARS: Final = 2000
++MAX_PROMPT_CHARS: Final = 600
++# A Stop hook older than this (a forwarder catching up after a restart) is not
++# a turn the user is looking at now.
++MAX_TURN_AGE_S: Final = 120.0
++# Only the transcript's tail is read; one turn's prompt and reply fit in it.
++TAIL_BYTES: Final = 512 * 1024
++NONE_REPLY: Final = "NONE"
++# A copied login must stay valid this long, so the side call never refreshes
++# it (a refresh would rotate the token the user's own sessions hold).
++MIN_TOKEN_LIFETIME_S: Final = 600.0
++
++SYSTEM_PROMPT: Final = (
++    "You predict the next message a user will type to their coding assistant. "
++    "You get the user's last message and the assistant's reply. Answer with the "
++    "user's most likely next message, in the user's own voice and style, as one "
++    f"line of at most {MAX_SUGGESTION_CHARS} characters, with no quotes and no "
++    f"explanation. If no next message is clearly likely, answer {NONE_REPLY}."
++)
++
++# Environment the side call must not inherit: OmniGent's runner wiring and
++# tokens, and Claude Code's own session and suggestion switches.
++_DROPPED_ENV_PREFIXES: Final = ("OMNIGENT_", "RUNNER_", "CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT")
++_DROPPED_ENV_NAMES: Final = frozenset(
++    {"CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "CLAUDE_CODE_SSE_PORT", "CLAUDE_CODE_SESSION_ID"}
++)
++_WORKDIR_PREFIX: Final = "omnigent-ae-prompt-suggest-"
++_OAUTH_TOKEN_ENV_VAR: Final = "CLAUDE_CODE_OAUTH_TOKEN"
++_CREDENTIALS_FILE: Final = ".credentials.json"
++# Any of these routes Claude somewhere other than Anthropic's API on the
++# user's own login (a gateway, Bedrock, Vertex, Foundry).
++_PROVIDER_ENV_KEYS: Final = (
++    "ANTHROPIC_BASE_URL",
++    "ANTHROPIC_AUTH_TOKEN",
++    "ANTHROPIC_BEDROCK_BASE_URL",
++    "ANTHROPIC_VERTEX_BASE_URL",
++    "CLAUDE_CODE_USE_BEDROCK",
++    "CLAUDE_CODE_USE_VERTEX",
++    "CLAUDE_CODE_USE_FOUNDRY",
++)
++# The session's own settings file in its bridge dir (bridge.py writes it).
++_BRIDGE_SETTINGS_FILE: Final = "claude-settings.json"
++# The account sidecar the session's statusLine shim writes from the terminal's
++# own OMNIGENT_CLAUDE_ACCOUNT on every render: empty for the default login, the
++# account name for a named one (status.CLAUDE_ACCOUNT_FILE).
++_BRIDGE_ACCOUNT_FILE: Final = "claude_account"
++
++
++@dataclass
++class SuggestionState:
++    """
++    Per-forwarder state for the prompt-suggestion side call.
++
++    :param task: The in-flight side call, or ``None`` when none runs.
++    :param is_child: Per session id, whether it is a sub-agent session (cached
++        after one lookup; sub-agent sessions get no suggestions).
++    :param shown: Session id whose composer may still show a posted
++        suggestion, so a prompt typed in the terminal can clear it.
++    """
++
++    task: asyncio.Task[None] | None = None
++    is_child: dict[str, bool] = field(default_factory=dict)
++    shown: str | None = None
++
++
++@dataclass(frozen=True)
++class TurnContext:
++    """
++    What the side call sees of the finished turn.
++
++    :param user_prompt: The user's last message, e.g. ``"fix the failing test"``,
++        or ``""`` when the transcript does not hold it yet.
++    :param assistant_text: The assistant's last reply text.
++    """
++
++    user_prompt: str
++    assistant_text: str
++
++
++def suggestions_enabled(env: Mapping[str, str] | None = None) -> bool:
++    """Whether ``AE_PROMPT_SUGGESTIONS`` switches the feature on (``1``, ``true`` or ``yes``)."""
++    value = (os.environ if env is None else env).get(ENABLE_ENV_VAR, "")
++    return value.strip().lower() in {"1", "true", "yes"}
++
++
++def _user_prompt_text(content: object) -> str | None:
++    """The typed text of a user transcript entry, or ``None`` for tool results and markers."""
++    if isinstance(content, str):
++        text = content.strip()
++    elif isinstance(content, list):
++        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
++            return None
++        text = "\n".join(
++            str(b.get("text", ""))
++            for b in content
++            if isinstance(b, dict) and b.get("type") == "text"
++        ).strip()
++    else:
++        return None
++    # Slash-command echoes, command output and system notices are wrapped in tags.
++    if not text or text.startswith("<"):
++        return None
++    return text
++
++
++def _tool_result_ids(content: object) -> set[str]:
++    """The ``tool_use_id`` of every tool result in a user entry."""
++    if not isinstance(content, list):
++        return set()
++    return {
++        str(b.get("tool_use_id"))
++        for b in content
++        if isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id")
++    }
++
++
++def _read_tail_lines(path: Path) -> list[str]:
++    """The transcript's last :data:`TAIL_BYTES`, as whole lines."""
++    with path.open("rb") as handle:
++        size = handle.seek(0, os.SEEK_END)
++        start = max(0, size - TAIL_BYTES)
++        handle.seek(start)
++        data = handle.read()
++    lines = data.decode("utf-8", errors="replace").splitlines()
++    return lines[1:] if start > 0 and lines else lines
++
++
++def read_turn_context(
++    transcript_path: Path | None, last_assistant_message: str | None = None
++) -> TurnContext | None:
++    """
++    Read the finished turn's last user prompt and last reply.
++
++    The ``Stop`` hook's ``last_assistant_message`` is the reply when present,
++    since Claude Code may fire the hook before the transcript holds the turn's
++    last lines; the transcript tail then supplies only the prompt. Without it,
++    the reply also comes from the tail.
++
++    :param transcript_path: Claude's session transcript (JSONL), when known.
++    :param last_assistant_message: The ``Stop`` payload's reply text, when sent.
++    :returns: The context, or ``None`` when there is no reply text, or (without
++        ``last_assistant_message``) no prompt, an unreadable transcript, or a
++        tail that still waits on the user (a tool call such as an
++        AskUserQuestion or a permission prompt with no result yet).
++    """
++    hook_reply = (last_assistant_message or "").strip()
++    try:
++        lines = _read_tail_lines(transcript_path) if transcript_path is not None else []
++    except OSError:
++        lines = []
++    user_prompt: str | None = None
++    assistant_text: str | None = None
++    pending_tools: set[str] = set()
++    for line in lines:
++        try:
++            entry = json.loads(line)
++        except json.JSONDecodeError:
++            continue
++        if not isinstance(entry, dict) or is_request_log_record(entry):
++            continue
++        if entry.get("isSidechain") or entry.get("isMeta") or entry.get("isCompactSummary"):
++            continue
++        message = entry.get("message")
++        if not isinstance(message, dict):
++            continue
++        content = message.get("content")
++        if entry.get("type") == "user":
++            pending_tools -= _tool_result_ids(content)
++            prompt = _user_prompt_text(content)
++            if prompt is not None:
++                user_prompt, assistant_text = prompt, None
++                pending_tools = set()
++        elif entry.get("type") == "assistant" and isinstance(content, list):
++            texts = [
++                str(b.get("text", "")).strip()
++                for b in content
++                if isinstance(b, dict) and b.get("type") == "text"
++            ]
++            if any(texts):
++                assistant_text = "\n".join(t for t in texts if t)
++            pending_tools |= {
++                str(b.get("id"))
++                for b in content
++                if isinstance(b, dict) and b.get("type") == "tool_use" and b.get("id")
++            }
++    if hook_reply:
++        return TurnContext(user_prompt=user_prompt or "", assistant_text=hook_reply)
++    if user_prompt is None or not assistant_text or pending_tools:
++        return None
++    return TurnContext(user_prompt=user_prompt, assistant_text=assistant_text)
++
++
++def build_side_call_prompt(context: TurnContext) -> str:
++    """
++    The side call's user message: the prompt's head and the reply's tail.
++
++    The whole message stays within :data:`MAX_CONTEXT_CHARS` of conversation.
++    """
++    prompt = context.user_prompt[:MAX_PROMPT_CHARS]
++    reply_budget = MAX_CONTEXT_CHARS - len(prompt)
++    reply = context.assistant_text[-reply_budget:]
++    return (
++        f"<user_message>\n{prompt}\n</user_message>\n\n"
++        f"<assistant_reply>\n{reply}\n</assistant_reply>\n\n"
++        "The user's next message:"
++    )
++
++
++def clean_suggestion(raw: str) -> str | None:
++    """
++    The suggestion to show, from the side call's raw output.
++
++    :param raw: Everything the side call printed.
++    :returns: The first non-empty line without wrapping quotes, cut at a word
++        boundary to :data:`MAX_SUGGESTION_CHARS`; ``None`` for ``NONE`` or
++        empty output.
++    """
++    line = next((ln.strip() for ln in raw.splitlines() if ln.strip()), "")
++    line = line.strip("\"'`“”‘’").strip()
++    if not line or line.rstrip(".").upper() == NONE_REPLY:
++        return None
++    if len(line) > MAX_SUGGESTION_CHARS:
++        cut = line[:MAX_SUGGESTION_CHARS]
++        space = cut.rfind(" ")
++        line = (cut[:space] if space > MAX_SUGGESTION_CHARS // 2 else cut).rstrip(" ,;:")
++    return line or None
++
++
++def side_call_argv(claude_bin: str) -> list[str]:
++    """
++    The side call's command line. Each flag checked against ``claude --help``
++    (Claude Code 2.1.305, 2026-10-20).
++
++    ``--safe-mode`` drops hooks, MCP servers, CLAUDE.md, skills, plugins and
++    auto-memory while keeping the OAuth login; ``--setting-sources ""`` loads
++    no user, project or local settings, and ``disableAllHooks`` stops any hook
++    a remaining source could add. ``--no-session-persistence`` writes no
++    transcript. The prompt arrives on stdin.
++    """
++    return [
++        claude_bin,
++        "-p",
++        "--model",
++        SIDE_CALL_MODEL,
++        "--safe-mode",
++        "--setting-sources",
++        "",
++        "--settings",
++        '{"disableAllHooks": true}',
++        "--strict-mcp-config",
++        "--tools",
++        "",
++        "--disable-slash-commands",
++        "--no-session-persistence",
++        "--output-format",
++        "text",
++        "--system-prompt",
++        SYSTEM_PROMPT,
++    ]
++
++
++def side_call_env(
++    base: Mapping[str, str] | None = None, *, config_dir: Path | None = None
++) -> dict[str, str]:
++    """
++    The side call's environment: this process's, minus OmniGent and Claude
++    session wiring, with ``CLAUDE_CONFIG_DIR`` pointed at ``config_dir``.
++
++    Claude Code rewrites ``.claude.json`` in its config dir on every run (a
++    measured run on 2026-10-20 changed ``~/.claude.json`` and left a backup);
++    a private dir keeps that write away from the user's live sessions.
++    """
++    source = os.environ if base is None else base
++    env = {
++        key: value
++        for key, value in source.items()
++        if not key.startswith(_DROPPED_ENV_PREFIXES) and key not in _DROPPED_ENV_NAMES
++    }
++    if config_dir is not None:
++        env["CLAUDE_CONFIG_DIR"] = str(config_dir)
++    return env
++
++
++def _login_config_dir(env: Mapping[str, str]) -> Path:
++    """The user's Claude config dir: ``CLAUDE_CONFIG_DIR`` when set, else ``~/.claude``."""
++    configured = env.get("CLAUDE_CONFIG_DIR", "").strip()
++    return Path(configured) if configured else Path.home() / ".claude"
++
++
++def copy_login(config_dir: Path, env: Mapping[str, str] | None = None) -> bool:
++    """
++    Give the private config dir the login the side call needs, and only that.
++
++    With ``CLAUDE_CODE_OAUTH_TOKEN`` in the environment the token travels there
++    and nothing is copied. Otherwise only the ``claudeAiOauth`` entry of the
++    user's credentials file is copied, and only while its access token stays
++    valid for :data:`MIN_TOKEN_LIFETIME_S`, so the side call never refreshes it.
++
++    :param config_dir: The private config dir.
++    :param env: Environment to read (the process's own by default).
++    :returns: Whether the side call has a login to use.
++    """
++    source = os.environ if env is None else env
++    if source.get(_OAUTH_TOKEN_ENV_VAR, "").strip():
++        return True
++    try:
++        data = json.loads((_login_config_dir(source) / _CREDENTIALS_FILE).read_text("utf-8"))
++    except (OSError, ValueError):
++        return False
++    oauth = data.get("claudeAiOauth") if isinstance(data, dict) else None
++    if not isinstance(oauth, dict) or not oauth.get("accessToken"):
++        return False
++    expires_at = oauth.get("expiresAt")
++    if not isinstance(expires_at, (int, float)):
++        return False
++    if expires_at / 1000 - time.time() < MIN_TOKEN_LIFETIME_S:
++        return False
++    target = config_dir / _CREDENTIALS_FILE
++    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
++    with os.fdopen(fd, "w", encoding="utf-8") as handle:
++        json.dump({"claudeAiOauth": oauth}, handle)
++    return True
++
++
++@contextlib.contextmanager
++def _side_call_dirs() -> Iterator[tuple[Path, Path]]:
++    """A fresh ``(cwd, config_dir)`` pair for one call, removed afterwards."""
++    root = Path(tempfile.mkdtemp(prefix=_WORKDIR_PREFIX))
++    try:
++        cwd, config_dir = root / "cwd", root / "config"
++        cwd.mkdir()
++        config_dir.mkdir(mode=0o700)
++        yield cwd, config_dir
++    finally:
++        shutil.rmtree(root, ignore_errors=True)
++
++
++def _claude_binary() -> str | None:
++    """The Claude CLI: ``OMNIGENT_CLAUDE_PATH`` when set, else ``claude`` on PATH."""
++    configured = os.environ.get(CLAUDE_PATH_ENV_VAR, "").strip()
++    return configured or shutil.which("claude")
++
++
++def _kill_group(proc: asyncio.subprocess.Process) -> None:
++    """SIGKILL the side call's whole process group (it leads its own session)."""
++    with contextlib.suppress(ProcessLookupError, PermissionError):
++        os.killpg(proc.pid, signal.SIGKILL)
++
++
++async def run_side_call(prompt: str, *, timeout_s: float = SIDE_CALL_TIMEOUT_S) -> str | None:
++    """
++    Run one isolated ``claude -p`` call and return its cleaned answer.
++
++    :param prompt: The side call's user message.
++    :param timeout_s: Seconds before the call is killed.
++    :returns: The suggestion, or ``None`` on ``NONE``, a failure, a timeout or
++        no usable login.
++    :raises asyncio.CancelledError: When a newer turn cancels the call; the
++        process group is killed first.
++    """
++    claude_bin = _claude_binary()
++    if claude_bin is None:
++        _logger.debug("prompt suggestion skipped: no claude binary on PATH")
++        return None
++    with _side_call_dirs() as (cwd, config_dir):
++        if not copy_login(config_dir):
++            _logger.debug("prompt suggestion skipped: no login valid for the next 10 minutes")
++            return None
++        proc = await asyncio.create_subprocess_exec(
++            *side_call_argv(claude_bin),
++            stdin=asyncio.subprocess.PIPE,
++            stdout=asyncio.subprocess.PIPE,
++            stderr=asyncio.subprocess.DEVNULL,
++            cwd=cwd,
++            env=side_call_env(config_dir=config_dir),
++            start_new_session=True,
++        )
++        try:
++            stdout, _ = await asyncio.wait_for(proc.communicate(prompt.encode()), timeout_s)
++        except BaseException as exc:
++            _kill_group(proc)
++            with contextlib.suppress(Exception):
++                await proc.wait()
++            if isinstance(exc, TimeoutError):
++                _logger.debug("prompt suggestion side call timed out after %.0fs", timeout_s)
++                return None
++            raise
++    if proc.returncode != 0:
++        _logger.debug("prompt suggestion side call exited %s", proc.returncode)
++        return None
++    return clean_suggestion(stdout.decode("utf-8", errors="replace"))
++
++
++def uses_default_provider(bridge_dir: Path | None, env: Mapping[str, str] | None = None) -> bool:
++    """
++    Whether the session runs on Claude's own login against Anthropic's API.
++
++    False when this process's environment or the session's settings file
++    names a gateway, Bedrock, Vertex or Foundry, or an ``apiKeyHelper``, or
++    when the host's claude-native launch config or managed settings resolve
++    one; then the side call would bill or reach somewhere else.
++
++    :param bridge_dir: The session's bridge dir, when known.
++    :param env: Environment to read (the process's own by default).
++    :returns: ``True`` only when every check finds the default provider.
++    """
++    source = os.environ if env is None else env
++    if any(source.get(key, "").strip() for key in _PROVIDER_ENV_KEYS):
++        return False
++    if bridge_dir is not None:
++        try:
++            settings = json.loads((bridge_dir / _BRIDGE_SETTINGS_FILE).read_text("utf-8"))
++        except FileNotFoundError:
++            settings = {}
++        except (OSError, ValueError):
++            return False
++        if not isinstance(settings, dict) or settings.get("apiKeyHelper"):
++            return False
++        settings_env = settings.get("env")
++        if isinstance(settings_env, dict) and any(settings_env.get(k) for k in _PROVIDER_ENV_KEYS):
++            return False
++    try:
++        from omnigent.harnesses.claude_native.main import (
++            managed_claude_gateway_signal,
++            resolve_native_claude_config,
++        )
++
++        if resolve_native_claude_config(spec=None, refresh_models=False) is not None:
++            return False
++        managed_base_url, _ = managed_claude_gateway_signal()
++    except Exception:  # noqa: BLE001 - an unreadable config is not the default provider
++        return False
++    return managed_base_url is None
++
++
++def uses_default_account(bridge_dir: Path | None) -> bool:
++    """
++    Whether the session's terminal runs on the host's default Claude login.
++
++    A named account reaches only the terminal (its token in the terminal's
++    environment), so a side call from the forwarder would bill the default
++    login instead; such sessions get no call, and no account token is ever
++    copied into one. The terminal's statusLine shim records its own
++    ``OMNIGENT_CLAUDE_ACCOUNT`` in the bridge dir's ``claude_account`` before
++    every render, so the file names the account the running terminal uses.
++    The forwarder's environment cannot say: the launch blanks the inherited
++    name and sets the account in the terminal's environment only.
++
++    :param bridge_dir: The session's bridge dir, when known.
++    :returns: ``True`` only when the file exists and is empty; a missing file
++        (no render yet) or any name reads as not the default.
++    """
++    if bridge_dir is None:
++        return False
++    try:
++        return not (bridge_dir / _BRIDGE_ACCOUNT_FILE).read_text("utf-8").strip()
++    except OSError:
++        return False
++
++
++async def _is_child_session(
++    client: httpx.AsyncClient, session_id: str, state: SuggestionState
++) -> bool | None:
++    """Whether the session is a sub-agent session; ``None`` when the lookup failed."""
++    if session_id in state.is_child:
++        return state.is_child[session_id]
++    try:
++        resp = await client.get(
++            f"/v1/sessions/{session_id}",
++            params={"include_items": "false", "include_usage": "false"},
++        )
++        resp.raise_for_status()
++        is_child = resp.json().get("parent_session_id") is not None
++    except (httpx.HTTPError, ValueError, AttributeError):
++        return None
++    state.is_child[session_id] = is_child
++    return is_child
++
++
++async def post_suggestion(
++    client: httpx.AsyncClient, *, session_id: str, suggestion: str | None
++) -> None:
++    """
++    Post one transient ``external_session_suggestion`` event.
++
++    :param client: Omnigent HTTP client.
++    :param session_id: Omnigent session/conversation id, e.g. ``"conv_abc123"``.
++    :param suggestion: The predicted prompt, or ``None`` to clear it.
++    :raises httpx.HTTPError: If the request fails or is rejected.
++    """
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": EXTERNAL_SESSION_SUGGESTION_TYPE, "data": {"suggestion": suggestion}},
++    )
++    resp.raise_for_status()
++
++
++async def _suggest(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    transcript_path: Path | None,
++    last_assistant_message: str | None,
++    bridge_dir: Path | None,
++    state: SuggestionState,
++) -> None:
++    """The background task: skip rules, side call, post. Never raises but on cancel."""
++    try:
++        if await _is_child_session(client, session_id, state) is not False:
++            return
++        if not await asyncio.to_thread(uses_default_account, bridge_dir):
++            _logger.debug("prompt suggestion skipped: session runs on a named Claude account")
++            return
++        if not await asyncio.to_thread(uses_default_provider, bridge_dir):
++            _logger.debug(
++                "prompt suggestion skipped: session is not on the default Anthropic provider"
++            )
++            return
++        context = await asyncio.to_thread(
++            read_turn_context, transcript_path, last_assistant_message
++        )
++        if context is None:
++            return
++        suggestion = await run_side_call(build_side_call_prompt(context))
++        if suggestion is None or client.is_closed:
++            return
++        await post_suggestion(client, session_id=session_id, suggestion=suggestion)
++        state.shown = session_id
++    except asyncio.CancelledError:
++        raise
++    except Exception:  # noqa: BLE001 - a suggestion is best effort and must not hurt forwarding
++        _logger.debug(
++            "prompt suggestion failed; session=%s",
++            session_id,
++            exc_info=True,
++            extra={"session_id": session_id},
++        )
++
++
++def cancel_prompt_suggestion(state: SuggestionState) -> None:
++    """Cancel the in-flight side call, if any (a newer turn, a rotation, the forwarder's exit)."""
++    task, state.task = state.task, None
++    if task is not None and not task.done():
++        task.cancel()
++
++
++async def clear_prompt_suggestion(client: httpx.AsyncClient, *, state: SuggestionState) -> None:
++    """
++    A prompt was typed: cancel any call in flight and clear a posted suggestion.
++
++    The web also clears on the turn's ``running`` edge; this covers a prompt
++    typed in the terminal before that edge lands. Best effort, never raises.
++    """
++    cancel_prompt_suggestion(state)
++    session_id, state.shown = state.shown, None
++    if session_id is None or client.is_closed:
++        return
++    try:
++        await post_suggestion(client, session_id=session_id, suggestion=None)
++    except httpx.HTTPError:
++        _logger.debug("prompt suggestion clear failed; session=%s", session_id, exc_info=True)
++
++
++def schedule_prompt_suggestion(
++    client: httpx.AsyncClient,
++    *,
++    session_id: str,
++    transcript_path: Path | None,
++    recorded_at: float | None,
++    state: SuggestionState,
++    last_assistant_message: str | None = None,
++    bridge_dir: Path | None = None,
++    env: Mapping[str, str] | None = None,
++) -> None:
++    """
++    Start the side call for a turn that just ended, in the background.
++
++    Called on the forwarder's hot path for the parent session's ``Stop`` hook,
++    so it only checks the switch and the turn's age and creates a task; any
++    older call still running is cancelled first.
++
++    :param client: Omnigent HTTP client the forwarder posts with.
++    :param session_id: Omnigent session/conversation id.
++    :param transcript_path: Claude transcript path from the hook payload.
++    :param recorded_at: Unix time the hook was recorded, when known.
++    :param state: Per-forwarder suggestion state; mutated in place.
++    :param last_assistant_message: The ``Stop`` payload's reply text, when sent.
++    :param bridge_dir: The session's bridge dir, for the provider check.
++    :param env: Environment to read the switch from (the process's own by default).
++    """
++    if not suggestions_enabled(env):
++        return
++    cancel_prompt_suggestion(state)
++    if transcript_path is None and not last_assistant_message:
++        return
++    if recorded_at is not None and time.time() - recorded_at > MAX_TURN_AGE_S:
++        return
++    state.task = asyncio.create_task(
++        _suggest(
++            client,
++            session_id=session_id,
++            transcript_path=transcript_path,
++            last_assistant_message=last_assistant_message,
++            bridge_dir=bridge_dir,
++            state=state,
++        ),
++        name=f"ae-prompt-suggest-{session_id}",
++    )
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 0a5233a4d5d55ee5859ea399ac709bcf16c4a428..0315692afea9c7977acdde4630170d81f63bf724 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -999,6 +999,8 @@ class ClaudeHookRecord:
+     failure_category: str | None = None
+     failure_message: str | None = None
+     failure_context: FailureContext | None = None
++    # ``Stop`` only: the turn's final reply text, for the prompt-suggestion side call.
++    last_assistant_message: str | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -3919,6 +3921,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+         task_status = "completed"
+     background_task_count = 0
+     background_tasks: list[_JsonObject] | None = None
++    raw_last = payload.get("last_assistant_message") if isinstance(payload, dict) else None
+     if event_name == "Stop" and isinstance(payload, dict):
+         raw_bg = payload.get("background_tasks")
+         if isinstance(raw_bg, list):
+@@ -4008,6 +4011,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+         failure_category=failure_category,
+         failure_message=failure_message,
+         failure_context=failure_context,
++        last_assistant_message=(
++            raw_last if event_name == "Stop" and isinstance(raw_last, str) else None
++        ),
+     )
+ 
+ 
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 0cea1d1f7b003cf76dd40fe09eea6904d0b500c4..c96b28eb502252570f2fa19c1f4457fd1cc19f92 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -26,6 +26,12 @@ from omnigent.harnesses.claude_native.ae_pane_progress import (
+     clear_progress_on_rotation,
+     relay_progress,
+ )
++from omnigent.harnesses.claude_native.ae_prompt_suggest import (
++    SuggestionState,
++    cancel_prompt_suggestion,
++    clear_prompt_suggestion,
++    schedule_prompt_suggestion,
++)
+ from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
+ from omnigent.harnesses.claude_native.bridge import (
+     BRIDGE_ID_LABEL_KEY,
+@@ -914,6 +920,8 @@ class _ForwardDedupeState:
+     session_not_bound_logged_for: str | None = None
+     # Live spinner line last relayed as ``external_session_progress``.
+     progress_relay: ProgressRelayState = field(default_factory=ProgressRelayState)
++    # The next-prompt side call after a finished turn (ae_prompt_suggest).
++    prompt_suggest: SuggestionState = field(default_factory=SuggestionState)
+ 
+ 
+ @dataclass(frozen=True)
+@@ -1358,6 +1366,7 @@ async def forward_claude_transcript_to_session(
+                         await clear_progress_on_rotation(
+                             client, old_session_id=session_id, state=dedupe.progress_relay
+                         )
++                        cancel_prompt_suggestion(dedupe.prompt_suggest)
+                         session_id = rotation
+                         state = None
+                         hook_state = None
+@@ -1402,6 +1411,7 @@ async def forward_claude_transcript_to_session(
+                         await clear_progress_on_rotation(
+                             client, old_session_id=session_id, state=dedupe.progress_relay
+                         )
++                        cancel_prompt_suggestion(dedupe.prompt_suggest)
+                         session_id = rotation
+                         state = None
+                         hook_state = None
+@@ -1582,6 +1592,7 @@ async def forward_claude_transcript_to_session(
+                             dedupe=dedupe,
+                         )
+             except asyncio.CancelledError:
++                cancel_prompt_suggestion(dedupe.prompt_suggest)
+                 await _cancel_subagent_forward_task(subagent_task)
+                 raise
+             except TimeoutError:
+@@ -1621,6 +1632,7 @@ async def forward_claude_transcript_to_session(
+             try:
+                 await asyncio.sleep(_loop_retry_delay_s(poll_interval_s, loop_failures))
+             except asyncio.CancelledError:
++                cancel_prompt_suggestion(dedupe.prompt_suggest)
+                 await _cancel_subagent_forward_task(subagent_task)
+                 raise
+ 
+@@ -4046,6 +4058,7 @@ async def _forward_available_status_events(
+             if record.event_name == "UserPromptSubmit" and not _is_subagent_hook_record(
+                 record, parent_claude_session_ids=parent_claude_session_ids
+             ):
++                await clear_prompt_suggestion(client, state=dedupe.prompt_suggest)
+                 with contextlib.suppress(Exception):
+                     # This proves Claude saw a submit; later hooks can still block the turn.
+                     _logger.info(
+@@ -4361,6 +4374,16 @@ async def _forward_available_status_events(
+             )
+             return durable
+         retry_tracker.clear(retry_key)
++        if status == "idle":
++            schedule_prompt_suggestion(
++                client,
++                session_id=session_id,
++                transcript_path=record.transcript_path,
++                recorded_at=record.recorded_at,
++                state=dedupe.prompt_suggest,
++                last_assistant_message=record.last_assistant_message,
++                bridge_dir=bridge_dir,
++            )
+         if response_id is not None:
+             # The turn ended — record its id as a pending settle so a later
+             # assistant entry still inheriting it is marked as a scheduled
+diff --git a/omnigent/server/routes/_sessions/ae_session_suggestion.py b/omnigent/server/routes/_sessions/ae_session_suggestion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8bab0f5880dcfe3646c742c905158f8e4a8e574d
+--- /dev/null
++++ b/omnigent/server/routes/_sessions/ae_session_suggestion.py
+@@ -0,0 +1,55 @@
++"""
++Publish a predicted next prompt to the session stream.
++
++After each finished turn the claude-native forwarder may post
++``external_session_suggestion`` with a one-line guess at the user's next
++message (see ``harnesses/claude_native/ae_prompt_suggest.py``). This validates
++the payload and broadcasts it as a transient ``session.suggestion`` event for
++the composer's ghost text; nothing is persisted. The type string and bound come
++from :mod:`omnigent.util.ae_session_suggestion`, which the forwarder shares.
++"""
++
++from __future__ import annotations
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.server.routes._sessions.common import session_stream
++from omnigent.server.schemas import SessionEventInput, SessionSuggestionEvent
++from omnigent.util.ae_session_suggestion import (
++    EXTERNAL_SESSION_SUGGESTION_TYPE,
++    MAX_SUGGESTION_CHARS,
++    SESSION_SUGGESTION_SSE_TYPE,
++)
++
++__all__ = ["EXTERNAL_SESSION_SUGGESTION_TYPE", "publish_external_session_suggestion"]
++
++
++def publish_external_session_suggestion(session_id: str, body: SessionEventInput) -> None:
++    """
++    Broadcast a predicted next prompt, or its clear.
++
++    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
++    :param body: ``POST /events`` body whose type is
++        :data:`EXTERNAL_SESSION_SUGGESTION_TYPE`; ``data.suggestion`` is one
++        line of text, or ``None`` to clear.
++    :raises OmnigentError: When the suggestion is not a non-empty single line
++        within :data:`MAX_SUGGESTION_CHARS`.
++    """
++    value = body.data.get("suggestion")
++    if value is not None:
++        if (
++            not isinstance(value, str)
++            or not value.strip()
++            or len(value) > MAX_SUGGESTION_CHARS
++            or "\n" in value
++            or "\r" in value
++        ):
++            raise OmnigentError(
++                f"{EXTERNAL_SESSION_SUGGESTION_TYPE} data.suggestion must be one non-empty "
++                f"line of at most {MAX_SUGGESTION_CHARS} characters, or null to clear it",
++                code=ErrorCode.INVALID_INPUT,
++            )
++        value = value.strip()
++    event = SessionSuggestionEvent(
++        type=SESSION_SUGGESTION_SSE_TYPE, conversation_id=session_id, suggestion=value
++    )
++    session_stream.publish(session_id, event.model_dump())
+diff --git a/omnigent/server/routes/_sessions/common.py b/omnigent/server/routes/_sessions/common.py
+index 1f94c71813152db0e526186a922aaab3bab83f6a..c1b60a30348aeb068f6849d9d53901b26d20101a 100644
+--- a/omnigent/server/routes/_sessions/common.py
++++ b/omnigent/server/routes/_sessions/common.py
+@@ -58,6 +58,7 @@ from omnigent.spec.types import (
+ )
+ from omnigent.stores.conversation_store import RUNNER_LIVENESS_TTL_S
+ from omnigent.util.ae_session_progress import EXTERNAL_SESSION_PROGRESS_TYPE
++from omnigent.util.ae_session_suggestion import EXTERNAL_SESSION_SUGGESTION_TYPE
+ 
+ # Pinned to the historical module path so log records keep landing on the
+ # ``omnigent.server.routes.sessions`` logger after the split into this package.
+@@ -573,6 +574,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
+     _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+     _EXTERNAL_SESSION_STATUS_TYPE,
+     _EXTERNAL_SESSION_PROGRESS_TYPE,
++    EXTERNAL_SESSION_SUGGESTION_TYPE,
+     _SUBAGENT_STATUS_TYPE,
+     _EXTERNAL_SESSION_USAGE_TYPE,
+     _EXTERNAL_COMPACTION_STATUS_TYPE,
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index a47d37dabc2d0d408fc7d87bc76973336e79807e..674bb78b728f6c74cad87bb7d56c5eee8f97d357 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -112,6 +112,10 @@ from omnigent.server.routes._sessions.ae_session_progress import (
+     EXTERNAL_SESSION_PROGRESS_TYPE,
+     publish_external_session_progress,
+ )
++from omnigent.server.routes._sessions.ae_session_suggestion import (
++    EXTERNAL_SESSION_SUGGESTION_TYPE,
++    publish_external_session_suggestion,
++)
+ from omnigent.server.routes._sessions.common import (
+     _ALLOWED_EVENT_TYPES,
+     _APPROVAL_TYPE,
+@@ -324,6 +328,7 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
+         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
+         _EXTERNAL_SESSION_USAGE_TYPE,
+         EXTERNAL_SESSION_PROGRESS_TYPE,
++        EXTERNAL_SESSION_SUGGESTION_TYPE,
+     }
+ )
+ 
+@@ -932,6 +937,9 @@ def register_events_routes(
+           ``session.progress`` event carrying the terminal's live spinner
+           line (``label``, ``elapsed``, ``tokens``; ``label`` null clears
+           it), without persisting an item or starting / steering a task.
++        - ``"external_session_suggestion"`` publishes a transient
++          ``session.suggestion`` event with a predicted next prompt
++          (``suggestion``; null clears it), without persisting anything.
+         - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
+           for transcript inactivity without forwarding a completion
+           to the runner.
+@@ -1063,6 +1071,7 @@ def register_events_routes(
+             _EXTERNAL_ELICITATION_RESOLVED_TYPE,
+             _EXTERNAL_SESSION_STATUS_TYPE,
+             EXTERNAL_SESSION_PROGRESS_TYPE,
++            EXTERNAL_SESSION_SUGGESTION_TYPE,
+             _SUBAGENT_STATUS_TYPE,
+             _EXTERNAL_SESSION_USAGE_TYPE,
+             _EXTERNAL_COMPACTION_STATUS_TYPE,
+@@ -1828,6 +1837,9 @@ def register_events_routes(
+         if body.type == EXTERNAL_SESSION_PROGRESS_TYPE:
+             publish_external_session_progress(session_id, body)
+             return {"queued": False}
++        if body.type == EXTERNAL_SESSION_SUGGESTION_TYPE:
++            publish_external_session_suggestion(session_id, body)
++            return {"queued": False}
+         if body.type == _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE:
+             _publish_external_output_reasoning_delta(session_id, body)
+             return {"queued": False}
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 8b140506cf1afc63a219d200e0cc903b9df5abe6..b0ade01a8794949778d1771fa47f32aff06e5523 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -3811,6 +3811,26 @@ class SessionProgressEvent(_SSEEventBase):
+     tokens: str | None = None
+ 
+ 
++class SessionSuggestionEvent(_SSEEventBase):
++    """
++    A predicted next prompt for the composer to show as ghost text.
++
++    After a finished turn the claude-native forwarder asks a small model for
++    the user's likely next message and relays the one-line answer.
++
++    Category: **transient** (SSE-only). Nothing is persisted and there is no
++    replay. ``suggestion`` is ``None`` to clear it.
++
++    :param type: Always ``"session.suggestion"``.
++    :param conversation_id: The conversation whose stream this rides.
++    :param suggestion: The predicted prompt, e.g. ``"Run the tests"``, or ``None``.
++    """
++
++    type: Literal["session.suggestion"]
++    conversation_id: str
++    suggestion: str | None = None
++
++
+ # ── Response pass-through events (response.*) ──────────────────────
+ 
+ 
+@@ -4808,6 +4828,7 @@ ServerStreamEvent = Annotated[
+     | SessionSupersededEvent
+     | SessionBtwSidechatEvent
+     | SessionProgressEvent
++    | SessionSuggestionEvent
+     | SessionPresenceEvent
+     # ── Transient (SSE-only) — session resource lifecycle ─────
+     | SessionResourceCreatedEvent
+diff --git a/omnigent/util/ae_session_suggestion.py b/omnigent/util/ae_session_suggestion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a2c4b46abfe6dc31e08ca0dc1da7b18c73c55a2e
+--- /dev/null
++++ b/omnigent/util/ae_session_suggestion.py
+@@ -0,0 +1,17 @@
++"""
++The wire contract for a predicted next prompt (the composer's ghost text).
++
++Shared by the claude-native forwarder (which posts the event) and the
++sessions route (which validates and publishes it), so the type string and
++the length bound cannot drift apart.
++"""
++
++from __future__ import annotations
++
++from typing import Final
++
++EXTERNAL_SESSION_SUGGESTION_TYPE: Final = "external_session_suggestion"
++SESSION_SUGGESTION_SSE_TYPE: Final = "session.suggestion"
++
++# One line in the composer; the side call is told to stay inside it.
++MAX_SUGGESTION_CHARS: Final = 120
+diff --git a/openapi.json b/openapi.json
+index acf9bc120da0efb2949cc79ae1eaaf7e2f75c2a5..9c4a273024f5c4ee259227ae3aa71da97b767882 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -5638,6 +5638,7 @@
+             "session.resource.deleted": "#/components/schemas/SessionResourceDeletedEvent",
+             "session.sandbox_status": "#/components/schemas/SessionSandboxStatusEvent",
+             "session.status": "#/components/schemas/SessionStatusEvent",
++            "session.suggestion": "#/components/schemas/SessionSuggestionEvent",
+             "session.superseded": "#/components/schemas/SessionSupersededEvent",
+             "session.terminal.activity": "#/components/schemas/SessionTerminalActivityEvent",
+             "session.terminal_pending": "#/components/schemas/SessionTerminalPendingEvent",
+@@ -5712,6 +5713,9 @@
+           {
+             "$ref": "#/components/schemas/SessionProgressEvent"
+           },
++          {
++            "$ref": "#/components/schemas/SessionSuggestionEvent"
++          },
+           {
+             "$ref": "#/components/schemas/SessionPresenceEvent"
+           },
+@@ -8232,6 +8236,54 @@
+         "title": "SessionStatusEvent",
+         "type": "object"
+       },
++      "SessionSuggestionEvent": {
++        "description": "A predicted next prompt for the composer to show as ghost text.\n\nAfter a finished turn the claude-native forwarder asks a small model for\nthe user's likely next message and relays the one-line answer.\n\nCategory: **transient** (SSE-only). Nothing is persisted and there is no\nreplay. `suggestion` is `None` to clear it.",
++        "properties": {
++          "conversation_id": {
++            "description": "The conversation whose stream this rides.",
++            "title": "Conversation Id",
++            "type": "string"
++          },
++          "sequence_number": {
++            "anyOf": [
++              {
++                "format": "int64",
++                "type": "integer"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "title": "Sequence Number"
++          },
++          "suggestion": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "default": null,
++            "description": "The predicted prompt, e.g. `\"Run the tests\"`, or `None`.",
++            "title": "Suggestion"
++          },
++          "type": {
++            "const": "session.suggestion",
++            "description": "Always `\"session.suggestion\"`.",
++            "title": "Type",
++            "type": "string"
++          }
++        },
++        "required": [
++          "type",
++          "conversation_id"
++        ],
++        "title": "SessionSuggestionEvent",
++        "type": "object"
++      },
+       "SessionSupersededEvent": {
+         "description": "This conversation was superseded by another and clients should\nfollow to it.\n\nEmitted by `_publish_session_superseded` in\n`omnigent/server/routes/sessions.py` when the claude-native\nforwarder rotates a session away on a Claude `/clear` (the old\nconversation keeps its history but the live terminal moves to a\nfresh conversation \u2014 see `_post_clear_supersession` in\n`omnigent/claude_native_forwarder.py`). A client actively viewing\nthe superseded conversation auto-redirects to `target_conversation_id`.\n\nCategory: **transient** (SSE-only), live-only by design. There is no\nSSE replay: a client that connects after the rotation does not get\nthis event. The durable counterpart is the persisted notice message\nappended to the old conversation (a `message` item linking to the\nnew conversation), which a reloading client renders instead of being\nforce-redirected.\n\nThe wire shape is FLAT (not enveloped):\n`{\"type\": \"session.superseded\", \"conversation_id\": <old>, \"target_conversation_id\": <new>, \"reason\": \"clear\"}`.",
+         "properties": {
+diff --git a/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py b/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f6b1a1bfabf078e901cca93e28975e38505826c9
+--- /dev/null
++++ b/tests/harnesses/claude_native/forwarder/test_ae_prompt_suggest.py
+@@ -0,0 +1,823 @@
++"""Tests for the next-prompt side call after a finished Claude turn."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import os
++import stat
++import time
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++
++import omnigent.harnesses.claude_native.ae_prompt_suggest as suggest
++import omnigent.harnesses.claude_native.forwarder as forwarder
++from omnigent.harnesses.claude_native.bridge import record_hook_event
++from tests.harnesses.claude_native.forwarder._support import _start_recording_server
++
++ON = {suggest.ENABLE_ENV_VAR: "1"}
++# The on_path fixture stubs the account check; the account tests put this back.
++_REAL_USES_DEFAULT_ACCOUNT = suggest.uses_default_account
++
++
++def _user(text: str) -> dict[str, Any]:
++    return {"type": "user", "message": {"role": "user", "content": text}}
++
++
++def _assistant(*blocks: dict[str, Any]) -> dict[str, Any]:
++    return {"type": "assistant", "message": {"role": "assistant", "content": list(blocks)}}
++
++
++def _text(text: str) -> dict[str, Any]:
++    return {"type": "text", "text": text}
++
++
++def _tool_use(tool_id: str, name: str = "Bash") -> dict[str, Any]:
++    return {"type": "tool_use", "id": tool_id, "name": name, "input": {}}
++
++
++def _tool_result(tool_id: str) -> dict[str, Any]:
++    return {
++        "type": "user",
++        "message": {
++            "role": "user",
++            "content": [{"type": "tool_result", "tool_use_id": tool_id, "content": "ok"}],
++        },
++    }
++
++
++def _transcript(tmp_path: Path, *entries: dict[str, Any]) -> Path:
++    path = tmp_path / "session.jsonl"
++    path.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
++    return path
++
++
++def _finished_turn(tmp_path: Path) -> Path:
++    return _transcript(
++        tmp_path,
++        _user("fix the failing test"),
++        _assistant(_text("Looking."), _tool_use("t1")),
++        _tool_result("t1"),
++        _assistant(_text("Fixed: the fixture now resets the clock. All 12 tests pass.")),
++    )
++
++
++def _fake_claude(tmp_path: Path, body: str) -> Path:
++    """A ``claude`` on PATH that records its argv, cwd, env and stdin, then runs ``body``."""
++    bin_dir = tmp_path / "bin"
++    bin_dir.mkdir(exist_ok=True)
++    log = tmp_path / "calls.jsonl"
++    script = bin_dir / "claude"
++    script.write_text(
++        "#!/usr/bin/env python3\n"
++        "import json, os, sys, time\n"
++        "stdin = sys.stdin.read()\n"
++        f"with open({str(log)!r}, 'a') as f:\n"
++        "    f.write(json.dumps({'argv': sys.argv[1:], 'cwd': os.getcwd(), 'pid': os.getpid(),\n"
++        "        'env': dict(os.environ), 'stdin': stdin}) + '\\n')\n"
++        f"{body}\n",
++        encoding="utf-8",
++    )
++    script.chmod(script.stat().st_mode | stat.S_IEXEC)
++    return log
++
++
++def _calls(log: Path) -> list[dict[str, Any]]:
++    if not log.exists():
++        return []
++    return [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
++
++
++@pytest.fixture
++def on_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """Put the fake ``claude`` first on PATH, give it a login, and keep its temp dirs here."""
++    monkeypatch.setenv("PATH", f"{tmp_path / 'bin'}{os.pathsep}{os.environ.get('PATH', '')}")
++    monkeypatch.delenv(suggest.CLAUDE_PATH_ENV_VAR, raising=False)
++    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "test-token")
++    monkeypatch.setattr(suggest.tempfile, "tempdir", str(tmp_path / "tmp"))
++    (tmp_path / "tmp").mkdir()
++    monkeypatch.setattr(suggest, "uses_default_provider", lambda bridge_dir, env=None: True)
++    monkeypatch.setattr(suggest, "uses_default_account", lambda bridge_dir: True)
++    return tmp_path
++
++
++def _leftover_dirs(root: Path) -> list[Path]:
++    return list((root / "tmp").glob(f"{suggest._WORKDIR_PREFIX}*"))
++
++
++class _Server:
++    """A MockTransport stand-in for the OmniGent server."""
++
++    def __init__(self, *, parent_session_id: str | None = None) -> None:
++        self.posts: list[dict[str, Any]] = []
++        self.gets: list[str] = []
++        self.parent_session_id = parent_session_id
++
++    def handler(self, request: httpx.Request) -> httpx.Response:
++        if request.method == "GET":
++            self.gets.append(request.url.path)
++            return httpx.Response(
++                200, json={"id": "conv_a", "parent_session_id": self.parent_session_id}
++            )
++        self.posts.append(json.loads(request.content.decode("utf-8")))
++        return httpx.Response(202, json={"queued": False})
++
++    def client(self) -> httpx.AsyncClient:
++        return httpx.AsyncClient(transport=httpx.MockTransport(self.handler), base_url="http://ap")
++
++
++# ── Transcript reading ─────────────────────────────────────────────
++
++
++def test_reads_last_prompt_and_last_reply(tmp_path: Path) -> None:
++    context = suggest.read_turn_context(_finished_turn(tmp_path))
++    assert context == suggest.TurnContext(
++        user_prompt="fix the failing test",
++        assistant_text="Fixed: the fixture now resets the clock. All 12 tests pass.",
++    )
++
++
++def test_skips_a_turn_that_waits_on_the_user(tmp_path: Path) -> None:
++    """An AskUserQuestion (or any tool call) without a result means the user owes an answer."""
++    path = _transcript(
++        tmp_path,
++        _user("deploy it"),
++        _assistant(_text("Which host?"), _tool_use("q1", "AskUserQuestion")),
++    )
++    assert suggest.read_turn_context(path) is None
++
++
++def test_ignores_meta_sidechain_and_tagged_entries(tmp_path: Path) -> None:
++    path = _transcript(
++        tmp_path,
++        _user("real prompt"),
++        {**_user("<command-name>/model</command-name>")},
++        {**_user("system note"), "isMeta": True},
++        {**_assistant(_text("subagent chatter")), "isSidechain": True},
++        _assistant(_text("Real reply.")),
++    )
++    assert suggest.read_turn_context(path) == suggest.TurnContext("real prompt", "Real reply.")
++
++
++def test_no_reply_after_the_prompt_reads_nothing(tmp_path: Path) -> None:
++    path = _transcript(tmp_path, _assistant(_text("old reply")), _user("new prompt"))
++    assert suggest.read_turn_context(path) is None
++    assert suggest.read_turn_context(tmp_path / "missing.jsonl") is None
++
++
++def test_side_call_prompt_stays_within_the_budget() -> None:
++    context = suggest.TurnContext("~" * 5000, "^" * 4000 + "END")
++    prompt = suggest.build_side_call_prompt(context)
++    assert prompt.count("~") == suggest.MAX_PROMPT_CHARS
++    assert prompt.count("~") + prompt.count("^") + len("END") == suggest.MAX_CONTEXT_CHARS
++    assert "END" in prompt  # the reply's tail is what the user just read
++
++
++@pytest.mark.parametrize(
++    ("raw", "expected"),
++    [
++        ("Run the tests again\n", "Run the tests again"),
++        ('"Open a draft PR"', "Open a draft PR"),
++        ("\n\nNONE\n", None),
++        ("none.", None),
++        ("", None),
++        ("first line\nsecond line", "first line"),
++    ],
++)
++def test_clean_suggestion(raw: str, expected: str | None) -> None:
++    assert suggest.clean_suggestion(raw) == expected
++
++
++def test_clean_suggestion_cuts_long_lines_at_a_word() -> None:
++    cleaned = suggest.clean_suggestion("word " * 60)
++    assert cleaned is not None
++    assert len(cleaned) <= suggest.MAX_SUGGESTION_CHARS
++    assert cleaned.endswith("word")
++
++
++# ── Isolation of the side call ─────────────────────────────────────
++
++
++def test_argv_isolates_the_side_call() -> None:
++    """No hooks, settings, MCP servers, tools or transcript (flags checked in claude --help)."""
++    argv = suggest.side_call_argv("claude")
++    assert argv[:4] == ["claude", "-p", "--model", "haiku"]
++    for flag in (
++        "--safe-mode",
++        "--strict-mcp-config",
++        "--disable-slash-commands",
++        "--no-session-persistence",
++    ):
++        assert flag in argv
++    assert argv[argv.index("--setting-sources") + 1] == ""
++    assert json.loads(argv[argv.index("--settings") + 1]) == {"disableAllHooks": True}
++    assert argv[argv.index("--tools") + 1] == ""
++    assert "--resume" not in argv and "--continue" not in argv
++
++
++def test_env_drops_omnigent_and_claude_session_wiring() -> None:
++    env = suggest.side_call_env(
++        config_dir=Path("/tmp/private"),
++        base={
++            "PATH": "/bin",
++            "HOME": "/home/u",
++            "CLAUDE_CONFIG_DIR": "/home/u/.claude",
++            "CLAUDE_CODE_OAUTH_TOKEN": "kept",
++            "OMNIGENT_TOKEN": "secret",
++            "OMNIGENT_RELAY_URL": "http://relay",
++            "RUNNER_SERVER_URL": "http://ap",
++            "CLAUDECODE": "1",
++            "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION": "true",
++        },
++    )
++    # The user's own config dir is replaced by the call's private one.
++    assert env == {
++        "PATH": "/bin",
++        "HOME": "/home/u",
++        "CLAUDE_CONFIG_DIR": "/tmp/private",
++        "CLAUDE_CODE_OAUTH_TOKEN": "kept",
++    }
++
++
++@pytest.mark.asyncio
++async def test_side_call_runs_the_fake_claude_isolated(
++    on_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    log = _fake_claude(on_path, "print('Run the tests again')")
++    monkeypatch.setenv("OMNIGENT_TOKEN", "secret")
++    result = await suggest.run_side_call("the prompt")
++    assert result == "Run the tests again"
++    (call,) = _calls(log)
++    assert call["argv"][:3] == ["-p", "--model", "haiku"]
++    assert "--no-session-persistence" in call["argv"]
++    assert call["stdin"] == "the prompt"
++    cwd = Path(call["cwd"])
++    assert cwd.name == "cwd" and cwd.parent.name.startswith(suggest._WORKDIR_PREFIX)
++    assert Path(call["env"]["CLAUDE_CONFIG_DIR"]) == cwd.parent / "config"
++    assert "OMNIGENT_TOKEN" not in call["env"]
++    assert _leftover_dirs(on_path) == []  # the per-call dir is removed afterwards
++
++
++@pytest.mark.asyncio
++async def test_side_call_none_and_failure_read_as_no_suggestion(on_path: Path) -> None:
++    _fake_claude(on_path, "print('NONE')")
++    assert await suggest.run_side_call("p") is None
++    _fake_claude(on_path, "print('boom'); sys.exit(3)")
++    assert await suggest.run_side_call("p") is None
++
++
++@pytest.mark.asyncio
++async def test_side_call_times_out_and_is_killed(on_path: Path) -> None:
++    log = _fake_claude(on_path, "time.sleep(30); print('late')")
++    started = time.monotonic()
++    assert await suggest.run_side_call("p", timeout_s=1.0) is None
++    assert time.monotonic() - started < 10
++    (call,) = _calls(log)
++    with pytest.raises(ProcessLookupError):
++        os.kill(call["pid"], 0)
++
++
++@pytest.mark.asyncio
++async def test_timeout_kills_the_whole_process_group(on_path: Path) -> None:
++    """A grandchild the CLI started (a node worker, say) dies with it."""
++    pid_file = on_path / "grandchild.pid"
++    _fake_claude(
++        on_path,
++        "import subprocess\n"
++        "child = subprocess.Popen(['sleep', '60'])\n"
++        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
++        "time.sleep(30)",
++    )
++    assert await suggest.run_side_call("p", timeout_s=1.5) is None
++    grandchild = int(pid_file.read_text())
++    for _ in range(50):
++        try:
++            os.kill(grandchild, 0)
++        except ProcessLookupError:
++            break
++        # A killed but unreaped child shows as a zombie; that is dead too.
++        if Path(f"/proc/{grandchild}/stat").read_text().split()[2] == "Z":
++            break
++        await asyncio.sleep(0.1)
++    else:
++        pytest.fail("the grandchild outlived the side call")
++
++
++@pytest.mark.asyncio
++async def test_the_call_writes_claude_json_only_in_its_private_dir(
++    on_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Claude Code rewrites .claude.json in its config dir on every run (measured 2026-10-20)."""
++    home = on_path / "home"
++    (home / ".claude").mkdir(parents=True)
++    (home / ".claude.json").write_text("{}")
++    monkeypatch.setenv("HOME", str(home))
++    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
++    log = _fake_claude(
++        on_path,
++        "cfg = os.environ.get('CLAUDE_CONFIG_DIR') or os.path.expanduser('~/.claude')\n"
++        "target = os.path.join(cfg, '.claude.json') if os.environ.get('CLAUDE_CONFIG_DIR') "
++        "else os.path.expanduser('~/.claude.json')\n"
++        "open(target, 'w').write('{\"numStartups\": 2}')\n"
++        "print('ok')",
++    )
++    assert await suggest.run_side_call("p") == "ok"
++    assert (home / ".claude.json").read_text() == "{}"
++    assert _calls(log)[0]["env"]["CLAUDE_CONFIG_DIR"] != str(home / ".claude")
++
++
++def _credentials(home: Path, expires_in_s: float) -> None:
++    (home / ".claude").mkdir(parents=True, exist_ok=True)
++    (home / ".claude" / ".credentials.json").write_text(
++        json.dumps(
++            {
++                "claudeAiOauth": {
++                    "accessToken": "a",
++                    "refreshToken": "r",
++                    "expiresAt": int((time.time() + expires_in_s) * 1000),
++                },
++                "mcpOAuth": {"server": {"accessToken": "other"}},
++            }
++        )
++    )
++
++
++def test_copy_login_copies_only_a_fresh_claude_login(tmp_path: Path) -> None:
++    home = tmp_path / "home"
++    env = {"CLAUDE_CONFIG_DIR": str(home / ".claude")}
++    private = tmp_path / "private"
++    private.mkdir()
++    _credentials(home, 3600)
++    assert suggest.copy_login(private, env)
++    copied = json.loads((private / ".credentials.json").read_text())
++    assert list(copied) == ["claudeAiOauth"]  # no MCP tokens
++    assert oct((private / ".credentials.json").stat().st_mode & 0o777) == "0o600"
++
++
++def test_copy_login_refuses_a_login_about_to_expire_or_missing(tmp_path: Path) -> None:
++    home = tmp_path / "home"
++    env = {"CLAUDE_CONFIG_DIR": str(home / ".claude")}
++    private = tmp_path / "private"
++    private.mkdir()
++    assert not suggest.copy_login(private, env)  # no credentials at all
++    _credentials(home, 60)  # a refresh would rotate the user's token
++    assert not suggest.copy_login(private, env)
++    assert not (private / ".credentials.json").exists()
++    assert suggest.copy_login(private, {**env, "CLAUDE_CODE_OAUTH_TOKEN": "t"})
++    assert not (private / ".credentials.json").exists()
++
++
++@pytest.mark.asyncio
++async def test_no_login_means_no_call(on_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN")
++    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(on_path / "nowhere"))
++    assert await suggest.run_side_call("p") is None
++    assert _calls(log) == []
++    assert _leftover_dirs(on_path) == []
++
++
++# ── Provider ───────────────────────────────────────────────────────
++
++
++@pytest.fixture
++def host_default(monkeypatch: pytest.MonkeyPatch) -> None:
++    """The host resolves no launch config and no managed gateway."""
++    import omnigent.harnesses.claude_native.main as native_main
++
++    monkeypatch.setattr(native_main, "resolve_native_claude_config", lambda **kw: None)
++    monkeypatch.setattr(native_main, "managed_claude_gateway_signal", lambda: (None, False))
++
++
++@pytest.mark.usefixtures("host_default")
++def test_default_provider_runs(tmp_path: Path) -> None:
++    (tmp_path / "claude-settings.json").write_text(json.dumps({"model": "opus", "hooks": {}}))
++    assert suggest.uses_default_provider(tmp_path, {"PATH": "/bin"})
++    assert suggest.uses_default_provider(None, {})
++
++
++@pytest.mark.usefixtures("host_default")
++@pytest.mark.parametrize(
++    ("env", "settings"),
++    [
++        ({"ANTHROPIC_BASE_URL": "https://gateway.example"}, {}),
++        ({"CLAUDE_CODE_USE_BEDROCK": "1"}, {}),
++        ({"CLAUDE_CODE_USE_VERTEX": "1"}, {}),
++        ({}, {"apiKeyHelper": "print-token"}),
++        ({}, {"env": {"ANTHROPIC_BASE_URL": "https://gateway.example"}}),
++    ],
++)
++def test_other_providers_skip(
++    tmp_path: Path, env: dict[str, str], settings: dict[str, Any]
++) -> None:
++    (tmp_path / "claude-settings.json").write_text(json.dumps(settings))
++    assert not suggest.uses_default_provider(tmp_path, env)
++
++
++def test_a_host_launch_config_or_managed_gateway_skips(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    import omnigent.harnesses.claude_native.main as native_main
++
++    monkeypatch.setattr(native_main, "resolve_native_claude_config", lambda **kw: object())
++    monkeypatch.setattr(native_main, "managed_claude_gateway_signal", lambda: (None, False))
++    assert not suggest.uses_default_provider(tmp_path, {})
++    monkeypatch.setattr(native_main, "resolve_native_claude_config", lambda **kw: None)
++    monkeypatch.setattr(
++        native_main, "managed_claude_gateway_signal", lambda: ("https://gw.example", True)
++    )
++    assert not suggest.uses_default_provider(tmp_path, {})
++
++
++# ── Scheduling ─────────────────────────────────────────────────────
++
++
++async def _schedule(
++    server: _Server, transcript: Path, state: suggest.SuggestionState, **kw: Any
++) -> None:
++    async with server.client() as client:
++        suggest.schedule_prompt_suggestion(
++            client,
++            session_id="conv_a",
++            transcript_path=transcript,
++            recorded_at=kw.pop("recorded_at", time.time()),
++            state=state,
++            env=kw.pop("env", ON),
++            last_assistant_message=kw.pop("last_assistant_message", None),
++        )
++        if state.task is not None:
++            await state.task
++
++
++@pytest.mark.asyncio
++async def test_finished_turn_posts_one_transient_suggestion(on_path: Path, tmp_path: Path) -> None:
++    log = _fake_claude(on_path, "print('Open a draft PR')")
++    server = _Server()
++    await _schedule(server, _finished_turn(tmp_path), suggest.SuggestionState())
++    assert server.posts == [
++        {"type": "external_session_suggestion", "data": {"suggestion": "Open a draft PR"}}
++    ]
++    assert len(_calls(log)) == 1
++    assert "fix the failing test" in _calls(log)[0]["stdin"]
++
++
++@pytest.mark.asyncio
++async def test_switched_off_by_default(on_path: Path, tmp_path: Path) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    server = _Server()
++    state = suggest.SuggestionState()
++    await _schedule(server, _finished_turn(tmp_path), state, env={})
++    assert state.task is None
++    assert server.posts == [] and server.gets == []
++    assert _calls(log) == []
++    assert not suggest.suggestions_enabled({suggest.ENABLE_ENV_VAR: "0"})
++
++
++@pytest.mark.asyncio
++async def test_sub_agent_sessions_get_no_suggestion(on_path: Path, tmp_path: Path) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    server = _Server(parent_session_id="conv_parent")
++    state = suggest.SuggestionState()
++    await _schedule(server, _finished_turn(tmp_path), state)
++    await _schedule(server, _finished_turn(tmp_path), state)
++    assert server.posts == []
++    assert server.gets == ["/v1/sessions/conv_a"]  # looked up once, then cached
++    assert _calls(log) == []
++
++
++@pytest.mark.asyncio
++async def test_waiting_turns_and_stale_hooks_make_no_call(on_path: Path, tmp_path: Path) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    server = _Server()
++    waiting = _transcript(
++        tmp_path,
++        _user("deploy"),
++        _assistant(_text("Which host?"), _tool_use("q1", "AskUserQuestion")),
++    )
++    await _schedule(server, waiting, suggest.SuggestionState())
++    stale = suggest.SuggestionState()
++    await _schedule(server, _finished_turn(tmp_path), stale, recorded_at=time.time() - 600)
++    assert stale.task is None
++    assert server.posts == []
++    assert _calls(log) == []
++
++
++@pytest.mark.asyncio
++async def test_a_newer_turn_cancels_the_older_call(on_path: Path, tmp_path: Path) -> None:
++    """The first call is killed mid-flight; only the newer turn's answer is posted."""
++    log = _fake_claude(
++        on_path,
++        "if 'first' in stdin:\n    time.sleep(30)\nprint('second answer')",
++    )
++    server = _Server()
++    state = suggest.SuggestionState()
++    first = _transcript(tmp_path, _user("first prompt"), _assistant(_text("reply one")))
++    async with server.client() as client:
++        suggest.schedule_prompt_suggestion(
++            client,
++            session_id="conv_a",
++            transcript_path=first,
++            recorded_at=None,
++            state=state,
++            env=ON,
++        )
++        older = state.task
++        assert older is not None
++        for _ in range(100):
++            if _calls(log):
++                break
++            await asyncio.sleep(0.05)
++        second = tmp_path / "second.jsonl"
++        second.write_text(
++            json.dumps(_user("second prompt")) + "\n" + json.dumps(_assistant(_text("two"))) + "\n"
++        )
++        suggest.schedule_prompt_suggestion(
++            client,
++            session_id="conv_a",
++            transcript_path=second,
++            recorded_at=None,
++            state=state,
++            env=ON,
++        )
++        newer = state.task
++        assert newer is not None and newer is not older
++        await newer
++        with pytest.raises(asyncio.CancelledError):
++            await older
++    assert server.posts == [
++        {"type": "external_session_suggestion", "data": {"suggestion": "second answer"}}
++    ]
++    first_call = _calls(log)[0]
++    with pytest.raises(ProcessLookupError):
++        os.kill(first_call["pid"], 0)
++
++
++@pytest.mark.asyncio
++async def test_cancel_with_nothing_in_flight_is_a_no_op() -> None:
++    state = suggest.SuggestionState()
++    suggest.cancel_prompt_suggestion(state)
++    assert state.task is None
++
++
++# ── Forwarder hook-up ──────────────────────────────────────────────
++
++
++async def _forward_hooks(bridge_dir: Path, dedupe: forwarder._ForwardDedupeState) -> None:
++    async with _Server().client() as client:
++        hook_state = await forwarder._ensure_hook_state(
++            bridge_dir, start_at_end=False, session_id="conv_abc"
++        )
++        await forwarder._forward_available_status_events(
++            client=client,
++            session_id="conv_abc",
++            bridge_dir=bridge_dir,
++            state=hook_state,
++            retry_tracker=forwarder._PostRetryTracker(),
++            dedupe=dedupe,
++            task_subjects={},
++            task_statuses={},
++            task_order=[],
++        )
++
++
++@pytest.mark.asyncio
++async def test_forwarder_schedules_on_the_parent_stop_and_clears_on_prompt_submit(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    calls: list[tuple[str, Any]] = []
++    monkeypatch.setattr(
++        forwarder,
++        "schedule_prompt_suggestion",
++        lambda client, **kw: calls.append(
++            ("schedule", (kw["transcript_path"], kw["last_assistant_message"], kw["bridge_dir"]))
++        ),
++    )
++
++    async def fake_clear(client: httpx.AsyncClient, *, state: Any) -> None:
++        calls.append(("clear", None))
++
++    monkeypatch.setattr(forwarder, "clear_prompt_suggestion", fake_clear)
++    bridge_dir = tmp_path / "bridge"
++    transcript = tmp_path / "t.jsonl"
++    for event in ("UserPromptSubmit", "Stop"):
++        record_hook_event(
++            bridge_dir,
++            {
++                "hook_event_name": event,
++                "session_id": "claude-session",
++                "transcript_path": str(transcript),
++                "last_assistant_message": "All green.",
++            },
++        )
++    # A Claude Code subagent's Stop rides the same hooks file and must not count.
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "Stop", "session_id": "claude-session", "agent_id": "a123"},
++    )
++    await _forward_hooks(bridge_dir, forwarder._ForwardDedupeState())
++    assert calls == [("clear", None), ("schedule", (transcript, "All green.", bridge_dir))]
++
++
++@pytest.mark.asyncio
++async def test_forwarder_never_blocks_on_the_side_call(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """With a side call that hangs, the hook pass still returns at once."""
++    _fake_claude(on_path, "time.sleep(30)")
++    monkeypatch.setenv(suggest.ENABLE_ENV_VAR, "1")
++    bridge_dir = tmp_path / "bridge"
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "Stop",
++            "session_id": "claude-session",
++            "transcript_path": str(_finished_turn(tmp_path)),
++        },
++    )
++    dedupe = forwarder._ForwardDedupeState()
++    started = time.monotonic()
++    await _forward_hooks(bridge_dir, dedupe)
++    assert time.monotonic() - started < 2
++    task = dedupe.prompt_suggest.task
++    assert task is not None and not task.done()
++    suggest.cancel_prompt_suggestion(dedupe.prompt_suggest)
++    with pytest.raises(asyncio.CancelledError):
++        await task
++
++
++# ── Review fixes: hook reply, clears, forwarder exit ───────────────
++
++
++def test_hook_reply_wins_over_a_half_written_transcript(tmp_path: Path) -> None:
++    """The Stop payload's reply is used even when the tail still ends mid tool call."""
++    path = _transcript(
++        tmp_path,
++        _user("deploy it"),
++        _assistant(_text("Deploying."), _tool_use("t9")),
++    )
++    assert suggest.read_turn_context(path) is None
++    assert suggest.read_turn_context(path, "Deployed to staging.") == suggest.TurnContext(
++        "deploy it", "Deployed to staging."
++    )
++    assert suggest.read_turn_context(None, "Done.") == suggest.TurnContext("", "Done.")
++    assert suggest.read_turn_context(path, "   ") is None
++
++
++@pytest.mark.asyncio
++async def test_the_hook_reply_reaches_the_side_call(on_path: Path, tmp_path: Path) -> None:
++    log = _fake_claude(on_path, "print('Ship it')")
++    server = _Server()
++    half = _transcript(tmp_path, _user("deploy it"), _assistant(_tool_use("t9")))
++    await _schedule(
++        server, half, suggest.SuggestionState(), last_assistant_message="Deployed to staging."
++    )
++    assert server.posts == [
++        {"type": "external_session_suggestion", "data": {"suggestion": "Ship it"}}
++    ]
++    assert "Deployed to staging." in _calls(log)[0]["stdin"]
++
++
++@pytest.mark.asyncio
++async def test_a_non_default_provider_makes_no_call(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    log = _fake_claude(on_path, "print('x')")
++    monkeypatch.setattr(suggest, "uses_default_provider", lambda bridge_dir, env=None: False)
++    server = _Server()
++    await _schedule(server, _finished_turn(tmp_path), suggest.SuggestionState())
++    assert server.posts == []
++    assert _calls(log) == []
++
++
++@pytest.mark.asyncio
++async def test_a_typed_prompt_clears_a_shown_suggestion(on_path: Path, tmp_path: Path) -> None:
++    _fake_claude(on_path, "print('Open a draft PR')")
++    server = _Server()
++    state = suggest.SuggestionState()
++    await _schedule(server, _finished_turn(tmp_path), state)
++    assert state.shown == "conv_a"
++    async with server.client() as client:
++        await suggest.clear_prompt_suggestion(client, state=state)
++        await suggest.clear_prompt_suggestion(client, state=state)  # nothing shown: no post
++    assert server.posts[1:] == [
++        {"type": "external_session_suggestion", "data": {"suggestion": None}}
++    ]
++
++
++@pytest.mark.asyncio
++async def test_no_post_after_the_client_closed(on_path: Path, tmp_path: Path) -> None:
++    _fake_claude(on_path, "time.sleep(1); print('late')")
++    server = _Server()
++    state = suggest.SuggestionState()
++    async with server.client() as client:
++        suggest.schedule_prompt_suggestion(
++            client,
++            session_id="conv_a",
++            transcript_path=_finished_turn(tmp_path),
++            recorded_at=None,
++            state=state,
++            env=ON,
++        )
++    task = state.task
++    assert task is not None
++    await task
++    assert server.posts == []
++
++
++@pytest.mark.asyncio
++async def test_the_forwarder_exit_cancels_the_side_call(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Cancelling the forwarder (teardown, supervisor restart) leaves no call behind."""
++    started = asyncio.Event()
++    cancelled = asyncio.Event()
++
++    async def hanging_suggest(*args: Any, **kwargs: Any) -> None:
++        started.set()
++        try:
++            await asyncio.sleep(60)
++        except asyncio.CancelledError:
++            cancelled.set()
++            raise
++
++    monkeypatch.setattr(suggest, "_suggest", hanging_suggest)
++    monkeypatch.setenv(suggest.ENABLE_ENV_VAR, "1")
++    bridge_dir = tmp_path / "bridge"
++    transcript = _finished_turn(tmp_path)
++    for event in ("SessionStart", "Stop"):
++        record_hook_event(
++            bridge_dir,
++            {
++                "hook_event_name": event,
++                "session_id": "claude-session",
++                "transcript_path": str(transcript),
++                "last_assistant_message": "Fixed.",
++            },
++        )
++    server, _thread, base_url = _start_recording_server()
++    task = asyncio.create_task(
++        forwarder.forward_claude_transcript_to_session(
++            base_url=base_url,
++            headers={},
++            session_id="conv_parent",
++            bridge_dir=bridge_dir,
++            agent_name="claude-native-ui",
++            start_at_end=False,
++            poll_interval_s=0.01,
++        )
++    )
++    try:
++        await asyncio.wait_for(started.wait(), 10)
++    finally:
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        server.shutdown()
++        server.server_close()
++    await asyncio.wait_for(cancelled.wait(), 2)
++
++
++# ── Named Claude accounts ──────────────────────────────────────────
++
++
++def test_default_account_runs_and_named_or_unknown_skips(tmp_path: Path) -> None:
++    """The statusLine shim writes "" for the default login and the name otherwise."""
++    assert not suggest.uses_default_account(None)
++    assert not suggest.uses_default_account(tmp_path)  # no render yet: unknown
++    (tmp_path / "claude_account").write_text("")
++    assert suggest.uses_default_account(tmp_path)
++    (tmp_path / "claude_account").write_text("AE Backup")
++    assert not suggest.uses_default_account(tmp_path)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(("account", "calls"), [("", 1), ("AE Backup", 0)])
++async def test_a_named_account_session_makes_no_call(
++    on_path: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, account: str, calls: int
++) -> None:
++    monkeypatch.setattr(suggest, "uses_default_account", _REAL_USES_DEFAULT_ACCOUNT)
++    log = _fake_claude(on_path, "print('Open a draft PR')")
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    (bridge_dir / "claude_account").write_text(account)
++    server = _Server()
++    state = suggest.SuggestionState()
++    async with server.client() as client:
++        suggest.schedule_prompt_suggestion(
++            client,
++            session_id="conv_a",
++            transcript_path=_finished_turn(tmp_path),
++            recorded_at=None,
++            state=state,
++            bridge_dir=bridge_dir,
++            env=ON,
++        )
++        assert state.task is not None
++        await state.task
++    assert len(_calls(log)) == calls
++    assert len(server.posts) == calls
++    for call in _calls(log):
++        assert call["env"].get("CLAUDE_CODE_OAUTH_TOKEN") == "test-token"  # no account token
+diff --git a/tests/server/integration/test_ae_session_suggestion.py b/tests/server/integration/test_ae_session_suggestion.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..56f11f424c4c2ccbb0f73432f9935e801fc4904a
+--- /dev/null
++++ b/tests/server/integration/test_ae_session_suggestion.py
+@@ -0,0 +1,100 @@
++"""Tests for the transient ``external_session_suggestion`` session event."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import httpx
++import pytest
++
++from tests.server.helpers import create_test_agent
++
++pytestmark = pytest.mark.asyncio
++
++
++async def _session_with_capture(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
++    """Create a session and capture what the route publishes to its stream."""
++    published: list[tuple[str, dict[str, Any]]] = []
++    monkeypatch.setattr(
++        "omnigent.server.routes.sessions.session_stream.publish",
++        lambda session_id, event: published.append((session_id, event)),
++    )
++    agent = await create_test_agent(client)
++    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert resp.status_code == 201, resp.text
++    return resp.json()["id"], published
++
++
++async def test_suggestion_is_published_as_a_transient_session_suggestion(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The predicted prompt reaches the stream as ``session.suggestion`` and nothing persists."""
++    session_id, published = await _session_with_capture(client, monkeypatch)
++
++    for data in ({"suggestion": "  Open a draft PR "}, {"suggestion": None}):
++        resp = await client.post(
++            f"/v1/sessions/{session_id}/events",
++            json={"type": "external_session_suggestion", "data": data},
++        )
++        assert resp.status_code == 202, resp.text
++        assert resp.json() == {"queued": False}
++
++    assert published == [
++        (
++            session_id,
++            {
++                "type": "session.suggestion",
++                "sequence_number": None,
++                "conversation_id": session_id,
++                "suggestion": "Open a draft PR",
++            },
++        ),
++        (
++            session_id,
++            {
++                "type": "session.suggestion",
++                "sequence_number": None,
++                "conversation_id": session_id,
++                "suggestion": None,
++            },
++        ),
++    ]
++    items = await client.get(f"/v1/sessions/{session_id}/items")
++    assert items.status_code == 200, items.text
++    assert items.json()["data"] == []
++
++
++@pytest.mark.parametrize(
++    "data",
++    [
++        {"suggestion": ""},
++        {"suggestion": "   "},
++        {"suggestion": 7},
++        {"suggestion": "x" * 121},
++        {"suggestion": "two\nlines"},
++    ],
++)
++async def test_suggestion_rejects_bad_shapes(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, data: dict[str, Any]
++) -> None:
++    """An empty, mistyped, overlong or multi-line suggestion is a 400 and publishes nothing."""
++    session_id, published = await _session_with_capture(client, monkeypatch)
++
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": "external_session_suggestion", "data": data},
++    )
++    assert resp.status_code == 400, resp.text
++    assert "external_session_suggestion" in resp.text
++    assert published == []
++
++
++async def test_suggestion_for_an_unknown_session_is_not_found(client: httpx.AsyncClient) -> None:
++    """The event goes through the same session lookup as its siblings."""
++    resp = await client.post(
++        "/v1/sessions/conv_does_not_exist/events",
++        json={"type": "external_session_suggestion", "data": {"suggestion": None}},
++    )
++    assert resp.status_code == 404, resp.text
+diff --git a/web/src/components/composer/AeSuggestionGhost.tsx b/web/src/components/composer/AeSuggestionGhost.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f256acd3607cc1885c8eef4ec5d8fdf72b6329e8
+--- /dev/null
++++ b/web/src/components/composer/AeSuggestionGhost.tsx
+@@ -0,0 +1,55 @@
++// The predicted next prompt drawn as grey ghost text over the empty composer,
++// with a "Tab to use" chip ("Tap to use" on narrow screens). The text lets
++// taps through to the box; only the chip fills it in. Nothing is sent here.
++
++import { useRef, type MouseEvent } from "react";
++import { cn } from "@/lib/utils";
++import { useAeSuggestionHint } from "@/lib/aeSuggestion";
++
++export function AeSuggestionGhost({
++  text,
++  onAccept,
++}: {
++  text: string;
++  /** Fill `text` into this textarea (the composer's own, found beside the ghost). */
++  onAccept: (textarea: HTMLTextAreaElement) => void;
++}) {
++  const hint = useAeSuggestionHint();
++  const rootRef = useRef<HTMLDivElement>(null);
++  const accept = (event: MouseEvent) => {
++    event.preventDefault();
++    const textarea = rootRef.current?.parentElement?.querySelector("textarea");
++    if (textarea) onAccept(textarea);
++  };
++  return (
++    // The row and the grey text let clicks through, so a tap anywhere but the
++    // chip focuses the textarea; the chip keeps its own space at the end.
++    <div
++      ref={rootRef}
++      data-testid="ae-suggestion"
++      className="pointer-events-none absolute inset-x-3 top-3 flex items-start gap-2"
++    >
++      <span
++        aria-hidden
++        data-testid="ae-suggestion-text"
++        className="composer-input-text min-w-0 truncate text-ui text-foreground/40"
++      >
++        {text}
++      </span>
++      <button
++        type="button"
++        tabIndex={-1}
++        data-testid="ae-suggestion-hint"
++        aria-label={`${hint}: ${text}`}
++        onMouseDown={(event) => event.preventDefault()}
++        onClick={accept}
++        className={cn(
++          "pointer-events-auto ml-auto shrink-0 rounded-md border border-current px-1.5 text-[11px] leading-[18px]",
++          "text-muted-foreground opacity-70 hover:opacity-100",
++        )}
++      >
++        {hint}
++      </button>
++    </div>
++  );
++}
+diff --git a/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx b/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..54ff6bb8d35ab6ea1a23aec8543ca1e08518abe9
+--- /dev/null
++++ b/web/src/components/composer/ChatComposer.aeSuggestion.test.tsx
+@@ -0,0 +1,179 @@
++import { useState } from "react";
++import { fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { ChatComposer } from "./ChatComposer";
++
++function renderComposer(suggestion: string | null, initial = "") {
++  const onKeyDown = vi.fn();
++  const onSubmit = vi.fn();
++  function Editor() {
++    const [value, setValue] = useState(initial);
++    return (
++      <form onSubmit={onSubmit}>
++        <ChatComposer
++          keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
++          aeSuggestion={suggestion}
++          input={{
++            "aria-label": "Draft",
++            placeholder: "Send a message…",
++            value,
++            onChange: (event) => setValue(event.target.value),
++            onKeyDown,
++          }}
++          actions={{ leading: null, trailing: null }}
++        />
++      </form>
++    );
++  }
++  render(<Editor />);
++  return {
++    input: screen.getByRole("textbox", { name: "Draft" }) as HTMLTextAreaElement,
++    onKeyDown,
++    onSubmit,
++  };
++}
++
++function mockWidth(narrow: boolean) {
++  vi.stubGlobal(
++    "matchMedia",
++    vi.fn((query: string) => ({
++      matches: narrow && query.includes("max-width: 639"),
++      media: query,
++      addEventListener: vi.fn(),
++      removeEventListener: vi.fn(),
++    })),
++  );
++}
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++});
++
++describe("ChatComposer prompt suggestion", () => {
++  it("shows the ghost text and the Tab chip over an empty box, hiding the placeholder", () => {
++    const { input } = renderComposer("Open a draft PR");
++    expect(screen.getByTestId("ae-suggestion-text")).toHaveTextContent("Open a draft PR");
++    expect(screen.getByTestId("ae-suggestion-hint")).toHaveTextContent("Tab to use");
++    expect(input).toHaveAttribute("placeholder", "");
++  });
++
++  it("is not drawn without a suggestion or once the box has text", () => {
++    renderComposer(null);
++    expect(screen.queryByTestId("ae-suggestion")).toBeNull();
++    expect(screen.getByRole("textbox", { name: "Draft" })).toHaveAttribute(
++      "placeholder",
++      "Send a message…",
++    );
++  });
++
++  it("hides as soon as the user types", () => {
++    const { input } = renderComposer("Open a draft PR");
++    fireEvent.change(input, { target: { value: "h" } });
++    expect(screen.queryByTestId("ae-suggestion")).toBeNull();
++  });
++
++  it("Tab fills the suggestion into the box and never sends it", () => {
++    const { input, onKeyDown, onSubmit } = renderComposer("Open a draft PR");
++    const tab = fireEvent.keyDown(input, { key: "Tab" });
++    expect(tab).toBe(false); // default prevented: focus stays in the box
++    expect(input).toHaveValue("Open a draft PR");
++    expect(onKeyDown).not.toHaveBeenCalled();
++    expect(onSubmit).not.toHaveBeenCalled();
++    expect(screen.queryByTestId("ae-suggestion")).toBeNull();
++  });
++
++  it("leaves Tab alone when no suggestion shows", () => {
++    const { input, onKeyDown } = renderComposer(null);
++    const tab = fireEvent.keyDown(input, { key: "Tab" });
++    expect(tab).toBe(true);
++    expect(input).toHaveValue("");
++    expect(onKeyDown).toHaveBeenCalledWith(
++      expect.objectContaining({ key: "Tab" }),
++      expect.anything(),
++    );
++  });
++
++  it("leaves Tab alone while the box has text", () => {
++    const typed = renderComposer("Open a draft PR", "draft @fi");
++    fireEvent.keyDown(typed.input, { key: "Tab" });
++    expect(typed.input).toHaveValue("draft @fi");
++    expect(typed.onKeyDown).toHaveBeenCalledTimes(1);
++  });
++
++  it("a tap on the grey text does not fill the box; it lets the tap through", () => {
++    const { input } = renderComposer("Run the tests again");
++    const text = screen.getByTestId("ae-suggestion-text");
++    expect(text.tagName).toBe("SPAN");
++    expect(text.closest("[data-testid=ae-suggestion]")).toHaveClass("pointer-events-none");
++    expect(text).not.toHaveClass("pointer-events-auto");
++    fireEvent.click(text);
++    expect(input).toHaveValue("");
++  });
++
++  it("the chip fills the box too", () => {
++    const { input } = renderComposer("Run the tests again");
++    fireEvent.click(screen.getByTestId("ae-suggestion-hint"));
++    expect(input).toHaveValue("Run the tests again");
++  });
++
++  it("ignores Tab mid-composition", () => {
++    const { input } = renderComposer("Open a draft PR");
++    fireEvent.keyDown(input, { key: "Tab", isComposing: true });
++    expect(input).toHaveValue("");
++  });
++
++  it("Esc hides the suggestion until the next one, and Tab then behaves as usual", () => {
++    const onKeyDown = vi.fn();
++    function Editor() {
++      const [value, setValue] = useState("");
++      const [suggestion, setSuggestion] = useState<string | null>("Open a draft PR");
++      return (
++        <>
++          <button type="button" onClick={() => setSuggestion(null)}>
++            turn starts
++          </button>
++          <button type="button" onClick={() => setSuggestion("Open a draft PR")}>
++            turn ends
++          </button>
++          <ChatComposer
++            keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
++            aeSuggestion={suggestion}
++            input={{
++              "aria-label": "Draft",
++              value,
++              onChange: (event) => setValue(event.target.value),
++              onKeyDown,
++            }}
++            actions={{ leading: null, trailing: null }}
++          />
++        </>
++      );
++    }
++    render(<Editor />);
++    const input = screen.getByRole("textbox", { name: "Draft" }) as HTMLTextAreaElement;
++    fireEvent.keyDown(input, { key: "Escape" });
++    expect(screen.queryByTestId("ae-suggestion")).toBeNull();
++    expect(onKeyDown).not.toHaveBeenCalled();
++    fireEvent.keyDown(input, { key: "Tab" });
++    expect(input).toHaveValue("");
++    expect(onKeyDown).toHaveBeenCalledTimes(1);
++    // The next turn clears the old suggestion, then brings one back (same text or not).
++    fireEvent.click(screen.getByText("turn starts"));
++    fireEvent.click(screen.getByText("turn ends"));
++    expect(screen.getByTestId("ae-suggestion-text")).toHaveTextContent("Open a draft PR");
++    fireEvent.keyDown(input, { key: "Tab" });
++    expect(input).toHaveValue("Open a draft PR");
++  });
++
++  it("says Tap to use below 640 px wide", () => {
++    mockWidth(true);
++    renderComposer("Open a draft PR");
++    expect(screen.getByTestId("ae-suggestion-hint")).toHaveTextContent("Tap to use");
++  });
++
++  it("says Tab to use at 640 px and wider", () => {
++    mockWidth(false);
++    renderComposer("Open a draft PR");
++    expect(screen.getByTestId("ae-suggestion-hint")).toHaveTextContent("Tab to use");
++  });
++});
+diff --git a/web/src/components/composer/ChatComposer.tsx b/web/src/components/composer/ChatComposer.tsx
+index 1b4ab4e6a187d494ad1f79e257ecd644c3f963c5..4adaec9ad65ede7da475103e33e07acf535baaef 100644
+--- a/web/src/components/composer/ChatComposer.tsx
++++ b/web/src/components/composer/ChatComposer.tsx
+@@ -2,6 +2,7 @@ import {
+   forwardRef,
+   useLayoutEffect,
+   useRef,
++  useState,
+   type ComponentPropsWithRef,
+   type ComponentPropsWithoutRef,
+   type KeyboardEvent,
+@@ -18,6 +19,8 @@ import {
+   isComposerSteerAllKey,
+ } from "@/lib/composerSendShortcutPreferences";
+ import { CHAT_COLUMN_WIDTH } from "@/pages/chatLayout";
++import { aeIsSuggestionAcceptKey, aeShownSuggestion } from "@/lib/aeSuggestion";
++import { AeSuggestionGhost } from "./AeSuggestionGhost";
+ 
+ export const COMPOSER_COLUMN_WIDTH = `w-full ${CHAT_COLUMN_WIDTH}`;
+ 
+@@ -92,12 +95,18 @@ interface ChatComposerProps extends Omit<ComponentPropsWithoutRef<"div">, "child
+     leadingTestId?: string;
+     trailingTestId?: string;
+   };
++  /** A predicted next prompt, drawn as ghost text while the box is empty. */
++  aeSuggestion?: string | null;
+ }
+ 
+ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(function ChatComposer(
+-  { className, input, keyboard, slots, actions, ...props },
++  { className, input, keyboard, slots, actions, aeSuggestion, ...props },
+   ref,
+ ) {
++  // Esc hides the suggestion until the next one (a new turn clears the old first).
++  const [aeDismissed, setAeDismissed] = useState<string | null>(null);
++  if (aeDismissed !== null && aeDismissed !== aeSuggestion) setAeDismissed(null);
++  const aeGhost = aeDismissed ? null : aeShownSuggestion(aeSuggestion, input.value);
+   const actionRowRef = useRef<HTMLDivElement>(null);
+   const actionWidthRef = useRef<HTMLDivElement>(null);
+   const leadingRef = useRef<HTMLDivElement>(null);
+@@ -119,7 +128,15 @@ export const ChatComposer = forwardRef<HTMLDivElement, ChatComposerProps>(functi
+       >
+         {slots?.inputPrefix}
+         {slots?.inputBackdrop}
+-        <ComposerTextInput input={input} keyboard={keyboard} />
++        <ComposerTextInput
++          input={input}
++          keyboard={keyboard}
++          aeSuggestion={aeGhost}
++          onAeDismiss={() => setAeDismissed(aeGhost)}
++        />
++        {aeGhost && (
++          <AeSuggestionGhost text={aeGhost} onAccept={(el) => aeFillSuggestion(el, aeGhost)} />
++        )}
+         {slots?.inputHint}
+       </ComposerInputArea>
+       {slots?.attachments}
+@@ -253,14 +270,37 @@ function insertComposerText(
+   textarea.dispatchEvent(new Event("input", { bubbles: true }));
+ }
+ 
++/** Put an accepted suggestion in the box (never sends) with the caret at its end. */
++function aeFillSuggestion(textarea: HTMLTextAreaElement, text: string) {
++  textarea.focus();
++  insertComposerText(textarea, text, 0, textarea.value.length);
++}
++
+ export function ComposerTextInput({
+   input,
+   keyboard,
+-}: Pick<ChatComposerProps, "input" | "keyboard">) {
++  aeSuggestion,
++  onAeDismiss,
++}: Pick<ChatComposerProps, "input" | "keyboard" | "aeSuggestion"> & { onAeDismiss?: () => void }) {
+   return (
+     <ComposerTextarea
+       {...input}
++      placeholder={aeSuggestion ? "" : input.placeholder}
+       onKeyDown={(event) => {
++        // Tab takes a shown suggestion and Esc hides it; with none shown, or
++        // mid-composition, both keys are untouched.
++        if (aeSuggestion && !event.nativeEvent.isComposing) {
++          if (aeIsSuggestionAcceptKey(event)) {
++            event.preventDefault();
++            aeFillSuggestion(event.currentTarget, aeSuggestion);
++            return;
++          }
++          if (event.key === "Escape" && onAeDismiss) {
++            event.preventDefault();
++            onAeDismiss();
++            return;
++          }
++        }
+         // A newline in every mode and on touch devices; completion menus never see it.
+         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
+           event.preventDefault();
+diff --git a/web/src/lib/aeStreamObserver.ts b/web/src/lib/aeStreamObserver.ts
+index 9377acc9da639f3d70b8e9db363ce02a18fcf1ed..56bf6b71d3c3da1663f1e9c5ab6509d4993104e4 100644
+--- a/web/src/lib/aeStreamObserver.ts
++++ b/web/src/lib/aeStreamObserver.ts
+@@ -4,10 +4,12 @@
+ import { aeStampLastEvent } from "@/lib/aeSessionActivity";
+ import { aeIsContentEvent, aeNextProgress, type AeSessionProgress } from "@/lib/aeSessionProgress";
+ import type { StreamEvent } from "@/lib/events";
++import { aeNextSuggestion } from "@/lib/aeSuggestion";
+ import { aeNoteCompactionFailed, aeNoteCompactionTotals } from "@/lib/aeTokenDefrag";
+ 
+ export interface AeObservedState {
+   aeProgress: AeSessionProgress | null;
++  aeSuggestion?: string | null;
+   sessionStatus: string;
+   tokensUsed?: number | null;
+ }
+@@ -20,7 +22,11 @@ export interface AeObservedState {
+ export function aeObserveStreamEvent(
+   event: StreamEvent,
+   conversationId: string,
+-  write: (patch: { lastEventAt?: number; aeProgress?: AeSessionProgress | null }) => void,
++  write: (patch: {
++    lastEventAt?: number;
++    aeProgress?: AeSessionProgress | null;
++    aeSuggestion?: string | null;
++  }) => void,
+   read: () => AeObservedState | null,
+ ): void {
+   const state = read();
+@@ -35,6 +41,10 @@ export function aeObserveStreamEvent(
+     event.status === "running" &&
+     state?.sessionStatus !== "running";
+   if (aeIsContentEvent(event) || startsRunning) aeStampLastEvent(conversationId, write);
++  const suggestion = aeNextSuggestion(event, conversationId, state?.sessionStatus);
++  if (suggestion !== undefined && suggestion !== (state?.aeSuggestion ?? null)) {
++    write({ aeSuggestion: suggestion });
++  }
+   const next = aeNextProgress(event, conversationId);
+   if (next === undefined) return;
+   if (next === null) {
+diff --git a/web/src/lib/aeSuggestion.test.ts b/web/src/lib/aeSuggestion.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a8158920a9faa59a3f827e9de6b2313ec8bda986
+--- /dev/null
++++ b/web/src/lib/aeSuggestion.test.ts
+@@ -0,0 +1,82 @@
++import { describe, expect, it } from "vitest";
++import type { StreamEvent } from "@/lib/events";
++import {
++  aeComposerSuggestion,
++  aeIsSuggestionAcceptKey,
++  aeNextSuggestion,
++  aeParseSessionSuggestion,
++  aeShownSuggestion,
++} from "./aeSuggestion";
++
++const KEY = { shiftKey: false, altKey: false, ctrlKey: false, metaKey: false };
++
++function suggestion(text: string | null, conversationId = "conv_a"): StreamEvent {
++  return { type: "session_suggestion", conversationId, suggestion: text };
++}
++
++describe("aeParseSessionSuggestion", () => {
++  it("reads a suggestion, a clear, and collapses whitespace", () => {
++    expect(
++      aeParseSessionSuggestion({ conversation_id: "c", suggestion: " Run\nthe  tests " }),
++    ).toEqual({ type: "session_suggestion", conversationId: "c", suggestion: "Run the tests" });
++    expect(aeParseSessionSuggestion({ conversation_id: "c", suggestion: null })).toEqual({
++      type: "session_suggestion",
++      conversationId: "c",
++      suggestion: null,
++    });
++  });
++
++  it("rejects a payload without a conversation or with a non-string suggestion", () => {
++    expect(aeParseSessionSuggestion({ suggestion: "x" })).toBeNull();
++    expect(aeParseSessionSuggestion({ conversation_id: "c", suggestion: 7 })).toBeNull();
++  });
++});
++
++describe("aeNextSuggestion", () => {
++  it("keeps this conversation's suggestion while idle and ignores another's", () => {
++    expect(aeNextSuggestion(suggestion("Open a PR"), "conv_a", "idle")).toBe("Open a PR");
++    expect(aeNextSuggestion(suggestion("Open a PR", "conv_b"), "conv_a", "idle")).toBeUndefined();
++  });
++
++  it("drops a suggestion that arrives while a turn runs", () => {
++    expect(aeNextSuggestion(suggestion("late"), "conv_a", "running")).toBeUndefined();
++  });
++
++  it("clears when the next turn starts or the session rotates", () => {
++    const running: StreamEvent = {
++      type: "session_status",
++      conversationId: "conv_a",
++      status: "running",
++    } as StreamEvent;
++    expect(aeNextSuggestion(running, "conv_a", "idle")).toBeNull();
++    const idle = { ...running, status: "idle" } as StreamEvent;
++    expect(aeNextSuggestion(idle, "conv_a", "running")).toBeUndefined();
++    expect(
++      aeNextSuggestion(
++        { type: "session_superseded", conversationId: "conv_a" } as StreamEvent,
++        "conv_a",
++        "idle",
++      ),
++    ).toBeNull();
++  });
++});
++
++describe("composer visibility", () => {
++  it("shows only when idle and the box accepts input", () => {
++    expect(aeComposerSuggestion("Go", { busy: false, blocked: false })).toBe("Go");
++    expect(aeComposerSuggestion("Go", { busy: true, blocked: false })).toBeNull();
++    expect(aeComposerSuggestion("Go", { busy: false, blocked: true })).toBeNull();
++  });
++
++  it("draws the ghost only over an empty box", () => {
++    expect(aeShownSuggestion("Go", "")).toBe("Go");
++    expect(aeShownSuggestion("Go", "h")).toBeNull();
++    expect(aeShownSuggestion(null, "")).toBeNull();
++  });
++
++  it("takes plain Tab only", () => {
++    expect(aeIsSuggestionAcceptKey({ key: "Tab", ...KEY })).toBe(true);
++    expect(aeIsSuggestionAcceptKey({ key: "Tab", ...KEY, shiftKey: true })).toBe(false);
++    expect(aeIsSuggestionAcceptKey({ key: "Enter", ...KEY })).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeSuggestion.ts b/web/src/lib/aeSuggestion.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9e5fef39773ab87bf0196a6ab5c73fc6e48fea3a
+--- /dev/null
++++ b/web/src/lib/aeSuggestion.ts
+@@ -0,0 +1,110 @@
++// A predicted next prompt, relayed as `session.suggestion` after a finished
++// Claude turn (the forwarder's `ae_prompt_suggest` side call), and the rules
++// for when the composer shows it as ghost text.
++
++import { useSyncExternalStore } from "react";
++import type { StreamEvent } from "@/lib/events";
++
++/** `session.suggestion`: transient, never persisted. `suggestion` is `null` to clear. */
++export interface AeSessionSuggestionEvent {
++  type: "session_suggestion";
++  conversationId: string;
++  suggestion: string | null;
++}
++
++/** Parse a `session.suggestion` SSE payload, or `null` when it is malformed. */
++export function aeParseSessionSuggestion(
++  data: Record<string, unknown>,
++): AeSessionSuggestionEvent | null {
++  const conversationId = data.conversation_id;
++  if (typeof conversationId !== "string" || !conversationId) return null;
++  const raw = data.suggestion;
++  if (raw === null || raw === undefined) {
++    return { type: "session_suggestion", conversationId, suggestion: null };
++  }
++  if (typeof raw !== "string") return null;
++  const suggestion = raw.replace(/\s+/g, " ").trim();
++  return { type: "session_suggestion", conversationId, suggestion: suggestion || null };
++}
++
++// A new turn or a rotated session makes the last guess stale.
++const CLEARS_SUGGESTION_TYPES: ReadonlySet<StreamEvent["type"]> = new Set<StreamEvent["type"]>([
++  "session_input_consumed",
++  "session_superseded",
++]);
++
++/**
++ * The suggestion a conversation should hold after `event`: the relayed one,
++ * or `null` once a turn starts. A suggestion that arrives while a turn runs
++ * belongs to the turn before it and is dropped. `undefined` leaves it as is.
++ */
++export function aeNextSuggestion(
++  event: StreamEvent,
++  conversationId: string,
++  sessionStatus: string | undefined,
++): string | null | undefined {
++  if (event.type === "session_suggestion") {
++    if (event.conversationId !== conversationId) return undefined;
++    if (event.suggestion !== null && sessionStatus === "running") return undefined;
++    return event.suggestion;
++  }
++  if (event.type === "session_status") {
++    if (event.conversationId !== conversationId) return undefined;
++    return event.status === "running" ? null : undefined;
++  }
++  return CLEARS_SUGGESTION_TYPES.has(event.type) ? null : undefined;
++}
++
++/**
++ * What the composer may show: the suggestion only while no turn runs and the
++ * box accepts input; the composer itself also hides it once anything is typed.
++ */
++export function aeComposerSuggestion(
++  suggestion: string | null,
++  { busy, blocked }: { busy: boolean; blocked: boolean },
++): string | null {
++  return busy || blocked ? null : suggestion;
++}
++
++/** The ghost text to draw over the textarea: only over an empty box. */
++export function aeShownSuggestion(
++  suggestion: string | null | undefined,
++  value: unknown,
++): string | null {
++  if (!suggestion) return null;
++  return value === undefined || value === "" ? suggestion : null;
++}
++
++// Tailwind's `sm` line: below it there is no Tab key to offer.
++const NARROW_QUERY = "(max-width: 639.98px)";
++
++function subscribeNarrow(callback: () => void): () => void {
++  if (typeof window === "undefined" || !window.matchMedia) return () => {};
++  const mql = window.matchMedia(NARROW_QUERY);
++  mql.addEventListener("change", callback);
++  return () => mql.removeEventListener("change", callback);
++}
++
++function narrowSnapshot(): boolean {
++  if (typeof window === "undefined" || !window.matchMedia) return false;
++  return window.matchMedia(NARROW_QUERY).matches;
++}
++
++/** "Tab to use", or "Tap to use" below 640 px wide. */
++export function useAeSuggestionHint(): string {
++  const narrow = useSyncExternalStore(subscribeNarrow, narrowSnapshot, () => false);
++  return narrow ? "Tap to use" : "Tab to use";
++}
++
++/** Plain Tab, the key that takes a shown suggestion. */
++export function aeIsSuggestionAcceptKey(event: {
++  key: string;
++  shiftKey: boolean;
++  altKey: boolean;
++  ctrlKey: boolean;
++  metaKey: boolean;
++}): boolean {
++  return (
++    event.key === "Tab" && !event.shiftKey && !event.altKey && !event.ctrlKey && !event.metaKey
++  );
++}
+diff --git a/web/src/lib/events.ts b/web/src/lib/events.ts
+index 151eb612beecbf6c88dd698f39c2c9aad44119ea..555eab18e5334a0124641e4adb10672f0781a6b7 100644
+--- a/web/src/lib/events.ts
++++ b/web/src/lib/events.ts
+@@ -11,6 +11,7 @@
+ import type { RoutingDecisionExtras } from "./routingDecision";
+ import type { CodexQuestion } from "./blocks";
+ import type { AeSessionProgressEvent } from "./aeSessionProgress";
++import type { AeSessionSuggestionEvent } from "./aeSuggestion";
+ import type {
+   BackgroundTaskInfo,
+   CodexPersistMode,
+@@ -1036,4 +1037,5 @@ export type StreamEvent =
+   | SessionPresenceEvent
+   | SessionBtwSidechatEvent
+   | AeSessionProgressEvent
++  | AeSessionSuggestionEvent
+   | BrowserActionRequestEvent;
+diff --git a/web/src/lib/sse.ts b/web/src/lib/sse.ts
+index 1d92dbebfbecc973475dab9179c410cddf982cb1..7c9131187edceef28d78d45d15ca5a64472ebe10 100644
+--- a/web/src/lib/sse.ts
++++ b/web/src/lib/sse.ts
+@@ -10,6 +10,7 @@
+ 
+ import { readSubagentActivity } from "./subagentActivity";
+ import { aeParseSessionProgress } from "./aeSessionProgress";
++import { aeParseSessionSuggestion } from "./aeSuggestion";
+ import { codexQuestionsFrom } from "./blocks";
+ import type {
+   BrowserActionRequestEvent,
+@@ -882,6 +883,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
+     } satisfies SessionSupersededEvent;
+   }
+   if (eventType === "session.progress") return aeParseSessionProgress(data);
++  if (eventType === "session.suggestion") return aeParseSessionSuggestion(data);
+   if (eventType === "session.btw_sidechat") {
+     const conversationId = data.conversation_id;
+     const question = data.question;
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 85d5adfcd014d7cca724d6c878c96e3f832b336c..e5ff2f97ef6bb164fd660b61f0b7afff7881429b 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -31,6 +31,7 @@ import {
+   composerSendShortcutKeys,
+   KeyboardShortcutTooltipContent,
+ } from "@/components/KeyboardShortcut";
++import { aeComposerSuggestion } from "@/lib/aeSuggestion";
+ import { useLocation, useNavigate, useParams, useRebasePath } from "@/lib/routing";
+ import { Button } from "@/components/ui/button";
+ import {
+@@ -2406,6 +2407,7 @@ function ComposerImpl(
+   const conversationId = useChatStore((s) => s.conversationId);
+   const queuedMessages = useChatStore((s) => s.queuedMessages);
+   const sessionStatus = useChatStore((s) => s.sessionStatus);
++  const aeSuggestion = useChatStore((s) => s.aeSuggestion);
+   const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
+   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+   const dequeueMessage = useChatStore((s) => s.dequeueMessage);
+@@ -3622,6 +3624,16 @@ function ComposerImpl(
+       </div>
+       <ChatComposer
+         keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
++        aeSuggestion={aeComposerSuggestion(aeSuggestion, {
++          busy: isWorking || sessionStatus === "running",
++          blocked:
++            disabled ||
++            unreachable ||
++            isReadOnly ||
++            composerLockedByBtw ||
++            hasPendingElicitation ||
++            draft.quotes.length > 0,
++        })}
+         ref={bindComposerCard}
+         className={cn(
+           "mx-auto",
+diff --git a/web/src/store/aeSuggestion.test.ts b/web/src/store/aeSuggestion.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a4b23951aa914e5dca9a7517715561278d2ce8a
+--- /dev/null
++++ b/web/src/store/aeSuggestion.test.ts
+@@ -0,0 +1,95 @@
++import { QueryClient } from "@tanstack/react-query";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { aeResetLastEventStamps } from "@/lib/aeSessionActivity";
++import {
++  bindConversationForTest,
++  initChatStore,
++  pumpStreamEvents,
++  useChatStore,
++} from "./chatStore";
++import { conversationRegistry } from "./conversationRegistry";
++
++function pushableStream() {
++  let ctrl: ReadableStreamDefaultController<Uint8Array> | null = null;
++  const enc = new TextEncoder();
++  const stream = new ReadableStream<Uint8Array>({
++    start(c) {
++      ctrl = c;
++    },
++  });
++  return {
++    stream,
++    push: (event: string, data: Record<string, unknown>) =>
++      ctrl!.enqueue(enc.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`)),
++  };
++}
++
++const tick = () =>
++  new Promise<void>((resolve) => {
++    setTimeout(resolve, 0);
++  });
++const immediate = { schedule: (fn: () => void) => fn(), cancel: () => {} };
++
++function bindPumped(conversationId: string, sessionStatus: "running" | "idle" = "idle") {
++  const { set, get } = bindConversationForTest(conversationId, { sessionStatus });
++  const sink = pushableStream();
++  const controller = new AbortController();
++  void pumpStreamEvents(conversationId, sink.stream, controller, set, get, immediate);
++  return { sink, controller };
++}
++
++beforeEach(() => {
++  initChatStore(new QueryClient({ defaultOptions: { queries: { retry: false } } }));
++  aeResetLastEventStamps();
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(async () => new Response("{}", { headers: { "content-type": "application/json" } })),
++  );
++});
++
++afterEach(() => {
++  conversationRegistry.clear();
++  vi.restoreAllMocks();
++  vi.unstubAllGlobals();
++});
++
++describe("chat store aeSuggestion", () => {
++  it("keeps the latest suggestion after a turn and clears it when the next turn starts", async () => {
++    const { sink, controller } = bindPumped("conv_sug_a");
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++
++    sink.push("session.suggestion", { conversation_id: "conv_sug_a", suggestion: "Open a PR" });
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBe("Open a PR");
++
++    sink.push("session.status", { conversation_id: "conv_sug_a", status: "running" });
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++    controller.abort();
++  });
++
++  it("drops a suggestion that lands while a turn runs, and another session's", async () => {
++    const { sink, controller } = bindPumped("conv_sug_b", "running");
++    sink.push("session.suggestion", { conversation_id: "conv_sug_b", suggestion: "stale" });
++    sink.push("session.suggestion", { conversation_id: "conv_other", suggestion: "not mine" });
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++    controller.abort();
++  });
++
++  it("a null suggestion clears it, and nothing carries over to another conversation", async () => {
++    const { sink, controller } = bindPumped("conv_sug_c");
++    sink.push("session.suggestion", { conversation_id: "conv_sug_c", suggestion: "Ship it" });
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBe("Ship it");
++    sink.push("session.suggestion", { conversation_id: "conv_sug_c", suggestion: null });
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++
++    sink.push("session.suggestion", { conversation_id: "conv_sug_c", suggestion: "Again" });
++    await tick();
++    bindConversationForTest("conv_sug_d");
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++    controller.abort();
++  });
++});
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index f9ad631404ab30f787c1290543c30f84303666a0..48334edc92ebf140b5959596caddee3702a6d247 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -693,6 +693,8 @@ export interface ConversationState {
+   aeRunningSince: number | null;
+   /** The terminal's live spinner line (`session.progress`), or `null` when none shows. */
+   aeProgress: AeSessionProgress | null;
++  /** The predicted next prompt (`session.suggestion`) for the composer's ghost text. */
++  aeSuggestion: string | null;
+   /**
+    * Whether the active session is a native-terminal wrapper
+    * (claude-native / codex-native), derived from the `omnigent.wrapper`
+@@ -1887,6 +1889,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+   lastEventAt: null,
+   aeRunningSince: null,
+   aeProgress: null,
++  aeSuggestion: null,
+   isNativeTerminalSession: false,
+   nativeVendorOwnsModel: false,
+   boundAgentId: null,
+@@ -4541,6 +4544,7 @@ async function bindStream(
+         // Events seen on an earlier visit are stale; the snapshot's blocks date it.
+         lastEventAt: null,
+         aeProgress: null,
++        aeSuggestion: null,
+         // This conversation's own effective effort, which is what a warm switch
+         // back re-projects (it does not re-bind, so it cannot recompute it).
+         sessionReasoningEffort: effectiveEffort,
+diff --git a/web/src/store/conversationState.ts b/web/src/store/conversationState.ts
+index 9c170e039e5fc81c44a0776e2208a202ff1dbcba..2784ec0fbdd1b648b12297c299f168be071fbe65 100644
+--- a/web/src/store/conversationState.ts
++++ b/web/src/store/conversationState.ts
+@@ -26,6 +26,7 @@ const CONVERSATION_STATE_KEY_MAP: Record<keyof ConversationState, true> = {
+   lastEventAt: true,
+   aeRunningSince: true,
+   aeProgress: true,
++  aeSuggestion: true,
+   isNativeTerminalSession: true,
+   nativeVendorOwnsModel: true,
+   boundAgentId: true,
+@@ -97,6 +98,7 @@ export function createInitialConversationState(): ConversationState {
+     lastEventAt: null,
+     aeRunningSince: null,
+     aeProgress: null,
++    aeSuggestion: null,
+     isNativeTerminalSession: false,
+     nativeVendorOwnsModel: false,
+     boundAgentId: null,

@@ -1,0 +1,475 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 12:03:14 -0700
+Subject: [PATCH 078/148] [ae-patch] Record each Claude session's account
+ beside its status line, and ask Usage for the session's own
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+A session on a backup Claude account (a setup token the runner injects) showed
+the box's default login's plan limits in the session rail and the usage
+popover: nothing recorded which account a session ran on, and the web asked one
+host-wide question. The runner now names a backup account in the launch env
+(blanking any inherited name), and the statusLine shim writes it to a
+claude_account sidecar on every render, empty for the default login, so the AE
+relay can key each session's own windows by account. account_label reads an
+account's label without loading its token.
+
+The Usage section, the usage popover and the Agents section ask
+/v1/ae/limits for their own session and cache each session separately, and the
+header names a backup account ("Claude Code · AE Backup").
+---
+ omnigent/harnesses/claude_native/bridge.py    |  7 ++-
+ omnigent/harnesses/claude_native/main.py      |  2 +
+ omnigent/harnesses/claude_native/status.py    |  3 +
+ omnigent/onboarding/claude_accounts.py        | 18 +++++-
+ .../test_claude_native_bridge.py              | 26 ++++++++-
+ tests/onboarding/test_claude_accounts.py      | 28 +++++++++
+ web/src/components/AePlanLimits.test.tsx      | 58 ++++++++++++++++++-
+ web/src/components/AePlanLimits.tsx           | 43 +++++++++++---
+ .../components/aeRail/AeRailAgents.test.tsx   |  2 +-
+ web/src/components/aeRail/AeRailAgents.tsx    |  2 +-
+ .../components/aeRail/AeRailUsage.test.tsx    | 32 ++++++++++
+ web/src/components/aeRail/AeRailUsage.tsx     |  2 +-
+ 12 files changed, 208 insertions(+), 15 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index eb6bd3e179010648913148ad6cdfed07313bb238..48c5b9d407204cc00df659669cd9105ddea25b9d 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -77,7 +77,7 @@ from omnigent.harnesses.claude_native.ae_pane_progress import (
+     progress_from_pane,
+ )
+ from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+-from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
++from omnigent.harnesses.claude_native.status import CLAUDE_ACCOUNT_FILE, CONTEXT_RAW_FILE
+ from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
+ from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
+@@ -2589,9 +2589,14 @@ def build_hook_settings(
+     # ``context.json``) and chains to whatever the user had globally so
+     # claude-hud / their bar still renders.
+     raw_quoted = shlex.quote(str(bridge_dir / CONTEXT_RAW_FILE))
++    # The account sidecar records which Claude login renders this bar
++    # (empty for the default one) so usage readers can key limits by account.
++    account_quoted = shlex.quote(str(bridge_dir / CLAUDE_ACCOUNT_FILE))
+     status_command = (
+         f"p=$(cat); printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
+         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
++        f"; printf '%s' \"${{OMNIGENT_CLAUDE_ACCOUNT-}}\" > {account_quoted}.$$.tmp"
++        f" && mv -f {account_quoted}.$$.tmp {account_quoted}"
+     )
+     chain_command = read_user_status_line_command()
+     if chain_command is not None:
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index f0bdc28a352fa8f4a41952b1743e710a7a55c284..11ba93956e4fc65e78dcb0ea8e26932489418e9f 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -1551,6 +1551,8 @@ def build_native_claude_terminal_env(
+             )
+     if account_name is not None and claude_config is not None:
+         raise RuntimeError("Claude account selection conflicts with provider authentication.")
++    # A backup account names itself below; blank any name the runner inherited.
++    terminal_env["OMNIGENT_CLAUDE_ACCOUNT"] = ""
+     if claude_config is None:
+         from omnigent.onboarding.claude_accounts import account_env_for_launch
+ 
+diff --git a/omnigent/harnesses/claude_native/status.py b/omnigent/harnesses/claude_native/status.py
+index 7a27b6ed2cd5054762e792ed4640a87b3285340e..0206e175adc7da1dc435610911c78bd5e5cd7a04 100644
+--- a/omnigent/harnesses/claude_native/status.py
++++ b/omnigent/harnesses/claude_native/status.py
+@@ -24,6 +24,9 @@ _CONTEXT_FILE = "context.json"
+ # (no Python spawn on Claude's blocking statusLine path). The forwarder
+ # normalizes it into ``context.json`` via :func:`sync_raw_status_context`.
+ CONTEXT_RAW_FILE = "context_raw.json"
++# Backup account name the session runs on, rewritten on every statusLine
++# render; empty for the box's default login.
++CLAUDE_ACCOUNT_FILE = "claude_account"
+ 
+ 
+ def normalize_status_payload(payload: dict[str, object]) -> dict[str, object] | None:
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+index c9d9fe0c63c687775d3c47685d501eee8753f3fe..7e5feacc81b3e69174f990e270667e75d2315cd0 100644
+--- a/omnigent/onboarding/claude_accounts.py
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -155,7 +155,23 @@ def account_env(name: str | None = None) -> dict[str, str]:
+         raise RuntimeError(
+             "The selected Claude account token is unavailable. Select another account."
+         )
+-    return {"CLAUDE_CODE_OAUTH_TOKEN": token, "ANTHROPIC_API_KEY": "", "ANTHROPIC_AUTH_TOKEN": ""}
++    # ``OMNIGENT_CLAUDE_ACCOUNT`` names the account to the statusLine shim, so
++    # usage readers can tell a backup account's windows from the default login's.
++    return {
++        "CLAUDE_CODE_OAUTH_TOKEN": token,
++        "ANTHROPIC_API_KEY": "",
++        "ANTHROPIC_AUTH_TOKEN": "",
++        "OMNIGENT_CLAUDE_ACCOUNT": name,
++    }
++
++
++def account_label(name: str) -> str:
++    """Return the editable label for *name*, or *name* itself; never loads secrets."""
++    try:
++        label = _read().get("labels", {}).get(name)
++    except Exception:
++        return name
++    return label if isinstance(label, str) and label else name
+ 
+ 
+ def account_env_for_launch(
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index a19d677b109e645c3c21a74d8cd8be1ed630e818..5c6744990a3dc27daa7fa83eb9c4c2d56216498c 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -11843,7 +11843,11 @@ def test_statusline_shell_command_captures_and_chains(
+     forwarder-side sync, and the chained command must receive the exact
+     stdin Claude sent.
+     """
+-    from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE, sync_raw_status_context
++    from omnigent.harnesses.claude_native.status import (
++        CLAUDE_ACCOUNT_FILE,
++        CONTEXT_RAW_FILE,
++        sync_raw_status_context,
++    )
+ 
+     chain_out = tmp_path / "chain_out.json"
+     monkeypatch.setattr(
+@@ -11861,12 +11865,30 @@ def test_statusline_shell_command_captures_and_chains(
+             "model": {"id": "claude-opus-4-8"},
+         }
+     )
++    default_env = {k: v for k, v in os.environ.items() if k != "OMNIGENT_CLAUDE_ACCOUNT"}
+     result = subprocess.run(
+-        ["/bin/sh", "-c", command], input=payload, capture_output=True, text=True
++        ["/bin/sh", "-c", command],
++        input=payload,
++        capture_output=True,
++        text=True,
++        env=default_env,
+     )
+     assert result.returncode == 0, result.stderr
+     assert (tmp_path / CONTEXT_RAW_FILE).read_text("utf-8") == payload
+     assert chain_out.read_text("utf-8") == payload
++    # The default login records an empty account sidecar on every render.
++    assert (tmp_path / CLAUDE_ACCOUNT_FILE).read_text("utf-8") == ""
++
++    backup = subprocess.run(
++        ["/bin/sh", "-c", command],
++        input=payload,
++        capture_output=True,
++        text=True,
++        env={**default_env, "OMNIGENT_CLAUDE_ACCOUNT": "AE Backup"},
++    )
++    assert backup.returncode == 0, backup.stderr
++    assert (tmp_path / CLAUDE_ACCOUNT_FILE).read_text("utf-8") == "AE Backup"
++    assert not list(tmp_path.glob(f"{CLAUDE_ACCOUNT_FILE}.*.tmp"))
+ 
+     sync_raw_status_context(tmp_path, None)
+     written = json.loads((tmp_path / "context.json").read_text("utf-8"))
+diff --git a/tests/onboarding/test_claude_accounts.py b/tests/onboarding/test_claude_accounts.py
+index 746b9392fd58f8f3011b84e8827e0b1866534cec..fb09020c4df3bb60da5fbf14539e64c0641bd199 100644
+--- a/tests/onboarding/test_claude_accounts.py
++++ b/tests/onboarding/test_claude_accounts.py
+@@ -37,10 +37,13 @@ def test_reject_duplicate_and_invalid_account():
+ def test_native_subscription_env_uses_selected_account():
+     from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
+ 
++    # The default login blanks an account name the runner may have inherited.
++    assert build_native_claude_terminal_env(None)["OMNIGENT_CLAUDE_ACCOUNT"] == ""
+     assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
+     env = build_native_claude_terminal_env(None)
+     assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat-backup"
+     assert env["ANTHROPIC_API_KEY"] == ""
++    assert env["OMNIGENT_CLAUDE_ACCOUNT"] == "Backup"
+ 
+ 
+ def test_session_account_choice_does_not_change_host_active_account(monkeypatch):
+@@ -194,3 +197,28 @@ def test_rename_frame_roundtrip():
+         account_label="Primary",
+     )
+     assert decode_host_frame(encode_host_frame(frame)) == frame
++
++
++def test_account_env_names_the_backup_account_and_label_never_loads_secrets(monkeypatch):
++    from omnigent.onboarding import secrets
++    from omnigent.onboarding.claude_accounts import account_label
++
++    assert change_account("claude-oauth-add", "Backup", "sk-ant-oat-backup").stored
++    assert account_env("Backup")["OMNIGENT_CLAUDE_ACCOUNT"] == "Backup"
++    assert account_env("") == {}
++    assert account_label("Backup") == "Backup"
++    assert change_account("claude-oauth-rename", "Backup", label="AE Backup").stored
++
++    def no_secrets(name):
++        raise AssertionError("account_label must not load secrets")
++
++    monkeypatch.setattr(secrets, "load_secret", no_secrets)
++    assert account_label("Backup") == "AE Backup"
++    assert account_label("Missing") == "Missing"
++
++
++def test_account_label_falls_back_to_the_name_on_bad_metadata(tmp_path):
++    from omnigent.onboarding.claude_accounts import account_label
++
++    (tmp_path / "claude-accounts.json").write_text("{")
++    assert account_label("Backup") == "Backup"
+diff --git a/web/src/components/AePlanLimits.test.tsx b/web/src/components/AePlanLimits.test.tsx
+index 633f7f8a77e9c03f2d44bb1972b005a70a456f9c..f0afcef29c1c6a26fc0654f21c2804c593f7266a 100644
+--- a/web/src/components/AePlanLimits.test.tsx
++++ b/web/src/components/AePlanLimits.test.tsx
+@@ -21,8 +21,10 @@ import { type AeContextSnapshotState, resetAeContextSnapshots } from "./aeContex
+ import { SNAPSHOT } from "./aeRailTestFixtures";
+ import {
+   type AeLimitsAnswer,
++  AeLimitsHarnessBlock,
+   AePlanLimitsPanel,
+   AePlanLimitsPopover,
++  fetchAeLimits,
+   formatAgo,
+   formatDuration,
+   formatMoney,
+@@ -204,6 +206,60 @@ describe("formatting", () => {
+   });
+ });
+ 
++describe("fetchAeLimits", () => {
++  beforeEach(() => {
++    vi.mocked(authenticatedFetch).mockReset();
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      Promise.resolve(new Response(JSON.stringify(ANSWER))),
++    );
++  });
++
++  it("adds session_id only when a session is given", async () => {
++    await fetchAeLimits();
++    await fetchAeLimits(null);
++    await fetchAeLimits("conv a/1");
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
++      "/v1/ae/limits",
++      "/v1/ae/limits",
++      "/v1/ae/limits?session_id=conv%20a%2F1",
++    ]);
++  });
++});
++
++describe("AeLimitsHarnessBlock account", () => {
++  const claude = ANSWER.harnesses.claude!;
++
++  it("names a backup account after the plan, and shows nothing for the default login", () => {
++    const { rerender } = render(
++      <AeLimitsHarnessBlock
++        harness="claude"
++        snapshot={{ ...claude, plan: "Max", account: "backup", account_label: "AE Backup" }}
++        now={NOW}
++      />,
++    );
++    expect(screen.getByTestId("ae-limits-account").textContent).toBe("AE Backup");
++    expect(screen.getByTestId("ae-limits-plan").parentElement?.textContent).toContain(
++      "Claude Code · Max · AE Backup",
++    );
++    rerender(
++      <AeLimitsHarnessBlock
++        harness="claude"
++        snapshot={{ ...claude, account: "backup" }}
++        now={NOW}
++      />,
++    );
++    expect(screen.getByTestId("ae-limits-account").textContent).toBe("backup");
++    rerender(
++      <AeLimitsHarnessBlock
++        harness="claude"
++        snapshot={{ ...claude, plan: "Max", account: null, account_label: null }}
++        now={NOW}
++      />,
++    );
++    expect(screen.queryByTestId("ae-limits-account")).toBeNull();
++  });
++});
++
+ describe("AePlanLimitsPanel", () => {
+   it("renders bars, reset times and the stamp for the session's own plan only", () => {
+     render(<AePlanLimitsPanel data={ANSWER} now={NOW} />);
+@@ -860,7 +916,7 @@ function routeFetch(
+     const url = String(input);
+     const json = (body: unknown, status = 200) =>
+       Promise.resolve(new Response(JSON.stringify(body), { status }));
+-    if (url === "/v1/ae/limits") return json(limits);
++    if (url.split("?")[0] === "/v1/ae/limits") return json(limits);
+     const childList = url.match(/^\/v1\/sessions\/([^/?]+)\/child_sessions$/);
+     if (childList) return json({ object: "list", data: children[childList[1]] ?? [] });
+     const snapshot = url.match(/^\/v1\/sessions\/([^/?]+)\?/);
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index 2dbaaba272aed4576523c29e2de84842cdcf95a7..28d5be1d3b3871fc6f28163b886ddbc4b85bcab9 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -76,6 +76,12 @@ export interface AeSessionContext {
+   input_tokens: number;
+   cache_write_tokens: number;
+   cache_read_tokens: number;
++  // Absent from a server older than per-session accounts.
++  /** The backup account this session runs on; null or absent = the box's default login. */
++  account?: string | null;
++  account_label?: string | null;
++  /** That account's own plan windows, when the session is on a backup account. */
++  windows?: AeLimitWindow[];
+ }
+ 
+ export interface AeLimitSnapshot {
+@@ -90,6 +96,10 @@ export interface AeLimitSnapshot {
+   credits?: AeCredits | null;
+   contexts?: AeSessionContext[];
+   hint?: string | null;
++  // Absent from a server older than per-session accounts.
++  /** The backup account this answer is for; null or absent = the box's default login. */
++  account?: string | null;
++  account_label?: string | null;
+ }
+ 
+ export interface AeLimitsAnswer {
+@@ -173,8 +183,12 @@ export function limitTone(pct: number): AeTone {
+   return "normal";
+ }
+ 
+-export async function fetchAeLimits(): Promise<AeLimitsAnswer> {
+-  const res = await authenticatedFetch(AE_LIMITS_PATH, { method: "GET" });
++/** With a session id the server answers for the account that session runs on. */
++export async function fetchAeLimits(sessionId?: string | null): Promise<AeLimitsAnswer> {
++  const path = sessionId
++    ? `${AE_LIMITS_PATH}?session_id=${encodeURIComponent(sessionId)}`
++    : AE_LIMITS_PATH;
++  const res = await authenticatedFetch(path, { method: "GET" });
+   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+   return (await res.json()) as AeLimitsAnswer;
+ }
+@@ -858,6 +872,14 @@ export function AeLimitsHarnessBlock({
+                 <span data-testid="ae-limits-plan">{snapshot.plan}</span>
+               </>
+             )}
++            {(snapshot?.account_label || snapshot?.account) && (
++              <>
++                {" · "}
++                <span data-testid="ae-limits-account">
++                  {snapshot.account_label || snapshot.account}
++                </span>
++              </>
++            )}
+           </>
+         }
+         tag={
+@@ -1052,15 +1074,22 @@ export function AePlanLimitsPanel({
+   );
+ }
+ 
+-/** `GET /v1/ae/limits` while `active`, then once a minute; one shared query for every caller. */
+-export function useAeLimits(active: boolean): {
++/**
++ * `GET /v1/ae/limits` while `active`, then once a minute; one shared query per
++ * session. Sessions on different Claude accounts never share a reading, so the
++ * session id is part of the cache key.
++ */
++export function useAeLimits(
++  active: boolean,
++  sessionId?: string | null,
++): {
+   data?: AeLimitsAnswer;
+   error?: unknown;
+   loading: boolean;
+ } {
+   const query = useQuery({
+-    queryKey: ["ae-limits"],
+-    queryFn: fetchAeLimits,
++    queryKey: ["ae-limits", sessionId ?? null],
++    queryFn: () => fetchAeLimits(sessionId),
+     enabled: active,
+     refetchInterval: active ? MINUTE : false,
+     staleTime: MINUTE / 2,
+@@ -1189,7 +1218,7 @@ function AePlanLimitsPopoverBody({
+   onShowRail: () => void;
+ }) {
+   const identity = aeContextIdentity(harness, model);
+-  const { data, error, loading } = useAeLimits(true);
++  const { data, error, loading } = useAeLimits(true, conversationId);
+   const sessions = useAeSessionContexts(true, conversationId, 60_000, identity);
+   // A cached category snapshot shows at once; a stale one refreshes.
+   const snapshot = useAeContextSnapshot(conversationId, {
+diff --git a/web/src/components/aeRail/AeRailAgents.test.tsx b/web/src/components/aeRail/AeRailAgents.test.tsx
+index eadfa8cb75f2e6592c8e8ca0008e4897be9958be..fd6944c05b62d9861ad8db63ecae43e04af5fa51 100644
+--- a/web/src/components/aeRail/AeRailAgents.test.tsx
++++ b/web/src/components/aeRail/AeRailAgents.test.tsx
+@@ -38,7 +38,7 @@ function child(id: string, extra: Record<string, unknown> = {}) {
+ function route(children: Record<string, unknown>[] | null, sessions: Record<string, object> = {}) {
+   vi.mocked(authenticatedFetch).mockImplementation((input) => {
+     const url = String(input);
+-    if (url === "/v1/ae/limits") return json({ now: "", harnesses: {} });
++    if (url.split("?")[0] === "/v1/ae/limits") return json({ now: "", harnesses: {} });
+     if (url.endsWith("/child_sessions")) {
+       return children ? json({ object: "list", data: children }) : json({ detail: "x" }, 500);
+     }
+diff --git a/web/src/components/aeRail/AeRailAgents.tsx b/web/src/components/aeRail/AeRailAgents.tsx
+index cda67cddc95a8da96ef912d9883421e7eb518ac8..c2ed50ab526708d2be0b2b9d48f886d127a6da2b 100644
+--- a/web/src/components/aeRail/AeRailAgents.tsx
++++ b/web/src/components/aeRail/AeRailAgents.tsx
+@@ -34,7 +34,7 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+     aeContextIdentity(harness, model),
+   );
+   // Claude Code collaborators report their window through the limits relay's status lines.
+-  const statusLines = useAeLimits(active).data?.harnesses.claude?.contexts;
++  const statusLines = useAeLimits(active, sessionId).data?.harnesses.claude?.contexts;
+   const subagents = sessions.subagents ?? 0;
+   const openTab = useAeRailOpenWorkspaceTab();
+   const now = Date.now();
+diff --git a/web/src/components/aeRail/AeRailUsage.test.tsx b/web/src/components/aeRail/AeRailUsage.test.tsx
+index f37a97427804794ba3f6907d23bcc953b9beee12..1c894df7891713c0586907a417061aa21c006e00 100644
+--- a/web/src/components/aeRail/AeRailUsage.test.tsx
++++ b/web/src/components/aeRail/AeRailUsage.test.tsx
+@@ -142,4 +142,36 @@ describe("AeRailUsage", () => {
+     render(<AeRailUsage sessionId="conv_a" />);
+     expect(authenticatedFetch).not.toHaveBeenCalled();
+   });
++
++  it("asks for the session's own account and keeps one reading per session", async () => {
++    useChatStore.setState({ conversationId: "conv_a", sessionHarness: "claude-native" });
++    const backup: AeLimitsAnswer = {
++      ...LIMITS,
++      harnesses: {
++        claude: {
++          ...LIMITS.harnesses.claude!,
++          plan: null,
++          account: "backup",
++          account_label: "AE Backup",
++        },
++      },
++    };
++    vi.mocked(authenticatedFetch).mockImplementation((input) =>
++      json(String(input).includes("session_id=conv%20b") ? backup : LIMITS),
++    );
++    const view = render(<AeRailUsage sessionId="conv_a" />);
++    await waitFor(() => expect(screen.getAllByTestId("ae-limits-harness")).toHaveLength(2));
++    expect(screen.queryByTestId("ae-limits-account")).toBeNull();
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => String(url))).toEqual([
++      "/v1/ae/limits?session_id=conv_a",
++    ]);
++    view.rerender(<AeRailUsage sessionId="conv b" />);
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-limits-account").textContent).toBe("AE Backup"),
++    );
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => String(url))).toEqual([
++      "/v1/ae/limits?session_id=conv_a",
++      "/v1/ae/limits?session_id=conv%20b",
++    ]);
++  });
+ });
+diff --git a/web/src/components/aeRail/AeRailUsage.tsx b/web/src/components/aeRail/AeRailUsage.tsx
+index b09485bda35dc55f213107fe5f590f4fdd45e8d0..cfe513b2b80d350ff61e8a3504b8aa8a1419a837 100644
+--- a/web/src/components/aeRail/AeRailUsage.tsx
++++ b/web/src/components/aeRail/AeRailUsage.tsx
+@@ -46,7 +46,7 @@ export function AeRailUsage({ sessionId }: AeRailSectionProps) {
+   // The store's harness belongs to its own conversation; another session's is unknown here.
+   const harness = useChatStore((s) => (s.conversationId === sessionId ? s.sessionHarness : null));
+   const active = useAeRailSectionActive("usage");
+-  const { data, error, loading } = useAeLimits(active);
++  const { data, error, loading } = useAeLimits(active, sessionId);
+   const now = useAeRailNow(active);
+   const inUse = aeLimitsHarnessFor(harness);
+   const order: AeHarness[] = inUse === "codex" ? ["codex", "claude"] : ["claude", "codex"];

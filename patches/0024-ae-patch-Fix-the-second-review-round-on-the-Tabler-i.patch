@@ -1,0 +1,770 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 07:27:29 -0700
+Subject: [PATCH 024/148] [ae-patch] Fix the second review round on the Tabler
+ icon loader
+
+Review of https://github.com/analyticendeavors/omnigent-ae/pull/57.
+
+- The asset glob asks for ?url&no-inline, so a library build (the embed)
+  emits the two JSON files as assets instead of inlining them as data: URLs
+  into a chunk the entry imports statically; a retry never adds a query to a
+  data: or blob: URL (aeTablerRetryUrl).
+- Own-key lookups use Object.prototype.hasOwnProperty.call, since Safari and
+  iOS 15.0 to 15.3 (still in build.target) lack Object.hasOwn.
+- The loader's fetch lives in aeTablerAssetFetch.ts, and test-setup.ts mocks
+  it with a disk reader (aeTablerAssetFetch.disk.ts), so no suite reaches the
+  global fetch for the icon set.
+- The loader retries by itself: on the window online event, and for a new
+  subscriber after a failure once a backoff (2 s doubling to 30 s) has passed.
+  The picker's Try again loads at once.
+- useAeTablerIcons is useSyncExternalStore over the loader
+  (subscribeAeTablerIcons, aeTablerIconsState); subscribing starts the load.
+- Listeners are notified outside the load's promise chain, each in a
+  try/catch, so a throwing listener cannot leave the load rejected.
+- Tests find node_modules from the test file's own path, not the working
+  directory.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ .../components/AeTablerIconPicker.test.tsx    |  32 ++--
+ web/src/components/AeTablerIconPicker.tsx     |  15 +-
+ web/src/extensions/services/projects.test.ts  |   5 +-
+ web/src/lib/aeTablerAssetFetch.disk.ts        |  20 +++
+ web/src/lib/aeTablerAssetFetch.ts             |  13 ++
+ web/src/lib/aeTablerIcon.test.tsx             |  43 ++---
+ web/src/lib/aeTablerIcon.tsx                  |  41 ++---
+ web/src/lib/aeTablerIconData.fake.ts          |  39 ++++
+ web/src/lib/aeTablerIconData.test.ts          | 166 ++++++++++++------
+ web/src/lib/aeTablerIconData.ts               |  90 +++++++---
+ web/src/test-setup.ts                         |   3 +
+ 11 files changed, 309 insertions(+), 158 deletions(-)
+ create mode 100644 web/src/lib/aeTablerAssetFetch.disk.ts
+ create mode 100644 web/src/lib/aeTablerAssetFetch.ts
+ create mode 100644 web/src/lib/aeTablerIconData.fake.ts
+
+diff --git a/web/src/components/AeTablerIconPicker.test.tsx b/web/src/components/AeTablerIconPicker.test.tsx
+index ec1799bfb967b3d98f9f174b3aac097afc6bc12f..9a96bdd0471abd59b9981df9de32f67157b76777 100644
+--- a/web/src/components/AeTablerIconPicker.test.tsx
++++ b/web/src/components/AeTablerIconPicker.test.tsx
+@@ -3,12 +3,13 @@
+ 
+ import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+ import { useState } from "react";
+-import { afterEach, describe, expect, it, vi } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { AeTablerIconPicker, searchAeTablerIcons } from "./AeTablerIconPicker";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ 
+-vi.mock("@/lib/aeTablerIconData", () => {
+-  const path = [["path", { d: "M4 4h16v16h-16z" }]];
++const fake = await vi.hoisted(async () => {
++  const { createFakeAeTablerIconData } = await import("@/lib/aeTablerIconData.fake");
++  const path: [string, Record<string, string>][] = [["path", { d: "M4 4h16v16h-16z" }]];
+   const names = [
+     "folder",
+     "rocket",
+@@ -19,19 +20,17 @@ vi.mock("@/lib/aeTablerIconData", () => {
+     "flame",
+     "zoom",
+   ];
+-  return {
+-    aeTablerIconsIfLoaded: () => null,
+-    loadAeTablerIcons: () => Promise.resolve(Object.fromEntries(names.map((n) => [n, path]))),
+-    subscribeAeTablerIcons: () => () => undefined,
+-    loadAeTablerIconTags: () =>
+-      Promise.resolve({
+-        rocket: { category: "Map", tags: ["galaxy", "spaceship"] },
+-        flame: { category: "Nature", tags: ["fire", "hot"] },
+-        zoom: { tags: ["magnifier"] },
+-      }),
+-  };
++  return createFakeAeTablerIconData(Object.fromEntries(names.map((n) => [n, path])), {
++    rocket: { category: "Map", tags: ["galaxy", "spaceship"] },
++    flame: { category: "Nature", tags: ["fire", "hot"] },
++    zoom: { tags: ["magnifier"] },
++  });
+ });
+ 
++vi.mock("@/lib/aeTablerIconData", () => fake.module);
++
++beforeEach(() => fake.reset());
++
+ afterEach(cleanup);
+ 
+ async function renderPicker() {
+@@ -154,11 +153,10 @@ describe("AeTablerIconPicker", () => {
+   });
+ 
+   it("offers a retry when the icon set fails to load", async () => {
+-    const data = await import("@/lib/aeTablerIconData");
+-    const load = vi.spyOn(data, "loadAeTablerIcons");
+-    load.mockRejectedValueOnce(new Error("offline"));
++    fake.store.failing = true;
+     render(<AeTablerIconPicker onSelect={vi.fn()} />);
+     expect(await screen.findByRole("alert")).toHaveTextContent("Couldn't load the icon set");
++    fake.store.failing = false;
+     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+     expect(await screen.findByTestId("ae-tabler-icon-rocket")).toBeInTheDocument();
+   });
+diff --git a/web/src/components/AeTablerIconPicker.tsx b/web/src/components/AeTablerIconPicker.tsx
+index 3f79108df963531983d6e552bb07634f0b43c4bd..2205ff93ad170565b9b7706fc433236d8e0436e9 100644
+--- a/web/src/components/AeTablerIconPicker.tsx
++++ b/web/src/components/AeTablerIconPicker.tsx
+@@ -10,7 +10,11 @@ import { type KeyboardEvent, type UIEvent, useEffect, useMemo, useRef, useState
+ import { Loader2Icon, SearchIcon } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import { AeTablerSvg, aeTablerValue, useAeTablerIcons } from "@/lib/aeTablerIcon";
+-import { type AeTablerIconTags, loadAeTablerIconTags } from "@/lib/aeTablerIconData";
++import {
++  type AeTablerIconTags,
++  loadAeTablerIconTags,
++  loadAeTablerIcons,
++} from "@/lib/aeTablerIconData";
+ import { cn } from "@/lib/utils";
+ 
+ const COLUMNS = 8;
+@@ -64,15 +68,20 @@ export function searchAeTablerIcons(
+ 
+ /** A themed Tabler icon picker. Calls `onSelect` with `tabler:<name>`. */
+ export function AeTablerIconPicker({ onSelect }: { onSelect: (value: string) => void }) {
+-  // Remounting the body retries a failed load; the loader forgets a failure.
++  // Try again loads now (past the loader's backoff) and remounts the body,
++  // which retries the tags too.
+   const [attempt, setAttempt] = useState(0);
++  const retry = () => {
++    loadAeTablerIcons().catch(() => undefined);
++    setAttempt((n) => n + 1);
++  };
+   return (
+     <div
+       data-testid="ae-tabler-picker"
+       className="flex w-[min(352px,calc(100vw-16px))] flex-col overflow-hidden rounded-lg bg-popover text-popover-foreground"
+       style={{ height: "var(--emoji-picker-height, 420px)" }}
+     >
+-      <PickerBody key={attempt} onSelect={onSelect} onRetry={() => setAttempt((n) => n + 1)} />
++      <PickerBody key={attempt} onSelect={onSelect} onRetry={retry} />
+     </div>
+   );
+ }
+diff --git a/web/src/extensions/services/projects.test.ts b/web/src/extensions/services/projects.test.ts
+index b4f67ea6db43da1f8acd64ce09efb3f52071448a..c8b45142ea8d2fb266278c1d449090402061296b 100644
+--- a/web/src/extensions/services/projects.test.ts
++++ b/web/src/extensions/services/projects.test.ts
+@@ -1,4 +1,6 @@
+ import { readFileSync } from "node:fs";
++import { dirname, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
+ import { QueryClient } from "@tanstack/react-query";
+ import { beforeEach, describe, expect, it, vi } from "vitest";
+ import {
+@@ -36,7 +38,8 @@ describe("projectSummary", () => {
+   });
+ 
+   it("fits every name in the installed @tabler/icons", () => {
+-    const file = "node_modules/@tabler/icons/tabler-nodes-outline.json";
++    const here = dirname(fileURLToPath(import.meta.url));
++    const file = resolve(here, "../../../node_modules/@tabler/icons/tabler-nodes-outline.json");
+     const names = Object.keys(JSON.parse(readFileSync(file, "utf8")) as Record<string, unknown>);
+     const longest = Math.max(...names.map((name) => name.length));
+     expect("tabler:".length + longest).toBeLessThanOrEqual(PROJECT_ICON_MAX_LENGTH);
+diff --git a/web/src/lib/aeTablerAssetFetch.disk.ts b/web/src/lib/aeTablerAssetFetch.disk.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..becbf4d48726b9872cbfed269aa3102035c9ed1f
+--- /dev/null
++++ b/web/src/lib/aeTablerAssetFetch.disk.ts
+@@ -0,0 +1,20 @@
++// Test stand-in for `aeTablerAssetFetch` (omnigent-ae, 2026-09-27), installed
++// for every suite by `src/test-setup.ts`: it answers from the installed
++// `@tabler/icons` files on disk, so icons draw as they would in the app and no
++// suite's fetch stub or call count sees the icon set.
++
++import { readFile } from "node:fs/promises";
++import { dirname, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++import { vi } from "vitest";
++
++/** The file behind an asset URL Vite gives the tests (`/@fs/<abs>` or root-relative). */
++export function aeTablerAssetFile(url: string): string {
++  const path = url.split("?")[0];
++  if (path.startsWith("/@fs/")) return path.slice("/@fs".length);
++  return resolve(dirname(fileURLToPath(import.meta.url)), `../..${path}`);
++}
++
++export const fetchAeTablerAsset = vi.fn(
++  async (url: string) => new Response(await readFile(aeTablerAssetFile(url))),
++);
+diff --git a/web/src/lib/aeTablerAssetFetch.ts b/web/src/lib/aeTablerAssetFetch.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8347a7f6c94b12d5dd72e970412b03454eeacdf5
+--- /dev/null
++++ b/web/src/lib/aeTablerAssetFetch.ts
+@@ -0,0 +1,13 @@
++// The one network call behind the Tabler icon set (omnigent-ae, 2026-09-27),
++// in its own module so the test setup can serve the files from disk and no
++// suite that draws a `tabler:` icon reaches the global fetch.
++
++/**
++ * Fetch one of this bundle's static assets. A plain fetch: the host transport
++ * (authenticatedFetch) is for server API routes, and these files sit next to
++ * the page's own scripts.
++ */
++export function fetchAeTablerAsset(url: string): Promise<Response> {
++  // oxlint-disable-next-line no-restricted-globals
++  return fetch(url);
++}
+diff --git a/web/src/lib/aeTablerIcon.test.tsx b/web/src/lib/aeTablerIcon.test.tsx
+index 374ce43112f783aecb16b82f5431c0c3e81b1b0c..6636c0dc13205dee6ddfed12883c171275744a30 100644
+--- a/web/src/lib/aeTablerIcon.test.tsx
++++ b/web/src/lib/aeTablerIcon.test.tsx
+@@ -9,33 +9,15 @@ import { ProjectRowIcon } from "@/shell/ProjectPicker";
+ 
+ const ROCKET_D = "M4 13a8 8 0 0 1 7 7";
+ 
+-// A loader that can fail on demand and tells subscribers on success, like the real one.
+-const data = vi.hoisted(() => ({
+-  set: { rocket: [["path", { d: "M4 13a8 8 0 0 1 7 7" }]] },
+-  loaded: null as object | null,
+-  failing: false,
+-  listeners: new Set<(set: object) => void>(),
+-}));
++// The store contract with a one-icon set; loads fail while `failing` is set.
++const fake = await vi.hoisted(async () => {
++  const { createFakeAeTablerIconData } = await import("@/lib/aeTablerIconData.fake");
++  return createFakeAeTablerIconData({ rocket: [["path", { d: "M4 13a8 8 0 0 1 7 7" }]] });
++});
+ 
+-vi.mock("@/lib/aeTablerIconData", () => ({
+-  aeTablerIconsIfLoaded: () => data.loaded,
+-  loadAeTablerIcons: () => {
+-    if (data.failing) return Promise.reject(new Error("offline"));
+-    data.loaded = data.set;
+-    for (const listener of [...data.listeners]) listener(data.set);
+-    return Promise.resolve(data.set);
+-  },
+-  subscribeAeTablerIcons: (listener: (set: object) => void) => {
+-    data.listeners.add(listener);
+-    return () => data.listeners.delete(listener);
+-  },
+-  loadAeTablerIconTags: () => Promise.resolve({}),
+-}));
++vi.mock("@/lib/aeTablerIconData", () => fake.module);
+ 
+-beforeEach(() => {
+-  data.loaded = null;
+-  data.failing = false;
+-});
++beforeEach(() => fake.reset());
+ 
+ afterEach(cleanup);
+ 
+@@ -114,7 +96,7 @@ describe("icon names that are Object.prototype keys", () => {
+ 
+ describe("recovery after a failed load", () => {
+   it("redraws icons that saw the failure once a later load succeeds", async () => {
+-    data.failing = true;
++    fake.store.failing = true;
+     const rows = render(
+       <>
+         <ProjectRowIcon icon="tabler:rocket" />
+@@ -124,14 +106,17 @@ describe("recovery after a failed load", () => {
+     await vi.waitFor(() =>
+       expect(rows.container.querySelectorAll("svg.lucide-folder")).toHaveLength(2),
+     );
+-    // The picker's Try again: another hook instance loads, this time successfully.
+-    data.failing = false;
+-    render(<AeProjectIconGlyph icon="tabler:rocket" />);
++    // One failed load for both rows, not one each.
++    expect(fake.store.loads).toBe(1);
++    // A later load (the loader's own retry, or the picker's Try again) succeeds.
++    fake.store.failing = false;
++    await fake.module.loadAeTablerIcons();
+     await vi.waitFor(() =>
+       expect(rows.container.querySelectorAll('[data-tabler-icon="rocket"] svg path')).toHaveLength(
+         2,
+       ),
+     );
+     expect(rows.container.querySelector("svg.lucide-folder")).toBeNull();
++    expect(fake.store.loads).toBe(2);
+   });
+ });
+diff --git a/web/src/lib/aeTablerIcon.tsx b/web/src/lib/aeTablerIcon.tsx
+index f45eac2f0675fe8af4d323b75b7de13e1030a69f..a3c463c0de48f2979e2cbcf889c9b5e6b9989040 100644
+--- a/web/src/lib/aeTablerIcon.tsx
++++ b/web/src/lib/aeTablerIcon.tsx
+@@ -4,13 +4,12 @@
+ // The shapes load lazily (`aeTablerIconData`), so a same-size empty box holds
+ // the place until they arrive; a name the set does not know is the folder.
+ 
+-import { useEffect, useState } from "react";
++import { useSyncExternalStore } from "react";
+ import { FolderIcon } from "lucide-react";
+ import {
+   type AeTablerIconNode,
+-  type AeTablerIconSet,
+-  aeTablerIconsIfLoaded,
+-  loadAeTablerIcons,
++  type AeTablerIconsState,
++  aeTablerIconsState,
+   subscribeAeTablerIcons,
+ } from "@/lib/aeTablerIconData";
+ import { cn } from "@/lib/utils";
+@@ -31,35 +30,19 @@ export function aeTablerValue(name: string): string {
+ }
+ 
+ /**
+- * The outline set once loaded; `"error"` when the load failed, until any later
+- * load (the picker's Try again) succeeds.
++ * The outline set once loaded; `"error"` after a failed load, until a later
++ * one (a retry, the picker's Try again) succeeds. Subscribing starts the load.
+  */
+-export function useAeTablerIcons(): AeTablerIconSet | "error" | null {
+-  const [set, setSet] = useState<AeTablerIconSet | "error" | null>(aeTablerIconsIfLoaded);
+-  useEffect(() => {
+-    if (set !== null && set !== "error") return undefined;
+-    let live = true;
+-    const unsubscribe = subscribeAeTablerIcons((loaded) => live && setSet(loaded));
+-    // A load that succeeded between the failure and this subscription.
+-    const already = aeTablerIconsIfLoaded();
+-    if (already) setSet(already);
+-    else if (set === null) {
+-      loadAeTablerIcons().then(
+-        (loaded) => live && setSet(loaded),
+-        () => live && setSet("error"),
+-      );
+-    }
+-    return () => {
+-      live = false;
+-      unsubscribe();
+-    };
+-  }, [set]);
+-  return set;
++export function useAeTablerIcons(): AeTablerIconsState {
++  return useSyncExternalStore(subscribeAeTablerIcons, aeTablerIconsState);
+ }
+ 
+ /** The icon's paths, or `undefined`; an own-key check, so `constructor` is not an icon. */
+-function iconNode(set: AeTablerIconSet | "error" | null, name: string | null) {
+-  return name && set && set !== "error" && Object.hasOwn(set, name) ? set[name] : undefined;
++function iconNode(set: AeTablerIconsState, name: string | null) {
++  if (!name || !set || set === "error") return undefined;
++  // Not Object.hasOwn: Safari and iOS 15.0 to 15.3, still in build.target, lack it.
++  // oxlint-disable-next-line prefer-object-has-own
++  return Object.prototype.hasOwnProperty.call(set, name) ? set[name] : undefined;
+ }
+ 
+ /** One Tabler outline icon as an inline SVG, drawn in `currentColor`. */
+diff --git a/web/src/lib/aeTablerIconData.fake.ts b/web/src/lib/aeTablerIconData.fake.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6dc3f786cd0c4746aadc97177628dd8846cd89f6
+--- /dev/null
++++ b/web/src/lib/aeTablerIconData.fake.ts
+@@ -0,0 +1,39 @@
++// A stand-in for `aeTablerIconData` in component suites (omnigent-ae,
++// 2026-09-27): the same store contract (subscribing starts the load, a failed
++// load reads "error" until one succeeds) with a small set, and a switch that
++// makes loads fail.
++
++import type { AeTablerIconSet, AeTablerIconTags, AeTablerIconsState } from "@/lib/aeTablerIconData";
++
++export function createFakeAeTablerIconData(set: AeTablerIconSet, tags: AeTablerIconTags = {}) {
++  const store = { state: null as AeTablerIconsState, failing: false, loads: 0 };
++  const listeners = new Set<() => void>();
++  const notify = () => {
++    for (const listener of [...listeners]) listener();
++  };
++  const loadAeTablerIcons = () => {
++    store.loads += 1;
++    store.state = store.failing ? "error" : set;
++    notify();
++    return store.failing ? Promise.reject(new Error("offline")) : Promise.resolve(set);
++  };
++  const module = {
++    aeTablerIconsIfLoaded: () => (store.state && store.state !== "error" ? store.state : null),
++    aeTablerIconsState: () => store.state,
++    subscribeAeTablerIcons: (listener: () => void) => {
++      listeners.add(listener);
++      if (store.state === null) loadAeTablerIcons().catch(() => undefined);
++      return () => {
++        listeners.delete(listener);
++      };
++    },
++    loadAeTablerIcons,
++    loadAeTablerIconTags: () => Promise.resolve(tags),
++  };
++  const reset = () => {
++    store.state = null;
++    store.failing = false;
++    store.loads = 0;
++  };
++  return { store, module, reset };
++}
+diff --git a/web/src/lib/aeTablerIconData.test.ts b/web/src/lib/aeTablerIconData.test.ts
+index 2187fd8c422f934a68f779223c0c56828ed1fba4..e4f2621ce2056a7ee68254240b0279c2a0a37af7 100644
+--- a/web/src/lib/aeTablerIconData.test.ts
++++ b/web/src/lib/aeTablerIconData.test.ts
+@@ -1,74 +1,132 @@
+-// The real JSON assets: the glob on the installed `@tabler/icons` path must
+-// find both files, or every `tabler:` icon silently degrades to the folder.
+-// `fetch` is served from disk, so the URLs the loaders ask for are checked too.
++// The real loader against the installed `@tabler/icons` files: the glob must
++// find both, or every `tabler:` icon silently degrades to the folder. The test
++// setup serves them from disk (`aeTablerAssetFetch.disk.ts`); each case loads a
++// fresh copy of the module, so failures and retries start from nothing.
+ 
+-import { readFileSync } from "node:fs";
+-import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
+-import {
+-  aeTablerIconsIfLoaded,
+-  loadAeTablerIcons,
+-  loadAeTablerIconTags,
+-  subscribeAeTablerIcons,
+-} from "@/lib/aeTablerIconData";
++import { afterEach, describe, expect, it, vi } from "vitest";
+ 
+-const requested: string[] = [];
+-let failNext = false;
++async function freshLoader() {
++  vi.resetModules();
++  const data = await import("@/lib/aeTablerIconData");
++  const { fetchAeTablerAsset } = await import("@/lib/aeTablerAssetFetch");
++  const fetch = vi.mocked(fetchAeTablerAsset);
++  fetch.mockClear();
++  const urls = () => fetch.mock.calls.map(([url]) => url);
++  const failNext = () => fetch.mockRejectedValueOnce(new TypeError("Load failed"));
++  return { data, fetch, urls, failNext };
++}
+ 
+-beforeAll(() => {
+-  vi.stubGlobal(
+-    "fetch",
+-    vi.fn((input: RequestInfo | URL) => {
+-      const url = String(input);
+-      requested.push(url);
+-      if (failNext) {
+-        failNext = false;
+-        // Safari's wording for a dropped connection.
+-        return Promise.reject(new TypeError("Load failed"));
+-      }
+-      // Vite's dev URL: `/@fs/<absolute path>` outside the root, else root-relative.
+-      const path = url.split("?")[0];
+-      const file = path.startsWith("/@fs/") ? path.slice("/@fs".length) : `.${path}`;
+-      return Promise.resolve(new Response(readFileSync(file)));
+-    }),
+-  );
++const settle = () =>
++  new Promise<void>((resolve) => {
++    setTimeout(resolve, 0);
++  });
++
++afterEach(() => {
++  vi.useRealTimers();
+ });
+ 
+-afterAll(() => {
+-  vi.unstubAllGlobals();
++describe("aeTablerRetryUrl", () => {
++  it("adds a retry query to an http URL and never to a data: or blob: URL", async () => {
++    const { aeTablerRetryUrl } = await import("@/lib/aeTablerIconData");
++    expect(aeTablerRetryUrl("/assets/a.json", 0)).toBe("/assets/a.json");
++    expect(aeTablerRetryUrl("/assets/a.json", 2)).toBe("/assets/a.json?retry=2");
++    expect(aeTablerRetryUrl("/assets/a.json?v=1", 1)).toBe("/assets/a.json?v=1&retry=1");
++    expect(aeTablerRetryUrl("data:application/json;base64,e30=", 3)).toBe(
++      "data:application/json;base64,e30=",
++    );
++    expect(aeTablerRetryUrl("blob:https://x/1", 1)).toBe("blob:https://x/1");
++  });
+ });
+ 
+ describe("aeTablerIconData", () => {
+   it("retries a failed load under a new URL, then loads once and caches", async () => {
+-    const heard = vi.fn();
+-    const unsubscribe = subscribeAeTablerIcons(heard);
+-    failNext = true;
+-    await expect(loadAeTablerIcons()).rejects.toThrow("Load failed");
+-    expect(aeTablerIconsIfLoaded()).toBeNull();
+-    expect(heard).not.toHaveBeenCalled();
++    const { data, urls, failNext } = await freshLoader();
++    failNext();
++    await expect(data.loadAeTablerIcons()).rejects.toThrow("Load failed");
++    expect(data.aeTablerIconsIfLoaded()).toBeNull();
++    expect(data.aeTablerIconsState()).toBe("error");
+ 
+-    const set = await loadAeTablerIcons();
+-    expect(requested).toHaveLength(2);
+-    expect(requested[0]).toMatch(/tabler-nodes-outline\.json$/);
++    const set = await data.loadAeTablerIcons();
++    expect(urls()).toHaveLength(2);
++    expect(urls()[0]).toMatch(/tabler-nodes-outline\.json(\?|$)/);
+     // Not the same URL again: a browser that cached the failure must refetch.
+-    expect(requested[1]).toBe(`${requested[0]}?retry=1`);
+-    expect(heard).toHaveBeenCalledWith(set);
+-    unsubscribe();
+-
++    expect(urls()[1]).toBe(data.aeTablerRetryUrl(urls()[0], 1));
+     expect(Object.keys(set).length).toBeGreaterThan(4000);
+     expect(set.rocket[0][0]).toBe("path");
+     expect(typeof set.rocket[0][1].d).toBe("string");
+-    expect(aeTablerIconsIfLoaded()).toBe(set);
+-    expect(await loadAeTablerIcons()).toBe(set);
+-    expect(requested).toHaveLength(2);
++    expect(data.aeTablerIconsState()).toBe(set);
++    expect(await data.loadAeTablerIcons()).toBe(set);
++    expect(urls()).toHaveLength(2);
+   });
+ 
+   it("loads the search tags, retrying under a new URL", async () => {
+-    requested.length = 0;
+-    failNext = true;
+-    await expect(loadAeTablerIconTags()).rejects.toThrow("Load failed");
+-    const tags = await loadAeTablerIconTags();
+-    expect(requested[0]).toMatch(/icons\.json$/);
+-    expect(requested[1]).toBe(`${requested[0]}?retry=1`);
++    const { data, urls, failNext } = await freshLoader();
++    failNext();
++    await expect(data.loadAeTablerIconTags()).rejects.toThrow("Load failed");
++    const tags = await data.loadAeTablerIconTags();
++    expect(urls()[0]).toMatch(/\/icons\.json(\?|$)/);
++    expect(urls()[1]).toBe(data.aeTablerRetryUrl(urls()[0], 1));
+     expect(tags.rocket.tags).toContain("space");
+   });
++
++  it("starts the load for the first subscriber and tells it once the set is in", async () => {
++    const { data, fetch } = await freshLoader();
++    const heard = vi.fn();
++    data.subscribeAeTablerIcons(heard);
++    data.subscribeAeTablerIcons(vi.fn());
++    expect(fetch).toHaveBeenCalledTimes(1);
++    expect(data.aeTablerIconsState()).toBeNull();
++    await data.loadAeTablerIcons();
++    await settle();
++    expect(data.aeTablerIconsState()).not.toBeNull();
++    expect(heard).toHaveBeenCalled();
++  });
++
++  it("keeps a good load when a listener throws", async () => {
++    const { data } = await freshLoader();
++    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
++    const after = vi.fn();
++    data.subscribeAeTablerIcons(() => {
++      if (data.aeTablerIconsIfLoaded()) throw new Error("listener broke");
++    });
++    data.subscribeAeTablerIcons(after);
++    const set = await data.loadAeTablerIcons();
++    await settle();
++    expect(data.aeTablerIconsIfLoaded()).toBe(set);
++    expect(after).toHaveBeenCalled();
++    // The promise stays resolved: a second call returns the same set, no refetch.
++    await expect(data.loadAeTablerIcons()).resolves.toBe(set);
++    expect(error).toHaveBeenCalled();
++    error.mockRestore();
++  });
++
++  it("retries for a new subscriber once the backoff has passed", async () => {
++    vi.useFakeTimers({ toFake: ["Date"] });
++    const { data, fetch, urls, failNext } = await freshLoader();
++    failNext();
++    const heard = vi.fn();
++    data.subscribeAeTablerIcons(heard);
++    await settle();
++    expect(data.aeTablerIconsState()).toBe("error");
++    // Right after the failure: no loop.
++    data.subscribeAeTablerIcons(vi.fn());
++    expect(fetch).toHaveBeenCalledTimes(1);
++    vi.setSystemTime(Date.now() + 2000);
++    data.subscribeAeTablerIcons(vi.fn());
++    expect(fetch).toHaveBeenCalledTimes(2);
++    expect(urls()[1]).toMatch(/[?&]retry=1$/);
++    await vi.waitFor(() => expect(data.aeTablerIconsIfLoaded()).not.toBeNull());
++    expect(heard).toHaveBeenCalled();
++  });
++
++  it("retries when the browser comes back online", async () => {
++    const { data, fetch, failNext } = await freshLoader();
++    failNext();
++    data.subscribeAeTablerIcons(vi.fn());
++    await settle();
++    expect(data.aeTablerIconsState()).toBe("error");
++    window.dispatchEvent(new Event("online"));
++    expect(fetch).toHaveBeenCalledTimes(2);
++    await vi.waitFor(() => expect(data.aeTablerIconsIfLoaded()).not.toBeNull());
++  });
+ });
+diff --git a/web/src/lib/aeTablerIconData.ts b/web/src/lib/aeTablerIconData.ts
+index 7ba6fd414dcbcd3ec950399b2d4385be70de3509..c2ab417ca52fd03624281162ea7f2a771ff38d46 100644
+--- a/web/src/lib/aeTablerIconData.ts
++++ b/web/src/lib/aeTablerIconData.ts
+@@ -1,6 +1,6 @@
+ // The Tabler icon set behind project icons (omnigent-ae, 2026-09-24). Two lazy
+ // JSON files from `@tabler/icons`, never in the main bundle: the outline shapes
+-// of every icon (about 240 KB gzipped, fetched the first time a `tabler:` icon
++// of every icon (about 250 KB gzipped, fetched the first time a `tabler:` icon
+ // renders or the picker opens) and the search tags (about 200 KB gzipped,
+ // fetched by the picker only). Both files sit outside the package's `exports`
+ // map, so they are reached with a glob on the installed path; that also keeps
+@@ -9,64 +9,95 @@
+ // Fetched as JSON assets rather than `import()`ed chunks (2026-09-27): Safari
+ // caches a failed dynamic import, so retrying the same `import()` never
+ // succeeds there. The eager `?url` glob bundles only each file's URL (relative
+-// to `import.meta.url`, so any base path works); a retry adds `retry=N`, which
+-// the static server ignores and every cache treats as a new URL.
++// to `import.meta.url`, so any base path works), and `no-inline` keeps the
++// files out of the bundle even in library builds (the embed), where Vite would
++// otherwise inline every asset as a data: URL. A retry adds `retry=N` to an
++// http(s) URL, which the static server ignores and every cache treats as new.
++
++import { fetchAeTablerAsset } from "@/lib/aeTablerAssetFetch";
+ 
+ /** One outline icon: its `<path>` elements and their attributes. */
+ export type AeTablerIconNode = [tag: string, attrs: Record<string, string>][];
+ export type AeTablerIconSet = Record<string, AeTablerIconNode>;
+ /** Icon name to its category and tags, from the package's `icons.json`. */
+ export type AeTablerIconTags = Record<string, { category?: string; tags?: (string | number)[] }>;
++/** The outline set; `null` while none has loaded and none has failed (or one is loading). */
++export type AeTablerIconsState = AeTablerIconSet | "error" | null;
+ 
+ const nodeFiles = import.meta.glob<string>(
+   "/node_modules/@tabler/icons/tabler-nodes-outline.json",
+-  {
+-    query: "?url",
+-    import: "default",
+-    eager: true,
+-  },
++  { query: "?url&no-inline", import: "default", eager: true },
+ );
+ const tagFiles = import.meta.glob<string>("/node_modules/@tabler/icons/icons.json", {
+-  query: "?url",
++  query: "?url&no-inline",
+   import: "default",
+   eager: true,
+ });
+ 
++/** The URL for attempt `retry` (0 is the first): a data: or blob: URL never takes a query. */
++export function aeTablerRetryUrl(url: string, retry: number): string {
++  if (retry === 0 || /^(data|blob):/i.test(url)) return url;
++  return `${url}${url.includes("?") ? "&" : "?"}retry=${retry}`;
++}
++
+ async function loadOne<T>(files: Record<string, string>, what: string, retry: number): Promise<T> {
+   const url = Object.values(files)[0];
+   if (!url) {
+     throw new Error(`@tabler/icons ${what} is missing; run pnpm install in web/ and rebuild`);
+   }
+-  const target = retry > 0 ? `${url}${url.includes("?") ? "&" : "?"}retry=${retry}` : url;
+-  // A static asset of this bundle, not a server API route: the host transport
+-  // (authenticatedFetch) is for API paths, so a plain fetch is the right call.
+-  // oxlint-disable-next-line no-restricted-globals
+-  const response = await fetch(target);
++  const response = await fetchAeTablerAsset(aeTablerRetryUrl(url, retry));
+   if (!response.ok) {
+     throw new Error(`@tabler/icons ${what} failed to load (HTTP ${response.status}); try again`);
+   }
+   return (await response.json()) as T;
+ }
+ 
++/** Retry delay after `failures` failed loads: 2 s, 4 s, 8 s, then 30 s at most. */
++const backoffMs = (failures: number) => Math.min(30_000, 1000 * 2 ** failures);
++
+ let iconSet: AeTablerIconSet | null = null;
+ let iconSetPromise: Promise<AeTablerIconSet> | null = null;
+ let iconTagsPromise: Promise<AeTablerIconTags> | null = null;
+ let iconSetFailures = 0;
++let iconSetFailedAt = 0;
+ let iconTagsFailures = 0;
+-const iconSetListeners = new Set<(set: AeTablerIconSet) => void>();
++const iconSetListeners = new Set<() => void>();
++
++function notify(): void {
++  // Outside the load's promise chain, and one listener's throw cannot stop the
++  // rest or leave the load looking failed.
++  for (const listener of [...iconSetListeners]) {
++    try {
++      listener();
++    } catch (err) {
++      console.error("[tabler icons] a listener threw", err);
++    }
++  }
++}
+ 
+ /** The loaded set, or `null` until `loadAeTablerIcons` has resolved once. */
+ export function aeTablerIconsIfLoaded(): AeTablerIconSet | null {
+   return iconSet;
+ }
+ 
++/** The store's snapshot: the set, `"error"` after a failed load until the next attempt, else `null`. */
++export function aeTablerIconsState(): AeTablerIconsState {
++  if (iconSet) return iconSet;
++  return iconSetFailures > 0 && !iconSetPromise ? "error" : null;
++}
++
+ /**
+- * Call `listener` when the outline set loads, whoever asked for it, so an icon
+- * that saw a failed load draws itself once a later retry succeeds. Returns the
+- * unsubscribe.
++ * Subscribe to changes of `aeTablerIconsState`, and ask for the set: the first
++ * subscriber starts the load, and one arriving after a failure retries once
++ * the backoff has passed. Returns the unsubscribe.
+  */
+-export function subscribeAeTablerIcons(listener: (set: AeTablerIconSet) => void): () => void {
++export function subscribeAeTablerIcons(listener: () => void): () => void {
+   iconSetListeners.add(listener);
++  if (!iconSet && !iconSetPromise) {
++    if (iconSetFailures === 0 || Date.now() - iconSetFailedAt >= backoffMs(iconSetFailures)) {
++      loadAeTablerIcons().catch(() => undefined);
++    }
++  }
+   return () => {
+     iconSetListeners.delete(listener);
+   };
+@@ -74,25 +105,34 @@ export function subscribeAeTablerIcons(listener: (set: AeTablerIconSet) => void)
+ 
+ /** Fetch the outline set once; after a failure the next call fetches again under a new URL. */
+ export function loadAeTablerIcons(): Promise<AeTablerIconSet> {
+-  iconSetPromise ??= loadOne<AeTablerIconSet>(
+-    nodeFiles,
+-    "tabler-nodes-outline.json",
+-    iconSetFailures,
+-  ).then(
++  if (iconSetPromise) return iconSetPromise;
++  const attempt = loadOne<AeTablerIconSet>(nodeFiles, "tabler-nodes-outline.json", iconSetFailures);
++  iconSetPromise = attempt.then(
+     (set) => {
+       iconSet = set;
+-      for (const listener of [...iconSetListeners]) listener(set);
+       return set;
+     },
+     (err: unknown) => {
+       iconSetPromise = null;
+       iconSetFailures += 1;
++      iconSetFailedAt = Date.now();
+       throw err;
+     },
+   );
++  iconSetPromise.then(notify, notify);
++  notify();
+   return iconSetPromise;
+ }
+ 
++// Back online after a failed load: try again for the icons on screen.
++if (typeof window !== "undefined") {
++  window.addEventListener("online", () => {
++    if (!iconSet && !iconSetPromise && iconSetFailures > 0 && iconSetListeners.size > 0) {
++      loadAeTablerIcons().catch(() => undefined);
++    }
++  });
++}
++
+ /** Fetch the search tags once; after a failure the next call fetches again under a new URL. */
+ export function loadAeTablerIconTags(): Promise<AeTablerIconTags> {
+   iconTagsPromise ??= loadOne<AeTablerIconTags>(tagFiles, "icons.json", iconTagsFailures).catch(
+diff --git a/web/src/test-setup.ts b/web/src/test-setup.ts
+index 7eab8829b80f360160676bff1af7f585782e5987..11e576e11837a586b885b9bd9cf29066276e4bc7 100644
+--- a/web/src/test-setup.ts
++++ b/web/src/test-setup.ts
+@@ -140,3 +140,6 @@ Object.defineProperty(window, "matchMedia", {
+     dispatchEvent: () => false,
+   }),
+ });
++
++// omnigent-ae: the Tabler icon set is read from disk, never the global fetch.
++vi.mock("@/lib/aeTablerAssetFetch", () => import("@/lib/aeTablerAssetFetch.disk"));

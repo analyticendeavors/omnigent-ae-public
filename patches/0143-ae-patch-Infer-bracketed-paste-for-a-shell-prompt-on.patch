@@ -1,0 +1,254 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 11:22:15 -0700
+Subject: [PATCH 143/148] [ae-patch] Infer bracketed paste for a shell prompt
+ on tmux older than 3.7
+
+tmux 3.6 has no #{bracket_paste_flag}, so the attach seed never replayed
+?2004h. A shell drew its prompt before the browser attached, the browser
+xterm never learned bracketed paste was on, and the chat's Run button
+refused every multi-line block. When tmux cannot report the flag, infer it:
+bash, zsh or fish in the foreground on the primary screen, with the pane's
+tty out of canonical mode (a line editor at its prompt). A script or the
+read builtin keeps canonical mode on and gets no bracketed paste.
+---
+ omnigent/terminals/_ae_bracket_paste.py  | 60 ++++++++++++++++++++++++
+ omnigent/terminals/control_bridge.py     | 19 ++++----
+ tests/terminals/test_ae_bracket_paste.py | 56 ++++++++++++++++++++++
+ tests/terminals/test_control_bridge.py   | 22 +++++++++
+ 4 files changed, 149 insertions(+), 8 deletions(-)
+ create mode 100644 omnigent/terminals/_ae_bracket_paste.py
+ create mode 100644 tests/terminals/test_ae_bracket_paste.py
+
+diff --git a/omnigent/terminals/_ae_bracket_paste.py b/omnigent/terminals/_ae_bracket_paste.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d7e51fb0b848aee64f6dc6cdea52fec503080e6
+--- /dev/null
++++ b/omnigent/terminals/_ae_bracket_paste.py
+@@ -0,0 +1,60 @@
++"""[ae] Infer a pane's bracketed paste mode where tmux cannot report it.
++
++``#{bracket_paste_flag}`` exists only in tmux >= 3.7; older tmux expands it
++empty, so the attach seed never replays ``?2004h``. A shell at its prompt
++enabled bracketed paste before the browser attached, the browser xterm never
++learns it, and a multi-line paste (the chat's Run button) is refused or runs
++line by line. Ubuntu 26.04 ships tmux 3.6, so that is the box's case.
++"""
++
++from __future__ import annotations
++
++import os
++from typing import Final
++
++try:
++    import termios
++except ImportError:  # Windows: no ttys, and no tmux either.
++    termios = None  # type: ignore[assignment]
++
++# Interactive shells whose line editor turns bracketed paste on by default
++# (bash >= 5.1 readline, zsh >= 5.1 zle, fish >= 3.0).
++_BRACKET_PASTE_SHELLS: Final[frozenset[str]] = frozenset({"bash", "zsh", "fish"})
++
++
++def _line_editor_active(tty: str) -> bool:
++    """Whether *tty* is out of canonical mode, as a line editor at its prompt leaves it.
++
++    A shell running a script or the ``read`` builtin keeps canonical mode on.
++    """
++    if termios is None or not tty:
++        return False
++    try:
++        fd = os.open(tty, os.O_RDONLY | os.O_NOCTTY | os.O_NONBLOCK)
++    except OSError:
++        return False
++    try:
++        return not termios.tcgetattr(fd)[3] & termios.ICANON
++    except termios.error:
++        return False
++    finally:
++        os.close(fd)
++
++
++def ae_infer_bracket_paste(flag: str, tty: str, current_command: str, alternate_on: bool) -> bool:
++    """Return the pane's bracketed paste mode.
++
++    A reported flag (``"0"``/``"1"``) wins. An empty flag means tmux cannot
++    tell, so infer it: on when one of the shells above is the foreground
++    command on the primary screen and its line editor holds the tty.
++
++    :param flag: ``#{bracket_paste_flag}`` as tmux expanded it.
++    :param tty: ``#{pane_tty}``.
++    :param current_command: ``#{pane_current_command}``.
++    :param alternate_on: Whether the pane is on the alternate screen.
++    :returns: Whether the seed should enable bracketed paste.
++    """
++    if flag:
++        return flag == "1"
++    name = os.path.basename(current_command.strip()).lstrip("-")
++    return not alternate_on and name in _BRACKET_PASTE_SHELLS and _line_editor_active(tty)
+diff --git a/omnigent/terminals/control_bridge.py b/omnigent/terminals/control_bridge.py
+index 5d6a9bf471c362d812e210e52f8f3974e20a1e3d..c02f7d05dad97d6f589ec4e18adc450f097ed025 100644
+--- a/omnigent/terminals/control_bridge.py
++++ b/omnigent/terminals/control_bridge.py
+@@ -53,6 +53,7 @@ from typing import Final
+ from fastapi import WebSocket, WebSocketDisconnect
+ 
+ from omnigent.inner.terminal_clipboard import MAX_CLIPBOARD_BYTES
++from omnigent.terminals._ae_bracket_paste import ae_infer_bracket_paste
+ from omnigent.terminals.ws_common import (
+     WS_CLOSE_INTERNAL_ERROR,
+     WS_CLOSE_TERMINAL_DETACHED,
+@@ -356,7 +357,7 @@ class _PaneMetadata:
+     :param app_cursor_keys: DECCKM (application cursor keys) from
+         ``#{keypad_cursor_flag}``.
+     :param bracket_paste: DECSET 2004 (bracketed paste) from
+-        ``#{bracket_paste_flag}``.
++        ``#{bracket_paste_flag}``, inferred by ``_ae_bracket_paste`` below tmux 3.7.
+     """
+ 
+     cursor_x: int
+@@ -397,8 +398,8 @@ def _mode_restore_escapes(meta: _PaneMetadata | None) -> tuple[bytes, bytes]:
+       claude) leaves the browser xterm unaware, so a multi-line paste is
+       sent as raw newlines and readline executes each line on arrival
+       instead of inserting the block. ``#{bracket_paste_flag}`` needs
+-      tmux >= 3.7; older tmux expands it empty, degrading to no replay
+-      (the pre-replay behavior).
++      tmux >= 3.7; older tmux expands it empty, and ``_ae_bracket_paste``
++      infers it for a shell at its prompt.
+ 
+     Only enables are emitted: every attach starts a fresh xterm whose modes
+     default off, so disables would be no-ops.
+@@ -453,7 +454,7 @@ async def _capture_pane_metadata(
+             "#{cursor_x},#{cursor_y},#{cursor_flag},#{alternate_on},"
+             "#{mouse_standard_flag},#{mouse_button_flag},#{mouse_all_flag},"
+             "#{mouse_sgr_flag},#{mouse_utf8_flag},#{keypad_cursor_flag},"
+-            "#{bracket_paste_flag}",
++            "#{bracket_paste_flag},#{pane_tty},#{pane_current_command}",
+             stdout=asyncio.subprocess.PIPE,
+             stderr=asyncio.subprocess.DEVNULL,
+         )
+@@ -463,15 +464,17 @@ async def _capture_pane_metadata(
+     if proc.returncode != 0:
+         return None
+     try:
+-        fields = [f.strip() for f in stdout.decode().strip().split(",")]
++        fields = [f.strip() for f in stdout.decode(errors="replace").strip().split(",", 12)]
+         if len(fields) < 4:
+             return None
+         # A tmux without some mouse/DECCKM formats expands them to "" (the
+         # field count holds), but pad regardless: a flags anomaly must cost
+         # only the optional mode replay, never the mandatory cursor and
+         # alt-screen state the rest of the seed depends on.
+-        fields += ["0"] * (11 - len(fields))
+-        x_str, y_str, flag_str, alt_str, std, btn, allm, sgr, utf8, ckm, bpaste = fields[:11]
++        fields += ["0"] * (13 - len(fields))
++        (x_str, y_str, flag_str, alt_str, std, btn, allm, sgr, utf8, ckm, bpaste, tty, cmd) = (
++            fields[:13]
++        )
+         return _PaneMetadata(
+             cursor_x=int(x_str),
+             cursor_y=int(y_str),
+@@ -483,7 +486,7 @@ async def _capture_pane_metadata(
+             mouse_sgr=sgr == "1",
+             mouse_utf8=utf8 == "1",
+             app_cursor_keys=ckm == "1",
+-            bracket_paste=bpaste == "1",
++            bracket_paste=ae_infer_bracket_paste(bpaste, tty, cmd, alt_str == "1"),
+         )
+     except (ValueError, UnicodeDecodeError):
+         return None
+diff --git a/tests/terminals/test_ae_bracket_paste.py b/tests/terminals/test_ae_bracket_paste.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..f09d4f5d4e486bf090a2e3cba74cf91f9509f8f9
+--- /dev/null
++++ b/tests/terminals/test_ae_bracket_paste.py
+@@ -0,0 +1,56 @@
++"""Tests for :mod:`omnigent.terminals._ae_bracket_paste`."""
++
++from __future__ import annotations
++
++import os
++import pty
++
++import pytest
++
++from omnigent.terminals import _ae_bracket_paste
++from omnigent.terminals._ae_bracket_paste import ae_infer_bracket_paste
++
++
++@pytest.mark.parametrize(
++    ("flag", "command", "alternate_on", "editor", "expected"),
++    [
++        ("1", "python3", False, False, True),
++        ("0", "bash", False, True, False),
++        ("", "bash", False, True, True),
++        ("", "-bash", False, True, True),
++        ("", "/usr/bin/zsh", False, True, True),
++        ("", "fish", False, True, True),
++        ("", "bash", False, False, False),
++        ("", "bash", True, True, False),
++        ("", "vim", False, True, False),
++        ("", "sh", False, True, False),
++        ("", "", False, True, False),
++    ],
++)
++def test_reported_flag_wins_and_empty_flag_infers_for_a_shell_prompt(
++    monkeypatch: pytest.MonkeyPatch,
++    flag: str,
++    command: str,
++    alternate_on: bool,
++    editor: bool,
++    expected: bool,
++) -> None:
++    monkeypatch.setattr(_ae_bracket_paste, "_line_editor_active", lambda _tty: editor)
++    assert ae_infer_bracket_paste(flag, "/dev/pts/9", command, alternate_on) is expected
++
++
++def test_line_editor_active_reads_the_tty_canonical_mode() -> None:
++    termios = pytest.importorskip("termios")
++    leader, follower = pty.openpty()
++    try:
++        tty = os.ttyname(follower)
++        assert _ae_bracket_paste._line_editor_active(tty) is False
++        attrs = termios.tcgetattr(follower)
++        attrs[3] &= ~termios.ICANON
++        termios.tcsetattr(follower, termios.TCSANOW, attrs)
++        assert _ae_bracket_paste._line_editor_active(tty) is True
++    finally:
++        os.close(leader)
++        os.close(follower)
++    assert _ae_bracket_paste._line_editor_active("") is False
++    assert _ae_bracket_paste._line_editor_active("/nonexistent/tty") is False
+diff --git a/tests/terminals/test_control_bridge.py b/tests/terminals/test_control_bridge.py
+index 79a3ea4ff86970d57cb0240cecd5f237d4fa0679..1539943f67f05f92881444ca2771dbd7e145e6ac 100644
+--- a/tests/terminals/test_control_bridge.py
++++ b/tests/terminals/test_control_bridge.py
+@@ -768,6 +768,28 @@ async def test_seed_replays_bracketed_paste_mode() -> None:
+         await _kill_tmux(sock)
+ 
+ 
++@pytest.mark.skipif(
++    not _HAS_TMUX or _HAS_TMUX_BRACKET_PASTE_FLAG,
++    reason="[ae] the inference runs only on tmux < 3.7",
++)
++@pytest.mark.asyncio
++async def test_ae_seed_infers_bracketed_paste_at_a_bash_prompt_only() -> None:
++    """[ae] On tmux < 3.7 a bash prompt seeds ``?2004h``; bash inside ``read`` does not."""
++    from omnigent.terminals.control_bridge import _run_tmux_capture
++
++    sock, target = await _new_private_tmux("bash --norc --noprofile")
++    await asyncio.sleep(0.5)
++    try:
++        seed = await _run_tmux_capture(str(sock), target)
++        assert seed is not None and b"\x1b[?2004h" in seed
++        subprocess.run(["tmux", "-S", str(sock), "send-keys", "-t", target, "read -r v", "Enter"])
++        await asyncio.sleep(0.5)
++        seed = await _run_tmux_capture(str(sock), target)
++        assert seed is not None and b"\x1b[?2004h" not in seed
++    finally:
++        await _kill_tmux(sock)
++
++
+ @pytest.mark.skipif(not _HAS_TMUX, reason="tmux not installed")
+ @pytest.mark.asyncio
+ async def test_seed_plain_shell_replays_no_modes() -> None:

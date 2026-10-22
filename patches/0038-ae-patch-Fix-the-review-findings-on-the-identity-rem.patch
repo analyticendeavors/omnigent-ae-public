@@ -1,0 +1,214 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 14 Oct 2026 07:27:58 -0700
+Subject: [PATCH 038/148] [ae-patch] Fix the review findings on the identity
+ remap: re-encrypt moved connections, keep the approved checkpoint
+
+Connection secrets are encrypted under the owner's id, so a connection moved
+to the new id decrypted to nothing and asked for a reconnect; the remap now
+re-encrypts it with the deployment's cipher, and counts a row it cannot read
+under connections_reconnect. On a forced merge the daily cost's approved
+checkpoint takes the higher value instead of the sum. A test pins the copied
+turn-actor label name to the server's.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ omnigent/server/identity_migration_extra.py   | 40 ++++++++-
+ tests/server/test_identity_migration_extra.py | 83 ++++++++++++++++++-
+ 2 files changed, 118 insertions(+), 5 deletions(-)
+
+diff --git a/omnigent/server/identity_migration_extra.py b/omnigent/server/identity_migration_extra.py
+index c693a37dcbe12125ebc808bad23d305eb23f5c35..ea1788aeb840141f73af8c589afef915c617e733 100644
+--- a/omnigent/server/identity_migration_extra.py
++++ b/omnigent/server/identity_migration_extra.py
+@@ -5,7 +5,11 @@ comments, policies, tokens and hosts. A deployment that has been in use also
+ carries the user id on its agents, projects, schedules, device grants,
+ conversation items, preferences, connections, daily costs and the turn-actor
+ label; without these the renamed user loses their projects, schedules and
+-history attribution. This module rewrites them inside the same transaction.
++history attribution. This module rewrites them inside the same transaction,
++so it assumes conversations live in the operational database (no separate
++``conversation_storage_location``).
++Connection secrets are encrypted under the owner's id, so a moved connection
++is re-encrypted under the new one.
+ """
+ 
+ from __future__ import annotations
+@@ -29,6 +33,9 @@ from omnigent.db.db_models import (
+     SqlUserDailyCost,
+     current_workspace_id,
+ )
++from omnigent.stores.credential_store import build_secret_cipher
++from omnigent.stores.credential_store.secret_cipher import SecretCipher
++from omnigent.stores.credential_store.sqlalchemy_store import _enc_context
+ 
+ # Mirrors ``_TURN_ACTOR_LABEL`` in ``omnigent.server.routes._sessions.common``;
+ # importing the routes package from here would pull the whole server in.
+@@ -55,7 +62,10 @@ def remap_extra_columns(
+     Runs inside the caller's transaction. Rows keyed by user id (preferences,
+     connections, daily costs) can collide only when ``new_id`` already existed
+     (a ``force`` merge): the new user's preference and connection win, and
+-    daily costs are summed.
++    daily costs are summed (the approved checkpoint keeps the higher value). A
++    moved connection whose secret the deployment's cipher cannot read (no
++    cipher, wrong key) moves as is and is counted under
++    ``connections_reconnect``: it was unreadable before the move too.
+ 
+     :param session: The open session of the remap transaction.
+     :param old_id: The identity being retired, e.g. ``"alice"``.
+@@ -90,6 +100,14 @@ def remap_extra_columns(
+     )
+     bump(SqlConversationLabel.__tablename__, result.rowcount or 0)
+ 
++    cipher: SecretCipher | None = None
++    if session.execute(
++        select(SqlConnection.user_id).where(
++            SqlConnection.workspace_id == ws, SqlConnection.user_id == old_id
++        )
++    ).first():
++        cipher = build_secret_cipher()
++
+     for model in (SqlPreference, SqlConnection):
+         rows = (
+             session.execute(select(model).where(model.workspace_id == ws, model.user_id == old_id))
+@@ -101,6 +119,8 @@ def remap_extra_columns(
+             if clash is not None:
+                 session.delete(row)
+             else:
++                if model is SqlConnection and not _reencrypt(cipher, row, new_id):
++                    bump("connections_reconnect", 1)
+                 row.user_id = new_id
+             bump(model.__tablename__, 1)
+         session.flush()
+@@ -118,7 +138,8 @@ def remap_extra_columns(
+         clash = session.get(SqlUserDailyCost, _key_for(SqlUserDailyCost, row, new_id))
+         if clash is not None:
+             clash.cost_usd += row.cost_usd
+-            clash.ask_approved_usd += row.ask_approved_usd
++            # The approved soft-cap checkpoint, not a running total.
++            clash.ask_approved_usd = max(clash.ask_approved_usd, row.ask_approved_usd)
+             clash.updated_at = max(clash.updated_at or 0, row.updated_at or 0)
+             session.delete(row)
+         else:
+@@ -133,3 +154,16 @@ def _key_for(model: Any, row: Any, user_id: str) -> tuple[Any, ...]:
+         user_id if col.key == "user_id" else getattr(row, col.key)
+         for col in inspect(model).primary_key
+     )
++
++
++def _reencrypt(cipher: SecretCipher | None, row: SqlConnection, new_id: str) -> bool:
++    """Re-encrypt *row*'s secret under *new_id*; ``False`` if it cannot be read."""
++    if cipher is None:
++        return False
++    old_ctx = _enc_context(row.workspace_id, row.user_id, row.provider, row.account_id)
++    plaintext = cipher.decrypt(row.secret_enc, context=old_ctx)
++    if plaintext is None:
++        return False
++    new_ctx = _enc_context(row.workspace_id, new_id, row.provider, row.account_id)
++    row.secret_enc = cipher.encrypt(plaintext, context=new_ctx)
++    return True
+diff --git a/tests/server/test_identity_migration_extra.py b/tests/server/test_identity_migration_extra.py
+index a9ad1731bf465d2a1f2d7356d465024bd97b0b60..be07461891a0c12b801adca2c0e9b5593328577d 100644
+--- a/tests/server/test_identity_migration_extra.py
++++ b/tests/server/test_identity_migration_extra.py
+@@ -9,6 +9,7 @@ daily costs) instead of violating their primary keys.
+ 
+ from __future__ import annotations
+ 
++import pytest
+ from sqlalchemy import select
+ from sqlalchemy.orm import Session
+ 
+@@ -175,7 +176,10 @@ def test_dry_run_leaves_extra_columns_alone(db_uri: str) -> None:
+ 
+ 
+ def test_force_merge_resolves_user_keyed_collisions(db_uri: str) -> None:
+-    """On a merge, NEW's preference and connection win and daily costs add up."""
++    """On a merge, NEW's preference and connection win and daily costs add up.
++
++    The approved checkpoint is a high-water mark, so it keeps the higher value.
++    """
+     accounts = SqlAlchemyAccountStore(db_uri)
+     accounts.create_user_with_password(OLD, hash_password("password123"))
+     accounts.create_user_with_password(NEW, hash_password("password123"))
+@@ -197,4 +201,79 @@ def test_force_merge_resolves_user_keyed_collisions(db_uri: str) -> None:
+     assert leftover is None
+     assert pref is not None and pref.value == "dark9"
+     assert conn is not None and conn.secret_enc == "s9"
+-    assert cost is not None and cost.cost_usd == 3.0 and cost.ask_approved_usd == 1.0
++    assert cost is not None and cost.cost_usd == 3.0 and cost.ask_approved_usd == 0.5
++
++
++class _BoundCipher:
++    """A cipher whose ciphertext only decrypts under the context it was made in."""
++
++    def encrypt(self, plaintext: str, *, context: dict[str, str]) -> str:
++        return f"{context['user_id']}|{plaintext}"
++
++    def decrypt(self, ciphertext: str, *, context: dict[str, str]) -> str | None:
++        owner, _, plaintext = ciphertext.partition("|")
++        return plaintext if owner == context["user_id"] else None
++
++
++def _seed_connection(db_uri: str, secret_enc: str) -> None:
++    """Create OLD and one GitHub connection for it with *secret_enc*."""
++    SqlAlchemyAccountStore(db_uri).create_user_with_password(OLD, hash_password("password123"))
++    with Session(get_or_create_engine(db_uri)) as s:
++        s.add(
++            SqlConnection(
++                user_id=OLD,
++                provider="github",
++                account_id="acct",
++                secret_enc=secret_enc,
++                metadata_json="{}",
++                created_at=1,
++                updated_at=1,
++            )
++        )
++        s.commit()
++
++
++def test_moved_connection_is_reencrypted_for_the_new_owner(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A readable secret decrypts under NEW after the move, and no longer under OLD."""
++    cipher = _BoundCipher()
++    monkeypatch.setattr(
++        "omnigent.server.identity_migration_extra.build_secret_cipher", lambda: cipher
++    )
++    _seed_connection(db_uri, cipher.encrypt('{"token": "t"}', context={"user_id": OLD}))
++    engine = get_or_create_engine(db_uri)
++
++    report = remap_identities(engine, {OLD: NEW}, dry_run=False)
++
++    with Session(engine) as s:
++        row = s.get(SqlConnection, (current_workspace_id(), NEW, "github", "acct"))
++    assert row is not None
++    assert cipher.decrypt(row.secret_enc, context={"user_id": NEW}) == '{"token": "t"}'
++    assert cipher.decrypt(row.secret_enc, context={"user_id": OLD}) is None
++    assert "connections_reconnect" not in report.per_table
++
++
++def test_unreadable_connection_moves_and_is_counted_for_reconnect(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """Without a cipher the row still moves; the report says it needs a reconnect."""
++    monkeypatch.setattr(
++        "omnigent.server.identity_migration_extra.build_secret_cipher", lambda: None
++    )
++    _seed_connection(db_uri, "opaque")
++    engine = get_or_create_engine(db_uri)
++
++    report = remap_identities(engine, {OLD: NEW}, dry_run=False)
++
++    with Session(engine) as s:
++        row = s.get(SqlConnection, (current_workspace_id(), NEW, "github", "acct"))
++    assert row is not None and row.secret_enc == "opaque"
++    assert report.per_table["connections_reconnect"] == 1
++
++
++def test_turn_actor_label_matches_the_server() -> None:
++    """The copied label name must stay the one the session routes write."""
++    from omnigent.server.routes._sessions.common import _TURN_ACTOR_LABEL
++
++    assert TURN_ACTOR_LABEL == _TURN_ACTOR_LABEL

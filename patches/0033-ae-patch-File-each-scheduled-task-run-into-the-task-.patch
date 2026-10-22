@@ -1,0 +1,1070 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 09:58:11 -0700
+Subject: [PATCH 033/148] [ae-patch] File each scheduled task run into the
+ task's project
+
+Every firing of a scheduled task opens a new session outside any project, so
+automation runs pile up unfiled in the sidebar. Reid decided on 2026-10-13
+that a task names a project its runs open in, with a server-configured
+default for new tasks (Automation Notes on the AE box).
+
+- omnigent/server/scheduled/task_project.py (new): project_id stored in its
+  own table, ae_scheduled_task_project, created on first use, so no Alembic
+  revision is needed; the default project named by
+  OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT, resolved per owner by name and
+  stored by id; and file_fired_session, which files the new session with
+  set_conversation_project after checking the owner still has the project.
+  A missing project or store error leaves the run unfiled and never fails
+  the fire.
+- project_id on ScheduledTask and on /v1/scheduled-tasks create, patch, get
+  and list. It must name one of the caller's projects (404 otherwise); null
+  or "" leaves runs unfiled; a create that omits it gets the default. Plus
+  the sys_scheduled_task_create/update tool schemas and dispatch allowlists.
+- fire.py gains an import, a FireDeps field and one call after the session
+  is created; app.py passes project_store to the router and FireDeps.
+- web: a Project picker on the automation dialog (AeTaskProjectField, new);
+  "Default project" on create omits the field so the server default applies.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ omnigent/entities/scheduled_task.py           |   3 +
+ omnigent/runner/tool_dispatch.py              |   2 +
+ omnigent/server/app.py                        |   2 +
+ omnigent/server/routes/scheduled_tasks.py     |  40 ++++-
+ omnigent/server/scheduled/fire.py             |   3 +
+ omnigent/server/scheduled/task_project.py     | 168 ++++++++++++++++++
+ omnigent/tools/builtins/scheduled_tasks.py    |  14 ++
+ .../test_scheduled_tasks_routes.py            |  90 ++++++++++
+ tests/server/scheduled/test_task_project.py   | 162 +++++++++++++++++
+ .../scheduled/AeTaskProjectField.test.tsx     |  37 ++++
+ .../scheduled/AeTaskProjectField.tsx          |  86 +++++++++
+ .../CreateScheduledTaskDialog.test.tsx        |  21 +++
+ .../scheduled/CreateScheduledTaskDialog.tsx   |  17 ++
+ web/src/lib/scheduledTasksApi.ts              |  13 ++
+ 14 files changed, 653 insertions(+), 5 deletions(-)
+ create mode 100644 omnigent/server/scheduled/task_project.py
+ create mode 100644 tests/server/scheduled/test_task_project.py
+ create mode 100644 web/src/components/scheduled/AeTaskProjectField.test.tsx
+ create mode 100644 web/src/components/scheduled/AeTaskProjectField.tsx
+
+diff --git a/omnigent/entities/scheduled_task.py b/omnigent/entities/scheduled_task.py
+index db9f6d6b032dd007190ef8201293c8c7941ac7df..d8e882929c2aae383bdbcfc1ef4df1fcb595694e 100644
+--- a/omnigent/entities/scheduled_task.py
++++ b/omnigent/entities/scheduled_task.py
+@@ -78,6 +78,8 @@ class ScheduledTask:
+     :param keep_runs: How many of the task's newest run sessions survive a
+         firing; ``None`` keeps them all. Not a ``scheduled_tasks`` column: it is
+         resolved from :mod:`omnigent.server.scheduled.retention`.
++    :param project_id: The project each run session is filed into, or ``None``.
++        Resolved from :mod:`omnigent.server.scheduled.task_project`.
+     """
+ 
+     id: str
+@@ -103,6 +105,7 @@ class ScheduledTask:
+     updated_at: int | None = None
+     account_generation: str | None = None
+     keep_runs: int | None = DEFAULT_KEEP_RUNS
++    project_id: str | None = None
+ 
+ 
+ @dataclass
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index 51667db7b5b5b1f74ba84231fcd6800cbba5eca2..29c4916745d469adb8d5d2c4f2fc10b1f34158c4 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -4631,6 +4631,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
+     "reasoning_effort",
+     "permission_mode",
+     "keep_runs",
++    "project_id",
+     "workspace",
+     "host_id",
+     "execution_target",
+@@ -4647,6 +4648,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
+     "permission_mode",
+     "max_cost_usd",
+     "keep_runs",
++    "project_id",
+     "workspace",
+     "host_id",
+     "execution_target",
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index db959d243b5a3084d6480396ae879666e3713692..4f5f9389070f1edbe68190cc298133311ec464fd 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -1754,6 +1754,7 @@ def create_app(
+                 sandbox_config=sandbox_config,
+                 managed_launches=app_inst.state.managed_launches,
+                 app_state=app_inst.state,
++                project_store=project_store,
+             )
+             on_fire = build_on_fire(fire_deps)
+             # The manual "run now" trigger reuses the same fire path (dispatch /
+@@ -3372,6 +3373,7 @@ def create_app(
+                 agent_cache=agent_cache,
+                 auth_provider=auth_provider,
+                 artifact_store=artifact_store,
++                project_store=project_store,
+             ),
+             prefix="/v1",
+             tags=["scheduled_tasks"],
+diff --git a/omnigent/server/routes/scheduled_tasks.py b/omnigent/server/routes/scheduled_tasks.py
+index e2239ee462b36dba378e64145166011d90f2f619..19ddce171291a81ae06bff9eb4a9f9b5dbed3b8f 100644
+--- a/omnigent/server/routes/scheduled_tasks.py
++++ b/omnigent/server/routes/scheduled_tasks.py
+@@ -36,7 +36,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_model_metadata,
+     validate_session_permission_mode,
+ )
+-from omnigent.server.scheduled import retention
++from omnigent.server.scheduled import retention, task_project
+ from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+@@ -72,6 +72,8 @@ class CreateScheduledTaskRequest(BaseModel):
+     max_cost_usd: float | None = Field(default=None, gt=0)
+     # Run sessions kept after each firing, newest first; null keeps them all.
+     keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)
++    # Project each run session is filed into; omitted uses the server default.
++    project_id: str | None = None
+     # Optional: no PINNED host/workspace. When both are unset the fire path
+     # resolves the owner's online host at fire time and defaults the workspace to
+     # that host's home directory (a failed run is recorded if none is online) —
+@@ -114,6 +116,7 @@ class UpdateScheduledTaskRequest(BaseModel):
+     permission_mode: str | None = None
+     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+     keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)  # null keeps all
++    project_id: str | None = None  # null or "" leaves runs unfiled
+     workspace: str | None = Field(default=None, min_length=1)
+     host_id: str | None = Field(default=None, min_length=1)
+     execution_target: str | None = Field(default=None, min_length=1)
+@@ -175,6 +178,7 @@ def _to_response(
+         "permission_mode": task.permission_mode,
+         "max_cost_usd": task.max_cost_usd,
+         "keep_runs": task.keep_runs,
++        "project_id": task.project_id,
+         "workspace": task.workspace,
+         "host_id": task.host_id,
+         "execution_target": task.execution_target,
+@@ -233,6 +237,7 @@ def create_scheduled_tasks_router(
+     agent_cache: Any | None = None,
+     auth_provider: AuthProvider | None = None,
+     artifact_store: ArtifactStore | None = None,
++    project_store: Any | None = None,
+ ) -> APIRouter:
+     """Build the scheduled-tasks router.
+ 
+@@ -368,6 +373,20 @@ def create_scheduled_tasks_router(
+             raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+         return task
+ 
++    def _owned_project_id(project_id: str | None, owner_id: str | None) -> str | None:
++        """The caller's project *project_id* names (``None`` for null or ``""``), else 404."""
++        if not project_id:
++            return None
++        if project_store is None:
++            raise OmnigentError(
++                "Filing runs into a project is not supported by this server",
++                code=ErrorCode.INVALID_INPUT,
++            )
++        project = project_store.get(project_id, user_id=owner_id)
++        if project is None:
++            raise OmnigentError("Project not found", code=ErrorCode.NOT_FOUND)
++        return str(project.id)
++
+     @router.post("/scheduled-tasks")
+     async def create_scheduled_task(
+         request: Request,
+@@ -390,6 +409,10 @@ def create_scheduled_tasks_router(
+             execution_target=body.execution_target,
+         )
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
++        if "project_id" in body.model_fields_set:
++            project_id = _owned_project_id(body.project_id, owner_id)
++        else:
++            project_id = task_project.default_project_id(project_store, owner_id)
+         bound = await _bind_agent(agent, owner_id)
+         try:
+             task = store.create(
+@@ -414,7 +437,8 @@ def create_scheduled_tasks_router(
+             raise
+         if "keep_runs" in body.model_fields_set:
+             retention.set_keep_runs(store, task.id, body.keep_runs)
+-        task = retention.with_keep_runs(store, [task])[0]
++        task_project.set_project(store, task.id, project_id)
++        task = task_project.with_project(store, retention.with_keep_runs(store, [task]))[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.add(task)
+@@ -441,7 +465,7 @@ def create_scheduled_tasks_router(
+         owner = _owner(request)
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+         tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+-        tasks = retention.with_keep_runs(store, tasks)
++        tasks = task_project.with_project(store, retention.with_keep_runs(store, tasks))
+         task_ids = [t.id for t in tasks]
+         running = store.list_running_runs_for_tasks(task_ids)
+         # Force-fail stale orphans FIRST so the completion badge below reports a
+@@ -468,7 +492,8 @@ def create_scheduled_tasks_router(
+         """Fetch one of the caller's scheduled tasks."""
+         owner = _owner(request)
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+-        task = retention.with_keep_runs(store, [_require_owned(scheduled_task_id, owner_id)])[0]
++        task = _require_owned(scheduled_task_id, owner_id)
++        task = task_project.with_project(store, retention.with_keep_runs(store, [task]))[0]
+         running = store.list_running_runs_for_tasks([task.id])
+         force_fail_stale_runs(store, running)
+         latest_status = store.list_latest_run_status_for_tasks([task.id])
+@@ -577,6 +602,8 @@ def create_scheduled_tasks_router(
+         fields = body.model_dump(exclude_unset=True)
+         keep_runs_set = "keep_runs" in fields
+         keep_runs = fields.pop("keep_runs", None)
++        project_set = "project_id" in fields
++        project_id = _owned_project_id(fields.pop("project_id", None), owner_id)
+         target_agent_id = fields.get("agent_id") or existing.agent_id
+         agent_changed = target_agent_id != existing.agent_id
+         new_copy: Agent | None = None
+@@ -672,7 +699,9 @@ def create_scheduled_tasks_router(
+             raise
+         if keep_runs_set:
+             retention.set_keep_runs(store, updated.id, keep_runs)
+-        updated = retention.with_keep_runs(store, [updated])[0]
++        if project_set:
++            task_project.set_project(store, updated.id, project_id)
++        updated = task_project.with_project(store, retention.with_keep_runs(store, [updated]))[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.update(updated)
+@@ -694,6 +723,7 @@ def create_scheduled_tasks_router(
+         _require_owned(scheduled_task_id, owner_id)
+         store.delete(scheduled_task_id)
+         retention.forget_keep_runs(store, scheduled_task_id)
++        task_project.forget_project(store, scheduled_task_id)
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.remove(scheduled_task_id)
+diff --git a/omnigent/server/scheduled/fire.py b/omnigent/server/scheduled/fire.py
+index 44602a7635657cba98beb3dcd5a7bfed3fbdf6e2..63d796bde86a6c3c18e6552b32a50c111c1ab6f7 100644
+--- a/omnigent/server/scheduled/fire.py
++++ b/omnigent/server/scheduled/fire.py
+@@ -68,6 +68,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_permission_mode,
+ )
+ from omnigent.server.scheduled.retention import notify_fire_observers
++from omnigent.server.scheduled.task_project import file_fired_session
+ from omnigent.server.schemas import SessionEventInput
+ 
+ _logger = logging.getLogger(__name__)
+@@ -149,6 +150,7 @@ class FireDeps:
+     # ``app.state``, read per fire for the default-public-sessions policy.
+     # ``None`` (tests, embedders) leaves every fired session private.
+     app_state: Any | None = None
++    project_store: Any | None = None
+ 
+ 
+ @dataclass
+@@ -857,6 +859,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+         workspace=task.workspace,
+         terminal_launch_args=await _permission_mode_launch_args(deps, task),
+     )
++    await file_fired_session(deps, task, conv.id)
+     reasoning_effort = task.reasoning_effort
+     if reasoning_effort is None:
+         reasoning_effort = await _spec_reasoning_effort(deps, task)
+diff --git a/omnigent/server/scheduled/task_project.py b/omnigent/server/scheduled/task_project.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2444e71e3cb9036de4d25e236ac44cc7d0bc63a7
+--- /dev/null
++++ b/omnigent/server/scheduled/task_project.py
+@@ -0,0 +1,168 @@
++"""The project a scheduled task files its run sessions into.
++
++Every firing creates a session, and without a project each one lands unfiled
++in the sidebar. A task may name one of its owner's first-class projects; the
++fire path files the new session there with the same store call the sidebar's
++"Move to project" uses.
++
++- **The setting.** ``project_id`` is stored beside ``scheduled_tasks`` in its
++  own table rather than as a column, so carrying it needs no Alembic revision:
++  the table is created on first use. ``None`` (or no row) leaves runs unfiled.
++- **The default.** ``OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT`` names a project;
++  a task created without a ``project_id`` gets the owner's project of that
++  name, when one exists. The id is stored, so renaming the project later keeps
++  the task pointed at it.
++- **The fire.** :func:`file_fired_session` files the new session. A project
++  that was deleted or is no longer the owner's leaves the run unfiled with a
++  warning; it never fails a fire.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import os
++import threading
++from dataclasses import replace
++from typing import TYPE_CHECKING, Any
++
++from sqlalchemy import Column, Integer, MetaData, String, Table, delete, select
++from sqlalchemy.engine import Engine
++
++from omnigent.db.db_models import current_workspace_id
++from omnigent.db.query_context import query_name_scope
++from omnigent.entities.scheduled_task import ScheduledTask
++
++if TYPE_CHECKING:
++    from omnigent.server.scheduled.fire import FireDeps
++
++_logger = logging.getLogger(__name__)
++
++#: Names the project a new task files its runs into when the create omits one.
++DEFAULT_PROJECT_ENV = "OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT"
++
++_metadata = MetaData()
++_project_table = Table(
++    "ae_scheduled_task_project",
++    _metadata,
++    Column("workspace_id", Integer, primary_key=True),
++    Column("scheduled_task_id", String(32), primary_key=True),
++    Column("project_id", String(32), nullable=False),
++)
++# custom-lint: disable-next=workspace-scoped-cache -- schema readiness is shared per engine
++_ready_engines: set[int] = set()
++_ready_lock = threading.Lock()
++# Stores without a database (test fakes) keep the setting in memory, keyed by
++# store identity, workspace and task.
++# custom-lint: disable-next=workspace-scoped-cache -- each key includes the workspace id
++_memory: dict[tuple[int, int, str], str] = {}
++
++
++def _engine_for(store: Any) -> Engine | None:
++    """The store's database engine with the project table created, or ``None``."""
++    location = getattr(store, "storage_location", None)
++    if not isinstance(location, str) or "://" not in location:
++        return None
++    from omnigent.db.utils import get_or_create_engine
++
++    engine = get_or_create_engine(location)
++    with _ready_lock:
++        if id(engine) not in _ready_engines:
++            with query_name_scope("omnigent.scheduled_task_project.create_table"):
++                _metadata.create_all(engine, tables=[_project_table], checkfirst=True)
++            _ready_engines.add(id(engine))
++    return engine
++
++
++def project_ids_for(store: Any, task_ids: list[str]) -> dict[str, str | None]:
++    """Each task's ``project_id`` in the current workspace, ``None`` when unset."""
++    ids = list(dict.fromkeys(task_ids))
++    workspace = current_workspace_id()
++    found: dict[str, str] = {}
++    engine = _engine_for(store)
++    if engine is None:
++        for task_id in ids:
++            key = (id(store), workspace, task_id)
++            if key in _memory:
++                found[task_id] = _memory[key]
++    elif ids:
++        stmt = select(_project_table.c.scheduled_task_id, _project_table.c.project_id).where(
++            _project_table.c.workspace_id == workspace,
++            _project_table.c.scheduled_task_id.in_(ids),
++        )
++        with query_name_scope("omnigent.scheduled_task_project.select"), engine.connect() as conn:
++            found = {row[0]: row[1] for row in conn.execute(stmt)}
++    return {task_id: found.get(task_id) for task_id in ids}
++
++
++def with_project(store: Any, tasks: list[ScheduledTask]) -> list[ScheduledTask]:
++    """*tasks* with ``project_id`` filled in from the project table."""
++    resolved = project_ids_for(store, [task.id for task in tasks])
++    return [replace(task, project_id=resolved[task.id]) for task in tasks]
++
++
++def set_project(store: Any, task_id: str, project_id: str | None) -> None:
++    """Store *project_id* for *task_id* in the current workspace; ``None`` clears it."""
++    workspace = current_workspace_id()
++    engine = _engine_for(store)
++    if engine is None:
++        key = (id(store), workspace, task_id)
++        if project_id is None:
++            _memory.pop(key, None)
++        else:
++            _memory[key] = project_id
++        return
++    where = (
++        _project_table.c.workspace_id == workspace,
++        _project_table.c.scheduled_task_id == task_id,
++    )
++    with query_name_scope("omnigent.scheduled_task_project.upsert"), engine.begin() as conn:
++        conn.execute(delete(_project_table).where(*where))
++        if project_id is not None:
++            conn.execute(
++                _project_table.insert().values(
++                    workspace_id=workspace, scheduled_task_id=task_id, project_id=project_id
++                )
++            )
++
++
++def forget_project(store: Any, task_id: str) -> None:
++    """Drop *task_id*'s setting (the task was deleted)."""
++    set_project(store, task_id, None)
++
++
++def default_project_id(project_store: Any | None, user_id: str | None) -> str | None:
++    """The owner's project named by :data:`DEFAULT_PROJECT_ENV`, or ``None``."""
++    name = os.environ.get(DEFAULT_PROJECT_ENV, "").strip()
++    if not name or project_store is None:
++        return None
++    for project in project_store.list(user_id=user_id):
++        if project.name.strip().casefold() == name.casefold():
++            return str(project.id)
++    _logger.warning("default project %r not found for owner %r; runs stay unfiled", name, user_id)
++    return None
++
++
++async def file_fired_session(deps: FireDeps, task: ScheduledTask, conversation_id: str) -> None:
++    """File the session a fire created into the task's project; never raises."""
++    try:
++        project_id = project_ids_for(deps.scheduled_task_store, [task.id])[task.id]
++        if project_id is None:
++            return
++        project_store = getattr(deps, "project_store", None)
++        if project_store is None:
++            _logger.warning("scheduled fire: no project store; task %s run left unfiled", task.id)
++            return
++        owned = await asyncio.to_thread(project_store.get, project_id, user_id=task.user_id)
++        if owned is None:
++            _logger.warning(
++                "scheduled fire: project %s for task %s is gone; run left unfiled",
++                project_id,
++                task.id,
++            )
++            return
++        await asyncio.to_thread(
++            deps.conversation_store.set_conversation_project, conversation_id, project_id
++        )
++    except Exception:
++        _logger.exception("scheduled fire: could not file task %s run into its project", task.id)
+diff --git a/omnigent/tools/builtins/scheduled_tasks.py b/omnigent/tools/builtins/scheduled_tasks.py
+index 13b5646ea57d5660724010741fabc56bdcdd50bb..ea07d234105501d7462ee8f39696490564560da7 100644
+--- a/omnigent/tools/builtins/scheduled_tasks.py
++++ b/omnigent/tools/builtins/scheduled_tasks.py
+@@ -119,6 +119,13 @@ class SysScheduledTaskCreateTool(Tool):
+                                 "idle ones are deleted. Omit for 5; null keeps them all."
+                             ),
+                         },
++                        "project_id": {
++                            "type": "string",
++                            "description": (
++                                "Project each run session is filed into. Omit for the "
++                                "server's default project; null leaves runs unfiled."
++                            ),
++                        },
+                         "workspace": {
+                             "type": "string",
+                             "description": (
+@@ -257,6 +264,13 @@ class SysScheduledTaskUpdateTool(Tool):
+                                 "Null keeps them all."
+                             ),
+                         },
++                        "project_id": {
++                            "type": "string",
++                            "description": (
++                                "New project each run session is filed into. Null or an "
++                                "empty string leaves runs unfiled."
++                            ),
++                        },
+                         "workspace": {
+                             "type": "string",
+                             "description": "New existing absolute runner start path.",
+diff --git a/tests/server/integration/test_scheduled_tasks_routes.py b/tests/server/integration/test_scheduled_tasks_routes.py
+index fa08fc1c95ffd7085224c21b79dfe5442de61644..bc8008ee6126e3cdef4745afada5e7cfae1275ad 100644
+--- a/tests/server/integration/test_scheduled_tasks_routes.py
++++ b/tests/server/integration/test_scheduled_tasks_routes.py
+@@ -26,6 +26,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
+ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+ from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
+ from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
++from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+ from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
+     SqlAlchemyScheduledTaskStore,
+ )
+@@ -72,6 +73,7 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+         # ownership) resolves against actual host rows. Without it,
+         # ``app.state.host_store`` is None and the route skips the check.
+         host_store=HostStore(db_uri),
++        project_store=SqlAlchemyProjectStore(db_uri),
+         auth_provider=UnifiedAuthProvider(source="header"),
+     )
+     _make_user(db_uri)
+@@ -1816,3 +1818,91 @@ async def test_keep_runs_out_of_range_is_rejected(
+         "/v1/scheduled-tasks", json=_create_body(keep_runs=0), headers=_headers()
+     )
+     assert zero.status_code in (400, 422), zero.text
++
++
++# ── project_id ───────────────────────────────────────────────────────────
++
++
++def _make_project(db_uri: str, name: str, owner: str = "alice@example.com") -> str:
++    import uuid
++
++    project = SqlAlchemyProjectStore(db_uri).create(uuid.uuid4().hex, name, owner)
++    return str(project.id)
++
++
++async def test_project_id_round_trips_and_clears(
++    auth_client: httpx.AsyncClient, db_uri: str
++) -> None:
++    project_id = _make_project(db_uri, "Automation Notes")
++    created = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
++    )
++    assert created.status_code == 200, created.text
++    task_id = created.json()["id"]
++    assert created.json()["project_id"] is None
++
++    patched = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"project_id": project_id}, headers=_headers()
++    )
++    assert patched.status_code == 200, patched.text
++    assert patched.json()["project_id"] == project_id
++    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
++    assert got.json()["project_id"] == project_id
++    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
++    [row] = [t for t in listed.json()["scheduled_tasks"] if t["id"] == task_id]
++    assert row["project_id"] == project_id
++
++    # Patching another field leaves the project alone; "" or null unfiles.
++    renamed = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
++    )
++    assert renamed.json()["project_id"] == project_id
++    cleared = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"project_id": ""}, headers=_headers()
++    )
++    assert cleared.status_code == 200, cleared.text
++    assert cleared.json()["project_id"] is None
++
++
++async def test_project_id_must_be_the_callers_project(
++    auth_client: httpx.AsyncClient, db_uri: str
++) -> None:
++    _make_user(db_uri, "bob@example.com")
++    bobs = _make_project(db_uri, "Bob's", owner="bob@example.com")
++    resp = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(project_id=bobs), headers=_headers()
++    )
++    assert resp.status_code == 404, resp.text
++    missing = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(project_id="f" * 32), headers=_headers()
++    )
++    assert missing.status_code == 404, missing.text
++
++
++async def test_default_project_applies_only_when_create_omits_one(
++    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from omnigent.server.scheduled import task_project
++
++    default_id = _make_project(db_uri, "Automation Notes")
++    other_id = _make_project(db_uri, "Other")
++    monkeypatch.setenv(task_project.DEFAULT_PROJECT_ENV, "Automation Notes")
++
++    omitted = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
++    )
++    assert omitted.json()["project_id"] == default_id
++    explicit = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(project_id=other_id), headers=_headers()
++    )
++    assert explicit.json()["project_id"] == other_id
++    unfiled = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(project_id=None), headers=_headers()
++    )
++    assert unfiled.json()["project_id"] is None
++
++    task_id = omitted.json()["id"]
++    deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
++    assert deleted.status_code == 200
++    store = SqlAlchemyScheduledTaskStore(db_uri)
++    assert task_project.project_ids_for(store, [task_id]) == {task_id: None}
+diff --git a/tests/server/scheduled/test_task_project.py b/tests/server/scheduled/test_task_project.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fbf506e42c430c911f0d4b2aab30fce98db554a0
+--- /dev/null
++++ b/tests/server/scheduled/test_task_project.py
+@@ -0,0 +1,162 @@
++"""Tests for :mod:`omnigent.server.scheduled.task_project`.
++
++The ``project_id`` setting (its own table, unset by default), the default
++project named by the environment, and filing a fired session into the task's
++project without ever failing the fire.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import Any
++
++import pytest
++
++from omnigent.server.scheduled import task_project
++from omnigent.server.scheduled.fire import build_on_fire
++from tests.server.scheduled.test_fire import (
++    FakeConversationStore,
++    FakeScheduledTaskStore,
++    _deps,
++    _drain,
++    _task,
++)
++
++
++@dataclass
++class _Project:
++    id: str
++    name: str
++
++
++class _FakeProjectStore:
++    def __init__(self, projects: dict[str | None, list[_Project]]) -> None:
++        self.projects = projects
++
++    def list(self, *, user_id: str | None) -> list[_Project]:
++        return list(self.projects.get(user_id, []))
++
++    def get(self, project_id: str, *, user_id: str | None) -> _Project | None:
++        return next((p for p in self.list(user_id=user_id) if p.id == project_id), None)
++
++
++class _FilingConversationStore(FakeConversationStore):
++    def __init__(self, **kwargs: Any) -> None:
++        super().__init__(**kwargs)
++        self.filed: dict[str, str | None] = {}
++
++    def set_conversation_project(self, conversation_id: str, project_id: str | None) -> bool:
++        self.filed[conversation_id] = project_id
++        return True
++
++
++async def _launch(conv: Any, task: Any) -> None:
++    return None
++
++
++# ── The setting ──────────────────────────────────────────────────────────
++
++
++def test_project_round_trips_and_forgets_in_sqlite(db_uri: str) -> None:
++    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
++        SqlAlchemyScheduledTaskStore,
++    )
++
++    store = SqlAlchemyScheduledTaskStore(db_uri)
++    assert task_project.project_ids_for(store, ["a", "b"]) == {"a": None, "b": None}
++    task_project.set_project(store, "a", "p" * 32)
++    task_project.set_project(store, "b", "q" * 32)
++    task_project.set_project(store, "b", None)
++    assert task_project.project_ids_for(store, ["a", "b"]) == {"a": "p" * 32, "b": None}
++    task_project.forget_project(store, "a")
++    assert task_project.project_ids_for(store, ["a"]) == {"a": None}
++
++
++def test_with_project_fills_the_entity() -> None:
++    store = FakeScheduledTaskStore()
++    task_project.set_project(store, "task_1", "proj_1")
++    [task] = task_project.with_project(store, [_task()])
++    assert task.project_id == "proj_1"
++
++
++# ── The default ──────────────────────────────────────────────────────────
++
++
++def test_default_project_resolves_by_name_per_owner(monkeypatch: pytest.MonkeyPatch) -> None:
++    projects = _FakeProjectStore(
++        {
++            "alice@example.com": [_Project("p1", "Work"), _Project("p2", "Automation Notes")],
++            "bob@example.com": [_Project("p3", "Work")],
++        }
++    )
++    monkeypatch.setenv(task_project.DEFAULT_PROJECT_ENV, "automation notes")
++    assert task_project.default_project_id(projects, "alice@example.com") == "p2"
++    assert task_project.default_project_id(projects, "bob@example.com") is None
++    assert task_project.default_project_id(None, "alice@example.com") is None
++    monkeypatch.delenv(task_project.DEFAULT_PROJECT_ENV)
++    assert task_project.default_project_id(projects, "alice@example.com") is None
++
++
++# ── The fire ─────────────────────────────────────────────────────────────
++
++
++@pytest.mark.asyncio
++async def test_fire_files_the_new_session_into_the_task_project() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    task_project.set_project(store, "task_1", "p1")
++    conversations = _FilingConversationStore()
++    deps = _deps(store, conversation_store=conversations)
++    deps.project_store = _FakeProjectStore({None: [_Project("p1", "Automation Notes")]})
++
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++
++    assert conversations.filed == {"conv_1": "p1"}
++    assert store.runs[-1]["status"] == "running"
++
++
++@pytest.mark.asyncio
++async def test_fire_leaves_the_run_unfiled_when_the_project_is_gone() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    task_project.set_project(store, "task_1", "deleted")
++    conversations = _FilingConversationStore()
++    deps = _deps(store, conversation_store=conversations)
++    deps.project_store = _FakeProjectStore({None: [_Project("p1", "Automation Notes")]})
++
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++
++    assert conversations.filed == {}
++    assert store.runs[-1]["status"] == "running"
++
++
++@pytest.mark.asyncio
++async def test_fire_without_a_project_never_files() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    conversations = _FilingConversationStore()
++    deps = _deps(store, conversation_store=conversations)
++    deps.project_store = _FakeProjectStore({None: [_Project("p1", "Automation Notes")]})
++
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++
++    assert conversations.filed == {}
++
++
++@pytest.mark.asyncio
++async def test_a_failing_project_store_does_not_fail_the_fire() -> None:
++    class _Broken(_FakeProjectStore):
++        def get(self, project_id: str, *, user_id: str | None) -> _Project | None:
++            raise RuntimeError("db down")
++
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    task_project.set_project(store, "task_1", "p1")
++    conversations = _FilingConversationStore()
++    deps = _deps(store, conversation_store=conversations)
++    deps.project_store = _Broken({})
++
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++
++    assert conversations.filed == {}
++    assert store.runs[-1]["status"] == "running"
+diff --git a/web/src/components/scheduled/AeTaskProjectField.test.tsx b/web/src/components/scheduled/AeTaskProjectField.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..390ff03f4c41379d9f2e11546c38bc8ebdebfc74
+--- /dev/null
++++ b/web/src/components/scheduled/AeTaskProjectField.test.tsx
+@@ -0,0 +1,37 @@
++import { describe, expect, it } from "vitest";
++import {
++  DEFAULT_PROJECT,
++  NO_PROJECT,
++  initialProjectChoice,
++  projectIdInput,
++} from "@/components/scheduled/AeTaskProjectField";
++
++describe("initialProjectChoice", () => {
++  it("starts a new task on the server default", () => {
++    expect(initialProjectChoice(undefined, false)).toBe(DEFAULT_PROJECT);
++  });
++
++  it("starts an edit on the task's project, or no project", () => {
++    expect(initialProjectChoice("p1", true)).toBe("p1");
++    expect(initialProjectChoice(null, true)).toBe(NO_PROJECT);
++  });
++});
++
++describe("projectIdInput", () => {
++  it("omits the field for the server default on create", () => {
++    expect(projectIdInput(DEFAULT_PROJECT, undefined)).toEqual({});
++  });
++
++  it("sends null for no project and the id for a project on create", () => {
++    expect(projectIdInput(NO_PROJECT, undefined)).toEqual({ projectId: null });
++    expect(projectIdInput("p1", undefined)).toEqual({ projectId: "p1" });
++  });
++
++  it("sends only a change on edit", () => {
++    expect(projectIdInput("p1", "p1")).toEqual({});
++    expect(projectIdInput(NO_PROJECT, null)).toEqual({});
++    expect(projectIdInput("p2", "p1")).toEqual({ projectId: "p2" });
++    expect(projectIdInput(NO_PROJECT, "p1")).toEqual({ projectId: null });
++    expect(projectIdInput("p1", null)).toEqual({ projectId: "p1" });
++  });
++});
+diff --git a/web/src/components/scheduled/AeTaskProjectField.tsx b/web/src/components/scheduled/AeTaskProjectField.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c9713b0891a9cd9b38143cf422ae8855ce624a4f
+--- /dev/null
++++ b/web/src/components/scheduled/AeTaskProjectField.tsx
+@@ -0,0 +1,86 @@
++// The Project picker on the automation dialog: which project each run session
++// is filed into. On create, "Default project" omits the field so the server's
++// configured default applies; "No project" leaves runs unfiled.
++import { Label } from "@/components/scheduled/Label";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import { useProjects } from "@/hooks/useConversations";
++
++/** Select value for "use the server's default project" (create only). */
++export const DEFAULT_PROJECT = "__default_project__";
++/** Select value for "file runs into no project". */
++export const NO_PROJECT = "__no_project__";
++
++/** The picker's starting value for a task being edited, or for a new task. */
++export function initialProjectChoice(projectId: string | null | undefined, isEdit: boolean) {
++  if (!isEdit) return DEFAULT_PROJECT;
++  return projectId ?? NO_PROJECT;
++}
++
++/**
++ * The `projectId` key to send for *choice*: omitted when it means "server
++ * default" or (on edit) when it did not change; `null` for no project.
++ */
++export function projectIdInput(
++  choice: string,
++  original: string | null | undefined,
++): { projectId?: string | null } {
++  if (choice === DEFAULT_PROJECT) return {};
++  const projectId = choice === NO_PROJECT ? null : choice;
++  if (original !== undefined && projectId === (original ?? null)) return {};
++  return { projectId };
++}
++
++export function AeTaskProjectField({
++  value,
++  onValueChange,
++  isEdit,
++  onSelectOpenChange,
++}: {
++  value: string;
++  onValueChange: (value: string) => void;
++  isEdit: boolean;
++  onSelectOpenChange?: (open: boolean) => void;
++}) {
++  const { data } = useProjects();
++  // Legacy label-projects carry no id and cannot be filed into.
++  const projects = (data ?? []).filter((p): p is typeof p & { id: string } => p.id !== null);
++  const knownValue =
++    value === DEFAULT_PROJECT || value === NO_PROJECT || projects.some((p) => p.id === value);
++
++  return (
++    <div className="flex flex-col gap-1.5" data-testid="task-project-field">
++      <Label htmlFor="task-project">Project</Label>
++      <Select
++        value={value}
++        componentId="tasks.scheduled.project"
++        onValueChange={onValueChange}
++        onOpenChange={onSelectOpenChange}
++      >
++        <SelectTrigger id="task-project" data-testid="task-project-trigger" className="w-full">
++          <SelectValue />
++        </SelectTrigger>
++        <SelectContent position="popper" align="start">
++          {!isEdit && <SelectItem value={DEFAULT_PROJECT}>Default project</SelectItem>}
++          <SelectItem value={NO_PROJECT}>No project</SelectItem>
++          {!knownValue && <SelectItem value={value}>Unknown project</SelectItem>}
++          {projects.map((project) => (
++            <SelectItem key={project.id} value={project.id}>
++              {project.name}
++            </SelectItem>
++          ))}
++        </SelectContent>
++      </Select>
++      <p className="text-sm text-muted-foreground">
++        {value === DEFAULT_PROJECT
++          ? "Each run opens in the server's default project, or unfiled when none is set."
++          : "Each run opens its session in this project."}
++      </p>
++    </div>
++  );
++}
+diff --git a/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx b/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx
+index 71f254775f9063cb7de2add3c6bd0bd42db79ae9..f97c0e8323bb43ecec771248c837265e5cce3de2 100644
+--- a/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx
++++ b/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx
+@@ -37,6 +37,10 @@ vi.mock("@/hooks/useScheduledTasks", () => ({
+   useUpdateScheduledTask: vi.fn(),
+ }));
+ vi.mock("@/lib/agentLabels", () => ({ useBrainHarnessLabels: () => ({}) }));
++vi.mock("@/hooks/useConversations", async (orig) => ({
++  ...(await orig<object>()),
++  useProjects: () => ({ data: [{ id: "p1", name: "Automation Notes" }] }),
++}));
+ vi.mock("@/shell/WorkspacePicker", () => ({
+   isNavigablePath: (path: string) => path.startsWith("/"),
+   WorkspacePicker: ({ onSelect }: { onSelect?: (p: string) => void }) => (
+@@ -436,6 +440,21 @@ describe("CreateScheduledTaskDialog edit mode", () => {
+     });
+   });
+ 
++  it("seeds the task's project and leaves it out of an unchanged update", async () => {
++    render(
++      <CreateScheduledTaskDialog
++        open
++        onOpenChange={vi.fn()}
++        editingTask={scheduledTask({ projectId: "p1" })}
++      />,
++    );
++    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Automation Notes");
++    fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
++
++    await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
++    expect(updateMutateAsync.mock.calls[0][0].input).not.toHaveProperty("projectId");
++  });
++
+   it("keeps the task's settings when the pick lands back on its own agent", async () => {
+     // Switching away and back is not a rebind, so the stored model/effort/
+     // permission must survive it — the clear is only justified by a real switch.
+@@ -566,6 +585,8 @@ describe("CreateScheduledTaskDialog submit", () => {
+     });
+     expect(arg).not.toHaveProperty("hostId");
+     expect(arg).not.toHaveProperty("workspace");
++    // Project left on "Default project" is omitted so the server default applies.
++    expect(arg).not.toHaveProperty("projectId");
+     // Timezone has no visible control but is still inferred + sent: a non-empty
+     // IANA-ish string (whatever the test env's local zone resolves to).
+     expect(typeof arg.timezone).toBe("string");
+diff --git a/web/src/components/scheduled/CreateScheduledTaskDialog.tsx b/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
+index b2acd6df58443b70412613629a5e117a7694bf7e..4bb45708d4e9720ef0dcbcd3d7c0bf1ec640e15c 100644
+--- a/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
++++ b/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
+@@ -24,6 +24,12 @@ import {
+ import { Label } from "@/components/scheduled/Label";
+ import { ScheduleFields } from "@/components/scheduled/ScheduleFields";
+ import { ModelEffortFields } from "@/components/scheduled/ModelEffortFields";
++import {
++  AeTaskProjectField,
++  DEFAULT_PROJECT,
++  initialProjectChoice,
++  projectIdInput,
++} from "@/components/scheduled/AeTaskProjectField";
+ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
+ import { AgentHarnessPicker } from "@/shell/NewChatDialog";
+ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+@@ -211,6 +217,7 @@ export function CreateScheduledTaskDialog({
+   // "managed_sandbox") instead of a connected host; hides the host/workspace
+   // pickers. Only offered when the server advertises managed sandboxes.
+   const [sandboxMode, setSandboxMode] = useState(false);
++  const [projectChoice, setProjectChoice] = useState<string>(DEFAULT_PROJECT);
+   const [error, setError] = useState<string | null>(null);
+   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
+ 
+@@ -237,6 +244,7 @@ export function CreateScheduledTaskDialog({
+         setHostId(editingTask.hostId ?? "");
+         setWorkspace(editingTask.workspace ?? "");
+         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
++        setProjectChoice(initialProjectChoice(editingTask.projectId, true));
+       } else {
+         setName(initialName ?? "");
+         setPrompt(initialPrompt ?? "");
+@@ -249,6 +257,7 @@ export function CreateScheduledTaskDialog({
+         setHostId("");
+         setWorkspace("");
+         setSandboxMode(false);
++        setProjectChoice(DEFAULT_PROJECT);
+       }
+       setError(null);
+     }
+@@ -330,6 +339,7 @@ export function CreateScheduledTaskDialog({
+         ...(!sandboxMode && hostId !== "" && workspace.trim() !== ""
+           ? { workspace: workspace.trim() }
+           : {}),
++        ...projectIdInput(projectChoice, editingTask ? (editingTask.projectId ?? null) : undefined),
+       };
+       if (editingTask) {
+         // Thread model/effort ONLY when the agent supports them. Each control's
+@@ -626,6 +636,13 @@ export function CreateScheduledTaskDialog({
+             </p>
+           )}
+ 
++          <AeTaskProjectField
++            value={projectChoice}
++            onValueChange={setProjectChoice}
++            isEdit={isEdit}
++            onSelectOpenChange={handleSelectOpenChange}
++          />
++
+           {error && (
+             <div
+               role="alert"
+diff --git a/web/src/lib/scheduledTasksApi.ts b/web/src/lib/scheduledTasksApi.ts
+index 3c97b7c5d0c69132340d0182758ba4f61ab6d387..e34d9675de02c32aeb04646543d795c6ba51937a 100644
+--- a/web/src/lib/scheduledTasksApi.ts
++++ b/web/src/lib/scheduledTasksApi.ts
+@@ -57,6 +57,8 @@ export interface ScheduledTask {
+   hostId: string | null;
+   /** Where firings run — a connected host, or a fresh managed sandbox per fire. */
+   executionTarget: ScheduledTaskExecutionTarget;
++  /** Project each run session is filed into, or `null` for unfiled runs. */
++  projectId?: string | null;
+   state: ScheduledTaskState;
+   /** Epoch seconds of the last fire, or `null` if it has never fired. */
+   lastRunAt: number | null;
+@@ -111,6 +113,11 @@ export interface CreateScheduledTaskInput {
+    * NOT be combined with `hostId` / `workspace`.
+    */
+   executionTarget?: ScheduledTaskExecutionTarget;
++  /**
++   * Project each run session is filed into. Omit for the server's default
++   * project; `null` leaves runs unfiled.
++   */
++  projectId?: string | null;
+ }
+ 
+ /**
+@@ -140,6 +147,8 @@ export interface UpdateScheduledTaskInput {
+    * also set `hostId` / `workspace` in the same update.
+    */
+   executionTarget?: ScheduledTaskExecutionTarget;
++  /** New project for run sessions; `null` leaves runs unfiled. */
++  projectId?: string | null;
+   state?: ScheduledTaskState;
+ }
+ 
+@@ -160,6 +169,7 @@ interface ScheduledTaskWire {
+   workspace: string | null;
+   host_id: string | null;
+   execution_target: ScheduledTaskExecutionTarget;
++  project_id?: string | null;
+   state: ScheduledTaskState;
+   last_run_at: number | null;
+   last_run_status: ScheduledTaskRunStatus | null;
+@@ -236,6 +246,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
+     workspace: wire.workspace,
+     hostId: wire.host_id,
+     executionTarget: wire.execution_target,
++    projectId: wire.project_id ?? null,
+     state: wire.state,
+     lastRunAt: wire.last_run_at,
+     lastRunStatus: wire.last_run_status,
+@@ -297,6 +308,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
+   if (input.workspace != null) body.workspace = input.workspace;
+   if (input.hostId != null) body.host_id = input.hostId;
+   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
++  if (input.projectId !== undefined) body.project_id = input.projectId;
+   const res = await authenticatedFetch("/v1/scheduled-tasks", {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+@@ -326,6 +338,7 @@ export async function updateScheduledTask(
+   if (input.workspace !== undefined) body.workspace = input.workspace;
+   if (input.hostId !== undefined) body.host_id = input.hostId;
+   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
++  if (input.projectId !== undefined) body.project_id = input.projectId ?? "";
+   if (input.state !== undefined) body.state = input.state;
+   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
+     method: "PATCH",

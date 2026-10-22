@@ -1,0 +1,735 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 22:19:33 -0700
+Subject: [PATCH 017/148] [ae-patch] Fix the terminal Paste button's review
+ findings
+
+Review of patch 0016 (the touch Paste button on the web terminal) found
+these, fixed here:
+
+- Paste now goes through pasteIntoAeTerminal, the same guards a Run
+  gets: nothing is written unless the socket is open, and multi-line
+  text is refused unless the shell turned on bracketed paste, where
+  every line would otherwise run as it arrived. Exactly one trailing
+  newline (\n or \r\n), a common copy artifact, is dropped first.
+- The session is taken at tap time. After the clipboard read, the text
+  is written only if that same session is still current and open; a
+  terminal that reconnected during the read gets nothing, and the text
+  waits in the sheet. A read that resolves after unmount is dropped.
+- Every paste that does not go through opens the sheet with the text
+  kept and a message for its cause: clipboard unreadable (API missing
+  or refused), clipboard empty, terminal not connected, terminal
+  reconnected during the read, or multi-line text the shell cannot
+  take. Send closes the sheet only on success and otherwise keeps the
+  draft and says why.
+- TerminalView keeps the control mounted while the attach is writable,
+  not only while connected, so an iOS app switch that drops the socket
+  no longer destroys an open sheet and its draft; the button is
+  disabled while not connected.
+- The sheet's DialogContent renders unconditionally, so it animates
+  closed like the other dialogs.
+- Comments no longer claim the phone's keyboard returns: iOS does not
+  raise it from a focus call made after an await.
+
+The suite adds the multi-line refusal and the bracketed pass, the
+trailing newline, a replaced or closed session during the read, a
+late read after unmount, a Send that cannot write, the empty clipboard,
+and a TerminalView test that the control and its sheet outlive a
+dropped socket.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ web/src/components/AeTerminalPaste.test.tsx | 266 +++++++++++++++++---
+ web/src/components/AeTerminalPaste.tsx      | 259 ++++++++++++-------
+ web/src/components/blocks/TerminalView.tsx  |   7 +-
+ 3 files changed, 411 insertions(+), 121 deletions(-)
+
+diff --git a/web/src/components/AeTerminalPaste.test.tsx b/web/src/components/AeTerminalPaste.test.tsx
+index d93620d1dfa21f4208a5c17f043620bf5145f05a..0bbd6c0b40a601abe1f9f3502469762733a2ce79 100644
+--- a/web/src/components/AeTerminalPaste.test.tsx
++++ b/web/src/components/AeTerminalPaste.test.tsx
+@@ -1,10 +1,15 @@
+-// The terminal's touch Paste control: shown on a coarse pointer only, a
+-// clipboard read writes through the session's `aeWrite` without Enter, and a
+-// refused read falls back to a sheet whose Send writes the typed text.
++// The terminal's touch Paste control: shown on a coarse pointer only; a
++// clipboard read pastes through the Run guards without Enter; every paste
++// that does not go through lands in a sheet that keeps the text and says why.
++// The last block mounts the real TerminalView to show the control outlives a
++// dropped socket.
+ 
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { AeTerminalPaste, type AeTerminalPasteSink } from "./AeTerminalPaste";
++import { TerminalView } from "@/components/blocks/TerminalView";
++import type { AeTerminalSink } from "@/lib/aeTerminalInput";
++import { AE_PASTE_MESSAGES, AeTerminalPaste, aeTrimPasteText } from "./AeTerminalPaste";
+ 
+ const originalMatchMedia = window.matchMedia;
+ const originalClipboard = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+@@ -32,12 +37,46 @@ function setClipboard(readText: (() => Promise<string>) | undefined): void {
+   });
+ }
+ 
+-function fakeSink() {
++function fakeSink(options: { state?: "open" | "connecting" | "gone"; bracketed?: boolean } = {}) {
+   const sink = {
++    state: options.state ?? "open",
++    bracketed: options.bracketed ?? true,
+     aeWrite: vi.fn<(text: string, submit: boolean) => void>(),
+     focus: vi.fn<() => void>(),
++    aeInputState: () => sink.state,
++    aeBracketedPaste: () => sink.bracketed,
++    aeOnOutput: () => ({ dispose: () => {} }),
+   };
+-  return sink satisfies AeTerminalPasteSink;
++  return sink satisfies AeTerminalSink;
++}
++
++/** A clipboard whose read resolves when the returned function is called. */
++function pendingClipboard(): (text: string) => void {
++  let resolveRead: (text: string) => void = () => {};
++  setClipboard(
++    () =>
++      new Promise<string>((resolve) => {
++        resolveRead = resolve;
++      }),
++  );
++  return (text) => resolveRead(text);
++}
++
++function renderPaste(getSink: () => AeTerminalSink | null, connected = true) {
++  return render(<AeTerminalPaste getSink={getSink} connected={connected} />);
++}
++
++function tap() {
++  fireEvent.click(screen.getByTestId("ae-terminal-paste"));
++}
++
++async function sheetReason(): Promise<string | null> {
++  const message = await screen.findByTestId("ae-terminal-paste-message");
++  return message.getAttribute("data-reason");
++}
++
++function draftText(): string {
++  return (screen.getByTestId("ae-terminal-paste-text") as HTMLTextAreaElement).value;
+ }
+ 
+ beforeEach(() => {
+@@ -46,6 +85,7 @@ beforeEach(() => {
+ 
+ afterEach(() => {
+   cleanup();
++  vi.unstubAllGlobals();
+   window.matchMedia = originalMatchMedia;
+   if (originalClipboard) Object.defineProperty(navigator, "clipboard", originalClipboard);
+   else setClipboard(undefined);
+@@ -54,49 +94,133 @@ afterEach(() => {
+ describe("AeTerminalPaste", () => {
+   it("is hidden on a fine pointer", () => {
+     setPointer(false);
+-    render(<AeTerminalPaste getSink={() => fakeSink()} />);
++    renderPaste(() => fakeSink());
+     expect(screen.queryByTestId("ae-terminal-paste")).toBeNull();
+   });
+ 
+-  it("is shown on a coarse pointer", () => {
+-    render(<AeTerminalPaste getSink={() => fakeSink()} />);
+-    expect(screen.getByRole("button", { name: "Paste into terminal" })).toBeTruthy();
++  it("is shown on a coarse pointer and disabled while not connected", () => {
++    const { rerender } = renderPaste(() => fakeSink());
++    const button = screen.getByRole("button", { name: "Paste into terminal" }) as HTMLButtonElement;
++    expect(button.disabled).toBe(false);
++    rerender(<AeTerminalPaste getSink={() => fakeSink()} connected={false} />);
++    expect(button.disabled).toBe(true);
+   });
+ 
+   it("writes the clipboard through aeWrite without Enter and refocuses", async () => {
+     const sink = fakeSink();
+     setClipboard(() => Promise.resolve("echo hi"));
+-    render(<AeTerminalPaste getSink={() => sink} />);
+-    fireEvent.click(screen.getByTestId("ae-terminal-paste"));
++    renderPaste(() => sink);
++    tap();
+     await waitFor(() => expect(sink.aeWrite).toHaveBeenCalledWith("echo hi", false));
+     expect(sink.aeWrite).toHaveBeenCalledTimes(1);
+     expect(sink.focus).toHaveBeenCalled();
+     expect(screen.queryByTestId("ae-terminal-paste-sheet")).toBeNull();
+   });
+ 
++  it("drops exactly one trailing newline", async () => {
++    expect(aeTrimPasteText("ls\r\n")).toBe("ls");
++    expect(aeTrimPasteText("ls\n\n")).toBe("ls\n");
++    const sink = fakeSink({ bracketed: false });
++    setClipboard(() => Promise.resolve("git status\n"));
++    renderPaste(() => sink);
++    tap();
++    await waitFor(() => expect(sink.aeWrite).toHaveBeenCalledWith("git status", false));
++  });
++
++  it("pastes multi-line text when the shell brackets pastes", async () => {
++    const sink = fakeSink({ bracketed: true });
++    setClipboard(() => Promise.resolve("cd /tmp\nls\n"));
++    renderPaste(() => sink);
++    tap();
++    await waitFor(() => expect(sink.aeWrite).toHaveBeenCalledWith("cd /tmp\nls", false));
++  });
++
++  it("refuses multi-line text without bracketed paste and keeps it in the sheet", async () => {
++    const sink = fakeSink({ bracketed: false });
++    setClipboard(() => Promise.resolve("cd /tmp\nrm -rf build"));
++    renderPaste(() => sink);
++    tap();
++    expect(await sheetReason()).toBe("multiline");
++    expect(screen.getByTestId("ae-terminal-paste-message").textContent).toContain(
++      AE_PASTE_MESSAGES.multiline,
++    );
++    expect(draftText()).toBe("cd /tmp\nrm -rf build");
++    expect(sink.aeWrite).not.toHaveBeenCalled();
++  });
++
+   it("opens the sheet when the clipboard read is refused", async () => {
+     const sink = fakeSink();
+     setClipboard(() => Promise.reject(new DOMException("denied", "NotAllowedError")));
+-    render(<AeTerminalPaste getSink={() => sink} />);
+-    fireEvent.click(screen.getByTestId("ae-terminal-paste"));
+-    expect(await screen.findByTestId("ae-terminal-paste-sheet")).toBeTruthy();
++    renderPaste(() => sink);
++    tap();
++    expect(await sheetReason()).toBe("unreadable");
+     expect(sink.aeWrite).not.toHaveBeenCalled();
+   });
+ 
+   it("opens the sheet when the Clipboard API is missing", async () => {
+     setClipboard(undefined);
+-    render(<AeTerminalPaste getSink={() => fakeSink()} />);
+-    fireEvent.click(screen.getByTestId("ae-terminal-paste"));
+-    expect(await screen.findByTestId("ae-terminal-paste-sheet")).toBeTruthy();
++    renderPaste(() => fakeSink());
++    tap();
++    expect(await sheetReason()).toBe("unreadable");
+   });
+ 
+-  it("sends the textarea's text through aeWrite without Enter", async () => {
++  it("says the clipboard is empty when it is", async () => {
++    setClipboard(() => Promise.resolve("\n"));
++    renderPaste(() => fakeSink());
++    tap();
++    expect(await sheetReason()).toBe("empty");
++    expect(screen.getByTestId("ae-terminal-paste-message").textContent).toContain(
++      "Clipboard is empty.",
++    );
++    const send = screen.getByTestId("ae-terminal-paste-send") as HTMLButtonElement;
++    expect(send.disabled).toBe(true);
++  });
++
++  it("keeps the text and writes nothing when the terminal reconnected during the read", async () => {
++    const first = fakeSink();
++    const second = fakeSink({ state: "connecting" });
++    let current: AeTerminalSink = first;
++    const resolveRead = pendingClipboard();
++    renderPaste(() => current);
++    tap();
++    first.state = "gone";
++    current = second;
++    await act(async () => resolveRead("make deploy"));
++    expect(await sheetReason()).toBe("reconnected");
++    expect(draftText()).toBe("make deploy");
++    expect(first.aeWrite).not.toHaveBeenCalled();
++    expect(second.aeWrite).not.toHaveBeenCalled();
++  });
++
++  it("keeps the text and says not ready when the socket closed during the read", async () => {
++    const sink = fakeSink();
++    const resolveRead = pendingClipboard();
++    renderPaste(() => sink);
++    tap();
++    sink.state = "gone";
++    await act(async () => resolveRead("make deploy"));
++    expect(await sheetReason()).toBe("not-ready");
++    expect(draftText()).toBe("make deploy");
++    expect(sink.aeWrite).not.toHaveBeenCalled();
++  });
++
++  it("drops a read that resolves after unmount", async () => {
++    const sink = fakeSink();
++    const resolveRead = pendingClipboard();
++    const { unmount } = renderPaste(() => sink);
++    tap();
++    unmount();
++    await act(async () => resolveRead("echo late"));
++    expect(sink.aeWrite).not.toHaveBeenCalled();
++  });
++
++  it("sends the textarea's text through aeWrite without Enter and closes", async () => {
+     const sink = fakeSink();
+     setClipboard(() => Promise.reject(new Error("no")));
+-    render(<AeTerminalPaste getSink={() => sink} />);
+-    fireEvent.click(screen.getByTestId("ae-terminal-paste"));
++    renderPaste(() => sink);
++    tap();
+     const box = await screen.findByTestId("ae-terminal-paste-text");
+-    fireEvent.change(box, { target: { value: "ls -la\npwd" } });
++    fireEvent.change(box, { target: { value: "ls -la\npwd\n" } });
+     await act(async () => {
+       fireEvent.click(screen.getByTestId("ae-terminal-paste-send"));
+     });
+@@ -105,11 +229,29 @@ describe("AeTerminalPaste", () => {
+     await waitFor(() => expect(screen.queryByTestId("ae-terminal-paste-sheet")).toBeNull());
+   });
+ 
++  it("keeps the sheet and the draft when Send cannot write", async () => {
++    const sink = fakeSink({ bracketed: false });
++    setClipboard(() => Promise.reject(new Error("no")));
++    renderPaste(() => sink);
++    tap();
++    const box = await screen.findByTestId("ae-terminal-paste-text");
++    fireEvent.change(box, { target: { value: "a\nb" } });
++    fireEvent.click(screen.getByTestId("ae-terminal-paste-send"));
++    expect(await sheetReason()).toBe("multiline");
++    expect(draftText()).toBe("a\nb");
++    sink.state = "connecting";
++    fireEvent.change(box, { target: { value: "ab" } });
++    fireEvent.click(screen.getByTestId("ae-terminal-paste-send"));
++    expect(await sheetReason()).toBe("not-ready");
++    expect(draftText()).toBe("ab");
++    expect(sink.aeWrite).not.toHaveBeenCalled();
++  });
++
+   it("writes nothing on Cancel", async () => {
+     const sink = fakeSink();
+     setClipboard(() => Promise.reject(new Error("no")));
+-    render(<AeTerminalPaste getSink={() => sink} />);
+-    fireEvent.click(screen.getByTestId("ae-terminal-paste"));
++    renderPaste(() => sink);
++    tap();
+     const box = await screen.findByTestId("ae-terminal-paste-text");
+     fireEvent.change(box, { target: { value: "rm -rf build" } });
+     await act(async () => {
+@@ -118,12 +260,76 @@ describe("AeTerminalPaste", () => {
+     await waitFor(() => expect(screen.queryByTestId("ae-terminal-paste-sheet")).toBeNull());
+     expect(sink.aeWrite).not.toHaveBeenCalled();
+   });
++});
++
++class FakeWebSocket {
++  static CONNECTING = 0;
++  static OPEN = 1;
++  static CLOSING = 2;
++  static CLOSED = 3;
++  static instances: FakeWebSocket[] = [];
++  readyState = 0;
++  binaryType = "blob";
++  private listeners: Record<string, ((ev: unknown) => void)[]> = {};
++  url: string;
++  constructor(url: string) {
++    this.url = url;
++    FakeWebSocket.instances.push(this);
++  }
++  addEventListener(type: string, fn: (ev: unknown) => void) {
++    (this.listeners[type] ??= []).push(fn);
++  }
++  send() {}
++  close() {
++    this.readyState = FakeWebSocket.CLOSED;
++  }
++  open() {
++    this.readyState = FakeWebSocket.OPEN;
++    for (const fn of this.listeners.open ?? []) fn({});
++  }
++  drop() {
++    this.readyState = FakeWebSocket.CLOSED;
++    for (const fn of this.listeners.close ?? []) fn({ code: 1006, reason: "" });
++  }
++}
++
++class FakeResizeObserver {
++  observe() {}
++  disconnect() {}
++}
++
++describe("AeTerminalPaste in TerminalView", () => {
++  beforeEach(() => {
++    FakeWebSocket.instances = [];
++    vi.stubGlobal("WebSocket", FakeWebSocket);
++    vi.stubGlobal("ResizeObserver", FakeResizeObserver);
++  });
++
++  it("stays mounted with its sheet and draft through a dropped socket", async () => {
++    setClipboard(() => Promise.reject(new Error("no")));
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    render(
++      <QueryClientProvider client={client}>
++        <TerminalView sessionId="conv_paste" terminalId="terminal_bash_p1" />
++      </QueryClientProvider>,
++    );
++    await waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
++    const socket = FakeWebSocket.instances.at(-1)!;
++    act(() => socket.open());
++    const button = (await screen.findByTestId("ae-terminal-paste")) as HTMLButtonElement;
++    expect(button.disabled).toBe(false);
++    tap();
++    const box = await screen.findByTestId("ae-terminal-paste-text");
++    fireEvent.change(box, { target: { value: "npm test" } });
++
++    act(() => socket.drop());
++    expect(screen.getByTestId("ae-terminal-paste")).toBe(button);
++    expect(button.disabled).toBe(true);
++    expect(screen.getByTestId("ae-terminal-paste-sheet")).toBeTruthy();
++    expect(draftText()).toBe("npm test");
+ 
+-  it("keeps Send disabled while the box is empty", async () => {
+-    setClipboard(() => Promise.resolve(""));
+-    render(<AeTerminalPaste getSink={() => fakeSink()} />);
+-    fireEvent.click(screen.getByTestId("ae-terminal-paste"));
+-    const send = await screen.findByTestId("ae-terminal-paste-send");
+-    expect((send as HTMLButtonElement).disabled).toBe(true);
++    fireEvent.click(screen.getByTestId("ae-terminal-paste-send"));
++    expect(await sheetReason()).toBe("not-ready");
++    expect(draftText()).toBe("npm test");
+   });
+ });
+diff --git a/web/src/components/AeTerminalPaste.tsx b/web/src/components/AeTerminalPaste.tsx
+index 46edeec9d714e0933aca4da173f853807eadfab3..a984e9589da450a3ec9cbd767a7a72ec73accf9d 100644
+--- a/web/src/components/AeTerminalPaste.tsx
++++ b/web/src/components/AeTerminalPaste.tsx
+@@ -3,17 +3,32 @@
+ // xterm.js draws the terminal on a canvas and keeps its keyboard input in a
+ // hidden textarea, so a long press on a phone offers no Paste: iOS never
+ // shows the edit menu over it. This control fills that gap. It shows only on
+-// a coarse (touch) primary pointer, and `TerminalView` renders it only while
+-// a writable attach is connected.
++// a coarse (touch) primary pointer. `TerminalView` keeps it mounted for as
++// long as the attach is writable, so an open sheet and its text survive a
++// dropped socket (an iOS app switch); the button is disabled while the
++// terminal is not connected.
+ //
+-// A tap reads the clipboard inside the user gesture and writes the text
+-// through the session's `aeWrite` (xterm's own paste, bracketed when the
+-// shell asked for it; Enter is never pressed). When the Clipboard API is
+-// missing (plain HTTP) or refuses (iOS declined, permission denied, empty),
+-// a small sheet opens with a textarea, where the native long press paste
+-// works, and Send writes what it holds. The text is never logged or stored.
+-
+-import { useRef, useState } from "react";
++// A tap takes the terminal session that is current at that moment, reads the
++// clipboard inside the user gesture, and pastes through `pasteIntoAeTerminal`,
++// the same guards a Run gets: nothing is written unless the socket is open,
++// and multi-line text is refused unless the shell turned on bracketed paste
++// (otherwise every line would run as it arrived). One trailing newline, a
++// common copy artifact, is dropped. Enter is never pressed. A write goes only
++// to the session the tap started with; if the terminal reconnected during
++// the read, the text waits in the sheet instead.
++//
++// The sheet opens whenever a paste does not go through, with a message for
++// the cause: the Clipboard API missing (plain HTTP) or refused, an empty
++// clipboard, a terminal that is not ready, or multi-line text the shell
++// cannot take. Its textarea keeps any text that was read and takes the native
++// long press Paste; Send pastes through the same guards and closes only on
++// success. The text is never logged or stored.
++//
++// Focus goes back to the terminal after a paste for a hardware keyboard. iOS
++// does not raise its on-screen keyboard from a focus call made after an
++// await, so on a phone the terminal is tapped again to type.
++
++import { useEffect, useRef, useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import {
+   Dialog,
+@@ -27,7 +42,7 @@ import { Textarea } from "@/components/ui/textarea";
+ import { useIsCoarsePointer } from "@/hooks/useIsCoarsePointer";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+-import type { AeTerminalSink } from "@/lib/aeTerminalInput";
++import { type AeTerminalSink, pasteIntoAeTerminal } from "@/lib/aeTerminalInput";
+ 
+ /**
+  * Tabler `clipboard-text` (outline), from @tabler/icons 3.46.0, inlined so a
+@@ -43,57 +58,124 @@ const CLIPBOARD_TEXT_ICON: AeTablerIconNode = [
+   ["path", { d: "M9 16h6" }],
+ ];
+ 
+-/** The part of a `TerminalSession` a paste needs. */
+-export type AeTerminalPasteSink = Pick<AeTerminalSink, "aeWrite" | "focus">;
++/** Why the sheet is open; each cause has its own message. */
++export type AePasteSheetReason = "unreadable" | "empty" | "not-ready" | "reconnected" | "multiline";
++
++export const AE_PASTE_MESSAGES: Record<AePasteSheetReason, string> = {
++  unreadable:
++    "The clipboard could not be read directly. Long press the box, choose Paste, then Send.",
++  empty: "Clipboard is empty. Copy the text again, or long press the box and choose Paste.",
++  "not-ready": "The terminal is not connected, so nothing was sent. Tap Send once it is back.",
++  reconnected:
++    "The terminal reconnected while the clipboard was read, so nothing was sent. Tap Send to paste.",
++  multiline:
++    "This shell has not turned on bracketed paste, so each line would run as it arrived. Nothing was sent; edit the text to one line, or Cancel.",
++};
++
++/** Drop exactly one trailing newline (`\n` or `\r\n`). */
++export function aeTrimPasteText(text: string): string {
++  return text.replace(/\r?\n$/, "");
++}
+ 
+-async function readClipboard(): Promise<string | null> {
++type ClipboardRead = { kind: "text"; text: string } | { kind: "empty" } | { kind: "unreadable" };
++
++async function readClipboard(): Promise<ClipboardRead> {
+   try {
+-    if (typeof navigator === "undefined" || !navigator.clipboard?.readText) return null;
+-    const text = await navigator.clipboard.readText();
+-    return text === "" ? null : text;
++    if (typeof navigator === "undefined" || !navigator.clipboard?.readText) {
++      return { kind: "unreadable" };
++    }
++    const text = aeTrimPasteText(await navigator.clipboard.readText());
++    return text === "" ? { kind: "empty" } : { kind: "text", text };
+   } catch {
+-    return null;
++    return { kind: "unreadable" };
+   }
+ }
+ 
+-export function AeTerminalPaste({ getSink }: { getSink: () => AeTerminalPasteSink | null }) {
++/**
++ * Paste through the Run guards. Returns the terminal's focus call when the
++ * paste went through, else the sheet's reason.
++ */
++function tryPaste(
++  sink: AeTerminalSink | null,
++  text: string,
++): { ok: true; focus: () => void } | { ok: false; reason: AePasteSheetReason } {
++  if (sink === null || sink.aeInputState() !== "open") return { ok: false, reason: "not-ready" };
++  const result = pasteIntoAeTerminal(sink, text, false);
++  if (result.ok) return { ok: true, focus: result.focus };
++  return { ok: false, reason: sink.aeInputState() === "open" ? "multiline" : "not-ready" };
++}
++
++export function AeTerminalPaste({
++  getSink,
++  connected,
++}: {
++  /** The terminal's current session (a re-dial replaces it), or null. */
++  getSink: () => AeTerminalSink | null;
++  /** Whether the attach is connected; the button is disabled otherwise. */
++  connected: boolean;
++}) {
+   const coarse = useIsCoarsePointer();
+-  const [sheetOpen, setSheetOpen] = useState(false);
++  const [reason, setReason] = useState<AePasteSheetReason | null>(null);
+   const [draft, setDraft] = useState("");
++  // Bumped on every tap and on unmount, so a read that resolves late is dropped.
++  const readGeneration = useRef(0);
+   const reading = useRef(false);
+-  const focusAfterClose = useRef(false);
++  // Set by a Send that went through; called once the sheet has closed (while
++  // it is open its focus trap would take the focus back).
++  const focusAfterClose = useRef<(() => void) | null>(null);
++
++  useEffect(
++    () => () => {
++      readGeneration.current += 1;
++      reading.current = false;
++    },
++    [],
++  );
+ 
+   if (!coarse) return null;
+ 
+-  const write = (text: string): boolean => {
+-    const sink = getSink();
+-    if (sink === null) return false;
+-    sink.aeWrite(text, false);
+-    return true;
++  const openSheet = (why: AePasteSheetReason, text: string) => {
++    setDraft(text);
++    setReason(why);
+   };
+ 
+   const paste = async () => {
+     if (reading.current) return;
+     reading.current = true;
+-    const text = await readClipboard();
++    const generation = ++readGeneration.current;
++    const sink = getSink();
++    const read = await readClipboard();
++    if (generation !== readGeneration.current) return;
+     reading.current = false;
+-    if (text !== null && write(text)) {
+-      getSink()?.focus();
++    if (read.kind !== "text") {
++      openSheet(read.kind, "");
+       return;
+     }
+-    setDraft("");
+-    setSheetOpen(true);
++    const current = getSink();
++    if (sink === null || current !== sink || sink.aeInputState() !== "open") {
++      openSheet(sink !== null && current !== sink ? "reconnected" : "not-ready", read.text);
++      return;
++    }
++    const pasted = tryPaste(sink, read.text);
++    if (pasted.ok) pasted.focus();
++    else openSheet(pasted.reason, read.text);
+   };
+ 
+-  const closeSheet = (sent: boolean) => {
+-    focusAfterClose.current = sent;
++  const closeSheet = () => {
++    setReason(null);
+     setDraft("");
+-    setSheetOpen(false);
+   };
+ 
+   const send = () => {
+-    if (draft === "") return;
+-    closeSheet(write(draft));
++    const text = aeTrimPasteText(draft);
++    if (text === "") return;
++    const pasted = tryPaste(getSink(), text);
++    if (!pasted.ok) {
++      setReason(pasted.reason);
++      return;
++    }
++    focusAfterClose.current = pasted.focus;
++    closeSheet();
+   };
+ 
+   return (
+@@ -102,7 +184,8 @@ export function AeTerminalPaste({ getSink }: { getSink: () => AeTerminalPasteSin
+         aria-label="Paste into terminal"
+         className="absolute top-2 right-4 z-30 size-9 border border-border bg-background/80 p-0 text-muted-foreground shadow-sm supports-[backdrop-filter]:bg-background/60 supports-[backdrop-filter]:backdrop-blur"
+         data-testid="ae-terminal-paste"
+-        // Keep the terminal's focus (and the phone's keyboard) through the tap.
++        disabled={!connected}
++        // Keep the terminal's focus through the tap where the browser allows.
+         onMouseDown={(event) => event.preventDefault()}
+         onClick={() => void paste()}
+         title="Paste"
+@@ -111,58 +194,56 @@ export function AeTerminalPaste({ getSink }: { getSink: () => AeTerminalPasteSin
+       >
+         <AeTablerSvg node={CLIPBOARD_TEXT_ICON} className="size-5" />
+       </Button>
+-      <Dialog open={sheetOpen} onOpenChange={(open) => !open && closeSheet(false)}>
+-        {sheetOpen && (
+-          <DialogContent
+-            className="sm:max-w-md"
+-            data-testid="ae-terminal-paste-sheet"
+-            onCloseAutoFocus={(event) => {
+-              if (!focusAfterClose.current) return;
+-              focusAfterClose.current = false;
+-              event.preventDefault();
+-              getSink()?.focus();
+-            }}
+-          >
+-            <DialogHeader>
+-              <DialogTitle>Paste into the terminal</DialogTitle>
+-              <DialogDescription>
+-                The clipboard could not be read directly. Long press the box, choose Paste, then
+-                Send. Enter is not pressed.
+-              </DialogDescription>
+-            </DialogHeader>
+-            <Textarea
+-              aria-label="Text to paste"
+-              autoCapitalize="off"
+-              autoComplete="off"
+-              autoCorrect="off"
+-              autoFocus
+-              // 16px keeps iOS from zooming the page when the box takes focus.
+-              className="max-h-48 min-h-24 font-mono text-base md:text-base"
+-              data-testid="ae-terminal-paste-text"
+-              onChange={(event) => setDraft(event.target.value)}
+-              spellCheck={false}
+-              value={draft}
+-            />
+-            <DialogFooter>
+-              <Button
+-                type="button"
+-                variant="outline"
+-                onClick={() => closeSheet(false)}
+-                data-testid="ae-terminal-paste-cancel"
+-              >
+-                Cancel
+-              </Button>
+-              <Button
+-                type="button"
+-                disabled={draft === ""}
+-                onClick={send}
+-                data-testid="ae-terminal-paste-send"
+-              >
+-                Send
+-              </Button>
+-            </DialogFooter>
+-          </DialogContent>
+-        )}
++      <Dialog open={reason !== null} onOpenChange={(open) => !open && closeSheet()}>
++        <DialogContent
++          className="sm:max-w-md"
++          data-testid="ae-terminal-paste-sheet"
++          onCloseAutoFocus={(event) => {
++            const focus = focusAfterClose.current;
++            focusAfterClose.current = null;
++            if (focus === null) return;
++            event.preventDefault();
++            focus();
++          }}
++        >
++          <DialogHeader>
++            <DialogTitle>Paste into the terminal</DialogTitle>
++            <DialogDescription data-testid="ae-terminal-paste-message" data-reason={reason ?? ""}>
++              {reason !== null && AE_PASTE_MESSAGES[reason]} Enter is not pressed.
++            </DialogDescription>
++          </DialogHeader>
++          <Textarea
++            aria-label="Text to paste"
++            autoCapitalize="off"
++            autoComplete="off"
++            autoCorrect="off"
++            autoFocus
++            // 16px keeps iOS from zooming the page when the box takes focus.
++            className="max-h-48 min-h-24 font-mono text-base md:text-base"
++            data-testid="ae-terminal-paste-text"
++            onChange={(event) => setDraft(event.target.value)}
++            spellCheck={false}
++            value={draft}
++          />
++          <DialogFooter>
++            <Button
++              type="button"
++              variant="outline"
++              onClick={closeSheet}
++              data-testid="ae-terminal-paste-cancel"
++            >
++              Cancel
++            </Button>
++            <Button
++              type="button"
++              disabled={aeTrimPasteText(draft) === ""}
++              onClick={send}
++              data-testid="ae-terminal-paste-send"
++            >
++              Send
++            </Button>
++          </DialogFooter>
++        </DialogContent>
+       </Dialog>
+     </>
+   );
+diff --git a/web/src/components/blocks/TerminalView.tsx b/web/src/components/blocks/TerminalView.tsx
+index 315526bb34a25da345cf2d3e87a6c4f8e0a12345..4c7171a7d850eb519badde9439511ba5b08926ad 100644
+--- a/web/src/components/blocks/TerminalView.tsx
++++ b/web/src/components/blocks/TerminalView.tsx
+@@ -770,8 +770,11 @@ export function TerminalView({
+         style={{ backgroundColor: terminalBackground }}
+       >
+         <div key={connectAttempt} ref={attachSession} className="h-full w-full overflow-hidden" />
+-        {!readOnly && state.kind === "connected" && (
+-          <AeTerminalPaste getSink={() => sessionRef.current} />
++        {!readOnly && (
++          <AeTerminalPaste
++            getSink={() => sessionRef.current}
++            connected={state.kind === "connected"}
++          />
+         )}
+         {state.kind !== "connected" && (
+           <StatusOverlay

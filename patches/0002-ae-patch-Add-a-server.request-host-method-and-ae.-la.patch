@@ -1,0 +1,1033 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 23 Sep 2026 15:52:29 +0000
+Subject: [PATCH 002/148] [ae-patch] Add a server.request host method and ae.*
+ labels on extension session summaries
+
+Phase 3 of omnigent-ae (patch P2, 2026-09-23). The Parking Lot page is an
+extension, so its only bridge to data is the host RPC; this patch gives that
+RPC exactly what the page needs and nothing more.
+
+`server.request` is a new host method behind a new `server.request`
+permission. It is an allowlist over the host's authenticated fetch, not a
+proxy: `GET` and `POST` under `/v1/ae/`, `PATCH /v1/sessions/{id}` whose
+body is `labels` only with every key under `ae.`, and
+`POST /v1/sessions/{id}/events` carrying one user message. Anything else
+(DELETE anywhere, a rename or archive through the PATCH, a label outside
+`ae.*`, an assistant message, a route outside the list) is refused before any
+network call. The body is rebuilt from the allowlisted fields, both directions
+are held to the RPC message budget, and a labels write invalidates the
+`["conversations"]` cache so the sidebar follows. The server's own status and
+JSON body come back as `{status, ok, body}` so the page reads upstream's
+error shape itself.
+
+Session summaries gain `labels`, filtered to `ae.*`, and `archived`. The
+extension API version stays 1: both changes are additive and an older bundle
+ignores the new fields.
+
+Logic lives in new files (web/src/extensions/services/serverRequest.ts, the
+`pickAeLabels` helper in web/src/lib/aeLabels.ts) so the upstream edits stay
+small: one line in api.py, one in registry.ts, ten in
+useExtensionHostServices.ts, three in sessions.ts, three in types.ts, and the
+SDK's context type. Tests cover the allowlist (45 cases in
+serverRequest.test.ts), the hook wiring and cache refresh, the projection,
+and the SDK page drain.
+
+Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Gtdkh7Zu1dUA6xfo6zgrGF
+---
+ docs/extending/browser_extensions.md          |  13 +-
+ omnigent/extensions/api.py                    |   1 +
+ sdks/web-extension/src/index.ts               |  33 ++
+ sdks/web-extension/src/sessions.ts            |   3 +
+ tests/extensions/test_registry.py             |   4 +
+ web/src/extensions/sdkSessions.test.ts        |   2 +
+ web/src/extensions/services/registry.ts       |   1 +
+ .../extensions/services/serverRequest.test.ts | 305 ++++++++++++++++++
+ web/src/extensions/services/serverRequest.ts  | 282 ++++++++++++++++
+ web/src/extensions/services/sessions.test.ts  |  16 +
+ web/src/extensions/services/sessions.ts       |   3 +
+ .../useExtensionHostServices.test.tsx         |  58 +++-
+ .../services/useExtensionHostServices.ts      |  10 +
+ web/src/extensions/types.ts                   |   3 +
+ web/src/lib/aeLabels.ts                       |  15 +
+ 15 files changed, 746 insertions(+), 3 deletions(-)
+ create mode 100644 web/src/extensions/services/serverRequest.test.ts
+ create mode 100644 web/src/extensions/services/serverRequest.ts
+
+diff --git a/docs/extending/browser_extensions.md b/docs/extending/browser_extensions.md
+index 60292196c1ffa0dc025c4898ac6b9bac139b1a06..9977946cba8dd24ec3663c52ae2dff04e03b64a0 100644
+--- a/docs/extending/browser_extensions.md
++++ b/docs/extending/browser_extensions.md
+@@ -58,7 +58,15 @@ Available V1 methods:
+   `sessions.pullRequest` (the PR filed from a session's branch, via the same
+   GitHub lookup as the shell's GitHub tab) with the `sessions.read` permission;
+ - `projects.list` with the `projects.read` permission and `projects.create`
+-  with the `projects.write` permission.
++  with the `projects.write` permission;
++- `server.request` with the `server.request` permission: an allowlisted HTTP
++  call over the host's authenticated fetch. Allowed are `GET` and `POST` under
++  `/v1/ae/`, `PATCH /v1/sessions/{id}` with a body of only `labels` whose keys
++  all start with `ae.`, and `POST /v1/sessions/{id}/events` carrying one user
++  message. Anything else is refused before any network call. The result is
++  `{status, ok, body}`, the server's own status and JSON body, so a page reads
++  the server's error shape itself. A labels write refreshes the shell's session
++  list. (Added by omnigent-ae, patch P2, 2026-09-23.)
+ 
+ The sessions API exposes only top-level, non-archived sessions the current user
+ can already read. Because operator-installed extension bundles are trusted code,
+@@ -67,7 +75,8 @@ directory paths visible to that user. Summaries contain ID, title, status, an `u
+ current user has not viewed yet, using the sidebar's unread rule), a
+ `titleProvisional` flag (the title is the shell's first-message placeholder
+ until the server names the session), working
+-directory, worktree branch, project ID, and created/updated timestamps. Pages default to 25 rows and accept up to
++directory, worktree branch, project ID, the session's `ae.*` labels (no other
++label key), an `archived` flag, and created/updated timestamps. Pages default to 25 rows and accept up to
+ 1,000; the host shortens unusually large pages to stay within the RPC response budget. The SDK drains at most
+ 200 pages or 5,000 sessions. Extensions receive neither raw
+ authenticated fetch nor the internal session WebSocket.
+diff --git a/omnigent/extensions/api.py b/omnigent/extensions/api.py
+index 8fd108e2d249d233fe30864d4371a3c72fc7bfc0..81ec321295df6ce77f558ee61054549e56c4cffc 100644
+--- a/omnigent/extensions/api.py
++++ b/omnigent/extensions/api.py
+@@ -20,6 +20,7 @@ class ExtensionPermission(StrEnum):
+     PROJECTS_READ = "projects.read"
+     PROJECTS_WRITE = "projects.write"
+     SESSIONS_READ = "sessions.read"
++    SERVER_REQUEST = "server.request"
+     STORAGE_USER = "storage.user"
+ 
+ 
+diff --git a/sdks/web-extension/src/index.ts b/sdks/web-extension/src/index.ts
+index 58a9891b3653ad03368e910f7c519d8372cc81da..6157695a08c35fa45fc57bd2ee836c7593882090 100644
+--- a/sdks/web-extension/src/index.ts
++++ b/sdks/web-extension/src/index.ts
+@@ -40,6 +40,20 @@ export interface ExtensionProjectSummary {
+   icon: string | null;
+ }
+ 
++/** What `server.request` may send: the host refuses anything else before it reaches the network. */
++export interface ExtensionServerRequest {
++  method: "GET" | "POST" | "PATCH";
++  path: string;
++  body?: unknown;
++}
++
++/** The server's answer, status and all; `body` is parsed JSON when the server sent JSON. */
++export interface ExtensionServerResponse {
++  status: number;
++  ok: boolean;
++  body: unknown;
++}
++
+ export class ExtensionApiError extends Error {
+   constructor(
+     readonly code: string,
+@@ -97,6 +111,15 @@ export interface ExtensionContext {
+     list(): Promise<ExtensionProjectSummary[]>;
+     create(options: { name: string }): Promise<ExtensionProjectSummary>;
+   };
++  server: {
++    /**
++     * An allowlisted HTTP request through the host's authenticated fetch
++     * (`server.request` permission): `GET` or `POST` under `/v1/ae/`, a
++     * `PATCH /v1/sessions/{id}` carrying only `ae.*` labels, or a
++     * `POST /v1/sessions/{id}/events` with one user message.
++     */
++    request(options: ExtensionServerRequest): Promise<ExtensionServerResponse>;
++  };
+ }
+ 
+ export interface ExtensionLifecycle {
+@@ -297,6 +320,16 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
+           name: options.name,
+         }),
+     },
++    server: {
++      // An absent body is left out, not sent as undefined: the host's
++      // payload budget rejects undefined values and drops the message.
++      request: (options) =>
++        request<ExtensionServerResponse>("server.request", {
++          method: options.method,
++          path: options.path,
++          ...(options.body === undefined ? {} : { body: options.body }),
++        }),
++    },
+   });
+ 
+   const handleInit = (event: MessageEvent<unknown>) => {
+diff --git a/sdks/web-extension/src/sessions.ts b/sdks/web-extension/src/sessions.ts
+index e930e30a3f3553348d9ccb88c57c7c5e3d5ff2dd..19b2630fd290879f54ac8020ae483523772fb425 100644
+--- a/sdks/web-extension/src/sessions.ts
++++ b/sdks/web-extension/src/sessions.ts
+@@ -11,6 +11,9 @@ export interface ExtensionSessionSummary {
+   gitBranch: string | null;
+   /** Owning project, or null for sessions outside any project. */
+   projectId: string | null;
++  /** The session's `ae.*` labels only; every other label key is withheld by the host. */
++  labels: Record<string, string>;
++  archived: boolean;
+   createdAt: number;
+   updatedAt: number;
+ }
+diff --git a/tests/extensions/test_registry.py b/tests/extensions/test_registry.py
+index 7ea1396dc1b8bb6400f60027a5de8b534263b3f2..4c09475881e044698adc5dd65da36b720cf0ac2f 100644
+--- a/tests/extensions/test_registry.py
++++ b/tests/extensions/test_registry.py
+@@ -148,12 +148,16 @@ def test_extension_permission_values_include_read_only_sessions() -> None:
+         "navigation",
+         "projects.read",
+         "projects.write",
++        "server.request",
+         "sessions.read",
+         "storage.user",
+     }
+     registry.validate_manifest(
+         replace(_manifest(), permissions=frozenset({ExtensionPermission.SESSIONS_READ}))
+     )
++    registry.validate_manifest(
++        replace(_manifest(), permissions=frozenset({ExtensionPermission.SERVER_REQUEST}))
++    )
+ 
+ 
+ def test_discovers_and_caches_valid_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+diff --git a/web/src/extensions/sdkSessions.test.ts b/web/src/extensions/sdkSessions.test.ts
+index 044c9ac94cb554d77148cb5d5f1f59b5a99bfb01..7d07b5b6911c937368f15f479fcaac93d09d7f1c 100644
+--- a/web/src/extensions/sdkSessions.test.ts
++++ b/web/src/extensions/sdkSessions.test.ts
+@@ -18,6 +18,8 @@ function session(id: string): ExtensionSessionSummary {
+     workspace: null,
+     gitBranch: null,
+     projectId: null,
++    labels: {},
++    archived: false,
+     createdAt: 1,
+     updatedAt: 1,
+   };
+diff --git a/web/src/extensions/services/registry.ts b/web/src/extensions/services/registry.ts
+index 6dae4432d2a99b36c402d6eea094563b4d270759..05c8339509d3ae028314b375224a235a42289e33 100644
+--- a/web/src/extensions/services/registry.ts
++++ b/web/src/extensions/services/registry.ts
+@@ -15,6 +15,7 @@ export const HOST_METHOD_PERMISSIONS = {
+   "sessions.pullRequest": "sessions.read",
+   "projects.list": "projects.read",
+   "projects.create": "projects.write",
++  "server.request": "server.request",
+ } as const satisfies Record<string, string | null>;
+ 
+ export function grantedHostMethods<T extends Record<string, unknown>>(
+diff --git a/web/src/extensions/services/serverRequest.test.ts b/web/src/extensions/services/serverRequest.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ec7db25506f9f3bf6841383d202c73ee6785146
+--- /dev/null
++++ b/web/src/extensions/services/serverRequest.test.ts
+@@ -0,0 +1,305 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { authenticatedFetch } from "@/lib/identity";
++import { ExtensionHostServiceError } from "./errors";
++import { parseServerRequest, performServerRequest } from "./serverRequest";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++
++beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
++afterEach(() => vi.useRealTimers());
++
++const userMessage = {
++  type: "message",
++  data: { role: "user", content: [{ type: "input_text", text: "A" }] },
++};
++
++function codeOf(params: unknown): string {
++  try {
++    parseServerRequest(params);
++  } catch (error) {
++    if (error instanceof ExtensionHostServiceError) return error.code;
++    throw error;
++  }
++  return "allowed";
++}
++
++describe("parseServerRequest: allowed shapes", () => {
++  it("passes GET and POST under /v1/ae/ with a plain query", () => {
++    expect(parseServerRequest({ method: "GET", path: "/v1/ae/lot?status=open&limit=50" })).toEqual({
++      kind: "ae",
++      method: "GET",
++      path: "/v1/ae/lot?status=open&limit=50",
++      body: null,
++    });
++    expect(
++      parseServerRequest({ method: "post", path: "/v1/ae/lot/park", body: { thread: "x" } }),
++    ).toEqual({ kind: "ae", method: "POST", path: "/v1/ae/lot/park", body: { thread: "x" } });
++    expect(parseServerRequest({ method: "POST", path: "/v1/ae/lot/t_1/resume" }).body).toEqual({});
++  });
++
++  it("passes a labels PATCH whose keys all sit under ae.", () => {
++    const request = parseServerRequest({
++      method: "PATCH",
++      path: "/v1/sessions/conv_1",
++      body: { labels: { "ae.status": "review", "ae.gate": "" } },
++    });
++    expect(request).toEqual({
++      kind: "labels",
++      method: "PATCH",
++      path: "/v1/sessions/conv_1",
++      body: { labels: { "ae.status": "review", "ae.gate": "" } },
++    });
++  });
++
++  it("passes one user message to a session's events and rebuilds the body", () => {
++    const request = parseServerRequest({
++      method: "POST",
++      path: "/v1/sessions/conv_1/events",
++      body: {
++        ...userMessage,
++        data: { ...userMessage.data, content: [{ type: "input_text", text: "close it" }] },
++      },
++    });
++    expect(request).toEqual({
++      kind: "user-message",
++      method: "POST",
++      path: "/v1/sessions/conv_1/events",
++      body: {
++        type: "message",
++        data: { role: "user", content: [{ type: "input_text", text: "close it" }] },
++      },
++    });
++  });
++});
++
++describe("parseServerRequest: denials", () => {
++  it.each([
++    ["DELETE anywhere", { method: "DELETE", path: "/v1/sessions/conv_1" }],
++    ["DELETE under the AE routes", { method: "DELETE", path: "/v1/ae/lot/t_1" }],
++    ["PUT", { method: "PUT", path: "/v1/ae/lot" }],
++    ["PATCH under the AE routes", { method: "PATCH", path: "/v1/ae/lot", body: {} }],
++    ["GET on a session", { method: "GET", path: "/v1/sessions/conv_1" }],
++    ["GET on the session list", { method: "GET", path: "/v1/sessions" }],
++    ["POST on a session", { method: "POST", path: "/v1/sessions/conv_1", body: {} }],
++    ["PATCH on session events", { method: "PATCH", path: "/v1/sessions/conv_1/events", body: {} }],
++    ["a route outside the list", { method: "GET", path: "/v1/projects" }],
++    ["a session sub-resource", { method: "POST", path: "/v1/sessions/conv_1/policies", body: {} }],
++    ["an absolute URL", { method: "GET", path: "https://evil.example/v1/ae/lot" }],
++    ["a protocol-relative URL", { method: "GET", path: "//evil.example/v1/ae/lot" }],
++    ["a traversal under the AE routes", { method: "GET", path: "/v1/ae/../sessions" }],
++    ["a fragment", { method: "GET", path: "/v1/ae/lot#x" }],
++    [
++      "a PATCH that renames",
++      {
++        method: "PATCH",
++        path: "/v1/sessions/conv_1",
++        body: { title: "x", labels: { "ae.status": "review" } },
++      },
++    ],
++    [
++      "a PATCH that archives",
++      { method: "PATCH", path: "/v1/sessions/conv_1", body: { archived: true } },
++    ],
++    [
++      "a label outside ae.",
++      {
++        method: "PATCH",
++        path: "/v1/sessions/conv_1",
++        body: { labels: { "omnigent.pinned": "1" } },
++      },
++    ],
++    [
++      "a label that only looks like ae.",
++      {
++        method: "PATCH",
++        path: "/v1/sessions/conv_1",
++        body: { labels: { "ae.status": "x", aex: "y" } },
++      },
++    ],
++    [
++      "the bare namespace as a key",
++      { method: "PATCH", path: "/v1/sessions/conv_1", body: { labels: { "ae.": "x" } } },
++    ],
++    [
++      "an assistant message",
++      {
++        method: "POST",
++        path: "/v1/sessions/conv_1/events",
++        body: { ...userMessage, data: { ...userMessage.data, role: "assistant" } },
++      },
++    ],
++    [
++      "a non-message event",
++      {
++        method: "POST",
++        path: "/v1/sessions/conv_1/events",
++        body: { ...userMessage, type: "tool" },
++      },
++    ],
++    [
++      "an event with extra fields",
++      { method: "POST", path: "/v1/sessions/conv_1/events", body: { ...userMessage, actor: "x" } },
++    ],
++    ["extra request fields", { method: "GET", path: "/v1/ae/lot", headers: { "X-A": "b" } }],
++  ])("refuses %s before any fetch", (_name, params) => {
++    expect(codeOf(params)).toBe("PermissionDenied");
++  });
++
++  it.each([
++    ["no params", undefined],
++    ["a missing path", { method: "GET" }],
++    ["a GET with a body", { method: "GET", path: "/v1/ae/lot", body: {} }],
++    ["a non-object POST body", { method: "POST", path: "/v1/ae/lot/park", body: "x" }],
++    ["a PATCH without labels", { method: "PATCH", path: "/v1/sessions/conv_1", body: {} }],
++    ["empty labels", { method: "PATCH", path: "/v1/sessions/conv_1", body: { labels: {} } }],
++    [
++      "a non-string label value",
++      { method: "PATCH", path: "/v1/sessions/conv_1", body: { labels: { "ae.absorbed": 2 } } },
++    ],
++    [
++      "a label value over 256 characters",
++      {
++        method: "PATCH",
++        path: "/v1/sessions/conv_1",
++        body: { labels: { "ae.next": "x".repeat(257) } },
++      },
++    ],
++    [
++      "a malformed session id",
++      { method: "PATCH", path: "/v1/sessions/%2F", body: { labels: { "ae.status": "x" } } },
++    ],
++    [
++      "a dot session id",
++      { method: "PATCH", path: "/v1/sessions/..", body: { labels: { "ae.status": "x" } } },
++    ],
++    [
++      "empty message content",
++      {
++        method: "POST",
++        path: "/v1/sessions/conv_1/events",
++        body: { ...userMessage, data: { role: "user", content: [] } },
++      },
++    ],
++    [
++      "a non-text content part",
++      {
++        method: "POST",
++        path: "/v1/sessions/conv_1/events",
++        body: {
++          ...userMessage,
++          data: { role: "user", content: [{ type: "input_image", text: "x" }] },
++        },
++      },
++    ],
++    ["a query with a stray character", { method: "GET", path: "/v1/ae/lot?a=<b>" }],
++  ])("rejects %s as malformed", (_name, params) => {
++    expect(codeOf(params)).toBe("InvalidParams");
++  });
++
++  it("rejects a body over the RPC message budget", () => {
++    expect(
++      codeOf({ method: "POST", path: "/v1/ae/lot/park", body: { state: "x".repeat(40_000) } }),
++    ).toBe("InvalidParams");
++  });
++});
++
++describe("performServerRequest", () => {
++  it("sends JSON bodies through the authenticated fetch and returns status and body", async () => {
++    vi.mocked(authenticatedFetch).mockResolvedValue(
++      new Response(JSON.stringify({ outcome: "filed", task_id: 7 }), {
++        status: 200,
++        headers: { "Content-Type": "application/json" },
++      }),
++    );
++    const controller = new AbortController();
++    const request = parseServerRequest({
++      method: "POST",
++      path: "/v1/ae/lot/park",
++      body: { thread: "x" },
++    });
++
++    await expect(performServerRequest(request, controller.signal)).resolves.toEqual({
++      status: 200,
++      ok: true,
++      body: { outcome: "filed", task_id: 7 },
++    });
++    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/ae/lot/park", {
++      method: "POST",
++      signal: controller.signal,
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ thread: "x" }),
++    });
++  });
++
++  it("hands back error statuses with the server's own error body", async () => {
++    vi.mocked(authenticatedFetch).mockResolvedValue(
++      new Response(JSON.stringify({ error: { code: "conflict", message: "no open gate" } }), {
++        status: 409,
++        headers: { "Content-Type": "application/json" },
++      }),
++    );
++    const request = parseServerRequest({ method: "GET", path: "/v1/ae/capacity" });
++
++    await expect(performServerRequest(request, new AbortController().signal)).resolves.toEqual({
++      status: 409,
++      ok: false,
++      body: { error: { code: "conflict", message: "no open gate" } },
++    });
++    const [, init] = vi.mocked(authenticatedFetch).mock.calls[0] as [string, RequestInit];
++    expect(init.body).toBeUndefined();
++  });
++
++  it("returns non-JSON bodies as text and an empty body as null", async () => {
++    vi.mocked(authenticatedFetch)
++      .mockResolvedValueOnce(new Response("plain", { status: 502 }))
++      .mockResolvedValueOnce(new Response(null, { status: 204 }));
++    const request = parseServerRequest({ method: "GET", path: "/v1/ae/health" });
++
++    await expect(performServerRequest(request, new AbortController().signal)).resolves.toEqual({
++      status: 502,
++      ok: false,
++      body: "plain",
++    });
++    await expect(performServerRequest(request, new AbortController().signal)).resolves.toEqual({
++      status: 204,
++      ok: true,
++      body: null,
++    });
++  });
++
++  it("refuses a response over the RPC message budget and maps transport failures", async () => {
++    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
++      new Response(JSON.stringify({ text: "x".repeat(70_000) }), {
++        status: 200,
++        headers: { "Content-Type": "application/json" },
++      }),
++    );
++    const request = parseServerRequest({ method: "GET", path: "/v1/ae/lot" });
++    await expect(performServerRequest(request, new AbortController().signal)).rejects.toMatchObject(
++      { code: "ResponseTooLarge" },
++    );
++
++    vi.mocked(authenticatedFetch).mockRejectedValueOnce(new TypeError("Failed to fetch"));
++    await expect(performServerRequest(request, new AbortController().signal)).rejects.toMatchObject(
++      { code: "HostError" },
++    );
++
++    vi.mocked(authenticatedFetch).mockResolvedValueOnce(
++      new Response("{", { status: 200, headers: { "Content-Type": "application/json" } }),
++    );
++    await expect(performServerRequest(request, new AbortController().signal)).rejects.toMatchObject(
++      { code: "HostError", message: "Malformed server response" },
++    );
++  });
++
++  it("does not fetch with a pre-aborted signal", async () => {
++    const controller = new AbortController();
++    controller.abort();
++    const request = parseServerRequest({ method: "GET", path: "/v1/ae/lot" });
++
++    await expect(performServerRequest(request, controller.signal)).rejects.toMatchObject({
++      name: "AbortError",
++    });
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/extensions/services/serverRequest.ts b/web/src/extensions/services/serverRequest.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bfdbb5b0f8b3c854d5062ad01f094cabe256a97b
+--- /dev/null
++++ b/web/src/extensions/services/serverRequest.ts
+@@ -0,0 +1,282 @@
++// `server.request`: the one bridge between an extension page and the server's
++// HTTP API (omnigent-ae patch P2, 2026-09-23). Pages run in an opaque-origin
++// iframe with no network egress, so the host makes the call on their behalf
++// over its own authenticated fetch. The bridge is an allowlist, not a proxy:
++// a request that is not one of the shapes below is refused before any fetch,
++// with `PermissionDenied` for a route or method outside the list and
++// `InvalidParams` for a malformed body inside it.
++//
++// Allowed:
++//   GET|POST  /v1/ae/...                     the AE layer's own routes
++//   PATCH     /v1/sessions/{id}              body {labels: {"ae.*": string}} only
++//   POST      /v1/sessions/{id}/events       a user message ({type: "message",
++//                                            data: {role: "user", content}})
++//
++// The response is handed back as `{status, ok, body}` with the body parsed as
++// JSON when the server sent JSON (text otherwise, bounded), so the page reads
++// the server's own `{"error": {"code", "message"}}` shape and decides what to
++// show. Both directions are held to the RPC message budget.
++
++import { authenticatedFetch } from "@/lib/identity";
++import { MAX_EXTENSION_MESSAGE_BYTES } from "../rpc/protocol";
++import { isExtensionPayloadWithinBudget } from "../rpc/validation";
++import { ExtensionHostServiceError } from "./errors";
++
++export const SERVER_REQUEST_METHODS = ["GET", "POST", "PATCH"] as const;
++export type ServerRequestMethod = (typeof SERVER_REQUEST_METHODS)[number];
++
++/** Label keys an extension may write through the labels PATCH. */
++export const SERVER_REQUEST_LABEL_NAMESPACE = "ae.";
++export const SERVER_REQUEST_LABEL_KEY_MAX_LENGTH = 64;
++/** The store caps a label value at 256 characters; the page never needs more. */
++export const SERVER_REQUEST_LABEL_VALUE_MAX_LENGTH = 256;
++export const SERVER_REQUEST_LABELS_MAX_KEYS = 16;
++export const SERVER_REQUEST_PATH_MAX_LENGTH = 1_024;
++export const SERVER_REQUEST_TEXT_MAX_LENGTH = 16_384;
++const SESSION_ID_MAX_LENGTH = 256;
++
++const AE_ROUTE = /^\/v1\/ae\/[A-Za-z0-9_./-]+$/;
++const SESSION_ROUTE = /^\/v1\/sessions\/([^/]+)$/;
++const SESSION_EVENTS_ROUTE = /^\/v1\/sessions\/([^/]+)\/events$/;
++const SESSION_ID = /^[A-Za-z0-9._~:-]+$/;
++const QUERY = /^[A-Za-z0-9_.~%+=&-]*$/;
++
++export type ServerRequestKind = "ae" | "labels" | "user-message";
++
++export interface ServerRequest {
++  kind: ServerRequestKind;
++  method: ServerRequestMethod;
++  path: string;
++  body: Record<string, unknown> | null;
++}
++
++export interface ServerResponse {
++  status: number;
++  ok: boolean;
++  body: unknown;
++}
++
++function plainObject(value: unknown): Record<string, unknown> | null {
++  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
++  const prototype = Object.getPrototypeOf(value);
++  if (prototype !== Object.prototype && prototype !== null) return null;
++  return value as Record<string, unknown>;
++}
++
++function denied(message: string): ExtensionHostServiceError {
++  return new ExtensionHostServiceError("PermissionDenied", message);
++}
++
++function invalid(message: string): ExtensionHostServiceError {
++  return new ExtensionHostServiceError("InvalidParams", message);
++}
++
++function requireKeys(
++  value: Record<string, unknown>,
++  allowed: readonly string[],
++  what: string,
++): void {
++  for (const key of Object.keys(value)) {
++    if (!allowed.includes(key)) {
++      throw denied(`${what} may not carry ${JSON.stringify(key)}`);
++    }
++  }
++}
++
++function validSessionId(segment: string): boolean {
++  let decoded: string;
++  try {
++    decoded = decodeURIComponent(segment);
++  } catch {
++    return false;
++  }
++  return (
++    decoded.length >= 1 &&
++    decoded.length <= SESSION_ID_MAX_LENGTH &&
++    decoded !== "." &&
++    decoded !== ".." &&
++    SESSION_ID.test(decoded)
++  );
++}
++
++/** The AE routes: a safe relative path under `/v1/ae/`, an optional plain query. */
++function parseAePath(path: string): string {
++  const [pathname, query, ...rest] = path.split("?");
++  if (rest.length > 0 || !AE_ROUTE.test(pathname)) {
++    throw denied("Path is outside the allowed routes");
++  }
++  if (pathname.split("/").some((segment) => segment === "." || segment === "..")) {
++    throw denied("Path is outside the allowed routes");
++  }
++  if (query !== undefined && !QUERY.test(query)) {
++    throw invalid("Query string contains unsupported characters");
++  }
++  return path;
++}
++
++/** `PATCH /v1/sessions/{id}`: `{labels}` only, every key under `ae.`, string values. */
++function parseLabelsBody(body: unknown): Record<string, unknown> {
++  const value = plainObject(body);
++  if (!value) throw invalid("A labels PATCH needs an object body");
++  requireKeys(value, ["labels"], "A session PATCH");
++  const labels = plainObject(value.labels);
++  if (!labels) throw invalid("labels must be an object");
++  const entries = Object.entries(labels);
++  if (entries.length < 1) throw invalid("labels must name at least one key");
++  if (entries.length > SERVER_REQUEST_LABELS_MAX_KEYS) {
++    throw invalid(`labels may carry at most ${SERVER_REQUEST_LABELS_MAX_KEYS} keys`);
++  }
++  for (const [key, item] of entries) {
++    if (
++      !key.startsWith(SERVER_REQUEST_LABEL_NAMESPACE) ||
++      key.length <= SERVER_REQUEST_LABEL_NAMESPACE.length ||
++      key.length > SERVER_REQUEST_LABEL_KEY_MAX_LENGTH ||
++      key.trim() !== key
++    ) {
++      throw denied(
++        `Label ${JSON.stringify(key)} is outside the ${SERVER_REQUEST_LABEL_NAMESPACE}* namespace`,
++      );
++    }
++    if (typeof item !== "string" || item.length > SERVER_REQUEST_LABEL_VALUE_MAX_LENGTH) {
++      throw invalid(
++        `Label ${JSON.stringify(key)} must be a string of at most ${SERVER_REQUEST_LABEL_VALUE_MAX_LENGTH} characters`,
++      );
++    }
++  }
++  return { labels: { ...labels } };
++}
++
++/** `POST /v1/sessions/{id}/events`: one user message, the shape the composer posts. */
++function parseUserMessageBody(body: unknown): Record<string, unknown> {
++  const value = plainObject(body);
++  if (!value) throw invalid("A session event needs an object body");
++  requireKeys(value, ["type", "data"], "A session event");
++  if (value.type !== "message") throw denied("Only message events may be posted");
++  const data = plainObject(value.data);
++  if (!data) throw invalid("Event data must be an object");
++  requireKeys(data, ["role", "content"], "A message event");
++  if (data.role !== "user") throw denied("Only user messages may be posted");
++  if (!Array.isArray(data.content) || data.content.length < 1) {
++    throw invalid("Message content must be a non-empty array");
++  }
++  const content = data.content.map((part) => {
++    const item = plainObject(part);
++    if (!item) throw invalid("Message content parts must be objects");
++    requireKeys(item, ["type", "text"], "A message content part");
++    if (item.type !== "input_text" || typeof item.text !== "string") {
++      throw invalid("Message content parts must be {type: 'input_text', text}");
++    }
++    if (item.text.length > SERVER_REQUEST_TEXT_MAX_LENGTH) {
++      throw invalid(`Message text may be at most ${SERVER_REQUEST_TEXT_MAX_LENGTH} characters`);
++    }
++    return { type: "input_text", text: item.text };
++  });
++  return { type: "message", data: { role: "user", content } };
++}
++
++/**
++ * Check one `server.request` call against the allowlist. Returns the request
++ * to make, with the body rebuilt from the fields the allowlist names so
++ * nothing else rides along; throws for anything outside it.
++ */
++export function parseServerRequest(params: unknown): ServerRequest {
++  const input = plainObject(params);
++  if (!input) throw invalid("Expected an object");
++  requireKeys(input, ["method", "path", "body"], "A server request");
++  const { method, path, body } = input;
++  if (typeof method !== "string") throw invalid("method is required");
++  const upper = method.toUpperCase();
++  if (!(SERVER_REQUEST_METHODS as readonly string[]).includes(upper)) {
++    throw denied(`Method ${JSON.stringify(method)} is not allowed`);
++  }
++  if (typeof path !== "string" || path.length < 1 || path.length > SERVER_REQUEST_PATH_MAX_LENGTH) {
++    throw invalid("path must be a non-empty string");
++  }
++  if (!path.startsWith("/") || path.startsWith("//") || /[\s#\\]/.test(path)) {
++    throw denied("Path is outside the allowed routes");
++  }
++  if (body !== undefined && body !== null && !isExtensionPayloadWithinBudget(body)) {
++    throw invalid("Request body exceeds the message budget");
++  }
++  const verb = upper as ServerRequestMethod;
++
++  if (path.startsWith("/v1/ae/")) {
++    if (verb === "PATCH") throw denied("PATCH is not allowed on the AE routes");
++    const aePath = parseAePath(path);
++    if (verb === "GET") {
++      if (body !== undefined && body !== null) throw invalid("A GET carries no body");
++      return { kind: "ae", method: verb, path: aePath, body: null };
++    }
++    const value = body === undefined || body === null ? {} : plainObject(body);
++    if (!value) throw invalid("A POST body must be an object");
++    return { kind: "ae", method: verb, path: aePath, body: { ...value } };
++  }
++
++  const eventsMatch = SESSION_EVENTS_ROUTE.exec(path);
++  if (eventsMatch) {
++    if (verb !== "POST") throw denied(`${verb} is not allowed on session events`);
++    if (!validSessionId(eventsMatch[1])) throw invalid("Session id is malformed");
++    return { kind: "user-message", method: verb, path, body: parseUserMessageBody(body) };
++  }
++
++  const sessionMatch = SESSION_ROUTE.exec(path);
++  if (sessionMatch) {
++    if (verb !== "PATCH") throw denied(`${verb} is not allowed on a session`);
++    if (!validSessionId(sessionMatch[1])) throw invalid("Session id is malformed");
++    return { kind: "labels", method: verb, path, body: parseLabelsBody(body) };
++  }
++
++  throw denied("Path is outside the allowed routes");
++}
++
++/** Make an allowlisted request over the host's authenticated fetch. */
++export async function performServerRequest(
++  request: ServerRequest,
++  signal: AbortSignal,
++): Promise<ServerResponse> {
++  if (signal.aborted) throw new DOMException("Host operation cancelled", "AbortError");
++  let response: Response;
++  try {
++    response = await authenticatedFetch(request.path, {
++      method: request.method,
++      signal,
++      ...(request.body === null
++        ? {}
++        : {
++            headers: { "Content-Type": "application/json" },
++            body: JSON.stringify(request.body),
++          }),
++    });
++  } catch (error) {
++    if (signal.aborted || (error instanceof DOMException && error.name === "AbortError")) {
++      throw error;
++    }
++    throw new ExtensionHostServiceError("HostError", "Server request failed");
++  }
++  let text: string;
++  try {
++    text = await response.text();
++  } catch (error) {
++    if (signal.aborted) throw error;
++    throw new ExtensionHostServiceError("HostError", "Server response could not be read");
++  }
++  // Two bytes per UTF-16 unit, the same accounting as the RPC budget; a body
++  // over it is refused here rather than after the host serializes it.
++  if (text.length * 2 > MAX_EXTENSION_MESSAGE_BYTES) {
++    throw new ExtensionHostServiceError("ResponseTooLarge", "Server response exceeds the limit");
++  }
++  let body: unknown = null;
++  if (text.length > 0) {
++    const contentType = response.headers.get("content-type") ?? "";
++    if (contentType.includes("json")) {
++      try {
++        body = JSON.parse(text);
++      } catch {
++        throw new ExtensionHostServiceError("HostError", "Malformed server response");
++      }
++    } else {
++      body = text;
++    }
++  }
++  return { status: response.status, ok: response.ok, body };
++}
+diff --git a/web/src/extensions/services/sessions.test.ts b/web/src/extensions/services/sessions.test.ts
+index 2b9b8aa1eb6693ace1c7c9cb9e7eb16ddb085c87..c5d20516a31d5227cf50c81be60c0e5fc3d0c29e 100644
+--- a/web/src/extensions/services/sessions.test.ts
++++ b/web/src/extensions/services/sessions.test.ts
+@@ -112,9 +112,11 @@ describe("projectSessionPage", () => {
+     );
+ 
+     expect(Object.keys(result.sessions[0]).sort()).toEqual([
++      "archived",
+       "createdAt",
+       "gitBranch",
+       "id",
++      "labels",
+       "projectId",
+       "status",
+       "title",
+@@ -129,6 +131,20 @@ describe("projectSessionPage", () => {
+     expect(result.nextCursor).toBeNull();
+   });
+ 
++  it("carries only the ae.* labels and the archived flag", () => {
++    const row = {
++      ...wireRow,
++      labels: { "ae.status": "working", "ae.next": "run the suite", secret: "value", "ae.n": 1 },
++    };
++    const page = { data: [row], has_more: false, last_id: null };
++    expect(projectSessionPage(page, 25).sessions[0]).toMatchObject({
++      labels: { "ae.status": "working", "ae.next": "run the suite" },
++      archived: false,
++    });
++    const bare = { data: [{ ...wireRow, labels: undefined, archived: true }], has_more: false };
++    expect(projectSessionPage(bare, 25).sessions[0]).toMatchObject({ labels: {}, archived: true });
++  });
++
+   it("flags a finished session unread with the sidebar's read-state rule", () => {
+     markConversationUnread("conv_1", wireRow.updated_at);
+     const page = { data: [{ ...wireRow, status: "idle" }], has_more: false, last_id: null };
+diff --git a/web/src/extensions/services/sessions.ts b/web/src/extensions/services/sessions.ts
+index def3907f8ccf60a0560560031b0fc761590e0d31..1119d0e5294a83bf6edd0b6c031526393dc66dab 100644
+--- a/web/src/extensions/services/sessions.ts
++++ b/web/src/extensions/services/sessions.ts
+@@ -3,6 +3,7 @@ import { authenticatedFetch } from "@/lib/identity";
+ import type { ConversationsPage } from "@/hooks/useConversations";
+ import { isConversationUnseen } from "@/hooks/useUnseenConversations";
+ import { getOptimisticTitle } from "@/lib/optimisticTitles";
++import { pickAeLabels } from "@/lib/aeLabels";
+ import type { ExtensionSessionPage, ExtensionSessionSummary } from "../types";
+ import { isExtensionSessionPageWithinBudget } from "../rpc/validation";
+ import { ExtensionHostServiceError } from "./errors";
+@@ -137,6 +138,8 @@ function projectSession(value: unknown): ExtensionSessionSummary {
+     workspace: optionalBoundedString(row.workspace, "workspace", SESSION_WORKSPACE_MAX_LENGTH),
+     gitBranch: optionalBoundedString(row.git_branch, "git_branch", SESSION_TITLE_MAX_LENGTH),
+     projectId: optionalBoundedString(row.project_id, "project_id", SESSION_ID_MAX_LENGTH),
++    labels: pickAeLabels(row.labels),
++    archived: row.archived === true,
+     createdAt,
+     updatedAt,
+   };
+diff --git a/web/src/extensions/services/useExtensionHostServices.test.tsx b/web/src/extensions/services/useExtensionHostServices.test.tsx
+index 88f56da2ba943f5d0354ed44f3da337628dc6f95..c148acb8e6dcfee06f12626d3745c95662edb231 100644
+--- a/web/src/extensions/services/useExtensionHostServices.test.tsx
++++ b/web/src/extensions/services/useExtensionHostServices.test.tsx
+@@ -31,7 +31,14 @@ const extension: ExtensionCatalogItem = {
+   version: "1.0.0",
+   extension_api: 1,
+   status: "enabled",
+-  permissions: ["navigation", "projects.read", "projects.write", "sessions.read", "storage.user"],
++  permissions: [
++    "navigation",
++    "projects.read",
++    "projects.write",
++    "server.request",
++    "sessions.read",
++    "storage.user",
++  ],
+   pages: [
+     {
+       id: "acme.review.dashboard",
+@@ -142,6 +149,8 @@ describe("useExtensionHostServices", () => {
+           workspace: "/workspace",
+           gitBranch: null,
+           projectId: null,
++          labels: {},
++          archived: false,
+           createdAt: 1,
+           updatedAt: 2,
+         },
+@@ -395,6 +404,52 @@ describe("useExtensionHostServices", () => {
+     invalidate.mockRestore();
+   });
+ 
++  it("bridges only allowlisted server requests and refreshes sessions after a labels write", async () => {
++    authenticatedFetchMock.mockResolvedValue(
++      new Response(JSON.stringify({ id: "conv_1", labels: { "ae.status": "parked" } }), {
++        status: 200,
++        headers: { "Content-Type": "application/json" },
++      }),
++    );
++    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue(undefined);
++    const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
++
++    await expect(
++      result.current.methods["server.request"]?.(
++        { method: "DELETE", path: "/v1/sessions/conv_1" },
++        signal(),
++      ),
++    ).rejects.toMatchObject({ code: "PermissionDenied" });
++    await expect(
++      result.current.methods["server.request"]?.(
++        { method: "PATCH", path: "/v1/sessions/conv_1", body: { labels: { title: "x" } } },
++        signal(),
++      ),
++    ).rejects.toMatchObject({ code: "PermissionDenied" });
++    expect(authenticatedFetchMock).not.toHaveBeenCalled();
++
++    await expect(
++      result.current.methods["server.request"]?.(
++        {
++          method: "PATCH",
++          path: "/v1/sessions/conv_1",
++          body: { labels: { "ae.status": "parked" } },
++        },
++        signal(),
++      ),
++    ).resolves.toEqual({
++      status: 200,
++      ok: true,
++      body: { id: "conv_1", labels: { "ae.status": "parked" } },
++    });
++    const [url, init] = authenticatedFetchMock.mock.calls[0] as [string, RequestInit];
++    expect(url).toBe("/v1/sessions/conv_1");
++    expect(init.method).toBe("PATCH");
++    expect(JSON.parse(String(init.body))).toEqual({ labels: { "ae.status": "parked" } });
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversations"] });
++    invalidate.mockRestore();
++  });
++
+   it("keeps sessions methods absent for existing extension permissions", () => {
+     const existing = { ...extension, permissions: ["navigation", "storage.user"] };
+     const { result } = renderHook(() => useExtensionHostServices(existing), { wrapper });
+@@ -403,6 +458,7 @@ describe("useExtensionHostServices", () => {
+     expect(result.current.methods["sessions.listPage"]).toBeUndefined();
+     expect(result.current.methods["projects.list"]).toBeUndefined();
+     expect(result.current.methods["projects.create"]).toBeUndefined();
++    expect(result.current.methods["server.request"]).toBeUndefined();
+     expect(result.current.methods["navigation.openSession"]).toBeDefined();
+     expect(result.current.methods["storage.user.get"]).toBeDefined();
+   });
+diff --git a/web/src/extensions/services/useExtensionHostServices.ts b/web/src/extensions/services/useExtensionHostServices.ts
+index e0d97a51ab78de6aa802ed1621253fdd773eb88c..f988342bf634e792e364ad5acfc8d3eabe462ed1 100644
+--- a/web/src/extensions/services/useExtensionHostServices.ts
++++ b/web/src/extensions/services/useExtensionHostServices.ts
+@@ -14,6 +14,7 @@ import {
+   listProjectSummaries,
+   parseCreateProjectParams,
+ } from "./projects";
++import { parseServerRequest, performServerRequest } from "./serverRequest";
+ import { cachedSessionSummaries, listSessionPage, SessionReadLimiter } from "./sessions";
+ import {
+   ExtensionStorageError,
+@@ -201,6 +202,15 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
+         void queryClient.invalidateQueries({ queryKey: ["projects"] });
+         return project;
+       },
++      "server.request": async (params: unknown, signal: AbortSignal) => {
++        const request = parseServerRequest(params);
++        const result = await performServerRequest(request, signal);
++        // A labels write changes what the sidebar shows; refresh its cache.
++        if (request.kind === "labels" && result.ok) {
++          void queryClient.invalidateQueries({ queryKey: ["conversations"] });
++        }
++        return result;
++      },
+     };
+     return grantedHostMethods(extension, implementations);
+   }, [
+diff --git a/web/src/extensions/types.ts b/web/src/extensions/types.ts
+index d7736c4b5b5b0c933a9cc493b0debc6f62963784..9a98a5dd9d284ffdfeb9615dda566262e1bab419 100644
+--- a/web/src/extensions/types.ts
++++ b/web/src/extensions/types.ts
+@@ -25,6 +25,9 @@ export interface ExtensionSessionSummary {
+   workspace: string | null;
+   gitBranch: string | null;
+   projectId: string | null;
++  /** The session's `ae.*` labels only (the AE layer's vocabulary); other keys are withheld. */
++  labels: Record<string, string>;
++  archived: boolean;
+   createdAt: number;
+   updatedAt: number;
+ }
+diff --git a/web/src/lib/aeLabels.ts b/web/src/lib/aeLabels.ts
+index 2ff28416a08ff5d96f16922d6de6a4817d430a5b..e0eb94641c3852f1f94e9314b9b91e14444ad6aa 100644
+--- a/web/src/lib/aeLabels.ts
++++ b/web/src/lib/aeLabels.ts
+@@ -119,6 +119,21 @@ export function isAeSlot(
+   );
+ }
+ 
++/**
++ * The `ae.*` labels of a row and nothing else, for the extension host's
++ * session summaries (patch P2): an extension page sees the AE vocabulary and
++ * never another label key. Values are strings already; anything else is
++ * dropped rather than coerced.
++ */
++export function pickAeLabels(labels: unknown): Record<string, string> {
++  if (!labels || typeof labels !== "object" || Array.isArray(labels)) return {};
++  const picked: Record<string, string> = {};
++  for (const [key, value] of Object.entries(labels as Record<string, unknown>)) {
++    if (key.startsWith(AE_NAMESPACE) && typeof value === "string") picked[key] = value;
++  }
++  return picked;
++}
++
+ /** Count the slots held across rows, each session counted once by id. */
+ export function countAeSlots(
+   conversations: Iterable<Pick<Conversation, "id" | "labels" | "archived" | "parent_session_id">>,

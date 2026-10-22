@@ -1,0 +1,1439 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 12:01:08 -0700
+Subject: [PATCH 049/148] [ae-patch] Add browser Claude sign-in and provider
+ settings defaults.
+
+---
+ omnigent/host/connect.py                      |  39 ++++
+ omnigent/host/frames.py                       |   9 +
+ omnigent/onboarding/claude_accounts.py        |   9 +
+ omnigent/onboarding/claude_browser_login.py   | 188 ++++++++++++++++++
+ omnigent/server/identity_migration_extra.py   |   4 +-
+ omnigent/server/routes/host_tunnel.py         |   3 +
+ omnigent/server/routes/hosts.py               |  16 +-
+ tests/onboarding/test_claude_browser_login.py | 101 ++++++++++
+ web/src/hooks/useHosts.ts                     |  18 +-
+ .../SettingsAiAccountsSection.test.tsx        | 154 ++++++++++++--
+ .../settings/SettingsAiAccountsSection.tsx    |  62 ++++--
+ .../pages/settings/SettingsHarnessAccount.tsx |  79 ++++++++
+ .../settings/SettingsHarnessDefaults.tsx      | 152 ++++++++++++++
+ web/src/shell/ClaudeAccounts.tsx              |  91 +++++----
+ web/src/shell/ClaudeBrowserLogin.test.tsx     |  66 ++++++
+ web/src/shell/ClaudeBrowserLogin.tsx          | 152 ++++++++++++++
+ web/src/shell/NewChatDialog.tsx               |  13 ++
+ 17 files changed, 1086 insertions(+), 70 deletions(-)
+ create mode 100644 omnigent/onboarding/claude_browser_login.py
+ create mode 100644 tests/onboarding/test_claude_browser_login.py
+ create mode 100644 web/src/pages/settings/SettingsHarnessAccount.tsx
+ create mode 100644 web/src/pages/settings/SettingsHarnessDefaults.tsx
+ create mode 100644 web/src/shell/ClaudeBrowserLogin.test.tsx
+ create mode 100644 web/src/shell/ClaudeBrowserLogin.tsx
+
+diff --git a/omnigent/host/connect.py b/omnigent/host/connect.py
+index 061fa41a6756859c78c7331595b52b87cf092a8e..1919bf57440ce49fc11ea98b38bccf7109bb5f92 100644
+--- a/omnigent/host/connect.py
++++ b/omnigent/host/connect.py
+@@ -3061,6 +3061,45 @@ class HostProcess:
+                 error=f"harness {frame.harness!r} is not configurable from the UI",
+             )
+ 
++        if frame.kind in {
++            "claude-login-start",
++            "claude-login-poll",
++            "claude-login-code",
++            "claude-login-cancel",
++        }:
++            from omnigent.onboarding.claude_browser_login import login_action
++
++            if install_key != ANTHROPIC_FAMILY:
++                return HostStoreSecretResultFrame(
++                    request_id=frame.request_id,
++                    status="failed",
++                    error="Browser sign-in requires Claude.",
++                )
++            try:
++                login = login_action(
++                    frame.kind, frame.account_name or "", frame.secret_value or ""
++                )
++            except (ValueError, RuntimeError):
++                return HostStoreSecretResultFrame(
++                    request_id=frame.request_id,
++                    status="failed",
++                    error="Could not update sign-in. Check the account label or restart sign-in.",
++                )
++            return HostStoreSecretResultFrame(
++                request_id=frame.request_id,
++                status="ok",
++                login_id=login["login_id"],
++                login_status=login["login_status"],
++                login_url=login["login_url"],
++                error=login["error"],
++                configured_harnesses=configured_harness_map()
++                if login["login_status"] == "complete"
++                else None,
++                gateway_inference=gateway_inference_map()
++                if login["login_status"] == "complete"
++                else None,
++            )
++
+         if frame.kind in ("claude-oauth-add", "claude-oauth-select"):
+             from omnigent.onboarding.claude_accounts import change_account
+ 
+diff --git a/omnigent/host/frames.py b/omnigent/host/frames.py
+index 22578e48a0831bac7df51c20a5a4bc07f3997c4b..3c5a0d60a68088b07326f5bd2dab339d879f3eca 100644
+--- a/omnigent/host/frames.py
++++ b/omnigent/host/frames.py
+@@ -868,6 +868,9 @@ class HostStoreSecretResultFrame:
+     configured_harnesses: dict[str, HarnessAvailability] | None = None
+     gateway_inference: dict[str, bool] | None = None
+     error: str | None = None
++    login_id: str | None = None
++    login_status: str | None = None
++    login_url: str | None = None
+ 
+ 
+ @dataclass
+@@ -1617,6 +1620,9 @@ def encode_host_frame(frame: HostFrame) -> str:
+                 "configured_harnesses": frame.configured_harnesses,
+                 "gateway_inference": frame.gateway_inference,
+                 "error": frame.error,
++                "login_id": frame.login_id,
++                "login_status": frame.login_status,
++                "login_url": frame.login_url,
+             }
+         )
+     if isinstance(frame, HostDetectCredentialsFrame):
+@@ -2654,6 +2660,9 @@ def _decode_store_secret_result(msg: _JsonObject) -> HostStoreSecretResultFrame:
+         configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+         gateway_inference=optional_str_bool_map(msg, "gateway_inference"),
+         error=_optional_nullable_str(msg, "error"),
++        login_id=_optional_nullable_str(msg, "login_id"),
++        login_status=_optional_nullable_str(msg, "login_status"),
++        login_url=_optional_nullable_str(msg, "login_url"),
+     )
+ 
+ 
+diff --git a/omnigent/onboarding/claude_accounts.py b/omnigent/onboarding/claude_accounts.py
+index 6d6e6d1a4fcd142555850ac37773acf099f24c1e..e219a9215f0c79628de427bef777d1ea655712a1 100644
+--- a/omnigent/onboarding/claude_accounts.py
++++ b/omnigent/onboarding/claude_accounts.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import json
+ import os
+ import re
++import threading
+ from pathlib import Path
+ 
+ from omnigent.onboarding import secrets
+@@ -56,7 +57,15 @@ def account_descriptors() -> list[dict[str, str | None]]:
+     ]
+ 
+ 
++_ACCOUNT_LOCK = threading.RLock()
++
++
+ def change_account(kind: str, name: str, token: str = "") -> StoreCredentialResult:
++    with _ACCOUNT_LOCK:
++        return _change_account(kind, name, token)
++
++
++def _change_account(kind: str, name: str, token: str = "") -> StoreCredentialResult:
+     if name and not _valid_name(name):
+         return StoreCredentialResult(
+             False, None, "Use a name of up to 64 letters, digits, spaces, - or _."
+diff --git a/omnigent/onboarding/claude_browser_login.py b/omnigent/onboarding/claude_browser_login.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c2fa8645f65cf7d71834c3571b936a7c3c4fb349
+--- /dev/null
++++ b/omnigent/onboarding/claude_browser_login.py
+@@ -0,0 +1,188 @@
++"""Host-owned Claude login processes; return authorization links, never tokens."""
++
++from __future__ import annotations
++
++import os
++import re
++import shutil
++import tempfile
++import threading
++import time
++import uuid
++from dataclasses import dataclass, field
++from urllib.parse import urlparse
++
++from omnigent.onboarding.claude_accounts import _read, _valid_name, change_account
++
++_TTL = 600
++_ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
++_URL = re.compile(r"https://[^\s\x1b\x07]+(?=[\s\x1b\x07])")
++_TOKEN = re.compile(r"sk-ant-oat[\w-]{20,}(?=[\s\x1b\x07])")
++_LOCK = threading.RLock()
++_JOBS: dict[str, Login] = {}
++
++
++@dataclass
++class Login:
++    name: str
++    id: str = field(default_factory=lambda: uuid.uuid4().hex)
++    status: str = "starting"
++    url: str = ""
++    error: str = ""
++    created: float = field(default_factory=time.monotonic)
++    cancel: threading.Event = field(default_factory=threading.Event)
++    code: str = ""
++
++    def public(self) -> dict[str, str]:
++        return {
++            "login_id": self.id,
++            "login_status": self.status,
++            "login_url": self.url,
++            "error": self.error,
++        }
++
++
++def authorization_url(output: str) -> str | None:
++    for match in _URL.finditer(output):
++        url = match.group()
++        parsed = urlparse(url)
++        if (
++            parsed.scheme == "https"
++            and parsed.hostname in {"claude.com", "claude.ai"}
++            and parsed.path in {"/oauth/authorize", "/cai/oauth/authorize"}
++        ):
++            return url
++    return None
++
++
++def _run(job: Login) -> None:
++    # Import only on supported hosts; a missing CLI/PTY dependency is a visible failure.
++    process = None
++    try:
++        import pexpect
++
++        binary = shutil.which("claude")
++        if binary is None:
++            raise RuntimeError("Claude Code is not installed")
++        with tempfile.TemporaryDirectory(prefix="omnigent-claude-login-") as directory:
++            env = {
++                k: v
++                for k, v in os.environ.items()
++                if k
++                not in {
++                    "CLAUDE_CODE_OAUTH_TOKEN",
++                    "ANTHROPIC_API_KEY",
++                    "ANTHROPIC_AUTH_TOKEN",
++                    "ANTHROPIC_BASE_URL",
++                    "CLAUDECODE",
++                    "CLAUDE_CODE_USE_BEDROCK",
++                    "CLAUDE_CODE_USE_VERTEX",
++                }
++            }
++            env.update(CLAUDE_CONFIG_DIR=directory, BROWSER="true", NO_COLOR="1", TERM="dumb")
++            process = pexpect.spawn(
++                binary,
++                ["setup-token"],
++                env=env,
++                encoding="utf-8",
++                codec_errors="replace",
++                dimensions=(40, 4096),
++                echo=False,
++            )
++            output = ""
++            while not job.cancel.is_set() and time.monotonic() - job.created < _TTL:
++                with _LOCK:
++                    code, job.code = job.code, ""
++                if code:
++                    process.sendline(code)
++                ended = False
++                try:
++                    output = (output + process.read_nonblocking(8192, timeout=0.25))[-131072:]
++                except pexpect.TIMEOUT:
++                    continue
++                except pexpect.EOF:
++                    ended = True
++                url = authorization_url(output)
++                with _LOCK:
++                    if url and not job.url:
++                        job.url, job.status = url, "waiting"
++                clean = _ANSI.sub("", output)
++                token = _TOKEN.search(clean)
++                if token:
++                    with _LOCK:
++                        if job.cancel.is_set():
++                            break
++                        saved = change_account("claude-oauth-add", job.name, token.group())
++                        job.status = "complete" if saved.stored else "failed"
++                        job.error = (
++                            "" if saved.stored else (saved.reason or "Could not save account.")
++                        )
++                    output = ""
++                    return
++                if ended:
++                    break
++            with _LOCK:
++                job.status = "cancelled" if job.cancel.is_set() else "failed"
++                job.error = (
++                    ""
++                    if job.cancel.is_set()
++                    else "Claude sign-in ended or expired. Try signing in again."
++                )
++    except Exception:
++        with _LOCK:
++            job.status = "failed"
++            job.error = (
++                "Could not start Claude sign-in. Check that Claude Code is installed on this host."
++            )
++    finally:
++        if process is not None:
++            process.close(force=True)
++        with _LOCK:
++            job.code = ""
++            job.url = "" if job.status != "waiting" else job.url
++
++
++def login_action(kind: str, name_or_id: str, code: str = "") -> dict[str, str]:
++    """Start, poll, submit a one-time code, or cancel an owner-authorized login."""
++    with _LOCK:
++        for key, job in list(_JOBS.items()):
++            if time.monotonic() - job.created > _TTL + 60:
++                job.cancel.set()
++                del _JOBS[key]
++        if kind == "claude-login-start":
++            if not _valid_name(name_or_id):
++                raise ValueError("Enter an account label using letters, numbers, spaces, - or _.")
++            if name_or_id in _read()["accounts"]:
++                raise ValueError("That account label already exists. Choose another label.")
++            if any(
++                j.name == name_or_id and j.status in {"starting", "waiting"}
++                for j in _JOBS.values()
++            ):
++                raise ValueError(
++                    "Sign-in for that label is already open. Finish or cancel it first."
++                )
++            if sum(j.status in {"starting", "waiting"} for j in _JOBS.values()) >= 3:
++                raise ValueError("Finish or cancel an existing sign-in before starting another.")
++            job = Login(name_or_id)
++            _JOBS[job.id] = job
++            threading.Thread(target=_run, args=(job,), daemon=True).start()
++            return job.public()
++        job = _JOBS.get(name_or_id)
++        if job is None:
++            raise ValueError("Sign-in expired or the host restarted. Start sign-in again.")
++        if kind == "claude-login-cancel":
++            job.cancel.set()
++            if job.status in {"starting", "waiting"}:
++                job.status = "cancelled"
++        elif kind == "claude-login-code":
++            if (
++                job.status != "waiting"
++                or not code
++                or len(code) > 2048
++                or any(ord(c) < 32 or ord(c) == 127 for c in code)
++            ):
++                raise ValueError("Paste the one-time authorization code shown by Claude.")
++            job.code = code
++        elif kind != "claude-login-poll":
++            raise ValueError("Unknown sign-in action.")
++        return job.public()
+diff --git a/omnigent/server/identity_migration_extra.py b/omnigent/server/identity_migration_extra.py
+index ea1788aeb840141f73af8c589afef915c617e733..3c09f2424f318a5807b37d940b8a366f632700f0 100644
+--- a/omnigent/server/identity_migration_extra.py
++++ b/omnigent/server/identity_migration_extra.py
+@@ -119,7 +119,9 @@ def remap_extra_columns(
+             if clash is not None:
+                 session.delete(row)
+             else:
+-                if model is SqlConnection and not _reencrypt(cipher, row, new_id):
++                if model is SqlConnection and not _reencrypt(
++                    cipher, cast(SqlConnection, row), new_id
++                ):
+                     bump("connections_reconnect", 1)
+                 row.user_id = new_id
+             bump(model.__tablename__, 1)
+diff --git a/omnigent/server/routes/host_tunnel.py b/omnigent/server/routes/host_tunnel.py
+index 5180981db69a0c401ede7f53ffdbcdd7c25c4ecf..067b8bf29f7d9ba7f2e5c1457e7a77fff2e3fa59 100644
+--- a/omnigent/server/routes/host_tunnel.py
++++ b/omnigent/server/routes/host_tunnel.py
+@@ -836,6 +836,9 @@ async def _receive_loop(
+                         "configured_harnesses": frame.configured_harnesses,
+                         "gateway_inference": frame.gateway_inference,
+                         "error": frame.error,
++                        "login_id": frame.login_id,
++                        "login_status": frame.login_status,
++                        "login_url": frame.login_url,
+                     }
+                 )
+             continue
+diff --git a/omnigent/server/routes/hosts.py b/omnigent/server/routes/hosts.py
+index 943c08591510b00dd6f8ef7c1965b2b28bed7446..7871f2bb98a3c13cd80522f5e84fd16409032928 100644
+--- a/omnigent/server/routes/hosts.py
++++ b/omnigent/server/routes/hosts.py
+@@ -1610,7 +1610,17 @@ def create_hosts_router(
+                 status_code=400,
+                 detail=f"harness {harness!r} is not configurable from the UI",
+             )
+-        if body.kind not in ("key", "gateway", "adopt", "claude-oauth-add", "claude-oauth-select"):
++        if body.kind not in (
++            "key",
++            "gateway",
++            "adopt",
++            "claude-oauth-add",
++            "claude-oauth-select",
++            "claude-login-start",
++            "claude-login-poll",
++            "claude-login-code",
++            "claude-login-cancel",
++        ):
+             raise HTTPException(status_code=400, detail=f"unknown credential kind {body.kind!r}")
+ 
+         user_id = require_user(request, auth_provider)
+@@ -1671,6 +1681,10 @@ def create_hosts_router(
+             "configured_harnesses": result.get("configured_harnesses") or {},
+             # Passed through as-is: ``None`` is "unknown", not "none backed".
+             "gateway_inference": written_gateway,
++            "login_id": result.get("login_id"),
++            "login_status": result.get("login_status"),
++            "login_url": result.get("login_url"),
++            "login_error": result.get("error"),
+         }
+ 
+     @router.get("/hosts/{host_id}/credentials/detected")
+diff --git a/tests/onboarding/test_claude_browser_login.py b/tests/onboarding/test_claude_browser_login.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a3ff644493a70d8c39ff97a1f96d9bacc697806
+--- /dev/null
++++ b/tests/onboarding/test_claude_browser_login.py
+@@ -0,0 +1,101 @@
++"""Browser login keeps credentials on the host and isolates the primary login."""
++
++from __future__ import annotations
++
++import time
++from unittest.mock import Mock
++
++import pytest
++
++from omnigent.onboarding import claude_browser_login as login
++from omnigent.onboarding.claude_accounts import account_env
++
++
++@pytest.fixture(autouse=True)
++def isolated(monkeypatch, tmp_path):
++    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
++    monkeypatch.setenv("OMNIGENT_DISABLE_KEYRING", "1")
++    monkeypatch.setattr(login, "_JOBS", {})
++
++
++def test_only_provider_authorization_url_is_exposed():
++    assert login.authorization_url("https://evil.test/oauth/authorize?code=x\n") is None
++    assert login.authorization_url("https://claude.com.evil.test/oauth/authorize?code=x\n") is None
++    assert login.authorization_url("https://claude.com/oauth/authorize?state=partial") is None
++    url = "https://claude.com/cai/oauth/authorize?state=example&code=true"
++    assert login.authorization_url(f"\x1b]8;;{url}\x07label\x1b]8;;\x07") == url
++
++
++def test_start_validation_cancel_and_expiry(monkeypatch):
++    monkeypatch.setattr(login.threading, "Thread", Mock())
++    with pytest.raises(ValueError):
++        login.login_action("claude-login-start", "../primary")
++    result = login.login_action("claude-login-start", "Backup")
++    assert result["login_status"] == "starting"
++    assert "token" not in repr(result)
++    with pytest.raises(ValueError, match="already open"):
++        login.login_action("claude-login-start", "Backup")
++    job = login._JOBS[result["login_id"]]
++    job.status = "waiting"
++    with pytest.raises(ValueError):
++        login.login_action("claude-login-code", job.id, "code\ncommand")
++    login.login_action("claude-login-code", job.id, "one-time-code#state")
++    assert job.code == "one-time-code#state"
++    assert "one-time-code" not in repr(job.public())
++    assert login.login_action("claude-login-cancel", job.id)["login_status"] == "cancelled"
++    assert job.cancel.is_set()
++    job.created = time.monotonic() - 700
++    with pytest.raises(ValueError, match="expired"):
++        login.login_action("claude-login-poll", job.id)
++
++
++def test_cli_token_saved_but_never_returned(monkeypatch):
++    import pexpect
++
++    token = "sk-ant-oat01-" + "x" * 45
++    process = Mock()
++    process.read_nonblocking.side_effect = [
++        "\x1b]8;;https://claude.com/oauth/authorize?state=abc\x07",
++        f"\n{token}\r\n",
++    ]
++    spawn = Mock(return_value=process)
++    monkeypatch.setattr(pexpect, "spawn", spawn)
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "original-token")
++    job = login.Login("Backup")
++    login._run(job)
++    assert job.status == "complete"
++    assert account_env()["CLAUDE_CODE_OAUTH_TOKEN"] == token
++    assert token not in repr(job.public())
++    env = spawn.call_args.kwargs["env"]
++    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
++    assert "omnigent-claude-login-" in env["CLAUDE_CONFIG_DIR"]
++    process.close.assert_called_once_with(force=True)
++
++
++def test_cli_failure_does_not_return_terminal_output(monkeypatch):
++    import pexpect
++
++    monkeypatch.setattr(login.shutil, "which", lambda _: "/usr/bin/claude")
++    monkeypatch.setattr(pexpect, "spawn", Mock(side_effect=RuntimeError("secret-value")))
++    job = login.Login("Backup")
++    login._run(job)
++    assert job.status == "failed"
++    assert "secret-value" not in repr(job.public())
++
++
++def test_login_frame_roundtrip():
++    from omnigent.host.frames import (
++        HostStoreSecretResultFrame,
++        decode_host_frame,
++        encode_host_frame,
++    )
++
++    frame = HostStoreSecretResultFrame(
++        request_id="id",
++        status="ok",
++        login_id="login",
++        login_status="waiting",
++        login_url="https://claude.com/oauth/authorize?state=test",
++    )
++    assert decode_host_frame(encode_host_frame(frame)) == frame
+diff --git a/web/src/hooks/useHosts.ts b/web/src/hooks/useHosts.ts
+index 328df8b811648ecea7d2614ec93f7a3c51218088..13bf8a80b9195ff94a28067f0ba7c80c31b95da1 100644
+--- a/web/src/hooks/useHosts.ts
++++ b/web/src/hooks/useHosts.ts
+@@ -262,7 +262,16 @@ export function useInstallingHarnesses(hostId: string): ReadonlySet<string> {
+ /** Payload for {@link useStoreCredential}: an API key, a gateway, or adopt. */
+ export interface StoreCredentialInput {
+   harness: string;
+-  kind: "key" | "gateway" | "adopt" | "claude-oauth-add" | "claude-oauth-select";
++  kind:
++    | "key"
++    | "gateway"
++    | "adopt"
++    | "claude-oauth-add"
++    | "claude-oauth-select"
++    | "claude-login-start"
++    | "claude-login-poll"
++    | "claude-login-code"
++    | "claude-login-cancel";
+   account_name?: string;
+   /** The API key / gateway token for `key` / `gateway`; omitted for `adopt`. */
+   secret?: string;
+@@ -278,7 +287,11 @@ export interface StoreCredentialInput {
+   env_var?: string;
+ }
+ 
+-interface StoreCredentialResult {
++export interface StoreCredentialResult {
++  login_id?: string | null;
++  login_status?: string | null;
++  login_url?: string | null;
++  login_error?: string | null;
+   object: "harness_credential";
+   harness: string;
+   configured_harnesses: Record<string, boolean | string>;
+@@ -324,6 +337,7 @@ export function useStoreCredential(hostId: string) {
+     // react-query fires both — don't consolidate them, or the cache patch here
+     // is lost.
+     onSuccess: (result) => {
++      if (result.login_status && result.login_status !== "complete") return;
+       queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (hosts) =>
+         hosts?.map((h) =>
+           h.host_id === hostId ? { ...h, configured_harnesses: result.configured_harnesses } : h,
+diff --git a/web/src/pages/settings/SettingsAiAccountsSection.test.tsx b/web/src/pages/settings/SettingsAiAccountsSection.test.tsx
+index 9e9c2a8eec174452227f9464cad7faf77a3a30b9..a3553be87dd59d37e5d13360b25c4b0daa8be93a 100644
+--- a/web/src/pages/settings/SettingsAiAccountsSection.test.tsx
++++ b/web/src/pages/settings/SettingsAiAccountsSection.test.tsx
+@@ -1,27 +1,157 @@
+ import { fireEvent, render, screen } from "@testing-library/react";
+-import { describe, expect, it, vi } from "vitest";
++import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { SettingsAiAccountsSection } from "./SettingsAiAccountsSection";
++import { readHarnessOptions, writeHarnessOption } from "@/lib/modePreferences";
+ 
++const state = vi.hoisted(() => ({
++  enabled: true,
++  hosts: [
++    {
++      host_id: "one",
++      name: "Laptop",
++      status: "online",
++      configured_harnesses: {
++        "claude-native": true,
++        "codex-native": true,
++        "pi-native": "needs-auth",
++        "cursor-native": true,
++      },
++    },
++    {
++      host_id: "two",
++      name: "Desktop",
++      status: "online",
++      configured_harnesses: { "claude-native": true },
++    },
++    { host_id: "off", name: "Offline host", status: "offline", configured_harnesses: {} },
++  ],
++  models: vi.fn(),
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+-  useHosts: () => ({
+-    data: [
+-      { host_id: "one", name: "Laptop", status: "online" },
+-      { host_id: "two", name: "Desktop", status: "online" },
+-      { host_id: "off", name: "Offline host", status: "offline" },
+-    ],
+-  }),
++  useHosts: () => ({ data: state.hosts }),
++  useHostModelOptions: (...args: unknown[]) => {
++    state.models(...args);
++    return {
++      data: [
++        {
++          id: "catalog-model",
++          displayName: "Catalog model",
++          isDefault: true,
++          supportedReasoningEfforts: [{ reasoningEffort: "high" }],
++        },
++      ],
++    };
++  },
++}));
++vi.mock("@/lib/CapabilitiesContext", () => ({ useServerInfo: () => ({}) }));
++vi.mock("@/lib/capabilities", () => ({ isFeatureEnabled: () => state.enabled }));
++vi.mock("@/lib/agentLabels", () => ({
++  useHarnessLabels: () => ({}),
++  isAutoHarness: () => false,
++  useHarnessSetupSteps: () => ({ "codex-native": [{ kind: "auth", command: "codex login" }] }),
+ }));
+ vi.mock("@/shell/ClaudeAccounts", () => ({
+   ClaudeAccounts: ({ host }: { host: { name: string } }) => <div>Accounts on {host.name}</div>,
+ }));
++vi.mock("@/shell/HarnessCredentialForm", () => ({
++  HarnessCredentialForm: ({ command }: { command: string }) => (
++    <div>
++      <input aria-label="Test secret" />
++      {command}
++    </div>
++  ),
++}));
++vi.mock("@/shell/HarnessSetupDialog", () => ({
++  HarnessSetupDialog: ({ open, harness }: { open: boolean; harness: string }) =>
++    open ? <div>Setup {harness}</div> : null,
++}));
++
+ describe("AI account settings", () => {
+-  it("routes account management to the selected online host", () => {
+-    render(<SettingsAiAccountsSection />);
++  beforeEach(() => {
++    localStorage.clear();
++    state.enabled = true;
++    state.models.mockClear();
++    state.hosts[1].status = "online";
++  });
++  it("retains the explicitly selected host when it goes offline", () => {
++    const { rerender } = render(<SettingsAiAccountsSection />);
+     expect(screen.getByText("Accounts on Laptop")).toBeTruthy();
+     fireEvent.change(screen.getByLabelText("Host"), { target: { value: "two" } });
+     expect(screen.getByText("Accounts on Desktop")).toBeTruthy();
+-    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "off" } });
+-    expect(screen.queryByText("Accounts on Desktop")).toBeNull();
++    state.hosts[1].status = "offline";
++    rerender(<SettingsAiAccountsSection />);
++    expect((screen.getByLabelText("Host") as HTMLSelectElement).value).toBe("two");
++    expect(screen.queryByText("Accounts on Laptop")).toBeNull();
+     expect(screen.getByText("Reconnect this host to manage its accounts.")).toBeTruthy();
++    expect(screen.queryByLabelText("Test secret")).toBeNull();
++  });
++  it("resets secrets when host or harness changes and shows CLI login", () => {
++    render(<SettingsAiAccountsSection />);
++    fireEvent.change(screen.getByLabelText("Test secret"), { target: { value: "private" } });
++    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "two" } });
++    expect((screen.getByLabelText("Test secret") as HTMLInputElement).value).toBe("");
++    fireEvent.change(screen.getByLabelText("Test secret"), { target: { value: "private" } });
++    fireEvent.change(screen.getByLabelText("Harness"), { target: { value: "codex-native" } });
++    expect((screen.getByLabelText("Test secret") as HTMLInputElement).value).toBe("");
++    expect(screen.getByText("codex login")).toBeTruthy();
++  });
++  it("gates host writes by the server feature", () => {
++    state.enabled = false;
++    render(<SettingsAiAccountsSection />);
++    expect(screen.queryByLabelText("Test secret")).toBeNull();
++    expect(screen.queryByText("Accounts on Laptop")).toBeNull();
++    expect(screen.queryByText("Setup instructions")).toBeNull();
++    expect(screen.getByLabelText("Default model")).toBeTruthy();
++  });
++  it("persists defaults across hosts and queries only the selected harness", () => {
++    writeHarnessOption("claude-native", { routing: "on" });
++    render(<SettingsAiAccountsSection />);
++    fireEvent.change(screen.getByLabelText("Default model"), {
++      target: { value: "catalog-model" },
++    });
++    fireEvent.change(screen.getByLabelText("Default permissions"), { target: { value: "plan" } });
++    expect(readHarnessOptions("claude-native")).toMatchObject({
++      model: "catalog-model",
++      routing: "off",
++      mode: "plan",
++    });
++    expect(state.models.mock.calls.every((call) => call[1] === "claude-native")).toBe(true);
++    fireEvent.change(screen.getByLabelText("Host"), { target: { value: "two" } });
++    expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe(
++      "catalog-model",
++    );
++    fireEvent.change(screen.getByLabelText("Harness"), { target: { value: "codex-native" } });
++    expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe("");
++    fireEvent.change(screen.getByLabelText("Default effort"), { target: { value: "high" } });
++    expect(readHarnessOptions("codex-native").effort).toBe("high");
++  });
++  it("offers setup for other installed harnesses without credential forms", () => {
++    render(<SettingsAiAccountsSection />);
++    fireEvent.change(screen.getByLabelText("Harness"), { target: { value: "cursor-native" } });
++    expect(screen.queryByLabelText("Test secret")).toBeNull();
++    fireEvent.click(screen.getByText("Setup instructions"));
++    expect(screen.getByText("Setup cursor-native")).toBeTruthy();
++    expect(state.models.mock.lastCall?.slice(1)).toEqual(["cursor-native", false]);
++  });
++  it("retains saved model preferences when the catalog does not include them", () => {
++    writeHarnessOption("claude-native", { model: "previous-host-model", effort: "high" });
++    render(<SettingsAiAccountsSection />);
++    expect((screen.getByLabelText("Default model") as HTMLSelectElement).value).toBe(
++      "previous-host-model",
++    );
++    expect(screen.getByText("previous-host-model (saved; unavailable on this host)")).toBeTruthy();
++    expect(readHarnessOptions("claude-native").model).toBe("previous-host-model");
++    fireEvent.change(screen.getByLabelText("Default model"), {
++      target: { value: "catalog-model" },
++    });
++    expect(readHarnessOptions("claude-native").effort).toBe("");
++  });
++  it("offers Pi credentials while waiting for authentication without probing models", () => {
++    render(<SettingsAiAccountsSection />);
++    fireEvent.change(screen.getByLabelText("Harness"), { target: { value: "pi-native" } });
++    expect(screen.getByLabelText("Test secret")).toBeTruthy();
++    expect(screen.getByText("Authentication required")).toBeTruthy();
++    expect(state.models.mock.lastCall?.slice(1)).toEqual(["pi-native", false]);
++    expect(screen.queryByText("codex login")).toBeNull();
+   });
+ });
+diff --git a/web/src/pages/settings/SettingsAiAccountsSection.tsx b/web/src/pages/settings/SettingsAiAccountsSection.tsx
+index 9914ea0cfcf2518dd14da12192c78ca830de6cdd..41a01780cc6d27b01f9a32fc44f18af41079e0d3 100644
+--- a/web/src/pages/settings/SettingsAiAccountsSection.tsx
++++ b/web/src/pages/settings/SettingsAiAccountsSection.tsx
+@@ -1,22 +1,32 @@
+ import { useState } from "react";
+ import { useHosts } from "@/hooks/useHosts";
+-import { ClaudeAccounts } from "@/shell/ClaudeAccounts";
++import { useHarnessLabels, isAutoHarness } from "@/lib/agentLabels";
++import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
++import { SettingsHarnessAccount } from "./SettingsHarnessAccount";
+ 
+ /** Subscription credentials belong to the machine that runs the agent. */
+ export function SettingsAiAccountsSection() {
+   const { data: hosts = [], isLoading, isError, refetch } = useHosts({ refetchOnFocus: true });
++  const labels = useHarnessLabels();
++  const [harness, setHarness] = useState("claude-native");
+   const [hostId, setHostId] = useState("");
+-  const host =
+-    hosts.find((item) => item.host_id === hostId) ??
+-    hosts.find((item) => item.status === "online") ??
+-    hosts[0];
++  const host = hostId
++    ? hosts.find((item) => item.host_id === hostId)
++    : (hosts.find((item) => item.status === "online") ?? hosts[0]);
++  const harnesses = new Map(
++    NATIVE_CODING_AGENTS.map((agent) => [agent.harness as string, agent.displayName as string]),
++  );
++  for (const id of Object.keys(labels)) {
++    if (id in (host?.configured_harnesses ?? {}) && !isAutoHarness(id) && !harnesses.has(id))
++      harnesses.set(id, labels[id] ?? id);
++  }
+   return (
+     <section className="min-w-0 space-y-4" data-testid="settings-ai-accounts">
+       <h2 className="text-lg font-semibold">AI accounts</h2>
+       <p className="text-sm text-muted-foreground">
+-        Manage the Claude subscription used for new chats and team members on each host. These
+-        accounts are separate from your Omnigent sign-in. Model, effort, and team configuration stay
+-        with each chat; gateway connections use their own credentials.
++        Manage provider accounts, API keys, gateway connections, and defaults for new chats.
++        Provider credentials are stored on the selected host and are separate from your Omnigent
++        sign-in.
+       </p>
+       {isLoading && <p role="status">Loading hosts…</p>}
+       {isError && (
+@@ -33,9 +43,10 @@ export function SettingsAiAccountsSection() {
+           Host
+           <select
+             className="min-w-0 w-full rounded-md border bg-background p-2"
+-            value={host?.host_id ?? ""}
++            value={hostId || host?.host_id || ""}
+             onChange={(event) => setHostId(event.target.value)}
+           >
++            {hostId && !host && <option value={hostId}>Selected host (unavailable)</option>}
+             {hosts.map((item) => (
+               <option key={item.host_id} value={item.host_id}>
+                 {item.name}
+@@ -45,10 +56,35 @@ export function SettingsAiAccountsSection() {
+           </select>
+         </label>
+       )}
+-      {host?.status === "offline" ? (
+-        <p>Reconnect this host to manage its accounts.</p>
+-      ) : (
+-        host && <ClaudeAccounts key={host.host_id} host={host} />
++      {hostId && !host && (
++        <p>The selected host is unavailable. Select another host to manage its accounts.</p>
++      )}
++      {host && (
++        <>
++          <label className="flex min-w-0 flex-col gap-2 text-sm">
++            Harness
++            <select
++              className="min-w-0 w-full rounded-md border bg-background p-2"
++              value={harness}
++              onChange={(event) => setHarness(event.target.value)}
++            >
++              {!harnesses.has(harness) && (
++                <option value={harness}>{labels[harness] ?? harness}</option>
++              )}
++              {[...harnesses].map(([id, label]) => (
++                <option key={id} value={id}>
++                  {label}
++                </option>
++              ))}
++            </select>
++          </label>
++          <SettingsHarnessAccount
++            key={`${host.host_id}:${harness}`}
++            host={host}
++            harness={harness}
++            label={harnesses.get(harness) ?? harness}
++          />
++        </>
+       )}
+     </section>
+   );
+diff --git a/web/src/pages/settings/SettingsHarnessAccount.tsx b/web/src/pages/settings/SettingsHarnessAccount.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..3402ba823c3931bea5d87d70dfa98081f47053e4
+--- /dev/null
++++ b/web/src/pages/settings/SettingsHarnessAccount.tsx
+@@ -0,0 +1,79 @@
++import { useState } from "react";
++import type { Host } from "@/hooks/useHosts";
++import { useServerInfo } from "@/lib/CapabilitiesContext";
++import { useHarnessSetupSteps } from "@/lib/agentLabels";
++import { harnessAuthableOnHost, harnessReadinessOnHost } from "@/lib/harnessSetup";
++import { isFeatureEnabled } from "@/lib/capabilities";
++import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
++import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
++import { ClaudeAccounts } from "@/shell/ClaudeAccounts";
++import { Button } from "@/components/ui/button";
++import { SettingsHarnessDefaults } from "./SettingsHarnessDefaults";
++
++export function SettingsHarnessAccount({
++  host,
++  harness,
++  label,
++}: {
++  host: Host;
++  harness: string;
++  label: string;
++}) {
++  const info = useServerInfo();
++  const steps = useHarnessSetupSteps();
++  const [setupOpen, setSetupOpen] = useState(false);
++  const readiness = harnessReadinessOnHost(harness, host);
++  const writable =
++    info !== "loading" && isFeatureEnabled(info, "harness_install") && host.status === "online";
++  const installed = !["binary-missing", "version-too-low", "unconfigured"].includes(
++    readiness.reason,
++  );
++  const command = steps[harness]?.find((step) => step.kind === "auth")?.command ?? null;
++  return (
++    <div className="space-y-4">
++      <div className="space-y-3 rounded-md border p-4">
++        <h3 className="font-medium">
++          {label} on {host.name}
++        </h3>
++        <p role="status" className="text-sm">
++          {readiness.reason === "ready"
++            ? "Ready"
++            : (readiness.explanation?.label ?? "Readiness unknown")}
++        </p>
++        {host.status !== "online" && <p>Reconnect this host to manage its accounts.</p>}
++        {info !== "loading" && !isFeatureEnabled(info, "harness_install") && (
++          <p className="text-sm text-muted-foreground">
++            Credential and installation controls are disabled by this server.
++          </p>
++        )}
++        {writable && (
++          <>
++            {harness === "claude-native" && <ClaudeAccounts key={host.host_id} host={host} />}
++            <Button variant="outline" onClick={() => setSetupOpen(true)}>
++              Setup instructions
++            </Button>
++            {installed && harnessAuthableOnHost(info, harness, host) && (
++              <HarnessCredentialForm
++                key={`${host.host_id}:${harness}`}
++                host={host}
++                harness={harness}
++                label={label}
++                command={harness === "claude-native" ? null : command}
++                onDone={() => undefined}
++              />
++            )}
++            <HarnessSetupDialog
++              key={`${host.host_id}:${harness}`}
++              open={setupOpen}
++              onOpenChange={setSetupOpen}
++              host={host}
++              harness={harness}
++              agentName={label}
++            />
++          </>
++        )}
++      </div>
++      <SettingsHarnessDefaults key={`${host.host_id}:${harness}`} host={host} harness={harness} />
++    </div>
++  );
++}
+diff --git a/web/src/pages/settings/SettingsHarnessDefaults.tsx b/web/src/pages/settings/SettingsHarnessDefaults.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8944f547792cba5872ff44e87837231ac25d3fb0
+--- /dev/null
++++ b/web/src/pages/settings/SettingsHarnessDefaults.tsx
+@@ -0,0 +1,152 @@
++import { useState } from "react";
++import { useHostModelOptions, type Host } from "@/hooks/useHosts";
++import { harnessUnconfiguredOnHost } from "@/lib/harnessSetup";
++import { readHarnessOptions, writeHarnessOption, type HarnessOptions } from "@/lib/modePreferences";
++import {
++  CLAUDE_NATIVE_EFFORTS,
++  PI_NATIVE_EFFORTS,
++  nativeModelLabel,
++} from "@/components/HarnessConfigControls";
++import { CLAUDE_NATIVE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
++import { codexCreateApprovalOptions } from "@/lib/codexApprovalOptions";
++import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
++import {
++  AGY_NATIVE_SKIP_MODES,
++  CODEX_NATIVE_APPROVAL_MODES,
++  CURSOR_NATIVE_EXEC_MODES,
++  DEVIN_NATIVE_PERMISSION_MODES,
++} from "@/lib/nativeHarnessModes";
++
++const permissionOptions: Record<
++  string,
++  readonly { value: string; label: string; description?: string }[]
++> = {
++  "claude-native": CLAUDE_NATIVE_PERMISSION_MODES,
++  "codex-native": codexCreateApprovalOptions(),
++  "opencode-native": CODEX_NATIVE_APPROVAL_MODES,
++  "cursor-native": CURSOR_NATIVE_EXEC_MODES,
++  "antigravity-native": AGY_NATIVE_SKIP_MODES,
++  "devin-native": DEVIN_NATIVE_PERMISSION_MODES,
++};
++const modelHarnesses = new Set(["claude-native", "codex-native", "pi-native", "devin-native"]);
++
++/** Uses the same per-harness browser preferences as New Chat. */
++export function SettingsHarnessDefaults({ harness, host }: { harness: string; host: Host }) {
++  const [options, setOptions] = useState(() => readHarnessOptions(harness));
++  const supportsModels = modelHarnesses.has(harness);
++  const canQuery =
++    supportsModels && host.status === "online" && !harnessUnconfiguredOnHost(harness, host);
++  const {
++    data: models = [],
++    isLoading,
++    isError,
++    refetch,
++  } = useHostModelOptions(host.host_id, harness, canQuery);
++  const modes = permissionOptions[harness] ?? [];
++  const efforts =
++    harness === "claude-native"
++      ? CLAUDE_NATIVE_EFFORTS
++      : harness === "pi-native"
++        ? PI_NATIVE_EFFORTS
++        : codexEffortLevelsForModel(
++            models,
++            options.model || models.find((model) => model.isDefault)?.id,
++          ).map((value) => ({ value, label: value }));
++  const save = (patch: HarnessOptions) => {
++    writeHarnessOption(harness, patch);
++    setOptions(readHarnessOptions(harness));
++  };
++  if (!supportsModels && !modes.length) return null;
++  return (
++    <div className="space-y-3 rounded-md border p-4">
++      <h3 className="font-medium">Browser defaults</h3>
++      <p className="text-sm text-muted-foreground">
++        Defaults for new chats in this browser, across all hosts. Project and chat overrides take
++        priority. New Chat also remembers changes here. Credentials above belong to the selected
++        host.
++      </p>
++      {supportsModels && (
++        <>
++          <DefaultSelect
++            label="Default model"
++            value={options.model ?? ""}
++            options={models.map((model) => ({ value: model.id, label: nativeModelLabel(model) }))}
++            onChange={(model) => save({ model, effort: "", routing: "off" })}
++          />
++          {canQuery && isLoading && <p role="status">Loading models…</p>}
++          {canQuery && isError && (
++            <p role="alert">
++              Could not load models.{" "}
++              <button type="button" className="underline" onClick={() => void refetch()}>
++                Retry models
++              </button>
++            </p>
++          )}
++          {!canQuery && (
++            <p className="text-sm text-muted-foreground">
++              Connect and set up this harness to load its model catalog.
++            </p>
++          )}
++          {canQuery && !isLoading && !isError && !models.length && (
++            <p className="text-sm text-muted-foreground">This host returned no model choices.</p>
++          )}
++          <DefaultSelect
++            label="Default effort"
++            value={options.effort ?? ""}
++            options={efforts}
++            onChange={(effort) => save({ effort })}
++          />
++        </>
++      )}
++      {!!modes.length && (
++        <>
++          <DefaultSelect
++            label="Default permissions"
++            value={options.mode ?? ""}
++            options={modes}
++            onChange={(mode) => save({ mode })}
++          />
++          <p className="text-sm text-muted-foreground">
++            {modes.find((mode) => mode.value === options.mode)?.description ??
++              "Permission choices control when the agent asks before acting. Full access or bypass modes remove approval safeguards."}
++          </p>
++        </>
++      )}
++    </div>
++  );
++}
++
++function DefaultSelect({
++  label,
++  value,
++  options,
++  onChange,
++}: {
++  label: string;
++  value: string;
++  options: readonly { value: string; label: string }[];
++  onChange: (value: string) => void;
++}) {
++  return (
++    <label className="flex min-w-0 flex-col gap-2 text-sm">
++      {label}
++      <select
++        className="min-w-0 w-full rounded-md border bg-background p-2"
++        value={value}
++        onChange={(event) => onChange(event.target.value)}
++      >
++        <option value="">Harness default</option>
++        {value && !options.some((option) => option.value === value) && (
++          <option value={value} disabled>
++            {value} (saved; unavailable on this host)
++          </option>
++        )}
++        {options.map((option) => (
++          <option key={option.value} value={option.value}>
++            {option.label}
++          </option>
++        ))}
++      </select>
++    </label>
++  );
++}
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+index e809a9b3a4e947343437b2d847da6c65801803e3..84e2c2f3d1163dc093bcda0f07b5f1f5deb0f672 100644
+--- a/web/src/shell/ClaudeAccounts.tsx
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -1,3 +1,4 @@
++import { ClaudeBrowserLogin } from "./ClaudeBrowserLogin";
+ import { useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+@@ -76,54 +77,62 @@ export function ClaudeAccounts({ host }: { host: Host | null | undefined }) {
+         Add Claude account
+       </Button>
+       {adding && (
+-        <div
+-          className="flex flex-col gap-2"
+-          onKeyDown={(event) => {
+-            if (event.key === "Enter") {
+-              event.preventDefault();
+-              event.stopPropagation();
+-              addAccount();
+-            }
+-          }}
+-        >
+-          <p className="text-xs text-muted-foreground">
+-            1. Open a terminal on a computer with Claude Code installed. Run:
+-          </p>
+-          <code className="block min-w-0 rounded bg-muted p-2 text-xs whitespace-pre-wrap [overflow-wrap:anywhere]">
+-            CLAUDE_CONFIG_DIR=~/.claude-backup claude setup-token
+-          </code>
+-          <p className="text-xs text-muted-foreground">
+-            2. In the browser, sign in with your second Claude account's email and login method. If
+-            your primary account opens, sign out there and choose the second account.
+-          </p>
+-          <p className="text-xs text-muted-foreground">
+-            3. Give this account a label, such as Personal or Backup. Paste the generated OAuth
+-            token below, not your password. Your original CLI login is preserved. When the token
+-            expires, add a fresh token under a new name.
+-          </p>
++        <div className="flex min-w-0 flex-col gap-2">
+           <Input
+             aria-label="Claude account name"
+-            placeholder="Label, e.g. Backup"
++            placeholder="Account label, e.g. Backup"
+             value={name}
+             maxLength={64}
+             onChange={(event) => setName(event.target.value)}
+           />
+-          <Input
+-            aria-label="Claude OAuth token"
+-            placeholder="OAuth token from setup-token"
+-            type="password"
+-            autoComplete="off"
+-            value={token}
+-            onChange={(event) => setToken(event.target.value)}
++          <ClaudeBrowserLogin
++            hostId={host.host_id}
++            name={name}
++            onComplete={() => {
++              setName("");
++              setToken("");
++              setAdding(false);
++              setMessage("Account saved and selected for new chats.");
++            }}
+           />
+-          <Button
+-            type="button"
+-            onClick={addAccount}
+-            size="sm"
+-            disabled={store.isPending || !name.trim() || !token.trim()}
+-          >
+-            Save account
+-          </Button>
++          <details className="min-w-0">
++            <summary className="cursor-pointer text-xs text-muted-foreground">
++              Advanced: paste an existing OAuth token
++            </summary>
++            <div className="mt-2 flex min-w-0 flex-col gap-2">
++              <p className="text-xs text-muted-foreground">
++                1. Open a terminal on a computer with Claude Code installed. Run:
++              </p>
++              <code className="block min-w-0 rounded bg-muted p-2 text-xs whitespace-pre-wrap [overflow-wrap:anywhere]">
++                CLAUDE_CONFIG_DIR=~/.claude-backup claude setup-token
++              </code>
++              <p className="text-xs text-muted-foreground">
++                2. In the browser, sign in with your second Claude account's email and login method.
++                If your primary account opens, sign out there and choose the second account.
++              </p>
++              <p className="text-xs text-muted-foreground">
++                3. Give this account a label, such as Personal or Backup. Paste the generated OAuth
++                token below, not your password. Your original CLI login is preserved. When the token
++                expires, add a fresh token under a new name.
++              </p>
++              <Input
++                aria-label="Claude OAuth token"
++                placeholder="OAuth token from setup-token"
++                type="password"
++                autoComplete="off"
++                value={token}
++                onChange={(event) => setToken(event.target.value)}
++              />
++              <Button
++                type="button"
++                onClick={addAccount}
++                size="sm"
++                disabled={store.isPending || !name.trim() || !token.trim()}
++              >
++                Save account
++              </Button>
++            </div>
++          </details>
+         </div>
+       )}
+       {message && (
+diff --git a/web/src/shell/ClaudeBrowserLogin.test.tsx b/web/src/shell/ClaudeBrowserLogin.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1daf02a3ba7220dc3872574e688c3e22313bd25f
+--- /dev/null
++++ b/web/src/shell/ClaudeBrowserLogin.test.tsx
+@@ -0,0 +1,66 @@
++import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { ClaudeBrowserLogin } from "./ClaudeBrowserLogin";
++
++const mutateAsync = vi.fn();
++vi.mock("@/hooks/useHosts", () => ({
++  useStoreCredential: () => ({ mutateAsync, isPending: false }),
++}));
++beforeEach(() => mutateAsync.mockReset());
++afterEach(() => vi.useRealTimers());
++const waiting = {
++  login_id: "id",
++  login_status: "waiting",
++  login_url: "https://claude.com/oauth/authorize?state=example",
++};
++describe("Claude browser login", () => {
++  it("starts login on the chosen host and submits only the one-time code", async () => {
++    mutateAsync.mockResolvedValue(waiting);
++    render(<ClaudeBrowserLogin hostId="host" name="Backup" onComplete={() => {}} />);
++    fireEvent.click(screen.getByText("Sign in with Claude"));
++    await screen.findByText("Open Claude sign-in");
++    expect(mutateAsync.mock.calls[0][0]).toEqual({
++      harness: "claude-native",
++      kind: "claude-login-start",
++      account_name: "Backup",
++    });
++    expect(screen.getByRole("link").getAttribute("href")).toBe(waiting.login_url);
++    fireEvent.change(screen.getByLabelText("Claude authorization code"), {
++      target: { value: "code#state" },
++    });
++    fireEvent.click(screen.getByText("Complete sign-in"));
++    await waitFor(() =>
++      expect(mutateAsync).toHaveBeenCalledWith({
++        harness: "claude-native",
++        kind: "claude-login-code",
++        account_name: "id",
++        secret: "code#state",
++      }),
++    );
++  });
++  it("never links an untrusted authorization URL", async () => {
++    mutateAsync.mockResolvedValue({
++      ...waiting,
++      login_url: "https://claude.com.evil.test/oauth/authorize",
++    });
++    render(<ClaudeBrowserLogin hostId="host" name="Backup" onComplete={() => {}} />);
++    fireEvent.click(screen.getByText("Sign in with Claude"));
++    await screen.findByText("Cancel sign-in");
++    expect(screen.queryByRole("link")).toBeNull();
++  });
++  it("polls until the host confirms the account was saved", async () => {
++    vi.useFakeTimers();
++    mutateAsync
++      .mockResolvedValueOnce(waiting)
++      .mockResolvedValueOnce({ login_id: "id", login_status: "complete" });
++    const done = vi.fn();
++    render(<ClaudeBrowserLogin hostId="host" name="Backup" onComplete={done} />);
++    await act(async () => {
++      fireEvent.click(screen.getByText("Sign in with Claude"));
++    });
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(1500);
++    });
++    expect(done).toHaveBeenCalledOnce();
++  });
++});
+diff --git a/web/src/shell/ClaudeBrowserLogin.tsx b/web/src/shell/ClaudeBrowserLogin.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..12461a6040ed2262bc39f33c70585fffe38c8b9a
+--- /dev/null
++++ b/web/src/shell/ClaudeBrowserLogin.tsx
+@@ -0,0 +1,152 @@
++import { useEffect, useRef, useState } from "react";
++import { Button } from "@/components/ui/button";
++import { Input } from "@/components/ui/input";
++import { useStoreCredential, type StoreCredentialResult } from "@/hooks/useHosts";
++
++function safeLoginUrl(value: string | null | undefined): string | null {
++  if (!value) return null;
++  try {
++    const url = new URL(value);
++    return url.protocol === "https:" &&
++      ["claude.com", "claude.ai"].includes(url.hostname) &&
++      ["/oauth/authorize", "/cai/oauth/authorize"].includes(url.pathname)
++      ? url.href
++      : null;
++  } catch {
++    return null;
++  }
++}
++
++/** Only the provider's authorization link and one-time code reach this form. */
++export function ClaudeBrowserLogin({
++  hostId,
++  name,
++  onComplete,
++}: {
++  hostId: string;
++  name: string;
++  onComplete: () => void;
++}) {
++  const store = useStoreCredential(hostId);
++  const [login, setLogin] = useState<StoreCredentialResult | null>(null);
++  const [error, setError] = useState("");
++  const [code, setCode] = useState("");
++  const completed = useRef(false);
++  const done = useRef(onComplete);
++  done.current = onComplete;
++  const active = login?.login_status === "starting" || login?.login_status === "waiting";
++  const action = async (
++    kind: "claude-login-start" | "claude-login-code" | "claude-login-cancel",
++  ) => {
++    if (store.isPending) return;
++    setError("");
++    try {
++      const result = await store.mutateAsync({
++        harness: "claude-native",
++        kind,
++        account_name: kind === "claude-login-start" ? name.trim() : (login?.login_id ?? ""),
++        ...(kind === "claude-login-code" ? { secret: code.trim() } : {}),
++      });
++      setCode("");
++      setLogin(result);
++    } catch (cause) {
++      setError(cause instanceof Error ? cause.message : "Could not start sign-in.");
++    }
++  };
++  const request = store.mutateAsync;
++  useEffect(() => {
++    if (!active || !login?.login_id) return;
++    let cancelled = false;
++    const timer = setTimeout(() => {
++      void request({
++        harness: "claude-native",
++        kind: "claude-login-poll",
++        account_name: login.login_id ?? "",
++      })
++        .then((result) => {
++          if (!cancelled) setLogin(result);
++        })
++        .catch((cause) => {
++          if (!cancelled) {
++            setError(
++              cause instanceof Error ? cause.message : "Connection lost. Start sign-in again.",
++            );
++            setLogin(null);
++          }
++        });
++    }, 1500);
++    return () => {
++      cancelled = true;
++      clearTimeout(timer);
++    };
++  }, [active, login, request]);
++  useEffect(() => {
++    if (login?.login_status === "complete" && !completed.current) {
++      completed.current = true;
++      done.current();
++    }
++  }, [login]);
++  const url = safeLoginUrl(login?.login_url);
++  return (
++    <div className="flex min-w-0 flex-col gap-2">
++      {!active && (
++        <Button
++          type="button"
++          disabled={!name.trim() || store.isPending}
++          onClick={() => void action("claude-login-start")}
++        >
++          Sign in with Claude
++        </Button>
++      )}
++      {active && (
++        <>
++          <p role="status" className="text-xs text-muted-foreground">
++            {url
++              ? "Open Claude and authorize your second subscription account. Your password stays on Claude's site."
++              : "Preparing secure sign-in on the host…"}
++          </p>
++          {url && (
++            <a className="text-sm underline" href={url} target="_blank" rel="noopener noreferrer">
++              Open Claude sign-in
++            </a>
++          )}
++          {url && (
++            <>
++              <p className="text-xs text-muted-foreground">
++                If Claude shows a one-time code, paste it here. If it opens your primary account,
++                switch to the second account before authorizing.
++              </p>
++              <Input
++                aria-label="Claude authorization code"
++                placeholder="One-time authorization code"
++                autoComplete="off"
++                value={code}
++                onChange={(e) => setCode(e.target.value)}
++              />
++              <Button
++                type="button"
++                disabled={!code.trim() || store.isPending}
++                onClick={() => void action("claude-login-code")}
++              >
++                Complete sign-in
++              </Button>
++            </>
++          )}
++          <Button
++            type="button"
++            variant="ghost"
++            disabled={store.isPending}
++            onClick={() => void action("claude-login-cancel")}
++          >
++            Cancel sign-in
++          </Button>
++        </>
++      )}
++      {(error || login?.login_error) && (
++        <p role="alert" className="text-xs text-destructive">
++          {error || login?.login_error}
++        </p>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 0f633ffa27dfc863d3e338014cf0721e9ec11be1..8fabb60dc5b7f9d8b79d78ea2913f0502c11f30e 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -4225,6 +4225,18 @@ export function NewChatLandingScreen() {
+       setDevinPermissionMode(
+         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
+       );
++      const model =
++        projectSeed(devinModelOptions) ??
++        (devinModelOptions.some((option) => option.id === stored.model) ? stored.model : "");
++      setPickedModel(model);
++      setPickedEffort(
++        codexEffortLevelsForModel(
++          devinModelOptions,
++          model || devinModelOptions.find((option) => option.isDefault)?.id,
++        ).includes(stored.effort)
++          ? stored.effort
++          : "",
++      );
+     }
+     // Reseed on harness changes, when the selected host's catalog resolves,
+     // and when the project's configured default model settles (its config
+@@ -4237,6 +4249,7 @@ export function NewChatLandingScreen() {
+     claudeModelOptions,
+     codexModelOptions,
+     piModelOptions,
++    devinModelOptions,
+     projectDefaultModel,
+   ]);
+   useEffect(() => {

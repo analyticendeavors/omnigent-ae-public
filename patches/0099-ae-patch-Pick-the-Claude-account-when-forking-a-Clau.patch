@@ -1,0 +1,1018 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:04:36 -0700
+Subject: [PATCH 099/148] [ae-patch] Pick the Claude account when forking a
+ Claude session
+
+Upstream v0.17.0 retired in-place agent switching
+(https://github.com/omnigent-ai/omnigent/pull/8795), and with it the way a
+running Claude session moved to another of the host's Claude subscription
+accounts (patch 0067). Reid asked on 2026-10-18 for that choice to live in the
+fork dialog instead. The fork request takes claude_account; the server checks
+it against the source host's detected Claude logins with the rules the switch
+route used (ae_fork_claude_account.py) and stamps omnigent.claude_native.account
+through the fork's extra labels, which the runner reads at Claude launch. The
+dialog's run-config section shows a Claude account row for a Claude native
+fork that stays on the source session's host. openapi.json is regenerated.
+---
+ .../routes/sessions/ae_fork_claude_account.py | 114 +++++++
+ .../server/routes/sessions/routes_core.py     |  15 +
+ omnigent/server/schemas.py                    |   5 +
+ openapi.json                                  |  13 +
+ .../routes/test_ae_fork_claude_account.py     | 280 ++++++++++++++++++
+ web/src/lib/sessionsApi.test.ts               |  19 ++
+ web/src/lib/sessionsApi.ts                    |   5 +
+ web/src/shell/AeForkClaudeAccount.test.tsx    | 159 ++++++++++
+ web/src/shell/AeForkClaudeAccount.tsx         | 119 ++++++++
+ web/src/shell/ForkSessionDialog.test.tsx      |  28 +-
+ web/src/shell/ForkSessionDialog.tsx           |  33 +++
+ 11 files changed, 788 insertions(+), 2 deletions(-)
+ create mode 100644 omnigent/server/routes/sessions/ae_fork_claude_account.py
+ create mode 100644 tests/server/routes/test_ae_fork_claude_account.py
+ create mode 100644 web/src/shell/AeForkClaudeAccount.test.tsx
+ create mode 100644 web/src/shell/AeForkClaudeAccount.tsx
+
+diff --git a/omnigent/server/routes/sessions/ae_fork_claude_account.py b/omnigent/server/routes/sessions/ae_fork_claude_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e5d297c94f0c6da0f30d147bfd6cc2d3e7b59b7e
+--- /dev/null
++++ b/omnigent/server/routes/sessions/ae_fork_claude_account.py
+@@ -0,0 +1,114 @@
++"""Check the Claude account a fork asks its Claude Code session to sign in with.
++
++The account rides on the forked session as ``omnigent.claude_native.account``,
++which the runner reads when it launches Claude. Moving a running session to
++another account used to go through the in-place agent switch; with that switch
++retired, the account is picked when forking. A fork binds its host after the
++fork request, so the checks run against the source session's host, the only
++host the web dialog offers the pick for. Binding the fork to another host still
++needs the caller to own that host, and a launch there fails with "The selected
++Claude account is unavailable on this host." when it lacks the account.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++from fastapi import Request
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.onboarding.claude_accounts import CLAUDE_PROVIDER_ENV_KEYS
++
++_PROVIDER_FAMILIES = frozenset({"claude-provider-env", "claude-provider-config"})
++_ACCOUNT_FAMILIES = frozenset({"claude-oauth", "claude-oauth-active"})
++
++
++def _invalid(message: str, code: ErrorCode = ErrorCode.INVALID_INPUT) -> OmnigentError:
++    return OmnigentError(message, code=code)
++
++
++async def validate_fork_claude_account(
++    request: Request,
++    *,
++    account: str,
++    agent: Any,
++    source: Any,
++    user_id: str | None,
++    host_type: str,
++) -> None:
++    """Raise unless the fork can run its Claude session under *account*.
++
++    The target must be Claude native with no provider credentials bound to the
++    agent or the session, and the source's host must be the caller's own
++    connected local host, where *account* names a detected Claude subscription
++    login (an empty string names the default CLI login).
++
++    :param request: The fork request, for the host store and registry.
++    :param account: Account name from the request, e.g. ``"Work"``.
++    :param agent: The agent the fork binds.
++    :param source: The session being forked.
++    :param user_id: The caller, or ``None`` in single-user mode.
++    :param host_type: The fork's ``host_type``; only ``"external"`` qualifies.
++    :raises OmnigentError: 400, 403 or 409 naming what rules the account out.
++    """
++    from omnigent.harness_aliases import canonicalize_harness
++    from omnigent.server.auth import RESERVED_USER_LOCAL
++    from omnigent.server.routes import sessions as sessions_facade
++    from omnigent.server.routes.hosts import _proxy_detect_credentials
++
++    if host_type != "external":
++        raise _invalid("Claude account selection requires a fork on a local connected host.")
++    loaded = await asyncio.to_thread(
++        sessions_facade.get_agent_cache().load, agent.id, agent.bundle_location
++    )
++    executor = loaded.spec.executor
++    if canonicalize_harness(executor.harness_kind) != "claude-native":
++        raise _invalid("Claude account selection requires a Claude native target.")
++    config = getattr(executor, "config", None)
++    spec_envs = (
++        getattr(loaded.spec, "env", None),
++        getattr(executor, "env", None),
++        config.get("env") if isinstance(config, dict) else None,
++    )
++    has_provider_env = any(
++        isinstance(env, dict) and any(env.get(key) for key in CLAUDE_PROVIDER_ENV_KEYS)
++        for env in spec_envs
++    )
++    if (
++        getattr(source, "inference_snapshot", None) is not None
++        or getattr(executor, "auth", None) is not None
++        or getattr(executor, "profile", None)
++        or has_provider_env
++    ):
++        raise _invalid("Claude account selection conflicts with bound provider authentication.")
++    if source.host_id is None:
++        raise _invalid("Claude account selection requires a local connected host.")
++    host_store = getattr(request.app.state, "host_store", None)
++    host = (
++        await asyncio.to_thread(host_store.get_host, source.host_id)
++        if host_store is not None
++        else None
++    )
++    if host is None or host.sandbox_provider is not None:
++        raise _invalid("Claude account selection requires a local registered host.")
++    if host.user_id != (user_id or RESERVED_USER_LOCAL):
++        raise _invalid(
++            "Claude account selection requires ownership of the session's host.",
++            ErrorCode.FORBIDDEN,
++        )
++    registry = getattr(request.app.state, "host_registry", None)
++    host_conn = registry.get(source.host_id) if registry is not None else None
++    if host_conn is None:
++        raise _invalid("Claude account selection requires a connected host.", ErrorCode.CONFLICT)
++    detected = await _proxy_detect_credentials(host_registry=registry, host_conn=host_conn)
++    credentials = detected.get("credentials", [])
++    if any(item.get("family") in _PROVIDER_FAMILIES for item in credentials):
++        raise _invalid("Claude account selection conflicts with host provider authentication.")
++    available = {
++        item.get("env_var") or ""
++        for item in credentials
++        if item.get("family") in _ACCOUNT_FAMILIES
++    }
++    if account not in available:
++        raise _invalid("Selected Claude account is unavailable on this host.")
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index a3d3044f1f84eb3bb2a3317567030cb462b8c2e0..6a9198a9ae5800b6bd87f8ad4c425fd19a310c7d 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -3515,6 +3515,21 @@ def register_core_routes(
+         if body.side_chat:
+             extra_labels[SIDE_CHAT_LABEL_KEY] = "1"
+             extra_labels[SIDE_CHAT_SOURCE_LABEL_KEY] = source_id
++        if body.claude_account is not None:
++            from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
++            from omnigent.server.routes.sessions.ae_fork_claude_account import (
++                validate_fork_claude_account,
++            )
++
++            await validate_fork_claude_account(
++                request,
++                account=body.claude_account,
++                agent=base_agent,
++                source=source,
++                user_id=user_id,
++                host_type=body.host_type,
++            )
++            extra_labels[CLAUDE_ACCOUNT_LABEL_KEY] = body.claude_account
+ 
+         # When the fork binds a NATIVE target, the native CLI won't replay
+         # the copied Omnigent transcript on its own — mark the fork so the
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 892c84e14efd8070c308299343e14d5022b2f6e3..8b140506cf1afc63a219d200e0cc903b9df5abe6 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -2620,6 +2620,10 @@ class SessionForkRequest(BaseModel):
+         explicit value overrides it and an explicit ``null`` gives the
+         fork an empty sandbox. Only valid with ``host_type: "managed"`` —
+         an external fork's directory is chosen when it binds a host.
++    :param claude_account: Claude subscription account a Claude native fork
++        signs in with on the source session's host, e.g. ``"Work"``; an
++        empty string selects the default CLI login. Omit to keep the
++        source's account.
+     """
+ 
+     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
+@@ -2636,6 +2640,7 @@ class SessionForkRequest(BaseModel):
+     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
+     # side-chat tab). It may share its parent's runner.
+     side_chat: bool = False
++    claude_account: str | None = Field(default=None, max_length=64)
+ 
+     model_config = ConfigDict(extra="forbid")
+ 
+diff --git a/openapi.json b/openapi.json
+index ca1170a261a05940c29d7e89ee2a241dfc4bd89a..acf9bc120da0efb2949cc79ae1eaaf7e2f75c2a5 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -6176,6 +6176,19 @@
+             "description": "Built-in agent to bind the fork to, switching it away from the source's agent/harness (e.g. fork a Claude session into a Codex one, or a Claude-SDK session into Claude Code). When `None`, the fork keeps the source's agent. Must be a built-in agent (one listed by `GET /v1/agents`).",
+             "title": "Agent Id"
+           },
++          "claude_account": {
++            "anyOf": [
++              {
++                "maxLength": 64,
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "Claude subscription account a Claude native fork signs in with on the source session's host, e.g. `\"Work\"`; an empty string selects the default CLI login. Omit to keep the source's account.",
++            "title": "Claude Account"
++          },
+           "codex_bypass_sandbox": {
+             "default": false,
+             "description": "Opt-in for the DANGEROUS codex-native full-bypass (`--dangerously-bypass-approvals-and-sandbox`) on the fork. The source's bypass label is ALWAYS dropped on a fork (a bypass-armed source can never silently re-arm its clone), so this is the only way a fork enables it \u2014 an explicit, banner-gated opt-in from the dialog, mirroring the new-session approval selector. `True` stamps `omnigent.codex_native.bypass_sandbox` on the fork; `False` / omitted leaves the fork in Codex's normal approval/sandbox stance. Only meaningful for a codex-native target; ignored otherwise.",
+diff --git a/tests/server/routes/test_ae_fork_claude_account.py b/tests/server/routes/test_ae_fork_claude_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3dce1b68f86aa48810d61ad5a41d0179271125cc
+--- /dev/null
++++ b/tests/server/routes/test_ae_fork_claude_account.py
+@@ -0,0 +1,280 @@
++"""The Claude account a fork can pick, checked against the source session's host."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++from fastapi.testclient import TestClient
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
++from omnigent.server.routes.sessions import ae_fork_claude_account
++from tests.server.routes.test_sessions_fork import (
++    _build_app,
++    _ConversationStore,
++    _make_conversation,
++    _make_item,
++    _StubAgentCache,
++    _switch_agent_store,
++)
++
++_SOURCE_ID = "e9f8f58523cec9a57d3bdf93be543e8c"
++_CLAUDE_TARGET = "280d725b404d2915f9e9d6cccce91303"
++_CODEX_TARGET = "44b4151dd6cdfed6ee19430832398e05"
++
++
++class _Spec:
++    def __init__(self, harness: str, *, auth: object = None, env: dict[str, str] | None = None):
++        self.env = env
++        self.executor = SimpleNamespace(harness_kind=harness, auth=auth, profile=None, config={})
++
++
++def _host_state(*, connected: bool, owner: str) -> SimpleNamespace:
++    connection = object()
++    hosts = SimpleNamespace(
++        get=lambda host: connection if connected and host == "host-local" else None
++    )
++    host_store = SimpleNamespace(
++        get_host=lambda host: SimpleNamespace(user_id=owner, sandbox_provider=None)
++    )
++    return SimpleNamespace(host_store=host_store, host_registry=hosts)
++
++
++def _request(*, connected: bool, owner: str) -> Any:
++    return SimpleNamespace(
++        app=SimpleNamespace(state=_host_state(connected=connected, owner=owner))
++    )
++
++
++@pytest.fixture
++def detected(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
++    from omnigent.server.routes import hosts
++
++    credentials = [
++        {"family": "claude-oauth", "source": "Work", "env_var": "Work"},
++        {"family": "claude-oauth", "source": "Default CLI account", "env_var": None},
++    ]
++
++    async def detect(**kwargs: Any) -> dict[str, Any]:
++        return {"credentials": credentials}
++
++    monkeypatch.setattr(hosts, "_proxy_detect_credentials", detect)
++    return credentials
++
++
++def _use_spec(monkeypatch: pytest.MonkeyPatch, spec: _Spec) -> None:
++    cache = SimpleNamespace(load=lambda agent_id, location: SimpleNamespace(spec=spec))
++    monkeypatch.setattr("omnigent.server.routes.sessions.get_agent_cache", lambda: cache)
++
++
++@pytest.mark.parametrize(
++    "account,connected,host_id,harness,owner,host_type,expected",
++    [
++        ("Work", True, "host-local", "claude-native", "local", "external", None),
++        ("", True, "host-local", "claude-native", "local", "external", None),
++        (
++            "Missing",
++            True,
++            "host-local",
++            "claude-native",
++            "local",
++            "external",
++            ErrorCode.INVALID_INPUT,
++        ),
++        ("Work", False, "host-local", "claude-native", "local", "external", ErrorCode.CONFLICT),
++        ("Work", True, None, "claude-native", "local", "external", ErrorCode.INVALID_INPUT),
++        ("Work", True, "host-local", "codex-native", "local", "external", ErrorCode.INVALID_INPUT),
++        (
++            "Work",
++            True,
++            "host-local",
++            "claude-native",
++            "another-user",
++            "external",
++            ErrorCode.FORBIDDEN,
++        ),
++        ("Work", True, "host-local", "claude-native", "local", "managed", ErrorCode.INVALID_INPUT),
++    ],
++)
++async def test_validates_the_account_against_the_source_host(
++    monkeypatch: pytest.MonkeyPatch,
++    detected: list[dict[str, Any]],
++    account: str,
++    connected: bool,
++    host_id: str | None,
++    harness: str,
++    owner: str,
++    host_type: str,
++    expected: ErrorCode | None,
++) -> None:
++    _use_spec(monkeypatch, _Spec(harness))
++    check = ae_fork_claude_account.validate_fork_claude_account(
++        _request(connected=connected, owner=owner),
++        account=account,
++        agent=SimpleNamespace(id="agent", bundle_location="bundle"),
++        source=SimpleNamespace(host_id=host_id, inference_snapshot=None),
++        user_id=None,
++        host_type=host_type,
++    )
++    if expected is None:
++        await check
++        return
++    with pytest.raises(OmnigentError) as error:
++        await check
++    assert error.value.code == expected
++
++
++@pytest.mark.parametrize("binding", ["session", "auth", "env", "host"])
++async def test_refuses_provider_credentials_before_signing_in(
++    monkeypatch: pytest.MonkeyPatch, detected: list[dict[str, Any]], binding: str
++) -> None:
++    spec = _Spec(
++        "claude-native",
++        auth=object() if binding == "auth" else None,
++        env={"ANTHROPIC_API_KEY": "sk-test"} if binding == "env" else None,
++    )
++    _use_spec(monkeypatch, spec)
++    if binding == "host":
++        detected.append({"family": "claude-provider-env", "source": "ANTHROPIC_API_KEY"})
++    with pytest.raises(OmnigentError, match="provider authentication") as error:
++        await ae_fork_claude_account.validate_fork_claude_account(
++            _request(connected=True, owner="local"),
++            account="Work",
++            agent=SimpleNamespace(id="agent", bundle_location="bundle"),
++            source=SimpleNamespace(
++                host_id="host-local",
++                inference_snapshot={"harness": "claude-native"} if binding == "session" else None,
++            ),
++            user_id=None,
++            host_type="external",
++        )
++    assert error.value.code == ErrorCode.INVALID_INPUT
++
++
++def _fork_store(
++    *, host_id: str | None = None, labels: dict[str, str] | None = None
++) -> _ConversationStore:
++    source = _make_conversation(labels=labels)
++    source.host_id = host_id
++    return _ConversationStore(
++        conversations={_SOURCE_ID: source},
++        items_by_conv={_SOURCE_ID: [_make_item("9980c8a9248139f14f4165e5d53088aa", "Hi")]},
++    )
++
++
++def _client_with_host(conv_store: _ConversationStore, *, owner: str) -> TestClient:
++    app = _build_app(conv_store, agent_store=_switch_agent_store())
++    hosts = _host_state(connected=True, owner=owner)
++    app.state.host_store = hosts.host_store
++    app.state.host_registry = hosts.host_registry
++    return TestClient(app)
++
++
++def _stub_targets(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(
++        "omnigent.server.routes.sessions.get_agent_cache",
++        lambda: _StubAgentCache(
++            {
++                "087b7cb7ac30abf4debfaa578d052ec6": "claude_sdk",
++                _CLAUDE_TARGET: "claude-native",
++                _CODEX_TARGET: "codex-native",
++            }
++        ),
++    )
++
++
++def test_fork_stamps_the_picked_account(monkeypatch: pytest.MonkeyPatch) -> None:
++    checked: list[str] = []
++
++    async def accept(request: Any, *, account: str, **kwargs: Any) -> None:
++        checked.append(account)
++
++    monkeypatch.setattr(ae_fork_claude_account, "validate_fork_claude_account", accept)
++    _stub_targets(monkeypatch)
++    conv_store = _fork_store()
++    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
++
++    resp = client.post(
++        f"/v1/sessions/{_SOURCE_ID}/fork",
++        json={"agent_id": _CLAUDE_TARGET, "claude_account": "Work"},
++    )
++
++    assert resp.status_code == 201, resp.text
++    assert checked == ["Work"]
++    assert conv_store.fork_calls[0]["extra_labels"] == {CLAUDE_ACCOUNT_LABEL_KEY: "Work"}
++
++
++def test_fork_without_a_pick_keeps_the_source_account(monkeypatch: pytest.MonkeyPatch) -> None:
++    _stub_targets(monkeypatch)
++    conv_store = _fork_store()
++    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
++
++    resp = client.post(f"/v1/sessions/{_SOURCE_ID}/fork", json={"agent_id": _CLAUDE_TARGET})
++
++    assert resp.status_code == 201, resp.text
++    assert CLAUDE_ACCOUNT_LABEL_KEY not in (conv_store.fork_calls[0]["extra_labels"] or {})
++    assert CLAUDE_ACCOUNT_LABEL_KEY not in conv_store.fork_calls[0]["dropped_label_keys"]
++
++
++def test_fork_refuses_an_account_for_a_codex_target(monkeypatch: pytest.MonkeyPatch) -> None:
++    _stub_targets(monkeypatch)
++    conv_store = _fork_store()
++    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
++
++    resp = client.post(
++        f"/v1/sessions/{_SOURCE_ID}/fork",
++        json={"agent_id": _CODEX_TARGET, "claude_account": "Work"},
++    )
++
++    assert resp.status_code == 400, resp.text
++    assert "Claude native target" in resp.text
++    assert conv_store.fork_calls == []
++
++
++def test_fork_refuses_an_account_on_a_host_the_caller_does_not_own(
++    monkeypatch: pytest.MonkeyPatch, detected: list[dict[str, Any]]
++) -> None:
++    _stub_targets(monkeypatch)
++    conv_store = _fork_store(host_id="host-local")
++    client = _client_with_host(conv_store, owner="another-user")
++
++    resp = client.post(
++        f"/v1/sessions/{_SOURCE_ID}/fork",
++        json={"agent_id": _CLAUDE_TARGET, "claude_account": "Work"},
++    )
++
++    assert resp.status_code == 403, resp.text
++    assert "ownership of the session's host" in resp.text
++    assert conv_store.fork_calls == []
++
++
++def test_fork_checks_the_switched_target_and_replaces_the_source_account(
++    monkeypatch: pytest.MonkeyPatch, detected: list[dict[str, Any]]
++) -> None:
++    # The source runs a Claude SDK agent, so only a check of the target passes.
++    _stub_targets(monkeypatch)
++    conv_store = _fork_store(host_id="host-local", labels={CLAUDE_ACCOUNT_LABEL_KEY: "Personal"})
++    client = _client_with_host(conv_store, owner="local")
++
++    resp = client.post(
++        f"/v1/sessions/{_SOURCE_ID}/fork",
++        json={"agent_id": _CLAUDE_TARGET, "claude_account": "Work"},
++    )
++
++    assert resp.status_code == 201, resp.text
++    assert resp.json()["labels"][CLAUDE_ACCOUNT_LABEL_KEY] == "Work"
++
++
++def test_fork_refuses_an_account_name_past_the_host_limit() -> None:
++    conv_store = _fork_store()
++    client = TestClient(_build_app(conv_store, agent_store=_switch_agent_store()))
++
++    resp = client.post(
++        f"/v1/sessions/{_SOURCE_ID}/fork",
++        json={"agent_id": _CLAUDE_TARGET, "claude_account": "a" * 65},
++    )
++
++    assert resp.status_code == 422, resp.text
++    assert conv_store.fork_calls == []
+diff --git a/web/src/lib/sessionsApi.test.ts b/web/src/lib/sessionsApi.test.ts
+index 7b628ac30f68417edd4dd16baeebb07f7c0eb61e..a89d4c2f5733aadfabd7d8c34a0ba5baef40b02f 100644
+--- a/web/src/lib/sessionsApi.test.ts
++++ b/web/src/lib/sessionsApi.test.ts
+@@ -476,6 +476,25 @@ describe("forkSession", () => {
+     expect(JSON.parse(init.body as string)).toEqual({});
+   });
+ 
++  it("sends a picked Claude account, the default login as an empty name", async () => {
++    const fork = () =>
++      mockJsonResponse({
++        id: "conv_fork",
++        agent_id: "agent_clone",
++        status: "idle",
++        created_at: 1704067200,
++      });
++    fetchMock.mockResolvedValueOnce(fork()).mockResolvedValueOnce(fork());
++
++    await forkSession("conv_src", { config: { claudeAccount: "Work" } });
++    await forkSession("conv_src", { config: { claudeAccount: "" } });
++
++    const bodies = fetchMock.mock.calls.map(([, init]) =>
++      JSON.parse((init as RequestInit).body as string),
++    );
++    expect(bodies).toEqual([{ claude_account: "Work" }, { claude_account: "" }]);
++  });
++
+   it("asks for a managed sandbox when a sandbox target is given", async () => {
+     fetchMock.mockResolvedValueOnce(
+       mockJsonResponse({
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index 79d7f1d5b262a6bf77d538b8b46f4c52383fbe17..d80be86d0743e2ed6275af03b0c1a7a067f7227d 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -825,6 +825,7 @@ export async function forkSession(
+       reasoningEffort?: string;
+       terminalLaunchArgs?: string[];
+       codexBypassSandbox?: boolean;
++      claudeAccount?: string;
+     };
+     sandbox?: { provider?: string | null; workspace?: string | null };
+     /** Mark the fork as a side chat (hidden from the left sidebar). */
+@@ -840,6 +841,7 @@ export async function forkSession(
+     reasoning_effort?: string;
+     terminal_launch_args?: string[];
+     codex_bypass_sandbox?: boolean;
++    claude_account?: string;
+     host_type?: "managed";
+     sandbox_provider?: string;
+     workspace?: string | null;
+@@ -871,6 +873,9 @@ export async function forkSession(
+   if (config?.codexBypassSandbox) {
+     body.codex_bypass_sandbox = true;
+   }
++  if (config?.claudeAccount !== undefined) {
++    body.claude_account = config.claudeAccount;
++  }
+   if (sandbox !== undefined) {
+     body.host_type = "managed";
+     // A provider the server didn't name is omitted so it picks its first.
+diff --git a/web/src/shell/AeForkClaudeAccount.test.tsx b/web/src/shell/AeForkClaudeAccount.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1ff9b53f175152e25bf2d5a00d9454de4b50ef25
+--- /dev/null
++++ b/web/src/shell/AeForkClaudeAccount.test.tsx
+@@ -0,0 +1,159 @@
++import { fireEvent, render, screen } from "@testing-library/react";
++import { describe, expect, it, vi } from "vitest";
++import type { DetectedCredential } from "@/hooks/useHosts";
++import { AeForkClaudeAccount, aeForkClaudeAccounts } from "./AeForkClaudeAccount";
++
++const rows = vi.hoisted(() => ({ value: [] as DetectedCredential[] }));
++vi.mock("@/hooks/useHosts", () => ({
++  useDetectedCredentials: () => ({ data: rows.value }),
++}));
++
++const WORK: DetectedCredential = { family: "claude-oauth", source: "Work", env_var: "Work" };
++const DEFAULT: DetectedCredential = {
++  family: "claude-oauth-active",
++  source: "Default CLI account",
++  env_var: null,
++};
++
++function openSelect(): void {
++  const trigger = screen.getByTestId("fork-session-config-claude-account");
++  fireEvent.pointerDown(trigger, new MouseEvent("pointerdown", { bubbles: true, button: 0 }));
++  fireEvent.click(trigger);
++}
++
++describe("aeForkClaudeAccounts", () => {
++  it("keeps only Claude subscription logins, the default login as an empty name", () => {
++    expect(
++      aeForkClaudeAccounts([
++        WORK,
++        DEFAULT,
++        {
++          family: "claude-provider-env",
++          source: "ANTHROPIC_API_KEY",
++          env_var: "ANTHROPIC_API_KEY",
++        },
++        WORK,
++      ]),
++    ).toEqual([
++      { account: "Work", label: "Work" },
++      { account: "", label: "Default CLI account" },
++    ]);
++  });
++});
++
++describe("AeForkClaudeAccount", () => {
++  it("renders nothing when the host reports no Claude logins", () => {
++    rows.value = [];
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount={undefined}
++        value={undefined}
++        onChange={() => {}}
++      />,
++    );
++    expect(screen.queryByTestId("fork-session-config-claude-account")).toBeNull();
++  });
++
++  it("keeps the source account until another login is picked", () => {
++    rows.value = [WORK, DEFAULT];
++    const onChange = vi.fn();
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount="Work"
++        value={undefined}
++        onChange={onChange}
++      />,
++    );
++    expect(screen.getByTestId("fork-session-config-claude-account")).toHaveTextContent(
++      "Same as this session (Work)",
++    );
++    openSelect();
++    fireEvent.click(screen.getByRole("option", { name: "Default CLI account" }));
++    expect(onChange).toHaveBeenLastCalledWith("");
++  });
++
++  it("reports a named login", () => {
++    rows.value = [WORK, DEFAULT];
++    const onChange = vi.fn();
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount={undefined}
++        value={undefined}
++        onChange={onChange}
++      />,
++    );
++    openSelect();
++    fireEvent.click(screen.getByRole("option", { name: "Work" }));
++    expect(onChange).toHaveBeenLastCalledWith("Work");
++  });
++
++  it("goes back to the source's account", () => {
++    rows.value = [WORK, DEFAULT];
++    const onChange = vi.fn();
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount={undefined}
++        value="Work"
++        onChange={onChange}
++      />,
++    );
++    expect(screen.getByTestId("fork-session-config-claude-account")).toHaveTextContent("Work");
++    openSelect();
++    fireEvent.click(screen.getByRole("option", { name: "Same as this session" }));
++    expect(onChange).toHaveBeenLastCalledWith(undefined);
++  });
++
++  it("hides on a host signed in with provider credentials and drops the pick", () => {
++    rows.value = [
++      WORK,
++      { family: "claude-provider-env", source: "ANTHROPIC_API_KEY", env_var: "ANTHROPIC_API_KEY" },
++    ];
++    const onChange = vi.fn();
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount={undefined}
++        value="Work"
++        onChange={onChange}
++      />,
++    );
++    expect(screen.queryByTestId("fork-session-config-claude-account")).toBeNull();
++    expect(onChange).toHaveBeenLastCalledWith(undefined);
++  });
++
++  it("drops a pick the host no longer lists", () => {
++    rows.value = [DEFAULT];
++    const onChange = vi.fn();
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount={undefined}
++        value="Work"
++        onChange={onChange}
++      />,
++    );
++    expect(screen.getByTestId("fork-session-config-claude-account")).toHaveTextContent(
++      "Same as this session",
++    );
++    expect(onChange).toHaveBeenLastCalledWith(undefined);
++  });
++
++  it("marks a source account the host no longer lists", () => {
++    rows.value = [DEFAULT];
++    render(
++      <AeForkClaudeAccount
++        hostId="h"
++        currentAccount="Work"
++        value={undefined}
++        onChange={() => {}}
++      />,
++    );
++    expect(screen.getByTestId("fork-session-config-claude-account")).toHaveTextContent(
++      "Same as this session (unavailable)",
++    );
++  });
++});
+diff --git a/web/src/shell/AeForkClaudeAccount.tsx b/web/src/shell/AeForkClaudeAccount.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..06ccd11d148e18269a67ef17498e53cba3432463
+--- /dev/null
++++ b/web/src/shell/AeForkClaudeAccount.tsx
+@@ -0,0 +1,119 @@
++// The fork dialog's Claude account row: which of the host's Claude
++// subscription logins the forked Claude Code session signs in with. Shown only
++// for a Claude native fork that stays on the source session's host, since the
++// server checks the pick against that host's detected logins.
++
++import { useEffect } from "react";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import { type DetectedCredential, useDetectedCredentials } from "@/hooks/useHosts";
++
++/** The session label the runner reads at Claude launch (server-internal). */
++export const AE_CLAUDE_ACCOUNT_LABEL = "omnigent.claude_native.account";
++
++const SAME_ACCOUNT = "__same__";
++// Radix Select items cannot carry an empty value; the default CLI login is "".
++const DEFAULT_LOGIN = "__default_login__";
++
++export interface AeForkClaudeAccountChoice {
++  /** Account name the fork request sends; "" is the default CLI login. */
++  account: string;
++  label: string;
++}
++
++/** The host's Claude subscription logins, in the order the host reports them. */
++export function aeForkClaudeAccounts(
++  rows: readonly DetectedCredential[],
++): AeForkClaudeAccountChoice[] {
++  const seen = new Set<string>();
++  const choices: AeForkClaudeAccountChoice[] = [];
++  for (const row of rows) {
++    if (!row.family.startsWith("claude-oauth")) continue;
++    const account = row.env_var ?? "";
++    if (seen.has(account)) continue;
++    seen.add(account);
++    choices.push({ account, label: row.source || (account === "" ? "Default login" : account) });
++  }
++  return choices;
++}
++
++/**
++ * @param hostId - The source session's host, whose logins are listed.
++ * @param currentAccount - The source session's account label, if any.
++ * @param value - The picked account, or `undefined` to keep the source's.
++ * @param onChange - Receives the new pick (`undefined` for "Same as this session").
++ */
++export function AeForkClaudeAccount({
++  hostId,
++  currentAccount,
++  value,
++  onChange,
++}: {
++  hostId: string;
++  currentAccount: string | undefined;
++  value: string | undefined;
++  onChange: (account: string | undefined) => void;
++}) {
++  const { data: credentials = [] } = useDetectedCredentials(hostId, true);
++  const accounts = aeForkClaudeAccounts(credentials);
++  // The server refuses any pick on a host signed in with provider credentials.
++  const providerAuth = credentials.some((row) => row.family.startsWith("claude-provider"));
++  // A pick the host stopped offering falls back to the source's account.
++  const stalePick =
++    value !== undefined && (providerAuth || !accounts.some((choice) => choice.account === value));
++  useEffect(() => {
++    if (stalePick) onChange(undefined);
++  }, [stalePick, onChange]);
++  if (accounts.length === 0 || providerAuth) return null;
++  // An unlabelled source runs on the host's account for new chats, not a named login.
++  const current =
++    currentAccount === undefined
++      ? undefined
++      : accounts.find((choice) => choice.account === currentAccount);
++  const sameLabel =
++    currentAccount === undefined
++      ? "Same as this session"
++      : `Same as this session (${current ? current.label : "unavailable"})`;
++  const selected =
++    value === undefined || stalePick ? SAME_ACCOUNT : value === "" ? DEFAULT_LOGIN : value;
++  return (
++    <div className="flex flex-col gap-1.5">
++      <span className="text-sm font-medium text-muted-foreground">Claude account</span>
++      <Select
++        value={selected}
++        onValueChange={(next) =>
++          onChange(next === SAME_ACCOUNT ? undefined : next === DEFAULT_LOGIN ? "" : next)
++        }
++        componentId="fork_session.config.claude_account"
++      >
++        <SelectTrigger
++          className="w-full cursor-pointer text-sm"
++          data-testid="fork-session-config-claude-account"
++          aria-label="Claude account"
++        >
++          <SelectValue />
++        </SelectTrigger>
++        <SelectContent
++          position="popper"
++          align="start"
++          className="[&_[data-slot=select-item]]:text-sm"
++        >
++          <SelectItem value={SAME_ACCOUNT}>{sameLabel}</SelectItem>
++          {accounts.map((choice) => (
++            <SelectItem
++              key={choice.account || DEFAULT_LOGIN}
++              value={choice.account === "" ? DEFAULT_LOGIN : choice.account}
++            >
++              {choice.label}
++            </SelectItem>
++          ))}
++        </SelectContent>
++      </Select>
++    </div>
++  );
++}
+diff --git a/web/src/shell/ForkSessionDialog.test.tsx b/web/src/shell/ForkSessionDialog.test.tsx
+index 474374d2e3317aaca5e514804ec9d429c630114b..a05a8ab7a8270c061d7e18b5bfc2bc64c67d4890 100644
+--- a/web/src/shell/ForkSessionDialog.test.tsx
++++ b/web/src/shell/ForkSessionDialog.test.tsx
+@@ -21,7 +21,7 @@ import {
+ } from "@/hooks/useAvailableAgents";
+ import { useSessionAgent } from "@/hooks/useAgents";
+ import { useSession } from "@/hooks/useSession";
+-import { useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
++import { useDetectedCredentials, useHosts, useHostModelOptions, type Host } from "@/hooks/useHosts";
+ import { useDirectorySessions } from "@/hooks/useDirectorySessions";
+ import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
+ import {
+@@ -42,7 +42,11 @@ vi.mock("@/hooks/useAvailableAgents", () => ({
+ }));
+ vi.mock("@/hooks/useAgents", () => ({ useSessionAgent: vi.fn() }));
+ vi.mock("@/hooks/useSession", () => ({ useSession: vi.fn() }));
+-vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn(), useHostModelOptions: vi.fn() }));
++vi.mock("@/hooks/useHosts", () => ({
++  useHosts: vi.fn(),
++  useHostModelOptions: vi.fn(),
++  useDetectedCredentials: vi.fn(() => ({ data: [] })),
++}));
+ vi.mock("@/hooks/useDirectorySessions", () => ({ useDirectorySessions: vi.fn() }));
+ vi.mock("@/hooks/RunnerHealthProvider", () => ({ useRunnerHealthRegistration: vi.fn() }));
+ vi.mock("@/hooks/useHostFilesystem", () => ({
+@@ -1338,6 +1342,26 @@ describe("ForkSessionDialog", () => {
+       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
+     }
+ 
++    it("drops the Claude account row once the sandbox is picked", () => {
++      // A sandbox fork keeps no host login, and the server refuses an account for one.
++      vi.mocked(useDetectedCredentials).mockReturnValue({
++        data: [{ family: "claude-oauth", source: "Work", env_var: "Work" }],
++      } as unknown as ReturnType<typeof useDetectedCredentials>);
++      useSessionMock.mockReturnValue({
++        session: { hostId: "host_1", labels: {} },
++        isLoading: false,
++        error: null,
++      } as unknown as ReturnType<typeof useSession>);
++      renderDialog({ ...CODING, info: { managed_sandboxes_enabled: true } });
++      openAgentSelect();
++      fireEvent.click(screen.getByTestId("fork-session-agent-option-ag_claude_native"));
++      expect(screen.getByTestId("fork-session-config-claude-account")).toBeInTheDocument();
++
++      selectSandbox();
++
++      expect(screen.queryByTestId("fork-session-config-claude-account")).not.toBeInTheDocument();
++    });
++
+     it("hides the sandbox option on a server that can't provision one", () => {
+       // Fails closed, mirroring the new-session picker: a server with no
+       // launch-capable sandbox config must not offer a target it will reject.
+diff --git a/web/src/shell/ForkSessionDialog.tsx b/web/src/shell/ForkSessionDialog.tsx
+index 722ffdfb7dd52afeb2edf451dcfe32dbece7cd7d..7eefe147fc24e690e9b54c7e6021a0d5f9172cbd 100644
+--- a/web/src/shell/ForkSessionDialog.tsx
++++ b/web/src/shell/ForkSessionDialog.tsx
+@@ -83,6 +83,7 @@ import { sandboxHostChoice, sandboxHostChoiceProvider } from "@/lib/hostPreferen
+ import { resolveWorkspacePath, useResolvedHostHome } from "./WorkspacePicker";
+ import { WorkspacePickerDialog } from "./WorkspacePickerDialog";
+ import { WorkspacePathField } from "./WorkspacePathField";
++import { AE_CLAUDE_ACCOUNT_LABEL, AeForkClaudeAccount } from "./AeForkClaudeAccount";
+ import {
+   ConnectHostInstructions,
+   SANDBOX_REPO_LABEL_KEY,
+@@ -196,6 +197,8 @@ export interface ForkRunConfigValue {
+    * always dropped, so a fork is never silently armed.
+    */
+   codexBypassSandbox?: boolean;
++  /** Claude login a Claude native fork signs in with ("" = default); absent keeps the source's. */
++  claudeAccount?: string;
+ }
+ 
+ /**
+@@ -232,6 +235,7 @@ export interface ForkRunConfigValue {
+  * @param selectedHostId - Host whose model catalog feeds the model picker; null
+  *   leaves it on Default until a host is chosen.
+  * @param onChange - Reports the ready-to-send value on every change.
++ * @param claudeAccountAllowed - False for a managed-sandbox fork, which keeps no host account.
+  */
+ function ForkRunConfig({
+   targetHarness,
+@@ -241,6 +245,7 @@ function ForkRunConfig({
+   sameAgentAsSource,
+   selectedHostId,
+   onChange,
++  claudeAccountAllowed = true,
+ }: {
+   targetHarness: string | null;
+   targetAgent: Pick<AvailableAgent, "name" | "harness">;
+@@ -249,6 +254,7 @@ function ForkRunConfig({
+   sameAgentAsSource: boolean;
+   selectedHostId: string | null;
+   onChange: (value: ForkRunConfigValue) => void;
++  claudeAccountAllowed?: boolean;
+ }) {
+   const hasPermission = nativeAgentHasCapability(targetAgent, "permissionMode");
+   const hasApproval = nativeAgentHasCapability(targetAgent, "approvalMode");
+@@ -259,6 +265,19 @@ function ForkRunConfig({
+   // the modelPicker capability (mirrors the new-session dialog).
+   const isCodex = targetHarness === "codex-native";
+   const showModel = hasModelPicker || isCodex;
++  // The server checks an account pick against the source's host, so offer it only there.
++  const accountHostId =
++    claudeAccountAllowed &&
++    targetHarness === "claude-native" &&
++    selectedHostId !== null &&
++    selectedHostId === sourceSession?.hostId
++      ? selectedHostId
++      : null;
++  const [claudeAccount, setClaudeAccount] = useState<string | undefined>(undefined);
++  // A hidden row drops its pick, so coming back to it starts from the source's account.
++  useEffect(() => {
++    if (accountHostId === null) setClaudeAccount(undefined);
++  }, [accountHostId]);
+ 
+   // Live model catalog for the target harness on the picked host. Only the
+   // native harnesses that expose a picker resolve a catalog; others pass a
+@@ -438,8 +457,13 @@ function ForkRunConfig({
+     } else if (hasAgySkip && touched.mode) {
+       value.terminalLaunchArgs = AGY_NATIVE_SKIP_MODES.find((m) => m.value === mode)?.args ?? [];
+     }
++    if (accountHostId !== null && claudeAccount !== undefined) {
++      value.claudeAccount = claudeAccount;
++    }
+     onChange(value);
+   }, [
++    accountHostId,
++    claudeAccount,
+     showModel,
+     hasPermission,
+     hasApproval,
+@@ -612,6 +636,14 @@ function ForkRunConfig({
+           )}
+         </>
+       )}
++      {accountHostId !== null && (
++        <AeForkClaudeAccount
++          hostId={accountHostId}
++          currentAccount={sourceSession?.labels?.[AE_CLAUDE_ACCOUNT_LABEL]}
++          value={claudeAccount}
++          onChange={setClaudeAccount}
++        />
++      )}
+     </div>
+   );
+ }
+@@ -1567,6 +1599,7 @@ function SupportedForkSessionForm({
+             sameAgentAsSource={sameAgentAsSource}
+             selectedHostId={isCodingSource ? selectedHostId : (sourceHostId ?? null)}
+             onChange={setRunConfig}
++            claudeAccountAllowed={!sandboxSelected}
+           />
+         )}
+ 

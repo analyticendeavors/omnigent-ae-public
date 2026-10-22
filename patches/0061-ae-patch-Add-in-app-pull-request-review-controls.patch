@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 18:09:42 -0700
+Subject: [PATCH 061/148] [ae-patch] Add in-app pull request review controls
+
+---
+ web/src/components/AePrCards.test.tsx | 102 +++++++++++++++++++++++++-
+ web/src/components/AePrCards.tsx      |  58 +++++++++++++++
+ web/src/lib/aePrs.ts                  |  16 ++++
+ 3 files changed, 173 insertions(+), 3 deletions(-)
+
+diff --git a/web/src/components/AePrCards.test.tsx b/web/src/components/AePrCards.test.tsx
+index dcfab5a15faa91f5341c098c152b65c01c09b2f6..2dc3f0f89a0087532bd54a090a4faf06a527c494 100644
+--- a/web/src/components/AePrCards.test.tsx
++++ b/web/src/components/AePrCards.test.tsx
+@@ -1,5 +1,5 @@
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+@@ -43,8 +43,11 @@ function serve(route: Route) {
+   );
+ }
+ 
+-function renderCards(prs: { url: string }[], sessionId = "s1") {
+-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++function renderCards(
++  prs: { url: string }[],
++  sessionId = "s1",
++  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
++) {
+   return render(
+     <QueryClientProvider client={qc}>
+       <AePrCards sessionId={sessionId} prs={prs} />
+@@ -603,3 +606,96 @@ describe("AePrCards", () => {
+     expect(screen.queryAllByTestId("ae-pr-card")).toHaveLength(0);
+   });
+ });
++
++describe("in-app review", () => {
++  it.each(["success", "stale head"])(
++    "keeps the %s card when an older GET finishes afterward",
++    async (outcome) => {
++      const key = ["ae-pr", REPO, 5];
++      const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++      const draft = card(5, {
++        draft: true,
++        merge: { ...card(5).merge, allowed: false, reason: "Draft" },
++      });
++      const fresh = card(5, { head_sha: outcome === "success" ? SHA : "f".repeat(40) });
++      let getCount = 0;
++      let finishOldGet: ((response: Response) => void) | undefined;
++      const oldGet = new Promise<Response>((resolve) => {
++        finishOldGet = resolve;
++      });
++      serve((path) => {
++        if (path.endsWith("/ready")) {
++          return outcome === "success"
++            ? json(fresh)
++            : json(
++                { error: { code: "merge_head_moved", message: "Head moved", card: fresh } },
++                409,
++              );
++        }
++        if (path.endsWith("/5")) return ++getCount === 1 ? json(draft) : oldGet;
++        throw new Error(`Unexpected request ${path}`);
++      });
++      renderCards([{ url: url(5) }], "s1", qc);
++      await screen.findByRole("button", { name: "Mark ready for review" });
++      void qc.invalidateQueries({ queryKey: key, exact: true });
++      await waitFor(() => expect(getCount).toBe(2));
++      fireEvent.click(screen.getByRole("button", { name: "Mark ready for review" }));
++      await waitFor(() => expect(qc.getQueryData(key)).toEqual(fresh));
++      await act(async () => {
++        finishOldGet?.(new Response(JSON.stringify(draft)));
++        await oldGet;
++      });
++      expect(qc.getQueryData(key)).toEqual(fresh);
++      expect(screen.queryByRole("button", { name: "Mark ready for review" })).toBeNull();
++    },
++  );
++
++  it("shows the description and marks a draft ready without merging", async () => {
++    const draft = card(5, {
++      draft: true,
++      body: "Change summary\nValidation: tests passed",
++      changed_files: 2,
++      additions: 10,
++      deletions: 3,
++      merge: { methods: ["squash"], default_method: "squash", allowed: false, reason: "Draft" },
++    });
++    let request: RequestInit | undefined;
++    serve((path, init) => {
++      if (path.endsWith("/ready")) {
++        request = init;
++        return json(card(5));
++      }
++      if (path.endsWith("/5")) return json(draft);
++      throw new Error(`Unexpected request ${path}`);
++    });
++    renderCards([{ url: url(5) }]);
++    await screen.findByText("Review details");
++    fireEvent.click(screen.getByText("Review details"));
++    expect(screen.getByText(/Validation: tests passed/)).toBeTruthy();
++    expect(screen.getByText(/2 files/)).toBeTruthy();
++    fireEvent.click(screen.getByRole("button", { name: "Mark ready for review" }));
++    await waitFor(() => expect(request?.method).toBe("POST"));
++    expect(JSON.parse(request?.body as string)).toEqual({ sha: SHA });
++    await waitFor(() =>
++      expect(screen.queryByRole("button", { name: "Mark ready for review" })).toBeNull(),
++    );
++    expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
++  });
++
++  it("keeps a draft unchanged and shows a failed ready request", async () => {
++    serve((path) =>
++      path.endsWith("/ready")
++        ? json(
++            { error: { code: "head_changed", message: "The branch changed. Review it again." } },
++            409,
++          )
++        : json(card(5, { draft: true })),
++    );
++    renderCards([{ url: url(5) }]);
++    await screen.findByText("Review details");
++    fireEvent.click(screen.getByText("Review details"));
++    fireEvent.click(screen.getByRole("button", { name: "Mark ready for review" }));
++    expect(await screen.findByRole("alert")).toHaveTextContent("The branch changed");
++    expect(screen.getByRole("button", { name: "Mark ready for review" })).toBeEnabled();
++  });
++});
+diff --git a/web/src/components/AePrCards.tsx b/web/src/components/AePrCards.tsx
+index 8f6343d1caabe21bff766c0c0981571526de9342..007953ba5831cc6defd171a6c303197fe32ff141 100644
+--- a/web/src/components/AePrCards.tsx
++++ b/web/src/components/AePrCards.tsx
+@@ -77,6 +77,7 @@ import {
+   AePrError,
+   fetchAePrCard,
+   mergeAePr,
++  markAePrReady,
+   parseAePrUrl,
+ } from "@/lib/aePrs";
+ import { cn } from "@/lib/utils";
+@@ -424,6 +425,62 @@ function ConfirmMerge({
+   );
+ }
+ 
++function ReviewDetails({ card }: { card: AePrCard }) {
++  const queryClient = useQueryClient();
++  const queryKey = ["ae-pr", card.repo, card.number] as const;
++  const ready = useMutation({
++    mutationFn: () => markAePrReady(card),
++    onSuccess: async (fresh) => {
++      await queryClient.cancelQueries({ queryKey, exact: true });
++      queryClient.setQueryData(queryKey, fresh);
++    },
++    onError: async (error) => {
++      if (error instanceof AePrError && error.card) {
++        await queryClient.cancelQueries({ queryKey, exact: true });
++        queryClient.setQueryData(queryKey, error.card);
++      }
++    },
++  });
++  return (
++    <details className="min-w-0 text-sm" data-testid="ae-pr-review-details">
++      <summary className="cursor-pointer py-1">Review details</summary>
++      <div className="flex min-w-0 flex-col gap-2 py-2">
++        <p className="text-muted-foreground">
++          {card.head_ref} → {card.base_ref}
++          {card.changed_files !== undefined && ` · ${card.changed_files} files`}
++          {card.additions !== undefined && ` · +${card.additions}`}
++          {card.deletions !== undefined && ` · −${card.deletions}`}
++        </p>
++        <p className="max-h-72 overflow-y-auto whitespace-pre-wrap wrap-anywhere">
++          {card.body || "No description provided."}
++        </p>
++        <p className="text-muted-foreground">
++          {aeCiText(card.ci)} · {AE_REVIEW_TEXT[card.review.state]}
++        </p>
++        {card.state === "open" && card.draft && (
++          <>
++            <p className="text-muted-foreground">
++              Marking ready opens this change for review. It does not merge it.
++            </p>
++            <Button
++              className={cn(TOUCH, "self-start")}
++              disabled={ready.isPending || !card.head_sha}
++              onClick={() => ready.mutate()}
++            >
++              {ready.isPending ? "Marking ready…" : "Mark ready for review"}
++            </Button>
++          </>
++        )}
++        {ready.isError && (
++          <p role="alert" className="text-destructive">
++            {ready.error.message}
++          </p>
++        )}
++      </div>
++    </details>
++  );
++}
++
+ /**
+  * One pull request's card. `panel` is the GitHub panel's full card; `inline`
+  * is the compact one under a chat message, which stays silent on an error or
+@@ -589,6 +646,7 @@ export function AePrCardView({
+                 </>
+               )}
+             </div>
++            <ReviewDetails card={card} />
+             {!result && confirming && (
+               <ConfirmMerge
+                 card={card}
+diff --git a/web/src/lib/aePrs.ts b/web/src/lib/aePrs.ts
+index d6fe302168878bd19dd3e00b5c893ce55d7f2843..3953117c894d6add1fe620b3ff4f1c3d17033fdb 100644
+--- a/web/src/lib/aePrs.ts
++++ b/web/src/lib/aePrs.ts
+@@ -26,6 +26,10 @@ export interface AePrCard {
+   number: number;
+   url: string;
+   title: string;
++  body?: string;
++  additions?: number;
++  deletions?: number;
++  changed_files?: number;
+   state: "open" | "merged" | "closed";
+   draft: boolean;
+   author: string | null;
+@@ -116,6 +120,18 @@ export async function fetchAePrCard(
+   return body as AePrCard;
+ }
+ 
++/** Mark the displayed revision ready without merging it. */
++export async function markAePrReady(card: AePrCard): Promise<AePrCard> {
++  const res = await authenticatedFetch(`/v1/ae/prs/${card.repo}/${card.number}/ready`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ sha: card.head_sha }),
++  });
++  const body = await readJson(res);
++  if (!res.ok) throw new AePrError(res.status, body);
++  return body as AePrCard;
++}
++
+ /** Merge pinned to the head SHA the card showed; a refusal carries the fresh card. */
+ export async function mergeAePr(
+   card: Pick<AePrCard, "repo" | "number" | "head_sha">,

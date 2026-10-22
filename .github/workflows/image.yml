@@ -1,0 +1,183 @@
+# ============================================================
+# omnigent-ae image publishing (Phase 6, 2026-09-23)
+#
+# On a tag push `ae-vX.Y.Z.N`: build the two-stage image exactly as ci.yml's
+# `image` job does (stage 1 upstream's Dockerfile on the patched submodule,
+# stage 2 deploy/Dockerfile), run the same smoke checks, then push
+# ghcr.io/analyticendeavors/omnigent-ae:<tag> with the workflow's own
+# GITHUB_TOKEN (packages: write). The box pulls that tag by name
+# (config/server.env, OMNIGENT_IMAGE_TAG; deploy/README.md "Upgrade").
+#
+# workflow_dispatch is the dry run: build and smoke, no push, on whatever ref
+# is chosen; the image is tagged dry-run-<sha>. Its `push` input publishes
+# only when the chosen ref is an `ae-v*` tag, so a branch build can never
+# land in the registry under a name the box would pull.
+#
+# release.yml (2026-09-24) creates the ae-v* tag after green CI on main and
+# then dispatches this workflow on it with push on: a tag pushed with
+# GITHUB_TOKEN does not fire the tag trigger above, so that dispatch is how an
+# automatic release publishes. A tag pushed by hand still fires it directly.
+#
+# The first push creates the GHCR package private. The box then needs
+# `docker login ghcr.io` with a read:packages token before its first pull
+# (README, Secrets). AE's package is never made public: its older tags were
+# built before the identifier scrub (deploy/README.md, step 5).
+#
+# The login and the push run only in analyticendeavors/omnigent-ae (2026-10-21,
+# before the public repo): a fork or the public copy builds and smokes the
+# image but never tries to push to AE's package. A fork that publishes its own
+# package changes IMAGE and the repository condition on those two steps.
+# ============================================================
+
+name: Image
+
+on:
+  push:
+    tags: ["ae-v*"]
+  workflow_dispatch:
+    inputs:
+      push:
+        description: "Push to GHCR (only honoured when the ref is an ae-v* tag); off is a dry run"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+# One build per ref; a second push of the same tag waits rather than racing
+# the first push to the registry.
+concurrency:
+  group: image-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/analyticendeavors/omnigent-ae
+
+jobs:
+  image:
+    name: Build, smoke and publish the two-stage image
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout with the upstream submodule
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      - name: Read upstream.lock into the job environment
+        run: |
+          set -euo pipefail
+          grep -E '^UPSTREAM_TAG=' upstream.lock >> "$GITHUB_ENV"
+
+      # The ref and the input are read once, here, into env; every later step
+      # works from IMAGE_TAG and PUSH and carries no expression in its body.
+      - name: Decide the image tag and whether to push
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          EVENT: ${{ github.event_name }}
+          PUSH_INPUT: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          push=false
+          case "$REF_TYPE:$REF_NAME" in
+            tag:ae-v*)
+              tag="$REF_NAME"
+              if [ "$EVENT" = "push" ] || [ "$PUSH_INPUT" = "true" ]; then
+                push=true
+              fi
+              ;;
+            *)
+              tag="dry-run-${SHA:0:12}"
+              if [ "$PUSH_INPUT" = "true" ]; then
+                echo "::warning::push was requested but the ref ($REF_TYPE $REF_NAME) is not an ae-v* tag; building without pushing. Tag a commit ae-vX.Y.Z.N to publish."
+              fi
+              ;;
+          esac
+          echo "IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+          echo "PUSH=$push" >> "$GITHUB_ENV"
+          echo "image: $IMAGE:$tag (push=$push)"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      # Same two steps as ci.yml's image job: stage 1 through buildx for the
+      # layer cache, loaded into the daemon so stage 2 can FROM it.
+      - name: Build stage 1 (upstream server image from the patched tree)
+        uses: docker/build-push-action@v7
+        with:
+          context: upstream
+          file: upstream/deploy/docker/Dockerfile
+          push: false
+          load: true
+          tags: omnigent-ae-base:release
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Build stage 2 (AE layer)
+        run: |
+          set -euo pipefail
+          docker build -f deploy/Dockerfile --build-arg BASE=omnigent-ae-base:release -t "$IMAGE:$IMAGE_TAG" .
+
+      - name: Image runs the pinned version, lists the Parking Lot extension and imports the AE packages
+        run: |
+          set -euo pipefail
+          ref="$IMAGE:$IMAGE_TAG"
+          want="omnigent ${UPSTREAM_TAG#v}"
+          got="$(docker run --rm "$ref" omni --version)"
+          echo "omni --version: $got"
+          case "$got" in
+            "$want"*) ;;
+            *)
+              echo "::error::expected '$want', got '$got'. The image is not built from the pinned tag; check upstream.lock and the submodule pointer."
+              exit 1
+              ;;
+          esac
+          ext="$(docker run --rm "$ref" omni extensions list)"
+          echo "omni extensions list: $ext"
+          case "$ext" in
+            *analyticendeavors.parking-lot*) ;;
+            *)
+              echo "::error::expected the Parking Lot extension in the catalog, got: $ext. Check that deploy/Dockerfile installs packages/ae_omni_extension and that its manifest is accepted."
+              exit 1
+              ;;
+          esac
+          docker run --rm "$ref" omni extensions doctor analyticendeavors.parking-lot
+          docker run --rm "$ref" python -c "import ae_omni_policies, ae_omni_extension, ae_omni_policies.mcp; print('ae_omni_policies', ae_omni_policies.__version__, 'ae_omni_extension', ae_omni_extension.__version__)"
+          docker run --rm "$ref" test -f /opt/ae/agents/steward/agent.yaml
+          docker run --rm "$ref" test -f /opt/ae/agents/shutdown/agent.yaml
+          docker run --rm "$ref" test -f /opt/ae/agents/orchestrator/agent.yaml
+
+      - name: Log in to GHCR
+        if: env.PUSH == 'true' && github.repository == 'analyticendeavors/omnigent-ae'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push the tag
+        if: env.PUSH == 'true' && github.repository == 'analyticendeavors/omnigent-ae'
+        run: |
+          set -euo pipefail
+          docker push "$IMAGE:$IMAGE_TAG"
+          echo "pushed $IMAGE:$IMAGE_TAG"
+          {
+            echo "## Published"
+            echo
+            echo '```'
+            echo "$IMAGE:$IMAGE_TAG"
+            echo '```'
+            echo
+            echo "On the box: set OMNIGENT_IMAGE_TAG=$IMAGE_TAG in config/server.env, then deploy/compose.sh pull && deploy/compose.sh up -d (deploy/README.md, Upgrade)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Dry run, not pushed
+        if: env.PUSH != 'true' || github.repository != 'analyticendeavors/omnigent-ae'
+        run: |
+          set -euo pipefail
+          echo "built and smoked $IMAGE:$IMAGE_TAG; nothing pushed (dry run)."
+          echo "Dry run: built and smoked \`$IMAGE:$IMAGE_TAG\`, nothing pushed." >> "$GITHUB_STEP_SUMMARY"

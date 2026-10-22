@@ -1,0 +1,377 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 22:37:11 -0700
+Subject: [PATCH 018/148] [ae-patch] Color the context ring near a full window
+ and label the prompt cache bar
+
+Reid asked on 2026-09-24 for two things in the composer's usage cues:
+
+- The context ring should change color as the session nears the end of
+  its context window, the way Claude Code desktop does. Upstream draws
+  ComposerContextRing grayscale on purpose. The new
+  web/src/lib/aeContextTone.ts holds the steps: normal below 60%,
+  warning from 60%, critical from 80%, decided on the rounded
+  percentage the tooltip prints. They are earlier than the plan limit
+  bars (limitTone, 70 and 90) because a context fills inside one
+  session and the harness compacts before 100%, while a plan limit only
+  stops work at 100%; limitTone's comment already described the ring's
+  steps as the earlier ones. Only the used arc takes the tone, through
+  the theme's text-warning and text-destructive tokens, which exist in
+  light and dark mode; the button and the track stay muted. The ring
+  has no visible percentage label in v0.15.0 (its tests keep text out
+  of the bar), so there is no label to color.
+- The thin bar under the popover's Context window row (three greys for
+  cached, cache write and new input) read as a second meter. Each part
+  now has its own chart color (chart-1 blue, chart-3 green, chart-5
+  grey, never the warning or destructive colors the bars above use for
+  "nearly full"), the legend keeps its dots, and a caption above the
+  bar says what it is: "How those tokens were billed (prompt cache)".
+  A /context-style breakdown (system prompt, tools, messages) is not
+  possible from this data; the status line carries only these counts.
+
+The popover's Context window bar uses contextTone too, so the ring and
+the bar always agree.
+
+Upstream files touched: ComposerContextRing.tsx (the import, one class
+on the used arc, two doc comment lines) and ComposerContextRing.test.tsx
+(the name and comment of the high-usage test, which still passes: the
+button stays muted). Tests: src/lib/aeContextTone.test.tsx (the steps,
+and the real ring at 50, 65 and 85 percent) and two cases in
+AePlanLimits.test.tsx.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ web/src/components/AePlanLimits.test.tsx      | 30 ++++++++
+ web/src/components/AePlanLimits.tsx           | 36 +++++++--
+ .../composer/ComposerContextRing.test.tsx     |  6 +-
+ .../composer/ComposerContextRing.tsx          |  6 +-
+ web/src/lib/aeContextTone.test.tsx            | 75 +++++++++++++++++++
+ web/src/lib/aeContextTone.ts                  | 46 ++++++++++++
+ 6 files changed, 186 insertions(+), 13 deletions(-)
+ create mode 100644 web/src/lib/aeContextTone.test.tsx
+ create mode 100644 web/src/lib/aeContextTone.ts
+
+diff --git a/web/src/components/AePlanLimits.test.tsx b/web/src/components/AePlanLimits.test.tsx
+index 4caaf98b62dabdd96311ce1c86168f0170acd8e7..70163821dbe412244ad7833d7129cb6e259b1542 100644
+--- a/web/src/components/AePlanLimits.test.tsx
++++ b/web/src/components/AePlanLimits.test.tsx
+@@ -203,6 +203,36 @@ describe("AePlanLimitsPanel", () => {
+     expect(screen.queryByTestId("ae-limits-hint")).toBeNull();
+   });
+ 
++  it("tones the context bar with the ring's steps, not the plan limit steps", () => {
++    const contextBar = (tokensUsed: number) => {
++      cleanup();
++      render(<AePlanLimitsPanel now={NOW} contextWindow={1_000_000} tokensUsed={tokensUsed} />);
++      const bar = within(screen.getByTestId("ae-limits-context")).getByRole("progressbar");
++      return (bar.firstChild as HTMLElement).className;
++    };
++    expect(contextBar(500_000)).toContain("bg-foreground/60");
++    // 65% is still grey on a plan limit bar (limitTone warns from 70).
++    expect(contextBar(650_000)).toContain("bg-warning");
++    expect(contextBar(850_000)).toContain("bg-destructive");
++  });
++
++  it("captions the prompt cache bar and gives each part its own colour", () => {
++    render(<AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_a" />);
++    const breakdown = screen.getByTestId("ae-context-breakdown");
++    const caption = within(breakdown).getByTestId("ae-context-breakdown-caption");
++    expect(caption.textContent).toBe("How those tokens were billed (prompt cache)");
++    // The caption sits above the thin bar, so it is read before the bar.
++    expect(breakdown.firstElementChild).toBe(caption);
++    const dots = Array.from(breakdown.querySelectorAll("span.rounded-full"));
++    expect(dots.map((dot) => dot.className.match(/bg-\S+/)?.[0])).toEqual([
++      "bg-chart-1",
++      "bg-chart-3",
++      "bg-chart-5",
++    ]);
++    // Never the colours the bars use for "nearly full".
++    expect(breakdown.innerHTML).not.toMatch(/bg-(warning|destructive)/);
++  });
++
+   it("shows another session's breakdown only for that session", () => {
+     render(<AePlanLimitsPanel data={FULL} now={NOW} conversationId="conv_other" />);
+     expect(screen.queryByTestId("ae-context-breakdown")).toBeNull();
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index 40e2b01fa385ab5ad7721578bffeeb20e162d3aa..98fb689caf19dadc271ab744f20db1ab5de0717f 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -11,6 +11,7 @@
+ 
+ import { type ReactNode, useEffect, useMemo, useState } from "react";
+ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
++import { type AeTone, contextTone } from "@/lib/aeContextTone";
+ import { authenticatedFetch } from "@/lib/identity";
+ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
+@@ -133,8 +134,11 @@ export function formatMoney(minor: number, currency: string): string {
+   return format.format(minor / 10 ** digits);
+ }
+ 
+-/** Bar colour: the ring's own thresholds, a little later because a limit is not a context. */
+-export function limitTone(pct: number): "normal" | "warning" | "critical" {
++/**
++ * Bar colour: the ring's own steps (`contextTone`, 60 and 80), a little later
++ * because a limit is not a context.
++ */
++export function limitTone(pct: number): AeTone {
+   if (pct >= 90) return "critical";
+   if (pct >= 70) return "warning";
+   return "normal";
+@@ -146,7 +150,7 @@ export async function fetchAeLimits(): Promise<AeLimitsAnswer> {
+   return (await res.json()) as AeLimitsAnswer;
+ }
+ 
+-const TONE_BAR: Record<ReturnType<typeof limitTone>, string> = {
++const TONE_BAR: Record<AeTone, string> = {
+   normal: "bg-foreground/60",
+   warning: "bg-warning",
+   critical: "bg-destructive",
+@@ -160,6 +164,7 @@ function UsageRow({
+   pct,
+   detail,
+   muted = false,
++  tone = limitTone(pct),
+   children,
+ }: {
+   id: string;
+@@ -168,10 +173,11 @@ function UsageRow({
+   pct: number;
+   detail?: string | null;
+   muted?: boolean;
++  /** Defaults to the plan limit steps; the context row passes `contextTone`. */
++  tone?: AeTone;
+   children?: ReactNode;
+ }) {
+   const rounded = Math.round(pct);
+-  const tone = limitTone(pct);
+   return (
+     <li className="flex flex-col gap-1" data-testid="ae-limit-window" data-window={id}>
+       <div className="flex items-baseline justify-between gap-2">
+@@ -249,13 +255,23 @@ function CreditsRow({ credits, now }: { credits: AeCredits; now: number }) {
+   );
+ }
+ 
+-/** The thin per-kind bar under the context row: cache read, cache write, new input. */
++/**
++ * The thin bar under the context row: how the used tokens were sent on the
++ * session's last request (read from the prompt cache, written to it, or new).
++ * Three greys read as a second meter (Reid, 2026-09-24), so since P18 each part
++ * has its own chart colour (blue, green, grey; never the warning or destructive
++ * colours the bars above use for "nearly full") and a caption says what it is.
++ * It is not a /context-style breakdown by system prompt, tools and messages:
++ * the status line the relay reads carries only these three counts.
++ */
+ const CONTEXT_PARTS = [
+-  { key: "cache_read_tokens", label: "Cached", className: "bg-foreground/60" },
+-  { key: "cache_write_tokens", label: "Cache write", className: "bg-foreground/40" },
+-  { key: "input_tokens", label: "New input", className: "bg-foreground/25" },
++  { key: "cache_read_tokens", label: "Cached", className: "bg-chart-1" },
++  { key: "cache_write_tokens", label: "Cache write", className: "bg-chart-3" },
++  { key: "input_tokens", label: "New input", className: "bg-chart-5" },
+ ] as const;
+ 
++const CONTEXT_BREAKDOWN_CAPTION = "How those tokens were billed (prompt cache)";
++
+ function ContextBreakdown({ context, now }: { context: AeSessionContext; now: number }) {
+   const parts = CONTEXT_PARTS.filter((part) => context[part.key] > 0);
+   if (parts.length === 0) return null;
+@@ -265,6 +281,9 @@ function ContextBreakdown({ context, now }: { context: AeSessionContext; now: nu
+       data-testid="ae-context-breakdown"
+       title={`From the session's status line, ${formatAgo(context.observed_at, now)}`}
+     >
++      <span className="text-xs text-muted-foreground" data-testid="ae-context-breakdown-caption">
++        {CONTEXT_BREAKDOWN_CAPTION}
++      </span>
+       <div className="flex h-1 w-full overflow-hidden rounded-full bg-foreground/10">
+         {parts.map((part) => (
+           <div
+@@ -310,6 +329,7 @@ function ContextRow({
+         label="Context window"
+         value={`${formatTokens(used)} / ${formatTokens(size)} · ${Math.round(pct)}%`}
+         pct={pct}
++        tone={contextTone(pct)}
+       >
+         {context && <ContextBreakdown context={context} now={now} />}
+       </UsageRow>
+diff --git a/web/src/components/composer/ComposerContextRing.test.tsx b/web/src/components/composer/ComposerContextRing.test.tsx
+index 0fd339dcbd224ef97ac3f496aa29172565b28a95..808d3f52d729ac744cd3efba3f89e98a27fdfa66 100644
+--- a/web/src/components/composer/ComposerContextRing.test.tsx
++++ b/web/src/components/composer/ComposerContextRing.test.tsx
+@@ -59,9 +59,9 @@ describe("ComposerContextRing", () => {
+     expect(screen.getByTestId("composer-context-ring")).not.toHaveTextContent("100%");
+   });
+ 
+-  it("stays grayscale — never warning/destructive — even at high usage", () => {
+-    // WHY: the bar is ambient status, not an alarm (#7024). A near-full
+-    // context must not paint the old warning/destructive colors.
++  it("keeps the button grayscale at high usage (omnigent-ae P18 tones only the arc)", () => {
++    // WHY: the bar is ambient status, not an alarm (#7024). The AE build colors
++    // the used arc near full (src/lib/aeContextTone.test.tsx); the button stays muted.
+     renderRing(1000, 950);
+     const ring = screen.getByTestId("composer-context-ring");
+     expect(ring).toHaveClass("text-muted-foreground");
+diff --git a/web/src/components/composer/ComposerContextRing.tsx b/web/src/components/composer/ComposerContextRing.tsx
+index 4034f1dcf3380b1c00007c31df665113f87d186a..b8d4b20a4911520514b4f36d3a24ef6e797ece88 100644
+--- a/web/src/components/composer/ComposerContextRing.tsx
++++ b/web/src/components/composer/ComposerContextRing.tsx
+@@ -1,6 +1,7 @@
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+ import { formatTokenCount } from "@/lib/formatCost";
+ import { cn } from "@/lib/utils";
++import { aeContextRingClass } from "@/lib/aeContextTone";
+ 
+ /** Circumference of the progress ring (r=5.5). */
+ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
+@@ -8,8 +9,8 @@ const RING_CIRCUMFERENCE = 2 * Math.PI * 5.5;
+ /**
+  * Compact context-usage ring for the composer workspace bar.
+  *
+- * Grayscale by design — a near-full context window is a neutral fact, not an
+- * error, so the ring never escalates to warning/destructive colors. Self-nulls
++ * Upstream keeps it grayscale; the omnigent-ae build (P18) colors the used arc
++ * warning, then destructive, near full, as Claude Code desktop does. Self-nulls
+  * when there is nothing to show, so the landing/pre-session window (no context
+  * figures) renders nothing.
+  *
+@@ -56,6 +57,7 @@ export function ComposerContextRing({
+                 cx="8"
+                 cy="8"
+                 r="5.5"
++                className={aeContextRingClass(usedPct)}
+                 stroke="currentColor"
+                 strokeWidth="2"
+                 strokeLinecap="round"
+diff --git a/web/src/lib/aeContextTone.test.tsx b/web/src/lib/aeContextTone.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b8e4598076690eb03a0c3bc2862bb4e3247b4f48
+--- /dev/null
++++ b/web/src/lib/aeContextTone.test.tsx
+@@ -0,0 +1,75 @@
++import { cleanup, render, screen } from "@testing-library/react";
++import { afterEach, describe, expect, it } from "vitest";
++
++import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import {
++  AE_CONTEXT_CRITICAL_PCT,
++  AE_CONTEXT_WARNING_PCT,
++  aeContextRingClass,
++  contextTone,
++} from "./aeContextTone";
++
++afterEach(cleanup);
++
++/** The used arc: the second circle, the one with a dash array. */
++function usedArc(tokensUsed: number) {
++  render(
++    <TooltipProvider>
++      <ComposerContextRing contextWindow={1000} tokensUsed={tokensUsed} />
++    </TooltipProvider>,
++  );
++  const ring = screen.getByTestId("composer-context-ring");
++  const arc = ring.querySelector("circle[stroke-dasharray]");
++  if (!arc) throw new Error("the ring drew no used arc");
++  return { ring, arc };
++}
++
++describe("contextTone", () => {
++  it("warns from 60% and turns critical from 80%", () => {
++    expect(AE_CONTEXT_WARNING_PCT).toBe(60);
++    expect(AE_CONTEXT_CRITICAL_PCT).toBe(80);
++    expect(contextTone(0)).toBe("normal");
++    expect(contextTone(59)).toBe("normal");
++    expect(contextTone(60)).toBe("warning");
++    expect(contextTone(79)).toBe("warning");
++    expect(contextTone(80)).toBe("critical");
++    expect(contextTone(100)).toBe("critical");
++    expect(contextTone(140)).toBe("critical");
++  });
++
++  it("decides on the rounded percentage the ring and the popover print", () => {
++    expect(contextTone(59.4)).toBe("normal");
++    expect(contextTone(59.6)).toBe("warning");
++    expect(contextTone(79.6)).toBe("critical");
++  });
++
++  it("maps tones to the theme's warning and destructive text colours", () => {
++    expect(aeContextRingClass(50)).toBeUndefined();
++    expect(aeContextRingClass(65)).toBe("text-warning");
++    expect(aeContextRingClass(85)).toBe("text-destructive");
++  });
++});
++
++describe("ComposerContextRing with the AE tone", () => {
++  it("leaves the arc grey at 50%", () => {
++    const { ring, arc } = usedArc(500);
++    expect(arc.getAttribute("class")).toBeNull();
++    expect(ring).toHaveClass("text-muted-foreground");
++  });
++
++  it("colours the arc with the warning token at 65%", () => {
++    const { ring, arc } = usedArc(650);
++    expect(arc).toHaveClass("text-warning");
++    expect(arc).toHaveAttribute("stroke", "currentColor");
++    // The track and the button stay muted; only the arc carries the tone.
++    expect(ring).toHaveClass("text-muted-foreground");
++    expect(screen.getByLabelText("65% of context used")).toBeInTheDocument();
++  });
++
++  it("colours the arc with the destructive token at 85%", () => {
++    const { arc } = usedArc(850);
++    expect(arc).toHaveClass("text-destructive");
++    expect(arc).not.toHaveClass("text-warning");
++  });
++});
+diff --git a/web/src/lib/aeContextTone.ts b/web/src/lib/aeContextTone.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9bc9cd72b69bb50579a0be668c43326547cf296b
+--- /dev/null
++++ b/web/src/lib/aeContextTone.ts
+@@ -0,0 +1,46 @@
++// The context ring's colour as the context window fills. Upstream draws
++// `ComposerContextRing` in grayscale on purpose (a near-full context is a
++// neutral fact, not an error). Reid asked on 2026-09-24 for the cue Claude Code
++// desktop gives instead: the ring turns a warning colour as the window
++// approaches full, so a compaction or a fresh session is not a surprise.
++// omnigent-ae patch P18; the plan limits popover (P6, P9) tones its Context
++// window bar with the same function so the ring and the bar always agree.
++
++/** Same three steps as the popover's `limitTone`, so one colour map serves both. */
++export type AeTone = "normal" | "warning" | "critical";
++
++/** Warning from this percentage of the context window used. */
++export const AE_CONTEXT_WARNING_PCT = 60;
++/** Critical from this percentage. */
++export const AE_CONTEXT_CRITICAL_PCT = 80;
++
++/**
++ * Tone for a context window `pct` (0 to 100) used.
++ *
++ * Earlier than the plan limit bars (70 and 90, `limitTone`): a context fills
++ * inside one session and the harness compacts before 100%, while a plan limit
++ * only stops work at 100%. Decided on the rounded percentage, the number the
++ * ring's tooltip and the popover print, so "60%" is never shown in grey.
++ */
++export function contextTone(pct: number): AeTone {
++  const shown = Math.round(pct);
++  if (shown >= AE_CONTEXT_CRITICAL_PCT) return "critical";
++  if (shown >= AE_CONTEXT_WARNING_PCT) return "warning";
++  return "normal";
++}
++
++/**
++ * Text colour for the ring's used arc (its stroke is `currentColor`). Normal
++ * adds nothing, so the arc keeps the ring's own `text-muted-foreground`. The
++ * theme's warning and destructive tokens are defined for light and dark mode.
++ */
++const RING_TEXT: Record<AeTone, string | undefined> = {
++  normal: undefined,
++  warning: "text-warning",
++  critical: "text-destructive",
++};
++
++/** Class for the used arc of `ComposerContextRing` at `pct` (0 to 100) used. */
++export function aeContextRingClass(pct: number): string | undefined {
++  return RING_TEXT[contextTone(pct)];
++}

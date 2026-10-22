@@ -1,0 +1,1670 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 25 Sep 2026 00:05:11 +0000
+Subject: [PATCH 011/148] [ae-patch] Add a Run button to chat shell code blocks
+ that pastes into the session's shell
+
+A session on a host with shells often replies with a command block, which
+today is copied by hand into a shell, often on a phone. Assistant code blocks
+tagged bash, sh, shell, zsh, console or powershell, or untagged blocks that
+read as commands, get a Run button beside the wrap and copy buttons, for the
+owner of a session whose agent declares shells (the "+ New shell" gate).
+
+Run opens a confirm sheet with the exact text, a plain warning for sudo,
+rm -rf, curl | sh and dd, and a hint when a heredoc, a quote or a line
+continuation is still open, in which case the block is pasted without Enter.
+On Run the session's selected or newest live shell (or a new default shell,
+through the existing create route) opens as a rail tab, or full screen on a
+phone, and the text is written with xterm's own paste followed by an Enter
+keystroke: the same onData path and WebSocket the keyboard uses. No server
+endpoint is added and sudo still asks for the password in the terminal.
+
+Logic lives in new files (lib/aeRunCommand.ts, lib/aeTerminalInput.ts,
+shell/useAeRunInTerminal.ts, components/AeRunCodeButton.tsx). Upstream files
+change by a few lines each: two methods on TerminalSession, a registration in
+TerminalView for writable attaches, the button in ChatCodeBlockPre, and the
+hook call in AppShell.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01CLNtvJJBnP8dWqxK5yffxB
+---
+ web/src/components/AeRunCodeButton.test.tsx  | 245 +++++++++
+ web/src/components/AeRunCodeButton.tsx       | 154 ++++++
+ web/src/components/ai-elements/message.tsx   |   2 +
+ web/src/components/blocks/TerminalSession.ts |  13 +
+ web/src/components/blocks/TerminalView.tsx   |   5 +
+ web/src/lib/aeRunCommand.test.ts             | 225 ++++++++
+ web/src/lib/aeRunCommand.ts                  | 534 +++++++++++++++++++
+ web/src/lib/aeTerminalInput.test.ts          |  75 +++
+ web/src/lib/aeTerminalInput.ts               | 133 +++++
+ web/src/shell/AppShell.tsx                   |   9 +
+ web/src/shell/useAeRunInTerminal.ts          | 104 ++++
+ 11 files changed, 1499 insertions(+)
+ create mode 100644 web/src/components/AeRunCodeButton.test.tsx
+ create mode 100644 web/src/components/AeRunCodeButton.tsx
+ create mode 100644 web/src/lib/aeRunCommand.test.ts
+ create mode 100644 web/src/lib/aeRunCommand.ts
+ create mode 100644 web/src/lib/aeTerminalInput.test.ts
+ create mode 100644 web/src/lib/aeTerminalInput.ts
+ create mode 100644 web/src/shell/useAeRunInTerminal.ts
+
+diff --git a/web/src/components/AeRunCodeButton.test.tsx b/web/src/components/AeRunCodeButton.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..39eb36e44b5abdb0a140aa82e6a91a58d5c73118
+--- /dev/null
++++ b/web/src/components/AeRunCodeButton.test.tsx
+@@ -0,0 +1,245 @@
++// Page test for Run-on-box: a Run on an assistant's bash block opens the
++// session's shell and sends the exact bytes through the real TerminalView ->
++// TerminalSession -> WebSocket path, the same path the keyboard uses. Only
++// the WebSocket and ResizeObserver globals are fakes.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { useState, type ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { MessageResponse } from "@/components/ai-elements/message";
++import { TerminalView } from "@/components/blocks/TerminalView";
++import { ConversationScopeContext } from "@/components/chat/conversationScope";
++import { resetAeTerminalInputForTests, setAeRunTarget } from "@/lib/aeTerminalInput";
++import type { TerminalInfo } from "@/lib/terminals";
++import { pickRunShell, useAeRunInTerminal } from "@/shell/useAeRunInTerminal";
++
++class FakeWebSocket {
++  static CONNECTING = 0;
++  static OPEN = 1;
++  static CLOSING = 2;
++  static CLOSED = 3;
++  static instances: FakeWebSocket[] = [];
++  readyState = 0;
++  binaryType = "blob";
++  sent: (string | Uint8Array)[] = [];
++  private listeners: Record<string, ((ev: unknown) => void)[]> = {};
++  url: string;
++  constructor(url: string) {
++    this.url = url;
++    FakeWebSocket.instances.push(this);
++  }
++  addEventListener(type: string, fn: (ev: unknown) => void) {
++    (this.listeners[type] ??= []).push(fn);
++  }
++  send(data: string | Uint8Array) {
++    this.sent.push(data);
++  }
++  close() {
++    this.readyState = FakeWebSocket.CLOSED;
++  }
++  open() {
++    this.readyState = FakeWebSocket.OPEN;
++    for (const fn of this.listeners.open ?? []) fn({});
++  }
++  message(data: string) {
++    // A realm-local ArrayBuffer: TerminalSession checks `instanceof ArrayBuffer`.
++    const encoded = new TextEncoder().encode(data);
++    const buffer = new ArrayBuffer(encoded.length);
++    new Uint8Array(buffer).set(encoded);
++    for (const fn of this.listeners.message ?? []) fn({ data: buffer });
++  }
++  /** Everything sent as keystrokes (binary frames), decoded. */
++  input(): string {
++    const decoder = new TextDecoder();
++    return this.sent
++      .filter((m): m is Uint8Array => typeof m !== "string")
++      .map((m) => decoder.decode(m))
++      .join("");
++  }
++}
++
++class FakeResizeObserver {
++  observe() {}
++  disconnect() {}
++}
++
++const SHELL: TerminalInfo = { id: "terminal_bash_u1", name: "bash", session: "u1", running: true };
++const ONE_SHELL = [SHELL];
++
++function assistantBlock(markdown: string): ReactNode {
++  return (
++    <div data-testid="assistant-text-section">
++      <MessageResponse mode="static">{markdown}</MessageResponse>
++    </div>
++  );
++}
++
++/** AppShell's part, reduced: the hook plus the rail tab it opens. */
++function SessionPage({
++  markdown,
++  terminals = ONE_SHELL,
++}: {
++  markdown: string;
++  terminals?: TerminalInfo[];
++}) {
++  const [openKey, setOpenKey] = useState<string | null>(null);
++  useAeRunInTerminal("conv_run", {
++    canRun: true,
++    declaredShells: ["bash"],
++    terminals,
++    selectedTerminalKey: null,
++    openTerminalTab: setOpenKey,
++    openTerminalsPanel: setOpenKey,
++  });
++  return (
++    <>
++      {assistantBlock(markdown)}
++      {openKey === "terminal:terminal_bash_u1" && (
++        <div data-testid="shell-tab">
++          <TerminalView sessionId="conv_run" terminalId="terminal_bash_u1" />
++        </div>
++      )}
++    </>
++  );
++}
++
++function renderPage(markdown: string) {
++  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  return render(
++    <QueryClientProvider client={client}>
++      <SessionPage markdown={markdown} />
++    </QueryClientProvider>,
++  );
++}
++
++async function openAndConnect(): Promise<FakeWebSocket> {
++  await waitFor(() => expect(FakeWebSocket.instances.length).toBeGreaterThan(0));
++  const socket = FakeWebSocket.instances.at(-1)!;
++  act(() => socket.open());
++  return socket;
++}
++
++beforeEach(() => {
++  FakeWebSocket.instances = [];
++  vi.stubGlobal("WebSocket", FakeWebSocket);
++  vi.stubGlobal("ResizeObserver", FakeResizeObserver);
++});
++
++afterEach(() => {
++  cleanup();
++  resetAeTerminalInputForTests();
++  vi.unstubAllGlobals();
++});
++
++describe("Run on a chat code block", () => {
++  it("sends the exact bytes of a multi-line block as one paste, then Enter", async () => {
++    renderPage("```bash\ncd /secure/omnigent\ndocker compose ps\n```");
++
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    expect(screen.getByTestId("ae-run-text").textContent).toBe(
++      "cd /secure/omnigent\ndocker compose ps",
++    );
++    fireEvent.click(screen.getByTestId("ae-run-confirm"));
++
++    const socket = await openAndConnect();
++    await waitFor(() => expect(socket.input()).toBe("cd /secure/omnigent\rdocker compose ps\r"));
++    expect(screen.getByTestId("shell-tab")).toBeTruthy();
++  });
++
++  it("wraps the paste in bracketed-paste markers when the shell asked for them", async () => {
++    renderPage("```bash\necho one\necho two\n```");
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    fireEvent.click(screen.getByTestId("ae-run-confirm"));
++    const socket = await openAndConnect();
++    // Hold the Run until the shell's own bracketed-paste request is parsed.
++    act(() => socket.message("\x1b[?2004h"));
++    await waitFor(() => expect(socket.input()).toBe("\x1b[200~echo one\recho two\x1b[201~\r"));
++  });
++
++  it("pastes an open heredoc without Enter and says why", async () => {
++    renderPage("```bash\nsudo tee /etc/ae.conf <<EOF\nkey=1\n```");
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    expect(screen.getByTestId("ae-run-hint").textContent).toMatch(/<<EOF/);
++    expect(
++      screen.getByTestId("ae-run-dangers").querySelector('[data-danger="sudo"]')?.textContent,
++    ).toMatch(/password/);
++    fireEvent.click(screen.getByTestId("ae-run-confirm"));
++    const socket = await openAndConnect();
++    await waitFor(() => expect(socket.input()).toBe("sudo tee /etc/ae.conf <<EOF\rkey=1"));
++  });
++
++  it("sends nothing on Cancel", async () => {
++    renderPage("```sh\nrm -rf /tmp/scratch\n```");
++    fireEvent.click(await screen.findByTestId("ae-run-button"));
++    expect(
++      screen.getByTestId("ae-run-dangers").querySelector('[data-danger="rm-rf"]'),
++    ).not.toBeNull();
++    fireEvent.click(screen.getByTestId("ae-run-cancel"));
++    await waitFor(() => expect(screen.queryByTestId("ae-run-sheet")).toBeNull());
++    expect(FakeWebSocket.instances).toHaveLength(0);
++    expect(screen.queryByTestId("shell-tab")).toBeNull();
++  });
++
++  it("keeps upstream's copy button beside Run", async () => {
++    renderPage("```zsh\nls\n```");
++    await screen.findByTestId("ae-run-button");
++    expect(screen.getByRole("button", { name: "Copy Code" })).toBeTruthy();
++  });
++});
++
++describe("where Run shows", () => {
++  const target = { conversationId: "conv_run", run: vi.fn() };
++
++  it("shows on shell fences and command-like untagged blocks in assistant text", async () => {
++    setAeRunTarget(target);
++    render(assistantBlock("```console\n$ uptime\n```\n\n```\ngit status\n```"));
++    await waitFor(() => expect(screen.getAllByTestId("ae-run-button")).toHaveLength(2));
++  });
++
++  it("hides on other languages and on prose-like untagged blocks", async () => {
++    setAeRunTarget(target);
++    render(assistantBlock("```python\nprint(1)\n```\n\n```\nsee the notes below\n```"));
++    await screen.findAllByRole("button", { name: "Copy Code" });
++    expect(screen.queryByTestId("ae-run-button")).toBeNull();
++  });
++
++  it("hides without a run target (no shells, a non-owner, a shared view)", async () => {
++    render(assistantBlock("```bash\nls\n```"));
++    await screen.findByRole("button", { name: "Copy Code" });
++    expect(screen.queryByTestId("ae-run-button")).toBeNull();
++  });
++
++  it("hides in a user message and in a side chat", async () => {
++    setAeRunTarget(target);
++    render(
++      <>
++        <MessageResponse mode="static">{"```bash\nls\n```"}</MessageResponse>
++        <ConversationScopeContext.Provider value="conv_side">
++          {assistantBlock("```bash\nls\n```")}
++        </ConversationScopeContext.Provider>
++      </>,
++    );
++    await waitFor(() =>
++      expect(screen.getAllByRole("button", { name: "Copy Code" })).toHaveLength(2),
++    );
++    expect(screen.queryByTestId("ae-run-button")).toBeNull();
++  });
++});
++
++describe("pickRunShell", () => {
++  const other: TerminalInfo = { id: "terminal_zsh_u2", name: "zsh", session: "u2", running: true };
++  const agent: TerminalInfo = {
++    id: "terminal_claude_main",
++    name: "claude",
++    session: "main",
++    running: true,
++  };
++
++  it("prefers the selected live shell, then the newest, never the agent pane", () => {
++    expect(pickRunShell([SHELL, other], "terminal:terminal_bash_u1")).toBe(SHELL);
++    expect(pickRunShell([SHELL, other], null)).toBe(other);
++    expect(pickRunShell([SHELL, { ...other, running: false }], null)).toBe(SHELL);
++    expect(pickRunShell([agent], null)).toBeNull();
++  });
++});
+diff --git a/web/src/components/AeRunCodeButton.tsx b/web/src/components/AeRunCodeButton.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b203f46782e5d549cff06c72cbf22ee418b0b952
+--- /dev/null
++++ b/web/src/components/AeRunCodeButton.tsx
+@@ -0,0 +1,154 @@
++// [ae] Run-on-box: the Run button on a chat code block and its confirm sheet.
++//
++// Rendered by `ChatCodeBlockPre` (components/ai-elements/message.tsx) beside
++// upstream's wrap and copy buttons. It shows only when all of these hold:
++//
++//   - AppShell published a run target (the viewer owns a session whose agent
++//     declares shells; `useAeRunInTerminal`),
++//   - the block sits in an assistant text section of the main chat (not a
++//     user bubble, not a side chat, not a plan or a PR body),
++//   - the block is a shell fence or an untagged block that reads as commands
++//     (`aeRunCommand.ts`).
++//
++// Nothing is sent until the sheet's Run: the sheet shows the exact text, says
++// plainly when the block uses sudo, rm -rf, curl | sh or dd, and says when
++// Enter is withheld because a heredoc or a quote is still open.
++
++import { PlayIcon, TriangleAlertIcon } from "lucide-react";
++import { isValidElement, useContext, useLayoutEffect, useRef, useState } from "react";
++import type { ReactNode } from "react";
++import { ConversationScopeContext } from "@/components/chat/conversationScope";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { showToast } from "@/components/ui/toast";
++import { codeBlockLanguage, isRunnableBlock, planRun, type AeRunPlan } from "@/lib/aeRunCommand";
++import { useAeRunTarget } from "@/lib/aeTerminalInput";
++
++/** Marker upstream's BlockRenderer puts on every assistant text section. */
++const ASSISTANT_SECTION_SELECTOR = '[data-testid="assistant-text-section"]';
++
++function blockLanguage(block: ReactNode): string | null {
++  if (!isValidElement<{ className?: string }>(block)) return null;
++  return codeBlockLanguage(block.props.className);
++}
++
++export function AeRunCodeButton({ block, code }: { block: ReactNode; code: string }) {
++  const target = useAeRunTarget();
++  const inSideChat = useContext(ConversationScopeContext) !== null;
++  const anchorRef = useRef<HTMLSpanElement>(null);
++  const [inAssistantText, setInAssistantText] = useState(false);
++  const [plan, setPlan] = useState<AeRunPlan | null>(null);
++  const [running, setRunning] = useState(false);
++  const language = blockLanguage(block);
++
++  useLayoutEffect(() => {
++    setInAssistantText(anchorRef.current?.closest(ASSISTANT_SECTION_SELECTOR) != null);
++  }, []);
++
++  const visible =
++    target !== null && !inSideChat && inAssistantText && isRunnableBlock(language, code);
++
++  const confirm = async () => {
++    if (!plan || !target) return;
++    setRunning(true);
++    const result = await target.run(plan.text, plan.submit);
++    setRunning(false);
++    setPlan(null);
++    if (!result.ok) showToast(result.error);
++    else if (!result.submitted)
++      showToast("Pasted without Enter. Finish the command in the terminal.");
++  };
++
++  return (
++    <span ref={anchorRef} className="contents" data-testid="ae-run-anchor">
++      {visible && (
++        <Button
++          aria-label="Run in terminal"
++          className="h-6 gap-1 bg-sidebar/80 px-1.5 text-xs text-muted-foreground hover:bg-sidebar/80 hover:text-foreground dark:hover:bg-sidebar/80 supports-[backdrop-filter]:bg-sidebar/70 supports-[backdrop-filter]:backdrop-blur"
++          data-testid="ae-run-button"
++          onClick={() => setPlan(planRun(code, language))}
++          size="sm"
++          title="Run in this session's shell"
++          type="button"
++          variant="ghost"
++        >
++          <PlayIcon className="size-3" aria-hidden />
++          Run
++        </Button>
++      )}
++      <Dialog open={plan !== null} onOpenChange={(open) => !open && !running && setPlan(null)}>
++        {plan && (
++          <DialogContent className="sm:max-w-lg" data-testid="ae-run-sheet">
++            <DialogHeader>
++              <DialogTitle>Run in the terminal?</DialogTitle>
++              <DialogDescription>
++                {plan.submit
++                  ? "This text is pasted into the session's shell on its host, then Enter is pressed."
++                  : "This text is pasted into the session's shell on its host. Enter is not pressed."}
++              </DialogDescription>
++            </DialogHeader>
++            <pre
++              className="max-h-64 overflow-auto rounded-md border border-border bg-muted p-3 font-mono text-xs whitespace-pre-wrap break-all"
++              data-testid="ae-run-text"
++            >
++              {plan.text}
++            </pre>
++            {plan.dangers.length > 0 && (
++              <ul className="flex flex-col gap-1.5" data-testid="ae-run-dangers">
++                {plan.dangers.map((danger) => (
++                  <li
++                    key={danger.id}
++                    className="flex items-start gap-2 rounded-md bg-destructive/10 px-2.5 py-1.5 text-xs text-destructive"
++                    data-danger={danger.id}
++                  >
++                    <TriangleAlertIcon className="mt-0.5 size-3.5 shrink-0" aria-hidden />
++                    <span>{danger.message}</span>
++                  </li>
++                ))}
++              </ul>
++            )}
++            {plan.removedHidden > 0 && (
++              <p className="text-xs text-muted-foreground" data-testid="ae-run-removed">
++                {plan.removedHidden === 1
++                  ? "1 hidden control character was removed from the block before sending."
++                  : `${plan.removedHidden} hidden control characters were removed from the block before sending.`}
++              </p>
++            )}
++            {plan.hint && (
++              <p className="text-xs text-muted-foreground" data-testid="ae-run-hint">
++                {plan.hint}
++              </p>
++            )}
++            <DialogFooter>
++              <Button
++                type="button"
++                variant="outline"
++                disabled={running}
++                onClick={() => setPlan(null)}
++                data-testid="ae-run-cancel"
++              >
++                Cancel
++              </Button>
++              <Button
++                type="button"
++                variant={plan.dangers.length > 0 ? "destructive" : "default"}
++                disabled={running}
++                onClick={() => void confirm()}
++                data-testid="ae-run-confirm"
++              >
++                {running ? "Sending…" : "Run"}
++              </Button>
++            </DialogFooter>
++          </DialogContent>
++        )}
++      </Dialog>
++    </span>
++  );
++}
+diff --git a/web/src/components/ai-elements/message.tsx b/web/src/components/ai-elements/message.tsx
+index 9bbc6d556ed11c30c6772175e3f1d0f4a9a7deba..3aa1a5cfa08d8b75bb8081795ad5311ab1033587 100644
+--- a/web/src/components/ai-elements/message.tsx
++++ b/web/src/components/ai-elements/message.tsx
+@@ -32,6 +32,7 @@ import {
+   type StreamdownProps,
+ } from "streamdown";
+ 
++import { AeRunCodeButton } from "@/components/AeRunCodeButton";
+ import { MarkdownErrorBoundary } from "./MarkdownErrorBoundary";
+ import { mermaidOptionsForTheme } from "./MermaidError";
+ import { FullscreenIcon, isMermaidPre, MermaidBlock, MERMAID_NO_FULLSCREEN } from "./MermaidBlock";
+@@ -611,6 +612,7 @@ function ChatCodeBlockPre({ children }: ComponentProps<"pre">) {
+       {/* Match Streamdown's action-pill height and reserve its rightmost slot
+           for download. All controls stay anchored to the header. */}
+       <div className="absolute top-2 right-12 z-10 -mr-1.5 flex items-center gap-0.5 border-y border-transparent py-1">
++        <AeRunCodeButton block={children} code={code} />
+         <ChatCodeBlockWrapToggle onToggle={toggleWrap} wrap={wrap} />
+         <ChatCodeBlockCopyButton getCode={getCode} />
+       </div>
+diff --git a/web/src/components/blocks/TerminalSession.ts b/web/src/components/blocks/TerminalSession.ts
+index 88df35557fb5f75a5a0702e21881a966df38303f..9f6f6a726941485d78e0c0ee19760a4d88abcdae 100644
+--- a/web/src/components/blocks/TerminalSession.ts
++++ b/web/src/components/blocks/TerminalSession.ts
+@@ -987,6 +987,19 @@ export class TerminalSession {
+     this.term.focus();
+   }
+ 
++  /** [ae] Run-on-box input state and paste; see `lib/aeTerminalInput.ts`. */
++  aeInputState(): "open" | "connecting" | "gone" {
++    if (this.disposed || this.ws.readyState > WebSocket.OPEN) return "gone";
++    return this.ws.readyState === WebSocket.OPEN ? "open" : "connecting";
++  }
++
++  aePaste(text: string, submit: boolean): boolean {
++    if (this.aeInputState() !== "open") return false;
++    this.term.paste(text);
++    if (submit) this.term.input("\r", true);
++    return true;
++  }
++
+   /**
+    * Update the terminal's code font without reconnecting —
+    * mirrors {@link setTheme}, mutating options in place. A new glyph size
+diff --git a/web/src/components/blocks/TerminalView.tsx b/web/src/components/blocks/TerminalView.tsx
+index 80754d7d775b06d1504ad88b033bb099d49a68b4..d02fc9c8c7bb31cffeb34f1a255b63c253e099e1 100644
+--- a/web/src/components/blocks/TerminalView.tsx
++++ b/web/src/components/blocks/TerminalView.tsx
+@@ -33,6 +33,7 @@ import {
+ import { subscribeCodeFont } from "@/lib/codeFontPreferences";
+ import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
+ import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
++import { registerAeTerminalInput } from "@/lib/aeTerminalInput";
+ import {
+   readTerminalThemeMode,
+   resolveTerminalIsDark,
+@@ -539,6 +540,7 @@ export function TerminalView({
+       // open is a no-op. The second attach's microtask proceeds and
+       // is the one that actually opens the WS.
+       let terminalSession: TerminalSession | null = null;
++      let aeUnregister: (() => void) | undefined;
+       let cancelled = false;
+       const upgradeCtl = new AbortController();
+       upgradeCtlRef.current = upgradeCtl;
+@@ -582,6 +584,8 @@ export function TerminalView({
+           notifyFileLink,
+         );
+         sessionRef.current = terminalSession;
++        if (!readOnly)
++          aeUnregister = registerAeTerminalInput(sessionId, terminalId, terminalSession);
+         // Relay-connected with a direct URL on offer: negotiate the
+         // loopback upgrade in the background. In Chrome this is what
+         // raises the Local Network Access prompt; the probe socket
+@@ -598,6 +602,7 @@ export function TerminalView({
+       return () => {
+         cancelled = true;
+         upgradeCtl.abort();
++        aeUnregister?.();
+         terminalSession?.dispose();
+         sessionRef.current = null;
+         onStateChangeRef.current?.(null);
+diff --git a/web/src/lib/aeRunCommand.test.ts b/web/src/lib/aeRunCommand.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..87da90fc902478ae8d94a5c970e6b98c22d55b78
+--- /dev/null
++++ b/web/src/lib/aeRunCommand.test.ts
+@@ -0,0 +1,225 @@
++import { describe, expect, it } from "vitest";
++import {
++  stripHiddenChars,
++  codeBlockLanguage,
++  commandText,
++  detectDangers,
++  isRunnableBlock,
++  looksLikeCommand,
++  openPowerShellConstruct,
++  openShellConstruct,
++  planRun,
++} from "./aeRunCommand";
++
++describe("codeBlockLanguage", () => {
++  it("reads the language-* class Streamdown puts on the code element", () => {
++    expect(codeBlockLanguage("language-bash")).toBe("bash");
++    expect(codeBlockLanguage("foo language-PowerShell bar")).toBe("powershell");
++    expect(codeBlockLanguage("foo")).toBeNull();
++    expect(codeBlockLanguage(undefined)).toBeNull();
++  });
++});
++
++describe("isRunnableBlock", () => {
++  it.each(["bash", "sh", "shell", "zsh", "console", "powershell"])("runs a %s fence", (lang) => {
++    expect(isRunnableBlock(lang, "anything at all")).toBe(true);
++  });
++
++  it.each(["python", "json", "yaml", "ts", "text", "diff"])("never runs a %s fence", (lang) => {
++    expect(isRunnableBlock(lang, "ls -la")).toBe(false);
++  });
++
++  it("never runs an empty block", () => {
++    expect(isRunnableBlock("bash", "  \n")).toBe(false);
++  });
++
++  it("runs an untagged block only when it reads as commands", () => {
++    expect(isRunnableBlock(null, "sudo systemctl restart ae-omnigent")).toBe(true);
++    expect(isRunnableBlock(null, '{"a": 1}')).toBe(false);
++  });
++});
++
++describe("looksLikeCommand", () => {
++  it("accepts known commands, paths, env prefixes, prompts, comments and continuations", () => {
++    expect(looksLikeCommand("git status\ngit log --oneline -5")).toBe(true);
++    expect(looksLikeCommand("./deploy/compose.sh pull")).toBe(true);
++    expect(looksLikeCommand("~/bin/tool --flag")).toBe(true);
++    expect(looksLikeCommand("OMNIGENT_SKIP_WEB_UI=true uv sync")).toBe(true);
++    expect(looksLikeCommand("$ docker ps")).toBe(true);
++    expect(looksLikeCommand("# restart it\nsystemctl --user restart ae-omnigent-host")).toBe(true);
++    expect(looksLikeCommand("docker run \\\n  --rm \\\n  hello-world")).toBe(true);
++  });
++
++  it("rejects prose, data and code", () => {
++    expect(looksLikeCommand("Restart the service and check the logs.")).toBe(false);
++    expect(looksLikeCommand("key: value\nother: 2")).toBe(false);
++    expect(looksLikeCommand("const x = 1;")).toBe(false);
++    expect(looksLikeCommand("def main():\n    pass")).toBe(false);
++    expect(looksLikeCommand("git status\nthen read the output")).toBe(false);
++    expect(looksLikeCommand("# only a comment")).toBe(false);
++  });
++
++  it("rejects a block longer than a command list", () => {
++    expect(looksLikeCommand(Array.from({ length: 21 }, () => "ls").join("\n"))).toBe(false);
++  });
++});
++
++describe("commandText", () => {
++  it("drops trailing whitespace and keeps everything else exactly", () => {
++    expect(commandText("  ls -la  \n\n")).toBe("  ls -la");
++  });
++
++  it("keeps only prompted lines of a transcript, without the prompt", () => {
++    const transcript = "$ df -h\nFilesystem Size\n/dev/sda1 100G\n$ free -m\n       total";
++    expect(commandText(transcript)).toBe("df -h\nfree -m");
++  });
++
++  it("keeps the continuation lines of a prompted command", () => {
++    expect(commandText("$ docker run \\\n  --rm hello\nHello from Docker")).toBe(
++      "docker run \\\n  --rm hello",
++    );
++  });
++});
++
++describe("openShellConstruct", () => {
++  it("is null for closed commands", () => {
++    expect(openShellConstruct("echo 'a' \"b\" `c`")).toBeNull();
++    expect(openShellConstruct('echo "it\'s fine"')).toBeNull();
++    expect(openShellConstruct("echo 'say \"hi\"'")).toBeNull();
++    expect(openShellConstruct("echo don\\'t")).toBeNull();
++    expect(openShellConstruct("echo $'a\\'b'")).toBeNull();
++    expect(openShellConstruct("grep x file # it's a comment")).toBeNull();
++    expect(openShellConstruct("cat <<< 'here string'")).toBeNull();
++  });
++
++  it("is null for a closed heredoc, quoted or dashed", () => {
++    expect(openShellConstruct("cat <<EOF > f\nline 'with quote\nEOF")).toBeNull();
++    expect(openShellConstruct("cat <<'EOF'\n$HOME\nEOF\necho done")).toBeNull();
++    expect(openShellConstruct("cat <<-END\n\tbody\n\tEND")).toBeNull();
++    expect(openShellConstruct("cat <<A <<B\na\nA\nb\nB")).toBeNull();
++  });
++
++  it("flags a heredoc whose delimiter never comes", () => {
++    expect(openShellConstruct("cat <<EOF > /etc/x.conf\nkey=value")).toEqual({
++      kind: "heredoc",
++      delimiter: "EOF",
++    });
++    expect(openShellConstruct('tee f <<"END"\nbody\nEN')).toEqual({
++      kind: "heredoc",
++      delimiter: "END",
++    });
++    expect(openShellConstruct("cat <<A <<B\na\nA\nb")).toEqual({ kind: "heredoc", delimiter: "B" });
++  });
++
++  it("flags unterminated quotes and backticks", () => {
++    expect(openShellConstruct("echo 'unterminated")).toEqual({ kind: "single-quote" });
++    expect(openShellConstruct('echo "unterminated\nmore')).toEqual({ kind: "double-quote" });
++    expect(openShellConstruct('echo "escaped \\"')).toEqual({ kind: "double-quote" });
++    expect(openShellConstruct("echo `date")).toEqual({ kind: "backtick" });
++  });
++
++  it("flags a trailing continuation, pipe or &&", () => {
++    expect(openShellConstruct("docker run \\")).toEqual({ kind: "continuation" });
++    expect(openShellConstruct("cat f |")).toEqual({ kind: "continuation" });
++    expect(openShellConstruct("make &&\n")).toEqual({ kind: "continuation" });
++    expect(openShellConstruct("echo done\\\\")).toBeNull();
++  });
++});
++
++describe("openPowerShellConstruct", () => {
++  it("is null for closed commands and here-strings", () => {
++    expect(openPowerShellConstruct("Get-Process | Select-Object -First 5")).toBeNull();
++    expect(openPowerShellConstruct("Write-Host 'it''s fine'")).toBeNull();
++    expect(openPowerShellConstruct('$x = @"\nbody "quoted"\n"@\nWrite-Host $x')).toBeNull();
++  });
++
++  it("flags an open here-string, quote or continuation", () => {
++    expect(openPowerShellConstruct("$x = @'\nbody")).toEqual({ kind: "here-string" });
++    expect(openPowerShellConstruct("Write-Host 'open")).toEqual({ kind: "single-quote" });
++    expect(openPowerShellConstruct('Write-Host "open')).toEqual({ kind: "double-quote" });
++    expect(openPowerShellConstruct("Get-Item x `")).toEqual({ kind: "continuation" });
++  });
++});
++
++describe("detectDangers", () => {
++  const ids = (text: string) => detectDangers(text).map((d) => d.id);
++
++  it("names sudo", () => {
++    expect(ids("sudo apt update")).toEqual(["sudo"]);
++    expect(ids("apt update && sudo apt upgrade")).toEqual(["sudo"]);
++    expect(ids("echo pseudo-terminal")).toEqual([]);
++  });
++
++  it("names rm -rf in every flag spelling, and only recursive plus force", () => {
++    for (const cmd of [
++      "rm -rf /tmp/x",
++      "rm -fr x",
++      "rm -Rf x",
++      "rm -r -f x",
++      "rm --recursive --force x",
++    ]) {
++      expect(ids(cmd)).toEqual(["rm-rf"]);
++    }
++    expect(ids("sudo rm -rf /var/cache/x")).toEqual(["sudo", "rm-rf"]);
++    expect(ids("rm -r x")).toEqual([]);
++    expect(ids("rm -f x")).toEqual([]);
++    expect(ids("git rm -rf --cached x")).toEqual([]);
++  });
++
++  it("names a download piped into a shell", () => {
++    expect(ids("curl -fsSL https://example.com/install.sh | sh")).toEqual(["curl-sh"]);
++    expect(ids("curl -fsSL https://example.com/i | sudo bash")).toEqual(["sudo", "curl-sh"]);
++    expect(ids("wget -qO- https://example.com/i | bash -s --")).toEqual(["curl-sh"]);
++    expect(ids('sh -c "$(curl -fsSL https://example.com/i)"')).toEqual(["curl-sh"]);
++    expect(ids("bash <(curl -s https://example.com/i)")).toEqual(["curl-sh"]);
++    expect(ids("curl -o out.json https://example.com | jq .")).toEqual([]);
++  });
++
++  it("names dd only as a command", () => {
++    expect(ids("sudo dd if=image.iso of=/dev/sdb bs=4M")).toEqual(["sudo", "dd"]);
++    expect(ids("dd if=/dev/zero of=f count=1")).toEqual(["dd"]);
++    expect(ids("echo add dd-thing")).toEqual([]);
++  });
++
++  it("lists each danger once in a fixed order", () => {
++    expect(ids("dd if=a of=b\nrm -rf c\nsudo ls\nsudo ls")).toEqual(["sudo", "rm-rf", "dd"]);
++    expect(detectDangers("sudo ls")[0].message).toMatch(/password/);
++  });
++});
++
++describe("stripHiddenChars", () => {
++  it("keeps tabs and newlines, folds CRLF, drops the rest", () => {
++    expect(stripHiddenChars("a\tb\r\nc\x07\x9b")).toEqual({ text: "a\tb\nc", removed: 2 });
++  });
++});
++
++describe("planRun", () => {
++  it("submits a closed block", () => {
++    expect(planRun("ls -la\n", "bash")).toEqual({
++      text: "ls -la",
++      removedHidden: 0,
++      submit: true,
++      hint: null,
++      dangers: [],
++    });
++  });
++
++  it("withholds Enter and gives a hint for an open heredoc", () => {
++    const plan = planRun("sudo tee /etc/x <<EOF\nkey=1\n", "bash");
++    expect(plan.submit).toBe(false);
++    expect(plan.hint).toMatch(/<<EOF/);
++    expect(plan.dangers.map((d) => d.id)).toEqual(["sudo"]);
++  });
++
++  it("removes hidden control characters, so the sheet shows what is sent", () => {
++    const plan = planRun("echo safe\x1b[201~\u202e; rm x\r\nls\u200b", "bash");
++    expect(plan.text).toBe("echo safe[201~; rm x\nls");
++    expect(plan.removedHidden).toBe(3);
++  });
++
++  it("uses PowerShell rules for a powershell fence", () => {
++    expect(planRun("Write-Host 'it''s'", "powershell").submit).toBe(true);
++    expect(planRun("Write-Host 'it''s'", "bash").submit).toBe(true);
++    expect(planRun("$s = @'\nx", "powershell").submit).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeRunCommand.ts b/web/src/lib/aeRunCommand.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f718c649172ef2ee66f7c6781774259969446d1
+--- /dev/null
++++ b/web/src/lib/aeRunCommand.ts
+@@ -0,0 +1,534 @@
++// [ae] Run-on-box: the pure half of the Run button on chat code blocks.
++//
++// A session on a host with shells can reply with a command block; the Run
++// button pastes that block into one of the session's own shells. Everything
++// here is pure so it can be tested without a DOM or a terminal:
++//
++//   - which blocks get a Run button (a shell fence, or an untagged block that
++//     reads as commands),
++//   - the exact text that will be sent (a `$ ` prompt is stripped),
++//   - whether Enter may follow the paste (never while a heredoc, a quote or a
++//     line continuation is still open),
++//   - the dangerous constructs the confirm sheet names (sudo, rm -rf,
++//     curl | sh, dd).
++//
++// The transport half is `aeTerminalInput.ts`; the button is
++// `components/AeRunCodeButton.tsx`.
++
++/** Fence languages that always get a Run button. */
++export const AE_RUN_SHELL_LANGUAGES: ReadonlySet<string> = new Set([
++  "bash",
++  "sh",
++  "shell",
++  "zsh",
++  "console",
++  "powershell",
++]);
++
++/** Language of a Streamdown `<code>` element from its `language-*` class, or null. */
++export function codeBlockLanguage(className: string | undefined | null): string | null {
++  if (!className) return null;
++  for (const cls of className.split(/\s+/)) {
++    if (cls.startsWith("language-")) {
++      const lang = cls.slice("language-".length).toLowerCase();
++      return lang === "" ? null : lang;
++    }
++  }
++  return null;
++}
++
++// First words that make an untagged block read as a command. Deliberately a
++// list of real command names rather than a "looks like a word" rule: an
++// untagged block of prose, JSON, YAML or code must not grow a Run button.
++const COMMAND_WORDS: ReadonlySet<string> = new Set([
++  "apt",
++  "apt-get",
++  "aws",
++  "awk",
++  "az",
++  "bash",
++  "brew",
++  "cargo",
++  "cat",
++  "cd",
++  "chmod",
++  "chown",
++  "claude",
++  "cp",
++  "crontab",
++  "curl",
++  "date",
++  "dd",
++  "df",
++  "dig",
++  "dnf",
++  "docker",
++  "docker-compose",
++  "du",
++  "echo",
++  "env",
++  "export",
++  "find",
++  "free",
++  "gh",
++  "git",
++  "go",
++  "grep",
++  "head",
++  "helm",
++  "hostnamectl",
++  "htop",
++  "ip",
++  "journalctl",
++  "just",
++  "kill",
++  "kubectl",
++  "less",
++  "ln",
++  "ls",
++  "lsblk",
++  "make",
++  "mkdir",
++  "mount",
++  "mv",
++  "nano",
++  "node",
++  "npm",
++  "npx",
++  "nvidia-smi",
++  "ollama",
++  "omnigent",
++  "openssl",
++  "pg_dump",
++  "ping",
++  "pip",
++  "pip3",
++  "pkill",
++  "pnpm",
++  "printf",
++  "ps",
++  "psql",
++  "pwd",
++  "pwsh",
++  "python",
++  "python3",
++  "reboot",
++  "restic",
++  "rg",
++  "rm",
++  "rsync",
++  "scp",
++  "sed",
++  "sh",
++  "shutdown",
++  "sleep",
++  "snap",
++  "source",
++  "ssh",
++  "sudo",
++  "systemctl",
++  "tail",
++  "tailscale",
++  "tar",
++  "tee",
++  "tmux",
++  "top",
++  "touch",
++  "ufw",
++  "umount",
++  "unzip",
++  "uv",
++  "vim",
++  "watch",
++  "wc",
++  "wget",
++  "which",
++  "whoami",
++  "xargs",
++  "yarn",
++  "zip",
++  "zsh",
++]);
++
++/** Longest untagged block still treated as commands; longer is a script or a listing. */
++const MAX_UNTAGGED_LINES = 20;
++
++/**
++ * Whether an untagged block reads as shell commands: every non-empty,
++ * non-comment line starts with a known command, a path to an executable
++ * (`./x`, `~/x`, `/usr/bin/x`), an env assignment before one, or continues a
++ * line ending in `\`.
++ */
++export function looksLikeCommand(code: string): boolean {
++  const lines = code.replace(/\s+$/, "").split("\n");
++  if (lines.length === 0 || lines.length > MAX_UNTAGGED_LINES) return false;
++  let sawCommand = false;
++  let continued = false;
++  for (const raw of lines) {
++    const line = raw.trim();
++    const isContinuation = continued;
++    continued = line.endsWith("\\");
++    if (isContinuation) continue;
++    if (line === "" || line.startsWith("#")) continue;
++    if (!lineStartsWithCommand(stripPrompt(line))) return false;
++    sawCommand = true;
++  }
++  return sawCommand;
++}
++
++function stripPrompt(line: string): string {
++  return line.startsWith("$ ") ? line.slice(2).trimStart() : line;
++}
++
++function lineStartsWithCommand(line: string): boolean {
++  const words = line.split(/\s+/);
++  let i = 0;
++  // `FOO=bar BAZ=1 cmd ...`
++  while (i < words.length && /^[A-Za-z_][A-Za-z0-9_]*=\S*$/.test(words[i])) i += 1;
++  const word = words[i];
++  if (word === undefined) return false;
++  if (/^(\.{1,2}|~)?\/[\w./~-]+$/.test(word)) return true;
++  return COMMAND_WORDS.has(word);
++}
++
++/** Whether a code block gets a Run button: a shell fence, or untagged and command-like. */
++export function isRunnableBlock(language: string | null, code: string): boolean {
++  if (code.trim() === "") return false;
++  if (language !== null) return AE_RUN_SHELL_LANGUAGES.has(language);
++  return looksLikeCommand(code);
++}
++
++/**
++ * The exact text Run sends. Trailing whitespace goes (Enter is sent
++ * separately). When a block is a transcript (`console`, or lines prompted
++ * with `$ `), only the prompted lines and their `\` continuations are kept,
++ * without the prompt, so output lines are never replayed as commands.
++ */
++export function commandText(code: string): string {
++  const trimmed = code.replace(/\s+$/, "");
++  const lines = trimmed.split("\n");
++  if (!lines.some((line) => line.startsWith("$ "))) return trimmed;
++  const kept: string[] = [];
++  let continued = false;
++  for (const line of lines) {
++    if (line.startsWith("$ ")) {
++      kept.push(line.slice(2));
++      continued = line.endsWith("\\");
++    } else if (continued) {
++      kept.push(line);
++      continued = line.endsWith("\\");
++    }
++  }
++  return kept.join("\n");
++}
++
++/** A construct still open at the end of a block, which Enter must not submit. */
++export type AeOpenConstruct =
++  | { kind: "heredoc"; delimiter: string }
++  | { kind: "single-quote" }
++  | { kind: "double-quote" }
++  | { kind: "backtick" }
++  | { kind: "continuation" }
++  | { kind: "here-string" };
++
++/**
++ * Scan a POSIX shell block for a construct left open at its end: a heredoc
++ * whose delimiter line never comes, an unterminated quote or backtick, or a
++ * trailing `\`, `|`, `&&` or `||` that would leave the shell at its `>`
++ * prompt. Null when Enter is safe.
++ */
++export function openShellConstruct(text: string): AeOpenConstruct | null {
++  const lines = text.split("\n");
++  let quote: "'" | '"' | "`" | "$'" | null = null;
++  const pending: { delimiter: string; stripTabs: boolean }[] = [];
++  let lineIndex = 0;
++  while (lineIndex < lines.length) {
++    const line = lines[lineIndex];
++    let i = 0;
++    let atWordStart = true;
++    while (i < line.length) {
++      const ch = line[i];
++      if (quote === "'") {
++        if (ch === "'") quote = null;
++        i += 1;
++        continue;
++      }
++      if (quote === '"' || quote === "`" || quote === "$'") {
++        if (ch === "\\") {
++          i += 2;
++          continue;
++        }
++        const closer = quote === "$'" ? "'" : quote;
++        if (ch === closer) quote = null;
++        i += 1;
++        continue;
++      }
++      if (ch === "\\") {
++        i += 2;
++        atWordStart = false;
++        continue;
++      }
++      if (ch === "#" && atWordStart) break;
++      if (ch === "$" && line[i + 1] === "'") {
++        quote = "$'";
++        i += 2;
++        continue;
++      }
++      if (ch === "'" || ch === '"' || ch === "`") {
++        quote = ch;
++        i += 1;
++        atWordStart = false;
++        continue;
++      }
++      if (ch === "<" && line[i + 1] === "<" && line[i + 2] === "<") {
++        i += 3;
++        atWordStart = false;
++        continue;
++      }
++      if (ch === "<" && line[i + 1] === "<") {
++        const heredoc = parseHeredocStart(line, i + 2);
++        if (heredoc) {
++          pending.push({ delimiter: heredoc.delimiter, stripTabs: heredoc.stripTabs });
++          i = heredoc.end;
++          atWordStart = false;
++          continue;
++        }
++      }
++      atWordStart = /[\s;&|()]/.test(ch);
++      i += 1;
++    }
++    lineIndex += 1;
++    if (quote !== null) continue;
++    // Heredoc bodies start on the line after the one that opened them.
++    while (pending.length > 0) {
++      const { delimiter, stripTabs } = pending[0];
++      let closed = false;
++      while (lineIndex < lines.length) {
++        const body = stripTabs ? lines[lineIndex].replace(/^\t+/, "") : lines[lineIndex];
++        lineIndex += 1;
++        if (body === delimiter) {
++          closed = true;
++          break;
++        }
++      }
++      if (!closed) return { kind: "heredoc", delimiter };
++      pending.shift();
++    }
++  }
++  if (quote === "'" || quote === "$'") return { kind: "single-quote" };
++  if (quote === '"') return { kind: "double-quote" };
++  if (quote === "`") return { kind: "backtick" };
++  const last = lastCodeLine(text);
++  if (last !== null && (/(^|[^\\])\\$/.test(last) || /(\||&&)$/.test(last))) {
++    return { kind: "continuation" };
++  }
++  return null;
++}
++
++function parseHeredocStart(
++  line: string,
++  from: number,
++): { delimiter: string; stripTabs: boolean; end: number } | null {
++  let i = from;
++  let stripTabs = false;
++  if (line[i] === "-") {
++    stripTabs = true;
++    i += 1;
++  }
++  while (line[i] === " " || line[i] === "\t") i += 1;
++  const rest = line.slice(i);
++  const match = /^(?:'([^']+)'|"([^"]+)"|\\?([A-Za-z0-9_.-]+))/.exec(rest);
++  if (!match) return null;
++  const delimiter = match[1] ?? match[2] ?? match[3];
++  return { delimiter, stripTabs, end: i + match[0].length };
++}
++
++function lastCodeLine(text: string): string | null {
++  const lines = text.replace(/\s+$/, "").split("\n");
++  for (let i = lines.length - 1; i >= 0; i -= 1) {
++    const line = lines[i].trimEnd();
++    if (line.trim() === "" || line.trim().startsWith("#")) continue;
++    return line;
++  }
++  return null;
++}
++
++/**
++ * The PowerShell counterpart of {@link openShellConstruct}: an unclosed
++ * here-string (`@'` / `@"` closed by `'@` / `"@` at a line start), an
++ * unterminated quote, or a trailing backtick or pipe.
++ */
++export function openPowerShellConstruct(text: string): AeOpenConstruct | null {
++  const lines = text.split("\n");
++  let quote: "'" | '"' | null = null;
++  let hereString: "'@" | '"@' | null = null;
++  for (const line of lines) {
++    if (hereString !== null) {
++      if (line.startsWith(hereString)) hereString = null;
++      continue;
++    }
++    let i = 0;
++    while (i < line.length) {
++      const ch = line[i];
++      if (quote !== null) {
++        if (quote === '"' && ch === "`") {
++          i += 2;
++          continue;
++        }
++        if (ch === quote) {
++          if (line[i + 1] === quote) {
++            i += 2;
++            continue;
++          }
++          quote = null;
++        }
++        i += 1;
++        continue;
++      }
++      if (ch === "#") break;
++      if (ch === "`") {
++        i += 2;
++        continue;
++      }
++      if (
++        ch === "@" &&
++        (line[i + 1] === "'" || line[i + 1] === '"') &&
++        i + 2 === line.trimEnd().length
++      ) {
++        hereString = line[i + 1] === "'" ? "'@" : '"@';
++        break;
++      }
++      if (ch === "'" || ch === '"') quote = ch;
++      i += 1;
++    }
++  }
++  if (hereString !== null) return { kind: "here-string" };
++  if (quote === "'") return { kind: "single-quote" };
++  if (quote === '"') return { kind: "double-quote" };
++  const last = lastCodeLine(text);
++  if (last !== null && /(`|\|)$/.test(last)) return { kind: "continuation" };
++  return null;
++}
++
++/** Plain-English hint for a block that is pasted without Enter. */
++export function openConstructHint(open: AeOpenConstruct): string {
++  switch (open.kind) {
++    case "heredoc":
++      return `The heredoc (<<${open.delimiter}) is never closed, so Run pastes the block without pressing Enter. Finish it in the terminal.`;
++    case "here-string":
++      return "The here-string is never closed, so Run pastes the block without pressing Enter. Finish it in the terminal.";
++    case "single-quote":
++    case "double-quote":
++    case "backtick":
++      return "A quote is left open, so Run pastes the block without pressing Enter. Check the end of the command in the terminal.";
++    case "continuation":
++      return "The last line continues onto a next line, so Run pastes the block without pressing Enter. Finish it in the terminal.";
++  }
++}
++
++/** A dangerous construct the confirm sheet names before anything is sent. */
++export interface AeRunDanger {
++  id: "sudo" | "rm-rf" | "curl-sh" | "dd";
++  message: string;
++}
++
++const DANGER_MESSAGES: Record<AeRunDanger["id"], string> = {
++  sudo: "Runs as root with sudo. The terminal asks for your password there; this page never sees or keeps it.",
++  "rm-rf": "Deletes files recursively with rm -rf. Nothing goes to a trash can.",
++  "curl-sh":
++    "Pipes a download straight into a shell (curl | sh). Whatever the server returns runs as you.",
++  dd: "Writes raw bytes with dd. A wrong of= overwrites a disk.",
++};
++
++// A command word counts only at a command position: line start, or after
++// ; & | ( ` $( or a leading sudo / env / time.
++const COMMAND_POSITION = String.raw`(?:^|[;&|(\x60]|\$\()\s*(?:(?:sudo|env|time|exec|nohup)\s+(?:-\S+\s+)*)*`;
++const SUDO_RE = /(?:^|[\s;&|(`])sudo(?=\s|$)/m;
++const DD_RE = new RegExp(`${COMMAND_POSITION}dd(?=\\s|$)`, "m");
++const RM_RE = new RegExp(`${COMMAND_POSITION}rm\\s+([^\\n;&|]*)`, "gm");
++const CURL_PIPE_SH_RE =
++  /\b(?:curl|wget)\b[^\n;]*\|\s*(?:sudo\s+(?:-\S+\s+)*)?(?:env\s+)?(?:ba|z|da|k|fi)?sh\b/;
++const SH_OF_DOWNLOAD_RE = /\b(?:ba|z|da)?sh\b[^\n]*(?:<\(|\$\()\s*(?:curl|wget)\b/;
++
++function isRecursiveForceRm(args: string): boolean {
++  let recursive = false;
++  let force = false;
++  for (const word of args.split(/\s+/)) {
++    if (word === "--") break;
++    if (word === "--recursive") recursive = true;
++    else if (word === "--force") force = true;
++    else if (/^-[A-Za-z]+$/.test(word)) {
++      if (/[rR]/.test(word)) recursive = true;
++      if (word.includes("f")) force = true;
++    }
++  }
++  return recursive && force;
++}
++
++/** Every dangerous construct in a block, in a fixed order (sudo, rm -rf, curl | sh, dd). */
++export function detectDangers(text: string): AeRunDanger[] {
++  const found = new Set<AeRunDanger["id"]>();
++  if (SUDO_RE.test(text)) found.add("sudo");
++  for (const match of text.matchAll(RM_RE)) {
++    if (isRecursiveForceRm(match[1])) found.add("rm-rf");
++  }
++  if (CURL_PIPE_SH_RE.test(text) || SH_OF_DOWNLOAD_RE.test(text)) found.add("curl-sh");
++  if (DD_RE.test(text)) found.add("dd");
++  return (["sudo", "rm-rf", "curl-sh", "dd"] as const)
++    .filter((id) => found.has(id))
++    .map((id) => ({ id, message: DANGER_MESSAGES[id] }));
++}
++
++// Characters that never belong in a command a person reads before running it:
++// C0 and C1 controls other than tab and newline (an ESC could end a bracketed
++// paste early or repaint the terminal), zero-width and bidi-override marks.
++function isHiddenChar(code: number): boolean {
++  if (code === 0x09 || code === 0x0a) return false;
++  return (
++    code <= 0x1f ||
++    (code >= 0x7f && code <= 0x9f) ||
++    (code >= 0x200b && code <= 0x200f) ||
++    (code >= 0x202a && code <= 0x202e) ||
++    (code >= 0x2066 && code <= 0x2069) ||
++    code === 0xfeff
++  );
++}
++
++/** Remove hidden characters (after folding CRLF to LF); returns the text and how many went. */
++export function stripHiddenChars(code: string): { text: string; removed: number } {
++  const folded = code.replace(/\r\n/g, "\n");
++  let text = "";
++  let removed = 0;
++  for (const ch of folded) {
++    if (isHiddenChar(ch.codePointAt(0) ?? 0)) removed += 1;
++    else text += ch;
++  }
++  return { text, removed };
++}
++
++/** Everything the confirm sheet shows and the Run sends. */
++export interface AeRunPlan {
++  /** The exact text pasted into the terminal. */
++  text: string;
++  /** How many hidden characters were removed from the block before sending. */
++  removedHidden: number;
++  /** Whether Enter follows the paste. */
++  submit: boolean;
++  /** Why Enter is withheld, or null when it is sent. */
++  hint: string | null;
++  dangers: AeRunDanger[];
++}
++
++/** Build the plan for one code block. */
++export function planRun(code: string, language: string | null): AeRunPlan {
++  const { text: visible, removed } = stripHiddenChars(code);
++  const text = commandText(visible);
++  const open = language === "powershell" ? openPowerShellConstruct(text) : openShellConstruct(text);
++  return {
++    text,
++    removedHidden: removed,
++    submit: open === null,
++    hint: open === null ? null : openConstructHint(open),
++    dangers: detectDangers(text),
++  };
++}
+diff --git a/web/src/lib/aeTerminalInput.test.ts b/web/src/lib/aeTerminalInput.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..45e95213de1b478f2ddc9a54793ddc4025520bc3
+--- /dev/null
++++ b/web/src/lib/aeTerminalInput.test.ts
+@@ -0,0 +1,75 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  type AeTerminalSink,
++  findAeTerminalSink,
++  getAeRunTarget,
++  registerAeTerminalInput,
++  resetAeTerminalInputForTests,
++  setAeRunTarget,
++  waitForAeTerminalSink,
++} from "./aeTerminalInput";
++
++function sink(state: "open" | "connecting" | "gone"): AeTerminalSink & { state: typeof state } {
++  const s = {
++    state,
++    aeInputState: () => s.state,
++    aePaste: vi.fn(() => s.state === "open"),
++  };
++  return s;
++}
++
++afterEach(() => {
++  resetAeTerminalInputForTests();
++  vi.useRealTimers();
++});
++
++describe("terminal input sinks", () => {
++  it("finds the newest open sink for the session and terminal", () => {
++    const older = sink("open");
++    const newer = sink("open");
++    registerAeTerminalInput("s1", "t1", older);
++    registerAeTerminalInput("s1", "t1", newer);
++    expect(findAeTerminalSink("s1", "t1")).toBe(newer);
++    expect(findAeTerminalSink("s1", "t2")).toBeNull();
++    expect(findAeTerminalSink("s2", "t1")).toBeNull();
++  });
++
++  it("skips connecting and gone sinks, and unregister removes one", () => {
++    const open = sink("open");
++    const connecting = sink("connecting");
++    registerAeTerminalInput("s1", "t1", open);
++    const unregister = registerAeTerminalInput("s1", "t1", connecting);
++    expect(findAeTerminalSink("s1", "t1")).toBe(open);
++    open.state = "gone";
++    expect(findAeTerminalSink("s1", "t1")).toBeNull();
++    connecting.state = "open";
++    expect(findAeTerminalSink("s1", "t1")).toBe(connecting);
++    unregister();
++    expect(findAeTerminalSink("s1", "t1")).toBeNull();
++  });
++
++  it("waits for a sink to connect, and gives up after the timeout", async () => {
++    vi.useFakeTimers();
++    const late = sink("connecting");
++    registerAeTerminalInput("s1", "t1", late);
++    const found = waitForAeTerminalSink("s1", "t1", 1000, 100);
++    await vi.advanceTimersByTimeAsync(300);
++    late.state = "open";
++    await vi.advanceTimersByTimeAsync(100);
++    await expect(found).resolves.toBe(late);
++
++    const never = waitForAeTerminalSink("s1", "missing", 1000, 100);
++    await vi.advanceTimersByTimeAsync(1100);
++    await expect(never).resolves.toBeNull();
++  });
++});
++
++describe("run target", () => {
++  it("publishes and clears the target", () => {
++    const target = { conversationId: "c1", run: vi.fn() };
++    setAeRunTarget(target);
++    expect(getAeRunTarget()).toBe(target);
++    setAeRunTarget(null);
++    expect(getAeRunTarget()).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeTerminalInput.ts b/web/src/lib/aeTerminalInput.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..df564d50b374b3ca8dbe8817c6a870d6a619902f
+--- /dev/null
++++ b/web/src/lib/aeTerminalInput.ts
+@@ -0,0 +1,133 @@
++// [ae] Run-on-box: the transport half of the Run button on chat code blocks.
++//
++// Two small module-level registries, so the chat's code blocks (deep inside
++// Streamdown) and the shell surfaces (under AppShell) never need a prop path:
++//
++//   - Input sinks. Every writable `TerminalView` registers its live
++//     `TerminalSession` here under (session id, terminal id). A Run writes
++//     through `TerminalSession.aePaste`, which is xterm's own paste followed
++//     by an Enter keystroke: the bytes take the same `term.onData` path, and
++//     the same WebSocket, as the keyboard. No new server endpoint.
++//   - The run target. AppShell publishes one while the viewer owns a session
++//     whose agent declares shells (`useAeRunInTerminal`); code blocks show Run
++//     only while it is set.
++
++import { useSyncExternalStore } from "react";
++
++/** What a `TerminalSession` exposes to a Run. */
++export interface AeTerminalSink {
++  /** `open` once the WebSocket is up; `gone` after dispose or close. */
++  aeInputState: () => "open" | "connecting" | "gone";
++  /** Paste through the keyboard path, then Enter when `submit`. False when not open. */
++  aePaste: (text: string, submit: boolean) => boolean;
++}
++
++const sinks = new Map<string, AeTerminalSink[]>();
++
++function sinkKey(sessionId: string, terminalId: string): string {
++  return `${sessionId}\u0000${terminalId}`;
++}
++
++function liveSinks(key: string): AeTerminalSink[] {
++  const list = (sinks.get(key) ?? []).filter((sink) => sink.aeInputState() !== "gone");
++  if (list.length === 0) sinks.delete(key);
++  else sinks.set(key, list);
++  return list;
++}
++
++/**
++ * Register a writable terminal attach. Read-only attaches never register (the
++ * server drops their input anyway). Returns the matching unregister.
++ */
++export function registerAeTerminalInput(
++  sessionId: string,
++  terminalId: string,
++  sink: AeTerminalSink,
++): () => void {
++  const key = sinkKey(sessionId, terminalId);
++  sinks.set(key, [...liveSinks(key), sink]);
++  return () => {
++    const rest = (sinks.get(key) ?? []).filter((s) => s !== sink);
++    if (rest.length === 0) sinks.delete(key);
++    else sinks.set(key, rest);
++  };
++}
++
++/** The most recently attached open sink for a terminal, or null. */
++export function findAeTerminalSink(sessionId: string, terminalId: string): AeTerminalSink | null {
++  const open = liveSinks(sinkKey(sessionId, terminalId)).filter(
++    (sink) => sink.aeInputState() === "open",
++  );
++  return open.length > 0 ? open[open.length - 1] : null;
++}
++
++/** How long a Run waits for the shell it opened to connect. */
++export const AE_SINK_WAIT_MS = 20_000;
++
++/**
++ * Resolve with the terminal's open sink as soon as one exists (the view it was
++ * just opened in connects asynchronously), or null after `timeoutMs`.
++ */
++export function waitForAeTerminalSink(
++  sessionId: string,
++  terminalId: string,
++  timeoutMs = AE_SINK_WAIT_MS,
++  intervalMs = 100,
++): Promise<AeTerminalSink | null> {
++  const deadline = Date.now() + timeoutMs;
++  return new Promise((resolve) => {
++    const poll = () => {
++      const sink = findAeTerminalSink(sessionId, terminalId);
++      if (sink !== null) {
++        resolve(sink);
++        return;
++      }
++      if (Date.now() >= deadline) {
++        resolve(null);
++        return;
++      }
++      setTimeout(poll, intervalMs);
++    };
++    poll();
++  });
++}
++
++/** Result of one Run. */
++export type AeRunResult = { ok: true; submitted: boolean } | { ok: false; error: string };
++
++/** What AppShell publishes while code blocks may show Run. */
++export interface AeRunTarget {
++  conversationId: string;
++  run: (text: string, submit: boolean) => Promise<AeRunResult>;
++}
++
++let runTarget: AeRunTarget | null = null;
++const targetListeners = new Set<() => void>();
++
++/** Publish (or clear, with null) the session code blocks run in. */
++export function setAeRunTarget(target: AeRunTarget | null): void {
++  if (runTarget === target) return;
++  runTarget = target;
++  for (const listener of targetListeners) listener();
++}
++
++/** The current run target, or null. */
++export function getAeRunTarget(): AeRunTarget | null {
++  return runTarget;
++}
++
++function subscribeTarget(listener: () => void): () => void {
++  targetListeners.add(listener);
++  return () => targetListeners.delete(listener);
++}
++
++/** React view of the run target. */
++export function useAeRunTarget(): AeRunTarget | null {
++  return useSyncExternalStore(subscribeTarget, getAeRunTarget, () => null);
++}
++
++/** Test helper: drop every sink and the target. */
++export function resetAeTerminalInputForTests(): void {
++  sinks.clear();
++  setAeRunTarget(null);
++}
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index d49600643f842c2ce8b9d5ad28d269b0b82a88b9..c829f45ce1617f5f2cdf63cbe1a3f33717772d08 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -144,6 +144,7 @@ import { ForkSessionDialog } from "./ForkSessionDialog";
+ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
+ import { InlineTerminalsSection } from "./InlineTerminalsSection";
+ import { resolveDefaultShell } from "./preferredShell";
++import { useAeRunInTerminal } from "./useAeRunInTerminal";
+ import { WorkspacePanel } from "./WorkspacePanel";
+ import { SessionRail } from "./SessionRail";
+ import type { RightRailTab } from "./railTabs";
+@@ -1950,6 +1951,14 @@ export function AppShell() {
+     openTerminalTab,
+   ]);
+   useNewShellHotkey(launchDefaultShell, shellLaunchable);
++  useAeRunInTerminal(conversationId, {
++    canRun: isOwnerLevel(permissionLevel) && !hideTerminalsTab,
++    declaredShells: boundAgent?.terminals ?? [],
++    terminals: railTerminals,
++    selectedTerminalKey,
++    openTerminalTab,
++    openTerminalsPanel,
++  });
+ 
+   // Focus a shell the user just created ("+"→Shell) as soon as its tab appears
+   // — a new non-agent terminal key that wasn't present when the create started.
+diff --git a/web/src/shell/useAeRunInTerminal.ts b/web/src/shell/useAeRunInTerminal.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3fa3010cd026c025e5a36a617e1318e3ab58421
+--- /dev/null
++++ b/web/src/shell/useAeRunInTerminal.ts
+@@ -0,0 +1,104 @@
++// [ae] Run-on-box: AppShell's side of the Run button on chat code blocks.
++//
++// While the viewer owns the session and its agent declares shells (the gate
++// upstream's "+ New shell" uses), this publishes the run target the code
++// blocks read. A Run then:
++//
++//   1. picks the shell: the rail's selected shell when it is live, else the
++//      newest live shell, else a new one of the default type through
++//      upstream's own create route (the same call as "+ New shell");
++//   2. opens it where the user sees it: a rail tab on desktop, the full-screen
++//      terminal view on a phone (the Shells drawer's Expand path);
++//   3. waits for that view's WebSocket and pastes through it
++//      (`aeTerminalInput.ts`).
++
++import { useEffect, useRef } from "react";
++import { useCreateTerminal, AGENT_TERMINAL_IDS, terminalTabKey } from "@/hooks/useTerminals";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import type { TerminalInfo } from "@/lib/terminals";
++import {
++  type AeRunResult,
++  type AeRunTarget,
++  getAeRunTarget,
++  setAeRunTarget,
++  waitForAeTerminalSink,
++} from "@/lib/aeTerminalInput";
++import { resolveDefaultShell } from "./preferredShell";
++
++export interface AeRunInTerminalOptions {
++  /** Owner of a session whose shells are reachable (not a claude-native sub-agent). */
++  canRun: boolean;
++  /** The agent's declared terminal names; empty means no shells, so no Run. */
++  declaredShells: readonly string[];
++  /** The session's terminals (AppShell's rail inventory). */
++  terminals: readonly TerminalInfo[];
++  /** The rail's selected shell tab key, if any. */
++  selectedTerminalKey: string | null;
++  /** Desktop: open a shell as a rail tab. */
++  openTerminalTab: (key: string) => void;
++  /** Phone: open a shell full-screen. */
++  openTerminalsPanel: (key: string) => void;
++}
++
++/** The live user shell a Run should target, or null when one must be created. */
++export function pickRunShell(
++  terminals: readonly TerminalInfo[],
++  selectedTerminalKey: string | null,
++): TerminalInfo | null {
++  const shells = terminals.filter((t) => t.running && !AGENT_TERMINAL_IDS.has(t.id));
++  const selected = shells.find((t) => terminalTabKey(t) === selectedTerminalKey);
++  return selected ?? shells[shells.length - 1] ?? null;
++}
++
++export function useAeRunInTerminal(
++  conversationId: string | null | undefined,
++  options: AeRunInTerminalOptions,
++): void {
++  const isMobile = useIsMobileViewport();
++  const create = useCreateTerminal(conversationId ?? "");
++  // The run closure reads the latest render's values; the published target
++  // only changes when the session or the gate does.
++  const latest = useRef({ ...options, isMobile, create });
++  latest.current = { ...options, isMobile, create };
++  const enabled = !!conversationId && options.canRun && options.declaredShells.length > 0;
++
++  useEffect(() => {
++    if (!enabled || !conversationId) return undefined;
++    const target: AeRunTarget = {
++      conversationId,
++      async run(text: string, submit: boolean): Promise<AeRunResult> {
++        const now = latest.current;
++        let shell = pickRunShell(now.terminals, now.selectedTerminalKey);
++        if (shell === null) {
++          const name = resolveDefaultShell(now.declaredShells);
++          if (name === null) return { ok: false, error: "This session declares no shell." };
++          try {
++            shell = await now.create.mutateAsync(name);
++          } catch (error) {
++            const reason = error instanceof Error ? error.message : String(error);
++            return {
++              ok: false,
++              error: `Could not start a shell on the host (${reason}). Check that the host is online, then run it again.`,
++            };
++          }
++        }
++        const key = terminalTabKey(shell);
++        if (latest.current.isMobile) latest.current.openTerminalsPanel(key);
++        else latest.current.openTerminalTab(key);
++        const sink = await waitForAeTerminalSink(conversationId, shell.id);
++        if (sink === null || !sink.aePaste(text, submit)) {
++          return {
++            ok: false,
++            error:
++              "The shell did not connect within 20 seconds. Nothing was sent; open the shell and run it again.",
++          };
++        }
++        return { ok: true, submitted: submit };
++      },
++    };
++    setAeRunTarget(target);
++    return () => {
++      if (getAeRunTarget() === target) setAeRunTarget(null);
++    };
++  }, [enabled, conversationId]);
++}

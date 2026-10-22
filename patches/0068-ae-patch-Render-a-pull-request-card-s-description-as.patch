@@ -1,0 +1,173 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 06:11:36 -0700
+Subject: [PATCH 068/148] [ae-patch] Render a pull request card's description
+ as markdown
+
+Review details showed the PR body as raw text, so GitHub markdown arrived as
+literal ## and ** marks. The body now goes through the chat's MessageResponse
+(GFM, sanitised, link-safe) in static mode, with remark-breaks matching GitHub's
+single-newline line breaks and headings sized down to suit the card. It renders
+only once Review details opens, and a huge body falls back to the chat's plain
+text view (ChatMarkdown now exports isPathologicalText and PlainTextFallback).
+---
+ web/src/components/AePrCards.test.tsx      | 36 +++++++++++++++++++-
+ web/src/components/AePrCards.tsx           | 39 +++++++++++++++++++---
+ web/src/components/blocks/ChatMarkdown.tsx |  4 +--
+ 3 files changed, 72 insertions(+), 7 deletions(-)
+
+diff --git a/web/src/components/AePrCards.test.tsx b/web/src/components/AePrCards.test.tsx
+index 2dc3f0f89a0087532bd54a090a4faf06a527c494..1b9a577f0281112356ce918bb9c6be9922cf659b 100644
+--- a/web/src/components/AePrCards.test.tsx
++++ b/web/src/components/AePrCards.test.tsx
+@@ -671,7 +671,7 @@ describe("in-app review", () => {
+     renderCards([{ url: url(5) }]);
+     await screen.findByText("Review details");
+     fireEvent.click(screen.getByText("Review details"));
+-    expect(screen.getByText(/Validation: tests passed/)).toBeTruthy();
++    expect(await screen.findByText(/Validation: tests passed/)).toBeTruthy();
+     expect(screen.getByText(/2 files/)).toBeTruthy();
+     fireEvent.click(screen.getByRole("button", { name: "Mark ready for review" }));
+     await waitFor(() => expect(request?.method).toBe("POST"));
+@@ -682,6 +682,40 @@ describe("in-app review", () => {
+     expect(screen.getByRole("button", { name: "Merge" })).toBeEnabled();
+   });
+ 
++  it("renders the description as markdown", async () => {
++    serve(() =>
++      json(card(5, { body: "## Validation\n- **pytest** passed\nsecond line\n\n`dist/` matches" })),
++    );
++    renderCards([{ url: url(5) }]);
++    await screen.findByText("Review details");
++    fireEvent.click(screen.getByText("Review details"));
++    const body = await screen.findByTestId("ae-pr-body");
++    expect(await within(body).findByRole("heading", { name: "Validation" })).toBeTruthy();
++    expect(within(body).getByText("dist/").tagName).toBe("CODE");
++    expect(within(body).getByRole("listitem").querySelector("br")).not.toBeNull();
++    expect(body.textContent).not.toMatch(/##|\*\*/);
++  });
++
++  it("renders the description only once Review details opens", async () => {
++    serve(() => json(card(5, { body: "## Validation" })));
++    renderCards([{ url: url(5) }]);
++    await screen.findByText("Review details");
++    expect(screen.getByTestId("ae-pr-body").childElementCount).toBe(0);
++  });
++
++  it.each([
++    ["keeps an unmatched marker in a finished description", "Trailing **Note", "Trailing **Note"],
++    ["shows a huge description as plain text", `## Log\n${"x".repeat(6_000)}`, "## Log"],
++  ])("%s", async (_name, body, shown) => {
++    serve(() => json(card(5, { body })));
++    renderCards([{ url: url(5) }]);
++    await screen.findByText("Review details");
++    fireEvent.click(screen.getByText("Review details"));
++    const rendered = await screen.findByTestId("ae-pr-body");
++    await waitFor(() => expect(rendered.textContent).toContain(shown));
++    expect(within(rendered).queryByRole("heading")).toBeNull();
++  });
++
+   it("keeps a draft unchanged and shows a failed ready request", async () => {
+     serve((path) =>
+       path.endsWith("/ready")
+diff --git a/web/src/components/AePrCards.tsx b/web/src/components/AePrCards.tsx
+index 007953ba5831cc6defd171a6c303197fe32ff141..495ba8b602973ce66938b75ce00ce20b13f322ad 100644
+--- a/web/src/components/AePrCards.tsx
++++ b/web/src/components/AePrCards.tsx
+@@ -48,6 +48,10 @@
+ 
+ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useId, useMemo, useState } from "react";
++import remarkBreaks from "remark-breaks";
++import { defaultRemarkPlugins } from "streamdown";
++import { MessageResponse } from "@/components/ai-elements/message";
++import { isPathologicalText, PlainTextFallback } from "@/components/blocks/ChatMarkdown";
+ import { Button } from "@/components/ui/button";
+ import {
+   AE_ICON_ALERT_CIRCLE,
+@@ -86,6 +90,12 @@ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+ import { patchAeStatus } from "@/shell/AeStatusMenu";
+ 
++// GitHub renders a single newline in a PR body as a line break; keep GFM too.
++const AE_PR_BODY_REMARK_PLUGINS = [...Object.values(defaultRemarkPlugins), remarkBreaks];
++// Chat-sized headings crowd a card, so a PR body's headings stay near body size.
++const AE_PR_BODY_CLASS =
++  "[&_:is(h1,h2,h3,h4)]:mt-3 [&_:is(h1,h2,h3,h4)]:mb-1 [&_:is(h1,h2)]:text-base [&_:is(h3,h4)]:text-sm";
++
+ /** How often an open card re-reads (the server caches GitHub for a minute). */
+ export const AE_PR_POLL_MS = 30_000;
+ 
+@@ -425,7 +435,24 @@ function ConfirmMerge({
+   );
+ }
+ 
++// A finished body renders static (no streaming repair); a huge one stays plain text.
++function AePrBody({ body }: { body: string | null | undefined }) {
++  if (!body) return <p>No description provided.</p>;
++  if (isPathologicalText(body)) return <PlainTextFallback text={body} />;
++  return (
++    <MessageResponse
++      className={AE_PR_BODY_CLASS}
++      mode="static"
++      remarkPlugins={AE_PR_BODY_REMARK_PLUGINS}
++    >
++      {body}
++    </MessageResponse>
++  );
++}
++
+ function ReviewDetails({ card }: { card: AePrCard }) {
++  // The markdown pipeline runs only once Review details is opened.
++  const [open, setOpen] = useState(false);
+   const queryClient = useQueryClient();
+   const queryKey = ["ae-pr", card.repo, card.number] as const;
+   const ready = useMutation({
+@@ -442,7 +469,11 @@ function ReviewDetails({ card }: { card: AePrCard }) {
+     },
+   });
+   return (
+-    <details className="min-w-0 text-sm" data-testid="ae-pr-review-details">
++    <details
++      className="min-w-0 text-sm"
++      data-testid="ae-pr-review-details"
++      onToggle={(event) => setOpen(event.currentTarget.open)}
++    >
+       <summary className="cursor-pointer py-1">Review details</summary>
+       <div className="flex min-w-0 flex-col gap-2 py-2">
+         <p className="text-muted-foreground">
+@@ -451,9 +482,9 @@ function ReviewDetails({ card }: { card: AePrCard }) {
+           {card.additions !== undefined && ` · +${card.additions}`}
+           {card.deletions !== undefined && ` · −${card.deletions}`}
+         </p>
+-        <p className="max-h-72 overflow-y-auto whitespace-pre-wrap wrap-anywhere">
+-          {card.body || "No description provided."}
+-        </p>
++        <div className="max-h-72 overflow-y-auto" data-testid="ae-pr-body">
++          {open && <AePrBody body={card.body} />}
++        </div>
+         <p className="text-muted-foreground">
+           {aeCiText(card.ci)} · {AE_REVIEW_TEXT[card.review.state]}
+         </p>
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index 5df1da693344c815d211c06c01e28ef3dd8c2858..6cd4594241f058963bd4fc852d208de9dbd21ee4 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -483,7 +483,7 @@ function longestUnbrokenRun(text: string): number {
+  * Whether `text` should bypass the markdown pipeline because rendering it
+  * there would risk locking the tab. See the constants above for the why.
+  */
+-function isPathologicalText(text: string): boolean {
++export function isPathologicalText(text: string): boolean {
+   return (
+     text.length > MAX_MARKDOWN_TEXT_LENGTH || longestUnbrokenRun(text) > MAX_UNBROKEN_TOKEN_LENGTH
+   );
+@@ -495,7 +495,7 @@ function isPathologicalText(text: string): boolean {
+  * break opportunity inside an otherwise unbreakable token. Over-long payloads
+  * are elided so the DOM node itself can't grow without bound.
+  */
+-function PlainTextFallback({ text }: { text: string }) {
++export function PlainTextFallback({ text }: { text: string }) {
+   const truncated = text.length > MAX_PLAINTEXT_DISPLAY_LENGTH;
+   const shown = truncated ? text.slice(0, MAX_PLAINTEXT_DISPLAY_LENGTH) : text;
+   return (

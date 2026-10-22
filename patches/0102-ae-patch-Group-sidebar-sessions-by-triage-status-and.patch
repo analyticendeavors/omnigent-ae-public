@@ -1,0 +1,2863 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 12:18:49 -0700
+Subject: [PATCH 102/148] [ae-patch] Group sidebar sessions by triage status
+ and order them by hand
+
+Reid asked on 2026-10-18 to sort sessions by drag and drop or a chosen order,
+to group them by status with visual separation, and to choose between
+automatic grouping and a fully manual order. This builds on upstream's
+sidebar_grouping_ui view options (2026-10-19) rather than a parallel view.
+
+Grouping gains Triage: Pinned on top, then Blocked, Working, Review, No
+status, Parked and Reference, each header showing the status glyph, the word
+and a row count, then an Archived group that stays collapsed and loads
+archived sessions only once opened. A row's group holds while the pointer is
+in the list, like the Status grouping.
+
+Ordering gains Manual: one saved order per user (GET and PUT /v1/ae/sidebar,
+served out of tree) ranks Sessions, Shared, each project folder and each
+group. Sessions missing from it sort on top, so new ones land first, and a
+move changes only the moved row. Rows move by drag within their own list and
+through a Move submenu in the row menu (flat items on a phone). Moves show at
+once and save in turn on the latest order; a save the server refuses as stale
+replays once on the order it returned. Manual is off while searching and on
+the Archived display. Triage and Manual load list pages up to the 100 rows
+the background refresh keeps current.
+
+A drop on a row-order target is always consumed, since upstream reads an
+unknown drop target as the Sessions list and would unfile a session dropped
+on a sibling in its own folder. Settings > Chat gains a Session list row with
+a reset of the manual order and an Undo.
+
+The logic lives in new AE files; Sidebar.tsx gets small hunks at the edit
+sites (view labels, the group order and titles, the order applied to the
+lists, the drop guard, the collision filter, an optional header title node,
+the Move menu, the row drop target and the Archived group).
+---
+ web/src/hooks/useAeSidebarOrder.test.tsx      | 247 +++++++++
+ web/src/hooks/useAeSidebarOrder.ts            | 284 +++++++++++
+ web/src/lib/aeSessionOrder.test.ts            | 146 ++++++
+ web/src/lib/aeSessionOrder.ts                 | 124 +++++
+ web/src/lib/aeSortIcons.ts                    |  37 ++
+ web/src/lib/aeTriage.test.ts                  |  67 +++
+ web/src/lib/aeTriage.ts                       |  61 +++
+ web/src/lib/sidebarViewPreferences.ts         |  13 +-
+ .../pages/settings/AeChatSettingsSection.tsx  |   5 +-
+ .../settings/AeSessionListSetting.test.tsx    | 124 +++++
+ .../pages/settings/AeSessionListSetting.tsx   |  81 +++
+ web/src/shell/AeArchivedGroup.tsx             | 128 +++++
+ web/src/shell/AeSidebarRowOrder.tsx           | 223 ++++++++
+ web/src/shell/Sidebar.aeSortModes.test.tsx    | 474 ++++++++++++++++++
+ web/src/shell/Sidebar.tsx                     |  76 ++-
+ web/src/shell/aeSidebarStore.test.ts          | 150 ++++++
+ web/src/shell/aeSidebarStore.ts               | 239 +++++++++
+ 17 files changed, 2462 insertions(+), 17 deletions(-)
+ create mode 100644 web/src/hooks/useAeSidebarOrder.test.tsx
+ create mode 100644 web/src/hooks/useAeSidebarOrder.ts
+ create mode 100644 web/src/lib/aeSessionOrder.test.ts
+ create mode 100644 web/src/lib/aeSessionOrder.ts
+ create mode 100644 web/src/lib/aeSortIcons.ts
+ create mode 100644 web/src/lib/aeTriage.test.ts
+ create mode 100644 web/src/lib/aeTriage.ts
+ create mode 100644 web/src/pages/settings/AeSessionListSetting.test.tsx
+ create mode 100644 web/src/pages/settings/AeSessionListSetting.tsx
+ create mode 100644 web/src/shell/AeArchivedGroup.tsx
+ create mode 100644 web/src/shell/AeSidebarRowOrder.tsx
+ create mode 100644 web/src/shell/Sidebar.aeSortModes.test.tsx
+ create mode 100644 web/src/shell/aeSidebarStore.test.ts
+ create mode 100644 web/src/shell/aeSidebarStore.ts
+
+diff --git a/web/src/hooks/useAeSidebarOrder.test.tsx b/web/src/hooks/useAeSidebarOrder.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..0997bd5651b4105758b08ca60bd21256b418cb12
+--- /dev/null
++++ b/web/src/hooks/useAeSidebarOrder.test.tsx
+@@ -0,0 +1,247 @@
++// The manual order's server sync: the read only while Manual is on, the
++// optimistic queued save, the one replay on a stale revision, the rollback on
++// a failure, and the capped page loading Triage and Manual ask for.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, renderHook, waitFor } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn(), toast: vi.fn() }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++vi.mock("@/components/ui/toast", () => ({ showToast: mocks.toast }));
++
++import type { SidebarListQuery } from "@/hooks/useSidebarData";
++import {
++  AE_SIDEBAR_QUERY_KEY,
++  type AeOrderOp,
++  type AeSidebarOrder,
++  aeEnqueueOrder,
++  aeOrderSettled,
++  useAeLoadAllPages,
++  useAeSidebarOrder,
++} from "./useAeSidebarOrder";
++
++const json = (body: unknown, status = 200) =>
++  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++
++function putBodies(): { order: string[]; revision: number }[] {
++  return mocks.fetch.mock.calls
++    .filter(([, init]) => (init as RequestInit | undefined)?.method === "PUT")
++    .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
++}
++
++// Session ids are 32 lowercase hex; the queue sends nothing else.
++const A = "a".repeat(32);
++const B = "b".repeat(32);
++const C = "c".repeat(32);
++const LOADED = [A, B, C];
++const moveTop = (id: string): AeOrderOp => ({
++  kind: "move",
++  id,
++  to: "top",
++  scopeIds: LOADED,
++  loadedIds: LOADED,
++});
++
++let client: QueryClient;
++const shown = () => client.getQueryData<AeSidebarOrder>(AE_SIDEBAR_QUERY_KEY);
++
++beforeEach(() => {
++  client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  mocks.fetch.mockReset();
++  mocks.toast.mockReset();
++});
++
++afterEach(() => client.clear());
++
++function wrapper({ children }: { children: ReactNode }) {
++  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
++}
++
++describe("useAeSidebarOrder", () => {
++  it("reads nothing while Manual is off", async () => {
++    renderHook(() => useAeSidebarOrder(false), { wrapper });
++    await new Promise((resolve) => {
++      setTimeout(resolve, 0);
++    });
++    expect(mocks.fetch).not.toHaveBeenCalled();
++  });
++
++  it("reads the saved order while Manual is on", async () => {
++    mocks.fetch.mockResolvedValue(json({ order: [B, A], revision: 4 }));
++    const { result } = renderHook(() => useAeSidebarOrder(true), { wrapper });
++    await waitFor(() => expect(result.current.data).toEqual({ order: [B, A], revision: 4 }));
++    expect(mocks.fetch).toHaveBeenCalledWith("/v1/ae/sidebar", { method: "GET" });
++  });
++});
++
++describe("aeEnqueueOrder", () => {
++  it("shows a move at once and saves it on the shown revision", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 2 });
++    mocks.fetch.mockResolvedValueOnce(json({ order: [C, A, B], revision: 3 }));
++    expect(aeEnqueueOrder(client, moveTop(C))).toBe(true);
++    expect(shown()).toEqual({ order: [C, A, B], revision: 2 });
++    await waitFor(() => expect(shown()?.revision).toBe(3));
++    expect(putBodies()).toEqual([{ order: [C, A, B], revision: 2 }]);
++    const init = mocks.fetch.mock.calls[0][1] as RequestInit;
++    expect(init.headers).toEqual({ "Content-Type": "application/json" });
++  });
++
++  it("saves nothing for a move that changes nothing", () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [A, B, C], revision: 1 });
++    expect(aeEnqueueOrder(client, moveTop(A))).toBe(false);
++    expect(mocks.fetch).not.toHaveBeenCalled();
++  });
++
++  it("queues quick moves, each save built on the latest order and revision", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 0 });
++    let answerFirst!: (res: Response) => void;
++    mocks.fetch
++      .mockReturnValueOnce(
++        new Promise<Response>((resolve) => {
++          answerFirst = resolve;
++        }),
++      )
++      .mockResolvedValueOnce(json({ order: [B, C, A], revision: 2 }));
++    aeEnqueueOrder(client, moveTop(C));
++    aeEnqueueOrder(client, moveTop(B));
++    expect(shown()?.order).toEqual([B, C, A]);
++    expect(putBodies()).toHaveLength(1);
++    await act(async () => answerFirst(json({ order: [C, A, B], revision: 1 })));
++    await waitFor(() => expect(putBodies()).toHaveLength(2));
++    expect(putBodies()[1]).toEqual({ order: [B, C, A], revision: 1 });
++    await waitFor(() => expect(shown()).toEqual({ order: [B, C, A], revision: 2 }));
++  });
++
++  it("replays the move once on the order a stale save gets back", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 0 });
++    mocks.fetch
++      .mockResolvedValueOnce(
++        json({ error: { code: "conflict", message: "stale", order: [B, A, C], revision: 5 } }, 409),
++      )
++      .mockResolvedValueOnce(json({ order: [C, B, A], revision: 6 }));
++    aeEnqueueOrder(client, moveTop(C));
++    await waitFor(() => expect(putBodies()).toHaveLength(2));
++    expect(putBodies()[1]).toEqual({ order: [C, B, A], revision: 5 });
++    await waitFor(() => expect(shown()).toEqual({ order: [C, B, A], revision: 6 }));
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++
++  it("gives up after a second stale save and shows the saved order", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 0 });
++    const conflict = (revision: number) =>
++      json({ error: { code: "conflict", message: "stale", order: [A], revision } }, 409);
++    mocks.fetch.mockResolvedValueOnce(conflict(5)).mockResolvedValueOnce(conflict(6));
++    aeEnqueueOrder(client, moveTop(C));
++    await waitFor(() => expect(mocks.toast).toHaveBeenCalledTimes(1));
++    expect(putBodies()).toHaveLength(2);
++    expect(shown()).toEqual({ order: [A], revision: 6 });
++    expect(String(mocks.toast.mock.calls[0][0])).toContain("changed on another device");
++  });
++
++  it("rolls back to the last saved order when a save fails", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [A, B, C], revision: 7 });
++    mocks.fetch.mockResolvedValueOnce(
++      json({ error: { code: "invalid_input", message: "bad id" } }, 400),
++    );
++    aeEnqueueOrder(client, moveTop(C));
++    expect(shown()?.order).toEqual([C, A, B]);
++    await waitFor(() => expect(mocks.toast).toHaveBeenCalledTimes(1));
++    expect(shown()).toEqual({ order: [A, B, C], revision: 7 });
++    expect(String(mocks.toast.mock.calls[0][0])).toContain("400: bad id");
++    // Every queued change was undone, so the toast speaks of all of them.
++    expect(String(mocks.toast.mock.calls[0][0])).toContain("recent changes to it were undone");
++  });
++
++  it("keeps the shown order when a read lands while a save is queued", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 0 });
++    let answerPut!: (res: Response) => void;
++    mocks.fetch.mockImplementation((_url: string, init?: RequestInit) =>
++      init?.method === "PUT"
++        ? new Promise<Response>((resolve) => {
++            answerPut = resolve;
++          })
++        : Promise.resolve(json({ order: [], revision: 0 })),
++    );
++    const { result } = renderHook(() => useAeSidebarOrder(true), { wrapper });
++    aeEnqueueOrder(client, moveTop(C));
++    await act(async () => {
++      await result.current.refetch();
++    });
++    expect(mocks.fetch).toHaveBeenCalledWith("/v1/ae/sidebar", { method: "GET" });
++    expect(shown()?.order).toEqual([C, A, B]);
++    await act(async () => answerPut(json({ order: [C, A, B], revision: 1 })));
++  });
++});
++
++describe("aeEnqueueOrder ids and settling", () => {
++  it("never sends a provisional temp: row's id", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 0 });
++    mocks.fetch.mockResolvedValueOnce(json({ order: [C, A, B], revision: 1 }));
++    aeEnqueueOrder(client, {
++      kind: "move",
++      id: C,
++      to: "top",
++      scopeIds: ["temp:new", ...LOADED],
++      loadedIds: LOADED,
++    });
++    aeEnqueueOrder(client, { kind: "set", order: ["temp:new", C, A, B] });
++    await waitFor(() => expect(putBodies().length).toBeGreaterThan(0));
++    for (const body of putBodies()) expect(body.order).not.toContain("temp:new");
++  });
++
++  it("settles true once saved and false once undone", async () => {
++    client.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [], revision: 0 });
++    await expect(aeOrderSettled(client)).resolves.toBe(true);
++    mocks.fetch
++      .mockResolvedValueOnce(json({ order: [], revision: 1 }))
++      .mockResolvedValueOnce(json({ error: { code: "invalid_input", message: "no" } }, 400));
++    aeEnqueueOrder(client, { kind: "set", order: [] });
++    await expect(aeOrderSettled(client)).resolves.toBe(true);
++    aeEnqueueOrder(client, { kind: "set", order: [A] });
++    await expect(aeOrderSettled(client)).resolves.toBe(false);
++  });
++});
++
++describe("useAeLoadAllPages", () => {
++  function listQuery(loaded: number, hasNextPage = true): SidebarListQuery {
++    return {
++      data: {
++        pages: [
++          {
++            data: Array.from({ length: loaded }, (_, i) => ({ id: `s${i}` })),
++            first_id: null,
++            last_id: null,
++            has_more: hasNextPage,
++          },
++        ],
++        pageParams: [undefined],
++      },
++      hasNextPage,
++      isFetchingNextPage: false,
++      isLoading: false,
++      isFetching: false,
++      isError: false,
++      error: null,
++      fetchNextPage: vi.fn(),
++    } as unknown as SidebarListQuery;
++  }
++
++  it("loads the next page while enabled and under the refresh window", () => {
++    const query = listQuery(30);
++    renderHook(() => useAeLoadAllPages(query, true), { wrapper });
++    expect(query.fetchNextPage).toHaveBeenCalledTimes(1);
++  });
++
++  it("stops at the refresh window, at the end, and while disabled", () => {
++    for (const [query, enabled] of [
++      [listQuery(100), true],
++      [listQuery(30, false), true],
++      [listQuery(30), false],
++    ] as const) {
++      renderHook(() => useAeLoadAllPages(query, enabled), { wrapper });
++      expect(query.fetchNextPage).not.toHaveBeenCalled();
++    }
++  });
++});
+diff --git a/web/src/hooks/useAeSidebarOrder.ts b/web/src/hooks/useAeSidebarOrder.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e9d05f8754cb05df561de60ba4ded5bcea4e3285
+--- /dev/null
++++ b/web/src/hooks/useAeSidebarOrder.ts
+@@ -0,0 +1,284 @@
++// The manual session order's sync with the server (omnigent-ae, 2026-10-19):
++// `GET /v1/ae/sidebar` reads it and `PUT /v1/ae/sidebar` saves it, carrying
++// the revision the change was based on. Moves show at once and save in turn,
++// each save built on the latest order; a save the server refuses as stale
++// (409, another device saved first) replays the queued moves once on the
++// order it returned. There is no push for this route, so the order refetches
++// on focus, on reconnect and every minute while the page is visible.
++
++import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
++import { useCallback, useContext, useEffect, useRef } from "react";
++import { showToast } from "@/components/ui/toast";
++import type { SidebarListQuery } from "@/hooks/useSidebarData";
++import { type AeMoveTo, aeIsOrderId, aeMoveInOrder } from "@/lib/aeSessionOrder";
++import { authenticatedFetch } from "@/lib/identity";
++import { SidebarConfigContext } from "@/lib/sidebarConfig";
++
++export const AE_SIDEBAR_QUERY_KEY = ["ae", "sidebar"] as const;
++
++const REFRESH_MS = 60_000;
++
++export interface AeSidebarOrder {
++  order: readonly string[];
++  revision: number;
++}
++
++/** What the server answers before anyone has saved an order. */
++export const AE_EMPTY_ORDER: AeSidebarOrder = { order: [], revision: 0 };
++
++function parseOrder(value: unknown): AeSidebarOrder | null {
++  if (!value || typeof value !== "object") return null;
++  const { order, revision } = value as { order?: unknown; revision?: unknown };
++  if (!Array.isArray(order) || !order.every((id) => typeof id === "string")) return null;
++  if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) return null;
++  return { order, revision };
++}
++
++/** The saved order; throws when the route cannot answer. */
++export async function fetchAeSidebarOrder(): Promise<AeSidebarOrder> {
++  const res = await authenticatedFetch("/v1/ae/sidebar", { method: "GET" });
++  if (!res.ok) throw new Error(`GET /v1/ae/sidebar answered ${res.status}`);
++  const parsed = parseOrder(await res.json());
++  if (!parsed) throw new Error("GET /v1/ae/sidebar answered without an order");
++  return parsed;
++}
++
++export type AePutResult =
++  { ok: true; saved: AeSidebarOrder } | { ok: false; current: AeSidebarOrder };
++
++/**
++ * Save `order` on top of `revision`. A stale revision comes back as the
++ * server's current order (`ok: false`); any other failure throws with the
++ * status and the server's message.
++ */
++export async function putAeSidebarOrder(
++  order: readonly string[],
++  revision: number,
++): Promise<AePutResult> {
++  const res = await authenticatedFetch("/v1/ae/sidebar", {
++    method: "PUT",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ order, revision }),
++  });
++  let body: unknown = null;
++  try {
++    body = await res.json();
++  } catch {
++    // No JSON body; the status line is all there is.
++  }
++  const error = (body as { error?: { message?: unknown } } | null)?.error;
++  if (res.status === 409) {
++    const current = parseOrder(error);
++    if (current) return { ok: false, current };
++  }
++  if (!res.ok) {
++    const message = typeof error?.message === "string" ? `: ${error.message}` : "";
++    throw new Error(`PUT /v1/ae/sidebar answered ${res.status}${message}`);
++  }
++  const saved = parseOrder(body);
++  if (!saved) throw new Error("PUT /v1/ae/sidebar answered without an order");
++  return { ok: true, saved };
++}
++
++/** One change to the order: a move within a list, or a whole new order. */
++export type AeOrderOp =
++  | {
++      kind: "move";
++      id: string;
++      to: AeMoveTo;
++      scopeIds: readonly string[];
++      loadedIds: readonly string[];
++    }
++  | { kind: "set"; order: readonly string[] };
++
++function applyOp(order: readonly string[], op: AeOrderOp): readonly string[] {
++  if (op.kind === "set") return op.order;
++  return aeMoveInOrder({
++    order,
++    loadedIds: op.loadedIds,
++    scopeIds: op.scopeIds,
++    id: op.id,
++    to: op.to,
++  });
++}
++
++interface SaveQueue {
++  /** The last order the server confirmed. */
++  acked: AeSidebarOrder;
++  pending: AeOrderOp[];
++  inflight: boolean;
++  /** A stale save was already replayed once since the last confirmed one. */
++  replayed: boolean;
++  /** Callers waiting for the queue to drain: true once saved, false once undone. */
++  waiters: ((saved: boolean) => void)[];
++}
++
++// One queue per query client, so the sidebar and Settings share it.
++const queues = new WeakMap<QueryClient, SaveQueue>();
++
++function queueOf(queryClient: QueryClient): SaveQueue {
++  let queue = queues.get(queryClient);
++  if (!queue) {
++    queue = { acked: AE_EMPTY_ORDER, pending: [], inflight: false, replayed: false, waiters: [] };
++    queues.set(queryClient, queue);
++  }
++  return queue;
++}
++
++function shownOrder(queryClient: QueryClient): AeSidebarOrder {
++  return queryClient.getQueryData<AeSidebarOrder>(AE_SIDEBAR_QUERY_KEY) ?? AE_EMPTY_ORDER;
++}
++
++export function reasonOf(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++function isBusy(queue: SaveQueue | undefined): boolean {
++  return !!queue && (queue.inflight || queue.pending.length > 0);
++}
++
++function settle(queue: SaveQueue, saved: boolean): void {
++  for (const resolve of queue.waiters.splice(0)) resolve(saved);
++}
++
++async function flush(queryClient: QueryClient, queue: SaveQueue): Promise<void> {
++  if (queue.inflight || queue.pending.length === 0) return;
++  queue.inflight = true;
++  const sent = queue.pending.splice(0);
++  let result: AePutResult;
++  try {
++    // A provisional `temp:` row has no session id yet; the server refuses it.
++    const order = shownOrder(queryClient).order.filter(aeIsOrderId);
++    result = await putAeSidebarOrder(order, queue.acked.revision);
++  } catch (error) {
++    queue.inflight = false;
++    queue.pending = [];
++    queue.replayed = false;
++    queryClient.setQueryData(AE_SIDEBAR_QUERY_KEY, queue.acked);
++    showToast(
++      `Could not save the session order: ${reasonOf(error)}. ` +
++        `Your recent changes to it were undone; try again.`,
++    );
++    settle(queue, false);
++    return;
++  }
++  queue.inflight = false;
++  if (result.ok) {
++    queue.acked = result.saved;
++    queue.replayed = false;
++    // Moves queued meanwhile are already on screen; the next save sends them.
++    if (queue.pending.length === 0) {
++      queryClient.setQueryData(AE_SIDEBAR_QUERY_KEY, result.saved);
++      settle(queue, true);
++    }
++    void flush(queryClient, queue);
++    return;
++  }
++  queue.acked = result.current;
++  const waiting = [...sent, ...queue.pending];
++  if (queue.replayed) {
++    queue.pending = [];
++    queue.replayed = false;
++    queryClient.setQueryData(AE_SIDEBAR_QUERY_KEY, result.current);
++    showToast(
++      "The session order changed on another device, so your recent changes to it were " +
++        "undone. The list shows the saved order; try again.",
++    );
++    settle(queue, false);
++    return;
++  }
++  queue.replayed = true;
++  queue.pending = waiting;
++  queryClient.setQueryData(AE_SIDEBAR_QUERY_KEY, {
++    order: waiting.reduce(applyOp, result.current.order),
++    revision: result.current.revision,
++  });
++  void flush(queryClient, queue);
++}
++
++/**
++ * Apply a change on screen and queue its save. Returns false when it changes
++ * nothing (a move past the end of a list, say), and then saves nothing.
++ */
++export function aeEnqueueOrder(queryClient: QueryClient, op: AeOrderOp): boolean {
++  const queue = queueOf(queryClient);
++  const shown = shownOrder(queryClient);
++  if (!queue.inflight && queue.pending.length === 0) queue.acked = shown;
++  const next = applyOp(shown.order, op);
++  if (next === shown.order) return false;
++  queryClient.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: next, revision: shown.revision });
++  queue.pending.push(op);
++  void flush(queryClient, queue);
++  return true;
++}
++
++/**
++ * A fetched order, unless it would undo what the screen shows: while a save
++ * is queued or running the shown order stands, and an answer older than the
++ * shown revision (a read that raced a save) is dropped.
++ */
++function mergeFetched(queryClient: QueryClient, fetched: AeSidebarOrder): AeSidebarOrder {
++  const shown = queryClient.getQueryData<AeSidebarOrder>(AE_SIDEBAR_QUERY_KEY);
++  if (!shown) return fetched;
++  if (isBusy(queues.get(queryClient))) return shown;
++  return fetched.revision < shown.revision ? shown : fetched;
++}
++
++/**
++ * The order to base a whole-order change on: the shown one while a save is
++ * queued (it carries the queued moves), else a fresh read from the server.
++ */
++export async function aeReadOrder(queryClient: QueryClient): Promise<AeSidebarOrder> {
++  if (isBusy(queues.get(queryClient))) return shownOrder(queryClient);
++  const current = mergeFetched(queryClient, await fetchAeSidebarOrder());
++  queryClient.setQueryData(AE_SIDEBAR_QUERY_KEY, current);
++  return current;
++}
++
++/** Resolves once the queue drains: true when everything saved, false when undone. */
++export function aeOrderSettled(queryClient: QueryClient): Promise<boolean> {
++  const queue = queues.get(queryClient);
++  if (!isBusy(queue)) return Promise.resolve(true);
++  return new Promise((resolve) => {
++    queue?.waiters.push(resolve);
++  });
++}
++
++/** The saved order, read only while `enabled` (Manual ordering on). */
++export function useAeSidebarOrder(enabled: boolean) {
++  const queryClient = useQueryClient();
++  return useQuery({
++    queryKey: AE_SIDEBAR_QUERY_KEY,
++    queryFn: async () => mergeFetched(queryClient, await fetchAeSidebarOrder()),
++    enabled,
++    staleTime: 30_000,
++    refetchInterval: enabled ? REFRESH_MS : false,
++    refetchOnWindowFocus: "always",
++    refetchOnReconnect: "always",
++    retry: false,
++  });
++}
++
++/** The queued, optimistic save, bound to this tree's query client. */
++export function useAeOrderMover(): (op: AeOrderOp) => boolean {
++  const queryClient = useQueryClient();
++  return useCallback((op: AeOrderOp) => aeEnqueueOrder(queryClient, op), [queryClient]);
++}
++
++/**
++ * Load the list's further pages while `enabled`, up to the rows the background
++ * refresh keeps current (`maxRefreshSessions`): a row past that window would
++ * keep a stale status, which Triage groups by and Manual ranks among.
++ */
++export function useAeLoadAllPages(query: SidebarListQuery, enabled: boolean): void {
++  const { maxRefreshSessions } = useContext(SidebarConfigContext);
++  const loaded = query.data?.pages.reduce((count, page) => count + page.data.length, 0) ?? 0;
++  const { hasNextPage, isFetchingNextPage, isError } = query;
++  const fetchNextPage = useRef(query.fetchNextPage);
++  fetchNextPage.current = query.fetchNextPage;
++  useEffect(() => {
++    if (!enabled || !hasNextPage || isFetchingNextPage || isError) return;
++    if (loaded >= maxRefreshSessions) return;
++    void fetchNextPage.current();
++  }, [enabled, hasNextPage, isFetchingNextPage, isError, loaded, maxRefreshSessions]);
++}
+diff --git a/web/src/lib/aeSessionOrder.test.ts b/web/src/lib/aeSessionOrder.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..073205975e4c0a65d7f2bfaec059d402cb928afe
+--- /dev/null
++++ b/web/src/lib/aeSessionOrder.test.ts
+@@ -0,0 +1,146 @@
++import { describe, expect, it } from "vitest";
++import {
++  AE_ORDER_MAX,
++  type AeMoveTo,
++  aeApplyManualOrder,
++  aeIsOrderId,
++  aeMoveInOrder,
++  aeTrimOrder,
++} from "./aeSessionOrder";
++
++const rows = (...ids: string[]) => ids.map((id) => ({ id }));
++const ids = (list: { id: string }[]) => list.map((row) => row.id);
++
++describe("aeApplyManualOrder", () => {
++  it("puts rows the order lacks first, in their incoming order, then the rest by rank", () => {
++    const ordered = aeApplyManualOrder(rows("new2", "b", "new1", "a", "c"), ["c", "a", "b"]);
++    expect(ids(ordered)).toEqual(["new2", "new1", "c", "a", "b"]);
++  });
++
++  it("returns the rows themselves for an empty order", () => {
++    const list = rows("a", "b");
++    expect(aeApplyManualOrder(list, [])).toBe(list);
++  });
++
++  it("ignores ranked ids the list does not hold", () => {
++    expect(ids(aeApplyManualOrder(rows("b", "a"), ["gone", "a", "b"]))).toEqual(["a", "b"]);
++  });
++});
++
++describe("aeMoveInOrder", () => {
++  // Two lists share one order: Sessions holds s1..s4, a folder holds f1 and f2.
++  const loadedIds = ["s1", "f1", "s2", "s3", "f2", "s4"];
++  const sessions = ["s1", "s2", "s3", "s4"];
++  const folder = ["f1", "f2"];
++  const shown = (order: readonly string[], members: string[]) =>
++    ids(aeApplyManualOrder(rows(...loadedIds.filter((id) => members.includes(id))), order));
++  const move = (order: readonly string[], id: string, to: AeMoveTo, scopeIds = sessions) =>
++    aeMoveInOrder({ order, loadedIds, scopeIds, id, to });
++
++  it("moves within the list from an empty order, writing the loaded rows in first", () => {
++    const next = move([], "s3", "top");
++    expect(shown(next, sessions)).toEqual(["s3", "s1", "s2", "s4"]);
++    // The other list shows what it showed.
++    expect(shown(next, folder)).toEqual(["f1", "f2"]);
++    expect(next).toEqual(["s3", "s1", "f1", "s2", "f2", "s4"]);
++  });
++
++  it("handles up, down and bottom by the list's own neighbours", () => {
++    let order = move([], "s3", "up");
++    expect(shown(order, sessions)).toEqual(["s1", "s3", "s2", "s4"]);
++    order = move(order, "s1", "down");
++    expect(shown(order, sessions)).toEqual(["s3", "s1", "s2", "s4"]);
++    order = move(order, "s3", "bottom");
++    expect(shown(order, sessions)).toEqual(["s1", "s2", "s4", "s3"]);
++    expect(shown(order, folder)).toEqual(["f1", "f2"]);
++  });
++
++  it("drops before or after a target the way the insertion line shows", () => {
++    expect(shown(move([], "s1", { after: "s3" }), sessions)).toEqual(["s2", "s3", "s1", "s4"]);
++    expect(shown(move([], "s4", { before: "s2" }), sessions)).toEqual(["s1", "s4", "s2", "s3"]);
++    expect(shown(move([], "s1", { before: "s3" }), sessions)).toEqual(["s2", "s1", "s3", "s4"]);
++  });
++
++  it("moves a folder row among its folder's rows only", () => {
++    const next = move([], "f2", "top", folder);
++    expect(shown(next, folder)).toEqual(["f2", "f1"]);
++    expect(shown(next, sessions)).toEqual(sessions);
++  });
++
++  it("returns the order itself for a move that changes nothing", () => {
++    const order = [...loadedIds];
++    expect(move(order, "s1", "top")).toBe(order);
++    expect(move(order, "s1", "up")).toBe(order);
++    expect(move(order, "s4", "down")).toBe(order);
++    expect(move(order, "s1", { before: "s2" })).toBe(order);
++    expect(move(order, "s1", { after: "missing" })).toBe(order);
++    expect(move(order, "unlisted", "top")).toBe(order);
++  });
++
++  it("keeps a new session on top of its list after other moves", () => {
++    const order = move([], "s4", "top");
++    const withNew = ["s0", ...sessions];
++    expect(ids(aeApplyManualOrder(rows(...withNew), order))).toEqual([
++      "s0",
++      "s4",
++      "s1",
++      "s2",
++      "s3",
++    ]);
++  });
++
++  it("replays on a fresh order by the list as that order shows it", () => {
++    // Another device put s4 first; "up" on s2 now passes s1 only.
++    const fresh = ["s4", "s1", "s2", "s3"];
++    expect(shown(move(fresh, "s2", "up"), sessions)).toEqual(["s4", "s2", "s1", "s3"]);
++  });
++});
++
++describe("aeTrimOrder", () => {
++  it("drops unloaded ids from the end first, keeping the moved id", () => {
++    const order = Array.from({ length: AE_ORDER_MAX + 2 }, (_, i) => `id${i}`);
++    const loaded = new Set(order.slice(0, AE_ORDER_MAX - 5));
++    const last = order[order.length - 1];
++    const trimmed = aeTrimOrder(order, loaded, last);
++    expect(trimmed).toHaveLength(AE_ORDER_MAX);
++    expect(trimmed.at(-1)).toBe(last);
++    expect(trimmed).not.toContain(order[order.length - 2]);
++    expect(trimmed).not.toContain(order[order.length - 3]);
++  });
++
++  it("never drops the moved id, even when every id is loaded", () => {
++    const order = Array.from({ length: AE_ORDER_MAX + 3 }, (_, i) => `id${i}`);
++    const last = order[order.length - 1];
++    const trimmed = aeTrimOrder(order, new Set(order), last);
++    expect(trimmed).toHaveLength(AE_ORDER_MAX);
++    expect(trimmed.at(-1)).toBe(last);
++    expect(trimmed.slice(0, -1)).toEqual(order.slice(0, AE_ORDER_MAX - 1));
++  });
++
++  it("keeps a row moved to the bottom of more than 500 loaded rows", () => {
++    const loadedIds = Array.from({ length: AE_ORDER_MAX + 20 }, (_, i) => `id${i}`);
++    const next = aeMoveInOrder({
++      order: [],
++      loadedIds,
++      scopeIds: loadedIds,
++      id: "id0",
++      to: "bottom",
++    });
++    expect(next).toHaveLength(AE_ORDER_MAX);
++    expect(next.at(-1)).toBe("id0");
++  });
++
++  it("leaves a short order alone", () => {
++    const order = ["a"];
++    expect(aeTrimOrder(order, new Set())).toBe(order);
++  });
++});
++
++describe("aeIsOrderId", () => {
++  it("accepts session ids and refuses a provisional row's", () => {
++    expect(aeIsOrderId("0123456789abcdef0123456789abcdef")).toBe(true);
++    expect(aeIsOrderId("temp:0123456789abcdef0123456789ab")).toBe(false);
++    expect(aeIsOrderId("0123456789ABCDEF0123456789ABCDEF")).toBe(false);
++    expect(aeIsOrderId("abc")).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeSessionOrder.ts b/web/src/lib/aeSessionOrder.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..3ef85c504028e669a1dd51c4296a447ebeb1f3d0
+--- /dev/null
++++ b/web/src/lib/aeSessionOrder.ts
+@@ -0,0 +1,124 @@
++// The sidebar's manual session order (omnigent-ae, 2026-10-19): one saved list
++// of session ids per user (`GET` and `PUT /v1/ae/sidebar`) ranks every list the
++// sidebar shows, Sessions, Shared, each project folder and each group alike.
++// A session the saved order does not hold sorts above the ranked ones, in the
++// list's own order, so a new session lands on top of its list.
++
++/** The most ids the server keeps; it refuses a longer order. */
++export const AE_ORDER_MAX = 500;
++
++/** Session ids are 32 lowercase hex; a provisional `temp:` row's id never enters the order. */
++const SESSION_ID_RE = /^[0-9a-f]{32}$/;
++
++export function aeIsOrderId(id: string): boolean {
++  return SESSION_ID_RE.test(id);
++}
++
++/** Where a move puts the session, within its own list. */
++export type AeMoveTo = "top" | "up" | "down" | "bottom" | { before: string } | { after: string };
++
++// One rank map per saved order, shared by every list that applies it.
++const ranks = new WeakMap<readonly string[], Map<string, number>>();
++
++function rankOf(order: readonly string[]): Map<string, number> {
++  let rank = ranks.get(order);
++  if (!rank) {
++    rank = new Map(order.map((id, index) => [id, index]));
++    ranks.set(order, rank);
++  }
++  return rank;
++}
++
++/**
++ * Rows in manual order: the ones `order` does not hold first, in their
++ * incoming order, then the rest by rank. An empty order returns `rows` itself.
++ */
++export function aeApplyManualOrder<T extends { id: string }>(
++  rows: T[],
++  order: readonly string[],
++): T[] {
++  if (order.length === 0) return rows;
++  const rank = rankOf(order);
++  const unranked = rows.filter((row) => !rank.has(row.id));
++  const ranked = rows
++    .filter((row) => rank.has(row.id))
++    .sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
++  return [...unranked, ...ranked];
++}
++
++/**
++ * The saved order after moving `id` within its list. `loadedIds` is every
++ * loaded row (window and folder rows alike) in the lists' own order; the ones
++ * the saved order lacks are written in first, in that order, so every list
++ * still shows what it showed. `scopeIds` are the members of the moved row's
++ * list, in any order: the list as shown is derived from the order, so a move
++ * replayed on a fresh order lands where it would have on that order. The moved
++ * id then sits next to its new neighbour in the list, which changes no other
++ * list. Returns `order` itself when the move changes nothing.
++ */
++export function aeMoveInOrder({
++  order,
++  loadedIds,
++  scopeIds,
++  id,
++  to,
++}: {
++  order: readonly string[];
++  loadedIds: readonly string[];
++  scopeIds: readonly string[];
++  id: string;
++  to: AeMoveTo;
++}): readonly string[] {
++  const known = new Set(order);
++  const prepend = loadedIds.filter((rowId) => !known.has(rowId));
++  const full = [...prepend, ...order];
++  const members = new Set(scopeIds);
++  const shown = full.filter((rowId) => members.has(rowId));
++  const from = shown.indexOf(id);
++  if (from < 0) return order;
++
++  let dest: number;
++  if (to === "top") dest = 0;
++  else if (to === "bottom") dest = shown.length - 1;
++  else if (to === "up") dest = from - 1;
++  else if (to === "down") dest = from + 1;
++  else {
++    const target = shown.indexOf("before" in to ? to.before : to.after);
++    if (target < 0) return order;
++    if ("before" in to) dest = target > from ? target - 1 : target;
++    else dest = target < from ? target + 1 : target;
++  }
++  if (dest === from || dest < 0 || dest >= shown.length) return order;
++
++  const moved = shown.filter((rowId) => rowId !== id);
++  moved.splice(dest, 0, id);
++  const next = full.filter((rowId) => rowId !== id);
++  if (dest > 0) next.splice(next.indexOf(moved[dest - 1]) + 1, 0, id);
++  else next.splice(next.indexOf(moved[1]), 0, id);
++  return aeTrimOrder(next, new Set(loadedIds), id);
++}
++
++/**
++ * Cap an order at `AE_ORDER_MAX`, dropping ids no list has loaded from the end
++ * first (archived, deleted, or past the loaded window), then the last ranks.
++ * `keep` (the moved id) is never dropped.
++ */
++export function aeTrimOrder(
++  order: readonly string[],
++  loaded: ReadonlySet<string>,
++  keep?: string,
++): readonly string[] {
++  if (order.length <= AE_ORDER_MAX) return order;
++  let excess = order.length - AE_ORDER_MAX;
++  const dropped = new Set<number>();
++  // Two passes from the end: unloaded ids, then any id; never `keep`.
++  for (const droppable of [(rowId: string) => !loaded.has(rowId), () => true]) {
++    for (let index = order.length - 1; index >= 0 && excess > 0; index -= 1) {
++      const rowId = order[index];
++      if (rowId === keep || dropped.has(index) || !droppable(rowId)) continue;
++      dropped.add(index);
++      excess -= 1;
++    }
++  }
++  return order.filter((_, index) => !dropped.has(index));
++}
+diff --git a/web/src/lib/aeSortIcons.ts b/web/src/lib/aeSortIcons.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3077fcbe066b1f6a286ddff58ed622c5659045e
+--- /dev/null
++++ b/web/src/lib/aeSortIcons.ts
+@@ -0,0 +1,37 @@
++// The sidebar's sort-mode icons: Tabler outline icons (@tabler/icons 3.46.0),
++// inlined as their paths so the session list loads no icon set. Drawn with
++// `AeTablerSvg`, like the PR cards' icons (`aePrIcons.ts`).
++
++import { AE_ICON_CIRCLE_DASHED } from "@/lib/aePrIcons";
++import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
++
++const paths = (...d: string[]): AeTablerIconNode => d.map((value) => ["path", { d: value }]);
++
++/** `arrows-sort`: the row menu's Move submenu. */
++export const AE_ICON_ARROWS_SORT = paths("M3 9l4 -4l4 4m-4 -4v14", "M21 15l-4 4l-4 -4m4 4v-14");
++
++/** `arrow-bar-to-up`: Move to top. */
++export const AE_ICON_MOVE_TOP = paths("M12 10l0 10", "M12 10l4 4", "M12 10l-4 4", "M4 4l16 0");
++
++/** `arrow-up`: Move up. */
++export const AE_ICON_MOVE_UP = paths("M12 5l0 14", "M18 11l-6 -6", "M6 11l6 -6");
++
++/** `arrow-down`: Move down. */
++export const AE_ICON_MOVE_DOWN = paths("M12 5l0 14", "M18 13l-6 6", "M6 13l6 6");
++
++/** `arrow-bar-to-down`: Move to bottom. */
++export const AE_ICON_MOVE_BOTTOM = paths(
++  "M4 20l16 0",
++  "M12 14l0 -10",
++  "M12 14l4 -4",
++  "M12 14l-4 -4",
++);
++
++/** `circle-dashed` (shared with the PR cards): the Triage group of sessions with no status. */
++export const AE_ICON_NO_STATUS = AE_ICON_CIRCLE_DASHED;
++
++/** `loader-2` (shared with the PR cards), spun while the Archived group loads more. */
++export { AE_ICON_LOADER } from "@/lib/aePrIcons";
++
++/** `history`: the Triage view's Archived group (unlike Reference's archive box). */
++export const AE_ICON_HISTORY = paths("M12 8l0 4l2 2", "M3.05 11a9 9 0 1 1 .5 4m-.5 5v-5h5");
+diff --git a/web/src/lib/aeTriage.test.ts b/web/src/lib/aeTriage.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..477834ac4c0e686d76b08c47564dc45ee02e2282
+--- /dev/null
++++ b/web/src/lib/aeTriage.test.ts
+@@ -0,0 +1,67 @@
++import { describe, expect, it } from "vitest";
++import { AE_STATUS_VALUES } from "@/lib/aeLabels";
++import { AE_STATUS_WORDS } from "@/components/AeStatusIcon";
++import {
++  AE_TRIAGE_GROUPS,
++  AE_TRIAGE_STATUS,
++  type AeTriageGroup,
++  aeGroupCounts,
++  aeTriageGroupOf,
++} from "./aeTriage";
++
++const row = (status?: string, pending = 0) => ({
++  id: `id-${status ?? "none"}-${pending}`,
++  labels: (status === undefined ? {} : { "ae.status": status }) as Record<string, string>,
++  pending_elicitations_count: pending,
++});
++
++describe("aeTriageGroupOf", () => {
++  it("groups by the shown status, in the triage order", () => {
++    expect(AE_TRIAGE_GROUPS).toEqual([
++      "Blocked",
++      "Working",
++      "Review",
++      "No status",
++      "Parked",
++      "Reference",
++    ]);
++    for (const status of AE_STATUS_VALUES) {
++      expect(aeTriageGroupOf(row(status), null)).toBe(AE_STATUS_WORDS[status]);
++      expect(AE_TRIAGE_STATUS[AE_STATUS_WORDS[status] as AeTriageGroup]).toBe(status);
++    }
++  });
++
++  it("puts a working session waiting on an approval under Blocked", () => {
++    expect(aeTriageGroupOf(row("working", 1), null)).toBe("Blocked");
++  });
++
++  it("puts a missing, blank or unknown status under No status", () => {
++    expect(aeTriageGroupOf(row(), null)).toBe("No status");
++    expect(aeTriageGroupOf(row(" "), null)).toBe("No status");
++    expect(aeTriageGroupOf(row("someday"), null)).toBe("No status");
++  });
++
++  it("holds the first group while a frozen map is passed", () => {
++    const frozen = new Map<string, AeTriageGroup>();
++    const session = row("working");
++    expect(aeTriageGroupOf(session, frozen)).toBe("Working");
++    expect(aeTriageGroupOf({ ...session, labels: { "ae.status": "review" } }, frozen)).toBe(
++      "Working",
++    );
++    expect(aeTriageGroupOf({ ...session, labels: { "ae.status": "review" } }, null)).toBe("Review");
++  });
++});
++
++describe("aeGroupCounts", () => {
++  it("counts rows per title", () => {
++    const counts = aeGroupCounts(
++      new Map([
++        ["a", "Working"],
++        ["b", "Working"],
++        ["c", "Review"],
++      ]),
++    );
++    expect(Object.fromEntries(counts)).toEqual({ Working: 2, Review: 1 });
++    expect(aeGroupCounts(null).size).toBe(0);
++  });
++});
+diff --git a/web/src/lib/aeTriage.ts b/web/src/lib/aeTriage.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1be0c9d8522036c8596fd04df31559c1a9f66089
+--- /dev/null
++++ b/web/src/lib/aeTriage.ts
+@@ -0,0 +1,61 @@
++// The sidebar's Triage grouping (omnigent-ae, 2026-10-19): one group per shown
++// `ae.status`, in the order a person works through them, with the sessions
++// that carry no status between the active and the resting ones.
++
++import type { Conversation } from "@/hooks/useConversations";
++import { type AeStatus, aeDisplayStatus } from "@/lib/aeLabels";
++
++export const AE_TRIAGE_GROUPS = [
++  "Blocked",
++  "Working",
++  "Review",
++  "No status",
++  "Parked",
++  "Reference",
++] as const;
++export type AeTriageGroup = (typeof AE_TRIAGE_GROUPS)[number];
++
++/** Each group's status; `null` for "No status". */
++export const AE_TRIAGE_STATUS: Record<AeTriageGroup, AeStatus | null> = {
++  Blocked: "blocked",
++  Working: "working",
++  Review: "review",
++  "No status": null,
++  Parked: "parked",
++  Reference: "reference",
++};
++
++// The group each status falls in; the titles are the status words the row
++// icons show (`AE_STATUS_WORDS`).
++const GROUP_OF = Object.fromEntries(
++  AE_TRIAGE_GROUPS.flatMap((group) => {
++    const status = AE_TRIAGE_STATUS[group];
++    return status ? [[status, group]] : [];
++  }),
++) as Record<AeStatus, AeTriageGroup>;
++
++/**
++ * A row's group, from the status the row shows (blocked included). A `frozen`
++ * map pins the first answer while the pointer is in the list, so a status
++ * change under the cursor does not move the row to another group.
++ */
++export function aeTriageGroupOf(
++  conversation: Pick<Conversation, "id" | "labels" | "pending_elicitations_count">,
++  frozen: Map<string, AeTriageGroup> | null,
++): AeTriageGroup {
++  const held = frozen?.get(conversation.id);
++  if (held) return held;
++  const status = aeDisplayStatus(conversation);
++  const group: AeTriageGroup = status ? GROUP_OF[status] : "No status";
++  frozen?.set(conversation.id, group);
++  return group;
++}
++
++/** Rows per group title, from the list's id-to-title map. */
++export function aeGroupCounts(
++  groupTitles: ReadonlyMap<string, string> | null,
++): Map<string, number> {
++  const counts = new Map<string, number>();
++  for (const title of groupTitles?.values() ?? []) counts.set(title, (counts.get(title) ?? 0) + 1);
++  return counts;
++}
+diff --git a/web/src/lib/sidebarViewPreferences.ts b/web/src/lib/sidebarViewPreferences.ts
+index 8096cc93f7e5818f9457bdb96f47b4965752f5cd..128c35c8c102c92dd796eff2141379c6835cbc3a 100644
+--- a/web/src/lib/sidebarViewPreferences.ts
++++ b/web/src/lib/sidebarViewPreferences.ts
+@@ -2,8 +2,8 @@
+ 
+ const STORAGE_KEY = "omnigent:sidebar-view";
+ 
+-export type SidebarGrouping = "default" | "status" | "updated";
+-export type SidebarOrdering = "updated" | "status";
++export type SidebarGrouping = "default" | "status" | "updated" | "triage";
++export type SidebarOrdering = "updated" | "status" | "manual";
+ export type SidebarShowField = "updated" | "environment" | "repo" | "branch";
+ 
+ export interface SidebarViewPreferences {
+@@ -12,8 +12,13 @@ export interface SidebarViewPreferences {
+   show: readonly SidebarShowField[];
+ }
+ 
+-export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = ["default", "status", "updated"];
+-export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = ["updated", "status"];
++export const SIDEBAR_GROUPINGS: readonly SidebarGrouping[] = [
++  "default",
++  "status",
++  "updated",
++  "triage",
++];
++export const SIDEBAR_ORDERINGS: readonly SidebarOrdering[] = ["updated", "status", "manual"];
+ export const SIDEBAR_SHOW_FIELDS: readonly SidebarShowField[] = [
+   "updated",
+   "environment",
+diff --git a/web/src/pages/settings/AeChatSettingsSection.tsx b/web/src/pages/settings/AeChatSettingsSection.tsx
+index fcfd92d53ed65fec1bf2e0f28ded1c1dade9fba0..33d243d63a10bd9e3f0e65b8ce85ee6a084e9b51 100644
+--- a/web/src/pages/settings/AeChatSettingsSection.tsx
++++ b/web/src/pages/settings/AeChatSettingsSection.tsx
+@@ -1,9 +1,11 @@
+ // Settings > Chat: options for the chat view. The rail preference lives in the
+-// rail's own store (lib/aeSessionRail.ts), saved with its layout on this device.
++// rail's own store (lib/aeSessionRail.ts), saved with its layout on this device;
++// the session list's manual order lives on the server (AeSessionListSetting).
+ 
+ import { useId } from "react";
+ import { AeTokenDefragSetting } from "@/components/AeTokenDefrag";
+ import { Switch } from "@/components/ui/switch";
++import { AeSessionListSetting } from "./AeSessionListSetting";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
+ 
+ /** The title and description SettingsPage's `Section` shell gives this section. */
+@@ -44,6 +46,7 @@ export function AeChatSettingsSection() {
+     <div data-testid="ae-chat-settings" className="flex flex-col gap-6">
+       <OpenRailInEverySessionControl />
+       <AeTokenDefragSetting />
++      <AeSessionListSetting />
+     </div>
+   );
+ }
+diff --git a/web/src/pages/settings/AeSessionListSetting.test.tsx b/web/src/pages/settings/AeSessionListSetting.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..a50aa352de0e24d89e510ba479d03576290f36eb
+--- /dev/null
++++ b/web/src/pages/settings/AeSessionListSetting.test.tsx
+@@ -0,0 +1,124 @@
++// Settings > Chat > Session list: the pointer to the list's filter button, and
++// "Reset manual order", which saves an empty order and offers an Undo that
++// puts the previous order back.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn(), toast: vi.fn(), showToast: vi.fn() }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
++vi.mock("sonner", () => ({ toast: mocks.toast }));
++
++import { AE_SIDEBAR_QUERY_KEY, aeEnqueueOrder } from "@/hooks/useAeSidebarOrder";
++import { AeSessionListSetting } from "./AeSessionListSetting";
++
++const A = "a".repeat(32);
++const B = "b".repeat(32);
++
++const json = (body: unknown, status = 200) =>
++  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++
++function puts(): { order: string[]; revision: number }[] {
++  return mocks.fetch.mock.calls
++    .filter(([, init]) => (init as RequestInit | undefined)?.method === "PUT")
++    .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
++}
++
++beforeEach(() => {
++  mocks.fetch.mockReset();
++  mocks.toast.mockReset();
++  mocks.showToast.mockReset();
++});
++
++afterEach(cleanup);
++
++describe("AeSessionListSetting", () => {
++  it("points at the list's filter button and renders without a query client", () => {
++    render(<AeSessionListSetting />);
++    expect(screen.getByText("Session list")).toBeInTheDocument();
++    expect(screen.getByText(/filter button at the top of the session list/)).toBeInTheDocument();
++    expect(mocks.fetch).not.toHaveBeenCalled();
++  });
++
++  it("resets the order on the current revision and undoes it", async () => {
++    const qc = new QueryClient();
++    mocks.fetch
++      .mockResolvedValueOnce(json({ order: [B, A], revision: 4 }))
++      .mockResolvedValueOnce(json({ order: [], revision: 5 }))
++      .mockResolvedValueOnce(json({ order: [B, A], revision: 6 }));
++    render(
++      <QueryClientProvider client={qc}>
++        <AeSessionListSetting />
++      </QueryClientProvider>,
++    );
++    fireEvent.click(screen.getByTestId("ae-reset-session-order"));
++    await waitFor(() => expect(mocks.toast).toHaveBeenCalledTimes(1));
++    expect(puts()).toEqual([{ order: [], revision: 4 }]);
++    expect(qc.getQueryData(AE_SIDEBAR_QUERY_KEY)).toEqual({ order: [], revision: 5 });
++    const [title, options] = mocks.toast.mock.calls[0] as [
++      string,
++      { action: { label: string; onClick: () => void } },
++    ];
++    expect(title).toBe("Manual order reset");
++    expect(options.action.label).toBe("Undo");
++    options.action.onClick();
++    await waitFor(() => expect(mocks.showToast).toHaveBeenCalledWith("Manual order restored."));
++    expect(puts()[1]).toEqual({ order: [B, A], revision: 5 });
++    expect(qc.getQueryData(AE_SIDEBAR_QUERY_KEY)).toEqual({ order: [B, A], revision: 6 });
++  });
++
++  it("waits behind a sidebar move still saving, then resets on top of it", async () => {
++    const qc = new QueryClient();
++    qc.setQueryData(AE_SIDEBAR_QUERY_KEY, { order: [A, B], revision: 2 });
++    let answerMove!: (res: Response) => void;
++    mocks.fetch
++      .mockReturnValueOnce(
++        new Promise<Response>((resolve) => {
++          answerMove = resolve;
++        }),
++      )
++      .mockResolvedValueOnce(json({ order: [], revision: 4 }));
++    // The sidebar's move: B to top, saving when Reset is pressed.
++    aeEnqueueOrder(qc, { kind: "set", order: [B, A] });
++    render(
++      <QueryClientProvider client={qc}>
++        <AeSessionListSetting />
++      </QueryClientProvider>,
++    );
++    fireEvent.click(screen.getByTestId("ae-reset-session-order"));
++    await act(async () => answerMove(json({ order: [B, A], revision: 3 })));
++    await waitFor(() => expect(mocks.toast).toHaveBeenCalledTimes(1));
++    // No read raced the move, and the reset went last, on the move's revision.
++    expect(mocks.fetch.mock.calls.every(([, init]) => init?.method === "PUT")).toBe(true);
++    expect(puts()).toEqual([
++      { order: [B, A], revision: 2 },
++      { order: [], revision: 3 },
++    ]);
++    expect(qc.getQueryData(AE_SIDEBAR_QUERY_KEY)).toEqual({ order: [], revision: 4 });
++  });
++
++  it("saves nothing when the order is already empty", async () => {
++    mocks.fetch.mockResolvedValueOnce(json({ order: [], revision: 0 }));
++    render(<AeSessionListSetting />);
++    fireEvent.click(screen.getByTestId("ae-reset-session-order"));
++    await waitFor(() => expect(mocks.showToast).toHaveBeenCalledTimes(1));
++    expect(puts()).toHaveLength(0);
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++
++  it("offers no Undo when the reset could not be saved", async () => {
++    const conflict = (revision: number) =>
++      json({ error: { code: "conflict", message: "stale", order: [B], revision } }, 409);
++    mocks.fetch
++      .mockResolvedValueOnce(json({ order: [A], revision: 1 }))
++      .mockResolvedValueOnce(conflict(2))
++      .mockResolvedValueOnce(conflict(3));
++    render(<AeSessionListSetting />);
++    fireEvent.click(screen.getByTestId("ae-reset-session-order"));
++    await waitFor(() => expect(mocks.showToast).toHaveBeenCalledTimes(1));
++    expect(String(mocks.showToast.mock.calls[0][0])).toContain("another device");
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/pages/settings/AeSessionListSetting.tsx b/web/src/pages/settings/AeSessionListSetting.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1f83aeda0e0c66ac4d724609b7f0559f4ab56158
+--- /dev/null
++++ b/web/src/pages/settings/AeSessionListSetting.tsx
+@@ -0,0 +1,81 @@
++// Settings > Chat: the session list's sort options (omnigent-ae, 2026-10-19).
++// Grouping and Ordering live in the list's own filter menu, per device; the
++// manual order is saved on the server, so its reset lives here, with an Undo
++// that puts the previous order back.
++
++import { QueryClient, QueryClientContext } from "@tanstack/react-query";
++import { useContext, useState } from "react";
++import { toast } from "sonner";
++import { Button } from "@/components/ui/button";
++import { showToast } from "@/components/ui/toast";
++import { aeEnqueueOrder, aeOrderSettled, aeReadOrder, reasonOf } from "@/hooks/useAeSidebarOrder";
++
++const UNDO_MS = 8000;
++
++export function AeSessionListSetting() {
++  // Reset and Undo go through the session list's save queue, so a move still
++  // saving cannot land after them. Settings also renders without a query
++  // client (tests); a local one stands in, with a queue of its own.
++  const appClient = useContext(QueryClientContext);
++  const [localClient] = useState(() => (appClient ? null : new QueryClient()));
++  const queryClient = appClient ?? localClient!;
++  const [busy, setBusy] = useState(false);
++
++  const undo = async (previous: readonly string[]) => {
++    aeEnqueueOrder(queryClient, { kind: "set", order: previous });
++    // A failed save shows the queue's own toast.
++    if (await aeOrderSettled(queryClient)) showToast("Manual order restored.");
++  };
++
++  const reset = async () => {
++    setBusy(true);
++    try {
++      const current = await aeReadOrder(queryClient);
++      if (current.order.length === 0) {
++        showToast("The manual order is already empty; the list shows newest first.");
++        return;
++      }
++      aeEnqueueOrder(queryClient, { kind: "set", order: [] });
++      if (!(await aeOrderSettled(queryClient))) return;
++      toast("Manual order reset", {
++        description: "Sessions now list newest first until you move one.",
++        duration: UNDO_MS,
++        action: { label: "Undo", onClick: () => void undo(current.order) },
++        testId: "ae-session-order-reset-toast",
++      });
++    } catch (error) {
++      showToast(
++        `Could not reset the manual order: ${reasonOf(error)}. Reload the page and try again.`,
++      );
++    } finally {
++      setBusy(false);
++    }
++  };
++
++  return (
++    <div
++      data-testid="ae-session-list-setting"
++      className="flex items-start justify-between gap-6 max-sm:flex-col max-sm:gap-2"
++    >
++      <div className="flex min-w-0 flex-1 flex-col">
++        <span className="text-ui font-medium">Session list</span>
++        <span className="text-ui text-muted-foreground">
++          Pick Triage grouping or Manual ordering from the filter button at the top of the session
++          list. The manual order is saved for your account, so it follows you to every device.
++        </span>
++      </div>
++      <Button
++        type="button"
++        variant="outline"
++        size="sm"
++        disabled={busy}
++        onClick={() => void reset()}
++        data-testid="ae-reset-session-order"
++        componentId="settings.chat.reset_session_order"
++        className="mt-0.5 shrink-0"
++      >
++        Reset manual order
++      </Button>
++    </div>
++  );
++}
+diff --git a/web/src/shell/AeArchivedGroup.tsx b/web/src/shell/AeArchivedGroup.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c827b212f0371b7141e8a8dc9eb542cc4265ed11
+--- /dev/null
++++ b/web/src/shell/AeArchivedGroup.tsx
+@@ -0,0 +1,128 @@
++// The Triage view's last group (omnigent-ae, 2026-10-19): archived sessions,
++// collapsed until opened on this device. Opening it loads the newest archived
++// page; "Show more" loads the next. The sidebar passes its own section
++// component and row props in, so this file imports nothing from Sidebar.tsx.
++
++import { type ComponentType, type MouseEvent, type ReactNode, useMemo, useState } from "react";
++import type { Conversation } from "@/hooks/useConversations";
++import { useArchivedSessions } from "@/hooks/useScopeCache";
++import { AE_ICON_HISTORY, AE_ICON_LOADER } from "@/lib/aeSortIcons";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++
++const STORAGE_KEY = "ae.sidebar.archivedOpen";
++
++function readOpen(): boolean {
++  try {
++    return window.localStorage.getItem(STORAGE_KEY) === "open";
++  } catch {
++    return false;
++  }
++}
++
++function writeOpen(open: boolean): void {
++  try {
++    if (open) window.localStorage.setItem(STORAGE_KEY, "open");
++    else window.localStorage.removeItem(STORAGE_KEY);
++  } catch {
++    // A local view preference; losing it is harmless.
++  }
++}
++
++/** The props the sidebar's `ConversationSection` takes that this group sets. */
++export interface AeSectionProps {
++  title?: string;
++  titleContent?: ReactNode;
++  conversations: Conversation[];
++  activeConversationId: string | null;
++  pinnedConversationIds: string[];
++  collapsed: boolean;
++  onToggleCollapsed: () => void;
++  onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
++  onTogglePinned: (conversationId: string) => void;
++  selectionMode: boolean;
++  selectedIds: Set<string>;
++  onToggleSelected: (conversationId: string, shiftKey?: boolean) => void;
++  onProjectAssigned?: (projectName: string) => void;
++  emptyMessage?: ReactNode;
++  footer?: ReactNode;
++}
++
++type AeRowProps = Omit<
++  AeSectionProps,
++  | "title"
++  | "titleContent"
++  | "conversations"
++  | "collapsed"
++  | "onToggleCollapsed"
++  | "emptyMessage"
++  | "footer"
++>;
++
++export function AeArchivedGroup({
++  show,
++  Section,
++  rowProps,
++}: {
++  /** Triage is on, outside search, selection, and the Shared and Archived displays. */
++  show: boolean;
++  Section: ComponentType<AeSectionProps>;
++  rowProps: AeRowProps;
++}) {
++  const [open, setOpen] = useState(readOpen);
++  const query = useArchivedSessions(show && open);
++  const rows = useMemo(() => query.data?.pages.flatMap((page) => page.data) ?? [], [query.data]);
++  if (!show) return null;
++  const toggle = () => {
++    writeOpen(!open);
++    setOpen(!open);
++  };
++  let footer: ReactNode = null;
++  if (query.isError) {
++    footer = (
++      <p role="status" className="px-2 py-1 text-destructive text-ui">
++        Could not load archived sessions.{" "}
++        <button type="button" onClick={() => void query.refetch()}>
++          Retry
++        </button>
++      </p>
++    );
++  } else if (query.isLoading) {
++    footer = <p className="px-2 py-1 text-muted-foreground text-sm">Loading…</p>;
++  } else if (query.hasNextPage) {
++    footer = (
++      <button
++        type="button"
++        data-testid="ae-archived-show-more"
++        disabled={query.isFetchingNextPage}
++        onClick={() => void query.fetchNextPage()}
++        className="flex w-full cursor-pointer items-center justify-center gap-1.5 rounded-md px-2 py-1.5 text-muted-foreground text-sm hover:bg-muted disabled:pointer-events-none disabled:opacity-50"
++      >
++        {query.isFetchingNextPage ? (
++          <>
++            <AeTablerSvg node={AE_ICON_LOADER} className="size-3 animate-spin" />
++            Loading…
++          </>
++        ) : (
++          "Show more"
++        )}
++      </button>
++    );
++  }
++  return (
++    <Section
++      title="Archived"
++      titleContent={
++        <span className="inline-flex items-center gap-1.5 align-middle">
++          <AeTablerSvg node={AE_ICON_HISTORY} className="size-3.5 shrink-0" />
++          Archived
++        </span>
++      }
++      conversations={rows}
++      collapsed={!open}
++      onToggleCollapsed={toggle}
++      emptyMessage={query.isLoading || query.isError ? undefined : "No archived sessions"}
++      footer={footer}
++      {...rowProps}
++    />
++  );
++}
+diff --git a/web/src/shell/AeSidebarRowOrder.tsx b/web/src/shell/AeSidebarRowOrder.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..e91c8bc9f33fa2a507080b658bd36297b53cb71c
+--- /dev/null
++++ b/web/src/shell/AeSidebarRowOrder.tsx
+@@ -0,0 +1,223 @@
++// The row-level parts of the sidebar's Manual ordering and Triage grouping
++// (omnigent-ae, 2026-10-19): each row as a drop target for reordering its own
++// list, the row menu's Move items, and the Triage group headers.
++
++import { useDroppable } from "@dnd-kit/core";
++import { type ComponentType, type ReactNode, useCallback, useRef } from "react";
++import { createPortal } from "react-dom";
++import { AE_STATUS_ICONS } from "@/components/AeStatusIcon";
++import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
++import { getEmbedRoot } from "@/lib/host";
++import type { AeMoveTo } from "@/lib/aeSessionOrder";
++import {
++  AE_ICON_ARROWS_SORT,
++  AE_ICON_MOVE_BOTTOM,
++  AE_ICON_MOVE_DOWN,
++  AE_ICON_MOVE_TOP,
++  AE_ICON_MOVE_UP,
++  AE_ICON_NO_STATUS,
++} from "@/lib/aeSortIcons";
++import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++import { AE_TRIAGE_STATUS, type AeTriageGroup, aeGroupCounts } from "@/lib/aeTriage";
++import {
++  type AeRowPlace,
++  type AeSidebarView,
++  aeInsertionSide,
++  aeMoveRow,
++  aePlaceOf,
++  useAeSidebarStore,
++} from "./aeSidebarStore";
++
++/**
++ * A row as a drop target for its own list's order: on only while Manual is on,
++ * for listed rows outside Pinned, Archived and selection. A pending save never
++ * toggles it, since every toggle re-measures every target mid-drag. The
++ * insertion line shows on the row under the pointer, never on the dragged one,
++ * portaled above the drag preview, which sits on the pointer and hid it.
++ */
++export function useAeOrderRow(
++  id: string,
++  {
++    isPinned,
++    isArchived,
++    selectionMode,
++  }: { isPinned: boolean; isArchived: boolean; selectionMode: boolean },
++): { setNodeRef: (node: HTMLElement | null) => void; insertion: ReactNode } {
++  const listed = useAeSidebarStore((s) => s.manual && s.listOf.has(id));
++  const enabled = listed && !isPinned && !isArchived && !selectionMode;
++  const { setNodeRef, isOver, active } = useDroppable({
++    id: `ae-order:${id}`,
++    data: { type: "ae-order", id },
++    disabled: !enabled,
++  });
++  const nodeRef = useRef<HTMLElement | null>(null);
++  const setRef = useCallback(
++    (node: HTMLElement | null) => {
++      nodeRef.current = node;
++      setNodeRef(node);
++    },
++    [setNodeRef],
++  );
++  const draggedId = active ? String(active.id) : null;
++  const side =
++    enabled && isOver && draggedId !== null && draggedId !== id
++      ? aeInsertionSide(draggedId, id)
++      : null;
++  const rect = side ? nodeRef.current?.getBoundingClientRect() : undefined;
++  // Same root as the DragOverlay (z-index 999), one layer above it. The accent
++  // color and end dot keep it from reading as a strikethrough on the preview.
++  const insertion =
++    side && rect
++      ? createPortal(
++          <span
++            data-testid="ae-order-insertion"
++            className="pointer-events-none fixed z-[1000] h-0.5 rounded-full bg-sidebar-primary"
++            style={{
++              left: rect.left,
++              width: rect.width,
++              top: (side === "before" ? rect.top : rect.bottom) - 1,
++            }}
++          >
++            <span className="-left-1 -top-[3px] absolute size-2 rounded-full border-2 border-sidebar-primary bg-background" />
++          </span>,
++          getEmbedRoot() ?? document.body,
++        )
++      : null;
++  return { setNodeRef: setRef, insertion };
++}
++
++// ── the Move menu ────────────────────────────────────────────────────────
++
++// The subset of the sidebar's menu-component bundle the Move items render,
++// typed structurally so both the dropdown and the context-menu families fit.
++interface AeMoveItemProps {
++  children?: ReactNode;
++  className?: string;
++  disabled?: boolean;
++  textValue?: string;
++  onSelect?: (event: Event) => void;
++  "data-testid"?: string;
++  "data-move"?: string;
++}
++
++export interface AeMoveMenuComponents {
++  Item: ComponentType<AeMoveItemProps>;
++  Sub: ComponentType<{ children?: ReactNode }>;
++  SubTrigger: ComponentType<{
++    children?: ReactNode;
++    className?: string;
++    "data-testid"?: string;
++  }>;
++  SubContent: ComponentType<{ children?: ReactNode; className?: string }>;
++}
++
++const MOVES: {
++  to: Extract<AeMoveTo, string>;
++  label: string;
++  icon: AeTablerIconNode;
++  /** The places where the move would change nothing. */
++  idleAt: readonly AeRowPlace[];
++}[] = [
++  { to: "top", label: "Move to top", icon: AE_ICON_MOVE_TOP, idleAt: ["only", "first"] },
++  { to: "up", label: "Move up", icon: AE_ICON_MOVE_UP, idleAt: ["only", "first"] },
++  { to: "down", label: "Move down", icon: AE_ICON_MOVE_DOWN, idleAt: ["only", "last"] },
++  { to: "bottom", label: "Move to bottom", icon: AE_ICON_MOVE_BOTTOM, idleAt: ["only", "last"] },
++];
++
++/**
++ * The row menu's Move items while Manual is on: a submenu on desktop, and
++ * plain items under a "Move" heading on a phone, like the Status items. Plain
++ * items rather than radio items: they act, they hold no choice.
++ */
++export function AeMoveMenu({
++  components: C,
++  conversationId,
++  onDone,
++}: {
++  components: AeMoveMenuComponents;
++  conversationId: string;
++  onDone?: () => void;
++}) {
++  const isMobile = useIsMobileViewport();
++  const place = useAeSidebarStore((s) => aePlaceOf(s, conversationId));
++  if (place === null) return null;
++  const items = MOVES.map(({ to, label, icon, idleAt }) => (
++    <C.Item
++      key={to}
++      data-testid="ae-move-item"
++      data-move={to}
++      disabled={idleAt.includes(place)}
++      textValue={label}
++      onSelect={() => {
++        onDone?.();
++        aeMoveRow(conversationId, to);
++      }}
++    >
++      <AeTablerSvg node={icon} className="size-3.5" />
++      {label}
++    </C.Item>
++  ));
++  if (isMobile) {
++    return (
++      <>
++        <p className="px-2 pt-1.5 pb-0.5 text-xs text-muted-foreground">Move</p>
++        {items}
++      </>
++    );
++  }
++  return (
++    <C.Sub>
++      <C.SubTrigger data-testid="ae-move-menu" className="whitespace-nowrap">
++        <AeTablerSvg node={AE_ICON_ARROWS_SORT} className="size-3.5" />
++        Move
++      </C.SubTrigger>
++      <C.SubContent className="min-w-40">{items}</C.SubContent>
++    </C.Sub>
++  );
++}
++
++// ── the Triage headers ───────────────────────────────────────────────────
++
++/**
++ * A Triage group's header text: the status glyph, the word and the row count.
++ * The glyph is hidden from screen readers, so the header reads as the word; a
++ * named status icon there would read it twice.
++ */
++export function AeTriageTitle({ title, count }: { title: string; count: number }) {
++  const status = AE_TRIAGE_STATUS[title as AeTriageGroup] ?? null;
++  const Icon = status ? AE_STATUS_ICONS[status] : null;
++  return (
++    <span
++      data-testid="ae-triage-title"
++      data-group={title}
++      className="inline-flex max-w-full items-center gap-1.5 align-middle"
++    >
++      {Icon ? (
++        <Icon aria-hidden="true" className="size-3.5 shrink-0" />
++      ) : (
++        <AeTablerSvg node={AE_ICON_NO_STATUS} className="size-3.5 shrink-0" />
++      )}
++      <span className="truncate">{title}</span>
++      <span className="shrink-0 tabular-nums opacity-70">{count}</span>
++    </span>
++  );
++}
++
++// Counted once per list update, shared by every group header.
++const counted = new WeakMap<ReadonlyMap<string, string>, Map<string, number>>();
++
++/** The header content for a Triage group; `undefined` keeps every other header as is. */
++export function aeTriageTitle(
++  ae: AeSidebarView,
++  title: string,
++  groupTitles: ReadonlyMap<string, string> | null,
++): ReactNode {
++  if (!ae.triage || !groupTitles) return undefined;
++  let counts = counted.get(groupTitles);
++  if (!counts) {
++    counts = aeGroupCounts(groupTitles);
++    counted.set(groupTitles, counts);
++  }
++  return <AeTriageTitle title={title} count={counts.get(title) ?? 0} />;
++}
+diff --git a/web/src/shell/Sidebar.aeSortModes.test.tsx b/web/src/shell/Sidebar.aeSortModes.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8273f60fc472f7c97ab3d7936434507120f841da
+--- /dev/null
++++ b/web/src/shell/Sidebar.aeSortModes.test.tsx
+@@ -0,0 +1,474 @@
++// The sidebar's Triage grouping and Manual ordering (omnigent-ae, 2026-10-19),
++// with the sidebar_grouping_ui flag on:
++//   1. The filter menu offers Triage under Grouping and Manual under Ordering.
++//   2. Triage lists Pinned, then one group per status with its glyph, word and
++//      count, then a collapsed Archived group that loads only when opened.
++//   3. Manual reads the saved order only while it is on, shows rows in it with
++//      new sessions on top, and moves rows from the row menu and by drag.
++//   4. A filed session dropped on a sibling in its own folder stays filed.
++
++import type * as IdentityModule from "@/lib/identity";
++import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
++
++const mocks = vi.hoisted(() => ({
++  fetch: vi.fn(),
++  isMobile: false,
++  moveToProject: vi.fn(),
++  projects: [] as string[],
++  folderRows: {} as Record<string, unknown[]>,
++  pinned: [] as unknown[],
++  archivedFetchNext: vi.fn(),
++}));
++
++vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => mocks.isMobile }));
++vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
++vi.mock("@/lib/identity", async (importOriginal) => ({
++  ...(await importOriginal<typeof IdentityModule>()),
++  authenticatedFetch: mocks.fetch,
++  getCurrentUserId: () => "viewer@example.com",
++  resolveIdentity: () => Promise.resolve("viewer@example.com"),
++}));
++vi.mock("@/hooks/useConversations", async () => {
++  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
++  return {
++    ...conversationHooksMock(),
++    usePinnedConversations: () => ({
++      data: { conversations: mocks.pinned, filterHonored: true },
++      isSuccess: true,
++    }),
++    useProjects: () => ({
++      data: mocks.projects.map((name) => ({ id: `p_${name}`, name })),
++    }),
++    useProjectSessions: (project: string, enabled: boolean) => ({
++      data: enabled
++        ? {
++            pages: [
++              {
++                data: mocks.folderRows[project] ?? [],
++                first_id: null,
++                last_id: null,
++                has_more: false,
++              },
++            ],
++            pageParams: [undefined],
++          }
++        : undefined,
++      isLoading: false,
++      hasNextPage: false,
++      isFetchingNextPage: false,
++      fetchNextPage: vi.fn(),
++    }),
++    useMoveToProject: () => ({ mutate: mocks.moveToProject }),
++  };
++});
++vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { MemoryRouter } from "react-router-dom";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { type Conversation, useConversations } from "@/hooks/useConversations";
++import { SidebarDataProvider } from "@/hooks/useSidebarData";
++import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
++import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
++import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
++import { useAeSidebarStore } from "./aeSidebarStore";
++import { Sidebar } from "./Sidebar";
++
++const useConvMock = vi.mocked(useConversations);
++
++let server = { order: [] as string[], revision: 0 };
++
++const json = (body: unknown, status = 200) =>
++  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++
++function sidebarCalls(method: string) {
++  return mocks.fetch.mock.calls.filter(
++    ([url, init]) =>
++      url === "/v1/ae/sidebar" && ((init as RequestInit | undefined)?.method ?? "GET") === method,
++  );
++}
++
++// Rows are named in the tests; their ids are 32 lowercase hex, as the server's
++// are, since only such ids enter the saved order. `temp:` names stay as is.
++const NAMES = new Map<string, string>();
++function sid(name: string): string {
++  if (name.startsWith("temp:")) return name;
++  const id = Buffer.from(name).toString("hex").padStart(32, "0");
++  NAMES.set(id, name);
++  return id;
++}
++const nameOf = (id: string) => NAMES.get(id) ?? id;
++
++/** The last PUT's order, by row name. */
++function lastPut(): { order: string[]; revision: number } {
++  const calls = sidebarCalls("PUT");
++  const body = JSON.parse(String((calls.at(-1)![1] as RequestInit).body));
++  return { ...body, order: body.order.map(nameOf) };
++}
++
++function row(name: string, updated: number, extra: Partial<Conversation> = {}): Conversation {
++  return conversation(sid(name), {
++    title: name,
++    updated_at: updated,
++    created_at: updated,
++    ...extra,
++  });
++}
++
++function serve(rows: Conversation[], archived: Conversation[] = [], archivedMore = false) {
++  useConvMock.mockImplementation((...args: unknown[]) => {
++    if (args[4] !== "archived") return conversationPage(rows);
++    const page = conversationPage(archived) as unknown as Record<string, unknown>;
++    return {
++      ...page,
++      hasNextPage: archivedMore,
++      fetchNextPage: mocks.archivedFetchNext,
++    } as unknown as ReturnType<typeof useConversations>;
++  });
++}
++
++function setView(grouping: string, ordering: string) {
++  localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping, ordering, show: [] }));
++}
++
++function renderSidebar() {
++  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  return render(
++    <QueryClientProvider client={qc}>
++      <SidebarDataProvider>
++        <TooltipProvider>
++          <MemoryRouter initialEntries={["/"]}>
++            <CapabilitiesProvider
++              info={{
++                ...FALLBACK_SERVER_INFO,
++                features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
++              }}
++            >
++              <Sidebar open={true} onClose={vi.fn()} />
++            </CapabilitiesProvider>
++          </MemoryRouter>
++        </TooltipProvider>
++      </SidebarDataProvider>
++    </QueryClientProvider>,
++  );
++}
++
++function headerNames(): string[] {
++  return [...document.querySelectorAll("h2 > button")].map((button) => button.textContent ?? "");
++}
++
++function rowIds(): string[] {
++  return [...document.querySelectorAll("li[data-sidebar-session-id]")].map((li) =>
++    nameOf(li.getAttribute("data-sidebar-session-id") ?? ""),
++  );
++}
++
++function rowItem(name: string): HTMLElement {
++  return document.querySelector<HTMLElement>(`li[data-sidebar-session-id="${sid(name)}"]`)!;
++}
++
++function openRowMenu(id: string) {
++  fireEvent.pointerDown(within(rowItem(id)).getByTestId("conversation-actions"), { button: 0 });
++}
++
++function openFilterSubmenu(testId: string) {
++  fireEvent.pointerDown(screen.getByTestId("session-filter"), {
++    button: 0,
++    ctrlKey: false,
++    pointerType: "mouse",
++  });
++  fireEvent.keyDown(screen.getByTestId(testId), { key: "ArrowRight" });
++}
++
++// jsdom has no layout, so give each session row a stacked rect for dnd-kit's
++// pointer collision; everything else stays zero-sized and never collides.
++const ROW_HEIGHT = 30;
++function stubRowRects() {
++  vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
++    const rows = [...document.querySelectorAll("li[data-sidebar-session-id]")];
++    const index = rows.indexOf(this);
++    if (index < 0) return new DOMRect(0, 0, 0, 0);
++    return new DOMRect(0, index * ROW_HEIGHT, 200, ROW_HEIGHT);
++  });
++}
++
++function rowCenter(id: string) {
++  return { clientX: 50, clientY: rowIds().indexOf(id) * ROW_HEIGHT + ROW_HEIGHT / 2 };
++}
++
++async function drag(sourceId: string, targetId: string) {
++  const start = rowCenter(sourceId);
++  const target = rowCenter(targetId);
++  fireEvent.mouseDown(rowItem(sourceId), { button: 0, ...start });
++  fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
++  await act(async () => {
++    fireEvent.mouseMove(document, target);
++  });
++  const insertion = screen.queryByTestId("ae-order-insertion");
++  await act(async () => {
++    fireEvent.mouseUp(document, target);
++  });
++  return insertion;
++}
++
++beforeEach(() => {
++  localStorage.clear();
++  mocks.isMobile = false;
++  mocks.projects = [];
++  mocks.folderRows = {};
++  mocks.pinned = [];
++  mocks.moveToProject.mockReset();
++  mocks.archivedFetchNext.mockReset();
++  server = { order: [], revision: 0 };
++  mocks.fetch.mockReset();
++  mocks.fetch.mockImplementation(async (url: string, init?: RequestInit) => {
++    if (url !== "/v1/ae/sidebar") return json({}, 404);
++    if (init?.method === "PUT") {
++      const body = JSON.parse(String(init.body)) as { order: string[] };
++      server = { order: body.order, revision: server.revision + 1 };
++    }
++    return json(server);
++  });
++});
++
++afterEach(async () => {
++  fireEvent.mouseUp(document);
++  cleanup();
++  await new Promise((resolve) => {
++    setTimeout(resolve, 20);
++  });
++  vi.restoreAllMocks();
++  useConvMock.mockReset();
++});
++
++describe("filter menu", () => {
++  it("offers Triage under Grouping and Manual under Ordering", () => {
++    serve([row("a", 3)]);
++    renderSidebar();
++    openFilterSubmenu("session-grouping-menu");
++    expect(screen.getByTestId("session-grouping-triage")).toHaveTextContent("Triage");
++    fireEvent.click(screen.getByTestId("session-grouping-triage"));
++    expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!)).toMatchObject({
++      grouping: "triage",
++    });
++    openFilterSubmenu("session-ordering-menu");
++    expect(screen.getByTestId("session-ordering-manual")).toHaveTextContent("Manual");
++  });
++});
++
++describe("Triage grouping", () => {
++  const ROWS = [
++    row("w", 9, { labels: { "ae.status": "working" } }),
++    row("blk", 8, { labels: { "ae.status": "working" }, pending_elicitations_count: 1 }),
++    row("r", 7, { labels: { "ae.status": "review" } }),
++    row("n", 6),
++    row("p", 5, { labels: { "ae.status": "parked" } }),
++    row("ref", 4, { labels: { "ae.status": "reference" } }),
++    row("w2", 3, { labels: { "ae.status": "working" } }),
++    row("pin", 2, { labels: { "omnigent.pinned": "1" } }),
++  ];
++
++  it("lists Pinned, then each status group with its count, then Archived", () => {
++    setView("triage", "updated");
++    mocks.pinned = [ROWS[7]];
++    serve(ROWS);
++    renderSidebar();
++    expect(headerNames()).toEqual([
++      "Pinned",
++      "Blocked1",
++      "Working2",
++      "Review1",
++      "No status1",
++      "Parked1",
++      "Reference1",
++      "Archived",
++    ]);
++    const working = screen.getAllByTestId("ae-triage-title")[1];
++    expect(working).toHaveAttribute("data-group", "Working");
++    // The glyph is hidden, so the header never reads the status twice.
++    expect(within(working).queryByRole("img")).toBeNull();
++    expect(working.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
++    expect(rowIds().slice(0, 3)).toEqual(["pin", "blk", "w"]);
++  });
++
++  it("keeps every other grouping's headers as they were", () => {
++    setView("status", "updated");
++    serve(ROWS);
++    renderSidebar();
++    expect(screen.queryByTestId("ae-triage-title")).toBeNull();
++    expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
++  });
++
++  it("loads archived sessions only once the Archived group opens, and shows more", () => {
++    setView("triage", "updated");
++    serve([row("a", 3)], [row("old", 1, { archived: true })], true);
++    renderSidebar();
++    const archivedEnabled = () =>
++      useConvMock.mock.calls.some(
++        (args) => args[4] === "archived" && (args[2] as { enabled?: boolean })?.enabled === true,
++      );
++    expect(archivedEnabled()).toBe(false);
++    expect(rowIds()).not.toContain("old");
++    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
++    expect(archivedEnabled()).toBe(true);
++    expect(rowIds()).toContain("old");
++    expect(localStorage.getItem("ae.sidebar.archivedOpen")).toBe("open");
++    // Tabler history, so it does not read as the Reference group's archive box.
++    const glyph = screen.getByRole("button", { name: "Archived" }).querySelector("svg path");
++    expect(glyph).toHaveAttribute("d", "M12 8l0 4l2 2");
++    fireEvent.click(screen.getByTestId("ae-archived-show-more"));
++    expect(mocks.archivedFetchNext).toHaveBeenCalledTimes(1);
++  });
++
++  it("hides Archived in selection mode and on the Shared display", () => {
++    setView("triage", "updated");
++    serve([row("a", 3), row("s", 2, { owner: "other@example.com" })]);
++    renderSidebar();
++    expect(screen.getByRole("button", { name: "Archived" })).toBeInTheDocument();
++    fireEvent.click(screen.getByTestId("toggle-selection-mode"));
++    expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
++    fireEvent.click(screen.getByRole("button", { name: "Exit selection mode" }));
++    openFilterSubmenu("session-display-menu");
++    fireEvent.click(screen.getByTestId("session-filter-shared"));
++    expect(screen.queryByRole("button", { name: "Archived" })).toBeNull();
++  });
++});
++
++describe("Manual ordering", () => {
++  it("reads the saved order only while Manual is on", async () => {
++    serve([row("a", 3)]);
++    renderSidebar();
++    await new Promise((resolve) => {
++      setTimeout(resolve, 20);
++    });
++    expect(sidebarCalls("GET")).toHaveLength(0);
++    cleanup();
++    setView("default", "manual");
++    renderSidebar();
++    await waitFor(() => expect(sidebarCalls("GET")).toHaveLength(1));
++  });
++
++  it("shows rows in the saved order, a session it lacks on top", async () => {
++    server = { order: ["c", "a"].map(sid), revision: 3 };
++    setView("default", "manual");
++    serve([row("a", 3), row("b", 2), row("c", 1)]);
++    renderSidebar();
++    await waitFor(() => expect(rowIds()).toEqual(["b", "c", "a"]));
++  });
++
++  it("moves a row from the menu and saves the order", async () => {
++    server = { order: ["a", "b", "c"].map(sid), revision: 3 };
++    setView("default", "manual");
++    serve([row("a", 3), row("b", 2), row("c", 1)]);
++    renderSidebar();
++    await waitFor(() => expect(rowIds()).toEqual(["a", "b", "c"]));
++    fireEvent.contextMenu(screen.getByRole("link", { name: /^c/ }));
++    fireEvent.keyDown(screen.getByTestId("ae-move-menu"), { key: "ArrowRight" });
++    const item = (to: string) =>
++      screen.getAllByTestId("ae-move-item").find((el) => el.getAttribute("data-move") === to)!;
++    expect(item("down")).toHaveAttribute("data-disabled");
++    expect(item("bottom")).toHaveAttribute("data-disabled");
++    fireEvent.click(item("top"));
++    await waitFor(() => expect(rowIds()).toEqual(["c", "a", "b"]));
++    await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
++    expect(lastPut()).toEqual({ order: ["c", "a", "b"], revision: 3 });
++  });
++
++  it("offers no Move items outside Manual", () => {
++    serve([row("a", 3), row("b", 2)]);
++    renderSidebar();
++    fireEvent.contextMenu(screen.getByRole("link", { name: /^a/ }));
++    expect(screen.queryByTestId("ae-move-menu")).toBeNull();
++  });
++
++  it("lists the Move items flat under a Move label on a phone", async () => {
++    mocks.isMobile = true;
++    setView("default", "manual");
++    serve([row("a", 3), row("b", 2)]);
++    renderSidebar();
++    await waitFor(() => expect(useAeSidebarStore.getState().manual).toBe(true));
++    openRowMenu("a");
++    expect(screen.getByText("Move", { selector: "p" })).toBeInTheDocument();
++    expect(screen.getAllByTestId("ae-move-item").map((item) => item.textContent)).toEqual([
++      "Move to top",
++      "Move up",
++      "Move down",
++      "Move to bottom",
++    ]);
++    // Plain items: the Status values stay the menu's only radio items.
++    expect(screen.getAllByRole("menuitemradio")).toHaveLength(5);
++    fireEvent.click(screen.getByText("Move to bottom"));
++    await waitFor(() => expect(rowIds()).toEqual(["b", "a"]));
++  });
++
++  it("keeps a session still being created out of the saved order", async () => {
++    mocks.isMobile = true;
++    setView("default", "manual");
++    serve([row("temp:new", 4, { provisional: true }), row("a", 3), row("b", 2)]);
++    renderSidebar();
++    await waitFor(() => expect(useAeSidebarStore.getState().manual).toBe(true));
++    expect(useAeSidebarStore.getState().loadedIds).not.toContain("temp:new");
++    openRowMenu("b");
++    fireEvent.click(screen.getByText("Move up"));
++    await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
++    expect(lastPut().order).toEqual(["b", "a"]);
++    // The unsaved row is listed (a provisional row carries no row id attribute).
++    expect(screen.getByRole("link", { name: /temp:new/ })).toBeInTheDocument();
++    expect(useAeSidebarStore.getState().listOf.get("temp:new")).toBe("sessions");
++  });
++
++  it("reorders the Sessions list by drag", async () => {
++    stubRowRects();
++    setView("default", "manual");
++    serve([row("a", 3), row("b", 2), row("c", 1)]);
++    renderSidebar();
++    await waitFor(() => expect(useAeSidebarStore.getState().listOf.size).toBe(3));
++    const insertion = await drag("c", "a");
++    expect(insertion).not.toBeNull();
++    await waitFor(() => expect(rowIds()).toEqual(["c", "a", "b"]));
++    await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
++  });
++
++  it("keeps a filed session in its folder when dropped on a sibling there", async () => {
++    stubRowRects();
++    mocks.projects = ["Alpha"];
++    const filed = [
++      row("f1", 3, { labels: { omni_project: "Alpha" } }),
++      row("f2", 2, { labels: { omni_project: "Alpha" } }),
++    ];
++    mocks.folderRows = { Alpha: filed };
++    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
++    setView("default", "manual");
++    serve([...filed, row("s1", 1)]);
++    renderSidebar();
++    await waitFor(() =>
++      expect(useAeSidebarStore.getState().listOf.get(sid("f2"))).toBe("folder:Alpha"),
++    );
++    expect(rowIds().slice(0, 2)).toEqual(["f1", "f2"]);
++    await drag("f2", "f1");
++    expect(mocks.moveToProject).not.toHaveBeenCalled();
++    await waitFor(() => expect(rowIds().slice(0, 2)).toEqual(["f2", "f1"]));
++    await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
++  });
++
++  it("does nothing when a row drops on a row in another Triage group", async () => {
++    stubRowRects();
++    setView("triage", "manual");
++    serve([
++      row("w", 2, { labels: { "ae.status": "working" } }),
++      row("r", 1, { labels: { "ae.status": "review" } }),
++    ]);
++    renderSidebar();
++    await waitFor(() => expect(useAeSidebarStore.getState().listOf.size).toBe(2));
++    const insertion = await drag("r", "w");
++    expect(insertion).toBeNull();
++    await new Promise((resolve) => {
++      setTimeout(resolve, 20);
++    });
++    expect(sidebarCalls("PUT")).toHaveLength(0);
++    expect(mocks.moveToProject).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index c1a7048c2122f568a0b0b2e55a2c3dce56b6a083..aaeceb023b93cf887ed753095e9f4e40678056a3 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -86,7 +86,6 @@ import {
+   type DragStartEvent,
+   MeasuringStrategy,
+   MouseSensor,
+-  pointerWithin,
+   TouchSensor,
+   useDraggable,
+   useDroppable,
+@@ -238,6 +237,16 @@ import { useAeProjectMarker, useAeSessionRowState } from "@/hooks/aeSessionActiv
+ import { AeSlotsPill } from "@/components/AeSlotsPill";
+ import { AeStatusMenu } from "@/shell/AeStatusMenu";
+ import { AeSplitMenuItem } from "@/shell/AeSplitMenuItem";
++import { AeArchivedGroup } from "@/shell/AeArchivedGroup";
++import { AeMoveMenu, aeTriageTitle, useAeOrderRow } from "@/shell/AeSidebarRowOrder";
++import {
++  aeHandleOrderDrop,
++  aePointerWithin,
++  useAeFolderOrder,
++  useAePublishSidebarScopes,
++  useAeSidebarView,
++} from "@/shell/aeSidebarStore";
++import { AE_TRIAGE_GROUPS } from "@/lib/aeTriage";
+ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+ import { useViewerId } from "@/hooks/useViewerId";
+ import { useExtensions } from "@/extensions/ExtensionProvider";
+@@ -1494,6 +1503,7 @@ function ProjectFolder({
+   }, [expanded, name, watchedRows, registerFolder]);
+   useEffect(() => () => registerFolder(name, null), [expanded, name, registerFolder]);
+   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
++  const aeFolderOrder = useAeFolderOrder();
+   const conversations = useMemo(() => {
+     // Union the folder's own pages with its members from the globally-loaded
+     // window, window rows winning: those carry the move overlay
+@@ -1503,12 +1513,13 @@ function ProjectFolder({
+     for (const c of query.data?.pages.flatMap((page) => page.data) ?? []) byId.set(c.id, c);
+     for (const c of windowConversations) byId.set(c.id, c);
+     // Pinned sessions live in the global Pinned section, not their folder.
+-    return sortByUpdatedAtDesc(
++    const byUpdated = sortByUpdatedAtDesc(
+       [...byId.values()].filter((c) => !pinnedSet.has(c.id)),
+       activeOverride,
+       frozenSortKeys,
+     );
+-  }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys]);
++    return aeFolderOrder(byUpdated);
++  }, [query.data, windowConversations, pinnedSet, activeOverride, frozenSortKeys, aeFolderOrder]);
+   const errors = useSessionErrorStates(conversations);
+   const startingConversationId = useChatStore((s) =>
+     s.status === "streaming" || s.terminalPending ? s.conversationId : null,
+@@ -1761,7 +1772,11 @@ function ConversationList({
+   );
+   const grouped = view.grouping !== "default";
+   const groupOrder: readonly string[] =
+-    view.grouping === "status" ? STATUS_BUCKETS : UPDATED_BUCKETS;
++    view.grouping === "triage"
++      ? AE_TRIAGE_GROUPS
++      : view.grouping === "status"
++        ? STATUS_BUCKETS
++        : UPDATED_BUCKETS;
+   // Status buckets read the unread mirror and the drafts store; only a status
+   // view subscribes, so other views don't re-render the list on those writes.
+   const statusView = view.grouping === "status" || view.ordering === "status";
+@@ -1879,6 +1894,7 @@ function ConversationList({
+     frozenKeysRef.current.clear();
+     frozenStatusRef.current.clear();
+   }, [orderFrozen]);
++  const ae = useAeSidebarView({ view, orderFrozen, conversationsQuery, searchQuery, activeTab });
+ 
+   // Build sections: Pinned and Archived are peeled off; the rest splits into
+   // the viewer's own sessions (Chats) and ones shared with them. Archived
+@@ -1943,7 +1959,7 @@ function ConversationList({
+         id,
+         name,
+         icon,
+-        conversations: sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys),
++        conversations: ae.applyOrder(sortByUpdatedAtDesc(inProject, activeOverride, frozenKeys)),
+       };
+     });
+     // NOTE: empty projects are intentionally NOT filtered out. A project comes
+@@ -1973,7 +1989,7 @@ function ConversationList({
+     const allOrdered =
+       view.ordering === "status"
+         ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
+-        : byUpdated;
++        : ae.applyOrder(byUpdated);
+     // Grouped views fold Shared into the groups too, so the first group takes
+     // the Projects header's place.
+     const splitShared = groupingUi && !grouped;
+@@ -1987,8 +2003,8 @@ function ConversationList({
+     const groupTitles = new Map<string, string>(
+       ordered.map((c) => [
+         c.id,
+-        view.grouping === "status"
+-          ? statusOf(c)
++        view.grouping === "status" || ae.triage
++          ? (ae.triageTitle(c) ?? statusOf(c))
+           : updatedBucket(
+               frozenKeys?.get(c.id) ??
+                 (activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at),
+@@ -2020,6 +2036,7 @@ function ConversationList({
+     unseenTick,
+     draftIds,
+     startingId,
++    ae,
+   ]);
+ 
+   const config = useContext(SidebarConfigContext);
+@@ -2215,6 +2232,7 @@ function ConversationList({
+       setActiveDrag(null);
+       setOverPin(null);
+       if (!dragged) return;
++      if (aeHandleOrderDrop(dragged.id, event.over)) return;
+       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
+       const action = resolveSidebarDrop(
+         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
+@@ -2338,6 +2356,7 @@ function ConversationList({
+     }
+     return [...byId.values()];
+   }, [sections.projectGroups, folderConversations]);
++  useAePublishSidebarScopes(ae, loadedSections, folderConversations, activeOverride, frozenKeys);
+ 
+   // The bulk-action bar lives under the header of the section it targets, so it
+   // unmounts when that section empties (e.g. every selected session
+@@ -2607,7 +2626,7 @@ function ConversationList({
+           const droppableContainers = args.droppableContainers.filter(
+             (container) => (container.data.current?.type === "project-order") === ordering,
+           );
+-          if (!ordering) return pointerWithin({ ...args, droppableContainers });
++          if (!ordering) return aePointerWithin({ ...args, droppableContainers });
+           // Restrict project drops to the project list inside the sidebar.
+           if (args.pointerCoordinates) {
+             const rects = droppableContainers
+@@ -2858,6 +2877,11 @@ function ConversationList({
+                             <ConversationSection
+                               key={group.title}
+                               title={group.title}
++                              titleContent={aeTriageTitle(
++                                ae,
++                                group.title,
++                                loadedSections.groupTitles,
++                              )}
+                               conversations={group.conversations}
+                               footer={
+                                 index === sessionGroups.length - 1 ? sessionStatus : undefined
+@@ -2908,6 +2932,11 @@ function ConversationList({
+                       scrollRoot={scrollContainerRef}
+                     />
+                   )}
++                  <AeArchivedGroup
++                    show={ae.archivedGroup && !selectionMode}
++                    Section={ConversationSection}
++                    rowProps={sessionRowProps}
++                  />
+                 </>
+               )}
+             </div>
+@@ -3059,6 +3088,7 @@ function projectMarkerState(
+ function SectionHeader({
+   headerDrag,
+   title,
++  titleContent,
+   icon,
+   marker,
+   active = false,
+@@ -3072,6 +3102,8 @@ function SectionHeader({
+ }: {
+   headerDrag?: ProjectHeaderDrag;
+   title: string;
++  /** Shown in place of `title`, which stays the section's key. */
++  titleContent?: ReactNode;
+   icon?: ReactNode;
+   marker?: SessionState | null;
+   /** Whether this header represents the current page context. */
+@@ -3176,7 +3208,7 @@ function SectionHeader({
+           />
+         </span>
+       ) : null}
+-      <span className="min-w-0 truncate">{title}</span>
++      <span className="min-w-0 truncate">{titleContent ?? title}</span>
+       {/* Trailing chevron, rotating on expand. Headers without a leading icon
+             reveal it on desktop hover/focus; icon headers show it only on mobile
+             (no hover) since desktop swaps the folder for the chevron above. */}
+@@ -3239,8 +3271,13 @@ const GROUPING_LABELS: Record<SidebarGrouping, string> = {
+   default: "Default",
+   status: "Status",
+   updated: "Updated",
++  triage: "Triage",
++};
++const ORDERING_LABELS: Record<SidebarOrdering, string> = {
++  updated: "Updated",
++  status: "Status",
++  manual: "Manual",
+ };
+-const ORDERING_LABELS: Record<SidebarOrdering, string> = { updated: "Updated", status: "Status" };
+ const SHOW_LABELS: Record<SidebarShowField, string> = {
+   updated: "Updated",
+   environment: "Environment",
+@@ -3588,6 +3625,7 @@ function SectionGroup({
+ function ConversationSection({
+   headerDrag,
+   title,
++  titleContent,
+   icon,
+   marker,
+   active,
+@@ -3612,6 +3650,8 @@ function ConversationSection({
+ }: {
+   headerDrag?: ProjectHeaderDrag;
+   title?: string;
++  /** Shown in place of `title` in the header. */
++  titleContent?: ReactNode;
+   /** Optional icon rendered before the title (e.g. project folder icon). */
+   icon?: ReactNode;
+   /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
+@@ -3664,6 +3704,7 @@ function ConversationSection({
+         <div className="group/header relative">
+           <SectionHeader
+             title={title}
++            titleContent={titleContent}
+             icon={icon}
+             marker={marker}
+             active={active}
+@@ -4091,6 +4132,11 @@ function ConversationMenuItems({
+         sessionId={conversation.id}
+         onDone={() => setMenuOpen(false)}
+       />
++      <AeMoveMenu
++        components={C}
++        conversationId={conversation.id}
++        onDone={() => setMenuOpen(false)}
++      />
+       {/* Stop / Archive / Delete are grouped at the bottom, below a
+           divider: lifecycle-ending actions separated from the everyday
+           ones above. */}
+@@ -4755,6 +4801,10 @@ function ConversationRowImpl({
+     data: { type: "pin-order", id: conversation.id },
+     disabled: !pinOrder || !isPinned,
+   });
++  const { setNodeRef: setAeOrderNodeRef, insertion: aeOrderInsertion } = useAeOrderRow(
++    conversation.id,
++    { isPinned, isArchived, selectionMode },
++  );
+   // A pin dragged down lands below this row; one dragged up, or a new pin, above it.
+   let pinInsertion: "before" | "after" | undefined;
+   if (pinOrder?.draggingId && pinOrder.overId === conversation.id) {
+@@ -4767,8 +4817,9 @@ function ConversationRowImpl({
+       rowRef.current = node;
+       setDragNodeRef(node);
+       setPinOrderNodeRef(node);
++      setAeOrderNodeRef(node);
+     },
+-    [setDragNodeRef, setPinOrderNodeRef],
++    [setDragNodeRef, setPinOrderNodeRef, setAeOrderNodeRef],
+   );
+   // Timestamps of the last two clicks this row received, for the dblclick
+   // rename guard: the list can reorder between the two clicks of a
+@@ -5044,6 +5095,7 @@ function ConversationRowImpl({
+           style={pinInsertion === "before" ? { top: 0 } : { bottom: 0 }}
+         />
+       )}
++      {aeOrderInsertion}
+       {/* Right-click anywhere on the row opens the same actions as the kebab.
+           Suppressed in selection mode (bulk-select owns the row), where the
+           bare link is rendered instead. ContextMenuTrigger preventDefaults the
+diff --git a/web/src/shell/aeSidebarStore.test.ts b/web/src/shell/aeSidebarStore.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1d79f07b7fff7c4cef373a8d715e265882168de7
+--- /dev/null
++++ b/web/src/shell/aeSidebarStore.test.ts
+@@ -0,0 +1,150 @@
++// The drag handlers' side of Manual ordering: every drop on a row-order target
++// is consumed (upstream would read it as the Sessions list and unfile the
++// row), and a row-order target in another list never collides.
++
++import type { Over } from "@dnd-kit/core";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { resolveSidebarDrop } from "./sidebarNav";
++import {
++  aeHandleOrderDrop,
++  aeInsertionSide,
++  aeMoveRow,
++  aePlaceOf,
++  aePointerWithin,
++  useAeSidebarStore,
++} from "./aeSidebarStore";
++
++const LISTS = new Map([
++  ["sessions", ["s1", "s2", "s3"]],
++  ["folder:Alpha", ["f1", "f2"]],
++]);
++
++function publish(move = vi.fn(() => true)) {
++  const listOf = new Map<string, string>();
++  for (const [key, ids] of LISTS) for (const id of ids) listOf.set(id, key);
++  useAeSidebarStore.setState({
++    manual: true,
++    order: [],
++    lists: LISTS,
++    listOf,
++    loadedIds: ["s1", "f1", "s2", "f2", "s3"],
++    move,
++  });
++  return move;
++}
++
++const over = (data: Record<string, unknown>) => ({ id: "x", data: { current: data } }) as Over;
++const orderTarget = (id: string) => over({ type: "ae-order", id });
++
++afterEach(() => {
++  useAeSidebarStore.setState({
++    manual: false,
++    order: null,
++    lists: new Map(),
++    listOf: new Map(),
++    loadedIds: [],
++    move: null,
++  });
++});
++
++describe("aeHandleOrderDrop", () => {
++  it("leaves every other target to upstream", () => {
++    publish();
++    expect(aeHandleOrderDrop("f1", null)).toBe(false);
++    expect(aeHandleOrderDrop("f1", over({ type: "project", name: "Alpha" }))).toBe(false);
++    expect(aeHandleOrderDrop("f1", over({ type: "pin-order", id: "p1" }))).toBe(false);
++  });
++
++  it("consumes a drop on a sibling in the row's own folder, which upstream would unfile", () => {
++    const move = publish();
++    // Without the guard: an unknown target reads as the Sessions list.
++    expect(
++      resolveSidebarDrop({ id: "f1", project: "Alpha", isPinned: false }, {
++        type: "ae-order",
++      } as never),
++    ).toMatchObject({ kind: "ungroup" });
++    expect(aeHandleOrderDrop("f1", orderTarget("f2"))).toBe(true);
++    expect(move).toHaveBeenCalledWith({
++      kind: "move",
++      id: "f1",
++      to: { after: "f2" },
++      scopeIds: ["f1", "f2"],
++      loadedIds: ["s1", "f1", "s2", "f2", "s3"],
++    });
++  });
++
++  it("drops above a row when dragged up, below it when dragged down", () => {
++    const move = publish();
++    aeHandleOrderDrop("s3", orderTarget("s1"));
++    expect(move).toHaveBeenLastCalledWith(expect.objectContaining({ to: { before: "s1" } }));
++    aeHandleOrderDrop("s1", orderTarget("s2"));
++    expect(move).toHaveBeenLastCalledWith(expect.objectContaining({ to: { after: "s2" } }));
++  });
++
++  it("consumes the row itself, another list's row and a drop with no save path", () => {
++    const move = publish();
++    expect(aeHandleOrderDrop("s1", orderTarget("s1"))).toBe(true);
++    expect(aeHandleOrderDrop("s1", orderTarget("f1"))).toBe(true);
++    expect(move).not.toHaveBeenCalled();
++    useAeSidebarStore.setState({ move: null });
++    expect(aeHandleOrderDrop("s1", orderTarget("s2"))).toBe(true);
++    expect(aeMoveRow("s1", "down")).toBe(false);
++  });
++});
++
++describe("aePointerWithin", () => {
++  const rect = (top: number) =>
++    ({ top, bottom: top + 30, left: 0, right: 200, width: 200, height: 30 }) as DOMRect;
++  const container = (id: string, data: Record<string, unknown>) => ({
++    id,
++    key: id,
++    data: { current: data },
++    disabled: false,
++    node: { current: null },
++    rect: { current: null },
++  });
++
++  function collide(activeId: string) {
++    const containers = [
++      container("ae-order:s2", { type: "ae-order", id: "s2" }),
++      container("ae-order:f2", { type: "ae-order", id: "f2" }),
++      container("project:Alpha", { type: "project", name: "Alpha" }),
++    ];
++    const args = {
++      active: { id: activeId, data: { current: { type: "session" } } },
++      collisionRect: rect(0),
++      droppableRects: new Map(containers.map((c) => [c.id, rect(0)])),
++      droppableContainers: containers,
++      pointerCoordinates: { x: 10, y: 10 },
++    } as unknown as Parameters<typeof aePointerWithin>[0];
++    return aePointerWithin(args).map((collision) => String(collision.id));
++  }
++
++  it("keeps only the dragged row's own list among the row-order targets", () => {
++    publish();
++    expect(collide("s1").sort()).toEqual(["ae-order:s2", "project:Alpha"]);
++    expect(collide("f1").sort()).toEqual(["ae-order:f2", "project:Alpha"]);
++  });
++
++  it("drops every row-order target outside Manual or for an unlisted row", () => {
++    publish();
++    expect(collide("pinned-row")).toEqual(["project:Alpha"]);
++    useAeSidebarStore.setState({ manual: false });
++    expect(collide("s1")).toEqual(["project:Alpha"]);
++  });
++});
++
++describe("aePlaceOf and aeInsertionSide", () => {
++  it("reads a row's place in its list", () => {
++    publish();
++    const state = useAeSidebarStore.getState();
++    expect(aePlaceOf(state, "s1")).toBe("first");
++    expect(aePlaceOf(state, "s2")).toBe("middle");
++    expect(aePlaceOf(state, "s3")).toBe("last");
++    expect(aePlaceOf(state, "missing")).toBeNull();
++    expect(aePlaceOf({ ...state, manual: false }, "s1")).toBeNull();
++    expect(aeInsertionSide("s1", "s3")).toBe("after");
++    expect(aeInsertionSide("s3", "s1")).toBe("before");
++    expect(aeInsertionSide("s1", "f1")).toBeNull();
++  });
++});
+diff --git a/web/src/shell/aeSidebarStore.ts b/web/src/shell/aeSidebarStore.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9c0f9c4750ba080eef6605788e5a9a6128d6fd7
+--- /dev/null
++++ b/web/src/shell/aeSidebarStore.ts
+@@ -0,0 +1,239 @@
++// The sidebar's Triage grouping and Manual ordering (omnigent-ae, 2026-10-19),
++// as the session list wires them in. The list publishes which list each row
++// sits in to a small module store once per change; rows, project folders, the
++// drag handlers and the Move menu read it through selectors, so a refresh
++// re-renders only the rows whose list changed. One session list mounts at a
++// time (the peek sidebar is the same instance), so the store is not keyed.
++
++import { type CollisionDetection, type Over, pointerWithin } from "@dnd-kit/core";
++import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
++import { create } from "zustand";
++import type { Conversation } from "@/hooks/useConversations";
++import {
++  type AeOrderOp,
++  useAeLoadAllPages,
++  useAeOrderMover,
++  useAeSidebarOrder,
++} from "@/hooks/useAeSidebarOrder";
++import type { SidebarListQuery } from "@/hooks/useSidebarData";
++import { type AeMoveTo, aeApplyManualOrder, aeIsOrderId } from "@/lib/aeSessionOrder";
++import { type AeTriageGroup, aeTriageGroupOf } from "@/lib/aeTriage";
++import type { SessionFilter } from "@/lib/sessionFilterPreferences";
++import type { SidebarViewPreferences } from "@/lib/sidebarViewPreferences";
++import {
++  type ActiveChatOverride,
++  dedupeConversationsById,
++  sortByUpdatedAtDesc,
++} from "./sidebarNav";
++
++interface AeSidebarState {
++  /** Manual ordering is on, outside search and the Archived display. */
++  manual: boolean;
++  /** The saved order while Manual is on, else `null`. */
++  order: readonly string[] | null;
++  /** Each list's row ids as shown, by list key (`sessions`, `shared`, `group:…`, `folder:…`). */
++  lists: ReadonlyMap<string, readonly string[]>;
++  /** Each listed row's list key. */
++  listOf: ReadonlyMap<string, string>;
++  /** Every loaded row, in the lists' own (updated) order. */
++  loadedIds: readonly string[];
++  /** Applies and queues a change to the order. */
++  move: ((op: AeOrderOp) => boolean) | null;
++}
++
++const IDLE: AeSidebarState = {
++  manual: false,
++  order: null,
++  lists: new Map(),
++  listOf: new Map(),
++  loadedIds: [],
++  move: null,
++};
++
++export const useAeSidebarStore = create<AeSidebarState>(() => IDLE);
++
++const NO_ORDER: readonly string[] = [];
++
++/** What the session list needs from the AE view options. */
++export interface AeSidebarView {
++  manual: boolean;
++  triage: boolean;
++  order: readonly string[] | null;
++  /** Triage groups held while the pointer is in the list. */
++  frozenTriage: Map<string, AeTriageGroup> | null;
++  /** Rows in the saved order while Manual is on; `rows` itself otherwise. */
++  applyOrder: <T extends { id: string }>(rows: T[]) => T[];
++  /** A row's Triage group while Triage is on, else `null`. */
++  triageTitle: (conversation: Conversation) => AeTriageGroup | null;
++  /** Triage's Archived group shows: not while searching, nor on the Shared and Archived displays. */
++  archivedGroup: boolean;
++}
++
++export function useAeSidebarView({
++  view,
++  orderFrozen,
++  conversationsQuery,
++  searchQuery,
++  activeTab,
++}: {
++  view: SidebarViewPreferences;
++  orderFrozen: boolean;
++  conversationsQuery: SidebarListQuery;
++  searchQuery: string;
++  activeTab: SessionFilter;
++}): AeSidebarView {
++  // Search results and archived rows keep upstream's order.
++  const listed = !searchQuery && activeTab !== "archived";
++  const manualOn = view.ordering === "manual" && listed;
++  const triage = view.grouping === "triage";
++  const { data } = useAeSidebarOrder(manualOn);
++  const order = manualOn ? (data?.order ?? NO_ORDER) : null;
++  useAeLoadAllPages(conversationsQuery, listed && (manualOn || triage));
++  // Like the Status grouping's frozen buckets: cleared once no hold remains.
++  const frozenRef = useRef(new Map<string, AeTriageGroup>());
++  useEffect(() => {
++    if (!orderFrozen) frozenRef.current.clear();
++  }, [orderFrozen]);
++  const frozenTriage = orderFrozen ? frozenRef.current : null;
++  const archivedGroup = triage && listed && activeTab !== "shared";
++  return useMemo(
++    () => ({
++      manual: order !== null,
++      triage,
++      order,
++      frozenTriage,
++      applyOrder: <T extends { id: string }>(rows: T[]) =>
++        order ? aeApplyManualOrder(rows, order) : rows,
++      triageTitle: (conversation: Conversation) =>
++        triage ? aeTriageGroupOf(conversation, frozenTriage) : null,
++      archivedGroup,
++    }),
++    [order, triage, frozenTriage, archivedGroup],
++  );
++}
++
++interface PublishedSections {
++  shared: Conversation[];
++  sessions: Conversation[];
++  projectGroups: { name: string; conversations: Conversation[] }[];
++  groupTitles: ReadonlyMap<string, string> | null;
++}
++
++/**
++ * Publish each list's rows to the store while Manual is on: Shared, Sessions
++ * or each of its groups, and each project folder with its own loaded pages.
++ */
++export function useAePublishSidebarScopes(
++  ae: AeSidebarView,
++  sections: PublishedSections,
++  folderConversations: ReadonlyMap<string, Conversation[]>,
++  activeOverride: ActiveChatOverride | null,
++  frozenKeys: Map<string, number> | null,
++): void {
++  const move = useAeOrderMover();
++  useLayoutEffect(() => {
++    if (!ae.manual) {
++      if (useAeSidebarStore.getState().manual) useAeSidebarStore.setState(IDLE);
++      return;
++    }
++    const lists = new Map<string, string[]>();
++    const add = (key: string, rows: readonly Conversation[]) => {
++      if (rows.length === 0) return;
++      const ids = lists.get(key) ?? [];
++      for (const row of rows) ids.push(row.id);
++      lists.set(key, ids);
++    };
++    add("shared", sections.shared);
++    const titles = sections.groupTitles;
++    if (titles) {
++      for (const row of sections.sessions) add(`group:${titles.get(row.id) ?? ""}`, [row]);
++    } else add("sessions", sections.sessions);
++    for (const group of sections.projectGroups) {
++      add(`folder:${group.name}`, folderConversations.get(group.name) ?? group.conversations);
++    }
++    const listOf = new Map<string, string>();
++    for (const [key, ids] of lists) for (const id of ids) listOf.set(id, key);
++    const rows = dedupeConversationsById([
++      ...sections.shared,
++      ...sections.sessions,
++      ...sections.projectGroups.flatMap((group) => group.conversations),
++      ...[...folderConversations.values()].flat(),
++    ]);
++    // A provisional `temp:` row (a session still being created) never enters the order.
++    const loadedIds = sortByUpdatedAtDesc(rows, activeOverride, frozenKeys)
++      .map((row) => row.id)
++      .filter(aeIsOrderId);
++    useAeSidebarStore.setState({ manual: true, order: ae.order, lists, listOf, loadedIds, move });
++  }, [ae.manual, ae.order, sections, folderConversations, activeOverride, frozenKeys, move]);
++  useLayoutEffect(() => () => useAeSidebarStore.setState(IDLE), []);
++}
++
++/** A project folder's rows in the saved order while Manual is on. */
++export function useAeFolderOrder(): <T extends { id: string }>(rows: T[]) => T[] {
++  const order = useAeSidebarStore((s) => s.order);
++  return useCallback(
++    <T extends { id: string }>(rows: T[]) => (order ? aeApplyManualOrder(rows, order) : rows),
++    [order],
++  );
++}
++
++/** Move a row within its list. False when it is in no list or the move changes nothing. */
++export function aeMoveRow(id: string, to: AeMoveTo): boolean {
++  const state = useAeSidebarStore.getState();
++  const list = state.listOf.get(id);
++  const scopeIds = list === undefined ? undefined : state.lists.get(list);
++  if (!state.manual || !state.move || !scopeIds) return false;
++  return state.move({ kind: "move", id, to, scopeIds, loadedIds: state.loadedIds });
++}
++
++/** Where a row sits in its list, for the Move menu; `null` outside Manual or any list. */
++export type AeRowPlace = "only" | "first" | "last" | "middle";
++
++export function aePlaceOf(state: AeSidebarState, id: string): AeRowPlace | null {
++  const list = state.manual ? state.listOf.get(id) : undefined;
++  const ids = list === undefined ? undefined : state.lists.get(list);
++  if (!ids) return null;
++  const index = ids.indexOf(id);
++  if (ids.length === 1) return "only";
++  if (index === 0) return "first";
++  return index === ids.length - 1 ? "last" : "middle";
++}
++
++/** Which side of `targetId` a drag of `draggedId` lands on; `null` across lists. */
++export function aeInsertionSide(draggedId: string, targetId: string): "before" | "after" | null {
++  const state = useAeSidebarStore.getState();
++  const list = state.listOf.get(draggedId);
++  if (list === undefined || state.listOf.get(targetId) !== list) return null;
++  const ids = state.lists.get(list) ?? [];
++  return ids.indexOf(draggedId) < ids.indexOf(targetId) ? "after" : "before";
++}
++
++/**
++ * Upstream's `pointerWithin`, minus the row-order targets of every list but
++ * the dragged row's own, so a drop on a row elsewhere falls through to the
++ * folder, Pinned or Sessions target beneath it, as it does outside Manual.
++ */
++export function aePointerWithin(args: Parameters<CollisionDetection>[0]) {
++  const state = useAeSidebarStore.getState();
++  const list = state.manual ? state.listOf.get(String(args.active.id)) : undefined;
++  const droppableContainers = args.droppableContainers.filter((container) => {
++    const data = container.data.current;
++    if (data?.type !== "ae-order") return true;
++    return list !== undefined && state.listOf.get(String(data.id)) === list;
++  });
++  return pointerWithin({ ...args, droppableContainers });
++}
++
++/**
++ * Handle a drop on a row-order target. True for every such target, the row
++ * itself and a no-op included: upstream reads any target it does not know as
++ * the Sessions list, which would take a filed session out of its folder.
++ */
++export function aeHandleOrderDrop(draggedId: string, over: Over | null): boolean {
++  const data = over?.data.current;
++  if (data?.type !== "ae-order") return false;
++  const targetId = String(data.id);
++  const side = targetId === draggedId ? null : aeInsertionSide(draggedId, targetId);
++  if (side) aeMoveRow(draggedId, side === "after" ? { after: targetId } : { before: targetId });
++  return true;
++}

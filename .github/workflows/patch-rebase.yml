@@ -1,0 +1,526 @@
+# ============================================================
+# omnigent-ae patch rebase bot (2026-10-20)
+#
+# Every PR that adds an [ae-patch] claims the next patch number when it is
+# written. Once one of them merges, every other open patch PR conflicts on
+# patches/*.patch, upstream.lock (AE_BRANCH_SHA, PATCH_COUNT), the upstream
+# pointer and the doc entries naming the number. On 2026-10-20 PR 164 and
+# PR 171 were each rebased by hand three times in 90 minutes. This does the
+# same rebase on every push to main.
+#
+#   find    lists open PRs into main that touch patches/ and that GitHub
+#           reads as CONFLICTING (mergeable is computed lazily, so it polls a
+#           bounded number of times); a dispatch with a PR number takes that
+#           PR whatever its mergeable state
+#   rebase  per PR, with only the read-only GITHUB_TOKEN: checks the head
+#           has not moved, runs main's scripts/rebase-patches.sh origin/main
+#           --ci on the PR checkout, then just patches-check and just lint, and
+#           hands the new commits on as git bundles in an artifact
+#   push    per PR, on a fresh runner where no PR code runs, the only job
+#           with PATCH_BOT_TOKEN: checks the bundles against main's lock, the
+#           PR's old head and the fork's branches, pushes the fork topic
+#           branch (force, with lease) and then the PR branch (a plain push of
+#           a merge, so a moved head is refused), and comments the new patch
+#           number. A conflict the script will not settle, or any failed
+#           check, pushes nothing and comments what needs a person.
+#
+# Why PATCH_BOT_TOKEN and not GITHUB_TOKEN: the built-in token cannot push to
+# the fork analyticendeavors/omnigent, and a push made with it starts no CI
+# run, so the rebased PR would never get its checks. Without the secret the
+# find job warns and passes (docs/UPSTREAM-SYNC.md, "Patch rebase bot").
+# ============================================================
+
+name: Patch rebase
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Only this PR number (rebased even if GitHub does not read it as conflicting)"
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  find:
+    name: Find conflicting patch PRs
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      prs: ${{ steps.find.outputs.prs }}
+    steps:
+      - name: Find conflicting patch PRs
+        id: find
+        env:
+          PATCH_BOT_TOKEN: ${{ secrets.PATCH_BOT_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          PR_INPUT: ${{ inputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PATCH_BOT_TOKEN" ]; then
+            echo "::warning::PATCH_BOT_TOKEN is not set, so the patch rebase bot cannot push to the PR or the fork; nothing was rebased. Add the secret (docs/UPSTREAM-SYNC.md, Patch rebase bot)."
+            echo 'prs=[]' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          forced=false
+          if [ -n "$PR_INPUT" ]; then
+            if ! [[ "$PR_INPUT" =~ ^[0-9]+$ ]]; then
+              echo "::error::the pr input must be a PR number; got '$PR_INPUT'."
+              exit 1
+            fi
+            numbers="$PR_INPUT"
+            forced=true
+          else
+            numbers="$(gh pr list --state open --base main --limit 100 --json number --jq '.[].number')"
+          fi
+          prs='[]'
+          for n in $numbers; do
+            info="$(gh pr view "$n" --json number,state,baseRefName,headRefName,headRefOid,isCrossRepository)"
+            if [ "$(jq -r '.state' <<<"$info")" != "OPEN" ] || [ "$(jq -r '.baseRefName' <<<"$info")" != "main" ]; then
+              echo "PR $n is not open against main; skipping"
+              continue
+            fi
+            if [ "$(jq -r '.isCrossRepository' <<<"$info")" = "true" ]; then
+              echo "PR $n comes from another repository, which the bot cannot push to; skipping"
+              continue
+            fi
+            # Read into a variable first: grep -q exits at the first match,
+            # and under pipefail the SIGPIPE it leaves gh would read as no match.
+            files="$(gh api --paginate "repos/$GH_REPO/pulls/$n/files" --jq '.[].filename')"
+            if ! grep -q '^patches/' <<<"$files"; then
+              echo "PR $n does not touch patches/; skipping"
+              continue
+            fi
+            # GitHub computes mergeable after a push to the base, on request;
+            # UNKNOWN means not yet. Eight tries ten seconds apart.
+            mergeable=UNKNOWN
+            for _ in 1 2 3 4 5 6 7 8; do
+              mergeable="$(gh pr view "$n" --json mergeable --jq '.mergeable')"
+              [ "$mergeable" != "UNKNOWN" ] && break
+              sleep 10
+            done
+            if [ "$forced" != "true" ] && [ "$mergeable" != "CONFLICTING" ]; then
+              echo "PR $n reads $mergeable; skipping"
+              continue
+            fi
+            echo "PR $n reads $mergeable; queued"
+            prs="$(jq -c --argjson i "$info" '. + [{number: $i.number, branch: $i.headRefName, sha: $i.headRefOid}]' <<<"$prs")"
+          done
+          echo "prs=$prs" >> "$GITHUB_OUTPUT"
+          echo "queued: $prs"
+
+  # Runs the PR's own code (its justfile, uv sync, the merged scripts), so it
+  # never holds a token that can write: the job's read-only GITHUB_TOKEN only.
+  # Its result leaves the runner as git bundles in an artifact; the push job
+  # reads them on a fresh runner where no PR code has run.
+  rebase:
+    name: Rebase PR ${{ matrix.number }}
+    needs: find
+    if: needs.find.outputs.prs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: patch-rebase-pr-${{ matrix.number }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include: ${{ fromJSON(needs.find.outputs.prs) }}
+    env:
+      PR: ${{ matrix.number }}
+      PR_SHA: ${{ matrix.sha }}
+      OMNIGENT_SKIP_WEB_UI: "true"
+    steps:
+      - name: Checkout the PR branch with the upstream submodule
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          submodules: true
+
+      - name: Install just
+        uses: extractions/setup-just@v4
+
+      - name: Check the PR head has not moved
+        id: head
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/out"
+          head="$(git rev-parse HEAD)"
+          if [ "$head" != "$PR_SHA" ]; then
+            echo "::notice::PR $PR moved to ${head:0:12} after it was queued at ${PR_SHA:0:12}; skipping it (the next push to main looks again)."
+            echo "current=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "current=true" >> "$GITHUB_OUTPUT"
+
+      - name: Rebase the patches onto main
+        id: rebase
+        if: steps.head.outputs.current == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name "ae-automation-bot"
+          git config user.email "ae-automation-bot@users.noreply.github.com"
+          git -C upstream config user.name "ae-automation-bot"
+          git -C upstream config user.email "ae-automation-bot@users.noreply.github.com"
+          report="$RUNNER_TEMP/report.txt"
+          log="$RUNNER_TEMP/rebase.log"
+          reason="$RUNNER_TEMP/out/reason.md"
+          : > "$report"
+          rc=0
+          # main's copy of the scripts, not the PR's: a PR cut before this
+          # bot existed has a rebase-patches.sh without --ci.
+          bot="$RUNNER_TEMP/bot-scripts"
+          mkdir -p "$bot"
+          git fetch --quiet origin main
+          for f in rebase-patches.sh export-patches.sh _lib.sh; do
+            git show "origin/main:scripts/$f" > "$bot/$f"
+          done
+          chmod +x "$bot"/*.sh
+          PATCH_ROOT="$PWD" PATCH_REBASE_REPORT="$report" "$bot/rebase-patches.sh" origin/main --ci > "$log" 2>&1 || rc=$?
+          cat "$log"
+          if [ "$rc" -ne 0 ]; then
+            if grep -q '^conflict=' "$report"; then
+              echo "These files conflict with main in a way the bot does not settle:" >> "$reason"
+              # shellcheck disable=SC2016 # the backticks are Markdown, not a command
+              sed -n 's/^conflict=\(.*\)/- `\1`/p' "$report" >> "$reason"
+            else
+              echo "The rebase script stopped:" >> "$reason"
+              grep '^error:' "$log" | sed 's/^/    /' >> "$reason" || true
+            fi
+            echo "::error::scripts/rebase-patches.sh --ci failed for PR $PR (exit $rc); see the log above."
+            exit 1
+          fi
+          grep -E '^(status|map|fork_sha)=' "$report" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python (upstream's pin)
+        if: steps.rebase.outputs.status == 'rebased'
+        uses: actions/setup-python@v7
+        with:
+          python-version-file: upstream/.python-version
+
+      - name: Set up uv
+        if: steps.rebase.outputs.status == 'rebased'
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          cache-dependency-glob: upstream/uv.lock
+
+      - name: Install upstream's locked lint environment
+        if: steps.rebase.outputs.status == 'rebased'
+        run: |
+          set -euo pipefail
+          just setup
+
+      - name: Patch series matches
+        if: steps.rebase.outputs.status == 'rebased'
+        run: |
+          set -euo pipefail
+          if ! just patches-check; then
+            echo "\`just patches-check\` failed after the rebase." >> "$RUNNER_TEMP/out/reason.md"
+            exit 1
+          fi
+
+      - name: Lint
+        if: steps.rebase.outputs.status == 'rebased'
+        run: |
+          set -euo pipefail
+          if ! just lint; then
+            echo "\`just lint\` failed after the rebase." >> "$RUNNER_TEMP/out/reason.md"
+            exit 1
+          fi
+
+      # Bundles carry only the new commits: the PR side on top of main and
+      # the PR's old head, the fork side on top of main's series commit.
+      - name: Bundle the rebased branches
+        if: steps.rebase.outputs.status == 'rebased'
+        env:
+          MAP: ${{ steps.rebase.outputs.map }}
+          NEW: ${{ steps.rebase.outputs.fork_sha }}
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/out"
+          main_fork="$(git show origin/main:upstream.lock | sed -n 's/^AE_BRANCH_SHA=//p')"
+          git branch -f patch-rebase-result HEAD
+          git bundle create "$out/pr.bundle" patch-rebase-result ^origin/main "^$PR_SHA"
+          if [ "$NEW" != "$main_fork" ]; then
+            git -C upstream branch -f patch-rebase-result HEAD
+            git -C upstream bundle create "$out/fork.bundle" patch-rebase-result "^$main_fork"
+          fi
+          {
+            echo "status=rebased"
+            echo "map=$MAP"
+            echo "fork_sha=$NEW"
+            echo "main=$(git rev-parse origin/main)"
+          } > "$out/result.env"
+
+      - name: Record the outcome
+        if: always() && steps.head.outputs.current == 'true'
+        env:
+          JOB_STATUS: ${{ job.status }}
+        run: |
+          set -euo pipefail
+          echo "job=$JOB_STATUS" >> "$RUNNER_TEMP/out/result.env"
+
+      - name: Upload the result for the push job
+        if: always() && steps.head.outputs.current == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: patch-rebase-${{ matrix.number }}
+          path: ${{ runner.temp }}/out
+          retention-days: 3
+
+  # A fresh runner where no PR code runs: the only job that sees
+  # PATCH_BOT_TOKEN. Everything it pushes is checked against facts it reads
+  # itself (main's lock, the PR's old lock, the fork's branches); the
+  # artifact only supplies the commits.
+  push:
+    name: Push PR ${{ matrix.number }}
+    needs: [find, rebase]
+    if: always() && needs.find.result == 'success' && needs.find.outputs.prs != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # One push per PR at a time, never cancelled half way: a cancel between
+    # the fork push and the PR push would leave the PR pinning a commit no
+    # fork branch holds.
+    concurrency:
+      group: patch-rebase-push-${{ matrix.number }}
+      cancel-in-progress: false
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.find.outputs.prs) }}
+    env:
+      PR: ${{ matrix.number }}
+      PR_BRANCH: ${{ matrix.branch }}
+      PR_SHA: ${{ matrix.sha }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download the rebase result
+        uses: actions/download-artifact@v4
+        with:
+          pattern: patch-rebase-${{ matrix.number }}
+          path: ${{ runner.temp }}/result
+
+      - name: Read the rebase result
+        id: result
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/result/patch-rebase-$PR"
+          if [ ! -f "$dir/result.env" ]; then
+            echo "no result for PR $PR (its head moved before the rebase); nothing to do"
+            echo "act=none" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          status="$(sed -n 's/^status=//p' "$dir/result.env")"
+          job="$(sed -n 's/^job=//p' "$dir/result.env")"
+          if [ "$job" = "success" ] && [ "$status" = "rebased" ] && [ -f "$dir/pr.bundle" ]; then
+            act=push
+          elif [ "$job" = "success" ]; then
+            act=none
+          else
+            act=comment
+          fi
+          echo "act=$act" >> "$GITHUB_OUTPUT"
+          echo "dir=$dir" >> "$GITHUB_OUTPUT"
+          echo "PR $PR: rebase job $job, status ${status:-none}; $act"
+
+      # Read-only GITHUB_TOKEN, for main and the PR's old head (the bundle's
+      # prerequisites). Nothing from the checkout is executed.
+      - name: Checkout main
+        if: steps.result.outputs.act == 'push'
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Check the result against main, the PR and the fork
+        id: check
+        if: steps.result.outputs.act == 'push'
+        env:
+          DIR: ${{ steps.result.outputs.dir }}
+        run: |
+          set -euo pipefail
+          # main moved again since the rebase: the run that push started
+          # rebases this PR anew, so this one stands down.
+          rebased_on="$(sed -n 's/^main=//p' "$DIR/result.env")"
+          if [ "$rebased_on" != "$(git rev-parse origin/main)" ]; then
+            echo "::notice::main moved past ${rebased_on:0:12} since the rebase; the newer run handles PR $PR."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --quiet origin "$PR_SHA"
+          git fetch --quiet "$DIR/pr.bundle" "patch-rebase-result:refs/patch-rebase/pr"
+          new_head="$(git rev-parse refs/patch-rebase/pr)"
+          git merge-base --is-ancestor "$PR_SHA" "$new_head" || { echo "::error::the bundled head does not descend from the PR's head"; exit 1; }
+          git merge-base --is-ancestor origin/main "$new_head" || { echo "::error::the bundled head does not contain main"; exit 1; }
+          new="$(git rev-parse "$new_head:upstream")"
+          old="$(git show "$PR_SHA:upstream.lock" | sed -n 's/^AE_BRANCH_SHA=//p')"
+          fork="$(git show origin/main:upstream.lock | sed -n 's/^AE_FORK=//p')"
+          series="$(git show origin/main:upstream.lock | sed -n 's/^AE_BRANCH=//p')"
+          main_fork="$(git show origin/main:upstream.lock | sed -n 's/^AE_BRANCH_SHA=//p')"
+          [ "$(git show "$new_head:upstream.lock" | sed -n 's/^AE_BRANCH_SHA=//p')" = "$new" ] \
+            || { echo "::error::the bundled head's lock and pointer disagree"; exit 1; }
+          # The fork branch moves only when the PR has fork commits of its
+          # own and they moved: not when the merge alone settled it (new is
+          # old), and not when the PR now pins main's own series commit.
+          topic=""
+          if [ "$new" != "$old" ] && [ "$new" != "$main_fork" ]; then
+            mapfile -t topics < <(git ls-remote --heads "$fork" | awk -v s="$old" '$1 == s { sub("^refs/heads/", "", $2); print $2 }' | grep -vxF "$series" || true)
+            if [ "${#topics[@]}" -ne 1 ]; then
+              {
+                echo "The PR pinned fork commit \`$old\`, and the fork branches other than \`$series\` at it are: ${topics[*]:-none}. The bot moves exactly one, so it cannot tell which."
+                echo "Push the fork commits to exactly one topic branch, or rebase by hand with \`just patches-rebase\`."
+              } >> "$DIR/reason.md"
+              echo "::error::fork commit $old is the head of ${#topics[@]} topic branches (${topics[*]:-none}); expected exactly one."
+              exit 1
+            fi
+            topic="${topics[0]}"
+            git init --quiet "$RUNNER_TEMP/fork"
+            git -C "$RUNNER_TEMP/fork" fetch --quiet --depth=1 "$fork" "$main_fork" "$old"
+            git -C "$RUNNER_TEMP/fork" fetch --quiet "$DIR/fork.bundle" "patch-rebase-result:refs/heads/patch-rebase-result"
+            [ "$(git -C "$RUNNER_TEMP/fork" rev-parse refs/heads/patch-rebase-result)" = "$new" ] \
+              || { echo "::error::the fork bundle's head is not the commit the PR now pins"; exit 1; }
+          fi
+          {
+            echo "go=true"
+            echo "new_head=$new_head"
+            echo "new=$new"
+            echo "old=$old"
+            echo "fork=$fork"
+            echo "topic=$topic"
+          } >> "$GITHUB_OUTPUT"
+          echo "PR $PR: ${PR_SHA:0:12} to ${new_head:0:12}; fork ${old:0:12} to ${new:0:12} (branch: ${topic:-none needed})"
+
+      # Fork first, so the pointer the PR push carries is already reachable on
+      # the fork when CI checks the submodule out. If the PR push is refused
+      # (its head moved during the run), the fork branch goes back. git gets
+      # the bot token from a credential helper that reads it from env when git
+      # runs it, after the empty extraheader drops the checkout's read-only
+      # GITHUB_TOKEN; the token is never on a command line or in the log.
+      - name: Push the fork branch, then the PR branch
+        id: push
+        if: steps.check.outputs.go == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PATCH_BOT_TOKEN }}
+          PATCH_BOT_TOKEN: ${{ secrets.PATCH_BOT_TOKEN }}
+          DIR: ${{ steps.result.outputs.dir }}
+          NEW_HEAD: ${{ steps.check.outputs.new_head }}
+          NEW: ${{ steps.check.outputs.new }}
+          OLD: ${{ steps.check.outputs.old }}
+          FORK: ${{ steps.check.outputs.fork }}
+          TOPIC: ${{ steps.check.outputs.topic }}
+        run: |
+          set -euo pipefail
+          reason="$DIR/reason.md"
+          # shellcheck disable=SC2016 # expanded by the helper's shell when git runs it
+          helper='!f() { test "$1" = get || exit 0; echo username=x-access-token; echo "password=$PATCH_BOT_TOKEN"; }; f'
+          botgit() { git -c "http.https://github.com/.extraheader=" -c credential.helper= -c "credential.helper=$helper" "$@"; }
+          current="$(gh pr view "$PR" --json headRefOid --jq '.headRefOid')"
+          if [ "$current" != "$PR_SHA" ]; then
+            echo "::notice::PR $PR moved to ${current:0:12} during the run; nothing pushed (the next push to main looks again)."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          fork_moved=false
+          if [ -n "$TOPIC" ]; then
+            botgit -C "$RUNNER_TEMP/fork" push --force-with-lease="refs/heads/$TOPIC:$OLD" "$FORK" "$NEW:refs/heads/$TOPIC"
+            fork_moved=true
+          fi
+          if ! botgit push origin "$NEW_HEAD:refs/heads/$PR_BRANCH"; then
+            echo "The push to \`$PR_BRANCH\` was refused (its head probably moved during the run)." >> "$reason"
+            if [ "$fork_moved" = "true" ]; then
+              if botgit -C "$RUNNER_TEMP/fork" push --force-with-lease="refs/heads/$TOPIC:$NEW" "$FORK" "$OLD:refs/heads/$TOPIC"; then
+                echo "The fork branch \`$TOPIC\` is back on \`$OLD\`." >> "$reason"
+              else
+                echo "The fork branch \`$TOPIC\` could not be put back on \`$OLD\` and now holds \`$NEW\`; push it back by hand." >> "$reason"
+              fi
+            fi
+            echo "::error::the push to $PR_BRANCH was refused; the comment says what happened to the fork branch."
+            exit 1
+          fi
+          {
+            echo "pushed=true"
+            echo "fork_moved=$fork_moved"
+          } >> "$GITHUB_OUTPUT"
+          echo "pushed ${NEW_HEAD:0:12} to $PR_BRANCH (fork branch moved: $fork_moved)"
+
+      - name: Comment the new patch number
+        if: steps.push.outputs.pushed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.PATCH_BOT_TOKEN }}
+          DIR: ${{ steps.result.outputs.dir }}
+          NEW_HEAD: ${{ steps.check.outputs.new_head }}
+          NEW: ${{ steps.check.outputs.new }}
+          TOPIC: ${{ steps.check.outputs.topic }}
+          FORK_MOVED: ${{ steps.push.outputs.fork_moved }}
+        run: |
+          set -euo pipefail
+          body="$RUNNER_TEMP/comment.md"
+          main_sha="$(git rev-parse origin/main)"
+          # Only four-digit pairs from the artifact reach the comment.
+          map="$(sed -n 's/^map=//p' "$DIR/result.env" | grep -oE '[0-9]{4}=[0-9]{4}' || true)"
+          {
+            echo "The patch rebase bot moved this PR onto main's series (main at \`${main_sha:0:12}\`)."
+            echo
+            if [ -n "$map" ]; then
+              while IFS='=' read -r was now; do
+                echo "- Patch \`$was\` is now \`$now\`."
+              done <<<"$map"
+            else
+              echo "- No patch number changed."
+            fi
+            if [ "$FORK_MOVED" = "true" ]; then
+              echo "- Pushed \`${NEW_HEAD:0:12}\` here and \`${NEW:0:12}\` to the fork branch \`$TOPIC\`."
+            else
+              echo "- Pushed \`${NEW_HEAD:0:12}\` here; the fork branch did not need to move."
+            fi
+            echo "- \`just patches-check\` and \`just lint\` passed on the runner; CI runs on the new push."
+            echo
+            echo "Doc entries main already had are untouched; this PR's entries follow them, renumbered. The PR title and body still name the old number, so edit them by hand."
+            echo
+            echo "<!-- patch-rebase-bot -->"
+          } > "$body"
+          gh pr comment "$PR" --body-file "$body"
+
+      # One comment per PR head: a second push to main with the same conflict
+      # stays quiet.
+      - name: Comment what needs a person
+        if: >-
+          always() && steps.push.outputs.pushed != 'true' &&
+          (steps.result.outputs.act == 'comment' || (steps.result.outputs.act == 'push' && failure()))
+        env:
+          GH_TOKEN: ${{ secrets.PATCH_BOT_TOKEN }}
+          DIR: ${{ steps.result.outputs.dir }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          marker="<!-- patch-rebase-bot needs-person head=$PR_SHA -->"
+          bodies="$(gh api --paginate "repos/$GH_REPO/issues/$PR/comments" --jq '.[].body')"
+          if grep -qF "$marker" <<<"$bodies"; then
+            echo "already commented on head ${PR_SHA:0:12}"
+            exit 0
+          fi
+          body="$RUNNER_TEMP/comment.md"
+          {
+            echo "The patch rebase bot could not move this PR onto main's series. This PR branch was not pushed."
+            echo
+            if [ -s "$DIR/reason.md" ]; then
+              cat "$DIR/reason.md"
+            else
+              echo "A step failed before the push; the run log says which."
+            fi
+            echo
+            echo "Run \`just patches-rebase\` on the branch, resolve, and push (docs/UPSTREAM-SYNC.md, Patch rebase bot). Run log: $RUN_URL"
+            echo
+            echo "$marker"
+          } > "$body"
+          gh pr comment "$PR" --body-file "$body"

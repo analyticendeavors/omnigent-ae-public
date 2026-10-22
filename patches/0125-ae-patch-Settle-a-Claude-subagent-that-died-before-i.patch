@@ -1,0 +1,450 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 17:30:15 -0700
+Subject: [PATCH 125/148] [ae-patch] Settle a Claude subagent that died before
+ its first lull or across a restart
+
+A Claude Code subagent child that never records a return was settled only by
+the staleness timer armed on its first idle lull. A child that died before any
+lull never got a timer, and a server restart dropped every pending timer, so
+the rail showed it Running and its parent "Waiting on 1 agent" indefinitely.
+
+The first running edge (external_session_status) now arms the same 60-minute
+check, and a background sweep at server startup reads the sub-agent rows whose
+persisted status is running in one query, settles idle the Claude children
+quiet past the cap with no recorded completion, and re-arms the rest for the
+time remaining. The settle check reads the row's live_status when the cache is
+empty, which is what readers see after a restart. The sweep is best-effort: a
+failure logs and never blocks startup.
+---
+ omnigent/server/ae_subagent_liveness.py       | 118 +++++++++++++-
+ omnigent/server/app.py                        |   3 +
+ .../server/routes/sessions/routes_events.py   |   6 +-
+ .../routes/test_ae_subagent_liveness.py       | 153 ++++++++++++++++++
+ tests/server/routes/test_subagent_status.py   |  28 ++++
+ 5 files changed, 301 insertions(+), 7 deletions(-)
+
+diff --git a/omnigent/server/ae_subagent_liveness.py b/omnigent/server/ae_subagent_liveness.py
+index bea20517da05502e945a8431aedaf555245da84a..3bbc7e5a546d48440e45e544ce0f19a0cfc4ff2b 100644
+--- a/omnigent/server/ae_subagent_liveness.py
++++ b/omnigent/server/ae_subagent_liveness.py
+@@ -5,6 +5,9 @@ transcript lull, so a live subagent would flicker between busy and completed.
+ The parent's completion marker is the reliable end signal; a lull before it is
+ held, the marker itself publishes the terminal status, and a child that never
+ gets one (its host restarted) is settled idle once its transcript goes quiet.
++The quiet check is armed when the child is first published running and again
++by a startup sweep, since a child can die before its first lull and a server
++restart drops every pending timer.
+ """
+ 
+ from __future__ import annotations
+@@ -12,6 +15,7 @@ from __future__ import annotations
+ import asyncio
+ import logging
+ import time
++from typing import Any
+ 
+ from omnigent.entities import Conversation
+ from omnigent.server.schemas import BackgroundTaskInfo
+@@ -24,9 +28,11 @@ _NATIVE_ID_LABELS = ("omnigent.claude_native.subagent_id", "omnigent.claude_nati
+ # A running Claude subagent with no transcript update for this long is presumed
+ # dead (no completion will ever arrive) and is settled idle.
+ CLAUDE_SUBAGENT_STALE_AFTER_S = 60 * 60
++# Upper bound on running sub-agent rows one startup sweep reads.
++_SWEEP_LIMIT = 500
+ 
+ _stale_timers: dict[str, asyncio.TimerHandle] = {}
+-_stale_checks: set[asyncio.Task[bool]] = set()
++_stale_checks: set[asyncio.Task[Any]] = set()
+ 
+ 
+ def is_claude_subagent_child(conv: Conversation) -> bool:
+@@ -115,6 +121,17 @@ def publish_claude_subagent_end(
+         _publish_status(child.id, "idle")
+ 
+ 
++def note_claude_subagent_status(conv: Conversation, status: str, store: ConversationStore) -> None:
++    """Arm the staleness check when a Claude subagent child is published running.
++
++    A child that dies before its first lull would otherwise have no timer at
++    all. An already pending check is left alone; it re-arms itself while the
++    transcript keeps moving.
++    """
++    if status == "running" and conv.id not in _stale_timers and is_claude_subagent_child(conv):
++        arm_stale_timer(conv.id, store, CLAUDE_SUBAGENT_STALE_AFTER_S)
++
++
+ def arm_stale_timer(
+     child_id: str, store: ConversationStore, delay: float = CLAUDE_SUBAGENT_STALE_AFTER_S
+ ) -> None:
+@@ -139,27 +156,38 @@ def _start_stale_check(child_id: str, store: ConversationStore) -> None:
+ 
+ 
+ async def settle_stale_claude_subagent(
+-    child_id: str, store: ConversationStore, *, now: float | None = None
++    child_id: str,
++    store: ConversationStore,
++    *,
++    now: float | None = None,
++    conv: Conversation | None = None,
+ ) -> bool:
+     """Publish idle for a running Claude subagent quiet past the staleness cap.
+ 
+     A child whose transcript moved since the timer was armed is re-armed for
+-    the time remaining.
++    the time remaining. With no cached status (a server restart emptied the
++    cache), the row's persisted ``live_status`` is what readers see, so that
++    is what is checked.
+ 
+     :param child_id: Child session to check.
+     :param store: Conversation store holding the child and its parent.
+     :param now: Current epoch seconds; defaults to the wall clock.
++    :param conv: The child row when the caller already read it.
+     :returns: Whether the child was settled idle.
+     """
+     from omnigent.server.routes._sessions.common import _session_status_cache
+     from omnigent.server.routes._sessions.helpers import _publish_status
+ 
+     try:
+-        if _session_status_cache.get(child_id) != "running":
++        cached = _session_status_cache.get(child_id)
++        if cached not in (None, "running"):
+             return False
+-        conv = await asyncio.to_thread(store.get_conversation, child_id)
++        if conv is None:
++            conv = await asyncio.to_thread(store.get_conversation, child_id)
+         if (
+             conv is None
++            or conv.id != child_id
++            or (cached is None and conv.live_status != "running")
+             or not is_claude_subagent_child(conv)
+             or await _completion_recorded(conv, store)
+         ):
+@@ -168,10 +196,88 @@ async def settle_stale_claude_subagent(
+         if quiet < CLAUDE_SUBAGENT_STALE_AFTER_S:
+             arm_stale_timer(child_id, store, CLAUDE_SUBAGENT_STALE_AFTER_S - quiet)
+             return False
+-        if _session_status_cache.get(child_id) != "running":
++        if _session_status_cache.get(child_id) != cached:
+             return False
+         _publish_status(child_id, "idle")
+         return True
+     except Exception:  # noqa: BLE001 — a best-effort sweep must not crash the loop
+         _logger.warning("Could not settle stale Claude subagent %s", child_id, exc_info=True)
+         return False
++
++
++def _running_sub_agent_ids(store: ConversationStore) -> list[str]:
++    """Return the ids of sub-agent rows whose persisted status reads running."""
++    from sqlalchemy import select
++
++    from omnigent.db.db_models import SqlConversationMetadata, current_workspace_id
++    from omnigent.db.enum_codecs import encode_conversation_kind, encode_session_live_status
++
++    session_maker = getattr(store, "_session", None)
++    if session_maker is None:
++        _logger.warning(
++            "Stale Claude subagent sweep skipped: the conversation store has no _session"
++        )
++        return []
++    statement = (
++        select(SqlConversationMetadata.id)
++        .where(
++            SqlConversationMetadata.workspace_id == current_workspace_id(),
++            SqlConversationMetadata.kind == encode_conversation_kind("sub_agent"),
++            SqlConversationMetadata.live_status == encode_session_live_status("running"),
++        )
++        .limit(_SWEEP_LIMIT)
++    )
++    with session_maker("ae_claude_subagent_startup_sweep") as session:
++        ids = [str(row[0]) for row in session.execute(statement).all()]
++    if len(ids) >= _SWEEP_LIMIT:
++        _logger.warning(
++            "Stale Claude subagent sweep read only the first %d running sub-agent rows",
++            _SWEEP_LIMIT,
++        )
++    return ids
++
++
++async def sweep_stale_claude_subagents(
++    store: ConversationStore, *, now: float | None = None
++) -> int:
++    """Settle or re-arm every Claude subagent child a restart left running.
++
++    Children quiet past the cap with no recorded completion are settled idle;
++    the rest get a timer for the time remaining. A child the status cache
++    already knows has reported since startup (a reconnect restored it), so it
++    only gets a timer, which re-reads the row when it fires. Best-effort: a
++    failure logs and settles nothing.
++
++    :param store: Conversation store holding the children and their parents.
++    :param now: Current epoch seconds; defaults to the wall clock.
++    :returns: How many children were settled idle.
++    """
++    from omnigent.server.routes._sessions.common import _session_status_cache
++
++    try:
++        ids = await asyncio.to_thread(_running_sub_agent_ids, store)
++        if not ids:
++            return 0
++        rows = await asyncio.to_thread(store.get_conversations, ids)
++        settled = 0
++        for conv in rows.values():
++            if not is_claude_subagent_child(conv):
++                continue
++            if _session_status_cache.get(conv.id) is not None:
++                if conv.id not in _stale_timers:
++                    arm_stale_timer(conv.id, store, CLAUDE_SUBAGENT_STALE_AFTER_S)
++            elif await settle_stale_claude_subagent(conv.id, store, now=now, conv=conv):
++                settled += 1
++        if settled:
++            _logger.info("Settled %d stale Claude subagent(s) left running", settled)
++        return settled
++    except Exception:  # noqa: BLE001 (a startup sweep must never block the server)
++        _logger.warning("Could not sweep stale Claude subagents", exc_info=True)
++        return 0
++
++
++def start_stale_sweep(store: ConversationStore) -> None:
++    """Run :func:`sweep_stale_claude_subagents` in the background."""
++    task = asyncio.ensure_future(sweep_stale_claude_subagents(store))
++    _stale_checks.add(task)
++    task.add_done_callback(_stale_checks.discard)
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index 065d1e7635ebe387cf058653c4a2d4b4a1243b3f..3675a7882c19feaca9ff4282b28c414f612c84ce 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -1720,6 +1720,9 @@ def create_app(
+                 otel_publisher=server_metrics_otel,
+             )
+         )
++        from omnigent.server.ae_subagent_liveness import start_stale_sweep
++
++        start_stale_sweep(conversation_store)
+         # Runner ``runner_last_seen`` is refreshed per-tunnel from each
+         # runner tunnel's ping loop (``runner_tunnel._ping_loop``), inside
+         # that handler's ``workspace_scope`` — not from a lifespan sweep,
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 674bb78b728f6c74cad87bb7d56c5eee8f97d357..4e637ebe72424f9e6731a35b09736f06d69fd425 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -77,7 +77,10 @@ from omnigent.server._elicitation_registry import (
+     _ParkedHarnessElicitation,
+     _PreResolvedHarnessElicitation,
+ )
+-from omnigent.server.ae_subagent_liveness import hold_premature_lull_idle
++from omnigent.server.ae_subagent_liveness import (
++    hold_premature_lull_idle,
++    note_claude_subagent_status,
++)
+ from omnigent.server.auth import (
+     LEVEL_EDIT,
+     LEVEL_OWNER,
+@@ -2042,6 +2045,7 @@ def register_events_routes(
+                 background_tasks=bg_tasks,
+                 blocked_on=blocked_on,
+             )
++            note_claude_subagent_status(conv, status, conversation_store)
+             if (
+                 conv.parent_conversation_id is not None
+                 and status in {"idle", "failed"}
+diff --git a/tests/server/routes/test_ae_subagent_liveness.py b/tests/server/routes/test_ae_subagent_liveness.py
+index 2eba6039af132c820dfa59bc8e764924b359db95..ba38a676d7e24445b6f0d612e45d3a8d60e5c7d6 100644
+--- a/tests/server/routes/test_ae_subagent_liveness.py
++++ b/tests/server/routes/test_ae_subagent_liveness.py
+@@ -212,3 +212,156 @@ async def test_replayed_return_only_settles_an_empty_cache(db_uri: str, publishe
+     finally:
+         common._session_status_cache.pop(child_id, None)
+         common._session_active_response_cache.pop(child_id, None)
++
++
++async def _wait_for_stale_check(child_id: str) -> None:
++    for _ in range(100):
++        if ae_subagent_liveness._stale_checks or child_id not in (
++            ae_subagent_liveness._stale_timers
++        ):
++            break
++        await asyncio.sleep(0.01)
++    await asyncio.gather(*ae_subagent_liveness._stale_checks)
++
++
++async def test_first_running_arms_cap_for_child_that_never_lulls(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch, published: Mock
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    _, child_id = _claude_child(store)
++    conv = store.get_conversation(child_id)
++    assert conv is not None
++    common._session_status_cache[child_id] = "running"
++    try:
++        # The real cap: the first running edge arms it, a later one keeps that timer.
++        ae_subagent_liveness.note_claude_subagent_status(conv, "running", store)
++        timer = ae_subagent_liveness._stale_timers[child_id]
++        remaining = timer.when() - asyncio.get_running_loop().time()
++        assert abs(remaining - CLAUDE_SUBAGENT_STALE_AFTER_S) < 5
++        ae_subagent_liveness.note_claude_subagent_status(conv, "running", store)
++        assert ae_subagent_liveness._stale_timers[child_id] is timer
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++        # The child dies before any lull; nothing but that timer can settle it.
++        monkeypatch.setattr(ae_subagent_liveness, "CLAUDE_SUBAGENT_STALE_AFTER_S", 0.01)
++        ae_subagent_liveness.note_claude_subagent_status(conv, "running", store)
++        await _wait_for_stale_check(child_id)
++        assert common._session_status_cache[child_id] == "idle"
++        assert _statuses(published, child_id) == ["idle"]
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++        common._session_status_cache.pop(child_id, None)
++
++
++async def test_running_edge_arms_nothing_for_other_children(db_uri: str) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    parent = store.create_conversation()
++    plain = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
++    _, child_id = _claude_child(store)
++    claude = store.get_conversation(child_id)
++    assert claude is not None
++    try:
++        ae_subagent_liveness.note_claude_subagent_status(plain, "running", store)
++        ae_subagent_liveness.note_claude_subagent_status(claude, "idle", store)
++        assert plain.id not in ae_subagent_liveness._stale_timers
++        assert child_id not in ae_subagent_liveness._stale_timers
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(plain.id)
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++
++
++@pytest.mark.parametrize(
++    ("quiet_s", "completion", "settled"),
++    [
++        pytest.param(CLAUDE_SUBAGENT_STALE_AFTER_S + 1, None, True, id="quiet-past-cap"),
++        pytest.param(600, None, False, id="recent-rearmed"),
++        pytest.param(CLAUDE_SUBAGENT_STALE_AFTER_S + 1, "completed", False, id="returned"),
++    ],
++)
++async def test_startup_sweep_settles_children_a_restart_left_running(
++    db_uri: str, published: Mock, quiet_s: int, completion: str | None, settled: bool
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    parent_id, child_id = _claude_child(store)
++    other = store.create_conversation(kind="sub_agent", parent_conversation_id=parent_id)
++    if completion is not None:
++        store.append(parent_id, [_completion_marker("task", "agent-1", completion)])
++    # After a restart: no timers, an empty cache, and the rows still say running.
++    for session_id in (child_id, other.id):
++        store.set_session_live_status(session_id, "running")
++        common._session_status_cache.pop(session_id, None)
++        ae_subagent_liveness.cancel_stale_timer(session_id)
++    conv = store.get_conversation(child_id)
++    assert conv is not None and conv.live_status == "running"
++    try:
++        result = await ae_subagent_liveness.sweep_stale_claude_subagents(
++            store, now=conv.updated_at + quiet_s
++        )
++        assert result == (1 if settled else 0)
++        assert common._session_status_cache.get(child_id) == ("idle" if settled else None)
++        assert _statuses(published, child_id) == (["idle"] if settled else [])
++        timer = ae_subagent_liveness._stale_timers.get(child_id)
++        if quiet_s < CLAUDE_SUBAGENT_STALE_AFTER_S:
++            assert timer is not None
++            remaining = timer.when() - asyncio.get_running_loop().time()
++            assert abs(remaining - (CLAUDE_SUBAGENT_STALE_AFTER_S - quiet_s)) < 5
++        else:
++            assert timer is None
++        # A sub-agent that is not a Claude Code child is left to its own paths.
++        assert other.id not in ae_subagent_liveness._stale_timers
++        assert _statuses(published, other.id) == []
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++        common._session_status_cache.pop(child_id, None)
++
++
++async def test_startup_sweep_failure_is_logged_not_raised(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    store = Mock(spec=SqlAlchemyConversationStore)
++    store._session = Mock(side_effect=RuntimeError("database is down"))
++    assert await ae_subagent_liveness.sweep_stale_claude_subagents(store) == 0
++    assert "Could not sweep stale Claude subagents" in caplog.text
++
++
++async def test_startup_sweep_only_arms_a_child_restored_since_startup(
++    db_uri: str, published: Mock
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    _, child_id = _claude_child(store)
++    store.set_session_live_status(child_id, "running")
++    ae_subagent_liveness.cancel_stale_timer(child_id)
++    conv = store.get_conversation(child_id)
++    assert conv is not None
++    # A reconnect republished running before the sweep reached this row.
++    common._session_status_cache[child_id] = "running"
++    try:
++        result = await ae_subagent_liveness.sweep_stale_claude_subagents(
++            store, now=conv.updated_at + CLAUDE_SUBAGENT_STALE_AFTER_S + 1
++        )
++        assert result == 0
++        assert common._session_status_cache[child_id] == "running"
++        assert _statuses(published, child_id) == []
++        assert child_id in ae_subagent_liveness._stale_timers
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(child_id)
++        common._session_status_cache.pop(child_id, None)
++
++
++async def test_startup_sweep_warns_at_its_row_limit(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    parent = store.create_conversation()
++    for _ in range(2):
++        row = store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
++        store.set_session_live_status(row.id, "running")
++    monkeypatch.setattr(ae_subagent_liveness, "_SWEEP_LIMIT", 2)
++    assert len(ae_subagent_liveness._running_sub_agent_ids(store)) == 2
++    assert "read only the first 2 running sub-agent rows" in caplog.text
++
++
++async def test_startup_sweep_warns_without_a_sql_store(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    assert await ae_subagent_liveness.sweep_stale_claude_subagents(Mock(spec=[])) == 0
++    assert "conversation store has no _session" in caplog.text
+diff --git a/tests/server/routes/test_subagent_status.py b/tests/server/routes/test_subagent_status.py
+index b123392dfaddaf48ecd032362fb218ff64feacf2..3c33163a0fd31942f5039d17d1b56e7c5696d905 100644
+--- a/tests/server/routes/test_subagent_status.py
++++ b/tests/server/routes/test_subagent_status.py
+@@ -359,6 +359,34 @@ async def test_subagent_idle_waits_for_claude_completion(
+         common._session_blocked_on_cache.pop(sid, None)
+ 
+ 
++@pytest.mark.parametrize(
++    ("wrapper", "status", "armed"),
++    [
++        pytest.param(_CLAUDE_SUBAGENT, "running", True, id="claude-running"),
++        pytest.param(_CLAUDE_SUBAGENT, "idle", False, id="claude-idle"),
++        pytest.param("codex-native-ui-subagent", "running", False, id="codex-running"),
++    ],
++)
++async def test_running_status_arms_claude_subagent_cap(
++    status_route: _StatusRoute, wrapper: str, status: str, armed: bool
++) -> None:
++    route = status_route
++    sid = route.child_id
++    route.store.set_labels(
++        sid, {"omnigent.wrapper": wrapper, "omnigent.claude_native.subagent_id": "agent-1"}
++    )
++    try:
++        # A child that dies before its first lull still gets the cap from this edge.
++        response = await route.client.post(
++            f"/v1/sessions/{sid}/events",
++            json={"type": "external_session_status", "data": {"status": status}},
++        )
++        assert response.status_code == 202, response.text
++        assert (sid in ae_subagent_liveness._stale_timers) is armed
++    finally:
++        ae_subagent_liveness.cancel_stale_timer(sid)
++
++
+ async def test_subagent_idle_preserves_failed_status(status_route: _StatusRoute) -> None:
+     route = status_route
+     sid = route.child_id

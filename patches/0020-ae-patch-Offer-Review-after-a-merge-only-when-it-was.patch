@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 03:36:13 -0700
+Subject: [PATCH 020/148] [ae-patch] Offer Review after a merge only when it
+ was the session's last open pull request
+
+After Merge, a PR card offered "Set this session to review". Review means
+the session is done and frees one of Reid's three slots, yet on
+2026-09-25 a session that had opened four pull requests showed the offer
+after the first merge, while three were still open. The card only asked
+the server whether the session was already in review; nothing counted the
+session's other pull requests.
+
+The decision now lives in a new file, web/src/lib/aeReviewOffer.ts: after
+a merge, take the session's other tracked pull requests (upstream's
+per-session list, the one the GitHub panel reads) and read their states
+from the same ["ae-pr", repo, number] queries the cards use. Review is
+offered only when none is open. While some are open the card says so in a
+muted line ("3 more open pull requests in this session.") and offers
+nothing; while a state is still unknown it says nothing, so a slow or
+failed read never offers review early. The Status submenu still sets
+review by hand at any time.
+
+The GitHub panel's cards pass the list they already hold; a card under a
+chat message passes the list from the github-info cache when it is there,
+and otherwise the hook reads it once, after the merge.
+
+AePrCards.tsx (P12's file) gains the import, the hook call, the muted line,
+one condition on the offer and a `tracked` prop; AeInlinePrCards.tsx (also
+P12's) passes that prop in one line. No other upstream file is touched.
+Suites: aeReviewOffer.test.ts (the pure rule), two cases in
+AePrCards.test.tsx (four tracked, first merged: no offer, "3 more"; last
+open one merged: offer) and one in AeInlinePrCards.test.tsx.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ web/src/components/AeInlinePrCards.test.tsx | 26 +++++-
+ web/src/components/AeInlinePrCards.tsx      |  1 +
+ web/src/components/AePrCards.test.tsx       | 45 ++++++++++
+ web/src/components/AePrCards.tsx            | 35 +++++++-
+ web/src/lib/aeReviewOffer.test.ts           | 59 +++++++++++++
+ web/src/lib/aeReviewOffer.ts                | 94 +++++++++++++++++++++
+ 6 files changed, 255 insertions(+), 5 deletions(-)
+ create mode 100644 web/src/lib/aeReviewOffer.test.ts
+ create mode 100644 web/src/lib/aeReviewOffer.ts
+
+diff --git a/web/src/components/AeInlinePrCards.test.tsx b/web/src/components/AeInlinePrCards.test.tsx
+index 5061c4fd0f534560007f6908188d7fd73f1a2bfe..8f34f638c50a651be76388be6755dde7507f2b04 100644
+--- a/web/src/components/AeInlinePrCards.test.tsx
++++ b/web/src/components/AeInlinePrCards.test.tsx
+@@ -122,6 +122,30 @@ describe("AeInlinePrCards", () => {
+       method: "squash",
+       session_id: "s1",
+     });
+-    expect(screen.getByTestId("ae-pr-set-review")).toBeTruthy();
++    expect(await screen.findByTestId("ae-pr-set-review")).toBeTruthy();
++  });
++
++  it("does not offer review while another tracked pull request is open (2026-09-25)", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation((input) => {
++      if (String(input).endsWith("/merge")) {
++        return json({
++          merged: true,
++          repo: REPO,
++          number: 41,
++          method: "squash",
++          sha: "abcdef1234",
++          message: "Pull Request successfully merged",
++          session: { id: "s1", status: "working", offer_review: true },
++        });
++      }
++      return json(card(Number(String(input).split("/").pop())));
++    });
++    renderText(`Opened ${url(41)}`, [url(41), url(42)]);
++    fireEvent.click(await screen.findByRole("button", { name: "Merge" }));
++    fireEvent.click(screen.getByRole("button", { name: "Confirm merge" }));
++    expect((await screen.findByTestId("ae-pr-more-open")).textContent).toBe(
++      "1 more open pull request in this session.",
++    );
++    expect(screen.queryByTestId("ae-pr-set-review")).toBeNull();
+   });
+ });
+diff --git a/web/src/components/AeInlinePrCards.tsx b/web/src/components/AeInlinePrCards.tsx
+index 5bf96a9b9336211225062d4fa6cfafa1d95a908e..43f7a16b7944a3a23776a7d71bd0deddafbf2227 100644
+--- a/web/src/components/AeInlinePrCards.tsx
++++ b/web/src/components/AeInlinePrCards.tsx
+@@ -38,6 +38,7 @@ function Cards({ urls, sessionId }: { urls: string[]; sessionId?: string }) {
+             repo={parsed.repo}
+             number={parsed.number}
+             sessionId={sessionId}
++            tracked={tracked}
+             variant="inline"
+           />
+         );
+diff --git a/web/src/components/AePrCards.test.tsx b/web/src/components/AePrCards.test.tsx
+index 4e1a76a6cf7cb318985749bf51941b0d29615e23..ab1a3727b07537dbcec6f191d1a29bf94663c9ff 100644
+--- a/web/src/components/AePrCards.test.tsx
++++ b/web/src/components/AePrCards.test.tsx
+@@ -162,6 +162,51 @@ describe("AePrCards", () => {
+     expect(JSON.parse(String(patch.init?.body))).toEqual({ labels: { "ae.status": "review" } });
+   });
+ 
++  // 2026-09-25: a session with four pull requests offered review after the
++  // first merge. Review waits for the session's last open one (patch P20).
++  function serveMerge(states: Record<number, AePrCard["state"]>) {
++    serve((path) => {
++      const merged = /\/(\d+)\/merge$/.exec(path);
++      if (merged) {
++        return json({
++          merged: true,
++          repo: REPO,
++          number: Number(merged[1]),
++          method: "squash",
++          sha: "m3rg3d0000",
++          message: "Pull Request successfully merged",
++          session: { id: "s1", status: "working", offer_review: true },
++        });
++      }
++      const number = Number(path.split("/").pop());
++      return json(card(number, { state: states[number] ?? "open" }));
++    });
++  }
++
++  it("holds review back while other tracked pull requests are open", async () => {
++    serveMerge({});
++    renderCards([{ url: url(11) }, { url: url(12) }, { url: url(13) }, { url: url(14) }]);
++    await waitFor(() => expect(screen.getAllByRole("button", { name: "Merge" })).toHaveLength(4));
++    const first = screen.getAllByTestId("ae-pr-card")[0];
++    fireEvent.click(within(first).getByRole("button", { name: "Merge" }));
++    fireEvent.click(within(first).getByRole("button", { name: "Confirm merge" }));
++    expect((await within(first).findByRole("status")).textContent).toContain("Merged #11");
++    expect((await within(first).findByTestId("ae-pr-more-open")).textContent).toBe(
++      "3 more open pull requests in this session.",
++    );
++    expect(screen.queryByTestId("ae-pr-set-review")).toBeNull();
++  });
++
++  it("offers review after the last open tracked pull request merges", async () => {
++    serveMerge({ 11: "merged", 12: "closed" });
++    renderCards([{ url: url(11) }, { url: url(12) }, { url: url(13) }]);
++    const last = (await screen.findAllByTestId("ae-pr-card"))[2];
++    fireEvent.click(await within(last).findByRole("button", { name: "Merge" }));
++    fireEvent.click(within(last).getByRole("button", { name: "Confirm merge" }));
++    expect(await within(last).findByTestId("ae-pr-set-review")).toBeTruthy();
++    expect(screen.queryByTestId("ae-pr-more-open")).toBeNull();
++  });
++
+   it("Cancel closes the confirm step without a request", async () => {
+     serve(() => json(card(9)));
+     renderCards([{ url: url(9) }]);
+diff --git a/web/src/components/AePrCards.tsx b/web/src/components/AePrCards.tsx
+index 1373f19294e1da068503f4e406ddf84c721a3186..4ddbff7844cf49718ddc96833e93510107f40ac6 100644
+--- a/web/src/components/AePrCards.tsx
++++ b/web/src/components/AePrCards.tsx
+@@ -4,7 +4,9 @@
+ // is disabled with the server's reason when CI is red or running, the branch
+ // conflicts, or protection blocks it. After a merge the card shows the result
+ // and offers to set this session to review (`ae.status`, through upstream's
+-// labels PATCH, the same write the sidebar's Status submenu makes).
++// labels PATCH, the same write the sidebar's Status submenu makes), only when
++// no other tracked pull request of the session is still open (patch P20,
++// 2026-09-25, lib/aeReviewOffer.ts).
+ //
+ // Which pull requests: upstream's per-session tracking
+ // (https://github.com/omnigent-ai/omnigent/pull/6935), the `prs` list the
+@@ -32,6 +34,7 @@ import {
+   parseAePrUrl,
+ } from "@/lib/aePrs";
+ import { cn } from "@/lib/utils";
++import { aeMoreOpenText, useAeReviewOffer } from "@/lib/aeReviewOffer";
+ import { patchAeStatus } from "@/shell/AeStatusMenu";
+ 
+ /** How often an open card re-reads (the server caches GitHub for a minute). */
+@@ -82,8 +85,17 @@ function Chip({ tone, children }: { tone: Tone; children: string }) {
+ 
+ const TOUCH = "h-11 md:h-8";
+ 
+-function MergedNote({ result, sessionId }: { result: AeMergeResult; sessionId?: string }) {
++function MergedNote({
++  result,
++  sessionId,
++  tracked,
++}: {
++  result: AeMergeResult;
++  sessionId?: string;
++  tracked?: readonly { url: string }[];
++}) {
+   const queryClient = useQueryClient();
++  const offer = useAeReviewOffer(sessionId, result, tracked);
+   const review = useMutation({
+     mutationFn: () => patchAeStatus(sessionId!, "review"),
+     onSuccess: () => queryClient.invalidateQueries({ queryKey: ["conversations"] }),
+@@ -95,8 +107,14 @@ function MergedNote({ result, sessionId }: { result: AeMergeResult; sessionId?:
+         Merged #{result.number} ({how}){result.sha ? `, ${result.sha.slice(0, 7)}` : ""}.{" "}
+         {result.message}
+       </p>
++      {offer.kind === "open" && (
++        <p className="text-muted-foreground" data-testid="ae-pr-more-open">
++          {aeMoreOpenText(offer.count)}.
++        </p>
++      )}
+       {sessionId &&
+         result.session?.offer_review &&
++        offer.kind === "offer" &&
+         (review.isSuccess ? (
+           <p className="text-muted-foreground">This session is in review.</p>
+         ) : (
+@@ -210,6 +228,7 @@ export function AePrCardView({
+   number,
+   url,
+   sessionId,
++  tracked,
+   first = false,
+   variant = "panel",
+ }: {
+@@ -217,6 +236,8 @@ export function AePrCardView({
+   number: number;
+   url: string;
+   sessionId?: string;
++  /** The session's tracked pull requests, when the caller holds the list. */
++  tracked?: readonly { url: string }[];
+   first?: boolean;
+   variant?: "panel" | "inline";
+ }) {
+@@ -286,7 +307,7 @@ export function AePrCardView({
+             <Chip tone={reviewTone(card.review.state)}>{AE_REVIEW_TEXT[card.review.state]}</Chip>
+           </div>
+           {result ? (
+-            <MergedNote result={result} sessionId={sessionId} />
++            <MergedNote result={result} sessionId={sessionId} tracked={tracked} />
+           ) : confirming ? (
+             <ConfirmMerge
+               card={card}
+@@ -353,7 +374,13 @@ export function AePrCards({
+       className="flex max-h-[45%] shrink-0 flex-col gap-2 overflow-y-auto border-b border-border p-2"
+     >
+       {refs.map((ref, index) => (
+-        <AePrCardView key={ref.url} sessionId={sessionId} first={index === 0} {...ref} />
++        <AePrCardView
++          key={ref.url}
++          sessionId={sessionId}
++          tracked={prs}
++          first={index === 0}
++          {...ref}
++        />
+       ))}
+     </section>
+   );
+diff --git a/web/src/lib/aeReviewOffer.test.ts b/web/src/lib/aeReviewOffer.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f20412a7a481228c2a4567078c73b66c59b913f5
+--- /dev/null
++++ b/web/src/lib/aeReviewOffer.test.ts
+@@ -0,0 +1,59 @@
++import { describe, expect, it } from "vitest";
++import { aeMoreOpenText, aeOtherTrackedPrs, aeReviewOffer } from "./aeReviewOffer";
++
++const REPO = "analyticendeavors/omnigent-ae";
++const url = (n: number, repo = REPO) => `https://github.com/${repo}/pull/${n}`;
++
++describe("aeOtherTrackedPrs", () => {
++  it("drops the merged pull request, repeats and other hosts", () => {
++    expect(
++      aeOtherTrackedPrs(
++        [
++          { url: url(1) },
++          { url: url(2) },
++          { url: url(2) },
++          { url: "https://github.com/AnalyticEndeavors/Omnigent-AE/pull/1" },
++          { url: "https://ghe.example/o/r/pull/3" },
++          { url: url(4, "analyticendeavors/omnigent") },
++        ],
++        { repo: REPO, number: 1 },
++      ),
++    ).toEqual([
++      { repo: REPO, number: 2 },
++      { repo: "analyticendeavors/omnigent", number: 4 },
++    ]);
++  });
++
++  it("matches the merged pull request whatever the case of its repo", () => {
++    expect(
++      aeOtherTrackedPrs([{ url: url(7) }], { repo: "AnalyticEndeavors/Omnigent-AE", number: 7 }),
++    ).toEqual([]);
++  });
++});
++
++describe("aeReviewOffer", () => {
++  it("offers review when the merged pull request was the only one", () => {
++    expect(aeReviewOffer([])).toEqual({ kind: "offer" });
++  });
++
++  it("offers review when every other one is merged or closed", () => {
++    expect(aeReviewOffer(["merged", "closed", "merged"])).toEqual({ kind: "offer" });
++  });
++
++  it("holds the offer back and counts the ones still open", () => {
++    expect(aeReviewOffer(["open", "open", "open"])).toEqual({ kind: "open", count: 3 });
++    expect(aeReviewOffer(["merged", "open", undefined])).toEqual({ kind: "open", count: 1 });
++  });
++
++  it("says nothing while a state or the tracked list is unknown", () => {
++    expect(aeReviewOffer(["merged", undefined])).toEqual({ kind: "unknown" });
++    expect(aeReviewOffer(undefined)).toEqual({ kind: "unknown" });
++  });
++});
++
++describe("aeMoreOpenText", () => {
++  it("counts in words that read on a phone", () => {
++    expect(aeMoreOpenText(1)).toBe("1 more open pull request in this session");
++    expect(aeMoreOpenText(3)).toBe("3 more open pull requests in this session");
++  });
++});
+diff --git a/web/src/lib/aeReviewOffer.ts b/web/src/lib/aeReviewOffer.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a9487ac4c732c43f0c9b18cdd9056461a8009280
+--- /dev/null
++++ b/web/src/lib/aeReviewOffer.ts
+@@ -0,0 +1,94 @@
++// Whether a PR card offers "Set this session to review" after a merge.
++// Review means the session is done and frees one of Reid's three slots, so the
++// offer belongs after the merge of the session's last open tracked pull
++// request, not after the first of several. On 2026-09-25 a session that had
++// opened four pull requests offered review after the first merge while three
++// were still open. The rule: count the session's other tracked pull requests
++// (upstream's per-session list, the one the GitHub panel reads) whose card
++// still says open; offer review at zero, say how many are left otherwise, and
++// say nothing while a state is still unknown. omnigent-ae patch P20.
++
++import { useQueries, useQuery } from "@tanstack/react-query";
++import { useMemo } from "react";
++import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
++import { type AePrCard, fetchAePrCard, parseAePrUrl } from "@/lib/aePrs";
++
++export type AeReviewOffer =
++  { kind: "offer" } | { kind: "open"; count: number } | { kind: "unknown" };
++
++interface PrRef {
++  repo: string;
++  number: number;
++}
++
++/**
++ * The github.com pull requests in `tracked` other than `merged`, once each.
++ * A tracked URL on another host has no card and is left out.
++ */
++export function aeOtherTrackedPrs(tracked: readonly { url: string }[], merged: PrRef): PrRef[] {
++  const self = `${merged.repo.toLowerCase()}#${merged.number}`;
++  const seen = new Set([self]);
++  const out: PrRef[] = [];
++  for (const pr of tracked) {
++    const parsed = parseAePrUrl(pr.url);
++    if (!parsed) continue;
++    const key = `${parsed.repo}#${parsed.number}`;
++    if (seen.has(key)) continue;
++    seen.add(key);
++    out.push(parsed);
++  }
++  return out;
++}
++
++/**
++ * The decision, from the states of the session's other tracked pull requests
++ * (`undefined` for one not read yet or unreadable; the whole list `undefined`
++ * while the tracked list itself is unknown). Any open one holds the offer back
++ * and is counted; an unknown one also holds it back, silently, so a slow or
++ * failed read never offers review early.
++ */
++export function aeReviewOffer(
++  others: readonly (AePrCard["state"] | undefined)[] | undefined,
++): AeReviewOffer {
++  if (!others) return { kind: "unknown" };
++  const count = others.filter((state) => state === "open").length;
++  if (count > 0) return { kind: "open", count };
++  if (others.some((state) => state === undefined)) return { kind: "unknown" };
++  return { kind: "offer" };
++}
++
++/** "1 more open pull request in this session", "3 more open pull requests in this session". */
++export function aeMoreOpenText(count: number): string {
++  return `${count} more open pull request${count === 1 ? "" : "s"} in this session`;
++}
++
++/**
++ * The offer for the card that just merged `merged`. `tracked` is the session's
++ * list when the caller holds it (the GitHub panel does); otherwise it is read
++ * from the session's GitHub info, once, after the merge. The other cards'
++ * states come from the same `["ae-pr", repo, number]` queries the cards use,
++ * so the panel's cards are not read twice.
++ */
++export function useAeReviewOffer(
++  sessionId: string | undefined,
++  merged: PrRef,
++  tracked: readonly { url: string }[] | undefined,
++): AeReviewOffer {
++  const info = useQuery({
++    queryKey: ["github-info", sessionId],
++    queryFn: () => fetchPullRequestInfo(sessionId!),
++    enabled: !!sessionId && !tracked,
++  });
++  const others = useMemo(() => {
++    const list = tracked ?? (info.data ? (info.data.prs ?? []) : undefined);
++    return list ? aeOtherTrackedPrs(list, merged) : undefined;
++  }, [tracked, info.data, merged]);
++  const cards = useQueries({
++    queries: (others ?? []).map((ref) => ({
++      queryKey: ["ae-pr", ref.repo, ref.number],
++      queryFn: () => fetchAePrCard(ref.repo, ref.number),
++      retry: false,
++    })),
++  });
++  return aeReviewOffer(others && cards.map((query) => query.data?.state));
++}

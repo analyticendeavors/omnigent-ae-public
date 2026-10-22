@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 01:01:37 -0700
+Subject: [PATCH 027/148] [ae-patch] Reject navigation.openExternal with
+ PopupBlocked when the browser blocks the new tab
+
+Review of https://github.com/analyticendeavors/omnigent-ae/pull/58
+(Claude and Codex, 2026-09-27): the handler opened with
+window.open(url, "_blank", "noopener,noreferrer") and ignored the result.
+With noopener, window.open returns null even on success, and the open runs
+one MessagePort hop after the tap, where iOS Safari may block it, so a
+blocked tab looked like success and the extension never offered a fallback.
+
+aeOpenExternalWindow (web/src/lib/aeExternalUrls.ts) now opens without
+noopener, clears the new window's opener at once (the protection noopener
+gave), and throws ExtensionHostServiceError("PopupBlocked") when
+window.open returns null. Native shells keep upstream's noopener call:
+their window-open policy routes the link to the system browser and reports
+null regardless (as followLinkWithPopupFallback in ChatMarkdown.tsx notes).
+The handler's edit is the import and one line; the URL allowlist and the
+GitHub matcher are unchanged.
+
+Tests: the GitHub cases now get a window back and check its opener is
+cleared; a null return rejects with PopupBlocked; an Electron shell keeps
+the noopener call. Upstream's handed-out case mocks a returned window and
+expects the two-argument open.
+
+Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+---
+ ...useExtensionHostServices.aeGithub.test.tsx | 35 +++++++++++++++--
+ .../useExtensionHostServices.test.tsx         |  8 +---
+ .../services/useExtensionHostServices.ts      |  4 +-
+ web/src/lib/aeExternalUrls.ts                 | 38 ++++++++++++++++++-
+ 4 files changed, 72 insertions(+), 13 deletions(-)
+
+diff --git a/web/src/extensions/services/useExtensionHostServices.aeGithub.test.tsx b/web/src/extensions/services/useExtensionHostServices.aeGithub.test.tsx
+index f9f1de0dd409fffd7b0ffeda261227070032c9e8..ef570a23e2ea78efb519931c1b46b301479f5372 100644
+--- a/web/src/extensions/services/useExtensionHostServices.aeGithub.test.tsx
++++ b/web/src/extensions/services/useExtensionHostServices.aeGithub.test.tsx
+@@ -1,6 +1,7 @@
+ // omnigent-ae patch P25 (2026-09-27): `navigation.openExternal` opens a GitHub
+ // pull request or issue URL the host never handed out (`lib/aeExternalUrls.ts`),
+-// and still refuses every other URL it did not hand out.
++// and still refuses every other URL it did not hand out. P27 (2026-09-27): a
++// tab the browser blocked rejects with PopupBlocked instead of passing as opened.
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { renderHook } from "@testing-library/react";
+ import type { ReactNode } from "react";
+@@ -54,9 +55,11 @@ function openExternal(permissions: ExtensionCatalogItem["permissions"] = ["navig
+ 
+ describe("navigation.openExternal and GitHub links (P25)", () => {
+   let open: ReturnType<typeof vi.spyOn>;
++  let tab: Window;
+ 
+   beforeEach(() => {
+-    open = vi.spyOn(window, "open").mockReturnValue(null);
++    tab = { opener: window } as unknown as Window;
++    open = vi.spyOn(window, "open").mockReturnValue(tab);
+   });
+ 
+   afterEach(() => {
+@@ -69,7 +72,33 @@ describe("navigation.openExternal and GitHub links (P25)", () => {
+     "https://github.com/omnigent-ai/omnigent/pull/6935/files",
+   ])("opens %s without the host handing it out", async (url) => {
+     await expect(openExternal()?.({ url }, signal())).resolves.toBeNull();
+-    expect(open).toHaveBeenCalledWith(url, "_blank", "noopener,noreferrer");
++    // P27: opened without noopener so a block is visible, then the opener cut.
++    expect(open).toHaveBeenCalledWith(url, "_blank");
++    expect(tab.opener).toBeNull();
++  });
++
++  it("rejects with PopupBlocked when the browser blocks the new tab (P27)", async () => {
++    open.mockReturnValue(null);
++    await expect(
++      openExternal()?.({ url: "https://github.com/acme/repo/pull/1" }, signal()),
++    ).rejects.toMatchObject({ code: "PopupBlocked" });
++  });
++
++  it("keeps upstream's noopener open in a native shell, whose policy reports null (P27)", async () => {
++    open.mockReturnValue(null);
++    Object.assign(window, { omnigentDesktop: { kind: "electron" } });
++    try {
++      await expect(
++        openExternal()?.({ url: "https://github.com/acme/repo/pull/1" }, signal()),
++      ).resolves.toBeNull();
++      expect(open).toHaveBeenCalledWith(
++        "https://github.com/acme/repo/pull/1",
++        "_blank",
++        "noopener,noreferrer",
++      );
++    } finally {
++      Reflect.deleteProperty(window, "omnigentDesktop");
++    }
+   });
+ 
+   it.each([
+diff --git a/web/src/extensions/services/useExtensionHostServices.test.tsx b/web/src/extensions/services/useExtensionHostServices.test.tsx
+index adb7d3d807832b231eec347da1f6acc53c5d3079..eed8366aa03c5f3da4d32fff64f6334a33b45ad4 100644
+--- a/web/src/extensions/services/useExtensionHostServices.test.tsx
++++ b/web/src/extensions/services/useExtensionHostServices.test.tsx
+@@ -301,7 +301,7 @@ describe("useExtensionHostServices", () => {
+         { status: 200 },
+       ),
+     );
+-    const open = vi.spyOn(window, "open").mockReturnValue(null);
++    const open = vi.spyOn(window, "open").mockReturnValue({ opener: window } as unknown as Window);
+     const { result } = renderHook(() => useExtensionHostServices(extension), { wrapper });
+ 
+     await expect(
+@@ -325,11 +325,7 @@ describe("useExtensionHostServices", () => {
+       { url: "https://git.example.com/acme/repo/pull/42" },
+       signal(),
+     );
+-    expect(open).toHaveBeenCalledWith(
+-      "https://git.example.com/acme/repo/pull/42",
+-      "_blank",
+-      "noopener,noreferrer",
+-    );
++    expect(open).toHaveBeenCalledWith("https://git.example.com/acme/repo/pull/42", "_blank");
+     open.mockRestore();
+   });
+ 
+diff --git a/web/src/extensions/services/useExtensionHostServices.ts b/web/src/extensions/services/useExtensionHostServices.ts
+index c67a2244e8b4d54eb3198c495180c15e618e6107..0cdbba7f6ca086345f0b794d82f06a62d8427cae 100644
+--- a/web/src/extensions/services/useExtensionHostServices.ts
++++ b/web/src/extensions/services/useExtensionHostServices.ts
+@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
+ import { useTheme } from "next-themes";
+ import { resolveIdentity } from "@/lib/identity";
+ import { getOmnigentServerIdentity } from "@/lib/host";
+-import { isAeGithubLinkUrl } from "@/lib/aeExternalUrls";
++import { aeOpenExternalWindow, isAeGithubLinkUrl } from "@/lib/aeExternalUrls";
+ import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+ import { useNavigate } from "@/lib/routing";
+ import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
+@@ -125,7 +125,7 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
+             "URL was not provided by the host",
+           );
+         }
+-        window.open(url, "_blank", "noopener,noreferrer");
++        aeOpenExternalWindow(url);
+         return null;
+       },
+       "navigation.openNewSession": async (params: unknown, signal: AbortSignal) => {
+diff --git a/web/src/lib/aeExternalUrls.ts b/web/src/lib/aeExternalUrls.ts
+index a45014a468fd9e0073bbae5c9a618c756de5d5d9..49e431abd0b1d5b28c88dae72c28962a86ebc01a 100644
+--- a/web/src/lib/aeExternalUrls.ts
++++ b/web/src/lib/aeExternalUrls.ts
+@@ -12,13 +12,17 @@
+ // issue page on github.com, written exactly the way GitHub's API returns it.
+ //
+ // Why this is safe to open for any extension holding the navigation
+-// permission: the host opens it with `noopener,noreferrer` in a new browsing
+-// context, the scheme is https, the host is exactly github.com (no userinfo,
++// permission: the host opens it in a new browsing context with no opener
++// (`noopener,noreferrer` until P27, which clears `opener` itself so a blocked
++// tab can be told apart; see `aeOpenExternalWindow`), the scheme is https, the host is exactly github.com (no userinfo,
+ // no port, so no lookalike authority), the path has a fixed shape with no
+ // encoded characters, and there is no query string, so the link cannot carry
+ // parameters to a GitHub endpoint. The worst an extension can do with it is
+ // open a GitHub pull request or issue page in a new tab.
+ 
++import { ExtensionHostServiceError } from "@/extensions/services/errors";
++import { isNativeShell } from "@/lib/nativeBridge";
++
+ const OWNER_OR_REPO = "[A-Za-z0-9._-]{1,100}";
+ const NUMBER = "[1-9][0-9]{0,9}";
+ const FRAGMENT = "(?:#[A-Za-z0-9._~-]{1,256})?";
+@@ -46,3 +50,33 @@ export function isAeGithubLinkUrl(url: unknown): url is string {
+     return false;
+   }
+ }
++
++/** The error code `navigation.openExternal` rejects with when no tab opened. */
++export const AE_POPUP_BLOCKED = "PopupBlocked";
++
++/**
++ * Open *url* in a new tab for `navigation.openExternal`, and throw when the
++ * browser blocked it (patch P27, 2026-09-27). Upstream opened with
++ * `noopener,noreferrer`, which makes `window.open` return null even on
++ * success, so a tab that iOS Safari blocked (the open runs one MessagePort
++ * hop after the tap) looked like success and the extension never offered its
++ * fallback. Now the tab opens without `noopener`, and its `opener` is cleared
++ * at once, which keeps noopener's protection; a null window means blocked.
++ * Native shells keep upstream's call: their window-open policy routes the
++ * link to the system browser and reports null regardless (see
++ * `followLinkWithPopupFallback` in ChatMarkdown.tsx).
++ */
++export function aeOpenExternalWindow(url: string): void {
++  if (isNativeShell()) {
++    window.open(url, "_blank", "noopener,noreferrer");
++    return;
++  }
++  const opened = window.open(url, "_blank");
++  if (!opened) {
++    throw new ExtensionHostServiceError(
++      AE_POPUP_BLOCKED,
++      "The browser blocked the new tab; allow pop-ups for this site or copy the link",
++    );
++  }
++  opened.opener = null;
++}

@@ -1,0 +1,569 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 17 Oct 2026 08:02:53 -0700
+Subject: [PATCH 070/148] [ae-patch] Show native Codex questions inline in
+ Claude's question form
+
+The Codex card opened a modal dialog with its own buttons, unlike Claude's
+inline AskUserQuestionForm, and Transcript kept every question that had no
+exact "Answer to Codex questions" reply, so a plain chat reply left full-width
+"Answer Codex questions" buttons behind. CodexQuestionCard now renders inline
+with AskUserQuestionForm, disabled while the answer sends; Cancel folds it to a
+"Show Codex's question" link. Only the newest question that no real user
+message (committed or still sending) has followed stays pending, a newer
+question supersedes older ones even without an item id, and a system notice
+does not retire it. The answer is still one normal user message, with line
+breaks in an answer folded to spaces.
+---
+ .../chat/CodexQuestionCard.test.tsx           | 104 ++++++++----
+ web/src/components/chat/CodexQuestionCard.tsx | 159 ++++++------------
+ .../chat/Transcript.activeTurn.test.ts        |  47 ++++++
+ web/src/components/chat/Transcript.tsx        |  27 +--
+ web/src/components/chat/aeCodexQuestions.ts   |  62 +++++++
+ 5 files changed, 241 insertions(+), 158 deletions(-)
+ create mode 100644 web/src/components/chat/aeCodexQuestions.ts
+
+diff --git a/web/src/components/chat/CodexQuestionCard.test.tsx b/web/src/components/chat/CodexQuestionCard.test.tsx
+index 5fd4477eb8bbca687c0479ead832a73f7fbb8de0..f939b47f164c07a19ca38108cd6227a510f1d91a 100644
+--- a/web/src/components/chat/CodexQuestionCard.test.tsx
++++ b/web/src/components/chat/CodexQuestionCard.test.tsx
+@@ -16,6 +16,20 @@ beforeEach(() => {
+ });
+ 
+ describe("CodexQuestionCard", () => {
++  it("renders inline in Claude's question form, with no dialog", () => {
++    render(
++      <CodexQuestionCard
++        conversationId="conv_1"
++        itemId="item_0"
++        questions={[{ title: "Which path?", options: ["A", "B"] }]}
++      />,
++    );
++    expect(screen.queryByRole("dialog")).toBeNull();
++    expect(screen.getByTestId("ask-user-question-form")).toBeTruthy();
++    expect(screen.getByText("Which path?")).toBeTruthy();
++    expect(screen.getByRole("radio", { name: "B" })).toBeTruthy();
++  });
++
+   it("sends one normal user answer and stays answered after reload", async () => {
+     send.mockResolvedValue(undefined);
+     const props = {
+@@ -24,69 +38,91 @@ describe("CodexQuestionCard", () => {
+       questions: [{ title: "Which path?", options: ["A", "B"] }],
+     };
+     const view = render(<CodexQuestionCard {...props} />);
+-    fireEvent.click(screen.getByRole("button", { name: "B" }));
+-    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
+-    expect(screen.getByRole("button", { name: "Sending..." })).toBeDisabled();
++    fireEvent.click(screen.getByRole("radio", { name: "B" }));
++    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+     await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
+     expect(send.mock.calls[0][0]).toBe("Answer to Codex questions:\nWhich path?: B");
+     expect(send.mock.calls[0][3]).toMatchObject({
+       pinnedConversationId: "conv_1",
+       stableId: "07070707070707070707070707070707",
+     });
+-    await waitFor(() => expect(screen.queryByRole("button", { name: "Send answer" })).toBeNull());
++    await waitFor(() => expect(screen.queryByTestId("codex-question-card")).toBeNull());
+     view.unmount();
+     render(<CodexQuestionCard {...props} />);
+-    expect(screen.queryByRole("button", { name: "Send answer" })).toBeNull();
++    expect(screen.queryByTestId("codex-question-card")).toBeNull();
+   });
+ 
+-  it("accepts free text and leaves failed answers available to retry", async () => {
+-    send.mockImplementation(async (_text, _agent, _files, opts) => opts.onError("Offline"));
++  it("answers several questions in one message, free text included", async () => {
++    send.mockResolvedValue(undefined);
+     render(
+       <CodexQuestionCard
+         conversationId="conv_1"
+-        itemId="item_2"
+-        questions={[{ title: "Describe it" }]}
++        itemId="item_5"
++        questions={[{ title: "Which path?", options: ["A", "B"] }, { title: "Why?" }]}
+       />,
+     );
+-    fireEvent.change(screen.getByRole("textbox", { name: "Free text answer for Describe it" }), {
+-      target: { value: "My answer" },
++    fireEvent.click(screen.getByRole("radio", { name: "A" }));
++    fireEvent.click(screen.getByTestId("ask-user-question-next"));
++    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
++      target: { value: "  Faster\n  and safer  " },
+     });
+-    fireEvent.click(screen.getByRole("button", { name: "Send answer" }));
+-    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Offline"));
+-    expect(screen.getByRole("button", { name: "Send answer" })).toBeEnabled();
+-    expect(localStorage.getItem("codex-question:conv_1:item_2:sent")).toBeNull();
++    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
++    await waitFor(() => expect(send).toHaveBeenCalledTimes(1));
++    // A line break in a typed answer must not start a line of its own.
++    expect(send.mock.calls[0][0]).toBe(
++      "Answer to Codex questions:\nWhich path?: A\nWhy?: Faster and safer",
++    );
+   });
+ 
+-  it("reopens a dismissed prompt without answering it", () => {
++  it("leaves a failed answer on screen to retry", async () => {
++    send.mockImplementation(async (_text, _agent, _files, opts) => opts.onError("Offline"));
+     render(
+       <CodexQuestionCard
+         conversationId="conv_1"
+-        itemId="item_3"
++        itemId="item_2"
+         questions={[{ title: "Describe it" }]}
+       />,
+     );
+-    expect(screen.getByRole("dialog", { name: "Codex has questions" })).toBeTruthy();
+-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
+-    expect(screen.queryByRole("dialog")).toBeNull();
+-    fireEvent.click(screen.getByRole("button", { name: "Answer Codex questions" }));
+-    expect(screen.getByRole("dialog", { name: "Codex has questions" })).toBeTruthy();
+-    expect(send).not.toHaveBeenCalled();
++    fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
++      target: { value: "My answer" },
++    });
++    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
++    await waitFor(() => expect(screen.getByRole("alert").textContent).toBe("Offline"));
++    expect(screen.getByTestId("ask-user-question-submit")).toBeEnabled();
++    expect(localStorage.getItem("codex-question:conv_1:item_2:sent")).toBeNull();
+   });
+ 
+-  it("opens when an older pending prompt becomes newest", () => {
++  it("cancel folds the card to a link that brings it back, without sending", () => {
+     const props = {
+       conversationId: "conv_1",
+-      itemId: "item_4",
+-      questions: [{ title: "What next?" }],
++      itemId: "item_3",
++      questions: [{ title: "Describe it" }],
+     };
+-    const view = render(<CodexQuestionCard {...props} autoOpen={false} />);
+-    expect(screen.queryByRole("dialog")).toBeNull();
+-    view.rerender(<CodexQuestionCard {...props} autoOpen />);
+-    expect(screen.getByRole("dialog", { name: "Codex has questions" })).toBeTruthy();
+-    fireEvent.click(screen.getByRole("button", { name: "Close" }));
++    const view = render(<CodexQuestionCard {...props} />);
++    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
++    expect(screen.queryByTestId("codex-question-card")).toBeNull();
++    expect(send).not.toHaveBeenCalled();
+     view.unmount();
+-    render(<CodexQuestionCard {...props} autoOpen />);
+-    expect(screen.queryByRole("dialog")).toBeNull();
+-    expect(screen.getByRole("button", { name: "Answer Codex questions" })).toBeTruthy();
++    render(<CodexQuestionCard {...props} />);
++    expect(screen.queryByTestId("codex-question-card")).toBeNull();
++    fireEvent.click(screen.getByRole("button", { name: "Show Codex's question" }));
++    expect(screen.getByTestId("codex-question-card")).toBeTruthy();
++    expect(localStorage.getItem("codex-question:conv_1:item_3:dismissed")).toBeNull();
++  });
++
++  it("disables the form while the answer is sending", async () => {
++    send.mockReturnValue(new Promise(() => {}));
++    render(
++      <CodexQuestionCard
++        conversationId="conv_1"
++        itemId="item_6"
++        questions={[{ title: "Which path?", options: ["A", "B"] }]}
++      />,
++    );
++    fireEvent.click(screen.getByRole("radio", { name: "A" }));
++    fireEvent.click(screen.getByTestId("ask-user-question-submit"));
++    await waitFor(() => expect(screen.getByText("Sending...")).toBeTruthy());
++    expect(screen.getByTestId("ask-user-question-submit")).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+   });
+ });
+diff --git a/web/src/components/chat/CodexQuestionCard.tsx b/web/src/components/chat/CodexQuestionCard.tsx
+index 06f9c6c15b0e96c901d8431e21bab98946305613..4b3b3c8a4c2f2dda75acb68ba0b13ce60f5aab53 100644
+--- a/web/src/components/chat/CodexQuestionCard.tsx
++++ b/web/src/components/chat/CodexQuestionCard.tsx
+@@ -1,46 +1,53 @@
+-import { useEffect, useRef, useState } from "react";
++import { useMemo, useRef, useState } from "react";
+ import { Button } from "@/components/ui/button";
+-import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
+-import { Input } from "@/components/ui/input";
++import {
++  AskUserQuestionForm,
++  type AskUserQuestionAnswers,
++} from "@/components/blocks/AskUserQuestionForm";
+ import type { CodexQuestion } from "@/lib/blocks";
+ import { useChatStore } from "@/store/chatStore";
++import { aeCodexAnswerText, aeCodexAsClaudeQuestions } from "./aeCodexQuestions";
+ 
+-export function isCodexQuestionAnswer(text: string, questions: CodexQuestion[]): boolean {
+-  return (
+-    text.startsWith("Answer to Codex questions:\n") &&
+-    questions.every((question) => text.includes(`\n${question.title}: `))
+-  );
+-}
+-
++/** Codex's questions inline in the chat, in the same form Claude's questions use. */
+ export function CodexQuestionCard({
+   conversationId,
+   itemId,
+   questions,
+-  autoOpen = true,
+ }: {
+   conversationId: string;
+   itemId: string;
+   questions: CodexQuestion[];
+-  autoOpen?: boolean;
+ }) {
+   const storageKey = `codex-question:${conversationId}:${itemId}`;
+-  const [answers, setAnswers] = useState(() => questions.map(() => ""));
++  const formQuestions = useMemo(() => aeCodexAsClaudeQuestions(questions), [questions]);
+   const [pending, setPending] = useState(false);
+   const [error, setError] = useState("");
+   const [sent, setSent] = useState(() => localStorage.getItem(`${storageKey}:sent`) === "1");
+-  const [open, setOpen] = useState(
+-    () => autoOpen && localStorage.getItem(`${storageKey}:dismissed`) !== "1",
++  const [dismissed, setDismissed] = useState(
++    () => localStorage.getItem(`${storageKey}:dismissed`) === "1",
+   );
+   const submitting = useRef(false);
+ 
+-  useEffect(() => {
+-    setOpen(autoOpen && localStorage.getItem(`${storageKey}:dismissed`) !== "1");
+-  }, [autoOpen, storageKey]);
+-
+   if (sent) return null;
++  if (dismissed) {
++    return (
++      <Button
++        type="button"
++        variant="link"
++        size="sm"
++        className="h-auto self-start p-0 text-muted-foreground"
++        onClick={() => {
++          localStorage.removeItem(`${storageKey}:dismissed`);
++          setDismissed(false);
++        }}
++      >
++        Show Codex's question
++      </Button>
++    );
++  }
+ 
+-  const submit = async () => {
+-    if (submitting.current || answers.some((answer) => !answer.trim())) return;
++  const submit = async (answers: AskUserQuestionAnswers) => {
++    if (submitting.current) return;
+     const chat = useChatStore.getState();
+     if (chat.conversationId !== conversationId || !chat.boundAgentId) {
+       setError("Open this session to answer the question.");
+@@ -62,11 +69,7 @@ export function CodexQuestionCard({
+         ).join("");
+         localStorage.setItem(`${storageKey}:send-id`, stableId);
+       }
+-      const answer = [
+-        "Answer to Codex questions:",
+-        ...questions.map((question, index) => `${question.title}: ${answers[index]!.trim()}`),
+-      ].join("\n");
+-      await chat.send(answer, chat.boundAgentId, undefined, {
++      await chat.send(aeCodexAnswerText(questions, answers), chat.boundAgentId, undefined, {
+         stableId,
+         pinnedConversationId: conversationId,
+         onError: (message) => {
+@@ -87,85 +90,29 @@ export function CodexQuestionCard({
+   };
+ 
+   return (
+-    <>
+-      <Button
+-        type="button"
+-        variant="outline"
+-        size="sm"
+-        onClick={() => {
+-          localStorage.removeItem(`${storageKey}:dismissed`);
+-          setOpen(true);
+-        }}
+-      >
+-        Answer Codex questions
+-      </Button>
+-      <Dialog
+-        open={open}
+-        onOpenChange={(next) => {
+-          if (pending) return;
+-          setOpen(next);
+-          if (!next) localStorage.setItem(`${storageKey}:dismissed`, "1");
+-        }}
+-      >
+-        <DialogContent className="max-h-[85vh] overflow-y-auto sm:max-w-lg">
+-          <DialogHeader>
+-            <DialogTitle>Codex has questions</DialogTitle>
+-          </DialogHeader>
+-          {questions.map((question, index) => (
+-            <div
+-              className="mb-3 space-y-2"
+-              key={`${question.title}:${question.options?.join("|") ?? ""}`}
+-            >
+-              <p className="text-sm">{question.title}</p>
+-              {!!question.options?.length && (
+-                <div className="flex flex-wrap gap-2">
+-                  {question.options.map((option) => (
+-                    <Button
+-                      type="button"
+-                      variant={answers[index] === option ? "default" : "outline"}
+-                      size="sm"
+-                      key={option}
+-                      disabled={pending}
+-                      aria-pressed={answers[index] === option}
+-                      onClick={() =>
+-                        setAnswers((current) =>
+-                          current.map((value, i) => (i === index ? option : value)),
+-                        )
+-                      }
+-                    >
+-                      {option}
+-                    </Button>
+-                  ))}
+-                </div>
+-              )}
+-              <Input
+-                aria-label={`Free text answer for ${question.title}`}
+-                placeholder="Or type an answer"
+-                value={answers[index]}
+-                disabled={pending}
+-                onChange={(event) =>
+-                  setAnswers((current) =>
+-                    current.map((value, i) => (i === index ? event.target.value : value)),
+-                  )
+-                }
+-              />
+-            </div>
+-          ))}
+-          {error && (
+-            <p role="alert" className="mb-2 text-sm text-destructive">
+-              {error}
+-            </p>
+-          )}
+-          <Button
+-            type="button"
+-            size="sm"
+-            disabled={pending || answers.some((answer) => !answer.trim())}
+-            onClick={() => void submit()}
+-          >
+-            {pending ? "Sending..." : "Send answer"}
+-          </Button>
+-        </DialogContent>
+-      </Dialog>
+-    </>
++    <div
++      className="flex flex-col gap-2 rounded-lg border border-border p-3"
++      data-testid="codex-question-card"
++      aria-busy={pending}
++    >
++      <p className="text-sm font-medium">Codex has questions</p>
++      <fieldset disabled={pending} className="contents">
++        <AskUserQuestionForm
++          questions={formQuestions}
++          onSubmit={(answers) => void submit(answers)}
++          onReject={() => {
++            if (pending) return;
++            localStorage.setItem(`${storageKey}:dismissed`, "1");
++            setDismissed(true);
++          }}
++        />
++      </fieldset>
++      {pending && <p className="text-sm text-muted-foreground">Sending...</p>}
++      {error && (
++        <p role="alert" className="text-sm text-destructive">
++          {error}
++        </p>
++      )}
++    </div>
+   );
+ }
+diff --git a/web/src/components/chat/Transcript.activeTurn.test.ts b/web/src/components/chat/Transcript.activeTurn.test.ts
+index c0ae8a0d5f930e9a6926e4d1732133edc83031ec..126cac2d54d690d907c0b37b7eed369eb81bcde2 100644
+--- a/web/src/components/chat/Transcript.activeTurn.test.ts
++++ b/web/src/components/chat/Transcript.activeTurn.test.ts
+@@ -34,6 +34,53 @@ it("keeps a repeated Codex question pending after an earlier answer", () => {
+   ]);
+ });
+ 
++function codexQuestion(id: string): ConversationItem {
++  return {
++    id,
++    type: "message",
++    response_id: id,
++    status: "completed",
++    role: "assistant",
++    model: "codex",
++    content: [{ type: "output_text", text: "Choose" }],
++    codex_questions: [{ title: `Which path for ${id}?` }],
++  };
++}
++
++function userItem(id: string, text: string): ConversationItem {
++  return {
++    id,
++    type: "message",
++    response_id: id,
++    status: "completed",
++    role: "user",
++    content: [{ type: "input_text", text }],
++  };
++}
++
++it("retires a Codex question once a plain chat reply follows it", () => {
++  const blocks = itemsToBlocks([codexQuestion("q_1"), userItem("u_1", "Do the first one")]);
++  expect(pendingCodexQuestions(blocks)).toEqual([]);
++});
++
++it("shows only the newest of several unanswered Codex questions", () => {
++  const blocks = itemsToBlocks([codexQuestion("q_1"), codexQuestion("q_2")]);
++  expect(pendingCodexQuestions(blocks).map((q) => q.itemId)).toEqual(["q_2"]);
++});
++
++it("lets a newer Codex question with no item id supersede an older one", () => {
++  const blocks = itemsToBlocks([codexQuestion("q_1"), codexQuestion("q_2")]);
++  const newest = blocks.findLast((block) => block.type === "text_done" && block.codexQuestions);
++  if (!newest || newest.type !== "text_done") throw new Error("no question block");
++  newest.ctx = { ...newest.ctx, itemId: null };
++  expect(pendingCodexQuestions(blocks)).toEqual([]);
++});
++
++it("keeps a Codex question pending after a system notice", () => {
++  const blocks = itemsToBlocks([codexQuestion("q_1"), userItem("u_1", "[System: interrupted]")]);
++  expect(pendingCodexQuestions(blocks).map((q) => q.itemId)).toEqual(["q_1"]);
++});
++
+ function user(itemId: string): Extract<Bubble, { kind: "user" }> {
+   return { kind: "user", itemId, content: [{ type: "input_text", text: `msg ${itemId}` }] };
+ }
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index 04e7e451e9fb95e18742a57c0a0fa706337c2872..beda5b08e0c3870ef5702e558e3e451a96bae288 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -10,7 +10,8 @@ import {
+ } from "@/components/ai-elements/conversation";
+ import { Message, MessageContent } from "@/components/ai-elements/message";
+ import { ElicitationCard } from "@/components/blocks/ApprovalCard";
+-import { CodexQuestionCard, isCodexQuestionAnswer } from "./CodexQuestionCard";
++import { aePendingCodexQuestions } from "./aeCodexQuestions";
++import { CodexQuestionCard } from "./CodexQuestionCard";
+ import { cn } from "@/lib/utils";
+ import { getCurrentAuthorId } from "@/lib/identity";
+ import { hasCommandModifier } from "@/lib/hotkeys";
+@@ -89,20 +90,7 @@ export interface TranscriptProps {
+ export function pendingCodexQuestions(
+   blocks: AnyBlock[],
+ ): { itemId: string; questions: CodexQuestion[] }[] {
+-  return blocks.flatMap((block, index) => {
+-    if (block.type !== "text_done" || !block.ctx.itemId || !block.codexQuestions?.length) return [];
+-    const answered = blocks
+-      .slice(index + 1)
+-      .some(
+-        (later) =>
+-          later.type === "user_message" &&
+-          later.content.some(
+-            (part) =>
+-              part.type === "input_text" && isCodexQuestionAnswer(part.text, block.codexQuestions!),
+-          ),
+-      );
+-    return answered ? [] : [{ itemId: block.ctx.itemId, questions: block.codexQuestions }];
+-  });
++  return aePendingCodexQuestions(blocks);
+ }
+ 
+ export function isNativeFindShortcut(
+@@ -185,7 +173,11 @@ function TranscriptImpl({
+   ]);
+ 
+   const pendingElicitations = useMemo(() => collectPendingElicitations(bubbles), [bubbles]);
+-  const codexQuestions = useMemo(() => pendingCodexQuestions(blocks), [blocks]);
++  // A reply still on its way retires the question too.
++  const codexQuestions = useMemo(
++    () => (pendingUserMessages.length > 0 ? [] : pendingCodexQuestions(blocks)),
++    [blocks, pendingUserMessages.length],
++  );
+   const streamBubbles = useMemo(
+     () => (pendingElicitations.length === 0 ? bubbles : stripPendingElicitations(bubbles)),
+     [bubbles, pendingElicitations.length],
+@@ -423,14 +415,13 @@ function TranscriptImpl({
+                   </Message>
+                 ))}
+                 {display.conversationId &&
+-                  codexQuestions.map(({ itemId, questions }, index) => (
++                  codexQuestions.map(({ itemId, questions }) => (
+                     <Message key={itemId} from="assistant" className="max-w-full">
+                       <MessageContent className="w-full">
+                         <CodexQuestionCard
+                           conversationId={display.conversationId!}
+                           itemId={itemId}
+                           questions={questions}
+-                          autoOpen={index === codexQuestions.length - 1}
+                         />
+                       </MessageContent>
+                     </Message>
+diff --git a/web/src/components/chat/aeCodexQuestions.ts b/web/src/components/chat/aeCodexQuestions.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..616a3a11f60d5fb3a6ba20d524c9ff38fedff74b
+--- /dev/null
++++ b/web/src/components/chat/aeCodexQuestions.ts
+@@ -0,0 +1,62 @@
++// Native Codex questions shown with Claude's question form (AE patch).
++//
++// Only the newest question still waiting is shown: any later user message,
++// a plain chat reply included, means the conversation moved on, and a newer
++// question supersedes an older one.
++
++import type { AskUserQuestionAnswers } from "@/components/blocks/AskUserQuestionForm";
++import type { ClaudeQuestion } from "@/lib/askUserQuestion";
++import type { AnyBlock, CodexQuestion } from "@/lib/blocks";
++import { isSystemUserContent } from "@/lib/systemMessage";
++
++export const AE_CODEX_ANSWER_PREFIX = "Answer to Codex questions:";
++
++/** The newest Codex question set that no user message has followed yet. */
++export function aePendingCodexQuestions(
++  blocks: AnyBlock[],
++): { itemId: string; questions: CodexQuestion[] }[] {
++  for (let index = blocks.length - 1; index >= 0; index--) {
++    const block = blocks[index]!;
++    if (block.type === "user_message" && !isSystemUserContent(block.content)) return [];
++    if (block.type === "text_done" && block.codexQuestions?.length) {
++      // A newer question with no item id still supersedes older ones.
++      return block.ctx.itemId
++        ? [{ itemId: block.ctx.itemId, questions: block.codexQuestions }]
++        : [];
++    }
++  }
++  return [];
++}
++
++function questionId(index: number): string {
++  return `codex-${index}`;
++}
++
++/** Codex's questions in the shape AskUserQuestionForm renders. */
++export function aeCodexAsClaudeQuestions(questions: CodexQuestion[]): ClaudeQuestion[] {
++  return questions.map((question, index) => ({
++    id: questionId(index),
++    question: question.title,
++    options: (question.options ?? []).map((label) => ({ label })),
++    multiSelect: false,
++  }));
++}
++
++/** Line breaks fold to spaces so each answer stays on its own line. */
++function oneLine(text: string): string {
++  return text.replace(/\s*\n\s*/g, " ").trim();
++}
++
++/** The one user message that answers them, one "title: answer" line each. */
++export function aeCodexAnswerText(
++  questions: CodexQuestion[],
++  answers: AskUserQuestionAnswers,
++): string {
++  return [
++    AE_CODEX_ANSWER_PREFIX,
++    ...questions.map((question, index) => {
++      const answer = answers[questionId(index)];
++      return `${oneLine(question.title)}: ${oneLine(typeof answer === "string" ? answer : "")}`;
++    }),
++  ].join("\n");
++}

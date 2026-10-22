@@ -1,0 +1,460 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 16:40:20 -0700
+Subject: [PATCH 057/148] [ae-patch] Isolate context probes and enforce access
+ and snapshot expiry.
+
+---
+ omnigent/runner/ae_context_usage.py           | 122 ++++++++++++++++--
+ .../sessions/routes_ae_context_usage.py       |   6 +-
+ tests/runner/test_ae_context_usage.py         |  74 +++++++++++
+ .../routes/test_ae_context_usage_routes.py    |   2 +-
+ web/src/components/AePlanLimits.tsx           |   5 +-
+ web/src/components/aeContextUsage.test.tsx    |  12 ++
+ web/src/components/aeContextUsage.ts          |  35 +++--
+ 7 files changed, 223 insertions(+), 33 deletions(-)
+
+diff --git a/omnigent/runner/ae_context_usage.py b/omnigent/runner/ae_context_usage.py
+index e1c0a93b548a7ba599d85544313f24368b923df9..a3326f2b0f1e9cd1de85ae6fe3b634a9a69970d6 100644
+--- a/omnigent/runner/ae_context_usage.py
++++ b/omnigent/runner/ae_context_usage.py
+@@ -7,6 +7,7 @@ import contextlib
+ import json
+ import os
+ import signal
++import tempfile
+ import time
+ import weakref
+ from datetime import UTC, datetime
+@@ -17,6 +18,7 @@ import httpx
+ from fastapi.responses import JSONResponse
+ 
+ TTL = 180
++_failures: dict[str, float] = {}
+ _cache: dict[str, tuple[float, dict[str, Any]]] = {}
+ _locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+ 
+@@ -26,16 +28,21 @@ def launch_config(
+ ) -> tuple[list[str], dict[str, str], str, str]:
+     """Use the owning Linux process, never another session's launch configuration."""
+     raw = json.loads((bridge / "context_raw.json").read_text())
++    if not isinstance(raw, dict):
++        raise ValueError("Invalid context snapshot")
+     session_id = raw.get("session_id")
+     if not isinstance(session_id, str) or not session_id:
+         raise ValueError("No Claude session reading yet. Send a message first.")
+     settings_path = str(bridge / "claude-settings.json")
+-    for proc in process_root.glob("[0-9]*"):
++    for proc in sorted(process_root.glob("[0-9]*"), key=lambda p: int(p.name), reverse=True):
+         try:
+-            argv = (proc / "cmdline").read_bytes().decode().split("\0")
++            original = (proc / "cmdline").read_bytes().decode().split("\0")
++            argv = []
++            for arg in original:
++                argv.extend(arg.split("=", 1) if arg.startswith("--") and "=" in arg else [arg])
+             if "--settings" not in argv or argv[argv.index("--settings") + 1] != settings_path:
+                 continue
+-            if Path(argv[0]).name != "claude":
++            if Path(argv[0]).name != "claude" and "/claude/versions/" not in argv[0]:
+                 continue
+             env = dict(
+                 item.split("=", 1)
+@@ -63,23 +70,49 @@ def launch_config(
+                 "--settings",
+                 json.dumps(settings),
+             ]
+-            for flag in (
++            single = {
+                 "--model",
+-                "--mcp-config",
+                 "--append-system-prompt",
+                 "--system-prompt",
+-                "--plugin-dir",
+-                "--add-dir",
+                 "--agents",
+                 "--agent",
+                 "--setting-sources",
+-            ):
+-                for i, arg in enumerate(argv[:-1]):
+-                    if arg == flag:
+-                        command.extend((flag, argv[i + 1]))
++                "--autocompact",
++                "--permission-mode",
++                "--append-system-prompt-file",
++                "--system-prompt-file",
++            }
++            multiple = {
++                "--mcp-config",
++                "--plugin-dir",
++                "--add-dir",
++                "--tools",
++                "--allowedTools",
++                "--allowed-tools",
++                "--disallowedTools",
++                "--disallowed-tools",
++            }
++            for i, flag in enumerate(argv):
++                if flag == "--strict-mcp-config":
++                    command.append(flag)
++                elif flag in single and i + 1 < len(argv):
++                    command.extend((flag, argv[i + 1]))
++                elif flag in multiple:
++                    command.append(flag)
++                    for value in argv[i + 1 :]:
++                        if value.startswith("--") or value == "":
++                            break
++                        command.append(value)
+             model = raw.get("model", {})
+             model_id = model.get("id") if isinstance(model, dict) else None
+             if isinstance(model_id, str) and model_id:
++                window = raw.get("context_window", {})
++                if (
++                    isinstance(window, dict)
++                    and window.get("context_window_size") == 1000000
++                    and "[1m]" not in model_id
++                ):
++                    model_id += "[1m]"
+                 if "--model" in command:
+                     command[command.index("--model") + 1] = model_id
+                 else:
+@@ -168,7 +201,53 @@ def _rows(rows: object, names: tuple[str, ...]) -> list[dict[str, Any]]:
+     return result
+ 
+ 
++def isolated_command(command: list[str], cwd: str, scratch: Path) -> list[str]:
++    """Redirect bridge advertisements to private copies before starting any MCP server."""
++    result = list(command)
++    index = 0
++    while index < len(result):
++        if result[index] != "--mcp-config":
++            index += 1
++            continue
++        index += 1
++        while index < len(result) and not result[index].startswith("--"):
++            value = result[index]
++            config = (
++                json.loads(value)
++                if value.lstrip().startswith("{")
++                else json.loads((Path(cwd) / value).read_text())
++            )
++            for server in config.get("mcpServers", {}).values():
++                args = server.get("args", [])
++                if "omnigent.harnesses.claude_native.bridge" not in args:
++                    continue
++                if "--bridge-dir" not in args:
++                    raise ValueError("Unsupported bridge launch configuration")
++                position = args.index("--bridge-dir") + 1
++                live = Path(args[position])
++                if not live.is_absolute():
++                    live = Path(cwd) / live
++                copy = scratch / str(index)
++                copy.mkdir(mode=0o700, exist_ok=True)
++                for name in ("bridge.json", "tool_relay.json"):
++                    source = live / name
++                    if source.exists():
++                        target = copy / name
++                        target.write_bytes(source.read_bytes())
++                        target.chmod(0o600)
++                args[position] = str(copy)
++            result[index] = json.dumps(config)
++            index += 1
++    return result
++
++
+ async def probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str, Any]:
++    with tempfile.TemporaryDirectory(prefix="ae-context-") as scratch:
++        isolated = await asyncio.to_thread(isolated_command, command, cwd, Path(scratch))
++        return await _probe(isolated, env, cwd)
++
++
++async def _probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str, Any]:
+     proc = await asyncio.create_subprocess_exec(
+         *command,
+         env=env,
+@@ -194,14 +273,21 @@ async def probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str,
+         await proc.stdin.drain()
+         while line := await proc.stdout.readline():
+             message = json.loads(line)
++            if not isinstance(message, dict):
++                raise ValueError("Invalid control message")
+             response = message.get("response", {})
++            if not isinstance(response, dict):
++                raise ValueError("Invalid control response")
+             if message.get("type") != "control_response" or response.get("request_id") != rid:
+                 continue
+             if response.get("subtype") != "success":
+                 raise ValueError(
+                     "Claude Code does not support context summaries. Update it and retry."
+                 )
+-            return response.get("response", {})
++            payload = response.get("response", {})
++            if not isinstance(payload, dict):
++                raise ValueError("Invalid control payload")
++            return payload
+         raise ValueError("Claude stopped before returning context. Try again.")
+ 
+     try:
+@@ -213,8 +299,10 @@ async def probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str,
+                 await asyncio.sleep(0.5)
+                 status = await request({"subtype": "mcp_status"})
+                 servers = status.get("mcpServers", [])
++                if not isinstance(servers, list) or any(not isinstance(s, dict) for s in servers):
++                    raise ValueError("Invalid MCP status")
+                 pending = any(s.get("status") in ("pending", "connecting") for s in servers)
+-                if attempt >= 3 and not pending:
++                if attempt >= 3 and servers and not pending:
+                     complete = all(s.get("status") == "connected" for s in servers)
+                     break
+             body = await request({"subtype": "get_context_usage", "detail": "summary"})
+@@ -244,6 +332,8 @@ async def handle_context_usage(
+     lock = _locks.setdefault(conversation_id, asyncio.Lock())
+     async with lock:
+         try:
++            if time.monotonic() - _failures.get(conversation_id, float("-inf")) < 30:
++                raise ValueError("Recent probe failure")
+             bridge_id = await _claude_native_bridge_id_for_session(
+                 server_client=server_client, session_id=conversation_id
+             )
+@@ -260,9 +350,13 @@ async def handle_context_usage(
+             for old in list(_cache):
+                 if now - _cache[old][0] >= TTL:
+                     del _cache[old]
++            _failures.pop(conversation_id, None)
+             _cache[key] = (now, answer)
+             return JSONResponse(answer)
+-        except (OSError, ValueError, TimeoutError):
++        except (OSError, ValueError, TimeoutError, AttributeError, TypeError, httpx.HTTPError):
++            _failures.setdefault(conversation_id, time.monotonic())
++            if time.monotonic() - _failures[conversation_id] >= 30:
++                _failures[conversation_id] = time.monotonic()
+             return JSONResponse(
+                 {
+                     "available": False,
+diff --git a/omnigent/server/routes/sessions/routes_ae_context_usage.py b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+index ac334a232f52fb0ed2eb515d3f3f56f9b48417dc..fa9898da3642cfeab74c2b68a518a492ef8099e6 100644
+--- a/omnigent/server/routes/sessions/routes_ae_context_usage.py
++++ b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ from fastapi import APIRouter, Request
+ 
+ from omnigent.runner.routing import RunnerRouter
+-from omnigent.server.auth import LEVEL_READ, AuthProvider
++from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+ from omnigent.server.routes._auth_helpers import get_user_id, require_access
+ from omnigent.server.routes._sessions.helpers import _forward_session_change_to_runner
+ from omnigent.server.routes.sessions.routes_ae_fast_mode import _runner_answer
+@@ -26,7 +26,7 @@ def register_context_usage_routes(
+         await require_access(
+             get_user_id(request, auth_provider),
+             session_id,
+-            LEVEL_READ,
++            LEVEL_EDIT,
+             permission_store,
+             conversation_store,
+         )
+@@ -39,6 +39,6 @@ def register_context_usage_routes(
+         if result is None:
+             return {
+                 "available": False,
+-                "reason": "Session runner is offline. Try again when it reconnects.",
++                "reason": "Context request timed out or the runner is offline. Try again shortly.",
+             }
+         return _runner_answer(result, action="read context breakdown")
+diff --git a/tests/runner/test_ae_context_usage.py b/tests/runner/test_ae_context_usage.py
+index b98e74cffa300b469e5d685b463e19699307eaab..bb59066e6556439411c464bdd4a632699535dab0 100644
+--- a/tests/runner/test_ae_context_usage.py
++++ b/tests/runner/test_ae_context_usage.py
+@@ -105,6 +105,11 @@ def test_launch_isolated_and_uses_current_model(tmp_path):
+                 str(settings),
+                 "--model",
+                 "old-model",
++                "--strict-mcp-config",
++                "--tools=Read",
++                "--disallowedTools",
++                "Bash",
++                "Write",
+                 "--mcp-config",
+                 "config",
+                 "--append-system-prompt",
+@@ -118,6 +123,11 @@ def test_launch_isolated_and_uses_current_model(tmp_path):
+     assert command[command.index("--model") + 1] == "current-model"
+     assert command[command.index("--resume") + 1] == sid == "live-session"
+     assert "--fork-session" in command and "--no-session-persistence" in command
++    assert "--strict-mcp-config" in command
++    assert command[command.index("--tools") + 1] == "Read"
++    assert command[
++        command.index("--disallowedTools") + 1 : command.index("--disallowedTools") + 3
++    ] == ["Bash", "Write"]
+     assert env == {"SAFE": "value"}
+     assert cwd == str(tmp_path)
+     copied = json.loads(command[command.index("--settings") + 1])
+@@ -144,3 +154,67 @@ async def test_cancelled_probe_reaps_process(tmp_path):
+         await asyncio.wait_for(usage.probe([sys.executable, str(script)], {}, str(tmp_path)), 1)
+     with pytest.raises(ProcessLookupError):
+         os.kill(int(pid_file.read_text()), 0)
++
++
++def test_probe_redirects_bridge_writes_to_private_directory(tmp_path):
++    live = tmp_path / "live"
++    live.mkdir()
++    (live / "bridge.json").write_text('{"token":"private"}')
++    (live / "server.json").write_text('{"pid":123}')
++    (live / "tool_relay.json").write_text('{"tools":[]}')
++    scratch = tmp_path / "scratch"
++    scratch.mkdir()
++    config = {
++        "mcpServers": {
++            "omnigent": {
++                "args": [
++                    "-m",
++                    "omnigent.harnesses.claude_native.bridge",
++                    "serve-mcp",
++                    "--bridge-dir",
++                    str(live),
++                ]
++            }
++        }
++    }
++    command = usage.isolated_command(
++        ["claude", "--mcp-config", json.dumps(config)], str(tmp_path), scratch
++    )
++    copied = json.loads(command[2])["mcpServers"]["omnigent"]["args"][-1]
++    copy = type(live)(copied)
++    assert copy != live and copy.parent == scratch
++    assert (copy / "bridge.json").read_bytes() == (live / "bridge.json").read_bytes()
++    assert (copy / "tool_relay.json").exists()
++    assert not (copy / "server.json").exists()
++    (copy / "server.json").write_text('{"pid":456}')
++    assert (live / "server.json").read_text() == '{"pid":123}'
++
++
++@pytest.mark.asyncio
++async def test_failed_requests_share_cooldown(monkeypatch):
++    import omnigent.runner.native as native
++
++    monkeypatch.setattr(
++        native, "_claude_native_bridge_id_for_session", AsyncMock(return_value="bridge")
++    )
++    monkeypatch.setattr(usage, "launch_config", lambda _: (["claude"], {}, "/tmp", "failed-id"))
++    probe = AsyncMock(side_effect=ValueError("unsupported"))
++    monkeypatch.setattr(usage, "probe", probe)
++    usage._failures.clear()
++    replies = await asyncio.gather(
++        *(
++            usage.handle_context_usage("failure", harness="claude-native", server_client=None)
++            for _ in range(3)
++        )
++    )
++    assert probe.await_count == 1
++    assert all(json.loads(reply.body)["available"] is False for reply in replies)
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("payload", ["null", "[]", '{"type":"control_response","response":null}'])
++async def test_malformed_protocol_is_rejected(tmp_path, payload):
++    script = tmp_path / "bad.py"
++    script.write_text(f"import sys\nsys.stdin.readline()\nprint({payload!r}, flush=True)\n")
++    with pytest.raises(ValueError):
++        await usage.probe([sys.executable, str(script)], {}, str(tmp_path))
+diff --git a/tests/server/routes/test_ae_context_usage_routes.py b/tests/server/routes/test_ae_context_usage_routes.py
+index 6b82bd3fc61dd31412b4b055987236f588c4e75f..e83f18157e7400d2bf858ae5e89691875429a28f 100644
+--- a/tests/server/routes/test_ae_context_usage_routes.py
++++ b/tests/server/routes/test_ae_context_usage_routes.py
+@@ -12,7 +12,7 @@ from tests.server.routes.test_ae_fast_mode_routes import OWNER, VIEWER, _app, _s
+ 
+ 
+ @pytest.mark.parametrize(
+-    "user,expected", [(OWNER, 200), (VIEWER, 200), ("stranger@example.com", 404)]
++    "user,expected", [(OWNER, 200), (VIEWER, 403), ("stranger@example.com", 404)]
+ )
+ def test_access(db_uri, monkeypatch, user, expected):
+     session = _seed_session(db_uri)
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index a9b79eb9f45f55ac3f857873bbd2185b87247230..f2f16a570127ba5100e338cc52a3138685d56f36 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -840,7 +840,10 @@ export function AePlanLimitsPanel({
+     detailsOpen && native,
+     `${active.harness}:${active.model}`,
+   );
+-  const categories = context.data?.available ? context.data : undefined;
++  const categories =
++    context.data?.available && now - Date.parse(context.data.observedAt) < 180_000
++      ? context.data
++      : undefined;
+   const collaborators = sessions.collaborators.map((c) =>
+     buildCollaboratorContext(c, statusLines, now),
+   );
+diff --git a/web/src/components/aeContextUsage.test.tsx b/web/src/components/aeContextUsage.test.tsx
+index 1981f66065d02ca8ea442699b54496c366b97c04..cd83ab36d9d789906125372f7ec870577b4edcd8 100644
+--- a/web/src/components/aeContextUsage.test.tsx
++++ b/web/src/components/aeContextUsage.test.tsx
+@@ -26,6 +26,18 @@ describe("on-demand context", () => {
+     });
+     expect(result.current.data).toBeUndefined();
+   });
++  it("clears the displayed snapshot when folded", async () => {
++    vi.mocked(authenticatedFetch).mockResolvedValue(
++      new Response(JSON.stringify({ available: true })),
++    );
++    const { result, rerender } = renderHook(
++      ({ open }) => useContextUsage("session", open, "claude"),
++      { initialProps: { open: true } },
++    );
++    await waitFor(() => expect(result.current.data?.available).toBe(true));
++    rerender({ open: false });
++    expect(result.current.data).toBeUndefined();
++  });
+   it("reports errors and retries when reopened", async () => {
+     vi.mocked(authenticatedFetch)
+       .mockResolvedValueOnce(new Response(null, { status: 503 }))
+diff --git a/web/src/components/aeContextUsage.ts b/web/src/components/aeContextUsage.ts
+index 6cc4946de8c35b430abac1e48203918e84532192..4f4d9448f26a36c47c2ff29d02af8bbcb76e49ee 100644
+--- a/web/src/components/aeContextUsage.ts
++++ b/web/src/components/aeContextUsage.ts
+@@ -28,24 +28,31 @@ export function useContextUsage(session: string | null, enabled: boolean, identi
+     if (!enabled || !session) return;
+     let cancelled = false;
+     setState({ key });
+-    authenticatedFetch(`/v1/sessions/${encodeURIComponent(session)}/context-usage`)
+-      .then(async (response) => {
+-        if (!response.ok)
+-          throw new Error("Could not load context. Close and reopen the breakdown to retry.");
+-        return (await response.json()) as ContextUsage;
+-      })
+-      .then((data) => {
+-        if (!cancelled) setState({ key, data });
+-      })
+-      .catch((error: unknown) => {
+-        if (!cancelled)
+-          setState({ key, error: error instanceof Error ? error.message : "Context unavailable" });
+-      });
++    const refresh = () =>
++      authenticatedFetch(`/v1/sessions/${encodeURIComponent(session)}/context-usage`)
++        .then(async (response) => {
++          if (!response.ok)
++            throw new Error("Could not load context. Close and reopen the breakdown to retry.");
++          return (await response.json()) as ContextUsage;
++        })
++        .then((data) => {
++          if (!cancelled) setState({ key, data });
++        })
++        .catch((error: unknown) => {
++          if (!cancelled)
++            setState({
++              key,
++              error: error instanceof Error ? error.message : "Context unavailable",
++            });
++        });
++    void refresh();
++    const timer = setInterval(refresh, 180_000);
+     return () => {
++      clearInterval(timer);
+       cancelled = true;
+     };
+   }, [enabled, session, key]);
+-  return state.key === key ? state : { key };
++  return enabled && state.key === key ? state : { key };
+ }
+ 
+ export const categoryColors = [

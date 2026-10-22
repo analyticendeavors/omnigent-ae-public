@@ -1,0 +1,273 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 18:59:12 -0700
+Subject: [PATCH 086/148] [ae-patch] Fix the review findings on the split
+ view's pane names: fetch when the list fails, end Loading..., refetch only on
+ a rename
+
+A pane outside the list now fetches its row once the list has loaded or failed, and reads Loading... only while that fetch is pending, so a failed fetch or list falls back to the frame title or Untitled session. The frame-title watcher refetches only when a pane's name changes from one name to another and forgets panes that left the layout. aeFrameTitleName reuses UNTITLED_CONVERSATION_LABEL and DEFAULT_APP_NAME, and the comments are shorter.
+---
+ web/src/lib/aeSplitLayout.test.ts  |  2 +-
+ web/src/lib/aeSplitLayout.ts       | 21 +++++-----
+ web/src/pages/AeSplitPage.test.tsx | 63 ++++++++++++++++++++++--------
+ web/src/pages/AeSplitPage.tsx      | 41 ++++++++++---------
+ 4 files changed, 76 insertions(+), 51 deletions(-)
+
+diff --git a/web/src/lib/aeSplitLayout.test.ts b/web/src/lib/aeSplitLayout.test.ts
+index 7dfd20a55c854883251938ca726a20a79e65e8d6..c5d6251a18e37929ac66e9340394022b23a73a79 100644
+--- a/web/src/lib/aeSplitLayout.test.ts
++++ b/web/src/lib/aeSplitLayout.test.ts
+@@ -2,7 +2,7 @@
+ // the URL round trip, the remembered layout and its migration from version 1,
+ // "Open in split view"'s merge rule, the presets (slot rectangles, growing,
+ // shrinking, switching, swapping), the divider math in both axes and the
+-// pane-frame check, and the pane pickers' session names (2026-10-18).
++// pane-frame check, and the pane pickers' session names.
+ 
+ import { beforeEach, describe, expect, it } from "vitest";
+ import {
+diff --git a/web/src/lib/aeSplitLayout.ts b/web/src/lib/aeSplitLayout.ts
+index fae1756c48c19fd685ef450235abe3dd92654b4e..0795286857d8c54483498f0b2ca6225e84fa5dd2 100644
+--- a/web/src/lib/aeSplitLayout.ts
++++ b/web/src/lib/aeSplitLayout.ts
+@@ -11,6 +11,8 @@
+ // streams and keyboard focus without touching upstream's store.
+ 
+ import { stripLeadingGlyph } from "@/lib/aeLabels";
++import { DEFAULT_APP_NAME } from "@/lib/branding";
++import { UNTITLED_CONVERSATION_LABEL } from "@/shell/sidebarNav";
+ 
+ /** At most this many panes; the Claude desktop app's multi-panel layout tops out at four. */
+ export const AE_SPLIT_MAX_PANES = 4;
+@@ -543,27 +545,22 @@ function cleanTitle(title: string | null | undefined): string | null {
+ }
+ 
+ /**
+- * A pane frame's document title as a session name, or null when it says
+- * nothing about the session. ChatPage writes the title as the session's name,
+- * prefixed with "● " while it works, "New session" while untitled, and the
+- * app name before a session loads (`index.html` and `main.tsx`).
++ * A pane frame's document title as a session name, or null when it names no
++ * session: ChatPage's working dot is dropped, its untitled label and the app name ignored.
+  */
+ export function aeFrameTitleName(
+   frameTitle: string | null | undefined,
+-  appName = "Omnigent",
++  appName = DEFAULT_APP_NAME,
+ ): string | null {
+   const name = cleanTitle(frameTitle?.replace(/^\u25CF\s*/u, ""));
+-  if (!name || name === "New session" || name === appName) return null;
++  if (!name || name === UNTITLED_CONVERSATION_LABEL || name === appName) return null;
+   return name;
+ }
+ 
+ /**
+- * The name a split-view pane picker shows for a session (2026-10-18): the
+- * first of the list row's title, the fetched row's title, the pane frame's
+- * document title, "Loading..." while a fetch is in flight, and
+- * "Untitled session". Never the session id, which is what the picker showed
+- * for any session outside the first page of the session list. An archived
+- * session reads "Name (archived)".
++ * A pane picker's name for a session, never its id: the list title, the fetched
++ * title, the frame title, "Loading..." while loading, else "Untitled session";
++ * archived sessions read "Name (archived)".
+  */
+ export function aeSplitPaneName({
+   listRow,
+diff --git a/web/src/pages/AeSplitPage.test.tsx b/web/src/pages/AeSplitPage.test.tsx
+index 55870023ab83f324cea96e236e5fc575218e7c7d..d1302ac3967327fcf99defb3a1cf2906bb26a8c6 100644
+--- a/web/src/pages/AeSplitPage.test.tsx
++++ b/web/src/pages/AeSplitPage.test.tsx
+@@ -3,9 +3,8 @@
+ // dividers in both axes, following a frame that moves to another session, the
+ // single-session fallback below 1024px, and every layout preset: the picker,
+ // where each preset puts its panes, growing on add, shrinking on close,
+-// swapping panes, and a version 1 layout restored after the upgrade. Pane
+-// names (2026-10-18): a pane outside the list page fetches its own row and the
+-// picker shows its name, never its id.
++// swapping panes, a version 1 layout restored after the upgrade, and pane
++// names for sessions outside the list page.
+ 
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+@@ -15,13 +14,18 @@ import { AE_SPLIT_STORAGE_KEY, readStoredLayout } from "@/lib/aeSplitLayout";
+ 
+ const mocks = vi.hoisted(() => ({
+   conversations: [] as { id: string; title: string | null }[],
++  listFailed: false,
+   fetchConversationById: vi.fn(),
+ }));
+ 
+ vi.mock("@/hooks/useConversations", () => ({
+-  useConversations: () => ({
+-    data: { pages: [{ data: mocks.conversations }], pageParams: [undefined] },
+-  }),
++  useConversations: () =>
++    mocks.listFailed
++      ? { data: undefined, isError: true }
++      : {
++          data: { pages: [{ data: mocks.conversations }], pageParams: [undefined] },
++          isError: false,
++        },
+   fetchConversationById: mocks.fetchConversationById,
+ }));
+ 
+@@ -74,6 +78,7 @@ beforeEach(() => {
+     { id: "b", title: "Beta" },
+     { id: "c", title: "Gamma" },
+   ];
++  mocks.listFailed = false;
+   mocks.fetchConversationById.mockReset();
+   mocks.fetchConversationById.mockResolvedValue(null);
+   setViewport(true);
+@@ -247,25 +252,49 @@ describe("AeSplitPage pane names", () => {
+     expect(Array.from(picker.options).find((o) => o.value === "u")!.text).toBe("Untitled session");
+   });
+ 
+-  it("refetches a fetched pane when its frame's title changes", async () => {
++  function frameTitled(i: number, id: string, title: string) {
++    const win = { location: { pathname: `/c/${id}` }, document: { title } };
++    Object.defineProperty(frames()[i]!, "contentWindow", { configurable: true, value: win });
++    return win;
++  }
++
++  function poll() {
++    act(() => {
++      vi.advanceTimersByTime(AE_SPLIT_FRAME_POLL_MS);
++    });
++  }
++
++  it("refetches a fetched pane only when its frame's name changes to another name", async () => {
+     vi.useFakeTimers({ shouldAdvanceTime: true });
+     mocks.fetchConversationById.mockResolvedValue({ id: OLD_ID, title: null, archived: false });
+     renderAt(`/split?s=${OLD_ID}`);
+     await waitFor(() => expect(mocks.fetchConversationById).toHaveBeenCalledTimes(1));
+-    const frame = frames()[0]!;
+-    const win = { location: { pathname: `/c/${OLD_ID}` }, document: { title: "Omnigent" } };
+-    Object.defineProperty(frame, "contentWindow", { configurable: true, value: win });
+-    act(() => {
+-      vi.advanceTimersByTime(AE_SPLIT_FRAME_POLL_MS);
+-    });
++    const win = frameTitled(0, OLD_ID, "Omnigent");
++    poll();
++    // The first name after load is not a change.
++    win.document.title = "\u25CF First name";
++    poll();
++    await waitFor(() => expect(pickerText(0)).toBe("First name"));
++    expect(mocks.fetchConversationById).toHaveBeenCalledTimes(1);
+     mocks.fetchConversationById.mockResolvedValue({ id: OLD_ID, title: "Fresh name" });
+-    win.document.title = "\u25CF Fresh name";
+-    act(() => {
+-      vi.advanceTimersByTime(AE_SPLIT_FRAME_POLL_MS);
+-    });
++    win.document.title = "Fresh name";
++    poll();
+     await waitFor(() => expect(mocks.fetchConversationById).toHaveBeenCalledTimes(2));
+     await waitFor(() => expect(pickerText(0)).toBe("Fresh name"));
+   });
++
++  it("fetches panes when the list fails, and a failed fetch falls back to the frame title", async () => {
++    vi.useFakeTimers({ shouldAdvanceTime: true });
++    mocks.listFailed = true;
++    mocks.fetchConversationById.mockRejectedValue(new Error("502 Bad Gateway"));
++    renderAt(`/split?s=${OLD_ID},b`);
++    await waitFor(() => expect(mocks.fetchConversationById).toHaveBeenCalledTimes(2));
++    await waitFor(() => expect(pickerText(0)).toBe("Untitled session"));
++    frameTitled(1, "b", "Framed beta");
++    poll();
++    await waitFor(() => expect(pickerText(1)).toBe("Framed beta"));
++    expect(screen.getByTestId("ae-split-row").textContent).not.toContain("Loading...");
++  });
+ });
+ 
+ describe("AeSplitPage layout presets", () => {
+diff --git a/web/src/pages/AeSplitPage.tsx b/web/src/pages/AeSplitPage.tsx
+index 1345615602183e1bd4e5e1cc9e35b4f4e434e8ac..e4a0aae315087d1fea8456f767287137e23f8087 100644
+--- a/web/src/pages/AeSplitPage.tsx
++++ b/web/src/pages/AeSplitPage.tsx
+@@ -15,10 +15,8 @@
+ // preset change or a swap moves a frame on screen without moving it in the
+ // DOM: a moved iframe reloads, which would drop a pane's stream and draft.
+ //
+-// Names, never ids (2026-10-18): a pane holding a session outside the first
+-// page of the session list (archived, older, shared, just created) fetches its
+-// own row, and every picker label goes through `aeSplitPaneName`, so a picker
+-// never shows a raw session id.
++// A pane on a session the list page does not hold fetches its own row, and
++// every picker label goes through `aeSplitPaneName`.
+ 
+ import {
+   GripVerticalIcon,
+@@ -241,17 +239,17 @@ export function AeSplitPage() {
+     });
+   }, []);
+ 
+-  const { data } = useConversations("", false, { enabled: desktop });
++  const { data, isError: listFailed } = useConversations("", false, { enabled: desktop });
+   const conversations = useMemo(() => data?.pages.flatMap((p) => p.data) ?? [], [data]);
+   const byId = useMemo(() => new Map(conversations.map((c) => [c.id, c])), [conversations]);
+   const appName = useAppName();
+ 
+-  // Panes on a session the list page does not hold fetch their own row (at
+-  // most four), once the list has answered.
++  // Panes the list does not hold fetch their own row (at most four) once the
++  // list has loaded or failed.
++  const listSettled = data !== undefined || listFailed;
+   const missing = useMemo(
+-    () =>
+-      data === undefined ? [] : layout.panes.filter((p): p is string => p !== null && !byId.has(p)),
+-    [data, layout.panes, byId],
++    () => (listSettled ? layout.panes.filter((p): p is string => p !== null && !byId.has(p)) : []),
++    [listSettled, layout.panes, byId],
+   );
+   const paneQueries = useQueries({
+     queries: missing.map((id) => ({
+@@ -264,7 +262,7 @@ export function AeSplitPage() {
+   const fetched = new Map<string, { row: AeSplitPaneRow | null; loading: boolean }>();
+   missing.forEach((id, i) => {
+     const q = paneQueries[i];
+-    fetched.set(id, { row: q?.data ?? null, loading: q?.data === undefined && !q?.isError });
++    fetched.set(id, { row: q?.data ?? null, loading: q?.isPending === true });
+   });
+ 
+   const paneName = (pane: AeSplitPane, frameTitle: string | undefined): string => {
+@@ -274,7 +272,7 @@ export function AeSplitPage() {
+       listRow: byId.get(pane),
+       fetchedRow: own?.row,
+       frameTitle,
+-      loading: data === undefined || own?.loading === true,
++      loading: !listSettled || own?.loading === true,
+       appName,
+     });
+   };
+@@ -288,20 +286,21 @@ export function AeSplitPage() {
+     if (next !== current) navigate(`/split?${next}`, { replace: true });
+   }, [layout, navigate, param, layoutParam]);
+ 
+-  // A fetched pane refetches its row when its frame's title changes (a rename,
+-  // or a new session getting its first title), so the picker catches up.
++  // A fetched pane refetches its row when its frame's name changes to another name (a rename).
+   const queryClient = useQueryClient();
+-  const seenFrameNames = useRef(new Map<string, string | null>());
++  const seenFrameNames = useRef(new Map<string, string>());
+   useEffect(() => {
++    const seen = seenFrameNames.current;
++    for (const id of seen.keys()) if (!layout.panes.includes(id)) seen.delete(id);
+     layout.panes.forEach((pane, i) => {
+       if (pane === null || byId.has(pane)) return;
+-      const title = frameTitles[keys[i] ?? -1];
+-      if (title === undefined) return;
+-      const name = aeFrameTitleName(title, appName);
+-      const seen = seenFrameNames.current;
+-      const changed = seen.has(pane) && seen.get(pane) !== name;
++      const name = aeFrameTitleName(frameTitles[keys[i] ?? -1], appName);
++      if (name === null) return;
++      const before = seen.get(pane);
+       seen.set(pane, name);
+-      if (changed) void queryClient.invalidateQueries({ queryKey: aeSplitPaneQueryKey(pane) });
++      if (before !== undefined && before !== name) {
++        void queryClient.invalidateQueries({ queryKey: aeSplitPaneQueryKey(pane) });
++      }
+     });
+   }, [frameTitles, layout.panes, keys, byId, appName, queryClient]);
+ 

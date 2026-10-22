@@ -1,0 +1,1114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 15 Oct 2026 16:46:14 -0700
+Subject: [PATCH 051/148] [ae-patch] Show Claude context categories on demand
+ in the Usage popover.
+
+---
+ omnigent/runner/ae_context_usage.py           | 274 ++++++++++++++++++
+ omnigent/runner/app.py                        |   9 +
+ omnigent/server/routes/sessions/__init__.py   |  12 +
+ .../sessions/routes_ae_context_usage.py       |  44 +++
+ openapi.json                                  |  44 +++
+ tests/runner/test_ae_context_usage.py         | 146 ++++++++++
+ .../routes/test_ae_context_usage_routes.py    |  30 ++
+ .../components/AeContextCategories.test.tsx   |  49 ++++
+ web/src/components/AeContextCategories.tsx    | 108 +++++++
+ web/src/components/AePlanLimits.test.tsx      |   4 +-
+ web/src/components/AePlanLimits.tsx           |  63 +++-
+ web/src/components/aeContextUsage.test.tsx    |  42 +++
+ web/src/components/aeContextUsage.ts          |  80 +++++
+ 13 files changed, 889 insertions(+), 16 deletions(-)
+ create mode 100644 omnigent/runner/ae_context_usage.py
+ create mode 100644 omnigent/server/routes/sessions/routes_ae_context_usage.py
+ create mode 100644 tests/runner/test_ae_context_usage.py
+ create mode 100644 tests/server/routes/test_ae_context_usage_routes.py
+ create mode 100644 web/src/components/AeContextCategories.test.tsx
+ create mode 100644 web/src/components/AeContextCategories.tsx
+ create mode 100644 web/src/components/aeContextUsage.test.tsx
+ create mode 100644 web/src/components/aeContextUsage.ts
+
+diff --git a/omnigent/runner/ae_context_usage.py b/omnigent/runner/ae_context_usage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..e1c0a93b548a7ba599d85544313f24368b923df9
+--- /dev/null
++++ b/omnigent/runner/ae_context_usage.py
+@@ -0,0 +1,274 @@
++"""Reconstruct a native session's context in a disposable Claude summary process."""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import json
++import os
++import signal
++import time
++import weakref
++from datetime import UTC, datetime
++from pathlib import Path
++from typing import Any
++
++import httpx
++from fastapi.responses import JSONResponse
++
++TTL = 180
++_cache: dict[str, tuple[float, dict[str, Any]]] = {}
++_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
++
++
++def launch_config(
++    bridge: Path, process_root: Path = Path("/proc")
++) -> tuple[list[str], dict[str, str], str, str]:
++    """Use the owning Linux process, never another session's launch configuration."""
++    raw = json.loads((bridge / "context_raw.json").read_text())
++    session_id = raw.get("session_id")
++    if not isinstance(session_id, str) or not session_id:
++        raise ValueError("No Claude session reading yet. Send a message first.")
++    settings_path = str(bridge / "claude-settings.json")
++    for proc in process_root.glob("[0-9]*"):
++        try:
++            argv = (proc / "cmdline").read_bytes().decode().split("\0")
++            if "--settings" not in argv or argv[argv.index("--settings") + 1] != settings_path:
++                continue
++            if Path(argv[0]).name != "claude":
++                continue
++            env = dict(
++                item.split("=", 1)
++                for item in (proc / "environ").read_bytes().decode().split("\0")
++                if "=" in item
++            )
++            env.pop("CLAUDECODE", None)
++            cwd = os.readlink(proc / "cwd")
++            settings = json.loads(Path(settings_path).read_text())
++            settings.pop("hooks", None)
++            settings["disableAllHooks"] = True
++            settings["statusLine"] = {"type": "command", "command": "true"}
++            command = [
++                argv[0],
++                "-p",
++                "--resume",
++                session_id,
++                "--fork-session",
++                "--no-session-persistence",
++                "--input-format",
++                "stream-json",
++                "--output-format",
++                "stream-json",
++                "--verbose",
++                "--settings",
++                json.dumps(settings),
++            ]
++            for flag in (
++                "--model",
++                "--mcp-config",
++                "--append-system-prompt",
++                "--system-prompt",
++                "--plugin-dir",
++                "--add-dir",
++                "--agents",
++                "--agent",
++                "--setting-sources",
++            ):
++                for i, arg in enumerate(argv[:-1]):
++                    if arg == flag:
++                        command.extend((flag, argv[i + 1]))
++            model = raw.get("model", {})
++            model_id = model.get("id") if isinstance(model, dict) else None
++            if isinstance(model_id, str) and model_id:
++                if "--model" in command:
++                    command[command.index("--model") + 1] = model_id
++                else:
++                    command.extend(("--model", model_id))
++            return command, env, cwd, session_id
++        except (OSError, ValueError, IndexError):
++            continue
++    raise ValueError("No live Claude process for this session. Resume it and try again.")
++
++
++def normalize(body: dict[str, Any], *, complete: bool) -> dict[str, Any]:
++    """Allow only display data across the runner boundary, never MCP configuration."""
++    categories = body.get("categories")
++    maximum = body.get("maxTokens")
++    total = body.get("totalTokens")
++    if (
++        not isinstance(categories, list)
++        or not isinstance(maximum, (int, float))
++        or maximum <= 0
++        or not isinstance(total, (int, float))
++        or total < 0
++    ):
++        raise ValueError(
++            "Claude returned an unsupported context response. Update Claude Code and retry."
++        )
++    clean = []
++    for row in categories:
++        if not isinstance(row, dict) or row.get("kind") not in (
++            "used",
++            "free",
++            "buffer",
++            "deferred",
++        ):
++            continue
++        tokens = row.get("tokens")
++        if (
++            not isinstance(tokens, (int, float))
++            or tokens < 0
++            or not isinstance(row.get("name"), str)
++        ):
++            continue
++        clean.append({"name": row["name"], "tokens": tokens, "kind": row["kind"]})
++    threshold = body.get("autoCompactThreshold")
++    return {
++        "available": True,
++        "categories": clean,
++        "totalTokens": total,
++        "maxTokens": maximum,
++        "autoCompactThreshold": threshold
++        if isinstance(threshold, (int, float)) and threshold > 0
++        else None,
++        "isAutoCompactEnabled": body.get("isAutoCompactEnabled") is True,
++        "observedAt": datetime.now(UTC).isoformat(),
++        "complete": complete,
++        "details": detail_rows(body),
++    }
++
++
++def detail_rows(body: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
++    result = {}
++    for key, label, names in (
++        ("memoryFiles", "Memory files", ("path", "name")),
++        ("mcpTools", "MCP tools", ("name", "toolName")),
++        ("agents", "Custom agents", ("name", "agentType")),
++    ):
++        rows = body.get(key, [])
++        result[label] = _rows(rows, names)
++    skills = body.get("skills", {})
++    result["Skills"] = _rows(
++        skills.get("skillFrontmatter", []) if isinstance(skills, dict) else [], ("name",)
++    )
++    return result
++
++
++def _rows(rows: object, names: tuple[str, ...]) -> list[dict[str, Any]]:
++    if not isinstance(rows, list):
++        return []
++    result = []
++    for row in rows:
++        if not isinstance(row, dict):
++            continue
++        name = next((row[n] for n in names if isinstance(row.get(n), str)), None)
++        tokens = row.get("tokens")
++        if name and isinstance(tokens, (int, float)) and tokens >= 0:
++            result.append({"name": name, "tokens": tokens})
++    return result
++
++
++async def probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str, Any]:
++    proc = await asyncio.create_subprocess_exec(
++        *command,
++        env=env,
++        cwd=cwd,
++        stdin=asyncio.subprocess.PIPE,
++        stdout=asyncio.subprocess.PIPE,
++        stderr=asyncio.subprocess.DEVNULL,
++        start_new_session=True,
++        limit=8 * 1024 * 1024,
++    )
++    assert proc.stdin is not None and proc.stdout is not None
++    sequence = 0
++
++    async def request(body: dict[str, Any]) -> dict[str, Any]:
++        nonlocal sequence
++        sequence += 1
++        rid = str(sequence)
++        proc.stdin.write(
++            (
++                json.dumps({"type": "control_request", "request_id": rid, "request": body}) + "\n"
++            ).encode()
++        )
++        await proc.stdin.drain()
++        while line := await proc.stdout.readline():
++            message = json.loads(line)
++            response = message.get("response", {})
++            if message.get("type") != "control_response" or response.get("request_id") != rid:
++                continue
++            if response.get("subtype") != "success":
++                raise ValueError(
++                    "Claude Code does not support context summaries. Update it and retry."
++                )
++            return response.get("response", {})
++        raise ValueError("Claude stopped before returning context. Try again.")
++
++    try:
++        async with asyncio.timeout(25):
++            await request({"subtype": "initialize"})
++            complete = False
++            # MCP discovery starts asynchronously after initialization.
++            for attempt in range(16):
++                await asyncio.sleep(0.5)
++                status = await request({"subtype": "mcp_status"})
++                servers = status.get("mcpServers", [])
++                pending = any(s.get("status") in ("pending", "connecting") for s in servers)
++                if attempt >= 3 and not pending:
++                    complete = all(s.get("status") == "connected" for s in servers)
++                    break
++            body = await request({"subtype": "get_context_usage", "detail": "summary"})
++            return normalize(body, complete=complete)
++    finally:
++        with contextlib.suppress(ProcessLookupError):
++            os.killpg(proc.pid, signal.SIGKILL)
++        transport = getattr(proc, "_transport", None)
++        if transport is not None:
++            transport.close()
++        await proc.wait()
++
++
++async def handle_context_usage(
++    conversation_id: str, *, harness: str | None, server_client: httpx.AsyncClient
++) -> JSONResponse:
++    from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
++    from omnigent.runner.native import _claude_native_bridge_id_for_session
++
++    if harness != "claude-native":
++        return JSONResponse(
++            {
++                "available": False,
++                "reason": "Context categories require a running Claude Code session.",
++            }
++        )
++    lock = _locks.setdefault(conversation_id, asyncio.Lock())
++    async with lock:
++        try:
++            bridge_id = await _claude_native_bridge_id_for_session(
++                server_client=server_client, session_id=conversation_id
++            )
++            command, env, cwd, session_id = await asyncio.to_thread(
++                launch_config, bridge_dir_for_bridge_id(bridge_id)
++            )
++            model = command[command.index("--model") + 1] if "--model" in command else ""
++            key = f"{conversation_id}:{session_id}:{model}"
++            cached = _cache.get(key)
++            if cached and time.monotonic() - cached[0] < TTL:
++                return JSONResponse(cached[1])
++            answer = await probe(command, env, cwd)
++            now = time.monotonic()
++            for old in list(_cache):
++                if now - _cache[old][0] >= TTL:
++                    del _cache[old]
++            _cache[key] = (now, answer)
++            return JSONResponse(answer)
++        except (OSError, ValueError, TimeoutError):
++            return JSONResponse(
++                {
++                    "available": False,
++                    "reason": (
++                        "Could not read Claude context. Resume the session, "
++                        "check its MCP connections, and try again."
++                    ),
++                }
++            )
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index b6c8471e0ce99b9d386db1eefc4c0c3df1aebb70..3c73c6a366d625fbf124b7c27926b2c0be518893 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -6772,6 +6772,15 @@ def create_runner_app(
+                 )
+             return Response(status_code=204)
+ 
++        if body_type == "context_usage":
++            from omnigent.runner.ae_context_usage import handle_context_usage
++
++            return await handle_context_usage(
++                conversation_id,
++                harness=_session_harness_name(conversation_id),
++                server_client=server_client,
++            )
++
+         if body_type in ("fast_mode_status", "fast_mode_change"):
+             from omnigent.runner.ae_fast_mode import handle_fast_mode_event
+ 
+diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
+index bb5b07217438412ee4e1663810d5b304fc5afeb9..f868b9590143a2ee775cb6833f320735f422db77 100644
+--- a/omnigent/server/routes/sessions/__init__.py
++++ b/omnigent/server/routes/sessions/__init__.py
+@@ -994,6 +994,18 @@ def create_sessions_router(
+         host_registry=host_registry,
+     )
+ 
++    from omnigent.server.routes.sessions.routes_ae_context_usage import (
++        register_context_usage_routes,
++    )
++
++    register_context_usage_routes(
++        router,
++        conversation_store=conversation_store,
++        runner_router=runner_router,
++        auth_provider=auth_provider,
++        permission_store=permission_store,
++    )
++
+     from omnigent.server.routes.sessions.routes_ae_fast_mode import register_ae_fast_mode_routes
+ 
+     register_ae_fast_mode_routes(
+diff --git a/omnigent/server/routes/sessions/routes_ae_context_usage.py b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac334a232f52fb0ed2eb515d3f3f56f9b48417dc
+--- /dev/null
++++ b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+@@ -0,0 +1,44 @@
++"""Authorized, on-demand Claude context snapshots through the session runner."""
++
++from __future__ import annotations
++
++from fastapi import APIRouter, Request
++
++from omnigent.runner.routing import RunnerRouter
++from omnigent.server.auth import LEVEL_READ, AuthProvider
++from omnigent.server.routes._auth_helpers import get_user_id, require_access
++from omnigent.server.routes._sessions.helpers import _forward_session_change_to_runner
++from omnigent.server.routes.sessions.routes_ae_fast_mode import _runner_answer
++from omnigent.stores import ConversationStore
++from omnigent.stores.permission_store import PermissionStore
++
++
++def register_context_usage_routes(
++    router: APIRouter,
++    *,
++    conversation_store: ConversationStore,
++    runner_router: RunnerRouter | None,
++    auth_provider: AuthProvider | None,
++    permission_store: PermissionStore | None,
++) -> None:
++    @router.get("/sessions/{session_id}/context-usage")
++    async def context_usage(request: Request, session_id: str) -> dict[str, object]:
++        await require_access(
++            get_user_id(request, auth_provider),
++            session_id,
++            LEVEL_READ,
++            permission_store,
++            conversation_store,
++        )
++        result = await _forward_session_change_to_runner(
++            session_id,
++            runner_router,
++            {"type": "context_usage"},
++            timeout_s=35,
++        )
++        if result is None:
++            return {
++                "available": False,
++                "reason": "Session runner is offline. Try again when it reconnects.",
++            }
++        return _runner_answer(result, action="read context breakdown")
+diff --git a/openapi.json b/openapi.json
+index 902d1f032c26e60b9edf10d902720d271965a89e..f5a3ee7ac594fa9dd0e1f4899734dd6397cd5ad1 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -13769,6 +13769,50 @@
+         ]
+       }
+     },
++    "/v1/sessions/{session_id}/context-usage": {
++      "get": {
++        "operationId": "context_usage_v1_sessions__session_id__context_usage_get",
++        "parameters": [
++          {
++            "in": "path",
++            "name": "session_id",
++            "required": true,
++            "schema": {
++              "title": "Session Id",
++              "type": "string"
++            }
++          }
++        ],
++        "responses": {
++          "200": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "additionalProperties": true,
++                  "title": "Response Context Usage V1 Sessions  Session Id  Context Usage Get",
++                  "type": "object"
++                }
++              }
++            },
++            "description": "Successful Response"
++          },
++          "422": {
++            "content": {
++              "application/json": {
++                "schema": {
++                  "$ref": "#/components/schemas/HTTPValidationError"
++                }
++              }
++            },
++            "description": "Validation Error"
++          }
++        },
++        "summary": "Context Usage",
++        "tags": [
++          "sessions"
++        ]
++      }
++    },
+     "/v1/sessions/{session_id}/fast-mode": {
+       "get": {
+         "description": "Read the session's fast mode from its Claude Code terminal.",
+diff --git a/tests/runner/test_ae_context_usage.py b/tests/runner/test_ae_context_usage.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b98e74cffa300b469e5d685b463e19699307eaab
+--- /dev/null
++++ b/tests/runner/test_ae_context_usage.py
+@@ -0,0 +1,146 @@
++"""Context reconstruction preserves deferred semantics and isolates subprocesses."""
++
++import asyncio
++import json
++import sys
++from unittest.mock import AsyncMock
++
++import pytest
++
++from omnigent.runner import ae_context_usage as usage
++
++
++def test_normalize_excludes_config_and_keeps_deferred():
++    result = usage.normalize(
++        {
++            "categories": [
++                {"name": "Messages", "tokens": 123, "kind": "used"},
++                {"name": "MCP tools", "tokens": 99, "kind": "deferred"},
++            ],
++            "maxTokens": 200000,
++            "totalTokens": 123,
++            "autoCompactThreshold": 167000,
++            "isAutoCompactEnabled": True,
++            "mcpTools": [{"name": "test", "tokens": 99, "config": "secret"}],
++            "memoryFiles": [{"path": "CLAUDE.md", "tokens": 10}],
++            "agents": [{"agentType": "reviewer", "tokens": 20}],
++            "skills": {"skillFrontmatter": [{"name": "review", "tokens": 30}]},
++        },
++        complete=False,
++    )
++    assert result["totalTokens"] == 123
++    assert result["categories"][1]["kind"] == "deferred"
++    assert result["autoCompactThreshold"] == 167000
++    assert result["details"]["Custom agents"] == [{"name": "reviewer", "tokens": 20}]
++    assert "secret" not in json.dumps(result)
++    assert result["complete"] is False
++
++
++@pytest.mark.asyncio
++async def test_protocol_waits_for_mcp_and_uses_summary(tmp_path):
++    script = tmp_path / "cli.py"
++    script.write_text("""import json,sys
++for line in sys.stdin:
++ r=json.loads(line); kind=r['request']['subtype']
++ if kind=='mcp_status': body={'mcpServers':[{'status':'connected'}]}
++ elif kind=='get_context_usage':
++  assert r['request']['detail']=='summary'
++  body={'categories':[{'name':'Messages','tokens':50,'kind':'used'}],
++        'maxTokens':200000,'totalTokens':50}
++ else: body={}
++ print(json.dumps({'type':'control_response','response':{'subtype':'success','request_id':r['request_id'],'response':body}}),flush=True)
++""")
++    result = await usage.probe([sys.executable, str(script)], {}, str(tmp_path))
++    assert result["totalTokens"] == 50
++    assert result["complete"] is True
++
++
++@pytest.mark.asyncio
++async def test_unsupported_harness_never_probes(monkeypatch):
++    probe = AsyncMock()
++    monkeypatch.setattr(usage, "probe", probe)
++    response = await usage.handle_context_usage("session", harness="codex", server_client=None)
++    assert json.loads(response.body)["available"] is False
++    probe.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_concurrent_reads_share_cached_probe(monkeypatch):
++    import omnigent.runner.native as native
++
++    monkeypatch.setattr(
++        native, "_claude_native_bridge_id_for_session", AsyncMock(return_value="bridge")
++    )
++    monkeypatch.setattr(usage, "launch_config", lambda _: (["claude"], {}, "/tmp", "claude-id"))
++    probe = AsyncMock(return_value={"available": True})
++    monkeypatch.setattr(usage, "probe", probe)
++    usage._cache.clear()
++    await asyncio.gather(
++        *(
++            usage.handle_context_usage("session", harness="claude-native", server_client=None)
++            for _ in range(3)
++        )
++    )
++    assert probe.await_count == 1
++
++
++def test_launch_isolated_and_uses_current_model(tmp_path):
++    bridge = tmp_path / "bridge"
++    bridge.mkdir()
++    settings = bridge / "claude-settings.json"
++    settings.write_text(
++        json.dumps({"hooks": {"SessionStart": []}, "statusLine": {"command": "live-writer"}})
++    )
++    (bridge / "context_raw.json").write_text(
++        json.dumps({"session_id": "live-session", "model": {"id": "current-model"}})
++    )
++    process_root = tmp_path / "proc"
++    proc = process_root / "123"
++    proc.mkdir(parents=True)
++    (proc / "cmdline").write_bytes(
++        "\0".join(
++            [
++                "claude",
++                "--settings",
++                str(settings),
++                "--model",
++                "old-model",
++                "--mcp-config",
++                "config",
++                "--append-system-prompt",
++                "prompt",
++            ]
++        ).encode()
++    )
++    (proc / "environ").write_bytes(b"CLAUDECODE=1\0SAFE=value\0")
++    (proc / "cwd").symlink_to(tmp_path)
++    command, env, cwd, sid = usage.launch_config(bridge, process_root)
++    assert command[command.index("--model") + 1] == "current-model"
++    assert command[command.index("--resume") + 1] == sid == "live-session"
++    assert "--fork-session" in command and "--no-session-persistence" in command
++    assert env == {"SAFE": "value"}
++    assert cwd == str(tmp_path)
++    copied = json.loads(command[command.index("--settings") + 1])
++    assert copied["disableAllHooks"] is True and "hooks" not in copied
++    assert copied["statusLine"]["command"] == "true"
++    assert json.loads(settings.read_text())["statusLine"]["command"] == "live-writer"
++    (proc / "cmdline").write_bytes(b"claude\0--settings\0/another/session\0")
++    with pytest.raises(ValueError, match="No live Claude"):
++        usage.launch_config(bridge, process_root)
++
++
++@pytest.mark.asyncio
++async def test_cancelled_probe_reaps_process(tmp_path):
++    import os
++
++    script = tmp_path / "blocked.py"
++    pid_file = tmp_path / "pid"
++    script.write_text(
++        "import os,time,pathlib\n"
++        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()))\n"
++        "time.sleep(60)\n"
++    )
++    with pytest.raises(TimeoutError):
++        await asyncio.wait_for(usage.probe([sys.executable, str(script)], {}, str(tmp_path)), 1)
++    with pytest.raises(ProcessLookupError):
++        os.kill(int(pid_file.read_text()), 0)
+diff --git a/tests/server/routes/test_ae_context_usage_routes.py b/tests/server/routes/test_ae_context_usage_routes.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6b82bd3fc61dd31412b4b055987236f588c4e75f
+--- /dev/null
++++ b/tests/server/routes/test_ae_context_usage_routes.py
+@@ -0,0 +1,30 @@
++"""The context probe is only dispatched after session authorization."""
++
++import json
++from unittest.mock import AsyncMock
++
++import pytest
++from fastapi.testclient import TestClient
++
++from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
++from omnigent.server.routes.sessions import routes_ae_context_usage as routes
++from tests.server.routes.test_ae_fast_mode_routes import OWNER, VIEWER, _app, _seed_session
++
++
++@pytest.mark.parametrize(
++    "user,expected", [(OWNER, 200), (VIEWER, 200), ("stranger@example.com", 404)]
++)
++def test_access(db_uri, monkeypatch, user, expected):
++    session = _seed_session(db_uri)
++    forward = AsyncMock(
++        return_value=_RunnerForwardResult(
++            status_code=200, body=json.dumps({"available": True}).encode()
++        )
++    )
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    with TestClient(_app(db_uri)) as client:
++        response = client.get(
++            f"/v1/sessions/{session}/context-usage", headers={"X-Forwarded-Email": user}
++        )
++    assert response.status_code == expected
++    assert forward.await_count == (1 if expected == 200 else 0)
+diff --git a/web/src/components/AeContextCategories.test.tsx b/web/src/components/AeContextCategories.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..9057935bde047f7fbafe25167527f83d39861c5b
+--- /dev/null
++++ b/web/src/components/AeContextCategories.test.tsx
+@@ -0,0 +1,49 @@
++import { render, screen } from "@testing-library/react";
++import { describe, expect, it } from "vitest";
++import { AeCategoryBar, AeContextCategories } from "./AeContextCategories";
++import { contextCountdown, type ContextUsage } from "./aeContextUsage";
++
++const data: ContextUsage = {
++  available: true,
++  totalTokens: 100000,
++  maxTokens: 200000,
++  autoCompactThreshold: 167000,
++  isAutoCompactEnabled: true,
++  observedAt: "2026-10-15T20:00:00Z",
++  complete: false,
++  categories: [
++    { name: "Messages", tokens: 100000, kind: "used" },
++    { name: "MCP tools (deferred)", tokens: 50000, kind: "deferred" },
++    { name: "Free space", tokens: 67000, kind: "free" },
++    { name: "Autocompact buffer", tokens: 33000, kind: "buffer" },
++  ],
++  details: { "Memory files": [{ name: "/some/long/path/CLAUDE.md", tokens: 100 }] },
++};
++
++describe("context categories", () => {
++  it("shows deferred tools without adding them to the used bar", () => {
++    render(
++      <>
++        <AeCategoryBar data={data} />
++        <AeContextCategories data={data} />
++      </>,
++    );
++    expect(screen.getByText("MCP tools (deferred)")).toBeInTheDocument();
++    expect(screen.getByText(/excluded from used space/)).toBeInTheDocument();
++    expect(screen.getByRole("img").children).toHaveLength(2);
++    expect(screen.getByRole("img").children[0]).toHaveStyle({ width: "50%" });
++    expect(screen.getByText(/Some MCP servers/)).toBeInTheDocument();
++    expect(screen.getByText("/some/long/path/CLAUDE.md")).toBeInTheDocument();
++  });
++  it("uses the returned threshold on smaller windows and honors disabled compaction", () => {
++    expect(contextCountdown(data, 100000)).toBe("About 67k until auto-compact");
++    expect(contextCountdown({ ...data, isAutoCompactEnabled: false }, 100000)).toBe(
++      "Auto-compact is off",
++    );
++  });
++  it("shows an unavailable reading without inventing categories", () => {
++    render(<AeContextCategories data={{ ...data, available: false, reason: "Runner offline" }} />);
++    expect(screen.getByRole("status")).toHaveTextContent("Runner offline");
++    expect(screen.queryByText("Messages")).not.toBeInTheDocument();
++  });
++});
+diff --git a/web/src/components/AeContextCategories.tsx b/web/src/components/AeContextCategories.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..34a963bec4f31cd355c59b5fef3b4728f4e1d50e
+--- /dev/null
++++ b/web/src/components/AeContextCategories.tsx
+@@ -0,0 +1,108 @@
++import { categoryColor, type ContextUsage } from "./aeContextUsage";
++
++const tokens = (value: number) =>
++  new Intl.NumberFormat("en", { maximumFractionDigits: 1, notation: "compact" }).format(value);
++
++export function AeCategoryBar({ data }: { data: ContextUsage }) {
++  return (
++    <div
++      className="flex h-2 w-full overflow-hidden rounded-full bg-muted"
++      role="img"
++      aria-label="Estimated context by category"
++    >
++      {data.categories
++        .filter((c) => c.kind === "used" || c.kind === "buffer")
++        .map((c) => (
++          <span
++            key={c.name}
++            title={`${c.name}: ${tokens(c.tokens)}`}
++            className={
++              c.kind === "buffer" ? "ml-auto bg-muted-foreground/20" : categoryColor(c.name)
++            }
++            style={{ width: `${Math.min(100, (c.tokens / data.maxTokens) * 100)}%` }}
++          />
++        ))}
++    </div>
++  );
++}
++
++export function AeContextCategories({ data, error }: { data?: ContextUsage; error?: string }) {
++  if (error)
++    return (
++      <p role="status" className="text-sm text-muted-foreground">
++        {error}
++      </p>
++    );
++  if (!data)
++    return (
++      <p role="status" className="text-sm text-muted-foreground">
++        Reading context categories…
++      </p>
++    );
++  if (!data.available)
++    return (
++      <p role="status" className="text-sm text-muted-foreground">
++        {data.reason}
++      </p>
++    );
++  return (
++    <section className="min-w-0 space-y-2" aria-label="Context categories">
++      <h4 className="text-sm font-medium">Context breakdown</h4>
++      <p className="text-xs text-muted-foreground">
++        Estimated snapshot · {tokens(data.totalTokens)} / {tokens(data.maxTokens)} ·{" "}
++        {new Date(data.observedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}
++      </p>
++      {!data.complete && (
++        <p className="text-xs text-muted-foreground">
++          Some MCP servers are unavailable or still connecting. Their tools may be missing.
++        </p>
++      )}
++      <dl className="space-y-1 text-sm">
++        {data.categories.map((c) => (
++          <div key={c.name} className="flex items-baseline justify-between gap-3">
++            <dt className="min-w-0 break-words">
++              <span
++                aria-hidden="true"
++                className={`mr-2 inline-block size-2 rounded-full ${c.kind === "used" ? categoryColor(c.name) : "bg-muted-foreground/40"}`}
++              />
++              {c.name}
++            </dt>
++            <dd className="shrink-0 tabular-nums">{tokens(c.tokens)}</dd>
++          </div>
++        ))}
++      </dl>
++      {data.categories.some((c) => c.kind === "deferred") && (
++        <p className="text-xs text-muted-foreground">
++          Deferred tools are available on demand and excluded from used space.
++        </p>
++      )}
++      {Object.entries(data.details)
++        .filter(([, rows]) => rows.length > 0)
++        .map(([name, rows]) => (
++          <details key={name} className="text-sm">
++            <summary className="flex min-h-8 cursor-pointer items-center pointer-coarse:min-h-10">
++              <svg
++                aria-hidden="true"
++                viewBox="0 0 24 24"
++                fill="none"
++                stroke="currentColor"
++                strokeWidth="2"
++                className="mr-1 size-4"
++              >
++                <path d="m9 6 6 6-6 6" />
++              </svg>
++              {name} ({rows.length})
++            </summary>
++            <dl className="max-h-48 space-y-1 overflow-y-auto pl-3">
++              {rows.map((row) => (
++                <div key={row.name} className="flex items-baseline justify-between gap-3">
++                  <dt className="min-w-0 break-all text-muted-foreground">{row.name}</dt>
++                  <dd className="shrink-0 tabular-nums">{tokens(row.tokens)}</dd>
++                </div>
++              ))}
++            </dl>
++          </details>
++        ))}
++    </section>
++  );
++}
+diff --git a/web/src/components/AePlanLimits.test.tsx b/web/src/components/AePlanLimits.test.tsx
+index a500ba21f4f084c6469f7dcee955952d3ec592f4..ba6be0a2e77f17118bc2133335182e2e060bada0 100644
+--- a/web/src/components/AePlanLimits.test.tsx
++++ b/web/src/components/AePlanLimits.test.tsx
+@@ -246,7 +246,7 @@ describe("AePlanLimitsPanel", () => {
+     expect(screen.queryByTestId("ae-limits-hint")).toBeNull();
+   });
+ 
+-  it("draws no breakdown toggle when nothing waits behind it", () => {
++  it("offers native context categories even without another plan or collaborator", () => {
+     render(
+       <AePlanLimitsPanel
+         data={{ now: iso(NOW), harnesses: { claude: FULL.harnesses.claude } }}
+@@ -255,7 +255,7 @@ describe("AePlanLimitsPanel", () => {
+         harness="claude-native"
+       />,
+     );
+-    expect(screen.queryByTestId("ae-limits-details-toggle")).toBeNull();
++    expect(screen.getByTestId("ae-limits-details-toggle")).toBeTruthy();
+     expect(screen.queryByTestId("ae-limits-in-use")).toBeNull();
+   });
+ 
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index 1d33de080af4e13b85b139705b69c682f478aae6..a9b79eb9f45f55ac3f857873bbd2185b87247230 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -34,6 +34,9 @@ import {
+   useAeSessionContexts,
+ } from "./aeSessionContext";
+ 
++import { AeCategoryBar, AeContextCategories } from "./AeContextCategories";
++import { contextCountdown, useContextUsage, type ContextUsage } from "./aeContextUsage";
++
+ export const AE_LIMITS_PATH = "/v1/ae/limits";
+ 
+ export type AeHarness = "claude" | "codex";
+@@ -571,14 +574,24 @@ function ContextEntryRow({
+   entry,
+   now,
+   lead = false,
++  categories,
+ }: {
++  categories?: ContextUsage;
+   entry: AeContextEntry;
+   now: number;
+   lead?: boolean;
+ }) {
+   const who = [entry.agent, aeModelName(entry.model)].filter(Boolean).join(" · ") || null;
+   const ariaLabel = `${entry.name} context${entry.agent ? ` (${entry.agent})` : ""}`;
+-  const { reading } = entry;
++  const reading: AeContextReading | null = categories
++    ? {
++        source: "snapshot",
++        used: categories.totalTokens,
++        size: categories.maxTokens,
++        observedAt: categories.observedAt,
++        stale: now - Date.parse(categories.observedAt) > 180_000,
++      }
++    : entry.reading;
+   const value = reading ? (
+     <ContextValue reading={reading} />
+   ) : (
+@@ -619,8 +632,14 @@ function ContextEntryRow({
+     );
+   }
+   const pct = (reading.used / reading.size) * 100;
+-  const detail = readingDetail(reading, now);
+-  const autoCompact = lead ? autoCompactText(entry, reading) : null;
++  const detail = categories
++    ? `Estimated category snapshot · ${formatAgo(categories.observedAt, now)}`
++    : readingDetail(reading, now);
++  const autoCompact = lead
++    ? categories
++      ? contextCountdown(categories, reading.used)
++      : autoCompactText(entry, reading)
++    : null;
+   return (
+     <li
+       className="flex flex-col gap-1.5"
+@@ -628,13 +647,17 @@ function ContextEntryRow({
+       data-window={`context:${entry.key}`}
+     >
+       {head}
+-      <Meter
+-        label={`${ariaLabel}: ${Math.round(pct)}% used`}
+-        pct={pct}
+-        segments={contextSegments(pct, reading.stale, entry.breakdown)}
+-        thick
+-      />
+-      {entry.breakdown && (
++      {categories ? (
++        <AeCategoryBar data={categories} />
++      ) : (
++        <Meter
++          label={`${ariaLabel}: ${Math.round(pct)}% used`}
++          pct={pct}
++          segments={contextSegments(pct, reading.stale, entry.breakdown)}
++          thick
++        />
++      )}
++      {entry.breakdown && !categories && (
+         <ContextLegend
+           context={entry.breakdown}
+           now={now}
+@@ -645,7 +668,11 @@ function ContextEntryRow({
+         <p
+           className="text-sm text-muted-foreground tabular-nums"
+           data-testid="ae-context-autocompact"
+-          title="Claude Code compacts a 1M context window at about 967k tokens by default"
++          title={
++            categories
++              ? "From Claude Code’s context snapshot"
++              : "Claude Code compacts a 1M context window at about 967k tokens by default"
++          }
+         >
+           {autoCompact}
+         </p>
+@@ -807,6 +834,13 @@ export function AePlanLimitsPanel({
+     statusLines,
+     now,
+   );
++  const native = active.harness === "claude-native" || active.harness === "native-claude";
++  const context = useContextUsage(
++    conversationId ?? null,
++    detailsOpen && native,
++    `${active.harness}:${active.model}`,
++  );
++  const categories = context.data?.available ? context.data : undefined;
+   const collaborators = sessions.collaborators.map((c) =>
+     buildCollaboratorContext(c, statusLines, now),
+   );
+@@ -824,7 +858,7 @@ export function AePlanLimitsPanel({
+     <div className="flex flex-col gap-3" data-testid="ae-plan-limits">
+       <section className="flex flex-col gap-2" data-testid="ae-limits-context">
+         <ul data-testid="ae-context-active">
+-          <ContextEntryRow entry={active} now={now} lead />
++          <ContextEntryRow entry={active} now={now} lead categories={categories} />
+         </ul>
+       </section>
+       <div className="flex flex-col gap-2.5 border-t pt-3" data-testid="ae-limits-plans">
+@@ -862,14 +896,14 @@ export function AePlanLimitsPanel({
+           />
+         )}
+       </div>
+-      {(hasCollaborators || others.length > 0) && (
++      {(native || hasCollaborators || others.length > 0) && (
+         <div className="flex flex-col gap-3 border-t pt-3">
+           <button
+             type="button"
+             aria-expanded={detailsOpen}
+             aria-controls={detailsId}
+             data-testid="ae-limits-details-toggle"
+-            className="cursor-pointer self-start rounded-md border border-border px-2.5 py-1 text-sm outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 pointer-coarse:py-2"
++            className="min-h-8 pointer-coarse:min-h-10 cursor-pointer self-start rounded-md border border-border px-2.5 py-1 text-sm outline-none hover:bg-muted focus-visible:ring-2 focus-visible:ring-ring/50 pointer-coarse:py-2"
+             onClick={() => setDetailsOpen((open) => !open)}
+           >
+             {detailsOpen ? "Hide detailed breakdown" : "See detailed breakdown"}
+@@ -880,6 +914,7 @@ export function AePlanLimitsPanel({
+             className="flex flex-col gap-4"
+             data-testid="ae-limits-details"
+           >
++            {native && <AeContextCategories data={context.data} error={context.error} />}
+             {hasCollaborators && (
+               <div className="flex flex-col gap-2" data-testid="ae-context-collaborators">
+                 <h4 className="text-sm text-muted-foreground">Collaborators</h4>
+diff --git a/web/src/components/aeContextUsage.test.tsx b/web/src/components/aeContextUsage.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1981f66065d02ca8ea442699b54496c366b97c04
+--- /dev/null
++++ b/web/src/components/aeContextUsage.test.tsx
+@@ -0,0 +1,42 @@
++import { act, renderHook, waitFor } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { authenticatedFetch } from "@/lib/identity";
++import { useContextUsage } from "./aeContextUsage";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
++describe("on-demand context", () => {
++  it("fetches only when expanded and discards replies from another session", async () => {
++    let resolve!: (value: Response) => void;
++    vi.mocked(authenticatedFetch).mockReturnValueOnce(
++      new Promise((r) => {
++        resolve = r;
++      }),
++    );
++    const { result, rerender } = renderHook(
++      ({ session, open }) => useContextUsage(session, open, "claude"),
++      { initialProps: { session: "first", open: false } },
++    );
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++    rerender({ session: "first", open: true });
++    expect(authenticatedFetch).toHaveBeenCalledWith("/v1/sessions/first/context-usage");
++    rerender({ session: "second", open: false });
++    await act(async () => {
++      resolve(new Response(JSON.stringify({ available: true })));
++    });
++    expect(result.current.data).toBeUndefined();
++  });
++  it("reports errors and retries when reopened", async () => {
++    vi.mocked(authenticatedFetch)
++      .mockResolvedValueOnce(new Response(null, { status: 503 }))
++      .mockResolvedValueOnce(new Response(JSON.stringify({ available: false, reason: "Offline" })));
++    const { result, rerender } = renderHook(
++      ({ open }) => useContextUsage("session", open, "claude"),
++      { initialProps: { open: true } },
++    );
++    await waitFor(() => expect(result.current.error).toMatch(/Could not load/));
++    rerender({ open: false });
++    rerender({ open: true });
++    await waitFor(() => expect(result.current.data?.reason).toBe("Offline"));
++  });
++});
+diff --git a/web/src/components/aeContextUsage.ts b/web/src/components/aeContextUsage.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6cc4946de8c35b430abac1e48203918e84532192
+--- /dev/null
++++ b/web/src/components/aeContextUsage.ts
+@@ -0,0 +1,80 @@
++import { useEffect, useState } from "react";
++import { authenticatedFetch } from "@/lib/identity";
++
++export interface ContextCategory {
++  name: string;
++  tokens: number;
++  kind: "used" | "free" | "buffer" | "deferred";
++}
++export interface ContextUsage {
++  available: boolean;
++  reason?: string;
++  categories: ContextCategory[];
++  totalTokens: number;
++  maxTokens: number;
++  autoCompactThreshold: number | null;
++  isAutoCompactEnabled: boolean;
++  observedAt: string;
++  complete: boolean;
++  details: Record<string, { name: string; tokens: number }[]>;
++}
++
++export function useContextUsage(session: string | null, enabled: boolean, identity: string) {
++  const [state, setState] = useState<{ key: string; data?: ContextUsage; error?: string }>({
++    key: "",
++  });
++  const key = `${session}:${identity}`;
++  useEffect(() => {
++    if (!enabled || !session) return;
++    let cancelled = false;
++    setState({ key });
++    authenticatedFetch(`/v1/sessions/${encodeURIComponent(session)}/context-usage`)
++      .then(async (response) => {
++        if (!response.ok)
++          throw new Error("Could not load context. Close and reopen the breakdown to retry.");
++        return (await response.json()) as ContextUsage;
++      })
++      .then((data) => {
++        if (!cancelled) setState({ key, data });
++      })
++      .catch((error: unknown) => {
++        if (!cancelled)
++          setState({ key, error: error instanceof Error ? error.message : "Context unavailable" });
++      });
++    return () => {
++      cancelled = true;
++    };
++  }, [enabled, session, key]);
++  return state.key === key ? state : { key };
++}
++
++export const categoryColors = [
++  "bg-chart-1",
++  "bg-chart-2",
++  "bg-chart-3",
++  "bg-chart-4",
++  "bg-chart-5",
++  "bg-sky-500",
++  "bg-violet-500",
++  "bg-teal-500",
++];
++export function categoryColor(name: string) {
++  const names = [
++    "System prompt",
++    "System tools",
++    "MCP server instructions",
++    "MCP tools",
++    "Custom agents",
++    "Memory files",
++    "Skills",
++    "Messages",
++  ];
++  return categoryColors[Math.max(0, names.indexOf(name)) % categoryColors.length];
++}
++
++export function contextCountdown(data: ContextUsage, used: number): string | null {
++  if (!data.isAutoCompactEnabled) return "Auto-compact is off";
++  if (data.autoCompactThreshold == null) return null;
++  const left = data.autoCompactThreshold - used;
++  return left <= 0 ? "Auto-compact is due" : `About ${Math.round(left / 1000)}k until auto-compact`;
++}

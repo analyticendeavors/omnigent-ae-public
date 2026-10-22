@@ -1,0 +1,396 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:30:59 -0700
+Subject: [PATCH 089/148] [ae-patch] Fix the review findings on the sidebar
+ rows' waiting state: clear stale dialogs, read own status once, trust the
+ open chat
+
+blocked_on is now served only while the session's cached status is running or waiting, and the relinquish, failed-to-idle reset and runner status probe paths clear it, so a row never reads parked on a dialog that is gone. The list builder reads the session's own status and its starting flag once and derives both status and turn_active from them. The open row prefers the chat store's turn and dialog over the list row's, which lag by a websocket tick; unbound rows use the row's fields.
+---
+ .../routes/_sessions/ae_session_activity.py   | 19 +++++---
+ omnigent/server/routes/_sessions/helpers.py   |  7 ++-
+ .../server/routes/_sessions/orchestration.py  | 23 +++++++---
+ .../server/routes/test_ae_session_activity.py | 44 +++++++++++++++++++
+ web/src/hooks/aeSessionActivityHooks.test.ts  | 24 +++++++++-
+ web/src/hooks/aeSessionActivityHooks.ts       | 38 +++++++++-------
+ 6 files changed, 127 insertions(+), 28 deletions(-)
+
+diff --git a/omnigent/server/routes/_sessions/ae_session_activity.py b/omnigent/server/routes/_sessions/ae_session_activity.py
+index 73cb609214682e1e528b6fea0c2f97ca8f6c9caf..e733b2689fe94a9f6856441af283d971a2f33eaf 100644
+--- a/omnigent/server/routes/_sessions/ae_session_activity.py
++++ b/omnigent/server/routes/_sessions/ae_session_activity.py
+@@ -17,13 +17,14 @@ this replica's relay caches.
+ 
+ from __future__ import annotations
+ 
++from typing import Literal
++
+ from omnigent.runtime import pending_elicitations
+ from omnigent.server.routes._sessions.common import (
+     _session_background_task_count_cache,
+     _session_blocked_on_cache,
+     _session_status_cache,
+ )
+-from omnigent.server.routes._sessions.helpers import _session_status_from_cache
+ 
+ # Relay statuses that mean a child is still doing work; ``waiting`` covers a
+ # child parked on an approval. A child still booting has no relay status yet,
+@@ -67,7 +68,9 @@ def session_active_child_count(child_session_ids: list[str]) -> int:
+     return busy
+ 
+ 
+-def session_turn_active(session_id: str, db_status: str | None, *, starting: bool) -> bool:
++def session_turn_active(
++    own_status: Literal["idle", "running", "failed"], *, starting: bool
++) -> bool:
+     """
+     Return whether a session's own turn is running, ignoring its children.
+ 
+@@ -75,20 +78,26 @@ def session_turn_active(session_id: str, db_status: str | None, *, starting: boo
+     row whose own turn ended but whose agents still work needs this to read
+     as waiting on them.
+ 
+-    :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+-    :param db_status: The row's persisted ``live_status``, used on a cache miss.
++    :param own_status: The session's own list status, without the child
++        roll-up, e.g. ``"idle"``.
+     :param starting: Whether a message is still waiting on the session's runner.
+     :returns: ``True`` while the session's own turn runs or is starting.
+     """
+-    return starting or _session_status_from_cache(session_id, db_status) == "running"
++    return starting or own_status == "running"
+ 
+ 
+ def session_blocked_on(session_id: str) -> str | None:
+     """
+     Return the dialog a running session is parked on, if any.
+ 
++    Served only while the session's cached status is still running or
++    waiting, so a status change that bypassed the publish path cannot leave
++    a row parked on a dialog that is gone.
++
+     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
+     :returns: The reason from the session's latest status edge, e.g.
+         ``"input needed"``, or ``None`` when it is not parked.
+     """
++    if _session_status_cache.get(session_id) not in ("running", "waiting"):
++        return None
+     return _session_blocked_on_cache.get(session_id)
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 376eefd68bd33deafc60fe6731680bbae3f7882c..b5461f3c69c87d91d1773fc7ad30d756fb939e94 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -1350,6 +1350,8 @@ def _session_status_with_child_rollup(
+     conversation_id: str,
+     child_session_ids: list[str],
+     db_status: str | None = None,
++    *,
++    own_status: Literal["idle", "running", "failed"] | None = None,
+ ) -> Literal["idle", "running", "failed"]:
+     """
+     Map a session's cached status plus direct child activity to list status.
+@@ -1367,10 +1369,13 @@ def _session_status_with_child_rollup(
+         local cache has no entry (this replica doesn't hold the runner
+         tunnel). The child rollup below stays cache-only — a wrong-pod
+         miss there just skips the parent's roll-up spinner, best-effort.
++    :param own_status: The session's own status when the caller already
++        read it, so both reads agree; ``None`` reads it here.
+     :returns: One of ``"idle"``, ``"running"``, ``"failed"`` for the
+         session-list row.
+     """
+-    own_status = _session_status_from_cache(conversation_id, db_status)
++    if own_status is None:
++        own_status = _session_status_from_cache(conversation_id, db_status)
+     if own_status == "running":
+         return "running"
+     # Background shells outliving a turn do NOT make the row running: the
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 5d67eb393ac7b0023c1304000142e1f9dc76ed80..385a76e1a2d6adc64feb8f119beed3e76cd07567 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -232,6 +232,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
+     _session_active_response_cache,
+     _session_background_task_count_cache,
+     _session_background_tasks_cache,
++    _session_blocked_on_cache,
+     _session_mcp_startup_cache,
+     _session_sandbox_status_cache,
+     _session_status_cache,
+@@ -1188,13 +1189,17 @@ def _build_session_list_item(
+     # dots straight from the list (no separate fetch). Built per-user here —
+     # `user_id` is the requesting caller, never broadcast to other viewers.
+     viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
++    # Read once so ``status`` and ``turn_active`` come from the same values.
++    own_status = _session_status_from_cache(conv.id, conv.live_status)
++    starting = _session_is_starting(conv.id)
+     return SessionListItem(
+         id=conv.id,
+         agent_id=conv.agent_id,
+         agent_name=agent_names_by_id.get(conv.agent_id),
+         status=_list_status_with_starting(
+-            _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
++            _session_status_with_child_rollup(conv.id, child_session_ids, own_status=own_status),
+             conv.id,
++            starting=starting,
+         ),
+         created_at=conv.created_at,
+         updated_at=conv.updated_at,
+@@ -1239,9 +1244,7 @@ def _build_session_list_item(
+         project_id=conv.project_id,
+         background_task_count=session_background_task_count(conv.id),
+         active_child_count=session_active_child_count(child_session_ids),
+-        turn_active=session_turn_active(
+-            conv.id, conv.live_status, starting=_session_is_starting(conv.id)
+-        ),
++        turn_active=session_turn_active(own_status, starting=starting),
+         blocked_on=session_blocked_on(conv.id),
+     )
+ 
+@@ -3745,6 +3748,7 @@ async def _publish_runner_recovered_status_impl(
+         if last_error is None or last_error.get("code") != "runner_disconnected":
+             return
+     _session_status_cache[session_id] = "idle"
++    _session_blocked_on_cache.pop(session_id, None)
+     session_live_state.persist_live_status(session_id, "idle")
+     event = SessionStatusEvent(
+         type="session.status",
+@@ -7136,15 +7140,21 @@ def _session_is_starting(conversation_id: str) -> bool:
+ def _list_status_with_starting(
+     status: Literal["idle", "running", "failed"],
+     conversation_id: str,
++    *,
++    starting: bool | None = None,
+ ) -> Literal["idle", "running", "failed"]:
+     """
+     Promote an idle session with a message still waiting on its runner to running.
+ 
+     :param status: Rolled-up list status for the session.
+     :param conversation_id: Session/conversation identifier.
++    :param starting: :func:`_session_is_starting` when the caller already
++        read it; ``None`` reads it here.
+     :returns: ``"running"`` for a booting session, else *status* unchanged.
+     """
+-    if status == "idle" and _session_is_starting(conversation_id):
++    if starting is None:
++        starting = _session_is_starting(conversation_id)
++    if status == "idle" and starting:
+         return "running"
+     return status
+ 
+@@ -7711,6 +7721,7 @@ def _relinquish_session_live_state(session_id: str) -> None:
+     """Drop local live state for a session now owned by another replica."""
+     _session_status_cache.pop(session_id, None)
+     _session_active_response_cache.pop(session_id, None)
++    _session_blocked_on_cache.pop(session_id, None)
+     session_live_state.forget_live_status(session_id)
+ 
+ 
+@@ -12397,6 +12408,8 @@ async def _run_runner_status_probe(
+                 if isinstance(payload, dict):
+                     raw = str(payload.get("status", "idle"))
+                     _session_status_cache[session_id] = raw
++                    # The probe names no dialog, so a remembered one may be gone.
++                    _session_blocked_on_cache.pop(session_id, None)
+                     if raw in ("idle", "running", "waiting", "failed"):
+                         session_live_state.persist_live_status(session_id, raw)
+                     _runner_status_probe_backoff.pop(session_id, None)
+diff --git a/tests/server/routes/test_ae_session_activity.py b/tests/server/routes/test_ae_session_activity.py
+index 0db16a05a11c0811fc3afe46a5026131d16e50c6..8218d9b328b7878d21791b90ffc445dbc8ce69a9 100644
+--- a/tests/server/routes/test_ae_session_activity.py
++++ b/tests/server/routes/test_ae_session_activity.py
+@@ -10,9 +10,11 @@ which the rolled-up ``status`` hides.
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import json
+ from collections.abc import Iterator
+ 
++import httpx
+ import pytest
+ from fastapi import FastAPI
+ from fastapi.testclient import TestClient
+@@ -20,9 +22,11 @@ from fastapi.testclient import TestClient
+ import omnigent.server.routes.sessions as sessions_routes
+ from omnigent.runtime import pending_elicitations
+ from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
++from omnigent.server.routes._sessions import orchestration
+ from omnigent.server.routes._sessions.ae_session_activity import (
+     session_active_child_count,
+     session_background_task_count,
++    session_blocked_on,
+ )
+ from omnigent.server.routes._sessions.common import _session_blocked_on_cache
+ from omnigent.server.routes.sessions import create_sessions_router
+@@ -255,6 +259,46 @@ def test_list_row_carries_dialog_a_running_session_is_parked_on(
+     assert _list_rows(app)[parent_id].get("blocked_on") is None
+ 
+ 
++def test_runner_status_probe_drops_a_remembered_dialog(
++    app: FastAPI, stores: Stores, touched
++) -> None:
++    """A probe resets the status without naming a dialog, so the old one goes."""
++    parent_id = _seed_parent(stores, touched, "probed")
++    sessions_routes._publish_status(parent_id, "running", blocked_on="input needed")
++    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json={"status": "running"}))
++
++    async def probe() -> str | None:
++        async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
++            return await orchestration._run_runner_status_probe(client, parent_id, None)
++
++    assert asyncio.run(probe()) == "running"
++    row = _list_rows(app)[parent_id]
++    assert row.get("blocked_on") is None
++    assert row["turn_active"] is True
++
++
++def test_relinquished_session_reads_not_parked(app: FastAPI, stores: Stores, touched) -> None:
++    """A session handed to another replica drops its dialog with its status."""
++    parent_id = _seed_parent(stores, touched, "moved")
++    sessions_routes._publish_status(parent_id, "running", blocked_on="input needed")
++
++    orchestration._relinquish_session_live_state(parent_id)
++
++    assert _session_blocked_on_cache.get(parent_id) is None
++    assert _list_rows(app)[parent_id].get("blocked_on") is None
++
++
++def test_dialog_is_served_only_while_the_session_still_runs(stores: Stores, touched) -> None:
++    """A status written outside the publish path hides a remembered dialog."""
++    parent_id = _seed_parent(stores, touched, "reset")
++    sessions_routes._publish_status(parent_id, "running", blocked_on="input needed")
++    assert session_blocked_on(parent_id) == "input needed"
++
++    sessions_routes._session_status_cache[parent_id] = "idle"
++
++    assert session_blocked_on(parent_id) is None
++
++
+ def test_failed_child_with_stale_approval_does_not_count(stores: Stores, touched) -> None:
+     """A failed child is done even if an approval entry lingers in the index."""
+     parent_id = _seed_parent(stores, touched, "parent")
+diff --git a/web/src/hooks/aeSessionActivityHooks.test.ts b/web/src/hooks/aeSessionActivityHooks.test.ts
+index 9407ee81d69ba82906a6b013c48cb38bac9be192..36c740e1ce2fc89b94e7f51693bb2b7363d1ce58 100644
+--- a/web/src/hooks/aeSessionActivityHooks.test.ts
++++ b/web/src/hooks/aeSessionActivityHooks.test.ts
+@@ -28,7 +28,8 @@ function row(extra: Partial<Row> = {}): Row {
+   return { id: "conv_a", status: "idle", updated_at: NOW_S, ...extra };
+ }
+ 
+-const base = { now: NOW, nextRun: null, lastEventAt: null, turnIdle: false };
++// A row that is not the open chat: the store has no answer for it.
++const base = { now: NOW, nextRun: null, lastEventAt: null, turnIdle: null };
+ 
+ function checkin(sessionId: string, at = NINE): ScheduledTask {
+   return {
+@@ -116,6 +117,27 @@ describe("aeRowState", () => {
+     expect(aeRowState(unknown, { kind: "running" }, base).state).toEqual({ kind: "running" });
+   });
+ 
++  it("trusts the open chat over the row's lagging own-turn flag", () => {
++    // A new turn just started; the row still carries the last tick's flag.
++    const parent = row({ status: "running", active_child_count: 2, turn_active: false });
++    expect(aeRowState(parent, { kind: "running" }, { ...base, turnIdle: false }).state).toEqual({
++      kind: "running",
++    });
++  });
++
++  it("trusts the open chat's dialog over the row's, even when it has none", () => {
++    const stale = row({
++      status: "running",
++      updated_at: NOW_S - 20 * 60,
++      blocked_on: "input needed",
++    });
++    const options = { ...base, turnIdle: false, blockedOn: null };
++    expect(aeRowState(stale, { kind: "running" }, options).state).toEqual({
++      kind: "quiet",
++      quietForMs: 20 * 60_000,
++    });
++  });
++
+   it("never turns a row quiet while the server says it is parked on a dialog", () => {
+     const stale = row({
+       status: "running",
+diff --git a/web/src/hooks/aeSessionActivityHooks.ts b/web/src/hooks/aeSessionActivityHooks.ts
+index ec96231fcbb8884e373664cd96a3379e5c8e11f3..b5a91d6f7ffcc4fb1a9a8467ba94e8a2f2405c16 100644
+--- a/web/src/hooks/aeSessionActivityHooks.ts
++++ b/web/src/hooks/aeSessionActivityHooks.ts
+@@ -121,14 +121,15 @@ function rowAgents(row: Pick<Conversation, "active_child_count">): number {
+   return row.active_child_count ?? 0;
+ }
+ 
+-/** Whether the open chat says its own turn is over (children may still run). */
+-function useBoundTurnIdle(conversationId: string): boolean {
+-  return useChatStore(
+-    (s) =>
+-      s.conversationId === conversationId &&
+-      !s.loadingConversation &&
+-      s.status === "idle" &&
+-      !computeIsWorking(s.sessionStatus),
++/**
++ * Whether the open chat says its own turn is over (children may still run),
++ * or `null` when this row is not the loaded chat.
++ */
++function useBoundTurnIdle(conversationId: string): boolean | null {
++  return useChatStore((s) =>
++    s.conversationId === conversationId && !s.loadingConversation
++      ? s.status === "idle" && !computeIsWorking(s.sessionStatus)
++      : null,
+   );
+ }
+ 
+@@ -136,8 +137,11 @@ function useBoundLastEventAt(conversationId: string): number | null {
+   return useChatStore((s) => (s.conversationId === conversationId ? s.lastEventAt : null));
+ }
+ 
+-function useBoundBlockedOn(conversationId: string): string | null {
+-  return useChatStore((s) => (s.conversationId === conversationId ? s.blockedOn : null));
++/** The open chat's dialog (`null` when none), or `undefined` when this row is not the chat. */
++function useBoundBlockedOn(conversationId: string): string | null | undefined {
++  return useChatStore((s) =>
++    s.conversationId === conversationId && !s.loadingConversation ? s.blockedOn : undefined,
++  );
+ }
+ 
+ type RowInput = Pick<
+@@ -158,16 +162,18 @@ export function aeRowState(
+     now: number;
+     nextRun: AeNextRun | null;
+     lastEventAt: number | null;
+-    turnIdle: boolean;
++    /** The open chat's answer; `null` defers to the row's own-turn flag. */
++    turnIdle: boolean | null;
++    /** The open chat's dialog; `undefined` defers to the row's. */
+     blockedOn?: string | null;
+   },
+ ): { state: SessionState | null; scheduled: SessionState | null } {
+   const agents = rowAgents(row);
+   const lastEventAt = Math.max(options.lastEventAt ?? 0, row.updated_at * 1000);
+   if (upstream?.kind === "running") {
+-    // A busy child keeps the parent row running; the open chat or the row's
+-    // own-turn flag says when the parent's turn is over and it only waits.
+-    const turnIdle = options.turnIdle || row.turn_active === false;
++    // A busy child keeps the parent row running; the open chat, else the
++    // row's own-turn flag, says when the parent's turn is over and it waits.
++    const turnIdle = options.turnIdle ?? row.turn_active === false;
+     if (turnIdle && agents > 0) {
+       return { state: { kind: "waiting", agents, sinceEventMs: null }, scheduled: null };
+     }
+@@ -175,7 +181,7 @@ export function aeRowState(
+     if (agents > 0) return { state: upstream, scheduled: null };
+     const activity = deriveAeActivity({
+       working: true,
+-      blockedOn: options.blockedOn ?? row.blocked_on,
++      blockedOn: options.blockedOn === undefined ? row.blocked_on : options.blockedOn,
+       pendingQuestions: 0,
+       lastEventAt,
+       nextRun: null,
+@@ -257,7 +263,7 @@ export function aeProjectMarker(
+           now: options.now,
+           nextRun: null,
+           lastEventAt: null,
+-          turnIdle: false,
++          turnIdle: null,
+         },
+       );
+       if (state?.kind === "waiting") {

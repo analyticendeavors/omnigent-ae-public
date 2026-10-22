@@ -1,0 +1,656 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 15:01:01 -0700
+Subject: [PATCH 148/148] [ae-patch] Cache the gh auth status answer for 60
+ seconds across the host's processes
+
+Every read of a session's GitHub resource ran gh auth status --json hosts, in
+the session's runner or the host service. The merge watcher reads every recent
+session each 120 seconds, so a box with a dozen sessions ran several of these
+per burst, all in the same second (39 of 135 gh processes in ten minutes).
+
+_list_accounts now goes through omnigent/runner/_ae_gh_auth_cache.py: one small
+file per user under the cache dir, keyed by the gh config dir, hosts.yml size and
+mtime, the sandbox flag and a hash of the GH token variables. Only an
+authenticated answer is cached; a failed gh call with an authentication error
+drops the entry, and concurrent misses share one gh run through a file lock.
+OMNIGENT_GH_AUTH_CACHE_SECONDS sets the TTL (0 turns it off); the root test
+conftest turns it off so stubbed gh answers never leak between tests.
+---
+ omnigent/runner/_ae_gh_auth_cache.py  | 264 ++++++++++++++++++++++
+ omnigent/runner/github_resource.py    |   9 +-
+ tests/conftest.py                     |   6 +
+ tests/runner/test_ae_gh_auth_cache.py | 302 ++++++++++++++++++++++++++
+ 4 files changed, 580 insertions(+), 1 deletion(-)
+ create mode 100644 omnigent/runner/_ae_gh_auth_cache.py
+ create mode 100644 tests/runner/test_ae_gh_auth_cache.py
+
+diff --git a/omnigent/runner/_ae_gh_auth_cache.py b/omnigent/runner/_ae_gh_auth_cache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..cc018d6a921d15b874ec0cc4bba59937d3a5d309
+--- /dev/null
++++ b/omnigent/runner/_ae_gh_auth_cache.py
+@@ -0,0 +1,264 @@
++"""A short-lived, host-wide cache of the ``gh auth status --json hosts`` answer.
++
++Every read of a session's GitHub resource (``GET /v1/sessions/{id}/resources/github``)
++reaches :func:`omnigent.runner.github_resource._list_accounts`, in whichever process
++serves it: the session's own runner (one process per session) or the host service
++when the runner is offline. A server-side watcher reads every recent session on an
++interval and browser tabs poll the same route, so the same answer is asked for
++many times a minute, often by several processes in the same second.
++
++The answer depends only on the gh login, not on the session, so it is cached in
++one small file per user that every process of the host shares:
++
++- **TTL.** ``OMNIGENT_GH_AUTH_CACHE_SECONDS`` (default 60; ``0`` turns the cache
++  off). A login that goes bad is reported within the TTL at worst.
++- **Only successes are cached.** A logged-out answer, a timeout, a gh that could
++  not run or unparseable output runs ``gh`` again on the next read.
++- **Key.** The gh config dir, the size and mtime of its ``hosts.yml`` (which
++  ``gh auth login``, ``logout`` and ``switch`` rewrite, so a login change misses at
++  once), whether the process is in a managed sandbox, and a hash of the ``GH_*``
++  token variables gh would read. Tokens are never stored, only that hash.
++- **Invalidation.** :func:`note_gh_result` marks the entry invalidated when a
++  ``gh`` call on the ambient login fails with an authentication error; a fill that
++  started before the mark does not overwrite it.
++- **One call per burst.** Concurrent misses take an advisory file lock, so the
++  first process runs ``gh`` and the rest read its answer. A waiter gives up after
++  a few seconds (or at the caller's deadline) and runs ``gh`` itself, so a stuck
++  holder never stalls a read.
++- **Pruning.** A write removes entries and locks of other keys idle for an hour.
++
++The cached value is ``(authenticated, accounts)`` exactly as ``_list_accounts``
++returns it; ``accounts`` carries login, active, state and host, never a token.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import hashlib
++import json
++import logging
++import math
++import os
++import re
++import tempfile
++import time
++from collections.abc import Callable, Iterator
++from pathlib import Path
++from typing import Any
++
++try:  # POSIX only; without it concurrent misses each run gh, as before.
++    import fcntl
++except ImportError:  # pragma: no cover - Windows
++    fcntl = None  # type: ignore[assignment]
++
++_logger = logging.getLogger(__name__)
++
++_DEFAULT_TTL_SECONDS = 60.0
++# How long a concurrent miss waits for the process already running gh.
++_LOCK_WAIT_SECONDS = 3.0
++_LOCK_POLL_SECONDS = 0.05
++# Entries and locks of other keys idle this long are removed on a write.
++_PRUNE_AFTER_SECONDS = 3600.0
++# The token variables gh reads (the same set github_resource._gh scrubs in a
++# sandbox); outside a sandbox they decide the identity.
++_TOKEN_VARS = ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN")
++_AUTH_FAILURE = re.compile(
++    r"bad credentials|HTTP 401|gh auth login|not logged in|authentication (failed|required)",
++    re.IGNORECASE,
++)
++
++Accounts = tuple[bool, list[dict[str, Any]]]
++
++
++def ttl_seconds() -> float:
++    """The cache TTL from ``OMNIGENT_GH_AUTH_CACHE_SECONDS``; ``0`` disables it."""
++    raw = os.environ.get("OMNIGENT_GH_AUTH_CACHE_SECONDS")
++    if raw is None:
++        return _DEFAULT_TTL_SECONDS
++    try:
++        value = float(raw)
++    except ValueError:
++        return _DEFAULT_TTL_SECONDS
++    if not math.isfinite(value):
++        return _DEFAULT_TTL_SECONDS
++    return max(value, 0.0)
++
++
++def _cache_dir() -> Path:
++    return Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache")) / "omnigent"
++
++
++def _gh_config_dir() -> str:
++    # gh's own platform-aware order, including %AppData%\GitHub CLI on Windows.
++    from omnigent.git_providers.github import _gh_config_dir as resolve
++
++    try:
++        return resolve()
++    except RuntimeError:
++        return ""
++
++
++def _key() -> str:
++    """Hash of everything ``gh auth status`` answers from (see the module docstring)."""
++    config_dir = Path(_gh_config_dir())
++    try:
++        stat = (config_dir / "hosts.yml").stat()
++        hosts_file = f"{stat.st_size}:{stat.st_mtime_ns}"
++    except OSError:
++        hosts_file = "missing"
++    sandbox = (os.environ.get("IS_SANDBOX") or "").strip() == "1"
++    # github_resource._gh scrubs the token variables inside a sandbox.
++    tokens = "" if sandbox else "\0".join(os.environ.get(name, "") for name in _TOKEN_VARS)
++    material = "\n".join(
++        [str(config_dir), hosts_file, f"sandbox={sandbox}", tokens, os.environ.get("GH_HOST", "")]
++    )
++    return hashlib.sha256(material.encode("utf-8", errors="replace")).hexdigest()[:24]
++
++
++def _entry_path(key: str) -> Path:
++    return _cache_dir() / f"gh-auth-status-{key}.json"
++
++
++def _load(path: Path) -> dict[str, Any] | None:
++    try:
++        data = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    return data if isinstance(data, dict) else None
++
++
++def _invalidated_since(path: Path, started: float) -> bool:
++    data = _load(path)
++    marked = data.get("invalidated_at") if data else None
++    return isinstance(marked, (int, float)) and marked >= started
++
++
++def _read(path: Path, ttl: float) -> Accounts | None:
++    data = _load(path)
++    if data is None:
++        return None
++    stored_at = data.get("stored_at")
++    accounts = data.get("accounts")
++    if not isinstance(stored_at, (int, float)) or not isinstance(accounts, list):
++        return None
++    age = time.time() - stored_at
++    # A negative age means the clock moved back; treat the entry as stale.
++    if age < 0 or age >= ttl or data.get("authenticated") is not True:
++        return None
++    return True, [dict(account) for account in accounts if isinstance(account, dict)]
++
++
++def _write(path: Path, data: dict[str, Any]) -> None:
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=".gh-auth-", suffix=".json")
++        try:
++            with os.fdopen(fd, "w", encoding="utf-8") as handle:
++                json.dump(data, handle)
++            os.replace(tmp, path)
++        except BaseException:
++            with contextlib.suppress(OSError):
++                os.unlink(tmp)
++            raise
++    except OSError as exc:
++        _logger.debug("gh auth cache: could not write %s: %s", path, exc)
++
++
++def _prune(keep: Path) -> None:
++    """Remove other keys' entries and locks that nobody has touched for an hour."""
++    cutoff = time.time() - _PRUNE_AFTER_SECONDS
++    for stale in keep.parent.glob("gh-auth-status-*"):
++        if stale.stem == keep.stem:
++            continue
++        with contextlib.suppress(OSError):
++            if stale.stat().st_mtime < cutoff:
++                stale.unlink()
++
++
++@contextlib.contextmanager
++def _locked(path: Path, deadline: float | None) -> Iterator[bool]:
++    """Hold an exclusive lock beside *path*; yields whether it was acquired.
++
++    :param deadline: A ``time.monotonic()`` instant after which to stop waiting.
++    """
++    if fcntl is None:
++        yield False
++        return
++    try:
++        path.parent.mkdir(parents=True, exist_ok=True)
++        handle = open(path.with_suffix(".lock"), "a+b")  # noqa: SIM115 - held across the yield
++    except OSError:
++        yield False
++        return
++    acquired = False
++    try:
++        give_up = time.monotonic() + _LOCK_WAIT_SECONDS
++        if deadline is not None:
++            give_up = min(give_up, deadline)
++        while True:
++            try:
++                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
++                acquired = True
++                break
++            except BlockingIOError:
++                if time.monotonic() >= give_up:
++                    break
++                time.sleep(_LOCK_POLL_SECONDS)
++            except OSError:
++                # No flock on this filesystem (ENOLCK, EINVAL): run unlocked.
++                break
++        yield acquired
++    finally:
++        if acquired:
++            with contextlib.suppress(OSError):
++                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
++        handle.close()
++
++
++def cached_accounts(compute: Callable[[], Accounts], *, deadline: float | None = None) -> Accounts:
++    """Return the cached ``gh auth status`` answer, or *compute* and cache a success.
++
++    :param compute: Runs ``gh auth status`` and returns ``(authenticated, accounts)``.
++    :param deadline: The caller's ``time.monotonic()`` budget, capping the lock wait.
++    :returns: The same shape *compute* returns.
++    """
++    ttl = ttl_seconds()
++    if ttl <= 0:
++        return compute()
++    path = _entry_path(_key())
++    hit = _read(path, ttl)
++    if hit is not None:
++        return hit
++    with _locked(path, deadline):
++        # Another process may have answered while this one waited for the lock.
++        hit = _read(path, ttl)
++        if hit is not None:
++            return hit
++        started = time.time()
++        value = compute()
++        # An invalidation that landed while gh ran wins over this answer.
++        if value[0] is True and not _invalidated_since(path, started):
++            _write(path, {"stored_at": time.time(), "authenticated": True, "accounts": value[1]})
++            _prune(path)
++        return value
++
++
++def invalidate() -> None:
++    """Mark the current key's entry invalidated, so the next read runs ``gh auth status``."""
++    if ttl_seconds() <= 0:
++        return
++    _write(_entry_path(_key()), {"invalidated_at": time.time()})
++
++
++def note_gh_result(result: tuple[int | None, str, str], *, token: str | None = None) -> None:
++    """Invalidate the cache when a ``gh`` call failed with an authentication error.
++
++    :param result: ``(returncode, stdout, stderr)`` from a ``gh`` call.
++    :param token: The explicit account token the call ran with, if any. Its failure
++        says nothing about the ambient login the cache holds, so it is ignored.
++    """
++    returncode, _, stderr = result
++    if token:
++        return
++    if returncode not in (None, 0) and _AUTH_FAILURE.search(stderr or ""):
++        invalidate()
+diff --git a/omnigent/runner/github_resource.py b/omnigent/runner/github_resource.py
+index 41bff2dbce396c68b0d31d25ff0f420d3e8ea342..bad45b71e7cd76608f62c252a6c101ef4b7157cc 100644
+--- a/omnigent/runner/github_resource.py
++++ b/omnigent/runner/github_resource.py
+@@ -67,7 +67,7 @@ from typing import Any
+ from urllib.parse import quote
+ 
+ from omnigent import config as _config
+-from omnigent.runner import pr_resource
++from omnigent.runner import _ae_gh_auth_cache, pr_resource
+ from omnigent.runner.git_providers import local_git
+ from omnigent.runner.session_prs import PullRequestRef
+ from omnigent.runtime.filesystem_registry import _git_timeout_seconds
+@@ -201,6 +201,7 @@ def _gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int | N
+         and time.monotonic() >= deadline
+     ):
+         _pr_title_timed_out.set(True)
++    _ae_gh_auth_cache.note_gh_result(result, token=token)
+     return result
+ 
+ 
+@@ -247,6 +248,12 @@ def _owner_repo_from_pr_url(url: str | None) -> str | None:
+ 
+ 
+ def _list_accounts(root: str) -> tuple[bool, list[dict[str, Any]]]:
++    return _ae_gh_auth_cache.cached_accounts(
++        lambda: _list_accounts_uncached(root), deadline=_pr_title_deadline.get()
++    )
++
++
++def _list_accounts_uncached(root: str) -> tuple[bool, list[dict[str, Any]]]:
+     """Return ``(authenticated, accounts)`` from ``gh auth status --json hosts``.
+ 
+     ``accounts`` is ``[{login, active, state, host}]``; ``authenticated`` is true
+diff --git a/tests/conftest.py b/tests/conftest.py
+index 8ae4acebf0aa39c42ed06f5f24521491ed9ae1e2..dd9d17f537f74c9937516473ca0ecbf50d76776c 100644
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -315,6 +315,12 @@ def _reset_runner_catalog_cache() -> Generator[None, None, None]:
+         module._runner_catalog_cache.clear()
+ 
+ 
++@pytest.fixture(autouse=True)
++def _no_gh_auth_cache(monkeypatch: pytest.MonkeyPatch) -> None:
++    """Turn off the host-wide ``gh auth status`` cache, which outlives a test's stubs."""
++    monkeypatch.setenv("OMNIGENT_GH_AUTH_CACHE_SECONDS", "0")
++
++
+ @pytest.fixture(autouse=True)
+ def _isolate_claude_native_state(
+     tmp_path_factory: pytest.TempPathFactory,
+diff --git a/tests/runner/test_ae_gh_auth_cache.py b/tests/runner/test_ae_gh_auth_cache.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0a434176a413a24362f1d89a6cfe2166111d197a
+--- /dev/null
++++ b/tests/runner/test_ae_gh_auth_cache.py
+@@ -0,0 +1,302 @@
++"""The host-wide ``gh auth status`` cache in :mod:`omnigent.runner._ae_gh_auth_cache`."""
++
++from __future__ import annotations
++
++import threading
++import time
++from pathlib import Path
++from typing import Any
++
++import pytest
++
++from omnigent.runner import _ae_gh_auth_cache as cache
++from omnigent.runner import github_resource
++
++_OK: tuple[bool, list[dict[str, Any]]] = (
++    True,
++    [{"login": "octo", "active": True, "state": "success", "host": "github.com"}],
++)
++
++
++@pytest.fixture(autouse=True)
++def _cache_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    """Enable the cache (the root conftest turns it off) in a private cache and gh dir."""
++    monkeypatch.setenv("OMNIGENT_GH_AUTH_CACHE_SECONDS", "60")
++    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
++    gh_dir = tmp_path / "gh"
++    gh_dir.mkdir()
++    (gh_dir / "hosts.yml").write_text("github.com:\n    user: octo\n", encoding="utf-8")
++    monkeypatch.setenv("GH_CONFIG_DIR", str(gh_dir))
++    for name in (*cache._TOKEN_VARS, "IS_SANDBOX", "GH_HOST"):
++        monkeypatch.delenv(name, raising=False)
++    return gh_dir
++
++
++class _Counter:
++    def __init__(self, *values: tuple[bool, list[dict[str, Any]]]) -> None:
++        self.values = list(values)
++        self.calls = 0
++
++    def __call__(self) -> tuple[bool, list[dict[str, Any]]]:
++        self.calls += 1
++        return self.values[min(self.calls, len(self.values)) - 1]
++
++
++def test_second_read_is_a_hit() -> None:
++    compute = _Counter(_OK)
++    assert cache.cached_accounts(compute) == _OK
++    assert cache.cached_accounts(compute) == _OK
++    assert compute.calls == 1
++
++
++def test_list_accounts_runs_gh_auth_status_once(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    calls: list[list[str]] = []
++
++    def fake_gh(argv: list[str], *, cwd: str, token: str | None = None) -> tuple[int, str, str]:
++        calls.append(argv)
++        hosts = (
++            '{"hosts": {"github.com": [{"login": "octo", "active": true, "state": "success"}]}}'
++        )
++        return 0, hosts, ""
++
++    monkeypatch.setattr(github_resource, "_gh", fake_gh)
++    first = github_resource._list_accounts(str(tmp_path))
++    second = github_resource._list_accounts(str(tmp_path))
++    assert first == second
++    assert first[0] is True
++    assert first[1][0]["login"] == "octo"
++    assert calls == [["auth", "status", "--json", "hosts"]]
++
++
++def test_entry_expires_after_ttl(monkeypatch: pytest.MonkeyPatch) -> None:
++    compute = _Counter(_OK)
++    now = time.time()
++    monkeypatch.setattr(cache.time, "time", lambda: now)
++    cache.cached_accounts(compute)
++    monkeypatch.setattr(cache.time, "time", lambda: now + 59)
++    cache.cached_accounts(compute)
++    assert compute.calls == 1
++    monkeypatch.setattr(cache.time, "time", lambda: now + 61)
++    cache.cached_accounts(compute)
++    assert compute.calls == 2
++
++
++def test_entry_from_the_future_is_stale(monkeypatch: pytest.MonkeyPatch) -> None:
++    compute = _Counter(_OK)
++    now = time.time()
++    monkeypatch.setattr(cache.time, "time", lambda: now)
++    cache.cached_accounts(compute)
++    monkeypatch.setattr(cache.time, "time", lambda: now - 30)
++    cache.cached_accounts(compute)
++    assert compute.calls == 2
++
++
++@pytest.mark.parametrize(
++    "failure",
++    [
++        (False, []),
++        (False, [{"login": "octo", "active": True, "state": "error", "host": "github.com"}]),
++    ],
++    ids=["gh-failed-or-logged-out", "token-invalid"],
++)
++def test_failure_is_never_cached(failure: tuple[bool, list[dict[str, Any]]]) -> None:
++    compute = _Counter(failure, failure, _OK)
++    assert cache.cached_accounts(compute) == failure
++    assert cache.cached_accounts(compute) == failure
++    assert compute.calls == 2
++    assert cache.cached_accounts(compute) == _OK
++    assert compute.calls == 3
++
++
++def test_non_finite_ttl_uses_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("OMNIGENT_GH_AUTH_CACHE_SECONDS", "nan")
++    assert cache.ttl_seconds() == cache._DEFAULT_TTL_SECONDS
++    monkeypatch.setenv("OMNIGENT_GH_AUTH_CACHE_SECONDS", "inf")
++    assert cache.ttl_seconds() == cache._DEFAULT_TTL_SECONDS
++
++
++def test_ttl_zero_turns_the_cache_off(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("OMNIGENT_GH_AUTH_CACHE_SECONDS", "0")
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    cache.cached_accounts(compute)
++    assert compute.calls == 2
++
++
++def test_login_change_misses(_cache_env: Path) -> None:
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    hosts = _cache_env / "hosts.yml"
++    hosts.write_text("github.com:\n    user: someone-else\n", encoding="utf-8")
++    cache.cached_accounts(compute)
++    assert compute.calls == 2
++
++
++def test_token_variables_key_the_entry(monkeypatch: pytest.MonkeyPatch) -> None:
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    monkeypatch.setenv("GH_TOKEN", "token-a")
++    cache.cached_accounts(compute)
++    monkeypatch.setenv("GH_TOKEN", "token-b")
++    cache.cached_accounts(compute)
++    assert compute.calls == 3
++    monkeypatch.setenv("GH_TOKEN", "token-a")
++    cache.cached_accounts(compute)
++    assert compute.calls == 3
++
++
++def test_sandbox_ignores_token_variables(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("IS_SANDBOX", "1")
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    monkeypatch.setenv("GH_TOKEN", "ambient")
++    cache.cached_accounts(compute)
++    assert compute.calls == 1
++
++
++def test_entry_holds_no_token(_cache_env: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("GH_TOKEN", "secret-token-value")
++    cache.cached_accounts(_Counter(_OK))
++    entries = list((Path(cache._cache_dir())).glob("gh-auth-status-*.json"))
++    assert len(entries) == 1
++    assert "secret-token-value" not in entries[0].read_text(encoding="utf-8")
++
++
++@pytest.mark.parametrize(
++    ("result", "dropped"),
++    [
++        ((1, "", "HTTP 401: Bad credentials (https://api.github.com/graphql)"), True),
++        ((4, "", "To get started with GitHub CLI, please run:  gh auth login"), True),
++        ((1, "", "no pull requests found for branch"), False),
++        ((None, "", "timed out"), False),
++        ((0, "ok", ""), False),
++    ],
++    ids=["bad-credentials", "logged-out", "other-failure", "timeout", "success"],
++)
++def test_auth_failure_invalidates(result: tuple[int | None, str, str], dropped: bool) -> None:
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    cache.note_gh_result(result)
++    cache.cached_accounts(compute)
++    assert compute.calls == (2 if dropped else 1)
++
++
++@pytest.mark.posix_only
++def test_concurrent_miss_runs_gh_once() -> None:
++    started = threading.Event()
++    calls = 0
++
++    def slow() -> tuple[bool, list[dict[str, Any]]]:
++        nonlocal calls
++        calls += 1
++        started.set()
++        time.sleep(0.3)
++        return _OK
++
++    results: list[tuple[bool, list[dict[str, Any]]]] = []
++    first = threading.Thread(target=lambda: results.append(cache.cached_accounts(slow)))
++    first.start()
++    assert started.wait(5)
++    # The second reader blocks on the first one's lock and reads its answer.
++    results.append(cache.cached_accounts(slow))
++    first.join(5)
++    assert calls == 1
++    assert results == [_OK, _OK]
++
++
++@pytest.mark.posix_only
++def test_lock_wait_is_capped(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(cache, "_LOCK_WAIT_SECONDS", 0.1)
++    release = threading.Event()
++    started = threading.Event()
++
++    def stuck() -> tuple[bool, list[dict[str, Any]]]:
++        started.set()
++        release.wait(5)
++        return _OK
++
++    holder = threading.Thread(target=lambda: cache.cached_accounts(stuck))
++    holder.start()
++    assert started.wait(5)
++    fallback = _Counter(_OK)
++    try:
++        assert cache.cached_accounts(fallback) == _OK
++        assert fallback.calls == 1
++    finally:
++        release.set()
++        holder.join(5)
++
++
++def test_failure_with_an_explicit_token_keeps_the_entry() -> None:
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    cache.note_gh_result((1, "", "HTTP 401: Bad credentials"), token="selected-account")
++    cache.cached_accounts(compute)
++    assert compute.calls == 1
++
++
++def test_invalidation_during_a_fill_wins() -> None:
++    def revoked_while_running() -> tuple[bool, list[dict[str, Any]]]:
++        cache.note_gh_result((1, "", "HTTP 401: Bad credentials"))
++        return _OK
++
++    assert cache.cached_accounts(revoked_while_running) == _OK
++    compute = _Counter(_OK)
++    cache.cached_accounts(compute)
++    assert compute.calls == 1
++
++
++@pytest.mark.posix_only
++def test_caller_deadline_caps_the_lock_wait() -> None:
++    release = threading.Event()
++    started = threading.Event()
++
++    def stuck() -> tuple[bool, list[dict[str, Any]]]:
++        started.set()
++        release.wait(5)
++        return _OK
++
++    holder = threading.Thread(target=lambda: cache.cached_accounts(stuck))
++    holder.start()
++    assert started.wait(5)
++    try:
++        began = time.monotonic()
++        cache.cached_accounts(_Counter(_OK), deadline=time.monotonic() + 0.05)
++        assert time.monotonic() - began < 1.0
++    finally:
++        release.set()
++        holder.join(5)
++
++
++@pytest.mark.posix_only
++def test_flock_without_support_runs_unlocked(monkeypatch: pytest.MonkeyPatch) -> None:
++    def no_locks(fd: int, operation: int) -> None:
++        raise OSError(37, "No locks available")
++
++    monkeypatch.setattr(cache.fcntl, "flock", no_locks)
++    began = time.monotonic()
++    compute = _Counter(_OK)
++    assert cache.cached_accounts(compute) == _OK
++    assert time.monotonic() - began < 1.0
++    cache.cached_accounts(compute)
++    assert compute.calls == 1
++
++
++def test_write_prunes_idle_entries_of_other_keys() -> None:
++    import os
++
++    directory = cache._cache_dir()
++    directory.mkdir(parents=True)
++    old = time.time() - 2 * cache._PRUNE_AFTER_SECONDS
++    idle = [directory / "gh-auth-status-idle.json", directory / "gh-auth-status-idle.lock"]
++    for path in idle:
++        path.write_text("{}", encoding="utf-8")
++        os.utime(path, (old, old))
++    recent = directory / "gh-auth-status-recent.json"
++    recent.write_text("{}", encoding="utf-8")
++    cache.cached_accounts(_Counter(_OK))
++    assert not any(path.exists() for path in idle)
++    assert recent.exists()
++    assert cache._entry_path(cache._key()).exists()

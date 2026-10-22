@@ -1,0 +1,381 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 19:36:52 -0700
+Subject: [PATCH 109/148] [ae-patch] Sort sessions by status icon under
+ Ordering: Status
+
+On 2026-10-20 Reid picked Ordering: Status expecting his status icons to drive
+it, but a session he had checked as Review sat between two Working ones.
+Upstream's Status ordering sorts by live activity (waiting on an approval,
+unread, running, draft, idle), so every idle session counted as done and fell
+by last update. Status ordering now sorts by the icon first, in the Triage
+groups' order (Blocked, Working, Review, No status, Parked, Reference), then
+by upstream's live state, then newest first, so sessions without an icon keep
+upstream's order. Project folders sort by icon too, then newest first. Search
+results and the Archived display keep upstream's order, as for Manual.
+---
+ web/src/hooks/useAeSidebarOrder.ts         |  2 +-
+ web/src/lib/aeTriage.test.ts               | 35 ++++++++++++++
+ web/src/lib/aeTriage.ts                    | 16 ++++++-
+ web/src/shell/Sidebar.aeSortModes.test.tsx | 45 ++++++++++++++++++
+ web/src/shell/Sidebar.tsx                  |  8 ++--
+ web/src/shell/aeSidebarStore.test.ts       | 26 +++++++++++
+ web/src/shell/aeSidebarStore.ts            | 54 +++++++++++++++++-----
+ 7 files changed, 170 insertions(+), 16 deletions(-)
+
+diff --git a/web/src/hooks/useAeSidebarOrder.ts b/web/src/hooks/useAeSidebarOrder.ts
+index 2b5b877eac99580b90e1027f86841b9767c07be7..a324df648552655375effe45f5b45e672efde5c1 100644
+--- a/web/src/hooks/useAeSidebarOrder.ts
++++ b/web/src/hooks/useAeSidebarOrder.ts
+@@ -287,7 +287,7 @@ export function useAeOrderMover(): (op: AeOrderOp) => boolean {
+ /**
+  * Load the list's further pages while `enabled`, up to the rows the background
+  * refresh keeps current (`maxRefreshSessions`): a row past that window would
+- * keep a stale status, which Triage groups by and Manual ranks among.
++ * keep a stale status, which Triage groups by, Status sorts by and Manual ranks among.
+  */
+ export function useAeLoadAllPages(query: SidebarListQuery, enabled: boolean): void {
+   const { maxRefreshSessions } = useContext(SidebarConfigContext);
+diff --git a/web/src/lib/aeTriage.test.ts b/web/src/lib/aeTriage.test.ts
+index 477834ac4c0e686d76b08c47564dc45ee02e2282..8cb97ad5f8d2f3fd8e771739ae9961aba6d36149 100644
+--- a/web/src/lib/aeTriage.test.ts
++++ b/web/src/lib/aeTriage.test.ts
+@@ -6,6 +6,7 @@ import {
+   AE_TRIAGE_STATUS,
+   type AeTriageGroup,
+   aeGroupCounts,
++  aeSortByTriage,
+   aeTriageGroupOf,
+ } from "./aeTriage";
+ 
+@@ -52,6 +53,40 @@ describe("aeTriageGroupOf", () => {
+   });
+ });
+ 
++describe("aeSortByTriage", () => {
++  const at = (id: string, status?: string, pending = 0) => ({ ...row(status, pending), id });
++
++  it("sorts by the shown status and keeps the incoming order within one", () => {
++    const rows = [
++      at("ref", "reference"),
++      at("w1", "working"),
++      at("none"),
++      at("r", "review"),
++      at("w2", "working"),
++      at("blk", "working", 1),
++      at("p", "parked"),
++    ];
++    expect(aeSortByTriage(rows, null).map((r) => r.id)).toEqual([
++      "blk",
++      "w1",
++      "w2",
++      "r",
++      "none",
++      "p",
++      "ref",
++    ]);
++    expect(rows.map((r) => r.id)[0]).toBe("ref");
++  });
++
++  it("holds each row's group while a frozen map is passed", () => {
++    const frozen = new Map<string, AeTriageGroup>();
++    aeSortByTriage([at("a", "review"), at("b", "working")], frozen);
++    const changed = [at("a", "working"), at("b", "review")];
++    expect(aeSortByTriage(changed, frozen).map((r) => r.id)).toEqual(["b", "a"]);
++    expect(aeSortByTriage(changed, null).map((r) => r.id)).toEqual(["a", "b"]);
++  });
++});
++
+ describe("aeGroupCounts", () => {
+   it("counts rows per title", () => {
+     const counts = aeGroupCounts(
+diff --git a/web/src/lib/aeTriage.ts b/web/src/lib/aeTriage.ts
+index 1be0c9d8522036c8596fd04df31559c1a9f66089..3f74209eeadbc6d5a812da1fad2a297485e85b16 100644
+--- a/web/src/lib/aeTriage.ts
++++ b/web/src/lib/aeTriage.ts
+@@ -34,13 +34,16 @@ const GROUP_OF = Object.fromEntries(
+   }),
+ ) as Record<AeStatus, AeTriageGroup>;
+ 
++/** What a row's Triage group reads. */
++export type AeTriageRow = Pick<Conversation, "id" | "labels" | "pending_elicitations_count">;
++
+ /**
+  * A row's group, from the status the row shows (blocked included). A `frozen`
+  * map pins the first answer while the pointer is in the list, so a status
+  * change under the cursor does not move the row to another group.
+  */
+ export function aeTriageGroupOf(
+-  conversation: Pick<Conversation, "id" | "labels" | "pending_elicitations_count">,
++  conversation: AeTriageRow,
+   frozen: Map<string, AeTriageGroup> | null,
+ ): AeTriageGroup {
+   const held = frozen?.get(conversation.id);
+@@ -51,6 +54,17 @@ export function aeTriageGroupOf(
+   return group;
+ }
+ 
++/** Rows in the Triage groups' order, each group keeping the order the rows came in. */
++export function aeSortByTriage<T extends AeTriageRow>(
++  rows: T[],
++  frozen: Map<string, AeTriageGroup> | null,
++): T[] {
++  const rank = new Map(
++    rows.map((row) => [row.id, AE_TRIAGE_GROUPS.indexOf(aeTriageGroupOf(row, frozen))]),
++  );
++  return [...rows].sort((a, b) => (rank.get(a.id) ?? 0) - (rank.get(b.id) ?? 0));
++}
++
+ /** Rows per group title, from the list's id-to-title map. */
+ export function aeGroupCounts(
+   groupTitles: ReadonlyMap<string, string> | null,
+diff --git a/web/src/shell/Sidebar.aeSortModes.test.tsx b/web/src/shell/Sidebar.aeSortModes.test.tsx
+index d1f057a38ac1e240a18bdcbc966d11c459df8454..2e5c1e0baa26deca00762dffa23bc9fc7d384edb 100644
+--- a/web/src/shell/Sidebar.aeSortModes.test.tsx
++++ b/web/src/shell/Sidebar.aeSortModes.test.tsx
+@@ -6,6 +6,7 @@
+ //   3. Manual reads the saved order only while it is on, shows rows in it with
+ //      new sessions on top, and moves rows from the row menu and by drag.
+ //   4. A filed session dropped on a sibling in its own folder stays filed.
++//   5. Status ordering sorts by status icon, in Sessions and in project folders.
+ 
+ import type * as IdentityModule from "@/lib/identity";
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+@@ -748,3 +749,47 @@ describe("reorder off and deferred moves", () => {
+     await waitFor(() => expect(rowIds()).toEqual(["new", "c", "a", "b", "old"]));
+   });
+ });
++
++describe("Status ordering by status icon", () => {
++  it("sorts Sessions by status icon, then live state, then newest", async () => {
++    setView("default", "status");
++    serve([
++      row("ref", 9, { labels: { "ae.status": "reference" } }),
++      row("r", 8, { labels: { "ae.status": "review" } }),
++      row("w_idle", 7, { labels: { "ae.status": "working" } }),
++      row("none", 6),
++      row("w_run", 5, { labels: { "ae.status": "working" }, status: "running" }),
++      row("blk", 4, { labels: { "ae.status": "working" }, pending_elicitations_count: 1 }),
++      row("p", 3, { labels: { "ae.status": "parked" } }),
++    ]);
++    renderSidebar();
++    await waitFor(() =>
++      expect(rowIds()).toEqual(["blk", "w_run", "w_idle", "r", "none", "p", "ref"]),
++    );
++  });
++
++  it("sorts a project folder's rows by status icon too", async () => {
++    mocks.projects = ["Alpha"];
++    const filed = [
++      row("f_ref", 3, { labels: { omni_project: "Alpha", "ae.status": "reference" } }),
++      row("f_r", 2, { labels: { omni_project: "Alpha", "ae.status": "review" } }),
++      row("f_w", 1, { labels: { omni_project: "Alpha", "ae.status": "working" } }),
++    ];
++    mocks.folderRows = { Alpha: filed };
++    localStorage.setItem("omnigent:expanded-project-sections", JSON.stringify(["Alpha"]));
++    setView("default", "status");
++    serve([...filed, row("s1", 0)]);
++    renderSidebar();
++    await waitFor(() => expect(rowIds().slice(0, 3)).toEqual(["f_w", "f_r", "f_ref"]));
++  });
++
++  it("leaves Updated ordering newest first", async () => {
++    setView("default", "updated");
++    serve([
++      row("r", 3, { labels: { "ae.status": "review" } }),
++      row("w", 2, { labels: { "ae.status": "working" } }),
++    ]);
++    renderSidebar();
++    await waitFor(() => expect(rowIds()).toEqual(["r", "w"]));
++  });
++});
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index d2264739068c9f715de5e592aa82b011273c1b87..d76a850c623db202bf552196af4c89782f21cbec 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -1994,11 +1994,13 @@ function ConversationList({
+       frozenStatus?.set(c.id, live);
+       return live;
+     };
+-    // Status ordering is a stable sort by bucket, so updated_at order holds within one.
+-    const allOrdered =
++    // Status ordering is a stable sort by bucket, so updated_at order holds within one;
++    // ae.applyOrder then sorts by status icon, keeping that order within an icon.
++    const allOrdered = ae.applyOrder(
+       view.ordering === "status"
+         ? groupConversations(byUpdated, statusOf, STATUS_BUCKETS).flatMap((g) => g.conversations)
+-        : ae.applyOrder(byUpdated);
++        : byUpdated,
++    );
+     // Grouped views fold Shared into the groups too, so the first group takes
+     // the Projects header's place.
+     const splitShared = groupingUi && !grouped;
+diff --git a/web/src/shell/aeSidebarStore.test.ts b/web/src/shell/aeSidebarStore.test.ts
+index 6034b1a0e946234f9c33488b86a19d09676dbd17..85304020f6fce11b68a222b5bc66d0c23db927e9 100644
+--- a/web/src/shell/aeSidebarStore.test.ts
++++ b/web/src/shell/aeSidebarStore.test.ts
+@@ -300,4 +300,30 @@ describe("useAeSidebarView", () => {
+     expect(listedFor("", "archived", true)).toBe(false);
+     expect(listedFor("", "all", false)).toBe(false);
+   });
++
++  it("loads further pages under Status ordering, so every session sorts by its icon", () => {
++    const client = new QueryClient();
++    const wrapper = ({ children }: { children: ReactNode }) =>
++      createElement(QueryClientProvider, { client }, children);
++    for (const [ordering, loads] of [
++      ["status", 1],
++      ["updated", 0],
++    ] as const) {
++      const paged = { ...query, hasNextPage: true, fetchNextPage: vi.fn() } as typeof query;
++      renderHook(
++        () =>
++          useAeSidebarView({
++            view: { grouping: "default", ordering, show: [] },
++            orderFrozen: false,
++            conversationsQuery: paged,
++            searchQuery: "",
++            activeTab: "all",
++            onViewChange: vi.fn(),
++            available: true,
++          }),
++        { wrapper },
++      );
++      expect(paged.fetchNextPage).toHaveBeenCalledTimes(loads);
++    }
++  });
+ });
+diff --git a/web/src/shell/aeSidebarStore.ts b/web/src/shell/aeSidebarStore.ts
+index 8eeeb7bcf09ad5ca71b00d950bebb8e714bd622a..81b8df0c7c0bcc182d75ddbc9bd7445038116240 100644
+--- a/web/src/shell/aeSidebarStore.ts
++++ b/web/src/shell/aeSidebarStore.ts
+@@ -29,7 +29,12 @@ import {
+   aeIsOrderId,
+   aeMoveInOrder,
+ } from "@/lib/aeSessionOrder";
+-import { type AeTriageGroup, aeTriageGroupOf } from "@/lib/aeTriage";
++import {
++  type AeTriageGroup,
++  type AeTriageRow,
++  aeSortByTriage,
++  aeTriageGroupOf,
++} from "@/lib/aeTriage";
+ import type { SessionFilter } from "@/lib/sessionFilterPreferences";
+ import type { SidebarViewPreferences } from "@/lib/sidebarViewPreferences";
+ import { type ActiveChatOverride, sortByUpdatedAtDesc } from "./sidebarNav";
+@@ -41,6 +46,10 @@ interface AeSidebarState {
+   manual: boolean;
+   /** The saved order while Manual is on, else `null`. */
+   order: readonly string[] | null;
++  /** Status ordering sorts rows by their status icon. */
++  statusSort: boolean;
++  /** Triage groups held while the pointer is in the list. */
++  frozenTriage: Map<string, AeTriageGroup> | null;
+   /** Each list's row ids as shown, by list key (`sessions`, `shared`, `group:…`, `folder:…`). */
+   lists: ReadonlyMap<string, readonly string[]>;
+   /** Each listed row's list key. */
+@@ -58,6 +67,8 @@ const IDLE: AeSidebarState = {
+   listed: false,
+   manual: false,
+   order: null,
++  statusSort: false,
++  frozenTriage: null,
+   lists: new Map(),
+   listOf: new Map(),
+   units: null,
+@@ -97,6 +108,19 @@ export function aeCancelPendingMoves(): void {
+ 
+ const NO_ORDER: readonly string[] = [];
+ 
++type AeListRow = AeOrderRow & AeTriageRow;
++
++/** Rows in the saved order while Manual is on, by status icon while Status is, else as given. */
++function aeOrderRows<T extends AeListRow>(
++  rows: T[],
++  order: readonly string[] | null,
++  statusSort: boolean,
++  frozen: Map<string, AeTriageGroup> | null,
++): T[] {
++  if (order) return aeApplyManualOrder(rows, order);
++  return statusSort ? aeSortByTriage(rows, frozen) : rows;
++}
++
+ /** What the session list needs from the AE view options. */
+ export interface AeSidebarView {
+   /** Rows are drop targets and offer Move: view options on, not searching, not Archived. */
+@@ -105,10 +129,12 @@ export interface AeSidebarView {
+   switchToManual: () => void;
+   triage: boolean;
+   order: readonly string[] | null;
++  /** Status ordering sorts by status icon (Blocked first, Reference last), outside search and Archived. */
++  statusSort: boolean;
+   /** Triage groups held while the pointer is in the list. */
+   frozenTriage: Map<string, AeTriageGroup> | null;
+-  /** Rows in the saved order while Manual is on; `rows` itself otherwise. */
+-  applyOrder: <T extends AeOrderRow>(rows: T[]) => T[];
++  /** Rows in the saved order while Manual is on, by status icon while Status is, else `rows`. */
++  applyOrder: <T extends AeListRow>(rows: T[]) => T[];
+   /** A row's Triage group while Triage is on, else `null`. */
+   triageTitle: (conversation: Conversation) => AeTriageGroup | null;
+   /** Triage's Archived group shows: not while searching, nor on the Shared and Archived displays. */
+@@ -136,11 +162,12 @@ export function useAeSidebarView({
+   // Search results and archived rows keep upstream's order.
+   const listed = available && !searchQuery && activeTab !== "archived";
+   const manualOn = view.ordering === "manual" && listed;
++  const statusSort = view.ordering === "status" && listed;
+   const triage = view.grouping === "triage";
+   const { data } = useAeSidebarOrder(manualOn);
+   const order = manualOn ? (data?.order ?? NO_ORDER) : null;
+   const switchToManual = useCallback(() => onViewChange({ ordering: "manual" }), [onViewChange]);
+-  useAeLoadAllPages(conversationsQuery, listed && (manualOn || triage));
++  useAeLoadAllPages(conversationsQuery, listed && (manualOn || triage || statusSort));
+   useEffect(() => {
+     if (!manualOn) aeCancelPendingMoves();
+   }, [manualOn]);
+@@ -158,14 +185,15 @@ export function useAeSidebarView({
+       switchToManual,
+       triage,
+       order,
++      statusSort,
+       frozenTriage,
+-      applyOrder: <T extends AeOrderRow>(rows: T[]) =>
+-        order ? aeApplyManualOrder(rows, order) : rows,
++      applyOrder: <T extends AeListRow>(rows: T[]) =>
++        aeOrderRows(rows, order, statusSort, frozenTriage),
+       triageTitle: (conversation: Conversation) =>
+         triage ? aeTriageGroupOf(conversation, frozenTriage) : null,
+       archivedGroup,
+     }),
+-    [listed, order, switchToManual, triage, frozenTriage, archivedGroup],
++    [listed, order, statusSort, switchToManual, triage, frozenTriage, archivedGroup],
+   );
+ }
+ 
+@@ -231,6 +259,8 @@ export function useAePublishSidebarScopes(
+       listed: true,
+       manual,
+       order: ae.order,
++      statusSort: ae.statusSort,
++      frozenTriage: ae.frozenTriage,
+       lists,
+       listOf,
+       units,
+@@ -248,12 +278,14 @@ export function useAePublishSidebarScopes(
+   );
+ }
+ 
+-/** A project folder's rows in the saved order while Manual is on. */
+-export function useAeFolderOrder(): <T extends AeOrderRow>(rows: T[]) => T[] {
++/** A project folder's rows ordered like the session list: Manual's saved order, or Status's icons. */
++export function useAeFolderOrder(): <T extends AeListRow>(rows: T[]) => T[] {
+   const order = useAeSidebarStore((s) => s.order);
++  const statusSort = useAeSidebarStore((s) => s.statusSort);
++  const frozen = useAeSidebarStore((s) => s.frozenTriage);
+   return useCallback(
+-    <T extends AeOrderRow>(rows: T[]) => (order ? aeApplyManualOrder(rows, order) : rows),
+-    [order],
++    <T extends AeListRow>(rows: T[]) => aeOrderRows(rows, order, statusSort, frozen),
++    [order, statusSort, frozen],
+   );
+ }
+ 

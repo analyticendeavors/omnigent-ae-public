@@ -1,0 +1,462 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 20 Oct 2026 13:51:21 -0700
+Subject: [PATCH 119/148] [ae-patch] Show the effort a Claude session runs at
+ when none was picked
+
+With no pick the runner passes no --effort and Claude Code takes effortLevel
+from its settings, which the web never saw, so the Effort menu showed no
+level and no check. At each launch without --effort the runner reads the
+level in Claude's precedence (managed, workspace local, workspace, then the
+launch account's user settings) and writes it to the session label
+ae.claude_effort_default, never to reasoning_effort, so nothing is pinned
+and a pick made mid-launch is not overwritten. The menu shows that level as
+"High (default)" with High checked, or "Claude default" when no file names
+one.
+---
+ omnigent/runner/ae_launch_effort.py           | 116 ++++++++++++++++++
+ omnigent/runner/native/orchestration.py       |   9 ++
+ tests/runner/test_ae_launch_effort.py         | 108 ++++++++++++++++
+ ...pp_sessions_native_terminals_autocreate.py |  12 +-
+ web/src/lib/aeEffortDefault.test.ts           |  44 +++++++
+ web/src/lib/aeEffortDefault.ts                |  57 +++++++++
+ web/src/pages/ChatPage.tsx                    |   6 +-
+ 7 files changed, 348 insertions(+), 4 deletions(-)
+ create mode 100644 omnigent/runner/ae_launch_effort.py
+ create mode 100644 tests/runner/test_ae_launch_effort.py
+ create mode 100644 web/src/lib/aeEffortDefault.test.ts
+ create mode 100644 web/src/lib/aeEffortDefault.ts
+
+diff --git a/omnigent/runner/ae_launch_effort.py b/omnigent/runner/ae_launch_effort.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..910d622836779e3dc4b4b47a950fc15d350147ee
+--- /dev/null
++++ b/omnigent/runner/ae_launch_effort.py
+@@ -0,0 +1,116 @@
++"""Record the effort a claude-native session runs at when none was picked.
++
++Reid, 2026-10-20: the composer's Effort menu showed no level and no check on a
++web-created Claude session, so he could not tell the effort before changing
++it. With no pick the runner passes no ``--effort`` and Claude Code takes
++``effortLevel`` from its settings, which only the host can read. At each
++launch the runner writes that level to the session label
++:data:`EFFORT_DEFAULT_LABEL` (:data:`NO_LEVEL` when no settings file names
++one), and the web shows it as the default. A label, not ``reasoning_effort``:
++that field is the user's pick, and saving the default there would pin it as
++``--effort`` on every relaunch and could overwrite a pick made mid-launch.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import json
++import logging
++import urllib.parse
++from collections.abc import Mapping, Sequence
++from pathlib import Path
++
++import httpx
++
++from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
++
++_logger = logging.getLogger(__name__)
++
++EFFORT_DEFAULT_LABEL = "ae.claude_effort_default"
++NO_LEVEL = "none"
++# Claude Code's managed policy file on Linux; it outranks every other source.
++_MANAGED_SETTINGS = Path("/etc/claude-code/managed-settings.json")
++
++
++def _settings_level(path: Path) -> str | None:
++    try:
++        parsed = json.loads(path.read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    effort = parsed.get("effortLevel") if isinstance(parsed, dict) else None
++    return effort if isinstance(effort, str) and effort in CLAUDE_EFFORTS else None
++
++
++def claude_settings_effort(env: Mapping[str, str], cwd: Path) -> str | None:
++    """
++    Return the ``effortLevel`` Claude Code applies for a launch env and workspace.
++
++    Sources in Claude's precedence: managed policy, the workspace's
++    ``.claude/settings.local.json`` and ``.claude/settings.json``, then the user
++    settings in ``CLAUDE_CONFIG_DIR`` (else ``$HOME/.claude``), so the
++    session's Claude account counts.
++
++    :param env: The Claude pane's launch environment, e.g.
++        ``{"HOME": "/home/user", "CLAUDE_CONFIG_DIR": "/home/user/.claude-acct2"}``.
++    :param cwd: The pane's working directory, e.g. ``Path("/home/user/repo")``.
++    :returns: A Claude effort, e.g. ``"high"``; ``None`` when no file names a
++        valid level.
++    """
++    config_dir = env.get("CLAUDE_CONFIG_DIR")
++    user_dir = Path(config_dir) if config_dir else Path(env.get("HOME") or Path.home()) / ".claude"
++    for path in (
++        _MANAGED_SETTINGS,
++        cwd / ".claude" / "settings.local.json",
++        cwd / ".claude" / "settings.json",
++        user_dir / "settings.json",
++    ):
++        level = _settings_level(path)
++        if level is not None:
++            return level
++    return None
++
++
++def _effort_in_args(args: Sequence[str]) -> bool:
++    return any(arg == "--effort" or arg.startswith("--effort=") for arg in args)
++
++
++async def record_launch_effort(
++    server_client: httpx.AsyncClient,
++    session_id: str,
++    *,
++    env: Mapping[str, str],
++    cwd: Path,
++    args: Sequence[str],
++) -> None:
++    """
++    Label the session with the effort Claude Code defaults to; never fails a launch.
++
++    Skipped when the launch passes ``--effort`` (a pick or a pass-through
++    argument), since that, not the settings, is what the pane runs at.
++
++    :param server_client: The runner's Omnigent client.
++    :param session_id: Session id, e.g. ``"conv_abc123"``.
++    :param env: The Claude pane's launch environment.
++    :param cwd: The pane's working directory.
++    :param args: The pane's launch arguments, e.g. ``["--effort", "low"]``.
++    """
++    if _effort_in_args(args):
++        return
++    level = await asyncio.to_thread(claude_settings_effort, env, cwd) or NO_LEVEL
++    try:
++        resp = await server_client.patch(
++            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
++            json={"labels": {EFFORT_DEFAULT_LABEL: level}},
++            params={"include_usage": "false"},
++            timeout=10.0,
++        )
++        resp.raise_for_status()
++    except Exception:  # noqa: BLE001 - a failed record must not sink the launch
++        _logger.warning(
++            "claude-native: could not label session %s with default effort %s; "
++            "the Effort menu shows no default until the next launch",
++            session_id,
++            level,
++            exc_info=True,
++            extra={"session_id": session_id},
++        )
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index f71e68137f27f2c12ceec24e716a392a1845edb9..66723edf5776b64d758a1283129db8160e3e6210 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -9055,6 +9055,15 @@ async def _auto_create_claude_terminal(
+             _claude_terminal_launch_cwd(env_spec, agent_os_env),
+             env=_claude_terminal_launch_env(env_spec),
+         )
++        from omnigent.runner.ae_launch_effort import record_launch_effort
++
++        await record_launch_effort(
++            server_client,
++            session_id,
++            env=_claude_terminal_launch_env(env_spec),
++            cwd=_claude_terminal_launch_cwd(env_spec, agent_os_env),
++            args=env_spec.args,
++        )
+     except BaseException as seed_error:
+         # No forwarder owns the routers yet, so release the ones this launch started.
+         # A ``None`` handle would shut down whichever router is registered now.
+diff --git a/tests/runner/test_ae_launch_effort.py b/tests/runner/test_ae_launch_effort.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ce8558a476e513a9b0e21c1038912a811c0fd564
+--- /dev/null
++++ b/tests/runner/test_ae_launch_effort.py
+@@ -0,0 +1,108 @@
++"""The runner labels a claude-native session with the effort Claude defaults to."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import httpx
++import pytest
++
++from omnigent.runner import ae_launch_effort
++from omnigent.runner.ae_launch_effort import (
++    EFFORT_DEFAULT_LABEL,
++    NO_LEVEL,
++    claude_settings_effort,
++    record_launch_effort,
++)
++
++
++@pytest.fixture(autouse=True)
++def _no_managed_settings(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(ae_launch_effort, "_MANAGED_SETTINGS", tmp_path / "managed.json")
++
++
++def _settings(path: Path, body: object) -> None:
++    path.parent.mkdir(parents=True, exist_ok=True)
++    path.write_text(json.dumps(body), encoding="utf-8")
++
++
++def test_reads_the_launch_accounts_config_dir_over_home(tmp_path: Path) -> None:
++    _settings(tmp_path / "home" / ".claude" / "settings.json", {"effortLevel": "high"})
++    _settings(tmp_path / "acct2" / "settings.json", {"effortLevel": "low"})
++    home = str(tmp_path / "home")
++    cwd = tmp_path / "repo"
++    assert claude_settings_effort({"HOME": home}, cwd) == "high"
++    assert (
++        claude_settings_effort({"HOME": home, "CLAUDE_CONFIG_DIR": str(tmp_path / "acct2")}, cwd)
++        == "low"
++    )
++
++
++def test_follows_claudes_precedence(tmp_path: Path) -> None:
++    env = {"CLAUDE_CONFIG_DIR": str(tmp_path / "user")}
++    cwd = tmp_path / "repo"
++    _settings(tmp_path / "user" / "settings.json", {"effortLevel": "low"})
++    assert claude_settings_effort(env, cwd) == "low"
++    _settings(cwd / ".claude" / "settings.json", {"effortLevel": "medium"})
++    assert claude_settings_effort(env, cwd) == "medium"
++    _settings(cwd / ".claude" / "settings.local.json", {"effortLevel": "high"})
++    assert claude_settings_effort(env, cwd) == "high"
++    _settings(tmp_path / "managed.json", {"effortLevel": "max"})
++    assert claude_settings_effort(env, cwd) == "max"
++
++
++@pytest.mark.parametrize("body", [{}, {"effortLevel": "turbo"}, {"effortLevel": 3}, ["high"]])
++def test_no_valid_level_gives_none(tmp_path: Path, body: object) -> None:
++    _settings(tmp_path / "settings.json", body)
++    assert claude_settings_effort({"CLAUDE_CONFIG_DIR": str(tmp_path)}, tmp_path / "repo") is None
++
++
++def test_missing_or_broken_settings_give_none(tmp_path: Path) -> None:
++    env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
++    assert claude_settings_effort(env, tmp_path / "repo") is None
++    (tmp_path / "settings.json").write_text("{not json", encoding="utf-8")
++    assert claude_settings_effort(env, tmp_path / "repo") is None
++
++
++async def test_labels_the_session_and_swallows_a_server_error(tmp_path: Path) -> None:
++    _settings(tmp_path / "settings.json", {"effortLevel": "xhigh"})
++    seen: list[httpx.Request] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        seen.append(request)
++        return httpx.Response(500 if len(seen) == 2 else 200, json={})
++
++    env = {"CLAUDE_CONFIG_DIR": str(tmp_path)}
++    cwd = tmp_path / "repo"
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://server"
++    ) as client:
++        await record_launch_effort(client, "conv_abc", env=env, cwd=cwd, args=["claude"])
++        await record_launch_effort(client, "conv_abc", env=env, cwd=cwd, args=[])  # 500, no raise
++        await record_launch_effort(
++            client, "conv_abc", env={"CLAUDE_CONFIG_DIR": str(tmp_path / "x")}, cwd=cwd, args=[]
++        )
++
++    assert len(seen) == 3
++    assert seen[0].method == "PATCH"
++    assert seen[0].url.path == "/v1/sessions/conv_abc"
++    assert json.loads(seen[0].content) == {"labels": {EFFORT_DEFAULT_LABEL: "xhigh"}}
++    assert json.loads(seen[2].content) == {"labels": {EFFORT_DEFAULT_LABEL: NO_LEVEL}}
++
++
++@pytest.mark.parametrize(
++    "args", [["--effort", "low"], ["--effort=low"], ["CLAUDE_X=1", "claude", "--effort", "max"]]
++)
++async def test_an_explicit_effort_argument_is_left_alone(tmp_path: Path, args: list[str]) -> None:
++    _settings(tmp_path / "settings.json", {"effortLevel": "high"})
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        raise AssertionError("no PATCH expected")
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://server"
++    ) as client:
++        await record_launch_effort(
++            client, "conv_abc", env={"CLAUDE_CONFIG_DIR": str(tmp_path)}, cwd=tmp_path, args=args
++        )
+diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+index c44056c90da492fc94491fda8d2f9776a924372c..bf09c8dcca6b3e1a9066ccd7576ed65b2bf88a97 100644
+--- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
++++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+@@ -2930,7 +2930,11 @@ async def test_auto_create_claude_terminal_resets_stale_bridge_id_label(
+ 
+     # Exactly one PATCH request must have been sent to correct the label.
+     # 0 means the fix was not applied and the relay would target the wrong dir.
+-    patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
++    patch_requests = [
++        r
++        for r in recorded_requests
++        if r.method == "PATCH" and b"ae.claude_effort_default" not in r.content
++    ]
+     assert len(patch_requests) == 1, (
+         f"Expected exactly one PATCH to correct the stale bridge_id label; "
+         f"got {len(patch_requests)}. 0 means _auto_create_claude_terminal did "
+@@ -3060,7 +3064,11 @@ async def test_auto_create_claude_terminal_honours_cleared_bridge_label(
+ 
+     import json as _json
+ 
+-    patch_requests = [r for r in recorded_requests if r.method == "PATCH"]
++    patch_requests = [
++        r
++        for r in recorded_requests
++        if r.method == "PATCH" and b"ae.claude_effort_default" not in r.content
++    ]
+     assert len(patch_requests) == 1
+     patch_body = _json.loads(patch_requests[0].content)
+     assert (
+diff --git a/web/src/lib/aeEffortDefault.test.ts b/web/src/lib/aeEffortDefault.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e831d958b648315a70d9c0bd9dd4dc72a747ef42
+--- /dev/null
++++ b/web/src/lib/aeEffortDefault.test.ts
+@@ -0,0 +1,44 @@
++import { QueryClient } from "@tanstack/react-query";
++import { describe, expect, it } from "vitest";
++import { aeEffortDefaultSuffix, readAeEffortDefault } from "./aeEffortDefault";
++
++function cacheWith(labels: Record<string, string>) {
++  const qc = new QueryClient();
++  qc.setQueryData(["conversations", "all"], {
++    pages: [{ data: [{ id: "conv_1", labels }] }],
++    pageParams: [null],
++  });
++  return qc;
++}
++
++describe("readAeEffortDefault", () => {
++  it("reads the level the runner recorded", () => {
++    expect(readAeEffortDefault(cacheWith({ "ae.claude_effort_default": "high" }), "conv_1")).toBe(
++      "high",
++    );
++  });
++
++  it("gives null for none, a missing label, or an uncached session", () => {
++    expect(readAeEffortDefault(cacheWith({ "ae.claude_effort_default": "none" }), "conv_1")).toBe(
++      null,
++    );
++    expect(readAeEffortDefault(cacheWith({}), "conv_1")).toBe(null);
++    expect(readAeEffortDefault(cacheWith({}), "conv_2")).toBe(null);
++  });
++});
++
++describe("aeEffortDefaultSuffix", () => {
++  it("names the recorded level as the default", () => {
++    expect(aeEffortDefaultSuffix("claude", false, "high")).toBe(": High (default)");
++  });
++
++  it("says Claude default when no level is recorded", () => {
++    expect(aeEffortDefaultSuffix("claude", false, null)).toBe(": Claude default");
++  });
++
++  it("stays blank under smart routing and for other harnesses", () => {
++    expect(aeEffortDefaultSuffix("claude", true, "high")).toBe("");
++    expect(aeEffortDefaultSuffix("codex", false, "high")).toBe("");
++    expect(aeEffortDefaultSuffix(null, false, null)).toBe("");
++  });
++});
+diff --git a/web/src/lib/aeEffortDefault.ts b/web/src/lib/aeEffortDefault.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d970bca57f6680947483e6af294ccad7e707ab6b
+--- /dev/null
++++ b/web/src/lib/aeEffortDefault.ts
+@@ -0,0 +1,57 @@
++// The Effort row's value when a Claude session has no pick. At each launch the
++// runner labels the session with the level Claude Code takes from its settings
++// (omnigent/runner/ae_launch_effort.py), "none" when no file names one. The
++// menu shows that level with "(default)" and checks it, or "Claude default"
++// when there is none, so the effort is visible before a change (Reid,
++// 2026-10-20). The label comes from the `["conversations"]` cache the sidebar
++// keeps warm, as the session chip's status does, so it costs no request.
++
++import { type QueryClient, QueryClientContext } from "@tanstack/react-query";
++import { useCallback, useContext, useSyncExternalStore } from "react";
++import type { Conversation } from "@/hooks/useConversations";
++import { formatStatusEffortLabel } from "@/lib/composerModelLabel";
++import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
++
++export const AE_EFFORT_DEFAULT_LABEL = "ae.claude_effort_default";
++const NO_LEVEL = "none";
++
++/** The recorded default level of a cached session, e.g. `"high"`; null when none. */
++export function readAeEffortDefault(queryClient: QueryClient, id: string): string | null {
++  for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
++    queryKey: ["conversations"],
++  })) {
++    for (const page of data?.pages ?? []) {
++      const row = page.data.find((conversation: Conversation) => conversation.id === id);
++      if (row) {
++        const level = row.labels?.[AE_EFFORT_DEFAULT_LABEL];
++        return level && level !== NO_LEVEL ? level : null;
++      }
++    }
++  }
++  return null;
++}
++
++/** Null without a query client (a composer rendered outside the app shell). */
++export function useAeEffortDefault(id: string | null): string | null {
++  const queryClient = useContext(QueryClientContext);
++  const subscribe = useCallback(
++    (onChange: () => void) => queryClient?.getQueryCache().subscribe(onChange) ?? (() => {}),
++    [queryClient],
++  );
++  const read = useCallback(
++    () => (id && queryClient ? readAeEffortDefault(queryClient, id) : null),
++    [queryClient, id],
++  );
++  return useSyncExternalStore(subscribe, read, read);
++}
++
++/** The Effort row's suffix for a Claude session with no pick, else `""`. */
++export function aeEffortDefaultSuffix(
++  pickerKind: string | null | undefined,
++  routingOn: boolean,
++  recorded: string | null,
++): string {
++  if (pickerKind !== "claude" || routingOn) return "";
++  const label = formatStatusEffortLabel(recorded);
++  return label ? `: ${label} (default)` : ": Claude default";
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 57aa7cba57716374df2a715ad0a9ec50033996e9..0ad7a6b4ca36e1be179f586d497565e82ad11db3 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -69,6 +69,7 @@ import { isIOSShell, onNativeSidebarDrag, setNativeServerSwitcherHidden } from "
+ import { type Agent, useSessionAgent, useAgents } from "@/hooks/useAgents";
+ import { AeFastModeSection } from "@/components/AeFastMode";
+ import { useAeFastModePending } from "@/lib/aeFastMode";
++import { aeEffortDefaultSuffix, useAeEffortDefault } from "@/lib/aeEffortDefault";
+ import { aeClaudeVersion, aeSplitPreviousBy, useAeClaudeVersions } from "@/lib/aeClaudeModels";
+ import { AePlanLimitsPopover } from "@/components/AePlanLimits";
+ import { AeTokenDefrag } from "@/components/AeTokenDefrag";
+@@ -4740,6 +4741,7 @@ function SessionHarnessPicker({
+   const forkDialog = useForkDialog();
+   const sessionModelSeeded = useChatStore((state) => state.sessionModelSeeded);
+   const selectedEffort = useSessionEffort();
++  const effortDefault = useAeEffortDefault(modelPickerKind === "claude" ? conversationId : null);
+   const costControlModeOverride = useChatStore((state) => state.costControlModeOverride);
+   const routingOn = costRoutingEligible && costControlModeOverride === "on";
+   const {
+@@ -4952,11 +4954,11 @@ function SessionHarnessPicker({
+         efforts={
+           showEffort && availableEfforts.length > 0
+             ? {
+-                label: `${modelPickerKind === "pi" ? "Thinking level" : "Effort"}${effortLabel ? `: ${effortLabel}` : ""}`,
++                label: `${modelPickerKind === "pi" ? "Thinking level" : "Effort"}${effortLabel ? `: ${effortLabel}` : aeEffortDefaultSuffix(modelPickerKind, routingOn, effortDefault)}`,
+                 choices: availableEfforts.map((effort) => ({
+                   key: effort,
+                   label: formatStatusEffortLabel(effort) ?? effort,
+-                  checked: !routingOn && effort === selectedEffort,
++                  checked: !routingOn && effort === (selectedEffort ?? effortDefault),
+                   disabled: routingOn || picksBusy || pendingModelChange !== null,
+                   onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                   testId: `composer-agent-effort-${effort}`,

@@ -1,0 +1,778 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 16 Oct 2026 19:09:38 -0700
+Subject: [PATCH 063/148] [ae-patch] Show the model each agent ran on in the
+ Agents pane's Model column.
+
+Child session rows gain a model field: the model the harness reported for
+the child, else the model its own usage was recorded against (Codex
+collaborators report it there), else the requested override. The
+claude-native forwarder now reports each Claude Code subagent's
+message.model to its mirrored child through external_model_change, once
+per change, so new subagents fill in too. The pane prints Claude ids as
+names ("Sonnet 5.5") and moves the status dot from the empty space
+before Model to the right of Time.
+---
+ .../claude_native/ae_subagent_model.py        |  71 +++++++
+ omnigent/harnesses/claude_native/forwarder.py |   7 +
+ .../server/routes/_sessions/ae_child_model.py |  43 +++++
+ omnigent/server/routes/_sessions/helpers.py   |   2 +
+ omnigent/server/schemas.py                    |   5 +
+ openapi.json                                  |  12 ++
+ .../forwarder/test_ae_subagent_model.py       | 173 ++++++++++++++++++
+ tests/server/test_ae_child_model.py           |  46 +++++
+ web/src/hooks/useChildSessions.ts             |   4 +
+ web/src/shell/AeAgentsSections.test.tsx       |  52 +++++-
+ web/src/shell/AeAgentsSections.tsx            |  52 ++++--
+ web/src/shell/SubagentsPanel.test.tsx         |   2 +-
+ web/src/shell/aeAgentsPaneModel.test.ts       |  10 +
+ web/src/shell/aeAgentsPaneModel.ts            |  11 ++
+ 14 files changed, 470 insertions(+), 20 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_subagent_model.py
+ create mode 100644 omnigent/server/routes/_sessions/ae_child_model.py
+ create mode 100644 tests/harnesses/claude_native/forwarder/test_ae_subagent_model.py
+ create mode 100644 tests/server/test_ae_child_model.py
+
+diff --git a/omnigent/harnesses/claude_native/ae_subagent_model.py b/omnigent/harnesses/claude_native/ae_subagent_model.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8cfbbfef8db44a8ee94c8e51ced94977ac2d7419
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_subagent_model.py
+@@ -0,0 +1,71 @@
++"""Report the model each Claude Code subagent runs on to its mirrored child session."""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Awaitable, Callable
++
++import httpx
++
++from omnigent.models.model_metadata import concrete_reported_model
++
++_logger = logging.getLogger(__name__)
++
++# Child session id to the model last reported for it, so each model is posted once.
++_reported: dict[str, str] = {}
++# A model seen but not yet delivered, kept apart from the transcript cursor, which
++# moves past the entry that named it; with the attempts made so far.
++_pending: dict[str, tuple[str, int]] = {}
++# A child whose posts keep failing (deleted server-side, say) stops being retried.
++MAX_ATTEMPTS = 5
++
++PostModel = Callable[..., Awaitable[None]]
++
++
++async def report_subagent_model(
++    client: httpx.AsyncClient,
++    post_model_change: PostModel,
++    *,
++    child_session_id: str,
++    latest_model: str | None,
++) -> None:
++    """
++    Post a subagent's ``message.model`` to its child session once per change.
++
++    A failed post is logged and retried on later transcript reads, even when no
++    new entry names the model again, up to :data:`MAX_ATTEMPTS`. It never blocks
++    forwarding the subagent's items.
++
++    :param client: Omnigent HTTP client.
++    :param post_model_change: The forwarder's ``external_model_change`` poster.
++    :param child_session_id: The mirrored child session, e.g. ``"conv_child456"``.
++    :param latest_model: ``message.model`` from the newest assistant entry read
++        this tick, e.g. ``"claude-sonnet-5-5"``; ``None`` when none was read.
++    """
++    seen = concrete_reported_model(latest_model) if latest_model else None
++    pending = _pending.get(child_session_id)
++    if seen is not None and (pending is None or pending[0] != seen):
++        pending = (seen, 0)
++    if pending is None:
++        return
++    model, attempts = pending
++    if _reported.get(child_session_id) == model:
++        _pending.pop(child_session_id, None)
++        return
++    if attempts >= MAX_ATTEMPTS:
++        return
++    try:
++        await post_model_change(client, session_id=child_session_id, model=model)
++    except httpx.HTTPError as exc:
++        _pending[child_session_id] = (model, attempts + 1)
++        _logger.warning(
++            "Could not report claude-native sub-agent model; "
++            "child=%s model=%s attempt=%s error=%s",
++            child_session_id,
++            model,
++            attempts + 1,
++            exc,
++        )
++        return
++    _pending.pop(child_session_id, None)
++    _reported[child_session_id] = model
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 3a9ba820591d00bf06647dacc69123f3352a3eaa..c18f67010bca85e49f03d79ebd72e8ea7a8fed57 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -21,6 +21,7 @@ import httpx
+ from omnigent.debug_logging import debug_event
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.errors import ErrorCode
++from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
+ from omnigent.harnesses.claude_native.bridge import (
+     BRIDGE_ID_LABEL_KEY,
+     OBSERVER_HOOK_STDERR_FILE,
+@@ -2177,6 +2178,12 @@ async def _forward_one_subagent(
+         current_response_id=None,
+         include_sidechains=True,
+     )
++    await report_subagent_model(
++        client,
++        _post_external_model_change,
++        child_session_id=entry.child_conversation_id,
++        latest_model=result.latest_model,
++    )
+     seen_source_ids = list(entry.seen_source_ids)
+     seen = set(seen_source_ids)
+     pending, safe_offset = _pending_items_from_records(result, seen, entry.byte_offset)
+diff --git a/omnigent/server/routes/_sessions/ae_child_model.py b/omnigent/server/routes/_sessions/ae_child_model.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..34971354182b0589013bbcdaf6a7b779af043708
+--- /dev/null
++++ b/omnigent/server/routes/_sessions/ae_child_model.py
+@@ -0,0 +1,43 @@
++"""The model a child session actually ran on, for the Agents pane's Model column."""
++
++from __future__ import annotations
++
++from typing import Any
++
++from omnigent.entities.conversation import Conversation
++
++
++def _model_with_most_tokens(session_usage: dict[str, Any]) -> str | None:
++    """Return the model id that used the most tokens in a session's own usage."""
++    by_model = session_usage.get("by_model")
++    if not isinstance(by_model, dict):
++        return None
++    best: str | None = None
++    best_tokens = -1.0
++    for model, buckets in by_model.items():
++        if not isinstance(model, str) or not model:
++            continue
++        tokens = buckets.get("total_tokens", 0) if isinstance(buckets, dict) else 0
++        tokens = tokens if isinstance(tokens, (int, float)) else 0
++        if tokens > best_tokens:
++            best, best_tokens = model, tokens
++    return best
++
++
++def child_display_model(conv: Conversation) -> str | None:
++    """
++    Pick the model to show for a child session.
++
++    The harness's own report wins (``reported_model``), then the model the
++    child's own usage was recorded against (Codex collaborators report it
++    there), then the model the user or the router requested.
++
++    :param conv: The child conversation row.
++    :returns: A model id such as ``"claude-sonnet-5-5"``, or ``None`` when
++        nothing names one.
++    """
++    return (
++        conv.reported_model
++        or _model_with_most_tokens(conv.session_usage or {})
++        or conv.model_override
++    )
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index bc7ed849c16dfc91d8d24182c938ed0bdb7676e7..60f2fa0e839518ed368844a8d261b6f15325af35 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -131,6 +131,7 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
+ from omnigent.server.routes._session_create_validation import (
+     validate_existing_host_workspace,
+ )
++from omnigent.server.routes._sessions.ae_child_model import child_display_model
+ 
+ # Shared constants, state, and small dataclasses live in the _sessions.common
+ # leaf module; import them here so this module and its re-exporters see the same
+@@ -10924,6 +10925,7 @@ def _child_session_summary_from_conversation(
+         # conversation label rather than a new column.
+         routed_model=conv.model_override if routing_decision_id is not None else None,
+         routing_decision_id=routing_decision_id,
++        model=child_display_model(conv),
+     )
+ 
+ 
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index f4d9a2b16165280b2b85cd8aacba857ee408c6eb..a0189fc71a158dda2e0c8474bb638a7e90eaa398 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -825,6 +825,10 @@ class ChildSessionSummary(BaseModel):
+         ``RoutingDecisionData.decision_id``. Read from the child's
+         ``omnigent.routing.decision_id`` label, stamped when routing pins
+         the model. ``None`` when the child was not routed.
++    :param model: Model the child actually ran on, e.g.
++        ``"claude-sonnet-5-5"``: the harness's own report, else the model
++        its own usage was recorded against, else the requested override.
++        ``None`` when nothing names one.
+     """
+ 
+     id: str
+@@ -848,6 +852,7 @@ class ChildSessionSummary(BaseModel):
+     pending_elicitations_count: int = 0
+     routed_model: str | None = None
+     routing_decision_id: str | None = None
++    model: str | None = None
+ 
+ 
+ # ── Responses ───────────────────────────────────────────────────
+diff --git a/openapi.json b/openapi.json
+index 47ad4d1970fdc967c7bfb6a563fce91411f98e6c..14234edf980bd54c9b67946d431475064fd768fd 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -760,6 +760,18 @@
+             "description": "Error details from the child's most recent failed run, e.g. `{\"code\": \"required_terminal_exited\", \"message\": \"...\"}`. `None` when the child has no durable failure detail. This is the typed projection of runner-owned failure labels; clients should not parse those labels directly.",
+             "title": "Last Task Error"
+           },
++          "model": {
++            "anyOf": [
++              {
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "Model the child actually ran on, e.g. `\"claude-sonnet-5-5\"`: the harness's own report, else the model its own usage was recorded against, else the requested override. `None` when nothing names one.",
++            "title": "Model"
++          },
+           "object": {
+             "default": "child_session",
+             "description": "Fixed resource type, always `\"child_session\"`.",
+diff --git a/tests/harnesses/claude_native/forwarder/test_ae_subagent_model.py b/tests/harnesses/claude_native/forwarder/test_ae_subagent_model.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..33b333b240002f69cc53a64a62111a61400e1284
+--- /dev/null
++++ b/tests/harnesses/claude_native/forwarder/test_ae_subagent_model.py
+@@ -0,0 +1,173 @@
++"""Reporting each Claude Code subagent's model to its mirrored child session."""
++
++from __future__ import annotations
++
++import asyncio
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++
++from omnigent.harnesses.claude_native import ae_subagent_model
++from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
++from omnigent.harnesses.claude_native.bridge import record_hook_event
++from omnigent.harnesses.claude_native.forwarder import forward_claude_transcript_to_session
++from tests.harnesses.claude_native.forwarder._support import (
++    _get_recorded_request,
++    _seed_subagent_on_disk,
++    _start_recording_server_with_responses,
++)
++
++
++@pytest.fixture(autouse=True)
++def _fresh_state() -> None:
++    ae_subagent_model._reported.clear()
++    ae_subagent_model._pending.clear()
++
++
++class _Recorder:
++    def __init__(self, fail: bool = False) -> None:
++        self.calls: list[dict[str, Any]] = []
++        self.fail = fail
++
++    async def __call__(self, client: Any, *, session_id: str, model: str) -> None:
++        self.calls.append({"session_id": session_id, "model": model})
++        if self.fail:
++            raise httpx.ConnectError("server unreachable")
++
++
++@pytest.mark.asyncio
++async def test_posts_each_model_once_per_child() -> None:
++    post = _Recorder()
++    for model in ("claude-sonnet-5-5", "claude-sonnet-5-5", None, "claude-opus-5-5"):
++        await report_subagent_model(None, post, child_session_id="conv_a", latest_model=model)
++    await report_subagent_model(
++        None, post, child_session_id="conv_b", latest_model="claude-sonnet-5-5"
++    )
++    assert post.calls == [
++        {"session_id": "conv_a", "model": "claude-sonnet-5-5"},
++        {"session_id": "conv_a", "model": "claude-opus-5-5"},
++        {"session_id": "conv_b", "model": "claude-sonnet-5-5"},
++    ]
++
++
++@pytest.mark.asyncio
++async def test_a_failed_post_is_retried_on_the_next_read() -> None:
++    failing = _Recorder(fail=True)
++    await report_subagent_model(
++        None, failing, child_session_id="conv_a", latest_model="claude-sonnet-5-5"
++    )
++    working = _Recorder()
++    await report_subagent_model(
++        None, working, child_session_id="conv_a", latest_model="claude-sonnet-5-5"
++    )
++    assert len(failing.calls) == 1
++    assert working.calls == [{"session_id": "conv_a", "model": "claude-sonnet-5-5"}]
++
++
++@pytest.mark.asyncio
++async def test_retries_a_failed_model_after_the_cursor_moves_past_it() -> None:
++    failing = _Recorder(fail=True)
++    await report_subagent_model(
++        None, failing, child_session_id="conv_a", latest_model="claude-sonnet-5-5"
++    )
++    # The next read starts past the entry that named the model.
++    working = _Recorder()
++    await report_subagent_model(None, working, child_session_id="conv_a", latest_model=None)
++    await report_subagent_model(None, working, child_session_id="conv_a", latest_model=None)
++    assert working.calls == [{"session_id": "conv_a", "model": "claude-sonnet-5-5"}]
++
++
++@pytest.mark.asyncio
++async def test_gives_up_after_repeated_failures() -> None:
++    failing = _Recorder(fail=True)
++    await report_subagent_model(
++        None, failing, child_session_id="conv_gone", latest_model="claude-sonnet-5-5"
++    )
++    for _ in range(ae_subagent_model.MAX_ATTEMPTS + 3):
++        await report_subagent_model(None, failing, child_session_id="conv_gone", latest_model=None)
++    assert len(failing.calls) == ae_subagent_model.MAX_ATTEMPTS
++
++
++@pytest.mark.asyncio
++async def test_skips_placeholder_models() -> None:
++    post = _Recorder()
++    await report_subagent_model(None, post, child_session_id="conv_a", latest_model="<synthetic>")
++    assert post.calls == []
++
++
++@pytest.mark.asyncio
++async def test_forwarder_reports_a_subagent_model_to_its_child(tmp_path: Path) -> None:
++    bridge_dir = tmp_path / "bridge"
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text("", encoding="utf-8")
++    _seed_subagent_on_disk(
++        transcript_path=transcript_path,
++        subagent_id="c7e9aaa",
++        agent_type="Explore",
++        description="Find the model",
++        tool_use_id="toolu_model",
++        transcript_records=[
++            {
++                "isSidechain": True,
++                "type": "assistant",
++                "uuid": "sa-assistant-1",
++                "message": {
++                    "role": "assistant",
++                    "model": "claude-sonnet-5-5",
++                    "content": [{"type": "text", "text": "looking now"}],
++                },
++            },
++        ],
++    )
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "SessionStart",
++            "session_id": "claude-session",
++            "transcript_path": str(transcript_path),
++        },
++    )
++
++    def response_for(body: object) -> object:
++        if isinstance(body, list):
++            return [{"queued": False, "item_id": f"item-{i}"} for i, _event in enumerate(body)]
++        if isinstance(body, dict) and body.get("type") == "external_subagent_start":
++            return {"queued": False, "child_session_id": "conv_child_model"}
++        return {}
++
++    server, _thread, base_url = _start_recording_server_with_responses(response_for)
++    task = asyncio.create_task(
++        forward_claude_transcript_to_session(
++            base_url=base_url,
++            headers={},
++            session_id="conv_parent",
++            bridge_dir=bridge_dir,
++            agent_name="claude-native-ui",
++            start_at_end=False,
++            poll_interval_s=0.01,
++        )
++    )
++    try:
++        reported: dict[str, Any] | None = None
++        for _ in range(40):
++            req = await _get_recorded_request(server)
++            body = req["body"]
++            if (
++                req["path"] == "/v1/sessions/conv_child_model/events"
++                and isinstance(body, dict)
++                and body.get("type") == "external_model_change"
++            ):
++                reported = body
++                break
++        assert reported == {
++            "type": "external_model_change",
++            "data": {"model": "claude-sonnet-5-5"},
++        }
++    finally:
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        server.shutdown()
++        server.server_close()
+diff --git a/tests/server/test_ae_child_model.py b/tests/server/test_ae_child_model.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a37eb16defb7775c97ffb79c2d69d587a08524be
+--- /dev/null
++++ b/tests/server/test_ae_child_model.py
+@@ -0,0 +1,46 @@
++"""The model the Agents pane shows for a child session."""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from typing import Any
++
++from omnigent.server.routes._sessions.ae_child_model import child_display_model
++
++
++def _conv(**overrides: Any) -> Any:
++    fields: dict[str, Any] = {"reported_model": None, "session_usage": {}, "model_override": None}
++    fields.update(overrides)
++    return SimpleNamespace(**fields)
++
++
++def test_harness_report_wins() -> None:
++    conv = _conv(
++        reported_model="claude-sonnet-5-5",
++        session_usage={"by_model": {"gpt-6-astra": {"total_tokens": 900}}},
++        model_override="claude-opus-5-5",
++    )
++    assert child_display_model(conv) == "claude-sonnet-5-5"
++
++
++def test_falls_back_to_the_model_with_the_most_tokens() -> None:
++    conv = _conv(
++        session_usage={
++            "by_model": {
++                "gpt-5.6-sol": {"total_tokens": 120},
++                "gpt-6-astra": {"total_tokens": 4800},
++                "bad": "not a dict",
++            }
++        }
++    )
++    assert child_display_model(conv) == "gpt-6-astra"
++
++
++def test_falls_back_to_the_requested_model() -> None:
++    assert child_display_model(_conv(model_override="claude-haiku-5-5")) == "claude-haiku-5-5"
++
++
++def test_none_when_nothing_names_a_model() -> None:
++    assert child_display_model(_conv()) is None
++    assert child_display_model(_conv(session_usage={"by_model": "garbage"})) is None
++    assert child_display_model(_conv(session_usage=None)) is None
+diff --git a/web/src/hooks/useChildSessions.ts b/web/src/hooks/useChildSessions.ts
+index 6d98662c7579bf8dbb253f1c31ca69940dd3dfe7..8ab8ceb459f40fc876a05580a4b753e6416d9f45 100644
+--- a/web/src/hooks/useChildSessions.ts
++++ b/web/src/hooks/useChildSessions.ts
+@@ -62,6 +62,8 @@ export interface ChildSessionInfo {
+    * not routed (routing off, or a server that predates the field).
+    */
+   routed_model?: string | null;
++  /** Model the child actually ran on, as the server reports it; absent on an older server. */
++  model?: string | null;
+   /** Unix epoch seconds the child was created, or absent on an older server. */
+   created_at?: number;
+   /** Unix epoch seconds of the child's latest update, or absent on an older server. */
+@@ -86,6 +88,7 @@ interface ChildSessionWire {
+   last_message_preview?: string | null;
+   pending_elicitations_count?: number;
+   routed_model?: string | null;
++  model?: string | null;
+   created_at?: number;
+   updated_at?: number;
+ }
+@@ -232,6 +235,7 @@ export async function fetchChildSessions(sessionId: string): Promise<ChildSessio
+     last_message_preview: row.last_message_preview ?? null,
+     pending_elicitations_count: row.pending_elicitations_count ?? 0,
+     routed_model: row.routed_model ?? null,
++    model: row.model ?? null,
+     created_at: row.created_at,
+     updated_at: row.updated_at,
+   }));
+diff --git a/web/src/shell/AeAgentsSections.test.tsx b/web/src/shell/AeAgentsSections.test.tsx
+index ff12896f6cfcec46d5e9df4809de1cd03b503db5..fd0b15936d8cd229aa01614c50dd81041beee82a 100644
+--- a/web/src/shell/AeAgentsSections.test.tsx
++++ b/web/src/shell/AeAgentsSections.test.tsx
+@@ -134,9 +134,8 @@ describe("row pieces", () => {
+           />
+         </div>,
+       );
+-      expect(screen.getByTestId("subagent-routed-model")).toHaveTextContent("sonnet");
++      expect(screen.getByTestId("subagent-routed-model")).toHaveTextContent("Sonnet 5");
+       expect(screen.getByTestId("subagent-elapsed")).toHaveTextContent("1m 05s");
+-      expect(screen.getByTestId("dot")).toBeInTheDocument();
+     } finally {
+       vi.useRealTimers();
+     }
+@@ -147,6 +146,55 @@ describe("row pieces", () => {
+     expect(screen.getByTestId("subagent-elapsed")).toHaveTextContent("1m 40s");
+   });
+ 
++  it("shows the model the agent ran on, ahead of a routed one", () => {
++    render(
++      <AeAgentRowMeta
++        child={child({ id: "c", model: "claude-opus-5-5[1m]", routed_model: "claude-haiku-5-5" })}
++        status={null}
++      />,
++    );
++    const cell = screen.getByTestId("subagent-model");
++    expect(cell).toHaveTextContent("Opus 5.5");
++    expect(cell).toHaveAttribute("title", "claude-opus-5-5[1m]");
++    cleanup();
++    render(<AeAgentRowMeta child={child({ id: "x", model: "gpt-6-astra" })} status={null} />);
++    expect(screen.getByTestId("subagent-model")).toHaveTextContent("gpt-6-astra");
++  });
++
++  it("puts the status dot right after Time, and keeps a Stop slot after it while running", () => {
++    const { container } = render(
++      <div>
++        <AeAgentRowMeta child={child({ id: "f" })} status={<span data-testid="dot" />} />
++      </div>,
++    );
++    const finishedCells = container.firstElementChild!.children;
++    expect(finishedCells[finishedCells.length - 1]).toContainElement(screen.getByTestId("dot"));
++    cleanup();
++    const { container: live } = render(
++      <div>
++        <AeAgentRowMeta child={running("r")} status={<span data-testid="dot" />} />
++      </div>,
++    );
++    const runningCells = live.firstElementChild!.children;
++    expect(runningCells[runningCells.length - 2]).toContainElement(screen.getByTestId("dot"));
++    expect(runningCells[runningCells.length - 1]).toBeEmptyDOMElement();
++  });
++
++  it("puts a status word left of Model so the columns stay in line", () => {
++    const { container } = render(
++      <div>
++        <AeAgentRowMeta
++          child={child({ id: "f", current_task_status: "failed" })}
++          status={<span data-testid="word">Failed</span>}
++          statusHasWord
++        />
++      </div>,
++    );
++    const cells = container.firstElementChild!.children;
++    expect(cells[0]).toBe(screen.getByTestId("word"));
++    expect(cells[cells.length - 1]).toBeEmptyDOMElement();
++  });
++
+   it("says No output yet while running and hides the harness context block", () => {
+     render(
+       <AeAgentLastLine
+diff --git a/web/src/shell/AeAgentsSections.tsx b/web/src/shell/AeAgentsSections.tsx
+index f2c0c35b84fb1eda3430824ba064488ef7df94b4..64ce2569a9e72c6851ddc94cbda5ce77f54a0fe5 100644
+--- a/web/src/shell/AeAgentsSections.tsx
++++ b/web/src/shell/AeAgentsSections.tsx
+@@ -5,7 +5,6 @@
+ 
+ import { useEffect, useState, type ReactNode } from "react";
+ import { showToast } from "@/components/ui/toast";
+-import { shortModelName } from "@/components/CostRoutingControl";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import {
+@@ -21,6 +20,7 @@ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
+ import { TodoPanel } from "./TodoPanel";
+ import {
++  agentModelLabel,
+   canStopChild,
+   childElapsedSeconds,
+   clearCutoff,
+@@ -36,8 +36,10 @@ const ICON_BUTTON =
+ // Widths shared by the column header and every row, so they line up as a table.
+ export const MODEL_COLUMN = "w-16 shrink-0 truncate text-right";
+ export const TIME_COLUMN = "w-14 shrink-0 whitespace-nowrap text-right tabular-nums";
+-// The Stop square or the status dot sits in this slot.
+-export const ACTION_COLUMN = "flex w-8 shrink-0 items-center justify-center pointer-coarse:w-10";
++// A bare status dot sits in this fixed slot right after Time; a running row keeps
++// one more slot at its right end for the Stop square.
++export const ACTION_COLUMN = "flex w-4 shrink-0 items-center justify-end";
++export const STOP_COLUMN = "w-8 shrink-0 pointer-coarse:w-10";
+ 
+ const FINISHED_OPEN_KEY = "ae.agentsPane.finishedOpen";
+ const clearedKey = (rootSessionId: string) => `ae.agentsPane.clearedAt.${rootSessionId}`;
+@@ -79,7 +81,7 @@ function SectionHeader({ children }: { children: ReactNode }) {
+   );
+ }
+ 
+-function ColumnHeader({ withAction }: { withAction: boolean }) {
++function ColumnHeader({ withStop }: { withStop: boolean }) {
+   return (
+     <li
+       aria-hidden="true"
+@@ -88,7 +90,8 @@ function ColumnHeader({ withAction }: { withAction: boolean }) {
+       <span className="min-w-0 flex-1">Task</span>
+       <span className={MODEL_COLUMN}>Model</span>
+       <span className={TIME_COLUMN}>Time</span>
+-      {withAction && <span className={ACTION_COLUMN} />}
++      <span className={ACTION_COLUMN} />
++      {withStop && <span className={STOP_COLUMN} />}
+     </li>
+   );
+ }
+@@ -155,7 +158,7 @@ function AgentsSectionsForRoot({ rootSessionId, agents, renderRow }: AeAgentsSec
+           </SectionHeader>
+         </li>
+       )}
+-      {running.length > 0 && <ColumnHeader withAction />}
++      {running.length > 0 && <ColumnHeader withStop />}
+       {running.map(renderRow)}
+       {(finished.length > 0 || clearedCount > 0) && (
+         <li data-testid="agents-finished-section" className="mt-1 border-t border-border/60">
+@@ -201,29 +204,43 @@ function AgentsSectionsForRoot({ rootSessionId, agents, renderRow }: AeAgentsSec
+           </SectionHeader>
+         </li>
+       )}
+-      {finishedOpen && finished.length > 0 && <ColumnHeader withAction={false} />}
++      {finishedOpen && finished.length > 0 && <ColumnHeader withStop={false} />}
+       {finishedOpen && finished.map(renderRow)}
+     </>
+   );
+ }
+ 
+ /**
+- * A child row's status, Model and Time columns, and on a running row the
+- * slot the Stop square sits over (empty when the row cannot be stopped).
++ * A child row's Model and Time columns and its status dot, then on a running
++ * row the slot the Stop square sits over (empty when it cannot be stopped).
++ * A status that shows a word ("Failed", "Needs response") goes left of Model
++ * instead, so its width never pushes the columns out of line.
++ *
++ * @param statusHasWord - True when `status` renders a word beside its dot.
+  */
+-export function AeAgentRowMeta({ child, status }: { child: ChildSessionInfo; status: ReactNode }) {
++export function AeAgentRowMeta({
++  child,
++  status,
++  statusHasWord = false,
++}: {
++  child: ChildSessionInfo;
++  status: ReactNode;
++  statusHasWord?: boolean;
++}) {
+   const finished = isChildFinished(child);
+   const now = useNow(!finished);
++  // The model the agent ran on, else the one routing picked; blank when neither is known.
++  const model = child.model ?? child.routed_model ?? null;
++  const routed = child.routed_model != null && model === child.routed_model;
+   return (
+     <>
+-      {status}
+-      {/* Blank when the router picked no model: the row cannot tell which one runs. */}
++      {statusHasWord && status}
+       <span
+-        className={cn(MODEL_COLUMN, "font-mono text-[10px] text-muted-foreground")}
+-        data-testid={child.routed_model ? "subagent-routed-model" : undefined}
+-        title={child.routed_model ? `Smart routing picked ${child.routed_model}` : undefined}
++        className={cn(MODEL_COLUMN, "text-[11px] text-muted-foreground")}
++        data-testid={model ? (routed ? "subagent-routed-model" : "subagent-model") : undefined}
++        title={model ? (routed ? `Smart routing picked ${model}` : model) : undefined}
+       >
+-        {child.routed_model ? shortModelName(child.routed_model) : null}
++        {model ? agentModelLabel(model) : null}
+       </span>
+       <span
+         className={cn(TIME_COLUMN, "text-xs text-muted-foreground")}
+@@ -231,7 +248,8 @@ export function AeAgentRowMeta({ child, status }: { child: ChildSessionInfo; sta
+       >
+         {formatElapsed(childElapsedSeconds(child, now))}
+       </span>
+-      {!finished && <span aria-hidden="true" className={ACTION_COLUMN} />}
++      <span className={ACTION_COLUMN}>{statusHasWord ? null : status}</span>
++      {!finished && <span aria-hidden="true" className={STOP_COLUMN} />}
+     </>
+   );
+ }
+diff --git a/web/src/shell/SubagentsPanel.test.tsx b/web/src/shell/SubagentsPanel.test.tsx
+index b33cd97df0a68a4e4be800a75680402a293a8821..b62d59a655fdc32ba79c5773fdf289f1496febd8 100644
+--- a/web/src/shell/SubagentsPanel.test.tsx
++++ b/web/src/shell/SubagentsPanel.test.tsx
+@@ -1544,7 +1544,7 @@ describe("SubagentsPanel", () => {
+     const { container } = renderPanel({ rootSessionId: "conv_root" });
+ 
+     const routed = childRow(container, "conv_routed");
+-    expect(within(routed).getByTestId("subagent-routed-model").textContent).toBe("sonnet");
++    expect(within(routed).getByTestId("subagent-routed-model").textContent).toBe("Sonnet 5");
+     expect(
+       within(childRow(container, "conv_plain")).queryByTestId("subagent-routed-model"),
+     ).toBeNull();
+diff --git a/web/src/shell/aeAgentsPaneModel.test.ts b/web/src/shell/aeAgentsPaneModel.test.ts
+index b5819f79d03174f2ca87187d732e9f17e86b9a30..7fa7b764430c594536bc205cdb9c8a2534ba13a0 100644
+--- a/web/src/shell/aeAgentsPaneModel.test.ts
++++ b/web/src/shell/aeAgentsPaneModel.test.ts
+@@ -1,6 +1,7 @@
+ import { describe, expect, it } from "vitest";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+ import {
++  agentModelLabel,
+   canStopChild,
+   childElapsedSeconds,
+   childLastLine,
+@@ -80,6 +81,15 @@ describe("splitAgentSections", () => {
+   });
+ });
+ 
++describe("agentModelLabel", () => {
++  it("reads Claude ids as names and leaves other ids as the harness spelled them", () => {
++    expect(agentModelLabel("claude-sonnet-5-5")).toBe("Sonnet 5.5");
++    expect(agentModelLabel("databricks-claude-opus-5-5")).toBe("Opus 5.5");
++    expect(agentModelLabel("claude-opus-5-5[1m]")).toBe("Opus 5.5");
++    expect(agentModelLabel("gpt-5.6-sol")).toBe("gpt-5.6-sol");
++  });
++});
++
+ describe("clearCutoff", () => {
+   it("is the newest finish time, never older than the last clear", () => {
+     expect(
+diff --git a/web/src/shell/aeAgentsPaneModel.ts b/web/src/shell/aeAgentsPaneModel.ts
+index 759d1f2baff9d19801e170047545b82c7fc1a311..691432e448a5ff1e36fffe82ccc26e7899743db6 100644
+--- a/web/src/shell/aeAgentsPaneModel.ts
++++ b/web/src/shell/aeAgentsPaneModel.ts
+@@ -2,6 +2,7 @@
+ // rows are live, how long each ran, what last line to show, and
+ // which rows OmniGent can actually stop (2026-10-15).
+ 
++import { aeModelName } from "@/components/aeSessionContext";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+ import { nativeCodingAgentForSubagentWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
+ import { childStatus, type AgentActivity } from "./subagentStatus";
+@@ -98,6 +99,16 @@ export function canStopChild(child: ChildSessionInfo): boolean {
+   return !isChildFinished(child) && !isNativeSubagentMirror(child);
+ }
+ 
++/**
++ * A model id as the Model column prints it: "claude-sonnet-5-5" reads
++ * "Sonnet 5.5", a gateway's "databricks-" prefix is dropped, and any other
++ * id (a GPT model, say) prints as the harness spelled it.
++ */
++export function agentModelLabel(model: string): string {
++  const id = model.trim().replace(/^databricks-/i, "");
++  return aeModelName(id) ?? id;
++}
++
+ const INJECTED_CONTEXT_PREFIX = "<system-reminder>";
+ 
+ /**

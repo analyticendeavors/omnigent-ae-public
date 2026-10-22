@@ -1,0 +1,241 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 18 Oct 2026 19:04:41 -0700
+Subject: [PATCH 092/148] [ae-patch] Show a permanent context answer at once
+ instead of retrying it
+
+An unavailable context answer that retrying can never fix now carries final: true: a session whose runner reports another harness, and a host without the Linux /proc interface. The web treats a final answer as settled, shows its reason at once with no Try again and schedules no quiet retry. A session whose harness the runner does not know yet answers pending, since its spec has not loaded. Answers without final keep the earlier rules.
+---
+ omnigent/runner/ae_context_usage.py           | 23 ++++++++++++------
+ tests/runner/test_ae_context_usage.py         | 24 ++++++++++++++++++-
+ web/src/components/aeContextUsage.test.tsx    | 19 +++++++++++++++
+ web/src/components/aeContextUsage.ts          | 19 +++++++--------
+ .../components/aeRail/AeRailContext.test.tsx  | 11 +++++++++
+ web/src/components/aeRail/AeRailContext.tsx   |  4 ++++
+ 6 files changed, 81 insertions(+), 19 deletions(-)
+
+diff --git a/omnigent/runner/ae_context_usage.py b/omnigent/runner/ae_context_usage.py
+index 3c63ec194269030100c9e20dd2975975303e58b3..a8990e71c0125c2ce16a01b0ebcbeac5e06fb923 100644
+--- a/omnigent/runner/ae_context_usage.py
++++ b/omnigent/runner/ae_context_usage.py
+@@ -29,11 +29,11 @@ _locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictio
+ 
+ 
+ class ContextNotReady(ValueError):
+-    """Claude has not started yet: no statusLine reading, no session id or no live process.
++    """Claude has not started yet; the route answers ``pending`` with no backoff."""
+ 
+-    The route answers ``pending`` for these, records no failure and starts no backoff, so
+-    the web keeps the rail loading and asks again instead of showing an error.
+-    """
++
++class ContextUnsupported(ValueError):
++    """Retrying can never succeed in this session; the route answers ``final``."""
+ 
+ 
+ class _RecentFailure(ValueError):
+@@ -55,6 +55,8 @@ def launch_config(
+     session_id = raw.get("session_id")
+     if not isinstance(session_id, str) or not session_id:
+         raise ContextNotReady("No Claude session reading yet. Send a message first.")
++    if not process_root.is_dir():
++        raise ContextUnsupported("Context categories need the Linux /proc interface.")
+     settings_path = str(bridge / "claude-settings.json")
+     for proc in sorted(process_root.glob("[0-9]*"), key=lambda p: int(p.name), reverse=True):
+         try:
+@@ -395,6 +397,9 @@ async def _probe(command: list[str], env: dict[str, str], cwd: str) -> dict[str,
+         await proc.wait()
+ 
+ 
++_PENDING = {"available": False, "pending": True, "reason": "Claude is starting."}
++
++
+ def _log_detail(exc: BaseException) -> str:
+     """The message's first line with every path cut to its last part; never config or env."""
+     text = exc.strerror if isinstance(exc, OSError) and exc.strerror else str(exc)
+@@ -408,10 +413,14 @@ async def handle_context_usage(
+     from omnigent.harnesses.claude_native.bridge import bridge_dir_for_bridge_id
+     from omnigent.runner.native import _claude_native_bridge_id_for_session
+ 
++    if harness is None:
++        # The runner has not loaded this session's spec yet: starting, not final.
++        return JSONResponse(_PENDING)
+     if harness != "claude-native":
+         return JSONResponse(
+             {
+                 "available": False,
++                "final": True,
+                 "reason": "Context categories require a running Claude Code session.",
+             }
+         )
+@@ -444,9 +453,9 @@ async def handle_context_usage(
+             return JSONResponse(answer)
+         except ContextNotReady:
+             # Claude is still starting (or not running): not a failure, so no backoff.
+-            return JSONResponse(
+-                {"available": False, "pending": True, "reason": "Claude is starting."}
+-            )
++            return JSONResponse(_PENDING)
++        except ContextUnsupported as exc:
++            return JSONResponse({"available": False, "final": True, "reason": str(exc)})
+         except (
+             OSError,
+             ValueError,
+diff --git a/tests/runner/test_ae_context_usage.py b/tests/runner/test_ae_context_usage.py
+index d653af493d6c519949eb3c6534c8e6a52ccc3a05..45e6cde90204c1c7ff70fa0ce457fd5bf510ea82 100644
+--- a/tests/runner/test_ae_context_usage.py
++++ b/tests/runner/test_ae_context_usage.py
+@@ -92,10 +92,32 @@ async def test_unsupported_harness_never_probes(monkeypatch):
+     probe = AsyncMock()
+     monkeypatch.setattr(usage, "probe", probe)
+     response = await usage.handle_context_usage("session", harness="codex", server_client=None)
+-    assert json.loads(response.body)["available"] is False
++    body = json.loads(response.body)
++    assert body["available"] is False
++    assert body["final"] is True
++    probe.assert_not_called()
++
++
++@pytest.mark.asyncio
++async def test_unknown_harness_is_pending_not_final(monkeypatch):
++    """The runner has not loaded the session's spec yet; that is starting, not final."""
++    probe = AsyncMock()
++    monkeypatch.setattr(usage, "probe", probe)
++    response = await usage.handle_context_usage("session", harness=None, server_client=None)
++    body = json.loads(response.body)
++    assert body["pending"] is True
++    assert "final" not in body
+     probe.assert_not_called()
+ 
+ 
++def test_no_proc_interface_is_final(tmp_path):
++    bridge = tmp_path / "bridge"
++    bridge.mkdir()
++    (bridge / "context_raw.json").write_text(json.dumps({"session_id": "live"}))
++    with pytest.raises(usage.ContextUnsupported):
++        usage.launch_config(bridge, process_root=tmp_path / "missing")
++
++
+ @pytest.mark.asyncio
+ async def test_concurrent_reads_share_cached_probe(monkeypatch):
+     import omnigent.runner.native as native
+diff --git a/web/src/components/aeContextUsage.test.tsx b/web/src/components/aeContextUsage.test.tsx
+index 4154c780e4e5bdb81722dc2d6494c7a79425d523..a2d58bdd296acc99a365d09e132ceb950f9b1c05 100644
+--- a/web/src/components/aeContextUsage.test.tsx
++++ b/web/src/components/aeContextUsage.test.tsx
+@@ -240,6 +240,25 @@ describe("while Claude starts", () => {
+     expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+   });
+ 
++  it("shows a final answer at once, retries nothing and reuses it", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      ok({ available: false, final: true, reason: "Another harness." }),
++    );
++    const { result, unmount } = renderHook(() =>
++      useAeContextSnapshot("conv_a", { enabled: true, identity }),
++    );
++    await advance(0);
++    expect(result.current.pending).toBe(false);
++    expect(result.current.loading).toBe(false);
++    expect(result.current.data?.reason).toBe("Another harness.");
++    await advance(60_000);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
++    unmount();
++    renderHook(() => useAeContextSnapshot("conv_a", { enabled: true, identity }));
++    await advance(0);
++    expect(authenticatedFetch).toHaveBeenCalledTimes(1);
++  });
++
+   it("cancels the quiet retry when the last subscriber goes", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() => ok(PENDING));
+     const { unmount } = renderHook(() =>
+diff --git a/web/src/components/aeContextUsage.ts b/web/src/components/aeContextUsage.ts
+index 7d93c3ae9cc954a162991290ead6f801e4ff1ec1..50891a7d64f44c7cc71d003d123b7722459d4fe3 100644
+--- a/web/src/components/aeContextUsage.ts
++++ b/web/src/components/aeContextUsage.ts
+@@ -3,14 +3,8 @@
+ // Claude process on the runner, so one request per session and identity is in
+ // flight at a time and a result is reused for three minutes.
+ //
+-// While Claude is still starting the runner answers `pending` (no statusLine
+-// reading, session id or process yet). Those answers, and any other
+-// unavailable answer that is not `offline`, are never cached as a result: the
+-// store keeps the sections loading and asks again quietly for about two
+-// minutes before it lets the error and "Try again" show. Only `offline` (the
+-// runner or host is gone) shows the error at once. Each turn end asks again.
+-// (2026-10-18: a new session showed "Could not read Claude context" until a
+-// manual refresh, because the first read raced Claude's start.)
++// A `pending` or other unavailable answer is retried quietly for about two
++// minutes; `offline` and `final` answers show at once. Each turn end asks again.
+ 
+ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+ import { authenticatedFetch } from "@/lib/identity";
+@@ -29,6 +23,8 @@ export interface ContextUsage {
+   pending?: boolean;
+   /** The runner or its host did not answer: a lost connection. */
+   offline?: boolean;
++  /** Retrying can never succeed in this session (another harness, no /proc). */
++  final?: boolean;
+   categories: ContextCategory[];
+   totalTokens: number;
+   maxTokens: number;
+@@ -143,10 +139,11 @@ function update(entry: Entry, value: Partial<SnapshotValue>): void {
+   for (const listener of entry.listeners) listener();
+ }
+ 
+-/** Only a real snapshot counts as fresh; an unavailable answer is asked again. */
++/** A real snapshot or a final answer is settled; any other unavailable one is asked again. */
+ function isFresh(entry: Entry, now: number): boolean {
++  const data = entry.value.data;
+   return (
+-    entry.value.data?.available === true &&
++    (data?.available === true || data?.final === true) &&
+     now - (entry.value.receivedAt ?? 0) < AE_CONTEXT_SNAPSHOT_TTL_MS
+   );
+ }
+@@ -172,7 +169,7 @@ function schedule(entry: Entry): void {
+ /** Store an answer; a not-ready one schedules a quiet retry until the window ends. */
+ function settle(entry: Entry, data: ContextUsage): void {
+   const now = Date.now();
+-  if (data.available || data.offline) {
++  if (data.available || data.offline || data.final) {
+     resetRetry(entry);
+     update(entry, { data, error: undefined, receivedAt: now, inFlight: false, pending: false });
+     return;
+diff --git a/web/src/components/aeRail/AeRailContext.test.tsx b/web/src/components/aeRail/AeRailContext.test.tsx
+index ae770066a1f9024d226a46efe58e0a16d601cfe4..4226dbd62a8c020989960bd1104e46c7df2a04bf 100644
+--- a/web/src/components/aeRail/AeRailContext.test.tsx
++++ b/web/src/components/aeRail/AeRailContext.test.tsx
+@@ -122,6 +122,17 @@ describe("AeRailContext", () => {
+     expect(screen.getByRole("button", { name: "Try again" })).toBeTruthy();
+   });
+ 
++  it("shows a final answer's reason at once with no Try again", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ available: false, final: true, reason: "Not a Claude Code session." }),
++    );
++    setSession("claude-native");
++    render(<AeRailContext sessionId={sessionId} />);
++    expect(await screen.findByText("Not a Claude Code session.")).toBeTruthy();
++    expect(screen.queryByRole("button", { name: "Try again" })).toBeNull();
++    expect(contextCalls()).toBe(1);
++  });
++
+   it("reads quietly while Claude starts, then shows the snapshot", async () => {
+     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+     vi.mocked(authenticatedFetch)
+diff --git a/web/src/components/aeRail/AeRailContext.tsx b/web/src/components/aeRail/AeRailContext.tsx
+index 594f9544b35f518e4e8b6c3f168b79449b29a1a1..21f44d9435cde7839ca75966b2eb739ff46ff65f 100644
+--- a/web/src/components/aeRail/AeRailContext.tsx
++++ b/web/src/components/aeRail/AeRailContext.tsx
+@@ -105,6 +105,10 @@ function SnapshotStatus({ snapshot }: { snapshot: AeContextSnapshotState }) {
+   // Claude is still starting and the store is retrying: loading, never "Try again".
+   if (snapshot.pending) return <AeRailMuted>Reading context categories…</AeRailMuted>;
+   const unavailable = snapshot.data && !snapshot.data.available ? snapshot.data : null;
++  // Retrying cannot change a final answer, so it gets no button.
++  if (!snapshot.error && unavailable?.final && unavailable.reason) {
++    return <AeRailMuted>{unavailable.reason}</AeRailMuted>;
++  }
+   if (snapshot.error || unavailable) {
+     return (
+       <TryAgain
