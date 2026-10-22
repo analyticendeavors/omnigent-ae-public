@@ -956,7 +956,13 @@ def test_image_workflow_triggers_and_permissions() -> None:
     assert on["push"] == {"tags": ["ae-v*"]}
     assert on["workflow_dispatch"]["inputs"]["push"]["type"] == "boolean"
     assert on["workflow_dispatch"]["inputs"]["push"]["default"] is False
-    assert wf["permissions"] == {"contents": "read", "packages": "write"}
+    assert wf["permissions"] == {"contents": "read"}, "writes belong to the job"
+    assert wf["jobs"]["image"]["permissions"] == {
+        "contents": "read",
+        "packages": "write",
+        "id-token": "write",
+        "attestations": "write",
+    }
     assert "concurrency" in wf and "group" in wf["concurrency"]
     assert wf["env"] == {"AE_IMAGE": "${{ vars.AE_IMAGE }}"}, (
         "IMAGE is written by the decide step, never derived a second time"
@@ -1099,6 +1105,66 @@ def test_image_workflow_accepts_nested_and_separated_names(tmp_path: Path, value
     assert f"IMAGE={value}\n" in written
 
 
+def test_image_workflow_attests_only_a_pushed_public_image() -> None:
+    steps = _workflow()["jobs"]["image"]["steps"]
+    names = [s.get("name") for s in steps]
+    attest = steps[names.index("Attest the build provenance")]
+    assert names.index("Attest the build provenance") == names.index("Push the tag") + 1
+    assert attest["if"] == "env.PUSH == 'true' && github.event.repository.private == false"
+    assert attest["uses"].startswith("actions/attest-build-provenance@")
+    assert attest["with"] == {
+        "subject-name": "${{ env.IMAGE }}",
+        "subject-digest": "${{ env.IMAGE_DIGEST }}",
+        "push-to-registry": True,
+    }
+    push = steps[names.index("Push the tag")]["run"]
+    assert 'docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG"' in push
+    assert 'echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"' in push
+
+
+# Every third-party action is pinned to a commit, with its release in a
+# comment for Dependabot to keep current (2026-10-22): a moved tag cannot
+# change what runs.
+PINNED_USES = re.compile(r"^\s*(?:- )?uses: [\w.-]+/[\w./-]+@[0-9a-f]{40} # v\d+(?:\.\d+)*\s*$")
+
+
+@pytest.mark.parametrize("workflow", sorted(WORKFLOWS.glob("*.yml")), ids=lambda p: p.name)
+def test_workflow_actions_are_pinned_to_a_commit(workflow: Path) -> None:
+    for number, line in enumerate(workflow.read_text().splitlines(), 1):
+        if "uses:" in line and not line.lstrip().startswith("#"):
+            if "uses: ./" in line or "uses: docker://" in line:
+                continue  # a local action or a container image, not a tag to pin
+            assert PINNED_USES.match(line), (
+                f"{workflow.name}:{number} is not pinned: {line.strip()}"
+            )
+
+
+def test_scorecard_runs_only_on_a_public_repository() -> None:
+    wf = yaml.safe_load((WORKFLOWS / "scorecard.yml").read_text())
+    assert wf["permissions"] == "read-all"
+    analysis = wf["jobs"]["analysis"]
+    assert analysis["needs"] == "visibility"
+    assert analysis["if"] == "needs.visibility.outputs.public == 'true'"
+    # Scorecard refuses to publish from a job with run steps or a job env.
+    assert "env" not in analysis
+    assert all("run" not in step for step in analysis["steps"])
+    read = wf["jobs"]["visibility"]["steps"][0]["run"]
+    assert read.lstrip().startswith("set -euo pipefail")
+    assert "${{" not in read
+
+
+def test_dependabot_leaves_the_upstream_pin_alone() -> None:
+    path = ROOT / ".github" / "dependabot.yml"
+    if not path.exists():
+        pytest.skip("no Dependabot config: the public sync leaves it out on purpose")
+    config = yaml.safe_load(path.read_text())
+    ecosystems = {u["package-ecosystem"] for u in config["updates"]}
+    assert ecosystems == {"github-actions", "pip", "npm", "docker"}
+    assert "gitsubmodule" not in ecosystems, "upstream moves with upstream.lock and the patches"
+    pip = next(u for u in config["updates"] if u["package-ecosystem"] == "pip")
+    assert {"dependency-name": "omnigent"} in pip["ignore"]
+
+
 def test_image_workflow_passes_actionlint() -> None:
     if _tool("actionlint") is None:
         _skip_missing("actionlint", "uv tool install actionlint-py")
@@ -1108,6 +1174,7 @@ def test_image_workflow_passes_actionlint() -> None:
             str(IMAGE_WORKFLOW.relative_to(ROOT)),
             str((WORKFLOWS / "ci.yml").relative_to(ROOT)),
             str((WORKFLOWS / "patch-rebase.yml").relative_to(ROOT)),
+            str((WORKFLOWS / "scorecard.yml").relative_to(ROOT)),
         ],
         cwd=ROOT,
         capture_output=True,

@@ -386,6 +386,27 @@ describe("Your move", () => {
     expect(target.textContent).toContain("the server has no GitHub token");
   });
 
+  it("asks for AE_GITHUB_REPOS when the token is there but no repos are", () => {
+    const { context } = stubContext();
+    const target = document.createElement("div");
+    const noRepos: YourMove = {
+      ...DATA,
+      pulls: {
+        ok: true,
+        configured: false,
+        login: "",
+        repos: [],
+        items: [],
+        errors: [],
+        note: "Pull requests are off: no repos to read.",
+        missing: "repos",
+      },
+    };
+    renderYourMoveSection(target, { data: noRepos, error: null }, { context, refresh: vi.fn() });
+    expect(target.textContent).toContain("Set AE_GITHUB_REPOS");
+    expect(target.textContent).not.toContain("no GitHub token");
+  });
+
   it("collapses to its heading when nothing waits", () => {
     const { context } = stubContext();
     const target = hosts();

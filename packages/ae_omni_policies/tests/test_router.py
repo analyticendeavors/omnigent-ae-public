@@ -7,6 +7,7 @@ import logging
 import time
 from collections.abc import Iterator
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -16,7 +17,7 @@ from fastapi import FastAPI, Request
 from omnigent.runtime import get_conversation_store
 from tests.server.helpers import create_test_session
 
-from ae_omni_policies import __version__, auth, deploy_hold, labels
+from ae_omni_policies import __version__, auth, deploy_hold, labels, slot_limit
 from ae_omni_policies import router as router_module
 from ae_omni_policies.taskstore import ORIGIN_SURFACE
 
@@ -150,6 +151,35 @@ async def test_capacity_reports_the_configured_limit(
     response = await client.get("/v1/ae/capacity")
     assert response.status_code == 200, response.text
     assert response.json()["limit"] == 4
+
+
+class _SlotCapStore:
+    """A policy store holding one enabled slot cap with *limit* (what slot_limit reads)."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+
+    def list_defaults(self) -> list[Any]:
+        return [
+            SimpleNamespace(
+                handler=slot_limit.HANDLER, enabled=True, factory_params={"limit": self.limit}
+            )
+        ]
+
+
+async def test_capacity_reports_the_limit_set_on_the_settings_page(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 2026-10-22: a limit on the slot cap (Settings > Global Policies) replaces
+    # AE_SLOT_LIMIT for every count, so the Dashboard and the sidebar match the cap.
+    monkeypatch.setattr(labels, "SLOT_LIMIT", 4)
+    slot_limit.remember_store(_SlotCapStore(5))
+    try:
+        capacity = (await client.get("/v1/ae/capacity")).json()
+        listed = (await client.get("/v1/ae/sessions")).json()
+    finally:
+        slot_limit.remember_store(None)
+    assert (capacity["limit"], listed["limit"]) == (5, 5)
 
 
 async def test_lot_maps_the_store(client: httpx.AsyncClient) -> None:
@@ -1054,6 +1084,26 @@ async def test_start_session_returns_the_live_one_for_the_same_key(
     assert listed["slots_used"] == 1
 
 
+async def test_start_session_holds_at_the_limit_set_on_the_settings_page(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> None:
+    # 2026-10-22: the orchestrator's slot hold counts against the page's limit too.
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    for title in ("One", "Two"):
+        await _session(client, title, {labels.STATUS: "working"})
+    slot_limit.remember_store(_SlotCapStore(2))
+    try:
+        full = await client.post("/v1/ae/sessions", json=START)
+    finally:
+        slot_limit.remember_store(None)
+    assert full.status_code == 409, full.text
+    error = full.json()["error"]
+    assert error["message"].startswith("Slots full: 2 of 2 working.")
+    assert error["limit"] == 2
+    assert app.calls == []
+
+
 async def test_start_session_at_the_limit_asks_unless_riding(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
 ) -> None:
@@ -1329,6 +1379,19 @@ async def test_deploy_hold_is_admin_only(
     # Nothing a non-admin sent changed the hold.
     after = (await client.get("/v1/ae/deploy/hold", headers=reid)).json()
     assert after["held"] is True and after["until"] == held.json()["until"]
+
+
+async def test_azure_cost_is_admin_only(client: httpx.AsyncClient, ae_admins: set[str]) -> None:
+    # Tenant spend and resource names are for admins (2026-10-22).
+    refused = await client.get(
+        "/v1/ae/azure-cost", headers={"X-Forwarded-Email": "steve@example.com"}
+    )
+    assert refused.status_code == 403, refused.text
+    assert refused.json()["error"]["code"] == "admin_only"
+    allowed = await client.get(
+        "/v1/ae/azure-cost", headers={"X-Forwarded-Email": "reid@example.com"}
+    )
+    assert allowed.status_code == 200, allowed.text
 
 
 async def test_deploy_hold_reports_a_corrupt_file_as_not_held(

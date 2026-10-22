@@ -252,6 +252,7 @@ async def test_pulls_by_or_awaiting_reid_with_ci_state(
 ) -> None:
     monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
     monkeypatch.setenv("AE_GITHUB_REPOS", "analyticendeavors/omnigent-ae, not a repo")
+    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-reid-havens")
     repo = "/repos/analyticendeavors/omnigent-ae"
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
@@ -301,6 +302,10 @@ async def test_one_repo_failing_keeps_the_other(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv(
+        "AE_GITHUB_REPOS", "analyticendeavors/omnigent-ae,analyticendeavors/agents-and-automation"
+    )
+    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-reid-havens")
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
         mock.get(f"{GH}/repos/analyticendeavors/omnigent-ae/pulls").respond(
@@ -356,11 +361,79 @@ def test_ci_state(runs: list[dict[str, Any]], state: str) -> None:
     assert github.ci_state(runs) == state
 
 
+async def test_no_repos_asks_for_them_without_calling_github(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
+    monkeypatch.delenv("AE_GITHUB_REPOS", raising=False)
+    with respx.mock(assert_all_called=False) as mock:
+        _mock_store(mock)
+        github_route = mock.get(url__startswith=GH)
+        pulls = (await client.get("/v1/ae/your-move")).json()["pulls"]
+    assert pulls["configured"] is False
+    assert pulls["items"] == []
+    assert "AE_GITHUB_REPOS" in pulls["note"]
+    assert not github_route.called
+
+
+async def test_the_login_defaults_to_the_tokens_own(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
+    monkeypatch.setenv("AE_GITHUB_REPOS", "juniper-outfitters/storefront")
+    monkeypatch.delenv("AE_GITHUB_LOGIN", raising=False)
+    github.reset_login_cache()
+    repo = "/repos/juniper-outfitters/storefront"
+    with respx.mock(assert_all_called=False) as mock:
+        _mock_store(mock)
+        me = mock.get(f"{GH}/user").respond(200, json={"login": "octo"})
+        mock.get(f"{GH}{repo}/pulls").respond(
+            200, json=[_pull(7, "octo", [], "f" * 40), _pull(8, "someone", [], "c" * 40)]
+        )
+        mock.get(f"{GH}{repo}/commits/{'f' * 40}/check-runs").respond(200, json={"check_runs": []})
+        pulls = (await client.get("/v1/ae/your-move")).json()["pulls"]
+    assert me.called
+    assert pulls["login"] == "octo"
+    assert [item["number"] for item in pulls["items"]] == [7]
+
+
+async def test_a_token_without_a_login_says_to_set_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    github.reset_login_cache()
+    settings = github.GitHubSettings.from_env(
+        {"AE_GITHUB_TOKEN": TOKEN, "AE_GITHUB_REPOS": "juniper-outfitters/storefront"}
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        mock.get(f"{GH}/user").respond(
+            403, json={"message": "Resource not accessible by integration"}
+        )
+        listed = mock.get(url__startswith=f"{GH}/repos/")
+        async with github.GitHubClient(settings) as client:
+            answer = await client.open_pulls()
+    assert answer["pulls"] == []
+    (error,) = answer["errors"]
+    assert error["repo"] == "GitHub"
+    assert "set AE_GITHUB_LOGIN" in error["message"]
+    assert not listed.called
+
+
+async def test_the_tokens_login_is_read_once() -> None:
+    github.reset_login_cache()
+    settings = github.GitHubSettings.from_env({"AE_GITHUB_TOKEN": TOKEN})
+    with respx.mock() as mock:
+        me = mock.get(f"{GH}/user").respond(200, json={"login": "octo"})
+        for _ in range(2):
+            async with github.GitHubClient(settings) as client:
+                assert await client.login() == "octo"
+    assert me.call_count == 1
+
+
 def test_settings_default_and_filter() -> None:
     settings = github.GitHubSettings.from_env({"AE_GITHUB_REPOS": "../etc, a/b"})
     assert settings.repos == ("a/b",)
     assert settings.configured is False
-    assert github.GitHubSettings.from_env({}).login == "ae-reid-havens"
+    # No AE repos or login by default (2026-10-22).
+    assert github.GitHubSettings.from_env({}).login == ""
+    assert github.GitHubSettings.from_env({}).repos == ()
     assert github.GitHubSettings.from_env({}).api_url == "https://api.github.com"
     local = github.GitHubSettings.from_env({"AE_GITHUB_API_URL": "http://127.0.0.1:8788/"})
     assert local.api_url == "http://127.0.0.1:8788"
@@ -371,6 +444,7 @@ async def test_pulls_keep_their_own_cache_through_fresh(
 ) -> None:
     monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
     monkeypatch.setenv("AE_GITHUB_REPOS", "analyticendeavors/omnigent-ae")
+    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-reid-havens")
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
         listed = mock.get(f"{GH}/repos/analyticendeavors/omnigent-ae/pulls").respond(200, json=[])

@@ -157,7 +157,7 @@ const mutedLines = (node: ParentNode) =>
 
 /** The card's buttons, not its header's fold toggle (board.ts). */
 const buttons = (node: ParentNode) => [
-  ...node.querySelectorAll<HTMLButtonElement>("button:not(.admin-card-toggle)"),
+  ...node.querySelectorAll<HTMLButtonElement>("button:not(.admin-card-toggle):not(.admin-grip)"),
 ];
 
 /** A segment of the hold control reads "1 h" and is named "Hold 1 h". */

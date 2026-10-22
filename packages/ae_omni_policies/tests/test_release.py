@@ -25,7 +25,8 @@ TAGS = f"{GH}/repos/analyticendeavors/omnigent-ae/git/matching-refs/tags/ae-v"
 def _env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     release.reset_cache()
     monkeypatch.setenv("AE_GITHUB_TOKEN", "test-token")
-    monkeypatch.delenv("AE_RELEASE_REPO", raising=False)
+    # AE's box sets its private repo; the default is the public one (2026-10-22).
+    monkeypatch.setenv("AE_RELEASE_REPO", "analyticendeavors/omnigent-ae")
     monkeypatch.delenv("AE_GITHUB_API_URL", raising=False)
     monkeypatch.setenv("OMNIGENT_IMAGE_TAG", "ae-v0.16.0.34")
     monkeypatch.setenv("AE_SERVER_ENV_EXAMPLE", "/nonexistent-ae-config/server.env.example")
@@ -116,6 +117,10 @@ async def test_an_answer_that_is_not_a_list_of_refs_is_an_error_not_a_500() -> N
         mock.get(TAGS).mock(return_value=httpx.Response(200, json={"ref": "x"}))
         odd = await release.status()
     assert odd["state"] == "unknown" and "no list" in odd["error"]
+
+
+def test_the_default_release_repo_is_the_public_one() -> None:
+    assert release.DEFAULT_REPO == "analyticendeavors/omnigent-ae-public"
 
 
 async def test_settings_the_example_sets_and_the_env_lacks_are_listed(

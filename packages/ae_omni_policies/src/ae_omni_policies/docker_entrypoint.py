@@ -270,8 +270,11 @@ def install() -> None:
                 kwargs[key] = value
         if kwargs.get("policy_store") is not None:
             from ae_omni_policies.policy_seed import seed_policies
+            from ae_omni_policies.slot_limit import remember_store
 
             seed_policies(kwargs["policy_store"], cfg, kwargs.get("policy_modules"))
+            # The slot counts follow the slot cap's limit on Settings (2026-10-22).
+            remember_store(kwargs["policy_store"])
         app = original(*args, **kwargs)
         from ae_omni_policies.session_cookie import install as install_cookie_expiry
 

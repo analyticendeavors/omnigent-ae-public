@@ -9,12 +9,18 @@
 // last card stretches, so every column ends on the same line. Which card goes
 // in which column depends on the page's width, so the cards move between
 // column elements when it changes:
-//   three columns (1040 px of page and up): Deploys over Databricks credit,
-//     then Accounts over Compute, then Box health;
-//   two columns (520 px and up): Deploys over Compute, Accounts over
-//     Databricks credit over Box health;
-//   one column (a phone): Deploys, Accounts, Compute, Databricks credit, Box
-//     health.
+//   three columns (1040 px of page and up): Deploys over Box health, then
+//     Accounts over Compute, then Azure spend over Databricks credit;
+//   two columns (520 px and up): Deploys over Box health over Compute,
+//     Accounts over Azure spend over Databricks credit;
+//   one column (a phone): Deploys, Accounts, Compute, Databricks credit,
+//     Azure spend, Box health.
+// 2026-10-22: the Azure spend card (azure.ts) joined. The same day Reid chose
+// the columns above (Box health under Deploys, Databricks credit under Azure
+// spend, which closes the holes the old defaults left) and asked to drag a
+// card elsewhere: on two and three columns each header has a grip
+// (boardDrag.ts), the arrangement is saved per column count (boardLayout.ts)
+// and "Reset layout" brings the defaults back. A phone is not arranged.
 // 2026-10-21: the Accounts card (accounts.ts) joined, at the head of the
 // middle column, where the account nearest its limit reads first.
 // The width comes from a ResizeObserver on the page (the window's resize where
@@ -27,28 +33,30 @@
 // they need attention (a tile amber or red: the host not connected, a secret
 // missing). On a wider page every card is open and the header is not a toggle.
 
+import { arrangement, type Defaults, onLayoutChange } from "./boardLayout";
+import { enableDrag } from "./boardDrag";
 import { type Child, el } from "./dom";
-import { foldIcon } from "./icons";
+import { foldIcon, gripIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
 import { getTile, type Health, onTiles, type TileId, worst } from "./tiles";
 
-export type CardId = "deploys" | "accounts" | "compute" | "credit" | "box";
+export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box";
 
 export const THREE_COLUMNS_PX = 1040;
 export const TWO_COLUMNS_PX = 520;
 
 /** The cards in each column, by column count. */
-export const LAYOUTS: Record<1 | 2 | 3, CardId[][]> = {
+export const LAYOUTS: Defaults = {
   3: [
-    ["deploys", "credit"],
+    ["deploys", "box"],
     ["accounts", "compute"],
-    ["box"],
+    ["azure", "credit"],
   ],
   2: [
-    ["deploys", "compute"],
-    ["accounts", "credit", "box"],
+    ["deploys", "box", "compute"],
+    ["accounts", "azure", "credit"],
   ],
-  1: [["deploys", "accounts", "compute", "credit", "box"]],
+  1: [["deploys", "accounts", "compute", "credit", "azure", "box"]],
 };
 
 /** The tiles whose health and values a card's folded header line carries. */
@@ -57,6 +65,7 @@ export const CARD_TILES: Record<CardId, TileId[]> = {
   accounts: ["accounts"],
   compute: ["fabric", "databricks"],
   credit: ["credit"],
+  azure: ["azure"],
   box: ["host", "secrets"],
 };
 
@@ -155,6 +164,14 @@ export function adminCard(
     el("span", { class: "admin-card-sum" }),
     foldIcon(),
   );
+  // Drag handle, shown on two and three columns only (style.css).
+  const grip = el("button", {
+    type: "button",
+    class: "admin-grip",
+    title: `Drag to move ${title}`,
+    "aria-label": `Move ${title}. Drag, or use the arrow keys.`,
+  });
+  grip.appendChild(gripIcon());
   const node = el(
     "section",
     { class: `admin-card admin-card-${id}`, "data-card": id, "aria-labelledby": `admin-${id}-h` },
@@ -163,6 +180,7 @@ export function adminCard(
       { class: "admin-card-top" },
       el("h2", { class: "admin-card-h", id: `admin-${id}-h` }, toggle),
       ...extra,
+      grip,
     ),
     el("div", { class: "admin-card-body", id: `admin-${id}-body` }, ...body),
   );
@@ -198,11 +216,21 @@ function applyFold(card: HTMLElement, phone: boolean): void {
   card.dataset.health = cardHealth(id);
 }
 
-/** Put the cards in *n* columns of *board*, keeping the focus where it was. */
-export function arrange(board: HTMLElement, cards: Record<CardId, HTMLElement>, n: 1 | 2 | 3): void {
-  if (board.dataset.columns !== String(n)) {
+/**
+ * Put the cards in *n* columns of *board*, keeping the focus where it was.
+ * *force* lays them out again even when the column count is unchanged (a
+ * saved arrangement changed).
+ */
+export function arrange(
+  board: HTMLElement,
+  cards: Record<CardId, HTMLElement>,
+  n: 1 | 2 | 3,
+  force = false,
+): void {
+  if (force || board.dataset.columns !== String(n)) {
     const focused = document.activeElement as HTMLElement | null;
-    const columns = LAYOUTS[n].map((ids) =>
+    const known = Object.keys(cards) as CardId[];
+    const columns = arrangement(n, LAYOUTS, known).map((ids) =>
       el("div", { class: "admin-col" }, ...ids.map((id) => cards[id])),
     );
     board.replaceChildren(...columns);
@@ -212,6 +240,8 @@ export function arrange(board: HTMLElement, cards: Record<CardId, HTMLElement>, 
     }
   }
   for (const card of Object.values(cards)) applyFold(card, n === 1);
+  // The Reset layout button shows or hides with the column count (fabric.ts).
+  board.dispatchEvent(new Event("admin-arranged"));
 }
 
 /**
@@ -226,12 +256,19 @@ export function mountBoard(
   cards: Record<CardId, HTMLElement>,
 ): { stop: () => void; refold: () => void } {
   let width = page.clientWidth || window.innerWidth;
-  const layout = () => arrange(board, cards, columnsFor(width));
+  const layout = (force = false) => arrange(board, cards, columnsFor(width), force);
   const refold = () => {
     for (const card of Object.values(cards)) applyFold(card, board.dataset.columns === "1");
   };
   layout();
   const stopTiles = onTiles(refold);
+  const stopLayout = onLayoutChange(() => layout(true));
+  const stopDrag = enableDrag(board, cards);
+  const stopAll = () => {
+    stopTiles();
+    stopLayout();
+    stopDrag();
+  };
   if (typeof ResizeObserver !== "undefined") {
     const observer = new ResizeObserver((entries) => {
       const next = entries[entries.length - 1]?.contentRect.width;
@@ -243,7 +280,7 @@ export function mountBoard(
     return {
       stop: () => {
         observer.disconnect();
-        stopTiles();
+        stopAll();
       },
       refold,
     };
@@ -256,7 +293,7 @@ export function mountBoard(
   return {
     stop: () => {
       window.removeEventListener("resize", onResize);
-      stopTiles();
+      stopAll();
     },
     refold,
   };

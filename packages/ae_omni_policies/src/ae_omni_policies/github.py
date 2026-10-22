@@ -12,10 +12,13 @@ so this reads an optional one from the environment:
   needs Contents and Pull requests read and write, Checks and Commit statuses
   read, and Workflows read and write for a pull request that changes
   ``.github/workflows`` (deploy/README.md, "The GitHub token", has the list).
-- ``AE_GITHUB_REPOS``: comma-separated ``owner/repo`` list, default
-  :data:`DEFAULT_REPOS`.
-- ``AE_GITHUB_LOGIN``: whose pull requests count, default
-  :data:`DEFAULT_LOGIN`.
+- ``AE_GITHUB_REPOS``: comma-separated ``owner/repo`` list for Your move's
+  pull requests; none by default, and the section says to set it
+  (:data:`NO_REPOS`).
+- ``AE_GITHUB_LOGIN``: whose pull requests count; by default the token's own
+  login, read from ``GET /user`` once per token for the life of the process
+  (2026-10-22: the defaults used to name Analytic Endeavors' repos and login).
+  A token that cannot read ``/user`` (a GitHub App token) needs it set.
 - ``AE_GITHUB_API_URL``: the API origin, default ``https://api.github.com``;
   set only for a local mock (the screenshots) or GitHub Enterprise.
 
@@ -42,8 +45,8 @@ import httpx
 from ae_omni_policies import __version__
 
 API_URL = "https://api.github.com"
-DEFAULT_REPOS = ("analyticendeavors/omnigent-ae", "analyticendeavors/agents-and-automation")
-DEFAULT_LOGIN = "ae-reid-havens"
+DEFAULT_REPOS: tuple[str, ...] = ()
+DEFAULT_LOGIN = ""
 REQUEST_TIMEOUT_S = 10.0
 # One person's open pull requests across a handful of repos; a cap keeps a
 # busy repo from turning one page load into a hundred check-run calls.
@@ -67,6 +70,18 @@ HOW_TO_ENABLE = (
     "Workflows: read and write) for the repos in AE_GITHUB_REPOS, set it as "
     "AE_GITHUB_TOKEN in the server's environment, then restart the stack "
     "(deploy/README.md, 'The GitHub token')."
+)
+# (API origin, token) to the token's own login; a token's login never changes.
+_logins: dict[tuple[str, str], str] = {}
+
+
+def reset_login_cache() -> None:
+    _logins.clear()
+
+
+NO_REPOS = (
+    "Pull requests are off: no repos to read. Set AE_GITHUB_REPOS to a comma-separated "
+    "owner/repo list in the server's environment, then restart the stack."
 )
 
 
@@ -419,9 +434,24 @@ class GitHubClient:
         runs = payload.get("check_runs") if isinstance(payload, dict) else None
         return ci_state([run for run in runs or [] if isinstance(run, dict)])
 
-    def _mine(self, pull: dict[str, Any]) -> list[str]:
-        """Why this pull request is waiting on the login: authored, review requested, or both."""
-        login = self._settings.login.lower()
+    async def login(self) -> str:
+        """``AE_GITHUB_LOGIN``, else the token's own login from ``GET /user``."""
+        if self._settings.login:
+            return self._settings.login
+        key = (self._settings.api_url, self._settings.token)
+        if key in _logins:
+            return _logins[key]
+        payload = await self._get("/user")
+        login = payload.get("login") if isinstance(payload, dict) else None
+        if not isinstance(login, str) or not login:
+            raise GitHubError("GET /user answered without a login")
+        _logins[key] = login
+        return login
+
+    @staticmethod
+    def _mine(pull: dict[str, Any], login: str) -> list[str]:
+        """Why this pull request is waiting on *login*: authored, review requested, or both."""
+        login = login.lower()
         why: list[str] = []
         author = (pull.get("user") or {}).get("login") or ""
         if author.lower() == login:
@@ -438,6 +468,21 @@ class GitHubClient:
             ``pulls`` newest first, capped at :data:`MAX_PULLS`.
         """
         settings = self._settings
+        try:
+            login = await self.login()
+        except GitHubError as exc:
+            return {
+                "login": "",
+                "repos": list(settings.repos),
+                "pulls": [],
+                "errors": [
+                    {
+                        "repo": "GitHub",
+                        "message": f"could not read the token's own login ({exc}); "
+                        "set AE_GITHUB_LOGIN to whose pull requests count",
+                    }
+                ],
+            }
 
         async def one_repo(repo: str) -> list[dict[str, Any]]:
             rows = await self._get(
@@ -448,7 +493,7 @@ class GitHubClient:
             for pull in rows if isinstance(rows, list) else []:
                 if not isinstance(pull, dict):
                     continue
-                why = self._mine(pull)
+                why = self._mine(pull, login)
                 if why:
                     found.append({"repo": repo, "why": why, "raw": pull})
             return found
@@ -490,7 +535,7 @@ class GitHubClient:
                 }
             )
         return {
-            "login": settings.login,
+            "login": login,
             "repos": list(settings.repos),
             "pulls": pulls,
             "errors": errors,
@@ -502,6 +547,7 @@ __all__ = [
     "DEFAULT_REPOS",
     "HOW_TO_ENABLE",
     "MERGE_METHODS",
+    "NO_REPOS",
     "ConditionalPull",
     "GitHubClient",
     "GitHubError",
@@ -509,4 +555,5 @@ __all__ = [
     "MergeMethod",
     "MergeOutcome",
     "ci_state",
+    "reset_login_cache",
 ]

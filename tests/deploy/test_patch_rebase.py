@@ -371,6 +371,20 @@ def test_workflow_meets_the_repo_standards() -> None:
             assert "${{" not in run, f"step {step['name']} interpolates an expression in run"
 
 
+def test_workflow_installs_the_same_just_as_ci() -> None:
+    # The rebase job runs on the branch it rebases, which may predate the local
+    # install-just action, so it installs just inline (2026-10-22); the pin must match.
+    action = yaml.safe_load(
+        (ROOT / ".github" / "actions" / "install-just" / "action.yml").read_text()
+    )
+    pinned = action["runs"]["steps"][0]["env"]
+    steps = _workflow()["jobs"]["rebase"]["steps"]
+    install = next(step for step in steps if step["name"] == "Install just")
+    assert "uses" not in install, "a local action is missing on a branch older than it"
+    assert install["env"] == pinned
+    assert install["run"] == action["runs"]["steps"][0]["run"]
+
+
 def test_workflow_warns_and_passes_without_the_token() -> None:
     find = _steps("find")["Find conflicting patch PRs"]
     assert find["env"]["PATCH_BOT_TOKEN"] == "${{ secrets.PATCH_BOT_TOKEN }}"

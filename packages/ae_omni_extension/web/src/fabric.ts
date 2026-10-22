@@ -115,7 +115,10 @@ import {
   fetchFabric,
 } from "./api";
 import { accountsSection, activateAccounts, deactivateAccounts } from "./accounts";
+import { activateAzure, azureSection, deactivateAzure } from "./azure";
 import { adminCard, mountBoard } from "./board";
+import { layoutResetButton } from "./boardDrag";
+import { loadBoardLayout } from "./boardLayout";
 import { holdMenus, rowMenu } from "./cards";
 import {
   activateDatabricks,
@@ -129,6 +132,7 @@ import { activateHost, deactivateHost, hostSection } from "./host";
 import {
   boltIcon,
   clockIcon,
+  cloudIcon,
   coinIcon,
   type FabricTone,
   linksIcon,
@@ -1133,6 +1137,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const host = hostSection();
   const secrets = secretsSection();
   const accountsBody = accountsSection();
+  const azureBody = azureSection();
   // The card headers carry one "Updated" each: Fabric's on Compute, the host's on Box health.
   databricks.querySelector(".dbx-refreshed")?.remove();
   secrets.querySelector(".secrets-refreshed")?.remove();
@@ -1140,7 +1145,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     "compute",
     "Compute",
     boltIcon(16),
-    [databricks.querySelector(".dbx-host"), refreshed],
+    [refreshed],
     el("div", { class: "admin-block admin-fabric" }, status, list, toast),
     databricks,
   );
@@ -1151,6 +1156,13 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     sharedIcon(16),
     [accountsBody.querySelector(".accounts-refreshed")],
     accountsBody,
+  );
+  const azure = adminCard(
+    "azure",
+    "Azure spend",
+    cloudIcon(),
+    [azureBody.querySelector(".azure-refreshed")],
+    azureBody,
   );
   const box = adminCard(
     "box",
@@ -1172,6 +1184,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
       { class: "fabric-top" },
       el("h1", { class: "fabric-h" }, "Admin Center"),
       updated,
+      layoutResetButton(board),
       again,
     ),
     tiles,
@@ -1179,7 +1192,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   );
   root.replaceChildren(main);
   mountTiles(tiles, updated);
-  const layout = mountBoard(main, board, { deploys, accounts, compute, credit, box });
+  const layout = mountBoard(main, board, { deploys, accounts, compute, credit, azure, box });
   stopBoard = layout.stop;
   active = true;
   const mine = ++activations;
@@ -1252,7 +1265,11 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
 
   // The theme, and which cards Reid folded on his phone (a local read; the
   // defaults without it), asked for together.
-  const [theme] = await Promise.all([context.theme.getCurrent(), loadSectionState(context)]);
+  const [theme] = await Promise.all([
+    context.theme.getCurrent(),
+    loadSectionState(context),
+    loadBoardLayout(context),
+  ]);
   layout.refold();
   document.documentElement.dataset.theme = theme.theme;
   const subscription = await context.theme.subscribe((next) => {
@@ -1274,6 +1291,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   activateDatabricks(context, compute, strip);
   activateSecrets(context, secrets);
   activateAccounts(context, accounts);
+  activateAzure(context, azure);
   const live = () => active && mine === activations;
   registerRefresh("fabric", () => (live() ? refresh() : undefined));
   onFocus = () => {
@@ -1291,6 +1309,7 @@ export function deactivateFabric(): void {
   deactivateDatabricks();
   deactivateSecrets();
   deactivateAccounts();
+  deactivateAzure();
   stopBoard?.();
   stopBoard = null;
   resetTiles();

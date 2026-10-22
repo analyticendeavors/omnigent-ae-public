@@ -39,7 +39,7 @@ import {
 
 export type Health = "ok" | "attention" | "idle" | "problem";
 
-/** "credit" is not drawn in the strip: it carries the credit card's folded line and health. */
+/** "credit" and "azure" are not drawn in the strip: they carry their card's folded line and health. */
 export type TileId =
   | "release"
   | "hold"
@@ -48,7 +48,8 @@ export type TileId =
   | "databricks"
   | "secrets"
   | "accounts"
-  | "credit";
+  | "credit"
+  | "azure";
 
 export interface Tile {
   id: TileId;

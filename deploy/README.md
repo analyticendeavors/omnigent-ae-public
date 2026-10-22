@@ -91,7 +91,7 @@ default `/secure/env/omnigent-ae.env`; the host unit reads
 
 | File | Keys |
 |---|---|
-| server (`AE_SERVER_SECRETS`) | required: `POSTGRES_PASSWORD`; with OIDC sign-in, `OMNIGENT_OIDC_CLIENT_SECRET` and `OMNIGENT_OIDC_COOKIE_SECRET`; with task-store, `AE_CF_ACCESS_CLIENT_ID` and `AE_CF_ACCESS_CLIENT_SECRET`. Optional: `AE_GITHUB_TOKEN`, `AE_FABRIC_WAKE_URL_<NAME>`, `AE_FABRIC_SUSPEND_KEY_<NAME>`, `AE_FABRIC_CAPACITIES_URL`, `AE_FABRIC_CAPACITIES_KEY`, `AE_DATABRICKS_CLIENT_ID`, `AE_DATABRICKS_CLIENT_SECRET`, `AE_SHARED_ACCOUNTS_KEY` |
+| server (`AE_SERVER_SECRETS`) | required: `POSTGRES_PASSWORD`; with OIDC sign-in, `OMNIGENT_OIDC_CLIENT_SECRET` and `OMNIGENT_OIDC_COOKIE_SECRET`; with task-store, `AE_CF_ACCESS_CLIENT_ID` and `AE_CF_ACCESS_CLIENT_SECRET`. Optional: `AE_GITHUB_TOKEN`, `AE_FABRIC_WAKE_URL_<NAME>`, `AE_FABRIC_SUSPEND_KEY_<NAME>`, `AE_FABRIC_CAPACITIES_URL`, `AE_FABRIC_CAPACITIES_KEY`, `AE_DATABRICKS_CLIENT_ID`, `AE_DATABRICKS_CLIENT_SECRET`, `AE_AZURE_COST_TENANT_ID`, `AE_AZURE_COST_CLIENT_ID`, `AE_AZURE_COST_CLIENT_SECRET`, `AE_SHARED_ACCOUNTS_KEY` |
 | host (`/secure/env/omnigent-host.env`) | `CLAUDE_CODE_OAUTH_TOKEN` |
 
 Compose reads the env file with `$` interpolation, so no value may contain a
@@ -214,6 +214,7 @@ optional secrets plus one setting:
 | server secrets file | `AE_DATABRICKS_CLIENT_ID` | the service principal's application ID |
 | server secrets file | `AE_DATABRICKS_CLIENT_SECRET` | its OAuth secret (scope `sql`); scopes are fixed when a secret is made, so another scope means a new secret |
 | `config/server.env` | `AE_DATABRICKS_HOST` | the workspace URL; not a secret |
+| `config/server.env` | `AE_AZURE_COST_SUBSCRIPTIONS` | the Azure card's subscriptions, `<guid>=<name>` pairs, comma separated; not a secret |
 
 All three are needed; without them the section says how to add them and the rest
 of the page works. After adding them, `deploy/compose.sh up -d --force-recreate

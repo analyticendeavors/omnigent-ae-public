@@ -643,6 +643,74 @@ GitHub panel ran `gh auth status`, and the merge watcher reads every recent sess
 two minutes, so the box ran about four a minute. The answer is now cached for 60 seconds
 in one file the host's processes share, with only signed-in answers kept.
 
+Draft pull requests in the action dock (2026-10-21, `patches/0149`, web): the dock listed
+only pull requests ready to merge, so a draft never showed (Reid's report, with #221 as
+the example). A draft now gets its own line, "#n draft · x/y checks", after the merges,
+with a Mark ready button; once ready and green it becomes the Merge line.
+
+The thread's PR card is a receipt (2026-10-21, `patches/0150`, web): the card under a chat
+message carried its own Merge button while the action dock showed the same pull request's
+Merge, so two Merge buttons sat on one screen. The card is now one line (state, number,
+title and a status word such as "checks 7/12", "ready", "merged 03:35" or "live") that
+opens in place onto the checks, Update branch and the review folds, with no Merge; the dock
+owns every live action. The GitHub panel's card keeps its Merge.
+
+Open Cost Management on the Azure card (2026-10-22, `patches/0151`, web): the Azure spend
+card links to the Azure portal's cost analysis page. The host admits that one URL for
+extensions and nothing else on portal.azure.com; the link reveals no subscription.
+
+Every open pull request in the action dock (2026-10-22, `patches/0152`, web): the dock
+listed only drafts and pull requests ready to merge, so PR 228 sat outside it while one of
+its twelve checks ran and Reid, having said "merge when ready", had nothing to watch
+(https://github.com/analyticendeavors/omnigent-ae/pull/228). Every other open pull request
+of the session now gets a waiting line with the thread receipt's word and tone ("checks
+11/12", "conflicts", "1 check failed", "behind main", "review requested"), after the drafts
+and before the deploys, and an Update branch button when GitHub allows one. Once ready it
+becomes the Merge line. Several fold into one "n not ready" badge, so the bar stays one line.
+
+Readable skills and file lists (2026-10-22, `patches/0153`, web): the slash command menu's Skills
+list and the `@` file menu were see-through in the dark theme, so the chat behind them ran into
+the rows. Both now blur what is behind them, as the other frosted popovers do.
+
+Waiting line keeps its word on a phone (2026-10-22, `patches/0154`, web): the live check of
+`0152` (https://github.com/analyticendeavors/omnigent-ae/pull/240) found that at 390 px a
+waiting line showed only "#240" and its icon. The dock hides a line's detail on a phone
+because a button beside it names the state (Merge, Mark ready); a waiting line usually has
+no button, so its word ("checks 11/12") now stays.
+
+Slot limit from Settings (2026-10-22, `packages/ae_omni_policies`): Reid runs four slots
+and expected to change the number on Settings > Global Policies. The slot cap policy has
+taken a `limit` there since the Edit button (`patches/0095`), but every count in the web
+UI read `AE_SLOT_LIMIT` through `GET /v1/ae/capacity`, so a limit set on the page held
+prompts at one number while the Dashboard and the sidebar showed another. `slot_limit.py`
+now answers for the counts by the rule the policies enforce: each enabled slot cap
+holds at its own `limit`, or at `AE_SLOT_LIMIT` when it sets none, and the lowest wins;
+with none on, `AE_SLOT_LIMIT`. The capacity route, the orchestrator's session list and
+its slot hold read it on every request. The web UI shows a new number on a reload, or
+when its window regains focus once its last read is five minutes old (patch 0014's
+cache, whose comment still says the limit moves only at a restart). Without a `limit`
+on the page nothing changes.
+
+Session rail when a session opens (2026-10-22, `patches/0155`, web): Reid wanted the rail,
+not the files panel, when a session opens. "Open the session rail in every session" still
+let a restored workspace panel come back whenever it fit beside the rail, and the rail then
+made way for it. Settings > Chat now asks "When a session opens, show": Session rail (the
+new default; a panel left open starts closed on a desktop), Both when they fit (the old
+switch on) or Workspace panel (the old switch off). A file, agents or comment link still
+opens the panel, and a device that had the switch off keeps the workspace panel. Details
+in `docs/PLAN-LIMITS.md` ("When a session opens").
+
+Feature docs per public release (2026-10-22, `scripts/docs-coverage.py`): the README's
+showcase and `docs/features` should keep up with the patch series, but Reid wanted that
+once per public release, not on every merge. The script lists the core patches added
+since a release tag that no page under `docs/features` links and
+`docs/features/uncited-patches.txt` does not excuse (review fixes and plumbing, each with
+its reason), plus, for information, the merges that changed `packages/` or `agents/`
+without a patch. The public release's prepare step runs the tag's own copy, pinned by its
+sha256 in the release script because prepare holds admin credentials, and stops on a gap
+until the pages cover it or `--docs-checked` is passed; exit 2 means the check could not
+run, never a gap.
+
 Patch series without private fixtures (2026-10-21, `patches/0106` and `0137`): the
 pre-publication audit (finding RS-codex-01) found that the patch that scrubbed AE's real
 Databricks workspace host from two web test fixtures left it in the text of `0106`, which

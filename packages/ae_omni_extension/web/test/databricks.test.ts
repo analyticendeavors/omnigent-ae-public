@@ -336,8 +336,9 @@ describe("the section on the page", () => {
     const compute = document.querySelector('.admin-card[data-card="compute"]');
     expect(cardOf(ID).closest(".admin-card")).toBe(compute);
     expect(compute?.querySelector(".admin-databricks")).not.toBeNull();
-    // The workspace link sits in the card's header.
-    expect(compute?.querySelector(".admin-card-top .dbx-host button")).not.toBeNull();
+    // The workspace link sits under the Databricks heading, not in the Compute header.
+    expect(compute?.querySelector(".admin-databricks .dbx-head .dbx-host button")).not.toBeNull();
+    expect(compute?.querySelector(".admin-card-top .dbx-host")).toBeNull();
     const credit = document.querySelector('.admin-card[data-card="credit"]');
     expect(document.getElementById("admin-credit-h")?.textContent).toBe("Databricks credit");
     expect(credit?.querySelector(".dbx-spend")).not.toBeNull();

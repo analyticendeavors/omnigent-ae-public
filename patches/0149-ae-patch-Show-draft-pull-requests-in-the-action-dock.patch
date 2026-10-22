@@ -1,0 +1,465 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 20:27:44 -0700
+Subject: [PATCH 149/155] [ae-patch] Show draft pull requests in the action
+ dock with a Mark ready button
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The dock listed only pull requests ready to merge, and a draft's mergeable
+state is "draft", so drafts never appeared. A draft now gets its own line,
+"#n draft · x/y checks", ranked after merges, with Mark ready (the card's
+own mutation, moved to hooks/useAeMarkReady.ts). Once ready and green it
+becomes the Merge line.
+---
+ web/src/components/AeActionDock.test.tsx | 42 ++++++++++++++++++++--
+ web/src/components/AeActionDock.tsx      | 42 ++++++++++++++++++----
+ web/src/components/AePrCards.tsx         | 22 +++---------
+ web/src/hooks/useAeActionDockItems.ts    |  2 ++
+ web/src/hooks/useAeMarkReady.ts          | 28 +++++++++++++++
+ web/src/lib/aeActionDock.test.ts         | 38 ++++++++++++++++++++
+ web/src/lib/aeActionDock.ts              | 45 ++++++++++++++++++++----
+ 7 files changed, 186 insertions(+), 33 deletions(-)
+ create mode 100644 web/src/hooks/useAeMarkReady.ts
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index efa246f0672f1771fb2ed88eba9c9cda1b098016..8b7c901ef88c0fa3cfa2c7f1db829c52e8663748 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -109,6 +109,7 @@ function serve(cards: Record<number, AePrCard>) {
+           session: null,
+         });
+       }
++      if (match?.[2] === "/ready" && init?.method === "POST") return json(card(n));
+       if (match?.[2] === "/deploy") {
+         return json({
+           state: "waiting",
+@@ -355,6 +356,43 @@ describe("AeActionDock", () => {
+     expect(JSON.parse(String(init!.body))).toMatchObject({ sha: SHA, method: "squash" });
+   });
+ 
++  it("a draft shows with Mark ready, which turns it into the Merge line", async () => {
++    serve({
++      180: card(180, {
++        draft: true,
++        mergeable: { state: "draft", detail: "" },
++        merge: { ...card(180).merge, allowed: false },
++      }),
++    });
++    renderDock([`Opened ${url(180)}`]);
++    const ready = await screen.findByTestId("ae-dock-ready");
++    expect(screen.getByTestId("ae-dock-lead").textContent).toContain("draft · 5/5 checks");
++    expect(screen.queryByTestId("ae-dock-merge")).toBeNull();
++    await act(async () => {
++      fireEvent.click(ready);
++    });
++    const posts = vi
++      .mocked(authenticatedFetch)
++      .mock.calls.filter(([, init]) => init?.method === "POST");
++    expect(posts.map(([path]) => path)).toEqual([`/v1/ae/prs/${REPO}/180/ready`]);
++    await screen.findByTestId("ae-dock-merge");
++    expect(screen.queryByTestId("ae-dock-ready")).toBeNull();
++  });
++
++  it("a failed Mark ready says so on the button", async () => {
++    serve({ 180: card(180, { draft: true, mergeable: { state: "draft", detail: "" } }) });
++    renderDock([`Opened ${url(180)}`]);
++    const ready = await screen.findByTestId("ae-dock-ready");
++    vi.mocked(authenticatedFetch).mockImplementationOnce(() =>
++      json({ error: { message: "head moved" } }, 409),
++    );
++    await act(async () => {
++      fireEvent.click(ready);
++    });
++    await waitFor(() => expect(ready.textContent).toBe("Failed, retry"));
++    expect(ready.getAttribute("aria-label")).toContain("Could not mark #180 ready");
++  });
++
+   it("a confirm opened from a list line gives the list half the screen until Cancel", async () => {
+     serve({ 180: card(180) });
+     renderDock([`See ${url(180)}`], [question]);
+@@ -430,9 +468,7 @@ describe("AeActionDock", () => {
+       predicate: (q) => q.queryKey[0] === "ae-pr" && q.queryKey[2] === 180,
+     });
+     act(() => qc.setQueryData(query.queryKey, card(180, { state: "merged" })));
+-    await waitFor(() =>
+-      expect(screen.queryByRole("group", { name: "Confirm merge" })).toBeNull(),
+-    );
++    await waitFor(() => expect(screen.queryByRole("group", { name: "Confirm merge" })).toBeNull());
+     expect(screen.queryByTestId("ae-dock-tray")).toBeNull();
+     expect(screen.getByTestId("ae-dock-lead").textContent).toContain("#181");
+   });
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index 62761bdf983bd4a58d156382b54c6b0166677481..8a7da528daef615565091c569c16cb36194d8bb6 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -13,12 +13,15 @@ import { AePrLinkHoverCard } from "@/components/AePrLinkHoverCard";
+ import { COMPOSER_CONTENT_INSET_CLASS } from "@/components/composer/ChatComposer";
+ import { Button } from "@/components/ui/button";
+ import { useAeActionDockItems, useAeQuestionsOnScreen } from "@/hooks/useAeActionDockItems";
++import { useAeMarkReady } from "@/hooks/useAeMarkReady";
+ import {
++  type AeDockDraft,
+   type AeDockItem,
+   type AeDockKind,
+   aeDeployText,
+   aeDockCountText,
+   aeDockSummary,
++  aeDraftText,
+   aeMergeText,
+ } from "@/lib/aeActionDock";
+ import {
+@@ -33,7 +36,7 @@ import {
+   AE_ICON_X,
+ } from "@/lib/aeActionDockIcons";
+ import { AE_ICON_CHEVRON_DOWN } from "@/lib/aeAgentsIcons";
+-import { AE_ICON_CHECK, AE_ICON_MERGE, AE_ICON_PR_OPEN } from "@/lib/aePrIcons";
++import { AE_ICON_CHECK, AE_ICON_MERGE, AE_ICON_PR_DRAFT, AE_ICON_PR_OPEN } from "@/lib/aePrIcons";
+ import { aeLimitGateShort, aeLimitGateText } from "@/lib/aeLimitGate";
+ import { AE_ADMIN_CENTER_PATH } from "@/lib/aePrDeploy";
+ import { aeCiText } from "@/lib/aePrs";
+@@ -51,6 +54,7 @@ const KIND_STYLE: Record<AeDockKind, { icon: AeTablerIconNode; tone: string; tin
+   question: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
+   limit: { icon: AE_ICON_GAUGE, tone: RED, tint: "bg-red-500/15" },
+   merge: { icon: AE_ICON_PR_OPEN, tone: GREEN, tint: "bg-emerald-500/15" },
++  draft: { icon: AE_ICON_PR_DRAFT, tone: "text-muted-foreground", tint: "bg-muted" },
+   deploy: { icon: AE_ICON_ROCKET, tone: MERGED_TEXT, tint: "bg-purple-500/15" },
+ };
+ 
+@@ -110,11 +114,13 @@ function ItemBody({ item, now, expanded }: { item: AeDockItem; now: number; expa
+     );
+   }
+   const detail =
+-    item.kind === "merge"
+-      ? expanded
+-        ? `${item.card.title} · ${aeCiText(item.card.ci)}`
+-        : aeMergeText(item)
+-      : aeDeployText(item, now);
++    item.kind === "deploy"
++      ? aeDeployText(item, now)
++      : expanded
++        ? `${item.card.title} · ${item.kind === "draft" ? "draft · " : ""}${aeCiText(item.card.ci)}`
++        : item.kind === "merge"
++          ? aeMergeText(item)
++          : aeDraftText(item);
+   return (
+     <>
+       {/* The chat links' preview on hover; no title, which would show over it. */}
+@@ -291,6 +297,8 @@ function ItemActions({
+           Merge
+         </Button>
+       );
++    case "draft":
++      return <MarkReadyButton item={item} />;
+     case "deploy":
+       return (
+         <>
+@@ -307,6 +315,28 @@ function ItemActions({
+   }
+ }
+ 
++/** The card's "Mark ready for review"; marking ready never merges, so no confirm step. */
++function MarkReadyButton({ item }: { item: AeDockDraft }) {
++  const ready = useAeMarkReady(item.card);
++  const failed = ready.isError
++    ? `Could not mark #${item.number} ready: ${ready.error.message}`
++    : null;
++  return (
++    <Button
++      variant="outline"
++      className={cn(ACTION, failed && RED)}
++      disabled={ready.busy || !item.card.head_sha}
++      onClick={() => ready.mutate()}
++      title={failed ?? `Mark #${item.number} ready for review`}
++      aria-label={failed ?? `Mark #${item.number} ready for review`}
++      data-testid="ae-dock-ready"
++    >
++      {/* A phone shows no title, so a failure changes the label too. */}
++      {ready.busy ? "Marking…" : failed ? "Failed, retry" : "Mark ready"}
++    </Button>
++  );
++}
++
+ /** The PR card's own confirm step (method choice, then Confirm), inside the dock. */
+ function DockConfirm({
+   item,
+diff --git a/web/src/components/AePrCards.tsx b/web/src/components/AePrCards.tsx
+index a400637ec7f3db6c10c1866ac92c1251d152e834..aa7b998874698338d2677876f209ea20089230e1 100644
+--- a/web/src/components/AePrCards.tsx
++++ b/web/src/components/AePrCards.tsx
+@@ -53,6 +53,7 @@ import { defaultRemarkPlugins } from "streamdown";
+ import { MessageResponse } from "@/components/ai-elements/message";
+ import { isPathologicalText, PlainTextFallback } from "@/components/blocks/ChatMarkdown";
+ import { Button } from "@/components/ui/button";
++import { useAeMarkReady } from "@/hooks/useAeMarkReady";
+ import {
+   AE_ICON_ALERT_CIRCLE,
+   AE_ICON_CHECK,
+@@ -82,7 +83,6 @@ import {
+   fetchAePrCard,
+   fetchAePrCompliance,
+   mergeAePr,
+-  markAePrReady,
+   parseAePrUrl,
+   updateAePrBranch,
+ } from "@/lib/aePrs";
+@@ -462,21 +462,7 @@ function AePrBody({ body }: { body: string | null | undefined }) {
+ function ReviewDetails({ card }: { card: AePrCard }) {
+   // The markdown pipeline runs only once Review details is opened.
+   const [open, setOpen] = useState(false);
+-  const queryClient = useQueryClient();
+-  const queryKey = ["ae-pr", card.repo, card.number] as const;
+-  const ready = useMutation({
+-    mutationFn: () => markAePrReady(card),
+-    onSuccess: async (fresh) => {
+-      await queryClient.cancelQueries({ queryKey, exact: true });
+-      queryClient.setQueryData(queryKey, fresh);
+-    },
+-    onError: async (error) => {
+-      if (error instanceof AePrError && error.card) {
+-        await queryClient.cancelQueries({ queryKey, exact: true });
+-        queryClient.setQueryData(queryKey, error.card);
+-      }
+-    },
+-  });
++  const ready = useAeMarkReady(card);
+   return (
+     <details
+       className="min-w-0 text-sm"
+@@ -504,10 +490,10 @@ function ReviewDetails({ card }: { card: AePrCard }) {
+             </p>
+             <Button
+               className={cn(TOUCH, "self-start")}
+-              disabled={ready.isPending || !card.head_sha}
++              disabled={ready.busy || !card.head_sha}
+               onClick={() => ready.mutate()}
+             >
+-              {ready.isPending ? "Marking ready…" : "Mark ready for review"}
++              {ready.busy ? "Marking ready…" : "Mark ready for review"}
+             </Button>
+           </>
+         )}
+diff --git a/web/src/hooks/useAeActionDockItems.ts b/web/src/hooks/useAeActionDockItems.ts
+index beb05b69c038336e904deacd60c26ca321600616..b5440e872ca61e2ab359ffd14b405dfa356e8796 100644
+--- a/web/src/hooks/useAeActionDockItems.ts
++++ b/web/src/hooks/useAeActionDockItems.ts
+@@ -17,6 +17,7 @@ import {
+   aeDeployTrack,
+   aeDockArrange,
+   aeDockDeploys,
++  aeDockDrafts,
+   aeDockMerges,
+   aeDockPrAnchor,
+   aeDockQuestions,
+@@ -244,6 +245,7 @@ export function useAeActionDockItems(
+       ...aeDockQuestions(questions),
+       ...(limit.item ? [limit.item] : []),
+       ...aeDockMerges(withCards),
++      ...aeDockDrafts(withCards),
+       ...aeDockDeploys(withCards, deploys, track, dismissedDeploys, now),
+     ],
+     questionsOnScreen,
+diff --git a/web/src/hooks/useAeMarkReady.ts b/web/src/hooks/useAeMarkReady.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1b88f9396f72e5d58f0ae7351ae43b7da5ec723
+--- /dev/null
++++ b/web/src/hooks/useAeMarkReady.ts
+@@ -0,0 +1,28 @@
++// Marks a draft pull request ready for review. The inline card and the action
++// dock share it, so either button updates both. omnigent-ae, 2026-10-21.
++
++import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
++import { type AePrCard, AePrError, markAePrReady } from "@/lib/aePrs";
++
++/** `busy` is true while any button marks this pull request ready, so none sends it twice. */
++export function useAeMarkReady(card: AePrCard) {
++  const queryClient = useQueryClient();
++  const queryKey = ["ae-pr", card.repo, card.number] as const;
++  const mutationKey = ["ae-pr-ready", card.repo, card.number] as const;
++  const busy = useIsMutating({ mutationKey }) > 0;
++  const mutation = useMutation({
++    mutationKey,
++    mutationFn: () => markAePrReady(card),
++    onSuccess: async (fresh) => {
++      await queryClient.cancelQueries({ queryKey, exact: true });
++      queryClient.setQueryData(queryKey, fresh);
++    },
++    onError: async (error) => {
++      if (error instanceof AePrError && error.card) {
++        await queryClient.cancelQueries({ queryKey, exact: true });
++        queryClient.setQueryData(queryKey, error.card);
++      }
++    },
++  });
++  return { ...mutation, busy };
++}
+diff --git a/web/src/lib/aeActionDock.test.ts b/web/src/lib/aeActionDock.test.ts
+index 66ef9e1b06f4bb8f6bbd71651424401a2cab4c3a..41278e3c4b372bc6532495d9f2dc0105aa45131b 100644
+--- a/web/src/lib/aeActionDock.test.ts
++++ b/web/src/lib/aeActionDock.test.ts
+@@ -9,11 +9,13 @@ import {
+   aeDockArrange,
+   aeDockBadgeLabel,
+   aeDockDeploys,
++  aeDockDrafts,
+   aeDockMerges,
+   aeDockPrAnchor,
+   aeDockQuestions,
+   aeDockQuestionText,
+   aeDockSummary,
++  aeDraftText,
+   aeHolderName,
+ } from "@/lib/aeActionDock";
+ import type { AePrDeploy } from "@/lib/aePrDeploy";
+@@ -107,6 +109,42 @@ describe("merges", () => {
+   });
+ });
+ 
++describe("drafts", () => {
++  const draft = { draft: true, mergeable: { state: "draft", detail: "" } } as const;
++
++  it("takes open drafts whatever their checks, never ready, closed or unfetched ones", () => {
++    const items = aeDockDrafts([
++      pr(1),
++      pr(2, draft),
++      pr(3, { ...draft, ci: { state: "failing", passing: 4, failing: 1, pending: 0, total: 5 } }),
++      { url: "u", repo: REPO, number: 4 },
++      pr(5, { ...draft, state: "closed" }),
++    ]);
++    expect(items.map((item) => item.number)).toEqual([2, 3]);
++    expect(aeDockMerges([pr(6, { draft: true })])).toEqual([]);
++    expect(items[0]!.key).toBe(`draft:${anchor(2)}`);
++    expect(aeDraftText(items[0]!)).toBe("draft · 5/5 checks");
++  });
++
++  it("ranks after merges and before deploys, with its own badge", () => {
++    const drafts = aeDockDrafts([pr(182, draft), pr(183, draft)]);
++    const arranged = aeDockArrange([...sample(), ...drafts], new Set());
++    expect(arranged.map((item) => item.key).slice(2)).toEqual([
++      `merge:${anchor(180)}`,
++      `merge:${anchor(181)}`,
++      `draft:${anchor(182)}`,
++      `draft:${anchor(183)}`,
++      `deploy:${anchor(179)}`,
++    ]);
++    expect(aeDockSummary(arranged, clock)!.badges).toContainEqual({
++      kind: "draft",
++      count: 2,
++      label: "2 drafts",
++    });
++    expect(aeDockBadgeLabel(drafts.slice(0, 1))).toBe("#182 draft");
++  });
++});
++
+ describe("deploy lifecycle", () => {
+   it("tracks a pull request seen waiting, then the time it turned live", () => {
+     const waiting = new Map([[anchor(9), deploy()]]);
+diff --git a/web/src/lib/aeActionDock.ts b/web/src/lib/aeActionDock.ts
+index 130d51851a20d9add608c82bfa2ad8a96891b97a..4d38bcebbc22e225c24555ad41bcba15bfdeb5d8 100644
+--- a/web/src/lib/aeActionDock.ts
++++ b/web/src/lib/aeActionDock.ts
+@@ -6,13 +6,19 @@ import { type AeLimitGate, aeLimitGateShort } from "@/lib/aeLimitGate";
+ import { type AePrDeploy, aeHasDeployState } from "@/lib/aePrDeploy";
+ import { type AePrCard, aeCiText, aeReadyToMerge } from "@/lib/aePrs";
+ 
+-export type AeDockKind = "question" | "limit" | "merge" | "deploy";
++export type AeDockKind = "question" | "limit" | "merge" | "draft" | "deploy";
+ 
+ /**
+  * Urgency: a question blocks the agent, a usage limit is about to, a merge
+- * waits on a click, a deploy only on time.
++ * waits on a click, a draft on a click before review, a deploy only on time.
+  */
+-export const AE_DOCK_KINDS: readonly AeDockKind[] = ["question", "limit", "merge", "deploy"];
++export const AE_DOCK_KINDS: readonly AeDockKind[] = [
++  "question",
++  "limit",
++  "merge",
++  "draft",
++  "deploy",
++];
+ 
+ /** A deploy item that went live stays this long, then clears. */
+ export const AE_DOCK_LIVE_MS = 60_000;
+@@ -39,6 +45,15 @@ export interface AeDockMerge extends ItemBase {
+   card: AePrCard;
+ }
+ 
++/** An open draft pull request, waiting to be marked ready for review. */
++export interface AeDockDraft extends ItemBase {
++  kind: "draft";
++  url: string;
++  repo: string;
++  number: number;
++  card: AePrCard;
++}
++
+ export interface AeDockDeploy extends ItemBase {
+   kind: "deploy";
+   url: string;
+@@ -57,7 +72,7 @@ export interface AeDockLimit extends ItemBase {
+   canSwitchAccount: boolean;
+ }
+ 
+-export type AeDockItem = AeDockQuestion | AeDockLimit | AeDockMerge | AeDockDeploy;
++export type AeDockItem = AeDockQuestion | AeDockLimit | AeDockMerge | AeDockDraft | AeDockDeploy;
+ 
+ /** "owner/repo#123", a pull request item's anchor. */
+ export function aeDockPrAnchor(repo: string, number: number): string {
+@@ -106,13 +121,24 @@ export interface AeDockPr {
+ export function aeDockMerges(prs: readonly AeDockPr[]): AeDockMerge[] {
+   const items: AeDockMerge[] = [];
+   prs.forEach((pr, order) => {
+-    if (!pr.card || !aeReadyToMerge(pr.card)) return;
++    if (!pr.card || pr.card.draft || !aeReadyToMerge(pr.card)) return;
+     const anchor = aeDockPrAnchor(pr.repo, pr.number);
+     items.push({ kind: "merge", key: `merge:${anchor}`, anchor, order, ...pr, card: pr.card });
+   });
+   return items;
+ }
+ 
++/** The transcript's open draft pull requests, first mentioned first. */
++export function aeDockDrafts(prs: readonly AeDockPr[]): AeDockDraft[] {
++  const items: AeDockDraft[] = [];
++  prs.forEach((pr, order) => {
++    if (pr.card?.state !== "open" || !pr.card.draft) return;
++    const anchor = aeDockPrAnchor(pr.repo, pr.number);
++    items.push({ kind: "draft", key: `draft:${anchor}`, anchor, order, ...pr, card: pr.card });
++  });
++  return items;
++}
++
+ /**
+  * What this page saw of each deploy: `waiting` once seen waiting, then the
+  * time it turned live. A pull request first seen live went live before the
+@@ -221,7 +247,7 @@ export function aeDockSummary(
+   return { lead, more, badges, total: items.length };
+ }
+ 
+-/** "Question waiting", "2 questions", "#180 ready", "#179 deploy 10:50 PM", "2 deploying". */
++/** "Question waiting", "2 questions", "#180 ready", "#181 draft", "#179 deploy 10:50 PM", "2 deploying". */
+ export function aeDockBadgeLabel(
+   items: readonly AeDockItem[],
+   clock: (iso: string) => string = aeClock,
+@@ -235,6 +261,8 @@ export function aeDockBadgeLabel(
+       return aeLimitGateShort(first.gate);
+     case "merge":
+       return many ? `${items.length} to merge` : `#${first.number} ready`;
++    case "draft":
++      return many ? `${items.length} drafts` : `#${first.number} draft`;
+     case "deploy": {
+       if (many) {
+         const live = items.every((item) => item.kind === "deploy" && item.deploy.state === "live");
+@@ -300,6 +328,11 @@ export function aeMergeText(item: AeDockMerge): string {
+   return `ready to merge · ${aeCiText(item.card.ci)}`;
+ }
+ 
++/** The draft line's detail: "draft · 5/5 checks". */
++export function aeDraftText(item: AeDockDraft): string {
++  return `draft · ${aeCiText(item.card.ci)}`;
++}
++
+ /** The dock's header and accessible name: "3 waiting". */
+ export function aeDockCountText(total: number): string {
+   return `${total} waiting`;

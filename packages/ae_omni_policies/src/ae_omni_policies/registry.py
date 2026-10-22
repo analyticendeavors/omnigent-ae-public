@@ -29,8 +29,9 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Working sessions allowed at once. Leave unset: the server's "
-                        "AE_SLOT_LIMIT is the default and what GET /v1/ae/capacity reports."
+                        "Working sessions allowed at once. Unset, the server's AE_SLOT_LIMIT "
+                        "applies; set, it replaces it here and in every slot count the web "
+                        "UI shows (GET /v1/ae/capacity)."
                     ),
                     "default": labels.SLOT_LIMIT,
                     "minimum": 1,

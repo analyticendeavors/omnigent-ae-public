@@ -407,7 +407,9 @@ function pullsGroup(deps: Deps, data: YourMove): HTMLElement | null {
     return el(
       "p",
       { class: "meta ym-off" },
-      'Pull requests are off: the server has no GitHub token (deploy/README.md, "The GitHub token").',
+      part.missing === "repos"
+        ? "Pull requests are off: no repos to read. Set AE_GITHUB_REPOS to an owner/repo list."
+        : 'Pull requests are off: the server has no GitHub token (deploy/README.md, "The GitHub token").',
     );
   }
   const errors = part.errors.map((failure) =>

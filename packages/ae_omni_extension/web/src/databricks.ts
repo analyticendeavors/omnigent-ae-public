@@ -775,14 +775,15 @@ function render(section: Section): void {
 
 /**
  * The warehouses' block, for activateFabric to put in the Compute card under
- * the Fabric capacities (it moves the workspace link into that card's header);
- * activateDatabricks fills it.
+ * the Fabric capacities, under its own "Databricks" heading that carries the
+ * workspace link; activateDatabricks fills it.
  */
 export function databricksSection(): HTMLElement {
   return el(
     "div",
     { class: "admin-block admin-databricks" },
-    el("span", { class: "dbx-host" }),
+    // Its own heading, so the workspace link sits with Databricks, not on the Compute card.
+    el("div", { class: "dbx-head" }, el("span", { class: "dbx-name" }, "Databricks"), el("span", { class: "dbx-host" })),
     el("p", { class: "meta refreshed dbx-refreshed" }),
     el("div", { class: "page-status dbx-status", "aria-live": "polite" }),
     // An id, as on the Fabric list, so a redraw can find a card.

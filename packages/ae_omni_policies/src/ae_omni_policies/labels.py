@@ -55,8 +55,9 @@ TRIAGE_VALUES = (TRIAGE_OFF, TRIAGE_CAPTURE)
 
 # The slot cap: working sessions allowed at once. One setting since 2026-09-24,
 # so moving from three slots to four is one line in config/server.env
-# (AE_SLOT_LIMIT=4) and a container recreate. The slot cap policy, GET
-# /v1/ae/capacity and, through that route, every count in the web UI read it.
+# (AE_SLOT_LIMIT=4) and a container recreate. Since 2026-10-22 a limit set on the
+# slot cap policy on Settings > Global Policies replaces it for the policy and, through
+# slot_limit.effective_limit and GET /v1/ae/capacity, for every count in the web UI.
 SLOT_LIMIT_ENV = "AE_SLOT_LIMIT"
 DEFAULT_SLOT_LIMIT = 3
 
