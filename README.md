@@ -1,26 +1,79 @@
 # omnigent-ae
 
-Analytic Endeavors' build of [OmniGent](https://github.com/omnigent-ai/omnigent)
-(Databricks, Apache-2.0), the open-source meta-harness that runs Claude Code, Codex and
-other coding agents behind one server, browser and phone UI. This fork builds Analytic Endeavors'
-branch-discipline methodology into the product. The full brief is internal to
-Analytic Endeavors.
+<!-- showcase:start -->
 
-What the AE layer adds:
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/media/banner-dark.png">
+    <img src="docs/media/banner-light.png" alt="omnigent-ae: a fork of Omnigent for running many coding agents at once" width="100%">
+  </picture>
+</p>
 
-- a Parking Lot page over task-store, and a Your move page (the lot block, the open
-  pull requests, the steward's brief);
-- a status label per session (`ae.status`, `docs/LABELS.md`) instead of a title glyph,
-  with a slots and capacity strip and a warn-or-block policy past three working sessions;
-- a cheap-model fork classifier and gate capture (`FORK:` / `Absorbed:` / `UNFILED`);
-- propose-only scheduled agents (steward, shutdown, orchestrator, reviewer-codex);
-- PR cards with Merge, plan limits for the Claude Code and Codex harnesses, and an
-  Admin Center (Fabric capacities, Databricks spend, deploy hold, the box host).
+<p align="center">
+  <a href="https://scorecard.dev/viewer/?uri=github.com/analyticendeavors/omnigent-ae-public"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/analyticendeavors/omnigent-ae-public/badge"></a>
+  <a href="LICENSE"><img alt="License: Apache-2.0" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <a href="https://github.com/omnigent-ai/omnigent"><img alt="Built on Omnigent" src="https://img.shields.io/badge/built%20on-Omnigent-a78bfa"></a>
+</p>
 
-It is a thin fork: upstream is pinned as a submodule at a release tag, the AE layer
-sits out of tree on OmniGent's own plugin seams (policies, extensions, out-of-tree
-routers), and the few unavoidable core changes are a small patch series that CI
-re-applies on every run. See `docs/UPSTREAM-SYNC.md` for how the pin moves.
+<p align="center"><b>Omnigent, extended for running many coding agents at once.</b></p>
+
+omnigent-ae is Analytic Endeavors' build of [Omnigent](https://github.com/omnigent-ai/omnigent) (Databricks, Apache-2.0), the open-source meta-harness that runs Claude Code, Codex and other coding agents behind one server, browser and phone UI. It adds a way of working for people who keep several agent sessions going at once: a few sessions at a time, everything that waits on you in one place, and the rest parked with a note. Every screen on this page is the real fork, running on made-up data.
+
+<p align="center"><img src="docs/media/hero.webp" alt="The Session Dashboard, split view, the session rail and the action dock"></p>
+
+<p align="center"><sub>From the narrated tour of the fork, on a made-up outdoor-gear retailer.</sub></p>
+
+## What it adds
+
+Grouped the way you meet them in a working day. Each picture opens a page with every feature in that area, how to reach it, and the core patch or package behind it.
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/session-dashboard.md"><img src="docs/media/dashboard-your-move-thumb.webp" alt="Session Dashboard"></a><br><sub>MANY SESSIONS</sub><br><b><a href="docs/features/session-dashboard.md">Session Dashboard</a></b><br>One page for the day: the working slots, the decisions waiting on you, open pull requests and why they wait, and the parking lot.</td>
+<td width="50%" valign="top"><a href="docs/features/sidebar.md"><img src="docs/media/sidebar-activity-thumb.webp" alt="Sidebar"></a><br><sub>MANY SESSIONS</sub><br><b><a href="docs/features/sidebar.md">Sidebar</a></b><br>Every row says whether its session is working, quiet, or waiting on you or its agents, and sessions group and sort by status.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/split-view.md"><img src="docs/media/split-open-thumb.webp" alt="Split view"></a><br><sub>MANY SESSIONS</sub><br><b><a href="docs/features/split-view.md">Split view</a></b><br>Up to four live sessions side by side, with layout presets and dividers you can drag.</td>
+<td width="50%" valign="top"><a href="docs/features/session-rail.md"><img src="docs/media/rail-context-fold-thumb.webp" alt="Session rail"></a><br><sub>INSIDE A SESSION</sub><br><b><a href="docs/features/session-rail.md">Session rail</a></b><br>One column beside the chat for triage notes, context, connectors, agents and plan limits.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/composer.md"><img src="docs/media/composer-suggestions-thumb.webp" alt="Composer"></a><br><sub>INSIDE A SESSION</sub><br><b><a href="docs/features/composer.md">Composer</a></b><br>Ghost-text prompt suggestions with ranked alternatives, model versions with their effort, and a token defrag while a chat compacts.</td>
+<td width="50%" valign="top"><a href="docs/features/action-dock.md"><img src="docs/media/dock-overview-thumb.webp" alt="Action dock"></a><br><sub>INSIDE A SESSION</sub><br><b><a href="docs/features/action-dock.md">Action dock</a></b><br>One strip in the composer for questions, open pull requests and their state, drafts to mark ready, merges and deploys.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/background-agents.md"><img src="docs/media/agents-pane-thumb.webp" alt="Background agents"></a><br><sub>AGENTS AND PULL REQUESTS</sub><br><b><a href="docs/features/background-agents.md">Background agents</a></b><br>Subagents laid out like Claude Desktop's background tasks: running, finished and failed, with the model each one ran on.</td>
+<td width="50%" valign="top"><a href="docs/features/pull-requests.md"><img src="docs/media/pr-receipt-thumb.webp" alt="Pull requests"></a><br><sub>AGENTS AND PULL REQUESTS</sub><br><b><a href="docs/features/pull-requests.md">Pull requests</a></b><br>A one-line receipt under the message that names a pull request, a preview on hover, and merged ones folded away.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/usage-and-accounts.md"><img src="docs/media/usage-popover-thumb.webp" alt="Usage and accounts"></a><br><sub>ACCOUNTS AND ADMIN</sub><br><b><a href="docs/features/usage-and-accounts.md">Usage and accounts</a></b><br>Plan limits per account, backup and shared Claude accounts, and a context ring that warns before the window fills.</td>
+<td width="50%" valign="top"><a href="docs/features/admin-center.md"><img src="docs/media/admin-board-thumb.webp" alt="Admin Center"></a><br><sub>ACCOUNTS AND ADMIN</sub><br><b><a href="docs/features/admin-center.md">Admin Center</a></b><br>A board of cards for whoever runs the server: deploy hold, host, accounts, limits and spend, plus editable global policies.</td>
+</tr>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/phone.md"><img src="docs/media/phone-dashboard-thumb.webp" alt="Phone"></a><br><sub>ON THE PHONE</sub><br><b><a href="docs/features/phone.md">Phone</a></b><br>The Dashboard, Run with a safety sheet, terminal Paste, the action dock and menus sized for a thumb.</td>
+<td width="50%" valign="top"><a href="docs/features/triage-and-policies.md"><img src="docs/media/rail-triage-notes-thumb.webp" alt="Triage and policies"></a><br><sub>TRIAGE AND POLICIES</sub><br><b><a href="docs/features/triage-and-policies.md">Triage and policies</a></b><br>The slot cap, the fork gate and its four answers, saved notes, the rabbit-hole check and the scheduled agents, all as Omnigent policies.</td>
+</tr>
+</table>
+
+All of it sits on Omnigent's own seams: a series of small core patches that CI re-applies on every run ([patches/README.md](patches/README.md)), a policy package, an extension, and a few out-of-tree routes. The [feature gallery](docs/features/README.md) has everything on one page.
+
+## Documentation
+
+- [Feature gallery](docs/features/README.md): every feature on one page, with where to find it and what builds it
+- [Deploy guide](deploy/README.md): run it as a service: compose, TLS, sign-in, a host for the agents, automatic updates and rollback
+- [Core patches](patches/README.md): every change to Omnigent's own code, one patch each, and why
+- [Upstream sync](docs/UPSTREAM-SYNC.md): how the pin moves to a new Omnigent release
+- [Session labels](docs/LABELS.md): the ae.* labels the policies read and write
+- [Plan limits](docs/PLAN-LIMITS.md): where the Claude Code and Codex plan limits come from
+- [Changelog](docs/CHANGELOG.md): the dated build diary
+
+<!-- showcase:end -->
+
+## How the fork stays thin
+
+Upstream is pinned as a submodule at a release tag, the AE layer sits out of tree on
+Omnigent's own plugin seams (policies, extensions, out-of-tree routers), and the few
+unavoidable core changes are a small patch series that CI re-applies on every run. See
+`docs/UPSTREAM-SYNC.md` for how the pin moves.
 
 ## Status
 
@@ -100,9 +153,10 @@ optional, and each says what is missing instead of failing:
 | Integration | Variables | Without them |
 |---|---|---|
 | task-store: the Parking Lot page, Your move's lot block, `park_fork` and `list_parked` in the agents' MCP server, the steward's brief | `AE_TASK_STORE_URL`, `AE_CF_ACCESS_CLIENT_ID`, `AE_CF_ACCESS_CLIENT_SECRET` | `/v1/ae/lot*` answers 503 "task-store is not configured" naming the two variables; everything else runs. task-store is Analytic Endeavors' own task app behind Cloudflare Access and is not published, so these features need an equivalent service or stay off |
-| GitHub: Your move's pull requests, the PR cards' Merge button | `AE_GITHUB_TOKEN`, `AE_GITHUB_REPOS`, `AE_GITHUB_LOGIN` | both sections say how to add the token |
+| GitHub: Your move's pull requests, the PR cards' Merge button | `AE_GITHUB_TOKEN`, `AE_GITHUB_REPOS`, `AE_GITHUB_LOGIN` | both sections say how to add the token; without `AE_GITHUB_REPOS` Your move asks for the repos, and without `AE_GITHUB_LOGIN` it counts the token's own login |
 | Fabric capacities in the Admin Center | `AE_FABRIC_WAKE_URL_<NAME>`, `AE_FABRIC_SUSPEND_KEY_<NAME>`; for every capacity with Pause, Start and resize, `AE_FABRIC_CAPACITIES_URL` and `AE_FABRIC_CAPACITIES_KEY` (2026-10-21) | `GET /v1/ae/fabric` says how to add one; a capacity with no suspend key has Wake only; without the fleet pair only the wake URL capacities show and resize answers 409 |
 | Databricks spend in the Admin Center | `AE_DATABRICKS_HOST`, `AE_DATABRICKS_CLIENT_ID`, `AE_DATABRICKS_CLIENT_SECRET` | the section is off; `GET /v1/ae/databricks` says how to add them |
+| Azure spend card in the Admin Center | `AE_AZURE_COST_SUBSCRIPTIONS`, `AE_AZURE_COST_TENANT_ID`, `AE_AZURE_COST_CLIENT_ID`, `AE_AZURE_COST_CLIENT_SECRET` | the card is off; `GET /v1/ae/azure-cost` says how to add them |
 | the policy model (fork classifier) | the `llm:` block in `config/server.yaml` | the classifier abstains |
 | Azure Key Vault | none in the server; `deploy/pull-secrets.sh` only | nothing: the server reads environment variables, so fill the secrets file another way |
 
@@ -111,7 +165,11 @@ The slot limit is the exception, read once at startup: `AE_SLOT_LIMIT` in
 slot cap and every slot count in the UI, so four slots is `AE_SLOT_LIMIT=4` and
 `deploy/compose.sh up -d --force-recreate omnigent`. A value that is not a whole
 number of one or more stops the server at startup with `AE_SLOT_LIMIT` named in the
-log.
+log. Since 2026-10-22 an admin can also set it without a restart: a `limit` on the
+slot cap on Settings > Global Policies replaces `AE_SLOT_LIMIT` for the cap and for
+every count (with several slot caps on, the lowest limit, a cap without one counting
+as `AE_SLOT_LIMIT`). The web UI shows the new number on a reload, or when its window
+regains focus once its last read is five minutes old.
 
 The AE policies are switched, edited and deleted on Settings > Global Policies
 since 2026-10-18; `config/server.yaml` only seeds a brand-new server
@@ -139,7 +197,7 @@ packages/ae_omni_extension the Dashboard (the Parking Lot and Your move pages un
 agents/                   steward, shutdown, orchestrator and reviewer-codex as single-file agent.yaml specs (OMNIGENT_BUILTIN_AGENT_DIRS)
 config/server.yaml        the server config that loads the AE layer (policy_modules, debug_router_modules, ae_seed_policies (the Global Policies page's first-boot seed since 2026-10-18), the commented llm: examples, the agents' environment)
 config/*.env.example      every variable the server (server.env.example) and the box host (host.env.example) read; the box copies them to config/*.env, gitignored
-scripts/                  check-lock, apply-patches, export-patches, rebase-patches, sync-upstream, next-release-tag, regen-golden-note, port-triage-fixtures, backfill-triage-notes, claude-effort-defaults, seed-schedules, ae-health (plus _lib.sh)
+scripts/                  check-lock, apply-patches, export-patches, rebase-patches, sync-upstream, next-release-tag, regen-golden-note, port-triage-fixtures, backfill-triage-notes, claude-effort-defaults, seed-schedules, ae-health, docs-coverage (plus _lib.sh)
 justfile                  every command in one place; CI calls the same recipes
 deploy/                   the box: Dockerfile (stage 2 of the image), docker-compose.override.yml, compose.sh, auto-update.sh, systemd/ (four units, plus the auto-update and plan limits timers under user/), ae-limits-statusline.sh, pull-secrets.sh, backup-omnigent.sh, install-host.sh, host-container.sh and host-container/ (the second user's host), host-relink.sh, README.md (the deploy guide)
 tests/deploy/             what a machine with no Docker daemon and no systemd can prove about deploy/ and the release workflow (run by `just test`)
@@ -150,6 +208,8 @@ docs/screenshots/         evidence per phase (phase-2: the sidebar; plan-limits:
 docs/UPSTREAM-SYNC.md     the sync procedure and what CI enforces
 docs/CHANGELOG.md         the history, newest first
 docs/design/              design notes (dashboard-review.md)
+docs/features/            the feature gallery: one page per area, each feature with its clip or screenshot, where to find it, and the core patch or package that builds it
+docs/media/               the gallery's animated WebP clips, screenshots and the README banner, cut from renders of the fork's real UI on made-up data
 .github/workflows/        ci.yml (patches, upstream-smoke, python, web, image, rules) image.yml (publish on an ae-v* tag), release.yml (tag main after green CI) and patch-rebase.yml (rebase open patch PRs after a merge)
 CLAUDE.md                 rules for Claude sessions here, plus the managed branch-discipline block
 ```
@@ -181,6 +241,7 @@ just triage-fixtures P # re-port the nine triage-gate scenarios from scripts/tes
 just sync vX.Y.Z      # move the pin (docs/UPSTREAM-SYNC.md)
 just schedules-seed U # create or update the two scheduled tasks on the server at U (Phase 5)
 just ae-health U      # GET /v1/ae/health on the server at U with the stored login (Phase 6)
+just docs-coverage T  # core patches since release tag T that no page under docs/features covers (the public release checks this)
 ```
 
 `just dev` exports `OMNIGENT_EXTENSION_DEV_BUNDLES` so the server reads the page's
@@ -222,12 +283,12 @@ at the CLI does, from what `omnigent login` wrote: the `server` key in
 `~/.omnigent/config.yaml`, else the one login in `~/.omnigent/auth_tokens.json`
 (refusing to guess among several), and uses the token stored for it
 (`packages/ae_omni_policies/src/ae_omni_policies/omni.py`, 2026-09-24). The MCP
-server talks only to the OmniGent server; the task-store credential stays in the
+server talks only to the Omnigent server; the task-store credential stays in the
 server's environment.
 
 The orchestrator (2026-09-25) is the interactive one: the operator talks to it from the phone
 and it runs box sessions the way a cloud Claude Code orchestrator does
-(start one from the OmniGent app: New session, pick the agent **orchestrator**).
+(start one from the Omnigent app: New session, pick the agent **orchestrator**).
 Its session tools go through `POST /v1/ae/sessions` (a slot held first under the slot cap's own lock,
 idempotent by `ae.orch_key`) and `GET /v1/ae/sessions`; `list_prs` reads the
 server's cards and `gh` on the host (`ae_omni_policies/gh.py`, read only);
@@ -250,10 +311,10 @@ directory name).
 
 ## Second user's host (container)
 
-Since 2026-10-20 a second OmniGent user can run agents on the box with no shared
+Since 2026-10-20 a second Omnigent user can run agents on the box with no shared
 files, logins or network reach with the primary user's: each such user gets a compose
 project `omnigent-host-<user>` (`deploy/host-container.sh`, `deploy/host-container/`),
-an OmniGent host container built from the pinned, patched submodule with its
+an Omnigent host container built from the pinned, patched submodule with its
 own home volume and non-root user, an internal network shared with the server
 container only, and a Squid egress proxy that refuses every private and tailnet
 destination. The server's side is one network per user in
@@ -319,6 +380,19 @@ patches-check` and `just lint`, pushes the fork topic branch and the PR branch w
 the `PATCH_BOT_TOKEN` secret, and comments the new patch number. A conflict it does
 not settle pushes nothing and comments the files that need a person. What it
 resolves and how: `docs/UPSTREAM-SYNC.md`, "Patch rebase bot".
+
+Supply chain (2026-10-22). Every third-party action is pinned to a commit with its
+release in a comment, so a moved tag cannot change what runs; `tests/deploy` fails on
+an unpinned `uses:`. Dependabot runs in the maintainer's private repository, where
+it opens weekly updates for the actions, the two Python packages, the extension's
+web workspace and the host container's egress proxy image (minor and patch bumps
+grouped, each major on its own); they reach this repository in its next release,
+and the upstream submodule is left to `upstream.lock`. When a public repository
+publishes, `image.yml` also pushes a build provenance attestation beside each
+image (`gh attestation verify oci://<image>:<tag> -R <owner>/<repo>` checks it), and
+`.github/workflows/scorecard.yml` runs OpenSSF Scorecard weekly and on every push to
+`main` for the badge above; a private copy skips both. `.github/CODEOWNERS` requests
+the maintainer's review on every pull request.
 
 ## Secrets
 

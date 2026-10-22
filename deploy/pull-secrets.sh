@@ -10,12 +10,11 @@
 # mv), so a reader never sees a half-written file and a failed run leaves the
 # previous one in place:
 #
-#   /secure/env/omnigent-ae.env    POSTGRES_PASSWORD, AE_CF_ACCESS_CLIENT_ID,
-#                                  AE_CF_ACCESS_CLIENT_SECRET, OMNIGENT_OIDC_CLIENT_SECRET,
-#                                  OMNIGENT_OIDC_COOKIE_SECRET, optional: AE_GITHUB_TOKEN,
-#                                  AE_FABRIC_WAKE_URL_AETRAINING, AE_FABRIC_SUSPEND_KEY_AETRAINING,
-#                                  AE_FABRIC_CAPACITIES_URL, AE_FABRIC_CAPACITIES_KEY, AE_DATABRICKS_CLIENT_ID,
-#                                  AE_DATABRICKS_CLIENT_SECRET, AE_SHARED_ACCOUNTS_KEY  (the server)
+#   /secure/env/omnigent-ae.env    POSTGRES_PASSWORD, AE_CF_ACCESS_CLIENT_ID, AE_CF_ACCESS_CLIENT_SECRET,
+#                                  OMNIGENT_OIDC_CLIENT_SECRET, OMNIGENT_OIDC_COOKIE_SECRET, optional: AE_GITHUB_TOKEN,
+#                                  AE_FABRIC_WAKE_URL_AETRAINING, AE_FABRIC_SUSPEND_KEY_AETRAINING, AE_FABRIC_CAPACITIES_URL,
+#                                  AE_FABRIC_CAPACITIES_KEY, AE_DATABRICKS_CLIENT_ID, AE_DATABRICKS_CLIENT_SECRET,
+#                                  AE_AZURE_COST_TENANT_ID, AE_AZURE_COST_CLIENT_ID, AE_AZURE_COST_CLIENT_SECRET, AE_SHARED_ACCOUNTS_KEY  (the server)
 #   /secure/env/omnigent-host.env  CLAUDE_CODE_OAUTH_TOKEN      (the host)
 #
 # The non-secret settings live in config/server.env and config/host.env (from
@@ -75,6 +74,9 @@ KV_FABRIC_CAPACITIES_KEY="${KV_FABRIC_CAPACITIES_KEY:-fabric-capacities-key}"
 # needed; absent, the section says how to add them.
 KV_DATABRICKS_CLIENT_ID="${KV_DATABRICKS_CLIENT_ID:-databricks-mvp-client-id}"
 KV_DATABRICKS_CLIENT_SECRET="${KV_DATABRICKS_CLIENT_SECRET:-databricks-mvp-client-secret}"
+KV_AZURE_COST_TENANT_ID="${KV_AZURE_COST_TENANT_ID:-azure-cost-tenant-id}"
+KV_AZURE_COST_CLIENT_ID="${KV_AZURE_COST_CLIENT_ID:-azure-cost-client-id}"
+KV_AZURE_COST_CLIENT_SECRET="${KV_AZURE_COST_CLIENT_SECRET:-azure-cost-client-secret}"
 # Optional (2026-10-20, shared Claude accounts): the Fernet key that encrypts the
 # shared accounts' tokens at rest (deploy/README.md, "Shared Claude accounts").
 # Absent, the Admin Center's section says so and no shared account can be added or used.
@@ -95,7 +97,7 @@ HOST_KEYS=(CLAUDE_CODE_OAUTH_TOKEN)
 # (packages/ae_omni_policies/src/ae_omni_policies/secrets_health.py, with what
 # each key turns on); a test fails when the two differ, so a new key goes there too.
 # Written when the vault has them, reported but never required by --check.
-SERVER_OPTIONAL_KEYS=(AE_GITHUB_TOKEN AE_FABRIC_WAKE_URL_AETRAINING AE_FABRIC_SUSPEND_KEY_AETRAINING AE_FABRIC_CAPACITIES_URL AE_FABRIC_CAPACITIES_KEY AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY)
+SERVER_OPTIONAL_KEYS=(AE_GITHUB_TOKEN AE_FABRIC_WAKE_URL_AETRAINING AE_FABRIC_SUSPEND_KEY_AETRAINING AE_FABRIC_CAPACITIES_URL AE_FABRIC_CAPACITIES_KEY AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_AZURE_COST_TENANT_ID AE_AZURE_COST_CLIENT_ID AE_AZURE_COST_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY)
 
 usage() {
   # The header comment, up to the first blank-free `set` line.
@@ -224,6 +226,7 @@ main() {
   local AE_FABRIC_WAKE_URL_AETRAINING AE_FABRIC_SUSPEND_KEY_AETRAINING
   local AE_FABRIC_CAPACITIES_URL AE_FABRIC_CAPACITIES_KEY
   local AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY
+  local AE_AZURE_COST_TENANT_ID AE_AZURE_COST_CLIENT_ID AE_AZURE_COST_CLIENT_SECRET
   note "reading ${#SERVER_KEYS[@]} + ${#HOST_KEYS[@]} secrets from vault '$VAULT'"
   fetch POSTGRES_PASSWORD "$KV_POSTGRES_PASSWORD"
   fetch AE_CF_ACCESS_CLIENT_ID "$KV_CF_ACCESS_CLIENT_ID"
@@ -238,6 +241,9 @@ main() {
   fetch_optional AE_FABRIC_CAPACITIES_KEY "$KV_FABRIC_CAPACITIES_KEY" "the Admin Center's full capacity list and resize"
   fetch_optional AE_DATABRICKS_CLIENT_ID "$KV_DATABRICKS_CLIENT_ID" "the Admin Center's Databricks section"
   fetch_optional AE_DATABRICKS_CLIENT_SECRET "$KV_DATABRICKS_CLIENT_SECRET" "the Admin Center's Databricks section"
+  fetch_optional AE_AZURE_COST_TENANT_ID "$KV_AZURE_COST_TENANT_ID" "the Admin Center's Azure card"
+  fetch_optional AE_AZURE_COST_CLIENT_ID "$KV_AZURE_COST_CLIENT_ID" "the Admin Center's Azure card"
+  fetch_optional AE_AZURE_COST_CLIENT_SECRET "$KV_AZURE_COST_CLIENT_SECRET" "the Admin Center's Azure card"
   fetch_optional AE_SHARED_ACCOUNTS_KEY "$KV_SHARED_ACCOUNTS_KEY" "shared Claude accounts"
 
   local stamp
@@ -270,6 +276,15 @@ main() {
     fi
     if [ -n "$AE_DATABRICKS_CLIENT_SECRET" ]; then
       printf '%s=%s\n' AE_DATABRICKS_CLIENT_SECRET "$AE_DATABRICKS_CLIENT_SECRET"
+    fi
+    if [ -n "$AE_AZURE_COST_TENANT_ID" ]; then
+      printf '%s=%s\n' AE_AZURE_COST_TENANT_ID "$AE_AZURE_COST_TENANT_ID"
+    fi
+    if [ -n "$AE_AZURE_COST_CLIENT_ID" ]; then
+      printf '%s=%s\n' AE_AZURE_COST_CLIENT_ID "$AE_AZURE_COST_CLIENT_ID"
+    fi
+    if [ -n "$AE_AZURE_COST_CLIENT_SECRET" ]; then
+      printf '%s=%s\n' AE_AZURE_COST_CLIENT_SECRET "$AE_AZURE_COST_CLIENT_SECRET"
     fi
     if [ -n "$AE_SHARED_ACCOUNTS_KEY" ]; then
       printf '%s=%s\n' AE_SHARED_ACCOUNTS_KEY "$AE_SHARED_ACCOUNTS_KEY"

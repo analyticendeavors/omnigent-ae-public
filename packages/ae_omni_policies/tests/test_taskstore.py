@@ -119,7 +119,12 @@ def test_settings_from_env() -> None:
     assert settings.configured
     assert settings.tz == notes.DEFAULT_TZ
     assert not Settings.from_env({}).configured
-    assert Settings.from_env({}).app_url == "https://tasks.go-ae.org"
+    assert Settings.from_env({}).app_url == ""
+    # A service token without an origin never calls anyone's app (2026-10-22).
+    token_only = Settings.from_env(
+        {"AE_CF_ACCESS_CLIENT_ID": "id", "AE_CF_ACCESS_CLIENT_SECRET": "secret"}
+    )
+    assert not token_only.configured
 
 
 async def test_list_parked_maps_the_lot() -> None:

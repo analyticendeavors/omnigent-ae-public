@@ -390,6 +390,8 @@ export interface YourMove {
         items: WaitingPull[];
         errors: { repo: string; message: string }[];
         note?: string;
+        /** Why the section is off: no token, or a token but no AE_GITHUB_REPOS (2026-10-22). */
+        missing?: "token" | "repos";
       }
     | SourceError;
 }
@@ -815,3 +817,40 @@ export interface AccountsAnswer {
 
 export const fetchAccounts = (context: ExtensionContext) =>
   call<AccountsAnswer>(context, "GET", "/v1/ae/limits/accounts");
+
+export interface AzureFlag {
+  resource: string;
+  subscription: string;
+  day: string;
+  cost: number;
+  average: number;
+  ratio: number;
+}
+
+export interface AzureView {
+  currency: string;
+  month: { spent: number; pace: number | null; lastMonth: number; through: string | null };
+  daily: Array<{ date: string; cost: number }>;
+  subscriptions: Array<{
+    id: string;
+    name: string;
+    spent: number;
+    /** Its own billing currency; a row not counted is never converted into the total's. */
+    currency: string;
+    counted: boolean;
+    error: string | null;
+  }>;
+  services: Array<{ name: string; cost: number }>;
+  flags: AzureFlag[];
+}
+
+export interface AzureCostAnswer {
+  configured: boolean;
+  note: string | null;
+  reading?: boolean;
+  asOf?: string | null;
+  view?: AzureView | null;
+}
+
+export const fetchAzureCost = (context: ExtensionContext) =>
+  call<AzureCostAnswer>(context, "GET", "/v1/ae/azure-cost");

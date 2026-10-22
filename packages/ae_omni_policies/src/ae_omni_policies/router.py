@@ -21,6 +21,8 @@ replaces stopping the auto-update timer by hand. The POSTs are JSON-only and
 origin-checked like the sidebar's ``PUT``. Resume is a POST, not a DELETE,
 because the page's extension SDK sends only GET, POST and PATCH.
 
+2026-10-22 (Admin Center, Azure card) added ``GET /azure-cost``
+(:mod:`ae_omni_policies.azure_cost`).
 2026-10-19 (Admin Center, Databricks) added ``GET /databricks``,
 ``POST /databricks/warehouses/{id}/start`` and ``.../stop``, and
 ``POST /databricks/spend/refresh`` (:mod:`ae_omni_policies.databricks`): the
@@ -143,6 +145,7 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from ae_omni_policies import (
     __version__,
+    azure_cost,
     databricks,
     deploy_hold,
     fabric,
@@ -161,6 +164,7 @@ from ae_omni_policies import (
     shared_accounts_routes,
     sidebar_prefs,
     slot_cap,
+    slot_limit,
     your_move,
 )
 from ae_omni_policies.auth import require_ae_user
@@ -396,9 +400,9 @@ def _not_configured(settings: Settings) -> JSONResponse:
     return _error(
         503,
         CODE_NOT_CONFIGURED,
-        "task-store is not configured: set AE_CF_ACCESS_CLIENT_ID and "
-        "AE_CF_ACCESS_CLIENT_SECRET (the Cloudflare Access service token) in the "
-        "server's environment.",
+        "task-store is not configured: set AE_TASK_STORE_URL (the app's origin), "
+        "AE_CF_ACCESS_CLIENT_ID and AE_CF_ACCESS_CLIENT_SECRET (the Cloudflare Access "
+        "service token) in the server's environment.",
         url=settings.app_url,
     )
 
@@ -495,7 +499,9 @@ async def capacity() -> dict[str, Any]:
     holds a slot, 2026-09-25). ``unlabelled_running`` catches sessions the slot
     cap has not placed yet.
     """
-    rows = await asyncio.to_thread(sessions.list_top_level)
+    rows, limit = await asyncio.gather(
+        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.effective_limit)
+    )
     now = time.time()
     # The clock, in the zone resurface dates are reckoned in, so a scheduled
     # agent can say which lot items resurface today without guessing the date
@@ -522,7 +528,7 @@ async def capacity() -> dict[str, Any]:
         elif item.status is None and item.live_status == "running":
             by_status["unlabelled_running"].append(item.as_dict())
     return {
-        "limit": labels.SLOT_LIMIT,
+        "limit": limit,
         "slots_used": len(by_status["working"]),
         "now": local_now.isoformat(timespec="seconds"),
         "today": local_now.date().isoformat(),
@@ -1377,7 +1383,9 @@ async def orchestrated_sessions() -> dict[str, Any]:
     What the orchestrator reads on each check-in to find the session that owns a
     pull request (by ``ae.repo`` and ``ae.branch``) and the ones to close out.
     """
-    rows = await asyncio.to_thread(sessions.list_top_level)
+    rows, limit = await asyncio.gather(
+        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.effective_limit)
+    )
     now = time.time()
     items = []
     for conv in rows:
@@ -1397,7 +1405,7 @@ async def orchestrated_sessions() -> dict[str, Any]:
         )
     working = sessions.working_sessions(rows)
     return {
-        "limit": labels.SLOT_LIMIT,
+        "limit": limit,
         "slots_used": len(working),
         "items": items,
     }
@@ -1430,7 +1438,8 @@ async def start_session(request: Request, body: SessionRequest) -> dict[str, Any
     if live is not None:
         return _existing(live) | {"key": key}
     hold = f"orch:{key}"
-    held, full, working, pending = slot_cap.reserve(hold, rows, riding=body.ride_unparked)
+    limit = await asyncio.to_thread(slot_limit.effective_limit)
+    held, full, working, pending = slot_cap.reserve(hold, rows, limit, riding=body.ride_unparked)
     if not held:
         now = time.time()
         return _error(
@@ -1438,13 +1447,13 @@ async def start_session(request: Request, body: SessionRequest) -> dict[str, Any
             CODE_SLOTS_FULL,
             slot_cap.reason_text(
                 [sessions.summarize(conv, now=now) for conv in working],
-                labels.SLOT_LIMIT,
+                limit,
                 "block",
                 None,
                 pending=pending,
             ),
             working=[sessions.summarize(conv, now=now).as_dict() for conv in working],
-            limit=labels.SLOT_LIMIT,
+            limit=limit,
         )
     try:
         return await _create_briefed(request, body, key, overflow=full)
@@ -2051,6 +2060,23 @@ def _databricks_failure(exc: databricks.DatabricksError) -> JSONResponse:
 
 def _databricks_not_configured() -> JSONResponse:
     return _error(409, databricks.CODE_NOT_CONFIGURED, databricks.not_configured_note())
+
+
+@router.get("/azure-cost", response_model=None)
+async def azure_cost_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """This month's Azure spend across the configured subscriptions; admins only.
+
+    Never waits on Azure: it answers the cache and starts a background reading
+    when the cache is over an hour old (:mod:`.azure_cost`). Without a service
+    principal, ``note`` says how to turn the card on. Admins only since
+    2026-10-22: tenant spend and resource names are not for every signed-in user.
+    """
+    if (refused := await _admin_only(request, user, "see Azure spend")) is not None:
+        return refused
+    return await azure_cost.overview()
 
 
 @router.get("/databricks")

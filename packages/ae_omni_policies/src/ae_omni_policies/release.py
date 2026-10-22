@@ -9,7 +9,8 @@ newer one is waiting, and how many sessions it is waiting on.
 - ``running``: ``OMNIGENT_IMAGE_TAG``, which compose hands the server from
   ``config/server.env`` (the tag the box deployed).
 - ``latest``: the highest ``ae-vX.Y.Z.N`` tag on ``AE_RELEASE_REPO``
-  (``analyticendeavors/omnigent-ae``) through the server's GitHub token, cached
+  (default ``analyticendeavors/omnigent-ae-public``; AE's box sets its private
+  repo) through the server's GitHub token, cached
   for two minutes behind one lock; ``null`` when GitHub is off or fails
   (``error`` says why).
 - ``state`` says only that a newer tag exists, not that the box will install
@@ -36,7 +37,9 @@ from ae_omni_policies import env_drift, github, sessions
 
 RUNNING_ENV = "OMNIGENT_IMAGE_TAG"
 REPO_ENV = "AE_RELEASE_REPO"
-DEFAULT_REPO = "analyticendeavors/omnigent-ae"
+# The public repository, which every operator can read (2026-10-22); a fork
+# that publishes its own image sets AE_RELEASE_REPO.
+DEFAULT_REPO = "analyticendeavors/omnigent-ae-public"
 CACHE_S = 120.0
 _TAG = re.compile(r"^ae-v(\d+(?:\.\d+)+)$")
 _MID_TURN = {"running", "waiting"}

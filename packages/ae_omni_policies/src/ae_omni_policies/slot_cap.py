@@ -175,9 +175,10 @@ def slot_cap(
     """Factory: gate the request phase on the number of working sessions.
 
     :param limit: Working sessions allowed at once; :data:`labels.SLOT_LIMIT`, which
-        is ``AE_SLOT_LIMIT`` from the environment (three when unset), unless a
-        caller passes its own. ``config/server.yaml`` passes none, so the
-        environment is the one setting (2026-09-24).
+        is ``AE_SLOT_LIMIT`` from the environment (three when unset), unless the
+        policy's parameters set one. The seed sets none; a limit set on Settings >
+        Global Policies wins, and since 2026-10-22 every count in the UI follows it
+        too (:mod:`ae_omni_policies.slot_limit`).
     :param mode: ``warn`` holds the prompt for approval (ASK); ``block`` drops it (DENY).
     :param lot_url: Optional link to the Parking Lot page, named in the reason text.
     :returns: The policy callable.

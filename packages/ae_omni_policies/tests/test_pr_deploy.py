@@ -32,7 +32,8 @@ def _env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     release.reset_cache()
     pr_deploy.reset_cache()
     monkeypatch.setenv("AE_GITHUB_TOKEN", "test-token")
-    monkeypatch.delenv("AE_RELEASE_REPO", raising=False)
+    # AE's box sets its private repo; the default is the public one (2026-10-22).
+    monkeypatch.setenv("AE_RELEASE_REPO", "analyticendeavors/omnigent-ae")
     monkeypatch.delenv("AE_GITHUB_API_URL", raising=False)
     monkeypatch.setenv("OMNIGENT_IMAGE_TAG", "ae-v0.18.0.31")
     monkeypatch.setenv("AE_SERVER_ENV_EXAMPLE", "/nonexistent-ae-config/server.env.example")

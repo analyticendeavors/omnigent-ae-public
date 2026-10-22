@@ -55,6 +55,21 @@ print(json.dumps([[p.id, p.name] for p in store.list_defaults()]))
 """
 
 
+# One container boot that seeds a slot cap with a limit: the slot counts' source
+# (slot_limit.effective_limit) must answer the seeded limit, not AE_SLOT_LIMIT.
+_SLOT_PROBE = """
+import json, os, sys
+sys.path.insert(0, {upstream!r})
+from ae_omni_policies import docker_entrypoint
+docker_entrypoint.install()
+import deploy.docker.entrypoint as ep
+ep.run_migrations(os.environ["DATABASE_URL"])
+ep.build_app()
+from ae_omni_policies import labels, slot_limit
+print(json.dumps([labels.SLOT_LIMIT, slot_limit.effective_limit()]))
+"""
+
+
 # The middleware classes on the container app, by name.
 _MIDDLEWARE_PROBE = """
 import json, sys
@@ -183,6 +198,22 @@ def test_a_seed_the_factory_rejects_stops_the_container(tmp_path: Path) -> None:
     ran = _run_probe(tmp_path, _SEED_PROBE.format(upstream=str(UPSTREAM)), config)
     assert ran.returncode != 0
     assert "does not build with these params" in ran.stderr
+
+
+def test_the_container_hands_the_slot_counts_the_policy_store(tmp_path: Path) -> None:
+    """A limit set on the slot cap (here by the seed) reaches every count (2026-10-22)."""
+    config = (
+        "policy_modules: [ae_omni_policies]\n"
+        "ae_seed_policies:\n"
+        "  ae_slot_cap:\n"
+        "    type: function\n"
+        "    handler: ae_omni_policies.slot_cap.slot_cap\n"
+        "    factory_params: {mode: warn, limit: 6}\n"
+    )
+    ran = _run_probe(tmp_path, _SLOT_PROBE.format(upstream=str(UPSTREAM)), config)
+    assert ran.returncode == 0, ran.stderr[-4000:]
+    env_limit, counted = json.loads(ran.stdout.strip().splitlines()[-1])
+    assert (env_limit, counted) == (3, 6)
 
 
 def test_config_kwargs_reads_both_keys_and_skips_absent_ones() -> None:

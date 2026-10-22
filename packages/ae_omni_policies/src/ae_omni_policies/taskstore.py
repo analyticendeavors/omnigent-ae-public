@@ -63,7 +63,9 @@ from ae_omni_policies.notes import (
 
 _logger = logging.getLogger(__name__)
 
-DEFAULT_APP_URL = "https://tasks.go-ae.org"
+# No default origin (2026-10-22): an unset AE_TASK_STORE_URL means
+# task-store is off, so a server never calls Analytic Endeavors' own app.
+DEFAULT_APP_URL = ""
 REQUEST_TIMEOUT_S = 10.0
 # Distinct from the worker's "fork-triage" so a task's origin says which door
 # filed it. The re-read after a failed create matches on it.
@@ -148,8 +150,8 @@ class Settings:
 
     @property
     def configured(self) -> bool:
-        """Whether both halves of the service token are present."""
-        return bool(self.client_id and self.client_secret)
+        """Whether the app's origin and both halves of the service token are present."""
+        return bool(self.app_url and self.client_id and self.client_secret)
 
 
 @dataclass(frozen=True)

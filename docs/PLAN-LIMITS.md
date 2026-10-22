@@ -533,6 +533,21 @@ device, and older saved layouts load with it on; Settings > Chat, a section adde
 chat options, carries the switch "Open the session rail in every session". Off, the rail
 behaves as before.
 
+When a session opens (patch 0155, 2026-10-22, Session rail by default): Reid still saw
+sessions open on the files panel, not the rail. On a wide window the restore rule kept a
+panel that fit, and before a resize measured it the shell's first restore assumed the
+panel's 240 px minimum, so the panel came back and the rail made way for it. The switch
+became a three-way choice, Settings > Chat > "When a session opens, show": Session rail
+(`rail`, the default) opens the rail and starts a restored panel closed whether or not
+the two fit; Both when they fit (`both`) is the old switch on, the restore rule above;
+Workspace panel (`panel`) is the old switch off. In all three a file, agents or comment
+link in the URL opens the panel, and the user can open either pane by hand afterwards.
+A new chat's temp id draws no rail, so under Session rail it keeps the Both rule. The choice is `sessionOpenView` in `ae.sessionRail.v1`, per device; a layout saved with
+the old switch off loads as Workspace panel, and any other layout as Session rail. The
+logic stays in `lib/aeSessionRail.ts` (`aeRailRestoredPanelOpen`,
+`aeRailSkipsRestoredPanel`, `aeRailOpensOnSwitch`); AppShell's two restore points are
+unchanged.
+
 Patch 0085 first closed the panels through the header toggle until the user's first
 click in the session. The review on 2026-10-18 found that this blocked keyboard users,
 closed panels the agent opened while the user typed, reopened the rail when a new chat's

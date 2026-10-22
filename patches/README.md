@@ -2173,3 +2173,152 @@ first push (2026-10-21, Codex and Claude code review): applied the Windows confi
 not invalidated (a different env is a different identity), and the 3 second wait stays
 below the 15 second `gh` timeout so a slow holder costs a waiter at most 3 seconds. It
 sits on the fork branch `analyticendeavors/omnigent@ae/gh-auth-cache`, after `0147`.
+
+`0149` (2026-10-21) shows open draft pull requests in the action dock. The dock took only
+cards where `aeReadyToMerge` holds, which needs `mergeable.state === "clean"`; a draft's
+state is `"draft"`, so every draft was dropped. `lib/aeActionDock.ts` adds the `draft`
+kind (`aeDockDrafts`, ranked after `merge` and before `deploy`, badge "#n draft" or
+"n drafts", line "draft · x/y checks"), and `aeDockMerges` now skips drafts so one pull
+request never yields both lines. The line's Mark ready button runs the card's own mutation,
+moved to `hooks/useAeMarkReady.ts` with a `mutationKey`, so the card, the strip and the
+tray share one in-flight state and none sends `/ready` twice; a failure turns the label to
+"Failed, retry" and puts the error in the title, since a phone shows no tooltip. Open
+pull requests that are not drafts and not ready (checks pending or failing, conflicts) stay
+out of the dock, as before. Tests: `lib/aeActionDock.test.ts` (drafts kept whatever their
+checks, ordering, badges, no merge line for a draft) and `components/AeActionDock.test.tsx`
+(Mark ready posts `/ready` and the line becomes Merge; a refused call shows on the button).
+Review before the first push (2026-10-21, Codex and Claude code review): applied the
+mutation key, the visible failure, "draft" in the tray line and the draft guard on merges;
+left as is: a draft outranks a held deploy (a draft waits on a click, a deploy on time), a
+line marked ready can vanish until GitHub reports it clean on the next poll, and drafts
+count as waiting (Reid chose the Mark ready line). It sits on the fork branch
+`analyticendeavors/omnigent@ae/dock-drafts`, after `0148`.
+
+`0150` (2026-10-21) turns the PR card under a chat message into a one-line receipt. The
+thread's card carried its own Merge while the action dock showed the same pull request's
+Merge, so two Merge buttons sat on one screen. The `inline` variant of `AePrCardView` is now
+one row, a button with `aria-expanded` (`data-testid="ae-pr-receipt"`): a state icon, `#n`,
+the title truncated, a status word and a chevron. Clicking it opens the old card's detail in
+place, minus Merge and the confirm step: the Ready line or chips, Update branch, Review
+details, AE compliance review, the merged note, and a muted line saying where to act ("Merge
+from the action bar", "Mark ready from the action bar" for a draft, "Merge from the GitHub
+panel" for one GitHub allows but does not call clean, which the dock does not list) beside
+the `repo #n` link. The word, its tone and the icon come from one pure function,
+`lib/aePrReceipt.ts`, so the color and the word cannot disagree. Precedence, first match
+wins: merged, closed, then draft, conflicts, failed checks, changes requested, checks
+running, behind the base with Update branch live, ready, and a waiting word. Colors: gray for
+draft (dashed ring) and closed (title dimmed), amber while checks run or a review asks for
+changes, red for conflicts or failed checks, blue when behind the base, green when ready,
+a purple ring once merged with the merge time, a solid purple check with a quiet "live" once
+the release runs it (the deploy query the dock already reads). Two decisions: "live" names
+no release, since the server cannot tell which one first shipped the merge; outside the
+release repo there is no deploy state, so the receipt ends at a solid "merged HH:MM". A merge
+made from the dock on this page shows in the receipt with its note and "Mark session done"
+offer, and the receipt opens on its own when it lands; a merge another session made of the
+same pull request is ignored. The merged fold's opened line uses the new `fold` variant (the
+detail only, no second row or link). The GitHub panel's card is unchanged. `AePrCard` gains
+the `merged_at` the server already sent. Tests: `lib/aePrReceipt.test.ts` (every word and
+tone, precedence, clock, hints), `components/AePrCards.test.tsx` (merged, live, non-release
+repo, colors, draft) and `components/AeInlinePrCards.test.tsx` (collapsed by default, opens
+in place with no Merge, a dock merge with the offer, another session's merge ignored).
+Review before the first push (2026-10-21, Codex and Claude code review): Codex found
+nothing; applied from the Claude leg: the hint names only a control that exists, blue only
+when Update branch is live, a failed draft says so, another session's merge is ignored, the
+receipt opens when a merge lands, and the fold shows no second link; left as is: the 24-hour
+"HH:MM" clock (the approved spec; the dock's deploy line uses the locale's clock), the
+collapsed row has no GitHub link (the spec puts it in the opened receipt), and the dated
+header comments (this repo's docs carry the why with dates). It sits on the fork branch
+`analyticendeavors/omnigent@ae/pr-receipt`, after `0149`.
+
+`0151` (2026-10-22) lets an extension open the Azure cost analysis page through
+`navigation.openExternal`. The Admin Center's Azure spend card (PR
+https://github.com/analyticendeavors/omnigent-ae/pull/223) offers "Open Cost Management",
+which the allowlist refused, so the card would only have shown the URL to copy.
+`isAeAzureCostLinkUrl` in `lib/aeExternalUrls.ts` admits exactly one URL, compared as a
+whole string: `https://portal.azure.com/#view/Microsoft_Azure_CostManagement/Menu/~/costanalysis`.
+It names no subscription, so the link reveals nothing and the portal asks the signed-in
+user which scope to show. Any other portal page, host, port, query or trailing character
+stays refused. Upstream hunk: the allowlist test in `navigation.openExternal`
+(`extensions/services/useExtensionHostServices.ts`, one more `&&` line). Tests:
+`aeExternalUrls.test.ts` and `useExtensionHostServices.aeGithub.test.tsx`, run by
+`just web-check`. It sits on the fork branch `analyticendeavors/omnigent@ae/azure-cost-link`,
+after `0150`.
+
+`0152` (2026-10-22) shows every open pull request of the session in the action dock. Until
+then the dock listed only drafts (`0149`) and pull requests ready to merge, so one still
+running checks, with conflicts or failed checks, waiting on a review, or behind its base
+had no line, and "merge when ready" left nothing to watch (Reid's report on
+https://github.com/analyticendeavors/omnigent-ae/pull/228, 2026-10-21, at "checks 11/12").
+A new dock kind, `waiting`, ranks after drafts and before deploys: `aeDockWaiting` in
+`lib/aeActionDock.ts` takes each open, non-draft pull request that `aeReadyToMerge` rejects
+and carries `aePrReceipt`'s word and tone, so the dock and the thread receipt always agree;
+the line's icon takes that tone and its badge reads "#228 checks 11/12" or "n not ready".
+The only button is Update branch, when `update_branch.allowed`: `hooks/useAeUpdateBranch.ts`
+uses the card's mutation key and `["ae-pr-branch-update", repo, number]` entry, so either
+button shows "Updating" in both. With no card mounted to clear that entry, it could outlive
+the update, so `aeBranchUpdatePending` counts it only while the head is unmoved and inside
+60 seconds; the dock's own card query fetches fresh and polls every 2 seconds in that
+window, and the dock's Confirm ignores a stale entry. Clicking the line does not open the
+GitHub panel (the panel's tab is AppShell state with no outside opener; the `#n` link keeps
+its hover preview and GitHub link). Tests: `lib/aeActionDock.test.ts` (every state, no
+overlap with merges or drafts, order, badges, the pending window) and
+`components/AeActionDock.test.tsx` (checks running turns into Merge, Update branch posts
+the head it saw, a stale entry leaves Confirm enabled, a closed pull request draws nothing).
+Review before the first push (2026-10-22, Codex and Claude code review): Codex found
+nothing; applied from the Claude leg: the stale entry no longer blocks Confirm, the fresh
+fetch and 2-second poll without a card, a timer frees the button when the window lapses,
+and the line's word is built from the card rather than cut from the receipt's text; left as
+is: no dismiss on a waiting line (every open pull request shows by request), the card keeps
+its own copy of the update mutation (moving it onto the hook is a separate refactor), Update
+branch shows beside a failure word, the badge stays amber for the group, and a refused
+update replaces the button with the card's new state. It sits on the fork branch
+`analyticendeavors/omnigent@ae/dock-waiting-prs`, after `0151`.
+
+`0153` (2026-10-22) blurs what is behind the slash command menu and the `@` file mention menu.
+Reid reported the Skills list hard to read: the dark theme's `--popover` is `#1a2129cc` (80%
+opaque) and the menu in `components/SlashCommandMenu.tsx` had no backdrop blur, so the chat text
+behind it showed through the rows (measured on the live page: background `rgba(26, 33, 41, 0.8)`,
+`backdrop-filter: none`; light themes are solid). The menu now carries `backdrop-blur-xl
+backdrop-saturate-150`, the frosted surface `shell/CodeViewer.tsx` and
+`shell/useMonacoCommentLayer.tsx` already give their popovers; injecting the same classes into
+the live menu left the text behind it unreadable and the rows clean. Reid asked for the `@` menu
+the same day, and `components/FileMentionMenu.tsx` has the same single `bg-popover` surface, so
+it gets the same classes. One class string each, no new token. The other 35 `bg-popover`
+surfaces have the same translucency and are left as they are. Tests:
+`components/SlashCommandMenu.test.tsx` and the new `components/FileMentionMenu.test.tsx` (each
+surface keeps the classes), run by `just web-check`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/skills-menu-blur`, after `0152`.
+
+`0154` (2026-10-22) keeps a waiting line's state word on a phone. The live check of `0152`
+(https://github.com/analyticendeavors/omnigent-ae/pull/240, in ae-v0.18.0.67) found that at
+390 px the line showed only "#240" and its amber icon: `ItemBody` in
+`components/AeActionDock.tsx` hides the detail below `md` for every pull request line,
+which suits merge and draft lines (their Merge and Mark ready buttons say the state) but
+leaves a waiting line, which mostly has no button, with nothing. The class now skips the
+`waiting` kind. Test: `components/AeActionDock.test.tsx` (the checks-running line's word is
+not hidden), run by `just web-check`. No review run (a one-condition change). It sits on
+the fork branch `analyticendeavors/omnigent@ae/dock-waiting-phone-word`, after `0153`.
+
+`0155` (2026-10-22) lets Settings > Chat choose what a session shows when it opens, with
+the session rail as the default. Reid wanted the rail, not the files panel, when a session
+opens: with "Open the session rail in every session" on, `aeRailRestoredPanelOpen` closed a
+restored workspace panel only when it and the rail would not fit, so on a wide window, or
+at the first restore (which passes no panel width and measures the 240 px minimum), the
+panel came back and the rail made way for it. The rail store's `openInEverySession` boolean
+becomes `sessionOpenView` in `lib/aeSessionRail.ts`: `rail` (Session rail, the new default)
+starts a restored panel closed on a desktop whether or not the two fit, `both` (Both when
+they fit) is the old switch on, `panel` (Workspace panel) is the old switch off. A file,
+agents or comment link still opens the panel under all three (the shell's existing URL
+signal), a new chat's `temp:` id (which draws no rail) keeps the `both` rule, and phones
+are unchanged. `readPersisted` reads a saved `openInEverySession:
+false` as `panel` and anything else without a saved choice as `rail`, and writes only the
+new field. Settings > Chat draws the choice as three cards with upstream's
+`CardRadioGroup`, the control Appearance uses for its Workspace panel default
+(`pages/settings/AeChatSettingsSection.tsx`). No upstream file changes but
+`test-setup.ts`, which seeds `panel` so upstream suites keep upstream's behavior. Tests:
+`lib/aeSessionRail.test.ts` (the three choices, the migration, the URL signal under
+`rail`), `shell/AeSessionRail.test.tsx`, `shell/AppShell.aeSessionRail.test.tsx` (a wide
+window under each choice, and a `?file=` link under `rail`) and
+`pages/settings/AeChatSettingsSection.test.tsx` (each card writes the store and storage),
+run by `just web-check`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/rail-default-choice`, after `0154`.

@@ -48,6 +48,9 @@ OPTIONAL: dict[str, str] = {
     "AE_FABRIC_CAPACITIES_KEY": "Fabric capacity list and resize",
     "AE_DATABRICKS_CLIENT_ID": "Databricks section",
     "AE_DATABRICKS_CLIENT_SECRET": "Databricks section",
+    "AE_AZURE_COST_TENANT_ID": "Azure card",
+    "AE_AZURE_COST_CLIENT_ID": "Azure card",
+    "AE_AZURE_COST_CLIENT_SECRET": "Azure card",
     "AE_SHARED_ACCOUNTS_KEY": "Shared Claude accounts",
 }
 

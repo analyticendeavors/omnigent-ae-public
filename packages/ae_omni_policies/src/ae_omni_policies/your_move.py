@@ -145,8 +145,8 @@ async def lot_source(today: str) -> dict[str, Any]:
     if not settings.configured:
         return _error(
             "task_store_not_configured",
-            "task-store is not configured: set AE_CF_ACCESS_CLIENT_ID and "
-            "AE_CF_ACCESS_CLIENT_SECRET in the server's environment.",
+            "task-store is not configured: set AE_TASK_STORE_URL, AE_CF_ACCESS_CLIENT_ID "
+            "and AE_CF_ACCESS_CLIENT_SECRET in the server's environment.",
         )
     async with TaskStoreClient(settings) as client:
         try:
@@ -237,7 +237,7 @@ async def pulls_source() -> dict[str, Any]:
 
 async def _read_pulls() -> dict[str, Any]:
     settings = github.GitHubSettings.from_env()
-    if not settings.configured:
+    if not settings.configured or not settings.repos:
         return {
             "ok": True,
             "configured": False,
@@ -245,7 +245,8 @@ async def _read_pulls() -> dict[str, Any]:
             "repos": list(settings.repos),
             "items": [],
             "errors": [],
-            "note": github.HOW_TO_ENABLE,
+            "note": github.HOW_TO_ENABLE if not settings.configured else github.NO_REPOS,
+            "missing": "token" if not settings.configured else "repos",
         }
     async with github.GitHubClient(settings) as client:
         result = await client.open_pulls()

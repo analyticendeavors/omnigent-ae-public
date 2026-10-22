@@ -1,0 +1,636 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 21 Oct 2026 22:27:55 -0700
+Subject: [PATCH 152/155] [ae-patch] Show every open pull request in the action
+ dock, with its state and Update branch when behind
+
+The dock listed only drafts and pull requests ready to merge, so one still running checks (or with conflicts, failed checks, a review pending, or behind main) had no line: asked to merge when ready, the user had nothing to watch. Each such pull request now gets a waiting line with the thread receipt's word and tone, after drafts and before deploys, and Update branch when GitHub allows it. It turns into the Merge line once ready. omnigent-ae, 2026-10-22.
+---
+ web/src/components/AeActionDock.test.tsx | 56 ++++++++++++++++-
+ web/src/components/AeActionDock.tsx      | 76 +++++++++++++++++++---
+ web/src/hooks/useAeActionDockItems.ts    | 31 +++++++--
+ web/src/hooks/useAeUpdateBranch.ts       | 58 +++++++++++++++++
+ web/src/lib/aeActionDock.test.ts         | 80 ++++++++++++++++++++++++
+ web/src/lib/aeActionDock.ts              | 73 +++++++++++++++++++--
+ 6 files changed, 354 insertions(+), 20 deletions(-)
+ create mode 100644 web/src/hooks/useAeUpdateBranch.ts
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 8b7c901ef88c0fa3cfa2c7f1db829c52e8663748..aadb27921f260783bbc53058c3ccd2f979ede6d9 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -164,9 +164,7 @@ afterEach(() => {
+ 
+ describe("AeActionDock", () => {
+   it("draws nothing when nothing waits", async () => {
+-    serve({
+-      7: card(7, { ci: { state: "failing", passing: 1, failing: 1, pending: 0, total: 2 } }),
+-    });
++    serve({ 7: card(7, { state: "closed" }) });
+     const { container } = renderDock([`Opened ${url(7)}`]);
+     await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
+     expect(container.querySelector("[data-testid=ae-action-dock]")).toBeNull();
+@@ -379,6 +377,58 @@ describe("AeActionDock", () => {
+     expect(screen.queryByTestId("ae-dock-ready")).toBeNull();
+   });
+ 
++  it("an open pull request still running checks shows its state, then turns into Merge", async () => {
++    serve({
++      180: card(180, { ci: { state: "pending", passing: 11, failing: 0, pending: 1, total: 12 } }),
++    });
++    const { qc } = renderDock([`Opened ${url(180)}`]);
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-dock-lead").textContent).toContain("checks 11/12"),
++    );
++    expect(screen.queryByTestId("ae-dock-merge")).toBeNull();
++    expect(screen.queryByTestId("ae-dock-update")).toBeNull();
++    serve({ 180: card(180) });
++    await act(async () => {
++      await qc.invalidateQueries({ queryKey: ["ae-pr", REPO, 180] });
++    });
++    await screen.findByTestId("ae-dock-merge");
++  });
++
++  it("a pull request behind main offers Update branch, which posts the head it saw", async () => {
++    serve({
++      180: card(180, {
++        mergeable: { state: "behind", detail: "" },
++        update_branch: { allowed: true, reason: null },
++        merge: { ...card(180).merge, allowed: false },
++      }),
++    });
++    renderDock([`Opened ${url(180)}`]);
++    const update = await screen.findByTestId("ae-dock-update");
++    expect(screen.getByTestId("ae-dock-lead").textContent).toContain("behind main");
++    vi.mocked(authenticatedFetch).mockImplementationOnce(() =>
++      json({ accepted: true, message: "", head_sha: SHA }),
++    );
++    await act(async () => {
++      fireEvent.click(update);
++    });
++    const posts = vi
++      .mocked(authenticatedFetch)
++      .mock.calls.filter(([, init]) => init?.method === "POST");
++    expect(posts.map(([path]) => path)).toEqual([`/v1/ae/prs/${REPO}/180/update-branch`]);
++    expect(JSON.parse(String(posts[0]![1]!.body))).toEqual({ sha: SHA });
++    await waitFor(() => expect(update.textContent).toBe("Updating…"));
++    expect(update).toBeDisabled();
++  });
++
++  it("an update entry left from an older head does not hold the dock's Confirm", async () => {
++    serve({ 180: card(180) });
++    const { qc } = renderDock([`Opened ${url(180)}`]);
++    qc.setQueryData(["ae-pr-branch-update", REPO, 180], { sha: "old-head", started: Date.now() });
++    fireEvent.click(await screen.findByTestId("ae-dock-merge"));
++    const confirm = await screen.findByTestId("ae-dock-confirm");
++    expect(within(confirm).getByRole("button", { name: "Squash into main" })).not.toBeDisabled();
++  });
++
+   it("a failed Mark ready says so on the button", async () => {
+     serve({ 180: card(180, { draft: true, mergeable: { state: "draft", detail: "" } }) });
+     renderDock([`Opened ${url(180)}`]);
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index 8a7da528daef615565091c569c16cb36194d8bb6..383b77c15520e8fb79051ca98bbaa7aea783e884 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -1,5 +1,5 @@
+ // The action dock: what waits on the user in this chat (a question, a pull
+-// request ready to merge, a merge on its way to the box), inside the composer's
++// request ready to merge or still open, a merge on its way to the box), inside the composer's
+ // workspace bar, and an account near its usage limit. The most urgent item sits after the folder and PR chips with
+ // its button, a badge per other kind sits before the bar's right cluster, and
+ // the caret opens a list as a tray above the bar (designs E1 and D3b). A question
+@@ -14,15 +14,20 @@ import { COMPOSER_CONTENT_INSET_CLASS } from "@/components/composer/ChatComposer
+ import { Button } from "@/components/ui/button";
+ import { useAeActionDockItems, useAeQuestionsOnScreen } from "@/hooks/useAeActionDockItems";
+ import { useAeMarkReady } from "@/hooks/useAeMarkReady";
++import { useAeUpdateBranch } from "@/hooks/useAeUpdateBranch";
+ import {
++  type AeBranchUpdate,
+   type AeDockDraft,
+   type AeDockItem,
+   type AeDockKind,
++  type AeDockWaiting,
++  aeBranchUpdatePending,
+   aeDeployText,
+   aeDockCountText,
+   aeDockSummary,
+   aeDraftText,
+   aeMergeText,
++  aeWaitingText,
+ } from "@/lib/aeActionDock";
+ import {
+   AE_ICON_ARROW_DOWN,
+@@ -39,6 +44,7 @@ import { AE_ICON_CHEVRON_DOWN } from "@/lib/aeAgentsIcons";
+ import { AE_ICON_CHECK, AE_ICON_MERGE, AE_ICON_PR_DRAFT, AE_ICON_PR_OPEN } from "@/lib/aePrIcons";
+ import { aeLimitGateShort, aeLimitGateText } from "@/lib/aeLimitGate";
+ import { AE_ADMIN_CENTER_PATH } from "@/lib/aePrDeploy";
++import type { AeReceiptTone } from "@/lib/aePrReceipt";
+ import { aeCiText } from "@/lib/aePrs";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+@@ -49,12 +55,23 @@ import { useForkDialog } from "@/shell/ForkDialogContext";
+ const GREEN = "text-emerald-600 dark:text-emerald-400";
+ const AMBER = "text-amber-600 dark:text-amber-400";
+ const RED = "text-red-600 dark:text-red-400";
++const BLUE = "text-blue-600 dark:text-blue-400";
++const MUTED = "text-muted-foreground";
++
++/** A waiting line's icon in its receipt's tone (only these four reach the dock). */
++const WAITING_TONE: Partial<Record<AeReceiptTone, string>> = {
++  amber: AMBER,
++  red: RED,
++  blue: BLUE,
++  gray: MUTED,
++};
+ 
+ const KIND_STYLE: Record<AeDockKind, { icon: AeTablerIconNode; tone: string; tint: string }> = {
+   question: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
+   limit: { icon: AE_ICON_GAUGE, tone: RED, tint: "bg-red-500/15" },
+   merge: { icon: AE_ICON_PR_OPEN, tone: GREEN, tint: "bg-emerald-500/15" },
+-  draft: { icon: AE_ICON_PR_DRAFT, tone: "text-muted-foreground", tint: "bg-muted" },
++  draft: { icon: AE_ICON_PR_DRAFT, tone: MUTED, tint: "bg-muted" },
++  waiting: { icon: AE_ICON_PR_OPEN, tone: AMBER, tint: "bg-amber-500/15" },
+   deploy: { icon: AE_ICON_ROCKET, tone: MERGED_TEXT, tint: "bg-purple-500/15" },
+ };
+ 
+@@ -77,10 +94,15 @@ function jumpTo(anchor: string) {
+ function ItemIcon({ item }: { item: AeDockItem }) {
+   const live = item.kind === "deploy" && item.deploy.state === "live";
+   const style = KIND_STYLE[item.kind];
++  const tone = live
++    ? GREEN
++    : item.kind === "waiting"
++      ? (WAITING_TONE[item.receipt.tone] ?? style.tone)
++      : style.tone;
+   return (
+     <AeTablerSvg
+       node={live ? AE_ICON_CHECK : style.icon}
+-      className={cn("size-3.5 shrink-0", live ? GREEN : style.tone)}
++      className={cn("size-3.5 shrink-0", tone)}
+     />
+   );
+ }
+@@ -116,11 +138,15 @@ function ItemBody({ item, now, expanded }: { item: AeDockItem; now: number; expa
+   const detail =
+     item.kind === "deploy"
+       ? aeDeployText(item, now)
+-      : expanded
+-        ? `${item.card.title} · ${item.kind === "draft" ? "draft · " : ""}${aeCiText(item.card.ci)}`
+-        : item.kind === "merge"
+-          ? aeMergeText(item)
+-          : aeDraftText(item);
++      : item.kind === "waiting"
++        ? expanded
++          ? `${item.card.title} · ${aeWaitingText(item)}`
++          : aeWaitingText(item)
++        : expanded
++          ? `${item.card.title} · ${item.kind === "draft" ? "draft · " : ""}${aeCiText(item.card.ci)}`
++          : item.kind === "merge"
++            ? aeMergeText(item)
++            : aeDraftText(item);
+   return (
+     <>
+       {/* The chat links' preview on hover; no title, which would show over it. */}
+@@ -299,6 +325,9 @@ function ItemActions({
+       );
+     case "draft":
+       return <MarkReadyButton item={item} />;
++    case "waiting":
++      // The one thing a waiting pull request can take from here; the rest waits on checks or people.
++      return item.card.update_branch?.allowed ? <UpdateBranchButton item={item} /> : null;
+     case "deploy":
+       return (
+         <>
+@@ -337,6 +366,28 @@ function MarkReadyButton({ item }: { item: AeDockDraft }) {
+   );
+ }
+ 
++/** The card's Update branch: merges the base into the head, so no confirm step either. */
++function UpdateBranchButton({ item }: { item: AeDockWaiting }) {
++  const update = useAeUpdateBranch(item.card);
++  const failed = update.isError
++    ? `Could not update #${item.number}: ${update.error.message}`
++    : null;
++  const label = failed ?? `Merge ${item.card.base_ref ?? "the base"} into #${item.number}'s branch`;
++  return (
++    <Button
++      variant="outline"
++      className={cn(ACTION, failed && RED)}
++      disabled={update.waiting || !item.card.head_sha}
++      onClick={() => update.mutate()}
++      title={label}
++      aria-label={label}
++      data-testid="ae-dock-update"
++    >
++      {update.waiting ? "Updating…" : failed ? "Failed, retry" : "Update branch"}
++    </Button>
++  );
++}
++
+ /** The PR card's own confirm step (method choice, then Confirm), inside the dock. */
+ function DockConfirm({
+   item,
+@@ -350,7 +401,14 @@ function DockConfirm({
+   const queryClient = useQueryClient();
+   const updateKey = ["ae-pr-branch-update", item.repo, item.number] as const;
+   const updating = useIsMutating({ mutationKey: updateKey }) > 0;
+-  const updateWaiting = updating || Boolean(queryClient.getQueryData(updateKey));
++  // A stale entry (head already moved, no card mounted to clear it) must not block Confirm.
++  const updateWaiting =
++    updating ||
++    aeBranchUpdatePending(
++      queryClient.getQueryData<AeBranchUpdate>(updateKey),
++      item.card.head_sha,
++      Date.now(),
++    );
+   return (
+     <div className="@container/aepr pb-2" data-testid="ae-dock-confirm">
+       <ConfirmMerge
+diff --git a/web/src/hooks/useAeActionDockItems.ts b/web/src/hooks/useAeActionDockItems.ts
+index b5440e872ca61e2ab359ffd14b405dfa356e8796..3df2b68078eff3674aec54de3305150782f1de89 100644
+--- a/web/src/hooks/useAeActionDockItems.ts
++++ b/web/src/hooks/useAeActionDockItems.ts
+@@ -3,7 +3,7 @@
+ // agree; pending questions are the ones the transcript floats to the bottom,
+ // published by Transcript.tsx. omnigent-ae, 2026-10-20.
+ 
+-import { useQueries, useQuery } from "@tanstack/react-query";
++import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+ import { AE_PR_POLL_MS } from "@/components/AePrCards";
+ import { useAeLimitGate } from "@/hooks/useAeLimitGate";
+@@ -15,9 +15,12 @@ import {
+   type AeDockQuestionSource,
+   AE_DOCK_LIVE_MS,
+   aeDeployTrack,
++  type AeBranchUpdate,
++  aeBranchUpdatePending,
+   aeDockArrange,
+   aeDockDeploys,
+   aeDockDrafts,
++  aeDockWaiting,
+   aeDockMerges,
+   aeDockPrAnchor,
+   aeDockQuestions,
+@@ -186,16 +189,35 @@ export function useAeActionDockItems(
+     }
+     return out;
+   }, [joined, tracked]);
+-  // The cards' own query. It polls only while no card in the feed polls it.
++  // The cards' own query. It polls only while no card in the feed polls it,
++  // fresh and every 2 s while an Update branch from the dock waits on the new head.
++  const queryClient = useQueryClient();
++  const updatePending = (repo: string, number: number, head: string | null) =>
++    aeBranchUpdatePending(
++      queryClient.getQueryData<AeBranchUpdate>(["ae-pr-branch-update", repo, number]),
++      head,
++      Date.now(),
++    );
+   const cards = useQueries({
+     queries: prs.map(({ repo, number }) => ({
+       queryKey: ["ae-pr", repo, number] as const,
+-      queryFn: () => fetchAePrCard(repo, number),
++      queryFn: () =>
++        fetchAePrCard(
++          repo,
++          number,
++          updatePending(
++            repo,
++            number,
++            queryClient.getQueryData<AePrCard>(["ae-pr", repo, number])?.head_sha ?? null,
++          ),
++        ),
+       retry: false,
+       refetchInterval: (query: { state: { data?: AePrCard }; getObserversCount: () => number }) =>
+         (query.state.data && query.state.data.state !== "open") || query.getObserversCount() > 1
+           ? false
+-          : AE_PR_POLL_MS,
++          : updatePending(repo, number, query.state.data?.head_sha ?? null)
++            ? 2_000
++            : AE_PR_POLL_MS,
+     })),
+   });
+   const withCards: AeDockPr[] = prs.map((pr, i) => ({ ...pr, card: cards[i]?.data }));
+@@ -246,6 +268,7 @@ export function useAeActionDockItems(
+       ...(limit.item ? [limit.item] : []),
+       ...aeDockMerges(withCards),
+       ...aeDockDrafts(withCards),
++      ...aeDockWaiting(withCards),
+       ...aeDockDeploys(withCards, deploys, track, dismissedDeploys, now),
+     ],
+     questionsOnScreen,
+diff --git a/web/src/hooks/useAeUpdateBranch.ts b/web/src/hooks/useAeUpdateBranch.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ea22a892f7e80fd9060796d611d38bdc7d3ad06
+--- /dev/null
++++ b/web/src/hooks/useAeUpdateBranch.ts
+@@ -0,0 +1,58 @@
++// Update branch from the action dock. Same mutation key and cache entries as the
++// card's own button (AePrCards.tsx), so a click in either place shows as
++// "Updating" in both; the card, or the dock's own query, polls the new head.
++// omnigent-ae, 2026-10-22.
++
++import { useIsMutating, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
++import { useEffect, useState } from "react";
++import {
++  AE_BRANCH_UPDATE_MS,
++  type AeBranchUpdate,
++  aeBranchUpdatePending,
++} from "@/lib/aeActionDock";
++import { type AePrCard, AePrError, updateAePrBranch } from "@/lib/aePrs";
++
++/** `waiting` is true from the click until the head moves, or a minute passes. */
++export function useAeUpdateBranch(card: AePrCard) {
++  const queryClient = useQueryClient();
++  const queryKey = ["ae-pr", card.repo, card.number] as const;
++  const updateKey = ["ae-pr-branch-update", card.repo, card.number] as const;
++  const busy = useIsMutating({ mutationKey: updateKey }) > 0;
++  const { data: accepted } = useQuery<AeBranchUpdate>({
++    queryKey: updateKey,
++    queryFn: () => null,
++    initialData: null,
++    enabled: false,
++    staleTime: Infinity,
++  });
++  const mutation = useMutation({
++    mutationKey: updateKey,
++    mutationFn: () => updateAePrBranch(card),
++    onSuccess: async (result) => {
++      queryClient.setQueryData(updateKey, { sha: result.head_sha, started: Date.now() });
++      await queryClient.cancelQueries({ queryKey, exact: true });
++      await queryClient.invalidateQueries({ queryKey, exact: true });
++      await queryClient.invalidateQueries({
++        queryKey: ["ae-pr-compliance", card.repo, card.number],
++      });
++    },
++    onError: async (error) => {
++      if (error instanceof AePrError && error.card) {
++        await queryClient.cancelQueries({ queryKey, exact: true });
++        queryClient.setQueryData(queryKey, error.card);
++      }
++    },
++  });
++  const pending = aeBranchUpdatePending(accepted, card.head_sha, Date.now());
++  // Nothing else re-renders when the window lapses on an unmoved head; this frees the button.
++  const [, setLapsed] = useState(0);
++  useEffect(() => {
++    if (!pending || !accepted) return;
++    const timer = window.setTimeout(
++      () => setLapsed((n) => n + 1),
++      accepted.started + AE_BRANCH_UPDATE_MS - Date.now() + 50,
++    );
++    return () => window.clearTimeout(timer);
++  }, [pending, accepted]);
++  return { ...mutation, busy, waiting: busy || pending };
++}
+diff --git a/web/src/lib/aeActionDock.test.ts b/web/src/lib/aeActionDock.test.ts
+index 41278e3c4b372bc6532495d9f2dc0105aa45131b..f65a50cc96c958176c7d9f15f54ce427fde1bbbf 100644
+--- a/web/src/lib/aeActionDock.test.ts
++++ b/web/src/lib/aeActionDock.test.ts
+@@ -1,9 +1,11 @@
+ import { describe, expect, it } from "vitest";
+ import {
++  AE_BRANCH_UPDATE_MS,
+   AE_DOCK_LIVE_MS,
+   type AeDockItem,
+   type AeDockPr,
+   aeAgo,
++  aeBranchUpdatePending,
+   aeDeployText,
+   aeDeployTrack,
+   aeDockArrange,
+@@ -15,8 +17,10 @@ import {
+   aeDockQuestions,
+   aeDockQuestionText,
+   aeDockSummary,
++  aeDockWaiting,
+   aeDraftText,
+   aeHolderName,
++  aeWaitingText,
+ } from "@/lib/aeActionDock";
+ import type { AePrDeploy } from "@/lib/aePrDeploy";
+ import type { AePrCard } from "@/lib/aePrs";
+@@ -145,6 +149,82 @@ describe("drafts", () => {
+   });
+ });
+ 
++describe("waiting", () => {
++  const running = {
++    ci: { state: "pending", passing: 11, failing: 0, pending: 1, total: 12 },
++  } as const;
++  const merge = card(0).merge;
++
++  it("takes every other open pull request with its receipt's word and tone", () => {
++    const items = aeDockWaiting([
++      pr(1),
++      pr(2, running),
++      pr(3, {
++        mergeable: { state: "conflicted", detail: "" },
++        merge: { ...merge, allowed: false },
++      }),
++      pr(4, { ci: { state: "failing", passing: 4, failing: 1, pending: 0, total: 5 } }),
++      pr(5, {
++        mergeable: { state: "behind", detail: "" },
++        update_branch: { allowed: true, reason: null },
++        merge: { ...merge, allowed: false },
++      }),
++      pr(6, { mergeable: { state: "blocked", detail: "" }, merge: { ...merge, allowed: false } }),
++      pr(7, { draft: true, mergeable: { state: "draft", detail: "" } }),
++      pr(8, { state: "closed" }),
++      pr(9, { state: "merged" }),
++      { url: "u", repo: REPO, number: 10 },
++    ]);
++    expect(items.map((item) => [item.number, aeWaitingText(item), item.receipt.tone])).toEqual([
++      [2, "checks 11/12", "amber"],
++      [3, "conflicts", "red"],
++      [4, "1 check failed", "red"],
++      [5, "behind main", "blue"],
++      [6, "blocked", "amber"],
++    ]);
++    expect(items[0]!.key).toBe(`waiting:${anchor(2)}`);
++  });
++
++  it("never overlaps merges or drafts, so a pull request shows once", () => {
++    const prs = [
++      pr(1),
++      pr(2, running),
++      pr(3, { draft: true, mergeable: { state: "draft", detail: "" } }),
++    ];
++    const keys = [...aeDockMerges(prs), ...aeDockDrafts(prs), ...aeDockWaiting(prs)].map(
++      (item) => item.anchor,
++    );
++    expect(keys).toEqual([anchor(1), anchor(3), anchor(2)]);
++  });
++
++  it("ranks after drafts and before deploys, with its own badge", () => {
++    const waiting = aeDockWaiting([pr(228, running), pr(229, running)]);
++    const arranged = aeDockArrange([...sample(), ...waiting], new Set());
++    expect(arranged.map((item) => item.key).slice(-3)).toEqual([
++      `waiting:${anchor(228)}`,
++      `waiting:${anchor(229)}`,
++      `deploy:${anchor(179)}`,
++    ]);
++    expect(aeDockSummary(arranged, clock)!.badges).toContainEqual({
++      kind: "waiting",
++      count: 2,
++      label: "2 not ready",
++    });
++    expect(aeDockBadgeLabel(waiting.slice(0, 1))).toBe("#228 checks 11/12");
++  });
++});
++
++describe("branch update", () => {
++  it("counts as running only while the head is unmoved and inside the window", () => {
++    const entry = { sha: "abc", started: NOW };
++    expect(aeBranchUpdatePending(entry, "abc", NOW + 1_000)).toBe(true);
++    expect(aeBranchUpdatePending(entry, "def", NOW + 1_000)).toBe(false);
++    expect(aeBranchUpdatePending(entry, "abc", NOW + AE_BRANCH_UPDATE_MS)).toBe(false);
++    expect(aeBranchUpdatePending(null, "abc", NOW)).toBe(false);
++    expect(aeBranchUpdatePending(undefined, "abc", NOW)).toBe(false);
++  });
++});
++
+ describe("deploy lifecycle", () => {
+   it("tracks a pull request seen waiting, then the time it turned live", () => {
+     const waiting = new Map([[anchor(9), deploy()]]);
+diff --git a/web/src/lib/aeActionDock.ts b/web/src/lib/aeActionDock.ts
+index 4d38bcebbc22e225c24555ad41bcba15bfdeb5d8..279d8c76b4e7e62a1ded57516f57b7aedc87b345 100644
+--- a/web/src/lib/aeActionDock.ts
++++ b/web/src/lib/aeActionDock.ts
+@@ -4,22 +4,43 @@
+ 
+ import { type AeLimitGate, aeLimitGateShort } from "@/lib/aeLimitGate";
+ import { type AePrDeploy, aeHasDeployState } from "@/lib/aePrDeploy";
++import { type AePrReceipt, aePrReceipt } from "@/lib/aePrReceipt";
+ import { type AePrCard, aeCiText, aeReadyToMerge } from "@/lib/aePrs";
+ 
+-export type AeDockKind = "question" | "limit" | "merge" | "draft" | "deploy";
++export type AeDockKind = "question" | "limit" | "merge" | "draft" | "waiting" | "deploy";
+ 
+ /**
+  * Urgency: a question blocks the agent, a usage limit is about to, a merge
+- * waits on a click, a draft on a click before review, a deploy only on time.
++ * waits on a click, a draft on a click before review, an open pull request
++ * that is not ready on checks or a person, a deploy only on time.
+  */
+ export const AE_DOCK_KINDS: readonly AeDockKind[] = [
+   "question",
+   "limit",
+   "merge",
+   "draft",
++  "waiting",
+   "deploy",
+ ];
+ 
++/** An accepted Update branch counts as running this long while the head stays put. */
++export const AE_BRANCH_UPDATE_MS = 60_000;
++
++/** The `["ae-pr-branch-update", repo, number]` cache entry the card and the dock share. */
++export type AeBranchUpdate = { sha: string; started: number } | null | undefined;
++
++/**
++ * True while an accepted update has not yet moved the head. The card clears the
++ * entry when it sees the new head; with no card mounted, it can outlive the update.
++ */
++export function aeBranchUpdatePending(
++  entry: AeBranchUpdate,
++  headSha: string | null,
++  now: number,
++): boolean {
++  return Boolean(entry) && entry!.sha === headSha && now - entry!.started < AE_BRANCH_UPDATE_MS;
++}
++
+ /** A deploy item that went live stays this long, then clears. */
+ export const AE_DOCK_LIVE_MS = 60_000;
+ 
+@@ -54,6 +75,17 @@ export interface AeDockDraft extends ItemBase {
+   card: AePrCard;
+ }
+ 
++/** An open pull request that is neither a draft nor ready: checks, conflicts, review, behind. */
++export interface AeDockWaiting extends ItemBase {
++  kind: "waiting";
++  url: string;
++  repo: string;
++  number: number;
++  card: AePrCard;
++  /** The thread receipt's word and tone, so the dock and the receipt agree. */
++  receipt: AePrReceipt;
++}
++
+ export interface AeDockDeploy extends ItemBase {
+   kind: "deploy";
+   url: string;
+@@ -72,7 +104,8 @@ export interface AeDockLimit extends ItemBase {
+   canSwitchAccount: boolean;
+ }
+ 
+-export type AeDockItem = AeDockQuestion | AeDockLimit | AeDockMerge | AeDockDraft | AeDockDeploy;
++export type AeDockItem =
++  AeDockQuestion | AeDockLimit | AeDockMerge | AeDockDraft | AeDockWaiting | AeDockDeploy;
+ 
+ /** "owner/repo#123", a pull request item's anchor. */
+ export function aeDockPrAnchor(repo: string, number: number): string {
+@@ -139,6 +172,26 @@ export function aeDockDrafts(prs: readonly AeDockPr[]): AeDockDraft[] {
+   return items;
+ }
+ 
++/** The transcript's other open pull requests (not drafts, not ready), first mentioned first. */
++export function aeDockWaiting(prs: readonly AeDockPr[]): AeDockWaiting[] {
++  const items: AeDockWaiting[] = [];
++  prs.forEach((pr, order) => {
++    if (pr.card?.state !== "open" || pr.card.draft || aeReadyToMerge(pr.card)) return;
++    const anchor = aeDockPrAnchor(pr.repo, pr.number);
++    const receipt = aePrReceipt(pr.card);
++    items.push({
++      kind: "waiting",
++      key: `waiting:${anchor}`,
++      anchor,
++      order,
++      ...pr,
++      card: pr.card,
++      receipt,
++    });
++  });
++  return items;
++}
++
+ /**
+  * What this page saw of each deploy: `waiting` once seen waiting, then the
+  * time it turned live. A pull request first seen live went live before the
+@@ -247,7 +300,10 @@ export function aeDockSummary(
+   return { lead, more, badges, total: items.length };
+ }
+ 
+-/** "Question waiting", "2 questions", "#180 ready", "#181 draft", "#179 deploy 10:50 PM", "2 deploying". */
++/**
++ * "Question waiting", "2 questions", "#180 ready", "#181 draft", "#228 checks 11/12",
++ * "2 not ready", "#179 deploy 10:50 PM", "2 deploying".
++ */
+ export function aeDockBadgeLabel(
+   items: readonly AeDockItem[],
+   clock: (iso: string) => string = aeClock,
+@@ -263,6 +319,8 @@ export function aeDockBadgeLabel(
+       return many ? `${items.length} to merge` : `#${first.number} ready`;
+     case "draft":
+       return many ? `${items.length} drafts` : `#${first.number} draft`;
++    case "waiting":
++      return many ? `${items.length} not ready` : `#${first.number} ${aeWaitingText(first)}`;
+     case "deploy": {
+       if (many) {
+         const live = items.every((item) => item.kind === "deploy" && item.deploy.state === "live");
+@@ -333,6 +391,13 @@ export function aeDraftText(item: AeDockDraft): string {
+   return `draft · ${aeCiText(item.card.ci)}`;
+ }
+ 
++/** The waiting line's detail, the receipt's word: "checks 11/12", "conflicts", "behind main". */
++export function aeWaitingText(item: AeDockWaiting): string {
++  // Blue is the receipt's "behind · update branch"; the dock's own button says the rest.
++  if (item.receipt.tone === "blue") return `behind ${item.card.base_ref ?? "base"}`;
++  return item.receipt.word;
++}
++
+ /** The dock's header and accessible name: "3 waiting". */
+ export function aeDockCountText(total: number): string {
+   return `${total} waiting`;
