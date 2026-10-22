@@ -284,8 +284,8 @@ def test_release_workflow_runs_after_ci_on_main_or_by_hand() -> None:
     condition = wf["jobs"]["tag"]["if"]
     assert "github.event.workflow_run.conclusion == 'success'" in condition
     assert "github.event.workflow_run.event == 'push'" in condition
-    assert condition.startswith("github.repository == 'analyticendeavors/omnigent-ae' && ("), (
-        "a fork or the public copy never tags itself"
+    assert condition.startswith("vars.AE_IMAGE != '' && ("), (
+        "a repository without the AE_IMAGE variable never tags itself"
     )
 
 
@@ -313,6 +313,21 @@ def test_release_workflow_meets_the_repo_standards() -> None:
         for key, value in (step.get("env") or {}).items():
             if "secrets." in str(value):
                 assert key == "GH_TOKEN", "secrets reach scripts through env as GH_TOKEN only"
+
+
+def test_release_workflow_checks_the_image_name_before_it_tags() -> None:
+    # A bad AE_IMAGE fails here, before a tag exists that image.yml cannot
+    # publish and the box would wait on forever (2026-10-21,
+    # https://github.com/analyticendeavors/omnigent-ae-public/issues/13).
+    names = [s["name"] for s in _workflow()["jobs"]["tag"]["steps"]]
+    check = "AE_IMAGE names a package under this repository's owner"
+    assert names.index(check) == names.index("Checkout main with every tag") + 1
+    step = _steps()[check]
+    assert step["env"] == {
+        "AE_IMAGE": "${{ vars.AE_IMAGE }}",
+        "OWNER": "${{ github.repository_owner }}",
+    }
+    assert 'scripts/check-image-name.sh "$AE_IMAGE" "$OWNER"' in step["run"]
 
 
 def test_release_workflow_tags_with_the_script_on_the_tip_of_main() -> None:

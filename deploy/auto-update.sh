@@ -99,7 +99,9 @@ BUSY_TIMEOUT="${AE_AUTO_UPDATE_BUSY_TIMEOUT:-30}"
 # compose exec in read_deploy_hold). It shares BUSY_TIMEOUT.
 HOLD_CMD="${AE_AUTO_UPDATE_DEPLOY_HOLD:-}"
 COMPOSE="$ROOT/deploy/compose.sh"
-IMAGE="ghcr.io/analyticendeavors/omnigent-ae"
+# The image comes from config/server.env (AE_IMAGE, the same line the compose
+# overlay interpolates), read once setting() exists.
+IMAGE=""
 
 HOST_PENDING="$STATE_DIR/host-pending"
 DEFERRED="$STATE_DIR/deferred"
@@ -548,6 +550,8 @@ dump_db() {
 [ -w "$SETTINGS" ] || die "cannot write $SETTINGS. Copy config/server.env.example to config/server.env as reid (deploy/README.md, step 3)."
 FROM="$(setting OMNIGENT_IMAGE_TAG)"
 [ -n "$FROM" ] || die "$SETTINGS has no OMNIGENT_IMAGE_TAG line; add the running tag (deploy/README.md, step 3)."
+IMAGE="$(setting AE_IMAGE)"
+[ -n "$IMAGE" ] || die "$SETTINGS has no AE_IMAGE line; add AE_IMAGE=ghcr.io/<owner>/<repo>, the package this box pulls (deploy/README.md, step 3)."
 PORT="$(setting OMNIGENT_PORT)"
 PORT="${PORT:-8010}"
 

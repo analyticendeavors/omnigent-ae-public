@@ -292,6 +292,9 @@ Edit both. Nothing secret goes in either file; they are gitignored anyway.
   character (step 9).
 - `OMNIGENT_IMAGE_TAG`: the tag to run, `ae-vX.Y.Z.N` (the newest tag on the
   Releases page, or the tag you build in step 5).
+- `AE_IMAGE`: the package that tag lives in, `ghcr.io/<owner>/<repo>`. The example
+  names the public build; a fork that publishes its own (step 5) names that one.
+  The compose overlay and `deploy/auto-update.sh` both read it.
 - Sign-in: the example ships OIDC settings with placeholders. Replace the
   issuer and tenant, the client id, `OMNIGENT_OIDC_REDIRECT_URI` (your public
   callback origin) and `OMNIGENT_OIDC_ALLOWED_DOMAINS`. The administrator goes in
@@ -325,9 +328,9 @@ a database that holds none of its policies (`packages/ae_omni_policies/README.md
 
 ### 5. The image
 
-The overlay runs `ghcr.io/<owner>/<repo>:${OMNIGENT_IMAGE_TAG}`, the image the
-operator's own `.github/workflows/image.yml` publishes on every `ae-v*` tag (the
-shipped overlay names AE's, `ghcr.io/analyticendeavors/omnigent-ae`). AE's package
+The overlay runs `${AE_IMAGE}:${OMNIGENT_IMAGE_TAG}` from `config/server.env`, the
+image the operator's own `.github/workflows/image.yml` publishes on every `ae-v*`
+tag (AE's box sets `AE_IMAGE=ghcr.io/analyticendeavors/omnigent-ae`). AE's package
 is private and stays private: its older tags were built before the identifier
 scrub, so never make it public. A fork, the public repo included, publishes its
 own package (the end of this step says what to change). The first push of
@@ -347,17 +350,15 @@ name and the tag `config/server.env` names:
 
 ```bash
 just image && just image-smoke
-docker tag omnigent-ae:local ghcr.io/<owner>/<repo>:ae-vX.Y.Z.N   # the name the overlay's image: line carries
+docker tag omnigent-ae:local ghcr.io/<owner>/<repo>:ae-vX.Y.Z.N   # AE_IMAGE and OMNIGENT_IMAGE_TAG from config/server.env
 ```
 
 A self-built image is not something `auto-update.sh` can pull, so leave the
-automatic update off with it. Publishing to your own registry means changing
-both image names in your fork: the overlay's `image:` line and `IMAGE` in
-`deploy/auto-update.sh`, which pulls the tag itself before it deploys. The
-workflows publish and tag only in `analyticendeavors/omnigent-ae`, so a fork also
-changes `IMAGE` and the `github.repository` condition in
-`.github/workflows/image.yml` and the condition on `.github/workflows/release.yml`'s
-job.
+automatic update off with it. Publishing your own package needs no file edits:
+set the repository variable `AE_IMAGE` to `ghcr.io/<owner>/<name>` (lower case,
+under your repository's owner), enable the Image and Release workflows, and put the
+same value in `config/server.env`. Without the variable both workflows build and
+check but never push or tag.
 
 ### 6. Units and the first start
 
@@ -591,12 +592,20 @@ publishes it. A docs-only or tests-only merge makes no tag; to ship one anyway,
 or to re-ship, run the Release workflow on `main` (Actions, Release, Run
 workflow) with `force` on. A tag is published by `.github/workflows/image.yml`,
 which builds the two stages the way CI does, runs the same smoke checks, and
-pushes `ghcr.io/<owner>/<repo>:ae-vX.Y.Z.N` (AE's own package is
+pushes `$AE_IMAGE:ae-vX.Y.Z.N`, the repository variable (AE's own package is
 `ghcr.io/analyticendeavors/omnigent-ae`). With the auto-update
 timer installed (next section) that is the whole deploy: the timer notices the
 tag within ten minutes of the image being published, deploys it, checks health
 and rolls back on failure, and rebuilds the host when the upstream part of the
-tag moved. Pushing a tag by hand still works (the release workflow then sees the
+tag moved.
+
+Upgrading a box set up before 2026-10-21: add the `AE_IMAGE` line to
+`config/server.env` before the release carrying https://github.com/analyticendeavors/omnigent-ae-public/issues/13
+reaches it (AE's box: `AE_IMAGE=ghcr.io/analyticendeavors/omnigent-ae`). The
+compose overlay and `deploy/auto-update.sh` require it, and a checkout that
+moves past that release without it cannot start the server or roll back.
+
+Pushing a tag by hand still works (the release workflow then sees the
 commit is tagged and does nothing for it):
 
 ```bash
@@ -787,8 +796,8 @@ As `<user>`, no sudo (linger is already on, step 10):
 cd ~/deploy/omnigent-ae && git pull --ff-only && git submodule update --init
 # The registry login for <user> (root's login does not reach a user unit), if the package is private.
 docker login ghcr.io -u <github-user>
-# The image the overlay names, ghcr.io/<owner>/<repo> (AE's: ghcr.io/analyticendeavors/omnigent-ae).
-docker pull ghcr.io/<owner>/<repo>:"$(sed -n 's/^OMNIGENT_IMAGE_TAG=//p' config/server.env)"
+# The image config/server.env names (AE_IMAGE and OMNIGENT_IMAGE_TAG).
+docker pull "$(sed -n 's/^AE_IMAGE=//p' config/server.env | tail -n 1)":"$(sed -n 's/^OMNIGENT_IMAGE_TAG=//p' config/server.env | tail -n 1)"
 # The units.
 mkdir -p ~/.config/systemd/user
 cp deploy/systemd/user/ae-omnigent-auto-update.service deploy/systemd/user/ae-omnigent-auto-update.timer ~/.config/systemd/user/
