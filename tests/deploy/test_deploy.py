@@ -117,8 +117,11 @@ def _skip_missing(name: str, install_hint: str) -> None:
 
 def test_override_pins_the_published_image_by_tag() -> None:
     svc = _override()["services"]["omnigent"]
-    assert svc["image"].startswith(f"{IMAGE}:${{OMNIGENT_IMAGE_TAG")
-    assert ":?" in svc["image"], "the tag must be required, never default to latest"
+    name, tag = svc["image"].split("}:", 1)
+    assert name.startswith("${AE_IMAGE:?"), "the image name comes from config/server.env"
+    assert tag.startswith("${OMNIGENT_IMAGE_TAG:?"), (
+        "the tag must be required, never default to latest"
+    )
     assert svc["build"] is None, (
         "build is reset so the box cannot rebuild upstream's unpatched image"
     )
@@ -254,7 +257,8 @@ def test_merged_compose_config(tmp_path: Path) -> None:
 
     settings = tmp_path / "server.env"
     settings.write_text(
-        "OMNIGENT_IMAGE_TAG=ae-v0.13.0.1\nOMNIGENT_PORT=8010\nOMNIGENT_AUTH_ENABLED=1\n"
+        f"OMNIGENT_IMAGE_TAG=ae-v0.13.0.1\nAE_IMAGE={IMAGE}\n"
+        "OMNIGENT_PORT=8010\nOMNIGENT_AUTH_ENABLED=1\n"
     )
     secrets = tmp_path / "omnigent-ae.env"
     secrets.write_text("POSTGRES_PASSWORD=test-only\n")
@@ -769,6 +773,7 @@ def test_install_host_puts_the_user_bin_dirs_on_path_before_needing_uv() -> None
 
 SERVER_VARS = {
     "OMNIGENT_IMAGE_TAG",
+    "AE_IMAGE",
     "OMNIGENT_PORT",
     "OMNIGENT_AUTH_ENABLED",
     "OMNIGENT_ACCOUNTS_BASE_URL",
@@ -912,8 +917,11 @@ def test_env_examples_agree_with_the_override_and_the_units() -> None:
 
 def test_env_example_names_exist_upstream_or_in_the_ae_layer() -> None:
     """Every OMNIGENT_* name in the examples must be read somewhere in the pinned
-    upstream tree; every AE_* name in packages/ae_omni_policies or, for a patch's
-    own switch (AE_PROMPT_SUGGESTIONS, patch 0123, 2026-10-20), the patched tree."""
+    upstream tree; every AE_* name in packages/ae_omni_policies, the two box
+    scripts that read server.env for themselves (the overlay's image line and
+    deploy/auto-update.sh; AE_IMAGE, 2026-10-21, https://github.com/analyticendeavors/omnigent-ae-public/issues/13)
+    or, for a patch's own switch (AE_PROMPT_SUGGESTIONS, patch 0123, 2026-10-20),
+    the patched tree."""
     upstream = ROOT / "upstream" / "omnigent"
     if not upstream.is_dir():
         pytest.skip("upstream/ is not checked out")
@@ -922,6 +930,8 @@ def test_env_example_names_exist_upstream_or_in_the_ae_layer() -> None:
     ae = "".join(
         p.read_text() for p in (ROOT / "packages" / "ae_omni_policies" / "src").rglob("*.py")
     )
+    ae += _override()["services"]["omnigent"]["image"]
+    ae += (DEPLOY / "auto-update.sh").read_text()
     for example in (CONFIG / "server.env.example", CONFIG / "host.env.example"):
         active, mentioned = _env_example(example)
         for key in set(active) | mentioned:
@@ -948,7 +958,9 @@ def test_image_workflow_triggers_and_permissions() -> None:
     assert on["workflow_dispatch"]["inputs"]["push"]["default"] is False
     assert wf["permissions"] == {"contents": "read", "packages": "write"}
     assert "concurrency" in wf and "group" in wf["concurrency"]
-    assert wf["env"]["IMAGE"] == IMAGE
+    assert wf["env"] == {"AE_IMAGE": "${{ vars.AE_IMAGE }}"}, (
+        "IMAGE is written by the decide step, never derived a second time"
+    )
 
 
 def test_image_workflow_meets_the_repo_standards() -> None:
@@ -999,24 +1011,92 @@ def test_image_workflow_mirrors_the_ci_image_job() -> None:
 
 def test_image_workflow_pushes_only_the_tag_with_the_workflow_token() -> None:
     rel_steps = {s.get("name"): s for s in _workflow()["jobs"]["image"]["steps"]}
+    # The decide step owns the whole gate (AE_IMAGE set and valid), so the
+    # login and the push need only PUSH (2026-10-21, https://github.com/analyticendeavors/omnigent-ae-public/issues/13).
     login = rel_steps["Log in to GHCR"]
-    assert (
-        login["if"] == "env.PUSH == 'true' && github.repository == 'analyticendeavors/omnigent-ae'"
-    )
+    assert login["if"] == "env.PUSH == 'true'"
     assert login["with"]["password"] == "${{ secrets.GITHUB_TOKEN }}"
     assert login["with"]["registry"] == "ghcr.io"
     push = rel_steps["Push the tag"]
-    assert (
-        push["if"] == "env.PUSH == 'true' && github.repository == 'analyticendeavors/omnigent-ae'"
-    )
+    assert push["if"] == "env.PUSH == 'true'"
     dry = rel_steps["Dry run, not pushed"]
-    assert (
-        dry["if"] == "env.PUSH != 'true' || github.repository != 'analyticendeavors/omnigent-ae'"
-    )
+    assert dry["if"] == "env.PUSH != 'true'"
     assert 'docker push "$IMAGE:$IMAGE_TAG"' in push["run"]
     decide = rel_steps["Decide the image tag and whether to push"]["run"]
     assert "tag:ae-v*)" in decide, "only an ae-v* tag ref may set push=true"
     assert "dry-run-" in decide
+
+
+def _decide(tmp_path: Path, **env: str) -> tuple[subprocess.CompletedProcess[str], str]:
+    steps = {s.get("name"): s for s in _workflow()["jobs"]["image"]["steps"]}
+    body = steps["Decide the image tag and whether to push"]["run"]
+    out = tmp_path / "github_env"
+    out.write_text("")
+    defaults = {
+        "REF_TYPE": "tag",
+        "REF_NAME": "ae-v0.18.0.60",
+        "SHA": "a" * 40,
+        "EVENT": "push",
+        "PUSH_INPUT": "",
+        "OWNER": "AnalyticEndeavors",
+        "AE_IMAGE": "",
+    }
+    result = subprocess.run(
+        ["bash", "-c", body],
+        cwd=ROOT,
+        env={"PATH": os.environ["PATH"], "GITHUB_ENV": str(out), **defaults, **env},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return result, out.read_text()
+
+
+def test_image_workflow_publishes_only_when_the_variable_is_set(tmp_path: Path) -> None:
+    result, written = _decide(tmp_path)
+    assert result.returncode == 0, result.stderr
+    assert "PUSH=false" in written, "no AE_IMAGE variable: build and smoke, never push"
+    assert "IMAGE=omnigent-ae-local\n" in written
+    assert "AE_IMAGE is not set" in result.stdout
+
+    result, written = _decide(tmp_path, AE_IMAGE=IMAGE)
+    assert result.returncode == 0, result.stderr
+    assert "PUSH=true" in written and "IMAGE_TAG=ae-v0.18.0.60" in written
+    assert f"IMAGE={IMAGE}\n" in written
+
+    result, written = _decide(tmp_path, AE_IMAGE=IMAGE, REF_TYPE="branch", REF_NAME="main")
+    assert result.returncode == 0, result.stderr
+    assert "PUSH=false" in written, "a branch never pushes, variable or not"
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "ghcr.io/someone-else/omnigent-ae",
+        "docker.io/analyticendeavors/omnigent-ae",
+        "ghcr.io/AnalyticEndeavors/omnigent-ae",
+        "ghcr.io/analyticendeavors/omnigent-ae:latest",
+        "ghcr.io/analyticendeavors/..",
+        "ghcr.io/analyticendeavors/-x",
+        "ghcr.io/analyticendeavors/a___b",
+        "ghcr.io/analyticendeavors/x/",
+    ],
+)
+def test_image_workflow_refuses_a_package_outside_the_owner(tmp_path: Path, value: str) -> None:
+    result, written = _decide(tmp_path, AE_IMAGE=value)
+    assert result.returncode != 0
+    assert "must be ghcr.io/analyticendeavors/<name>" in result.stdout
+    assert written == ""
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["ghcr.io/analyticendeavors/omnigent/server", "ghcr.io/analyticendeavors/a__b.c-d"],
+)
+def test_image_workflow_accepts_nested_and_separated_names(tmp_path: Path, value: str) -> None:
+    result, written = _decide(tmp_path, AE_IMAGE=value)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert f"IMAGE={value}\n" in written
 
 
 def test_image_workflow_passes_actionlint() -> None:

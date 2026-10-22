@@ -408,7 +408,7 @@ Cadence: every upstream release tag, within a week of it.
 6. After the merge, tag the product repo `ae-vX.Y.Z.1` (the `.N` counts AE
    releases on the same upstream tag). The tag push runs
    `.github/workflows/image.yml`, which builds the two stages as CI does, smokes
-   them, and pushes `ghcr.io/analyticendeavors/omnigent-ae:ae-vX.Y.Z.1`. On the
+   them, and pushes `$AE_IMAGE:ae-vX.Y.Z.1` (the repository variable). On the
    box: that tag into `config/server.env`, `deploy/compose.sh pull`,
    `deploy/compose.sh up -d`, then `deploy/install-host.sh` and a host restart
    so the host runs the same version as the server (`deploy/README.md`,

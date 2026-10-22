@@ -278,12 +278,15 @@ reachability checks and the known gaps) is "Second user's host (container)" in
 
 `.github/workflows/image.yml` runs on a tag push `ae-vX.Y.Z.N` (and by hand as a dry
 run). It builds the two stages exactly as the `image` job does, runs the same smoke
-checks, and pushes `ghcr.io/<owner>/<repo>:ae-vX.Y.Z.N`, the operator's own package
-(AE's is `ghcr.io/analyticendeavors/omnigent-ae`), with the
-workflow's own `GITHUB_TOKEN` (`packages: write`). The login and the push run only in
-`analyticendeavors/omnigent-ae`, and the release workflow below tags only there, so a
-fork builds and smokes the image without touching AE's package; a fork that publishes
-changes `IMAGE` and that repository condition. `workflow_dispatch` builds without
+checks, and pushes `$AE_IMAGE:ae-vX.Y.Z.N` with the workflow's own `GITHUB_TOKEN`
+(`packages: write`). `AE_IMAGE` is a repository variable (Settings, Secrets and
+variables, Actions, Variables) naming the operator's own package,
+`ghcr.io/<owner>/<name>` in lower case under the repository's owner (AE's private
+repo sets `ghcr.io/analyticendeavors/omnigent-ae`). It is the only publish gate: with
+it unset the workflow builds and smokes but never logs in or pushes, and the release
+workflow below never tags, so a fork is quiet until its owner sets it; a value under
+another owner or registry fails the run
+(`scripts/check-image-name.sh`, which both workflows call before anything is pushed). `workflow_dispatch` builds without
 pushing unless its `push` input is on and the chosen ref is an `ae-v*` tag, so a
 branch build never lands in the registry under a name the box would pull. Since
 2026-09-24 the tag push is the whole deploy: a user timer on the box

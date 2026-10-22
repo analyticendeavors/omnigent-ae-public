@@ -164,7 +164,8 @@ class Box:
         secrets = tmp / "omnigent-ae.env"
         secrets.write_text("POSTGRES_PASSWORD=test-only\n")
         self.settings.write_text(
-            "OMNIGENT_IMAGE_TAG=ae-v0.13.0.1\nOMNIGENT_PORT=8010\nOMNIGENT_AUTH_ENABLED=1\n"
+            f"OMNIGENT_IMAGE_TAG=ae-v0.13.0.1\nAE_IMAGE={IMAGE}\n"
+            "OMNIGENT_PORT=8010\nOMNIGENT_AUTH_ENABLED=1\n"
         )
         self.env = {
             **os.environ,
@@ -244,6 +245,33 @@ def test_no_new_tag_is_a_quiet_noop(box: Box) -> None:
     assert "from=ae-v0.13.0.1 to=ae-v0.13.0.1 result=noop" in box.last()
     assert not any(c.startswith("docker") for c in box.calls())
     assert not (box.state / "log").exists(), "a no-op does not grow the log"
+
+
+def test_the_image_name_comes_from_the_settings_file(box: Box) -> None:
+    # 2026-10-21, https://github.com/analyticendeavors/omnigent-ae-public/issues/13:
+    # AE_IMAGE in config/server.env names the package, so a fork's box pulls its
+    # own image without editing the script.
+    box.settings.write_text(box.settings.read_text().replace(IMAGE, "ghcr.io/someone/fork"))
+    box.release("ae-v0.13.0.2")
+    result = box.run()
+    assert result.returncode == 0, result.stderr
+    assert "docker pull --quiet ghcr.io/someone/fork:ae-v0.13.0.2" in box.calls()
+
+
+def test_missing_image_name_stops_before_anything_changes(box: Box) -> None:
+    box.settings.write_text(
+        "".join(
+            line
+            for line in box.settings.read_text().splitlines(keepends=True)
+            if not line.startswith("AE_IMAGE=")
+        )
+    )
+    box.release("ae-v0.13.0.2")
+    result = box.run()
+    assert result.returncode != 0
+    assert "has no AE_IMAGE line" in result.stderr
+    assert box.tag() == "ae-v0.13.0.1"
+    assert not any(c.startswith("docker") for c in box.calls())
 
 
 def test_tag_not_yet_published_waits_and_changes_nothing(box: Box) -> None:
