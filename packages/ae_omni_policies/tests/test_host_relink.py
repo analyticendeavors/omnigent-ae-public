@@ -21,7 +21,7 @@ from ae_omni_policies.host_relink import HostRelinkStore, Status
 from ae_omni_policies.host_relink import Request as Ask
 
 NOW = 1_792_520_000  # 2026-10-20T18:13:20Z
-BOX = {"host_id": "host_box", "name": "ae-llm-box", "status": "online", "sandbox_provider": None}
+BOX = {"host_id": "host_box", "name": "example-box", "status": "online", "sandbox_provider": None}
 OFFLINE = {**BOX, "status": "offline"}
 
 
@@ -115,7 +115,7 @@ def test_pick_host_prefers_the_named_then_the_only_real_one() -> None:
     assert host_relink.pick_host([sandbox, OFFLINE], None) == OFFLINE
     other = {**BOX, "host_id": "h2", "name": "laptop"}
     assert host_relink.pick_host([OFFLINE, other], None) == other
-    assert host_relink.pick_host([OFFLINE, other], "ae-llm-box") == OFFLINE
+    assert host_relink.pick_host([OFFLINE, other], "example-box") == OFFLINE
     assert host_relink.pick_host([OFFLINE], "missing") is None
     assert host_relink.pick_host([sandbox], None) is None
     # Two offline hosts and no AE_RESUME_HOST: ambiguous, as Resume finds it.
@@ -148,7 +148,7 @@ def test_a_connected_host_hides_the_button_whatever_the_helper_said() -> None:
     assert shown.state == "connected"
     assert shown.can_request is False and shown.requested is False
     assert shown.expires_at is None and shown.streak == 0
-    assert shown.host == {"id": "host_box", "name": "ae-llm-box", "status": "online"}
+    assert shown.host == {"id": "host_box", "name": "example-box", "status": "online"}
 
 
 def test_a_rejected_host_offers_the_button_with_the_streak() -> None:
@@ -336,7 +336,7 @@ async def test_get_host_says_connected(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["state"] == "connected" and body["can_request"] is False
-    assert body["host"]["name"] == "ae-llm-box" and body["error"] is None
+    assert body["host"]["name"] == "example-box" and body["error"] is None
 
 
 async def test_get_host_shows_the_helpers_report_while_rejected(
@@ -400,10 +400,10 @@ async def test_the_card_and_resume_pick_the_same_host(
     resumed = await router_module._resume_host(Request({"type": "http"}))
     body = (await client.get("/v1/ae/host")).json()
     assert resumed["host_id"] == "h2" and body["host"]["id"] == "h2"
-    monkeypatch.setenv("AE_RESUME_HOST", "ae-llm-box")
+    monkeypatch.setenv("AE_RESUME_HOST", "example-box")
     body = (await client.get("/v1/ae/host")).json()
     assert body["host"]["id"] == "host_box" and body["state"] == "offline"
-    with pytest.raises(router_module._NoTarget, match="ae-llm-box"):
+    with pytest.raises(router_module._NoTarget, match="example-box"):
         await router_module._resume_host(Request({"type": "http"}))
     monkeypatch.delenv("AE_RESUME_HOST")
     monkeypatch.setattr(

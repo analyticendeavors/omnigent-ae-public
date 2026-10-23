@@ -13,11 +13,11 @@
 #
 #   ~/.claude/settings.json:
 #     "statusLine": {"type": "command",
-#                    "command": "/home/reid/repos/omnigent-ae/deploy/ae-limits-statusline.sh"}
+#                    "command": "/path/to/omnigent-ae/deploy/ae-limits-statusline.sh"}
 #
 # A status bar you already had keeps working: pass its command as the
 # arguments and it receives the same stdin, e.g.
-#     "command": "/home/reid/repos/omnigent-ae/deploy/ae-limits-statusline.sh npx -y claude-hud"
+#     "command": "/path/to/omnigent-ae/deploy/ae-limits-statusline.sh npx -y claude-hud"
 #
 # Shell, not Python: the statusLine runs on Claude Code's render path and
 # upstream moved its own capture to a shell shim for the same reason. The

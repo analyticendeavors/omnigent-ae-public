@@ -1,6 +1,6 @@
 // Your move (2026-09-24): everything waiting on Reid, readable on a phone.
-// Reid runs several sessions at once and merges from his phone while
-// travelling, and kept asking "what's left"; this answers "what is waiting on
+// Reid runs several sessions at once and merges from his phone and
+// kept asking "what's left"; this answers "what is waiting on
 // me right now" from `GET /v1/ae/your-move`, each item with the one button
 // that resolves it.
 //

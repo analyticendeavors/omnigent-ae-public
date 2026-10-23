@@ -433,7 +433,7 @@ upstream's `tests/server/test_openapi_drift.py` (since 2026-10-14),
 | `web` | `just web-lint`: `pnpm install --frozen-lockfile --filter web` in the patched tree, then upstream's `lint` and `type-check` over the whole SPA; then `just ext-build`, which rebuilds the Parking Lot bundle and fails if the committed `dist/` differs |
 | `web-test` | `just web-test <n>/4` in four parallel shards (vitest `--shard`): vitest over the suites the patches add or touch (the AE helpers and components, every `Sidebar` suite, the extension navigation map, the extension host services, the SDK page drain, and since 2026-10-14 the ChatPage composer, mention and statusLine suites, which had failed unseen since patch 0030). Split out of `web` on 2026-10-20: one run of the whole list took about 5 of that job's 10 minutes. `just web-check` still runs both halves locally |
 | `image` | stage 1 from `upstream/deploy/docker/Dockerfile`, stage 2 from `deploy/Dockerfile`; `omni --version` must print the pinned version; `omni extensions list` must name `analyticendeavors.parking-lot` and `doctor` must resolve its bundle; both AE packages must import |
-| `rules` | the managed block in `CLAUDE.md` matches `claude-config/BRANCH-DISCIPLINE-CLAUDE-RULES.md` in ae-claude-skills (needs the `RULES_SOURCE_TOKEN` secret; without it the job checks only the markers, warns, and passes) |
+| `rules` | on the private repository only (the public export drops the block): the managed block in `CLAUDE.md` matches `claude-config/BRANCH-DISCIPLINE-CLAUDE-RULES.md` in ae-claude-skills (needs the `RULES_SOURCE_TOKEN` secret; without it the job checks only the markers, warns, and passes) |
 
 ## Shallow checkouts
 

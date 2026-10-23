@@ -32,7 +32,7 @@ const POST = "POST /v1/ae/host/relink";
 const NOW = Date.parse("2026-10-20T18:05:48Z");
 
 const status = (extra: Partial<HostStatus> = {}): HostStatus => ({
-  host: { id: "host_box", name: "ae-llm-box", status: "offline" },
+  host: { id: "host_box", name: "example-box", status: "offline" },
   state: "offline",
   streak: 0,
   since: null,
@@ -54,7 +54,7 @@ const status = (extra: Partial<HostStatus> = {}): HostStatus => ({
 
 const connected = () =>
   status({
-    host: { id: "host_box", name: "ae-llm-box", status: "online" },
+    host: { id: "host_box", name: "example-box", status: "online" },
     state: "connected",
     can_request: false,
   });
@@ -217,7 +217,7 @@ describe("the section", () => {
     const { context } = stubContext({ [GET]: [ok(rejected())] });
     const node = await mount(context);
     expect(pill(node)).toBe("Rejected");
-    expect(node.querySelector(".fabric-name")?.textContent).toBe("ae-llm-box");
+    expect(node.querySelector(".fabric-name")?.textContent).toBe("example-box");
     const [ask] = buttons(node);
     expect(ask?.textContent).toBe(ASK_LABEL);
     expect(ask?.classList.contains("btn-tint")).toBe(true);

@@ -1,7 +1,7 @@
 """``GET /v1/ae/your-move``: everything waiting on Reid, in one payload.
 
 Why (Reid, 2026-09-24): across a long day he kept asking "what's left", runs
-several sessions at once and merges from his phone for three weeks of travel.
+several sessions at once and merges from his phone.
 This answers "what is waiting on me right now" from signals that already
 exist; it adds no prompt rule (CLAUDE.md rule 4) and writes nothing.
 

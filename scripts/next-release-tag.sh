@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Decide whether a commit on main gets the next ae-v* release tag, and which.
 # Added 2026-09-24 for .github/workflows/release.yml, so that merging a PR is the
-# whole release while Reid travels with only a laptop: the workflow tags, the
-# box's auto-update timer deploys.
+# whole release while the maintainer is away from a laptop: the workflow tags,
+# the box's auto-update timer deploys.
 #
 # Usage: scripts/next-release-tag.sh [--force] [--tip REF] SHA
 #

@@ -73,6 +73,31 @@ def _rename(index: int, title: str) -> ConversationItem:
     )
 
 
+def _question(index: int, call_id: str, name: str = "AskUserQuestion") -> ConversationItem:
+    return ConversationItem(
+        id=f"item_{index}",
+        type="function_call",
+        status="completed",
+        response_id="r",
+        created_at=1,
+        data={"agent": "worker", "name": name, "arguments": "{}", "call_id": call_id},
+    )
+
+
+PICKED = 'Your questions have been answered: "Split this off?"="Save for later".'
+
+
+def _result(index: int, call_id: str, output: str = PICKED) -> ConversationItem:
+    return ConversationItem(
+        id=f"item_{index}",
+        type="function_call_output",
+        status="completed",
+        response_id="r",
+        created_at=1,
+        data={"call_id": call_id, "output": output},
+    )
+
+
 # ── updates_for: the pure scan ───────────────────────────────────────
 
 
@@ -161,6 +186,57 @@ def test_a_user_turn_answers_an_open_gate() -> None:
     # Nothing to answer, nothing written; a meta item is not the human.
     assert updates_for([_message(1, "hi", role="user")], {labels.GATE: "answered"}) == {}
     assert updates_for([_message(1, "ctx", role="user", meta=True)], {labels.GATE: "open"}) == {}
+
+
+def test_a_pick_in_the_gate_pop_up_answers_the_gate() -> None:
+    # In one batch: the gate, its pop-up, the human's pick.
+    items = [_message(1, GATE), _question(2, "q1"), _result(3, "q1")]
+    assert updates_for(items, {})[labels.GATE] == "answered"
+    # Across batches: the call id is saved, then its result answers the gate.
+    asked = updates_for([_message(1, GATE), _question(2, "q1")], {})
+    assert asked[labels.GATE_ASK] == "q1"
+    opened = {labels.GATE: "open", labels.GATE_ASK: "q1"}
+    picked = 'The user answered: "Split this off?"="Do it now"'
+    assert updates_for([_result(3, "q1", picked)], opened) == {
+        labels.GATE: "answered",
+        labels.GATE_ASK: "",
+    }
+
+
+def test_only_the_gate_pop_up_and_only_a_pick_answer_it() -> None:
+    opened = {labels.GATE: "open", labels.GATE_ASK: "q1"}
+    # Another tool, or a later task pop-up, leaves the gate and its pop-up alone.
+    others = [
+        _question(1, "t1", name="Bash"),
+        _result(2, "t1"),
+        _question(3, "q2"),
+        _result(4, "q2"),
+    ]
+    assert updates_for(others, opened) == {}
+    # A declined or interrupted pop-up keeps the gate open and frees the slot,
+    # so the next pop-up asks the gate again.
+    for output in (
+        "The user doesn't want to proceed with this tool use.",
+        "[Tool call interrupted: the session ended before this call's result was saved]",
+        "Permission denied by hook",
+    ):
+        assert updates_for([_result(1, "q1", output)], opened) == {labels.GATE_ASK: ""}
+    retry = [_result(1, "q1", "Permission denied by hook"), _question(2, "q3"), _result(3, "q3")]
+    assert updates_for(retry, opened) == {labels.GATE: "answered", labels.GATE_ASK: ""}
+    # No gate open, no pop-up saved.
+    assert updates_for([_question(1, "q1")], {labels.GATE: "answered"}) == {}
+
+
+def test_a_new_gate_or_a_typed_answer_clears_the_saved_pop_up() -> None:
+    opened = {labels.GATE: "open", labels.GATE_ASK: "q1"}
+    assert updates_for([_message(1, GATE)], opened)[labels.GATE_ASK] == ""
+    assert updates_for([_message(1, "B", role="user")], opened) == {
+        labels.GATE: "answered",
+        labels.GATE_ASK: "",
+    }
+    # The old pop-up's late result no longer answers the new gate.
+    reopened = [_message(1, GATE), _result(2, "q1")]
+    assert updates_for(reopened, opened)[labels.GATE] == "open"
 
 
 def test_user_lines_never_open_a_gate() -> None:
@@ -257,6 +333,18 @@ def test_observe_items_writes_through_the_store(store: _Store) -> None:
     assert observe_items("conv_a", [_message(2, "plain prose")]) == {}
     assert observe_items("conv_missing", [_message(3, GATE)]) == {}
     assert len(store.writes) == 1
+
+
+def test_observe_items_answers_the_gate_from_its_saved_pop_up(store: _Store) -> None:
+    assert (
+        observe_items("conv_a", [_message(1, GATE), _question(2, "q1")])[labels.GATE_ASK] == "q1"
+    )
+    assert observe_items("conv_a", [_result(3, "t1")]) == {}
+    assert observe_items("conv_a", [_result(4, "q1")]) == {
+        labels.GATE: "answered",
+        labels.GATE_ASK: "",
+    }
+    assert store.rows["conv_a"].labels[labels.GATE] == "answered"
 
 
 def test_overlapping_batches_take_different_note_numbers(

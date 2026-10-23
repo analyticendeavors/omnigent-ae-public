@@ -21,6 +21,9 @@ NAMESPACE = "ae."
 STATUS = "ae.status"
 STARTED = "ae.started"
 GATE = "ae.gate"
+# The call id of the pop-up question (AskUserQuestion) that asks the open gate,
+# so its answer, which lands as a tool result, can close it (2026-10-23).
+GATE_ASK = "ae.gate_ask"
 FORK = "ae.fork"
 NEXT = "ae.next"
 ABSORBED = "ae.absorbed"

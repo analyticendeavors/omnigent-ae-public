@@ -70,7 +70,7 @@ _CONFIG_KEYS = ("policy_modules", "debug_router_modules")
 # The Graphiti MCP URL (2026-10-21). agents/steward and agents/shutdown ship the
 # placeholder below as their box_memory url; render_agent_dirs fills it from
 # this variable, or drops the server when the variable is unset or empty, before
-# upstream registers the specs. On the box the value is http://ae-llm-box:8000/mcp.
+# upstream registers the specs. On the box the value is http://box.example:8000/mcp.
 GRAPH_MCP_ENV = "AE_GRAPH_MCP_URL"
 GRAPH_MCP_TOKEN = "${" + GRAPH_MCP_ENV + "}"
 

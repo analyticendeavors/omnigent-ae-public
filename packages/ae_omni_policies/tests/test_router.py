@@ -734,7 +734,7 @@ AGENTS = {
 }
 BOX = {
     "host_id": "host_box",
-    "name": "ae-llm-box",
+    "name": "example-box",
     "status": "online",
     "sandbox_provider": None,
 }
@@ -776,7 +776,7 @@ def home(monkeypatch: pytest.MonkeyPatch) -> list[str]:
 
     async def _home(request: Request, host_id: str) -> str | None:
         asked.append(host_id)
-        return "/home/reid"
+        return "/home/user"
 
     monkeypatch.setattr(router_module, "_host_home", _home)
     return asked
@@ -799,16 +799,16 @@ async def test_resume_session_creates_and_posts_the_block(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["session_id"] == "conv_resumed"
-    assert body["host"] == {"id": "host_box", "name": "ae-llm-box"}
+    assert body["host"] == {"id": "host_box", "name": "example-box"}
     assert body["agent"] == {"id": "ag_native", "name": "claude-native-ui"}
-    assert body["workspace"] == "/home/reid"
+    assert body["workspace"] == "/home/user"
     assert home == ["host_box"]
     create = app.calls[2]
     assert create[:2] == ("POST", "/v1/sessions")
     assert create[2] == {
         "agent_id": "ag_native",
         "host_id": "host_box",
-        "workspace": "/home/reid",
+        "workspace": "/home/user",
         "labels": {
             labels.TASK: task["id"],
             "omnigent.ui": "terminal",
@@ -896,15 +896,15 @@ async def test_resume_session_without_a_host_carries_the_block(
 async def test_resume_session_picks_the_named_host_and_workspace(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
 ) -> None:
-    monkeypatch.setenv("AE_RESUME_HOST", "ae-llm-box")
-    monkeypatch.setenv("AE_RESUME_WORKSPACE", "/home/reid/GitHub")
+    monkeypatch.setenv("AE_RESUME_HOST", "example-box")
+    monkeypatch.setenv("AE_RESUME_WORKSPACE", "/home/user/GitHub")
     app = _App(hosts=[BOX, {**BOX, "host_id": "host_mac", "name": "mac"}])
     monkeypatch.setattr(router_module, "_loopback", app)
     with respx.mock(base_url=BASE) as mock:
         task = _task_mock(mock)
         response = await client.post(f"/v1/ae/lot/{task['id']}/session")
     assert response.status_code == 200, response.text
-    assert response.json()["workspace"] == "/home/reid/GitHub"
+    assert response.json()["workspace"] == "/home/user/GitHub"
     assert home == []
     assert app.calls[2][2]["host_id"] == "host_box"
 
@@ -1048,7 +1048,7 @@ async def test_start_session_holds_a_slot_creates_and_briefs(
     assert body["session_id"] == "conv_resumed"
     assert body["existing"] is False
     assert body["path"] == "/c/conv_resumed"
-    assert body["workspace"] == "/home/reid/repos/omnigent-ae"
+    assert body["workspace"] == "/home/user/repos/omnigent-ae"
     assert body["overflow"] is False
     assert home == ["host_box"]
     method, path, create = app.calls[2]
@@ -1056,7 +1056,7 @@ async def test_start_session_holds_a_slot_creates_and_briefs(
     assert create == {
         "agent_id": "ag_native",
         "host_id": "host_box",
-        "workspace": "/home/reid/repos/omnigent-ae",
+        "workspace": "/home/user/repos/omnigent-ae",
         "title": START["title"],
         "labels": {
             labels.STATUS: "working",
@@ -1084,7 +1084,7 @@ async def test_start_session_codex_absolute_workspace_and_derived_key(
     app = _App()
     monkeypatch.setattr(router_module, "_loopback", app)
     body = {"title": "Codex review", "brief": "Review it.", "harness": "codex"}
-    body |= {"workspace": "/srv/repo/", "host": "ae-llm-box"}
+    body |= {"workspace": "/srv/repo/", "host": "example-box"}
     response = await client.post("/v1/ae/sessions", json=body)
     assert response.status_code == 200, response.text
     answer = response.json()

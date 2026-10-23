@@ -39,7 +39,12 @@ import threading
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from omnigent.entities.conversation import ConversationItem, FunctionCallData, MessageData
+from omnigent.entities.conversation import (
+    ConversationItem,
+    FunctionCallData,
+    FunctionCallOutputData,
+    MessageData,
+)
 from omnigent.policies.schema import PolicyEvent, PolicyResponse
 from omnigent.runtime import get_conversation_store
 
@@ -70,6 +75,14 @@ NEXT_LINE = re.compile(r"^NEXT:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 TITLE_LINE = re.compile(r"^Title:[ \t]*(.*?)[ \t]*$", re.MULTILINE)
 # The agent-facing rename tool (``omnigent/tools/builtins/session_rename.py``).
 RENAME_TOOLS = frozenset({"sys_session_rename"})
+# Claude's pop-up question tool. The first one asked while a gate is open is
+# the gate's (its call id is saved in ``ae.gate_ask``); its result is the
+# human's answer, the way a typed reply is.
+QUESTION_TOOLS = frozenset({"AskUserQuestion"})
+# How a pop-up result that carries a pick begins. A declined, interrupted or
+# hook-denied pop-up returns other text and leaves the gate open; of the 498
+# pop-up results on the box on 2026-10-23, 488 began with one of these.
+QUESTION_ANSWERS = ("Your questions have been answered", "The user answered:")
 
 # The legacy title glyphs, one per status (``web/src/lib/aeLabels.ts``
 # ``AE_LEGACY_GLYPHS`` mirrors this). The reference glyph usually arrives with
@@ -149,7 +162,9 @@ def updates_for(items: Sequence[ConversationItem], current: Mapping[str, str]) -
     Pure: reads the items and the session's current labels, returns the
     upsert. Counters continue from their current values, and each counted line
     is saved under its number; the last ``FORK:`` line in the batch wins; a user
-    turn while the gate is open answers it.
+    turn while the gate is open answers it, and so does a pick in the gate's
+    pop-up: the first :data:`QUESTION_TOOLS` call while the gate is open, whose
+    call id ``ae.gate_ask`` carries across batches.
 
     :param items: Persisted items, oldest first.
     :param current: The session's labels before the batch.
@@ -159,6 +174,7 @@ def updates_for(items: Sequence[ConversationItem], current: Mapping[str, str]) -
     absorbed = labels.count(current, labels.ABSORBED)
     unfiled = labels.count(current, labels.UNFILED)
     gate = labels.label(current, labels.GATE)
+    saved_ask = ask = labels.label(current, labels.GATE_ASK)
     for item in items:
         data = item.data
         if item.type == "message" and isinstance(data, MessageData):
@@ -167,6 +183,7 @@ def updates_for(items: Sequence[ConversationItem], current: Mapping[str, str]) -
                 forks = FORK_LINE.findall(text)
                 if forks:
                     gate = labels.GATE_OPEN
+                    ask = None
                     updates[labels.GATE] = gate
                     updates[labels.FORK] = labels.clip(forks[-1])
                 absorbed = _count_lines(
@@ -185,10 +202,23 @@ def updates_for(items: Sequence[ConversationItem], current: Mapping[str, str]) -
             elif not data.is_meta and gate == labels.GATE_OPEN:
                 gate = labels.GATE_ANSWERED
                 updates[labels.GATE] = gate
+                ask = None
         elif isinstance(data, FunctionCallData) and data.name in RENAME_TOOLS:
             status = glyph_status(_rename_title(data))
             if status:
                 updates[labels.STATUS] = status
+        elif isinstance(data, FunctionCallData) and data.name in QUESTION_TOOLS:
+            if gate == labels.GATE_OPEN and ask is None:
+                ask = data.call_id
+        elif isinstance(data, FunctionCallOutputData) and ask and data.call_id == ask:
+            # Answered or not, the pop-up is spent: after a decline, the next
+            # pop-up asks the gate again.
+            ask = None
+            if gate == labels.GATE_OPEN and data.output.lstrip().startswith(QUESTION_ANSWERS):
+                gate = labels.GATE_ANSWERED
+                updates[labels.GATE] = gate
+    if ask != saved_ask:
+        updates[labels.GATE_ASK] = ask or ""
     return updates
 
 

@@ -86,7 +86,7 @@ const hold = (over: Partial<DeployHold> = {}): DeployHold => ({
 
 const host = (state: HostStatus["state"]): HostStatus =>
   ({
-    host: { id: "h", name: "ae-llm-box", status: "online" },
+    host: { id: "h", name: "example-box", status: "online" },
     state,
   }) as HostStatus;
 

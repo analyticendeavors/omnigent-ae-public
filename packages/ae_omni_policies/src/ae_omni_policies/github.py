@@ -1,6 +1,6 @@
 """GitHub client for the Your move pull requests and the PR cards' Merge button.
 
-Added 2026-09-24. Reid merges from his phone while travelling and kept asking
+Added 2026-09-24. Reid merges from his phone and kept asking
 which pull requests were his to act on; the server had no GitHub credential,
 so this reads an optional one from the environment:
 

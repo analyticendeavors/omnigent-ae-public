@@ -48,7 +48,7 @@ EXPECTED = {
 # ship a placeholder url that the image's entrypoint fills from AE_GRAPH_MCP_URL
 # before registering them (2026-10-21); the box's value stands in for it here.
 BOX_MEMORY = "box_memory"
-BOX_MEMORY_URL = "http://ae-llm-box:8000/mcp"
+BOX_MEMORY_URL = "http://box.example:8000/mcp"
 BOX_MEMORY_READ = ["search_nodes", "search_memory_facts", "get_episodes", "get_entity_edge"]
 BOX_MEMORY_WRITE = {"add_memory", "delete_episode", "delete_entity_edge", "clear_graph"}
 WITH_BOX_MEMORY = ("steward", "shutdown")
@@ -91,7 +91,7 @@ def _rendered(name: str, tmp_path: Path, url: str | None) -> Path:
 def test_box_memory_ships_the_placeholder(name: str, tmp_path: Path) -> None:
     """The repo file carries no host; upstream's loader leaves the token as is."""
     text = (AGENTS / name / "agent.yaml").read_text(encoding="utf-8")
-    assert "ae-llm-box:8000/mcp" not in text.replace(f"(on the box: {BOX_MEMORY_URL})", "")
+    assert "box.example:8000/mcp" not in text.replace(f"(on the box: {BOX_MEMORY_URL})", "")
     spec = load_spec(materialize_bundle(AGENTS / name, tmp_path / name))
     (memory,) = [server for server in spec.mcp_servers if server.name == BOX_MEMORY]
     assert memory.url == docker_entrypoint.GRAPH_MCP_TOKEN
