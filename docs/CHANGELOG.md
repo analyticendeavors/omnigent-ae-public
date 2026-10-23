@@ -106,7 +106,7 @@ below).
 
 Phase 7 (2026-09-24): daily use, no core patch. The steward and the shutdown note
 carry the box memory as a second MCP tool, `box_memory`: the business Graphiti graph
-over streamable HTTP at `http://ae-llm-box:8000/mcp` (the tailnet name, because
+over streamable HTTP at `http://box.example:8000/mcp` (the tailnet name, because
 Graphiti binds the box's Tailscale IP and not loopback), with an allowlist of its four
 read tools; `add_memory`, the two deletes and `clear_graph` never reach an agent, nor
 does the personal graph on `:8001` (`packages/ae_omni_policies/tests/test_agents.py` holds both). Each prompt
@@ -115,9 +115,9 @@ the page for everything after the deploy: adding a laptop or WSL host (`omnigent
 `omnigent host`, `host enable`; Windows needs WSL), `omnigent import --harness claude
 --last 25` and where the sessions land, the phone (Tailscale, Safari, Add to Home
 Screen, the Dashboard, PR cards, the Run and Paste buttons, Remote Control from the
-Claude app), and travel mode for three weeks with only an iPhone (rewritten
+Claude app), and travel mode with only an iPhone (rewritten
 2026-09-24; it said laptop before): code in Claude Code on the web, box work in a
-session on host `ae-llm-box`, root steps through Cockpit's terminal, what still needs
+session on the box's host, root steps through Cockpit's terminal, what still needs
 a keyboard, a pre-trip checklist with one reboot at home, and what to do when the box
 is unreachable. Done when Reid opens the
 lot on the phone and resumes a parked task into a session on a host; that last step
@@ -208,8 +208,8 @@ output, Run hides while a block is still streaming, and the terminal gets the fo
 after a Run so a sudo password can be typed straight away.
 
 Release on merge (2026-09-24): `.github/workflows/release.yml` makes a merge to
-`main` the whole release, for the three weeks from 2026-09-25 when Reid has only a
-laptop and Claude web sessions cannot push tags. When CI passes on a push to `main`
+`main` the whole release, for when Reid has only a laptop and Claude web
+sessions cannot push tags. When CI passes on a push to `main`
 it tags the tip `ae-vX.Y.Z.N` (the next N for the pinned upstream tag, 1 after a
 sync), but only when something that ships changed since the last tag and the commit
 has no `ae-v*` tag yet, then dispatches `image.yml` on that tag to publish the
@@ -218,8 +218,8 @@ no tag; to ship one anyway, or re-ship, run the Release workflow on `main` with
 `force` on.
 
 Your move (2026-09-24): no core patch. One screen of everything waiting on Reid,
-because across a long day he kept asking what was left and will merge from his phone
-for three weeks. `GET /v1/ae/your-move` (`ae_omni_policies/your_move.py`) aggregates
+because across a long day he kept asking what was left and will merge from his phone.
+`GET /v1/ae/your-move` (`ae_omni_policies/your_move.py`) aggregates
 sessions that need him (an open gate, an approval outstanding, `blocked`, `review`),
 lot items resurfacing today or overdue, the steward's latest brief and his open pull
 requests with CI state, each source isolated so one failure shows inline and the rest
@@ -1118,9 +1118,9 @@ tooltip names the letter so it can be matched to the gate's RECOMMEND line. The
 recommended button is not marked, because the observer captures the FORK clause
 (`ae.fork`) and not RECOMMEND. On a phone the gate's buttons wrap two to a row.
 
-PR cards (2026-09-24): the twelfth core patch, `patches/0012` (P12, web). Reid is
-travelling for three weeks and merged every pull request by hand on github.com from
-his phone. Each pull request a session tracks (upstream's per-session tracking,
+PR cards (2026-09-24): the twelfth core patch, `patches/0012` (P12, web). Reid merged
+every pull request by hand on github.com from his phone. Each pull request a session
+tracks (upstream's per-session tracking,
 https://github.com/omnigent-ai/omnigent/pull/6935) is now a card at the top of the
 session's GitHub panel and, compact, under the chat message that names it, and every open one across sessions is a card in the
 Dashboard's new Open PRs section, right under Your move (a pull request with a card
@@ -1315,7 +1315,7 @@ GitHub" reads "GitHub" while Copy is a copy icon named "Copy link" at every widt
 Merge, GitHub and Copy share one row.
 
 Lot search and tags (2026-09-25, https://github.com/analyticendeavors/omnigent-ae/issues/28),
-no core patch. Reid reads the lot on his phone while travelling and asked for four
+no core patch. Reid reads the lot on his phone and asked for four
 things. Every tag shows on a lot card, wrapping, in task-store's own colour and Tabler
 icon (`GET /v1/ae/lot/tags` rows now carry `color` and `icon`; `?icons=true` adds the
 icons' path data, read once from the app's `/tabler-icons.json` and kept), and a tap

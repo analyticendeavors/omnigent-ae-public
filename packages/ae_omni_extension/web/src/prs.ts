@@ -1,7 +1,7 @@
 // Open PRs (2026-09-24): every open pull request a session tracks, as a card
-// with CI, mergeability, reviews and a Merge button. Reid is travelling for
-// three weeks and merged every pull request by hand on github.com from his
-// phone; this puts the merge next to the sessions that opened them.
+// with CI, mergeability, reviews and a Merge button. Reid merged every pull
+// request by hand on github.com from his phone; this puts the merge next to the
+// sessions that opened them.
 //
 // Which pull requests: upstream's per-session tracking
 // (https://github.com/omnigent-ai/omnigent/pull/6935), read by

@@ -430,7 +430,7 @@ Never in the repo. The workflows read these repository secrets:
 
 | Secret | Used by | What it is |
 |---|---|---|
-| `RULES_SOURCE_TOKEN` | `rules` job | fine-grained PAT, Contents: read on `analyticendeavors/ae-claude-skills`. Without it the job only checks that the managed markers are present, warns, and passes; with it, any drift from the source fails the PR. |
+| `RULES_SOURCE_TOKEN` | `rules` job (private repository only) | fine-grained PAT, Contents: read on `analyticendeavors/ae-claude-skills`. Without it the job only checks that the managed markers are present, warns, and passes; with it, any drift from the source fails the PR. |
 | `PATCH_BOT_TOKEN` | `patch-rebase.yml` | fine-grained PAT on `analyticendeavors/omnigent-ae` and `analyticendeavors/omnigent`: Contents, Pull requests and Workflows read and write. `GITHUB_TOKEN` cannot push to the fork, and its pushes start no CI. Without it the workflow warns and passes. Setup: `docs/UPSTREAM-SYNC.md`, "Patch rebase bot". |
 
 The other direction, ae-claude-skills stamping this repo, uses its own

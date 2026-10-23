@@ -66,7 +66,7 @@ class World:
             agent_id=AGENT_ID,
             runner_id=runner_id,
             host_id=host_id,
-            workspace="/home/reid/repos/x",
+            workspace="/home/user/repos/x",
             parent_conversation_id=parent,
             labels=DISCONNECTED if session_labels is None else session_labels,
         )

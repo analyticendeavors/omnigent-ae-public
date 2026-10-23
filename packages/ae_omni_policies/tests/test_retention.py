@@ -318,7 +318,7 @@ async def test_first_fire_after_deploy_clears_the_backlog(world: World) -> None:
 
     host_id = uuid.uuid4().hex
     task = world.task()
-    task = world.tasks.update(task.id, host_id=host_id, workspace="/home/reid")
+    task = world.tasks.update(task.id, host_id=host_id, workspace="/home/user")
     backlog = [world.run(task) for _ in range(7)]
     renamed = world.run(task, title="Monday brief, keep")
 

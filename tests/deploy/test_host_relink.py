@@ -32,7 +32,7 @@ FIRST = (
     "⚠ Connection refused (HTTP 403): the host tunnel was rejected. Retrying; this usually "
     "means the VPN or network dropped."
 )
-CONNECTED = "✓ Connected as 'ae-llm-box' (bbf29d9e), 0 live runner(s). Listening for sessions"
+CONNECTED = "✓ Connected as 'example-box' (bbf29d9e), 0 live runner(s). Listening for sessions"
 
 
 def every_30th(n: int) -> str:

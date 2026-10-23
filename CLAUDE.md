@@ -49,9 +49,3 @@ this repository sees only this checkout:
   what failed and what to do about it.
 - Never reference a PR, issue or task without its URL.
 - No hardcoded secrets, tokens or passwords; no contact or prospect data in the repo.
-
-<!-- AE-BRANCH-DISCIPLINE-RULES:START (managed by scripts/setup-branch-discipline-local.sh) -->
-# Global rules
-
-If Reid's global rules (`~/.claude/CLAUDE.md`, beginning "# User-Level Instructions for Claude Code") are not already in your context, call `get_global_rules` (ae-rules connector) before your first reply, read every part, and follow the result for the session. If the tool is missing or fails, say so in your first reply with the error. CI jobs skip this.
-<!-- AE-BRANCH-DISCIPLINE-RULES:END -->

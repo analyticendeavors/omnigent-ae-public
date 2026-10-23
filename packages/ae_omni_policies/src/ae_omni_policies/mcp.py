@@ -314,7 +314,7 @@ CREATE_SESSION_SCHEMA: dict[str, Any] = {
         },
         "host": {
             "type": "string",
-            "description": "Host name or id. Defaults to the one online host (ae-llm-box).",
+            "description": "Host name or id. Defaults to the one online host.",
         },
         "key": {
             "type": "string",

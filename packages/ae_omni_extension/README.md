@@ -334,7 +334,7 @@ pages.
 
 ## Your move (2026-09-24)
 
-Why: Reid runs several sessions at once, merges from his phone while travelling,
+Why: Reid runs several sessions at once, merges from his phone,
 and kept asking "what's left". The section answers "what is waiting on me right
 now" from one route, `GET /v1/ae/your-move` (`ae_omni_policies/your_move.py`),
 which reads signals that already exist and adds no prompt rule. It was a page of
@@ -438,7 +438,7 @@ it otherwise), so it offers none. Open on GitHub and Copy stay (Copy link alone 
 ## Tags, repo and search (2026-09-25)
 
 Reid's feedback on the lot (https://github.com/analyticendeavors/omnigent-ae/issues/28),
-read mostly on an iPhone while travelling.
+read mostly on an iPhone.
 
 - **Tags.** Every tag a task carries shows, in a row under the card's header that
   wraps; no "+1". Each chip wears task-store's own colour and Tabler icon, the ones

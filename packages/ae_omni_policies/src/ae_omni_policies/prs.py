@@ -1,8 +1,8 @@
 """Pull request cards with a Merge button, built on upstream's per-session PR tracking.
 
-Added 2026-09-24. Reid is travelling for three weeks, works from his phone,
-and merged every pull request by hand on github.com. The cards put CI,
-mergeability, reviews and a Merge button next to the session that opened the
+Added 2026-09-24. Reid works from his phone and merged every pull request by
+hand on github.com. The cards put CI, mergeability, reviews and a Merge button
+next to the session that opened the
 pull request (patch P11, the session's GitHub panel) and on the Dashboard
 (the extension's Open PRs section).
 
