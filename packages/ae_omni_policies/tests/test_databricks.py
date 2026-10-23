@@ -124,6 +124,35 @@ def _succeeded(month: str | None = "12.5", total: str | None = "40.25") -> dict[
     }
 
 
+def _breakdown(*rows: list[object]) -> dict[str, object]:
+    """A finished breakdown statement with *rows* of (kind, item, usd)."""
+    return {
+        **_statement("SUCCEEDED"),
+        "manifest": {"total_row_count": len(rows)},
+        "result": {"data_array": [list(row) for row in rows]},
+    }
+
+
+def _sql_of(request: httpx.Request) -> str:
+    return json.loads(request.content)["statement"]
+
+
+def _routed(spend: httpx.Response | Exception, breakdown: httpx.Response | Exception) -> object:
+    """A side effect for the statements route: each query gets its own answer."""
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        reply = spend if _sql_of(request) == databricks.SPEND_SQL else breakdown
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    return answer
+
+
+def _days_back(n: int) -> str:
+    return (datetime.now(UTC).date() - timedelta(days=n)).isoformat()
+
+
 def _mock(
     mock: respx.MockRouter, *warehouses: dict[str, object]
 ) -> tuple[respx.Route, respx.Route]:
@@ -252,6 +281,9 @@ async def test_none_configured_says_how_to_turn_it_on(client: httpx.AsyncClient)
         "creditStart": "2026-08-19",
         "creditEnd": "2027-08-19",
         "warehouseId": None,
+        "products": None,
+        "days": None,
+        "note": None,
     }
 
 
@@ -755,8 +787,11 @@ async def test_a_reading_on_get_is_reported_and_then_fresh(
         clock.now += databricks.LIST_TTL_S + 1
         second = await client.get("/v1/ae/databricks")
         await _settle()
-        # Fresh now: the second GET did not read again.
-        assert statements.call_count == 1
+        # Fresh now: the second GET did not read again (the totals, then the breakdown).
+        assert [_sql_of(call.request) for call in statements.calls] == [
+            databricks.SPEND_SQL,
+            databricks.BREAKDOWN_SQL,
+        ]
     assert first.json()["spend"]["status"] == "reading"
     spend = second.json()["spend"]
     assert spend["status"] == "ok"
@@ -863,7 +898,12 @@ async def test_refresh_reads_in_the_background_and_polls_to_the_end(
     caplog.set_level(logging.DEBUG)
     with respx.mock(assert_all_called=False) as mock:
         _mock(mock, _warehouse("STOPPED"))
-        posted = mock.post(STATEMENTS_URL).respond(200, json=_statement("PENDING"))
+        posted = mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(
+                httpx.Response(200, json=_statement("PENDING")),
+                httpx.Response(200, json=_breakdown()),
+            )
+        )
         polled = mock.get(f"{STATEMENTS_URL}/{STATEMENT_ID}")
         polled.side_effect = [
             httpx.Response(200, json=_statement("RUNNING")),
@@ -877,7 +917,7 @@ async def test_refresh_reads_in_the_background_and_polls_to_the_end(
     assert started["status"] == "reading"
     assert started["warehouseId"] == WID
     assert started["cadence"] == "monthly"
-    body = json.loads(posted.calls.last.request.content)
+    body = json.loads(posted.calls[0].request.content)
     assert body == {
         "warehouse_id": WID,
         "statement": databricks.SPEND_SQL,
@@ -1276,3 +1316,415 @@ def test_totals_from_another_credit_start_are_not_shown(
 async def test_the_shared_transport_is_reused_across_calls() -> None:
     first = databricks._shared_transport()
     assert databricks._shared_transport() is first
+
+
+# ── spend: the breakdown (2026-10-22) ────────────────────────────────────
+
+
+def test_the_breakdown_is_priced_and_joined_as_the_totals() -> None:
+    sql = databricks.BREAKDOWN_SQL
+    assert "p.pricing.effective_list.default" in sql
+    assert "p.pricing.default" not in sql
+    assert ":credit_start" in sql
+    assert ":since" in sql
+    assert "billing_origin_product" in sql
+    # The same join, line for line (whitespace aside), as SPEND_SQL.
+    start = databricks.SPEND_SQL.index("FROM system.billing.usage u")
+    end = databricks.SPEND_SQL.index("WHERE u.usage_date")
+    join = " ".join(databricks.SPEND_SQL[start:end].split())
+    assert join in " ".join(sql.split())
+
+
+async def test_the_breakdown_rides_the_reading_and_is_parsed(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+) -> None:
+    _configure(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+    rows = _breakdown(
+        ["product", "JOBS", "1.5"],
+        ["product", "SQL", "6.25"],
+        ["product", "DLT", "0"],
+        ["product", "OTHER", "0.75"],
+        ["product", "AI.FUNCTIONS", "0.25"],  # not a code the page shows: counted as OTHER
+        ["product", "APPS", "-2"],  # a net credit: left out
+        ["day", _days_back(0), "2.5"],
+        ["day", _days_back(3), "4"],
+        ["day", _days_back(30), "9"],  # outside the window: left out
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("STOPPED"))
+        posted = mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(
+                httpx.Response(200, json=_succeeded()), httpx.Response(200, json=rows)
+            )
+        )
+        await client.post("/v1/ae/databricks/spend/refresh", json={})
+        await _settle()
+        after = await client.get("/v1/ae/databricks")
+    second = json.loads(posted.calls[1].request.content)
+    assert second["statement"] == databricks.BREAKDOWN_SQL
+    assert second["warehouse_id"] == WID
+    assert second["parameters"] == [
+        {"name": "credit_start", "value": "2026-08-19", "type": "DATE"},
+        {"name": "since", "value": _days_back(20), "type": "DATE"},
+    ]
+    spend = after.json()["spend"]
+    assert (spend["status"], spend["monthUsd"], spend["note"]) == ("ok", 12.5, None)
+    # Largest first; a product at $0 is left out.
+    assert spend["products"] == [
+        {"product": "SQL", "usd": 6.25},
+        {"product": "JOBS", "usd": 1.5},
+        {"product": "OTHER", "usd": 1.0},
+    ]
+    days = spend["days"]
+    assert len(days) == databricks.BREAKDOWN_DAYS
+    assert days[0] == {"date": _days_back(20), "usd": 0.0}
+    assert days[-1] == {"date": _days_back(0), "usd": 2.5}
+    assert days[-4] == {"date": _days_back(3), "usd": 4.0}
+    assert sum(day["usd"] for day in days) == 6.5
+    _clean(after.text, caplog.text)
+
+
+async def test_no_spend_rows_is_an_empty_breakdown_of_zero_days(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _configure(monkeypatch)
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("RUNNING"))
+        # No rows comes back with no data_array at all.
+        empty = {**_statement("SUCCEEDED"), "manifest": {"total_row_count": 0}}
+        mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(
+                httpx.Response(200, json=_succeeded("0", "0")), httpx.Response(200, json=empty)
+            )
+        )
+        await client.post("/v1/ae/databricks/spend/refresh", json={})
+        await _settle()
+    spend = databricks.spend_view(databricks.credit())
+    assert spend["products"] == []
+    assert [day["usd"] for day in spend["days"]] == [0.0] * databricks.BREAKDOWN_DAYS
+    assert spend["note"] is None
+
+
+@pytest.mark.parametrize(
+    ("reply", "fragment"),
+    [
+        (
+            httpx.Response(
+                200,
+                json=_statement("FAILED", error={"error_code": "INTERNAL_ERROR", "message": ECHO}),
+            ),
+            "The spend breakdown query failed: ",
+        ),
+        (httpx.Response(500, json={"message": ECHO}), "answered 500"),
+        (httpx.Response(200, json=_breakdown(["region", "us-west-2", "1"])), "expected shape"),
+        (httpx.Response(200, json=_breakdown(["day", "2026-10-01", "lots"])), "expected shape"),
+        (RuntimeError(ECHO), "(RuntimeError)"),
+    ],
+)
+async def test_a_failed_breakdown_keeps_the_totals_and_carries_a_note(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    tmp_path: Path,
+    reply: httpx.Response | Exception,
+    fragment: str,
+) -> None:
+    _configure(monkeypatch)
+    caplog.set_level(logging.DEBUG)
+    _seed(
+        tmp_path / "ae-databricks.json",
+        status="ok",
+        monthUsd=3.5,
+        totalUsd=9.0,
+        creditStart="2026-08-19",
+        products=[{"product": "SQL", "usd": 3.5}],
+        days=[{"date": "2026-10-01", "usd": 3.5}],
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("RUNNING"))
+        mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(httpx.Response(200, json=_succeeded()), reply)
+        )
+        await client.post("/v1/ae/databricks/spend/refresh", json={})
+        await _settle()
+        after = await client.get("/v1/ae/databricks")
+    spend = after.json()["spend"]
+    # The totals are the new reading's, and the status is not an error.
+    assert (spend["status"], spend["message"], spend["monthUsd"]) == ("ok", None, 12.5)
+    # The old rows are not shown beside the newer totals.
+    assert (spend["products"], spend["days"]) == (None, None)
+    assert spend["note"].startswith("Breakdown unavailable")
+    assert "The totals are complete." in spend["note"]
+    assert fragment in spend["note"]
+    saved = (tmp_path / "ae-databricks.json").read_text(encoding="utf-8")
+    assert json.loads(saved)["breakdownNote"] == spend["note"]
+    _clean(after.text, caplog.text, saved)
+
+
+async def test_failed_totals_run_no_breakdown_and_keep_the_last_one(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch)
+    products = [{"product": "SQL", "usd": 3.5}]
+    _seed(
+        tmp_path / "ae-databricks.json",
+        status="ok",
+        monthUsd=3.5,
+        totalUsd=9.0,
+        creditStart="2026-08-19",
+        products=products,
+    )
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("RUNNING"))
+        statements = mock.post(STATEMENTS_URL).respond(500, json={"message": "boom"})
+        await client.post("/v1/ae/databricks/spend/refresh", json={})
+        await _settle()
+        assert statements.call_count == 1
+    spend = databricks.spend_view(databricks.credit())
+    assert spend["status"] == "error"
+    # The last good reading stays whole: its totals and its breakdown.
+    assert (spend["monthUsd"], spend["products"]) == (3.5, products)
+
+
+@pytest.mark.parametrize(("state", "reads"), [("STOPPED", False), ("RUNNING", True)])
+async def test_the_breakdown_never_wakes_a_warehouse_on_its_own(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, state: str, reads: bool
+) -> None:
+    _configure(monkeypatch)
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse(state))
+        one = mock.get(f"{LIST_URL}/{WID}").respond(200, json=_warehouse(state))
+        statements = mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(
+                httpx.Response(200, json=_succeeded()), httpx.Response(200, json=_breakdown())
+            )
+        )
+        await client.get("/v1/ae/databricks")
+        await _settle()
+        # GET on a stopped warehouse posts nothing; on a running one, the two
+        # statements of one reading, after one uncached state check.
+        assert [_sql_of(call.request) for call in statements.calls] == (
+            [databricks.SPEND_SQL, databricks.BREAKDOWN_SQL] if reads else []
+        )
+        assert {json.loads(call.request.content)["warehouse_id"] for call in statements.calls} <= {
+            WID
+        }
+        assert one.call_count == (1 if reads else 0)
+
+
+async def test_the_breakdown_shares_the_deadline_and_is_cancelled(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.DEBUG)
+    clock = Clock()
+    monkeypatch.setattr(databricks, "_monotonic", clock)
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        if request.url.path.endswith("/cancel"):
+            return httpx.Response(200, json={})
+        if request.method == "POST" and _sql_of(request) == databricks.SPEND_SQL:
+            # The totals took most of the reading's time.
+            clock.now += databricks.READING_DEADLINE_S - 1
+            return httpx.Response(200, json=_succeeded())
+        clock.now += 2
+        return httpx.Response(200, json=_statement("RUNNING"))
+
+    await databricks._read_spend(
+        ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+    )
+    assert seen.count(CANCEL) == 1
+    spend = databricks.spend_view(databricks.credit({}))
+    assert (spend["status"], spend["monthUsd"], spend["products"]) == ("ok", 12.5, None)
+    assert "spend breakdown query did not finish within" in spend["note"]
+    _clean(json.dumps(spend), caplog.text)
+
+
+async def test_a_reading_cancelled_in_the_breakdown_saves_the_totals(tmp_path: Path) -> None:
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+    seen: list[str] = []
+    polling = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        if request.url.path.endswith("/cancel"):
+            return httpx.Response(200, json={})
+        if request.method == "POST":
+            if _sql_of(request) == databricks.SPEND_SQL:
+                return httpx.Response(200, json=_succeeded())
+            return httpx.Response(200, json=_statement("PENDING"))
+        polling.set()
+        await asyncio.sleep(60)  # a poll that never answers
+        return httpx.Response(200, json=_breakdown())
+
+    task = asyncio.create_task(
+        databricks._read_spend(
+            ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+        )
+    )
+    await polling.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert CANCEL in seen
+    saved = json.loads((tmp_path / "ae-databricks.json").read_text(encoding="utf-8"))
+    assert (saved["status"], saved["monthUsd"], saved["products"]) == ("ok", 12.5, None)
+    assert "stopped before it finished" in saved["breakdownNote"]
+    assert saved["attemptedAt"] is not None
+
+
+async def test_the_breakdown_survives_a_restart_through_the_state_file(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch)
+    rows = _breakdown(["product", "SQL", "6.25"], ["day", _days_back(1), "6.25"])
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("STOPPED"))
+        mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(
+                httpx.Response(200, json=_succeeded()), httpx.Response(200, json=rows)
+            )
+        )
+        await client.post("/v1/ae/databricks/spend/refresh", json={})
+        await _settle()
+    before = databricks.spend_view(databricks.credit())
+    saved = json.loads((tmp_path / "ae-databricks.json").read_text(encoding="utf-8"))
+    assert saved["products"] == [{"product": "SQL", "usd": 6.25}]
+    assert len(saved["days"]) == databricks.BREAKDOWN_DAYS
+    databricks.reset()
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("STOPPED"))
+        statements = mock.post(STATEMENTS_URL).respond(200, json=_succeeded())
+        after = await client.get("/v1/ae/databricks")
+        assert not statements.called
+    spend = after.json()["spend"]
+    assert (spend["products"], spend["days"], spend["note"]) == (
+        before["products"],
+        before["days"],
+        None,
+    )
+
+
+def test_an_odd_saved_breakdown_reads_as_none(tmp_path: Path) -> None:
+    _seed(
+        tmp_path / "ae-databricks.json",
+        status="ok",
+        products=[{"product": "SQL", "usd": "lots"}],
+        days=[{"date": "../etc", "usd": 1}],
+        breakdownNote=7,
+    )
+    spend = databricks.spend_view(databricks.credit({}))
+    assert (spend["products"], spend["days"], spend["note"]) == (None, None, None)
+    databricks.reset()
+    _seed(
+        tmp_path / "ae-databricks.json", status="ok", days=[{"date": "2026-10-01", "usd": 1}] * 22
+    )
+    assert databricks.spend_view(databricks.credit({}))["days"] is None
+
+
+async def test_a_credit_change_drops_the_breakdown(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed(
+        tmp_path / "ae-databricks.json",
+        status="ok",
+        monthUsd=3.5,
+        totalUsd=9.0,
+        creditStart="2026-08-19",
+        products=[{"product": "SQL", "usd": 3.5}],
+        days=[{"date": "2026-10-01", "usd": 3.5}],
+        breakdownNote="Breakdown unavailable: old. The totals are complete.",
+    )
+    assert databricks.spend_view(databricks.credit({}))["products"] is not None
+    moved = databricks.credit({"AE_DATABRICKS_CREDIT_START": "2026-10-01"})
+    spend = databricks.spend_view(moved)
+    assert (spend["products"], spend["days"], spend["note"]) == (None, None, None)
+    # A reading under the new credit whose breakdown fails leaves none from the old one.
+    _configure(monkeypatch)
+    monkeypatch.setenv("AE_DATABRICKS_CREDIT_START", "2026-10-01")
+    with respx.mock(assert_all_called=False) as mock:
+        _mock(mock, _warehouse("RUNNING"))
+        mock.post(STATEMENTS_URL).mock(
+            side_effect=_routed(
+                httpx.Response(200, json=_succeeded()), httpx.Response(500, json={"message": "x"})
+            )
+        )
+        await client.post("/v1/ae/databricks/spend/refresh", json={})
+        await _settle()
+    state = databricks._state()
+    assert (state["creditStart"], state["products"], state["days"]) == ("2026-10-01", None, None)
+
+
+async def test_a_reading_out_of_time_posts_no_breakdown(monkeypatch: pytest.MonkeyPatch) -> None:
+    clock = Clock()
+    monkeypatch.setattr(databricks, "_monotonic", clock)
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+    posted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        posted.append(_sql_of(request))
+        # The totals used more than the whole reading's time.
+        clock.now += databricks.READING_DEADLINE_S + 1
+        return httpx.Response(200, json=_succeeded())
+
+    await databricks._read_spend(
+        ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+    )
+    assert posted == [databricks.SPEND_SQL]
+    spend = databricks.spend_view(databricks.credit({}))
+    assert (spend["status"], spend["monthUsd"], spend["products"]) == ("ok", 12.5, None)
+    assert "was not started" in spend["note"]
+
+
+async def test_new_totals_never_show_beside_the_last_readings_rows(tmp_path: Path) -> None:
+    _seed(
+        tmp_path / "ae-databricks.json",
+        status="ok",
+        monthUsd=1.0,
+        totalUsd=1.0,
+        creditStart="2026-08-19",
+        products=[{"product": "SQL", "usd": 1.0}],
+        days=[{"date": "2026-10-01", "usd": 1.0}],
+    )
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+    polling = asyncio.Event()
+    release = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        if request.method == "POST":
+            if _sql_of(request) == databricks.SPEND_SQL:
+                return httpx.Response(200, json=_succeeded("100", "100"))
+            return httpx.Response(200, json=_statement("PENDING"))
+        polling.set()
+        await release.wait()
+        return httpx.Response(200, json=_breakdown(["product", "SQL", "100"]))
+
+    task = asyncio.create_task(
+        databricks._read_spend(
+            ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+        )
+    )
+    await polling.wait()
+    # Mid-breakdown: the new totals, no rows, and the totals already on disk.
+    during = databricks.spend_view(databricks.credit({}))
+    assert (during["monthUsd"], during["products"], during["days"]) == (100.0, None, None)
+    saved = json.loads((tmp_path / "ae-databricks.json").read_text(encoding="utf-8"))
+    assert (saved["monthUsd"], saved["products"]) == (100.0, None)
+    release.set()
+    await task
+    after = databricks.spend_view(databricks.credit({}))
+    assert after["products"] == [{"product": "SQL", "usd": 100.0}]

@@ -109,10 +109,13 @@ export function azureTile(
   };
 }
 
-function sparkline(view: AzureView): SVGElement {
+/**
+ * A daily cost line, `azure-spark` (shared with the Databricks credit card,
+ * 2026-10-22): *label* names it for a screen reader from its highest point.
+ */
+export function sparkline(costs: number[], label: (top: number) => string): SVGElement {
   const width = 300;
   const height = 46;
-  const costs = view.daily.map((day) => day.cost);
   const top = Math.max(...costs, 0.01);
   const step = costs.length > 1 ? width / (costs.length - 1) : 0;
   const points = costs
@@ -126,10 +129,7 @@ function sparkline(view: AzureView): SVGElement {
   svg.setAttribute("preserveAspectRatio", "none");
   svg.setAttribute("class", "azure-spark");
   svg.setAttribute("role", "img");
-  svg.setAttribute(
-    "aria-label",
-    `Daily cost for the last ${costs.length} days, highest ${money(top, view.currency)}`,
-  );
+  svg.setAttribute("aria-label", label(top));
   const line = document.createElementNS(SVG_NS, "polyline");
   line.setAttribute("points", points);
   svg.appendChild(line);
@@ -192,7 +192,10 @@ export function azureBody(view: AzureView): Child[] {
           delta ? ` (${delta})` : "",
         )
       : null,
-    sparkline(view),
+    sparkline(
+      view.daily.map((day) => day.cost),
+      (top) => `Daily cost for the last ${view.daily.length} days, highest ${money(top, currency)}`,
+    ),
     el(
       "p",
       { class: "azure-caption meta" },
