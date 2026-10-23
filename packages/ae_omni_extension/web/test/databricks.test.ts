@@ -22,12 +22,15 @@ import {
   nextDelay,
   POLL_BUSY_MS,
   POLL_IDLE_MS,
+  productName,
   question,
   REFRESH_LABEL,
   spendBars,
+  spendDays,
   spendStatusText,
   stateText,
   toneOf,
+  topProducts,
 } from "../src/databricks";
 import { activateFabric, deactivateFabric } from "../src/fabric";
 import css from "../src/style.css?raw";
@@ -734,5 +737,123 @@ describe("a second activation (review fix, 2026-10-19)", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(second.querySelector(".fabric-name")?.textContent).toBe("Second again");
     expect(first.querySelector("article")).toBeNull();
+  });
+});
+
+describe("the spend breakdown (2026-10-22)", () => {
+  const days = (usd: number[]) =>
+    usd.map((value, i) => ({ date: `2026-10-${String(i + 1).padStart(2, "0")}`, usd: value }));
+  const products = [
+    { product: "SQL", usd: 6.25 },
+    { product: "JOBS", usd: 3 },
+    { product: "INTERACTIVE", usd: 2 },
+    { product: "DLT", usd: 1.5 },
+    { product: "MODEL_SERVING", usd: 0.75 },
+    { product: "DEFAULT_STORAGE", usd: 0.5 },
+    { product: "APPS", usd: 0 },
+  ];
+
+  it("names products in plain words, title casing a code it does not know", () => {
+    expect(productName("SQL")).toBe("SQL");
+    expect(productName("JOBS")).toBe("Jobs");
+    expect(productName("INTERACTIVE")).toBe("Notebooks");
+    expect(productName("NOTEBOOKS")).toBe("Notebooks");
+    expect(productName("DLT")).toBe("Lakeflow pipelines");
+    expect(productName("MODEL_SERVING")).toBe("Model serving");
+    expect(productName("DEFAULT_STORAGE")).toBe("Default Storage");
+    expect(productName("OTHER")).toBe("Other");
+  });
+
+  it("keeps the five biggest products with spend and only days with some spend", () => {
+    const top = topProducts(spend({ products }));
+    expect(top.map((row) => row.name)).toEqual([
+      "SQL",
+      "Jobs",
+      "Notebooks",
+      "Lakeflow pipelines",
+      "Model serving",
+    ]);
+    expect(topProducts(spend())).toEqual([]);
+    expect(
+      topProducts(
+        spend({
+          products: [
+            { product: "INTERACTIVE", usd: 4 },
+            { product: "SQL", usd: 5 },
+            { product: "NOTEBOOKS", usd: 2 },
+          ],
+        }),
+      ),
+    ).toEqual([
+      { name: "Notebooks", usd: 6 },
+      { name: "SQL", usd: 5 },
+    ]);
+    expect(spendDays(spend({ days: days([-3, 1.5]) }))?.map((day) => day.usd)).toEqual([0, 1.5]);
+    expect(spendDays(spend({ days: days(Array(21).fill(0)) }))).toBeNull();
+    expect(spendDays(spend({ days: days([0, 1.5]) }))?.length).toBe(2);
+    expect(spendDays(spend())).toBeNull();
+  });
+
+  it("draws the sparkline and the top five under the ring", async () => {
+    const daily = days([...Array(20).fill(0.5), 3]);
+    const { context } = stubContext({
+      [PATH]: [ok(overview([warehouse()], { spend: spend({ products, days: daily }) }))],
+    });
+    const section = await mount(context);
+    const block = section.querySelector(".dbx-spend .dbx-breakdown");
+    expect(block).not.toBeNull();
+    // Under the ring and the bars, not beside them.
+    expect(block?.previousElementSibling?.classList.contains("dbx-spend-main")).toBe(true);
+    const spark = block?.querySelector("svg.azure-spark");
+    expect(spark?.getAttribute("aria-label")).toBe("Daily spend for the last 21 days, highest $3");
+    const points = spark?.querySelector("polyline")?.getAttribute("points")?.split(" ") ?? [];
+    expect(points).toHaveLength(21);
+    expect(points[20]).toBe("300.0,4.0");
+    expect(block?.querySelector(".azure-caption")?.textContent).toBe(
+      "Daily spend, last 21 days. Billing data lags a few hours.",
+    );
+    const rows = [...(block?.querySelectorAll(".dbx-products li") ?? [])].map((li) =>
+      [...li.children].map((child) => child.textContent),
+    );
+    expect(rows).toEqual([
+      ["SQL", "$6.25"],
+      ["Jobs", "$3"],
+      ["Notebooks", "$2"],
+      ["Lakeflow pipelines", "$1.50"],
+      ["Model serving", "$0.75"],
+    ]);
+    expect(section.querySelector(".dbx-note")).toBeNull();
+  });
+
+  it("draws nothing new with no spend in the rows, nor from an older server", async () => {
+    for (const extra of [
+      { products: [], days: days(Array(21).fill(0)), monthUsd: 0, totalUsd: 0 },
+      {},
+      { products: null, days: null, note: null },
+    ]) {
+      const { context } = stubContext({
+        [PATH]: [ok(overview([warehouse()], { spend: spend(extra) }))],
+      });
+      const section = await mount(context);
+      expect(section.querySelector(".dbx-spend-main")).not.toBeNull();
+      expect(section.querySelector(".dbx-breakdown")).toBeNull();
+      expect(section.querySelector(".azure-spark")).toBeNull();
+      expect(section.querySelector(".dbx-note")).toBeNull();
+      deactivateDatabricks();
+      section.remove();
+    }
+  });
+
+  it("says why when the breakdown failed, and keeps the totals", async () => {
+    const note =
+      "Breakdown unavailable: The spend breakdown query failed. The totals are complete.";
+    const { context } = stubContext({
+      [PATH]: [ok(overview([warehouse()], { spend: spend({ note }) }))],
+    });
+    const section = await mount(context);
+    expect(section.querySelector(".dbx-note")?.textContent).toBe(note);
+    expect(section.querySelector(".notice-error")).toBeNull();
+    expect(section.querySelectorAll(".dbx-bar")).toHaveLength(2);
+    expect(section.querySelector(".dbx-breakdown")).toBeNull();
   });
 });

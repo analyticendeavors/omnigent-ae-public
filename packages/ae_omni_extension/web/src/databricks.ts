@@ -42,6 +42,13 @@
 // warehouse's state and the spend of the credit) and a credit health that
 // unfolds the credit card on a phone once three quarters of it is spent. The
 // header's refresh button runs the plain read, never Refresh.
+//
+// 2026-10-22, the breakdown: under the ring, the last 21 days' spend as the
+// Azure card's sparkline (shared from azure.ts) and this month's top five
+// products (system.billing.usage's billing_origin_product, with friendly
+// names), from the same server reading as the totals, so it never wakes a
+// warehouse either. With no spend in the rows nothing new is drawn; when the
+// breakdown failed the server's note says so under the bars.
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import {
@@ -53,6 +60,7 @@ import {
   fetchDatabricks,
   refreshDatabricksSpend,
 } from "./api";
+import { sparkline } from "./azure";
 import { ring } from "./board";
 import { announce, button, el, empty, notice, replaceChildren } from "./dom";
 import { externalLinkIcon, type FabricTone, refreshIcon, startIcon, stopIcon } from "./icons";
@@ -230,6 +238,65 @@ export function spendStatusText(spend: DatabricksSpend, canAct = true): string |
     return `Spend could not be read: ${message}${/[.!?]$/.test(message) ? "" : "."}`;
   }
   return null;
+}
+
+/**
+ * Friendly names for system.billing.usage's billing_origin_product codes (the
+ * Databricks docs list them); any other code is title cased.
+ */
+const PRODUCT_NAMES: Record<string, string> = {
+  SQL: "SQL",
+  JOBS: "Jobs",
+  INTERACTIVE: "Notebooks",
+  NOTEBOOKS: "Notebooks",
+  DLT: "Lakeflow pipelines",
+  MODEL_SERVING: "Model serving",
+  ALL_PURPOSE: "All-purpose compute",
+  VECTOR_SEARCH: "AI Search",
+  AI_FUNCTIONS: "AI Functions",
+  AI_GATEWAY: "AI Gateway",
+  AI_RUNTIME: "AI Runtime",
+};
+
+/** `SQL` -> "SQL", `DEFAULT_STORAGE` -> "Default Storage". */
+export function productName(code: string): string {
+  const known = PRODUCT_NAMES[code.toUpperCase()];
+  if (known) return known;
+  return code
+    .toLowerCase()
+    .split(/[_\s]+/)
+    .filter(Boolean)
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+export const TOP_PRODUCTS = 5;
+
+/**
+ * This month's biggest products with spend, at most TOP_PRODUCTS, largest
+ * first; codes sharing a name (INTERACTIVE, NOTEBOOKS) are one row.
+ */
+export function topProducts(spend: DatabricksSpend): Array<{ name: string; usd: number }> {
+  const byName = new Map<string, number>();
+  for (const row of spend.products ?? []) {
+    if (row.usd <= 0) continue;
+    const name = productName(row.product);
+    byName.set(name, (byName.get(name) ?? 0) + row.usd);
+  }
+  return [...byName]
+    .map(([name, usd]) => ({ name, usd }))
+    .sort((a, b) => b.usd - a.usd)
+    .slice(0, TOP_PRODUCTS);
+}
+
+/**
+ * The days to draw as the sparkline, or null when none had spend (nothing to
+ * draw). A day of net credit draws at zero, inside the line's box.
+ */
+export function spendDays(spend: DatabricksSpend): Array<{ date: string; usd: number }> | null {
+  const days = spend.days ?? [];
+  if (!days.some((day) => day.usd > 0)) return null;
+  return days.map((day) => ({ date: day.date, usd: Math.max(0, day.usd) }));
 }
 
 /** The headline bar's spend (spendBars), or null before any reading. */
@@ -666,6 +733,49 @@ function creditRing(spend: DatabricksSpend): HTMLElement | null {
   );
 }
 
+/** The sparkline and the top products under the ring, or null with no spend in them. */
+function breakdownBlock(spend: DatabricksSpend): HTMLElement | null {
+  const days = spendDays(spend);
+  const products = topProducts(spend);
+  if (!days && products.length === 0) return null;
+  return el(
+    "div",
+    { class: "dbx-breakdown" },
+    days
+      ? sparkline(
+          days.map((day) => day.usd),
+          (top) => `Daily spend for the last ${days.length} days, highest ${dollars(top)}`,
+        )
+      : null,
+    days
+      ? el(
+          "p",
+          { class: "azure-caption meta" },
+          `Daily spend, last ${days.length} days. Billing data lags a few hours.`,
+        )
+      : null,
+    products.length
+      ? el(
+          "div",
+          { class: "azure-services dbx-products" },
+          el("h3", { class: "azure-h" }, "Biggest by product this month"),
+          el(
+            "ul",
+            {},
+            ...products.map((row) =>
+              el(
+                "li",
+                {},
+                el("span", {}, row.name),
+                el("span", { class: "azure-amt" }, dollars(row.usd)),
+              ),
+            ),
+          ),
+        )
+      : null,
+  );
+}
+
 function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTMLElement {
   const { state } = section;
   const quiet = spend.status === "reading";
@@ -696,6 +806,8 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
       : asOf
         ? el("p", { class: "dbx-asof" }, asOf)
         : null,
+    hasNumbers ? breakdownBlock(spend) : null,
+    spend.note ? el("p", { class: "dbx-asof dbx-note" }, spend.note) : null,
   );
   if (status) {
     if (quiet) node.appendChild(el("p", { class: "dbx-asof dbx-reading" }, status));

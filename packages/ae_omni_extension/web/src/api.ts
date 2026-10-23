@@ -661,6 +661,15 @@ export interface DatabricksSpend {
   creditEnd: string;
   /** The warehouse a reading runs on, if any. */
   warehouseId: string | null;
+  /**
+   * The breakdown (2026-10-22), from the same reading: this month's spend by
+   * `billing_origin_product`, largest first, and the last 21 days by day,
+   * oldest first. Null until a reading has one, or when it failed (then
+   * `note` says why; the totals are complete). An older server sends none.
+   */
+  products?: Array<{ product: string; usd: number }> | null;
+  days?: Array<{ date: string; usd: number }> | null;
+  note?: string | null;
 }
 
 export interface DatabricksOverview {

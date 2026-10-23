@@ -57,6 +57,22 @@ a time, and a refresh while one runs answers its "reading" state. A query the
 service principal may not run (no ``USE CATALOG`` on ``system``, and so on)
 reads as ``no_access`` with the grants to ask for.
 
+The breakdown (2026-10-22): the same reading runs a second statement,
+:data:`BREAKDOWN_SQL`, right after the totals succeed: this month's spend by
+product (``billing_origin_product``) and the last :data:`BREAKDOWN_DAYS` days'
+spend by day, priced exactly as :data:`SPEND_SQL` is (the same join, the
+effective list price, the same credit start bound). It never wakes a warehouse
+on its own: it rides a reading the cost guard already allowed, on the
+warehouse the totals query just used, and shares that reading's
+:data:`READING_DEADLINE_S` deadline and its cancel on any exit. It is a bonus on
+top of the totals, the way azure_cost.py treats its spike check: when it fails
+the totals stay, the rows are dropped rather than shown stale (the last
+reading's rows go the moment new totals land, and the totals are saved before
+the breakdown starts), and the
+``spend`` object carries a ``note``, not an error status. The rows live in the
+state file beside the totals, and a credit start change hides them with the
+totals.
+
 Caches: the token in process, refreshed :data:`TOKEN_REFRESH_MARGIN_S` before
 it expires, behind one lock; the warehouse listing for :data:`LIST_TTL_S`,
 dropped after a Start or a Stop (a listing in flight then does not write its
@@ -82,7 +98,7 @@ import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote, quote_plus, urlencode
@@ -194,6 +210,39 @@ JOIN system.billing.list_prices p
  AND u.usage_end_time >= p.price_start_time
  AND (p.price_end_time IS NULL OR u.usage_end_time < p.price_end_time)
 WHERE u.usage_date >= :credit_start"""
+
+# The breakdown (module note): one row per product this month and one per day
+# since :since, as (kind, item, usd). Priced and joined as SPEND_SQL, and bound
+# by the credit start too, so the products add up to its month_usd. The month
+# start comes from the warehouse's clock, as in SPEND_SQL; :since from ours.
+BREAKDOWN_SQL = """\
+WITH priced AS (
+  SELECT
+    u.usage_date,
+    COALESCE(NULLIF(TRIM(u.billing_origin_product), ''), 'OTHER') AS product,
+    u.usage_quantity * p.pricing.effective_list.default AS usd
+  FROM system.billing.usage u
+  JOIN system.billing.list_prices p
+    ON u.sku_name = p.sku_name AND u.cloud = p.cloud AND u.usage_unit = p.usage_unit
+   AND u.usage_end_time >= p.price_start_time
+   AND (p.price_end_time IS NULL OR u.usage_end_time < p.price_end_time)
+  WHERE u.usage_date >= :credit_start
+    AND u.usage_date >= LEAST(:since, CAST(date_trunc('MONTH', current_date()) AS DATE))
+)
+SELECT 'product' AS kind, product AS item, SUM(usd) AS usd
+FROM priced
+WHERE usage_date >= date_trunc('MONTH', current_date())
+GROUP BY product
+UNION ALL
+SELECT 'day' AS kind, CAST(usage_date AS STRING) AS item, SUM(usd) AS usd
+FROM priced
+WHERE usage_date >= :since
+GROUP BY usage_date"""
+BREAKDOWN_DAYS = 21
+# The most product rows kept: the docs list about 35 codes.
+PRODUCTS_MAX = 50
+_PRODUCT = re.compile(r"^[A-Za-z0-9_ -]{1,64}$")
+_DAY = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass(frozen=True)
@@ -739,6 +788,9 @@ def _blank_spend() -> dict[str, Any]:
         "warehouseId": None,
         "attemptedAt": None,
         "creditStart": None,
+        "products": None,
+        "days": None,
+        "breakdownNote": None,
     }
 
 
@@ -753,6 +805,36 @@ def _money(value: object) -> float | None:
         return None
     number = float(value)
     return number if math.isfinite(number) else None
+
+
+def _products(raw: object) -> list[dict[str, Any]] | None:
+    """Saved product rows, each ``{"product", "usd"}``; None when the field does not read."""
+    if not isinstance(raw, list) or len(raw) > PRODUCTS_MAX:
+        return None
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        product, usd = item.get("product"), _money(item.get("usd"))
+        if not isinstance(product, str) or not _PRODUCT.match(product) or usd is None:
+            return None
+        rows.append({"product": product, "usd": usd})
+    return rows
+
+
+def _days(raw: object) -> list[dict[str, Any]] | None:
+    """Saved day rows, each ``{"date", "usd"}``; None when the field does not read."""
+    if not isinstance(raw, list) or len(raw) > BREAKDOWN_DAYS:
+        return None
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None
+        day, usd = item.get("date"), _money(item.get("usd"))
+        if not isinstance(day, str) or not _DAY.match(day) or usd is None:
+            return None
+        rows.append({"date": day, "usd": usd})
+    return rows
 
 
 def _load(path: Path | None) -> dict[str, Any]:
@@ -782,6 +864,10 @@ def _load(path: Path | None) -> dict[str, Any]:
         state["warehouseId"] = warehouse_id
     start = raw.get("creditStart")
     state["creditStart"] = start if isinstance(start, str) and len(start) == 10 else None
+    state["products"] = _products(raw.get("products"))
+    state["days"] = _days(raw.get("days"))
+    note = raw.get("breakdownNote")
+    state["breakdownNote"] = note[: _ERROR_TEXT_MAX * 3] if isinstance(note, str) else None
     return state
 
 
@@ -845,6 +931,10 @@ def spend_view(settings: Credit, warehouse_id: str | None = None) -> dict[str, A
         "creditStart": settings.start.isoformat(),
         "creditEnd": settings.end.isoformat(),
         "warehouseId": warehouse_id if warehouse_id is not None else state["warehouseId"],
+        # The breakdown (module note): None until a reading has one.
+        "products": state["products"] if same_credit else None,
+        "days": state["days"] if same_credit else None,
+        "note": state["breakdownNote"] if same_credit else None,
     }
 
 
@@ -900,30 +990,35 @@ async def _cancel(
         )
 
 
-async def _run_statement(
+async def _statement(
     ws: Workspace,
-    settings: Credit,
     warehouse_id: str,
+    sql: str,
+    parameters: list[dict[str, str]],
     transport: httpx.AsyncBaseTransport | None,
-) -> dict[str, Any]:
-    """Run :data:`SPEND_SQL` and answer ``{"monthUsd", "totalUsd", "asOf"}``.
+    *,
+    what: str,
+    started: float,
+) -> list[Any]:
+    """Run *sql* and answer its ``data_array``, bounded by the reading's deadline.
+
+    *started* is when the reading began (:func:`_monotonic`), so every
+    statement of one reading shares :data:`READING_DEADLINE_S`. *what* names
+    the statement in its errors ("spend query").
 
     :raises DatabricksError: ``CODE_NO_ACCESS`` when the grants are missing,
-        ``CODE_TIMEOUT`` past :data:`READING_DEADLINE_S`, otherwise failed.
+        ``CODE_TIMEOUT`` past the deadline, otherwise failed.
     """
-    started = _monotonic()
     try:
         payload = await _api(
             ws,
             "POST",
             "/api/2.0/sql/statements",
-            what="spend query",
+            what=what,
             body={
                 "warehouse_id": warehouse_id,
-                "statement": SPEND_SQL,
-                "parameters": [
-                    {"name": "credit_start", "value": settings.start.isoformat(), "type": "DATE"}
-                ],
+                "statement": sql,
+                "parameters": parameters,
                 "wait_timeout": STATEMENT_WAIT,
                 "on_wait_timeout": "CONTINUE",
                 "format": "JSON_ARRAY",
@@ -938,13 +1033,13 @@ async def _run_statement(
         raise
     statement_id = payload.get("statement_id")
     if not isinstance(statement_id, str) or not _STATEMENT_ID.match(statement_id):
-        raise DatabricksError("The spend query's answer carried no statement id.")
+        raise DatabricksError(f"The {what}'s answer carried no statement id.")
     state, upstream, text = _statement_state(payload)
     try:
         while state in _RUNNING_STATEMENT:
             if _monotonic() - started >= READING_DEADLINE_S:
                 raise DatabricksError(
-                    f"The spend query did not finish within {READING_DEADLINE_S / 60:g} "
+                    f"The {what} did not finish within {READING_DEADLINE_S / 60:g} "
                     "minutes and was cancelled; Refresh to try again.",
                     code=CODE_TIMEOUT,
                     status=504,
@@ -954,7 +1049,7 @@ async def _run_statement(
                 ws,
                 "GET",
                 f"/api/2.0/sql/statements/{statement_id}",
-                what="spend query status",
+                what=f"{what} status",
                 transport=transport,
             )
             state, upstream, text = _statement_state(payload)
@@ -970,16 +1065,104 @@ async def _run_statement(
             raise DatabricksError(NO_ACCESS, code=CODE_NO_ACCESS)
         detail = _scrub(text, ws)[:_ERROR_TEXT_MAX] if text else None
         word = state.lower() if state in ("FAILED", "CANCELED", "CLOSED") else "not read"
-        raise DatabricksError(f"The spend query {word}" + (f": {detail}" if detail else "."))
+        raise DatabricksError(f"The {what} {word}" + (f": {detail}" if detail else "."))
     result = payload.get("result")
     data = result.get("data_array") if isinstance(result, dict) else None
-    first = data[0] if isinstance(data, list) and data else [None, None, None]
+    # No rows comes back with no data_array at all.
+    return data if isinstance(data, list) else []
+
+
+async def _run_statement(
+    ws: Workspace,
+    settings: Credit,
+    warehouse_id: str,
+    transport: httpx.AsyncBaseTransport | None,
+) -> dict[str, Any]:
+    """Run :data:`SPEND_SQL` and answer ``{"monthUsd", "totalUsd", "asOf"}``.
+
+    :raises DatabricksError: as :func:`_statement` does.
+    """
+    data = await _statement(
+        ws,
+        warehouse_id,
+        SPEND_SQL,
+        [{"name": "credit_start", "value": settings.start.isoformat(), "type": "DATE"}],
+        transport,
+        what="spend query",
+        started=_monotonic(),
+    )
+    first = data[0] if data else [None, None, None]
     if not isinstance(first, list) or len(first) < 3:
         raise DatabricksError("The spend query's answer was not the expected shape.")
     return {
         "monthUsd": _amount(first[0]),
         "totalUsd": _amount(first[1]),
         "asOf": _instant(first[2]),
+    }
+
+
+async def _run_breakdown(
+    ws: Workspace,
+    settings: Credit,
+    warehouse_id: str,
+    transport: httpx.AsyncBaseTransport | None,
+    started: float,
+) -> dict[str, Any]:
+    """Run :data:`BREAKDOWN_SQL` and answer ``{"products", "days"}`` (module note).
+
+    ``products`` is ``[{"product", "usd"}]``, the largest first, at most
+    :data:`PRODUCTS_MAX`; ``days`` is one ``{"date", "usd"}`` per day of the
+    last :data:`BREAKDOWN_DAYS` (UTC), oldest first, a day with no rows at 0.
+
+    :raises DatabricksError: as :func:`_statement` does, or on an odd answer.
+    """
+    # A reading out of time posts nothing more: a new statement would bill past the deadline.
+    if _monotonic() - started >= READING_DEADLINE_S:
+        raise DatabricksError(
+            f"The spend breakdown query was not started: the reading ran past "
+            f"{READING_DEADLINE_S / 60:g} minutes. Refresh to try again.",
+            code=CODE_TIMEOUT,
+            status=504,
+        )
+    today = _now().date()
+    since = today - timedelta(days=BREAKDOWN_DAYS - 1)
+    data = await _statement(
+        ws,
+        warehouse_id,
+        BREAKDOWN_SQL,
+        [
+            {"name": "credit_start", "value": settings.start.isoformat(), "type": "DATE"},
+            {"name": "since", "value": since.isoformat(), "type": "DATE"},
+        ],
+        transport,
+        what="spend breakdown query",
+        started=started,
+    )
+    window = {(since + timedelta(days=i)).isoformat(): 0.0 for i in range(BREAKDOWN_DAYS)}
+    products: list[dict[str, Any]] = []
+    for row in data:
+        if not isinstance(row, list) or len(row) < 3 or not isinstance(row[1], str):
+            raise DatabricksError("The spend breakdown's answer was not the expected shape.")
+        kind, item, usd = row[0], row[1].strip(), _amount(row[2])
+        if kind == "product":
+            # A code this page cannot show safely counts as OTHER rather than
+            # failing the whole breakdown; a credit (net negative) is left out.
+            code = item if _PRODUCT.match(item) else "OTHER"
+            if usd > 0:
+                products.append({"product": code, "usd": usd})
+        elif kind == "day" and _DAY.match(item):
+            # A day outside the window (the warehouse's clock ahead of ours) is left out.
+            if item in window:
+                window[item] = usd
+        else:
+            raise DatabricksError("The spend breakdown's answer was not the expected shape.")
+    merged: dict[str, float] = {}
+    for row in products:
+        merged[row["product"]] = round(merged.get(row["product"], 0.0) + row["usd"], 2)
+    ranked = sorted(merged.items(), key=lambda pair: (-pair[1], pair[0]))
+    return {
+        "products": [{"product": code, "usd": usd} for code, usd in ranked[:PRODUCTS_MAX]],
+        "days": [{"date": day, "usd": usd} for day, usd in window.items()],
     }
 
 
@@ -1020,6 +1203,8 @@ async def _read_spend(
     state = _state()
     if only_if_running and not await _still_running(ws, warehouse_id, transport):
         return
+    good = False
+    started = _monotonic()
     try:
         outcome = await _run_statement(ws, settings, warehouse_id, transport)
     except asyncio.CancelledError:
@@ -1042,9 +1227,15 @@ async def _read_spend(
         _logger.warning("databricks spend reading failed (%s)", type(exc).__name__)
         state.update(status="error", message=f"The spend reading failed ({type(exc).__name__}).")
     else:
+        good = True
         if state["creditStart"] not in (None, settings.start.isoformat()):
             state.update(readAt=None, asOf=None, monthUsd=None, totalUsd=None)
         state.update(
+            # The last reading's rows never sit beside these totals, not even
+            # while the breakdown runs: they go now, and the breakdown fills them.
+            products=None,
+            days=None,
+            breakdownNote=None,
             status="ok",
             message=None,
             readAt=_now(),
@@ -1059,7 +1250,42 @@ async def _read_spend(
             outcome["totalUsd"],
         )
     state.update(attemptedAt=_now(), warehouseId=warehouse_id)
+    # Saved before the breakdown, so a good (billed) totals reading survives a kill during it.
     _save(_spend_path if isinstance(_spend_path, Path) else None, state)
+    if good:
+        await _read_breakdown(ws, settings, warehouse_id, transport, started, state)
+
+
+async def _read_breakdown(
+    ws: Workspace,
+    settings: Credit,
+    warehouse_id: str,
+    transport: httpx.AsyncBaseTransport | None,
+    started: float,
+    state: dict[str, Any],
+) -> None:
+    """The breakdown after good totals (module note): rows, or none and a ``note``; saved."""
+    path = _spend_path if isinstance(_spend_path, Path) else None
+    try:
+        rows = await _run_breakdown(ws, settings, warehouse_id, transport, started)
+    except asyncio.CancelledError:
+        # The totals are already saved: record why the rows are missing, then let it through.
+        state.update(
+            breakdownNote="The breakdown was stopped before it finished; Refresh to try again."
+        )
+        _save(path, state)
+        raise
+    except DatabricksError as exc:
+        _logger.warning("databricks spend breakdown failed: %s", exc)
+        state.update(breakdownNote=f"Breakdown unavailable: {exc} The totals are complete.")
+    except Exception as exc:  # noqa: BLE001 - the totals must still be kept
+        _logger.warning("databricks spend breakdown failed (%s)", type(exc).__name__)
+        state.update(
+            breakdownNote=f"Breakdown unavailable ({type(exc).__name__}). The totals are complete."
+        )
+    else:
+        state.update(products=rows["products"], days=rows["days"])
+    _save(path, state)
 
 
 def _begin_reading(
@@ -1198,6 +1424,8 @@ def reset() -> None:
 
 __all__ = [
     "BAD_HOST",
+    "BREAKDOWN_DAYS",
+    "BREAKDOWN_SQL",
     "CODE_AUTH",
     "CODE_FAILED",
     "CODE_NOT_CONFIGURED",
