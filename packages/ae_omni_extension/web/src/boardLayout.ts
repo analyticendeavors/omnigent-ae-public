@@ -125,8 +125,9 @@ export function resetArrangement(): void {
   write();
 }
 
-export function hasArrangement(): boolean {
-  return Object.keys(saved).length > 0;
+/** Whether an arrangement is saved, for *n* columns when given, for any width otherwise. */
+export function hasArrangement(n?: 2 | 3): boolean {
+  return n === undefined ? Object.keys(saved).length > 0 : String(n) in saved;
 }
 
 /** Call *listener* after every change to the saved arrangement; the returned function stops it. */

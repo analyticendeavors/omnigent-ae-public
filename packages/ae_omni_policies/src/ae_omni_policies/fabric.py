@@ -53,6 +53,21 @@ probe already in flight when that happens does not write its stale answer
 back); one capacity failing is reported on its own row, never instead of the
 others.
 
+2026-10-22, instant GET (measured live: three ``GET /v1/ae/fabric`` took 4.6 s,
+4.6 s and 8.0 s, the last with the capacities Logic App not answering within
+8 s). The per-capacity caches above live ten seconds but the page polls every
+15 s while busy and 60 s when idle, so every poll missed and waited on live
+Logic App calls. :func:`overview` now keeps the last whole answer
+(:data:`_last`) and returns it at once, however old; when it is older than
+:data:`STATUS_TTL_S` (an answer with an error in it counts as stale at once) it
+also starts one background refresh, never two, and the next poll gets the fresh
+rows. The first ever GET still waits for the live answer. :func:`forget` drops
+the kept answer, so after a wake, suspend, keep awake or scale the next GET
+waits live, and a refresh begun before that action does not write its older
+answer back. A refresh that fails keeps the last rows and shows the error the
+way a live GET does (``fleetError``, or the row's own ``error``); a bug in the refresh is logged
+by class name only.
+
 2026-10-16, second pass (Reid approved the compact row design): the probe
 answer may also carry ``sku``, ``region``, ``capacityId`` (the ARM resource
 id), ``hourlyUsd``, ``resumedAt`` (the last successful resume),
@@ -856,12 +871,25 @@ _fleet_generation = 0
 _fleet_known: list[dict[str, Any]] = []
 
 
+# The last whole GET answer: (taken at, answer), monotonic clock. Served at once
+# at any age; forget() drops it, so an action is never followed by a stale card.
+_last: tuple[float, dict[str, Any]] | None = None
+# Bumped by every forget(); a refresh that began before a bump is stale.
+_last_generation = 0
+# The one background refresh in flight, if any.
+_refresh_task: asyncio.Task[None] | None = None
+
+
 def forget(name: str | None = None) -> None:
     """Drop one capacity's cached status (after a wake or a suspend), or all of them.
 
     The last known details stay (:data:`_known`) unless every capacity goes.
     """
-    global _fleet_cache, _fleet_generation
+    global _fleet_cache, _fleet_generation, _last, _last_generation, _refresh_task
+    _last = None
+    # An older refresh may finish, but its write is dropped (generation); let a new one start.
+    _refresh_task = None
+    _last_generation += 1
     # Any action changes the fleet's list, and forget() runs after every one.
     _fleet_generation += 1
     _fleet_cache = None
@@ -918,13 +946,9 @@ async def status(
     return _public(capacity, state, details)
 
 
-async def overview(
-    environ: Mapping[str, str] | None = None,
-    *,
-    transport: httpx.AsyncBaseTransport | None = None,
+async def _live_overview(
+    env: Mapping[str, str], transport: httpx.AsyncBaseTransport | None
 ) -> dict[str, Any]:
-    """``GET /v1/ae/fabric``: every configured capacity's state, each isolated."""
-    env = os.environ if environ is None else environ
     shared = fleet(env)
     if shared is not None:
         return await _fleet_overview(shared, env, transport)
@@ -933,6 +957,99 @@ async def overview(
     answer: dict[str, Any] = {"configured": bool(found), "capacities": list(rows)}
     if not found:
         answer["note"] = HOW_TO_ENABLE
+    return answer
+
+
+def _row_key(row: Mapping[str, Any]) -> tuple[str, str]:
+    return str(row.get("name", "")).lower(), str(row.get("capacityId") or "")
+
+
+def _has_error(answer: Mapping[str, Any]) -> bool:
+    """Whether a read failed in *answer*: asked again on the next poll, not after the TTL."""
+    return "fleetError" in answer or any(row.get("error") for row in answer.get("capacities", []))
+
+
+def _keep_last_rows(old: dict[str, Any], new: dict[str, Any]) -> dict[str, Any]:
+    """*new*, where a failed read keeps the rows the card already showed.
+
+    A row that came back with an ``error`` keeps its last good fields (the
+    error is shown on it), through any number of failed reads in a row; a fleet
+    list that failed and left fewer rows than before keeps the old ones, with
+    the new ``fleetError`` on top. A failed probe's row carries no
+    ``capacityId`` (:func:`_failed_row`), so it falls back to the name when
+    exactly one earlier row has it (review of 2026-10-22).
+    """
+    old_rows = old.get("capacities", [])
+    before = {_row_key(row): row for row in old_rows}
+    by_name: dict[str, list[dict[str, Any]]] = {}
+    for row in old_rows:
+        by_name.setdefault(_row_key(row)[0], []).append(row)
+    rows = []
+    for row in new.get("capacities", []):
+        last = before.get(_row_key(row))
+        if last is None and not row.get("capacityId"):
+            named = by_name.get(_row_key(row)[0], [])
+            last = named[0] if len(named) == 1 else None
+        if row.get("error") and last is not None:
+            row = {**last, "error": row["error"]}
+        rows.append(row)
+    if "fleetError" in new and len(rows) < len(old.get("capacities", [])):
+        rows = list(old["capacities"])
+    return {**new, "capacities": rows}
+
+
+def _store(generation: int, answer: dict[str, Any]) -> None:
+    """Keep *answer* as the last one, unless an action landed since *generation*."""
+    global _last
+    if _last_generation != generation:
+        return
+    if _last is not None:
+        answer = _keep_last_rows(_last[1], answer)
+    _last = (time.monotonic(), answer)
+
+
+async def _refresh(
+    env: Mapping[str, str], transport: httpx.AsyncBaseTransport | None, generation: int
+) -> None:
+    try:
+        _store(generation, await _live_overview(env, transport))
+    except Exception as exc:  # noqa: BLE001 (a bug here must be logged, never stick the cache)
+        # Never the message: it could echo a Logic App URL.
+        _logger.warning("fabric background refresh failed unexpectedly: %s", type(exc).__name__)
+
+
+def _begin_refresh(env: Mapping[str, str], transport: httpx.AsyncBaseTransport | None) -> None:
+    global _refresh_task
+    if _refresh_task is None or _refresh_task.done():
+        _refresh_task = asyncio.get_running_loop().create_task(
+            _refresh(dict(env), transport, _last_generation)
+        )
+
+
+def refresh_task() -> asyncio.Task[None] | None:
+    return _refresh_task
+
+
+async def overview(
+    environ: Mapping[str, str] | None = None,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """``GET /v1/ae/fabric``: every configured capacity's state, each isolated.
+
+    Answers the last known result at once; one background refresh starts when
+    it is older than :data:`STATUS_TTL_S`. With nothing kept (first call, or
+    after :func:`forget`) it waits for the live answer.
+    """
+    env = os.environ if environ is None else environ
+    held = _last
+    if held is not None:
+        if time.monotonic() - held[0] >= STATUS_TTL_S or _has_error(held[1]):
+            _begin_refresh(env, transport)
+        return held[1]
+    generation = _last_generation
+    answer = await _live_overview(env, transport)
+    _store(generation, answer)
     return answer
 
 
@@ -1456,6 +1573,7 @@ __all__ = [
     "iso",
     "keep_awake_options",
     "overview",
+    "refresh_task",
     "sleeps_at",
     "status",
     "suspend_not_configured",

@@ -563,6 +563,8 @@ export interface FabricOverview {
   fleet?: boolean;
   /** Why the fleet's list is missing or partial; the rows shown still stand. */
   fleetError?: string;
+  /** Whether the caller may use the actions; the page hides them when false (2026-10-22). */
+  can_act: boolean;
 }
 
 /**
@@ -671,6 +673,8 @@ export interface DatabricksOverview {
   error: { code: string; message: string } | null;
   warehouses: DatabricksWarehouse[];
   spend: DatabricksSpend | null;
+  /** Whether the caller may use the actions; the page hides them when false (2026-10-22). */
+  can_act: boolean;
 }
 
 export const fetchDatabricks = (context: ExtensionContext) =>
@@ -756,6 +760,8 @@ export interface HostStatus {
   request_untaken: boolean;
   can_request: boolean;
   error: string | null;
+  /** Whether the caller may ask for a reconnect link; the card hides the button when false (2026-10-22). */
+  can_act: boolean;
 }
 
 export const fetchHostStatus = (context: ExtensionContext) =>
@@ -839,6 +845,8 @@ export interface AzureView {
     currency: string;
     counted: boolean;
     error: string | null;
+    /** A caveat on a row that was read: its totals are complete but a part (spike check) was not. */
+    note?: string | null;
   }>;
   services: Array<{ name: string; cost: number }>;
   flags: AzureFlag[];

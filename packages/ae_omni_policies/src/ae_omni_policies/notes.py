@@ -38,7 +38,9 @@ QUADRANT_AXES: dict[str, dict[str, int]] = {
 # decide", not "do it by then".
 RESURFACE_DAYS: dict[str, int] = {"hotfix": 3, "feature": 30, "admin": 14}
 
-DEFAULT_TZ = "America/Los_Angeles"
+# The zone when AE_TASK_STORE_TZ names none. UTC since 2026-10-22, so a
+# stranger's server is not on Analytic Endeavors' clock; the box sets its own.
+DEFAULT_TZ = "UTC"
 PARKING_LOT_NAME = "Parking Lot"
 # A list is only the phone's if its surface says ``todo``; ``parking`` never
 # syncs to Microsoft To Do, which is the whole point of a parking lot.
@@ -51,7 +53,7 @@ _MINUTES = re.compile(r"\bmin(ute)?s?\b", re.IGNORECASE)
 _NEWLINE_RUNS = re.compile(r"\s*\n+\s*")
 _FENCES = re.compile(r"`{3,}")
 _SENTENCE_STOP = re.compile(r"[.!?](\s|$)")
-_GITHUB_PREFIX = re.compile(r"^https?://(www\.)?github\.com/", re.IGNORECASE)
+_GITHUB_PREFIX = re.compile(r"^((https?://)?(www\.)?github\.com/|git@github\.com:)", re.IGNORECASE)
 _DOT_GIT = re.compile(r"\.git$", re.IGNORECASE)
 # The worker's ``\w`` is ASCII (JavaScript), so spell it out rather than use
 # Python's Unicode-aware ``\w``.
@@ -157,7 +159,7 @@ def repo_slug(raw: str | None) -> str | None:
     """``owner/name`` from a slug or a GitHub URL, or ``None`` when neither."""
     if not raw:
         return None
-    trimmed = _DOT_GIT.sub("", _GITHUB_PREFIX.sub("", one_line(raw))).strip("/")
+    trimmed = _DOT_GIT.sub("", _GITHUB_PREFIX.sub("", one_line(raw)).strip("/"))
     parts = trimmed.split("/")
     if len(parts) < 2:
         return None
@@ -166,7 +168,9 @@ def repo_slug(raw: str | None) -> str | None:
     def ok(segment: str) -> bool:
         return bool(_SLUG_PART.match(segment)) and bool(_WORD_CHAR.search(segment))
 
-    return f"{owner}/{name}" if ok(owner) and ok(name) else None
+    # A GitHub owner never has a dot, so a dotted first segment is a host
+    # ("gitlab.com/owner/name"), never an owner.
+    return f"{owner}/{name}" if ok(owner) and "." not in owner and ok(name) else None
 
 
 def summary_for(summary: str | None, state: str) -> str:

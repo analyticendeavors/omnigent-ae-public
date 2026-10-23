@@ -413,6 +413,39 @@ async def test_a_failing_handler_answers_with_text(
         assert _payload(result) == {"error": "omni_capacity failed: RuntimeError: wire cut"}
 
 
+# 2026-10-22: an httpx error's text can carry the request URL and its query,
+# so the agent gets the class name only.
+SECRET_URL = "http://box.test/v1/thing?sig=s3cret-sig"
+
+
+def _refuse(request: httpx.Request) -> httpx.Response:
+    raise httpx.ConnectError(f"refused {SECRET_URL}", request=request)
+
+
+async def test_a_transport_failure_never_shows_the_error_text() -> None:
+    status, body = await _stub(_refuse).call("GET", "/v1/thing")
+    assert status == 0
+    assert body == {"error": {"message": "http://box.test did not answer: ConnectError"}}
+
+
+async def test_a_checkin_transport_failure_never_shows_the_error_text() -> None:
+    answer = await mcp_module.schedule_checkin(_stub(_refuse), {"stop": True})
+    assert answer == {"error": "Could not reach the scheduled tasks: ConnectError"}
+
+
+async def test_a_handler_httpx_failure_never_shows_the_error_text(
+    omni: OmniClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async with connect(omni) as session:
+
+        async def _explode(client: OmniClient, args: dict[str, Any]) -> Any:
+            raise httpx.ReadTimeout(f"timed out on {SECRET_URL}")
+
+        monkeypatch.setitem(mcp_module.HANDLERS, "omni_capacity", _explode)
+        result = await session.call_tool("omni_capacity", {})
+        assert _payload(result) == {"error": "omni_capacity failed: ReadTimeout"}
+
+
 ORCHESTRATOR_TOOLS = [
     "omni_capacity",
     "omni_transcript",

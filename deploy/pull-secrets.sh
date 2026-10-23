@@ -90,7 +90,10 @@ GROUP="${AE_ENV_GROUP:-reid}"
 MODE=640
 
 # The OIDC pair is required: leaving it out on a vault error would fail the
-# next restart in OIDC mode instead of this run.
+# next restart in OIDC mode instead of this run. This script fills a full
+# deploy, which signs in with OIDC and runs the task store; the Admin Center's
+# Secrets section counts those two pairs as required only on a server that uses
+# them (secrets_health.py, 2026-10-22).
 SERVER_KEYS=(POSTGRES_PASSWORD AE_CF_ACCESS_CLIENT_ID AE_CF_ACCESS_CLIENT_SECRET OMNIGENT_OIDC_CLIENT_SECRET OMNIGENT_OIDC_COOKIE_SECRET)
 HOST_KEYS=(CLAUDE_CODE_OAUTH_TOKEN)
 # The Admin Center's Secrets section lists both server arrays from its own copy

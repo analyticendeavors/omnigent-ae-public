@@ -68,6 +68,36 @@ All of it sits on Omnigent's own seams: a series of small core patches that CI r
 
 <!-- showcase:end -->
 
+## Quick start
+
+This runs the published image on one Linux machine with username and password sign-in, then connects that machine as the host your agents run on. It takes about ten minutes. You need Linux on x86_64 (the image is `linux/amd64` only), Docker with Compose 2.24 or newer, `git`, [`uv`](https://docs.astral.sh/uv/), and the Claude Code CLI with a Claude subscription. The full service setup (TLS, Microsoft sign-in, systemd, automatic updates) is the [deploy guide](deploy/README.md).
+
+```bash
+git clone --recurse-submodules https://github.com/analyticendeavors/omnigent-ae-public.git
+cd omnigent-ae-public
+cp config/server.env.example config/server.env
+# The release this checkout is on, and a data directory (an absolute path):
+sed -i "s/^OMNIGENT_IMAGE_TAG=.*/OMNIGENT_IMAGE_TAG=$(git describe --tags --abbrev=0 --match 'ae-v*')/" config/server.env
+echo "AE_DATA_DIR=$HOME/omnigent-ae-data" >> config/server.env
+# The one secret a try-out needs:
+(umask 077; printf 'POSTGRES_PASSWORD=%s\n' "$(openssl rand -hex 16)" > config/secrets.env)
+deploy/compose.sh up -d
+```
+
+Open http://127.0.0.1:8010 and create the admin account; the first visit asks for it. Then make this machine a host, signing in with that account when asked:
+
+```bash
+deploy/install-host.sh
+~/.omnigent-host/venv/bin/omnigent login http://127.0.0.1:8010
+~/.omnigent-host/venv/bin/omnigent host --no-open http://127.0.0.1:8010
+```
+
+`install-host.sh` builds the host's Python environment in `~/.omnigent-host/venv` and also registers this fork's `ae` MCP server in your Claude Code and Codex settings. The host runs Claude Code as you, so it uses your existing `claude` login; on a machine where `claude` is not signed in, set `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) in the host's environment, or every turn ends with "Not logged in". With the host connected, type a task on the start page and press Start session.
+
+On a machine that already runs omnigent-ae, `compose.sh` refuses to start a second copy under the same name. Prefix every `compose.sh` command with `COMPOSE_PROJECT_NAME=omnigent-try`, and set another `OMNIGENT_PORT` along with the two URLs beside it in `config/server.env`.
+
+To stop, press Ctrl-C on the host and run `deploy/compose.sh down`. The database and files stay in `AE_DATA_DIR` for the next `up`. Docker creates them as root and as Postgres's user, so deleting them needs `sudo`. `config/server.env` lists every optional setting below its REQUIRED block. The Parking Lot, the Admin Center's cloud cards and the PR cards stay off until you add their settings (Configure, below).
+
 ## How the fork stays thin
 
 Upstream is pinned as a submodule at a release tag, the AE layer sits out of tree on
@@ -122,7 +152,7 @@ unset is `pnpm install` followed by `pnpm --filter web run build`, both from
 `upstream/`, writing `upstream/omnigent/server/static/web-ui/`; after it, `just dev`
 serves the UI from that directory. Not yet documented: that local path has not been
 walked end to end from a fresh clone, so the supported way to run the fork with its
-UI is the image: `just image` builds it (upstream's server image from the patched
+UI is the published image (Quick start, above). To build your own, `just image` builds it (upstream's server image from the patched
 tree, then the AE layer), `just image-smoke` proves it, and `deploy/README.md` is
 how to run it with compose.
 
@@ -263,8 +293,8 @@ just schedules-seed https://<box-hostname>.<tailnet>.ts.net:8010                
 
 | Agent | Harness | Fires | Tools (MCP allowlist) | Writes |
 |---|---|---|---|---|
-| `steward` | claude-sdk | weekdays 08:00 America/Los_Angeles | `list_parked`, `omni_capacity`; box memory's read tools | nothing: one brief, lot items resurfacing today and the working sessions with elapsed time |
-| `shutdown` | claude-sdk | weekdays 17:30 America/Los_Angeles | `omni_capacity`, `omni_transcript`; box memory's read tools | nothing: one THREAD / STATE / NEXT / SLOT / QUADRANT note per working session; the operator flips the status from the Parking Lot page |
+| `steward` | claude-sdk | weekdays 08:00, server's `AE_TASK_STORE_TZ` | `list_parked`, `omni_capacity`; box memory's read tools | nothing: one brief, lot items resurfacing today and the working sessions with elapsed time |
+| `shutdown` | claude-sdk | weekdays 17:30, server's `AE_TASK_STORE_TZ` | `omni_capacity`, `omni_transcript`; box memory's read tools | nothing: one THREAD / STATE / NEXT / SLOT / QUADRANT note per working session; the operator flips the status from the Parking Lot page |
 | `reviewer-codex` | codex | on request, off by default | none (read-only `os_env`) | nothing: findings with file and line |
 | `orchestrator` | claude-sdk | when the operator talks to it; its own hourly check-in | `omni_capacity`, `omni_transcript`, `omni_set_status`, `list_parked`, `create_session`, `post_message`, `schedule_checkin`, `list_prs`, `ask_reid` | sessions it starts and briefs, messages to them, its one check-in schedule, review on merged work; never a merge |
 

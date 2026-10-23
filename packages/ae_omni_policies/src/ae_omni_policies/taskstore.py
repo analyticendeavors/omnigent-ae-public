@@ -38,7 +38,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 from typing import Any, Literal
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
@@ -222,6 +222,15 @@ def view_url(app_url: str, title: str, bucket_id: str | None) -> str:
     return f"{app_url}/#/all?{query}"
 
 
+def _on_github(url: str) -> bool:
+    """Whether *url*'s host is GitHub itself, not a page that merely names it."""
+    try:
+        host = urlsplit(url.strip()).hostname
+    except ValueError:
+        return False
+    return host in ("github.com", "www.github.com")
+
+
 def repo_of(notes_text: str | None, links: list[Any] | None = None) -> str | None:
     """The repository a parked task belongs to, as ``owner/name``, or ``None``.
 
@@ -237,7 +246,7 @@ def repo_of(notes_text: str | None, links: list[Any] | None = None) -> str | Non
                 return slug
     for link in links or []:
         url = link.get("url") if isinstance(link, dict) else None
-        if isinstance(url, str) and "github.com/" in url.lower():
+        if isinstance(url, str) and _on_github(url):
             slug = repo_slug(url)
             if slug:
                 return slug
@@ -285,7 +294,9 @@ def _style(value: Any) -> str | None:
 def _describe(exc: Exception) -> str:
     if isinstance(exc, httpx.TimeoutException):
         return f"no answer within {REQUEST_TIMEOUT_S:g}s"
-    return str(exc) or exc.__class__.__name__
+    # The class name only (2026-10-22, as mcp.py): an httpx error's text can
+    # carry the request URL, and this text reaches the agent through park_fork.
+    return exc.__class__.__name__
 
 
 def _snippet(text: str) -> str:

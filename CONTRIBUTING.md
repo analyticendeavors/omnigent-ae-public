@@ -2,6 +2,8 @@
 
 omnigent-ae is a thin fork of OmniGent: an upstream release tag plus a short patch series, with everything else kept out of tree in `packages/`, `agents/`, `config/` and `deploy/`. `README.md` has the layout. This page covers how to build, test and send a change.
 
+Everyone taking part follows the [code of conduct](CODE_OF_CONDUCT.md). Security problems go through [SECURITY.md](SECURITY.md), never a public issue.
+
 ## Build and test
 
 Commands live in the `justfile`, and CI runs the same recipes. You need `just`, `uv`, `git`, and Node and pnpm for the web and extension recipes.

@@ -7,6 +7,10 @@ operator. Analytic Endeavors' own runbook for its host (its addresses, its
 secrets source, its TLS fronts, its identity provider and its second user) lives
 in a private repository and is not needed to follow this page.
 
+To try it on one machine first, with no TLS, no identity provider, no systemd
+and no `/secure` volume, follow the Quick start in the top-level `README.md`
+(about ten minutes); this page is the service it grows into.
+
 Every command here runs on the host unless it says otherwise. `<user>` is the
 Linux account that owns the checkout and runs the host; the root steps want
 `sudo`.
@@ -16,8 +20,8 @@ What is in this directory:
 | File | What it is |
 |---|---|
 | `Dockerfile` | stage 2 of the image: the AE layer on upstream's server image |
-| `docker-compose.override.yml` | the overlay on upstream's compose file: the published image, loopback `:8010`, the two env files, bind mounts under `/secure` |
-| `compose.sh` | `docker compose` with both compose files and both env files filled in; everything else here calls it |
+| `docker-compose.override.yml` | the overlay on upstream's compose file: the published image, loopback `:8010`, the two env files, bind mounts under `AE_DATA_DIR` (default `/secure/omnigent`) |
+| `compose.sh` | `docker compose` with the compose files and both env files filled in, plus `config/compose.local.yml` when it exists (this machine's own additions); everything else here calls it |
 | `auto-update.sh` | one pass of the automatic deploy: the newest `ae-v*` tag on `main`, pulled, started, health-checked, rolled back on failure |
 | `pull-secrets.sh` | one way to fill the two secrets files: Azure Key Vault to `/secure/env/omnigent-ae.env` and `/secure/env/omnigent-host.env`, atomically |
 | `backup-omnigent.sh` | nightly `pg_dump` into `/secure/omnigent/backups`, newest seven kept |
@@ -56,8 +60,9 @@ volume is the intent (the database, the artifacts and the persisted cookie
 secret sit there); for a plain directory, bind-mount it onto itself
 (`sudo mount --bind /secure /secure`, persisted in fstab). Check with
 `mountpoint /secure` before step 2.
-`AE_SERVER_SECRETS` moves the server's secrets file elsewhere (step 1); the
-bind mounts and the host unit's secrets file keep the `/secure` paths.
+`AE_SERVER_SECRETS` moves the server's secrets file elsewhere (step 1), and
+`AE_DATA_DIR` in `config/server.env` moves the two bind mounts; the backups and
+the host unit's secrets file keep the `/secure` paths.
 
 ## Before starting
 
@@ -286,7 +291,7 @@ cp config/host.env.example config/host.env
 
 Edit both. Nothing secret goes in either file; they are gitignored anyway.
 
-- The host's URL: replace the `<box-hostname>.<tailnet>.ts.net:8010` origin in
+- The host's URL: replace the `http://127.0.0.1:8010` origin in
   `OMNIGENT_ACCOUNTS_BASE_URL`, `OMNIGENT_WS_ALLOWED_ORIGINS` and
   `OMNIGENT_SERVER_URL` (in `config/host.env`) with the https origin your TLS
   front serves (step 7). The host's URL must match the base URL character for
@@ -296,10 +301,13 @@ Edit both. Nothing secret goes in either file; they are gitignored anyway.
 - `AE_IMAGE`: the package that tag lives in, `ghcr.io/<owner>/<repo>`. The example
   names the public build; a fork that publishes its own (step 5) names that one.
   The compose overlay and `deploy/auto-update.sh` both read it.
-- Sign-in: the example ships OIDC settings with placeholders. Replace the
-  issuer and tenant, the client id, `OMNIGENT_OIDC_REDIRECT_URI` (your public
-  callback origin) and `OMNIGENT_OIDC_ALLOWED_DOMAINS`. The administrator goes in
-  the `/data/admins` roster file (Adding an OIDC provider, under step 7).
+- Sign-in: the example ships accounts mode (username and password, the
+  admin created on the first visit, step 7), which needs no further setting and
+  suits a first install. For an identity provider instead, uncomment the OIDC
+  block and replace the issuer and tenant, the client id,
+  `OMNIGENT_OIDC_REDIRECT_URI` (your public callback origin) and
+  `OMNIGENT_OIDC_ALLOWED_DOMAINS`; the administrator then goes in the
+  `/data/admins` roster file (Adding an OIDC provider, under step 7).
 - The optional features (task-store, GitHub, Fabric, Databricks, the policy
   model) and what each looks like when its variables are unset are in the
   top-level `README.md`, "Configure".
@@ -562,7 +570,7 @@ host, with the venv step 8 built and the login from step 9:
 
 From a laptop with the dev setup, `just schedules-seed https://<host origin>` is
 the same call. "AE steward" (weekdays 08:00) and "AE shutdown note" (weekdays
-17:30, both America/Los_Angeles) then appear on the Tasks page, and the host runs
+17:30, both in the server's `AE_TASK_STORE_TZ`, UTC when unset) then appear on the Tasks page, and the host runs
 them.
 
 ### 12. Verify
@@ -1046,8 +1054,10 @@ machine's network; a container gets all three boundaries from Docker, and
 | `omnigent-host-<name>-egress` | `omnigent-ae-host-egress:<server tag>`: Squid (`ubuntu/squid` pinned by digest) with `host-container/squid.conf` baked in | `omnigent-host-<name>-egress`, `omnigent-host-<name>-outbound` |
 
 - **The server** is `http://omnigent:8000` on the network `omnigent-host-<name>`,
-  which `docker-compose.override.yml` declares (internal) and joins the server
-  container to. Postgres is not on it, and no other user's host is. The server
+  which this machine's `config/compose.local.yml` declares (internal) and joins
+  the server container to (gitignored, from `config/compose.local.yml.example`;
+  `compose.sh` adds it when it exists, since 2026-10-22, so the public overlay
+  names no user). Postgres is not on it, and no other user's host is. The server
   stack owns the network so the server never depends on a host project; the host
   project only attaches to it. Both networks are created with
   `com.docker.network.bridge.inhibit_ipv4`, because Docker otherwise gives an
@@ -1084,8 +1094,9 @@ machine's network; a container gets all three boundaries from Docker, and
 
 ### First start, once
 
-The overlay ships one such network, `host-steve`; for another name, add it first
-(A further user, below). Then, as `<user>` in the deploy clone (no sudo):
+Each name needs its network in `config/compose.local.yml` first (A further
+user, below). Without that file, `compose.sh` warns whenever `omnigent-host-*`
+networks exist, since the server would join none of them. Then, as `<user>` in the deploy clone (no sudo):
 
 ```bash
 cd ~/deploy/omnigent-ae
@@ -1157,11 +1168,13 @@ systemctl --user restart ae-omnigent-host-container@<name>
 
 Pick a lower-case name (it names the containers, network and volume), then:
 
-1. `docker-compose.override.yml`: add `host-<name>: {}` under the server's
+1. `config/compose.local.yml` (gitignored; start from
+   `sed 's/<user>/<name>/g' config/compose.local.yml.example`, never an unedited
+   copy, whose placeholder network name stops the server stack): add `host-<name>: {}` under the server's
    `networks:` and a `host-<name>` entry (`name: omnigent-host-<name>`,
    `internal: true`, and the `driver_opts` below) to the top-level `networks:`
-   block, beside `host-steve`;
-   merge, and let a deploy (or `deploy/compose.sh up -d`) recreate the server.
+   block, beside any user already there; then `deploy/compose.sh up -d`
+   recreates the server (every session reconnects, so pick a quiet moment).
    The network needs the isolation option, or a container on it can reach any
    port the machine serves on a wildcard address (see "What runs" above):
 

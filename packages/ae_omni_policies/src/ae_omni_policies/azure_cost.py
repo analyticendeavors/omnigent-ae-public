@@ -30,37 +30,66 @@ days by resource) behind a one hour cache. ``GET`` never waits on Azure: it
 answers the cache and, when the cache is older than :data:`CACHE_TTL_S`,
 starts a reading in the background (the extension host gives a call ten
 seconds). A subscription that fails keeps its previous answer and says why, so
-one 429 does not blank the card. A reading with a failure is tried again after
-:data:`RETRY_TTL_S` (two minutes); a 429 stops the pass and waits Azure's own retry
-time (one minute to one hour), or :data:`RATE_LIMIT_TTL_S` (15 minutes) without one,
-because every query made while limited only extends the limit. The newest day with data
+one 429 does not blank the card. A reading with a transient failure is tried again
+after :data:`RETRY_TTL_S` (two minutes); one whose every failure is permanent (no Cost
+Management Reader role, a refused principal, too many pages) waits the hour like a good
+reading, because retrying cannot fix it and spends the shared rate limit (2026-10-22). A 429
+stops the pass and waits Azure's own retry time (one minute to one hour), or
+:data:`RATE_LIMIT_TTL_S` (15 minutes) without one, because every query made while limited
+only extends the limit. The newest day with data
 is ``through``, and the pace is computed up to it.
 
-Three guards from the 2026-10-22 review: a query with more pages than
+The spike check (the by-resource query) is separate from the totals (2026-10-22): when it
+fails, the totals stay, the previous reading's resources stay (stale flags beat none, and
+:data:`FLAG_FRESH_DAYS` ages them out), and the row carries a ``note``, not an ``error``. A
+transient spike failure is retried in two minutes, a permanent one waits the hour.
+
+Four guards from the 2026-10-22 review: a query with more pages than
 :data:`MAX_PAGES` is an error, never a quietly partial total; amounts are
 never converted, so a subscription billed in another currency than the first
-read one gets its own line in its own currency and stays out of the totals; and a flag needs a
+read one gets its own line in its own currency and stays out of the totals, while a
+subscription with no rows has no currency and does not vote for one; and a flag needs a
 finished day within :data:`FLAG_FRESH_DAYS` days and at least
 :data:`FLAG_MIN_PRIOR_DAYS` earlier days, so a new resource or an old spike
 does not raise one.
+
+Persisted since 2026-10-22: the cache lived in memory only, so after every deploy the card
+said "Reading..." until the first ``GET`` started a reading and two queries per subscription
+came back (eleven minutes after a restart that day). Each pass now writes the view, the
+readings, the errors, ``at`` and the wall-clock time the next reading is due (a 429's wait
+included) to ``AE_AZURE_COST_STATE_FILE`` (default ``/data/ae-azure-cost.json``; empty turns
+it off), atomically the way databricks.py writes its state. The first ``overview()`` after a
+start loads it and answers with the saved view and its real ``asOf``; due is judged by wall
+clock, because the monotonic clock restarts with the process, so a saved rate limit is still
+honored after a deploy. The file names the subscriptions it was read for and a one-way hash
+of the tenant and client id, never the ids, the secret or a token; a file for another
+subscription list or principal is ignored, as is one that is missing, unreadable or
+malformed (the log names the exception's class only). :data:`lifespan_router`, in
+``router.DEBUG_ROUTERS`` beside merge_watch's, loads it at boot and starts a reading then
+when the saved one is due, so the first visit after a deploy rarely waits.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import os
 import re
+import tempfile
 import time
-from collections.abc import Mapping
+from collections.abc import AsyncIterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlencode
 
 import httpx
+from fastapi import APIRouter, FastAPI
 
 _logger = logging.getLogger(__name__)
 
@@ -83,6 +112,9 @@ MAX_FLAGS = 5
 API_VERSION = "2023-11-01"
 USER_AGENT = "ae-omni-policies/azure-cost"
 CODE_NOT_CONFIGURED = "azure_cost_not_configured"
+STATE_FILE_ENV = "AE_AZURE_COST_STATE_FILE"
+DEFAULT_STATE_FILE = "/data/ae-azure-cost.json"
+STATE_VERSION = 1
 _GUID = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
 )
@@ -100,6 +132,10 @@ class Config:
 
     def key(self) -> str:
         return f"{self.tenant}:{self.client_id}"
+
+    def principal(self) -> str:
+        """A one-way hash of the tenant and client id, safe to write to the state file."""
+        return hashlib.sha256(f"ae-azure-cost:{self.key()}".encode()).hexdigest()
 
 
 def _env(environ: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -142,7 +178,16 @@ def not_configured_note() -> str:
 
 
 class AzureCostError(Exception):
-    """A failure whose text is safe to show: it never carries a secret."""
+    """A failure whose text is safe to show: it never carries a secret.
+
+    *permanent* marks one that retrying will not fix (a principal without the role, a
+    refused principal, a subscription too big to page); the card then waits the hour
+    instead of asking again every two minutes and spending the shared rate limit.
+    """
+
+    def __init__(self, message: str, *, permanent: bool = False) -> None:
+        super().__init__(message)
+        self.permanent = permanent
 
 
 class RateLimitedError(AzureCostError):
@@ -211,6 +256,21 @@ def _tokens_held() -> list[str]:
     return [token for token, _ in _token_cache.values()]
 
 
+_REFUSED_CODES = {"invalid_client", "unauthorized_client", "invalid_grant"}
+
+
+def _refused_principal(body: bytes | str) -> bool:
+    """True when a 400 from the token endpoint names a bad principal, not a bad request.
+
+    Only the error code is read; the body is never put in a message.
+    """
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") in _REFUSED_CODES
+
+
 async def _token(cfg: Config, transport: httpx.AsyncBaseTransport) -> str:
     lock = _token_locks.setdefault(cfg.key(), asyncio.Lock())
     async with lock:
@@ -245,10 +305,11 @@ async def _token(cfg: Config, transport: httpx.AsyncBaseTransport) -> str:
                 f"Microsoft sign-in could not be reached ({type(exc).__name__})."
             ) from None
         if status != 200:
-            if status in (400, 401):
+            if status == 401 or (status == 400 and _refused_principal(body)):
                 raise AzureCostError(
                     f"Microsoft refused the Azure cost service principal ({status}). Check the "
-                    "AE_AZURE_COST_* secrets and restart the stack."
+                    "AE_AZURE_COST_* secrets and restart the stack.",
+                    permanent=True,
                 )
             raise AzureCostError(f"Microsoft sign-in answered {status}.")
         try:
@@ -334,10 +395,17 @@ async def _query(
                 + (f"; retry in {_scrub(wait, cfg)} s." if wait and wait.isdigit() else "."),
                 _backoff(wait),
             )
-        if status in (401, 403):
+        if status == 401:
+            # An invalid or expired bearer token, not a missing role: sign in again next try.
+            _token_cache.pop(cfg.key(), None)
+            raise AzureCostError(
+                "Cost Management refused the sign-in token (401); the next try signs in again."
+            )
+        if status == 403:
             raise AzureCostError(
                 f"The service principal may not read this subscription's costs ({status}). "
-                "Give it Cost Management Reader on it."
+                "Give it Cost Management Reader on it.",
+                permanent=True,
             )
         if status != 200:
             raise AzureCostError(f"Cost Management answered {status}.")
@@ -358,7 +426,8 @@ async def _query(
     if url is not None:
         raise AzureCostError(
             f"Cost Management returned more than {MAX_PAGES} pages of rows; the card does not "
-            "show partial costs."
+            "show partial costs.",
+            permanent=True,
         )
     return rows
 
@@ -374,22 +443,37 @@ def _resource_name(resource_id: str) -> str:
 
 
 async def _read_subscription(
-    cfg: Config, transport: httpx.AsyncBaseTransport, token: str, sub: str, today: date
+    cfg: Config,
+    transport: httpx.AsyncBaseTransport,
+    token: str,
+    sub: str,
+    today: date,
+    previous: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     first_last = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
     by_service = await _query(
         cfg, transport, token, sub, _body(first_last, today, "ServiceName", "Daily")
     )
-    by_resource = await _query(
-        cfg,
-        transport,
-        token,
-        sub,
-        _body(today - timedelta(days=RESOURCE_DAYS), today, "ResourceId", "Daily"),
-    )
+    by_resource: list[dict[str, Any]] = []
+    note = None
+    spike = None
+    try:
+        by_resource = await _query(
+            cfg,
+            transport,
+            token,
+            sub,
+            _body(today - timedelta(days=RESOURCE_DAYS), today, "ResourceId", "Daily"),
+        )
+    except RateLimitedError:
+        raise
+    except AzureCostError as exc:
+        # The spike check is a bonus on top of the totals: losing it must not lose them.
+        note = f"Spike check unavailable: {_scrub(str(exc), cfg)} Totals are complete."
+        spike = "permanent" if exc.permanent else "transient"
     daily: dict[str, float] = {}
     services: dict[str, dict[str, float]] = {}
-    currency = "USD"
+    currency: str | None = None
     for row in by_service:
         day = _day(row.get("UsageDate"))
         if day is None:
@@ -399,8 +483,16 @@ async def _read_subscription(
         name = str(row.get("ServiceName") or "Other")
         month = services.setdefault(str(day)[:7], {})
         month[name] = month.get(name, 0.0) + amount
-        currency = str(row.get("Currency") or currency)
+        currency = str(row.get("Currency") or currency or "USD")
     resources: dict[str, dict[str, float]] = {}
+    if spike is not None and previous is not None:
+        # Stale flags beat none; FLAG_FRESH_DAYS ages them out. Days past the query's window
+        # are dropped, so a carried copy, now saved across restarts, cannot grow for good.
+        oldest = str(today - timedelta(days=RESOURCE_DAYS))
+        for rid, days in (previous.get("resources") or {}).items():
+            recent = {day: cost for day, cost in days.items() if day >= oldest}
+            if recent:
+                resources[rid] = recent
     for row in by_resource:
         day = _day(row.get("UsageDate"))
         rid = str(row.get("ResourceId") or "")
@@ -409,7 +501,15 @@ async def _read_subscription(
         resources.setdefault(rid, {})[str(day)] = resources.get(rid, {}).get(
             str(day), 0.0
         ) + _cost(row.get("Cost"))
-    return {"daily": daily, "services": services, "resources": resources, "currency": currency}
+    return {
+        "daily": daily,
+        "services": services,
+        "resources": resources,
+        "currency": currency,
+        "note": note,
+        # How the spike check failed, for _read to pick the retry time; it pops this.
+        "spike": spike,
+    }
 
 
 def _flags(
@@ -462,7 +562,13 @@ def _assemble(
     # one rate-limited subscription cannot swap which currency is "apart" between polls.
     configured = {sid for sid, _ in cfg.subscriptions}
     kept = {sid: reading for sid, reading in readings.items() if sid in configured}
-    seen = [kept[sid]["currency"] for sid, _ in cfg.subscriptions if sid in kept]
+    # A subscription with no rows has no currency (None) and does not vote; it adds nothing
+    # to the totals, so it counts in them whatever the currency.
+    seen = [
+        kept[sid]["currency"]
+        for sid, _ in cfg.subscriptions
+        if sid in kept and kept[sid]["currency"] is not None
+    ]
     currency = max(dict.fromkeys(seen), key=seen.count, default="USD")
     for sid, name in cfg.subscriptions:
         reading = kept.get(sid)
@@ -470,7 +576,7 @@ def _assemble(
         spent = 0.0
         counted = True
         row_currency = currency
-        if reading is not None and reading["currency"] != currency:
+        if reading is not None and reading["currency"] not in (None, currency):
             # Never converted: it gets its own line in its own currency, outside every total.
             counted = False
             row_currency = reading["currency"]
@@ -491,6 +597,8 @@ def _assemble(
                 "currency": row_currency,
                 "counted": counted,
                 "error": error,
+                # A stale note beside a new error would contradict it.
+                "note": None if reading is None or error else reading.get("note"),
             }
         )
     spent = sum(amount for day, amount in daily.items() if day.startswith(month))
@@ -534,6 +642,194 @@ _state: dict[str, Any] = {
     "key": None,
 }
 _task: asyncio.Task[None] | None = None
+# Whether this process has looked at the state file yet (once, on the first overview or at boot).
+_loaded = False
+# The saved view's parts and their types, as _assemble builds them: the page reads them as is.
+_VIEW_SHAPE: dict[str, type] = {
+    "currency": str,
+    "month": dict,
+    "daily": list,
+    "subscriptions": list,
+    "services": list,
+    "flags": list,
+}
+
+
+def _state_path() -> Path | None:
+    raw = os.environ.get(STATE_FILE_ENV)
+    raw = DEFAULT_STATE_FILE if raw is None else raw.strip()
+    return Path(raw) if raw else None
+
+
+def _instant(value: object) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return parsed.astimezone(UTC) if parsed.tzinfo else None
+
+
+def _amounts(value: object) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, float] = {}
+    for key, amount in value.items():
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            return None
+        out[str(key)] = float(amount)
+    return out
+
+
+def _nested(value: object) -> dict[str, dict[str, float]] | None:
+    if not isinstance(value, dict):
+        return None
+    out: dict[str, dict[str, float]] = {}
+    for key, inner in value.items():
+        amounts = _amounts(inner)
+        if amounts is None:
+            return None
+        out[str(key)] = amounts
+    return out
+
+
+def _saved_reading(value: object) -> dict[str, Any] | None:
+    """A reading as _read_subscription returns it, or None when the saved one is not that."""
+    if not isinstance(value, dict):
+        return None
+    daily = _amounts(value.get("daily"))
+    services = _nested(value.get("services"))
+    resources = _nested(value.get("resources"))
+    currency = value.get("currency")
+    note = value.get("note")
+    if daily is None or services is None or resources is None:
+        return None
+    if not isinstance(currency, (str, type(None))) or not isinstance(note, (str, type(None))):
+        return None
+    return {
+        "daily": daily,
+        "services": services,
+        "resources": resources,
+        "currency": currency,
+        "note": note,
+    }
+
+
+def _subscription_list(cfg: Config) -> list[list[str]]:
+    return [[sid, name] for sid, name in cfg.subscriptions]
+
+
+def _load(cfg: Config, path: Path | None) -> dict[str, Any] | None:
+    """The saved reading for *cfg*, or None when there is none that applies."""
+    if path is None:
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        _logger.warning("azure cost: ignoring unreadable %s (%s)", path, type(exc).__name__)
+        return None
+    if not isinstance(raw, dict) or raw.get("version") != STATE_VERSION:
+        _logger.warning("azure cost: ignoring malformed %s", path)
+        return None
+    if raw.get("subscriptions") != _subscription_list(cfg) or raw.get("principal") != (
+        cfg.principal()
+    ):
+        # Read for another subscription list or principal: none of it applies now.
+        _logger.info("azure cost: discarding %s, read for another configuration", path)
+        return None
+    at, due = _instant(raw.get("at")), _instant(raw.get("due"))
+    view, readings, errors = raw.get("view"), raw.get("readings"), raw.get("errors")
+    configured = {sid for sid, _ in cfg.subscriptions}
+    if (
+        at is None
+        or due is None
+        or not isinstance(view, dict)
+        or not all(isinstance(view.get(key), kind) for key, kind in _VIEW_SHAPE.items())
+        or not all(
+            isinstance(row, dict)
+            for key in ("daily", "subscriptions", "services", "flags")
+            for row in view[key]
+        )
+        or not isinstance(readings, dict)
+        or not isinstance(errors, dict)
+        or not all(sid in configured and isinstance(text, str) for sid, text in errors.items())
+    ):
+        _logger.warning("azure cost: ignoring malformed %s", path)
+        return None
+    kept: dict[str, dict[str, Any]] = {}
+    for sid, value in readings.items():
+        reading = _saved_reading(value)
+        if sid not in configured or reading is None:
+            _logger.warning("azure cost: ignoring malformed %s", path)
+            return None
+        kept[sid] = reading
+    return {"view": view, "readings": kept, "errors": dict(errors), "at": at, "due": due}
+
+
+def _save(cfg: Config, path: Path | None) -> None:
+    """Write the reading atomically (a temp file, then ``os.replace``), like databricks.py.
+
+    Only the subscription list and :meth:`Config.principal` say what it was read for:
+    never the tenant id, the client id, the secret or a token.
+    """
+    if path is None or _state["at"] is None:
+        return
+    body = {
+        "version": STATE_VERSION,
+        "subscriptions": _subscription_list(cfg),
+        "principal": cfg.principal(),
+        "at": iso(_state["at"]),
+        "due": iso(_state["at"] + timedelta(seconds=_state["ttl"])),
+        "view": _state["view"],
+        "readings": _state["readings"],
+        "errors": _state["errors"],
+    }
+    tmp: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(prefix=".ae-azure-cost-", dir=str(path.parent))
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(body, handle, separators=(",", ":"))
+        os.replace(tmp, path)
+        tmp = None
+    except (OSError, TypeError, ValueError) as exc:
+        _logger.warning("azure cost: could not write %s (%s)", path, type(exc).__name__)
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
+def _restore(cfg: Config) -> None:
+    """Load the saved reading once per process, so a restart answers with it at once.
+
+    Due is judged by wall clock (the monotonic clock restarts with the process): the time
+    left becomes this process's ttl, capped at the hour, so a saved 429 wait still holds.
+    """
+    global _loaded
+    if _loaded:
+        return
+    _loaded = True
+    if _state["at"] is not None:
+        return
+    saved = _load(cfg, _state_path())
+    if saved is None:
+        return
+    left = (saved["due"] - _now()).total_seconds()
+    _state.update(
+        {
+            "view": saved["view"],
+            "readings": saved["readings"],
+            "errors": saved["errors"],
+            "at": saved["at"],
+            "mono": _monotonic(),
+            "ttl": min(max(left, 0.0), CACHE_TTL_S),
+            "key": (cfg.key(), cfg.subscriptions),
+        }
+    )
 
 
 async def _read(cfg: Config) -> None:
@@ -547,6 +843,8 @@ async def _read(cfg: Config) -> None:
     errors: dict[str, str] = {}
     done: set[str] = set()
     backoff = 0.0
+    permanent: set[str] = set()
+    spike_retry = False
 
     def unread(message: str) -> dict[str, str]:
         # Only the subscriptions this pass did not finish; the others keep their new reading.
@@ -557,9 +855,11 @@ async def _read(cfg: Config) -> None:
             token = await _token(cfg, transport)
             for sid, _ in cfg.subscriptions:
                 try:
-                    _state["readings"][sid] = await _read_subscription(
-                        cfg, transport, token, sid, today
+                    reading = await _read_subscription(
+                        cfg, transport, token, sid, today, _state["readings"].get(sid)
                     )
+                    spike_retry = spike_retry or reading.pop("spike") == "transient"
+                    _state["readings"][sid] = reading
                     done.add(sid)
                 except RateLimitedError as exc:
                     # Stop asking: more queries while limited only extend the limit.
@@ -568,8 +868,12 @@ async def _read(cfg: Config) -> None:
                     break
                 except AzureCostError as exc:
                     errors[sid] = _scrub(str(exc), cfg)
+                    if exc.permanent:
+                        permanent.add(sid)
     except AzureCostError as exc:
         errors = unread(_scrub(str(exc), cfg))
+        if exc.permanent:
+            permanent.update(errors)
     except TimeoutError:
         errors = unread("The reading took too long.")
     except Exception as exc:  # noqa: BLE001  a bug must show on the card, not leave it reading for good
@@ -577,11 +881,17 @@ async def _read(cfg: Config) -> None:
         errors = unread("The reading failed unexpectedly.")
     _state["errors"] = errors
     _state["mono"] = _monotonic()
-    # A failure is tried again in two minutes, a rate limit after its wait, a good reading
-    # after the hour.
-    _state["ttl"] = backoff or (RETRY_TTL_S if errors else CACHE_TTL_S)
+    # A transient failure is tried again in two minutes, a rate limit after its wait, a good
+    # reading after the hour. So is a pass whose every error is permanent (no role, a refused
+    # principal, too many pages): retrying cannot fix it and each try spends the shared
+    # Cost Management rate limit.
+    # A transient spike-check failure counts too: its note is not an error, but it is worth
+    # asking again soon.
+    retry = spike_retry or any(sid not in permanent for sid in errors)
+    _state["ttl"] = backoff or (RETRY_TTL_S if retry else CACHE_TTL_S)
     _state["at"] = _now()
     _state["view"] = _assemble(cfg, _state["readings"], errors, today)
+    _save(cfg, _state_path())
     if errors:
         _logger.warning("azure cost reading had %d failing subscription(s)", len(errors))
 
@@ -606,6 +916,7 @@ async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     cfg = config(environ)
     if cfg is None:
         return {"configured": False, "note": not_configured_note()}
+    _restore(cfg)
     if _stale():
         _begin(cfg)
     view = _state["view"]
@@ -619,10 +930,11 @@ async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
 
 
 def reset() -> None:
-    global _task, _transport, _transport_loop
+    global _task, _transport, _transport_loop, _loaded
     if _task is not None and not _task.done():
         _task.cancel()
     _task = None
+    _loaded = False
     _transport = None
     _transport_loop = None
     _token_cache.clear()
@@ -638,3 +950,28 @@ def reset() -> None:
             "key": None,
         }
     )
+
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+    """Load the saved reading at boot, and start a reading then when it is due."""
+    try:
+        cfg = config()
+        if cfg is not None:
+            _restore(cfg)
+            if _stale():
+                _begin(cfg)
+    except Exception as exc:  # noqa: BLE001  the card must never stop the server starting
+        _logger.warning("azure cost: boot reading not started (%s)", type(exc).__name__)
+    try:
+        yield
+    finally:
+        task = _task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+#: No routes; included for its lifespan, like merge_watch's (see the module docstring).
+lifespan_router = APIRouter(lifespan=lifespan)

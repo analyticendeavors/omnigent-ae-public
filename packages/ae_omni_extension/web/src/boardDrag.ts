@@ -14,7 +14,10 @@
 // the board outlives is cancelled, never committed: a breakpoint or a saved
 // layout arriving mid-drag rebuilds the columns around the cards, which would
 // otherwise drop the card into a detached column and save a layout under the
-// wrong column count. Stopping the board cancels it too.
+// wrong column count. A board that only reflows (a scrollbar narrowing the
+// page) keeps its columns and fires no "admin-arranged" event, so the drag goes
+// on, and the lifted card takes the width of its slot. Stopping the board
+// cancels it too.
 //
 // The grip also takes the arrow keys (up and down in the column, left and
 // right to the next column), so the page can be arranged without a mouse; each
@@ -93,6 +96,9 @@ function begin(
     if (event.pointerId !== start.pointerId) return;
     card.style.left = `${event.clientX - offsetX}px`;
     card.style.top = `${event.clientY - offsetY}px`;
+    // The slot sits in a column, so its width follows a reflow the drag outlived.
+    const slotWidth = slot.getBoundingClientRect().width;
+    if (slotWidth > 0) card.style.width = `${slotWidth}px`;
     const columns = [...board.children] as HTMLElement[];
     const boxes = columns.map((col) => {
       const rect = col.getBoundingClientRect();
@@ -186,6 +192,8 @@ export function enableDrag(board: HTMLElement, cards: Record<CardId, HTMLElement
     });
   };
   const onKey = (event: Event) => {
+    // A pointer drag owns the board; a keyboard move would save the pre-drag layout.
+    if (cancelActive) return;
     const key = event as KeyboardEvent;
     const n = arranged(board);
     const grip = (key.target as Element | null)?.closest?.(".admin-grip");
@@ -217,15 +225,20 @@ export function enableDrag(board: HTMLElement, cards: Record<CardId, HTMLElement
   };
 }
 
-/** The page header's Reset layout button: shown only while an arrangement is saved and there are columns. */
+/**
+ * The page header's Reset layout button: shown only while the current column
+ * count has a saved arrangement (one saved at another width is not on screen).
+ * Pressing it clears every width, as its title says.
+ */
 export function layoutResetButton(board: HTMLElement): HTMLButtonElement {
   const node = button("Reset layout", {
-    title: "Put the cards back in their default places",
+    title: "Put the cards back in their default places, at every width",
     onClick: () => resetArrangement(),
   });
   node.classList.add("admin-reset");
   const update = () => {
-    node.hidden = !hasArrangement() || arranged(board) === null;
+    const n = arranged(board);
+    node.hidden = n === null || !hasArrangement(n);
   };
   update();
   board.addEventListener("admin-arranged", update);

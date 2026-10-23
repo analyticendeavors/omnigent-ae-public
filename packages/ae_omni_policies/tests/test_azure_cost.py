@@ -13,7 +13,8 @@ import json
 import logging
 import os
 from collections.abc import Callable, Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from urllib.parse import parse_qs
 
 import httpx
@@ -35,10 +36,11 @@ Handler = Callable[[httpx.Request], httpx.Response]
 
 
 @pytest.fixture(autouse=True)
-def _azure_env(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+def _azure_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator[None]:
     for key in list(os.environ):
         if key.startswith("AE_AZURE_COST_"):
             monkeypatch.delenv(key)
+    monkeypatch.setenv("AE_AZURE_COST_STATE_FILE", str(tmp_path / "ae-azure-cost.json"))
     monkeypatch.setattr(azure_cost, "_now", lambda: NOW)
     azure_cost.reset()
     yield
@@ -496,3 +498,464 @@ async def test_another_failure_still_retries_in_two_minutes(
     await _read(monkeypatch)
     clock[0] += azure_cost.RETRY_TTL_S + 1
     assert (await azure_cost.overview())["reading"] is True
+
+
+async def test_a_failed_spike_check_keeps_the_totals_and_says_so_in_a_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+
+    def sub(request: httpx.Request) -> httpx.Response:
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return httpx.Response(500, text=ECHO)
+
+    _mock(monkeypatch, _azure([], subscription=sub))
+    view = (await _read(monkeypatch))["view"]
+    assert isinstance(view, dict)
+    row = view["subscriptions"][0]
+    # The row is not a failed one (the card counts "error"), and its totals are all there.
+    assert row["error"] is None
+    assert row["spent"] == 300.0
+    assert view["month"]["spent"] == 300.0
+    assert view["flags"] == []
+    assert row["note"] == (
+        "Spike check unavailable: Cost Management answered 500. Totals are complete."
+    )
+    _no_secrets(row["note"])
+
+
+async def test_only_permanent_errors_wait_the_hour_before_asking_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    _mock(monkeypatch, _azure([], subscription=lambda r: httpx.Response(403, text=ECHO)))
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    await _read(monkeypatch)
+    # No role is not going to fix itself: two minutes later the card still answers from cache.
+    clock[0] += azure_cost.RETRY_TTL_S + 1
+    assert (await azure_cost.overview())["reading"] is False
+    clock[0] += azure_cost.CACHE_TTL_S
+    assert (await azure_cost.overview())["reading"] is True
+
+
+async def test_a_permanent_error_beside_a_transient_one_still_retries_in_two_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+
+    def sub(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(403 if SUB_A in str(request.url) else 500)
+
+    _mock(monkeypatch, _azure([], subscription=sub))
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    await _read(monkeypatch)
+    clock[0] += azure_cost.RETRY_TTL_S + 1
+    assert (await azure_cost.overview())["reading"] is True
+
+
+def test_a_subscription_with_no_rows_does_not_vote_for_usd() -> None:
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Prod"), (SUB_B, "Dev")))
+    empty: dict[str, object] = {"daily": {}, "services": {}, "resources": {}, "currency": None}
+    euro = {
+        "daily": {"2026-10-20": 10.0},
+        "services": {},
+        "resources": {},
+        "currency": "EUR",
+    }
+    view = azure_cost._assemble(cfg, {SUB_A: empty, SUB_B: euro}, {}, NOW.date())
+    assert view["currency"] == "EUR"
+    assert view["month"]["spent"] == 10.0
+    rows = {s["name"]: s for s in view["subscriptions"]}
+    assert rows["Prod"]["counted"] is True
+    assert rows["Prod"]["currency"] == "EUR"
+    # Nothing voted at all: the default stands.
+    assert azure_cost._assemble(cfg, {SUB_A: empty}, {}, NOW.date())["currency"] == "USD"
+    # A reading cached before the change always carried a string currency and has no note.
+    old = {"daily": {}, "services": {}, "resources": {}, "currency": "USD"}
+    kept = azure_cost._assemble(cfg, {SUB_A: old}, {}, NOW.date())
+    assert kept["subscriptions"][0]["note"] is None
+
+
+def _spike_fails(status: int) -> Handler:
+    def sub(request: httpx.Request) -> httpx.Response:
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return httpx.Response(status)
+
+    return sub
+
+
+async def test_a_transient_spike_failure_retries_in_two_minutes_a_permanent_one_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    _mock(monkeypatch, _azure([], subscription=_spike_fails(500)))
+    await _read(monkeypatch)
+    clock[0] += azure_cost.RETRY_TTL_S + 1
+    assert (await azure_cost.overview())["reading"] is True
+    await azure_cost.reading_task()
+    # A 403 on the spike query will not fix itself.
+    _mock(monkeypatch, _azure([], subscription=_spike_fails(403)))
+    clock[0] += azure_cost.CACHE_TTL_S + 1
+    await _read(monkeypatch)
+    clock[0] += azure_cost.RETRY_TTL_S + 1
+    assert (await azure_cost.overview())["reading"] is False
+
+
+async def test_a_failed_spike_check_keeps_the_flags_of_the_last_good_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    _mock(monkeypatch, _azure([]))
+    first = (await _read(monkeypatch))["view"]
+    assert isinstance(first, dict)
+    assert first["flags"]
+    _mock(monkeypatch, _azure([], subscription=_spike_fails(500)))
+    clock[0] += azure_cost.CACHE_TTL_S + 1
+    second = (await _read(monkeypatch))["view"]
+    assert isinstance(second, dict)
+    assert second["subscriptions"][0]["note"]
+    assert second["flags"] == first["flags"]
+
+
+async def test_a_401_from_cost_management_drops_the_token_and_is_not_a_missing_role(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    calls: list[httpx.Request] = []
+    _mock(monkeypatch, _azure(calls, subscription=lambda r: httpx.Response(401, text=ECHO)))
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    view = (await _read(monkeypatch))["view"]
+    assert isinstance(view, dict)
+    error = view["subscriptions"][0]["error"]
+    assert "Cost Management Reader" not in error
+    assert "signs in again" in error
+    _no_secrets(error)
+    assert azure_cost._token_cache == {}
+    clock[0] += azure_cost.RETRY_TTL_S + 1
+    assert (await azure_cost.overview())["reading"] is True
+
+
+@pytest.mark.parametrize(
+    ("body", "permanent"),
+    [
+        ('{"error": "invalid_client"}', True),
+        ('{"error": "invalid_grant"}', True),
+        ('{"error": "temporarily_unavailable"}', False),
+        ("not json", False),
+    ],
+)
+async def test_only_a_400_that_names_the_principal_is_permanent(
+    monkeypatch: pytest.MonkeyPatch, body: str, permanent: bool
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    _mock(monkeypatch, lambda request: httpx.Response(400, text=body))
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    view = (await _read(monkeypatch))["view"]
+    assert isinstance(view, dict)
+    error = view["subscriptions"][0]["error"]
+    if permanent:
+        assert "refused the Azure cost service principal" in error
+    else:
+        assert error == "Microsoft sign-in answered 400."
+    clock[0] += azure_cost.RETRY_TTL_S + 1
+    assert (await azure_cost.overview())["reading"] is not permanent
+
+
+def test_a_stale_note_is_not_shown_beside_a_new_error() -> None:
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Prod"),))
+    reading = {
+        "daily": {"2026-10-20": 10.0},
+        "services": {},
+        "resources": {},
+        "currency": "USD",
+        "note": "Spike check unavailable: x. Totals are complete.",
+    }
+    clean = azure_cost._assemble(cfg, {SUB_A: reading}, {}, NOW.date())
+    assert clean["subscriptions"][0]["note"]
+    failed = azure_cost._assemble(cfg, {SUB_A: reading}, {SUB_A: "limited"}, NOW.date())
+    assert failed["subscriptions"][0]["note"] is None
+
+
+# The saved reading (2026-10-22): a deploy restarts the server, and the card used to say
+# "Reading..." until a first GET started a fresh reading.
+
+
+def _state_file() -> Path:
+    return Path(os.environ["AE_AZURE_COST_STATE_FILE"])
+
+
+def _clock(monkeypatch: pytest.MonkeyPatch) -> list[datetime]:
+    wall = [NOW]
+    monkeypatch.setattr(azure_cost, "_now", lambda: wall[0])
+    return wall
+
+
+_GOOD_VIEW: dict[str, object] = {
+    "currency": "USD",
+    "month": {"spent": 10.0, "pace": None, "lastMonth": 0.0, "through": "2026-10-20"},
+    "daily": [{"date": "2026-10-20", "cost": 10.0}],
+    "subscriptions": [],
+    "services": [],
+    "flags": [],
+}
+_GOOD_READING: dict[str, object] = {
+    "daily": {"2026-10-20": 10.0},
+    "services": {"2026-10": {"SQL Database": 10.0}},
+    "resources": {},
+    "currency": "USD",
+    "note": None,
+}
+
+
+def _saved_file(**parts: object) -> str:
+    body: dict[str, object] = {
+        "version": 1,
+        "subscriptions": [[SUB_A, "Production"]],
+        "principal": azure_cost.Config(
+            TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"),)
+        ).principal(),
+        "at": "2026-10-21T12:00:00Z",
+        "due": "2026-10-21T13:00:00Z",
+        "view": _GOOD_VIEW,
+        "readings": {SUB_A: _GOOD_READING},
+        "errors": {},
+    }
+    body.update(parts)
+    return json.dumps(body)
+
+
+async def test_a_carried_spike_reading_drops_days_past_the_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Readings now outlive a restart, so the copy kept when the spike check fails is trimmed.
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"),))
+
+    def no_spike(request: httpx.Request) -> httpx.Response:
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return httpx.Response(500)
+
+    previous = {
+        "resources": {SQL_ID: {"2026-09-01": 9.0, "2026-10-19": 1.0}, "old": {"2026-09-02": 1.0}}
+    }
+    reading = await azure_cost._read_subscription(
+        cfg, httpx.MockTransport(no_spike), TOKEN, SUB_A, NOW.date(), previous
+    )
+    assert reading["resources"] == {SQL_ID: {"2026-10-19": 1.0}}
+    assert previous["resources"][SQL_ID] == {"2026-09-01": 9.0, "2026-10-19": 1.0}
+
+
+def _restart() -> None:
+    # What a deploy does to the process: every in-memory cache is gone.
+    azure_cost.reset()
+
+
+async def test_a_reading_is_saved_with_its_time_and_when_the_next_is_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    answer = await _read(monkeypatch)
+    saved = json.loads(_state_file().read_text(encoding="utf-8"))
+    assert saved["at"] == answer["asOf"] == "2026-10-21T12:00:00Z"
+    assert saved["due"] == "2026-10-21T13:00:00Z"
+    assert saved["view"] == answer["view"]
+    assert saved["subscriptions"] == [[SUB_A, "Production"], [SUB_B, "Dev"]]
+    assert set(saved["readings"]) == {SUB_A, SUB_B}
+    assert _state_file().stat().st_mode & 0o077 == 0
+
+
+async def test_a_restart_answers_from_the_file_and_reads_nothing_when_not_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    before = await _read(monkeypatch)
+    _restart()
+    wall = _clock(monkeypatch)
+    wall[0] = NOW + timedelta(minutes=50)
+    calls: list[httpx.Request] = []
+    _mock(monkeypatch, _azure(calls))
+    after = await azure_cost.overview()
+    assert after["reading"] is False
+    assert after["asOf"] == before["asOf"]
+    assert after["view"] == before["view"]
+    assert azure_cost.reading_task() is None
+    assert calls == []
+
+
+async def test_a_restart_with_a_due_file_shows_it_and_starts_one_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    before = await _read(monkeypatch)
+    _restart()
+    wall = _clock(monkeypatch)
+    wall[0] = NOW + timedelta(seconds=azure_cost.CACHE_TTL_S + 1)
+    calls: list[httpx.Request] = []
+    _mock(monkeypatch, _azure(calls))
+    first = await azure_cost.overview()
+    assert first["reading"] is True
+    assert first["view"] == before["view"]
+    task = azure_cost.reading_task()
+    assert (await azure_cost.overview())["reading"] is True
+    assert azure_cost.reading_task() is task
+    assert task is not None
+    await task
+    # One sign-in and two queries per subscription: one reading, not two.
+    assert len(calls) == 5
+    assert (await azure_cost.overview())["asOf"] == "2026-10-21T13:00:01Z"
+
+
+async def test_a_saved_rate_limit_is_still_honored_after_a_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    _mock(monkeypatch, _azure([], subscription=_limited("300")))
+    await _read(monkeypatch)
+    assert json.loads(_state_file().read_text())["due"] == "2026-10-21T12:05:00Z"
+    _restart()
+    wall = _clock(monkeypatch)
+    wall[0] = NOW + timedelta(seconds=299)
+    clock = [5.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    calls: list[httpx.Request] = []
+    _mock(monkeypatch, _azure(calls))
+    assert (await azure_cost.overview())["reading"] is False
+    # Only one second of the wait is left; this process's own clock now runs it out.
+    clock[0] += 0.5
+    assert (await azure_cost.overview())["reading"] is False
+    clock[0] += 1
+    assert (await azure_cost.overview())["reading"] is True
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"AE_AZURE_COST_SUBSCRIPTIONS": f"{SUB_A}=Production"},
+        {"AE_AZURE_COST_SUBSCRIPTIONS": f"{SUB_B}=Dev,{SUB_A}=Production"},
+        {"AE_AZURE_COST_CLIENT_ID": "66666666-6666-4666-8666-666666666666"},
+    ],
+)
+async def test_a_file_read_for_another_configuration_is_discarded(
+    monkeypatch: pytest.MonkeyPatch, change: dict[str, str]
+) -> None:
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    await _read(monkeypatch)
+    _restart()
+    for key, value in change.items():
+        monkeypatch.setenv(key, value)
+    answer = await azure_cost.overview()
+    assert answer["view"] is None
+    assert answer["asOf"] is None
+    assert answer["reading"] is True
+
+
+async def test_a_well_formed_saved_file_is_accepted() -> None:
+    # The baseline for the corrupt cases below: each one breaks a single part of this file.
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"),))
+    path = Path(os.environ["AE_AZURE_COST_STATE_FILE"])
+    path.write_text(_saved_file(), encoding="utf-8")
+    saved = azure_cost._load(cfg, path)
+    assert saved is not None
+    assert saved["readings"][SUB_A]["daily"] == {"2026-10-20": 10.0}
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "{not json",
+        "[]",
+        json.dumps({"version": 99}),
+        _saved_file(readings={SUB_A: {**_GOOD_READING, "daily": {"2026-10-20": "ten"}}}),
+        _saved_file(view={**_GOOD_VIEW, "month": None, "daily": "x"}),
+        _saved_file(view={**_GOOD_VIEW, "flags": [0]}),
+    ],
+)
+async def test_a_corrupt_file_is_ignored_and_reads_as_today(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, content: str
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    _state_file().write_text(content, encoding="utf-8")
+    _mock(monkeypatch, _azure([]))
+    with caplog.at_level(logging.WARNING, logger="ae_omni_policies.azure_cost"):
+        answer = await azure_cost.overview()
+    assert answer["view"] is None
+    assert answer["reading"] is True
+    assert "ignoring" in caplog.text
+    assert "not json" not in caplog.text
+    task = azure_cost.reading_task()
+    assert task is not None
+    await task
+    assert (await azure_cost.overview())["view"] is not None
+
+
+async def test_the_file_never_holds_a_secret_or_a_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+
+    def echoing(request: httpx.Request) -> httpx.Response:
+        if SUB_B in request.url.path:
+            return httpx.Response(403, text=ECHO)
+        return _azure([])(request)
+
+    _mock(monkeypatch, _azure([], subscription=echoing))
+    await _read(monkeypatch)
+    text = _state_file().read_text(encoding="utf-8")
+    _no_secrets(text)
+    assert f"{TENANT}:{CLIENT_ID}" not in text
+    assert json.loads(text)["errors"][SUB_B]
+
+
+async def test_an_empty_state_file_setting_keeps_the_reading_in_memory_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AE_AZURE_COST_STATE_FILE", "")
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    assert (await _read(monkeypatch))["view"] is not None
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_boot_loads_the_file_and_reads_only_when_it_is_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from fastapi import FastAPI
+
+    from ae_omni_policies.router import DEBUG_ROUTERS
+
+    assert any(entry[0] is azure_cost.lifespan_router for entry in DEBUG_ROUTERS)
+    app = FastAPI()
+    app.include_router(azure_cost.lifespan_router)
+    _configure(monkeypatch)
+    calls: list[httpx.Request] = []
+    _mock(monkeypatch, _azure(calls))
+    # No file yet: boot starts the first reading, so the first visit may find it done.
+    async with app.router.lifespan_context(app):
+        task = azure_cost.reading_task()
+        assert task is not None
+        await task
+    assert _state_file().exists()
+    _restart()
+    calls.clear()
+    # A fresh file: boot answers from it and asks Azure nothing.
+    async with app.router.lifespan_context(app):
+        assert azure_cost.reading_task() is None
+        assert (await azure_cost.overview())["asOf"] == "2026-10-21T12:00:00Z"
+    assert calls == []

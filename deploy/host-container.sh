@@ -114,7 +114,7 @@ case "$1" in
     compose exec host bash -l ;;
   up)
     docker network inspect "$NETWORK" >/dev/null 2>&1 \
-      || die "network $NETWORK does not exist. It belongs to the server stack: add it to deploy/docker-compose.override.yml (the omnigent service and the networks block) and run deploy/compose.sh up -d, which recreates the server container"
+      || die "network $NETWORK does not exist. It belongs to the server stack: add it to config/compose.local.yml (copy config/compose.local.yml.example; the omnigent service's networks and the top-level networks block) and run deploy/compose.sh up -d, which recreates the server container"
     images_present || build
     compose "$@" ;;
   *)

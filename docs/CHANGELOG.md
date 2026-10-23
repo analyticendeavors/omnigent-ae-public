@@ -700,6 +700,17 @@ switch on) or Workspace panel (the old switch off). A file, agents or comment li
 opens the panel, and a device that had the switch off keeps the workspace panel. Details
 in `docs/PLAN-LIMITS.md` ("When a session opens").
 
+Approval code under Show details (2026-10-22, `patches/0156`, web): on approval cards
+that gate the person's own message (the rabbit-hole check, the slot cap) the JSON under
+the policy's sentence now sits behind a Show details toggle, closed by default; Reid had
+asked for it on 2026-10-17. Cards that gate what the agent is about to do (a tool call's
+command, a response) keep their code in view, whoever wrote the policy.
+
+Insertion line between lists (2026-10-22, `patches/0157`, web): dragging a session onto a
+row of another project folder, of Sessions, or of another Triage group now shows the
+blue line, and the drop files it there (or sets that group's status), then places it at
+the line in the manual order. Reid asked for it after moving a session out of a project.
+
 Feature docs per public release (2026-10-22, `scripts/docs-coverage.py`): the README's
 showcase and `docs/features` should keep up with the patch series, but Reid wanted that
 once per public release, not on every merge. The script lists the core patches added

@@ -41,7 +41,7 @@ note "installed: $("$VENV/bin/omnigent" --version)"
 "$VENV/bin/python" -c "import ae_omni_policies.mcp, ae_omni_policies.limits_relay" \
   || die "ae_omni_policies.mcp or .limits_relay does not import from $VENV"
 
-# Give Reid's interactive Claude Code and Codex sessions the AE tools too
+# Give the host user's interactive Claude Code and Codex sessions the AE tools too
 # (omni_set_status, omni_capacity, park_fork, ...), not only the scheduled
 # agents, whose YAML names the server itself. Added 2026-09-24 after sessions
 # on the box said they could not flip their own ae.status. User scope, once,

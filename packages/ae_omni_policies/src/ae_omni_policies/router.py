@@ -113,7 +113,11 @@ there is no per-user scoping there, because upstream's permission store is not
 reachable from a router mounted this way. Admin-only (2026-10-21, pre-publication
 audit A3): merging, marking ready and updating a pull request branch with the
 server's GitHub token, and reading, setting or ending the deploy hold
-(:func:`_admin_only`). ``/your-move`` lists only sessions the caller may open, and
+(:func:`_admin_only`). Admin-only since 2026-10-22 (public issues 4, 18 and 19):
+the Fabric wake, suspend, keep-awake and scale actions, the Databricks start,
+stop and spend refresh, the host relink (it ends every live session) and the
+plan-limits snapshot post, which feeds the usage gate; the box's limits relay
+posts with the admin's stored login. ``/your-move`` lists only sessions the caller may open, and
 ``/limits?session_id=`` answers a session's account only to a caller who may
 open it. Who is an admin is decided by ``GET /v1/me`` asked as the caller
 (``shared_accounts_routes.admin_probe``), so signed in must never be treated
@@ -473,6 +477,25 @@ async def _admin_only(request: Request, user: str | None, action: str) -> JSONRe
     )
 
 
+def _transport_failure(exc: httpx.HTTPError, step: str) -> str:
+    """What a failed in-process call tells the caller; the details stay in the log.
+
+    httpx's own text names the loopback URL it tried, so it is logged here and
+    never sent (2026-10-22, CodeQL py/stack-trace-exposure on the public repo).
+    A refused connection never reached the server, so a retry is safe; a timeout
+    or a dropped connection may have landed, so the caller checks first.
+    """
+    _logger.warning("%s failed: %r", step, exc)
+    if isinstance(exc, (httpx.ConnectError, httpx.ConnectTimeout)):
+        return "could not reach the server; try again, and if it repeats the server log says why"
+    if isinstance(exc, httpx.TimeoutException):
+        return "timed out before an answer, so it may have gone through; check before trying again"
+    return (
+        "the connection dropped before an answer, so it may have gone through; "
+        "check before trying again"
+    )
+
+
 def _acl_user(user: str | None) -> str | None:
     """The identity to filter session listings by; ``None`` on a single-user runtime."""
     return None if user is None or user == RESERVED_USER_LOCAL else user
@@ -487,6 +510,16 @@ async def health() -> dict[str, Any]:
         "version": __version__,
         "task_store": {"url": settings.app_url, "configured": settings.configured},
     }
+
+
+@router.get("/schedule-defaults")
+async def schedule_defaults() -> dict[str, Any]:
+    """The server's own clock and default project, for the schedule seeder and
+    the check-in tool (2026-10-22): ``AE_TASK_STORE_TZ`` (UTC when unset) and
+    ``OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT`` (``None`` when unset). Both are
+    server settings, and the seeder runs on another machine's environment."""
+    project = (os.environ.get("OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT") or "").strip()
+    return {"timezone": Settings.from_env().tz, "project": project or None}
 
 
 @router.get("/capacity")
@@ -667,13 +700,19 @@ def _host_reading() -> tuple[host_relink.Status | None, host_relink.Request | No
 
 @router.get("/host")
 async def host_view(
-    request: Request, _user: Annotated[str | None, Depends(require_ae_user)]
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
 ) -> dict[str, Any]:
-    """The box host's connection and the reconnect helper's last report (``host_relink.py``)."""
-    host, host_error = await _box_host(request)
+    """The box host's connection and the reconnect helper's last report (``host_relink.py``).
+
+    ``can_act`` says whether the caller may ask for a reconnect link (2026-10-22).
+    """
+    (host, host_error), can_act = await asyncio.gather(
+        _box_host(request), shared_accounts_routes.admin_probe(request, user)
+    )
     status, asked, read_error = await asyncio.to_thread(_host_reading)
     error = "; ".join(item for item in (host_error, read_error) if item) or None
-    return host_relink.view(host, status, asked, error=error).model_dump()
+    answer = host_relink.view(host, status, asked, error=error).model_dump()
+    return {**answer, "can_act": can_act}
 
 
 @router.post(
@@ -690,7 +729,10 @@ async def host_relink_request(
     live session, so a connected host is refused here and not only hidden on
     the page. A request while a link is out would queue a second login loop
     after the first, so that is refused here too (2026-10-20). Any body is ignored.
+    Admin only (2026-10-22, public issue 4).
     """
+    if (refused := await _admin_only(request, user, "reconnect the box host")) is not None:
+        return refused
     who = (user or "").strip() or "local"
     host, host_error = await _box_host(request)
     if host is None:
@@ -715,7 +757,9 @@ async def host_relink_request(
         return _error(500, host_relink.CODE_NOT_SAVED, str(exc))
     _logger.info("host relink requested by %s for %s", who, host.get("name"))
     status, asked, read_error = await asyncio.to_thread(_host_reading)
-    return host_relink.view(host, status, asked, error=read_error).model_dump()
+    # The caller passed the admin gate above, so the card keeps its button.
+    answer = host_relink.view(host, status, asked, error=read_error).model_dump()
+    return {**answer, "can_act": True}
 
 
 @router.get("/secrets")
@@ -821,11 +865,25 @@ async def _may_open_session(request: Request, user: str | None, session_id: str)
     return response.status_code == 200
 
 
-@router.post("/limits/{harness}", response_model=None)
+@router.post(
+    "/limits/{harness}",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
 async def limits_post(
-    harness: limits.Harness, body: limits.LimitSnapshot
+    request: Request,
+    harness: limits.Harness,
+    body: limits.LimitSnapshot,
+    user: Annotated[str | None, Depends(require_ae_user)],
 ) -> dict[str, Any] | JSONResponse:
-    """Record one harness's snapshot; an older reading than the one held is ignored."""
+    """Record one harness's snapshot; an older reading than the one held is ignored.
+
+    Admin only (2026-10-22, public issue 18): the reading decides whether new
+    sessions are blocked. The box's relay (``limits_relay.py``) posts JSON with
+    the admin's stored login and no ``Origin``, so it passes both checks.
+    """
+    if (refused := await _admin_only(request, user, "record plan usage")) is not None:
+        return refused
     if body.harness != harness:
         return _error(
             400,
@@ -1228,7 +1286,8 @@ async def resume_session(request: Request, task_id: str) -> dict[str, Any] | JSO
     except _NoTarget as exc:
         return _error(503, CODE_RESUME_NO_TARGET, f"no session was started: {exc}", **carry)
     except httpx.HTTPError as exc:
-        return _error(503, CODE_RESUME_NO_TARGET, f"no session was started: {exc}", **carry)
+        reason = _transport_failure(exc, "finding an agent, host and workspace")
+        return _error(503, CODE_RESUME_NO_TARGET, f"no session was started: {reason}", **carry)
 
     task_ref = str(resumed["task_id"])
     session_labels = {labels.TASK: task_ref}
@@ -1246,7 +1305,10 @@ async def resume_session(request: Request, task_id: str) -> dict[str, Any] | JSO
     try:
         created = await _loopback(request, "POST", "/v1/sessions", create)
     except httpx.HTTPError as exc:
-        return _error(502, CODE_RESUME_NOT_CREATED, f"creating the session failed: {exc}", **carry)
+        reason = _transport_failure(exc, "creating the session")
+        return _error(
+            502, CODE_RESUME_NOT_CREATED, f"creating the session failed: {reason}", **carry
+        )
     snapshot = _json_or_none(created)
     session_id = snapshot.get("id") if isinstance(snapshot, dict) else None
     if created.status_code >= 300 or not isinstance(session_id, str):
@@ -1264,7 +1326,7 @@ async def resume_session(request: Request, task_id: str) -> dict[str, Any] | JSO
         posted = await _loopback(request, "POST", events, _message(first_message(resumed)))
         failure = None if posted.status_code < 300 else f"{posted.status_code} {posted.text[:200]}"
     except httpx.HTTPError as exc:
-        failure = str(exc)
+        failure = _transport_failure(exc, "posting the first message")
     if failure is not None:
         return _error(
             502,
@@ -1468,8 +1530,11 @@ async def _create_briefed(
         agent = await _resume_agent(request, HARNESS_AGENTS[body.harness])
         host = await _resume_host(request, body.host)
         workspace = await _session_workspace(request, str(host["host_id"]), body.workspace)
-    except (_NoTarget, httpx.HTTPError) as exc:
+    except _NoTarget as exc:
         return _error(503, CODE_SESSION_NO_TARGET, f"no session was started: {exc}")
+    except httpx.HTTPError as exc:
+        reason = _transport_failure(exc, "finding an agent, host and workspace")
+        return _error(503, CODE_SESSION_NO_TARGET, f"no session was started: {reason}")
     session_labels = {
         labels.STATUS: labels.WORKING,
         labels.STARTED: str(int(time.time())),
@@ -1494,7 +1559,8 @@ async def _create_briefed(
     try:
         created = await _loopback(request, "POST", "/v1/sessions", create)
     except httpx.HTTPError as exc:
-        return _error(502, CODE_SESSION_NOT_CREATED, f"creating the session failed: {exc}")
+        reason = _transport_failure(exc, "creating the session")
+        return _error(502, CODE_SESSION_NOT_CREATED, f"creating the session failed: {reason}")
     snapshot = _json_or_none(created)
     session_id = snapshot.get("id") if isinstance(snapshot, dict) else None
     if created.status_code >= 300 or not isinstance(session_id, str):
@@ -1509,7 +1575,7 @@ async def _create_briefed(
         )
         failure = None if posted.status_code < 300 else f"{posted.status_code} {posted.text[:200]}"
     except httpx.HTTPError as exc:
-        failure = str(exc)
+        failure = _transport_failure(exc, "posting the brief")
     if failure is not None:
         return _error(
             502,
@@ -1563,7 +1629,8 @@ async def gate_reply(
     try:
         response = await _loopback_post(request, f"/v1/sessions/{session_id}/events", event)
     except httpx.HTTPError as exc:
-        return _error(502, CODE_REPLY_NOT_POSTED, f"posting the reply failed: {exc}")
+        reason = _transport_failure(exc, "posting the reply")
+        return _error(502, CODE_REPLY_NOT_POSTED, f"posting the reply failed: {reason}")
     if response.status_code >= 300:
         return _error(
             502,
@@ -1877,16 +1944,32 @@ def _fabric_failure(exc: fabric.FabricError) -> JSONResponse:
 
 
 @router.get("/fabric")
-async def fabric_view() -> dict[str, Any]:
+async def fabric_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any]:
     """Every Fabric capacity the environment names, with its state (:mod:`.fabric`).
 
     Always a 200: a capacity whose Logic App fails carries ``error`` on its own
     row. With none configured, ``note`` says how to turn the page on.
+    ``can_act`` says whether the caller may use the actions, so the page hides
+    them from a non-admin (2026-10-22; the action routes refuse one anyway).
     """
-    return await fabric.overview()
+    answer, can_act = await asyncio.gather(
+        fabric.overview(), shared_accounts_routes.admin_probe(request, user)
+    )
+    return {**answer, "can_act": can_act}
+
+
+_FABRIC_ACTION_WORDS = {
+    "wake": "wake a Fabric capacity",
+    "suspend": "turn off a Fabric capacity",
+    "keepawake": "keep a Fabric capacity awake",
+    "scale": "resize a Fabric capacity",
+}
 
 
 async def _fabric_action(
+    request: Request,
     name: str,
     action: Literal["wake", "suspend", "keepawake", "scale"],
     user: str | None,
@@ -1900,6 +1983,9 @@ async def _fabric_action(
             "Waking or turning off a Fabric capacity needs a signed-in user. "
             "Sign in again, then retry.",
         )
+    # Every action changes the bill, so admin only (2026-10-22, public issues 4 and 19).
+    if (refused := await _admin_only(request, user, _FABRIC_ACTION_WORDS[action])) is not None:
+        return refused
     if action != "keepawake":
         # Pause, Start and resize go through the shared Logic App when it is set
         # up (fabric.py, 2026-10-21); keep awake stays on the capacity's own.
@@ -1987,14 +2073,14 @@ async def _fabric_action(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def fabric_wake(
-    name: str, user: Annotated[str | None, Depends(require_ae_user)]
+    request: Request, name: str, user: Annotated[str | None, Depends(require_ae_user)]
 ) -> dict[str, Any] | JSONResponse:
     """Wake one capacity (the Logic App resumes it only when Paused); never retried.
 
     404 for a name the environment does not configure; a Logic App failure is a
     502, its timeout a 504, each with a sentence that names no secret.
     """
-    return await _fabric_action(name, "wake", user)
+    return await _fabric_action(request, name, "wake", user)
 
 
 @router.post(
@@ -2003,14 +2089,14 @@ async def fabric_wake(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def fabric_suspend(
-    name: str, user: Annotated[str | None, Depends(require_ae_user)]
+    request: Request, name: str, user: Annotated[str | None, Depends(require_ae_user)]
 ) -> dict[str, Any] | JSONResponse:
     """Turn one capacity off (the Logic App suspends it only when Active); never retried.
 
     409 when the capacity has no suspend key, so holders of the shared wake
     link alone can never turn it off; otherwise as :func:`fabric_wake`.
     """
-    return await _fabric_action(name, "suspend", user)
+    return await _fabric_action(request, name, "suspend", user)
 
 
 @router.post(
@@ -2019,6 +2105,7 @@ async def fabric_suspend(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def fabric_keep_awake(
+    request: Request,
     name: str,
     body: KeepAwakeRequest,
     user: Annotated[str | None, Depends(require_ae_user)],
@@ -2030,7 +2117,7 @@ async def fabric_keep_awake(
     the capacity's full row as ``GET`` shows it, with the new ``keepAwakeUntil``,
     ``sleepsAt`` and ``keepAwakeOptions`` (fabric.py ``act``).
     """
-    return await _fabric_action(name, "keepawake", user, body.hours)
+    return await _fabric_action(request, name, "keepawake", user, body.hours)
 
 
 @router.post(
@@ -2039,6 +2126,7 @@ async def fabric_keep_awake(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def fabric_scale(
+    request: Request,
     name: str,
     body: ScaleRequest,
     user: Annotated[str | None, Depends(require_ae_user)],
@@ -2050,7 +2138,7 @@ async def fabric_scale(
     does not have is a 404, and one two capacities share a 409. Billing
     changes at once, so the page asks first. Answers the full row like Wake.
     """
-    return await _fabric_action(name, "scale", user, sku=body.sku)
+    return await _fabric_action(request, name, "scale", user, sku=body.sku)
 
 
 def _databricks_failure(exc: databricks.DatabricksError) -> JSONResponse:
@@ -2080,19 +2168,24 @@ async def azure_cost_view(
 
 
 @router.get("/databricks")
-async def databricks_view() -> dict[str, Any]:
+async def databricks_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any]:
     """The Databricks workspace's warehouses and spend (:mod:`.databricks`).
 
     Always a 200: a listing that fails rides in ``error``. With no credential,
     ``note`` says how to turn the section on. Starts a background spend
     reading only when the warehouse it runs on is already RUNNING and the last
-    attempt is stale; it never starts a warehouse.
+    attempt is stale; it never starts a warehouse. ``can_act`` as on ``/fabric``.
     """
-    return await databricks.overview()
+    answer, can_act = await asyncio.gather(
+        databricks.overview(), shared_accounts_routes.admin_probe(request, user)
+    )
+    return {**answer, "can_act": can_act}
 
 
 async def _databricks_action(
-    warehouse_id: str, action: databricks.Action, user: str | None
+    request: Request, warehouse_id: str, action: databricks.Action, user: str | None
 ) -> dict[str, Any] | JSONResponse:
     if user is None:
         return _error(
@@ -2101,6 +2194,11 @@ async def _databricks_action(
             "Starting or stopping a Databricks warehouse needs a signed-in user. "
             "Sign in again, then retry.",
         )
+    # A running warehouse bills, so admin only (2026-10-22, public issue 4).
+    if (
+        refused := await _admin_only(request, user, f"{action} a Databricks warehouse")
+    ) is not None:
+        return refused
     ws = databricks.workspace()
     if ws is None:
         return _databricks_not_configured()
@@ -2124,7 +2222,7 @@ async def _databricks_action(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def databricks_start(
-    warehouse_id: str, user: Annotated[str | None, Depends(require_ae_user)]
+    request: Request, warehouse_id: str, user: Annotated[str | None, Depends(require_ae_user)]
 ) -> dict[str, Any] | JSONResponse:
     """Start one warehouse; it bills until it auto stops. Never retried.
 
@@ -2132,7 +2230,7 @@ async def databricks_start(
     Databricks failure 502 and its timeout 504, each with a sentence that names
     no secret. Answers the warehouse's row after the call.
     """
-    return await _databricks_action(warehouse_id, "start", user)
+    return await _databricks_action(request, warehouse_id, "start", user)
 
 
 @router.post(
@@ -2141,10 +2239,10 @@ async def databricks_start(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def databricks_stop(
-    warehouse_id: str, user: Annotated[str | None, Depends(require_ae_user)]
+    request: Request, warehouse_id: str, user: Annotated[str | None, Depends(require_ae_user)]
 ) -> dict[str, Any] | JSONResponse:
     """Stop one warehouse; otherwise as :func:`databricks_start`."""
-    return await _databricks_action(warehouse_id, "stop", user)
+    return await _databricks_action(request, warehouse_id, "stop", user)
 
 
 @router.post(
@@ -2153,6 +2251,7 @@ async def databricks_stop(
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
 async def databricks_refresh(
+    request: Request,
     user: Annotated[str | None, Depends(require_ae_user)],
 ) -> dict[str, Any] | JSONResponse:
     """Read spend now, in the background; a query on a stopped warehouse wakes it.
@@ -2167,6 +2266,9 @@ async def databricks_refresh(
             ErrorCode.UNAUTHORIZED,
             "Reading Databricks spend needs a signed-in user. Sign in again, then retry.",
         )
+    # The read can wake a stopped warehouse, so admin only (2026-10-22, public issue 4).
+    if (refused := await _admin_only(request, user, "refresh Databricks spend")) is not None:
+        return refused
     ws = databricks.workspace()
     if ws is None:
         return _databricks_not_configured()
@@ -2187,6 +2289,8 @@ DEBUG_ROUTERS: list[tuple[APIRouter, str, list[str]]] = [
     (shared_accounts_routes.router, "/v1/ae", ["ae"]),
     # No routes: included for its lifespan, which runs the merge watcher (2026-10-21).
     (merge_watch.lifespan_router, "", ["ae"]),
+    # No routes: loads the Azure card's saved reading at boot (2026-10-22).
+    (azure_cost.lifespan_router, "", ["ae"]),
 ]
 
 __all__ = [

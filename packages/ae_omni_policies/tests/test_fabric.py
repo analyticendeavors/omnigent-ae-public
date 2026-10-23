@@ -176,6 +176,11 @@ async def test_status_lists_each_capacity_isolated_and_cached(
         )
         first = await client.get("/v1/ae/fabric")
         second = await client.get("/v1/ae/fabric")
+        # An answer with an error in it is stale at once: the second GET returned
+        # it unchanged and started the refresh that asks the failing one again.
+        refresh = fabric.refresh_task()
+        assert refresh is not None
+        await refresh
     assert first.status_code == 200
     rows = {row["name"]: row for row in first.json()["capacities"]}
     # The old-shape Logic App answer still reads, with every new field null.
@@ -1974,3 +1979,160 @@ async def test_a_capacity_in_an_unread_subscription_keeps_its_last_known_row() -
     assert answer["fleetError"].startswith("Azure did not answer for 1 subscription;")
     for message in (answer["fleetError"], by["salesdemo"]["error"]):
         assert other_sub not in message.lower()
+
+
+# 2026-10-22: GET answers the last known result and refreshes in the background.
+
+
+def _age_last(seconds: float) -> None:
+    """Make the kept answer *seconds* older, as if that long had passed."""
+    assert fabric._last is not None
+    taken, answer = fabric._last
+    fabric._last = (taken - seconds, answer)
+
+
+def _counting(
+    states: list[str], gate: asyncio.Event | None = None, reached: asyncio.Event | None = None
+) -> tuple[httpx.MockTransport, list[int]]:
+    """A transport answering *states* in turn; calls after the first wait on *gate*."""
+    calls: list[int] = []
+
+    async def handler(_request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        if gate is not None and len(calls) > 1:
+            if reached is not None:
+                reached.set()
+            await gate.wait()
+        return httpx.Response(200, json=_answer(states[min(len(calls), len(states)) - 1]))
+
+    return httpx.MockTransport(handler), calls
+
+
+async def test_a_warm_get_answers_without_calling_the_transport() -> None:
+    env = {"AE_FABRIC_WAKE_URL_AETRAINING": WAKE_URL}
+    transport, calls = _counting(["Active"])
+    first = await fabric.overview(env, transport=transport)  # cold: waits live
+    assert len(calls) == 1
+    before = fabric.refresh_task()
+    again = await fabric.overview(env, transport=transport)
+    assert again == first
+    assert len(calls) == 1
+    assert fabric.refresh_task() is before  # no refresh started
+
+
+async def test_a_stale_get_answers_the_cache_and_starts_exactly_one_refresh() -> None:
+    env = {"AE_FABRIC_WAKE_URL_AETRAINING": WAKE_URL}
+    gate = asyncio.Event()
+    reached = asyncio.Event()
+    transport, calls = _counting(["Paused", "Active"], gate, reached)
+    first = await fabric.overview(env, transport=transport)
+    assert first["capacities"][0]["state"] == "Paused"
+    _age_last(fabric.STATUS_TTL_S + 1)
+    fabric._status_cache.clear()  # the per-capacity cache has expired as well
+    answers = [await fabric.overview(env, transport=transport) for _ in range(3)]
+    assert all(answer["capacities"][0]["state"] == "Paused" for answer in answers)
+    task = fabric.refresh_task()
+    assert task is not None and not task.done()
+    await reached.wait()
+    assert len(calls) == 2  # the cold read plus ONE refresh, however many polls
+    gate.set()
+    await task
+    fresh = await fabric.overview(env, transport=transport)
+    assert fresh["capacities"][0]["state"] == "Active"
+    assert len(calls) == 2
+
+
+async def test_forget_makes_the_next_get_wait_for_a_live_answer() -> None:
+    env = {"AE_FABRIC_WAKE_URL_AETRAINING": WAKE_URL}
+    transport, calls = _counting(["Paused", "Waking"])
+    assert (await fabric.overview(env, transport=transport))["capacities"][0]["state"] == "Paused"
+    fabric.forget("aetraining")  # what act() does after a wake
+    after = await fabric.overview(env, transport=transport)
+    assert after["capacities"][0]["state"] == "Waking"
+    assert len(calls) == 2
+
+
+async def test_a_refresh_begun_before_an_action_does_not_write_back() -> None:
+    env = {"AE_FABRIC_WAKE_URL_AETRAINING": WAKE_URL}
+    gate = asyncio.Event()
+    reached = asyncio.Event()
+    transport, _calls = _counting(["Paused", "Paused", "Waking"], gate, reached)
+    await fabric.overview(env, transport=transport)
+    _age_last(fabric.STATUS_TTL_S + 1)
+    fabric._status_cache.clear()
+    await fabric.overview(env, transport=transport)  # starts the refresh
+    task = fabric.refresh_task()
+    assert task is not None
+    await reached.wait()
+    fabric.forget("aetraining")  # an action lands while the refresh is out
+    gate.set()
+    await task
+    assert fabric._last is None  # the older answer was not kept
+    live = await fabric.overview(env, transport=transport)
+    assert live["capacities"][0]["state"] == "Waking"
+
+
+async def test_a_failed_refresh_keeps_the_last_rows_and_shows_the_error() -> None:
+    env = {"AE_FABRIC_WAKE_URL_AETRAINING": WAKE_URL}
+    healthy = [True]
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        if healthy[0]:
+            return httpx.Response(200, json=_answer("Active"))
+        return httpx.Response(500, text="down")
+
+    transport = httpx.MockTransport(handler)
+    await fabric.overview(env, transport=transport)
+    healthy[0] = False
+    _age_last(fabric.STATUS_TTL_S + 1)
+    fabric._status_cache.clear()
+    await fabric.overview(env, transport=transport)
+    task = fabric.refresh_task()
+    assert task is not None
+    await task
+    row = (await fabric.overview(env, transport=transport))["capacities"][0]
+    assert row["state"] == "Active"  # the last good state stays
+    assert row["error"]  # and the failure is shown on the row
+
+
+def test_failed_rows_keep_the_last_good_fields_by_name_and_across_failures() -> None:
+    # A failed probe's row has no capacityId, so it matches the good row by name;
+    # a second failure in a row still keeps the good fields (review of 2026-10-22).
+    good = {"name": "aetraining", "capacityId": "/subscriptions/x/c", "state": "Active"}
+    failed = {"name": "aetraining", "state": "Unknown", "error": "down"}
+    once = fabric._keep_last_rows({"capacities": [good]}, {"capacities": [failed]})
+    assert once["capacities"] == [{**good, "error": "down"}]
+    again = fabric._keep_last_rows(once, {"capacities": [{**failed, "error": "still down"}]})
+    assert again["capacities"] == [{**good, "error": "still down"}]
+
+
+def test_a_failed_row_never_borrows_a_name_two_capacities_share() -> None:
+    first = {"name": "dup", "capacityId": "/subscriptions/a/c", "state": "Active"}
+    second = {"name": "dup", "capacityId": "/subscriptions/b/c", "state": "Paused"}
+    failed = {"name": "dup", "state": "Unknown", "error": "down"}
+    kept = fabric._keep_last_rows({"capacities": [first, second]}, {"capacities": [failed]})
+    assert kept["capacities"][0] == failed
+
+
+async def test_a_bug_in_the_refresh_is_logged_by_class_and_never_sticks(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    env = {"AE_FABRIC_WAKE_URL_AETRAINING": WAKE_URL}
+    transport, _calls = _counting(["Active"])
+    await fabric.overview(env, transport=transport)
+    _age_last(fabric.STATUS_TTL_S + 1)
+
+    async def boom(*_args: object, **_kwargs: object) -> dict[str, object]:
+        raise RuntimeError(WAKE_URL)
+
+    monkeypatch.setattr(fabric, "_live_overview", boom)
+    caplog.set_level(logging.DEBUG)
+    await fabric.overview(env, transport=transport)
+    task = fabric.refresh_task()
+    assert task is not None
+    await task
+    assert "RuntimeError" in caplog.text
+    _clean(caplog.text)
+    _age_last(fabric.STATUS_TTL_S + 1)
+    await fabric.overview(env, transport=transport)  # a new refresh may start
+    assert fabric.refresh_task() is not task

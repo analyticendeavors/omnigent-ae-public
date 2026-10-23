@@ -381,6 +381,22 @@ async def test_gate_reply_failure_leaves_the_gate_open(
     assert _labels(session_id)[labels.GATE] == "open"
 
 
+async def test_a_transport_failure_never_shows_the_loopback_url(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # httpx names the URL it tried; the caller gets the step and the kind of failure only.
+    async def down(*_args: object, **_kwargs: object) -> httpx.Response:
+        raise httpx.ConnectError("cannot connect to http://127.0.0.1:8000/v1/sessions/x/events")
+
+    monkeypatch.setattr(router_module, "_loopback_post", down)
+    session_id = await _session(client, "Gated", {labels.GATE: "open"})
+    response = await client.post(f"/v1/ae/gate/{session_id}/reply", json={"route": "B"})
+    assert response.status_code == 502
+    message = response.json()["error"]["message"]
+    assert message.startswith("posting the reply failed: could not reach the server; try again")
+    assert "127.0.0.1" not in message
+
+
 async def test_gate_reply_rejects_unknown_sessions_and_routes(client: httpx.AsyncClient) -> None:
     absent = await client.post(f"/v1/ae/gate/{ABSENT_SESSION}/reply", json={"route": "A"})
     assert absent.status_code == 404
@@ -442,13 +458,33 @@ async def test_gate_reply_needs_an_open_gate(
 # ── Phase 5 (2026-09-23): the two routes the MCP server's worker tools need ──
 
 
-async def test_capacity_carries_the_clock(client: httpx.AsyncClient) -> None:
+async def test_capacity_carries_the_clock(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AE_TASK_STORE_TZ", raising=False)
     response = await client.get("/v1/ae/capacity")
     assert response.status_code == 200, response.text
     body = response.json()
+    assert body["timezone"] == "UTC", "the fallback since 2026-10-22"
+    monkeypatch.setenv("AE_TASK_STORE_TZ", "America/Los_Angeles")
+    body = (await client.get("/v1/ae/capacity")).json()
     assert body["timezone"] == "America/Los_Angeles"
     assert body["now"].startswith(body["today"])
     assert len(body["today"]) == 10
+
+
+async def test_schedule_defaults_name_the_server_clock_and_project(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AE_TASK_STORE_TZ", raising=False)
+    monkeypatch.delenv("OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT", raising=False)
+    bare = await client.get("/v1/ae/schedule-defaults")
+    assert bare.status_code == 200, bare.text
+    assert bare.json() == {"timezone": "UTC", "project": None}
+    monkeypatch.setenv("AE_TASK_STORE_TZ", "America/Los_Angeles")
+    monkeypatch.setenv("OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT", " Automation Notes ")
+    body = (await client.get("/v1/ae/schedule-defaults")).json()
+    assert body == {"timezone": "America/Los_Angeles", "project": "Automation Notes"}
 
 
 async def test_lot_tags_maps_the_store(client: httpx.AsyncClient) -> None:

@@ -166,6 +166,24 @@ describe("the tile", () => {
     expect(azureTile(first, true, false, null)).toMatchObject({ note: "", health: "ok" });
   });
 
+  it("says the spike check is unavailable when a counted row has a note, health unchanged", () => {
+    const sub = {
+      id: "a",
+      name: "Juniper Production",
+      spent: 268,
+      currency: "USD",
+      counted: true,
+      error: null,
+      note: "Spike check unavailable: x. Totals are complete.",
+    };
+    const tile = azureTile(view({ subscriptions: [sub] }), true, false, null);
+    expect(tile).toMatchObject({
+      health: "ok",
+      note: "spike check unavailable",
+      summary: "$412 this month · spike check unavailable",
+    });
+  });
+
   it("counts flags and goes amber", () => {
     const one = azureTile(view({ flags: [flag] }), true, false, null);
     expect(one).toMatchObject({
@@ -275,6 +293,23 @@ describe("the card", () => {
     expect(node.querySelector(".azure-sub-err")?.textContent).toBe(
       "Cost Management is rate limiting.",
     );
+  });
+
+  it("shows a subscription's note as muted text and does not count it as not read", async () => {
+    const sub = {
+      id: "b",
+      name: "Juniper Dev",
+      spent: 97,
+      currency: "USD",
+      counted: true,
+      error: null,
+      note: "Spike check unavailable: Cost Management answered 500. Totals are complete.",
+    };
+    const { context } = stubContext([ok(answer(view({ subscriptions: [sub] })))]);
+    const node = await mount(context);
+    expect(node.querySelector(".azure-sub-caveat")?.textContent).toContain("Totals are complete.");
+    expect(node.querySelector(".azure-sub-err")).toBeNull();
+    expect(node.textContent).not.toContain("not read");
   });
 
   it("shows a subscription billed in pounds as its own line, outside the total", async () => {

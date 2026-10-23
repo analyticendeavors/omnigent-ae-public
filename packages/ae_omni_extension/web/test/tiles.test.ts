@@ -104,6 +104,7 @@ const databricks = (
   monthUsd: number | null,
 ): DatabricksOverview => ({
   configured: true,
+  can_act: true,
   note: null,
   host: null,
   error: null,
@@ -243,6 +244,7 @@ describe("the words", () => {
     const active = fabricTile(
       {
         configured: true,
+        can_act: true,
         capacities: [
           {
             name: "aetraining",
@@ -391,7 +393,7 @@ describe("the board", () => {
       "Host connected",
     );
     const capacities = [{ name: "a", state: "Active", can_suspend: true }];
-    setTile(fabricTile({ configured: true, capacities }, null, NOW));
+    setTile(fabricTile({ configured: true, capacities, can_act: true }, null, NOW));
     setTile(databricksTile(databricks("STOPPED", 12.4), null));
     arrange(board, all, 1);
     // Each part names what it is (2026-10-20 review).

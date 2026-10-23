@@ -2,9 +2,11 @@
 
 AE's own runbook for it lives in a private repository (moved out of deploy/ on
 2026-10-21). What a checkout can prove about it:
-the allowlist in config/server.env.example, read by upstream's own parser and
-policy, admits both origins and nothing near them; the base URL stays the
-tailnet one, so hosts, invite and magic links keep using it; and the upstream
+the remote allowlist config/server.env.example shows (commented since
+2026-10-22, when the example's active values became the Quick start's
+127.0.0.1), read by upstream's own parser and policy, admits both origins and
+nothing near them; the tailnet origin leads it, so hosts, invite and magic
+links keep using the base URL; and the upstream
 iOS shell still refuses a cross-origin redirect in its main frame, which is
 the fact the doc's Access decision rests on. A sync that changes that code
 fails here, so the runbook gets reread rather than silently going stale.
@@ -23,6 +25,7 @@ HOST_EXAMPLE = ROOT / "config" / "host.env.example"
 IOS_WEBVIEW = ROOT / "upstream" / "web" / "ios" / "Omnigent" / "OmnigentWebView.swift"
 
 PUBLIC_ORIGIN = "https://omnigent.<your-domain>"
+TAILNET_ORIGIN = "https://<box-hostname>.<tailnet>.ts.net:8010"
 
 
 def _active(path: Path) -> dict[str, str]:
@@ -35,10 +38,19 @@ def _active(path: Path) -> dict[str, str]:
     return out
 
 
+def _remote_allowlist() -> str:
+    """The commented two-name allowlist the example shows for a tailnet plus a public hostname."""
+    for raw in SERVER_EXAMPLE.read_text().splitlines():
+        m = re.match(r"^#\s*OMNIGENT_WS_ALLOWED_ORIGINS=(.*,.*)$", raw.strip())
+        if m:
+            return m.group(1).strip()
+    raise AssertionError("server.env.example shows no two-name OMNIGENT_WS_ALLOWED_ORIGINS")
+
+
 @pytest.fixture
 def allowlist(monkeypatch: pytest.MonkeyPatch) -> frozenset[str]:
     ws_origin = pytest.importorskip("omnigent.server.ws_origin")
-    value = _active(SERVER_EXAMPLE)["OMNIGENT_WS_ALLOWED_ORIGINS"]
+    value = _remote_allowlist()
     monkeypatch.setenv("OMNIGENT_WS_ALLOWED_ORIGINS", value)
     return ws_origin.parse_allowed_origins()
 
@@ -46,15 +58,14 @@ def allowlist(monkeypatch: pytest.MonkeyPatch) -> frozenset[str]:
 def test_the_allowlist_holds_exactly_the_tailnet_and_the_public_origin(
     allowlist: frozenset[str],
 ) -> None:
-    base = _active(SERVER_EXAMPLE)["OMNIGENT_ACCOUNTS_BASE_URL"]
-    assert allowlist == {base, PUBLIC_ORIGIN}
+    assert allowlist == {TAILNET_ORIGIN, PUBLIC_ORIGIN}
 
 
 @pytest.mark.parametrize(
     ("origin", "allowed"),
     [
         (PUBLIC_ORIGIN, True),
-        ("https://<box-hostname>.<tailnet>.ts.net:8010", True),
+        (TAILNET_ORIGIN, True),
         # Non-browser clients (the host, the runner) send no Origin at all.
         (None, True),
         # Exact match only: the scheme, a trailing slash, a port or a
@@ -80,11 +91,13 @@ def test_the_base_url_and_the_hosts_stay_on_the_tailnet() -> None:
     host = _active(HOST_EXAMPLE)
     # Invite, magic and device-login links are built from the base URL; hosts
     # log in with it and never cross Cloudflare Access.
-    assert ".ts.net:8010" in server["OMNIGENT_ACCOUNTS_BASE_URL"]
     assert host["OMNIGENT_SERVER_URL"] == server["OMNIGENT_ACCOUNTS_BASE_URL"]
-    # Both names are https, so the __Host- session cookie works on each; it is
-    # host-only, so each name keeps its own login.
-    assert server["OMNIGENT_ACCOUNTS_BASE_URL"].startswith("https://")
+    # The remote allowlist leads with the tailnet origin the base URL takes
+    # there, and both names are https, so the __Host- session cookie works on
+    # each; it is host-only, so each name keeps its own login.
+    remote = _remote_allowlist().split(",")
+    assert remote[0] == TAILNET_ORIGIN
+    assert all(origin.startswith("https://") for origin in remote)
 
 
 def test_the_ios_shell_still_refuses_cross_origin_main_frame_navigation() -> None:

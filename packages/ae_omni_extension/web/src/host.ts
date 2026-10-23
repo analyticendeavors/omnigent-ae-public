@@ -126,7 +126,8 @@ export function noticeTexts(status: HostStatus): Array<{ text: string; kind: "er
       kind: "error",
       text:
         "The server is turning the host away (HTTP 403), so sessions cannot start. " +
-        "The box sends a sign-in link on its own after 30 rejections; the button sends one now.",
+        "The box sends a sign-in link on its own after 30 rejections" +
+        (status.can_act ? "; the button sends one now." : "."),
     });
   } else if (status.state === "sent") {
     items.push({
@@ -140,9 +141,13 @@ export function noticeTexts(status: HostStatus): Array<{ text: string; kind: "er
       kind: "error",
       text:
         status.reason === "restart"
-          ? "The sign-in worked, but ae-omnigent-host.service did not restart. The button " +
-            "signs in again and retries the restart."
-          : "No sign-in arrived. The button sends a fresh link.",
+          ? "The sign-in worked, but ae-omnigent-host.service did not restart. " +
+            (status.can_act
+              ? "The button signs in again and retries the restart."
+              : "An admin can sign in again and retry the restart.")
+          : status.can_act
+            ? "No sign-in arrived. The button sends a fresh link."
+            : "No sign-in arrived. An admin can send a fresh link.",
     });
   }
   if (status.message) items.push({ kind: "info", text: status.message });
@@ -158,10 +163,11 @@ export function noticeTexts(status: HostStatus): Array<{ text: string; kind: "er
   return items;
 }
 
-/** The button's label, or null when the card shows none (connected, or nothing to ask). */
+/** The button's label, or null when the card shows none (connected, nothing to ask, or not an admin). */
 export function buttonLabel(status: HostStatus): string | null {
+  if (!status.can_act) return null;
   if (status.requested) return "Asking the box...";
-  return status.can_request ? ASK_LABEL : null;
+  return status.can_request && status.can_act ? ASK_LABEL : null;
 }
 
 /** The Box host tile: a dot and the state, the host's name under it. */

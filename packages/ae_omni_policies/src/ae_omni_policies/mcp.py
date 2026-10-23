@@ -372,7 +372,7 @@ SCHEDULE_CHECKIN_SCHEMA: dict[str, Any] = {
         },
         "until": {
             "type": "string",
-            "description": "Last day to check in, YYYY-MM-DD in Reid's timezone. Optional.",
+            "description": "Last day to check in, YYYY-MM-DD in the server's timezone. Optional.",
         },
         "session_id": {
             "type": "string",
@@ -645,7 +645,9 @@ class OmniClient:
         try:
             response = await self._client().request(method, path, json=json_body, params=params)
         except httpx.HTTPError as exc:
-            reason = str(exc) or exc.__class__.__name__
+            # The class name only: an httpx error's text can carry the request
+            # URL and its query, and this answer goes to the agent.
+            reason = exc.__class__.__name__
             return 0, {
                 "error": {"message": f"{self.settings.server_url} did not answer: {reason}"}
             }
@@ -867,6 +869,7 @@ async def schedule_checkin(client: OmniClient, args: dict[str, Any]) -> Any:
             if response.status_code != 200:
                 return {"error": f"Could not pause the check-in: {_message_of(response)}"}
             return {"name": schedules.CHECKIN_NAME, "id": existing["id"], "action": "paused"}
+        zone, _ = await schedules.server_defaults(http)
         until_raw = str(args.get("until") or "").strip()
         try:
             until = date.fromisoformat(until_raw) if until_raw else None
@@ -875,6 +878,7 @@ async def schedule_checkin(client: OmniClient, args: dict[str, Any]) -> Any:
                 until=until,
                 session_id=str(args.get("session_id") or "").strip() or None,
                 note=str(args.get("note") or "").strip() or None,
+                timezone=zone,
             )
         except ValueError as exc:
             return {"error": f"Nothing was scheduled: {exc}"}
@@ -902,8 +906,10 @@ async def schedule_checkin(client: OmniClient, args: dict[str, Any]) -> Any:
                 return _checkin_answer(existing, "unchanged")
             response = await http.patch(f"/v1/scheduled-tasks/{existing['id']}", json=drift)
             action = "updated"
-    except (schedules.SeedError, httpx.HTTPError) as exc:
+    except schedules.SeedError as exc:
         return {"error": f"Could not reach the scheduled tasks: {exc}"}
+    except httpx.HTTPError as exc:
+        return {"error": f"Could not reach the scheduled tasks: {exc.__class__.__name__}"}
     if response.status_code != 200:
         return {"error": f"Could not save the check-in: {_message_of(response)}"}
     return _checkin_answer(response.json(), action)
@@ -1122,6 +1128,9 @@ def create_server(client: OmniClient) -> Server:
             return _text(await handler(client, dict(arguments or {})))
         except Exception as exc:
             _logger.exception("tool %s failed", name)
+            if isinstance(exc, httpx.HTTPError):
+                # Same as call(): an httpx error's text can carry the URL.
+                return _text({"error": f"{name} failed: {exc.__class__.__name__}"})
             return _text({"error": f"{name} failed: {exc.__class__.__name__}: {exc}"})
 
     return server

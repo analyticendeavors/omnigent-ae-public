@@ -220,6 +220,13 @@ function applyFold(card: HTMLElement, phone: boolean): void {
  * Put the cards in *n* columns of *board*, keeping the focus where it was.
  * *force* lays them out again even when the column count is unchanged (a
  * saved arrangement changed).
+ *
+ * The plain "admin-arranged" event fires only when the columns were replaced
+ * (2026-10-22): the column count, a saved arrangement and the phone switch all
+ * change only then. A scrollbar that appears mid-drag narrows the page and
+ * calls this again at the same column count, and a drag must survive that;
+ * only a rebuild takes its column away. A tile changing health does not come
+ * through here (mountBoard refolds), only a width change does.
  */
 export function arrange(
   board: HTMLElement,
@@ -227,7 +234,8 @@ export function arrange(
   n: 1 | 2 | 3,
   force = false,
 ): void {
-  if (force || board.dataset.columns !== String(n)) {
+  const rebuilt = force || board.dataset.columns !== String(n);
+  if (rebuilt) {
     const focused = document.activeElement as HTMLElement | null;
     const known = Object.keys(cards) as CardId[];
     const columns = arrangement(n, LAYOUTS, known).map((ids) =>
@@ -241,7 +249,7 @@ export function arrange(
   }
   for (const card of Object.values(cards)) applyFold(card, n === 1);
   // The Reset layout button shows or hides with the column count (fabric.ts).
-  board.dispatchEvent(new Event("admin-arranged"));
+  if (rebuilt) board.dispatchEvent(new Event("admin-arranged"));
 }
 
 /**

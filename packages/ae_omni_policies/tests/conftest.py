@@ -41,6 +41,11 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("AE_MERGE_WATCH", "0")
     from ae_omni_policies import auth, prs, router, slot_cap, taskstore
 
+    async def accepted(_request: Any, _user: str) -> bool:
+        return True
+
+    # The app-provider check (GET /v1/me) has its own tests in test_auth_gates.py.
+    monkeypatch.setattr(auth, "session_check", accepted)
     auth.reset_provider_cache()
     slot_cap.reset_pending_claims()
     taskstore.reset_icon_set()

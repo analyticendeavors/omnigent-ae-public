@@ -17,10 +17,10 @@ Collapsed, the dock is one line after the folder and pull request chips: the mos
 
 <p align="center"><img src="../media/dock-open.jpg" alt="The opened list"></p>
 
-The caret at the end of the strip opens every waiting item as a tray above the bar: questions first, then a usage limit, pull requests ready to merge, drafts and the rest, oldest first within each kind. A badge opens the list at its kind, and Escape closes it.
+The caret at the end of the strip opens every waiting item as a tray above the bar: questions first, then a usage limit, pull requests ready to merge, drafts and the rest, oldest first within each kind. A badge opens the list at its kind, and Escape closes it. While the tray is open, a chat scrolled to the bottom lifts above it, so the last lines stay in view.
 
 **Where:** The caret at the end of the strip, or any badge.<br>
-**Built from:** core patches [`0137`](../../patches/0137-ae-patch-Add-an-action-dock-above-the-composer-for-q.patch), [`0141`](../../patches/0141-ae-patch-Put-the-action-dock-inside-the-composer-s-w.patch)
+**Built from:** core patches [`0137`](../../patches/0137-ae-patch-Add-an-action-dock-above-the-composer-for-q.patch), [`0141`](../../patches/0141-ae-patch-Put-the-action-dock-inside-the-composer-s-w.patch), [`0159`](../../patches/0159-ae-patch-Lift-the-chat-above-the-open-action-dock-tr.patch)
 
 ## A waiting question
 

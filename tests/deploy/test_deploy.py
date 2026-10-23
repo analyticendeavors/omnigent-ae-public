@@ -141,11 +141,13 @@ def test_override_reads_settings_then_secrets() -> None:
     assert env_file == [SERVER_SETTINGS_REF, SERVER_SECRETS_REF]
 
 
-def test_override_binds_data_and_postgres_under_secure() -> None:
+def test_override_binds_data_and_postgres_under_the_data_dir() -> None:
+    # AE_DATA_DIR moves both (2026-10-22, README.md "Quick start"); unset, the
+    # box's /secure/omnigent as before.
     services = _override()["services"]
-    assert services["omnigent"]["volumes"] == ["/secure/omnigent/data:/data"]
+    assert services["omnigent"]["volumes"] == ["${AE_DATA_DIR:-/secure/omnigent}/data:/data"]
     assert services["postgres"]["volumes"] == [
-        "/secure/omnigent/postgres:/var/lib/postgresql/data"
+        "${AE_DATA_DIR:-/secure/omnigent}/postgres:/var/lib/postgresql/data"
     ]
     assert services["omnigent"]["extra_hosts"] == ["host.docker.internal:host-gateway"]
 
@@ -164,20 +166,28 @@ def test_override_touches_no_other_service_keys() -> None:
         "extra_hosts",
         "ports",
         "volumes",
-        "networks",
     }
 
 
-def test_override_gives_each_host_container_its_own_internal_network() -> None:
+def test_override_names_no_host_network() -> None:
+    """Per-user host networks are one machine's list (2026-10-22): they live in
+    the gitignored config/compose.local.yml, never in the shipped overlay."""
+    override = _override()
+    assert "networks" not in override
+    assert "networks" not in override["services"]["omnigent"]
+    assert "config/compose.local.yml" in (ROOT / ".gitignore").read_text()
+
+
+def test_local_compose_example_gives_each_host_container_its_own_internal_network() -> None:
     """The server joins one internal network per containerised user host
     (2026-10-20); it keeps the default network (Postgres and the way out), and
     Postgres joins none of them."""
-    override = _override()
+    override = yaml.safe_load((CONFIG / "compose.local.yml.example").read_text())
     server_networks = override["services"]["omnigent"]["networks"]
     assert "default" in server_networks
     host_networks = {name for name in server_networks if name != "default"}
     assert host_networks, "no host-<user> network is declared"
-    assert "networks" not in override["services"]["postgres"]
+    assert "postgres" not in override["services"]
     for name in host_networks:
         assert name.startswith("host-"), name
         network = override["networks"][name]
@@ -724,6 +734,9 @@ def test_compose_wrapper_names_both_files_and_both_compose_files() -> None:
         '--env-file "$SERVER_SECRETS"',
         '-f "$UPSTREAM_COMPOSE"',
         '-f "$OVERRIDE"',
+        '-f "$LOCAL_COMPOSE"',
+        'config/compose.local.yml"',
+        "config/secrets.env",
         "/secure/env/omnigent-ae.env",
         "deploy/docker-compose.override.yml",
         "docker-compose.yaml",
@@ -737,6 +750,117 @@ def test_compose_wrapper_names_both_files_and_both_compose_files() -> None:
         env={**os.environ, "AE_SERVER_SETTINGS": "/nonexistent/server.env"},
     )
     assert missing.returncode == 1 and "config/server.env.example" in missing.stderr
+
+
+def _compose_args(
+    tmp_path: Path,
+    env: dict[str, str],
+    command: tuple[str, ...] = ("config",),
+    expect_refusal: bool = False,
+) -> list[str]:
+    """What compose.sh hands docker, from a copy of the checkout with a stub docker."""
+    root = tmp_path / "checkout"
+    (root / "deploy").mkdir(parents=True)
+    (root / "scripts").mkdir()
+    (root / "upstream" / "deploy" / "docker").mkdir(parents=True)
+    shutil.copy2(DEPLOY / "compose.sh", root / "deploy" / "compose.sh")
+    shutil.copy2(ROOT / "scripts" / "_lib.sh", root / "scripts" / "_lib.sh")
+    (root / "upstream" / "deploy" / "docker" / "docker-compose.yaml").write_text("services: {}\n")
+    (root / "config").mkdir()
+    (root / "config" / "server.env").write_text("OMNIGENT_PORT=8010\n")
+    for name, body in env.items():
+        if name.startswith("config/"):
+            (root / name).write_text(body)
+    stub = tmp_path / "bin"
+    stub.mkdir()
+    # `ps` answers with $FAKE_PS_OWNERS (the config files of a running project
+    # named omnigent),
+    # `network ls` with nothing; `compose` prints the arguments it was given.
+    (stub / "docker").write_text(
+        '#!/bin/sh\ncase "$1" in\n'
+        '  ps) case "$*" in *"project=omnigent "*) printf "%s\\n" "${FAKE_PS_OWNERS:-}" ;; esac; exit 0 ;;\n'
+        "  network) exit 0 ;;\n"
+        'esac\nprintf "%s\\n" "$@"\n'
+    )
+    (stub / "docker").chmod(0o755)
+    run_env = {
+        k: v
+        for k, v in os.environ.items()
+        if not k.startswith(("AE_SERVER_", "COMPOSE_PROJECT_NAME", "FAKE_PS_OWNERS"))
+        and k != "PATCH_ROOT"
+    }
+    run_env |= {k: v for k, v in env.items() if not k.startswith("config/")}
+    run_env["PATH"] = f"{stub}:{run_env['PATH']}"
+    result = subprocess.run(
+        [str(root / "deploy" / "compose.sh"), *command],
+        capture_output=True,
+        text=True,
+        check=False,
+        env=run_env,
+    )
+    if expect_refusal:
+        assert result.returncode == 1, result.stdout
+        return [result.stderr]
+    assert result.returncode == 0, result.stderr
+    return [line.replace(str(root), "<root>") for line in result.stdout.splitlines()]
+
+
+def test_compose_wrapper_prefers_a_checkout_secrets_file_and_adds_the_local_compose(
+    tmp_path: Path,
+) -> None:
+    """config/secrets.env wins over /secure, so a try-out checkout on the box never
+    starts on the live secrets; config/compose.local.yml rides along when it
+    exists (2026-10-22, README.md "Quick start")."""
+    args = _compose_args(
+        tmp_path,
+        {
+            "config/secrets.env": "POSTGRES_PASSWORD=test-only\n",
+            "config/compose.local.yml": "services: {}\n",
+        },
+    )
+    assert args[args.index("--env-file", 2) + 1] == "<root>/config/secrets.env"
+    files = [args[i + 1] for i, arg in enumerate(args) if arg == "-f"]
+    assert files[-1] == "<root>/config/compose.local.yml"
+    assert files[1].endswith("deploy/docker-compose.override.yml")
+
+
+def test_compose_wrapper_takes_named_secrets_and_no_local_compose(tmp_path: Path) -> None:
+    secrets = tmp_path / "named.env"
+    secrets.write_text("POSTGRES_PASSWORD=test-only\n")
+    args = _compose_args(
+        tmp_path,
+        {"config/secrets.env": "POSTGRES_PASSWORD=other\n", "AE_SERVER_SECRETS": str(secrets)},
+    )
+    assert args[args.index("--env-file", 2) + 1] == str(secrets)
+    assert not any(arg.endswith("compose.local.yml") for arg in args)
+
+
+def test_compose_wrapper_refuses_a_project_another_checkout_runs(tmp_path: Path) -> None:
+    """A Quick start beside the full deploy must not recreate or stop the running
+    stack, which upstream's compose file names `omnigent` too (from the Quick
+    start's review, 2026-10-22)."""
+    other = "/srv/deploy/upstream/deploy/docker/docker-compose.yaml,/srv/deploy/deploy/docker-compose.override.yml"
+    base = {"config/secrets.env": "POSTGRES_PASSWORD=test-only\n", "FAKE_PS_OWNERS": other}
+    for verb in (("up", "-d"), ("down",), ("restart", "omnigent")):
+        (err,) = _compose_args(tmp_path / verb[0], base, verb, expect_refusal=True)
+        assert "already runs from another checkout" in err and "COMPOSE_PROJECT_NAME" in err
+    # Read-only commands and another project name go through.
+    assert _compose_args(tmp_path / "config", base)[0] == "compose"
+    renamed = base | {"COMPOSE_PROJECT_NAME": "omnigent-try"}
+    assert "up" in _compose_args(tmp_path / "renamed", renamed, ("up", "-d"))
+    flagged = _compose_args(tmp_path / "flag", base, ("-p", "omnigent-try", "up", "-d"))
+    assert "omnigent-try" in flagged
+
+
+def test_compose_wrapper_lets_its_own_checkout_through(tmp_path: Path) -> None:
+    # The box's server and Postgres were last created from two different
+    # checkouts; one container from this one is enough.
+    own = str(tmp_path / "own" / "checkout" / "deploy" / "docker-compose.override.yml")
+    owners = f"/elsewhere/deploy/docker-compose.override.yml\nupstream.yaml,{own}"
+    args = _compose_args(
+        tmp_path / "own", {"FAKE_PS_OWNERS": owners, "config/secrets.env": "X=1\n"}, ("up", "-d")
+    )
+    assert args[-2:] == ["up", "-d"]
 
 
 def test_install_host_uses_uv_and_the_pinned_submodule() -> None:
@@ -799,8 +923,6 @@ SERVER_VARS = {
     "OMNIGENT_OIDC_SESSION_TTL_HOURS",
     "OMNIGENT_OIDC_CLIENT_SECRET",
     "OMNIGENT_OIDC_COOKIE_SECRET",
-    "AE_FABRIC_WAKE_URL_AETRAINING",
-    "AE_FABRIC_SUSPEND_KEY_AETRAINING",
     "AE_FABRIC_CAPACITIES_URL",
     "AE_FABRIC_CAPACITIES_KEY",
 }
@@ -820,8 +942,6 @@ SECRET_VARS = {
     "OMNIGENT_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "ANTHROPIC_API_KEY",
-    "AE_FABRIC_WAKE_URL_AETRAINING",
-    "AE_FABRIC_SUSPEND_KEY_AETRAINING",
     "AE_FABRIC_CAPACITIES_URL",
     "AE_FABRIC_CAPACITIES_KEY",
 }
@@ -882,24 +1002,31 @@ def test_env_examples_agree_with_the_override_and_the_units() -> None:
     server, _ = _env_example(CONFIG / "server.env.example")
     host, _ = _env_example(CONFIG / "host.env.example")
     assert server["OMNIGENT_PORT"] == "8010"
-    # 90 days, not upstream's 30, so a login made before a three-week trip
+    # 90 days, not upstream's 30, so a login made before a long absence
     # outlasts it (2026-09-24, deploy/README.md "Re-login").
     assert server["OMNIGENT_GRANT_MAX_LIFETIME_DAYS"] == "90"
-    assert server["OMNIGENT_ACCOUNTS_BASE_URL"].endswith(":8010")
-    # The tailnet origin leads the allowlist; the Cloudflare one follows it
-    # (tests/deploy/test_public_hostname.py, 2026-09-24).
-    assert (
-        server["OMNIGENT_WS_ALLOWED_ORIGINS"].split(",")[0] == server["OMNIGENT_ACCOUNTS_BASE_URL"]
+    # The Quick start's server (2026-10-22): this machine, accounts mode, the
+    # base URL leading the allowlist.
+    assert server["OMNIGENT_ACCOUNTS_BASE_URL"] == "http://127.0.0.1:8010"
+    assert server["OMNIGENT_WS_ALLOWED_ORIGINS"] == server["OMNIGENT_ACCOUNTS_BASE_URL"]
+    assert server["OMNIGENT_AUTH_ENABLED"] == "1"
+    assert not any(key.startswith("OMNIGENT_OIDC_") for key in server), (
+        "OIDC stays commented: an issuer, even a placeholder, switches accounts mode off"
     )
-    # Microsoft sign-in (2026-10-14, AE's private cutover runbook): one callback host,
-    # the Cloudflare one, and a session as long as the Access session in front.
-    assert server["OMNIGENT_AUTH_PROVIDER"] == "oidc"
-    assert server["OMNIGENT_OIDC_REDIRECT_URI"] == "https://omnigent.<your-domain>/auth/callback"
-    assert server["OMNIGENT_OIDC_REDIRECT_URI"].rsplit("/auth/", 1)[0] in server[
-        "OMNIGENT_WS_ALLOWED_ORIGINS"
-    ].split(",")
-    assert server["OMNIGENT_OIDC_EMAIL_CLAIM"] == "preferred_username"
-    assert server["OMNIGENT_OIDC_SESSION_TTL_HOURS"] == "720"
+    assert "OMNIGENT_AUTH_PROVIDER" not in server
+    assert "AE_GRAPH_MCP_URL" not in server, "a placeholder URL registers a dead MCP server"
+    # The OIDC block, uncommented, is the Microsoft sign-in the full deploy
+    # uses (2026-10-14): one callback host and a 30-day session.
+    _, mentioned = _env_example(CONFIG / "server.env.example")
+    text = (CONFIG / "server.env.example").read_text()
+    assert {
+        "OMNIGENT_AUTH_PROVIDER",
+        "OMNIGENT_OIDC_ISSUER",
+        "OMNIGENT_OIDC_REDIRECT_URI",
+    } <= mentioned
+    assert "# OMNIGENT_OIDC_REDIRECT_URI=https://omnigent.<your-domain>/auth/callback" in text
+    assert "# OMNIGENT_OIDC_SESSION_TTL_HOURS=720" in text
+    assert text.index("REQUIRED") < text.index("OMNIGENT_IMAGE_TAG=") < text.index("OPTIONAL")
     assert server["AE_SELF_URL"] == "http://127.0.0.1:8000", (
         "inside the container the server is on 8000"
     )
@@ -918,7 +1045,7 @@ def test_env_examples_agree_with_the_override_and_the_units() -> None:
 def test_env_example_names_exist_upstream_or_in_the_ae_layer() -> None:
     """Every OMNIGENT_* name in the examples must be read somewhere in the pinned
     upstream tree; every AE_* name in packages/ae_omni_policies, the two box
-    scripts that read server.env for themselves (the overlay's image line and
+    scripts that read server.env for themselves (the overlay, for AE_IMAGE and AE_DATA_DIR, and
     deploy/auto-update.sh; AE_IMAGE, 2026-10-21, https://github.com/analyticendeavors/omnigent-ae-public/issues/13)
     or, for a patch's own switch (AE_PROMPT_SUGGESTIONS, patch 0123, 2026-10-20),
     the patched tree."""
@@ -930,13 +1057,14 @@ def test_env_example_names_exist_upstream_or_in_the_ae_layer() -> None:
     ae = "".join(
         p.read_text() for p in (ROOT / "packages" / "ae_omni_policies" / "src").rglob("*.py")
     )
-    ae += _override()["services"]["omnigent"]["image"]
+    # The overlay's interpolations only: a name in its comments reads nothing.
+    ae += " ".join(re.findall(r"\$\{([A-Z][A-Z0-9_]*)", OVERRIDE.read_text()))
     ae += (DEPLOY / "auto-update.sh").read_text()
     for example in (CONFIG / "server.env.example", CONFIG / "host.env.example"):
         active, mentioned = _env_example(example)
         for key in set(active) | mentioned:
             if key.startswith("OMNIGENT_"):
-                assert key in corpus, f"{example.name}: upstream v0.13.0 reads no {key}"
+                assert key in corpus, f"{example.name}: the pinned upstream reads no {key}"
             elif key.startswith("AE_"):
                 assert key in ae or key in corpus, (
                     f"{example.name}: neither the AE layer nor the patched upstream tree reads {key}"
