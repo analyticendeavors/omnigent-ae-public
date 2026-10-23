@@ -14,6 +14,7 @@ import os
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +29,14 @@ from ae_omni_policies import schedules
 from ae_omni_policies.omni import Settings, http_client
 
 AGENTS = Path(__file__).resolve().parents[3] / "agents"
+BOX_TZ = "America/Los_Angeles"
+
+
+@pytest.fixture(autouse=True)
+def _server_zone(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The box's zone on the in-process server; seed and the check-in read it from
+    ``GET /v1/ae/capacity`` (2026-10-22), so every row below lands in it."""
+    monkeypatch.setenv("AE_TASK_STORE_TZ", BOX_TZ)
 
 
 @pytest.fixture()
@@ -94,7 +103,8 @@ async def _listed(client: httpx.AsyncClient) -> dict[str, dict[str, Any]]:
 def test_the_decided_times() -> None:
     assert schedules.STEWARD.rrule == "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=8;BYMINUTE=0"
     assert schedules.SHUTDOWN.rrule == "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR;BYHOUR=17;BYMINUTE=30"
-    assert {s.timezone for s in schedules.SCHEDULES} == {"America/Los_Angeles"}
+    # The shipped rows carry the fallback; seed() puts the server's zone on them.
+    assert {s.timezone for s in schedules.SCHEDULES} == {"UTC"} == {schedules.TIMEZONE}
     assert [s.agent for s in schedules.SCHEDULES] == ["steward", "shutdown"]
     assert all(s.max_cost_usd > 0 for s in schedules.SCHEDULES)
 
@@ -112,7 +122,7 @@ async def test_seed_creates_both_then_changes_nothing(sched_client: httpx.AsyncC
         row = listed[schedule.name]
         assert row["agent_id"] == agents[schedule.agent]
         assert row["rrule"] == schedule.rrule
-        assert row["timezone"] == "America/Los_Angeles"
+        assert row["timezone"] == BOX_TZ
         assert row["prompt"] == schedule.prompt
         assert row["max_cost_usd"] == schedule.max_cost_usd
         assert row["state"] == "active"
@@ -215,11 +225,12 @@ def test_checkin_rule_is_hourly_or_slower_and_passes_upstreams_validator() -> No
     from omnigent.server.scheduled.rrule import validate_rrule
 
     assert schedules.checkin_rrule(1) == "FREQ=HOURLY;INTERVAL=1"
-    until = schedules.checkin_rrule(2, date(2026, 10, 16))
+    until = schedules.checkin_rrule(2, date(2026, 10, 16), tz=BOX_TZ)
     # 23:59:59 on 2026-10-16 in Los Angeles (PDT, UTC-7) is 06:59:59Z the next day.
     assert until == "FREQ=HOURLY;INTERVAL=2;UNTIL=20261017T065959Z"
+    assert schedules.checkin_rrule(2, date(2026, 10, 16)).endswith("UNTIL=20261016T235959Z")
     for rule in (schedules.checkin_rrule(1), schedules.checkin_rrule(24), until):
-        validate_rrule(rule, ZoneInfo(schedules.TIMEZONE))
+        validate_rrule(rule, ZoneInfo(BOX_TZ))
     for bad in (0, 25):
         with pytest.raises(ValueError, match="every_hours"):
             schedules.checkin_rrule(bad)
@@ -337,10 +348,12 @@ async def project_client(
 
 
 async def test_seed_files_both_into_automation_notes(
-    project_client: tuple[httpx.AsyncClient, Any],
+    project_client: tuple[httpx.AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # No project in the rows since 2026-10-22: the server's own default files them.
     client, projects = project_client
-    notes = projects.create(uuid.uuid4().hex, schedules.PROJECT, None)
+    notes = projects.create(uuid.uuid4().hex, "Automation Notes", None)
+    monkeypatch.setenv("OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT", "Automation Notes")
     await schedules.seed(client)
     rows = await _listed(client)
     assert {rows[s.name]["project_id"] for s in schedules.SCHEDULES} == {notes.id}
@@ -349,8 +362,10 @@ async def test_seed_files_both_into_automation_notes(
 async def test_seed_fills_a_missing_project_and_keeps_a_chosen_one(
     project_client: tuple[httpx.AsyncClient, Any],
 ) -> None:
+    # A schedule that names its own project (none of the shipped ones do).
     client, projects = project_client
-    (_, shutdown) = await schedules.seed(client)
+    named = tuple(replace(s, project="Automation Notes") for s in schedules.SCHEDULES)
+    (_, shutdown) = await schedules.seed(client, named)
     rows = await _listed(client)
     assert rows["AE steward"]["project_id"] is None, "no Automation Notes project yet"
 
@@ -361,9 +376,45 @@ async def test_seed_fills_a_missing_project_and_keeps_a_chosen_one(
     )
     assert moved.status_code == 200, moved.text
 
-    result = await schedules.seed(client)
+    result = await schedules.seed(client, named)
     assert result[0]["changed"] == ["project_id"]
     assert result[1]["action"] == "unchanged"
     rows = await _listed(client)
     assert rows["AE steward"]["project_id"] == notes.id
     assert rows["AE shutdown note"]["project_id"] == elsewhere.id
+
+
+@pytest.mark.parametrize(
+    ("status", "body", "match"),
+    [
+        (404, {"detail": "Not Found"}, "reading the server's timezone: 404"),
+        (200, {"project": None}, "names no timezone"),
+        (200, {"timezone": " ", "project": None}, "names no timezone"),
+    ],
+)
+async def test_seed_stops_when_the_server_names_no_zone(
+    status: int, body: dict[str, Any], match: str
+) -> None:
+    # Never a silent UTC: a reseed in the wrong zone would move every clock.
+    def answer(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(status, json=body)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(answer), base_url="http://x") as c:
+        with pytest.raises(schedules.SeedError, match=match):
+            await schedules.seed(c)
+
+
+async def test_seed_files_rows_made_before_the_default_project_existed(
+    project_client: tuple[httpx.AsyncClient, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The server's default names a project nobody has made yet, so the rows are
+    # created unfiled; a reseed after it exists files them.
+    client, projects = project_client
+    monkeypatch.setenv("OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT", "Automation Notes")
+    await schedules.seed(client)
+    assert {row["project_id"] for row in (await _listed(client)).values()} == {None}
+    notes = projects.create(uuid.uuid4().hex, "Automation Notes", None)
+    result = await schedules.seed(client)
+    assert [row["changed"] for row in result] == [["project_id"], ["project_id"]]
+    rows = await _listed(client)
+    assert {rows[s.name]["project_id"] for s in schedules.SCHEDULES} == {notes.id}

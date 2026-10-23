@@ -75,6 +75,7 @@ function overview(
 ): DatabricksOverview {
   return {
     configured: true,
+    can_act: true,
     note: null,
     host: HOST,
     error: null,
@@ -294,6 +295,8 @@ describe("the pieces", () => {
       /USE CATALOG.*USE SCHEMA.*SELECT/,
     );
     expect(spendStatusText(spend({ status: "ok" }))).toBeNull();
+    // A non-admin has no Refresh, so the line does not mention one.
+    expect(spendStatusText(spend({ status: "never" }), false)).toBe("Spend has not been read yet.");
   });
 
   it("keeps an action's row and a Refresh's spend over a read that began before it", () => {
@@ -357,6 +360,25 @@ describe("the section on the page", () => {
     expect(section.querySelectorAll("article")).toHaveLength(0);
     expect(section.querySelector(".dbx-spend")).toBeNull();
     expect(section.querySelector(".dbx-host button")).toBeNull();
+  });
+
+  it("shows a non-admin the warehouses and the link, never Start, Stop or Refresh", async () => {
+    const stopped = "fedcba9876543210";
+    const { context } = stubContext({
+      [PATH]: [
+        ok(
+          overview(
+            [warehouse(), warehouse({ id: stopped, name: "Reporting", state: "STOPPED", url: "" })],
+            { can_act: false },
+          ),
+        ),
+      ],
+    });
+    await mount(context);
+    expect(buttonNames(cardOf(ID))).toEqual(["Open Serverless Starter Warehouse in Databricks"]);
+    expect(buttonNames(cardOf(stopped))).toEqual([]);
+    expect(document.querySelector(".dbx-spend")).not.toBeNull();
+    expect(document.querySelector(".dbx-spend button")).toBeNull();
   });
 
   it("draws each warehouse with its state, meta line and only the button its state allows", async () => {

@@ -83,6 +83,12 @@ def test_repo_of_reads_the_repo_line_then_a_github_link() -> None:
     assert repo_of("REPO: nonsense", links) == "analyticendeavors/website_content"
     assert repo_of(None) is None
     assert repo_of("NEXT: y", [{"url": "https://example.com"}, "junk"]) is None
+    # A link that only names github.com in its path or host is not a GitHub link.
+    for url in (
+        "https://example.com/github.com/analyticendeavors/omnigent-ae",
+        "https://github.com.evil.example/analyticendeavors/omnigent-ae",
+    ):
+        assert repo_of("NEXT: y", [{"url": url}]) is None
 
 
 def test_issue_url_of_takes_the_first_github_issue_only() -> None:
@@ -361,7 +367,8 @@ async def test_create_transport_failure_without_a_match_is_unfiled() -> None:
         async with TaskStoreClient(SETTINGS) as client:
             out = await client.park(FIELDS, today=date(2026, 9, 23))
     assert out["outcome"] == "unfiled"
-    assert out["reason"] == "down"
+    # The class name only (2026-10-22): an httpx error's text can carry the URL.
+    assert out["reason"] == "ConnectError"
 
 
 async def test_get_retries_transport_and_stamp_failure_is_a_warning() -> None:

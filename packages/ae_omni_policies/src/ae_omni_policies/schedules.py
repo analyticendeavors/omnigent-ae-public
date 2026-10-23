@@ -9,7 +9,9 @@ what is missing, patch what drifted, leave the rest alone (a task Reid paused
 stays paused; ``state`` is never sent). Written 2026-09-23 (Phase 5).
 
 Times decided 2026-09-23 (Reid): the steward on weekdays at 08:00 and the
-shutdown note on weekdays at 17:30, both ``America/Los_Angeles``, as RRULEs in
+shutdown note on weekdays at 17:30, both in the server's own zone
+(``AE_TASK_STORE_TZ``, read through ``GET /v1/ae/schedule-defaults`` since 2026-10-22;
+``America/Los_Angeles`` on the box), as RRULEs in
 upstream's grammar (``omnigent/server/scheduled/rrule.py``; the floor is one
 hour, so daily rules are far inside it). Both agents are propose-only, so a
 run that spends more than a couple of dollars is a run that went somewhere it
@@ -28,23 +30,28 @@ import asyncio
 import json
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, date, datetime, time
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import httpx
 
+from ae_omni_policies.notes import DEFAULT_TZ
 from ae_omni_policies.omni import SERVER_URL_ENV, TOKEN_ENV, Settings, http_client, stored_token
 
-TIMEZONE = "America/Los_Angeles"
+# A Schedule's zone until seed() or the check-in sets the server's own.
+TIMEZONE = DEFAULT_TZ
 WEEKDAYS = "FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR"
 # Per run. A brief costs cents; a cap of two dollars leaves room for a long
 # transcript read and stops a loop before it matters.
 MAX_COST_USD = 2.0
 # The sidebar project each run session opens in (the task-project core patch,
-# 2026-10-13), by name; the seeder resolves it through GET /v1/projects.
-PROJECT = "Automation Notes"
+# 2026-10-13), by name; the seeder resolves it through GET /v1/projects. None
+# since 2026-10-22: a create that names no project lands in the server's own
+# OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT ("Automation Notes" on the box), which
+# seed() also reads from the server to file a row created before that project.
+PROJECT: str | None = None
 
 STEWARD_PROMPT = (
     "Run the morning steward brief now. Read the lot and the slots with your tools, "
@@ -157,13 +164,15 @@ def checkin_schedule(
     until: date | None = None,
     session_id: str | None = None,
     note: str | None = None,
+    timezone: str = TIMEZONE,
 ) -> Schedule:
-    """The check-in row, in the same shape the seeder writes."""
+    """The check-in row, in the same shape the seeder writes, in *timezone*."""
     return Schedule(
         name=CHECKIN_NAME,
         agent=CHECKIN_AGENT,
-        rrule=checkin_rrule(every_hours, until),
+        rrule=checkin_rrule(every_hours, until, tz=timezone),
         prompt=checkin_prompt(session_id, note),
+        timezone=timezone,
     )
 
 
@@ -181,6 +190,24 @@ class SeedError(Exception):
 def _failure(what: str, response: httpx.Response) -> SeedError:
     text = " ".join(response.text.split())[:300]
     return SeedError(f"{what}: {response.status_code} {text}")
+
+
+async def server_defaults(http: httpx.AsyncClient) -> tuple[str, str | None]:
+    """The server's zone and default project, from ``GET /v1/ae/schedule-defaults``.
+
+    :raises SeedError: When the route does not answer or names no zone. Never a
+        silent fallback: a reseed in the wrong zone would move every schedule's
+        clock.
+    """
+    response = await http.get("/v1/ae/schedule-defaults")
+    if response.status_code != 200:
+        raise _failure("reading the server's timezone", response)
+    body = response.json()
+    zone = body.get("timezone") if isinstance(body, dict) else None
+    if not isinstance(zone, str) or not zone.strip():
+        raise SeedError("reading the server's timezone: the answer names no timezone")
+    project = body.get("project")
+    return zone.strip(), project.strip() if isinstance(project, str) and project.strip() else None
 
 
 async def agents_by_name(http: httpx.AsyncClient) -> dict[str, str]:
@@ -230,7 +257,7 @@ async def projects_by_name(http: httpx.AsyncClient) -> dict[str, str]:
 async def seed(
     http: httpx.AsyncClient, schedules: tuple[Schedule, ...] = SCHEDULES
 ) -> list[dict[str, Any]]:
-    """Create or update *schedules* on the server *http* points at.
+    """Create or update *schedules* on the server *http* points at, in its zone.
 
     :param http: A client for the server, identity headers set.
     :param schedules: What to ensure; the two shipped ones by default.
@@ -239,11 +266,14 @@ async def seed(
     :raises SeedError: When an agent is not registered or a call fails. Earlier
         schedules in the tuple are already written by then; a rerun finishes.
     """
+    zone, default_project = await server_defaults(http)
     agents = await agents_by_name(http)
     existing = await list_scheduled(http)
     projects = await projects_by_name(http)
     results: list[dict[str, Any]] = []
-    for schedule in schedules:
+    for schedule in (
+        replace(s, timezone=zone, project=s.project or default_project) for s in schedules
+    ):
         agent_id = agents.get(schedule.agent)
         if agent_id is None:
             raise SeedError(
@@ -377,4 +407,5 @@ __all__ = [
     "main",
     "projects_by_name",
     "seed",
+    "server_defaults",
 ]

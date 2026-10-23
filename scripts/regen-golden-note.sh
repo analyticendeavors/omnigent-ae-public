@@ -39,6 +39,7 @@ trap 'rm -rf "$work"' EXIT
 {
   echo "// Extracted from $src by scripts/regen-golden-note.sh; do not edit."
   awk '/^const QUADRANT_AXES/,/^type Quadrant = /' "$src"
+  awk '/^function cleanTags/,/^}/' "$src"
   awk '/^function normalizeTags/,/^}/' "$src"
   awk '/^function estimateFor/,/^}/' "$src"
   # "// --- note assembly" through the line before "const ok = " (the MCP glue).

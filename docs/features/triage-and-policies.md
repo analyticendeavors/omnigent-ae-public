@@ -42,10 +42,10 @@ Parked work becomes a task with a note a fresh session can resume from: the thre
 
 ## The rabbit-hole check
 
-Once a session passes four hours or sixty prompts, its next prompt asks before it runs. Accepting covers the rest of that session, so it costs one click, at the moment a long session is most likely to have drifted.
+Once a session passes four hours or sixty prompts, its next prompt asks before it runs. Accepting covers the rest of that session, so it costs one click, at the moment a long session is most likely to have drifted. Its approval card gives the reason and folds the held request's code under Show details, as the slot cap's warning card does.
 
 **Where:** An approval card in the chat; the hours and prompts are parameters on Settings > Global Policies.<br>
-**Built from:** [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+**Built from:** core patch [`0156`](../../patches/0156-ae-patch-Fold-a-request-phase-approval-card-s-code-u.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
 ## Hurry modes
 

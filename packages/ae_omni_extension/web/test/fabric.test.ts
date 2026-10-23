@@ -42,7 +42,7 @@ vi.mock("@omnigent/extension-sdk", () => sdk);
 type Reply = { ok: boolean; status: number; body: unknown };
 
 function overview(capacities: FabricCapacity[], extra: Partial<FabricOverview> = {}) {
-  return { configured: capacities.length > 0, capacities, ...extra };
+  return { configured: capacities.length > 0, capacities, can_act: true, ...extra };
 }
 
 // A fresh row per use: the page updates a card's row in place after an action.
@@ -259,6 +259,28 @@ describe("the pieces", () => {
 });
 
 describe("the Admin Center page", () => {
+  it("shows a non-admin the state and no action, size picker included", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [
+        ok(
+          overview(
+            [
+              { name: "aetraining", state: "Paused", can_suspend: true },
+              { name: "aeprod", state: "Active", can_suspend: true },
+            ],
+            { can_act: false },
+          ),
+        ),
+      ],
+    });
+    await activateFabric(context);
+    await flush();
+    expect(buttonNames(cardOf("aetraining"))).toEqual([]);
+    expect(buttonNames(cardOf("aeprod"))).toEqual([]);
+    expect(cardOf("aeprod").textContent).toContain("Active");
+    expect(document.querySelector(".card-fabric select")).toBeNull();
+  });
+
   it("renders one card per capacity with only the button its state allows", async () => {
     const { context } = stubContext({
       "/v1/ae/fabric": [

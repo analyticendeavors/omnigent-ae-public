@@ -2322,3 +2322,90 @@ window under each choice, and a `?file=` link under `rail`) and
 `pages/settings/AeChatSettingsSection.test.tsx` (each card writes the store and storage),
 run by `just web-check`. It sits on the fork branch
 `analyticendeavors/omnigent@ae/rail-default-choice`, after `0154`.
+
+`0156` (2026-10-22) folds a request-phase approval card's code under Show details. Reid,
+on cards such as the rabbit-hole check: he reads the friendly sentence at the top, and the
+JSON under it is noise most of the time; he asked for it folded by default and opened only
+when needed. A request-phase ask (the rabbit-hole check, the slot cap) gates the message
+the person just sent, so its preview repeats that message:
+`components/blocks/AeApprovalPreview.tsx` puts it behind a Show details toggle, closed by
+default, linked by `aria-controls` (`aeFoldsApprovalPreview`: `phase === "request"`).
+Every other phase shows what the agent is about to do (a tool call's command, a
+response), so its preview stays in view whoever wrote the policy; the first version
+folded any written policy's code, and the review caught that a "confirm before git push"
+policy would then hide the command it asks about. `components/blocks/ApprovalCard.tsx`
+changes in the one place the pending card drew the preview. Tests:
+`components/blocks/AeApprovalPreview.test.tsx` (the toggle, the phase rule, a rabbit-hole
+card folded, a written tool-call policy and a Bash prompt left open), run by
+`just web-check` with the card's own suite. It sits on the fork branch
+`analyticendeavors/omnigent@ae/approval-preview-fold`, after `0155`.
+
+`0157` (2026-10-22) shows the insertion line when a sidebar row moves to another list.
+Reid, dragging a session out of a project folder into Sessions: the blue line that shows
+where a row lands within its own list was missing between lists, and he wanted it there
+for projects and for Triage groups. A row of another list is now a drop target when the
+drop means something (`shell/aeSidebarStore.ts`, `aeCrossMove`): another project folder,
+or Sessions to unfile it, in the default view; another Triage group under Triage, which
+sets that group's status (No status clears it). Shared rows and the other groupings (by
+status activity, by date) keep upstream's drops, since nothing a drop can write moves a
+row between those groups. The line follows the pointer's half of the row under it
+(`aeTrackDragMove`, wired to `onDragMove` and `onDragOver`), and the drop lands on that
+side: the row is filed (upstream's `useMoveToProject`) or its status written
+(`applyAeStatus`, which now takes `null`), then placed in the manual order as a
+same-list drag is, switching the device to Manual outside it. A row landing in another
+list is always ranked (`keep` on `aeMoveInOrder`), even where the order before the move
+already puts it at the line; without that, the review found, nothing saved and the filed
+row showed by recency. A status drop chains behind any move still waiting and holds the
+new group under the pointer from the start. A refused status (Working at the slot limit,
+a failed write) leaves the row where it was with the usual toast; a row Blocked by an
+open question that drops on Working changes nothing. No status sends an empty
+`ae.status`, and the server's PATCH (`server/routes/sessions/routes_core.py`) now
+deletes an empty `ae.status` the way it deletes an empty project or pin, instead of
+storing it. A drop on a folder
+header or the empty part of a list works as before, with no line. Row targets now
+outrank the folder or Sessions target beneath them, so the drop goes where the line
+shows. `shell/Sidebar.tsx` changes in a few lines. Tests: `shell/aeSidebarStore.test.ts`
+(which lists a row can move between, the filing and the placement, the status write and
+its refusal, the tracked side, a cross-list drop that looks unchanged),
+`lib/aeSessionOrder.test.ts` (`keep`), `shell/Sidebar.aeSortModes.test.tsx` (a folder
+row dropped on a Sessions row, a row moved across Triage groups, a failed status write),
+run by `just web-check`, and `tests/server/routes/test_sessions_crud.py` (an empty
+`ae.status` deletes the label). It sits on the fork branch
+`analyticendeavors/omnigent@ae/sidebar-cross-list-drop`, after `0156`.
+
+`0158` (2026-10-22) fixes three findings from the public-release audit of that day.
+The session-open choice on Settings > Chat (`0155`) read a layout saved under the old
+"Open the session rail in every session" switch, on or never set, as `rail`; that switch
+had closed a restored workspace panel only when the two did not fit, which is `both`, so
+upgraded devices lost their open panels. `readSessionOpenView` in `lib/aeSessionRail.ts`
+now reads it as `both`. Devices that already ran `0155` had saved that misreading as an
+explicit `rail`, so every write now adds `openViewSettled: true`, and a `rail` saved without
+it loads as `both` (a `rail` someone picked on Settings under `0155` moves to `both` once;
+picking it again sticks). A device with nothing saved still starts on `rail`, as `0155`
+chose. A global policy save (add, edit, delete in `hooks/useDefaultPolicies.ts`) now calls
+`refreshAeSlotLimit` (`lib/aeSlotLimit.ts`), so a new slot cap `limit` reaches this tab at
+once, and the query's stale time drops from five minutes to one for other tabs and devices.
+And the PR card's Update branch mutation was a second copy of the action dock's
+(`hooks/useAeUpdateBranch.ts`); both now use `useAeUpdateBranchMutation(repo, number)`, which
+takes the card at `mutate` so the card can hold it before its own query answers; the dock's
+`useAeUpdateBranch` returns only what it reads, with `mutate` bound to its card. Tests:
+`lib/aeSessionRail.test.ts` (the old switch on and unset, a `0155` rail repaired, a settled
+rail kept, a fresh device across a save), `hooks/useDefaultPolicies.test.ts` (each save
+refreshes the slot limit),
+with `components/AePrCards*.test.tsx` and `components/AeActionDock.test.tsx` unchanged and
+passing, run by `just web-check`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/web-audit-findings`, after `0157`.
+
+`0159` (2026-10-22) keeps the last chat lines visible above the open action dock tray. The
+tray floats over the transcript (`absolute bottom-full`), so opening it covered the bottom
+lines. `hooks/useAeDockLift.ts` takes the tray element (a callback ref, so a tray that
+unmounts and returns is watched again) and, while the transcript scroller
+(`[data-virtualized-transcript]`) is pinned to the bottom, within 8 px, adds the tray's
+height as bottom padding and scrolls to the new end. It re-checks on a tray resize (a merge
+confirm) and on scroll, so a reader scrolled up is left alone and reaching the bottom again
+lifts. Removing the tray restores the padding. `lib/aeDockLift.ts` holds the pinned check and
+the scroller lookup; `components/AeActionDock.tsx` changes in four lines. Tests:
+`hooks/useAeDockLift.test.tsx` (pinned open and restore, scrolled up through a resize, scroll
+to the bottom, remount), with `components/AeActionDock.test.tsx` unchanged and passing, run
+by `just web-check`. It sits on the fork branch `analyticendeavors/omnigent@ae/dock-lift`,
+after `0158`.

@@ -95,6 +95,10 @@ export function azureTile(
   const parts = [spent];
   if (flags) parts.push(flags === 1 ? "1 flag" : `${flags} flags`);
   else if (failed) parts.push(failed === 1 ? "1 not read" : `${failed} not read`);
+  // Health stays as is: the totals are complete, but "no flags" would read as checked.
+  if (view.subscriptions.some((sub) => sub.counted && sub.note)) {
+    parts.push("spike check unavailable");
+  }
   const delta = paceDelta(view.month.pace, view.month.lastMonth);
   return {
     id: "azure",
@@ -159,6 +163,7 @@ function subscriptionRow(
           `Billed in ${own}, so it is not in the ${currency} total.`,
         ),
     sub.error ? el("span", { class: "azure-sub-err meta" }, sub.error) : null,
+    sub.note ? el("span", { class: "azure-sub-caveat meta" }, sub.note) : null,
   );
 }
 

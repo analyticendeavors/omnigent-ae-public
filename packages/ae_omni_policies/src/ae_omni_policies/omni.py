@@ -211,8 +211,15 @@ class Settings:
 
     def headers(self) -> dict[str, str]:
         """Who is calling. The bearer token is not here: :class:`LoginAuth`
-        adds the current one to each request."""
-        return {"accept": "application/json", "user-agent": USER_AGENT}
+        adds the current one to each request. ``origin`` is upstream's
+        first-party sentinel (``OMNIGENT_INTERNAL_WS_ORIGIN``), so the
+        origin-checked writes such as ``POST /v1/ae/limits`` keep passing once
+        upstream stops letting a missing ``Origin`` through (2026-10-22)."""
+        return {
+            "accept": "application/json",
+            "origin": "omnigent://internal",
+            "user-agent": USER_AGENT,
+        }
 
 
 class LoginAuth(httpx.Auth):

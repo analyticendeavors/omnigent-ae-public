@@ -96,6 +96,22 @@ async def _me(request: Request, *, cookie: bool = True) -> dict[str, Any] | None
     With ``cookie=False`` the cookie is not forwarded, so only a bearer token (or a
     trusted proxy's identity header) names the caller.
     """
+    response = await ask_me(request, cookie=cookie)
+    if response is None or response.status_code != 200:
+        return None
+    try:
+        body = response.json()
+    except ValueError:
+        return None
+    return body if isinstance(body, dict) else None
+
+
+async def ask_me(request: Request, *, cookie: bool = True) -> httpx.Response | None:
+    """:func:`_me`'s raw answer, ``None`` when the loopback itself failed.
+
+    ``auth.require_ae_user`` needs to tell "the app refused this credential" from
+    "the app did not answer", which :func:`_me` folds together.
+    """
     names = {*_FORWARDED_HEADERS, resolve_auth_header().lower()}
     if not cookie:
         names.discard("cookie")
@@ -114,13 +130,7 @@ async def _me(request: Request, *, cookie: bool = True) -> dict[str, Any] | None
     except httpx.HTTPError as exc:
         _logger.warning("ae shared accounts: could not ask /v1/me: %s", exc)
         return None
-    if response.status_code != 200:
-        return None
-    try:
-        body = response.json()
-    except ValueError:
-        return None
-    return body if isinstance(body, dict) else None
+    return response
 
 
 async def _probe_admin(request: Request, user: str | None) -> bool:

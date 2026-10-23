@@ -378,6 +378,17 @@ describe("Reset layout", () => {
     expect(node.hidden).toBe(true);
     expect(currentLayout(board)).toEqual(LAYOUTS[3]);
   });
+
+  it("shows only for a column count that has its own arrangement", () => {
+    const { board, cards } = makeBoard();
+    const node = layoutResetButton(board);
+    document.body.appendChild(node);
+    setArrangement(3, [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]]);
+    arrange(board, cards, 2);
+    expect(node.hidden).toBe(true);
+    arrange(board, cards, 3);
+    expect(node.hidden).toBe(false);
+  });
 });
 
 /** A pointer event carrying a pointer id, which jsdom's MouseEvent does not take. */
@@ -420,6 +431,34 @@ describe("a drag that the board outlives", () => {
     expect(cardsIn(board)).toHaveLength(6);
     expect(new Set(cardsIn(board)).size).toBe(6);
     expect(currentLayout(board)).toEqual(LAYOUTS[2]);
+  });
+
+  it("goes on when the board only reflows at the same column count", () => {
+    const { board, cards } = makeBoard();
+    stubLayout(board);
+    fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
+    fire(document, "pointermove", 700, 10);
+    // A scrollbar narrowing the page: nothing is rebuilt, so no event fires.
+    const heard = vi.fn();
+    board.addEventListener("admin-arranged", heard);
+    arrange(board, cards, 3);
+    expect(heard).not.toHaveBeenCalled();
+    expect(board.querySelector(".admin-slot")).not.toBeNull();
+    expect(cards.deploys.classList.contains("is-dragging")).toBe(true);
+    fire(document, "pointerup", 700, 10);
+    expect(arrangement(3, LAYOUTS, IDS)[2]).toEqual(["deploys", "azure", "credit"]);
+  });
+
+  it("ignores an arrow key pressed during a pointer drag", () => {
+    const { board, cards } = makeBoard();
+    stubLayout(board);
+    fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
+    grip(cards.deploys).dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }),
+    );
+    expect(hasArrangement()).toBe(false);
+    expect(cards.deploys.classList.contains("is-dragging")).toBe(true);
+    fire(document, "pointerup", 20, 20);
   });
 
   it("is cancelled when a saved arrangement arrives while the card is lifted", async () => {

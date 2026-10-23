@@ -89,9 +89,9 @@ in stage 2 (`deploy/Dockerfile`).
 
 | Variable | Meaning |
 |---|---|
-| `AE_TASK_STORE_URL` | task-store origin, default `https://tasks.go-ae.org` |
+| `AE_TASK_STORE_URL` | task-store origin; unset, the Parking Lot and its tools are off (no default origin) |
 | `AE_CF_ACCESS_CLIENT_ID`, `AE_CF_ACCESS_CLIENT_SECRET` | the Cloudflare Access service token; without both, `/v1/ae/lot*` answers 503 |
-| `AE_TASK_STORE_TZ` | IANA zone for resurface dates, default `America/Los_Angeles` |
+| `AE_TASK_STORE_TZ` | IANA zone for resurface dates, the lot's "today" and the seeded schedules' clock; default `UTC` since 2026-10-22 (it was `America/Los_Angeles`) |
 | `AE_SLOT_LIMIT` | working sessions allowed at once, default `3`; read once at startup, and the one setting since 2026-09-24: the slot cap uses it (`config/server.yaml` passes no `limit`) and `GET /v1/ae/capacity` reports it as `limit`, which the web UI's counts follow. Not a whole number of one or more: the import raises and the server does not start |
 | `AE_SELF_URL` | optional; the gate reply, Resume's session create and the PR scan call the server through a real HTTP loopback to this base instead of in-process |
 | `AE_RESUME_AGENT` | optional; the built-in agent a resumed session binds to, default `claude-native-ui` (Claude Code) |

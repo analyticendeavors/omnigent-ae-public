@@ -943,6 +943,8 @@ function actionButtons(page: Page, capacity: FabricCapacity): HTMLElement[] {
   const nodes: HTMLElement[] = [];
   const menu = linksMenu(page, capacity);
   if (menu) nodes.push(menu);
+  // A non-admin sees the state and the links, never an action (2026-10-22).
+  if (!page.state.data?.can_act) return nodes;
   const openStep = page.state.confirming.get(name);
   if (canKeepAwake(capacity)) {
     const keep = iconButton(
@@ -1010,7 +1012,13 @@ function capacityCard(page: Page, capacity: FabricCapacity, now: number): HTMLEl
     page.state.confirming.delete(name);
   }
   if (!canKeepAwake(capacity)) page.state.keeping.delete(name);
-  const resizable = canResize(capacity);
+  // A caller who may not act has no open step either (2026-10-22).
+  const canAct = page.state.data?.can_act === true;
+  if (!canAct) {
+    page.state.confirming.delete(name);
+    page.state.keeping.delete(name);
+  }
+  const resizable = canResize(capacity) && canAct;
   if (!resizable || page.state.resizing.get(name) === capacity.sku) {
     page.state.resizing.delete(name);
   }

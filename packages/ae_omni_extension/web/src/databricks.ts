@@ -209,10 +209,13 @@ export function asOfText(spend: DatabricksSpend, now: number): string | null {
 }
 
 /** The strip's one status line for a state other than a good reading, if any. */
-export function spendStatusText(spend: DatabricksSpend): string | null {
+export function spendStatusText(spend: DatabricksSpend, canAct = true): string | null {
   if (spend.status === "reading") return "Reading spend...";
   if (spend.status === "never") {
-    return "Spend has not been read yet. Refresh wakes the warehouse to read it.";
+    // A non-admin has no Refresh (2026-10-22), so the line does not point at one.
+    return canAct
+      ? "Spend has not been read yet. Refresh wakes the warehouse to read it."
+      : "Spend has not been read yet.";
   }
   if (spend.status === "no_access") {
     return (
@@ -513,6 +516,8 @@ function actionButtons(section: Section, warehouse: DatabricksWarehouse): HTMLEl
       ),
     );
   }
+  // A non-admin sees the state and the link, never Start or Stop (2026-10-22).
+  if (!state.data?.can_act) return nodes;
   const action = offered(warehouse);
   const openStep = state.confirming.get(id);
   const toggle = (which: Action) => () => {
@@ -542,8 +547,10 @@ function warehouseCard(section: Section, warehouse: DatabricksWarehouse): HTMLEl
   const held = state.inFlight.get(warehouse.id);
   if (held) return held;
   const { id, name } = warehouse;
-  // A step the state no longer offers is dropped.
-  if (state.confirming.get(id) !== offered(warehouse)) state.confirming.delete(id);
+  // A step the state no longer offers, or a caller who may not act, is dropped.
+  if (state.confirming.get(id) !== offered(warehouse) || !state.data?.can_act) {
+    state.confirming.delete(id);
+  }
   const meta = metaItems(warehouse);
   const node = el(
     "article",
@@ -662,7 +669,7 @@ function creditRing(spend: DatabricksSpend): HTMLElement | null {
 function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTMLElement {
   const { state } = section;
   const quiet = spend.status === "reading";
-  const status = spendStatusText(spend);
+  const status = spendStatusText(spend, state.data?.can_act === true);
   const hasNumbers = spend.monthUsd != null || spend.totalUsd != null;
   const asOf = asOfText(spend, now);
   const node = el(
@@ -672,7 +679,7 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
       "div",
       { class: "dbx-spend-top" },
       el("span", { class: "fabric-name", id: "dbx-spend-h" }, "Spend"),
-      refreshButton(section, spend),
+      state.data?.can_act ? refreshButton(section, spend) : null,
     ),
     hasNumbers || spend.status === "ok"
       ? el(

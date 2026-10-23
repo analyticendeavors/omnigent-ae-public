@@ -15,6 +15,7 @@ import {
   hostSection,
   metaItems,
   nextDelay,
+  noticeTexts,
   POLL_CONNECTED_MS,
   POLL_DISCONNECTED_MS,
   stateText,
@@ -47,6 +48,7 @@ const status = (extra: Partial<HostStatus> = {}): HostStatus => ({
   request_untaken: false,
   can_request: true,
   error: null,
+  can_act: true,
   ...extra,
 });
 
@@ -153,6 +155,19 @@ describe("the words", () => {
     expect(buttonLabel(sent())).toBeNull();
     expect(buttonLabel(status({ requested: true, can_request: false }))).toBe("Asking the box...");
     expect(buttonLabel(status({ state: "sending", can_request: false }))).toBeNull();
+    // A non-admin is never offered the link (2026-10-22); the server refuses one anyway.
+    expect(buttonLabel(status({ can_act: false }))).toBeNull();
+    // Not even the disabled "Asking the box..." while an admin's request is out.
+    expect(buttonLabel(status({ can_act: false, requested: true, can_request: false }))).toBeNull();
+    // Nor do the notices point a non-admin at a button they do not have.
+    for (const extra of [
+      { state: "rejected" as const },
+      { state: "failed" as const, reason: "restart" as const },
+      { state: "failed" as const, reason: "lapsed" as const },
+    ]) {
+      const texts = noticeTexts(status({ ...extra, can_act: false })).map((item) => item.text);
+      expect(texts.join(" ")).not.toMatch(/button/i);
+    }
   });
 
   it("reads often while disconnected and redraws every second during a countdown", () => {

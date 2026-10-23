@@ -46,18 +46,21 @@ def test_missing_is_none_without_an_example(tmp_path: Path) -> None:
     assert env_drift.missing({env_drift.EXAMPLE_ENV: str(tmp_path / "absent")}) is None
 
 
-def test_the_repo_example_parses_and_expects_the_oidc_keys() -> None:
+def test_the_repo_example_expects_its_required_block_only() -> None:
     keys = env_drift.expected_keys(REPO_EXAMPLE.read_text(encoding="utf-8"))
-    assert "OMNIGENT_IMAGE_TAG" in keys
-    # The cutover finished 2026-10-20 and the markers are gone, so the check covers them.
-    assert "OMNIGENT_AUTH_PROVIDER" in keys
-    assert len([key for key in keys if key.startswith("OMNIGENT_OIDC_")]) == 7
+    for key in ("AE_IMAGE", "OMNIGENT_IMAGE_TAG", "OMNIGENT_ACCOUNTS_BASE_URL"):
+        assert key in keys
+    # Since 2026-10-22 the example ships accounts mode with the OIDC block and
+    # AE_GRAPH_MCP_URL commented (README.md "Quick start"), so a server that does
+    # not use them is never told it lacks them.
+    assert "OMNIGENT_AUTH_PROVIDER" not in keys
+    assert not [key for key in keys if key.startswith("OMNIGENT_OIDC_")]
+    assert "AE_GRAPH_MCP_URL" not in keys
 
 
-def test_the_graph_url_is_reported_only_when_the_box_lacks_it() -> None:
-    """AE_GRAPH_MCP_URL (2026-10-21) is expected, so the Deploys section names it if missing."""
+def test_a_missing_required_key_is_reported() -> None:
     keys = env_drift.expected_keys(REPO_EXAMPLE.read_text(encoding="utf-8"))
     full = dict.fromkeys(keys, "x") | {env_drift.EXAMPLE_ENV: str(REPO_EXAMPLE)}
     assert env_drift.missing(full) == []
-    without = {key: value for key, value in full.items() if key != "AE_GRAPH_MCP_URL"}
-    assert env_drift.missing(without) == ["AE_GRAPH_MCP_URL"]
+    without = {key: value for key, value in full.items() if key != "AE_IMAGE"}
+    assert env_drift.missing(without) == ["AE_IMAGE"]

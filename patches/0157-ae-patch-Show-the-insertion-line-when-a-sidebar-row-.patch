@@ -1,0 +1,949 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 12:09:14 -0700
+Subject: [PATCH 157/159] [ae-patch] Show the insertion line when a sidebar row
+ moves to another project, Sessions or Triage group
+
+A drop on a row of another list now files the dragged row there (another
+project folder, or Sessions to unfile it) or, under Triage, sets the status
+of the group it lands in, then places it on the side the insertion line
+showed, saved in the manual order like a same-list drag. A row landing in
+another list is always ranked, even where the order looks unchanged, or it
+would show there by recency. The line follows the pointer's half of the row
+under it. Shared rows and the other groupings keep upstream's drops. A
+refused status write leaves the row where it was. The server's PATCH now
+deletes an empty ae.status (No status) instead of storing it.
+---
+ .../server/routes/sessions/routes_core.py     |   3 +-
+ tests/server/routes/test_sessions_crud.py     |  22 ++
+ web/src/hooks/useAeSidebarOrder.ts            |   3 +
+ web/src/lib/aeSessionOrder.test.ts            |  16 ++
+ web/src/lib/aeSessionOrder.ts                 |   7 +-
+ web/src/shell/AeSidebarRowOrder.tsx           |   8 +-
+ web/src/shell/AeStatusMenu.tsx                |  30 ++-
+ web/src/shell/Sidebar.aeSortModes.test.tsx    |  39 ++--
+ web/src/shell/Sidebar.tsx                     |  11 +-
+ web/src/shell/aeSidebarStore.test.ts          | 194 +++++++++++++++++-
+ web/src/shell/aeSidebarStore.ts               | 194 ++++++++++++++++--
+ 11 files changed, 466 insertions(+), 61 deletions(-)
+
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 838a6df994785e07cc83484cbecd3a564e13ba2d..a8f49a110eb1b2d3cc1031deb0374d8bb8f67b68 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -3093,7 +3093,8 @@ def register_core_routes(
+         # so without this an empty string would linger as a stored value.
+         # The pinned key was rewritten to the caller's per-user key above, so
+         # clear that one (not the canonical bare key) on an empty value.
+-        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id)):
++        # omnigent-ae: `ae.status` too (empty = "No status", a sidebar drop).
++        for _clear_key in (PROJECT_LABEL_KEY, pinned_label_key(user_id), "ae.status"):
+             if labels_to_set.get(_clear_key) == "":
+                 labels_to_set = {k: v for k, v in labels_to_set.items() if k != _clear_key}
+                 await asyncio.to_thread(conversation_store.delete_label, session_id, _clear_key)
+diff --git a/tests/server/routes/test_sessions_crud.py b/tests/server/routes/test_sessions_crud.py
+index 0440dfcecc29630cc2f74a0dc5c6b36756a04448..071b3535cc02b849876526a037a6b52c9b8ac1c7 100644
+--- a/tests/server/routes/test_sessions_crud.py
++++ b/tests/server/routes/test_sessions_crud.py
+@@ -592,6 +592,28 @@ async def test_patch_session_empty_project_removes_label(
+     assert "omni_project" not in conv.labels
+ 
+ 
++async def test_patch_session_empty_ae_status_removes_label(
++    client: httpx.AsyncClient,
++    session_id: str,
++    db_uri: str,
++) -> None:
++    """omnigent-ae: an empty ``ae.status`` removes the label (Triage's No status)."""
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    conv_store.set_labels(session_id, {"ae.status": "review", "ae.next": "x"})
++
++    resp = await client.patch(
++        f"/v1/sessions/{session_id}",
++        json={"labels": {"ae.status": ""}},
++        headers={"Content-Type": "application/json"},
++    )
++    assert resp.status_code == 200
++
++    conv = conv_store.get_conversation(session_id)
++    assert conv is not None
++    assert "ae.status" not in conv.labels
++    assert conv.labels.get("ae.next") == "x"
++
++
+ # ── Pinned session label (omnigent.pinned) ───────────────────────────
+ 
+ 
+diff --git a/web/src/hooks/useAeSidebarOrder.ts b/web/src/hooks/useAeSidebarOrder.ts
+index a324df648552655375effe45f5b45e672efde5c1..f29540833894c2ceae2f57f63c2830f4cdee03d1 100644
+--- a/web/src/hooks/useAeSidebarOrder.ts
++++ b/web/src/hooks/useAeSidebarOrder.ts
+@@ -89,6 +89,8 @@ export type AeOrderOp =
+       scopeIds: readonly string[];
+       /** Every loaded row, by ranking unit (see `aeMoveInOrder`). */
+       units: readonly (readonly AeOrderRow[])[];
++      /** The row lands in another list: save its place even when the order looks unchanged. */
++      keep?: boolean;
+     }
+   | { kind: "set"; order: readonly string[] };
+ 
+@@ -100,6 +102,7 @@ function applyOp(order: readonly string[], op: AeOrderOp): readonly string[] {
+     scopeIds: op.scopeIds,
+     id: op.id,
+     to: op.to,
++    keep: op.keep,
+   });
+ }
+ 
+diff --git a/web/src/lib/aeSessionOrder.test.ts b/web/src/lib/aeSessionOrder.test.ts
+index a55dbed0f3f11c124965668fe7eeaf129b091811..0e22a10036bacb25a0947a88aa66a8b29ae05036 100644
+--- a/web/src/lib/aeSessionOrder.test.ts
++++ b/web/src/lib/aeSessionOrder.test.ts
+@@ -72,6 +72,22 @@ describe("aeMoveInOrder", () => {
+   const move = (order: readonly string[], id: string, to: AeMoveTo, scopeIds = sessions) =>
+     aeMoveInOrder({ order, units, scopeIds, id, to });
+ 
++  it("ranks a row landing in another list even where the order looks unchanged", () => {
++    // Materialized, f1 already sits right before s1; without `keep` nothing saves
++    // and the filed row would show in Sessions by recency.
++    const scopeIds = [...sessions, "f1"];
++    expect(move([], "f1", { before: "s1" }, scopeIds)).toEqual([]);
++    const kept = aeMoveInOrder({
++      order: [],
++      units,
++      scopeIds,
++      id: "f1",
++      to: { before: "s1" },
++      keep: true,
++    });
++    expect(kept.indexOf("f1")).toBe(kept.indexOf("s1") - 1);
++  });
++
+   it("moves within the list from an empty order, ranking the loaded rows first", () => {
+     const next = move([], "s3", "top");
+     expect(shown(next)).toEqual(["s3", "s1", "s2", "s4"]);
+diff --git a/web/src/lib/aeSessionOrder.ts b/web/src/lib/aeSessionOrder.ts
+index 6cc5e6f10a1ff84333eaf812454b269455ed29dc..ef8812857b9e18e7c624afea16112f87e4ebb649 100644
+--- a/web/src/lib/aeSessionOrder.ts
++++ b/web/src/lib/aeSessionOrder.ts
+@@ -94,7 +94,8 @@ function materialize(order: readonly string[], units: readonly (readonly AeOrder
+  * order: the list as shown is derived from the order, so a move replayed on a
+  * fresh order lands where it would have on that order. The moved id then sits
+  * next to its new neighbour in the list, which changes no other list. Returns
+- * `order` itself when the move changes nothing.
++ * `order` itself when the move changes nothing, unless `keep`: a row landing in
++ * another list is always ranked, or it would show there by recency.
+  */
+ export function aeMoveInOrder({
+   order,
+@@ -102,12 +103,14 @@ export function aeMoveInOrder({
+   scopeIds,
+   id,
+   to,
++  keep = false,
+ }: {
+   order: readonly string[];
+   units: readonly (readonly AeOrderRow[])[];
+   scopeIds: readonly string[];
+   id: string;
+   to: AeMoveTo;
++  keep?: boolean;
+ }): readonly string[] {
+   const full = materialize(order, units);
+   const members = new Set(scopeIds);
+@@ -126,7 +129,7 @@ export function aeMoveInOrder({
+     if ("before" in to) dest = target > from ? target - 1 : target;
+     else dest = target < from ? target + 1 : target;
+   }
+-  if (dest === from || dest < 0 || dest >= shown.length) return order;
++  if ((dest === from && !keep) || dest < 0 || dest >= shown.length) return order;
+ 
+   const moved = shown.filter((rowId) => rowId !== id);
+   moved.splice(dest, 0, id);
+diff --git a/web/src/shell/AeSidebarRowOrder.tsx b/web/src/shell/AeSidebarRowOrder.tsx
+index 9a28024bcba2187c9363ec00569de8d7aef3bc90..da7b5b06674191a3397f433ce1ae33f74e4c56ec 100644
+--- a/web/src/shell/AeSidebarRowOrder.tsx
++++ b/web/src/shell/AeSidebarRowOrder.tsx
+@@ -31,8 +31,9 @@ import {
+ import { AeMenuFold } from "./AeMenuFold";
+ 
+ /**
+- * A row as a drop target for its own list's order, in any Ordering (outside
+- * Manual a drop switches to it): on for listed rows outside Pinned, Archived
++ * A row as a drop target for its list's order, in any Ordering (outside
++ * Manual a drop switches to it), also for a row dragged in from another list
++ * (`aeCrossMove`): on for listed rows outside Pinned, Archived
+  * and selection. A pending save never
+  * toggles it, since every toggle re-measures every target mid-drag. The
+  * insertion line shows on the row under the pointer, never on the dragged one,
+@@ -61,10 +62,11 @@ export function useAeOrderRow(
+     },
+     [setNodeRef],
+   );
++  const crossSide = useAeSidebarStore((s) => (s.crossSide?.id === id ? s.crossSide.side : null));
+   const draggedId = active ? String(active.id) : null;
+   const side =
+     enabled && isOver && draggedId !== null && draggedId !== id
+-      ? aeInsertionSide(draggedId, id)
++      ? (aeInsertionSide(draggedId, id) ?? crossSide)
+       : null;
+   const rect = side ? nodeRef.current?.getBoundingClientRect() : undefined;
+   // Same root as the DragOverlay (z-index 999), one layer above it. The accent
+diff --git a/web/src/shell/AeStatusMenu.tsx b/web/src/shell/AeStatusMenu.tsx
+index 397eb02189595ecf288b1b29688bc2059ab45efa..84874e7656797e6e30aa6a63989d06bc502ad9ba 100644
+--- a/web/src/shell/AeStatusMenu.tsx
++++ b/web/src/shell/AeStatusMenu.tsx
+@@ -79,12 +79,15 @@ async function describeFailure(res: Response): Promise<string> {
+   return detail ? `${status}: ${detail}` : status;
+ }
+ 
+-/** Write `ae.status` through upstream's labels PATCH; throws with the server's answer. */
+-export async function patchAeStatus(sessionId: string, status: AeStatus): Promise<void> {
++/**
++ * Write `ae.status` through upstream's labels PATCH (`null` clears it, which an
++ * empty value does there); throws with the server's answer.
++ */
++export async function patchAeStatus(sessionId: string, status: AeStatus | null): Promise<void> {
+   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}`, {
+     method: "PATCH",
+     headers: { "Content-Type": "application/json" },
+-    body: JSON.stringify({ labels: { [AE_STATUS_KEY]: status } }),
++    body: JSON.stringify({ labels: { [AE_STATUS_KEY]: status ?? "" } }),
+   });
+   if (!res.ok) throw new Error(await describeFailure(res));
+ }
+@@ -116,6 +119,11 @@ function cachedRows(queryClient: QueryClient): Conversation[] {
+   return rows;
+ }
+ 
++/** A session list row from the cache, for a write that starts from a drag. */
++export function aeCachedRow(queryClient: QueryClient, id: string): Conversation | undefined {
++  return cachedRows(queryClient).find((row) => row.id === id);
++}
++
+ /**
+  * Whether `sessionId` may become working: the server's `/v1/ae/capacity`
+  * count when it answers, else the sidebar cache's (each session once).
+@@ -174,14 +182,15 @@ export function slotsFullMessage(room: Extract<AeSlotRoom, { ok: false }>): stri
+ 
+ // ── the cache overlay ────────────────────────────────────────────────────
+ 
+-function withStatus<T extends Row>(row: T, status: AeStatus): T {
+-  return { ...row, labels: { ...(row.labels ?? {}), [AE_STATUS_KEY]: status } };
++function withStatus<T extends Row>(row: T, status: AeStatus | null): T {
++  const { [AE_STATUS_KEY]: _old, ...rest } = row.labels ?? {};
++  return { ...row, labels: status ? { ...rest, [AE_STATUS_KEY]: status } : rest };
+ }
+ 
+ function overlayPages(
+   data: ConversationsInfiniteData | undefined,
+   id: string,
+-  status: AeStatus,
++  status: AeStatus | null,
+ ): ConversationsInfiniteData | undefined {
+   if (!data || !data.pages.some((page) => page.data.some((row) => row.id === id))) return data;
+   return {
+@@ -204,7 +213,7 @@ function overlayPages(
+ export function overlayAeStatusIntoCaches(
+   queryClient: QueryClient,
+   id: string,
+-  status: AeStatus,
++  status: AeStatus | null,
+ ): void {
+   for (const queryKey of [["conversations"], ["project-sessions"]]) {
+     for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+@@ -239,12 +248,13 @@ export function overlayAeStatusIntoCaches(
+  * Set a session's `ae.status` the way the menu does: nothing when it already
+  * holds that value, the slot check before working, the PATCH, then the
+  * overlay. Every failure is a toast that says what failed and what to do.
+- * Returns whether the label was written.
++ * `null` clears the status (a drop into Triage's No status group). Returns
++ * whether the label was written.
+  */
+ export async function applyAeStatus(
+   queryClient: QueryClient,
+   conversation: Row,
+-  status: AeStatus,
++  status: AeStatus | null,
+ ): Promise<boolean> {
+   if (aeStatusOf(conversation.labels) === status) return false;
+   if (status === "working") {
+@@ -259,7 +269,7 @@ export async function applyAeStatus(
+   } catch (error) {
+     const reason = error instanceof Error ? error.message : String(error);
+     showToast(
+-      `Could not set the status to ${AE_STATUS_WORDS[status]}: ${reason}. ` +
++      `Could not set the status to ${status ? AE_STATUS_WORDS[status] : "No status"}: ${reason}. ` +
+         `Reload the page and try again, or set it from the Parking Lot page.`,
+     );
+     return false;
+diff --git a/web/src/shell/Sidebar.aeSortModes.test.tsx b/web/src/shell/Sidebar.aeSortModes.test.tsx
+index a560d7eb9fa3bd409a0e96be76475ac0361e48a8..099b4361aa9a92ecebc34bb5278dcd3035ac8dff 100644
+--- a/web/src/shell/Sidebar.aeSortModes.test.tsx
++++ b/web/src/shell/Sidebar.aeSortModes.test.tsx
+@@ -487,7 +487,7 @@ describe("Manual ordering", () => {
+     await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
+   });
+ 
+-  it("does nothing when a row drops on a row in another Triage group", async () => {
++  it("leaves a row in its Triage group when the status write fails", async () => {
+     stubRowRects();
+     setView("triage", "manual");
+     serve([
+@@ -496,11 +496,10 @@ describe("Manual ordering", () => {
+     ]);
+     renderSidebar();
+     await waitFor(() => expect(useAeSidebarStore.getState().listOf.size).toBe(2));
+-    const insertion = await drag("r", "w");
+-    expect(insertion).toBeNull();
+-    await new Promise((resolve) => {
+-      setTimeout(resolve, 20);
+-    });
++    // The mocked server answers the status PATCH with 404.
++    expect(await drag("r", "w")).not.toBeNull();
++    await waitFor(() => expect(mocks.toast).toHaveBeenCalled());
++    expect(String(mocks.toast.mock.calls.at(-1)?.[0])).toContain("Could not set the status");
+     expect(sidebarCalls("PUT")).toHaveLength(0);
+     expect(mocks.moveToProject).not.toHaveBeenCalled();
+   });
+@@ -605,7 +604,7 @@ describe("drag and Move in any Ordering", () => {
+     expect(ordering()).toBe("updated");
+   });
+ 
+-  it("still unfiles a filed row dropped on a Sessions row", async () => {
++  it("unfiles a filed row dropped on a Sessions row and places it at the line", async () => {
+     stubRowRects();
+     mocks.projects = ["Alpha"];
+     const filed = [row("f1", 3, { labels: { omni_project: "Alpha" } })];
+@@ -614,26 +613,34 @@ describe("drag and Move in any Ordering", () => {
+     serve([...filed, row("a", 2), row("b", 1)]);
+     renderSidebar();
+     await waitFor(() => expect(useAeSidebarStore.getState().listOf.size).toBe(3));
+-    await drag("f1", "b");
++    // The pointer sits on the lower half of "b", so the row lands below it.
++    expect(await drag("f1", "b")).not.toBeNull();
+     expect(mocks.moveToProject).toHaveBeenCalledWith({ id: sid("f1"), project: "" });
+-    expect(sidebarCalls("PUT")).toHaveLength(0);
++    await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
++    expect(lastPut().order).toEqual(["a", "b", "f1"]);
++    expect(ordering()).toBe("manual");
+   });
+ 
+-  it("does nothing across Triage groups outside Manual either", async () => {
++  it("moves a row across Triage groups: sets the status, then places it at the line", async () => {
+     stubRowRects();
+-    setView("triage", "updated");
++    setView("triage", "manual");
++    const base = mocks.fetch.getMockImplementation()!;
++    mocks.fetch.mockImplementation(async (url: string, init?: RequestInit) =>
++      url.startsWith("/v1/sessions/") ? json({}) : base(url, init),
++    );
+     serve([
+       row("w", 2, { labels: { "ae.status": "working" } }),
+       row("r", 1, { labels: { "ae.status": "review" } }),
+     ]);
+     renderSidebar();
+     await waitFor(() => expect(useAeSidebarStore.getState().listOf.size).toBe(2));
+-    expect(await drag("r", "w")).toBeNull();
+-    await new Promise((resolve) => {
+-      setTimeout(resolve, 20);
++    expect(await drag("w", "r")).not.toBeNull();
++    await waitFor(() => expect(sidebarCalls("PUT")).toHaveLength(1));
++    const patch = mocks.fetch.mock.calls.find(([url]) => url === `/v1/sessions/${sid("w")}`);
++    expect(JSON.parse(String((patch![1] as RequestInit).body))).toEqual({
++      labels: { "ae.status": "review" },
+     });
+-    expect(sidebarCalls("PUT")).toHaveLength(0);
+-    expect(ordering()).toBe("updated");
++    expect(lastPut().order).toEqual(["r", "w"]);
+   });
+ });
+ 
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index 48c27774bebbe4b84029b674551779ffaf319113..00ee8b8c0709af0f9dc30c283d24e57b568fa614 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -242,8 +242,10 @@ import { AeArchivedGroup } from "@/shell/AeArchivedGroup";
+ import { AE_BULK_LABEL_CLASS, AeBulkBarCount } from "@/shell/AeBulkBarCount";
+ import { AeMoveMenu, aeTriageTitle, useAeOrderRow } from "@/shell/AeSidebarRowOrder";
+ import {
++  aeEndDrag,
+   aeHandleOrderDrop,
+   aePointerWithin,
++  aeTrackDragMove,
+   useAeFolderOrder,
+   useAePublishSidebarScopes,
+   useAeSidebarView,
+@@ -2244,7 +2246,11 @@ function ConversationList({
+       setActiveDrag(null);
+       setOverPin(null);
+       if (!dragged) return;
+-      if (aeHandleOrderDrop(dragged.id, event.over)) return;
++      const fileTo = (project: string) => {
++        moveToProject.mutate({ id: dragged.id, project });
++        if (project) expandProject(project);
++      };
++      if (aeHandleOrderDrop(dragged.id, event.over, fileTo)) return;
+       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
+       const action = resolveSidebarDrop(
+         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
+@@ -2662,12 +2668,15 @@ function ConversationList({
+         measuring={{ droppable: { strategy: MeasuringStrategy.Always } }}
+         onDragStart={handleDragStart}
+         onDragEnd={handleDragEnd}
++        onDragMove={aeTrackDragMove}
+         onDragOver={(event) => {
++          aeTrackDragMove(event);
+           const over = event.over?.data.current;
+           setOverProject(over?.type === "project-order" ? (over.name as string) : null);
+           setOverPin(over?.type === "pin-order" ? (over.id as string) : null);
+         }}
+         onDragCancel={() => {
++          aeEndDrag();
+           setActiveDrag(null);
+           setOverPin(null);
+           setDraggedProject(null);
+diff --git a/web/src/shell/aeSidebarStore.test.ts b/web/src/shell/aeSidebarStore.test.ts
+index 85304020f6fce11b68a222b5bc66d0c23db927e9..81188a40291a10e10936c22f8d56ddc70f7b52b4 100644
+--- a/web/src/shell/aeSidebarStore.test.ts
++++ b/web/src/shell/aeSidebarStore.test.ts
+@@ -16,11 +16,14 @@ import { resolveSidebarDrop } from "./sidebarNav";
+ import {
+   AE_MANUAL_SWITCH_TOAST,
+   aeCancelPendingMoves,
++  aeCrossMove,
++  aeEndDrag,
+   aeHandleOrderDrop,
+   aeInsertionSide,
+   aeMoveRow,
+   aePlaceOf,
+   aePointerWithin,
++  aeTrackDragMove,
+   useAeSidebarStore,
+   useAeSidebarView,
+ } from "./aeSidebarStore";
+@@ -64,6 +67,9 @@ afterEach(() => {
+     move: null,
+     queryClient: null,
+     switchToManual: null,
++    triage: false,
++    frozenTriage: null,
++    crossSide: null,
+   });
+   aeCancelPendingMoves();
+   mocks.fetch.mockReset();
+@@ -104,10 +110,14 @@ describe("aeHandleOrderDrop", () => {
+     expect(move).toHaveBeenLastCalledWith(expect.objectContaining({ to: { after: "s2" } }));
+   });
+ 
+-  it("consumes the row itself, another list's row and a drop with no save path", () => {
++  it("consumes the row itself, a row it cannot move to and a drop with no save path", () => {
+     const move = publish();
+     expect(aeHandleOrderDrop("s1", orderTarget("s1"))).toBe(true);
+-    expect(aeHandleOrderDrop("s1", orderTarget("f1"))).toBe(true);
++    useAeSidebarStore.setState({
++      lists: new Map([...LISTS, ["shared", ["x1"]]]),
++      listOf: new Map([...useAeSidebarStore.getState().listOf, ["x1", "shared"]]),
++    });
++    expect(aeHandleOrderDrop("s1", orderTarget("x1"))).toBe(true);
+     expect(move).not.toHaveBeenCalled();
+     useAeSidebarStore.setState({ move: null });
+     expect(aeHandleOrderDrop("s1", orderTarget("s2"))).toBe(true);
+@@ -115,6 +125,143 @@ describe("aeHandleOrderDrop", () => {
+   });
+ });
+ 
++describe("a drop on a row of another list", () => {
++  it("files the row into that folder or Sessions, then places it on the line's side", () => {
++    const move = publish();
++    const fileTo = vi.fn();
++    useAeSidebarStore.setState({ crossSide: { id: "f2", side: "after" } });
++    expect(aeHandleOrderDrop("s1", orderTarget("f2"), fileTo)).toBe(true);
++    expect(fileTo).toHaveBeenCalledExactlyOnceWith("Alpha");
++    expect(move).toHaveBeenLastCalledWith(
++      expect.objectContaining({ id: "s1", to: { after: "f2" }, scopeIds: ["f1", "f2", "s1"] }),
++    );
++    expect(useAeSidebarStore.getState().crossSide).toBeNull();
++
++    aeHandleOrderDrop("f1", orderTarget("s2"), fileTo);
++    expect(fileTo).toHaveBeenLastCalledWith("");
++    expect(move).toHaveBeenLastCalledWith(
++      expect.objectContaining({
++        id: "f1",
++        to: { before: "s2" },
++        scopeIds: ["s1", "s2", "s3", "f1"],
++      }),
++    );
++  });
++
++  it("reads which lists a row can move between", () => {
++    publish();
++    const state = useAeSidebarStore.getState();
++    expect(aeCrossMove(state, "s1", "s2")).toBeNull();
++    expect(aeCrossMove(state, "s1", "f1")).toEqual({ kind: "project", project: "Alpha" });
++    expect(aeCrossMove(state, "f1", "s1")).toEqual({ kind: "project", project: "" });
++    expect(aeCrossMove(state, "missing", "s1")).toBeNull();
++    const groups = new Map([
++      ["r1", "group:Review"],
++      ["n1", "group:No status"],
++      ["u1", "group:Today"],
++    ]);
++    expect(aeCrossMove({ listOf: groups, triage: true }, "r1", "n1")).toEqual({
++      kind: "status",
++      group: "No status",
++      status: null,
++    });
++    expect(aeCrossMove({ listOf: groups, triage: true }, "n1", "r1")).toMatchObject({
++      status: "review",
++    });
++    // The other groupings (by status activity, by date) group by what a drop cannot change.
++    expect(aeCrossMove({ listOf: groups, triage: false }, "r1", "n1")).toBeNull();
++    expect(aeCrossMove({ listOf: groups, triage: true }, "r1", "u1")).toBeNull();
++  });
++
++  it("sets the Triage group's status, holds the row there, then places it", async () => {
++    const [R, W] = ["a", "b"].map((ch) => ch.repeat(32));
++    const move = vi.fn(() => true);
++    const queryClient = new QueryClient();
++    queryClient.setQueryData(["conversations", "x"], {
++      pages: [{ data: [{ id: R, labels: { "ae.status": "review" } }] }],
++      pageParams: [null],
++    });
++    const frozen = new Map();
++    useAeSidebarStore.setState({
++      listed: true,
++      manual: true,
++      order: [],
++      triage: true,
++      frozenTriage: frozen,
++      lists: new Map([
++        ["group:Review", [R]],
++        ["group:Parked", [W]],
++      ]),
++      listOf: new Map([
++        [R, "group:Review"],
++        [W, "group:Parked"],
++      ]),
++      units: () => [[{ id: R }, { id: W }]],
++      move,
++      queryClient,
++    });
++    mocks.fetch.mockResolvedValue(new Response("{}", { status: 200 }));
++    expect(aeHandleOrderDrop(R, orderTarget(W))).toBe(true);
++    await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
++    expect(JSON.parse(String(mocks.fetch.mock.calls[0][1].body))).toEqual({
++      labels: { "ae.status": "parked" },
++    });
++    expect(frozen.get(R)).toBe("Parked");
++    expect(move).toHaveBeenCalledWith(
++      expect.objectContaining({ id: R, to: { before: W }, scopeIds: [W, R] }),
++    );
++  });
++
++  it("leaves the row in place when the status is refused", async () => {
++    const [R, W] = ["a", "b"].map((ch) => ch.repeat(32));
++    const move = vi.fn(() => true);
++    useAeSidebarStore.setState({
++      listed: true,
++      manual: true,
++      triage: true,
++      lists: new Map([
++        ["group:Review", [R]],
++        ["group:Parked", [W]],
++      ]),
++      listOf: new Map([
++        [R, "group:Review"],
++        [W, "group:Parked"],
++      ]),
++      units: () => [[{ id: R }, { id: W }]],
++      move,
++      queryClient: new QueryClient(),
++    });
++    mocks.fetch.mockResolvedValue(new Response("{}", { status: 500 }));
++    aeHandleOrderDrop(R, orderTarget(W));
++    await vi.waitFor(() => expect(mocks.toast).toHaveBeenCalledTimes(1));
++    expect(move).not.toHaveBeenCalled();
++  });
++
++  it("tracks the pointer's half of the row under it, for another list only", () => {
++    publish();
++    const event = (activeId: string, overId: string, y: number) =>
++      ({
++        active: { id: activeId, rect: { current: { translated: null } } },
++        over: {
++          id: `ae-order:${overId}`,
++          rect: { top: 100, height: 30 },
++          data: { current: { type: "ae-order", id: overId } },
++        },
++        activatorEvent: new MouseEvent("mousedown", { clientY: 0 }),
++        delta: { x: 0, y },
++      }) as unknown as Parameters<typeof aeTrackDragMove>[0];
++    aeTrackDragMove(event("s1", "f1", 110));
++    expect(useAeSidebarStore.getState().crossSide).toEqual({ id: "f1", side: "before" });
++    aeTrackDragMove(event("s1", "f1", 120));
++    expect(useAeSidebarStore.getState().crossSide).toEqual({ id: "f1", side: "after" });
++    aeTrackDragMove(event("s1", "s2", 120));
++    expect(useAeSidebarStore.getState().crossSide).toBeNull();
++    aeTrackDragMove(event("s1", "f1", 120));
++    expect(aeEndDrag()).toEqual({ id: "f1", side: "after" });
++    expect(useAeSidebarStore.getState().crossSide).toBeNull();
++  });
++});
++
+ describe("aePointerWithin", () => {
+   const rect = (top: number) =>
+     ({ top, bottom: top + 30, left: 0, right: 200, width: 200, height: 30 }) as DOMRect;
+@@ -143,16 +290,28 @@ describe("aePointerWithin", () => {
+     return aePointerWithin(args).map((collision) => String(collision.id));
+   }
+ 
+-  it("keeps only the dragged row's own list among the row-order targets", () => {
++  it("keeps the row targets a drop can use, rows first", () => {
+     publish();
+-    expect(collide("s1").sort()).toEqual(["ae-order:s2", "project:Alpha"]);
+-    expect(collide("f1").sort()).toEqual(["ae-order:f2", "project:Alpha"]);
++    expect(collide("s1")).toEqual(["ae-order:s2", "ae-order:f2", "project:Alpha"]);
++    expect(collide("f1")).toEqual(["ae-order:s2", "ae-order:f2", "project:Alpha"]);
+   });
+ 
+-  it("keeps the own list's targets outside Manual too", () => {
++  it("drops another list's targets a row cannot move to", () => {
++    publish();
++    useAeSidebarStore.setState({
++      listOf: new Map([
++        ["s1", "shared"],
++        ["s2", "sessions"],
++        ["f2", "folder:Alpha"],
++      ]),
++    });
++    expect(collide("s1")).toEqual(["project:Alpha"]);
++  });
++
++  it("keeps the targets outside Manual too", () => {
+     publish();
+     useAeSidebarStore.setState({ manual: false });
+-    expect(collide("s1").sort()).toEqual(["ae-order:s2", "project:Alpha"]);
++    expect(collide("s1")).toEqual(["ae-order:s2", "ae-order:f2", "project:Alpha"]);
+   });
+ 
+   it("drops every row-order target for a row in no list (pinned, archived)", () => {
+@@ -212,6 +371,27 @@ describe("a move outside Manual", () => {
+     expect(move).toHaveBeenCalledWith(expect.objectContaining({ id: C, to: { before: A } }));
+   });
+ 
++  it("switches and saves a drop into another list even where the order looks unchanged", async () => {
++    const { move, switchToManual } = publishUpdated();
++    const F = "f".repeat(32);
++    useAeSidebarStore.setState({
++      lists: new Map([
++        ["sessions", [A, B, C]],
++        ["folder:Alpha", [F]],
++      ]),
++      listOf: new Map([...[A, B, C].map((id) => [id, "sessions"] as const), [F, "folder:Alpha"]]),
++      units: () => [[{ id: F }], [{ id: A }, { id: B }, { id: C }]],
++    });
++    mocks.fetch.mockResolvedValue(json({ order: [], revision: 0 }));
++    useAeSidebarStore.setState({ crossSide: { id: C, side: "after" } });
++    expect(aeHandleOrderDrop(F, orderTarget(C), () => {})).toBe(true);
++    expect(switchToManual).toHaveBeenCalledTimes(1);
++    await vi.waitFor(() => expect(move).toHaveBeenCalledTimes(1));
++    expect(move).toHaveBeenCalledWith(
++      expect.objectContaining({ id: F, to: { after: C }, keep: true }),
++    );
++  });
++
+   it("switches nothing for a move that changes nothing", () => {
+     const { switchToManual } = publishUpdated();
+     expect(aeMoveRow(A, "top")).toBe(false);
+diff --git a/web/src/shell/aeSidebarStore.ts b/web/src/shell/aeSidebarStore.ts
+index 81b8df0c7c0bcc182d75ddbc9bd7445038116240..e6c3092965c4d4f24f0ca2af486d4c47f42018d7 100644
+--- a/web/src/shell/aeSidebarStore.ts
++++ b/web/src/shell/aeSidebarStore.ts
+@@ -5,9 +5,16 @@
+ // re-renders only the rows whose list changed. One session list mounts at a
+ // time (the peek sidebar is the same instance), so the store is not keyed.
+ // In any Ordering, a drop on a row of the same list or a Move item reorders;
+-// outside Manual it first switches this device to Manual.
++// outside Manual it first switches this device to Manual. A drop on a row of
++// another list (another project folder, Sessions, or another Triage group)
++// first files the row there or sets its status, then places it the same way.
+ 
+-import { type CollisionDetection, type Over, pointerWithin } from "@dnd-kit/core";
++import {
++  type CollisionDetection,
++  type DragMoveEvent,
++  type Over,
++  pointerWithin,
++} from "@dnd-kit/core";
+ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
+ import { create } from "zustand";
+@@ -22,6 +29,7 @@ import {
+   useAeSidebarOrder,
+ } from "@/hooks/useAeSidebarOrder";
+ import type { SidebarListQuery } from "@/hooks/useSidebarData";
++import type { AeStatus } from "@/lib/aeLabels";
+ import {
+   type AeMoveTo,
+   type AeOrderRow,
+@@ -30,6 +38,7 @@ import {
+   aeMoveInOrder,
+ } from "@/lib/aeSessionOrder";
+ import {
++  AE_TRIAGE_STATUS,
+   type AeTriageGroup,
+   type AeTriageRow,
+   aeSortByTriage,
+@@ -37,6 +46,7 @@ import {
+ } from "@/lib/aeTriage";
+ import type { SessionFilter } from "@/lib/sessionFilterPreferences";
+ import type { SidebarViewPreferences } from "@/lib/sidebarViewPreferences";
++import { aeCachedRow, applyAeStatus } from "./AeStatusMenu";
+ import { type ActiveChatOverride, sortByUpdatedAtDesc } from "./sidebarNav";
+ 
+ interface AeSidebarState {
+@@ -48,8 +58,12 @@ interface AeSidebarState {
+   order: readonly string[] | null;
+   /** Status ordering sorts rows by their status icon. */
+   statusSort: boolean;
++  /** Triage grouping is on. */
++  triage: boolean;
+   /** Triage groups held while the pointer is in the list. */
+   frozenTriage: Map<string, AeTriageGroup> | null;
++  /** During a drag, the row of another list under the pointer and the side the drop lands on. */
++  crossSide: { id: string; side: "before" | "after" } | null;
+   /** Each list's row ids as shown, by list key (`sessions`, `shared`, `group:…`, `folder:…`). */
+   lists: ReadonlyMap<string, readonly string[]>;
+   /** Each listed row's list key. */
+@@ -68,7 +82,9 @@ const IDLE: AeSidebarState = {
+   manual: false,
+   order: null,
+   statusSort: false,
++  triage: false,
+   frozenTriage: null,
++  crossSide: null,
+   lists: new Map(),
+   listOf: new Map(),
+   units: null,
+@@ -260,6 +276,7 @@ export function useAePublishSidebarScopes(
+       manual,
+       order: ae.order,
+       statusSort: ae.statusSort,
++      triage: ae.triage,
+       frozenTriage: ae.frozenTriage,
+       lists,
+       listOf,
+@@ -290,17 +307,22 @@ export function useAeFolderOrder(): <T extends AeListRow>(rows: T[]) => T[] {
+ }
+ 
+ /**
+- * Move a row within its list. Outside Manual, switch to Manual and make the
+- * move on a fresh read of the saved order. False when the row is in no list
+- * or the move changes nothing.
++ * Move a row within its list, or within `list` when it is landing in another
++ * one. Outside Manual, switch to Manual and make the move on a fresh read of
++ * the saved order. False when the row is in no list or the move changes nothing.
+  */
+-export function aeMoveRow(id: string, to: AeMoveTo): boolean {
++export function aeMoveRow(
++  id: string,
++  to: AeMoveTo,
++  list = useAeSidebarStore.getState().listOf.get(id),
++): boolean {
+   const state = useAeSidebarStore.getState();
+   const { move, units, queryClient, switchToManual } = state;
+-  const list = state.listOf.get(id);
+-  const scopeIds = list === undefined ? undefined : state.lists.get(list);
++  const ids = list === undefined ? undefined : state.lists.get(list);
++  const keep = list !== state.listOf.get(id);
++  const scopeIds = ids && !ids.includes(id) ? [...ids, id] : ids;
+   if (!state.listed || !move || !units || !scopeIds) return false;
+-  const op: AeOrderOp = { kind: "move", id, to, scopeIds, units: units() };
++  const op: AeOrderOp = { kind: "move", id, to, scopeIds, units: units(), ...(keep && { keep }) };
+   if (state.manual) {
+     if (waiting === 0) return move(op);
+     later(() => {
+@@ -310,7 +332,7 @@ export function aeMoveRow(id: string, to: AeMoveTo): boolean {
+   }
+   if (!switchToManual || !queryClient) return false;
+   // A move that would not change the list as shown switches nothing.
+-  if (aeMoveInOrder({ order: NO_ORDER, units: op.units, scopeIds, id, to }) === NO_ORDER) {
++  if (!keep && aeMoveInOrder({ order: NO_ORDER, units: op.units, scopeIds, id, to }) === NO_ORDER) {
+     return false;
+   }
+   switchToManual();
+@@ -352,33 +374,163 @@ export function aeInsertionSide(draggedId: string, targetId: string): "before" |
+   return ids.indexOf(draggedId) < ids.indexOf(targetId) ? "after" : "before";
+ }
+ 
++/** What a drop on a row of another list does before placing the row: file it, or set its status. */
++export type AeCrossMove =
++  | { kind: "project"; project: string }
++  | { kind: "status"; group: AeTriageGroup; status: AeStatus | null };
++
+ /**
+- * Upstream's `pointerWithin`, minus the row-order targets of every list but
+- * the dragged row's own, so a drop on a row elsewhere falls through to the
+- * folder, Pinned or Sessions target beneath it. A row in no list (pinned or
+- * archived) sees none, so upstream's pin and filing drops stand.
++ * What dropping `draggedId` on `targetId` in another list does: into another
++ * project folder or Sessions (`project` "" unfiles it), or into another Triage
++ * group (its status, `null` for No status). `null` within one list, and for
++ * Shared, the other groupings and rows in no list.
++ */
++export function aeCrossMove(
++  state: Pick<AeSidebarState, "listOf" | "triage">,
++  draggedId: string,
++  targetId: string,
++): AeCrossMove | null {
++  const from = state.listOf.get(draggedId);
++  const to = state.listOf.get(targetId);
++  if (from === undefined || to === undefined || from === to) return null;
++  const projectOf = (key: string) =>
++    key === "sessions" ? "" : key.startsWith("folder:") ? key.slice("folder:".length) : null;
++  const project = projectOf(to);
++  if (project !== null && projectOf(from) !== null) return { kind: "project", project };
++  if (!state.triage || !from.startsWith("group:") || !to.startsWith("group:")) return null;
++  const group = to.slice("group:".length);
++  if (!Object.hasOwn(AE_TRIAGE_STATUS, group)) return null;
++  return {
++    kind: "status",
++    group: group as AeTriageGroup,
++    status: AE_TRIAGE_STATUS[group as AeTriageGroup],
++  };
++}
++
++/**
++ * Upstream's `pointerWithin`, minus the row-order targets a drop cannot use:
++ * those of other lists, except where `aeCrossMove` takes the row. A row in no
++ * list (pinned or archived) sees none, so upstream's pin and filing drops
++ * stand. A row target outranks the folder or Sessions target beneath it, so
++ * the drop lands where the insertion line shows.
+  */
+ export function aePointerWithin(args: Parameters<CollisionDetection>[0]) {
+   const state = useAeSidebarStore.getState();
+-  const list = state.listOf.get(String(args.active.id));
++  const draggedId = String(args.active.id);
++  const list = state.listOf.get(draggedId);
+   const droppableContainers = args.droppableContainers.filter((container) => {
+     const data = container.data.current;
+     if (data?.type !== "ae-order") return true;
+-    return list !== undefined && state.listOf.get(String(data.id)) === list;
++    if (list === undefined) return false;
++    const targetId = String(data.id);
++    return state.listOf.get(targetId) === list || aeCrossMove(state, draggedId, targetId) !== null;
++  });
++  const collisions = pointerWithin({ ...args, droppableContainers });
++  const isRow = (collision: { id: unknown }) => String(collision.id).startsWith("ae-order:");
++  return [...collisions.filter(isRow), ...collisions.filter((c) => !isRow(c))];
++}
++
++function pointerY({ activatorEvent, active, delta }: DragMoveEvent): number | null {
++  if (activatorEvent instanceof MouseEvent) return activatorEvent.clientY + delta.y;
++  if (typeof TouchEvent !== "undefined" && activatorEvent instanceof TouchEvent) {
++    const touch = activatorEvent.touches[0] ?? activatorEvent.changedTouches[0];
++    if (touch) return touch.clientY + delta.y;
++  }
++  const rect = active.rect.current.translated;
++  return rect ? rect.top + rect.height / 2 : null;
++}
++
++/**
++ * Track which half of another list's row the pointer is on, so the insertion
++ * line and the drop agree. Within one list the side comes from the drag's
++ * direction instead (`aeInsertionSide`).
++ */
++export function aeTrackDragMove(event: DragMoveEvent): void {
++  const state = useAeSidebarStore.getState();
++  const data = event.over?.data.current;
++  let next: AeSidebarState["crossSide"] = null;
++  if (event.over && data?.type === "ae-order") {
++    const targetId = String(data.id);
++    const y = pointerY(event);
++    if (y !== null && aeCrossMove(state, String(event.active.id), targetId)) {
++      const { top, height } = event.over.rect;
++      next = { id: targetId, side: y < top + height / 2 ? "before" : "after" };
++    }
++  }
++  const current = state.crossSide;
++  if (current?.id !== next?.id || current?.side !== next?.side) {
++    useAeSidebarStore.setState({ crossSide: next });
++  }
++}
++
++/** Clear the drag's insertion side; a cancelled drag calls it, a drop does through `aeHandleOrderDrop`. */
++export function aeEndDrag(): AeSidebarState["crossSide"] {
++  const { crossSide } = useAeSidebarStore.getState();
++  if (crossSide) useAeSidebarStore.setState({ crossSide: null });
++  return crossSide;
++}
++
++/**
++ * Set the status a drop into another Triage group means, then place the row,
++ * chained behind any move still waiting so moves apply in the order made. The
++ * new group is held under the pointer from the start, so the write's own
++ * render draws it there; a refused or unchanged status (Working at the slot
++ * limit, a row Blocked by an open question) puts the hold back.
++ */
++function aeDropIntoGroup(
++  draggedId: string,
++  move: Extract<AeCrossMove, { kind: "status" }>,
++  to: AeMoveTo,
++  list: string,
++): void {
++  later(async (current) => {
++    const { queryClient, frozenTriage } = useAeSidebarStore.getState();
++    if (!queryClient) return;
++    const row = aeCachedRow(queryClient, draggedId) ?? { id: draggedId, labels: {} };
++    const held = frozenTriage?.get(draggedId);
++    frozenTriage?.set(draggedId, move.group);
++    if (!(await applyAeStatus(queryClient, row, move.status))) {
++      if (held === undefined) frozenTriage?.delete(draggedId);
++      else frozenTriage?.set(draggedId, held);
++      return;
++    }
++    if (current()) aeMoveRow(draggedId, to, list);
+   });
+-  return pointerWithin({ ...args, droppableContainers });
+ }
+ 
+ /**
+  * Handle a drop on a row-order target. True for every such target, the row
+  * itself and a no-op included: upstream reads any target it does not know as
+- * the Sessions list, which would take a filed session out of its folder.
++ * the Sessions list, which would take a filed session out of its folder. A
++ * row of another list files the dragged row there through `fileTo` (a
++ * project name, "" for Sessions) or sets its Triage status, then places it on
++ * the side the insertion line showed.
+  */
+-export function aeHandleOrderDrop(draggedId: string, over: Over | null): boolean {
++export function aeHandleOrderDrop(
++  draggedId: string,
++  over: Over | null,
++  fileTo: (project: string) => void = () => {},
++): boolean {
++  const crossSide = aeEndDrag();
+   const data = over?.data.current;
+   if (data?.type !== "ae-order") return false;
+   const targetId = String(data.id);
+-  const side = targetId === draggedId ? null : aeInsertionSide(draggedId, targetId);
+-  if (side) aeMoveRow(draggedId, side === "after" ? { after: targetId } : { before: targetId });
++  if (targetId === draggedId) return true;
++  const state = useAeSidebarStore.getState();
++  const cross = aeCrossMove(state, draggedId, targetId);
++  const side = cross
++    ? crossSide?.id === targetId
++      ? crossSide.side
++      : "before"
++    : aeInsertionSide(draggedId, targetId);
++  if (!side) return true;
++  const to = side === "after" ? { after: targetId } : { before: targetId };
++  const list = state.listOf.get(targetId);
++  if (cross?.kind === "status" && list !== undefined) {
++    aeDropIntoGroup(draggedId, cross, to, list);
++    return true;
++  }
++  if (cross?.kind === "project") fileTo(cross.project);
++  aeMoveRow(draggedId, to, list);
+   return true;
+ }
