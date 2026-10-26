@@ -1,0 +1,1032 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:35:05 -0700
+Subject: [PATCH 174/191] [ae-patch] Show the lead's model changes as chat rows
+ with Undo, mark raised helpers on the Agents card, and tell the lead how to
+ raise or step down.
+
+---
+ omnigent/inner/ae_roles.py                    |  38 ++-
+ tests/inner/test_ae_roles.py                  |  25 +-
+ .../blocks/AeModelChangeRow.test.tsx          | 231 ++++++++++++++++++
+ .../components/blocks/AeModelChangeRow.tsx    | 160 ++++++++++++
+ .../components/blocks/BlockRenderer.test.tsx  |  78 ++++++
+ web/src/components/blocks/BlockRenderer.tsx   |  13 +-
+ web/src/lib/aeModelChange.test.ts             |  23 ++
+ web/src/lib/aeModelChange.ts                  | 173 +++++++++++++
+ web/src/pages/settings/AeRolesEditor.tsx      |   9 +-
+ web/src/shell/AeAgentMeta.tsx                 |  31 ++-
+ web/src/shell/AeAgentsUsage.test.tsx          |  57 +++++
+ 11 files changed, 816 insertions(+), 22 deletions(-)
+ create mode 100644 web/src/components/blocks/AeModelChangeRow.test.tsx
+ create mode 100644 web/src/components/blocks/AeModelChangeRow.tsx
+ create mode 100644 web/src/lib/aeModelChange.test.ts
+ create mode 100644 web/src/lib/aeModelChange.ts
+
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index 24e0b7feca46a8bbea3e146d3de9c0e8488c0a19..135a333a8d27c4a276b8653fd30e3b1a829c3632 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -486,21 +486,39 @@ def _rules_short(rules: object) -> str:
+     return f"{change}, {down}, {raises} raise{'' if raises == 1 else 's'}, {helpers}"
+ 
+ 
++_RAISE_TOOL = (
++    "Model changes: use set_session_model to raise a stuck helper or step yourself down; "
++)
++# A native subagent has no live model switch, and a START ON line may not have been applied.
++_CHANGE_TAIL = (
++    "A native subagent cannot change model mid-run: stop it and start a new one a tier up, "
++    "and treat it like a raise under the same rule. If the first message has a START ON: "
++    "line this chat is not on yet, switch yourself with set_session_model."
++)
++
++
+ def _rules(rules: object) -> str:
+     rules = rules if isinstance(rules, dict) else {}
+-    change = {
+-        "tell": "Model changes: raise a stuck child or lower yourself: tell the user after.",
+-        "ask": "Model changes: raise a stuck child or lower yourself: ask the user first.",
+-        "off": "Model changes: do not raise a child or lower yourself on your own.",
+-    }.get(str(rules.get("raise_or_lower")), "Model changes: ask the user first.")
+     down = "on" if rules.get("lead_steps_down") is True else "off"
+     raises = rules.get("auto_raises")
+     raises = raises if isinstance(raises, int) and not isinstance(raises, bool) else 0
+-    past = "." if rules.get("raise_or_lower") == "off" else "; past that, ask first."
+-    return (
+-        f"{change} Step down for mechanical work: {down}. "
+-        f"Automatic raises per child: {raises}{past}"
+-    )
++    mode = rules.get("raise_or_lower")
++    if mode == "off":
++        return (
++            "Model changes: do not raise a helper or lower yourself; set_session_model refuses. "
++            f"Step down for mechanical work: {down}. Automatic raises per child: {raises}."
++        )
++    if mode == "tell":
++        change = (
++            f"{_RAISE_TOOL}it applies at once up to {raises} automatic "
++            f"raise{'' if raises == 1 else 's'} per helper, then asks the user."
++        )
++    else:
++        change = (
++            f"{_RAISE_TOOL}every change asks the user first, "
++            "except going back to the model you started on."
++        )
++    return f"{change} Step down for mechanical work: {down}. {_CHANGE_TAIL}"
+ 
+ 
+ _TOOLS = (
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 4ed014600d156fa2b3f19cf2d9c80848a1c73cb5..e4540dd7b10ecdca8c020718594469290f151021 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -350,8 +350,9 @@ def test_balanced_wording_matches_the_contract(prefs: dict[str, Any]) -> None:
+         "- Reviewer (reviews, verifying a finding, fix checks): sonnet, medium.",
+         "- Builder (code once the plan is pinned): sonnet, medium.",
+         "- Helper (polling, PR watching, screenshots, mechanical commits): haiku, low.",
+-        "Model changes: raise a stuck child or lower yourself: tell the user after. Step down "
+-        "for mechanical work: on. Automatic raises per child: 1; past that, ask first.",
++        "Model changes: use set_session_model to raise a stuck helper or step yourself down; "
++        "it applies at once up to 1 automatic raise per helper, then asks the user. Step down "
++        "for mechanical work: on. " + ae_roles._CHANGE_TAIL,
+     ]
+ 
+ 
+@@ -370,12 +371,30 @@ def test_auto_roles_and_a_fixed_lead_render(prefs: dict[str, Any]) -> None:
+     assert lines[0].startswith("Roles preset: YOLO (customized for this session).")
+     assert lines[1] == "- Lead: you, on fable, max."
+     assert lines[4] == "- Builder (code once the plan is pinned): your pick."
+-    assert lines[-1].startswith("Model changes: do not raise a child or lower yourself")
++    assert lines[-1].startswith("Model changes: do not raise a helper or lower yourself")
+     assert lines[-1].endswith("Step down for mechanical work: off. Automatic raises per child: 0.")
+     assert "past that" not in text
+     assert len(lines) < 12
+ 
+ 
++def test_the_notice_names_the_tool_for_every_rule() -> None:
++    def last(rule: str, raises: int = 2) -> str:
++        preset = copy.deepcopy(BALANCED)
++        preset["rules"].update({"raise_or_lower": rule, "auto_raises": raises})
++        return (render_roles({"preset": preset, "custom": False}) or "").splitlines()[-1]
++
++    assert "up to 2 automatic raises per helper, then asks the user" in last("tell")
++    assert (
++        "every change asks the user first, except going back to the model you started on"
++        in last("ask")
++    )
++    assert "START ON:" in last("ask")
++    off = last("off")
++    assert "set_session_model refuses" in off
++    assert "START ON" not in off
++    assert "and treat it like a raise under the same rule" in last("tell")
++
++
+ def test_a_model_without_a_tier_alias_keeps_its_id() -> None:
+     preset = copy.deepcopy(BALANCED)
+     preset["roles"]["builder"] = {"mode": "fixed", "model": "gpt-5.5-codex", "effort": "high"}
+diff --git a/web/src/components/blocks/AeModelChangeRow.test.tsx b/web/src/components/blocks/AeModelChangeRow.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4da394bc189f4fe37737a1eb457d4dfb7c22b97f
+--- /dev/null
++++ b/web/src/components/blocks/AeModelChangeRow.test.tsx
+@@ -0,0 +1,231 @@
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { type AeModelChange, aeUndoModelChange, parseAeModelChange } from "@/lib/aeModelChange";
++import { AeModelChangeRow } from "./AeModelChangeRow";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++
++afterEach(cleanup);
++beforeEach(() => mocks.fetch.mockReset());
++
++const RAISE = {
++  status: "changed",
++  session_id: "conv_b",
++  title: "Fix the sync lock",
++  role: "builder",
++  is_lead: false,
++  from: { model: "sonnet", effort: "medium" },
++  to: { model: "opus", effort: "high" },
++  kind: "raise",
++  raises: 1,
++  cap: 1,
++  counted: true,
++  approved: "auto",
++  reason: "Stuck on lock ordering",
++  refusal: null,
++  undo: { model: "sonnet", effort: "medium" },
++};
++
++function change(over: Record<string, unknown> = {}): AeModelChange {
++  const parsed = parseAeModelChange(JSON.stringify({ ...RAISE, ...over }));
++  if (!parsed) throw new Error("fixture did not parse");
++  return parsed;
++}
++
++function renderRow(c: AeModelChange) {
++  return render(
++    <MemoryRouter>
++      <AeModelChangeRow change={c} />
++    </MemoryRouter>,
++  );
++}
++
++describe("AeModelChangeRow", () => {
++  it("reads a counted raise with an amber up arrow, the count and both buttons", () => {
++    renderRow(change());
++    expect(screen.getByTestId("ae-model-change-text").textContent).toBe(
++      "Raised Builder “Fix the sync lock” from Sonnet medium to Opus high",
++    );
++    expect(screen.getByTestId("ae-model-change-arrow").getAttribute("data-direction")).toBe("up");
++    expect(screen.getByTestId("ae-model-change-arrow").getAttribute("class")).toContain(
++      "text-amber-500",
++    );
++    expect(screen.getByTestId("ae-model-change-why").textContent).toBe(
++      "Stuck on lock ordering · raise 1 of 1 automatic",
++    );
++    expect(screen.getByRole("link", { name: "Open helper" }).getAttribute("href")).toBe(
++      "/c/conv_b",
++    );
++    expect(screen.getByTestId("ae-model-change-undo").textContent).toBe("Undo");
++  });
++
++  it("reads a lower with a green down arrow", () => {
++    renderRow(
++      change({
++        kind: "lower",
++        counted: false,
++        from: { model: "opus", effort: "high" },
++        to: { model: "sonnet", effort: "medium" },
++      }),
++    );
++    expect(screen.getByTestId("ae-model-change-arrow").getAttribute("data-direction")).toBe("down");
++    expect(screen.getByTestId("ae-model-change-arrow").getAttribute("class")).toContain(
++      "text-emerald-500",
++    );
++    expect(screen.getByTestId("ae-model-change-why").textContent).toBe("Stuck on lock ordering");
++  });
++
++  it("says the lead stepped down and offers no helper link", () => {
++    renderRow(
++      change({
++        is_lead: true,
++        kind: "lower",
++        counted: false,
++        title: "Lead",
++        role: null,
++        from: { model: "opus", effort: "high" },
++        to: { model: "sonnet", effort: "medium" },
++      }),
++    );
++    expect(screen.getByTestId("ae-model-change-text").textContent).toBe(
++      "Lead stepped down from Opus high to Sonnet medium",
++    );
++    expect(screen.queryByRole("link", { name: "Open helper" })).toBeNull();
++  });
++
++  it.each([
++    [true, "raise", "Lead raised itself from Sonnet medium to Opus high"],
++    [true, "lower", "Lead stepped down from Sonnet medium to Opus high"],
++    [
++      false,
++      "raise",
++      "Raised Builder \u201cFix the sync lock\u201d from Sonnet medium to Opus high",
++    ],
++    [
++      false,
++      "lower",
++      "Lowered Builder \u201cFix the sync lock\u201d from Sonnet medium to Opus high",
++    ],
++  ])("words is_lead %s kind %s", (isLead, kind, text) => {
++    renderRow(
++      change({
++        is_lead: isLead,
++        kind,
++        role: isLead ? null : "builder",
++        title: isLead ? "" : "Fix the sync lock",
++      }),
++    );
++    expect(screen.getByTestId("ae-model-change-text").textContent).toBe(text);
++    expect(screen.getByTestId("ae-model-change-arrow").getAttribute("data-direction")).toBe(
++      kind === "raise" ? "up" : "down",
++    );
++  });
++
++  it("says approved by you instead of a count", () => {
++    renderRow(change({ approved: "reid", counted: true }));
++    expect(screen.getByTestId("ae-model-change-why").textContent).toBe(
++      "Stuck on lock ordering · approved by you",
++    );
++  });
++
++  it("undoes with the old values and no caller, then reads Undone and disables", async () => {
++    let finish: (res: Response) => void = () => {};
++    mocks.fetch.mockReturnValue(
++      new Promise<Response>((resolve) => {
++        finish = resolve;
++      }),
++    );
++    renderRow(change());
++    const undo = screen.getByTestId("ae-model-change-undo") as HTMLButtonElement;
++    fireEvent.click(undo);
++    await waitFor(() => expect(undo.disabled).toBe(true));
++    expect(undo.textContent).toBe("Undoing");
++    const [url, init] = mocks.fetch.mock.calls[0];
++    expect(url).toBe("/v1/ae/sessions/conv_b/model");
++    expect(init.method).toBe("POST");
++    expect(JSON.parse(init.body)).toEqual({
++      model: "sonnet",
++      effort: "medium",
++      undo: true,
++      reason: "Undo",
++    });
++    finish(new Response(JSON.stringify({ status: "changed" }), { status: 200 }));
++    await waitFor(() => expect(undo.textContent).toBe("Undone"));
++    expect(undo.disabled).toBe(true);
++  });
++
++  it("sends null undo values as they are and refuses to read unchanged as undone", async () => {
++    mocks.fetch.mockResolvedValue(
++      new Response(JSON.stringify({ status: "unchanged" }), { status: 200 }),
++    );
++    renderRow(change({ undo: { model: null, effort: "low" } }));
++    const undo = screen.getByTestId("ae-model-change-undo") as HTMLButtonElement;
++    fireEvent.click(undo);
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-model-change-error").textContent).toBe(
++        "Could not undo: nothing changed",
++      ),
++    );
++    expect(JSON.parse(mocks.fetch.mock.calls[0][1].body)).toEqual({
++      model: null,
++      effort: "low",
++      undo: true,
++      reason: "Undo",
++    });
++    expect(undo.disabled).toBe(false);
++    expect(undo.textContent).toBe("Undo");
++  });
++
++  it("shows a short error and keeps Undo available when the call fails", async () => {
++    mocks.fetch.mockResolvedValue(
++      new Response(JSON.stringify({ error: { message: "Not your session" } }), { status: 403 }),
++    );
++    renderRow(change());
++    const undo = screen.getByTestId("ae-model-change-undo") as HTMLButtonElement;
++    fireEvent.click(undo);
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-model-change-error").textContent).toBe("Not your session"),
++    );
++    expect(undo.disabled).toBe(false);
++    expect(undo.textContent).toBe("Undo");
++  });
++
++  it.each([
++    [
++      { status: "declined" },
++      'Kept the builder "Fix the sync lock" on Sonnet medium (you declined)',
++    ],
++    [
++      { status: "refused", refusal: "The preset forbids changes" },
++      "Not changed: The preset forbids changes",
++    ],
++    [
++      { status: "unchanged" },
++      'Not changed: the builder "Fix the sync lock" already runs Sonnet medium',
++    ],
++    [
++      { status: "needs_approval" },
++      'Waiting for you to approve a change for the builder "Fix the sync lock"',
++    ],
++  ])("shows one muted line for %j", (over, text) => {
++    renderRow(change({ ...over, undo: null }));
++    expect(screen.getByTestId("ae-model-change-note").textContent).toBe(text);
++    expect(screen.queryByTestId("ae-model-change-undo")).toBeNull();
++  });
++});
++
++describe("parseAeModelChange", () => {
++  it("returns null for output that is not the contract", () => {
++    expect(parseAeModelChange(null)).toBeNull();
++    expect(parseAeModelChange("plain words")).toBeNull();
++    expect(parseAeModelChange("[1]")).toBeNull();
++    expect(parseAeModelChange(JSON.stringify({ status: "odd", session_id: "x" }))).toBeNull();
++  });
++
++  it("undo throws on a failed response", async () => {
++    mocks.fetch.mockResolvedValue(new Response("{}", { status: 500 }));
++    await expect(aeUndoModelChange("s", { model: null, effort: "low" })).rejects.toBeTruthy();
++  });
++});
+diff --git a/web/src/components/blocks/AeModelChangeRow.tsx b/web/src/components/blocks/AeModelChangeRow.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c9ac1403f00c68eeab8666752991aeb80d5f3d7
+--- /dev/null
++++ b/web/src/components/blocks/AeModelChangeRow.tsx
+@@ -0,0 +1,160 @@
++// A model change the lead made with set_session_model (omnigent-ae): one row in the
++// chat with the from and to, the reason, Undo and a link to the helper. The tool's
++// result JSON is the contract; anything else falls back to the plain tool card.
++
++import { ArrowDownIcon, ArrowUpIcon } from "lucide-react";
++import { useState } from "react";
++import { Button } from "@/components/ui/button";
++import { aeAgentRole, aeRoleName } from "@/lib/aeAgentRole";
++import { AE_MODEL_FAMILY_BG } from "@/lib/aeAgentUsage";
++import {
++  type AeModelChange,
++  type AeModelPoint,
++  aeModelPointFamily,
++  aeModelPointText,
++  aeUndoModelChange,
++} from "@/lib/aeModelChange";
++import { Link } from "@/lib/routing";
++import { cn } from "@/lib/utils";
++
++function ModelText({ point }: { point: AeModelPoint }) {
++  const family = aeModelPointFamily(point);
++  return (
++    <span className="inline-flex items-baseline gap-1 font-medium">
++      {family && (
++        <span
++          aria-hidden="true"
++          className={cn("size-1.5 shrink-0 self-center rounded-full", AE_MODEL_FAMILY_BG[family])}
++        />
++      )}
++      {aeModelPointText(point)}
++    </span>
++  );
++}
++
++function RoleChip({ role }: { role: string | null }) {
++  const id = aeAgentRole({ labels: role ? { "ae.role": role } : {} });
++  if (!id) return null;
++  return (
++    <>
++      <span
++        data-testid="ae-model-change-role"
++        className="rounded bg-foreground/[0.07] px-1.5 text-[10px] font-medium uppercase tracking-wide"
++      >
++        {aeRoleName(id)}
++      </span>{" "}
++    </>
++  );
++}
++
++/** The muted second line: the reason, then how the change was allowed. */
++function whyLine(change: AeModelChange): string {
++  const parts = [change.reason];
++  if (change.approved === "reid") parts.push("approved by you");
++  else if (change.counted && change.approved === "auto" && change.cap !== null) {
++    parts.push(`raise ${change.raises} of ${change.cap} automatic`);
++  }
++  return parts.filter(Boolean).join(" · ");
++}
++
++/** One muted line for a change that did not happen. */
++function skippedLine(change: AeModelChange): string {
++  const who = change.isLead
++    ? "the lead"
++    : `the ${change.role ?? "helper"}${change.title ? ` "${change.title}"` : ""}`;
++  const stay = aeModelPointText(change.from);
++  if (change.status === "declined") return `Kept ${who} on ${stay} (you declined)`;
++  if (change.status === "needs_approval") return `Waiting for you to approve a change for ${who}`;
++  if (change.status === "unchanged") return `Not changed: ${who} already runs ${stay}`;
++  return `Not changed: ${change.refusal ?? "the preset does not allow it"}`;
++}
++
++export function AeModelChangeRow({ change }: { change: AeModelChange }) {
++  const [undo, setUndo] = useState<"idle" | "busy" | "done">("idle");
++  const [error, setError] = useState<string | null>(null);
++
++  if (change.status !== "changed") {
++    return (
++      <p className="not-prose text-xs text-muted-foreground" data-testid="ae-model-change-note">
++        {skippedLine(change)}
++      </p>
++    );
++  }
++
++  const raised = change.kind === "raise";
++  const Arrow = raised ? ArrowUpIcon : ArrowDownIcon;
++  const undoTo = change.undo;
++  const runUndo = async () => {
++    if (!undoTo) return;
++    setUndo("busy");
++    setError(null);
++    try {
++      await aeUndoModelChange(change.sessionId, undoTo);
++      setUndo("done");
++    } catch (err) {
++      setUndo("idle");
++      setError(err instanceof Error && err.message ? err.message : "Undo failed");
++    }
++  };
++
++  return (
++    <div
++      className="not-prose flex w-full items-start gap-2 rounded-md border border-border bg-muted/30 px-3 py-2 text-sm"
++      data-testid="ae-model-change"
++    >
++      <Arrow
++        aria-hidden="true"
++        data-testid="ae-model-change-arrow"
++        data-direction={raised ? "up" : "down"}
++        className={cn("mt-0.5 size-4 shrink-0", raised ? "text-amber-500" : "text-emerald-500")}
++      />
++      <div className="min-w-0 flex-1">
++        <p data-testid="ae-model-change-text">
++          {change.isLead ? (
++            `Lead ${raised ? "raised itself" : "stepped down"} from `
++          ) : (
++            <>
++              {raised ? "Raised" : "Lowered"} <RoleChip role={change.role} />
++              {change.title && <>&ldquo;{change.title}&rdquo; </>}
++              from{" "}
++            </>
++          )}
++          <ModelText point={change.from} /> to <ModelText point={change.to} />
++        </p>
++        {whyLine(change) && (
++          <p className="mt-0.5 text-xs text-muted-foreground" data-testid="ae-model-change-why">
++            {whyLine(change)}
++          </p>
++        )}
++        <div className="mt-1.5 flex flex-wrap items-center gap-2">
++          {undoTo && (
++            <Button
++              size="sm"
++              variant="outline"
++              disabled={undo !== "idle"}
++              onClick={runUndo}
++              componentId="ae.model_change.undo"
++              data-testid="ae-model-change-undo"
++            >
++              {undo === "busy" ? "Undoing" : undo === "done" ? "Undone" : "Undo"}
++            </Button>
++          )}
++          {!change.isLead && (
++            <Button size="sm" variant="outline" asChild componentId="ae.model_change.open_helper">
++              <Link to={`/c/${change.sessionId}`}>Open helper</Link>
++            </Button>
++          )}
++          {error && (
++            <span
++              role="alert"
++              className="text-xs text-destructive"
++              data-testid="ae-model-change-error"
++            >
++              {error}
++            </span>
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
+diff --git a/web/src/components/blocks/BlockRenderer.test.tsx b/web/src/components/blocks/BlockRenderer.test.tsx
+index c238f76fd327719cf607d055e14ab0a82249396f..dc7a8e2b7e1e15925c6024d37cb7c7d9c9bb29dd 100644
+--- a/web/src/components/blocks/BlockRenderer.test.tsx
++++ b/web/src/components/blocks/BlockRenderer.test.tsx
+@@ -7,6 +7,7 @@ import path from "node:path";
+ import { fileURLToPath } from "node:url";
+ import type { ReactNode } from "react";
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { MemoryRouter } from "react-router-dom";
+ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { RenderItem } from "@/lib/renderItems";
+@@ -44,6 +45,83 @@ const renderMarkdownText = (text: string) =>
+   );
+ 
+ describe("BlockRenderer dispatch", () => {
++  describe("set_session_model rows (omnigent-ae)", () => {
++    const CHANGED = JSON.stringify({
++      status: "changed",
++      session_id: "conv_b",
++      title: "Fix the lock",
++      role: "builder",
++      is_lead: false,
++      from: { model: "sonnet", effort: "medium" },
++      to: { model: "opus", effort: "high" },
++      kind: "raise",
++      raises: 1,
++      cap: 1,
++      counted: true,
++      approved: "auto",
++      reason: "Stuck",
++      undo: { model: "sonnet", effort: "medium" },
++    });
++
++    function toolItem(
++      name: string,
++      output: string | null,
++      state: "output-available" | "input-available",
++    ) {
++      return {
++        kind: "tool",
++        itemId: "fc_m",
++        execution: {
++          name,
++          arguments: { model: "opus" },
++          argsSummary: "",
++          callId: "call_m",
++          agentName: "test",
++          executedBy: "server",
++          output,
++        },
++        output,
++        state,
++        startedAt: null,
++        duration: undefined,
++      } as RenderItem;
++    }
++
++    it.each(["set_session_model", "mcp__ae__set_session_model"])(
++      "renders %s as a model change row",
++      (name) => {
++        render(
++          <MemoryRouter>
++            <BlockRenderer
++              items={[toolItem(name, CHANGED, "output-available")]}
++              sessionStatus="idle"
++            />
++          </MemoryRouter>,
++        );
++        expect(screen.getByTestId("ae-model-change")).toBeDefined();
++      },
++    );
++
++    it("keeps the plain tool card while the call runs or when the output is not JSON", () => {
++      const { unmount } = render(
++        <BlockRenderer
++          items={[toolItem("set_session_model", null, "input-available")]}
++          sessionStatus="running"
++        />,
++      );
++      expect(screen.queryByTestId("ae-model-change")).toBeNull();
++      unmount();
++      render(
++        <BlockRenderer
++          items={[toolItem("set_session_model", "plain words", "output-available")]}
++          sessionStatus="idle"
++        />,
++      );
++      expect(screen.queryByTestId("ae-model-change")).toBeNull();
++      expect(screen.queryByTestId("ae-model-change-note")).toBeNull();
++    });
++  });
++
+   it("renders a slash_command RenderItem via SlashCommandCard", () => {
+     const items: RenderItem[] = [
+       {
+diff --git a/web/src/components/blocks/BlockRenderer.tsx b/web/src/components/blocks/BlockRenderer.tsx
+index a6b0a082f9a9fff573eb66d4add44c342d3816f7..83ad0d06255f9e32d5d0271e894d011d72699c5c 100644
+--- a/web/src/components/blocks/BlockRenderer.tsx
++++ b/web/src/components/blocks/BlockRenderer.tsx
+@@ -31,6 +31,8 @@ import { FilePathAwareMessageResponse } from "./ChatMarkdown";
+ import { ElicitationCard } from "./ApprovalCard";
+ import { ReasoningView } from "./ReasoningView";
+ import { SlashCommandCard } from "./SlashCommandCard";
++import { AE_SET_SESSION_MODEL_NAMES, parseAeModelChange } from "@/lib/aeModelChange";
++import { AeModelChangeRow } from "./AeModelChangeRow";
+ import { SmartRoutingCard } from "./SmartRoutingCard";
+ import { TerminalCommandCard } from "./TerminalCommandCard";
+ import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
+@@ -683,12 +685,15 @@ function renderToolRunFragment(
+ }
+ 
+ const ADVISE_MODELS_NAMES = new Set(["sys_advise_models", "mcp__omnigent__sys_advise_models"]);
++const SET_SESSION_MODEL_NAMES = AE_SET_SESSION_MODEL_NAMES;
+ const SESSION_SEND_NAMES = new Set(["sys_session_send", "mcp__omnigent__sys_session_send"]);
+ 
+ function isPersistentToolCard(item: RenderItem): boolean {
+   return (
+     item.kind === "tool" &&
+-    (ADVISE_MODELS_NAMES.has(item.execution.name) || SESSION_SEND_NAMES.has(item.execution.name))
++    (ADVISE_MODELS_NAMES.has(item.execution.name) ||
++      SESSION_SEND_NAMES.has(item.execution.name) ||
++      SET_SESSION_MODEL_NAMES.has(item.execution.name))
+   );
+ }
+ 
+@@ -779,6 +784,12 @@ function renderItem(
+           />
+         );
+       }
++      // The lead's model change reads as one row with Undo; a running call or
++      // an output that is not the result JSON keeps the plain card.
++      if (SET_SESSION_MODEL_NAMES.has(item.execution.name) && item.state === "output-available") {
++        const change = parseAeModelChange(item.output);
++        if (change) return <AeModelChangeRow key={key} change={change} />;
++      }
+       return (
+         <ToolCard
+           key={key}
+diff --git a/web/src/lib/aeModelChange.test.ts b/web/src/lib/aeModelChange.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d4b3050eded4a7feea2ef54ec62e3367c2ee141
+--- /dev/null
++++ b/web/src/lib/aeModelChange.test.ts
+@@ -0,0 +1,23 @@
++import { describe, expect, it } from "vitest";
++import { aeRunsAboveStart } from "./aeModelChange";
++
++const start = { model: "claude-sonnet-5-5", effort: "medium" };
++
++describe("aeRunsAboveStart", () => {
++  it.each([
++    ["claude-opus-4-8", "low", true],
++    ["claude-sonnet-5-5", "high", true],
++    ["claude-sonnet-5-5", "medium", false],
++    ["claude-sonnet-5-5", "low", false],
++    ["claude-haiku-4-5", "max", false],
++    ["claude-fable-5-1", null, true],
++    [null, "high", true],
++    [null, "low", false],
++  ])("%s %s above the start: %s", (model, effort, above) => {
++    expect(aeRunsAboveStart({ model, effort }, start)).toBe(above);
++  });
++
++  it("keeps the raise label when nothing can be compared", () => {
++    expect(aeRunsAboveStart({ model: null, effort: null }, start)).toBe(true);
++  });
++});
+diff --git a/web/src/lib/aeModelChange.ts b/web/src/lib/aeModelChange.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8a09cbb5467ae0d71490b8b04e42bb22b0e1dac3
+--- /dev/null
++++ b/web/src/lib/aeModelChange.ts
+@@ -0,0 +1,173 @@
++// The lead's set_session_model result and its Undo call (omnigent-ae). The chat row, the
++// Agents card and their tests share these; the server route is `POST /v1/ae/sessions/{id}/model`.
++
++import { AE_MODEL_FAMILY_NAMES, aeModelFamily, type AeModelFamily } from "@/lib/aeAgentUsage";
++import { authenticatedFetch } from "@/lib/identity";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
++
++/** Tool names the lead's call arrives under (the native MCP form carries the server prefix). */
++export const AE_SET_SESSION_MODEL_NAMES: ReadonlySet<string> = new Set([
++  "set_session_model",
++  "mcp__ae__set_session_model",
++]);
++
++export interface AeModelPoint {
++  model: string | null;
++  effort: string | null;
++}
++
++export type AeModelChangeStatus =
++  "changed" | "needs_approval" | "declined" | "refused" | "unchanged";
++
++export interface AeModelChange {
++  status: AeModelChangeStatus;
++  sessionId: string;
++  title: string;
++  role: string | null;
++  isLead: boolean;
++  from: AeModelPoint;
++  to: AeModelPoint;
++  kind: "raise" | "lower" | "same";
++  raises: number;
++  cap: number | null;
++  counted: boolean;
++  approved: "auto" | "reid" | "user" | null;
++  reason: string;
++  refusal: string | null;
++  undo: AeModelPoint | null;
++}
++
++const STATUSES: readonly string[] = [
++  "changed",
++  "needs_approval",
++  "declined",
++  "refused",
++  "unchanged",
++];
++
++function str(value: unknown): string | null {
++  return typeof value === "string" && value.trim() ? value : null;
++}
++
++function point(value: unknown): AeModelPoint {
++  const rec = typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
++  return { model: str(rec.model), effort: str(rec.effort) };
++}
++
++function count(value: unknown): number {
++  return typeof value === "number" && Number.isFinite(value) ? value : 0;
++}
++
++/** The contract JSON, or null when the output is not one (so the caller shows the plain tool card). */
++export function parseAeModelChange(output: string | null): AeModelChange | null {
++  if (!output) return null;
++  let raw: unknown;
++  try {
++    raw = JSON.parse(output);
++  } catch {
++    return null;
++  }
++  if (typeof raw !== "object" || raw === null) return null;
++  const rec = raw as Record<string, unknown>;
++  const status = rec.status;
++  const sessionId = str(rec.session_id);
++  if (typeof status !== "string" || !STATUSES.includes(status) || !sessionId) return null;
++  const kind = rec.kind === "raise" || rec.kind === "lower" ? rec.kind : "same";
++  const approved = rec.approved === "auto" || rec.approved === "reid" || rec.approved === "user";
++  const undo = rec.undo && typeof rec.undo === "object" ? point(rec.undo) : null;
++  return {
++    status: status as AeModelChangeStatus,
++    sessionId,
++    title: str(rec.title) ?? "",
++    role: str(rec.role),
++    isLead: rec.is_lead === true,
++    from: point(rec.from),
++    to: point(rec.to),
++    kind,
++    raises: count(rec.raises),
++    cap: typeof rec.cap === "number" ? rec.cap : null,
++    counted: rec.counted === true,
++    approved: approved ? (rec.approved as AeModelChange["approved"]) : null,
++    reason: str(rec.reason) ?? "",
++    refusal: str(rec.refusal),
++    undo,
++  };
++}
++
++/** Put the model and effort from before a change back. The browser sends no caller, so no rule applies. */
++export async function aeUndoModelChange(sessionId: string, undo: AeModelPoint): Promise<void> {
++  const res = await authenticatedFetch(`/v1/ae/sessions/${encodeURIComponent(sessionId)}/model`, {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({
++      model: undo.model,
++      effort: undo.effort,
++      undo: true,
++      reason: "Undo",
++    }),
++  });
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  // A 200 can still mean nothing moved (for example "unchanged"); never read that as undone.
++  const body = (await res.json().catch(() => null)) as { status?: unknown } | null;
++  if (body?.status !== "changed") throw new Error("Could not undo: nothing changed");
++}
++
++/** "Sonnet", or the id itself for a model with no Claude family. */
++export function aeModelPointName(model: string | null): string {
++  if (!model) return "its model";
++  const family = aeModelFamily(model);
++  return family === "other" || family === "codex" ? model : AE_MODEL_FAMILY_NAMES[family];
++}
++
++/** The family a point's dot takes its color from, or null with no model. */
++export function aeModelPointFamily(at: AeModelPoint): AeModelFamily | null {
++  return at.model ? aeModelFamily(at.model) : null;
++}
++
++/** "Sonnet medium"; the effort is left out when unknown. */
++export function aeModelPointText(at: AeModelPoint): string {
++  return [aeModelPointName(at.model), at.effort].filter(Boolean).join(" ");
++}
++
++/** The `ae.model_start` label ("<model>|<effort>") as a point, or null when absent. */
++export function parseAeModelStart(label: string | undefined): AeModelPoint | null {
++  if (!label) return null;
++  const [model, effort] = label.split("|");
++  const parsed = { model: model || null, effort: effort || null };
++  return parsed.model || parsed.effort ? parsed : null;
++}
++
++/** A non-negative whole number label, or null. */
++export function aeLabelCount(label: string | undefined): number | null {
++  const n = label !== undefined && /^\d+$/.test(label) ? Number(label) : NaN;
++  return Number.isFinite(n) ? n : null;
++}
++
++const FAMILY_RANK: Readonly<Record<string, number>> = { haiku: 0, sonnet: 1, opus: 2, fable: 3 };
++const EFFORT_RANK: Readonly<Record<string, number>> = {
++  low: 0,
++  medium: 1,
++  high: 2,
++  xhigh: 3,
++  max: 4,
++};
++
++/**
++ * Whether a helper now runs above the model and effort it started on: family first
++ * (haiku < sonnet < opus < fable), then effort. A part either side does not
++ * name is skipped; with nothing to compare, the raise label stands (true).
++ */
++export function aeRunsAboveStart(now: AeModelPoint, start: AeModelPoint): boolean {
++  const family = (m: string | null) => (m ? FAMILY_RANK[aeModelFamily(m)] : undefined);
++  const effort = (e: string | null) => (e ? EFFORT_RANK[e] : undefined);
++  const pairs = [
++    [family(now.model), family(start.model)],
++    [effort(now.effort), effort(start.effort)],
++  ];
++  for (const [a, b] of pairs) {
++    if (a === undefined || b === undefined || a === b) continue;
++    return a > b;
++  }
++  const compared = pairs.some(([a, b]) => a !== undefined && b !== undefined);
++  return !compared;
++}
+diff --git a/web/src/pages/settings/AeRolesEditor.tsx b/web/src/pages/settings/AeRolesEditor.tsx
+index 9df764e1c8ddab62470bc37559db7bbad150b4ef..301a35868440a44d1dbf6880e3f9ce204029c162 100644
+--- a/web/src/pages/settings/AeRolesEditor.tsx
++++ b/web/src/pages/settings/AeRolesEditor.tsx
+@@ -305,11 +305,7 @@ export function AeRolesEditor({
+         <h3 className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+           Model changes in this preset
+         </h3>
+-        <RuleRow
+-          title="Raise a stuck child, or lower the lead"
+-          hint="Applies to both directions"
+-          later
+-        >
++        <RuleRow title="Raise a stuck child, or lower the lead" hint="Applies to both directions">
+           <AeSegmented
+             label="Raise a stuck child, or lower the lead"
+             value={draft.rules.raise_or_lower}
+@@ -322,7 +318,6 @@ export function AeRolesEditor({
+         <RuleRow
+           title="Lead steps down for mechanical work"
+           hint="Watching CI, applying decided fixes: the Builder's model"
+-          later
+         >
+           <AeSegmented
+             label="Lead steps down for mechanical work"
+@@ -333,7 +328,7 @@ export function AeRolesEditor({
+             disabled={saving}
+           />
+         </RuleRow>
+-        <RuleRow title="Automatic raises per child" hint="After this, every raise asks you" later>
++        <RuleRow title="Automatic raises per child" hint="After this, every raise asks you">
+           <AeStepper
+             label="Automatic raises per child"
+             value={draft.rules.auto_raises}
+diff --git a/web/src/shell/AeAgentMeta.tsx b/web/src/shell/AeAgentMeta.tsx
+index 92a17ad155f29bd94f148fb667e2b6f4a0f1b071..cdf587cd5b61dc1aec8d46f4a56bfdc6bf2f2636 100644
+--- a/web/src/shell/AeAgentMeta.tsx
++++ b/web/src/shell/AeAgentMeta.tsx
+@@ -4,6 +4,12 @@
+ 
+ import { createContext, useContext, useMemo, type ReactNode } from "react";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
++import {
++  aeLabelCount,
++  aeModelPointText,
++  aeRunsAboveStart,
++  parseAeModelStart,
++} from "@/lib/aeModelChange";
+ import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+ import {
+   AE_MODEL_FAMILIES,
+@@ -104,7 +110,17 @@ export function AeAgentMetaLine({
+   const cost = usage?.costUsd ?? null;
+   const tokens = usage?.tokens != null && usage.tokens > 0 ? usage.tokens : null;
+   const model = withModel ? (child.model ?? child.routed_model ?? native?.model ?? null) : null;
+-  if (!role && !model && !effort && cost === null && tokens === null) return null;
++  const raises = aeLabelCount(child.labels?.["ae.raises"]) ?? 0;
++  const cap = aeLabelCount(child.labels?.["ae.raise_cap"]);
++  const started = parseAeModelStart(child.labels?.["ae.model_start"]);
++  const raisedTitle = `Raised ${raises} time${raises === 1 ? "" : "s"}${
++    started ? ` from ${aeModelPointText(started)}` : ""
++  }`;
++  const nowModel = child.model ?? child.routed_model ?? native?.model ?? null;
++  // The count is history; the arrow shows only while the helper still runs above where it started.
++  const raised =
++    raises >= 1 && (!started || aeRunsAboveStart({ model: nowModel, effort }, started));
++  if (!role && !model && !effort && cost === null && tokens === null && !raised) return null;
+   return (
+     <p
+       className={cn(
+@@ -136,6 +152,19 @@ export function AeAgentMetaLine({
+         </span>
+       )}
+       {effort && <span data-testid="subagent-effort">{effort}</span>}
++      {raised && (
++        <span data-testid="subagent-raised" title={raisedTitle} className="shrink-0 text-amber-500">
++          &uarr;
++        </span>
++      )}
++      {raises >= 1 && cap !== null && raises >= cap && (
++        <span
++          data-testid="subagent-cap-reached"
++          className="shrink-0 rounded bg-foreground/[0.07] px-1.5 text-[10px]"
++        >
++          cap reached
++        </span>
++      )}
+       {(cost !== null || tokens !== null) && (
+         <span className="ml-auto shrink-0 tabular-nums" data-testid="subagent-cost">
+           {cost !== null && aeFormatCost(cost)}
+diff --git a/web/src/shell/AeAgentsUsage.test.tsx b/web/src/shell/AeAgentsUsage.test.tsx
+index 4046042bdf0fbcced14c060c6394650946cfa29c..7a1e1589f49cfb15d565c5c845f305b3cb24fd2f 100644
+--- a/web/src/shell/AeAgentsUsage.test.tsx
++++ b/web/src/shell/AeAgentsUsage.test.tsx
+@@ -323,3 +323,60 @@ describe("Agents card usage", () => {
+     expect(document.body.textContent).not.toContain("0 tokens");
+   });
+ });
++
++describe("AeAgentMetaLine raise marks", () => {
++  const row = (labels: Record<string, string>) =>
++    ({
++      id: "r",
++      title: "t",
++      task_summary: null,
++      tool: null,
++      session_name: null,
++      labels,
++      current_task_status: "completed",
++      busy: false,
++      last_message_preview: null,
++      pending_elicitations_count: 0,
++    }) as unknown as ChildSessionInfo;
++
++  const mark = (c: ChildSessionInfo) =>
++    render(
++      <QueryClientProvider client={new QueryClient()}>
++        <AeAgentMetaLine child={c} />
++      </QueryClientProvider>,
++    );
++
++  it("shows an amber arrow whose title says how often and from what", () => {
++    mark(
++      row({ "ae.raises": "2", "ae.model_start": "claude-sonnet-5-5|medium", "ae.raise_cap": "3" }),
++    );
++    expect(screen.getByTestId("subagent-raised").getAttribute("title")).toBe(
++      "Raised 2 times from Sonnet medium",
++    );
++    expect(screen.queryByTestId("subagent-cap-reached")).toBeNull();
++  });
++
++  it("says Raised 1 time without a start label, and marks the cap when reached", () => {
++    mark(row({ "ae.raises": "1", "ae.raise_cap": "1" }));
++    expect(screen.getByTestId("subagent-raised").getAttribute("title")).toBe("Raised 1 time");
++    expect(screen.getByTestId("subagent-cap-reached").textContent).toBe("cap reached");
++  });
++
++  it.each([
++    ["claude-opus-4-8", true],
++    ["claude-sonnet-5-5", false],
++    ["claude-haiku-4-5", false],
++  ])("shows the arrow for %s only while above the start family: %s", (model, shown) => {
++    mark({
++      ...row({ "ae.raises": "1", "ae.model_start": "claude-sonnet-5-5|medium" }),
++      model,
++    } as never);
++    expect(screen.queryByTestId("subagent-raised") !== null).toBe(shown);
++  });
++
++  it("shows nothing for a helper that was never raised", () => {
++    mark(row({ "ae.raises": "0", "ae.raise_cap": "0" }));
++    expect(screen.queryByTestId("subagent-raised")).toBeNull();
++    expect(screen.queryByTestId("subagent-cap-reached")).toBeNull();
++  });
++});

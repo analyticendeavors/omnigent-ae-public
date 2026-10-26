@@ -103,7 +103,7 @@ export function moveButton(
         announce(`${session.title}: marked ${status}.`);
         await deps.refresh();
       } catch (error) {
-        const card = pressed.closest<HTMLElement>("article.card");
+        const card = pressed.closest<HTMLElement>("article.card, li");
         if (card) flash(card, describeError(error), "error");
       }
     },

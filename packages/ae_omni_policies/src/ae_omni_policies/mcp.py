@@ -14,7 +14,10 @@ slots), ``omni_set_status`` (``ae.status`` on a session) and
 ``post_message``, ``schedule_checkin``, ``list_prs`` (the server's cards plus
 ``gh`` on the host, :mod:`ae_omni_policies.gh`) and ``ask_reid`` (an MCP
 elicitation, which OmniGent shows as a pop-up). The first three write and sit
-on :data:`WRITING_TOOLS`.
+on :data:`WRITING_TOOLS`. ``report_review`` (2026-10-24) records a lead's final review counts
+for the preset run log (:mod:`ae_omni_policies.preset_runs`) and is a writer too.
+``preset_insights_read`` and ``submit_preset_suggestions`` (2026-10-24) are the scheduled
+preset reviewer's pair; the second writes.
 
 Every tool is a thin HTTP call to the OmniGent server with the token
 ``omnigent login`` stored (or ``OMNIGENT_TOKEN``), through
@@ -44,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import sys
 from collections.abc import Sequence
 from datetime import date
@@ -334,13 +338,47 @@ CREATE_SESSION_SCHEMA: dict[str, Any] = {
         },
         "orchestrator": {
             "type": "string",
-            "description": "Your own session id (conv_...), recorded on the new session.",
+            "description": (
+                "Your own session id, recorded on the new session (filled in when left out). "
+                "It joins your family: the sidebar groups it under you, and you and the "
+                "sessions you start hold one slot between you, up to 3 of them working at once."
+            ),
+        },
+        "role": {
+            "type": "string",
+            "enum": ["lead", "planner", "reviewer", "builder", "helper"],
+            "description": (
+                "The role this session plays; it gets the model and effort your preset sets "
+                "for that role."
+            ),
+        },
+        "model": {
+            "type": "string",
+            "description": "A model catalog id for the session; wins over the role's model.",
+        },
+        "effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "xhigh", "max"],
+            "description": "Reasoning effort for the session; wins over the role's effort.",
+        },
+        "preset": {
+            "type": "string",
+            "description": "A preset id the new session opens on, for the helpers it starts.",
         },
         "ride_unparked": {
             "type": "boolean",
             "description": (
                 "Start it past the slot limit. Only after Reid picked that in ask_reid; the "
                 "session is marked overflow."
+            ),
+        },
+        "standalone": {
+            "type": "boolean",
+            "description": (
+                "Open a chat of its own for Reid instead of a helper (a handoff): it joins "
+                "no family, holds its own slot, and runs as lead on preset (your default "
+                "preset when left out). Pass key (or a distinct title) for each handoff, or "
+                "a live chat with the same title is returned. Give its link to Reid."
             ),
         },
     },
@@ -434,6 +472,144 @@ ASK_REID_SCHEMA: dict[str, Any] = {
         },
     },
     "required": ["question", "options"],
+    "additionalProperties": False,
+}
+
+REPORT_REVIEW_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "reviewers_run": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many reviewers ran in this review.",
+        },
+        "findings_returned": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many findings the reviewers returned after you merged them.",
+        },
+        "findings_fixed": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "How many of those findings you fixed.",
+        },
+        "call_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 100,
+            "description": (
+                "A name for this review round, e.g. 'final review' or 'fix check 2'. A second "
+                "call with a name already counted in this run is ignored, so a repeated call "
+                "never counts twice."
+            ),
+        },
+    },
+    "required": ["reviewers_run", "findings_returned", "findings_fixed"],
+    "additionalProperties": False,
+}
+
+PRESET_INSIGHTS_READ_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+_PRESET_CHANGE_PATHS = (
+    "roles.(lead|planner|builder|helper|reviewer), roles.reviewer.reviewers.(0|1|2) or "
+    "rules.(raise_or_lower|lead_steps_down|auto_raises|helpers|review_merge|"
+    "reviewer_unavailable)"
+)
+SUBMIT_PRESET_SUGGESTIONS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 800,
+            "description": "One paragraph on what the review found.",
+        },
+        "suggestions": {
+            "type": "array",
+            "maxItems": 5,
+            "description": "At most five suggestions, or no_change items for what you checked.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string", "enum": ["own", "starter", "no_change"]},
+                    "owner": {
+                        "type": ["string", "null"],
+                        "description": "The preset's owner. Omit for your own; others need admin.",
+                    },
+                    "preset_id": {
+                        "type": ["string", "null"],
+                        "description": "Required for own and no_change.",
+                    },
+                    "title": {"type": "string", "minLength": 1, "maxLength": 120},
+                    "why": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 800,
+                        "description": "Run count and the numbers it rests on.",
+                    },
+                    "saving": {
+                        "type": ["string", "null"],
+                        "maxLength": 200,
+                        "description": "Expected saving, such as 'about $5 per run'. "
+                        "Required for own and starter.",
+                    },
+                    "changes": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "description": "own needs at least one; no_change none.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path": {
+                                    "type": "string",
+                                    "description": f"One of {_PRESET_CHANGE_PATHS}.",
+                                },
+                                "value": {
+                                    "description": "The new JSON value for that path, in the "
+                                    "preset's own shape."
+                                },
+                            },
+                            "required": ["path", "value"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["kind", "title", "why"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["summary", "suggestions"],
+    "additionalProperties": False,
+}
+
+SET_SESSION_MODEL_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "session_id": {
+            "type": "string",
+            "description": "The session to change: your own, or one you started.",
+        },
+        "model": {
+            "type": "string",
+            "description": "The model catalog id, such as claude-opus-5-5. Omit to keep it.",
+        },
+        "effort": {
+            "type": "string",
+            "enum": ["low", "medium", "high", "xhigh", "max"],
+            "description": "The reasoning effort. Leave out to keep it.",
+        },
+        "reason": {
+            "type": "string",
+            "maxLength": 200,
+            "description": "One plain sentence on why, shown to Reid in the notice and the log.",
+        },
+    },
+    "required": ["session_id", "reason"],
     "additionalProperties": False,
 }
 
@@ -531,6 +707,8 @@ TOOLS: list[types.Tool] = [
             "repository directory) and post its brief as the first message. Holds a slot: at "
             "the limit it answers slots_full with who holds them (blocked and failed sessions "
             "hold none). Idempotent by key: a retry returns the live session (existing: true). "
+            "Pass role (planner, reviewer, builder, helper) for the model and effort your "
+            "preset sets for that role, or standalone to open a handoff chat for Reid. "
             "Returns the session id and its URL."
         ),
         inputSchema=CREATE_SESSION_SCHEMA,
@@ -570,6 +748,42 @@ TOOLS: list[types.Tool] = [
         ),
         inputSchema=ASK_REID_SCHEMA,
     ),
+    types.Tool(
+        name="set_session_model",
+        description=(
+            "Change the model or effort of your own session or one you started, under your "
+            "preset's rules. It may apply at once and tell Reid, ask him first in a pop-up, or "
+            "be refused; the answer says which. A Codex helper takes effort changes only."
+        ),
+        inputSchema=SET_SESSION_MODEL_SCHEMA,
+    ),
+    types.Tool(
+        name="report_review",
+        description=(
+            "After the final review of your work, record what it found: reviewers run, "
+            "findings returned and findings fixed. Counts only; it feeds the preset run log. "
+            "Calls in one run add up; pass call_id so a repeat of the same round is not "
+            "counted twice."
+        ),
+        inputSchema=REPORT_REVIEW_SCHEMA,
+    ),
+    types.Tool(
+        name="preset_insights_read",
+        description=(
+            "Preset reviewer only: read how role presets performed since the last review "
+            "(runs, model changes, preset switches, the presets). Answers due false with a "
+            "reason when no review is due. Call it once."
+        ),
+        inputSchema=PRESET_INSIGHTS_READ_SCHEMA,
+    ),
+    types.Tool(
+        name="submit_preset_suggestions",
+        description=(
+            "Preset reviewer only: submit the review's summary and at most five suggestions. "
+            "The server checks them and answers an error naming what to fix. Call it once."
+        ),
+        inputSchema=SUBMIT_PRESET_SUGGESTIONS_SCHEMA,
+    ),
 ]
 TOOL_NAMES: tuple[str, ...] = tuple(tool.name for tool in TOOLS)
 # The tools that change something. A propose-only agent's allowlist must not
@@ -583,6 +797,9 @@ WRITING_TOOLS: frozenset[str] = frozenset(
         "create_session",
         "post_message",
         "schedule_checkin",
+        "set_session_model",
+        "report_review",
+        "submit_preset_suggestions",
     }
 )
 
@@ -817,20 +1034,40 @@ def session_url(settings: Settings, path: str | None) -> str | None:
 
 async def create_session(client: OmniClient, args: dict[str, Any]) -> Any:
     body = {key: value for key, value in args.items() if value not in (None, "")}
+    if "orchestrator" not in body:
+        # The runner puts the calling session's id in the MCP server's environment.
+        caller = _caller_session()
+        if caller:
+            body["orchestrator"] = caller
     status, data = await client.call("POST", "/v1/ae/sessions", json_body=body)
     if status == 200 and isinstance(data, dict):
         return data | {"url": session_url(client.settings, data.get("path"))}
     error = data.get("error") if isinstance(data, dict) else None
+    if status == 409 and isinstance(error, dict) and error.get("code") == "family_full":
+        return {
+            "outcome": "family_full",
+            "reason": error.get("message"),
+            "working": error.get("working") or [],
+            "limit": error.get("limit"),
+            "instruction": (
+                "Nothing was started. Wait for one of your sessions to finish or set it to "
+                "review, then start this one."
+            ),
+        }
     if status == 409 and isinstance(error, dict):
+        instruction = (
+            "Nothing was started. Give Reid the handoff note as a block to paste into a new "
+            "chat, and tell him every slot is taken."
+            if body.get("standalone")
+            else "Nothing was started. Ask Reid with ask_reid: wait for a slot (recommended), "
+            "park one of the working sessions, or start it anyway with ride_unparked."
+        )
         return {
             "outcome": "slots_full",
             "reason": error.get("message"),
             "working": error.get("working") or [],
             "limit": error.get("limit"),
-            "instruction": (
-                "Nothing was started. Ask Reid with ask_reid: wait for a slot (recommended), "
-                "park one of the working sessions, or start it anyway with ride_unparked."
-            ),
+            "instruction": instruction,
         }
     answer: dict[str, Any] = {"error": f"Could not start the session: {_message(status, data)}"}
     if isinstance(error, dict) and error.get("session_id"):
@@ -1087,6 +1324,118 @@ async def ask_reid(session: Any, args: dict[str, Any]) -> Any:
     return {"answer": picked, "action": "accept", "recommended": picked == options[0]}
 
 
+async def set_session_model(client: OmniClient, session: Any, args: dict[str, Any]) -> Any:
+    """Change a session's model or effort; on ``needs_approval`` ask Reid, and on a yes confirm."""
+    session_id = str(args["session_id"])
+    body = {
+        key: args.get(key)
+        for key in ("model", "effort", "reason")
+        if args.get(key) not in (None, "")
+    }
+    caller = _caller_session()
+    if not caller:
+        # Without a caller the route would treat this as the browser and skip the rules.
+        return {
+            "error": (
+                "Could not find this session's own id (OMNIGENT_RUNNER_PRIMARY_SESSION_ID is "
+                "not set), so nothing was changed. Ask Reid to change the model in the picker."
+            )
+        }
+    body["caller"] = caller
+    path = f"/v1/ae/sessions/{session_id}/model"
+    status, data = await client.call("POST", path, json_body=body)
+    if status != 200 or not isinstance(data, dict):
+        return {"error": f"Could not change the model: {_message(status, data)}"}
+    if data.get("status") != "needs_approval":
+        return data
+    options = list(data.get("options") or [])
+    if len(options) < 2:
+        return data | {"instruction": "Ask Reid in chat whether to make this change."}
+    asked = await ask_reid(session, {"question": data.get("question"), "options": options})
+    if "reason" in asked:
+        # No pop-ups on this client: hand the question back for the chat.
+        return data | {
+            "instruction": (
+                "Ask Reid in chat: the question on one line, then the two options, recommended "
+                "first. If he says yes, call set_session_model again."
+            )
+        }
+    if asked.get("answer") != options[0]:
+        return data | {"status": "declined"}
+    status, confirmed = await client.call("POST", path, json_body=body | {"confirmed": True})
+    if status != 200 or not isinstance(confirmed, dict):
+        return {"error": f"Could not change the model: {_message(status, confirmed)}"}
+    if confirmed.get("status") == "changed":
+        confirmed["approved"] = "reid"
+    return confirmed
+
+
+async def report_review(client: OmniClient, args: dict[str, Any]) -> Any:
+    """Record the lead's review counts for the preset run log, as the calling session."""
+    caller = (
+        os.environ.get("OMNIGENT_RUNNER_PRIMARY_SESSION_ID")
+        or os.environ.get("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID")
+        or ""
+    ).strip()
+    if not caller:
+        return {
+            "error": (
+                "Could not find this session's own id (OMNIGENT_RUNNER_PRIMARY_SESSION_ID is "
+                "not set), so nothing was recorded."
+            )
+        }
+    body = {key: args.get(key) for key in REPORT_REVIEW_SCHEMA["required"]}
+    if args.get("call_id") is not None:
+        body["call_id"] = args["call_id"]
+    status, data = await client.call(
+        "POST", f"/v1/ae/sessions/{caller}/review-report", json_body=body
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"error": f"Could not record the review: {_message(status, data)}"}
+    return data
+
+
+def _caller_session() -> str:
+    return (
+        os.environ.get("OMNIGENT_RUNNER_PRIMARY_SESSION_ID")
+        or os.environ.get("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID")
+        or ""
+    ).strip()
+
+
+_NO_OWN_ID = (
+    "Could not find this session's own id (OMNIGENT_RUNNER_PRIMARY_SESSION_ID is not set), "
+    "so nothing was {done}."
+)
+
+
+async def preset_insights_read(client: OmniClient, args: dict[str, Any]) -> Any:  # noqa: ARG001
+    """The preset reviewer's one read, as the calling session."""
+    caller = _caller_session()
+    if not caller:
+        return {"error": _NO_OWN_ID.format(done="read")}
+    status, data = await client.call(
+        "POST", f"/v1/ae/sessions/{caller}/preset-insights", json_body={}
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"error": f"Could not read the preset insights: {_message(status, data)}"}
+    return data
+
+
+async def submit_preset_suggestions(client: OmniClient, args: dict[str, Any]) -> Any:
+    """Submit the reviewer's suggestions, as the calling session."""
+    caller = _caller_session()
+    if not caller:
+        return {"error": _NO_OWN_ID.format(done="submitted")}
+    body = {key: args.get(key) for key in SUBMIT_PRESET_SUGGESTIONS_SCHEMA["properties"]}
+    status, data = await client.call(
+        "POST", f"/v1/ae/sessions/{caller}/preset-suggestions", json_body=body
+    )
+    if status != 200 or not isinstance(data, dict):
+        return {"error": f"Could not submit the suggestions: {_message(status, data)}"}
+    return data
+
+
 HANDLERS = {
     "park_fork": park_fork,
     "list_tags": list_tags,
@@ -1100,9 +1449,14 @@ HANDLERS = {
     "post_message": post_message,
     "schedule_checkin": schedule_checkin,
     "list_prs": list_prs,
+    "report_review": report_review,
+    "preset_insights_read": preset_insights_read,
+    "submit_preset_suggestions": submit_preset_suggestions,
 }
 # Tools that talk to Reid through the MCP session, not the server.
 SESSION_HANDLERS = {"ask_reid": ask_reid}
+# Tools that need both: the server for the change and the MCP session to ask Reid.
+CLIENT_SESSION_HANDLERS = {"set_session_model": set_session_model}
 
 
 def create_server(client: OmniClient) -> Server:
@@ -1119,9 +1473,14 @@ def create_server(client: OmniClient) -> Server:
     ) -> Sequence[types.TextContent]:
         handler = HANDLERS.get(name)
         asker = SESSION_HANDLERS.get(name)
-        if handler is None and asker is None:
+        both = CLIENT_SESSION_HANDLERS.get(name)
+        if handler is None and asker is None and both is None:
             return _text({"error": f"unknown tool {name!r}; tools are {', '.join(TOOL_NAMES)}"})
         try:
+            if both is not None:
+                return _text(
+                    await both(client, server.request_context.session, dict(arguments or {}))
+                )
             if asker is not None:
                 return _text(await asker(server.request_context.session, dict(arguments or {})))
             assert handler is not None
@@ -1164,6 +1523,7 @@ if __name__ == "__main__":
 
 
 __all__ = [
+    "CLIENT_SESSION_HANDLERS",
     "HANDLERS",
     "SESSION_HANDLERS",
     "TOOLS",

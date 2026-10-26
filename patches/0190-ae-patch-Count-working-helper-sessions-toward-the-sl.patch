@@ -1,0 +1,677 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 10:00:25 -0700
+Subject: [PATCH 190/191] [ae-patch] Count working helper sessions toward the
+ slot limit when Settings turns it on
+
+---
+ web/src/components/AeSlotsPill.test.tsx       | 43 +++++++++-
+ web/src/components/AeSlotsPill.tsx            |  5 +-
+ .../components/aeRail/AeRailTriage.test.tsx   |  4 +-
+ web/src/lib/aeFamily.ts                       | 22 +++++
+ web/src/lib/aeLabels.test.ts                  | 27 +++++-
+ web/src/lib/aeLabels.ts                       | 21 ++---
+ web/src/lib/aeSlotLimit.test.tsx              | 40 +++++++++
+ web/src/lib/aeSlotLimit.ts                    | 86 +++++++++++++++++--
+ web/src/shell/AeStatusMenu.test.tsx           | 76 +++++++++++++++-
+ web/src/shell/AeStatusMenu.tsx                | 67 ++++++++++++---
+ 10 files changed, 353 insertions(+), 38 deletions(-)
+
+diff --git a/web/src/components/AeSlotsPill.test.tsx b/web/src/components/AeSlotsPill.test.tsx
+index 24f46118fe82c65cfe4258446a771d84206c79fe..6225e8efe26b97e0604e29606d18ef536f30c1e3 100644
+--- a/web/src/components/AeSlotsPill.test.tsx
++++ b/web/src/components/AeSlotsPill.test.tsx
+@@ -4,7 +4,7 @@ import { MemoryRouter } from "react-router-dom";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import type { Conversation } from "@/hooks/useConversations";
+ import { AE_PARKING_LOT_PATH } from "@/lib/aeLabels";
+-import { AE_SLOT_LIMIT_QUERY_KEY } from "@/lib/aeSlotLimit";
++import { AE_HELPERS_COUNT_QUERY_KEY, AE_SLOT_LIMIT_QUERY_KEY } from "@/lib/aeSlotLimit";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+ import { AeSlotsPill, readAeSlotCount } from "./AeSlotsPill";
+ 
+@@ -66,6 +66,32 @@ describe("readAeSlotCount", () => {
+     expect(readAeSlotCount(qc)).toBe(2);
+   });
+ 
++  it("counts working helpers only when Settings counts them", () => {
++    const helper = (id: string, parent: string) =>
++      row(id, { labels: { "ae.status": "working", "ae.orch": parent } });
++    const qc = new QueryClient();
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([row("lead"), helper("k1", "lead"), helper("k2", "lead"), helper("o", "gone")]),
++    );
++    expect(readAeSlotCount(qc)).toBe(1);
++    qc.setQueryData(AE_HELPERS_COUNT_QUERY_KEY, true);
++    expect(readAeSlotCount(qc)).toBe(4);
++  });
++
++  it("counts a self-parented or cyclic row as a lead", () => {
++    const qc = new QueryClient();
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([
++        row("self", { labels: { "ae.status": "working", "ae.orch": "self" } }),
++        row("r1", { labels: { "ae.status": "working", "ae.orch": "r2" } }),
++        row("r2", { labels: { "ae.status": "working", "ae.orch": "r1" } }),
++      ]),
++    );
++    expect(readAeSlotCount(qc)).toBe(3);
++  });
++
+   it("is zero with nothing cached", () => {
+     expect(readAeSlotCount(new QueryClient())).toBe(0);
+   });
+@@ -118,6 +144,21 @@ describe("AeSlotsPill", () => {
+     expect(screen.getByTestId("ae-slots-count")).toHaveAttribute("data-full", "true");
+   });
+ 
++  it("shows helpers in the pill once the setting is on", () => {
++    const qc = new QueryClient();
++    qc.setQueryData(AE_HELPERS_COUNT_QUERY_KEY, true);
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([row("lead"), row("k1", { labels: { "ae.status": "working", "ae.orch": "lead" } })]),
++    );
++    renderPill(qc);
++    expect(screen.getByRole("link", { name: "Session Dashboard 2/3" })).toBeInTheDocument();
++    act(() => {
++      qc.setQueryData(AE_HELPERS_COUNT_QUERY_KEY, false);
++    });
++    expect(screen.getByRole("link", { name: "Session Dashboard 1/3" })).toBeInTheDocument();
++  });
++
+   it("repaints when the cache changes", () => {
+     const qc = new QueryClient();
+     renderPill(qc);
+diff --git a/web/src/components/AeSlotsPill.tsx b/web/src/components/AeSlotsPill.tsx
+index 2f1005b7ab1825f23b286510b428d50fdf5c4717..cfc60822056e8b9c67a5dd58f2f3ce2385c1cae8 100644
+--- a/web/src/components/AeSlotsPill.tsx
++++ b/web/src/components/AeSlotsPill.tsx
+@@ -17,7 +17,7 @@ import { LayoutDashboardIcon } from "lucide-react";
+ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+ import { type MouseEvent, useCallback, useEffect, useSyncExternalStore } from "react";
+ import { AE_PARKING_LOT_PATH, countAeSlots, isAeDashboardPath } from "@/lib/aeLabels";
+-import { useAeSlotLimit } from "@/lib/aeSlotLimit";
++import { readAeHelpersCount, useAeHelpersCount, useAeSlotLimit } from "@/lib/aeSlotLimit";
+ import { syncAeAppBadge } from "@/lib/aeAppBadge";
+ import { useLocation } from "@/lib/routing";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+@@ -29,7 +29,7 @@ export function readAeSlotCount(queryClient: QueryClient): number {
+   const rows = queryClient
+     .getQueriesData<ConversationsInfiniteData>({ queryKey: ["conversations"] })
+     .flatMap(([, data]) => data?.pages.flatMap((page) => page.data) ?? []);
+-  return countAeSlots(rows);
++  return countAeSlots(rows, readAeHelpersCount(queryClient));
+ }
+ 
+ /** Subscribes to the query cache; the snapshot is a number, so React skips unchanged counts. */
+@@ -48,6 +48,7 @@ export interface AeSlotsPillProps {
+ }
+ 
+ export function AeSlotsPill({ onNavigate }: AeSlotsPillProps) {
++  useAeHelpersCount();
+   const count = useAeSlotCount();
+   const limit = useAeSlotLimit();
+   const full = count >= limit;
+diff --git a/web/src/components/aeRail/AeRailTriage.test.tsx b/web/src/components/aeRail/AeRailTriage.test.tsx
+index 211b6c83453ad2d5bf027ac8978eb75ef7c40abf..a6610524fcfb63a1e488d8b77ea67b1c74b6e604 100644
+--- a/web/src/components/aeRail/AeRailTriage.test.tsx
++++ b/web/src/components/aeRail/AeRailTriage.test.tsx
+@@ -60,7 +60,7 @@ let client: QueryClient;
+ 
+ function route(url: string, init?: RequestInit): Promise<Response> {
+   const method = init?.method ?? "GET";
+-  if (url === "/v1/ae/capacity") return Promise.resolve(json(200, { limit: 3, working: [] }));
++  if (url.split("?")[0] === "/v1/ae/capacity") return Promise.resolve(json(200, { limit: 3, working: [] }));
+   if (method === "PATCH" && url === "/v1/sessions/s1") return Promise.resolve(json(200, {}));
+   if (url === "/v1/ae/gate/s1/reply") return Promise.resolve(gateAnswer());
+   if (url.startsWith("/v1/ae/lot")) {
+@@ -150,7 +150,7 @@ describe("AeRailTriage", () => {
+ 
+   it("refuses Working at the slot limit with the menu's toast", async () => {
+     mocks.fetch.mockImplementation((url: string, init?: RequestInit) =>
+-      url === "/v1/ae/capacity"
++      url.split("?")[0] === "/v1/ae/capacity"
+         ? Promise.resolve(
+             json(200, {
+               limit: 3,
+diff --git a/web/src/lib/aeFamily.ts b/web/src/lib/aeFamily.ts
+index a75aa66225297d570d61c8ebd85e23a6dbed56cb..7cf0089fa1ce12c4b4f445a73178db1cb4d99f60 100644
+--- a/web/src/lib/aeFamily.ts
++++ b/web/src/lib/aeFamily.ts
+@@ -31,6 +31,28 @@ export function aeOrchParent(labels: Labels): string | null {
+   return orch && orch !== AE_ORCH_UNKNOWN ? orch : null;
+ }
+ 
++/**
++ * Whether a row is a helper another session started: `ae.orch` names a parent that is
++ * not the row itself and whose chain (as far as `byId` reaches) does not lead back to
++ * it. A self-parent or a cycle has no lead above it and counts as a lead
++ * (mirrors `ae_omni_policies.sessions.is_helper`).
++ */
++export function aeIsHelper(row: FamilyRow, byId?: ReadonlyMap<string, FamilyRow>): boolean {
++  const first = aeOrchParent(row.labels);
++  if (first === null) return false;
++  let parent: string = first;
++  const seen = new Set([row.id]);
++  for (let depth = 0; depth < MAX_DEPTH; depth++) {
++    if (seen.has(parent)) return parent !== row.id;
++    seen.add(parent);
++    const above: FamilyRow | undefined = byId?.get(parent);
++    const next: string | null = above ? aeOrchParent(above.labels) : null;
++    if (next === null) return true; // a lead, or a parent out of sight, sits above it
++    parent = next;
++  }
++  return true;
++}
++
+ /** The session this one descends from in the sidebar: its starter, else its fork source. */
+ export function aeFamilyParent(labels: Labels): string | null {
+   return aeOrchParent(labels) ?? value(labels, AE_FORK_SOURCE_KEY);
+diff --git a/web/src/lib/aeLabels.test.ts b/web/src/lib/aeLabels.test.ts
+index a8713ee385ee26db856e0eda6780351453a8388b..984002ad542cf8f027c5a3b9674674d5a5853a55 100644
+--- a/web/src/lib/aeLabels.test.ts
++++ b/web/src/lib/aeLabels.test.ts
+@@ -119,8 +119,8 @@ describe("slots", () => {
+     expect(
+       countAeSlots([working("lead"), child("k1", "lead"), child("k2", "lead"), child("g", "k1")]),
+     ).toBe(1);
+-    // Children of a lead that is not listed still share its slot.
+-    expect(countAeSlots([child("k1", "gone"), child("k2", "gone"), working("b")])).toBe(2);
++    // A helper whose lead is absent, parked or archived holds nothing (2026-10-26).
++    expect(countAeSlots([child("k1", "gone"), child("k2", "gone"), working("b")])).toBe(1);
+     expect(countAeSlots([child("x", "1"), child("y", "1")])).toBe(2);
+     // A fork is related in the sidebar but keeps its own slot.
+     const fork = { id: "f", labels: { "ae.status": "working", "omnigent.fork.source_id": "lead" } };
+@@ -128,6 +128,29 @@ describe("slots", () => {
+   });
+ });
+ 
++describe("countAeSlots with helpers counted", () => {
++  const working = (id: string) => ({ id, labels: { "ae.status": "working" } });
++  const child = (id: string, parent: string, status = "working") => ({
++    id,
++    labels: { "ae.status": status, "ae.orch": parent },
++  });
++
++  it("counts each working helper as well as its lead; finished ones and repeats do not", () => {
++    const rows = [
++      working("lead"),
++      child("k1", "lead"),
++      child("k2", "lead"),
++      child("done", "lead", "review"),
++      child("orphan", "gone"),
++      working("other"),
++    ];
++    expect(countAeSlots(rows)).toBe(2);
++    expect(countAeSlots(rows, false)).toBe(2);
++    expect(countAeSlots(rows, true)).toBe(5);
++    expect(countAeSlots([...rows, child("k1", "lead")], true)).toBe(5);
++  });
++});
++
+ describe("isAeDashboardPath", () => {
+   const base = "/extensions/analyticendeavors.parking-lot/";
+ 
+diff --git a/web/src/lib/aeLabels.ts b/web/src/lib/aeLabels.ts
+index 976de343a9c5e438de3b23d33afca5413d0544e4..bbd978cbd47b3b7f4ef741ec11b2be0778cf984d 100644
+--- a/web/src/lib/aeLabels.ts
++++ b/web/src/lib/aeLabels.ts
+@@ -10,7 +10,7 @@
+ // or blank value as unset.
+ 
+ import type { Conversation } from "@/hooks/useConversations";
+-import { familySlotKey } from "@/lib/aeFamily";
++import { aeIsHelper } from "@/lib/aeFamily";
+ 
+ export const AE_NAMESPACE = "ae.";
+ 
+@@ -159,20 +159,21 @@ export function pickAeLabels(labels: unknown): Record<string, string> {
+ }
+ 
+ /**
+- * Count the slots held across rows, each session counted once by id and each
+- * session family once (a lead and the sessions it started hold one slot; see
+- * `lib/aeFamily.ts`).
++ * Count the slots held across rows, each session once by id. A lead holds one
++ * slot for its family (see `lib/aeFamily.ts`); a helper it started (a row with an
++ * `ae.orch` parent) holds none, even when its lead is parked, archived or not
++ * loaded, unless `helpersCount` (Settings > Global Policies, slot cap) is on, when
++ * each working helper holds one of its own. Mirrors `ae_omni_policies.sessions.held_keys`.
+  */
+ export function countAeSlots(
+   conversations: Iterable<AeSlotRow & Pick<Conversation, "id">>,
++  helpersCount = false,
+ ): number {
+-  const rows = new Map<string, AeSlotRow & Pick<Conversation, "id">>();
+-  for (const conversation of conversations) {
+-    if (!rows.has(conversation.id)) rows.set(conversation.id, conversation);
+-  }
++  const rows = [...conversations];
++  const byId = new Map(rows.map((row) => [row.id, row] as const));
+   const held = new Set<string>();
+-  for (const row of rows.values()) {
+-    if (isAeSlot(row)) held.add(familySlotKey(row, rows));
++  for (const row of rows) {
++    if (isAeSlot(row) && (helpersCount || !aeIsHelper(row, byId))) held.add(row.id);
+   }
+   return held.size;
+ }
+diff --git a/web/src/lib/aeSlotLimit.test.tsx b/web/src/lib/aeSlotLimit.test.tsx
+index 6ac685d428ace65a2e6b49eb3764ed642dd0fc94..017dac5cf8c49f412e13364af0a7fa7e9077a084 100644
+--- a/web/src/lib/aeSlotLimit.test.tsx
++++ b/web/src/lib/aeSlotLimit.test.tsx
+@@ -12,9 +12,12 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
+ import {
+   AE_SLOT_LIMIT_QUERY_KEY,
+   fetchAeSlotLimit,
++  fetchAeSlotRules,
+   parseAeSlotLimit,
+   readAeSlotLimit,
++  refreshAeSlotLimit,
+   rememberAeSlotLimit,
++  useAeHelpersCount,
+   useAeSlotLimit,
+ } from "./aeSlotLimit";
+ 
+@@ -95,6 +98,43 @@ describe("useAeSlotLimit", () => {
+     expect(qc.getQueryData(AE_SLOT_LIMIT_QUERY_KEY)).toBe(4);
+   });
+ 
++  it("takes the limit and the helpers setting from one answer", async () => {
++    mocks.fetch.mockResolvedValue(json(200, { limit: 5, helpers_count: true }));
++    const qc = new QueryClient();
++    function Both() {
++      return (
++        <span data-testid="both">
++          {useAeSlotLimit()}/{String(useAeHelpersCount())}
++        </span>
++      );
++    }
++    render(
++      <QueryClientProvider client={qc}>
++        <Both />
++      </QueryClientProvider>,
++    );
++    await waitFor(() => expect(screen.getByTestId("both")).toHaveTextContent("5/true"));
++    expect(mocks.fetch).toHaveBeenCalledTimes(1);
++  });
++
++  it("asks again after a policy save instead of sharing a request begun before it", async () => {
++    let finishOld: (res: Response) => void = () => {};
++    mocks.fetch.mockReturnValueOnce(
++      new Promise<Response>((resolve) => {
++        finishOld = resolve;
++      }),
++    );
++    const qc = new QueryClient();
++    const old = fetchAeSlotRules();
++    mocks.fetch.mockResolvedValueOnce(json(200, { limit: 6, helpers_count: true }));
++    await refreshAeSlotLimit(qc);
++    const fresh = await fetchAeSlotRules();
++    expect(fresh).toEqual({ limit: 6, helpersCount: true });
++    expect(mocks.fetch.mock.calls.length).toBeGreaterThanOrEqual(2);
++    finishOld(json(200, { limit: 3, helpers_count: false }));
++    await expect(old).resolves.toEqual({ limit: 3, helpersCount: false });
++  });
++
+   it("stays on three when the route cannot answer", async () => {
+     mocks.fetch.mockImplementation(async () => {
+       throw new TypeError("Failed to fetch");
+diff --git a/web/src/lib/aeSlotLimit.ts b/web/src/lib/aeSlotLimit.ts
+index a39114d032fd443a607baf362c22ff101b89cc6c..e67246f12d97740fa0a1cdebd60cdfab5e2189c4 100644
+--- a/web/src/lib/aeSlotLimit.ts
++++ b/web/src/lib/aeSlotLimit.ts
+@@ -6,11 +6,12 @@
+ // it from here. `AE_SLOT_LIMIT` in `aeLabels` is only the
+ // fallback until the answer arrives, or when the route cannot answer.
+ 
+-import { type QueryClient, useQuery } from "@tanstack/react-query";
++import { type QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
+ import { AE_SLOT_LIMIT } from "@/lib/aeLabels";
+ import { authenticatedFetch } from "@/lib/identity";
+ 
+ export const AE_SLOT_LIMIT_QUERY_KEY = ["ae", "slot-limit"] as const;
++export const AE_HELPERS_COUNT_QUERY_KEY = ["ae", "helpers-count"] as const;
+ 
+ /**
+  * A policy save can move the limit at any time: this tab asks again at once
+@@ -23,14 +24,40 @@ export function parseAeSlotLimit(value: unknown): number | null {
+   return typeof value === "number" && Number.isInteger(value) && value >= 1 ? value : null;
+ }
+ 
++/** The two settings one `GET /v1/ae/capacity` answer carries, from one policy snapshot. */
++export interface AeSlotRules {
++  limit: number;
++  helpersCount: boolean;
++}
++
++let inFlightRules: Promise<AeSlotRules> | null = null;
++
++/**
++ * `limit` and `helpers_count` from one `GET /v1/ae/capacity`; throws when the route
++ * cannot answer. Callers asking at the same moment share the one request, so the
++ * two never come from different policy snapshots.
++ */
++export function fetchAeSlotRules(): Promise<AeSlotRules> {
++  if (inFlightRules) return inFlightRules;
++  const request = (async () => {
++    const res = await authenticatedFetch("/v1/ae/capacity", { method: "GET" });
++    if (!res.ok) throw new Error(`GET /v1/ae/capacity answered ${res.status}`);
++    const answer = (await res.json()) as { limit?: unknown; helpers_count?: unknown };
++    const limit = parseAeSlotLimit(answer.limit);
++    if (limit === null) throw new Error("GET /v1/ae/capacity carried no slot limit");
++    return { limit, helpersCount: answer.helpers_count === true };
++  })();
++  inFlightRules = request;
++  const clear = () => {
++    if (inFlightRules === request) inFlightRules = null;
++  };
++  request.then(clear, clear);
++  return request;
++}
++
+ /** `limit` from `GET /v1/ae/capacity`; throws when the route cannot answer. */
+ export async function fetchAeSlotLimit(): Promise<number> {
+-  const res = await authenticatedFetch("/v1/ae/capacity", { method: "GET" });
+-  if (!res.ok) throw new Error(`GET /v1/ae/capacity answered ${res.status}`);
+-  const answer = (await res.json()) as { limit?: unknown };
+-  const limit = parseAeSlotLimit(answer.limit);
+-  if (limit === null) throw new Error("GET /v1/ae/capacity carried no slot limit");
+-  return limit;
++  return (await fetchAeSlotRules()).limit;
+ }
+ 
+ /** Keep a limit another capacity answer carried, so every count repaints with it. */
+@@ -45,9 +72,47 @@ export function rememberAeSlotLimit(queryClient: QueryClient, value: unknown): n
+  * cap's `limit`, and the counts would otherwise wait out the five minutes.
+  */
+ export function refreshAeSlotLimit(queryClient: QueryClient): Promise<void> {
++  // A request already in flight began before the save and would hand back the
++  // pre-save limit and helpers setting; drop it so the refetch asks again.
++  inFlightRules = null;
++  void queryClient.invalidateQueries({ queryKey: AE_HELPERS_COUNT_QUERY_KEY });
+   return queryClient.invalidateQueries({ queryKey: AE_SLOT_LIMIT_QUERY_KEY });
+ }
+ 
++/** `helpers_count` from `GET /v1/ae/capacity`: whether working helpers hold slots. */
++export async function fetchAeHelpersCount(): Promise<boolean> {
++  return (await fetchAeSlotRules()).helpersCount;
++}
++
++/** Keep the setting another capacity answer carried. */
++export function rememberAeHelpersCount(queryClient: QueryClient, value: unknown): boolean {
++  const on = value === true;
++  queryClient.setQueryData(AE_HELPERS_COUNT_QUERY_KEY, on);
++  return on;
++}
++
++/** The last "helpers count" answer, or off. */
++export function readAeHelpersCount(queryClient: QueryClient): boolean {
++  return queryClient.getQueryData<boolean>(AE_HELPERS_COUNT_QUERY_KEY) ?? false;
++}
++
++/** Whether helper sessions count toward the limit (Settings, default off). */
++export function useAeHelpersCount(): boolean {
++  const queryClient = useQueryClient();
++  const { data } = useQuery({
++    queryKey: AE_HELPERS_COUNT_QUERY_KEY,
++    queryFn: async () => {
++      // Both settings come from the one answer, so the pill never mixes two snapshots.
++      const rules = await fetchAeSlotRules();
++      queryClient.setQueryData(AE_SLOT_LIMIT_QUERY_KEY, rules.limit);
++      return rules.helpersCount;
++    },
++    staleTime: STALE_MS,
++    retry: false,
++  });
++  return data ?? false;
++}
++
+ /** The last limit the server gave, or the fallback. */
+ export function readAeSlotLimit(queryClient: QueryClient): number {
+   return queryClient.getQueryData<number>(AE_SLOT_LIMIT_QUERY_KEY) ?? AE_SLOT_LIMIT;
+@@ -55,9 +120,14 @@ export function readAeSlotLimit(queryClient: QueryClient): number {
+ 
+ /** The server's slot limit for a count; the fallback until it answers or when it fails. */
+ export function useAeSlotLimit(): number {
++  const queryClient = useQueryClient();
+   const { data } = useQuery({
+     queryKey: AE_SLOT_LIMIT_QUERY_KEY,
+-    queryFn: fetchAeSlotLimit,
++    queryFn: async () => {
++      const rules = await fetchAeSlotRules();
++      queryClient.setQueryData(AE_HELPERS_COUNT_QUERY_KEY, rules.helpersCount);
++      return rules.limit;
++    },
+     staleTime: STALE_MS,
+     retry: false,
+   });
+diff --git a/web/src/shell/AeStatusMenu.test.tsx b/web/src/shell/AeStatusMenu.test.tsx
+index 19c3a21c25c826fef73ad6d7536254e09a7210c1..058d634a83dd241ad48587d1c0bcc1e250f73e8d 100644
+--- a/web/src/shell/AeStatusMenu.test.tsx
++++ b/web/src/shell/AeStatusMenu.test.tsx
+@@ -81,7 +81,7 @@ function serve({
+   patch = json(200, {}),
+ }: { capacity?: Response | Error; patch?: Response } = {}) {
+   mocks.fetch.mockImplementation(async (path: string, init?: RequestInit) => {
+-    if (path === "/v1/ae/capacity") {
++    if (path.split("?")[0] === "/v1/ae/capacity") {
+       if (capacity instanceof Error) throw capacity;
+       return capacity;
+     }
+@@ -316,12 +316,12 @@ describe("applyAeStatus", () => {
+ 
+   it("lets a family member work in its family's slot, even with its top unloaded", async () => {
+     // Server: three families hold all three slots; "kid" works in the lead's.
+-    const row = (id: string, family: string) => ({ id, title: id, family });
++    const row = (id: string, family: string, helper = false) => ({ id, title: id, family, helper });
+     const answer = () =>
+       serve({
+         capacity: json(200, {
+           limit: 3,
+-          working: [row("lead", "lead"), row("kid", "lead"), row("b", "b"), row("c", "c")],
++          working: [row("lead", "lead"), row("kid", "lead", true), row("b", "b"), row("c", "c")],
+         }),
+       });
+     answer();
+@@ -341,6 +341,76 @@ describe("applyAeStatus", () => {
+     expect(refused).toMatchObject({ ok: false, used: 3, limit: 3, source: "server" });
+   });
+ 
++  it("lets a fork ride the slot of a working session it hangs from", async () => {
++    // Three families at the limit; the fork's chain points at "kid", which works as a
++    // helper of the lead whose family holds a slot, so the fork takes none.
++    const row = (id: string, family: string, helper = false) => ({ id, title: id, family, helper });
++    serve({
++      capacity: json(200, {
++        limit: 3,
++        working: [row("lead", "lead"), row("kid", "lead", true), row("b", "b"), row("c", "c")],
++      }),
++    });
++    const qc = new QueryClient();
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([conv("fork", { labels: { "ae.orch": "kid" } })]),
++    );
++    expect(await checkAeSlotRoom(qc, "fork")).toEqual({ ok: true });
++  });
++
++  it("counts working helpers when the server says helpers count", async () => {
++    const row = (id: string, helper = false) => ({ id, title: id, family: id, helper });
++    serve({
++      capacity: json(200, {
++        limit: 3,
++        helpers_count: true,
++        working: [row("lead"), row("k1", true), row("k2", true)],
++      }),
++    });
++    const qc = new QueryClient();
++    qc.setQueryData(["conversations", "", false], pages([conv("solo")]));
++    expect(await checkAeSlotRoom(qc, "solo")).toMatchObject({ ok: false, used: 3, limit: 3 });
++    serve({
++      capacity: json(200, {
++        limit: 3,
++        helpers_count: false,
++        working: [row("lead"), row("k1", true), row("k2", true)],
++      }),
++    });
++    expect(await checkAeSlotRoom(qc, "solo")).toEqual({ ok: true });
++  });
++
++  it("falls back to the cached ae.orch label when an older server sends no helper field", async () => {
++    const row = (id: string) => ({ id, title: id, family: id });
++    serve({
++      capacity: json(200, {
++        limit: 3,
++        working: [row("lead"), row("kid"), row("b"), row("c")],
++      }),
++    });
++    const qc = new QueryClient();
++    qc.setQueryData(
++      ["conversations", "", false],
++      pages([conv("kid", { labels: { "ae.status": "working", "ae.orch": "lead" } }), conv("solo")]),
++    );
++    // kid is a helper by its cached label; rows the cache lacks count as leads, so 3 of 3.
++    expect(await checkAeSlotRoom(qc, "solo")).toMatchObject({ ok: false, used: 3, limit: 3 });
++  });
++
++  it("trusts the server's own_helper flag when the helper row is not loaded", async () => {
++    const lead = (id: string) => ({ id, title: id, family: id, helper: false });
++    const working = [lead("a"), lead("b"), lead("c")];
++    const qc = new QueryClient();
++    serve({ capacity: json(200, { limit: 3, helpers_count: false, own_helper: true, working }) });
++    expect(await checkAeSlotRoom(qc, "unloaded")).toEqual({ ok: true });
++    serve({ capacity: json(200, { limit: 3, helpers_count: true, own_helper: true, working }) });
++    expect(await checkAeSlotRoom(qc, "unloaded")).toMatchObject({ ok: false, used: 3 });
++    expect(mocks.fetch).toHaveBeenCalledWith("/v1/ae/capacity?session=unloaded", {
++      method: "GET",
++    });
++  });
++
+   it("surfaces the server's refusal of the PATCH and leaves the cache alone", async () => {
+     serve({ patch: json(403, { detail: "Only the owner can edit labels" }, "Forbidden") });
+     const qc = new QueryClient();
+diff --git a/web/src/shell/AeStatusMenu.tsx b/web/src/shell/AeStatusMenu.tsx
+index 6654b353b0a2566b6349a19bfed9855b3dfce840..3d90ed53588c25205bca9be1b0ccbc2d3a03a62c 100644
+--- a/web/src/shell/AeStatusMenu.tsx
++++ b/web/src/shell/AeStatusMenu.tsx
+@@ -21,8 +21,13 @@ import {
+   aeStatusOf,
+   isAeSlot,
+ } from "@/lib/aeLabels";
+-import { familySlotChain, familySlotKey } from "@/lib/aeFamily";
+-import { readAeSlotLimit, rememberAeSlotLimit } from "@/lib/aeSlotLimit";
++import { aeIsHelper, familySlotChain, familySlotKey } from "@/lib/aeFamily";
++import {
++  readAeHelpersCount,
++  readAeSlotLimit,
++  rememberAeHelpersCount,
++  rememberAeSlotLimit,
++} from "@/lib/aeSlotLimit";
+ import { authenticatedFetch } from "@/lib/identity";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+ import { AeMenuFold } from "@/shell/AeMenuFold";
+@@ -104,10 +109,15 @@ interface CapacityRow {
+   title?: string | null;
+   /** The family it counts against (`/v1/ae/capacity`, 2026-10-23). */
+   family?: string;
++  /** Started by another session (`/v1/ae/capacity`, 2026-10-26). */
++  helper?: boolean;
+ }
+ 
+ interface CapacityAnswer {
+   limit?: unknown;
++  helpers_count?: unknown;
++  /** Whether the asked-about session is a helper (`?session=`, 2026-10-26). */
++  own_helper?: boolean | null;
+   slots_used?: number;
+   working?: CapacityRow[];
+ }
+@@ -135,6 +145,26 @@ function ridesInHeldSlot(queryClient: QueryClient, sessionId: string, held: Set<
+   return [familySlotKey(own, byId), ...familySlotChain(own, byId)].some((id) => held.has(id));
+ }
+ 
++/** Whether the session is a helper another one started (it holds no slot unless counted). */
++function ownIsHelper(
++  queryClient: QueryClient,
++  sessionId: string,
++  fromServer?: boolean | null,
++): boolean {
++  // The server knows rows the sidebar has not loaded; the cache covers an older server.
++  if (typeof fromServer === "boolean") return fromServer;
++  const rows = cachedRows(queryClient);
++  const own = rows.find((row) => row.id === sessionId);
++  return own !== undefined && aeIsHelper(own, new Map(rows.map((row) => [row.id, row] as const)));
++}
++
++/** A working row's helper flag: the server's, else the cached row's `ae.orch` (older server). */
++function rowIsHelper(row: CapacityRow, cached: Map<string, Conversation>): boolean {
++  if (typeof row.helper === "boolean") return row.helper;
++  const own = cached.get(row.id);
++  return own !== undefined && aeIsHelper(own, cached);
++}
++
+ /** A session list row from the cache, for a write that starts from a drag. */
+ export function aeCachedRow(queryClient: QueryClient, id: string): Conversation | undefined {
+   return cachedRows(queryClient).find((row) => row.id === id);
+@@ -149,15 +179,25 @@ export async function checkAeSlotRoom(
+   sessionId: string,
+ ): Promise<AeSlotRoom> {
+   try {
+-    const res = await authenticatedFetch("/v1/ae/capacity", { method: "GET" });
++    const res = await authenticatedFetch(
++      `/v1/ae/capacity?session=${encodeURIComponent(sessionId)}`,
++      { method: "GET" },
++    );
+     if (res.ok) {
+       const answer = (await res.json()) as CapacityAnswer;
+       const working = (answer.working ?? []).filter((row) => row.id !== sessionId);
+       const limit = rememberAeSlotLimit(queryClient, answer.limit) ?? readAeSlotLimit(queryClient);
+-      // A family holds one slot (2026-10-23): joining one that works takes none.
+-      const families = new Set(working.map((row) => row.family ?? row.id));
++      const helpers = rememberAeHelpersCount(queryClient, answer.helpers_count);
++      // A lead holds one slot for its family (2026-10-23); a helper holds none unless
++      // Settings counts helpers (2026-10-26).
++      if (!helpers && ownIsHelper(queryClient, sessionId, answer.own_helper)) return { ok: true };
++      const cachedById = new Map(cachedRows(queryClient).map((row) => [row.id, row] as const));
++      const holding = working.filter((row) => helpers || !rowIsHelper(row, cachedById));
++      // A family holds one slot (2026-10-23): joining one that works takes none. With
++      // helpers counted each holds its own, so nothing rides.
++      const families = new Set(holding.map((row) => (helpers ? row.id : (row.family ?? row.id))));
+       const held = new Set([...families, ...working.map((row) => row.id)]);
+-      if (ridesInHeldSlot(queryClient, sessionId, held)) return { ok: true };
++      if (!helpers && ridesInHeldSlot(queryClient, sessionId, held)) return { ok: true };
+       const used = families.size;
+       if (used < limit) return { ok: true };
+       return {
+@@ -173,16 +213,23 @@ export async function checkAeSlotRoom(
+   }
+   const seen = new Set<string>([sessionId]);
+   const working: Conversation[] = [];
+-  for (const row of cachedRows(queryClient)) {
++  const allRows = cachedRows(queryClient);
++  const byId = new Map(allRows.map((row) => [row.id, row] as const));
++  for (const row of allRows) {
+     if (seen.has(row.id)) continue;
+     seen.add(row.id);
+     if (isAeSlot(row)) working.push(row);
+   }
+   const limit = readAeSlotLimit(queryClient);
+-  const byId = new Map(cachedRows(queryClient).map((row) => [row.id, row] as const));
+-  const families = new Set(working.map((row) => familySlotKey(row, byId)));
++  const helpers = readAeHelpersCount(queryClient);
++  if (!helpers && ownIsHelper(queryClient, sessionId)) return { ok: true };
++  const families = new Set(
++    working
++      .filter((row) => helpers || !aeIsHelper(row, byId))
++      .map((row) => (helpers ? row.id : familySlotKey(row, byId))),
++  );
+   const held = new Set([...families, ...working.map((row) => row.id)]);
+-  if (ridesInHeldSlot(queryClient, sessionId, held)) return { ok: true };
++  if (!helpers && ridesInHeldSlot(queryClient, sessionId, held)) return { ok: true };
+   if (families.size < limit) return { ok: true };
+   return {
+     ok: false,

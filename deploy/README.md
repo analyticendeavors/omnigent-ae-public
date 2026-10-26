@@ -31,6 +31,8 @@ What is in this directory:
 | `systemd/ae-omnigent-host.service` | user unit: `omnigent host` in the foreground, restarted on failure |
 | `systemd/user/ae-omnigent-auto-update.service`, `.timer` | user units: `auto-update.sh` every ten minutes |
 | `systemd/user/ae-omnigent-limits.service`, `.timer` | user units: the plan limits relay every five minutes |
+| `systemd/user/ae-omnigent-secrets-meta.service`, `.timer` | user units: the Key Vault expiry relay once a day (Secret expiry dates) |
+| `vault-source-tags.sh` | propose, then with `--apply` set, the `ae-source` tags that give app secrets their Entra end dates (Secret expiry dates) |
 | `host-relink.sh`, `systemd/user/ae-omnigent-host-relink.service` | the host's reconnect: a sign-in link and a host restart when the server rejects it (Re-login, Host relink) |
 | `host-container.sh`, `host-container/` | a second user's host as a container: the images, the compose project with its egress proxy, the sign-in (Second user's host (container)) |
 | `systemd/user/ae-omnigent-host-container@.service` | user unit template: one user's host container project, `up -d` and `down` |
@@ -96,7 +98,7 @@ default `/secure/env/omnigent-ae.env`; the host unit reads
 
 | File | Keys |
 |---|---|
-| server (`AE_SERVER_SECRETS`) | required: `POSTGRES_PASSWORD`; with OIDC sign-in, `OMNIGENT_OIDC_CLIENT_SECRET` and `OMNIGENT_OIDC_COOKIE_SECRET`; with task-store, `AE_CF_ACCESS_CLIENT_ID` and `AE_CF_ACCESS_CLIENT_SECRET`. Optional: `AE_GITHUB_TOKEN`, `AE_FABRIC_WAKE_URL_<NAME>`, `AE_FABRIC_SUSPEND_KEY_<NAME>`, `AE_FABRIC_CAPACITIES_URL`, `AE_FABRIC_CAPACITIES_KEY`, `AE_DATABRICKS_CLIENT_ID`, `AE_DATABRICKS_CLIENT_SECRET`, `AE_AZURE_COST_TENANT_ID`, `AE_AZURE_COST_CLIENT_ID`, `AE_AZURE_COST_CLIENT_SECRET`, `AE_SHARED_ACCOUNTS_KEY` |
+| server (`AE_SERVER_SECRETS`) | required: `POSTGRES_PASSWORD`; with OIDC sign-in, `OMNIGENT_OIDC_CLIENT_SECRET` and `OMNIGENT_OIDC_COOKIE_SECRET`; with task-store, `AE_CF_ACCESS_CLIENT_ID` and `AE_CF_ACCESS_CLIENT_SECRET`. Optional: `AE_GITHUB_TOKEN`, `AE_GIT_TOKEN_<OWNER>` (one per GitHub account the Git repos card reads), `AE_FABRIC_WAKE_URL_<NAME>`, `AE_FABRIC_SUSPEND_KEY_<NAME>`, `AE_FABRIC_CAPACITIES_URL`, `AE_FABRIC_CAPACITIES_KEY`, `AE_DATABRICKS_CLIENT_ID`, `AE_DATABRICKS_CLIENT_SECRET`, `AE_AZURE_COST_TENANT_ID`, `AE_AZURE_COST_CLIENT_ID`, `AE_AZURE_COST_CLIENT_SECRET`, `AE_SHARED_ACCOUNTS_KEY` |
 | host (`/secure/env/omnigent-host.env`) | `CLAUDE_CODE_OAUTH_TOKEN` |
 
 Compose reads the env file with `$` interpolation, so no value may contain a
@@ -174,6 +176,32 @@ then `deploy/compose.sh up -d --force-recreate omnigent` so the server reads it.
 A token that expires shows as a 401 on the page, per repo, with the fix named. A
 token that can read but not merge shows Merge's refusal with the missing
 permissions named.
+
+#### The Git repos card's tokens (optional)
+
+The Admin Center's Git repos card (read only) lists open pull requests, Dependabot
+alerts and branches with no pull request across several GitHub accounts. Turn it on
+with `AE_GIT_SWEEP_CONFIG` (`owner/repo:path` of a Dependency Sweep config JSON)
+and/or `AE_GIT_REPOS` (comma-separated `owner/repo`); `AE_GIT_VIEW_ONLY` repos are
+shown but left out of the totals; `AE_GIT_SWEEP_WORKFLOW` names the sweep workflow
+(default `dependency-sweep.yml`). `AE_GIT_KEEP_BRANCHES` (comma-separated
+`owner/repo:branch`, exact branch name) marks branches kept on purpose: the card still
+lists them but does not count them as old branches.
+
+Each owner reads with `AE_GIT_TOKEN_<OWNER>` (owner upper-cased, every run of
+non-alphanumerics as `_`: `fabrikam-labs` is `AE_GIT_TOKEN_FABRIKAM_LABS`), else
+`AE_GITHUB_TOKEN`. An owner with neither shows as not connected and its repos are
+not called. Use fine-grained, read-only tokens:
+
+| Permission | Level | For |
+|---|---|---|
+| Metadata | Read-only | added by GitHub automatically |
+| Contents | Read-only | branches, the sweep config, lockfiles |
+| Pull requests | Read-only | open pull requests |
+| Dependabot alerts | Read-only | the alert lists (a 403 on alerts names this) |
+| Actions | Read-only | the sweep repo's last runs |
+
+Restart the server after adding a key; a 401 on the card means the token expired.
 
 #### The Admin Center's Fabric secrets (optional)
 
@@ -874,6 +902,100 @@ systemctl --user enable --now ae-omnigent-limits.timer
 journalctl --user -u ae-omnigent-limits -n 20
 ```
 
+## Secret expiry dates
+
+The Admin Center's Server secrets list shows, for each key, when the vault says its
+secret expires, when it last changed, and Edit and Rotate links (2026-10-23). The
+server never reads Key Vault (the vault uses access policies, and a live container
+should not hold a vault login for dates), so a daily user timer on the box does the
+reading as reid: `python -m ae_omni_policies.secrets_relay` runs `az keyvault secret
+list` (attributes only; it never calls `secret show`) and posts name, enabled, expires
+and updated to `POST /v1/ae/secrets/meta` (until 2026-10-23 only for the names this
+deployment maps to its keys; now for every secret, below). No value, length or hash is read or sent. The server keeps
+the last post in `/data/ae-secrets-meta.json` (`AE_SECRETS_META_FILE` moves it; set
+it empty to keep it in memory). A card with no reading, or one over 36 hours old, says
+so and names the command below.
+
+```
+# 1. the relay module in the host venv (the auto-update does this on a release
+#    that changes packages/ae_omni_policies)
+deploy/install-host.sh
+# 2. az logged in as this user (uv tool install azure-cli; az login --use-device-code)
+# 3. the timer, once a day at 06:15 local time
+cp deploy/systemd/user/ae-omnigent-secrets-meta.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ae-omnigent-secrets-meta.timer
+# 4. run it now and see what it would post, then post it
+~/.omnigent-host/venv/bin/python -m ae_omni_policies.secrets_relay --dry-run
+systemctl --user start ae-omnigent-secrets-meta.service
+journalctl --user -u ae-omnigent-secrets-meta -n 20
+```
+
+A secret shows "no expiry set" until someone sets one: in the portal on its Edit page,
+or `az keyvault secret set-attributes --vault-name ae-secrets-vault --name <name>
+--expires <date>`. Edit opens the secret in the Azure portal. Rotate opens the system
+that issues the value (GitHub, the Databricks account console, the Entra app) and the
+hint beside it names the account, because a Databricks login in the wrong tenant cost
+an hour on 2026-10-23.
+
+Since the Key Vault card (2026-10-23) the relay posts every secret of both vaults:
+the box's (`AE_VAULT_NAME`, default `ae-secrets-vault`) and each extra one
+(`AE_EXTRA_VAULTS`, comma-separated, default empty, so no extra vault; set it in `config/host.env`, which the relay unit loads, to add the website's vault). It also says, by key name only, whether `/secure/env/omnigent-host.env`
+(`AE_HOST_ENV_FILE`) has `CLAUDE_CODE_OAUTH_TOKEN`; the file is 640 root:reid, so reid
+can read it, and only a yes or no leaves the relay. A part it cannot read (an extra
+vault, the host's file, the Entra dates) is named in the journal and left out, the
+rest is posted, and the run exits 1 so the timer shows it.
+
+### Expiry alerts
+
+Since 2026-10-23 the server turns those dates into phone alarms. Right after each post
+it files a task in the task store (the same one the Parking Lot uses, so only when
+`AE_TASK_STORE_URL` and the Access token are set) for every secret whose effective
+expiry is 30 days or fewer away, in either vault; at 7 days it moves the same task's
+alarm, and once more on expiry. The alarm is `AE_SECRET_ALERT_TIME` (default 09:00) in
+`AE_TASK_STORE_TZ`, and the task app pushes it to the phone. Tasks land in the list
+named `AE_SECRET_ALERT_LIST` (no list when unset) with the `ae` tag when the app has
+it; the note links to the Rotate and Edit pages and names the owner set on the Key
+Vault card. When the expiry moves out (rotated), the server closes the task. What was
+sent is kept in `/data/ae-secret-alerts.json` (`AE_SECRET_ALERTS_FILE`), so restarts
+and repeat posts file nothing twice. `AE_SECRET_ALERTS=off` turns it off. A failure
+(the store down, a list name that matches nothing) is logged, shown on the card, and
+tried again with the next day's post. Owners set on the card live in
+`/data/ae-secret-owners.json` (`AE_SECRET_OWNERS_FILE`).
+
+### Entra end dates for app secrets
+
+Only 2 of 103 vault secrets carry an expiry, but every Entra app client secret has a
+real end date on its app. The relay reads them with `az ad app list --all` (appId,
+display name and each secret's `endDateTime`; never the `hint`, which is the start of
+the secret) and puts the latest one on each vault secret tagged
+`ae-source=entra:<appId>`. The card then shows the earlier of the vault's date and the
+app's, with "from Entra" beside it. Tags come back from `secret list`, so no value is
+read. The server's own GitHub calls do the same for `AE_GITHUB_TOKEN` from GitHub's
+`github-authentication-token-expiration` header ("from GitHub").
+
+`deploy/vault-source-tags.sh` proposes the tags: a known pair (azure-cost-client-secret
+is ae-omnigent-azure-cost, omnigent-oidc-client-secret is AE OmniGent, the server's
+`OMNIGENT_OIDC_CLIENT_ID`), or a secret whose name, less its `-client-secret` ending,
+has every word in exactly one app's display name. Already tagged secrets are left
+alone, and anything unsure is left out (add it to `KNOWN_SOURCES` in
+`secrets_relay.py` once its app is known). The script reads `AE_VAULT_NAME` and `AE_EXTRA_VAULTS` from the
+`config/host.env` next to it and prints which file it used; that is the relay unit's file
+only when run from the deployed tree (`~/deploy/omnigent-ae`), so run it there.
+
+```
+deploy/vault-source-tags.sh            # print each proposal and its az command; sets nothing
+deploy/vault-source-tags.sh --apply    # set them, keeping each secret's other tags
+systemctl --user start ae-omnigent-secrets-meta.service   # then post the new dates
+```
+
+Tagging does not count as a change. `set-attributes` bumps a secret's `updated`, so
+the card's "changed" date and its 180-day count read `created` instead, when the
+current version was made, which `secret list` reports and a tag never touches. An app
+with more than one client secret shows "latest of N": the relay uses the newest end
+date. A run that cannot read the Entra apps, the website's vault or the host's file
+says so, posts the rest, and the server keeps its previous reading of the missing
+part, marked "from <date>" on the card.
 ## Fast mode, per session
 
 The model menu of a Claude session has a Fast mode switch, which types

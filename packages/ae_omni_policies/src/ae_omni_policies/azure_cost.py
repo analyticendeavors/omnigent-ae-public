@@ -36,8 +36,10 @@ Management Reader role, a refused principal, too many pages) waits the hour like
 reading, because retrying cannot fix it and spends the shared rate limit (2026-10-22). A 429
 stops the pass and waits Azure's own retry time (one minute to one hour), or
 :data:`RATE_LIMIT_TTL_S` (15 minutes) without one, because every query made while limited
-only extends the limit. The newest day with data
-is ``through``, and the pace is computed up to it.
+only extends the limit. The limit is one fact about the pass, not an error on each unread
+subscription (2026-10-23): ``overview()`` carries ``rateLimit`` (``retryAt`` and ``goodAt``,
+the last pass that read anything) and the card says it once under the month total.
+The newest day with data is ``through``, and the pace is computed up to it.
 
 The spike check (the by-resource query) is separate from the totals (2026-10-22): when it
 fails, the totals stay, the previous reading's resources stay (stale flags beat none, and
@@ -90,6 +92,8 @@ from urllib.parse import urlencode
 
 import httpx
 from fastapi import APIRouter, FastAPI
+
+from ae_omni_policies import key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -306,6 +310,8 @@ async def _token(cfg: Config, transport: httpx.AsyncBaseTransport) -> str:
             ) from None
         if status != 200:
             if status == 401 or (status == 400 and _refused_principal(body)):
+                # The Admin Center's secrets list shows the refusal by its status only.
+                key_health.record("azure_cost", False, status)
                 raise AzureCostError(
                     f"Microsoft refused the Azure cost service principal ({status}). Check the "
                     "AE_AZURE_COST_* secrets and restart the stack.",
@@ -323,6 +329,7 @@ async def _token(cfg: Config, transport: httpx.AsyncBaseTransport) -> str:
         if isinstance(expires, bool) or not isinstance(expires, (int, float)) or expires <= 0:
             expires = 3600
         _token_cache[cfg.key()] = (token, _monotonic() + float(expires) - TOKEN_REFRESH_MARGIN_S)
+        key_health.record("azure_cost", True)
         return token
 
 
@@ -596,6 +603,9 @@ def _assemble(
                 "spent": round(spent, 2),
                 "currency": row_currency,
                 "counted": counted,
+                # False for a subscription never read (a cold start, a pass that stopped
+                # first): its $0 is not a reading, and the card says "not read yet".
+                "read": reading is not None,
                 "error": error,
                 # A stale note beside a new error would contradict it.
                 "note": None if reading is None or error else reading.get("note"),
@@ -640,6 +650,11 @@ _state: dict[str, Any] = {
     "mono": None,
     "ttl": CACHE_TTL_S,
     "key": None,
+    # Whether the last pass stopped on a 429, when the next try is due, and when a pass last
+    # read at least one subscription (the numbers' real age while limited).
+    "limited": False,
+    "due": None,
+    "good_at": None,
 }
 _task: asyncio.Task[None] | None = None
 # Whether this process has looked at the state file yet (once, on the first overview or at boot).
@@ -707,13 +722,18 @@ def _saved_reading(value: object) -> dict[str, Any] | None:
         return None
     if not isinstance(currency, (str, type(None))) or not isinstance(note, (str, type(None))):
         return None
-    return {
+    read_at = _instant(value.get("readAt"))
+    out: dict[str, Any] = {
         "daily": daily,
         "services": services,
         "resources": resources,
         "currency": currency,
         "note": note,
     }
+    if read_at is not None:
+        # Old state files have none; _load stamps those once when it restores them.
+        out["readAt"] = iso(read_at)
+    return out
 
 
 def _subscription_list(cfg: Config) -> list[list[str]]:
@@ -760,13 +780,26 @@ def _load(cfg: Config, path: Path | None) -> dict[str, Any] | None:
         _logger.warning("azure cost: ignoring malformed %s", path)
         return None
     kept: dict[str, dict[str, Any]] = {}
+    good_at = _instant(raw.get("goodAt"))
+    # Old files carry no per-reading time. Stamp each such reading once, with the time the
+    # file last had a good read, so a later partial pass cannot lend it a newer time.
+    legacy_at = iso(good_at or at)
     for sid, value in readings.items():
         reading = _saved_reading(value)
         if sid not in configured or reading is None:
             _logger.warning("azure cost: ignoring malformed %s", path)
             return None
+        reading.setdefault("readAt", legacy_at)
         kept[sid] = reading
-    return {"view": view, "readings": kept, "errors": dict(errors), "at": at, "due": due}
+    return {
+        "view": view,
+        "readings": kept,
+        "errors": dict(errors),
+        "at": at,
+        "due": due,
+        "limited": raw.get("limited") is True,
+        "good_at": good_at,
+    }
 
 
 def _save(cfg: Config, path: Path | None) -> None:
@@ -783,6 +816,8 @@ def _save(cfg: Config, path: Path | None) -> None:
         "principal": cfg.principal(),
         "at": iso(_state["at"]),
         "due": iso(_state["at"] + timedelta(seconds=_state["ttl"])),
+        "limited": bool(_state["limited"]),
+        "goodAt": iso(_state["good_at"]),
         "view": _state["view"],
         "readings": _state["readings"],
         "errors": _state["errors"],
@@ -828,6 +863,9 @@ def _restore(cfg: Config) -> None:
             "mono": _monotonic(),
             "ttl": min(max(left, 0.0), CACHE_TTL_S),
             "key": (cfg.key(), cfg.subscriptions),
+            "limited": saved["limited"],
+            "due": saved["due"],
+            "good_at": saved["good_at"],
         }
     )
 
@@ -843,6 +881,7 @@ async def _read(cfg: Config) -> None:
     errors: dict[str, str] = {}
     done: set[str] = set()
     backoff = 0.0
+    limited = False
     permanent: set[str] = set()
     spike_retry = False
 
@@ -859,12 +898,23 @@ async def _read(cfg: Config) -> None:
                         cfg, transport, token, sid, today, _state["readings"].get(sid)
                     )
                     spike_retry = spike_retry or reading.pop("spike") == "transient"
+                    # When this subscription was read, so a rate limit later in the pass
+                    # (or a later pass) does not make the whole snapshot look unread.
+                    reading["readAt"] = iso(_now())
                     _state["readings"][sid] = reading
                     done.add(sid)
                 except RateLimitedError as exc:
                     # Stop asking: more queries while limited only extend the limit.
+                    # The limit is one fact about the whole pass, shown once by the card
+                    # (``rateLimit``), not repeated as an error on every unread subscription.
                     backoff = exc.wait_s
-                    errors = unread(_scrub(str(exc), cfg))
+                    limited = True
+                    # Subscriptions this pass never reached keep their earlier error (a 403
+                    # stays a 403); the limit itself is not one.
+                    for left, _ in cfg.subscriptions:
+                        before = _state["errors"].get(left)
+                        if left not in done and left not in errors and before:
+                            errors[left] = before
                     break
                 except AzureCostError as exc:
                     errors[sid] = _scrub(str(exc), cfg)
@@ -890,6 +940,10 @@ async def _read(cfg: Config) -> None:
     retry = spike_retry or any(sid not in permanent for sid in errors)
     _state["ttl"] = backoff or (RETRY_TTL_S if retry else CACHE_TTL_S)
     _state["at"] = _now()
+    _state["limited"] = limited
+    _state["due"] = _state["at"] + timedelta(seconds=_state["ttl"])
+    if done:
+        _state["good_at"] = _state["at"]
     _state["view"] = _assemble(cfg, _state["readings"], errors, today)
     _save(cfg, _state_path())
     if errors:
@@ -911,6 +965,14 @@ def _begin(cfg: Config) -> None:
         _task = asyncio.get_running_loop().create_task(_read(cfg))
 
 
+def _rate_limit() -> dict[str, Any] | None:
+    """The one rate-limit note the card shows, or None: when the next try is due, and the
+    time of the last pass that read anything (the numbers' real age)."""
+    if not _state["limited"]:
+        return None
+    return {"retryAt": iso(_state["due"]), "goodAt": iso(_state["good_at"])}
+
+
 async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     """The card's data: the cache now, and a background reading when it is old."""
     cfg = config(environ)
@@ -925,7 +987,28 @@ async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
         "note": None,
         "reading": _task is not None and not _task.done(),
         "asOf": iso(_state["at"]),
+        "rateLimit": _rate_limit(),
         "view": view,
+    }
+
+
+def snapshot(environ: Mapping[str, str] | None = None) -> dict[str, Any] | None:
+    """What the last reading holds, for :mod:`.cost_targets` (2026-10-25); ``None`` when not
+    configured. It asks Azure nothing and starts no reading: ``readings`` (by subscription id:
+    daily amounts, per-month services, per-resource days, currency), ``errors``, ``names``,
+    ``at`` (a datetime or None), ``limited`` and the rate-limit note. Treat it as read only."""
+    cfg = config(environ)
+    if cfg is None:
+        return None
+    _restore(cfg)
+    return {
+        "subscriptions": list(cfg.subscriptions),
+        "readings": _state["readings"],
+        "errors": dict(_state["errors"]),
+        "at": _state["at"],
+        "limited": _state["limited"],
+        "goodAt": _state["good_at"],
+        "rateLimit": _rate_limit(),
     }
 
 
@@ -948,6 +1031,9 @@ def reset() -> None:
             "mono": None,
             "ttl": CACHE_TTL_S,
             "key": None,
+            "limited": False,
+            "due": None,
+            "good_at": None,
         }
     )
 

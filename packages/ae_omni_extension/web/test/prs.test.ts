@@ -784,3 +784,154 @@ describe("two cards with the same number in different repos", () => {
     expect(buttonNamed(first, "Squash into main")).toBeTruthy();
   });
 });
+
+describe("Mark ready and Update branch on the card", () => {
+  it("shows Mark ready on a draft, posts the head it showed, and redraws from the fresh card", async () => {
+    const { deps, request } = stubContext([
+      { ok: true, status: 200, body: card(7, { draft: false }) },
+    ]);
+    const target = host();
+    renderPrsSection(target, { data: prs([card(7, { draft: true })]), error: null }, deps);
+    const node = target.querySelector<HTMLElement>(".card-pr")!;
+    buttonNamed(node, "Mark ready for review").click();
+    await flush();
+    expect(request).toHaveBeenCalledWith({
+      method: "POST",
+      path: "/v1/ae/prs/analyticendeavors/omnigent-ae/7/ready",
+      body: { sha: SHA },
+    });
+  });
+
+  it("offers Update branch only when the server says it is allowed", () => {
+    const { deps } = stubContext();
+    const target = host();
+    renderPrsSection(
+      target,
+      {
+        data: prs([
+          card(1, { update_branch: { allowed: true, reason: null } }),
+          card(2, { update_branch: { allowed: false, reason: "Resolve conflicts manually." } }),
+          card(3),
+        ]),
+        error: null,
+      },
+      deps,
+    );
+    const nodes = [...target.querySelectorAll<HTMLElement>(".card-pr")];
+    expect(nodes.map((n) => !!n.textContent?.includes("Update branch"))).toEqual([
+      true,
+      false,
+      false,
+    ]);
+    expect(nodes.some((n) => n.textContent?.includes("Mark ready"))).toBe(false);
+  });
+
+  it("says Waiting for GitHub after Update branch is accepted, then refreshes", async () => {
+    const { deps, request, refresh } = stubContext([
+      { ok: true, status: 202, body: { accepted: true, message: "ok", head_sha: SHA } },
+    ]);
+    const target = host();
+    renderPrsSection(
+      target,
+      { data: prs([card(1, { update_branch: { allowed: true, reason: null } })]), error: null },
+      deps,
+    );
+    const node = target.querySelector<HTMLElement>(".card-pr")!;
+    buttonNamed(node, "Update branch").click();
+    await flush();
+    expect(request).toHaveBeenCalledWith({
+      method: "POST",
+      path: "/v1/ae/prs/analyticendeavors/omnigent-ae/1/update-branch",
+      body: { sha: SHA },
+    });
+    expect(refresh).toHaveBeenCalledWith(true);
+    expect(node.querySelector(".flash")).toBeNull();
+  });
+
+  it("does not call an accepted branch update failed when the refresh after it fails", async () => {
+    const { deps, refresh } = stubContext([
+      { ok: true, status: 202, body: { accepted: true, message: "ok", head_sha: SHA } },
+    ]);
+    refresh.mockRejectedValueOnce(new Error("offline"));
+    const target = host();
+    renderPrsSection(
+      target,
+      { data: prs([card(1, { update_branch: { allowed: true, reason: null } })]), error: null },
+      deps,
+    );
+    const node = target.querySelector<HTMLElement>(".card-pr")!;
+    buttonNamed(node, "Update branch").click();
+    await flush();
+    expect(node.querySelector(".flash")).toBeNull();
+  });
+});
+
+describe("Review details on the card", () => {
+  it("reads the compliance review only when opened, and shows the verdict and head", async () => {
+    const report = {
+      body: "All checks reviewed.",
+      verdict: "approved",
+      url: "https://github.com/analyticendeavors/omnigent-ae/pull/7#issuecomment-1",
+      updated_at: "2026-10-23T10:00:00Z",
+      reviewed_sha: SHA,
+      revision: "stale",
+    };
+    const { deps, request } = stubContext([{ ok: true, status: 200, body: { report } }]);
+    const target = host();
+    renderPrsSection(
+      target,
+      { data: prs([card(7, { body: "Why this change", changed_files: 3, additions: 10, deletions: 2 })]), error: null },
+      deps,
+    );
+    const details = target.querySelector<HTMLDetailsElement>("details.pr-details")!;
+    expect(request).not.toHaveBeenCalled();
+    expect(details.textContent).toContain("3 files · +10 · -2");
+    expect(details.textContent).toContain("Why this change");
+    details.open = true;
+    await flush();
+    expect(request).toHaveBeenCalledWith({
+      method: "GET",
+      path: "/v1/ae/prs/analyticendeavors/omnigent-ae/7/compliance",
+      body: undefined,
+    });
+    expect(details.textContent).toContain("Compliance: approved, is for an older head");
+    expect(details.textContent).toContain("All checks reviewed.");
+  });
+
+  it("says a read failed and retries it", async () => {
+    const { deps, request } = stubContext([
+      { ok: false, status: 502, body: { error: { message: "GitHub down" } } },
+      { ok: true, status: 200, body: { report: null } },
+    ]);
+    const target = host();
+    renderPrsSection(target, { data: prs([card(7)]), error: null }, deps);
+    const details = target.querySelector<HTMLDetailsElement>("details.pr-details")!;
+    details.open = true;
+    await flush();
+    expect(details.textContent).toContain("not read");
+    buttonNamed(details, "Retry").click();
+    await flush();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(details.textContent).toContain("No compliance review posted.");
+  });
+});
+
+describe("Review details across a redraw", () => {
+  it("reads the compliance review once, not on every redraw of an open card", async () => {
+    const { deps, request } = stubContext([
+      { ok: true, status: 200, body: { report: null } },
+    ]);
+    const target = host();
+    const view = { data: prs([card(7)]), error: null };
+    renderPrsSection(target, view, deps);
+    const first = target.querySelector<HTMLDetailsElement>("details.pr-details")!;
+    first.open = true;
+    await flush();
+    renderPrsSection(target, view, deps);
+    await flush();
+    const again = target.querySelector<HTMLDetailsElement>("details.pr-details")!;
+    expect(again.open).toBe(true);
+    expect(again.textContent).toContain("No compliance review posted.");
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});

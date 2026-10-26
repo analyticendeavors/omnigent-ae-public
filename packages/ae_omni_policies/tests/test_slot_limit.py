@@ -99,7 +99,7 @@ def test_a_store_that_fails_falls_back_and_says_so(caplog: pytest.LogCaptureFixt
     slot_limit.remember_store(_Store(error=RuntimeError("database is locked")))
     with caplog.at_level(logging.WARNING, logger=slot_limit.__name__):
         assert slot_limit.effective_limit() == 4
-    assert "using AE_SLOT_LIMIT" in caplog.text
+    assert "using the fallback" in caplog.text
 
 
 def test_a_change_on_the_page_shows_on_the_next_read() -> None:
@@ -118,3 +118,41 @@ def test_forgetting_the_store_returns_to_the_environment() -> None:
     assert slot_limit.effective_limit() == 6
     slot_limit.remember_store(None)
     assert slot_limit.effective_limit() == 4
+
+
+def test_family_children_reads_the_lowest_enabled_cap() -> None:
+    def cap(params: dict[str, object], enabled: bool = True) -> SimpleNamespace:
+        return SimpleNamespace(handler=slot_limit.HANDLER, enabled=enabled, factory_params=params)
+
+    pick = slot_limit.family_children_from_policies
+    assert pick([], 3) is None
+    assert pick([cap({})], 3) == 3
+    assert pick([cap({"family_children": 2}), cap({"family_children": 5})], 3) == 2
+    assert pick([cap({"family_children": 0})], 3) == 0
+    assert pick([cap({"family_children": 0}), cap({"family_children": 4})], 3) == 4
+    assert pick([cap({"family_children": True}), cap({}, enabled=False)], 3) == 3
+
+
+def test_resolve_takes_family_children_from_every_cap_and_the_limit_from_the_lowest() -> None:
+    def cap(**params: object) -> SimpleNamespace:
+        return SimpleNamespace(handler=slot_limit.HANDLER, enabled=True, factory_params=params)
+
+    # Cap A (limit 3, family_children 0) with cap B (limit 5, family_children 2): the
+    # limit is A's, but B still sets the family cap, as before 2026-10-26.
+    rules = slot_limit.resolve_from_policies(
+        [cap(limit=3, family_children=0), cap(limit=5, family_children=2, helpers_count=True)], 4
+    )
+    assert rules == slot_limit.SlotConfig(3, False, 2)
+
+
+def test_resolve_falls_back_to_the_callers_rules_when_the_store_fails() -> None:
+    class _Broken:
+        def list_defaults(self) -> list[object]:
+            raise RuntimeError("down")
+
+    slot_limit.remember_store(_Broken())  # type: ignore[arg-type]
+    try:
+        mine = slot_limit.SlotConfig(7, True, 9)
+        assert slot_limit.resolve(mine) == mine
+    finally:
+        slot_limit.remember_store(None)

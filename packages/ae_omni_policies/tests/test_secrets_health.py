@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ae_omni_policies import auth, secrets_health
+from ae_omni_policies import auth, secrets_health, secrets_meta
 
 PULL_SECRETS = Path(__file__).resolve().parents[3] / "deploy" / "pull-secrets.sh"
 SENTINEL = "sentinel-secret-value-7f3a"
@@ -159,8 +159,21 @@ def test_the_answer_carries_names_only() -> None:
     env = dict.fromkeys([*secrets_health.REQUIRED, *secrets_health.OPTIONAL], SENTINEL)
     body = secrets_health.view(env).model_dump_json()
     assert SENTINEL not in body
-    assert str(len(SENTINEL)) not in body
-    assert set(secrets_health.SecretKey.model_fields) == {"key", "present", "use"}
+    # As a JSON value: the bare digits also turn up in this year's dates and times.
+    assert not re.search(rf'":{len(SENTINEL)}[,}}]', body)
+    # Expiry words and links ride along (secrets_meta.Words), and since 2026-10-23
+    # where the key lives and how its last call went (key_health.py); nothing else may.
+    assert set(secrets_health.SecretKey.model_fields) == {
+        "key",
+        "present",
+        "use",
+        "where",
+        "check",
+        "checked_at",
+        "check_detail",
+        "worked_at",
+        *secrets_meta.Words.model_fields,
+    }
 
 
 async def test_route_reads_the_server_environment(
@@ -180,11 +193,17 @@ async def test_route_reads_the_server_environment(
     assert SENTINEL not in response.text
     body = response.json()
     assert body["missing"] == ["AE_CF_ACCESS_CLIENT_ID", "AE_CF_ACCESS_CLIENT_SECRET"]
-    assert body["required"][0] == {
+    first = body["required"][0]
+    assert {k: first[k] for k in ("key", "present", "use")} == {
         "key": "POSTGRES_PASSWORD",
         "present": True,
         "use": "Database",
     }
+    # No reading from the box yet: the vault name and links show, the dates say unknown.
+    assert first["vault_name"] == "omnigent-ae-postgres-password"
+    assert first["expiry_state"] == "unknown"
+    assert body["meta_read_at"] is None
+    assert body["meta_stale"] is True
     optional = {row["key"]: row["present"] for row in body["optional"]}
     want = {key: key == "AE_DATABRICKS_CLIENT_SECRET" for key in secrets_health.OPTIONAL}
     want |= dict.fromkeys(secrets_health.CONDITIONAL["oidc"], False)

@@ -37,9 +37,31 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("AE_CF_ACCESS_CLIENT_ID", "test-client-id.access")
     monkeypatch.setenv("AE_CF_ACCESS_CLIENT_SECRET", "test-client-secret")
     monkeypatch.delenv("AE_SELF_URL", raising=False)
+    # create_session reads the calling session from these; a test that wants one sets it.
+    monkeypatch.delenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", raising=False)
+    monkeypatch.delenv("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID", raising=False)
     # The merge watcher polls GitHub from the app's lifespan; only its own tests run it.
     monkeypatch.setenv("AE_MERGE_WATCH", "0")
-    from ae_omni_policies import auth, prs, router, slot_cap, taskstore
+    # The auto-archive sweep likewise; only its own tests run it.
+    monkeypatch.setenv("AE_AUTO_ARCHIVE", "0")
+    # Expiry alerts run after every vault reading; only their own tests run them.
+    monkeypatch.setenv("AE_SECRET_ALERTS", "off")
+    monkeypatch.setenv("AE_SECRET_OWNERS_FILE", "")
+    monkeypatch.setenv("AE_SECRET_ALERTS_FILE", "")
+    # Cost targets keep their rules and alert state in memory; only their own tests use files.
+    monkeypatch.setenv("AE_COST_TARGETS_FILE", "")
+    monkeypatch.setenv("AE_COST_ALERT_STATE_FILE", "")
+    from ae_omni_policies import (
+        auth,
+        cost_targets,
+        prs,
+        router,
+        secret_alerts,
+        secret_owners,
+        secrets_meta,
+        slot_cap,
+        taskstore,
+    )
 
     async def accepted(_request: Any, _user: str) -> bool:
         return True
@@ -52,12 +74,20 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # The lot, tag and pull request caches outlive a request (2026-09-26).
     router.reset_lot_cache()
     prs.reset_cache()
+    secrets_meta.reset_store()
+    secret_owners.reset_store()
+    secret_alerts.reset_store()
+    cost_targets.reset_stores()
     yield
     auth.reset_provider_cache()
     slot_cap.reset_pending_claims()
     taskstore.reset_icon_set()
     router.reset_lot_cache()
     prs.reset_cache()
+    secrets_meta.reset_store()
+    secret_owners.reset_store()
+    secret_alerts.reset_store()
+    cost_targets.reset_stores()
 
 
 @pytest.fixture()

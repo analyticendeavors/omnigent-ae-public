@@ -21,7 +21,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
             "past the limit the prompt is held for approval (mode warn) or dropped (mode block) "
             "with the working sessions named. A message starting with 'ride unparked' runs "
             "one more anyway and marks the session ae.overflow=1. Sessions waiting on an answer "
-            "do not count."
+            "do not count. A family (a session and the sessions it started through "
+            "create_session) holds one slot between them."
         ),
         "params_schema": {
             "type": "object",
@@ -43,6 +44,24 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                         "warn holds the prompt for approval (ASK); block drops it (DENY)."
                     ),
                     "default": "warn",
+                },
+                "family_children": {
+                    "type": "integer",
+                    "description": (
+                        "Sessions one lead may have working at once inside its family's "
+                        "slot; create_session refuses one more. 0 lifts the cap."
+                    ),
+                    "default": 3,
+                    "minimum": 0,
+                },
+                "helpers_count": {
+                    "type": "boolean",
+                    "description": (
+                        "Helper sessions count toward the session limit. Off, a family holds "
+                        "one slot and its helpers, builders and reviewers never count; on, "
+                        "each working helper holds a slot too."
+                    ),
+                    "default": False,
                 },
                 "lot_url": {
                     "type": "string",

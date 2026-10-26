@@ -7,7 +7,7 @@
 // pane the answer to "is anything wrong?" sat several scrolls down. The tiles
 // read only what the sections already fetch: each section builds its own tile
 // from its own state (deploys.ts, host.ts, fabric.ts, databricks.ts,
-// secrets.ts, accounts.ts) and hands it here after every draw, so the strip adds no request
+// secrets.ts, vault.ts, accounts.ts, git.ts) and hands it here after every draw, so the strip adds no request
 // of its own. A tile has a label with an icon, one value, a muted note and a
 // coloured left edge by health: green ok, amber needs attention, grey idle,
 // red a problem. The Deploy hold tile adds a bar of the hold's time left.
@@ -30,7 +30,9 @@ import { el, replaceChildren } from "./dom";
 import {
   boltIcon,
   databaseIcon,
+  gitBranchIcon,
   keyIcon,
+  lockIcon,
   pauseIcon,
   serverIcon,
   sharedIcon,
@@ -47,9 +49,12 @@ export type TileId =
   | "fabric"
   | "databricks"
   | "secrets"
+  | "vault"
+  | "git"
   | "accounts"
   | "credit"
-  | "azure";
+  | "azure"
+  | "presets";
 
 export interface Tile {
   id: TileId;
@@ -73,8 +78,12 @@ export const TILE_ORDER: ReadonlyArray<{ id: TileId; label: string; icon: () => 
   { id: "host", label: "Box host", icon: serverIcon },
   { id: "fabric", label: "Fabric", icon: () => boltIcon() },
   { id: "databricks", label: "Databricks", icon: databaseIcon },
-  { id: "secrets", label: "Secrets", icon: keyIcon },
+  // 2026-10-23: the Secrets tile split in two, the box's keys and every vault secret.
+  { id: "secrets", label: "Secrets on box", icon: keyIcon },
+  { id: "vault", label: "Key Vault", icon: () => lockIcon() },
   { id: "accounts", label: "Accounts", icon: sharedIcon },
+  // 2026-10-24: the Git repos tile (git.ts), a ninth.
+  { id: "git", label: "Git", icon: () => gitBranchIcon() },
 ];
 
 const RANK: Record<Health, number> = { problem: 3, attention: 2, ok: 1, idle: 0 };

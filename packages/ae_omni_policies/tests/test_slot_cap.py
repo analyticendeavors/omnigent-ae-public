@@ -124,7 +124,7 @@ def test_warn_mode_asks_with_the_three_titles(store: _Store) -> None:
     result = slot_cap(mode="warn")(_request())
     assert result is not None and result["result"] == "ASK"
     reason = result["reason"]
-    assert reason.startswith("Slots full: 3 of 3 working. ")
+    assert reason.startswith("Slots full: 3 of 3 taken; this one would make 4 of 3. ")
     assert "1. Fix pricing padding (next: verify light mode)" in reason
     assert "2. Renewal note (elapsed 10m)" in reason
     assert "3. CSV export header (elapsed under a minute)" in reason
@@ -258,7 +258,7 @@ def test_pages_through_the_store(store: _Store) -> None:
 def test_overflow_counts_past_the_limit(store: _Store) -> None:
     store.rows = [*THREE, _working("c4", "Fourth", NOW - 30, **{labels.OVERFLOW: "1"})]
     result = slot_cap(mode="block")(_request())
-    assert result["reason"].startswith("Slots full: 4 of 3 working.")
+    assert result["reason"].startswith("Slots full: 4 of 3 taken; this one would make 5 of 3.")
     assert "4. Fourth" in result["reason"]
 
 
@@ -277,7 +277,7 @@ def test_a_claim_counts_before_its_row_shows_it(
     monkeypatch.setattr(sessions, "current_session_id", lambda: "conv_b")
     held = policy(_request())
     assert held["result"] == "DENY"
-    assert held["reason"].startswith("Slots full: 3 of 3 working.")
+    assert held["reason"].startswith("Slots full: 3 of 3 taken; this one would make 4 of 3.")
     assert "1 more claimed a slot a moment ago." in held["reason"]
 
     # A's own re-evaluation never counts its pending claim against itself.
@@ -287,7 +287,9 @@ def test_a_claim_counts_before_its_row_shows_it(
     # Once the row shows the claim, the pending entry is dropped, not double counted.
     store.rows = [*THREE[:2], _working("conv_a", "A", NOW)]
     monkeypatch.setattr(sessions, "current_session_id", lambda: "conv_b")
-    assert policy(_request())["reason"].startswith("Slots full: 3 of 3 working.")
+    assert policy(_request())["reason"].startswith(
+        "Slots full: 3 of 3 taken; this one would make 4 of 3."
+    )
 
     # And a claim that never lands expires.
     store.rows = THREE[:2]
@@ -384,3 +386,442 @@ def test_a_first_prompt_in_the_merge_watcher_words_still_counts(store: _Store) -
     store.rows = THREE
     result = slot_cap(mode="warn")(_request(MERGE_NOTE))
     assert result is not None and result["result"] == "ASK"
+
+
+# ── families (2026-10-23) ────────────────────────────────────────────────
+
+
+def _child(id: str, title: str, parent: str, started: int, **extra: str) -> Conversation:
+    return _working(id, title, started, **{labels.ORCH: parent, **extra})
+
+
+def test_family_key_follows_the_orch_chain_to_its_top() -> None:
+    lead = _working("lead", "Role routing build", NOW - 900)
+    child = _child("kid", "Families PR", "lead", NOW - 600)
+    grandchild = _child("grand", "Its helper", "kid", NOW - 300)
+    orphan = _child("orphan", "Archived lead's child", "gone", NOW - 200)
+    unknown = _child("solo", "Started without an id", labels.ORCH_UNKNOWN, NOW - 100)
+    keys = sessions.family_keys([lead, child, grandchild, orphan, unknown])
+    assert keys == {
+        "lead": "lead",
+        "kid": "lead",
+        "grand": "lead",
+        "orphan": "gone",
+        "solo": "solo",
+    }
+    loop = [_child("a", "A", "b", NOW), _child("b", "B", "a", NOW)]
+    assert set(sessions.family_keys(loop).values()) <= {"a", "b"}
+
+
+def test_a_family_holds_one_slot() -> None:
+    rows = [
+        _working("lead", "Lead", NOW - 900),
+        _child("k1", "One", "lead", NOW - 600),
+        _child("k2", "Two", "lead", NOW - 500),
+        _working("other", "Other", NOW - 400),
+    ]
+    keys = sessions.family_keys(rows)
+    assert sessions.slots_held(sessions.working_sessions(rows)) == 2
+    kids = sessions.family_children_working("lead", sessions.working_sessions(rows), keys)
+    assert [row.id for row in kids] == ["k1", "k2"]
+
+
+def test_reserve_for_a_family_that_holds_a_slot_takes_none() -> None:
+    rows = [_working("lead", "Lead", NOW - 900), *THREE[:2]]
+    held, full, _, _ = slot_cap_module.reserve("orch:x", rows, 3, family="lead")
+    assert (held, full) == (True, False)
+    # Nothing was claimed, so a session outside the family still finds the last slot.
+    held, full, _, _ = slot_cap_module.reserve("orch:y", rows, 4)
+    assert (held, full) == (True, False)
+    slot_cap_module.release("orch:y")
+    # A family member never needs a slot, even when its lead holds none (2026-10-24).
+    held, full, _, _ = slot_cap_module.reserve("orch:z", rows, 3, family="elsewhere")
+    assert (held, full) == (True, False)
+
+
+def test_a_create_from_a_lead_in_review_skips_the_slot_check_but_not_the_family_cap() -> None:
+    lead = _conv("lead", "Lead", {labels.STATUS: "review"})
+    rows = [lead, *THREE, _child("k1", "One", "lead", NOW - 600)]
+    rows[-1].live_status = "running"
+    held, full, _, _ = slot_cap_module.reserve("orch:a", rows, 3, family="lead", family_cap=3)
+    assert (held, full) == (True, False)
+    slot_cap_module.release("orch:a")
+    with pytest.raises(slot_cap_module.FamilyFull):
+        slot_cap_module.reserve("orch:b", rows, 3, family="lead", family_cap=1)
+    # A create with no family still counts slots.
+    held, full, _, _ = slot_cap_module.reserve("orch:c", rows, 3)
+    assert (held, full) == (False, True)
+
+
+def test_the_event_names_the_session_even_without_the_ambient_id(
+    store: _Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.rows = THREE
+    store.own["child"] = _conv("child", "Codex reviewer", parent="c1")
+    event = {**_request(), "context": {"labels": {}, "conversation_id": "child"}}
+    for ambient in (None, OWN):
+        monkeypatch.setattr(sessions, "current_session_id", lambda ambient=ambient: ambient)
+        assert slot_cap(mode="block")(event) is None
+    assert store.calls == []
+
+
+def test_a_lead_whose_family_holds_a_slot_rides_in_it(store: _Store) -> None:
+    lead = _conv(OWN, "Lead in review", {labels.STATUS: "review"})
+    store.own[OWN] = lead
+    store.rows = [
+        lead,
+        _child("k1", "Working child", OWN, NOW - 600),
+        *THREE[:2],
+    ]
+    store.rows[1].live_status = "running"
+    # Three families hold slots: the lead's own, c1 and c2. Held, so it rides.
+    for mode in ("warn", "block"):
+        result = slot_cap(mode=mode)(_request())
+        assert result is not None and result["result"] == "ALLOW"
+        assert labels.OVERFLOW not in result["set_labels"]
+    # With no working child its family holds nothing, and a full set of slots asks.
+    store.rows = [lead, *THREE]
+    held = slot_cap()(_request())
+    assert held is not None and held["result"] == "ASK"
+
+
+def test_a_family_member_prompts_through_full_slots(store: _Store) -> None:
+    lead = _working("lead", "Lead", NOW - 900)
+    store.rows = [lead, *THREE[:2]]
+    fork = _conv(OWN, "Fork of the lead's child", {labels.ORCH: "lead"})
+    store.own[OWN] = fork
+    store.rows.append(fork)
+    result = slot_cap()(_request())
+    assert result is not None and result["result"] == "ALLOW"
+    assert labels.OVERFLOW not in result["set_labels"]
+    # Outside the family the same three slots are full.
+    store.own[OWN] = _conv(OWN, "Fresh")
+    store.rows[-1] = store.own[OWN]
+    held = slot_cap()(_request())
+    assert held is not None and held["result"] == "ASK"
+
+
+def test_concurrent_family_reserves_stop_at_the_cap() -> None:
+    # Two creates from one lead in the same instant: the second sees the first's claim.
+    rows = [
+        _working("lead", "Lead", NOW - 900),
+        _child("k1", "One", "lead", NOW - 600),
+        _child("k2", "Two", "lead", NOW - 500),
+    ]
+    held, full, _, claims = slot_cap_module.reserve(
+        "orch:k3", rows, 3, family="lead", family_cap=3
+    )
+    assert (held, full, claims) == (True, False, 0)
+    with pytest.raises(slot_cap_module.FamilyFull) as caught:
+        slot_cap_module.reserve("orch:k4", rows, 3, family="lead", family_cap=3)
+    assert caught.value.cap == 3
+    assert [row.id for row in caught.value.children] == ["k1", "k2"]
+    # A claim riding in the lead's slot takes no slot from anyone else.
+    held, full, _, claims = slot_cap_module.reserve("orch:other", rows, 2)
+    assert (held, full, claims) == (True, False, 0)
+    slot_cap_module.release("orch:k3")
+    slot_cap_module.reserve("orch:k4", rows, 3, family="lead", family_cap=3)
+
+
+def test_a_family_member_past_the_cap_is_allowed_and_marked_overflow(
+    store: _Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        slot_cap_module.slot_limit,
+        "resolve",
+        lambda *_: slot_cap_module.slot_limit.SlotConfig(3, False, 2),
+    )
+    fork = _conv(OWN, "Fork of a child", {labels.ORCH: "lead"})
+    store.own[OWN] = fork
+    store.rows = [
+        _working("lead", "Lead", NOW - 900),
+        _child("k1", "One", "lead", NOW - 600),
+        _child("k2", "Two", "lead", NOW - 500),
+        fork,
+    ]
+    for mode in ("warn", "block"):
+        result = slot_cap(mode=mode)(_request())
+        assert result is not None and result["result"] == "ALLOW"
+        assert result["set_labels"][labels.STATUS] == labels.WORKING
+        assert result["set_labels"][labels.OVERFLOW] == "1"
+
+
+def test_a_member_whose_lead_is_not_working_never_asks_for_a_slot(store: _Store) -> None:
+    member = _conv(OWN, "Helper", {labels.ORCH: "lead"})
+    store.own[OWN] = member
+    store.rows = [
+        _conv("lead", "Lead", {labels.STATUS: "review"}),
+        *THREE,
+        member,
+    ]
+    for mode in ("warn", "block"):
+        result = slot_cap(mode=mode)(_request())
+        assert result is not None and result["result"] == "ALLOW"
+        assert labels.OVERFLOW not in result["set_labels"]
+        assert result["set_labels"][labels.STATUS] == labels.WORKING
+
+
+def test_an_idle_family_member_does_not_count_toward_the_family_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(slot_cap_module, "_now", lambda: float(NOW))
+    idle = _child("k1", "One", "lead", NOW - 600)
+    idle.live_status = sessions.IDLE
+    busy = _child("k2", "Two", "lead", NOW - 500)
+    busy.live_status = "running"
+    rows = [_working("lead", "Lead", NOW - 900), idle, busy]
+    keys = sessions.family_keys(rows)
+    kids = sessions.family_children_working(
+        "lead", sessions.working_sessions(rows), keys, float(NOW)
+    )
+    assert [row.id for row in kids] == ["k2"]
+    # A cap of one: the idle helper leaves room, the running one does not.
+    held, _, _, _ = slot_cap_module.reserve("orch:a", rows[:2], 3, family="lead", family_cap=1)
+    assert held
+    slot_cap_module.release("orch:a")
+    with pytest.raises(slot_cap_module.FamilyFull):
+        slot_cap_module.reserve("orch:b", rows, 3, family="lead", family_cap=1)
+
+
+def test_a_just_created_idle_helper_still_counts_as_busy() -> None:
+    fresh = _child("k1", "New", "lead", NOW - sessions.FRESH_HELPER_S + 1)
+    fresh.live_status = sessions.IDLE
+    old = _child("k2", "Done", "lead", NOW - sessions.FRESH_HELPER_S)
+    old.live_status = sessions.IDLE
+    rows = [_working("lead", "Lead", NOW - 900), fresh, old]
+    keys = sessions.family_keys(rows)
+    working = sessions.working_sessions(rows)
+    kids = sessions.family_children_working("lead", working, keys, float(NOW))
+    assert [row.id for row in kids] == ["k1"]
+    kids = sessions.family_children_working("lead", working, keys, float(NOW) + 60)
+    assert kids == []
+
+
+def test_the_slots_full_reason_counts_families() -> None:
+    working = [
+        sessions.summarize(_working("lead", "Lead", NOW - 900), now=NOW),
+        sessions.summarize(_child("k1", "One", "lead", NOW - 600), now=NOW),
+    ]
+    text = slot_cap_module.reason_text(working, 1, "block", None, used=1)
+    assert text.startswith("Slots full: 1 of 1 taken; this one would make 2 of 1. 1. Lead")
+
+
+# --- "Helper sessions count toward the session limit" (Settings, 2026-10-26) ---
+
+
+def _helpers_rows() -> list[Conversation]:
+    return [
+        _working("lead", "Lead", NOW - 900),
+        _child("k1", "Builder", "lead", NOW - 600),
+        _child("k2", "Reviewer", "lead", NOW - 500),
+        _conv("done", "Finished", {labels.STATUS: "review", labels.ORCH: "lead"}),
+        _child("orphan", "Lead parked or gone", "gone", NOW - 400),
+        _working("other", "Other", NOW - 300),
+    ]
+
+
+def test_helpers_off_children_and_orphans_never_count() -> None:
+    working = sessions.working_sessions(_helpers_rows())
+    assert sessions.slots_held(working) == 2
+    assert sessions.held_keys(working) == {"lead", "other"}
+
+
+def test_helpers_on_each_working_child_counts_finished_ones_do_not() -> None:
+    working = sessions.working_sessions(_helpers_rows())
+    assert sessions.slots_held(working, helpers_count=True) == 5
+    assert "done" not in sessions.held_keys(working, helpers_count=True)
+
+
+def test_a_child_whose_lead_is_parked_holds_nothing_when_off() -> None:
+    lead = _conv("lead", "Lead", {labels.STATUS: "parked"})
+    rows = [lead, _child("k1", "Builder", "lead", NOW - 600), *THREE[:2]]
+    assert sessions.slots_held(sessions.working_sessions(rows)) == 2
+    held, full, _, _ = slot_cap_module.reserve("orch:a", rows, 3)
+    assert (held, full) == (True, False)
+
+
+def test_reserve_for_a_child_takes_a_slot_only_when_helpers_count() -> None:
+    rows = [_working("lead", "Lead", NOW - 900), *THREE[:2]]
+    held, full, _, _ = slot_cap_module.reserve("orch:x", rows, 3, family="lead")
+    assert (held, full) == (True, False)
+    slot_cap_module.release("orch:x")
+    held, full, _, _ = slot_cap_module.reserve(
+        "orch:y", rows, 3, family="lead", helpers_count=True
+    )
+    assert (held, full) == (False, True)
+    held, full, _, _ = slot_cap_module.reserve(
+        "orch:z", rows, 3, family="lead", riding=True, helpers_count=True
+    )
+    assert (held, full) == (True, True)
+    slot_cap_module.release("orch:z")
+
+
+def test_pending_child_claims_count_only_when_helpers_count() -> None:
+    rows = [_working("lead", "Lead", NOW - 900)]
+    slot_cap_module.reset_pending_claims()
+    slot_cap_module.reserve("orch:a", rows, 3, family="lead")
+    _, _, _, pending = slot_cap_module.reserve("orch:c", rows, 3)
+    assert pending == 0
+    slot_cap_module.reset_pending_claims()
+    slot_cap_module.reserve("orch:a", rows, 3, family="lead", helpers_count=True)
+    _, _, _, pending = slot_cap_module.reserve("orch:c", rows, 3, helpers_count=True)
+    assert pending == 1
+    slot_cap_module.reset_pending_claims()
+
+
+def test_a_family_member_prompt_asks_at_full_slots_when_helpers_count(store: _Store) -> None:
+    store.rows = [_working("lead", "Lead", NOW - 900), *THREE[:2]]
+    member = _conv(OWN, "Helper", {labels.ORCH: "lead"})
+    store.own[OWN] = member
+    store.rows.append(member)
+    free = slot_cap()(_request())
+    assert free is not None and free["result"] == "ALLOW"
+    counted = slot_cap(helpers_count=True)(_request())
+    assert counted is not None and counted["result"] == "ASK"
+    store.rows[0] = _conv("lead", "Lead", {labels.STATUS: "parked"})
+    counted = slot_cap(helpers_count=True)(_request())
+    assert counted is not None and counted["result"] == "ALLOW"
+
+
+def test_the_setting_reads_from_enabled_slot_caps_only() -> None:
+    from types import SimpleNamespace
+
+    from ae_omni_policies import slot_limit
+
+    def cap(enabled: bool, **params: object) -> SimpleNamespace:
+        return SimpleNamespace(handler=slot_limit.HANDLER, enabled=enabled, factory_params=params)
+
+    assert slot_limit.helpers_count_from_policies([]) is False
+    assert slot_limit.helpers_count_from_policies([cap(True)]) is False
+    assert slot_limit.helpers_count_from_policies([cap(False, helpers_count=True)]) is False
+    assert slot_limit.helpers_count_from_policies([cap(True, helpers_count=True)]) is True
+
+
+# --- one resolved rule set, review fixes (2026-10-26) ---
+
+
+def _cap_policy(enabled: bool = True, **params: object) -> Any:
+    from types import SimpleNamespace
+
+    from ae_omni_policies import slot_limit
+
+    return SimpleNamespace(handler=slot_limit.HANDLER, enabled=enabled, factory_params=params)
+
+
+def test_resolve_takes_all_three_from_the_cap_with_the_lowest_limit() -> None:
+    from ae_omni_policies import slot_limit
+
+    # Cap A: limit 3, helpers off. Cap B: limit 5, helpers on. Taking the flag from any
+    # cap would make a rule stricter than both (limit 3 with helpers counted).
+    a = _cap_policy(limit=3, helpers_count=False, family_children=2)
+    b = _cap_policy(limit=5, helpers_count=True, family_children=4)
+    assert slot_limit.resolve_from_policies([a, b], 9) == (3, False, 2)
+    assert slot_limit.resolve_from_policies([b, a], 9) == (3, False, 2)
+    # Tied on the limit: the one that counts helpers is the stricter.
+    tied = _cap_policy(limit=3, helpers_count=True, family_children=0)
+    assert slot_limit.resolve_from_policies([a, tied], 9) == (3, True, 2)
+    # A disabled cap takes no part; none at all gives the defaults.
+    assert slot_limit.resolve_from_policies([_cap_policy(False, limit=1), b], 9) == (5, True, 4)
+    assert slot_limit.resolve_from_policies([], 9) == (9, False, 3)
+
+
+def test_two_caps_never_make_a_rule_stricter_than_both() -> None:
+    rows = [
+        _working("l1", "Lead one", NOW - 900),
+        _working("l2", "Lead two", NOW - 800),
+        _child("k1", "Helper", "l1", NOW - 700),
+    ]
+    held_a = len(sessions.held_keys(sessions.working_sessions(rows), helpers_count=False))
+    held_b = len(sessions.held_keys(sessions.working_sessions(rows), helpers_count=True))
+    assert (held_a, held_b) == (2, 3)  # passes cap A (3, off) and cap B (5, on)
+    from ae_omni_policies import slot_limit
+
+    limit, helpers, _ = slot_limit.resolve_from_policies(
+        [_cap_policy(limit=3), _cap_policy(limit=5, helpers_count=True)], 9
+    )
+    held, full, _, _ = slot_cap_module.reserve(
+        "orch:mixed", rows, limit, family="l1", helpers_count=helpers
+    )
+    assert (held, full) == (True, False)
+    slot_cap_module.release("orch:mixed")
+
+
+def test_resolve_reads_the_store_once() -> None:
+    from ae_omni_policies import slot_limit
+
+    class Flip:
+        calls = 0
+
+        def list_defaults(self) -> list[Any]:
+            Flip.calls += 1
+            # A save lands between reads: the second read would be a different config.
+            if Flip.calls == 1:
+                return [_cap_policy(limit=3, helpers_count=True, family_children=2)]
+            return [_cap_policy(limit=8, helpers_count=False, family_children=6)]
+
+    slot_limit.remember_store(Flip())  # type: ignore[arg-type]
+    try:
+        assert slot_limit.resolve() == (3, True, 2)
+        assert Flip.calls == 1
+    finally:
+        slot_limit.remember_store(None)
+
+
+def test_stored_helpers_count_values_that_are_not_booleans_mean_off() -> None:
+    from ae_omni_policies import slot_limit
+
+    for stored in ("true", "True", 1, "1", None, [True]):
+        assert slot_limit.resolve_from_policies([_cap_policy(helpers_count=stored)], 3)[1] is False
+    assert slot_limit.resolve_from_policies([_cap_policy(helpers_count=True)], 3)[1] is True
+
+
+def test_the_family_cap_still_applies_to_a_member_prompt_when_helpers_count(
+    store: _Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ae_omni_policies import slot_limit
+
+    monkeypatch.setattr(slot_cap_module, "_now", lambda: float(NOW))
+    slot_limit.remember_store(
+        type("S", (), {"list_defaults": lambda self: [_cap_policy(limit=9, family_children=2)]})()
+    )
+    try:
+        store.rows = [
+            _working("lead", "Lead", NOW - 900),
+            _child("k1", "One", "lead", NOW - 600),
+            _child("k2", "Two", "lead", NOW - 500),
+        ]
+        member = _conv(OWN, "Third helper", {labels.ORCH: "lead"})
+        store.own[OWN] = member
+        store.rows.append(member)
+        for helpers in (False, True):
+            slot_cap_module.reset_pending_claims()
+            verdict = slot_cap(limit=9, helpers_count=helpers)(_request())
+            assert verdict is not None and verdict["result"] == "ALLOW"
+            assert verdict["set_labels"].get(labels.OVERFLOW) == "1", helpers
+    finally:
+        slot_limit.remember_store(None)
+
+
+def test_a_working_helper_whose_lead_is_archived_holds_its_own_slot_when_on() -> None:
+    rows = [_child("k1", "Orphan helper", "gone", NOW - 600), *THREE[:2]]
+    working = sessions.working_sessions(rows)
+    assert sessions.slots_held(working) == 2
+    assert sessions.slots_held(working, helpers_count=True) == 3
+    held, full, _, _ = slot_cap_module.reserve("orch:o", rows, 3, helpers_count=True)
+    assert (held, full) == (False, True)
+
+
+def test_a_self_parent_or_orch_cycle_counts_as_a_lead() -> None:
+    selfish = _working("a", "Self parent", NOW - 600, **{labels.ORCH: "a"})
+    ring_a = _working("r1", "Ring one", NOW - 500, **{labels.ORCH: "r2"})
+    ring_b = _working("r2", "Ring two", NOW - 400, **{labels.ORCH: "r1"})
+    working = sessions.working_sessions([selfish, ring_a, ring_b])
+    assert sessions.held_keys(working) == {"a", "r1", "r2"}
+    # A row that only feeds into a loop is still a helper.
+    tail = _working("t", "Tail", NOW - 300, **{labels.ORCH: "r1"})
+    assert sessions.is_helper(tail, {row.id: row for row in [ring_a, ring_b, tail]})
+
+
+def test_slots_held_takes_helpers_count_by_keyword_only() -> None:
+    with pytest.raises(TypeError):
+        sessions.slots_held([], {}, True)  # type: ignore[misc]

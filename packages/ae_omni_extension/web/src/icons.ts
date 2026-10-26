@@ -524,3 +524,52 @@ export function coinIcon(): SVGElement {
 export function foldIcon(): SVGElement {
   return decorative(TABLER_CHEVRON_DOWN, "icon-fold", 16);
 }
+
+// The Key Vault card (2026-10-23, vault.ts): Tabler lock for its badge and tile,
+// pencil for a row's Edit link.
+const TABLER_LOCK: IconNode = [
+  [
+    "path",
+    { d: "M5 13a2 2 0 0 1 2 -2h10a2 2 0 0 1 2 2v6a2 2 0 0 1 -2 2h-10a2 2 0 0 1 -2 -2v-6z" },
+  ],
+  ["path", { d: "M11 16a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" }],
+  ["path", { d: "M8 11v-4a4 4 0 1 1 8 0v4" }],
+];
+const TABLER_PENCIL: IconNode = [
+  ["path", { d: "M4 20h4l10.5 -10.5a2.828 2.828 0 1 0 -4 -4l-10.5 10.5v4" }],
+  ["path", { d: "M13.5 6.5l4 4" }],
+];
+
+export function lockIcon(size = 14): SVGElement {
+  return decorative(TABLER_LOCK, "icon-lock", size);
+}
+
+export function pencilIcon(): SVGElement {
+  return decorative(TABLER_PENCIL, "icon-pencil", 14);
+}
+
+// The Git repos card (2026-10-24, git.ts): Tabler git-branch for its badge and tile.
+const TABLER_GIT_BRANCH: IconNode = [
+  ["path", { d: "M7 18m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M7 6m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M17 6m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M7 8l0 8" }],
+  ["path", { d: "M9 18h6a2 2 0 0 0 2 -2v-5" }],
+  ["path", { d: "M14 14l3 -3l3 3" }],
+];
+
+export function gitBranchIcon(size = 14): SVGElement {
+  return decorative(TABLER_GIT_BRANCH, "icon-git-branch", size);
+}
+
+// The Presets card (2026-10-24, presets.ts): Tabler chart-bar for its badge.
+const TABLER_CHART_BAR: IconNode = [
+  ["path", { d: "M3 12m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v6a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+  ["path", { d: "M9 8m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v10a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+  ["path", { d: "M15 4m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v14a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+  ["path", { d: "M4 20l14 0" }],
+];
+
+export function chartBarIcon(size = 14): SVGElement {
+  return decorative(TABLER_CHART_BAR, "icon-chart-bar", size);
+}

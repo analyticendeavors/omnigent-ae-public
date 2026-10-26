@@ -409,3 +409,33 @@ describe("the Dashboard", () => {
     expect(target.querySelector("#reference")?.classList.contains("is-closed")).toBe(false);
   });
 });
+
+describe("Reference reopen", () => {
+  it("gives each Reference line a menu that moves it back to Working or Review", () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    renderReference(target, [session("r", { "ae.status": "reference" })], {
+      context: {} as never,
+      refresh: vi.fn(),
+    });
+    const items = [...target.querySelectorAll(".menu-item")].map((n) => n.textContent);
+    expect(items).toEqual(["Move to Working", "Move to Review"]);
+  });
+});
+
+describe("Reference reopen failure", () => {
+  it("shows a failed move on its row", async () => {
+    const target = document.createElement("div");
+    document.body.appendChild(target);
+    const context = {
+      server: { request: vi.fn(async () => ({ ok: false, status: 500, body: {} })) },
+    } as never;
+    renderReference(target, [session("r", { "ae.status": "reference" })], {
+      context,
+      refresh: vi.fn(),
+    });
+    (target.querySelector(".menu-item") as HTMLButtonElement).click();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(target.querySelector("li .flash")).not.toBeNull();
+  });
+});

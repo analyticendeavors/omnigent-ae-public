@@ -1,0 +1,2266 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 18:33:56 -0700
+Subject: [PATCH 166/191] [ae-patch] Deliver the lead's notice on plain-text
+ native turns, tell child sessions they are helpers, and switch the model when
+ a preset fixes the lead
+
+The executor adapter flattened every text-only message to a string and dropped
+the framework notice block, so plain-text native turns never received the team
+and roles notice. The notice now rides along as a block next to one input_text
+block, for the current turn only and only for the Claude and Codex native
+executors, which read it; every other executor gets the plain string as before,
+replayed history loses old notices, and steering still sends plain text. Child
+sessions get one helper line instead of the lead's Auto or Team text (a fork
+stays a lead). The lead line names the session's own model and effort and the
+preset's model when it differs; only a Claude lead hears about the Agent tool
+and tier aliases; an older model version keeps its full id. The roles block
+drops "past that, ask first" when model changes are off. Picking a preset whose
+lead is fixed (pill, Alt digit, a new pick in the dialog, START ON) also sets
+the session's model and effort, resolved against the session's own harness and
+checked against the session's own row, with a toast and Undo. Settings uses
+"Own subagents only" for the Helpers rule everywhere and tags the model change
+rules "Coming later".
+---
+ omnigent/inner/ae_notice_content.py           |  96 +++++++
+ omnigent/inner/ae_roles.py                    | 192 ++++++++++++--
+ .../runtime/harnesses/_executor_adapter.py    |  27 +-
+ tests/inner/test_ae_roles.py                  | 118 +++++++--
+ tests/inner/test_ae_team.py                   |  13 +
+ .../harnesses/test_executor_adapter.py        | 141 ++++++++++
+ tests/server/integration/test_ae_team.py      |  31 +++
+ web/src/components/AeSessionPresetRow.tsx     |   4 +-
+ web/src/components/AeTeamControl.test.tsx     |  70 ++++-
+ web/src/components/AeTeamControl.tsx          |  36 ++-
+ .../composer/AeSessionPresetPill.tsx          |   2 +-
+ web/src/hooks/useAeSessionPreset.ts           |  31 ++-
+ web/src/lib/aeLeadModel.test.ts               | 160 ++++++++++++
+ web/src/lib/aeLeadModel.ts                    | 247 ++++++++++++++++++
+ web/src/lib/aeLeadModelChat.test.ts           | 176 +++++++++++++
+ web/src/lib/aeLeadModelChat.ts                |  91 +++++++
+ web/src/lib/aeRoles.ts                        |   8 +
+ web/src/lib/aeStartOnApply.test.ts            |  54 ++++
+ web/src/lib/aeStartOnApply.ts                 |  53 +++-
+ web/src/lib/aeTeamPresets.test.ts             |   2 +-
+ web/src/lib/aeTeamPresets.ts                  |   2 +-
+ web/src/pages/settings/AeRolesControls.tsx    |   2 +-
+ web/src/pages/settings/AeRolesEditor.tsx      |  26 +-
+ .../settings/AeRolesSettingsSection.test.tsx  |   6 +-
+ 24 files changed, 1505 insertions(+), 83 deletions(-)
+ create mode 100644 omnigent/inner/ae_notice_content.py
+ create mode 100644 web/src/lib/aeLeadModel.test.ts
+ create mode 100644 web/src/lib/aeLeadModel.ts
+ create mode 100644 web/src/lib/aeLeadModelChat.test.ts
+ create mode 100644 web/src/lib/aeLeadModelChat.ts
+
+diff --git a/omnigent/inner/ae_notice_content.py b/omnigent/inner/ae_notice_content.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..31cc86289b1dc7a42e4671d3de50d165c18bfaf9
+--- /dev/null
++++ b/omnigent/inner/ae_notice_content.py
+@@ -0,0 +1,96 @@
++"""Keep framework notices on text-only executor content.
++
++Added 2026-10-24 by omnigent-ae. The executor adapter flattens a text-only
++message to a plain string, which dropped the ``_omnigent_framework_notice``
++block the server attaches to native terminal messages (the lead's team and
++roles notice). A notice survived only when the message also carried an image,
++file or audio block, so plain-text native turns never got it. Executors read
++notices with :func:`omnigent.inner.native_attachments.framework_notices` and
++extract visible text from ``input_text`` blocks only, so a list of one text
++block plus the notice blocks keeps the visible text exactly as before.
++
++The server attaches the notice to every user message for every harness, and
++the runner replays it with each prior turn. Only the Claude and Codex native
++executors read it for the current turn; :func:`scope_framework_notices` keeps it
++there and nowhere else, so other executors and replayed history see the plain
++text they always did.
++"""
++
++from __future__ import annotations
++
++from typing import Any
++
++from omnigent.inner.native_attachments import FRAMEWORK_NOTICE_BLOCK_TYPE
++
++
++def with_framework_notices(text: str, content: object) -> str | list[dict[str, Any]]:
++    """*text*, or *text* as one ``input_text`` block plus *content*'s notice blocks.
++
++    :param text: The visible text already extracted from *content*.
++    :param content: The original message content (a string or a block list).
++    :returns: *text* unchanged when it is empty or *content* has no notice block.
++    """
++    if not text or not isinstance(content, list):
++        return text
++    notices = [
++        block
++        for block in content
++        if isinstance(block, dict) and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
++    ]
++    if not notices:
++        return text
++    return [{"type": "input_text", "text": text}, *notices]
++
++
++def reads_framework_notices(executor: object) -> bool:
++    """Whether *executor* reads the current turn's notice blocks itself.
++
++    Only the Claude and Codex native executors do; every other executor gets
++    text-only content as a plain string, exactly as before this module existed.
++    """
++    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
++    from omnigent.inner.codex_native_executor import CodexNativeExecutor
++
++    return isinstance(executor, (ClaudeNativeExecutor, CodexNativeExecutor))
++
++
++def scope_framework_notices(
++    messages: list[dict[str, Any]], *, keep_current: bool
++) -> list[dict[str, Any]]:
++    """Keep notice blocks only on the latest user message, and only when wanted.
++
++    The runner replays every prior user message with the notice it was sent
++    with, so a prior turn's notice would repeat (and an old preset's text with
++    it) on every later turn. Prior turns lose their notice blocks; a text-only
++    message goes back to its plain string. The latest user message keeps its
++    notice when *keep_current* is true; otherwise a text-only one goes back to
++    its plain string and a multimodal one stays as it was.
++
++    :param messages: Role-keyed messages from the executor adapter.
++    :param keep_current: Whether the executor reads the current turn's notice.
++    :returns: *messages*, with contents rewritten in place.
++    """
++    current = max(
++        (i for i, message in enumerate(messages) if message.get("role") == "user"), default=-1
++    )
++    for index, message in enumerate(messages):
++        content = message.get("content")
++        if not isinstance(content, list) or not any(_is_notice(b) for b in content):
++            continue
++        if index == current and keep_current:
++            continue
++        visible = [block for block in content if not _is_notice(block)]
++        text_only = all(
++            isinstance(block, dict) and block.get("type") == "input_text" for block in visible
++        )
++        if text_only:
++            message["content"] = "\n".join(
++                str(block.get("text", "")) for block in visible if isinstance(block, dict)
++            )
++        elif index != current:
++            message["content"] = visible
++    return messages
++
++
++def _is_notice(block: object) -> bool:
++    return isinstance(block, dict) and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index f910b25cdfa419f3f82d5b0b54f7f3e3e402664b..4553f6685ae6d315f565da0ef94aa96e7c77410a 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -24,6 +24,18 @@ Solo when the preset keeps work in house (``own``), else Team when the label
+ lists sessions, else Solo for a label still saved as mode ``solo``, else Auto.
+ A label saved as Solo before presets had the rule reads as the ``solo`` preset
+ when the user has one, else the default with ``helpers`` set to ``own``.
++
++Child sessions (2026-10-24): a session started by a lead is a helper, so its
++whole notice is :data:`HELPER_NOTICE` (metadata ``{"ae_helper": True}``), never
++the lead's Auto or Team text. A fork copies ``ae.orch`` but is a top-level
++session the user drives, so it stays a lead.
++
++The lead line names what the session really runs (its own model and effort,
++under ``lead_session``), and says so when the preset asks for another model.
++Only a Claude lead hears about Claude's Agent tool and tier aliases. A role
++fixed to a model id shows the tier alias only when the id is the current one for
++that tier (``current``, from the omnigent-ae package), since a bare alias
++resolves to the newest version.
+ """
+ 
+ from __future__ import annotations
+@@ -46,6 +58,8 @@ LOCAL_USER = "local"
+ ROLES: tuple[str, ...] = ("lead", "planner", "reviewer", "builder", "helper")
+ LEAD_PICKS_SHOWN = 8
+ _LABEL_MAX = 16_384
++FORK_SOURCE_LABEL = "omnigent.fork.source_id"
++_ONE_M = "[1m]"
+ _ALIASES = ("fable", "opus", "sonnet", "haiku")
+ _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+ 
+@@ -85,6 +99,12 @@ BALANCED: dict[str, Any] = {
+ }
+ SOLO = "solo"
+ OWN = "own"
++HELPER_KEY = "ae_helper"
++HELPER_NOTICE = (
++    "You are a helper session started by a lead session. Do the task you were given and "
++    "report back to it; do not start other sessions or bring in other agents. Use your own "
++    "native subagents only if the task needs them."
++)
+ 
+ 
+ def _role_prefs() -> Any | None:
+@@ -191,10 +211,12 @@ def resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, Any
+     and the resolved preset's Helpers rule reads as ``own`` either way.
+ 
+     :returns: ``{"preset": {...}, "custom": bool}``, or ``{"lead_picks": True,
+-        "presets": [...], "more": n}`` when the session lets the lead choose.
++        "presets": [...], "more": n}`` when the session lets the lead choose; either
++        with ``current`` (the current catalog id per tier alias).
+     """
+     roles = _resolve_roles(conv, store)
+-    return _own_helpers(roles) if _legacy_solo(conv) else roles
++    roles = _own_helpers(roles) if _legacy_solo(conv) else roles
++    return {**roles, "current": _current_ids()}
+ 
+ 
+ def _resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, Any]:
+@@ -235,10 +257,16 @@ def _resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, An
+ 
+ 
+ def _is_child(conv: Conversation) -> bool:
+-    """True for a session with a parent or an ``ae.orch`` label holding a session id."""
++    """True for a session with a parent or an ``ae.orch`` label holding a session id.
++
++    A fork (``omnigent.fork.source_id``, no parent) copies its source's labels
++    but is a top-level session, so it is never a child.
++    """
+     if getattr(conv, "parent_conversation_id", None):
+         return True
+     labels = conv.labels if isinstance(conv.labels, dict) else {}
++    if labels.get(FORK_SOURCE_LABEL):
++        return False
+     orch = labels.get(ORCH_LABEL)
+     return isinstance(orch, str) and orch.strip() not in ("", "1")
+ 
+@@ -248,20 +276,65 @@ def with_roles(
+ ) -> dict[str, object]:
+     """*notice* (or a new one) with the resolved roles under ``ae_roles``; never raises.
+ 
+-    A child session is a helper, not a lead, so its notice is returned as is.
++    A child session is a helper, not a lead: its notice is replaced by the
++    helper marker that renders as :data:`HELPER_NOTICE`.
+     The ``ae_team`` mode becomes the one the preset and label call for (see
+     :func:`effective_mode`).
+     """
+     if _is_child(conv):
+-        return notice
++        return {HELPER_KEY: True}
+     try:
+         roles = resolve_roles(conv, store)
+     except Exception:  # noqa: BLE001 (the notice must never break a message)
+         _logger.warning("ae roles: could not resolve the preset; using Balanced", exc_info=True)
+         roles = {"preset": _summary(BALANCED), "custom": False}
++    roles = {**roles, "lead_session": _lead_session(conv)}
+     return {**effective_mode(notice, roles), "ae_roles": roles}
+ 
+ 
++def _lead_session(conv: Conversation) -> dict[str, object]:
++    """What the session runs (its own model and effort, when set) and whether it is Claude.
++
++    ``claude`` is ``None`` when nothing on the row says which harness runs it.
++    """
++    model = getattr(conv, "model_override", None)
++    effort = getattr(conv, "reasoning_effort", None)
++    labels = conv.labels if isinstance(conv.labels, dict) else {}
++    hints = [
++        hint.lower()
++        for hint in (
++            getattr(conv, "harness_override", None),
++            labels.get("omnigent.wrapper"),
++            model,
++            getattr(conv, "reported_model", None),
++        )
++        if isinstance(hint, str) and hint.strip()
++    ]
++    agent = getattr(conv, "agent_id", None)
++    agent = agent.lower() if isinstance(agent, str) else ""
++    claude: bool | None = None
++    if any(word in hint for hint in hints for word in ("claude", *_ALIASES)):
++        claude = True
++    elif hints or "codex" in agent:
++        claude = False
++    elif "claude" in agent:
++        claude = True
++    return {
++        "model": model if isinstance(model, str) else None,
++        "effort": effort if isinstance(effort, str) else None,
++        "claude": claude,
++    }
++
++
++def _current_ids() -> dict[str, str]:
++    """The current catalog id per tier alias, from the omnigent-ae package (else none)."""
++    module = _role_prefs()
++    if module is None:
++        return {}
++    current = {alias: getattr(module, alias.upper(), None) for alias in _ALIASES}
++    return {alias: value for alias, value in current.items() if isinstance(value, str)}
++
++
+ def effective_mode(notice: dict[str, object] | None, roles: object) -> dict[str, object]:
+     """*notice* with its ``ae_team`` mode set from the preset (a copy; never raises).
+ 
+@@ -299,7 +372,33 @@ def _text(value: object, limit: int) -> str:
+     return _CONTROL.sub(" ", str(value or "")).strip()[:limit]
+ 
+ 
+-def _model(setting: object) -> str:
++def _comparable(model: str) -> str:
++    """*model* without the 1M context suffix, lower case."""
++    model = model.strip().lower()
++    return model[: -len(_ONE_M)] if model.endswith(_ONE_M) else model
++
++
++def _named(model: str, current: object) -> str:
++    """The tier alias when *model* is its tier's current id (or the alias), else *model*."""
++    plain = _comparable(model)
++    if plain in _ALIASES:
++        return plain
++    ids = current if isinstance(current, dict) else {}
++    for alias, value in ids.items():
++        target = _comparable(str(value))
++        if target and (
++            plain == target or (plain.endswith(target) and not plain[-len(target) - 1].isalnum())
++        ):
++            return str(alias)
++    return model
++
++
++def _with_effort(model: str, effort: str, current: object) -> str:
++    named = _named(model, current)
++    return f"{named}, {effort}" if effort else named
++
++
++def _model(setting: object, current: object = None) -> str:
+     if not isinstance(setting, dict):
+         return "your pick"
+     mode = setting.get("mode")
+@@ -307,11 +406,34 @@ def _model(setting: object) -> str:
+         return "the session model"
+     if mode != "fixed":
+         return "your pick"
+-    model = _text(setting.get("model"), 128)
+-    effort = _text(setting.get("effort"), 16)
+-    alias = next((a for a in _ALIASES if a in model.lower()), None)
+-    named = f"{alias} / {model}" if alias and alias != model.lower() else model
+-    return f"{named}, {effort}" if effort else named
++    # The tier alias is what a native subagent takes, but only the current version
++    # answers to it; an older version keeps its full id.
++    return _with_effort(
++        _text(setting.get("model"), 128), _text(setting.get("effort"), 16), current
++    )
++
++
++def _lead_line(lead: object, session: object, current: object) -> str:
++    """The lead line: what the session runs, and the preset's model when it differs."""
++    session = session if isinstance(session, dict) else {}
++    model = _text(session.get("model"), 128)
++    effort = _text(session.get("effort"), 16)
++    actual = _with_effort(model, effort, current) if model else ""
++    lead = lead if isinstance(lead, dict) else {}
++    if lead.get("mode") == "fixed":
++        asked = _model(lead, current)
++        wanted = _comparable(_text(lead.get("model"), 128))
++        same_model = bool(model) and _named(_comparable(model), current) == _named(wanted, current)
++        same_effort = not effort or effort == _text(lead.get("effort"), 16)
++        if not model or (same_model and same_effort):
++            return f"- Lead: you, on {asked}."
++        return f"- Lead: you, on {actual} (the preset asks for {asked})."
++    if lead.get("mode") == "auto":
++        now = f" (now {actual})" if actual else ""
++        return f"- Lead: you, on the model of your pick{now}."
++    if actual:
++        return f"- Lead: you, on {actual} (the session model)."
++    return "- Lead: you, on the session model."
+ 
+ 
+ def _rules_short(rules: object) -> str:
+@@ -339,34 +461,50 @@ def _rules(rules: object) -> str:
+     down = "on" if rules.get("lead_steps_down") is True else "off"
+     raises = rules.get("auto_raises")
+     raises = raises if isinstance(raises, int) and not isinstance(raises, bool) else 0
++    past = "." if rules.get("raise_or_lower") == "off" else "; past that, ask first."
+     return (
+         f"{change} Step down for mechanical work: {down}. "
+-        f"Automatic raises per child: {raises}; past that, ask first."
++        f"Automatic raises per child: {raises}{past}"
+     )
+ 
+ 
+ _TOOLS = (
+-    "The Agent tool takes tier aliases (opus, sonnet, haiku, fable); sessions take catalog ids."
++    "Native subagents (Claude's Agent tool) take a tier alias (opus, sonnet, haiku, fable) "
++    "and an effort. For a separate session, name its role in the brief."
+ )
++_TOOLS_OTHER = (
++    "Give a native subagent the role's model and effort where your harness supports it. "
++    "For a separate session, name its role in the brief."
++)
++
++
++def _tools(roles: dict[str, Any]) -> str:
++    """The Agent tool sentence for a Claude (or unknown) lead, else the generic one."""
++    session = roles.get("lead_session")
++    if isinstance(session, dict) and session.get("claude") is False:
++        return _TOOLS_OTHER
++    return _TOOLS
+ 
+ 
+ def render_roles(roles: object) -> str | None:
+     """The lead's roles block (under 12 lines) for ``ae_roles`` metadata, or ``None``."""
+     if not isinstance(roles, dict):
+         return None
++    current = roles.get("current")
++    tools = _tools(roles)
+     if roles.get("lead_picks") is True:
+         presets = [p for p in roles.get("presets") or [] if isinstance(p, dict)]
+         if not presets:
+             return None
+         lines = [
+             "Roles preset: lead picks. Pick the preset below that fits this task and say "
+-            "which in one line, then name a role for each helper you start and give it "
+-            f"that role's model and effort. {_TOOLS}"
++            "which in one line, then name a role for each helper you start and give a "
++            f"native subagent that role's model and effort. {tools}"
+         ]
+         for preset in presets[:LEAD_PICKS_SHOWN]:
+             setting = preset.get("roles") if isinstance(preset.get("roles"), dict) else {}
+             parts = [
+-                f"{role} {_model(setting.get(role))}"
++                f"{role} {_model(setting.get(role), current)}"
+                 for role in ROLES
+                 if role != "lead"
+                 or not isinstance(setting.get(role), dict)
+@@ -389,24 +527,24 @@ def render_roles(roles: object) -> str | None:
+         title += " (customized for this session)"
+     setting = preset.get("roles") if isinstance(preset.get("roles"), dict) else {}
+     lines = [
+-        f"Roles preset: {title}. Name a role for each helper you start and give it that "
+-        f"role's model and effort. {_TOOLS}"
++        f"Roles preset: {title}. Name a role for each helper you start and give a native "
++        f"subagent that role's model and effort. {tools}"
+     ]
+-    lead = setting.get("lead")
+-    if isinstance(lead, dict) and lead.get("mode") == "fixed":
+-        lines.append(f"- Lead: you, on {_model(lead)}.")
+-    elif isinstance(lead, dict) and lead.get("mode") == "auto":
+-        lines.append("- Lead: you, on the model of your pick.")
+-    else:
+-        lines.append("- Lead: you, on the session model.")
++    lines.append(_lead_line(setting.get("lead"), roles.get("lead_session"), current))
+     for role in ROLES[1:]:
+-        lines.append(f"- {_ROLE_LABELS[role]}: {_model(setting.get(role))}.")
++        lines.append(f"- {_ROLE_LABELS[role]}: {_model(setting.get(role), current)}.")
+     lines.append(_rules(preset.get("rules")))
+     return "\n".join(lines)
+ 
+ 
+ def append_roles(text: str | None, metadata: Any) -> str | None:
+-    """*text* with the roles block from *metadata* appended (either may be missing)."""
++    """*text* with the roles block from *metadata* appended (either may be missing).
++
++    A child session's metadata carries only the helper marker and reads as
++    :data:`HELPER_NOTICE` alone.
++    """
++    if isinstance(metadata, dict) and metadata.get(HELPER_KEY) is True:
++        return HELPER_NOTICE
+     block = render_roles(metadata.get("ae_roles")) if isinstance(metadata, dict) else None
+     if text and block:
+         return f"{text}\n\n{block}"
+diff --git a/omnigent/runtime/harnesses/_executor_adapter.py b/omnigent/runtime/harnesses/_executor_adapter.py
+index d8602ccbb29956444aedc717b6e12c317db466a3..a788aef5061c53ff419f1690bd747d42a6d3f4de 100644
+--- a/omnigent/runtime/harnesses/_executor_adapter.py
++++ b/omnigent/runtime/harnesses/_executor_adapter.py
+@@ -25,6 +25,11 @@ from fastapi import Response
+ 
+ from omnigent.debug_logging import phase_scope
+ from omnigent.errors import ElicitationDeclinedError, ErrorPhase
++from omnigent.inner.ae_notice_content import (
++    reads_framework_notices,
++    scope_framework_notices,
++    with_framework_notices,
++)
+ from omnigent.inner.executor import (
+     CompactionComplete,
+     CompactionStarted,
+@@ -239,7 +244,9 @@ class ExecutorAdapter(HarnessApp):
+         instance. Installs stable tool/elicitation/policy bridges once on first use.
+         """
+         executor = self._ensure_executor()
+-        messages = _translate_input_to_messages(request.input)
++        messages = _translate_input_to_messages(
++            request.input, keep_current_notices=reads_framework_notices(executor)
++        )
+         # Stamp session_key on every message so the inner executor keys its client consistently,
+         # matching the key used by enqueue_session_message (steering delivery depends on this).
+         for message in messages:
+@@ -1449,6 +1456,8 @@ def _extract_user_text(
+ 
+ def _translate_input_to_messages(
+     input_value: str | list[dict[str, Any]],
++    *,
++    keep_current_notices: bool = False,
+ ) -> list[Message]:
+     """Convert a CreateResponseRequest input to inner Message list.
+ 
+@@ -1459,11 +1468,9 @@ def _translate_input_to_messages(
+         return [{"role": "user", "content": input_value}]
+ 
+     history_messages = _extract_role_keyed_messages(input_value)
+-    if history_messages:
+-        return history_messages
+-
+-    content = _normalize_message_content(input_value)
+-    return [{"role": "user", "content": content}]
++    if not history_messages:
++        history_messages = [{"role": "user", "content": _normalize_message_content(input_value)}]
++    return scope_framework_notices(history_messages, keep_current=keep_current_notices)
+ 
+ 
+ def _extract_role_keyed_messages(
+@@ -1494,7 +1501,11 @@ _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file"
+ def _normalize_message_content(
+     content: Any,
+ ) -> str | list[dict[str, Any]]:
+-    """Normalize message content: plain string for text-only; full block list for multimodal."""
++    """Normalize message content: plain string for text-only; full block list for multimodal.
++
++    Text-only content that carries a framework notice keeps it (see
++    :mod:`omnigent.inner.ae_notice_content`).
++    """
+     if content is None:
+         return ""
+     if isinstance(content, str):
+@@ -1516,7 +1527,7 @@ def _normalize_message_content(
+         text_value = block.get("text")
+         if isinstance(text_value, str):
+             parts.append(text_value)
+-    return "\n".join(parts)
++    return with_framework_notices("\n".join(parts), content)
+ 
+ 
+ def _serialize_args(args: dict[str, Any]) -> str:
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 0fbcdcec0abc4661b91a2eacb41d24ab3111ce8f..153b74ab877b24dfeab6f7718806625bf5474c19 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -36,6 +36,14 @@ YOLO: dict[str, Any] = {
+ }
+ 
+ 
++CURRENT = {
++    "fable": "claude-fable-5-1",
++    "opus": "claude-opus-5-5",
++    "sonnet": "claude-sonnet-5-5",
++    "haiku": "claude-haiku-5-5",
++}
++
++
+ def conversation(labels: dict[str, str] | None = None, **kwargs: Any) -> Conversation:
+     return Conversation(
+         id="conv",
+@@ -82,6 +90,7 @@ def test_no_label_uses_the_owners_default(prefs: dict[str, Any]) -> None:
+             "rules": YOLO["rules"],
+         },
+         "custom": False,
++        "current": ae_roles._current_ids(),
+     }
+ 
+ 
+@@ -163,7 +172,8 @@ def test_lead_picks_lists_the_users_presets(prefs: dict[str, Any]) -> None:
+     assert len(lines) == 10
+     assert lines[0].startswith("Roles preset: lead picks. Pick the preset")
+     assert lines[1].startswith("- Preset 0: Most tasks:")
+-    assert "planner opus / claude-opus-5-5, high" in lines[1]
++    assert "planner opus, high" in lines[1]
++    assert "claude-" not in text
+     assert "lead" not in lines[1].split("(", 1)[1]
+     assert lines[-1] == "(2 more presets are not shown.)"
+     assert lines[1].endswith("; changes: tell after, steps down, 1 raise, any agent or session).")
+@@ -307,12 +317,16 @@ def test_a_legacy_solo_label_with_a_preset_keeps_that_preset(prefs: dict[str, An
+         {"labels": {"ae.orch": "sess_123"}},
+     ],
+ )
+-def test_a_child_session_gets_no_roles_block(
++def test_a_child_session_gets_only_the_helper_line(
+     prefs: dict[str, Any], kwargs: dict[str, Any]
+ ) -> None:
++    labels = {TEAM_LABEL: json.dumps({"version": 1, "mode": "team", "members": []})}
++    kwargs = {**kwargs, "labels": {**kwargs.get("labels", {}), **labels}}
+     notice = team_notice(conversation(**kwargs), owner_store())
+-    assert notice is None or "ae_roles" not in notice
+-    assert "Roles preset" not in (render_team_notice(notice) or "")
++    assert notice == {"ae_helper": True}
++    assert render_team_notice(notice) == ae_roles.HELPER_NOTICE
++    assert "lead session" in ae_roles.HELPER_NOTICE
++    assert "do not start other sessions" in ae_roles.HELPER_NOTICE
+ 
+ 
+ @pytest.mark.parametrize("orch", ["1", "", " "])
+@@ -326,16 +340,15 @@ def test_balanced_wording_matches_the_contract(prefs: dict[str, Any]) -> None:
+     block = text.split("\n\n", 1)[1]
+     assert text.startswith("Auto collaboration is enabled")
+     assert block.splitlines() == [
+-        "Roles preset: Balanced. Name a role for each helper you start and give it that "
+-        "role's model and effort. The Agent tool takes tier aliases (opus, sonnet, haiku, "
+-        "fable); sessions take catalog ids.",
++        "Roles preset: Balanced. Name a role for each helper you start and give a native "
++        "subagent that role's model and effort. Native subagents (Claude's Agent tool) take "
++        "a tier alias (opus, sonnet, haiku, fable) and an effort. For a separate session, "
++        "name its role in the brief.",
+         "- Lead: you, on the session model.",
+-        "- Planner (design, architecture, unknown root cause): opus / claude-opus-5-5, high.",
+-        "- Reviewer (reviews, verifying a finding, fix checks): sonnet / claude-sonnet-5-5, "
+-        "medium.",
+-        "- Builder (code once the plan is pinned): sonnet / claude-sonnet-5-5, medium.",
+-        "- Helper (polling, PR watching, screenshots, mechanical commits): haiku / "
+-        "claude-haiku-5-5, low.",
++        "- Planner (design, architecture, unknown root cause): opus, high.",
++        "- Reviewer (reviews, verifying a finding, fix checks): sonnet, medium.",
++        "- Builder (code once the plan is pinned): sonnet, medium.",
++        "- Helper (polling, PR watching, screenshots, mechanical commits): haiku, low.",
+         "Model changes: raise a stuck child or lower yourself: tell the user after. Step down "
+         "for mechanical work: on. Automatic raises per child: 1; past that, ask first.",
+     ]
+@@ -351,16 +364,24 @@ def test_every_mode_carries_the_block(prefs: dict[str, Any], mode: str) -> None:
+ def test_auto_roles_and_a_fixed_lead_render(prefs: dict[str, Any]) -> None:
+     preset = copy.deepcopy(YOLO)
+     preset["roles"]["builder"] = {"mode": "auto"}
+-    text = render_roles({"preset": preset, "custom": True}) or ""
++    text = render_roles({"preset": preset, "custom": True, "current": CURRENT}) or ""
+     lines = text.splitlines()
+     assert lines[0].startswith("Roles preset: YOLO (customized for this session).")
+-    assert lines[1] == "- Lead: you, on fable / claude-fable-5-1, max."
++    assert lines[1] == "- Lead: you, on fable, max."
+     assert lines[4] == "- Builder (code once the plan is pinned): your pick."
+     assert lines[-1].startswith("Model changes: do not raise a child or lower yourself")
+-    assert "Step down for mechanical work: off. Automatic raises per child: 0" in lines[-1]
++    assert lines[-1].endswith("Step down for mechanical work: off. Automatic raises per child: 0.")
++    assert "past that" not in text
+     assert len(lines) < 12
+ 
+ 
++def test_a_model_without_a_tier_alias_keeps_its_id() -> None:
++    preset = copy.deepcopy(BALANCED)
++    preset["roles"]["builder"] = {"mode": "fixed", "model": "gpt-5.5-codex", "effort": "high"}
++    text = render_roles({"preset": preset, "custom": False}) or ""
++    assert "- Builder (code once the plan is pinned): gpt-5.5-codex, high." in text
++
++
+ def test_rendering_survives_junk_metadata() -> None:
+     assert render_roles(None) is None
+     assert render_roles({"preset": "x"}) is None
+@@ -402,3 +423,68 @@ def test_without_the_package_balanced_uses_tier_aliases(monkeypatch: pytest.Monk
+     text = render_team_notice(team_notice(conversation(), owner_store())) or ""
+     assert "- Planner (design, architecture, unknown root cause): opus, high." in text
+     assert "- Helper (polling, PR watching, screenshots, mechanical commits): haiku, low." in text
++
++
++def test_a_fork_with_a_copied_orch_label_is_a_lead(prefs: dict[str, Any]) -> None:
++    """A fork copies ae.orch but is a top-level session; a fork with a parent is a child."""
++    labels = {"ae.orch": "sess_123", ae_roles.FORK_SOURCE_LABEL: "conv_src"}
++    notice = team_notice(conversation(labels), owner_store()) or {}
++    assert "ae_roles" in notice and "ae_helper" not in notice
++    child = team_notice(conversation(labels, parent_conversation_id="lead"), owner_store())
++    assert child == {"ae_helper": True}
++
++
++def _lead_line(conv: Conversation) -> str:
++    text = render_roles(team_notice(conv, owner_store()).get("ae_roles")) or ""
++    return next(line for line in text.splitlines() if line.startswith("- Lead:"))
++
++
++def test_the_lead_line_names_what_the_session_runs(
++    prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(ae_roles, "_current_ids", lambda: dict(CURRENT))
++    yolo = team_label(roles={"preset": "yolo"})
++    assert _lead_line(conversation(yolo)) == "- Lead: you, on fable, max."
++    on_opus = conversation(yolo, model_override="claude-opus-5-5", reasoning_effort="high")
++    assert _lead_line(on_opus) == "- Lead: you, on opus, high (the preset asks for fable, max)."
++    on_fable = conversation(yolo, model_override="claude-fable-5-1[1m]", reasoning_effort="max")
++    assert _lead_line(on_fable) == "- Lead: you, on fable, max."
++    balanced = conversation(model_override="claude-opus-5-5", reasoning_effort="high")
++    assert _lead_line(balanced) == "- Lead: you, on opus, high (the session model)."
++    assert _lead_line(conversation()) == "- Lead: you, on the session model."
++
++
++def test_only_a_claude_lead_hears_about_the_agent_tool(prefs: dict[str, Any]) -> None:
++    def first_line(conv: Conversation) -> str:
++        text = render_roles(team_notice(conv, owner_store()).get("ae_roles")) or ""
++        return text.splitlines()[0]
++
++    codex = first_line(conversation(model_override="gpt-5.6-sol", reasoning_effort="high"))
++    assert "Claude's Agent tool" not in codex and "tier alias" not in codex
++    assert codex.endswith(ae_roles._TOOLS_OTHER)
++    claude = first_line(conversation(harness_override="claude-native"))
++    assert claude.endswith(ae_roles._TOOLS)
++    # Nothing on the row names a harness: the Claude wording stays, as before.
++    assert first_line(conversation()).endswith(ae_roles._TOOLS)
++
++
++def test_an_older_model_version_keeps_its_full_id() -> None:
++    preset = copy.deepcopy(BALANCED)
++    preset["roles"]["planner"] = {"mode": "fixed", "model": "claude-opus-4-8", "effort": "high"}
++    preset["roles"]["reviewer"] = {
++        "mode": "fixed",
++        "model": "claude-sonnet-5-5[1m]",
++        "effort": "medium",
++    }
++    preset["roles"]["builder"] = {
++        "mode": "fixed",
++        "model": "system.ai.claude-fable-5-1",
++        "effort": "high",
++    }
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert "- Planner (design, architecture, unknown root cause): claude-opus-4-8, high." in text
++    assert "- Reviewer (reviews, verifying a finding, fix checks): sonnet, medium." in text
++    assert "- Builder (code once the plan is pinned): fable, high." in text
++    # Without the current ids a fixed id is shown as is.
++    bare = render_roles({"preset": preset, "custom": False}) or ""
++    assert "claude-sonnet-5-5[1m], medium" in bare
+diff --git a/tests/inner/test_ae_team.py b/tests/inner/test_ae_team.py
+index f2143d76af4c25f75ef371110a451eb04103d8fa..1614d8d2d573b97260b84ed935fbba584d4299ff 100644
+--- a/tests/inner/test_ae_team.py
++++ b/tests/inner/test_ae_team.py
+@@ -109,3 +109,16 @@ def test_team_label_whose_sessions_are_gone_reads_as_auto() -> None:
+     notice = team_notice(conversation("parent", labels={TEAM_LABEL: label}), store)
+     assert notice["ae_team"] == {"mode": "auto", "members": []}
+     assert "Auto collaboration" in (render_team_notice(notice) or "")
++
++
++def test_a_child_session_is_told_it_is_a_helper_not_the_lead() -> None:
++    child = conversation("child", parent_conversation_id="parent")
++    notice = team_notice(child, Mock())
++    text = render_team_notice(notice) or ""
++    assert text.startswith("You are a helper session started by a lead session.")
++    assert "You are the lead" not in text
++    assert "Roles preset" not in text
++    expanded = expand_framework_notices(
++        [{"role": "user", "content": [framework_notice_block(notice)]}]
++    )
++    assert expanded == [{"role": "system", "content": [{"type": "input_text", "text": text}]}]
+diff --git a/tests/runtime/harnesses/test_executor_adapter.py b/tests/runtime/harnesses/test_executor_adapter.py
+index 2b1e448cbc8981f580e7a7cc8327e1414e586e2e..e33168462fb25db6838fcf1974911df7eef0d417 100644
+--- a/tests/runtime/harnesses/test_executor_adapter.py
++++ b/tests/runtime/harnesses/test_executor_adapter.py
+@@ -2844,3 +2844,144 @@ async def test_subprocess_tracking_uses_validated_session_without_telemetry(
+     assert [pr.url for pr in SessionPrRegistry(conv_id).list()] == [
+         "https://github.com/example/sdk/pull/42"
+     ]
++
++
++_NOTICE_BLOCK = {
++    "type": "_omnigent_framework_notice",
++    "source_metadata": {"ae_team": {"mode": "auto", "members": []}},
++}
++
++
++def test_text_with_a_framework_notice_keeps_the_notice() -> None:
++    """A text-only message keeps its notice block; the visible text is unchanged."""
++    from omnigent.inner.native_attachments import framework_notices
++    from omnigent.runtime.harnesses._executor_adapter import (
++        _normalize_message_content,
++        _translate_input_to_messages,
++    )
++
++    content = [
++        {"type": "input_text", "text": "hi"},
++        {"type": "input_text", "text": "there"},
++        _NOTICE_BLOCK,
++    ]
++    normalized = _normalize_message_content(content)
++    assert normalized == [{"type": "input_text", "text": "hi\nthere"}, _NOTICE_BLOCK]
++    assert len(framework_notices(normalized)) == 1
++    messages = _translate_input_to_messages(
++        [{"type": "message", "role": "user", "content": content}], keep_current_notices=True
++    )
++    assert len(framework_notices(messages[0]["content"])) == 1
++
++
++def test_plain_text_without_a_notice_still_flattens() -> None:
++    """Text-only content without a notice normalizes to a plain string, as before."""
++    from omnigent.runtime.harnesses._executor_adapter import _normalize_message_content
++
++    assert _normalize_message_content([{"type": "input_text", "text": "hi"}]) == "hi"
++    assert _normalize_message_content([_NOTICE_BLOCK]) == ""
++
++
++def test_native_executors_keep_the_notice_out_of_visible_text(tmp_path: Path) -> None:
++    """Claude and Codex native executors send the text and read the notice separately."""
++    from omnigent.inner import claude_native_executor, codex_native_executor
++    from omnigent.runtime.harnesses._executor_adapter import _normalize_message_content
++
++    content = _normalize_message_content([{"type": "input_text", "text": "hi"}, _NOTICE_BLOCK])
++    messages = [{"role": "user", "content": content}]
++    assert claude_native_executor._latest_user_text(messages, tmp_path) == "hi"
++    notices = claude_native_executor._latest_framework_notices(messages)
++    assert len(notices) == 1 and notices[0].startswith("Auto collaboration is enabled")
++    items = codex_native_executor._content_to_input_items(content, tmp_path)
++    assert items == [{"type": "text", "text": "hi"}]
++    context = codex_native_executor.codex_team_context(content)
++    assert context is not None and "Auto collaboration" in str(context)
++
++
++def _turn(text: str, *, notice: bool = True) -> dict[str, Any]:
++    content: list[dict[str, Any]] = [{"type": "input_text", "text": text}]
++    if notice:
++        content.append(_NOTICE_BLOCK)
++    return {"type": "message", "role": "user", "content": content}
++
++
++def _reply(text: str) -> dict[str, Any]:
++    return {
++        "type": "message",
++        "role": "assistant",
++        "content": [{"type": "output_text", "text": text}],
++    }
++
++
++def test_other_executors_get_plain_text_with_no_notice() -> None:
++    """A non-native executor (Databricks here) still gets the plain text, as before."""
++    from omnigent.inner.databricks_executor import _convert_messages
++    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
++
++    messages = _translate_input_to_messages([_turn("hi")])
++    assert messages == [{"role": "user", "content": "hi"}]
++    assert _convert_messages(messages, "") == [{"role": "user", "content": "hi"}]
++
++
++def test_replayed_history_drops_prior_notices() -> None:
++    """Prior turns lose their notice; only the current turn keeps exactly one."""
++    from omnigent.inner.native_attachments import framework_notices
++    from omnigent.runtime.harnesses._executor_adapter import _translate_input_to_messages
++
++    image = {"type": "input_image", "image_url": "data:image/png;base64,AA=="}
++    history = [
++        _turn("one"),
++        _reply("ok"),
++        {"type": "message", "role": "user", "content": [image, _NOTICE_BLOCK]},
++        _reply("seen"),
++        _turn("now"),
++    ]
++    native = _translate_input_to_messages(history, keep_current_notices=True)
++    assert native[0]["content"] == "one"
++    assert native[2]["content"] == [image]
++    assert sum(len(framework_notices(m["content"])) for m in native) == 1
++    assert native[4]["content"] == [{"type": "input_text", "text": "now"}, _NOTICE_BLOCK]
++    other = _translate_input_to_messages(history)
++    assert [m["content"] for m in other if m["role"] == "user"] == ["one", [image], "now"]
++    assert "_omnigent_framework_notice" not in json.dumps(other)
++
++
++def test_only_native_claude_and_codex_read_notices() -> None:
++    """The adapter keeps the current notice only for the executors that read it."""
++    from omnigent.inner.ae_notice_content import reads_framework_notices
++    from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
++    from omnigent.inner.codex_native_executor import CodexNativeExecutor
++
++    assert reads_framework_notices(ClaudeNativeExecutor.__new__(ClaudeNativeExecutor))
++    assert reads_framework_notices(CodexNativeExecutor.__new__(CodexNativeExecutor))
++    assert not reads_framework_notices(_AcceptingInjectionExecutor())
++
++
++@pytest.mark.asyncio
++async def test_watch_injections_sends_plain_text_with_a_notice() -> None:
++    """Steering (non-native executors only) sends the plain text, never the notice."""
++    import asyncio as _aio
++
++    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
++    from omnigent.server.schemas import CreateResponseRequest
++
++    executor = _AcceptingInjectionExecutor()
++    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
++    ctx = _OneInjectionCtx(
++        CreateResponseRequest(
++            model="m",
++            input=[{"type": "input_text", "text": "steer me"}, _NOTICE_BLOCK],
++            injection_id="inj_n",
++        )
++    )
++    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
++    try:
++        for _ in range(200):
++            if ctx.emitted:
++                break
++            await _aio.sleep(0.01)
++    finally:
++        task.cancel()
++        with contextlib.suppress(_aio.CancelledError):
++            await task
++    assert executor.received == [("sk", "steer me")]
+diff --git a/tests/server/integration/test_ae_team.py b/tests/server/integration/test_ae_team.py
+index 1a2c8f6cd40531a373142ac4da18f3f3addf2ec9..f8bdd6b75208545139c50f626faa3d3733512918 100644
+--- a/tests/server/integration/test_ae_team.py
++++ b/tests/server/integration/test_ae_team.py
+@@ -5,6 +5,7 @@ import json
+ import httpx
+ import pytest
+ 
++from omnigent.inner.ae_roles import HELPER_NOTICE
+ from omnigent.inner.ae_team import TEAM_LABEL
+ from omnigent.inner.native_attachments import framework_notices
+ from omnigent.server.routes._sessions import orchestration
+@@ -81,3 +82,33 @@ async def test_team_forward_preserves_authored_message(
+         assert not items  # Native transcript forwarder remains the single writer.
+     else:
+         assert items[0].data.content == content
++
++
++async def test_native_child_session_gets_the_helper_notice(
++    client: httpx.AsyncClient, db_uri: str
++) -> None:
++    agent = await create_test_agent(client, name="team-helper")
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert created.status_code == 201
++    store = SqlAlchemyConversationStore(db_uri)
++    child = store.create_conversation(
++        kind="sub_agent", parent_conversation_id=created.json()["id"], agent_id=agent["id"]
++    )
++    store.set_labels(child.id, {"omnigent.ui": "terminal", "omnigent.wrapper": "codex-native-ui"})
++    conv = store.get_conversation(child.id)
++    assert conv is not None
++    content = [{"type": "input_text", "text": "Check the build"}]
++    event = SessionEventInput(type="message", data={"role": "user", "content": content})
++    sent: list[dict] = []
++
++    def capture(request: httpx.Request) -> httpx.Response:
++        sent.append(json.loads(request.content))
++        return httpx.Response(202, json={"queued": True})
++
++    async with httpx.AsyncClient(
++        base_url="http://runner.test", transport=httpx.MockTransport(capture)
++    ) as runner:
++        await orchestration._forward_native_terminal_message(
++            runner, child.id, conv, event, conversation_store=store
++        )
++    assert framework_notices(sent[-1]["content"]) == [HELPER_NOTICE]
+diff --git a/web/src/components/AeSessionPresetRow.tsx b/web/src/components/AeSessionPresetRow.tsx
+index 6c03a9115e5d59949d3732cd327519e5e24f37f4..7634062c1b0a782b2747fb302eb50ce2ad8ac5ed 100644
+--- a/web/src/components/AeSessionPresetRow.tsx
++++ b/web/src/components/AeSessionPresetRow.tsx
+@@ -194,9 +194,7 @@ export function AeSessionPresetRow({
+         <div data-testid="ae-session-helpers" className="space-y-2 rounded-lg bg-muted/50 p-2">
+           <div className="flex items-center justify-between gap-2">
+             <div className="min-w-0 text-xs">
+-              <p className="font-medium">
+-                Helpers: {AE_HELPERS_LABELS[helpers].label.toLowerCase()}
+-              </p>
++              <p className="font-medium">Helpers: {AE_HELPERS_LABELS[helpers].label}</p>
+               <p className="text-muted-foreground">
+                 {helpersChanged ? "Changed for this session." : `From ${base?.title}.`} Native
+                 subagents are always available.
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+index 2fc6741ef3509ca5fdec3fb248c19f7cea82690d..c1ccb4d30c783a7505666c6bdae2d8de23eacdac 100644
+--- a/web/src/components/AeTeamControl.test.tsx
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -26,6 +26,11 @@ const mocks = vi.hoisted(() => ({
+   saveRoles: vi.fn(),
+   getSessionSlim: vi.fn(),
+   updateSession: vi.fn(),
++  switchLead: vi.fn(),
++}));
++vi.mock("@/lib/aeLeadModelChat", async (original) => ({
++  ...(await original<object>()),
++  aeSwitchPresetLead: mocks.switchLead,
+ }));
+ vi.mock("@/hooks/useAeRoles", () => ({
+   AE_ROLES_QUERY_KEY: ["ae", "roles"],
+@@ -188,6 +193,7 @@ beforeEach(() => {
+   mocks.models.mockReturnValue({ data: [{ id: "test-model", displayName: "Available model" }] });
+   vi.mocked(saveAeTeam).mockResolvedValue(session);
+   mocks.roles.mockReturnValue({ data: undefined });
++  mocks.switchLead.mockResolvedValue({ kind: "none" });
+ });
+ afterEach(cleanup);
+ 
+@@ -572,6 +578,68 @@ describe("roles preset per session", () => {
+     expect(vi.mocked(saveAeTeam).mock.calls[0][1]).not.toHaveProperty("roles");
+   });
+ 
++  it("switches the lead model only when the dialog picks a different preset", async () => {
++    const onYolo = {
++      ...session,
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({
++          version: 1,
++          mode: "auto",
++          members: [],
++          roles: { preset: "yolo" },
++        }),
++      },
++    };
++    mount({ session: onYolo });
++    openPicker();
++    // A non-lead row edit on the same preset: the roles are saved, the model is left alone.
++    fireEvent.click(screen.getByRole("button", { name: "Customize" }));
++    fireEvent.change(screen.getByLabelText("Planner model"), { target: { value: "__auto" } });
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(saveAeTeam).toHaveBeenCalledTimes(1));
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++    expect(mocks.switchLead).not.toHaveBeenCalled();
++    openPicker();
++    fireEvent.click(screen.getByRole("radio", { name: "Save tokens" }));
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(mocks.switchLead).toHaveBeenCalledTimes(1));
++    expect(mocks.switchLead.mock.calls[0][3]).toMatchObject({ id: "save-tokens" });
++  });
++
++  it("runs the dialog's label save and lead switch as one step before a later pick", async () => {
++    const { aeLatestWins } = await import("@/lib/aeSessionRoles");
++    const order: string[] = [];
++    let finishSwitch!: () => void;
++    vi.mocked(saveAeTeam).mockImplementation(async () => {
++      order.push("save");
++      return session;
++    });
++    mocks.switchLead.mockImplementation(
++      () =>
++        new Promise((resolve) => {
++          order.push("switch");
++          finishSwitch = () => resolve({ kind: "none" });
++        }),
++    );
++    mount();
++    openPicker();
++    fireEvent.click(screen.getByRole("radio", { name: "Save tokens" }));
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(order).toEqual(["save", "switch"]));
++    // A newer pick arriving while the switch runs waits for it; it is never run between
++    // the save and the switch, so the older model cannot land on top of it.
++    const newer = aeLatestWins("parent", async () => order.push("newer"));
++    await act(async () => {
++      await Promise.resolve();
++    });
++    expect(order).toEqual(["save", "switch"]);
++    await act(async () => {
++      finishSwitch();
++      await newer;
++    });
++    expect(order).toEqual(["save", "switch", "newer"]);
++  });
++
+   it("customizes roles for this session and saves them as a new preset", async () => {
+     mocks.saveRoles.mockImplementation(async (doc: typeof ROLES) => ({
+       ok: true,
+@@ -652,7 +720,7 @@ describe("roles preset per session", () => {
+     mount({ session: solo });
+     openPicker();
+     expect(
+-      screen.getByText("Solo keeps work in this chat. Pick another preset to add sessions."),
++      screen.getByText("Solo uses own subagents only. Pick another preset to add sessions."),
+     ).toBeInTheDocument();
+     expect(screen.getByTestId("ae-team-sessions")).toHaveAttribute("aria-disabled", "true");
+     expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+index 6a895c505957a0b2c09ce3679943b6dc1bb64928..0898ba6ca69612c40fb0c27c14599360d6bc4852 100644
+--- a/web/src/components/AeTeamControl.tsx
++++ b/web/src/components/AeTeamControl.tsx
+@@ -37,6 +37,7 @@ import {
+   aeSessionsLocked,
+   aeSessionsLockedHint,
+ } from "@/lib/aeTeamPresets";
++import { aeAnnouncePresetLead, aeSwitchPresetLead } from "@/lib/aeLeadModelChat";
+ import { AeSessionPresetRow } from "./AeSessionPresetRow";
+ import { AeSessionPresetPill } from "./composer/AeSessionPresetPill";
+ import { Button } from "./ui/button";
+@@ -373,6 +374,8 @@ export function AeTeamControl({
+   // Roles go to saveAeTeam only when this dialog changed them, so a stale
+   // value from when it opened never overwrites a newer pick (pill, Alt digit).
+   const [rolesTouched, setRolesTouched] = useState(false);
++  // The preset in force when the dialog opened: only a different pick switches the lead model.
++  const [openedPresetId, setOpenedPresetId] = useState<string | null>(null);
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const saved = readAeTeam(session.labels);
+@@ -409,7 +412,10 @@ export function AeTeamControl({
+       // The migrated roles are for display; they are written only when the user
+       // changes the roles row, or when they are a plain reference to the Solo
+       // preset (no frozen copy of a preset is ever written just for opening).
++      const opened = legacy ? migrated : (stored.roles ?? null);
+       setDraft(legacy ? { ...stored, roles: migrated } : stored);
++      const openedChoice = rolesState ? aeResolveSessionPreset(opened, rolesState) : null;
++      setOpenedPresetId(openedChoice?.kind === "preset" ? openedChoice.preset.id : null);
+       setRolesTouched(
+         legacy && !stored.roles && migrated?.preset === AE_SOLO_PRESET_ID && !migrated.custom,
+       );
+@@ -428,18 +434,34 @@ export function AeTeamControl({
+       const { roles: _staleRoles, ...withoutRoles } = draft;
+       // Through the same per-session line the pill's menu writes use, so a
+       // menu change still saving lands first and is never overwritten.
+-      const updated = await aeLatestWins(
++      // A newly chosen preset with a fixed lead also switches the model; a Helpers
++      // toggle or a non-lead row edit on the same preset leaves the model alone.
++      const switchPreset =
++        rolesTouched && choice?.kind === "preset" && choice.preset.id !== openedPresetId
++          ? choice.preset
++          : null;
++      // The label save and the lead switch share one callback, so a later pick
++      // supersedes both and an older switch never overwrites a newer model.
++      const done = await aeLatestWins(
+         session.id,
+         async () => {
+-          if (!locked) return saveAeTeam(session.id, rolesTouched ? draft : withoutRoles);
+-          // Own subagents only: the stored sessions stay as they are (no child
+-          // sessions, no routing change); only the roles choice can be saved.
+-          return rolesTouched ? saveAeSessionRoles(session.id, draft.roles ?? null) : null;
++          const updated = locked
++            ? // Own subagents only: the stored sessions stay as they are (no child
++              // sessions, no routing change); only the roles choice can be saved.
++              rolesTouched
++              ? await saveAeSessionRoles(session.id, draft.roles ?? null)
++              : null
++            : await saveAeTeam(session.id, rolesTouched ? draft : withoutRoles);
++          if (updated) queryClient.setQueryData(["session", session.id], updated);
++          const lead = switchPreset
++            ? await aeSwitchPresetLead(queryClient, session.id, session.hostId, switchPreset)
++            : null;
++          return { lead };
+         },
+         { queue: true },
+       );
+-      if (updated && updated !== AE_SUPERSEDED) {
+-        queryClient.setQueryData(["session", session.id], updated);
++      if (done !== AE_SUPERSEDED && switchPreset && done.lead) {
++        aeAnnouncePresetLead(queryClient, session.id, switchPreset.title, done.lead);
+       }
+       await queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(session.id) });
+       onOpenChange(false);
+diff --git a/web/src/components/composer/AeSessionPresetPill.tsx b/web/src/components/composer/AeSessionPresetPill.tsx
+index ba1203992a5a94d12294f4f5a6201c4c8ccae145..93cd8f83fc837401f472665eefa1c4e51f6d5906 100644
+--- a/web/src/components/composer/AeSessionPresetPill.tsx
++++ b/web/src/components/composer/AeSessionPresetPill.tsx
+@@ -312,7 +312,7 @@ export function AeSessionPresetPill({
+             <span className="block text-sm">Who works on this?</span>
+             {!isMobile && (
+               <span className="block truncate text-xs text-muted-foreground">
+-                Customize roles, change lead, Helpers
++                Customize roles, change lead, Own subagents only or Any agent or session
+               </span>
+             )}
+           </span>
+diff --git a/web/src/hooks/useAeSessionPreset.ts b/web/src/hooks/useAeSessionPreset.ts
+index b1808016207fd9a4ee4df3882c2be10cb4f1f03b..be9bbe9e74f1f810527a84a5177563cbb0a3c1fb 100644
+--- a/web/src/hooks/useAeSessionPreset.ts
++++ b/web/src/hooks/useAeSessionPreset.ts
+@@ -19,6 +19,8 @@ import {
+   readAeSessionRoles,
+   saveAeSessionRoles,
+ } from "@/lib/aeSessionRoles";
++import { aeFixedLead } from "@/lib/aeLeadModel";
++import { aeAnnouncePresetLead, aeSwitchPresetLead } from "@/lib/aeLeadModelChat";
+ import { aeStartOnLine } from "@/lib/aeStartOn";
+ import { readAeTeam } from "@/lib/aeTeam";
+ import {
+@@ -56,18 +58,27 @@ export function useAeSessionPreset(sessionId: string | null | undefined) {
+   /**
+    * Put the session on `id` (a preset id or "lead-picks"); resolves true once
+    * saved. Picks for one session run one at a time and the latest wins: a pick
+-   * still waiting when a later one arrives never lands (resolves false).
++   * still waiting when a later one arrives never lands (resolves false). A
++   * preset with a fixed lead also switches the model, inside the same turn of
++   * the line, then says so in a toast with Undo.
+    */
++  const hostId = session?.hostId;
+   const pick = useCallback(
+     async (id: string): Promise<boolean> => {
+       if (!sessionId || !state) return false;
++      const preset = state.presets.find((p) => p.id === id);
+       try {
+-        const saved = await aeLatestWins(sessionId, () =>
+-          saveAeSessionRoles(sessionId, aeRolesForPick(id, state.default_preset)),
+-        );
+-        if (saved === AE_SUPERSEDED) return false;
+-        queryClient.setQueryData(["session", sessionId], saved);
++        const done = await aeLatestWins(sessionId, async () => {
++          const saved = await saveAeSessionRoles(
++            sessionId,
++            aeRolesForPick(id, state.default_preset),
++          );
++          queryClient.setQueryData(["session", sessionId], saved);
++          return aeSwitchPresetLead(queryClient, sessionId, hostId, preset);
++        });
++        if (done === AE_SUPERSEDED) return false;
+         aeRememberPreset(id);
++        if (preset) aeAnnouncePresetLead(queryClient, sessionId, preset.title, done);
+         return true;
+       } catch (error) {
+         const reason = error instanceof Error ? error.message : String(error);
+@@ -75,7 +86,7 @@ export function useAeSessionPreset(sessionId: string | null | undefined) {
+         return false;
+       }
+     },
+-    [queryClient, sessionId, state],
++    [queryClient, sessionId, state, hostId],
+   );
+   /**
+    * Add (`on`) or remove one session for this chat; resolves true once saved.
+@@ -146,8 +157,12 @@ export function useAePresetHotkey(
+         showToast(`Already on ${preset.title}.`, { duration: 2000 });
+         return true;
+       }
++      // A fixed-lead preset gets the "Lead switched" toast from the pick instead.
+       void pick(preset.id).then(
+-        (ok) => ok && showToast(`Roles preset: ${preset.title}`, { duration: 2000 }),
++        (ok) =>
++          ok &&
++          !aeFixedLead(preset) &&
++          showToast(`Roles preset: ${preset.title}`, { duration: 2000 }),
+       );
+       return true;
+     },
+diff --git a/web/src/lib/aeLeadModel.test.ts b/web/src/lib/aeLeadModel.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..260d61fe7ce46bd30c3c83f9409508fb3be611cd
+--- /dev/null
++++ b/web/src/lib/aeLeadModel.test.ts
+@@ -0,0 +1,160 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  aeAnnounceLead,
++  aeFindLeadOption,
++  aeFixedLead,
++  aeLeadSentence,
++  aePatchLeadWriter,
++  aeSwitchLead,
++  aeUndoLead,
++} from "./aeLeadModel";
++import type { NativeModelOption, Session } from "./types";
++
++const mocks = vi.hoisted(() => ({
++  getSessionSlim: vi.fn(),
++  updateSession: vi.fn(),
++  toast: vi.fn(),
++}));
++vi.mock("@/lib/sessionsApi", () => ({
++  getSessionSlim: mocks.getSessionSlim,
++  updateSession: mocks.updateSession,
++}));
++vi.mock("sonner", () => ({ toast: mocks.toast }));
++
++const MODELS: NativeModelOption[] = [
++  { id: "opus", model: "claude-opus-5-5", displayName: "Opus 5.5" },
++  { id: "fable[1m]", model: "claude-fable-5-1[1m]", displayName: "Fable 5.1 (1M context)" },
++  { id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" },
++];
++const FABLE_MAX = { model: "claude-fable-5-1", effort: "max" as const };
++
++let stored: Session;
++beforeEach(() => {
++  vi.resetAllMocks();
++  stored = {
++    id: "s1",
++    labels: { "omnigent.wrapper": "claude-code-native-ui" },
++    modelOverride: "opus",
++    reasoningEffort: "high",
++  } as unknown as Session;
++  mocks.getSessionSlim.mockImplementation(async () => stored);
++  mocks.updateSession.mockImplementation(async (_id: string, patch: Partial<Session>) => {
++    stored = { ...stored, ...patch };
++    return stored;
++  });
++});
++
++describe("aeFixedLead", () => {
++  it("returns the lead only when the preset fixes it", () => {
++    expect(aeFixedLead({ roles: { lead: { mode: "fixed", ...FABLE_MAX } } } as never)).toEqual(
++      FABLE_MAX,
++    );
++    expect(aeFixedLead({ roles: { lead: { mode: "session" } } } as never)).toBeNull();
++    expect(aeFixedLead({ roles: { lead: { mode: "auto" } } } as never)).toBeNull();
++    expect(aeFixedLead(undefined)).toBeNull();
++  });
++});
++
++describe("aeFindLeadOption", () => {
++  it("matches a catalog id to the plain picker row over its 1M variant", () => {
++    expect(aeFindLeadOption("claude-fable-5-1", MODELS)?.id).toBe("fable");
++    expect(aeFindLeadOption("claude-haiku-5-5", MODELS)).toBeNull();
++  });
++});
++
++describe("aeSwitchLead", () => {
++  it("sets model and effort, says so, and Undo restores both", async () => {
++    const on = vi.fn();
++    const write = aePatchLeadWriter("s1", on);
++    const result = await aeSwitchLead("s1", FABLE_MAX, MODELS, write);
++    expect(mocks.updateSession.mock.calls).toEqual([
++      ["s1", { modelOverride: "fable" }],
++      ["s1", { reasoningEffort: "max" }],
++    ]);
++    expect(on).toHaveBeenCalledTimes(2);
++    expect(aeLeadSentence(result)).toBe("Lead switched to Fable 5.1 max.");
++    aeAnnounceLead("s1", "YOLO", result, write);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Lead switched to Fable 5.1 max",
++      expect.objectContaining({ action: expect.objectContaining({ label: "Undo" }) }),
++    );
++    if (result.kind !== "switched") throw new Error("expected a switch");
++    expect(await aeUndoLead("s1", result, write)).toEqual({
++      restored: ["the model", "the effort"],
++      kept: [],
++    });
++    expect(stored).toMatchObject({ modelOverride: "opus", reasoningEffort: "high" });
++  });
++
++  it("Undo leaves a model the user changed since the switch", async () => {
++    const write = aePatchLeadWriter("s1", vi.fn());
++    const result = await aeSwitchLead("s1", FABLE_MAX, MODELS, write);
++    stored = { ...stored, modelOverride: "sonnet" };
++    if (result.kind !== "switched") throw new Error("expected a switch");
++    expect(await aeUndoLead("s1", result, write)).toEqual({
++      restored: ["the effort"],
++      kept: ["the model"],
++    });
++    expect(stored.modelOverride).toBe("sonnet");
++  });
++
++  it("changes nothing when the host does not offer the model, and says so", async () => {
++    const write = aePatchLeadWriter("s1", vi.fn());
++    const result = await aeSwitchLead("s1", FABLE_MAX, MODELS.slice(0, 1), write);
++    expect(result).toEqual({ kind: "missing", name: "Fable 5.1" });
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++    aeAnnounceLead("s1", "YOLO", result, write);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Roles preset: YOLO. This host does not offer Fable 5.1, so the model was not changed.",
++      { duration: 6_000 },
++    );
++  });
++
++  it("does nothing when already on the lead, or when the preset has no fixed lead", async () => {
++    stored = { ...stored, modelOverride: "fable", reasoningEffort: "max" };
++    const write = aePatchLeadWriter("s1", vi.fn());
++    expect(await aeSwitchLead("s1", FABLE_MAX, MODELS, write)).toEqual({ kind: "same" });
++    expect(await aeSwitchLead("s1", null, MODELS, write)).toEqual({ kind: "none" });
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++  });
++
++  it("keeps the 1M variant of the same model and changes only the effort", async () => {
++    stored = { ...stored, modelOverride: "fable[1m]", reasoningEffort: "high" };
++    const result = await aeSwitchLead("s1", FABLE_MAX, MODELS, aePatchLeadWriter("s1", vi.fn()));
++    expect(mocks.updateSession.mock.calls).toEqual([["s1", { reasoningEffort: "max" }]]);
++    expect(result).toMatchObject({ kind: "switched", after: { model: "fable[1m]" } });
++    stored = { ...stored, reasoningEffort: "max" };
++    mocks.updateSession.mockClear();
++    expect(await aeSwitchLead("s1", FABLE_MAX, MODELS, aePatchLeadWriter("s1", vi.fn()))).toEqual({
++      kind: "same",
++    });
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++  });
++
++  it("keeps a full-id 1M session when the picker row is a tier alias", async () => {
++    stored = { ...stored, modelOverride: "claude-fable-5-1[1m]", reasoningEffort: "max" };
++    expect(await aeSwitchLead("s1", FABLE_MAX, MODELS, aePatchLeadWriter("s1", vi.fn()))).toEqual({
++      kind: "same",
++    });
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++    stored = { ...stored, reasoningEffort: "high" };
++    const result = await aeSwitchLead("s1", FABLE_MAX, MODELS, aePatchLeadWriter("s1", vi.fn()));
++    expect(mocks.updateSession.mock.calls).toEqual([["s1", { reasoningEffort: "max" }]]);
++    expect(result).toMatchObject({ after: { model: "claude-fable-5-1[1m]" } });
++  });
++
++  it("still names the preset when the lead was already on its model", () => {
++    aeAnnounceLead("s1", "YOLO", { kind: "same" }, aePatchLeadWriter("s1", vi.fn()));
++    expect(mocks.toast).toHaveBeenCalledWith("Roles preset: YOLO", { duration: 2_000 });
++    mocks.toast.mockClear();
++    aeAnnounceLead("s1", "YOLO", { kind: "none" }, aePatchLeadWriter("s1", vi.fn()));
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++
++  it("skips the effort on a harness without effort control", async () => {
++    stored = { ...stored, labels: {}, harness: "openai-agents" } as unknown as Session;
++    const result = await aeSwitchLead("s1", FABLE_MAX, MODELS, aePatchLeadWriter("s1", vi.fn()));
++    expect(mocks.updateSession.mock.calls).toEqual([["s1", { modelOverride: "fable" }]]);
++    expect(aeLeadSentence(result)).toBe("Lead switched to Fable 5.1.");
++  });
++});
+diff --git a/web/src/lib/aeLeadModel.ts b/web/src/lib/aeLeadModel.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..eb2a2c1918b8d42e866217cbed4950effed6ddaf
+--- /dev/null
++++ b/web/src/lib/aeLeadModel.ts
+@@ -0,0 +1,247 @@
++// A preset's fixed lead model (omnigent-ae, 2026-10-24). A preset whose lead
++// role is "fixed" (YOLO: Fable at max) used to change only the label, so the
++// composer stayed on its old model while the lead notice said otherwise. Picking
++// such a preset now also sets the session's model and effort, resolved against
++// the model options the picker offers, with a toast and an Undo that puts back
++// only what is still as the switch left it. A lead of "session" or "auto"
++// changes nothing about the model.
++
++import type { QueryClient } from "@tanstack/react-query";
++import { toast } from "sonner";
++import { aeWithClaudeVersions } from "@/lib/aeClaudeModels";
++import { type AeRoleEffort, type AeRolePreset, aeModelLabel } from "@/lib/aeRoles";
++import { comparableModelId } from "@/lib/codexNativeModels";
++import { supportsEffortControl } from "@/lib/sessionCapabilities";
++import { getSessionSlim, updateSession } from "@/lib/sessionsApi";
++import type { NativeModelOption, Session } from "@/lib/types";
++
++export interface AeFixedLead {
++  model: string;
++  effort: AeRoleEffort;
++}
++
++/** The preset's lead model and effort when its lead role is fixed, else null. */
++export function aeFixedLead(preset: Pick<AeRolePreset, "roles"> | null | undefined) {
++  const lead = preset?.roles?.lead;
++  return lead?.mode === "fixed" ? { model: lead.model, effort: lead.effort } : null;
++}
++
++/** The picker option that runs `model` (a catalog id), or null when the host offers none. */
++export function aeFindLeadOption(
++  model: string,
++  options: readonly NativeModelOption[],
++): NativeModelOption | null {
++  const want = comparableModelId(model);
++  if (!want) return null;
++  const matches = options.filter(
++    (o) => comparableModelId(o.model) === want || comparableModelId(o.id) === want,
++  );
++  // The plain row over a "[1m]" context variant of the same model.
++  return matches.find((o) => !/\[1m\]$/i.test(o.id)) ?? matches[0] ?? null;
++}
++
++/**
++ * The model options the composer's picker shows: the session's own catalog
++ * (`sessionRows`) once it is bound, else the host's cached probe rows for the
++ * session's harness only. No harness, no fallback: a model another harness
++ * offers is never one this session can run.
++ */
++export function aeLeadModelOptions(
++  queryClient: QueryClient,
++  hostId: string | null | undefined,
++  sessionRows: readonly NativeModelOption[] = [],
++  harness?: string | null,
++): NativeModelOption[] {
++  const rows: NativeModelOption[] = [...sessionRows];
++  if (!rows.length && hostId && harness) {
++    const data = queryClient.getQueryData<NativeModelOption[]>([
++      "host-model-options",
++      hostId,
++      harness,
++    ]);
++    if (Array.isArray(data)) rows.push(...data);
++  }
++  return aeWithClaudeVersions(rows);
++}
++
++type OnSession = (session: Session) => void;
++
++interface Setting {
++  model: string | null;
++  effort: string | null;
++}
++
++export type AeLeadSwitch =
++  | { kind: "none" }
++  | { kind: "same" }
++  | { kind: "missing"; name: string }
++  /** The model write returned, but the session is not on the target model. */
++  | { kind: "not_taken"; name: string }
++  | {
++      kind: "switched";
++      label: string;
++      before: Setting;
++      after: Setting;
++      /** Whether the effort was written (harnesses without effort control skip it). */
++      effortSet: boolean;
++      effortError: string | null;
++    };
++
++const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
++
++/** Writes the session's model or effort and resolves to the value the server kept. */
++export type AeLeadWriter = (
++  field: "model" | "effort",
++  value: string | null,
++) => Promise<string | null>;
++
++/** A writer that PATCHes the session and hands each saved session to `on`. */
++export function aePatchLeadWriter(sessionId: string, on: OnSession): AeLeadWriter {
++  return async (field, value) => {
++    const updated = await updateSession(
++      sessionId,
++      field === "model" ? { modelOverride: value } : { reasoningEffort: value },
++    );
++    on(updated);
++    return (field === "model" ? updated.modelOverride : updated.reasoningEffort) ?? null;
++  };
++}
++
++/**
++ * Put the session's model and effort on `lead`, resolved against `options`.
++ * A missing option changes nothing; the caller says so. Throws only when the
++ * model write fails; an effort failure is reported in the result.
++ */
++export async function aeSwitchLead(
++  sessionId: string,
++  lead: AeFixedLead | null,
++  options: readonly NativeModelOption[],
++  write: AeLeadWriter,
++): Promise<AeLeadSwitch> {
++  if (!lead) return { kind: "none" };
++  const option = aeFindLeadOption(lead.model, options);
++  if (!option) return { kind: "missing", name: aeModelLabel(lead.model) };
++  const session = await getSessionSlim(sessionId);
++  const before: Setting = {
++    model: session.modelOverride ?? null,
++    effort: session.reasoningEffort ?? null,
++  };
++  const withEffort = supportsEffortControl(session);
++  // The same model in another context variant ("[1m]") counts as the same: it stays.
++  // The picker id may be a tier alias ("fable") for the model the session names in full.
++  const current = comparableModelId(before.model);
++  const sameModel =
++    current === comparableModelId(option.id) ||
++    (option.model != null && current === comparableModelId(option.model));
++  if (sameModel && (!withEffort || before.effort === lead.effort)) {
++    return { kind: "same" };
++  }
++  const name = option.displayName ?? aeModelLabel(option.model ?? option.id);
++  const after: Setting = { ...before };
++  if (!sameModel) {
++    after.model = await write("model", option.id);
++    if (comparableModelId(after.model) !== comparableModelId(option.id)) {
++      return { kind: "not_taken", name };
++    }
++  }
++  let effortSet = false;
++  let effortError: string | null = null;
++  if (withEffort && before.effort !== lead.effort) {
++    try {
++      after.effort = await write("effort", lead.effort);
++      effortSet = true;
++    } catch (error) {
++      effortError = reasonOf(error);
++    }
++  }
++  return {
++    kind: "switched",
++    label: withEffort ? `${name} ${lead.effort}` : name,
++    before,
++    after,
++    effortSet,
++    effortError,
++  };
++}
++
++/** Undo a switch: put back the model and effort that are still as it left them. */
++export async function aeUndoLead(
++  sessionId: string,
++  applied: Extract<AeLeadSwitch, { kind: "switched" }>,
++  write: AeLeadWriter,
++): Promise<{ restored: string[]; kept: string[] }> {
++  const now = await getSessionSlim(sessionId);
++  const restored: string[] = [];
++  const kept: string[] = [];
++  const { before, after } = applied;
++  if (before.model !== after.model) {
++    if ((now.modelOverride ?? null) === after.model) {
++      await write("model", before.model);
++      restored.push("the model");
++    } else {
++      kept.push("the model");
++    }
++  }
++  if (applied.effortSet) {
++    if ((now.reasoningEffort ?? null) === after.effort) {
++      await write("effort", before.effort);
++      restored.push("the effort");
++    } else {
++      kept.push("the effort");
++    }
++  }
++  return { restored, kept };
++}
++
++/** The sentence a toast uses for a switch result, or null when there is nothing to say. */
++export function aeLeadSentence(result: AeLeadSwitch): string | null {
++  if (result.kind === "missing") {
++    return `This host does not offer ${result.name}, so the model was not changed.`;
++  }
++  if (result.kind === "not_taken") {
++    return `The switch to ${result.name} did not take, so the model is as it was. Use the model picker.`;
++  }
++  if (result.kind !== "switched") return null;
++  const effortNote = result.effortError ? ` (effort not changed: ${result.effortError})` : "";
++  return `Lead switched to ${result.label}${effortNote}.`;
++}
++
++/** The "Lead switched to X" toast with Undo, after a preset pick from the pill, Alt digit or dialog. */
++export function aeAnnounceLead(
++  sessionId: string,
++  presetTitle: string,
++  result: AeLeadSwitch,
++  write: AeLeadWriter,
++) {
++  const sentence = aeLeadSentence(result);
++  if (!sentence) {
++    // A fixed lead already on its model: the pick still gets its toast.
++    if (result.kind === "same") toast(`Roles preset: ${presetTitle}`, { duration: 2_000 });
++    return;
++  }
++  if (result.kind !== "switched") {
++    toast(`Roles preset: ${presetTitle}. ${sentence}`, { duration: 6_000 });
++    return;
++  }
++  toast(sentence.slice(0, -1), {
++    duration: 10_000,
++    action: {
++      label: "Undo",
++      onClick: () =>
++        void aeUndoLead(sessionId, result, write).then(
++          ({ restored, kept }) => {
++            const left = kept.length
++              ? ` Left ${kept.join(" and ")} as it is now, since it changed after the switch.`
++              : "";
++            toast(
++              restored.length
++                ? `Put back ${restored.join(" and ")}.${left}`
++                : `Nothing put back.${left}`,
++            );
++          },
++          (error: unknown) =>
++            toast(`Could not undo the lead switch: ${reasonOf(error)}. Use the model picker.`),
++        ),
++    },
++  });
++}
+diff --git a/web/src/lib/aeLeadModelChat.test.ts b/web/src/lib/aeLeadModelChat.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..27e28749800e4497eb2a8549749848d7480430dd
+--- /dev/null
++++ b/web/src/lib/aeLeadModelChat.test.ts
+@@ -0,0 +1,176 @@
++import { QueryClient } from "@tanstack/react-query";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { useChatStore } from "@/store/chatStore";
++import { aeAnnouncePresetLead, aeSwitchPresetLead } from "./aeLeadModelChat";
++import type { Session } from "./types";
++
++const mocks = vi.hoisted(() => ({
++  getSessionSlim: vi.fn(),
++  updateSession: vi.fn(),
++  toast: vi.fn(),
++}));
++vi.mock("@/lib/sessionsApi", async (original) => ({
++  ...(await original<object>()),
++  getSessionSlim: mocks.getSessionSlim,
++  updateSession: mocks.updateSession,
++}));
++vi.mock("sonner", () => ({ toast: mocks.toast }));
++
++const YOLO = {
++  title: "YOLO",
++  roles: {
++    lead: { mode: "fixed", model: "claude-fable-5-1", effort: "max" },
++    planner: { mode: "auto" },
++    reviewer: { mode: "auto" },
++    builder: { mode: "auto" },
++    helper: { mode: "auto" },
++  },
++} as const;
++const session = {
++  id: "s1",
++  hostId: "h1",
++  labels: { "omnigent.wrapper": "claude-code-native-ui" },
++  modelOverride: "opus",
++  reasoningEffort: "high",
++} as unknown as Session;
++
++const initial = useChatStore.getState();
++let queryClient: QueryClient;
++// The server's row for s1: the chat store's writes land here too.
++let stored: Session;
++beforeEach(() => {
++  vi.resetAllMocks();
++  queryClient = new QueryClient();
++  stored = { ...session };
++  mocks.getSessionSlim.mockImplementation(async () => stored);
++  mocks.updateSession.mockImplementation(async (_id: string, patch: object) => {
++    stored = { ...stored, ...patch };
++    return stored;
++  });
++});
++afterEach(() => {
++  useChatStore.setState(initial, true);
++});
++
++describe("aeSwitchPresetLead", () => {
++  it("switches the open chat through the chat store's setModel and setEffort", async () => {
++    const setModel = vi.fn(async (model: string | null) => {
++      useChatStore.setState({ sessionModelOverride: model });
++      stored = { ...stored, modelOverride: model };
++    });
++    const setEffort = vi.fn(async (effort: string | null) => {
++      useChatStore.setState({ sessionReasoningEffort: effort });
++      stored = { ...stored, reasoningEffort: effort };
++    });
++    useChatStore.setState({
++      conversationId: "s1",
++      codexModelOptions: [{ id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" }],
++      setModel,
++      setEffort,
++    });
++    queryClient.setQueryData(["session", "s1"], { ...session, harness: "claude-native" });
++    const result = await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO);
++    expect(setModel).toHaveBeenCalledWith("fable", { expectConfirmation: true });
++    expect(setEffort).toHaveBeenCalledWith("max");
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++    aeAnnouncePresetLead(queryClient, "s1", "YOLO", result);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Lead switched to Fable 5.1 max",
++      expect.objectContaining({ action: expect.objectContaining({ label: "Undo" }) }),
++    );
++  });
++
++  it("reads the switched session's own row when the user moves to another chat mid-switch", async () => {
++    const setModel = vi.fn(async (model: string | null) => {
++      stored = { ...stored, modelOverride: model };
++      // The user opened another chat while the harness confirmed the switch.
++      useChatStore.setState({ conversationId: "other", sessionModelOverride: "haiku" });
++    });
++    useChatStore.setState({
++      conversationId: "s1",
++      codexModelOptions: [{ id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" }],
++      setModel,
++    });
++    queryClient.setQueryData(["session", "s1"], { ...session, harness: "claude-native" });
++    const result = await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO);
++    expect(result).toMatchObject({
++      kind: "switched",
++      after: { model: "fable", effort: "max" },
++    });
++    // The effort went to s1 by PATCH, since s1 is no longer the open chat.
++    expect(mocks.updateSession).toHaveBeenCalledWith("s1", { reasoningEffort: "max" });
++  });
++
++  it("says the switch did not take when the session's model is not the target", async () => {
++    const setModel = vi.fn(async () => {
++      // The harness refused quietly: the row keeps its old model.
++    });
++    useChatStore.setState({
++      conversationId: "s1",
++      codexModelOptions: [{ id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" }],
++      setModel,
++    });
++    queryClient.setQueryData(["session", "s1"], { ...session, harness: "claude-native" });
++    const result = await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO);
++    expect(result).toEqual({ kind: "not_taken", name: "Fable 5.1" });
++    aeAnnouncePresetLead(queryClient, "s1", "YOLO", result);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Roles preset: YOLO. The switch to Fable 5.1 did not take, so the model is as it was. Use the model picker.",
++      { duration: 6_000 },
++    );
++  });
++
++  it("uses only the cached options of the session's own harness", async () => {
++    useChatStore.setState({ conversationId: "other" });
++    queryClient.setQueryData(["session", "s1"], { ...session, harness: "codex-native" });
++    queryClient.setQueryData(
++      ["host-model-options", "h1", "claude-native"],
++      [{ id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" }],
++    );
++    const result = await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO);
++    expect(result).toEqual({ kind: "missing", name: expect.any(String) });
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++    // No harness known: no fallback either.
++    queryClient.removeQueries({ queryKey: ["session", "s1"] });
++    expect(await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO)).toMatchObject({
++      kind: "missing",
++    });
++  });
++
++  it("PATCHes a session that is not the open chat, using the host's cached options", async () => {
++    useChatStore.setState({ conversationId: "other" });
++    queryClient.setQueryData(["session", "s1"], { ...session, harness: "claude-native" });
++    queryClient.setQueryData(
++      ["host-model-options", "h1", "claude-native"],
++      [{ id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" }],
++    );
++    await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO);
++    expect(mocks.updateSession.mock.calls).toEqual([
++      ["s1", { modelOverride: "fable" }],
++      ["s1", { reasoningEffort: "max" }],
++    ]);
++    expect(queryClient.getQueryData(["session", "s1"])).toMatchObject({ reasoningEffort: "max" });
++  });
++
++  it("leaves the model alone for a preset whose lead is the session model", async () => {
++    const preset = { ...YOLO, roles: { ...YOLO.roles, lead: { mode: "session" } } } as const;
++    expect(await aeSwitchPresetLead(queryClient, "s1", "h1", preset)).toEqual({ kind: "none" });
++    expect(mocks.getSessionSlim).not.toHaveBeenCalled();
++  });
++
++  it("reports a failed model write instead of throwing", async () => {
++    useChatStore.setState({ conversationId: "other" });
++    queryClient.setQueryData(
++      ["host-model-options", "h1", "claude-native"],
++      [{ id: "fable", model: "claude-fable-5-1" }],
++    );
++    queryClient.setQueryData(["session", "s1"], { ...session, harness: "claude-native" });
++    mocks.updateSession.mockRejectedValueOnce(new Error("runner offline"));
++    const result = await aeSwitchPresetLead(queryClient, "s1", "h1", YOLO);
++    expect(result).toEqual({ kind: "failed", reason: "runner offline" });
++    aeAnnouncePresetLead(queryClient, "s1", "YOLO", result);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Roles preset: YOLO. Could not switch the lead model: runner offline. Use the model picker.",
++    );
++  });
++});
+diff --git a/web/src/lib/aeLeadModelChat.ts b/web/src/lib/aeLeadModelChat.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..13524418cdcf07f7b9d5ffd733a6cf7b89d4f585
+--- /dev/null
++++ b/web/src/lib/aeLeadModelChat.ts
+@@ -0,0 +1,91 @@
++// Switching the lead model from the composer (omnigent-ae, 2026-10-24): the
++// pill, Alt 1 to 9 and the "Who works on this?" dialog. The open chat's model
++// and effort go through the chat store's setModel and setEffort so the picker
++// updates at once; any other session is PATCHed. Kept apart from aeLeadModel.ts
++// because the chat store imports the START ON path, which uses that file.
++
++import type { QueryClient } from "@tanstack/react-query";
++import { toast } from "sonner";
++import {
++  type AeLeadSwitch,
++  type AeLeadWriter,
++  aeAnnounceLead,
++  aeFixedLead,
++  aeLeadModelOptions,
++  aePatchLeadWriter,
++  aeSwitchLead,
++} from "@/lib/aeLeadModel";
++import type { AeRolePreset } from "@/lib/aeRoles";
++import { getSessionSlim } from "@/lib/sessionsApi";
++import type { Session } from "@/lib/types";
++import { useChatStore } from "@/store/chatStore";
++
++/**
++ * Writes through the chat store when `sessionId` is the open chat, else PATCHes
++ * it. Resolves to the value `sessionId`'s own row holds after the write, never
++ * the open chat's (the user may have moved to another chat while it ran).
++ */
++export function aeChatLeadWriter(queryClient: QueryClient, sessionId: string): AeLeadWriter {
++  const patch = aePatchLeadWriter(sessionId, (session) =>
++    queryClient.setQueryData(["session", sessionId], session),
++  );
++  return async (field, value) => {
++    const chat = useChatStore.getState();
++    if (chat.conversationId !== sessionId) return patch(field, value);
++    if (field === "model") {
++      // Like the model picker: a native Claude or Codex chip waits for the harness to confirm.
++      const harness = queryClient.getQueryData<Session>(["session", sessionId])?.harness;
++      await chat.setModel(value, {
++        expectConfirmation: harness === "claude-native" || harness === "codex-native",
++      });
++    } else {
++      await chat.setEffort(value);
++    }
++    const row = await getSessionSlim(sessionId);
++    return (field === "model" ? row.modelOverride : row.reasoningEffort) ?? null;
++  };
++}
++
++/**
++ * After `preset` was saved for `sessionId`: when its lead is fixed, switch the
++ * session's model and effort to it. Resolves to the result without a toast, so
++ * the caller can order it after its own label write; never throws.
++ */
++export async function aeSwitchPresetLead(
++  queryClient: QueryClient,
++  sessionId: string,
++  hostId: string | null | undefined,
++  preset: Pick<AeRolePreset, "roles" | "title"> | null | undefined,
++): Promise<AeLeadSwitch | { kind: "failed"; reason: string }> {
++  const lead = aeFixedLead(preset);
++  if (!lead) return { kind: "none" };
++  const chat = useChatStore.getState();
++  const rows = chat.conversationId === sessionId ? chat.codexModelOptions : [];
++  const harness = queryClient.getQueryData<Session>(["session", sessionId])?.harness;
++  try {
++    return await aeSwitchLead(
++      sessionId,
++      lead,
++      aeLeadModelOptions(queryClient, hostId, rows, harness),
++      aeChatLeadWriter(queryClient, sessionId),
++    );
++  } catch (error) {
++    return { kind: "failed", reason: error instanceof Error ? error.message : String(error) };
++  }
++}
++
++/** The toast for {@link aeSwitchPresetLead}'s result; nothing for a preset that left the model alone. */
++export function aeAnnouncePresetLead(
++  queryClient: QueryClient,
++  sessionId: string,
++  presetTitle: string,
++  result: Awaited<ReturnType<typeof aeSwitchPresetLead>>,
++) {
++  if (result.kind === "failed") {
++    toast(
++      `Roles preset: ${presetTitle}. Could not switch the lead model: ${result.reason}. Use the model picker.`,
++    );
++    return;
++  }
++  aeAnnounceLead(sessionId, presetTitle, result, aeChatLeadWriter(queryClient, sessionId));
++}
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index 352817c8fd5506bd1c1afcdbef0b7b0b6afc5a7f..a82256419194d511e1641181f19184dda3c0e5d4 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -40,6 +40,14 @@ export const AE_HELPERS_LABELS: Record<AeHelpers, { label: string; hint: string
+   any: { label: "Any agent or session", hint: "The lead may bring in other agents" },
+   own: { label: "Own subagents only", hint: "No other agents or sessions" },
+ };
++/**
++ * Tag on the model change rules (2026-10-24): nothing acts on them until the
++ * lead gets a tool to change models, so Settings says so.
++ */
++export const AE_COMING_LATER = {
++  label: "Coming later",
++  hint: "The lead does not change models on its own yet.",
++} as const;
+ /** The Helpers choices as a segmented control takes them. */
+ export const AE_HELPERS_OPTIONS = AE_HELPERS.map((value) => ({
+   value,
+diff --git a/web/src/lib/aeStartOnApply.test.ts b/web/src/lib/aeStartOnApply.test.ts
+index 588274e3e18b82a70a60b96b2508f1aae14eff7e..48f55fb464965017e4721a947df9a528b1399d71 100644
+--- a/web/src/lib/aeStartOnApply.test.ts
++++ b/web/src/lib/aeStartOnApply.test.ts
+@@ -197,6 +197,60 @@ describe("aeApplyQueuedStartOn", () => {
+     expect(mocks.updateSession.mock.calls[0][1]).toEqual({ modelOverride: "sonnet" });
+   });
+ 
++  it("a preset with a fixed lead also switches model and effort, and Undo restores all", async () => {
++    let stored = session;
++    mocks.getSessionSlim.mockImplementation(async () => stored);
++    mocks.updateSession.mockImplementation(async (_id: string, patch: Partial<Session>) => {
++      const labels = { ...stored.labels, ...patch.labels };
++      stored = { ...stored, ...patch, labels } as Session;
++      return stored;
++    });
++    const yolo = preset("yolo", "YOLO");
++    yolo.roles.lead = { mode: "fixed", model: "claude-fable-5-1", effort: "max" } as never;
++    mocks.fetchAeRoles.mockResolvedValue({ ...ROLES, presets: [ROLES.presets[0], yolo] });
++    const models = [
++      ...MODELS,
++      { id: "fable", model: "claude-fable-5-1", displayName: "Fable 5.1" },
++    ];
++    aeQueueStartOn("s1", { text: "START ON: YOLO", models });
++    await aeApplyQueuedStartOn("s1", "s1", vi.fn());
++    expect(mocks.updateSession.mock.calls.slice(1)).toEqual([
++      ["s1", { modelOverride: "fable" }],
++      ["s1", { reasoningEffort: "max" }],
++    ]);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Started on YOLO. Lead switched to Fable 5.1 max.",
++      expect.objectContaining({ action: expect.objectContaining({ label: "Undo" }) }),
++    );
++    undoAction()();
++    await vi.waitFor(() =>
++      expect(mocks.toast).toHaveBeenCalledWith(
++        "Put back the roles preset and the model and the effort.",
++      ),
++    );
++    expect(stored).toMatchObject({ modelOverride: "sonnet", reasoningEffort: "medium" });
++  });
++
++  it("a fixed lead the host does not offer keeps the preset and says so", async () => {
++    const yolo = preset("yolo", "YOLO");
++    yolo.roles.lead = { mode: "fixed", model: "claude-fable-5-1", effort: "max" } as never;
++    mocks.fetchAeRoles.mockResolvedValue({ ...ROLES, presets: [ROLES.presets[0], yolo] });
++    aeQueueStartOn("s1", { text: "START ON: YOLO", models: MODELS });
++    await aeApplyQueuedStartOn("s1", "s1", vi.fn());
++    expect(mocks.updateSession).toHaveBeenCalledTimes(1);
++    expect(mocks.toast).toHaveBeenCalledWith(
++      "Started on YOLO. This host does not offer Fable 5.1, so the model was not changed.",
++      expect.anything(),
++    );
++  });
++
++  it("a preset whose lead is the session model changes only the label", async () => {
++    aeQueueStartOn("s1", { text: "START ON: YOLO", models: MODELS });
++    await aeApplyQueuedStartOn("s1", "s1", vi.fn());
++    expect(mocks.updateSession).toHaveBeenCalledTimes(1);
++    expect(mocks.updateSession.mock.calls[0][1]).not.toHaveProperty("modelOverride");
++  });
++
+   it("past the budget the send goes on, then the Started on toast and Undo follow", async () => {
+     vi.useFakeTimers();
+     try {
+diff --git a/web/src/lib/aeStartOnApply.ts b/web/src/lib/aeStartOnApply.ts
+index 86b74b5f8fc44148f074b5e0e846975fa40f96ef..a346515fc9d9879b52f56702d0a7a6c468252fde 100644
+--- a/web/src/lib/aeStartOnApply.ts
++++ b/web/src/lib/aeStartOnApply.ts
+@@ -3,6 +3,7 @@
+ // after the session exists and before the message is posted, so the first turn
+ // already runs on it. A toast says "Started on X" with Undo, which puts back
+ // the preset, model and effort the session had. Failures never block the send.
++// A preset with a fixed lead also switches the model and effort (2026-10-24).
+ 
+ import { toast } from "sonner";
+ import {
+@@ -16,6 +17,15 @@ import {
+   readAeTeamLabelMode,
+ } from "@/lib/aeSessionRoles";
+ import { fetchAeRoles } from "@/hooks/useAeRoles";
++import {
++  type AeFixedLead,
++  type AeLeadSwitch,
++  aeFixedLead,
++  aeLeadSentence,
++  aePatchLeadWriter,
++  aeSwitchLead,
++  aeUndoLead,
++} from "@/lib/aeLeadModel";
+ import { type AeStartOnTarget, aeParseStartOn } from "@/lib/aeStartOn";
+ import { supportsEffortControl } from "@/lib/sessionCapabilities";
+ import { getSessionSlim, updateSession } from "@/lib/sessionsApi";
+@@ -31,6 +41,9 @@ interface AeStartOnPlan {
+   target: AeStartOnTarget;
+   /** The user's default preset id, which a preset pick writes as "no field". */
+   defaultId: string;
++  /** A picked preset's fixed lead, and the model options to resolve it against. */
++  lead: AeFixedLead | null;
++  models: readonly NativeModelOption[];
+ }
+ 
+ /** A queued plan older than this is dropped rather than applied to a later send. */
+@@ -90,6 +103,9 @@ interface Applied {
+   after: After;
+   /** Set when the model landed but the effort PATCH failed. */
+   effortError: string | null;
++  /** What a preset's fixed lead did to the model, or why it did nothing. */
++  lead: AeLeadSwitch | null;
++  leadError: string | null;
+ }
+ 
+ const reasonOf = (error: unknown) => (error instanceof Error ? error.message : String(error));
+@@ -115,6 +131,8 @@ async function applyPlan(
+     effort: before.effort,
+   };
+   let effortError: string | null = null;
++  let lead: AeLeadSwitch | null = null;
++  let leadError: string | null = null;
+   const { target } = plan;
+   if (target.kind === "preset") {
+     const roles = aeRolesForPick(target.presetId, plan.defaultId);
+@@ -125,6 +143,14 @@ async function applyPlan(
+     after.roles = readAeSessionRoles(updated.labels);
+     after.labelText = updated.labels?.[AE_TEAM_LABEL_KEY];
+     aeRememberPreset(target.presetId);
++    if (plan.lead) {
++      try {
++        const write = aePatchLeadWriter(sessionId, onSession);
++        lead = await aeSwitchLead(sessionId, plan.lead, plan.models, write);
++      } catch (error) {
++        leadError = reasonOf(error);
++      }
++    }
+   } else {
+     const updated = await updateSession(sessionId, { modelOverride: target.model });
+     onSession(updated);
+@@ -140,13 +166,13 @@ async function applyPlan(
+       }
+     }
+   }
+-  return { before, after, effortError };
++  return { before, after, effortError, lead, leadError };
+ }
+ 
+ async function undo(
+   sessionId: string,
+   target: AeStartOnTarget,
+-  { before, after }: Applied,
++  { before, after, lead }: Applied,
+   on: OnSession,
+ ) {
+   try {
+@@ -166,6 +192,11 @@ async function undo(
+       } else {
+         kept.push("the roles preset");
+       }
++      if (lead?.kind === "switched") {
++        const back = await aeUndoLead(sessionId, lead, aePatchLeadWriter(sessionId, on));
++        restored.push(...back.restored);
++        kept.push(...back.kept);
++      }
+     } else {
+       if ((now.modelOverride ?? null) === after.model) {
+         on(await updateSession(sessionId, { modelOverride: before.model }));
+@@ -198,10 +229,17 @@ function announce(sessionId: string, plan: AeStartOnPlan, applied: Applied, on:
+   const { target } = plan;
+   const partial = target.kind === "model" && applied.effortError !== null && target.effort;
+   const name = partial ? target.label.slice(0, -(target.effort!.length + 1)) : target.label;
++  const leadNote = applied.leadError
++    ? ` Could not switch the lead model: ${applied.leadError}.`
++    : applied.lead
++      ? ` ${aeLeadSentence(applied.lead) ?? ""}`.trimEnd()
++      : "";
+   toast(
+     partial
+       ? `Started on ${name}; effort ${target.effort} was not applied (${applied.effortError}).`
+-      : `Started on ${target.label}`,
++      : leadNote
++        ? `Started on ${target.label}.${leadNote}`
++        : `Started on ${target.label}`,
+     {
+       duration: 10_000,
+       action: { label: "Undo", onClick: () => void undo(sessionId, target, applied, on) },
+@@ -229,7 +267,14 @@ export async function aeApplyQueuedStartOn(
+     if (!state.apply_start_on) return;
+     const target = aeParseStartOn(queuedLine.text, state.presets, queuedLine.models);
+     if (!target) return;
+-    const plan: AeStartOnPlan = { target, defaultId: state.default_preset };
++    const preset =
++      target.kind === "preset" ? state.presets.find((p) => p.id === target.presetId) : undefined;
++    const plan: AeStartOnPlan = {
++      target,
++      defaultId: state.default_preset,
++      lead: aeFixedLead(preset),
++      models: queuedLine.models,
++    };
+     held.plan = plan;
+     announce(sessionId, plan, await applyPlan(sessionId, plan, onSession), onSession);
+   };
+diff --git a/web/src/lib/aeTeamPresets.test.ts b/web/src/lib/aeTeamPresets.test.ts
+index 9ea279833be7b0e5c8258a5f6cd4c79015f1ca3f..78208e0fecee20572cb453d2f704186ad13b0ef2 100644
+--- a/web/src/lib/aeTeamPresets.test.ts
++++ b/web/src/lib/aeTeamPresets.test.ts
+@@ -133,7 +133,7 @@ describe("reading a label saved before the fold", () => {
+         isDefault: false,
+         edited: false,
+       }),
+-    ).toBe("Solo keeps work in this chat. Pick another preset to add sessions.");
++    ).toBe("Solo uses own subagents only. Pick another preset to add sessions.");
+   });
+ });
+ 
+diff --git a/web/src/lib/aeTeamPresets.ts b/web/src/lib/aeTeamPresets.ts
+index f2879c421f043069bc787073c91b6cf88dbad1d3..7882591fbf174c9b4fee85522d1e9d0fcfd2078f 100644
+--- a/web/src/lib/aeTeamPresets.ts
++++ b/web/src/lib/aeTeamPresets.ts
+@@ -90,7 +90,7 @@ export function aeChoiceHelpers(choice: AeSessionPresetChoice | null): AeHelpers
+ /** The line shown where the sessions list is greyed out by an "Own subagents only" preset. */
+ export function aeSessionsLockedHint(choice: AeSessionPresetChoice | null): string {
+   const title = choice?.kind === "preset" ? choice.preset.title : "This preset";
+-  return `${title} keeps work in this chat. Pick another preset to add sessions.`;
++  return `${title} uses own subagents only. Pick another preset to add sessions.`;
+ }
+ 
+ /** Whether a choice id is the reserved "Lead picks" one (for callers that only hold ids). */
+diff --git a/web/src/pages/settings/AeRolesControls.tsx b/web/src/pages/settings/AeRolesControls.tsx
+index 01e1459dd4c405a48af43f8dac104a09ef89ae3d..8c18e9832208a749ceca779b0fac8eae4dca9237 100644
+--- a/web/src/pages/settings/AeRolesControls.tsx
++++ b/web/src/pages/settings/AeRolesControls.tsx
+@@ -50,7 +50,7 @@ export function AeInHouseTag() {
+       className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-muted px-1.5 text-[10px] font-semibold text-muted-foreground"
+     >
+       <HomeIcon className="size-2.5" aria-hidden="true" />
+-      In house
++      Own subagents only
+     </span>
+   );
+ }
+diff --git a/web/src/pages/settings/AeRolesEditor.tsx b/web/src/pages/settings/AeRolesEditor.tsx
+index 11a8ff88f2f38aa03d87e52fd958c7f60cc9af82..ff041d21180e37ad659150e708e902e748bdd613 100644
+--- a/web/src/pages/settings/AeRolesEditor.tsx
++++ b/web/src/pages/settings/AeRolesEditor.tsx
+@@ -8,6 +8,7 @@ import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
+ import { aeClaudeCodeDefaultEffort, aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
+ import {
+   AE_AUTO_RAISES_MAX,
++  AE_COMING_LATER,
+   AE_HELPERS_OPTIONS,
+   AE_ROLE_EFFORTS,
+   AE_ROLE_IDS,
+@@ -196,16 +197,30 @@ export function AeRoleRow({
+ function RuleRow({
+   title,
+   hint,
++  later,
+   children,
+ }: {
+   title: string;
+   hint?: string;
++  /** Tags a rule nothing acts on yet with a muted "Coming later" note. */
++  later?: boolean;
+   children: React.ReactNode;
+ }) {
+   return (
+     <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-2">
+       <div className="min-w-0">
+-        <div className="text-sm">{title}</div>
++        <div className="text-sm">
++          {title}
++          {later && (
++            <span
++              title={AE_COMING_LATER.hint}
++              data-testid="ae-rule-coming-later"
++              className="ml-1.5 text-[11px] text-muted-foreground"
++            >
++              {AE_COMING_LATER.label}
++            </span>
++          )}
++        </div>
+         {hint && <div className="text-xs text-muted-foreground">{hint}</div>}
+       </div>
+       {children}
+@@ -329,7 +344,11 @@ export function AeRolesEditor({
+         <h3 className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+           Model changes in this preset
+         </h3>
+-        <RuleRow title="Raise a stuck child, or lower the lead" hint="Applies to both directions">
++        <RuleRow
++          title="Raise a stuck child, or lower the lead"
++          hint="Applies to both directions"
++          later
++        >
+           <AeSegmented
+             label="Raise a stuck child, or lower the lead"
+             value={draft.rules.raise_or_lower}
+@@ -342,6 +361,7 @@ export function AeRolesEditor({
+         <RuleRow
+           title="Lead steps down for mechanical work"
+           hint="Watching CI, applying decided fixes: the Builder's model"
++          later
+         >
+           <AeSegmented
+             label="Lead steps down for mechanical work"
+@@ -352,7 +372,7 @@ export function AeRolesEditor({
+             disabled={saving}
+           />
+         </RuleRow>
+-        <RuleRow title="Automatic raises per child" hint="After this, every raise asks you">
++        <RuleRow title="Automatic raises per child" hint="After this, every raise asks you" later>
+           <AeStepper
+             label="Automatic raises per child"
+             value={draft.rules.auto_raises}
+diff --git a/web/src/pages/settings/AeRolesSettingsSection.test.tsx b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+index 0e6e19eef5bd87fa58ccad773232bffa1e36f9cb..cd021f0dd0c1ec2da4b9483978427e04e3bdfc87 100644
+--- a/web/src/pages/settings/AeRolesSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+@@ -95,7 +95,7 @@ const YOLO: AeRolePreset = {
+   title: "YOLO",
+   icon: "rocket",
+   color: "red",
+-  description: "Fable at max on every role, never asks",
++  description: "Fable at max on every role, no automatic model changes",
+   when_to_use: "Hard problems.",
+   pinned: false,
+   roles: {
+@@ -244,7 +244,9 @@ describe("AeRolesSettingsSection", () => {
+     expect(puts()[0].presets[1].rules).toEqual({ ...BALANCED.rules, helpers: "own" });
+     expect(puts()[0].presets[3]).toEqual(solo);
+     fireEvent.click(screen.getByRole("button", { name: "All presets" }));
+-    expect(await screen.findAllByText("In house")).toHaveLength(2);
++    expect(
++      await screen.findAllByTitle("Own subagents only: no other agents or sessions"),
++    ).toHaveLength(2);
+   });
+ 
+   it("reloads the server's state on a conflict, says so and keeps the edits", async () => {

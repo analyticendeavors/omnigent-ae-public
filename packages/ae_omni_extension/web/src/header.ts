@@ -56,14 +56,18 @@ export interface Release {
   env_missing?: string[] | null;
 }
 
-export async function fetchRelease(context: ExtensionContext): Promise<Release> {
+export async function fetchRelease(
+  context: ExtensionContext,
+): Promise<Release> {
   const response = await context.server.request({
     method: "GET",
     path: "/v1/ae/release",
   });
-  if (!response.ok) throw new Error(`GET /v1/ae/release answered ${response.status}`);
+  if (!response.ok)
+    throw new Error(`GET /v1/ae/release answered ${response.status}`);
   const body = response.body as Partial<Release> | null;
-  if (!body || typeof body.state !== "string") throw new Error("GET /v1/ae/release: no state");
+  if (!body || typeof body.state !== "string")
+    throw new Error("GET /v1/ae/release: no state");
   return body as Release;
 }
 
@@ -77,7 +81,12 @@ export interface HeaderData {
   /** Open pull requests; null until the scan answers or while it is off. */
   prs: PrCard[] | null;
   /** `soon`: tasks coming back within SOON_DAYS; `overdue`: already past their date. */
-  lot: { count: number; next: LotTask | null; soon: number; overdue: number } | null;
+  lot: {
+    count: number;
+    next: LotTask | null;
+    soon: number;
+    overdue: number;
+  } | null;
   release: Release | null;
   needsNote: number;
   reference: number;
@@ -118,7 +127,9 @@ export function resetHeaderView(): void {
 
 /** The soonest lot task coming back on or after *today* (YYYY-MM-DD), else null. */
 export function nextBack(tasks: LotTask[], today: string): LotTask | null {
-  const dated = tasks.filter((task) => task.resurfaces && task.resurfaces >= today);
+  const dated = tasks.filter(
+    (task) => task.resurfaces && task.resurfaces >= today,
+  );
   dated.sort((a, b) =>
     a.resurfaces! < b.resurfaces! ? -1 : a.resurfaces! > b.resurfaces! ? 1 : 0,
   );
@@ -126,7 +137,10 @@ export function nextBack(tasks: LotTask[], today: string): LotTask | null {
 }
 
 /** Lot tasks coming back within SOON_DAYS of *today*, and those already overdue. */
-export function lotCounts(tasks: LotTask[], today: string): { soon: number; overdue: number } {
+export function lotCounts(
+  tasks: LotTask[],
+  today: string,
+): { soon: number; overdue: number } {
   const last = addDays(today, SOON_DAYS - 1);
   const days = tasks
     .map((task) => task.resurfaces?.slice(0, 10))
@@ -178,12 +192,21 @@ function usageMeters(limits: Limits | null): HTMLElement | null {
     return el(
       "div",
       { class: "hd-meter", title: shown.title },
-      el("div", { class: "hd-meter-lbl" }, windowName(shown, longest), el("b", {}, `${pct}%`)),
+      el(
+        "div",
+        { class: "hd-meter-lbl" },
+        windowName(shown, longest),
+        el("b", {}, `${pct}%`),
+      ),
       el("div", { class: "hd-track", "aria-hidden": "true" }, fill),
     );
   });
   return meters.length
-    ? el("div", { class: "hd-usage", role: "status", "aria-label": "Plan limits" }, ...meters)
+    ? el(
+        "div",
+        { class: "hd-usage", role: "status", "aria-label": "Plan limits" },
+        ...meters,
+      )
     : null;
 }
 
@@ -198,14 +221,24 @@ let folded: ReadonlySet<string> = new Set();
 
 function sectionLink(id: string, text: string, cls = ""): HTMLElement {
   if (folded.has(id)) return el("span", { class: cls || undefined }, text);
-  const link = el("button", { type: "button", class: `hd-link ${cls}`.trim() }, text);
+  const link = el(
+    "button",
+    { type: "button", class: `hd-link ${cls}`.trim() },
+    text,
+  );
   link.addEventListener("click", () => jumpTo(id));
   return link;
 }
 
-function sessionLink(context: ExtensionContext, row: CapacitySession): HTMLElement {
+function sessionLink(
+  context: ExtensionContext,
+  row: CapacitySession,
+): HTMLElement {
   const link = el("button", { type: "button", class: "hd-link" }, row.title);
-  link.addEventListener("click", () => void context.navigation.openSession(row.id));
+  link.addEventListener(
+    "click",
+    () => void context.navigation.openSession(row.id),
+  );
   return link;
 }
 
@@ -230,7 +263,9 @@ function toggle(onChange: () => void): HTMLElement {
       persist?.();
       onChange();
       // The redraw replaced this button: keep the focus on its successor.
-      document.querySelector<HTMLElement>(`.hd-toggle [data-view="${id}"]`)?.focus();
+      document
+        .querySelector<HTMLElement>(`.hd-toggle [data-view="${id}"]`)
+        ?.focus();
     });
     group.appendChild(button);
   }
@@ -239,30 +274,64 @@ function toggle(onChange: () => void): HTMLElement {
 
 // ── flow ────────────────────────────────────────────────────────────────
 
-function slotBlocks(context: ExtensionContext, data: HeaderData): HTMLElement[] {
+/**
+ * The working sessions as slots: one per family (a lead and the sessions it
+ * started hold one, 2026-10-23), led by the lead when it works, else by the
+ * family's oldest working session, and how many more ride in it.
+ */
+export function familySlots(
+  working: CapacitySession[],
+): { row: CapacitySession; more: number }[] {
+  const groups = new Map<string, CapacitySession[]>();
+  for (const row of working) {
+    const key = row.family ?? row.id;
+    const members = groups.get(key);
+    if (members) members.push(row);
+    else groups.set(key, [row]);
+  }
+  return [...groups].map(([key, members]) => ({
+    row: members.find((member) => member.id === key) ?? members[0],
+    more: members.length - 1,
+  }));
+}
+
+function slotBlocks(
+  context: ExtensionContext,
+  data: HeaderData,
+): HTMLElement[] {
   const blocks: HTMLElement[] = [];
   const caps: HTMLElement[] = [];
-  const total = Math.max(data.working.length, data.limit);
+  const slots = familySlots(data.working);
+  const total = Math.max(slots.length, data.limit);
   for (let index = 0; index < total; index++) {
-    const row = data.working[index];
+    const slot = slots[index];
+    const row = slot?.row;
     const over = index >= data.limit;
     caps.push(el("span", {}, over ? "over" : `slot ${index + 1}`));
     if (!row) {
-      blocks.push(el("div", { class: "hd-slot is-free" }, el("span", {}, "free")));
+      blocks.push(
+        el("div", { class: "hd-slot is-free" }, el("span", {}, "free")),
+      );
       continue;
     }
     const old = row.elapsed_s >= OLD_S;
+    const more = slot.more > 0 ? ` +${slot.more}` : "";
+    const riders =
+      slot.more > 0 ? `, with ${slot.more} more in its family` : "";
     const block = el(
       "button",
       {
         type: "button",
         class: `hd-slot${over ? " is-over" : ""}${old ? " is-old" : ""}`,
-        title: `${row.title}, ${row.elapsed}${over ? ", over the limit" : ""}`,
+        title: `${row.title}, ${row.elapsed}${riders}${over ? ", over the limit" : ""}`,
       },
       el("b", {}, row.title),
-      el("span", {}, over ? `${row.elapsed}, over` : row.elapsed),
+      el("span", {}, `${over ? `${row.elapsed}, over` : row.elapsed}${more}`),
     );
-    block.addEventListener("click", () => void context.navigation.openSession(row.id));
+    block.addEventListener(
+      "click",
+      () => void context.navigation.openSession(row.id),
+    );
     blocks.push(block);
   }
   return [
@@ -272,7 +341,10 @@ function slotBlocks(context: ExtensionContext, data: HeaderData): HTMLElement[] 
 }
 
 /** A row of pips, each `i.hd-pip` with its tone class (empty for grey). */
-function pipRow(classes: string[], extra: HTMLElement | null = null): HTMLElement {
+function pipRow(
+  classes: string[],
+  extra: HTMLElement | null = null,
+): HTMLElement {
   return el(
     "span",
     { class: "hd-pips", "aria-hidden": "true" },
@@ -285,13 +357,18 @@ function pips(prCard: PrCard): HTMLElement {
   const { passing, failing, pending, total } = prCard.ci;
   const marks: HTMLElement[] = [];
   const add = (count: number, cls: string) => {
-    for (let i = 0; i < count; i++) marks.push(el("i", { class: `hd-pip ${cls}` }));
+    for (let i = 0; i < count; i++)
+      marks.push(el("i", { class: `hd-pip ${cls}` }));
   };
   add(passing, "is-pass");
   add(failing, "is-fail");
   add(pending, "is-wait");
   if (total === 0) add(1, "");
-  return el("span", { class: "hd-pips is-wrap", "aria-hidden": "true" }, ...marks);
+  return el(
+    "span",
+    { class: "hd-pips is-wrap", "aria-hidden": "true" },
+    ...marks,
+  );
 }
 
 function pipeRow(
@@ -302,7 +379,9 @@ function pipeRow(
   return el(
     "div",
     { class: "hd-pipe-row" },
-    typeof name === "string" ? el("span", { class: "hd-pipe-name" }, name) : name,
+    typeof name === "string"
+      ? el("span", { class: "hd-pipe-name" }, name)
+      : name,
     middle ?? el("span", {}),
     el("span", { class: "hd-pipe-right" }, right),
   );
@@ -312,7 +391,9 @@ function pipeRow(
 function releaseShort(release: Release): string {
   if (release.state === "waiting") {
     // Only that a newer tag exists: a pin, rollback or hold on the box is out of view.
-    return release.mid_turn > 0 ? `held, ${release.mid_turn} mid-reply` : "not installed yet";
+    return release.mid_turn > 0
+      ? `held, ${release.mid_turn} mid-reply`
+      : "not installed yet";
   }
   if (release.state === "current")
     return release.running ? `${release.running} current` : "current";
@@ -330,7 +411,9 @@ function releaseLong(release: Release): string {
     return `Release${tag}${held}`;
   }
   if (release.state === "current")
-    return release.running ? `Release ${release.running} current` : "Release current";
+    return release.running
+      ? `Release ${release.running} current`
+      : "Release current";
   return `Release status unknown${release.error ? `: ${release.error}` : ""}`;
 }
 
@@ -341,9 +424,14 @@ function releaseLong(release: Release): string {
  * status draws hollow pips, not the grey of a step not reached.
  */
 function releaseSteps(release: Release): HTMLElement {
-  if (release.state === "current") return pipRow(["is-pass", "is-pass", "is-pass"]);
+  if (release.state === "current")
+    return pipRow(["is-pass", "is-pass", "is-pass"]);
   if (release.state === "waiting")
-    return pipRow(["is-pass", release.mid_turn > 0 ? "is-wait" : "is-pass", ""]);
+    return pipRow([
+      "is-pass",
+      release.mid_turn > 0 ? "is-wait" : "is-pass",
+      "",
+    ]);
   return pipRow(["is-unknown", "is-unknown", "is-unknown"]);
 }
 
@@ -352,7 +440,9 @@ function movePips(count: number): HTMLElement {
   if (count === 0) return pipRow([""]);
   return pipRow(
     Array.from({ length: Math.min(count, MOVE_PIPS) }, () => "is-wait"),
-    count > MOVE_PIPS ? el("span", { class: "hd-more" }, `+${count - MOVE_PIPS}`) : null,
+    count > MOVE_PIPS
+      ? el("span", { class: "hd-more" }, `+${count - MOVE_PIPS}`)
+      : null,
   );
 }
 
@@ -368,7 +458,10 @@ function lotPips(soon: number, overdue: number): HTMLElement {
   const shown = marks.slice(0, LOT_PIPS);
   while (shown.length < LOT_PIPS) shown.push("");
   const more = marks.length - LOT_PIPS;
-  return pipRow(shown, more > 0 ? el("span", { class: "hd-more" }, `+${more}`) : null);
+  return pipRow(
+    shown,
+    more > 0 ? el("span", { class: "hd-more" }, `+${more}`) : null,
+  );
 }
 
 function pipeline(data: HeaderData): HTMLElement {
@@ -377,15 +470,26 @@ function pipeline(data: HeaderData): HTMLElement {
     const { passing, failing, total } = prCard.ci;
     const name = sectionLink("prs", `PR #${prCard.number}`, "hd-pipe-name");
     name.title = prCard.title;
-    const row = pipeRow(name, pips(prCard), total ? `${passing}/${total}` : "no checks");
+    const row = pipeRow(
+      name,
+      pips(prCard),
+      total ? `${passing}/${total}` : "no checks",
+    );
     // Muted as concept 3, but a failing check is said in red, not only by a pip.
     if (failing > 0) row.classList.add("is-fail");
     rows.push(row);
   }
   const more = (data.prs?.length ?? 0) - PIPE_PRS;
-  if (more > 0) rows.push(pipeRow(sectionLink("prs", `+${more} PRs`, "hd-pipe-name"), null, ""));
+  if (more > 0)
+    rows.push(
+      pipeRow(sectionLink("prs", `+${more} PRs`, "hd-pipe-name"), null, ""),
+    );
   if (data.release) {
-    const row = pipeRow("Release", releaseSteps(data.release), releaseShort(data.release));
+    const row = pipeRow(
+      "Release",
+      releaseSteps(data.release),
+      releaseShort(data.release),
+    );
     if (data.release.latest) row.title = `Newest tag ${data.release.latest}`;
     rows.push(row);
   }
@@ -407,7 +511,9 @@ function pipeline(data: HeaderData): HTMLElement {
         [
           `${data.lot.count}`,
           data.lot.overdue ? `${data.lot.overdue} overdue` : null,
-          next?.resurfaces ? `next ${monthDay(next.resurfaces.slice(0, 10))}` : null,
+          next?.resurfaces
+            ? `next ${monthDay(next.resurfaces.slice(0, 10))}`
+            : null,
         ]
           .filter(Boolean)
           .join(", "),
@@ -450,10 +556,16 @@ function span(text: string, tone: string): HTMLElement {
 }
 
 /** The brief's sentence parts, worst first; strings and links. */
-export function briefParts(context: ExtensionContext, data: HeaderData): (HTMLElement | string)[] {
+export function briefParts(
+  context: ExtensionContext,
+  data: HeaderData,
+): (HTMLElement | string)[] {
   const parts: (HTMLElement | string)[] = [];
   if (data.used > data.limit) {
-    parts.push(span(`Over capacity: ${data.used} working, limit ${data.limit}.`, "bad"), " ");
+    parts.push(
+      span(`Over capacity: ${data.used} working, limit ${data.limit}.`, "bad"),
+      " ",
+    );
   } else if (data.used === data.limit) {
     parts.push(span(`All ${data.limit} slots in use.`, "warn"), " ");
   } else {
@@ -470,28 +582,51 @@ export function briefParts(context: ExtensionContext, data: HeaderData): (HTMLEl
   const prs = data.prs ?? [];
   if (prs.length > 0) {
     const failing = prs.filter((p) => p.ci.failing > 0).length;
-    const pending = prs.filter((p) => p.ci.failing === 0 && p.ci.pending > 0).length;
+    const pending = prs.filter(
+      (p) => p.ci.failing === 0 && p.ci.pending > 0,
+    ).length;
     const ready = prs.filter(isReady).length;
     const one = prs.length === 1;
     const is = one ? " is " : " are ";
     parts.push(sectionLink("prs", one ? "1 PR" : `${prs.length} PRs`));
     if (failing > 0)
-      parts.push(one ? " has " : `: ${failing} with `, span("failing checks.", "bad"), " ");
+      parts.push(
+        one ? " has " : `: ${failing} with `,
+        span("failing checks.", "bad"),
+        " ",
+      );
     else if (pending > 0 && pending < prs.length)
       parts.push(": ", span(`${pending} waiting on CI.`, "warn"), " ");
     else if (pending > 0) parts.push(is, span("waiting on CI.", "warn"), " ");
-    else if (ready === prs.length) parts.push(is, span("ready to merge.", "good"), " ");
+    else if (ready === prs.length)
+      parts.push(is, span("ready to merge.", "good"), " ");
     else if (ready > 0)
-      parts.push(": ", span(`${ready} ready to merge, the rest need a look.`, "warn"), " ");
-    else parts.push(" ", span(one ? "needs a look." : "need a look.", "warn"), " ");
+      parts.push(
+        ": ",
+        span(`${ready} ready to merge, the rest need a look.`, "warn"),
+        " ",
+      );
+    else
+      parts.push(
+        " ",
+        span(one ? "needs a look." : "need a look.", "warn"),
+        " ",
+      );
   }
   if (data.yourMove !== undefined) {
-    if (data.yourMove === 0) parts.push(span("Nothing is on your move.", "good"), " ");
+    if (data.yourMove === 0)
+      parts.push(span("Nothing is on your move.", "good"), " ");
     else {
       parts.push(
-        sectionLink("your-move", data.yourMove === 1 ? "1 thing" : `${data.yourMove} things`),
+        sectionLink(
+          "your-move",
+          data.yourMove === 1 ? "1 thing" : `${data.yourMove} things`,
+        ),
         " ",
-        span(data.yourMove === 1 ? "is on your move." : "are on your move.", "warn"),
+        span(
+          data.yourMove === 1 ? "is on your move." : "are on your move.",
+          "warn",
+        ),
         " ",
       );
     }
@@ -530,7 +665,8 @@ function briefFoot(data: HeaderData): HTMLElement | null {
   ].filter((part): part is string => part !== null);
   if (counts.length) groups.push([el("span", {}, counts.join(", "))]);
   if (!groups.length) return null;
-  const sep = (text: string) => el("span", { class: "hd-sep", "aria-hidden": "true" }, text);
+  const sep = (text: string) =>
+    el("span", { class: "hd-sep", "aria-hidden": "true" }, text);
   const parts: HTMLElement[] = [];
   groups.forEach((group, g) => {
     if (g > 0) parts.push(sep("|"));
@@ -583,7 +719,13 @@ export function renderHeader(
     return;
   }
   replaceChildren(host, [
-    el("div", { class: "hd-top" }, title, usageMeters(data.limits), toggle(onChange)),
+    el(
+      "div",
+      { class: "hd-top" },
+      title,
+      usageMeters(data.limits),
+      toggle(onChange),
+    ),
     flow(context, data),
   ]);
 }

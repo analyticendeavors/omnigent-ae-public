@@ -525,6 +525,17 @@ describe("Your move merge", () => {
     expect(buttonNamed(pull, "Open on GitHub")).toBeTruthy();
   });
 
+  it("reads the card on a Review details tap and then shows the details and a draft's Mark ready", async () => {
+    const { request, target } = setup([{ ok: true, status: 200, body: card23({ draft: true }) }]);
+    buttonNamed(pullOf(target), "Review details").click();
+    await flush();
+    expect(calls(request, CARD_PATH)).toBe(1);
+    const pull = pullOf(target);
+    expect(pull.querySelector<HTMLDetailsElement>("details.pr-details")?.open).toBe(true);
+    expect(buttonNamed(pull, "Mark ready for review")).toBeTruthy();
+    expect(pull.querySelector(".tag")?.textContent).toBe("draft");
+  });
+
   it("reads the card on a tap and opens the confirm step when the gate is open", async () => {
     const { request, target } = setup();
     await tapMerge(target);

@@ -1,0 +1,1332 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 16:27:55 -0700
+Subject: [PATCH 179/191] [ae-patch] Add a Spend shows setting (tokens, cost or
+ off) with real token counts for Claude sessions, and close the dead space on
+ Family rows.
+
+---
+ .../claude_native/ae_transcript_tokens.py     | 159 ++++++++++++++++
+ omnigent/harnesses/claude_native/forwarder.py |  26 ++-
+ .../claude_native/forwarder/test_usage.py     | 165 +++++++++++++++++
+ .../test_ae_transcript_tokens.py              |  90 +++++++++
+ .../components/AeSessionHoverStatus.test.tsx  |  29 ++-
+ web/src/components/AeSessionHoverStatus.tsx   |  18 +-
+ web/src/lib/aeAgentUsage.ts                   |   3 +
+ web/src/lib/aeSpendDisplay.test.ts            |  85 +++++++++
+ web/src/lib/aeSpendDisplay.ts                 | 173 ++++++++++++++++++
+ .../pages/settings/AeChatSettingsSection.tsx  |   2 +
+ .../pages/settings/AeSpendDisplaySetting.tsx  |  46 +++++
+ web/src/shell/AeAgentMeta.tsx                 |  43 ++++-
+ web/src/shell/AeAgentsUsage.test.tsx          |  51 +++++-
+ web/src/shell/AeFamilyTree.tsx                |  27 ++-
+ web/src/shell/Sidebar.aeFamilies.test.tsx     |  54 ++++++
+ web/src/shell/Sidebar.tsx                     |   3 +-
+ 16 files changed, 946 insertions(+), 28 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_transcript_tokens.py
+ create mode 100644 tests/harnesses/claude_native/test_ae_transcript_tokens.py
+ create mode 100644 web/src/lib/aeSpendDisplay.test.ts
+ create mode 100644 web/src/lib/aeSpendDisplay.ts
+ create mode 100644 web/src/pages/settings/AeSpendDisplaySetting.tsx
+
+diff --git a/omnigent/harnesses/claude_native/ae_transcript_tokens.py b/omnigent/harnesses/claude_native/ae_transcript_tokens.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..36e639157b99cc23bf45643c7c4d00ca2744c077
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_transcript_tokens.py
+@@ -0,0 +1,159 @@
++"""
++Session token totals read from a Claude transcript (omnigent-ae, 2026-10-24).
++
++Claude Code's statusLine reports dollars but no session token total, so the
++forwarder tallies tokens from the transcript itself: the parent transcript plus
++every ``subagents/agent-*.jsonl`` beside it, the same subtree the cost covers.
++Each API response is counted once per ``requestId`` (the last record wins), and
++files are read incrementally so a long session is not re-parsed every poll.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import dataclass
++from pathlib import Path
++
++# (input incl. cache, output, cache reads), the shape the server's cumulative fields take.
++Totals = tuple[int, int, int]
++_ZERO: Totals = (0, 0, 0)
++_CHUNK = 1 << 20
++
++
++@dataclass
++class _FileTally:
++    """Parse position of one transcript file."""
++
++    identity: tuple[int, int]
++    offset: int = 0
++
++
++def _int(value: object) -> int:
++    return value if isinstance(value, int) and not isinstance(value, bool) else 0
++
++
++def _tokens_of(entry: dict[str, object]) -> Totals | None:
++    message = entry.get("message")
++    if not isinstance(message, dict) or message.get("role") != "assistant":
++        return None
++    usage = message.get("usage")
++    if not isinstance(usage, dict) or not isinstance(usage.get("input_tokens"), int):
++        return None
++    cache_read = _int(usage.get("cache_read_input_tokens"))
++    total_in = (
++        _int(usage.get("input_tokens"))
++        + _int(usage.get("cache_creation_input_tokens"))
++        + cache_read
++    )
++    return (total_in, _int(usage.get("output_tokens")), cache_read)
++
++
++class TranscriptTokenTally:
++    """
++    Incremental token totals for one forwarded Claude session.
++
++    One map keyed by ``requestId`` spans every file and every parent path, last
++    record wins, so a resumed transcript that replays old requests, a request
++    written to two files, or a re-read file never counts twice.
++    """
++
++    def __init__(self) -> None:
++        self._files: dict[Path, _FileTally] = {}
++        self._entries: dict[str, Totals] = {}
++        self._totals: Totals = _ZERO
++        self._high: Totals = _ZERO
++        # Lines handed to the JSON parser; lets tests prove old bytes are not re-read.
++        self.lines_parsed = 0
++
++    def update(self, parent: Path) -> Totals:
++        """
++        Read new transcript bytes and return the session's token totals.
++
++        :param parent: Parent transcript, e.g. ``".../projects/x/<session>.jsonl"``.
++        :returns: ``(input including cache, output, cache reads)``, never lower
++            than a previous return.
++        """
++        self._read(parent, include_sidechains=False)
++        try:
++            sub_paths = sorted((parent.with_suffix("") / "subagents").glob("agent-*.jsonl"))
++        except OSError:
++            sub_paths = []
++        for path in sub_paths:
++            self._read(path, include_sidechains=True)
++        # The clamp is a guard only; the keyed map already never loses a request.
++        self._high = (
++            max(self._high[0], self._totals[0]),
++            max(self._high[1], self._totals[1]),
++            max(self._high[2], self._totals[2]),
++        )
++        return self._high
++
++    def _set(self, key: str, tokens: Totals) -> None:
++        old = self._entries.get(key, _ZERO)
++        self._entries[key] = tokens
++        self._totals = (
++            self._totals[0] + tokens[0] - old[0],
++            self._totals[1] + tokens[1] - old[1],
++            self._totals[2] + tokens[2] - old[2],
++        )
++
++    def _read(self, path: Path, *, include_sidechains: bool) -> None:
++        try:
++            stat = path.stat()
++        except OSError:
++            return
++        identity = (stat.st_dev, stat.st_ino)
++        tally = self._files.get(path)
++        # A shrunk or replaced file restarts from byte 0; its old entries stay
++        # in the map and are overwritten by the same requestIds.
++        if tally is None or tally.identity != identity or stat.st_size < tally.offset:
++            tally = _FileTally(identity=identity)
++            self._files[path] = tally
++        if stat.st_size == tally.offset:
++            return
++        try:
++            with path.open("rb") as handle:
++                handle.seek(tally.offset)
++                carry = b""
++                while chunk := handle.read(_CHUNK):
++                    data = carry + chunk
++                    end = data.rfind(b"\n")
++                    if end < 0:
++                        carry = data
++                        continue
++                    carry = data[end + 1 :]
++                    self._lines(path, tally, data[: end + 1], include_sidechains)
++        except OSError:
++            return
++
++    def _lines(
++        self, path: Path, tally: _FileTally, block: bytes, include_sidechains: bool
++    ) -> None:
++        """Count the whole lines in ``block`` (which starts at ``tally.offset``)."""
++        position = tally.offset
++        for raw in block.split(b"\n")[:-1]:
++            line_start = position
++            position += len(raw) + 1
++            if not raw.strip():
++                continue
++            self.lines_parsed += 1
++            try:
++                entry = json.loads(raw)
++            except ValueError:
++                # Includes a bad byte (UnicodeDecodeError); skip the line.
++                continue
++            if not isinstance(entry, dict):
++                continue
++            if not include_sidechains and entry.get("isSidechain") is True:
++                continue
++            tokens = _tokens_of(entry)
++            if tokens is None:
++                continue
++            request_id = entry.get("requestId")
++            key = (
++                request_id
++                if isinstance(request_id, str) and request_id
++                else f"{path}@{line_start}"
++            )
++            self._set(key, tokens)
++        tally.offset = position
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index c96b28eb502252570f2fa19c1f4457fd1cc19f92..525b088123c4bb202fd0ba7b82b5b8fe50c95c68 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -33,6 +33,7 @@ from omnigent.harnesses.claude_native.ae_prompt_suggest import (
+     schedule_prompt_suggestion,
+ )
+ from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
++from omnigent.harnesses.claude_native.ae_transcript_tokens import TranscriptTokenTally
+ from omnigent.harnesses.claude_native.bridge import (
+     BRIDGE_ID_LABEL_KEY,
+     OBSERVER_HOOK_STDERR_FILE,
+@@ -800,6 +801,9 @@ class DeltaForwardState:
+     byte_offset: int = 0
+ 
+ 
++_ZERO_TOKENS = (0, 0, 0)
++
++
+ @dataclass
+ class _ForwardDedupeState:
+     """
+@@ -861,6 +865,9 @@ class _ForwardDedupeState:
+     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
+     # Kept to suppress duplicate posts when S hasn't advanced.
+     posted_cost: float | None = None
++    # Session token totals tally and the last totals POSTed with the cost (omnigent-ae).
++    token_tally: TranscriptTokenTally = field(default_factory=TranscriptTokenTally)
++    posted_tokens: tuple[int, int, int] | None = None
+     # Last POLICY/budget cost (USD) POSTed as ``policy_cost_usd`` —
+     # ``max(S, forwarder transcript estimate)``, which reflects in-flight
+     # sub-agent spend so the gate can block mid-turn. Separate baseline
+@@ -3052,7 +3059,20 @@ async def _forward_session_cost(
+     # lower transcript read (e.g. just after a rotation) and suppresses
+     # steady-state churn. The two fields advance independently (policy_cost
+     # moves mid-turn while display_cost/S is frozen).
+-    payload: dict[str, float | str] = {}
++    payload: dict[str, float | int | str] = {}
++    # Tokens ride with the last statusLine cost so the server keeps that cost
++    # instead of pricing the tokens from the catalog; none before a first cost.
++    tokens = _ZERO_TOKENS
++    # Never post a cost below the one already posted (the server also clamps).
++    known = [c for c in (status_cost, dedupe.posted_cost) if c is not None]
++    cost_known = max(known) if known else None
++    if cost_known is not None:
++        tokens = await asyncio.to_thread(dedupe.token_tally.update, parent_transcript_path)
++        if tokens != (dedupe.posted_tokens or _ZERO_TOKENS):
++            payload["cumulative_input_tokens"] = tokens[0]
++            payload["cumulative_output_tokens"] = tokens[1]
++            payload["cumulative_cache_read_input_tokens"] = tokens[2]
++            payload["cumulative_cost_usd"] = cost_known
+     if display_cost is not None and (
+         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
+     ):
+@@ -3100,7 +3120,9 @@ async def _forward_session_cost(
+     dedupe.cost_retry_failures = 0
+     dedupe.cost_retry_not_before = 0.0
+     if "cumulative_cost_usd" in payload:
+-        dedupe.posted_cost = display_cost
++        dedupe.posted_cost = max(payload["cumulative_cost_usd"], dedupe.posted_cost or 0.0)
++    if "cumulative_input_tokens" in payload:
++        dedupe.posted_tokens = tokens
+     if "policy_cost_usd" in payload:
+         dedupe.posted_policy_cost = policy_cost
+ 
+diff --git a/tests/harnesses/claude_native/forwarder/test_usage.py b/tests/harnesses/claude_native/forwarder/test_usage.py
+index 400cd8dbb5a9597d43d52688b583e2787348dd33..97ed2aea69afadd63e2798866ad87749f721f954 100644
+--- a/tests/harnesses/claude_native/forwarder/test_usage.py
++++ b/tests/harnesses/claude_native/forwarder/test_usage.py
+@@ -697,3 +697,168 @@ async def test_forward_session_cost_tags_display_advance_with_model(
+         estimate_box["value"] = 0.90
+         await run()
+         assert posted[-1] == {"policy_cost_usd": pytest.approx(0.90)}
++
++
++def _assistant(
++    request_id: str, inp: int, out: int, *, cc: int = 0, cr: int = 0, side: bool = False
++) -> str:
++    entry: dict[str, Any] = {
++        "type": "assistant",
++        "requestId": request_id,
++        "message": {
++            "role": "assistant",
++            "usage": {
++                "input_tokens": inp,
++                "output_tokens": out,
++                "cache_creation_input_tokens": cc,
++                "cache_read_input_tokens": cr,
++            },
++        },
++    }
++    if side:
++        entry["isSidechain"] = True
++    return json.dumps(entry) + "\n"
++
++
++@pytest.mark.asyncio
++async def test_forward_session_cost_posts_transcript_tokens_with_cost(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """Tokens ride with the statusLine cost, are tallied once per request, grow
++    incrementally, include sub-agents, skip sidechains and never go down."""
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    parent = tmp_path / "sess.jsonl"
++    cost_box: dict[str, float | None] = {"value": None}
++    monkeypatch.setattr(
++        forwarder,
++        "read_claude_context_state",
++        lambda _bridge: {} if cost_box["value"] is None else {"total_cost_usd": cost_box["value"]},
++    )
++    parent.write_text(
++        _assistant("r1", 10, 5, cc=20, cr=70)
++        + _assistant("r1", 10, 6, cc=20, cr=70)  # same request: last record wins
++        + _assistant("rs", 999, 999, side=True)  # sidechain: skipped
++        + '{"type": "assistant", "requestId": "r2"',  # half-written line: waits
++        encoding="utf-8",
++    )
++    sub_dir = tmp_path / "sess" / "subagents"
++    sub_dir.mkdir(parents=True)
++    (sub_dir / "agent-a.jsonl").write_text(
++        _assistant("s1", 1, 2, cr=3, side=True), encoding="utf-8"
++    )
++    dedupe = forwarder._ForwardDedupeState()
++    posted: list[dict[str, Any]] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        body = json.loads(request.content)
++        if body.get("type") == "external_session_usage":
++            posted.append(body["data"])
++        return httpx.Response(200, json={})
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://ap"
++    ) as client:
++
++        async def run() -> None:
++            await forwarder._forward_session_cost(
++                client=client,
++                session_id="conv_parent",
++                bridge_dir=bridge_dir,
++                parent_transcript_path=parent,
++                subagent_state=forwarder.SubagentForwardState(subagents={}),
++                dedupe=dedupe,
++                cost_cache={},
++            )
++
++        # No statusLine cost yet: no token post.
++        await run()
++        assert posted == []
++
++        cost_box["value"] = 0.5
++        await run()
++        assert posted == [
++            {
++                "cumulative_cost_usd": 0.5,
++                "policy_cost_usd": 0.5,
++                "cumulative_input_tokens": 100 + 4,
++                "cumulative_output_tokens": 6 + 2,
++                "cumulative_cache_read_input_tokens": 73,
++            }
++        ]
++        await run()
++        assert len(posted) == 1
++
++        # Cost unchanged, tokens grow: the post still carries the last cost.
++        with parent.open("a", encoding="utf-8") as handle:
++            handle.write(
++                ', "message": {"role": "assistant", '
++                '"usage": {"input_tokens": 7, "output_tokens": 1}}}\n'
++            )
++        await run()
++        assert posted[-1]["cumulative_cost_usd"] == 0.5
++        assert posted[-1]["cumulative_input_tokens"] == 111
++        assert posted[-1]["cumulative_output_tokens"] == 9
++
++        # A new transcript (resume) adds on top of the old totals.
++        parent2 = tmp_path / "sess2.jsonl"
++        parent2.write_text(_assistant("n1", 2, 3), encoding="utf-8")
++        parent = parent2
++        await run()
++        assert posted[-1]["cumulative_input_tokens"] == 113
++        assert posted[-1]["cumulative_output_tokens"] == 12
++
++
++@pytest.mark.asyncio
++async def test_token_post_failure_retries_and_cost_never_goes_down(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    """A failed token post leaves the baseline alone; cost never posts below posted_cost."""
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    parent = tmp_path / "sess.jsonl"
++    parent.write_text(_assistant("r1", 10, 5), encoding="utf-8")
++    cost_box = {"value": 0.5}
++    monkeypatch.setattr(
++        forwarder,
++        "read_claude_context_state",
++        lambda _bridge: {"total_cost_usd": cost_box["value"], "model": "claude-opus-4-8"},
++    )
++    monkeypatch.setattr(forwarder.time, "monotonic", lambda: 1000.0)
++    dedupe = forwarder._ForwardDedupeState()
++    dedupe.posted_cost = 0.5
++    posted: list[dict[str, Any]] = []
++    fail = {"on": True}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if fail["on"]:
++            return httpx.Response(503, request=request)
++        body = json.loads(request.content)
++        posted.append(body["data"])
++        return httpx.Response(200, json={}, request=request)
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://ap"
++    ) as client:
++
++        async def run() -> None:
++            await forwarder._forward_session_cost(
++                client=client,
++                session_id="conv_parent",
++                bridge_dir=bridge_dir,
++                parent_transcript_path=parent,
++                subagent_state=forwarder.SubagentForwardState(subagents={}),
++                dedupe=dedupe,
++                cost_cache={},
++            )
++
++        await run()
++        assert dedupe.posted_tokens is None
++        fail["on"] = False
++        dedupe.cost_retry_not_before = 0.0
++        cost_box["value"] = 0.2  # a lower statusLine reading
++        await run()
++        assert dedupe.posted_tokens == (10, 5, 0)
++        assert posted[-1]["cumulative_cost_usd"] == 0.5
++        assert posted[-1]["model"] == "claude-opus-4-8"
++        assert dedupe.posted_cost == 0.5
+diff --git a/tests/harnesses/claude_native/test_ae_transcript_tokens.py b/tests/harnesses/claude_native/test_ae_transcript_tokens.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..4c7059698dc2a203f44844877548212a3ca723b5
+--- /dev/null
++++ b/tests/harnesses/claude_native/test_ae_transcript_tokens.py
+@@ -0,0 +1,90 @@
++"""Token tally over Claude transcripts (omnigent-ae)."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++from omnigent.harnesses.claude_native.ae_transcript_tokens import TranscriptTokenTally
++
++
++def _line(request_id: str, inp: int, out: int, *, cr: int = 0, side: bool = False) -> str:
++    entry: dict[str, object] = {
++        "requestId": request_id,
++        "message": {
++            "role": "assistant",
++            "usage": {
++                "input_tokens": inp,
++                "output_tokens": out,
++                "cache_read_input_tokens": cr,
++            },
++        },
++    }
++    if side:
++        entry["isSidechain"] = True
++    return json.dumps(entry) + "\n"
++
++
++def test_second_poll_parses_only_new_bytes(tmp_path: Path) -> None:
++    parent = tmp_path / "s.jsonl"
++    parent.write_text(_line("a", 1, 1) + _line("b", 2, 2), encoding="utf-8")
++    tally = TranscriptTokenTally()
++    assert tally.update(parent) == (3, 3, 0)
++    assert tally.lines_parsed == 2
++    tally.update(parent)
++    assert tally.lines_parsed == 2
++    with parent.open("a", encoding="utf-8") as handle:
++        handle.write(_line("c", 4, 4, cr=1))
++    assert tally.update(parent) == (8, 7, 1)
++    assert tally.lines_parsed == 3
++
++
++def test_shrunk_or_replaced_file_keeps_totals_without_double_count(tmp_path: Path) -> None:
++    parent = tmp_path / "s.jsonl"
++    parent.write_text(_line("a", 10, 1) + _line("b", 20, 2), encoding="utf-8")
++    tally = TranscriptTokenTally()
++    assert tally.update(parent) == (30, 3, 0)
++    parent.write_text(_line("a", 10, 1), encoding="utf-8")  # shrank
++    assert tally.update(parent) == (30, 3, 0)
++    parent.unlink()
++    parent.write_text(_line("a", 10, 1) + _line("c", 5, 5) + _line("d", 1, 1), encoding="utf-8")
++    assert tally.update(parent) == (36, 9, 0)
++
++
++def test_resumed_transcript_replaying_request_ids_is_not_counted_twice(tmp_path: Path) -> None:
++    old = tmp_path / "old.jsonl"
++    old.write_text(_line("a", 10, 1) + _line("b", 20, 2), encoding="utf-8")
++    tally = TranscriptTokenTally()
++    assert tally.update(old) == (30, 3, 0)
++    new = tmp_path / "new.jsonl"
++    new.write_text(_line("a", 10, 1) + _line("b", 20, 2) + _line("c", 1, 1), encoding="utf-8")
++    assert tally.update(new) == (31, 4, 0)
++    # Back to the old path: still the same totals.
++    assert tally.update(old) == (31, 4, 0)
++
++
++def test_subagent_files_count_once_across_files_and_grow_later(tmp_path: Path) -> None:
++    parent = tmp_path / "s.jsonl"
++    parent.write_text(_line("p", 1, 1) + _line("x", 99, 99, side=True), encoding="utf-8")
++    subs = tmp_path / "s" / "subagents"
++    subs.mkdir(parents=True)
++    first = subs / "agent-a.jsonl"
++    first.write_text(_line("s1", 2, 2), encoding="utf-8")
++    (subs / "agent-b.jsonl").write_text(_line("s1", 2, 2), encoding="utf-8")  # same request
++    tally = TranscriptTokenTally()
++    assert tally.update(parent) == (3, 3, 0)
++    with first.open("a", encoding="utf-8") as handle:
++        handle.write(_line("s2", 4, 4))
++    assert tally.update(parent) == (7, 7, 0)
++
++
++def test_bad_byte_and_half_written_lines_do_not_stop_the_tally(tmp_path: Path) -> None:
++    parent = tmp_path / "s.jsonl"
++    parent.write_bytes(
++        _line("a", 1, 1).encode() + b'{"requestId": "\xff\xfe"}\n' + b'{"requestId": "half"'
++    )
++    tally = TranscriptTokenTally()
++    assert tally.update(parent) == (1, 1, 0)
++    with parent.open("ab") as handle:
++        handle.write(b', "message": {"role": "assistant", "usage": {"input_tokens": 5}}}\n')
++    assert tally.update(parent) == (6, 1, 0)
+diff --git a/web/src/components/AeSessionHoverStatus.test.tsx b/web/src/components/AeSessionHoverStatus.test.tsx
+index df1cb41260eb6602de4b3c5e56ad36d58171d8f0..151cb800d55287bcc9e615a0f3d22493d5100d79 100644
+--- a/web/src/components/AeSessionHoverStatus.test.tsx
++++ b/web/src/components/AeSessionHoverStatus.test.tsx
+@@ -39,7 +39,11 @@ function route(items: Record<string, unknown[]>, children: Record<string, unknow
+ 
+ const NOW = Date.now();
+ 
+-beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
++beforeEach(() => {
++  vi.mocked(authenticatedFetch).mockReset();
++  // These cases cover cost mode; tokens is the default.
++  window.localStorage.setItem("omnigent:ae-spend-display", "cost");
++});
+ afterEach(cleanup);
+ 
+ describe("AeSessionHoverStatus", () => {
+@@ -227,6 +231,29 @@ describe("AeSessionHoverStatus", () => {
+       expect(screen.getByTestId("ae-hover-started-by")).toHaveTextContent("Started by PR3 lead");
+     });
+ 
++    it.each([
++      ["tokens", "Opus 4.8 · medium · 116.4k tokens"],
++      ["off", "Opus 4.8 · medium"],
++    ])("shows the %s setting on the role line", async (mode, text) => {
++      window.localStorage.setItem("omnigent:ae-spend-display", mode);
++      answerUsage();
++      const view = familyView([row("kid", { "ae.orch": "lead", "ae.role": "builder" }, "Kid")]);
++      render(
++        <AeFamilyContext.Provider value={view}>
++          <AeSessionHoverStatus
++            sessionId="kid"
++            state={{ kind: "idle" } as never}
++            updatedAt={NOW}
++            labels={{ "ae.orch": "lead", "ae.role": "builder" }}
++          />
++        </AeFamilyContext.Provider>,
++      );
++      const line = screen.getByTestId("ae-hover-role-line");
++      await waitFor(() => expect(line).toHaveTextContent(text));
++      expect(line.textContent).not.toContain("$");
++      if (mode === "off") expect(line.textContent).not.toContain("tokens");
++    });
++
+     it.each([
+       [71.25, "Haiku 4.5 · medium · $71.25"],
+       [0, "Haiku 4.5 · medium · $0"],
+diff --git a/web/src/components/AeSessionHoverStatus.tsx b/web/src/components/AeSessionHoverStatus.tsx
+index e4be50fde0dab79b9f5d3eb149b34ea5800c5159..a50d021ea476d7cd1dbf23218a63d1bee5f8bbd5 100644
+--- a/web/src/components/AeSessionHoverStatus.tsx
++++ b/web/src/components/AeSessionHoverStatus.tsx
+@@ -11,12 +11,12 @@ import { useAeRoles } from "@/hooks/useAeRoles";
+ import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+ import {
+   AE_MODEL_FAMILY_BG,
+-  aeSpendOf,
+   type AeSessionUsage,
+   aeModelFamily,
+   useAeSessionUsages,
+ } from "@/lib/aeAgentUsage";
+ import { aeOrchParent } from "@/lib/aeFamily";
++import { aeSpendLabel, useAeSpendDisplay } from "@/lib/aeSpendDisplay";
+ import { AeFamilyContext } from "@/lib/aeFamilyView";
+ import { fetchAeSessionPeek } from "@/lib/aeSessionPeek";
+ import { aeDuration, aeScheduledTooltip, aeWaitingLabel } from "@/lib/aeSessionActivity";
+@@ -124,15 +124,13 @@ function LeadLine({
+   usage: ReadonlyMap<string, AeSessionUsage>;
+ }) {
+   const roles = useAeRoles();
+-  const spend = aeSpendOf(usage.values());
++  const spend = aeSpendLabel(usage.values(), useAeSpendDisplay());
+   const presetId = labels?.["ae.preset"];
+   const title = roles.data?.presets.find((p) => p.id === presetId)?.title ?? null;
+   const parts = [
+     title,
+     `leads ${count} session${count === 1 ? "" : "s"}`,
+-    spend
+-      ? `family ${spend.kind === "cost" ? aeFormatCost(spend.value) : `${aeFormatTokens(spend.value)} tokens`}`
+-      : null,
++    spend ? `family ${spend.long}` : null,
+   ].filter(Boolean);
+   return (
+     <p className="truncate text-xs text-muted-foreground" data-testid="ae-hover-lead-line">
+@@ -152,6 +150,7 @@ function AeRoleLine({
+   updatedAt: number;
+ }) {
+   const { families } = useContext(AeFamilyContext);
++  const mode = useAeSpendDisplay();
+   const role = aeAgentRole({ labels });
+   const familyRole = families.byRow.get(sessionId);
+   const started = role !== null || aeOrchParent(labels) !== null;
+@@ -168,11 +167,16 @@ function AeRoleLine({
+   }
+   if (!started) return null;
+   const own = usage.get(sessionId);
++  const ownSpend = own ? aeSpendLabel([own], mode) : null;
+   const detail = [
+     own?.model ? agentModelLabel(own.model) : null,
+     own?.effort,
+-    own?.costUsd != null ? aeFormatCost(own.costUsd) : null,
+-    own?.tokens != null && own.tokens > 0 ? `${aeFormatTokens(own.tokens)} tokens` : null,
++    ...(mode === "cost"
++      ? [
++          own?.costUsd != null ? aeFormatCost(own.costUsd) : null,
++          own?.tokens != null && own.tokens > 0 ? `${aeFormatTokens(own.tokens)} tokens` : null,
++        ]
++      : [ownSpend?.long]),
+   ].filter(Boolean);
+   return (
+     <>
+diff --git a/web/src/lib/aeAgentUsage.ts b/web/src/lib/aeAgentUsage.ts
+index 792d463fa7e473b1620f16649753df1f0ef5fee7..d13f71672b5d78cff44f096acc8132262a3e1642 100644
+--- a/web/src/lib/aeAgentUsage.ts
++++ b/web/src/lib/aeAgentUsage.ts
+@@ -104,6 +104,8 @@ export function aeCostByFamily(
+ export interface AeSessionUsage {
+   /** Null unless every model row reports tokens. */
+   tokens: number | null;
++  /** The per-model rows the numbers come from (the spend setting reads them). */
++  byModel?: Record<string, ModelUsage> | null;
+   byFamily: Partial<Record<AeModelFamily, number>>;
+   costUsd: number | null;
+   costByFamily: Partial<Record<AeModelFamily, number>>;
+@@ -166,6 +168,7 @@ export function useAeSessionUsages(
+     if (!data) return;
+     out.set(sessions[index].id, {
+       tokens: aeUsageTokens(data.usageByModel),
++      byModel: data.usageByModel,
+       byFamily: aeTokensByFamily(data.usageByModel),
+       costUsd: aeUsageCost(data.usageByModel),
+       costByFamily: aeCostByFamily(data.usageByModel),
+diff --git a/web/src/lib/aeSpendDisplay.test.ts b/web/src/lib/aeSpendDisplay.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba6555ea2e28fa63bc4f06e158f00c51eb7a5080
+--- /dev/null
++++ b/web/src/lib/aeSpendDisplay.test.ts
+@@ -0,0 +1,85 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import type { AeSessionUsage } from "@/lib/aeAgentUsage";
++import {
++  aeSpendLabel,
++  aeTokenStats,
++  readAeSpendDisplay,
++  writeAeSpendDisplay,
++} from "@/lib/aeSpendDisplay";
++import type { ModelUsage } from "@/lib/types";
++
++const row = (over: Partial<ModelUsage>): ModelUsage => ({
++  inputTokens: null,
++  outputTokens: null,
++  totalTokens: null,
++  cacheReadInputTokens: null,
++  cacheCreationInputTokens: null,
++  totalCostUsd: null,
++  ...over,
++});
++
++const usage = (byModel: Record<string, ModelUsage>, costUsd: number | null = null) =>
++  ({
++    tokens: null,
++    byModel,
++    byFamily: {},
++    costUsd,
++    costByFamily: {},
++    effort: null,
++    model: null,
++  }) satisfies AeSessionUsage;
++
++describe("spend display setting", () => {
++  beforeEach(() => window.localStorage.clear());
++
++  it("defaults to tokens and keeps what is written", () => {
++    expect(readAeSpendDisplay()).toBe("tokens");
++    writeAeSpendDisplay("off");
++    expect(readAeSpendDisplay()).toBe("off");
++    window.localStorage.setItem("omnigent:ae-spend-display", "nonsense");
++    expect(readAeSpendDisplay()).toBe("tokens");
++  });
++});
++
++describe("aeTokenStats", () => {
++  it("counts new input and output, not cache reads, and sums the rows that have counts", () => {
++    const stats = aeTokenStats({
++      a: row({ inputTokens: 1000, outputTokens: 200, cacheReadInputTokens: 50_000 }),
++      b: row({ inputTokens: 100, cacheCreationInputTokens: 300 }),
++      c: row({ totalCostUsd: 2 }),
++    });
++    expect(stats).toMatchObject({
++      spent: 1600,
++      cacheRead: 50_000,
++      cacheWrite: 300,
++      complete: false,
++    });
++    expect(aeTokenStats({ c: row({ totalCostUsd: 2 }) })).toBeNull();
++  });
++});
++
++describe("aeSpendLabel", () => {
++  const withTokens = usage({ a: row({ inputTokens: 200_000, outputTokens: 12_000 }) }, 3);
++  const noTokens = usage({ a: row({ totalCostUsd: 1 }) }, 1);
++
++  it("shows tokens with a breakdown title, and a plus when a session has no count", () => {
++    expect(aeSpendLabel([withTokens], "tokens")).toMatchObject({
++      text: "212k tok",
++      long: "212k tokens",
++    });
++    const mixed = aeSpendLabel([withTokens, noTokens], "tokens");
++    expect(mixed?.text).toBe("212k+ tok");
++    expect(mixed?.title).toContain("1 session has no token count");
++    expect(mixed?.title).toContain("input (incl. cache writes) 200k, output 12k, cache reads 0");
++    expect(mixed?.title).not.toContain("cache writes 0");
++  });
++
++  it("hides when no session has tokens, and when off", () => {
++    expect(aeSpendLabel([noTokens], "tokens")).toBeNull();
++    expect(aeSpendLabel([withTokens], "off")).toBeNull();
++  });
++
++  it("keeps the old cost behavior in cost mode", () => {
++    expect(aeSpendLabel([withTokens, noTokens], "cost")?.text).toBe("$4.00");
++  });
++});
+diff --git a/web/src/lib/aeSpendDisplay.ts b/web/src/lib/aeSpendDisplay.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5a75167c617c5ec78916742ac79fa9585bea50db
+--- /dev/null
++++ b/web/src/lib/aeSpendDisplay.ts
+@@ -0,0 +1,173 @@
++// What the spend pills show (omnigent-ae, 2026-10-24): tokens, the estimated
++// cost, or nothing. Device-local. Tokens are the default because an OAuth
++// (subscription) account does not pay the API-price estimate the cost shows.
++
++import { useSyncExternalStore } from "react";
++import { aeFormatCost, aeFormatTokens } from "@/lib/aeAgentRole";
++import { aeSpendOf, type AeSessionUsage } from "@/lib/aeAgentUsage";
++import type { ModelUsage } from "@/lib/types";
++
++const STORAGE_KEY = "omnigent:ae-spend-display";
++
++export type AeSpendDisplay = "tokens" | "cost" | "off";
++export const AE_SPEND_DISPLAYS: readonly AeSpendDisplay[] = ["tokens", "cost", "off"];
++export const DEFAULT_AE_SPEND_DISPLAY: AeSpendDisplay = "tokens";
++
++export function readAeSpendDisplay(): AeSpendDisplay {
++  if (typeof window === "undefined") return DEFAULT_AE_SPEND_DISPLAY;
++  try {
++    const stored = window.localStorage.getItem(STORAGE_KEY);
++    return AE_SPEND_DISPLAYS.includes(stored as AeSpendDisplay)
++      ? (stored as AeSpendDisplay)
++      : DEFAULT_AE_SPEND_DISPLAY;
++  } catch {
++    return DEFAULT_AE_SPEND_DISPLAY;
++  }
++}
++
++const listeners = new Set<() => void>();
++
++export function writeAeSpendDisplay(value: AeSpendDisplay): void {
++  try {
++    window.localStorage.setItem(STORAGE_KEY, value);
++  } catch {
++    // A local view preference; losing it is harmless.
++  }
++  listeners.forEach((listener) => listener());
++}
++
++function subscribe(listener: () => void): () => void {
++  listeners.add(listener);
++  const onStorage = (event: StorageEvent) => {
++    if (event.key === STORAGE_KEY) listener();
++  };
++  window.addEventListener("storage", onStorage);
++  return () => {
++    listeners.delete(listener);
++    window.removeEventListener("storage", onStorage);
++  };
++}
++
++export function useAeSpendDisplay(): AeSpendDisplay {
++  return useSyncExternalStore(subscribe, readAeSpendDisplay, () => DEFAULT_AE_SPEND_DISPLAY);
++}
++
++export interface AeTokenStats {
++  /** New input plus output; cache reads are not counted. */
++  spent: number;
++  input: number;
++  output: number;
++  cacheRead: number;
++  cacheWrite: number;
++  /** Some row reported cache writes; the server folds them into input otherwise. */
++  cacheWriteKnown: boolean;
++  /** Every model row reported tokens. */
++  complete: boolean;
++}
++
++/** Token counts over the model rows that have them, or null when none does. */
++export function aeTokenStats(
++  byModel: Record<string, ModelUsage> | null | undefined,
++): AeTokenStats | null {
++  let found = false;
++  let complete = true;
++  let cacheWriteKnown = false;
++  const stats = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
++  for (const row of Object.values(byModel ?? {})) {
++    if (row.inputTokens == null && row.outputTokens == null) {
++      complete = false;
++      continue;
++    }
++    found = true;
++    stats.input += row.inputTokens ?? 0;
++    stats.output += row.outputTokens ?? 0;
++    stats.cacheRead += row.cacheReadInputTokens ?? 0;
++    stats.cacheWrite += row.cacheCreationInputTokens ?? 0;
++    if (row.cacheCreationInputTokens != null) cacheWriteKnown = true;
++  }
++  if (!found) return null;
++  return {
++    ...stats,
++    spent: stats.input + stats.cacheWrite + stats.output,
++    cacheWriteKnown,
++    complete,
++  };
++}
++
++/** New input plus output tokens of one session, or null when it has no count. */
++export function aeUsageSpentTokens(usage: AeSessionUsage): number | null {
++  return aeTokenStats(usage.byModel)?.spent ?? usage.tokens ?? null;
++}
++
++/** "input 150k, output 20k, cache reads 1.2M, cache writes 40k". */
++export function aeTokenBreakdown(stats: AeTokenStats): string {
++  return [
++    `input${stats.cacheWriteKnown ? "" : " (incl. cache writes)"} ${aeFormatTokens(stats.input)}`,
++    `output ${aeFormatTokens(stats.output)}`,
++    `cache reads ${aeFormatTokens(stats.cacheRead)}`,
++    stats.cacheWriteKnown ? `cache writes ${aeFormatTokens(stats.cacheWrite)}` : null,
++  ]
++    .filter(Boolean)
++    .join(", ");
++}
++
++export interface AeSpendLabel {
++  /** Pill text, e.g. "212k tok" or "$1.64". */
++  text: string;
++  /** Sentence form, e.g. "212k tokens" or "$1.64". */
++  long: string;
++  title: string;
++  /** Cost mode: what the number is, for a title built around the pill's own "+". */
++  unit: "estimated" | "tokens";
++}
++
++/**
++ * The one formatter behind every spend pill. Cost mode is the old behavior;
++ * tokens mode sums the sessions that have counts and marks the total with "+"
++ * when some do not (or when `extraMissing` says more sessions are unread).
++ */
++export function aeSpendLabel(
++  usages: Iterable<AeSessionUsage>,
++  mode: AeSpendDisplay,
++  omitted = 0,
++): AeSpendLabel | null {
++  if (mode === "off") return null;
++  const list = [...usages];
++  if (mode === "cost") {
++    const spend = aeSpendOf(list);
++    if (!spend) return null;
++    const text = spend.kind === "cost" ? aeFormatCost(spend.value) : aeFormatTokens(spend.value);
++    const long = spend.kind === "cost" ? text : `${text} tokens`;
++    const unit = spend.kind === "cost" ? "estimated" : "tokens";
++    return { text, long, title: `${text} ${unit}`, unit };
++  }
++  let spent = 0;
++  let missing = omitted;
++  let cacheWriteKnown = false;
++  const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
++  for (const usage of list) {
++    const stats = aeTokenStats(usage.byModel);
++    const own = stats?.spent ?? usage.tokens ?? null;
++    if (own === null || (stats && !stats.complete)) missing += 1;
++    if (own === null) continue;
++    spent += own;
++    if (stats) {
++      sum.input += stats.input;
++      sum.output += stats.output;
++      sum.cacheRead += stats.cacheRead;
++      sum.cacheWrite += stats.cacheWrite;
++      cacheWriteKnown ||= stats.cacheWriteKnown;
++    }
++  }
++  if (spent <= 0) return null;
++  const plus = missing > 0 ? "+" : "";
++  const text = `${aeFormatTokens(spent)}${plus}`;
++  const note =
++    missing > 0 ? ` · ${missing} session${missing === 1 ? " has" : "s have"} no token count` : "";
++  return {
++    text: `${text} tok`,
++    long: `${text} tokens`,
++    unit: "tokens",
++    title: `${text} tokens: ${aeTokenBreakdown({ ...sum, spent, cacheWriteKnown, complete: true })}${note}`,
++  };
++}
+diff --git a/web/src/pages/settings/AeChatSettingsSection.tsx b/web/src/pages/settings/AeChatSettingsSection.tsx
+index 76092a38f26bb5f0efd79c4569d2d2174e0ac750..846b1fed651ff818b76b7df21ff7c4e4b56c34e5 100644
+--- a/web/src/pages/settings/AeChatSettingsSection.tsx
++++ b/web/src/pages/settings/AeChatSettingsSection.tsx
+@@ -9,6 +9,7 @@ import type { AeRailIconName } from "@/components/aeRail/aeRailIcons";
+ import { AeRailIcon } from "@/components/aeRail/aeRailUi";
+ import { SettingsLabel } from "@/components/SettingsLabel";
+ import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
++import { AeSpendDisplaySetting } from "./AeSpendDisplaySetting";
+ import { AeSessionListSetting } from "./AeSessionListSetting";
+ import { AeSuggestionKeysSetting } from "./AeSuggestionKeysSetting";
+ import {
+@@ -86,6 +87,7 @@ export function AeChatSettingsSection() {
+   return (
+     <div data-testid="ae-chat-settings" className="flex flex-col gap-6">
+       <SessionOpenViewControl />
++      <AeSpendDisplaySetting />
+       <AeTokenDefragSetting />
+       <AeSuggestionKeysSetting />
+       <AeSessionListSetting />
+diff --git a/web/src/pages/settings/AeSpendDisplaySetting.tsx b/web/src/pages/settings/AeSpendDisplaySetting.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..569d03e0a9209925f1a838ee3a8c26a802573926
+--- /dev/null
++++ b/web/src/pages/settings/AeSpendDisplaySetting.tsx
+@@ -0,0 +1,46 @@
++// Settings > Chat > Spend shows (omnigent-ae, 2026-10-24): what the spend pills
++// read, saved on this device. Tokens suit a subscription account.
++
++import { useId } from "react";
++import { SettingsLabel } from "@/components/SettingsLabel";
++import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
++import {
++  AE_SPEND_DISPLAYS,
++  type AeSpendDisplay,
++  useAeSpendDisplay,
++  writeAeSpendDisplay,
++} from "@/lib/aeSpendDisplay";
++
++const CARDS: Record<AeSpendDisplay, { label: string; title: string }> = {
++  tokens: { label: "Tokens", title: "Pills show new input plus output tokens." },
++  cost: { label: "Cost", title: "Pills show the estimated cost at API rates." },
++  off: { label: "Off", title: "No spend on pills, rows or the hover card." },
++};
++
++export function AeSpendDisplaySetting() {
++  const value = useAeSpendDisplay();
++  const labelId = useId();
++  return (
++    <div data-testid="ae-spend-display" className="flex flex-col gap-3">
++      <SettingsLabel
++        label="Spend shows"
++        labelId={labelId}
++        description="Tokens suit a subscription account; cost is an API-price estimate."
++      />
++      <CardRadioGroup<AeSpendDisplay>
++        labelledBy={labelId}
++        value={value}
++        onSelect={writeAeSpendDisplay}
++        componentId="settings.chat.spend_display"
++        className="grid grid-cols-1 gap-3 sm:grid-cols-3"
++        cardClassName="items-center gap-2 p-4"
++        items={AE_SPEND_DISPLAYS.map((mode) => ({
++          value: mode,
++          testId: `ae-spend-display-${mode}`,
++          title: CARDS[mode].title,
++          body: <span className="text-ui font-normal md:font-medium">{CARDS[mode].label}</span>,
++        }))}
++      />
++    </div>
++  );
++}
+diff --git a/web/src/shell/AeAgentMeta.tsx b/web/src/shell/AeAgentMeta.tsx
+index 8c70597c37ce4d80245b05316fd13de00a48f94c..b78268cfdf139b4560d5077d334f5f11a7cbf199 100644
+--- a/web/src/shell/AeAgentMeta.tsx
++++ b/web/src/shell/AeAgentMeta.tsx
+@@ -5,6 +5,7 @@
+ import { createContext, useContext, useMemo, type ReactNode } from "react";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+ import { aeRaiseMarks } from "@/lib/aeModelChange";
++import { aeSpendLabel, aeUsageSpentTokens, useAeSpendDisplay } from "@/lib/aeSpendDisplay";
+ import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+ import {
+   AE_MODEL_FAMILIES,
+@@ -102,15 +103,18 @@ export function AeAgentMetaLine({
+   const native = useAeNativeInput(child);
+   const role = aeAgentRole(child);
+   const effort = usage?.effort ?? native?.effort ?? null;
+-  const cost = usage?.costUsd ?? null;
+-  const tokens = usage?.tokens != null && usage.tokens > 0 ? usage.tokens : null;
++  const mode = useAeSpendDisplay();
++  const own = usage && mode === "tokens" ? aeSpendLabel([usage], mode) : null;
++  const cost = mode === "cost" ? (usage?.costUsd ?? null) : null;
++  const tokens = mode === "cost" && usage?.tokens != null && usage.tokens > 0 ? usage.tokens : null;
+   const model = withModel ? (child.model ?? child.routed_model ?? native?.model ?? null) : null;
+   const nowModel = child.model ?? child.routed_model ?? native?.model ?? null;
+   // The count is history; the arrow shows only while the helper still runs above where it started.
+   const marks = aeRaiseMarks(child.labels, { model: nowModel, effort });
+   const raised = marks.raised;
+   const raisedTitle = marks.title;
+-  if (!role && !model && !effort && cost === null && tokens === null && !raised) return null;
++  if (!role && !model && !effort && cost === null && tokens === null && !own && !raised)
++    return null;
+   return (
+     <p
+       className={cn(
+@@ -155,6 +159,17 @@ export function AeAgentMetaLine({
+           cap reached
+         </span>
+       )}
++      {own && (
++        <span
++          className="ml-auto shrink-0 tabular-nums"
++          data-testid="subagent-cost"
++          title={own.title}
++        >
++          <span className="text-[10px] opacity-70" data-testid="subagent-tokens">
++            {own.text}
++          </span>
++        </span>
++      )}
+       {(cost !== null || tokens !== null) && (
+         <span className="ml-auto shrink-0 tabular-nums" data-testid="subagent-cost">
+           {cost !== null && aeFormatCost(cost)}
+@@ -184,11 +199,13 @@ export function AeAgentsTotal({
+   as?: "li" | "div";
+ }) {
+   const usage = useContext(UsageContext);
++  const mode = useAeSpendDisplay();
+   const lead = usage.get(rootSessionId);
+-  if (!lead) return null;
++  if (!lead || mode === "off") return null;
+   // Cost is the measure; tokens stand in only when the lead reports no cost.
+-  const byCost = lead.costUsd !== null;
+-  const measure = (u: AeSessionUsage) => (byCost ? (u.costUsd ?? 0) : (u.tokens ?? 0));
++  const byCost = mode === "cost" && lead.costUsd !== null;
++  const measure = (u: AeSessionUsage) =>
++    byCost ? (u.costUsd ?? 0) : mode === "tokens" ? (aeUsageSpentTokens(u) ?? 0) : (u.tokens ?? 0);
+   const leadValue = measure(lead);
+   const leadFamilies = byCost ? lead.costByFamily : lead.byFamily;
+   const known = childIds.map((id) => usage.get(id)).filter((u): u is AeSessionUsage => !!u);
+@@ -209,7 +226,11 @@ export function AeAgentsTotal({
+       }
+     }
+   }
+-  const fmt = (n: number) => (byCost ? aeFormatCost(n) : `${aeFormatTokens(n)} tokens`);
++  // Tokens mode: sessions without a count leave the total short, so it ends in "+".
++  const noCount =
++    mode === "tokens" ? [lead, ...known].filter((u) => aeUsageSpentTokens(u) === null) : [];
++  const plus = noCount.length > 0 ? "+" : "";
++  const fmt = (n: number) => (byCost ? aeFormatCost(n) : `${aeFormatTokens(n)}${plus} tokens`);
+   // Tokens only when every model in the lead and the rows read reports them.
+   const tokenTotal =
+     byCost && lead.tokens !== null && known.every((u) => u.tokens !== null)
+@@ -229,7 +250,13 @@ export function AeAgentsTotal({
+         This chat and its agents:{" "}
+         <b
+           className="font-medium text-foreground tabular-nums"
+-          title="Estimated at API rates"
++          title={
++            mode === "tokens"
++              ? noCount.length > 0
++                ? `${noCount.length} session${noCount.length === 1 ? " has" : "s have"} no token count`
++                : "New input plus output tokens"
++              : "Estimated at API rates"
++          }
+           data-testid="agents-total-cost"
+         >
+           {fmt(total)}
+diff --git a/web/src/shell/AeAgentsUsage.test.tsx b/web/src/shell/AeAgentsUsage.test.tsx
+index 7a1e1589f49cfb15d565c5c845f305b3cb24fd2f..ed2eda0b383706b6d1ac3245a36f1caa72fbc925 100644
+--- a/web/src/shell/AeAgentsUsage.test.tsx
++++ b/web/src/shell/AeAgentsUsage.test.tsx
+@@ -1,6 +1,6 @@
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+-import { cleanup, render, screen } from "@testing-library/react";
+-import { afterEach, describe, expect, it, vi } from "vitest";
++import { cleanup, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+ import { useChatStore } from "@/store/chatStore";
+ import { AeAgentMetaLine } from "./AeAgentMeta";
+@@ -82,6 +82,11 @@ afterEach(() => {
+   usageMock.mockReset();
+ });
+ 
++// These cases cover cost mode; tokens is the default.
++beforeEach(() => {
++  window.localStorage.setItem("omnigent:ae-spend-display", "cost");
++});
++
+ describe("Agents card usage", () => {
+   it("shows role, effort and tokens per row and a total split by model", async () => {
+     usageMock.mockImplementation(async (id: string) =>
+@@ -324,6 +329,48 @@ describe("Agents card usage", () => {
+   });
+ });
+ 
++describe("spend setting", () => {
++  function setup() {
++    usageMock.mockImplementation(async (id: string) =>
++      id === "conv_root"
++        ? usage("claude-sonnet-5-5", 300_000, 48_000)
++        : id === "b"
++          ? claudeUsage("claude-sonnet-5-5", 1)
++          : usage("claude-sonnet-5-5", 100_000, 16_000),
++    );
++    const live = { busy: true, current_task_status: "in_progress" };
++    renderCard([child("a", live), child("b", live)], true);
++  }
++
++  it("tokens mode shows token counts, no cost, and a plus on a total missing a session", async () => {
++    window.localStorage.setItem("omnigent:ae-spend-display", "tokens");
++    setup();
++    await screen.findByTestId("agents-total");
++    await waitFor(() =>
++      expect(screen.getAllByTestId("subagent-cost").map((n) => n.textContent)).toEqual([
++        "116k tok",
++      ]),
++    );
++    const total = screen.getByTestId("agents-total");
++    expect(total.textContent).not.toContain("$");
++    expect(total.textContent).toContain("348k+ tokens");
++    expect(screen.getByTestId("agents-total-cost").getAttribute("title")).toBe(
++      "1 session has no token count",
++    );
++  });
++
++  it("off mode shows no spend and no total", async () => {
++    window.localStorage.setItem("omnigent:ae-spend-display", "off");
++    setup();
++    await waitFor(() => expect(usageMock).toHaveBeenCalled());
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, 50);
++    });
++    expect(screen.queryByTestId("subagent-cost")).toBeNull();
++    expect(screen.queryByTestId("agents-total")).toBeNull();
++  });
++});
++
+ describe("AeAgentMetaLine raise marks", () => {
+   const row = (labels: Record<string, string>) =>
+     ({
+diff --git a/web/src/shell/AeFamilyTree.tsx b/web/src/shell/AeFamilyTree.tsx
+index 88e09a51958c38b6a46c37744d4df8cd20739ab9..ae1dd35d3df29af7f1d06146584876fa45c5d9c9 100644
+--- a/web/src/shell/AeFamilyTree.tsx
++++ b/web/src/shell/AeFamilyTree.tsx
+@@ -11,8 +11,9 @@ import {
+   createContext,
+   useContext,
+ } from "react";
+-import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+-import { aeSpendOf, useAeSessionUsages } from "@/lib/aeAgentUsage";
++import { aeAgentRole, aeRoleName } from "@/lib/aeAgentRole";
++import { useAeSessionUsages } from "@/lib/aeAgentUsage";
++import { aeSpendLabel, useAeSpendDisplay } from "@/lib/aeSpendDisplay";
+ import { aeRaiseMarks } from "@/lib/aeModelChange";
+ import { AE_FAMILY_COLORS, type AeFamily, aeFamilyHint } from "@/lib/aeFamily";
+ import {
+@@ -121,6 +122,14 @@ function Lines({
+ // Pinned draws as a plain row.
+ const InFamilies = createContext(false);
+ 
++/** A family row's marker is a dot or spinner (16px at most), so its title keeps pr-7, not the pr-8 slot. */
++export function useAeFamilyMarkerReserve(conversationId: string): string | null {
++  const { tree } = useContext(AeFamilyContext);
++  const inFamilies = useContext(InFamilies);
++  const inTree = inFamilies && (tree?.leads.has(conversationId) || tree?.rows.has(conversationId));
++  return inTree ? "pr-7" : null;
++}
++
+ /** A tree row's lines and indent, before its status icon; nothing outside the tree view. */
+ export function AeFamilyTreeIndent({
+   conversationId,
+@@ -225,17 +234,21 @@ function TokenPill({ family }: { family: AeFamily }) {
+     members.map((m) => ({ id: m.id, stamp: 0 })),
+     { staleMs: PILL_MS, pollMs: PILL_MS, live: busy },
+   );
+-  const spend = aeSpendOf(usage.values());
++  const mode = useAeSpendDisplay();
++  const spend = aeSpendLabel(usage.values(), mode, family.members.length - members.length);
+   if (!spend) return null;
+-  const more = family.members.length > PILL_MEMBERS ? "+" : "";
+-  const text = spend.kind === "cost" ? aeFormatCost(spend.value) : aeFormatTokens(spend.value);
++  const more = mode === "cost" && family.members.length > PILL_MEMBERS ? "+" : "";
+   return (
+     <span
+       data-testid="ae-family-tokens"
+-      title={`${text}${more} ${spend.kind === "cost" ? "estimated" : "tokens"} across this family`}
++      title={
++        mode === "cost"
++          ? `${spend.text}${more} ${spend.unit} across this family`
++          : `${spend.title} across this family`
++      }
+       className="inline-flex h-[18px] shrink-0 items-center rounded-full bg-foreground/[0.06] px-1.5 text-[11.5px] tabular-nums text-muted-foreground"
+     >
+-      {text}
++      {spend.text}
+       {more}
+     </span>
+   );
+diff --git a/web/src/shell/Sidebar.aeFamilies.test.tsx b/web/src/shell/Sidebar.aeFamilies.test.tsx
+index 8b1bb0d323e3118afbe35e302a689121e13d2a40..b2d0bc6418992453c25c7a0cd191bc02a431c08f 100644
+--- a/web/src/shell/Sidebar.aeFamilies.test.tsx
++++ b/web/src/shell/Sidebar.aeFamilies.test.tsx
+@@ -10,6 +10,7 @@
+ import type * as IdentityModule from "@/lib/identity";
+ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+ 
+ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+ 
+@@ -118,6 +119,8 @@ function dotOf(name: string): HTMLElement | null {
+ 
+ beforeEach(() => {
+   localStorage.clear();
++  // These cases cover cost mode; tokens is the default.
++  window.localStorage.setItem("omnigent:ae-spend-display", "cost");
+   resetAeFamilyFoldsCache();
+   resetAeFamilyClosedCache();
+   mocks.archived.mockReset();
+@@ -326,6 +329,57 @@ describe("Grouping > Family", () => {
+     });
+   });
+ 
++  it("reserves pr-7 for a Family row's marker and keeps pr-8 elsewhere", () => {
++    // A draft puts a marker on the row, so it has a trailing indicator.
++    setSessionDraft(sid("Escalation tool"), { text: "x", files: [] });
++    setSessionDraft(sid("Fabric card speed"), { text: "x", files: [] });
++    const reserve = (name: string) =>
++      rowItem(name).querySelector<HTMLElement>(`a[href="/c/${sid(name)}"]`)!.className;
++    useConvMock.mockImplementation(() => conversationPage(ROWS));
++    setView({ grouping: "family" });
++    renderSidebar();
++    expect(reserve("Escalation tool")).toMatch(/(^|\s)pr-7(\s|$)/);
++    expect(reserve("Fabric card speed")).toMatch(/(^|\s)pr-8(\s|$)/);
++    clearSessionDrafts();
++  });
++
++  describe("spend setting", () => {
++    function tokenUsage() {
++      useConvMock.mockImplementation(() => conversationPage(ROWS));
++      mocks.fetch.mockImplementation((input: unknown) =>
++        Promise.resolve(
++          String(input).startsWith("/v1/sessions/")
++            ? new Response(
++                JSON.stringify({
++                  usage_by_model: {
++                    "gpt-5.5": { input_tokens: 90_000, output_tokens: 10_000, total_cost_usd: 2 },
++                  },
++                }),
++              )
++            : new Response("{}", { status: 404 }),
++        ),
++      );
++      setView({ grouping: "family" });
++    }
++
++    it("shows tokens on the family pill in tokens mode", async () => {
++      window.localStorage.setItem("omnigent:ae-spend-display", "tokens");
++      tokenUsage();
++      renderSidebar();
++      const pill = await within(rowItem("Role routing build")).findByTestId("ae-family-tokens");
++      expect(pill.textContent).toBe("400k tok");
++      expect(pill.getAttribute("title")).toContain("input (incl. cache writes) 360k");
++    });
++
++    it("shows no family pill when off", async () => {
++      window.localStorage.setItem("omnigent:ae-spend-display", "off");
++      tokenUsage();
++      renderSidebar();
++      await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
++      expect(within(rowItem("Role routing build")).queryByTestId("ae-family-tokens")).toBeNull();
++    });
++  });
++
+   it("falls back to tokens on the family pill when no cost is reported", async () => {
+     useConvMock.mockImplementation(() => conversationPage(ROWS));
+     mocks.fetch.mockImplementation((input: unknown) =>
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index 2671a141a88cf94ce996dad50d191da5e3066d5c..7f888accc7399d3136e5550525e37521247683cc 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -4899,6 +4899,7 @@ function ConversationRowImpl({
+   const show = useContext(SidebarShowContext);
+   const showUpdated = show.includes("updated") && !hasSessionIndicator;
+   const hasTrailingIndicator = hasSessionIndicator || showSharedIndicator || showUpdated;
++  const familyReserve = AeTree.useAeFamilyMarkerReserve(conversation.id);
+   const metaEnvironment = show.includes("environment") ? (
+     <SessionEnvironmentLabel conversation={conversation} hostsById={hostsById} />
+   ) : null;
+@@ -5136,7 +5137,7 @@ function ConversationRowImpl({
+                 : hasSessionIndicator && showSharedIndicator
+                   ? "pr-14"
+                   : hasTrailingIndicator
+-                    ? "pr-8"
++                    ? (familyReserve ?? "pr-8")
+                     : "pr-2"),
+         // The narrowed reserve must track exactly when the trailing controls
+         // appear and the state marker fades — both keyed on `:focus-visible`.

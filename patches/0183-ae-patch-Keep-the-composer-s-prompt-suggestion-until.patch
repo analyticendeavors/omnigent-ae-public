@@ -1,0 +1,538 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 12:35:47 -0700
+Subject: [PATCH 183/191] [ae-patch] Keep the composer's prompt suggestion
+ until the next prompt
+
+Hold the latest session.suggestion in server memory (6 hours, 1000 sessions), replay it to a new stream subscriber, and drop it on a clear or when a turn starts. The web bind no longer wipes a replay that lands during the snapshot fetch.
+---
+ .../routes/_sessions/ae_session_suggestion.py |  87 +++++++++++++-
+ omnigent/server/routes/_sessions/helpers.py   |  30 ++++-
+ .../server/routes/_sessions/orchestration.py  |   4 +
+ .../server/routes/sessions/routes_events.py   |   3 +-
+ .../integration/test_ae_session_suggestion.py | 107 ++++++++++++++++++
+ .../server/routes/test_stream_live_events.py  |  54 +++++++++
+ web/src/store/chatStore.test.ts               |  35 ++++++
+ web/src/store/chatStore.ts                    |   4 +-
+ 8 files changed, 315 insertions(+), 9 deletions(-)
+
+diff --git a/omnigent/server/routes/_sessions/ae_session_suggestion.py b/omnigent/server/routes/_sessions/ae_session_suggestion.py
+index cdaa4c29004101b8ea7d6e4af5a7d926f16b2890..6eca9011da69a3f8ddea855df0f062eb18f74fd9 100644
+--- a/omnigent/server/routes/_sessions/ae_session_suggestion.py
++++ b/omnigent/server/routes/_sessions/ae_session_suggestion.py
+@@ -5,15 +5,22 @@ After each finished turn a native forwarder may post
+ ``external_session_suggestion`` with up to three ranked one-line guesses at the
+ user's next message (see ``harnesses/ae_prompt_suggest_core.py``). This
+ validates the payload and broadcasts it as a transient ``session.suggestion``
+-event for the composer's ghost text; nothing is persisted. The type string and
++event for the composer's ghost text. Nothing reaches the database: the latest
++list is held in memory until a clear, the next ``running`` edge, or six
++hours, and a new stream subscriber gets it replayed. The type string and
+ bounds come from :mod:`omnigent.util.ae_session_suggestion`, which the
+ forwarder shares.
+ """
+ 
+ from __future__ import annotations
+ 
++import threading
++import time
++from collections import OrderedDict
++from typing import Any
++
+ from omnigent.errors import ErrorCode, OmnigentError
+-from omnigent.server.routes._sessions.common import session_stream
++from omnigent.server.routes._sessions.common import _session_status_cache, session_stream
+ from omnigent.server.schemas import SessionEventInput, SessionSuggestionEvent
+ from omnigent.util.ae_session_suggestion import (
+     EXTERNAL_SESSION_SUGGESTION_TYPE,
+@@ -22,7 +29,70 @@ from omnigent.util.ae_session_suggestion import (
+     SESSION_SUGGESTION_SSE_TYPE,
+ )
+ 
+-__all__ = ["EXTERNAL_SESSION_SUGGESTION_TYPE", "publish_external_session_suggestion"]
++__all__ = [
++    "EXTERNAL_SESSION_SUGGESTION_TYPE",
++    "forget",
++    "publish_external_session_suggestion",
++    "reset_for_tests",
++    "snapshot_for",
++]
++
++_MAX_AGE_S = 6 * 3600
++_MAX_SESSIONS = 1000
++
++# Session id to (stored at, ``session.suggestion`` event). A lock guards it
++# because ``_publish_status`` can run off the event loop.
++_latest: OrderedDict[str, tuple[float, dict[str, Any]]] = OrderedDict()
++# Session id to the monotonic time ``forget`` last ran. A guess whose status
++# read began before that stamp may be for a turn that has already started, so
++# ``_remember`` refuses it. Same cap and eviction as ``_latest``.
++_forgotten_at: OrderedDict[str, float] = OrderedDict()
++_lock = threading.Lock()
++
++
++def forget(session_id: str) -> None:
++    """Drop the held suggestion for ``session_id`` (a clear, or a turn starting)."""
++    with _lock:
++        _latest.pop(session_id, None)
++        _forgotten_at[session_id] = time.monotonic()
++        _forgotten_at.move_to_end(session_id)
++        while len(_forgotten_at) > _MAX_SESSIONS:
++            _forgotten_at.popitem(last=False)
++
++
++def snapshot_for(session_id: str) -> list[dict[str, Any]]:
++    """
++    The held ``session.suggestion`` event for a new subscriber, as a list of 0 or 1.
++
++    An entry older than six hours is dropped rather than replayed.
++    """
++    with _lock:
++        entry = _latest.get(session_id)
++        if entry is None:
++            return []
++        stored_at, event = entry
++        if time.monotonic() - stored_at > _MAX_AGE_S:
++            del _latest[session_id]
++            return []
++        return [dict(event)]
++
++
++def reset_for_tests() -> None:
++    """Clear every held suggestion."""
++    with _lock:
++        _latest.clear()
++        _forgotten_at.clear()
++
++
++def _remember(session_id: str, event: dict[str, Any], observed_at: float) -> None:
++    """Hold ``event`` unless ``forget`` ran at or after ``observed_at``."""
++    with _lock:
++        if _forgotten_at.get(session_id, float("-inf")) >= observed_at:
++            return
++        _latest[session_id] = (time.monotonic(), dict(event))
++        _latest.move_to_end(session_id)
++        while len(_latest) > _MAX_SESSIONS:
++            _latest.popitem(last=False)
+ 
+ 
+ def _is_one_line(value: object) -> bool:
+@@ -74,6 +144,9 @@ def publish_external_session_suggestion(session_id: str, body: SessionEventInput
+         one), or both are ``None`` to clear.
+     :raises OmnigentError: When the payload breaks the bounds above.
+     """
++    # Taken before the status read: a running edge after this point makes the
++    # guess stale, and ``forget`` stamps it so ``_remember`` can tell.
++    observed_at = time.monotonic()
+     suggestions = _ranked_suggestions(body.data)
+     event = SessionSuggestionEvent(
+         type=SESSION_SUGGESTION_SSE_TYPE,
+@@ -81,4 +154,10 @@ def publish_external_session_suggestion(session_id: str, body: SessionEventInput
+         suggestion=suggestions[0] if suggestions else None,
+         suggestions=suggestions,
+     )
+-    session_stream.publish(session_id, event.model_dump())
++    payload = event.model_dump()
++    if suggestions is None:
++        forget(session_id)
++    elif _session_status_cache.get(session_id) != "running":
++        # A guess posted mid-turn is stale on arrival (the web drops it too).
++        _remember(session_id, payload, observed_at)
++    session_stream.publish(session_id, payload)
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 3fb6eb7af01ca3f9b2c4185559a16d9d1ea35e24..8a2c2becfa110b1773603686988dd25346f97683 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -131,6 +131,7 @@ from omnigent.server.routes._host_worktree import CreatedWorktree
+ from omnigent.server.routes._session_create_validation import (
+     validate_existing_host_workspace,
+ )
++from omnigent.server.routes._sessions import ae_session_suggestion
+ from omnigent.server.routes._sessions.ae_child_model import child_display_model
+ 
+ # Shared constants, state, and small dataclasses live in the _sessions.common
+@@ -4935,6 +4936,9 @@ def _publish_status(
+         return
+     previous_status = _session_status_cache.get(session_id)
+     _session_status_cache[session_id] = status
++    if status == "running":
++        # A new turn makes the held next-prompt guess stale; Codex never posts a clear.
++        ae_session_suggestion.forget(session_id)
+     if previous_status != status:
+         _publish_child_status_to_parent(session_id, status)
+     # Mirror the transition onto the conversation row (best-effort,
+@@ -9330,6 +9334,25 @@ async def _evaluate_output_policy(
+     }
+ 
+ 
++def _pre_ready_replay(session_id: str) -> list[dict[str, Any]]:
++    """
++    Events replayed to a new stream subscriber before its ready heartbeat.
++
++    The in-flight text and the last ``session.suggestion`` are gathered in
++    separate blocks so one failing does not drop the other.
++    """
++    events: list[dict[str, Any]] = []
++    try:
++        events.extend(inflight_text.snapshot_for(session_id))
++    except Exception:  # noqa: BLE001 - one replay failing must not drop the other
++        _logger.exception("in-flight text replay failed for %s", session_id)
++    try:
++        events.extend(ae_session_suggestion.snapshot_for(session_id))
++    except Exception:  # noqa: BLE001 - one replay failing must not drop the other
++        _logger.exception("suggestion replay failed for %s", session_id)
++    return events
++
++
+ async def _stream_live_events(
+     request: Request,
+     session_id: str,
+@@ -9342,8 +9365,9 @@ async def _stream_live_events(
+     Yield SSE-formatted events from the conversation's live stream.
+ 
+     Events are delivered live from the moment :func:`session_stream.subscribe`
+-    is invoked forward — there is no buffer and no replay. Events
+-    published before this generator subscribed are lost; clients
++    is invoked forward — there is no buffer. Only two things replay before the
++    ready heartbeat: the in-flight text and the last ``session.suggestion``.
++    Other events published before this generator subscribed are lost; clients
+     reconcile pre-subscribe state via the snapshot endpoint
+     (``GET /v1/sessions/{id}``) and dedupe by item id.
+ 
+@@ -9429,7 +9453,7 @@ async def _stream_live_events(
+                 # async ``on_subscribed`` hook, or window deltas double-render.
+                 # Resource state stays in ``on_subscribed`` — it needs
+                 # awaits and is not dedup-sensitive.
+-                pre_ready_snapshot=lambda: inflight_text.snapshot_for(session_id),
++                pre_ready_snapshot=lambda: _pre_ready_replay(session_id),
+                 on_subscribed=on_subscribed,
+             )
+         ) as live_events:
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index e6660d486dfd4a6b9117258b6c9bfede0de5b146..0668a71fbb54c0a78a86b2ffa9a4795b6abd2da0 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -168,6 +168,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_agent,
+     validate_session_model_metadata,
+ )
++from omnigent.server.routes._sessions import ae_session_suggestion
+ from omnigent.server.routes._sessions.ae_session_activity import (
+     session_active_child_count,
+     session_background_task_count,
+@@ -7722,6 +7723,7 @@ class _RelayTransportLost(Exception):
+ def _relinquish_session_live_state(session_id: str) -> None:
+     """Drop local live state for a session now owned by another replica."""
+     _session_status_cache.pop(session_id, None)
++    ae_session_suggestion.forget(session_id)
+     _session_active_response_cache.pop(session_id, None)
+     _session_blocked_on_cache.pop(session_id, None)
+     session_live_state.forget_live_status(session_id)
+@@ -12410,6 +12412,8 @@ async def _run_runner_status_probe(
+                 if isinstance(payload, dict):
+                     raw = str(payload.get("status", "idle"))
+                     _session_status_cache[session_id] = raw
++                    if raw == "running":
++                        ae_session_suggestion.forget(session_id)
+                     # The probe names no dialog, so a remembered one may be gone.
+                     _session_blocked_on_cache.pop(session_id, None)
+                     if raw in ("idle", "running", "waiting", "failed"):
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 4e637ebe72424f9e6731a35b09736f06d69fd425..4ac41d202aacd15114099919477e47d521f8475d 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -942,7 +942,8 @@ def register_events_routes(
+           it), without persisting an item or starting / steering a task.
+         - ``"external_session_suggestion"`` publishes a transient
+           ``session.suggestion`` event with a predicted next prompt
+-          (``suggestion``; null clears it), without persisting anything.
++          (``suggestion``; null clears it), held in memory for replay to a new
++          stream subscriber, without persisting anything.
+         - ``"subagent.status"`` with ``data.idle=true`` publishes idle status
+           for transcript inactivity without forwarding a completion
+           to the runner.
+diff --git a/tests/server/integration/test_ae_session_suggestion.py b/tests/server/integration/test_ae_session_suggestion.py
+index 0eb0aa6ad0de03823683d2679d5bfc8e9edcee9b..6e83a36a53863b2fbc71e21ca6285cdd25189ff9 100644
+--- a/tests/server/integration/test_ae_session_suggestion.py
++++ b/tests/server/integration/test_ae_session_suggestion.py
+@@ -2,16 +2,34 @@
+ 
+ from __future__ import annotations
+ 
++import time
+ from typing import Any
+ 
+ import httpx
+ import pytest
+ 
++from omnigent.server.routes._sessions import ae_session_suggestion
++from omnigent.server.routes._sessions import helpers as session_helpers
++from omnigent.server.routes._sessions.common import _session_status_cache
+ from tests.server.helpers import create_test_agent
+ 
+ pytestmark = pytest.mark.asyncio
+ 
+ 
++@pytest.fixture(autouse=True)
++def _reset_held_suggestions() -> Any:
++    ae_session_suggestion.reset_for_tests()
++    yield
++    ae_session_suggestion.reset_for_tests()
++
++
++def _post(client: httpx.AsyncClient, session_id: str, data: dict[str, Any]) -> Any:
++    return client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": "external_session_suggestion", "data": data},
++    )
++
++
+ async def _session_with_capture(
+     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+ ) -> tuple[str, list[tuple[str, dict[str, Any]]]]:
+@@ -45,6 +63,8 @@ async def test_suggestion_is_published_as_a_transient_session_suggestion(
+         assert resp.status_code == 202, resp.text
+         assert resp.json() == {"queued": False}
+ 
++    # The null post cleared what the earlier posts held.
++    assert ae_session_suggestion.snapshot_for(session_id) == []
+     assert published == [
+         (
+             session_id,
+@@ -82,6 +102,93 @@ async def test_suggestion_is_published_as_a_transient_session_suggestion(
+     assert items.json()["data"] == []
+ 
+ 
++async def test_latest_suggestion_is_held_for_replay(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A post is held in memory and ``snapshot_for`` returns the newest event."""
++    session_id, _ = await _session_with_capture(client, monkeypatch)
++
++    assert ae_session_suggestion.snapshot_for(session_id) == []
++    assert (await _post(client, session_id, {"suggestions": ["One", "Two"]})).status_code == 202
++    assert (await _post(client, session_id, {"suggestion": "Newest"})).status_code == 202
++
++    assert ae_session_suggestion.snapshot_for(session_id) == [
++        {
++            "type": "session.suggestion",
++            "sequence_number": None,
++            "conversation_id": session_id,
++            "suggestion": "Newest",
++            "suggestions": ["Newest"],
++        }
++    ]
++
++
++async def test_suggestion_posted_while_running_is_published_but_not_held(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The web drops a guess that lands mid-turn, so the server does not replay it."""
++    session_id, published = await _session_with_capture(client, monkeypatch)
++    monkeypatch.setitem(_session_status_cache, session_id, "running")
++
++    assert (await _post(client, session_id, {"suggestion": "Too late"})).status_code == 202
++
++    assert len(published) == 1
++    assert ae_session_suggestion.snapshot_for(session_id) == []
++
++
++async def test_running_status_forgets_the_held_suggestion(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A new turn drops the guess even when no harness posts a clear (Codex)."""
++    session_id, _ = await _session_with_capture(client, monkeypatch)
++    assert (await _post(client, session_id, {"suggestion": "Stale soon"})).status_code == 202
++    assert ae_session_suggestion.snapshot_for(session_id) != []
++
++    session_helpers._publish_status(session_id, "running")
++
++    assert ae_session_suggestion.snapshot_for(session_id) == []
++
++
++async def test_guess_read_before_a_running_edge_is_not_stored() -> None:
++    """A status read that began before ``forget`` ran must not store a stale guess."""
++    observed_at = time.monotonic()
++    ae_session_suggestion.forget("conv_race")
++
++    ae_session_suggestion._remember("conv_race", {"conversation_id": "conv_race"}, observed_at)
++
++    assert ae_session_suggestion.snapshot_for("conv_race") == []
++
++
++async def test_held_suggestion_expires_after_six_hours(
++    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    session_id, _ = await _session_with_capture(client, monkeypatch)
++    assert (await _post(client, session_id, {"suggestion": "Old"})).status_code == 202
++    assert ae_session_suggestion.snapshot_for(session_id) != []
++
++    stored_at = ae_session_suggestion._latest[session_id][0]
++    monkeypatch.setattr(
++        ae_session_suggestion.time,
++        "monotonic",
++        lambda: stored_at + ae_session_suggestion._MAX_AGE_S + 1,
++    )
++
++    assert ae_session_suggestion.snapshot_for(session_id) == []
++    assert session_id not in ae_session_suggestion._latest
++
++
++async def test_held_suggestions_are_capped_oldest_first(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(ae_session_suggestion, "_MAX_SESSIONS", 2)
++    for sid in ("conv_a", "conv_b", "conv_c"):
++        ae_session_suggestion._remember(sid, {"conversation_id": sid}, time.monotonic())
++
++    assert ae_session_suggestion.snapshot_for("conv_a") == []
++    assert ae_session_suggestion.snapshot_for("conv_b") != []
++    assert ae_session_suggestion.snapshot_for("conv_c") != []
++
++
+ @pytest.mark.parametrize(
+     "data",
+     [
+diff --git a/tests/server/routes/test_stream_live_events.py b/tests/server/routes/test_stream_live_events.py
+index c15383dde3d75e40124f703ae949bc9f04976198..86c5a287cdd663fc09eb239f45efa91b9b445987 100644
+--- a/tests/server/routes/test_stream_live_events.py
++++ b/tests/server/routes/test_stream_live_events.py
+@@ -8,12 +8,14 @@ normal stream completion — never during ``aclose`` / ``GeneratorExit``.
+ from __future__ import annotations
+ 
+ import asyncio
++import time
+ from typing import Any
+ 
+ import pytest
+ 
+ from omnigent.runtime import session_stream
+ from omnigent.server import presence, shutdown_state
++from omnigent.server.routes._sessions import ae_session_suggestion
+ from omnigent.server.routes.sessions import _stream_live_events
+ 
+ pytestmark = pytest.mark.asyncio
+@@ -34,6 +36,7 @@ def _reset_presence_and_subscribers() -> Any:
+     """Isolate module-global presence + session_stream state per test."""
+     presence.reset_for_tests()
+     shutdown_state.reset_for_tests()
++    ae_session_suggestion.reset_for_tests()
+     session_stream._subscribers.clear()
+     yield
+     presence.reset_for_tests()
+@@ -128,3 +131,54 @@ async def test_normal_completion_emits_done_and_cleans_up(
+             break
+         await asyncio.sleep(0.02)
+     assert presence.snapshot(SESSION_ID, SESSION_ID)["viewers"] == []
++
++
++def _suggestion_event(suggestion: str | None) -> dict[str, Any]:
++    return {
++        "type": "session.suggestion",
++        "sequence_number": None,
++        "conversation_id": SESSION_ID,
++        "suggestion": suggestion,
++        "suggestions": None if suggestion is None else [suggestion],
++    }
++
++
++async def test_held_suggestion_is_replayed_after_ready_before_live_events() -> None:
++    """A new subscriber gets the held guess after the heartbeat; a later clear follows it."""
++    ae_session_suggestion._remember(SESSION_ID, _suggestion_event("Open a PR"), time.monotonic())
++
++    gen = _stream_live_events(
++        _ConnectedRequest(),  # type: ignore[arg-type]
++        SESSION_ID,
++    )
++    try:
++        assert "session.heartbeat" in await asyncio.wait_for(gen.__anext__(), timeout=2.0)
++        replay = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
++        assert "session.suggestion" in replay
++        assert "Open a PR" in replay
++
++        session_stream.publish(SESSION_ID, _suggestion_event("Second guess"))
++        later = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
++        assert "Second guess" in later
++
++        session_stream.publish(SESSION_ID, _suggestion_event(None))
++        cleared = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
++        assert "session.suggestion" in cleared
++        assert '"suggestion": null' in cleared or '"suggestion":null' in cleared
++    finally:
++        await gen.aclose()
++
++
++async def test_no_held_suggestion_means_no_extra_frame() -> None:
++    """Without a held guess the first frame after the heartbeat is the next live event."""
++    gen = _stream_live_events(
++        _ConnectedRequest(),  # type: ignore[arg-type]
++        SESSION_ID,
++    )
++    try:
++        assert "session.heartbeat" in await asyncio.wait_for(gen.__anext__(), timeout=2.0)
++        session_stream.publish(SESSION_ID, _suggestion_event("Live one"))
++        frame = await asyncio.wait_for(gen.__anext__(), timeout=2.0)
++        assert "Live one" in frame
++    finally:
++        await gen.aclose()
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 3d0554d21281883a236c9b630c47130bcfe7fb9a..618878dc2c4de159ae778e2754fc1832b560ffe3 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -794,6 +794,41 @@ describe("chatStore — lazy subtree usage", () => {
+     expect(useChatStore.getState().sessionCostUsd).toBe(8);
+   });
+ 
++  it("keeps a suggestion replayed during the bind snapshot fetch, and nulls an old one", async () => {
++    let finishSnapshot!: (response: Response) => void;
++    const pending = new Promise<Response>((resolve) => {
++      finishSnapshot = resolve;
++    });
++    routeUsage(
++      "conv_sug_replay",
++      () => mockResponse({ id: "conv_sug_replay", total_cost_usd: null, usage_by_model: null }),
++      pending,
++    );
++    const binding = useChatStore.getState().switchTo("conv_sug_replay");
++    await tick();
++    // The stream's replay lands while the snapshot is still in flight.
++    useChatStore.setState({ aeSuggestion: ["Open a PR"] });
++
++    finishSnapshot(snapshot("conv_sug_replay"));
++    await binding;
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toEqual(["Open a PR"]);
++
++    // A suggestion set before the bind and unchanged during the fetch is stale.
++    useChatStore.setState({ aeSuggestion: ["Set before bind"] });
++    routeUsage("conv_sug_same", () => mockResponse({ id: "conv_sug_same" }));
++    await useChatStore.getState().switchTo("conv_sug_same");
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++
++    // A suggestion left from an earlier visit is stale: a fresh bind clears it.
++    useChatStore.setState({ aeSuggestion: ["Old guess"] });
++    routeUsage("conv_sug_fresh", () => mockResponse({ id: "conv_sug_fresh" }));
++    await useChatStore.getState().switchTo("conv_sug_fresh");
++    await tick();
++    expect(useChatStore.getState().aeSuggestion).toBeNull();
++  });
++
+   it("does not overwrite newer streamed cost or model usage with a slow read", async () => {
+     let finishUsage!: (response: Response) => void;
+     const pending = new Promise<Response>((resolve) => {
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index f0555db26450b72b65bda92183005ee63ffe5a72..ea584ff043609fcc2fec27341e7efe39f073d0a4 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -4557,7 +4557,9 @@ async function bindStream(
+         // Events seen on an earlier visit are stale; the snapshot's blocks date it.
+         lastEventAt: null,
+         aeProgress: null,
+-        aeSuggestion: null,
++        // A replay that landed during the fetch is newer than the snapshot.
++        aeSuggestion:
++          state.aeSuggestion !== stateBeforeFetch.aeSuggestion ? state.aeSuggestion : null,
+         // This conversation's own effective effort, which is what a warm switch
+         // back re-projects (it does not re-bind, so it cannot recompute it).
+         sessionReasoningEffort: effectiveEffort,

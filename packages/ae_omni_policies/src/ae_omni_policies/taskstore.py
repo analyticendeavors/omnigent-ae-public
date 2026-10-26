@@ -43,7 +43,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from ae_omni_policies import __version__
+from ae_omni_policies import __version__, key_health
 from ae_omni_policies.notes import (
     DEFAULT_TZ,
     PARKING_LOT_NAME,
@@ -359,10 +359,22 @@ class TaskStoreClient:
 
         status = response.status_code
         if 300 <= status < 400:
+            # Access sends a bad service token to its login page (the secrets list shows it).
+            key_health.record("taskstore", False, status)
             return Result(ok=False, status=status, kind="auth", error=REDIRECT_ERROR)
 
         text = response.text
-        if status == 403 and _BOT_PROTECTION.search(text):
+        bot = status == 403 and bool(_BOT_PROTECTION.search(text))
+        # Cloudflare Access refuses a bad service token with its own 403 page (HTML);
+        # a JSON 403 is the store's own authorization answer, past Access, so the
+        # token worked (review of https://github.com/analyticendeavors/omnigent-ae/pull/301).
+        content_type = response.headers.get("content-type", "")
+        if status == 403 and not bot and "json" not in content_type:
+            key_health.record("taskstore", False, status)
+        elif status < 500 and not bot:
+            # Past Access: the service token worked, whatever the store said next.
+            key_health.record("taskstore", True)
+        if bot:
             # Cloudflare's own 1010 arrives as a 403 that looks like the store
             # refusing the principal. It is not: the request never reached the
             # origin. Checked before the JSON parse, where it can fire.

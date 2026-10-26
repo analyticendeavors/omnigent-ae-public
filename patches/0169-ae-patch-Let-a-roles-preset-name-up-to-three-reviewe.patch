@@ -1,0 +1,3127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:51:48 -0700
+Subject: [PATCH 169/191] [ae-patch] Let a roles preset name up to three
+ reviewers, Claude models or other agents, that the lead runs independently at
+ the final review and merges into one verdict, with stacked reviewer rows in
+ Settings, Customize and Who works on this
+
+---
+ omnigent/inner/ae_reviewers.py                | 243 ++++++++
+ omnigent/inner/ae_roles.py                    |  61 +-
+ omnigent/inner/ae_text.py                     |  20 +
+ tests/inner/test_ae_roles.py                  | 274 +++++++++
+ web/src/components/AeSessionPresetRow.tsx     |  84 ++-
+ web/src/components/AeTeamControl.test.tsx     |  39 ++
+ web/src/components/AeTeamControl.tsx          |  47 +-
+ .../composer/AePresetSessionsSection.tsx      |   9 +-
+ .../composer/AeSessionPresetPill.tsx          |  10 +-
+ web/src/hooks/useAeReviewerAgents.test.tsx    |  21 +
+ web/src/hooks/useAeReviewerAgents.ts          |  37 ++
+ web/src/lib/aeReviewers.test.ts               | 235 ++++++++
+ web/src/lib/aeReviewers.ts                    | 358 ++++++++++++
+ web/src/lib/aeRoleBase.ts                     |  15 +
+ web/src/lib/aeRoles.ts                        |  78 ++-
+ .../pages/settings/AeReviewerRows.test.tsx    | 316 +++++++++++
+ web/src/pages/settings/AeReviewerRows.tsx     | 531 ++++++++++++++++++
+ web/src/pages/settings/AeRolesControls.tsx    |  64 ++-
+ web/src/pages/settings/AeRolesEditor.tsx      | 107 ++--
+ .../settings/AeRolesSettingsSection.test.tsx  |   3 +
+ 20 files changed, 2437 insertions(+), 115 deletions(-)
+ create mode 100644 omnigent/inner/ae_reviewers.py
+ create mode 100644 omnigent/inner/ae_text.py
+ create mode 100644 web/src/hooks/useAeReviewerAgents.test.tsx
+ create mode 100644 web/src/hooks/useAeReviewerAgents.ts
+ create mode 100644 web/src/lib/aeReviewers.test.ts
+ create mode 100644 web/src/lib/aeReviewers.ts
+ create mode 100644 web/src/lib/aeRoleBase.ts
+ create mode 100644 web/src/pages/settings/AeReviewerRows.test.tsx
+ create mode 100644 web/src/pages/settings/AeReviewerRows.tsx
+
+diff --git a/omnigent/inner/ae_reviewers.py b/omnigent/inner/ae_reviewers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fd7f22cdbdc65cd524b49c93084246f4054c67c4
+--- /dev/null
++++ b/omnigent/inner/ae_reviewers.py
+@@ -0,0 +1,243 @@
++"""Several reviewers per role preset in the lead notice.
++
++Added 2026-10-24 by omnigent-ae (multiple reviewers per preset). A preset's
++``roles.reviewer`` is one role setting, as before, or ``{"mode": "multi",
++"reviewers": [slot, ...]}`` with 1 to 3 slots (``ae_omni_policies.role_prefs``
++owns the shape). A slot is a Claude model and effort run as a native subagent,
++``auto`` (slot 1 only), or another agent (``{"mode": "agent", "agent": id,
++"name": ..., "model": ..., "effort": ...}``) run as a fresh child session each
++review, so no reviewer carries what it saw last round.
++
++With two or more reviewers the lead runs them all at the final review without
++asking, on the same diff, never showing one reviewer's findings to another, and
++merges them into one verdict. That replaces the separate /dual-review offer in
++chats on such a preset; the notice says so plainly. Fix checks and verifying a
++single finding stay with reviewer 1. The preset's rules pick how results are
++shown (``review_merge``) and what happens when a reviewer cannot start
++(``reviewer_unavailable``). A preset whose Helpers rule keeps work with the
++lead's own subagents (``own``) cannot start child sessions, so its agent slots
++are named as skipped.
++
++:func:`ae_roles.render_roles` calls :func:`reviewer_lines` for the preset in
++force and :func:`reviewers_short` for each lead-picks line.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from typing import Any
++
++from omnigent.inner.ae_text import OWN
++from omnigent.inner.ae_text import text as _text
++
++MAX_REVIEWERS = 3
++MULTI = "multi"
++AGENT = "agent"
++_LABEL = "Reviewer (reviews, verifying a finding, fix checks)"
++_LABEL_MANY = "Reviewers (final review of a build)"
++
++ModelText = Callable[[object, object], str]
++
++
++def slots(setting: object) -> list[dict[str, object]]:
++    """The reviewer slots of a ``roles.reviewer`` value: one for a plain setting, up to three."""
++    if not isinstance(setting, dict):
++        return []
++    if setting.get("mode") != MULTI:
++        return [setting]
++    raw = setting.get("reviewers")
++    if not isinstance(raw, list):
++        return []
++    return [slot for slot in raw if isinstance(slot, dict)][:MAX_REVIEWERS]
++
++
++def _is_agent(slot: dict[str, object]) -> bool:
++    return slot.get("mode") == AGENT and bool(_text(slot.get("agent"), 128))
++
++
++def _agent_name(slot: dict[str, object]) -> str:
++    return _text(slot.get("name"), 40) or "the agent"
++
++
++def resolve_agents(roles: dict[str, Any], lookup: Callable[[str], str | None]) -> dict[str, Any]:
++    """*roles* (resolved notice metadata) with each agent slot's id looked up by its name.
++
++    An install seeded before the id scheme keeps a random id for a built-in agent
++    row, so a slot that carries ``agent_name`` gets the live id from *lookup*; a
++    name that is unknown keeps the stored id. Returns copies; never raises.
++    """
++
++    def settled(setting: object) -> object:
++        if not isinstance(setting, dict) or setting.get("mode") != MULTI:
++            return fixed_slot(setting)
++        raw = setting.get("reviewers")
++        if not isinstance(raw, list):
++            return setting
++        return {**setting, "reviewers": [fixed_slot(slot) for slot in raw]}
++
++    def fixed_slot(slot: object) -> object:
++        if not isinstance(slot, dict) or slot.get("mode") != AGENT:
++            return slot
++        name = _text(slot.get("agent_name"), 64)
++        if not name:
++            return slot
++        try:
++            live = lookup(name)
++        except Exception:  # noqa: BLE001 (an unreadable agent list keeps the stored id)
++            live = None
++        return {**slot, "agent": live} if isinstance(live, str) and live else slot
++
++    def preset_of(preset: object) -> object:
++        setting = preset.get("roles") if isinstance(preset, dict) else None
++        if not isinstance(setting, dict) or "reviewer" not in setting:
++            return preset
++        assert isinstance(preset, dict)
++        return {**preset, "roles": {**setting, "reviewer": settled(setting["reviewer"])}}
++
++    resolved = dict(roles)
++    if isinstance(roles.get("preset"), dict):
++        resolved["preset"] = preset_of(roles["preset"])
++    if isinstance(roles.get("presets"), list):
++        resolved["presets"] = [preset_of(p) for p in roles["presets"]]
++    return resolved
++
++
++def _agent(slot: dict[str, object], *, brief: bool = False) -> str:
++    """An agent slot: who it is and how to start it, with only the arguments it fixes."""
++    agent = _text(slot.get("agent"), 128)
++    model = _text(slot.get("model"), 128)
++    effort = _text(slot.get("effort"), 16)
++    args = [f"agent_id {agent}"]
++    if model:
++        args.append(f"model {model}")
++    if effort:
++        args.append(f"reasoning_effort {effort}")
++    defaults = [word for word, value in (("model", model), ("effort", effort)) if not value]
++    default = f"; its default {' and '.join(defaults)}" if defaults else ""
++    if brief:
++        return f"{_agent_name(slot)} (fresh child session: sys_session_create {', '.join(args)})"
++    return (
++        f"{_agent_name(slot)} agent (a fresh child session each review: "
++        f"sys_session_create with {', '.join(args)}{default})"
++    )
++
++
++def _claude(slot: dict[str, object], model_text: ModelText, current: object) -> str:
++    return f"{model_text(slot, current)} (native subagent)"
++
++
++def _split(
++    found: list[dict[str, object]], rules: dict[str, object]
++) -> tuple[list[dict[str, object]], str]:
++    """The slots that can run under the Helpers rule, and a note naming the skipped agents."""
++    own = rules.get("helpers") == OWN
++    skipped = [_agent_name(slot) for slot in found if own and _is_agent(slot)]
++    usable = [slot for slot in found if not (own and _is_agent(slot))]
++    note = (
++        f"{' and '.join(skipped)} skipped: this preset keeps work with your own subagents"
++        if skipped
++        else ""
++    )
++    return usable, note
++
++
++def reviewer_lines(
++    setting: object, rules: object, current: object, model_text: ModelText
++) -> list[str]:
++    """The notice lines for *setting*: one line for one reviewer, three for two or more.
++
++    :param setting: The preset's ``roles.reviewer`` value.
++    :param rules: The preset's rules (``review_merge``, ``reviewer_unavailable``, ``helpers``).
++    :param current: The current catalog id per tier alias.
++    :param model_text: Renders a Claude setting as the rest of the notice does.
++    """
++    rules = rules if isinstance(rules, dict) else {}
++    usable, skip_note = _split(slots(setting), rules)
++    if len(usable) < 2:
++        if not usable:
++            one = "your pick"
++        elif _is_agent(usable[0]):
++            one = f"{_agent(usable[0])}; a review never goes to an existing child session"
++        else:
++            one = model_text(usable[0], current)
++        note = f" ({skip_note})" if skip_note else ""
++        return [f"- {_LABEL}: {one}{note}."]
++    listed = " ".join(
++        f"{index}. {_agent(slot) if _is_agent(slot) else _claude(slot, model_text, current)}."
++        for index, slot in enumerate(usable, start=1)
++    )
++    lists = (
++        "show each reviewer's list first"
++        if rules.get("review_merge") == "separate"
++        else "keep each reviewer's list under it"
++    )
++    unavailable = (
++        "A reviewer that cannot start: ask the user before reviewing."
++        if rules.get("reviewer_unavailable") == "ask"
++        else "A reviewer that cannot start: skip it, review with the rest and say so."
++    )
++    if skip_note:
++        unavailable += f" {skip_note[0].upper()}{skip_note[1:]}."
++    return [
++        f"- {_LABEL_MANY}: {listed}",
++        "  These reviewers replace the /dual-review offer; run them when the work is done, "
++        "without asking. Give every reviewer the same diff and brief, run them at once, never "
++        "show one reviewer's findings to another. Never hand a review to an existing child "
++        "session, including one added to this chat: this overrides reusing sessions or "
++        "handing work to the team, for reviews only. Then merge into one verdict: dedupe, "
++        "mark agreements, settle each disagreement with a one-line reason, rank by severity, "
++        f"{lists}.",
++        f"  Fix checks and verifying one finding: reviewer 1 only. {unavailable}",
++    ]
++
++
++def reviewers_short(setting: object, rules: object, current: object, model_text: ModelText) -> str:
++    """A lead-picks part: ``reviewer sonnet, medium``, or with agents how to start them.
++
++    A preset with two or more reviewers or an agent reviewer carries what the lead
++    needs after picking it: how to start each agent (the resolved id), the merge and
++    unavailable rules when they differ from the defaults, and skipped agents under
++    the Helpers rule. The lead's pick is not written to the session label, so the
++    next turn's notice lists the picks again rather than this preset in full.
++    """
++    rules = rules if isinstance(rules, dict) else {}
++    found = slots(setting)
++    if not found:
++        return f"reviewer {model_text(setting, current)}"
++    if not any(_is_agent(slot) for slot in found) and len(found) < 2:
++        return f"reviewer {model_text(found[0], current)}"
++    usable, skip_note = _split(found, rules)
++    names = [
++        _agent(slot, brief=True) if _is_agent(slot) else model_text(slot, current)
++        for slot in usable
++    ]
++    text = f"reviewer{'s' if len(names) > 1 else ''} {' + '.join(names) or 'your pick'}"
++    if len(usable) > 1:
++        if rules.get("review_merge") == "separate":
++            text += "; show each reviewer's list first"
++        if rules.get("reviewer_unavailable") == "ask":
++            text += "; ask first if one cannot start"
++    if skip_note:
++        text += f"; {skip_note}"
++    return text
++
++
++def several(setting: object) -> bool:
++    """Whether *setting* names two or more reviewers."""
++    return len(slots(setting)) > 1
++
++
++def explained(setting: object) -> bool:
++    """Whether a lead-picks line for *setting* needs :data:`MANY_PICKS` to make sense."""
++    return several(setting) or any(_is_agent(slot) for slot in slots(setting))
++
++
++MANY_PICKS = (
++    "Reviewers named with an agent or with several: run all of them at the final review "
++    "without asking (they replace the /dual-review offer), each alone on the same diff "
++    "(never show one's findings to another), then merge into one verdict: dedupe, mark "
++    "agreements, settle disagreements, rank by severity; unless the line says otherwise, "
++    "keep each list under it and, for a reviewer that cannot start, skip it and say so. "
++    "Agents run as a fresh child session each review, never an existing one; fix checks go "
++    "to reviewer 1."
++)
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index 4553f6685ae6d315f565da0ef94aa96e7c77410a..17518f9d6b0535e66538be3a11b5b1fe0b38b180 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -36,16 +36,23 @@ Only a Claude lead hears about Claude's Agent tool and tier aliases. A role
+ fixed to a model id shows the tier alias only when the id is the current one for
+ that tier (``current``, from the omnigent-ae package), since a bare alias
+ resolves to the newest version.
++
++Reviewers (2026-10-24): a preset may name up to three reviewers; their lines
++come from :mod:`omnigent.inner.ae_reviewers`.
+ """
+ 
+ from __future__ import annotations
+ 
+ import json
+ import logging
+-import re
+ from typing import TYPE_CHECKING, Any
+ 
++from omnigent.inner import ae_reviewers, ae_text
++from omnigent.inner.ae_text import OWN
++
+ if TYPE_CHECKING:
++    from collections.abc import Callable
++
+     from omnigent.entities.conversation import Conversation
+     from omnigent.stores.conversation_store import ConversationStore
+ 
+@@ -61,7 +68,6 @@ _LABEL_MAX = 16_384
+ FORK_SOURCE_LABEL = "omnigent.fork.source_id"
+ _ONE_M = "[1m]"
+ _ALIASES = ("fable", "opus", "sonnet", "haiku")
+-_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
+ 
+ _ROLE_LABELS = {
+     "lead": "Lead",
+@@ -98,7 +104,6 @@ BALANCED: dict[str, Any] = {
+     },
+ }
+ SOLO = "solo"
+-OWN = "own"
+ HELPER_KEY = "ae_helper"
+ HELPER_NOTICE = (
+     "You are a helper session started by a lead session. Do the task you were given and "
+@@ -216,6 +221,7 @@ def resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, Any
+     """
+     roles = _resolve_roles(conv, store)
+     roles = _own_helpers(roles) if _legacy_solo(conv) else roles
++    roles = ae_reviewers.resolve_agents(roles, _agent_lookup(store))
+     return {**roles, "current": _current_ids()}
+ 
+ 
+@@ -256,6 +262,36 @@ def _resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, An
+     return {"preset": _summary(fallback), "custom": False}
+ 
+ 
++def _agent_lookup(store: ConversationStore) -> Callable[[str], str | None]:
++    """A function that finds a registered agent's live id by name (``None`` when unknown).
++
++    A built-in agent seeded before the id scheme keeps a random id, so a reviewer slot
++    stores the agent's name too. Reads the agent row the way ``list_conversations``
++    resolves ``agent_name``; a store without a database answers ``None``.
++    """
++
++    def lookup(name: str) -> str | None:
++        sql_store: Any = store
++        if not callable(getattr(sql_store, "_session", None)):
++            return None
++        from sqlalchemy import select
++
++        from omnigent.db.db_models import SqlAgent, current_workspace_id
++        from omnigent.db.enum_codecs import encode_agent_kind
++
++        with sql_store._session("ae_agent_by_name") as session:
++            row = session.execute(
++                select(SqlAgent.id).where(
++                    SqlAgent.workspace_id == current_workspace_id(),
++                    SqlAgent.name == name,
++                    SqlAgent.kind == encode_agent_kind("server"),
++                )
++            ).scalar_one_or_none()
++        return str(row) if row else None
++
++    return lookup
++
++
+ def _is_child(conv: Conversation) -> bool:
+     """True for a session with a parent or an ``ae.orch`` label holding a session id.
+ 
+@@ -368,8 +404,7 @@ def solo_opening(metadata: object) -> str:
+     return f'This session\'s preset ("{title}") keeps work in house'
+ 
+ 
+-def _text(value: object, limit: int) -> str:
+-    return _CONTROL.sub(" ", str(value or "")).strip()[:limit]
++_text = ae_text.text
+ 
+ 
+ def _comparable(model: str) -> str:
+@@ -504,7 +539,11 @@ def render_roles(roles: object) -> str | None:
+         for preset in presets[:LEAD_PICKS_SHOWN]:
+             setting = preset.get("roles") if isinstance(preset.get("roles"), dict) else {}
+             parts = [
+-                f"{role} {_model(setting.get(role), current)}"
++                ae_reviewers.reviewers_short(
++                    setting.get(role), preset.get("rules"), current, _model
++                )
++                if role == "reviewer"
++                else f"{role} {_model(setting.get(role), current)}"
+                 for role in ROLES
+                 if role != "lead"
+                 or not isinstance(setting.get(role), dict)
+@@ -518,6 +557,11 @@ def render_roles(roles: object) -> str | None:
+         more = roles.get("more")
+         if isinstance(more, int) and not isinstance(more, bool) and more > 0:
+             lines.append(f"({more} more presets are not shown.)")
++        if any(
++            isinstance(p.get("roles"), dict) and ae_reviewers.explained(p["roles"].get("reviewer"))
++            for p in presets[:LEAD_PICKS_SHOWN]
++        ):
++            lines.append(ae_reviewers.MANY_PICKS)
+         return "\n".join(lines)
+     preset = roles.get("preset")
+     if not isinstance(preset, dict):
+@@ -532,6 +576,11 @@ def render_roles(roles: object) -> str | None:
+     ]
+     lines.append(_lead_line(setting.get("lead"), roles.get("lead_session"), current))
+     for role in ROLES[1:]:
++        if role == "reviewer":
++            lines += ae_reviewers.reviewer_lines(
++                setting.get(role), preset.get("rules"), current, _model
++            )
++            continue
+         lines.append(f"- {_ROLE_LABELS[role]}: {_model(setting.get(role), current)}.")
+     lines.append(_rules(preset.get("rules")))
+     return "\n".join(lines)
+diff --git a/omnigent/inner/ae_text.py b/omnigent/inner/ae_text.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..74385df7fa99f88755a2e7b2cc8d40ac6ae9bfb9
+--- /dev/null
++++ b/omnigent/inner/ae_text.py
+@@ -0,0 +1,20 @@
++"""Text cleaning and one constant shared by the lead-notice modules.
++
++Added 2026-10-24 by omnigent-ae so ``ae_roles`` and ``ae_reviewers`` (which
++``ae_roles`` imports) use one sanitizer without importing each other.
++"""
++
++from __future__ import annotations
++
++import re
++
++# Control characters, C1 controls and the Unicode line and paragraph separators,
++# written as escapes so no invisible character sits in this file.
++CONTROL = re.compile("[\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029]+")
++# The Helpers rule value that keeps work with the lead's own subagents.
++OWN = "own"
++
++
++def text(value: object, limit: int) -> str:
++    """*value* as one clean line of at most *limit* characters."""
++    return CONTROL.sub(" ", str(value or "")).strip()[:limit]
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 153b74ab877b24dfeab6f7718806625bf5474c19..93d4c49e9451dea9857fd789bc5bbe968d646259 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import copy
+ import json
++from pathlib import Path
+ from typing import Any
+ from unittest.mock import Mock
+ 
+@@ -488,3 +489,276 @@ def test_an_older_model_version_keeps_its_full_id() -> None:
+     # Without the current ids a fixed id is shown as is.
+     bare = render_roles({"preset": preset, "custom": False}) or ""
+     assert "claude-sonnet-5-5[1m], medium" in bare
++
++
++# ── several reviewers ─────────────────────────────────────────────────────
++
++CODEX = {"mode": "agent", "agent": "ag_codex", "name": "Codex", "model": None, "effort": "medium"}
++SONNET_MEDIUM = {"mode": "fixed", "model": "claude-sonnet-5-5", "effort": "medium"}
++
++
++def _with_reviewers(*slots: dict[str, Any], **rules: Any) -> dict[str, Any]:
++    preset = copy.deepcopy(BALANCED)
++    preset["roles"]["reviewer"] = {"mode": "multi", "reviewers": list(slots)}
++    preset["rules"] = {**preset["rules"], **rules}
++    return preset
++
++
++def test_two_reviewers_render_as_drawn() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM, CODEX)
++    lines = (render_roles({"preset": preset, "custom": False, "current": CURRENT}) or "").split(
++        "\n"
++    )
++    assert len(lines) == 9
++    assert lines[3] == (
++        "- Reviewers (final review of a build): 1. sonnet, medium (native subagent). "
++        "2. Codex agent (a fresh child session each review: sys_session_create with "
++        "agent_id ag_codex, reasoning_effort medium; its default model)."
++    )
++    assert lines[4].startswith(
++        "  These reviewers replace the /dual-review offer; run them when the work is done, "
++        "without asking. Give every reviewer the same diff and brief, run them at once, never "
++        "show one reviewer's findings to another."
++    )
++    assert lines[4].endswith("rank by severity, keep each reviewer's list under it.")
++    assert lines[5] == (
++        "  Fix checks and verifying one finding: reviewer 1 only. A reviewer that cannot "
++        "start: skip it, review with the rest and say so."
++    )
++    assert lines[6].startswith("- Builder")
++
++
++def test_three_reviewers_with_the_other_rules_stay_under_twelve_lines() -> None:
++    gemini = {
++        "mode": "agent",
++        "agent": "ag_gem",
++        "name": "Gemini CLI",
++        "model": "g-2",
++        "effort": None,
++    }
++    preset = _with_reviewers(
++        {"mode": "auto"}, CODEX, gemini, review_merge="separate", reviewer_unavailable="ask"
++    )
++    text = render_roles({"preset": preset, "custom": True, "current": CURRENT}) or ""
++    lines = text.split("\n")
++    assert len(lines) < 12
++    assert "1. your pick (native subagent). 2. Codex agent" in lines[3]
++    assert (
++        "3. Gemini CLI agent (a fresh child session each review: sys_session_create with "
++        "agent_id ag_gem, model g-2; its default effort)." in lines[3]
++    )
++    assert lines[4].endswith("show each reviewer's list first.")
++    assert lines[5].endswith("A reviewer that cannot start: ask the user before reviewing.")
++
++
++def test_a_fourth_reviewer_is_never_shown() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM, CODEX, CODEX, {**CODEX, "name": "Fourth"})
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert "Fourth" not in text
++    assert "3. Codex agent" in text
++
++
++def test_one_reviewer_in_the_list_keeps_the_old_line() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM)
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert "- Reviewer (reviews, verifying a finding, fix checks): sonnet, medium." in text
++    assert "dual-review" not in text
++
++
++def test_a_single_agent_reviewer_gets_one_line() -> None:
++    preset = _with_reviewers(CODEX)
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert (
++        "- Reviewer (reviews, verifying a finding, fix checks): Codex agent (a fresh child "
++        "session each review: sys_session_create with agent_id ag_codex, reasoning_effort "
++        "medium; its default model); a review never goes to an existing child session." in text
++    )
++    assert "dual-review" not in text
++
++
++def test_own_helpers_skip_agent_reviewers() -> None:
++    gemini = {**CODEX, "agent": "ag_gem", "name": "Gemini CLI"}
++    preset = _with_reviewers(SONNET_MEDIUM, CODEX, helpers="own")
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert (
++        "- Reviewer (reviews, verifying a finding, fix checks): sonnet, medium (Codex skipped: "
++        "this preset keeps work with your own subagents)." in text
++    )
++    assert "sys_session_create" not in text
++    preset = _with_reviewers(
++        SONNET_MEDIUM, {**SONNET_MEDIUM, "model": "claude-opus-5-5"}, gemini, helpers="own"
++    )
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert "1. sonnet, medium (native subagent). 2. opus, medium (native subagent)." in text
++    assert text.count("Gemini CLI skipped: this preset keeps work with your own subagents.") == 1
++    assert "sys_session_create" not in text
++
++
++def test_lead_picks_summarize_reviewers(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [
++        BALANCED,
++        _with_reviewers(SONNET_MEDIUM, CODEX) | {"id": "two", "title": "Two"},
++    ]
++    roles = resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    text = render_roles(roles) or ""
++    lines = text.split("\n")
++    assert "reviewer sonnet, medium;" in lines[1]
++    assert (
++        "reviewers sonnet, medium + Codex (fresh child session: sys_session_create "
++        "agent_id ag_codex, reasoning_effort medium);" in lines[2]
++    )
++    assert lines[-1].startswith("Reviewers named with an agent or with several: run all")
++    assert len(lines) < 12
++
++
++def test_lead_picks_without_several_reviewers_has_no_extra_line(prefs: dict[str, Any]) -> None:
++    roles = resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    assert "Reviewers named with" not in (render_roles(roles) or "")
++
++
++def test_eight_lead_picks_with_several_reviewers_stay_under_twelve_lines(
++    prefs: dict[str, Any],
++) -> None:
++    many = _with_reviewers(SONNET_MEDIUM, CODEX, CODEX)
++    prefs["presets"] = [many | {"id": f"p{i}", "title": f"P{i}"} for i in range(10)]
++    roles = resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    lines = (render_roles(roles) or "").split("\n")
++    assert len(lines) == 11
++    assert lines[-2] == "(2 more presets are not shown.)"
++
++
++def test_junk_reviewer_values_render_safely() -> None:
++    for junk in (
++        {"mode": "multi"},
++        {"mode": "multi", "reviewers": "x"},
++        {"mode": "multi", "reviewers": [3, {"mode": "agent"}]},
++    ):
++        preset = copy.deepcopy(BALANCED)
++        preset["roles"]["reviewer"] = junk
++        text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++        assert "- Reviewer (reviews, verifying a finding, fix checks): your pick." in text
++
++
++def test_real_balanced_starter_carries_codex(monkeypatch: pytest.MonkeyPatch) -> None:
++    role_prefs = pytest.importorskip("ae_omni_policies.role_prefs")
++    starter = next(p for p in role_prefs.starters() if p["id"] == "balanced")
++    text = render_roles({"preset": starter, "custom": False, "current": CURRENT}) or ""
++    assert f"agent_id {role_prefs.CODEX_AGENT_ID}" in text
++    assert len(text.split("\n")) == 9
++
++
++def test_the_notice_never_sends_a_review_to_an_existing_session() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM, CODEX)
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert (
++        "Never hand a review to an existing child session, including one added to this chat: "
++        "this overrides reusing sessions or handing work to the team, for reviews only." in text
++    )
++
++
++def test_a_slot_without_effort_leaves_reasoning_effort_out() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM, {**CODEX, "effort": None})
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert "sys_session_create with agent_id ag_codex; its default model and effort" in text
++    assert "reasoning_effort" not in text
++
++
++def test_lead_picks_carry_what_a_pick_needs_to_run(prefs: dict[str, Any]) -> None:
++    gemini = {"mode": "agent", "agent": "ag_gem", "name": "Gemini CLI", "model": "g-2"}
++    prefs["presets"] = [
++        _with_reviewers(
++            SONNET_MEDIUM,
++            CODEX,
++            gemini,
++            review_merge="separate",
++            reviewer_unavailable="ask",
++        )
++        | {"id": "three", "title": "Three"},
++        _with_reviewers(SONNET_MEDIUM, CODEX, helpers="own") | {"id": "own", "title": "Own"},
++        _with_reviewers(CODEX) | {"id": "one", "title": "One"},
++    ]
++    roles = resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    lines = (render_roles(roles) or "").split("\n")
++    assert (
++        "reviewers sonnet, medium + Codex (fresh child session: sys_session_create agent_id "
++        "ag_codex, reasoning_effort medium) + Gemini CLI (fresh child session: "
++        "sys_session_create agent_id ag_gem, model g-2); show each reviewer's list first; "
++        "ask first if one cannot start;" in lines[1]
++    )
++    assert "reviewer sonnet, medium; Codex skipped: this preset keeps work" in lines[2]
++    assert "sys_session_create" not in lines[2]
++    assert "reviewer Codex (fresh child session: sys_session_create agent_id ag_codex," in lines[3]
++    assert "never an existing one" in lines[-1]
++
++
++def test_eight_picks_with_agents_and_rules_still_fit(prefs: dict[str, Any]) -> None:
++    many = _with_reviewers(
++        SONNET_MEDIUM, CODEX, CODEX, review_merge="separate", reviewer_unavailable="ask"
++    )
++    prefs["presets"] = [many | {"id": f"p{i}", "title": f"P{i}"} for i in range(10)]
++    roles = resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    assert len((render_roles(roles) or "").split("\n")) == 11
++
++
++def _named_codex() -> dict[str, Any]:
++    return {**CODEX, "agent": "random-seeded-id", "agent_name": "codex-native-ui"}
++
++
++def test_an_agent_slot_resolves_its_live_id_by_name(
++    prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    prefs["presets"] = [
++        _with_reviewers(SONNET_MEDIUM, _named_codex()) | {"id": "balanced"},
++        _with_reviewers(_named_codex()) | {"id": "two", "title": "Two"},
++    ]
++    asked: list[str] = []
++
++    def lookup(name: str) -> str | None:
++        asked.append(name)
++        return "live_codex_id" if name == "codex-native-ui" else None
++
++    monkeypatch.setattr(ae_roles, "_agent_lookup", lambda store: lookup)
++    text = render_roles(resolve_roles(conversation(), owner_store())) or ""
++    assert "agent_id live_codex_id" in text
++    assert "random-seeded-id" not in text
++    assert asked == ["codex-native-ui"]
++    picks = render_roles(
++        resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    )
++    assert picks is not None
++    assert picks.count("agent_id live_codex_id") == 2
++
++
++def test_an_unknown_or_failing_name_keeps_the_stored_id(
++    prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    prefs["presets"] = [_with_reviewers(SONNET_MEDIUM, _named_codex()) | {"id": "balanced"}]
++    monkeypatch.setattr(ae_roles, "_agent_lookup", lambda store: lambda name: None)
++    assert "agent_id random-seeded-id" in (
++        render_roles(resolve_roles(conversation(), owner_store())) or ""
++    )
++
++    def broken(name: str) -> str | None:
++        raise RuntimeError("db down")
++
++    monkeypatch.setattr(ae_roles, "_agent_lookup", lambda store: broken)
++    assert "agent_id random-seeded-id" in (
++        render_roles(resolve_roles(conversation(), owner_store())) or ""
++    )
++    # A mock store has no agent table: the stored id stays.
++    monkeypatch.undo()
++    monkeypatch.setattr(ae_roles, "_load_prefs", lambda user: ("balanced", prefs["presets"]))
++    assert "agent_id random-seeded-id" in (
++        render_roles(resolve_roles(conversation(), owner_store())) or ""
++    )
++
++
++def test_the_shared_sanitizer_strips_line_separators() -> None:
++    from omnigent.inner import ae_reviewers, ae_text
++
++    assert ae_text.text("a\u2028b\x00c\x85d", 20) == "a b c d"
++    assert ae_text.text(None, 5) == ""
++    assert ae_roles.OWN is ae_reviewers.OWN is ae_text.OWN
++    source = Path(ae_text.__file__).read_text(encoding="utf-8")
++    assert not any(ord(ch) in (0x2028, 0x2029) for ch in source)
++    assert "\\u2028" in source
+diff --git a/web/src/components/AeSessionPresetRow.tsx b/web/src/components/AeSessionPresetRow.tsx
+index 7634062c1b0a782b2747fb302eb50ce2ad8ac5ed..23c6742183323b138bdc089f48777fbe6d36ad3b 100644
+--- a/web/src/components/AeSessionPresetRow.tsx
++++ b/web/src/components/AeSessionPresetRow.tsx
+@@ -29,6 +29,7 @@ import {
+   aePresetId,
+   aeRoleSummary,
+   aeSameRoles,
++  structuredCopy,
+ } from "@/lib/aeRoles";
+ import {
+   type AeSessionRoles,
+@@ -39,6 +40,9 @@ import {
+ import { cn } from "@/lib/utils";
+ import { AeRolePresetTile, AeSegmented } from "@/pages/settings/AeRolesControls";
+ import { AeRoleRow } from "@/pages/settings/AeRolesEditor";
++import { AeReviewerRowsView, AeReviewSettings } from "@/pages/settings/AeReviewerRows";
++import type { AeReviewerAgents } from "@/hooks/useAeReviewerAgents";
++import { aeReviewsCard } from "@/lib/aeReviewers";
+ 
+ const chipClass = (on: boolean) =>
+   cn(
+@@ -50,10 +54,13 @@ export function AeSessionPresetRow({
+   value,
+   onChange,
+   disabled = false,
++  reviewerAgents,
+ }: {
+   value: AeSessionRoles | null;
+   onChange: (roles: AeSessionRoles | null) => void;
+   disabled?: boolean;
++  /** The agents and host the dialog already loaded, for reviewer slots and the Reviews card. */
++  reviewerAgents: AeReviewerAgents;
+ }) {
+   const { data: state } = useAeRoles();
+   const save = useAeRolesSave();
+@@ -88,6 +95,7 @@ export function AeSessionPresetRow({
+     if (shown) setRoles(shown.roles, { ...shown.rules, helpers });
+   };
+   const helpers = shown ? aeHelpersOf(shown.rules) : null;
++  const reviews = shown ? aeReviewsCard(shown, base, reviewerAgents) : null;
+   const helpersChanged = !!shown && !!base && helpers !== aeHelpersOf(base.rules);
+   const saveAsPreset = async (title: string) => {
+     if (!shown || !base || saving) return;
+@@ -107,7 +115,7 @@ export function AeSessionPresetRow({
+       description: "",
+       when_to_use: "",
+       pinned: false,
+-      roles: { ...shown.roles },
++      roles: structuredCopy(shown).roles,
+       rules: { ...shown.rules },
+     };
+     setSaving(true);
+@@ -222,18 +230,70 @@ export function AeSessionPresetRow({
+           )}
+         </div>
+       )}
++      {shown && reviews && (
++        <div
++          data-testid="ae-session-reviews"
++          className={cn(
++            "flex items-center justify-between gap-2 rounded-lg p-2",
++            reviews.warning ? "border border-amber-500/40 bg-amber-500/10" : "bg-muted/50",
++          )}
++        >
++          <div className="min-w-0 text-xs">
++            <p className="font-medium">{reviews.title}</p>
++            <p
++              className={
++                reviews.warning ? "text-amber-600 dark:text-amber-400" : "text-muted-foreground"
++              }
++            >
++              {reviews.text}
++            </p>
++          </div>
++          {!customizing && (
++            <button
++              type="button"
++              disabled={disabled}
++              onClick={() => setCustomizing(true)}
++              className="shrink-0 text-xs text-muted-foreground hover:text-foreground disabled:opacity-40"
++            >
++              Change
++            </button>
++          )}
++        </div>
++      )}
+       {customizing && shown && (
+-        <div role="group" aria-label="Roles for this session" className="border-t pt-1">
+-          {AE_ROLE_IDS.map((role) => (
+-            <AeRoleRow
+-              key={role}
+-              role={role}
+-              setting={shown.roles[role]}
+-              models={models}
+-              disabled={disabled || saving}
+-              onChange={(setting) => setRoles({ ...shown.roles, [role]: setting })}
+-            />
+-          ))}
++        <div
++          role="group"
++          aria-label="Roles for this session"
++          className="@container/roles border-t pt-1"
++        >
++          {AE_ROLE_IDS.map((role) =>
++            role === "reviewer" ? (
++              <AeReviewerRowsView
++                key={role}
++                setting={shown.roles.reviewer}
++                models={models}
++                agents={reviewerAgents}
++                disabled={disabled || saving}
++                onChange={(reviewer) => setRoles({ ...shown.roles, reviewer })}
++              />
++            ) : (
++              <AeRoleRow
++                key={role}
++                role={role}
++                setting={shown.roles[role]}
++                models={models}
++                disabled={disabled || saving}
++                onChange={(setting) => setRoles({ ...shown.roles, [role]: setting })}
++              />
++            ),
++          )}
++          <AeReviewSettings
++            reviewer={shown.roles.reviewer}
++            rules={shown.rules}
++            onChange={(rules) => setRoles(shown.roles, { ...shown.rules, ...rules })}
++            disabled={disabled || saving}
++            title="Reviews in this chat"
++          />
+           <p className="pt-1 text-xs text-muted-foreground">For this session only.</p>
+         </div>
+       )}
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+index 3129b19760f4d05ce38a1e57e79e9fbc84ebe991..ce22e3aac56cbdf0ae3e644afd4c672634f522ae 100644
+--- a/web/src/components/AeTeamControl.test.tsx
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -538,6 +538,45 @@ describe("roles preset per session", () => {
+     mocks.roles.mockReturnValue({ data: ROLES });
+   });
+ 
++  it("pins the reviewer agents a preset names and finds one by its registered name", () => {
++    // Stored under an id this install does not have; the live Codex row has another id.
++    const reviewerSlot = {
++      mode: "agent" as const,
++      agent: "seeded-elsewhere",
++      agent_name: codex.name,
++      name: "Codex",
++      model: null,
++      effort: null,
++    };
++    const withReviewers = {
++      ...preset("balanced", "Balanced"),
++      roles: {
++        ...preset("balanced", "Balanced").roles,
++        reviewer: {
++          mode: "multi" as const,
++          reviewers: [
++            { mode: "fixed" as const, model: "test-model", effort: "medium" as const },
++            reviewerSlot,
++          ],
++        },
++      },
++    };
++    mocks.roles.mockReturnValue({
++      data: { ...ROLES, presets: [withReviewers, ROLES.presets[0], ROLES.presets[2]] },
++    });
++    mount();
++    openPicker();
++    const last = mocks.agents.mock.calls.at(-1)?.[0] as { pinnedAgentIds: string[] };
++    expect(last.pinnedAgentIds).toContain("seeded-elsewhere");
++    expect(screen.queryByTestId("ae-reviewer-tag-2")).not.toBeInTheDocument();
++    expect(
++      screen.getByText(
++        "Already Reviewer 2 in this preset. A review always starts a fresh session, never this one.",
++      ),
++    ).toBeInTheDocument();
++    expect(screen.queryByText(/Add it here only/)).not.toBeInTheDocument();
++  });
++
+   it("saves the chosen preset into the label and writes nothing for the default", async () => {
+     mount();
+     openPicker();
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+index 0898ba6ca69612c40fb0c27c14599360d6bc4852..137773e9ea830f0c36efb414018a2851f68baa41 100644
+--- a/web/src/components/AeTeamControl.tsx
++++ b/web/src/components/AeTeamControl.tsx
+@@ -1,4 +1,4 @@
+-import { useId, useState } from "react";
++import { useId, useMemo, useState } from "react";
+ import { ChevronDown, UsersRound } from "lucide-react";
+ import { useQueryClient } from "@tanstack/react-query";
+ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+@@ -38,6 +38,12 @@ import {
+   aeSessionsLockedHint,
+ } from "@/lib/aeTeamPresets";
+ import { aeAnnouncePresetLead, aeSwitchPresetLead } from "@/lib/aeLeadModelChat";
++import {
++  aeReviewerAgents,
++  aeReviewerMemberNote,
++  aeReviewerNumberOf,
++  aeReviewerNumbers,
++} from "@/lib/aeReviewers";
+ import { AeSessionPresetRow } from "./AeSessionPresetRow";
+ import { AeSessionPresetPill } from "./composer/AeSessionPresetPill";
+ import { Button } from "./ui/button";
+@@ -56,12 +62,14 @@ function MemberChoice({
+   member,
+   disabled,
+   onChange,
++  reviewerNote = null,
+ }: {
+   option: AeTeamOption;
+   host: Host | null;
+   member: AeTeamMember | undefined;
+   disabled: boolean;
+   onChange: (member: AeTeamMember | null) => void;
++  reviewerNote?: string | null;
+ }) {
+   const { agent, name, readiness, recommendation } = option;
+   const descriptionId = useId();
+@@ -95,7 +103,8 @@ function MemberChoice({
+         <span className="min-w-0 flex-1 break-words text-sm font-medium">{name}</span>
+       </label>
+       <div id={descriptionId} className="ml-7 space-y-1 text-xs text-muted-foreground">
+-        {recommendation && <p className="mt-1 text-primary">{recommendation}</p>}
++        {reviewerNote && <p className="mt-1 text-primary">{reviewerNote}</p>}
++        {recommendation && !reviewerNote && <p className="mt-1 text-primary">{recommendation}</p>}
+         {agent.description && <p className="mt-1 line-clamp-2 break-words">{agent.description}</p>}
+         {readiness.explanation && (
+           <p className="mt-1">
+@@ -147,24 +156,30 @@ export function AeTeamEditor({
+   agents,
+   host,
+   lead,
++  options: givenOptions,
+   disabled: disabledProp = false,
+   lockedHint = null,
++  reviewerNumbers,
+ }: {
+   draft: AeTeam;
+   onChange: (draft: AeTeam) => void;
+   agents: AvailableAgent[];
+   host: Host | null;
+   lead?: AeTeamLead;
++  /** The options for `agents`, when the caller already computed them for its own lists. */
++  options?: AeTeamOption[];
+   disabled?: boolean;
+   /** Set when the preset keeps work in house: the list greys out with this line. */
+   lockedHint?: string | null;
++  /** Agent id to its reviewer number in the chosen preset, for the "Already Reviewer n" note. */
++  reviewerNumbers?: ReadonlyMap<string, number>;
+ }) {
+   const disabled = disabledProp || !!lockedHint;
+   const [showSetup, setShowSetup] = useState(false);
+   const [showOther, setShowOther] = useState(false);
+   const setupId = useId();
+   const otherId = useId();
+-  const options = aeTeamOptions(agents, host, lead);
++  const options = givenOptions ?? aeTeamOptions(agents, host, lead);
+   const visible = options.filter(
+     ({ agent, readiness, primary }) =>
+       (readiness.selectable && primary) || draft.members.some((m) => m.agentId === agent.id),
+@@ -183,6 +198,7 @@ export function AeTeamEditor({
+         option={option}
+         host={host}
+         member={member}
++        reviewerNote={aeReviewerMemberNote(aeReviewerNumberOf(reviewerNumbers, option.agent))}
+         disabled={disabled || (!member && draft.members.length >= AE_TEAM_LIMIT)}
+         onChange={(next) =>
+           onChange({
+@@ -379,17 +395,29 @@ export function AeTeamControl({
+   const [saving, setSaving] = useState(false);
+   const [error, setError] = useState<string | null>(null);
+   const saved = readAeTeam(session.labels);
++  const choice = rolesState ? aeResolveSessionPreset(draft.roles ?? null, rolesState) : null;
+   const {
+     data: agents = [],
+     isLoading,
+     isError,
+   } = useAvailableAgents({
+     enabled: open,
+-    pinnedAgentIds: [session.agentId, ...saved.members.map((member) => member.agentId)],
++    pinnedAgentIds: [
++      session.agentId,
++      ...saved.members.map((member) => member.agentId),
++      // The agents the shown preset's reviewers name, so none reads "Not found" when deduped.
++      ...(choice?.kind === "preset"
++        ? aeReviewerAgents(choice.preset.roles.reviewer).map((r) => r.slot.agent)
++        : []),
++    ],
++  });
++  const { data: hosts = [], isSuccess: hostsLoaded } = useHosts({
++    enabled: open,
++    includeSandbox: true,
+   });
+-  const { data: hosts = [] } = useHosts({ enabled: open, includeSandbox: true });
+   const host = hosts.find((h) => h.host_id === session.hostId) ?? null;
+-  const choice = rolesState ? aeResolveSessionPreset(draft.roles ?? null, rolesState) : null;
++  // One options list for the reviewer rows and the sessions list below.
++  const options = useMemo(() => aeTeamOptions(agents, host, session), [agents, host, session]);
+   // A label still saved as Solo stays locked until the user picks something else here.
+   const locked = aeSessionsLocked(choice, aeIsLegacySolo(session.labels) && !rolesTouched);
+   // Sessions kept while the preset keeps work in house are not checked for readiness.
+@@ -504,6 +532,11 @@ export function AeTeamControl({
+             </Button>
+           </div>
+           <AeSessionPresetRow
++            reviewerAgents={{
++              options,
++              host,
++              loaded: !isLoading && !isError && hostsLoaded,
++            }}
+             value={draft.roles ?? null}
+             onChange={(roles) => {
+               setRolesTouched(true);
+@@ -522,10 +555,12 @@ export function AeTeamControl({
+             draft={draft}
+             onChange={setDraft}
+             agents={agents}
++            options={options}
+             host={host}
+             lead={session}
+             disabled={saving || disabled}
+             lockedHint={locked ? aeSessionsLockedHint(choice) : null}
++            reviewerNumbers={aeReviewerNumbers(choice)}
+           />
+           <p className="text-xs text-muted-foreground">
+             Applies to your next message. Work already running can finish.
+diff --git a/web/src/components/composer/AePresetSessionsSection.tsx b/web/src/components/composer/AePresetSessionsSection.tsx
+index 8b66a7efb3849ab4ec4e685261490974b167cd28..f8cda7c83e7b045ca051548c6dedf0556159ecfd 100644
+--- a/web/src/components/composer/AePresetSessionsSection.tsx
++++ b/web/src/components/composer/AePresetSessionsSection.tsx
+@@ -11,6 +11,7 @@ import { useHosts } from "@/hooks/useHosts";
+ import { useSession } from "@/hooks/useSession";
+ import { AE_TEAM_LIMIT, type AeTeamMember } from "@/lib/aeTeam";
+ import { AE_WORKING_HINT } from "@/lib/aeTeamPresets";
++import { aeReviewerMemberTag, aeReviewerNumberOf } from "@/lib/aeReviewers";
+ import { aeTeamOptions } from "@/lib/aeTeamOptions";
+ import { cn } from "@/lib/utils";
+ 
+@@ -72,6 +73,7 @@ export function AePresetSessionsSection({
+   pending = false,
+   onToggle,
+   onNewSession,
++  reviewerNumbers,
+ }: {
+   sessionId: string;
+   members: AeTeamMember[];
+@@ -86,6 +88,8 @@ export function AePresetSessionsSection({
+   pending?: boolean;
+   onToggle: (member: AeTeamMember, on: boolean) => void;
+   onNewSession: () => void;
++  /** Agent id to its reviewer number in the chosen preset. */
++  reviewerNumbers?: ReadonlyMap<string, number>;
+ }) {
+   const { session } = useSession(sessionId);
+   const { data: agents = [] } = useAvailableAgents({
+@@ -134,7 +138,10 @@ export function AePresetSessionsSection({
+           <SessionRow
+             key={`offer-${option.agent.id}`}
+             title={option.name}
+-            detail={compact ? "New session" : "New session · agent default model"}
++            detail={
++              aeReviewerMemberTag(aeReviewerNumberOf(reviewerNumbers, option.agent)) ??
++              (compact ? "New session" : "New session · agent default model")
++            }
+             checked={false}
+             disabled={frozen || full}
+             onToggle={() =>
+diff --git a/web/src/components/composer/AeSessionPresetPill.tsx b/web/src/components/composer/AeSessionPresetPill.tsx
+index 3e127c0f636a1ca544c00cf3c24d3c714d2c4371..2bc4b572034846df1698a915e5aeac9e06406fc4 100644
+--- a/web/src/components/composer/AeSessionPresetPill.tsx
++++ b/web/src/components/composer/AeSessionPresetPill.tsx
+@@ -13,12 +13,18 @@ import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ import { useAePresetHotkey, useAeSessionPreset } from "@/hooks/useAeSessionPreset";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+-import { AE_PRESET_SHORTCUTS, AE_RESERVED_PRESET_ID, type AeRolePreset } from "@/lib/aeRoles";
++import {
++  AE_PRESET_SHORTCUTS,
++  AE_RESERVED_PRESET_ID,
++  type AeRolePreset,
++  aeRoleSummary,
++} from "@/lib/aeRoles";
+ import { aeChoiceId, aeReadRecentPresets } from "@/lib/aeSessionRoles";
+ import { useNavigate } from "@/lib/routing";
+ import { cn } from "@/lib/utils";
+ import { aeSessionsLockedHint } from "@/lib/aeTeamPresets";
+ import { AeRolePresetTile } from "@/pages/settings/AeRolesControls";
++import { aeReviewerNumbers } from "@/lib/aeReviewers";
+ import { AePresetSessionsSection } from "./AePresetSessionsSection";
+ 
+ function Row({
+@@ -41,6 +47,7 @@ function Row({
+       type="button"
+       role="menuitemradio"
+       aria-checked={active}
++      title={aeRoleSummary(preset.roles)}
+       onClick={onPick}
+       className={cn(
+         "flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-muted",
+@@ -297,6 +304,7 @@ export function AeSessionPresetPill({
+             pending={pending}
+             onToggle={(member, on) => void setMember(member, on)}
+             onNewSession={openTeam}
++            reviewerNumbers={aeReviewerNumbers(choice)}
+           />
+         )}
+       </div>
+diff --git a/web/src/hooks/useAeReviewerAgents.test.tsx b/web/src/hooks/useAeReviewerAgents.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..943d59438e4f2929a729a790caa5c1dc34d02728
+--- /dev/null
++++ b/web/src/hooks/useAeReviewerAgents.test.tsx
+@@ -0,0 +1,21 @@
++import { renderHook } from "@testing-library/react";
++import { describe, expect, it, vi } from "vitest";
++import { useAeReviewerAgents } from "./useAeReviewerAgents";
++
++const mocks = vi.hoisted(() => ({ agents: vi.fn(), hosts: vi.fn() }));
++vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: mocks.agents }));
++vi.mock("@/hooks/useHosts", () => ({ useHosts: mocks.hosts }));
++
++describe("useAeReviewerAgents", () => {
++  it("pins the agents the stored reviewers name, like the lead and members", () => {
++    mocks.agents.mockReturnValue({ data: [], isSuccess: true });
++    mocks.hosts.mockReturnValue({ data: [], isSuccess: true });
++    renderHook(() => useAeReviewerAgents(undefined, ["codex-id"]));
++    expect(mocks.agents).toHaveBeenLastCalledWith({
++      enabled: true,
++      pinnedAgentIds: ["codex-id"],
++    });
++    renderHook(() => useAeReviewerAgents());
++    expect(mocks.agents).toHaveBeenLastCalledWith({ enabled: true, pinnedAgentIds: undefined });
++  });
++});
+diff --git a/web/src/hooks/useAeReviewerAgents.ts b/web/src/hooks/useAeReviewerAgents.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e3ceb6dd94bc17286c8e617e22b649d8d02268b5
+--- /dev/null
++++ b/web/src/hooks/useAeReviewerAgents.ts
+@@ -0,0 +1,37 @@
++// The agents a reviewer slot can name (omnigent-ae, 2026-10-24): the same
++// list and readiness the "Who works on this?" sessions list uses, checked
++// against the given host, or in Settings the host the role models come from.
++
++import { useMemo } from "react";
++import { useAvailableAgents } from "@/hooks/useAvailableAgents";
++import { type Host, useHosts } from "@/hooks/useHosts";
++import { type AeTeamOption, aeTeamOptions } from "@/lib/aeTeamOptions";
++
++export interface AeReviewerAgents {
++  options: AeTeamOption[];
++  host: Host | null;
++  loaded: boolean;
++}
++
++/**
++ * `pinnedAgentIds` are the agents the stored reviewers name: pinned like the lead and
++ * members are, so a stored reviewer is never shown "Not found" because the list was deduped.
++ */
++export function useAeReviewerAgents(
++  hostOverride?: Host | null,
++  pinnedAgentIds?: string[],
++): AeReviewerAgents {
++  const agentsQuery = useAvailableAgents({ enabled: true, pinnedAgentIds });
++  const hostsQuery = useHosts();
++  const hosts = hostsQuery.data ?? [];
++  const online = hosts.filter((h) => h.status === "online");
++  const host =
++    hostOverride !== undefined
++      ? hostOverride
++      : (online.find((h) => h.configured_harnesses?.["claude-native"] === true) ??
++        online[0] ??
++        null);
++  const agents = agentsQuery.data;
++  const options = useMemo(() => aeTeamOptions(agents ?? [], host), [agents, host]);
++  return { options, host, loaded: agentsQuery.isSuccess === true && hostsQuery.isSuccess === true };
++}
+diff --git a/web/src/lib/aeReviewers.test.ts b/web/src/lib/aeReviewers.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..229f5d9366dc14bb5cd6c518fde76a7a7d0b7fe7
+--- /dev/null
++++ b/web/src/lib/aeReviewers.test.ts
+@@ -0,0 +1,235 @@
++import { describe, expect, it } from "vitest";
++import { aeParseRolesState, aeRoleSummary, type AeRoleTable } from "./aeRoles";
++import type { AeTeamOption } from "./aeTeamOptions";
++import {
++  AE_CODEX_AGENT_ID,
++  AE_CODEX_AGENT_NAME,
++  aeAgentEfforts,
++  aeParseReviewerMulti,
++  aeReviewerAgentOption,
++  aeReviewerAgentStatus,
++  aeReviewerNumberOf,
++  aeReviewerList,
++  aeReviewerMemberNote,
++  aeReviewerMemberTag,
++  aeReviewerNumbers,
++  aeReviewsCard,
++  aeReviewerSummary,
++  aeWriteReviewers,
++} from "./aeReviewers";
++
++const codex = {
++  mode: "agent" as const,
++  agent: AE_CODEX_AGENT_ID,
++  name: "Codex",
++  model: null,
++  effort: "medium" as const,
++};
++const named = { ...codex, agent: "random-seeded-id", agent_name: AE_CODEX_AGENT_NAME };
++// The agents list as the sessions picker builds it: Codex under an id that is not the built-in one.
++const liveCodex = {
++  agent: { id: "live-codex-id", name: AE_CODEX_AGENT_NAME, harness: "codex-native" },
++  name: "Codex",
++  readiness: { state: "available", reason: "ready", selectable: true },
++} as unknown as AeTeamOption;
++const sonnet = { mode: "fixed" as const, model: "claude-sonnet-5-5", effort: "medium" as const };
++
++const roles = (reviewer: unknown) => ({
++  lead: { mode: "session" },
++  planner: { mode: "fixed", model: "claude-opus-5-5", effort: "high" },
++  reviewer,
++  builder: sonnet,
++  helper: { mode: "fixed", model: "claude-haiku-5-5", effort: "low" },
++});
++const stateWith = (reviewer: unknown, rules: Record<string, unknown> = {}) =>
++  aeParseRolesState({
++    revision: 0,
++    default_preset: "p",
++    presets: [
++      {
++        id: "p",
++        title: "Balanced",
++        icon: "scale",
++        color: "teal",
++        roles: roles(reviewer),
++        rules: { raise_or_lower: "tell", lead_steps_down: true, auto_raises: 1, ...rules },
++      },
++    ],
++  });
++
++describe("aeReviewers", () => {
++  it("keeps reading the old single reviewer and writes it back unchanged", () => {
++    const state = stateWith(sonnet);
++    expect(state?.presets[0].roles.reviewer).toEqual(sonnet);
++    expect(aeWriteReviewers(aeReviewerList(sonnet))).toEqual(sonnet);
++    expect(aeWriteReviewers([{ mode: "auto" }])).toEqual({ mode: "auto" });
++  });
++
++  it("parses 1 to 3 reviewers, null model and effort, and the new rules", () => {
++    const state = stateWith(
++      { mode: "multi", reviewers: [sonnet, { ...codex, effort: null }] },
++      { review_merge: "separate", reviewer_unavailable: "ask" },
++    );
++    const preset = state?.presets[0];
++    expect(preset?.roles.reviewer).toEqual({
++      mode: "multi",
++      reviewers: [sonnet, { ...codex, agent_name: null, effort: null }],
++    });
++    expect(preset?.rules.review_merge).toBe("separate");
++    expect(preset?.rules.reviewer_unavailable).toBe("ask");
++  });
++
++  it("rejects 0 or 4 reviewers, Auto past slot 1 and a bad agent slot", () => {
++    expect(aeParseReviewerMulti({ mode: "multi", reviewers: [] })).toBeNull();
++    expect(
++      aeParseReviewerMulti({ mode: "multi", reviewers: [sonnet, sonnet, sonnet, sonnet] }),
++    ).toBeNull();
++    expect(
++      aeParseReviewerMulti({ mode: "multi", reviewers: [sonnet, { mode: "auto" }] }),
++    ).toBeNull();
++    expect(
++      aeParseReviewerMulti({ mode: "multi", reviewers: [{ ...codex, agent: "" }] }),
++    ).toBeNull();
++    expect(
++      aeParseReviewerMulti({ mode: "multi", reviewers: [{ ...codex, name: "x".repeat(41) }] }),
++    ).toBeNull();
++    expect(stateWith({ mode: "multi", reviewers: [] })).toBeNull();
++  });
++
++  it("writes the multi shape for 2 or 3 reviewers or a lone agent, never a 4th", () => {
++    expect(aeWriteReviewers([sonnet, codex])).toEqual({
++      mode: "multi",
++      reviewers: [sonnet, codex],
++    });
++    expect(aeWriteReviewers([codex])).toEqual({ mode: "multi", reviewers: [codex] });
++    const four = aeWriteReviewers([sonnet, codex, sonnet, codex]);
++    expect(four.mode === "multi" && four.reviewers).toHaveLength(3);
++    expect(aeWriteReviewers([sonnet, { mode: "auto" }])).toEqual(sonnet);
++  });
++
++  it("summarizes reviewers compactly with the right row label", () => {
++    expect(aeReviewerSummary({ mode: "multi", reviewers: [sonnet, codex] })).toBe(
++      "Sonnet 5.5 medium + Codex",
++    );
++    const table = roles({ mode: "multi", reviewers: [sonnet, codex] }) as AeRoleTable;
++    expect(aeRoleSummary(table)).toContain("Reviewers Sonnet 5.5 medium + Codex");
++    expect(aeRoleSummary(roles(sonnet) as AeRoleTable)).toContain("Reviewer Sonnet 5.5 medium");
++  });
++
++  it("builds the Reviews card, amber when the agent cannot run", () => {
++    const shown = { roles: { reviewer: aeWriteReviewers([sonnet, codex]) }, rules: {} };
++    const base = { title: "Balanced", rules: {} };
++    const ready = aeReviewsCard(shown, base, { options: [], host: null, loaded: false });
++    expect(ready).toEqual({
++      title: "Reviews: one merged verdict",
++      text: "From Balanced. Each reviewer works alone; Codex runs as its own session.",
++      warning: false,
++    });
++    const offline = aeReviewsCard(shown, base, {
++      options: [],
++      host: { status: "offline" },
++      loaded: true,
++    });
++    expect(offline?.warning).toBe(true);
++    expect(offline?.text).toBe(
++      "Codex is offline. If it is still offline at review time, Sonnet 5.5 reviews alone.",
++    );
++    expect(
++      aeReviewsCard({ roles: { reviewer: sonnet }, rules: {} }, base, {
++        options: [],
++        host: null,
++        loaded: true,
++      }),
++    ).toBeNull();
++  });
++
++  it("notes an added session that is already a reviewer", () => {
++    expect(aeReviewerMemberNote(2)).toBe(
++      "Already Reviewer 2 in this preset. A review always starts a fresh session, never this one.",
++    );
++    expect(aeReviewerMemberNote(undefined)).toBeNull();
++    expect(aeReviewerMemberTag(3)).toBe("Already Reviewer 3 in this preset");
++    const preset = { roles: { reviewer: aeWriteReviewers([sonnet, codex]) } };
++    expect(aeReviewerNumbers({ kind: "preset", preset })?.get(AE_CODEX_AGENT_ID)).toBe(2);
++    expect(aeReviewerNumbers({ kind: "lead-picks" })).toBeUndefined();
++  });
++
++  it("keeps the registered name on an agent slot and drops a bad one", () => {
++    const state = stateWith({ mode: "multi", reviewers: [named] });
++    expect(state?.presets[0].roles.reviewer).toEqual({ mode: "multi", reviewers: [named] });
++    expect(
++      aeParseReviewerMulti({ mode: "multi", reviewers: [{ ...named, agent_name: "no spaces" }] }),
++    ).toBeNull();
++  });
++
++  it("finds the live agent by registered name when the stored id is not listed", () => {
++    expect(aeReviewerAgentOption(named, [liveCodex])).toBe(liveCodex);
++    expect(aeReviewerAgentOption({ agent: "random-seeded-id" }, [liveCodex])).toBeNull();
++    const up = aeReviewerAgentStatus(named, [liveCodex], { status: "online" });
++    expect(up.status).toBe("ready");
++    expect(aeReviewerAgentStatus(codex, [liveCodex], { status: "online" }).status).toBe("missing");
++    const preset = { roles: { reviewer: aeWriteReviewers([sonnet, named]) } };
++    const numbers = aeReviewerNumbers({ kind: "preset", preset });
++    expect(aeReviewerNumberOf(numbers, liveCodex.agent)).toBe(2);
++    expect(aeReviewerNumberOf(numbers, { id: "x", name: "other" })).toBeUndefined();
++  });
++
++  it("offers only the efforts the agent's harness takes", () => {
++    expect(aeAgentEfforts("claude-native")).toEqual(["low", "medium", "high", "xhigh", "max"]);
++    expect(aeAgentEfforts("antigravity-native")).toEqual(["low", "medium", "high"]);
++    expect(aeAgentEfforts("gemini")).toEqual(["low", "medium", "high"]);
++    expect(aeAgentEfforts("codex-native", ["low", "high", "none"])).toEqual(["low", "high"]);
++    expect(aeAgentEfforts("codex-native", [])).toHaveLength(5);
++    expect(aeAgentEfforts(null)).toHaveLength(5);
++  });
++
++  it("shows skipped agents, amber and without an agent session, when Helpers is own", () => {
++    const shown = {
++      roles: { reviewer: aeWriteReviewers([sonnet, codex]) },
++      rules: { helpers: "own" as const },
++    };
++    const card = aeReviewsCard(
++      shown,
++      { title: "Solo", rules: {} },
++      {
++        options: [liveCodex],
++        host: { status: "online" },
++        loaded: true,
++      },
++    );
++    expect(card).toEqual({
++      title: "Reviews: Sonnet 5.5 only",
++      text: "Codex skipped: Helpers is set to own subagents only. Sonnet 5.5 reviews alone.",
++      warning: true,
++    });
++    expect(card?.text).not.toMatch(/session/);
++    const two = aeReviewsCard(
++      { ...shown, roles: { reviewer: aeWriteReviewers([sonnet, sonnet, codex]) } },
++      undefined,
++      { options: [], host: null, loaded: false },
++    );
++    expect(two?.title).toBe("Reviews: one merged verdict");
++    expect(two?.warning).toBe(true);
++    expect(two?.text).not.toMatch(/runs as its own session/);
++    const any = aeReviewsCard({ ...shown, rules: { helpers: "any" } }, undefined, {
++      options: [],
++      host: null,
++      loaded: false,
++    });
++    expect(any?.warning).toBe(false);
++  });
++
++  it("does not read or rewrite a session-mode reviewer as Auto", () => {
++    expect(stateWith({ mode: "session" })).toBeNull();
++    expect(stateWith({ mode: "multi", reviewers: [{ mode: "session" }] })).toBeNull();
++  });
++
++  it("adds no review rules to a preset that has none, so a re-save is the same", () => {
++    const state = stateWith({ mode: "multi", reviewers: [sonnet, codex] });
++    expect(state?.presets[0].rules).toEqual({
++      raise_or_lower: "tell",
++      lead_steps_down: true,
++      auto_raises: 1,
++    });
++  });
++});
+diff --git a/web/src/lib/aeReviewers.ts b/web/src/lib/aeReviewers.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..5290fe26bb937d3420ddbcd6f51b00ea15fbbc47
+--- /dev/null
++++ b/web/src/lib/aeReviewers.ts
+@@ -0,0 +1,358 @@
++// Reviewers per preset (omnigent-ae, 2026-10-24): the Reviewer role holds one
++// to three reviewers. Each slot is a Claude model and effort (a native
++// subagent), Auto (slot 1 only) or another agent run as a child session. The
++// server (ae_omni_policies role_prefs.py) stores one Claude reviewer as the
++// plain role setting and anything else as {"mode": "multi", "reviewers": [...]}.
++// This file parses, lists, writes back and summarizes that value.
++
++import type { Host } from "@/hooks/useHosts";
++import {
++  AE_ROLE_EFFORTS,
++  type AeRoleEffort,
++  type AeRoleSetting,
++  aeModelLabel,
++} from "@/lib/aeRoleBase";
++import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
++import type { AeTeamOption } from "@/lib/aeTeamOptions";
++
++export const AE_REVIEWERS_MAX = 3;
++export const AE_AGENT_NAME_MAX = 40;
++/** The built-in Codex agent's id: sha256("builtin:codex-native-ui"), first 32 hex. */
++export const AE_CODEX_AGENT_ID = "16a06503889b0c3034496821afd41b9e";
++/**
++ * Its registered name. An install seeded before the id scheme keeps a random id for
++ * this row, so a slot also stores the name and the live id is found by it.
++ */
++export const AE_CODEX_AGENT_NAME = "codex-native-ui";
++const AGENT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
++
++export interface AeReviewerAgentSlot {
++  mode: "agent";
++  agent: string;
++  /** The agent's registered name ("codex-native-ui"); the live id is found by it when set. */
++  agent_name?: string | null;
++  /** The agent's display name when it was picked (aeTeamAgentName). */
++  name: string;
++  /** Null: the agent's default model. */
++  model: string | null;
++  /** Null: the agent's default effort. */
++  effort: AeRoleEffort | null;
++}
++
++export type AeReviewerSlot =
++  { mode: "auto" } | { mode: "fixed"; model: string; effort: AeRoleEffort } | AeReviewerAgentSlot;
++
++export interface AeReviewerMulti {
++  mode: "multi";
++  reviewers: AeReviewerSlot[];
++}
++
++/** What `roles.reviewer` holds: the plain role setting (one reviewer) or the multi shape. */
++export type AeReviewerSetting = AeRoleSetting | AeReviewerMulti;
++
++export const AE_REVIEW_MERGES = ["merged", "separate"] as const;
++export type AeReviewMerge = (typeof AE_REVIEW_MERGES)[number];
++export const AE_REVIEWER_UNAVAILABLE = ["run_rest", "ask"] as const;
++export type AeReviewerUnavailable = (typeof AE_REVIEWER_UNAVAILABLE)[number];
++
++export const AE_REVIEW_MERGE_OPTIONS: { value: AeReviewMerge; label: string }[] = [
++  { value: "merged", label: "One merged verdict" },
++  { value: "separate", label: "Each list, then verdict" },
++];
++export const AE_REVIEWER_UNAVAILABLE_OPTIONS: { value: AeReviewerUnavailable; label: string }[] = [
++  { value: "run_rest", label: "Run the rest, tell me" },
++  { value: "ask", label: "Ask me" },
++];
++
++/** The merge rule of a preset or customization; absent reads as "merged". */
++export function aeReviewMergeOf(rules: { review_merge?: AeReviewMerge } | undefined) {
++  return rules?.review_merge === "separate" ? "separate" : "merged";
++}
++/** The unavailable-reviewer rule; absent reads as "run_rest". */
++export function aeReviewerUnavailableOf(
++  rules: { reviewer_unavailable?: AeReviewerUnavailable } | undefined,
++) {
++  return rules?.reviewer_unavailable === "ask" ? "ask" : "run_rest";
++}
++
++function isObject(value: unknown): value is Record<string, unknown> {
++  return !!value && typeof value === "object" && !Array.isArray(value);
++}
++
++function isEffort(value: unknown): value is AeRoleEffort {
++  return (AE_ROLE_EFFORTS as readonly unknown[]).includes(value);
++}
++
++function parseSlot(value: unknown, index: number): AeReviewerSlot | null {
++  if (!isObject(value)) return null;
++  if (value.mode === "auto") return index === 0 ? { mode: "auto" } : null;
++  if (value.mode === "fixed") {
++    if (typeof value.model !== "string" || !value.model || !isEffort(value.effort)) return null;
++    return { mode: "fixed", model: value.model, effort: value.effort };
++  }
++  if (value.mode === "agent") {
++    const { agent, name, model, effort, agent_name: agentName } = value;
++    if (typeof agent !== "string" || !agent) return null;
++    if (agentName != null && (typeof agentName !== "string" || !AGENT_NAME_PATTERN.test(agentName)))
++      return null;
++    if (typeof name !== "string" || !name || Array.from(name).length > AE_AGENT_NAME_MAX)
++      return null;
++    if (model != null && (typeof model !== "string" || !model)) return null;
++    if (effort != null && !isEffort(effort)) return null;
++    return {
++      mode: "agent",
++      agent,
++      agent_name: typeof agentName === "string" ? agentName : null,
++      name,
++      model: typeof model === "string" ? model : null,
++      effort: isEffort(effort) ? effort : null,
++    };
++  }
++  return null;
++}
++
++/** The multi shape, or null when `value` is not a well-formed one (1 to 3 slots). */
++export function aeParseReviewerMulti(value: unknown): AeReviewerMulti | null {
++  if (!isObject(value) || value.mode !== "multi" || !Array.isArray(value.reviewers)) return null;
++  const list = value.reviewers;
++  if (list.length < 1 || list.length > AE_REVIEWERS_MAX) return null;
++  const reviewers = list.map(parseSlot);
++  return reviewers.every((slot): slot is AeReviewerSlot => slot !== null)
++    ? { mode: "multi", reviewers }
++    : null;
++}
++
++/** The reviewers as a list of 1 to 3 slots. A plain "session" setting reads as Auto. */
++export function aeReviewerList(setting: AeReviewerSetting): AeReviewerSlot[] {
++  if (setting.mode === "multi") return setting.reviewers.slice(0, AE_REVIEWERS_MAX);
++  if (setting.mode === "session") return [{ mode: "auto" }];
++  return [setting];
++}
++
++/**
++ * The compact value to store: one Claude (or Auto) reviewer stays the plain
++ * role setting, so presets saved before multi reviewers keep their shape; two
++ * or three reviewers, or one agent reviewer, use the multi shape. Auto past
++ * slot 1 and slots past 3 are dropped.
++ */
++export function aeWriteReviewers(slots: readonly AeReviewerSlot[]): AeReviewerSetting {
++  const kept = slots
++    .filter((slot, i) => slot.mode !== "auto" || i === 0)
++    .slice(0, AE_REVIEWERS_MAX);
++  if (kept.length === 0) return { mode: "auto" };
++  if (kept.length === 1 && kept[0].mode !== "agent") return kept[0];
++  return { mode: "multi", reviewers: kept };
++}
++
++/** "Reviewer" with one slot, "Reviewers" with two or three. */
++export function aeReviewerRowLabel(setting: AeReviewerSetting): string {
++  return aeReviewerList(setting).length > 1 ? "Reviewers" : "Reviewer";
++}
++
++function slotSummary(slot: AeReviewerSlot): string {
++  if (slot.mode === "fixed") return `${aeModelLabel(slot.model)} ${slot.effort}`;
++  if (slot.mode === "agent") return slot.name;
++  return "auto";
++}
++
++/** "Sonnet 5.5 medium + Codex". */
++export function aeReviewerSummary(setting: AeReviewerSetting): string {
++  return aeReviewerList(setting).map(slotSummary).join(" + ");
++}
++
++/** The agent slots, each with its 1-based reviewer number. */
++export function aeReviewerAgents(
++  setting: AeReviewerSetting,
++): { slot: AeReviewerAgentSlot; number: number }[] {
++  return aeReviewerList(setting).flatMap((slot, i) =>
++    slot.mode === "agent" ? [{ slot, number: i + 1 }] : [],
++  );
++}
++
++/** Whether an agent reviewer can run on `host`: ready, offline, needs setup, or not listed. */
++export type AeReviewerAgentStatus = "ready" | "offline" | "setup" | "missing";
++
++export function aeReviewerAgentStatus(
++  slot: Pick<AeReviewerAgentSlot, "agent" | "agent_name">,
++  options: readonly AeTeamOption[],
++  host: Pick<Host, "status"> | null,
++): { status: AeReviewerAgentStatus; option: AeTeamOption | null } {
++  const option = aeReviewerAgentOption(slot, options);
++  if (!host || host.status !== "online") return { status: "offline", option };
++  if (!option) return { status: "missing", option };
++  if (option.readiness.selectable) return { status: "ready", option };
++  return { status: option.readiness.state === "setup-required" ? "setup" : "offline", option };
++}
++
++/** The registered name to store on a slot, or null when it is not one the server accepts. */
++export function aeAgentNameOf(name: string): string | null {
++  return AGENT_NAME_PATTERN.test(name) ? name : null;
++}
++
++/** The option a slot names: by id, else by registered name (an install seeded under another id). */
++export function aeReviewerAgentOption(
++  slot: Pick<AeReviewerAgentSlot, "agent" | "agent_name">,
++  options: readonly AeTeamOption[],
++): AeTeamOption | null {
++  return (
++    options.find((o) => o.agent.id === slot.agent) ??
++    (slot.agent_name ? options.find((o) => o.agent.name === slot.agent_name) : undefined) ??
++    null
++  );
++}
++
++/** Whether an agent (as the sessions list shows it) is the one a slot names. */
++export function aeReviewerSlotIs(
++  slot: Pick<AeReviewerAgentSlot, "agent" | "agent_name">,
++  agent: { id: string; name: string },
++): boolean {
++  return slot.agent === agent.id || (!!slot.agent_name && slot.agent_name === agent.name);
++}
++
++/**
++ * The efforts an agent slot can offer for its harness (the web twin of
++ * efforts_for_harness in omnigent/util/reasoning_effort.py, cut to the efforts a
++ * preset stores). `modelLevels` are the levels the chosen model lists, when the
++ * harness reports them per model (Codex and Devin).
++ */
++export function aeAgentEfforts(
++  harness: string | null | undefined,
++  modelLevels: readonly string[] = [],
++): AeRoleEffort[] {
++  const key = nativeCodingAgentForHarness(harness)?.key;
++  const name = (harness ?? "").toLowerCase();
++  let levels: readonly AeRoleEffort[] = AE_ROLE_EFFORTS;
++  if (key === "antigravity" || name.includes("gemini")) levels = ["low", "medium", "high"];
++  else if (name.includes("copilot")) levels = ["low", "medium", "high", "xhigh"];
++  if ((key === "codex" || key === "devin") && modelLevels.length > 0) {
++    const listed = levels.filter((e) => modelLevels.includes(e));
++    if (listed.length > 0) return listed;
++  }
++  return [...levels];
++}
++
++/** The settings route that sets up an agent's harness. */
++export function aeAgentSetupHref(harness: string | null | undefined): string {
++  return harness ? `/settings/harnesses/${encodeURIComponent(harness)}` : "/settings/harnesses";
++}
++
++interface ReviewRules {
++  helpers?: "any" | "own";
++  review_merge?: AeReviewMerge;
++  reviewer_unavailable?: AeReviewerUnavailable;
++}
++
++/**
++ * The "Reviews" card in "Who works on this?": null with fewer than two
++ * reviewers. Amber (warning) when an agent reviewer cannot run on the host
++ * now; while agents load, every agent counts as ready.
++ */
++export function aeReviewsCard(
++  shown: { roles: { reviewer: AeReviewerSetting }; rules: ReviewRules },
++  base: { title: string; rules: ReviewRules } | undefined,
++  agents: {
++    options: readonly AeTeamOption[];
++    host: Pick<Host, "status"> | null;
++    loaded: boolean;
++  },
++): { title: string; text: string; warning: boolean } | null {
++  const slots = aeReviewerList(shown.roles.reviewer);
++  if (slots.length < 2) return null;
++  const merge = aeReviewMergeOf(shown.rules);
++  const title =
++    merge === "merged" ? "Reviews: one merged verdict" : "Reviews: each list, then verdict";
++  // Own subagents only: an agent reviewer is a child session, so the lead skips it.
++  if (shown.rules.helpers === "own") {
++    const skipped = slots.flatMap((s) => (s.mode === "agent" ? [s.name] : []));
++    if (skipped.length > 0) {
++      const rest = slots.filter((s) => s.mode !== "agent").map(slotName);
++      const who = rest.length ? rest.join(" and ") : "The lead";
++      return {
++        title: rest.length > 1 ? title : `Reviews: ${rest.length ? who : "the lead"} only`,
++        text: `${skipped.join(" and ")} skipped: Helpers is set to own subagents only. ${who} ${
++          rest.length > 1 ? "review, each alone" : rest.length ? "reviews alone" : "reviews"
++        }.`,
++        warning: true,
++      };
++    }
++  }
++  const down = agents.loaded
++    ? slots.findIndex(
++        (s) =>
++          s.mode === "agent" &&
++          aeReviewerAgentStatus(s, agents.options, agents.host).status !== "ready",
++      )
++    : -1;
++  if (down >= 0) {
++    const agent = slots[down] as AeReviewerAgentSlot;
++    const status = aeReviewerAgentStatus(agent, agents.options, agents.host).status;
++    const what =
++      status === "setup" ? "needs setup" : status === "missing" ? "is not found" : "is offline";
++    const rest = slots.filter((_, i) => i !== down).map(slotName);
++    const fallback =
++      aeReviewerUnavailableOf(shown.rules) === "ask"
++        ? "the lead asks you before the review."
++        : `${rest.join(" and ")} ${rest.length > 1 ? "review" : "reviews"} alone.`;
++    const still = status === "offline" ? "still offline" : "still unavailable";
++    return {
++      title,
++      text: `${agent.name} ${what}. If it is ${still} at review time, ${fallback}`,
++      warning: true,
++    };
++  }
++  const changed = !!base && merge !== aeReviewMergeOf(base.rules);
++  const from = changed ? "Changed for this session." : base ? `From ${base.title}.` : "";
++  const named = slots.flatMap((s) => (s.mode === "agent" ? [s.name] : []));
++  const sessions =
++    named.length === 0
++      ? ""
++      : named.length === 1
++        ? ` ${named[0]} runs as its own session.`
++        : ` ${named.join(" and ")} run as their own sessions.`;
++  return {
++    title,
++    text: `${from} Each reviewer works alone;${sessions || " none sees another's findings."}`.trim(),
++    warning: false,
++  };
++}
++
++function slotName(slot: AeReviewerSlot): string {
++  if (slot.mode === "fixed") return aeModelLabel(slot.model);
++  if (slot.mode === "agent") return slot.name;
++  return "the lead's pick";
++}
++
++/** The note on an added-session row whose agent is already a reviewer in the preset. */
++export function aeReviewerMemberNote(number: number | undefined): string | null {
++  return number
++    ? `Already Reviewer ${number} in this preset. A review always starts a fresh session, never this one.`
++    : null;
++}
++
++/** The short form for the composer menu's session rows. */
++export function aeReviewerMemberTag(number: number | undefined): string | null {
++  return number ? `Already Reviewer ${number} in this preset` : null;
++}
++
++/** Agent id to reviewer number for a resolved session choice; undefined for Lead picks. */
++export function aeReviewerNumbers(
++  choice: { kind: string; preset?: { roles: { reviewer: AeReviewerSetting } } } | null,
++): ReadonlyMap<string, number> | undefined {
++  const preset = choice?.kind === "preset" ? choice.preset : undefined;
++  if (!preset) return undefined;
++  const numbers = new Map<string, number>();
++  for (const { slot, number } of aeReviewerAgents(preset.roles.reviewer)) {
++    numbers.set(slot.agent, number);
++    // Also by registered name, for an install whose agent id differs from the stored one.
++    if (slot.agent_name) numbers.set(`name:${slot.agent_name}`, number);
++  }
++  return numbers;
++}
++
++/** The reviewer number of a listed agent, by id first and then by registered name. */
++export function aeReviewerNumberOf(
++  numbers: ReadonlyMap<string, number> | undefined,
++  agent: { id: string; name: string },
++): number | undefined {
++  return numbers?.get(agent.id) ?? numbers?.get(`name:${agent.name}`);
++}
+diff --git a/web/src/lib/aeRoleBase.ts b/web/src/lib/aeRoleBase.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0439f15f21461b77e5b38710973a6ca1d1378afc
+--- /dev/null
++++ b/web/src/lib/aeRoleBase.ts
+@@ -0,0 +1,15 @@
++// The role setting shapes aeRoles.ts and aeReviewers.ts both build on
++// (omnigent-ae, 2026-10-24); aeRoles.ts re-exports them.
++
++import { aeClaudeVersionLabel } from "@/lib/aeClaudeModels";
++
++export const AE_ROLE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
++export type AeRoleEffort = (typeof AE_ROLE_EFFORTS)[number];
++
++export type AeRoleSetting =
++  { mode: "auto" } | { mode: "session" } | { mode: "fixed"; model: string; effort: AeRoleEffort };
++
++/** "claude-opus-5-5" -> "Opus 5.5"; an id it cannot read stays as is. */
++export function aeModelLabel(model: string): string {
++  return aeClaudeVersionLabel(model) ?? model;
++}
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index a82256419194d511e1641181f19184dda3c0e5d4..39c4ea33c4cda84a427414da29eeeabec71edd27 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -5,14 +5,31 @@
+ // shapes, the parser for the server's answer and the pure edits Settings >
+ // Roles makes before it saves the whole list.
+ 
+-import { aeClaudeVersion, aeClaudeVersionLabel } from "@/lib/aeClaudeModels";
++import { aeClaudeVersion } from "@/lib/aeClaudeModels";
++import {
++  AE_ROLE_EFFORTS,
++  type AeRoleEffort,
++  type AeRoleSetting,
++  aeModelLabel,
++} from "@/lib/aeRoleBase";
++import {
++  type AeReviewerSetting,
++  type AeReviewerUnavailable,
++  type AeReviewMerge,
++  aeParseReviewerMulti,
++  aeReviewerList,
++  aeReviewerRowLabel,
++  aeReviewerSummary,
++  aeReviewerUnavailableOf,
++  aeReviewMergeOf,
++} from "@/lib/aeReviewers";
+ import { comparableModelId } from "@/lib/codexNativeModels";
+ 
+ export const AE_ROLE_IDS = ["lead", "planner", "reviewer", "builder", "helper"] as const;
+ export type AeRoleId = (typeof AE_ROLE_IDS)[number];
+ 
+-export const AE_ROLE_EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+-export type AeRoleEffort = (typeof AE_ROLE_EFFORTS)[number];
++export { AE_ROLE_EFFORTS, aeModelLabel };
++export type { AeRoleEffort, AeRoleSetting };
+ 
+ export const AE_ROLE_COLORS = [
+   "green",
+@@ -89,10 +106,10 @@ export const AE_PRESET_TITLE_MAX = 40;
+ export const AE_PRESET_DESCRIPTION_MAX = 120;
+ export const AE_PRESET_WHEN_MAX = 400;
+ 
+-export type AeRoleSetting =
+-  { mode: "auto" } | { mode: "session" } | { mode: "fixed"; model: string; effort: AeRoleEffort };
+-
+-export type AeRoleTable = Record<AeRoleId, AeRoleSetting>;
++/** The Reviewer role may hold one to three reviewers (aeReviewers.ts). */
++export type AeRoleTable = {
++  [K in AeRoleId]: K extends "reviewer" ? AeReviewerSetting : AeRoleSetting;
++};
+ 
+ export interface AeRoleRules {
+   raise_or_lower: AeRaiseMode;
+@@ -100,6 +117,10 @@ export interface AeRoleRules {
+   auto_raises: number;
+   /** Absent on presets saved before the rule existed; read it with `aeHelpersOf`. */
+   helpers?: AeHelpers;
++  /** With two or more reviewers; absent reads as "merged" (aeReviewMergeOf). */
++  review_merge?: AeReviewMerge;
++  /** With two or more reviewers; absent reads as "run_rest" (aeReviewerUnavailableOf). */
++  reviewer_unavailable?: AeReviewerUnavailable;
+ }
+ 
+ export interface AeRolePreset {
+@@ -162,11 +183,6 @@ export function aeModelDotClass(model: string): string {
+   return (family && FAMILY_DOTS[family]) || "bg-muted-foreground";
+ }
+ 
+-/** "claude-opus-5-5" -> "Opus 5.5"; an id it cannot read stays as is. */
+-export function aeModelLabel(model: string): string {
+-  return aeClaudeVersionLabel(model) ?? model;
+-}
+-
+ // ---------------------------------------------------------------------------
+ // Parsing the server's answer
+ 
+@@ -199,6 +215,16 @@ function parsePreset(value: unknown): AeRolePreset | null {
+   if (!isObject(roles) || !isObject(rules)) return null;
+   const table = {} as AeRoleTable;
+   for (const role of AE_ROLE_IDS) {
++    if (role === "reviewer") {
++      // Only the lead may use the session model (the server refuses it here), so a
++      // stored session reviewer is not a preset this client reads or rewrites as Auto.
++      const plain = parseSetting(roles.reviewer);
++      const setting =
++        plain?.mode === "session" ? null : (plain ?? aeParseReviewerMulti(roles.reviewer));
++      if (!setting) return null;
++      table.reviewer = setting;
++      continue;
++    }
+     const setting = parseSetting(roles[role]);
+     if (!setting) return null;
+     table[role] = setting;
+@@ -221,6 +247,12 @@ function parsePreset(value: unknown): AeRolePreset | null {
+       auto_raises: Math.max(0, Math.min(AE_AUTO_RAISES_MAX, Math.round(auto_raises))),
+       // Kept only when stored, so a preset saved before the rule round-trips unchanged.
+       ...(rules.helpers === "own" || rules.helpers === "any" ? { helpers: rules.helpers } : {}),
++      ...(rules.review_merge === "merged" || rules.review_merge === "separate"
++        ? { review_merge: rules.review_merge }
++        : {}),
++      ...(rules.reviewer_unavailable === "run_rest" || rules.reviewer_unavailable === "ask"
++        ? { reviewer_unavailable: rules.reviewer_unavailable }
++        : {}),
+     },
+   };
+ }
+@@ -345,9 +377,16 @@ export function aeRestoreStarters<T extends AeRolesDoc>(
+ }
+ 
+ export function structuredCopy(preset: AeRolePreset): AeRolePreset {
++  const { reviewer } = preset.roles;
+   return {
+     ...preset,
+-    roles: { ...preset.roles },
++    roles: {
++      ...preset.roles,
++      reviewer:
++        reviewer.mode === "multi"
++          ? { mode: "multi", reviewers: reviewer.reviewers.map((slot) => ({ ...slot })) }
++          : reviewer,
++    },
+     rules: { ...preset.rules },
+   };
+ }
+@@ -362,7 +401,9 @@ export function aeSameRoles(
+     a.rules.raise_or_lower === b.rules.raise_or_lower &&
+     a.rules.lead_steps_down === b.rules.lead_steps_down &&
+     a.rules.auto_raises === b.rules.auto_raises &&
+-    aeHelpersOf(a.rules) === aeHelpersOf(b.rules)
++    aeHelpersOf(a.rules) === aeHelpersOf(b.rules) &&
++    aeReviewMergeOf(a.rules) === aeReviewMergeOf(b.rules) &&
++    aeReviewerUnavailableOf(a.rules) === aeReviewerUnavailableOf(b.rules)
+   );
+ }
+ 
+@@ -400,7 +441,10 @@ export function aeTopModel(models: readonly string[]): string | null {
+  * the host's model ids; with none loaded, the preset's own models stand in.
+  */
+ export function aeIsTopTierEverywhere(roles: AeRoleTable, catalog: readonly string[]): boolean {
+-  const settings = AE_ROLE_IDS.map((role) => roles[role]);
++  // Agent reviewers run on another provider's models, so only Claude slots count.
++  const settings = AE_ROLE_IDS.flatMap((role): (AeRoleSetting | { mode: "agent" })[] =>
++    role === "reviewer" ? aeReviewerList(roles.reviewer) : [roles[role]],
++  ).filter((s) => s.mode !== "agent");
+   if (!settings.every((s) => s.mode === "fixed" && s.effort === "max")) return false;
+   const models = settings.map((s) => (s.mode === "fixed" ? s.model : ""));
+   const top = aeTopModel(catalog.length > 0 ? catalog : models);
+@@ -413,6 +457,10 @@ export function aeIsTopTierEverywhere(roles: AeRoleTable, catalog: readonly stri
+ export function aeRoleSummary(roles: AeRoleTable): string {
+   const parts: string[] = [];
+   for (const role of AE_ROLE_IDS) {
++    if (role === "reviewer") {
++      parts.push(`${aeReviewerRowLabel(roles.reviewer)} ${aeReviewerSummary(roles.reviewer)}`);
++      continue;
++    }
+     const setting = roles[role];
+     const value =
+       setting.mode === "fixed"
+diff --git a/web/src/pages/settings/AeReviewerRows.test.tsx b/web/src/pages/settings/AeReviewerRows.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f776651b0b8e423c7d8642eea30ccddba4c3cd8c
+--- /dev/null
++++ b/web/src/pages/settings/AeReviewerRows.test.tsx
+@@ -0,0 +1,316 @@
++import { fireEvent, render, screen } from "@testing-library/react";
++import { useState } from "react";
++import { describe, expect, it, vi } from "vitest";
++import type { AvailableAgent } from "@/hooks/useAvailableAgents";
++import { AE_CODEX_AGENT_ID, type AeReviewerSetting } from "@/lib/aeReviewers";
++import type { AeRoleRules } from "@/lib/aeRoles";
++import type { AeTeamOption } from "@/lib/aeTeamOptions";
++import { AeReviewerRowsView, AeReviewSettings } from "./AeReviewerRows";
++
++vi.mock("@/hooks/useAeReviewerAgents", () => ({
++  useAeReviewerAgents: () => ({ options: [], host: null, loaded: false }),
++}));
++vi.mock("@/hooks/useHosts", () => ({
++  useHostModelOptions: () => ({ data: [], isError: false, isFetching: false }),
++}));
++
++const models = [
++  { value: "claude-opus-5-5", label: "Opus 5.5" },
++  { value: "claude-sonnet-5-5", label: "Sonnet 5.5" },
++];
++const agent = (id: string, name: string, harness: string): AvailableAgent =>
++  ({ id, name, display_name: name, description: null, harness, skills: [] }) as AvailableAgent;
++const ready = (a: AvailableAgent): AeTeamOption => ({
++  agent: a,
++  name: a.display_name,
++  readiness: { state: "available", reason: "ready", selectable: true } as AeTeamOption["readiness"],
++  recommendation: "Recommended: different provider for independent review.",
++  primary: true,
++});
++const setup = (a: AvailableAgent): AeTeamOption => ({
++  agent: a,
++  name: a.display_name,
++  readiness: {
++    state: "setup-required",
++    reason: "needs-auth",
++    selectable: false,
++  } as AeTeamOption["readiness"],
++  recommendation: null,
++  primary: true,
++});
++const codex = agent("codex-id", "Codex", "codex-native");
++const gemini = agent("gemini-id", "Gemini CLI", "gemini");
++const host = { host_id: "h1", status: "online" } as never;
++const defaultOptions = [ready(codex), setup(gemini)];
++
++function Harness({
++  initial,
++  options = defaultOptions,
++  onSave,
++}: {
++  initial: AeReviewerSetting;
++  options?: AeTeamOption[];
++  onSave: (value: AeReviewerSetting) => void;
++}) {
++  const [value, setValue] = useState(initial);
++  const [rules, setRules] = useState<AeRoleRules>({
++    raise_or_lower: "tell",
++    lead_steps_down: true,
++    auto_raises: 1,
++  });
++  return (
++    <>
++      <AeReviewerRowsView
++        setting={value}
++        models={models}
++        disabled={false}
++        agents={{ options, host, loaded: true }}
++        onChange={(next) => {
++          setValue(next);
++          onSave(next);
++        }}
++      />
++      <AeReviewSettings
++        reviewer={value}
++        rules={rules}
++        disabled={false}
++        onChange={(r) => setRules({ ...rules, ...r })}
++      />
++    </>
++  );
++}
++
++const sonnet = { mode: "fixed" as const, model: "claude-sonnet-5-5", effort: "medium" as const };
++
++describe("AeReviewerRows", () => {
++  it("renders an old single reviewer as one row and keeps its shape on an effort edit", () => {
++    const onSave = vi.fn();
++    render(<Harness initial={sonnet} onSave={onSave} />);
++    expect(screen.getByText("Reviewer")).toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: /Remove Reviewer/ })).not.toBeInTheDocument();
++    expect(screen.queryByTestId("ae-review-settings")).not.toBeInTheDocument();
++    fireEvent.click(screen.getByRole("radio", { name: "High" }));
++    expect(onSave).toHaveBeenLastCalledWith({ ...sonnet, effort: "high" });
++  });
++
++  it("adds up to three reviewers, then the add link gives way to the hint", () => {
++    const onSave = vi.fn();
++    render(<Harness initial={sonnet} onSave={onSave} />);
++    fireEvent.click(screen.getByRole("button", { name: /Add reviewer/ }));
++    expect(onSave).toHaveBeenLastCalledWith({
++      mode: "multi",
++      reviewers: [
++        sonnet,
++        {
++          mode: "agent",
++          agent: "codex-id",
++          agent_name: "Codex",
++          name: "Codex",
++          model: null,
++          effort: null,
++        },
++      ],
++    });
++    expect(screen.getByText("Reviewers")).toBeInTheDocument();
++    expect(screen.getByTestId("ae-review-settings")).toBeInTheDocument();
++    fireEvent.click(screen.getByRole("button", { name: /Add reviewer/ }));
++    expect(screen.queryByRole("button", { name: /Add reviewer/ })).not.toBeInTheDocument();
++    expect(screen.getByText("3 of 3. Remove one to add another.")).toBeInTheDocument();
++    expect(screen.getAllByRole("button", { name: /Remove Reviewer/ })).toHaveLength(3);
++  });
++
++  it("adds Codex by its built-in id when no agent is recommended (Settings has no lead)", () => {
++    const onSave = vi.fn();
++    const builtin = agent(AE_CODEX_AGENT_ID, "Codex", "codex-native");
++    const options = [
++      { ...ready(agent("cc", "Claude Code", "claude-native")), recommendation: null },
++    ];
++    options.push({ ...ready(builtin), recommendation: null });
++    render(<Harness initial={sonnet} options={options} onSave={onSave} />);
++    fireEvent.click(screen.getByRole("button", { name: /Add reviewer/ }));
++    expect(onSave).toHaveBeenLastCalledWith({
++      mode: "multi",
++      reviewers: [
++        sonnet,
++        {
++          mode: "agent",
++          agent: AE_CODEX_AGENT_ID,
++          agent_name: "Codex",
++          name: "Codex",
++          model: null,
++          effort: null,
++        },
++      ],
++    });
++  });
++
++  it("removes a reviewer back to the plain single setting", () => {
++    const onSave = vi.fn();
++    render(
++      <Harness
++        initial={{
++          mode: "multi",
++          reviewers: [
++            sonnet,
++            { mode: "agent", agent: "codex-id", name: "Codex", model: null, effort: null },
++          ],
++        }}
++        onSave={onSave}
++      />,
++    );
++    fireEvent.click(screen.getByRole("button", { name: "Remove Reviewer 2" }));
++    expect(onSave).toHaveBeenLastCalledWith(sonnet);
++    expect(screen.queryByTestId("ae-review-settings")).not.toBeInTheDocument();
++  });
++
++  it("lists agents in the slot picker, greys those needing setup, and picks one", () => {
++    const onSave = vi.fn();
++    render(<Harness initial={sonnet} onSave={onSave} />);
++    const picker = screen.getByRole("combobox", { name: "Reviewer model" });
++    expect(screen.getByRole("option", { name: "Gemini CLI (needs setup)" })).toBeDisabled();
++    expect(screen.getByRole("option", { name: "Auto (the lead picks)" })).toBeInTheDocument();
++    fireEvent.change(picker, { target: { value: "agent:codex-id" } });
++    expect(onSave).toHaveBeenLastCalledWith({
++      mode: "multi",
++      reviewers: [
++        {
++          mode: "agent",
++          agent: "codex-id",
++          agent_name: "Codex",
++          name: "Codex",
++          model: null,
++          effort: null,
++        },
++      ],
++    });
++    expect(screen.getByRole("combobox", { name: "Reviewer 1 effort" })).toHaveValue("");
++  });
++
++  it("offers Auto only on slot 1 and tags an agent that needs setup", () => {
++    render(
++      <Harness
++        initial={{
++          mode: "multi",
++          reviewers: [
++            sonnet,
++            { mode: "agent", agent: "gemini-id", name: "Gemini CLI", model: null, effort: null },
++          ],
++        }}
++        onSave={vi.fn()}
++      />,
++    );
++    const second = screen.getByRole("combobox", { name: "Reviewer 2 model" });
++    expect(second.querySelector('option[value="__auto"]')).toBeNull();
++    expect(screen.getByTestId("ae-reviewer-tag-2")).toHaveTextContent("Needs setup");
++    expect(screen.getByRole("link", { name: "Set up" })).toHaveAttribute(
++      "href",
++      "/settings/harnesses/gemini",
++    );
++  });
++
++  it("says an agent reviewer does not run when Helpers is own subagents only", () => {
++    const codexSlot = {
++      mode: "agent" as const,
++      agent: "codex-id",
++      name: "Codex",
++      model: null,
++      effort: null,
++    };
++    const own: AeRoleRules = {
++      raise_or_lower: "tell",
++      lead_steps_down: true,
++      auto_raises: 1,
++      helpers: "own",
++    };
++    const { rerender } = render(
++      <AeReviewSettings
++        reviewer={{ mode: "multi", reviewers: [codexSlot] }}
++        rules={own}
++        disabled={false}
++        onChange={() => {}}
++      />,
++    );
++    expect(screen.getByTestId("ae-review-own-note")).toHaveTextContent(
++      "Helpers is set to own subagents only, so Codex does not run.",
++    );
++    expect(screen.queryByTestId("ae-review-settings")).not.toBeInTheDocument();
++    rerender(
++      <AeReviewSettings
++        reviewer={{ mode: "multi", reviewers: [sonnet, codexSlot] }}
++        rules={{ ...own, helpers: "any" }}
++        disabled={false}
++        onChange={() => {}}
++      />,
++    );
++    expect(screen.queryByTestId("ae-review-own-note")).not.toBeInTheDocument();
++    expect(screen.getByTestId("ae-review-settings")).toBeInTheDocument();
++  });
++
++  it("starts a new agent slot on its default effort and offers only the harness's efforts", () => {
++    const geminiReady = ready(gemini);
++    render(
++      <Harness
++        initial={{
++          mode: "multi",
++          reviewers: [
++            sonnet,
++            { mode: "agent", agent: "gemini-id", name: "Gemini CLI", model: null, effort: null },
++          ],
++        }}
++        options={[ready(codex), geminiReady]}
++        onSave={vi.fn()}
++      />,
++    );
++    const effort = screen.getByRole("combobox", { name: "Reviewer 2 effort" });
++    expect(effort).toHaveValue("");
++    const values = Array.from(effort.querySelectorAll("option")).map((o) => o.value);
++    expect(values).toEqual(["", "low", "medium", "high"]);
++  });
++
++  it("keeps a stored effort listed even when it is the harness's top level", () => {
++    const onSave = vi.fn();
++    render(
++      <Harness
++        initial={{
++          mode: "multi",
++          reviewers: [
++            sonnet,
++            { mode: "agent", agent: "codex-id", name: "Codex", model: null, effort: "max" },
++          ],
++        }}
++        options={[ready(codex)]}
++        onSave={onSave}
++      />,
++    );
++    expect(screen.getByRole("combobox", { name: "Reviewer 2 effort" })).toHaveValue("max");
++    expect(screen.getAllByRole("option", { name: "Max" }).length).toBeGreaterThan(0);
++  });
++
++  it("finds a stored Codex slot by registered name when the id differs", () => {
++    const live = agent("live-codex-id", "codex-native-ui", "codex-native");
++    render(
++      <Harness
++        initial={{
++          mode: "multi",
++          reviewers: [
++            sonnet,
++            {
++              mode: "agent",
++              agent: "random-seeded-id",
++              agent_name: "codex-native-ui",
++              name: "Codex",
++              model: null,
++              effort: null,
++            },
++          ],
++        }}
++        options={[{ ...ready(live), name: "Codex" }]}
++        onSave={vi.fn()}
++      />,
++    );
++    expect(screen.queryByTestId("ae-reviewer-tag-2")).not.toBeInTheDocument();
++    expect(screen.getByRole("combobox", { name: "Reviewer 2 model" })).toHaveValue(
++      "agent:live-codex-id",
++    );
++  });
++});
+diff --git a/web/src/pages/settings/AeReviewerRows.tsx b/web/src/pages/settings/AeReviewerRows.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7797b9cfaa12072c2c578b8ae29053fe12f58a4d
+--- /dev/null
++++ b/web/src/pages/settings/AeReviewerRows.tsx
+@@ -0,0 +1,531 @@
++// Settings > Roles: the Reviewer row with one to three reviewers (omnigent-ae,
++// 2026-10-24, concept A). Slot 1 sits on the role row; slots 2 and 3 stack
++// under it, numbered. Each slot picks a Claude model (a subagent, with the
++// same effort bars as the other roles) or another agent (a child session,
++// with its model and effort). The two review settings show with 2 or more.
++
++import { PlusIcon, XIcon } from "lucide-react";
++import { type AeReviewerAgents, useAeReviewerAgents } from "@/hooks/useAeReviewerAgents";
++import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
++import { type Host, useHostModelOptions } from "@/hooks/useHosts";
++import { aeClaudeCodeDefaultEffort, aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
++import {
++  AE_REVIEW_MERGE_OPTIONS,
++  AE_REVIEWER_UNAVAILABLE_OPTIONS,
++  AE_REVIEWERS_MAX,
++  type AeReviewerAgentSlot,
++  type AeReviewerSetting,
++  type AeReviewerSlot,
++  type AeReviewerUnavailable,
++  type AeReviewMerge,
++  AE_AGENT_NAME_MAX,
++  AE_CODEX_AGENT_ID,
++  AE_CODEX_AGENT_NAME,
++  aeAgentEfforts,
++  aeAgentNameOf,
++  aeAgentSetupHref,
++  aeReviewerAgentOption,
++  aeReviewerAgents,
++  aeReviewerAgentStatus,
++  aeReviewerList,
++  aeReviewerRowLabel,
++  aeReviewerUnavailableOf,
++  aeReviewMergeOf,
++  aeWriteReviewers,
++} from "@/lib/aeReviewers";
++import {
++  AE_ROLE_LABELS,
++  type AeRoleEffort,
++  type AeRoleRules,
++  aeHelpersOf,
++  aeModelDotClass,
++  aeModelLabel,
++} from "@/lib/aeRoles";
++import type { AeTeamOption } from "@/lib/aeTeamOptions";
++import { codexEffortLevelsForModel, comparableModelId } from "@/lib/codexNativeModels";
++import { cn } from "@/lib/utils";
++import { AeEffortBar, AeSegmented } from "./AeRolesControls";
++
++const AUTO = "__auto";
++const AGENT = "agent:";
++
++const GRID =
++  "grid grid-cols-[5.5rem_1fr] items-center gap-x-3 gap-y-2 @lg/roles:grid-cols-[7rem_minmax(0,14rem)_1fr]";
++
++function Tag({ tone, children }: { tone: "amber" | "muted"; children: React.ReactNode }) {
++  return (
++    <span
++      className={cn(
++        "rounded-full px-1.5 py-px text-[11px] font-medium",
++        tone === "amber" ? "bg-amber-500/15 text-amber-500" : "bg-muted text-muted-foreground",
++      )}
++    >
++      {children}
++    </span>
++  );
++}
++
++function AgentDetails({
++  slot,
++  label,
++  option,
++  host,
++  disabled,
++  onChange,
++}: {
++  slot: AeReviewerAgentSlot;
++  label: string;
++  option: AeTeamOption | null;
++  host: Host | null;
++  disabled: boolean;
++  onChange: (slot: AeReviewerAgentSlot) => void;
++}) {
++  const ready = !!option?.readiness.selectable;
++  const catalog = useHostModelOptions(host?.host_id ?? null, option?.agent.harness ?? "", ready, {
++    poll: false,
++  });
++  const models = catalog.data ?? [];
++  // Only the efforts this agent's harness takes (and, where the harness lists them per model, the chosen model's).
++  const efforts = aeAgentEfforts(
++    option?.agent.harness,
++    slot.model ? codexEffortLevelsForModel(models, slot.model) : [],
++  );
++  const effortOf = (model: string | null) =>
++    slot.effort &&
++    !aeAgentEfforts(
++      option?.agent.harness,
++      model ? codexEffortLevelsForModel(models, model) : [],
++    ).includes(slot.effort)
++      ? null
++      : slot.effort;
++  const selectClass =
++    "min-w-0 rounded-md border border-input bg-background px-1.5 py-1 text-xs text-foreground";
++  return (
++    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
++      {models.length > 0 || slot.model ? (
++        <select
++          aria-label={`${label} model`}
++          value={slot.model ?? ""}
++          disabled={disabled}
++          onChange={(e) => {
++            const model = e.target.value || null;
++            onChange({ ...slot, model, effort: effortOf(model) });
++          }}
++          className={selectClass}
++        >
++          <option value="">Agent default model</option>
++          {slot.model && !models.some((m) => m.id === slot.model) && (
++            <option value={slot.model}>{slot.model}</option>
++          )}
++          {models.map((m) => (
++            <option key={m.id} value={m.id}>
++              {m.displayName ?? m.id}
++            </option>
++          ))}
++        </select>
++      ) : (
++        <span className="text-xs text-muted-foreground">Agent default model</span>
++      )}
++      <select
++        aria-label={`${label} effort`}
++        value={slot.effort ?? ""}
++        disabled={disabled}
++        onChange={(e) =>
++          onChange({ ...slot, effort: (e.target.value || null) as AeRoleEffort | null })
++        }
++        className={selectClass}
++      >
++        <option value="">Default effort</option>
++        {slot.effort && !efforts.includes(slot.effort) && (
++          <option value={slot.effort}>{aeClaudeEffortLabel(slot.effort)}</option>
++        )}
++        {efforts.map((effort) => (
++          <option key={effort} value={effort}>
++            {aeClaudeEffortLabel(effort)}
++          </option>
++        ))}
++      </select>
++    </div>
++  );
++}
++
++function SlotRow({
++  index,
++  slots,
++  rowLabel,
++  models,
++  options,
++  host,
++  loaded,
++  disabled,
++  onChange,
++  onRemove,
++}: {
++  index: number;
++  slots: readonly AeReviewerSlot[];
++  rowLabel: string;
++  models: readonly AeRoleModelChoice[];
++  options: readonly AeTeamOption[];
++  host: Host | null;
++  loaded: boolean;
++  disabled: boolean;
++  onChange: (slot: AeReviewerSlot) => void;
++  onRemove: (() => void) | null;
++}) {
++  const slot = slots[index];
++  const label = `Reviewer ${index + 1}`;
++  const fixed = slot.mode === "fixed" ? slot : null;
++  const agentSlot = slot.mode === "agent" ? slot : null;
++  const listed = fixed
++    ? models.find((m) => comparableModelId(m.value) === comparableModelId(fixed.model))
++    : undefined;
++  const agentState = agentSlot ? aeReviewerAgentStatus(agentSlot, options, host) : null;
++  // The live id when the slot was stored under another one (matched by registered name).
++  const agentId = agentSlot ? (agentState?.option?.agent.id ?? agentSlot.agent) : "";
++  const value = fixed ? (listed?.value ?? fixed.model) : agentSlot ? `${AGENT}${agentId}` : AUTO;
++  const ready = options.filter((o) => o.readiness.selectable && o.primary);
++  const needSetup = options.filter((o) => !o.readiness.selectable);
++  const usedBy = (model: string) => {
++    const at = slots.findIndex(
++      (s, i) =>
++        i !== index &&
++        s.mode === "fixed" &&
++        comparableModelId(s.model) === comparableModelId(model),
++    );
++    return at < 0 ? "" : `, used by Reviewer ${at + 1}`;
++  };
++  const choose = (next: string) => {
++    if (next === AUTO) return onChange({ mode: "auto" });
++    if (next.startsWith(AGENT)) {
++      const id = next.slice(AGENT.length);
++      const option = options.find((o) => o.agent.id === id);
++      if (!option) return;
++      return onChange({
++        mode: "agent",
++        agent: id,
++        agent_name: aeAgentNameOf(option.agent.name),
++        name: Array.from(option.name).slice(0, AE_AGENT_NAME_MAX).join("") || "Agent",
++        model: null,
++        effort: null,
++      });
++    }
++    const effort =
++      fixed?.effort ?? ((aeClaudeCodeDefaultEffort(next) as AeRoleEffort | null) || "medium");
++    onChange({ mode: "fixed", model: next, effort });
++  };
++  const { hint } = AE_ROLE_LABELS.reviewer;
++  return (
++    <div data-testid={`ae-reviewer-slot-${index + 1}`} className={cn(GRID, index > 0 && "pt-2")}>
++      {index === 0 ? (
++        <div className="min-w-0">
++          <div className="text-sm font-semibold">{rowLabel}</div>
++          <div className="text-xs leading-tight text-muted-foreground">{hint}</div>
++        </div>
++      ) : (
++        <div className="pr-1 text-right text-xs font-medium text-muted-foreground">{index + 1}</div>
++      )}
++      <label className="relative flex min-w-0 items-center">
++        <span className="sr-only">{`${label} model`}</span>
++        {fixed && (
++          <span
++            aria-hidden="true"
++            className={cn(
++              "pointer-events-none absolute left-2.5 size-2 rounded-full",
++              aeModelDotClass(fixed.model),
++            )}
++          />
++        )}
++        <select
++          aria-label={index === 0 ? "Reviewer model" : `${label} model`}
++          value={value}
++          disabled={disabled}
++          onChange={(e) => choose(e.target.value)}
++          className={cn(
++            "w-full min-w-0 rounded-md border border-input bg-background py-1.5 pr-2 text-sm text-foreground",
++            fixed ? "pl-6" : "pl-2",
++          )}
++        >
++          {index === 0 && <option value={AUTO}>Auto (the lead picks)</option>}
++          <optgroup label="Claude, as a subagent">
++            {fixed && !listed && <option value={fixed.model}>{aeModelLabel(fixed.model)}</option>}
++            {models.map((model) => (
++              <option key={model.value} value={model.value}>
++                {model.label}
++                {usedBy(model.value)}
++              </option>
++            ))}
++          </optgroup>
++          <optgroup label="Other agents, as a child session">
++            {agentSlot && !ready.some((o) => o.agent.id === agentId) && (
++              <option value={value}>{agentSlot.name}</option>
++            )}
++            {ready.map((o) => (
++              <option key={o.agent.id} value={`${AGENT}${o.agent.id}`}>
++                {o.name}
++              </option>
++            ))}
++            {needSetup
++              .filter((o) => o.agent.id !== agentId)
++              .map((o) => (
++                <option key={o.agent.id} value={`${AGENT}${o.agent.id}`} disabled>
++                  {`${o.name} (needs setup)`}
++                </option>
++              ))}
++          </optgroup>
++        </select>
++      </label>
++      <div className="col-start-2 flex min-w-0 items-center justify-between gap-2 @lg/roles:col-start-3">
++        <div className="flex min-w-0 flex-wrap items-center gap-1.5">
++          {fixed ? (
++            <AeEffortBar
++              role={index === 0 ? "Reviewer" : label}
++              effort={fixed.effort}
++              onChange={(effort) => onChange({ ...fixed, effort })}
++              disabled={disabled}
++            />
++          ) : agentSlot ? (
++            <AgentDetails
++              slot={agentSlot}
++              label={label}
++              option={agentState?.option ?? null}
++              host={host}
++              disabled={disabled}
++              onChange={onChange}
++            />
++          ) : (
++            <span className="text-xs text-muted-foreground">The lead chooses</span>
++          )}
++          {agentSlot && loaded && agentState && agentState.status !== "ready" && (
++            <span data-testid={`ae-reviewer-tag-${index + 1}`} className="flex items-center gap-1">
++              <Tag tone="amber">
++                {agentState.status === "setup"
++                  ? "Needs setup"
++                  : agentState.status === "missing"
++                    ? "Not found"
++                    : "Offline"}
++              </Tag>
++              {agentState.status === "setup" && (
++                <a
++                  href={aeAgentSetupHref(agentState.option?.agent.harness)}
++                  className="text-xs text-primary hover:underline"
++                >
++                  Set up
++                </a>
++              )}
++            </span>
++          )}
++        </div>
++        {onRemove && (
++          <button
++            type="button"
++            aria-label={`Remove ${label}`}
++            title={`Remove ${label}`}
++            disabled={disabled}
++            onClick={onRemove}
++            className="shrink-0 rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-40"
++          >
++            <XIcon className="size-3.5" />
++          </button>
++        )}
++      </div>
++    </div>
++  );
++}
++
++/** A new slot that differs from the others: a ready agent first (another provider), else an unused model. */
++function nextSlot(
++  slots: readonly AeReviewerSlot[],
++  models: readonly AeRoleModelChoice[],
++  options: readonly AeTeamOption[],
++): AeReviewerSlot | null {
++  const agentSlots = slots.flatMap((s) => (s.mode === "agent" ? [s] : []));
++  const free = options.filter(
++    (o) =>
++      o.readiness.selectable &&
++      o.primary &&
++      !agentSlots.some((s) => aeReviewerAgentOption(s, [o]) !== null),
++  );
++  // Another provider first: the team list's recommendation, or Codex where nothing is recommended (Settings has no lead).
++  const preferred =
++    free.find((o) => o.recommendation) ??
++    free.find((o) => o.agent.id === AE_CODEX_AGENT_ID || o.agent.name === AE_CODEX_AGENT_NAME);
++  const agent = preferred ?? free[0];
++  if (preferred) {
++    return {
++      mode: "agent",
++      agent: agent.agent.id,
++      agent_name: aeAgentNameOf(agent.agent.name),
++      name: Array.from(agent.name).slice(0, AE_AGENT_NAME_MAX).join(""),
++      model: null,
++      effort: null,
++    };
++  }
++  const usedModels = new Set(
++    slots.flatMap((s) => (s.mode === "fixed" ? [comparableModelId(s.model)] : [])),
++  );
++  const model =
++    models.find((m) => !usedModels.has(comparableModelId(m.value))) ??
++    models[0] ??
++    (() => {
++      const first = slots.find((s) => s.mode === "fixed");
++      return first?.mode === "fixed" ? { value: first.model } : undefined;
++    })();
++  if (model) return { mode: "fixed", model: model.value, effort: "medium" };
++  if (agent) {
++    return {
++      mode: "agent",
++      agent: agent.agent.id,
++      agent_name: aeAgentNameOf(agent.agent.name),
++      name: Array.from(agent.name).slice(0, AE_AGENT_NAME_MAX).join(""),
++      model: null,
++      effort: null,
++    };
++  }
++  return null;
++}
++
++interface ReviewerRowsProps {
++  setting: AeReviewerSetting;
++  models: readonly AeRoleModelChoice[];
++  onChange: (setting: AeReviewerSetting) => void;
++  disabled: boolean;
++}
++
++/** Settings > Roles: reads the agents and host itself. */
++export function AeReviewerRows(props: ReviewerRowsProps) {
++  const pinned = aeReviewerAgents(props.setting).map((r) => r.slot.agent);
++  return <AeReviewerRowsView {...props} agents={useAeReviewerAgents(undefined, pinned)} />;
++}
++
++/** The rows with the agents list given (the per-session dialog passes its own). */
++export function AeReviewerRowsView({
++  setting,
++  models,
++  onChange,
++  disabled,
++  agents: { options, host, loaded },
++}: ReviewerRowsProps & { agents: AeReviewerAgents }) {
++  const slots = aeReviewerList(setting);
++  const write = (next: AeReviewerSlot[]) => onChange(aeWriteReviewers(next));
++  const candidate = slots.length < AE_REVIEWERS_MAX ? nextSlot(slots, models, options) : null;
++  return (
++    <div
++      data-testid="ae-role-row-reviewer"
++      role="group"
++      aria-label="Reviewers"
++      className="border-t border-border py-2.5"
++    >
++      {slots.map((_, index) => (
++        <SlotRow
++          // Slots have no id of their own; their place is their identity.
++          // eslint-disable-next-line react/no-array-index-key
++          key={index}
++          index={index}
++          slots={slots}
++          rowLabel={aeReviewerRowLabel(setting)}
++          models={models}
++          options={options}
++          host={host}
++          loaded={loaded}
++          disabled={disabled}
++          onChange={(slot) => write(slots.map((s, i) => (i === index ? slot : s)))}
++          onRemove={slots.length >= 2 ? () => write(slots.filter((__, i) => i !== index)) : null}
++        />
++      ))}
++      <div className={cn(GRID, "pt-2")}>
++        <div className="col-start-2">
++          {slots.length < AE_REVIEWERS_MAX ? (
++            <button
++              type="button"
++              disabled={disabled || !candidate}
++              onClick={() => candidate && write([...slots, candidate])}
++              className="inline-flex items-center gap-1 text-xs text-primary hover:underline disabled:opacity-40"
++            >
++              <PlusIcon className="size-3.5" aria-hidden="true" />
++              Add reviewer
++              <span className="text-muted-foreground">
++                ({slots.length} of {AE_REVIEWERS_MAX})
++              </span>
++            </button>
++          ) : (
++            <span className="text-xs text-muted-foreground">
++              {AE_REVIEWERS_MAX} of {AE_REVIEWERS_MAX}. Remove one to add another.
++            </span>
++          )}
++        </div>
++      </div>
++    </div>
++  );
++}
++
++/** "Reviews in this preset": the merge and unavailable rules, only with 2 or more reviewers. */
++export function AeReviewSettings({
++  reviewer,
++  rules,
++  onChange,
++  disabled,
++  title = "Reviews in this preset",
++}: {
++  reviewer: AeReviewerSetting;
++  rules: AeRoleRules;
++  onChange: (rules: {
++    review_merge?: AeReviewMerge;
++    reviewer_unavailable?: AeReviewerUnavailable;
++  }) => void;
++  disabled: boolean;
++  title?: string;
++}) {
++  const slots = aeReviewerList(reviewer);
++  // Own subagents only: an agent reviewer is a child session, so the lead skips it.
++  const skipped =
++    aeHelpersOf(rules) === "own"
++      ? slots.flatMap((slot) => (slot.mode === "agent" ? [slot.name] : []))
++      : [];
++  const note = skipped.length ? (
++    <p data-testid="ae-review-own-note" className="text-xs text-amber-600 dark:text-amber-400">
++      Helpers is set to own subagents only, so {skipped.join(" and ")}{" "}
++      {skipped.length > 1 ? "do" : "does"} not run. Allow any agent or session to use{" "}
++      {skipped.length > 1 ? "them" : "it"}.
++    </p>
++  ) : null;
++  if (slots.length < 2) return note ? <div className="mt-2">{note}</div> : null;
++  const row = "flex flex-wrap items-center justify-between gap-x-4 gap-y-2 py-2";
++  return (
++    <div data-testid="ae-review-settings" className="mt-3 border-t border-border pt-3">
++      <h3 className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
++        {title}
++      </h3>
++      {note}
++      <div className={row}>
++        <div className="min-w-0">
++          <div className="text-sm">With more than one reviewer</div>
++          <div className="text-xs text-muted-foreground">
++            Each reviewer works alone on the same diff either way
++          </div>
++        </div>
++        <AeSegmented
++          label="With more than one reviewer"
++          value={aeReviewMergeOf(rules)}
++          options={AE_REVIEW_MERGE_OPTIONS}
++          onChange={(review_merge) => onChange({ review_merge })}
++          testId="ae-rule-review-merge"
++          disabled={disabled}
++        />
++      </div>
++      <div className={row}>
++        <div className="min-w-0">
++          <div className="text-sm">A reviewer is offline or not set up</div>
++          <div className="text-xs text-muted-foreground">Checked when the review starts</div>
++        </div>
++        <AeSegmented
++          label="A reviewer is offline or not set up"
++          value={aeReviewerUnavailableOf(rules)}
++          options={AE_REVIEWER_UNAVAILABLE_OPTIONS}
++          onChange={(reviewer_unavailable) => onChange({ reviewer_unavailable })}
++          testId="ae-rule-reviewer-unavailable"
++          disabled={disabled}
++        />
++      </div>
++    </div>
++  );
++}
+diff --git a/web/src/pages/settings/AeRolesControls.tsx b/web/src/pages/settings/AeRolesControls.tsx
+index 8c18e9832208a749ceca779b0fac8eae4dca9237..a416f261da49b32794a7aaaca156a7f95a31be22 100644
+--- a/web/src/pages/settings/AeRolesControls.tsx
++++ b/web/src/pages/settings/AeRolesControls.tsx
+@@ -2,7 +2,13 @@
+ // a segmented choice and a 0..n stepper.
+ 
+ import { HomeIcon, MinusIcon, PlusIcon } from "lucide-react";
+-import { AE_ROLE_COLOR_CLASSES, type AeRoleColor } from "@/lib/aeRoles";
++import { aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
++import {
++  AE_ROLE_COLOR_CLASSES,
++  AE_ROLE_EFFORTS,
++  type AeRoleColor,
++  type AeRoleEffort,
++} from "@/lib/aeRoles";
+ import { AeProjectIconGlyph, aeTablerValue } from "@/lib/aeTablerIcon";
+ import { cn } from "@/lib/utils";
+ 
+@@ -166,3 +172,59 @@ export function AeStepper({
+     </div>
+   );
+ }
++
++/** Five effort bars, Low to Max, as a radio group. */
++export function AeEffortBar({
++  role,
++  effort,
++  onChange,
++  disabled,
++}: {
++  role: string;
++  effort: AeRoleEffort;
++  onChange: (effort: AeRoleEffort) => void;
++  disabled: boolean;
++}) {
++  const level = AE_ROLE_EFFORTS.indexOf(effort);
++  return (
++    <div className="flex items-center gap-2">
++      <div
++        role="radiogroup"
++        aria-label={`${role} effort`}
++        className="flex gap-0.5"
++        onKeyDown={(e) => {
++          const step =
++            e.key === "ArrowRight" || e.key === "ArrowUp"
++              ? 1
++              : e.key === "ArrowLeft" || e.key === "ArrowDown"
++                ? -1
++                : 0;
++          if (!step) return;
++          e.preventDefault();
++          if (disabled) return;
++          const next = Math.max(0, Math.min(AE_ROLE_EFFORTS.length - 1, level + step));
++          onChange(AE_ROLE_EFFORTS[next]);
++          e.currentTarget.querySelectorAll<HTMLButtonElement>("[role=radio]")[next]?.focus();
++        }}
++      >
++        {AE_ROLE_EFFORTS.map((value, i) => (
++          <button
++            key={value}
++            type="button"
++            role="radio"
++            aria-checked={value === effort}
++            disabled={disabled}
++            aria-label={aeClaudeEffortLabel(value) ?? value}
++            tabIndex={value === effort ? 0 : -1}
++            onClick={() => onChange(value)}
++            className={cn(
++              "h-4 w-2 rounded-[2px] focus-visible:outline-2 focus-visible:outline-ring",
++              i <= level ? "bg-teal-400" : "bg-muted-foreground/25 hover:bg-muted-foreground/40",
++            )}
++          />
++        ))}
++      </div>
++      <span className="w-10 text-xs text-muted-foreground">{aeClaudeEffortLabel(effort)}</span>
++    </div>
++  );
++}
+diff --git a/web/src/pages/settings/AeRolesEditor.tsx b/web/src/pages/settings/AeRolesEditor.tsx
+index ff041d21180e37ad659150e708e902e748bdd613..9df764e1c8ddab62470bc37559db7bbad150b4ef 100644
+--- a/web/src/pages/settings/AeRolesEditor.tsx
++++ b/web/src/pages/settings/AeRolesEditor.tsx
+@@ -5,12 +5,11 @@
+ import { AlertTriangleIcon, CopyIcon, PencilIcon, Trash2Icon } from "lucide-react";
+ import { Button } from "@/components/ui/button";
+ import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
+-import { aeClaudeCodeDefaultEffort, aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
++import { aeClaudeCodeDefaultEffort } from "@/lib/aeEffortDefault";
+ import {
+   AE_AUTO_RAISES_MAX,
+   AE_COMING_LATER,
+   AE_HELPERS_OPTIONS,
+-  AE_ROLE_EFFORTS,
+   AE_ROLE_IDS,
+   AE_ROLE_LABELS,
+   type AeRaiseMode,
+@@ -26,7 +25,8 @@ import {
+ } from "@/lib/aeRoles";
+ import { comparableModelId } from "@/lib/codexNativeModels";
+ import { cn } from "@/lib/utils";
+-import { AeRolePresetTile, AeSegmented, AeStepper } from "./AeRolesControls";
++import { AeEffortBar, AeRolePresetTile, AeSegmented, AeStepper } from "./AeRolesControls";
++import { AeReviewerRows, AeReviewSettings } from "./AeReviewerRows";
+ 
+ export type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
+ 
+@@ -49,61 +49,6 @@ const ON_OFF = [
+   { value: "on", label: "On" },
+ ] as const;
+ 
+-function EffortBar({
+-  role,
+-  effort,
+-  onChange,
+-  disabled,
+-}: {
+-  role: string;
+-  effort: AeRoleEffort;
+-  onChange: (effort: AeRoleEffort) => void;
+-  disabled: boolean;
+-}) {
+-  const level = AE_ROLE_EFFORTS.indexOf(effort);
+-  return (
+-    <div className="flex items-center gap-2">
+-      <div
+-        role="radiogroup"
+-        aria-label={`${role} effort`}
+-        className="flex gap-0.5"
+-        onKeyDown={(e) => {
+-          const step =
+-            e.key === "ArrowRight" || e.key === "ArrowUp"
+-              ? 1
+-              : e.key === "ArrowLeft" || e.key === "ArrowDown"
+-                ? -1
+-                : 0;
+-          if (!step) return;
+-          e.preventDefault();
+-          if (disabled) return;
+-          const next = Math.max(0, Math.min(AE_ROLE_EFFORTS.length - 1, level + step));
+-          onChange(AE_ROLE_EFFORTS[next]);
+-          e.currentTarget.querySelectorAll<HTMLButtonElement>("[role=radio]")[next]?.focus();
+-        }}
+-      >
+-        {AE_ROLE_EFFORTS.map((value, i) => (
+-          <button
+-            key={value}
+-            type="button"
+-            role="radio"
+-            aria-checked={value === effort}
+-            disabled={disabled}
+-            aria-label={aeClaudeEffortLabel(value) ?? value}
+-            tabIndex={value === effort ? 0 : -1}
+-            onClick={() => onChange(value)}
+-            className={cn(
+-              "h-4 w-2 rounded-[2px] focus-visible:outline-2 focus-visible:outline-ring",
+-              i <= level ? "bg-teal-400" : "bg-muted-foreground/25 hover:bg-muted-foreground/40",
+-            )}
+-          />
+-        ))}
+-      </div>
+-      <span className="w-10 text-xs text-muted-foreground">{aeClaudeEffortLabel(effort)}</span>
+-    </div>
+-  );
+-}
+-
+ export function AeRoleRow({
+   role,
+   setting,
+@@ -139,7 +84,7 @@ export function AeRoleRow({
+   return (
+     <div
+       data-testid={`ae-role-row-${role}`}
+-      className="grid grid-cols-[5.5rem_1fr] items-center gap-x-3 gap-y-2 border-t border-border py-2.5 sm:grid-cols-[7rem_minmax(0,14rem)_1fr]"
++      className="grid grid-cols-[5.5rem_1fr] items-center gap-x-3 gap-y-2 border-t border-border py-2.5 @lg/roles:grid-cols-[7rem_minmax(0,14rem)_1fr]"
+     >
+       <div className="min-w-0">
+         <div className="text-sm font-semibold">{label}</div>
+@@ -176,9 +121,9 @@ export function AeRoleRow({
+           ))}
+         </select>
+       </label>
+-      <div className="col-start-2 sm:col-start-3">
++      <div className="col-start-2 @lg/roles:col-start-3">
+         {fixed ? (
+-          <EffortBar
++          <AeEffortBar
+             role={label}
+             effort={fixed.effort}
+             onChange={(effort) => onChange({ ...fixed, effort })}
+@@ -265,7 +210,7 @@ export function AeRolesEditor({
+   onDuplicate: () => void;
+   onDelete: () => void;
+ }) {
+-  const setRole = (role: AeRoleId, setting: AeRoleSetting) =>
++  const setRole = (role: Exclude<AeRoleId, "reviewer">, setting: AeRoleSetting) =>
+     onChange({ ...draft, roles: { ...draft.roles, [role]: setting } });
+   const setRules = (rules: Partial<AeRoleRules>) =>
+     onChange({ ...draft, rules: { ...draft.rules, ...rules } });
+@@ -326,19 +271,35 @@ export function AeRolesEditor({
+         </div>
+       </div>
+ 
+-      <div role="group" aria-label="Roles">
+-        {AE_ROLE_IDS.map((role) => (
+-          <AeRoleRow
+-            key={role}
+-            role={role}
+-            setting={draft.roles[role]}
+-            models={models}
+-            onChange={(setting) => setRole(role, setting)}
+-            disabled={saving}
+-          />
+-        ))}
++      <div role="group" aria-label="Roles" className="@container/roles">
++        {AE_ROLE_IDS.map((role) =>
++          role === "reviewer" ? (
++            <AeReviewerRows
++              key={role}
++              setting={draft.roles.reviewer}
++              models={models}
++              onChange={(reviewer) => onChange({ ...draft, roles: { ...draft.roles, reviewer } })}
++              disabled={saving}
++            />
++          ) : (
++            <AeRoleRow
++              key={role}
++              role={role}
++              setting={draft.roles[role]}
++              models={models}
++              onChange={(setting) => setRole(role, setting)}
++              disabled={saving}
++            />
++          ),
++        )}
+       </div>
+       {catalogNote && <p className="pt-1 text-xs text-muted-foreground">{catalogNote}</p>}
++      <AeReviewSettings
++        reviewer={draft.roles.reviewer}
++        rules={draft.rules}
++        onChange={setRules}
++        disabled={saving}
++      />
+ 
+       <div className="mt-3 border-t border-border pt-3">
+         <h3 className="text-[11px] font-medium tracking-wide text-muted-foreground uppercase">
+diff --git a/web/src/pages/settings/AeRolesSettingsSection.test.tsx b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+index cd021f0dd0c1ec2da4b9483978427e04e3bdfc87..2aa2bc6ec4e63dc60038d9493937ae26e0c12698 100644
+--- a/web/src/pages/settings/AeRolesSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+@@ -11,6 +11,9 @@ import type * as AeTablerIconModule from "@/lib/aeTablerIcon";
+ const mocks = vi.hoisted(() => ({ fetch: vi.fn(), showToast: vi.fn() }));
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
+ vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
++vi.mock("@/hooks/useAeReviewerAgents", () => ({
++  useAeReviewerAgents: () => ({ options: [], host: null, loaded: false }),
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: () => ({
+     data: [

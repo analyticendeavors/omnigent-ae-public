@@ -78,4 +78,4 @@ Pull requests that are already merged fold into one row under the message that n
 
 ---
 
-Previous: [Admin Center](admin-center.md) &middot; Next: [Triage and policies](triage-and-policies.md)
+Previous: [Admin Center](admin-center.md)

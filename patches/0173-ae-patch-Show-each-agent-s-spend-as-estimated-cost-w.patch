@@ -1,0 +1,719 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 12:12:34 -0700
+Subject: [PATCH 173/191] [ae-patch] Show each agent's spend as estimated cost,
+ with tokens only where every model reports them, so Claude sessions stop
+ reading as zero.
+
+---
+ .../components/AeSessionHoverStatus.test.tsx  |  93 +++++++++++++-
+ web/src/components/AeSessionHoverStatus.tsx   |  12 +-
+ web/src/lib/aeAgentRole.test.ts               |  19 ++-
+ web/src/lib/aeAgentRole.ts                    |   9 ++
+ web/src/lib/aeAgentUsage.ts                   |  55 +++++++-
+ web/src/shell/AeAgentMeta.tsx                 |  66 +++++++---
+ web/src/shell/AeAgentsUsage.test.tsx          | 120 ++++++++++++++++--
+ web/src/shell/AeFamilyTree.tsx                |  15 ++-
+ web/src/shell/Sidebar.aeFamilies.test.tsx     |  30 ++++-
+ 9 files changed, 371 insertions(+), 48 deletions(-)
+
+diff --git a/web/src/components/AeSessionHoverStatus.test.tsx b/web/src/components/AeSessionHoverStatus.test.tsx
+index c06bc7f705a9df9c4cea935527e6878345d23b04..df1cb41260eb6602de4b3c5e56ad36d58171d8f0 100644
+--- a/web/src/components/AeSessionHoverStatus.test.tsx
++++ b/web/src/components/AeSessionHoverStatus.test.tsx
+@@ -175,7 +175,16 @@ describe("AeSessionHoverStatus", () => {
+       id: "x",
+       reasoning_effort: "medium",
+       model_override: "claude-opus-4-8",
+-      usage_by_model: { [model]: { input_tokens: input, output_tokens: output } },
++      usage_by_model: {
++        [model]: { input_tokens: input, output_tokens: output, total_cost_usd: 1.64 },
++      },
++    });
++    // A Claude native row: cost only.
++    const costOnly = (cost: number) => ({
++      id: "x",
++      reasoning_effort: "medium",
++      model_override: "claude-haiku-4-5",
++      usage_by_model: { "claude-haiku-4-5": { total_cost_usd: cost } },
+     });
+     const row = (id: string, labels: Record<string, string>, title: string) =>
+       ({ id, title, labels }) as never;
+@@ -212,10 +221,88 @@ describe("AeSessionHoverStatus", () => {
+       );
+       const line = screen.getByTestId("ae-hover-role-line");
+       expect(line).toHaveTextContent("Builder");
+-      await waitFor(() => expect(line).toHaveTextContent("Opus 4.8 · medium · 116.4k tokens"));
++      await waitFor(() =>
++        expect(line).toHaveTextContent("Opus 4.8 · medium · $1.64 · 116.4k tokens"),
++      );
+       expect(screen.getByTestId("ae-hover-started-by")).toHaveTextContent("Started by PR3 lead");
+     });
+ 
++    it.each([
++      [71.25, "Haiku 4.5 · medium · $71.25"],
++      [0, "Haiku 4.5 · medium · $0"],
++    ])("shows cost and no tokens for a cost-only row of %s", async (cost, text) => {
++      vi.mocked(authenticatedFetch).mockImplementation((input) =>
++        /^\/v1\/sessions\/[^/?]+\?/.test(String(input))
++          ? json(costOnly(cost))
++          : json({ object: "list", data: [], has_more: false }),
++      );
++      const view = familyView([row("kid", { "ae.orch": "lead", "ae.role": "builder" }, "Kid")]);
++      render(
++        <AeFamilyContext.Provider value={view}>
++          <AeSessionHoverStatus
++            sessionId="kid"
++            state={{ kind: "idle" } as never}
++            updatedAt={NOW}
++            labels={{ "ae.orch": "lead", "ae.role": "builder" }}
++          />
++        </AeFamilyContext.Provider>,
++      );
++      const line = screen.getByTestId("ae-hover-role-line");
++      await waitFor(() => expect(line).toHaveTextContent(text));
++      expect(line.textContent).not.toContain("tokens");
++    });
++
++    it("falls back to tokens for the child and the lead line when no cost is reported", async () => {
++      vi.mocked(authenticatedFetch).mockImplementation((input) =>
++        /^\/v1\/sessions\/[^/?]+\?/.test(String(input))
++          ? json({
++              id: "x",
++              reasoning_effort: "medium",
++              model_override: "claude-opus-4-8",
++              usage_by_model: {
++                "claude-opus-4-8": { input_tokens: 100_000, output_tokens: 16_400 },
++              },
++            })
++          : json({ object: "list", data: [], has_more: false }),
++      );
++      const rows = [
++        row("lead", {}, "PR3 lead"),
++        row("kid", { "ae.orch": "lead", "ae.role": "builder" }, "Kid"),
++      ];
++      const view = familyView(rows);
++      const kid = render(
++        <AeFamilyContext.Provider value={view}>
++          <AeSessionHoverStatus
++            sessionId="kid"
++            state={{ kind: "idle" } as never}
++            updatedAt={NOW}
++            labels={{ "ae.orch": "lead", "ae.role": "builder" }}
++          />
++        </AeFamilyContext.Provider>,
++      );
++      await waitFor(() =>
++        expect(screen.getByTestId("ae-hover-role-line").textContent).toBe(
++          "BuilderOpus 4.8 · medium · 116.4k tokens",
++        ),
++      );
++      kid.unmount();
++      render(
++        <AeFamilyContext.Provider value={view}>
++          <AeSessionHoverStatus
++            sessionId="lead"
++            state={{ kind: "idle" } as never}
++            updatedAt={NOW}
++            labels={{}}
++          />
++        </AeFamilyContext.Provider>,
++      );
++      await waitFor(() =>
++        expect(screen.getByTestId("ae-hover-lead-line")).toHaveTextContent(
++          "leads 1 session · family 232.8k tokens",
++        ),
++      );
++    });
++
+     it("shows a lead's session count and family total", async () => {
+       answerUsage();
+       const rows = [
+@@ -236,7 +323,7 @@ describe("AeSessionHoverStatus", () => {
+       );
+       await waitFor(() =>
+         expect(screen.getByTestId("ae-hover-lead-line")).toHaveTextContent(
+-          "leads 2 sessions · family 349.2k tokens",
++          "leads 2 sessions · family $4.92",
+         ),
+       );
+     });
+diff --git a/web/src/components/AeSessionHoverStatus.tsx b/web/src/components/AeSessionHoverStatus.tsx
+index 8781b26b2c771b5023a98cd131823b4276f70124..e4be50fde0dab79b9f5d3eb149b34ea5800c5159 100644
+--- a/web/src/components/AeSessionHoverStatus.tsx
++++ b/web/src/components/AeSessionHoverStatus.tsx
+@@ -8,9 +8,10 @@ import { RunningDot } from "@/components/RunningDot";
+ import { type ChildSessionInfo, fetchChildSessions } from "@/hooks/useChildSessions";
+ import type { SessionState } from "@/hooks/useSessionState";
+ import { useAeRoles } from "@/hooks/useAeRoles";
+-import { aeAgentRole, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
++import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+ import {
+   AE_MODEL_FAMILY_BG,
++  aeSpendOf,
+   type AeSessionUsage,
+   aeModelFamily,
+   useAeSessionUsages,
+@@ -123,13 +124,15 @@ function LeadLine({
+   usage: ReadonlyMap<string, AeSessionUsage>;
+ }) {
+   const roles = useAeRoles();
+-  const total = [...usage.values()].reduce((sum, u) => sum + (u.tokens ?? 0), 0);
++  const spend = aeSpendOf(usage.values());
+   const presetId = labels?.["ae.preset"];
+   const title = roles.data?.presets.find((p) => p.id === presetId)?.title ?? null;
+   const parts = [
+     title,
+     `leads ${count} session${count === 1 ? "" : "s"}`,
+-    usage.size > 0 && total > 0 ? `family ${aeFormatTokens(total)} tokens` : null,
++    spend
++      ? `family ${spend.kind === "cost" ? aeFormatCost(spend.value) : `${aeFormatTokens(spend.value)} tokens`}`
++      : null,
+   ].filter(Boolean);
+   return (
+     <p className="truncate text-xs text-muted-foreground" data-testid="ae-hover-lead-line">
+@@ -168,7 +171,8 @@ function AeRoleLine({
+   const detail = [
+     own?.model ? agentModelLabel(own.model) : null,
+     own?.effort,
+-    own?.tokens != null ? `${aeFormatTokens(own.tokens)} tokens` : null,
++    own?.costUsd != null ? aeFormatCost(own.costUsd) : null,
++    own?.tokens != null && own.tokens > 0 ? `${aeFormatTokens(own.tokens)} tokens` : null,
+   ].filter(Boolean);
+   return (
+     <>
+diff --git a/web/src/lib/aeAgentRole.test.ts b/web/src/lib/aeAgentRole.test.ts
+index 00547f8856980aadd5100b9a789bdee63617129f..17157f1278aff583650be0d5fa34cbfc208a6bbb 100644
+--- a/web/src/lib/aeAgentRole.test.ts
++++ b/web/src/lib/aeAgentRole.test.ts
+@@ -1,5 +1,5 @@
+ import { describe, expect, it } from "vitest";
+-import { aeAgentRole, aeFormatTokens, aeRoleName } from "./aeAgentRole";
++import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "./aeAgentRole";
+ 
+ describe("aeAgentRole", () => {
+   it("reads the ae.role label", () => {
+@@ -62,3 +62,20 @@ describe("aeFormatTokens", () => {
+     expect(aeFormatTokens(n)).toBe(text);
+   });
+ });
++
++describe("aeFormatCost", () => {
++  it.each([
++    [0, "$0"],
++    [0.004, "<$0.01"],
++    [0.01, "$0.01"],
++    [1.636, "$1.64"],
++    [71.25, "$71.25"],
++    [99.994, "$99.99"],
++    [99.995, "$100"],
++    [99.996, "$100"],
++    [100, "$100"],
++    [1234.4, "$1,234"],
++  ])("formats %s as %s", (usd, text) => {
++    expect(aeFormatCost(usd)).toBe(text);
++  });
++});
+diff --git a/web/src/lib/aeAgentRole.ts b/web/src/lib/aeAgentRole.ts
+index d7b7041f498db9d9e6f6a19144817012b11e1195..6de4bf38a677b258bb1f8c61780756b95fcfbb4e 100644
+--- a/web/src/lib/aeAgentRole.ts
++++ b/web/src/lib/aeAgentRole.ts
+@@ -53,3 +53,12 @@ export function aeFormatTokens(n: number): string {
+   if (n < 1_000_000) return `${trim(Math.floor(n / 100) / 10, 1)}k`;
+   return `${trim(n / 1_000_000, 2)}M`;
+ }
++
++/** $0, <$0.01, $1.64, $71.25, $1,234. */
++export function aeFormatCost(usd: number): string {
++  if (usd <= 0) return "$0";
++  if (usd < 0.01) return "<$0.01";
++  // Decide on the rounded cents, so 99.996 reads $100 and not $100.00.
++  if (Math.round(usd * 100) < 10_000) return `$${usd.toFixed(2)}`;
++  return `$${Math.round(usd).toLocaleString("en-US")}`;
++}
+diff --git a/web/src/lib/aeAgentUsage.ts b/web/src/lib/aeAgentUsage.ts
+index 743b73484f519e99493c8083664dd8103eec57d5..792d463fa7e473b1620f16649753df1f0ef5fee7 100644
+--- a/web/src/lib/aeAgentUsage.ts
++++ b/web/src/lib/aeAgentUsage.ts
+@@ -1,4 +1,4 @@
+-// Token use per agent for the Agents card, the sidebar hover and the family
++// Spend per agent (cost, tokens where known) for the Agents card, the sidebar hover and the family
+ // pill (omnigent-ae). A session's usage covers its whole subtree, so a lead's
+ // number already holds its native subagents.
+ 
+@@ -65,20 +65,67 @@ export function aeTokensByFamily(
+   return out;
+ }
+ 
+-/** Input plus output tokens over a usage map, or null when none is known. */
++/**
++ * Input plus output tokens over a usage map. Null unless every row reports
++ * tokens: Claude native rows carry cost only, so a partial sum would read as
++ * the Codex share alone.
++ */
+ export function aeUsageTokens(usage: Record<string, ModelUsage> | null | undefined): number | null {
+   if (!usage || Object.keys(usage).length === 0) return null;
+-  return Object.values(usage).reduce((sum, row) => sum + aeModelTokens(row), 0);
++  const rows = Object.values(usage);
++  if (!rows.every((row) => row.inputTokens != null || row.outputTokens != null)) return null;
++  return rows.reduce((sum, row) => sum + aeModelTokens(row), 0);
++}
++
++/** Estimated cost of one model's usage; every harness reports it. */
++export function aeModelCost(row: ModelUsage): number {
++  return row.totalCostUsd ?? 0;
++}
++
++/** Estimated cost over a usage map, or null when no row reports one. */
++export function aeUsageCost(usage: Record<string, ModelUsage> | null | undefined): number | null {
++  const rows = Object.values(usage ?? {}).filter((row) => row.totalCostUsd != null);
++  if (rows.length === 0) return null;
++  return rows.reduce((sum, row) => sum + aeModelCost(row), 0);
++}
++
++/** Estimated cost per model family, summed over a usage map. */
++export function aeCostByFamily(
++  usage: Record<string, ModelUsage> | null | undefined,
++): Partial<Record<AeModelFamily, number>> {
++  const out: Partial<Record<AeModelFamily, number>> = {};
++  for (const [model, row] of Object.entries(usage ?? {})) {
++    const family = aeModelFamily(model);
++    out[family] = (out[family] ?? 0) + aeModelCost(row);
++  }
++  return out;
+ }
+ 
+ export interface AeSessionUsage {
++  /** Null unless every model row reports tokens. */
+   tokens: number | null;
+   byFamily: Partial<Record<AeModelFamily, number>>;
++  costUsd: number | null;
++  costByFamily: Partial<Record<AeModelFamily, number>>;
+   effort: string | null;
+   /** The model the session runs on, or null when the read does not say. */
+   model: string | null;
+ }
+ 
++/**
++ * A set of sessions' spend: cost when any session reports it, else tokens,
++ * else null (nothing known, or nothing spent).
++ */
++export function aeSpendOf(
++  usages: Iterable<AeSessionUsage>,
++): { kind: "cost" | "tokens"; value: number } | null {
++  const list = [...usages];
++  const cost = list.reduce((sum, u) => sum + (u.costUsd ?? 0), 0);
++  if (list.some((u) => u.costUsd !== null)) return cost > 0 ? { kind: "cost", value: cost } : null;
++  const tokens = list.reduce((sum, u) => sum + (u.tokens ?? 0), 0);
++  return tokens > 0 ? { kind: "tokens", value: tokens } : null;
++}
++
+ const USAGE_STALE_MS = 30_000;
+ 
+ export interface AeUsageRequest {
+@@ -120,6 +167,8 @@ export function useAeSessionUsages(
+     out.set(sessions[index].id, {
+       tokens: aeUsageTokens(data.usageByModel),
+       byFamily: aeTokensByFamily(data.usageByModel),
++      costUsd: aeUsageCost(data.usageByModel),
++      costByFamily: aeCostByFamily(data.usageByModel),
+       model: data.model,
+       effort:
+         data.reasoningEffort && data.reasoningEffort !== "default" ? data.reasoningEffort : null,
+diff --git a/web/src/shell/AeAgentMeta.tsx b/web/src/shell/AeAgentMeta.tsx
+index 09e821a1ede1ee7284b7a4ca85fa5a396ae937c8..92a17ad155f29bd94f148fb667e2b6f4a0f1b071 100644
+--- a/web/src/shell/AeAgentMeta.tsx
++++ b/web/src/shell/AeAgentMeta.tsx
+@@ -1,10 +1,10 @@
+ // What an agent row says about itself beyond its title (omnigent-ae): role chip,
+-// effort and tokens, and the total line under the list. The Agents tab and the
++// effort and cost, and the total line under the list. The Agents tab and the
+ // rail's Agents card share it; each wraps its rows in AeAgentMetaProvider.
+ 
+ import { createContext, useContext, useMemo, type ReactNode } from "react";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+-import { aeAgentRole, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
++import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+ import {
+   AE_MODEL_FAMILIES,
+   AE_MODEL_FAMILY_BG,
+@@ -86,7 +86,7 @@ export function AeAgentMetaProvider({
+   );
+ }
+ 
+-/** Role chip, effort and tokens on one line; each shows only when known, and the line is gone when none is. */
++/** Role chip, effort and cost (tokens when known) on one line; each shows only when known, and the line is gone when none is. */
+ export function AeAgentMetaLine({
+   child,
+   className,
+@@ -101,9 +101,10 @@ export function AeAgentMetaLine({
+   const native = useAeNativeInput(child);
+   const role = aeAgentRole(child);
+   const effort = usage?.effort ?? native?.effort ?? null;
+-  const tokens = usage?.tokens ?? null;
++  const cost = usage?.costUsd ?? null;
++  const tokens = usage?.tokens != null && usage.tokens > 0 ? usage.tokens : null;
+   const model = withModel ? (child.model ?? child.routed_model ?? native?.model ?? null) : null;
+-  if (!role && !model && !effort && tokens === null) return null;
++  if (!role && !model && !effort && cost === null && tokens === null) return null;
+   return (
+     <p
+       className={cn(
+@@ -135,9 +136,15 @@ export function AeAgentMetaLine({
+         </span>
+       )}
+       {effort && <span data-testid="subagent-effort">{effort}</span>}
+-      {tokens !== null && (
+-        <span className="ml-auto shrink-0 tabular-nums" data-testid="subagent-tokens">
+-          {aeFormatTokens(tokens)}
++      {(cost !== null || tokens !== null) && (
++        <span className="ml-auto shrink-0 tabular-nums" data-testid="subagent-cost">
++          {cost !== null && aeFormatCost(cost)}
++          {tokens !== null && (
++            <span className="text-[10px] opacity-70" data-testid="subagent-tokens">
++              {cost !== null && " · "}
++              {aeFormatTokens(tokens)} tok
++            </span>
++          )}
+         </span>
+       )}
+     </p>
+@@ -159,23 +166,39 @@ export function AeAgentsTotal({
+ }) {
+   const usage = useContext(UsageContext);
+   const lead = usage.get(rootSessionId);
+-  if (!lead || lead.tokens === null) return null;
++  if (!lead) return null;
++  // Cost is the measure; tokens stand in only when the lead reports no cost.
++  const byCost = lead.costUsd !== null;
++  const measure = (u: AeSessionUsage) => (byCost ? (u.costUsd ?? 0) : (u.tokens ?? 0));
++  const leadValue = measure(lead);
++  const leadFamilies = byCost ? lead.costByFamily : lead.byFamily;
+   const known = childIds.map((id) => usage.get(id)).filter((u): u is AeSessionUsage => !!u);
+-  const childSum = known.reduce((sum, u) => sum + (u.tokens ?? 0), 0);
++  const childSum = known.reduce((sum, u) => sum + measure(u), 0);
+   // Every child here is in the lead's spawn tree, so its usage already holds them.
+   // The max covers a lead read that is older than the children's.
+-  const total = Math.max(lead.tokens, childSum);
++  const total = Math.max(leadValue, childSum);
+   // With an unread child (a folded group), the lead's share cannot be told apart.
+-  const own = known.length === childIds.length ? Math.max(0, total - childSum) : null;
++  // Float residue under half a cent is a true zero.
++  const rest = Math.max(0, total - childSum);
++  const own = known.length === childIds.length ? (rest < 0.005 ? 0 : rest) : null;
+   // A stale lead read has no trustworthy split, so the children's stand in.
+-  const byFamily: Record<string, number> = childSum > lead.tokens ? {} : { ...lead.byFamily };
+-  if (childSum > lead.tokens) {
++  const byFamily: Record<string, number> = childSum > leadValue ? {} : { ...leadFamilies };
++  if (childSum > leadValue) {
+     for (const u of known) {
+-      for (const [family, n] of Object.entries(u.byFamily)) {
++      for (const [family, n] of Object.entries(byCost ? u.costByFamily : u.byFamily)) {
+         byFamily[family] = (byFamily[family] ?? 0) + (n ?? 0);
+       }
+     }
+   }
++  const fmt = (n: number) => (byCost ? aeFormatCost(n) : `${aeFormatTokens(n)} tokens`);
++  // Tokens only when every model in the lead and the rows read reports them.
++  const tokenTotal =
++    byCost && lead.tokens !== null && known.every((u) => u.tokens !== null)
++      ? Math.max(
++          lead.tokens,
++          known.reduce((sum, u) => sum + (u.tokens ?? 0), 0),
++        )
++      : null;
+   if (total <= 0) return null;
+   const sum = Object.values(byFamily).reduce((a, b) => a + b, 0) || 1;
+   const parts = AE_MODEL_FAMILIES.map((family) => ({ family, n: byFamily[family] ?? 0 })).filter(
+@@ -185,8 +208,17 @@ export function AeAgentsTotal({
+     <Tag data-testid="agents-total" className="mt-1 border-t border-border/60 px-2.5 py-2 text-xs">
+       <div className="text-muted-foreground">
+         This chat and its agents:{" "}
+-        <b className="font-medium text-foreground tabular-nums">{aeFormatTokens(total)} tokens</b>{" "}
+-        {own !== null && <>(lead {aeFormatTokens(own)})</>}
++        <b
++          className="font-medium text-foreground tabular-nums"
++          title="Estimated at API rates"
++          data-testid="agents-total-cost"
++        >
++          {fmt(total)}
++        </b>{" "}
++        {own !== null && <>(lead {fmt(own)})</>}
++        {tokenTotal !== null && tokenTotal > 0 && (
++          <span data-testid="agents-total-tokens"> · {aeFormatTokens(tokenTotal)} tokens</span>
++        )}
+       </div>
+       <div className="mt-1.5 flex h-1.5 overflow-hidden rounded-full bg-muted" aria-hidden="true">
+         {parts.map((p) => (
+diff --git a/web/src/shell/AeAgentsUsage.test.tsx b/web/src/shell/AeAgentsUsage.test.tsx
+index 831f97a2d2d92aa34929e49984666ea7578e8b16..4046042bdf0fbcced14c060c6394650946cfa29c 100644
+--- a/web/src/shell/AeAgentsUsage.test.tsx
++++ b/web/src/shell/AeAgentsUsage.test.tsx
+@@ -12,6 +12,7 @@ vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+   getSessionUsage: usageMock,
+ }));
+ 
++// Cost is a hundred-thousandth of a dollar per token, so 116k tokens read $1.16.
+ const usage = (model: string, input: number, output: number, effort: string | null = null) => ({
+   id: "x",
+   totalCostUsd: null,
+@@ -23,11 +24,42 @@ const usage = (model: string, input: number, output: number, effort: string | nu
+       totalTokens: null,
+       cacheReadInputTokens: null,
+       cacheCreationInputTokens: null,
+-      totalCostUsd: null,
++      totalCostUsd: (input + output) / 100_000,
+     },
+   },
+ });
+ 
++/** A Claude native row: cost only, no token counts. */
++const claudeUsage = (model: string, cost: number) => ({
++  id: "x",
++  totalCostUsd: null,
++  reasoningEffort: null,
++  usageByModel: {
++    [model]: {
++      inputTokens: null,
++      outputTokens: null,
++      totalTokens: null,
++      cacheReadInputTokens: null,
++      cacheCreationInputTokens: null,
++      totalCostUsd: cost,
++    },
++  },
++});
++
++function renderCard(agents: ChildSessionInfo[], withLine = false) {
++  render(
++    <QueryClientProvider client={new QueryClient()}>
++      <ul>
++        <AeAgentsSections
++          rootSessionId="conv_root"
++          agents={agents}
++          renderRow={(c) => <li key={c.id}>{withLine ? <AeAgentMetaLine child={c} /> : c.id}</li>}
++        />
++      </ul>
++    </QueryClientProvider>,
++  );
++}
++
+ function child(id: string, extra: Partial<ChildSessionInfo> = {}): ChildSessionInfo {
+   return {
+     id,
+@@ -80,17 +112,21 @@ describe("Agents card usage", () => {
+         </ul>
+       </QueryClientProvider>,
+     );
+-    await screen.findAllByTestId("subagent-tokens");
++    await screen.findAllByTestId("subagent-cost");
+     await screen.findByTestId("agents-total");
+     expect(screen.getByText("Builder")).toBeTruthy();
+-    expect(screen.getAllByTestId("subagent-tokens").map((n) => n.textContent)).toEqual([
+-      "116k",
+-      "116k",
++    expect(screen.getAllByTestId("subagent-cost").map((n) => n.textContent)).toEqual([
++      "$1.16 · 116k tok",
++      "$1.16 · 116k tok",
+     ]);
+     expect(screen.getAllByTestId("subagent-effort")).toHaveLength(2);
+     const total = screen.getByTestId("agents-total");
++    expect(total.textContent).toContain("$2.48");
++    expect(total.textContent).toContain("(lead $0.16)");
+     expect(total.textContent).toContain("248k tokens");
+-    expect(total.textContent).toContain("(lead 16k)");
++    expect(screen.getByTestId("agents-total-cost").getAttribute("title")).toBe(
++      "Estimated at API rates",
++    );
+     expect(total.textContent).toContain("Sonnet 94%");
+   });
+ 
+@@ -151,8 +187,8 @@ describe("Agents card usage", () => {
+   });
+ 
+   it.each([
+-    [100_000, "120k tokens", "(lead 0)"],
+-    [300_000, "300k tokens", "(lead 180k)"],
++    [100_000, "$1.20", "(lead $0)"],
++    [300_000, "$3.00", "(lead $1.80)"],
+   ])("totals a lead of %s with two 60k children", async (leadTokens, totalText, leadText) => {
+     usageMock.mockImplementation(async (id: string) =>
+       id === "conv_root"
+@@ -217,7 +253,73 @@ describe("Agents card usage", () => {
+       </QueryClientProvider>,
+     );
+     const total = await screen.findByTestId("agents-total");
+-    expect(total.textContent).toContain("300k tokens");
++    expect(total.textContent).toContain("$3.00");
+     expect(total.textContent).not.toContain("lead");
+   });
++
++  it("shows cost and no tokens for a Claude row that reports cost only", async () => {
++    usageMock.mockImplementation(async () => claudeUsage("claude-opus-4-8", 71.25));
++    renderCard([child("a", { busy: true, current_task_status: "in_progress" })], true);
++    const cost = await screen.findByTestId("subagent-cost");
++    expect(cost.textContent).toBe("$71.25");
++    expect(screen.queryByTestId("subagent-tokens")).toBeNull();
++    const total = await screen.findByTestId("agents-total");
++    expect(total.textContent).toContain("$71.25");
++    expect(total.textContent).not.toContain("tokens");
++  });
++
++  it("shows cost and tokens for a Codex row that reports both", async () => {
++    usageMock.mockImplementation(async () => usage("gpt-5.5", 150_000, 51_000));
++    renderCard([child("a", { busy: true, current_task_status: "in_progress" })], true);
++    const cost = await screen.findByTestId("subagent-cost");
++    expect(cost.textContent).toBe("$2.01 · 201k tok");
++  });
++
++  it("leaves the token suffix off a mixed total", async () => {
++    usageMock.mockImplementation(async (id: string) =>
++      id === "conv_root"
++        ? {
++            ...claudeUsage("claude-opus-4-8", 70),
++            usageByModel: {
++              ...claudeUsage("claude-opus-4-8", 70).usageByModel,
++              ...usage("gpt-5.5", 150_000, 51_000).usageByModel,
++            },
++          }
++        : usage("gpt-5.5", 150_000, 51_000),
++    );
++    renderCard([child("a", { busy: true, current_task_status: "in_progress" })]);
++    const total = await screen.findByTestId("agents-total");
++    expect(total.textContent).toContain("$72.01");
++    expect(screen.queryByTestId("agents-total-tokens")).toBeNull();
++  });
++
++  it("adds the token suffix when every row reports tokens", async () => {
++    usageMock.mockImplementation(async () => usage("gpt-5.5", 150_000, 51_000));
++    renderCard([child("a", { busy: true, current_task_status: "in_progress" })]);
++    const total = await screen.findByTestId("agents-total");
++    expect(total.textContent).toContain("201k tokens");
++  });
++
++  it("falls back to tokens when no row reports a cost", async () => {
++    const tokensOnly = () => {
++      const u = usage("gpt-5.5", 150_000, 51_000);
++      u.usageByModel["gpt-5.5"].totalCostUsd = null as never;
++      return u;
++    };
++    usageMock.mockImplementation(async () => tokensOnly());
++    renderCard([child("a", { busy: true, current_task_status: "in_progress" })], true);
++    const row = await screen.findByTestId("subagent-cost");
++    expect(row.textContent).toBe("201k tok");
++    const total = await screen.findByTestId("agents-total");
++    expect(total.textContent).toContain("201k tokens");
++    expect(total.textContent).not.toContain("$");
++  });
++
++  it("shows $0 for a zero-cost row and never 0 tokens", async () => {
++    usageMock.mockImplementation(async () => claudeUsage("claude-haiku-4-5", 0));
++    renderCard([child("a", { busy: true, current_task_status: "in_progress" })], true);
++    const cost = await screen.findByTestId("subagent-cost");
++    expect(cost.textContent).toBe("$0");
++    expect(document.body.textContent).not.toContain("0 tokens");
++  });
+ });
+diff --git a/web/src/shell/AeFamilyTree.tsx b/web/src/shell/AeFamilyTree.tsx
+index 2316cc677f29bb0faadd71c42ae25a6d7c6208b8..3fdabf166efd36e5a5207e81b7dcd1f3c6898e52 100644
+--- a/web/src/shell/AeFamilyTree.tsx
++++ b/web/src/shell/AeFamilyTree.tsx
+@@ -11,8 +11,8 @@ import {
+   createContext,
+   useContext,
+ } from "react";
+-import { aeAgentRole, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+-import { useAeSessionUsages } from "@/lib/aeAgentUsage";
++import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
++import { aeSpendOf, useAeSessionUsages } from "@/lib/aeAgentUsage";
+ import { AE_FAMILY_COLORS, type AeFamily, aeFamilyHint } from "@/lib/aeFamily";
+ import { Link } from "@/lib/routing";
+ import {
+@@ -201,7 +201,7 @@ const PILL_MEMBERS = 25;
+ const PILL_MS = 60_000;
+ 
+ /**
+- * The family's token total. It reads usage itself, so a token change re-renders
++ * The family's cost total. It reads usage itself, so a cost change re-renders
+  * this pill and no row; the tree object stays the same.
+  */
+ function TokenPill({ family }: { family: AeFamily }) {
+@@ -212,16 +212,17 @@ function TokenPill({ family }: { family: AeFamily }) {
+     members.map((m) => ({ id: m.id, stamp: 0 })),
+     { staleMs: PILL_MS, pollMs: PILL_MS, live: busy },
+   );
+-  const total = [...usage.values()].reduce((sum, u) => sum + (u.tokens ?? 0), 0);
+-  if (usage.size === 0 || total <= 0) return null;
++  const spend = aeSpendOf(usage.values());
++  if (!spend) return null;
+   const more = family.members.length > PILL_MEMBERS ? "+" : "";
++  const text = spend.kind === "cost" ? aeFormatCost(spend.value) : aeFormatTokens(spend.value);
+   return (
+     <span
+       data-testid="ae-family-tokens"
+-      title={`${aeFormatTokens(total)}${more} tokens across this family`}
++      title={`${text}${more} ${spend.kind === "cost" ? "estimated" : "tokens"} across this family`}
+       className="inline-flex h-[18px] shrink-0 items-center rounded-full bg-foreground/[0.06] px-1.5 text-[11.5px] tabular-nums text-muted-foreground"
+     >
+-      {aeFormatTokens(total)}
++      {text}
+       {more}
+     </span>
+   );
+diff --git a/web/src/shell/Sidebar.aeFamilies.test.tsx b/web/src/shell/Sidebar.aeFamilies.test.tsx
+index 8d4c98dcc86222281486f05a377cc8c651bc6694..0753a87c81b3839f529f46afe7ca49980ebfe802 100644
+--- a/web/src/shell/Sidebar.aeFamilies.test.tsx
++++ b/web/src/shell/Sidebar.aeFamilies.test.tsx
+@@ -234,7 +234,7 @@ describe("Grouping > Family", () => {
+     expect(depth("Fabric card speed")).toBeUndefined();
+   });
+ 
+-  it("shows the family's tokens on the lead and a role chip on a child that has one", async () => {
++  it("shows the family's cost on the lead and a role chip on a child that has one", async () => {
+     useConvMock.mockImplementation(() =>
+       conversationPage([
+         row("Escalation tool", 60, { "ae.orch": sid("Role routing build"), "ae.role": "builder" }),
+@@ -247,7 +247,7 @@ describe("Grouping > Family", () => {
+           ? new Response(
+               JSON.stringify({
+                 usage_by_model: {
+-                  "claude-sonnet-5-5": { input_tokens: 90_000, output_tokens: 10_000 },
++                  "claude-sonnet-5-5": { total_cost_usd: 1.5 },
+                 },
+               }),
+             )
+@@ -260,10 +260,32 @@ describe("Grouping > Family", () => {
+       "Builder",
+     );
+     expect(within(rowItem("Families PR")).queryByTestId("ae-family-role")).toBeNull();
+-    // Lead plus its three listed sessions at 100k each.
++    // Lead plus its three listed sessions at $1.50 each (cost only, as Claude reports).
+     expect(
+       (await within(rowItem("Role routing build")).findByTestId("ae-family-tokens")).textContent,
+-    ).toBe("400k");
++    ).toBe("$6.00");
++  });
++
++  it("falls back to tokens on the family pill when no cost is reported", async () => {
++    useConvMock.mockImplementation(() => conversationPage(ROWS));
++    mocks.fetch.mockImplementation((input: unknown) =>
++      Promise.resolve(
++        String(input).startsWith("/v1/sessions/")
++          ? new Response(
++              JSON.stringify({
++                usage_by_model: {
++                  "gpt-5.5": { input_tokens: 90_000, output_tokens: 10_000 },
++                },
++              }),
++            )
++          : new Response("{}", { status: 404 }),
++      ),
++    );
++    setView({ grouping: "family" });
++    renderSidebar();
++    const pill = await within(rowItem("Role routing build")).findByTestId("ae-family-tokens");
++    expect(pill.textContent).toBe("400k");
++    expect(pill.getAttribute("title")).toBe("400k tokens across this family");
+   });
+ 
+   it("folds a family from the lead's pill and remembers it", () => {

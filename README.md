@@ -17,7 +17,7 @@
 
 <p align="center"><b>Omnigent, extended for running many coding agents at once.</b></p>
 
-omnigent-ae is Analytic Endeavors' build of [Omnigent](https://github.com/omnigent-ai/omnigent) (Databricks, Apache-2.0), the open-source meta-harness that runs Claude Code, Codex and other coding agents behind one server, browser and phone UI. It adds a way of working for people who keep several agent sessions going at once: a few sessions at a time, everything that waits on you in one place, and the rest parked with a note. Every screen on this page is the real fork, running on made-up data.
+omnigent-ae is Analytic Endeavors' build of [Omnigent](https://github.com/omnigent-ai/omnigent) (Databricks, Apache-2.0), the open-source meta-harness that runs Claude Code, Codex and other coding agents behind one server, browser and phone UI. It adds a way of working for people who keep several agent sessions going at once: presets that give each role its own model and effort, a few sessions at a time, everything that waits on you in one place, and the rest parked with a note. Every screen on this page is the real fork, running on made-up data.
 
 <p align="center"><img src="docs/media/hero.webp" alt="The Session Dashboard, split view, the session rail and the action dock"></p>
 
@@ -28,6 +28,10 @@ omnigent-ae is Analytic Endeavors' build of [Omnigent](https://github.com/omnige
 Grouped the way you meet them in a working day. Each picture opens a page with every feature in that area, how to reach it, and the core patch or package behind it.
 
 <table>
+<tr>
+<td width="50%" valign="top"><a href="docs/features/roles-presets.md"><img src="docs/media/roles-preset-pill-thumb.webp" alt="Roles presets"></a><br><sub>ROLES PRESETS</sub><br><b><a href="docs/features/roles-presets.md">Roles presets</a></b><br>Each role's model and effort per preset, a pill to pick one per chat, families of sessions, and up to three independent reviewers merged into one verdict.</td>
+<td width="50%" valign="top"><a href="docs/features/triage-and-policies.md"><img src="docs/media/rail-triage-notes-thumb.webp" alt="Triage and policies"></a><br><sub>TRIAGE AND POLICIES</sub><br><b><a href="docs/features/triage-and-policies.md">Triage and policies</a></b><br>The slot cap, the fork gate and its four answers, saved notes, the rabbit-hole check and the scheduled agents, all as Omnigent policies.</td>
+</tr>
 <tr>
 <td width="50%" valign="top"><a href="docs/features/session-dashboard.md"><img src="docs/media/dashboard-your-move-thumb.webp" alt="Session Dashboard"></a><br><sub>MANY SESSIONS</sub><br><b><a href="docs/features/session-dashboard.md">Session Dashboard</a></b><br>One page for the day: the working slots, the decisions waiting on you, open pull requests and why they wait, and the parking lot.</td>
 <td width="50%" valign="top"><a href="docs/features/sidebar.md"><img src="docs/media/sidebar-activity-thumb.webp" alt="Sidebar"></a><br><sub>MANY SESSIONS</sub><br><b><a href="docs/features/sidebar.md">Sidebar</a></b><br>Every row says whether its session is working, quiet, or waiting on you or its agents, and sessions group and sort by status.</td>
@@ -50,7 +54,7 @@ Grouped the way you meet them in a working day. Each picture opens a page with e
 </tr>
 <tr>
 <td width="50%" valign="top"><a href="docs/features/phone.md"><img src="docs/media/phone-dashboard-thumb.webp" alt="Phone"></a><br><sub>ON THE PHONE</sub><br><b><a href="docs/features/phone.md">Phone</a></b><br>The Dashboard, Run with a safety sheet, terminal Paste, the action dock and menus sized for a thumb.</td>
-<td width="50%" valign="top"><a href="docs/features/triage-and-policies.md"><img src="docs/media/rail-triage-notes-thumb.webp" alt="Triage and policies"></a><br><sub>TRIAGE AND POLICIES</sub><br><b><a href="docs/features/triage-and-policies.md">Triage and policies</a></b><br>The slot cap, the fork gate and its four answers, saved notes, the rabbit-hole check and the scheduled agents, all as Omnigent policies.</td>
+<td width="50%"></td>
 </tr>
 </table>
 

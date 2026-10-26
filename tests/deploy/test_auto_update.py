@@ -1178,6 +1178,8 @@ def test_user_units_are_the_expected_set() -> None:
         "ae-omnigent-host-relink.service",
         "ae-omnigent-limits.service",
         "ae-omnigent-limits.timer",
+        "ae-omnigent-secrets-meta.service",
+        "ae-omnigent-secrets-meta.timer",
     ]
 
 
@@ -1197,6 +1199,26 @@ def test_limits_relay_units_run_the_module_every_five_minutes() -> None:
     path = USER_UNITS / "ae-omnigent-limits.timer"
     t = _unit(path)
     assert t.get("Timer", "OnCalendar") == "*:0/5"
+    assert t.get("Install", "WantedBy") == "timers.target"
+    assert "local time" in path.read_text()
+
+
+def test_secrets_meta_relay_units_run_the_module_daily() -> None:
+    # The Server secrets list's expiry dates (deploy/README.md, 2026-10-23).
+    s = _unit(USER_UNITS / "ae-omnigent-secrets-meta.service")
+    assert s.get("Service", "Type") == "oneshot"
+    assert s.get("Service", "ExecStart") == (
+        "%h/.omnigent-host/venv/bin/python -m ae_omni_policies.secrets_relay"
+    )
+    # az lives in ~/.local/bin, which a systemd user session does not have.
+    assert "%h/.local/bin" in s.get("Service", "Environment")
+    assert s.get("Service", "EnvironmentFile") == "-%h/deploy/omnigent-ae/config/host.env"
+    assert not s.has_option("Service", "User"), "a user unit names no User="
+    assert not s.has_section("Install"), "the timer starts it"
+    path = USER_UNITS / "ae-omnigent-secrets-meta.timer"
+    t = _unit(path)
+    assert t.get("Timer", "OnCalendar") == "*-*-* 06:15:00"
+    assert t.get("Timer", "Persistent") == "true"
     assert t.get("Install", "WantedBy") == "timers.target"
     assert "local time" in path.read_text()
 

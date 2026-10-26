@@ -739,6 +739,27 @@ async def discover_live(app: FastAPI, identity: OwnerIdentity, watched: set[str]
     return Scan(by_url=found, read=frozenset(row.id for row in rows) - failed)
 
 
+_WORKSPACE_GONE_RE = re.compile(r"workspace_missing|workspace no longer exists", re.IGNORECASE)
+
+
+async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str) -> bool:
+    """True when the session names a workspace directory that is gone from disk.
+
+    A post to such a session makes the server relaunch the runner in the deleted
+    worktree, and the user sees a "workspace no longer exists" pill. The server and
+    the host share this box, so ``os.path.isdir`` answers. Anything unknown (the read
+    fails, no workspace field) is not gone: the post goes ahead as before.
+    """
+    try:
+        response = await _call(app, "GET", f"/v1/sessions/{session_id}", headers)
+        if response.status_code >= 300:
+            return False
+        workspace = response.json().get("workspace")
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return False
+    return isinstance(workspace, str) and bool(workspace.strip()) and not os.path.isdir(workspace)
+
+
 async def post_live(
     app: FastAPI, identity: OwnerIdentity, session_id: str, text: str
 ) -> PostOutcome:
@@ -749,6 +770,11 @@ async def post_live(
             "merge watcher: cannot act as the owner of %s (no owner grant, or an auth mode "
             "that cannot mint a token); the note is dropped",
             session_id,
+        )
+        return "drop"
+    if await _workspace_gone(app, headers, session_id):
+        _logger.info(
+            "merge watcher: the workspace of %s no longer exists; the note is dropped", session_id
         )
         return "drop"
     body = {
@@ -768,6 +794,11 @@ async def post_live(
         return "retry"
     if response.status_code < 300:
         return "posted"
+    if response.status_code >= 400 and _WORKSPACE_GONE_RE.search(response.text):
+        _logger.info(
+            "merge watcher: %s has no workspace on the host; the note is dropped", session_id
+        )
+        return "drop"
     if response.status_code in (408, 409, 425, 429) or response.status_code >= 500:
         return "retry"
     _logger.warning(

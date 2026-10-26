@@ -17,7 +17,15 @@
 // 0151 admits that one URL); where the host refuses, the URL shows to copy.
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
-import { AeRequestError, type AzureFlag, type AzureView, describeError, fetchAzureCost } from "./api";
+import {
+  AeRequestError,
+  type AzureCostAnswer,
+  type AzureFlag,
+  type AzureView,
+  describeError,
+  fetchAzureCost,
+} from "./api";
+import { mountTargets, type Targets, targetsSection } from "./azureTargets";
 import { button, type Child, el, notice, replaceChildren } from "./dom";
 import { externalLinkIcon } from "./icons";
 import { copyText } from "./lot";
@@ -69,6 +77,7 @@ export function azureTile(
   configured: boolean,
   reading: boolean,
   error: unknown,
+  rateLimit: AzureCostAnswer["rateLimit"] = null,
 ): Tile {
   if (!configured) {
     return {
@@ -95,6 +104,8 @@ export function azureTile(
   const parts = [spent];
   if (flags) parts.push(flags === 1 ? "1 flag" : `${flags} flags`);
   else if (failed) parts.push(failed === 1 ? "1 not read" : `${failed} not read`);
+  // Unread subscriptions carry no error of their own while limited, so the tile says it.
+  if (rateLimit) parts.push("rate limited");
   // Health stays as is: the totals are complete, but "no flags" would read as checked.
   if (view.subscriptions.some((sub) => sub.counted && sub.note)) {
     parts.push("spike check unavailable");
@@ -104,7 +115,7 @@ export function azureTile(
     id: "azure",
     value: money(view.month.spent, view.currency),
     note: parts.slice(1).join(" · ") || (delta ? `pace ${delta}` : ""),
-    health: flags || failed ? "attention" : "ok",
+    health: flags || failed || rateLimit ? "attention" : "ok",
     summary: parts.join(" · "),
   };
 }
@@ -145,12 +156,13 @@ function subscriptionRow(
   // An older server sends neither field: such a row is counted, in the total's currency.
   const counted = sub.counted !== false;
   const own = sub.currency ?? currency;
+  const unread = sub.read === false;
   const share = counted && total > 0 ? Math.min(100, (sub.spent / total) * 100) : 0;
   return el(
     "li",
     { class: counted ? "azure-sub" : "azure-sub azure-sub-apart" },
     el("span", { class: "azure-sub-name" }, sub.name),
-    el("span", { class: "azure-amt" }, money(sub.spent, own)),
+    el("span", { class: "azure-amt" }, unread ? "not read yet" : money(sub.spent, own)),
     counted
       ? el(
           "span",
@@ -167,8 +179,46 @@ function subscriptionRow(
   );
 }
 
+/** "3:42 PM" today, else "Oct 24, 3:42 PM", in the viewer's clock. */
+function clockText(ms: number, now: number): string {
+  const time = new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (new Date(ms).toDateString() === new Date(now).toDateString()) return time;
+  return `${new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" })}, ${time}`;
+}
+
+/**
+ * The one sentence for a rate limit (2026-10-23), shown once under the month total instead of
+ * under every subscription. With a next try still ahead it says when; otherwise it says the
+ * numbers are from the last good reading and how old that is.
+ */
+export function rateLimitText(limit: RateLimit, now: number): string {
+  const retry = limit.retryAt ? Date.parse(limit.retryAt) : Number.NaN;
+  if (!Number.isNaN(retry) && retry > now) {
+    return `Cost Management is rate limiting. Next try ${clockText(retry, now)}.`;
+  }
+  const good = limit.goodAt ? Date.parse(limit.goodAt) : Number.NaN;
+  if (Number.isNaN(good)) {
+    return "Cost Management is rate limiting. There is no reading yet.";
+  }
+  return `Cost Management is rate limiting. These numbers are from the last good reading, ${ageText(good, now)}.`;
+}
+
+function ageText(ms: number, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - ms) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  return hours < 48 ? `${hours} h ago` : `${Math.floor(hours / 24)} d ago`;
+}
+
+type RateLimit = NonNullable<AzureCostAnswer["rateLimit"]>;
+
 /** The card's body for *view*, a list of nodes. */
-export function azureBody(view: AzureView): Child[] {
+export function azureBody(
+  view: AzureView,
+  rateLimit: AzureCostAnswer["rateLimit"] = null,
+  now = Date.now(),
+): Child[] {
   const { month, currency } = view;
   const delta = paceDelta(month.pace, month.lastMonth);
   return [
@@ -183,6 +233,7 @@ export function azureBody(view: AzureView): Child[] {
         month.through ? `this month, through ${dayText(month.through)}` : "this month",
       ),
     ),
+    rateLimit ? el("p", { class: "azure-limit meta", role: "status" }, rateLimitText(rateLimit, now)) : null,
     month.pace !== null
       ? el(
           "p",
@@ -257,6 +308,7 @@ interface SectionState {
   view: AzureView | null;
   configured: boolean;
   note: string | null;
+  rateLimit: AzureCostAnswer["rateLimit"];
   reading: boolean;
   asOf: number;
   error: unknown;
@@ -319,12 +371,12 @@ function render(parts: Parts, state: SectionState): void {
     const text = state.error ? null : "Reading...";
     replaceChildren(parts.list, [text ? el("p", { class: "meta" }, text) : null]);
   } else {
-    replaceChildren(parts.list, [...azureBody(state.view), costLink(parts, state)]);
+    replaceChildren(parts.list, [...azureBody(state.view, state.rateLimit), costLink(parts, state)]);
   }
   parts.refreshed.textContent = state.asOf
     ? `Updated ${new Date(state.asOf).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
     : "";
-  const tile = azureTile(state.view, state.configured, state.reading, state.error);
+  const tile = azureTile(state.view, state.configured, state.reading, state.error, state.rateLimit);
   setTile(state.view ? staleTile(tile, state.error) : tile, state.asOf || undefined);
 }
 
@@ -336,17 +388,22 @@ export function azureSection(): HTMLElement {
     el("p", { class: "meta refreshed azure-refreshed" }),
     el("div", { class: "page-status azure-status" }),
     el("section", { class: "azure-list", "aria-label": "Azure spend" }),
+    targetsSection(),
   );
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null;
 let onFocus: (() => void) | null = null;
+/** The Targets panel of the mounted card (azureTargets.ts); its reads ride on the card's own. */
+let targets: Targets | null = null;
 /** Bumped by every activate and deactivate, as in accounts.ts. */
 let generation = 0;
 
 function stop(): void {
   if (timer) clearTimeout(timer);
   timer = null;
+  targets?.dispose();
+  targets = null;
   if (!onFocus) return;
   window.removeEventListener("focus", onFocus);
   document.removeEventListener("visibilitychange", onFocus);
@@ -364,10 +421,14 @@ export function activateAzure(context: ExtensionContext, root: HTMLElement): voi
   const mine = ++generation;
   const live = () => generation === mine;
   stop();
+  const panel = root.querySelector<HTMLElement>(".azure-targets");
+  const mounted = panel ? mountTargets(context, panel) : null;
+  targets = mounted;
   const state: SectionState = {
     view: null,
     configured: true,
     note: null,
+    rateLimit: null,
     reading: false,
     asOf: 0,
     error: null,
@@ -396,6 +457,7 @@ export function activateAzure(context: ExtensionContext, root: HTMLElement): voi
           if (!live()) return;
           state.configured = answer.configured;
           state.note = answer.note;
+          state.rateLimit = answer.rateLimit ?? null;
           state.reading = Boolean(answer.reading);
           // The server's own reading time: the numbers are as old as that, not as the poll.
           if (answer.view) state.view = answer.view;
@@ -421,6 +483,9 @@ export function activateAzure(context: ExtensionContext, root: HTMLElement): voi
       .then(() => {
         if (!live()) return;
         render(parts, state);
+        // The targets are read on the card's own poll; they fail on their own, quietly.
+        if (state.configured && !state.adminOnly) void mounted?.refresh();
+        if (panel) panel.hidden = !state.configured || state.adminOnly;
         if (!state.adminOnly) schedule();
       })
       .finally(() => {

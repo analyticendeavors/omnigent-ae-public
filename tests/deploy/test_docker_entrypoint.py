@@ -274,7 +274,10 @@ def test_the_orchestrator_is_registered_even_when_the_box_line_omits_it(tmp_path
     assert off["OMNIGENT_BUILTIN_AGENT_DIRS"] == box
     unset: dict[str, str] = {}
     assert docker_entrypoint.ensure_agent_dirs(unset, extra) == str(orchestrator)
-    assert docker_entrypoint.EXTRA_AGENT_DIRS == ("/opt/ae/agents/orchestrator",)
+    assert docker_entrypoint.EXTRA_AGENT_DIRS == (
+        "/opt/ae/agents/orchestrator",
+        "/opt/ae/agents/preset-reviewer",
+    )
 
 
 _GRAPH_SPEC = """name: {name}

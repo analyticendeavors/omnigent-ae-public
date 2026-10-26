@@ -1,0 +1,402 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 09:54:50 -0700
+Subject: [PATCH 189/191] [ae-patch] Show a lead's family as labelled rows at
+ the top of the hover card
+
+The family's session count, open count and total sat on one small grey line under the status, easy to miss now that the lead row shows only its name. The hover card now opens with a FAMILY block: Preset (when set), Sessions (N, M open) and the family total as Spend shows sets it (Tokens or Cost; none when off). The block is its own component, so a session that leads nothing reads no roles or usage.
+---
+ .../components/AeSessionHoverStatus.test.tsx  |  47 ++++-
+ web/src/components/AeSessionHoverStatus.tsx   | 165 ++++++++++++------
+ web/src/shell/Sidebar.aeFamilies.test.tsx     |  33 ++--
+ 3 files changed, 173 insertions(+), 72 deletions(-)
+
+diff --git a/web/src/components/AeSessionHoverStatus.test.tsx b/web/src/components/AeSessionHoverStatus.test.tsx
+index 83a1204be622cbc9d99b77074cd390523f1180d8..f673d5ceca04551088b7c2d2aceae8a3d5a81776 100644
+--- a/web/src/components/AeSessionHoverStatus.test.tsx
++++ b/web/src/components/AeSessionHoverStatus.test.tsx
+@@ -4,6 +4,11 @@ import { cleanup, render as rtlRender, screen, waitFor } from "@testing-library/
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++// The family block names a lead's preset from the roles document.
++vi.mock("@/hooks/useAeRoles", async (importOriginal) => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  useAeRoles: () => ({ data: { presets: [{ id: "balanced", title: "Balanced build preset" }] } }),
++}));
+ 
+ import { authenticatedFetch } from "@/lib/identity";
+ import { aeFamilies } from "@/lib/aeFamily";
+@@ -324,10 +329,39 @@ describe("AeSessionHoverStatus", () => {
+         </AeFamilyContext.Provider>,
+       );
+       await waitFor(() =>
+-        expect(screen.getByTestId("ae-hover-lead-line")).toHaveTextContent(
+-          "leads 1 session, 1 open · family 232.8k tokens",
+-        ),
++        expect(screen.getByTestId("ae-hover-family-spend").textContent).toBe("Tokens232.8k"),
+       );
++      expect(screen.getByTestId("ae-hover-family-sessions").textContent).toBe("Sessions1, 1 open");
++      // The family block sits above the status block.
++      const family = screen.getByTestId("ae-hover-family");
++      expect(
++        family.compareDocumentPosition(screen.getByTestId("ae-hover-status")) &
++          Node.DOCUMENT_POSITION_FOLLOWING,
++      ).toBeTruthy();
++      expect(screen.queryByTestId("ae-hover-role-line")).toBeNull();
++    });
++
++    it("names a lead's preset, in full on hover, and only when the preset is known", async () => {
++      answerUsage();
++      const view = familyView([row("lead", {}, "PR3 lead"), row("a", { "ae.orch": "lead" }, "A")]);
++      const lead = (preset: string) => (
++        <AeFamilyContext.Provider value={view}>
++          <AeSessionHoverStatus
++            sessionId="lead"
++            state={{ kind: "idle" } as never}
++            updatedAt={NOW}
++            labels={{ "ae.preset": preset }}
++          />
++        </AeFamilyContext.Provider>
++      );
++      const known = render(lead("balanced"));
++      const preset = screen.getByTestId("ae-hover-family-preset");
++      expect(preset.textContent).toBe("PresetBalanced build preset");
++      expect(preset).toHaveAttribute("title", "Balanced build preset");
++      known.unmount();
++      render(lead("gone"));
++      expect(screen.getByTestId("ae-hover-family")).toBeInTheDocument();
++      expect(screen.queryByTestId("ae-hover-family-preset")).toBeNull();
+     });
+ 
+     it("shows a lead's session count and family total", async () => {
+@@ -349,10 +383,9 @@ describe("AeSessionHoverStatus", () => {
+         </AeFamilyContext.Provider>,
+       );
+       await waitFor(() =>
+-        expect(screen.getByTestId("ae-hover-lead-line")).toHaveTextContent(
+-          "leads 2 sessions, 2 open · family $4.92",
+-        ),
++        expect(screen.getByTestId("ae-hover-family-spend").textContent).toBe("Cost$4.92"),
+       );
++      expect(screen.getByTestId("ae-hover-family-sessions").textContent).toBe("Sessions2, 2 open");
+     });
+ 
+     it("adds no line to a plain session", () => {
+@@ -366,7 +399,7 @@ describe("AeSessionHoverStatus", () => {
+         />,
+       );
+       expect(screen.queryByTestId("ae-hover-role-line")).toBeNull();
+-      expect(screen.queryByTestId("ae-hover-lead-line")).toBeNull();
++      expect(screen.queryByTestId("ae-hover-family")).toBeNull();
+     });
+   });
+ });
+diff --git a/web/src/components/AeSessionHoverStatus.tsx b/web/src/components/AeSessionHoverStatus.tsx
+index 37e61a547fa752cc74f525f0558c732dbc0892d0..ce4a8c15d6567d2c3d2609cd72de359e11585534 100644
+--- a/web/src/components/AeSessionHoverStatus.tsx
++++ b/web/src/components/AeSessionHoverStatus.tsx
+@@ -3,19 +3,14 @@
+ // question, agents or last reply fetched only while the card is open.
+ 
+ import { useQuery } from "@tanstack/react-query";
+-import { useContext, useEffect, useState } from "react";
++import { type ReactNode, useContext, useEffect, useState } from "react";
+ import { RunningDot } from "@/components/RunningDot";
+ import { type ChildSessionInfo, fetchChildSessions } from "@/hooks/useChildSessions";
+ import type { SessionState } from "@/hooks/useSessionState";
+ import { useAeRoles } from "@/hooks/useAeRoles";
+ import { aeAgentRole, aeFormatCost, aeFormatTokens, aeRoleName } from "@/lib/aeAgentRole";
+-import {
+-  AE_MODEL_FAMILY_BG,
+-  type AeSessionUsage,
+-  aeModelFamily,
+-  useAeSessionUsages,
+-} from "@/lib/aeAgentUsage";
+-import { aeOrchParent } from "@/lib/aeFamily";
++import { AE_MODEL_FAMILY_BG, aeModelFamily, useAeSessionUsages } from "@/lib/aeAgentUsage";
++import { type AeFamily, aeOrchParent } from "@/lib/aeFamily";
+ import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
+ import { aeSpendLabel, useAeSpendDisplay } from "@/lib/aeSpendDisplay";
+ import { AeFamilyContext } from "@/lib/aeFamilyView";
+@@ -115,36 +110,110 @@ function RunningAgents({ sessionId, updatedAt }: { sessionId: string; updatedAt:
+   );
+ }
+ 
+-function LeadLine({
++/** One label and value row of the family block, as the card's details rows read. */
++function FamilyRow({
++  label,
++  testId,
++  title,
++  children,
++}: {
++  label: string;
++  testId: string;
++  title?: string;
++  children: ReactNode;
++}) {
++  return (
++    <div data-testid={testId} className="flex items-center justify-between gap-3" title={title}>
++      <span className="shrink-0 text-muted-foreground">{label}</span>
++      <span className="min-w-0 truncate tabular-nums">{children}</span>
++    </div>
++  );
++}
++
++/**
++ * A lead's family, as its own block above the status (2026-10-26, replacing
++ * the grey "leads N sessions · family X" line): its preset, its sessions with
++ * how many are open, and the family total as Spend shows sets it. The lead row
++ * itself shows only its name (patch 0184), so this is where the counts live.
++ */
++function AeFamilyBlock({
++  sessionId,
+   labels,
+-  count,
+-  open,
+-  usage,
++  updatedAt,
+ }: {
++  sessionId: string;
+   labels: Record<string, string> | undefined;
+-  count: number;
+-  /** Sessions not closed (reference or archived); the lead row itself shows no count. */
+-  open: number;
+-  usage: ReadonlyMap<string, AeSessionUsage>;
++  updatedAt: number;
+ }) {
++  const { families } = useContext(AeFamilyContext);
++  const familyRole = families.byRow.get(sessionId);
++  const lead =
++    familyRole?.isLead === true && familyRole.family.members.length > 1 ? familyRole.family : null;
++  // Its own component, so a session that leads nothing reads no roles or usage.
++  return lead ? (
++    <FamilyBlockBody sessionId={sessionId} lead={lead} labels={labels} updatedAt={updatedAt} />
++  ) : null;
++}
++
++function FamilyBlockBody({
++  sessionId,
++  lead,
++  labels,
++  updatedAt,
++}: {
++  sessionId: string;
++  lead: AeFamily;
++  labels: Record<string, string> | undefined;
++  updatedAt: number;
++}) {
++  const { tree } = useContext(AeFamilyContext);
+   const roles = useAeRoles();
+-  const spend = aeSpendLabel(usage.values(), useAeSpendDisplay());
++  const mode = useAeSpendDisplay();
++  // A lead's total is its family's sessions, each read once.
++  const usage = useAeSessionUsages(
++    lead.members.map((m) => ({ id: m.id, stamp: m.id === sessionId ? updatedAt : 0 })),
++  );
++  // Grouping > Family also counts archived children, as its "N closed" row does.
++  const treeLead = tree?.leads.get(sessionId);
++  const others = lead.members.filter((m) => m.id !== sessionId);
++  const count = treeLead?.count ?? others.length;
++  const open = treeLead
++    ? (treeLead.closed?.open ?? treeLead.count)
++    : others.filter((m) => !aeIsClosedMember(m)).length;
++  const spend = aeSpendLabel(usage.values(), mode);
+   const presetId = labels?.["ae.preset"];
+-  const title = roles.data?.presets.find((p) => p.id === presetId)?.title ?? null;
+-  const parts = [
+-    title,
+-    `leads ${count} session${count === 1 ? "" : "s"}, ${open} open`,
+-    spend ? `family ${spend.long}` : null,
+-  ].filter(Boolean);
++  const preset = roles.data?.presets.find((p) => p.id === presetId)?.title ?? null;
+   return (
+-    // Wraps rather than truncates, so the family total at the end stays readable.
+-    <p className="text-xs text-muted-foreground" data-testid="ae-hover-lead-line">
+-      {parts.join(" · ")}
+-    </p>
++    <div
++      className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5 text-sm"
++      data-testid="ae-hover-family"
++    >
++      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
++        Family
++      </p>
++      {preset && (
++        // Truncates in the narrow card; the title holds the whole name.
++        <FamilyRow label="Preset" testId="ae-hover-family-preset" title={preset}>
++          {preset}
++        </FamilyRow>
++      )}
++      <FamilyRow label="Sessions" testId="ae-hover-family-sessions">
++        {count}, {open} open
++      </FamilyRow>
++      {spend && (
++        <FamilyRow
++          label={spend.unit === "estimated" ? "Cost" : "Tokens"}
++          testId="ae-hover-family-spend"
++          title={spend.title}
++        >
++          {spend.long.replace(/ tokens$/, "")}
++        </FamilyRow>
++      )}
++    </div>
+   );
+ }
+ 
+-/** Third line: a started session's role, model and use, or a lead's preset and family total. */
++/** Third line: a started session's role, model and use. A lead's family: `AeFamilyBlock`. */
+ function AeRoleLine({
+   sessionId,
+   labels,
+@@ -154,30 +223,19 @@ function AeRoleLine({
+   labels: Record<string, string> | undefined;
+   updatedAt: number;
+ }) {
+-  const { families, tree } = useContext(AeFamilyContext);
++  const { families } = useContext(AeFamilyContext);
+   const mode = useAeSpendDisplay();
+   const role = aeAgentRole({ labels });
+   const familyRole = families.byRow.get(sessionId);
+   const started = role !== null || aeOrchParent(labels) !== null;
+-  const lead =
+-    familyRole?.isLead === true && familyRole.family.members.length > 1 ? familyRole.family : null;
+-  // A lead's total is its family's sessions, each read once; a child shows its own use.
+-  const ids = lead ? lead.members.map((m) => m.id) : started ? [sessionId] : [];
++  const lead = familyRole?.isLead === true && familyRole.family.members.length > 1;
++  // A child shows its own use; a lead's family total is AeFamilyBlock's.
++  const ids = !lead && started ? [sessionId] : [];
+   const usage = useAeSessionUsages(
+     ids.map((id) => ({ id, stamp: id === sessionId ? updatedAt : 0 })),
+     { enabled: ids.length > 0 },
+   );
+-  if (lead) {
+-    // Grouping > Family also counts archived children, as its "N closed" row does.
+-    const treeLead = tree?.leads.get(sessionId);
+-    const others = lead.members.filter((m) => m.id !== sessionId);
+-    const count = treeLead?.count ?? others.length;
+-    const open = treeLead
+-      ? (treeLead.closed?.open ?? treeLead.count)
+-      : others.filter((m) => !aeIsClosedMember(m)).length;
+-    return <LeadLine labels={labels} count={count} open={open} usage={usage} />;
+-  }
+-  if (!started) return null;
++  if (lead || !started) return null;
+   const own = usage.get(sessionId);
+   const ownSpend = own ? aeSpendLabel([own], mode) : null;
+   const detail = [
+@@ -320,13 +378,16 @@ export function AeSessionHoverStatus({
+   }
+ 
+   return (
+-    <div
+-      className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5"
+-      data-testid="ae-hover-status"
+-      data-kind={kind}
+-    >
+-      {body}
+-      <AeRoleLine sessionId={sessionId} labels={labels} updatedAt={updatedAt} />
+-    </div>
++    <>
++      <AeFamilyBlock sessionId={sessionId} labels={labels} updatedAt={updatedAt} />
++      <div
++        className="mt-2.5 flex flex-col gap-1 border-t border-border pt-2.5"
++        data-testid="ae-hover-status"
++        data-kind={kind}
++      >
++        {body}
++        <AeRoleLine sessionId={sessionId} labels={labels} updatedAt={updatedAt} />
++      </div>
++    </>
+   );
+ }
+diff --git a/web/src/shell/Sidebar.aeFamilies.test.tsx b/web/src/shell/Sidebar.aeFamilies.test.tsx
+index 0b583a61c25738681723141b10719a511202327b..beb686ba9ed55a6aefe832e1a7300ad4941d6bd8 100644
+--- a/web/src/shell/Sidebar.aeFamilies.test.tsx
++++ b/web/src/shell/Sidebar.aeFamilies.test.tsx
+@@ -128,14 +128,19 @@ function rowNames(): string[] {
+   );
+ }
+ 
+-/** Hovers a lead's row and returns its hover card's lead line, once it reads `text`. */
+-async function leadLine(name: string, text: string): Promise<HTMLElement> {
++/**
++ * Hovers a lead's row and returns its hover card's family block, once its
++ * `field` (sessions or spend) reads `text`, label and value run together.
++ */
++async function familyBlock(name: string, field: string, text: string): Promise<HTMLElement> {
+   const link = rowItem(name).querySelector<HTMLElement>(`a[href="/c/${sid(name)}"]`)!;
+   fireEvent.pointerMove(link, { pointerType: "mouse" });
+   const card = await screen.findByTestId("session-tooltip-content");
+-  const line = await within(card).findByTestId("ae-hover-lead-line");
+-  await waitFor(() => expect(line.textContent).toContain(text));
+-  return line;
++  const block = await within(card).findByTestId("ae-hover-family");
++  await waitFor(() =>
++    expect(within(block).queryByTestId(`ae-hover-family-${field}`)?.textContent).toBe(text),
++  );
++  return block;
+ }
+ 
+ function dotOf(name: string): HTMLElement | null {
+@@ -296,8 +301,10 @@ describe("Grouping > Family", () => {
+     expect(badge.getAttribute("title")).toBe("Builder");
+     expect(within(rowItem("Families PR")).queryByTestId("ae-family-role")).toBeNull();
+     // Lead plus its three listed sessions at $1.50 each (cost only, as Claude reports).
+-    const line = await leadLine("Role routing build", "family $6.00");
+-    expect(line.textContent).toBe("leads 3 sessions, 3 open · family $6.00");
++    const block = await familyBlock("Role routing build", "spend", "Cost$6.00");
++    expect(within(block).getByTestId("ae-hover-family-sessions").textContent).toBe(
++      "Sessions3, 3 open",
++    );
+   });
+ 
+   it.each([
+@@ -330,7 +337,7 @@ describe("Grouping > Family", () => {
+     setView({ grouping: "family" });
+     renderSidebar();
+     const lead = rowItem("Role routing build");
+-    await leadLine("Role routing build", "family $4.00");
++    await familyBlock("Role routing build", "spend", "Cost$4.00");
+     const chevron = within(lead).getByTestId("ae-family-fold");
+     expect(chevron.textContent).toBe("");
+     expect(chevron.getAttribute("aria-label")).toBe("Hide 3 sessions");
+@@ -445,16 +452,16 @@ describe("Grouping > Family", () => {
+       window.localStorage.setItem("omnigent:ae-spend-display", "tokens");
+       tokenUsage();
+       renderSidebar();
+-      await leadLine("Role routing build", "family 400k tokens");
++      await familyBlock("Role routing build", "spend", "Tokens400k");
+     });
+ 
+     it("shows no family total on the hover card when off", async () => {
+       window.localStorage.setItem("omnigent:ae-spend-display", "off");
+       tokenUsage();
+       renderSidebar();
+-      const line = await leadLine("Role routing build", "leads 3 sessions, 3 open");
++      const block = await familyBlock("Role routing build", "sessions", "Sessions3, 3 open");
+       await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+-      expect(line.textContent).not.toContain("family");
++      expect(within(block).queryByTestId("ae-hover-family-spend")).toBeNull();
+     });
+   });
+ 
+@@ -475,7 +482,7 @@ describe("Grouping > Family", () => {
+     );
+     setView({ grouping: "family" });
+     renderSidebar();
+-    await leadLine("Role routing build", "family 400k tokens");
++    await familyBlock("Role routing build", "spend", "Tokens400k");
+   });
+ 
+   it("folds a family from the lead's chevron and remembers it", () => {
+@@ -527,7 +534,7 @@ describe("Grouping > Family", () => {
+       view.rerenderSidebar();
+       expect(closedNames()).toEqual(["Old helper"]);
+       expect(JSON.parse(localStorage.getItem("omnigent:ae-family-closed-open")!)).toEqual([lead]);
+-      await leadLine("Role routing build", "leads 5 sessions, 4 open");
++      await familyBlock("Role routing build", "sessions", "Sessions5, 4 open");
+     });
+ 
+     it("counts archived children and lists them with the open group", async () => {

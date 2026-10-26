@@ -1,0 +1,3534 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 16:17:16 -0700
+Subject: [PATCH 165/191] [ae-patch] Fold the composer's Auto, Solo and Team
+ button into the roles preset pill, with a Helpers rule per preset and
+ sessions added per chat
+
+---
+ omnigent/inner/ae_roles.py                    | 102 +++-
+ omnigent/inner/ae_team.py                     |   9 +-
+ tests/inner/test_ae_roles.py                  | 126 ++++-
+ tests/inner/test_ae_team.py                   |   9 +
+ web/src/components/AeSessionPresetRow.tsx     |  55 +-
+ web/src/components/AeTeamControl.stories.tsx  |   1 -
+ web/src/components/AeTeamControl.test.tsx     | 407 ++++++++++-----
+ web/src/components/AeTeamControl.tsx          | 483 +++++++++---------
+ .../composer/AePresetSessionsSection.tsx      | 166 ++++++
+ .../composer/AeSessionPresetPill.tsx          | 283 +++++++---
+ web/src/hooks/useAeSessionPreset.ts           |  65 ++-
+ web/src/lib/aeRoles.ts                        |  36 +-
+ web/src/lib/aeSessionRoles.test.ts            |  28 +
+ web/src/lib/aeSessionRoles.ts                 |  72 ++-
+ web/src/lib/aeStartOnApply.test.ts            |  38 +-
+ web/src/lib/aeStartOnApply.ts                 |  27 +-
+ web/src/lib/aeTeam.test.ts                    | 144 ++++--
+ web/src/lib/aeTeam.ts                         |  53 +-
+ web/src/lib/aeTeamPresets.test.ts             | 206 ++++++++
+ web/src/lib/aeTeamPresets.ts                  | 130 +++++
+ web/src/pages/settings/AeRolesControls.tsx    |  15 +-
+ web/src/pages/settings/AeRolesEditor.tsx      |  12 +
+ web/src/pages/settings/AeRolesPresetRow.tsx   |   4 +-
+ .../settings/AeRolesSettingsSection.test.tsx  |  24 +
+ 24 files changed, 1972 insertions(+), 523 deletions(-)
+ create mode 100644 web/src/components/composer/AePresetSessionsSection.tsx
+ create mode 100644 web/src/lib/aeTeamPresets.test.ts
+ create mode 100644 web/src/lib/aeTeamPresets.ts
+
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index a1ad48e865ee2f9ebe8d746c3d2a48f874fa6546..f910b25cdfa419f3f82d5b0b54f7f3e3e402664b 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -16,6 +16,14 @@ the user's presets (``{"preset": id}``, optionally with a session-only
+ ``custom`` roles and rules pair), ``lead-picks`` to let the lead choose, else the
+ user's default. The user is the session owner, ``local`` when there is none.
+ When the omnigent-ae package is not installed, the Balanced starter applies.
++
++Helpers (2026-10-23, when the composer's Auto / Solo / Team button folded into
++presets): every preset's rules carry ``helpers``, ``any`` or ``own``. The
++collaboration mode the lead is told follows from it in :func:`with_roles`:
++Solo when the preset keeps work in house (``own``), else Team when the label
++lists sessions, else Solo for a label still saved as mode ``solo``, else Auto.
++A label saved as Solo before presets had the rule reads as the ``solo`` preset
++when the user has one, else the default with ``helpers`` set to ``own``.
+ """
+ 
+ from __future__ import annotations
+@@ -68,8 +76,15 @@ BALANCED: dict[str, Any] = {
+         "builder": _fixed("sonnet", "medium"),
+         "helper": _fixed("haiku", "low"),
+     },
+-    "rules": {"raise_or_lower": "tell", "lead_steps_down": True, "auto_raises": 1},
++    "rules": {
++        "raise_or_lower": "tell",
++        "lead_steps_down": True,
++        "auto_raises": 1,
++        "helpers": "any",
++    },
+ }
++SOLO = "solo"
++OWN = "own"
+ 
+ 
+ def _role_prefs() -> Any | None:
+@@ -112,8 +127,8 @@ def _owner(conv: Conversation, store: ConversationStore) -> str:
+     return LOCAL_USER
+ 
+ 
+-def _label_override(conv: Conversation) -> dict[str, Any] | None:
+-    """The ``roles`` field of a well-formed ``ae.team`` label, or ``None``."""
++def _label(conv: Conversation) -> dict[str, Any] | None:
++    """A well-formed ``ae.team`` label, or ``None``."""
+     raw = conv.labels.get(TEAM_LABEL) if isinstance(conv.labels, dict) else None
+     if not isinstance(raw, str) or not raw or len(raw) > _LABEL_MAX:
+         return None
+@@ -123,6 +138,20 @@ def _label_override(conv: Conversation) -> dict[str, Any] | None:
+         return None
+     if not isinstance(config, dict) or config.get("version") != 1:
+         return None
++    return config
++
++
++def _legacy_solo(conv: Conversation) -> bool:
++    """True for a label still saved as mode ``solo`` (written before the Helpers rule)."""
++    config = _label(conv)
++    return config is not None and config.get("mode") == SOLO
++
++
++def _label_override(conv: Conversation) -> dict[str, Any] | None:
++    """The ``roles`` field of a well-formed ``ae.team`` label, or ``None``."""
++    config = _label(conv)
++    if config is None:
++        return None
+     roles = config.get("roles")
+     if not isinstance(roles, dict) or not isinstance(roles.get("preset"), str):
+         return None
+@@ -138,16 +167,43 @@ def _summary(preset: dict[str, Any]) -> dict[str, Any]:
+     }
+ 
+ 
++def helpers_of(roles: object) -> str:
++    """``own`` when the resolved preset keeps work with the lead's own subagents, else ``any``."""
++    preset = roles.get("preset") if isinstance(roles, dict) else None
++    rules = preset.get("rules") if isinstance(preset, dict) else None
++    return OWN if isinstance(rules, dict) and rules.get("helpers") == OWN else "any"
++
++
++def _own_helpers(roles: dict[str, Any]) -> dict[str, Any]:
++    """*roles* with the resolved preset's Helpers rule set to ``own``."""
++    preset = roles.get("preset")
++    if not isinstance(preset, dict):
++        return roles
++    rules = preset.get("rules") if isinstance(preset.get("rules"), dict) else {}
++    return {**roles, "preset": {**preset, "rules": {**rules, "helpers": OWN}}}
++
++
+ def resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, Any]:
+     """The preset in force for *conv*'s next turn, as notice metadata.
+ 
++    A label still saved as mode ``solo`` keeps work in house: with no ``roles``
++    field it reads as the ``solo`` preset (the default when the user has none),
++    and the resolved preset's Helpers rule reads as ``own`` either way.
++
+     :returns: ``{"preset": {...}, "custom": bool}``, or ``{"lead_picks": True,
+         "presets": [...], "more": n}`` when the session lets the lead choose.
+     """
++    roles = _resolve_roles(conv, store)
++    return _own_helpers(roles) if _legacy_solo(conv) else roles
++
++
++def _resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, Any]:
+     default_id, presets = _load_prefs(_owner(conv, store))
+     by_id = {p.get("id"): p for p in presets}
+     override = _label_override(conv)
+     chosen_id = override["preset"] if override else None
++    if chosen_id is None and _legacy_solo(conv) and SOLO in by_id:
++        chosen_id = SOLO
+     if chosen_id == LEAD_PICKS:
+         shown = presets[:LEAD_PICKS_SHOWN]
+         return {
+@@ -193,6 +249,8 @@ def with_roles(
+     """*notice* (or a new one) with the resolved roles under ``ae_roles``; never raises.
+ 
+     A child session is a helper, not a lead, so its notice is returned as is.
++    The ``ae_team`` mode becomes the one the preset and label call for (see
++    :func:`effective_mode`).
+     """
+     if _is_child(conv):
+         return notice
+@@ -201,7 +259,40 @@ def with_roles(
+     except Exception:  # noqa: BLE001 (the notice must never break a message)
+         _logger.warning("ae roles: could not resolve the preset; using Balanced", exc_info=True)
+         roles = {"preset": _summary(BALANCED), "custom": False}
+-    return {**(notice or {}), "ae_roles": roles}
++    return {**effective_mode(notice, roles), "ae_roles": roles}
++
++
++def effective_mode(notice: dict[str, object] | None, roles: object) -> dict[str, object]:
++    """*notice* with its ``ae_team`` mode set from the preset (a copy; never raises).
++
++    Solo when the preset's Helpers rule is ``own`` (its sessions, if any, wait
++    unused until another preset is picked); else Team when the label lists
++    sessions that still resolve; else Solo for a legacy mode ``solo`` label; else Auto.
++    """
++    team = notice.get("ae_team") if isinstance(notice, dict) else None
++    if not isinstance(team, dict):
++        if helpers_of(roles) == OWN:
++            # No readable team notice, but the preset keeps work in house.
++            return {**(notice or {}), "ae_team": {"mode": SOLO, "members": []}}
++        return dict(notice or {})
++    mode = team.get("mode")
++    if helpers_of(roles) == OWN:
++        mode = SOLO
++    elif mode == "team" and team.get("members"):
++        return dict(notice or {})
++    elif mode != SOLO:
++        mode = "auto"
++    return {**(notice or {}), "ae_team": {"mode": mode, "members": []}}
++
++
++def solo_opening(metadata: object) -> str:
++    """The Solo notice's first clause, naming the preset that keeps work in house."""
++    roles = metadata.get("ae_roles") if isinstance(metadata, dict) else None
++    preset = roles.get("preset") if isinstance(roles, dict) else None
++    title = _text(preset.get("title"), 40) if isinstance(preset, dict) else ""
++    if not title:
++        return "This session keeps work in house"
++    return f'This session\'s preset ("{title}") keeps work in house'
+ 
+ 
+ def _text(value: object, limit: int) -> str:
+@@ -234,7 +325,8 @@ def _rules_short(rules: object) -> str:
+     raises = rules.get("auto_raises")
+     raises = raises if isinstance(raises, int) and not isinstance(raises, bool) else 0
+     down = "steps down" if rules.get("lead_steps_down") is True else "no step down"
+-    return f"{change}, {down}, {raises} raise{'' if raises == 1 else 's'}"
++    helpers = "own subagents only" if rules.get("helpers") == OWN else "any agent or session"
++    return f"{change}, {down}, {raises} raise{'' if raises == 1 else 's'}, {helpers}"
+ 
+ 
+ def _rules(rules: object) -> str:
+diff --git a/omnigent/inner/ae_team.py b/omnigent/inner/ae_team.py
+index b65ef401f3f586bc67f740243dfb5c43e92708ee..049d8b5e8dac5aba1cc0fcf52f691672f0b85214 100644
+--- a/omnigent/inner/ae_team.py
++++ b/omnigent/inner/ae_team.py
+@@ -5,7 +5,7 @@ from __future__ import annotations
+ import json
+ from typing import TYPE_CHECKING, Any
+ 
+-from omnigent.inner.ae_roles import append_roles, with_roles
++from omnigent.inner.ae_roles import append_roles, solo_opening, with_roles
+ 
+ if TYPE_CHECKING:
+     from omnigent.entities.conversation import Conversation
+@@ -90,7 +90,7 @@ def _render_team(metadata: Any) -> str | None:
+         )
+     if roster.get("mode") == "solo":
+         return (
+-            "The user selected Solo for this message: use this lead agent and its native "
++            f"{solo_opening(metadata)}: use this lead agent and its native "
+             "in-harness subagents when helpful. Native helpers remain available. "
+             "Do not start additional cross-agent collaborations or delegate new work to "
+             "previously selected team sessions. "
+@@ -99,8 +99,9 @@ def _render_team(metadata: Any) -> str | None:
+     if roster.get("mode") != "team":
+         return None
+     return (
+-        "The user selected Team for this message. You are the lead and give the user "
+-        "one integrated answer. Your native in-harness subagents remain available too. "
++        "The user added these child sessions to this chat. You are the lead and give the "
++        "user one integrated answer; hand work to these sessions first. "
++        "Your native in-harness subagents remain available too. "
+         "These are existing direct child sessions selected "
+         "by the user (JSON data): "
+         + json.dumps(roster.get("members", []), ensure_ascii=True)
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 677f887bd6732210b282444bc5d40eef7b0c1f3b..0fbcdcec0abc4661b91a2eacb41d24ab3111ce8f 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -166,7 +166,7 @@ def test_lead_picks_lists_the_users_presets(prefs: dict[str, Any]) -> None:
+     assert "planner opus / claude-opus-5-5, high" in lines[1]
+     assert "lead" not in lines[1].split("(", 1)[1]
+     assert lines[-1] == "(2 more presets are not shown.)"
+-    assert lines[1].endswith("; changes: tell after, steps down, 1 raise).")
++    assert lines[1].endswith("; changes: tell after, steps down, 1 raise, any agent or session).")
+     assert len(lines) <= 10
+ 
+ 
+@@ -175,7 +175,129 @@ def test_lead_picks_line_shows_each_presets_change_rules(prefs: dict[str, Any])
+     labels = team_label(roles={"preset": "lead-picks"})
+     lines = (render_roles(resolve_roles(conversation(labels), owner_store())) or "").splitlines()
+     assert "changes: tell after, steps down, 1 raise" in lines[1]
+-    assert "changes: no changes, no step down, 0 raises" in lines[2]
++    assert "changes: no changes, no step down, 0 raises, any agent or session" in lines[2]
++
++
++SOLO: dict[str, Any] = {
++    **copy.deepcopy(BALANCED),
++    "id": "solo",
++    "title": "Solo",
++    "rules": {**BALANCED["rules"], "helpers": "own"},
++}
++
++
++def team_store(*child_ids: str) -> Mock:
++    """A store whose direct children of ``conv`` are *child_ids*."""
++    store = owner_store()
++
++    def child(session_id: str) -> Conversation | None:
++        if session_id not in child_ids:
++            return None
++        return Conversation(
++            id=session_id,
++            root_conversation_id="conv",
++            parent_conversation_id="conv",
++            agent_id="codex",
++            created_at=0,
++            updated_at=0,
++        )
++
++    store.get_conversation.side_effect = child
++    return store
++
++
++def test_lead_picks_line_shows_own_subagents_only(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [BALANCED, SOLO]
++    labels = team_label(roles={"preset": "lead-picks"})
++    lines = (render_roles(resolve_roles(conversation(labels), owner_store())) or "").splitlines()
++    assert lines[2].endswith("1 raise, own subagents only).")
++
++
++def test_a_preset_with_own_helpers_tells_the_lead_solo(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [BALANCED, SOLO]
++    notice = team_notice(conversation(team_label(roles={"preset": "solo"})), owner_store())
++    assert notice["ae_team"] == {"mode": "solo", "members": []}
++    text = render_team_notice(notice) or ""
++    assert text.startswith(
++        'This session\'s preset ("Solo") keeps work in house: use this lead agent and its '
++        "native in-harness subagents when helpful."
++    )
++    assert "\n\nRoles preset: Solo." in text
++
++
++def test_own_helpers_win_over_added_sessions(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [BALANCED, SOLO]
++    labels = {
++        TEAM_LABEL: json.dumps(
++            {
++                "version": 1,
++                "mode": "team",
++                "members": [{"sessionId": "kid"}],
++                "roles": {"preset": "solo"},
++            }
++        )
++    }
++    notice = team_notice(conversation(labels), team_store("kid"))
++    assert notice["ae_team"] == {"mode": "solo", "members": []}
++
++
++def test_own_helpers_tell_solo_when_the_team_notice_is_unreadable() -> None:
++    own = {"preset": {"id": "solo", "title": "Solo", "rules": {"helpers": "own"}}}
++    assert ae_roles.effective_mode(None, own)["ae_team"] == {"mode": "solo", "members": []}
++    any_ = {"preset": {"id": "yolo", "title": "Yolo", "rules": {"helpers": "any"}}}
++    assert ae_roles.effective_mode(None, any_) == {}
++
++
++def test_added_sessions_tell_the_lead_team(prefs: dict[str, Any]) -> None:
++    labels = {
++        TEAM_LABEL: json.dumps({"version": 1, "mode": "team", "members": [{"sessionId": "kid"}]})
++    }
++    notice = team_notice(conversation(labels), team_store("kid"))
++    assert notice["ae_team"] == {
++        "mode": "team",
++        "members": [{"session_id": "kid", "agent_id": "codex"}],
++    }
++    text = render_team_notice(notice) or ""
++    assert text.startswith(
++        "The user added these child sessions to this chat. You are the lead and give the user "
++        "one integrated answer; hand work to these sessions first."
++    )
++    assert '"session_id": "kid"' in text
++
++
++def test_any_helpers_and_no_sessions_is_auto(prefs: dict[str, Any]) -> None:
++    notice = team_notice(conversation(team_label(roles={"preset": "yolo"})), owner_store())
++    assert notice["ae_team"] == {"mode": "auto", "members": []}
++
++
++def test_a_legacy_solo_label_reads_as_the_solo_preset(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [BALANCED, SOLO]
++    labels = {TEAM_LABEL: '{"version":1,"mode":"solo","members":[]}'}
++    notice = team_notice(conversation(labels), owner_store())
++    assert notice["ae_roles"]["preset"]["id"] == "solo"
++    assert notice["ae_team"]["mode"] == "solo"
++
++
++def test_a_legacy_solo_label_without_a_solo_preset_keeps_work_in_house(
++    prefs: dict[str, Any],
++) -> None:
++    labels = {TEAM_LABEL: '{"version":1,"mode":"solo","members":[]}'}
++    notice = team_notice(conversation(labels), owner_store())
++    assert notice["ae_roles"]["preset"]["id"] == "balanced"
++    assert notice["ae_roles"]["preset"]["rules"]["helpers"] == "own"
++    assert notice["ae_team"]["mode"] == "solo"
++    assert (render_team_notice(notice) or "").startswith(
++        'This session\'s preset ("Balanced") keeps work in house'
++    )
++
++
++def test_a_legacy_solo_label_with_a_preset_keeps_that_preset(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [BALANCED, SOLO, YOLO]
++    labels = {TEAM_LABEL: json.dumps({"version": 1, "mode": "solo", "roles": {"preset": "yolo"}})}
++    notice = team_notice(conversation(labels), owner_store())
++    assert notice["ae_roles"]["preset"]["id"] == "yolo"
++    assert notice["ae_roles"]["preset"]["rules"]["helpers"] == "own"
++    assert notice["ae_team"]["mode"] == "solo"
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/tests/inner/test_ae_team.py b/tests/inner/test_ae_team.py
+index 99d5c150e4c6990fa9ac92a2c5859e54d05c4389..f2143d76af4c25f75ef371110a451eb04103d8fa 100644
+--- a/tests/inner/test_ae_team.py
++++ b/tests/inner/test_ae_team.py
+@@ -100,3 +100,12 @@ def test_notice_is_transient_and_cannot_be_authored_by_clients() -> None:
+     assert expanded[1] == {"role": "user", "content": content[:1]}
+     with pytest.raises(ValueError, match="reserved"):
+         MessageData(role="user", content=content)
++
++
++def test_team_label_whose_sessions_are_gone_reads_as_auto() -> None:
++    label = json.dumps({"version": 1, "mode": "team", "members": [{"sessionId": "gone"}]})
++    store = Mock()
++    store.get_conversation.return_value = None
++    notice = team_notice(conversation("parent", labels={TEAM_LABEL: label}), store)
++    assert notice["ae_team"] == {"mode": "auto", "members": []}
++    assert "Auto collaboration" in (render_team_notice(notice) or "")
+diff --git a/web/src/components/AeSessionPresetRow.tsx b/web/src/components/AeSessionPresetRow.tsx
+index 3c8f912348313aaf2d87e7b8b8427c55ccf5ccb2..6c03a9115e5d59949d3732cd327519e5e24f37f4 100644
+--- a/web/src/components/AeSessionPresetRow.tsx
++++ b/web/src/components/AeSessionPresetRow.tsx
+@@ -2,7 +2,9 @@
+ // Chips for "Lead picks" and each preset, a one-line summary of the chosen
+ // preset's roles, and Customize, which opens the five role rows for this
+ // session only. A customized table can be saved as a new preset. The dialog's
+-// Save writes the choice into the session's ae.team label.
++// Save writes the choice into the session's ae.team label. The Helpers line
++// (2026-10-23) shows the preset's Helpers rule; Change overrides it for this
++// session only, the same way Customize does for the roles.
+ 
+ import { WandSparklesIcon } from "lucide-react";
+ import { useState } from "react";
+@@ -11,12 +13,17 @@ import { showToast } from "@/components/ui/toast";
+ import { useAeRoleModels } from "@/hooks/useAeRoleModels";
+ import { useAeRoles, useAeRolesSave } from "@/hooks/useAeRoles";
+ import {
++  AE_HELPERS_LABELS,
++  AE_HELPERS_OPTIONS,
+   AE_PRESET_LIMIT,
+   AE_PRESET_TITLE_MAX,
+   AE_RESERVED_PRESET_ID,
+   AE_ROLE_IDS,
+   type AeRolePreset,
++  type AeHelpers,
++  type AeRoleRules,
+   type AeRoleTable,
++  aeHelpersOf,
+   aeNormalizeOrder,
+   aeOneLine,
+   aePresetId,
+@@ -30,7 +37,7 @@ import {
+   aeRolesForPick,
+ } from "@/lib/aeSessionRoles";
+ import { cn } from "@/lib/utils";
+-import { AeRolePresetTile } from "@/pages/settings/AeRolesControls";
++import { AeRolePresetTile, AeSegmented } from "@/pages/settings/AeRolesControls";
+ import { AeRoleRow } from "@/pages/settings/AeRolesEditor";
+ 
+ const chipClass = (on: boolean) =>
+@@ -52,6 +59,7 @@ export function AeSessionPresetRow({
+   const save = useAeRolesSave();
+   const { models } = useAeRoleModels();
+   const [customizing, setCustomizing] = useState(!!value?.custom);
++  const [changingHelpers, setChangingHelpers] = useState(false);
+   const [naming, setNaming] = useState<string | null>(null);
+   const [saving, setSaving] = useState(false);
+   if (!state) return null;
+@@ -67,15 +75,20 @@ export function AeSessionPresetRow({
+     if (id === AE_RESERVED_PRESET_ID) setCustomizing(false);
+     onChange(aeRolesForPick(id, state.default_preset));
+   };
+-  const setRoles = (roles: AeRoleTable) => {
++  const setRoles = (roles: AeRoleTable, rules?: AeRoleRules) => {
+     if (!base || !shown) return;
+-    const next = { roles, rules: shown.rules };
++    const next = { roles, rules: rules ?? shown.rules };
+     onChange(
+       aeSameRoles(next, base)
+         ? aeRolesForPick(base.id, state.default_preset)
+         : { preset: base.id, custom: next },
+     );
+   };
++  const setHelpers = (helpers: AeHelpers) => {
++    if (shown) setRoles(shown.roles, { ...shown.rules, helpers });
++  };
++  const helpers = shown ? aeHelpersOf(shown.rules) : null;
++  const helpersChanged = !!shown && !!base && helpers !== aeHelpersOf(base.rules);
+   const saveAsPreset = async (title: string) => {
+     if (!shown || !base || saving) return;
+     if (state.presets.length >= AE_PRESET_LIMIT) {
+@@ -177,6 +190,40 @@ export function AeSessionPresetRow({
+           ? aeRoleSummary(shown.roles)
+           : "The lead chooses a preset per task and says which in one line."}
+       </p>
++      {shown && helpers && (
++        <div data-testid="ae-session-helpers" className="space-y-2 rounded-lg bg-muted/50 p-2">
++          <div className="flex items-center justify-between gap-2">
++            <div className="min-w-0 text-xs">
++              <p className="font-medium">
++                Helpers: {AE_HELPERS_LABELS[helpers].label.toLowerCase()}
++              </p>
++              <p className="text-muted-foreground">
++                {helpersChanged ? "Changed for this session." : `From ${base?.title}.`} Native
++                subagents are always available.
++              </p>
++            </div>
++            <button
++              type="button"
++              aria-expanded={changingHelpers}
++              disabled={disabled}
++              onClick={() => setChangingHelpers((v) => !v)}
++              className="shrink-0 text-xs text-muted-foreground hover:text-foreground disabled:opacity-40"
++            >
++              {changingHelpers ? "Done" : "Change"}
++            </button>
++          </div>
++          {(changingHelpers || customizing) && (
++            <AeSegmented
++              label="Helpers for this session"
++              value={helpers}
++              options={AE_HELPERS_OPTIONS}
++              onChange={setHelpers}
++              testId="ae-session-helpers-choice"
++              disabled={disabled || saving}
++            />
++          )}
++        </div>
++      )}
+       {customizing && shown && (
+         <div role="group" aria-label="Roles for this session" className="border-t pt-1">
+           {AE_ROLE_IDS.map((role) => (
+diff --git a/web/src/components/AeTeamControl.stories.tsx b/web/src/components/AeTeamControl.stories.tsx
+index de9d9d77c4b217ba845c8451c25559a8d175b7dd..569f7b58e7a0f683a74261b3c5f53b8778e8865c 100644
+--- a/web/src/components/AeTeamControl.stories.tsx
++++ b/web/src/components/AeTeamControl.stories.tsx
+@@ -143,7 +143,6 @@ export default { title: "Components/AeTeamControl", component: TeamDemo } satisf
+ >;
+ type Story = StoryObj<typeof TeamDemo>;
+ export const Auto: Story = {};
+-export const Solo: Story = { args: { initialDraft: { version: 1, mode: "solo", members: [] } } };
+ export const MixedTeam: Story = { args: { initialDraft: mixedTeam } };
+ export const CustomAgentAliases: Story = {
+   args: {
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+index 3fca8c892187fde9244d43743060fc8067c33f6a..2fc6741ef3509ca5fdec3fb248c19f7cea82690d 100644
+--- a/web/src/components/AeTeamControl.test.tsx
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -117,27 +117,68 @@ const sessionWithTeam = (members: AeTeamMember[], overrides: Partial<AeTeam> = {
+   ...session,
+   labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "team", members, ...overrides }) },
+ });
+-function mount(props: Partial<Parameters<typeof AeTeamControl>[0]> = {}) {
++type ControlProps = Omit<Parameters<typeof AeTeamControl>[0], "open" | "onOpenChange">;
++// The dialog has no trigger of its own (the composer pill opens it); this stands in for the pill.
++function Harness(props: Partial<ControlProps>) {
++  const [open, setOpen] = useState(false);
++  return (
++    <>
++      <button type="button" onClick={() => setOpen(true)}>
++        Open picker
++      </button>
++      <AeTeamControl session={session} {...props} open={open} onOpenChange={setOpen} />
++    </>
++  );
++}
++function mount(props: Partial<ControlProps> = {}) {
+   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   const view = (next = {}) => (
+     <QueryClientProvider client={client}>
+-      <AeTeamControl session={session} {...props} {...next} />
++      <Harness {...props} {...next} />
+     </QueryClientProvider>
+   );
+   const rendered = render(view());
+   return {
+     client,
+-    rerender: (next: Partial<Parameters<typeof AeTeamControl>[0]> = {}) =>
+-      rendered.rerender(view(next)),
++    rerender: (next: Partial<ControlProps> = {}) => rendered.rerender(view(next)),
+   };
+ }
+ function openPicker() {
+-  fireEvent.click(screen.getByRole("button", { name: /^(Collaboration:|Team:)/ }));
+-}
+-function chooseTeam() {
+-  openPicker();
+-  fireEvent.click(screen.getByRole("button", { name: "Team" }));
++  fireEvent.click(screen.getByRole("button", { name: "Open picker" }));
+ }
++const preset = (id: string, title: string, helpers?: "any" | "own") => ({
++  id,
++  title,
++  icon: "scale",
++  color: "teal" as const,
++  description: `${title} card`,
++  when_to_use: "",
++  pinned: false,
++  roles: {
++    lead: { mode: "session" as const },
++    planner: { mode: "fixed" as const, model: "test-model", effort: "high" as const },
++    reviewer: { mode: "auto" as const },
++    builder: { mode: "auto" as const },
++    helper: { mode: "auto" as const },
++  },
++  rules: {
++    raise_or_lower: "tell" as const,
++    lead_steps_down: true,
++    auto_raises: 1,
++    ...(helpers ? { helpers } : {}),
++  },
++});
++const ROLES = {
++  revision: 3,
++  default_preset: "balanced",
++  apply_start_on: true,
++  presets: [
++    preset("save-tokens", "Save tokens"),
++    preset("balanced", "Balanced"),
++    preset("yolo", "YOLO"),
++  ],
++  starters: [],
++};
+ const saveButton = () => screen.getByRole("button", { name: "Save selection" });
+ 
+ beforeEach(() => {
+@@ -155,9 +196,12 @@ describe("composer team picker", () => {
+     const client = new QueryClient();
+     const invalidate = vi.spyOn(client, "invalidateQueries");
+     mocks.session.mockReturnValue({ session: null, isLoading: true, error: null });
++    mocks.roles.mockReturnValue({ data: ROLES });
+     const view = () => (
+       <QueryClientProvider client={client}>
+-        <SessionTeamControl sessionId="parent" />
++        <MemoryRouter>
++          <SessionTeamControl sessionId="parent" />
++        </MemoryRouter>
+       </QueryClientProvider>
+     );
+     const rendered = render(view());
+@@ -168,55 +212,43 @@ describe("composer team picker", () => {
+     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "parent"] });
+     mocks.session.mockReturnValue({ session, isLoading: false, error: null });
+     rendered.rerender(view());
+-    openPicker();
++    // No team button any more: the preset pill's menu opens the dialog.
++    expect(screen.queryByRole("button", { name: /^(Collaboration:|Team:)/ })).toBeNull();
++    fireEvent.click(screen.getByRole("button", { name: "Roles preset: Balanced" }));
++    fireEvent.click(screen.getByRole("button", { name: /Who works on this\?/ }));
+     expect(screen.getByText("Lead / orchestrator")).toBeInTheDocument();
+   });
+ 
+-  it("defaults to Auto and explains native helpers in every mode without saving", () => {
++  it("shows the sessions list without mode tiles and saves nothing on opening", () => {
+     mount();
+-    expect(screen.getByRole("button", { name: "Collaboration: Auto" })).toHaveTextContent("Auto");
+     openPicker();
+-    expect(screen.getByRole("button", { name: "Auto Recommended" })).toHaveAttribute(
+-      "aria-pressed",
+-      "true",
+-    );
+-    expect(screen.getByText(/The lead chooses useful collaborators/)).toBeInTheDocument();
+-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+-    fireEvent.click(screen.getByRole("button", { name: "Solo" }));
+-    expect(screen.getByText(/The lead works with its native helpers/)).toBeInTheDocument();
+-    expect(
+-      screen.getByText("Native subagents remain available in every mode."),
+-    ).toBeInTheDocument();
+-    expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Auto Recommended" })).not.toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Solo" })).not.toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Team" })).not.toBeInTheDocument();
++    expect(screen.getByText("Add sessions")).toBeInTheDocument();
++    expect(screen.getByText(`0 of ${AE_TEAM_LIMIT}`)).toBeInTheDocument();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).not.toBeChecked();
++    expect(saveButton()).toBeEnabled();
+     expect(saveAeTeam).not.toHaveBeenCalled();
+   });
+ 
+-  it("retains a draft across modes and discards it on cancel", () => {
++  it("discards a draft on cancel", () => {
+     mount();
+-    chooseTeam();
++    openPicker();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
+     fireEvent.change(screen.getByRole("combobox", { name: "Model for Claude Code" }), {
+       target: { value: "test-model" },
+     });
+-    for (const mode of ["Solo", "Auto Recommended"]) {
+-      fireEvent.click(screen.getByRole("button", { name: mode }));
+-      expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
+-      fireEvent.click(screen.getByRole("button", { name: "Team" }));
+-      expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeChecked();
+-      expect(screen.getByRole("combobox", { name: "Model for Claude Code" })).toHaveValue(
+-        "test-model",
+-      );
+-    }
++    expect(screen.getByText(`1 of ${AE_TEAM_LIMIT}`)).toBeInTheDocument();
+     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+     expect(saveAeTeam).not.toHaveBeenCalled();
+-    chooseTeam();
++    openPicker();
+     expect(screen.getByRole("checkbox", { name: "Claude Code" })).not.toBeChecked();
+-    expect(saveButton()).toBeDisabled();
+   });
+ 
+   it("shows native coding and custom agents first, with a different-provider recommendation", () => {
+     mount();
+-    chooseTeam();
++    openPicker();
+     expect(
+       screen.getAllByRole("checkbox").map((input) => input.getAttribute("aria-label")),
+     ).toEqual(["Claude Code", "Codex", "Product reviewer"]);
+@@ -224,7 +256,9 @@ describe("composer team picker", () => {
+       "Recommended: different provider for independent review.",
+     );
+     expect(
+-      screen.getByText("Each collaborator uses its configured account and its own context."),
++      screen.getByText(
++        "The lead hands work to these first. They keep their own context and account.",
++      ),
+     ).toBeInTheDocument();
+     expect(screen.queryByText(/own account allowance|separate accounts/i)).not.toBeInTheDocument();
+     expect(screen.queryByRole("checkbox", { name: "Orchestrator" })).not.toBeInTheDocument();
+@@ -233,14 +267,12 @@ describe("composer team picker", () => {
+     fireEvent.click(disclosure);
+     expect(screen.getByRole("checkbox", { name: "Orchestrator" })).toBeEnabled();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Orchestrator" }));
+-    fireEvent.click(screen.getByRole("button", { name: "Solo" }));
+-    fireEvent.click(screen.getByRole("button", { name: "Team" }));
+     expect(screen.getByRole("checkbox", { name: "Orchestrator" })).toBeChecked();
+   });
+ 
+   it("keeps agents needing setup hidden until disclosed and then disabled", () => {
+     mount();
+-    chooseTeam();
++    openPicker();
+     expect(screen.queryByRole("checkbox", { name: "Another agent" })).not.toBeInTheDocument();
+     const disclosure = screen.getByRole("button", { name: /Show agents needing setup/ });
+     expect(disclosure).toHaveAttribute("aria-expanded", "false");
+@@ -256,8 +288,7 @@ describe("composer team picker", () => {
+   it("saves both collaborators and their models without reordering on model edits", async () => {
+     const { client } = mount();
+     const invalidate = vi.spyOn(client, "invalidateQueries");
+-    chooseTeam();
+-    expect(saveButton()).toBeDisabled();
++    openPicker();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Codex" }));
+     fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
+     fireEvent.change(screen.getByRole("combobox", { name: "Model for Codex" }), {
+@@ -267,7 +298,7 @@ describe("composer team picker", () => {
+     await waitFor(() =>
+       expect(saveAeTeam).toHaveBeenCalledWith("parent", {
+         version: 1,
+-        mode: "team",
++        mode: expect.any(String),
+         members: [memberFor(codex, { model: "test-model" }), memberFor(claude)],
+       }),
+     );
+@@ -276,36 +307,12 @@ describe("composer team picker", () => {
+     expect(invalidate).toHaveBeenCalledWith({ queryKey: childSessionsQueryKey("parent") });
+   });
+ 
+-  it.each(["Auto Recommended", "Solo"])(
+-    "saves %s without requiring ready collaborators",
+-    async (mode) => {
+-      mocks.agents.mockReturnValue({ data: [] });
+-      mocks.hosts.mockReturnValue({ data: [] });
+-      mount({ session: sessionWithTeam([memberFor(unavailable)], { routingBeforeTeam: "on" }) });
+-      openPicker();
+-      expect(saveButton()).toBeDisabled();
+-      fireEvent.click(screen.getByRole("button", { name: mode }));
+-      expect(saveButton()).toBeEnabled();
+-      fireEvent.click(saveButton());
+-      await waitFor(() =>
+-        expect(saveAeTeam).toHaveBeenCalledWith(
+-          "parent",
+-          expect.objectContaining({
+-            mode: mode === "Solo" ? "solo" : "auto",
+-            routingBeforeTeam: "on",
+-          }),
+-        ),
+-      );
+-      await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+-    },
+-  );
+-
+   it("preserves custom aliases and independent model choices by agent id", async () => {
+     const work = { ...codex, id: "work", name: "codex-work", builtin: false };
+     const personal = { ...codex, id: "personal", name: "codex-personal", builtin: false };
+     mocks.agents.mockReturnValue({ data: [codex, work, personal] });
+     mount({ session: { ...session, agentId: work.id, agentName: work.name } });
+-    chooseTeam();
++    openPicker();
+     fireEvent.click(screen.getByRole("checkbox", { name: "codex-work" }));
+     fireEvent.click(screen.getByRole("checkbox", { name: "codex-personal" }));
+     fireEvent.change(screen.getByRole("combobox", { name: "Model for codex-work" }), {
+@@ -317,7 +324,7 @@ describe("composer team picker", () => {
+     await waitFor(() =>
+       expect(saveAeTeam).toHaveBeenCalledWith("parent", {
+         version: 1,
+-        mode: "team",
++        mode: expect.any(String),
+         members: [
+           memberFor(work, { displayName: "codex-work", model: "test-model" }),
+           memberFor(personal, { displayName: "codex-personal" }),
+@@ -355,7 +362,7 @@ describe("composer team picker", () => {
+     await waitFor(() =>
+       expect(saveAeTeam).toHaveBeenCalledWith("parent", {
+         version: 1,
+-        mode: "team",
++        mode: expect.any(String),
+         members: [memberFor(claude)],
+       }),
+     );
+@@ -416,7 +423,7 @@ describe("composer team picker", () => {
+     await waitFor(() =>
+       expect(saveAeTeam).toHaveBeenCalledWith("parent", {
+         version: 1,
+-        mode: "team",
++        mode: expect.any(String),
+         members: [memberFor(claude)],
+       }),
+     );
+@@ -426,7 +433,7 @@ describe("composer team picker", () => {
+   it("keeps failed saves visible and retries with the same selection", async () => {
+     vi.mocked(saveAeTeam).mockRejectedValueOnce(new Error("Host offline"));
+     mount();
+-    chooseTeam();
++    openPicker();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
+     fireEvent.click(saveButton());
+     expect(await screen.findByRole("alert")).toHaveTextContent("Host offline");
+@@ -445,18 +452,17 @@ describe("composer team picker", () => {
+       }),
+     );
+     mount();
+-    chooseTeam();
++    openPicker();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
+     fireEvent.click(saveButton());
+     expect(saveButton()).toBeDisabled();
+     expect(screen.getByRole("button", { name: "Cancel" })).toBeDisabled();
+-    expect(screen.getByRole("button", { name: "Solo" })).toBeDisabled();
+     expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
+     expect(screen.getByRole("button", { name: "Change lead" })).toBeDisabled();
+     fireEvent.click(saveButton());
+     fireEvent.keyDown(screen.getByRole("dialog"), { key: "Escape" });
+     expect(screen.getByRole("dialog")).toBeInTheDocument();
+-    expect(saveAeTeam).toHaveBeenCalledTimes(1);
++    await waitFor(() => expect(saveAeTeam).toHaveBeenCalledTimes(1));
+     await act(async () => resolveSave(session));
+     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+   });
+@@ -476,17 +482,18 @@ describe("composer team picker", () => {
+ 
+   it("disables a read-only picker", () => {
+     mount({ disabled: true });
+-    expect(screen.getByRole("button", { name: "Collaboration: Auto" })).toBeDisabled();
+     openPicker();
+-    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
++    expect(saveButton()).toBeDisabled();
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
++    expect(screen.getByRole("button", { name: "Change lead" })).toBeDisabled();
+   });
+ 
+-  it("reports agent loading failures and keeps an empty Team unsavable", () => {
++  it("reports agent loading failures and still saves a chat with no sessions", () => {
+     mocks.agents.mockReturnValue({ data: [], isError: true });
+     mount();
+-    chooseTeam();
++    openPicker();
+     expect(screen.getByRole("alert")).toHaveTextContent("Could not load available agents.");
+-    expect(saveButton()).toBeDisabled();
++    expect(saveButton()).toBeEnabled();
+   });
+ });
+ 
+@@ -507,7 +514,7 @@ describe("team editor", () => {
+       return <AeTeamEditor draft={draft} onChange={setDraft} agents={choices} host={host} />;
+     }
+     render(<Editor />);
+-    expect(screen.getByText(`${AE_TEAM_LIMIT}/${AE_TEAM_LIMIT}`)).toBeInTheDocument();
++    expect(screen.getByText(`${AE_TEAM_LIMIT} of ${AE_TEAM_LIMIT}`)).toBeInTheDocument();
+     expect(screen.getByRole("checkbox", { name: `Custom ${AE_TEAM_LIMIT}` })).toBeDisabled();
+     expect(screen.getByRole("combobox", { name: "Model for Custom 0" })).toBeEnabled();
+     fireEvent.click(screen.getByRole("checkbox", { name: "Custom 0" }));
+@@ -518,34 +525,6 @@ describe("team editor", () => {
+ });
+ 
+ describe("roles preset per session", () => {
+-  const preset = (id: string, title: string) => ({
+-    id,
+-    title,
+-    icon: "scale",
+-    color: "teal" as const,
+-    description: `${title} card`,
+-    when_to_use: "",
+-    pinned: false,
+-    roles: {
+-      lead: { mode: "session" as const },
+-      planner: { mode: "fixed" as const, model: "test-model", effort: "high" as const },
+-      reviewer: { mode: "auto" as const },
+-      builder: { mode: "auto" as const },
+-      helper: { mode: "auto" as const },
+-    },
+-    rules: { raise_or_lower: "tell" as const, lead_steps_down: true, auto_raises: 1 },
+-  });
+-  const ROLES = {
+-    revision: 3,
+-    default_preset: "balanced",
+-    apply_start_on: true,
+-    presets: [
+-      preset("save-tokens", "Save tokens"),
+-      preset("balanced", "Balanced"),
+-      preset("yolo", "YOLO"),
+-    ],
+-    starters: [],
+-  };
+   beforeEach(() => {
+     mocks.roles.mockReturnValue({ data: ROLES });
+   });
+@@ -584,10 +563,12 @@ describe("roles preset per session", () => {
+     };
+     mount({ session: withRoles });
+     openPicker();
+-    fireEvent.click(screen.getByRole("button", { name: "Solo" }));
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
+     fireEvent.click(saveButton());
+     await waitFor(() => expect(saveAeTeam).toHaveBeenCalledTimes(1));
+-    expect(vi.mocked(saveAeTeam).mock.calls[0][1]).toMatchObject({ mode: "solo" });
++    expect(vi.mocked(saveAeTeam).mock.calls[0][1]).toMatchObject({
++      members: [memberFor(claude)],
++    });
+     expect(vi.mocked(saveAeTeam).mock.calls[0][1]).not.toHaveProperty("roles");
+   });
+ 
+@@ -663,4 +644,202 @@ describe("roles preset per session", () => {
+     screen.getByLabelText("Message").dispatchEvent(event);
+     expect(event.defaultPrevented).toBe(false);
+   });
++  it("greys the sessions list on a preset that keeps work in house and saves no sessions", async () => {
++    mocks.roles.mockReturnValue({
++      data: { ...ROLES, presets: [...ROLES.presets, preset("solo", "Solo", "own")] },
++    });
++    const solo = sessionWithTeam([memberFor(claude)], { roles: { preset: "solo" } });
++    mount({ session: solo });
++    openPicker();
++    expect(
++      screen.getByText("Solo keeps work in this chat. Pick another preset to add sessions."),
++    ).toBeInTheDocument();
++    expect(screen.getByTestId("ae-team-sessions")).toHaveAttribute("aria-disabled", "true");
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
++    expect(saveButton()).toBeEnabled();
++    // Nothing changed: no child session, no routing change, no label write.
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++    expect(saveAeTeam).not.toHaveBeenCalled();
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++  });
++
++  it("saves only the roles from a kept-in-house preset and keeps the stored sessions", async () => {
++    mocks.roles.mockReturnValue({
++      data: { ...ROLES, presets: [...ROLES.presets, preset("solo", "Solo", "own")] },
++    });
++    const stored = sessionWithTeam([memberFor(claude, { sessionId: "kid" })]);
++    mocks.getSessionSlim.mockResolvedValue(stored);
++    mocks.updateSession.mockResolvedValue(stored);
++    mount({ session: stored });
++    openPicker();
++    fireEvent.click(screen.getByRole("radio", { name: "Solo" }));
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(mocks.updateSession).toHaveBeenCalledTimes(1));
++    expect(saveAeTeam).not.toHaveBeenCalled();
++    const patch = mocks.updateSession.mock.calls[0][1];
++    expect(patch).not.toHaveProperty("subagentRoutingOverride");
++    expect(JSON.parse(patch.labels[AE_TEAM_LABEL])).toMatchObject({
++      mode: "team",
++      members: [memberFor(claude, { sessionId: "kid" })],
++      roles: { preset: "solo" },
++    });
++  });
++
++  it("queues the dialog's save behind a menu change still saving", async () => {
++    const { aeLatestWins } = await import("@/lib/aeSessionRoles");
++    let finishMenuWrite!: () => void;
++    const menuWrite = aeLatestWins(
++      "parent",
++      () =>
++        new Promise<string>((resolve) => {
++          finishMenuWrite = () => resolve("done");
++        }),
++      { queue: true },
++    );
++    mount();
++    openPicker();
++    fireEvent.click(screen.getByRole("checkbox", { name: "Claude Code" }));
++    fireEvent.click(saveButton());
++    await act(async () => {
++      await Promise.resolve();
++    });
++    expect(saveAeTeam).not.toHaveBeenCalled();
++    await act(async () => {
++      finishMenuWrite();
++      await menuWrite;
++    });
++    await waitFor(() => expect(saveAeTeam).toHaveBeenCalledTimes(1));
++  });
++
++  it("keeps a chat saved as Solo with Lead picks greyed, and saves nothing until the row changes", async () => {
++    const legacy = {
++      ...session,
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({
++          version: 1,
++          mode: "solo",
++          members: [],
++          roles: { preset: "lead-picks" },
++        }),
++      },
++    };
++    mount({ session: legacy });
++    openPicker();
++    expect(screen.getByTestId("ae-team-sessions")).toHaveAttribute("aria-disabled", "true");
++    expect(screen.getByRole("checkbox", { name: "Claude Code" })).toBeDisabled();
++    fireEvent.click(screen.getByRole("radio", { name: "YOLO" }));
++    expect(screen.getByTestId("ae-team-sessions")).not.toHaveAttribute("aria-disabled");
++  });
++
++  it("does not write a frozen copy of the default for a Solo label when the dialog just opens", async () => {
++    const legacy = {
++      ...session,
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "solo", members: [] }) },
++    };
++    mount({ session: legacy });
++    openPicker();
++    expect(screen.getByTestId("ae-team-sessions")).toHaveAttribute("aria-disabled", "true");
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
++    expect(saveAeTeam).not.toHaveBeenCalled();
++    expect(mocks.updateSession).not.toHaveBeenCalled();
++  });
++
++  it("reads a chat saved as Solo as the Solo preset and writes the new shape on Save", async () => {
++    const actual = await vi.importActual<typeof AeTeamModule>("@/lib/aeTeam");
++    vi.mocked(saveAeTeam).mockImplementation(actual.saveAeTeam);
++    mocks.roles.mockReturnValue({
++      data: { ...ROLES, presets: [...ROLES.presets, preset("solo", "Solo", "own")] },
++    });
++    const legacy = {
++      ...session,
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "solo", members: [] }) },
++    };
++    mocks.getSessionSlim.mockResolvedValue(legacy);
++    mocks.updateSession.mockResolvedValue(session);
++    mount({ session: legacy });
++    openPicker();
++    expect(screen.getByRole("radio", { name: "Solo" })).toBeChecked();
++    fireEvent.click(saveButton());
++    await waitFor(() => expect(mocks.updateSession).toHaveBeenCalledTimes(1));
++    const label = JSON.parse(mocks.updateSession.mock.calls[0][1].labels[AE_TEAM_LABEL]);
++    expect(label).toMatchObject({
++      version: 1,
++      mode: "auto",
++      members: [],
++      roles: { preset: "solo" },
++    });
++  });
++});
++
++describe("composer preset pill states", () => {
++  function renderPill(props: { working?: boolean } = {}, current: Session = session) {
++    mocks.session.mockReturnValue({ session: current, isLoading: false, error: null });
++    const client = new QueryClient();
++    render(
++      <QueryClientProvider client={client}>
++        <MemoryRouter>
++          <SessionTeamControl sessionId="parent" {...props} />
++        </MemoryRouter>
++      </QueryClientProvider>,
++    );
++  }
++
++  it("keeps a pill-shaped way into the dialog when presets fail to load, and retries them", () => {
++    const refetch = vi.fn();
++    mocks.roles.mockReturnValue({ data: undefined, isError: true, refetch });
++    renderPill();
++    const fallback = screen.getByTestId("ae-preset-pill-fallback");
++    expect(fallback).toHaveAccessibleName("Retry roles presets");
++    fireEvent.click(fallback);
++    expect(refetch).toHaveBeenCalledTimes(1);
++    // Change lead and the sessions list stay reachable.
++    expect(screen.getByRole("button", { name: "Change lead" })).toBeInTheDocument();
++    expect(screen.getByText("Add sessions")).toBeInTheDocument();
++  });
++
++  it("shows the same fallback while presets load, without a retry", () => {
++    const refetch = vi.fn();
++    mocks.roles.mockReturnValue({ data: undefined, isLoading: true, refetch });
++    renderPill();
++    fireEvent.click(screen.getByTestId("ae-preset-pill-fallback"));
++    expect(refetch).not.toHaveBeenCalled();
++    expect(screen.getByText("Lead / orchestrator")).toBeInTheDocument();
++  });
++
++  it("disables adding and removing sessions in the menu while a turn runs", () => {
++    mocks.roles.mockReturnValue({ data: ROLES });
++    renderPill({ working: true }, sessionWithTeam([memberFor(claude, { sessionId: "kid" })]));
++    fireEvent.click(screen.getByRole("button", { name: /^Roles preset: Balanced/ }));
++    expect(screen.getByRole("menuitemcheckbox", { name: "Claude Code" })).toBeDisabled();
++    expect(
++      screen.getByText("You can save collaboration changes after this turn finishes."),
++    ).toBeInTheDocument();
++    // Switching the preset only writes the label and stays available.
++    expect(screen.getAllByRole("menuitemradio", { name: /YOLO/ })[0]).toBeEnabled();
++  });
++
++  it("holds the dialog back while a menu change is still saving, then opens it", async () => {
++    mocks.roles.mockReturnValue({ data: ROLES });
++    const stored = sessionWithTeam([memberFor(claude, { sessionId: "kid" })]);
++    let release!: (value: Session) => void;
++    mocks.getSessionSlim.mockReturnValue(
++      new Promise<Session>((resolve) => {
++        release = resolve;
++      }),
++    );
++    vi.mocked(saveAeTeam).mockResolvedValue(session);
++    renderPill({}, stored);
++    fireEvent.click(screen.getByRole("button", { name: /^Roles preset: Balanced/ }));
++    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Claude Code" }));
++    await waitFor(() =>
++      expect(screen.getByRole("button", { name: /Who works on this\?/ })).toBeDisabled(),
++    );
++    await act(async () => release(stored));
++    await waitFor(() =>
++      expect(screen.getByRole("button", { name: /Who works on this\?/ })).toBeEnabled(),
++    );
++  });
+ });
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+index 416ef7be69067ab5e62dbcb920017bc494bb48c3..6a895c505957a0b2c09ce3679943b6dc1bb64928 100644
+--- a/web/src/components/AeTeamControl.tsx
++++ b/web/src/components/AeTeamControl.tsx
+@@ -22,6 +22,21 @@ import {
+ } from "@/lib/aeTeam";
+ import type { Session } from "@/lib/types";
+ import { useForkDialog } from "@/shell/ForkDialogContext";
++import { useAeRoles } from "@/hooks/useAeRoles";
++import {
++  AE_SUPERSEDED,
++  aeLatestWins,
++  aeResolveSessionPreset,
++  saveAeSessionRoles,
++} from "@/lib/aeSessionRoles";
++import {
++  AE_SOLO_PRESET_ID,
++  AE_WORKING_HINT,
++  aeIsLegacySolo,
++  aeMigratedSessionRoles,
++  aeSessionsLocked,
++  aeSessionsLockedHint,
++} from "@/lib/aeTeamPresets";
+ import { AeSessionPresetRow } from "./AeSessionPresetRow";
+ import { AeSessionPresetPill } from "./composer/AeSessionPresetPill";
+ import { Button } from "./ui/button";
+@@ -131,7 +146,8 @@ export function AeTeamEditor({
+   agents,
+   host,
+   lead,
+-  disabled = false,
++  disabled: disabledProp = false,
++  lockedHint = null,
+ }: {
+   draft: AeTeam;
+   onChange: (draft: AeTeam) => void;
+@@ -139,7 +155,10 @@ export function AeTeamEditor({
+   host: Host | null;
+   lead?: AeTeamLead;
+   disabled?: boolean;
++  /** Set when the preset keeps work in house: the list greys out with this line. */
++  lockedHint?: string | null;
+ }) {
++  const disabled = disabledProp || !!lockedHint;
+   const [showSetup, setShowSetup] = useState(false);
+   const [showOther, setShowOther] = useState(false);
+   const setupId = useId();
+@@ -179,127 +198,100 @@ export function AeTeamEditor({
+   };
+   return (
+     <div className="space-y-4">
+-      <div className="grid grid-cols-3 gap-2" role="group" aria-label="Collaboration mode">
+-        {(["auto", "solo", "team"] as const).map((mode) => (
+-          <button
+-            key={mode}
+-            type="button"
+-            aria-label={mode === "auto" ? "Auto Recommended" : mode === "solo" ? "Solo" : "Team"}
+-            aria-pressed={draft.mode === mode}
+-            disabled={disabled}
+-            onClick={() => onChange({ ...draft, mode })}
+-            className={`min-w-0 rounded-xl border px-2 py-3 text-center disabled:opacity-50 ${draft.mode === mode ? "border-primary bg-primary/5" : "border-border"}`}
+-          >
+-            <span className="block text-sm font-medium">
+-              {mode === "auto" ? "Auto" : mode === "solo" ? "Solo" : "Team"}
+-            </span>
+-            {mode === "auto" && (
+-              <span className="block text-[10px] text-muted-foreground">Recommended</span>
+-            )}
+-          </button>
+-        ))}
+-      </div>
+-      <div className="space-y-2 text-xs text-muted-foreground">
+-        <p aria-live="polite">
+-          {draft.mode === "auto"
+-            ? "The lead chooses useful collaborators from your connected agents as needed."
+-            : draft.mode === "solo"
+-              ? "The lead works with its native helpers, without an added cross-agent team."
+-              : "You choose collaborators. The lead assigns tasks and brings their results together."}
++      <div
++        className={`space-y-2 ${lockedHint ? "opacity-60" : ""}`}
++        data-testid="ae-team-sessions"
++        aria-disabled={disabled || undefined}
++      >
++        <p className="text-sm font-medium">
++          Add sessions{" "}
++          <span className="text-muted-foreground">
++            {draft.members.length} of {AE_TEAM_LIMIT}
++          </span>
+         </p>
+-        <p>Native subagents remain available in every mode.</p>
+-      </div>
+-      {draft.mode === "team" && (
+-        <div className="space-y-2">
+-          <p className="text-sm font-medium">
+-            Collaborators{" "}
+-            <span className="text-muted-foreground">
+-              {draft.members.length}/{AE_TEAM_LIMIT}
+-            </span>
+-          </p>
+-          <p className="text-xs text-muted-foreground">
+-            Each collaborator uses its configured account and its own context.
++        <p className="text-xs text-muted-foreground">
++          {lockedHint ??
++            "The lead hands work to these first. They keep their own context and account."}
++        </p>
++        {!options.some((option) => option.readiness.selectable) && (
++          <p className="text-sm text-muted-foreground">
++            No collaborators are ready on this host yet.
+           </p>
+-          {!options.some((option) => option.readiness.selectable) && (
+-            <p className="text-sm text-muted-foreground">
+-              No collaborators are ready on this host yet.
+-            </p>
+-          )}
+-          {visible.map(renderChoice)}
+-          {draft.members
+-            .filter((m) => !agents.some((a) => a.id === m.agentId))
+-            .map((member) => (
+-              <div
+-                key={member.agentId}
+-                className="flex items-start justify-between gap-2 rounded-xl border p-3 text-sm"
+-              >
+-                <div className="min-w-0 space-y-1 break-words">
+-                  <p className="font-medium">
+-                    {aeTeamAgentName({
+-                      name: member.agentName,
+-                      display_name: member.displayName,
+-                      harness: null,
+-                    })}
+-                    {" · Unavailable"}
+-                  </p>
+-                  <p className="text-xs text-muted-foreground">
+-                    This agent is no longer available. Remove it or choose another collaborator to
+-                    save this team.
+-                  </p>
+-                </div>
+-                <Button
+-                  variant="ghost"
+-                  aria-label={`Remove ${member.displayName}`}
+-                  disabled={disabled}
+-                  onClick={() =>
+-                    onChange({
+-                      ...draft,
+-                      members: draft.members.filter((m) => m.agentId !== member.agentId),
+-                    })
+-                  }
+-                >
+-                  Remove
+-                </Button>
++        )}
++        {visible.map(renderChoice)}
++        {draft.members
++          .filter((m) => !agents.some((a) => a.id === m.agentId))
++          .map((member) => (
++            <div
++              key={member.agentId}
++              className="flex items-start justify-between gap-2 rounded-xl border p-3 text-sm"
++            >
++              <div className="min-w-0 space-y-1 break-words">
++                <p className="font-medium">
++                  {aeTeamAgentName({
++                    name: member.agentName,
++                    display_name: member.displayName,
++                    harness: null,
++                  })}
++                  {" · Unavailable"}
++                </p>
++                <p className="text-xs text-muted-foreground">
++                  This agent is no longer available. Remove it or choose another collaborator to
++                  save this team.
++                </p>
+               </div>
+-            ))}
+-          {otherConnected.length > 0 && (
+-            <div className="space-y-2 pt-1">
+-              <button
+-                type="button"
+-                aria-expanded={showOther}
+-                aria-controls={otherId}
+-                onClick={() => setShowOther((show) => !show)}
+-                className="flex w-full items-center gap-2 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
++              <Button
++                variant="ghost"
++                aria-label={`Remove ${member.displayName}`}
++                disabled={disabled}
++                onClick={() =>
++                  onChange({
++                    ...draft,
++                    members: draft.members.filter((m) => m.agentId !== member.agentId),
++                  })
++                }
+               >
+-                <ChevronDown className={`size-4 shrink-0 ${showOther ? "rotate-180" : ""}`} />
+-                Other connected agents
+-                <span>({otherConnected.length})</span>
+-              </button>
+-              <div id={otherId} hidden={!showOther} className="space-y-2">
+-                {showOther && otherConnected.map(renderChoice)}
+-              </div>
++                Remove
++              </Button>
+             </div>
+-          )}
+-          {needingSetup.length > 0 && (
+-            <div className="space-y-2 pt-1">
+-              <button
+-                type="button"
+-                aria-expanded={showSetup}
+-                aria-controls={setupId}
+-                onClick={() => setShowSetup((show) => !show)}
+-                className="flex w-full items-center gap-2 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
+-              >
+-                <ChevronDown className={`size-4 shrink-0 ${showSetup ? "rotate-180" : ""}`} />
+-                {showSetup ? "Hide agents needing setup" : "Show agents needing setup"}
+-                <span>({needingSetup.length})</span>
+-              </button>
+-              <div id={setupId} hidden={!showSetup} className="space-y-2">
+-                {showSetup && needingSetup.map(renderChoice)}
+-              </div>
++          ))}
++        {otherConnected.length > 0 && (
++          <div className="space-y-2 pt-1">
++            <button
++              type="button"
++              aria-expanded={showOther}
++              aria-controls={otherId}
++              onClick={() => setShowOther((show) => !show)}
++              className="flex w-full items-center gap-2 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
++            >
++              <ChevronDown className={`size-4 shrink-0 ${showOther ? "rotate-180" : ""}`} />
++              Other connected agents
++              <span>({otherConnected.length})</span>
++            </button>
++            <div id={otherId} hidden={!showOther} className="space-y-2">
++              {showOther && otherConnected.map(renderChoice)}
+             </div>
+-          )}
+-        </div>
+-      )}
++          </div>
++        )}
++        {needingSetup.length > 0 && (
++          <div className="space-y-2 pt-1">
++            <button
++              type="button"
++              aria-expanded={showSetup}
++              aria-controls={setupId}
++              onClick={() => setShowSetup((show) => !show)}
++              className="flex w-full items-center gap-2 py-2 text-left text-xs text-muted-foreground hover:text-foreground"
++            >
++              <ChevronDown className={`size-4 shrink-0 ${showSetup ? "rotate-180" : ""}`} />
++              {showSetup ? "Hide agents needing setup" : "Show agents needing setup"}
++              <span>({needingSetup.length})</span>
++            </button>
++            <div id={setupId} hidden={!showSetup} className="space-y-2">
++              {showSetup && needingSetup.map(renderChoice)}
++            </div>
++          </div>
++        )}
++      </div>
+     </div>
+   );
+ }
+@@ -316,11 +308,23 @@ export function SessionTeamControl({
+ }) {
+   const { session, error, isLoading } = useSession(sessionId);
+   const queryClient = useQueryClient();
++  const [open, setOpen] = useState(false);
+   if (session) {
+     return (
+       <>
+-        <AeTeamControl session={session} disabled={disabled} working={working} />
+-        <AeSessionPresetPill sessionId={sessionId} disabled={disabled} />
++        <AeSessionPresetPill
++          sessionId={sessionId}
++          disabled={disabled}
++          working={working}
++          onOpenTeam={() => setOpen(true)}
++        />
++        <AeTeamControl
++          session={session}
++          disabled={disabled}
++          working={working}
++          open={open}
++          onOpenChange={setOpen}
++        />
+       </>
+     );
+   }
+@@ -338,23 +342,31 @@ export function SessionTeamControl({
+       className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
+     >
+       <UsersRound className="size-4" />
+-      <span>{error ? "Retry team" : "Team…"}</span>
++      <span>{error ? "Retry" : "Roles…"}</span>
+     </button>
+   );
+ }
+ 
+-/** Composer-level collaboration preferences; opening the picker never starts work. */
++/**
++ * The "Who works on this?" dialog: lead, roles preset (with Helpers) and the
++ * chat's sessions. Opened from the composer's preset pill; opening it never
++ * starts work.
++ */
+ export function AeTeamControl({
+   session,
+   disabled = false,
+   working = false,
++  open,
++  onOpenChange,
+ }: {
+   session: Session;
+   disabled?: boolean;
+   working?: boolean;
++  open: boolean;
++  onOpenChange: (open: boolean) => void;
+ }) {
+   const queryClient = useQueryClient();
+-  const [open, setOpen] = useState(false);
++  const { data: rolesState } = useAeRoles();
+   // A new lead forks the session; in-place agent switching is not available.
+   const forkDialog = useForkDialog();
+   const [draft, setDraft] = useState<AeTeam>(() => readAeTeam(session.labels));
+@@ -374,21 +386,39 @@ export function AeTeamControl({
+   });
+   const { data: hosts = [] } = useHosts({ enabled: open, includeSandbox: true });
+   const host = hosts.find((h) => h.host_id === session.hostId) ?? null;
++  const choice = rolesState ? aeResolveSessionPreset(draft.roles ?? null, rolesState) : null;
++  // A label still saved as Solo stays locked until the user picks something else here.
++  const locked = aeSessionsLocked(choice, aeIsLegacySolo(session.labels) && !rolesTouched);
++  // Sessions kept while the preset keeps work in house are not checked for readiness.
+   const invalid =
+-    draft.mode === "team" &&
+-    (!draft.members.length ||
+-      draft.members.some((m) => {
+-        const agent = agents.find((a) => a.id === m.agentId);
+-        return !agent || !aeTeamReadiness(agent.harness, host).selectable;
+-      }));
+-  function changeOpen(next: boolean) {
+-    if (saving) return;
+-    if (next) {
+-      setDraft(readAeTeam(session.labels));
+-      setRolesTouched(false);
++    !locked &&
++    draft.members.some((m) => {
++      const agent = agents.find((a) => a.id === m.agentId);
++      return !agent || !aeTeamReadiness(agent.harness, host).selectable;
++    });
++  // Each opening starts from the saved label, a Solo-era label read the new way.
++  const [wasOpen, setWasOpen] = useState(false);
++  if (open !== wasOpen) {
++    setWasOpen(open);
++    if (open) {
++      const stored = readAeTeam(session.labels);
++      const migrated = rolesState
++        ? aeMigratedSessionRoles(session.labels, stored.roles ?? null, rolesState)
++        : (stored.roles ?? null);
++      const legacy = aeIsLegacySolo(session.labels) && !!rolesState;
++      // The migrated roles are for display; they are written only when the user
++      // changes the roles row, or when they are a plain reference to the Solo
++      // preset (no frozen copy of a preset is ever written just for opening).
++      setDraft(legacy ? { ...stored, roles: migrated } : stored);
++      setRolesTouched(
++        legacy && !stored.roles && migrated?.preset === AE_SOLO_PRESET_ID && !migrated.custom,
++      );
+       setError(null);
+     }
+-    setOpen(next);
++  }
++  function changeOpen(next: boolean) {
++    if (saving) return;
++    onOpenChange(next);
+   }
+   async function save() {
+     if (disabled || invalid || saving || working) return;
+@@ -396,115 +426,108 @@ export function AeTeamControl({
+     setError(null);
+     try {
+       const { roles: _staleRoles, ...withoutRoles } = draft;
+-      const updated = await saveAeTeam(session.id, rolesTouched ? draft : withoutRoles);
+-      queryClient.setQueryData(["session", session.id], updated);
++      // Through the same per-session line the pill's menu writes use, so a
++      // menu change still saving lands first and is never overwritten.
++      const updated = await aeLatestWins(
++        session.id,
++        async () => {
++          if (!locked) return saveAeTeam(session.id, rolesTouched ? draft : withoutRoles);
++          // Own subagents only: the stored sessions stay as they are (no child
++          // sessions, no routing change); only the roles choice can be saved.
++          return rolesTouched ? saveAeSessionRoles(session.id, draft.roles ?? null) : null;
++        },
++        { queue: true },
++      );
++      if (updated && updated !== AE_SUPERSEDED) {
++        queryClient.setQueryData(["session", session.id], updated);
++      }
+       await queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(session.id) });
+-      setOpen(false);
++      onOpenChange(false);
+     } catch (cause) {
+       setError(cause instanceof Error ? cause.message : "Could not save the team. Try again.");
+     } finally {
+       setSaving(false);
+     }
+   }
+-  const team = saved.mode === "team";
+-  const modeName = saved.mode === "auto" ? "Auto" : saved.mode === "solo" ? "Solo" : "Team";
+   return (
+-    <>
+-      <button
+-        type="button"
+-        aria-label={
+-          team ? `Team: ${saved.members.length} collaborators` : `Collaboration: ${modeName}`
+-        }
+-        title={
+-          team ? saved.members.map((m) => m.displayName).join(", ") : "Choose Auto, Solo, or Team"
+-        }
+-        disabled={disabled}
+-        onClick={() => changeOpen(true)}
+-        className="inline-flex h-8 shrink-0 items-center gap-1 rounded-lg px-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
++    <Dialog open={open} onOpenChange={changeOpen}>
++      <DialogContent
++        className="flex max-h-[85dvh] flex-col gap-4 sm:max-w-lg"
++        data-testid="ae-team-dialog"
+       >
+-        <UsersRound className="size-4" />
+-        <span>{team ? `Team · ${saved.members.length}` : modeName}</span>
+-      </button>
+-      <Dialog open={open} onOpenChange={changeOpen}>
+-        <DialogContent
+-          className="flex max-h-[85dvh] flex-col gap-4 sm:max-w-lg"
+-          data-testid="ae-team-dialog"
+-        >
+-          <DialogHeader>
+-            <DialogTitle>Who works on this?</DialogTitle>
+-            <DialogDescription>Choose how your lead works with collaborators.</DialogDescription>
+-          </DialogHeader>
+-          <div className="min-h-0 space-y-4 overflow-y-auto px-1 pb-1">
+-            <div className="flex items-center justify-between gap-3 rounded-xl bg-muted/50 p-3">
+-              <div className="min-w-0">
+-                <p className="text-xs text-muted-foreground">Lead / orchestrator</p>
+-                <p className="truncate text-sm font-medium">{aeTeamLeadName(session, agents)}</p>
+-              </div>
+-              <Button
+-                variant="outline"
+-                size="sm"
+-                className="shrink-0"
+-                disabled={saving || working || disabled || !forkDialog?.canFork}
+-                title={forkDialog?.disabledReason}
+-                onClick={() => {
+-                  setOpen(false);
+-                  forkDialog?.openForkDialog({ sourceSessionId: session.id });
+-                }}
+-              >
+-                Change lead
+-              </Button>
++        <DialogHeader>
++          <DialogTitle>Who works on this?</DialogTitle>
++          <DialogDescription>
++            Pick a preset, and any sessions the lead should hand work to.
++          </DialogDescription>
++        </DialogHeader>
++        <div className="min-h-0 space-y-4 overflow-y-auto px-1 pb-1">
++          <div className="flex items-center justify-between gap-3 rounded-xl bg-muted/50 p-3">
++            <div className="min-w-0">
++              <p className="text-xs text-muted-foreground">Lead / orchestrator</p>
++              <p className="truncate text-sm font-medium">{aeTeamLeadName(session, agents)}</p>
+             </div>
+-            <AeSessionPresetRow
+-              value={draft.roles ?? null}
+-              onChange={(roles) => {
+-                setRolesTouched(true);
+-                setDraft((d) => ({ ...d, roles }));
+-              }}
+-              disabled={saving || disabled}
+-            />
+-            {working && (
+-              <p className="text-xs text-muted-foreground">
+-                You can save collaboration changes after this turn finishes.
+-              </p>
+-            )}
+-            {isLoading && <p className="text-sm text-muted-foreground">Loading agents…</p>}
+-            {isError && (
+-              <p role="alert" className="text-sm text-destructive">
+-                Could not load available agents. Close and reopen to retry.
+-              </p>
+-            )}
+-            <AeTeamEditor
+-              draft={draft}
+-              onChange={setDraft}
+-              agents={agents}
+-              host={host}
+-              lead={session}
+-              disabled={saving || disabled}
+-            />
+-            <p className="text-xs text-muted-foreground">
+-              Applies to your next message. Existing work can finish when you change modes.
+-            </p>
+-            {error && (
+-              <p role="alert" className="text-sm text-destructive">
+-                {error}
+-              </p>
+-            )}
+-          </div>
+-          <DialogFooter>
+-            <Button variant="ghost" disabled={saving} onClick={() => changeOpen(false)}>
+-              Cancel
+-            </Button>
+             <Button
+-              aria-label="Save selection"
+-              loading={saving}
+-              disabled={disabled || invalid || saving || working}
+-              onClick={() => void save()}
++              variant="outline"
++              size="sm"
++              className="shrink-0"
++              disabled={saving || working || disabled || !forkDialog?.canFork}
++              title={forkDialog?.disabledReason}
++              onClick={() => {
++                onOpenChange(false);
++                forkDialog?.openForkDialog({ sourceSessionId: session.id });
++              }}
+             >
+-              Save selection
++              Change lead
+             </Button>
+-          </DialogFooter>
+-        </DialogContent>
+-      </Dialog>
+-    </>
++          </div>
++          <AeSessionPresetRow
++            value={draft.roles ?? null}
++            onChange={(roles) => {
++              setRolesTouched(true);
++              setDraft((d) => ({ ...d, roles }));
++            }}
++            disabled={saving || disabled}
++          />
++          {working && <p className="text-xs text-muted-foreground">{AE_WORKING_HINT}</p>}
++          {isLoading && <p className="text-sm text-muted-foreground">Loading agents…</p>}
++          {isError && (
++            <p role="alert" className="text-sm text-destructive">
++              Could not load available agents. Close and reopen to retry.
++            </p>
++          )}
++          <AeTeamEditor
++            draft={draft}
++            onChange={setDraft}
++            agents={agents}
++            host={host}
++            lead={session}
++            disabled={saving || disabled}
++            lockedHint={locked ? aeSessionsLockedHint(choice) : null}
++          />
++          <p className="text-xs text-muted-foreground">
++            Applies to your next message. Work already running can finish.
++          </p>
++          {error && (
++            <p role="alert" className="text-sm text-destructive">
++              {error}
++            </p>
++          )}
++        </div>
++        <DialogFooter>
++          <Button variant="ghost" disabled={saving} onClick={() => changeOpen(false)}>
++            Cancel
++          </Button>
++          <Button
++            aria-label="Save selection"
++            loading={saving}
++            disabled={disabled || invalid || saving || working}
++            onClick={() => void save()}
++          >
++            Save selection
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
+   );
+ }
+diff --git a/web/src/components/composer/AePresetSessionsSection.tsx b/web/src/components/composer/AePresetSessionsSection.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b66a7efb3849ab4ec4e685261490974b167cd28
+--- /dev/null
++++ b/web/src/components/composer/AePresetSessionsSection.tsx
+@@ -0,0 +1,166 @@
++// "Sessions for this chat" in the composer's preset menu (omnigent-ae,
++// 2026-10-23): this chat's collaborators, one per agent, ticked to add or
++// untick to remove (each saves at once, like picking a preset). A new agent
++// gets an idle child session on save, as the "Who works on this?" dialog does.
++// A preset whose Helpers rule is "Own subagents only" greys the list out.
++
++import { CheckIcon, PlusIcon } from "lucide-react";
++import { useAvailableAgents } from "@/hooks/useAvailableAgents";
++import { useChildSessions, type ChildSessionInfo } from "@/hooks/useChildSessions";
++import { useHosts } from "@/hooks/useHosts";
++import { useSession } from "@/hooks/useSession";
++import { AE_TEAM_LIMIT, type AeTeamMember } from "@/lib/aeTeam";
++import { AE_WORKING_HINT } from "@/lib/aeTeamPresets";
++import { aeTeamOptions } from "@/lib/aeTeamOptions";
++import { cn } from "@/lib/utils";
++
++function childTitle(child: ChildSessionInfo | undefined): string | null {
++  if (!child) return null;
++  // Children the dialog creates are titled "ui:<agent>:<name> · <model>"; show the task instead.
++  if (child.task_summary) return child.task_summary;
++  return child.title && !child.title.startsWith("ui:") ? child.title : null;
++}
++
++function SessionRow({
++  title,
++  detail,
++  checked,
++  disabled,
++  onToggle,
++}: {
++  title: string;
++  detail: string;
++  checked: boolean;
++  disabled: boolean;
++  onToggle: () => void;
++}) {
++  return (
++    <button
++      type="button"
++      role="menuitemcheckbox"
++      aria-checked={checked}
++      aria-label={title}
++      disabled={disabled}
++      onClick={onToggle}
++      className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-muted disabled:hover:bg-transparent"
++    >
++      <span
++        aria-hidden="true"
++        className={cn(
++          "inline-flex size-4 shrink-0 items-center justify-center rounded border",
++          checked ? "border-primary bg-primary text-primary-foreground" : "border-border",
++        )}
++      >
++        {checked && <CheckIcon className="size-3" />}
++      </span>
++      <span className="min-w-0 flex-1">
++        <span className="block truncate text-sm">{title}</span>
++        <span className="block truncate text-xs text-muted-foreground">{detail}</span>
++      </span>
++    </button>
++  );
++}
++
++export function AePresetSessionsSection({
++  sessionId,
++  members,
++  open,
++  locked,
++  lockedHint,
++  compact = false,
++  working = false,
++  pending = false,
++  onToggle,
++  onNewSession,
++}: {
++  sessionId: string;
++  members: AeTeamMember[];
++  /** The menu is open: only then are agents, hosts and children fetched. */
++  open: boolean;
++  locked: boolean;
++  lockedHint: string;
++  compact?: boolean;
++  /** A turn is running: sessions cannot be added or removed until it finishes. */
++  working?: boolean;
++  /** A session change is still saving: the dialog (which reads the label) waits. */
++  pending?: boolean;
++  onToggle: (member: AeTeamMember, on: boolean) => void;
++  onNewSession: () => void;
++}) {
++  const { session } = useSession(sessionId);
++  const { data: agents = [] } = useAvailableAgents({
++    enabled: open,
++    pinnedAgentIds: [...(session ? [session.agentId] : []), ...members.map((m) => m.agentId)],
++  });
++  const { data: hosts = [] } = useHosts({ enabled: open, includeSandbox: true });
++  const { children } = useChildSessions(sessionId, null, open && members.length > 0);
++  const host = hosts.find((h) => h.host_id === session?.hostId) ?? null;
++  const options = session ? aeTeamOptions(agents, host, session) : [];
++  const offered = options.filter(
++    (o) => o.readiness.selectable && o.primary && !members.some((m) => m.agentId === o.agent.id),
++  );
++  const full = members.length >= AE_TEAM_LIMIT;
++  const frozen = locked || working;
++  return (
++    <div data-testid="ae-preset-sessions" aria-disabled={locked || undefined}>
++      <div className="flex items-baseline justify-between px-2 pt-2 pb-1 text-[10px] font-medium tracking-wide text-muted-foreground uppercase">
++        <span>Sessions for this chat</span>
++        <span className="normal-case tabular-nums">
++          {members.length} of {AE_TEAM_LIMIT}
++        </span>
++      </div>
++      {locked && <p className="px-2 pb-1 text-xs text-muted-foreground">{lockedHint}</p>}
++      {working && !locked && (
++        <p className="px-2 pb-1 text-xs text-muted-foreground">{AE_WORKING_HINT}</p>
++      )}
++      <div className={cn(locked && "opacity-45")}>
++        {members.map((member) => {
++          const child = children.find((c) => c.id === member.sessionId);
++          const status = child ? (child.busy ? "running" : "idle") : null;
++          const model = member.model ?? (compact ? null : "agent default model");
++          const task = childTitle(child);
++          return (
++            <SessionRow
++              key={`member-${member.agentId}`}
++              title={task ?? member.displayName}
++              detail={[task ? member.displayName : null, model, status].filter(Boolean).join(" · ")}
++              checked
++              disabled={frozen}
++              onToggle={() => onToggle(member, false)}
++            />
++          );
++        })}
++        {offered.map((option) => (
++          <SessionRow
++            key={`offer-${option.agent.id}`}
++            title={option.name}
++            detail={compact ? "New session" : "New session · agent default model"}
++            checked={false}
++            disabled={frozen || full}
++            onToggle={() =>
++              onToggle(
++                {
++                  agentId: option.agent.id,
++                  agentName: option.agent.name,
++                  displayName: option.name,
++                  model: null,
++                },
++                true,
++              )
++            }
++          />
++        ))}
++        <button
++          type="button"
++          role="menuitem"
++          disabled={locked || pending}
++          onClick={onNewSession}
++          className="flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left text-sm text-muted-foreground hover:bg-muted hover:text-foreground disabled:hover:bg-transparent"
++        >
++          <PlusIcon className="size-4 shrink-0" aria-hidden="true" />
++          New session from an agent…
++        </button>
++      </div>
++    </div>
++  );
++}
+diff --git a/web/src/components/composer/AeSessionPresetPill.tsx b/web/src/components/composer/AeSessionPresetPill.tsx
+index 6808af393080b98b7aca7b273f3eb744adefcd08..ba1203992a5a94d12294f4f5a6201c4c8ccae145 100644
+--- a/web/src/components/composer/AeSessionPresetPill.tsx
++++ b/web/src/components/composer/AeSessionPresetPill.tsx
+@@ -2,9 +2,14 @@
+ // preset icon and name beside the model picker. Its menu has a search box,
+ // "Lead picks", pinned and recent presets, then every preset with its Alt
+ // digit. A pick writes the `roles` field of the session's ae.team label.
++// Since the Auto / Solo / Team button folded into presets (2026-10-23) it is
++// the composer's one "who works on this" control: the menu also lists this
++// chat's sessions and opens the full dialog, the pill counts added sessions,
++// and on a phone the menu is a bottom sheet.
+ 
+-import { ChevronDownIcon, SearchIcon, WandSparklesIcon } from "lucide-react";
+-import { useEffect, useRef, useState } from "react";
++import { ChevronDownIcon, SearchIcon, UsersRoundIcon, WandSparklesIcon } from "lucide-react";
++import { type ReactNode, useEffect, useRef, useState } from "react";
++import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
+ import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
+ import { useAePresetHotkey, useAeSessionPreset } from "@/hooks/useAeSessionPreset";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+@@ -12,19 +17,23 @@ import { AE_PRESET_SHORTCUTS, AE_RESERVED_PRESET_ID, type AeRolePreset } from "@
+ import { aeChoiceId, aeReadRecentPresets } from "@/lib/aeSessionRoles";
+ import { useNavigate } from "@/lib/routing";
+ import { cn } from "@/lib/utils";
++import { aeSessionsLockedHint } from "@/lib/aeTeamPresets";
+ import { AeRolePresetTile } from "@/pages/settings/AeRolesControls";
++import { AePresetSessionsSection } from "./AePresetSessionsSection";
+ 
+ function Row({
+   preset,
+   index,
+   active,
+   isDefault,
++  compact,
+   onPick,
+ }: {
+   preset: AeRolePreset;
+   index: number;
+   active: boolean;
+   isDefault: boolean;
++  compact: boolean;
+   onPick: () => void;
+ }) {
+   return (
+@@ -52,7 +61,7 @@ function Row({
+           <span className="block truncate text-xs text-muted-foreground">{preset.description}</span>
+         )}
+       </span>
+-      {index < AE_PRESET_SHORTCUTS && (
++      {!compact && index < AE_PRESET_SHORTCUTS && (
+         <kbd className="shrink-0 rounded border border-border px-1 text-[10px] text-muted-foreground">
+           Alt {index + 1}
+         </kbd>
+@@ -81,15 +90,21 @@ function ManagePresets({ onDone }: { onDone: () => void }) {
+ export function AeSessionPresetPill({
+   sessionId,
+   disabled = false,
++  working = false,
++  onOpenTeam,
+ }: {
+   sessionId: string;
+   disabled?: boolean;
++  /** A turn is running: sessions cannot be added or removed from the menu until it finishes. */
++  working?: boolean;
++  /** Opens the "Who works on this?" dialog; without it the menu has no sessions section. */
++  onOpenTeam?: () => void;
+ }) {
+   const isMobile = useIsMobileViewport();
+   const [open, setOpen] = useState(false);
+   const [query, setQuery] = useState("");
+   const current = useAeSessionPreset(sessionId);
+-  const { state, choice, pick } = current;
++  const { state, choice, pick, team, setMember, locked, pending, rolesQuery } = current;
+   const triggerRef = useRef<HTMLButtonElement>(null);
+   const onPresetKey = useAePresetHotkey(sessionId, current);
+   // Alt 1 to 9 only while typing in this pill's own composer.
+@@ -103,7 +118,34 @@ export function AeSessionPresetPill({
+     document.addEventListener("keydown", onKeyDown);
+     return () => document.removeEventListener("keydown", onKeyDown);
+   }, [disabled, onPresetKey]);
+-  if (!state || !choice) return null;
++  if (!state || !choice) {
++    // Presets did not load (yet): keep a pill-shaped way into "Who works on this?"
++    // so Change lead and the sessions list stay reachable, and retry the read.
++    const failed = rolesQuery.isError === true;
++    const label = failed ? "Roles unavailable. Retry" : "Roles";
++    return (
++      <button
++        ref={triggerRef}
++        type="button"
++        data-testid="ae-preset-pill-fallback"
++        aria-label={failed ? "Retry roles presets" : "Loading roles presets"}
++        title={
++          failed
++            ? "Could not load roles presets. Click to retry and open Who works on this?"
++            : "Loading roles presets…"
++        }
++        disabled={disabled}
++        onClick={() => {
++          if (failed) void rolesQuery.refetch();
++          onOpenTeam?.();
++        }}
++        className="inline-flex h-8 max-w-48 min-w-0 shrink-0 items-center gap-1.5 rounded-full border border-border py-0.5 pr-2 pl-2 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50 max-sm:pr-2"
++      >
++        <UsersRoundIcon className="size-3.5 shrink-0" aria-hidden="true" />
++        {!isMobile && <span className="truncate">{failed ? "Retry" : label}</span>}
++      </button>
++    );
++  }
+   const activeId = aeChoiceId(choice);
+   const name =
+     choice.kind === "lead-picks"
+@@ -116,6 +158,15 @@ export function AeSessionPresetPill({
+   const recent = aeReadRecentPresets()
+     .map((id) => presets.find((p) => p.id === id))
+     .filter((p): p is AeRolePreset => !!p && !p.pinned);
++  // Sessions wait unused while the preset keeps work in house, so the pill counts none.
++  const count = locked ? 0 : team.members.length;
++  const openTeam = () => {
++    // The dialog reads the label: wait for a session change still saving.
++    if (pending) return;
++    setOpen(false);
++    setQuery("");
++    onOpenTeam?.();
++  };
+   const choose = (id: string) => {
+     setOpen(false);
+     setQuery("");
+@@ -128,6 +179,7 @@ export function AeSessionPresetPill({
+       index={presets.indexOf(preset)}
+       active={preset.id === activeId}
+       isDefault={preset.id === state.default_preset}
++      compact={isMobile}
+       onPick={() => choose(preset.id)}
+     />
+   );
+@@ -137,88 +189,167 @@ export function AeSessionPresetPill({
+     </div>
+   );
+   const pinned = shown.filter((p) => p.pinned);
+-  return (
+-    <Popover open={open} onOpenChange={(next) => (!next || !disabled) && setOpen(next)}>
+-      <PopoverTrigger asChild>
+-        <button
+-          ref={triggerRef}
+-          type="button"
+-          data-testid="ae-preset-pill"
+-          aria-label={`Roles preset: ${name}`}
+-          title={`Roles preset: ${name}`}
+-          disabled={disabled}
+-          className="inline-flex h-8 max-w-48 min-w-0 shrink-0 items-center gap-1.5 rounded-full border border-border py-0.5 pr-2 pl-0.5 text-xs hover:bg-accent disabled:opacity-50 max-sm:pr-0.5"
++  const label = `Roles preset: ${name}${count ? `, ${count} session${count === 1 ? "" : "s"}` : ""}`;
++  const trigger = (
++    <button
++      ref={triggerRef}
++      type="button"
++      data-testid="ae-preset-pill"
++      aria-label={label}
++      title={
++        count
++          ? `${label}: ${team.members.map((m) => m.displayName).join(", ")}`
++          : `Roles preset: ${name}`
++      }
++      disabled={disabled}
++      onClick={isMobile ? () => setOpen(true) : undefined}
++      className="relative inline-flex h-8 max-w-48 min-w-0 shrink-0 items-center gap-1.5 rounded-full border border-border py-0.5 pr-2 pl-0.5 text-xs hover:bg-accent disabled:opacity-50 max-sm:pr-0.5"
++    >
++      {choice.kind === "lead-picks" ? (
++        <span className="inline-flex size-6 shrink-0 items-center justify-center rounded-lg bg-teal-500/15 text-teal-400">
++          <WandSparklesIcon className="size-3.5" />
++        </span>
++      ) : (
++        <AeRolePresetTile icon={choice.preset.icon} color={choice.preset.color} size="sm" />
++      )}
++      {!isMobile && <span className="truncate">{name}</span>}
++      {count > 0 && (
++        <span
++          data-testid="ae-preset-pill-count"
++          aria-hidden="true"
++          className={cn(
++            "inline-flex h-4 min-w-4 shrink-0 items-center justify-center rounded-full bg-blue-500 px-1 text-[10px] font-semibold text-white tabular-nums",
++            isMobile && "absolute -top-1 -right-1 ring-2 ring-background",
++          )}
+         >
+-          {choice.kind === "lead-picks" ? (
++          {count}
++        </span>
++      )}
++      {!isMobile && <ChevronDownIcon className="size-3 shrink-0 text-muted-foreground" />}
++    </button>
++  );
++  const body: ReactNode = (
++    <>
++      <label className="flex items-center gap-2 rounded-md border border-input px-2 py-1.5">
++        <SearchIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
++        <input
++          type="search"
++          value={query}
++          onChange={(e) => setQuery(e.target.value)}
++          placeholder="Search presets"
++          aria-label="Search presets"
++          className="min-w-0 flex-1 bg-transparent text-sm outline-none"
++        />
++      </label>
++      <div
++        role="menu"
++        aria-label="Roles presets"
++        className={cn("overflow-y-auto", isMobile ? "max-h-[65dvh]" : "max-h-[60vh]")}
++      >
++        {matches("lead picks") && (
++          <button
++            type="button"
++            role="menuitemradio"
++            aria-checked={activeId === AE_RESERVED_PRESET_ID}
++            onClick={() => choose(AE_RESERVED_PRESET_ID)}
++            className={cn(
++              "flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-muted",
++              activeId === AE_RESERVED_PRESET_ID && "bg-muted",
++            )}
++          >
+             <span className="inline-flex size-6 shrink-0 items-center justify-center rounded-lg bg-teal-500/15 text-teal-400">
+               <WandSparklesIcon className="size-3.5" />
+             </span>
+-          ) : (
+-            <AeRolePresetTile icon={choice.preset.icon} color={choice.preset.color} size="sm" />
+-          )}
+-          {!isMobile && <span className="truncate">{name}</span>}
+-          {!isMobile && <ChevronDownIcon className="size-3 shrink-0 text-muted-foreground" />}
++            <span className="min-w-0 flex-1">
++              <span className="block text-sm">Lead picks</span>
++              <span className="block truncate text-xs text-muted-foreground">
++                Chooses a preset per task and says which
++              </span>
++            </span>
++          </button>
++        )}
++        {words.length === 0 && pinned.length > 0 && (
++          <>
++            {heading("Pinned")}
++            {pinned.map((p) => row(p, `pinned-${p.id}`))}
++          </>
++        )}
++        {words.length === 0 && recent.length > 0 && (
++          <>
++            {heading("Recent")}
++            {recent.map((p) => row(p, `recent-${p.id}`))}
++          </>
++        )}
++        {heading(words.length > 0 ? "Matches" : "All presets")}
++        {shown.map((p) => row(p, `all-${p.id}`))}
++        {shown.length === 0 && (
++          <p className="px-2 py-2 text-xs text-muted-foreground">No preset matches.</p>
++        )}
++        {onOpenTeam && words.length === 0 && (
++          <AePresetSessionsSection
++            sessionId={sessionId}
++            members={team.members}
++            open={open}
++            locked={locked}
++            lockedHint={aeSessionsLockedHint(choice)}
++            compact={isMobile}
++            working={working}
++            pending={pending}
++            onToggle={(member, on) => void setMember(member, on)}
++            onNewSession={openTeam}
++          />
++        )}
++      </div>
++      {onOpenTeam && (
++        <button
++          type="button"
++          onClick={openTeam}
++          disabled={pending}
++          className="flex items-center gap-2.5 rounded-md border-t disabled:opacity-50 border-border px-2 pt-2 pb-1 text-left hover:text-foreground"
++        >
++          <UsersRoundIcon className="size-4 shrink-0 text-muted-foreground" aria-hidden="true" />
++          <span className="min-w-0 flex-1">
++            <span className="block text-sm">Who works on this?</span>
++            {!isMobile && (
++              <span className="block truncate text-xs text-muted-foreground">
++                Customize roles, change lead, Helpers
++              </span>
++            )}
++          </span>
+         </button>
+-      </PopoverTrigger>
++      )}
++      <ManagePresets onDone={() => setOpen(false)} />
++    </>
++  );
++  if (isMobile) {
++    return (
++      <>
++        {trigger}
++        <Dialog open={open} onOpenChange={(next) => (!next || !disabled) && setOpen(next)}>
++          <DialogContent
++            showCloseButton={false}
++            data-testid="ae-preset-menu"
++            className="top-auto bottom-0 left-0 flex max-w-full translate-x-0 translate-y-0 flex-col gap-1 rounded-t-2xl rounded-b-none p-2 pb-[max(0.5rem,env(safe-area-inset-bottom))] sm:max-w-full"
++            style={{ top: "auto", maxHeight: "85dvh" }}
++          >
++            <DialogTitle className="sr-only">Roles preset and sessions</DialogTitle>
++            <div className="mx-auto mb-1 h-1 w-9 rounded-full bg-muted-foreground/40" />
++            {body}
++          </DialogContent>
++        </Dialog>
++      </>
++    );
++  }
++  return (
++    <Popover open={open} onOpenChange={(next) => (!next || !disabled) && setOpen(next)}>
++      <PopoverTrigger asChild>{trigger}</PopoverTrigger>
+       <PopoverContent
+         align="end"
+         side="top"
+         className="w-80 max-w-[calc(100vw-2rem)] gap-1 p-1.5"
+         data-testid="ae-preset-menu"
+       >
+-        <label className="flex items-center gap-2 rounded-md border border-input px-2 py-1.5">
+-          <SearchIcon className="size-3.5 text-muted-foreground" aria-hidden="true" />
+-          <input
+-            type="search"
+-            value={query}
+-            onChange={(e) => setQuery(e.target.value)}
+-            placeholder="Search presets"
+-            aria-label="Search presets"
+-            className="min-w-0 flex-1 bg-transparent text-sm outline-none"
+-          />
+-        </label>
+-        <div role="menu" aria-label="Roles presets" className="max-h-[60vh] overflow-y-auto">
+-          {matches("lead picks") && (
+-            <button
+-              type="button"
+-              role="menuitemradio"
+-              aria-checked={activeId === AE_RESERVED_PRESET_ID}
+-              onClick={() => choose(AE_RESERVED_PRESET_ID)}
+-              className={cn(
+-                "flex w-full items-center gap-2.5 rounded-md px-2 py-1.5 text-left hover:bg-muted",
+-                activeId === AE_RESERVED_PRESET_ID && "bg-muted",
+-              )}
+-            >
+-              <span className="inline-flex size-6 shrink-0 items-center justify-center rounded-lg bg-teal-500/15 text-teal-400">
+-                <WandSparklesIcon className="size-3.5" />
+-              </span>
+-              <span className="min-w-0 flex-1">
+-                <span className="block text-sm">Lead picks</span>
+-                <span className="block truncate text-xs text-muted-foreground">
+-                  Chooses a preset per task and says which
+-                </span>
+-              </span>
+-            </button>
+-          )}
+-          {words.length === 0 && pinned.length > 0 && (
+-            <>
+-              {heading("Pinned")}
+-              {pinned.map((p) => row(p, `pinned-${p.id}`))}
+-            </>
+-          )}
+-          {words.length === 0 && recent.length > 0 && (
+-            <>
+-              {heading("Recent")}
+-              {recent.map((p) => row(p, `recent-${p.id}`))}
+-            </>
+-          )}
+-          {heading(words.length > 0 ? "Matches" : "All presets")}
+-          {shown.map((p) => row(p, `all-${p.id}`))}
+-          {shown.length === 0 && (
+-            <p className="px-2 py-2 text-xs text-muted-foreground">No preset matches.</p>
+-          )}
+-        </div>
+-        <ManagePresets onDone={() => setOpen(false)} />
++        {body}
+       </PopoverContent>
+     </Popover>
+   );
+diff --git a/web/src/hooks/useAeSessionPreset.ts b/web/src/hooks/useAeSessionPreset.ts
+index ab56a9338fff0314a0239fd8643aa01e1d9b4255..b1808016207fd9a4ee4df3882c2be10cb4f1f03b 100644
+--- a/web/src/hooks/useAeSessionPreset.ts
++++ b/web/src/hooks/useAeSessionPreset.ts
+@@ -4,9 +4,10 @@
+ // lib/aeSessionRoles.ts; this file binds them to the session and roles queries.
+ 
+ import { useQueryClient } from "@tanstack/react-query";
+-import { useCallback, useMemo } from "react";
++import { useCallback, useMemo, useState } from "react";
+ import { showToast } from "@/components/ui/toast";
+ import { useAeRoles } from "@/hooks/useAeRoles";
++import { childSessionsQueryKey } from "@/hooks/useChildSessions";
+ import { useSession } from "@/hooks/useSession";
+ import {
+   AE_SUPERSEDED,
+@@ -19,6 +20,14 @@ import {
+   saveAeSessionRoles,
+ } from "@/lib/aeSessionRoles";
+ import { aeStartOnLine } from "@/lib/aeStartOn";
++import { readAeTeam } from "@/lib/aeTeam";
++import {
++  aeIsLegacySolo,
++  aeMigratedSessionRoles,
++  aeSaveTeamMember,
++  aeSessionsLocked,
++} from "@/lib/aeTeamPresets";
++import type { AeTeamMember } from "@/lib/aeTeam";
+ import { aeDropStartOn, aeQueueStartOn } from "@/lib/aeStartOnApply";
+ import { aeChordFromEvent, aeSameChord, readAeSuggestionKeys } from "@/lib/aeSuggestionKeys";
+ import { isTempConvId } from "@/lib/tempConversationId";
+@@ -28,13 +37,22 @@ import { useChatStore } from "@/store/chatStore";
+ export function useAeSessionPreset(sessionId: string | null | undefined) {
+   const queryClient = useQueryClient();
+   const { session } = useSession(sessionId);
+-  const { data: state } = useAeRoles();
++  const rolesQuery = useAeRoles();
++  const state = rolesQuery.data;
+   const labels = session?.labels;
+-  const roles = useMemo(() => readAeSessionRoles(labels), [labels]);
++  // Session changes still saving: the dialog reads the label, so it waits for them.
++  const [pending, setPending] = useState(0);
++  // A label saved as Solo before presets had a Helpers rule reads the new way.
++  const roles = useMemo(() => {
++    const stored = readAeSessionRoles(labels);
++    return state ? aeMigratedSessionRoles(labels, stored, state) : stored;
++  }, [labels, state]);
++  const team = useMemo(() => readAeTeam(labels), [labels]);
+   const choice = useMemo(
+     () => (state ? aeResolveSessionPreset(roles, state) : null),
+     [roles, state],
+   );
++  const choiceLocked = aeSessionsLocked(choice, aeIsLegacySolo(labels));
+   /**
+    * Put the session on `id` (a preset id or "lead-picks"); resolves true once
+    * saved. Picks for one session run one at a time and the latest wins: a pick
+@@ -59,7 +77,46 @@ export function useAeSessionPreset(sessionId: string | null | undefined) {
+     },
+     [queryClient, sessionId, state],
+   );
+-  return { state, roles, choice, pick };
++  /**
++   * Add (`on`) or remove one session for this chat; resolves true once saved.
++   * Queued behind any pending pick for the session, never skipped.
++   */
++  const setMember = useCallback(
++    async (member: AeTeamMember, on: boolean): Promise<boolean> => {
++      if (!sessionId) return false;
++      setPending((n) => n + 1);
++      try {
++        const saved = await aeLatestWins(sessionId, () => aeSaveTeamMember(sessionId, member, on), {
++          queue: true,
++        });
++        if (saved === AE_SUPERSEDED) return false;
++        queryClient.setQueryData(["session", sessionId], saved);
++        void queryClient.invalidateQueries({ queryKey: childSessionsQueryKey(sessionId) });
++        return true;
++      } catch (error) {
++        const reason = error instanceof Error ? error.message : String(error);
++        showToast(`Could not change this chat's sessions: ${reason}`);
++        return false;
++      } finally {
++        setPending((n) => n - 1);
++      }
++    },
++    [queryClient, sessionId],
++  );
++  return {
++    state,
++    roles,
++    choice,
++    pick,
++    team,
++    setMember,
++    /** The sessions list is greyed out (Helpers "own", or a label still saved as Solo). */
++    locked: choiceLocked,
++    /** A session add or remove is still saving. */
++    pending: pending > 0,
++    /** The roles query, for a retry when it failed. */
++    rolesQuery,
++  };
+ }
+ 
+ /**
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index 437f33e77c05420b434c19a7246814b99cad722a..352817c8fd5506bd1c1afcdbef0b7b0b6afc5a7f 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -29,6 +29,27 @@ export type AeRoleColor = (typeof AE_ROLE_COLORS)[number];
+ export const AE_RAISE_MODES = ["off", "tell", "ask"] as const;
+ export type AeRaiseMode = (typeof AE_RAISE_MODES)[number];
+ 
++/**
++ * Helpers rule (2026-10-23, when Auto / Solo / Team folded into presets): "any"
++ * lets the lead bring in other agents and sessions, "own" keeps work with the
++ * lead and its native subagents. Missing on presets saved before it: "any".
++ */
++export const AE_HELPERS = ["any", "own"] as const;
++export type AeHelpers = (typeof AE_HELPERS)[number];
++export const AE_HELPERS_LABELS: Record<AeHelpers, { label: string; hint: string }> = {
++  any: { label: "Any agent or session", hint: "The lead may bring in other agents" },
++  own: { label: "Own subagents only", hint: "No other agents or sessions" },
++};
++/** The Helpers choices as a segmented control takes them. */
++export const AE_HELPERS_OPTIONS = AE_HELPERS.map((value) => ({
++  value,
++  label: AE_HELPERS_LABELS[value].label,
++}));
++/** The Helpers rule of a preset or customization; absent reads as "any". */
++export function aeHelpersOf(rules: { helpers?: AeHelpers } | undefined): AeHelpers {
++  return rules?.helpers === "own" ? "own" : "any";
++}
++
+ /** The per-session choice that lets the lead pick among presets; never a preset's id. */
+ export const AE_RESERVED_PRESET_ID = "lead-picks";
+ 
+@@ -69,6 +90,8 @@ export interface AeRoleRules {
+   raise_or_lower: AeRaiseMode;
+   lead_steps_down: boolean;
+   auto_raises: number;
++  /** Absent on presets saved before the rule existed; read it with `aeHelpersOf`. */
++  helpers?: AeHelpers;
+ }
+ 
+ export interface AeRolePreset {
+@@ -89,6 +112,8 @@ export interface AeRolesDoc {
+   default_preset: string;
+   apply_start_on: boolean;
+   presets: AeRolePreset[];
++  /** Starter ids the read offered; a save sends them back so the server knows what this client saw. */
++  starters_seen?: string[];
+ }
+ 
+ /** What `GET` and `PUT /v1/ae/roles` answer. */
+@@ -186,6 +211,8 @@ function parsePreset(value: unknown): AeRolePreset | null {
+       raise_or_lower: raise_or_lower as AeRaiseMode,
+       lead_steps_down,
+       auto_raises: Math.max(0, Math.min(AE_AUTO_RAISES_MAX, Math.round(auto_raises))),
++      // Kept only when stored, so a preset saved before the rule round-trips unchanged.
++      ...(rules.helpers === "own" || rules.helpers === "any" ? { helpers: rules.helpers } : {}),
+     },
+   };
+ }
+@@ -199,7 +226,7 @@ function parsePresets(value: unknown): AeRolePreset[] | null {
+ /** The server's roles state, or null when the body is not one. */
+ export function aeParseRolesState(value: unknown): AeRolesState | null {
+   if (!isObject(value)) return null;
+-  const { revision, default_preset, apply_start_on, presets, starters } = value;
++  const { revision, default_preset, apply_start_on, presets, starters, starters_seen } = value;
+   if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) return null;
+   if (typeof default_preset !== "string") return null;
+   const list = parsePresets(presets);
+@@ -210,6 +237,9 @@ export function aeParseRolesState(value: unknown): AeRolesState | null {
+     apply_start_on: apply_start_on !== false,
+     presets: list,
+     starters: parsePresets(starters) ?? [],
++    ...(Array.isArray(starters_seen) && starters_seen.every((id) => typeof id === "string")
++      ? { starters_seen: starters_seen as string[] }
++      : {}),
+   };
+ }
+ 
+@@ -220,6 +250,7 @@ export function aeRolesDoc(state: AeRolesDoc): AeRolesDoc {
+     default_preset: state.default_preset,
+     apply_start_on: state.apply_start_on,
+     presets: state.presets,
++    ...(state.starters_seen ? { starters_seen: state.starters_seen } : {}),
+   };
+ }
+ 
+@@ -322,7 +353,8 @@ export function aeSameRoles(
+       JSON.stringify(AE_ROLE_IDS.map((r) => b.roles[r])) &&
+     a.rules.raise_or_lower === b.rules.raise_or_lower &&
+     a.rules.lead_steps_down === b.rules.lead_steps_down &&
+-    a.rules.auto_raises === b.rules.auto_raises
++    a.rules.auto_raises === b.rules.auto_raises &&
++    aeHelpersOf(a.rules) === aeHelpersOf(b.rules)
+   );
+ }
+ 
+diff --git a/web/src/lib/aeSessionRoles.test.ts b/web/src/lib/aeSessionRoles.test.ts
+index fc562504b14363d0d2b512ad3e6f76ac50efc500..2e67379e8a86fa4f2a5b5629ba00586f7b4af2c8 100644
+--- a/web/src/lib/aeSessionRoles.test.ts
++++ b/web/src/lib/aeSessionRoles.test.ts
+@@ -156,6 +156,34 @@ describe("recent presets and write order", () => {
+     expect(order).toEqual(["first", "third"]);
+   });
+ 
++  it("never skips a queued session change and lets it not skip a pick", async () => {
++    const order: string[] = [];
++    let release: () => void = () => {};
++    const pick = aeLatestWins("q", async () => {
++      order.push("pick");
++      await new Promise<void>((resolve) => {
++        release = resolve;
++      });
++    });
++    await vi.waitFor(() => expect(order).toEqual(["pick"]));
++    const add = aeLatestWins("q", async () => order.push("add"), { queue: true });
++    const remove = aeLatestWins("q", async () => order.push("remove"), { queue: true });
++    const later = aeLatestWins("q", async () => order.push("later"));
++    release();
++    await Promise.all([pick, add, remove, later]);
++    expect(order).toEqual(["pick", "add", "remove", "later"]);
++  });
++
++  it("writes Auto when a Team label has no sessions left, Team while it has some", () => {
++    const team = (members: unknown[]) => ({
++      "ae.team": JSON.stringify({ version: 1, mode: "team", members }),
++    });
++    expect(JSON.parse(aeTeamLabelWithRoles(team([]), { preset: "a" })).mode).toBe("auto");
++    expect(JSON.parse(aeTeamLabelWithRoles(team([{ x: 1 }]), null)).mode).toBe("team");
++    const solo = { "ae.team": JSON.stringify({ version: 1, mode: "solo", members: [] }) };
++    expect(JSON.parse(aeTeamLabelWithRoles(solo, { preset: "a" })).mode).toBe("auto");
++  });
++
+   it("keeps going after a write fails", async () => {
+     await expect(aeLatestWins("f", () => Promise.reject(new Error("no")))).rejects.toThrow("no");
+     expect(await aeLatestWins("f", async () => "ok")).toBe("ok");
+diff --git a/web/src/lib/aeSessionRoles.ts b/web/src/lib/aeSessionRoles.ts
+index 6e23d4bca8242fa0f501baf102995693cda4932d..bc9194265025bf56da28bdda9d38de53d36f21b2 100644
+--- a/web/src/lib/aeSessionRoles.ts
++++ b/web/src/lib/aeSessionRoles.ts
+@@ -84,6 +84,12 @@ function parseLabel(raw: string | undefined): Record<string, unknown> | null {
+   }
+ }
+ 
++/** The mode stored in the label ("auto", "solo", "team", or whatever an unknown writer set); null when none. */
++export function readAeTeamLabelMode(labels?: Record<string, string>): string | null {
++  const mode = parseLabel(labels?.[AE_TEAM_LABEL_KEY])?.mode;
++  return typeof mode === "string" ? mode : null;
++}
++
+ /** The session's `roles` choice; null means "your default". */
+ export function readAeSessionRoles(labels?: Record<string, string>): AeSessionRoles | null {
+   return aeParseSessionRoles(parseLabel(labels?.[AE_TEAM_LABEL_KEY])?.roles);
+@@ -92,11 +98,15 @@ export function readAeSessionRoles(labels?: Record<string, string>): AeSessionRo
+ /**
+  * The `ae.team` label text with `roles` set (or removed for null), every other
+  * field kept. A missing or unreadable label starts as Auto with no members,
+- * which is what the session already runs as.
++ * which is what the session already runs as. The mode is "team" only while the
++ * label lists sessions, else "auto": a label saved as Solo is replaced, since
++ * a chosen preset's Helpers rule now says whether work stays in house.
+  */
+ export function aeTeamLabelWithRoles(
+   labels: Record<string, string> | undefined,
+   roles: AeSessionRoles | null,
++  /** Set by Undo: the mode the label had before (a legacy "solo" comes back as it was). */
++  previousMode?: string | null,
+ ): string {
+   const base = parseLabel(labels?.[AE_TEAM_LABEL_KEY]) ?? {
+     version: 1,
+@@ -104,7 +114,43 @@ export function aeTeamLabelWithRoles(
+     members: [],
+   };
+   const { roles: _old, ...rest } = base;
+-  return JSON.stringify(roles ? { ...rest, roles: aeRolesWire(roles) } : rest);
++  const sessions = Array.isArray(rest.members) && rest.members.length > 0;
++  const mode =
++    rest.mode === "team" && sessions
++      ? "team"
++      : previousMode === "solo" && !sessions
++        ? "solo"
++        : "auto";
++  return JSON.stringify(roles ? { ...rest, mode, roles: aeRolesWire(roles) } : { ...rest, mode });
++}
++
++/**
++ * The `ae.team` label text a team writer saves: the fields it owns set, every
++ * other field of the stored label kept. `roles` null or undefined drops the
++ * field (the caller resolves "keep" before calling); `routingBeforeTeam`
++ * undefined drops it.
++ */
++export function aeTeamLabelText(
++  labels: Record<string, string> | undefined,
++  fields: {
++    mode: string;
++    members: unknown[];
++    routingBeforeTeam?: "on" | "off" | null;
++    roles: AeSessionRoles | null | undefined;
++  },
++): string {
++  const base = parseLabel(labels?.[AE_TEAM_LABEL_KEY]) ?? {};
++  const { roles: _roles, routingBeforeTeam: _routing, ...rest } = base;
++  return JSON.stringify({
++    ...rest,
++    version: 1,
++    mode: fields.mode,
++    members: fields.members,
++    ...(fields.routingBeforeTeam !== undefined
++      ? { routingBeforeTeam: fields.routingBeforeTeam }
++      : {}),
++    ...(fields.roles ? { roles: aeRolesWire(fields.roles) } : {}),
++  });
+ }
+ 
+ /** Write the session's `roles` choice on its freshest labels; resolves to the saved session. */
+@@ -115,7 +161,7 @@ export async function saveAeSessionRoles(sessionId: string, roles: AeSessionRole
+   });
+ }
+ 
+-const writeTails = new Map<string, { tail: Promise<unknown>; latest: number }>();
++const writeTails = new Map<string, { tail: Promise<unknown>; latest: number; pending: number }>();
+ /** Returned by `aeLatestWins` for a write a later one replaced before it started. */
+ export const AE_SUPERSEDED = Symbol("superseded");
+ 
+@@ -123,21 +169,29 @@ export const AE_SUPERSEDED = Symbol("superseded");
+  * Run `write` after every earlier write for `key` finished, one at a time. A
+  * write still waiting when a later one is queued is skipped (resolves
+  * AE_SUPERSEDED): the latest pick wins and the earlier one never lands.
++ * `queue: true` writes (adding or removing one session, each a change against
++ * the freshest label) wait their turn in the same line but are never skipped
++ * and never skip a pick.
+  */
+ export function aeLatestWins<T>(
+   key: string,
+   write: () => Promise<T>,
++  opts: { queue?: boolean } = {},
+ ): Promise<T | typeof AE_SUPERSEDED> {
+-  const entry = writeTails.get(key) ?? { tail: Promise.resolve(), latest: 0 };
+-  const mine = ++entry.latest;
++  const entry = writeTails.get(key) ?? { tail: Promise.resolve(), latest: 0, pending: 0 };
++  const mine = opts.queue ? null : ++entry.latest;
++  entry.pending += 1;
+   const run = entry.tail.then<T | typeof AE_SUPERSEDED>(() =>
+-    entry.latest === mine ? write() : AE_SUPERSEDED,
++    mine === null || entry.latest === mine ? write() : AE_SUPERSEDED,
+   );
+   entry.tail = run.catch(() => undefined);
+   writeTails.set(key, entry);
+-  void entry.tail.then(() => {
+-    if (writeTails.get(key) === entry && entry.latest === mine) writeTails.delete(key);
+-  });
++  void run
++    .catch(() => undefined)
++    .then(() => {
++      entry.pending -= 1;
++      if (writeTails.get(key) === entry && entry.pending === 0) writeTails.delete(key);
++    });
+   return run;
+ }
+ 
+diff --git a/web/src/lib/aeStartOnApply.test.ts b/web/src/lib/aeStartOnApply.test.ts
+index 0bc672e60eecceb0498333d48f31a322e9336146..588274e3e18b82a70a60b96b2508f1aae14eff7e 100644
+--- a/web/src/lib/aeStartOnApply.test.ts
++++ b/web/src/lib/aeStartOnApply.test.ts
+@@ -49,7 +49,7 @@ const session = {
+   id: "s1",
+   labels: {
+     "omnigent.wrapper": "claude-code-native-ui",
+-    "ae.team": JSON.stringify({ version: 1, mode: "solo", members: [] }),
++    "ae.team": JSON.stringify({ version: 1, mode: "auto", members: [], future: 1 }),
+   },
+   modelOverride: "sonnet",
+   reasoningEffort: "medium",
+@@ -76,7 +76,13 @@ describe("aeApplyQueuedStartOn", () => {
+     aeQueueStartOn("s1", { text: 'START ON: preset "YOLO"', models: MODELS });
+     await aeApplyQueuedStartOn("s1", "s1", onSession);
+     const label = JSON.parse(mocks.updateSession.mock.calls[0][1].labels["ae.team"]);
+-    expect(label).toEqual({ version: 1, mode: "solo", members: [], roles: { preset: "yolo" } });
++    expect(label).toEqual({
++      version: 1,
++      mode: "auto",
++      members: [],
++      future: 1,
++      roles: { preset: "yolo" },
++    });
+     expect(onSession).toHaveBeenCalledTimes(1);
+     expect(mocks.toast).toHaveBeenCalledWith("Started on YOLO", expect.anything());
+ 
+@@ -90,7 +96,33 @@ describe("aeApplyQueuedStartOn", () => {
+     undoAction()();
+     await vi.waitFor(() => expect(mocks.updateSession).toHaveBeenCalledTimes(2));
+     const restored = JSON.parse(mocks.updateSession.mock.calls[1][1].labels["ae.team"]);
+-    expect(restored).toEqual({ version: 1, mode: "solo", members: [] });
++    expect(restored).toEqual({ version: 1, mode: "auto", members: [], future: 1 });
++  });
++
++  it("Undo puts a legacy Solo label back exactly as it was", async () => {
++    const legacyText = JSON.stringify({ version: 1, mode: "solo", members: [] });
++    const legacy = { ...session, labels: { "ae.team": legacyText } } as unknown as Session;
++    mocks.getSessionSlim.mockResolvedValue(legacy);
++    aeQueueStartOn("s1", { text: 'START ON: preset "YOLO"', models: MODELS });
++    await aeApplyQueuedStartOn("s1", "s1", vi.fn());
++    const written = mocks.updateSession.mock.calls[0][1].labels["ae.team"];
++    expect(JSON.parse(written)).toMatchObject({ mode: "auto", roles: { preset: "yolo" } });
++    // Untouched since: the previous text comes back byte for byte.
++    mocks.getSessionSlim.mockResolvedValue({ ...session, labels: { "ae.team": written } });
++    undoAction()();
++    await vi.waitFor(() => expect(mocks.updateSession).toHaveBeenCalledTimes(2));
++    expect(mocks.updateSession.mock.calls[1][1].labels["ae.team"]).toBe(legacyText);
++    // Changed since (another field added): roles go back and the Solo mode stays.
++    mocks.updateSession.mockClear();
++    mocks.getSessionSlim.mockResolvedValue({
++      ...session,
++      labels: { "ae.team": JSON.stringify({ ...JSON.parse(written), extra: 2 }) },
++    });
++    undoAction()();
++    await vi.waitFor(() => expect(mocks.updateSession).toHaveBeenCalledTimes(1));
++    const merged = JSON.parse(mocks.updateSession.mock.calls[0][1].labels["ae.team"]);
++    expect(merged).toMatchObject({ mode: "solo", extra: 2 });
++    expect(merged).not.toHaveProperty("roles");
+   });
+ 
+   it("sets model and effort and Undo restores both", async () => {
+diff --git a/web/src/lib/aeStartOnApply.ts b/web/src/lib/aeStartOnApply.ts
+index 8d7b30af901e31a2d8af22947c0701f47ec06b67..86b74b5f8fc44148f074b5e0e846975fa40f96ef 100644
+--- a/web/src/lib/aeStartOnApply.ts
++++ b/web/src/lib/aeStartOnApply.ts
+@@ -13,6 +13,7 @@ import {
+   aeTeamLabelWithRoles,
+   AE_TEAM_LABEL_KEY,
+   readAeSessionRoles,
++  readAeTeamLabelMode,
+ } from "@/lib/aeSessionRoles";
+ import { fetchAeRoles } from "@/hooks/useAeRoles";
+ import { type AeStartOnTarget, aeParseStartOn } from "@/lib/aeStartOn";
+@@ -67,6 +68,9 @@ type OnSession = (session: Session) => void;
+ 
+ interface Before {
+   roles: AeSessionRoles | null;
++  /** The label's mode and exact text before, so Undo can put a legacy Solo label back as it was. */
++  mode: string | null;
++  labelText: string | undefined;
+   model: string | null;
+   effort: string | null;
+   /** Whether the effort was changed too (harnesses without effort control skip it). */
+@@ -76,6 +80,7 @@ interface Before {
+ /** What START ON left on the session, so Undo only touches what is still as it set it. */
+ interface After {
+   roles: AeSessionRoles | null;
++  labelText: string | undefined;
+   model: string | null;
+   effort: string | null;
+ }
+@@ -97,11 +102,18 @@ async function applyPlan(
+   const session = await getSessionSlim(sessionId);
+   const before: Before = {
+     roles: readAeSessionRoles(session.labels),
++    mode: readAeTeamLabelMode(session.labels),
++    labelText: session.labels?.[AE_TEAM_LABEL_KEY],
+     model: session.modelOverride ?? null,
+     effort: session.reasoningEffort ?? null,
+     effortSet: false,
+   };
+-  const after: After = { roles: before.roles, model: before.model, effort: before.effort };
++  const after: After = {
++    roles: before.roles,
++    labelText: before.labelText,
++    model: before.model,
++    effort: before.effort,
++  };
+   let effortError: string | null = null;
+   const { target } = plan;
+   if (target.kind === "preset") {
+@@ -111,6 +123,7 @@ async function applyPlan(
+     });
+     onSession(updated);
+     after.roles = readAeSessionRoles(updated.labels);
++    after.labelText = updated.labels?.[AE_TEAM_LABEL_KEY];
+     aeRememberPreset(target.presetId);
+   } else {
+     const updated = await updateSession(sessionId, { modelOverride: target.model });
+@@ -142,11 +155,13 @@ async function undo(
+     const kept: string[] = [];
+     if (target.kind === "preset") {
+       if (aeSameSessionRoles(readAeSessionRoles(now.labels), after.roles)) {
+-        on(
+-          await updateSession(sessionId, {
+-            labels: { [AE_TEAM_LABEL_KEY]: aeTeamLabelWithRoles(now.labels, before.roles) },
+-          }),
+-        );
++        // Untouched since START ON: put the exact previous label back; else
++        // change only the roles, keeping a legacy Solo mode.
++        const text =
++          before.labelText !== undefined && now.labels?.[AE_TEAM_LABEL_KEY] === after.labelText
++            ? before.labelText
++            : aeTeamLabelWithRoles(now.labels, before.roles, before.mode);
++        on(await updateSession(sessionId, { labels: { [AE_TEAM_LABEL_KEY]: text } }));
+         restored.push("the roles preset");
+       } else {
+         kept.push("the roles preset");
+diff --git a/web/src/lib/aeTeam.test.ts b/web/src/lib/aeTeam.test.ts
+index 4b1a19b717d7cbf97d2ff38fa6525cd8a3898b0f..a71cf1c867edd2538f27c0be77487ef91a6b5efd 100644
+--- a/web/src/lib/aeTeam.test.ts
++++ b/web/src/lib/aeTeam.test.ts
+@@ -122,15 +122,84 @@ describe("team persistence", () => {
+     expect(updateSession).not.toHaveBeenCalled();
+   });
+ 
+-  it.each(["auto", "solo"] as const)("saves %s without provisioning children", async (mode) => {
+-    await saveAeTeam("parent", { version: 1, mode, members: [codex] });
++  it("saves no sessions as Auto without provisioning children", async () => {
++    await saveAeTeam("parent", { version: 1, mode: "team", members: [] });
+     expect(fetchChildSessions).not.toHaveBeenCalled();
+     expect(createSession).not.toHaveBeenCalled();
+     expect(updateSession).toHaveBeenCalledWith("parent", {
+-      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode, members: [] }) },
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "auto", members: [] }) },
+     });
+   });
+ 
++  it("derives Team from the sessions, whatever mode the draft names", async () => {
++    vi.mocked(fetchChildSessions).mockResolvedValue([]);
++    await saveAeTeam("parent", { version: 1, mode: "auto", members: [codex] });
++    expect(createSession).toHaveBeenCalledOnce();
++    const label = JSON.parse(vi.mocked(updateSession).mock.calls.at(-1)![1].labels![AE_TEAM_LABEL]);
++    expect(label.mode).toBe("team");
++    expect(label.members).toHaveLength(1);
++  });
++
++  it("keeps a label saved as Solo until a writer sets its roles", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({
++      ...parent,
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "solo", members: [] }) },
++    });
++    await saveAeTeam("parent", { version: 1, mode: "auto", members: [] });
++    expect(updateSession).toHaveBeenLastCalledWith("parent", {
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "solo", members: [] }) },
++    });
++    await saveAeTeam("parent", {
++      version: 1,
++      mode: "auto",
++      members: [],
++      roles: { preset: "solo" },
++    });
++    expect(updateSession).toHaveBeenLastCalledWith("parent", {
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({
++          version: 1,
++          mode: "auto",
++          members: [],
++          roles: { preset: "solo" },
++        }),
++      },
++    });
++  });
++
++  it("keeps label fields this client does not know", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({
++      ...parent,
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "auto", members: [], future: 7 }),
++      },
++    });
++    await saveAeTeam("parent", { version: 1, mode: "auto", members: [] });
++    const label = JSON.parse(vi.mocked(updateSession).mock.calls.at(-1)![1].labels![AE_TEAM_LABEL]);
++    expect(label.future).toBe(7);
++  });
++
++  it("keeps a readable roles choice and unknown fields on a label it cannot read as a team", async () => {
++    const odd = JSON.stringify({
++      version: 1,
++      mode: "swarm",
++      roles: { preset: "yolo" },
++      future: 9,
++    });
++    expect(readAeTeam({ [AE_TEAM_LABEL]: odd }).roles).toEqual({ preset: "yolo" });
++    vi.mocked(getSessionSlim).mockResolvedValue({ ...parent, labels: { [AE_TEAM_LABEL]: odd } });
++    await saveAeTeam("parent", { version: 1, mode: "auto", members: [] });
++    const label = JSON.parse(vi.mocked(updateSession).mock.calls.at(-1)![1].labels![AE_TEAM_LABEL]);
++    expect(label).toMatchObject({
++      mode: "auto",
++      members: [],
++      roles: { preset: "yolo" },
++      future: 9,
++    });
++    const noMembers = JSON.stringify({ version: 1, mode: "team", roles: { preset: "yolo" } });
++    expect(readAeTeam({ [AE_TEAM_LABEL]: noMembers }).roles).toEqual({ preset: "yolo" });
++  });
++
+   it("defaults to Auto while retaining an explicitly saved Solo preference", () => {
+     expect(readAeTeam().mode).toBe("auto");
+     expect(readAeTeam({ [AE_TEAM_LABEL]: '{"version":1,"mode":"solo","members":[]}' }).mode).toBe(
+@@ -138,29 +207,26 @@ describe("team persistence", () => {
+     );
+   });
+ 
+-  it.each(["auto", "solo"] as const)(
+-    "restores the original routing when leaving a selected team for %s",
+-    async (mode) => {
+-      vi.mocked(getSessionSlim).mockResolvedValue({
+-        ...parent,
+-        subagentRoutingOverride: "off",
+-        labels: {
+-          [AE_TEAM_LABEL]: JSON.stringify({
+-            version: 1,
+-            mode: "team",
+-            members: [codex],
+-            routingBeforeTeam: "on",
+-          }),
+-        },
+-      });
+-      await saveAeTeam("parent", { version: 1, mode, members: [] });
+-      expect(createSession).not.toHaveBeenCalled();
+-      expect(updateSession).toHaveBeenCalledExactlyOnceWith("parent", {
+-        subagentRoutingOverride: "on",
+-        labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode, members: [] }) },
+-      });
+-    },
+-  );
++  it("restores the original routing when the last session is removed", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue({
++      ...parent,
++      subagentRoutingOverride: "off",
++      labels: {
++        [AE_TEAM_LABEL]: JSON.stringify({
++          version: 1,
++          mode: "team",
++          members: [codex],
++          routingBeforeTeam: "on",
++        }),
++      },
++    });
++    await saveAeTeam("parent", { version: 1, mode: "team", members: [] });
++    expect(createSession).not.toHaveBeenCalled();
++    expect(updateSession).toHaveBeenCalledExactlyOnceWith("parent", {
++      subagentRoutingOverride: "on",
++      labels: { [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "auto", members: [] }) },
++    });
++  });
+ 
+   it("preserves the original routing across edits to an existing team", async () => {
+     vi.mocked(getSessionSlim).mockResolvedValue({
+@@ -237,19 +303,19 @@ describe("team persistence", () => {
+     });
+ 
+     it.each([
+-      ["auto", "solo"],
+-      ["solo", "team"],
+-      ["team", "auto"],
+-    ] as const)("keeps the preset when switching %s to %s", async (from, to) => {
+-      vi.mocked(getSessionSlim).mockResolvedValue(labelled(from));
+-      await saveAeTeam("parent", {
+-        version: 1,
+-        mode: to,
+-        members: to === "team" ? [codex] : [],
+-      });
+-      expect(savedLabel().roles).toEqual(roles);
+-      expect(savedLabel().mode).toBe(to);
+-    });
++      ["auto", true, "team"],
++      ["solo", true, "team"],
++      ["team", false, "auto"],
++      ["solo", false, "solo"],
++    ] as const)(
++      "keeps the preset when a %s label is saved (sessions: %s)",
++      async (from, add, to) => {
++        vi.mocked(getSessionSlim).mockResolvedValue(labelled(from));
++        await saveAeTeam("parent", { version: 1, mode: "auto", members: add ? [codex] : [] });
++        expect(savedLabel().roles).toEqual(roles);
++        expect(savedLabel().mode).toBe(to);
++      },
++    );
+ 
+     it("writes a new preset from the draft and clears it for null", async () => {
+       vi.mocked(getSessionSlim).mockResolvedValue(labelled("auto"));
+diff --git a/web/src/lib/aeTeam.ts b/web/src/lib/aeTeam.ts
+index 43f799927ed968624b1e4703d7e263ed8409eaa5..2af5afd3c1d77c2790187ccd6e48c697379102ce 100644
+--- a/web/src/lib/aeTeam.ts
++++ b/web/src/lib/aeTeam.ts
+@@ -1,5 +1,5 @@
+ import { fetchChildSessions } from "@/hooks/useChildSessions";
+-import { type AeSessionRoles, aeParseSessionRoles, aeRolesWire } from "./aeSessionRoles";
++import { type AeSessionRoles, aeParseSessionRoles, aeTeamLabelText } from "./aeSessionRoles";
+ import { createSession, getSessionSlim, updateSession } from "./sessionsApi";
+ 
+ export const AE_TEAM_LABEL = "ae.team";
+@@ -29,9 +29,12 @@ export function readAeTeam(labels?: Record<string, string>): AeTeam {
+   if (!raw || raw.length > 16_384) return automatic;
+   try {
+     const value = JSON.parse(raw) as Partial<AeTeam>;
+-    if (value?.version !== 1 || !["auto", "solo", "team"].includes(value.mode ?? ""))
+-      return automatic;
+-    if (!Array.isArray(value.members) || value.members.length > AE_TEAM_LIMIT) return automatic;
++    if (value?.version !== 1) return automatic;
++    // A label this client cannot read as a team (unknown mode, bad members) still
++    // keeps a readable roles choice, so a writer never drops it.
++    const roleOnly = { ...automatic, ...aeParsedRoles(aeParseSessionRoles(value.roles)) };
++    if (!["auto", "solo", "team"].includes(value.mode ?? "")) return roleOnly;
++    if (!Array.isArray(value.members) || value.members.length > AE_TEAM_LIMIT) return roleOnly;
+     const members = value.members.filter(
+       (m): m is AeTeamMember =>
+         !!m &&
+@@ -62,27 +65,31 @@ function aeParsedRoles(roles: AeSessionRoles | null) {
+   return roles ? { roles } : {};
+ }
+ 
+-function aeRolesField(roles: AeSessionRoles | null | undefined) {
+-  return roles ? { roles: aeRolesWire(roles) } : {};
+-}
+-
+ export function aeTeamMemberKey(member: AeTeamMember): string {
+   return JSON.stringify([member.agentId, member.model]);
+ }
+ 
+-/** Save a collaboration preference, provisioning idle children only for Team.
++/** Save the chat's sessions and roles choice, provisioning idle children for new members.
++ * The mode is derived: "team" when the draft lists sessions, else "auto" (the
++ * preset's Helpers rule replaced Solo, 2026-10-23); a label still saved as Solo
++ * keeps that mode until a writer sets its roles. Every other label field is kept.
+  * Retry reuses children by their durable label, including a partially saved team.
+  * No prompts are sent here. The lead sees the roster on its next message.
+  */
+-export async function saveAeTeam(sessionId: string, draft: AeTeam) {
+-  if (draft.mode === "team" && (!draft.members.length || draft.members.length > AE_TEAM_LIMIT)) {
+-    throw new Error(`Choose between 1 and ${AE_TEAM_LIMIT} collaborators.`);
++export async function saveAeTeam(sessionId: string, input: AeTeam) {
++  if (input.members.length > AE_TEAM_LIMIT) {
++    throw new Error(`Choose up to ${AE_TEAM_LIMIT} sessions.`);
+   }
+   const parent = await getSessionSlim(sessionId);
+   const saved = readAeTeam(parent.labels);
+   const routing = parent.subagentRoutingOverride ?? null;
+   // Every writer keeps the session's roles preset unless the draft sets it.
+-  const roles = draft.roles === undefined ? saved.roles : draft.roles;
++  const roles = input.roles === undefined ? saved.roles : input.roles;
++  const keepSolo = input.roles === undefined && saved.mode === "solo";
++  const draft: AeTeam = {
++    ...input,
++    mode: input.members.length ? "team" : keepSolo ? "solo" : "auto",
++  };
+   if (draft.mode !== "team") {
+     return updateSession(sessionId, {
+       // Restore only the override this picker owns; preserve later manual changes.
+@@ -90,11 +97,10 @@ export async function saveAeTeam(sessionId: string, draft: AeTeam) {
+         ? { subagentRoutingOverride: saved.routingBeforeTeam ?? null }
+         : {}),
+       labels: {
+-        [AE_TEAM_LABEL]: JSON.stringify({
+-          version: 1,
++        [AE_TEAM_LABEL]: aeTeamLabelText(parent.labels, {
+           mode: draft.mode,
+           members: [],
+-          ...aeRolesField(roles),
++          roles,
+         }),
+       },
+     });
+@@ -104,7 +110,7 @@ export async function saveAeTeam(sessionId: string, draft: AeTeam) {
+   // Manual model choices must not be replaced by the parent's spawn router.
+   if (routing !== "off") await updateSession(sessionId, { subagentRoutingOverride: "off" });
+   try {
+-    return await persistAeTeam(sessionId, { ...draft, routingBeforeTeam, roles });
++    return await persistAeTeam(sessionId, { ...draft, routingBeforeTeam, roles }, parent.labels);
+   } catch (error) {
+     if (routing !== "off") {
+       try {
+@@ -119,7 +125,11 @@ export async function saveAeTeam(sessionId: string, draft: AeTeam) {
+   }
+ }
+ 
+-async function persistAeTeam(sessionId: string, draft: AeTeam) {
++async function persistAeTeam(
++  sessionId: string,
++  draft: AeTeam,
++  labels: Record<string, string> | undefined,
++) {
+   const members: AeTeamMember[] = [];
+   if (draft.mode === "team") {
+     const children = await fetchChildSessions(sessionId);
+@@ -150,12 +160,11 @@ async function persistAeTeam(sessionId: string, draft: AeTeam) {
+   return updateSession(sessionId, {
+     ...(draft.mode === "team" ? { subagentRoutingOverride: "off" as const } : {}),
+     labels: {
+-      [AE_TEAM_LABEL]: JSON.stringify({
+-        version: 1,
++      [AE_TEAM_LABEL]: aeTeamLabelText(labels, {
+         mode: draft.mode,
+         members,
+-        routingBeforeTeam: draft.routingBeforeTeam,
+-        ...aeRolesField(draft.roles),
++        routingBeforeTeam: draft.routingBeforeTeam ?? null,
++        roles: draft.roles,
+       }),
+     },
+   });
+diff --git a/web/src/lib/aeTeamPresets.test.ts b/web/src/lib/aeTeamPresets.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9ea279833be7b0e5c8258a5f6cd4c79015f1ca3f
+--- /dev/null
++++ b/web/src/lib/aeTeamPresets.test.ts
+@@ -0,0 +1,206 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import type { AeRolePreset } from "./aeRoles";
++import { AE_TEAM_LABEL, type AeTeamMember } from "./aeTeam";
++import {
++  aeIsLegacySolo,
++  aeMigratedSessionRoles,
++  aeSaveTeamMember,
++  aeSessionsLocked,
++  aeSessionsLockedHint,
++  aeToggleMember,
++} from "./aeTeamPresets";
++import { createSession, getSessionSlim, updateSession } from "./sessionsApi";
++import { fetchChildSessions } from "@/hooks/useChildSessions";
++
++vi.mock("./sessionsApi", () => ({
++  createSession: vi.fn(),
++  updateSession: vi.fn(),
++  getSessionSlim: vi.fn(),
++}));
++vi.mock("@/hooks/useChildSessions", () => ({ fetchChildSessions: vi.fn() }));
++
++const preset = (id: string, helpers?: "any" | "own"): AeRolePreset => ({
++  id,
++  title: id === "solo" ? "Solo" : id,
++  icon: "scale",
++  color: "teal",
++  description: "",
++  when_to_use: "",
++  pinned: false,
++  roles: {
++    lead: { mode: "session" },
++    planner: { mode: "fixed", model: "claude-opus-5-5", effort: "high" },
++    reviewer: { mode: "auto" },
++    builder: { mode: "auto" },
++    helper: { mode: "auto" },
++  },
++  rules: {
++    raise_or_lower: "tell",
++    lead_steps_down: true,
++    auto_raises: 1,
++    ...(helpers ? { helpers } : {}),
++  },
++});
++const WITH_SOLO = { default_preset: "b", presets: [preset("b"), preset("solo", "own")] };
++const WITHOUT_SOLO = { default_preset: "b", presets: [preset("b"), preset("y")] };
++const solo = (extra: object = {}) => ({
++  [AE_TEAM_LABEL]: JSON.stringify({ version: 1, mode: "solo", members: [], ...extra }),
++});
++
++const codex: AeTeamMember = {
++  agentId: "ag_codex",
++  agentName: "codex-native",
++  displayName: "Codex",
++  model: null,
++  sessionId: "child-codex",
++};
++const gemini: AeTeamMember = {
++  agentId: "ag_gemini",
++  agentName: "gemini-native",
++  displayName: "Gemini CLI",
++  model: null,
++};
++
++describe("reading a label saved before the fold", () => {
++  it("spots a Solo label and nothing else", () => {
++    expect(aeIsLegacySolo(solo())).toBe(true);
++    expect(aeIsLegacySolo()).toBe(false);
++    expect(aeIsLegacySolo({ [AE_TEAM_LABEL]: '{"version":1,"mode":"team"}' })).toBe(false);
++    expect(aeIsLegacySolo({ [AE_TEAM_LABEL]: "{" })).toBe(false);
++  });
++
++  it("reads Solo with no roles as the Solo starter when the user has it", () => {
++    expect(aeMigratedSessionRoles(solo(), null, WITH_SOLO)).toEqual({ preset: "solo" });
++  });
++
++  it("reads Solo as the default kept in house when the user has no Solo preset", () => {
++    const roles = aeMigratedSessionRoles(solo(), null, WITHOUT_SOLO);
++    expect(roles?.preset).toBe("b");
++    expect(roles?.custom?.rules.helpers).toBe("own");
++    expect(roles?.custom?.roles).toEqual(preset("b").roles);
++  });
++
++  it("reads Solo as an edited solo preset (Helpers any) customized to own", () => {
++    const edited = { default_preset: "b", presets: [preset("b"), preset("solo", "any")] };
++    const roles = aeMigratedSessionRoles(solo(), null, edited);
++    expect(roles).toEqual({
++      preset: "solo",
++      custom: {
++        roles: preset("solo").roles,
++        rules: { ...preset("solo", "any").rules, helpers: "own" },
++      },
++    });
++  });
++
++  it("greys the list for a legacy Solo label whatever the roles say", () => {
++    const leadPicks = { kind: "lead-picks" } as const;
++    expect(aeSessionsLocked(leadPicks, true)).toBe(true);
++    expect(aeSessionsLocked(leadPicks, false)).toBe(false);
++    expect(
++      aeSessionsLocked(
++        { kind: "preset", preset: preset("y"), isDefault: false, edited: false },
++        false,
++      ),
++    ).toBe(false);
++  });
++
++  it("keeps a chosen preset and only turns its Helpers to own", () => {
++    const roles = aeMigratedSessionRoles(solo(), { preset: "y" }, WITHOUT_SOLO);
++    expect(roles).toEqual({
++      preset: "y",
++      custom: { roles: preset("y").roles, rules: { ...preset("y").rules, helpers: "own" } },
++    });
++    expect(aeMigratedSessionRoles(solo(), { preset: "solo" }, WITH_SOLO)).toEqual({
++      preset: "solo",
++    });
++  });
++
++  it("leaves new-shape labels, Lead picks and unreadable roles alone", () => {
++    const team = { [AE_TEAM_LABEL]: '{"version":1,"mode":"team","members":[]}' };
++    expect(aeMigratedSessionRoles(team, null, WITH_SOLO)).toBeNull();
++    expect(aeMigratedSessionRoles(solo(), { preset: "lead-picks" }, WITH_SOLO)).toEqual({
++      preset: "lead-picks",
++    });
++    const raw = { preset: "y", raw: { preset: "y", custom: { future: 1 } } };
++    expect(aeMigratedSessionRoles(solo(), raw, WITHOUT_SOLO)).toBe(raw);
++  });
++
++  it("names the preset in the greyed-out hint", () => {
++    expect(
++      aeSessionsLockedHint({
++        kind: "preset",
++        preset: preset("solo", "own"),
++        isDefault: false,
++        edited: false,
++      }),
++    ).toBe("Solo keeps work in this chat. Pick another preset to add sessions.");
++  });
++});
++
++describe("adding or removing one session", () => {
++  beforeEach(() => {
++    vi.resetAllMocks();
++    vi.mocked(fetchChildSessions).mockResolvedValue([]);
++    vi.mocked(createSession).mockResolvedValue({
++      id: "child-gemini",
++      kind: "sub_agent",
++    } as Awaited<ReturnType<typeof createSession>>);
++    vi.mocked(updateSession).mockImplementation(
++      async (_id, patch) => patch as Awaited<ReturnType<typeof updateSession>>,
++    );
++  });
++
++  const parentWith = (label: object) =>
++    ({
++      id: "parent",
++      agentId: "ag_claude",
++      subagentRoutingOverride: "off",
++      labels: { [AE_TEAM_LABEL]: JSON.stringify(label) },
++    }) as unknown as Awaited<ReturnType<typeof getSessionSlim>>;
++  const savedLabel = () =>
++    JSON.parse(vi.mocked(updateSession).mock.calls.at(-1)![1].labels![AE_TEAM_LABEL]);
++
++  it("toggles one member per agent", () => {
++    expect(aeToggleMember([codex], gemini, true)).toEqual([codex, gemini]);
++    expect(aeToggleMember([codex, gemini], codex, false)).toEqual([gemini]);
++    expect(aeToggleMember([codex], { ...codex, sessionId: undefined }, true)).toEqual([codex]);
++  });
++
++  it("adds a session on the freshest label, keeping roles and unknown fields", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue(
++      parentWith({
++        version: 1,
++        mode: "team",
++        members: [codex],
++        routingBeforeTeam: "on",
++        roles: { preset: "y", custom: { future: 1 } },
++        future: true,
++      }),
++    );
++    await aeSaveTeamMember("parent", gemini, true);
++    const label = savedLabel();
++    expect(label.mode).toBe("team");
++    expect(label.members.map((m: AeTeamMember) => m.agentId)).toEqual(["ag_codex", "ag_gemini"]);
++    expect(label.roles).toEqual({ preset: "y", custom: { future: 1 } });
++    expect(label.future).toBe(true);
++    expect(label.routingBeforeTeam).toBe("on");
++  });
++
++  it("removing the last session writes Auto and keeps the roles", async () => {
++    vi.mocked(getSessionSlim).mockResolvedValue(
++      parentWith({ version: 1, mode: "team", members: [codex], roles: { preset: "y" } }),
++    );
++    await aeSaveTeamMember("parent", codex, false);
++    expect(savedLabel()).toEqual({ version: 1, mode: "auto", members: [], roles: { preset: "y" } });
++    expect(createSession).not.toHaveBeenCalled();
++  });
++
++  it("refuses a seventh session", async () => {
++    const six = Array.from({ length: 6 }, (_, i) => ({ ...codex, agentId: `ag_${i}` }));
++    vi.mocked(getSessionSlim).mockResolvedValue(
++      parentWith({ version: 1, mode: "team", members: six }),
++    );
++    await expect(aeSaveTeamMember("parent", gemini, true)).rejects.toThrow("up to 6");
++    expect(updateSession).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/lib/aeTeamPresets.ts b/web/src/lib/aeTeamPresets.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f2879c421f043069bc787073c91b6cf88dbad1d3
+--- /dev/null
++++ b/web/src/lib/aeTeamPresets.ts
+@@ -0,0 +1,130 @@
++// One composer control for "who works on this" (omnigent-ae, 2026-10-23).
++// The Auto / Solo / Team button folded into roles presets: a preset's Helpers
++// rule replaces Solo ("own" keeps work with the lead and its native
++// subagents), and Team became the chat's list of added sessions (the ae.team
++// label's members). This file holds the pieces the pill menu, the "Who works
++// on this?" dialog and their tests share: reading a label saved before the
++// fold (migrated on read, written in the new shape on the next save) and
++// adding or removing one session.
++
++import {
++  AE_RESERVED_PRESET_ID,
++  type AeHelpers,
++  type AeRolesState,
++  aeHelpersOf,
++} from "@/lib/aeRoles";
++import {
++  AE_TEAM_LABEL_KEY,
++  type AeSessionPresetChoice,
++  type AeSessionRoles,
++  aeResolveSessionPreset,
++} from "@/lib/aeSessionRoles";
++import { AE_TEAM_LIMIT, type AeTeamMember, readAeTeam, saveAeTeam } from "@/lib/aeTeam";
++import { getSessionSlim } from "@/lib/sessionsApi";
++
++/** Shown where collaboration changes wait for the running turn (the dialog and the pill menu). */
++export const AE_WORKING_HINT = "You can save collaboration changes after this turn finishes.";
++
++/** The Solo starter's id (ae_omni_policies role_prefs.SOLO_PRESET). */
++export const AE_SOLO_PRESET_ID = "solo";
++
++/** True for an ae.team label still saved as mode "solo" (written before the fold). */
++export function aeIsLegacySolo(labels?: Record<string, string>): boolean {
++  const raw = labels?.[AE_TEAM_LABEL_KEY];
++  if (!raw || raw.length > 16_384) return false;
++  try {
++    const value: unknown = JSON.parse(raw);
++    return (
++      !!value &&
++      typeof value === "object" &&
++      (value as { version?: unknown }).version === 1 &&
++      (value as { mode?: unknown }).mode === "solo"
++    );
++  } catch {
++    return false;
++  }
++}
++
++/**
++ * The session's roles choice with a label still saved as Solo read the new
++ * way: no roles becomes the Solo preset (or, when the user has none, the
++ * default customized to "Own subagents only"); a chosen preset whose Helpers
++ * rule is "any" gets a session-only customization to "own". Any other label
++ * is returned as is. Read only: callers write it on the next save.
++ */
++export function aeMigratedSessionRoles(
++  labels: Record<string, string> | undefined,
++  roles: AeSessionRoles | null,
++  state: Pick<AeRolesState, "default_preset" | "presets">,
++): AeSessionRoles | null {
++  if (!aeIsLegacySolo(labels) || roles?.raw) return roles;
++  // A "solo" preset the user edited to Helpers "any" still reads as Solo: it
++  // gets the same session-only "own" customization as any other preset.
++  const named = !roles && state.presets.some((p) => p.id === AE_SOLO_PRESET_ID);
++  const choice = aeResolveSessionPreset(named ? { preset: AE_SOLO_PRESET_ID } : roles, state);
++  if (choice?.kind !== "preset") return roles;
++  if (aeHelpersOf(choice.preset.rules) === "own") return roles ?? { preset: choice.preset.id };
++  return {
++    preset: choice.preset.id,
++    custom: { roles: choice.preset.roles, rules: { ...choice.preset.rules, helpers: "own" } },
++  };
++}
++
++/**
++ * Whether the sessions list is greyed out: the preset's Helpers rule is "own",
++ * or the label is still a legacy Solo one (the server tells the lead Solo
++ * whatever the preset says, including Lead picks) and nothing has replaced it.
++ */
++export function aeSessionsLocked(
++  choice: AeSessionPresetChoice | null,
++  legacySolo: boolean,
++): boolean {
++  return legacySolo || aeChoiceHelpers(choice) === "own";
++}
++
++/** The Helpers rule in force for a session; "Lead picks" leaves it to the lead ("any"). */
++export function aeChoiceHelpers(choice: AeSessionPresetChoice | null): AeHelpers {
++  return choice?.kind === "preset" ? aeHelpersOf(choice.preset.rules) : "any";
++}
++
++/** The line shown where the sessions list is greyed out by an "Own subagents only" preset. */
++export function aeSessionsLockedHint(choice: AeSessionPresetChoice | null): string {
++  const title = choice?.kind === "preset" ? choice.preset.title : "This preset";
++  return `${title} keeps work in this chat. Pick another preset to add sessions.`;
++}
++
++/** Whether a choice id is the reserved "Lead picks" one (for callers that only hold ids). */
++export function aeIsLeadPicks(id: string | null): boolean {
++  return id === AE_RESERVED_PRESET_ID;
++}
++
++/**
++ * The members after adding (`on`) or removing one agent's session; a member
++ * is one per agent, as the dialog's list keeps them.
++ */
++export function aeToggleMember(
++  members: readonly AeTeamMember[],
++  member: AeTeamMember,
++  on: boolean,
++): AeTeamMember[] {
++  const rest = members.filter((m) => m.agentId !== member.agentId);
++  if (!on) return rest;
++  const existing = members.find((m) => m.agentId === member.agentId);
++  return existing ? [...members] : [...rest, member];
++}
++
++/**
++ * Add or remove one session on the freshest label and save it the way the
++ * dialog does (a new agent gets a child session; the roles field is kept).
++ * Resolves to the saved session.
++ */
++export async function aeSaveTeamMember(sessionId: string, member: AeTeamMember, on: boolean) {
++  const parent = await getSessionSlim(sessionId);
++  const saved = readAeTeam(parent.labels);
++  const members = aeToggleMember(saved.members, member, on);
++  if (members.length > AE_TEAM_LIMIT) {
++    throw new Error(`A chat can have up to ${AE_TEAM_LIMIT} sessions. Remove one first.`);
++  }
++  const { roles: _fresh, ...rest } = saved;
++  return saveAeTeam(sessionId, { ...rest, mode: members.length ? "team" : "auto", members });
++}
+diff --git a/web/src/pages/settings/AeRolesControls.tsx b/web/src/pages/settings/AeRolesControls.tsx
+index 3758d12dc1247f8d9acfb01bbbe359d2eb10ae67..01e1459dd4c405a48af43f8dac104a09ef89ae3d 100644
+--- a/web/src/pages/settings/AeRolesControls.tsx
++++ b/web/src/pages/settings/AeRolesControls.tsx
+@@ -1,7 +1,7 @@
+ // Small pieces Settings > Roles draws in several places: a preset's icon tile,
+ // a segmented choice and a 0..n stepper.
+ 
+-import { MinusIcon, PlusIcon } from "lucide-react";
++import { HomeIcon, MinusIcon, PlusIcon } from "lucide-react";
+ import { AE_ROLE_COLOR_CLASSES, type AeRoleColor } from "@/lib/aeRoles";
+ import { AeProjectIconGlyph, aeTablerValue } from "@/lib/aeTablerIcon";
+ import { cn } from "@/lib/utils";
+@@ -42,6 +42,19 @@ export function AeRolePresetTile({
+   );
+ }
+ 
++/** The small tag on a preset whose Helpers rule keeps work in house ("Own subagents only"). */
++export function AeInHouseTag() {
++  return (
++    <span
++      title="Own subagents only: no other agents or sessions"
++      className="inline-flex shrink-0 items-center gap-0.5 rounded-full bg-muted px-1.5 text-[10px] font-semibold text-muted-foreground"
++    >
++      <HomeIcon className="size-2.5" aria-hidden="true" />
++      In house
++    </span>
++  );
++}
++
+ /** A one-row radio group drawn as joined buttons; arrow keys move the choice. */
+ export function AeSegmented<T extends string>({
+   label,
+diff --git a/web/src/pages/settings/AeRolesEditor.tsx b/web/src/pages/settings/AeRolesEditor.tsx
+index 09e911f66c01a0080d5335e7c16c443ce2a4d681..11a8ff88f2f38aa03d87e52fd958c7f60cc9af82 100644
+--- a/web/src/pages/settings/AeRolesEditor.tsx
++++ b/web/src/pages/settings/AeRolesEditor.tsx
+@@ -8,6 +8,7 @@ import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
+ import { aeClaudeCodeDefaultEffort, aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
+ import {
+   AE_AUTO_RAISES_MAX,
++  AE_HELPERS_OPTIONS,
+   AE_ROLE_EFFORTS,
+   AE_ROLE_IDS,
+   AE_ROLE_LABELS,
+@@ -18,6 +19,7 @@ import {
+   type AeRoleRules,
+   type AeRoleSetting,
+   type AeRoleTable,
++  aeHelpersOf,
+   aeModelDotClass,
+   aeModelLabel,
+ } from "@/lib/aeRoles";
+@@ -360,6 +362,16 @@ export function AeRolesEditor({
+             disabled={saving}
+           />
+         </RuleRow>
++        <RuleRow title="Helpers" hint="Who the lead may hand work to besides its own subagents">
++          <AeSegmented
++            label="Helpers"
++            value={aeHelpersOf(draft.rules)}
++            options={AE_HELPERS_OPTIONS}
++            onChange={(helpers) => setRules({ helpers })}
++            testId="ae-rule-helpers"
++            disabled={saving}
++          />
++        </RuleRow>
+       </div>
+ 
+       {topTier && (
+diff --git a/web/src/pages/settings/AeRolesPresetRow.tsx b/web/src/pages/settings/AeRolesPresetRow.tsx
+index 478cdd455df73a20b4fb5fef98a408d2c85ab688..ac65011844fc92b1f88a98845e500d01db01f04c 100644
+--- a/web/src/pages/settings/AeRolesPresetRow.tsx
++++ b/web/src/pages/settings/AeRolesPresetRow.tsx
+@@ -28,11 +28,12 @@ import {
+   AE_PRESET_SEARCH_FROM,
+   AE_PRESET_SHORTCUTS,
+   type AeRolePreset,
++  aeHelpersOf,
+   aeRowIconCount,
+   aeRowOrder,
+ } from "@/lib/aeRoles";
+ import { cn } from "@/lib/utils";
+-import { AeRolePresetTile } from "./AeRolesControls";
++import { AeInHouseTag, AeRolePresetTile } from "./AeRolesControls";
+ 
+ const verticalOnly: Modifier = ({ transform }) => ({ ...transform, x: 0 });
+ 
+@@ -266,6 +267,7 @@ function ListRow({
+                 Default
+               </span>
+             )}
++            {aeHelpersOf(preset.rules) === "own" && <AeInHouseTag />}
+           </span>
+           {preset.description && (
+             <span className="block truncate text-xs text-muted-foreground">
+diff --git a/web/src/pages/settings/AeRolesSettingsSection.test.tsx b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+index 2b61c81c32390d11b8620cb485ca62a1e34089a9..0e6e19eef5bd87fa58ccad773232bffa1e36f9cb 100644
+--- a/web/src/pages/settings/AeRolesSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+@@ -223,6 +223,30 @@ describe("AeRolesSettingsSection", () => {
+     ).toHaveAttribute("aria-checked", "true");
+   });
+ 
++  it("saves the Helpers rule with the preset and tags in-house presets in the list", async () => {
++    const solo: AeRolePreset = {
++      ...BALANCED,
++      id: "solo",
++      title: "Solo",
++      rules: { ...BALANCED.rules, helpers: "own" },
++    };
++    serve(stateOf({ revision: 2, presets: [...STARTERS, solo] }));
++    renderSection();
++    await screen.findByRole("heading", { name: "Balanced" });
++    const helpers = editor().getByTestId("ae-rule-helpers");
++    expect(within(helpers).getByRole("radio", { name: "Any agent or session" })).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++    fireEvent.click(within(helpers).getByRole("radio", { name: "Own subagents only" }));
++    fireEvent.click(editor().getByRole("button", { name: "Save" }));
++    await waitFor(() => expect(puts()).toHaveLength(1));
++    expect(puts()[0].presets[1].rules).toEqual({ ...BALANCED.rules, helpers: "own" });
++    expect(puts()[0].presets[3]).toEqual(solo);
++    fireEvent.click(screen.getByRole("button", { name: "All presets" }));
++    expect(await screen.findAllByText("In house")).toHaveLength(2);
++  });
++
+   it("reloads the server's state on a conflict, says so and keeps the edits", async () => {
+     const current = stateOf({
+       revision: 7,

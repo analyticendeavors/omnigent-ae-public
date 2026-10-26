@@ -2409,3 +2409,565 @@ the scroller lookup; `components/AeActionDock.tsx` changes in four lines. Tests:
 to the bottom, remount), with `components/AeActionDock.test.tsx` unchanged and passing, run
 by `just web-check`. It sits on the fork branch `analyticendeavors/omnigent@ae/dock-lift`,
 after `0158`.
+
+`0160` (2026-10-23) makes an image, video or PDF read answer again. Starlette 1.9 decides at the start
+message whether to compress, so `skip_gzip`'s opt-out left the buffered start unsent and the body
+reached the client first: the metrics middleware asserted and every binary file read in the web UI
+returned 500 while text files loaded. `_StateAwareGZipResponder` in `routes/_gzip_route.py` now sends
+the start itself, unless Starlette already passes the response through (then it would repeat the start), which Starlette 1.3 and 1.9 both accept. Test:
+`test_skip_gzip_sends_the_response_start_before_the_body` in `tests/server/routes/test_session_resources.py`,
+which drive the responder and check the message order (a second test covers an already excluded content type). It sits on the fork branch
+`analyticendeavors/omnigent@ae/gzip-binary-start-first`, after `0159`.
+
+`0161` (2026-10-23) marks session families in the sidebar and counts each family as one
+slot. A family is a session plus the sessions it started through the orchestrator's
+`create_session`, which records the starting session's id as `ae.orch` (`1` names none); in
+the sidebar a fork (`omnigent.fork.source_id`) joins its source's family too. Reid asked for a
+way to see which sessions belong together, in any order, and decided a family holds one slot,
+since the slot limit counts pieces of work and a family reports through its lead.
+`lib/aeFamily.ts` finds the families among the loaded rows (`aeFamilies`, two members at
+least), follows the `ae.orch` chain for a row's slot (`familySlotKey`, mirroring
+`ae_omni_policies.sessions.family_key`, forks left out because a fork is often new work) and
+gives each family a color from eight that it keeps across list updates (`assignFamilyColors`,
+stored per device). `lib/aeFamilyView.ts` holds the context the rows read, `useAeFamilies`
+(families only while something shows them, and the same object until a family, member,
+color or title changes, so a list update that only bumps a time re-renders no dot) and
+`aeFamilyGroups`. `shell/AeFamilyDot.tsx` holds the row's dot (after the status icon; a
+click narrows the list to its family and a second click widens it, without opening the
+session, and a double-click never reaches the row's rename), the bar shown while narrowed,
+and the group header. The narrowing ends when its family leaves the list or the display
+changes. `lib/sidebarViewPreferences.ts`
+adds the `family` grouping and a `familyDots` switch, on unless turned off, under Show.
+`shell/Sidebar.tsx` carries the families to every row through `SidebarRowDataProvider`,
+filters the list while narrowed (folders give way then, so the family's filed sessions list
+with the rest and the filter menu moves to the Sessions header), and splits the Family grouping
+with `aeFamilyGroups` (one group per family named after its lead, lead first, then Sessions); `shell/aeSidebarStore.ts`
+loads every page for it. `lib/aeLabels.ts` `countAeSlots` and `shell/AeStatusMenu.tsx`
+`checkAeSlotRoom` count one slot per family, the latter from the `family` key
+`/v1/ae/capacity` now puts on each working row, matched against every session above the row
+on its `ae.orch` chain (`familySlotChain`), since the server may key a family by a top the
+cache has not loaded. A fork reads "Forked from" even though it copies its source's
+`ae.orch`. Tests: `lib/aeFamily.test.ts`, `shell/Sidebar.aeFamilies.test.tsx` (dots, the
+narrowing and its clear, a double-click, a family leaving the list, the switch, the
+grouping), `lib/aeLabels.test.ts` (one slot per family, forks apart),
+`shell/AeStatusMenu.test.tsx` (a family member with its top unloaded), with the rest of
+`shell/Sidebar*.test.tsx` unchanged and passing, run by
+`just web-check`. It sits on the fork branch `analyticendeavors/omnigent@ae/session-families`,
+after `0160`.
+
+`0162` (2026-10-23) tells the lead, every turn and in every collaboration mode (Auto, Solo,
+Team), which model and effort each role gets: lead, planner, reviewer, builder and helper.
+Reid asked for token-aware routing: the lead runs on one model and starts helpers on cheaper
+ones by the job, instead of every helper inheriting the lead's model (a 51-hour build had
+run all 277 of its subagents on Opus). The block names tier aliases for Claude's `Agent` tool
+and catalog ids for sessions, plus the preset's model change rules, in under 12 lines. The
+preset is the one the session's `ae.team` label names in its `roles` field (`{"preset": id}`,
+optionally with a `custom` table checked by `role_prefs.validate_custom`; `lead-picks` lists
+up to 8 presets with their "when to use" notes and model change rules, and has the lead pick
+one), else the session
+owner's default from `ae_omni_policies.role_prefs` (`/v1/ae/roles`). The owner comes from
+`get_session_owner(..., owner_only=True)` on the session, then its root, then `local`, so a
+user the session is shared with never decides it. All of it lives in the new
+`omnigent/inner/ae_roles.py`; `ae_team.py` only wraps `team_notice` (adds `ae_roles` to the
+metadata) and `render_team_notice` (appends the block). Upstream never hard-depends on the AE
+package: the import is guarded and falls back to the Balanced starter written with tier
+aliases (upstream's no-hardcoded-models lint). A malformed `ae.team` label now yields the
+roles block alone instead of no notice. A child session (a `parent_conversation_id`, or an `ae.orch`
+holding a session id) gets no block: it is a helper, and telling it "Lead: you" would let it
+start helpers of its own. Tested by `tests/inner/test_ae_roles.py` and the
+updated `tests/inner/test_ae_team.py`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/role-presets`, after `0161`.
+
+`0163` (2026-10-23) adds Settings > Roles, where presets set each role's model and effort
+and the model change rules (raise a stuck child or lower the lead: Off, Tell me after, Ask
+first; lead steps down for mechanical work; automatic raises per child, 0 to 3). It follows
+the mockups Reid approved on 2026-10-23. Presets sit collapsed in one row (the open one by
+name, the default with a teal dot, pinned ones as icons, then `+N`); "All presets" opens the
+list grouped Pinned and Others, with drag or arrow-key order and a search past 8. Each preset
+has a title, a Tabler icon (`AeTablerIconPicker`) and one of eight colors, a card description
+and a "when to use" note the lead reads under "Lead picks"; list order is the Alt 1 to 9 order
+the composer will use. Starters are ordinary presets (edit, duplicate, delete, "Restore
+starters"). A preset with the top model at max on every role shows a cost warning; the host
+catalog has no cost tier, so the top model is judged by family and then version. Logic lives
+in new files: `lib/aeRoles.ts` (types, parser, list edits), `hooks/useAeRoles.ts` (`GET` and
+`PUT /v1/ae/roles`, written like `useAeSidebarOrder`: a 409 loads the server's state and keeps
+the edits, a 422 shows the first message) and `pages/settings/AeRoles*.tsx`; `settingsNav.tsx`
+and `SettingsPage.tsx` gain the section in a few lines. The session picker and composer pill
+come with the next PR. Tested by `lib/aeRoles.test.ts` and
+`pages/settings/AeRolesSettingsSection.test.tsx`, run by `just web-check`. It sits on the fork
+branch `analyticendeavors/omnigent@ae/role-presets`, after `0162`.
+
+`0164` (2026-10-23) lets each session pick its own roles preset. Settings > Roles keeps the
+defaults (patches 0162 and 0163); Reid asked that a running or new session can switch without
+changing them. The choice is the `roles` field of the session's `ae.team` label, which the
+lead's notice already reads; choosing the default writes no field, so a later change of
+default still applies. Four ways in: a "Roles preset" row under the lead in "Who works on
+this?" (chips, "Lead picks", Customize for this session's role table, "Save as preset"); a
+pill after the team button in the composer (search, recent per device, "Lead picks", every
+preset with its digit); Alt+1 to 9 in that composer, in list order, skipped when it equals the
+user's suggestion chord; and a `START ON:` line in a session's first message, which sets the
+preset, or the model and effort through `PATCH /v1/sessions/{id}`, before the message is sent
+and shows "Started on X" with Undo. Settings > Roles gains the "Apply START ON lines" switch
+(the store's `apply_start_on`, on by default) and a preset row that shows every preset that
+fits, with "+N" only for the rest (Reid, 2026-10-23: "+1" showed with the bar mostly empty).
+`aeTeam.ts`'s writers now keep `roles` when the mode changes. Logic lives in new files:
+`lib/aeSessionRoles.ts` (label read and write, recent, digit match), `lib/aeStartOn.ts` (the
+parser), `lib/aeStartOnApply.ts` (queue, apply, Undo), `hooks/useAeSessionPreset.ts`,
+`hooks/useAeRoleModels.ts`, `components/AeSessionPresetRow.tsx` and
+`components/composer/AeSessionPresetPill.tsx`. `ChatPage.tsx` gains one call that queues a
+first message's line, `NewChatDialog.tsx` does the same for the first prompt of a new session
+(under the real session id), `chatStore.ts` applies it once the session exists and drops it if
+the send ends first, and `KeyboardShortcutsDialog.tsx` lists the shortcut. Tested by
+`lib/aeSessionRoles.test.ts`, `lib/aeStartOn.test.ts`, `lib/aeStartOnApply.test.ts` and the
+updated `AeTeamControl`, `aeTeam` and `AeRolesSettingsSection` suites, run by `just web-check`.
+It sits on the fork branch `analyticendeavors/omnigent@ae/role-presets-session`, after `0163`.
+
+`0165` (2026-10-23) folds the composer's Auto / Solo / Team button into the roles preset pill,
+so the composer has one "who works on this" control (Reid picked concept A of the team-merge
+mockup on 2026-10-23). Auto went away because a preset already lets the lead decide; Solo
+became a Helpers rule on every preset (`rules.helpers`, "Any agent or session" or "Own
+subagents only", absent read as any), set in Settings > Roles under "Model changes in this
+preset" and per session beside Customize; Team became the chat's list of added sessions. The
+pill's menu gains "Sessions for this chat" (up to 6, one per agent, each tick saving at once
+and creating an idle child for a new agent, as the dialog does), "New session from an
+agent..." and a "Who works on this?" row that opens the dialog; the pill shows a count when
+sessions are added, and on a phone the menu is a bottom sheet. The dialog drops the mode
+tiles and keeps the lead, the preset row with a Helpers line, and the sessions list, which
+greys out with a hint on a preset whose Helpers rule is "Own subagents only" (presets with
+that rule carry an "In house" tag). The label writers derive the mode: "team" while the
+label lists sessions, else "auto", keeping every other field and the raw roles. A chat saved
+as Solo reads as the Solo starter (or the default customized to own subagents when the user
+has none, shown greyed whatever its roles say) and is written in the new shape only when the
+user changes the roles row, never as a frozen copy just for opening the dialog; nothing is
+rewritten in bulk. When presets cannot load, the pill becomes a "Roles" or "Retry" button
+that still opens the dialog.
+The lead notice's mode follows from the preset and label in `omnigent/inner/ae_roles.py`:
+Solo when the Helpers rule is own (added sessions wait unused, matching the greyed list),
+else Team when the label's sessions still resolve, else Solo for a label still saved as
+Solo, else Auto; the Solo and Team openings now name the preset or the added sessions, and
+"Lead picks" lines show each preset's Helpers rule. Logic lives in the new
+`lib/aeTeamPresets.ts` and `components/composer/AePresetSessionsSection.tsx`. Tested by
+`tests/inner/test_ae_roles.py`, `tests/inner/test_ae_team.py`, `lib/aeTeamPresets.test.ts`
+and the updated `AeTeamControl`, `aeTeam`, `aeSessionRoles`, `aeStartOnApply` and
+`AeRolesSettingsSection` suites. It sits on the fork branch
+`analyticendeavors/omnigent@ae/team-into-presets`, after `0164`.
+
+`0166` (2026-10-24) fixes what the role routing review of 2026-10-23 found wrong in the
+lead notice, and the runner bug that kept the notice from most turns. The executor adapter's
+`_normalize_message_content` flattened every text-only message to a string and dropped every
+non-text block, including the `_omnigent_framework_notice` block the server attaches to
+every user message; a notice survived only when the message also carried an image,
+file or audio block. So plain-text native turns have never received the team or roles text
+since the composer-teams patch (`0030`, 2026-10-13). Text-only content that carries a
+notice now normalizes to one `input_text` block plus the notice blocks (new
+`omnigent/inner/ae_notice_content.py`), and `scope_framework_notices` keeps that only for
+the current user turn and only for the Claude and Codex native executors, which read visible
+text from text blocks and the notice through `framework_notices` (Claude native writes it
+to the UserPromptSubmit context file, Codex native sends it as `omnigent.team` context).
+Every other executor (Claude SDK, Codex app-server, Databricks, openai-agents, Pi and the
+rest) gets the plain string it always did, since several stringify a list into the visible
+prompt; replayed prior turns lose their notice blocks, so a notice never repeats or carries
+an old preset forward; mid-turn steering, which reaches non-native executors only, still
+sends plain text. A child session (a parent, or an `ae.orch` label holding a session id)
+now gets one helper line instead of the lead's Auto or Team text; a fork
+(`omnigent.fork.source_id`, no parent) copies `ae.orch` but stays a lead. The lead line
+names the session's own model and effort, and the preset's model when it differs ("you, on
+opus, high (the preset asks for fable, max)"). Only a Claude lead hears about Claude's
+Agent tool and tier aliases; a Codex or other lead gets the roles by model and effort. A
+role fixed to an older model version keeps its full id, since a bare alias resolves to the
+newest (the current id per tier comes from `ae_omni_policies.role_prefs`). The roles block
+names tier aliases and effort for native subagents only ("opus, high"), says a separate
+session gets its role in the brief (`create_session` has no model field yet), and drops
+"past that, ask first" when model changes are off. Picking a preset whose lead role is
+fixed (pill, Alt digit, a different preset in the dialog, START ON) now also sets the
+session's model and effort, resolved against the session's own catalog or the host's cached
+options for the session's harness only, with a "Lead switched to X" toast and an Undo that
+restores only what is still as the switch left it. The same model in its 1M variant stays,
+with only the effort changed; the result is read from the switched session's own row (the
+user may have moved to another chat), and a switch that did not take says so. When the host
+does not offer the model, only the label changes and the toast says so (new
+`lib/aeLeadModel.ts` and `lib/aeLeadModelChat.ts`; START ON folds it into its own toast and
+Undo). Settings names the Helpers rule "Own subagents only" or "Any agent or session"
+everywhere (the "In house" tag and the "keeps work in this chat" hint are gone) and tags the
+three model change rules "Coming later", since nothing acts on them until the lead gets a
+tool to change models. The YOLO starter's description now matches its rules (in
+`ae_omni_policies.role_prefs`). Tested by `tests/runtime/harnesses/test_executor_adapter.py`,
+`tests/inner/test_ae_roles.py`, `tests/inner/test_ae_team.py`,
+`tests/server/integration/test_ae_team.py`, `lib/aeLeadModel.test.ts`,
+`lib/aeLeadModelChat.test.ts` and the updated `aeStartOnApply`, `aeTeamPresets`,
+`AeTeamControl` and `AeRolesSettingsSection` suites. It sits on the fork branch
+`analyticendeavors/omnigent@ae/role-notice-delivery`, after `0165`.
+
+`0167` (2026-10-23) opens the roles preset picker on a phone showing its list, not its
+search box. The phone picker is a bottom sheet (a Radix `Dialog`), and Radix moves focus
+to the first field when it opens, which was "Search presets"; the keyboard then covered
+the list. The sheet now cancels that open focus and focuses itself instead (so the focus
+trap and screen readers still work), and the keyboard appears only when the search box is
+tapped. The desktop popover is unchanged. In
+`components/composer/AeSessionPresetPill.tsx` only; the "Who works on this?" dialog opens
+on a button, not a text field, so it needed no change. Tested by two new cases in the
+`AeTeamControl` suite (phone: the search box is not the active element; desktop: it still
+is). It sits on the fork branch `analyticendeavors/omnigent@ae/phone-preset-focus`, after
+`0166`.
+
+`0168` (2026-10-24) shows Grouping > Family as tree rows. Reid asked that families come first
+as parent and child hierarchies and that sessions in no family sit apart, and picked concept B
+from the mockups. The Families section lists each family under its lead, which is the parent
+row; its sessions (and theirs) hang under it on a thin line in the family's color, which
+replaces the dot on child rows. A count pill on the lead folds the family, remembered per
+device, and still shows a folded child that needs a response or is running; the family of the
+open session unfolds for that visit. "Not in a family" follows, with a count, in the current
+sort. A lead that is pinned or filtered out shows as its real row; an archived or unloaded lead
+gets a stand-in row (clickable dot, opens the lead, closes the phone drawer), and only
+`ae.orch` links make such a family, so a fork of an unloaded source stays in the rest. Members
+of an `ae.orch` cycle resolve to the lowest id in the cycle, so each session shows once. Each
+family is its own drop list (`family:<root>`), so Manual drag and Move up or down stay inside
+the family. The tree keeps one object until its shape, folds or pills change, so a timestamp
+update re-renders no row. Triage, Status and the other groupings are unchanged. Logic lives in
+new `lib/aeFamilyTree.ts` and `shell/AeFamilyTree.tsx`; `lib/aeFamily.ts`,
+`lib/aeFamilyView.ts`, `shell/AeFamilyDot.tsx`, `shell/aeSidebarStore.ts` and `Sidebar.tsx`
+change in a few lines. Tested by `lib/aeFamilyTree.test.ts`, `lib/aeFamily.test.ts`,
+`shell/aeSidebarStore.test.ts` and `shell/Sidebar.aeFamilies.test.tsx`, run by
+`just web-check`. It sits on the fork branch `analyticendeavors/omnigent@ae/family-tree-view`,
+after `0167`.
+
+`0169` (2026-10-24) lets a roles preset name up to three reviewers. Reid uses Codex as a second
+reviewer on every build and asked that a preset run both reviews on its own, picking concept A
+from the mockups. A preset's Reviewer role is still one setting, or now a stack of one to three
+slots (`{"mode": "multi", "reviewers": [...]}`): a Claude model and effort run as a native
+subagent, `auto` (slot 1 only), or another agent such as Codex, run as a fresh child session
+each review so it carries nothing from the last round. With two or more reviewers the lead
+notice tells the lead to run them all at the final review without asking, on the same diff,
+without showing one reviewer's findings to another, and to merge them into one verdict; this
+replaces the separate /dual-review offer in chats on such a preset, and Reid's global rule stays
+as the fallback. Fix checks and verifying a single finding stay with reviewer 1. Two preset
+rules come with it: how results are shown (`review_merge`: one merged verdict, or each list then
+the verdict) and what happens when a reviewer cannot start (`reviewer_unavailable`: run the rest
+and say so, or ask). A preset whose Helpers rule is "own" names its agent slots as skipped.
+Settings > Roles, Customize and "Who works on this?" show the reviewers as stacked rows with
+Add reviewer and remove; Codex is found by its registered agent name, and each slot offers the
+efforts its harness supports. Notice text lives in new `omnigent/inner/ae_reviewers.py` and
+`ae_text.py`, called from `ae_roles.py`; the web side in new `lib/aeReviewers.ts`,
+`lib/aeRoleBase.ts`, `hooks/useAeReviewerAgents.ts` and `pages/settings/AeReviewerRows.tsx`.
+The store side (`ae_omni_policies/role_prefs.py`, not a patch) accepts the stacked shape,
+keeps default rules out of the saved file, and starts Balanced and YOLO with Codex as
+Reviewer 2. Tested by `tests/inner/test_ae_roles.py`, `lib/aeReviewers.test.ts`,
+`hooks/useAeReviewerAgents.test.tsx`, `pages/settings/AeReviewerRows.test.tsx`,
+`components/AeTeamControl.test.tsx` and the package's `test_role_prefs.py`. It sits on the
+fork branch `analyticendeavors/omnigent@ae/multi-reviewer`, after `0168`.
+
+`0170` (2026-10-24) keeps the composer's preset menu short as starters grow, and restyles the
+preset pill. Reid asked for more starter presets without a taller picker and picked
+layout B ("pinned first, the rest behind More") from the mockups. With the search box empty
+the menu shows Lead picks, then the pinned presets in saved order (plus the active preset when
+it is unpinned, so the current choice always shows), then a "More presets" button with the
+hidden count and up to five small icons that expands the rest in place and folds again when
+the menu closes, then this chat's sessions. With nothing pinned it is one flat list; search is
+one flat list of matches. The Recent section and the duplicate "All presets" list are gone from
+the menu (the recent-preset store stays). Alt 1 to 9 stay tied to each preset's place in the
+full list, hidden or not. The pill now looks like the model picker beside it, on desktop and
+phone: a ghost button with square corners, the preset icon bare in its color, and a chevron
+(the phone shows only icon and chevron). Reid flagged the square tile inside a round outline
+and picked "twin of the model button" from the mockups. Grouping lives in new `lib/aePresetMenu.ts`; `AeSessionPresetPill.tsx`
+changes in a few lines, and `AeRolePresetTile` in `pages/settings/AeRolesControls.tsx` gains an
+`xs` size for the More row's icons. The three new starters themselves (Think it through, Deep
+debug, Quick fix) and the pins on the original four live in `ae_omni_policies/role_prefs.py`,
+not a patch: a saved list with no pins gets its presets pinned the first time a new starter is
+appended, and never again once any of the three has been offered. Tested by
+`lib/aePresetMenu.test.ts`, `components/AeTeamControl.test.tsx` and the package's
+`test_role_prefs.py`. It sits on the fork branch `analyticendeavors/omnigent@ae/more-starters`,
+after `0169`.
+
+`0171` (2026-10-24) renames the Grouping > Family section for sessions in no family from "Not in
+a family" to "Standalone". Reid asked for a shorter name; "Orphans" was turned down because the
+real orphans (children whose lead is archived) already show under a "Lead not loaded" row in
+Families, and "Solo" would clash with the Solo preset. One constant in `lib/aeFamilyTree.ts`
+(`AE_FAMILY_REST_SECTION`); the section's drop-list key follows it and lives only in memory, so no
+saved order is lost. Tested by `lib/aeFamilyTree.test.ts`, `shell/aeSidebarStore.test.ts` and
+`shell/Sidebar.aeFamilies.test.tsx`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/family-standalone`, after `0170`.
+
+`0172` (2026-10-24) shows who works on what, on which model, at what cost. It is PR 3 of the
+role routing plan; Reid approved the mockups (`pr3-spawn-by-role.html`) with the defaults. The
+rail Agents card and the Agents tab show, per agent, a small role chip, the model with its
+colored dot, the effort, and its tokens, then a total line "This chat and its agents" with a
+thin bar split by model family. The total is the lead's subtree usage (upstream already sums a
+session's parent_id spawn tree, native subagents included), floored at the children's sum when
+the lead's read is stale. Only the rows a surface shows are read; finished rows are read once
+and never polled, and running rows refresh every 30 s. A native subagent's model and effort come
+from the lead's Agent tool call (matched by `omnigent.claude_native.tool_use_id`), so they show
+while the lead's chat is open. A role comes from the `ae.role` label, or from a description that
+starts with a role word, an optional one or two character tag and a colon ("Builder A: ...",
+"Reviewer 2: ..."). The sidebar hover gains a third line: role, model, effort, tokens and the
+parent for a child; preset, sessions led and the family total for a lead. In Grouping > Family
+the lead row shows a token pill (own component, at most 25 members read, 60 s stale) and child
+rows a role chip. Preset picks from the composer pill, Alt digits and "Who works on this?" call
+the new `PUT /v1/ae/sessions/{id}/preset`. The roles notice now tells the lead to pass `role` on
+`create_session` and to start native subagent descriptions with the role. New
+`lib/aeAgentRole.ts`, `lib/aeAgentUsage.ts`, `lib/aeNativeAgentInput.ts` and
+`shell/AeAgentMeta.tsx`; `AeAgentsSections.tsx`, `aeRail/AeRailAgents.tsx`,
+`AeSessionHoverStatus.tsx`, `AeFamilyTree.tsx`, `aeSessionRoles.ts`, `sessionsApi.ts` and
+`omnigent/inner/ae_roles.py` change. The store side (`ae_omni_policies`, not a patch): `create_session`
+takes `role`, `model`, `effort` and `preset` and resolves the role through the parent's preset,
+stamps `ae.role` and `ae.preset`, fills `ae.orch` from the runner's session, and logs preset
+switches to `/data/ae-preset-log.jsonl`. Tested by the new `lib/aeAgentRole.test.ts`,
+`lib/aeNativeAgentInput.test.ts`, `shell/AeAgentsUsage.test.tsx` and
+`hooks/useAeSessionPreset.record.test.tsx`, additions to `AeAgentsSections`,
+`AeSessionHoverStatus`, `Sidebar.aeFamilies` and `sessionsApi` tests, and
+`tests/inner/test_ae_roles.py`. It sits on the
+fork branch `analyticendeavors/omnigent@ae/spawn-by-role`, after `0171`.
+
+`0173` (2026-10-24) shows each agent's spend as estimated cost. The live check of `0172` found
+that Claude native sessions report only `total_cost_usd` in each `usage_by_model` row, with no
+token counts (Codex rows carry both), so a chat whose lead spent $71 on Opus read "200.9k tokens"
+(the Codex tokens alone) and a Haiku helper read "0 tokens". Cost is now the measure on the
+Agents card and tab, the total line ("Estimated at API rates", split bar by cost), the Family lead
+pill and the sidebar hover; tokens show as a muted detail only when every model row reports them,
+and "0 tokens" never prints. When no row reports a cost the surfaces fall back to tokens, and they
+hide only when both are unknown. `aeFormatCost` decides its branch on rounded cents ("$0",
+"<$0.01", "$71.25", "$1,234"). In `lib/aeAgentUsage.ts` (`aeUsageCost`, `aeCostByFamily`,
+`aeSpendOf`), `lib/aeAgentRole.ts`, `shell/AeAgentMeta.tsx`, `shell/AeFamilyTree.tsx` and
+`components/AeSessionHoverStatus.tsx`. Tested by `shell/AeAgentsUsage.test.tsx`,
+`components/AeSessionHoverStatus.test.tsx`, `shell/Sidebar.aeFamilies.test.tsx` and
+`lib/aeAgentRole.test.ts`. It sits on the fork branch `analyticendeavors/omnigent@ae/agent-cost`,
+after `0172`.
+
+`0174` (2026-10-24) lets the lead raise a stuck helper or step itself down, under the preset's
+rules. It is PR 4 of the role routing plan; Reid approved the mockups (`pr4-escalation.html`)
+with the defaults: Undo on every "Tell me after" change, the lead may climb back to the model it
+started on without asking, and Codex helpers are raised in effort only. When the lead calls the
+new `set_session_model` tool, the chat shows the call as one row: an up or down arrow, "Raised the
+builder ... from Sonnet medium to Opus high" (or "Lowered", "Lead raised itself", "Lead stepped
+down"), the reason, "raise n of cap automatic" or "approved by you", and Undo (which reads "Could
+not undo" unless the server confirms) plus Open helper. A declined, refused or waiting change is
+one muted line. The Agents card marks a helper running above its starting model with an amber
+arrow (title: times raised and from what) and shows "cap reached" once its automatic raises are
+spent. The roles notice names the tool and its rule, tells the lead to treat restarting a native
+subagent a tier up like a raise, and to switch itself when a START ON line was not applied.
+Settings drops the "later" tag on all three model change rows. New `lib/aeModelChange.ts` and
+`components/blocks/AeModelChangeRow.tsx`; `BlockRenderer.tsx`, `shell/AeAgentMeta.tsx`,
+`pages/settings/AeRolesEditor.tsx` and `omnigent/inner/ae_roles.py` change. The store side
+(`ae_omni_policies`, not a patch): `POST /v1/ae/sessions/{id}/model` and the MCP tool, with the
+rules in `escalation.py`, a per-session lock, labels `ae.model_start`, `ae.raises`,
+`ae.raise_cap`, and `/data/ae-model-log.jsonl`. Tested by `AeModelChangeRow.test.tsx`,
+`lib/aeModelChange.test.ts`, `BlockRenderer.test.tsx`, `shell/AeAgentsUsage.test.tsx`,
+`tests/inner/test_ae_roles.py`, and the package's `test_escalation.py`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/escalation`, after `0173`.
+
+`0175` (2026-10-24) folds a family's closed sessions into one row. Reid asked that finished
+helpers stop growing the list without hiding them in the archive, with a summary of how many
+sessions a lead ran; he picked the defaults from the mockup (`family-closed.html`). In Grouping >
+Family, a member whose `ae.status` is `reference`, and any archived child of a shown lead, is
+closed: it leaves the tree and the family gets one "N closed" row after its open rows, folded by
+default and remembered per family on the device (`omnigent:ae-family-closed-open`). Opened, it
+lists the closed sessions newest first, muted, five then "Show N more"; archived ones keep their
+box icon. Done (review) sessions stay visible. The lead's count pill reads "N · M open", titled
+with the breakdown ("15 sessions: 2 working, 1 done waiting for your read, 12 closed (9
+archived)"). Archived children come from one read of the archived list (pages of 200 by cursor, at
+most 5, with a note in the title when more remain), under its own query key so it never shares a
+cache entry with the Settings archive list; the key carries the listed members, so archiving a
+child refetches at once, and the old rows stay shown meanwhile. Closed and synthetic rows sit
+outside the drop lists, hotkeys and selection. Standalone is unchanged. New
+`lib/aeFamilyClosed.ts`; `lib/aeFamilyTree.ts`, `shell/AeFamilyTree.tsx`, `shell/aeSidebarStore.ts`
+and `Sidebar.tsx` change in a few lines each. Tested by `lib/aeFamilyClosed.test.ts`,
+`lib/aeFamilyTree.test.ts`, `shell/aeSidebarStore.test.ts` and `shell/Sidebar.aeFamilies.test.tsx`.
+It sits on the fork branch `analyticendeavors/omnigent@ae/closed-rows`, after `0174`.
+
+`0176` (2026-10-24) adds a "Create project" row at the foot of the Add to project lists. Reid
+asked for a visible create button there; before, a project could only be made by typing a new
+name into the search box, which then offered "+ Create <name>". While the search box is empty,
+the row shows; picking it keeps the menu open and turns the row into its own name box (focused;
+a box rather than the search field, so Radix's hover focus on menu items cannot pull focus away
+while the pointer rests where the row was). Enter files the session into the named project, made
+on demand as before; a name matching an existing project (any case) files into that one, and an
+Enter that confirms an IME composition is ignored. The search box is unchanged. One new
+`shell/AeCreateProjectRow.tsx`, used by `shell/ProjectPicker.tsx` (chat header menu and project
+tag) and `ProjectPickerMenu` in `Sidebar.tsx` (kebab and right-click menus). Tested by
+`shell/HeaderConversationMenu.test.tsx` and `shell/Sidebar.rowActions.test.tsx`. It sits on the
+fork branch `analyticendeavors/omnigent@ae/create-project-row`, after `0175`.
+
+`0177` (2026-10-24) makes the lead's model changes visible where Reid works. The live check of
+`0174` found its transcript row never renders in Claude chats (a terminal pane, which nothing
+can draw into without starting a turn) and its Agents card arrow never covers the helpers
+`set_session_model` can change (those started by `create_session` sit in Grouping > Family, not
+on the card). Reid picked the defaults from the mockup (`escalation-gaps.html`). A band beside
+the connection banner, in both the terminal and the chat view, lists each change of the last 24
+hours newest first ("Raised the builder ... from Sonnet medium to Opus high · reason · 2 min
+ago"), with Undo (reads "Undone" after), Open helper and Dismiss (remembered per device by an
+exact signature); two lines show and the rest fold. The `set_session_model` call itself is a
+normal tool card again. In Grouping > Family a helper running above the model it started on
+carries a muted line ("↑ Opus high · from Sonnet medium") and a "cap reached" chip, with the last
+change and its reason on hover; the Agents card shares the same rule. The band reads the new
+`GET /v1/ae/sessions/{lead}/model-changes` every 60 s while visible (stops on 403 or 404, backs
+off on errors), which lists the lead's and its own helpers' `ae.model_last` labels (store side,
+compact keys under the 256 character cap). New `components/AeModelChangeBand.tsx`;
+`lib/aeModelChange.ts`, `shell/AeFamilyTree.tsx`, `shell/AeAgentMeta.tsx`, `BlockRenderer.tsx`,
+`pages/ChatPage.tsx` (two lines) and `Sidebar.tsx` (one line) change; `AeModelChangeRow.tsx` is
+removed. Tested by `components/AeModelChangeBand.test.tsx`, `lib/aeModelChange.test.ts`,
+`shell/Sidebar.aeFamilies.test.tsx`, `BlockRenderer.test.tsx` and the package's
+`test_escalation.py`. It sits on the fork branch `analyticendeavors/omnigent@ae/model-change-band`,
+after `0176`.
+
+`0178` (2026-10-24) puts the roles preset pill on the new-chat screen. Reid found that a new chat
+showed no pill until its first message had created the session, so a chat could not start on a
+chosen preset. The pill reads and writes the session's `ae.team` label, so it rendered only once
+a session existed. In `shell/NewChatDialog.tsx` the pill now sits left of the model picker with no
+session behind it: it shows the default preset, and a pick (menu, search, More presets, Alt 1 to
+9, the phone sheet) is held in `lib/aeDraftPreset.ts`. When the dialog creates the session it binds
+the pick, with the composer's model options, to that session id (dropped after 120 s), and
+`lib/aeDraftPresetApply.ts` applies it from the chat store's first send through the START ON path
+(`aeApplyPlan`, now exported from `aeStartOnApply.ts`) before the message posts, so the first turn
+runs on it; a preset with a fixed lead switches the model too. The pill pick beats a START ON
+line in the same message and is not gated by "Apply START ON lines". A default pick writes
+nothing; leaving the new-chat screen clears the pick. Any failure (roles read, PATCH, lead switch)
+gives one toast and never blocks the send; past the 8 s budget a toast says it may apply after
+the first turn. `NewChatDialog.tsx`, `store/chatStore.ts`, `AeSessionPresetPill.tsx` and
+`hooks/useAeSessionPreset.ts` change by a few lines each. Tested by `lib/aeDraftPresetApply.test.ts`,
+`components/composer/AeSessionPresetPill.draft.test.tsx` and `shell/NewChatDialog.test.tsx` (the
+other `NewChatDialog.*` suites mock the roles read, which they count fetches against). It sits on
+the fork branch `analyticendeavors/omnigent@ae/new-chat-preset-pill`, after `0177`.
+
+`0179` (2026-10-24) lets Reid choose what the spend pills show. He uses a subscription Claude
+account, so the estimated dollar cost added by `0173` is not what he pays. Settings > Chat gains
+"Spend shows" (Tokens, the default; Cost; Off), stored per device in
+`omnigent:ae-spend-display` (`lib/aeSpendDisplay.ts`, `pages/settings/AeSpendDisplaySetting.tsx`).
+Claude sessions reported cost only: the forwarder posted the statusLine's dollars and dropped the
+transcript's token counts. New `harnesses/claude_native/ae_transcript_tokens.py` tallies each
+transcript and its sub-agent transcripts incrementally (1 MiB chunks, one map keyed by
+`requestId` across every file and resumed path, last record wins, sidechains skipped), and
+`forwarder.py` posts the totals as `cumulative_*_tokens` with every token post also carrying the
+cost (never lower than the last posted), so the server's per-model usage gains tokens without its
+cost changing. Tokens mode shows new input plus output ("212k tok"), with input, output and cache
+reads in the hover (Claude's cache writes sit inside input); a total that leaves out sessions
+without counts ends in "+" and says how many; with no counts the pill hides. Off removes the
+Family pill, the Agents card spend and the hover's spend. Family tree rows reserve `pr-7` instead
+of `pr-8` for the right-edge marker, closing the dead space Reid saw beside the pills and role
+chips. Known limits: tokens land in the statusLine's current model bucket, so a sub-agent on
+another model counts under the parent's; cost mode now also shows Claude token counts where Codex
+rows already did. `AeFamilyTree.tsx`, `AeAgentMeta.tsx`, `AeSessionHoverStatus.tsx`,
+`aeAgentUsage.ts`, `Sidebar.tsx` (one line) and `AeChatSettingsSection.tsx` (two lines) change.
+Tested by `tests/harnesses/claude_native/test_ae_transcript_tokens.py`, the forwarder's
+`test_usage.py`, `lib/aeSpendDisplay.test.ts` and the Family, Agents card, hover and Sidebar
+suites. It sits on the fork branch `analyticendeavors/omnigent@ae/spend-display`, after `0178`.
+
+`0180` (2026-10-24) tells the lead to start a Codex reviewer with `create_session` instead of
+`sys_session_create`. The role-routing release smoke on ae-v0.18.0.109 found that Codex reviewers
+started with `sys_session_create` were plain child sessions: no `ae.orch`, `ae.role` or
+`ae.status`, so they never joined the lead's family, were not capped, did not show in the Family
+view and could not be raised by `set_session_model`. In `omnigent/inner/ae_reviewers.py` a Codex
+slot (agent `16a06503889b0c3034496821afd41b9e` or `codex-native-ui`) now reads `create_session
+with role "reviewer", harness "codex", effort <slot effort>, a title naming the review round,
+and workspace the repo under review`; the fresh title keeps `create_session`'s idempotent key from handing back the previous
+round's reviewer. Any other agent slot keeps the `sys_session_create` text. "Never hand a review
+to an existing child session" now says "existing session". The server half (`spawn_role.py`
+picks the Codex slot for `role="reviewer"` with `harness="codex"`) lives in
+`packages/ae_omni_policies`. Tested by `tests/inner/test_ae_roles.py`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/smoke-gaps-0180`, after `0179`.
+
+`0181` (2026-10-24) tells the lead to report its final review, and lets the Roles editor carry
+the preset-insights setting. In `omnigent/inner/ae_roles.py` the Agent tool sentence of the roles
+notice (`_tools`, used by the single-preset and the lead-picks block alike) now ends with one
+line: after the final review, call `report_review` with the reviewers run, findings returned and
+findings fixed. The tool and its route are the fork's (`packages/ae_omni_policies`, `mcp.py` and
+`router.py`); the line only feeds the preset run log (`preset_runs.py`). In `web/src/lib/aeRoles.ts`
+the roles state gains an optional `insights` object (`enabled`, `weeks`, `scope`) that the parse
+keeps and `aeRolesDoc` sends back, so a save from Settings > Roles does not drop the server's
+setting; there is no control for it yet. Tested by `tests/inner/test_ae_roles.py` and
+`web/src/lib/aeRoles.test.ts`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/preset-runs-notice`, after `0180`.
+
+`0182` (2026-10-24) adds the Preset insights block to Settings > Roles. New files:
+`web/src/hooks/useAePresetReview.ts` (the review status `GET /v1/ae/preset-review`, the user's
+own suggestions, and Run now, Apply, Undo and Dismiss) and
+`web/src/pages/settings/AePresetInsightsBlock.tsx` (a switch titled "Collect run logs and review
+presets" that saves the roles `insights` setting, the reviewer, the All or Own scope for admins,
+the last and next review with a Run now button, and the user's own suggestions; a "Presets card
+shows" Cost, Tokens or Both control that saves `insights.show`). Upstream files
+touched: `AeRolesSettingsSection.tsx` renders the block as its last block (2 lines),
+`web/src/hooks/useAeRoles.ts` hands the PUT answer's `insights_task` back so the block can show
+its error, and `web/src/lib/aeRoles.ts` gains `aeWithInsights` and the optional `show` field. The server half is in
+`packages/ae_omni_policies` (`router.py`, `preset_review.py`, `preset_suggestions.py`). Tested by
+`AePresetInsightsBlock.test.tsx` and `aeRoles.test.ts`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/preset-review-block`, after `0181`.
+
+`0183` (2026-10-25) keeps the composer's prompt suggestion until the next prompt. The
+suggestion used to vanish on a reload or a second tab because `session.suggestion` was
+transient. `omnigent/server/routes/_sessions/ae_session_suggestion.py` now holds the latest
+event per session in server memory (6 hours, 1000 sessions, oldest evicted) and exposes
+`forget` and `snapshot_for`; a null post clears it, and `_publish_status` in `helpers.py` forgets
+it on every `running` status (Codex never posts a clear). `_stream_live_events` replays it
+through `pre_ready_snapshot` after the ready heartbeat, so the replay and the live tail never
+cross. In `web/src/store/chatStore.ts` `bindStream` keeps an `aeSuggestion` that arrived during
+the snapshot fetch instead of nulling it. Single replica only, like the in-flight text replay.
+Tested by `test_ae_session_suggestion.py`, `test_stream_live_events.py` and a case in
+`chatStore.test.ts`. It sits on the fork branch `analyticendeavors/omnigent@ae/suggestion-replay`,
+after `0182`.
+
+`0184` (2026-10-25) shows only the name on a family's lead row and archives a lead's sessions
+with it. In Grouping > Family the lead's cost pill and "N · M open" pill covered the name on a
+narrow panel and sat under the pin on hover. `web/src/shell/AeFamilyTree.tsx` now draws a bare
+fold chevron there (its title keeps the counts), and the family's session and open counts move
+to the hover card's lead line in `AeSessionHoverStatus.tsx`, next to the family total that
+already follows Spend shows; under Family grouping the counts include archived children, as the
+"N closed" row does. The new `web/src/shell/AeFamilyArchive.tsx` makes archiving a lead (menu or
+quick button) archive every session under it, read fresh from the session list (up to five
+pages of 200) so children past the loaded pages or outside a search count too: at once when all
+are in the family's closed group, else after a confirm that reads "Are you sure you would like to archive this? There are
+still open sessions.", where Cancel archives nothing. `Sidebar.tsx` gains five lines. Tested by
+`Sidebar.aeFamilies.test.tsx` and `AeSessionHoverStatus.test.tsx`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/family-row-hover`, after `0183`.
+
+`0185` (2026-10-25) makes the chat header's Archive cascade like the sidebar's (`0184`). The
+header still archived a family's lead alone, leaving its sessions running with no lead. In
+`web/src/shell/AeFamilyArchive.tsx` the hook takes a `gate`: `"tree"` for a sidebar row (only a
+lead in Grouping > Family's tree cascades, as before) and `"read"` for the header, which has no
+tree, so it reads the session list to learn whether the session leads a family. Once a read is
+done the archive runs in the hook, so it leaves the open chat only when that chat is one of the
+archived sessions, even if the user switched chats during the read. The read now also takes the
+archived list, in parallel, so an open session started by an archived helper still traces back to
+its lead (this also fixes `0184`'s sidebar cascade). `archiveFamily` now takes the single-session archive as its fallback
+instead of returning a flag. `HeaderConversationMenu.tsx` and `Sidebar.tsx` change a few lines
+each. Bulk select still archives only the rows ticked. Tested by
+`HeaderConversationMenu.test.tsx` (now in the `web-test` list) and `Sidebar.aeFamilies.test.tsx`.
+It sits on the fork branch `analyticendeavors/omnigent@ae/family-archive-header`, after `0184`.
+
+`0186` (2026-10-25) makes the model change band's actions look clickable without making the row
+taller. In `AeModelChangeBand.tsx`, Undo and Open helper are 18 px filled chips on an 18 px line
+(Undo in the emerald accent, Open helper in the neutral soft fill the role chip uses), each with
+an invisible `::after` that widens the tap area to 28 px. The Dismiss text becomes an 18 px close
+box with a Tabler X, `aria-label` and `title` "Dismiss", pinned to the row's right edge so it
+stays at the top right when the chips wrap under the text on a phone. The ids and test ids are
+unchanged. Tested by `AeModelChangeBand.test.tsx` (now in the `web-test` list). It sits on the
+fork branch `analyticendeavors/omnigent@ae/band-actions-chips`, after `0185`.
+
+`0188` (2026-10-26) adds Settings > Chat > "Pin a lead's family" (Yes or No, saved on this
+device in `omnigent:ae-pin-family`, No by default; `web/src/lib/aePinFamily.ts` and
+`web/src/pages/settings/AePinFamilySetting.tsx`). With Yes, pinning a session that leads a
+family also pins its open sessions, lead first so the family lists together in Pinned;
+reference and archived sessions stay unpinned, and a family that needs more pin spots than are
+free pins nothing and says so. Unpinning the lead unpins every pinned session of the family,
+with one Undo that re-pins them at their old values. Pin writes run one after another, since
+the app refuses overlapping ones, and the cascade stops at the first that fails and says how many
+saved. The cap is counted as the pin toggle counts it (without shared pins, only the viewer's own
+sessions count, and another person's session in the family is not pinned), and a member past the
+sidebar's loaded pages is seeded into the `conversation-backfill` cache so its Pinned row has a
+title at once. A session whose cached labels show it was started by another toggles alone,
+with no read. The cascade is
+`web/src/shell/aePinFamily.ts`; the sidebar's pin toggle and the chat header's Pin call it with
+the old single toggle as the fallback, a few lines each in `Sidebar.tsx` and
+`HeaderConversationMenu.tsx`. The family read `0185` added moves to
+`web/src/lib/aeFamilyRead.ts`, shared by archive and pin. Tested by `aePinFamily.test.ts`
+(now in the `web-test` list) and `AeChatSettingsSection.test.tsx`. It sits on the fork branch
+`analyticendeavors/omnigent@ae/family-pin`, after `0187`.
+
+`0189` (2026-10-26) shows a lead's family as labelled rows at the top of the sidebar hover card.
+Since `0184` the lead row shows only its name, and the family's counts and total sat on one
+small grey line under the status, easy to miss. In `web/src/components/AeSessionHoverStatus.tsx`
+the new `AeFamilyBlock` renders above the status block: a FAMILY heading, then Preset (when the
+lead has one), Sessions ("7, 6 open", archived children counted under Grouping > Family as the
+"N closed" row counts them) and the family total as Spend shows sets it (Tokens or Cost; no row
+when Off). It replaces the grey lead line; `AeRoleLine` keeps a started session's role line. The
+block's body is its own component, so a session that leads nothing reads no roles or usage.
+Reid picked the layout from four mockups (2026-10-26). Tested by `AeSessionHoverStatus.test.tsx`
+and `Sidebar.aeFamilies.test.tsx`. It sits on the fork branch `analyticendeavors/omnigent@ae/family-pin`,
+after `0188`.

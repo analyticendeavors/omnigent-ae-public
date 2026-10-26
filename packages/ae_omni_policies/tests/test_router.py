@@ -182,6 +182,40 @@ async def test_capacity_reports_the_limit_set_on_the_settings_page(
     assert (capacity["limit"], listed["limit"]) == (5, 5)
 
 
+class _HelpersStore:
+    def __init__(self, on: bool) -> None:
+        self.on = on
+
+    def list_defaults(self) -> list[Any]:
+        return [
+            SimpleNamespace(
+                handler=slot_limit.HANDLER, enabled=True, factory_params={"helpers_count": self.on}
+            )
+        ]
+
+
+@pytest.mark.parametrize("on", [False, True])
+async def test_capacity_follows_the_helpers_count_setting(
+    client: httpx.AsyncClient, on: bool
+) -> None:
+    # 2026-10-26: off, only leads hold slots and an orphan helper holds none; on, each
+    # working helper holds one too, and the same count reaches /v1/ae/sessions.
+    lead = await _session(client, "Lead", {labels.STATUS: "working"})
+    for title, orch in (("Builder", lead), ("Orphan", "gone")):
+        await _session(client, title, {labels.STATUS: "working", labels.ORCH: orch})
+    await _session(client, "Done", {labels.STATUS: "review", labels.ORCH: lead})
+    slot_limit.remember_store(_HelpersStore(on))
+    try:
+        capacity = (await client.get("/v1/ae/capacity")).json()
+        listed = (await client.get("/v1/ae/sessions")).json()
+    finally:
+        slot_limit.remember_store(None)
+    expected = 3 if on else 1
+    assert capacity["helpers_count"] is on
+    assert (capacity["slots_used"], listed["slots_used"]) == (expected, expected)
+    assert sorted(row["helper"] for row in capacity["working"]) == [False, True, True]
+
+
 async def test_lot_maps_the_store(client: httpx.AsyncClient) -> None:
     with respx.mock(base_url=BASE) as mock:
         mock.get("/api/buckets").respond(200, json=LOT["buckets"])
@@ -1034,6 +1068,8 @@ START = {
     "branch": "claude/dashboard-overflow",
     "orchestrator": "conv_orch",
 }
+# A create with no lead: the only kind that takes a slot of its own.
+ALONE = {key: value for key, value in START.items() if key != "orchestrator"}
 
 
 async def test_start_session_holds_a_slot_creates_and_briefs(
@@ -1065,6 +1101,7 @@ async def test_start_session_holds_a_slot_creates_and_briefs(
             labels.ORCH_KEY: "claude/dashboard-overflow",
             labels.REPO: "analyticendeavors/omnigent-ae",
             labels.BRANCH: "claude/dashboard-overflow",
+            labels.PRESET: "balanced",
             "omnigent.ui": "terminal",
             "omnigent.wrapper": "claude-code-native-ui",
         },
@@ -1117,7 +1154,8 @@ async def test_start_session_returns_the_live_one_for_the_same_key(
     assert [row["id"] for row in listed["items"]] == [live]
     assert listed["items"][0]["key"] == START["key"]
     assert listed["items"][0]["path"] == f"/c/{live}"
-    assert listed["slots_used"] == 1
+    # Its lead is absent, so it holds no slot unless Settings counts helpers (2026-10-26).
+    assert listed["slots_used"] == 0
 
 
 async def test_start_session_holds_at_the_limit_set_on_the_settings_page(
@@ -1130,12 +1168,12 @@ async def test_start_session_holds_at_the_limit_set_on_the_settings_page(
         await _session(client, title, {labels.STATUS: "working"})
     slot_limit.remember_store(_SlotCapStore(2))
     try:
-        full = await client.post("/v1/ae/sessions", json=START)
+        full = await client.post("/v1/ae/sessions", json=ALONE)
     finally:
         slot_limit.remember_store(None)
     assert full.status_code == 409, full.text
     error = full.json()["error"]
-    assert error["message"].startswith("Slots full: 2 of 2 working.")
+    assert error["message"].startswith("Slots full: 2 of 2 taken; this one would make 3 of 2.")
     assert error["limit"] == 2
     assert app.calls == []
 
@@ -1149,19 +1187,91 @@ async def test_start_session_at_the_limit_asks_unless_riding(
         await _session(client, title, {labels.STATUS: "working"})
     failed = await _session(client, "Crashed", {labels.STATUS: "working"})
     get_conversation_store().set_session_live_status(failed, "failed")
-    full = await client.post("/v1/ae/sessions", json=START)
+    full = await client.post("/v1/ae/sessions", json=ALONE)
     assert full.status_code == 409, full.text
     error = full.json()["error"]
     assert error["code"] == "slots_full"
-    assert error["message"].startswith("Slots full: 3 of 3 working.")
+    assert error["message"].startswith("Slots full: 3 of 3 taken; this one would make 4 of 3.")
     assert "Crashed" not in error["message"], "a failed session holds no slot"
     assert {row["title"] for row in error["working"]} == {"One", "Two", "Three"}
     assert app.calls == []
 
-    riding = await client.post("/v1/ae/sessions", json=START | {"ride_unparked": True})
+    riding = await client.post("/v1/ae/sessions", json=ALONE | {"ride_unparked": True})
     assert riding.status_code == 200, riding.text
     assert riding.json()["overflow"] is True
     assert app.calls[2][2]["labels"][labels.OVERFLOW] == "1"
+
+
+async def test_a_create_from_a_lead_never_waits_on_the_slot_limit(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> None:
+    # 2026-10-24: the lead is the single session; its helpers start even when slots are full
+    # and the lead itself holds none (it is in review).
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    lead = await _session(client, "Lead", {labels.STATUS: "review"})
+    for title in ("One", "Two", "Three"):
+        await _session(client, title, {labels.STATUS: "working"})
+    response = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    assert response.status_code == 200, response.text
+    assert (await client.post("/v1/ae/sessions", json=ALONE | {"key": "x"})).status_code == 409
+
+
+async def test_start_session_joins_the_lead_family_slot_and_caps_its_children(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> None:
+    # 2026-10-23: a lead and the sessions it starts hold one slot; past
+    # family_children of them working, create_session is refused.
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    lead = await _session(client, "Role routing build", {labels.STATUS: "working"})
+    for title in ("Two", "Three"):
+        await _session(client, title, {labels.STATUS: "working"})
+    child = START | {"orchestrator": lead}
+    first = await client.post("/v1/ae/sessions", json=child | {"key": "kid-1"})
+    assert first.status_code == 200, first.text
+    assert first.json()["overflow"] is False, "the lead's slot covers it"
+    assert app.calls[2][2]["labels"][labels.ORCH] == lead
+    for key in ("kid-2", "kid-3"):
+        await _session(
+            client, key, {labels.STATUS: "working", labels.ORCH: lead, labels.ORCH_KEY: key}
+        )
+    await _session(
+        client, "kid-1", {labels.STATUS: "working", labels.ORCH: lead, labels.ORCH_KEY: "x"}
+    )
+    capacity = (await client.get("/v1/ae/capacity")).json()
+    assert capacity["slots_used"] == 3
+    assert {row["family"] for row in capacity["working"]} >= {lead}
+    full = await client.post("/v1/ae/sessions", json=child | {"key": "kid-4"})
+    assert full.status_code == 409, full.text
+    error = full.json()["error"]
+    assert (error["code"], error["limit"]) == ("family_full", 3)
+    assert len(error["working"]) == 3
+    assert "Wait for one to finish" in error["message"]
+
+
+async def test_start_session_ignores_a_lead_the_caller_may_not_open(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> None:
+    # Naming someone else's working session must not ride in its slot (review, 2026-10-23).
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    lead = await _session(client, "Not yours", {labels.STATUS: "working"})
+    for title in ("Two", "Three"):
+        await _session(client, title, {labels.STATUS: "working"})
+
+    async def _closed(user: str | None, session_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(router_module, "_may_write_session", _closed)
+    full = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    assert full.status_code == 409, full.text
+    assert full.json()["error"]["code"] == "slots_full"
+    riding = await client.post(
+        "/v1/ae/sessions", json=START | {"orchestrator": lead, "ride_unparked": True}
+    )
+    assert riding.status_code == 200, riding.text
+    assert app.calls[2][2]["labels"][labels.ORCH] == "1"
 
 
 async def test_start_session_failures_name_what_to_do(
@@ -1482,3 +1592,124 @@ async def test_deploy_hold_posts_are_json_only_and_origin_checked(
     )
     assert foreign_resume.status_code == 403
     assert (await client.get("/v1/ae/deploy/hold")).json()["held"] is True
+
+
+def test_the_derived_session_key_is_scoped_to_the_lead() -> None:
+    base = {"title": "Review 1: slots", "brief": "look", "harness": "codex"}
+    one = router_module._session_key(router_module.SessionRequest(**base, orchestrator="lead-a"))
+    two = router_module._session_key(router_module.SessionRequest(**base, orchestrator="lead-b"))
+    again = router_module._session_key(router_module.SessionRequest(**base, orchestrator="lead-a"))
+    assert one != two
+    assert one == again
+
+
+# --- helpers_count review fixes (2026-10-26) ---
+
+
+class _CapsStore:
+    def __init__(self, *params: dict[str, Any]) -> None:
+        self.params = params
+
+    def list_defaults(self) -> list[Any]:
+        return [
+            SimpleNamespace(handler=slot_limit.HANDLER, enabled=True, factory_params=dict(p))
+            for p in self.params
+        ]
+
+
+async def test_capacity_reports_one_cap_s_rules_and_the_callers_own_flag(
+    client: httpx.AsyncClient,
+) -> None:
+    lead = await _session(client, "Lead", {labels.STATUS: "working"})
+    kid = await _session(client, "Kid", {labels.STATUS: "working", labels.ORCH: lead})
+    slot_limit.remember_store(
+        _CapsStore({"limit": 3, "helpers_count": False}, {"limit": 5, "helpers_count": True})
+    )
+    try:
+        body = (await client.get(f"/v1/ae/capacity?session={kid}")).json()
+        none = (await client.get("/v1/ae/capacity?session=conv_unknown")).json()
+        lead_body = (await client.get(f"/v1/ae/capacity?session={lead}")).json()
+    finally:
+        slot_limit.remember_store(None)
+    assert (body["limit"], body["helpers_count"], body["own_helper"]) == (3, False, True)
+    assert none["own_helper"] is None
+    assert lead_body["own_helper"] is False
+
+
+async def test_capacity_hides_own_helper_for_a_session_the_caller_does_not_own(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    lead = await _session(client, "Lead", {labels.STATUS: "working"})
+    kid = await _session(client, "Kid", {labels.STATUS: "working", labels.ORCH: lead})
+
+    async def _closed(user: str | None, session_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(router_module, "_may_write_session", _closed)
+    body = (await client.get(f"/v1/ae/capacity?session={kid}")).json()
+    assert body["own_helper"] is None
+
+
+async def test_start_session_with_helpers_counted_refuses_at_the_limit_and_rides(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> None:
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    lead = await _session(client, "Lead", {labels.STATUS: "working"})
+    await _session(client, "Other", {labels.STATUS: "working"})
+    await _session(client, "Helper", {labels.STATUS: "working", labels.ORCH: lead})
+    slot_limit.remember_store(_CapsStore({"limit": 3, "helpers_count": True}))
+    try:
+        full = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+        assert full.status_code == 409, full.text
+        assert full.json()["error"]["code"] == "slots_full"
+        assert app.calls == []
+        riding = await client.post(
+            "/v1/ae/sessions", json=START | {"orchestrator": lead, "ride_unparked": True}
+        )
+        assert riding.status_code == 200, riding.text
+        assert riding.json()["overflow"] is True
+    finally:
+        slot_limit.remember_store(None)
+
+
+async def test_two_caps_do_not_refuse_what_both_allow(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> None:
+    # Cap A: 3, helpers off. Cap B: 5, helpers on. Two leads and a helper pass both.
+    monkeypatch.setattr(router_module, "_loopback", _App())
+    lead = await _session(client, "Lead", {labels.STATUS: "working"})
+    await _session(client, "Other", {labels.STATUS: "working"})
+    await _session(client, "Helper", {labels.STATUS: "working", labels.ORCH: lead})
+    slot_limit.remember_store(
+        _CapsStore({"limit": 3, "helpers_count": False}, {"limit": 5, "helpers_count": True})
+    )
+    try:
+        ok = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    finally:
+        slot_limit.remember_store(None)
+    assert ok.status_code == 200, ok.text
+
+
+async def test_an_orphan_helper_holds_its_own_slot_when_helpers_count(
+    client: httpx.AsyncClient,
+) -> None:
+    await _session(client, "Orphan", {labels.STATUS: "working", labels.ORCH: "gone"})
+    slot_limit.remember_store(_CapsStore({"helpers_count": True}))
+    try:
+        on = (await client.get("/v1/ae/capacity")).json()
+    finally:
+        slot_limit.remember_store(None)
+    assert on["slots_used"] == 1
+
+
+async def test_a_non_boolean_helpers_count_is_off(client: httpx.AsyncClient) -> None:
+    lead = await _session(client, "Lead", {labels.STATUS: "working"})
+    await _session(client, "Kid", {labels.STATUS: "working", labels.ORCH: lead})
+    for stored in ("true", 1):
+        slot_limit.remember_store(_CapsStore({"helpers_count": stored}))
+        try:
+            body = (await client.get("/v1/ae/capacity")).json()
+        finally:
+            slot_limit.remember_store(None)
+        assert (body["helpers_count"], body["slots_used"]) == (False, 1)

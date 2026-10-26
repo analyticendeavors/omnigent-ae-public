@@ -42,7 +42,7 @@ from typing import Any, Literal
 
 import httpx
 
-from ae_omni_policies import __version__
+from ae_omni_policies import __version__, key_health
 
 API_URL = "https://api.github.com"
 DEFAULT_REPOS: tuple[str, ...] = ()
@@ -130,7 +130,7 @@ def ci_state(check_runs: list[dict[str, Any]]) -> CiState:
     return "passing"
 
 
-def _why(response: httpx.Response) -> str:
+def _why(response: httpx.Response, *, write_issues: bool = False) -> str:
     try:
         message = response.json().get("message")
     except (ValueError, AttributeError):
@@ -138,6 +138,8 @@ def _why(response: httpx.Response) -> str:
     hint = ""
     if response.status_code == 401:
         hint = "; the token is invalid or expired, replace it in Key Vault"
+    elif response.status_code in (403, 404) and write_issues:
+        hint = "; the token needs Issues: write on that repo"
     elif response.status_code in (403, 404):
         hint = "; check the token can read this repo (Pull requests and Checks: read)"
     return f"{response.status_code} {message or response.reason_phrase}{hint}"
@@ -186,6 +188,26 @@ class UpdateBranchOutcome:
     message: str
 
 
+async def _observe(response: httpx.Response) -> None:
+    """Tell the Admin Center's secrets list how the token fared (``key_health.py``).
+
+    A 401 is the token refused; any other answer below 500 means GitHub took it
+    (a 404 or 422 is about the request, not the token). The token's own expiry
+    rides on every answer in GitHub's ``github-authentication-token-expiration``
+    header (fine-grained and classic tokens with an expiry).
+    """
+    status = response.status_code
+    if status == 401:
+        key_health.record("github", False, status)
+    elif status < 500:
+        key_health.record("github", True)
+        when = key_health.parse_github_expiry(
+            response.headers.get(key_health.GITHUB_EXPIRY_HEADER)
+        )
+        if when is not None:
+            key_health.note_expiry(TOKEN_ENV, when)
+
+
 class GitHubClient:
     """An async context manager over ``httpx.AsyncClient`` with the token in the header."""
 
@@ -203,6 +225,7 @@ class GitHubClient:
                 "X-GitHub-Api-Version": "2022-11-28",
                 "User-Agent": USER_AGENT,
             },
+            event_hooks={"response": [_observe]},
         )
 
     async def __aenter__(self) -> GitHubClient:
@@ -423,6 +446,24 @@ class GitHubClient:
                 raise GitHubError(f"{method} {path} failed: {type(exc).__name__}") from exc
             if response.status_code not in (200, 201):
                 raise GitHubError(f"{method} {path} answered {_why(response)}")
+
+    async def create_issue(self, repo: str, title: str, body: str) -> str:
+        """Open an issue in *repo* and return its ``html_url``.
+
+        Needs Issues write on the token. No labels are sent, so a label missing from the
+        repo cannot turn the call into a 422 (added 2026-10-24, the preset reviewer).
+        """
+        path = f"/repos/{repo}/issues"
+        try:
+            response = await self._http.post(path, json={"title": title, "body": body})
+        except httpx.HTTPError as exc:
+            raise GitHubError(f"POST {path} failed: {type(exc).__name__}") from exc
+        if response.status_code != 201:
+            raise GitHubError(f"POST {path} answered {_why(response, write_issues=True)}")
+        url = response.json().get("html_url")
+        if not isinstance(url, str) or not url:
+            raise GitHubError(f"POST {path} answered no issue url")
+        return url
 
     async def _ci(self, repo: str, sha: str) -> CiState:
         if not sha:

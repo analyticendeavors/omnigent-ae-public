@@ -44,7 +44,7 @@ Each gate button posts the answer to the session as its next message. Save for l
 
 <p align="center"><img src="../media/dashboard-prs.webp" alt="Open PRs, each with the reason it waits"></p>
 
-Every open pull request your sessions opened gets a card with its checks, conflicts and review, and one line that says why it cannot merge yet: checks still running, a failing check, changes requested, or a branch behind its base. Merge stays off until that line clears, and Open on GitHub opens the pull request in a new tab.
+Every open pull request your sessions opened gets a card with its checks, conflicts and review, and one line that says why it cannot merge yet: checks still running, a failing check, changes requested, or a branch behind its base. Merge stays off until that line clears, and Open on GitHub opens the pull request in a new tab. A draft's card offers Mark ready for review and a branch behind its base offers Update branch, as the action dock does, and Review details opens the size, the description and the compliance review without starting a merge.
 
 **Where:** Open PRs on the Session Dashboard.<br>
 **Built from:** core patch [`0025`](../../patches/0025-ae-patch-Let-navigation.openExternal-open-GitHub-pul.patch); [`packages/ae_omni_extension`](../../packages/ae_omni_extension); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
@@ -58,6 +58,13 @@ Parked work is listed by urgency, return date and tag, with search and filters. 
 **Where:** Parking Lot, the right-hand column of the Session Dashboard. It needs a task service (`AE_TASK_STORE_URL`).<br>
 **Built from:** [`packages/ae_omni_extension`](../../packages/ae_omni_extension); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
+## Reopen a closed session
+
+Each session in the Dashboard's Reference list has a menu that moves it back to Working or Review, so a session closed too early comes back without opening it.
+
+**Where:** The menu on a line in Reference on the Session Dashboard.<br>
+**Built from:** [`packages/ae_omni_extension`](../../packages/ae_omni_extension)
+
 ---
 
-Next: [Sidebar](sidebar.md)
+Previous: [Triage and policies](triage-and-policies.md) &middot; Next: [Sidebar](sidebar.md)
