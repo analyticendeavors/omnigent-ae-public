@@ -1,0 +1,1715 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 19:44:52 -0700
+Subject: [PATCH 168/191] [ae-patch] Show Grouping > Family as tree rows,
+ families first, then the sessions in no family
+
+Each lead is the parent row with its sessions on a line in the family color, a fold pill per lead remembered per device, and a stand-in row for a lead that is not listed.
+---
+ web/src/lib/aeFamily.test.ts              |  12 +
+ web/src/lib/aeFamily.ts                   |  24 +-
+ web/src/lib/aeFamilyTree.test.ts          | 273 ++++++++++++++++++
+ web/src/lib/aeFamilyTree.ts               | 333 ++++++++++++++++++++++
+ web/src/lib/aeFamilyView.ts               |  56 +---
+ web/src/shell/AeFamilyDot.tsx             |  67 ++---
+ web/src/shell/AeFamilyTree.tsx            | 320 +++++++++++++++++++++
+ web/src/shell/Sidebar.aeFamilies.test.tsx | 110 ++++++-
+ web/src/shell/Sidebar.tsx                 | 107 ++++---
+ web/src/shell/aeSidebarStore.test.ts      |  58 ++++
+ web/src/shell/aeSidebarStore.ts           |  12 +-
+ 11 files changed, 1241 insertions(+), 131 deletions(-)
+ create mode 100644 web/src/lib/aeFamilyTree.test.ts
+ create mode 100644 web/src/lib/aeFamilyTree.ts
+ create mode 100644 web/src/shell/AeFamilyTree.tsx
+
+diff --git a/web/src/lib/aeFamily.test.ts b/web/src/lib/aeFamily.test.ts
+index 4ca530e930f768b50c0ca89e382d1c9f79d6833c..638ffea34879e6b3331c9f9293e1437abc4b472c 100644
+--- a/web/src/lib/aeFamily.test.ts
++++ b/web/src/lib/aeFamily.test.ts
+@@ -61,6 +61,18 @@ describe("aeFamilies", () => {
+     ).toBe(0);
+   });
+ 
++  it("resolves every member of an ae.orch cycle to one top session", () => {
++    const rows = [
++      row("D", { "ae.orch": "A" }),
++      row("A", { "ae.orch": "B" }),
++      row("B", { "ae.orch": "A" }),
++    ];
++    const { byRoot, byRow } = aeFamilies(rows);
++    expect([...byRoot.keys()]).toEqual(["A"]);
++    expect([...byRow.keys()].sort()).toEqual(["A", "B", "D"]);
++    expect(byRow.get("A")!.isLead).toBe(true);
++  });
++
+   it("follows a slot to the top of the ae.orch chain, never through a fork", () => {
+     const rows = [row("lead"), row("k1", { "ae.orch": "lead" }), row("g", { "ae.orch": "k1" })];
+     const byId = new Map(rows.map((c) => [c.id, c] as const));
+diff --git a/web/src/lib/aeFamily.ts b/web/src/lib/aeFamily.ts
+index 90620f718d23e37825508d6c5905bec79865c4b8..a75aa66225297d570d61c8ebd85e23a6dbed56cb 100644
+--- a/web/src/lib/aeFamily.ts
++++ b/web/src/lib/aeFamily.ts
+@@ -40,13 +40,17 @@ function topOf(
+   row: FamilyRow,
+   byId: ReadonlyMap<string, FamilyRow>,
+   parentOf: (labels: Labels) => string | null,
++  /** A cycle's members all resolve to its lowest id, so each shows in one family. */
++  canonicalCycle = false,
+ ): string {
+   let key = row.id;
+-  const seen = new Set([key]);
++  const chain = [key];
+   let parent = parentOf(row.labels);
+-  for (let depth = 0; depth < MAX_DEPTH && parent && !seen.has(parent); depth += 1) {
++  for (let depth = 0; depth < MAX_DEPTH && parent; depth += 1) {
++    const at = chain.indexOf(parent);
++    if (at !== -1) return canonicalCycle ? chain.slice(at).reduce((a, b) => (b < a ? b : a)) : key;
+     key = parent;
+-    seen.add(key);
++    chain.push(key);
+     const next = byId.get(key);
+     parent = next ? parentOf(next.labels) : null;
+   }
+@@ -195,17 +199,25 @@ export function assignFamilyColors(roots: readonly string[]): Map<string, number
+ /**
+  * The families among *rows*, in the order their first member appears. A family
+  * needs two loaded members to show: a lone row has nothing to be marked against.
++ * With *orphans* (the family tree view), a lone row started by an unlisted
++ * session shows too, under that lead, rather than falling into the rest.
+  */
+-export function aeFamilies(rows: readonly Conversation[]): AeFamilies {
++export function aeFamilies(rows: readonly Conversation[], orphans = false): AeFamilies {
+   const byId = new Map(rows.map((row) => [row.id, row] as const));
+   const grouped = new Map<string, Conversation[]>();
+   for (const row of rows) {
+-    const root = topOf(row, byId, aeFamilyParent);
++    const root = topOf(row, byId, aeFamilyParent, true);
+     const members = grouped.get(root);
+     if (members) members.push(row);
+     else grouped.set(root, [row]);
+   }
+-  const shown = [...grouped].filter(([, members]) => members.length > 1);
++  // Tree view: an unlisted top session makes a family only through `ae.orch`
++  // (a fork of an unloaded source stays in the rest).
++  const shown = [...grouped].filter(([root, members]) =>
++    orphans && !byId.has(root)
++      ? members.some((row) => aeOrchParent(row.labels) === root)
++      : members.length > 1,
++  );
+   if (shown.length === 0) return NO_FAMILIES;
+   const colors = assignFamilyColors(shown.map(([root]) => root));
+   const byRoot = new Map<string, AeFamily>();
+diff --git a/web/src/lib/aeFamilyTree.test.ts b/web/src/lib/aeFamilyTree.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ba4b215535f4228b853f5c82cd82e7be88f4e98f
+--- /dev/null
++++ b/web/src/lib/aeFamilyTree.test.ts
+@@ -0,0 +1,273 @@
++import { renderHook } from "@testing-library/react";
++import { afterEach, describe, expect, it } from "vitest";
++import type { Conversation } from "@/hooks/useConversations";
++import { aeFamilies } from "./aeFamily";
++import {
++  AE_FAMILIES_SECTION,
++  AE_FAMILY_REST_SECTION,
++  aeFamilyTree,
++  aeWithFamiliesSection,
++  resetAeFamilyFoldsCache,
++  toggleAeFamilyFold,
++  useAeEffectiveFolds,
++  useAeStableTree,
++} from "./aeFamilyTree";
++
++function row(id: string, labels: Record<string, string> = {}, extra: Partial<Conversation> = {}) {
++  return {
++    id,
++    object: "conversation",
++    title: id,
++    created_at: 0,
++    updated_at: 0,
++    labels,
++    permission_level: null,
++    status: "idle",
++    ...extra,
++  } as Conversation;
++}
++
++const orch = (id: string) => ({ "ae.orch": id });
++
++function build(
++  ordered: Conversation[],
++  {
++    folded = [] as string[],
++    byLead = false,
++    orphans = true,
++    lookup = undefined as ((id: string) => Conversation | undefined) | undefined,
++  } = {},
++) {
++  return aeFamilyTree(ordered, aeFamilies(ordered, orphans), {
++    folded: new Set(folded),
++    byLead,
++    lookup,
++  });
++}
++
++afterEach(() => {
++  localStorage.clear();
++  resetAeFamilyFoldsCache();
++});
++
++describe("aeFamilyTree", () => {
++  it("puts families first, each lead then its sessions as a tree, then the rest in order", () => {
++    const ordered = [
++      row("rest1"),
++      row("grandchild", orch("child1")),
++      row("child2", orch("lead")),
++      row("lead"),
++      row("child1", orch("lead")),
++      row("rest2"),
++    ];
++    const { sessions, groupTitles, groupOrder, tree } = build(ordered);
++    // Each step keeps the list's order: child2 sorts ahead of child1.
++    expect(sessions.map((c) => c.id)).toEqual([
++      "lead",
++      "child2",
++      "child1",
++      "grandchild",
++      "rest1",
++      "rest2",
++    ]);
++    expect(groupOrder).toEqual([AE_FAMILIES_SECTION, AE_FAMILY_REST_SECTION]);
++    expect(groupTitles.get("grandchild")).toBe(AE_FAMILIES_SECTION);
++    expect(groupTitles.get("rest1")).toBe(AE_FAMILY_REST_SECTION);
++    expect(tree.familyCount).toBe(1);
++    const at = (id: string) => tree.rows.get(id)!;
++    expect(at("lead")).toMatchObject({ depth: 0, stem: true, more: false });
++    expect(at("child2")).toMatchObject({ depth: 1, more: true, stem: false });
++    expect(at("child1")).toMatchObject({ depth: 1, more: false, stem: true });
++    // The last child's line ends at its own row, so none runs past the grandchild.
++    expect(at("grandchild")).toMatchObject({ depth: 2, through: [false], more: false });
++    expect(tree.leads.get("lead")).toMatchObject({ count: 3, folded: false, standIn: null });
++  });
++
++  it("ranks families by their first member, or by their lead under Manual", () => {
++    const ordered = [row("b-child", orch("b")), row("a"), row("a-child", orch("a")), row("b")];
++    expect(build(ordered).sessions.map((c) => c.id)).toEqual(["b", "b-child", "a", "a-child"]);
++    expect(build(ordered, { byLead: true }).sessions.map((c) => c.id)).toEqual([
++      "a",
++      "a-child",
++      "b",
++      "b-child",
++    ]);
++  });
++
++  it("folds a family to its lead, rolling up a waiting or running session", () => {
++    const ordered = [
++      row("lead"),
++      row("waiting", orch("lead"), { pending_elicitations_count: 1 }),
++      row("busy", orch("lead"), { status: "running" }),
++      row("rest"),
++    ];
++    const { sessions, tree } = build(ordered, { folded: ["lead"] });
++    expect(sessions.map((c) => c.id)).toEqual(["lead", "rest"]);
++    expect(tree.rows.get("lead")!.stem).toBe(false);
++    expect(tree.leads.get("lead")).toMatchObject({
++      count: 2,
++      folded: true,
++      needsResponse: true,
++      running: true,
++    });
++  });
++
++  it("stands in for a lead that is not listed, as its own entry before its sessions", () => {
++    const archived = row("gone", {}, { archived: true, title: "Old lead" });
++    const ordered = [row("only", orch("gone")), row("rest")];
++    const lookup = (id: string) => (id === "gone" ? archived : undefined);
++    const { sessions, tree, groupTitles } = build(ordered, { lookup });
++    expect(sessions.map((c) => c.id)).toEqual(["gone", "only", "rest"]);
++    expect(groupTitles.get("gone")).toBe(AE_FAMILIES_SECTION);
++    expect(tree.standIns.has("gone")).toBe(true);
++    expect(tree.leads.get("gone")).toMatchObject({ count: 1, standIn: { lead: archived } });
++    expect(tree.rows.get("gone")).toMatchObject({ depth: 0, stem: true });
++    expect(tree.rows.get("only")).toMatchObject({ depth: 1, more: false });
++    // Folded, the family's sessions leave the list; only the stand-in stays.
++    const folded = build(ordered, { folded: ["gone"], lookup });
++    expect(folded.sessions.map((c) => c.id)).toEqual(["gone", "rest"]);
++    expect(folded.tree.rows.has("only")).toBe(false);
++    expect(folded.tree.leads.get("gone")).toMatchObject({ folded: true });
++  });
++
++  it("stands in for an unknown lead with a stub entry of the lead's id", () => {
++    const { sessions, tree } = build([row("a", orch("ghost")), row("b", orch("ghost"))], {
++      folded: ["ghost"],
++    });
++    expect(sessions.map((c) => c.id)).toEqual(["ghost"]);
++    expect(tree.leads.get("ghost")).toMatchObject({ standIn: { lead: null }, folded: true });
++  });
++
++  it("lists a pinned or filtered-out lead as its real row, not a copy without behavior", () => {
++    const pinned = row("pinned-lead", {}, { title: "Pinned lead" });
++    const { sessions, tree } = build([row("kid", orch("pinned-lead"))], {
++      lookup: (id) => (id === "pinned-lead" ? pinned : undefined),
++    });
++    expect(sessions[0]).toBe(pinned);
++    expect(tree.standIns.size).toBe(0);
++    expect(tree.leads.get("pinned-lead")).toMatchObject({ standIn: null, count: 1 });
++  });
++
++  it("puts every member of an ae.orch cycle, and its tail, in one family", () => {
++    const ordered = [row("D", orch("A")), row("A", orch("B")), row("B", orch("A")), row("rest")];
++    const { sessions, tree, groupTitles } = build(ordered);
++    const ids = sessions.map((c) => c.id);
++    expect(new Set(ids).size).toBe(ids.length);
++    expect(tree.familyCount).toBe(1);
++    expect(tree.standIns.size).toBe(0);
++    expect(ids).toEqual(["A", "D", "B", "rest"]);
++    expect(groupTitles.get("B")).toBe(AE_FAMILIES_SECTION);
++  });
++
++  it("makes a family from an ae.orch link only, not from an unloaded fork source", () => {
++    const fork = row("f", { "omnigent.fork.source_id": "unloaded" });
++    const twin = row("g", { "omnigent.fork.source_id": "unloaded" });
++    const { tree, groupTitles } = build([fork, twin]);
++    expect(tree.familyCount).toBe(0);
++    expect(groupTitles.get("f")).toBe(AE_FAMILY_REST_SECTION);
++    expect(build([row("k", orch("gone"))]).tree.familyCount).toBe(1);
++  });
++
++  it("lists a search match whose lead did not match in the rest, with no stand-in", () => {
++    const ordered = [row("kid", orch("lead"))];
++    const families = aeFamilies([row("lead"), ...ordered], true);
++    const { sessions, tree, groupTitles } = aeFamilyTree(ordered, families, {
++      folded: new Set(),
++      byLead: false,
++      searching: true,
++    });
++    expect(sessions.map((c) => c.id)).toEqual(["kid"]);
++    expect(tree.familyCount).toBe(0);
++    expect(groupTitles.get("kid")).toBe(AE_FAMILY_REST_SECTION);
++  });
++
++  it("caps the indent at two steps", () => {
++    const ordered = [
++      row("lead"),
++      row("c1", orch("lead")),
++      row("c2", orch("c1")),
++      row("c3", orch("c2")),
++      row("c4", orch("lead")),
++      // A fork copies its source's ae.orch and still nests under its source.
++      row("c4-fork", { "ae.orch": "lead", "omnigent.fork.source_id": "c4" }),
++    ];
++    const { sessions, tree } = build(ordered);
++    const ids = sessions.map((c) => c.id);
++    expect(new Set(ids).size).toBe(ids.length);
++    expect(ids).toEqual(["lead", "c1", "c2", "c3", "c4", "c4-fork"]);
++    expect(tree.rows.get("c4-fork")!.depth).toBe(2);
++    expect(tree.rows.get("c3")!.depth).toBe(2);
++    expect(tree.rows.get("c2")).toMatchObject({ depth: 2, through: [true], more: true });
++  });
++
++  it("puts an empty Families section first when no family shows", () => {
++    const rest = [row("a")];
++    const { tree } = build(rest);
++    expect(
++      aeWithFamiliesSection([{ title: AE_FAMILY_REST_SECTION, conversations: rest }], tree),
++    ).toEqual([
++      { title: AE_FAMILIES_SECTION, conversations: [] },
++      { title: AE_FAMILY_REST_SECTION, conversations: rest },
++    ]);
++    expect(aeWithFamiliesSection([{ title: "Today", conversations: rest }], null)).toHaveLength(1);
++  });
++});
++
++describe("family folds", () => {
++  it("remembers a fold on this device", () => {
++    toggleAeFamilyFold("lead");
++    expect(JSON.parse(localStorage.getItem("omnigent:ae-family-folds")!)).toEqual(["lead"]);
++    resetAeFamilyFoldsCache();
++    toggleAeFamilyFold("lead");
++    expect(JSON.parse(localStorage.getItem("omnigent:ae-family-folds")!)).toEqual([]);
++  });
++});
++
++describe("family folds, as the open session sees them", () => {
++  it("unfolds the open session's family for this visit, until a fold is toggled", () => {
++    const folded = new Set(["lead"]);
++    const { result, rerender } = renderHook(
++      ({ remembered, active }) =>
++        useAeEffectiveFolds(remembered, active, active === "lead" ? null : "lead"),
++      { initialProps: { remembered: folded as ReadonlySet<string>, active: "kid" } },
++    );
++    expect(result.current.has("lead")).toBe(false);
++    // Another session leaves the remembered fold alone.
++    rerender({ remembered: folded, active: "lead" });
++    expect(result.current.has("lead")).toBe(true);
++    rerender({ remembered: folded, active: "kid" });
++    expect(result.current.has("lead")).toBe(false);
++    // A toggle ends the override, so the user's fold shows.
++    rerender({ remembered: new Set(["lead"]), active: "kid" });
++    expect(result.current.has("lead")).toBe(true);
++  });
++
++  it("sets a fold outright when asked", () => {
++    toggleAeFamilyFold("lead", true);
++    toggleAeFamilyFold("lead", true);
++    expect(JSON.parse(localStorage.getItem("omnigent:ae-family-folds")!)).toEqual(["lead"]);
++    toggleAeFamilyFold("lead", false);
++    expect(JSON.parse(localStorage.getItem("omnigent:ae-family-folds")!)).toEqual([]);
++  });
++});
++
++describe("useAeStableTree", () => {
++  const treeFor = (updated: number, folded: string[] = []) => {
++    const ordered = [
++      row("lead", {}, { updated_at: updated }),
++      row("kid", orch("lead"), { updated_at: updated }),
++    ];
++    return build(ordered, { folded }).tree;
++  };
++
++  it("keeps the same tree across an update that only changes a time", () => {
++    const { result, rerender } = renderHook(({ tree }) => useAeStableTree(tree), {
++      initialProps: { tree: treeFor(1) },
++    });
++    const first = result.current;
++    rerender({ tree: treeFor(2) });
++    expect(result.current).toBe(first);
++    rerender({ tree: treeFor(3, ["lead"]) });
++    expect(result.current).not.toBe(first);
++  });
++});
+diff --git a/web/src/lib/aeFamilyTree.ts b/web/src/lib/aeFamilyTree.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..a5db6c6e15947d96a15de632e9946d804d6cf6b6
+--- /dev/null
++++ b/web/src/lib/aeFamilyTree.ts
+@@ -0,0 +1,333 @@
++// Grouping > Family as tree rows (omnigent-ae, 2026-10-24): a "Families"
++// section first, each family's lead as the parent row with its sessions
++// indented under it on a line in the family's color, then "Not in a family"
++// with every other session in the current sort. A lead's count pill folds its
++// family; the folds are remembered per device. The families themselves:
++// `aeFamily.ts`; the rows that draw this: `shell/AeFamilyTree.tsx`.
++
++import { useMemo, useRef, useSyncExternalStore } from "react";
++import type { Conversation } from "@/hooks/useConversations";
++import { AE_FORK_SOURCE_KEY, type AeFamilies, type AeFamily, aeOrchParent } from "@/lib/aeFamily";
++
++export const AE_FAMILIES_SECTION = "Families";
++export const AE_FAMILY_REST_SECTION = "Not in a family";
++export const AE_FAMILY_SECTIONS = [AE_FAMILIES_SECTION, AE_FAMILY_REST_SECTION] as const;
++export const AE_FAMILIES_HINT =
++  "No families yet. When a session starts another, both show here as a family.";
++/** Pixels of indent per tree step. */
++export const AE_FAMILY_TREE_STEP = 18;
++/** Deeper sessions line up at this step under their parent. */
++export const AE_FAMILY_TREE_MAX_DEPTH = 2;
++
++/** Where a listed row sits in its family's tree, for its lines. */
++export interface AeTreeRow {
++  family: AeFamily;
++  /** 0 for the lead, else 1 to `AE_FAMILY_TREE_MAX_DEPTH`. */
++  depth: number;
++  /** Per step 1 to depth - 1: whether that step's line runs on past this row. */
++  through: boolean[];
++  /** Whether a later row at this depth follows, so this row's line runs on down. */
++  more: boolean;
++  /** Whether this row's children follow it, so a line drops from its icon. */
++  stem: boolean;
++}
++
++/** A family's lead as the tree shows it: the pill, and a stand-in when it is not a listed row. */
++export interface AeTreeLead {
++  family: AeFamily;
++  /** Listed sessions under the lead. */
++  count: number;
++  folded: boolean;
++  /** Folded with a hidden session waiting on a response. */
++  needsResponse: boolean;
++  /** Folded with a hidden session running. */
++  running: boolean;
++  /**
++   * The lead is an archived or unknown session: a stand-in row (its entry in the
++   * list carries the lead's id) draws instead of a session row.
++   */
++  standIn: null | {
++    /** The lead's session when known (archived), else null. */
++    lead: Conversation | null;
++  };
++}
++
++export interface AeFamilyTree {
++  rows: ReadonlyMap<string, AeTreeRow>;
++  /** By the lead's id. */
++  leads: ReadonlyMap<string, AeTreeLead>;
++  /** Ids of the list entries that draw as a stand-in lead, not as a session. */
++  standIns: ReadonlySet<string>;
++  familyCount: number;
++}
++
++export interface AeFamilyTreeOptions {
++  /** Folded families, by top session id. */
++  folded: ReadonlySet<string>;
++  /** Rank families by their lead's place (Manual) rather than their first member's. */
++  byLead: boolean;
++  /** A session outside the list (archived or pinned), for an unlisted lead. */
++  lookup?: (id: string) => Conversation | undefined;
++  /** A search is on: a family whose lead did not match lists its sessions in the rest. */
++  searching?: boolean;
++}
++
++function needsResponse(c: Conversation): boolean {
++  return (c.pending_elicitations_count ?? 0) > 0;
++}
++
++/** Lines for a family's flattened rows, from their depths alone. */
++function lines(depths: readonly number[], at: number) {
++  const runsOn = (step: number) => {
++    for (let j = at + 1; j < depths.length; j += 1) {
++      if (depths[j] < step) return false;
++      if (depths[j] === step) return true;
++    }
++    return false;
++  };
++  const depth = depths[at];
++  const through: boolean[] = [];
++  for (let step = 1; step < depth; step += 1) through.push(runsOn(step));
++  return { through, more: depth > 0 && runsOn(depth), stem: depths[at + 1] === depth + 1 };
++}
++
++/**
++ * *ordered* (the list in its current sort) as Grouping > Family shows it: each
++ * family's rows (lead, then its sessions as a tree, each step in list order),
++ * families ranked by their first member (or their lead under Manual), then the
++ * rest in list order. A folded family keeps only its lead.
++ */
++export function aeFamilyTree(
++  ordered: readonly Conversation[],
++  families: AeFamilies,
++  { folded, byLead, lookup, searching = false }: AeFamilyTreeOptions,
++): {
++  sessions: Conversation[];
++  groupTitles: Map<string, string>;
++  groupOrder: string[];
++  tree: AeFamilyTree;
++} {
++  const position = new Map(ordered.map((c, index) => [c.id, index] as const));
++  const membersOf = new Map<string, Conversation[]>();
++  const rest: Conversation[] = [];
++  for (const c of ordered) {
++    const family = families.byRow.get(c.id)?.family;
++    if (!family || (searching && !position.has(family.root))) {
++      rest.push(c);
++      continue;
++    }
++    const members = membersOf.get(family.root);
++    if (members) members.push(c);
++    else membersOf.set(family.root, [c]);
++  }
++  const rank = (root: string, members: Conversation[]) =>
++    byLead && position.has(root) ? position.get(root)! : position.get(members[0].id)!;
++  const ranked = [...membersOf].sort(([a, am], [b, bm]) => rank(a, am) - rank(b, bm));
++
++  const rows = new Map<string, AeTreeRow>();
++  const leads = new Map<string, AeTreeLead>();
++  const standIns = new Set<string>();
++  const familyRows: Conversation[] = [];
++  for (const [root, members] of ranked) {
++    const family = families.byRoot.get(root)!;
++    const listed = members.find((c) => c.id === root) ?? null;
++    const others = members.filter((c) => c.id !== root);
++    const ids = new Set(others.map((c) => c.id));
++    // Each session under the listed session it forked from or was started by
++    // (a fork copies its source's ae.orch, so the fork label wins), else under
++    // the lead; a session a cycle never reaches goes under the lead too.
++    const childrenOf = new Map<string, Conversation[]>();
++    for (const c of others) {
++      const fork = c.labels?.[AE_FORK_SOURCE_KEY]?.trim();
++      const parent = fork && ids.has(fork) ? fork : aeOrchParent(c.labels);
++      const key = parent && parent !== c.id && ids.has(parent) ? parent : root;
++      const list = childrenOf.get(key);
++      if (list) list.push(c);
++      else childrenOf.set(key, [c]);
++    }
++    const flat: { c: Conversation; depth: number }[] = [];
++    const seen = new Set<string>();
++    const walk = (id: string, depth: number) => {
++      for (const c of childrenOf.get(id) ?? []) {
++        if (seen.has(c.id)) continue;
++        seen.add(c.id);
++        flat.push({ c, depth: Math.min(depth, AE_FAMILY_TREE_MAX_DEPTH) });
++        walk(c.id, depth + 1);
++      }
++    };
++    walk(root, 1);
++    for (const c of others) {
++      if (seen.has(c.id)) continue;
++      seen.add(c.id);
++      flat.push({ c, depth: 1 });
++      walk(c.id, 2);
++    }
++
++    // The lead's entry: its listed row, a pinned or filtered-out session as a
++    // real row, or a stand-in for an archived or unknown one.
++    const known = listed ? null : (lookup?.(root) ?? null);
++    const real = listed ?? (known && known.archived !== true ? known : null);
++    const entry = real ?? known ?? unknownLead(root);
++    if (!real) standIns.add(root);
++
++    const isFolded = folded.has(root) && others.length > 0;
++    const hidden = isFolded ? flat.map((item) => item.c) : [];
++    leads.set(root, {
++      family,
++      count: others.length,
++      folded: isFolded,
++      needsResponse: hidden.some(needsResponse),
++      running: hidden.some((c) => c.status === "running"),
++      standIn: real ? null : { lead: known },
++    });
++    const shown = isFolded ? [] : flat;
++    const depths = [0, ...shown.map((item) => item.depth)];
++    rows.set(root, { family, depth: 0, ...lines(depths, 0) });
++    familyRows.push(entry);
++    shown.forEach((item, index) => {
++      rows.set(item.c.id, { family, depth: item.depth, ...lines(depths, index + 1) });
++      familyRows.push(item.c);
++    });
++  }
++
++  const groupTitles = new Map<string, string>();
++  for (const c of familyRows) groupTitles.set(c.id, AE_FAMILIES_SECTION);
++  for (const c of rest) groupTitles.set(c.id, AE_FAMILY_REST_SECTION);
++  return {
++    sessions: [...familyRows, ...rest],
++    groupTitles,
++    groupOrder: [...AE_FAMILY_SECTIONS],
++    tree: { rows, leads, standIns, familyCount: ranked.length },
++  };
++}
++
++/** The list entry for a lead nothing is known about; the stand-in row draws in its place. */
++function unknownLead(id: string): Conversation {
++  return {
++    id,
++    object: "conversation",
++    title: null,
++    created_at: 0,
++    updated_at: 0,
++    labels: {},
++    permission_level: null,
++    status: "idle",
++  } as unknown as Conversation;
++}
++
++/**
++ * The grouped sections with "Families" always first in the tree view, empty
++ * when no family shows, so its hint says how one forms.
++ */
++export function aeWithFamiliesSection<T extends { title: string; conversations: Conversation[] }>(
++  groups: T[],
++  tree: AeFamilyTree | null | undefined,
++): T[] {
++  if (!tree || groups[0]?.title === AE_FAMILIES_SECTION) return groups;
++  return [{ title: AE_FAMILIES_SECTION, conversations: [] } as unknown as T, ...groups];
++}
++
++// ── folded families, per device ─────────────────────────────────────────
++
++const FOLDS_KEY = "omnigent:ae-family-folds";
++const FOLDS_KEPT = 64;
++let folds: ReadonlySet<string> | null = null;
++const listeners = new Set<() => void>();
++
++function readFolds(): ReadonlySet<string> {
++  try {
++    const parsed: unknown = JSON.parse(window.localStorage.getItem(FOLDS_KEY) ?? "[]");
++    return new Set(Array.isArray(parsed) ? parsed.filter((x) => typeof x === "string") : []);
++  } catch {
++    return new Set();
++  }
++}
++
++function snapshot(): ReadonlySet<string> {
++  if (folds === null) folds = typeof window === "undefined" ? new Set() : readFolds();
++  return folds;
++}
++
++function subscribe(listener: () => void): () => void {
++  listeners.add(listener);
++  return () => listeners.delete(listener);
++}
++
++/** The families folded on this device, by top session id. */
++export function useAeFamilyFolds(): ReadonlySet<string> {
++  return useSyncExternalStore(subscribe, snapshot, snapshot);
++}
++
++/** Fold or unfold a family (flip it by default), and remember it on this device. */
++export function toggleAeFamilyFold(root: string, fold?: boolean): void {
++  const next = new Set(snapshot());
++  if (fold ?? !next.has(root)) next.add(root);
++  else next.delete(root);
++  folds = new Set([...next].slice(-FOLDS_KEPT));
++  try {
++    window.localStorage.setItem(FOLDS_KEY, JSON.stringify([...folds]));
++  } catch {
++    // A view nicety: a fold that does not survive a reload is harmless.
++  }
++  for (const listener of listeners) listener();
++}
++
++/** Forget the cached folds, so the next read comes from storage (tests). */
++export function resetAeFamilyFoldsCache(): void {
++  folds = null;
++}
++
++/**
++ * The folds with the open session's family unfolded while that session is one of
++ * its hidden sessions: for this visit only, until the user toggles any fold.
++ */
++export function useAeEffectiveFolds(
++  remembered: ReadonlySet<string>,
++  activeId: string | null,
++  activeRoot: string | null,
++): ReadonlySet<string> {
++  const visit = useRef<{ id: string | null; folds: ReadonlySet<string> } | null>(null);
++  if (visit.current?.id !== activeId) visit.current = { id: activeId, folds: remembered };
++  const open =
++    activeRoot !== null &&
++    activeRoot !== activeId &&
++    visit.current.folds === remembered &&
++    remembered.has(activeRoot);
++  return useMemo(() => {
++    if (!open) return remembered;
++    const next = new Set(remembered);
++    next.delete(activeRoot);
++    return next;
++  }, [open, remembered, activeRoot]);
++}
++
++function treeSignature(tree: AeFamilyTree): string {
++  const parts = [`${tree.familyCount}`];
++  for (const [id, lead] of tree.leads) {
++    const { family, standIn } = lead;
++    parts.push(
++      `L${id}:${family.color}:${lead.count}:${lead.folded ? 1 : 0}${lead.needsResponse ? 1 : 0}${lead.running ? 1 : 0}`,
++      standIn ? `${standIn.lead?.title ?? ""}:${standIn.lead ? 1 : 0}` : "-",
++    );
++  }
++  for (const [id, row] of tree.rows) {
++    parts.push(
++      `R${id}:${row.family.root}:${row.depth}:${row.through.map(Number).join("")}:${+row.more}${+row.stem}`,
++    );
++  }
++  parts.push([...tree.standIns].join(","));
++  return parts.join("\n");
++}
++
++/**
++ * The same tree object until its roots, members, depths, folds, pill state or
++ * colors change, so a list update that only bumps a time re-renders no row.
++ */
++export function useAeStableTree(tree: AeFamilyTree | null): AeFamilyTree | null {
++  const kept = useRef<{ key: string; tree: AeFamilyTree | null }>({ key: "", tree: null });
++  const key = tree ? treeSignature(tree) : "";
++  if (key !== kept.current.key || (tree === null) !== (kept.current.tree === null)) {
++    kept.current = { key, tree };
++  }
++  return kept.current.tree;
++}
+diff --git a/web/src/lib/aeFamilyView.ts b/web/src/lib/aeFamilyView.ts
+index 3a2f8463d82cf2d33bf7d0237a4badace8151003..ec411e7c19c02ce4f291aba3205be9f60e5857bd 100644
+--- a/web/src/lib/aeFamilyView.ts
++++ b/web/src/lib/aeFamilyView.ts
+@@ -1,10 +1,12 @@
+ // The sidebar's view of session families (omnigent-ae, 2026-10-23): the
+ // context every row reads, a hook that keeps the families stable across list
+-// updates, and the "By family" groups. The families themselves: `aeFamily.ts`.
++// updates. The families themselves: `aeFamily.ts`; Grouping > Family's tree:
++// `aeFamilyTree.ts`.
+ 
+ import { createContext, useMemo, useRef } from "react";
+ import type { Conversation } from "@/hooks/useConversations";
+-import { type AeFamilies, type AeFamily, NO_FAMILIES, aeFamilies } from "@/lib/aeFamily";
++import { type AeFamilies, NO_FAMILIES, aeFamilies } from "@/lib/aeFamily";
++import type { AeFamilyTree } from "@/lib/aeFamilyTree";
+ 
+ export interface AeFamilyView {
+   families: AeFamilies;
+@@ -13,6 +15,8 @@ export interface AeFamilyView {
+   /** The family the list is narrowed to, by its top session's id. */
+   filter: string | null;
+   onFilter: (root: string | null) => void;
++  /** Grouping > Family's tree rows, `null` in every other view. */
++  tree?: AeFamilyTree | null;
+ }
+ 
+ export const AeFamilyContext = createContext<AeFamilyView>({
+@@ -39,50 +43,16 @@ function signature(families: AeFamilies): string {
+  * object comes back until a family, member, color or title changes, so a list
+  * update that only bumps a row's time does not re-render every row's dot.
+  */
+-export function useAeFamilies(rows: readonly Conversation[], enabled: boolean): AeFamilies {
++export function useAeFamilies(
++  rows: readonly Conversation[],
++  enabled: boolean,
++  orphans = false,
++): AeFamilies {
+   const kept = useRef<{ key: string; families: AeFamilies }>({ key: "", families: NO_FAMILIES });
+   return useMemo(() => {
+-    const families = enabled ? aeFamilies(rows) : NO_FAMILIES;
++    const families = enabled ? aeFamilies(rows, orphans) : NO_FAMILIES;
+     const key = signature(families);
+     if (key !== kept.current.key) kept.current = { key, families };
+     return kept.current.families;
+-  }, [rows, enabled]);
+-}
+-
+-/** The rest of the list under "By family": sessions in no family. */
+-export const AE_FAMILY_REST = "Sessions";
+-
+-/**
+- * "By family": one group per family, named after its lead and in the order its
+- * first row appears, then everything else. `leadsFirst` is *ordered* with each
+- * lead ahead of its family, for the caller to split by `groupTitles`.
+- */
+-export function aeFamilyGroups(ordered: readonly Conversation[], families: AeFamilies) {
+-  const groupTitles = new Map<string, string>();
+-  const titleOfRoot = new Map<string, string>();
+-  const familyByTitle = new Map<string, AeFamily>();
+-  const groupOrder: string[] = [];
+-  for (const c of ordered) {
+-    const family = families.byRow.get(c.id)?.family;
+-    if (!family) {
+-      groupTitles.set(c.id, AE_FAMILY_REST);
+-      continue;
+-    }
+-    let title = titleOfRoot.get(family.root);
+-    if (title === undefined) {
+-      const base = family.leadTitle ?? "Unlisted session";
+-      title = base;
+-      for (let n = 2; familyByTitle.has(title) || title === AE_FAMILY_REST; n += 1) {
+-        title = `${base} (${n})`;
+-      }
+-      titleOfRoot.set(family.root, title);
+-      familyByTitle.set(title, family);
+-      groupOrder.push(title);
+-    }
+-    groupTitles.set(c.id, title);
+-  }
+-  groupOrder.push(AE_FAMILY_REST);
+-  const isLead = (c: Conversation) => Number(families.byRow.get(c.id)?.isLead ?? false);
+-  const leadsFirst = [...ordered].sort((a, b) => isLead(b) - isLead(a));
+-  return { leadsFirst, groupTitles, groupOrder, familyByTitle };
++  }, [rows, enabled, orphans]);
+ }
+diff --git a/web/src/shell/AeFamilyDot.tsx b/web/src/shell/AeFamilyDot.tsx
+index 6ec2d82f0191ac8ba259600b38af623b300ed112..01436debfc6253c9b8d4efbbe2e41b2e0472132a 100644
+--- a/web/src/shell/AeFamilyDot.tsx
++++ b/web/src/shell/AeFamilyDot.tsx
+@@ -1,7 +1,7 @@
+ // Session family marks in the sidebar (omnigent-ae, 2026-10-23): one colored
+-// dot on every row of a family, a filter the dot turns on, and the "By family"
+-// group header. The families come from `aeFamilies` (lib/aeFamily.ts), the
+-// context from lib/aeFamilyView.ts.
++// dot on every row of a family and a filter the dot turns on. In Grouping >
++// Family's tree only the lead keeps its dot; lines mark the rest. The families
++// come from `aeFamilies` (lib/aeFamily.ts), the context from lib/aeFamilyView.ts.
+ 
+ import { XIcon } from "lucide-react";
+ import { type KeyboardEvent, type MouseEvent, useContext } from "react";
+@@ -24,16 +24,22 @@ export function AeFamilySwatch({ family, className }: { family: AeFamily; classN
+   );
+ }
+ 
+-/**
+- * The row's dot, before the title. A click narrows the list to the family (a
+- * second click widens it again) without opening the session.
+- */
+-export function AeFamilyDot({ conversationId }: { conversationId: string }) {
+-  const { families, dots, filter, onFilter } = useContext(AeFamilyContext);
+-  const role = families.byRow.get(conversationId);
+-  if (!dots || !role) return null;
+-  const { root } = role.family;
+-  const hint = aeFamilyHint(role);
++/** The dot as the filter button, for a row or a stand-in lead; a lead's dot carries a ring. */
++export function AeFamilyDotButton({
++  family,
++  isLead,
++  hint,
++  dashed,
++}: {
++  family: AeFamily;
++  isLead: boolean;
++  hint: string;
++  /** An outline dot, for a lead that is not loaded. */
++  dashed?: boolean;
++}) {
++  const { filter, onFilter } = useContext(AeFamilyContext);
++  const { root } = family;
++  const color = AE_FAMILY_COLORS[family.color];
+   const toggle = (event: MouseEvent | KeyboardEvent) => {
+     event.preventDefault();
+     event.stopPropagation();
+@@ -62,17 +68,27 @@ export function AeFamilyDot({ conversationId }: { conversationId: string }) {
+       <span
+         className={cn(
+           "size-2 rounded-full",
+-          role.isLead && "ring-1 ring-current ring-offset-1 ring-offset-background",
++          isLead && !dashed && "ring-1 ring-current ring-offset-1 ring-offset-background",
++          dashed && "border-[1.5px] border-dashed",
+         )}
+-        style={{
+-          backgroundColor: AE_FAMILY_COLORS[role.family.color],
+-          color: AE_FAMILY_COLORS[role.family.color],
+-        }}
++        style={dashed ? { borderColor: color } : { backgroundColor: color, color }}
+       />
+     </span>
+   );
+ }
+ 
++/**
++ * The row's dot, before the title. A click narrows the list to the family (a
++ * second click widens it again) without opening the session.
++ */
++export function AeFamilyDot({ conversationId }: { conversationId: string }) {
++  const { families, dots, tree } = useContext(AeFamilyContext);
++  const role = families.byRow.get(conversationId);
++  const treeDepth = tree?.rows.get(conversationId)?.depth;
++  if (!role || (treeDepth === undefined ? !dots : treeDepth > 0)) return null;
++  return <AeFamilyDotButton family={role.family} isLead={role.isLead} hint={aeFamilyHint(role)} />;
++}
++
+ /** Shown above the list while it is narrowed to one family. */
+ export function AeFamilyFilterBar() {
+   const { families, filter, onFilter } = useContext(AeFamilyContext);
+@@ -98,18 +114,3 @@ export function AeFamilyFilterBar() {
+     </div>
+   );
+ }
+-
+-/** A "By family" group's header: the dot, the lead's title and the row count. */
+-export function AeFamilyTitle({ family }: { family: AeFamily }) {
+-  return (
+-    <span
+-      data-testid="ae-family-title"
+-      data-family={family.root}
+-      className="inline-flex max-w-full items-center gap-1.5 align-middle"
+-    >
+-      <AeFamilySwatch family={family} />
+-      <span className="truncate">{familyName(family)}</span>
+-      <span className="shrink-0 tabular-nums opacity-70">{family.members.length}</span>
+-    </span>
+-  );
+-}
+diff --git a/web/src/shell/AeFamilyTree.tsx b/web/src/shell/AeFamilyTree.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..973f866ca78c5b4f8fe2d03a6dcd3a4b7c244828
+--- /dev/null
++++ b/web/src/shell/AeFamilyTree.tsx
+@@ -0,0 +1,320 @@
++// Grouping > Family's tree rows in the sidebar (omnigent-ae, 2026-10-24): the
++// indent and colored lines before a row's icon, the lead's fold pill, the
++// stand-in row for a lead that is not listed, and the section titles. The tree
++// itself: lib/aeFamilyTree.ts.
++
++import { ArchiveIcon, ChevronDownIcon, ChevronRightIcon, GhostIcon, InfoIcon } from "lucide-react";
++import {
++  type KeyboardEvent,
++  type MouseEvent,
++  type ReactNode,
++  createContext,
++  useContext,
++} from "react";
++import { AE_FAMILY_COLORS, aeFamilyHint } from "@/lib/aeFamily";
++import { Link } from "@/lib/routing";
++import {
++  AE_FAMILIES_HINT,
++  AE_FAMILIES_SECTION,
++  AE_FAMILY_REST_SECTION,
++  AE_FAMILY_TREE_STEP,
++  type AeFamilyTree,
++  type AeTreeLead,
++  type AeTreeRow,
++  toggleAeFamilyFold,
++} from "@/lib/aeFamilyTree";
++import { AeFamilyContext } from "@/lib/aeFamilyView";
++import { cn } from "@/lib/utils";
++import { AeFamilyDotButton } from "@/shell/AeFamilyDot";
++import { SIDEBAR_ROW } from "@/shell/sidebarStyles";
++
++// Half the 16px status icon past the row's left padding: the icon's center at depth 0.
++const ICON_HALF = 8;
++// The row's left padding, and its wider one while the checkboxes show.
++const PAD_LEFT = 8;
++const PAD_LEFT_SELECTING = 32;
++// Literal class names, so Tailwind finds them; 10px is half the 20px first line.
++const ELBOW_HEIGHT = "h-[calc(0.375rem+10px)] md:h-[calc(0.25rem+10px)]";
++const STEM_TOP = "top-[calc(0.375rem+18px)] md:top-[calc(0.25rem+18px)]";
++const LINE = "1.5px solid";
++// The sidebar rows' hover, as Sidebar.tsx spells it.
++const ROW_HOVER = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
++
++function color(row: Pick<AeTreeRow, "family">): string {
++  return AE_FAMILY_COLORS[row.family.color];
++}
++
++function Lines({
++  row,
++  selecting = false,
++}: {
++  row: Pick<AeTreeRow, "family" | "depth" | "through" | "more" | "stem">;
++  selecting?: boolean;
++}) {
++  const c = color(row);
++  const x = (step: number) =>
++    (selecting ? PAD_LEFT_SELECTING : PAD_LEFT) + ICON_HALF + AE_FAMILY_TREE_STEP * (step - 1);
++  const parts: ReactNode[] = [];
++  const steps = row.through.flatMap((on, index) => (on ? [index + 1] : []));
++  for (const step of steps) {
++    parts.push(
++      <span
++        key={`t${step}`}
++        className="absolute top-0 -bottom-px"
++        style={{ left: x(step), borderLeft: `${LINE} ${c}` }}
++      />,
++    );
++  }
++  if (row.depth > 0) {
++    const left = x(row.depth);
++    const width = AE_FAMILY_TREE_STEP - 10;
++    parts.push(
++      row.more ? (
++        <span
++          key="v"
++          className="absolute top-0 -bottom-px"
++          style={{ left, borderLeft: `${LINE} ${c}` }}
++        />
++      ) : null,
++      <span
++        key="e"
++        className={cn("absolute top-0", ELBOW_HEIGHT)}
++        style={{
++          left,
++          width,
++          borderLeft: row.more ? undefined : `${LINE} ${c}`,
++          borderBottom: `${LINE} ${c}`,
++          borderBottomLeftRadius: row.more ? undefined : 6,
++        }}
++      />,
++    );
++  }
++  if (row.stem) {
++    parts.push(
++      <span
++        key="s"
++        className={cn("absolute -bottom-px", STEM_TOP)}
++        style={{ left: x(row.depth + 1), borderLeft: `${LINE} ${c}` }}
++      />,
++    );
++  }
++  return (
++    <span aria-hidden="true" className="pointer-events-none absolute inset-0 opacity-60">
++      {parts}
++    </span>
++  );
++}
++
++// Whether the rows below sit in the Families section: a pinned lead's copy in
++// Pinned draws as a plain row.
++const InFamilies = createContext(false);
++
++/** A tree row's lines and indent, before its status icon; nothing outside the tree view. */
++export function AeFamilyTreeIndent({
++  conversationId,
++  selectionMode = false,
++}: {
++  conversationId: string;
++  selectionMode?: boolean;
++}) {
++  const { tree } = useContext(AeFamilyContext);
++  const inFamilies = useContext(InFamilies);
++  const row = inFamilies ? tree?.rows.get(conversationId) : undefined;
++  if (!row) return null;
++  return (
++    <>
++      <Lines row={row} selecting={selectionMode} />
++      {row.depth > 0 && (
++        <span
++          aria-hidden="true"
++          data-testid="ae-family-indent"
++          data-depth={row.depth}
++          className="shrink-0"
++          style={{ width: AE_FAMILY_TREE_STEP * row.depth }}
++        />
++      )}
++    </>
++  );
++}
++
++function stop(event: MouseEvent | KeyboardEvent) {
++  event.preventDefault();
++  event.stopPropagation();
++}
++
++function FoldPill({ lead }: { lead: AeTreeLead }) {
++  if (lead.count === 0) return null;
++  const { root } = lead.family;
++  const toggle = (event: MouseEvent | KeyboardEvent) => {
++    stop(event);
++    toggleAeFamilyFold(root, !lead.folded);
++  };
++  const label = `${lead.folded ? "Show" : "Hide"} ${lead.count} session${lead.count === 1 ? "" : "s"}`;
++  return (
++    <span
++      role="button"
++      tabIndex={0}
++      title={label}
++      aria-label={label}
++      // Not aria-expanded: an expanded control inside a row reveals the row's hover controls.
++      data-folded={lead.folded}
++      data-testid="ae-family-fold"
++      data-family={root}
++      className={cn(
++        // The tap target runs the row's full height on a phone.
++        "relative ml-auto inline-flex h-[18px] shrink-0 items-center gap-0.5 rounded-full pr-1 pl-1.5 text-[11.5px] tabular-nums before:absolute before:-inset-x-2 before:-inset-y-3 before:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
++        lead.folded
++          ? "bg-foreground/10 text-foreground"
++          : "bg-foreground/[0.06] text-muted-foreground",
++      )}
++      onClick={toggle}
++      onDoubleClick={stop}
++      onKeyDown={(event) => {
++        if (event.key === "Enter" || event.key === " ") toggle(event);
++      }}
++    >
++      {lead.folded && lead.needsResponse && (
++        <span
++          data-testid="ae-family-fold-waiting"
++          className="mr-0.5 size-1.5 rounded-full bg-brand-accent"
++        />
++      )}
++      {lead.folded && lead.running && (
++        <span
++          data-testid="ae-family-fold-running"
++          className="mr-0.5 size-2.5 animate-spin rounded-full border-[1.5px] border-current border-t-transparent motion-reduce:animate-none"
++        />
++      )}
++      {lead.count}
++      {lead.folded ? (
++        <ChevronRightIcon className="size-3" />
++      ) : (
++        <ChevronDownIcon className="size-3" />
++      )}
++    </span>
++  );
++}
++
++/** A listed lead's fold pill, after its title. */
++export function AeFamilyFold({ conversationId }: { conversationId: string }) {
++  const { tree } = useContext(AeFamilyContext);
++  const inFamilies = useContext(InFamilies);
++  const lead = inFamilies ? tree?.leads.get(conversationId) : undefined;
++  if (!lead || lead.standIn) return null;
++  return <FoldPill lead={lead} />;
++}
++
++function StandIn({
++  lead,
++  onNavigate,
++}: {
++  lead: AeTreeLead;
++  onNavigate?: (e: MouseEvent<HTMLAnchorElement>) => void;
++}) {
++  const { family } = lead;
++  const known = lead.standIn!.lead;
++  const archived = known?.archived === true;
++  return (
++    <li className="group relative" data-testid="ae-family-stand-in" data-family={family.root}>
++      <Link
++        to={`/c/${family.root}`}
++        componentId="sidebar.family_lead"
++        title={known ? undefined : "Open the lead session"}
++        onClick={onNavigate}
++        className={cn(
++          SIDEBAR_ROW,
++          "relative flex w-full items-center pr-2 text-left text-muted-foreground transition-colors",
++          ROW_HOVER,
++        )}
++      >
++        {!lead.folded && lead.count > 0 && (
++          <Lines row={{ family, depth: 0, through: [], more: false, stem: true }} />
++        )}
++        {archived ? (
++          <ArchiveIcon className="ui-icon mr-1.5" aria-hidden="true" />
++        ) : known ? null : (
++          <GhostIcon className="ui-icon mr-1.5" aria-hidden="true" />
++        )}
++        <AeFamilyDotButton
++          family={family}
++          isLead
++          dashed={!known}
++          hint={aeFamilyHint({ family, isLead: true, forked: false, parentTitle: null })}
++        />
++        <span className={cn("min-w-0 truncate", !known && "italic")}>
++          {known ? (known.title ?? known.id) : "Lead not loaded"}
++        </span>
++        {archived && (
++          <span className="ml-1.5 shrink-0 rounded bg-foreground/[0.07] px-1.5 text-[11px]">
++            Archived
++          </span>
++        )}
++        <FoldPill lead={lead} />
++      </Link>
++    </li>
++  );
++}
++
++/**
++ * A row in a section's list: a stand-in lead draws as its own entry, any other
++ * row as given. `section` is the section the row is in.
++ */
++export function AeFamilyTreeSlot({
++  conversationId,
++  section,
++  onNavigate,
++  children,
++}: {
++  conversationId: string;
++  section: string | undefined;
++  onNavigate?: (e: MouseEvent<HTMLAnchorElement>) => void;
++  children: ReactNode;
++}) {
++  const { tree } = useContext(AeFamilyContext);
++  if (!tree || section !== AE_FAMILIES_SECTION) return children;
++  const standIn = tree.standIns.has(conversationId) ? tree.leads.get(conversationId) : undefined;
++  return (
++    <InFamilies.Provider value>
++      {standIn ? <StandIn lead={standIn} onNavigate={onNavigate} /> : children}
++    </InFamilies.Provider>
++  );
++}
++
++/** The tree view's section titles with their counts; null for any other group. */
++export function aeFamilySectionTitle(
++  tree: AeFamilyTree | null | undefined,
++  group: { title: string; conversations: readonly unknown[] },
++): ReactNode {
++  if (!tree) return null;
++  const count =
++    group.title === AE_FAMILIES_SECTION
++      ? tree.familyCount
++      : group.title === AE_FAMILY_REST_SECTION
++        ? group.conversations.length
++        : null;
++  if (count === null) return null;
++  return (
++    <span
++      data-testid="ae-family-section"
++      data-section={group.title}
++      className="inline-flex max-w-full items-center gap-1.5 align-middle"
++    >
++      <span className="truncate">{group.title}</span>
++      <span className="shrink-0 tabular-nums opacity-70">{count}</span>
++    </span>
++  );
++}
++
++/** The empty "Families" section's one line. */
++export function aeFamiliesHint(
++  tree: AeFamilyTree | null | undefined,
++  title: string,
++): ReactNode | undefined {
++  if (!tree || title !== AE_FAMILIES_SECTION) return undefined;
++  return (
++    <span data-testid="ae-families-hint" className="flex items-start gap-1.5 text-xs leading-snug">
++      <InfoIcon className="mt-px size-3.5 shrink-0" aria-hidden="true" />
++      {AE_FAMILIES_HINT}
++    </span>
++  );
++}
+diff --git a/web/src/shell/Sidebar.aeFamilies.test.tsx b/web/src/shell/Sidebar.aeFamilies.test.tsx
+index 8e61539da599599d6bf54c41797df7b0d953101a..152b0c1b8b875a445be7634ae50fccf943f29cd8 100644
+--- a/web/src/shell/Sidebar.aeFamilies.test.tsx
++++ b/web/src/shell/Sidebar.aeFamilies.test.tsx
+@@ -3,7 +3,8 @@
+ //   1. A lead and the sessions it started (ae.orch), and forks of them, carry
+ //      one colored dot; other rows carry none.
+ //   2. A dot narrows the list to its family without opening the session.
+-//   3. Grouping > Family lists one group per family, lead first, then the rest.
++//   3. Grouping > Family lists "Families" (each lead with its sessions as a
++//      tree, foldable from the lead's pill) then "Not in a family".
+ //   4. Show > Family dots turns the dots off.
+ 
+ import type * as IdentityModule from "@/lib/identity";
+@@ -43,6 +44,7 @@ import { TooltipProvider } from "@/components/ui/tooltip";
+ import { type Conversation, useConversations } from "@/hooks/useConversations";
+ import { SidebarDataProvider } from "@/hooks/useSidebarData";
+ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
++import { resetAeFamilyFoldsCache } from "@/lib/aeFamilyTree";
+ import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
+ import { conversation, conversationPage } from "@/test/sidebarMockHelpers";
+ import { Sidebar } from "./Sidebar";
+@@ -74,7 +76,7 @@ function setView(view: Record<string, unknown>) {
+   );
+ }
+ 
+-function renderSidebar() {
++function renderSidebar(onClose = vi.fn()) {
+   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   const ui = () => (
+     <QueryClientProvider client={qc}>
+@@ -87,7 +89,7 @@ function renderSidebar() {
+                 features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
+               }}
+             >
+-              <Sidebar open={true} onClose={vi.fn()} />
++              <Sidebar open={true} onClose={onClose} />
+             </CapabilitiesProvider>
+           </MemoryRouter>
+         </TooltipProvider>
+@@ -114,6 +116,7 @@ function dotOf(name: string): HTMLElement | null {
+ 
+ beforeEach(() => {
+   localStorage.clear();
++  resetAeFamilyFoldsCache();
+   mocks.fetch.mockReset();
+   mocks.fetch.mockResolvedValue(new Response("{}", { status: 404 }));
+   useConvMock.mockImplementation(() => conversationPage(ROWS));
+@@ -205,12 +208,14 @@ describe("family dots", () => {
+ });
+ 
+ describe("Grouping > Family", () => {
+-  it("lists each family under its lead, lead first, then every other session", () => {
++  function sections(): (string | null)[] {
++    return screen.getAllByTestId("ae-family-section").map((el) => el.textContent);
++  }
++
++  it("lists families first as tree rows, then every other session", () => {
+     setView({ grouping: "family" });
+     renderSidebar();
+-    const titles = screen.getAllByTestId("ae-family-title");
+-    expect(titles).toHaveLength(1);
+-    expect(titles[0].textContent).toBe("Role routing build4");
++    expect(sections()).toEqual(["Families1", "Not in a family2"]);
+     expect(rowNames()).toEqual([
+       "Role routing build",
+       "Escalation tool",
+@@ -219,7 +224,94 @@ describe("Grouping > Family", () => {
+       "Fabric card speed",
+       "PASS deck",
+     ]);
+-    const headers = [...document.querySelectorAll("h2 > button")].map((b) => b.textContent);
+-    expect(headers).toEqual(["Role routing build4", "Sessions"]);
++    // The lead keeps its dot; lines and indent replace the dots on its sessions.
++    expect(dotOf("Role routing build")).not.toBeNull();
++    expect(dotOf("Escalation tool")).toBeNull();
++    const depth = (name: string) =>
++      within(rowItem(name)).queryByTestId("ae-family-indent")?.getAttribute("data-depth");
++    expect(depth("Escalation tool")).toBe("1");
++    expect(depth("Families PR (fork)")).toBe("2");
++    expect(depth("Fabric card speed")).toBeUndefined();
++  });
++
++  it("folds a family from the lead's pill and remembers it", () => {
++    setView({ grouping: "family" });
++    const view = renderSidebar();
++    const pill = within(rowItem("Role routing build")).getByTestId("ae-family-fold");
++    expect(pill.textContent).toBe("3");
++    fireEvent.click(pill);
++    expect(rowNames()).toEqual(["Role routing build", "Fabric card speed", "PASS deck"]);
++    expect(JSON.parse(localStorage.getItem("omnigent:ae-family-folds")!)).toEqual([
++      sid("Role routing build"),
++    ]);
++    view.rerenderSidebar();
++    expect(rowNames()).toHaveLength(3);
++    fireEvent.click(within(rowItem("Role routing build")).getByTestId("ae-family-fold"));
++    expect(rowNames()).toHaveLength(6);
++  });
++
++  it("says how a family forms while none shows", () => {
++    useConvMock.mockImplementation(() =>
++      conversationPage(
++        ROWS.filter((c) => !c.labels?.["ae.orch"] && !c.labels?.["omnigent.fork.source_id"]),
++      ),
++    );
++    setView({ grouping: "family" });
++    renderSidebar();
++    expect(sections()).toEqual(["Families0", "Not in a family3"]);
++    expect(screen.getByTestId("ae-families-hint")).toBeTruthy();
++  });
++
++  it("stands in for a lead that is not loaded, keeping its session out of the rest", () => {
++    useConvMock.mockImplementation(() =>
++      conversationPage(ROWS.filter((c) => c.title !== "Role routing build")),
++    );
++    setView({ grouping: "family" });
++    renderSidebar();
++    expect(screen.getByTestId("ae-family-stand-in").textContent).toContain("Lead not loaded");
++    expect(rowNames().slice(0, 3)).toEqual([
++      "Escalation tool",
++      "Families PR",
++      "Families PR (fork)",
++    ]);
++  });
++
++  const withoutLead = () =>
++    useConvMock.mockImplementation(() =>
++      conversationPage(ROWS.filter((c) => c.title !== "Role routing build")),
++    );
++
++  it("lists only the stand-in while its family is folded, never the hidden session", () => {
++    withoutLead();
++    localStorage.setItem("omnigent:ae-family-folds", JSON.stringify([sid("Role routing build")]));
++    setView({ grouping: "family" });
++    renderSidebar();
++    const standIn = screen.getByTestId("ae-family-stand-in");
++    expect(within(standIn).getByTestId("ae-family-fold").textContent).toBe("3");
++    expect(rowNames()).toEqual(["Fabric card speed", "PASS deck"]);
++  });
++
++  it("narrows to a stand-in family from its dot", () => {
++    withoutLead();
++    setView({ grouping: "family" });
++    renderSidebar();
++    fireEvent.click(within(screen.getByTestId("ae-family-stand-in")).getByTestId("ae-family-dot"));
++    expect(screen.getByTestId("ae-family-filter")).toBeTruthy();
++    expect(rowNames()).toEqual(["Escalation tool", "Families PR", "Families PR (fork)"]);
++  });
++
++  it("closes the phone drawer when the stand-in lead is tapped", () => {
++    withoutLead();
++    setView({ grouping: "family" });
++    const matchMedia = window.matchMedia;
++    window.matchMedia = vi.fn().mockReturnValue({ matches: false }) as never;
++    try {
++      const onClose = vi.fn();
++      renderSidebar(onClose);
++      fireEvent.click(within(screen.getByTestId("ae-family-stand-in")).getByRole("link"));
++      expect(onClose).toHaveBeenCalledTimes(1);
++    } finally {
++      window.matchMedia = matchMedia;
++    }
+   });
+ });
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index b50df7c73f9fbcc5cf96417ae7a81377c3807d94..28b6e6dd51deccaf419a3424e2977a8f01eb3cdf 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -251,13 +251,16 @@ import {
+   useAeSidebarView,
+ } from "@/shell/aeSidebarStore";
+ import { AE_TRIAGE_GROUPS } from "@/lib/aeTriage";
++import { AeFamilyContext, type AeFamilyView, useAeFamilies } from "@/lib/aeFamilyView";
+ import {
+-  AeFamilyContext,
+-  type AeFamilyView,
+-  aeFamilyGroups,
+-  useAeFamilies,
+-} from "@/lib/aeFamilyView";
+-import { AeFamilyDot, AeFamilyFilterBar, AeFamilyTitle } from "@/shell/AeFamilyDot";
++  aeFamilyTree,
++  aeWithFamiliesSection,
++  useAeEffectiveFolds,
++  useAeFamilyFolds,
++  useAeStableTree,
++} from "@/lib/aeFamilyTree";
++import { AeFamilyDot, AeFamilyFilterBar } from "@/shell/AeFamilyDot";
++import * as AeTree from "@/shell/AeFamilyTree";
+ import { PrimaryNavLink } from "@/shell/PrimaryNavLink";
+ import { useViewerId } from "@/hooks/useViewerId";
+ import { useExtensions } from "@/extensions/ExtensionProvider";
+@@ -1817,6 +1820,7 @@ function ConversationList({
+   const families = useAeFamilies(
+     familyRows,
+     view.familyDots || view.grouping === "family" || familyFilter !== null,
++    view.grouping === "family",
+   );
+   // Another display (Shared, Archived) starts unfiltered.
+   useEffect(() => setFamilyFilter(null), [activeTab]);
+@@ -1885,6 +1889,12 @@ function ConversationList({
+   // out from under you. Snapshot is dropped on navigate-away so the
+   // chat snaps back to its real position once you've left.
+   const { conversationId: activeId } = useParams<{ conversationId: string }>();
++  // The open session's family unfolds while it is one of its hidden sessions.
++  const familyFolds = useAeEffectiveFolds(
++    useAeFamilyFolds(),
++    activeId ?? null,
++    activeId ? (families.byRow.get(activeId)?.family.root ?? null) : null,
++  );
+   // Resolve the active conversation's top-level root once here (rows get a plain
+   // `isActive` prop, not their own query). Falls back to the raw id while the
+   // parent walk loads — a top-level session resolves to itself.
+@@ -2059,17 +2069,18 @@ function ConversationList({
+         projectGroups,
+         groupTitles: null,
+         groupOrder: null,
+-        familyByTitle: null,
++        aeTree: null,
+       };
+     }
+     if (view.grouping === "family") {
+-      const { leadsFirst, ...groups } = aeFamilyGroups(ordered, families);
+-      const sessions = groupConversations(
+-        leadsFirst,
+-        (c) => groups.groupTitles.get(c.id),
+-        groups.groupOrder,
+-      ).flatMap((g) => g.conversations);
+-      return { pinned, shared, projectGroups, sessions, ...groups };
++      const { tree: aeTree, ...groups } = aeFamilyTree(ordered, families, {
++        folded: familyFolds,
++        byLead: view.ordering === "manual",
++        searching: searchQuery !== "",
++        lookup: (id) =>
++          allConversations.find((c) => c.id === id) ?? pinned.find((c) => c.id === id),
++      });
++      return { pinned, shared, projectGroups, ...groups, aeTree };
+     }
+     // Buckets use render-time "now", so a day rollover shows on the next list update.
+     const now = new Date();
+@@ -2095,7 +2106,7 @@ function ConversationList({
+       projectGroups,
+       groupTitles,
+       groupOrder: null,
+-      familyByTitle: null,
++      aeTree: null,
+     };
+     // `unseenTick` / `draftIds` aren't read here: they version the stores status buckets read.
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+@@ -2121,8 +2132,14 @@ function ConversationList({
+     ae,
+     families,
+     familyFilter,
++    familyFolds,
++    searchQuery,
+   ]);
+ 
++  const aeTree = useAeStableTree(loadedSections.aeTree);
++  const treeView = useMemo(() => ({ ...familyView, tree: aeTree }), [familyView, aeTree]);
++  // A stand-in lead draws as its own entry; it is no session to navigate to or select.
++  const standIns = loadedSections.aeTree?.standIns;
+   const config = useContext(SidebarConfigContext);
+   // Shared renders above Sessions, so the display window pages through both in that order.
+   const listRows = useMemo(
+@@ -2152,8 +2169,9 @@ function ConversationList({
+     const titles = loadedSections.groupTitles;
+     if (!titles || sections.sessions.length === 0) return null;
+     const order = loadedSections.groupOrder ?? groupOrder;
+-    return groupConversations(sections.sessions, (c) => titles.get(c.id), order);
+-  }, [loadedSections.groupTitles, loadedSections.groupOrder, sections.sessions, groupOrder]);
++    const groups = groupConversations(sections.sessions, (c) => titles.get(c.id), order);
++    return aeWithFamiliesSection(groups, loadedSections.aeTree);
++  }, [loadedSections, sections.sessions, groupOrder]);
+ 
+   // Scope-active flags: which section owns the current selection UI (checkboxes
+   // + bulk-action bar). Only one is true at a time unless the selection is unified.
+@@ -2513,8 +2531,10 @@ function ConversationList({
+       ...(sessionGroups
+         ? sessionGroups.flatMap((g) => visible(g.title, g.conversations))
+         : visible("Chats", sections.sessions)),
+-    ].map((c) => c.id);
+-  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects]);
++    ]
++      .filter((c) => !standIns?.has(c.id))
++      .map((c) => c.id);
++  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects, standIns]);
+   // Getter for the shift-select range, built on demand (at click time). Scopes
+   // to whichever section is selectable: the flat Sessions list, or the sessions
+   // across expanded project folders (in render order). For projects scope the
+@@ -2532,7 +2552,9 @@ function ConversationList({
+     };
+     if (selectionScope === "projects") return projectIds();
+     const visibleIds = (title: string, list: readonly Conversation[]) =>
+-      effectiveCollapsedSections.includes(title) ? [] : list.map((c) => c.id);
++      effectiveCollapsedSections.includes(title)
++        ? []
++        : list.filter((c) => !standIns?.has(c.id)).map((c) => c.id);
+     return [
+       ...(unifiedSelection ? projectIds() : []),
+       ...visibleIds("Shared", sections.shared),
+@@ -2707,7 +2729,7 @@ function ConversationList({
+       viewerId={viewerId}
+       serverInfo={serverInfo}
+       onActivate={activateRow}
+-      familyView={familyView}
++      familyView={treeView}
+     >
+       <DndContext
+         sensors={sensors}
+@@ -2972,14 +2994,13 @@ function ConversationList({
+                               key={group.title}
+                               title={group.title}
+                               titleContent={
+-                                loadedSections.familyByTitle?.has(group.title) ? (
+-                                  <AeFamilyTitle
+-                                    family={loadedSections.familyByTitle.get(group.title)!}
+-                                  />
+-                                ) : (
+-                                  aeTriageTitle(ae, group.title, loadedSections.groupTitles)
+-                                )
++                                AeTree.aeFamilySectionTitle(loadedSections.aeTree, group) ??
++                                aeTriageTitle(ae, group.title, loadedSections.groupTitles)
+                               }
++                              emptyMessage={AeTree.aeFamiliesHint(
++                                loadedSections.aeTree,
++                                group.title,
++                              )}
+                               conversations={group.conversations}
+                               footer={
+                                 index === sessionGroups.length - 1 ? sessionStatus : undefined
+@@ -3890,18 +3911,24 @@ function ConversationSection({
+             // Indent project chats a step under the project-folder name above.
+             <ul className={cn("flex flex-col gap-px", indentRows && "pl-6")}>
+               {conversations.map((conv) => (
+-                <ConversationRow
++                <AeTree.AeFamilyTreeSlot
+                   key={conv.id}
+-                  conversation={conv}
+-                  isActive={conv.id === activeConversationId}
+-                  isPinned={pinnedConversationIds.includes(conv.id)}
+-                  onClick={onRowClick}
+-                  onTogglePinned={onTogglePinned}
+-                  selectionMode={selectionMode}
+-                  isSelected={selectedIds.has(conv.id)}
+-                  onToggleSelected={onToggleSelected}
+-                  onProjectAssigned={onProjectAssigned}
+-                />
++                  conversationId={conv.id}
++                  section={title}
++                  onNavigate={onRowClick}
++                >
++                  <ConversationRow
++                    conversation={conv}
++                    isActive={conv.id === activeConversationId}
++                    isPinned={pinnedConversationIds.includes(conv.id)}
++                    onClick={onRowClick}
++                    onTogglePinned={onTogglePinned}
++                    selectionMode={selectionMode}
++                    isSelected={selectedIds.has(conv.id)}
++                    onToggleSelected={onToggleSelected}
++                    onProjectAssigned={onProjectAssigned}
++                  />
++                </AeTree.AeFamilyTreeSlot>
+               ))}
+             </ul>
+           )}
+@@ -5154,6 +5181,7 @@ function ConversationRowImpl({
+       {/* Row 1: the session name. Working, needs-approval, unseen, and draft
+           markers render in the shared trailing indicator slot below. */}
+       <div className="flex w-full items-center">
++        <AeTree.AeFamilyTreeIndent conversationId={conversation.id} selectionMode={selectionMode} />
+         <AeConversationStatusIcon conversation={conversation} className="mr-1.5" />
+         <AeFamilyDot conversationId={conversation.id} />
+         <span
+@@ -5167,6 +5195,7 @@ function ConversationRowImpl({
+           {label}
+           {hasUnseenMessages && <span className="sr-only"> (unread)</span>}
+         </span>
++        <AeTree.AeFamilyFold conversationId={conversation.id} />
+       </div>
+       {/* Row 2: the "Show" metadata, each part omitted when it has no value. */}
+       <SessionMetaLine environment={metaEnvironment} repo={metaRepo} branch={metaBranch} />
+diff --git a/web/src/shell/aeSidebarStore.test.ts b/web/src/shell/aeSidebarStore.test.ts
+index 9c54daeef12e5c3e2d674f02903367b9f2e54a6b..11e3c454dc06127d9571a7d35a1ca5d8772b8d80 100644
+--- a/web/src/shell/aeSidebarStore.test.ts
++++ b/web/src/shell/aeSidebarStore.test.ts
+@@ -24,6 +24,7 @@ import {
+   aePlaceOf,
+   aePointerWithin,
+   aeTrackDragMove,
++  useAePublishSidebarScopes,
+   useAeSidebarStore,
+   useAeSidebarView,
+ } from "./aeSidebarStore";
+@@ -507,3 +508,60 @@ describe("useAeSidebarView", () => {
+     }
+   });
+ });
++
++describe("useAePublishSidebarScopes in the family tree", () => {
++  it("publishes each family as its own list, and no stand-in lead", () => {
++    const rows = (...ids: string[]) => ids.map((id) => ({ id })) as never[];
++    const ae = {
++      listed: true,
++      manual: true,
++      order: null,
++      statusSort: false,
++      triage: false,
++      frozenTriage: null,
++      switchToManual: vi.fn(),
++    } as never;
++    const sessions = rows("a", "a1", "ghost", "g1", "plain");
++    const titles = new Map([
++      ["a", "Families"],
++      ["a1", "Families"],
++      ["ghost", "Families"],
++      ["g1", "Families"],
++      ["plain", "Not in a family"],
++    ]);
++    const family = (root: string) => ({ family: { root } });
++    const aeTree = {
++      rows: new Map([
++        ["a", family("a")],
++        ["a1", family("a")],
++        ["ghost", family("ghost")],
++        ["g1", family("ghost")],
++      ]),
++      standIns: new Set(["ghost"]),
++    };
++    const client = new QueryClient();
++    const wrapper = ({ children }: { children: ReactNode }) =>
++      createElement(QueryClientProvider, { client }, children);
++    renderHook(
++      () =>
++        useAePublishSidebarScopes(
++          ae,
++          { shared: [], sessions, projectGroups: [], groupTitles: titles, aeTree },
++          new Map(),
++          null,
++          null,
++        ),
++      { wrapper },
++    );
++    const { lists, listOf } = useAeSidebarStore.getState();
++    expect([...lists]).toEqual([
++      ["family:a", ["a", "a1"]],
++      ["family:ghost", ["g1"]],
++      ["group:Not in a family", ["plain"]],
++    ]);
++    expect(listOf.has("ghost")).toBe(false);
++    // A drop in another family has no list to land on, so nothing collides or snaps back.
++    expect(aeCrossMove(useAeSidebarStore.getState(), "a1", "g1")).toBeNull();
++    expect(aePlaceOf(useAeSidebarStore.getState(), "a1")).toBe("last");
++  });
++});
+diff --git a/web/src/shell/aeSidebarStore.ts b/web/src/shell/aeSidebarStore.ts
+index bde9eed5cabfef08403ec2a6e3dd3b8b960ba4c3..5eae8dcfb498d250d16f86baf87642d8371d22f6 100644
+--- a/web/src/shell/aeSidebarStore.ts
++++ b/web/src/shell/aeSidebarStore.ts
+@@ -220,6 +220,11 @@ interface PublishedSections {
+   sessions: Conversation[];
+   projectGroups: { name: string; conversations: Conversation[] }[];
+   groupTitles: ReadonlyMap<string, string> | null;
++  /** Grouping > Family's tree: each family is its own list, and a stand-in lead is in none. */
++  aeTree?: {
++    rows: ReadonlyMap<string, { family: { root: string } }>;
++    standIns: ReadonlySet<string>;
++  } | null;
+ }
+ 
+ /**
+@@ -250,7 +255,12 @@ export function useAePublishSidebarScopes(
+     add("shared", sections.shared);
+     const titles = sections.groupTitles;
+     if (titles) {
+-      for (const row of sections.sessions) add(`group:${titles.get(row.id) ?? ""}`, [row]);
++      const tree = sections.aeTree;
++      for (const row of sections.sessions) {
++        if (tree?.standIns.has(row.id)) continue;
++        const family = tree?.rows.get(row.id)?.family.root;
++        add(family ? `family:${family}` : `group:${titles.get(row.id) ?? ""}`, [row]);
++      }
+     } else add("sessions", sections.sessions);
+     for (const group of sections.projectGroups) {
+       add(`folder:${group.name}`, folderConversations.get(group.name) ?? group.conversations);

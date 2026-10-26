@@ -1,0 +1,1117 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 22:39:05 -0700
+Subject: [PATCH 182/191] [ae-patch] Add preset insights block to Settings
+ Roles
+
+A switch for the preset-insights setting, the reviewer and scope rows, Run now, and the user's own suggestions with Apply, Undo and Dismiss.
+---
+ web/src/hooks/useAePresetReview.ts            | 147 +++++++
+ web/src/hooks/useAeRoles.ts                   |  17 +-
+ web/src/lib/aeRoles.test.ts                   |  19 +
+ web/src/lib/aeRoles.ts                        |  16 +-
+ .../settings/AePresetInsightsBlock.test.tsx   | 413 ++++++++++++++++++
+ .../pages/settings/AePresetInsightsBlock.tsx  | 369 ++++++++++++++++
+ .../settings/AeRolesSettingsSection.test.tsx  |   1 +
+ .../pages/settings/AeRolesSettingsSection.tsx |   3 +
+ 8 files changed, 981 insertions(+), 4 deletions(-)
+ create mode 100644 web/src/hooks/useAePresetReview.ts
+ create mode 100644 web/src/pages/settings/AePresetInsightsBlock.test.tsx
+ create mode 100644 web/src/pages/settings/AePresetInsightsBlock.tsx
+
+diff --git a/web/src/hooks/useAePresetReview.ts b/web/src/hooks/useAePresetReview.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9fbe178de9b370a4aca184685071cb5ce5e15d91
+--- /dev/null
++++ b/web/src/hooks/useAePresetReview.ts
+@@ -0,0 +1,147 @@
++// Settings > Roles > Preset insights (omnigent-ae, 2026-10-24, preset insights
++// PR 3): the scheduled preset review's status (`GET /v1/ae/preset-review`), the
++// signed-in user's own suggestions (`GET /v1/ae/preset-suggestions`) and the
++// actions on them (`POST .../{id}/apply|undo|dismiss`, `POST
++// /v1/ae/preset-review/run`). Apply and Undo answer the saved roles, which go
++// into the roles cache so the list above shows the change at once.
++
++import { useQuery, useQueryClient } from "@tanstack/react-query";
++import { useCallback, useMemo } from "react";
++import { aeParseRolesState } from "@/lib/aeRoles";
++import { authenticatedFetch } from "@/lib/identity";
++import { AE_ROLES_QUERY_KEY } from "./useAeRoles";
++
++export const AE_PRESET_REVIEW_QUERY_KEY = ["ae", "preset-review"] as const;
++export const AE_PRESET_SUGGESTIONS_QUERY_KEY = ["ae", "preset-suggestions"] as const;
++
++export interface AePresetReviewStatus {
++  enabled: boolean;
++  scope: "all" | "own";
++  task: { id: string; state: string; next_run_at: string | null } | null;
++  last_review: string | null;
++  next_review: string | null;
++  reviewer: { model: string; effort: string; preset_title: string | null };
++  open: number;
++}
++
++export interface AePresetSuggestion {
++  id: string;
++  review_id: string;
++  kind: "own" | "starter" | "no_change";
++  preset_title?: string | null;
++  title: string;
++  why: string;
++  saving?: string | null;
++  status:
++    | "open"
++    | "applying"
++    | "applied"
++    | "undoing"
++    | "dismissed"
++    | "issue_opening"
++    | "issue_opened"
++    | "undone";
++  can_apply: boolean;
++  can_undo: boolean;
++  /** One line per change, rendered by the server ("Builder: A high to B medium"). */
++  changes_text?: string;
++}
++
++export type AePresetReviewAction = "run" | "apply" | "undo" | "dismiss";
++export type AePresetReviewResult = { ok: true } | { ok: false; message: string };
++
++async function errorMessage(res: Response): Promise<string> {
++  try {
++    const body = (await res.json()) as { error?: { message?: unknown } } | null;
++    if (typeof body?.error?.message === "string" && body.error.message) return body.error.message;
++  } catch {
++    // No JSON body; the status line is all there is.
++  }
++  return `The server answered ${res.status}.`;
++}
++
++export function useAePresetReviewStatus(enabled: boolean) {
++  return useQuery({
++    queryKey: AE_PRESET_REVIEW_QUERY_KEY,
++    queryFn: async (): Promise<AePresetReviewStatus> => {
++      const res = await authenticatedFetch("/v1/ae/preset-review", { method: "GET" });
++      if (!res.ok) throw new Error(`GET /v1/ae/preset-review answered ${res.status}`);
++      return (await res.json()) as AePresetReviewStatus;
++    },
++    enabled,
++    staleTime: 30_000,
++    refetchOnWindowFocus: "always",
++    retry: false,
++  });
++}
++
++/** The user's own suggestions, newest first. */
++export function useAePresetSuggestions(enabled: boolean) {
++  return useQuery({
++    queryKey: AE_PRESET_SUGGESTIONS_QUERY_KEY,
++    queryFn: async (): Promise<AePresetSuggestion[]> => {
++      const res = await authenticatedFetch("/v1/ae/preset-suggestions", { method: "GET" });
++      if (!res.ok) throw new Error(`GET /v1/ae/preset-suggestions answered ${res.status}`);
++      const body = (await res.json()) as { suggestions?: AePresetSuggestion[] };
++      return body.suggestions ?? [];
++    },
++    enabled,
++    staleTime: 30_000,
++    refetchOnWindowFocus: "always",
++    retry: false,
++  });
++}
++
++/** `run(null)` starts the review; the others act on the suggestion `id`. */
++export function useAePresetReviewActions() {
++  const queryClient = useQueryClient();
++  const act = useCallback(
++    async (action: AePresetReviewAction, id: string | null): Promise<AePresetReviewResult> => {
++      const path =
++        action === "run"
++          ? "/v1/ae/preset-review/run"
++          : `/v1/ae/preset-suggestions/${encodeURIComponent(id ?? "")}/${action}`;
++      let res: Response;
++      try {
++        res = await authenticatedFetch(path, {
++          method: "POST",
++          headers: { "Content-Type": "application/json" },
++          body: "{}",
++        });
++      } catch (error) {
++        // The request may have landed: read the roles again before trusting the list.
++        void queryClient.invalidateQueries({ queryKey: AE_ROLES_QUERY_KEY });
++        return { ok: false, message: error instanceof Error ? error.message : String(error) };
++      }
++      if (!res.ok) {
++        // A refusal still means the lists changed under us (the preset moved on, another
++        // device saved): read the suggestions and the roles again.
++        void queryClient.invalidateQueries({ queryKey: AE_PRESET_SUGGESTIONS_QUERY_KEY });
++        void queryClient.invalidateQueries({ queryKey: AE_ROLES_QUERY_KEY });
++        return { ok: false, message: await errorMessage(res) };
++      }
++      const body = (await res.json().catch(() => null)) as { roles?: unknown } | null;
++      const roles = aeParseRolesState(body?.roles);
++      if (roles) queryClient.setQueryData(AE_ROLES_QUERY_KEY, roles);
++      else if (action === "apply" || action === "undo") {
++        // The preset changed but the answer did not carry the roles: fetch them.
++        void queryClient.invalidateQueries({ queryKey: AE_ROLES_QUERY_KEY });
++      }
++      await Promise.all([
++        queryClient.invalidateQueries({ queryKey: AE_PRESET_SUGGESTIONS_QUERY_KEY }),
++        queryClient.invalidateQueries({ queryKey: AE_PRESET_REVIEW_QUERY_KEY }),
++      ]);
++      return { ok: true };
++    },
++    [queryClient],
++  );
++  return useMemo(
++    () => ({
++      run: () => act("run", null),
++      apply: (id: string) => act("apply", id),
++      undo: (id: string) => act("undo", id),
++      dismiss: (id: string) => act("dismiss", id),
++    }),
++    [act],
++  );
++}
+diff --git a/web/src/hooks/useAeRoles.ts b/web/src/hooks/useAeRoles.ts
+index 0461bb60503d8c85e55ad42b181b4f140709d1e0..eee592760992ba03eaf218542c8b21374dca8562 100644
+--- a/web/src/hooks/useAeRoles.ts
++++ b/web/src/hooks/useAeRoles.ts
+@@ -19,8 +19,16 @@ export async function fetchAeRoles(): Promise<AeRolesState> {
+   return parsed;
+ }
+ 
++/** What the save did to the scheduled preset review (`insights_task` in the PUT answer). */
++export interface AeInsightsTask {
++  ok: boolean;
++  action?: string;
++  error?: string;
++}
++
+ export type AeRolesPutResult =
+-  { ok: true; saved: AeRolesState } | { ok: false; current: AeRolesState };
++  | { ok: true; saved: AeRolesState; insightsTask?: AeInsightsTask }
++  | { ok: false; current: AeRolesState };
+ 
+ /**
+  * Save `doc` on top of its revision. A stale revision comes back as the
+@@ -55,7 +63,12 @@ export async function putAeRoles(doc: AeRolesDoc): Promise<AeRolesPutResult> {
+   }
+   const saved = aeParseRolesState(body);
+   if (!saved) throw new Error("PUT /v1/ae/roles answered without presets");
+-  return { ok: true, saved };
++  const task = (body as { insights_task?: unknown } | null)?.insights_task;
++  const insightsTask =
++    task && typeof task === "object" && typeof (task as AeInsightsTask).ok === "boolean"
++      ? (task as AeInsightsTask)
++      : undefined;
++  return { ok: true, saved, ...(insightsTask ? { insightsTask } : {}) };
+ }
+ 
+ export function useAeRoles() {
+diff --git a/web/src/lib/aeRoles.test.ts b/web/src/lib/aeRoles.test.ts
+index e9566050c771b04eeab77fcc0182e5f9980b491d..9d5e25860701a02b9317f0ae9c88bab477e3be62 100644
+--- a/web/src/lib/aeRoles.test.ts
++++ b/web/src/lib/aeRoles.test.ts
+@@ -13,6 +13,7 @@ import {
+   aeRestoreStarters,
+   aeSetPinned,
+   aeTopModel,
++  aeWithInsights,
+ } from "./aeRoles";
+ 
+ const preset = (id: string, pinned = false): AeRolePreset => ({
+@@ -113,9 +114,27 @@ describe("aeRoles", () => {
+     expect(aeRolesDoc(state as AeRolesDoc).insights).toEqual(insights);
+     expect(aeParseRolesState({ ...body, insights: { enabled: "yes" } })?.insights).toBeUndefined();
+     expect(aeParseRolesState({ ...body, insights: null })?.insights).toBeUndefined();
++    const shown = { ...insights, show: "tokens" };
++    expect(aeParseRolesState({ ...body, insights: shown })?.insights).toEqual(shown);
++    expect(aeParseRolesState({ ...body, insights: { ...insights, show: "x" } })?.insights).toEqual(
++      insights,
++    );
+     expect("insights" in aeRolesDoc(doc([preset("a")]))).toBe(false);
+   });
+ 
++  it("aeWithInsights replaces the setting and keeps the rest of the doc", () => {
++    const base = {
++      ...doc([preset("a")]),
++      starters: [],
++      insights: { enabled: false, weeks: 2, scope: "all" },
++    } as const;
++    const next = aeWithInsights(base as AeRolesDoc, { enabled: true, weeks: 2, scope: "own" });
++    expect(next.insights).toEqual({ enabled: true, weeks: 2, scope: "own" });
++    expect(next.revision).toBe(base.revision);
++    expect(next.presets).toEqual(base.presets);
++    expect("starters" in next).toBe(false);
++  });
++
+   it("trims a long title by code points so the copy fits 40 without splitting a pair", () => {
+     const long = { ...preset("a"), title: "😀".repeat(40) };
+     const { doc: next } = aeDuplicatePreset(doc([long]), long);
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index cd45892bc4cae9fe5f5c18c6d4636553df1ec809..93421f20e990e8b12722033229ab2138b3f06c10 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -135,21 +135,33 @@ export interface AeRolePreset {
+   rules: AeRoleRules;
+ }
+ 
+-/** The user's preset-insights setting. The editor has no control for it yet; a save sends it back unchanged. */
++/** The user's preset-insights setting (AePresetInsightsBlock); every other save sends it back unchanged. */
+ export interface AeInsights {
+   enabled: boolean;
+   weeks: number;
+   scope: "all" | "own";
++  /** What the Admin Center Presets card shows this user; absent means both. */
++  show?: AeInsightsShow;
+ }
+ 
++export type AeInsightsShow = "cost" | "tokens" | "both";
++
+ function parseInsights(value: unknown): AeInsights | null {
+   if (!isObject(value)) return null;
+-  const { enabled, weeks, scope } = value;
++  const { enabled, weeks, scope, show } = value;
+   if (typeof enabled !== "boolean" || typeof weeks !== "number") return null;
+   if (scope !== "all" && scope !== "own") return null;
++  if (show === "cost" || show === "tokens" || show === "both") {
++    return { enabled, weeks, scope, show };
++  }
+   return { enabled, weeks, scope };
+ }
+ 
++/** `state` with its insights setting replaced, for the Preset insights block's save. */
++export function aeWithInsights(state: AeRolesDoc, insights: AeInsights): AeRolesDoc {
++  return aeRolesDoc({ ...state, insights });
++}
++
+ /** What `PUT /v1/ae/roles` takes. */
+ export interface AeRolesDoc {
+   revision: number;
+diff --git a/web/src/pages/settings/AePresetInsightsBlock.test.tsx b/web/src/pages/settings/AePresetInsightsBlock.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..35e4057cbc0dabbe068eb10cffb073d56e9bb066
+--- /dev/null
++++ b/web/src/pages/settings/AePresetInsightsBlock.test.tsx
+@@ -0,0 +1,413 @@
++// Settings > Roles > Preset insights: the switch saves the insights setting and
++// shows the task error, the rows appear only while it is on, Run now posts, and
++// the user's own suggestions apply, undo and dismiss (409 message on the row).
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type { AePresetSuggestion } from "@/hooks/useAePresetReview";
++import type { AeRolesState } from "@/lib/aeRoles";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn(), showToast: vi.fn(), admin: { value: false } }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
++vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => mocks.admin.value }));
++
++import { AePresetInsightsBlock, aeInsightsDay, aeOwnSuggestions } from "./AePresetInsightsBlock";
++
++const json = (body: unknown, status = 200) =>
++  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++
++function stateOf(patch: Partial<AeRolesState> = {}): AeRolesState {
++  return {
++    revision: 3,
++    default_preset: "balanced",
++    apply_start_on: true,
++    presets: [],
++    starters: [],
++    ...patch,
++  };
++}
++
++const ON = { enabled: true, weeks: 2, scope: "all" as const };
++
++function suggestion(patch: Partial<AePresetSuggestion> = {}): AePresetSuggestion {
++  return {
++    id: "sg_1",
++    review_id: "rv_1",
++    kind: "own",
++    preset_title: "Deep debug",
++    title: "Builder Opus high to Sonnet high",
++    why: "There were 14 runs.",
++    saving: "about $5 per run",
++    status: "open",
++    can_apply: true,
++    can_undo: false,
++    ...patch,
++  };
++}
++
++const STATUS = {
++  enabled: true,
++  scope: "all",
++  task: { id: "t1", state: "active", next_run_at: "2026-11-03T07:00:00Z" },
++  last_review: "2026-10-20T07:30:00Z",
++  next_review: "2026-11-03T07:00:00Z",
++  reviewer: { model: "claude-opus-5-5", effort: "high", preset_title: "Balanced" },
++  open: 1,
++};
++
++interface Routes {
++  suggestions?: AePresetSuggestion[];
++  put?: (body: AeRolesState) => Response;
++  post?: Record<string, Response>;
++  status?: () => typeof STATUS;
++}
++
++function serve({ suggestions = [suggestion()], put, post = {}, status }: Routes = {}) {
++  const calls: { url: string; method: string; body: string }[] = [];
++  mocks.fetch.mockImplementation(async (url: string, init?: RequestInit) => {
++    const method = init?.method ?? "GET";
++    calls.push({ url, method, body: String(init?.body ?? "") });
++    if (url === "/v1/ae/preset-review" && method === "GET") return json(status ? status() : STATUS);
++    if (url === "/v1/ae/preset-suggestions" && method === "GET")
++      return json({ suggestions, reviews: [] });
++    if (url === "/v1/ae/roles" && method === "PUT") {
++      const body = JSON.parse(String(init?.body)) as AeRolesState;
++      return put ? put(body) : json({ ...body, revision: body.revision + 1, starters: [] });
++    }
++    if (method === "POST") return post[url] ?? json({ ok: true });
++    return json({}, 404);
++  });
++  return calls;
++}
++
++function mount(state: AeRolesState) {
++  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  return render(
++    <QueryClientProvider client={client}>
++      <AePresetInsightsBlock state={state} />
++    </QueryClientProvider>,
++  );
++}
++
++beforeEach(() => {
++  mocks.fetch.mockReset();
++  mocks.showToast.mockReset();
++  mocks.admin.value = false;
++});
++afterEach(cleanup);
++
++describe("the words", () => {
++  it("writes a day and picks the user's own live suggestions", () => {
++    expect(aeInsightsDay("2026-10-20T12:00:00Z")).toMatch(/Oct\s20/);
++    expect(aeInsightsDay(null)).toBe("");
++    expect(aeInsightsDay("not a date")).toBe("");
++    const rows = aeOwnSuggestions([
++      suggestion(),
++      suggestion({ id: "b", status: "dismissed" }),
++      suggestion({ id: "c", kind: "starter" }),
++      suggestion({ id: "d", status: "applied", can_apply: false, can_undo: true }),
++    ]);
++    expect(rows.map((s) => s.id)).toEqual(["sg_1", "d"]);
++  });
++});
++
++describe("off", () => {
++  it("shows the switch and the off copy, and reads nothing", () => {
++    const calls = serve();
++    mount(stateOf());
++    expect(
++      screen.getByRole("switch", { name: "Collect run logs and review presets" }),
++    ).toHaveAttribute("aria-checked", "false");
++    expect(screen.getByText(/Off\. The Admin Center card still shows runs/)).toBeInTheDocument();
++    expect(screen.queryByText("Every 2 weeks")).toBeNull();
++    expect(calls).toEqual([]);
++  });
++
++  it("turning it on saves insights with weeks 2 and scope all", async () => {
++    const calls = serve();
++    mount(stateOf());
++    fireEvent.click(screen.getByRole("switch"));
++    await waitFor(() => expect(mocks.showToast).toHaveBeenCalledWith("Preset insights are on."));
++    const put = calls.find((c) => c.method === "PUT");
++    expect(JSON.parse(put?.body ?? "{}").insights).toEqual({
++      enabled: true,
++      weeks: 2,
++      scope: "all",
++    });
++  });
++
++  it("shows the scheduled task's error from the save", async () => {
++    serve({
++      put: (body) =>
++        json({
++          ...body,
++          revision: 4,
++          starters: [],
++          insights_task: { ok: false, action: "none", error: "agent preset-reviewer is missing" },
++        }),
++    });
++    mount(stateOf());
++    fireEvent.click(screen.getByRole("switch"));
++    expect(await screen.findByRole("alert")).toHaveTextContent("agent preset-reviewer is missing");
++  });
++
++  it("a conflict toasts and keeps the switch as it was", async () => {
++    serve({ put: (body) => json({ error: { ...body, revision: 9, starters: [] } }, 409) });
++    mount(stateOf());
++    fireEvent.click(screen.getByRole("switch"));
++    await waitFor(() =>
++      expect(mocks.showToast).toHaveBeenCalledWith(
++        "Your roles changed on another device, so the saved presets were reloaded.",
++      ),
++    );
++  });
++});
++
++describe("Presets card shows", () => {
++  it("renders in the off state, defaults to Both, and saves only show", async () => {
++    const calls = serve();
++    mount(stateOf({ insights: { enabled: false, weeks: 2, scope: "all" } }));
++    expect(screen.getByRole("switch")).toHaveAttribute("aria-checked", "false");
++    expect(screen.getByRole("group", { name: "Presets card shows" })).toBeInTheDocument();
++    expect(screen.getByRole("button", { name: "Both" })).toHaveAttribute("aria-pressed", "true");
++    fireEvent.click(screen.getByRole("button", { name: "Tokens" }));
++    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
++    const put = calls.find((c) => c.method === "PUT");
++    expect(JSON.parse(put?.body ?? "{}").insights).toEqual({
++      enabled: false,
++      weeks: 2,
++      scope: "all",
++      show: "tokens",
++    });
++    expect(calls.filter((c) => c.method === "PUT")).toHaveLength(1);
++  });
++
++  it("renders in the on state, shows the saved pick, and keeps scope and weeks", async () => {
++    mocks.admin.value = true;
++    const calls = serve();
++    mount(stateOf({ insights: { enabled: true, weeks: 4, scope: "own", show: "tokens" } }));
++    expect(screen.getByRole("button", { name: "Tokens" })).toHaveAttribute("aria-pressed", "true");
++    fireEvent.click(screen.getByRole("button", { name: "Cost" }));
++    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
++    const put = calls.find((c) => c.method === "PUT");
++    expect(JSON.parse(put?.body ?? "{}").insights).toEqual({
++      enabled: true,
++      weeks: 4,
++      scope: "own",
++      show: "cost",
++    });
++  });
++
++  it("the other controls keep the saved show", async () => {
++    mocks.admin.value = true;
++    const calls = serve();
++    mount(stateOf({ insights: { enabled: true, weeks: 2, scope: "all", show: "cost" } }));
++    fireEvent.click(screen.getByRole("button", { name: "Own" }));
++    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
++    const put = calls.find((c) => c.method === "PUT");
++    expect(JSON.parse(put?.body ?? "{}").insights.show).toBe("cost");
++  });
++});
++
++describe("on", () => {
++  it("lists how often, the reviewer, the scope, the dates and the open count", async () => {
++    serve();
++    mount(stateOf({ insights: ON }));
++    expect(screen.getByText("Every 2 weeks")).toBeInTheDocument();
++    expect(
++      await screen.findByText(
++        /Default planner \(Balanced: Opus 5\.5 high\), capped at \$2 per run/,
++      ),
++    ).toBeInTheDocument();
++    expect(await screen.findByText(/Last review Oct\s\d+, next Nov\s\d+/)).toBeInTheDocument();
++    expect(screen.getByText("1 suggestion waiting")).toBeInTheDocument();
++    expect(screen.getByText("Starters and your own presets.")).toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Own" })).toBeNull();
++  });
++
++  it("an admin picks the scope and it saves", async () => {
++    mocks.admin.value = true;
++    const calls = serve();
++    mount(stateOf({ insights: ON }));
++    fireEvent.click(screen.getByRole("button", { name: "Own" }));
++    await waitFor(() => expect(calls.some((c) => c.method === "PUT")).toBe(true));
++    const put = calls.find((c) => c.method === "PUT");
++    expect(JSON.parse(put?.body ?? "{}").insights.scope).toBe("own");
++  });
++
++  it("Run now posts to the run route and says so", async () => {
++    const calls = serve();
++    mount(stateOf({ insights: ON }));
++    fireEvent.click(screen.getByRole("button", { name: "Run now" }));
++    await waitFor(() =>
++      expect(calls.some((c) => c.method === "POST" && c.url === "/v1/ae/preset-review/run")).toBe(
++        true,
++      ),
++    );
++    await waitFor(() => expect(mocks.showToast).toHaveBeenCalled());
++  });
++
++  it("Run now shows the server's message on a 409", async () => {
++    serve({
++      post: {
++        "/v1/ae/preset-review/run": json(
++          { error: { code: "review_running", message: "A review is already running." } },
++          409,
++        ),
++      },
++    });
++    mount(stateOf({ insights: ON }));
++    fireEvent.click(screen.getByRole("button", { name: "Run now" }));
++    await waitFor(() =>
++      expect(mocks.showToast).toHaveBeenCalledWith("A review is already running."),
++    );
++  });
++});
++
++describe("suggestions", () => {
++  it("Apply and Dismiss show on an open one, and Apply posts", async () => {
++    const calls = serve();
++    mount(stateOf({ insights: ON }));
++    const row = await screen.findByTestId("ae-preset-suggestion-sg_1");
++    expect(row).toHaveTextContent("Deep debug: Builder Opus high to Sonnet high");
++    expect(row).toHaveTextContent("Expected saving: about $5 per run");
++    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
++    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
++    await waitFor(() =>
++      expect(calls.some((c) => c.url === "/v1/ae/preset-suggestions/sg_1/apply")).toBe(true),
++    );
++  });
++
++  it("shows what Apply will change above the buttons", async () => {
++    serve({
++      suggestions: [
++        suggestion({ changes_text: "Builder: claude-opus-5-5 high to claude-sonnet-5-5 medium" }),
++      ],
++    });
++    mount(stateOf({ insights: ON }));
++    const changes = await screen.findByTestId("ae-preset-changes-sg_1");
++    expect(changes).toHaveTextContent(
++      "Builder: claude-opus-5-5 high to claude-sonnet-5-5 medium",
++    );
++  });
++
++  it("an undone one offers Apply and Dismiss", async () => {
++    serve({ suggestions: [suggestion({ status: "undone" })] });
++    mount(stateOf({ insights: ON }));
++    await screen.findByTestId("ae-preset-suggestion-sg_1");
++    expect(screen.getByRole("button", { name: "Apply" })).toBeInTheDocument();
++    expect(screen.getByRole("button", { name: "Dismiss" })).toBeInTheDocument();
++  });
++
++  it("after Run now it polls every 15 s until a newer review shows up", async () => {
++    vi.useFakeTimers({ shouldAdvanceTime: true });
++    try {
++      let fresh = false;
++      const calls = serve({
++        status: () => (fresh ? { ...STATUS, last_review: "2999-01-01T00:00:00Z" } : STATUS),
++      });
++      mount(stateOf({ insights: ON }));
++      await screen.findByTestId("ae-preset-suggestion-sg_1");
++      fireEvent.click(screen.getByRole("button", { name: "Run now" }));
++      await waitFor(() => expect(mocks.showToast).toHaveBeenCalled());
++      const reads = () =>
++        calls.filter((c) => c.method === "GET" && c.url === "/v1/ae/preset-review").length;
++      const before = reads();
++      await vi.advanceTimersByTimeAsync(15_500);
++      await waitFor(() => expect(reads()).toBeGreaterThan(before));
++      fresh = true;
++      await vi.advanceTimersByTimeAsync(15_500);
++      await waitFor(() => expect(reads()).toBeGreaterThan(before + 1));
++      const settled = reads();
++      await vi.advanceTimersByTimeAsync(60_000);
++      expect(reads()).toBe(settled);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
++  it("an applied one offers Undo only", async () => {
++    serve({ suggestions: [suggestion({ status: "applied", can_apply: false, can_undo: true })] });
++    mount(stateOf({ insights: ON }));
++    const row = await screen.findByTestId("ae-preset-suggestion-sg_1");
++    expect(row).toHaveTextContent("(applied)");
++    expect(screen.getByRole("button", { name: "Undo" })).toBeInTheDocument();
++    expect(screen.queryByRole("button", { name: "Apply" })).toBeNull();
++    expect(screen.queryByRole("button", { name: "Dismiss" })).toBeNull();
++  });
++
++  it("the 409 message shows on the row and the buttons stay", async () => {
++    const message =
++      "This preset changed since the review on Oct 20. Dismiss it or edit the preset yourself.";
++    serve({
++      post: {
++        "/v1/ae/preset-suggestions/sg_1/apply": json(
++          { error: { code: "preset_changed", message } },
++          409,
++        ),
++      },
++    });
++    mount(stateOf({ insights: ON }));
++    await screen.findByTestId("ae-preset-suggestion-sg_1");
++    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
++    expect(await screen.findByRole("alert")).toHaveTextContent(message);
++    expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled();
++  });
++});
++
++describe("the roles cache after Apply", () => {
++  function mountWithClient(state: AeRolesState) {
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    const invalidate = vi.spyOn(client, "invalidateQueries");
++    render(
++      <QueryClientProvider client={client}>
++        <AePresetInsightsBlock state={state} />
++      </QueryClientProvider>,
++    );
++    const rolesRead = () =>
++      invalidate.mock.calls.some(
++        ([filters]) => JSON.stringify(filters?.queryKey) === JSON.stringify(["ae", "roles"]),
++      );
++    return { rolesRead };
++  }
++
++  it("a refused Apply reads the roles again", async () => {
++    serve({
++      post: {
++        "/v1/ae/preset-suggestions/sg_1/apply": json(
++          { error: { code: "preset_changed", message: "The preset changed." } },
++          409,
++        ),
++      },
++    });
++    const { rolesRead } = mountWithClient(stateOf({ insights: ON }));
++    await screen.findByTestId("ae-preset-suggestion-sg_1");
++    expect(rolesRead()).toBe(false);
++    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
++    await screen.findByRole("alert");
++    expect(rolesRead()).toBe(true);
++  });
++
++  it("a successful Apply whose answer has no roles reads them again", async () => {
++    serve({ post: { "/v1/ae/preset-suggestions/sg_1/apply": json({ ok: true }) } });
++    const { rolesRead } = mountWithClient(stateOf({ insights: ON }));
++    await screen.findByTestId("ae-preset-suggestion-sg_1");
++    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
++    await waitFor(() => expect(rolesRead()).toBe(true));
++  });
++
++  it("a successful Apply that carries the roles does not", async () => {
++    serve({
++      post: {
++        "/v1/ae/preset-suggestions/sg_1/apply": json({ ok: true, roles: stateOf({ insights: ON }) }),
++      },
++    });
++    const { rolesRead } = mountWithClient(stateOf({ insights: ON }));
++    await screen.findByTestId("ae-preset-suggestion-sg_1");
++    fireEvent.click(screen.getByRole("button", { name: "Apply" }));
++    await waitFor(() => expect(screen.getByRole("button", { name: "Apply" })).toBeEnabled());
++    expect(rolesRead()).toBe(false);
++  });
++});
+diff --git a/web/src/pages/settings/AePresetInsightsBlock.tsx b/web/src/pages/settings/AePresetInsightsBlock.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..489bba6be34f4107c784e9c4cdf88ecfa5e1c2b8
+--- /dev/null
++++ b/web/src/pages/settings/AePresetInsightsBlock.tsx
+@@ -0,0 +1,369 @@
++// Settings > Roles > Preset insights (omnigent-ae, 2026-10-24, preset insights
++// PR 3). One switch starts the detailed run log and the scheduled preset review
++// (the server creates the task on save and deletes it when the switch goes off).
++// Below it: who reviews, how often, which presets, when the last and next review
++// are, a Run now button, and the user's own suggestions with Apply, Undo and
++// Dismiss. Starter-preset suggestions show in Admin Center, not here.
++
++import { useQueryClient } from "@tanstack/react-query";
++import { useEffect, useState } from "react";
++import { Button } from "@/components/ui/button";
++import { Switch } from "@/components/ui/switch";
++import { showToast } from "@/components/ui/toast";
++import { useIsAdmin } from "@/hooks/useIsAdmin";
++import {
++  AE_PRESET_REVIEW_QUERY_KEY,
++  AE_PRESET_SUGGESTIONS_QUERY_KEY,
++  type AePresetSuggestion,
++  useAePresetReviewActions,
++  useAePresetReviewStatus,
++  useAePresetSuggestions,
++} from "@/hooks/useAePresetReview";
++import { useAeRolesSave } from "@/hooks/useAeRoles";
++import {
++  type AeInsights,
++  type AeInsightsShow,
++  type AeRolesState,
++  aeModelLabel,
++  aeWithInsights,
++} from "@/lib/aeRoles";
++
++const CONFLICT = "Your roles changed on another device, so the saved presets were reloaded.";
++const DEFAULT_WEEKS = 2;
++const COST_CAP = "$2";
++const POLL_MS = 15_000;
++const POLL_MAX_MS = 10 * 60_000;
++
++/** "Oct 20", in the viewer's zone; empty for a missing or unreadable time. */
++export function aeInsightsDay(iso: string | null | undefined): string {
++  const when = iso ? new Date(iso) : null;
++  if (!when || Number.isNaN(when.getTime())) return "";
++  return when.toLocaleDateString([], { month: "short", day: "numeric" });
++}
++
++const LIVE = new Set(["open", "applying", "applied", "undoing", "undone"]);
++
++/** The suggestions this block lists: the user's own that are live (open, applied, undone or mid-change). */
++export function aeOwnSuggestions(all: AePresetSuggestion[] | undefined): AePresetSuggestion[] {
++  return (all ?? []).filter((s) => s.kind === "own" && LIVE.has(s.status));
++}
++
++function Row({
++  title,
++  hint,
++  children,
++}: {
++  title: string;
++  hint?: React.ReactNode;
++  children?: React.ReactNode;
++}) {
++  return (
++    <div className="flex flex-col gap-2 border-t border-border px-4 py-3 first:border-t-0 sm:flex-row sm:items-start sm:justify-between sm:gap-4">
++      <div className="min-w-0 break-words">
++        <div className="text-sm font-medium">{title}</div>
++        {hint ? <div className="text-xs text-muted-foreground">{hint}</div> : null}
++      </div>
++      {children ? (
++        <div className="flex shrink-0 flex-wrap items-center gap-2">{children}</div>
++      ) : null}
++    </div>
++  );
++}
++
++function SuggestionRow({
++  suggestion,
++  busy,
++  failure,
++  onAct,
++}: {
++  suggestion: AePresetSuggestion;
++  busy: boolean;
++  failure: string | undefined;
++  onAct: (action: "apply" | "undo" | "dismiss") => void;
++}) {
++  const applied = suggestion.status === "applied";
++  const facts = [suggestion.why, suggestion.saving ? `Expected saving: ${suggestion.saving}` : ""]
++    .filter(Boolean)
++    .join(" ");
++  return (
++    <div
++      data-testid={`ae-preset-suggestion-${suggestion.id}`}
++      className="flex flex-col gap-2 border-t border-border px-4 py-3"
++    >
++      <div className="min-w-0 break-words">
++        <div className="text-sm font-medium">
++          {suggestion.preset_title ? `${suggestion.preset_title}: ` : ""}
++          {suggestion.title}
++          {applied ? " (applied)" : suggestion.status === "undone" ? " (undone)" : ""}
++        </div>
++        <div className="text-xs text-muted-foreground">{facts}</div>
++        {suggestion.changes_text ? (
++          <div
++            data-testid={`ae-preset-changes-${suggestion.id}`}
++            className="mt-1 text-xs font-medium"
++          >
++            {suggestion.changes_text.split("\n").map((line) => (
++              <div key={line}>{line}</div>
++            ))}
++          </div>
++        ) : null}
++        {failure ? (
++          <div role="alert" className="mt-1 text-xs text-destructive">
++            {failure}
++          </div>
++        ) : null}
++      </div>
++      <div className="flex flex-wrap gap-2">
++        {suggestion.can_apply && (
++          <Button size="sm" disabled={busy} onClick={() => onAct("apply")}>
++            Apply
++          </Button>
++        )}
++        {suggestion.can_undo && (
++          <Button size="sm" variant="outline" disabled={busy} onClick={() => onAct("undo")}>
++            Undo
++          </Button>
++        )}
++        {(suggestion.status === "open" || suggestion.status === "undone") && (
++          <Button size="sm" variant="outline" disabled={busy} onClick={() => onAct("dismiss")}>
++            Dismiss
++          </Button>
++        )}
++      </div>
++    </div>
++  );
++}
++
++const SHOW_OPTIONS: [AeInsightsShow, string][] = [
++  ["cost", "Cost"],
++  ["tokens", "Tokens"],
++  ["both", "Both"],
++];
++
++export function AePresetInsightsBlock({ state }: { state: AeRolesState }) {
++  const save = useAeRolesSave();
++  const isAdmin = useIsAdmin();
++  const insights = state.insights;
++  const enabled = insights?.enabled ?? false;
++  const status = useAePresetReviewStatus(enabled);
++  const suggestionsQuery = useAePresetSuggestions(enabled);
++  const actions = useAePresetReviewActions();
++  const [saving, setSaving] = useState(false);
++  const [taskError, setTaskError] = useState<string | null>(null);
++  const [running, setRunning] = useState(false);
++  const [watchFrom, setWatchFrom] = useState<number | null>(null);
++  const queryClient = useQueryClient();
++  const [busyIds, setBusyIds] = useState<Set<string>>(new Set());
++  const [failures, setFailures] = useState<Record<string, string>>({});
++
++  const change = async (next: AeInsights, message: string) => {
++    if (saving) return;
++    setSaving(true);
++    try {
++      const result = await save(aeWithInsights(state, next));
++      if (!result.ok) {
++        showToast(CONFLICT);
++        return;
++      }
++      setTaskError(
++        result.insightsTask?.ok === false
++          ? (result.insightsTask.error ?? "The scheduled review could not be set up.")
++          : null,
++      );
++      showToast(message);
++    } catch (error) {
++      showToast(`Could not save: ${error instanceof Error ? error.message : String(error)}`);
++    } finally {
++      setSaving(false);
++    }
++  };
++  const shown: AeInsightsShow = insights?.show ?? "both";
++  const current = (): AeInsights => ({
++    enabled,
++    weeks: insights?.weeks ?? DEFAULT_WEEKS,
++    scope: insights?.scope ?? "all",
++    ...(insights?.show ? { show: insights.show } : {}),
++  });
++
++  const runNow = async () => {
++    setRunning(true);
++    const result = await actions.run();
++    setRunning(false);
++    if (result.ok) setWatchFrom(Date.now());
++    showToast(
++      result.ok ? "The review started. Its suggestions show here when it ends." : result.message,
++    );
++  };
++  const act = async (id: string, action: "apply" | "undo" | "dismiss") => {
++    setBusyIds((ids) => new Set(ids).add(id));
++    setFailures((f) => {
++      const { [id]: _gone, ...rest } = f;
++      return rest;
++    });
++    const result = await actions[action](id);
++    setBusyIds((ids) => {
++      const rest = new Set(ids);
++      rest.delete(id);
++      return rest;
++    });
++    if (!result.ok) setFailures((f) => ({ ...f, [id]: result.message }));
++  };
++
++  const info = status.data;
++  const lastReviewAt = info?.last_review ? Date.parse(info.last_review) : Number.NaN;
++  // After Run now: read the status and suggestions every 15 s for up to 10 minutes, and stop once
++  // a review newer than the click shows up.
++  useEffect(() => {
++    if (watchFrom === null) return;
++    if (!Number.isNaN(lastReviewAt) && lastReviewAt > watchFrom) {
++      setWatchFrom(null);
++      return;
++    }
++    const timer = setInterval(() => {
++      if (Date.now() - watchFrom > POLL_MAX_MS) {
++        setWatchFrom(null);
++        return;
++      }
++      void queryClient.invalidateQueries({ queryKey: AE_PRESET_REVIEW_QUERY_KEY });
++      void queryClient.invalidateQueries({ queryKey: AE_PRESET_SUGGESTIONS_QUERY_KEY });
++    }, POLL_MS);
++    return () => clearInterval(timer);
++  }, [watchFrom, lastReviewAt, queryClient]);
++  const mine = aeOwnSuggestions(suggestionsQuery.data);
++  const open = mine.filter((s) => s.status === "open").length;
++  const reviewer = info?.reviewer;
++  const reviewerText = reviewer
++    ? `Default planner (${reviewer.preset_title ?? "your default"}: ${aeModelLabel(reviewer.model)} ${reviewer.effort}), capped at ${COST_CAP} per run`
++    : `Default planner, capped at ${COST_CAP} per run`;
++  const last = aeInsightsDay(info?.last_review);
++  const next = aeInsightsDay(info?.next_review);
++  const when = last
++    ? `Last review ${last}${next ? `, next ${next}` : ""}`
++    : next
++      ? `No review yet, next ${next}`
++      : "No review yet";
++
++  return (
++    <div
++      data-testid="ae-preset-insights"
++      className="overflow-hidden rounded-xl border border-border"
++    >
++      <div className="border-b border-border px-4 py-2 text-sm font-medium">Preset insights</div>
++      <Row
++        title="Collect run logs and review presets"
++        hint={
++          enabled
++            ? "Records each run's preset, roles, models, time, cost, raises, step-downs, hangs and review results. Stored on the server only."
++            : "Off. The Admin Center card still shows runs, cost and model changes from what is always recorded; the takeaways and the reviewer need this on."
++        }
++      >
++        <Switch
++          aria-label="Collect run logs and review presets"
++          checked={enabled}
++          disabled={saving}
++          onCheckedChange={(on) =>
++            void change(
++              { ...current(), enabled: on },
++              on ? "Preset insights are on." : "Preset insights are off. The log is kept.",
++            )
++          }
++        />
++      </Row>
++      <Row
++        title="Presets card shows"
++        hint="Cost is an estimate at API rates. Tokens are what a subscription actually uses up."
++      >
++        <div role="group" aria-label="Presets card shows" className="flex gap-1">
++          {SHOW_OPTIONS.map(([value, label]) => (
++            <Button
++              key={value}
++              size="sm"
++              variant={shown === value ? "secondary" : "outline"}
++              aria-pressed={shown === value}
++              disabled={saving}
++              onClick={() =>
++                shown !== value &&
++                void change(
++                  { ...current(), show: value },
++                  `The Presets card shows ${label.toLowerCase()}.`,
++                )
++              }
++            >
++              {label}
++            </Button>
++          ))}
++        </div>
++      </Row>
++      {taskError && (
++        <div
++          role="alert"
++          className="border-t border-border px-4 py-2 text-xs text-destructive break-words"
++        >
++          The scheduled review could not be set up: {taskError}
++        </div>
++      )}
++      {enabled && (
++        <>
++          <Row title="How often" hint="The reviewer reads every log line since its last run.">
++            <span className="text-sm">Every 2 weeks</span>
++          </Row>
++          <Row title="Reviewer" hint={reviewerText} />
++          <Row
++            title="Presets it reviews"
++            hint={
++              isAdmin
++                ? "Starters, your own presets, and every user's custom presets."
++                : "Starters and your own presets."
++            }
++          >
++            {isAdmin ? (
++              <div role="group" aria-label="Presets it reviews" className="flex gap-1">
++                {(["all", "own"] as const).map((scope) => (
++                  <Button
++                    key={scope}
++                    size="sm"
++                    variant={(insights?.scope ?? "all") === scope ? "secondary" : "outline"}
++                    aria-pressed={(insights?.scope ?? "all") === scope}
++                    disabled={saving}
++                    onClick={() =>
++                      (insights?.scope ?? "all") !== scope &&
++                      void change(
++                        { ...current(), scope },
++                        scope === "all"
++                          ? "The review covers all users' presets."
++                          : "The review covers your presets only.",
++                      )
++                    }
++                  >
++                    {scope === "all" ? "All" : "Own"}
++                  </Button>
++                ))}
++              </div>
++            ) : null}
++          </Row>
++          <Row
++            title={when}
++            hint={
++              mine.length || info
++                ? `${open} ${open === 1 ? "suggestion" : "suggestions"} waiting`
++                : undefined
++            }
++          >
++            <Button size="sm" variant="outline" disabled={running} onClick={() => void runNow()}>
++              Run now
++            </Button>
++          </Row>
++          {mine.map((s) => (
++            <SuggestionRow
++              key={s.id}
++              suggestion={s}
++              busy={busyIds.has(s.id)}
++              failure={failures[s.id]}
++              onAct={(action) => void act(s.id, action)}
++            />
++          ))}
++        </>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/pages/settings/AeRolesSettingsSection.test.tsx b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+index 2aa2bc6ec4e63dc60038d9493937ae26e0c12698..3b777aa6e32242b0d6aef2a7397c51648d72e72f 100644
+--- a/web/src/pages/settings/AeRolesSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+@@ -11,6 +11,7 @@ import type * as AeTablerIconModule from "@/lib/aeTablerIcon";
+ const mocks = vi.hoisted(() => ({ fetch: vi.fn(), showToast: vi.fn() }));
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
+ vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
++vi.mock("@/hooks/useIsAdmin", () => ({ useIsAdmin: () => false }));
+ vi.mock("@/hooks/useAeReviewerAgents", () => ({
+   useAeReviewerAgents: () => ({ options: [], host: null, loaded: false }),
+ }));
+diff --git a/web/src/pages/settings/AeRolesSettingsSection.tsx b/web/src/pages/settings/AeRolesSettingsSection.tsx
+index e2c33d8792e06e2873bda90468489fd9a10c898c..af70cf0883de0e6f22a751f3afbcd0f27316d68a 100644
+--- a/web/src/pages/settings/AeRolesSettingsSection.tsx
++++ b/web/src/pages/settings/AeRolesSettingsSection.tsx
+@@ -35,6 +35,7 @@ import {
+   aeSameRoles,
+   aeSetPinned,
+ } from "@/lib/aeRoles";
++import { AePresetInsightsBlock } from "./AePresetInsightsBlock";
+ import { type AeRoleDraft, AeRolesEditor } from "./AeRolesEditor";
+ import { type AePresetDetails, AeRolesPresetForm } from "./AeRolesPresetForm";
+ import { AeRolesCollapsedRow, AeRolesPresetList } from "./AeRolesPresetRow";
+@@ -314,6 +315,8 @@ export function AeRolesSettingsSection() {
+         </p>
+       )}
+ 
++      <AePresetInsightsBlock state={state} />
++
+       {form && (
+         <AeRolesPresetForm
+           mode={form}

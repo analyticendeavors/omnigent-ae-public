@@ -493,3 +493,78 @@ async def test_a_post_that_hangs_is_given_up_without_a_second_try(
     await harness.tick()
     assert calls == ["conv_a"]
     assert harness.watcher.records[f"{REPO}#196"].pending == {}
+
+
+class _FixedIdentity(merge_watch.OwnerIdentity):
+    async def headers(self, session_id: str) -> dict[str, str] | None:
+        return {"x-test": "owner"}
+
+
+def _fake_call(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    get: httpx.Response | Exception,
+    post: httpx.Response | None = None,
+) -> list[str]:
+    calls: list[str] = []
+
+    async def fake(app: Any, method: str, path: str, headers: Any, body: Any = None):
+        calls.append(method)
+        if method == "GET":
+            if isinstance(get, Exception):
+                raise get
+            return get
+        return post or httpx.Response(200)
+
+    monkeypatch.setattr(merge_watch, "_call", fake)
+    return calls
+
+
+async def _post() -> str:
+    return await merge_watch.post_live(None, _FixedIdentity(), "conv_a", "note")  # type: ignore[arg-type]
+
+
+async def test_a_gone_workspace_is_dropped_without_a_post(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gone = httpx.Response(200, json={"workspace": str(tmp_path / "deleted-worktree")})
+    calls = _fake_call(monkeypatch, get=gone)
+    assert await _post() == "drop"
+    assert calls == ["GET"]
+
+
+async def test_an_existing_workspace_still_posts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": str(tmp_path)}))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
+@pytest.mark.parametrize(
+    "get",
+    [
+        httpx.ConnectError("down"),
+        httpx.Response(500),
+        httpx.Response(200, json={}),
+        httpx.Response(200, json={"workspace": ""}),
+    ],
+)
+async def test_an_unknown_workspace_still_posts(
+    monkeypatch: pytest.MonkeyPatch, get: httpx.Response | Exception
+) -> None:
+    calls = _fake_call(monkeypatch, get=get)
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
+async def test_a_workspace_missing_refusal_is_dropped_not_retried(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    body = {"error": {"code": "WORKSPACE_MISSING", "message": "The workspace no longer exists"}}
+    _fake_call(
+        monkeypatch,
+        get=httpx.Response(200, json={"workspace": str(tmp_path)}),
+        post=httpx.Response(409, json=body),
+    )
+    assert await _post() == "drop"

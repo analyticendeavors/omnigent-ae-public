@@ -25,6 +25,7 @@ EXPECTED = {
     "steward": ("claude-sdk", ["list_parked", "omni_capacity"]),
     "shutdown": ("claude-sdk", ["omni_capacity", "omni_transcript"]),
     "reviewer-codex": ("codex", None),
+    "preset-reviewer": ("claude-sdk", ["preset_insights_read", "submit_preset_suggestions"]),
     "orchestrator": (
         "claude-sdk",
         [
@@ -36,6 +37,7 @@ EXPECTED = {
             "post_message",
             "schedule_checkin",
             "list_prs",
+            "set_session_model",
             "ask_reid",
         ],
     ),

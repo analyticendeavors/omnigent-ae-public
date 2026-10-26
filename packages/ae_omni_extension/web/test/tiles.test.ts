@@ -324,7 +324,7 @@ describe("the board", () => {
   const cards = () =>
     Object.fromEntries(
       (
-        ["deploys", "accounts", "compute", "credit", "azure", "box"] as CardId[]
+        ["deploys", "accounts", "compute", "credit", "azure", "box", "vault", "git", "presets"] as CardId[]
       ).map((id) => [
         id,
         adminCard(
@@ -355,20 +355,22 @@ describe("the board", () => {
     const all = cards();
     arrange(board, all, 3);
     expect(columns(board)).toEqual(LAYOUTS[3]);
-    // Box health sits under Deploys and Databricks credit under Azure spend (2026-10-22).
+    // Box health sits under Deploys and Databricks credit under Azure spend (2026-10-22);
+    // Key Vault under Box health (2026-10-23); Git repos last in a column (2026-10-24);
+    // Presets right after Deploys (2026-10-24).
     expect(columns(board)).toEqual([
-      ["deploys", "box"],
+      ["deploys", "presets", "box", "vault"],
       ["accounts", "compute"],
-      ["azure", "credit"],
+      ["azure", "credit", "git"],
     ]);
     arrange(board, all, 2);
     expect(columns(board)).toEqual([
-      ["deploys", "box", "compute"],
-      ["accounts", "azure", "credit"],
+      ["deploys", "presets", "box", "compute", "git"],
+      ["accounts", "azure", "credit", "vault"],
     ]);
     arrange(board, all, 1);
     expect(columns(board)).toEqual([
-      ["deploys", "accounts", "compute", "credit", "azure", "box"],
+      ["deploys", "presets", "accounts", "compute", "credit", "azure", "box", "vault", "git"],
     ]);
     arrange(board, all, 3);
     // Every card is open on a wide page, and its header is not a toggle.

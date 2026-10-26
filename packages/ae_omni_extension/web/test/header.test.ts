@@ -21,7 +21,11 @@ import {
 } from "../src/header";
 import type { Limits } from "../src/limits";
 
-function session(id: string, title: string, elapsed_s: number): CapacitySession {
+function session(
+  id: string,
+  title: string,
+  elapsed_s: number,
+): CapacitySession {
   return {
     id,
     title,
@@ -68,8 +72,20 @@ const LIMITS: Limits = {
       plan: null,
       note: null,
       windows: [
-        { id: "5h", label: "5h", used_percent: 0, resets_at: null, window_minutes: 300 },
-        { id: "wk", label: "week", used_percent: 100, resets_at: null, window_minutes: 10_080 },
+        {
+          id: "5h",
+          label: "5h",
+          used_percent: 0,
+          resets_at: null,
+          window_minutes: 300,
+        },
+        {
+          id: "wk",
+          label: "week",
+          used_percent: 100,
+          resets_at: null,
+          window_minutes: 10_080,
+        },
       ],
     },
     codex: {
@@ -78,7 +94,13 @@ const LIMITS: Limits = {
       plan: null,
       note: null,
       windows: [
-        { id: "wk", label: "week", used_percent: 74, resets_at: null, window_minutes: 10_080 },
+        {
+          id: "wk",
+          label: "week",
+          used_percent: 74,
+          resets_at: null,
+          window_minutes: 10_080,
+        },
       ],
     },
   },
@@ -149,7 +171,9 @@ describe("the flow view", () => {
   it("is the default and draws a block per working session, over the limit hatched", () => {
     const { context } = stubContext();
     draw(context);
-    expect(host.querySelector(".hd-title")?.textContent).toBe("Session Dashboard");
+    expect(host.querySelector(".hd-title")?.textContent).toBe(
+      "Session Dashboard",
+    );
     expect(host.querySelector(".hd-flow")).not.toBeNull();
     const blocks = [...host.querySelectorAll<HTMLElement>(".hd-slot")];
     expect(blocks.map((b) => b.querySelector("b")?.textContent)).toEqual([
@@ -158,20 +182,61 @@ describe("the flow view", () => {
       "MSFT Decision Model",
       "Session Rail",
     ]);
-    expect(blocks.map((b) => b.classList.contains("is-over"))).toEqual([false, false, false, true]);
-    expect(blocks.map((b) => b.classList.contains("is-old"))).toEqual([true, true, false, false]);
+    expect(blocks.map((b) => b.classList.contains("is-over"))).toEqual([
+      false,
+      false,
+      false,
+      true,
+    ]);
+    expect(blocks.map((b) => b.classList.contains("is-old"))).toEqual([
+      true,
+      true,
+      false,
+      false,
+    ]);
     expect(host.querySelector(".hd-flow h2 b")?.textContent).toBe("4 of 3");
-    expect(host.querySelector(".hd-flow h2 b")?.classList.contains("is-over")).toBe(true);
+    expect(
+      host.querySelector(".hd-flow h2 b")?.classList.contains("is-over"),
+    ).toBe(true);
     // Concept 3: no dot, a name under each slot.
     expect(host.querySelector(".hd-dot")).toBeNull();
-    expect([...host.querySelectorAll(".hd-cap span")].map((cap) => cap.textContent)).toEqual([
-      "slot 1",
-      "slot 2",
-      "slot 3",
-      "over",
-    ]);
+    expect(
+      [...host.querySelectorAll(".hd-cap span")].map((cap) => cap.textContent),
+    ).toEqual(["slot 1", "slot 2", "slot 3", "over"]);
     blocks[0].click();
     expect(context.navigation.openSession).toHaveBeenCalledWith("s1");
+  });
+
+  it("draws a session family as one slot, led by its lead, with the rest counted", () => {
+    const { context } = stubContext();
+    const lead = {
+      ...session("lead", "Role routing build", 3600),
+      family: "lead",
+    };
+    const kids = ["Families PR", "Roles PR"].map((title, i) => ({
+      ...session(`k${i}`, title, 600),
+      family: "lead",
+    }));
+    draw(
+      context,
+      data({
+        used: 2,
+        working: [kids[0], lead, kids[1], session("s9", "Solo", 60)],
+      }),
+    );
+    const blocks = [
+      ...host.querySelectorAll<HTMLElement>(".hd-slot:not(.is-free)"),
+    ];
+    expect(blocks.map((b) => b.querySelector("b")?.textContent)).toEqual([
+      "Role routing build",
+      "Solo",
+    ]);
+    expect(blocks[0].querySelector("span")?.textContent).toBe("1h +2");
+    expect(blocks[0].title).toContain("with 2 more in its family");
+    expect(host.querySelectorAll(".hd-slot.is-free")).toHaveLength(1);
+    expect(host.querySelectorAll(".hd-slot.is-over")).toHaveLength(0);
+    blocks[0].click();
+    expect(context.navigation.openSession).toHaveBeenCalledWith("lead");
   });
 
   it("shows free slots dashed when fewer sessions work than the limit", () => {
@@ -193,7 +258,9 @@ describe("the flow view", () => {
       `Lot16, next ${monthDay("2026-10-19")}`,
     ]);
     const pipClasses = (row: HTMLElement) =>
-      [...row.querySelectorAll(".hd-pip")].map((pip) => pip.className.replace("hd-pip", "").trim());
+      [...row.querySelectorAll(".hd-pip")].map((pip) =>
+        pip.className.replace("hd-pip", "").trim(),
+      );
     expect(pipClasses(rows[0])).toEqual([
       "is-pass",
       "is-pass",
@@ -210,7 +277,9 @@ describe("the flow view", () => {
     expect(pipClasses(rows[3])).toEqual(["is-soon", "", ""]);
     expect(rows[1].title).toBe("Newest tag ae-v0.16.0.35");
     for (const row of rows) {
-      expect(row.querySelector(".hd-pips")?.getAttribute("aria-hidden")).toBe("true");
+      expect(row.querySelector(".hd-pips")?.getAttribute("aria-hidden")).toBe(
+        "true",
+      );
     }
   });
 
@@ -218,18 +287,18 @@ describe("the flow view", () => {
     const { context } = stubContext();
     draw(context, data({ lot: { count: 4, next: null, soon: 1, overdue: 2 } }));
     const lot = [...host.querySelectorAll<HTMLElement>(".hd-pipe-row")][3];
-    expect([...lot.querySelectorAll(".hd-pip")].map((pip) => pip.className)).toEqual([
-      "hd-pip is-fail",
-      "hd-pip is-fail",
-      "hd-pip is-soon",
-    ]);
+    expect(
+      [...lot.querySelectorAll(".hd-pip")].map((pip) => pip.className),
+    ).toEqual(["hd-pip is-fail", "hd-pip is-fail", "hd-pip is-soon"]);
     expect(lot.textContent).toBe("Lot4, 2 overdue");
   });
 
   it("says a failing PR's count in red, and the brief names how many are waiting on CI", async () => {
     const { context } = stubContext();
     draw(context, data({ prs: [pr(1, { passing: 1, failing: 1, total: 2 })] }));
-    expect(host.querySelector(".hd-pipe-row")?.classList.contains("is-fail")).toBe(true);
+    expect(
+      host.querySelector(".hd-pipe-row")?.classList.contains("is-fail"),
+    ).toBe(true);
     const brief = stubContext("brief");
     await loadHeaderView(brief.context);
     const ready = {
@@ -238,8 +307,15 @@ describe("the flow view", () => {
       merge: { allowed: true },
       mergeable: { state: "clean" },
     } as unknown as PrCard;
-    draw(brief.context, data({ prs: [pr(2, { passing: 1, pending: 1, total: 2 }), ready, ready] }));
-    expect(host.querySelector(".hd-brief p")?.textContent).toContain("3 PRs: 1 waiting on CI.");
+    draw(
+      brief.context,
+      data({
+        prs: [pr(2, { passing: 1, pending: 1, total: 2 }), ready, ready],
+      }),
+    );
+    expect(host.querySelector(".hd-brief p")?.textContent).toContain(
+      "3 PRs: 1 waiting on CI.",
+    );
   });
 
   it("never prints a missing version", () => {
@@ -247,15 +323,29 @@ describe("the flow view", () => {
     draw(
       context,
       data({
-        release: { running: null, latest: null, state: "current", mid_turn: 0, error: null },
+        release: {
+          running: null,
+          latest: null,
+          state: "current",
+          mid_turn: 0,
+          error: null,
+        },
       }),
     );
-    expect(host.querySelectorAll(".hd-pipe-row")[1].textContent).toBe("Releasecurrent");
+    expect(host.querySelectorAll(".hd-pipe-row")[1].textContent).toBe(
+      "Releasecurrent",
+    );
   });
 
   it("caps Your move at eight pips and the lot's blue pips at three", () => {
     const { context } = stubContext();
-    draw(context, data({ yourMove: 11, lot: { count: 9, next: null, soon: 5, overdue: 0 } }));
+    draw(
+      context,
+      data({
+        yourMove: 11,
+        lot: { count: 9, next: null, soon: 5, overdue: 0 },
+      }),
+    );
     const rows = [...host.querySelectorAll<HTMLElement>(".hd-pipe-row")];
     expect(rows[2].querySelectorAll(".hd-pip.is-wait")).toHaveLength(8);
     expect(rows[2].querySelector(".hd-more")?.textContent).toBe("+3");
@@ -270,12 +360,18 @@ describe("the flow view", () => {
     draw(
       context,
       data({
-        release: { running: "x", latest: null, state: "unknown", mid_turn: 0, error: "timeout" },
+        release: {
+          running: "x",
+          latest: null,
+          state: "unknown",
+          mid_turn: 0,
+          error: "timeout",
+        },
       }),
     );
-    expect(host.querySelectorAll(".hd-pipe-row")[1].querySelectorAll(".is-unknown")).toHaveLength(
-      3,
-    );
+    expect(
+      host.querySelectorAll(".hd-pipe-row")[1].querySelectorAll(".is-unknown"),
+    ).toHaveLength(3);
     draw(
       context,
       data({
@@ -288,21 +384,32 @@ describe("the flow view", () => {
         },
       }),
     );
-    expect(host.querySelectorAll(".hd-pipe-row")[1].querySelectorAll(".is-pass")).toHaveLength(3);
+    expect(
+      host.querySelectorAll(".hd-pipe-row")[1].querySelectorAll(".is-pass"),
+    ).toHaveLength(3);
   });
 
   it("puts a usage bar per harness beside the title, its week window", () => {
     const { context } = stubContext();
     draw(context);
     const meters = [...host.querySelectorAll<HTMLElement>(".hd-top .hd-meter")];
-    expect(meters.map((meter) => meter.querySelector(".hd-meter-lbl")?.textContent)).toEqual([
-      "Claude week100%",
-      "Codex week74%",
+    expect(
+      meters.map((meter) => meter.querySelector(".hd-meter-lbl")?.textContent),
+    ).toEqual(["Claude week100%", "Codex week74%"]);
+    expect(meters[0].title).toMatch(
+      /^Claude, updated .+\n5h: 0% used\nweek: 100% used$/,
+    );
+    const fills = meters.map((meter) =>
+      meter.querySelector<HTMLElement>(".hd-fill")!,
+    );
+    expect(fills.map((fill) => fill.style.getPropertyValue("--pct"))).toEqual([
+      "100%",
+      "74%",
     ]);
-    expect(meters[0].title).toMatch(/^Claude, updated .+\n5h: 0% used\nweek: 100% used$/);
-    const fills = meters.map((meter) => meter.querySelector<HTMLElement>(".hd-fill")!);
-    expect(fills.map((fill) => fill.style.getPropertyValue("--pct"))).toEqual(["100%", "74%"]);
-    expect(fills.map((fill) => fill.className)).toEqual(["hd-fill is-err", "hd-fill is-warn"]);
+    expect(fills.map((fill) => fill.className)).toEqual([
+      "hd-fill is-err",
+      "hd-fill is-warn",
+    ]);
   });
 
   it("says current for the running release and hides rows that have no data", () => {
@@ -322,7 +429,9 @@ describe("the flow view", () => {
         },
       }),
     );
-    const text = [...host.querySelectorAll(".hd-pipe-row")].map((row) => row.textContent);
+    const text = [...host.querySelectorAll(".hd-pipe-row")].map(
+      (row) => row.textContent,
+    );
     expect(text).toEqual(["Releaseae-v1.0.0.1 current"]);
   });
 });
@@ -332,7 +441,9 @@ describe("the brief view", () => {
     const { context } = stubContext("brief");
     return loadHeaderView(context).then(() => {
       draw(context);
-      expect(host.querySelector(".hd-dot")?.classList.contains("is-over")).toBe(true);
+      expect(host.querySelector(".hd-dot")?.classList.contains("is-over")).toBe(
+        true,
+      );
       expect(host.querySelector(".hd-usage")).toBeNull();
       const sentence = host.querySelector(".hd-brief p")?.textContent ?? "";
       expect(sentence).toBe(
@@ -341,9 +452,9 @@ describe("the brief view", () => {
           `Next from the lot: shutdown-note-ritual, back ${dayLabel("2026-10-19")}.`,
       );
       // Concept 2's footer: usage, then the release, then the counts.
-      const foot = [...host.querySelectorAll(".hd-foot > span:not(.hd-sep)")].map(
-        (part) => part.textContent,
-      );
+      const foot = [
+        ...host.querySelectorAll(".hd-foot > span:not(.hd-sep)"),
+      ].map((part) => part.textContent);
       expect(foot).toEqual([
         "Claude 5h 0%",
         "Claude week 100%",
@@ -351,14 +462,17 @@ describe("the brief view", () => {
         "Release ae-v0.16.0.35 held: 2 sessions mid-reply",
         "16 parked, 1 needs a note, 1 reference",
       ]);
-      expect([...host.querySelectorAll(".hd-foot .hd-sep")].map((sep) => sep.textContent)).toEqual([
-        "/",
-        "/",
-        "|",
-        "|",
-      ]);
-      expect(host.querySelector(".hd-foot .hd-use.is-err")?.textContent).toBe("Claude week 100%");
-      const oldest = [...host.querySelectorAll<HTMLElement>(".hd-brief .hd-link")][0];
+      expect(
+        [...host.querySelectorAll(".hd-foot .hd-sep")].map(
+          (sep) => sep.textContent,
+        ),
+      ).toEqual(["/", "/", "|", "|"]);
+      expect(host.querySelector(".hd-foot .hd-use.is-err")?.textContent).toBe(
+        "Claude week 100%",
+      );
+      const oldest = [
+        ...host.querySelectorAll<HTMLElement>(".hd-brief .hd-link"),
+      ][0];
       oldest.click();
       expect(context.navigation.openSession).toHaveBeenCalledWith("s1");
     });
@@ -372,7 +486,10 @@ describe("the brief view", () => {
         data({
           used: 2,
           working: [session("s1", "A", OLD_S - 1), session("s2", "B", 60)],
-          prs: [pr(1, { failing: 1, total: 2, passing: 1 }), pr(2, { passing: 2, total: 2 })],
+          prs: [
+            pr(1, { failing: 1, total: 2, passing: 1 }),
+            pr(2, { passing: 2, total: 2 }),
+          ],
           yourMove: 2,
           lot: { count: 0, next: null, soon: 0, overdue: 0 },
         }),
@@ -388,7 +505,9 @@ describe("after review (2026-10-17)", () => {
   it("draws the title alone until the remembered view is read", () => {
     const { context } = stubContext();
     draw(context, data({ ready: false }));
-    expect(host.querySelector(".hd-title")?.textContent).toBe("Session Dashboard");
+    expect(host.querySelector(".hd-title")?.textContent).toBe(
+      "Session Dashboard",
+    );
     expect(host.querySelector(".hd-toggle")).toBeNull();
     expect(host.querySelector(".hd-flow, .hd-brief")).toBeNull();
   });
@@ -397,7 +516,9 @@ describe("after review (2026-10-17)", () => {
     const { context } = stubContext();
     draw(context, data({ folded: new Set(["your-move"]) }));
     const rows = [...host.querySelectorAll<HTMLElement>(".hd-pipe-row")];
-    const yourMove = rows.find((row) => row.textContent?.startsWith("Your move"))!;
+    const yourMove = rows.find((row) =>
+      row.textContent?.startsWith("Your move"),
+    )!;
     expect(yourMove.querySelector("button")).toBeNull();
     const lot = rows.find((row) => row.textContent?.startsWith("Lot"))!;
     expect(lot.querySelector("button.hd-link")).not.toBeNull();
@@ -428,7 +549,9 @@ describe("after review (2026-10-17)", () => {
         },
       }),
     );
-    expect(host.querySelector(".hd-brief p")?.textContent).toContain("1 PR needs a look.");
+    expect(host.querySelector(".hd-brief p")?.textContent).toContain(
+      "1 PR needs a look.",
+    );
     expect(host.querySelector(".hd-foot")?.textContent).toContain(
       "Release ae-v1.0.0.2 next, not installed yet",
     );
@@ -439,10 +562,18 @@ describe("after review (2026-10-17)", () => {
     draw(
       context,
       data({
-        release: { running: "x", latest: null, state: "unknown", mid_turn: 0, error: "no token" },
+        release: {
+          running: "x",
+          latest: null,
+          state: "unknown",
+          mid_turn: 0,
+          error: "no token",
+        },
       }),
     );
-    const text = [...host.querySelectorAll(".hd-pipe-row")].map((row) => row.textContent);
+    const text = [...host.querySelectorAll(".hd-pipe-row")].map(
+      (row) => row.textContent,
+    );
     expect(text).toContain("Releaseunknown: no token");
   });
 
@@ -450,7 +581,9 @@ describe("after review (2026-10-17)", () => {
     const { context } = stubContext();
     await loadHeaderView(context);
     draw(context);
-    host.querySelector<HTMLButtonElement>('.hd-toggle [data-view="brief"]')!.click();
+    host
+      .querySelector<HTMLButtonElement>('.hd-toggle [data-view="brief"]')!
+      .click();
     expect(document.activeElement?.getAttribute("data-view")).toBe("brief");
   });
 });
@@ -460,16 +593,20 @@ describe("the toggle", () => {
     const { context, set } = stubContext();
     await loadHeaderView(context);
     draw(context);
-    const brief = host.querySelector<HTMLButtonElement>('.hd-toggle [data-view="brief"]')!;
+    const brief = host.querySelector<HTMLButtonElement>(
+      '.hd-toggle [data-view="brief"]',
+    )!;
     expect(brief.getAttribute("aria-pressed")).toBe("false");
     brief.click();
     expect(headerView()).toBe("brief");
     expect(set).toHaveBeenCalledWith(HEADER_VIEW_KEY, "brief");
     expect(host.querySelector(".hd-brief")).not.toBeNull();
     expect(host.querySelector(".hd-flow")).toBeNull();
-    expect(host.querySelector('.hd-toggle [data-view="brief"]')?.getAttribute("aria-pressed")).toBe(
-      "true",
-    );
+    expect(
+      host
+        .querySelector('.hd-toggle [data-view="brief"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
   });
 
   it("ignores a saved value that is not a view", async () => {

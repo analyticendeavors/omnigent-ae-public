@@ -738,8 +738,10 @@ def _seed(path: Path, **fields: object) -> None:
         ("STARTING", True, None, False),
         ("RUNNING", False, None, False),
         ("RUNNING", True, 10, False),
+        ("RUNNING", True, 31, False),
+        ("RUNNING", True, 59, False),
         ("RUNNING", True, None, True),
-        ("RUNNING", True, 31, True),
+        ("RUNNING", True, 61, True),
     ],
 )
 async def test_get_reads_spend_only_off_a_running_warehouse_when_stale(
@@ -842,7 +844,16 @@ async def test_an_automatic_reading_rereads_the_state_uncached_first(
 
 @pytest.mark.parametrize(
     ("auto_stop", "reads"),
-    [(None, False), (0, False), (30, False), (45, False), (29, True), (5, True)],
+    [
+        (None, False),
+        (60, False),
+        (90, False),
+        (58, False),
+        (0, True),
+        (55, True),
+        (45, True),
+        (5, True),
+    ],
 )
 async def test_get_never_reads_on_a_warehouse_reads_could_hold_awake(
     client: httpx.AsyncClient,
@@ -859,6 +870,25 @@ async def test_get_never_reads_on_a_warehouse_reads_could_hold_awake(
         await client.get("/v1/ae/databricks")
         await _settle()
         assert statements.called is reads
+
+
+async def test_an_automatic_try_after_an_error_waits_fifteen_minutes_not_an_hour(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _configure(monkeypatch)
+    for minutes, reads in ((10, False), (16, True)):
+        databricks.reset()
+        attempted = datetime.now(UTC) - timedelta(minutes=minutes)
+        _seed(
+            tmp_path / "ae-databricks.json", status="error", attemptedAt=databricks.iso(attempted)
+        )
+        with respx.mock(assert_all_called=False) as mock:
+            _mock(mock, _warehouse("RUNNING"))
+            mock.get(f"{LIST_URL}/{WID}").respond(200, json=_warehouse("RUNNING"))
+            statements = mock.post(STATEMENTS_URL).respond(200, json=_succeeded())
+            await client.get("/v1/ae/databricks")
+            await _settle()
+            assert statements.called is reads
 
 
 def test_a_reading_prefers_a_running_then_a_starting_serverless_warehouse() -> None:

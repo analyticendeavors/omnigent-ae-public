@@ -139,7 +139,7 @@ async def test_fourth_prompt_is_denied_in_block_mode(
     body = await _evaluate(client, fourth, bare=True)
     assert body["result"] == "POLICY_ACTION_DENY"
     reason = body["reason"]
-    assert reason.startswith("Slots full: 3 of 3 working. ")
+    assert reason.startswith("Slots full: 3 of 3 taken; this one would make 4 of 3. ")
     for title in TITLES:
         assert title in reason
     assert "1. Fix pricing padding (next: verify light mode)" in reason

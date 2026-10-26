@@ -15,6 +15,7 @@ import {
   money,
   paceDelta,
   POLL_MS,
+  rateLimitText,
   READING_POLL_MS,
 } from "../src/azure";
 import { getTile, resetTiles } from "../src/tiles";
@@ -75,14 +76,36 @@ const failed = (code: number, message: string): Reply => ({
 
 type Call = { method: string; path: string };
 
+const emptyTargets = {
+  max: 50,
+  rules: [],
+  scopes: { subscriptions: [], services: [], resources: [], capacities: [] },
+  alerts: {
+    on: true,
+    offReason: null,
+    list: "AE Work",
+    time: "09:00",
+    tz: "America/Los_Angeles",
+    open: 0,
+    lastRun: null,
+    lastError: null,
+  },
+};
+
 function stubContext(replies: Reply[], openExternal = vi.fn(async () => undefined)) {
   const request = vi.fn(async ({ method, path }: Call) => {
     if (`${method} ${path}` !== GET) return failed(500, `unexpected ${method} ${path}`);
     return replies.shift() ?? failed(500, "no reply queued");
   });
+  // The Targets panel reads its own route (azureTargets.test.ts covers it); here it answers
+  // empty and is not counted, so these tests stay about the card's own reads.
+  const server = {
+    request: (call: Call) =>
+      call.path.startsWith("/v1/ae/azure-cost/targets") ? Promise.resolve(ok(emptyTargets)) : request(call),
+  };
   const context = {
     view: "fabric",
-    server: { request },
+    server,
     navigation: { openExternal },
   } as unknown as ExtensionContext;
   return { context, request, openExternal };
@@ -144,7 +167,36 @@ describe("the words", () => {
   });
 });
 
+describe("the rate-limit sentence", () => {
+  it("names the next try while it is ahead", () => {
+    const retryAt = new Date(NOW + 60_000).toISOString();
+    expect(rateLimitText({ retryAt, goodAt: null }, NOW)).toMatch(
+      /^Cost Management is rate limiting\. Next try .*\.$/,
+    );
+  });
+
+  it("falls back to the age of the last good reading when no next try is ahead", () => {
+    const goodAt = new Date(NOW - 3 * 3_600_000).toISOString();
+    expect(rateLimitText({ retryAt: null, goodAt }, NOW)).toBe(
+      "Cost Management is rate limiting. These numbers are from the last good reading, 3 h ago.",
+    );
+    const past = new Date(NOW - 1000).toISOString();
+    expect(rateLimitText({ retryAt: past, goodAt }, NOW)).toContain("3 h ago");
+    expect(rateLimitText({ retryAt: null, goodAt: null }, NOW)).toBe(
+      "Cost Management is rate limiting. There is no reading yet.",
+    );
+  });
+});
+
 describe("the tile", () => {
+  it("goes amber and says so while Cost Management is rate limiting", () => {
+    const limit = { retryAt: null, goodAt: null };
+    const tile = azureTile(view(), true, false, null, limit);
+    expect(tile.health).toBe("attention");
+    expect(tile.note).toBe("rate limited");
+    expect(azureTile(view(), true, false, null).health).toBe("ok");
+  });
+
   it("is idle and says so when the card is not set up", () => {
     expect(azureTile(null, false, false, null)).toMatchObject({
       health: "idle",
@@ -277,6 +329,71 @@ describe("the card", () => {
     await vi.advanceTimersByTimeAsync(READING_POLL_MS);
     expect(request).toHaveBeenCalledTimes(2);
     expect(node.querySelector(".azure-big")?.textContent).toContain("$412");
+  });
+
+  it("says a rate limit once under the month total, not under each subscription", async () => {
+    const limit = {
+      retryAt: new Date(NOW + 10 * 60_000).toISOString(),
+      goodAt: new Date(NOW - 2 * 3_600_000).toISOString(),
+    };
+    const { context } = stubContext([ok(answer(view(), { rateLimit: limit }))]);
+    const node = await mount(context);
+    const notes = [...node.querySelectorAll(".azure-limit")];
+    expect(notes).toHaveLength(1);
+    expect(notes[0].textContent).toMatch(
+      /^Cost Management is rate limiting\. Next try \d{1,2}:\d{2}\s?[AP]M\.$/,
+    );
+    expect(notes[0].previousElementSibling?.classList.contains("azure-big")).toBe(true);
+    expect(node.querySelectorAll(".azure-sub-err")).toHaveLength(0);
+  });
+
+  it("marks the note as a status and says so when nothing was ever read", async () => {
+    const { context } = stubContext([
+      ok(answer(view(), { rateLimit: { retryAt: null, goodAt: null } })),
+    ]);
+    const node = await mount(context);
+    const note = node.querySelector(".azure-limit");
+    expect(note?.getAttribute("role")).toBe("status");
+    expect(note?.textContent).toBe("Cost Management is rate limiting. There is no reading yet.");
+  });
+
+  it("shows 'not read yet' for a subscription that was never read", async () => {
+    const sub = {
+      id: "b",
+      name: "Juniper Dev",
+      spent: 0,
+      currency: "USD",
+      counted: true,
+      read: false,
+      error: null,
+    };
+    const { context } = stubContext([ok(answer(view({ subscriptions: [sub] })))]);
+    const node = await mount(context);
+    expect(node.querySelector(".azure-sub .azure-amt")?.textContent).toBe("not read yet");
+  });
+
+  it("shows no rate-limit note when the server sends none", async () => {
+    const { context } = stubContext([ok(answer(view()))]);
+    const node = await mount(context);
+    expect(node.querySelector(".azure-limit")).toBeNull();
+  });
+
+  it("keeps another per-subscription error beside the one rate-limit note", async () => {
+    const sub = {
+      id: "b",
+      name: "Juniper Dev",
+      spent: 0,
+      currency: "USD",
+      counted: true,
+      error: "The service principal may not read this subscription's costs (403).",
+    };
+    const limit = { retryAt: null, goodAt: null };
+    const { context } = stubContext([
+      ok(answer(view({ subscriptions: [sub] }), { rateLimit: limit })),
+    ]);
+    const node = await mount(context);
+    expect(node.querySelectorAll(".azure-limit")).toHaveLength(1);
+    expect(node.querySelector(".azure-sub-err")?.textContent).toContain("403");
   });
 
   it("shows a subscription's error under its row", async () => {

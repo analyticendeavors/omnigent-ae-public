@@ -60,14 +60,18 @@
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import {
   AeRequestError,
+  type ComplianceReport,
   describeError,
+  fetchCompliance,
   type MergeMethod,
   type MergeResult,
+  markReadyPr,
   mergePr,
   type OpenPrs,
   type PrCard,
   type PrSessionRef,
   setStatus,
+  updateBranchPr,
   type YourMove,
 } from "./api";
 import { announce, body, button, el, empty, flash, notice, replaceChildren, section } from "./dom";
@@ -210,6 +214,9 @@ function startMethod(card: PrCard): MergeMethod {
 
 /** For tests: forget merged cards. */
 export function resetPrsState(): void {
+  detailsOpen.clear();
+  complianceHeld.clear();
+  complianceReading.clear();
   merged.clear();
   tombstones.clear();
   confirming.clear();
@@ -583,6 +590,177 @@ export function keepConfirm(
   }
 }
 
+/**
+ * Review details (2026-10-23), the receipt's opened view on the dashboard card:
+ * the size of the change, the description as text, and the AE compliance report
+ * with its verdict and whether it covers the current head. The report is read
+ * only when the section is opened, and a failed read says so with Retry. Open
+ * state survives the 20-second redraw by the card's URL.
+ */
+const detailsOpen = new Set<string>();
+/** The last compliance answer per card, so a redraw does not read it again. */
+const complianceHeld = new Map<string, ComplianceReport | null>();
+const complianceReading = new Set<string>();
+
+/** Open a card's Review details from outside, before its next draw. */
+export function markDetailsOpen(url: string): void {
+  detailsOpen.add(urlKey(url));
+}
+
+export function detailsRow(deps: Deps, card: PrCard): HTMLElement | null {
+  if (card.state !== "open") return null;
+  const key = urlKey(card.url);
+  const box = el("details", { class: "pr-details" }) as HTMLDetailsElement;
+  box.open = detailsOpen.has(key);
+  const content = el("div", { class: "pr-details-body" });
+  box.append(el("summary", {}, "Review details"), content);
+  const size = [
+    card.changed_files !== undefined ? `${card.changed_files} files` : null,
+    card.additions !== undefined ? `+${card.additions}` : null,
+    card.deletions !== undefined ? `-${card.deletions}` : null,
+  ].filter((part) => part !== null);
+  if (size.length > 0) content.appendChild(el("p", { class: "meta" }, size.join(" · ")));
+  content.appendChild(
+    card.body
+      ? el("pre", { class: "pr-description" }, card.body)
+      : el("p", { class: "meta" }, "No description."),
+  );
+  const report = el("div", { class: "pr-compliance" });
+  const show = (found: ComplianceReport | null) => {
+    if (!found) {
+      report.replaceChildren(el("p", { class: "meta" }, "No compliance review posted."));
+      return;
+    }
+    const covers =
+      found.revision === "current"
+        ? "covers the current head"
+        : found.revision === "stale"
+          ? "is for an older head"
+          : "head not stated";
+    report.replaceChildren(
+      el(
+        "p",
+        { class: `pr-verdict pr-verdict-${found.verdict}` },
+        `Compliance: ${found.verdict}, ${covers}`,
+      ),
+      el("pre", { class: "pr-description" }, found.body),
+    );
+  };
+  content.appendChild(report);
+  const load = async (fresh: boolean) => {
+    // One read per card at a time; the 20-second redraw reuses the last answer.
+    if (complianceReading.has(key)) return;
+    complianceReading.add(key);
+    report.replaceChildren(el("p", { class: "meta" }, "Reading the compliance review."));
+    try {
+      const { report: found } = await fetchCompliance(deps.context, card, fresh);
+      complianceHeld.set(key, found);
+      show(found);
+    } catch (error) {
+      report.replaceChildren(
+        el("p", { class: "pr-why" }, `Compliance review not read: ${describeError(error)}`),
+        button("Retry", { onClick: () => void load(true) }),
+      );
+    } finally {
+      complianceReading.delete(key);
+    }
+  };
+  const ensure = () => {
+    if (complianceHeld.has(key)) show(complianceHeld.get(key) ?? null);
+    else void load(false);
+  };
+  box.addEventListener("toggle", () => {
+    if (box.open) {
+      detailsOpen.add(key);
+      ensure();
+    } else detailsOpen.delete(key);
+  });
+  if (box.open) ensure();
+  return box;
+}
+
+/** The drawn card for *url*, after a redraw replaced the node a request started from. */
+function cardFor(url: string): HTMLElement | null {
+  return (
+    [...document.querySelectorAll<HTMLElement>("article[data-pr]")].find(
+      (node) => node.dataset.pr === url,
+    ) ?? null
+  );
+}
+
+/** The refusal's fresh card, when the server sent one. */
+function freshOf(error: unknown): PrCard | undefined {
+  return error instanceof AeRequestError
+    ? (error.body as { error?: { card?: PrCard } } | null)?.error?.card
+    : undefined;
+}
+
+/**
+ * Mark ready (a draft) and Update branch (behind its base), the dock's two
+ * pull request actions, on the dashboard's cards too (2026-10-23). Each posts
+ * the head the card showed; a refusal that carries a fresh card redraws the
+ * card from it. Empty for a merged, closed or already-ready card.
+ */
+export function stateButtons(
+  deps: Deps,
+  card: PrCard,
+  node: HTMLElement,
+  hooks: MergeHooks,
+): HTMLButtonElement[] {
+  if (card.state !== "open") return [];
+  const out: HTMLButtonElement[] = [];
+  const failWith = (error: unknown, label: string) => {
+    const fresh = freshOf(error);
+    // A redraw may have replaced the card while the request ran.
+    let target = node.isConnected ? node : (cardFor(card.url) ?? node);
+    if (fresh) {
+      const rebuilt = hooks.rebuild(fresh);
+      target.replaceWith(rebuilt);
+      target = rebuilt;
+    }
+    flash(target, `${label}: ${describeError(error)}`, "error");
+  };
+  if (card.draft) {
+    out.push(
+      button("Mark ready for review", {
+        title: "Open this draft for review; it does not merge",
+        onClick: async (pressed) => {
+          pressed.disabled = true;
+          try {
+            const fresh = await markReadyPr(deps.context, card);
+            announce(`${card.repo}#${card.number} is ready for review.`);
+            node.replaceWith(hooks.rebuild(fresh));
+          } catch (error) {
+            pressed.disabled = false;
+            failWith(error, "Not marked ready");
+          }
+        },
+      }),
+    );
+  }
+  if (card.update_branch?.allowed) {
+    out.push(
+      button("Update branch", {
+        title: "Merge the base into this branch at the head the card showed",
+        onClick: async (pressed) => {
+          pressed.disabled = true;
+          try {
+            await updateBranchPr(deps.context, card);
+          } catch (error) {
+            pressed.disabled = false;
+            failWith(error, "Branch not updated");
+            return;
+          }
+          // Accepted: the toast survives the redraw; a failed refresh is not a failed update.
+          announce(`Branch update for ${card.repo}#${card.number} is waiting for GitHub.`);
+          await deps.refresh(true).catch(() => undefined);
+        },
+      }),
+    );
+  }
+  return out;
+}
+
 /** One pull request's card; the Dashboard and its tests build it the same way. */
 export function prCard(deps: Deps, card: PrCard): HTMLElement {
   const live = mergingNode(card.url);
@@ -622,9 +800,12 @@ export function prCard(deps: Deps, card: PrCard): HTMLElement {
   // no Merge to offer.
   const open = card.state === "open";
   const actions = el("div", { class: "actions" });
+  if (open) actions.append(...stateButtons(deps, card, node, hooks));
   if (open) actions.appendChild(mergeButton(deps, card, node, actions, hooks));
   actions.append(...linkButtons(deps.context, card.url, node));
   node.appendChild(statusRow(statusLead(card), open ? mergeWhy(card) : null, actions));
+  const details = detailsRow(deps, card);
+  if (details) node.appendChild(details);
   keepConfirm(deps, card, node, actions, hooks);
   return node;
 }

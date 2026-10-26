@@ -54,7 +54,7 @@ UPSTREAM_ENTRYPOINT = os.environ.get("AE_UPSTREAM_ENTRYPOINT", "/app/entrypoint.
 # listed yet; AE_EXTRA_AGENTS=off leaves the line exactly as configured.
 BUILTIN_AGENTS_ENV = "OMNIGENT_BUILTIN_AGENT_DIRS"
 EXTRA_AGENTS_ENV = "AE_EXTRA_AGENTS"
-EXTRA_AGENT_DIRS = ("/opt/ae/agents/orchestrator",)
+EXTRA_AGENT_DIRS = ("/opt/ae/agents/orchestrator", "/opt/ae/agents/preset-reviewer")
 # Release features every build turns on even though config/server.env on the box
 # lists only the older ones (2026-10-19, sidebar grouping and manual order). That
 # file is Reid's unmanaged one and the auto-update rewrites only the image tag,

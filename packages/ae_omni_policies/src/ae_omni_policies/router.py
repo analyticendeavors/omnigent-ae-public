@@ -21,8 +21,19 @@ replaces stopping the auto-update timer by hand. The POSTs are JSON-only and
 origin-checked like the sidebar's ``PUT``. Resume is a POST, not a DELETE,
 because the page's extension SDK sends only GET, POST and PATCH.
 
+2026-10-24 (preset insights PR 3) added the preset review: ``PUT /roles`` now creates or deletes
+the scheduled review task (:mod:`preset_review`), the reviewer's
+``POST /sessions/{id}/preset-insights`` and ``.../preset-suggestions``,
+``GET /preset-suggestions`` with ``POST .../{id}/apply``, ``undo``, ``dismiss`` and ``issue``
+(:mod:`preset_suggestions`), and ``POST /preset-review/run`` with ``GET /preset-review``
+for Settings > Roles.
+2026-10-24 (Admin Center, Presets card) added ``GET /presets?days=7|30``
+(:mod:`ae_omni_policies.preset_stats`), admins only.
 2026-10-22 (Admin Center, Azure card) added ``GET /azure-cost``
 (:mod:`ae_omni_policies.azure_cost`).
+2026-10-25 added ``GET /azure-cost/targets``, ``PUT`` and ``DELETE
+/azure-cost/targets/{id}`` (:mod:`ae_omni_policies.cost_targets`): limits on spend and
+on a running Fabric capacity, with a task-store alarm when one is crossed.
 2026-10-19 (Admin Center, Databricks) added ``GET /databricks``,
 ``POST /databricks/warehouses/{id}/start`` and ``.../stop``, and
 ``POST /databricks/spend/refresh`` (:mod:`ae_omni_policies.databricks`): the
@@ -117,7 +128,9 @@ server's GitHub token, and reading, setting or ending the deploy hold
 the Fabric wake, suspend, keep-awake and scale actions, the Databricks start,
 stop and spend refresh, the host relink (it ends every live session) and the
 plan-limits snapshot post, which feeds the usage gate; the box's limits relay
-posts with the admin's stored login. ``/your-move`` lists only sessions the caller may open, and
+posts with the admin's stored login. Admin-only since 2026-10-23: ``/vault``, every
+secret name in both Key Vaults, and the secrets meta post it is built from.
+``/your-move`` lists only sessions the caller may open, and
 ``/limits?session_id=`` answers a session's account only to a caller who may
 open it. Who is an admin is decided by ``GET /v1/me`` asked as the caller
 (``shared_accounts_routes.admin_probe``), so signed in must never be treated
@@ -127,11 +140,16 @@ as admin.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import functools
 import hashlib
+import json
 import logging
 import os
+import re
 import time
-from datetime import UTC, datetime
+from collections.abc import AsyncIterator
+from datetime import UTC, datetime, timedelta
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
@@ -141,7 +159,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import ErrorCode
-from omnigent.runtime import get_conversation_store
+from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL, resolve_auth_header
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
@@ -149,26 +167,42 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
 
 from ae_omni_policies import (
     __version__,
+    auto_archive,
     azure_cost,
+    cost_targets,
     databricks,
     deploy_hold,
+    escalation,
     fabric,
+    git_center,
     github,
     host_relink,
     labels,
     limits,
     merge_watch,
+    model_log,
     pr_compliance,
     pr_deploy,
+    preset_log,
+    preset_review,
+    preset_runs,
+    preset_stats,
+    preset_suggestions,
     prs,
     release,
+    role_prefs,
+    secret_alerts,
+    secret_owners,
     secrets_health,
+    secrets_meta,
     sessions,
     shared_accounts,
     shared_accounts_routes,
     sidebar_prefs,
     slot_cap,
     slot_limit,
+    spawn_role,
+    vault_inventory,
     your_move,
 )
 from ae_omni_policies.auth import require_ae_user
@@ -455,6 +489,28 @@ async def _loopback(
         return await http.request(method, path, json=body, headers=headers)
 
 
+@contextlib.asynccontextmanager
+async def _loopback_client(request: Request) -> AsyncIterator[httpx.AsyncClient]:
+    """A client for this server's own API as the caller, same transport rules as :func:`_loopback`.
+
+    For code that makes several calls (the preset review's scheduled task): a task created
+    through it belongs to the caller.
+    """
+    headers = forwarded_headers(request)
+    self_url = (os.environ.get("AE_SELF_URL") or "").rstrip("/")
+    if self_url:
+        client = httpx.AsyncClient(base_url=self_url, timeout=_LOOPBACK_TIMEOUT_S, headers=headers)
+    else:
+        client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=request.app),
+            base_url="http://ae-loopback",
+            timeout=_LOOPBACK_TIMEOUT_S,
+            headers=headers,
+        )
+    async with client as http:
+        yield http
+
+
 async def _loopback_post(request: Request, path: str, body: dict[str, Any]) -> httpx.Response:
     """POST *body* to this server's own *path* as the caller (see :func:`_loopback`)."""
     return await _loopback(request, "POST", path, body)
@@ -523,8 +579,17 @@ async def schedule_defaults() -> dict[str, Any]:
 
 
 @router.get("/capacity")
-async def capacity() -> dict[str, Any]:
+async def capacity(
+    user: Annotated[str | None, Depends(require_ae_user)],
+    session: Annotated[str | None, Query()] = None,
+) -> dict[str, Any]:
     """Every top-level session bucketed by ``ae.status``, with elapsed time and NEXT.
+
+    ``limit``, ``helpers_count`` and the family cap come from one cap in one read of the
+    policy store (2026-10-26). Each working row carries ``helper``; ``own_helper`` says
+    whether the session named by ``?session=`` is one, loaded in the web cache or not;
+    it is ``None`` unless the caller owns that session, so it cannot probe another
+    user's sessions.
 
     ``working`` holds the slots (``ae.status=working``, not waiting on the human);
     ``blocked`` is derived: working but ``pending_elicitation_count > 0``, or
@@ -532,9 +597,14 @@ async def capacity() -> dict[str, Any]:
     holds a slot, 2026-09-25). ``unlabelled_running`` catches sessions the slot
     cap has not placed yet.
     """
-    rows, limit = await asyncio.gather(
-        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.effective_limit)
+    rows, rules = await asyncio.gather(
+        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.resolve)
     )
+    limit, helpers = rules.limit, rules.helpers_count
+    by_id = {row.id: row for row in rows}
+    own_helper = None
+    if session in by_id and await _may_write_session(user, session):
+        own_helper = sessions.is_helper(by_id[session], by_id)
     now = time.time()
     # The clock, in the zone resurface dates are reckoned in, so a scheduled
     # agent can say which lot items resurface today without guessing the date
@@ -544,6 +614,7 @@ async def capacity() -> dict[str, Any]:
     summaries = sorted(
         (sessions.summarize(row, now=now) for row in rows), key=lambda item: item.started
     )
+    keys = sessions.family_keys(rows)
     by_status: dict[str, list[dict[str, Any]]] = {
         "working": [],
         "blocked": [],
@@ -555,14 +626,22 @@ async def capacity() -> dict[str, Any]:
     for item in summaries:
         if item.status == labels.WORKING:
             held = not (item.blocked or item.failed)
-            by_status["working" if held else "blocked"].append(item.as_dict())
+            row = item.as_dict() | {
+                "family": keys.get(item.id, item.id),
+                "helper": sessions.is_helper(by_id[item.id], by_id),
+            }
+            by_status["working" if held else "blocked"].append(row)
         elif item.status in by_status:
             by_status[item.status].append(item.as_dict())
         elif item.status is None and item.live_status == "running":
             by_status["unlabelled_running"].append(item.as_dict())
     return {
         "limit": limit,
-        "slots_used": len(by_status["working"]),
+        "helpers_count": helpers,
+        "own_helper": own_helper,
+        # One slot per lead (2026-10-23): its helpers hold none, unless Settings counts
+        # them (2026-10-26); a helper whose lead is not working holds nothing when off.
+        "slots_used": sum(1 for row in by_status["working"] if helpers or not row["helper"]),
         "now": local_now.isoformat(timespec="seconds"),
         "today": local_now.date().isoformat(),
         "timezone": settings.tz,
@@ -768,6 +847,210 @@ async def secrets_view(_user: Annotated[str | None, Depends(require_ae_user)]) -
     return secrets_health.view().model_dump()
 
 
+@router.post(
+    "/secrets/meta",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def secrets_meta_post(
+    request: Request,
+    body: secrets_meta.MetaPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Keep the box's reading of the vault's secret attributes (names and dates, no values).
+
+    Admin only, like ``/limits``: the box's relay (``secrets_relay.py``) posts with the
+    admin's stored login. Every secret of every vault posted is kept (the Key Vault
+    card lists them all); a part the post marks ``failed`` keeps its previous reading.
+    ``kept`` counts the secrets held afterwards, across all vaults.
+
+    Then the expiry alerts run in the background (``secret_alerts.py``, 2026-10-23):
+    the relay's answer never waits on the task store, and a failure there is kept
+    in the alerts' state for the card, not returned here.
+    """
+    if (refused := await _admin_only(request, user, "record secret expiry dates")) is not None:
+        return refused
+    try:
+        kept = await asyncio.to_thread(secrets_meta.store().put, body)
+    except OSError as exc:
+        _logger.warning("secrets meta not saved: %s", exc)
+        return _error(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"could not save the vault reading ({exc}); check that /data is writable, "
+            "then rerun the relay.",
+        )
+    _start_alerts()
+    return {"kept": kept}
+
+
+# A task created with asyncio.create_task is only weakly held; keep it until done.
+_alert_runs: set[asyncio.Task[Any]] = set()
+
+
+def _start_alerts() -> None:
+    async def _go() -> None:
+        reading = await asyncio.to_thread(secrets_meta.store().read)
+        await secret_alerts.run(reading)
+
+    task = asyncio.create_task(_go())
+    _alert_runs.add(task)
+    task.add_done_callback(_alert_runs.discard)
+
+
+VAULT_ROWS_PAGE = 25
+"""Rows per ``/vault/rows`` page. The extension bridge refuses a body over 32,768
+characters (it counts two bytes per UTF-16 unit against 64 KiB). A row is about 400
+characters, and nearly 800 with an owner, an Entra rotate link and its hint, so 25
+leave room (``test_secret_alerts.py`` checks the worst case)."""
+
+
+async def _vault_inventory() -> vault_inventory.Inventory:
+    reading = await asyncio.to_thread(secrets_meta.store().read)
+    owners = secret_owners.store()
+    owner_map = await asyncio.to_thread(owners.read)
+    alert_state = await asyncio.to_thread(secret_alerts.store().read)
+    now = datetime.now(UTC)
+    inventory = vault_inventory.view(
+        reading, now, owners=owner_map, alerts=secret_alerts.infos(alert_state)
+    )
+    inventory.owners_editable = owners.writable
+    inventory.alerts = secret_alerts.summary(alert_state, secret_alerts.config(), now)
+    return inventory
+
+
+@router.get("/vault", response_model=None)
+async def vault_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    rows: bool = True,
+) -> dict[str, Any] | JSONResponse:
+    """Every secret in both Key Vaults by name, with counts and groups (``vault_inventory.py``).
+
+    Admin only, like the reading it is built from: the names say which services we use.
+    ``rows=false`` leaves each vault's ``secrets`` empty: the card reads them in pages
+    from ``/vault/rows``, because 116 rows (51,000 characters on 2026-10-24) passed the
+    extension bridge's 32,768-character cap and the card read "Server response
+    exceeds the limit".
+    """
+    if (refused := await _admin_only(request, user, "see the Key Vault inventory")) is not None:
+        return refused
+    inventory = await _vault_inventory()
+    if not rows:
+        for view in inventory.vaults:
+            view.secrets = []
+    return inventory.model_dump()
+
+
+@router.get("/vault/rows", response_model=None)
+async def vault_rows(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    vault: Annotated[str, Query(pattern=secrets_meta.VAULT_PATTERN)],
+    start: Annotated[int, Query(ge=0, le=100_000)] = 0,
+) -> dict[str, Any] | JSONResponse:
+    """One page of one vault's rows, :data:`VAULT_ROWS_PAGE` at a time (2026-10-24).
+
+    ``next`` is where the following page starts, ``None`` after the last. A vault the
+    reading does not hold answers an empty page.
+    """
+    if (refused := await _admin_only(request, user, "see the Key Vault inventory")) is not None:
+        return refused
+    inventory = await _vault_inventory()
+    secrets = next((view.secrets for view in inventory.vaults if view.vault == vault), [])
+    page = secrets[start : start + VAULT_ROWS_PAGE]
+    end = start + len(page)
+    return {
+        "vault": vault,
+        "secrets": [row.model_dump() for row in page],
+        "next": end if end < len(secrets) else None,
+    }
+
+
+@router.get("/vault/people", response_model=None)
+async def vault_people(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """OmniGent's members, for the Key Vault card's owner picker (2026-10-23).
+
+    The page cannot reach ``/auth/users`` (its bridge allows only ``/v1/ae``), so this
+    asks it as the caller and passes the answer on. A runtime without that route, or
+    one that refuses, answers an empty list: the picker then offers the owners
+    already set.
+    """
+    if (refused := await _admin_only(request, user, "list who can own a secret")) is not None:
+        return refused
+    response = await shared_accounts_routes.ask_as_caller(request, "/auth/users")
+    users: list[dict[str, Any]] = []
+    if response is not None and response.status_code == 200:
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        rows = body.get("users") if isinstance(body, dict) else None
+        users = [
+            {"id": row["id"], "is_admin": bool(row.get("is_admin"))}
+            for row in rows or []
+            if isinstance(row, dict) and isinstance(row.get("id"), str)
+        ]
+    return {"users": users}
+
+
+@router.post(
+    "/vault/owner",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def vault_owner_post(
+    request: Request,
+    body: secret_owners.OwnerPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Set or clear the owner of one or more secrets in one vault (``secret_owners.py``).
+
+    POST, not PUT: the extension page's bridge allows only GET and POST under ``/v1/ae``.
+    """
+    if (refused := await _admin_only(request, user, "set who owns a secret")) is not None:
+        return refused
+    owner = (body.owner or "").strip() or None
+    names = list(dict.fromkeys(body.names))
+    if owner is not None and not secret_owners.OWNER_PATTERN.match(owner):
+        return _error(
+            400,
+            ErrorCode.INVALID_INPUT,
+            f"owner {owner!r} is not a sign-in id (name@domain); pick one from the list.",
+        )
+    reading = await asyncio.to_thread(secrets_meta.store().read)
+    known: set[str] = set()
+    if reading is not None:
+        known = set(
+            reading.secrets if body.vault == reading.vault else reading.vaults.get(body.vault, {})
+        )
+    unknown = sorted(set(names) - known)
+    if unknown:
+        shown = ", ".join(unknown[:5]) + (
+            f" and {len(unknown) - 5} more" if len(unknown) > 5 else ""
+        )
+        return _error(
+            400,
+            ErrorCode.INVALID_INPUT,
+            f"not in {body.vault}'s latest reading: {shown}. Reload the card and try again.",
+        )
+    try:
+        owners = await asyncio.to_thread(secret_owners.store().set, body.vault, names, owner)
+    except secret_owners.OwnerSaveError as exc:
+        _logger.warning("secret owners not saved: %s", exc)
+        return _error(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"could not save the owner ({exc}); check that /data is writable, then try again.",
+        )
+    return {
+        "updated": len(names),
+        "owners": {name: owners.get(secret_owners.key_of(body.vault, name)) for name in names},
+    }
+
+
 @router.get("/limits")
 async def limits_view(
     request: Request,
@@ -865,6 +1148,41 @@ async def _may_open_session(request: Request, user: str | None, session_id: str)
     return response.status_code == 200
 
 
+_owner_identity = merge_watch.OwnerIdentity()
+
+
+def _permission_store() -> Any | None:
+    """Upstream's permission store, opened on the server's own database."""
+    return _owner_identity._permission_store()
+
+
+def _owns_session(user: str, session_id: str) -> bool:
+    from omnigent.server.auth import LEVEL_OWNER
+    from omnigent.server.permissions import check_session_access
+
+    store = _permission_store()
+    if store is None:
+        return False
+    return check_session_access(user, session_id, LEVEL_OWNER, store, get_conversation_store())
+
+
+async def _may_write_session(user: str | None, session_id: str) -> bool:
+    """Whether the caller owns *session_id* (an admin counts), for routes that change it.
+
+    Read access, which :func:`_may_open_session` checks, is not enough: a view-only
+    collaborator must not rewrite a session's preset or lead a family under it. Always
+    true on a single-user runtime; any failure is a no.
+    """
+    who = _acl_user(user)
+    if who is None:
+        return True
+    try:
+        return await asyncio.to_thread(_owns_session, who, session_id)
+    except Exception:  # noqa: BLE001 (cannot tell, so no)
+        _logger.warning("session owner check failed for %s", session_id, exc_info=True)
+        return False
+
+
 @router.post(
     "/limits/{harness}",
     response_model=None,
@@ -933,6 +1251,587 @@ async def sidebar_put(
             revision=result.state.revision,
         )
     return result.state.model_dump()
+
+
+@router.get("/roles")
+async def roles_view(user: Annotated[str | None, Depends(require_ae_user)]) -> dict[str, Any]:
+    """The caller's role presets, default and revision, plus the canonical starters.
+
+    Added 2026-10-23 (role routing): Settings > Roles edits the list and
+    the lead notice reads it every turn (``role_prefs.py`` says why). A user who
+    never saved reads the starters at revision 0.
+    """
+    state = await asyncio.to_thread(role_prefs.store().get, user or "local")
+    return role_prefs.view(state)
+
+
+@router.put(
+    "/roles",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def roles_put(
+    body: role_prefs.RolesPut,
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Save the whole preset list when ``revision`` is the one held; 409 carries the state.
+
+    Since 2026-10-24 (preset insights PR 3) the answer also carries ``insights_task``: the
+    scheduled preset review is created or updated on every save with insights on, and deleted
+    when insights are off (on every save, so a failed delete is retried). A task failure never
+    fails the save.
+    """
+    who = user or "local"
+    old = (await asyncio.to_thread(role_prefs.store().get, who)).insights
+    try:
+        result = await asyncio.to_thread(role_prefs.store().put, who, body)
+    except role_prefs.RolesSaveError as exc:
+        return _error(503, role_prefs.CODE_NOT_SAVED, str(exc))
+    if result.conflict:
+        return _error(
+            409,
+            ErrorCode.CONFLICT,
+            "The role presets changed on another device; reload them and retry the save.",
+            **role_prefs.view(result.state),
+        )
+    return role_prefs.view(result.state) | {
+        "insights_task": await _sync_review_task(request, result.state, old, who)
+    }
+
+
+async def _sync_review_task(
+    request: Request,
+    state: role_prefs.RolesState,
+    old: role_prefs.Insights | None,
+    who: str = "local",
+) -> dict[str, Any]:
+    """Create, update or delete the scheduled preset review to match the saved insights."""
+    on = bool(state.insights and state.insights.enabled)
+    # With insights off the task is removed on every call, not only on the on-to-off save, so a
+    # delete that failed once is retried by the next save (or Apply or Undo) instead of leaving
+    # an orphan that keeps firing. *old* is kept for callers; the saved state alone decides.
+    _ = old
+    try:
+        async with _loopback_client(request) as http:
+            if on:
+                answer = await preset_review.ensure_task(
+                    http, lambda: role_prefs.store().get(who), who
+                )
+            else:
+                answer = await preset_review.remove_task(http, who)
+    except Exception as exc:  # noqa: BLE001 (a task failure never fails the save)
+        _logger.warning("preset review task not synced", exc_info=True)
+        return {"ok": False, "action": "none", "error": type(exc).__name__}
+    if not answer.get("ok"):
+        _logger.warning("preset review task not synced: %s", answer.get("error"))
+    return {k: v for k, v in answer.items() if k in ("ok", "action", "error")}
+
+
+class EmptyBody(BaseModel):
+    """A POST that takes ``{}`` and nothing else."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+async def _reviewer_caller(
+    request: Request, user: str | None, session_id: str
+) -> tuple[str, bool] | JSONResponse:
+    """``(owner, admin)`` for a preset-reviewer session's tool call, or the refusal.
+
+    Checked in order: the session exists (404), the caller may write it (403), and it runs the
+    ``preset-reviewer`` agent (403 ``not_reviewer``). ``admin`` is true only when the caller is
+    the session's owner, an OmniGent admin, and the owner's insights scope is ``all``.
+
+    Why this does not check how the session started (2026-10-24): any session on the
+    preset-reviewer agent may call the tools. A non-admin can only target their own presets, so
+    a hand-started reviewer bypasses only the 13-day gap and the cost cap, on the caller's own
+    account.
+    """
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can use session {session_id}")
+    if await _agent_name(conv) != preset_runs.REVIEWER_AGENT:
+        return _error(
+            403,
+            "not_reviewer",
+            f"session {session_id} is not a {preset_runs.REVIEWER_AGENT} session",
+        )
+    who = user or "local"
+    owner = await asyncio.to_thread(_owner_identity.owner, session_id) or who
+    insights = (await asyncio.to_thread(role_prefs.store().get, owner)).insights
+    admin = bool(
+        who == owner
+        and insights is not None
+        and insights.scope == "all"
+        and await shared_accounts_routes.admin_probe(request, user)
+    )
+    return owner, admin
+
+
+@router.post(
+    "/sessions/{session_id}/preset-insights",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def post_preset_insights(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The preset reviewer's one read (``preset_insights_read``); see :mod:`preset_review`."""
+    caller = await _reviewer_caller(request, user, session_id)
+    if isinstance(caller, JSONResponse):
+        return caller
+    owner, admin = caller
+    try:
+        answer = await asyncio.to_thread(preset_review.build_read, owner, admin, datetime.now(UTC))
+        if answer.get("due") is True:
+            # Only a session that was told its read is due may submit (post_preset_suggestions).
+            await asyncio.to_thread(
+                preset_suggestions.store().note_due_read, session_id, time.time()
+            )
+    except preset_suggestions.SuggestionError as exc:
+        return _error(exc.status, exc.code, exc.message)
+    return answer
+
+
+@router.post(
+    "/sessions/{session_id}/preset-suggestions",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def post_preset_suggestions(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: preset_suggestions.SubmitBody,
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Store the reviewer's suggestions (``submit_preset_suggestions``) and rename the session."""
+    caller = await _reviewer_caller(request, user, session_id)
+    if isinstance(caller, JSONResponse):
+        return caller
+    owner, admin = caller
+    if not await asyncio.to_thread(preset_suggestions.store().has_due_read, session_id):
+        return _error(
+            409,
+            "no_due_read",
+            "This session has not had a due read; call preset_insights_read first, "
+            "and submit only when it answers due.",
+        )
+    now = datetime.now(UTC)
+    roles = role_prefs.store()
+    try:
+        review = await asyncio.to_thread(
+            functools.partial(
+                preset_suggestions.store().submit,
+                session=session_id,
+                owner=owner,
+                admin=admin,
+                body=body,
+                roles_for=roles.get,
+                now=now,
+            )
+        )
+    except preset_suggestions.SuggestionError as exc:
+        return _error(exc.status, exc.code, exc.message)
+    try:
+        local = now.astimezone(ZoneInfo(Settings.from_env().tz))
+    except Exception:  # noqa: BLE001 (a bad zone name falls back to UTC; the title still sets)
+        local = now.astimezone(UTC)
+    try:
+        await asyncio.to_thread(
+            get_conversation_store().update_conversation,
+            session_id,
+            title=f"Preset review {local:%b} {local.day}",
+        )
+    except Exception:  # noqa: BLE001 (the suggestions are stored; only the title is lost)
+        _logger.warning("could not rename preset review session %s", session_id, exc_info=True)
+    return {"ok": True, "review_id": review["id"], "count": review["count"]}
+
+
+@router.get("/preset-suggestions", response_model=None)
+async def list_preset_suggestions(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    all: Annotated[bool, Query()] = False,
+) -> dict[str, Any] | JSONResponse:
+    """The caller's suggestions, or every user's with ``all=true`` (admins only), newest first."""
+    who = user or "local"
+    if all and (refused := await _admin_only(request, user, "read every user's suggestions")):
+        return refused
+    sugs, reviews = await asyncio.to_thread(
+        preset_suggestions.store().list_for, None if all else who
+    )
+    return {"suggestions": [preset_suggestions.public(s, who) for s in sugs], "reviews": reviews}
+
+
+async def _sync_after_change(request: Request, who: str) -> dict[str, Any]:
+    """Bring the review task onto the model the changed preset now names (never fatal)."""
+    state = await asyncio.to_thread(role_prefs.store().get, who)
+    return await _sync_review_task(request, state, state.insights, who)
+
+
+def _suggestion_failure(exc: preset_suggestions.SuggestionError) -> JSONResponse:
+    return _error(exc.status, exc.code, exc.message)
+
+
+async def _roles_view(who: str) -> dict[str, Any]:
+    return role_prefs.view(await asyncio.to_thread(role_prefs.store().get, who))
+
+
+@router.post(
+    "/preset-suggestions/{suggestion_id}/apply",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def apply_preset_suggestion(
+    suggestion_id: Annotated[str, Path(max_length=40)],
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Apply an ``own`` suggestion to the caller's preset (409 when the preset changed)."""
+    who = user or "local"
+    try:
+        record, _revision = await asyncio.to_thread(
+            preset_suggestions.store().apply, who, suggestion_id
+        )
+    except preset_suggestions.SuggestionError as exc:
+        return _suggestion_failure(exc)
+    return {
+        "ok": True,
+        "suggestion": preset_suggestions.public(record, who),
+        "roles": await _roles_view(who),
+        "insights_task": await _sync_after_change(request, who),
+    }
+
+
+@router.post(
+    "/preset-suggestions/{suggestion_id}/undo",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def undo_preset_suggestion(
+    suggestion_id: Annotated[str, Path(max_length=40)],
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Put the preset back as it was before Apply, when it is still what Apply wrote."""
+    who = user or "local"
+    try:
+        record, _revision = await asyncio.to_thread(
+            preset_suggestions.store().undo, who, suggestion_id
+        )
+    except preset_suggestions.SuggestionError as exc:
+        return _suggestion_failure(exc)
+    return {
+        "ok": True,
+        "suggestion": preset_suggestions.public(record, who),
+        "roles": await _roles_view(who),
+        "insights_task": await _sync_after_change(request, who),
+    }
+
+
+@router.post(
+    "/preset-suggestions/{suggestion_id}/dismiss",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def dismiss_preset_suggestion(
+    suggestion_id: Annotated[str, Path(max_length=40)],
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Dismiss an open suggestion: its owner, or an admin for any."""
+    who = user or "local"
+    store = preset_suggestions.store()
+    try:
+        record = await asyncio.to_thread(store.get, suggestion_id)
+        admin = record.get("owner") != who and await shared_accounts_routes.admin_probe(
+            request, user
+        )
+        record = await asyncio.to_thread(store.dismiss, who, suggestion_id, bool(admin))
+    except preset_suggestions.SuggestionError as exc:
+        return _suggestion_failure(exc)
+    return {"ok": True, "suggestion": preset_suggestions.public(record, who)}
+
+
+PRESET_ISSUE_REPO_ENV = "AE_PRESET_ISSUE_REPO"
+# Private on purpose: a suggestion names internal run numbers, never the public repo.
+DEFAULT_PRESET_ISSUE_REPO = "analyticendeavors/omnigent-ae"
+
+
+ISSUE_BODY_MAX = 20000
+_MENTION = re.compile(r"@(?=\w)")
+
+
+def _no_mentions(text: str) -> str:
+    """*text* with a zero-width space after each ``@``, so GitHub notifies nobody."""
+    return _MENTION.sub("@\u200b", text)
+
+
+def _issue_body(record: dict[str, Any]) -> str:
+    """The issue text for a starter suggestion, cut to :data:`ISSUE_BODY_MAX` characters.
+
+    The reviewer's words (``why``, ``saving``) and the changes sit inside one code fence, so a
+    link, an image or an ``org/repo#n`` reference in them renders as plain text; mentions are
+    neutralized as well. Only the fixed labels and the review reference stay outside.
+    """
+    changes = (
+        "\n".join(
+            f"{c['path']} = {json.dumps(c['value'], separators=(',', ':'))}"
+            for c in record["changes"]
+        )
+        or "none (no field)"
+    )
+    inside = "\n".join(
+        [
+            f"Preset: {_no_mentions(str(record.get('preset_title') or 'several starters'))}",
+            f"Why: {_no_mentions(str(record['why']))}",
+            f"Expected saving: {_no_mentions(str(record.get('saving') or 'not stated'))}",
+            "Changes:",
+            changes,
+        ]
+    )
+    longest = max((len(m) for m in re.findall(r"`+", inside)), default=0)
+    fence = "`" * max(3, longest + 1)
+    body = "\n".join(
+        [
+            fence,
+            inside,
+            fence,
+            f"From: preset review {str(record['created_at'])[:10]}, "
+            f"session {record['review_session']}",
+        ]
+    )
+    if len(body) > ISSUE_BODY_MAX:
+        body = body[: ISSUE_BODY_MAX - 40] + "\n(cut: the body was over the limit)"
+    return body
+
+
+_REPO_PRIVATE_TTL_S = 600.0
+_repo_private: dict[str, tuple[float, bool]] = {}
+
+
+async def _repo_is_private(client: github.GitHubClient, repo: str) -> bool:
+    """Whether *repo* is private, cached for 10 minutes."""
+    held = _repo_private.get(repo)
+    if held is not None and time.monotonic() - held[0] < _REPO_PRIVATE_TTL_S:
+        return held[1]
+    private = (await client.repository(repo)).get("private") is True
+    _repo_private[repo] = (time.monotonic(), private)
+    return private
+
+
+@router.post(
+    "/preset-suggestions/{suggestion_id}/issue",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def open_preset_suggestion_issue(
+    suggestion_id: Annotated[str, Path(max_length=40)],
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Open a GitHub issue for an open ``starter`` suggestion (admins only)."""
+    if refused := await _admin_only(request, user, "open an issue for a starter suggestion"):
+        return refused
+    store = preset_suggestions.store()
+    try:
+        record = await asyncio.to_thread(store.get, suggestion_id)
+    except preset_suggestions.SuggestionError as exc:
+        return _suggestion_failure(exc)
+    if record.get("kind") != "starter" or record.get("status") not in ("open", "issue_opening"):
+        return _error(409, "not_applicable", "only an open starter suggestion becomes an issue")
+    settings = github.GitHubSettings.from_env()
+    if not settings.configured:
+        return _error(
+            503,
+            "github_off",
+            "AE_GITHUB_TOKEN is not set on the server, so no issue can be opened.",
+        )
+    repo = (os.environ.get(PRESET_ISSUE_REPO_ENV) or "").strip() or DEFAULT_PRESET_ISSUE_REPO
+    try:
+        record = await asyncio.to_thread(store.reserve_issue, suggestion_id)
+    except preset_suggestions.SuggestionError as exc:
+        return _suggestion_failure(exc)
+    try:
+        async with github.GitHubClient(settings) as client:
+            if not await _repo_is_private(client, repo):
+                raise _IssueRefused(
+                    409,
+                    "repo_not_private",
+                    f"{repo} is not a private repository, and a suggestion names internal run "
+                    f"numbers. Point {PRESET_ISSUE_REPO_ENV} at a private repo.",
+                )
+            url = await client.create_issue(
+                repo,
+                "Starter preset suggestion: "
+                + _no_mentions(
+                    f"{record['preset_title']}: {record['title']}"
+                    if record.get("preset_title")
+                    else record["title"]
+                ),
+                _issue_body(record),
+            )
+    except _IssueRefused as exc:
+        store.release_issue(suggestion_id)
+        return _error(exc.status, exc.code, exc.message)
+    except github.GitHubError as exc:
+        store.release_issue(suggestion_id)
+        return _error(502, "github_failed", str(exc))
+    except BaseException:
+        # Synchronous on purpose: a cancelled request must still free the reservation.
+        store.release_issue(suggestion_id)
+        raise
+    _logger.warning("preset suggestion %s: opened GitHub issue %s", suggestion_id, url)
+    failure: preset_suggestions.SuggestionError | None = None
+    for _attempt in range(2):
+        try:
+            record = store.mark_issue(suggestion_id, url)
+            break
+        except preset_suggestions.SuggestionError as exc:
+            failure = exc
+    else:
+        _logger.warning(
+            "preset suggestion %s: issue %s was created but could not be recorded",
+            suggestion_id,
+            url,
+        )
+        assert failure is not None
+        return _suggestion_failure(failure)
+    return {"ok": True, "suggestion": preset_suggestions.public(record, user or "local")}
+
+
+class _IssueRefused(Exception):
+    def __init__(self, status: int, code: str, message: str) -> None:
+        super().__init__(message)
+        self.status = status
+        self.code = code
+        self.message = message
+
+
+_run_locks: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+@router.post(
+    "/preset-review/run",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def run_preset_review(
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> JSONResponse:
+    """Run the preset review now: make sure the task exists, flag the read due, fire the task."""
+    who = user or "local"
+    store = preset_suggestions.store()
+    lock = _run_locks.setdefault((id(asyncio.get_running_loop()), who), asyncio.Lock())
+    async with lock, _loopback_client(request) as http:
+        # Read the roles inside the lock: a save that switched insights off while this request
+        # waited must win, and the task is built from the live state, not one read earlier.
+        state = await asyncio.to_thread(role_prefs.store().get, who)
+        if not (state.insights and state.insights.enabled):
+            return _error(409, "insights_off", "Preset insights are off; switch them on first.")
+        ensured = await preset_review.ensure_task(http, lambda: role_prefs.store().get(who), who)
+        if not ensured.get("ok"):
+            return _error(502, "task_failed", str(ensured.get("error") or "the task failed"))
+        row = await preset_review.find_task(http, who)
+        if row is None:
+            return _error(
+                409, "task_missing", "The review task is gone; switch insights off and on again."
+            )
+        if row.get("state") not in (None, "active"):
+            return _error(
+                409,
+                "task_paused",
+                "The review task is paused. Resume it in Scheduled tasks, then run again.",
+            )
+        mine = not await asyncio.to_thread(store.peek_forced, who, time.time())
+        try:
+            await asyncio.to_thread(store.force, who, time.time())
+        except preset_suggestions.SuggestionError as exc:
+            return _suggestion_failure(exc)
+        try:
+            response = await http.post(f"/v1/scheduled-tasks/{ensured['id']}/run")
+        except httpx.HTTPError as exc:
+            if mine:
+                await _clear_forced(store, who)
+            return _error(502, "run_failed", f"starting the review failed: {type(exc).__name__}")
+    if response.status_code not in (200, 202):
+        if mine:
+            await _clear_forced(store, who)
+        if response.status_code == 409:
+            return _error(409, "review_running", "A review is already running.")
+        return _error(502, "run_failed", f"starting the review answered {response.status_code}")
+    return JSONResponse(status_code=202, content={"started": True})
+
+
+async def _clear_forced(store: preset_suggestions.SuggestionStore, who: str) -> None:
+    """Drop the Run now flag this request set; a store failure is logged, not raised."""
+    try:
+        await asyncio.to_thread(store.take_forced, who, time.time())
+    except preset_suggestions.SuggestionError:
+        _logger.warning("could not clear the Run now flag for %s", who, exc_info=True)
+
+
+@router.get("/preset-review", response_model=None)
+async def preset_review_status(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any]:
+    """Settings > Roles status: the task, the last and next review, the reviewer, open count."""
+    who = user or "local"
+    state = await asyncio.to_thread(role_prefs.store().get, who)
+    insights = state.insights
+    sugs = preset_suggestions.store()
+    last = await asyncio.to_thread(sugs.last_review, who)
+    task = None
+    try:
+        async with _loopback_client(request) as http:
+            row = await preset_review.find_task(http, who)
+        if row is not None:
+            task = {
+                "id": row.get("id"),
+                "state": row.get("state"),
+                "next_run_at": row.get("next_run_at"),
+            }
+    except Exception:  # noqa: BLE001 (status still answers without the task)
+        _logger.warning("preset review status: could not read the task", exc_info=True)
+    next_review = task["next_run_at"] if task else None
+    if next_review and last:
+        try:
+            when = datetime.fromisoformat(str(next_review).replace("Z", "+00:00"))
+            floor = datetime.fromisoformat(str(last["at"]).replace("Z", "+00:00")) + timedelta(
+                days=preset_review.MIN_GAP_DAYS
+            )
+            while when < floor:
+                when += timedelta(days=7)
+            next_review = when.isoformat()
+        except ValueError:
+            pass
+    model, effort = preset_review.reviewer_model(state)
+    default = next((p for p in state.presets if p.id == state.default_preset), None)
+    return {
+        "enabled": bool(insights and insights.enabled),
+        "scope": insights.scope if insights else "all",
+        "task": task,
+        "last_review": last["at"] if last else None,
+        "next_review": next_review,
+        "reviewer": {
+            "model": model,
+            "effort": effort,
+            "preset_title": default.title if default else None,
+        },
+        "open": await asyncio.to_thread(sugs.open_count, who),
+    }
 
 
 @router.get("/your-move")
@@ -1381,13 +2280,16 @@ def _existing(conv: Conversation) -> dict[str, Any]:
 
 
 CODE_SLOTS_FULL = "slots_full"
+CODE_FAMILY_FULL = "family_full"
 CODE_SESSION_NO_TARGET = "session_no_target"
 CODE_SESSION_NOT_CREATED = "session_not_created"
 CODE_BRIEF_NOT_POSTED = "session_brief_not_posted"
+CODE_MODEL_NOT_CHANGED = "session_model_not_changed"
 # Which built-in agent each harness choice binds, the two the composer offers
 # for a terminal-first session on the box.
 HARNESS_AGENTS: dict[str, str] = {"claude": "claude-native-ui", "codex": "codex-native-ui"}
 _KEY_MAX = 64
+_TEAM_LABEL = "ae.team"
 
 
 class SessionRequest(BaseModel):
@@ -1412,12 +2314,36 @@ class SessionRequest(BaseModel):
     branch: str | None = Field(default=None, min_length=1, max_length=200)
     orchestrator: str | None = Field(default=None, min_length=1, max_length=100)
     ride_unparked: bool = False
+    # Role routing (2026-10-24): the role fills model and effort from the caller's preset;
+    # explicit model or effort win.
+    role: Literal["lead", "planner", "reviewer", "builder", "helper"] | None = None
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")
+    # A chat of its own for Reid (a handoff, 2026-10-25): no family, its own slot, role
+    # ``lead`` on ``preset``; ``orchestrator`` is then only the opener.
+    standalone: bool = False
 
 
 def _session_key(body: SessionRequest) -> str:
+    """The explicit key, else a hash of the requested values that make two spawns one piece
+    of work. Requested, not resolved, so a retry dedupes after the lead's preset changed."""
     if body.key:
         return body.key.strip()
-    seed = "\n".join((body.harness, body.workspace or "", " ".join(body.title.lower().split())))
+    seed = "\n".join(
+        (
+            body.harness,
+            body.workspace or "",
+            " ".join(body.title.lower().split()),
+            body.role or "",
+            body.model or "",
+            body.effort or "",
+            body.preset or "",
+            body.orchestrator or "",
+        )
+    )
+    if body.standalone:
+        seed += "\nstandalone"
     return "auto-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
 
 
@@ -1438,6 +2364,429 @@ async def _session_workspace(request: Request, host_id: str, wanted: str | None)
     return f"{home.rstrip('/')}/{rest.lstrip('/')}".rstrip("/")
 
 
+class PresetPut(BaseModel):
+    """``PUT /v1/ae/sessions/{id}/preset``: the preset id the session now runs under."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    preset: str = Field(pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")
+
+
+@router.put(
+    "/sessions/{session_id}/preset",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def set_session_preset(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: PresetPut,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Set ``ae.preset`` and log the switch; a session already on it is left alone.
+
+    Added 2026-10-24 so the web client's preset pick leaves a record (``preset_log``).
+    A log failure never fails the change.
+    """
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can change session {session_id}")
+    try:
+        await asyncio.to_thread(spawn_role.check_preset, user, body.preset)
+    except spawn_role.UnknownPreset as exc:
+        return _error(422, ErrorCode.INVALID_INPUT, str(exc))
+    old = labels.label(conv.labels, labels.PRESET)
+    if old == body.preset:
+        return {"ok": True, "preset": body.preset}
+    await _set_labels(session_id, {labels.PRESET: body.preset})
+    await asyncio.to_thread(preset_log.append, session_id, old, body.preset, user)
+    return {"ok": True, "preset": body.preset}
+
+
+class ReviewReportPost(BaseModel):
+    """``POST /v1/ae/sessions/{id}/review-report``: what a lead's final review found."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reviewers_run: int = Field(ge=0, le=20)
+    findings_returned: int = Field(ge=0, le=10000)
+    findings_fixed: int = Field(ge=0, le=10000)
+    call_id: str | None = Field(default=None, min_length=1, max_length=100)
+
+
+@router.post(
+    "/sessions/{session_id}/review-report",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def post_review_report(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: ReviewReportPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Store the lead's review report until its run line is written (``preset_runs``).
+
+    Added 2026-10-24 (the ``report_review`` tool). The caller must own the session. A family
+    child reports on behalf of the lead that started it (``ae.orch``, followed up to five hops).
+    Calls in one run add up, except a repeated ``call_id`` (2026-10-25). Answers the running
+    totals.
+    """
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(
+            403, ErrorCode.FORBIDDEN, f"only the owner can report on session {session_id}"
+        )
+    lead_id = session_id
+    for _ in range(5):
+        parent = labels.orch_parent(conv.labels)
+        if parent is None:
+            break
+        parent_conv = await _conversation(parent)
+        if parent_conv is None:
+            break
+        lead_id, conv = parent, parent_conv
+    if lead_id != session_id and not await _may_write_session(user, lead_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can report on session {lead_id}")
+    # The setting that counts is the lead's owner's, not the caller's (an admin may be calling).
+    owner = await asyncio.to_thread(_owner_identity.owner, lead_id) or user
+    insights_on = await asyncio.to_thread(preset_runs.insights_enabled, owner)
+    lead_status = "archived" if getattr(conv, "archived", False) else labels.status_of(conv.labels)
+    result = await asyncio.to_thread(
+        functools.partial(
+            preset_runs.record_review,
+            preset_runs.shared_state(),
+            lead_id,
+            body.reviewers_run,
+            body.findings_returned,
+            body.findings_fixed,
+            call_id=body.call_id,
+            insights_on=insights_on,
+            lead_now=(lead_status, preset_runs._time(conv, "updated_at")),
+        )
+    )
+    return {"ok": True, "session_id": lead_id, **result}
+
+
+class ModelPost(BaseModel):
+    """``POST /v1/ae/sessions/{id}/model``: change a session's model or effort."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    reason: str | None = Field(default=None, min_length=1, max_length=200)
+    caller: str | None = Field(default=None, min_length=1, max_length=100)
+    confirmed: bool = False
+    undo: bool = False
+
+
+# One lock per target session (see set_session_model); a few bytes each, never pruned.
+_MODEL_LOCKS: dict[str, asyncio.Lock] = {}
+MODEL_CHANGE_WINDOW = 24 * 3600  # how long a change stays on the band
+# What _agent_name answers when the agent could not be read.
+AGENT_UNKNOWN = "?"
+
+
+async def _agent_name(conv: Conversation) -> str | None:
+    """The registered name of the session's agent (``codex-native-ui`` for Codex), if known."""
+    if not conv.agent_id:
+        return None
+    if conv.agent_id == role_prefs.CODEX_AGENT_ID:
+        return role_prefs.CODEX_AGENT_NAME
+    try:
+        agent = await asyncio.to_thread(get_agent_store().get, conv.agent_id)
+    except Exception:  # noqa: BLE001 (cannot tell, so no model change)
+        _logger.warning("model change: could not read agent %s", conv.agent_id, exc_info=True)
+        return AGENT_UNKNOWN
+    return agent.name if agent is not None else None
+
+
+def _current_model(conv: Conversation) -> tuple[str | None, str | None]:
+    """The session's ``(model, effort)``. ``model_override`` is the request and is empty on a
+    session running its agent's default, so the model the harness last reported stands in."""
+    model = getattr(conv, "model_override", None) or getattr(conv, "reported_model", None)
+    return model or None, getattr(conv, "reasoning_effort", None) or None
+
+
+def _model_answer(
+    conv: Conversation,
+    status: str,
+    *,
+    old: tuple[str | None, str | None],
+    new: tuple[str | None, str | None],
+    kind: str,
+    is_lead: bool,
+    raises: int,
+    cap: int | None,
+    counted: bool = False,
+    approved: str | None = None,
+    reason: str = "",
+    refusal: str | None = None,
+    ask: bool = False,
+    warning: str | None = None,
+) -> dict[str, Any]:
+    role = labels.label(conv.labels, labels.ROLE)
+    title = sessions.display_title(conv)
+    return {
+        "status": status,
+        "session_id": conv.id,
+        "title": title,
+        "role": role,
+        "is_lead": is_lead,
+        "from": {"model": old[0], "effort": old[1]},
+        "to": {"model": new[0], "effort": new[1]},
+        "kind": kind,
+        "raises": raises,
+        "cap": cap,
+        "counted": counted,
+        "approved": approved,
+        "reason": reason,
+        "refusal": refusal,
+        "question": escalation.question(kind, role, title, *new) if ask else None,
+        "options": escalation.options(kind, *new) if ask else None,
+        "undo": (
+            # The raw override, not the resolved display value: Undo must not pin one.
+            {
+                "model": getattr(conv, "model_override", None) or None,
+                "effort": getattr(conv, "reasoning_effort", None) or None,
+            }
+            if status == "changed"
+            else None
+        ),
+        **({"warning": warning} if warning else {}),
+    }
+
+
+@router.post(
+    "/sessions/{session_id}/model",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def set_session_model(
+    request: Request,
+    session_id: Annotated[str, Path(max_length=120)],
+    body: ModelPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Change a session's model and effort under the lead's preset rules (2026-10-24, PR 4).
+
+    Two paths. Without ``caller`` (the browser, for example Undo) the owner's change always
+    applies, with no rules and no count. With ``caller`` (the ``set_session_model`` tool) the
+    user must own both sessions, the target must be the caller or one it started
+    (``ae.orch``), and :mod:`escalation` applies the caller's preset rules. Answers 200 with
+    the status in the body; a change patches the session through the loopback, stamps the
+    labels and appends a line to the model log.
+    """
+    if body.model is None and body.effort is None and not body.undo:
+        return _error(422, ErrorCode.INVALID_INPUT, "set model, effort or both")
+    if not body.undo and not body.reason:
+        return _error(422, ErrorCode.INVALID_INPUT, "reason is required (1 to 200 characters)")
+    # One change at a time per session: two parallel raises must not both read the same
+    # count, and the count is only written after the PATCH.
+    async with _MODEL_LOCKS.setdefault(session_id, asyncio.Lock()):
+        return await _change_model(request, session_id, body, user)
+
+
+async def _change_model(
+    request: Request, session_id: str, body: ModelPost, user: str | None
+) -> dict[str, Any] | JSONResponse:
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can change session {session_id}")
+    lead_conv: Conversation | None = None
+    if body.caller:
+        lead_conv = conv if body.caller == session_id else await _conversation(body.caller)
+        if lead_conv is None:
+            return _not_found(f"no session {body.caller}")
+        if not await _may_write_session(user, body.caller):
+            return _error(
+                403, ErrorCode.FORBIDDEN, f"only the owner can change session {body.caller}"
+            )
+        if body.caller != session_id and labels.orch_parent(conv.labels) != body.caller:
+            return _error(
+                403,
+                ErrorCode.FORBIDDEN,
+                f"session {session_id} was not started by {body.caller}, so it cannot change it",
+            )
+    old = _current_model(conv)
+    # Undo restores exact values, so null clears; any other change keeps what it leaves out.
+    new = (body.model, body.effort) if body.undo else (body.model or old[0], body.effort or old[1])
+    kind = escalation.classify(*old, *new)
+    has_parent = labels.orch_parent(conv.labels) is not None
+    # A session with a parent is a child even when it changes itself: the lead path is for
+    # the top of a family only.
+    is_lead = body.caller == session_id and not has_parent if body.caller else not has_parent
+    raises = labels.count(conv.labels, labels.RAISES)
+    reason = body.reason or "undo"
+    common = {"old": old, "new": new, "kind": kind, "is_lead": is_lead, "raises": raises}
+    counted = False
+    approved: str | None = "user"
+    cap: int | None = None
+    if body.caller:
+        assert lead_conv is not None
+        rules_conv = lead_conv
+        parent = labels.orch_parent(lead_conv.labels)
+        if body.caller == session_id and parent is not None:
+            # A helper changing itself answers to its parent's preset, not its own default.
+            rules_conv = await _conversation(parent) or lead_conv
+        effective = await asyncio.to_thread(spawn_role._effective, rules_conv, user or "local")
+        preset = effective.get("preset")
+        given = preset.get("rules") if isinstance(preset, dict) else None
+        rules = escalation.DEFAULT_RULES | {
+            key: value for key, value in (given or {}).items() if value is not None
+        }
+        cap = int(rules.get("auto_raises") or 0)
+        start = escalation.parse_start(labels.label(conv.labels, labels.MODEL_START))
+        start_kind = escalation.classify(*start, *new) if start and is_lead else None
+        agent = await _agent_name(conv)
+        decision = escalation.decide(
+            rules,
+            kind=kind,
+            is_lead=is_lead,
+            raises=raises,
+            start_kind=start_kind,
+            codex=agent == role_prefs.CODEX_AGENT_NAME,
+            agent_unknown=agent == AGENT_UNKNOWN,
+            model_changes=new[0] != old[0],
+            confirmed=body.confirmed,
+        )
+        if decision.status != "changed":
+            return _model_answer(
+                conv,
+                decision.status,
+                **common,
+                cap=cap,
+                reason=reason,
+                refusal=decision.refusal,
+                ask=decision.status == "needs_approval",
+            )
+        counted, approved = decision.counted, decision.approved
+    elif kind == "same":
+        return _model_answer(conv, "unchanged", **common, cap=None, reason=reason)
+    # Upstream's PATCH reads null as "leave alone"; "default" is its clear value.
+    patch: dict[str, str] = {}
+    if new[0] != old[0]:
+        patch["model_override"] = str(new[0] or "default")
+    if new[1] != old[1]:
+        patch["reasoning_effort"] = str(new[1] or "default")
+    response = await _loopback(request, "PATCH", f"/v1/sessions/{session_id}", patch)
+    if response.status_code >= 300:
+        _logger.warning("model change on %s failed: %s", session_id, response.status_code)
+        return _error(
+            502,
+            CODE_MODEL_NOT_CHANGED,
+            f"the session was not changed: the server answered {response.status_code}. "
+            "Try again, or change it in the model picker.",
+        )
+    updates: dict[str, str] = {}
+    last = escalation.last_change_label(
+        old=old,
+        new=new,
+        kind=kind,
+        reason=reason,
+        at=int(time.time()),
+        caller=body.caller,
+        approved=approved,
+        # The raw override, as Undo needs it (see _model_answer).
+        undo=(
+            getattr(conv, "model_override", None) or None,
+            getattr(conv, "reasoning_effort", None) or None,
+        ),
+        undone=body.undo,
+    )
+    if last is None:
+        _logger.warning("model change on %s: ae.model_last would not fit, not written", session_id)
+    else:
+        updates[labels.MODEL_LAST] = last
+    if labels.label(conv.labels, labels.MODEL_START) is None:
+        updates[labels.MODEL_START] = escalation.start_value(*old)
+    if counted:
+        raises += 1
+        updates[labels.RAISES] = str(raises)
+        updates[labels.RAISE_CAP] = str(cap)
+    warning: str | None = None
+    # The PATCH already happened: a failed bookkeeping write must not hide that.
+    try:
+        if updates:
+            await _set_labels(session_id, updates)
+    except Exception:  # noqa: BLE001
+        _logger.warning("model change on %s: labels not written", session_id, exc_info=True)
+        warning = "The change applied but its count and start value were not saved."
+    try:
+        await asyncio.to_thread(
+            model_log.append,
+            {
+                "session": session_id,
+                "caller": body.caller,
+                "by": user,
+                "from": {"model": old[0], "effort": old[1]},
+                "to": {"model": new[0], "effort": new[1]},
+                "kind": kind,
+                "reason": reason,
+                "approved": approved,
+            },
+        )
+    except Exception:  # noqa: BLE001
+        _logger.warning("model change on %s: log not written", session_id, exc_info=True)
+    return _model_answer(
+        conv,
+        "changed",
+        **(common | {"raises": raises}),
+        cap=cap,
+        counted=counted,
+        approved=approved,
+        reason=reason,
+        warning=warning,
+    )
+
+
+@router.get("/sessions/{lead_id}/model-changes", response_model=None)
+async def model_changes(
+    lead_id: Annotated[str, Path(max_length=120)],
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The lead's and its helpers' model changes from the last 24 hours, newest first.
+
+    Feeds the change band in every chat. Reads only the ``ae.model_last`` labels, never the log.
+    """
+    lead = await _conversation(lead_id)
+    if lead is None:
+        return _not_found(f"no session {lead_id}")
+    if not await _may_write_session(user, lead_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can read session {lead_id}")
+    who = _acl_user(user)
+    rows = await asyncio.to_thread(lambda: sessions.list_top_level(accessible_by=who))
+    members = [lead] + [
+        conv for conv in rows if conv.id != lead_id and labels.orch_parent(conv.labels) == lead_id
+    ]
+    cutoff = time.time() - MODEL_CHANGE_WINDOW
+    items = []
+    for conv in members:
+        change = escalation.parse_last(labels.label(conv.labels, labels.MODEL_LAST))
+        if change is None or change["at"] < cutoff:
+            continue
+        # accessible_by also lets a viewer-grant session through; only the owner's helpers
+        # belong on the band. Checked after the label test so most rows cost nothing.
+        if conv.id != lead_id and not await _may_write_session(user, conv.id):
+            continue
+        items.append(
+            {
+                "session_id": conv.id,
+                "title": sessions.display_title(conv),
+                "role": labels.label(conv.labels, labels.ROLE),
+                "is_lead": conv.id == lead_id,
+                "change": change,
+            }
+        )
+    items.sort(key=lambda item: item["change"]["at"], reverse=True)
+    return {"changes": items}
+
+
 @router.get("/sessions")
 async def orchestrated_sessions() -> dict[str, Any]:
     """Every live top-level session the orchestrator started, with repo, branch and key.
@@ -1445,9 +2794,10 @@ async def orchestrated_sessions() -> dict[str, Any]:
     What the orchestrator reads on each check-in to find the session that owns a
     pull request (by ``ae.repo`` and ``ae.branch``) and the ones to close out.
     """
-    rows, limit = await asyncio.gather(
-        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.effective_limit)
+    rows, rules = await asyncio.gather(
+        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.resolve)
     )
+    limit, helpers = rules.limit, rules.helpers_count
     now = time.time()
     items = []
     for conv in rows:
@@ -1468,7 +2818,9 @@ async def orchestrated_sessions() -> dict[str, Any]:
     working = sessions.working_sessions(rows)
     return {
         "limit": limit,
-        "slots_used": len(working),
+        "slots_used": sessions.slots_held(
+            working, helpers_count=helpers, by_id={row.id: row for row in rows}
+        ),
         "items": items,
     }
 
@@ -1478,7 +2830,11 @@ async def orchestrated_sessions() -> dict[str, Any]:
     response_model=None,
     dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
 )
-async def start_session(request: Request, body: SessionRequest) -> dict[str, Any] | JSONResponse:
+async def start_session(
+    request: Request,
+    body: SessionRequest,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
     """Start a top-level session on a host and post its brief, holding a slot first.
 
     The orchestrator agent's ``create_session`` tool (2026-09-25). The calls are
@@ -1493,15 +2849,87 @@ async def start_session(request: Request, body: SessionRequest) -> dict[str, Any
       unless ``ride_unparked``, which Reid chooses; the session then carries
       ``ae.overflow=1``. The session is created already ``working``, so the
       slot cap passes its first prompt without counting it twice.
+    - The family (2026-10-23): a session started by ``orchestrator`` joins its
+      family, which holds one slot however many of it work. Past
+      ``family_children`` of them working at once it answers 409
+      ``family_full`` instead, counting creates still in flight. An
+      ``orchestrator`` the caller does not own leads nothing: the session is
+      recorded with ``ae.orch=1`` and needs a slot of its own.
+    - ``standalone`` (2026-10-25) records ``ae.orch=1`` the same way, whoever
+      opened it, and resolves its role (``lead`` when none is given) from the
+      preset it opens on rather than the opener's.
     """
-    key = _session_key(body)
     rows = await asyncio.to_thread(sessions.list_top_level)
+    key = _session_key(body)
     live = _live_session(rows, labels.ORCH_KEY, key)
     if live is not None:
         return _existing(live) | {"key": key}
+    parent = labels.orch_parent({labels.ORCH: body.orchestrator} if body.orchestrator else None)
+    # A family rides in its lead's slot, so only a session the caller owns can lead it.
+    if parent is not None and not await _may_write_session(user, parent):
+        parent = None
+    # A standalone chat leads its own family; its opener only lends a session-role model.
+    opener = parent
+    if body.standalone:
+        parent = None
+        body = body.model_copy(update={"role": body.role or "lead"})
+    parent_conv = None
+    if opener is not None:
+        try:
+            parent_conv = await _conversation(opener)
+        except Exception:  # noqa: BLE001 (an unknown lead means the owner's default preset)
+            _logger.warning("create_session: could not read lead %s", opener)
+    try:
+        spawn = await asyncio.to_thread(
+            spawn_role.resolve,
+            parent=parent_conv,
+            user=user,
+            role=body.role,
+            model=body.model,
+            effort=body.effort,
+            preset=body.preset,
+            harness=body.harness if "harness" in body.model_fields_set else None,
+            standalone=body.standalone,
+        )
+    except spawn_role.UnknownPreset as exc:
+        return _error(422, ErrorCode.INVALID_INPUT, str(exc))
+    except Exception:  # noqa: BLE001 (presets unreadable: start as if no role was given)
+        _logger.warning(
+            "create_session: role resolution failed; starting without it", exc_info=True
+        )
+        spawn = spawn_role.Spawn(
+            harness=body.harness,
+            model=body.model,
+            effort=body.effort,
+            preset=body.preset or role_prefs.DEFAULT_PRESET,
+        )
+    body = body.model_copy(update={"harness": spawn.harness})
+    family = _family_of_parent(rows, parent)
     hold = f"orch:{key}"
-    limit = await asyncio.to_thread(slot_limit.effective_limit)
-    held, full, working, pending = slot_cap.reserve(hold, rows, limit, riding=body.ride_unparked)
+    rules = await asyncio.to_thread(slot_limit.resolve)
+    cap = rules.family_children if family is not None else 0
+    limit, helpers = rules.limit, rules.helpers_count
+    try:
+        held, full, working, pending = slot_cap.reserve(
+            hold,
+            rows,
+            limit,
+            riding=body.ride_unparked,
+            family=family,
+            family_cap=cap,
+            helpers_count=helpers,
+        )
+    except slot_cap.FamilyFull as exc:
+        now = time.time()
+        return _error(
+            409,
+            CODE_FAMILY_FULL,
+            f"Nothing was started: {len(exc.children)} of this family's sessions are already "
+            f"working, the most one lead may run at once ({exc.cap}). Wait for one to finish "
+            "or set it to review, then start this one.",
+            working=[sessions.summarize(conv, now=now).as_dict() for conv in exc.children],
+            limit=exc.cap,
+        )
     if not held:
         now = time.time()
         return _error(
@@ -1513,18 +2941,39 @@ async def start_session(request: Request, body: SessionRequest) -> dict[str, Any
                 "block",
                 None,
                 pending=pending,
+                used=sessions.slots_held(
+                    working, helpers_count=helpers, by_id={row.id: row for row in rows}
+                ),
             ),
             working=[sessions.summarize(conv, now=now).as_dict() for conv in working],
             limit=limit,
         )
     try:
-        return await _create_briefed(request, body, key, overflow=full)
+        return await _create_briefed(
+            request, body, key, overflow=full, parent=parent, spawn=spawn, user=user
+        )
     finally:
         slot_cap.release(hold)
 
 
+def _family_of_parent(rows: list[Any], parent: str | None) -> str | None:
+    """The family a session started by *parent* joins, or ``None`` without a parent."""
+    if parent is None:
+        return None
+    by_id = {row.id: row for row in rows}
+    row = by_id.get(parent)
+    return sessions.family_key(row, by_id) if row is not None else parent
+
+
 async def _create_briefed(
-    request: Request, body: SessionRequest, key: str, *, overflow: bool
+    request: Request,
+    body: SessionRequest,
+    key: str,
+    *,
+    overflow: bool,
+    parent: str | None,
+    spawn: spawn_role.Spawn,
+    user: str | None = None,
 ) -> dict[str, Any] | JSONResponse:
     try:
         agent = await _resume_agent(request, HARNESS_AGENTS[body.harness])
@@ -1538,7 +2987,7 @@ async def _create_briefed(
     session_labels = {
         labels.STATUS: labels.WORKING,
         labels.STARTED: str(int(time.time())),
-        labels.ORCH: body.orchestrator or "1",
+        labels.ORCH: parent or labels.ORCH_UNKNOWN,
         labels.ORCH_KEY: key,
         _UI_MODE_LABEL: "terminal",
         _WRAPPER_LABEL: _NATIVE_WRAPPERS[str(agent["name"])],
@@ -1549,6 +2998,11 @@ async def _create_briefed(
         session_labels[labels.BRANCH] = body.branch.strip()
     if overflow:
         session_labels[labels.OVERFLOW] = "1"
+    if body.role:
+        session_labels[labels.ROLE] = body.role
+    session_labels[labels.PRESET] = spawn.preset
+    if body.preset:
+        session_labels[_TEAM_LABEL] = spawn_role.team_label(spawn.preset)
     create = {
         "agent_id": agent["id"],
         "host_id": host["host_id"],
@@ -1556,6 +3010,10 @@ async def _create_briefed(
         "labels": session_labels,
         "title": body.title.strip(),
     }
+    if spawn.model:
+        create["model_override"] = spawn.model
+    if spawn.effort:
+        create["reasoning_effort"] = spawn.effort
     try:
         created = await _loopback(request, "POST", "/v1/sessions", create)
     except httpx.HTTPError as exc:
@@ -1585,10 +3043,13 @@ async def _create_briefed(
             session_id=session_id,
             path=f"/c/{session_id}",
         )
+    await asyncio.to_thread(preset_log.append, session_id, None, spawn.preset, user)
     return {
         "session_id": session_id,
         "existing": False,
         "key": key,
+        "model": spawn.model,
+        "effort": spawn.effort,
         "title": create["title"],
         "path": f"/c/{session_id}",
         "host": {"id": host["host_id"], "name": host.get("name")},
@@ -2167,6 +3628,144 @@ async def azure_cost_view(
     return await azure_cost.overview()
 
 
+@router.get("/azure-cost/targets", response_model=None)
+async def azure_cost_targets_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The cost targets, each with its status, and the names a scope can take; admins only.
+
+    Added 2026-10-25. Reads the Azure card's cache and the last Fabric tick; it never asks
+    Azure or Fabric anything and never writes to either.
+    """
+    if (refused := await _admin_only(request, user, "see cost targets")) is not None:
+        return refused
+    try:
+        data = await asyncio.to_thread(cost_targets.load_rules)
+    except cost_targets.RulesFileError as exc:
+        return _error(503, "cost_targets_unreadable", str(exc))
+    return cost_targets.view_now(data)
+
+
+@router.put(
+    "/azure-cost/targets/{target_id}",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+@router.post(
+    "/azure-cost/targets/{target_id}",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def azure_cost_target_put(
+    request: Request,
+    target_id: Annotated[str, Path(max_length=60)],
+    body: cost_targets.RuleBody,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Create or replace one cost target; admins only. 422 says what to change.
+
+    ``POST`` is the same call: the extension host's ``server.request`` sends only GET, POST
+    and PATCH, so the card cannot use ``PUT``.
+    """
+    if (refused := await _admin_only(request, user, "change cost targets")) is not None:
+        return refused
+    try:
+        rule = await asyncio.to_thread(cost_targets.put_rule, target_id, body)
+    except cost_targets.RuleError as exc:
+        return _error(422, ErrorCode.INVALID_INPUT, str(exc))
+    except cost_targets.RulesFileError as exc:
+        return _error(503, "cost_targets_unreadable", str(exc))
+    except OSError:
+        return _error(
+            503,
+            "cost_targets_not_saved",
+            "The target could not be saved (the targets file is not writable). "
+            "Check AE_COST_TARGETS_FILE and the /data volume.",
+        )
+    _logger.info("cost target %s saved by %s", rule.id, user)
+    row = cost_targets.row_now(rule)
+    return {"rule": row}
+
+
+@router.delete(
+    "/azure-cost/targets/{target_id}",
+    response_model=None,
+    dependencies=[Depends(require_trusted_origin)],
+)
+@router.post(
+    "/azure-cost/targets/{target_id}/delete",
+    response_model=None,
+    dependencies=[Depends(require_trusted_origin)],
+)
+async def azure_cost_target_delete(
+    request: Request,
+    target_id: Annotated[str, Path(max_length=60)],
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Delete one cost target; admins only. Its open alert task is closed at the next check.
+
+    ``POST .../delete`` is the same call, for the extension host (GET, POST and PATCH only).
+    """
+    if (refused := await _admin_only(request, user, "change cost targets")) is not None:
+        return refused
+    try:
+        found = await asyncio.to_thread(cost_targets.delete_rule, target_id)
+    except cost_targets.RulesFileError as exc:
+        return _error(503, "cost_targets_unreadable", str(exc))
+    except OSError:
+        return _error(
+            503,
+            "cost_targets_not_saved",
+            "The target could not be deleted (the targets file is not writable). "
+            "Check AE_COST_TARGETS_FILE and the /data volume.",
+        )
+    if not found:
+        return _not_found(f"no cost target {target_id}")
+    _logger.info("cost target %s deleted by %s", target_id, user)
+    return {"ok": True, "deleted": target_id}
+
+
+@router.get("/presets", response_model=None)
+async def presets_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    days: Annotated[int, Query()] = 30,
+) -> dict[str, Any] | JSONResponse:
+    """Preset insights for the last 7 or 30 days; admins only.
+
+    Never waits on the run log: it answers the cache and recomputes in a thread when the
+    cache is over five minutes old; with no cache yet it answers ``{"state": "warming"}``
+    (:mod:`.preset_stats`). Admin only because it lists every user's session titles. Both
+    cost and token totals are always in the answer; ``show`` is the caller's own pick.
+    """
+    if days not in preset_stats.WINDOWS:
+        return _error(422, "invalid_days", "days must be 7 or 30.")
+    if (refused := await _admin_only(request, user, "see preset insights")) is not None:
+        return refused
+    answer = preset_stats.overview(days)
+    # The cache is shared; what to show is the caller's own setting (cost, tokens or both).
+    state = await asyncio.to_thread(role_prefs.store().get, user or "local")
+    show = state.insights.show if state.insights else "both"
+    return {**answer, "show": show}
+
+
+@router.get("/git", response_model=None)
+async def git_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    fresh: bool = False,
+) -> dict[str, Any] | JSONResponse:
+    """Every configured repo's open PRs, Dependabot alerts and stray branches; admins only.
+
+    Read only (:mod:`.git_center`), cached 300 s; ``?fresh=true`` awaits a new load.
+    Admins only (2026-10-24): it carries repo names and security alerts.
+    """
+    if (refused := await _admin_only(request, user, "see the Git repos")) is not None:
+        return refused
+    return await git_center.overview(fresh=fresh)
+
+
 @router.get("/databricks")
 async def databricks_view(
     request: Request, user: Annotated[str | None, Depends(require_ae_user)]
@@ -2291,6 +3890,12 @@ DEBUG_ROUTERS: list[tuple[APIRouter, str, list[str]]] = [
     (merge_watch.lifespan_router, "", ["ae"]),
     # No routes: loads the Azure card's saved reading at boot (2026-10-22).
     (azure_cost.lifespan_router, "", ["ae"]),
+    # No routes: seeds the cost targets and runs their hourly check (2026-10-25).
+    (cost_targets.lifespan_router, "", ["ae"]),
+    # No routes: archives chats left in reference for ten minutes (2026-10-24).
+    (auto_archive.lifespan_router, "", ["ae"]),
+    # No routes: writes the preset run log when a lead's run ends (2026-10-24).
+    (preset_runs.lifespan_router, "", ["ae"]),
 ]
 
 __all__ = [

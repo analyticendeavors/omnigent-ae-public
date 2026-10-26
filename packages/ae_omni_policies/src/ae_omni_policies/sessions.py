@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -39,6 +39,11 @@ MAX_ROWS = 500
 # Upstream's live_status for a turn that errored ("idle", "running", "waiting",
 # "failed"; omnigent/entities/conversation.py).
 FAILED = "failed"
+# A turn that ended and is waiting for the next prompt.
+IDLE = "idle"
+# A helper started this recently still counts as busy when it reads idle: the row has not
+# reported its first turn yet, and a burst of creates must not slip past the family cap.
+FRESH_HELPER_S = 60
 
 
 def list_top_level(
@@ -76,13 +81,19 @@ def current_conversation_id() -> str | None:
     return current_session_id()
 
 
-def own_row(store: Any | None = None) -> Conversation | None:
+def own_row(
+    store: Any | None = None, event: Mapping[str, Any] | None = None
+) -> Conversation | None:
     """The conversation being evaluated, fresh from the store.
 
     :param store: A conversation store; defaults to the runtime's.
-    :returns: The row, or ``None`` when the ambient id is unknown or the row is gone.
+    :param event: The policy event. Its ``context.conversation_id`` (injected by the
+        engine) names the session first, since the ambient id can be unset or another
+        session's on the path a child's first message takes (2026-10-24).
+    :returns: The row, or ``None`` when the id is unknown or the row is gone.
     """
-    session_id = current_conversation_id()
+    context = (event or {}).get("context") or {}
+    session_id = context.get("conversation_id") or current_conversation_id()
     if not session_id:
         return None
     store = store if store is not None else get_conversation_store()
@@ -118,6 +129,110 @@ def working_sessions(rows: Sequence[Conversation]) -> list[Conversation]:
     ]
     working.sort(key=started_at)
     return working
+
+
+# How far up the ae.orch chain a family root is looked for: a lead's children
+# start their own children rarely, and a cycle must end.
+_FAMILY_DEPTH = 8
+
+
+def family_key(conv: Conversation, by_id: Mapping[str, Conversation]) -> str:
+    """The id of the session at the top of *conv*'s ``ae.orch`` chain, or its own id.
+
+    A parent that is not in *by_id* (archived, or never listed) still names the
+    family, so its children keep counting as one.
+    """
+    key = conv.id
+    seen = {key}
+    parent = labels.orch_parent(conv.labels)
+    for _ in range(_FAMILY_DEPTH):
+        if parent is None or parent in seen:
+            break
+        key = parent
+        seen.add(key)
+        row = by_id.get(key)
+        parent = labels.orch_parent(row.labels) if row is not None else None
+    return key
+
+
+def family_keys(rows: Sequence[Conversation]) -> dict[str, str]:
+    """Each row's :func:`family_key`, by row id."""
+    by_id = {row.id: row for row in rows}
+    return {row.id: family_key(row, by_id) for row in rows}
+
+
+def is_helper(conv: Conversation, by_id: Mapping[str, Conversation] | None = None) -> bool:
+    """A session another one started (``ae.orch`` names a parent): a helper, builder or reviewer.
+
+    A row that names itself as its parent, or whose ``ae.orch`` chain (as far as *by_id*
+    reaches) leads back to it, has no lead above it: it counts as a lead (2026-10-26).
+    """
+    parent = labels.orch_parent(conv.labels)
+    if parent is None:
+        return False
+    seen = {conv.id}
+    for _ in range(_FAMILY_DEPTH):
+        if parent in seen:
+            return parent != conv.id  # a loop through this row means no lead above it
+        seen.add(parent)
+        row = by_id.get(parent) if by_id is not None else None
+        above = labels.orch_parent(row.labels) if row is not None else None
+        if above is None:
+            return True  # a lead (or a parent out of sight) sits above it
+        parent = above
+    return True
+
+
+def held_keys(
+    working: Sequence[Conversation],
+    *,
+    helpers_count: bool = False,
+    by_id: Mapping[str, Conversation] | None = None,
+) -> set[str]:
+    """The ids that hold a slot among the *working* rows.
+
+    A family holds one slot, through its lead: a working row with no ``ae.orch`` parent.
+    A working helper whose lead is parked, archived or absent holds nothing (2026-10-26,
+    Codex: it used to keep its family's slot alive). With *helpers_count* on, each working
+    helper also holds a slot of its own, in addition to its lead's. *by_id* (every row)
+    lets an ``ae.orch`` cycle through a parked row be seen; it defaults to the working rows.
+    """
+    ids = by_id if by_id is not None else {row.id: row for row in working}
+    return {row.id for row in working if helpers_count or not is_helper(row, ids)}
+
+
+def slots_held(
+    working: Sequence[Conversation],
+    *,
+    helpers_count: bool = False,
+    by_id: Mapping[str, Conversation] | None = None,
+) -> int:
+    """Slots the *working* rows hold: one per lead, plus one per helper when *helpers_count*."""
+    return len(held_keys(working, helpers_count=helpers_count, by_id=by_id))
+
+
+def family_children_working(
+    family: str,
+    working: Sequence[Conversation],
+    keys: Mapping[str, str],
+    now: float | None = None,
+) -> list[Conversation]:
+    """The busy rows in *family* other than the family's own top session.
+
+    Busy is any live status but ``idle`` (2026-10-24): a helper that finished its turn keeps
+    ``ae.status=working`` until someone flips it, and counting it left a lead with three
+    idle helpers stuck on ``409 family_full``. A row that never reported (``None``) is
+    just starting and counts, so a burst of creates still stops at the cap; so does an idle
+    one started under :data:`FRESH_HELPER_S` ago (``ae.started``, else ``created_at``).
+    """
+    now = time.time() if now is None else now
+    return [
+        row
+        for row in working
+        if row.id != family
+        and keys.get(row.id, row.id) == family
+        and (row.live_status != IDLE or now - started_at(row) < FRESH_HELPER_S)
+    ]
 
 
 def started_at(conv: Conversation) -> int:
@@ -197,17 +312,24 @@ def summarize(conv: Conversation, *, now: float | None = None) -> SessionSummary
 
 __all__ = [
     "FAILED",
+    "IDLE",
     "MAX_ROWS",
     "PAGE_SIZE",
     "SessionSummary",
     "current_conversation_id",
     "display_title",
+    "family_children_working",
+    "family_key",
+    "family_keys",
     "format_elapsed",
+    "held_keys",
     "is_blocked",
     "is_failed",
+    "is_helper",
     "is_top_level",
     "list_top_level",
     "own_row",
+    "slots_held",
     "started_at",
     "summarize",
     "working_sessions",

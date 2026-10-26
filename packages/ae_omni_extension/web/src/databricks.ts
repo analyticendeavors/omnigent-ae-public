@@ -209,11 +209,48 @@ export function barPercent(usd: number | null, credit: number): number {
   return Math.min(100, Math.max(0, (usd / credit) * 100));
 }
 
-/** "as of 2:00 PM (billing data lags a few hours)", or null without data. */
+/** A reading this old (48 hours) turns amber: nobody has pressed Refresh or the warehouse stayed off. */
+export const STALE_READING_MS = 48 * 60 * 60 * 1000;
+
+/** "just now", "35 min ago", "2 h ago", "3 d ago" for a reading *ms* old. */
+export function readAgeText(ms: number, now: number): string {
+  const minutes = Math.floor(Math.max(0, now - ms) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} min ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${hours} h ago`;
+  return `${Math.floor(hours / 24)} d ago`;
+}
+
+/** When the last good reading finished, in ms, or null without one. */
+function readAtMs(spend: DatabricksSpend): number | null {
+  const ms = spend.readAt ? Date.parse(spend.readAt) : Number.NaN;
+  return Number.isNaN(ms) ? null : ms;
+}
+
+/** Whether the numbers were read 48 hours ago or more. */
+export function readingIsStale(spend: DatabricksSpend | null, now: number): boolean {
+  const ms = spend ? readAtMs(spend) : null;
+  return ms !== null && now - ms >= STALE_READING_MS;
+}
+
+/**
+ * "as of 2 h ago (billing data lags a few hours)", or null without data. The age is the
+ * reading's (when it was taken); a server that sends no `readAt` gets the newest usage row's
+ * time instead.
+ */
 export function asOfText(spend: DatabricksSpend, now: number): string | null {
+  const read = readAtMs(spend);
+  if (read !== null) return `as of ${readAgeText(read, now)} (billing data lags a few hours)`;
   const ms = spend.asOf ? Date.parse(spend.asOf) : Number.NaN;
   if (Number.isNaN(ms)) return null;
   return `as of ${whenText(ms, now)} (billing data lags a few hours)`;
+}
+
+/** "as of 2 h ago" for the tile note, or null before any reading. */
+function asOfAge(spend: DatabricksSpend, now = Date.now()): string | null {
+  const ms = readAtMs(spend);
+  return ms === null ? null : `as of ${readAgeText(ms, now)}`;
 }
 
 /** The strip's one status line for a state other than a good reading, if any. */
@@ -305,13 +342,14 @@ function headlineUsd(spend: DatabricksSpend): number | null {
 }
 
 /** The credit's health: a problem once spent, attention past three quarters. */
-export function creditHealth(spend: DatabricksSpend | null): Health {
+export function creditHealth(spend: DatabricksSpend | null, now = Date.now()): Health {
   if (!spend) return "idle";
   if (spend.status === "error" || spend.status === "no_access") return "attention";
   const used = headlineUsd(spend);
   if (used == null || spend.creditUsd <= 0) return "idle";
   if (used >= spend.creditUsd) return "problem";
-  return used >= spend.creditUsd * 0.75 ? "attention" : "ok";
+  // Amber also when the numbers are two days old, however much credit is left.
+  return used >= spend.creditUsd * 0.75 || readingIsStale(spend, now) ? "attention" : "ok";
 }
 
 /** The Databricks tile: the first warehouse's state, the headline spend of the credit. */
@@ -331,8 +369,10 @@ export function databricksTile(data: DatabricksOverview | null, error: unknown):
   const first = data.warehouses[0];
   const spend = data.spend;
   const used = spend ? headlineUsd(spend) : null;
+  const age = spend ? asOfAge(spend) : null;
   const note = spend
-    ? `${used == null ? "spend not read" : dollars(used)} of ${dollars(spend.creditUsd)} used`
+    ? `${used == null ? "spend not read" : dollars(used)} of ${dollars(spend.creditUsd)} used` +
+      (age ? ` · ${age}` : "")
     : "";
   const credit = creditHealth(spend);
   // A listing that failed (auth, timeout) comes back as a 200 with no
@@ -782,6 +822,7 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
   const status = spendStatusText(spend, state.data?.can_act === true);
   const hasNumbers = spend.monthUsd != null || spend.totalUsd != null;
   const asOf = asOfText(spend, now);
+  const asOfClass = readingIsStale(spend, now) ? "dbx-asof dbx-asof-stale" : "dbx-asof";
   const node = el(
     "div",
     { class: "card card-fabric dbx-spend", role: "group", "aria-labelledby": "dbx-spend-h" },
@@ -800,11 +841,11 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
             "div",
             { class: "dbx-bars" },
             ...spendBars(spend).map((bar) => barNode(bar, spend.creditUsd)),
-            asOf ? el("p", { class: "dbx-asof" }, asOf) : null,
+            asOf ? el("p", { class: asOfClass }, asOf) : null,
           ),
         )
       : asOf
-        ? el("p", { class: "dbx-asof" }, asOf)
+        ? el("p", { class: asOfClass }, asOf)
         : null,
     hasNumbers ? breakdownBlock(spend) : null,
     spend.note ? el("p", { class: "dbx-asof dbx-note" }, spend.note) : null,

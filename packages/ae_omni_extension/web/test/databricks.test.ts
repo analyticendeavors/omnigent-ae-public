@@ -10,6 +10,10 @@ import { resetMenuState } from "../src/cards";
 import {
   activateDatabricks,
   asOfText,
+  creditHealth,
+  databricksTile,
+  readAgeText,
+  readingIsStale,
   barPercent,
   barText,
   databricksSection,
@@ -267,11 +271,36 @@ describe("the pieces", () => {
 
   it("says how old the billing data is", () => {
     const now = Date.parse("2026-10-19T12:30:00");
-    const today = asOfText(spend({ asOf: "2026-10-19T12:00:00" }), now);
+    const today = asOfText(spend({ readAt: null, asOf: "2026-10-19T12:00:00" }), now);
     expect(today).toMatch(/^as of \d{1,2}:00\s?[AP]M \(billing data lags a few hours\)$/);
-    const yesterday = asOfText(spend({ asOf: "2026-10-18T09:00:00" }), now);
+    const yesterday = asOfText(spend({ readAt: null, asOf: "2026-10-18T09:00:00" }), now);
     expect(yesterday).toMatch(/^as of [A-Z][a-z]{2} 18, \d{1,2}:00\s?[AP]M \(/);
-    expect(asOfText(spend({ asOf: null }), now)).toBeNull();
+    expect(asOfText(spend({ readAt: null, asOf: null }), now)).toBeNull();
+  });
+
+  it("says how long ago the spend was read, from the reading's time", () => {
+    const now = Date.parse("2026-10-19T17:10:00Z");
+    expect(asOfText(spend({ readAt: "2026-10-19T15:10:00Z" }), now)).toBe(
+      "as of 2 h ago (billing data lags a few hours)",
+    );
+    expect(readAgeText(now - 30_000, now)).toBe("just now");
+    expect(readAgeText(now - 35 * 60_000, now)).toBe("35 min ago");
+    expect(readAgeText(now - 3 * 86_400_000, now)).toBe("3 d ago");
+  });
+
+  it("turns amber past 48 hours: the line, and the credit's health", () => {
+    const now = Date.parse("2026-10-23T15:10:00Z");
+    expect(readingIsStale(spend({ readAt: "2026-10-21T15:11:00Z" }), now)).toBe(false);
+    expect(readingIsStale(spend({ readAt: "2026-10-21T15:10:00Z" }), now)).toBe(true);
+    expect(readingIsStale(spend({ readAt: null }), now)).toBe(false);
+    expect(creditHealth(spend({ readAt: "2026-10-21T15:10:00Z" }), now)).toBe("attention");
+    expect(creditHealth(spend({ readAt: "2026-10-23T14:10:00Z" }), now)).toBe("ok");
+  });
+
+  it("puts the reading's age in the tile note", () => {
+    const readAt = new Date(Date.now() - 2 * 3_600_000).toISOString();
+    const tile = databricksTile(overview([], { spend: spend({ readAt }) }), null);
+    expect(tile.note).toMatch(/ used · as of 2 h ago$/);
   });
 
   it("ends the error line with one period whether or not the server's message has one", () => {

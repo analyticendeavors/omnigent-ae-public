@@ -1444,3 +1444,89 @@ SKU and price. On the page each row's SKU is a size picker, and a pick
 opens a confirm naming both sizes and both prices an hour; only its Resize button
 sends the call. Details in `packages/ae_omni_policies/src/ae_omni_policies/fabric.py`
 (module note) and `packages/ae_omni_extension/README.md`.
+
+2026-10-23: the dashboard's pull request cards (Open PRs and Your move) gained the dock's two state actions, Mark ready for review on a draft and Update branch on a branch that is behind, each pinned to the head the card showed; each card also opens Review details (size, description, and the AE compliance review with its verdict and whether it covers the current head, read only when opened and kept across redraws; on Your move a Review details button reads the card without starting a merge); Reference lines gained a menu that moves a closed session back to Working or Review. No core patch; extension bundle only.
+
+Secret expiry list (2026-10-23, Reid): the Admin Center's Server secrets chips became
+one row per key with its Key Vault name, its expiry (amber inside 60 days, red once
+past, "no expiry set" otherwise), when it last changed, and Edit and Rotate links. Edit
+is the secret's Azure portal page; Rotate is the system that issues the value, with a
+hint naming the account it opens (a Databricks login in the wrong tenant had cost an
+hour that day). The server never reads Key Vault, so a daily user timer on the box
+(`ae-omnigent-secrets-meta`) runs `python -m ae_omni_policies.secrets_relay`, which
+lists the vault's secrets (attributes only, never `secret show`), keeps the names
+`secrets_meta.VAULT_NAMES` maps to server keys (a test parses `deploy/pull-secrets.sh`
+and fails on any difference) and posts name, enabled, expires and updated to the admin-only
+`POST /v1/ae/secrets/meta`; the server keeps the last post in `/data/ae-secrets-meta.json`
+(`AE_SECRETS_META_FILE`) and `GET /v1/ae/secrets` merges it. A required key that has
+expired turns the card red; the tile says how many are expiring. The card says when no
+reading exists or the newest is over 36 hours old. There is no Refresh button: the page
+already reads again on focus, and `systemctl --user start ae-omnigent-secrets-meta.service`
+refreshes the dates at once. Install steps are in `deploy/README.md` (Secret expiry dates).
+
+Admin Center spend polish (2026-10-23, Reid): the Azure spend card said "Cost Management is
+rate limiting." under each of its four subscriptions; it now says it once under the month
+total. `GET /v1/ae/azure-cost` carries `rateLimit` (`retryAt`, the time the next try is due,
+and `goodAt`, when a pass last read any subscription), kept in the state file across a
+restart; the card names the next try while it is ahead and otherwise says the numbers are
+from the last good reading and how old that is. A subscription's own error (no role, a
+refused principal) still shows on its row. The Databricks credit card read "as of Oct 19" four
+days later because the server only read spend on a RUNNING warehouse with an auto stop under
+30 minutes, at most every 30 minutes; it now reads when the warehouse is already RUNNING and
+auto stops in under an hour or never, at most once an hour, and never starts a stopped one.
+The card and the tile note show the reading's age ("as of 2 h ago"), amber past 48 hours; the
+manual Refresh button is unchanged. No core patch; the server and the extension bundle only.
+
+Key Vault card (2026-10-23, Reid approved the concept that day): the Admin Center now
+answers two questions in two places. Box health keeps "does this box have what it
+needs": its secrets block is "Secrets on this box", collapsed by default to the
+counts and a chip per key that needs you (missing, expired, inside 60 days, refused),
+with Show keys remembered per user. The host's `CLAUDE_CODE_OAUTH_TOKEN` joins the
+rows: the relay checks `/secure/env/omnigent-host.env` by key name only. A new Key
+Vault card lists every secret in both vaults (103 and 10 that day) by name, with a
+vault switch, four counts (expired, under 60 days, no expiry, untouched 180 days),
+a short Needs you list, and a searchable, filterable list grouped by the first word
+of each name. The Secrets tile split into "Secrets on box" and "Key Vault". The relay
+(`secrets_relay.py`) now posts every secret of both vaults and the server keeps them
+all (`/data/ae-secrets-meta.json`); the new `GET /v1/ae/vault` is admin only
+(`vault_inventory.py`), and the post's cap rose from 500 to 1,000 names per vault.
+Source expiry: a vault secret tagged `ae-source=entra:<appId>` carries its Entra
+app's latest secret end date (`az ad app list`, end dates only), and the server
+records GitHub's `github-authentication-token-expiration` header for
+`AE_GITHUB_TOKEN`; a row's expiry is the earlier date, marked "from Entra" or "from
+GitHub". `deploy/vault-source-tags.sh` proposes those tags and sets them with
+`--apply`. Last worked: `key_health.py` keeps, in memory, the newest outcome of the
+server's own calls per feature (Databricks and Azure cost tokens, GitHub API, task
+store, Fabric Logic Apps, a working OIDC sign-in, success only), as a status code or
+an error class only, and each box row says "worked 2:07 PM" or "failed: 401 at 1:50 PM". No core
+patch; extension bundle and AE package only.
+
+Secret expiry alerts and owners (2026-10-23, Reid approved the plan that day): a
+secret's expiry now reaches Reid's phone. After the box's daily reading lands
+(`POST /v1/ae/secrets/meta`, 06:15), the server files a task-store task for each
+secret whose effective expiry (the card's own, vault or Entra or GitHub) is 30 days
+or fewer away, moves the same task's alarm at 7 days and once more when it expires,
+and closes it when the expiry moves out (the secret was rotated). The alarm is 09:00
+on the home clock (`AE_TASK_STORE_TZ`), which is what the task app pushes; tasks land
+in `AE_SECRET_ALERT_LIST` ("AE Work" until a DevOps board is chosen) with the `ae`
+tag. One task per secret per expiry date, kept in `/data/ae-secret-alerts.json`, and
+found again by its "Alert key" line if that file is lost (`secret_alerts.py`).
+Owners: each secret can be given an OmniGent member as owner from the Key Vault card,
+one row or a whole group at a time (`POST /v1/ae/vault/owner`, people from
+`GET /v1/ae/vault/people`, both admin only; the map lives in
+`/data/ae-secret-owners.json`, never in Key Vault). Rows and Needs you lines show the
+owner's initials, filter chips count each owner and "No owner", Needs you says when an
+alarm is set, and the tile says when the next alarm rings. Vault rows gained a Rotate
+link (the Entra app's Credentials page for a tagged app secret). Also fixed: the
+meta POST's save-failure path named `ErrorCode.INTERNAL`, which does not exist. No
+core patch; extension bundle and AE package only.
+
+Key Vault card fix (2026-10-23, Reid): the card read "The Key Vault inventory could not be read (Server response exceeds the limit)" after PR 304. That PR added a rotate link and hint to every row, which took the answer to 91 KB for 116 secrets; the extension bridge refuses more than 64 KiB. Rows now omit `edit_url` (the page builds the portal link from the vault and secret name) and send `rotate_url` and `rotate_hint` only when the issuer has its own page, and a test holds the answer for 116 secrets under 56 KiB. No core patch; extension bundle and AE package only.
+
+Key Vault card, rows in pages (2026-10-24, Reid): PR 306 brought the answer to 51,000 characters, but the card still read "Server response exceeds the limit". The bridge counts two bytes per UTF-16 unit against 64 KiB, so its real cap is 32,768 characters, and PR 306 tested against the wrong number. The card now reads `GET /v1/ae/vault?rows=false` (counts, needs-you list, groups, alerts) and then each vault's rows from the new `GET /v1/ae/vault/rows?vault=<name>&start=<n>`, 25 rows a page, admin only; a test holds the summary and every page under 32,768 characters for 130 worst-case rows. No core patch; extension bundle and AE package only.
+
+Slot card names the count it would make (2026-10-24, Reid): Reid approved a session at the slot limit and read the card's "Slots full: 4 of 4 working" as if that session were the 4th, so the cap seemed to ask at the limit instead of past it. It had counted right: four others were working and the new one made five. The reason text now reads "Slots full: 4 of 4 taken; this one would make 5 of 4.", on the approval card, the block-mode refusal and the `POST /v1/ae/sessions` 409 alike. No core patch; AE package only.
+
+Git repos card (2026-10-24, Reid): after a backlog cleanup across three GitHub accounts took dozens of `gh` queries, Reid asked for one place that shows every repo. Of two mockups (a card in the Admin Center, a standalone page) he picked the card, read only first, with a read-only token per personal account. `GET /v1/ae/git` (admin only, cached 5 minutes) reads the Dependency Sweep's repo list, then per repo one GraphQL query for open pull requests, branches with no open or merged pull request and open Dependabot alerts. Each alert is checked against its lockfile on the default branch, because GitHub's alerts lag the fix by hours and on 2026-10-22 its dependency graph dropped a push outright: that day 38 open alerts were already fixed on main. Those land under "Fixed on main, waiting on GitHub"; only alerts still vulnerable, or whose lockfile cannot be read, count as needing a fix. Before it shipped, Reid asked for mockups of the card itself and picked "Needs you first" out of three (sections, needs you first, by repo): on the day it was built, every one of the 38 open alerts was GitHub lag and three of the four pull requests were drafts or still in CI, so a card that gave each section equal room mostly showed nothing to do. It follows the Key Vault card's shape (numbers, Needs you, Show all). No core patch; extension bundle and AE package only.
+
+Cost targets on the Azure card (2026-10-25, Reid): the Azure card shows spend, but only to someone who opens it, and a Fabric capacity left running bills $0.72 an hour while nobody looks. Reid asked to set limits and get a task with a phone alarm when one is crossed. The card now has a Targets panel (add, edit, switch on or off, delete with a confirm in the page) and the server (`cost_targets.py`) judges each target against the reading it already holds: month to date, latest finished day and month-end forecast (the card's pace figure, needing three days of data) for all of Azure, one subscription, one service (month to date only) or one resource (latest finished day only); and hours Active for a Fabric capacity. Two limits shaped it. Cost Management is rate limited and shared, so no query was added: a rate-limited, stale or missing reading makes a target `cannot-evaluate` and files nothing, and a subscription billed in another currency is skipped for USD limits. The reading keeps services by month and resources for nine days, which is why a service has no day figure and a resource no month figure. Fabric's reading has no start time for most capacities, so the hourly check records when it first saw each one Active and counts from there (a recent `resumedAt` wins when it exists). Alerts file one task per target and period (month, data day, or Active episode) in the list named by `AE_COST_ALERT_LIST` (default AE Work), with the 09:00 home-clock alarm the expiry alerts use, or an alarm three minutes out for Fabric; they close when the value falls back, and a spend task from a finished month is left open for a person to tick. A lost state file is rebuilt from each task's "Alert key" line. Defaults seed once, only while the targets file does not exist: month to date over $600 for MVP SC and MVP 2025, over $50 for AnalyticEndeavors and AnalyticEndeavorsTools, any resource over $25 a day, any capacity Active over 6 hours; all can be edited or deleted and stay deleted. The extension host sends only GET, POST and PATCH, so the card saves and deletes with POST (`/azure-cost/targets/{id}` and `/{id}/delete`) while `PUT` and `DELETE` work too. The answer is capped under the bridge's 32,768 characters and a test holds it. No core patch; extension bundle and AE package only.

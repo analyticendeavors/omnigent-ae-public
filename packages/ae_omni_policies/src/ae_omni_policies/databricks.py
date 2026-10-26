@@ -42,8 +42,8 @@ Cost guard: ``GET`` never starts anything. A spend reading runs a query on a
 warehouse, and a query on a stopped serverless warehouse starts it and bills
 until it auto stops, so ``GET`` starts a reading only when the chosen
 warehouse (a serverless one, RUNNING preferred, then STARTING) is already
-RUNNING, auto stops in under :data:`SPEND_STALE_S` (so periodic reads can never
-hold it awake), and the last attempt is older than that (or there was none);
+RUNNING, auto stops in under :data:`SPEND_STALE_S` or never (so hourly reads can
+never hold it awake), and the last attempt is over an hour old (or there was none);
 the background task then reads the warehouse's state again, uncached, and
 posts the query only if it is still RUNNING. Otherwise only
 ``POST /v1/ae/databricks/spend/refresh`` reads, and the page labels that
@@ -105,7 +105,7 @@ from urllib.parse import quote, quote_plus, urlencode
 
 import httpx
 
-from ae_omni_policies import __version__
+from ae_omni_policies import __version__, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -135,7 +135,8 @@ POLL_INTERVAL_S = 5.0
 READING_DEADLINE_S = 240.0
 CANCEL_TIMEOUT_S = 5.0
 # GET starts a reading on a RUNNING warehouse only when the last attempt is older.
-SPEND_STALE_S = 30 * 60.0
+SPEND_STALE_S = 60 * 60.0
+SPEND_ERROR_RETRY_S = 15 * 60.0
 USER_AGENT = f"omnigent-ae/{__version__} (+https://github.com/analyticendeavors/omnigent-ae)"
 
 # An https origin: a dotted host name and an optional port, nothing after it.
@@ -475,6 +476,25 @@ def drop_token(ws: Workspace | None = None) -> None:
         _retire(ws.key())
 
 
+_REFUSED_CODES = frozenset({"invalid_client", "unauthorized_client", "invalid_grant"})
+
+
+def _refused_credential(status: int, body: bytes) -> bool:
+    """Whether the token endpoint refused the service principal itself.
+
+    A 401 does; a 400 or 403 only when its OAuth ``error`` names the client (review of
+    https://github.com/analyticendeavors/omnigent-ae/pull/301): a malformed request
+    or a scope the principal lacks is not a bad secret. Only the code is read.
+    """
+    if status == 401:
+        return True
+    try:
+        payload = json.loads(body)
+    except ValueError:
+        return False
+    return isinstance(payload, dict) and payload.get("error") in _REFUSED_CODES
+
+
 async def _token(ws: Workspace, transport: httpx.AsyncBaseTransport) -> str:
     """A ``scope=sql`` token, from the cache until five minutes before it expires."""
     key = ws.key()
@@ -510,6 +530,9 @@ async def _token(ws: Workspace, transport: httpx.AsyncBaseTransport) -> str:
         if status != 200:
             _upstream, detail = _body_error(body, ws)
             if status in (400, 401, 403):
+                if _refused_credential(status, body):
+                    # The Admin Center's secrets list shows the refusal by its status only.
+                    key_health.record("databricks", False, status)
                 message = (
                     f"Databricks refused the service principal's credential ({status})"
                     + (f": {detail.rstrip('.')}." if detail else ".")
@@ -533,6 +556,7 @@ async def _token(ws: Workspace, transport: httpx.AsyncBaseTransport) -> str:
             expires = 3600
         _retire(key)
         _tokens[key] = (token, _monotonic() + float(expires) - TOKEN_REFRESH_MARGIN_S)
+        key_health.record("databricks", True)
         return token
 
 
@@ -1310,17 +1334,25 @@ def _begin_reading(
 def _auto_read_allowed(row: Mapping[str, Any]) -> bool:
     """Whether ``GET`` may read on *row* unasked (module note, cost guard).
 
-    Only a RUNNING warehouse that auto stops sooner than :data:`SPEND_STALE_S`:
-    with no auto stop (``None`` or 0), or one at least that long, a read every
-    :data:`SPEND_STALE_S` could keep it from ever going idle.
+    Only a RUNNING warehouse, never a stopped one (a query would start it). One with an
+    auto stop at least :data:`SPEND_STALE_S` long is skipped, since a read every
+    :data:`SPEND_STALE_S` could keep it from ever going idle; one with no auto stop (0)
+    never idles, so a read costs nothing. An unknown auto stop (``None``) is skipped.
     """
     stop = row["autoStopMins"]
-    return row["state"] == "RUNNING" and bool(stop) and stop * 60 < SPEND_STALE_S
+    if row["state"] != "RUNNING" or stop is None:
+        return False
+    # The attempt time is set before the breakdown query, so a read can run up to
+    # READING_DEADLINE_S after it: that much headroom keeps the warehouse able to idle.
+    return stop == 0 or stop * 60 + READING_DEADLINE_S < SPEND_STALE_S
 
 
 def _stale() -> bool:
-    attempted = _state()["attemptedAt"]
-    return attempted is None or (_now() - attempted).total_seconds() >= SPEND_STALE_S
+    state = _state()
+    attempted = state["attemptedAt"]
+    # A read that ended in error is tried again sooner than a good one.
+    wait = SPEND_ERROR_RETRY_S if state["status"] == "error" else SPEND_STALE_S
+    return attempted is None or (_now() - attempted).total_seconds() >= wait
 
 
 async def overview(

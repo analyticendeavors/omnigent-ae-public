@@ -56,7 +56,7 @@ function say(card: HTMLElement, text: string): void {
 }
 
 /** Ask the host to open *url*; a refusal puts the URL in *card*'s status line. */
-async function openOrShow(context: ExtensionContext, url: string, card: HTMLElement) {
+export async function openOrShow(context: ExtensionContext, url: string, card: HTMLElement) {
   card.querySelector(".flash")?.remove();
   try {
     await context.navigation.openExternal(url);

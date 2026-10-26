@@ -93,6 +93,11 @@ class SwrCache[K: Hashable, V]:
         """Why the last load of *key* failed, or ``None`` when it succeeded."""
         return self._errors.get(key)
 
+    def peek(self, key: K) -> V | None:
+        """The held value for *key*, however old, or ``None`` (never starts a load)."""
+        held = self._entries.get(key)
+        return held[1] if held is not None else None
+
     def refreshing(self, key: K) -> bool:
         task = self._inflight.get(key)
         return task is not None and not task.done()

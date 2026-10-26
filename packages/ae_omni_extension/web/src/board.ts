@@ -21,6 +21,13 @@
 // card elsewhere: on two and three columns each header has a grip
 // (boardDrag.ts), the arrangement is saved per column count (boardLayout.ts)
 // and "Reset layout" brings the defaults back. A phone is not arranged.
+// 2026-10-23: the Key Vault card (vault.ts) joined, under Box health on two
+// and three columns and after it on a phone; a saved arrangement without it
+// gets it in that default column (boardLayout.ts).
+// 2026-10-24: the Git repos card (git.ts) joined, last in the right column on
+// three columns, last in the left on two, and last on a phone.
+// 2026-10-24: the Presets card (presets.ts) joined, right after Deploys in the
+// first column on three and two columns, and after Deploys on a phone.
 // 2026-10-21: the Accounts card (accounts.ts) joined, at the head of the
 // middle column, where the account nearest its limit reads first.
 // The width comes from a ResizeObserver on the page (the window's resize where
@@ -40,7 +47,7 @@ import { foldIcon, gripIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
 import { getTile, type Health, onTiles, type TileId, worst } from "./tiles";
 
-export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box";
+export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets";
 
 export const THREE_COLUMNS_PX = 1040;
 export const TWO_COLUMNS_PX = 520;
@@ -48,15 +55,15 @@ export const TWO_COLUMNS_PX = 520;
 /** The cards in each column, by column count. */
 export const LAYOUTS: Defaults = {
   3: [
-    ["deploys", "box"],
+    ["deploys", "presets", "box", "vault"],
     ["accounts", "compute"],
-    ["azure", "credit"],
+    ["azure", "credit", "git"],
   ],
   2: [
-    ["deploys", "box", "compute"],
-    ["accounts", "azure", "credit"],
+    ["deploys", "presets", "box", "compute", "git"],
+    ["accounts", "azure", "credit", "vault"],
   ],
-  1: [["deploys", "accounts", "compute", "credit", "azure", "box"]],
+  1: [["deploys", "presets", "accounts", "compute", "credit", "azure", "box", "vault", "git"]],
 };
 
 /** The tiles whose health and values a card's folded header line carries. */
@@ -67,6 +74,9 @@ export const CARD_TILES: Record<CardId, TileId[]> = {
   credit: ["credit"],
   azure: ["azure"],
   box: ["host", "secrets"],
+  vault: ["vault"],
+  git: ["git"],
+  presets: ["presets"],
 };
 
 export function columnsFor(width: number): 1 | 2 | 3 {

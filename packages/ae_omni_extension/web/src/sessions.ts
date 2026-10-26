@@ -12,7 +12,7 @@
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { type AeStatus, countOf, label, type Session, statusOf, titleOf } from "./api";
-import { moveButton, sessionRow } from "./cards";
+import { moveButton, rowMenu, sessionRow } from "./cards";
 import { body, button, el, replaceChildren, section } from "./dom";
 import { statusIcon, unsortedIcon } from "./icons";
 
@@ -144,7 +144,19 @@ export function renderReference(host: HTMLElement, sessions: Session[], deps: De
     });
     open.classList.add("line");
     open.append(statusIcon("reference"), el("span", { class: "line-title" }, titleOf(session)));
-    lines.appendChild(el("li", {}, open));
+    // Reopen: Reference is closed, and the dashboard could not undo it (2026-10-23).
+    const named = { id: session.id, title: titleOf(session) };
+    lines.appendChild(
+      el(
+        "li",
+        {},
+        open,
+        rowMenu(named, [
+          moveButton(deps, named, TO_WORKING.text, TO_WORKING.status, TO_WORKING.title),
+          moveButton(deps, named, TO_REVIEW.text, TO_REVIEW.status, TO_REVIEW.title),
+        ]),
+      ),
+    );
   }
   body(node).appendChild(lines);
   replaceChildren(host, [node]);

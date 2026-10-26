@@ -218,13 +218,18 @@ async def test_one_rate_limited_subscription_does_not_blank_the_card(
         return _answer(_resource_rows(), RESOURCE_COLUMNS)
 
     _mock(monkeypatch, _azure([], subscription=limited))
-    view = (await _read(monkeypatch))["view"]
+    answer = await _read(monkeypatch)
+    view = answer["view"]
     assert isinstance(view, dict)
     by_name = {s["name"]: s for s in view["subscriptions"]}
     assert by_name["Production"]["error"] is None
     assert by_name["Production"]["spent"] == 300.0
-    assert "rate limiting" in by_name["Dev"]["error"]
-    assert "retry in 30 s" in by_name["Dev"]["error"]
+    # The limit is one fact for the card (``rateLimit``), not an error on the unread row.
+    assert by_name["Dev"]["error"] is None
+    assert answer["rateLimit"] == {
+        "retryAt": "2026-10-21T12:01:00Z",
+        "goodAt": "2026-10-21T12:00:00Z",
+    }
 
 
 async def test_no_access_says_which_role_to_give(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -485,7 +490,59 @@ async def test_a_rate_limit_stops_the_pass_so_no_more_queries_extend_it(
     assert isinstance(view, dict)
     # One token call and one query: the second subscription is never asked.
     assert len(calls) == 2
-    assert all("rate limiting" in s["error"] for s in view["subscriptions"])
+    assert all(s["error"] is None for s in view["subscriptions"])
+    # Never read, so the card says "not read yet" instead of a $0.00 that looks like a reading.
+    assert all(s["read"] is False and s["spent"] == 0.0 for s in view["subscriptions"])
+
+
+async def test_a_good_reading_has_no_rate_limit_and_a_saved_one_survives_a_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Production")
+    _mock(monkeypatch, _azure([]))
+    assert (await _read(monkeypatch))["rateLimit"] is None
+    _mock(monkeypatch, _azure([], subscription=_limited("300")))
+    azure_cost.reset()
+    _state_file().unlink()
+    answer = await _read(monkeypatch)
+    # Nothing was read this pass, so the numbers have no good reading to date.
+    assert answer["rateLimit"] == {"retryAt": "2026-10-21T12:05:00Z", "goodAt": None}
+    _restart()
+    assert (await azure_cost.overview())["rateLimit"] == answer["rateLimit"]
+
+
+async def test_a_rate_limited_pass_keeps_an_earlier_error_on_subscriptions_it_never_reached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    state = {"limit_a": False}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if SUB_A in request.url.path and state["limit_a"]:
+            return httpx.Response(429, headers={"retry-after": "300"})
+        if SUB_B in request.url.path:
+            return httpx.Response(403, text="no")
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return _answer(_resource_rows(), RESOURCE_COLUMNS)
+
+    _mock(monkeypatch, _azure([], subscription=handler))
+    clock = [1000.0]
+    monkeypatch.setattr(azure_cost, "_monotonic", lambda: clock[0])
+    first = await _read(monkeypatch)
+    assert "Cost Management Reader" in first["view"]["subscriptions"][1]["error"]
+    state["limit_a"] = True
+    clock[0] += azure_cost.CACHE_TTL_S + 1
+    await azure_cost.overview()
+    task = azure_cost.reading_task()
+    assert task is not None
+    await task
+    answer = await azure_cost.overview()
+    assert answer["rateLimit"] is not None
+    by_name = {s["name"]: s for s in answer["view"]["subscriptions"]}
+    assert by_name["Dev"]["error"] is not None
+    assert by_name["Production"]["error"] is None
 
 
 async def test_another_failure_still_retries_in_two_minutes(
@@ -776,6 +833,84 @@ async def test_a_reading_is_saved_with_its_time_and_when_the_next_is_due(
     assert saved["subscriptions"] == [[SUB_A, "Production"], [SUB_B, "Dev"]]
     assert set(saved["readings"]) == {SUB_A, SUB_B}
     assert _state_file().stat().st_mode & 0o077 == 0
+
+
+async def test_each_good_subscription_reading_carries_the_time_it_was_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    await _read(monkeypatch)
+    snap = azure_cost.snapshot()
+    assert snap is not None
+    assert {r["readAt"] for r in snap["readings"].values()} == {"2026-10-21T12:00:00Z"}
+    saved = json.loads(_state_file().read_text(encoding="utf-8"))
+    assert saved["readings"][SUB_A]["readAt"] == "2026-10-21T12:00:00Z"
+    _restart()
+    again = azure_cost.snapshot()
+    assert again is not None
+    assert again["readings"][SUB_A]["readAt"] == "2026-10-21T12:00:00Z"
+
+
+async def test_read_at_survives_a_save_and_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    _mock(monkeypatch, _azure([]))
+    await _read(monkeypatch)
+    cfg = azure_cost.Config(
+        TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"), (SUB_B, "Dev"))
+    )
+    saved = azure_cost._load(cfg, _state_file())
+    assert saved is not None
+    assert {r["readAt"] for r in saved["readings"].values()} == {"2026-10-21T12:00:00Z"}
+
+
+async def test_a_state_file_from_before_read_at_still_loads() -> None:
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"),))
+    path = Path(os.environ["AE_AZURE_COST_STATE_FILE"])
+    path.write_text(_saved_file(), encoding="utf-8")
+    saved = azure_cost._load(cfg, path)
+    assert saved is not None
+    # Stamped once with the file's own time, never left for a later pass to lend a newer one.
+    assert saved["readings"][SUB_A]["readAt"] == "2026-10-21T12:00:00Z"
+
+
+async def test_a_legacy_reading_keeps_the_old_time_through_a_partial_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    legacy = {k: v for k, v in _GOOD_READING.items() if k != "readAt"}
+    cfg = azure_cost.Config(
+        TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"), (SUB_B, "Dev"))
+    )
+    _state_file().write_text(
+        _saved_file(
+            subscriptions=[[SUB_A, "Production"], [SUB_B, "Dev"]],
+            principal=cfg.principal(),
+            readings={SUB_A: legacy, SUB_B: legacy},
+            at="2026-10-21T11:00:00Z",
+            due="2026-10-21T11:30:00Z",
+            goodAt="2026-10-21T11:00:00Z",
+        ),
+        encoding="utf-8",
+    )
+
+    def only_a(request: httpx.Request) -> httpx.Response:
+        if SUB_B in request.url.path:
+            return httpx.Response(429, headers={"retry-after": "300"})
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return _answer(_resource_rows(), RESOURCE_COLUMNS)
+
+    _mock(monkeypatch, _azure([], subscription=only_a))
+    await azure_cost.overview()
+    task = azure_cost.reading_task()
+    assert task is not None
+    await task
+    snap = azure_cost.snapshot()
+    assert snap is not None
+    assert snap["readings"][SUB_A]["readAt"] == "2026-10-21T12:00:00Z"
+    assert snap["readings"][SUB_B]["readAt"] == "2026-10-21T11:00:00Z"
 
 
 async def test_a_restart_answers_from_the_file_and_reads_nothing_when_not_due(

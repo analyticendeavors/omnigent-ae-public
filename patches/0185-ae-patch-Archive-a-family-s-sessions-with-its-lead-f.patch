@@ -1,0 +1,381 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 18:21:46 -0700
+Subject: [PATCH 185/191] [ae-patch] Archive a family's sessions with its lead
+ from the chat header too
+
+Patch 0184 made Archive on a lead's sidebar row archive every session under it, asking first while one is open. The chat header's Archive still archived the lead alone, leaving its helpers running. The header now uses the same cascade; it has no sidebar tree, so it reads the session list to learn whether the session leads a family, and archives it alone when it does not.
+---
+ web/src/shell/AeFamilyArchive.tsx             |  51 +++++--
+ web/src/shell/HeaderConversationMenu.test.tsx | 137 ++++++++++++++++--
+ web/src/shell/HeaderConversationMenu.tsx      |  12 +-
+ web/src/shell/Sidebar.tsx                     |  11 +-
+ 4 files changed, 183 insertions(+), 28 deletions(-)
+
+diff --git a/web/src/shell/AeFamilyArchive.tsx b/web/src/shell/AeFamilyArchive.tsx
+index f8f6c4ede6311b81cb3f9ceb897e57553f285927..866835d28ce491d39efb0fa80b32ebdd5dfd59e1 100644
+--- a/web/src/shell/AeFamilyArchive.tsx
++++ b/web/src/shell/AeFamilyArchive.tsx
+@@ -1,7 +1,9 @@
+ // Archive a family's lead together with its sessions (omnigent-ae, 2026-10-25).
+ // In Grouping > Family, archiving a lead row archives every session under it.
+ // When one of them is still open (not in the family's closed group), a confirm
+-// asks first; Cancel archives nothing. The tree: lib/aeFamilyTree.ts.
++// asks first; Cancel archives nothing. The tree: lib/aeFamilyTree.ts. The chat
++// header's Archive does the same since 2026-10-25 (`gate: "read"`): it has no
++// sidebar tree, so it reads the family to learn whether the session leads one.
+ //
+ // The sessions to archive come from a fresh read of the session list, not the
+ // sidebar's rows: those stop at the loaded pages and a search, and the tree
+@@ -55,15 +57,16 @@ export function aeFamilyArchiveTargets(
+   return { children, open: children.filter((c) => !aeIsClosedMember(c)).length };
+ }
+ 
+-/** The unarchived session list, newest first, up to `READ_PAGES` pages. */
+-async function readSessions(queryClient: QueryClient): Promise<Conversation[]> {
++/** One slice of the session list, newest first, up to `READ_PAGES` pages. */
++async function readSlice(queryClient: QueryClient, archived: boolean): Promise<Conversation[]> {
+   const rows: Conversation[] = [];
+   let after: string | undefined;
+   for (let page = 0; page < READ_PAGES; page += 1) {
+     // eslint-disable-next-line no-await-in-loop -- each page needs the previous cursor
+     const got = await fetchConversationsPage({
+       searchQuery: "",
+-      includeArchived: false,
++      includeArchived: archived,
++      visibility: archived ? "archived" : undefined,
+       queryClient,
+       limit: READ_LIMIT,
+       after,
+@@ -75,6 +78,21 @@ async function readSessions(queryClient: QueryClient): Promise<Conversation[]> {
+   return rows;
+ }
+ 
++/**
++ * The open sessions, plus the archived ones so that a session started by an
++ * archived helper still traces back to its lead. Archived rows only link the
++ * family; `aeFamilyArchiveTargets` never archives them again.
++ */
++async function readSessions(queryClient: QueryClient): Promise<Conversation[]> {
++  const [open, archived] = await Promise.all([
++    readSlice(queryClient, false),
++    readSlice(queryClient, true),
++  ]);
++  const byId = new Map<string, Conversation>();
++  for (const c of [...archived, ...open]) byId.set(c.id, c);
++  return [...byId.values()];
++}
++
+ interface Seen {
+   tree: AeFamilyTree | null | undefined;
+   activeId: string | undefined;
+@@ -96,14 +114,19 @@ type RequestArchive = (
+ ) => void;
+ 
+ /**
+- * A lead row's archive. `archiveFamily` returns false when the row is no lead
+- * with sessions under it, so the caller archives the row alone. The row renders
++ * A lead's archive. `archiveFamily(alone)` archives the session with every one
++ * under it. With `gate: "tree"` (a sidebar row) only a lead in Grouping >
++ * Family's tree reads its family, and any other row calls `alone` at once; with
++ * `gate: "read"` (the chat header) every archive reads it. Once a read is done
++ * the archive runs here, never through `alone`: the caller's closure is from
++ * the click, and by then another session may be open. The caller renders
+  * `source` and `dialog`.
+  */
+ export function useAeFamilyArchive(
+   lead: Conversation,
+   requestArchive: RequestArchive,
+-): { archiveFamily: () => boolean; source: ReactNode; dialog: ReactNode } {
++  { gate }: { gate: "tree" | "read" },
++): { archiveFamily: (alone: () => void) => void; source: ReactNode; dialog: ReactNode } {
+   const seen = useRef<Seen>({ tree: null, activeId: undefined });
+   // A second Archive click while the read runs does nothing.
+   const reading = useRef(false);
+@@ -131,10 +154,15 @@ export function useAeFamilyArchive(
+       showArchiveUndoToast(queryClient, all, navigate);
+     });
+ 
+-  const archiveFamily = () => {
+-    const treeLead = seen.current.tree?.leads.get(lead.id);
+-    if (!treeLead || treeLead.standIn) return false;
+-    if (reading.current) return true;
++  const archiveFamily = (alone: () => void) => {
++    if (gate === "tree") {
++      const treeLead = seen.current.tree?.leads.get(lead.id);
++      if (!treeLead || treeLead.standIn) {
++        alone();
++        return;
++      }
++    }
++    if (reading.current) return;
+     reading.current = true;
+     readSessions(queryClient)
+       .finally(() => {
+@@ -149,7 +177,6 @@ export function useAeFamilyArchive(
+         },
+         () => showToast("Couldn't read the family's sessions, so nothing was archived. Try again."),
+       );
+-    return true;
+   };
+ 
+   const dialog = (
+diff --git a/web/src/shell/HeaderConversationMenu.test.tsx b/web/src/shell/HeaderConversationMenu.test.tsx
+index 180a577997b654b7e56cf82fbe5c2b142003b80f..76b174f55802f2cfc84330dab6c9ce3b17ee7e0e 100644
+--- a/web/src/shell/HeaderConversationMenu.test.tsx
++++ b/web/src/shell/HeaderConversationMenu.test.tsx
+@@ -28,6 +28,8 @@ const mocks = vi.hoisted(() => ({
+   rename: vi.fn(),
+   moveToProject: vi.fn(),
+   archive: vi.fn(),
++  archiveMany: vi.fn(),
++  readSessions: vi.fn(),
+   deleteConversation: vi.fn(),
+   markUnread: vi.fn(),
+   fork: vi.fn(),
+@@ -52,6 +54,12 @@ vi.mock("@/hooks/useConversations", async (importOriginal) => {
+     useRenameConversation: () => ({ mutate: mocks.rename, isPending: false }),
+     useMoveToProject: () => ({ mutate: mocks.moveToProject }),
+     useArchiveConversation: () => ({ mutate: mocks.archive }),
++    useBulkArchiveConversations: () => ({
++      mutate: mocks.archiveMany,
++      mutateAsync: mocks.archiveMany,
++      isPending: false,
++    }),
++    fetchConversationsPage: mocks.readSessions,
+     useStopAndDeleteConversation: () => ({
+       mutate: mocks.deleteConversation,
+       isPending: false,
+@@ -136,10 +144,22 @@ beforeEach(() => {
+   mocks.isMobile = false;
+   mocks.projects = [{ id: "project-1", name: "Sprint 42" }];
+   vi.clearAllMocks();
++  // Archive reads the session list (open, then archived) to find the session's family; none by default.
++  sessionList([CONVERSATION]);
++  mocks.archiveMany.mockResolvedValue([]);
+ });
+ 
+ afterEach(cleanup);
+ 
++/** What the archive's read of the session list returns: *open* rows, and *archived* ones. */
++function sessionList(open: Conversation[], archived: Conversation[] = []) {
++  mocks.readSessions.mockImplementation(async ({ visibility }: { visibility?: string }) => ({
++    data: visibility === "archived" ? archived : open,
++    has_more: false,
++    last_id: null,
++  }));
++}
++
+ describe("HeaderConversationMenu", () => {
+   it("keeps an unsupported Fork visible without opening its dialog", () => {
+     renderMenu({ forkDisabledReason: "Forking this sandbox session is not supported yet." });
+@@ -280,22 +300,18 @@ describe("HeaderConversationMenu", () => {
+     expect(mocks.rename).toHaveBeenCalledWith({ id: "conv-1", title: "Roadmap planning" });
+   });
+ 
+-  it("runs archive and delete actions for the active session", () => {
++  it("runs archive and delete actions for the active session", async () => {
+     const view = renderMenu();
+ 
+     openMenu();
+     fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
+     // A worktree session asks whether to delete the worktree first.
+     expect(mocks.archive).not.toHaveBeenCalled();
+-    fireEvent.click(screen.getByRole("button", { name: "Yes, delete worktree" }));
+-    // The optimistic overlay lives in the hook, and the Undo toast fires
+-    // synchronously (navigating away unmounts this menu, so a mutate onSuccess
+-    // callback wouldn't fire).
+-    expect(mocks.archive).toHaveBeenCalledWith({
+-      id: "conv-1",
+-      archived: true,
+-      deleteWorktree: true,
+-    });
++    fireEvent.click(await screen.findByRole("button", { name: "Yes, delete worktree" }));
++    // A session with nothing under it archives alone, after the family read.
++    expect(mocks.archiveMany).toHaveBeenCalledTimes(1);
++    expect(mocks.archiveMany.mock.calls[0][0]).toMatchObject({ ids: ["conv-1"], archived: true });
++    expect([...mocks.archiveMany.mock.calls[0][0].deleteWorktreeIds]).toEqual(["conv-1"]);
+ 
+     view.unmount();
+     renderMenu();
+@@ -309,6 +325,107 @@ describe("HeaderConversationMenu", () => {
+     });
+   });
+ 
++  describe("archiving a family's lead", () => {
++    const child = (id: string, status: string): Conversation => ({
++      ...CONVERSATION,
++      id,
++      title: id,
++      git_branch: null,
++      labels: { "ae.orch": "conv-1", "ae.status": status },
++    });
++    const lead: Conversation = { ...CONVERSATION, git_branch: null };
++    const withChildren = (...children: Conversation[]) => sessionList([lead, ...children]);
++    const archiveLead = () => {
++      renderMenu({ conversation: lead });
++      openMenu();
++      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
++    };
++
++    it("archives the lead and its closed sessions at once", async () => {
++      withChildren(child("conv-a", "reference"), child("conv-b", "reference"));
++      archiveLead();
++      await waitFor(() => expect(mocks.archiveMany).toHaveBeenCalledTimes(1));
++      expect(mocks.archiveMany.mock.calls[0][0]).toMatchObject({
++        ids: ["conv-1", "conv-a", "conv-b"],
++        archived: true,
++      });
++      expect(screen.queryByTestId("ae-family-archive-confirm")).toBeNull();
++      expect(mocks.archive).not.toHaveBeenCalled();
++    });
++
++    it("asks first while a session is open, and Cancel archives nothing", async () => {
++      withChildren(child("conv-a", "reference"), child("conv-b", "working"));
++      archiveLead();
++      const confirm = await screen.findByTestId("ae-family-archive-confirm");
++      expect(confirm.textContent).toContain(
++        "Are you sure you would like to archive this? There are still open sessions.",
++      );
++      fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
++      await waitFor(() => expect(screen.queryByTestId("ae-family-archive-confirm")).toBeNull());
++      expect(mocks.archiveMany).not.toHaveBeenCalled();
++      expect(mocks.archive).not.toHaveBeenCalled();
++    });
++
++    it("archives every session once the confirm is accepted", async () => {
++      withChildren(child("conv-b", "working"));
++      archiveLead();
++      await screen.findByTestId("ae-family-archive-confirm");
++      fireEvent.click(screen.getByRole("button", { name: "Archive" }));
++      expect(mocks.archiveMany.mock.calls[0][0]).toMatchObject({ ids: ["conv-1", "conv-b"] });
++    });
++
++    it("finds an open session under an archived helper", async () => {
++      // conv-b was started by conv-a, which is already archived.
++      sessionList(
++        [lead, { ...child("conv-b", "working"), labels: { "ae.orch": "conv-a" } }],
++        [{ ...child("conv-a", "reference"), archived: true }],
++      );
++      archiveLead();
++      await screen.findByTestId("ae-family-archive-confirm");
++      fireEvent.click(screen.getByRole("button", { name: "Archive" }));
++      expect(mocks.archiveMany.mock.calls[0][0]).toMatchObject({ ids: ["conv-1", "conv-b"] });
++    });
++
++    it("archives a session started by a lead alone", async () => {
++      withChildren(child("conv-a", "working"));
++      renderMenu({ conversation: child("conv-a", "working") });
++      openMenu();
++      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
++      await waitFor(() => expect(mocks.archiveMany).toHaveBeenCalledTimes(1));
++      expect(mocks.archiveMany.mock.calls[0][0]).toMatchObject({ ids: ["conv-a"] });
++      expect(screen.queryByTestId("ae-family-archive-confirm")).toBeNull();
++    });
++
++    it("archives nothing and says so when the family can't be read", async () => {
++      const toasts: unknown[] = [];
++      const onToast = (event: Event) => toasts.push((event as CustomEvent).detail.content);
++      window.addEventListener("omnigent:toast", onToast);
++      try {
++        mocks.readSessions.mockRejectedValue(new Error("offline"));
++        archiveLead();
++        await waitFor(() =>
++          expect(toasts).toContain(
++            "Couldn't read the family's sessions, so nothing was archived. Try again.",
++          ),
++        );
++        expect(mocks.archive).not.toHaveBeenCalled();
++        expect(mocks.archiveMany).not.toHaveBeenCalled();
++      } finally {
++        window.removeEventListener("omnigent:toast", onToast);
++      }
++    });
++
++    it("reads once for a double click", async () => {
++      withChildren(child("conv-a", "reference"));
++      archiveLead();
++      openMenu();
++      fireEvent.click(screen.getByRole("menuitem", { name: "Archive" }));
++      await waitFor(() => expect(mocks.archiveMany).toHaveBeenCalledTimes(1));
++      // Two slices per read: open and archived.
++      expect(mocks.readSessions).toHaveBeenCalledTimes(2);
++    });
++  });
++
+   it("offers Unarchive on an archived session and unarchives in place", () => {
+     // An archived session reopened by URL must not be re-offered the action
+     // that was already taken; the item flips like the sidebar row's menu.
+diff --git a/web/src/shell/HeaderConversationMenu.tsx b/web/src/shell/HeaderConversationMenu.tsx
+index b1dba67dd8acff2eb257d376a59d01d9de679336..28f30e7a3ba76546d12c3766c1474a0b4c6944f2 100644
+--- a/web/src/shell/HeaderConversationMenu.tsx
++++ b/web/src/shell/HeaderConversationMenu.tsx
+@@ -68,6 +68,7 @@ import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+ import { showArchiveUndoToast } from "./archiveUndoToast";
+ import { unpinWithUndo } from "./unpinUndoToast";
+ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
++import { useAeFamilyArchive } from "@/shell/AeFamilyArchive";
+ import { cn } from "@/lib/utils";
+ import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
+ import { conversationDisplayLabel } from "./sidebarNav";
+@@ -120,6 +121,9 @@ export function HeaderConversationMenu({
+   const moveToProject = useMoveToProject();
+   const archive = useArchiveConversation();
+   const archiveWorktreePrompt = useArchiveWorktreePrompt();
++  const familyArchive = useAeFamilyArchive(conversation, archiveWorktreePrompt.requestArchive, {
++    gate: "read",
++  });
+   const deleteConversation = useStopAndDeleteConversation();
+   const [menuOpen, setMenuOpen] = useState(false);
+   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
+@@ -206,8 +210,10 @@ export function HeaderConversationMenu({
+       archive.mutate({ id: conversation.id, archived: false });
+       return;
+     }
+-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+-      archiveNow(deleteWorktreeIds.has(conversation.id)),
++    familyArchive.archiveFamily(() =>
++      archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
++        archiveNow(deleteWorktreeIds.has(conversation.id)),
++      ),
+     );
+   };
+ 
+@@ -446,6 +452,8 @@ export function HeaderConversationMenu({
+       </DropdownMenu>
+ 
+       {archiveWorktreePrompt.dialog}
++      {familyArchive.source}
++      {familyArchive.dialog}
+       <Dialog open={renameOpen} onOpenChange={setRenameOpen}>
+         <DialogContent>
+           <form onSubmit={submitRename}>
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index 9ec3652366c1ad243f0bb88a4d4c08d6d79f9849..1a3fe96149f567195fb247e4300ac7f15dbe8e67 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -4741,7 +4741,9 @@ function ConversationRowImpl({
+   const del = useStopAndDeleteConversation();
+   const archive = useArchiveConversation();
+   const archiveWorktreePrompt = useArchiveWorktreePrompt();
+-  const familyArchive = useAeFamilyArchive(conversation, archiveWorktreePrompt.requestArchive);
++  const familyArchive = useAeFamilyArchive(conversation, archiveWorktreePrompt.requestArchive, {
++    gate: "tree",
++  });
+   const leave = useLeaveSession();
+   const moveToProject = useMoveToProject();
+   // The kebab's user-facing "Stop session" action. Archiving does NOT go
+@@ -5022,9 +5024,10 @@ function ConversationRowImpl({
+       runUnarchive();
+       return;
+     }
+-    if (familyArchive.archiveFamily()) return;
+-    archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+-      archiveNow(deleteWorktreeIds.has(conversation.id)),
++    familyArchive.archiveFamily(() =>
++      archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
++        archiveNow(deleteWorktreeIds.has(conversation.id)),
++      ),
+     );
+   }
+ 

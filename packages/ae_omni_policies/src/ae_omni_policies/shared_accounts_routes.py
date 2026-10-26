@@ -112,6 +112,17 @@ async def ask_me(request: Request, *, cookie: bool = True) -> httpx.Response | N
     ``auth.require_ae_user`` needs to tell "the app refused this credential" from
     "the app did not answer", which :func:`_me` folds together.
     """
+    return await ask_as_caller(request, "/v1/me", cookie=cookie)
+
+
+async def ask_as_caller(
+    request: Request, path: str, *, cookie: bool = True
+) -> httpx.Response | None:
+    """``GET`` *path* on this server as the caller; ``None`` when the loopback failed.
+
+    Shared by ``/v1/me`` and, since 2026-10-23, the Key Vault card's people list
+    (``/auth/users``), which the extension page cannot call itself.
+    """
     names = {*_FORWARDED_HEADERS, resolve_auth_header().lower()}
     if not cookie:
         names.discard("cookie")
@@ -120,15 +131,15 @@ async def ask_me(request: Request, *, cookie: bool = True) -> httpx.Response | N
     try:
         if self_url:
             async with httpx.AsyncClient(base_url=self_url, timeout=_LOOPBACK_TIMEOUT_S) as http:
-                response = await http.get("/v1/me", headers=headers)
+                response = await http.get(path, headers=headers)
         else:
             transport = httpx.ASGITransport(app=request.app)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://ae-loopback", timeout=_LOOPBACK_TIMEOUT_S
             ) as http:
-                response = await http.get("/v1/me", headers=headers)
+                response = await http.get(path, headers=headers)
     except httpx.HTTPError as exc:
-        _logger.warning("ae shared accounts: could not ask /v1/me: %s", exc)
+        _logger.warning("ae shared accounts: could not ask %s: %s", path, exc)
         return None
     return response
 
@@ -334,6 +345,7 @@ __all__ = [
     "CODE_BROWSER",
     "FORK_HOOK_REGISTERED",
     "admin_probe",
+    "ask_as_caller",
     "router",
     "session_probe",
 ]

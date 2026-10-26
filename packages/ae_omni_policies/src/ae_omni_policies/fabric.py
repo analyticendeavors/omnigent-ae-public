@@ -174,7 +174,7 @@ from urllib.parse import quote, quote_plus, urlsplit
 
 import httpx
 
-from ae_omni_policies import __version__
+from ae_omni_policies import __version__, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -449,6 +449,26 @@ async def _send(transport: httpx.AsyncBaseTransport, request: httpx.Request) -> 
     finally:
         await response.aclose()
     return response.status_code, body
+
+
+def _note_capacity(capacity: Capacity, action: Action, status: int) -> None:
+    """Tell the Admin Center's secrets list how the capacity's pair fared (``key_health.py``).
+
+    The wake URL carries the Logic App's signature, so a 401 is that URL refused and
+    any answer below 500 means it was taken. The suspend key rides only on suspend and
+    keep-awake, where the Logic App answers 403 to a wrong one.
+    """
+    suffix = capacity.env_suffix
+    if status == 401:
+        key_health.record(f"fabric_wake:{suffix}", False, status)
+        return
+    if status < 500:
+        key_health.record(f"fabric_wake:{suffix}", True)
+    if action in ("suspend", "keepawake"):
+        if status == 403:
+            key_health.record(f"fabric_suspend:{suffix}", False, status)
+        elif status == 200:
+            key_health.record(f"fabric_suspend:{suffix}", True)
 
 
 def _request(capacity: Capacity, action: Action, hours: int | None = None) -> httpx.Request:
@@ -756,6 +776,7 @@ async def call(
             f"{capacity.name}: the Logic App could not be reached for the {what} call "
             f"({type(exc).__name__})."
         ) from None
+    _note_capacity(capacity, action, status)
     if status != 200:
         detail = _body_error(body, capacity)
         if status == 403 and action in ("suspend", "keepawake"):
@@ -1217,6 +1238,10 @@ async def fleet_call(
             f"({type(exc).__name__}).",
             unsent=reading,
         ) from None
+    if status_code == 403:
+        key_health.record("fabric_fleet", False, status_code)
+    elif status_code == 200:
+        key_health.record("fabric_fleet", True)
     if status_code != 200:
         detail = _body_error(raw, shared)
         if status_code == 403:

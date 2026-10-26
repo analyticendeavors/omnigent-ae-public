@@ -35,7 +35,7 @@ Each session carries a triage status (Working, Blocked, Review, Parked or Refere
 
 <p align="center"><img src="../media/sidebar-group-by-status.webp" alt="Group and order sessions by status"></p>
 
-Grouping: Triage splits the list into Blocked, Working, Review, No status, Parked and Reference, each with its icon and count, then a collapsed Archived group. Ordering: Status keeps your grouping and sorts each list by status icon, then by activity.
+Grouping: Triage splits the list into Blocked, Working, Review, No status, Parked and Reference, each with its icon and count, then a collapsed Archived group. Ordering: Status keeps your grouping and sorts each list by status icon, then by activity. Grouping: Family, a tree of each lead's sessions, is on the [Roles presets](roles-presets.md) page.
 
 **Where:** The filter icon on the Projects or Sessions header, then Grouping or Ordering. The menu needs upstream's `sidebar_grouping_ui` release flag, which the fork's image turns on; without it the filter menu offers only Display.<br>
 **Built from:** core patches [`0102`](../../patches/0102-ae-patch-Group-sidebar-sessions-by-triage-status-and.patch), [`0109`](../../patches/0109-ae-patch-Sort-sessions-by-status-icon-under-Ordering.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
@@ -57,6 +57,15 @@ Select puts a checkbox on every row and a bar with the count and its actions, su
 
 **Where:** Select sessions on the Projects or Sessions header.<br>
 **Built from:** core patch [`0103`](../../patches/0103-ae-patch-Keep-the-bulk-select-bar-inside-a-narrow-si.patch)
+
+## Create a project from Add to project
+
+<p align="center"><img src="../media/project-create-row.jpg" alt="Create a project from Add to project"></p>
+
+The Add to project lists end in a Create project row. Picking it turns the row into its own name box, and Enter files the session into the new project; a name that matches an existing project, in any case, files into that one.
+
+**Where:** Add to project in a session's menu, its right-click menu, or the chat header's project tag.<br>
+**Built from:** core patch [`0176`](../../patches/0176-ae-patch-Add-a-Create-project-row-at-the-foot-of-the.patch)
 
 ---
 

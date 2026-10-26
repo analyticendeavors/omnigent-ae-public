@@ -36,6 +36,7 @@ GATED = [
     ("/v1/ae/databricks/spend/refresh", {}),
     ("/v1/ae/host/relink", {}),
     ("/v1/ae/limits/claude", SNAPSHOT),
+    ("/v1/ae/secrets/meta", {"secrets": []}),
 ]
 
 

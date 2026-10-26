@@ -2,7 +2,7 @@
 
 <sub>Agents and pull requests &middot; [All features](README.md)</sub>
 
-Stock Omnigent lists a session's subagents in the Agents tab of the right panel. The fork lays that tab out like Claude Desktop's background tasks, keeps each helper's state honest while it runs, fails or is closed, and lets you choose how the lead works with other agents.
+Stock Omnigent lists a session's subagents in the Agents tab of the right panel. The fork lays that tab out like Claude Desktop's background tasks, keeps each helper's state honest while it runs, fails or is closed, and shows each one's role, model, effort and spend.
 
 ## An Agents pane like Claude Desktop's
 
@@ -58,12 +58,23 @@ A helper session that is closed drops out of its parent's count at once, so the 
 **Where:** The hourglass on the session's sidebar row.<br>
 **Built from:** core patch [`0133`](../../patches/0133-ae-patch-Stop-counting-a-closed-subagent-toward-its-.patch)
 
-## Who works on this
+## Role, model, effort and spend per agent
 
-A control in the composer sets how the lead works with other agents. Auto brings in collaborators when useful, Solo sticks to the lead's own subagents, and Team lets you pick collaborators, such as Codex for an independent review, each with its own model. Change lead swaps the orchestrator itself.
+<p align="center"><img src="../media/agents-roles-spend.jpg" alt="Role, model, effort and spend per agent"></p>
 
-**Where:** The Auto button in the composer, which opens the "Who works on this?" dialog.<br>
-**Built from:** core patches [`0030`](../../patches/0030-ae-patch-Add-composer-teams-and-separate-model-conte.patch), [`0032`](../../patches/0032-ae-patch-Add-Auto-collaboration-and-hide-unconfigure.patch)
+Each agent on the rail's Agents card and in the Agents tab shows its role, its model with a colored dot, its effort and what it spent, then a total line, "This chat and its agents", with a thin bar split by model family. A helper the lead raised carries an amber arrow. The role comes from the start of the agent's description ("Builder A: ..."), and the lead is told to name one on every helper it starts. Sessions the lead starts with `create_session` show in Grouping > Family instead (see [Roles presets](roles-presets.md)).
+
+**Where:** The Agents card in the session rail, and the Agents tab.<br>
+**Built from:** core patches [`0172`](../../patches/0172-ae-patch-Show-each-agent-s-role-model-effort-and-tok.patch), [`0173`](../../patches/0173-ae-patch-Show-each-agent-s-spend-as-estimated-cost-w.patch)
+
+## Spend in tokens or cost
+
+<p align="center"><img src="../media/settings-spend-shows.jpg" alt="Spend in tokens or cost"></p>
+
+Settings > Chat's "Spend shows" picks what every spend figure shows: Tokens (new input plus output, the default, which suits a subscription account), Cost (an estimate at API prices) or Off. Claude sessions report real token counts, read from their transcripts, so they no longer read as zero.
+
+**Where:** Settings > Chat > Spend shows.<br>
+**Built from:** core patch [`0179`](../../patches/0179-ae-patch-Add-a-Spend-shows-setting-tokens-cost-or-of.patch)
 
 ---
 

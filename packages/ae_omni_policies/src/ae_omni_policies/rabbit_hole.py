@@ -98,7 +98,7 @@ def rabbit_hole(hours: float = 4, turns: int = 60) -> PolicyCallable:
         if not (over_time or over_turns):
             return counted
         try:
-            row = sessions.own_row()
+            row = sessions.own_row(event=event)
         except STORE_ERRORS:
             _logger.warning("rabbit_hole could not read the store; not asking", exc_info=True)
             return counted

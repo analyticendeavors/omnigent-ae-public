@@ -135,7 +135,10 @@ import {
   cloudIcon,
   coinIcon,
   type FabricTone,
+  gitBranchIcon,
+  chartBarIcon,
   linksIcon,
+  lockIcon,
   powerIcon,
   refreshIcon,
   sharedIcon,
@@ -143,6 +146,9 @@ import {
 } from "./icons";
 import { copyText } from "./lot";
 import { activateSecrets, deactivateSecrets, secretsSection } from "./secrets";
+import { activateGit, deactivateGit, gitSection } from "./git";
+import { activatePresets, deactivatePresets, presetsSection } from "./presets";
+import { activateVault, deactivateVault, loadVaultView, vaultSection } from "./vault";
 import { loadSectionState } from "./sections";
 import {
   type Health,
@@ -1146,6 +1152,9 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const secrets = secretsSection();
   const accountsBody = accountsSection();
   const azureBody = azureSection();
+  const vaultBody = vaultSection();
+  const gitBody = gitSection();
+  const presetsBody = presetsSection();
   // The card headers carry one "Updated" each: Fabric's on Compute, the host's on Box health.
   databricks.querySelector(".dbx-refreshed")?.remove();
   secrets.querySelector(".secrets-refreshed")?.remove();
@@ -1171,6 +1180,27 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     cloudIcon(),
     [azureBody.querySelector(".azure-refreshed")],
     azureBody,
+  );
+  const vault = adminCard(
+    "vault",
+    "Key Vault",
+    lockIcon(16),
+    [vaultBody.querySelector(".vault-refreshed")],
+    vaultBody,
+  );
+  const git = adminCard(
+    "git",
+    "Git repos",
+    gitBranchIcon(16),
+    [gitBody.querySelector(".git-refreshed")],
+    gitBody,
+  );
+  const presets = adminCard(
+    "presets",
+    "Presets",
+    chartBarIcon(16),
+    [presetsBody.querySelector(".presets-refreshed")],
+    presetsBody,
   );
   const box = adminCard(
     "box",
@@ -1200,7 +1230,17 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   );
   root.replaceChildren(main);
   mountTiles(tiles, updated);
-  const layout = mountBoard(main, board, { deploys, accounts, compute, credit, azure, box });
+  const layout = mountBoard(main, board, {
+    deploys,
+    accounts,
+    compute,
+    credit,
+    azure,
+    box,
+    vault,
+    git,
+    presets,
+  });
   stopBoard = layout.stop;
   active = true;
   const mine = ++activations;
@@ -1277,6 +1317,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     context.theme.getCurrent(),
     loadSectionState(context),
     loadBoardLayout(context),
+    loadVaultView(context),
   ]);
   layout.refold();
   document.documentElement.dataset.theme = theme.theme;
@@ -1300,6 +1341,9 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   activateSecrets(context, secrets);
   activateAccounts(context, accounts);
   activateAzure(context, azure);
+  activateVault(context, vault);
+  activateGit(context, git);
+  activatePresets(context, presets);
   const live = () => active && mine === activations;
   registerRefresh("fabric", () => (live() ? refresh() : undefined));
   onFocus = () => {
@@ -1318,6 +1362,9 @@ export function deactivateFabric(): void {
   deactivateSecrets();
   deactivateAccounts();
   deactivateAzure();
+  deactivateVault();
+  deactivateGit();
+  deactivatePresets();
   stopBoard?.();
   stopBoard = null;
   resetTiles();

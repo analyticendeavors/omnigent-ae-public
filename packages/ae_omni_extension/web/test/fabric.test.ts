@@ -467,7 +467,7 @@ describe("the Admin Center page", () => {
     });
     await activateFabric(context);
     await flush();
-    expect(document.querySelector(".page-status .notice-error")?.textContent).toBe(
+    expect(document.querySelector(".admin-fabric .page-status .notice-error")?.textContent).toBe(
       "Fabric capacities could not be read: server down",
     );
   });

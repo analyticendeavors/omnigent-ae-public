@@ -23,6 +23,8 @@ const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
 
 const IDS: CardId[] = ["deploys", "accounts", "compute", "credit", "azure", "box"];
+/** The default columns as the board draws them from IDS (the fixture has no Key Vault card). */
+const shown = (n: 2 | 3) => LAYOUTS[n].map((col) => col.filter((id) => IDS.includes(id)));
 
 function storageContext(initial?: unknown) {
   const set = vi.fn(async () => undefined);
@@ -278,7 +280,7 @@ describe("dragging", () => {
     document.dispatchEvent(
       new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
     );
-    expect(currentLayout(board)).toEqual(LAYOUTS[3]);
+    expect(currentLayout(board)).toEqual(shown(3));
     expect(hasArrangement()).toBe(false);
     expect(board.querySelector(".admin-slot")).toBeNull();
     expect(cards.deploys.classList.contains("is-dragging")).toBe(false);
@@ -345,19 +347,19 @@ describe("the keyboard", () => {
 describe("a saved arrangement on the board", () => {
   it("is laid out when it loads after the page, and again after a reset", async () => {
     const { board } = makeBoard();
-    expect(currentLayout(board)).toEqual(LAYOUTS[3]);
+    expect(currentLayout(board)).toEqual(shown(3));
     const saved = { "3": [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]] };
     await loadBoardLayout(storageContext(saved).context);
     expect(currentLayout(board)[0]).toEqual(["box"]);
     resetArrangement();
-    expect(currentLayout(board)).toEqual(LAYOUTS[3]);
+    expect(currentLayout(board)).toEqual(shown(3));
   });
 
   it("keeps two and three columns apart", () => {
     const { board, cards } = makeBoard(3);
     setArrangement(3, [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]]);
     arrange(board, cards, 2);
-    expect(currentLayout(board)).toEqual(LAYOUTS[2]);
+    expect(currentLayout(board)).toEqual(shown(2));
   });
 });
 
@@ -376,7 +378,7 @@ describe("Reset layout", () => {
     node.click();
     expect(hasArrangement()).toBe(false);
     expect(node.hidden).toBe(true);
-    expect(currentLayout(board)).toEqual(LAYOUTS[3]);
+    expect(currentLayout(board)).toEqual(shown(3));
   });
 
   it("shows only for a column count that has its own arrangement", () => {
@@ -430,7 +432,7 @@ describe("a drag that the board outlives", () => {
     // Every card is on the board exactly once.
     expect(cardsIn(board)).toHaveLength(6);
     expect(new Set(cardsIn(board)).size).toBe(6);
-    expect(currentLayout(board)).toEqual(LAYOUTS[2]);
+    expect(currentLayout(board)).toEqual(shown(2));
   });
 
   it("goes on when the board only reflows at the same column count", () => {

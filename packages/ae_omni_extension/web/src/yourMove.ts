@@ -67,13 +67,16 @@ import { briefIcon, ciIcon, dueIcon, pullIcon, waitIcon } from "./icons";
 import { parkedByTask, shortDate, taskCard } from "./lot";
 import { linkButtons, urlLinkButton } from "./openLink";
 import {
+  detailsRow,
   keepConfirm,
+  markDetailsOpen,
   type MergeHooks,
   mergeButton,
   mergedCards,
   mergeWhy,
   mergingNode,
   openConfirm,
+  stateButtons,
   statusRow,
   urlKey,
   wasMerged,
@@ -297,7 +300,7 @@ function pullCard(deps: Deps, pull: WaitingPull): HTMLElement {
     el(
       "div",
       { class: "card-head" },
-      pullIcon(pull.draft),
+      pullIcon(full?.draft ?? pull.draft),
       el("h3", { class: "card-title pull-title", title: pull.title }, pull.title),
       ciIcon(pull.ci),
     ),
@@ -316,7 +319,7 @@ function pullCard(deps: Deps, pull: WaitingPull): HTMLElement {
     { class: "card-sub" },
     el("span", { class: "repo" }, `${pull.repo}#${pull.number}`),
     el("span", { class: `ci ci-${pull.ci}` }, CI_TEXT[pull.ci]),
-    pull.draft ? el("span", { class: "tag" }, "draft") : null,
+    (full?.draft ?? pull.draft) ? el("span", { class: "tag" }, "draft") : null,
     el("span", {}, why),
   );
   const off = full ? mergeWhy(full) : null;
@@ -343,6 +346,7 @@ function pullCard(deps: Deps, pull: WaitingPull): HTMLElement {
   };
   const actions = el("div", { class: "actions" });
   const fresh = full !== null && !entry?.error && Date.now() - (entry?.at ?? 0) < CARD_TTL_MS;
+  if (fresh && full) actions.append(...stateButtons(deps, full, card, hooks));
   actions.appendChild(
     fresh
       ? mergeButton(deps, full, card, actions, hooks)
@@ -352,8 +356,24 @@ function pullCard(deps: Deps, pull: WaitingPull): HTMLElement {
           onClick: () => tapMerge(deps, pull),
         }),
   );
+  // No read on render or poll (the rule above); one tap reads the card, then its
+  // state buttons and Review details show without starting a merge (review, 2026-10-23).
+  if (!full) {
+    actions.appendChild(
+      button("Review details", {
+        title: "Read this pull request from GitHub: checks, description and compliance review",
+        onClick: async () => {
+          markDetailsOpen(pull.url);
+          await readCard(deps, pull);
+          redraw(key);
+        },
+      }),
+    );
+  }
   actions.append(...linkButtons(deps.context, pull.url, card));
   card.appendChild(statusRow(sub, off, failed, actions));
+  const more = full ? detailsRow(deps, full) : null;
+  if (more) card.appendChild(more);
   if (full) keepConfirm(deps, full, card, actions, hooks);
   shown.set(key, { node: card, deps, pull });
   return card;

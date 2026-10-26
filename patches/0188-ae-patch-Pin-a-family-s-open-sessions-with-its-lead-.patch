@@ -1,0 +1,998 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 09:41:31 -0700
+Subject: [PATCH 188/191] [ae-patch] Pin a family's open sessions with its
+ lead, as a setting
+
+Settings > Chat gains "Pin a lead's family" (Yes or No, saved on this device, No by default). With Yes, pinning a session that leads a family also pins its open sessions, lead first; reference and archived ones stay unpinned, and a family that needs more pin spots than are free pins nothing and says so. Unpinning the lead unpins every pinned session of the family, with one Undo that re-pins them where they were. The family comes from the same fresh read the archive cascade uses, now in web/src/lib/aeFamilyRead.ts.
+---
+ web/src/lib/aeFamilyRead.ts                   |  55 ++++
+ web/src/lib/aePinFamily.ts                    |  43 +++
+ .../settings/AeChatSettingsSection.test.tsx   |  11 +
+ .../pages/settings/AeChatSettingsSection.tsx  |   2 +
+ web/src/pages/settings/AePinFamilySetting.tsx |  47 +++
+ web/src/shell/AeFamilyArchive.tsx             |  49 +--
+ web/src/shell/HeaderConversationMenu.tsx      |  24 +-
+ web/src/shell/Sidebar.tsx                     |  24 +-
+ web/src/shell/aePinFamily.test.ts             | 310 ++++++++++++++++++
+ web/src/shell/aePinFamily.ts                  | 257 +++++++++++++++
+ 10 files changed, 765 insertions(+), 57 deletions(-)
+ create mode 100644 web/src/lib/aeFamilyRead.ts
+ create mode 100644 web/src/lib/aePinFamily.ts
+ create mode 100644 web/src/pages/settings/AePinFamilySetting.tsx
+ create mode 100644 web/src/shell/aePinFamily.test.ts
+ create mode 100644 web/src/shell/aePinFamily.ts
+
+diff --git a/web/src/lib/aeFamilyRead.ts b/web/src/lib/aeFamilyRead.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..039584d3730665e484b5b5c52a50572921eea13e
+--- /dev/null
++++ b/web/src/lib/aeFamilyRead.ts
+@@ -0,0 +1,55 @@
++// A fresh read of a session family (omnigent-ae, 2026-10-25, moved here
++// 2026-10-26): the archive and pin cascades (shell/AeFamilyArchive.tsx,
++// shell/aePinFamily.ts) read the session list rather than trusting the
++// sidebar's rows, which stop at the loaded pages and a search.
++
++import type { QueryClient } from "@tanstack/react-query";
++import { type Conversation, fetchConversationsPage } from "@/hooks/useConversations";
++import { aeFamilies } from "@/lib/aeFamily";
++
++const READ_LIMIT = 200;
++const READ_PAGES = 5;
++
++/** One slice of the session list, newest first, up to `READ_PAGES` pages. */
++async function readSlice(queryClient: QueryClient, archived: boolean): Promise<Conversation[]> {
++  const rows: Conversation[] = [];
++  let after: string | undefined;
++  for (let page = 0; page < READ_PAGES; page += 1) {
++    // eslint-disable-next-line no-await-in-loop -- each page needs the previous cursor
++    const got = await fetchConversationsPage({
++      searchQuery: "",
++      includeArchived: archived,
++      visibility: archived ? "archived" : undefined,
++      queryClient,
++      limit: READ_LIMIT,
++      after,
++    });
++    rows.push(...got.data);
++    if (!got.has_more || got.last_id === null) break;
++    after = got.last_id ?? undefined;
++  }
++  return rows;
++}
++
++/**
++ * The open sessions, plus the archived ones so that a session started by an
++ * archived helper still traces back to its lead. Archived rows only link the
++ * family; callers leave them out of what they act on.
++ */
++export async function aeReadFamilySessions(queryClient: QueryClient): Promise<Conversation[]> {
++  const [open, archived] = await Promise.all([
++    readSlice(queryClient, false),
++    readSlice(queryClient, true),
++  ]);
++  const byId = new Map<string, Conversation>();
++  for (const c of [...archived, ...open]) byId.set(c.id, c);
++  return [...byId.values()];
++}
++
++/**
++ * The family *id* leads among *rows*, lead first; empty when *id* is no family's
++ * top session (it was started by or forked from another one).
++ */
++export function aeFamilyOf(rows: readonly Conversation[], id: string): Conversation[] {
++  return aeFamilies(rows, true).byRoot.get(id)?.members ?? [];
++}
+diff --git a/web/src/lib/aePinFamily.ts b/web/src/lib/aePinFamily.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e63f519a1e0e34dacccab92f0599695fd39e9dc1
+--- /dev/null
++++ b/web/src/lib/aePinFamily.ts
+@@ -0,0 +1,43 @@
++// Settings > Chat > Pin a lead's family (omnigent-ae, 2026-10-26): whether
++// pinning a family's lead also pins its open sessions, and unpinning it unpins
++// the family. Device-local, off by default. The cascade: shell/aePinFamily.ts.
++
++import { useSyncExternalStore } from "react";
++
++const STORAGE_KEY = "omnigent:ae-pin-family";
++
++export function readAePinFamily(): boolean {
++  if (typeof window === "undefined") return false;
++  try {
++    return window.localStorage.getItem(STORAGE_KEY) === "on";
++  } catch {
++    return false;
++  }
++}
++
++const listeners = new Set<() => void>();
++
++export function writeAePinFamily(on: boolean): void {
++  try {
++    window.localStorage.setItem(STORAGE_KEY, on ? "on" : "off");
++  } catch {
++    // A local preference; losing it is harmless.
++  }
++  listeners.forEach((listener) => listener());
++}
++
++function subscribe(listener: () => void): () => void {
++  listeners.add(listener);
++  const onStorage = (event: StorageEvent) => {
++    if (event.key === STORAGE_KEY) listener();
++  };
++  window.addEventListener("storage", onStorage);
++  return () => {
++    listeners.delete(listener);
++    window.removeEventListener("storage", onStorage);
++  };
++}
++
++export function useAePinFamily(): boolean {
++  return useSyncExternalStore(subscribe, readAePinFamily, () => false);
++}
+diff --git a/web/src/pages/settings/AeChatSettingsSection.test.tsx b/web/src/pages/settings/AeChatSettingsSection.test.tsx
+index cd1595b5775eed17898982b53afcbe39521ebcb3..ec4a33495485175e0cb7f2d70beaef0c33b0f456 100644
+--- a/web/src/pages/settings/AeChatSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeChatSettingsSection.test.tsx
+@@ -76,6 +76,17 @@ describe("AeChatSettingsSection", () => {
+     );
+   });
+ 
++  it("offers Pin a lead's family, off by default, and saves the choice", () => {
++    renderAt("/settings/chat", <AeChatSettingsSection />);
++    expect(screen.getByRole("radiogroup", { name: "Pin a lead's family" })).toBeInTheDocument();
++    expect(screen.getByTestId("ae-pin-family-no")).toHaveAttribute("aria-checked", "true");
++    fireEvent.click(screen.getByTestId("ae-pin-family-yes"));
++    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("on");
++    expect(screen.getByTestId("ae-pin-family-yes")).toHaveAttribute("aria-checked", "true");
++    fireEvent.click(screen.getByTestId("ae-pin-family-no"));
++    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("off");
++  });
++
+   it("is what /settings/chat renders", () => {
+     renderAt("/settings/chat", <SettingsPage />);
+     expect(screen.getByTestId("ae-chat-settings")).toBeInTheDocument();
+diff --git a/web/src/pages/settings/AeChatSettingsSection.tsx b/web/src/pages/settings/AeChatSettingsSection.tsx
+index 846b1fed651ff818b76b7df21ff7c4e4b56c34e5..ddbb598ab83e5d2c0c19680149839fa8a7ae242c 100644
+--- a/web/src/pages/settings/AeChatSettingsSection.tsx
++++ b/web/src/pages/settings/AeChatSettingsSection.tsx
+@@ -10,6 +10,7 @@ import { AeRailIcon } from "@/components/aeRail/aeRailUi";
+ import { SettingsLabel } from "@/components/SettingsLabel";
+ import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+ import { AeSpendDisplaySetting } from "./AeSpendDisplaySetting";
++import { AePinFamilySetting } from "./AePinFamilySetting";
+ import { AeSessionListSetting } from "./AeSessionListSetting";
+ import { AeSuggestionKeysSetting } from "./AeSuggestionKeysSetting";
+ import {
+@@ -88,6 +89,7 @@ export function AeChatSettingsSection() {
+     <div data-testid="ae-chat-settings" className="flex flex-col gap-6">
+       <SessionOpenViewControl />
+       <AeSpendDisplaySetting />
++      <AePinFamilySetting />
+       <AeTokenDefragSetting />
+       <AeSuggestionKeysSetting />
+       <AeSessionListSetting />
+diff --git a/web/src/pages/settings/AePinFamilySetting.tsx b/web/src/pages/settings/AePinFamilySetting.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..b7fd3143419b21deb7d8a1f29954701067a93273
+--- /dev/null
++++ b/web/src/pages/settings/AePinFamilySetting.tsx
+@@ -0,0 +1,47 @@
++// Settings > Chat > Pin a lead's family (omnigent-ae, 2026-10-26): whether
++// pinning a family's lead pins its open sessions too, saved on this device.
++// The cascade: shell/aePinFamily.ts.
++
++import { useId } from "react";
++import { SettingsLabel } from "@/components/SettingsLabel";
++import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
++import { useAePinFamily, writeAePinFamily } from "@/lib/aePinFamily";
++
++type Choice = "yes" | "no";
++
++const CARDS: { value: Choice; label: string; title: string }[] = [
++  {
++    value: "yes",
++    label: "Yes",
++    title: "Pinning a lead pins its open sessions; unpinning it unpins the family.",
++  },
++  { value: "no", label: "No", title: "Pinning a lead pins only the lead." },
++];
++
++export function AePinFamilySetting() {
++  const on = useAePinFamily();
++  const labelId = useId();
++  return (
++    <div data-testid="ae-pin-family" className="flex flex-col gap-3">
++      <SettingsLabel
++        label="Pin a lead's family"
++        labelId={labelId}
++        description="When you pin a family's lead, also pin its open sessions, and unpin them with it."
++      />
++      <CardRadioGroup<Choice>
++        labelledBy={labelId}
++        value={on ? "yes" : "no"}
++        onSelect={(value) => writeAePinFamily(value === "yes")}
++        componentId="settings.chat.pin_family"
++        className="grid grid-cols-1 gap-3 sm:grid-cols-2"
++        cardClassName="items-center gap-2 p-4"
++        items={CARDS.map((card) => ({
++          value: card.value,
++          testId: `ae-pin-family-${card.value}`,
++          title: card.title,
++          body: <span className="text-ui font-normal md:font-medium">{card.label}</span>,
++        }))}
++      />
++    </div>
++  );
++}
+diff --git a/web/src/shell/AeFamilyArchive.tsx b/web/src/shell/AeFamilyArchive.tsx
+index 866835d28ce491d39efb0fa80b32ebdd5dfd59e1..8d50b6281c23da8ee0ffc5a2d778d0cbbe24da73 100644
+--- a/web/src/shell/AeFamilyArchive.tsx
++++ b/web/src/shell/AeFamilyArchive.tsx
+@@ -9,7 +9,7 @@
+ // sidebar's rows: those stop at the loaded pages and a search, and the tree
+ // keeps its objects across updates that only change a worktree or a time.
+ 
+-import { type QueryClient, useQueryClient } from "@tanstack/react-query";
++import { useQueryClient } from "@tanstack/react-query";
+ import {
+   type ReactNode,
+   type RefObject,
+@@ -31,10 +31,9 @@ import { showToast } from "@/components/ui/toast";
+ import {
+   BulkConversationMutationError,
+   type Conversation,
+-  fetchConversationsPage,
+   useBulkArchiveConversations,
+ } from "@/hooks/useConversations";
+-import { aeFamilies } from "@/lib/aeFamily";
++import { aeFamilyOf, aeReadFamilySessions } from "@/lib/aeFamilyRead";
+ import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
+ import type { AeFamilyTree } from "@/lib/aeFamilyTree";
+ import { AeFamilyContext } from "@/lib/aeFamilyView";
+@@ -44,55 +43,15 @@ import { showArchiveUndoToast } from "@/shell/archiveUndoToast";
+ export const AE_FAMILY_ARCHIVE_CONFIRM =
+   "Are you sure you would like to archive this? There are still open sessions.";
+ 
+-const READ_LIMIT = 200;
+-const READ_PAGES = 5;
+-
+ /** The sessions under a lead among *rows*, and how many are open (not in the closed group). */
+ export function aeFamilyArchiveTargets(
+   rows: readonly Conversation[],
+   id: string,
+ ): { children: Conversation[]; open: number } {
+-  const members = aeFamilies(rows, true).byRoot.get(id)?.members ?? [];
+-  const children = members.filter((c) => c.id !== id && c.archived !== true);
++  const children = aeFamilyOf(rows, id).filter((c) => c.id !== id && c.archived !== true);
+   return { children, open: children.filter((c) => !aeIsClosedMember(c)).length };
+ }
+ 
+-/** One slice of the session list, newest first, up to `READ_PAGES` pages. */
+-async function readSlice(queryClient: QueryClient, archived: boolean): Promise<Conversation[]> {
+-  const rows: Conversation[] = [];
+-  let after: string | undefined;
+-  for (let page = 0; page < READ_PAGES; page += 1) {
+-    // eslint-disable-next-line no-await-in-loop -- each page needs the previous cursor
+-    const got = await fetchConversationsPage({
+-      searchQuery: "",
+-      includeArchived: archived,
+-      visibility: archived ? "archived" : undefined,
+-      queryClient,
+-      limit: READ_LIMIT,
+-      after,
+-    });
+-    rows.push(...got.data);
+-    if (!got.has_more || got.last_id === null) break;
+-    after = got.last_id ?? undefined;
+-  }
+-  return rows;
+-}
+-
+-/**
+- * The open sessions, plus the archived ones so that a session started by an
+- * archived helper still traces back to its lead. Archived rows only link the
+- * family; `aeFamilyArchiveTargets` never archives them again.
+- */
+-async function readSessions(queryClient: QueryClient): Promise<Conversation[]> {
+-  const [open, archived] = await Promise.all([
+-    readSlice(queryClient, false),
+-    readSlice(queryClient, true),
+-  ]);
+-  const byId = new Map<string, Conversation>();
+-  for (const c of [...archived, ...open]) byId.set(c.id, c);
+-  return [...byId.values()];
+-}
+-
+ interface Seen {
+   tree: AeFamilyTree | null | undefined;
+   activeId: string | undefined;
+@@ -164,7 +123,7 @@ export function useAeFamilyArchive(
+     }
+     if (reading.current) return;
+     reading.current = true;
+-    readSessions(queryClient)
++    aeReadFamilySessions(queryClient)
+       .finally(() => {
+         reading.current = false;
+       })
+diff --git a/web/src/shell/HeaderConversationMenu.tsx b/web/src/shell/HeaderConversationMenu.tsx
+index 28f30e7a3ba76546d12c3766c1474a0b4c6944f2..f5cc14c0f845c3ec9005c1e4ba4a73942c81d87d 100644
+--- a/web/src/shell/HeaderConversationMenu.tsx
++++ b/web/src/shell/HeaderConversationMenu.tsx
+@@ -1,4 +1,5 @@
+ import {
++  useContext,
+   useEffect,
+   useRef,
+   useState,
+@@ -67,6 +68,8 @@ import { useNavigate } from "@/lib/routing";
+ import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+ import { showArchiveUndoToast } from "./archiveUndoToast";
+ import { unpinWithUndo } from "./unpinUndoToast";
++import { aeTogglePinFamily } from "@/shell/aePinFamily";
++import { SidebarConfigContext } from "@/lib/sidebarConfig";
+ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+ import { useAeFamilyArchive } from "@/shell/AeFamilyArchive";
+ import { cn } from "@/lib/utils";
+@@ -117,6 +120,7 @@ export function HeaderConversationMenu({
+   const togglePinned = useTogglePinnedConversation();
+   // Pin writes don't overlap, so Pin/Unpin is disabled while one is saving.
+   const pinSaving = useIsMutating({ mutationKey: PIN_WRITE_MUTATION_KEY }) > 0;
++  const { pinCap, pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
+   const rename = useRenameConversation();
+   const moveToProject = useMoveToProject();
+   const archive = useArchiveConversation();
+@@ -242,9 +246,23 @@ export function HeaderConversationMenu({
+         className={itemClass}
+         disabled={pinSaving}
+         onSelect={() =>
+-          isPinned
+-            ? unpinWithUndo(queryClient, togglePinned.mutateAsync, conversation.id, conversation)
+-            : togglePinned.mutate({ id: conversation.id, pinned: true })
++          aeTogglePinFamily({
++            queryClient,
++            writePin: togglePinned.mutateAsync,
++            session: conversation,
++            pinned: isPinned,
++            pinCap,
++            includeShared: pinsIncludeShared && sharedAvailable,
++            alone: () =>
++              isPinned
++                ? unpinWithUndo(
++                    queryClient,
++                    togglePinned.mutateAsync,
++                    conversation.id,
++                    conversation,
++                  )
++                : togglePinned.mutate({ id: conversation.id, pinned: true }),
++          })
+         }
+       >
+         {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index b9ed28dc9b6dd8545df6882c32a1e12953349c0a..171393f0abc9995baa7e48a4949e34c6b807a561 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -182,6 +182,7 @@ import { showToast } from "@/components/ui/toast";
+ import { showArchiveUndoToast } from "./archiveUndoToast";
+ import { useAeFamilyArchive } from "@/shell/AeFamilyArchive";
+ import { unpinWithUndo } from "./unpinUndoToast";
++import { aeTogglePinFamily } from "@/shell/aePinFamily";
+ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+ import { PermissionsModal } from "@/components/PermissionsModal";
+ import { ProjectSettingsDialog } from "./ProjectSettingsDialog";
+@@ -911,17 +912,22 @@ function SidebarImpl({
+     [pinnedConversations],
+   );
+   // Stable identity (useStableCallback) so its changing deps don't defeat the row memo.
++  const { pinCap, pinsIncludeShared, sharedAvailable } = useContext(SidebarConfigContext);
+   const togglePinnedConversation = useStableCallback((conversationId: string) => {
+-    if (!pinnedIdSet.has(conversationId)) {
+-      togglePinnedMutation.mutate({ id: conversationId, pinned: true });
+-      return;
+-    }
+-    unpinWithUndo(
++    const isPinned = pinnedIdSet.has(conversationId);
++    const before = pinnedConversations.find((c) => c.id === conversationId);
++    aeTogglePinFamily({
+       queryClient,
+-      togglePinnedMutation.mutateAsync,
+-      conversationId,
+-      pinnedConversations.find((c) => c.id === conversationId),
+-    );
++      writePin: togglePinnedMutation.mutateAsync,
++      session: before ?? { id: conversationId },
++      pinned: isPinned,
++      pinCap,
++      includeShared: pinsIncludeShared && sharedAvailable,
++      alone: () =>
++        isPinned
++          ? unpinWithUndo(queryClient, togglePinnedMutation.mutateAsync, conversationId, before)
++          : togglePinnedMutation.mutate({ id: conversationId, pinned: true }),
++    });
+   });
+ 
+   // One-time migration: pins used to live only in localStorage. Push any
+diff --git a/web/src/shell/aePinFamily.test.ts b/web/src/shell/aePinFamily.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..990ab65eac2aeb19c83e00a558a86d2d0fa01596
+--- /dev/null
++++ b/web/src/shell/aePinFamily.test.ts
+@@ -0,0 +1,310 @@
++// Pin a lead's family (omnigent-ae, 2026-10-26):
++//   1. Setting off: the single toggle runs, with no read.
++//   2. On: pinning a lead pins it and its open sessions, lead first; reference,
++//      archived and already pinned sessions are left alone.
++//   3. On: a family that needs more pin spots than are free pins nothing and says so.
++//   4. On: unpinning the lead unpins every pinned session of the family, with one Undo
++//      that re-pins them at their old values.
++//   5. On: a session started by another, or one that leads nothing, toggles alone.
++//   6. A failed read changes nothing and says so; a double click reads once.
++//   7. Without shared pins, only the viewer's sessions count and get pinned.
++//   8. A member the sidebar has not loaded is seeded into the cache before its pin.
++
++import { QueryClient } from "@tanstack/react-query";
++import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type * as ConversationsModule from "@/hooks/useConversations";
++import { PINNED_CONVERSATIONS_KEY, type Conversation } from "@/hooks/useConversations";
++import { writeAePinFamily } from "@/lib/aePinFamily";
++import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
++
++const mocks = vi.hoisted(() => ({ read: vi.fn(), toast: vi.fn(), showToast: vi.fn() }));
++
++vi.mock("@/hooks/useConversations", async (importOriginal) => ({
++  ...(await importOriginal<typeof ConversationsModule>()),
++  fetchConversationsPage: mocks.read,
++}));
++vi.mock("sonner", () => ({ toast: mocks.toast }));
++vi.mock("@/components/ui/toast", () => ({ showToast: mocks.showToast }));
++vi.mock("@/lib/identity", () => ({ getCurrentUserId: () => "me@example.com" }));
++
++import { aeTogglePinFamily, resetAePinFamilyForTests } from "./aePinFamily";
++
++function session(
++  id: string,
++  labels: Record<string, string> = {},
++  extra: Partial<Conversation> = {},
++) {
++  return {
++    id,
++    object: "conversation",
++    title: id,
++    created_at: 0,
++    updated_at: 0,
++    labels,
++    permission_level: null,
++    status: "idle",
++    ...extra,
++  } as Conversation;
++}
++
++const LEAD = session("lead");
++const child = (id: string, status = "working", parent = "lead") =>
++  session(id, { "ae.orch": parent, "ae.status": status });
++
++let queryClient: QueryClient;
++type WritePin = (vars: { id: string; pinned: boolean; pinnedAt?: number }) => Promise<unknown>;
++let writePin: Mock<WritePin>;
++let alone: Mock<() => void>;
++
++/** The session list the read returns: *open* rows, and *archived* ones. */
++function sessionList(open: Conversation[], archived: Conversation[] = []) {
++  mocks.read.mockImplementation(async ({ visibility }: { visibility?: string }) => ({
++    data: visibility === "archived" ? archived : open,
++    has_more: false,
++    last_id: null,
++  }));
++}
++
++/** Sessions pinned now, with their pin values. */
++function pinned(pins: Record<string, number>) {
++  queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
++    conversations: Object.entries(pins).map(([id, at]) =>
++      session(id, { [PINNED_LABEL_KEY]: String(at) }),
++    ),
++    filterHonored: true,
++  });
++}
++
++function toggle(target: Conversation, isPinned: boolean, pinCap = 30, includeShared = true) {
++  aeTogglePinFamily({
++    queryClient,
++    writePin,
++    session: target,
++    pinned: isPinned,
++    pinCap,
++    includeShared,
++    alone,
++  });
++}
++
++const settle = () =>
++  vi
++    .waitFor(() => expect(mocks.read).toHaveBeenCalled())
++    .then(
++      () =>
++        new Promise<void>((resolve) => {
++          setTimeout(resolve, 10);
++        }),
++    );
++
++beforeEach(() => {
++  window.localStorage.clear();
++  writeAePinFamily(true);
++  resetAePinFamilyForTests();
++  queryClient = new QueryClient();
++  pinned({});
++  writePin = vi.fn<WritePin>(() => Promise.resolve({}));
++  alone = vi.fn<() => void>();
++  mocks.read.mockReset();
++  mocks.toast.mockReset();
++  mocks.showToast.mockReset();
++});
++
++afterEach(() => {
++  window.localStorage.clear();
++});
++
++describe("aeTogglePinFamily", () => {
++  it("toggles alone, with no read, while the setting is off", () => {
++    writeAePinFamily(false);
++    sessionList([LEAD, child("a")]);
++    toggle(LEAD, false);
++    expect(alone).toHaveBeenCalledTimes(1);
++    expect(mocks.read).not.toHaveBeenCalled();
++    expect(writePin).not.toHaveBeenCalled();
++  });
++
++  it("pins the lead, then its open sessions, and nothing closed or pinned already", async () => {
++    sessionList(
++      [LEAD, child("a"), child("b", "review"), child("ref", "reference"), child("c")],
++      [session("old", { "ae.orch": "lead" }, { archived: true })],
++    );
++    pinned({ c: 5 });
++    toggle(LEAD, false);
++    await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(3));
++    expect(writePin.mock.calls.map(([w]) => w)).toEqual([
++      { id: "lead", pinned: true },
++      { id: "a", pinned: true },
++      { id: "b", pinned: true },
++    ]);
++    expect(alone).not.toHaveBeenCalled();
++  });
++
++  it("pins a grandchild started by an open session", async () => {
++    sessionList([LEAD, child("a"), child("g", "working", "a")]);
++    toggle(LEAD, false);
++    await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(3));
++    expect(writePin.mock.calls.map(([w]) => w.id)).toEqual(["lead", "a", "g"]);
++  });
++
++  it("pins nothing and says so when the family needs more spots than are free", async () => {
++    sessionList([LEAD, child("a"), child("b")]);
++    pinned({ x: 1, y: 2 });
++    toggle(LEAD, false, 4);
++    await settle();
++    expect(writePin).not.toHaveBeenCalled();
++    expect(alone).not.toHaveBeenCalled();
++    expect(mocks.showToast).toHaveBeenCalledWith(
++      "Not enough pin spots for this family (3 needed, 2 free). Nothing was pinned.",
++    );
++  });
++
++  it("stops at the first pin that fails and says how many saved", async () => {
++    sessionList([LEAD, child("a"), child("b")]);
++    writePin.mockImplementation(({ id }: { id: string }) =>
++      id === "a" ? Promise.reject(new Error("refused")) : Promise.resolve({}),
++    );
++    toggle(LEAD, false);
++    await settle();
++    expect(writePin.mock.calls.map(([w]) => w.id)).toEqual(["lead", "a"]);
++    expect(mocks.showToast).toHaveBeenCalledWith(
++      "Pinned 1 of 3 family sessions; the rest did not save. Pin them again to retry.",
++    );
++  });
++
++  it("does not pin the lead again when it was pinned while the family was read", async () => {
++    sessionList([LEAD, child("a")]);
++    mocks.read.mockImplementationOnce(async () => {
++      pinned({ lead: 7 });
++      return { data: [LEAD, child("a")], has_more: false, last_id: null };
++    });
++    toggle(LEAD, false);
++    await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(1));
++    expect(writePin.mock.calls[0][0]).toEqual({ id: "a", pinned: true });
++  });
++
++  describe("without shared pins", () => {
++    const theirs = (id: string, extra: Record<string, string> = {}) =>
++      session(id, { [PINNED_LABEL_KEY]: "1", ...extra }, { owner: "other@example.com" });
++
++    it("counts only the viewer's pins against the cap", async () => {
++      sessionList([LEAD, child("a")]);
++      queryClient.setQueryData(PINNED_CONVERSATIONS_KEY, {
++        conversations: [session("x", { [PINNED_LABEL_KEY]: "1" }), theirs("s1"), theirs("s2")],
++        filterHonored: true,
++      });
++      toggle(LEAD, false, 3, false);
++      await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++      expect(mocks.showToast).not.toHaveBeenCalled();
++    });
++
++    it("leaves another person's session in the family unpinned", async () => {
++      sessionList([
++        LEAD,
++        child("a"),
++        session("s", { "ae.orch": "lead", "ae.status": "working" }, { owner: "other@example.com" }),
++      ]);
++      toggle(LEAD, false, 30, false);
++      await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++      expect(writePin.mock.calls.map(([w]) => w.id)).toEqual(["lead", "a"]);
++    });
++  });
++
++  it("seeds a member the sidebar has not loaded before pinning it", async () => {
++    const far = child("far");
++    sessionList([LEAD, far]);
++    let seen: unknown;
++    writePin.mockImplementation(({ id }: { id: string }) => {
++      if (id === "far") seen = queryClient.getQueryData(["conversation-backfill", "far"]);
++      return Promise.resolve({});
++    });
++    toggle(LEAD, false);
++    await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++    expect(seen).toEqual(far);
++  });
++
++  it("toggles a loaded child alone, with no read, from its cached labels", () => {
++    queryClient.setQueryData(["conversations", "x"], {
++      pages: [{ data: [child("a")] }],
++      pageParams: [undefined],
++    });
++    // The sidebar knows only the id of a row it has not pinned.
++    toggle({ id: "a" } as Conversation, false);
++    expect(alone).toHaveBeenCalledTimes(1);
++    expect(mocks.read).not.toHaveBeenCalled();
++  });
++
++  it("unpins the lead and every pinned family session, and Undo re-pins them where they were", async () => {
++    sessionList([LEAD, child("a"), child("b"), child("ref", "reference")]);
++    pinned({ lead: 10, a: 11, ref: 12 });
++    toggle(LEAD, true);
++    await vi.waitFor(() => expect(mocks.toast).toHaveBeenCalledTimes(1));
++    expect(writePin.mock.calls.map(([w]) => w)).toEqual([
++      { id: "lead", pinned: false },
++      { id: "a", pinned: false },
++      { id: "ref", pinned: false },
++    ]);
++    const [title, opts] = mocks.toast.mock.calls[0];
++    expect(title).toBe("Unpinned 3 sessions");
++    writePin.mockClear();
++    pinned({});
++    opts.action.onClick();
++    await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(3));
++    expect(writePin.mock.calls.map(([w]) => w)).toEqual([
++      { id: "lead", pinned: true, pinnedAt: 10 },
++      { id: "a", pinned: true, pinnedAt: 11 },
++      { id: "ref", pinned: true, pinnedAt: 12 },
++    ]);
++  });
++
++  it("unpins alone when no other family session is pinned", async () => {
++    sessionList([LEAD, child("a")]);
++    pinned({ lead: 10 });
++    toggle(LEAD, true);
++    await settle();
++    expect(alone).toHaveBeenCalledTimes(1);
++    expect(writePin).not.toHaveBeenCalled();
++  });
++
++  it("toggles a session started by another alone, with no read", () => {
++    toggle(child("a"), false);
++    expect(alone).toHaveBeenCalledTimes(1);
++    expect(mocks.read).not.toHaveBeenCalled();
++  });
++
++  it("toggles a session that leads nothing alone", async () => {
++    sessionList([LEAD, session("other")]);
++    toggle(LEAD, false);
++    await settle();
++    expect(alone).toHaveBeenCalledTimes(1);
++    expect(writePin).not.toHaveBeenCalled();
++  });
++
++  it("pins the lead alone when every session under it is closed", async () => {
++    sessionList([LEAD, child("ref", "reference")]);
++    toggle(LEAD, false);
++    await settle();
++    expect(alone).toHaveBeenCalledTimes(1);
++    expect(writePin).not.toHaveBeenCalled();
++  });
++
++  it("changes nothing and says so when the family can't be read", async () => {
++    mocks.read.mockRejectedValue(new Error("offline"));
++    toggle(LEAD, false);
++    await settle();
++    expect(alone).not.toHaveBeenCalled();
++    expect(writePin).not.toHaveBeenCalled();
++    expect(mocks.showToast).toHaveBeenCalledWith(
++      "Couldn't read the family's sessions, so nothing was pinned. Try again.",
++    );
++  });
++
++  it("reads once for a double click", async () => {
++    sessionList([LEAD, child("a")]);
++    toggle(LEAD, false);
++    toggle(LEAD, false);
++    await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++    // Two slices per read: open and archived.
++    expect(mocks.read).toHaveBeenCalledTimes(2);
++  });
++});
+diff --git a/web/src/shell/aePinFamily.ts b/web/src/shell/aePinFamily.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..0287afb9c8738cf7d85679e89eb909af6ddffd14
+--- /dev/null
++++ b/web/src/shell/aePinFamily.ts
+@@ -0,0 +1,257 @@
++// Pin and unpin a family with its lead (omnigent-ae, 2026-10-26). With
++// Settings > Chat > "Pin a lead's family" on (lib/aePinFamily.ts), pinning a
++// session that leads a family also pins its open sessions (not reference or
++// archived ones), lead first so the family lists together in Pinned; a family
++// that needs more pin spots than are free pins nothing and says so. Unpinning
++// the lead unpins every pinned session of the family, with one Undo. With the
++// setting off, or for a session that leads no family, `alone` runs the single
++// pin or unpin as before. The family comes from a fresh read (lib/aeFamilyRead.ts).
++
++import type { QueryClient } from "@tanstack/react-query";
++import { toast } from "sonner";
++import { showToast } from "@/components/ui/toast";
++import {
++  PINNED_CONVERSATIONS_KEY,
++  type Conversation,
++  type PinnedConversationsResult,
++} from "@/hooks/useConversations";
++import { aeFamilyParent } from "@/lib/aeFamily";
++import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
++import { aeFamilyOf, aeReadFamilySessions } from "@/lib/aeFamilyRead";
++import { readAePinFamily } from "@/lib/aePinFamily";
++import { getCurrentUserId } from "@/lib/identity";
++import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
++import { sessionVisibility } from "@/lib/sessionVisibility";
++import { readPinnedConversationIds } from "./sidebarNav";
++
++/** The pin toggle's `mutateAsync` (`useTogglePinnedConversation`). */
++type WritePin = (vars: { id: string; pinned: boolean; pinnedAt?: number }) => Promise<unknown>;
++
++/** As long as the single unpin's Undo, and under its id, so a newer unpin replaces the pill. */
++const UNDO_MS = 5000;
++const UNDO_TOAST_ID = "unpin-undo";
++
++const BACKFILL = "conversation-backfill";
++
++/** A session's row in the pinned cache, a loaded list or project page, or the backfill cache. */
++function cachedRow(queryClient: QueryClient, id: string): Conversation | undefined {
++  const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
++  const pinned = pins?.conversations.find((c) => c.id === id);
++  if (pinned) return pinned;
++  for (const queryKey of [["conversations"], ["project-sessions"]]) {
++    for (const [, data] of queryClient.getQueriesData<{ pages?: { data?: Conversation[] }[] }>({
++      queryKey,
++    })) {
++      const row = data?.pages?.flatMap((page) => page.data ?? []).find((c) => c.id === id);
++      if (row) return row;
++    }
++  }
++  return queryClient.getQueryData<Conversation | null>([BACKFILL, id]) ?? undefined;
++}
++
++/** Sessions pinned now, in the server pinned cache or legacy local pins, with their pin value. */
++function pinnedNow(queryClient: QueryClient): Map<string, number | undefined> {
++  const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
++  const out = new Map<string, number | undefined>();
++  for (const id of readPinnedConversationIds()) out.set(id, undefined);
++  for (const c of pins?.conversations ?? []) {
++    const value = Number(c.labels?.[PINNED_LABEL_KEY]);
++    out.set(c.id, Number.isFinite(value) && value > 0 ? value : undefined);
++  }
++  return out;
++}
++
++/**
++ * The pins that count against the cap, counted as the pin toggle counts them:
++ * without shared pins, only the viewer's own sessions.
++ */
++function pinsCounted(queryClient: QueryClient, includeShared: boolean): number {
++  const viewerId = getCurrentUserId();
++  const mine = (row: Conversation | undefined) =>
++    includeShared || (row !== undefined && sessionVisibility(row, viewerId) === "mine");
++  const pins = queryClient.getQueryData<PinnedConversationsResult>(PINNED_CONVERSATIONS_KEY);
++  const ids = new Set((pins?.conversations ?? []).filter((c) => mine(c)).map((c) => c.id));
++  for (const id of readPinnedConversationIds()) {
++    if (mine(cachedRow(queryClient, id))) ids.add(id);
++  }
++  return ids.size;
++}
++
++/** Writes one pin after another (the app refuses overlapping pin writes); stops at the first failure. */
++async function writeEach(
++  writePin: WritePin,
++  writes: { id: string; pinned: boolean; pinnedAt?: number }[],
++): Promise<string[]> {
++  const done: string[] = [];
++  for (const write of writes) {
++    try {
++      // eslint-disable-next-line no-await-in-loop -- pin writes must not overlap
++      await writePin(write);
++    } catch {
++      // The toggle's own onError rolled that row back and said why.
++      break;
++    }
++    done.push(write.id);
++  }
++  return done;
++}
++
++async function pinFamily(
++  queryClient: QueryClient,
++  writePin: WritePin,
++  family: Conversation[],
++  id: string,
++  pinCap: number,
++  includeShared: boolean,
++): Promise<void> {
++  const viewerId = getCurrentUserId();
++  // Read again now: the lead or a member may have been pinned while the family was read.
++  const pinned = pinnedNow(queryClient);
++  const targets = family.filter(
++    (c) =>
++      !pinned.has(c.id) &&
++      (c.id === id ||
++        (c.archived !== true &&
++          !aeIsClosedMember(c) &&
++          // Without shared pins the toggle refuses another person's session.
++          (includeShared || sessionVisibility(c, viewerId) === "mine"))),
++  );
++  if (targets.length === 0) return;
++  const free = Math.max(pinCap - pinsCounted(queryClient, includeShared), 0);
++  if (targets.length > free) {
++    showToast(
++      `Not enough pin spots for this family (${targets.length} needed, ${free} free). Nothing was pinned.`,
++    );
++    return;
++  }
++  // The toggle builds its optimistic Pinned row from the cache; a member past
++  // the sidebar's loaded pages is there only once this read seeds it.
++  for (const c of targets) {
++    if (!cachedRow(queryClient, c.id)) queryClient.setQueryData([BACKFILL, c.id], c);
++  }
++  // Lead first: Pinned sorts by pin time, so the family lists together under it.
++  const ordered = [...targets.filter((c) => c.id === id), ...targets.filter((c) => c.id !== id)];
++  const done = await writeEach(
++    writePin,
++    ordered.map((c) => ({ id: c.id, pinned: true })),
++  );
++  if (done.length > 0 && done.length < ordered.length) {
++    showToast(
++      `Pinned ${done.length} of ${ordered.length} family sessions; the rest did not save. Pin them again to retry.`,
++    );
++  }
++}
++
++async function unpinFamily(
++  queryClient: QueryClient,
++  writePin: WritePin,
++  family: Conversation[],
++  lead: Pick<Conversation, "id" | "title">,
++): Promise<void> {
++  const pinned = pinnedNow(queryClient);
++  const members = [lead.id, ...family.map((c) => c.id).filter((m) => m !== lead.id)].filter((m) =>
++    pinned.has(m),
++  );
++  const done = await writeEach(
++    writePin,
++    members.map((m) => ({ id: m, pinned: false })),
++  );
++  if (done.length === 0) return;
++  toast(`Unpinned ${done.length} session${done.length === 1 ? "" : "s"}`, {
++    id: UNDO_TOAST_ID,
++    description: lead.title || undefined,
++    duration: UNDO_MS,
++    action: {
++      label: "Undo",
++      onClick: () => {
++        // Re-pin at the old values, so the family returns to its old Pinned
++        // slots; skip any pinned again meanwhile.
++        const now = pinnedNow(queryClient);
++        void writeEach(
++          writePin,
++          done
++            .filter((m) => !now.has(m))
++            .map((m) => ({ id: m, pinned: true, pinnedAt: pinned.get(m) })),
++        );
++      },
++    },
++    testId: "unpin-undo-toast-item",
++  });
++}
++
++// A second click on the same lead while its family is read does nothing.
++const reading = new Set<string>();
++
++/**
++ * Pin or unpin *session*, with its family when the setting is on and it leads
++ * one; otherwise `alone` does the single pin or unpin.
++ */
++export function aeTogglePinFamily({
++  queryClient,
++  writePin,
++  session,
++  pinned,
++  pinCap,
++  includeShared,
++  alone,
++}: {
++  queryClient: QueryClient;
++  writePin: WritePin;
++  session: Pick<Conversation, "id"> & Partial<Pick<Conversation, "labels" | "title">>;
++  /** Pinned now: the toggle unpins. */
++  pinned: boolean;
++  pinCap: number;
++  /** Whether Pinned holds shared sessions, as the pin toggle reads it. */
++  includeShared: boolean;
++  alone: () => void;
++}): void {
++  if (!readAePinFamily()) {
++    alone();
++    return;
++  }
++  // A session started by or forked from another leads no family: no read.
++  const labels = session.labels ?? cachedRow(queryClient, session.id)?.labels;
++  if (labels && aeFamilyParent(labels) !== null) {
++    alone();
++    return;
++  }
++  if (reading.has(session.id)) return;
++  reading.add(session.id);
++  aeReadFamilySessions(queryClient)
++    .finally(() => reading.delete(session.id))
++    .then(
++      (rows) => {
++        const family = aeFamilyOf(rows, session.id);
++        const lead = family.find((c) => c.id === session.id);
++        const others = family.filter((c) => c.id !== session.id);
++        // No family under it: the single toggle, as with the setting off.
++        if (!lead || others.length === 0) {
++          alone();
++          return undefined;
++        }
++        if (pinned) {
++          const now = pinnedNow(queryClient);
++          if (!others.some((c) => now.has(c.id))) {
++            alone();
++            return undefined;
++          }
++          return unpinFamily(queryClient, writePin, family, lead);
++        }
++        const open = others.filter((c) => c.archived !== true && !aeIsClosedMember(c));
++        if (open.length === 0) {
++          alone();
++          return undefined;
++        }
++        return pinFamily(queryClient, writePin, family, session.id, pinCap, includeShared);
++      },
++      () =>
++        showToast(
++          `Couldn't read the family's sessions, so nothing was ${pinned ? "unpinned" : "pinned"}. Try again.`,
++        ),
++    );
++}
++
++/** Resets the read guard between tests. */
++export function resetAePinFamilyForTests(): void {
++  reading.clear();
++}

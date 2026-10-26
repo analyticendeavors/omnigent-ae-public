@@ -440,6 +440,7 @@ def test_scripts_are_the_expected_set_and_executable() -> None:
         "host-relink.sh",
         "install-host.sh",
         "pull-secrets.sh",
+        "vault-source-tags.sh",
     ]
     for script in SCRIPTS:
         assert os.access(script, os.X_OK), f"{script.name} is not executable"

@@ -122,6 +122,10 @@ async def test_lists_the_worker_tools_and_ours(omni: OmniClient) -> None:
             "schedule_checkin",
             "list_prs",
             "ask_reid",
+            "set_session_model",
+            "report_review",
+            "preset_insights_read",
+            "submit_preset_suggestions",
         )
         by_name = {tool.name: tool for tool in listed.tools}
         park = by_name["park_fork"].inputSchema
@@ -455,12 +459,13 @@ ORCHESTRATOR_TOOLS = [
     "post_message",
     "schedule_checkin",
     "list_prs",
+    "set_session_model",
     "ask_reid",
 ]
 
 
 def test_the_orchestrator_writes_only_what_it_needs(tmp_path: Path) -> None:
-    """Sessions, messages, its check-in and a status; never the lot, never a merge."""
+    """Sessions, messages, its check-in, a status, a model change; never the lot or a merge."""
     allowlist = _allowlist("orchestrator", tmp_path)
     assert allowlist == ORCHESTRATOR_TOOLS
     assert set(allowlist) <= set(TOOL_NAMES)
@@ -469,14 +474,55 @@ def test_the_orchestrator_writes_only_what_it_needs(tmp_path: Path) -> None:
         "post_message",
         "schedule_checkin",
         "omni_set_status",
+        "set_session_model",
     }
     assert "park_fork" not in allowlist and "link_issue" not in allowlist
 
 
 def test_every_new_writer_is_on_writing_tools() -> None:
-    assert {"create_session", "post_message", "schedule_checkin"} <= WRITING_TOOLS
+    assert {
+        "create_session",
+        "post_message",
+        "schedule_checkin",
+        "report_review",
+        "submit_preset_suggestions",
+    } <= WRITING_TOOLS
+    assert "preset_insights_read" not in WRITING_TOOLS
     assert not {"list_prs", "ask_reid"} & WRITING_TOOLS
     assert set(TOOL_NAMES) >= WRITING_TOOLS
+
+
+def test_the_preset_reviewer_lists_exactly_its_two_tools_and_one_writer(tmp_path: Path) -> None:
+    allowlist = _allowlist("preset-reviewer", tmp_path)
+    assert allowlist == ["preset_insights_read", "submit_preset_suggestions"]
+    assert set(allowlist) <= set(TOOL_NAMES)
+    assert set(allowlist) & WRITING_TOOLS == {"submit_preset_suggestions"}
+
+
+async def test_preset_tools_post_as_the_calling_session(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_rev")
+    seen: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.url.path, json.loads(request.content)))
+        if request.url.path.endswith("preset-suggestions"):
+            return httpx.Response(422, json={"error": {"message": "suggestions[0]: bad"}})
+        return httpx.Response(200, json={"due": False, "why": "soon"})
+
+    args = {"summary": "s", "suggestions": []}
+    async with create_connected_server_and_client_session(create_server(_stub(handler))) as s:
+        read = _payload(await s.call_tool("preset_insights_read", {}))
+        failed = _payload(await s.call_tool("submit_preset_suggestions", args))
+        monkeypatch.delenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID")
+        monkeypatch.delenv("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID", raising=False)
+        missing = _payload(await s.call_tool("preset_insights_read", {}))
+    assert read == {"due": False, "why": "soon"}
+    assert "suggestions[0]: bad" in failed["error"]
+    assert "own id" in missing["error"]
+    assert seen == [
+        ("/v1/ae/sessions/conv_rev/preset-insights", {}),
+        ("/v1/ae/sessions/conv_rev/preset-suggestions", args),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -543,8 +589,19 @@ async def test_create_session_answers_the_url_slots_full_and_failures() -> None:
                 json={
                     "error": {
                         "code": "slots_full",
-                        "message": "Slots full: 3 of 3 working.",
+                        "message": "Slots full: 3 of 3 taken; this one would make 4 of 3.",
                         "working": [{"id": "conv_a", "title": "A"}],
+                        "limit": 3,
+                    }
+                },
+            ),
+            httpx.Response(
+                409,
+                json={
+                    "error": {
+                        "code": "family_full",
+                        "message": "Nothing was started: 3 of this family's sessions are working",
+                        "working": [{"id": "conv_k", "title": "K"}],
                         "limit": 3,
                     }
                 },
@@ -577,10 +634,58 @@ async def test_create_session_answers_the_url_slots_full_and_failures() -> None:
         assert full["outcome"] == "slots_full"
         assert full["working"] == [{"id": "conv_a", "title": "A"}]
         assert "ask_reid" in full["instruction"]
+        family = _payload(await session.call_tool("create_session", {"title": "T", "brief": "B"}))
+        assert (family["outcome"], family["limit"]) == ("family_full", 3)
+        assert "ask_reid" not in family["instruction"]
         half = _payload(await session.call_tool("create_session", {"title": "T", "brief": "B"}))
         assert half["error"].startswith("Could not start the session: 502 session conv_2")
         assert half["url"] == "http://box.test/c/conv_2"
-    assert "t0ken" not in json.dumps([ok, full, half])
+    assert "t0ken" not in json.dumps([ok, full, family, half])
+
+
+async def test_create_session_fills_the_orchestrator_from_the_calling_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"session_id": "conv_1", "path": "/c/conv_1"})
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "abc123")
+    async with connect(_stub(handler)) as session:
+        await session.call_tool("create_session", {"title": "T", "brief": "B", "role": "builder"})
+        await session.call_tool(
+            "create_session", {"title": "T", "brief": "B", "orchestrator": "given"}
+        )
+    assert seen[0] == {"title": "T", "brief": "B", "role": "builder", "orchestrator": "abc123"}
+    assert seen[1]["orchestrator"] == "given", "an explicit id wins"
+
+
+async def test_create_session_standalone_keeps_the_opener_and_says_paste_when_full(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        error = {"code": "slots_full", "message": "Slots full", "working": [], "limit": 3}
+        return httpx.Response(409, json={"error": error})
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "abc123")
+    async with connect(_stub(handler)) as session:
+        full = _payload(
+            await session.call_tool(
+                "create_session",
+                {"title": "T", "brief": "B", "standalone": True, "preset": "balanced"},
+            )
+        )
+        helper = _payload(await session.call_tool("create_session", {"title": "T", "brief": "B"}))
+    assert seen[0]["standalone"] is True
+    assert seen[0]["orchestrator"] == "abc123", "the opener lends a session-role model"
+    assert full["outcome"] == "slots_full"
+    assert "paste" in full["instruction"] and "ride_unparked" not in full["instruction"]
+    assert "ride_unparked" in helper["instruction"]
 
 
 async def test_create_session_through_the_real_route(

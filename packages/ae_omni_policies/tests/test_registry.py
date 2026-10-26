@@ -19,7 +19,13 @@ def test_upstream_scan_picks_up_the_module() -> None:
         slot_cap = get_entry("ae_omni_policies.slot_cap.slot_cap")
         assert slot_cap is not None and slot_cap.kind == "factory"
         assert slot_cap.params_schema is not None
-        assert set(slot_cap.params_schema["properties"]) == {"limit", "mode", "lot_url"}
+        assert set(slot_cap.params_schema["properties"]) == {
+            "limit",
+            "mode",
+            "lot_url",
+            "family_children",
+            "helpers_count",
+        }
         hurry = get_entry("ae_omni_policies.hurry.hurry_modes")
         assert hurry is not None and hurry.kind == "callable"
         suspect = get_entry("ae_omni_policies.fork_suspect.fork_suspect")

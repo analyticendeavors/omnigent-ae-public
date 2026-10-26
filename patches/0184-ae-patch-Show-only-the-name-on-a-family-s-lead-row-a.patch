@@ -1,0 +1,784 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:58:19 -0700
+Subject: [PATCH 184/191] [ae-patch] Show only the name on a family's lead row
+ and archive its sessions with it
+
+In Grouping > Family a lead row now shows its name and a bare fold chevron. The family's cost pill and session count pill covered the name on a narrow panel and sat under the pin on hover; the count and open count move to the hover card's lead line, beside the family total that already follows Spend shows.
+
+Archiving a lead archives every session under it. When all of them are in the family's closed group it archives at once; otherwise a confirm asks first and Cancel archives nothing.
+---
+ .../components/AeSessionHoverStatus.test.tsx  |   4 +-
+ web/src/components/AeSessionHoverStatus.tsx   |  20 +-
+ web/src/shell/AeFamilyArchive.tsx             | 183 ++++++++++++++++++
+ web/src/shell/AeFamilyTree.tsx                |  70 ++-----
+ web/src/shell/Sidebar.aeFamilies.test.tsx     | 182 ++++++++++++++---
+ web/src/shell/Sidebar.tsx                     |   5 +
+ 6 files changed, 378 insertions(+), 86 deletions(-)
+ create mode 100644 web/src/shell/AeFamilyArchive.tsx
+
+diff --git a/web/src/components/AeSessionHoverStatus.test.tsx b/web/src/components/AeSessionHoverStatus.test.tsx
+index 151cb800d55287bcc9e615a0f3d22493d5100d79..83a1204be622cbc9d99b77074cd390523f1180d8 100644
+--- a/web/src/components/AeSessionHoverStatus.test.tsx
++++ b/web/src/components/AeSessionHoverStatus.test.tsx
+@@ -325,7 +325,7 @@ describe("AeSessionHoverStatus", () => {
+       );
+       await waitFor(() =>
+         expect(screen.getByTestId("ae-hover-lead-line")).toHaveTextContent(
+-          "leads 1 session · family 232.8k tokens",
++          "leads 1 session, 1 open · family 232.8k tokens",
+         ),
+       );
+     });
+@@ -350,7 +350,7 @@ describe("AeSessionHoverStatus", () => {
+       );
+       await waitFor(() =>
+         expect(screen.getByTestId("ae-hover-lead-line")).toHaveTextContent(
+-          "leads 2 sessions · family $4.92",
++          "leads 2 sessions, 2 open · family $4.92",
+         ),
+       );
+     });
+diff --git a/web/src/components/AeSessionHoverStatus.tsx b/web/src/components/AeSessionHoverStatus.tsx
+index a50d021ea476d7cd1dbf23218a63d1bee5f8bbd5..37e61a547fa752cc74f525f0558c732dbc0892d0 100644
+--- a/web/src/components/AeSessionHoverStatus.tsx
++++ b/web/src/components/AeSessionHoverStatus.tsx
+@@ -16,6 +16,7 @@ import {
+   useAeSessionUsages,
+ } from "@/lib/aeAgentUsage";
+ import { aeOrchParent } from "@/lib/aeFamily";
++import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
+ import { aeSpendLabel, useAeSpendDisplay } from "@/lib/aeSpendDisplay";
+ import { AeFamilyContext } from "@/lib/aeFamilyView";
+ import { fetchAeSessionPeek } from "@/lib/aeSessionPeek";
+@@ -117,10 +118,13 @@ function RunningAgents({ sessionId, updatedAt }: { sessionId: string; updatedAt:
+ function LeadLine({
+   labels,
+   count,
++  open,
+   usage,
+ }: {
+   labels: Record<string, string> | undefined;
+   count: number;
++  /** Sessions not closed (reference or archived); the lead row itself shows no count. */
++  open: number;
+   usage: ReadonlyMap<string, AeSessionUsage>;
+ }) {
+   const roles = useAeRoles();
+@@ -129,11 +133,12 @@ function LeadLine({
+   const title = roles.data?.presets.find((p) => p.id === presetId)?.title ?? null;
+   const parts = [
+     title,
+-    `leads ${count} session${count === 1 ? "" : "s"}`,
++    `leads ${count} session${count === 1 ? "" : "s"}, ${open} open`,
+     spend ? `family ${spend.long}` : null,
+   ].filter(Boolean);
+   return (
+-    <p className="truncate text-xs text-muted-foreground" data-testid="ae-hover-lead-line">
++    // Wraps rather than truncates, so the family total at the end stays readable.
++    <p className="text-xs text-muted-foreground" data-testid="ae-hover-lead-line">
+       {parts.join(" · ")}
+     </p>
+   );
+@@ -149,7 +154,7 @@ function AeRoleLine({
+   labels: Record<string, string> | undefined;
+   updatedAt: number;
+ }) {
+-  const { families } = useContext(AeFamilyContext);
++  const { families, tree } = useContext(AeFamilyContext);
+   const mode = useAeSpendDisplay();
+   const role = aeAgentRole({ labels });
+   const familyRole = families.byRow.get(sessionId);
+@@ -163,7 +168,14 @@ function AeRoleLine({
+     { enabled: ids.length > 0 },
+   );
+   if (lead) {
+-    return <LeadLine labels={labels} count={lead.members.length - 1} usage={usage} />;
++    // Grouping > Family also counts archived children, as its "N closed" row does.
++    const treeLead = tree?.leads.get(sessionId);
++    const others = lead.members.filter((m) => m.id !== sessionId);
++    const count = treeLead?.count ?? others.length;
++    const open = treeLead
++      ? (treeLead.closed?.open ?? treeLead.count)
++      : others.filter((m) => !aeIsClosedMember(m)).length;
++    return <LeadLine labels={labels} count={count} open={open} usage={usage} />;
+   }
+   if (!started) return null;
+   const own = usage.get(sessionId);
+diff --git a/web/src/shell/AeFamilyArchive.tsx b/web/src/shell/AeFamilyArchive.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f8f6c4ede6311b81cb3f9ceb897e57553f285927
+--- /dev/null
++++ b/web/src/shell/AeFamilyArchive.tsx
+@@ -0,0 +1,183 @@
++// Archive a family's lead together with its sessions (omnigent-ae, 2026-10-25).
++// In Grouping > Family, archiving a lead row archives every session under it.
++// When one of them is still open (not in the family's closed group), a confirm
++// asks first; Cancel archives nothing. The tree: lib/aeFamilyTree.ts.
++//
++// The sessions to archive come from a fresh read of the session list, not the
++// sidebar's rows: those stop at the loaded pages and a search, and the tree
++// keeps its objects across updates that only change a worktree or a time.
++
++import { type QueryClient, useQueryClient } from "@tanstack/react-query";
++import {
++  type ReactNode,
++  type RefObject,
++  useContext,
++  useLayoutEffect,
++  useRef,
++  useState,
++} from "react";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { showToast } from "@/components/ui/toast";
++import {
++  BulkConversationMutationError,
++  type Conversation,
++  fetchConversationsPage,
++  useBulkArchiveConversations,
++} from "@/hooks/useConversations";
++import { aeFamilies } from "@/lib/aeFamily";
++import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
++import type { AeFamilyTree } from "@/lib/aeFamilyTree";
++import { AeFamilyContext } from "@/lib/aeFamilyView";
++import { useNavigate, useParams } from "@/lib/routing";
++import { showArchiveUndoToast } from "@/shell/archiveUndoToast";
++
++export const AE_FAMILY_ARCHIVE_CONFIRM =
++  "Are you sure you would like to archive this? There are still open sessions.";
++
++const READ_LIMIT = 200;
++const READ_PAGES = 5;
++
++/** The sessions under a lead among *rows*, and how many are open (not in the closed group). */
++export function aeFamilyArchiveTargets(
++  rows: readonly Conversation[],
++  id: string,
++): { children: Conversation[]; open: number } {
++  const members = aeFamilies(rows, true).byRoot.get(id)?.members ?? [];
++  const children = members.filter((c) => c.id !== id && c.archived !== true);
++  return { children, open: children.filter((c) => !aeIsClosedMember(c)).length };
++}
++
++/** The unarchived session list, newest first, up to `READ_PAGES` pages. */
++async function readSessions(queryClient: QueryClient): Promise<Conversation[]> {
++  const rows: Conversation[] = [];
++  let after: string | undefined;
++  for (let page = 0; page < READ_PAGES; page += 1) {
++    // eslint-disable-next-line no-await-in-loop -- each page needs the previous cursor
++    const got = await fetchConversationsPage({
++      searchQuery: "",
++      includeArchived: false,
++      queryClient,
++      limit: READ_LIMIT,
++      after,
++    });
++    rows.push(...got.data);
++    if (!got.has_more || got.last_id === null) break;
++    after = got.last_id ?? undefined;
++  }
++  return rows;
++}
++
++interface Seen {
++  tree: AeFamilyTree | null | undefined;
++  activeId: string | undefined;
++}
++
++/** Keeps the tree and the open session in reach, so the row itself does not re-render on them. */
++function Source({ into }: { into: RefObject<Seen> }) {
++  const { tree } = useContext(AeFamilyContext);
++  const { conversationId } = useParams<{ conversationId: string }>();
++  useLayoutEffect(() => {
++    into.current = { tree, activeId: conversationId };
++  }, [into, tree, conversationId]);
++  return null;
++}
++
++type RequestArchive = (
++  conversations: readonly Conversation[],
++  proceed: (deleteWorktreeIds: ReadonlySet<string>) => void,
++) => void;
++
++/**
++ * A lead row's archive. `archiveFamily` returns false when the row is no lead
++ * with sessions under it, so the caller archives the row alone. The row renders
++ * `source` and `dialog`.
++ */
++export function useAeFamilyArchive(
++  lead: Conversation,
++  requestArchive: RequestArchive,
++): { archiveFamily: () => boolean; source: ReactNode; dialog: ReactNode } {
++  const seen = useRef<Seen>({ tree: null, activeId: undefined });
++  // A second Archive click while the read runs does nothing.
++  const reading = useRef(false);
++  const [pending, setPending] = useState<Conversation[] | null>(null);
++  const bulkArchive = useBulkArchiveConversations();
++  const queryClient = useQueryClient();
++  const navigate = useNavigate();
++
++  const archiveAll = (all: Conversation[]) =>
++    requestArchive(all, (deleteWorktreeIds) => {
++      // The rows leave the list optimistically and this one unmounts; leave
++      // and offer Undo now, as the bulk bar does.
++      const { activeId } = seen.current;
++      if (activeId && all.some((c) => c.id === activeId)) navigate("/", { replace: true });
++      // mutateAsync's promise settles after this row unmounts; a mutate callback would not.
++      bulkArchive
++        .mutateAsync({ ids: all.map((c) => c.id), archived: true, deleteWorktreeIds })
++        .catch((err: unknown) => {
++          const failed =
++            err instanceof BulkConversationMutationError ? err.failed.length : all.length;
++          showToast(
++            `Couldn't archive ${failed} of ${all.length} sessions; those are back in the list`,
++          );
++        });
++      showArchiveUndoToast(queryClient, all, navigate);
++    });
++
++  const archiveFamily = () => {
++    const treeLead = seen.current.tree?.leads.get(lead.id);
++    if (!treeLead || treeLead.standIn) return false;
++    if (reading.current) return true;
++    reading.current = true;
++    readSessions(queryClient)
++      .finally(() => {
++        reading.current = false;
++      })
++      .then(
++        (rows) => {
++          const { children, open } = aeFamilyArchiveTargets(rows, lead.id);
++          const all = [lead, ...children];
++          if (open > 0) setPending(all);
++          else archiveAll(all);
++        },
++        () => showToast("Couldn't read the family's sessions, so nothing was archived. Try again."),
++      );
++    return true;
++  };
++
++  const dialog = (
++    <Dialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>
++      {pending !== null && (
++        <DialogContent data-testid="ae-family-archive-confirm" onClick={(e) => e.stopPropagation()}>
++          <DialogHeader>
++            <DialogTitle>Archive family</DialogTitle>
++            <DialogDescription>{AE_FAMILY_ARCHIVE_CONFIRM}</DialogDescription>
++          </DialogHeader>
++          <DialogFooter className="border-t-0 bg-transparent">
++            <Button type="button" variant="ghost" onClick={() => setPending(null)}>
++              Cancel
++            </Button>
++            <Button
++              type="button"
++              onClick={() => {
++                const all = pending;
++                setPending(null);
++                archiveAll(all);
++              }}
++            >
++              Archive
++            </Button>
++          </DialogFooter>
++        </DialogContent>
++      )}
++    </Dialog>
++  );
++  return { archiveFamily, source: <Source into={seen} />, dialog };
++}
+diff --git a/web/src/shell/AeFamilyTree.tsx b/web/src/shell/AeFamilyTree.tsx
+index ae1dd35d3df29af7f1d06146584876fa45c5d9c9..8683ff9f38b4844d74cf5a2cd78f7b0738fe30c5 100644
+--- a/web/src/shell/AeFamilyTree.tsx
++++ b/web/src/shell/AeFamilyTree.tsx
+@@ -1,7 +1,9 @@
+ // Grouping > Family's tree rows in the sidebar (omnigent-ae, 2026-10-24): the
+-// indent and colored lines before a row's icon, the lead's fold pill, the
++// indent and colored lines before a row's icon, the lead's fold chevron, the
+ // stand-in row for a lead that is not listed, and the section titles. The tree
+-// itself: lib/aeFamilyTree.ts.
++// itself: lib/aeFamilyTree.ts. Since 2026-10-25 a lead row shows only its name
++// and the chevron, so a narrow panel keeps the name readable; the family's cost
++// and open count are on the hover card's lead line (AeSessionHoverStatus.tsx).
+ 
+ import { ArchiveIcon, ChevronDownIcon, ChevronRightIcon, GhostIcon, InfoIcon } from "lucide-react";
+ import {
+@@ -13,12 +15,10 @@ import {
+ } from "react";
+ import { aeAgentRole, aeRoleName } from "@/lib/aeAgentRole";
+ import { useAeSessionUsages } from "@/lib/aeAgentUsage";
+-import { aeSpendLabel, useAeSpendDisplay } from "@/lib/aeSpendDisplay";
+ import { aeRaiseMarks } from "@/lib/aeModelChange";
+-import { AE_FAMILY_COLORS, type AeFamily, aeFamilyHint } from "@/lib/aeFamily";
++import { AE_FAMILY_COLORS, aeFamilyHint } from "@/lib/aeFamily";
+ import {
+   AE_CLOSED_CAPPED_NOTE,
+-  aeClosedPill,
+   aeClosedTitle,
+   revealAeFamilyClosed,
+   toggleAeFamilyClosed,
+@@ -163,7 +163,7 @@ function stop(event: MouseEvent | KeyboardEvent) {
+   event.stopPropagation();
+ }
+ 
+-function FoldPill({ lead }: { lead: AeTreeLead }) {
++function FoldChevron({ lead }: { lead: AeTreeLead }) {
+   if (lead.count === 0) return null;
+   const { root } = lead.family;
+   const toggle = (event: MouseEvent | KeyboardEvent) => {
+@@ -186,7 +186,7 @@ function FoldPill({ lead }: { lead: AeTreeLead }) {
+       data-family={root}
+       className={cn(
+         // The tap target runs the row's full height on a phone.
+-        "relative ml-auto inline-flex h-[18px] shrink-0 items-center gap-0.5 rounded-full pr-1 pl-1.5 text-[11.5px] tabular-nums before:absolute before:-inset-x-2 before:-inset-y-3 before:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
++        "relative ml-auto inline-flex h-[18px] min-w-[18px] shrink-0 items-center justify-center gap-0.5 rounded-full px-0.5 before:absolute before:-inset-x-2 before:-inset-y-3 before:content-[''] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+         lead.folded
+           ? "bg-foreground/10 text-foreground"
+           : "bg-foreground/[0.06] text-muted-foreground",
+@@ -209,7 +209,6 @@ function FoldPill({ lead }: { lead: AeTreeLead }) {
+           className="mr-0.5 size-2.5 animate-spin rounded-full border-[1.5px] border-current border-t-transparent motion-reduce:animate-none"
+         />
+       )}
+-      {lead.closed ? aeClosedPill(lead.closed) : lead.count}
+       {lead.folded ? (
+         <ChevronRightIcon className="size-3" />
+       ) : (
+@@ -219,42 +218,9 @@ function FoldPill({ lead }: { lead: AeTreeLead }) {
+   );
+ }
+ 
+-const PILL_MEMBERS = 25;
+-const PILL_MS = 60_000;
++const USAGE_MS = 60_000;
+ 
+-/**
+- * The family's cost total. It reads usage itself, so a cost change re-renders
+- * this pill and no row; the tree object stays the same.
+- */
+-function TokenPill({ family }: { family: AeFamily }) {
+-  const members = family.members.slice(0, PILL_MEMBERS);
+-  // One read per member, kept a minute; it polls only while one of them works.
+-  const busy = members.some((m) => m.turn_active === true || m.status === "running");
+-  const usage = useAeSessionUsages(
+-    members.map((m) => ({ id: m.id, stamp: 0 })),
+-    { staleMs: PILL_MS, pollMs: PILL_MS, live: busy },
+-  );
+-  const mode = useAeSpendDisplay();
+-  const spend = aeSpendLabel(usage.values(), mode, family.members.length - members.length);
+-  if (!spend) return null;
+-  const more = mode === "cost" && family.members.length > PILL_MEMBERS ? "+" : "";
+-  return (
+-    <span
+-      data-testid="ae-family-tokens"
+-      title={
+-        mode === "cost"
+-          ? `${spend.text}${more} ${spend.unit} across this family`
+-          : `${spend.title} across this family`
+-      }
+-      className="inline-flex h-[18px] shrink-0 items-center rounded-full bg-foreground/[0.06] px-1.5 text-[11.5px] tabular-nums text-muted-foreground"
+-    >
+-      {spend.text}
+-      {more}
+-    </span>
+-  );
+-}
+-
+-/** A listed lead's token and fold pills, or a child's role chip, after its title. */
++/** A listed lead's fold chevron, or a child's role chip, after its title. */
+ export function AeFamilyFold({ conversationId }: { conversationId: string }) {
+   const { tree } = useContext(AeFamilyContext);
+   const inFamilies = useContext(InFamilies);
+@@ -273,17 +239,12 @@ export function AeFamilyFold({ conversationId }: { conversationId: string }) {
+     ) : null;
+   }
+   if (lead.standIn) return null;
+-  return (
+-    <span className="ml-auto flex shrink-0 items-center gap-1">
+-      <TokenPill family={lead.family} />
+-      <FoldPill lead={lead} />
+-    </span>
+-  );
++  return <FoldChevron lead={lead} />;
+ }
+ 
+ /**
+  * A raised helper's second line: where it runs now and where it started, with a cap chip.
+- * It reads usage only for a member with `ae.model_start`, under TokenPill's query key.
++ * It reads usage only for a member with `ae.model_start`, under the hover card's query key.
+  */
+ export function AeFamilyRaiseLine({ conversationId }: { conversationId: string }) {
+   const { tree } = useContext(AeFamilyContext);
+@@ -294,8 +255,8 @@ export function AeFamilyRaiseLine({ conversationId }: { conversationId: string }
+   const usage = useAeSessionUsages([{ id: conversationId, stamp: 0 }], {
+     enabled: tracked,
+     live: tracked,
+-    staleMs: PILL_MS,
+-    pollMs: PILL_MS,
++    staleMs: USAGE_MS,
++    pollMs: USAGE_MS,
+   }).get(conversationId);
+   if (!tracked) return null;
+   // Until usage lands the current point is unknown; show nothing rather than guess.
+@@ -366,10 +327,7 @@ function StandIn({
+             Archived
+           </span>
+         )}
+-        <span className="ml-auto flex shrink-0 items-center gap-1">
+-          <TokenPill family={family} />
+-          <FoldPill lead={lead} />
+-        </span>
++        <FoldChevron lead={lead} />
+       </Link>
+     </li>
+   );
+diff --git a/web/src/shell/Sidebar.aeFamilies.test.tsx b/web/src/shell/Sidebar.aeFamilies.test.tsx
+index b2d0bc6418992453c25c7a0cd191bc02a431c08f..53ddf2d35c4728c3b42759fcda9af70f7655d7c7 100644
+--- a/web/src/shell/Sidebar.aeFamilies.test.tsx
++++ b/web/src/shell/Sidebar.aeFamilies.test.tsx
+@@ -4,8 +4,11 @@
+ //      one colored dot; other rows carry none.
+ //   2. A dot narrows the list to its family without opening the session.
+ //   3. Grouping > Family lists "Families" (each lead with its sessions as a
+-//      tree, foldable from the lead's pill) then "Standalone".
++//      tree, foldable from the lead's chevron) then "Standalone".
+ //   4. Show > Family dots turns the dots off.
++//   5. A lead row shows only its name and chevron; the family's cost and
++//      session count are in its hover card (2026-10-25).
++//   6. Archiving a lead archives its sessions, asking first while one is open.
+ 
+ import type * as IdentityModule from "@/lib/identity";
+ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+@@ -14,7 +17,12 @@ import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
+ 
+ vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
+ 
+-const mocks = vi.hoisted(() => ({ fetch: vi.fn(), archived: vi.fn() }));
++const mocks = vi.hoisted(() => ({
++  fetch: vi.fn(),
++  archived: vi.fn(),
++  archiveOne: vi.fn(),
++  archiveMany: vi.fn(),
++}));
+ 
+ vi.mock("@/hooks/useIsMobileViewport", () => ({ useIsMobileViewport: () => false }));
+ vi.mock("@/lib/serverOrigin", () => ({ isCurrentServerLocal: () => false }));
+@@ -36,6 +44,13 @@ vi.mock("@/hooks/useConversations", async () => {
+     useProjects: () => ({ data: [] }),
+     useMoveToProject: () => ({ mutate: vi.fn() }),
+     useTogglePinnedConversation: () => ({ mutate: vi.fn(), mutateAsync: vi.fn() }),
++    useArchiveConversation: () => ({ mutate: mocks.archiveOne }),
++    useBulkArchiveConversations: () => ({
++      mutate: mocks.archiveMany,
++      mutateAsync: mocks.archiveMany,
++      isPending: false,
++      isError: false,
++    }),
+   };
+ });
+ vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
+@@ -113,6 +128,16 @@ function rowNames(): string[] {
+   );
+ }
+ 
++/** Hovers a lead's row and returns its hover card's lead line, once it reads `text`. */
++async function leadLine(name: string, text: string): Promise<HTMLElement> {
++  const link = rowItem(name).querySelector<HTMLElement>(`a[href="/c/${sid(name)}"]`)!;
++  fireEvent.pointerMove(link, { pointerType: "mouse" });
++  const card = await screen.findByTestId("session-tooltip-content");
++  const line = await within(card).findByTestId("ae-hover-lead-line");
++  await waitFor(() => expect(line.textContent).toContain(text));
++  return line;
++}
++
+ function dotOf(name: string): HTMLElement | null {
+   return within(rowItem(name)).queryByTestId("ae-family-dot");
+ }
+@@ -125,6 +150,8 @@ beforeEach(() => {
+   resetAeFamilyClosedCache();
+   mocks.archived.mockReset();
+   mocks.archived.mockResolvedValue({ data: [] });
++  mocks.archiveOne.mockReset();
++  mocks.archiveMany.mockReset();
+   mocks.fetch.mockReset();
+   mocks.fetch.mockResolvedValue(new Response("{}", { status: 404 }));
+   useConvMock.mockImplementation(() => conversationPage(ROWS));
+@@ -242,7 +269,7 @@ describe("Grouping > Family", () => {
+     expect(depth("Fabric card speed")).toBeUndefined();
+   });
+ 
+-  it("shows the family's cost on the lead and a role chip on a child that has one", async () => {
++  it("shows the family's cost and open count on the lead's hover card and a role chip on a child", async () => {
+     useConvMock.mockImplementation(() =>
+       conversationPage([
+         row("Escalation tool", 60, { "ae.orch": sid("Role routing build"), "ae.role": "builder" }),
+@@ -269,9 +296,27 @@ describe("Grouping > Family", () => {
+     );
+     expect(within(rowItem("Families PR")).queryByTestId("ae-family-role")).toBeNull();
+     // Lead plus its three listed sessions at $1.50 each (cost only, as Claude reports).
+-    expect(
+-      (await within(rowItem("Role routing build")).findByTestId("ae-family-tokens")).textContent,
+-    ).toBe("$6.00");
++    const line = await leadLine("Role routing build", "family $6.00");
++    expect(line.textContent).toBe("leads 3 sessions, 3 open · family $6.00");
++  });
++
++  it("shows only the name and a bare chevron on the lead row, never a cost or count pill", async () => {
++    mocks.fetch.mockImplementation((input: unknown) =>
++      Promise.resolve(
++        String(input).startsWith("/v1/sessions/")
++          ? new Response(JSON.stringify({ usage_by_model: { m: { total_cost_usd: 1 } } }))
++          : new Response("{}", { status: 404 }),
++      ),
++    );
++    setView({ grouping: "family" });
++    renderSidebar();
++    const lead = rowItem("Role routing build");
++    await leadLine("Role routing build", "family $4.00");
++    const chevron = within(lead).getByTestId("ae-family-fold");
++    expect(chevron.textContent).toBe("");
++    expect(chevron.getAttribute("aria-label")).toBe("Hide 3 sessions");
++    const link = lead.querySelector<HTMLElement>(`a[href="/c/${sid("Role routing build")}"]`)!;
++    expect(link.textContent).toBe("Role routing build");
+   });
+ 
+   describe("raise line", () => {
+@@ -362,25 +407,24 @@ describe("Grouping > Family", () => {
+       setView({ grouping: "family" });
+     }
+ 
+-    it("shows tokens on the family pill in tokens mode", async () => {
++    it("shows the family's tokens on the hover card in tokens mode", async () => {
+       window.localStorage.setItem("omnigent:ae-spend-display", "tokens");
+       tokenUsage();
+       renderSidebar();
+-      const pill = await within(rowItem("Role routing build")).findByTestId("ae-family-tokens");
+-      expect(pill.textContent).toBe("400k tok");
+-      expect(pill.getAttribute("title")).toContain("input (incl. cache writes) 360k");
++      await leadLine("Role routing build", "family 400k tokens");
+     });
+ 
+-    it("shows no family pill when off", async () => {
++    it("shows no family total on the hover card when off", async () => {
+       window.localStorage.setItem("omnigent:ae-spend-display", "off");
+       tokenUsage();
+       renderSidebar();
++      const line = await leadLine("Role routing build", "leads 3 sessions, 3 open");
+       await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
+-      expect(within(rowItem("Role routing build")).queryByTestId("ae-family-tokens")).toBeNull();
++      expect(line.textContent).not.toContain("family");
+     });
+   });
+ 
+-  it("falls back to tokens on the family pill when no cost is reported", async () => {
++  it("falls back to tokens on the hover card when no cost is reported", async () => {
+     useConvMock.mockImplementation(() => conversationPage(ROWS));
+     mocks.fetch.mockImplementation((input: unknown) =>
+       Promise.resolve(
+@@ -397,16 +441,14 @@ describe("Grouping > Family", () => {
+     );
+     setView({ grouping: "family" });
+     renderSidebar();
+-    const pill = await within(rowItem("Role routing build")).findByTestId("ae-family-tokens");
+-    expect(pill.textContent).toBe("400k");
+-    expect(pill.getAttribute("title")).toBe("400k tokens across this family");
++    await leadLine("Role routing build", "family 400k tokens");
+   });
+ 
+-  it("folds a family from the lead's pill and remembers it", () => {
++  it("folds a family from the lead's chevron and remembers it", () => {
+     setView({ grouping: "family" });
+     const view = renderSidebar();
+     const pill = within(rowItem("Role routing build")).getByTestId("ae-family-fold");
+-    expect(pill.textContent).toBe("3");
++    expect(pill.getAttribute("title")).toBe("Hide 3 sessions");
+     fireEvent.click(pill);
+     expect(rowNames()).toEqual(["Role routing build", "Fabric card speed", "PASS deck"]);
+     expect(JSON.parse(localStorage.getItem("omnigent:ae-family-folds")!)).toEqual([
+@@ -429,7 +471,7 @@ describe("Grouping > Family", () => {
+         (li) => li.textContent,
+       );
+ 
+-    it("folds a reference child into '1 closed', keeps a review child, and remembers opening it", () => {
++    it("folds a reference child into '1 closed', keeps a review child, and remembers opening it", async () => {
+       withClosed(
+         ref("Old helper", 5),
+         row("Done helper", 6, { "ae.orch": lead, "ae.status": "review" }),
+@@ -437,7 +479,7 @@ describe("Grouping > Family", () => {
+       setView({ grouping: "family" });
+       const view = renderSidebar();
+       const pill = within(rowItem("Role routing build")).getByTestId("ae-family-fold");
+-      expect(pill.textContent).toBe("5 · 4 open");
++      expect(pill.textContent).toBe("");
+       expect(pill.getAttribute("title")).toBe(
+         "5 sessions: 3 working, 1 done waiting for your read, 1 closed",
+       );
+@@ -451,6 +493,7 @@ describe("Grouping > Family", () => {
+       view.rerenderSidebar();
+       expect(closedNames()).toEqual(["Old helper"]);
+       expect(JSON.parse(localStorage.getItem("omnigent:ae-family-closed-open")!)).toEqual([lead]);
++      await leadLine("Role routing build", "leads 5 sessions, 4 open");
+     });
+ 
+     it("counts archived children and lists them with the open group", async () => {
+@@ -509,9 +552,9 @@ describe("Grouping > Family", () => {
+       setView({ grouping: "family" });
+       renderSidebar();
+       expect(screen.queryByTestId("ae-family-closed-fold")).toBeNull();
+-      expect(within(rowItem("Role routing build")).getByTestId("ae-family-fold").textContent).toBe(
+-        "3",
+-      );
++      expect(
++        within(rowItem("Role routing build")).getByTestId("ae-family-fold").getAttribute("title"),
++      ).toBe("Hide 3 sessions");
+     });
+   });
+ 
+@@ -552,7 +595,9 @@ describe("Grouping > Family", () => {
+     setView({ grouping: "family" });
+     renderSidebar();
+     const standIn = screen.getByTestId("ae-family-stand-in");
+-    expect(within(standIn).getByTestId("ae-family-fold").textContent).toBe("3");
++    expect(within(standIn).getByTestId("ae-family-fold").getAttribute("title")).toBe(
++      "Show 3 sessions",
++    );
+     expect(rowNames()).toEqual(["Fabric card speed", "PASS deck"]);
+   });
+ 
+@@ -579,4 +624,93 @@ describe("Grouping > Family", () => {
+       window.matchMedia = matchMedia;
+     }
+   });
++
++  describe("archive cascade", () => {
++    const lead = sid("Role routing build");
++    const mine = (c: Conversation): Conversation => ({ ...c, owner: "viewer@example.com" });
++    const child = (name: string, status: string, parent = lead) =>
++      mine(row(name, 50, { "ae.orch": parent, "ae.status": status }));
++    /** *listed* are the sidebar's rows; the archive reads them plus *unlisted* from the server. */
++    const family = (listed: Conversation[], unlisted: Conversation[] = []) => {
++      const rows = [...listed, mine(row("PASS deck", 20)), mine(row("Role routing build", 10))];
++      useConvMock.mockImplementation(() => conversationPage(rows));
++      mocks.archived.mockImplementation(async ({ visibility }: { visibility?: string }) =>
++        visibility === "archived"
++          ? { data: [] }
++          : { data: [...rows, ...unlisted], has_more: false, last_id: null },
++      );
++      setView({ grouping: "family" });
++    };
++    const archivedIds = () => mocks.archiveMany.mock.calls[0][0].ids;
++
++    function rightClickArchive(name: string) {
++      const link = rowItem(name).querySelector<HTMLElement>(`a[href="/c/${sid(name)}"]`)!;
++      fireEvent.contextMenu(link);
++      fireEvent.click(screen.getByTestId("archive-conversation"));
++    }
++
++    beforeEach(() => mocks.archiveMany.mockResolvedValue([]));
++
++    it("archives every child at once when all are in the closed group, grandchildren too", async () => {
++      family([
++        child("Escalation tool", "reference"),
++        child("Families PR", "reference"),
++        child("Nested helper", "reference", sid("Families PR")),
++      ]);
++      renderSidebar();
++      rightClickArchive("Role routing build");
++      await waitFor(() => expect(mocks.archiveMany).toHaveBeenCalledTimes(1));
++      expect(screen.queryByTestId("ae-family-archive-confirm")).toBeNull();
++      expect(archivedIds()).toEqual([
++        lead,
++        sid("Escalation tool"),
++        sid("Families PR"),
++        sid("Nested helper"),
++      ]);
++      expect(mocks.archiveMany.mock.calls[0][0].archived).toBe(true);
++      expect(mocks.archiveOne).not.toHaveBeenCalled();
++    });
++
++    it("asks first while a child is open, then archives them all", async () => {
++      family([child("Escalation tool", "reference"), child("Families PR", "working")]);
++      renderSidebar();
++      rightClickArchive("Role routing build");
++      const confirm = await screen.findByTestId("ae-family-archive-confirm");
++      expect(confirm.textContent).toContain(
++        "Are you sure you would like to archive this? There are still open sessions.",
++      );
++      expect(mocks.archiveMany).not.toHaveBeenCalled();
++      fireEvent.click(within(confirm).getByRole("button", { name: "Archive" }));
++      expect(mocks.archiveMany).toHaveBeenCalledTimes(1);
++      expect(archivedIds()).toEqual([lead, sid("Escalation tool"), sid("Families PR")]);
++    });
++
++    it("finds an open child the sidebar has not loaded, and asks first", async () => {
++      family([child("Escalation tool", "reference")], [child("Older helper", "working")]);
++      renderSidebar();
++      rightClickArchive("Role routing build");
++      const confirm = await screen.findByTestId("ae-family-archive-confirm");
++      fireEvent.click(within(confirm).getByRole("button", { name: "Archive" }));
++      expect(archivedIds()).toEqual([lead, sid("Escalation tool"), sid("Older helper")]);
++    });
++
++    it("archives nothing when the confirm is cancelled", async () => {
++      family([child("Escalation tool", "working"), child("Families PR", "working")]);
++      renderSidebar();
++      rightClickArchive("Role routing build");
++      const confirm = await screen.findByTestId("ae-family-archive-confirm");
++      fireEvent.click(within(confirm).getByRole("button", { name: "Cancel" }));
++      await waitFor(() => expect(screen.queryByTestId("ae-family-archive-confirm")).toBeNull());
++      expect(mocks.archiveMany).not.toHaveBeenCalled();
++      expect(mocks.archiveOne).not.toHaveBeenCalled();
++    });
++
++    it("archives a session with no family alone", () => {
++      family([child("Escalation tool", "working"), child("Families PR", "working")]);
++      renderSidebar();
++      rightClickArchive("PASS deck");
++      expect(mocks.archiveOne).toHaveBeenCalledTimes(1);
++      expect(mocks.archiveMany).not.toHaveBeenCalled();
++    });
++  });
+ });
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index 7f888accc7399d3136e5550525e37521247683cc..9ec3652366c1ad243f0bb88a4d4c08d6d79f9849 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -180,6 +180,7 @@ import { relativeTime } from "@/lib/relativeTime";
+ import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
+ import { showToast } from "@/components/ui/toast";
+ import { showArchiveUndoToast } from "./archiveUndoToast";
++import { useAeFamilyArchive } from "@/shell/AeFamilyArchive";
+ import { unpinWithUndo } from "./unpinUndoToast";
+ import { useArchiveWorktreePrompt } from "./ArchiveWorktreeDialog";
+ import { PermissionsModal } from "@/components/PermissionsModal";
+@@ -4740,6 +4741,7 @@ function ConversationRowImpl({
+   const del = useStopAndDeleteConversation();
+   const archive = useArchiveConversation();
+   const archiveWorktreePrompt = useArchiveWorktreePrompt();
++  const familyArchive = useAeFamilyArchive(conversation, archiveWorktreePrompt.requestArchive);
+   const leave = useLeaveSession();
+   const moveToProject = useMoveToProject();
+   // The kebab's user-facing "Stop session" action. Archiving does NOT go
+@@ -5020,6 +5022,7 @@ function ConversationRowImpl({
+       runUnarchive();
+       return;
+     }
++    if (familyArchive.archiveFamily()) return;
+     archiveWorktreePrompt.requestArchive([conversation], (deleteWorktreeIds) =>
+       archiveNow(deleteWorktreeIds.has(conversation.id)),
+     );
+@@ -5653,6 +5656,8 @@ function ConversationRowImpl({
+         )}
+       </Dialog>
+       {archiveWorktreePrompt.dialog}
++      {familyArchive.source}
++      {familyArchive.dialog}
+       <Dialog open={leaveOpen} onOpenChange={setLeaveOpen}>
+         {leaveOpen && (
+           <DialogContent

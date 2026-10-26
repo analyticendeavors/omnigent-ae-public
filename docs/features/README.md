@@ -2,6 +2,32 @@
 
 Everything omnigent-ae adds to Omnigent, grouped the way you meet it in a working day. Every screen is the real fork on made-up data (Juniper Outfitters, a fictional outdoor-gear retailer). Each feature names the core patch or package that builds it, so it can be read on its own or proposed upstream.
 
+## Roles presets
+
+A preset decides which model and effort each role in a chat runs on, so the lead plans on a strong model and hands the routine work to cheaper ones.
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="./roles-presets.md"><img src="../media/roles-preset-pill-thumb.webp" alt="Roles presets"></a><br><b><a href="./roles-presets.md">Roles presets</a></b><br>Each role's model and effort per preset, a pill to pick one per chat, families of sessions, and up to three independent reviewers merged into one verdict.</td>
+<td width="50%"></td>
+</tr>
+</table>
+
+- [Roles presets](roles-presets.md): Presets in Settings > Roles, The lead reads its preset every turn, Pick a preset per chat, Start a new chat on a preset, Who works on this, Independent reviewers, one verdict, Rules for model changes and helpers, Model changes you can undo, Families of sessions, A family at a glance, Preset insights
+
+## Triage and policies
+
+Beneath the screens sits a way of working, built from Omnigent policies: a cap on working sessions, a gate for new work that shows up mid-task, and notes that make parked work resumable.
+
+<table>
+<tr>
+<td width="50%" valign="top"><a href="./triage-and-policies.md"><img src="../media/rail-triage-notes-thumb.webp" alt="Triage and policies"></a><br><b><a href="./triage-and-policies.md">Triage and policies</a></b><br>The slot cap, the fork gate and its four answers, saved notes, the rabbit-hole check and the scheduled agents, all as Omnigent policies.</td>
+<td width="50%"></td>
+</tr>
+</table>
+
+- [Triage and policies](triage-and-policies.md): A cap on working sessions, The fork gate, Absorbed and Unfiled notes, The parking lot, Handoffs that open their own chat, Closed chats leave the list, The rabbit-hole check, Hurry modes, Agents that ship with it, Policies you can edit
+
 ## Many sessions
 
 Stock Omnigent lists sessions in a sidebar and opens one at a time. The fork adds a page for the whole morning, a sidebar that says what each session is doing, and up to four sessions side by side.
@@ -17,8 +43,8 @@ Stock Omnigent lists sessions in a sidebar and opens one at a time. The fork add
 </tr>
 </table>
 
-- [Session Dashboard](session-dashboard.md): A Session Dashboard row with the slot count, A header in Flow or Brief, Your move, Answer a gate from the Dashboard, Open PRs, each with the reason it waits, The Parking Lot with Resume
-- [Sidebar](sidebar.md): Every row shows what its session is doing, A hover card that says what is happening now, Status icons and the Status menu, Group and order sessions by status, Drag to reorder, Bulk select in a narrow sidebar
+- [Session Dashboard](session-dashboard.md): A Session Dashboard row with the slot count, A header in Flow or Brief, Your move, Answer a gate from the Dashboard, Open PRs, each with the reason it waits, The Parking Lot with Resume, Reopen a closed session
+- [Sidebar](sidebar.md): Every row shows what its session is doing, A hover card that says what is happening now, Status icons and the Status menu, Group and order sessions by status, Drag to reorder, Bulk select in a narrow sidebar, Create a project from Add to project
 - [Split view](split-view.md): Open in split view, Pane pickers that show session names, Four live sessions at once, Layout presets, Dividers in both directions, Swap panes by the grip, One right-hand pane at a time
 
 ## Inside a session
@@ -51,7 +77,7 @@ Long sessions spend their time on background agents and pull requests. The fork 
 </tr>
 </table>
 
-- [Background agents](background-agents.md): An Agents pane like Claude Desktop's, The model each agent ran on, Running until the lead records its return, Failed helpers, Waiting on agents, Closed helpers stop counting, Who works on this
+- [Background agents](background-agents.md): An Agents pane like Claude Desktop's, The model each agent ran on, Running until the lead records its return, Failed helpers, Waiting on agents, Closed helpers stop counting, Role, model, effort and spend per agent, Spend in tokens or cost
 - [Pull requests](pull-requests.md): One-line receipt, The opened receipt, Hover preview on links, Merged pull requests fold, Update branch, Compliance review, Recommended merge method and Mark session done
 
 ## Accounts and admin
@@ -66,7 +92,7 @@ Running many sessions means watching plan limits and accounts. The fork shows us
 </table>
 
 - [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Pick the account when forking
-- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Every account's limits, Compute and spend, Edit a global policy's parameters
+- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Key Vault, Git repos, Every account's limits, Compute and spend, Presets card, Edit a global policy's parameters
 
 ## On the phone
 
@@ -80,16 +106,3 @@ Omnigent runs in a phone browser. The fork makes the parts you need away from a 
 </table>
 
 - [Phone](phone.md): Session Dashboard on a phone, Status and Move fold in the session menu, Run a code block in the session's shell, Risky commands named before they run, A Paste button in the terminal, Waiting pull requests keep their state, Merge from the action dock, Merged pull requests on one line
-
-## Triage and policies
-
-Under the screens sits a way of working, built from Omnigent policies: a cap on working sessions, a gate for new work that shows up mid-task, and notes that make parked work resumable.
-
-<table>
-<tr>
-<td width="50%" valign="top"><a href="./triage-and-policies.md"><img src="../media/rail-triage-notes-thumb.webp" alt="Triage and policies"></a><br><b><a href="./triage-and-policies.md">Triage and policies</a></b><br>The slot cap, the fork gate and its four answers, saved notes, the rabbit-hole check and the scheduled agents, all as Omnigent policies.</td>
-<td width="50%"></td>
-</tr>
-</table>
-
-- [Triage and policies](triage-and-policies.md): A cap on working sessions, The fork gate, Absorbed and Unfiled notes, The parking lot, The rabbit-hole check, Hurry modes, Agents that ship with it, Policies you can edit

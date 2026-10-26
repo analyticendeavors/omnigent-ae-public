@@ -1,20 +1,28 @@
 // The Admin Center's Secrets section (2026-10-20): each key the server
-// expects, with whether it has it, names only. Every call is mocked: the
-// route is GET /v1/ae/secrets.
+// expects, with whether it has it, names only; 2026-10-23, one row per key with
+// its vault expiry and Edit and Rotate links. Every call is mocked: the route
+// is GET /v1/ae/secrets.
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { SecretsStatus } from "../src/api";
+import type { SecretKey, SecretsStatus } from "../src/api";
 import {
   activateSecrets,
   card,
+  checkText,
   deactivateSecrets,
+  expiryText,
+  fromText,
   keyState,
   metaItems,
   noticeTexts,
+  okLine,
   pillText,
+  problems,
   secretsSection,
+  secretsTile,
   toneOf,
 } from "../src/secrets";
+import { isOpen, resetSectionState } from "../src/sections";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -33,14 +41,28 @@ const OPTIONAL: Array<[string, string]> = [
   ["AE_DATABRICKS_CLIENT_ID", "Databricks section"],
 ];
 
-/** Every key present except those named in *off*. */
-function status(off: string[] = []): SecretsStatus {
-  const rows = (keys: Array<[string, string]>) =>
-    keys.map(([key, use]) => ({ key, use, present: !off.includes(key) }));
+const EDIT = "https://portal.azure.com/#@/asset/Microsoft_Azure_KeyVault/Secret/https://v.example/secrets/";
+
+/** Every key present except those named in *off*; *rows* overrides a key's vault fields. */
+function status(off: string[] = [], rows: Record<string, Partial<SecretKey>> = {}): SecretsStatus {
+  const build = (keys: Array<[string, string]>) =>
+    keys.map(([key, use]) => ({
+      key,
+      use,
+      present: !off.includes(key),
+      vault_name: `kv-${key.toLowerCase()}`,
+      expiry_state: "none" as const,
+      edit_url: `${EDIT}kv-${key.toLowerCase()}`,
+      rotate_url: `${EDIT}kv-${key.toLowerCase()}`,
+      rotate_hint: "Make the new value where it is issued.",
+      ...rows[key],
+    }));
   return {
-    required: rows(REQUIRED),
-    optional: rows(OPTIONAL),
+    required: build(REQUIRED),
+    optional: build(OPTIONAL),
     missing: REQUIRED.map(([key]) => key).filter((key) => off.includes(key)),
+    meta_read_at: "2026-10-20T12:00:00Z",
+    meta_stale: false,
   };
 }
 
@@ -75,10 +97,11 @@ async function mount(context: ExtensionContext): Promise<HTMLElement> {
 const pill = (node: ParentNode) => node.querySelector(".fabric-state")?.textContent;
 const notices = (node: ParentNode) =>
   [...node.querySelectorAll(".notice")].map((item) => item.textContent);
-const chipOf = (node: ParentNode, use: string) =>
-  node.querySelector<HTMLElement>(`.secret-key[data-use="${use}"]`);
+const rowOf = (node: ParentNode, key: string) =>
+  node.querySelector<HTMLElement>(`.secret-row[data-key="${key}"]`);
 
 beforeEach(() => {
+  resetSectionState();
   document.body.replaceChildren();
   const root = document.createElement("div");
   root.id = "root";
@@ -98,18 +121,52 @@ describe("the words", () => {
     expect(toneOf(status())).toBe("on");
     expect(toneOf(status(["AE_GITHUB_TOKEN"]))).toBe("on");
     expect(toneOf(status(["POSTGRES_PASSWORD"]))).toBe("failed");
-    expect(pillText(status())).toBe("All required present");
+    expect(pillText(status())).toBe("All present");
     expect(pillText(status(["POSTGRES_PASSWORD", "OMNIGENT_OIDC_COOKIE_SECRET"]))).toBe(
       "2 required missing",
     );
   });
 
-  it("counts each group", () => {
-    expect(metaItems(status(["OMNIGENT_OIDC_COOKIE_SECRET", "AE_GITHUB_TOKEN"]))).toEqual([
-      "1 of 2 required",
-      "1 of 2 optional",
-      "As of the server's last start",
-    ]);
+  it("counts the keys and says when the vault was read", () => {
+    const items = metaItems(
+      status(["OMNIGENT_OIDC_COOKIE_SECRET"], { AE_GITHUB_TOKEN: { expiry_state: "soon" } }),
+    );
+    expect(items.slice(0, 3)).toEqual(["4 keys", "2 required", "1 expiring"]);
+    expect(items[3]).toMatch(/^vault read /);
+    expect(metaItems({ ...status(), meta_read_at: null })[3]).toBe("vault not read yet");
+  });
+
+  it("turns red for an expired required key but only the tile for an expired optional one", () => {
+    const expired = { expiry_state: "expired" as const, expires: "2026-10-01T00:00:00Z" };
+    const required = status([], { POSTGRES_PASSWORD: expired });
+    expect(toneOf(required)).toBe("failed");
+    expect(pillText(required)).toBe("1 required expired");
+    expect(secretsTile(required, null).health).toBe("problem");
+    const optional = status([], { AE_GITHUB_TOKEN: expired });
+    expect(toneOf(optional)).toBe("on");
+    expect(secretsTile(optional, null)).toMatchObject({ health: "attention", note: "1 expired" });
+    const soon = status([], { AE_GITHUB_TOKEN: { expiry_state: "soon" } });
+    expect(secretsTile(soon, null)).toMatchObject({ health: "attention", note: "1 expiring soon" });
+    expect(secretsTile(status(), null)).toMatchObject({
+      health: "ok",
+      note: "all present, none expiring",
+    });
+  });
+
+  it("words each expiry state", () => {
+    const row = { key: "K", use: "u", present: true, expires: "2028-10-23T00:00:00+00:00" };
+    expect(expiryText({ ...row, expiry_state: "ok", days_left: 730 })).toBe(
+      "expires 2028-10-23, 730 days",
+    );
+    expect(expiryText({ ...row, expiry_state: "soon", days_left: 1 })).toBe(
+      "expires 2028-10-23, 1 day",
+    );
+    expect(expiryText({ ...row, expiry_state: "expired", days_left: -3 })).toBe(
+      "expired 2028-10-23",
+    );
+    expect(expiryText({ ...row, expiry_state: "none" })).toBe("no expiry set");
+    expect(expiryText({ ...row, expiry_state: "unknown" })).toBe("expiry not read");
+    expect(expiryText({ key: "K", use: "u", present: true })).toBe("expiry not read");
   });
 
   it("calls an absent optional key not set, not missing", () => {
@@ -129,19 +186,127 @@ describe("the words", () => {
   });
 });
 
+describe("the notices about dates", () => {
+  it("names an expired key and how to recover", () => {
+    const expired = status([], { AE_GITHUB_TOKEN: { expiry_state: "expired" } });
+    const items = noticeTexts(expired);
+    expect(items).toHaveLength(1);
+    expect(items[0]?.kind).toBe("error");
+    expect(items[0]?.text).toMatch(/^Expired in Key Vault: AE_GITHUB_TOKEN\./);
+  });
+
+  it("says when the box has not reported, or reported too long ago", () => {
+    const never = noticeTexts({ ...status(), meta_read_at: null, meta_stale: true });
+    expect(never[0]?.text).toMatch(/^No expiry dates yet/);
+    const old = noticeTexts({ ...status(), meta_stale: true });
+    expect(old[0]?.text).toMatch(/over 36 hours old/);
+    expect(old[0]?.text).toMatch(/secrets_relay/);
+  });
+});
+
 describe("the section", () => {
-  it("lists every key with its state and use", async () => {
+  it("lists every key, required first, with its state, use and vault name", async () => {
     const { context } = stubContext([ok(status())]);
     const node = await mount(context);
-    expect(pill(node)).toBe("All required present");
+    expect(pill(node)).toBe("All present");
     expect(node.querySelector(".card-fabric")?.classList.contains("fabric-on")).toBe(true);
     const keys = [...node.querySelectorAll(".secret-name")].map((item) => item.textContent);
     expect(keys).toEqual([...REQUIRED, ...OPTIONAL].map(([key]) => key));
-    expect(chipOf(node, "PR cards and Merge")?.querySelector(".secret-use")?.textContent).toBe(
-      "PR cards and Merge",
-    );
+    const github = rowOf(node, "AE_GITHUB_TOKEN");
+    expect(github?.querySelector(".secret-use")?.textContent).toBe("PR cards and Merge");
+    expect(github?.querySelector(".secret-vault")?.textContent).toBe("Key Vault: kv-ae_github_token");
+    expect(github?.querySelector(".secret-state")?.textContent).toBe("Present");
+    expect(
+      [...node.querySelectorAll(".secret-group-title")].map((item) => item.textContent),
+    ).toEqual(["Required", "Optional"]);
     expect(notices(node)).toEqual([]);
     expect(node.querySelector(".secrets-refreshed")?.textContent).toMatch(/^Updated /);
+  });
+
+  it("shows each key's expiry, amber inside 60 days and red once past", async () => {
+    const { context } = stubContext([
+      ok(
+        status([], {
+          POSTGRES_PASSWORD: {
+            expiry_state: "ok",
+            expires: "2028-10-23T00:00:00+00:00",
+            days_left: 730,
+            updated: "2026-10-22T05:02:08+00:00",
+          },
+          AE_GITHUB_TOKEN: {
+            expiry_state: "soon",
+            expires: "2026-11-02T00:00:00+00:00",
+            days_left: 10,
+          },
+          AE_DATABRICKS_CLIENT_ID: {
+            expiry_state: "expired",
+            expires: "2026-10-01T00:00:00+00:00",
+            days_left: -20,
+            enabled: false,
+          },
+        }),
+      ),
+    ]);
+    const node = await mount(context);
+    const db = rowOf(node, "POSTGRES_PASSWORD");
+    expect(db?.querySelector(".secret-expiry")?.textContent).toBe("expires 2028-10-23, 730 days");
+    expect(db?.querySelector(".secret-changed")?.textContent).toBe("changed today");
+    expect(db?.querySelector(".secret-changed")?.getAttribute("title")).toBe(
+      "Changed in Key Vault 2026-10-22",
+    );
+    expect(db?.classList.contains("secret-soon")).toBe(false);
+    const soon = rowOf(node, "AE_GITHUB_TOKEN");
+    expect(soon?.classList.contains("secret-soon")).toBe(true);
+    expect(soon?.querySelector(".expiry-soon")?.textContent).toBe("expires 2026-11-02, 10 days");
+    expect(soon?.querySelector(".secret-hint")?.textContent).toBe(
+      "Make the new value where it is issued.",
+    );
+    const expired = rowOf(node, "AE_DATABRICKS_CLIENT_ID");
+    expect(expired?.classList.contains("secret-expired")).toBe(true);
+    expect(expired?.querySelector(".secret-disabled")?.textContent).toBe("disabled in vault");
+    expect(rowOf(node, "OMNIGENT_OIDC_COOKIE_SECRET")?.querySelector(".secret-expiry")?.textContent).toBe(
+      "no expiry set",
+    );
+    expect(rowOf(node, "OMNIGENT_OIDC_COOKIE_SECRET")?.querySelector(".secret-hint")).toBeNull();
+    expect(notices(node).some((text) => /^Expired in Key Vault: AE_DATABRICKS_CLIENT_ID/.test(text ?? ""))).toBe(true);
+  });
+
+  it("gives each row an Edit and a Rotate link that name the key and open safely", async () => {
+    const { context } = stubContext([ok(status())]);
+    const node = await mount(context);
+    const links = [...(rowOf(node, "POSTGRES_PASSWORD")?.querySelectorAll("a") ?? [])];
+    expect(links.map((link) => link.textContent)).toEqual(["Edit", "Rotate"]);
+    expect(links.map((link) => link.getAttribute("aria-label"))).toEqual([
+      "Edit POSTGRES_PASSWORD in Key Vault",
+      "Rotate POSTGRES_PASSWORD",
+    ]);
+    for (const link of links) {
+      expect(link.getAttribute("target")).toBe("_blank");
+      expect(link.getAttribute("rel")).toBe("noopener noreferrer");
+      expect(link.getAttribute("href")).toMatch(/^https:\/\//);
+    }
+    expect(links[1]?.title).toBe("Make the new value where it is issued.");
+  });
+
+  it("draws no link for a key without a vault name or for an address that is not https", async () => {
+    const { context } = stubContext([
+      ok(
+        status([], {
+          POSTGRES_PASSWORD: { vault_name: null, edit_url: null, rotate_url: null },
+          AE_GITHUB_TOKEN: { edit_url: "javascript:alert(1)", rotate_url: "http://plain.example" },
+        }),
+      ),
+    ]);
+    const node = await mount(context);
+    expect(rowOf(node, "POSTGRES_PASSWORD")?.querySelectorAll("a")).toHaveLength(0);
+    expect(rowOf(node, "POSTGRES_PASSWORD")?.querySelector(".secret-expiry")).toBeNull();
+    expect(rowOf(node, "AE_GITHUB_TOKEN")?.querySelectorAll("a")).toHaveLength(0);
+  });
+
+  it("says when the vault dates are stale", async () => {
+    const { context } = stubContext([ok({ ...status(), meta_stale: true })]);
+    const node = await mount(context);
+    expect(notices(node).join(" ")).toMatch(/over 36 hours old/);
   });
 
   it("marks a missing required key red and an unset optional one grey", async () => {
@@ -151,10 +316,10 @@ describe("the section", () => {
     const node = await mount(context);
     expect(pill(node)).toBe("1 required missing");
     expect(node.querySelector(".card-fabric")?.classList.contains("fabric-failed")).toBe(true);
-    const missing = chipOf(node, "Microsoft sign-in");
+    const missing = rowOf(node, "OMNIGENT_OIDC_COOKIE_SECRET");
     expect(missing?.classList.contains("secret-missing")).toBe(true);
     expect(missing?.querySelector(".secret-state")?.textContent).toBe("Missing");
-    const absent = chipOf(node, "Databricks section");
+    const absent = rowOf(node, "AE_DATABRICKS_CLIENT_ID");
     expect(absent?.classList.contains("secret-absent")).toBe(true);
     expect(absent?.querySelector(".secret-state")?.textContent).toBe("Not set");
     expect(node.querySelector('.notice[role="alert"]')?.textContent).toMatch(
@@ -162,34 +327,18 @@ describe("the section", () => {
     );
   });
 
-  it("draws one chip for a feature that needs two keys", async () => {
+  it("draws one row per key even when a feature needs two", () => {
     const two = status();
     two.required.push({ key: "OMNIGENT_OIDC_CLIENT_ID", use: "Microsoft sign-in", present: true });
-    const { context } = stubContext([ok(two)]);
-    const node = await mount(context);
-    const chips = [...node.querySelectorAll('[aria-label="Required"] .secret-use')];
-    expect(chips.map((item) => item.textContent)).toEqual(["Database", "Microsoft sign-in"]);
-    expect(chipOf(node, "Microsoft sign-in")?.title).toBe(
-      "OMNIGENT_OIDC_COOKIE_SECRET: Present\nOMNIGENT_OIDC_CLIENT_ID: Present",
-    );
-  });
-
-  it("turns a two-key chip red or grey when either key is missing", () => {
-    const rows = (use: string, present: boolean[]) =>
-      present.map((p, i) => ({ key: `K${i}`, use, present: p }));
-    const two = (required: boolean, present: boolean[]) => {
-      const list = rows("Feature", present);
-      return card({
-        required: required ? list : [],
-        optional: required ? [] : list,
-        missing: [],
-      }).querySelectorAll(".secret-key");
-    };
-    expect(two(true, [true, false])).toHaveLength(1);
-    expect(two(true, [true, false])[0]?.classList.contains("secret-missing")).toBe(true);
-    expect((two(true, [true, false])[0] as HTMLElement).title).toBe("K0: Present\nK1: Missing");
-    expect(two(false, [false, true])[0]?.classList.contains("secret-absent")).toBe(true);
-    expect(two(true, [true, true])[0]?.className).toBe("secret-key");
+    two.required.push({ key: "OMNIGENT_OIDC_CLIENT_SECRET", use: "Microsoft sign-in", present: false });
+    const rows = card(two).querySelectorAll('[aria-label="Required"] .secret-row');
+    expect([...rows].map((row) => row.getAttribute("data-key"))).toEqual([
+      "POSTGRES_PASSWORD",
+      "OMNIGENT_OIDC_COOKIE_SECRET",
+      "OMNIGENT_OIDC_CLIENT_ID",
+      "OMNIGENT_OIDC_CLIENT_SECRET",
+    ]);
+    expect(keyState(two.required[3] as SecretKey, true)).toBe("Missing");
   });
 
   it("reads again on focus, with no timer of its own", async () => {
@@ -221,7 +370,7 @@ describe("the section", () => {
     const node = await mount(context);
     window.dispatchEvent(new Event("focus"));
     await flush();
-    expect(pill(node)).toBe("All required present");
+    expect(pill(node)).toBe("All present");
     expect(notices(node).at(-1)).toMatch(/^The secrets could not be read/);
   });
 
@@ -239,5 +388,160 @@ describe("the section", () => {
     window.dispatchEvent(new Event("focus"));
     await flush();
     expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── 2026-10-23: collapsed by default, chips, the host key, last worked ──────
+
+const groupsOf = (node: ParentNode) => node.querySelector<HTMLElement>(".secret-groups");
+const toggleOf = (node: ParentNode) => node.querySelector<HTMLButtonElement>(".secret-toggle");
+const chipsOf = (node: ParentNode) =>
+  [...node.querySelectorAll<HTMLElement>(".secret-chip")].map((chip) => chip.dataset.key);
+
+describe("collapsed and open", () => {
+  it("starts collapsed with one green line when nothing needs Reid", () => {
+    const node = card(status());
+    expect(groupsOf(node)?.hidden).toBe(true);
+    expect(toggleOf(node)?.getAttribute("aria-expanded")).toBe("false");
+    expect(toggleOf(node)?.textContent).toBe("Show 4 keys");
+    expect(node.querySelector(".secret-okline")?.textContent).toBe(
+      "Nothing needs you. Next expiry: none set.",
+    );
+    expect(chipsOf(node)).toEqual([]);
+    expect(node.querySelector(".fabric-name")?.textContent).toBe("Secrets on this box");
+  });
+
+  it("opens and closes the rows and remembers it", () => {
+    const node = card(status());
+    toggleOf(node)?.click();
+    expect(groupsOf(node)?.hidden).toBe(false);
+    expect(toggleOf(node)?.textContent).toBe("Hide keys");
+    expect(isOpen("secrets-keys", false)).toBe(true);
+    expect(groupsOf(card(status()))?.hidden).toBe(false);
+    toggleOf(node)?.click();
+    expect(groupsOf(node)?.hidden).toBe(true);
+    expect(isOpen("secrets-keys", true)).toBe(false);
+  });
+
+  it("chips only the keys that need Reid, worst first, and links each to Rotate", () => {
+    const answer = status(["POSTGRES_PASSWORD", "AE_DATABRICKS_CLIENT_ID"], {
+      AE_GITHUB_TOKEN: { expiry_state: "soon", days_left: 21 },
+    });
+    const node = card(answer);
+    // An unset optional key is not a problem; a missing required one is.
+    expect(chipsOf(node)).toEqual(["POSTGRES_PASSWORD", "AE_GITHUB_TOKEN"]);
+    const soon = node.querySelector<HTMLAnchorElement>('.secret-chip[data-key="AE_GITHUB_TOKEN"]');
+    expect(soon?.tagName).toBe("A");
+    expect(soon?.textContent).toBe("PR cards and Mergeexpires in 21d");
+    expect(soon?.getAttribute("rel")).toBe("noopener noreferrer");
+    const missing = node.querySelector('.secret-chip[data-key="POSTGRES_PASSWORD"]');
+    expect(missing?.tagName).toBe("SPAN");
+    expect(missing?.classList.contains("chip-err")).toBe(true);
+    expect(node.querySelector(".secret-okline")).toBeNull();
+  });
+
+  it("names the nearest expiry when nothing needs Reid", () => {
+    const answer = status([], {
+      AE_GITHUB_TOKEN: { expiry_state: "ok", expires: "2027-05-15T00:00:00Z", days_left: 203 },
+    });
+    expect(okLine(answer)).toBe("Nothing needs you. Next expiry: PR cards and Merge, 2027-05-15.");
+  });
+});
+
+describe("the host key and last worked", () => {
+  const host = (present: boolean): SecretKey => ({
+    key: "CLAUDE_CODE_OAUTH_TOKEN",
+    use: "Claude on the host",
+    present,
+    where: "host",
+    vault_name: "claude-code-oauth-token",
+    expiry_state: "none",
+  });
+
+  it("tags the host row and turns red when the host lacks its key", () => {
+    const answer = status();
+    answer.required.push(host(false));
+    answer.host_missing = ["CLAUDE_CODE_OAUTH_TOKEN"];
+    expect(toneOf(answer)).toBe("failed");
+    expect(pillText(answer)).toBe("1 required missing");
+    expect(secretsTile(answer, null).health).toBe("problem");
+    const node = card(answer);
+    expect(rowOf(node, "CLAUDE_CODE_OAUTH_TOKEN")?.querySelector(".secret-tag")?.textContent).toBe(
+      "host",
+    );
+    expect(noticeTexts(answer)[0]?.text).toMatch(/^The host's env file has no CLAUDE_CODE_OAUTH_TOKEN/);
+  });
+
+  it("says when a key last worked or was refused, red for a required key", () => {
+    const at = "2026-10-20T14:07:00Z";
+    expect(checkText({ ...host(true), check: "ok", checked_at: at })).toMatch(/^worked /);
+    expect(
+      checkText({ ...host(true), check: "failed", checked_at: at, check_detail: "401" }),
+    ).toMatch(/^failed: 401 at /);
+    const answer = status([], {
+      POSTGRES_PASSWORD: { check: "failed", checked_at: at, check_detail: "401" },
+      AE_GITHUB_TOKEN: { check: "ok", checked_at: at },
+    });
+    answer.failing = ["POSTGRES_PASSWORD"];
+    expect(toneOf(answer)).toBe("failed");
+    expect(pillText(answer)).toBe("1 required refused");
+    expect(problems(answer).map((p) => p.text)).toEqual(["refused (401)"]);
+    const node = card(answer);
+    expect(rowOf(node, "POSTGRES_PASSWORD")?.querySelector(".check-failed")?.textContent).toMatch(
+      /^failed: 401 at /,
+    );
+    expect(rowOf(node, "AE_GITHUB_TOKEN")?.querySelector(".check-ok")?.getAttribute("title")).toBe(
+      "Since the server started; it resets on a restart.",
+    );
+  });
+
+  it("goes amber, not red, for a refused optional key", () => {
+    const answer = status([], {
+      AE_GITHUB_TOKEN: { check: "failed", checked_at: "2026-10-20T14:07:00Z", check_detail: "401" },
+    });
+    expect(toneOf(answer)).toBe("warn");
+    expect(card(answer).classList.contains("secrets-warn")).toBe(true);
+    expect(secretsTile(answer, null).health).toBe("attention");
+  });
+
+  it("marks a date from Entra or GitHub and an old change", () => {
+    const node = card(
+      status([], {
+        AE_GITHUB_TOKEN: {
+          expiry_state: "soon",
+          expires: "2026-11-02T00:00:00Z",
+          days_left: 12,
+          expiry_from: "github",
+          updated: "2026-01-01T00:00:00Z",
+        },
+      }),
+    );
+    const row = rowOf(node, "AE_GITHUB_TOKEN");
+    expect(row?.querySelector(".secret-from")?.textContent).toBe(" from GitHub");
+    expect(row?.querySelector(".secret-changed")?.classList.contains("secret-old")).toBe(true);
+  });
+
+  it("draws an older server's answer, without the new fields", () => {
+    const old = status();
+    delete old.meta_stale;
+    const node = card(old);
+    expect(node.querySelector(".secret-check")).toBeNull();
+    expect(node.querySelector(".secret-tag")).toBeNull();
+    expect(toneOf(old)).toBe("on");
+    expect(pill(node)).toBe("All present");
+  });
+});
+
+describe("issuer dates", () => {
+  it("says latest of N and when a carried Entra reading was made", () => {
+    const row = { expiry_state: "ok" as const, expiry_from: "entra" as const };
+    expect(fromText(row)).toBe("from Entra");
+    expect(fromText({ ...row, source_count: 2 })).toBe("from Entra, latest of 2");
+    expect(fromText({ ...row, source_from: "2026-10-21T06:15:00Z" })).toMatch(
+      /^from Entra, read Oct 2[01]$/,
+    );
+    expect(fromText({ ...row, expiry_from: "github" })).toBe("from GitHub");
+    expect(fromText({ ...row, expiry_from: "vault" })).toBeNull();
+    expect(fromText({ ...row, expiry_state: "none" })).toBeNull();
   });
 });

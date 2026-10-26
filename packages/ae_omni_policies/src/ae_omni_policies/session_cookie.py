@@ -48,6 +48,8 @@ from starlette.requests import HTTPConnection
 from starlette.responses import Response
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ae_omni_policies import key_health
+
 _logger = logging.getLogger(__name__)
 
 COOKIE_SECRET_ENV = "OMNIGENT_OIDC_COOKIE_SECRET"
@@ -56,6 +58,7 @@ DOMAIN_ENV = "OMNIGENT_DOMAIN"
 # Upstream's names (OIDCConfig.session_cookie_name): __Host- on HTTPS only.
 SECURE_COOKIE_NAME = "__Host-ap_session"
 PLAIN_COOKIE_NAME = "ap_session"
+CALLBACK_SUFFIX = "/auth/callback"
 
 
 def is_page_load(headers: Headers) -> bool:
@@ -130,6 +133,13 @@ class SessionCookieExpiry:
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if (
+            scope["type"] == "http"
+            and scope["method"] == "GET"
+            and scope["path"].endswith(CALLBACK_SUFFIX)
+        ):
+            await self.app(scope, receive, self._watch_callback(send))
+            return
+        if (
             scope["type"] != "http"
             or scope["method"] != "GET"
             or is_auth_path(scope["path"])
@@ -154,6 +164,30 @@ class SessionCookieExpiry:
             await send(message)
 
         await self.app(scope, receive, send_with_cookie)
+
+    def _watch_callback(self, send: Send) -> Send:
+        """Tell the Admin Center's secrets list when a sign-in's token exchange worked.
+
+        Added 2026-10-23 (``key_health.py``): a redirect that sets the session cookie
+        means the IdP took the OIDC client secret and the cookie secret signed the
+        session. Only success is recorded. Upstream answers ``400 {"error": "Token
+        exchange failed"}`` alike for a refused secret, an expired code and an IdP
+        5xx, so a failure here cannot say the secret is wrong (Codex review,
+        2026-10-23); the row then keeps its last "worked" time.
+        """
+        prefix = f"{self.name}=".encode("latin-1")
+
+        async def watched(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                status = message["status"]
+                cookies = Headers(raw=list(message.get("headers", []))).getlist("set-cookie")
+                if 300 <= status < 400 and any(
+                    value.encode("latin-1").startswith(prefix) for value in cookies
+                ):
+                    key_health.record("oidc", True)
+            await send(message)
+
+        return watched
 
 
 def secure_cookies(environ: Mapping[str, str]) -> bool:
