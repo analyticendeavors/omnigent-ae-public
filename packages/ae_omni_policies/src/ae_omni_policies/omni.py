@@ -50,12 +50,11 @@ from pathlib import Path
 
 import httpx
 
-from ae_omni_policies import __version__
+from ae_omni_policies import USER_AGENT
 
 SERVER_URL_ENV = "OMNIGENT_SERVER_URL"
 TOKEN_ENV = "OMNIGENT_TOKEN"
 REQUEST_TIMEOUT_S = 30.0
-USER_AGENT = f"omnigent-ae/{__version__} (+https://github.com/analyticendeavors/omnigent-ae)"
 CONFIG_SERVER_KEY = "server"
 FIX_HINT = f"Set {SERVER_URL_ENV} to the server's URL, or run `omnigent login <url>` as this user."
 NOT_CONFIGURED = f"No OmniGent server to talk to. {FIX_HINT}"

@@ -110,8 +110,8 @@ over streamable HTTP at `http://box.example:8000/mcp` (the tailnet name, because
 Graphiti binds the box's Tailscale IP and not loopback), with an allowlist of its four
 read tools; `add_memory`, the two deletes and `clear_graph` never reach an agent, nor
 does the personal graph on `:8001` (`packages/ae_omni_policies/tests/test_agents.py` holds both). Each prompt
-allows one memory call and carries on when it is unavailable. `docs/DAILY-USE.md` is
-the page for everything after the deploy: adding a laptop or WSL host (`omnigent login`,
+allows one memory call and carries on when it is unavailable. A daily-use page (it
+was `docs/DAILY-USE.md`, which is no longer in the tree) was written for everything after the deploy: adding a laptop or WSL host (`omnigent login`,
 `omnigent host`, `host enable`; Windows needs WSL), `omnigent import --harness claude
 --last 25` and where the sessions land, the phone (Tailscale, Safari, Add to Home
 Screen, the Dashboard, PR cards, the Run and Paste buttons, Remote Control from the

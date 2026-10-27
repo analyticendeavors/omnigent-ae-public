@@ -8,7 +8,7 @@ Stock Omnigent has policies: small functions that see each prompt and tool call 
 
 <p align="center"><img src="../media/dashboard-overview.jpg" alt="A cap on working sessions"></p>
 
-Every session carries a status (working, blocked, review, parked or reference) as its `ae.status` label. The first prompt in a session claims a working slot. Once the limit is reached (three by default, set with `AE_SLOT_LIMIT` in the server's environment, or with the slot cap's `limit` on Settings > Global Policies, which replaces it), the next prompt is held with a warning or blocked, and the reply names the sessions holding the slots; typing `ride unparked` runs one more anyway. A blocked or failed session holds no slot. A family of sessions holds one slot through its lead; the slot cap's `helpers_count` parameter (off by default) makes each working helper hold a slot of its own as well. Without it, a helper holds no slot, even when its lead is parked, archived or gone. Every slot count in the UI follows the same number.
+Every session carries a status (working, blocked, review, parked or reference) as its `ae.status` label. The first prompt in a session claims a working slot. Once the limit is reached (three by default, set with `AE_SLOT_LIMIT` in the server's environment, or with the slot cap's `limit` on Settings > Global Policies; with several enabled caps the lowest limit wins), the next prompt is held with a warning or blocked, and the reply names the sessions holding the slots; typing `ride unparked` runs one more anyway. A blocked or failed session holds no slot. A family of sessions holds one slot through its lead; the slot cap's `helpers_count` parameter (off by default) makes each working helper hold a slot of its own as well. Without it, a helper holds no slot, even when its lead is parked, archived or gone. Every slot count in the UI follows the same number.
 
 **Where:** The slots strip on the Session Dashboard, and Status on any session's menu.<br>
 **Built from:** core patches [`0001`](../../patches/0001-ae-patch-Show-the-ae.status-label-on-session-rows-an.patch), [`0004`](../../patches/0004-ae-patch-Add-a-Status-submenu-to-the-sidebar-session.patch), [`0035`](../../patches/0035-ae-patch-Count-only-unblocked-unfailed-working-sessi.patch), [`0190`](../../patches/0190-ae-patch-Count-working-helper-sessions-toward-the-sl.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
@@ -42,10 +42,10 @@ Parked work becomes a task with a note a fresh session can resume from: the thre
 
 ## Handoffs that open their own chat
 
-A lead can hand work off by starting a new chat itself: `create_session` with `standalone: true`, the handoff note as the brief and the preset the note names. The new chat holds its own slot, joins no family, and you get its link. When every slot is taken, the lead gives you the note to paste instead.
+A lead can hand work off by starting a new chat itself: `create_session` with `standalone: true`, the handoff note as the brief and the preset the note names. The new chat holds its own slot, joins no family, and you get its link, which opens the new chat inside Omnigent rather than a browser tab, as any chat link to another session (`/c/<id>`) does. When every slot is taken, the lead gives you the note to paste instead.
 
 **Where:** Ask the lead for a handoff; the new chat appears in the sidebar.<br>
-**Built from:** [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+**Built from:** core patch [`0194`](../../patches/0194-ae-patch-Switch-to-another-session-inside-the-app-wh.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
 ## Closed chats leave the list
 

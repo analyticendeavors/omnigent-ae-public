@@ -652,6 +652,46 @@ default login, as every session did before; the box runs none. During a deploy t
 new relay may post the new fields to the old server once, which answers 422 until the
 server restarts; the next tick succeeds.
 
+### A new chat before its first reply (patch 0202, 2026-10-26)
+
+Gap closed. On 2026-10-26 a new chat on AE Backup showed AE Default's numbers (98%
+weekly, and the "AE Default is at 98%" banner) until the relay's next 5-minute tick
+posted the chat's first status line: `session_view` returned the host reading for any
+session not in `snapshot.sessions`. Verified live that day: session b56f56a9 answered
+account None / AE Default at 19:44, then `shared:AE Backup` after the 19:45 tick.
+
+- The runner writes `claude_account` in the bridge directory at launch (to a temp file,
+  then renamed, so it never races the shim's own write), from the same environment the
+  terminal gets: empty for the default login, the account name otherwise. The relay's
+  live scan therefore lists an unrendered session with its real account.
+- `GET /v1/ae/limits?session_id=` also takes `account=` (empty for the default login). A
+  session's account is found in this order: its entry in `snapshot.sessions` (the relay
+  has seen it); the server label `omnigent.claude_native.account` a fork carries, which
+  is trusted as it is (it was checked at fork time, so it needs no entry in the host's
+  login list and has no age limit); the `account=` hint, which the Usage panels fill
+  from the login picked for new chats (the host's `claude-oauth-active` row) and freeze
+  at the first value seen for each session. The hint is the picker's value today, not
+  the session's, so the server uses it only for a session created in the last 10
+  minutes (`LIMITS_HINT_WINDOW_S`, two relay ticks; after that the relay lists every
+  live session with its launch-time account). An older session without a relay entry,
+  for example one whose terminal exited, gets the plain host answer. A hint for an
+  account the host does not list as signed in is ignored too, and so is any hint or
+  label for a session the caller cannot open.
+- The session is answered from its own account's newest stored reading
+  (`LimitStore._accounts`, the same readings `/limits/accounts` serves), never the host
+  reading of another account. A backup account drops the plan and credits and keeps
+  the backup hint. A backup session with no windows of its own now shows the account's
+  newest reading, taken from another session on it, at that reading's time, with a note
+  that says so (Reid's call, 2026-10-26: a stale number from the right account beats
+  none). An account with no reading at all gets empty windows and "No reading yet for
+  <label>; it shows after this session's first reply."
+- `account=` without `session_id` does nothing; no web caller needs it.
+
+The panels wait for the host's logins to answer (not stale cached ones, while a refetch
+is in flight) before their first request, so neither the default login's numbers nor the
+previous pick shows first. A session launched before 0202 has no file
+until its first render, as before.
+
 ## Accounts summary (2026-10-21)
 
 Reid runs several Claude logins (the default, personal ones, shared ones) and one

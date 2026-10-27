@@ -1,9 +1,9 @@
 // The Admin Center's Databricks section (2026-10-19): one row per SQL
 // warehouse, with Start and Stop, and a spend strip that weighs what the
-// workspace has used against its $200 credit.
+// workspace has used against its credit, when one is set.
 //
-// Why: Reid's Databricks workspace (AWS, serverless only) runs on a $200
-// credit, and a SQL warehouse bills for every minute it is up. He wanted to see
+// Why: Reid's Databricks workspace (AWS, serverless only) runs on a
+// prepaid credit, and a SQL warehouse bills for every minute it is up. He wanted to see
 // both on the page that already wakes the Fabric capacity, from the iPhone as
 // much as the laptop, rather than signing in to the account console. The
 // server reads the workspace with a service principal (`GET /v1/ae/databricks`,
@@ -18,7 +18,7 @@
 // URL it refuses, and then the URL shows as text to copy, as in fabric.ts.
 //
 // The spend strip shows two bars, this month's spend and the spend since the
-// credit started, each "$x of $200". Reid believes the credit resets monthly,
+// credit started, each "$x of $credit". Reid believes the credit resets monthly,
 // while the account console shows one credit for a year, so both are shown and
 // the server's cadence only picks which leads. Billing data lags hours, so the
 // strip says "as of" the newest usage row. Reading spend needs a running
@@ -91,7 +91,7 @@ export function stateText(state: string): string {
 
 // ── words and numbers ───────────────────────────────────────────────────────
 
-/** Dollars: `$200` when whole, else to the cent (`$12.40`). */
+/** Dollars: `$500` when whole, else to the cent (`$12.40`). */
 export function dollars(usd: number): string {
   const cents = Math.round(usd * 100);
   return cents % 100 === 0 ? `$${cents / 100}` : `$${(cents / 100).toFixed(2)}`;
@@ -102,7 +102,7 @@ function clockTime(ms: number): string {
   return new Date(ms).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
 }
 
-/** A credit date (`2026-08-19`) as `Aug 19, 2026`, read as a calendar day. */
+/** A credit date (`2030-01-01`) as `Jan 1, 2030`, read as a calendar day. */
 export function dayText(day: string): string {
   const ms = Date.parse(`${day}T00:00:00Z`);
   if (Number.isNaN(ms)) return day;
@@ -181,12 +181,23 @@ export interface SpendBar {
   head: boolean;
 }
 
+/** True when the server has a credit set; without one nothing is drawn against it. */
+export function hasCredit(spend: DatabricksSpend): spend is DatabricksSpend & {
+  creditUsd: number;
+  creditStart: string;
+  creditEnd: string;
+} {
+  return spend.creditUsd != null && spend.creditStart != null && spend.creditEnd != null;
+}
+
 /**
  * The two bars, the headline first: this month's when the credit is monthly,
  * the whole credit's when it is granted once.
  */
 export function spendBars(spend: DatabricksSpend): SpendBar[] {
   const month: SpendBar = { key: "month", label: "This month", usd: spend.monthUsd, head: false };
+  // No credit set on the server: this month's spend is all there is to show.
+  if (!hasCredit(spend)) return [{ ...month, head: true }];
   const total: SpendBar = {
     key: "total",
     label: `Credit since ${dayText(spend.creditStart)}`,
@@ -198,7 +209,7 @@ export function spendBars(spend: DatabricksSpend): SpendBar[] {
   return bars;
 }
 
-/** "$12.40 of $200", or "not read yet of $200" before any reading. */
+/** "$12.40 of $500", or "not read yet of $500" before any reading. */
 export function barText(usd: number | null, credit: number): string {
   return `${usd == null ? "not read yet" : dollars(usd)} of ${dollars(credit)}`;
 }
@@ -346,7 +357,7 @@ export function creditHealth(spend: DatabricksSpend | null, now = Date.now()): H
   if (!spend) return "idle";
   if (spend.status === "error" || spend.status === "no_access") return "attention";
   const used = headlineUsd(spend);
-  if (used == null || spend.creditUsd <= 0) return "idle";
+  if (!hasCredit(spend) || used == null || spend.creditUsd <= 0) return "idle";
   if (used >= spend.creditUsd) return "problem";
   // Amber also when the numbers are two days old, however much credit is left.
   return used >= spend.creditUsd * 0.75 || readingIsStale(spend, now) ? "attention" : "ok";
@@ -370,9 +381,11 @@ export function databricksTile(data: DatabricksOverview | null, error: unknown):
   const spend = data.spend;
   const used = spend ? headlineUsd(spend) : null;
   const age = spend ? asOfAge(spend) : null;
+  const spent = (usd: number | null) => (usd == null ? "spend not read" : dollars(usd));
   const note = spend
-    ? `${used == null ? "spend not read" : dollars(used)} of ${dollars(spend.creditUsd)} used` +
-      (age ? ` · ${age}` : "")
+    ? (hasCredit(spend)
+        ? `${spent(used)} of ${dollars(spend.creditUsd)} used`
+        : `${spent(used)} this month`) + (age ? ` · ${age}` : "")
     : "";
   const credit = creditHealth(spend);
   // A listing that failed (auth, timeout) comes back as a 200 with no
@@ -404,13 +417,13 @@ export function databricksTile(data: DatabricksOverview | null, error: unknown):
   };
 }
 
-/** The credit card's folded line and health ("$200 left"), as a tile the strip does not show. */
+/** The credit card's folded line and health ("$100 left"), as a tile the strip does not show. */
 export function creditTile(data: DatabricksOverview | null): Tile {
   const spend = data?.spend ?? null;
   const used = spend ? headlineUsd(spend) : null;
   return {
     id: "credit",
-    value: spend && used != null ? `${dollars(Math.max(0, spend.creditUsd - used))} left` : "",
+    value: spend && hasCredit(spend) && used != null ? `${dollars(Math.max(0, spend.creditUsd - used))} left` : "",
     note: "",
     health: creditHealth(spend),
   };
@@ -757,10 +770,16 @@ function refreshButton(section: Section, spend: DatabricksSpend): HTMLButtonElem
   return keyed(node, "dbx:refresh");
 }
 
+/** This month's spend as plain text, for a server with no credit set. */
+function monthLine(spend: DatabricksSpend): HTMLElement {
+  const usd = spend.monthUsd;
+  return el("p", { class: "dbx-asof" }, `This month: ${usd == null ? "not read yet" : dollars(usd)}`);
+}
+
 /** The ring of the credit left by the headline bar, or null before any reading. */
 function creditRing(spend: DatabricksSpend): HTMLElement | null {
   const used = headlineUsd(spend);
-  if (used == null || spend.creditUsd <= 0) return null;
+  if (!hasCredit(spend) || used == null || spend.creditUsd <= 0) return null;
   const left = Math.max(0, spend.creditUsd - used);
   const health = creditHealth(spend);
   const tone = health === "problem" ? "ring-err" : health === "attention" ? "ring-warn" : "ring-ok";
@@ -840,7 +859,9 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
           el(
             "div",
             { class: "dbx-bars" },
-            ...spendBars(spend).map((bar) => barNode(bar, spend.creditUsd)),
+            ...(hasCredit(spend)
+              ? spendBars(spend).map((bar) => barNode(bar, spend.creditUsd))
+              : [monthLine(spend)]),
             asOf ? el("p", { class: asOfClass }, asOf) : null,
           ),
         )
@@ -856,9 +877,11 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
     else node.appendChild(notice(status, spend.status === "error" ? "error" : "info"));
   }
   if (state.spendFailed) node.appendChild(notice(state.spendFailed, "error"));
-  const start = dayText(spend.creditStart);
-  const end = dayText(spend.creditEnd);
-  node.title = `The ${dollars(spend.creditUsd)} credit runs ${start} to ${end}.`;
+  if (hasCredit(spend)) {
+    const start = dayText(spend.creditStart);
+    const end = dayText(spend.creditEnd);
+    node.title = `The ${dollars(spend.creditUsd)} credit runs ${start} to ${end}.`;
+  }
   return node;
 }
 

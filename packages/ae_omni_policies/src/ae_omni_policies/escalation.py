@@ -5,7 +5,7 @@ module only says what the rules allow.
 
 A move is a **raise** when the model family gets bigger (haiku < sonnet < opus <
 fable) or the family stays and the effort goes up (low < medium < high < xhigh <
-max). A bigger family with a lower effort is still a raise. A **lower** move is the
+max < ultra). A bigger family with a lower effort is still a raise. A **lower** move is the
 reverse. **Same** means nothing changes. Two ids that cannot be ranked against each
 other (an unknown family, or a new version of one family) and an equal effort count
 as a raise: the safe reading is the one that asks.
@@ -18,7 +18,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
+EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "ultra")
 FAMILIES: tuple[str, ...] = ("haiku", "sonnet", "opus", "fable")
 # A session on its agent's default effort ranks as medium, for comparison only.
 DEFAULT_EFFORT = "medium"

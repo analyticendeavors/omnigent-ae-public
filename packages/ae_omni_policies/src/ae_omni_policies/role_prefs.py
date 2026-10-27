@@ -68,6 +68,7 @@ from pydantic import (
     StrictBool,
     StrictInt,
     ValidationError,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -91,6 +92,9 @@ LEAD_PICKS = "lead-picks"
 
 ROLES: tuple[str, ...] = ("lead", "planner", "reviewer", "builder", "helper")
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+# An agent reviewer slot also takes "ultra", which some Codex models offer above max.
+# Claude rows and fixed slots stay on Effort.
+AgentEffort = Literal["low", "medium", "high", "xhigh", "max", "ultra"]
 Color = Literal["green", "teal", "blue", "violet", "amber", "red", "pink", "slate"]
 
 # Catalog ids as the claude-native harness reports them (checked 2026-10-23
@@ -159,7 +163,7 @@ class AgentReviewer(_Strict):
     agent_name: str | None = Field(default=None, pattern=_AGENT_NAME)
     # None: the agent's default model or effort.
     model: str | None = Field(default=None, pattern=_MODEL_ID)
-    effort: Effort | None = None
+    effort: AgentEffort | None = None
 
     @model_validator(mode="after")
     def _named(self) -> AgentReviewer:
@@ -169,6 +173,20 @@ class AgentReviewer(_Strict):
 
 
 ReviewerSlot = Annotated[AutoRole | FixedRole | AgentReviewer, Field(discriminator="mode")]
+
+# Planner, builder and helper take the same picker as a reviewer minus other agents (Reid,
+# 2026-10-26): Auto, a Claude model, the session's, or a Codex child session. Other agents run
+# outside the family (no slot cap, no ae.role), so a non-Codex agent slot is refused here.
+WorkerSetting = Annotated[
+    AutoRole | SessionRole | FixedRole | AgentReviewer, Field(discriminator="mode")
+]
+
+
+def is_codex_agent(slot: object) -> bool:
+    """True when *slot* is an agent slot run by the built-in Codex agent."""
+    return isinstance(slot, AgentReviewer) and (
+        slot.agent_name == CODEX_AGENT_NAME or slot.agent == CODEX_AGENT_ID
+    )
 
 
 class MultiReviewer(_Strict):
@@ -193,17 +211,27 @@ class Roles(_Strict):
     """One setting per role, all five required."""
 
     lead: RoleSetting
-    planner: RoleSetting
+    planner: WorkerSetting
     # One setting (one reviewer, the shape before 2026-10-24) or 1 to 3 reviewers.
     reviewer: ReviewerSetting
-    builder: RoleSetting
-    helper: RoleSetting
+    builder: WorkerSetting
+    helper: WorkerSetting
 
     @model_validator(mode="after")
     def _session_is_lead_only(self) -> Roles:
         for role in ROLES[1:]:
             if isinstance(getattr(self, role), SessionRole):
                 raise ValueError(f"{role} cannot use the session model; only the lead can")
+        return self
+
+    @model_validator(mode="after")
+    def _workers_run_codex_only(self) -> Roles:
+        for role in ("planner", "builder", "helper"):
+            slot = getattr(self, role)
+            if isinstance(slot, AgentReviewer) and not is_codex_agent(slot):
+                raise ValueError(
+                    f"{role} can run on Claude or Codex; other agents are for reviewers only"
+                )
         return self
 
 
@@ -278,6 +306,15 @@ class Insights(_Strict):
     scope: Literal["all", "own"]
     # What the Presets card shows (2026-10-24): cost, tokens or both. Old saved values lack it.
     show: Literal["cost", "tokens", "both"] = "both"
+    # How often the scheduled review runs (2026-10-26). Old saved values lack it and read as
+    # every two weeks, which is what the review did before the setting existed.
+    frequency: Literal["weekly", "biweekly", "monthly"] = "biweekly"
+
+    @field_validator("frequency", mode="before")
+    @classmethod
+    def _frequency_null_is_default(cls, value: Any) -> Any:
+        """A null frequency reads as the default; any other bad value is refused by the Literal."""
+        return "biweekly" if value is None else value
 
 
 class _PresetList(_Strict):

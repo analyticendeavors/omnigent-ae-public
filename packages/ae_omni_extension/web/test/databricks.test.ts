@@ -11,6 +11,7 @@ import {
   activateDatabricks,
   asOfText,
   creditHealth,
+  creditTile,
   databricksTile,
   readAgeText,
   readingIsStale,
@@ -68,10 +69,10 @@ const spend = (extra: Partial<DatabricksSpend> = {}): DatabricksSpend => ({
   asOf: "2026-10-19T12:00:00Z",
   monthUsd: 12.4,
   totalUsd: 61.25,
-  creditUsd: 200,
+  creditUsd: 500,
   cadence: "once",
-  creditStart: "2026-08-19",
-  creditEnd: "2027-08-19",
+  creditStart: "2030-01-01",
+  creditEnd: "2030-12-31",
   warehouseId: ID,
   ...extra,
 });
@@ -238,13 +239,13 @@ describe("the pieces", () => {
   });
 
   it("says money as whole dollars or to the cent, and fills a bar up to the credit", () => {
-    expect(dollars(200)).toBe("$200");
+    expect(dollars(500)).toBe("$500");
     expect(dollars(12.4)).toBe("$12.40");
-    expect(barText(12.4, 200)).toBe("$12.40 of $200");
-    expect(barText(null, 200)).toBe("not read yet of $200");
-    expect(barPercent(50, 200)).toBe(25);
-    expect(barPercent(250, 200)).toBe(100);
-    expect(barPercent(null, 200)).toBe(0);
+    expect(barText(12.4, 500)).toBe("$12.40 of $500");
+    expect(barText(null, 500)).toBe("not read yet of $500");
+    expect(barPercent(125, 500)).toBe(25);
+    expect(barPercent(600, 500)).toBe(100);
+    expect(barPercent(null, 500)).toBe(0);
   });
 
   it("leads with the whole credit when granted once and with this month when monthly", () => {
@@ -253,7 +254,7 @@ describe("the pieces", () => {
       ["total", true],
       ["month", false],
     ]);
-    expect(once[0].label).toBe(`Credit since ${dayText("2026-08-19")}`);
+    expect(once[0].label).toBe(`Credit since ${dayText("2030-01-01")}`);
     const monthly = spendBars(spend({ cadence: "monthly" }));
     expect(monthly.map((bar) => [bar.key, bar.head])).toEqual([
       ["month", true],
@@ -263,9 +264,9 @@ describe("the pieces", () => {
   });
 
   it("reads a credit date as the calendar day, whatever the viewer's zone", () => {
-    const text = dayText("2026-08-19");
-    expect(text).toContain("19");
-    expect(text).toContain("2026");
+    const text = dayText("2030-01-01");
+    expect(text).toContain("1");
+    expect(text).toContain("2030");
     expect(dayText("not a date")).toBe("not a date");
   });
 
@@ -554,16 +555,16 @@ describe("the spend strip", () => {
     expect(bars[0].classList.contains("dbx-bar-head")).toBe(true);
     expect(bars[1].classList.contains("dbx-bar-head")).toBe(false);
     expect(bars[0].querySelector(".dbx-bar-label")?.textContent).toBe(
-      `Credit since ${dayText("2026-08-19")}`,
+      `Credit since ${dayText("2030-01-01")}`,
     );
-    expect(bars[0].querySelector(".dbx-bar-value")?.textContent).toBe("$61.25 of $200");
+    expect(bars[0].querySelector(".dbx-bar-value")?.textContent).toBe("$61.25 of $500");
     expect(bars[1].querySelector(".dbx-bar-label")?.textContent).toBe("This month");
-    expect(bars[1].querySelector(".dbx-bar-value")?.textContent).toBe("$12.40 of $200");
+    expect(bars[1].querySelector(".dbx-bar-value")?.textContent).toBe("$12.40 of $500");
     const meter = bars[1].querySelector(".dbx-track");
     expect(meter?.getAttribute("role")).toBe("meter");
     expect(meter?.getAttribute("aria-valuenow")).toBe("12.4");
-    expect(meter?.getAttribute("aria-valuemax")).toBe("200");
-    expect(bars[1].querySelector<HTMLElement>(".dbx-fill")?.style.width).toBe("6.2%");
+    expect(meter?.getAttribute("aria-valuemax")).toBe("500");
+    expect(bars[1].querySelector<HTMLElement>(".dbx-fill")?.style.width).toBe("2.48%");
     expect(section.querySelector(".dbx-asof")?.textContent).toMatch(
       /^as of .+ \(billing data lags a few hours\)$/,
     );
@@ -572,10 +573,26 @@ describe("the spend strip", () => {
     expect(refresh.disabled).toBe(false);
   });
 
+  it("draws no credit when the server has none: this month's spend only, no error", async () => {
+    const none = spend({ creditUsd: null, creditStart: null, creditEnd: null });
+    const data = overview([warehouse()], { spend: none });
+    const { context } = stubContext({ [PATH]: [ok(data)] });
+    const section = await mount(context);
+    expect(section.querySelector(".dbx-bar")).toBeNull();
+    expect(section.querySelector(".ring")).toBeNull();
+    expect(section.textContent).toContain("This month: $12.40");
+    expect(section.textContent).not.toContain("credit");
+    expect(section.querySelector(".dbx-spend")?.getAttribute("title")).toBeNull();
+    expect(databricksTile(data, null).note).toMatch(/^\$12\.40 this month/);
+    const folded = creditTile(data);
+    expect(folded.value).toBe("");
+    expect(folded.health).toBe("idle");
+  });
+
   it("leads with this month when the credit is monthly, and marks a bar past the credit", async () => {
     const { context } = stubContext({
       [PATH]: [
-        ok(overview([warehouse()], { spend: spend({ cadence: "monthly", totalUsd: 212.5 }) })),
+        ok(overview([warehouse()], { spend: spend({ cadence: "monthly", totalUsd: 612.5 }) })),
       ],
     });
     const section = await mount(context);
@@ -583,7 +600,7 @@ describe("the spend strip", () => {
     expect(bars.map((bar) => bar.dataset.bar)).toEqual(["month", "total"]);
     expect(bars[0].classList.contains("dbx-bar-head")).toBe(true);
     expect(bars[1].classList.contains("dbx-bar-over")).toBe(true);
-    expect(bars[1].querySelector(".dbx-bar-value")?.textContent).toBe("$212.50 of $200");
+    expect(bars[1].querySelector(".dbx-bar-value")?.textContent).toBe("$612.50 of $500");
     expect(bars[1].querySelector<HTMLElement>(".dbx-fill")?.style.width).toBe("100%");
   });
 

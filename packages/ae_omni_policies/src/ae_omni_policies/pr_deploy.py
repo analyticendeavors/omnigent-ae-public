@@ -111,6 +111,9 @@ async def status(repo: str, number: int, transport: Any = None) -> dict[str, Any
     }
     settings = github.GitHubSettings.from_env()
     # The cheap refusals first: they skip the session scan release.status() runs.
+    if not release_repo():
+        answer["error"] = f"the server has no release repository ({release.REPO_ENV})"
+        return answer
     if repo.lower() != release_repo().lower():
         answer["error"] = f"{repo} is not the release repository ({release_repo()})"
         return answer

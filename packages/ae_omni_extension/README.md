@@ -299,7 +299,7 @@ mid-word.
 ### Databricks (2026-10-19)
 
 Why: the Admin Center roadmap's Databricks compute and spend strip, built on the
-Databricks on AWS account "Analytic Endeavors (MVP)", whose $200 credit is a hard cap
+Databricks on AWS account "Analytic Endeavors (MVP)", whose prepaid credit is a hard cap
 (no payment method on file). Serverless only, because classic clusters on AWS also
 bill EC2.
 
@@ -311,7 +311,8 @@ auto stop, serverless) with Start or Stop, each asking once under the row; Start
 sentence says the warehouse bills until it auto stops. Below the rows, the spend strip
 shows two bars against the credit, "This month" and "Credit since <start>", led by
 whichever `AE_DATABRICKS_CREDIT_CADENCE` names, with the time the billing data runs
-to (it lags hours).
+to (it lags hours). With no credit set (no built-in default; the server sends null),
+it shows this month's spend alone.
 
 Spend is a query on a warehouse, so it costs a wake: the server reads it on its own
 only when the warehouse is already running and the last attempt is over 30 minutes

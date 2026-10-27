@@ -15,6 +15,7 @@ import os
 from collections.abc import Callable, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qs
 
 import httpx
@@ -1094,3 +1095,175 @@ async def test_boot_loads_the_file_and_reads_only_when_it_is_due(
         assert azure_cost.reading_task() is None
         assert (await azure_cost.overview())["asOf"] == "2026-10-21T12:00:00Z"
     assert calls == []
+
+
+# Azure's own USD figure (2026-10-26): the query asks for CostUSD and the reading uses it.
+
+
+def test_the_query_asks_for_the_usd_column_too() -> None:
+    body = azure_cost._body(NOW.date(), NOW.date(), "ServiceName", "Daily")
+    aggregation = body["dataset"]["aggregation"]
+    assert aggregation["totalCostUSD"] == {"name": "CostUSD", "function": "Sum"}
+    assert aggregation["totalCost"] == {"name": "Cost", "function": "Sum"}
+
+
+async def test_a_gbp_row_with_a_usd_figure_is_read_as_usd_and_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=UK")
+    columns = ["Cost", "CostUSD", "UsageDate", "ServiceName", "Currency"]
+    res_columns = ["Cost", "CostUSD", "UsageDate", "ResourceId", "Currency"]
+    rows = [[10.0, 13.0, 20261000 + day, "SQL Database", "GBP"] for day in range(1, 21)]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(rows, columns)
+        return _answer([[1.0, 1.3, 20261001, SQL_ID, "GBP"]], res_columns)
+
+    _mock(monkeypatch, _azure([], subscription=handler))
+    answer = await _read(monkeypatch)
+    view = answer["view"]
+    assert isinstance(view, dict)
+    assert view["currency"] == "USD"
+    assert view["month"]["spent"] == 260.0
+    row = view["subscriptions"][0]
+    assert (row["counted"], row["currency"], row["billedIn"]) == (True, "USD", "GBP")
+
+
+async def test_a_row_without_a_usd_figure_keeps_its_own_currency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch, f"{SUB_A}=Prod,{SUB_B}=UK")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        gbp = SUB_B in request.url.path
+        if grouping == "ServiceName":
+            currency = "GBP" if gbp else "USD"
+            rows = [[10.0, 20261000 + day, "SQL Database", currency] for day in range(1, 21)]
+            return _answer(rows, SERVICE_COLUMNS)
+        return _answer([], RESOURCE_COLUMNS)
+
+    _mock(monkeypatch, _azure([], subscription=handler))
+    view = (await _read(monkeypatch))["view"]
+    assert isinstance(view, dict)
+    rows = {s["name"]: s for s in view["subscriptions"]}
+    assert rows["UK"]["counted"] is False and rows["UK"]["currency"] == "GBP"
+    assert rows["UK"]["billedIn"] is None
+    assert view["month"]["spent"] == 200.0
+
+
+async def test_a_state_file_with_a_gbp_reading_loads_and_stays_out_of_the_totals() -> None:
+    cfg = azure_cost.Config(
+        TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"), (SUB_B, "UK"))
+    )
+    gbp = {**_GOOD_READING, "currency": "GBP"}
+    _state_file().write_text(
+        _saved_file(
+            subscriptions=[[SUB_A, "Production"], [SUB_B, "UK"]],
+            principal=cfg.principal(),
+            readings={SUB_A: _GOOD_READING, SUB_B: gbp},
+        ),
+        encoding="utf-8",
+    )
+    saved = azure_cost._load(cfg, _state_file())
+    assert saved is not None
+    assert set(saved["readings"]) == {SUB_A, SUB_B}
+    assert saved["readings"][SUB_A]["billedIn"] is None
+    assert saved["due"] == datetime(2026, 10, 21, 13, 0, tzinfo=UTC)
+    view = azure_cost._assemble(cfg, saved["readings"], {}, NOW.date())
+    assert {s["name"]: s["counted"] for s in view["subscriptions"]} == {
+        "Production": True,
+        "UK": False,
+    }
+
+
+async def test_billed_in_survives_a_save() -> None:
+    reading = {**_GOOD_READING, "billedIn": "GBP"}
+    assert azure_cost._saved_reading(reading)["billedIn"] == "GBP"
+    assert azure_cost._saved_reading({**_GOOD_READING, "billedIn": 5}) is None
+
+
+async def _spent_with(
+    monkeypatch: pytest.MonkeyPatch,
+    service_rows: list[list[object]],
+    resource_rows: list[list[object]],
+) -> dict[str, Any]:
+    _configure(monkeypatch, f"{SUB_A}=UK")
+    columns = ["Cost", "CostUSD", "UsageDate", "ServiceName", "Currency"]
+    res_columns = ["Cost", "CostUSD", "UsageDate", "ResourceId", "Currency"]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(service_rows, columns)
+        return _answer(resource_rows, res_columns)
+
+    _mock(monkeypatch, _azure([], subscription=handler))
+    view = (await _read(monkeypatch))["view"]
+    assert isinstance(view, dict)
+    return view
+
+
+async def test_mixed_usd_rows_in_the_service_query_fall_back_to_billing_currency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[list[object]] = [[10.0, 13.0, 20261001, "SQL Database", "GBP"]]
+    rows.append([10.0, None, 20261002, "SQL Database", "GBP"])
+    view = await _spent_with(monkeypatch, rows, [])
+    row = view["subscriptions"][0]
+    assert (row["currency"], row["billedIn"]) == ("GBP", None)
+    assert view["month"]["spent"] == 20.0
+
+
+async def test_a_resource_row_without_usd_sends_the_whole_subscription_back(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rows: list[list[object]] = [[10.0, 13.0, 20261001, "SQL Database", "GBP"]]
+    resources: list[list[object]] = [[1.0, None, 20261001, SQL_ID, "GBP"]]
+    view = await _spent_with(monkeypatch, rows, resources)
+    row = view["subscriptions"][0]
+    assert (row["currency"], row["billedIn"]) == ("GBP", None)
+    assert view["month"]["spent"] == 10.0
+
+
+async def test_an_old_gbp_reading_loads_and_keeps_the_saved_due(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"),))
+    _state_file().write_text(
+        _saved_file(
+            principal=cfg.principal(),
+            readings={SUB_A: {**_GOOD_READING, "currency": "GBP"}},
+            due="2026-10-21T13:00:00Z",
+        ),
+        encoding="utf-8",
+    )
+    _restart()
+    azure_cost._restore(cfg)
+    assert azure_cost._state["readings"][SUB_A]["currency"] == "GBP"
+    assert azure_cost._state["due"] == datetime(2026, 10, 21, 13, 0, tzinfo=UTC)
+    assert not azure_cost._stale()
+
+
+async def test_a_saved_limited_wait_with_a_gbp_reading_is_not_made_due_now(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _configure(monkeypatch)
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, ((SUB_A, "Production"),))
+    _state_file().write_text(
+        _saved_file(
+            principal=cfg.principal(),
+            readings={SUB_A: {**_GOOD_READING, "currency": "GBP"}},
+            due="2026-10-21T12:15:00Z",
+            limited=True,
+        ),
+        encoding="utf-8",
+    )
+    _restart()
+    azure_cost._restore(cfg)
+    assert azure_cost._state["limited"] is True
+    assert azure_cost._state["due"] == datetime(2026, 10, 21, 12, 15, tzinfo=UTC)
+    assert not azure_cost._stale()

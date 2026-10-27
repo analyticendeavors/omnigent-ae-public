@@ -80,10 +80,10 @@ Agents shows each collaborator's own context reading, then Claude Code's own sub
 
 <p align="center"><img src="../media/rail-usage.jpg" alt="Usage for this session's account"></p>
 
-Usage shows the plan limits of both harnesses, with the plan this session runs on first and tagged This session. For a Claude session it reads the limits of the Claude account the session runs on, named beside the plan, so sessions on different accounts never share a reading.
+Usage shows the plan limits of both harnesses, with the plan this session runs on first and tagged This session. For a Claude session it reads the limits of the Claude account the session runs on, named beside the plan, so sessions on different accounts never share a reading. A new chat on another account shows that account's usage before its first reply.
 
 **Where:** The Usage section of the session rail.<br>
-**Built from:** core patches [`0071`](../../patches/0071-ae-patch-Add-a-session-rail-beside-the-chat-and-slim.patch), [`0078`](../../patches/0078-ae-patch-Record-each-Claude-session-s-account-beside.patch)
+**Built from:** core patches [`0071`](../../patches/0071-ae-patch-Add-a-session-rail-beside-the-chat-and-slim.patch), [`0078`](../../patches/0078-ae-patch-Record-each-Claude-session-s-account-beside.patch), [`0202`](../../patches/0202-ae-patch-Name-a-Claude-session-s-account-at-launch-a.patch)
 
 ---
 

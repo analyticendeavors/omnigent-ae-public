@@ -104,6 +104,14 @@ def _tool(name: str) -> str | None:
     return shutil.which(name)
 
 
+def _passwordless_sudo() -> bool:
+    """``sudo -n true`` exits 0 only when sudo works without a password prompt."""
+    sudo = shutil.which("sudo")
+    if sudo is None:
+        return False
+    return subprocess.run([sudo, "-n", "true"], capture_output=True, timeout=30).returncode == 0
+
+
 def _skip_missing(name: str, install_hint: str) -> None:
     message = (
         f"{name} is not installed here; {install_hint}. The check ran in CI, not on this machine."
@@ -552,8 +560,8 @@ def test_pull_secrets_full_run_writes_both_files_and_leaves_no_temp_copy(
     """A full run against a fake ``az`` writes both env files and removes its
     plaintext temp directory on exit. The temp directory once survived because
     the EXIT trap read a ``local`` that had gone out of scope (2026-09-24)."""
-    if os.geteuid() != 0 and shutil.which("sudo") is None:
-        pytest.skip("the placement step needs root or sudo")
+    if os.geteuid() != 0 and not _passwordless_sudo():
+        pytest.skip("needs root or passwordless sudo")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake_az = bindir / "az"
@@ -602,8 +610,8 @@ def test_pull_secrets_runs_without_the_optional_secrets(tmp_path: Path) -> None:
     (2026-10-16) are optional: a vault without them still writes both files,
     leaves the keys out, says which feature stays off, and ``--check`` reports
     them absent without failing."""
-    if os.geteuid() != 0 and shutil.which("sudo") is None:
-        pytest.skip("the placement step needs root or sudo")
+    if os.geteuid() != 0 and not _passwordless_sudo():
+        pytest.skip("needs root or passwordless sudo")
     bindir = tmp_path / "bin"
     bindir.mkdir()
     fake_az = bindir / "az"

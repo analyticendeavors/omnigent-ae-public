@@ -770,12 +770,13 @@ export interface DatabricksSpend {
   monthUsd: number | null;
   /** Since `creditStart`. */
   totalUsd: number | null;
-  creditUsd: number;
+  /** Null (with the dates) when the server has no credit set: nothing to draw against. */
+  creditUsd: number | null;
   /** Which bar leads: this month's (`monthly`) or the whole credit's (`once`). */
   cadence: "monthly" | "once";
   /** YYYY-MM-DD. */
-  creditStart: string;
-  creditEnd: string;
+  creditStart: string | null;
+  creditEnd: string | null;
   /** The warehouse a reading runs on, if any. */
   warehouseId: string | null;
   /**
@@ -1215,6 +1216,8 @@ export interface AzureView {
     /** Its own billing currency; a row not counted is never converted into the total's. */
     currency: string;
     counted: boolean;
+    /** Set when Azure's USD figure stood in for a bill in this currency (for example "GBP"). */
+    billedIn?: string | null;
     /** False for a subscription never read; its $0 is not a reading. An older server sends none. */
     read?: boolean;
     error: string | null;
@@ -1501,6 +1504,24 @@ export const fetchAzureCost = (context: ExtensionContext) =>
 
 export const fetchPresets = (context: ExtensionContext, days: number) =>
   call<PresetsAnswer>(context, "GET", `/v1/ae/presets?days=${days}`);
+
+// ── Newer models (2026-10-26, model nudge): newer_models.py ─
+
+export interface NewerModel {
+  model: string;
+  name: string;
+  from: string[];
+  presets: number;
+}
+
+export interface NewerModelsAnswer {
+  presets: { id: string; title: string; rows: { role: string; newer: string }[] }[];
+  models: NewerModel[];
+}
+
+/** Read only; the server answers empty when no host catalog can be read. */
+export const fetchNewerModels = (context: ExtensionContext) =>
+  call<NewerModelsAnswer>(context, "GET", "/v1/ae/roles/newer-models");
 
 // ── Preset suggestions (2026-10-24, preset insights PR 3): preset_suggestions.py ─
 

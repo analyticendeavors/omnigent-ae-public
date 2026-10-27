@@ -712,6 +712,20 @@ def test_agent_slots_carry_a_stable_name_the_readers_resolve_by() -> None:
         RolesPut.model_validate(_body(presets=[preset]))
 
 
+@pytest.mark.parametrize("role", ["planner", "builder", "helper"])
+def test_workers_take_a_codex_slot_but_no_other_agent(role: str) -> None:
+    preset = _preset("a")
+    preset["roles"][role] = _CODEX | {"model": "gpt-5.6-sol", "effort": "high"}
+    RolesPut.model_validate(_body(presets=[preset]))
+    preset["roles"][role] = _CODEX | {"agent": "ag_gemini", "agent_name": None, "name": "Gemini"}
+    with pytest.raises(ValidationError, match="Claude or Codex"):
+        RolesPut.model_validate(_body(presets=[preset]))
+    preset["roles"]["lead"] = _CODEX
+    preset["roles"][role] = {"mode": "auto"}
+    with pytest.raises(ValidationError):
+        RolesPut.model_validate(_body(presets=[preset]))
+
+
 def test_session_mode_is_not_a_reviewer_slot() -> None:
     preset = _preset("a")
     preset["roles"]["reviewer"] = {"mode": "multi", "reviewers": [{"mode": "session"}]}
@@ -734,7 +748,13 @@ def test_insights_is_optional_and_absent_from_the_stored_json(tmp_path: Path) ->
 def test_insights_round_trip_absent_keeps_and_null_clears(tmp_path: Path) -> None:
     path = tmp_path / "roles.json"
     store = RolePrefsStore(path)
-    insights = {"enabled": True, "weeks": 4, "scope": "own", "show": "both"}
+    insights = {
+        "enabled": True,
+        "weeks": 4,
+        "scope": "own",
+        "show": "both",
+        "frequency": "biweekly",
+    }
     first = store.put("u", RolesPut.model_validate(_body(insights=insights)))
     assert json.loads(path.read_text())["users"]["u"]["insights"] == insights
     assert RolePrefsStore(path).get("u").insights.enabled is True
@@ -807,3 +827,53 @@ def test_all_states_lists_valid_saved_users_with_new_starters(tmp_path: Path) ->
     # Copies: changing one does not change the store.
     states["ann"].presets.clear()
     assert RolePrefsStore(path).all_states()["ann"].presets
+
+
+def test_insights_frequency_defaults_to_biweekly_round_trips_and_validates(
+    tmp_path: Path,
+) -> None:
+    old = {"enabled": True, "weeks": 4, "scope": "own", "show": "both"}
+    store = RolePrefsStore(tmp_path / "roles.json")
+    state = store.put("u", RolesPut.model_validate(_body(insights=old))).state
+    assert state.insights.frequency == "biweekly"
+    for frequency in ("weekly", "biweekly", "monthly"):
+        parsed = RolesPut.model_validate(_body(insights={**old, "frequency": frequency}))
+        assert parsed.insights.frequency == frequency
+    saved = store.put(
+        "u", RolesPut.model_validate(_body(revision=1, insights={**old, "frequency": "monthly"}))
+    ).state
+    assert RolePrefsStore(tmp_path / "roles.json").get("u").insights.frequency == "monthly"
+    assert role_prefs.view(saved)["insights"]["frequency"] == "monthly"
+    with pytest.raises(ValidationError):
+        RolesPut.model_validate(_body(insights={**old, "frequency": "daily"}))
+
+
+def test_insights_frequency_null_reads_as_the_default_and_bad_values_are_refused() -> None:
+    old = {"enabled": True, "weeks": 2, "scope": "all", "show": "both"}
+    parsed = RolesPut.model_validate(_body(insights={**old, "frequency": None}))
+    assert parsed.insights.frequency == "biweekly"
+    for bad in ("daily", 7, ["weekly"], True):
+        with pytest.raises(ValidationError, match="weekly"):
+            RolesPut.model_validate(_body(insights={**old, "frequency": bad}))
+
+
+def test_ultra_is_stored_for_an_agent_slot_only() -> None:
+    preset = _preset("a")
+    preset["roles"]["reviewer"] = {
+        "mode": "multi",
+        "reviewers": [_CODEX | {"model": "gpt-6-sol", "effort": "ultra"}],
+    }
+    put = RolesPut.model_validate(_body(presets=[preset]))
+    assert put.presets[0].roles.reviewer.model_dump()["reviewers"][0]["effort"] == "ultra"
+    for slot in (
+        {"mode": "fixed", "model": "claude-sonnet-5-5", "effort": "ultra"},
+        {"mode": "multi", "reviewers": [{"mode": "fixed", "model": "x", "effort": "ultra"}]},
+    ):
+        bad = _preset("a")
+        bad["roles"]["reviewer"] = slot
+        with pytest.raises(ValidationError):
+            RolesPut.model_validate(_body(presets=[bad]))
+    planner = _preset("a")
+    planner["roles"]["planner"] = {"mode": "fixed", "model": "claude-opus-5-5", "effort": "ultra"}
+    with pytest.raises(ValidationError):
+        RolesPut.model_validate(_body(presets=[planner]))

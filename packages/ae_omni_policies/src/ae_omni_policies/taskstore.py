@@ -43,7 +43,7 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import httpx
 
-from ae_omni_policies import __version__, key_health
+from ae_omni_policies import USER_AGENT, key_health
 from ae_omni_policies.notes import (
     DEFAULT_TZ,
     PARKING_LOT_NAME,
@@ -70,10 +70,6 @@ REQUEST_TIMEOUT_S = 10.0
 # Distinct from the worker's "fork-triage" so a task's origin says which door
 # filed it. The re-read after a failed create matches on it.
 ORIGIN_SURFACE = "omnigent-ae"
-# tasks.go-ae.org sits behind bot protection that answers some client agents
-# with error 1010 before Access sees the token. Naming ourselves keeps the
-# request out of that bucket and makes the origin's logs say who called.
-USER_AGENT = f"omnigent-ae/{__version__} (+https://github.com/analyticendeavors/omnigent-ae)"
 
 REDIRECT_ERROR = (
     "Cloudflare Access redirected to its login page, so it did not accept the service "
@@ -344,6 +340,9 @@ class TaskStoreClient:
             "CF-Access-Client-Id": self.settings.client_id,
             "CF-Access-Client-Secret": self.settings.client_secret,
             "accept": "application/json",
+            # tasks.go-ae.org sits behind bot protection that answers some client agents
+            # with error 1010 before Access sees the token. Naming ourselves keeps the
+            # request out of that bucket and makes the origin's logs say who called.
             "user-agent": USER_AGENT,
         }
         content = None

@@ -24,7 +24,9 @@ judged by its own read time (``readAt``): one over six hours old, or never read,
 ``cannot-evaluate`` and no alert for the rules that need it; a rate limit alone blanks nothing
 (the answer's ``note`` says it). Every target is ``cannot-evaluate`` only when Azure is not
 configured, was never read, or every subscription is too old.
-Amounts are never converted: a subscription billed in another currency than USD is skipped.
+Amounts are USD as Azure reports them (its ``CostUSD`` column), so a subscription billed in GBP
+is judged against its USD limit. Only a reading that fell back to its own non-USD currency
+(Azure sent no ``CostUSD``) is skipped.
 A total (all, a service, each resource) that is already over its limit alerts even when another
 subscription is unreadable, because the missing part could only add to it; a total under its
 limit with a subscription unreadable is ``cannot-evaluate``, never a quiet ``ok``.

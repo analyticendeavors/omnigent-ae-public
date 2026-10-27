@@ -382,7 +382,22 @@ def test_month_end_forecast_matches_the_cards_pace() -> None:
     )
 
 
-def test_a_subscription_billed_in_another_currency_is_skipped() -> None:
+def test_a_gbp_subscription_read_in_usd_is_judged_against_its_usd_limit() -> None:
+    snap = _snapshot()
+    snap["readings"][SUB_SC] = {
+        **_reading(_days(1, 20, 35.0), currency="USD"),
+        "billedIn": "GBP",
+        "readAt": snap["at"].isoformat(),
+    }
+    spend = cost_targets.spend_from(snap, NOW)
+    assert "MVP SC" in spend.subs and not spend.skipped
+    result = cost_targets.evaluate_spend(
+        _rule("a", "month_to_date", "subscription", "MVP SC", 600), spend
+    )
+    assert result.status == "over" and result.value == 700.0
+
+
+def test_a_subscription_billed_in_another_currency_without_a_usd_figure_is_skipped() -> None:
     snap = _snapshot(
         subscriptions=[(SUB_SC, "MVP SC"), (SUB_25, "MVP 2025"), (SUB_EUR, "Euro")],
     )

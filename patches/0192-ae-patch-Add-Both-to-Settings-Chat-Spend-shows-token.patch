@@ -1,0 +1,305 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 12:08:03 -0700
+Subject: [PATCH 192/202] [ae-patch] Add Both to Settings > Chat > Spend shows:
+ tokens and estimated cost together
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Spend shows offered Tokens, Cost or Off. Both shows the two together ("1.98M tok · $9.80"), and every label now carries its token and cost parts so a card can show them as separate rows. The Agents card's per-session line follows it; its total uses cost only when every session reports one, else tokens. Tokens, Cost and Off show exactly what they did.
+---
+ web/src/lib/aeSpendDisplay.test.ts            | 64 +++++++++++++
+ web/src/lib/aeSpendDisplay.ts                 | 91 ++++++++++++++-----
+ .../settings/AeSpendDisplaySetting.test.tsx   | 17 ++++
+ .../pages/settings/AeSpendDisplaySetting.tsx  |  3 +-
+ web/src/shell/AeAgentMeta.tsx                 | 17 ++--
+ 5 files changed, 161 insertions(+), 31 deletions(-)
+ create mode 100644 web/src/pages/settings/AeSpendDisplaySetting.test.tsx
+
+diff --git a/web/src/lib/aeSpendDisplay.test.ts b/web/src/lib/aeSpendDisplay.test.ts
+index ba6555ea2e28fa63bc4f06e158f00c51eb7a5080..e7ca4a1483c55c5126c2374d29836e4710b59526 100644
+--- a/web/src/lib/aeSpendDisplay.test.ts
++++ b/web/src/lib/aeSpendDisplay.test.ts
+@@ -83,3 +83,67 @@ describe("aeSpendLabel", () => {
+     expect(aeSpendLabel([withTokens, noTokens], "cost")?.text).toBe("$4.00");
+   });
+ });
++
++describe("aeSpendLabel both", () => {
++  const big = usage({ a: row({ inputTokens: 1_900_000, outputTokens: 80_000 }) }, 9.8);
++  const withTokens = usage({ a: row({ inputTokens: 200_000, outputTokens: 12_000 }) }, 3);
++  const noTokens = usage({ a: row({ totalCostUsd: 1 }) }, 1);
++  const tokensOnly = usage({ a: row({ inputTokens: 1000, outputTokens: 200 }) }, null);
++
++  it("joins tokens and the estimated cost", () => {
++    const label = aeSpendLabel([big], "both");
++    expect(label).toMatchObject({
++      text: "1.98M tok · $9.80",
++      long: "1.98M tokens · $9.80",
++      unit: "both",
++    });
++    expect(label?.title).toBe(`${label?.parts?.tokens?.title} · $9.80 estimated`);
++    expect(label?.parts?.tokens?.text).toBe("1.98M tok");
++    expect(label?.parts?.cost?.text).toBe("$9.80");
++  });
++
++  it("keeps the plus for incomplete tokens", () => {
++    expect(aeSpendLabel([withTokens, noTokens], "both")?.text).toBe("212k+ tok · $4.00");
++  });
++
++  it("marks a cost that leaves out a session with no cost, as tokens mark theirs", () => {
++    // A subscription session reports tokens but no cost.
++    const label = aeSpendLabel([big, tokensOnly], "both");
++    expect(label?.text).toBe("1.98M tok \u00b7 $9.80+");
++    expect(label?.parts?.cost?.title).toBe("$9.80 estimated \u00b7 1 session reports no cost");
++    // Cost mode keeps its old text.
++    expect(aeSpendLabel([big, tokensOnly], "cost")?.text).toBe("$9.80");
++  });
++
++  it("falls back to the tokens label when no real cost exists", () => {
++    const label = aeSpendLabel([tokensOnly], "both");
++    expect(label).toMatchObject({ text: "1.2k tok", unit: "tokens" });
++    expect(label?.parts).toMatchObject({ cost: null });
++  });
++
++  it("falls back to the cost label when no tokens exist", () => {
++    const label = aeSpendLabel([noTokens], "both");
++    expect(label).toMatchObject({ text: "$1.00", unit: "estimated" });
++    expect(label?.parts).toMatchObject({ tokens: null });
++  });
++
++  it("is null when off and fills parts in the other modes", () => {
++    expect(aeSpendLabel([big], "off")).toBeNull();
++    expect(aeSpendLabel([big], "tokens")).toMatchObject({
++      text: "1.98M tok",
++      parts: { cost: null },
++    });
++    const cost = aeSpendLabel([big], "cost");
++    expect(cost?.text).toBe("$9.80");
++    expect(cost?.parts).toMatchObject({ tokens: null });
++    expect(cost?.parts?.cost?.text).toBe("$9.80");
++    const fell = aeSpendLabel([{ ...tokensOnly, tokens: 5000 }], "cost");
++    expect(fell?.parts?.cost).toBeNull();
++    expect(fell?.parts?.tokens?.text).toBe("5k");
++  });
++
++  it("accepts both from storage", () => {
++    window.localStorage.setItem("omnigent:ae-spend-display", "both");
++    expect(readAeSpendDisplay()).toBe("both");
++  });
++});
+diff --git a/web/src/lib/aeSpendDisplay.ts b/web/src/lib/aeSpendDisplay.ts
+index 5a75167c617c5ec78916742ac79fa9585bea50db..dbc85b4eed2b303130a49152466fb8368cb115c2 100644
+--- a/web/src/lib/aeSpendDisplay.ts
++++ b/web/src/lib/aeSpendDisplay.ts
+@@ -1,5 +1,5 @@
+ // What the spend pills show (omnigent-ae, 2026-10-24): tokens, the estimated
+-// cost, or nothing. Device-local. Tokens are the default because an OAuth
++// cost, both, or nothing. Device-local. Tokens are the default because an OAuth
+ // (subscription) account does not pay the API-price estimate the cost shows.
+ 
+ import { useSyncExternalStore } from "react";
+@@ -9,8 +9,8 @@ import type { ModelUsage } from "@/lib/types";
+ 
+ const STORAGE_KEY = "omnigent:ae-spend-display";
+ 
+-export type AeSpendDisplay = "tokens" | "cost" | "off";
+-export const AE_SPEND_DISPLAYS: readonly AeSpendDisplay[] = ["tokens", "cost", "off"];
++export type AeSpendDisplay = "tokens" | "cost" | "both" | "off";
++export const AE_SPEND_DISPLAYS: readonly AeSpendDisplay[] = ["tokens", "cost", "both", "off"];
+ export const DEFAULT_AE_SPEND_DISPLAY: AeSpendDisplay = "tokens";
+ 
+ export function readAeSpendDisplay(): AeSpendDisplay {
+@@ -118,29 +118,21 @@ export interface AeSpendLabel {
+   long: string;
+   title: string;
+   /** Cost mode: what the number is, for a title built around the pill's own "+". */
+-  unit: "estimated" | "tokens";
++  unit: "estimated" | "tokens" | "both";
++  /** The token and cost labels this one is made of; the one that is absent is null. */
++  parts?: { tokens: AeSpendLabel | null; cost: AeSpendLabel | null };
+ }
+ 
+-/**
+- * The one formatter behind every spend pill. Cost mode is the old behavior;
+- * tokens mode sums the sessions that have counts and marks the total with "+"
+- * when some do not (or when `extraMissing` says more sessions are unread).
+- */
+-export function aeSpendLabel(
+-  usages: Iterable<AeSessionUsage>,
+-  mode: AeSpendDisplay,
+-  omitted = 0,
+-): AeSpendLabel | null {
+-  if (mode === "off") return null;
+-  const list = [...usages];
+-  if (mode === "cost") {
+-    const spend = aeSpendOf(list);
+-    if (!spend) return null;
+-    const text = spend.kind === "cost" ? aeFormatCost(spend.value) : aeFormatTokens(spend.value);
+-    const long = spend.kind === "cost" ? text : `${text} tokens`;
+-    const unit = spend.kind === "cost" ? "estimated" : "tokens";
+-    return { text, long, title: `${text} ${unit}`, unit };
+-  }
++function costLabel(list: AeSessionUsage[]): AeSpendLabel | null {
++  const spend = aeSpendOf(list);
++  if (!spend) return null;
++  const text = spend.kind === "cost" ? aeFormatCost(spend.value) : aeFormatTokens(spend.value);
++  const long = spend.kind === "cost" ? text : `${text} tokens`;
++  const unit = spend.kind === "cost" ? "estimated" : "tokens";
++  return { text, long, title: `${text} ${unit}`, unit };
++}
++
++function tokensLabel(list: AeSessionUsage[], omitted: number): AeSpendLabel | null {
+   let spent = 0;
+   let missing = omitted;
+   let cacheWriteKnown = false;
+@@ -171,3 +163,54 @@ export function aeSpendLabel(
+     title: `${text} tokens: ${aeTokenBreakdown({ ...sum, spent, cacheWriteKnown, complete: true })}${note}`,
+   };
+ }
++
++/**
++ * The one formatter behind every spend pill. Cost mode is the old behavior;
++ * tokens mode sums the sessions that have counts and marks the total with "+"
++ * when some do not (or when `omitted` says more sessions are unread). Both mode
++ * joins the two, each only when it is really available.
++ */
++export function aeSpendLabel(
++  usages: Iterable<AeSessionUsage>,
++  mode: AeSpendDisplay,
++  omitted = 0,
++): AeSpendLabel | null {
++  if (mode === "off") return null;
++  const list = [...usages];
++  if (mode === "cost") {
++    const cost = costLabel(list);
++    if (!cost) return null;
++    return cost.unit === "estimated"
++      ? { ...cost, parts: { tokens: null, cost } }
++      : { ...cost, parts: { tokens: cost, cost: null } };
++  }
++  const tokens = tokensLabel(list, omitted);
++  if (mode === "tokens") return tokens && { ...tokens, parts: { tokens, cost: null } };
++  const realCost = costLabel(list);
++  // Both: a cost that leaves sessions out is marked "+", as an incomplete token total is
++  // (a subscription session reports no cost). Cost mode keeps its old text.
++  const noCost = list.filter((u) => u.costUsd === null).length + omitted;
++  const cost =
++    realCost?.unit !== "estimated"
++      ? null
++      : noCost > 0
++        ? {
++            ...realCost,
++            text: `${realCost.text}+`,
++            long: `${realCost.long}+`,
++            title: `${realCost.title} · ${noCost} session${noCost === 1 ? " reports" : "s report"} no cost`,
++          }
++        : realCost;
++  if (tokens && cost) {
++    return {
++      text: `${tokens.text} · ${cost.text}`,
++      long: `${tokens.long} · ${cost.long}`,
++      title: `${tokens.title} · ${cost.title}`,
++      unit: "both",
++      parts: { tokens, cost },
++    };
++  }
++  if (tokens) return { ...tokens, parts: { tokens, cost: null } };
++  if (cost) return { ...cost, parts: { tokens: null, cost } };
++  return null;
++}
+diff --git a/web/src/pages/settings/AeSpendDisplaySetting.test.tsx b/web/src/pages/settings/AeSpendDisplaySetting.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ea46cb91bfee3d43f35e7d9a62c24a0a81debdc
+--- /dev/null
++++ b/web/src/pages/settings/AeSpendDisplaySetting.test.tsx
+@@ -0,0 +1,17 @@
++import { fireEvent, render, screen } from "@testing-library/react";
++import { beforeEach, describe, expect, it } from "vitest";
++import { AeSpendDisplaySetting } from "@/pages/settings/AeSpendDisplaySetting";
++import { readAeSpendDisplay } from "@/lib/aeSpendDisplay";
++
++describe("AeSpendDisplaySetting", () => {
++  beforeEach(() => window.localStorage.clear());
++
++  it("offers Both and saves it", () => {
++    render(<AeSpendDisplaySetting />);
++    for (const mode of ["tokens", "cost", "both", "off"]) {
++      expect(screen.getByTestId(`ae-spend-display-${mode}`)).toBeTruthy();
++    }
++    fireEvent.click(screen.getByTestId("ae-spend-display-both"));
++    expect(readAeSpendDisplay()).toBe("both");
++  });
++});
+diff --git a/web/src/pages/settings/AeSpendDisplaySetting.tsx b/web/src/pages/settings/AeSpendDisplaySetting.tsx
+index 569d03e0a9209925f1a838ee3a8c26a802573926..191676a1d22b725fc235850ce9e53d786ddef329 100644
+--- a/web/src/pages/settings/AeSpendDisplaySetting.tsx
++++ b/web/src/pages/settings/AeSpendDisplaySetting.tsx
+@@ -14,6 +14,7 @@ import {
+ const CARDS: Record<AeSpendDisplay, { label: string; title: string }> = {
+   tokens: { label: "Tokens", title: "Pills show new input plus output tokens." },
+   cost: { label: "Cost", title: "Pills show the estimated cost at API rates." },
++  both: { label: "Both", title: "Pills show tokens and the estimated cost." },
+   off: { label: "Off", title: "No spend on pills, rows or the hover card." },
+ };
+ 
+@@ -32,7 +33,7 @@ export function AeSpendDisplaySetting() {
+         value={value}
+         onSelect={writeAeSpendDisplay}
+         componentId="settings.chat.spend_display"
+-        className="grid grid-cols-1 gap-3 sm:grid-cols-3"
++        className="grid grid-cols-1 gap-3 sm:grid-cols-4"
+         cardClassName="items-center gap-2 p-4"
+         items={AE_SPEND_DISPLAYS.map((mode) => ({
+           value: mode,
+diff --git a/web/src/shell/AeAgentMeta.tsx b/web/src/shell/AeAgentMeta.tsx
+index b78268cfdf139b4560d5077d334f5f11a7cbf199..abc3ba2ae4222ad136e3ab403926703a1968cd10 100644
+--- a/web/src/shell/AeAgentMeta.tsx
++++ b/web/src/shell/AeAgentMeta.tsx
+@@ -104,7 +104,7 @@ export function AeAgentMetaLine({
+   const role = aeAgentRole(child);
+   const effort = usage?.effort ?? native?.effort ?? null;
+   const mode = useAeSpendDisplay();
+-  const own = usage && mode === "tokens" ? aeSpendLabel([usage], mode) : null;
++  const own = usage && (mode === "tokens" || mode === "both") ? aeSpendLabel([usage], mode) : null;
+   const cost = mode === "cost" ? (usage?.costUsd ?? null) : null;
+   const tokens = mode === "cost" && usage?.tokens != null && usage.tokens > 0 ? usage.tokens : null;
+   const model = withModel ? (child.model ?? child.routed_model ?? native?.model ?? null) : null;
+@@ -203,9 +203,15 @@ export function AeAgentsTotal({
+   const lead = usage.get(rootSessionId);
+   if (!lead || mode === "off") return null;
+   // Cost is the measure; tokens stand in only when the lead reports no cost.
+-  const byCost = mode === "cost" && lead.costUsd !== null;
++  // Both mode needs one number, so it uses cost only when every session has one.
++  const allRead = [lead, ...childIds.map((id) => usage.get(id))];
++  const byCost =
++    mode === "cost"
++      ? lead.costUsd !== null
++      : mode === "both" && allRead.every((u) => u !== undefined && u.costUsd !== null);
++  const byTokens = mode === "tokens" || (mode === "both" && !byCost);
+   const measure = (u: AeSessionUsage) =>
+-    byCost ? (u.costUsd ?? 0) : mode === "tokens" ? (aeUsageSpentTokens(u) ?? 0) : (u.tokens ?? 0);
++    byCost ? (u.costUsd ?? 0) : byTokens ? (aeUsageSpentTokens(u) ?? 0) : (u.tokens ?? 0);
+   const leadValue = measure(lead);
+   const leadFamilies = byCost ? lead.costByFamily : lead.byFamily;
+   const known = childIds.map((id) => usage.get(id)).filter((u): u is AeSessionUsage => !!u);
+@@ -227,8 +233,7 @@ export function AeAgentsTotal({
+     }
+   }
+   // Tokens mode: sessions without a count leave the total short, so it ends in "+".
+-  const noCount =
+-    mode === "tokens" ? [lead, ...known].filter((u) => aeUsageSpentTokens(u) === null) : [];
++  const noCount = byTokens ? [lead, ...known].filter((u) => aeUsageSpentTokens(u) === null) : [];
+   const plus = noCount.length > 0 ? "+" : "";
+   const fmt = (n: number) => (byCost ? aeFormatCost(n) : `${aeFormatTokens(n)}${plus} tokens`);
+   // Tokens only when every model in the lead and the rows read reports them.
+@@ -251,7 +256,7 @@ export function AeAgentsTotal({
+         <b
+           className="font-medium text-foreground tabular-nums"
+           title={
+-            mode === "tokens"
++            byTokens
+               ? noCount.length > 0
+                 ? `${noCount.length} session${noCount.length === 1 ? " has" : "s have"} no token count`
+                 : "New input plus output tokens"

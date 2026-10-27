@@ -27,6 +27,9 @@ the scheduled review task (:mod:`preset_review`), the reviewer's
 ``GET /preset-suggestions`` with ``POST .../{id}/apply``, ``undo``, ``dismiss`` and ``issue``
 (:mod:`preset_suggestions`), and ``POST /preset-review/run`` with ``GET /preset-review``
 for Settings > Roles.
+2026-10-26 (model nudge) added ``GET /roles/newer-models`` (:mod:`newer_models`): the caller's
+preset rows with a newer model in the same family, read only. The preset review also files one
+suggestion per such row (at most three a review).
 2026-10-24 (Admin Center, Presets card) added ``GET /presets?days=7|30``
 (:mod:`ae_omni_policies.preset_stats`), admins only.
 2026-10-22 (Admin Center, Azure card) added ``GET /azure-cost``
@@ -38,7 +41,7 @@ on a running Fabric capacity, with a task-store alarm when one is crossed.
 ``POST /databricks/warehouses/{id}/start`` and ``.../stop``, and
 ``POST /databricks/spend/refresh`` (:mod:`ae_omni_policies.databricks`): the
 AWS MVP workspace's SQL warehouses with Start and Stop, and its spend against
-the $200 credit. The POSTs are JSON-only and origin-checked like Fabric's,
+its credit (when one is set). The POSTs are JSON-only and origin-checked like Fabric's,
 because a Start bills until the warehouse auto stops and a Refresh wakes it;
 ``GET`` never starts anything and reads spend only off a warehouse already
 running.
@@ -159,6 +162,7 @@ from fastapi import APIRouter, Depends, Path, Query, Request
 from fastapi.responses import JSONResponse
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import ErrorCode
+from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL, resolve_auth_header
 from omnigent.server.routes._content_type import require_json_content_type
@@ -181,6 +185,7 @@ from ae_omni_policies import (
     limits,
     merge_watch,
     model_log,
+    newer_models,
     pr_compliance,
     pr_deploy,
     preset_log,
@@ -1051,11 +1056,18 @@ async def vault_owner_post(
     }
 
 
+# A hint is the picker's current value, so it is good only for a chat young enough to have
+# launched on it: two relay ticks (5 minutes each), after which the relay lists every live
+# session with the account its launch-time claude_account file names.
+LIMITS_HINT_WINDOW_S = 10 * 60
+
+
 @router.get("/limits")
 async def limits_view(
     request: Request,
     user: Annotated[str | None, Depends(require_ae_user)],
     session_id: Annotated[str | None, Query(max_length=120)] = None,
+    account: Annotated[str | None, Query(max_length=120)] = None,
 ) -> dict[str, Any]:
     """The newest plan-limit snapshot per harness (``claude``, ``codex``), ``null`` if never seen.
 
@@ -1066,10 +1078,42 @@ async def limits_view(
     shows its own account's limits (``limits.session_view``). A session the
     caller cannot open (2026-10-21, audit A2) is answered like an unknown one:
     the box-wide view, never that session's account windows.
+
+    ``account`` (2026-10-26) is the Claude login the caller picked for new
+    chats (empty for the default login). It answers a chat the relay has not
+    posted yet with that account's numbers instead of the host reading's, but
+    only for a session created within :data:`LIMITS_HINT_WINDOW_S`: the pick
+    is today's, not the session's, so an older session must not take it. A
+    forked session's own server label (``omnigent.claude_native.account``)
+    outranks the hint, is trusted as it is, and has no age limit. Both are
+    ignored for a session the caller cannot open, and ``account`` alone,
+    with no ``session_id``, does nothing.
     """
+    named: str | None = limits.UNSET
+    trusted = False
     if session_id is not None and not await _may_open_session(request, user, session_id):
         session_id = None
-    return await asyncio.to_thread(limits.store().view, session_id=session_id)
+    if session_id is not None:
+        conv = await _session_for_limits(session_id)
+        stamped = (conv.labels or {}).get(CLAUDE_ACCOUNT_LABEL_KEY) if conv is not None else None
+        if stamped is not None:
+            named, trusted = stamped or None, True
+        elif account is not None and conv is not None:
+            age = time.time() - conv.created_at
+            if 0 <= age <= LIMITS_HINT_WINDOW_S:
+                named = account or None
+    return await asyncio.to_thread(
+        limits.store().view, session_id=session_id, account=named, trusted=trusted
+    )
+
+
+async def _session_for_limits(session_id: str) -> Conversation | None:
+    """The session's record, or ``None`` when it cannot be read (then no label or hint applies)."""
+    try:
+        return await _conversation(session_id)
+    except Exception:  # noqa: BLE001 (an unreadable session has no label and no hint)
+        _logger.warning("limits: could not read session %s", session_id, exc_info=True)
+        return None
 
 
 def _shared_labels() -> dict[str, str] | None:
@@ -1265,6 +1309,28 @@ async def roles_view(user: Annotated[str | None, Depends(require_ae_user)]) -> d
     return role_prefs.view(state)
 
 
+@router.get("/roles/newer-models", response_model=None)
+async def roles_newer_models(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any]:
+    """The caller's preset rows that have a newer model in the same family (read only).
+
+    Added 2026-10-26 (model nudge). Never changes a preset. With no host catalog (hosts offline,
+    a catalog call failing or taking over five seconds) the answer is empty, not an error.
+    """
+    who = user or "local"
+    empty: dict[str, Any] = {"presets": [], "models": []}
+    try:
+        async with _loopback_client(request) as http:
+            catalog = await newer_models.catalog_soft(http, lambda: _loopback_client(request))
+        state = await asyncio.to_thread(role_prefs.store().get, who)
+    except Exception:  # noqa: BLE001 (this is a hint; it must never break the page)
+        _logger.warning("could not read the newer-models list", exc_info=True)
+        return empty
+    found = newer_models.find(state.presets, catalog)
+    return {"presets": found, "models": newer_models.summary(found)}
+
+
 @router.put(
     "/roles",
     response_model=None,
@@ -1390,6 +1456,11 @@ async def post_preset_insights(
     try:
         answer = await asyncio.to_thread(preset_review.build_read, owner, admin, datetime.now(UTC))
         if answer.get("due") is True:
+            found, not_moved, _checked = await _newer_for_review(request, owner)
+            answer["newer_models"] = [
+                {"owner": user_id, "presets": rows} for user_id, rows in found.items()
+            ]
+            answer["newer_models_not_moved"] = not_moved
             # Only a session that was told its read is due may submit (post_preset_suggestions).
             await asyncio.to_thread(
                 preset_suggestions.store().note_due_read, session_id, time.time()
@@ -1397,6 +1468,92 @@ async def post_preset_insights(
     except preset_suggestions.SuggestionError as exc:
         return _error(exc.status, exc.code, exc.message)
     return answer
+
+
+async def _newer_for_review(
+    request: Request, owner: str, timeout: float = newer_models.OVERALL_TIMEOUT_S
+) -> tuple[dict[str, list[dict[str, Any]]], list[dict[str, Any]], bool]:
+    """``(rows per user, rows not moved, checked)`` for the review.
+
+    *checked* is False when no catalog could be read in *timeout* seconds (nothing is then
+    known about newer models). Only the review owner's presets are compared, even in an admin
+    run: the catalog is read through the caller's identity, so it says nothing about another
+    user's hosts.
+    """
+    not_moved: list[dict[str, Any]] = []
+    try:
+        states = await asyncio.to_thread(newer_models.states_for, owner, role_prefs.store())
+        async with _loopback_client(request) as http:
+            catalog = await newer_models.catalog_soft(
+                http, lambda: _loopback_client(request), timeout=timeout
+            )
+        found = newer_models.for_users(states, catalog, not_moved)
+        return found, not_moved, bool(catalog)
+    except Exception:  # noqa: BLE001 (the review still runs without this list)
+        _logger.warning("could not read the newer-models list for the review", exc_info=True)
+        return {}, [], False
+
+
+SUBMIT_CATALOG_WAIT_S = 2.0
+
+
+MODEL_STEP_CAP = 3
+
+
+def _with_model_steps(
+    body: preset_suggestions.SubmitBody,
+    found: dict[str, list[dict[str, Any]]],
+    states: dict[str, list[role_prefs.Preset]],
+    not_moved: list[dict[str, Any]] | None = None,
+) -> preset_suggestions.SubmitBody:
+    """*body* with model-step suggestions first (at most :data:`MODEL_STEP_CAP`), then its own.
+
+    The server adds the steps so the nudge does not depend on the model remembering. Steps the
+    reviewer already filed are not added again. Steps held back, and rows that could not move,
+    are named in the summary.
+    """
+    starters = {p.id: preset_suggestions._dump(p) for p in role_prefs.STARTERS}
+    starter_keys = {
+        (user, p.id)
+        for user, ps in states.items()
+        for p in ps
+        if starters.get(p.id) == preset_suggestions._dump(p)
+    }
+    now = time.time()
+    runs = preset_stats.read_log_runs(now - 14 * 86400.0, now)
+    extras = newer_models.step_items(
+        found,
+        runs=runs,
+        records=preset_suggestions.store().all_suggestions(),
+        starter_keys=starter_keys,
+    )
+    steps = [preset_suggestions.Item.model_validate(e) for e in extras]
+    own = list(body.suggestions)
+    filed = {
+        (i.owner or next(iter(found), ""), i.preset_id, c.path, (c.value or {}).get("model"))
+        for i in own
+        for c in i.changes
+        if i.kind == "own" and isinstance(c.value, dict)
+    }
+    steps = [
+        s
+        for s in steps
+        if (s.owner, s.preset_id, s.changes[0].path, s.changes[0].value["model"]) not in filed
+    ]
+    chosen = steps[:MODEL_STEP_CAP]
+    held = len(steps) - len(chosen)
+    room = preset_suggestions.MAX_PER_REVIEW - len(chosen)
+    notes = []
+    if held:
+        notes.append(f"{held} more model update{'s' if held != 1 else ''} next week.")
+    for row in not_moved or []:
+        notes.append(f"Not moved: {row['role']} on {row['title']}, {row['reason']}.")
+    summary = body.summary.strip()
+    extra = (" " + " ".join(notes)) if notes else ""
+    summary = summary[: max(800 - len(extra), 0)].rstrip() + extra
+    return body.model_copy(
+        update={"suggestions": [*chosen, *own[: max(room, 0)]], "summary": summary[:800]}
+    )
 
 
 @router.post(
@@ -1424,6 +1581,18 @@ async def post_preset_suggestions(
         )
     now = datetime.now(UTC)
     roles = role_prefs.store()
+    try:
+        found, not_moved, checked = await _newer_for_review(request, owner, SUBMIT_CATALOG_WAIT_S)
+        if not checked:
+            summary = body.summary.strip()
+            body = body.model_copy(
+                update={"summary": summary[:780].rstrip() + " Model check skipped."}
+            )
+        elif found or not_moved:
+            states = await asyncio.to_thread(newer_models.states_for, owner, roles)
+            body = await asyncio.to_thread(_with_model_steps, body, found, states, not_moved)
+    except Exception:  # noqa: BLE001 (the reviewer's own suggestions still go in)
+        _logger.warning("could not add the model-step suggestions", exc_info=True)
     try:
         review = await asyncio.to_thread(
             functools.partial(
@@ -1783,6 +1952,20 @@ async def _clear_forced(store: preset_suggestions.SuggestionStore, who: str) -> 
         _logger.warning("could not clear the Run now flag for %s", who, exc_info=True)
 
 
+_HEAL_EVERY = 60.0
+_heal_at: dict[str, float] = {}
+
+
+def _heal_due(who: str) -> bool:
+    """True at most once per ``_HEAL_EVERY`` seconds per user; records the attempt."""
+    now = time.monotonic()
+    last = _heal_at.get(who)
+    if last is not None and now - last < _HEAL_EVERY:
+        return False
+    _heal_at[who] = now
+    return True
+
+
 @router.get("/preset-review", response_model=None)
 async def preset_review_status(
     request: Request, user: Annotated[str | None, Depends(require_ae_user)]
@@ -1794,10 +1977,36 @@ async def preset_review_status(
     sugs = preset_suggestions.store()
     last = await asyncio.to_thread(sugs.last_review, who)
     task = None
+    zone: ZoneInfo | None = None
     try:
         async with _loopback_client(request) as http:
             row = await preset_review.find_task(http, who)
+            # A frequency save whose task PATCH failed leaves the old rule firing while the
+            # gap already follows the new one. Retry the sync once from this read.
+            want_rule = preset_review.FREQUENCIES[preset_review.frequency_of(insights)][0]
+            if (
+                row is not None
+                and insights
+                and insights.enabled
+                and row.get("rrule") != want_rule
+                and _heal_due(who)
+            ):
+                # ensure_task cannot do a rule-only PATCH cheaply (it needs the agent id and the
+                # server defaults), so the heal is throttled instead: at most once per
+                # _HEAL_EVERY seconds per user, so an unpatchable row adds no extra calls to
+                # every poll. The roles are re-read inside its lock, never the GET's snapshot,
+                # so a PUT that changed the frequency meanwhile is not overwritten with the old
+                # rule; a row that already matches the fresh rule comes back "unchanged".
+                healed = await preset_review.ensure_task(
+                    http, lambda: role_prefs.store().get(who), who, skip_if_disabled=True
+                )
+                if healed.get("ok"):
+                    row = await preset_review.find_task(http, who) or row
+                else:
+                    _logger.warning("preset review status: heal failed: %s", healed.get("error"))
         if row is not None:
+            with contextlib.suppress(Exception):
+                zone = ZoneInfo(str(row.get("timezone")))
             task = {
                 "id": row.get("id"),
                 "state": row.get("state"),
@@ -1810,10 +2019,11 @@ async def preset_review_status(
         try:
             when = datetime.fromisoformat(str(next_review).replace("Z", "+00:00"))
             floor = datetime.fromisoformat(str(last["at"]).replace("Z", "+00:00")) + timedelta(
-                days=preset_review.MIN_GAP_DAYS
+                days=preset_review.gap_days(insights)
             )
-            while when < floor:
-                when += timedelta(days=7)
+            when = preset_review.next_review_after(
+                when, floor, preset_review.frequency_of(insights), zone
+            )
             next_review = when.isoformat()
         except ValueError:
             pass
@@ -2318,7 +2528,8 @@ class SessionRequest(BaseModel):
     # explicit model or effort win.
     role: Literal["lead", "planner", "reviewer", "builder", "helper"] | None = None
     model: str | None = Field(default=None, min_length=1, max_length=200)
-    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    # "ultra" only for a Codex session; create_session rejects it for any other harness.
+    effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] | None = None
     preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")
     # A chat of its own for Reid (a handoff, 2026-10-25): no family, its own slot, role
     # ``lead`` on ``preset``; ``orchestrator`` is then only the opener.
@@ -2476,7 +2687,8 @@ class ModelPost(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     model: str | None = Field(default=None, min_length=1, max_length=200)
-    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
+    # "ultra" only for a Codex session; the change is rejected for any other.
+    effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] | None = None
     reason: str | None = Field(default=None, min_length=1, max_length=200)
     caller: str | None = Field(default=None, min_length=1, max_length=100)
     confirmed: bool = False
@@ -2613,6 +2825,10 @@ async def _change_model(
                 ErrorCode.FORBIDDEN,
                 f"session {session_id} was not started by {body.caller}, so it cannot change it",
             )
+    if body.effort == "ultra" and spawn_role._harness_of(conv) != "codex":
+        return _error(
+            422, ErrorCode.INVALID_INPUT, "ultra effort is only for a Codex session; use max"
+        )
     old = _current_model(conv)
     # Undo restores exact values, so null clears; any other change keeps what it leaves out.
     new = (body.model, body.effort) if body.undo else (body.model or old[0], body.effort or old[1])
@@ -2903,6 +3119,13 @@ async def start_session(
             effort=body.effort,
             preset=body.preset or role_prefs.DEFAULT_PRESET,
         )
+    if spawn.effort == "ultra" and spawn.harness != "codex":
+        if body.effort == "ultra":
+            return _error(
+                422, ErrorCode.INVALID_INPUT, "ultra effort is only for a Codex session; use max"
+            )
+        # Not asked for by name (a role's setting carried it): start at max instead of failing.
+        spawn.effort = "max"
     body = body.model_copy(update={"harness": spawn.harness})
     family = _family_of_parent(rows, parent)
     hold = f"orch:{key}"

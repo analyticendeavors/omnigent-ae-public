@@ -358,8 +358,11 @@ CREATE_SESSION_SCHEMA: dict[str, Any] = {
         },
         "effort": {
             "type": "string",
-            "enum": ["low", "medium", "high", "xhigh", "max"],
-            "description": "Reasoning effort for the session; wins over the role's effort.",
+            "enum": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "description": (
+                "Reasoning effort for the session; wins over the role's effort. "
+                "ultra is only for a Codex session."
+            ),
         },
         "preset": {
             "type": "string",
@@ -600,8 +603,10 @@ SET_SESSION_MODEL_SCHEMA: dict[str, Any] = {
         },
         "effort": {
             "type": "string",
-            "enum": ["low", "medium", "high", "xhigh", "max"],
-            "description": "The reasoning effort. Leave out to keep it.",
+            "enum": ["low", "medium", "high", "xhigh", "max", "ultra"],
+            "description": (
+                "The reasoning effort; ultra is only for a Codex session. Leave out to keep it."
+            ),
         },
         "reason": {
             "type": "string",

@@ -1,0 +1,97 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:14:17 -0700
+Subject: [PATCH 201/202] [ae-patch] Stop the item observer drain from spinning
+ on tasks that already finished
+
+drain_item_observers waited for each task's queued _pending.discard callback. When every pending task was already done, gather returned without yielding on Python 3.12, so the loop spun and the callback never ran. The drain now drops finished tasks itself before it gathers. Adds a regression test and a 30 second per-test timeout.
+---
+ omnigent/server/item_observers.py   |  9 ++++++-
+ tests/server/test_item_observers.py | 40 +++++++++++++++++++++++++++++
+ 2 files changed, 48 insertions(+), 1 deletion(-)
+
+diff --git a/omnigent/server/item_observers.py b/omnigent/server/item_observers.py
+index 3d1a73baff5733523a6364db450e341b6c35370d..b609b099517a19d33b2a11da37d12c3c3a02fa4f 100644
+--- a/omnigent/server/item_observers.py
++++ b/omnigent/server/item_observers.py
+@@ -96,7 +96,14 @@ def notify_items_persisted(session_id: str, items: Sequence[ConversationItem]) -
+ 
+ async def drain_item_observers() -> None:
+     """Wait for every in-flight observer task to finish (tests and shutdown)."""
+-    while _pending:
++    while True:
++        # Drop finished tasks here instead of waiting for their queued
++        # _pending.discard callback: gather over only-finished tasks completes
++        # without yielding (Python 3.12 eager path), so a loop that waited for
++        # the callback would spin forever and starve it.
++        _pending.difference_update([task for task in _pending if task.done()])
++        if not _pending:
++            return
+         await asyncio.gather(*list(_pending), return_exceptions=True)
+ 
+ 
+diff --git a/tests/server/test_item_observers.py b/tests/server/test_item_observers.py
+index 7b3e89d12156c23e031ff91b8fe9e082fcfd72e5..67413d6ff61f5ed85ed23352b1eccdb0c5ed133d 100644
+--- a/tests/server/test_item_observers.py
++++ b/tests/server/test_item_observers.py
+@@ -13,6 +13,7 @@ from __future__ import annotations
+ 
+ import asyncio
+ import logging
++import threading
+ from collections.abc import Iterator, Sequence
+ from dataclasses import dataclass, field
+ from typing import Any
+@@ -33,6 +34,10 @@ from omnigent.server.item_observers import (
+ from omnigent.server.routes._sessions.helpers import _flush_relay_text
+ from tests.server.helpers import create_test_agent
+ 
++# The timeout method is `thread`: a hang ends the worker run and the dump names
++# the test, it does not fail one test. The whole file takes about 2 seconds.
++pytestmark = pytest.mark.timeout(30)
++
+ 
+ @pytest.fixture(autouse=True)
+ def _clean_registry() -> Iterator[None]:
+@@ -155,6 +160,41 @@ async def test_a_sync_observer_runs_off_the_event_loop() -> None:
+     assert loop_thread == [False]
+ 
+ 
++def test_drain_returns_when_a_finished_task_is_still_pending() -> None:
++    """A task that finished in the drainer's own loop pass must not spin drain."""
++
++    async def scenario() -> None:
++        loop = asyncio.get_running_loop()
++
++        async def quick() -> None:
++            return None
++
++        task = loop.create_task(quick())
++        item_observers._pending.add(task)
++        task.add_done_callback(item_observers._pending.discard)
++        await asyncio.sleep(0)  # task finishes this pass; its discard is queued for the next
++        assert task.done() and task in item_observers._pending
++        await drain_item_observers()
++
++    errors: list[BaseException] = []
++
++    def run() -> None:
++        try:
++            asyncio.run(scenario())
++        except BaseException as exc:  # noqa: BLE001 - handed to the test thread below
++            errors.append(exc)
++
++    worker = threading.Thread(target=run, daemon=True)
++    worker.start()
++    worker.join(timeout=5)
++    hung = worker.is_alive()
++    reset_item_observers()  # empties _pending so a spinning drain exits
++    worker.join(timeout=5)
++    if errors:
++        raise errors[0]
++    assert not hung, "drain_item_observers spun on a finished task"
++
++
+ def test_outside_an_event_loop_observers_are_skipped(
+     caplog: pytest.LogCaptureFixture,
+ ) -> None:

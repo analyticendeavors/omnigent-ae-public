@@ -119,8 +119,18 @@ async def test_an_answer_that_is_not_a_list_of_refs_is_an_error_not_a_500() -> N
     assert odd["state"] == "unknown" and "no list" in odd["error"]
 
 
-def test_the_default_release_repo_is_the_public_one() -> None:
-    assert release.DEFAULT_REPO == "analyticendeavors/omnigent-ae-public"
+def test_there_is_no_default_release_repo() -> None:
+    assert release.DEFAULT_REPO == ""
+
+
+async def test_without_a_release_repo_the_update_check_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AE_RELEASE_REPO", raising=False)
+    release.reset_cache()
+    with respx.mock():
+        answer = await release.status()
+    assert answer["state"] == "unknown" and "AE_RELEASE_REPO" in answer["error"]
 
 
 async def test_settings_the_example_sets_and_the_env_lacks_are_listed(

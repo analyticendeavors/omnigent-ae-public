@@ -27,6 +27,9 @@ from ae_omni_policies import retention as _retention
 from ae_omni_policies.registry import POLICY_REGISTRY
 
 __version__ = "0.1.0"
+#: The User-Agent every outbound HTTP client sends. It names the product and
+#: version only: no repository link, so a fork sends nothing about this one.
+USER_AGENT = f"omnigent-ae/{__version__}"
 
 #: Whether the observer is registered with upstream (patch P3 present).
 OBSERVER_REGISTERED = _observer.REGISTERED
@@ -40,5 +43,6 @@ __all__ = [
     "OBSERVER_REGISTERED",
     "POLICY_REGISTRY",
     "RETENTION_REGISTERED",
+    "USER_AGENT",
     "__version__",
 ]

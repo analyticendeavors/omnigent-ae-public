@@ -24,7 +24,10 @@
 ARG BASE=omnigent-ae-base:local
 FROM ${BASE}
 
-LABEL org.opencontainers.image.source="https://github.com/analyticendeavors/omnigent-ae" \
+# GitHub links a package to the repository named here. CI passes the repository
+# that publishes the image; a local build leaves it empty.
+ARG IMAGE_SOURCE=""
+LABEL org.opencontainers.image.source="${IMAGE_SOURCE}" \
       org.opencontainers.image.description="OmniGent with Analytic Endeavors' branch-discipline layer" \
       org.opencontainers.image.licenses="Apache-2.0"
 

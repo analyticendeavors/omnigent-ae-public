@@ -9,8 +9,8 @@ newer one is waiting, and how many sessions it is waiting on.
 - ``running``: ``OMNIGENT_IMAGE_TAG``, which compose hands the server from
   ``config/server.env`` (the tag the box deployed).
 - ``latest``: the highest ``ae-vX.Y.Z.N`` tag on ``AE_RELEASE_REPO``
-  (default ``analyticendeavors/omnigent-ae-public``; AE's box sets its private
-  repo) through the server's GitHub token, cached
+  (no default; the example config sets the public repository and AE's box sets
+  its private one) through the server's GitHub token, cached
   for two minutes behind one lock; ``null`` when GitHub is off or fails
   (``error`` says why).
 - ``state`` says only that a newer tag exists, not that the box will install
@@ -37,9 +37,9 @@ from ae_omni_policies import env_drift, github, sessions
 
 RUNNING_ENV = "OMNIGENT_IMAGE_TAG"
 REPO_ENV = "AE_RELEASE_REPO"
-# The public repository, which every operator can read (2026-10-22); a fork
-# that publishes its own image sets AE_RELEASE_REPO.
-DEFAULT_REPO = "analyticendeavors/omnigent-ae-public"
+# No default (2026-10-26): the repository that publishes the image is the
+# operator's to name, and a fork must not poll someone else's tags.
+DEFAULT_REPO = ""
 CACHE_S = 120.0
 _TAG = re.compile(r"^ae-v(\d+(?:\.\d+)+)$")
 _MID_TURN = {"running", "waiting"}
@@ -83,7 +83,9 @@ async def _refresh(transport: Any) -> tuple[str | None, str | None]:
         return _cache[1], _cache[2]
     settings = github.GitHubSettings.from_env()
     repo = (os.environ.get(REPO_ENV) or "").strip() or DEFAULT_REPO
-    if not settings.configured:
+    if not repo:
+        latest, error = None, f"the server has no release repository ({REPO_ENV})"
+    elif not settings.configured:
         latest, error = None, "the server has no GitHub token (AE_GITHUB_TOKEN)"
     else:
         try:

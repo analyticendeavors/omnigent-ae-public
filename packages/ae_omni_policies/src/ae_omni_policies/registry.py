@@ -30,9 +30,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "limit": {
                     "type": "integer",
                     "description": (
-                        "Working sessions allowed at once. Unset, the server's AE_SLOT_LIMIT "
-                        "applies; set, it replaces it here and in every slot count the web "
-                        "UI shows (GET /v1/ae/capacity)."
+                        "Working sessions allowed at once. Unset: AE_SLOT_LIMIT (default 3). "
+                        "With several enabled caps, the lowest limit wins."
                     ),
                     "default": labels.SLOT_LIMIT,
                     "minimum": 1,
@@ -48,8 +47,8 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "family_children": {
                     "type": "integer",
                     "description": (
-                        "Sessions one lead may have working at once inside its family's "
-                        "slot; create_session refuses one more. 0 lifts the cap."
+                        "Busy children per lead, the lead not counted. Default 3. 0 lifts only "
+                        "this cap; another cap's lowest nonzero value still applies."
                     ),
                     "default": 3,
                     "minimum": 0,
@@ -57,9 +56,9 @@ POLICY_REGISTRY: list[dict[str, object]] = [
                 "helpers_count": {
                     "type": "boolean",
                     "description": (
-                        "Helper sessions count toward the session limit. Off, a family holds "
-                        "one slot and its helpers, builders and reviewers never count; on, "
-                        "each working helper holds a slot too."
+                        "Off (default): helpers never hold a slot. On: each working helper does. "
+                        "Of several caps, the lowest limit sets this (a tie goes to the cap "
+                        "that counts helpers). family_children still applies."
                     ),
                     "default": False,
                 },
