@@ -128,7 +128,7 @@ in stage 2 (`deploy/Dockerfile`).
 | `AE_COST_ALERT_LIST` | optional; the task-store list cost alert tasks land in, by name, default `AE Work`; the alarm time and zone are the expiry alerts' (`AE_SECRET_ALERT_TIME`, `AE_TASK_STORE_TZ`) |
 | `AE_DATABRICKS_CLIENT_ID` | optional, a secret; the service principal's OAuth client (application) ID. Never logged or returned; `deploy/pull-secrets.sh` writes it from Key Vault `databricks-mvp-client-id` |
 | `AE_DATABRICKS_CLIENT_SECRET` | optional, a secret; its OAuth secret, API scope `sql` (warehouses and statement execution). Never logged or returned; `deploy/pull-secrets.sh` writes it from Key Vault `databricks-mvp-client-secret` |
-| `AE_DATABRICKS_CREDIT_USD`, `_CREDIT_CADENCE`, `_CREDIT_START`, `_CREDIT_END` | optional; the spend strip's credit, default `200`, `once`, `2026-08-19`, `2027-08-19`. Both bars always show (this month, and since the start); the cadence (`monthly` or `once`) picks which leads |
+| `AE_DATABRICKS_CREDIT_USD`, `_CREDIT_CADENCE`, `_CREDIT_START`, `_CREDIT_END` | optional; the spend strip's credit. There is no built-in credit: it shows only when the amount and both dates are set (the cadence defaults to `once`), otherwise the strip shows this month's spend alone. Both bars always show (this month, and since the start); the cadence (`monthly` or `once`) picks which leads |
 | `AE_DATABRICKS_STATE_FILE` | optional; the JSON file keeping the last spend reading across restarts, default `/data/ae-databricks.json` |
 | `AE_STEWARD_AGENT` | optional; the agent whose newest session is Your move's brief, default `steward` |
 

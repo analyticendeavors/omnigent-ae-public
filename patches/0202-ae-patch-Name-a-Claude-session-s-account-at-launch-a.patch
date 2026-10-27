@@ -1,0 +1,698 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 19:57:36 -0700
+Subject: [PATCH 202/202] [ae-patch] Name a Claude session's account at launch,
+ and ask Usage for the picked account before a session exists
+
+The statusLine shim names a session's Claude account only on its first render, so a new chat on a backup login showed the default login's usage until its first reply. The runner now writes claude_account at launch, and the Usage panels send the account picked for new chats (account=) so the server can answer a chat it has no reading for yet.
+---
+ .../claude_native/ae_launch_account.py        | 45 +++++++++++
+ omnigent/runner/native/orchestration.py       |  8 +-
+ .../claude_native/test_ae_launch_account.py   | 34 ++++++++
+ .../test_app_claude_native_launch_args.py     | 58 ++++++++++++++
+ web/src/components/AePlanLimits.test.tsx      | 61 ++++++++++++++
+ web/src/components/AePlanLimits.tsx           | 47 ++++++++---
+ .../components/aeRail/AeRailUsage.test.tsx    | 33 ++++++++
+ web/src/components/aeRail/AeRailUsage.tsx     |  7 +-
+ web/src/hooks/useAeLimitGate.ts               |  8 +-
+ .../hooks/useAePickedClaudeAccount.test.tsx   | 79 +++++++++++++++++++
+ web/src/hooks/useAePickedClaudeAccount.ts     | 34 ++++++++
+ web/src/lib/aeLimitGate.test.ts               | 23 ++++++
+ web/src/lib/aeLimitGate.ts                    | 13 +++
+ 13 files changed, 438 insertions(+), 12 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_launch_account.py
+ create mode 100644 tests/harnesses/claude_native/test_ae_launch_account.py
+ create mode 100644 web/src/hooks/useAePickedClaudeAccount.test.tsx
+ create mode 100644 web/src/hooks/useAePickedClaudeAccount.ts
+
+diff --git a/omnigent/harnesses/claude_native/ae_launch_account.py b/omnigent/harnesses/claude_native/ae_launch_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ddbcebea9322f9acdaac707c58290c4c53d8c9d2
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_launch_account.py
+@@ -0,0 +1,45 @@
++"""
++Name a Claude session's account in its bridge dir at launch.
++
++The statusLine shim writes ``claude_account`` on Claude Code's first render, so
++until a new session's first reply the box could not say which login it runs on
++and the Usage panel showed the default login's numbers for a session on a
++backup account. The runner writes the same file once, before the terminal
++starts, from the environment it just built for it.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import logging
++import os
++from collections.abc import Mapping
++from pathlib import Path
++
++from omnigent.harnesses.claude_native.status import CLAUDE_ACCOUNT_FILE
++
++_logger = logging.getLogger(__name__)
++
++
++def write_launch_account(bridge_dir: Path, terminal_env: Mapping[str, str]) -> None:
++    """
++    Record the account the terminal is about to run on.
++
++    Written to a temp file and renamed, so it never races the shim's own
++    rename of the same file. A failed write is logged and skipped: the shim
++    writes the file on the first render anyway.
++
++    :param bridge_dir: The session's bridge dir.
++    :param terminal_env: The environment the terminal launches with; its
++        ``OMNIGENT_CLAUDE_ACCOUNT`` is empty for the default login.
++    """
++    account = terminal_env.get("OMNIGENT_CLAUDE_ACCOUNT", "")
++    target = bridge_dir / CLAUDE_ACCOUNT_FILE
++    tmp = target.with_name(f"{CLAUDE_ACCOUNT_FILE}.launch.{os.getpid()}.tmp")
++    try:
++        tmp.write_text(account, encoding="utf-8")
++        os.replace(tmp, target)
++    except OSError as exc:
++        _logger.warning("could not record the Claude account in %s: %s", bridge_dir, exc)
++        with contextlib.suppress(OSError):
++            tmp.unlink()
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 66723edf5776b64d758a1283129db8160e3e6210..70105120f2bf5ee37a5ad5aee1ebc36ad0f50431 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -8881,6 +8881,7 @@ async def _auto_create_claude_terminal(
+     # ``/model`` conversion reads THIS session's pins, not the runner's
+     # ambient env (the CLI path records these at prepare time; the runner
+     # resolves its config only after the bridge exists).
++    from omnigent.harnesses.claude_native.ae_launch_account import write_launch_account
+     from omnigent.harnesses.claude_native.bridge import record_model_vocabulary
+     from omnigent.harnesses.claude_native.main import stored_claude_picker_values
+ 
+@@ -9011,6 +9012,11 @@ async def _auto_create_claude_terminal(
+         validate_claude_hook_interpreter_compatibility(resolved_claude)
+ 
+     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config, claude_account)
++    claude_terminal_env = build_native_claude_terminal_env(
++        claude_config, account_name=claude_account
++    )
++    # Name the account before the first render, so usage readers do not wait for the shim.
++    await asyncio.to_thread(write_launch_account, bridge_dir, claude_terminal_env)
+ 
+     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
+     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
+@@ -9029,7 +9035,7 @@ async def _auto_create_claude_terminal(
+         # Tool Search env plus ucode gateway env (ANTHROPIC_BASE_URL
+         # etc.) when derived. Empty provider config still forces
+         # ENABLE_TOOL_SEARCH=true so MCP schemas are loaded on demand.
+-        env=build_native_claude_terminal_env(claude_config, account_name=claude_account),
++        env=claude_terminal_env,
+         # Names to strip (see ``_claude_terminal_env_unset``). Dropping
+         # ``DATABRICKS_CONFIG_PROFILE`` matters because Claude's MCP servers
+         # inherit this env and several build ``WorkspaceClient`` without pinning
+diff --git a/tests/harnesses/claude_native/test_ae_launch_account.py b/tests/harnesses/claude_native/test_ae_launch_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..8f37e8951eafd82ae83d803dacf9923d2575a288
+--- /dev/null
++++ b/tests/harnesses/claude_native/test_ae_launch_account.py
+@@ -0,0 +1,34 @@
++"""The account a Claude terminal launches on is recorded before its first render (omnigent-ae)."""
++
++from __future__ import annotations
++
++from pathlib import Path
++
++from omnigent.harnesses.claude_native.ae_launch_account import write_launch_account
++from omnigent.harnesses.claude_native.main import build_native_claude_terminal_env
++from omnigent.harnesses.claude_native.status import CLAUDE_ACCOUNT_FILE
++
++
++def test_default_login_is_recorded_as_empty(tmp_path: Path) -> None:
++    write_launch_account(tmp_path, build_native_claude_terminal_env(None, account_name=None))
++
++    assert (tmp_path / CLAUDE_ACCOUNT_FILE).read_text(encoding="utf-8") == ""
++
++
++def test_backup_account_is_recorded_by_name(tmp_path: Path) -> None:
++    write_launch_account(tmp_path, {"OMNIGENT_CLAUDE_ACCOUNT": "shared:AE Backup"})
++
++    assert (tmp_path / CLAUDE_ACCOUNT_FILE).read_text(encoding="utf-8") == "shared:AE Backup"
++
++
++def test_a_rewrite_replaces_the_file_and_leaves_no_temp_file(tmp_path: Path) -> None:
++    (tmp_path / CLAUDE_ACCOUNT_FILE).write_text("old", encoding="utf-8")
++
++    write_launch_account(tmp_path, {"OMNIGENT_CLAUDE_ACCOUNT": "AE Backup"})
++
++    assert (tmp_path / CLAUDE_ACCOUNT_FILE).read_text(encoding="utf-8") == "AE Backup"
++    assert [p.name for p in tmp_path.iterdir()] == [CLAUDE_ACCOUNT_FILE]
++
++
++def test_a_missing_bridge_dir_is_skipped(tmp_path: Path) -> None:
++    write_launch_account(tmp_path / "gone", {"OMNIGENT_CLAUDE_ACCOUNT": "AE Backup"})
+diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
+index aba8e2308878570313b60aabadde289dfbb0ef9b..1c8bcf9268a753b63a78066f920fa3318a36f74b 100644
+--- a/tests/runner/test_app_claude_native_launch_args.py
++++ b/tests/runner/test_app_claude_native_launch_args.py
+@@ -1152,6 +1152,64 @@ async def test_auto_create_claude_terminal_seeds_trust_with_launch_env(
+     registry.launch_required_terminal.assert_awaited_once()
+ 
+ 
++@pytest.mark.parametrize(
++    "login,expected",
++    [(None, ""), ("AE Backup", "AE Backup")],
++)
++async def test_auto_create_claude_terminal_records_the_account_before_the_first_render(
++    bridge_dir: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    login: str | None,
++    expected: str,
++) -> None:
++    """
++    The bridge dir names the terminal's account before the statusLine shim runs.
++
++    The shim writes ``claude_account`` on Claude Code's first render, so a new
++    chat's usage was read for the wrong login until its first reply.
++
++    :param login: The account env the launch resolves; ``None`` is the default login.
++    :param expected: What ``claude_account`` holds (empty for the default login).
++    """
++    from unittest.mock import Mock
++
++    from omnigent.harnesses.claude_native.status import CLAUDE_ACCOUNT_FILE
++    from omnigent.runner.resource_registry import SessionResourceRegistry
++
++    if login is not None:
++        monkeypatch.setattr(
++            "omnigent.onboarding.claude_accounts.account_env_for_launch",
++            lambda env, account_name=None: {"OMNIGENT_CLAUDE_ACCOUNT": login},
++        )
++    from omnigent.harnesses.claude_native import ae_launch_account
++
++    real = ae_launch_account.write_launch_account
++    stamped: list[Path] = []
++
++    def record(bridge: Path, env: object) -> None:
++        real(bridge, env)  # type: ignore[arg-type]
++        stamped.append(bridge)
++
++    monkeypatch.setattr(ae_launch_account, "write_launch_account", record)
++    seen: list[str] = []
++
++    def launch(*_args: object, **_kwargs: object) -> None:
++        # The terminal has not started, so no render has happened: only the launch wrote it.
++        assert len(stamped) == 1
++        seen.append((stamped[0] / CLAUDE_ACCOUNT_FILE).read_text(encoding="utf-8"))
++        raise RuntimeError("stop after launch")
++
++    registry = Mock(spec=SessionResourceRegistry)
++    registry.launch_required_terminal.side_effect = launch
++
++    with pytest.raises(RuntimeError, match="stop after launch"):
++        await _auto_create_claude_terminal_for_test(
++            monkeypatch, session_id="conv_account_stamp", workspace=bridge_dir, registry=registry
++        )
++
++    assert seen == [expected]
++
++
+ @pytest.mark.parametrize(
+     "subagent_started,turn_started",
+     [(True, True), (True, False), (False, True), (False, False)],
+diff --git a/web/src/components/AePlanLimits.test.tsx b/web/src/components/AePlanLimits.test.tsx
+index f0afcef29c1c6a26fc0654f21c2804c593f7266a..91d9c800916268e30750ec5faa234e550ebc62b9 100644
+--- a/web/src/components/AePlanLimits.test.tsx
++++ b/web/src/components/AePlanLimits.test.tsx
+@@ -4,6 +4,7 @@ import {
+   cleanup,
+   fireEvent,
+   render as rtlRender,
++  renderHook,
+   screen,
+   waitFor,
+   within,
+@@ -12,6 +13,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+ 
++// The picked-account lookup reads the session and the host's logins; its own suite covers it.
++const picked = vi.hoisted(() => ({
++  value: { account: undefined as string | undefined, ready: true },
++}));
++vi.mock("@/hooks/useAePickedClaudeAccount", () => ({
++  useAePickedClaudeAccount: () => picked.value,
++}));
++
+ import { authenticatedFetch } from "@/lib/identity";
+ import { useChatStore } from "@/store/chatStore";
+ import { ComposerContextRing } from "@/components/composer/ComposerContextRing";
+@@ -33,6 +42,7 @@ import {
+   formatResetShort,
+   formatTokens,
+   limitTone,
++  useAeLimits,
+   windowLabel,
+ } from "./AePlanLimits";
+ import type { AeSessionContextsState } from "./aeSessionContext";
+@@ -224,6 +234,57 @@ describe("fetchAeLimits", () => {
+       "/v1/ae/limits?session_id=conv%20a%2F1",
+     ]);
+   });
++
++  it("adds account when one is picked, empty for the default login", async () => {
++    await fetchAeLimits("conv_a", "shared:AE Backup");
++    await fetchAeLimits("conv_a", "");
++    await fetchAeLimits(null, "Work");
++    await fetchAeLimits("conv_a", null);
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
++      "/v1/ae/limits?session_id=conv_a&account=shared%3AAE%20Backup",
++      "/v1/ae/limits?session_id=conv_a&account=",
++      "/v1/ae/limits?account=Work",
++      "/v1/ae/limits?session_id=conv_a",
++    ]);
++  });
++});
++
++describe("useAeLimits account hint", () => {
++  beforeEach(() => {
++    vi.mocked(authenticatedFetch).mockReset();
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      Promise.resolve(new Response(JSON.stringify(ANSWER))),
++    );
++  });
++  afterEach(cleanup);
++
++  it("keeps the first hint seen for a session, so a later pick does not move it", async () => {
++    const { result, rerender } = renderHook(
++      ({ account }: { account?: string }) => useAeLimits(true, "conv_hint_a", account),
++      { wrapper: QueryWrapper, initialProps: { account: "Backup" } as { account?: string } },
++    );
++    await waitFor(() => expect(result.current.data).toBeDefined());
++    rerender({ account: "" });
++    rerender({ account: undefined });
++    await waitFor(() => expect(result.current.data).toBeDefined());
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
++      "/v1/ae/limits?session_id=conv_hint_a&account=Backup",
++    ]);
++  });
++
++  it("asks without an account until a hint arrives, then once with it", async () => {
++    const { rerender } = renderHook(
++      ({ account }: { account?: string }) => useAeLimits(true, "conv_hint_b", account),
++      { wrapper: QueryWrapper, initialProps: {} as { account?: string } },
++    );
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(1));
++    rerender({ account: "Backup" });
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
++      "/v1/ae/limits?session_id=conv_hint_b",
++      "/v1/ae/limits?session_id=conv_hint_b&account=Backup",
++    ]);
++  });
+ });
+ 
+ describe("AeLimitsHarnessBlock account", () => {
+diff --git a/web/src/components/AePlanLimits.tsx b/web/src/components/AePlanLimits.tsx
+index c9aee35e678dd8227b20c881623d0fee146d2607..2512b8550c1b01e317cd0d740b835ece96c01aa1 100644
+--- a/web/src/components/AePlanLimits.tsx
++++ b/web/src/components/AePlanLimits.tsx
+@@ -17,6 +17,7 @@
+ import { useQuery } from "@tanstack/react-query";
+ import { type ReactNode, useEffect, useId, useMemo, useRef, useState } from "react";
+ import { Popover, PopoverAnchor, PopoverContent } from "@/components/ui/popover";
++import { useAePickedClaudeAccount } from "@/hooks/useAePickedClaudeAccount";
+ import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+ import { type AeTone, contextTone } from "@/lib/aeContextTone";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
+@@ -177,16 +178,40 @@ export function limitTone(pct: number): AeTone {
+   return "normal";
+ }
+ 
+-/** With a session id the server answers for the account that session runs on. */
+-export async function fetchAeLimits(sessionId?: string | null): Promise<AeLimitsAnswer> {
+-  const path = sessionId
+-    ? `${AE_LIMITS_PATH}?session_id=${encodeURIComponent(sessionId)}`
+-    : AE_LIMITS_PATH;
++/**
++ * With a session id the server answers for the account that session runs on.
++ * `account` is the login picked for new chats (`""` for the default login): the
++ * server uses it for a chat it has no reading for yet, and ignores it once the
++ * chat has one.
++ */
++export async function fetchAeLimits(
++  sessionId?: string | null,
++  account?: string | null,
++): Promise<AeLimitsAnswer> {
++  const params: string[] = [];
++  if (sessionId) params.push(`session_id=${encodeURIComponent(sessionId)}`);
++  if (account != null) params.push(`account=${encodeURIComponent(account)}`);
++  const path = params.length ? `${AE_LIMITS_PATH}?${params.join("&")}` : AE_LIMITS_PATH;
+   const res = await authenticatedFetch(path, { method: "GET" });
+   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`.trim());
+   return (await res.json()) as AeLimitsAnswer;
+ }
+ 
++/** The first account hint seen per session: a later pick changes new chats, not this one. */
++const frozenAccounts = new Map<string, string>();
++const FROZEN_ACCOUNTS_KEEP = 200;
++
++function freezeAccount(sessionId: string | null | undefined, account: string | undefined) {
++  if (!sessionId) return account;
++  const held = frozenAccounts.get(sessionId);
++  if (held !== undefined || account === undefined) return held;
++  frozenAccounts.set(sessionId, account);
++  if (frozenAccounts.size > FROZEN_ACCOUNTS_KEEP) {
++    frozenAccounts.delete(frozenAccounts.keys().next().value as string);
++  }
++  return account;
++}
++
+ /**
+  * The reset as a row shows it: a countdown within a day ("Resets in 21m"),
+  * else the weekday and time ("Resets Wed 4:00 AM"), past a week the date.
+@@ -1071,19 +1096,22 @@ export function AePlanLimitsPanel({
+ /**
+  * `GET /v1/ae/limits` while `active`, then once a minute; one shared query per
+  * session. Sessions on different Claude accounts never share a reading, so the
+- * session id is part of the cache key.
++ * session id is part of the cache key, and so is the account hint (the login
++ * picked for new chats, frozen at the first one seen for that session).
+  */
+ export function useAeLimits(
+   active: boolean,
+   sessionId?: string | null,
++  account?: string,
+ ): {
+   data?: AeLimitsAnswer;
+   error?: unknown;
+   loading: boolean;
+ } {
++  const named = freezeAccount(sessionId, account);
+   const query = useQuery({
+-    queryKey: ["ae-limits", sessionId ?? null],
+-    queryFn: () => fetchAeLimits(sessionId),
++    queryKey: ["ae-limits", sessionId ?? null, named ?? null],
++    queryFn: () => fetchAeLimits(sessionId, named),
+     enabled: active,
+     refetchInterval: active ? MINUTE : false,
+     staleTime: MINUTE / 2,
+@@ -1212,7 +1240,8 @@ function AePlanLimitsPopoverBody({
+   onShowRail: () => void;
+ }) {
+   const identity = aeContextIdentity(harness, model);
+-  const { data, error, loading } = useAeLimits(true, conversationId);
++  const picked = useAePickedClaudeAccount(conversationId, isClaudeCode(harness));
++  const { data, error, loading } = useAeLimits(picked.ready, conversationId, picked.account);
+   const sessions = useAeSessionContexts(true, conversationId, 60_000, identity);
+   // A cached category snapshot shows at once; a stale one refreshes.
+   const snapshot = useAeContextSnapshot(conversationId, {
+diff --git a/web/src/components/aeRail/AeRailUsage.test.tsx b/web/src/components/aeRail/AeRailUsage.test.tsx
+index 1c894df7891713c0586907a417061aa21c006e00..d2aa87de65b116164755da42d471615f11f287ef 100644
+--- a/web/src/components/aeRail/AeRailUsage.test.tsx
++++ b/web/src/components/aeRail/AeRailUsage.test.tsx
+@@ -5,6 +5,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+ 
++// The picked-account lookup reads the session and the host's logins; its own suite covers it.
++const picked = vi.hoisted(() => ({
++  value: { account: undefined as string | undefined, ready: true },
++}));
++vi.mock("@/hooks/useAePickedClaudeAccount", () => ({
++  useAePickedClaudeAccount: () => picked.value,
++}));
++
+ import { authenticatedFetch } from "@/lib/identity";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
+ import { useChatStore } from "@/store/chatStore";
+@@ -86,6 +94,7 @@ beforeEach(() => {
+ afterEach(() => {
+   cleanup();
+   useChatStore.setState({ sessionHarness: null });
++  picked.value = { account: undefined, ready: true };
+ });
+ 
+ describe("usageSummary", () => {
+@@ -174,4 +183,28 @@ describe("AeRailUsage", () => {
+       "/v1/ae/limits?session_id=conv%20b",
+     ]);
+   });
++
++  it("sends the picked account for a chat that has no reading yet", async () => {
++    useChatStore.setState({ conversationId: "conv_new", sessionHarness: "claude-native" });
++    picked.value = { account: "shared:AE Backup", ready: true };
++    render(<AeRailUsage sessionId="conv_new" />);
++    await waitFor(() => expect(screen.getAllByTestId("ae-limits-harness")).toHaveLength(2));
++    expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => String(url))).toEqual([
++      "/v1/ae/limits?session_id=conv_new&account=shared%3AAE%20Backup",
++    ]);
++  });
++
++  it("waits for the host's logins before asking, so the default's numbers never flash", async () => {
++    useChatStore.setState({ conversationId: "conv_wait", sessionHarness: "claude-native" });
++    picked.value = { account: undefined, ready: false };
++    const view = render(<AeRailUsage sessionId="conv_wait" />);
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++    picked.value = { account: "", ready: true };
++    view.rerender(<AeRailUsage sessionId="conv_wait" />);
++    await waitFor(() =>
++      expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => String(url))).toEqual([
++        "/v1/ae/limits?session_id=conv_wait&account=",
++      ]),
++    );
++  });
+ });
+diff --git a/web/src/components/aeRail/AeRailUsage.tsx b/web/src/components/aeRail/AeRailUsage.tsx
+index cfe513b2b80d350ff61e8a3504b8aa8a1419a837..d8bddbb39eb8e6cfca6da105e15bb0266b707cbd 100644
+--- a/web/src/components/aeRail/AeRailUsage.tsx
++++ b/web/src/components/aeRail/AeRailUsage.tsx
+@@ -1,6 +1,7 @@
+ // The rail's Usage section: both plans' limits, the session's own plan first
+ // and tagged, with the same rows as the usage popover.
+ 
++import { useAePickedClaudeAccount } from "@/hooks/useAePickedClaudeAccount";
+ import { type AeRailSectionProps, useAeRailSectionActive } from "@/lib/aeSessionRail";
+ import { useChatStore } from "@/store/chatStore";
+ import {
+@@ -46,7 +47,11 @@ export function AeRailUsage({ sessionId }: AeRailSectionProps) {
+   // The store's harness belongs to its own conversation; another session's is unknown here.
+   const harness = useChatStore((s) => (s.conversationId === sessionId ? s.sessionHarness : null));
+   const active = useAeRailSectionActive("usage");
+-  const { data, error, loading } = useAeLimits(active, sessionId);
++  const picked = useAePickedClaudeAccount(
++    sessionId,
++    active && aeLimitsHarnessFor(harness) === "claude",
++  );
++  const { data, error, loading } = useAeLimits(active && picked.ready, sessionId, picked.account);
+   const now = useAeRailNow(active);
+   const inUse = aeLimitsHarnessFor(harness);
+   const order: AeHarness[] = inUse === "codex" ? ["codex", "claude"] : ["claude", "codex"];
+diff --git a/web/src/hooks/useAeLimitGate.ts b/web/src/hooks/useAeLimitGate.ts
+index fd6b7f586e4f0d8bb6b07a06e99bc4524a91b9c3..8d9eaa20d985fa5b97b490ad7716e043fa7d728c 100644
+--- a/web/src/hooks/useAeLimitGate.ts
++++ b/web/src/hooks/useAeLimitGate.ts
+@@ -5,6 +5,7 @@
+ import { useState } from "react";
+ import { useAeLimits } from "@/components/AePlanLimits";
+ import { aeLimitsHarnessFor } from "@/components/aeSessionContext";
++import { useAePickedClaudeAccount } from "@/hooks/useAePickedClaudeAccount";
+ import { useDetectedCredentials } from "@/hooks/useHosts";
+ import { useSession } from "@/hooks/useSession";
+ import type { AeDockLimit } from "@/lib/aeActionDock";
+@@ -56,7 +57,12 @@ export function useAeLimitGate(sessionId: string | undefined): {
+   const harness = useChatStore((s) =>
+     sessionId && s.conversationId === sessionId ? aeLimitsHarnessFor(s.sessionHarness) : null,
+   );
+-  const { data } = useAeLimits(Boolean(sessionId && harness), sessionId);
++  const picked = useAePickedClaudeAccount(sessionId, harness === "claude");
++  const { data } = useAeLimits(
++    Boolean(sessionId && harness) && picked.ready,
++    sessionId,
++    picked.account,
++  );
+   const [dismissed, setDismissed] = useState(() => readDismissed() ?? []);
+   const gate = aeLimitGate(data, harness, Date.now(), dismissed);
+   const claude = gate?.harness === "claude";
+diff --git a/web/src/hooks/useAePickedClaudeAccount.test.tsx b/web/src/hooks/useAePickedClaudeAccount.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..92f183b361eacf439d2944f3407b7df7acb3edcb
+--- /dev/null
++++ b/web/src/hooks/useAePickedClaudeAccount.test.tsx
+@@ -0,0 +1,79 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import type { ReactNode } from "react";
++import { renderHook, waitFor } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({
++  session: { session: null as { hostId?: string } | null, isLoading: false },
++  credentials: { data: undefined as unknown, isSuccess: false, isError: false, isFetching: false },
++}));
++vi.mock("@/hooks/useSession", () => ({ useSession: () => mocks.session }));
++vi.mock("@/hooks/useHosts", () => ({ useDetectedCredentials: () => mocks.credentials }));
++
++import { useAePickedClaudeAccount } from "./useAePickedClaudeAccount";
++
++const wrapper = ({ children }: { children: ReactNode }) => (
++  <QueryClientProvider client={new QueryClient()}>{children}</QueryClientProvider>
++);
++
++beforeEach(() => {
++  mocks.session = { session: { hostId: "h1" }, isLoading: false };
++  mocks.credentials = { data: undefined, isSuccess: false, isError: false, isFetching: false };
++});
++
++describe("useAePickedClaudeAccount", () => {
++  it("is ready with no account when it is off", () => {
++    const { result } = renderHook(() => useAePickedClaudeAccount("conv_a", false), { wrapper });
++    expect(result.current).toEqual({ account: undefined, ready: true });
++  });
++
++  it("waits for the host's logins, then names the selected one", async () => {
++    const { result, rerender } = renderHook(() => useAePickedClaudeAccount("conv_a", true), {
++      wrapper,
++    });
++    expect(result.current).toEqual({ account: undefined, ready: false });
++    mocks.credentials = {
++      data: [
++        { family: "claude-oauth", source: "Default CLI account", env_var: "" },
++        { family: "claude-oauth-active", source: "AE Backup", env_var: "shared:AE Backup" },
++      ],
++      isSuccess: true,
++      isError: false,
++      isFetching: false,
++    };
++    rerender();
++    await waitFor(() =>
++      expect(result.current).toEqual({ account: "shared:AE Backup", ready: true }),
++    );
++  });
++
++  it("is ready without a hint when the logins cannot be read or the host is unknown", () => {
++    mocks.credentials = { data: undefined, isSuccess: false, isError: true, isFetching: false };
++    const failed = renderHook(() => useAePickedClaudeAccount("conv_a", true), { wrapper });
++    expect(failed.result.current).toEqual({ account: undefined, ready: true });
++    mocks.session = { session: null, isLoading: false };
++    const noHost = renderHook(() => useAePickedClaudeAccount("conv_a", true), { wrapper });
++    expect(noHost.result.current).toEqual({ account: undefined, ready: true });
++  });
++
++  it("does not name a pick from stale cached logins while a refetch is in flight", () => {
++    mocks.credentials = {
++      data: [{ family: "claude-oauth-active", source: "AE Backup", env_var: "AE Backup" }],
++      isSuccess: true,
++      isError: false,
++      isFetching: true,
++    };
++    const { result, rerender } = renderHook(() => useAePickedClaudeAccount("conv_a", true), {
++      wrapper,
++    });
++    expect(result.current).toEqual({ account: undefined, ready: false });
++    mocks.credentials = {
++      data: [{ family: "claude-oauth-active", source: "Default CLI account", env_var: "" }],
++      isSuccess: true,
++      isError: false,
++      isFetching: false,
++    };
++    rerender();
++    expect(result.current).toEqual({ account: "", ready: true });
++  });
++});
+diff --git a/web/src/hooks/useAePickedClaudeAccount.ts b/web/src/hooks/useAePickedClaudeAccount.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e12095a15456b5ba2b1d120f5bb8099ef34164d1
+--- /dev/null
++++ b/web/src/hooks/useAePickedClaudeAccount.ts
+@@ -0,0 +1,34 @@
++// The Claude login the account picker has selected for new chats, as the usage
++// panels send it to `GET /v1/ae/limits?account=`: a chat that has not replied
++// yet has no reading of its own, and the server answers it for this account
++// rather than with the host's reading of another one. omnigent-ae, 2026-10-26.
++
++import { useDetectedCredentials } from "@/hooks/useHosts";
++import { useSession } from "@/hooks/useSession";
++import { aePickedClaudeAccount } from "@/lib/aeLimitGate";
++
++/**
++ * @param sessionId - The chat the usage panel is for; its host is asked.
++ * @param enabled - Only a Claude chat has an account to name.
++ * @returns `account` is `""` for the default login and `undefined` when none
++ *   can be named; `ready` is false until the host's logins have answered (or
++ *   failed to), so a panel waits for them instead of showing the default
++ *   login's numbers first.
++ */
++export function useAePickedClaudeAccount(
++  sessionId: string | null | undefined,
++  enabled: boolean,
++): { account: string | undefined; ready: boolean } {
++  const on = enabled && Boolean(sessionId);
++  const { session, isLoading } = useSession(on ? sessionId : null);
++  const credentials = useDetectedCredentials(session?.hostId, on);
++  if (!on) return { account: undefined, ready: true };
++  const hostKnown = Boolean(session?.hostId);
++  // Cached logins from before a pick are stale while a refetch is in flight: wait it out,
++  // or the session's first hint (frozen for good) would be the previous pick.
++  const settled = (credentials.isSuccess || credentials.isError) && !credentials.isFetching;
++  return {
++    account: credentials.data && settled ? aePickedClaudeAccount(credentials.data) : undefined,
++    ready: !isLoading && (!hostKnown || settled),
++  };
++}
+diff --git a/web/src/lib/aeLimitGate.test.ts b/web/src/lib/aeLimitGate.test.ts
+index 73d973351ea0674f0ae5c2681ac9d01a3e74d253..29a8ddc0fc3f92aeefaf06c9f17ebb24b2b25ac9 100644
+--- a/web/src/lib/aeLimitGate.test.ts
++++ b/web/src/lib/aeLimitGate.test.ts
+@@ -3,6 +3,7 @@ import type { AeLimitWindow, AeLimitsAnswer } from "@/components/AePlanLimits";
+ import {
+   AE_LIMIT_GATE_PERCENT,
+   aeHasOtherClaudeAccount,
++  aePickedClaudeAccount,
+   aeHeadlineWindows,
+   aeLimitGate,
+   aeLimitGateShort,
+@@ -205,3 +206,25 @@ describe("aeHasOtherClaudeAccount", () => {
+     expect(aeHasOtherClaudeAccount([], undefined)).toBe(false);
+   });
+ });
++
++describe("aePickedClaudeAccount", () => {
++  const login = (family: string, env_var: string | null) => ({ family, source: "x", env_var });
++
++  it("names the selected login, empty for the default", () => {
++    expect(
++      aePickedClaudeAccount([
++        login("claude-oauth", ""),
++        login("claude-oauth-active", "shared:AE Backup"),
++      ]),
++    ).toBe("shared:AE Backup");
++    expect(aePickedClaudeAccount([login("claude-oauth-active", null)])).toBe("");
++    expect(aePickedClaudeAccount([login("claude-oauth", "")])).toBe("");
++  });
++
++  it("names nothing without a Claude login or on a provider gateway", () => {
++    expect(aePickedClaudeAccount([])).toBeUndefined();
++    expect(
++      aePickedClaudeAccount([login("claude-provider", null), login("claude-oauth-active", "A")]),
++    ).toBeUndefined();
++  });
++});
+diff --git a/web/src/lib/aeLimitGate.ts b/web/src/lib/aeLimitGate.ts
+index b00c2a9a21be8a076e9b359e23e0ab2f297c737e..d22364b1db1489ce4eb95c48c8acf6c1bf5c3137 100644
+--- a/web/src/lib/aeLimitGate.ts
++++ b/web/src/lib/aeLimitGate.ts
+@@ -209,3 +209,16 @@ export function aeHasOtherClaudeAccount(
+   const current = currentAccount ?? active?.env_var ?? "";
+   return logins.some((row) => (row.env_var ?? "") !== current);
+ }
++
++/**
++ * The Claude login new chats start on: the host's selected row (`""` is the
++ * default login), as the account picker shows it. `undefined` when the host
++ * lists no Claude login or the chat runs on a provider gateway, where no login
++ * names the chat's account.
++ */
++export function aePickedClaudeAccount(rows: readonly AeLimitCredentialRow[]): string | undefined {
++  if (rows.some((row) => row.family.startsWith("claude-provider"))) return undefined;
++  const logins = rows.filter((row) => row.family.startsWith("claude-oauth"));
++  if (logins.length === 0) return undefined;
++  return logins.find((row) => row.family === "claude-oauth-active")?.env_var ?? "";
++}

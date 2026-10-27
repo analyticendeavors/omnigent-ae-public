@@ -67,14 +67,14 @@ Each agent on the rail's Agents card and in the Agents tab shows its role, its m
 **Where:** The Agents card in the session rail, and the Agents tab.<br>
 **Built from:** core patches [`0172`](../../patches/0172-ae-patch-Show-each-agent-s-role-model-effort-and-tok.patch), [`0173`](../../patches/0173-ae-patch-Show-each-agent-s-spend-as-estimated-cost-w.patch)
 
-## Spend in tokens or cost
+## Spend in tokens, cost or both
 
-<p align="center"><img src="../media/settings-spend-shows.jpg" alt="Spend in tokens or cost"></p>
+<p align="center"><img src="../media/settings-spend-shows.jpg" alt="Spend in tokens, cost or both"></p>
 
-Settings > Chat's "Spend shows" picks what every spend figure shows: Tokens (new input plus output, the default, which suits a subscription account), Cost (an estimate at API prices) or Off. Claude sessions report real token counts, read from their transcripts, so they no longer read as zero.
+Settings > Chat's "Spend shows" picks what every spend figure shows: Tokens (new input plus output, the default, which suits a subscription account), Cost (an estimate at API prices), Both ("1.98M tok · $9.80") or Off. Under Both, a cost that leaves out a session with no cost, such as a subscription one, ends in "+". Claude sessions report real token counts, read from their transcripts, so they no longer read as zero.
 
 **Where:** Settings > Chat > Spend shows.<br>
-**Built from:** core patch [`0179`](../../patches/0179-ae-patch-Add-a-Spend-shows-setting-tokens-cost-or-of.patch)
+**Built from:** core patches [`0179`](../../patches/0179-ae-patch-Add-a-Spend-shows-setting-tokens-cost-or-of.patch), [`0192`](../../patches/0192-ae-patch-Add-Both-to-Settings-Chat-Spend-shows-token.patch)
 
 ---
 

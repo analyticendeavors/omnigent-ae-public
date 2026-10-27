@@ -550,3 +550,54 @@ def test_a_session_lead_takes_the_parents_harness_with_its_model() -> None:
     assert (resolve("codex").model, resolve("codex").effort) == ("gpt-5.5", "medium")
     out = resolve("claude")
     assert (out.harness, out.model, out.effort) == ("claude", None, None)
+
+
+_ULTRA_CODEX = {
+    "mode": "agent",
+    "agent": "x",
+    "agent_name": role_prefs.CODEX_AGENT_NAME,
+    "name": "Codex",
+    "model": "gpt-6-sol",
+    "effort": "ultra",
+}
+
+
+async def test_a_codex_reviewer_on_ultra_starts_at_ultra(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    _use(monkeypatch, _preset(reviewer={"mode": "multi", "reviewers": [_ULTRA_CODEX]}))
+    response = await _start(client, role="reviewer", key="codex-ultra")
+    assert response.status_code == 200, response.text
+    create = _create(app)
+    assert create["agent_id"] == "ag_codex"
+    assert (create["model_override"], create["reasoning_effort"]) == ("gpt-6-sol", "ultra")
+    assert response.json()["effort"] == "ultra"
+
+
+async def test_ultra_asked_for_by_name_is_for_codex_only(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    _use(monkeypatch, _preset())
+    refused = await _start(client, role="builder", effort="ultra")
+    assert refused.status_code == 422
+    assert "Codex" in refused.text
+    assert not app.calls, "nothing started"
+    _use(monkeypatch, _preset(reviewer={"mode": "multi", "reviewers": [_ULTRA_CODEX]}))
+    accepted = await _start(client, role="reviewer", effort="ultra", key="codex-named")
+    assert accepted.status_code == 200, accepted.text
+    assert _create(app)["reasoning_effort"] == "ultra"
+
+
+def test_the_tool_schemas_offer_ultra_and_the_ladder_ranks_it_last() -> None:
+    from ae_omni_policies import escalation, mcp
+
+    schemas = [t for t in mcp.TOOLS if "effort" in (t.inputSchema.get("properties") or {})]
+    assert schemas
+    for tool in schemas:
+        assert "ultra" in tool.inputSchema["properties"]["effort"]["enum"], tool.name
+    assert escalation.EFFORTS[-1] == "ultra"
+    assert escalation.classify("gpt-6-sol", "max", "gpt-6-sol", "ultra") == "raise"

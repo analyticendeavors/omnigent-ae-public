@@ -13,7 +13,7 @@ A preset decides which model and effort each role in a chat runs on, so the lead
 </tr>
 </table>
 
-- [Roles presets](roles-presets.md): Presets in Settings > Roles, The lead reads its preset every turn, Pick a preset per chat, Start a new chat on a preset, Who works on this, Independent reviewers, one verdict, Rules for model changes and helpers, Model changes you can undo, Families of sessions, A family at a glance, Preset insights
+- [Roles presets](roles-presets.md): Presets in Settings > Roles, Newer models offered, never applied, The lead reads its preset every turn, Pick a preset per chat, Start a new chat on a preset, Who works on this, Independent reviewers, one verdict, Rules for model changes and helpers, Model changes you can undo, Families of sessions, A family at a glance, Preset insights
 
 ## Triage and policies
 
@@ -77,7 +77,7 @@ Long sessions spend their time on background agents and pull requests. The fork 
 </tr>
 </table>
 
-- [Background agents](background-agents.md): An Agents pane like Claude Desktop's, The model each agent ran on, Running until the lead records its return, Failed helpers, Waiting on agents, Closed helpers stop counting, Role, model, effort and spend per agent, Spend in tokens or cost
+- [Background agents](background-agents.md): An Agents pane like Claude Desktop's, The model each agent ran on, Running until the lead records its return, Failed helpers, Waiting on agents, Closed helpers stop counting, Role, model, effort and spend per agent, Spend in tokens, cost or both
 - [Pull requests](pull-requests.md): One-line receipt, The opened receipt, Hover preview on links, Merged pull requests fold, Update branch, Compliance review, Recommended merge method and Mark session done
 
 ## Accounts and admin

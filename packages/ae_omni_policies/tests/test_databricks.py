@@ -24,6 +24,13 @@ import respx
 
 from ae_omni_policies import auth, databricks
 
+# A credit for the tests that need one; the server has no built-in credit.
+CREDIT_ENV = {
+    "AE_DATABRICKS_CREDIT_USD": "500",
+    "AE_DATABRICKS_CREDIT_CADENCE": "once",
+    "AE_DATABRICKS_CREDIT_START": "2030-01-01",
+    "AE_DATABRICKS_CREDIT_END": "2030-12-31",
+}
 HOST = "https://dbc-test0000-abcd.cloud.databricks.com"
 CLIENT_ID = "0f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b"
 # '+', '/' and '=' so the percent-encoded spellings differ from the raw one.
@@ -65,6 +72,8 @@ def _databricks_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Iterator
         if key.startswith("AE_DATABRICKS_"):
             monkeypatch.delenv(key)
     monkeypatch.setenv("AE_DATABRICKS_STATE_FILE", str(tmp_path / "ae-databricks.json"))
+    for key, value in CREDIT_ENV.items():
+        monkeypatch.setenv(key, value)
     monkeypatch.setattr(databricks, "POLL_INTERVAL_S", 0)
     databricks.reset()
     yield
@@ -207,33 +216,86 @@ def test_configuration_needs_a_good_host_and_both_secrets() -> None:
     assert databricks.not_configured_note({}) == databricks.HOW_TO_ENABLE
 
 
-def test_credit_settings_read_and_fall_back_to_their_defaults() -> None:
-    default = databricks.credit({})
-    assert default == databricks.Credit(200.0, "once", date(2026, 8, 19), date(2027, 8, 19))
+def test_credit_settings_read_and_a_bad_value_means_no_credit() -> None:
+    full = databricks.credit(CREDIT_ENV)
+    assert full == databricks.Credit(500.0, "once", date(2030, 1, 1), date(2030, 12, 31))
     custom = databricks.credit(
         {
             "AE_DATABRICKS_CREDIT_USD": "150",
             "AE_DATABRICKS_CREDIT_CADENCE": "Monthly",
-            "AE_DATABRICKS_CREDIT_START": "2026-09-01",
-            "AE_DATABRICKS_CREDIT_END": "2027-09-01",
+            "AE_DATABRICKS_CREDIT_START": "2030-02-01",
+            "AE_DATABRICKS_CREDIT_END": "2031-02-01",
         }
     )
-    assert (custom.usd, custom.cadence, custom.start.isoformat(), custom.end.isoformat()) == (
-        150.0,
-        "monthly",
-        "2026-09-01",
-        "2027-09-01",
+    assert custom == databricks.Credit(150.0, "monthly", date(2030, 2, 1), date(2031, 2, 1))
+    # An unreadable cadence alone falls back to once; the credit stays.
+    assert databricks.credit({**CREDIT_ENV, "AE_DATABRICKS_CREDIT_CADENCE": "weekly"}) == full
+    # Any other unreadable or missing value leaves no credit at all.
+    none = databricks.Credit(None, "once", None, None)
+    for bad in (
+        {"AE_DATABRICKS_CREDIT_USD": "-5"},
+        {"AE_DATABRICKS_CREDIT_USD": "0"},
+        {"AE_DATABRICKS_CREDIT_USD": "nan"},
+        {"AE_DATABRICKS_CREDIT_USD": ""},
+        {"AE_DATABRICKS_CREDIT_START": "soon"},
+        {"AE_DATABRICKS_CREDIT_END": ""},
+    ):
+        assert databricks.credit({**CREDIT_ENV, **bad}) == none, bad
+
+
+def test_with_no_credit_vars_there_is_no_credit_and_no_error() -> None:
+    assert databricks.credit({}) == databricks.Credit(None, "once", None, None)
+    spend = databricks.spend_view(databricks.credit({}))
+    assert (spend["creditUsd"], spend["creditStart"], spend["creditEnd"]) == (None, None, None)
+    assert spend["status"] == "never"
+
+
+def test_with_no_credit_the_spend_window_starts_on_the_months_first_day(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(databricks, "_now", lambda: datetime(2026, 10, 19, 12, 0, tzinfo=UTC))
+    assert databricks.credit({}).since == date(2026, 10, 1)
+    assert databricks.credit(CREDIT_ENV).since == date(2030, 1, 1)
+
+
+def test_a_credit_that_starts_after_it_ends_is_no_credit() -> None:
+    backwards = {
+        **CREDIT_ENV,
+        "AE_DATABRICKS_CREDIT_START": "2030-12-31",
+        "AE_DATABRICKS_CREDIT_END": "2030-01-01",
+    }
+    assert databricks.credit(backwards) == databricks.Credit(None, "once", None, None)
+
+
+def test_switching_from_a_credit_to_none_keeps_the_months_reading(tmp_path: Path) -> None:
+    _seed(
+        tmp_path / "ae-databricks.json",
+        status="ok",
+        monthUsd=3.5,
+        totalUsd=9.0,
+        readAt="2026-10-18T08:00:00Z",
+        creditStart="2030-01-01",
     )
-    odd = databricks.credit(
-        {
-            "AE_DATABRICKS_CREDIT_USD": "-5",
-            "AE_DATABRICKS_CREDIT_CADENCE": "weekly",
-            "AE_DATABRICKS_CREDIT_START": "soon",
-            "AE_DATABRICKS_CREDIT_END": "",
-        }
-    )
-    assert odd == default
-    assert databricks.credit({"AE_DATABRICKS_CREDIT_USD": "nan"}).usd == 200.0
+    spend = databricks.spend_view(databricks.credit({}))
+    assert (spend["monthUsd"], spend["totalUsd"]) == (3.5, None)
+    assert spend["readAt"] == "2026-10-18T08:00:00Z"
+
+
+def test_a_partial_credit_config_warns_once_naming_variables_only(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING)
+    partial = {"AE_DATABRICKS_CREDIT_USD": "123456", "AE_DATABRICKS_CREDIT_START": "2030-01-01"}
+    databricks.credit(partial)
+    databricks.credit(partial)
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "AE_DATABRICKS_CREDIT_END" in warnings[0].getMessage()
+    assert "123456" not in caplog.text and "2030-01-01" not in caplog.text
+    caplog.clear()
+    databricks.credit({})
+    databricks.credit(CREDIT_ENV)
+    assert not caplog.records
 
 
 def test_secrets_are_scrubbed_in_encoded_forms_and_with_tokens_held() -> None:
@@ -276,10 +338,10 @@ async def test_none_configured_says_how_to_turn_it_on(client: httpx.AsyncClient)
         "asOf": None,
         "monthUsd": None,
         "totalUsd": None,
-        "creditUsd": 200.0,
+        "creditUsd": 500.0,
         "cadence": "once",
-        "creditStart": "2026-08-19",
-        "creditEnd": "2027-08-19",
+        "creditStart": "2030-01-01",
+        "creditEnd": "2030-12-31",
         "warehouseId": None,
         "products": None,
         "days": None,
@@ -951,7 +1013,7 @@ async def test_refresh_reads_in_the_background_and_polls_to_the_end(
     assert body == {
         "warehouse_id": WID,
         "statement": databricks.SPEND_SQL,
-        "parameters": [{"name": "credit_start", "value": "2026-08-19", "type": "DATE"}],
+        "parameters": [{"name": "credit_start", "value": "2030-01-01", "type": "DATE"}],
         "wait_timeout": "30s",
         "on_wait_timeout": "CONTINUE",
         "format": "JSON_ARRAY",
@@ -1074,7 +1136,7 @@ async def test_a_failed_reading_keeps_the_last_numbers_and_names_no_secret(
         monthUsd=3.5,
         totalUsd=9.0,
         warehouseId=WID,
-        creditStart="2026-08-19",
+        creditStart="2030-01-01",
     )
     with respx.mock(assert_all_called=False) as mock:
         _mock(mock, _warehouse("STOPPED"))
@@ -1113,10 +1175,10 @@ async def test_a_reading_past_its_deadline_is_cancelled(
         return httpx.Response(200, json=_statement("RUNNING"))
 
     await databricks._read_spend(
-        ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+        ws, databricks.credit(CREDIT_ENV), WID, transport=httpx.MockTransport(handler)
     )
     assert f"POST /api/2.0/sql/statements/{STATEMENT_ID}/cancel" in seen
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert spend["status"] == "error"
     assert "did not finish within" in spend["message"]
     assert "was cancelled" in spend["message"]
@@ -1168,10 +1230,10 @@ async def test_a_statement_left_running_is_cancelled_on_any_exit(
     ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
     seen: list[str] = []
     await databricks._read_spend(
-        ws, databricks.credit({}), WID, transport=_statement_handler(poll, seen)
+        ws, databricks.credit(CREDIT_ENV), WID, transport=_statement_handler(poll, seen)
     )
     assert (CANCEL in seen) is cancels
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert spend["status"] == status
     _clean(json.dumps(spend), caplog.text)
 
@@ -1198,7 +1260,7 @@ async def test_a_reading_cancelled_mid_poll_cancels_the_statement_and_records_it
 
     task = asyncio.create_task(
         databricks._read_spend(
-            ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+            ws, databricks.credit(CREDIT_ENV), WID, transport=httpx.MockTransport(handler)
         )
     )
     await polling.wait()
@@ -1206,7 +1268,7 @@ async def test_a_reading_cancelled_mid_poll_cancels_the_statement_and_records_it
     with pytest.raises(asyncio.CancelledError):
         await task
     assert CANCEL in seen
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert spend["status"] == "error"
     assert "stopped before it finished" in spend["message"]
     saved = json.loads((tmp_path / "ae-databricks.json").read_text(encoding="utf-8"))
@@ -1290,7 +1352,7 @@ async def test_the_reading_survives_a_restart_through_the_state_file(
     saved = json.loads((tmp_path / "ae-databricks.json").read_text(encoding="utf-8"))
     assert saved["status"] == "ok"
     assert (saved["monthUsd"], saved["totalUsd"]) == (12.5, 40.25)
-    assert saved["creditStart"] == "2026-08-19"
+    assert saved["creditStart"] == "2030-01-01"
     assert saved["warehouseId"] == WID
     assert list(tmp_path.glob(".ae-databricks-*")) == []  # no temp file left behind
     # A restart: memory gone, the file read back, nothing asked of Databricks.
@@ -1312,11 +1374,11 @@ def test_an_unreadable_or_odd_state_file_reads_as_never(
 ) -> None:
     path = tmp_path / "ae-databricks.json"
     path.write_text("{not json", encoding="utf-8")
-    assert databricks.spend_view(databricks.credit({}))["status"] == "never"
+    assert databricks.spend_view(databricks.credit(CREDIT_ENV))["status"] == "never"
     assert "ignoring unreadable" in caplog.text
     databricks.reset()
     _seed(path, status="reading", monthUsd="lots", warehouseId="../etc", readAt="yesterday")
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert (spend["status"], spend["monthUsd"], spend["warehouseId"], spend["readAt"]) == (
         "never",
         None,
@@ -1334,13 +1396,13 @@ def test_totals_from_another_credit_start_are_not_shown(
         monthUsd=3.5,
         totalUsd=9.0,
         readAt="2026-10-18T08:00:00Z",
-        creditStart="2026-08-19",
+        creditStart="2030-01-01",
     )
-    assert databricks.spend_view(databricks.credit({}))["totalUsd"] == 9.0
-    moved = databricks.credit({"AE_DATABRICKS_CREDIT_START": "2026-10-01"})
+    assert databricks.spend_view(databricks.credit(CREDIT_ENV))["totalUsd"] == 9.0
+    moved = databricks.credit({**CREDIT_ENV, "AE_DATABRICKS_CREDIT_START": "2030-06-01"})
     spend = databricks.spend_view(moved)
     assert (spend["monthUsd"], spend["totalUsd"], spend["readAt"]) == (None, None, None)
-    assert spend["creditStart"] == "2026-10-01"
+    assert spend["creditStart"] == "2030-06-01"
 
 
 async def test_the_shared_transport_is_reused_across_calls() -> None:
@@ -1398,7 +1460,7 @@ async def test_the_breakdown_rides_the_reading_and_is_parsed(
     assert second["statement"] == databricks.BREAKDOWN_SQL
     assert second["warehouse_id"] == WID
     assert second["parameters"] == [
-        {"name": "credit_start", "value": "2026-08-19", "type": "DATE"},
+        {"name": "credit_start", "value": "2030-01-01", "type": "DATE"},
         {"name": "since", "value": _days_back(20), "type": "DATE"},
     ]
     spend = after.json()["spend"]
@@ -1451,7 +1513,7 @@ async def test_no_spend_rows_is_an_empty_breakdown_of_zero_days(
         ),
         (httpx.Response(500, json={"message": ECHO}), "answered 500"),
         (httpx.Response(200, json=_breakdown(["region", "us-west-2", "1"])), "expected shape"),
-        (httpx.Response(200, json=_breakdown(["day", "2026-10-01", "lots"])), "expected shape"),
+        (httpx.Response(200, json=_breakdown(["day", "2030-06-01", "lots"])), "expected shape"),
         (RuntimeError(ECHO), "(RuntimeError)"),
     ],
 )
@@ -1470,9 +1532,9 @@ async def test_a_failed_breakdown_keeps_the_totals_and_carries_a_note(
         status="ok",
         monthUsd=3.5,
         totalUsd=9.0,
-        creditStart="2026-08-19",
+        creditStart="2030-01-01",
         products=[{"product": "SQL", "usd": 3.5}],
-        days=[{"date": "2026-10-01", "usd": 3.5}],
+        days=[{"date": "2030-06-01", "usd": 3.5}],
     )
     with respx.mock(assert_all_called=False) as mock:
         _mock(mock, _warehouse("RUNNING"))
@@ -1505,7 +1567,7 @@ async def test_failed_totals_run_no_breakdown_and_keep_the_last_one(
         status="ok",
         monthUsd=3.5,
         totalUsd=9.0,
-        creditStart="2026-08-19",
+        creditStart="2030-01-01",
         products=products,
     )
     with respx.mock(assert_all_called=False) as mock:
@@ -1569,10 +1631,10 @@ async def test_the_breakdown_shares_the_deadline_and_is_cancelled(
         return httpx.Response(200, json=_statement("RUNNING"))
 
     await databricks._read_spend(
-        ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+        ws, databricks.credit(CREDIT_ENV), WID, transport=httpx.MockTransport(handler)
     )
     assert seen.count(CANCEL) == 1
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert (spend["status"], spend["monthUsd"], spend["products"]) == ("ok", 12.5, None)
     assert "spend breakdown query did not finish within" in spend["note"]
     _clean(json.dumps(spend), caplog.text)
@@ -1599,7 +1661,7 @@ async def test_a_reading_cancelled_in_the_breakdown_saves_the_totals(tmp_path: P
 
     task = asyncio.create_task(
         databricks._read_spend(
-            ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+            ws, databricks.credit(CREDIT_ENV), WID, transport=httpx.MockTransport(handler)
         )
     )
     await polling.wait()
@@ -1653,13 +1715,13 @@ def test_an_odd_saved_breakdown_reads_as_none(tmp_path: Path) -> None:
         days=[{"date": "../etc", "usd": 1}],
         breakdownNote=7,
     )
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert (spend["products"], spend["days"], spend["note"]) == (None, None, None)
     databricks.reset()
     _seed(
-        tmp_path / "ae-databricks.json", status="ok", days=[{"date": "2026-10-01", "usd": 1}] * 22
+        tmp_path / "ae-databricks.json", status="ok", days=[{"date": "2030-06-01", "usd": 1}] * 22
     )
-    assert databricks.spend_view(databricks.credit({}))["days"] is None
+    assert databricks.spend_view(databricks.credit(CREDIT_ENV))["days"] is None
 
 
 async def test_a_credit_change_drops_the_breakdown(
@@ -1670,18 +1732,18 @@ async def test_a_credit_change_drops_the_breakdown(
         status="ok",
         monthUsd=3.5,
         totalUsd=9.0,
-        creditStart="2026-08-19",
+        creditStart="2030-01-01",
         products=[{"product": "SQL", "usd": 3.5}],
-        days=[{"date": "2026-10-01", "usd": 3.5}],
+        days=[{"date": "2030-06-01", "usd": 3.5}],
         breakdownNote="Breakdown unavailable: old. The totals are complete.",
     )
-    assert databricks.spend_view(databricks.credit({}))["products"] is not None
-    moved = databricks.credit({"AE_DATABRICKS_CREDIT_START": "2026-10-01"})
+    assert databricks.spend_view(databricks.credit(CREDIT_ENV))["products"] is not None
+    moved = databricks.credit({**CREDIT_ENV, "AE_DATABRICKS_CREDIT_START": "2030-06-01"})
     spend = databricks.spend_view(moved)
     assert (spend["products"], spend["days"], spend["note"]) == (None, None, None)
     # A reading under the new credit whose breakdown fails leaves none from the old one.
     _configure(monkeypatch)
-    monkeypatch.setenv("AE_DATABRICKS_CREDIT_START", "2026-10-01")
+    monkeypatch.setenv("AE_DATABRICKS_CREDIT_START", "2030-06-01")
     with respx.mock(assert_all_called=False) as mock:
         _mock(mock, _warehouse("RUNNING"))
         mock.post(STATEMENTS_URL).mock(
@@ -1692,7 +1754,7 @@ async def test_a_credit_change_drops_the_breakdown(
         await client.post("/v1/ae/databricks/spend/refresh", json={})
         await _settle()
     state = databricks._state()
-    assert (state["creditStart"], state["products"], state["days"]) == ("2026-10-01", None, None)
+    assert (state["creditStart"], state["products"], state["days"]) == ("2030-06-01", None, None)
 
 
 async def test_a_reading_out_of_time_posts_no_breakdown(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1710,10 +1772,10 @@ async def test_a_reading_out_of_time_posts_no_breakdown(monkeypatch: pytest.Monk
         return httpx.Response(200, json=_succeeded())
 
     await databricks._read_spend(
-        ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+        ws, databricks.credit(CREDIT_ENV), WID, transport=httpx.MockTransport(handler)
     )
     assert posted == [databricks.SPEND_SQL]
-    spend = databricks.spend_view(databricks.credit({}))
+    spend = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert (spend["status"], spend["monthUsd"], spend["products"]) == ("ok", 12.5, None)
     assert "was not started" in spend["note"]
 
@@ -1724,9 +1786,9 @@ async def test_new_totals_never_show_beside_the_last_readings_rows(tmp_path: Pat
         status="ok",
         monthUsd=1.0,
         totalUsd=1.0,
-        creditStart="2026-08-19",
+        creditStart="2030-01-01",
         products=[{"product": "SQL", "usd": 1.0}],
-        days=[{"date": "2026-10-01", "usd": 1.0}],
+        days=[{"date": "2030-06-01", "usd": 1.0}],
     )
     ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
     polling = asyncio.Event()
@@ -1745,16 +1807,16 @@ async def test_new_totals_never_show_beside_the_last_readings_rows(tmp_path: Pat
 
     task = asyncio.create_task(
         databricks._read_spend(
-            ws, databricks.credit({}), WID, transport=httpx.MockTransport(handler)
+            ws, databricks.credit(CREDIT_ENV), WID, transport=httpx.MockTransport(handler)
         )
     )
     await polling.wait()
     # Mid-breakdown: the new totals, no rows, and the totals already on disk.
-    during = databricks.spend_view(databricks.credit({}))
+    during = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert (during["monthUsd"], during["products"], during["days"]) == (100.0, None, None)
     saved = json.loads((tmp_path / "ae-databricks.json").read_text(encoding="utf-8"))
     assert (saved["monthUsd"], saved["products"]) == (100.0, None)
     release.set()
     await task
-    after = databricks.spend_view(databricks.credit({}))
+    after = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert after["products"] == [{"product": "SQL", "usd": 100.0}]

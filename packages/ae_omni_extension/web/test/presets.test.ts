@@ -6,6 +6,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { PresetRow, PresetsAnswer, PresetSuggestion } from "../src/api";
 import {
   activatePresets,
+  loadDismissed,
+  NEWER_HINT,
+  newerText,
+  pendingNewer,
   COST_NOTE,
   costDelta,
   DAYS_KEY,
@@ -130,6 +134,8 @@ const failed = (status: number, code: string, message: string): Reply => ({
   body: { error: { code, message } },
 });
 
+let newerReply: Reply = failed(404, "x", "no newer models here");
+
 function stubContext(replies: Reply[]) {
   const request = vi.fn(
     async ({ method, path }: { method: string; path: string }) => {
@@ -145,9 +151,11 @@ function stubContext(replies: Reply[]) {
     // The suggestion side reads are not counted: these tests count the presets route.
     server: {
       request: async (args: { method: string; path: string }) =>
-        args.path.startsWith("/v1/ae/preset-suggestions")
-          ? failed(404, "x", "no suggestions here")
-          : request(args),
+        args.path === "/v1/ae/roles/newer-models"
+          ? newerReply
+          : args.path.startsWith("/v1/ae/preset-suggestions")
+            ? failed(404, "x", "no suggestions here")
+            : request(args),
     },
     navigation: { openSession },
   } as unknown as ExtensionContext;
@@ -172,6 +180,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   vi.setSystemTime(NOW);
   window.localStorage.clear();
+  newerReply = failed(404, "x", "no newer models here");
   resetTiles();
 });
 
@@ -945,5 +954,89 @@ describe("suggestions", () => {
     const node = await mount(context);
     expect(node.querySelectorAll(".presets-row")).toHaveLength(2);
     expect(node.querySelector(".presets-suggestions")).toBeNull();
+  });
+});
+
+
+describe("the newer model notice", () => {
+  const opus = { model: "claude-opus-5-6", name: "Opus 5.6", from: ["Opus 5.5"], presets: 2 };
+  const sonnet = { model: "claude-sonnet-5-6", name: "Sonnet 5.6", from: ["Sonnet 5.5"], presets: 1 };
+  const newer = {
+    presets: [
+      { id: "a", title: "A", rows: [{ role: "Planner", newer: opus.model }] },
+      { id: "b", title: "B", rows: [{ role: "Planner", newer: opus.model }] },
+    ],
+    models: [opus],
+  };
+
+  it("shows the new model, the count and the hint above the card", async () => {
+    newerReply = ok(newer);
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const note = node.querySelector<HTMLElement>(".presets-nudge");
+    expect(note?.textContent).toContain(
+      "New model: Opus 5.6. 2 of your presets use Opus 5.5. Review in Settings > Roles.",
+    );
+    expect(note?.querySelector("b")).toBeNull();
+    expect((note?.title ?? "").length).toBeLessThanOrEqual(140);
+    expect(note?.title).toBe(NEWER_HINT);
+    expect(node.querySelector(".presets-body")?.firstElementChild).toBe(note);
+  });
+
+  it("paints the card first and adds the notice when the read returns", async () => {
+    let release: (reply: Reply) => void = () => undefined;
+    const late = new Promise<Reply>((resolve) => {
+      release = resolve;
+    });
+    const { context } = stubContext([ok(answer())]);
+    const inner = context.server.request.bind(context.server);
+    (context.server as { request: unknown }).request = async (
+      args: Parameters<typeof inner>[0],
+    ) => (args.path === "/v1/ae/roles/newer-models" ? late : inner(args));
+    const node = await mount(context);
+    expect(node.querySelector(".presets-body table, .presets-body .presets-table")).not.toBeNull();
+    expect(node.querySelector(".presets-nudge")).toBeNull();
+    release(ok(newer));
+    await flush();
+    expect(node.querySelector(".presets-nudge")).not.toBeNull();
+  });
+
+  it("names every new model in one sentence", () => {
+    const both = { presets: [...newer.presets, { id: "c", title: "C", rows: [{ role: "Builder", newer: sonnet.model }] }], models: [opus, sonnet] };
+    expect(newerText([opus, sonnet], both)).toBe(
+      "New models: Opus 5.6, Sonnet 5.6. 3 of your presets use Opus 5.5 or Sonnet 5.5.",
+    );
+    expect(newerText([sonnet], both)).toBe("New model: Sonnet 5.6. 1 of your presets uses Sonnet 5.5.");
+  });
+
+  it("stays away when the route fails or nothing is newer", async () => {
+    const { context } = stubContext([ok(answer())]);
+    expect((await mount(context)).querySelector(".presets-nudge")).toBeNull();
+    deactivatePresets();
+    document.getElementById("root")?.replaceChildren();
+    newerReply = ok({ presets: [], models: [] });
+    const second = stubContext([ok(answer())]);
+    expect((await mount(second.context)).querySelector(".presets-nudge")).toBeNull();
+  });
+
+  it("dismiss hides all of them and a newer one returns it", async () => {
+    newerReply = ok({ ...newer, models: [opus, sonnet] });
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    node.querySelector<HTMLButtonElement>(".presets-nudge-x")?.click();
+    expect(node.querySelector(".presets-nudge")).toBeNull();
+    expect(loadDismissed()).toEqual([opus.model, sonnet.model]);
+    const next = { model: "claude-opus-5-7", name: "Opus 5.7", from: ["Opus 5.5"], presets: 1 };
+    expect(pendingNewer({ presets: [], models: [opus, sonnet, next] }, loadDismissed())).toEqual([next]);
+  });
+
+  it("renders without storage", async () => {
+    newerReply = ok(newer);
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
+      throw new Error("blocked");
+    });
+    const { context } = stubContext([ok(answer())]);
+    expect((await mount(context)).querySelector(".presets-nudge")).not.toBeNull();
+    vi.restoreAllMocks();
   });
 });

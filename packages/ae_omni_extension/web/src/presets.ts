@@ -22,9 +22,12 @@ import {
   applySuggestion,
   describeError,
   dismissSuggestion,
+  fetchNewerModels,
   fetchPresets,
   fetchPresetSuggestions,
   openSuggestionIssue,
+  type NewerModel,
+  type NewerModelsAnswer,
   type PresetReview,
   type PresetRow,
   type PresetRun,
@@ -54,6 +57,85 @@ export const COST_NOTE =
 
 export const TOKENS_NOTE =
   "Tokens are input and output tokens, summed over the lead and its helpers; cache reads are not counted.";
+
+export const NEWER_KEY = "presets.newer.dismissed";
+export const NEWER_HINT =
+  "A newer model in the same family is in the catalog. Presets are never changed for you; open Settings > Roles to switch.";
+
+/** Model ids whose notice this viewer dismissed. Storage may be blocked; the notice still shows. */
+export function loadDismissed(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(window.localStorage.getItem(NEWER_KEY) ?? "[]");
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveDismissed(ids: string[]): void {
+  try {
+    window.localStorage.setItem(NEWER_KEY, JSON.stringify(ids.slice(-20)));
+  } catch {
+    // Not remembered; the notice returns on the next load.
+  }
+}
+
+/** Every newer model the viewer has not dismissed. */
+export function pendingNewer(
+  data: NewerModelsAnswer | null,
+  dismissed: readonly string[],
+): NewerModel[] {
+  return (data?.models ?? []).filter((m) => !dismissed.includes(m.model));
+}
+
+/** "New model: Opus 5.6. 2 of your presets use Opus 5.5." for one or several models. */
+export function newerText(models: readonly NewerModel[], data?: NewerModelsAnswer | null): string {
+  const names = models.map((m) => m.name).join(", ");
+  const from = [...new Set(models.flatMap((m) => m.from))];
+  const ids = new Set(models.map((m) => m.model));
+  const rows = data?.presets?.filter((p) => p.rows.some((r) => ids.has(r.newer)));
+  const count = rows ? rows.length : Math.max(...models.map((m) => m.presets));
+  const verb = count === 1 ? "uses" : "use";
+  const label = models.length === 1 ? "New model" : "New models";
+  return `${label}: ${names}. ${count} of your presets ${verb} ${from.join(" or ")}.`;
+}
+
+/** The slim notice at the top of the card; the Settings pointer is text, not a link. */
+function newerNotice(state: State): HTMLElement | null {
+  const models = pendingNewer(state.newer, loadDismissed());
+  if (!models.length) return null;
+  const names = models.map((m) => m.name).join(", ");
+  const dismiss = el("button", {
+    type: "button",
+    class: "presets-nudge-x",
+    "aria-label": `Dismiss the notice for ${names}`,
+    title: "Dismiss until the next new model",
+  });
+  dismiss.appendChild(closeIcon());
+  dismiss.addEventListener("click", () => {
+    saveDismissed([...loadDismissed(), ...models.map((m) => m.model)]);
+    paintNotice(state);
+  });
+  return el(
+    "div",
+    { class: "presets-nudge", role: "note", title: NEWER_HINT },
+    el(
+      "span",
+      { class: "presets-nudge-text" },
+      `${newerText(models, state.newer)} Review in Settings > Roles.`,
+    ),
+    dismiss,
+  );
+}
+
+/** Put the notice at the top of the card body, or take it away; the rest is left alone. */
+function paintNotice(state: State): void {
+  const body = state.body;
+  if (!body || state.adminOnly) return;
+  body.querySelector(".presets-nudge")?.remove();
+  const node = newerNotice(state);
+  if (node) body.prepend(node);
+}
 
 /** What the card shows for this viewer: the server sends their own setting. */
 export type Show = "cost" | "tokens" | "both";
@@ -229,6 +311,8 @@ interface State {
   answer: PresetsAnswer | null;
   error: unknown;
   adminOnly: boolean;
+  /** Newer models in the catalog (null until read, or when the read failed). */
+  newer: NewerModelsAnswer | null;
   /** Every user's suggestions (null until read, or when the read failed: the card still draws). */
   suggestions: PresetSuggestionsAnswer | null;
   /** Ids of the viewer's own suggestions, so "For <owner>" shows only on someone else's. */
@@ -238,6 +322,8 @@ interface State {
   /** The last failure per suggestion id, shown on its row. */
   rowErrors: Map<string, string>;
   redraw: () => void;
+  /** The card body, once drawn, for inserting the notice without a redraw. */
+  body: HTMLElement | null;
   /** Where the pop-up was opened from, so focus can go back to it. */
   opener: HTMLElement | null;
   popup: { preset: string; node: HTMLElement; off: () => void } | null;
@@ -675,6 +761,7 @@ export function footnote(show: Show): string {
 function drawBody(parts: Parts, state: State): void {
   const view = state.answer;
   const lines: Child[] = [];
+  if (!state.adminOnly) lines.push(newerNotice(state));
   if (state.adminOnly) {
     lines.push(el("p", { class: "empty" }, "Preset insights are for admins."));
   } else if (view?.state === "error") {
@@ -1008,11 +1095,13 @@ export function activatePresets(
     answer: null,
     error: null,
     adminOnly: false,
+    newer: null,
     suggestions: null,
     mine: new Set(),
     busy: new Set(),
     rowErrors: new Map(),
     redraw: () => undefined,
+    body: parts.body,
     opener: null,
     popup: null,
   };
@@ -1061,6 +1150,17 @@ export function activatePresets(
   const refresh = (): Promise<void> => {
     if (reading) return reading;
     const asked = state.days;
+    // The notice is a side read after the card paints: it never delays the card, and a failure
+    // or a slow answer leaves the card as it was.
+    void fetchNewerModels(context).then(
+      (answer) => {
+        if (!live()) return;
+        const same = JSON.stringify(answer) === JSON.stringify(state.newer);
+        state.newer = answer;
+        if (!same) paintNotice(state);
+      },
+      () => undefined,
+    );
     // The suggestions are a side read: a failure leaves the card as it was.
     const side = Promise.all([
       fetchPresetSuggestions(context, true),

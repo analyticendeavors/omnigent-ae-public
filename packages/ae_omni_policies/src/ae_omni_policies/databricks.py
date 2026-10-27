@@ -21,10 +21,12 @@ Configuration, from the environment:
   only, which covers ``/api/2.0/sql/warehouses*`` and
   ``/api/2.0/sql/statements*`` and nothing else (not Unity Catalog's APIs), so
   a leaked token could at most start a warehouse or run a query.
-- ``AE_DATABRICKS_CREDIT_USD`` (default 200), ``AE_DATABRICKS_CREDIT_CADENCE``
+- ``AE_DATABRICKS_CREDIT_USD``, ``AE_DATABRICKS_CREDIT_CADENCE``
   (``monthly`` or ``once``, default ``once``), ``AE_DATABRICKS_CREDIT_START``
-  and ``AE_DATABRICKS_CREDIT_END`` (ISO dates, default 2026-08-19 and
-  2027-08-19). A value that does not read falls back to its default.
+  and ``AE_DATABRICKS_CREDIT_END`` (ISO dates). There is no built-in credit:
+  unless the amount (a positive number) and both dates read, the strip has no
+  credit and shows only this month's spend. A cadence that does not read is
+  ``once``.
 - ``AE_DATABRICKS_STATE_FILE`` (default ``/data/ae-databricks.json``): the
   last spend reading, written atomically the way ``limits.py`` writes its
   state, so a restart shows it without waking a warehouse.
@@ -105,7 +107,7 @@ from urllib.parse import quote, quote_plus, urlencode
 
 import httpx
 
-from ae_omni_policies import __version__, key_health
+from ae_omni_policies import USER_AGENT, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -118,9 +120,10 @@ CREDIT_START_ENV = "AE_DATABRICKS_CREDIT_START"
 CREDIT_END_ENV = "AE_DATABRICKS_CREDIT_END"
 STATE_FILE_ENV = "AE_DATABRICKS_STATE_FILE"
 DEFAULT_STATE_FILE = "/data/ae-databricks.json"
-DEFAULT_CREDIT_USD = 200.0
-DEFAULT_CREDIT_START = date(2026, 8, 19)
-DEFAULT_CREDIT_END = date(2027, 8, 19)
+# The credit start a reading is filed under when no credit is set. A reading
+# without a credit is bounded to the current month, so only its month figures
+# mean the same as a credit reading's.
+NO_CREDIT_KEY = "none"
 
 # Under the SDK's ten-second budget for one host call, token and listing (or
 # token, Start and the row read back) together.
@@ -137,7 +140,6 @@ CANCEL_TIMEOUT_S = 5.0
 # GET starts a reading on a RUNNING warehouse only when the last attempt is older.
 SPEND_STALE_S = 60 * 60.0
 SPEND_ERROR_RETRY_S = 15 * 60.0
-USER_AGENT = f"omnigent-ae/{__version__} (+https://github.com/analyticendeavors/omnigent-ae)"
 
 # An https origin: a dotted host name and an optional port, nothing after it.
 _LABEL = r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
@@ -282,10 +284,22 @@ class Workspace:
 class Credit:
     """The credit the strip measures against (module note)."""
 
-    usd: float
+    usd: float | None
     cadence: Cadence
-    start: date
-    end: date
+    start: date | None
+    end: date | None
+
+    @property
+    def since(self) -> date:
+        """The spend query's lower bound: the credit start, or this month's first day."""
+        if self.start is not None:
+            return self.start
+        return _now().date().replace(day=1)
+
+    @property
+    def key(self) -> str:
+        """What a saved reading records as the window it was read over."""
+        return self.start.isoformat() if self.start is not None else NO_CREDIT_KEY
 
 
 def _env(environ: Mapping[str, str] | None) -> Mapping[str, str]:
@@ -315,29 +329,68 @@ def not_configured_note(environ: Mapping[str, str] | None = None) -> str:
     return BAD_HOST if raw and _host(raw) is None else HOW_TO_ENABLE
 
 
-def _date(raw: str | None, default: date) -> date:
+def _date(raw: str | None) -> date | None:
     try:
         return date.fromisoformat((raw or "").strip())
     except ValueError:
-        return default
+        return None
+
+
+_credit_warned: tuple[str, ...] | None = None
+
+
+def _warn_credit_forget() -> None:
+    global _credit_warned
+    _credit_warned = None
+
+
+def _warn_credit(problems: tuple[str, ...]) -> None:
+    """Warn once per distinct set of problem variables (names only, never values)."""
+    global _credit_warned
+    if problems == _credit_warned:
+        return
+    _credit_warned = problems
+    if problems:
+        _logger.warning(
+            "databricks credit left off: %s not set to a usable value; the credit shows "
+            "only when %s, %s and %s all read and the start is not after the end",
+            ", ".join(problems),
+            CREDIT_USD_ENV,
+            CREDIT_START_ENV,
+            CREDIT_END_ENV,
+        )
 
 
 def credit(environ: Mapping[str, str] | None = None) -> Credit:
-    """The credit settings, each falling back to its default when it does not read."""
+    """The credit settings; there is no credit unless the amount and both dates read."""
     env = _env(environ)
+    raw_usd = (env.get(CREDIT_USD_ENV) or "").strip()
+    raw_start = (env.get(CREDIT_START_ENV) or "").strip()
+    raw_end = (env.get(CREDIT_END_ENV) or "").strip()
     try:
-        usd = float((env.get(CREDIT_USD_ENV) or "").strip())
+        usd: float | None = float(raw_usd)
     except ValueError:
-        usd = DEFAULT_CREDIT_USD
-    if not math.isfinite(usd) or usd <= 0:
-        usd = DEFAULT_CREDIT_USD
+        usd = None
+    if usd is not None and (not math.isfinite(usd) or usd <= 0):
+        usd = None
+    start = _date(raw_start)
+    end = _date(raw_end)
+    problems: list[str] = []
+    if raw_usd or raw_start or raw_end:
+        if usd is None:
+            problems.append(CREDIT_USD_ENV)
+        if start is None:
+            problems.append(CREDIT_START_ENV)
+        if end is None:
+            problems.append(CREDIT_END_ENV)
+        if start is not None and end is not None and start > end:
+            problems += [CREDIT_START_ENV, CREDIT_END_ENV]
+    _warn_credit(tuple(problems))
+    if usd is None or start is None or end is None or start > end:
+        usd, start, end = None, None, None
     cadence = (env.get(CREDIT_CADENCE_ENV) or "").strip().lower()
-    return Credit(
-        usd=usd,
-        cadence="monthly" if cadence == "monthly" else "once",
-        start=_date(env.get(CREDIT_START_ENV), DEFAULT_CREDIT_START),
-        end=_date(env.get(CREDIT_END_ENV), DEFAULT_CREDIT_END),
-    )
+    kind: Cadence = "monthly" if cadence == "monthly" else "once"
+    return Credit(usd=usd, cadence=kind, start=start, end=end)
 
 
 class DatabricksError(Exception):
@@ -887,7 +940,9 @@ def _load(path: Path | None) -> dict[str, Any]:
     if isinstance(warehouse_id, str) and WAREHOUSE_ID.match(warehouse_id):
         state["warehouseId"] = warehouse_id
     start = raw.get("creditStart")
-    state["creditStart"] = start if isinstance(start, str) and len(start) == 10 else None
+    state["creditStart"] = (
+        start if isinstance(start, str) and (len(start) == 10 or start == NO_CREDIT_KEY) else None
+    )
     state["products"] = _products(raw.get("products"))
     state["days"] = _days(raw.get("days"))
     note = raw.get("breakdownNote")
@@ -942,18 +997,21 @@ def spend_view(settings: Credit, warehouse_id: str | None = None) -> dict[str, A
     """The ``spend`` object of ``GET /v1/ae/databricks`` (and of Refresh)."""
     state = _state()
     # Totals read from another credit start measure something else: not shown.
-    same_credit = state["creditStart"] in (None, settings.start.isoformat())
+    same_credit = state["creditStart"] in (None, settings.key)
+    # This month's figure is the same with or without a credit window, so it stays
+    # valid when the credit is switched off; the totals and breakdown do not.
+    month_ok = same_credit or settings.start is None
     return {
         "status": "reading" if reading_task() is not None else state["status"],
         "message": state["message"],
-        "readAt": iso(state["readAt"]) if same_credit else None,
-        "asOf": iso(state["asOf"]) if same_credit else None,
-        "monthUsd": state["monthUsd"] if same_credit else None,
+        "readAt": iso(state["readAt"]) if month_ok else None,
+        "asOf": iso(state["asOf"]) if month_ok else None,
+        "monthUsd": state["monthUsd"] if month_ok else None,
         "totalUsd": state["totalUsd"] if same_credit else None,
         "creditUsd": settings.usd,
         "cadence": settings.cadence,
-        "creditStart": settings.start.isoformat(),
-        "creditEnd": settings.end.isoformat(),
+        "creditStart": settings.start.isoformat() if settings.start else None,
+        "creditEnd": settings.end.isoformat() if settings.end else None,
         "warehouseId": warehouse_id if warehouse_id is not None else state["warehouseId"],
         # The breakdown (module note): None until a reading has one.
         "products": state["products"] if same_credit else None,
@@ -1110,7 +1168,7 @@ async def _run_statement(
         ws,
         warehouse_id,
         SPEND_SQL,
-        [{"name": "credit_start", "value": settings.start.isoformat(), "type": "DATE"}],
+        [{"name": "credit_start", "value": settings.since.isoformat(), "type": "DATE"}],
         transport,
         what="spend query",
         started=_monotonic(),
@@ -1155,7 +1213,7 @@ async def _run_breakdown(
         warehouse_id,
         BREAKDOWN_SQL,
         [
-            {"name": "credit_start", "value": settings.start.isoformat(), "type": "DATE"},
+            {"name": "credit_start", "value": settings.since.isoformat(), "type": "DATE"},
             {"name": "since", "value": since.isoformat(), "type": "DATE"},
         ],
         transport,
@@ -1252,7 +1310,7 @@ async def _read_spend(
         state.update(status="error", message=f"The spend reading failed ({type(exc).__name__}).")
     else:
         good = True
-        if state["creditStart"] not in (None, settings.start.isoformat()):
+        if state["creditStart"] not in (None, settings.key):
             state.update(readAt=None, asOf=None, monthUsd=None, totalUsd=None)
         state.update(
             # The last reading's rows never sit beside these totals, not even
@@ -1266,7 +1324,7 @@ async def _read_spend(
             asOf=outcome["asOf"],
             monthUsd=outcome["monthUsd"],
             totalUsd=outcome["totalUsd"],
-            creditStart=settings.start.isoformat(),
+            creditStart=settings.key,
         )
         _logger.info(
             "databricks spend: month %.2f, total %.2f USD",
@@ -1452,6 +1510,7 @@ def reset() -> None:
     forget()
     _tokens.clear()
     _retired.clear()
+    _warn_credit_forget()
 
 
 __all__ = [

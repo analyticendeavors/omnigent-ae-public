@@ -1,0 +1,1621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 18:54:34 -0700
+Subject: [PATCH 200/202] [ae-patch] Put the Planner, Builder and Helper on the
+ reviewer model picker, with Codex as an option
+
+---
+ omnigent/inner/ae_reviewers.py                |  52 ++-
+ omnigent/inner/ae_roles.py                    |  14 +-
+ tests/inner/test_ae_roles.py                  |  38 ++
+ web/src/components/AeSessionPresetRow.tsx     |   2 +
+ web/src/components/AeTeamControl.test.tsx     |  13 +-
+ web/src/components/AeTeamControl.tsx          |  12 +-
+ web/src/lib/aeReviewers.ts                    |  39 ++-
+ web/src/lib/aeRoles.test.ts                   |  40 +++
+ web/src/lib/aeRoles.ts                        |  47 ++-
+ web/src/lib/aeSettingHints.ts                 |   6 +-
+ web/src/pages/settings/AeFoldPicker.test.tsx  |  18 +
+ web/src/pages/settings/AeFoldPicker.tsx       |  27 +-
+ .../pages/settings/AeModelUpdates.test.tsx    |  31 +-
+ web/src/pages/settings/AeReviewerRows.tsx     | 273 ++-------------
+ web/src/pages/settings/AeRoleModelPicker.tsx  | 325 ++++++++++++++++++
+ web/src/pages/settings/AeRolesEditor.tsx      | 120 +++----
+ .../settings/AeRolesSettingsSection.test.tsx  |  22 +-
+ 17 files changed, 684 insertions(+), 395 deletions(-)
+ create mode 100644 web/src/pages/settings/AeRoleModelPicker.tsx
+
+diff --git a/omnigent/inner/ae_reviewers.py b/omnigent/inner/ae_reviewers.py
+index b8906d92fc1e6584e75a6e53a84051deecba281d..05341409e8529f8989661fa1a9bdbe386ff02e8e 100644
+--- a/omnigent/inner/ae_reviewers.py
++++ b/omnigent/inner/ae_reviewers.py
+@@ -16,7 +16,8 @@ single finding stay with reviewer 1. The preset's rules pick how results are
+ shown (``review_merge``) and what happens when a reviewer cannot start
+ (``reviewer_unavailable``). A preset whose Helpers rule keeps work with the
+ lead's own subagents (``own``) cannot start child sessions, so its agent slots
+-are named as skipped.
++are named as skipped. The planner, builder and helper settings may also be a Codex
++slot (2026-10-26, :func:`worker_text`); the same rule skips it.
+ 
+ :func:`ae_roles.render_roles` calls :func:`reviewer_lines` for the preset in
+ force and :func:`reviewers_short` for each lead-picks line.
+@@ -68,6 +69,9 @@ def _agent_name(slot: dict[str, object]) -> str:
+     return _text(slot.get("name"), 40) or "the agent"
+ 
+ 
++WORKERS = ("planner", "builder", "helper")
++
++
+ def resolve_agents(roles: dict[str, Any], lookup: Callable[[str], str | None]) -> dict[str, Any]:
+     """*roles* (resolved notice metadata) with each agent slot's id looked up by its name.
+ 
+@@ -98,10 +102,13 @@ def resolve_agents(roles: dict[str, Any], lookup: Callable[[str], str | None]) -
+ 
+     def preset_of(preset: object) -> object:
+         setting = preset.get("roles") if isinstance(preset, dict) else None
+-        if not isinstance(setting, dict) or "reviewer" not in setting:
++        if not isinstance(setting, dict):
+             return preset
+         assert isinstance(preset, dict)
+-        return {**preset, "roles": {**setting, "reviewer": settled(setting["reviewer"])}}
++        changed = {
++            role: settled(setting[role]) for role in ("reviewer", *WORKERS) if role in setting
++        }
++        return {**preset, "roles": {**setting, **changed}} if changed else preset
+ 
+     resolved = dict(roles)
+     if isinstance(roles.get("preset"), dict):
+@@ -111,7 +118,7 @@ def resolve_agents(roles: dict[str, Any], lookup: Callable[[str], str | None]) -
+     return resolved
+ 
+ 
+-def _agent(slot: dict[str, object], *, brief: bool = False) -> str:
++def _agent(slot: dict[str, object], *, brief: bool = False, role: str = "reviewer") -> str:
+     """An agent slot: who it is and how to start it, with only the arguments it fixes."""
+     agent = _text(slot.get("agent"), 128)
+     model = _text(slot.get("model"), 128)
+@@ -119,7 +126,7 @@ def _agent(slot: dict[str, object], *, brief: bool = False) -> str:
+     codex = _is_codex(slot)
+     # A Codex reviewer started by create_session joins the lead's family (capped, listed,
+     # raisable); one started by sys_session_create is a bare child outside it.
+-    args = ['role "reviewer"', 'harness "codex"'] if codex else [f"agent_id {agent}"]
++    args = [f'role "{role}"', 'harness "codex"'] if codex else [f"agent_id {agent}"]
+     if model:
+         args.append(f"model {model}")
+     if effort:
+@@ -127,17 +134,22 @@ def _agent(slot: dict[str, object], *, brief: bool = False) -> str:
+     defaults = [word for word, value in (("model", model), ("effort", effort)) if not value]
+     default = f"; its default {' and '.join(defaults)}" if defaults else ""
+     if codex:
+-        title = ", a title naming the review round, and workspace the repo under review"
++        if role == "reviewer":
++            title = ", a title naming the review round, and workspace the repo under review"
++        else:
++            title = ", a title naming the task, and workspace the task's repo"
+         if brief:
+             return f"{_agent_name(slot)} (fresh session: create_session {', '.join(args)}{title})"
+         return (
+-            f"{_agent_name(slot)} agent (a fresh session each review: create_session with "
++            f"{_agent_name(slot)} agent (a fresh session each "
++            f"{'review' if role == 'reviewer' else 'task'}: create_session with "
+             f"{', '.join(args)}{title}{default})"
+         )
+     if brief:
+         return f"{_agent_name(slot)} (fresh child session: sys_session_create {', '.join(args)})"
+     return (
+-        f"{_agent_name(slot)} agent (a fresh child session each review: "
++        f"{_agent_name(slot)} agent (a fresh child session each "
++        f"{'review' if role == 'reviewer' else 'task'}: "
+         f"sys_session_create with {', '.join(args)}{default})"
+     )
+ 
+@@ -161,6 +173,30 @@ def _split(
+     return usable, note
+ 
+ 
++def worker_text(
++    role: str,
++    setting: object,
++    rules: object,
++    current: object,
++    model_text: ModelText,
++    *,
++    brief: bool = False,
++) -> str:
++    """A planner, builder or helper setting as notice text (Claude model, or a Codex session).
++
++    A Codex slot says how to start it with this *role*; under the Helpers rule ``own`` it
++    is named as skipped, since the lead cannot start child sessions then.
++    """
++    if not isinstance(setting, dict) or not _is_agent(setting):
++        return model_text(setting, current)
++    if isinstance(rules, dict) and rules.get("helpers") == OWN:
++        return (
++            f"{_agent_name(setting)} skipped: this preset keeps work with your own "
++            "subagents, so use a native subagent of your pick"
++        )
++    return _agent(setting, brief=brief, role=role)
++
++
+ def reviewer_lines(
+     setting: object, rules: object, current: object, model_text: ModelText
+ ) -> list[str]:
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index f5e1e3958375874ef913a1808be74c2687c5f57f..63150f90e2243ab5b4c3d38cb09d210c85090021 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -575,7 +575,10 @@ def render_roles(roles: object) -> str | None:
+                     setting.get(role), preset.get("rules"), current, _model
+                 )
+                 if role == "reviewer"
+-                else f"{role} {_model(setting.get(role), current)}"
++                else f"{role} "
++                + ae_reviewers.worker_text(
++                    role, setting.get(role), preset.get("rules"), current, _model, brief=True
++                )
+                 for role in ROLES
+                 if role != "lead"
+                 or not isinstance(setting.get(role), dict)
+@@ -613,7 +616,14 @@ def render_roles(roles: object) -> str | None:
+                 setting.get(role), preset.get("rules"), current, _model
+             )
+             continue
+-        lines.append(f"- {_ROLE_LABELS[role]}: {_model(setting.get(role), current)}.")
++        shown = (
++            _model(setting.get(role), current)
++            if role == "lead"
++            else ae_reviewers.worker_text(
++                role, setting.get(role), preset.get("rules"), current, _model
++            )
++        )
++        lines.append(f"- {_ROLE_LABELS[role]}: {shown}.")
+     lines.append(_rules(preset.get("rules")))
+     return "\n".join(lines)
+ 
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 674217b8cdb6b89c9e21886eb96dad1ee36b8862..441d4aa2fc3344ef1f30cbce9d131f936b36d3e0 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -828,3 +828,41 @@ def test_the_shared_sanitizer_strips_line_separators() -> None:
+     source = Path(ae_text.__file__).read_text(encoding="utf-8")
+     assert not any(ord(ch) in (0x2028, 0x2029) for ch in source)
+     assert "\\u2028" in source
++
++
++# ── Codex planner, builder and helper (2026-10-26) ─────────────────────────
++
++
++def _with_worker(role: str, slot: dict[str, Any], **rules: Any) -> dict[str, Any]:
++    preset = copy.deepcopy(BALANCED)
++    preset["roles"][role] = slot
++    preset["rules"] = {**preset["rules"], **rules}
++    return preset
++
++
++def test_a_codex_builder_says_how_to_start_it_with_its_own_role() -> None:
++    preset = _with_worker("builder", {**CODEX, "model": "gpt-5.6-sol"})
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    [line] = [x for x in text.split("\n") if x.startswith("- Builder")]
++    assert 'create_session with role "builder", harness "codex", model gpt-5.6-sol' in line
++    assert "a title naming the task" in line and "review" not in line
++
++
++def test_a_codex_helper_is_skipped_under_own_subagents_only() -> None:
++    preset = _with_worker("helper", CODEX, helpers="own")
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    [line] = [x for x in text.split("\n") if x.startswith("- Helper")]
++    assert "Codex skipped: this preset keeps work with your own subagents" in line
++    assert "create_session" not in line
++
++
++def test_lead_picks_names_a_codex_planner_with_its_role() -> None:
++    preset = _with_worker("planner", CODEX)
++    text = render_roles({"lead_picks": True, "presets": [preset], "current": CURRENT}) or ""
++    assert 'planner Codex (fresh session: create_session role "planner", harness "codex"' in text
++
++
++def test_worker_agent_slots_get_the_live_id_by_name() -> None:
++    preset = _with_worker("builder", {**CODEX, "agent": "stale"})
++    out = ae_reviewers.resolve_agents({"preset": preset}, lambda name: "live-id")
++    assert out["preset"]["roles"]["builder"]["agent"] == "live-id"
+diff --git a/web/src/components/AeSessionPresetRow.tsx b/web/src/components/AeSessionPresetRow.tsx
+index 23c6742183323b138bdc089f48777fbe6d36ad3b..3192b964f7123b67a02de350e117f722c7ade496 100644
+--- a/web/src/components/AeSessionPresetRow.tsx
++++ b/web/src/components/AeSessionPresetRow.tsx
+@@ -282,6 +282,8 @@ export function AeSessionPresetRow({
+                 role={role}
+                 setting={shown.roles[role]}
+                 models={models}
++                agents={reviewerAgents}
++                ownHelpers={aeHelpersOf(shown.rules) === "own"}
+                 disabled={disabled || saving}
+                 onChange={(setting) => setRoles({ ...shown.roles, [role]: setting })}
+               />
+diff --git a/web/src/components/AeTeamControl.test.tsx b/web/src/components/AeTeamControl.test.tsx
+index b9d42cef27bde59624d14c70202976bbbbdc4ff4..b3f68e2bba89bd638e62fa884f33824f441a29f8 100644
+--- a/web/src/components/AeTeamControl.test.tsx
++++ b/web/src/components/AeTeamControl.test.tsx
+@@ -200,6 +200,15 @@ beforeEach(() => {
+ });
+ afterEach(cleanup);
+ 
++/** The model picker's trigger for a role row. */
++const modelTrigger = (role: string) =>
++  screen.getByRole("button", { name: new RegExp(`^${role} model`) });
++/** Opens a role row's picker and picks the option with this name. */
++const pickModel = (role: string, name: string) => {
++  fireEvent.click(modelTrigger(role));
++  fireEvent.click(within(screen.getByRole("tree")).getByRole("treeitem", { name }));
++};
++
+ describe("composer team picker", () => {
+   it("keeps a loading entry point and lets failed metadata be retried", () => {
+     const client = new QueryClient();
+@@ -636,7 +645,7 @@ describe("roles preset per session", () => {
+     openPicker();
+     // A non-lead row edit on the same preset: the roles are saved, the model is left alone.
+     fireEvent.click(screen.getByRole("button", { name: "Customize" }));
+-    fireEvent.change(screen.getByLabelText("Planner model"), { target: { value: "__auto" } });
++    pickModel("Planner", "Auto (the lead picks)");
+     fireEvent.click(saveButton());
+     await waitFor(() => expect(saveAeTeam).toHaveBeenCalledTimes(1));
+     await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+@@ -690,7 +699,7 @@ describe("roles preset per session", () => {
+     mount();
+     openPicker();
+     fireEvent.click(screen.getByRole("button", { name: "Customize" }));
+-    fireEvent.change(screen.getByLabelText("Planner model"), { target: { value: "__auto" } });
++    pickModel("Planner", "Auto (the lead picks)");
+     expect(screen.getByRole("radio", { name: "Balanced, edited" })).toBeInTheDocument();
+     fireEvent.click(screen.getByRole("button", { name: "Save as preset" }));
+     expect(screen.getByLabelText("New preset name")).toHaveValue("Balanced edited");
+diff --git a/web/src/components/AeTeamControl.tsx b/web/src/components/AeTeamControl.tsx
+index cc45c1a356c408444231d49d867f10b3f19a2e80..ed3daafb965f304214573f8d73a9baa7dd18c159 100644
+--- a/web/src/components/AeTeamControl.tsx
++++ b/web/src/components/AeTeamControl.tsx
+@@ -40,12 +40,8 @@ import {
+   aeSessionsLockedHint,
+ } from "@/lib/aeTeamPresets";
+ import { aeAnnouncePresetLead, aeSwitchPresetLead } from "@/lib/aeLeadModelChat";
+-import {
+-  aeReviewerAgents,
+-  aeReviewerMemberNote,
+-  aeReviewerNumberOf,
+-  aeReviewerNumbers,
+-} from "@/lib/aeReviewers";
++import { aeRoleAgents } from "@/lib/aeRoles";
++import { aeReviewerMemberNote, aeReviewerNumberOf, aeReviewerNumbers } from "@/lib/aeReviewers";
+ import { AeSessionPresetRow } from "./AeSessionPresetRow";
+ import { AeSessionPresetPill } from "./composer/AeSessionPresetPill";
+ import { Button } from "./ui/button";
+@@ -408,9 +404,7 @@ export function AeTeamControl({
+       session.agentId,
+       ...saved.members.map((member) => member.agentId),
+       // The agents the shown preset's reviewers name, so none reads "Not found" when deduped.
+-      ...(choice?.kind === "preset"
+-        ? aeReviewerAgents(choice.preset.roles.reviewer).map((r) => r.slot.agent)
+-        : []),
++      ...(choice?.kind === "preset" ? aeRoleAgents(choice.preset.roles) : []),
+     ],
+   });
+   const { data: hosts = [], isSuccess: hostsLoaded } = useHosts({
+diff --git a/web/src/lib/aeReviewers.ts b/web/src/lib/aeReviewers.ts
+index fd1f65cf28b18149480d63192c3658f3bf904dd3..514521dfbc6d95edbb7d856ea0c504b73582681d 100644
+--- a/web/src/lib/aeReviewers.ts
++++ b/web/src/lib/aeReviewers.ts
+@@ -96,27 +96,30 @@ function parseSlot(value: unknown, index: number): AeReviewerSlot | null {
+     if (typeof value.model !== "string" || !value.model || !isEffort(value.effort)) return null;
+     return { mode: "fixed", model: value.model, effort: value.effort };
+   }
+-  if (value.mode === "agent") {
+-    const { agent, name, model, effort, agent_name: agentName } = value;
+-    if (typeof agent !== "string" || !agent) return null;
+-    if (agentName != null && (typeof agentName !== "string" || !AGENT_NAME_PATTERN.test(agentName)))
+-      return null;
+-    if (typeof name !== "string" || !name || Array.from(name).length > AE_AGENT_NAME_MAX)
+-      return null;
+-    if (model != null && (typeof model !== "string" || !model)) return null;
+-    if (effort != null && !isAgentEffort(effort)) return null;
+-    return {
+-      mode: "agent",
+-      agent,
+-      agent_name: typeof agentName === "string" ? agentName : null,
+-      name,
+-      model: typeof model === "string" ? model : null,
+-      effort: isAgentEffort(effort) ? effort : null,
+-    };
+-  }
++  if (value.mode === "agent") return aeParseAgentSlot(value);
+   return null;
+ }
+ 
++/** An agent slot (the reviewer's, or a Codex planner, builder or helper), or null when malformed. */
++export function aeParseAgentSlot(value: unknown): AeReviewerAgentSlot | null {
++  if (!isObject(value) || value.mode !== "agent") return null;
++  const { agent, name, model, effort, agent_name: agentName } = value;
++  if (typeof agent !== "string" || !agent) return null;
++  if (agentName != null && (typeof agentName !== "string" || !AGENT_NAME_PATTERN.test(agentName)))
++    return null;
++  if (typeof name !== "string" || !name || Array.from(name).length > AE_AGENT_NAME_MAX) return null;
++  if (model != null && (typeof model !== "string" || !model)) return null;
++  if (effort != null && !isAgentEffort(effort)) return null;
++  return {
++    mode: "agent",
++    agent,
++    agent_name: typeof agentName === "string" ? agentName : null,
++    name,
++    model: typeof model === "string" ? model : null,
++    effort: isAgentEffort(effort) ? effort : null,
++  };
++}
++
+ /** The multi shape, or null when `value` is not a well-formed one (1 to 3 slots). */
+ export function aeParseReviewerMulti(value: unknown): AeReviewerMulti | null {
+   if (!isObject(value) || value.mode !== "multi" || !Array.isArray(value.reviewers)) return null;
+diff --git a/web/src/lib/aeRoles.test.ts b/web/src/lib/aeRoles.test.ts
+index 862e07aa6fd8bef0700fd94d0afda257abb45430..585eec56c61655732d26720877ec121c7c9c64bc 100644
+--- a/web/src/lib/aeRoles.test.ts
++++ b/web/src/lib/aeRoles.test.ts
+@@ -8,6 +8,8 @@ import {
+   aeIsTopTierEverywhere,
+   aeOneLine,
+   aeParseRolesState,
++  aeRoleAgents,
++  aeRoleSummary,
+   aeRolesDoc,
+   aePresetId,
+   aeRestoreStarters,
+@@ -151,3 +153,41 @@ describe("aeRoles", () => {
+     expect(aeDuplicatePreset(doc([short]), short).doc.presets[1].title).toBe("Plan copy");
+   });
+ });
++
++describe("a Codex planner, builder or helper", () => {
++  const codex = {
++    mode: "agent",
++    agent: "codex-id",
++    agent_name: "codex-native-ui",
++    name: "Codex",
++    model: "gpt-5.6-sol",
++    effort: "high",
++  };
++  const withBuilder = (builder: unknown) => {
++    const base = preset("a");
++    return { ...base, roles: { ...base.roles, builder } };
++  };
++
++  it("parses, lists its agent and reads in the summary", () => {
++    const state = aeParseRolesState({
++      revision: 1,
++      default_preset: "a",
++      apply_start_on: true,
++      presets: [withBuilder(codex)],
++    });
++    const parsed = state?.presets[0];
++    expect(parsed?.roles.builder).toMatchObject({ mode: "agent", model: "gpt-5.6-sol" });
++    expect(aeRoleAgents(parsed!.roles)).toEqual(["codex-id"]);
++    expect(aeRoleSummary(parsed!.roles)).toContain("Builder Codex gpt-5.6-sol high");
++  });
++
++  it("still reads a worker saved on the session model", () => {
++    const state = aeParseRolesState({
++      revision: 1,
++      default_preset: "a",
++      apply_start_on: true,
++      presets: [withBuilder({ mode: "session" })],
++    });
++    expect(state?.presets[0].roles.builder).toEqual({ mode: "session" });
++  });
++});
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index 112fc8b4ab2b5dfbb4b98e2f42b58256a891daa8..1b8f5ebab716edfce78d20e8ebb72affb9919069 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -13,10 +13,13 @@ import {
+   aeModelLabel,
+ } from "@/lib/aeRoleBase";
+ import {
++  type AeReviewerAgentSlot,
+   type AeReviewerSetting,
+   type AeReviewerUnavailable,
+   type AeReviewMerge,
++  aeParseAgentSlot,
+   aeParseReviewerMulti,
++  aeReviewerAgents,
+   aeReviewerList,
+   aeReviewerRowLabel,
+   aeReviewerSummary,
+@@ -106,9 +109,20 @@ export const AE_PRESET_TITLE_MAX = 40;
+ export const AE_PRESET_DESCRIPTION_MAX = 120;
+ export const AE_PRESET_WHEN_MAX = 400;
+ 
++/**
++ * What the Planner, Builder and Helper rows hold (2026-10-26): Auto, a Claude model, or a
++ * Codex session (an agent slot; the server refuses any other agent there).
++ */
++export type AeWorkerSetting = AeRoleSetting | AeReviewerAgentSlot;
++export const AE_WORKER_ROLES = ["planner", "builder", "helper"] as const;
++
+ /** The Reviewer role may hold one to three reviewers (aeReviewers.ts). */
+ export type AeRoleTable = {
+-  [K in AeRoleId]: K extends "reviewer" ? AeReviewerSetting : AeRoleSetting;
++  [K in AeRoleId]: K extends "reviewer"
++    ? AeReviewerSetting
++    : K extends (typeof AE_WORKER_ROLES)[number]
++      ? AeWorkerSetting
++      : AeRoleSetting;
+ };
+ 
+ export interface AeRoleRules {
+@@ -270,8 +284,15 @@ function parsePreset(value: unknown): AeRolePreset | null {
+       continue;
+     }
+     const setting = parseSetting(roles[role]);
+-    if (!setting) return null;
+-    table[role] = setting;
++    if (role === "lead") {
++      if (!setting) return null;
++      table.lead = setting;
++      continue;
++    }
++    // A worker may also be a Codex session. A saved session setting still reads as before.
++    const worker = setting ?? aeParseAgentSlot(roles[role]);
++    if (!worker) return null;
++    table[role] = worker;
+   }
+   const { raise_or_lower, lead_steps_down, auto_raises } = rules;
+   if (!(AE_RAISE_MODES as readonly unknown[]).includes(raise_or_lower)) return null;
+@@ -489,7 +510,7 @@ export function aeTopModel(models: readonly string[]): string | null {
+  */
+ export function aeIsTopTierEverywhere(roles: AeRoleTable, catalog: readonly string[]): boolean {
+   // Agent reviewers run on another provider's models, so only Claude slots count.
+-  const settings = AE_ROLE_IDS.flatMap((role): (AeRoleSetting | { mode: "agent" })[] =>
++  const settings = AE_ROLE_IDS.flatMap((role): (AeWorkerSetting | { mode: "agent" })[] =>
+     role === "reviewer" ? aeReviewerList(roles.reviewer) : [roles[role]],
+   ).filter((s) => s.mode !== "agent");
+   if (!settings.every((s) => s.mode === "fixed" && s.effort === "max")) return false;
+@@ -500,6 +521,16 @@ export function aeIsTopTierEverywhere(roles: AeRoleTable, catalog: readonly stri
+   return models.every((m) => comparableModelId(m) === target);
+ }
+ 
++/** The ids of every agent the table names (reviewers, and Codex planner, builder or helper). */
++export function aeRoleAgents(roles: AeRoleTable): string[] {
++  return [
++    ...aeReviewerAgents(roles.reviewer).map((r) => r.slot.agent),
++    ...AE_WORKER_ROLES.flatMap((role) =>
++      roles[role].mode === "agent" ? [(roles[role] as AeReviewerAgentSlot).agent] : [],
++    ),
++  ];
++}
++
+ /** One line for a preset's role mix: "Opus 5.5 plans, Sonnet 5.5 reviews, ...". */
+ export function aeRoleSummary(roles: AeRoleTable): string {
+   const parts: string[] = [];
+@@ -512,9 +543,11 @@ export function aeRoleSummary(roles: AeRoleTable): string {
+     const value =
+       setting.mode === "fixed"
+         ? `${aeModelLabel(setting.model)} ${setting.effort}`
+-        : setting.mode === "session"
+-          ? "session model"
+-          : "auto";
++        : setting.mode === "agent"
++          ? [setting.name, setting.model, setting.effort].filter(Boolean).join(" ")
++          : setting.mode === "session"
++            ? "session model"
++            : "auto";
+     parts.push(`${AE_ROLE_LABELS[role].label} ${value}`);
+   }
+   return parts.join(" · ");
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 50d9a719c9111d2b504b25a743cf14e87c7f39e9..d6222163f2ca1d501df89f30136080c1bfe235c5 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -42,7 +42,7 @@ export const AE_SETTING_HINTS = {
+   },
+   "roles.planner": {
+     label: "Planner",
+-    hint: `Does design and root-cause work. Auto lets the lead choose. ${EFFORT}`,
++    hint: `Design, root cause. Claude, Codex or Auto. Codex is skipped on Own subagents only. ${EFFORT}`,
+     source: "tooltip",
+   },
+   "roles.reviewer": {
+@@ -52,12 +52,12 @@ export const AE_SETTING_HINTS = {
+   },
+   "roles.builder": {
+     label: "Builder",
+-    hint: `Writes code. Auto lets the lead choose. ${EFFORT}`,
++    hint: `Writes code. Claude, Codex or Auto. Codex is skipped on Own subagents only. ${EFFORT}`,
+     source: "tooltip",
+   },
+   "roles.helper": {
+     label: "Helper",
+-    hint: `Watches, polls and commits. Auto lets the lead choose. ${EFFORT}`,
++    hint: `Watches, polls, commits. Claude, Codex or Auto. Codex is skipped on Own subagents only. ${EFFORT}`,
+     source: "tooltip",
+   },
+   "reviewer.older": {
+diff --git a/web/src/pages/settings/AeFoldPicker.test.tsx b/web/src/pages/settings/AeFoldPicker.test.tsx
+index 88b85558570e39e16c6fae2e9b880e12e008797c..a9f0d51abda00e6c3204ffa504185291ce680089 100644
+--- a/web/src/pages/settings/AeFoldPicker.test.tsx
++++ b/web/src/pages/settings/AeFoldPicker.test.tsx
+@@ -49,6 +49,24 @@ const tabbable = () =>
+   screen.getAllByRole("treeitem").filter((el) => el.getAttribute("tabindex") === "0");
+ 
+ describe("AeFoldPicker", () => {
++  it("lists every top option above the groups", () => {
++    render(
++      <AeFoldPicker
++        value="__session"
++        ariaLabel="Lead model"
++        groups={groups}
++        top={[
++          opt("Auto (the lead picks)", { value: "__auto" }),
++          opt("Session model", { value: "__session" }),
++        ]}
++        onPick={() => {}}
++      />,
++    );
++    fireEvent.click(screen.getByRole("button", { name: /^Lead model/ }));
++    const items = screen.getAllByRole("treeitem").map((el) => el.textContent);
++    expect(items.slice(0, 2)).toEqual(["Auto (the lead picks)", "Session model"]);
++  });
++
+   it("is a plain button that names the current model and a dialog it controls", () => {
+     render(<Harness />);
+     expect(trigger()).toHaveAccessibleName("Reviewer 2 model, Fable 5.1");
+diff --git a/web/src/pages/settings/AeFoldPicker.tsx b/web/src/pages/settings/AeFoldPicker.tsx
+index 462264a8a4c897dc51e3c08a3b51b76e40a932f7..ae5577f46234c09abdae500b690793a126e553b4 100644
+--- a/web/src/pages/settings/AeFoldPicker.tsx
++++ b/web/src/pages/settings/AeFoldPicker.tsx
+@@ -60,7 +60,7 @@ export function AeFoldPicker({
+   ariaLabel,
+   nameSuffix = "",
+   groups,
+-  auto,
++  top,
+   disabled,
+   triggerClassName,
+   nameClassName,
+@@ -73,8 +73,8 @@ export function AeFoldPicker({
+   /** Said after the current model in the trigger's name, e.g. ", runs through Codex". */
+   nameSuffix?: string;
+   groups: readonly AeFoldGroup[];
+-  /** An option above the groups (the first reviewer's "Auto"). */
+-  auto?: AeFoldOption;
++  /** Options above the groups: "Auto", and for the lead "Session model". */
++  top?: readonly AeFoldOption[];
+   disabled?: boolean;
+   /** Padding for the dot and tag the row draws over the trigger. */
+   triggerClassName?: string;
+@@ -100,9 +100,11 @@ export function AeFoldPicker({
+     seen.add(key);
+     return key;
+   };
+-  const autoEntry: Entry | null = auto
+-    ? { key: keyOf("auto", auto), option: auto, level: 1 }
+-    : null;
++  const topEntries: Entry[] = (top ?? []).map((option) => ({
++    key: keyOf("top", option),
++    option,
++    level: 1,
++  }));
+   const sections = groups
+     .filter((g) => g.options.length > 0 || g.older.length > 0)
+     .map((group) => {
+@@ -129,7 +131,7 @@ export function AeFoldPicker({
+     });
+ 
+   const focusable: Focusable[] = [];
+-  if (autoEntry) focusable.push({ kind: "option", ...autoEntry });
++  for (const e of topEntries) focusable.push({ kind: "option", ...e });
+   for (const s of sections) {
+     for (const e of s.latest) focusable.push({ kind: "option", ...e });
+     if (s.group.older.length > 0) {
+@@ -139,10 +141,9 @@ export function AeFoldPicker({
+   }
+   // Only the first row holding the value is the selected one.
+   const selectedKey = focusable.find((f) => f.kind === "option" && f.option.value === value)?.key;
+-  const current = [
+-    ...(auto ? [auto] : []),
+-    ...groups.flatMap((g) => [...g.options, ...g.older]),
+-  ].find((o) => o.value === value);
++  const current = [...(top ?? []), ...groups.flatMap((g) => [...g.options, ...g.older])].find(
++    (o) => o.value === value,
++  );
+   const currentLabel = current?.label ?? "Unavailable model";
+   const tabbableKey =
+     (activeKey && focusable.some((f) => f.key === activeKey) ? activeKey : null) ??
+@@ -261,7 +262,7 @@ export function AeFoldPicker({
+         onFocus={() => setActiveKey(e.key)}
+         className={cn(
+           ROW,
+-          e.key.startsWith("auto/") ? "pl-2" : e.level === 2 ? "pl-8" : "pl-5",
++          e.key.startsWith("top/") ? "pl-2" : e.level === 2 ? "pl-8" : "pl-5",
+           selected && "font-semibold shadow-[inset_3px_0_0_0_currentColor]",
+           option.disabled && cn("cursor-not-allowed hover:bg-transparent", QUIET),
+         )}
+@@ -340,7 +341,7 @@ export function AeFoldPicker({
+           data-testid="ae-fold-list"
+           onKeyDown={onKeyDown}
+         >
+-          {autoEntry && optionRow(autoEntry)}
++          {topEntries.map(optionRow)}
+           {sections.map((s) => (
+             <div key={s.group.id}>
+               <div id={s.head} className="px-2 pt-2 pb-1 text-xs font-semibold text-foreground">
+diff --git a/web/src/pages/settings/AeModelUpdates.test.tsx b/web/src/pages/settings/AeModelUpdates.test.tsx
+index 544fab299c00b1b29b207577e6ecb6a7bb46af64..e52ddb319dd144cd831ffa4c8fae656b39136d7c 100644
+--- a/web/src/pages/settings/AeModelUpdates.test.tsx
++++ b/web/src/pages/settings/AeModelUpdates.test.tsx
+@@ -124,6 +124,10 @@ beforeEach(() => {
+ });
+ afterEach(cleanup);
+ 
++/** The model picker's trigger for a role row. */
++const modelTrigger = (role: string) =>
++  screen.getByRole("button", { name: new RegExp(`^${role} model`) });
++
+ describe("the update nudge in the preset editor", () => {
+   it("shows a banner and a chip on each row with a newer model in its family", () => {
+     render(<Editor />);
+@@ -227,12 +231,33 @@ describe("the update nudge in the preset editor", () => {
+     expect(screen.getByTestId("ae-model-update-batch")).toHaveTextContent("Updated 2 models");
+   });
+ 
++  it("offers Codex for a Planner but only Claude models and the session for the Lead", () => {
++    render(<Editor />);
++    fireEvent.click(modelTrigger("Planner"));
++    const planner = within(screen.getByRole("tree"));
++    expect(planner.getByText("Run through Codex, as a child session")).toBeInTheDocument();
++    expect(planner.queryByText("Other agents")).not.toBeInTheDocument();
++    fireEvent.click(planner.getByRole("treeitem", { name: "GPT-6-Sol" }));
++    expect(latest.roles.planner).toMatchObject({
++      mode: "agent",
++      agent: "16a06503889b0c3034496821afd41b9e",
++      agent_name: "codex-native-ui",
++      name: "Codex",
++      model: "gpt-6-sol",
++    });
++    fireEvent.click(modelTrigger("Lead"));
++    const lead = within(screen.getByRole("tree"));
++    expect(lead.getByRole("treeitem", { name: "Session model" })).toBeInTheDocument();
++    expect(lead.getByText("Claude models")).toBeInTheDocument();
++    expect(lead.queryByText("Run through Codex, as a child session")).not.toBeInTheDocument();
++  });
++
+   it("drops the Updated note when the row is changed by hand afterwards", () => {
+     render(<Editor />);
+     fireEvent.click(screen.getByRole("button", { name: "Update Planner to Opus 5.6" }));
+-    fireEvent.change(screen.getByLabelText("Planner model"), {
+-      target: { value: "claude-haiku-5-5" },
+-    });
++    fireEvent.click(modelTrigger("Planner"));
++    fireEvent.click(screen.getAllByRole("treeitem", { name: /^Older models, collapsed/ })[0]);
++    fireEvent.click(screen.getByRole("treeitem", { name: /haiku/i }));
+     expect(screen.queryByTestId("ae-model-updated-planner")).not.toBeInTheDocument();
+   });
+ 
+diff --git a/web/src/pages/settings/AeReviewerRows.tsx b/web/src/pages/settings/AeReviewerRows.tsx
+index fba06e7823add21cecafe85969ff50deda2fda61..a41b636b2126221f3746b0c0dc857e9555cdc59f 100644
+--- a/web/src/pages/settings/AeReviewerRows.tsx
++++ b/web/src/pages/settings/AeReviewerRows.tsx
+@@ -12,14 +12,8 @@ import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
+ import { type AeCodexCatalog, useAeCodexCatalog } from "@/hooks/useAeCodexCatalog";
+ import type { AeModelUpdatesState } from "@/hooks/useAeModelUpdates";
+ import { type Host, useHostModelOptions } from "@/hooks/useHosts";
+-import {
+-  aeCodexDefaultEffort,
+-  aeCodexEfforts,
+-  aeCodexLabel,
+-  aeNewCodexReviewerModel,
+-} from "@/lib/aeCodexModels";
+-import { aeClaudeFoldSplit, aeCodexFoldSplit } from "@/lib/aeModelFold";
+-import { aeClaudeCodeDefaultEffort, aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
++import { aeCodexDefaultEffort, aeNewCodexReviewerModel } from "@/lib/aeCodexModels";
++import { aeClaudeEffortLabel } from "@/lib/aeEffortDefault";
+ import {
+   AE_REVIEW_MERGE_OPTIONS,
+   AE_REVIEWER_UNAVAILABLE_OPTIONS,
+@@ -34,41 +28,22 @@ import {
+   aeAgentNameOf,
+   aeAgentSetupHref,
+   aeIsCodexAgent,
+-  aeIsCodexSlot,
+   aeReviewerAgentOption,
+   aeReviewerAgents,
+-  aeReviewerAgentStatus,
+   aeReviewerList,
+   aeReviewerRowLabel,
+   aeReviewerUnavailableOf,
+   aeReviewMergeOf,
+   aeWriteReviewers,
+ } from "@/lib/aeReviewers";
+-import {
+-  AE_ROLE_EFFORTS,
+-  AE_ROLE_LABELS,
+-  type AeRoleEffort,
+-  type AeRoleRules,
+-  aeHelpersOf,
+-  aeModelDotClass,
+-  aeModelLabel,
+-} from "@/lib/aeRoles";
+-import type { AeAgentEffort } from "@/lib/aeRoleBase";
++import { AE_ROLE_LABELS, type AeRoleEffort, type AeRoleRules, aeHelpersOf } from "@/lib/aeRoles";
+ import type { AeTeamOption } from "@/lib/aeTeamOptions";
+-import {
+-  codexEffortLevelsForModel,
+-  comparableModelId,
+-  findNativeModelOption,
+-} from "@/lib/codexNativeModels";
++import { codexEffortLevelsForModel, comparableModelId } from "@/lib/codexNativeModels";
+ import type { NativeModelOption } from "@/lib/types";
+ import { cn } from "@/lib/utils";
+ import { AeUpdateChip } from "./AeModelUpdates";
+-import { AeEffortBar, AeSegmented } from "./AeRolesControls";
+-import { AeFoldPicker, type AeFoldGroup, type AeFoldOption } from "./AeFoldPicker";
+-
+-const AUTO = "__auto";
+-const AGENT = "agent:";
+-const CODEX = "codex:";
++import { AeSegmented } from "./AeRolesControls";
++import { aeRoleModelPick } from "./AeRoleModelPicker";
+ 
+ const GRID =
+   "grid grid-cols-[5.5rem_1fr] items-center gap-x-3 gap-y-2 @lg/roles:grid-cols-[7rem_minmax(0,14rem)_1fr]";
+@@ -203,41 +178,6 @@ function SlotRow({
+ }) {
+   const slot = slots[index];
+   const label = `Reviewer ${index + 1}`;
+-  const fixed = slot.mode === "fixed" ? slot : null;
+-  const agentSlot = slot.mode === "agent" ? slot : null;
+-  const listed = fixed
+-    ? models.find((m) => comparableModelId(m.value) === comparableModelId(fixed.model))
+-    : undefined;
+-  const agentState = agentSlot ? aeReviewerAgentStatus(agentSlot, options, host) : null;
+-  const agentOption = agentState?.option ?? null;
+-  // The live id when the slot was stored under another one (matched by registered name).
+-  const agentId = agentSlot ? (agentOption?.agent.id ?? agentSlot.agent) : "";
+-  // A Codex slot shows its model in the one dropdown, like a Claude row; its
+-  // models come from the host (the stored one, else the host's default).
+-  const codexSlot = agentSlot && aeIsCodexSlot(agentSlot, agentOption) ? agentSlot : null;
+-  const defaultRow = codex.rows.find((row) => row.isDefault) ?? null;
+-  const codexRow = codexSlot
+-    ? codexSlot.model
+-      ? findNativeModelOption(codex.rows, codexSlot.model)
+-      : defaultRow
+-    : null;
+-  const codexValue = codexSlot
+-    ? `${CODEX}${codexRow ? rowValue(codexRow) : (codexSlot.model ?? "")}`
+-    : "";
+-  // Everything the host lists, when Codex is ready to pick from (latest on top, the rest in the fold).
+-  const pickable = codex.ready ? codex.rows : [];
+-  // The saved value always has its own option, whatever the agent's state or the list's.
+-  const codexOffered = codexSlot && !pickable.some((row) => row === codexRow);
+-  const value = fixed
+-    ? (listed?.value ?? fixed.model)
+-    : codexSlot
+-      ? codexValue
+-      : agentSlot
+-        ? `${AGENT}${agentId}`
+-        : AUTO;
+-  const rest = options.filter((o) => !(codex.ready && o.agent.id === codex.option?.agent.id));
+-  const ready = rest.filter((o) => o.readiness.selectable && o.primary);
+-  const needSetup = rest.filter((o) => !o.readiness.selectable);
+   const usedBy = (model: string) => {
+     const at = slots.findIndex(
+       (s, i) =>
+@@ -247,140 +187,25 @@ function SlotRow({
+     );
+     return at < 0 ? "" : `used by Reviewer ${at + 1}`;
+   };
+-  const choose = (next: string) => {
+-    if (next === AUTO) return onChange({ mode: "auto" });
+-    if (next.startsWith(CODEX)) {
+-      const model = next.slice(CODEX.length);
+-      const named = codexSlot ?? codex.option;
+-      if (!model || !named) return;
+-      const target = findNativeModelOption(codex.rows, model);
+-      const offered = aeCodexEfforts(target);
+-      const current = codexSlot?.effort ?? fixed?.effort ?? null;
+-      const effort =
+-        current && (offered.length === 0 || offered.includes(current))
+-          ? current
+-          : aeCodexDefaultEffort(target);
+-      if (codexSlot) return onChange({ ...codexSlot, model, effort });
+-      const option = codex.option as AeTeamOption;
+-      return onChange({
+-        mode: "agent",
+-        agent: option.agent.id,
+-        agent_name: aeAgentNameOf(option.agent.name),
+-        name: Array.from(option.name).slice(0, AE_AGENT_NAME_MAX).join("") || "Agent",
+-        model,
+-        effort,
+-      });
+-    }
+-    if (next.startsWith(AGENT)) {
+-      const id = next.slice(AGENT.length);
+-      const option = options.find((o) => o.agent.id === id);
+-      if (!option) return;
+-      return onChange({
+-        mode: "agent",
+-        agent: id,
+-        agent_name: aeAgentNameOf(option.agent.name),
+-        name: Array.from(option.name).slice(0, AE_AGENT_NAME_MAX).join("") || "Agent",
+-        model: null,
+-        effort: null,
+-      });
+-    }
+-    const carried = fixed?.effort ?? (agentSlot?.effort === "ultra" ? "max" : agentSlot?.effort);
+-    const effort =
+-      carried ?? ((aeClaudeCodeDefaultEffort(next) as AeRoleEffort | null) || "medium");
+-    onChange({ mode: "fixed", model: next, effort });
+-  };
+-  // The bar offers the levels this row's model offers: all five for Claude, the model's own for Codex.
+-  const codexLevels = aeCodexEfforts(codexRow);
+-  const resolved = codexLevels.length > 0;
+-  const baseLevels: readonly AeAgentEffort[] = codexSlot
+-    ? resolved
+-      ? codexLevels
+-      : aeAgentEfforts(agentOption?.agent.harness)
+-    : AE_ROLE_EFFORTS;
+-  const storedEffort = codexSlot?.effort ?? null;
+-  // A stored effort the model no longer offers is shown as it is, as an extra step marked unavailable.
+-  const stray = storedEffort && !baseLevels.includes(storedEffort) ? storedEffort : null;
+-  const barLevels: readonly AeAgentEffort[] = stray ? [...baseLevels, stray] : baseLevels;
+-  const barEffort: AeAgentEffort | null =
+-    storedEffort ?? (codexRow ? aeCodexDefaultEffort(codexRow) : null);
+-  const barUnavailable = resolved ? stray : null;
+-  // A stored model the catalog lacks is sorted like any other: older than its family's newest goes
+-  // under Older models (which then opens), newer goes on top.
+-  const strayModel =
+-    fixed && !listed ? { value: fixed.model, label: aeModelLabel(fixed.model) } : null;
+-  const claudeSplit = aeClaudeFoldSplit(strayModel ? [...models, strayModel] : models);
+-  const strayFirst = (list: readonly AeRoleModelChoice[]) =>
+-    strayModel
+-      ? [...list.filter((m) => m === strayModel), ...list.filter((m) => m !== strayModel)]
+-      : list;
+-  const codexSplit = aeCodexFoldSplit(codex.ready ? codex.rows : []);
+-  const codexOption = (row: NativeModelOption): AeFoldOption => ({
+-    value: `${CODEX}${rowValue(row)}`,
+-    label: aeCodexLabel(row),
+-    id: row.id,
++  const pick = aeRoleModelPick({
++    setting: slot,
++    groups: "all",
++    auto: index === 0,
++    ariaLabel: index === 0 ? "Reviewer model" : `${label} model`,
++    barLabel: index === 0 ? "Reviewer" : label,
++    toolTestId: `ae-reviewer-tool-${index + 1}`,
++    models,
++    options,
++    codex,
++    host,
++    disabled,
++    usedBy,
++    // A reviewer slot never offers the session model, so the pick is always a slot.
++    onChange: (next) => onChange(next as AeReviewerSlot),
+   });
+-  const claudeOption = (model: AeRoleModelChoice): AeFoldOption => ({
+-    value: model.value,
+-    label: model.label,
+-    note: usedBy(model.value) || undefined,
+-  });
+-  const pickerGroups: AeFoldGroup[] = [
+-    {
+-      id: "claude",
+-      label: "Run through Claude, as a subagent",
+-      options: [...strayFirst(claudeSplit.latest).map(claudeOption)],
+-      older: claudeSplit.older.map(claudeOption),
+-    },
+-    ...(codex.ready || codexSlot
+-      ? [
+-          {
+-            id: "codex",
+-            label: "Run through Codex, as a child session",
+-            options: [
+-              ...(codexOffered
+-                ? [
+-                    {
+-                      value: codexValue,
+-                      label: codexRow
+-                        ? aeCodexLabel(codexRow)
+-                        : codexSlot?.model || "Codex, default model",
+-                    },
+-                  ]
+-                : []),
+-              ...codexSplit.latest.map(codexOption),
+-              ...(codex.ready && codex.loading
+-                ? [{ value: "__codex_loading", label: "Loading Codex models", disabled: true }]
+-                : []),
+-              ...(codex.ready && codex.failed
+-                ? [{ value: "__codex_failed", label: "Codex models unavailable", disabled: true }]
+-                : []),
+-            ],
+-            older: codexSplit.older.map(codexOption),
+-          },
+-        ]
+-      : []),
+-    {
+-      id: "agents",
+-      label: "Other agents",
+-      options: [
+-        ...(agentSlot && !codexSlot && !ready.some((o) => o.agent.id === agentId)
+-          ? [{ value, label: agentSlot.name }]
+-          : []),
+-        ...ready.map((o) => ({ value: `${AGENT}${o.agent.id}`, label: o.name })),
+-        ...needSetup
+-          .filter((o) => o.agent.id !== agentId)
+-          .map((o) => ({
+-            value: `${AGENT}${o.agent.id}`,
+-            label: o.name,
+-            note: "needs setup",
+-            disabled: true,
+-          })),
+-      ],
+-      older: [],
+-    },
+-  ];
++  const { agentSlot, agentState, trigger, bar } = pick;
++  const agentOption = agentState?.option ?? null;
+   const { hint } = AE_ROLE_LABELS.reviewer;
+-  const dotModel = fixed ? fixed.model : codexRow ? rowValue(codexRow) : (codexSlot?.model ?? "");
+   return (
+     <div data-testid={`ae-reviewer-slot-${index + 1}`} className={cn(GRID, index > 0 && "pt-2")}>
+       {index === 0 ? (
+@@ -394,57 +219,11 @@ function SlotRow({
+       ) : (
+         <div className="pr-1 text-right text-xs font-medium text-muted-foreground">{index + 1}</div>
+       )}
+-      <div className="relative flex min-w-0 items-center">
+-        {(fixed || codexSlot) && (
+-          <span
+-            aria-hidden="true"
+-            className={cn(
+-              "pointer-events-none absolute left-2.5 size-2 rounded-full",
+-              aeModelDotClass(dotModel),
+-            )}
+-          />
+-        )}
+-        {codexSlot && (
+-          <span
+-            aria-hidden="true"
+-            data-testid={`ae-reviewer-tool-${index + 1}`}
+-            className="pointer-events-none absolute right-7 rounded-full bg-muted px-1.5 py-px text-[11px] font-medium text-foreground"
+-          >
+-            Codex
+-          </span>
+-        )}
+-        <AeFoldPicker
+-          ariaLabel={index === 0 ? "Reviewer model" : `${label} model`}
+-          nameSuffix={codexSlot ? ", runs through Codex" : ""}
+-          value={value}
+-          disabled={disabled}
+-          auto={index === 0 ? { value: AUTO, label: "Auto (the lead picks)" } : undefined}
+-          groups={pickerGroups}
+-          headingHint={<AeHint id="reviewer.older" />}
+-          onPick={choose}
+-          triggerClassName={cn("pr-2", fixed || codexSlot ? "pl-6" : "pl-2")}
+-          nameClassName={codexSlot ? "mr-[4.25rem]" : undefined}
+-        />
+-      </div>
++      {trigger}
+       <div className="col-start-2 flex min-w-0 items-center justify-between gap-2 @lg/roles:col-start-3">
+         <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 @[480px]/roles:flex-nowrap">
+-          {fixed || codexSlot ? (
+-            <AeEffortBar
+-              role={index === 0 ? "Reviewer" : label}
+-              effort={fixed ? fixed.effort : barEffort}
+-              levels={fixed ? AE_ROLE_EFFORTS : barLevels}
+-              unavailable={fixed ? null : barUnavailable}
+-              onChange={(effort) =>
+-                onChange(
+-                  fixed
+-                    ? { ...fixed, effort: effort as AeRoleEffort }
+-                    : codexSlot
+-                      ? { ...codexSlot, effort }
+-                      : slot,
+-                )
+-              }
+-              disabled={disabled}
+-            />
++          {bar ? (
++            bar
+           ) : agentSlot ? (
+             <AgentDetails
+               slot={agentSlot}
+diff --git a/web/src/pages/settings/AeRoleModelPicker.tsx b/web/src/pages/settings/AeRoleModelPicker.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..74b24cb739f008f475130b3180726f2d1f5e4ca4
+--- /dev/null
++++ b/web/src/pages/settings/AeRoleModelPicker.tsx
+@@ -0,0 +1,325 @@
++// The one model picker every role row shares (omnigent-ae, 2026-10-26). It was the
++// Reviewer slot's picker (2026-10-24, folded 2026-10-26); the Lead, Planner, Builder
++// and Helper rows now use it too. Top options (Auto, and for the Lead the Session
++// model), then "Run through Claude, as a subagent" and, where the row allows it,
++// "Run through Codex, as a child session" (each: latest on top, older ones in a
++// fold) and "Other agents" (Reviewer rows only). `aeRoleModelPick` returns the
++// trigger and the effort bar as two nodes so each row lays them out its own way.
++
++import type { ReactNode } from "react";
++import { AeHint } from "@/components/AeHint";
++import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
++import type { AeCodexCatalog } from "@/hooks/useAeCodexCatalog";
++import type { Host } from "@/hooks/useHosts";
++import { aeCodexDefaultEffort, aeCodexEfforts, aeCodexLabel } from "@/lib/aeCodexModels";
++import { aeClaudeFoldSplit, aeCodexFoldSplit } from "@/lib/aeModelFold";
++import { aeClaudeCodeDefaultEffort } from "@/lib/aeEffortDefault";
++import {
++  AE_AGENT_NAME_MAX,
++  AE_CODEX_AGENT_ID,
++  AE_CODEX_AGENT_NAME,
++  type AeReviewerAgentSlot,
++  aeAgentEfforts,
++  aeAgentNameOf,
++  aeIsCodexSlot,
++  aeReviewerAgentStatus,
++} from "@/lib/aeReviewers";
++import { AE_ROLE_EFFORTS, type AeRoleEffort, aeModelDotClass, aeModelLabel } from "@/lib/aeRoles";
++import type { AeAgentEffort } from "@/lib/aeRoleBase";
++import type { AeTeamOption } from "@/lib/aeTeamOptions";
++import { comparableModelId, findNativeModelOption } from "@/lib/codexNativeModels";
++import type { NativeModelOption } from "@/lib/types";
++import { cn } from "@/lib/utils";
++import { AeEffortBar } from "./AeRolesControls";
++import { AeFoldPicker, type AeFoldGroup, type AeFoldOption } from "./AeFoldPicker";
++
++const AUTO = "__auto";
++const SESSION = "__session";
++const AGENT = "agent:";
++const CODEX = "codex:";
++
++/** What a row stores: Auto, the session's model (Lead), a Claude model, or an agent slot. */
++export type AePickSetting =
++  | { mode: "auto" }
++  | { mode: "session" }
++  | { mode: "fixed"; model: string; effort: AeRoleEffort }
++  | AeReviewerAgentSlot;
++
++/** Which groups a row offers under the top options. */
++export type AePickGroups = "claude" | "claude+codex" | "all";
++
++/** The dropdown's value for a Codex model, and the one for "no model named". */
++const rowValue = (row: NativeModelOption) => row.model ?? row.id;
++
++export interface AeRolePickInput {
++  setting: AePickSetting;
++  groups: AePickGroups;
++  /** Offer "Auto (the lead picks)" on top. */
++  auto: boolean;
++  /** Offer "Session model" on top (the Lead only). */
++  session?: boolean;
++  /** The trigger's name without the model, e.g. "Planner model". */
++  ariaLabel: string;
++  /** The effort bar's name, e.g. "Planner". */
++  barLabel: string;
++  /** Test id of the "Codex" tag drawn over the trigger. */
++  toolTestId?: string;
++  models: readonly AeRoleModelChoice[];
++  options: readonly AeTeamOption[];
++  codex: AeCodexCatalog;
++  host: Host | null;
++  disabled: boolean;
++  /** Says which other row already uses a model ("used by Reviewer 2"). */
++  usedBy?: (model: string) => string;
++  onChange: (setting: AePickSetting) => void;
++}
++
++export interface AeRolePick {
++  trigger: ReactNode;
++  /** The effort bar, or null when the setting has none (Auto, Session, another agent). */
++  bar: ReactNode | null;
++  fixed: Extract<AePickSetting, { mode: "fixed" }> | null;
++  agentSlot: AeReviewerAgentSlot | null;
++  codexSlot: AeReviewerAgentSlot | null;
++  agentState: ReturnType<typeof aeReviewerAgentStatus> | null;
++}
++
++export function aeRoleModelPick(input: AeRolePickInput): AeRolePick {
++  const { setting, groups, models, options, codex, host, disabled, onChange } = input;
++  const fixed = setting.mode === "fixed" ? setting : null;
++  const agentSlot = setting.mode === "agent" ? setting : null;
++  const listed = fixed
++    ? models.find((m) => comparableModelId(m.value) === comparableModelId(fixed.model))
++    : undefined;
++  const agentState = agentSlot ? aeReviewerAgentStatus(agentSlot, options, host) : null;
++  const agentOption = agentState?.option ?? null;
++  // The live id when the slot was stored under another one (matched by registered name).
++  const agentId = agentSlot ? (agentOption?.agent.id ?? agentSlot.agent) : "";
++  // A Codex slot shows its model in the one dropdown, like a Claude row; its
++  // models come from the host (the stored one, else the host's default).
++  const codexSlot = agentSlot && aeIsCodexSlot(agentSlot, agentOption) ? agentSlot : null;
++  const defaultRow = codex.rows.find((row) => row.isDefault) ?? null;
++  const codexRow = codexSlot
++    ? codexSlot.model
++      ? findNativeModelOption(codex.rows, codexSlot.model)
++      : defaultRow
++    : null;
++  const codexValue = codexSlot
++    ? `${CODEX}${codexRow ? rowValue(codexRow) : (codexSlot.model ?? "")}`
++    : "";
++  // Everything the host lists, when Codex is ready to pick from (latest on top, the rest in the fold).
++  const pickable = codex.ready ? codex.rows : [];
++  // The saved value always has its own option, whatever the agent's state or the list's.
++  const codexOffered = codexSlot && !pickable.some((row) => row === codexRow);
++  const value = fixed
++    ? (listed?.value ?? fixed.model)
++    : codexSlot
++      ? codexValue
++      : agentSlot
++        ? `${AGENT}${agentId}`
++        : setting.mode === "session"
++          ? SESSION
++          : AUTO;
++  const rest = options.filter((o) => !(codex.ready && o.agent.id === codex.option?.agent.id));
++  const ready = rest.filter((o) => o.readiness.selectable && o.primary);
++  const needSetup = rest.filter((o) => !o.readiness.selectable);
++  const choose = (next: string) => {
++    if (next === AUTO) return onChange({ mode: "auto" });
++    if (next === SESSION) return onChange({ mode: "session" });
++    if (next.startsWith(CODEX)) {
++      const model = next.slice(CODEX.length);
++      const named = codexSlot ?? codex.option;
++      if (!model || !named) return;
++      const target = findNativeModelOption(codex.rows, model);
++      const offered = aeCodexEfforts(target);
++      const current = codexSlot?.effort ?? fixed?.effort ?? null;
++      const effort =
++        current && (offered.length === 0 || offered.includes(current))
++          ? current
++          : aeCodexDefaultEffort(target);
++      // A worker row stores the built-in Codex agent, the only one the server accepts there.
++      const builtIn = groups !== "all";
++      const identity = builtIn ? { agent: AE_CODEX_AGENT_ID, agent_name: AE_CODEX_AGENT_NAME } : {};
++      if (codexSlot) return onChange({ ...codexSlot, ...identity, model, effort });
++      const option = codex.option as AeTeamOption;
++      return onChange({
++        mode: "agent",
++        agent: builtIn ? AE_CODEX_AGENT_ID : option.agent.id,
++        agent_name: builtIn ? AE_CODEX_AGENT_NAME : aeAgentNameOf(option.agent.name),
++        name: Array.from(option.name).slice(0, AE_AGENT_NAME_MAX).join("") || "Agent",
++        model,
++        effort,
++      });
++    }
++    if (next.startsWith(AGENT)) {
++      const id = next.slice(AGENT.length);
++      const option = options.find((o) => o.agent.id === id);
++      if (!option) return;
++      return onChange({
++        mode: "agent",
++        agent: id,
++        agent_name: aeAgentNameOf(option.agent.name),
++        name: Array.from(option.name).slice(0, AE_AGENT_NAME_MAX).join("") || "Agent",
++        model: null,
++        effort: null,
++      });
++    }
++    const carried = fixed?.effort ?? (agentSlot?.effort === "ultra" ? "max" : agentSlot?.effort);
++    const effort =
++      carried ?? ((aeClaudeCodeDefaultEffort(next) as AeRoleEffort | null) || "medium");
++    onChange({ mode: "fixed", model: next, effort });
++  };
++  // The bar offers the levels this row's model offers: all five for Claude, the model's own for Codex.
++  const codexLevels = aeCodexEfforts(codexRow);
++  const resolved = codexLevels.length > 0;
++  const baseLevels: readonly AeAgentEffort[] = codexSlot
++    ? resolved
++      ? codexLevels
++      : aeAgentEfforts(agentOption?.agent.harness)
++    : AE_ROLE_EFFORTS;
++  const storedEffort = codexSlot?.effort ?? null;
++  // A stored effort the model no longer offers is shown as it is, as an extra step marked unavailable.
++  const stray = storedEffort && !baseLevels.includes(storedEffort) ? storedEffort : null;
++  const barLevels: readonly AeAgentEffort[] = stray ? [...baseLevels, stray] : baseLevels;
++  const barEffort: AeAgentEffort | null =
++    storedEffort ?? (codexRow ? aeCodexDefaultEffort(codexRow) : null);
++  const barUnavailable = resolved ? stray : null;
++  // A stored model the catalog lacks is sorted like any other: older than its family's newest goes
++  // under Older models (which then opens), newer goes on top.
++  const strayModel =
++    fixed && !listed ? { value: fixed.model, label: aeModelLabel(fixed.model) } : null;
++  const claudeSplit = aeClaudeFoldSplit(strayModel ? [...models, strayModel] : models);
++  const strayFirst = (list: readonly AeRoleModelChoice[]) =>
++    strayModel
++      ? [...list.filter((m) => m === strayModel), ...list.filter((m) => m !== strayModel)]
++      : list;
++  const codexSplit = aeCodexFoldSplit(codex.ready ? codex.rows : []);
++  const codexOption = (row: NativeModelOption): AeFoldOption => ({
++    value: `${CODEX}${rowValue(row)}`,
++    label: aeCodexLabel(row),
++    id: row.id,
++  });
++  const claudeOption = (model: AeRoleModelChoice): AeFoldOption => ({
++    value: model.value,
++    label: model.label,
++    note: input.usedBy?.(model.value) || undefined,
++  });
++  const top: AeFoldOption[] = [
++    ...(input.auto ? [{ value: AUTO, label: "Auto (the lead picks)" }] : []),
++    ...(input.session ? [{ value: SESSION, label: "Session model" }] : []),
++  ];
++  const pickerGroups: AeFoldGroup[] = [
++    {
++      id: "claude",
++      label: groups === "claude" ? "Claude models" : "Run through Claude, as a subagent",
++      options: [...strayFirst(claudeSplit.latest).map(claudeOption)],
++      older: claudeSplit.older.map(claudeOption),
++    },
++    ...(groups !== "claude" && (codex.ready || codexSlot)
++      ? [
++          {
++            id: "codex",
++            label: "Run through Codex, as a child session",
++            options: [
++              ...(codexOffered
++                ? [
++                    {
++                      value: codexValue,
++                      label: codexRow
++                        ? aeCodexLabel(codexRow)
++                        : codexSlot?.model || "Codex, default model",
++                    },
++                  ]
++                : []),
++              ...codexSplit.latest.map(codexOption),
++              ...(codex.ready && codex.loading
++                ? [{ value: "__codex_loading", label: "Loading Codex models", disabled: true }]
++                : []),
++              ...(codex.ready && codex.failed
++                ? [{ value: "__codex_failed", label: "Codex models unavailable", disabled: true }]
++                : []),
++            ],
++            older: codexSplit.older.map(codexOption),
++          },
++        ]
++      : []),
++    ...(groups === "all"
++      ? [
++          {
++            id: "agents",
++            label: "Other agents",
++            options: [
++              ...(agentSlot && !codexSlot && !ready.some((o) => o.agent.id === agentId)
++                ? [{ value, label: agentSlot.name }]
++                : []),
++              ...ready.map((o) => ({ value: `${AGENT}${o.agent.id}`, label: o.name })),
++              ...needSetup
++                .filter((o) => o.agent.id !== agentId)
++                .map((o) => ({
++                  value: `${AGENT}${o.agent.id}`,
++                  label: o.name,
++                  note: "needs setup",
++                  disabled: true,
++                })),
++            ],
++            older: [],
++          },
++        ]
++      : []),
++  ];
++  const dotModel = fixed ? fixed.model : codexRow ? rowValue(codexRow) : (codexSlot?.model ?? "");
++  const trigger = (
++    <div className="relative flex min-w-0 items-center">
++      {(fixed || codexSlot) && (
++        <span
++          aria-hidden="true"
++          className={cn(
++            "pointer-events-none absolute left-2.5 size-2 rounded-full",
++            aeModelDotClass(dotModel),
++          )}
++        />
++      )}
++      {codexSlot && (
++        <span
++          aria-hidden="true"
++          data-testid={input.toolTestId}
++          className="pointer-events-none absolute right-7 rounded-full bg-muted px-1.5 py-px text-[11px] font-medium text-foreground"
++        >
++          Codex
++        </span>
++      )}
++      <AeFoldPicker
++        ariaLabel={input.ariaLabel}
++        nameSuffix={codexSlot ? ", runs through Codex" : ""}
++        value={value}
++        disabled={disabled}
++        top={top}
++        groups={pickerGroups}
++        headingHint={<AeHint id="reviewer.older" />}
++        onPick={choose}
++        triggerClassName={cn("pr-2", fixed || codexSlot ? "pl-6" : "pl-2")}
++        nameClassName={codexSlot ? "mr-[4.25rem]" : undefined}
++      />
++    </div>
++  );
++  const bar =
++    fixed || codexSlot ? (
++      <AeEffortBar
++        role={input.barLabel}
++        effort={fixed ? fixed.effort : barEffort}
++        levels={fixed ? AE_ROLE_EFFORTS : barLevels}
++        unavailable={fixed ? null : barUnavailable}
++        onChange={(effort) =>
++          onChange(
++            fixed
++              ? { ...fixed, effort: effort as AeRoleEffort }
++              : codexSlot
++                ? { ...codexSlot, effort }
++                : setting,
++          )
++        }
++        disabled={disabled}
++      />
++    ) : null;
++  return { trigger, bar, fixed, agentSlot, codexSlot, agentState };
++}
+diff --git a/web/src/pages/settings/AeRolesEditor.tsx b/web/src/pages/settings/AeRolesEditor.tsx
+index fee90e954ab7fefee9d98a5edf866e9c409519cc..2752a62ce4ab4a611ab444fecef1de7bace39bea 100644
+--- a/web/src/pages/settings/AeRolesEditor.tsx
++++ b/web/src/pages/settings/AeRolesEditor.tsx
+@@ -11,7 +11,6 @@ import type { AeRoleModelChoice } from "@/hooks/useAeRoleModels";
+ import { useAeCodexCatalog } from "@/hooks/useAeCodexCatalog";
+ import { useAeModelUpdates } from "@/hooks/useAeModelUpdates";
+ import { useAeReviewerAgents } from "@/hooks/useAeReviewerAgents";
+-import { aeClaudeCodeDefaultEffort } from "@/lib/aeEffortDefault";
+ import {
+   AE_AUTO_RAISES_MAX,
+   AE_COMING_LATER,
+@@ -19,20 +18,17 @@ import {
+   AE_ROLE_IDS,
+   AE_ROLE_LABELS,
+   type AeRaiseMode,
+-  type AeRoleEffort,
+   type AeRoleId,
+   type AeRolePreset,
+   type AeRoleRules,
+-  type AeRoleSetting,
++  type AeWorkerSetting,
+   type AeRoleTable,
+   aeHelpersOf,
+-  aeModelDotClass,
+-  aeModelLabel,
++  aeRoleAgents,
+ } from "@/lib/aeRoles";
+-import { comparableModelId } from "@/lib/codexNativeModels";
+-import { cn } from "@/lib/utils";
+-import { AeEffortBar, AeRolePresetTile, AeSegmented, AeStepper } from "./AeRolesControls";
+-import { aeReviewerAgents } from "@/lib/aeReviewers";
++import { AeRolePresetTile, AeSegmented, AeStepper } from "./AeRolesControls";
++import type { AeReviewerAgents } from "@/hooks/useAeReviewerAgents";
++import { aeRoleModelPick } from "./AeRoleModelPicker";
+ import { AeUpdateBanner, AeUpdateChip } from "./AeModelUpdates";
+ import { AeReviewerRowsView, AeReviewSettings } from "./AeReviewerRows";
+ 
+@@ -43,9 +39,6 @@ export interface AeRoleDraft {
+   rules: AeRoleRules;
+ }
+ 
+-const AUTO = "__auto";
+-const SESSION = "__session";
+-
+ const RAISE_OPTIONS: { value: AeRaiseMode; label: string }[] = [
+   { value: "off", label: "Off" },
+   { value: "tell", label: "Tell me after" },
+@@ -61,37 +54,43 @@ export function AeRoleRow({
+   role,
+   setting,
+   models,
++  agents,
+   onChange,
+   disabled,
+   chip = null,
++  ownHelpers = false,
+ }: {
+-  role: AeRoleId;
+-  setting: AeRoleSetting;
++  role: Exclude<AeRoleId, "reviewer">;
++  setting: AeWorkerSetting;
+   models: readonly AeRoleModelChoice[];
+-  onChange: (setting: AeRoleSetting) => void;
++  /** The agents and host the Codex group reads (Settings reads them once for all rows). */
++  agents: AeReviewerAgents;
++  onChange: (setting: AeWorkerSetting) => void;
+   disabled: boolean;
+   /** The update chip, on the bar's line. */
+   chip?: React.ReactNode;
++  /** Helpers is "own subagents only": a Codex session here is skipped by the lead. */
++  ownHelpers?: boolean;
+ }) {
+   const { label, hint } = AE_ROLE_LABELS[role];
+-  const fixed = setting.mode === "fixed" ? setting : null;
+-  const listed = fixed
+-    ? models.find((m) => comparableModelId(m.value) === comparableModelId(fixed.model))
+-    : undefined;
+-  const value = fixed
+-    ? (listed?.value ?? fixed.model)
+-    : setting.mode === "session"
+-      ? SESSION
+-      : AUTO;
+-  const choose = (next: string) => {
+-    if (next === AUTO) onChange({ mode: "auto" });
+-    else if (next === SESSION) onChange({ mode: "session" });
+-    else {
+-      const effort =
+-        fixed?.effort ?? ((aeClaudeCodeDefaultEffort(next) as AeRoleEffort | null) || "medium");
+-      onChange({ mode: "fixed", model: next, effort });
+-    }
+-  };
++  const codex = useAeCodexCatalog(agents);
++  // The Lead is the session itself (Claude models and the session's own); the helpers it
++  // starts can also be Codex sessions. Other agents are for reviewers only.
++  const pick = aeRoleModelPick({
++    setting,
++    groups: role === "lead" ? "claude" : "claude+codex",
++    auto: true,
++    session: role === "lead",
++    ariaLabel: `${label} model`,
++    barLabel: label,
++    toolTestId: `ae-role-tool-${role}`,
++    models,
++    options: agents.options,
++    codex,
++    host: agents.host,
++    disabled,
++    onChange,
++  });
+   return (
+     <div
+       data-testid={`ae-role-row-${role}`}
+@@ -104,51 +103,19 @@ export function AeRoleRow({
+         </div>
+         <div className="text-xs leading-tight text-muted-foreground">{hint}</div>
+       </div>
+-      <label className="relative flex min-w-0 items-center">
+-        <span className="sr-only">{`${label} model`}</span>
+-        {fixed && (
+-          <span
+-            aria-hidden="true"
+-            className={cn(
+-              "pointer-events-none absolute left-2.5 size-2 rounded-full",
+-              aeModelDotClass(fixed.model),
+-            )}
+-          />
+-        )}
+-        <select
+-          aria-label={`${label} model`}
+-          value={value}
+-          disabled={disabled}
+-          onChange={(e) => choose(e.target.value)}
+-          className={cn(
+-            "w-full min-w-0 rounded-md border border-input bg-background py-1.5 pr-2 text-sm text-foreground",
+-            fixed ? "pl-6" : "pl-2",
+-          )}
+-        >
+-          <option value={AUTO}>Auto (the lead picks)</option>
+-          {role === "lead" && <option value={SESSION}>Session model</option>}
+-          {fixed && !listed && <option value={fixed.model}>{aeModelLabel(fixed.model)}</option>}
+-          {models.map((model) => (
+-            <option key={model.value} value={model.value}>
+-              {model.label}
+-            </option>
+-          ))}
+-        </select>
+-      </label>
++      {pick.trigger}
+       <div className="col-start-2 flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 @lg/roles:col-start-3 @[480px]/roles:flex-nowrap">
+-        {fixed ? (
+-          <AeEffortBar
+-            role={label}
+-            effort={fixed.effort}
+-            onChange={(effort) => onChange({ ...fixed, effort })}
+-            disabled={disabled}
+-          />
+-        ) : (
++        {pick.bar ?? (
+           <span className="text-xs text-muted-foreground">
+             {setting.mode === "session" ? "The session's model and effort" : "The lead chooses"}
+           </span>
+         )}
+         {chip}
++        {ownHelpers && pick.codexSlot && (
++          <span data-testid={`ae-role-skipped-${role}`} className="text-xs text-amber-500">
++            Skipped: Helpers is Own subagents only
++          </span>
++        )}
+       </div>
+     </div>
+   );
+@@ -228,15 +195,12 @@ export function AeRolesEditor({
+   onDuplicate: () => void;
+   onDelete: () => void;
+ }) {
+-  const setRole = (role: Exclude<AeRoleId, "reviewer">, setting: AeRoleSetting) =>
++  const setRole = (role: Exclude<AeRoleId, "reviewer">, setting: AeWorkerSetting) =>
+     onChange({ ...draft, roles: { ...draft.roles, [role]: setting } });
+   const setRules = (rules: Partial<AeRoleRules>) =>
+     onChange({ ...draft, rules: { ...draft.rules, ...rules } });
+   // The update nudge: a chip per row on an older model, never applied without a click.
+-  const agents = useAeReviewerAgents(
+-    undefined,
+-    aeReviewerAgents(draft.roles.reviewer).map((r) => r.slot.agent),
+-  );
++  const agents = useAeReviewerAgents(undefined, aeRoleAgents(draft.roles));
+   const codex = useAeCodexCatalog(agents);
+   const claudeIds = useMemo(() => models.map((m) => m.value), [models]);
+   const updates = useAeModelUpdates(preset.id, draft.roles, claudeIds, codex.rows, (roles) =>
+@@ -320,9 +284,11 @@ export function AeRolesEditor({
+               role={role}
+               setting={draft.roles[role]}
+               models={models}
++              agents={agents}
+               onChange={(setting) => setRole(role, setting)}
+               disabled={saving}
+               chip={<AeUpdateChip rowKey={role} state={updates} disabled={saving} />}
++              ownHelpers={aeHelpersOf(draft.rules) === "own"}
+             />
+           ),
+         )}
+diff --git a/web/src/pages/settings/AeRolesSettingsSection.test.tsx b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+index 5d0b04ed60562eb530375e24c6a143aa0c108191..26a7572b8269a563fadf688f7036ee07898df38d 100644
+--- a/web/src/pages/settings/AeRolesSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeRolesSettingsSection.test.tsx
+@@ -167,6 +167,15 @@ beforeEach(() => {
+ 
+ afterEach(cleanup);
+ 
++/** The model picker's trigger for a role row. */
++const modelTrigger = (role: string) =>
++  screen.getByRole("button", { name: new RegExp(`^${role} model`) });
++/** Opens a role row's picker and picks the option with this name. */
++const pickModel = (role: string, name: string) => {
++  fireEvent.click(modelTrigger(role));
++  fireEvent.click(within(screen.getByRole("tree")).getByRole("treeitem", { name }));
++};
++
+ describe("AeRolesSettingsSection", () => {
+   it("renders a hint for every Roles control in the inventory", async () => {
+     const two = {
+@@ -212,11 +221,12 @@ describe("AeRolesSettingsSection", () => {
+     const row = within(screen.getByTestId("ae-roles-row"));
+     expect(row.getByRole("button", { name: "Balanced, your default, open" })).toBeInTheDocument();
+     expect(row.getAllByRole("button", { name: "2 more presets" })[0]).toBeInTheDocument();
+-    expect(editor().getByLabelText("Planner model")).toHaveValue(OPUS);
+-    expect(editor().getByLabelText("Lead model")).toHaveValue("__session");
++    expect(modelTrigger("Planner")).toHaveTextContent("Opus 5.5");
++    expect(modelTrigger("Lead")).toHaveTextContent("Session model");
+     expect(screen.queryByTestId("ae-roles-top-tier")).not.toBeInTheDocument();
+     // The catalog's 1M Fable row and the plain one are one choice.
+-    const options = within(editor().getByLabelText("Builder model")).getAllByRole("option");
++    fireEvent.click(modelTrigger("Builder"));
++    const options = within(screen.getByRole("tree")).getAllByRole("treeitem");
+     expect(options.map((o) => o.textContent)).toEqual([
+       "Auto (the lead picks)",
+       "Sonnet 5.5",
+@@ -234,7 +244,7 @@ describe("AeRolesSettingsSection", () => {
+     expect(save).toBeDisabled();
+     const builderEffort = editor().getByRole("radiogroup", { name: "Builder effort" });
+     fireEvent.click(within(builderEffort).getByRole("radio", { name: "High" }));
+-    fireEvent.change(editor().getByLabelText("Helper model"), { target: { value: "__auto" } });
++    pickModel("Helper", "Auto (the lead picks)");
+     fireEvent.click(
+       within(editor().getByTestId("ae-rule-raise")).getByRole("radio", { name: "Ask first" }),
+     );
+@@ -431,7 +441,7 @@ describe("AeRolesSettingsSection", () => {
+     );
+     fireEvent.click(editor().getByRole("button", { name: "Save" }));
+     await waitFor(() => expect(editor().getByRole("button", { name: "Saving…" })).toBeDisabled());
+-    expect(editor().getByLabelText("Helper model")).toBeDisabled();
++    expect(modelTrigger("Helper")).toBeDisabled();
+     expect(
+       within(editor().getByRole("radiogroup", { name: "Builder effort" })).getByRole("radio", {
+         name: "Low",
+@@ -447,7 +457,7 @@ describe("AeRolesSettingsSection", () => {
+     expect(screen.getByRole("button", { name: "New preset" })).toBeDisabled();
+     release(json({}));
+     await waitFor(() => expect(mocks.showToast).toHaveBeenCalledWith("Saved Balanced."));
+-    expect(editor().getByLabelText("Helper model")).not.toBeDisabled();
++    expect(modelTrigger("Helper")).not.toBeDisabled();
+   });
+ 
+   it("reorders with a grip's arrow keys and pins to the top group", async () => {

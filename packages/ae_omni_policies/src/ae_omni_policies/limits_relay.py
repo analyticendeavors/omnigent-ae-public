@@ -22,10 +22,11 @@ missing Codex login never hides the Claude reading:
      capture also carries the session's ``context_window``, posted per
      session for the popover's context row. Since 2026-10-17 the harness also
      writes ``claude_account`` beside it (the backup account the session runs
-     on, empty for the default login): each session's own windows are posted
-     with its account, and the host windows come from a default-login session
-     whenever one has a reading, so a backup account's limits never stand in
-     for the default login's;
+     on, empty for the default login; the runner also writes it at launch since
+     2026-10-26, so a session that has not rendered yet names its account): each
+     session's own windows are posted with its account, and the host windows come
+     from a default-login session whenever one has a reading, so a backup
+     account's limits never stand in for the default login's;
   3. the CLI's stream-json ``get_usage`` control request, answered from the
      claude.ai usage endpoint, for the per-model weekly windows, the usage
      credits and the plan. The CLI is started without
@@ -295,7 +296,9 @@ def scan_live(root: Path) -> list[tuple[str, datetime, str | None]]:
     process. This needs no status line capture, which the harness writes only
     after the session's first render: a session that has not rendered yet (the
     first minutes after a deploy, a fresh one) is live all the same
-    (2026-10-21, the default login's "No live session").
+    (2026-10-21, the default login's "No live session"). Its account is known
+    all the same since 2026-10-26: the runner writes ``claude_account`` at
+    launch, before the first render.
     """
     found: list[tuple[str, datetime, str | None]] = []
     try:

@@ -16,7 +16,7 @@ import pytest
 import respx
 from test_preset_review import Server, _row
 
-from ae_omni_policies import github, preset_runs, preset_suggestions, role_prefs
+from ae_omni_policies import github, preset_review, preset_runs, preset_suggestions, role_prefs
 from ae_omni_policies import router as router_module
 from ae_omni_policies.role_prefs import RolePrefsStore
 
@@ -509,6 +509,89 @@ async def test_status_reports_the_task_the_reviewer_and_the_next_review(
     assert status["next_review"] is not None and status["next_review"] > "2026-10-26T14:00:00"
 
 
+async def test_changing_frequency_patches_only_the_rule_and_monthly_lands_on_a_first_monday(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    await _enable(client, {})
+    world.server.rows = [_row(id="task_1", next_run_at="2026-10-26T14:00:00+00:00")]
+    world.server.calls.clear()
+    monthly = await client.put(
+        "/v1/ae/roles", json=_roles_body(1, insights=INSIGHTS | {"frequency": "monthly"})
+    )
+    assert monthly.json()["insights_task"]["action"] == "updated"
+    patches = [c for c in world.server.writes() if c[0] == "PATCH"]
+    assert len(patches) == 1 and patches[0][2] == {"rrule": preset_review.MONTHLY_RRULE}
+    world.server.rows = [
+        _row(
+            id="task_1", rrule=preset_review.MONTHLY_RRULE, next_run_at="2026-11-02T15:00:00+00:00"
+        )
+    ]
+    sid = world.reviewer()
+    await client.post(f"/v1/ae/sessions/{sid}/preset-suggestions", json=_submit_body(_own()))
+    status = (await client.get("/v1/ae/preset-review")).json()
+    when = datetime.fromisoformat(status["next_review"])
+    assert when.weekday() == 0 and when.day <= 7 and when > datetime.now(UTC) + timedelta(days=26)
+    # Monthly to weekly changes the rule back; weekly to biweekly shares one rule, so the
+    # second save finds the row already right and writes nothing.
+    world.server.rows = [_row(id="task_1", rrule=preset_review.MONTHLY_RRULE)]
+    world.server.calls.clear()
+    weekly = await client.put(
+        "/v1/ae/roles", json=_roles_body(2, insights=INSIGHTS | {"frequency": "weekly"})
+    )
+    assert weekly.json()["insights_task"]["action"] == "updated"
+    assert [c[2] for c in world.server.writes()] == [{"rrule": preset_review.WEEKLY_RRULE}]
+    world.server.rows = [_row(id="task_1", rrule=preset_review.WEEKLY_RRULE)]
+    world.server.calls.clear()
+    biweekly = await client.put(
+        "/v1/ae/roles", json=_roles_body(3, insights=INSIGHTS | {"frequency": "biweekly"})
+    )
+    assert biweekly.json()["insights_task"]["action"] == "unchanged"
+    assert world.server.writes() == []
+
+
+async def test_run_now_then_monthly_keeps_the_rule_and_the_flag(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    await _enable(client, {})
+    world.server.rows = [_row(id="task_1")]
+    started = await client.post("/v1/ae/preset-review/run", json={})
+    assert started.status_code == 202
+    monthly = await client.put(
+        "/v1/ae/roles", json=_roles_body(1, insights=INSIGHTS | {"frequency": "monthly"})
+    )
+    assert monthly.json()["insights_task"]["action"] == "updated"
+    world.server.rows = [_row(id="task_1", rrule=preset_review.MONTHLY_RRULE)]
+    world.server.calls.clear()
+    again = await client.post("/v1/ae/preset-review/run", json={})
+    assert again.status_code == 202
+    assert [c for c in world.server.writes() if c[0] == "PATCH"] == []
+    assert ("POST", "/v1/scheduled-tasks/task_1/run", None) in world.server.calls
+
+
+async def test_a_failed_rule_patch_is_healed_by_the_next_sync_and_by_a_status_read(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    await _enable(client, {})
+    world.server.rows = [_row(id="task_1")]
+    world.server.fail_patches = 1
+    monthly = INSIGHTS | {"frequency": "monthly"}
+    failed = await client.put("/v1/ae/roles", json=_roles_body(1, insights=monthly))
+    assert failed.status_code == 200 and failed.json()["insights_task"]["ok"] is False
+    # The saved frequency is monthly, so the gap is 27 days while the old rule still stands.
+    assert role_prefs.store().get("local").insights.frequency == "monthly"
+    # A status read notices the stale rule and retries once.
+    world.server.calls.clear()
+    await client.get("/v1/ae/preset-review")
+    patches = [c for c in world.server.writes() if c[0] == "PATCH"]
+    assert [p[2] for p in patches] == [{"rrule": preset_review.MONTHLY_RRULE}]
+    # The next roles sync heals it too when the status read did not run.
+    world.server.rows = [_row(id="task_1")]
+    world.server.calls.clear()
+    healed = await client.put("/v1/ae/roles", json=_roles_body(2, insights=monthly))
+    assert healed.json()["insights_task"]["action"] == "updated"
+    assert [c[2] for c in world.server.writes()] == [{"rrule": preset_review.MONTHLY_RRULE}]
+
+
 # -- review round 1 fixes (2026-10-24)
 
 
@@ -791,3 +874,95 @@ async def test_submit_needs_a_due_read_for_that_session(
     assert not_due.json()["due"] is False
     again = await client.post(f"/v1/ae/sessions/{sid2}/preset-suggestions", json=_submit_body())
     assert again.status_code == 409 and again.json()["error"]["code"] == "no_due_read"
+
+
+# -- status-read heal: race and throttle (2026-10-26)
+
+
+@pytest.fixture(autouse=True)
+def _fresh_heal_throttle() -> None:
+    router_module._heal_at.clear()
+
+
+async def test_status_heal_does_not_write_the_old_rule_after_a_frequency_change(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _enable(client, {})
+    store = role_prefs.store()
+    monthly = INSIGHTS | {"frequency": "monthly"}
+    revision = store.get("local").revision
+    store.put("local", role_prefs.RolesPut.model_validate(_roles_body(revision, insights=monthly)))
+    world.server.rows = [_row(id="task_1", rrule=preset_review.WEEKLY_RRULE)]
+    world.server.calls.clear()
+    real_find = preset_review.find_task
+    flipped = False
+
+    async def find_then_flip(http: httpx.AsyncClient, who: str) -> Any:
+        nonlocal flipped
+        row = await real_find(http, who)
+        if not flipped:  # a PUT lands between the GET's snapshot and its heal
+            flipped = True
+            rev = store.get(who).revision
+            weekly = INSIGHTS | {"frequency": "weekly"}
+            store.put(who, role_prefs.RolesPut.model_validate(_roles_body(rev, insights=weekly)))
+        return row
+
+    monkeypatch.setattr(preset_review, "find_task", find_then_flip)
+    response = await client.get("/v1/ae/preset-review")
+    assert response.status_code == 200
+    assert flipped
+    assert [c for c in world.server.writes() if c[0] == "PATCH"] == []
+
+
+async def test_status_heal_does_not_create_a_task_after_insights_are_disabled(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _enable(client, {})
+    store = role_prefs.store()
+    monthly = INSIGHTS | {"frequency": "monthly"}
+    revision = store.get("local").revision
+    store.put("local", role_prefs.RolesPut.model_validate(_roles_body(revision, insights=monthly)))
+    world.server.rows = [_row(id="task_1", rrule=preset_review.WEEKLY_RRULE)]
+    world.server.calls.clear()
+    real_find = preset_review.find_task
+    flipped = False
+
+    async def find_then_disable(http: httpx.AsyncClient, who: str) -> Any:
+        nonlocal flipped
+        row = await real_find(http, who)
+        if not flipped:  # a PUT disables insights and removes the task after the snapshot
+            flipped = True
+            rev = store.get(who).revision
+            off = monthly | {"enabled": False}
+            store.put(who, role_prefs.RolesPut.model_validate(_roles_body(rev, insights=off)))
+            world.server.rows = []
+        return row
+
+    monkeypatch.setattr(preset_review, "find_task", find_then_disable)
+    response = await client.get("/v1/ae/preset-review")
+    assert response.status_code == 200
+    assert flipped
+    assert [c for c in world.server.writes() if c[0] in ("POST", "PATCH")] == []
+    assert world.server.rows == []
+
+
+async def test_status_heal_is_throttled_to_one_attempt_a_minute(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await _enable(client, {})
+    world.server.rows = [_row(id="task_1")]
+    world.server.fail_patches = 5
+    monthly = INSIGHTS | {"frequency": "monthly"}
+    revision = role_prefs.store().get("local").revision
+    role_prefs.store().put(
+        "local", role_prefs.RolesPut.model_validate(_roles_body(revision, insights=monthly))
+    )
+    world.server.calls.clear()
+    await client.get("/v1/ae/preset-review")
+    await client.get("/v1/ae/preset-review")
+    assert len([c for c in world.server.writes() if c[0] == "PATCH"]) == 1
+    # A minute later the next read tries again.
+    now = router_module.time.monotonic()
+    monkeypatch.setattr(router_module.time, "monotonic", lambda: now + 61)
+    await client.get("/v1/ae/preset-review")
+    assert len([c for c in world.server.writes() if c[0] == "PATCH"]) == 2

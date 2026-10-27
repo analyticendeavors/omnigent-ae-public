@@ -509,6 +509,12 @@ class SuggestionStore:
             self._load()
             return copy.deepcopy(self._data["reviews"])
 
+    def all_suggestions(self) -> list[dict[str, Any]]:
+        """Every stored suggestion, any status, oldest first (copies; not capped like a list)."""
+        with self._lock:
+            self._load()
+            return copy.deepcopy(self._data["suggestions"])
+
     def get(self, sid: str) -> dict[str, Any]:
         """One suggestion record (a copy).
 

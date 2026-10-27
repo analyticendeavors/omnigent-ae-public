@@ -48,10 +48,12 @@ transient spike failure is retried in two minutes, a permanent one waits the hou
 
 Four guards from the 2026-10-22 review: a query with more pages than
 :data:`MAX_PAGES` is an error, never a quietly partial total; amounts are
-never converted, so a subscription billed in another currency than the first
-read one gets its own line in its own currency and stays out of the totals, while a
-subscription with no rows has no currency and does not vote for one; and a flag needs a
-finished day within :data:`FLAG_FRESH_DAYS` days and at least
+in USD as Azure reports them (the queries ask for its ``CostUSD`` column, and a subscription
+billed in GBP counts like any other, its reading carrying ``billedIn``). Only a row without
+``CostUSD`` falls back to ``Cost`` in its own currency; a subscription so read, billed in
+another currency than the first read one, gets its own line in its own currency and stays
+out of the totals, and a subscription with no rows has no currency and does not vote for
+one; and a flag needs a finished day within :data:`FLAG_FRESH_DAYS` days and at least
 :data:`FLAG_MIN_PRIOR_DAYS` earlier days, so a new resource or an old spike
 does not raise one.
 
@@ -340,7 +342,11 @@ def _body(day_from: date, day_to: date, grouping: str, granularity: str) -> dict
         "timePeriod": {"from": f"{day_from}T00:00:00Z", "to": f"{day_to}T23:59:59Z"},
         "dataset": {
             "granularity": granularity,
-            "aggregation": {"totalCost": {"name": "Cost", "function": "Sum"}},
+            "aggregation": {
+                "totalCost": {"name": "Cost", "function": "Sum"},
+                # Azure's own USD figure; response columns are "Cost" and "CostUSD".
+                "totalCostUSD": {"name": "CostUSD", "function": "Sum"},
+            },
             "grouping": [{"type": "Dimension", "name": grouping}],
         },
     }
@@ -445,6 +451,26 @@ def _cost(value: object) -> float:
     return float(value)
 
 
+def _has_usd(row: Mapping[str, Any]) -> bool:
+    usd = row.get("CostUSD")
+    return isinstance(usd, (int, float)) and not isinstance(usd, bool)
+
+
+def _amount(row: Mapping[str, Any], use_usd: bool = True) -> tuple[float, str | None, str | None]:
+    """A row's amount, its currency, and the billing currency when the USD figure was used.
+
+    A non-null ``CostUSD`` is Azure's own conversion, so it wins and the currency is USD; the
+    billing currency is kept only when it differs. A row without it keeps ``Cost`` and its own
+    ``Currency`` (the old, never-converted path).
+    """
+    own = row.get("Currency")
+    own = str(own) if own else None
+    usd = row.get("CostUSD")
+    if use_usd and _has_usd(row):
+        return float(usd), "USD", (own if own not in (None, "USD") else None)
+    return _cost(row.get("Cost")), own, None
+
+
 def _resource_name(resource_id: str) -> str:
     return resource_id.rstrip("/").rsplit("/", 1)[-1] or resource_id
 
@@ -478,19 +504,24 @@ async def _read_subscription(
         # The spike check is a bonus on top of the totals: losing it must not lose them.
         note = f"Spike check unavailable: {_scrub(str(exc), cfg)} Totals are complete."
         spike = "permanent" if exc.permanent else "transient"
+    # One basis per subscription, across both queries: CostUSD only when every row has it,
+    # otherwise Cost in the billing currency for every row, so no total mixes the two.
+    use_usd = all(_has_usd(row) for row in (*by_service, *by_resource))
     daily: dict[str, float] = {}
     services: dict[str, dict[str, float]] = {}
     currency: str | None = None
+    billed_in: str | None = None
     for row in by_service:
         day = _day(row.get("UsageDate"))
         if day is None:
             continue
-        amount = _cost(row.get("Cost"))
+        amount, row_currency, row_billed = _amount(row, use_usd)
         daily[str(day)] = daily.get(str(day), 0.0) + amount
         name = str(row.get("ServiceName") or "Other")
         month = services.setdefault(str(day)[:7], {})
         month[name] = month.get(name, 0.0) + amount
-        currency = str(row.get("Currency") or currency or "USD")
+        currency = row_currency or currency or "USD"
+        billed_in = row_billed or billed_in
     resources: dict[str, dict[str, float]] = {}
     if spike is not None and previous is not None:
         # Stale flags beat none; FLAG_FRESH_DAYS ages them out. Days past the query's window
@@ -505,14 +536,15 @@ async def _read_subscription(
         rid = str(row.get("ResourceId") or "")
         if day is None or not rid:
             continue
-        resources.setdefault(rid, {})[str(day)] = resources.get(rid, {}).get(
-            str(day), 0.0
-        ) + _cost(row.get("Cost"))
+        resources.setdefault(rid, {})[str(day)] = (
+            resources.get(rid, {}).get(str(day), 0.0) + _amount(row, use_usd)[0]
+        )
     return {
         "daily": daily,
         "services": services,
         "resources": resources,
         "currency": currency,
+        "billedIn": billed_in if currency == "USD" else None,
         "note": note,
         # How the spike check failed, for _read to pick the retry time; it pops this.
         "spike": spike,
@@ -603,6 +635,8 @@ def _assemble(
                 "spent": round(spent, 2),
                 "currency": row_currency,
                 "counted": counted,
+                # Set when Azure's USD figure stood in for a bill in another currency.
+                "billedIn": None if reading is None else reading.get("billedIn"),
                 # False for a subscription never read (a cold start, a pass that stopped
                 # first): its $0 is not a reading, and the card says "not read yet".
                 "read": reading is not None,
@@ -722,12 +756,16 @@ def _saved_reading(value: object) -> dict[str, Any] | None:
         return None
     if not isinstance(currency, (str, type(None))) or not isinstance(note, (str, type(None))):
         return None
+    billed_in = value.get("billedIn")
+    if not isinstance(billed_in, (str, type(None))):
+        return None
     read_at = _instant(value.get("readAt"))
     out: dict[str, Any] = {
         "daily": daily,
         "services": services,
         "resources": resources,
         "currency": currency,
+        "billedIn": billed_in,
         "note": note,
     }
     if read_at is not None:
@@ -789,6 +827,10 @@ def _load(cfg: Config, path: Path | None) -> dict[str, Any] | None:
         if sid not in configured or reading is None:
             _logger.warning("azure cost: ignoring malformed %s", path)
             return None
+        # A reading saved before CostUSD (a GBP subscription in its own currency) loads as it
+        # is: it stays on the separate-currency path, out of the USD totals, until the next
+        # normal refresh replaces it. It never forces an early re-read, which would ignore a
+        # saved rate-limit wait.
         reading.setdefault("readAt", legacy_at)
         kept[sid] = reading
     return {

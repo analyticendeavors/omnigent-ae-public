@@ -73,6 +73,11 @@ the host unit's secrets file keep the `/secure` paths.
   https overlay.
 - [`uv`](https://docs.astral.sh/uv/) for `<user>`, no sudo:
   `curl -LsSf https://astral.sh/uv/install.sh | sh`.
+- The Claude CLI for `<user>`, signed in, before step 8: `curl -fsSL https://claude.ai/install.sh | bash`,
+  then `claude auth login`. `deploy/install-host.sh` registers the AE MCP server with a
+  `claude` that is already on `PATH` and only warns when there is none, and step 10's
+  unit needs the CLI's directory on its `PATH`. The `CLAUDE_CODE_OAUTH_TOKEN` in the
+  host's secrets file is the setup token for sessions, separate from this login.
 - The checkout, with the submodule:
 
   ```bash
@@ -265,8 +270,8 @@ lag by hours, so the strip shows the time its data runs to.
 #### Shared Claude accounts
 
 So a second user's host can use Claude accounts that the admin manages, without
-copying tokens between hosts. The admin adds them on the Admin Center's Shared
-Claude accounts section; every user's account picker then lists them, marked
+copying tokens between hosts. The admin adds them under Settings, Claude accounts
+(in OmniGent's own Settings, not the Admin Center); every user's account picker then lists them, marked
 Shared, and a session's runner fetches the token from the server at launch
 (`ae_omni_policies/shared_accounts.py` says how it is kept and guarded). The
 tokens sit encrypted in `/data/ae-shared-claude-accounts.json`
@@ -295,7 +300,7 @@ server re-encrypts every stored token under the new key (nothing to re-add).
 Once the file's next load has done that, drop the old key and recreate again.
 
 A token the server has handed to a host stays valid until it is revoked at
-claude.ai: removing a shared account in Admin Center stops new launches but does
+claude.ai: removing a shared account under Settings, Claude accounts stops new launches but does
 not revoke a copy a host already holds, and a Claude session's agent can read its
 own environment. When an account is removed because it leaked, revoke its
 `claude setup-token` login at claude.ai.

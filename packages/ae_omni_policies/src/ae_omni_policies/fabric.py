@@ -174,7 +174,7 @@ from urllib.parse import quote, quote_plus, urlsplit
 
 import httpx
 
-from ae_omni_policies import __version__, key_health
+from ae_omni_policies import USER_AGENT, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -189,7 +189,6 @@ REQUEST_TIMEOUT_S = 8.0
 FLEET_WRITE_TIMEOUT_S = 9.5
 STATUS_TTL_S = 10.0
 SUSPEND_KEY_HEADER = "x-suspend-key"
-USER_AGENT = f"omnigent-ae/{__version__} (+https://github.com/analyticendeavors/omnigent-ae)"
 # The env suffix: upper-case letters, digits and underscores.
 _SUFFIX = re.compile(r"^[A-Z0-9][A-Z0-9_]*$")
 # A state is a word or two of letters (ARM's Active, Paused, ...; the Logic

@@ -137,8 +137,8 @@ AE packages into that venv, editable. `uv sync` prunes anything outside upstream
 lock, so re-run `just setup` after a sync. From there `just lock-check`, `just lint`,
 `just test`, `just upstream-smoke`, `just web-check` and `just ext-build` all run
 (Daily commands, below). Two tests in `tests/deploy/test_deploy.py` run
-`deploy/pull-secrets.sh` under `sudo` and fail without passwordless sudo; they skip
-only when `sudo` is absent.
+`deploy/pull-secrets.sh` under `sudo`; they skip unless you are root or `sudo -n true`
+succeeds (passwordless sudo).
 
 ## Run
 

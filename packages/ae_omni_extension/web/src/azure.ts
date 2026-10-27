@@ -175,6 +175,13 @@ function subscriptionRow(
           `Billed in ${own}, so it is not in the ${currency} total.`,
         ),
     sub.error ? el("span", { class: "azure-sub-err meta" }, sub.error) : null,
+    sub.billedIn
+      ? el(
+          "span",
+          { class: "azure-sub-caveat meta" },
+          `billed in ${sub.billedIn}; USD as Azure reports it`,
+        )
+      : null,
     sub.note ? el("span", { class: "azure-sub-caveat meta" }, sub.note) : null,
   );
 }

@@ -731,6 +731,11 @@ def test_scan_live_counts_running_sessions_without_a_capture(tmp_path: Path) -> 
     live = limits_relay.scan_live(bridges)
     assert sorted((c, a) for c, _, a in live) == [("conv_backup", "work"), ("conv_new", None)]
     assert limits_relay.scan_live(tmp_path / "none") == []
+    # A bridge the harness stamped at launch names its account before any render.
+    snap = limits_relay.with_live(claude_snapshot({"rate_limits": {}}, NOW), live)
+    assert snap is not None
+    by_id = {s.conversation_id: s.account for s in snap.sessions}
+    assert by_id == {"conv_backup": "work", "conv_new": None}
 
 
 def test_with_live_makes_the_default_login_count_without_any_capture(tmp_path: Path) -> None:
@@ -1548,3 +1553,199 @@ def test_the_limits_view_keeps_a_backup_sessions_own_label() -> None:
     own = _own("conv_b", account="Backup", windows=[_window("five_hour", 25)])
     host = _host("statusline", own).model_copy(update={"known_accounts": _KNOWN})
     assert _claude_view(host, "conv_b")["account_label"] == "Backup label"
+
+
+# ── a session the relay has not posted yet (2026-10-26) ─────────────────
+
+
+def _backup_reading(used: float = 21) -> limits.AccountUsage:
+    return limits.AccountUsage(
+        harness="claude",
+        account="Backup",
+        label="AE Backup",
+        windows=[_window("five_hour", used), _window("seven_day", 4)],
+        observed_at=NOW - timedelta(minutes=2),
+    )
+
+
+def _readings(*rows: limits.AccountUsage) -> dict[tuple[str, str], limits.AccountUsage]:
+    return {(r.harness, r.account or ""): r for r in rows}
+
+
+def _default_host(*sessions: limits.SessionLimits) -> LimitSnapshot:
+    return _host("statusline+usage", *sessions).model_copy(update={"known_accounts": _KNOWN})
+
+
+def test_an_unknown_session_on_backup_gets_the_backup_reading() -> None:
+    host = _default_host()
+    view = limits.session_view(
+        host, "conv_new", account="Backup", readings=_readings(_backup_reading())
+    )
+    assert [(w.id, w.used_percent) for w in view.windows] == [("five_hour", 21), ("seven_day", 4)]
+    assert (view.plan, view.credits, view.hint) == (None, None, limits.BACKUP_HINT)
+    assert (view.account, view.account_label) == ("Backup", "AE Backup")
+    assert view.observed_at == NOW - timedelta(minutes=2)
+    assert view.note is not None and "AE Backup" in view.note and "another session" in view.note
+    assert host.windows[0].used_percent == 0  # the stored reading is untouched
+
+
+def test_an_unknown_backup_session_with_no_reading_never_gets_the_defaults_numbers() -> None:
+    view = limits.session_view(_default_host(), "conv_new", account="Backup", readings={})
+    assert view.windows == []
+    assert view.note == limits.NO_ACCOUNT_READING_NOTE.format(account="AE Backup")
+    assert (view.plan, view.credits, view.account) == (None, None, "Backup")
+
+
+def test_a_session_in_the_snapshot_ignores_the_hint() -> None:
+    own = _own("conv_d", windows=[_window("five_hour", 25)])
+    host = _default_host(own)
+    assert (
+        limits.session_view(
+            host, "conv_d", account="Backup", readings=_readings(_backup_reading())
+        )
+        is host
+    )
+
+
+def test_a_listed_backup_session_without_windows_gets_the_accounts_reading() -> None:
+    host = _default_host(_own("conv_b", account="Backup"))
+    view = limits.session_view(host, "conv_b", readings=_readings(_backup_reading()))
+    assert [w.used_percent for w in view.windows] == [21, 4]
+    assert view.observed_at == NOW - timedelta(minutes=2)
+    assert view.note is not None and "another session" in view.note
+    # Without a reading of its own account it still has none, as before.
+    bare = limits.session_view(host, "conv_b", readings={})
+    assert (bare.windows, bare.note) == ([], limits.NO_WINDOWS_NOTE)
+
+
+def test_an_account_the_host_does_not_list_gives_the_host_answer() -> None:
+    host = _default_host()
+    assert limits.session_view(host, "conv_new", account="Gone", readings={}) is host
+
+
+def test_a_default_login_hint_on_a_backup_host_reading_gets_the_default_reading() -> None:
+    host = _default_host().model_copy(update={"account": "Backup", "plan": None})
+    held = limits.AccountUsage(
+        harness="claude",
+        label="AE Default",
+        plan="Max",
+        windows=[_window("five_hour", 7)],
+        observed_at=NOW,
+    )
+    view = limits.session_view(host, "conv_new", account=None, readings=_readings(held))
+    assert (view.account, view.plan, [w.used_percent for w in view.windows]) == (None, "Max", [7])
+
+
+def test_the_store_answers_a_new_backup_chat_from_its_account() -> None:
+    store = LimitStore(None)
+    store.put(_default_host(_own("conv_b", account="Backup", windows=[_window("five_hour", 33)])))
+    body = store.view(now=NOW, session_id="conv_new", account="Backup")["harnesses"]["claude"]
+    assert [w["used_percent"] for w in body["windows"]] == [33]
+    assert body["account"] == "Backup"
+    plain = store.view(now=NOW, session_id="conv_new")["harnesses"]["claude"]
+    assert plain["account"] is None and plain["windows"][0]["used_percent"] == 0
+
+
+# ── the route: label, hint and who may ask ──────────────────────────────
+
+
+@pytest.fixture
+def _two_logins(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    """A stored Claude post with a Backup reading, a settable label and open access."""
+    from ae_omni_policies import router as router_module
+
+    state: dict[str, Any] = {"labels": {}, "open": True, "age_s": 30}
+    own = _own("conv_b", account="Backup", windows=[_window("five_hour", 33)])
+    limits.store().put(_default_host(own))
+
+    async def _may_open(request: Any, user: str | None, session_id: str) -> bool:
+        return bool(state["open"])
+
+    async def _conversation(session_id: str) -> Any:
+        created = int(time.time()) - state["age_s"]
+        return type("Conv", (), {"labels": state["labels"], "created_at": created})()
+
+    monkeypatch.setattr(router_module, "_may_open_session", _may_open)
+    monkeypatch.setattr(router_module, "_conversation", _conversation)
+    return state
+
+
+async def _claude(client: httpx.AsyncClient, query: str) -> dict[str, Any]:
+    response = await client.get(f"/v1/ae/limits?{query}")
+    assert response.status_code == 200, response.text
+    return response.json()["harnesses"]["claude"]
+
+
+async def test_route_uses_the_account_hint_for_a_new_session(
+    client: httpx.AsyncClient, _two_logins: dict[str, Any]
+) -> None:
+    body = await _claude(client, "session_id=conv_new&account=Backup")
+    assert (body["account"], [w["used_percent"] for w in body["windows"]]) == ("Backup", [33])
+    host = await _claude(client, "session_id=conv_new")
+    assert host["account"] is None
+
+
+async def test_route_label_beats_the_hint(
+    client: httpx.AsyncClient, _two_logins: dict[str, Any]
+) -> None:
+    _two_logins["labels"] = {"omnigent.claude_native.account": "Backup"}
+    body = await _claude(client, "session_id=conv_new&account=")
+    assert body["account"] == "Backup"
+    _two_logins["labels"] = {"omnigent.claude_native.account": ""}
+    body = await _claude(client, "session_id=conv_new&account=Backup")
+    assert body["account"] is None
+
+
+async def test_route_ignores_hint_and_label_when_the_caller_cannot_open_the_session(
+    client: httpx.AsyncClient, _two_logins: dict[str, Any]
+) -> None:
+    _two_logins["open"] = False
+    _two_logins["labels"] = {"omnigent.claude_native.account": "Backup"}
+    body = await _claude(client, "session_id=conv_new&account=Backup")
+    assert body["account"] is None
+    assert body["windows"][0]["used_percent"] == 0
+
+
+async def test_route_ignores_the_hint_for_a_session_older_than_the_window(
+    client: httpx.AsyncClient, _two_logins: dict[str, Any]
+) -> None:
+    from ae_omni_policies import router as router_module
+
+    inside = router_module.LIMITS_HINT_WINDOW_S - 60
+    _two_logins["age_s"] = inside
+    assert (await _claude(client, "session_id=conv_new&account=Backup"))["account"] == "Backup"
+    _two_logins["age_s"] = router_module.LIMITS_HINT_WINDOW_S + 60
+    old = await _claude(client, "session_id=conv_new&account=Backup")
+    assert old["account"] is None and old["windows"][0]["used_percent"] == 0
+    # A label has no age limit.
+    _two_logins["labels"] = {"omnigent.claude_native.account": "Backup"}
+    assert (await _claude(client, "session_id=conv_new"))["account"] == "Backup"
+
+
+async def test_route_ignores_account_without_a_session(
+    client: httpx.AsyncClient, _two_logins: dict[str, Any]
+) -> None:
+    assert (await _claude(client, "account=Backup"))["account"] is None
+
+
+def test_a_label_for_an_unlisted_shared_account_is_trusted() -> None:
+    held = limits.AccountUsage(
+        harness="claude",
+        account="shared:Team",
+        label="Team (shared)",
+        windows=[_window("five_hour", 55)],
+        observed_at=NOW,
+    )
+    for host in (_default_host(), _default_host().model_copy(update={"known_accounts": []})):
+        view = limits.session_view(
+            host, "conv_f", account="shared:Team", trusted=True, readings=_readings(held)
+        )
+        assert (view.account, [w.used_percent for w in view.windows]) == ("shared:Team", [55])
+        bare = limits.session_view(
+            host, "conv_f", account="shared:Team", trusted=True, readings={}
+        )
+        assert bare.windows == [] and bare.account == "shared:Team"
+        assert bare.note == limits.NO_ACCOUNT_READING_NOTE.format(account="Team")
+        assert (bare.plan, bare.credits, bare.hint) == (None, None, limits.BACKUP_HINT)
+        # The same account as a hint is not on the host's list: the host answer.
+        assert limits.session_view(host, "conv_f", account="shared:Team", readings={}) is host

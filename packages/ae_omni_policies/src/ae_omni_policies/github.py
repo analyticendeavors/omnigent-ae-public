@@ -42,7 +42,7 @@ from typing import Any, Literal
 
 import httpx
 
-from ae_omni_policies import __version__, key_health
+from ae_omni_policies import USER_AGENT, key_health
 
 API_URL = "https://api.github.com"
 DEFAULT_REPOS: tuple[str, ...] = ()
@@ -55,7 +55,6 @@ TOKEN_ENV = "AE_GITHUB_TOKEN"
 REPOS_ENV = "AE_GITHUB_REPOS"
 LOGIN_ENV = "AE_GITHUB_LOGIN"
 API_URL_ENV = "AE_GITHUB_API_URL"
-USER_AGENT = f"omnigent-ae/{__version__} (+https://github.com/analyticendeavors/omnigent-ae)"
 # Owner and name as GitHub spells them; no dot-only segment, so never a path walk.
 _REPO = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]*/[A-Za-z0-9_-][A-Za-z0-9_.-]*$")
 

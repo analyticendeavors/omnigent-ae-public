@@ -2971,3 +2971,118 @@ block's body is its own component, so a session that leads nothing reads no role
 Reid picked the layout from four mockups (2026-10-26). Tested by `AeSessionHoverStatus.test.tsx`
 and `Sidebar.aeFamilies.test.tsx`. It sits on the fork branch `analyticendeavors/omnigent@ae/family-pin`,
 after `0188`.
+
+`0192` (2026-10-26) adds Both to Settings > Chat > Spend shows. It offered Tokens, Cost or Off;
+Both shows the two together ("1.98M tok · $9.80"). In `web/src/lib/aeSpendDisplay.ts` the mode
+list becomes tokens, cost, both, off (tokens stays the default), and every label now carries
+`parts` (its tokens and cost labels) so a card can show them as separate rows; Tokens, Cost and
+Off produce what they did. `AeSpendDisplaySetting.tsx` gets the fourth card. The Agents card
+(`AeAgentMeta.tsx`) shows both on each session's line, and its total uses cost only when every
+session reports one, else tokens. Under Both a cost that leaves out a session with no cost
+(a subscription one) ends in "+", as an incomplete token total does. Tested by `aeSpendDisplay.test.ts` and
+`AeSpendDisplaySetting.test.tsx` (both now in the `web-test` list). It sits on the fork branch
+`analyticendeavors/omnigent@ae/family-details`, after `0191`.
+
+`0193` (2026-10-26) fills a family lead's row and the hover cards, from Reid's picks on a
+mockup round the same day. Lead rows held 16px for a thinking spinner even when idle, so the name
+stopped about 28px short (`0191`'s slots). In `web/src/lib/aeLeadRowSlots.ts` the spinner now
+takes the time slot when nothing else is there and sits left of a marker only when one is, so an
+idle lead's reserve drops from 90px to 70px and nothing shifts when thinking starts. A folded
+lead's chevron (`AeFamilyTree.tsx`) carries its open count as a badge on its corner, pink when a
+hidden session waits on you; the badge overlaps the chevron, so the time column never moves.
+In `web/src/components/AeSessionHoverStatus.tsx` the FAMILY block reads "3 open · 6 closed",
+shows Tokens and Cost rows under Both, and names up to 4 open sessions (waiting first, then
+working, then idle, each with its role letter, and an arrow when raised), then "+N more"; a child
+that started sessions of its own gets the same block as "Its sessions". A raised helper's card
+adds "Raised from Haiku low · 17h ago · cap reached" and the reason (two lines, full text on
+hover), from the new `aeRaiseDetail` in `web/src/lib/aeModelChange.ts`; an undone raise is read
+from the labels, not the possibly stale usage. Rows under "N closed" get the same hover card as
+open rows (a failed one says it stopped with an error): `AeFamilyTreeSlot` takes a `closedHover` render prop and
+`Sidebar.tsx` passes its card. Tested by `aeLeadRowSlots.test.ts`, `Sidebar.aeLeadSlots.test.tsx`,
+`Sidebar.aeFamilies.test.tsx`, `AeSessionHoverStatus.test.tsx` and `aeModelChange.test.ts` (now
+in the `web-test` list). It sits on the fork branch `analyticendeavors/omnigent@ae/family-details`,
+after `0192`.
+
+
+`0195` (2026-10-26) adds a review frequency to Settings > Roles > Preset insights. The block
+showed a fixed "Every 2 weeks"; `AePresetInsightsBlock.tsx` now offers Weekly, Every 2 weeks and
+Monthly, saved with the insights setting through the same path as Scope and Show (`frequency` on
+`AeInsights` in `web/src/lib/aeRoles.ts`, which also holds the option list; absent reads as Every
+2 weeks). The server side is out of tree (`ae_omni_policies.preset_review`): the frequency picks
+the scheduled task's rule and the skip (6, 13 or 27 days), and the hint says Monthly runs on the
+first Monday and, only while Monthly is selected, that Run now in mid-month can push the next
+review out by up to 8 weeks. The buttons use `aria-disabled` while saving, and the hint is tied to
+the group with `aria-describedby`.
+Tested by `AePresetInsightsBlock.test.tsx` and `aeRoles.test.ts` (both already in the `web-test`
+list). It sits on the fork branch `analyticendeavors/omnigent@ae/preset-review-frequency`, after
+`0194`.
+
+
+`0197` (2026-10-26) truncates a family lead's title at its hover actions, as a standalone row
+does. `0191` kept a lead's right padding fixed on hover and laid a fade under the pin, archive and
+kebab buttons, but the title stayed readable behind them (Reid, 2026-10-26). On hover, focus
+inside the actions or an open menu, the lead row's link now takes 106px of right padding (28px
+chevron slot, 2px wrapper padding, three 24px buttons and two 2px gaps), from
+`AE_LEAD_ACTIONS_RESERVE` and `AE_LEAD_ACTIONS_RESERVE_MENU` in `web/src/lib/aeLeadRowSlots.ts`;
+the classes carry `!` to beat the row's inline resting padding. The fade constants are gone. The
+chevron, time and spinner slots still never move. Measured in the real app: the hovered lead's
+title ends at the pin's left edge, as the standalone row's does. Tested by `aeLeadRowSlots.test.ts`
+and `Sidebar.aeLeadSlots.test.tsx` (both already in the `web-test` list). It sits on the fork
+branch `analyticendeavors/omnigent@ae/family-row-hover-truncate`, after `0196`.
+
+
+`0200` (2026-10-26) puts the Planner, Builder and Helper rows on the Reviewer slot's model picker,
+so each can run as a Claude subagent or a Codex child session. The picker moved out of
+`AeReviewerRows.tsx` into `web/src/pages/settings/AeRoleModelPicker.tsx` (`aeRoleModelPick`:
+Auto and, for the Lead, Session model on top; then Claude and Codex groups, each with its older
+models in a fold; "Other agents" only on Reviewer rows via `groups: "all"`). `AeFoldPicker` takes
+`top` options instead of one `auto`. `AeRoleRow` uses it, so the Lead gets the fold picker with
+Claude models only. `aeRoles.ts` types those three roles as `AeWorkerSetting` (an agent slot is
+allowed, parsed with the new `aeParseAgentSlot`) and `aeRoleAgents` lists every agent a table names
+(pinned in Settings and the per-session dialog). In the lead notice, `ae_reviewers.worker_text`
+renders a Codex worker with its own `role` ("create_session role builder, harness codex") and names
+it as skipped under Helpers Own subagents only; `resolve_agents` settles the live Codex id for
+worker slots too. The server side is out of tree: `role_prefs.py` accepts only a Codex agent slot
+for those roles (other agents run outside the family, with no slot cap or role label) and
+`newer_models.py` offers update chips for a Codex worker. The hints on the three roles say Claude
+or Codex and the skip rule. Tested by `AeModelUpdates.test.tsx`, `AeRolesSettingsSection.test.tsx`,
+`AeTeamControl.test.tsx`, `AeFoldPicker.test.tsx`, `aeRoles.test.ts` and `tests/inner/test_ae_roles.py`
+(all already in the test lists); `AeReviewerRows.test.tsx` passes unchanged. It sits on the fork
+branch `analyticendeavors/omnigent@ae/role-model-picker`, after `0199`.
+
+
+`0201` (2026-10-26) stops `drain_item_observers` from spinning forever on Python 3.12. When every
+task left in `_pending` had already finished but its `_pending.discard` done-callback was still
+queued, `asyncio.gather` completed without yielding, so the `while _pending:` loop starved the
+callback it was waiting for. This hung a CI run of `test_item_observers.py` twice
+(https://github.com/analyticendeavors/omnigent-ae/issues/359). The drain now drops finished tasks
+from `_pending` itself at the top of each pass, returns when none are left, and only then gathers;
+no call site changes, and `test_triage_fixtures.py` shares the fix. Tested by
+`test_drain_returns_when_a_finished_task_is_still_pending` in `tests/server/test_item_observers.py`
+(already in `upstream-smoke`), which runs the stuck state on its own loop in a thread and fails in
+5 seconds without the fix. The file also carries `pytest.mark.timeout(30)`. Only tests call the
+drain; production shutdown does not. It sits on the fork branch
+`analyticendeavors/omnigent@ae/item-observer-flake`, after `0200`.
+
+
+`0202` (2026-10-26) names a Claude session's account before its first reply. The statusLine shim
+wrote `claude_account` into the bridge directory on Claude Code's first render, so a new chat on a
+backup login had no account on record and Usage showed the default login's numbers until the
+limits relay's next tick. New `harnesses/claude_native/ae_launch_account.py` writes the file at
+launch (temp file, then rename) from the env `_auto_create_claude_terminal` builds, now held in a
+variable so the writer and the launch read the same one (4 lines in `orchestration.py`). On the
+web, `fetchAeLimits(sessionId, account?)` and `useAeLimits(active, sessionId, account?)` in
+`AePlanLimits.tsx` send `account=` and key the query on it, with a module-level map that freezes
+the first hint seen per session; the new hook `useAePickedClaudeAccount` reads the account picker's
+selected login (`claude-oauth-active`, via the new `aePickedClaudeAccount` in `aeLimitGate.ts`) and
+holds the request until the host's logins have answered afresh (never from stale cached rows while a refetch runs). `AeRailUsage`, `useAeLimitGate` and the Usage
+popover use it. The server side is out of tree: `limits.session_view` answers from the session's
+account, `router.limits_view` takes `account=` only with a `session_id`, trusts the fork label as it is,
+and uses the hint only for a session created in the last 10 minutes, since the pick is today's and
+not the session's (`docs/PLAN-LIMITS.md`, "A new chat before its first reply"). Tested by
+`tests/harnesses/claude_native/test_ae_launch_account.py` and
+`test_auto_create_claude_terminal_records_the_account_before_the_first_render` in
+`tests/runner/test_app_claude_native_launch_args.py` (both added to `upstream-smoke`),
+`useAePickedClaudeAccount.test.tsx` (added to `web-test`), and `AePlanLimits.test.tsx`,
+`AeRailUsage.test.tsx` and `aeLimitGate.test.ts` (already listed). It sits on the fork branch
+`analyticendeavors/omnigent@ae/usage-session-account`, after `0201`.

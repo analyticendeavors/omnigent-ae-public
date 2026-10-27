@@ -126,10 +126,10 @@ const databricks = (
     asOf: null,
     monthUsd,
     totalUsd: monthUsd,
-    creditUsd: 200,
+    creditUsd: 500,
     cadence: "monthly",
-    creditStart: "2026-08-19",
-    creditEnd: "2027-08-19",
+    creditStart: "2030-01-01",
+    creditEnd: "2030-12-31",
     warehouseId: "w",
   },
 });
@@ -266,13 +266,13 @@ describe("the words", () => {
     const stopped = databricksTile(databricks("STOPPED", 12.4), null);
     expect(stopped).toMatchObject({
       value: "Stopped",
-      note: "$12.40 of $200 used",
+      note: "$12.40 of $500 used",
       health: "idle",
     });
-    expect(creditTile(databricks("STOPPED", 12.4)).value).toBe("$187.60 left");
-    expect(creditHealth(databricks("RUNNING", 160).spend)).toBe("attention");
-    expect(creditHealth(databricks("RUNNING", 210).spend)).toBe("problem");
-    expect(databricksTile(databricks("STOPPED", 210), null).health).toBe(
+    expect(creditTile(databricks("STOPPED", 12.4)).value).toBe("$487.60 left");
+    expect(creditHealth(databricks("RUNNING", 400).spend)).toBe("attention");
+    expect(creditHealth(databricks("RUNNING", 510).spend)).toBe("problem");
+    expect(databricksTile(databricks("STOPPED", 510), null).health).toBe(
       "problem",
     );
     const failed = {
@@ -306,7 +306,7 @@ describe("the strip and the header", () => {
       tiles[1].querySelector(".tile-label svg")?.getAttribute("aria-hidden"),
     ).toBe("true");
     expect(time.textContent).toMatch(/^Updated /);
-    expect(getTile("credit")?.value).toBe("$187.60 left");
+    expect(getTile("credit")?.value).toBe("$487.60 left");
   });
 
   it("runs every registered read from the refresh button", () => {

@@ -8,6 +8,7 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import httpx
 import pytest
@@ -64,6 +65,7 @@ class Server:
         self.agent = agent
         self.calls: list[tuple[str, str, Any]] = []
         self.fail_deletes = 0
+        self.fail_patches = 0
 
     def __call__(self, request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else None
@@ -79,6 +81,9 @@ class Server:
         if path == "/v1/scheduled-tasks" and request.method == "POST":
             return httpx.Response(200, json={"id": "task_new", **body})
         if request.method == "PATCH":
+            if self.fail_patches > 0:
+                self.fail_patches -= 1
+                return httpx.Response(500, json={})
             return httpx.Response(200, json={"id": path.rsplit("/", 1)[1], **body})
         if request.method == "DELETE":
             if self.fail_deletes > 0:
@@ -454,6 +459,135 @@ def test_user_preset_text_is_cleaned_and_capped_before_the_reviewer_sees_it(
     assert len(out["when_to_use"]) == preset_review.MAX_USER_TEXT == 200
     name = out["roles"]["reviewer"]["reviewers"][0]["name"]
     assert "\n" not in name and len(name) <= preset_review.MAX_USER_TEXT
+    # A Codex planner, builder or helper is cleaned the same way.
+    codex = {
+        "mode": "agent",
+        "agent": role_prefs.CODEX_AGENT_ID,
+        "agent_name": role_prefs.CODEX_AGENT_NAME,
+        "name": "Codex\nnow " + "n" * 300,
+    }
+    workers = dirty.roles.model_copy(update={"planner": codex, "builder": codex, "helper": codex})
+    out = preset_review._clean_preset(dirty.model_copy(update={"roles": workers}))
+    for role in ("planner", "builder", "helper"):
+        name = out["roles"][role]["name"]
+        assert "\n" not in name and len(name) <= preset_review.MAX_USER_TEXT
     # The read uses it for every listed preset.
     listed = _read(world)["presets"]["users"]["ann"]["presets"]
     assert all(len(p["when_to_use"]) <= preset_review.MAX_USER_TEXT for p in listed)
+
+
+# -- review frequency (2026-10-26)
+
+
+def test_build_schedule_picks_the_rule_per_frequency() -> None:
+    rules = {
+        f: preset_review.build_schedule(_state(frequency=f), "UTC").rrule
+        for f in ("weekly", "biweekly", "monthly")
+    }
+    assert rules["weekly"] == rules["biweekly"] == "FREQ=WEEKLY;BYDAY=MO;BYHOUR=7;BYMINUTE=0"
+    assert rules["monthly"] == "FREQ=MONTHLY;BYDAY=1MO;BYHOUR=7;BYMINUTE=0"
+    # Never set, or insights off: today's rule.
+    assert preset_review.build_schedule(_state(), "UTC").rrule == preset_review.WEEKLY_RRULE
+
+
+@pytest.mark.parametrize(("frequency", "gap"), [("weekly", 6), ("biweekly", 13), ("monthly", 27)])
+def test_due_state_uses_the_gap_for_the_frequency(
+    world: dict[str, Any], frequency: str, gap: int
+) -> None:
+    _enable(world["roles"], "ann", frequency=frequency)
+    _review_at(world, "ann", gap - 1)
+    skipped = _read(world)
+    assert skipped["due"] is False and f"after {gap}." in skipped["why"]
+    expected = NOW - timedelta(days=gap - 1) + timedelta(days=gap)
+    assert skipped["next_due"].startswith(expected.date().isoformat())
+    world["sugs"] = preset_suggestions.SuggestionStore(world["tmp"] / "other.json")
+    _review_at(world, "ann", gap)
+    assert _read(world)["due"] is True
+
+
+def test_next_review_after_steps_weekly_by_seven_days_and_monthly_to_a_first_monday() -> None:
+    fire = datetime(2026, 10, 26, 14, 0, tzinfo=UTC)  # a Monday, the 26th
+    floor = datetime(2026, 11, 5, tzinfo=UTC)
+    assert preset_review.next_review_after(fire, floor, "weekly") == datetime(
+        2026, 11, 9, 14, 0, tzinfo=UTC
+    )
+    first_mondays = datetime(2026, 11, 2, 14, 0, tzinfo=UTC)
+    assert preset_review.next_review_after(fire, floor, "monthly") == datetime(
+        2026, 12, 7, 14, 0, tzinfo=UTC
+    )
+    assert preset_review.next_review_after(first_mondays, first_mondays, "monthly") == (
+        first_mondays
+    )
+    # Evaluated in the task's zone: 21:00 UTC Sunday is Monday 07:00 in Sydney.
+    zone = ZoneInfo("Australia/Sydney")
+    sunday = datetime(2026, 11, 1, 21, 0, tzinfo=UTC)
+    assert preset_review.next_review_after(sunday, sunday, "monthly", zone) == sunday
+
+
+LA = ZoneInfo("America/Los_Angeles")
+
+
+def _la(*args: int) -> datetime:
+    return datetime(*args, tzinfo=LA)
+
+
+def test_next_review_after_keeps_07_00_local_across_both_dst_changes() -> None:
+    # Autumn: Mon Oct 26 07:00 PDT steps to Mon Nov 2 07:00 PST (14:00Z becomes 15:00Z).
+    fire = _la(2026, 10, 26, 7).astimezone(UTC)
+    got = preset_review.next_review_after(fire, datetime(2026, 11, 1, tzinfo=UTC), "weekly", LA)
+    assert got == _la(2026, 11, 2, 7) and got.astimezone(LA).hour == 7
+    # Spring: Mon Mar 2 07:00 PST steps to Mon Mar 9 07:00 PDT (15:00Z becomes 14:00Z).
+    fire = _la(2026, 3, 2, 7).astimezone(UTC)
+    got = preset_review.next_review_after(fire, datetime(2026, 3, 5, tzinfo=UTC), "weekly", LA)
+    assert got == _la(2026, 3, 9, 7) and got.astimezone(LA).hour == 7
+    # Monthly across the autumn change lands on the first Monday at 07:00 PST.
+    fire = _la(2026, 10, 5, 7).astimezone(UTC)
+    got = preset_review.next_review_after(fire, _la(2026, 10, 20).astimezone(UTC), "monthly", LA)
+    assert got == _la(2026, 11, 2, 7)
+
+
+@pytest.mark.parametrize(
+    ("floor_day", "expected"),
+    [
+        # Floors on days 8 to 31 of a month: the next first Monday after them.
+        ((2026, 10, 8), (2026, 11, 2)),
+        ((2026, 10, 19), (2026, 11, 2)),
+        ((2026, 10, 31), (2026, 11, 2)),
+        ((2026, 12, 15), (2027, 1, 4)),
+        # Floors on days 1 to 7: the first Monday on or after the floor, else next month's.
+        ((2026, 11, 1), (2026, 11, 2)),
+        ((2026, 11, 3), (2026, 12, 7)),
+        ((2026, 11, 7), (2026, 12, 7)),
+        ((2027, 1, 2), (2027, 1, 4)),
+    ],
+)
+def test_monthly_floor_lands_on_the_next_first_monday_at_07_00(
+    floor_day: tuple[int, int, int], expected: tuple[int, int, int]
+) -> None:
+    fire = _la(2026, 10, 5, 7).astimezone(UTC)  # the October first Monday, already fired
+    got = preset_review.next_review_after(fire, _la(*floor_day), "monthly", LA)
+    assert got == _la(*expected, 7)
+    assert got.astimezone(LA).weekday() == 0 and got.astimezone(LA).day <= 7
+
+
+def test_the_monthly_rule_passes_upstreams_validator_and_fires_first_mondays() -> None:
+    from omnigent.server.scheduled.rrule import validate_rrule
+
+    trigger = validate_rrule(preset_review.MONTHLY_RRULE, LA)
+    assert trigger.next_fire_after(_la(2026, 10, 6), LA) == _la(2026, 11, 2, 7)
+    assert trigger.next_fire_after(_la(2026, 11, 2, 7), LA) == _la(2026, 12, 7, 7)
+    assert trigger.next_fire_after(_la(2026, 12, 7, 7), LA) == _la(2027, 1, 4, 7)
+
+
+def test_next_review_after_refuses_a_start_that_is_not_a_monday() -> None:
+    tuesday = datetime(2026, 10, 27, 14, 0, tzinfo=UTC)
+    with pytest.raises(ValueError, match="Monday"):
+        preset_review.next_review_after(tuesday, tuesday, "monthly")
+    # Monday in UTC but Sunday in Los Angeles is also not a Monday start there.
+    with pytest.raises(ValueError, match="Monday"):
+        preset_review.next_review_after(
+            datetime(2026, 10, 26, 3, 0, tzinfo=UTC),
+            datetime(2026, 11, 1, tzinfo=UTC),
+            "weekly",
+            LA,
+        )
