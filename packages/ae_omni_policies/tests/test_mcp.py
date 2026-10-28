@@ -119,6 +119,7 @@ async def test_lists_the_worker_tools_and_ours(omni: OmniClient) -> None:
             "omni_transcript",
             "create_session",
             "post_message",
+            "answer_child_question",
             "schedule_checkin",
             "list_prs",
             "ask_reid",
@@ -457,6 +458,7 @@ ORCHESTRATOR_TOOLS = [
     "list_parked",
     "create_session",
     "post_message",
+    "answer_child_question",
     "schedule_checkin",
     "list_prs",
     "set_session_model",
@@ -472,6 +474,7 @@ def test_the_orchestrator_writes_only_what_it_needs(tmp_path: Path) -> None:
     assert set(allowlist) & WRITING_TOOLS == {
         "create_session",
         "post_message",
+        "answer_child_question",
         "schedule_checkin",
         "omni_set_status",
         "set_session_model",
@@ -483,6 +486,7 @@ def test_every_new_writer_is_on_writing_tools() -> None:
     assert {
         "create_session",
         "post_message",
+        "answer_child_question",
         "schedule_checkin",
         "report_review",
         "submit_preset_suggestions",
@@ -742,6 +746,203 @@ async def test_post_message_posts_one_user_turn() -> None:
     assert empty["error"].startswith("text is empty")
 
 
+LEAD = "conv_lead"
+CHILD = "conv_child"
+ASK = {
+    "type": "response.elicitation_request",
+    "elicitation_id": "elicit_q",
+    "params": {
+        "message": "Keep it?",
+        "ask_user_question": {
+            "questions": [
+                {
+                    "question": "Keep the Fuel Cost measure?",
+                    "header": "Measure",
+                    "options": [{"label": "Keep it"}, {"label": "Drop it"}],
+                    "multiSelect": False,
+                },
+                {
+                    "id": "folders",
+                    "question": "Which folders?",
+                    "options": [{"label": "A"}, {"label": "B"}],
+                    "multiSelect": True,
+                },
+            ]
+        },
+    },
+}
+ANSWERS = {"Keep the Fuel Cost measure?": "Keep it", "folders": ["A", "B"]}
+
+
+def _family_server(
+    *,
+    relay: bool | None = True,
+    labels_: dict[str, str] | None = None,
+    pending: list[dict[str, Any]] | None = None,
+    parent: str | None = None,
+) -> tuple[OmniClient, list[dict[str, Any]]]:
+    """A server whose child session is ``CHILD`` with *pending* prompts; posts land in the list."""
+    posted: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/ae/roles":
+            return httpx.Response(200, json={} if relay is None else {"child_relay": relay})
+        if request.url.path == f"/v1/sessions/{CHILD}":
+            return httpx.Response(
+                200,
+                json={
+                    "id": CHILD,
+                    "labels": {"ae.orch": LEAD} if labels_ is None else labels_,
+                    "parent_session_id": parent,
+                    "pending_elicitations": [ASK] if pending is None else pending,
+                },
+            )
+        if request.url.path == f"/v1/sessions/{CHILD}/elicitations/elicit_q/resolve":
+            posted.append(json.loads(request.content))
+            return httpx.Response(202, json={"queued": False})
+        return httpx.Response(404, json={"error": {"message": "no such route"}})
+
+    return _stub(handler), posted
+
+
+@pytest.fixture(autouse=True)
+def _caller_is_the_lead(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Only the relay tests run as the lead; other tools read the same variable.
+    if request.node.name.startswith("test_answer_child_question"):
+        monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", LEAD)
+
+
+async def _relay(client: OmniClient, **args: Any) -> Any:
+    body = {
+        "child_session_id": CHILD,
+        "elicitation_id": "elicit_q",
+        **args,
+    }
+    async with connect(client) as session:
+        return _payload(await session.call_tool("answer_child_question", body))
+
+
+async def test_answer_child_question_posts_the_web_cards_content_shape() -> None:
+    client, posted = _family_server()
+    answered = await _relay(client, answers=ANSWERS)
+    assert answered == {"answered": True, "child_session_id": CHILD, "elicitation_id": "elicit_q"}
+    # askUserQuestion.ts: a flat {question id or text: label | [labels]} map under accept.
+    assert posted == [{"action": "accept", "content": ANSWERS}]
+
+
+async def test_answer_child_question_cancel_declines() -> None:
+    client, posted = _family_server()
+    assert (await _relay(client, cancel=True))["answered"] is True
+    assert posted == [{"action": "decline"}]
+
+
+async def test_answer_child_question_refuses_when_relay_is_off() -> None:
+    client, posted = _family_server(relay=False)
+    refused = await _relay(client, answers=ANSWERS)
+    assert "Lead relays answers" in refused["error"] and "action dock" in refused["error"]
+    assert posted == []
+
+
+async def test_answer_child_question_defaults_on_when_the_setting_is_absent() -> None:
+    client, posted = _family_server(relay=None)
+    assert (await _relay(client, answers=ANSWERS))["answered"] is True
+    assert len(posted) == 1
+
+
+@pytest.mark.parametrize(
+    "child",
+    [
+        {"labels_": {"ae.orch": "conv_other"}},
+        {"labels_": {"ae.orch": "1"}},
+        {"labels_": {}},
+        {"labels_": {"ae.orch": LEAD, "omnigent.fork.source_id": "conv_src"}},
+        {"parent": "conv_parent"},
+    ],
+    ids=["other-lead", "a-lead", "unlabelled", "fork", "sub-agent"],
+)
+async def test_answer_child_question_refuses_a_session_the_lead_did_not_start(
+    child: dict[str, Any],
+) -> None:
+    client, posted = _family_server(**child)
+    refused = await _relay(client, answers=ANSWERS)
+    assert "not a session" in refused["error"] and "action dock" in refused["error"]
+    assert posted == []
+
+
+async def test_answer_child_question_says_already_answered() -> None:
+    client, posted = _family_server(pending=[])
+    answered = await _relay(client, answers=ANSWERS)
+    assert answered["error"].startswith("Already answered")
+    assert posted == []
+
+
+@pytest.mark.parametrize(
+    "params",
+    [
+        {"message": "Allow Bash?", "phase": "tool_call"},
+        {
+            "message": "Plan",
+            "exit_plan_mode": {"plan": "Do it"},
+            "ask_user_question": ASK["params"]["ask_user_question"],
+        },
+        {"message": "Run?", "command": "ls", "phase": "codex_command_approval"},
+        {
+            "message": "MCP write?",
+            "_meta": {"codex_approval_kind": "mcp_tool_call"},
+            "ask_user_question": ASK["params"]["ask_user_question"],
+        },
+        {
+            # A native Claude MCP-server elicitation (patch 0211): a permission-type card with
+            # the server's schema as a form and no ask_user_question payload.
+            "mode": "form",
+            "message": "powerbi-modeling-sp asks: Delete table Sales?",
+            "phase": "pre_tool_use",
+            "policy_name": "claude_native_permission",
+            "tool_name": "mcp:powerbi-modeling-sp",
+            "requestedSchema": {
+                "type": "object",
+                "properties": {
+                    "Confirm the operation": {
+                        "type": "string",
+                        "enum": ["Yes", "No"],
+                        "enumNames": ["Continue the operation", "Decline the operation"],
+                    }
+                },
+                "required": ["Confirm the operation"],
+            },
+        },
+    ],
+    ids=["tool-permission", "plan-approval", "codex-command", "mcp-write", "mcp-elicitation"],
+)
+async def test_answer_child_question_refuses_every_other_prompt_kind(
+    params: dict[str, Any],
+) -> None:
+    pending = [{**ASK, "params": params}]
+    client, posted = _family_server(pending=pending)
+    refused = await _relay(client, answers=ANSWERS)
+    assert "only a question" in refused["error"] and "action dock" in refused["error"]
+    assert posted == []
+
+
+@pytest.mark.parametrize(
+    "answers",
+    [
+        None,
+        {},
+        {"Keep the Fuel Cost measure?": "Keep it"},
+        {**ANSWERS, "extra": "x"},
+        {"Keep the Fuel Cost measure?": ["Keep it"], "folders": ["A"]},
+        {"Keep the Fuel Cost measure?": "Keep it", "folders": []},
+    ],
+    ids=["none", "empty", "missing-key", "unknown-key", "list-for-single", "empty-multi"],
+)
+async def test_answer_child_question_refuses_a_malformed_answer(answers: Any) -> None:
+    client, posted = _family_server()
+    refused = await _relay(client, **({} if answers is None else {"answers": answers}))
+    assert refused["error"].startswith("Could not answer the child's question")
+    assert posted == []
+
+
 ORCHESTRATED = [
     {
         "id": "conv_fix",
@@ -983,3 +1184,33 @@ async def test_list_prs_reads_reported_urls_so_a_merge_is_seen_without_gh(
     assert by_url[merged["url"]]["attention"] == "close_out"
     assert any("pull/47: 502 GitHub said 404" in error for error in answer["errors"])
     assert any("not a github.com pull request URL" in error for error in answer["errors"])
+
+
+async def test_answer_child_question_ignores_a_spoofed_parent_and_needs_a_caller(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A caller-asserted parent id is no longer an input: it is rejected by the schema.
+    client, posted = _family_server()
+    async with connect(client) as session:
+        spoof = await session.call_tool(
+            "answer_child_question",
+            {
+                "parent_session_id": LEAD,
+                "child_session_id": CHILD,
+                "elicitation_id": "elicit_q",
+                "answers": ANSWERS,
+            },
+        )
+    assert spoof.isError or "parent_session_id" in json.dumps(_payload(spoof))
+    assert posted == []
+    # Another lead's session cannot answer this lead's child.
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_intruder")
+    refused = await _relay(client, answers=ANSWERS)
+    assert "not a session" in refused["error"] and "action dock" in refused["error"]
+    assert posted == []
+    # No caller id at all: refused before any request.
+    monkeypatch.delenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID")
+    monkeypatch.delenv("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID", raising=False)
+    none = await _relay(client, answers=ANSWERS)
+    assert "own id" in none["error"] and "action dock" in none["error"]
+    assert posted == []

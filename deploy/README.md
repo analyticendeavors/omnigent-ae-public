@@ -111,8 +111,8 @@ Compose reads the env file with `$` interpolation, so no value may contain a
 
 `deploy/pull-secrets.sh` is one way to fill both: it reads the values from an
 Azure Key Vault as `<user>` and places the files through sudo, atomically, so a
-failed run leaves the previous files in place. Its defaults are AE's: the vault
-(`AE_VAULT_NAME`), the secret names (the `KV_*` variables at the top of the
+failed run leaves the previous files in place. Its defaults are AE's, except the vault
+(`AE_VAULT_NAME`, required, no default; the shell's value, else the one in `config/host.env`), the secret names (the `KV_*` variables at the top of the
 script) and the files' group (`AE_ENV_GROUP`, which must exist; use `<user>`'s
 group). It fetches one named Fabric capacity and the shared capacities Logic App. It fetches, and `--check`
 requires, all five server keys in the table's required column (the OIDC and
@@ -937,14 +937,14 @@ journalctl --user -u ae-omnigent-secrets-meta -n 20
 ```
 
 A secret shows "no expiry set" until someone sets one: in the portal on its Edit page,
-or `az keyvault secret set-attributes --vault-name ae-secrets-vault --name <name>
+or `az keyvault secret set-attributes --vault-name $AE_VAULT_NAME --name <name>
 --expires <date>`. Edit opens the secret in the Azure portal. Rotate opens the system
 that issues the value (GitHub, the Databricks account console, the Entra app) and the
 hint beside it names the account, because a Databricks login in the wrong tenant cost
 an hour on 2026-10-23.
 
 Since the Key Vault card (2026-10-23) the relay posts every secret of both vaults:
-the box's (`AE_VAULT_NAME`, default `ae-secrets-vault`) and each extra one
+the box's (`AE_VAULT_NAME`, no default; the relay exits 1 with one log line when it is unset, and `--propose-tags` still runs for the extra vaults) and each extra one
 (`AE_EXTRA_VAULTS`, comma-separated, default empty, so no extra vault; set it in `config/host.env`, which the relay unit loads, to add the website's vault). It also says, by key name only, whether `/secure/env/omnigent-host.env`
 (`AE_HOST_ENV_FILE`) has `CLAUDE_CODE_OAUTH_TOKEN`; the file is 640 root:reid, so reid
 can read it, and only a yes or no leaves the relay. A part it cannot read (an extra

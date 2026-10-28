@@ -1,0 +1,1733 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:23:55 -0700
+Subject: [PATCH 210/220] [ae-patch] Show a session's questions and prompts in
+ its lead's action dock
+
+A family child is a top-level session labelled ae.orch with its lead's id, so the sub-agent mirror (parent_conversation_id only) never reached the lead. The server now also mirrors a child's elicitation request and resolved signal into its lead's stream and adds its pending prompts to the lead's snapshot, marked with the child's title. The lead's transcript skips those blocks; the action dock lists them and renders each real approval card, which resolves in the child through the existing resolve route. Two settings rows in Settings > General > Sessions (child_prompts, child_relay on the user's roles) switch the mirror and the lead's relay tool.
+---
+ omnigent/server/ae_family_prompts.py          | 196 ++++++++++++++++
+ omnigent/server/routes/_sessions/helpers.py   |   5 +-
+ tests/server/routes/test_ae_family_prompts.py | 218 ++++++++++++++++++
+ tests/server/routes/test_ae_family_resolve.py |  47 ++++
+ web/src/components/AeActionDock.test.tsx      | 104 +++++++++
+ web/src/components/AeActionDock.tsx           |  49 +++-
+ web/src/components/AeDockChildPrompt.tsx      |  65 ++++++
+ web/src/components/chat/Transcript.tsx        |   5 +-
+ web/src/hooks/useAeActionDockItems.ts         |  33 +++
+ web/src/hooks/useApproveHotkey.test.tsx       |  20 ++
+ web/src/hooks/useApproveHotkey.ts             |   7 +-
+ web/src/lib/aeActionDock.test.ts              |  57 +++++
+ web/src/lib/aeActionDock.ts                   |  55 ++++-
+ web/src/lib/aeFamilyPrompts.test.ts           | 100 ++++++++
+ web/src/lib/aeFamilyPrompts.ts                |  36 +++
+ web/src/lib/aeRoles.ts                        |  21 +-
+ web/src/lib/aeSettingHints.test.ts            |   2 +
+ web/src/lib/aeSettingHints.ts                 |  10 +
+ web/src/lib/blockStream.ts                    |   1 +
+ web/src/lib/blocks.ts                         |   2 +
+ web/src/lib/events.ts                         |   6 +
+ web/src/lib/sse.ts                            |   3 +
+ web/src/pages/ChatPage.tsx                    |   4 +-
+ web/src/pages/SettingsPage.tsx                |   2 +
+ .../settings/AeChildPromptSettings.test.tsx   | 107 +++++++++
+ .../pages/settings/AeChildPromptSettings.tsx  |  78 +++++++
+ 26 files changed, 1216 insertions(+), 17 deletions(-)
+ create mode 100644 omnigent/server/ae_family_prompts.py
+ create mode 100644 tests/server/routes/test_ae_family_prompts.py
+ create mode 100644 tests/server/routes/test_ae_family_resolve.py
+ create mode 100644 web/src/components/AeDockChildPrompt.tsx
+ create mode 100644 web/src/lib/aeFamilyPrompts.test.ts
+ create mode 100644 web/src/lib/aeFamilyPrompts.ts
+ create mode 100644 web/src/pages/settings/AeChildPromptSettings.test.tsx
+ create mode 100644 web/src/pages/settings/AeChildPromptSettings.tsx
+
+diff --git a/omnigent/server/ae_family_prompts.py b/omnigent/server/ae_family_prompts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3f361f7523d6ccde5f28d49af6f00162cfb512b0
+--- /dev/null
++++ b/omnigent/server/ae_family_prompts.py
+@@ -0,0 +1,196 @@
++"""Show a family child's prompts in its lead's chat (omnigent-ae, 2026-10-27).
++
++A sub-agent's prompt (AskUserQuestion, a tool permission, plan approval) is already
++mirrored into its ancestors' streams and snapshots, so the parent chat can render a card
++that resolves in the child. Those mirrors walk only ``parent_conversation_id``. A family
++child is a top-level session whose ``ae.orch`` label holds its lead's session id, so
++nothing reached the lead. This module is that missing link, and only that: the two
++publish helpers and the snapshot function in ``routes/_sessions/helpers.py`` each call one
++function here.
++
++Rules:
++
++* One hop. A child's prompts go to its own lead, never up the chain.
++* A lead has ``ae.orch = "1"`` and is never a child. A fork carries
++  ``omnigent.fork.source_id`` and copies its source's labels, but is a top-level session
++  of its own, so it is never a child either.
++* A session that has a ``parent_conversation_id`` is a sub-agent, mirrored the old way.
++* The owner's setting "child prompts in this chat" (default on) gates all of it.
++
++The mirrored event also carries ``params.ae_family_child`` and ``params.ae_requester_title``
++(the child's title) so the web app can keep it out of the lead's transcript and show it in
++the action dock instead. Resolving needs no new route: the dock posts to the child's own
++resolve route, like the child's card and the Inbox page.
++"""
++
++from __future__ import annotations
++
++import logging
++from typing import TYPE_CHECKING, Any
++
++from omnigent.inner import ae_roles
++from omnigent.runtime import pending_elicitations, session_stream
++
++if TYPE_CHECKING:
++    from omnigent.entities.conversation import Conversation
++    from omnigent.stores.conversation_store import ConversationStore
++
++_logger = logging.getLogger(__name__)
++
++FAMILY_CHILD_PARAM = "ae_family_child"
++REQUESTER_TITLE_PARAM = "ae_requester_title"
++
++
++def _enabled(conv: Conversation, store: ConversationStore) -> bool:
++    """The session owner's "child prompts in this chat" setting; on when unreadable."""
++    module = ae_roles._role_prefs()
++    if module is None:
++        return True
++    try:
++        return bool(module.store().family_flags(ae_roles._owner(conv, store))[0])
++    except Exception:  # noqa: BLE001 (a broken prefs file must never block a prompt)
++        _logger.warning("ae family prompts: could not read the setting", exc_info=True)
++        return True
++
++
++def lead_id_of(conv: Conversation) -> str | None:
++    """The lead session id a family child's ``ae.orch`` label names, else ``None``.
++
++    :param conv: A conversation row.
++    :returns: The lead's id for a top-level, non-fork session labelled with a session id;
++        ``None`` for a lead (``"1"``), an unlabelled session, a fork and a sub-agent.
++    """
++    if getattr(conv, "parent_conversation_id", None):
++        return None
++    labels = conv.labels if isinstance(conv.labels, dict) else {}
++    if labels.get(ae_roles.FORK_SOURCE_LABEL):
++        return None
++    orch = labels.get(ae_roles.ORCH_LABEL)
++    if not isinstance(orch, str):
++        return None
++    lead = orch.strip()
++    return lead if lead not in ("", "1") and lead != conv.id else None
++
++
++def _same_owner(child: Conversation, lead: Conversation, store: ConversationStore) -> bool:
++    return ae_roles._owner(child, store) == ae_roles._owner(lead, store)
++
++
++def valid_lead_id(conv: Conversation, store: ConversationStore) -> str | None:
++    """The lead *conv*'s label names, only if that session exists and has the same owner.
++
++    ``ae.orch`` is not a reserved label, so any session can name any id; without this check a
++    session could push prompt cards into another user's dock.
++    """
++    lead_id = lead_id_of(conv)
++    if lead_id is None:
++        return None
++    lead = store.get_conversation(lead_id)
++    if lead is None or not _same_owner(conv, lead, store):
++        return None
++    return lead_id
++
++
++def family_parent_id(conv: Conversation, store: ConversationStore) -> str | None:
++    """The lead that should see *conv*'s new prompts, or ``None`` (no valid lead, or off)."""
++    lead = valid_lead_id(conv, store)
++    if lead is None or not _enabled(conv, store):
++        return None
++    return lead
++
++
++def _marked(event: dict[str, Any], conv: Conversation) -> dict[str, Any]:
++    """*event* with the family-child marker and the child's title on a copy of its params."""
++    params = event.get("params")
++    base = params if isinstance(params, dict) else {}
++    title = conv.title if isinstance(conv.title, str) else ""
++    return {
++        **event,
++        "params": {**base, FAMILY_CHILD_PARAM: True, REQUESTER_TITLE_PARAM: title or conv.id},
++    }
++
++
++def publish_request(
++    store: ConversationStore,
++    session_id: str,
++    mirrored: dict[str, Any],
++) -> None:
++    """Mirror a child's elicitation request into its lead's stream.
++
++    :param store: Store used to read the child and its owner's setting.
++    :param session_id: The child session that owns the elicitation.
++    :param mirrored: The event as already targeted at the child (``target_session_id`` set).
++    """
++    conv = store.get_conversation(session_id)
++    lead = family_parent_id(conv, store) if conv is not None else None
++    if conv is not None and lead is not None:
++        session_stream.publish(lead, _marked(mirrored, conv))
++
++
++def publish_resolved(
++    store: ConversationStore,
++    session_id: str,
++    elicitation_id: str,
++    action: str | None,
++    reason: str | None,
++) -> None:
++    """Tell a child's lead that the child's prompt is resolved.
++
++    :param store: Store used to read the child and its owner's setting.
++    :param session_id: The child session that owned the elicitation.
++    :param elicitation_id: The elicitation correlation id.
++    :param action: The verdict carried through, as the ancestor mirror does.
++    :param reason: The no-verdict reason carried through.
++    """
++    conv = store.get_conversation(session_id)
++    # Not gated on the setting: switching it off must still clear a card already in the dock.
++    lead = valid_lead_id(conv, store) if conv is not None else None
++    if lead is None:
++        return
++    # Imported here: helpers imports this module, so a top-level import would be circular.
++    from omnigent.server.routes._sessions.helpers import _publish_elicitation_resolved
++
++    _publish_elicitation_resolved(lead, elicitation_id, action=action, reason=reason)
++
++
++def pending_for(
++    store: ConversationStore,
++    lead: Conversation,
++    events: list[dict[str, Any]],
++) -> list[dict[str, Any]]:
++    """Pending prompts of *lead*'s family children that *events* does not hold yet.
++
++    Walks only the sessions that have a prompt pending right now (the in-memory index), so
++    it adds no label query.
++
++    :param store: Store used to load each pending session.
++    :param lead: The session being snapshotted.
++    :param events: Pending events already collected for it (used to skip duplicates).
++    :returns: Family-child prompt events, marked and targeted at their child.
++    """
++    seen = {e.get("elicitation_id") for e in events if isinstance(e.get("elicitation_id"), str)}
++    out: list[dict[str, Any]] = []
++    for session_id in pending_elicitations.pending_session_ids():
++        if session_id == lead.id:
++            continue
++        child = store.get_conversation(session_id)
++        if child is None or lead_id_of(child) != lead.id:
++            continue
++        if not _same_owner(child, lead, store) or not _enabled(child, store):
++            continue
++        for event in pending_elicitations.snapshot_for(session_id):
++            elicitation_id = event.get("elicitation_id")
++            if isinstance(elicitation_id, str):
++                if elicitation_id in seen:
++                    continue
++                seen.add(elicitation_id)
++            params = event.get("params")
++            targeted = {
++                **event,
++                "params": {
++                    **(params if isinstance(params, dict) else {}),
++                    "target_session_id": session_id,
++                },
++            }
++            out.append(_marked(targeted, child))
++    return out
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 8a2c2becfa110b1773603686988dd25346f97683..db44549f12c7409cd3badf3c9e61b18e30e4eeae 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -102,7 +102,7 @@ from omnigent.runtime import (
+ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.runtime.policies.engine import PolicyEngine
+ from omnigent.runtime.tool_output import cap_tool_output
+-from omnigent.server import presence, session_live_state, shutdown_state
++from omnigent.server import ae_family_prompts, presence, session_live_state, shutdown_state
+ from omnigent.server._elicitation_registry import (
+     _harness_elicitation_owners,
+     _harness_parked_elicitations,
+@@ -1580,6 +1580,7 @@ def _publish_elicitation_request_to_ancestors(
+     mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
+     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
+         session_stream.publish(ancestor_id, mirrored)
++    ae_family_prompts.publish_request(conv_store, session_id, mirrored)
+ 
+ 
+ def _publish_elicitation_resolved_to_ancestors(
+@@ -1604,6 +1605,7 @@ def _publish_elicitation_resolved_to_ancestors(
+     """
+     for ancestor_id in _ancestor_session_ids(conv_store, session_id):
+         _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
++    ae_family_prompts.publish_resolved(conv_store, session_id, elicitation_id, action, reason)
+ 
+ 
+ @restart_on_stale_cursor
+@@ -1684,6 +1686,7 @@ def _pending_elicitation_snapshot_for_session(
+             if isinstance(elicitation_id, str):
+                 seen.add(elicitation_id)
+             events.append(_targeted_elicitation_event(event, target_session_id=child.id))
++    events.extend(ae_family_prompts.pending_for(conv_store, conv, events))
+     return events
+ 
+ 
+diff --git a/tests/server/routes/test_ae_family_prompts.py b/tests/server/routes/test_ae_family_prompts.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc006a54602c5d3faf596fd77f42ce9b37293730
+--- /dev/null
++++ b/tests/server/routes/test_ae_family_prompts.py
+@@ -0,0 +1,218 @@
++"""A family child's prompts reach its lead's stream and snapshot (omnigent-ae, 2026-10-27)."""
++
++from __future__ import annotations
++
++from collections.abc import Iterator
++from types import SimpleNamespace
++from typing import Any
++from unittest.mock import Mock
++
++import pytest
++
++from omnigent.inner import ae_roles
++from omnigent.runtime import pending_elicitations
++from omnigent.server import ae_family_prompts
++from omnigent.server.routes._sessions.helpers import (
++    _pending_elicitation_snapshot_for_session,
++    _publish_elicitation_request_to_ancestors,
++    _publish_elicitation_resolved_to_ancestors,
++    _targeted_elicitation_event,
++)
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++
++_EVENT = {
++    "type": "response.elicitation_request",
++    "elicitation_id": "elicit_1",
++    "params": {"message": "Keep it?", "ask_user_question": {"questions": []}},
++}
++
++
++@pytest.fixture
++def prefs(monkeypatch: pytest.MonkeyPatch) -> dict[str, bool]:
++    """The owner's family settings, both on; a test flips ``child_prompts``."""
++    flags = {"child_prompts": True, "child_relay": True}
++    module = SimpleNamespace(
++        store=lambda: SimpleNamespace(
++            family_flags=lambda _user: (flags["child_prompts"], flags["child_relay"])
++        )
++    )
++    monkeypatch.setattr(ae_roles, "_role_prefs", lambda: module)
++    return flags
++
++
++@pytest.fixture
++def published(monkeypatch: pytest.MonkeyPatch) -> Mock:
++    mock = Mock()
++    monkeypatch.setattr("omnigent.server.ae_family_prompts.session_stream.publish", mock)
++    monkeypatch.setattr("omnigent.server.routes._sessions.helpers.session_stream.publish", mock)
++    return mock
++
++
++@pytest.fixture(autouse=True)
++def _clean_index() -> Iterator[None]:
++    pending_elicitations.reset_for_tests()
++    yield
++    pending_elicitations.reset_for_tests()
++
++
++def _family(db_uri: str) -> tuple[SqlAlchemyConversationStore, Any, Any]:
++    store = SqlAlchemyConversationStore(db_uri)
++    lead = store.create_conversation(labels={"ae.orch": "1"})
++    child = store.create_conversation(title="Halcyon Orbital", labels={"ae.orch": lead.id})
++    return store, lead, child
++
++
++def test_a_family_childs_request_reaches_its_lead(
++    db_uri: str, prefs: dict[str, bool], published: Mock
++) -> None:
++    store, lead, child = _family(db_uri)
++    _publish_elicitation_request_to_ancestors(store, child.id, _EVENT)
++    published.assert_called_once()
++    stream_id, event = published.call_args.args
++    assert stream_id == lead.id
++    assert event["elicitation_id"] == "elicit_1"
++    assert event["params"]["target_session_id"] == child.id
++    assert event["params"]["ae_family_child"] is True
++    assert event["params"]["ae_requester_title"] == "Halcyon Orbital"
++    # The original event is untouched.
++    assert "ae_family_child" not in _EVENT["params"]
++
++
++def test_the_resolved_signal_reaches_the_lead(
++    db_uri: str, prefs: dict[str, bool], published: Mock
++) -> None:
++    store, lead, child = _family(db_uri)
++    _publish_elicitation_resolved_to_ancestors(store, child.id, "elicit_1", "accept")
++    stream_id, event = published.call_args.args
++    assert stream_id == lead.id
++    assert event["type"] == "response.elicitation_resolved"
++    assert event["elicitation_id"] == "elicit_1"
++
++
++def test_nothing_is_published_when_the_setting_is_off(
++    db_uri: str, prefs: dict[str, bool], published: Mock
++) -> None:
++    prefs["child_prompts"] = False
++    store, _lead, child = _family(db_uri)
++    _publish_elicitation_request_to_ancestors(store, child.id, _EVENT)
++    published.assert_not_called()
++
++
++@pytest.mark.parametrize("label", ["1", "", "   "])
++def test_a_lead_or_unlabelled_session_has_no_family_parent(
++    db_uri: str, prefs: dict[str, bool], published: Mock, label: str
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    conv = store.create_conversation(labels={"ae.orch": label} if label else {})
++    _publish_elicitation_request_to_ancestors(store, conv.id, _EVENT)
++    published.assert_not_called()
++
++
++def test_a_fork_is_never_a_child(db_uri: str, prefs: dict[str, bool], published: Mock) -> None:
++    store, lead, _child = _family(db_uri)
++    fork = store.create_conversation(
++        labels={"ae.orch": lead.id, "omnigent.fork.source_id": "conv_source"}
++    )
++    _publish_elicitation_request_to_ancestors(store, fork.id, _EVENT)
++    published.assert_not_called()
++
++
++def test_a_sub_agent_still_mirrors_to_its_parent_only(
++    db_uri: str, prefs: dict[str, bool], published: Mock
++) -> None:
++    store, lead, _child = _family(db_uri)
++    parent = store.create_conversation()
++    sub = store.create_conversation(
++        kind="sub_agent",
++        parent_conversation_id=parent.id,
++        title="Explore:agent-1",
++        labels={"ae.orch": lead.id},
++    )
++    _publish_elicitation_request_to_ancestors(store, sub.id, _EVENT)
++    published.assert_called_once()
++    stream_id, event = published.call_args.args
++    assert stream_id == parent.id
++    assert "ae_family_child" not in event["params"]
++
++
++def test_one_hop_only(db_uri: str, prefs: dict[str, bool], published: Mock) -> None:
++    """A child's child goes to its own lead (the child), never the grandparent."""
++    store, lead, child = _family(db_uri)
++    grandchild = store.create_conversation(title="Deep", labels={"ae.orch": child.id})
++    _publish_elicitation_request_to_ancestors(store, grandchild.id, _EVENT)
++    assert [call.args[0] for call in published.call_args_list] == [child.id]
++    assert lead.id not in [call.args[0] for call in published.call_args_list]
++
++
++def test_the_snapshot_lists_a_family_childs_pending_prompt(
++    db_uri: str, prefs: dict[str, bool]
++) -> None:
++    store, lead, child = _family(db_uri)
++    pending_elicitations.record_publish(child.id, _EVENT)
++    events = _pending_elicitation_snapshot_for_session(store, store.get_conversation(lead.id))
++    assert [e["elicitation_id"] for e in events] == ["elicit_1"]
++    assert events[0]["params"]["target_session_id"] == child.id
++    assert events[0]["params"]["ae_family_child"] is True
++    assert events[0]["params"]["ae_requester_title"] == "Halcyon Orbital"
++
++
++def test_the_snapshot_does_not_repeat_a_live_mirror(db_uri: str, prefs: dict[str, bool]) -> None:
++    store, lead, child = _family(db_uri)
++    pending_elicitations.record_publish(child.id, _EVENT)
++    live = ae_family_prompts._marked(
++        _targeted_elicitation_event(_EVENT, target_session_id=child.id), child
++    )
++    pending_elicitations.record_publish(lead.id, live)
++    events = _pending_elicitation_snapshot_for_session(store, store.get_conversation(lead.id))
++    assert [e["elicitation_id"] for e in events] == ["elicit_1"]
++
++
++def test_the_snapshot_skips_other_leads_and_the_setting_off(
++    db_uri: str, prefs: dict[str, bool]
++) -> None:
++    store, lead, child = _family(db_uri)
++    other = store.create_conversation(labels={"ae.orch": "1"})
++    stranger = store.create_conversation(labels={"ae.orch": other.id})
++    pending_elicitations.record_publish(stranger.id, {**_EVENT, "elicitation_id": "elicit_2"})
++    assert _pending_elicitation_snapshot_for_session(store, store.get_conversation(lead.id)) == []
++    pending_elicitations.record_publish(child.id, _EVENT)
++    prefs["child_prompts"] = False
++    assert _pending_elicitation_snapshot_for_session(store, store.get_conversation(lead.id)) == []
++
++
++def _owners(monkeypatch: pytest.MonkeyPatch, owners: dict[str, str]) -> None:
++    monkeypatch.setattr(ae_roles, "_owner", lambda conv, _store: owners.get(conv.id, "local"))
++
++
++def test_a_lead_owned_by_someone_else_gets_nothing(
++    db_uri: str, prefs: dict[str, bool], published: Mock, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    store, lead, child = _family(db_uri)
++    _owners(monkeypatch, {lead.id: "alice", child.id: "mallory"})
++    _publish_elicitation_request_to_ancestors(store, child.id, _EVENT)
++    _publish_elicitation_resolved_to_ancestors(store, child.id, "elicit_1", "accept")
++    published.assert_not_called()
++    pending_elicitations.record_publish(child.id, _EVENT)
++    assert _pending_elicitation_snapshot_for_session(store, store.get_conversation(lead.id)) == []
++
++
++def test_a_missing_lead_gets_nothing(db_uri: str, prefs: dict[str, bool], published: Mock) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    orphan = store.create_conversation(labels={"ae.orch": "0" * 32})
++    _publish_elicitation_request_to_ancestors(store, orphan.id, _EVENT)
++    _publish_elicitation_resolved_to_ancestors(store, orphan.id, "elicit_1", "accept")
++    published.assert_not_called()
++
++
++def test_the_resolved_signal_still_clears_the_dock_when_the_setting_goes_off(
++    db_uri: str, prefs: dict[str, bool], published: Mock
++) -> None:
++    store, lead, child = _family(db_uri)
++    prefs["child_prompts"] = False
++    _publish_elicitation_resolved_to_ancestors(store, child.id, "elicit_1", "accept")
++    stream_id, event = published.call_args.args
++    assert stream_id == lead.id and event["type"] == "response.elicitation_resolved"
++    # New requests stay gated by the setting.
++    published.reset_mock()
++    _publish_elicitation_request_to_ancestors(store, child.id, _EVENT)
++    published.assert_not_called()
+diff --git a/tests/server/routes/test_ae_family_resolve.py b/tests/server/routes/test_ae_family_resolve.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5778eea6c8615bc48379eea70aefbd9584e1d0ee
+--- /dev/null
++++ b/tests/server/routes/test_ae_family_resolve.py
+@@ -0,0 +1,47 @@
++"""A family child's prompt, mirrored to its lead, resolves in the child (omnigent-ae, 2026-10-27).
++
++The lead's action dock posts to the child's own resolve route, so the ownership check inside
++``_resolve_elicitation`` has to pass for the child id and keep refusing the lead id.
++"""
++
++from __future__ import annotations
++
++import asyncio
++from collections.abc import Iterator
++from typing import Any
++
++import pytest
++
++from omnigent.runtime import pending_elicitations
++from omnigent.server import _elicitation_registry as registry
++from omnigent.server.routes._sessions.orchestration import _resolve_elicitation
++
++pytestmark = pytest.mark.asyncio
++
++
++@pytest.fixture(autouse=True)
++def _clean() -> Iterator[None]:
++    registry.reset_for_tests()
++    pending_elicitations.reset_for_tests()
++    yield
++    registry.reset_for_tests()
++    pending_elicitations.reset_for_tests()
++
++
++async def test_the_childs_id_resolves_its_prompt_and_the_leads_id_does_not() -> None:
++    future: asyncio.Future[Any] = asyncio.get_running_loop().create_future()
++    registry._harness_elicitation_registry["elicit_1"] = future
++    registry._harness_elicitation_owners["elicit_1"] = "child_session"
++
++    # The dock never posts to the lead, but a wrong id must not release the child's Future.
++    await _resolve_elicitation(
++        "lead_session", {"elicitation_id": "elicit_1", "action": "accept"}, None
++    )
++    assert not future.done()
++
++    # The child's id is the owner: the dock's verdict releases it.
++    await _resolve_elicitation(
++        "child_session", {"elicitation_id": "elicit_1", "action": "accept"}, None
++    )
++    assert future.done()
++    assert future.result().action == "accept"
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 0f0a18c7689f0c1794c0c8df295128d07312007c..4295992a0f43d4b1d98ef53ffad5ddbd4f75de9c 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -780,3 +780,107 @@ describe("AeActionDock usage gate", () => {
+     expect(await screen.findByTestId("ae-dock-limit-new")).toBeTruthy();
+   });
+ });
++
++describe("AeActionDock child prompts", () => {
++  const ask = {
++    type: "elicitation",
++    ctx: { agent: null, depth: 0, turn: 1, timestamp: 0, responseId: "r1", itemId: "i1" },
++    elicitationId: "fam1",
++    targetSessionId: "conv_child",
++    familyChild: { title: "Halcyon Orbital" },
++    message: "Keep it?",
++    phase: "tool_call",
++    policyName: "",
++    contentPreview: "",
++    requestedSchema: {},
++    status: "pending",
++    response: null,
++    askUserQuestion: {
++      questions: [
++        {
++          question: "Keep the Fuel Cost measure?",
++          header: "Measure",
++          multiSelect: false,
++          options: [{ label: "Keep it" }, { label: "Drop it" }],
++        },
++      ],
++    },
++  } as unknown as AnyBlock;
++  const permission = {
++    ...(ask as object),
++    elicitationId: "fam2",
++    targetSessionId: "conv_other",
++    familyChild: { title: "Brightwater" },
++    message: "Allow Bash: pbi-tools deploy ./model?",
++    askUserQuestion: null,
++  } as unknown as AnyBlock;
++
++  function renderChildDock(blocks: AnyBlock[]) {
++    useChatStore.setState({ conversationId: "s1", blocks });
++    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    qc.setQueryData(["github-info", "s1"], { available: true, prs: [] });
++    return render(
++      <QueryClientProvider client={qc}>
++        <MemoryRouter>
++          <ComposerWorkspaceBar data-testid="composer-workspace-controls">
++            <AeActionDock sessionId="s1" />
++          </ComposerWorkspaceBar>
++        </MemoryRouter>
++      </QueryClientProvider>,
++    );
++  }
++
++  it("leads with the child's title and question, and badges nothing else", async () => {
++    renderChildDock([ask]);
++    const lead = await screen.findByTestId("ae-dock-lead");
++    expect(lead.textContent).toContain("Halcyon Orbital: Keep the Fuel Cost measure?");
++    expect(screen.queryByTestId("ae-dock-jump")).toBeNull();
++  });
++
++  it("opens a tray with each prompt's real card, the child's title and an open link", async () => {
++    renderChildDock([ask, permission]);
++    fireEvent.click(await screen.findByTestId("ae-dock-caret"));
++    const cards = await screen.findAllByTestId("ae-dock-child-prompt");
++    expect(cards).toHaveLength(2);
++    expect(cards[0]!.textContent).toContain("Halcyon Orbital");
++    expect(cards[0]!.textContent).toContain("Keep the Fuel Cost measure?");
++    expect(within(cards[0]!).getByText("Keep it")).toBeTruthy();
++    expect(cards[1]!.textContent).toContain("Brightwater");
++    expect(cards[1]!.textContent).toContain("pbi-tools deploy");
++    expect(within(cards[1]!).getAllByRole("button").length).toBeGreaterThan(0);
++    const links = screen.getAllByTestId("ae-dock-child-open");
++    expect(links[0]!.getAttribute("href")).toBe("/c/conv_child");
++    expect(links[1]!.getAttribute("href")).toBe("/c/conv_other");
++    // A tall prompt scrolls inside the tray, which gets up to half the screen.
++    expect(screen.getByTestId("ae-dock-list").className).toContain("max-h-[50vh]");
++  });
++
++  it("the strip's Answer opens the tray", async () => {
++    renderChildDock([ask]);
++    fireEvent.click(await screen.findByTestId("ae-dock-child-answer"));
++    expect(await screen.findByTestId("ae-dock-child-prompt")).toBeTruthy();
++  });
++
++  it("answers in the child, not in this chat, and the line leaves the dock", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => json({ queued: false }, 202));
++    renderChildDock([ask]);
++    fireEvent.click(await screen.findByTestId("ae-dock-child-answer"));
++    const prompt = await screen.findByTestId("ae-dock-child-prompt");
++    fireEvent.click(within(prompt).getByText("Keep it"));
++    fireEvent.click(within(prompt).getByRole("button", { name: /submit/i }));
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        "/v1/sessions/conv_child/elicitations/fam1/resolve",
++        expect.objectContaining({ method: "POST" }),
++      ),
++    );
++    const call = vi
++      .mocked(authenticatedFetch)
++      .mock.calls.find(([path]) => String(path).includes("/resolve"))!;
++    expect(JSON.parse(String(call[1]?.body))).toEqual({
++      action: "accept",
++      content: { "Keep the Fuel Cost measure?": "Keep it" },
++    });
++    await waitFor(() => expect(screen.queryByTestId("ae-action-dock")).toBeNull());
++  });
++});
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index d8b39ab000eeb5aa28739e18c2e28f7bbb12edcc..7bf53f9baa22a4997ab5c9f09a274a4771d52bb7 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -17,6 +17,7 @@ import {
+   useState,
+ } from "react";
+ import { ConfirmMerge, MERGED_TEXT } from "@/components/AePrCards";
++import { AeDockChildPrompt } from "@/components/AeDockChildPrompt";
+ import { AePrLinkHoverCard } from "@/components/AePrLinkHoverCard";
+ import { COMPOSER_CONTENT_INSET_CLASS } from "@/components/composer/ChatComposer";
+ import { Button } from "@/components/ui/button";
+@@ -41,6 +42,7 @@ import {
+   type AeDockWaiting,
+   aeBranchUpdatePending,
+   aeDeployText,
++  aeDockChildPromptText,
+   aeDockCountText,
+   aeDockSummary,
+   aeDraftText,
+@@ -87,6 +89,7 @@ const WAITING_TONE: Partial<Record<AeReceiptTone, string>> = {
+ 
+ const KIND_STYLE: Record<AeDockKind, { icon: AeTablerIconNode; tone: string; tint: string }> = {
+   question: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
++  childPrompt: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
+   limit: { icon: AE_ICON_GAUGE, tone: RED, tint: "bg-red-500/15" },
+   merge: { icon: AE_ICON_PR_OPEN, tone: GREEN, tint: "bg-emerald-500/15" },
+   draft: { icon: AE_ICON_PR_DRAFT, tone: MUTED, tint: "bg-muted" },
+@@ -159,6 +162,14 @@ function ItemBody({ item, now, expanded }: { item: AeDockItem; now: number; expa
+       </span>
+     );
+   }
++  if (item.kind === "childPrompt") {
++    const text = aeDockChildPromptText(item);
++    return (
++      <span className="min-w-0 truncate" title={text} data-ae-lead-text="">
++        {text}
++      </span>
++    );
++  }
+   const detail =
+     item.kind === "deploy"
+       ? aeDeployText(item, now)
+@@ -335,6 +346,7 @@ function ItemActions({
+   confirming,
+   onMerge,
+   onDismiss,
++  onOpenTray,
+   limitActions,
+   inList,
+ }: {
+@@ -342,6 +354,8 @@ function ItemActions({
+   confirming: boolean;
+   onMerge: () => void;
+   onDismiss: () => void;
++  /** Opens the tray at this item's kind. */
++  onOpenTray: () => void;
+   limitActions: AeLimitActions;
+   /** A line of the opened list, not the strip. */
+   inList: boolean;
+@@ -395,6 +409,18 @@ function ItemActions({
+           <AeTablerSvg node={AE_ICON_ARROW_DOWN} className="size-3" />
+         </Button>
+       );
++    case "childPrompt":
++      // The answer is the real card in the tray; the strip has no room for its buttons.
++      return (
++        <Button
++          variant="outline"
++          className={ACTION}
++          onClick={onOpenTray}
++          data-testid="ae-dock-child-answer"
++        >
++          Answer
++        </Button>
++      );
+     case "merge":
+       return (
+         <Button
+@@ -643,6 +669,8 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+ 
+   const summary = aeDockSummary(items);
+   const confirmOpen = items.some((item) => item.key === confirming);
++  // A child's prompt carries a whole card, so the opened list gets up to half the screen too.
++  const tallList = confirmOpen || items.some((item) => item.kind === "childPrompt");
+   // The item being confirmed went away (merged elsewhere, or its card came on
+   // screen): drop the confirm, and the tray if it was opened only for it.
+   useEffect(() => {
+@@ -694,6 +722,7 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+         setConfirming((key) => (key === item.key ? null : item.key));
+       }}
+       onDismiss={() => dismiss(item.anchor)}
++      onOpenTray={() => toggle(true, item.kind)}
+       limitActions={limitActions}
+     />
+   );
+@@ -783,8 +812,8 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+             className={cn(
+               "relative",
+               "overflow-y-auto overscroll-contain",
+-              // Four lines; a confirm gets up to half the screen to show whole.
+-              confirmOpen ? "max-h-[50vh]" : "max-h-[120px]",
++              // Four lines; a confirm or a child's prompt gets up to half the screen to show whole.
++              tallList ? "max-h-[50vh]" : "max-h-[120px]",
+             )}
+             data-testid="ae-dock-list"
+           >
+@@ -795,12 +824,16 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+                 className={cn(index > 0 && "border-t border-border/60")}
+                 data-testid="ae-dock-line"
+               >
+-                <div className="flex h-[30px] min-w-0 items-center gap-2">
+-                  <ItemIcon item={item} />
+-                  <ItemBody item={item} now={now} expanded />
+-                  <span className="flex-1" />
+-                  {actions(item, true)}
+-                </div>
++                {item.kind === "childPrompt" ? (
++                  <AeDockChildPrompt item={item} />
++                ) : (
++                  <div className="flex h-[30px] min-w-0 items-center gap-2">
++                    <ItemIcon item={item} />
++                    <ItemBody item={item} now={now} expanded />
++                    <span className="flex-1" />
++                    {actions(item, true)}
++                  </div>
++                )}
+                 {confirmFor(item)}
+               </li>
+             ))}
+diff --git a/web/src/components/AeDockChildPrompt.tsx b/web/src/components/AeDockChildPrompt.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..fc283a83ab4b7704fd3b102bfbf1d73a024ceec8
+--- /dev/null
++++ b/web/src/components/AeDockChildPrompt.tsx
+@@ -0,0 +1,65 @@
++// One prompt from a session this chat started, in the action dock's tray (omnigent-ae,
++// 2026-10-27): the child's title, an open link to its chat, and the real approval card.
++// The card is the one the transcript uses; its verdict goes to the child, because the
++// store block carries the child as `targetSessionId` (chatStore.submitApproval). A tall
++// prompt scrolls inside the tray's list.
++
++import { ApprovalCard } from "@/components/blocks/ApprovalCard";
++import { AE_ICON_HELP_CIRCLE } from "@/lib/aeActionDockIcons";
++import type { AeDockChildPrompt } from "@/lib/aeActionDock";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++import type { ElicitationBlock } from "@/lib/blocks";
++import { Link, useLocation } from "@/lib/routing";
++import { sessionNavigationSearch } from "@/lib/sessionNavigation";
++import { useChatStore } from "@/store/chatStore";
++
++export function AeDockChildPrompt({ item }: { item: AeDockChildPrompt }) {
++  const block = useChatStore((s) =>
++    s.blocks.find(
++      (b): b is ElicitationBlock => b.type === "elicitation" && b.elicitationId === item.anchor,
++    ),
++  );
++  const { search } = useLocation();
++  if (!block) return null;
++  return (
++    <div className="pb-2" data-testid="ae-dock-child-prompt">
++      <div className="flex h-[30px] min-w-0 items-center gap-2">
++        <AeTablerSvg
++          node={AE_ICON_HELP_CIRCLE}
++          className="size-3.5 shrink-0 text-amber-600 dark:text-amber-400"
++        />
++        <span className="min-w-0 truncate font-semibold" title={item.childTitle}>
++          {item.childTitle || "A session this chat started"}
++        </span>
++        <span className="flex-1" />
++        <Link
++          to={{ pathname: `/c/${item.childId}`, search: sessionNavigationSearch(search) }}
++          componentId="dock.child_prompt.open"
++          className="shrink-0 text-muted-foreground hover:text-foreground hover:underline"
++          data-testid="ae-dock-child-open"
++        >
++          Open chat
++        </Link>
++      </div>
++      <ApprovalCard
++        elicitationId={block.elicitationId}
++        message={block.message}
++        phase={block.phase}
++        policyName={block.policyName}
++        contentPreview={block.contentPreview}
++        requestedSchema={block.requestedSchema}
++        url={block.url}
++        status={block.status}
++        response={block.response}
++        askUserQuestion={block.askUserQuestion}
++        exitPlanMode={block.exitPlanMode}
++        codexCommand={block.codexCommand}
++        allowAllEdits={block.allowAllEdits}
++        allowAutoMode={block.allowAutoMode}
++        rememberScope={block.rememberScope}
++        codexPersistModes={block.codexPersistModes}
++        className="border-0 bg-transparent p-0"
++      />
++    </div>
++  );
++}
+diff --git a/web/src/components/chat/Transcript.tsx b/web/src/components/chat/Transcript.tsx
+index 8886db186dbaf7c34ffca34f5c3769c60e67ce98..1508166c40f2dee3aea664d85cba6950d8baee89 100644
+--- a/web/src/components/chat/Transcript.tsx
++++ b/web/src/components/chat/Transcript.tsx
+@@ -64,6 +64,7 @@ import {
+ } from "@/components/chat/chatBubbleParts";
+ import { SCROLL_RESTORE_BUDGET_MS } from "@/shell/useScrollRestore";
+ import { useAePublishDockQuestions } from "@/hooks/useAeActionDockItems";
++import { aeWithoutFamilyPrompts } from "@/lib/aeFamilyPrompts";
+ 
+ export interface TranscriptProps {
+   hostId: string | null | undefined;
+@@ -132,7 +133,9 @@ function TranscriptImpl({
+   sandboxLaunching,
+   spacerMeasureRef,
+ }: TranscriptProps) {
+-  const blocks = useChatStore((s) => s.blocks);
++  const storeBlocks = useChatStore((s) => s.blocks);
++  // A family child's prompt lives in the action dock, not in this feed (omnigent-ae).
++  const blocks = useMemo(() => aeWithoutFamilyPrompts(storeBlocks), [storeBlocks]);
+   const pendingUserMessages = useChatStore((s) => s.pendingUserMessages);
+   const activeResponse = useChatStore((s) => s.activeResponse);
+   const interruptedResponseIds = useChatStore((s) => s.interruptedResponseIds);
+diff --git a/web/src/hooks/useAeActionDockItems.ts b/web/src/hooks/useAeActionDockItems.ts
+index 3df2b68078eff3674aec54de3305150782f1de89..97fefb0640252c9ffe344b8834f6ccacc8566948 100644
+--- a/web/src/hooks/useAeActionDockItems.ts
++++ b/web/src/hooks/useAeActionDockItems.ts
+@@ -10,6 +10,7 @@ import { useAeLimitGate } from "@/hooks/useAeLimitGate";
+ import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+ import {
+   type AeDeployTrack,
++  type AeDockChildPromptSource,
+   type AeDockItem,
+   type AeDockPr,
+   type AeDockQuestionSource,
+@@ -18,6 +19,7 @@ import {
+   type AeBranchUpdate,
+   aeBranchUpdatePending,
+   aeDockArrange,
++  aeDockChildPrompts,
+   aeDockDeploys,
+   aeDockDrafts,
+   aeDockWaiting,
+@@ -28,6 +30,7 @@ import {
+ import { type AePrDeploy, aeHasDeployState, aePrDeployQuery } from "@/lib/aePrDeploy";
+ import { type AePrCard, aePrUrlsIn, fetchAePrCard, parseAePrUrl } from "@/lib/aePrs";
+ import type { AnyBlock } from "@/lib/blocks";
++import { aeFamilyPrompts } from "@/lib/aeFamilyPrompts";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ // ── pending questions, published by the transcript ─────────────────────
+@@ -84,6 +87,34 @@ function useDockQuestions(conversationId: string | undefined) {
+   return (conversationId && current.get(conversationId)) || NONE;
+ }
+ 
++// ── prompts of sessions this chat started ──────────────────────────────
++
++/**
++ * The family children's pending prompts as a JSON string, so the store subscription compares
++ * by value and a streamed token never re-renders the dock. Empty when there are none.
++ */
++function childPromptsKey(sessionId: string | undefined): string {
++  const { conversationId, blocks } = useChatStore.getState();
++  if (!sessionId || conversationId !== sessionId) return "";
++  const sources = aeFamilyPrompts(blocks).map((block) => ({
++    id: block.elicitationId,
++    childId: block.targetSessionId!,
++    childTitle: block.familyChild?.title ?? "",
++    message: block.message,
++    askUserQuestion: block.askUserQuestion,
++    codexCommand: block.codexCommand,
++  }));
++  return sources.length ? JSON.stringify(sources) : "";
++}
++
++function useDockChildPrompts(sessionId: string | undefined) {
++  const key = useChatStore(() => childPromptsKey(sessionId));
++  return useMemo(
++    () => aeDockChildPrompts(key ? (JSON.parse(key) as AeDockChildPromptSource[]) : []),
++    [key],
++  );
++}
++
+ // ── pull requests in the transcript ────────────────────────────────────
+ 
+ const urlsOfBlock = new WeakMap<AnyBlock, string[]>();
+@@ -261,10 +292,12 @@ export function useAeActionDockItems(
+   }, [track, now]);
+ 
+   const questions = useDockQuestions(sessionId);
++  const childPrompts = useDockChildPrompts(sessionId);
+   const limit = useAeLimitGate(sessionId);
+   const items = aeDockArrange(
+     [
+       ...aeDockQuestions(questions),
++      ...childPrompts,
+       ...(limit.item ? [limit.item] : []),
+       ...aeDockMerges(withCards),
+       ...aeDockDrafts(withCards),
+diff --git a/web/src/hooks/useApproveHotkey.test.tsx b/web/src/hooks/useApproveHotkey.test.tsx
+index cfd472aa172519bce6f6c8d79e565ea1213f4d90..1281f57a6f5ec058d581f0240ec112a717706f5e 100644
+--- a/web/src/hooks/useApproveHotkey.test.tsx
++++ b/web/src/hooks/useApproveHotkey.test.tsx
+@@ -44,6 +44,26 @@ describe("useApproveHotkey", () => {
+     required: ["branch"],
+   };
+ 
++  it("never accepts a family child's prompt it cannot show, and does not reach past it", () => {
++    blocks = [
++      { ...pending, elicitationId: "own" },
++      {
++        ...pending,
++        elicitationId: "child",
++        targetSessionId: "conv_child",
++        familyChild: { title: "Halcyon" },
++      },
++    ];
++    renderHook(() => useApproveHotkey(true));
++    press();
++    expect(submitApproval).toHaveBeenCalledTimes(1);
++    expect(submitApproval).toHaveBeenCalledWith("own", "accept");
++    submitApproval.mockClear();
++    blocks = [blocks[1]];
++    press();
++    expect(submitApproval).not.toHaveBeenCalled();
++  });
++
+   it("does not accept a prompt that asks for fields", () => {
+     // The card disables Submit until the required fields are answered. A
+     // keystroke that accepts anyway walks around that gate and sends the
+diff --git a/web/src/hooks/useApproveHotkey.ts b/web/src/hooks/useApproveHotkey.ts
+index 7b165f904924a063a9cf526590edb66ec3798081..d31166278fea73898a0cbd7f8dd564970e3a15fe 100644
+--- a/web/src/hooks/useApproveHotkey.ts
++++ b/web/src/hooks/useApproveHotkey.ts
+@@ -21,6 +21,7 @@
+ // keystroke that expressed send intent must never resolve a permission
+ // prompt that mounted moments earlier.
+ 
++import { aeIsFamilyPrompt } from "@/lib/aeFamilyPrompts";
+ import { useEffect } from "react";
+ 
+ import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
+@@ -69,12 +70,16 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
+       const { blocks, submitApproval } = useChatStore.getState();
+       // Newest-first: accept the most recent still-pending prompt that takes a
+       // plain verdict. Skip AskUserQuestion (needs an explicit choice).
++      // A family child's prompt lives in the dock, not on screen, so it never takes this chord.
+       // The newest pending prompt is the one on screen. Searching past it for
+       // an older binary one would accept something the person cannot see while
+       // they are filling in a form.
+       const newest = [...blocks]
+         .reverse()
+-        .find((b): b is ElicitationBlock => b.type === "elicitation" && b.status === "pending");
++        .find(
++          (b): b is ElicitationBlock =>
++            b.type === "elicitation" && b.status === "pending" && !aeIsFamilyPrompt(b),
++        );
+       if (!newest) return;
+       const takesAPlainVerdict =
+         !newest.askUserQuestion && schemaFields(newest.requestedSchema).length === 0;
+diff --git a/web/src/lib/aeActionDock.test.ts b/web/src/lib/aeActionDock.test.ts
+index f65a50cc96c958176c7d9f15f54ce427fde1bbbf..d092366b4b954bb24f3bd1dc5eabf68e5a313f10 100644
+--- a/web/src/lib/aeActionDock.test.ts
++++ b/web/src/lib/aeActionDock.test.ts
+@@ -10,6 +10,8 @@ import {
+   aeDeployTrack,
+   aeDockArrange,
+   aeDockBadgeLabel,
++  aeDockChildPrompts,
++  aeDockChildPromptText,
+   aeDockDeploys,
+   aeDockDrafts,
+   aeDockMerges,
+@@ -386,3 +388,58 @@ describe("deploy text", () => {
+     expect(aeHolderName("local")).toBe("local");
+   });
+ });
++
++describe("a child's prompt in the dock", () => {
++  const child = (id: string, title: string, over = {}) => ({
++    id,
++    childId: `conv_${id}`,
++    childTitle: title,
++    message: "Approve?",
++    askUserQuestion: { questions: [{ question: "Keep the Fuel Cost measure?" }] },
++    ...over,
++  });
++
++  it("ranks right after a question and ahead of a limit or a merge, oldest first", () => {
++    const arranged = aeDockArrange(
++      [
++        ...aeDockDeploys([], new Map(), {}, new Set(), NOW),
++        ...aeDockMerges([]),
++        ...aeDockChildPrompts([child("c1", "Halcyon Orbital"), child("c2", "Brightwater")]),
++        ...aeDockQuestions([{ id: "q1" }]),
++      ],
++      new Set(),
++    );
++    expect(arranged.map((item) => item.key)).toEqual([
++      "question:q1",
++      "childPrompt:c1",
++      "childPrompt:c2",
++    ]);
++  });
++
++  it("is never hidden as an on-screen question", () => {
++    const arranged = aeDockArrange(aeDockChildPrompts([child("c1", "Halcyon")]), new Set(["c1"]));
++    expect(arranged).toHaveLength(1);
++  });
++
++  it("reads 'Title: question' on the bar and '2 child prompts' as a badge", () => {
++    const items = aeDockChildPrompts([
++      child("c1", "Halcyon Orbital"),
++      child("c2", "Brightwater", {
++        askUserQuestion: null,
++        message: "Allow Bash: pbi-tools deploy ./model?",
++      }),
++    ]);
++    expect(aeDockChildPromptText(items[0]!)).toBe("Halcyon Orbital: Keep the Fuel Cost measure?");
++    expect(aeDockChildPromptText(items[1]!)).toBe(
++      "Brightwater: Allow Bash: pbi-tools deploy ./model?",
++    );
++    expect(aeDockBadgeLabel(items)).toBe("2 child prompts");
++    expect(aeDockBadgeLabel(items.slice(0, 1))).toBe("Child prompt");
++    const summary = aeDockSummary(
++      aeDockArrange([...aeDockMerges([]), ...items], new Set()),
++      clock,
++    )!;
++    expect(summary.lead.kind).toBe("childPrompt");
++    expect(summary.more).toBe(1);
++  });
++});
+diff --git a/web/src/lib/aeActionDock.ts b/web/src/lib/aeActionDock.ts
+index ff627ce3ca4eab0d3387dfd4ede23441744b4fac..9baff8e6f42f67e7a005427efef6ab148d957291 100644
+--- a/web/src/lib/aeActionDock.ts
++++ b/web/src/lib/aeActionDock.ts
+@@ -7,15 +7,18 @@ import { type AePrDeploy, aeHasDeployState } from "@/lib/aePrDeploy";
+ import { type AePrReceipt, aePrReceipt } from "@/lib/aePrReceipt";
+ import { type AePrCard, aeCiText, aeReadyToMerge } from "@/lib/aePrs";
+ 
+-export type AeDockKind = "question" | "limit" | "merge" | "draft" | "waiting" | "deploy";
++export type AeDockKind =
++  "question" | "childPrompt" | "limit" | "merge" | "draft" | "waiting" | "deploy";
+ 
+ /**
+- * Urgency: a question blocks the agent, a usage limit is about to, a merge
++ * Urgency: a question blocks the agent, and so does a prompt from a session this chat
++ * started (listed right after it), a usage limit is about to, a merge
+  * waits on a click, a draft on a click before review, an open pull request
+  * that is not ready on checks or a person, a deploy only on time.
+  */
+ export const AE_DOCK_KINDS: readonly AeDockKind[] = [
+   "question",
++  "childPrompt",
+   "limit",
+   "merge",
+   "draft",
+@@ -58,6 +61,19 @@ export interface AeDockQuestion extends ItemBase {
+   text: string;
+ }
+ 
++/**
++ * A prompt a session this chat started is waiting on (omnigent-ae, 2026-10-27). The tray
++ * renders its real card from the chat store by `anchor` (the elicitation id) and resolves
++ * it in the child.
++ */
++export interface AeDockChildPrompt extends ItemBase {
++  kind: "childPrompt";
++  childId: string;
++  childTitle: string;
++  /** The question, the command or the prompt's first line. */
++  text: string;
++}
++
+ export interface AeDockMerge extends ItemBase {
+   kind: "merge";
+   url: string;
+@@ -109,7 +125,13 @@ export interface AeDockLimit extends ItemBase {
+ }
+ 
+ export type AeDockItem =
+-  AeDockQuestion | AeDockLimit | AeDockMerge | AeDockDraft | AeDockWaiting | AeDockDeploy;
++  | AeDockQuestion
++  | AeDockChildPrompt
++  | AeDockLimit
++  | AeDockMerge
++  | AeDockDraft
++  | AeDockWaiting
++  | AeDockDeploy;
+ 
+ /** "owner/repo#123", a pull request item's anchor. */
+ export function aeDockPrAnchor(repo: string, number: number): string {
+@@ -147,6 +169,31 @@ export function aeDockQuestions(sources: readonly AeDockQuestionSource[]): AeDoc
+   }));
+ }
+ 
++export interface AeDockChildPromptSource extends AeDockQuestionSource {
++  /** The child session that owns the prompt; the verdict is posted to it. */
++  childId: string;
++  childTitle: string;
++}
++
++export function aeDockChildPrompts(
++  sources: readonly AeDockChildPromptSource[],
++): AeDockChildPrompt[] {
++  return sources.map((source, order) => ({
++    kind: "childPrompt",
++    key: `childPrompt:${source.id}`,
++    anchor: source.id,
++    order,
++    childId: source.childId,
++    childTitle: source.childTitle,
++    text: aeDockQuestionText(source),
++  }));
++}
++
++/** "Halcyon Orbital: Keep the measure?", the bar's line for a child's prompt. */
++export function aeDockChildPromptText(item: AeDockChildPrompt): string {
++  return item.childTitle ? `${item.childTitle}: ${item.text}` : item.text;
++}
++
+ export interface AeDockPr {
+   url: string;
+   repo: string;
+@@ -317,6 +364,8 @@ export function aeDockBadgeLabel(
+   switch (first.kind) {
+     case "question":
+       return many ? `${items.length} questions` : "Question waiting";
++    case "childPrompt":
++      return many ? `${items.length} child prompts` : "Child prompt";
+     case "limit":
+       return aeLimitGateShort(first.gate);
+     case "merge":
+diff --git a/web/src/lib/aeFamilyPrompts.test.ts b/web/src/lib/aeFamilyPrompts.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..bb388385f5b03b6e10bf9f45ea07de52b5c448df
+--- /dev/null
++++ b/web/src/lib/aeFamilyPrompts.test.ts
+@@ -0,0 +1,100 @@
++import { describe, expect, it } from "vitest";
++import { parseEvent } from "@/lib/sse";
++import { BlockStream } from "@/lib/blockStream";
++import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
++import {
++  aeFamilyPrompts,
++  aeIsFamilyPrompt,
++  aeParksThisTurn,
++  aeWithoutFamilyPrompts,
++} from "@/lib/aeFamilyPrompts";
++
++const ctx = { agent: null, depth: 0, turn: 1, timestamp: 0, responseId: "r1", itemId: "i1" };
++
++function prompt(over: Partial<ElicitationBlock>): ElicitationBlock {
++  return {
++    type: "elicitation",
++    ctx,
++    elicitationId: "e1",
++    message: "Approve?",
++    phase: "tool_call",
++    policyName: "",
++    contentPreview: "",
++    requestedSchema: {},
++    status: "pending",
++    response: null,
++    ...over,
++  };
++}
++
++const text = { type: "text_done", ctx, fullText: "hi", hasCodeBlocks: false } as AnyBlock;
++const mirror = prompt({
++  elicitationId: "fam",
++  targetSessionId: "conv_child",
++  familyChild: { title: "Halcyon Orbital" },
++});
++const subAgent = prompt({ elicitationId: "sub", targetSessionId: "conv_sub" });
++const own = prompt({ elicitationId: "own" });
++
++describe("family child prompts", () => {
++  it("keeps family mirrors out of the feed and leaves sub-agent mirrors and own prompts", () => {
++    const blocks = [text, mirror, subAgent, own];
++    expect(aeWithoutFamilyPrompts(blocks).map((b) => b.type)).toEqual([
++      "text_done",
++      "elicitation",
++      "elicitation",
++    ]);
++    expect(aeWithoutFamilyPrompts(blocks).filter((b) => b.type === "elicitation").length).toBe(2);
++    expect(aeIsFamilyPrompt(subAgent)).toBe(false);
++    expect(aeIsFamilyPrompt(own)).toBe(false);
++  });
++
++  it("returns the same array when there is nothing to remove", () => {
++    const blocks = [text, subAgent, own];
++    expect(aeWithoutFamilyPrompts(blocks)).toBe(blocks);
++  });
++
++  it("lists only pending family prompts that name a child", () => {
++    const answered = { ...mirror, elicitationId: "done", status: "responded" } as ElicitationBlock;
++    const orphan = { ...mirror, elicitationId: "orphan", targetSessionId: null };
++    expect(
++      aeFamilyPrompts([text, mirror, answered, orphan, subAgent]).map((b) => b.elicitationId),
++    ).toEqual(["fam"]);
++  });
++
++  it("carries the marker from the stream event to the block", () => {
++    const event = parseEvent("response.elicitation_request", {
++      elicitation_id: "e9",
++      params: {
++        message: "Keep it?",
++        target_session_id: "conv_child",
++        ae_family_child: true,
++        ae_requester_title: "Halcyon Orbital",
++      },
++    });
++    expect(event).toMatchObject({
++      targetSessionId: "conv_child",
++      familyChild: { title: "Halcyon Orbital" },
++    });
++    const plain = parseEvent("response.elicitation_request", {
++      elicitation_id: "e8",
++      params: { message: "x", target_session_id: "conv_sub" },
++    });
++    expect(plain).not.toHaveProperty("familyChild");
++    const blocks = new BlockStream().reduceSync([event!]);
++    expect(blocks.find((b) => b.type === "elicitation")).toMatchObject({
++      familyChild: { title: "Halcyon Orbital" },
++    });
++  });
++});
++
++describe("which prompts park this turn", () => {
++  it("counts its own prompt but not a mirrored child's or sub-agent's", () => {
++    expect(aeParksThisTurn(own, "s1")).toBe(true);
++    expect(aeParksThisTurn({ ...own, targetSessionId: "s1" } as ElicitationBlock, "s1")).toBe(true);
++    expect(aeParksThisTurn(mirror, "s1")).toBe(false);
++    expect(aeParksThisTurn(subAgent, "s1")).toBe(false);
++    expect(aeParksThisTurn({ ...own, status: "responded" } as ElicitationBlock, "s1")).toBe(false);
++    expect(aeParksThisTurn(text, "s1")).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeFamilyPrompts.ts b/web/src/lib/aeFamilyPrompts.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..499f7cff561e894eab8eff24714f94e40adcb5b9
+--- /dev/null
++++ b/web/src/lib/aeFamilyPrompts.ts
+@@ -0,0 +1,36 @@
++// A family child's prompts in its lead's chat (omnigent-ae, 2026-10-27). The server mirrors a
++// session's AskUserQuestion or permission prompt into its lead's stream, marked with the
++// child's title (omnigent/server/ae_family_prompts.py). The lead's transcript skips those
++// blocks and the action dock shows them instead, resolving in the child. Kept out of the
++// components: the vitest suites mock whole component modules.
++
++import type { AnyBlock, ElicitationBlock } from "@/lib/blocks";
++
++/** A prompt the server marked as a family child's, mirrored into this chat. */
++export function aeIsFamilyPrompt(block: AnyBlock): block is ElicitationBlock {
++  return block.type === "elicitation" && Boolean(block.familyChild);
++}
++
++/** `blocks` without family-child prompts; the same array when it has none. */
++export function aeWithoutFamilyPrompts(blocks: readonly AnyBlock[]): AnyBlock[] {
++  return blocks.some(aeIsFamilyPrompt)
++    ? blocks.filter((block) => !aeIsFamilyPrompt(block))
++    : (blocks as AnyBlock[]);
++}
++
++/** The family children's prompts still waiting, oldest first. */
++export function aeFamilyPrompts(blocks: readonly AnyBlock[]): ElicitationBlock[] {
++  return blocks.filter(
++    (block): block is ElicitationBlock =>
++      aeIsFamilyPrompt(block) && block.status === "pending" && Boolean(block.targetSessionId),
++  );
++}
++
++/** True for a pending prompt that parks this conversation's own turn, not a mirrored child's. */
++export function aeParksThisTurn(block: AnyBlock, conversationId: string | null): boolean {
++  return (
++    block.type === "elicitation" &&
++    block.status === "pending" &&
++    (block.targetSessionId == null || block.targetSessionId === conversationId)
++  );
++}
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index 1b8f5ebab716edfce78d20e8ebb72affb9919069..037c0870d827f1c06bb03b153fb00efdd68f1c8d 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -201,6 +201,10 @@ export interface AeRolesDoc {
+   starters_seen?: string[];
+   /** Absent until the user sets it. */
+   insights?: AeInsights;
++  /** Show the prompts of sessions this chat started in its action dock; absent reads as on. */
++  child_prompts?: boolean;
++  /** Let the lead pass an answer to a child's question; absent reads as on. */
++  child_relay?: boolean;
+ }
+ 
+ /** What `GET` and `PUT /v1/ae/roles` answer. */
+@@ -331,8 +335,17 @@ function parsePresets(value: unknown): AeRolePreset[] | null {
+ /** The server's roles state, or null when the body is not one. */
+ export function aeParseRolesState(value: unknown): AeRolesState | null {
+   if (!isObject(value)) return null;
+-  const { revision, default_preset, apply_start_on, presets, starters, starters_seen, insights } =
+-    value;
++  const {
++    revision,
++    default_preset,
++    apply_start_on,
++    presets,
++    starters,
++    starters_seen,
++    insights,
++    child_prompts,
++    child_relay,
++  } = value;
+   if (typeof revision !== "number" || !Number.isInteger(revision) || revision < 0) return null;
+   if (typeof default_preset !== "string") return null;
+   const list = parsePresets(presets);
+@@ -347,6 +360,8 @@ export function aeParseRolesState(value: unknown): AeRolesState | null {
+       ? { starters_seen: starters_seen as string[] }
+       : {}),
+     ...(parseInsights(insights) ? { insights: parseInsights(insights) as AeInsights } : {}),
++    ...(typeof child_prompts === "boolean" ? { child_prompts } : {}),
++    ...(typeof child_relay === "boolean" ? { child_relay } : {}),
+   };
+ }
+ 
+@@ -359,6 +374,8 @@ export function aeRolesDoc(state: AeRolesDoc): AeRolesDoc {
+     presets: state.presets,
+     ...(state.starters_seen ? { starters_seen: state.starters_seen } : {}),
+     ...(state.insights ? { insights: state.insights } : {}),
++    ...(state.child_prompts !== undefined ? { child_prompts: state.child_prompts } : {}),
++    ...(state.child_relay !== undefined ? { child_relay: state.child_relay } : {}),
+   };
+ }
+ 
+diff --git a/web/src/lib/aeSettingHints.test.ts b/web/src/lib/aeSettingHints.test.ts
+index f3a6b55ac64f9f3a6c76e79c083774737ab0d45b..b3a19360aeefedc4b0cca14e5f39db92e86b7c57 100644
+--- a/web/src/lib/aeSettingHints.test.ts
++++ b/web/src/lib/aeSettingHints.test.ts
+@@ -26,6 +26,8 @@ const CHOICES = [
+   "insights.scope",
+   "chat.spend_display",
+   "chat.pin_family",
++  "family.child_prompts",
++  "family.relay",
+ ] as const;
+ 
+ describe("the setting hints", () => {
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index d6222163f2ca1d501df89f30136080c1bfe235c5..ea8be6be2db88616166e8c3d5f4d6e315c9e4790 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -170,6 +170,16 @@ export const AE_SETTING_HINTS = {
+     hint: "Yes: also pins its open sessions, or none if pin spots run short. No (default): lead only. Unpinning removes all pinned members, closed too.",
+     source: "existing",
+   },
++  "family.child_prompts": {
++    label: "Child prompts in this chat",
++    hint: "Questions and permission prompts from sessions this chat started show in its action dock, with their buttons. Default: on.",
++    source: "existing",
++  },
++  "family.relay": {
++    label: "Lead relays answers to child questions",
++    hint: "The lead may pass your answer to a child's question. It can never approve tool use or MCP writes for a child. Default: on.",
++    source: "existing",
++  },
+   "chat.suggestion_keys": {
+     label: "Suggestion keys",
+     hint: "Next and Previous step through the composer's suggestions when it offers several. Defaults Alt+] and Alt+[. Change records a new combo.",
+diff --git a/web/src/lib/blockStream.ts b/web/src/lib/blockStream.ts
+index 1277379e78d24a3a0aeb71dd189325697bf97ab8..f844a9ed646ba0b57c32c2c99e3e9cded2b1f57c 100644
+--- a/web/src/lib/blockStream.ts
++++ b/web/src/lib/blockStream.ts
+@@ -923,6 +923,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
+             : ctx(state),
+         elicitationId: event.elicitationId,
+         targetSessionId: event.targetSessionId,
++        ...(event.familyChild ? { familyChild: event.familyChild } : {}),
+         message: event.message,
+         phase: event.phase,
+         policyName: event.policyName,
+diff --git a/web/src/lib/blocks.ts b/web/src/lib/blocks.ts
+index d5ade8c41dde9a6375a482ec444f52f76f7e8452..bfc653a8ca0afa8db7543429da396bcea49836c1 100644
+--- a/web/src/lib/blocks.ts
++++ b/web/src/lib/blocks.ts
+@@ -634,6 +634,8 @@ export interface ElicitationBlock {
+    * ancestor chat; null/undefined means use the active session.
+    */
+   targetSessionId?: string | null;
++  /** Set for a family child's prompt (omnigent-ae): the child's title; it shows in the dock only. */
++  familyChild?: { title: string } | null;
+   /** Human-readable message describing what's being gated. */
+   message: string;
+   /** "input" | "tool_call" | "tool_result" | "output". */
+diff --git a/web/src/lib/events.ts b/web/src/lib/events.ts
+index 555eab18e5334a0124641e4adb10672f0781a6b7..3d720deaca9dce8ca913d72387d7a82bfba30904 100644
+--- a/web/src/lib/events.ts
++++ b/web/src/lib/events.ts
+@@ -190,6 +190,12 @@ export interface ElicitationRequest {
+    * a sub-agent prompt into its parent chat.
+    */
+   targetSessionId?: string | null;
++  /**
++   * Set when the prompt belongs to a family child (a session its lead started), mirrored
++   * into the lead's stream with the child's title (omnigent-ae). It shows in the lead's
++   * action dock, never in its transcript.
++   */
++  familyChild?: { title: string } | null;
+   message: string;
+   /** A restricted subset of JSON Schema. Empty `{}` for binary approve/reject. */
+   requestedSchema: Record<string, unknown>;
+diff --git a/web/src/lib/sse.ts b/web/src/lib/sse.ts
+index 7c9131187edceef28d78d45d15ca5a64472ebe10..3de7cd377eb3089e65bd83e6e2f9c147ffd2a1da 100644
+--- a/web/src/lib/sse.ts
++++ b/web/src/lib/sse.ts
+@@ -1077,6 +1077,9 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
+       elicitationId,
+       targetSessionId:
+         typeof targetSessionId === "string" && targetSessionId ? targetSessionId : null,
++      ...(p.ae_family_child === true
++        ? { familyChild: { title: String(p.ae_requester_title ?? "") } }
++        : {}),
+       message: String(p.message ?? ""),
+       requestedSchema:
+         requestedSchema && typeof requestedSchema === "object" && !Array.isArray(requestedSchema)
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index df25338d58a75bd33c25341cb69786c094443756..577a7d0436789dc96637a5e63aa553eb5cb194c4 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -1,3 +1,4 @@
++import { aeParksThisTurn } from "@/lib/aeFamilyPrompts";
+ import { SelectionPopup } from "@/components/chat/SelectionPopup";
+ import { useLoadedConversations } from "@/hooks/useSidebarData";
+ import { useConversationRedirect } from "@/hooks/useConversationRedirect";
+@@ -651,7 +652,8 @@ export function ChatPage() {
+   // the flag is unchanged, so `blocks` reference churn on every streaming
+   // frame no longer re-renders this root — only an elicitation edge does.
+   const hasPendingElicitation = useChatStore((s) =>
+-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
++    // A mirrored child prompt (omnigent-ae) does not park this session's turn.
++    s.blocks.some((b) => aeParksThisTurn(b, s.conversationId)),
+   );
+ 
+   // Single-session snapshot (shared cache with chatStore.bindStream).
+diff --git a/web/src/pages/SettingsPage.tsx b/web/src/pages/SettingsPage.tsx
+index 4beb003b5e57bce0fa4f298eafb92fb3f177e116..d6b13aea26acd7641a4580a68ce11be11de8f71c 100644
+--- a/web/src/pages/SettingsPage.tsx
++++ b/web/src/pages/SettingsPage.tsx
+@@ -262,6 +262,7 @@ import {
+ } from "@/lib/backgroundSessionTitlesPreferences";
+ import { AE_ROLES_SETTINGS } from "@/lib/aeRoles";
+ import { AE_CHAT_SETTINGS, AeChatSettingsSection } from "./settings/AeChatSettingsSection";
++import { AeChildPromptSettings } from "./settings/AeChildPromptSettings";
+ import { AeRolesSettingsSection } from "./settings/AeRolesSettingsSection";
+ import { SettingsAiAccountsSection } from "./settings/SettingsAiAccountsSection";
+ import { SettingsHarnessesSection } from "./settings/SettingsHarnessesSection";
+@@ -1737,6 +1738,7 @@ function GeneralSection() {
+         </SettingsGroup>
+         <SettingsGroup title="Sessions" testId="settings-group-sessions">
+           <BackgroundSessionTitlesControl />
++          <AeChildPromptSettings />
+         </SettingsGroup>
+         <SettingsGroup title="Terminal" testId="settings-group-terminal">
+           <TerminalClipboardControl />
+diff --git a/web/src/pages/settings/AeChildPromptSettings.test.tsx b/web/src/pages/settings/AeChildPromptSettings.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..212fa33c05b5e0db1a2c74c8f8e032d70fe01b5d
+--- /dev/null
++++ b/web/src/pages/settings/AeChildPromptSettings.test.tsx
+@@ -0,0 +1,107 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++
++import { AE_SETTING_HINTS } from "@/lib/aeSettingHints";
++import { authenticatedFetch } from "@/lib/identity";
++import { AeChildPromptSettings } from "./AeChildPromptSettings";
++
++const STATE = {
++  revision: 3,
++  default_preset: "balanced",
++  apply_start_on: true,
++  presets: [
++    {
++      id: "balanced",
++      title: "Balanced",
++      icon: "scale",
++      color: "teal",
++      description: "",
++      roles: {
++        lead: { mode: "session" },
++        planner: { mode: "auto" },
++        reviewer: { mode: "auto" },
++        builder: { mode: "auto" },
++        helper: { mode: "auto" },
++      },
++      rules: { raise_or_lower: "tell", lead_steps_down: true, auto_raises: 1 },
++    },
++  ],
++  starters: [],
++};
++
++const json = (body: unknown, status = 200) =>
++  Promise.resolve(new Response(JSON.stringify(body), { status }));
++
++function mount() {
++  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  return render(
++    <QueryClientProvider client={qc}>
++      <AeChildPromptSettings />
++    </QueryClientProvider>,
++  );
++}
++
++beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
++afterEach(cleanup);
++
++describe("AeChildPromptSettings", () => {
++  it("gives each control a non-empty hint, shown on its row and as the phone tooltip", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => json(STATE));
++    mount();
++    const rows = [
++      ["ae-child-prompts", "family.child_prompts"],
++      ["ae-child-relay", "family.relay"],
++    ] as const;
++    await screen.findByTestId("ae-child-prompts");
++    for (const [testId, id] of rows) {
++      const row = screen.getByTestId(testId);
++      const { label, hint } = AE_SETTING_HINTS[id];
++      expect(hint.trim()).not.toBe("");
++      expect(row.textContent).toContain(hint);
++      // Reachable by keyboard focus and tap: the phone tooltip is a real button.
++      const about = screen.getByRole("button", { name: `About ${label}` });
++      expect(about.tabIndex).toBeGreaterThanOrEqual(0);
++    }
++    expect(AE_SETTING_HINTS["family.child_prompts"].hint).toBe(
++      "Questions and permission prompts from sessions this chat started show in its action dock, with their buttons. Default: on.",
++    );
++    expect(AE_SETTING_HINTS["family.relay"].hint).toBe(
++      "The lead may pass your answer to a child's question. It can never approve tool use or MCP writes for a child. Default: on.",
++    );
++  });
++
++  it("reads unset as on and off when the server says false", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => json({ ...STATE, child_relay: false }));
++    mount();
++    const prompts = await screen.findByTestId("ae-child-prompts-toggle");
++    const relay = screen.getByTestId("ae-child-relay-toggle");
++    await waitFor(() => expect(prompts).not.toBeDisabled());
++    expect(prompts).toBeChecked();
++    expect(relay).not.toBeChecked();
++  });
++
++  it("saves the flag with the rest of the roles at its revision", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation((_path, init) =>
++      json(init?.method === "PUT" ? { ...STATE, revision: 4, child_prompts: false } : STATE),
++    );
++    mount();
++    const toggle = await screen.findByTestId("ae-child-prompts-toggle");
++    await waitFor(() => expect(toggle).not.toBeDisabled());
++    fireEvent.click(toggle);
++    await waitFor(() => {
++      const put = vi
++        .mocked(authenticatedFetch)
++        .mock.calls.find(([, init]) => init?.method === "PUT");
++      expect(put).toBeTruthy();
++      expect(JSON.parse(String(put![1]!.body))).toMatchObject({
++        revision: 3,
++        default_preset: "balanced",
++        child_prompts: false,
++      });
++    });
++    await waitFor(() => expect(screen.getByTestId("ae-child-prompts-toggle")).not.toBeChecked());
++  });
++});
+diff --git a/web/src/pages/settings/AeChildPromptSettings.tsx b/web/src/pages/settings/AeChildPromptSettings.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8fa69dddd7f0cbd08a4b21e2d5f2f94578691ff3
+--- /dev/null
++++ b/web/src/pages/settings/AeChildPromptSettings.tsx
+@@ -0,0 +1,78 @@
++// Settings > General > Sessions: the two family settings (omnigent-ae, 2026-10-27). Both are
++// saved with the user's roles on the server (`child_prompts` and `child_relay`, top level, not
++// per preset), because the server mirrors the prompts and the relay tool checks the second.
++// An unset value reads as on. Each row's one hint line is also the phone tooltip's text.
++
++import { QueryClientContext } from "@tanstack/react-query";
++import { useContext, useId, useState } from "react";
++import { SettingsLabel } from "@/components/SettingsLabel";
++import { Switch } from "@/components/ui/switch";
++import { showToast } from "@/components/ui/toast";
++import { useAeRoles, useAeRolesSave } from "@/hooks/useAeRoles";
++import { aeRolesDoc } from "@/lib/aeRoles";
++import { AE_SETTING_HINTS, type AeSettingHintId } from "@/lib/aeSettingHints";
++
++type Field = "child_prompts" | "child_relay";
++
++const ROWS: { field: Field; hint: AeSettingHintId; testId: string }[] = [
++  { field: "child_prompts", hint: "family.child_prompts", testId: "ae-child-prompts" },
++  { field: "child_relay", hint: "family.relay", testId: "ae-child-relay" },
++];
++
++const CONFLICT = "Your settings changed on another device, so they were reloaded.";
++
++function Row({ field, hint, testId }: (typeof ROWS)[number]) {
++  const roles = useAeRoles();
++  const save = useAeRolesSave();
++  const [saving, setSaving] = useState(false);
++  const labelId = useId();
++  const descriptionId = useId();
++  const state = roles.data;
++  const { label, hint: text } = AE_SETTING_HINTS[hint];
++  const change = async (next: boolean) => {
++    if (!state || saving) return;
++    setSaving(true);
++    try {
++      const result = await save(aeRolesDoc({ ...state, [field]: next }));
++      if (!result.ok) showToast(CONFLICT);
++    } catch (error) {
++      showToast(`Could not save: ${error instanceof Error ? error.message : String(error)}`);
++    } finally {
++      setSaving(false);
++    }
++  };
++  return (
++    <div className="flex items-start justify-between gap-6" data-testid={testId}>
++      <SettingsLabel
++        label={label}
++        labelId={labelId}
++        descriptionId={descriptionId}
++        className="flex-1"
++        description={text}
++        descriptionClassName="text-ui"
++      />
++      <Switch
++        aria-labelledby={labelId}
++        aria-describedby={descriptionId}
++        checked={state?.[field] !== false}
++        disabled={!state || saving}
++        onCheckedChange={(next) => void change(next)}
++        data-testid={`${testId}-toggle`}
++        className="mt-0.5 shrink-0"
++        componentId={`settings.general.${field}`}
++      />
++    </div>
++  );
++}
++
++/** The two rows; nothing outside a query client (the settings page's tests render without one). */
++export function AeChildPromptSettings() {
++  if (!useContext(QueryClientContext)) return null;
++  return (
++    <div className="mt-4 flex flex-col gap-4 border-t border-border pt-4">
++      {ROWS.map((row) => (
++        <Row key={row.field} {...row} />
++      ))}
++    </div>
++  );
++}

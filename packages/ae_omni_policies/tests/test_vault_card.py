@@ -421,7 +421,7 @@ def _inventory_reading() -> secrets_meta.Reading:
 
 def test_the_inventory_counts_groups_badges_and_needs() -> None:
     got = vault_inventory.view(_inventory_reading(), NOW)
-    assert [v.vault for v in got.vaults] == ["ae-secrets-vault", "kv-example-web"]
+    assert [v.vault for v in got.vaults] == ["kv-example-box", "kv-example-web"]
     box, web = got.vaults
     assert box.count == 6 and web.count == 1
     assert box.counts.model_dump() == {
@@ -556,7 +556,7 @@ def test_a_failed_part_keeps_its_previous_reading() -> None:
     assert got.host == {"CLAUDE_CODE_OAUTH_TOKEN": True}
     assert got.carried("entra") == NOW
     assert got.carried("vault:kv-example-web") == NOW
-    assert got.carried("vault:ae-secrets-vault") is None
+    assert got.carried("vault:kv-example-box") is None
     words = secrets_meta.expiry(
         got.secrets["azure-cost-client-secret"], later, entra_from=got.carried("entra")
     )
@@ -601,7 +601,7 @@ def test_an_old_state_file_still_loads(tmp_path: Path) -> None:
         json.dumps(
             {
                 "read_at": "2026-10-23T12:00:00+00:00",
-                "vault": "ae-secrets-vault",
+                "vault": "kv-example-box",
                 "secrets": {
                     "omnigent-ae-github-token": {
                         "name": "omnigent-ae-github-token",
@@ -649,7 +649,7 @@ def test_the_dry_run_proposes_all_eight_pairs() -> None:
         "youtube-client-secret",
     ]
     proposals, _ = secrets_relay.propose_tags(
-        {"ae-secrets-vault": [{"name": name, "tags": {}} for name in names]}, apps
+        {"kv-example-box": [{"name": name, "tags": {}} for name in names]}, apps
     )
     got = {p.name: p.app.name for p in proposals}
     assert got == {

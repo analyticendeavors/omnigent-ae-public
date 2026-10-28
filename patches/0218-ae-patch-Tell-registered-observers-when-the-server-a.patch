@@ -1,0 +1,334 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:12:22 -0700
+Subject: [PATCH 218/220] [ae-patch] Tell registered observers when the server
+ accepts an elicitation verdict
+
+---
+ omnigent/server/elicitation_observers.py      | 126 ++++++++++++++
+ .../server/routes/_sessions/orchestration.py  |   3 +
+ tests/server/test_elicitation_observers.py    | 161 ++++++++++++++++++
+ 3 files changed, 290 insertions(+)
+ create mode 100644 omnigent/server/elicitation_observers.py
+ create mode 100644 tests/server/test_elicitation_observers.py
+
+diff --git a/omnigent/server/elicitation_observers.py b/omnigent/server/elicitation_observers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..c159f1ef17411f0dda914961533a4e3373fb9a20
+--- /dev/null
++++ b/omnigent/server/elicitation_observers.py
+@@ -0,0 +1,126 @@
++"""Observers of elicitation verdicts the server accepts.
++
++A small registry :func:`~omnigent.server.routes._sessions.orchestration._resolve_elicitation`
++calls at the top of every verdict, whichever route delivered it (the ``approval``
++event on ``POST /v1/sessions/{id}/events`` or ``POST .../elicitations/{eid}/resolve``).
++A resolved elicitation persists no conversation item, so the item-observers
++registry never sees it; a module that wants to react to an answer (to tell an
++idle parent that its child resumed, say) has nowhere else to hook.
++
++The pending prompt is read from :mod:`omnigent.runtime.pending_elicitations` at
++notify time, before the resolution clears it, and handed to each observer; it is
++``None`` when nothing was pending for that session and id (a repeat or bogus
++verdict). Observers are fire-and-forget, as in :mod:`omnigent.server.item_observers`:
++a sync one runs on a worker thread, an async one as a task on the running loop,
++and whatever either raises is logged and dropped. The registry is process-local
++and empty until something registers.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import inspect
++import logging
++from collections.abc import Callable
++from typing import Any
++
++from omnigent.runtime import pending_elicitations
++
++_log = logging.getLogger(__name__)
++
++ElicitationObserver = Callable[[str, str, dict[str, Any], dict[str, Any] | None], Any]
++
++_observers: list[ElicitationObserver] = []
++# Strong references to in-flight observer tasks: the loop keeps only weak ones.
++# custom-lint: disable-next=workspace-scoped-cache -- task objects are globally unique
++_pending: set[asyncio.Task[None]] = set()
++
++
++def register_elicitation_observer(fn: ElicitationObserver) -> None:
++    """Add *fn*; registering the same callable twice is a no-op.
++
++    :param fn: ``fn(session_id, elicitation_id, data, pending)``, sync or async.
++        ``data`` is the verdict payload (``action``, optional ``content``);
++        ``pending`` is the prompt's ``response.elicitation_request`` event, or
++        ``None`` when the id was not pending on that session.
++    """
++    if fn not in _observers:
++        _observers.append(fn)
++
++
++def unregister_elicitation_observer(fn: ElicitationObserver) -> None:
++    """Remove *fn*; an unknown callable is ignored."""
++    if fn in _observers:
++        _observers.remove(fn)
++
++
++def reset_elicitation_observers() -> None:
++    """Drop every observer and forget in-flight tasks (tests)."""
++    _observers.clear()
++    _pending.clear()
++
++
++def notify_elicitation_resolved(session_id: str, data: dict[str, Any]) -> None:
++    """Hand a verdict to every observer without waiting for any.
++
++    Never raises into the request. Must run on the event loop; with no loop the
++    observers are skipped with a warning.
++
++    :param session_id: Session the verdict was delivered under, e.g. ``"conv_abc123"``.
++    :param data: The verdict payload carrying ``elicitation_id``, e.g.
++        ``{"elicitation_id": "elicit_abc", "action": "accept"}``.
++    """
++    if not _observers:
++        return
++    try:
++        elicitation_id = data.get("elicitation_id")
++        if not isinstance(elicitation_id, str) or not elicitation_id:
++            return
++        found = pending_elicitations.lookup(elicitation_id)
++        pending = found[1] if found is not None and found[0] == session_id else None
++        loop = asyncio.get_running_loop()
++        for observer in list(_observers):
++            task = loop.create_task(_run(observer, session_id, elicitation_id, data, pending))
++            _pending.add(task)
++            task.add_done_callback(_pending.discard)
++    except Exception:  # noqa: BLE001 (an observer hook must never break the resolve)
++        _log.exception("elicitation observers could not be notified for session=%s", session_id)
++
++
++async def drain_elicitation_observers() -> None:
++    """Wait for every in-flight observer task to finish (tests and shutdown)."""
++    while True:
++        _pending.difference_update([task for task in _pending if task.done()])
++        if not _pending:
++            return
++        await asyncio.gather(*list(_pending), return_exceptions=True)
++
++
++async def _run(
++    observer: ElicitationObserver,
++    session_id: str,
++    elicitation_id: str,
++    data: dict[str, Any],
++    pending: dict[str, Any] | None,
++) -> None:
++    """Run one observer off the request path and log anything it raises."""
++    try:
++        if inspect.iscoroutinefunction(observer):
++            await observer(session_id, elicitation_id, data, pending)
++        else:
++            result = await asyncio.to_thread(observer, session_id, elicitation_id, data, pending)
++            if inspect.isawaitable(result):
++                await result
++    except Exception:  # noqa: BLE001 (an observer must never break the resolve)
++        name = getattr(observer, "__qualname__", None) or repr(observer)
++        _log.exception("elicitation observer %s failed for session=%s", name, session_id)
++
++
++__all__ = [
++    "ElicitationObserver",
++    "drain_elicitation_observers",
++    "notify_elicitation_resolved",
++    "register_elicitation_observer",
++    "reset_elicitation_observers",
++    "unregister_elicitation_observer",
++]
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 8cb1ccc09a3d3c33dbe982f404013091779700fc..af6c677e32c74f0b629af9fc94e08daf21d8f7f0 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -143,6 +143,7 @@ from omnigent.server.bundles import (
+     validate_agent_bundle,
+ )
+ from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
++from omnigent.server.elicitation_observers import notify_elicitation_resolved
+ from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+ from omnigent.server.item_observers import notify_items_persisted
+ from omnigent.server.managed_hosts import (
+@@ -2277,6 +2278,8 @@ async def _resolve_elicitation(
+     # matches, no resolved event published) rather than 500-ing the
+     # client — the runner forward still fires so the runner can reject.
+     elicitation_id = data.get("elicitation_id", "")
++    # Before anything below clears the pending index, so an observer can read the prompt.
++    notify_elicitation_resolved(session_id, data)
+     harness_future = _harness_elicitation_registry.get(elicitation_id)
+     if harness_future is not None and not harness_future.done():
+         # Only the session that owns this elicitation
+diff --git a/tests/server/test_elicitation_observers.py b/tests/server/test_elicitation_observers.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7bd92bf2be96fef03e52ae76a57c40202527a6a5
+--- /dev/null
++++ b/tests/server/test_elicitation_observers.py
+@@ -0,0 +1,161 @@
++"""The elicitation-observers registry and its call site in ``_resolve_elicitation``.
++
++``omnigent.server.elicitation_observers`` lets out-of-tree code react to a
++verdict the server accepts. Both routes that deliver one are covered through the
++real app (the ``approval`` event and the ``.../resolve`` URL). The contract
++under test: an observer sees the verdict with the prompt that was pending, a
++verdict for an id that was not pending reaches it with ``None``, and an observer
++that raises is logged and never fails the request.
++"""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Iterator
++from typing import Any
++
++import httpx
++import pytest
++
++from omnigent.runtime import pending_elicitations
++from omnigent.server.elicitation_observers import (
++    drain_elicitation_observers,
++    register_elicitation_observer,
++    reset_elicitation_observers,
++    unregister_elicitation_observer,
++)
++from tests.server.helpers import create_test_agent
++
++pytestmark = [pytest.mark.timeout(30), pytest.mark.asyncio]
++
++
++@pytest.fixture(autouse=True)
++def _clean_registry() -> Iterator[None]:
++    reset_elicitation_observers()
++    yield
++    reset_elicitation_observers()
++
++
++class _Recorder:
++    def __init__(self) -> None:
++        self.calls: list[tuple[str, str, dict[str, Any], dict[str, Any] | None]] = []
++
++    def __call__(
++        self, session_id: str, elicitation_id: str, data: dict[str, Any], pending: Any
++    ) -> None:
++        self.calls.append((session_id, elicitation_id, dict(data), pending))
++
++
++async def _session(client: httpx.AsyncClient) -> str:
++    agent = await create_test_agent(client)
++    resp = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert resp.status_code == 201, resp.text
++    return resp.json()["id"]
++
++
++def _park(session_id: str, elicitation_id: str) -> None:
++    pending_elicitations.record_publish(
++        session_id,
++        {
++            "type": "response.elicitation_request",
++            "elicitation_id": elicitation_id,
++            "params": {"message": "Are you sure?"},
++        },
++    )
++
++
++async def test_events_approval_path_notifies_with_the_pending_prompt(
++    client: httpx.AsyncClient,
++) -> None:
++    recorder = _Recorder()
++    register_elicitation_observer(recorder)
++    sid = await _session(client)
++    _park(sid, "elicit_events")
++
++    resp = await client.post(
++        f"/v1/sessions/{sid}/events",
++        json={"type": "approval", "data": {"elicitation_id": "elicit_events", "action": "accept"}},
++    )
++    assert resp.status_code == 202, resp.text
++    await drain_elicitation_observers()
++
++    assert len(recorder.calls) == 1
++    got_sid, got_eid, data, pending = recorder.calls[0]
++    assert (got_sid, got_eid, data["action"]) == (sid, "elicit_events", "accept")
++    assert pending is not None and pending["params"] == {"message": "Are you sure?"}
++
++
++async def test_resolve_url_path_notifies_and_not_pending_reads_none(
++    client: httpx.AsyncClient,
++) -> None:
++    recorder = _Recorder()
++    register_elicitation_observer(recorder)
++    sid = await _session(client)
++    _park(sid, "elicit_url")
++
++    first = await client.post(
++        f"/v1/sessions/{sid}/elicitations/elicit_url/resolve", json={"action": "decline"}
++    )
++    assert first.status_code == 202, first.text
++    await drain_elicitation_observers()
++    again = await client.post(
++        f"/v1/sessions/{sid}/elicitations/elicit_url/resolve", json={"action": "decline"}
++    )
++    assert again.status_code == 202, again.text
++    await drain_elicitation_observers()
++
++    assert [call[3] is not None for call in recorder.calls] == [True, False]
++
++
++async def test_pending_on_another_session_is_not_handed_over(
++    client: httpx.AsyncClient,
++) -> None:
++    recorder = _Recorder()
++    register_elicitation_observer(recorder)
++    sid = await _session(client)
++    other = await _session(client)
++    _park(other, "elicit_other")
++
++    resp = await client.post(
++        f"/v1/sessions/{sid}/elicitations/elicit_other/resolve", json={"action": "accept"}
++    )
++    assert resp.status_code == 202, resp.text
++    await drain_elicitation_observers()
++
++    assert [call[3] for call in recorder.calls] == [None]
++
++
++async def test_a_raising_observer_is_logged_and_never_breaks_the_resolve(
++    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
++) -> None:
++    def boom(*_args: Any) -> None:
++        raise RuntimeError("observer exploded")
++
++    recorder = _Recorder()
++    register_elicitation_observer(boom)
++    register_elicitation_observer(recorder)
++    sid = await _session(client)
++    _park(sid, "elicit_boom")
++
++    with caplog.at_level(logging.ERROR):
++        resp = await client.post(
++            f"/v1/sessions/{sid}/elicitations/elicit_boom/resolve", json={"action": "accept"}
++        )
++        await drain_elicitation_observers()
++
++    assert resp.status_code == 202, resp.text
++    assert len(recorder.calls) == 1
++    assert "observer exploded" in caplog.text
++
++
++async def test_unregister_stops_notifications(client: httpx.AsyncClient) -> None:
++    recorder = _Recorder()
++    register_elicitation_observer(recorder)
++    register_elicitation_observer(recorder)
++    unregister_elicitation_observer(recorder)
++    sid = await _session(client)
++    await client.post(
++        f"/v1/sessions/{sid}/elicitations/elicit_x/resolve", json={"action": "accept"}
++    )
++    await drain_elicitation_observers()
++    assert recorder.calls == []

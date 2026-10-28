@@ -1,0 +1,250 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 21:28:41 -0700
+Subject: [PATCH 203/220] [ae-patch] Show a session's title for a bare session
+ link in chat
+
+A link to another session whose text is the URL itself reads as that session's title, looked up once per id and cached, with a short 'session <id>' label while it loads or when the lookup fails. Explicit [text](url) links keep their text.
+---
+ .../blocks/AeSessionLink.title.test.tsx       | 83 +++++++++++++++++++
+ web/src/components/blocks/AeSessionLink.tsx   |  9 +-
+ .../blocks/ChatMarkdown.sessionLinks.test.tsx |  6 +-
+ web/src/lib/aeSessionTitles.ts                | 67 +++++++++++++++
+ 4 files changed, 163 insertions(+), 2 deletions(-)
+ create mode 100644 web/src/components/blocks/AeSessionLink.title.test.tsx
+ create mode 100644 web/src/lib/aeSessionTitles.ts
+
+diff --git a/web/src/components/blocks/AeSessionLink.title.test.tsx b/web/src/components/blocks/AeSessionLink.title.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..88afd910ae43c7736dbce9da750ddb00c92c2073
+--- /dev/null
++++ b/web/src/components/blocks/AeSessionLink.title.test.tsx
+@@ -0,0 +1,83 @@
++// A bare session URL in chat reads as the session's title; an explicit link
++// text stays as written, and a failed lookup falls back to `session <id>`.
++
++import { cleanup, render, screen } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, expect, it, vi } from "vitest";
++import { resetSessionTitleCache } from "@/lib/aeSessionTitles";
++import { SessionRouteLink } from "./AeSessionLink";
++
++const getSessionSlim = vi.fn();
++vi.mock("@/lib/sessionsApi", () => ({
++  getSessionSlim: (id: string) => getSessionSlim(id),
++}));
++
++const ID = "0f0e59ed993446efa42135a5e80b95a1";
++const URL_TEXT = `https://ae-llm-box.tailcb44aa.ts.net:8010/c/${ID}`;
++
++beforeEach(() => {
++  resetSessionTitleCache();
++  getSessionSlim.mockReset();
++});
++afterEach(cleanup);
++
++function link(text: string) {
++  render(
++    <MemoryRouter>
++      <SessionRouteLink route={`/c/${ID}`} href={URL_TEXT}>
++        {text}
++      </SessionRouteLink>
++    </MemoryRouter>,
++  );
++}
++
++it("shows the title for a bare URL and keeps the href and URL tooltip", async () => {
++  getSessionSlim.mockResolvedValue({ title: "Builder: PASS decks" });
++  link(URL_TEXT);
++  const anchor = await screen.findByRole("link", { name: "Builder: PASS decks" });
++  expect(anchor.getAttribute("href")).toBe(URL_TEXT);
++  expect(anchor.getAttribute("title")).toBe(URL_TEXT);
++});
++
++it("shows the short label until the title lands, then the title", async () => {
++  getSessionSlim.mockResolvedValue({ title: "Late title" });
++  link(URL_TEXT);
++  expect(screen.getByRole("link").textContent).toBe("session 0f0e59ed");
++  await screen.findByText("Late title");
++});
++
++it("falls back to the short label when the lookup fails", async () => {
++  getSessionSlim.mockRejectedValue(new Error("403"));
++  link(URL_TEXT);
++  await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith(ID));
++  expect(screen.getByRole("link").textContent).toBe("session 0f0e59ed");
++});
++
++it("falls back when the session has no title", async () => {
++  getSessionSlim.mockResolvedValue({ title: null });
++  link(URL_TEXT);
++  await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalled());
++  expect(screen.getByRole("link").textContent).toBe("session 0f0e59ed");
++});
++
++it("keeps explicit link text and does not look anything up", () => {
++  link("my notes");
++  expect(screen.getByRole("link").textContent).toBe("my notes");
++  expect(getSessionSlim).not.toHaveBeenCalled();
++});
++
++it("looks a session up once for repeated links", async () => {
++  getSessionSlim.mockResolvedValue({ title: "Once" });
++  render(
++    <MemoryRouter>
++      <SessionRouteLink route={`/c/${ID}`} href={URL_TEXT}>
++        {URL_TEXT}
++      </SessionRouteLink>
++      <SessionRouteLink route={`/c/${ID}`} href={URL_TEXT}>
++        {URL_TEXT}
++      </SessionRouteLink>
++    </MemoryRouter>,
++  );
++  await screen.findAllByText("Once");
++  expect(getSessionSlim).toHaveBeenCalledTimes(1);
++});
+diff --git a/web/src/components/blocks/AeSessionLink.tsx b/web/src/components/blocks/AeSessionLink.tsx
+index 53681fea361575bc5c1c248b8917d49fe5225421..21a1e794a0765b2ca644530812f7230ee62a2dc3 100644
+--- a/web/src/components/blocks/AeSessionLink.tsx
++++ b/web/src/components/blocks/AeSessionLink.tsx
+@@ -5,6 +5,7 @@
+ import type React from "react";
+ import { useInRouterContext } from "react-router-dom";
+ import { sessionLinkRoute } from "@/lib/aeSessionLinks";
++import { useSessionLinkTitle } from "@/lib/aeSessionTitles";
+ import { withBasePath } from "@/lib/basePath";
+ import { useLocation, useNavigate } from "@/lib/routing";
+ import { cn } from "@/lib/utils";
+@@ -20,6 +21,9 @@ type AnchorProps = React.ComponentPropsWithoutRef<"a">;
+  * default, and every other anchor attribute (target, rel, aria-*) is kept.
+  * A link to the session already open navigates nowhere, so repeat clicks do
+  * not stack history entries.
++ *
++ * A link whose text is the session URL itself (a bare autolink) shows the
++ * session's title instead; an explicit `[text](url)` keeps its own text.
+  */
+ export function SessionRouteLink({
+   route,
+@@ -31,6 +35,8 @@ export function SessionRouteLink({
+ }: AnchorProps & { route: string }) {
+   const navigate = useNavigate();
+   const location = useLocation();
++  const bare = typeof children === "string" && sessionLinkRoute(children.trim()) !== null;
++  const title = useSessionLinkTitle(route, bare);
+   return (
+     <a
+       data-streamdown="link"
+@@ -38,6 +44,7 @@ export function SessionRouteLink({
+       href={href}
+       className={cn(SESSION_LINK_CLASS, className)}
+       data-ae-session-link=""
++      title={props.title ?? (bare ? children : undefined)}
+       onClick={(event) => {
+         onClick?.(event);
+         if (event.defaultPrevented || event.button !== 0) return;
+@@ -47,7 +54,7 @@ export function SessionRouteLink({
+         navigate(route);
+       }}
+     >
+-      {children}
++      {title ?? children}
+     </a>
+   );
+ }
+diff --git a/web/src/components/blocks/ChatMarkdown.sessionLinks.test.tsx b/web/src/components/blocks/ChatMarkdown.sessionLinks.test.tsx
+index 82492b1140275d340d27cf975fdaa11bc0f9c990..56d809aa074f2929682b0a60856cdc40d4d3748c 100644
+--- a/web/src/components/blocks/ChatMarkdown.sessionLinks.test.tsx
++++ b/web/src/components/blocks/ChatMarkdown.sessionLinks.test.tsx
+@@ -14,6 +14,10 @@ vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
+   ...(await importOriginal<typeof NativeBridge>()),
+   isNativeShell: () => native,
+ }));
++// A bare session URL shows the session's title; keep the lookup offline here.
++vi.mock("@/lib/sessionsApi", () => ({
++  getSessionSlim: () => Promise.reject(new Error("offline")),
++}));
+ const toast = vi.fn();
+ vi.mock("@/components/ui/toast", () => ({ showToast: (m: string) => toast(m) }));
+ 
+@@ -110,7 +114,7 @@ it.each([
+   `<https://omnigent.go-ae.org/c/${ID}>`,
+   `https://omnigent.go-ae.org/c/${ID}`,
+ ])("routes %s without the file toast", (md) => {
+-  const text = md.startsWith("[") ? "docs" : md.replace(/^<|>$/g, "");
++  const text = md.startsWith("[") ? "docs" : `session ${ID.slice(0, 8)}`;
+   render(
+     <MemoryRouter initialEntries={["/c/other"]}>
+       <QueryClientProvider client={new QueryClient()}>
+diff --git a/web/src/lib/aeSessionTitles.ts b/web/src/lib/aeSessionTitles.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..cd7521937a507ceeb87a30e47fe51a3920d85628
+--- /dev/null
++++ b/web/src/lib/aeSessionTitles.ts
+@@ -0,0 +1,67 @@
++// Titles for chat links that show a bare session URL. A link to another session
++// (`/c/<id>`) whose text is the URL itself reads as that session's title; the
++// lookup goes through the sessions API once per id and is cached for the page.
++
++import { useEffect, useState } from "react";
++import { getSessionSlim } from "./sessionsApi";
++
++const SESSION_ID = /\/c\/([0-9a-f]{32})/i;
++
++const titles = new Map<string, string>();
++const pending = new Map<string, Promise<string>>();
++
++/** `session <first 8 chars>`: the label while a lookup runs or after it fails. */
++export function sessionLinkFallbackLabel(route: string): string {
++  const id = SESSION_ID.exec(route)?.[1] ?? route;
++  return `session ${id.slice(0, 8)}`;
++}
++
++function sessionIdOf(route: string): string | null {
++  return SESSION_ID.exec(route)?.[1]?.toLowerCase() ?? null;
++}
++
++async function loadTitle(id: string): Promise<string> {
++  const cached = titles.get(id);
++  if (cached !== undefined) return cached;
++  let inflight = pending.get(id);
++  if (inflight === undefined) {
++    inflight = getSessionSlim(id)
++      .then((session) => {
++        const title = session.title?.trim() ?? "";
++        if (title !== "") titles.set(id, title);
++        return title;
++      })
++      .catch(() => "")
++      .finally(() => pending.delete(id));
++    pending.set(id, inflight);
++  }
++  return inflight;
++}
++
++/**
++ * The title of the session a `/c/<id>` route points at, or its short
++ * `session <id>` label until the lookup lands (and when it fails or the
++ * session has no title). `enabled` false skips the lookup and returns null.
++ */
++export function useSessionLinkTitle(route: string, enabled: boolean): string | null {
++  const id = sessionIdOf(route);
++  const [title, setTitle] = useState<string | null>(() => (id ? (titles.get(id) ?? null) : null));
++  useEffect(() => {
++    if (!enabled || id === null) return;
++    let live = true;
++    void loadTitle(id).then((found) => {
++      if (live && found !== "") setTitle(found);
++    });
++    return () => {
++      live = false;
++    };
++  }, [enabled, id]);
++  if (!enabled || id === null) return null;
++  return title ?? sessionLinkFallbackLabel(route);
++}
++
++/** Test hook: forget every cached title. */
++export function resetSessionTitleCache(): void {
++  titles.clear();
++  pending.clear();
++}

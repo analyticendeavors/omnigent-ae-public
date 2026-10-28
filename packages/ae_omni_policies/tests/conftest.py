@@ -37,6 +37,7 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("AE_CF_ACCESS_CLIENT_ID", "test-client-id.access")
     monkeypatch.setenv("AE_CF_ACCESS_CLIENT_SECRET", "test-client-secret")
     monkeypatch.delenv("AE_SELF_URL", raising=False)
+    monkeypatch.setenv("AE_VAULT_NAME", "kv-example-box")
     # create_session reads the calling session from these; a test that wants one sets it.
     monkeypatch.delenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", raising=False)
     monkeypatch.delenv("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID", raising=False)

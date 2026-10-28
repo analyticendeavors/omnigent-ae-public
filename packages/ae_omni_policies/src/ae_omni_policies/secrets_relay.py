@@ -61,7 +61,7 @@ import httpx
 
 from ae_omni_policies import omni, secrets_meta
 
-VAULT_ENV = "AE_VAULT_NAME"
+VAULT_ENV = secrets_meta.VAULT_ENV
 EXTRA_VAULTS_ENV = "AE_EXTRA_VAULTS"
 HOST_ENV_FILE_ENV = "AE_HOST_ENV_FILE"
 HOST_ENV_FILE = Path("/secure/env/omnigent-host.env")
@@ -598,7 +598,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--vault",
         default=None,
-        help=f"the Key Vault (default: ${VAULT_ENV}, else {secrets_meta.VAULT})",
+        help=f"the Key Vault (default: ${VAULT_ENV}, required one way or the other)",
     )
     parser.add_argument(
         "--az-bin",
@@ -626,7 +626,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--apply", action="store_true", help="with --propose-tags: set them")
     args = parser.parse_args(argv)
-    vault = args.vault or os.environ.get(VAULT_ENV) or secrets_meta.VAULT
+    vault = args.vault or secrets_meta.box_vault()
     az_bin = args.az_bin or os.environ.get(AZ_BIN_ENV) or shutil.which("az")
     if args.extra_vault is not None:
         extra = [name for name in args.extra_vault if name]
@@ -635,6 +635,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         extra = [name.strip() for name in (raw or "").split(",") if name.strip()]
     if args.apply and not args.propose_tags:
         parser.error("--apply goes with --propose-tags")
+    if not vault:
+        # Fail the unit, not just the log: a card that goes stale silently is the failure this
+        # catches. The tag proposal does not need the box name, so the extra vaults still get it;
+        # a posted reading is keyed by the box vault, so that run has nothing it can send.
+        print(
+            f"secrets_relay: {VAULT_ENV} is not set; the box vault was not read", file=sys.stderr
+        )
+        if args.propose_tags and extra:
+            run_propose(vaults=extra, az_bin=az_bin, apply=args.apply)
+        return 1
     if args.propose_tags:
         return run_propose(vaults=[vault, *extra], az_bin=az_bin, apply=args.apply)
     host_env = Path(args.host_env or os.environ.get(HOST_ENV_FILE_ENV) or HOST_ENV_FILE)

@@ -1,6 +1,6 @@
 // The Admin Center's Key Vault card (2026-10-23, the concept Reid approved
-// that day): every secret in both vaults, ae-secrets-vault and
-// the website's vault, by name. Names and dates only: the server answers from
+// that day): every secret in both vaults, the box's (`AE_VAULT_NAME`) and
+// the website's, by name. Names and dates only: the server answers from
 // the box's daily reading (`GET /v1/ae/vault`, ae_omni_policies/
 // vault_inventory.py, admins only) and never sees a value.
 //
@@ -189,6 +189,8 @@ export function vaultNeedsLook(view: VaultView): boolean {
   );
 }
 
+const VAULT_UNSET_NOTE = "vault not configured (AE_VAULT_NAME)";
+
 /**
  * The Key Vault tile: each vault's count, the expiring and untouched totals.
  * Since 2026-10-23 it also says when the next expiry alarm rings and how many
@@ -206,7 +208,8 @@ export function vaultTile(inventory: VaultInventory | null, error: unknown): Til
     };
   }
   if (!inventory.vaults.length) {
-    return { id: "vault", value: "Not read", note: "the box has not reported", health: "attention" };
+    const note = inventory.configured === false ? VAULT_UNSET_NOTE : "the box has not reported";
+    return { id: "vault", value: "Not read", note, health: "attention" };
   }
   const expiring = inventory.vaults.reduce((n, v) => n + v.counts.soon + v.counts.expired, 0);
   const old = inventory.vaults.reduce((n, v) => n + v.counts.untouched, 0);

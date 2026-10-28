@@ -300,7 +300,7 @@ just schedules-seed https://<box-hostname>.<tailnet>.ts.net:8010                
 | `steward` | claude-sdk | weekdays 08:00, server's `AE_TASK_STORE_TZ` | `list_parked`, `omni_capacity`; box memory's read tools | nothing: one brief, lot items resurfacing today and the working sessions with elapsed time |
 | `shutdown` | claude-sdk | weekdays 17:30, server's `AE_TASK_STORE_TZ` | `omni_capacity`, `omni_transcript`; box memory's read tools | nothing: one THREAD / STATE / NEXT / SLOT / QUADRANT note per working session; the operator flips the status from the Parking Lot page |
 | `reviewer-codex` | codex | on request, off by default | none (read-only `os_env`) | nothing: findings with file and line |
-| `orchestrator` | claude-sdk | when the operator talks to it; its own hourly check-in | `omni_capacity`, `omni_transcript`, `omni_set_status`, `list_parked`, `create_session`, `post_message`, `schedule_checkin`, `list_prs`, `ask_reid` | sessions it starts and briefs, messages to them, its one check-in schedule, review on merged work; never a merge |
+| `orchestrator` | claude-sdk | when the operator talks to it; its own hourly check-in | `omni_capacity`, `omni_transcript`, `omni_set_status`, `list_parked`, `create_session`, `post_message`, `answer_child_question`, `schedule_checkin`, `list_prs`, `ask_reid` | sessions it starts and briefs, messages to them, its one check-in schedule, review on merged work; never a merge |
 
 Where a run happens is decided at fire time: a task with no pinned host runs on the
 owner's online host and defaults its workspace to that host's home directory, and

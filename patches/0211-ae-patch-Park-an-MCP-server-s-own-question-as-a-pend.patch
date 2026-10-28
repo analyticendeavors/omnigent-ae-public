@@ -1,0 +1,621 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 13:52:09 -0700
+Subject: [PATCH 211/220] [ae-patch] Park an MCP server's own question as a
+ pending elicitation
+
+Claude Code runs an Elicitation hook when an MCP server asks the user something (powerbi-modeling-sp with --require-confirmation, for one). The wrapper never registered it, so the question reached only the TUI. build_hook_settings now registers it beside PermissionRequest with the same day-long timeout, a mcp-elicitation hook subcommand forwards it, and a new route parks it as a permission-type card carrying the server's schema as a form, then returns Claude's hookSpecificOutput. Every failure exits 0 with no output so Claude shows its own dialog.
+---
+ .../claude_native/ae_mcp_elicitation_hook.py  |  82 ++++++++++++
+ omnigent/harnesses/claude_native/bridge.py    |  23 ++++
+ omnigent/harnesses/claude_native/hook.py      |   4 +
+ omnigent/server/routes/sessions/__init__.py   |  11 ++
+ .../sessions/routes_ae_mcp_elicitation.py     | 123 ++++++++++++++++++
+ .../test_claude_native_bridge.py              |  23 ++++
+ .../claude_native/test_claude_native_hook.py  |  96 ++++++++++++++
+ .../server/routes/test_ae_mcp_elicitation.py  | 120 +++++++++++++++++
+ web/src/components/AeActionDock.test.tsx      |  41 ++++++
+ 9 files changed, 523 insertions(+)
+ create mode 100644 omnigent/harnesses/claude_native/ae_mcp_elicitation_hook.py
+ create mode 100644 omnigent/server/routes/sessions/routes_ae_mcp_elicitation.py
+ create mode 100644 tests/server/routes/test_ae_mcp_elicitation.py
+
+diff --git a/omnigent/harnesses/claude_native/ae_mcp_elicitation_hook.py b/omnigent/harnesses/claude_native/ae_mcp_elicitation_hook.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c025eed0cdb2d2c8f97cf5bd71096d1b04952f2
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_mcp_elicitation_hook.py
+@@ -0,0 +1,82 @@
++"""Forward Claude Code's ``Elicitation`` hook to the active Omnigent session (omnigent-ae).
++
++An MCP server's question (``--require-confirmation`` on powerbi-modeling-sp, for one) fires
++this hook. We park it on the server as a pending elicitation and print the answer JSON
++Claude reads. Every failure path exits 0 with nothing on stdout, so Claude Code opens its own
++dialog. Never exit 2: Claude Code reads that as a silent decline.
++"""
++
++from __future__ import annotations
++
++import argparse
++import json
++import sys
++from pathlib import Path
++
++from omnigent.harnesses.claude_native.bridge import (
++    approval_wait_marker_path,
++    read_active_session_id,
++    read_permission_hook_config,
++    url_component,
++)
++
++
++def _headers(raw: str | None, config: dict[str, object]) -> dict[str, str]:
++    from omnigent.harnesses.claude_native.hook import _parse_headers
++
++    headers = _parse_headers(raw)
++    if not headers and isinstance(config.get("ap_auth_headers"), dict):
++        headers = {str(k): str(v) for k, v in config["ap_auth_headers"].items()}  # type: ignore[union-attr]
++    return headers
++
++
++def main(argv: list[str]) -> int:
++    """Run the ``mcp-elicitation`` subcommand; returns 0 on every path."""
++    try:
++        return _run(argv)
++    except SystemExit:
++        # argparse exits 2 on bad arguments, which Claude Code reads as a silent decline.
++        return 0
++    except Exception as exc:  # noqa: BLE001 (any failure must leave the TUI dialog to Claude)
++        print(f"omnigent claude mcp elicitation hook: {exc.__class__.__name__}", file=sys.stderr)
++        return 0
++
++
++def _run(argv: list[str]) -> int:
++    from omnigent.cli_auth import databricks_request_headers
++    from omnigent.harnesses.claude_native.hook import _post_hook_with_reattach
++    from omnigent.native.native_policy_hook import policy_hook_reauth
++
++    parser = argparse.ArgumentParser(prog="hook mcp-elicitation")
++    parser.add_argument("--bridge-dir", required=True)
++    parser.add_argument("--omnigent-server-url")
++    parser.add_argument("--omnigent-auth-headers-json")
++    args = parser.parse_args(argv)
++    try:
++        payload = json.loads(sys.stdin.read() or "{}")
++    except json.JSONDecodeError:
++        return 0
++    # URL-mode elicitations stay in the TUI for now.
++    if not isinstance(payload, dict) or payload.get("mode") == "url":
++        return 0
++    bridge_dir = Path(args.bridge_dir)
++    session_id = read_active_session_id(bridge_dir)
++    config = read_permission_hook_config(bridge_dir)
++    server_url = args.omnigent_server_url or config.get("ap_server_url")
++    if not session_id or not isinstance(server_url, str) or not server_url:
++        return 0
++    headers = _headers(args.omnigent_auth_headers_json, config)
++    headers.update(databricks_request_headers(server_url))
++    base = f"{server_url.rstrip('/')}/v1/sessions/{url_component(session_id)}"
++    url = f"{base}/hooks/ae-mcp-elicitation"
++    resp = _post_hook_with_reattach(
++        url,
++        headers,
++        payload,
++        "claude mcp elicitation",
++        reauth=policy_hook_reauth(server_url, headers),
++        wait_marker=approval_wait_marker_path(session_id, bridge_dir=bridge_dir),
++    )
++    if resp is not None and resp.content:
++        sys.stdout.write(resp.text)
++    return 0
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 0315692afea9c7977acdde4630170d81f63bf724..1c11b3213da6d4730e2e489eae463792475e1d51 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -2498,6 +2498,29 @@ def build_hook_settings(
+             "timeout": 86400,
+         }
+         hooks["PermissionRequest"] = [{"hooks": [permission_hook]}]
++        # An MCP server's own question (omnigent-ae, 2026-10-27). With no hook Claude shows its
++        # TUI dialog only; this parks it as a web card. Same day-long wait as above.
++        hooks["Elicitation"] = [
++            {
++                "hooks": [
++                    {
++                        "type": "command",
++                        "command": _python_hook_command(
++                            [
++                                python,
++                                "-I",
++                                "-m",
++                                "omnigent.harnesses.claude_native.hook",
++                                "mcp-elicitation",
++                                "--bridge-dir",
++                                str(bridge_dir),
++                            ]
++                        ),
++                        "timeout": 86400,
++                    }
++                ]
++            }
++        ]
+ 
+         # Policy-gate native Claude Code tools, not just relay/MCP tools.
+         # The hook is a bare curl against the relay's evaluate-policy
+diff --git a/omnigent/harnesses/claude_native/hook.py b/omnigent/harnesses/claude_native/hook.py
+index 67c0991115d3ff20dba2d323c094d0f25492fa3a..72885fb911341bb3de2cb0534674554c184dfbb9 100644
+--- a/omnigent/harnesses/claude_native/hook.py
++++ b/omnigent/harnesses/claude_native/hook.py
+@@ -192,6 +192,10 @@ def main(argv: list[str] | None = None) -> int:
+         return observe_main(raw_argv[1:])
+     if raw_argv and raw_argv[0] == "permission-request":
+         return _main_permission_request(raw_argv[1:])
++    if raw_argv and raw_argv[0] == "mcp-elicitation":
++        from omnigent.harnesses.claude_native.ae_mcp_elicitation_hook import main as mcp_main
++
++        return mcp_main(raw_argv[1:])
+     if raw_argv and raw_argv[0] == "ask-user-question":
+         # Retired PreToolUse forwarder: settings written before the upgrade
+         # still name it until the terminal restarts. Exit 0 with no output so
+diff --git a/omnigent/server/routes/sessions/__init__.py b/omnigent/server/routes/sessions/__init__.py
+index 7fa0d7b4a3732bef985844d064db80b98144ba01..c94d3f5e48c3c02f31cbf183052726c73f2e9aed 100644
+--- a/omnigent/server/routes/sessions/__init__.py
++++ b/omnigent/server/routes/sessions/__init__.py
+@@ -1015,6 +1015,17 @@ def create_sessions_router(
+         permission_store=permission_store,
+     )
+ 
++    from omnigent.server.routes.sessions.routes_ae_mcp_elicitation import (
++        register_ae_mcp_elicitation_routes,
++    )
++
++    register_ae_mcp_elicitation_routes(
++        router,
++        conversation_store=conversation_store,
++        auth_provider=auth_provider,
++        permission_store=permission_store,
++    )
++
+     from omnigent.server.routes.sessions.routes_ae_fast_mode import register_ae_fast_mode_routes
+ 
+     register_ae_fast_mode_routes(
+diff --git a/omnigent/server/routes/sessions/routes_ae_mcp_elicitation.py b/omnigent/server/routes/sessions/routes_ae_mcp_elicitation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..54c3eed0281e12292bb0c0e5e902fa20d389c1bd
+--- /dev/null
++++ b/omnigent/server/routes/sessions/routes_ae_mcp_elicitation.py
+@@ -0,0 +1,123 @@
++"""Park a Claude Code MCP-server elicitation as a pending elicitation (omnigent-ae, 2026-10-27).
++
++Claude Code's ``Elicitation`` hook fires when an MCP server asks the user a question (for
++example powerbi-modeling-sp with ``--require-confirmation``). Nothing registered it, so the
++question only ever reached the TUI. The wrapper now forwards it here and the answer goes
++back as the hook's ``hookSpecificOutput``. The prompt is a permission-type card (policy
++``claude_native_permission``, the server's schema as a form) and never carries
++``ask_user_question``, so the lead's ``answer_child_question`` relay tool refuses it: only
++Reid answers an MCP prompt.
++"""
++
++from __future__ import annotations
++
++import json
++from typing import TYPE_CHECKING, Any
++
++from fastapi import APIRouter, Depends, Request, Response, status
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.server.auth import LEVEL_EDIT, AuthProvider
++from omnigent.server.routes._auth_helpers import get_user_id, require_access
++from omnigent.server.routes._content_type import require_json_content_type
++from omnigent.server.routes._sessions.helpers import _client_supplied_hook_elicitation_id
++from omnigent.server.routes._sessions.orchestration import (
++    _publish_and_wait_for_harness_elicitation,
++)
++from omnigent.server.schemas import ElicitationRequestParams
++from omnigent.stores import ConversationStore
++from omnigent.stores.permission_store import PermissionStore
++
++if TYPE_CHECKING:
++    from omnigent.spec.types import ElicitationResult
++
++
++def mcp_elicitation_params(payload: dict[str, Any]) -> ElicitationRequestParams:
++    """The card for one ``Elicitation`` hook payload.
++
++    :raises OmnigentError: 400 when ``mcp_server_name`` or ``requested_schema`` is malformed.
++    """
++    server = payload.get("mcp_server_name")
++    if not isinstance(server, str) or not server.strip():
++        raise OmnigentError(
++            "Elicitation hook body must include a non-empty 'mcp_server_name' string.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    schema = payload.get("requested_schema")
++    if schema is not None and not isinstance(schema, dict):
++        raise OmnigentError(
++            "Elicitation hook body 'requested_schema' must be an object when present.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++    raw_message = payload.get("message")
++    message = raw_message.strip() if isinstance(raw_message, str) else ""
++    # A permission-type prompt: no ask_user_question, exit_plan_mode, allow_auto_mode or
++    # remember_scope. The relay tool keys off the first to refuse it.
++    return ElicitationRequestParams(
++        mode="form",
++        message=f"{server.strip()} asks: {message}" if message else f"{server.strip()} asks",
++        requestedSchema=schema or None,
++        url=None,
++        phase="pre_tool_use",
++        policy_name="claude_native_permission",
++        content_preview=message[:1024],
++        tool_name=f"mcp:{server.strip()}",
++    )
++
++
++def mcp_elicitation_answer(result: ElicitationResult | None) -> Response:
++    """The hook's reply: Claude's ``hookSpecificOutput``, or an empty 200 (TUI fallback)."""
++    if result is None:
++        return Response(status_code=status.HTTP_200_OK)
++    output: dict[str, Any] = {"hookEventName": "Elicitation", "action": result.action}
++    if result.action == "accept" and isinstance(result.content, dict):
++        output["content"] = result.content
++    return Response(
++        content=json.dumps({"hookSpecificOutput": output}), media_type="application/json"
++    )
++
++
++def register_ae_mcp_elicitation_routes(
++    router: APIRouter,
++    *,
++    conversation_store: ConversationStore,
++    auth_provider: AuthProvider | None,
++    permission_store: PermissionStore | None,
++) -> None:
++    @router.post(
++        "/sessions/{session_id}/hooks/ae-mcp-elicitation",
++        include_in_schema=False,
++        response_model=None,
++        dependencies=[Depends(require_json_content_type)],
++    )
++    async def ae_mcp_elicitation_hook(request: Request, session_id: str) -> Response:
++        from omnigent.server.routes import sessions as _sf
++
++        await require_access(
++            get_user_id(request, auth_provider),
++            session_id,
++            LEVEL_EDIT,
++            permission_store,
++            conversation_store,
++        )
++        try:
++            payload = await request.json()
++        except json.JSONDecodeError as exc:
++            raise OmnigentError(
++                f"Invalid JSON in Elicitation hook body: {exc}", code=ErrorCode.INVALID_INPUT
++            ) from exc
++        if not isinstance(payload, dict):
++            raise OmnigentError(
++                "Elicitation hook body must be a JSON object.", code=ErrorCode.INVALID_INPUT
++            )
++        params = mcp_elicitation_params(payload)
++        result = await _publish_and_wait_for_harness_elicitation(
++            request,
++            session_id=session_id,
++            params=params,
++            timeout_s=_sf._CLAUDE_NATIVE_PERMISSION_HOOK_TIMEOUT_S,
++            conversation_store=conversation_store,
++            elicitation_id=_client_supplied_hook_elicitation_id(payload, session_id),
++            tool_name=None,
++        )
++        return mcp_elicitation_answer(result)
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 6e08bc47bb9497cb70353264081825cab77eb14b..4bcf98a9967a6f6638fc488b8bd8e321f6977e5c 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -13065,3 +13065,26 @@ def test_hold_approval_wait_marker_refreshes_until_released(
+     settled = len(touches)
+     time.sleep(0.1)
+     assert len(touches) == settled, "the refresher must stop when the block exits"
++
++
++def test_augment_claude_args_registers_the_mcp_elicitation_hook_only_with_a_server(
++    tmp_path: Path,
++) -> None:
++    """The Elicitation hook rides with the server URL and waits a day, like PermissionRequest."""
++    bare = _load_invocation_settings(
++        augment_claude_args((), bridge_dir=tmp_path, python_executable="/venv/bin/python")
++    )
++    assert "Elicitation" not in bare["hooks"]
++    args = augment_claude_args(
++        (),
++        bridge_dir=tmp_path,
++        python_executable="/venv/bin/python",
++        ap_server_url="http://127.0.0.1:8787/",
++        ap_auth_headers={"Authorization": "Bearer xyz"},
++    )
++    entries = _load_invocation_settings(args)["hooks"]["Elicitation"]
++    assert len(entries) == 1 and "matcher" not in entries[0]
++    (hook,) = entries[0]["hooks"]
++    assert hook["type"] == "command" and hook["timeout"] == 86400
++    assert "omnigent.harnesses.claude_native.hook mcp-elicitation" in hook["command"]
++    assert "Bearer xyz" not in hook["command"]
+diff --git a/tests/harnesses/claude_native/test_claude_native_hook.py b/tests/harnesses/claude_native/test_claude_native_hook.py
+index 933dc52af83f8ab33b2154c4fb1f436249335b5e..6693a558dab6187e9bc904af94d76a17324e7c0c 100644
+--- a/tests/harnesses/claude_native/test_claude_native_hook.py
++++ b/tests/harnesses/claude_native/test_claude_native_hook.py
+@@ -3050,3 +3050,99 @@ def test_route_turn_follows_a_clear_rotation_onto_the_new_session(
+     assert _run_route_turn(bridge_dir, {"prompt": "hello"}, monkeypatch) == 0
+     assert urls == ["http://127.0.0.1:54321/v1/sessions/conv_replacement/route-turn"]
+     assert turn_routing_marker_session(bridge_dir) == "conv_replacement"
++
++
++def _mcp_payload(**over: object) -> dict[str, object]:
++    return {
++        "hook_event_name": "Elicitation",
++        "mcp_server_name": "powerbi-modeling-sp",
++        "message": "Delete the table?",
++        "mode": "form",
++        "requested_schema": {"type": "object", "properties": {}},
++        **over,
++    }
++
++
++def _mcp_bridge(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
++    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path / "root")
++    bridge_dir = prepare_bridge_dir("conv_old", bridge_id="bridge_mcp", workspace=tmp_path)
++    write_active_session_id(bridge_dir, "conv_new")
++    build_hook_settings(
++        bridge_dir,
++        ap_server_url="http://127.0.0.1:8787",
++        ap_auth_headers={"Authorization": "Bearer xyz"},
++    )
++    return bridge_dir
++
++
++def test_mcp_elicitation_hook_posts_to_the_active_session_and_prints_the_answer(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    from omnigent.harnesses.claude_native import ae_mcp_elicitation_hook as hook_module
++
++    posted: dict[str, object] = {}
++    answer = '{"hookSpecificOutput":{"hookEventName":"Elicitation","action":"accept"}}'
++
++    def fake_post(url: str, headers: dict[str, str], payload: dict[str, object], *a, **kw):
++        import httpx
++
++        posted.update(url=url, headers=headers, payload=payload)
++        return httpx.Response(200, text=answer, request=httpx.Request("POST", url))
++
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.hook._post_hook_with_reattach", fake_post
++    )
++    bridge_dir = _mcp_bridge(tmp_path, monkeypatch)
++    payload = _mcp_payload()
++    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
++    assert claude_native_hook.main(["mcp-elicitation", "--bridge-dir", str(bridge_dir)]) == 0
++    assert posted["url"] == "http://127.0.0.1:8787/v1/sessions/conv_new/hooks/ae-mcp-elicitation"
++    assert posted["payload"] == payload
++    assert posted["headers"] == {"Authorization": "Bearer xyz"}
++    assert capsys.readouterr().out == answer
++    assert hook_module.main is not None
++
++
++@pytest.mark.parametrize("case", ["unreachable", "url-mode", "bad-json", "raises"])
++def test_mcp_elicitation_hook_exits_zero_with_no_output_when_it_cannot_answer(
++    tmp_path: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++    case: str,
++) -> None:
++    calls: list[str] = []
++
++    def fake_post(url: str, *a, **kw):
++        calls.append(url)
++        if case == "raises":
++            raise RuntimeError("boom")
++
++    monkeypatch.setattr(
++        "omnigent.harnesses.claude_native.hook._post_hook_with_reattach", fake_post
++    )
++    bridge_dir = _mcp_bridge(tmp_path, monkeypatch)
++    body = (
++        "{not json"
++        if case == "bad-json"
++        else json.dumps(
++            _mcp_payload(**({"mode": "url", "url": "https://x"} if case == "url-mode" else {}))
++        )
++    )
++    monkeypatch.setattr(sys, "stdin", io.StringIO(body))
++    assert claude_native_hook.main(["mcp-elicitation", "--bridge-dir", str(bridge_dir)]) == 0
++    assert capsys.readouterr().out == ""
++    # URL mode and bad JSON never reach the server.
++    assert bool(calls) == (case in ("unreachable", "raises"))
++
++
++def test_mcp_elicitation_hook_turns_bad_arguments_into_exit_zero_with_no_output(
++    capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """argparse would exit 2, which Claude Code reads as a silent decline."""
++    monkeypatch.setattr(sys, "stdin", io.StringIO("{}"))
++    assert claude_native_hook.main(["mcp-elicitation", "--no-such-flag"]) == 0
++    assert claude_native_hook.main(["mcp-elicitation"]) == 0
++    assert capsys.readouterr().out == ""
+diff --git a/tests/server/routes/test_ae_mcp_elicitation.py b/tests/server/routes/test_ae_mcp_elicitation.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..41c9eb2b7b0b12d18839eace2bde0b82d432ec43
+--- /dev/null
++++ b/tests/server/routes/test_ae_mcp_elicitation.py
+@@ -0,0 +1,120 @@
++"""An MCP server's Elicitation hook parks as a permission-type card (omnigent-ae, 2026-10-27)."""
++
++from __future__ import annotations
++
++import json
++from types import SimpleNamespace
++
++import pytest
++
++from omnigent.errors import OmnigentError
++from omnigent.server.routes.sessions.routes_ae_mcp_elicitation import (
++    mcp_elicitation_answer,
++    mcp_elicitation_params,
++)
++
++SCHEMA = {
++    "type": "object",
++    "properties": {
++        "Confirm the operation": {
++            "type": "string",
++            "enum": ["Yes", "No"],
++            "enumNames": ["Continue the operation", "Decline the operation"],
++        }
++    },
++    "required": ["Confirm the operation"],
++}
++PAYLOAD = {
++    "hook_event_name": "Elicitation",
++    "mcp_server_name": "powerbi-modeling-sp",
++    "message": "Delete table Sales?",
++    "mode": "form",
++    "requested_schema": SCHEMA,
++}
++
++
++def test_the_card_is_a_permission_prompt_with_the_servers_schema_and_no_question_payload() -> None:
++    params = mcp_elicitation_params(PAYLOAD).model_dump(exclude_none=False)
++    assert params["mode"] == "form"
++    assert params["phase"] == "pre_tool_use"
++    assert params["policy_name"] == "claude_native_permission"
++    assert params["requestedSchema"] == SCHEMA
++    assert params["message"] == "powerbi-modeling-sp asks: Delete table Sales?"
++    assert params["tool_name"] == "mcp:powerbi-modeling-sp"
++    for key in ("ask_user_question", "allow_auto_mode", "remember_scope", "exit_plan_mode"):
++        assert not params.get(key), key
++
++
++@pytest.mark.parametrize(
++    "bad", [{"mcp_server_name": ""}, {"mcp_server_name": 3}, {"requested_schema": "x"}]
++)
++def test_a_malformed_body_is_refused(bad: dict[str, object]) -> None:
++    with pytest.raises(OmnigentError):
++        mcp_elicitation_params({**PAYLOAD, **bad})
++
++
++def test_the_answer_is_claudes_hook_output_and_an_unanswered_wait_is_an_empty_200() -> None:
++    accept = mcp_elicitation_answer(
++        SimpleNamespace(action="accept", content={"Confirm the operation": "Yes"})
++    )
++    assert json.loads(accept.body) == {
++        "hookSpecificOutput": {
++            "hookEventName": "Elicitation",
++            "action": "accept",
++            "content": {"Confirm the operation": "Yes"},
++        }
++    }
++    decline = mcp_elicitation_answer(SimpleNamespace(action="decline", content={"x": 1}))
++    assert json.loads(decline.body)["hookSpecificOutput"] == {
++        "hookEventName": "Elicitation",
++        "action": "decline",
++    }
++    empty = mcp_elicitation_answer(None)
++    assert empty.status_code == 200 and empty.body == b""
++
++
++def test_the_route_needs_edit_access_not_read() -> None:
++    """A read-only collaborator must not park a fake form in the owner's chat."""
++    import inspect
++
++    from omnigent.server.auth import LEVEL_EDIT
++    from omnigent.server.routes.sessions import routes_ae_mcp_elicitation as module
++
++    source = inspect.getsource(module.register_ae_mcp_elicitation_routes)
++    assert "LEVEL_EDIT" in source and "LEVEL_READ" not in source
++    assert module.LEVEL_EDIT == LEVEL_EDIT
++
++
++@pytest.mark.asyncio
++async def test_a_read_level_caller_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
++    from fastapi import APIRouter
++    from fastapi.testclient import TestClient  # noqa: F401  (route table only)
++
++    from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
++    from omnigent.server.routes.sessions import routes_ae_mcp_elicitation as module
++
++    seen: list[int] = []
++
++    async def fake_require(user, session_id, level, perms, store):
++        seen.append(level)
++        if level > LEVEL_READ:
++            raise OmnigentError("forbidden", code="forbidden")  # type: ignore[arg-type]
++
++    monkeypatch.setattr(module, "require_access", fake_require)
++    monkeypatch.setattr(module, "get_user_id", lambda request, provider: "reader")
++    router = APIRouter()
++    module.register_ae_mcp_elicitation_routes(
++        router,
++        conversation_store=None,
++        auth_provider=None,
++        permission_store=None,  # type: ignore[arg-type]
++    )
++    handler = router.routes[0].endpoint  # type: ignore[attr-defined]
++
++    class _Req:
++        async def json(self) -> dict[str, object]:
++            return PAYLOAD
++
++    with pytest.raises(OmnigentError):
++        await handler(_Req(), "conv_x")
++    assert seen == [LEVEL_EDIT]
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 4295992a0f43d4b1d98ef53ffad5ddbd4f75de9c..8c2febe2f04edc4fc35cbed2756fc8a8c9c4bb0c 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -883,4 +883,45 @@ describe("AeActionDock child prompts", () => {
+     });
+     await waitFor(() => expect(screen.queryByTestId("ae-action-dock")).toBeNull());
+   });
++  it("renders an MCP server's schema form for its real payload and answers in the child", async () => {
++    const field = "Confirm the operation";
++    const mcp = {
++      ...(ask as object),
++      elicitationId: "mcp1",
++      targetSessionId: "conv_pbi",
++      familyChild: { title: "Halcyon Orbital" },
++      message: "powerbi-modeling-sp asks: Delete table Sales?",
++      policyName: "claude_native_permission",
++      askUserQuestion: null,
++      requestedSchema: {
++        type: "object",
++        properties: {
++          [field]: {
++            type: "string",
++            enum: ["Yes", "No"],
++            enumNames: ["Continue the operation", "Decline the operation"],
++          },
++        },
++        required: [field],
++      },
++    } as unknown as AnyBlock;
++    vi.mocked(authenticatedFetch).mockImplementation(() => json({ queued: false }, 202));
++    renderChildDock([mcp]);
++    fireEvent.click(await screen.findByTestId("ae-dock-child-answer"));
++    const prompt = await screen.findByTestId("ae-dock-child-prompt");
++    expect(prompt.textContent).toContain("powerbi-modeling-sp asks");
++    expect(prompt.textContent).toContain(field);
++    fireEvent.change(within(prompt).getByRole("combobox"), { target: { value: "Yes" } });
++    fireEvent.click(within(prompt).getByRole("button", { name: /submit/i }));
++    await waitFor(() => {
++      const call = vi
++        .mocked(authenticatedFetch)
++        .mock.calls.find(([path]) => String(path).includes("/resolve"))!;
++      expect(call[0]).toBe("/v1/sessions/conv_pbi/elicitations/mcp1/resolve");
++      expect(JSON.parse(String(call[1]?.body))).toEqual({
++        action: "accept",
++        content: { [field]: "Yes" },
++      });
++    });
++  });
+ });

@@ -402,6 +402,37 @@ POST_MESSAGE_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+ANSWER_CHILD_QUESTION_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "child_session_id": {
+            "type": "string",
+            "description": "The session that asked the question (conv_...).",
+        },
+        "elicitation_id": {
+            "type": "string",
+            "description": "The pending question's id, from the child's prompt.",
+        },
+        "answers": {
+            "type": "object",
+            "description": (
+                "One entry per question, keyed by the question's id or, when it has none, its "
+                "text exactly. The value is the chosen option label or free text; a "
+                "multi-select question takes a list of them."
+            ),
+            "additionalProperties": {
+                "anyOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}]
+            },
+        },
+        "cancel": {
+            "type": "boolean",
+            "description": "True to decline the question instead of answering it.",
+        },
+    },
+    "required": ["child_session_id", "elicitation_id"],
+    "additionalProperties": False,
+}
+
 SCHEDULE_CHECKIN_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -727,6 +758,17 @@ TOOLS: list[types.Tool] = [
         inputSchema=POST_MESSAGE_SCHEMA,
     ),
     types.Tool(
+        name="answer_child_question",
+        description=(
+            "Pass Reid's answer to a question (AskUserQuestion) that a session you started is "
+            "waiting on. Ask Reid first with ask_reid. Never for tool permissions, plan "
+            "approval, commands or MCP prompts: those are Reid's to answer in the dock. "
+            "Refuses when Reid turned relaying off, the session is not yours, or the question "
+            "is no longer pending."
+        ),
+        inputSchema=ANSWER_CHILD_QUESTION_SCHEMA,
+    ),
+    types.Tool(
         name="schedule_checkin",
         description=(
             "Create, change or pause the one recurring orchestrator check-in (a scheduled task "
@@ -801,6 +843,7 @@ WRITING_TOOLS: frozenset[str] = frozenset(
         "omni_set_status",
         "create_session",
         "post_message",
+        "answer_child_question",
         "schedule_checkin",
         "set_session_model",
         "report_review",
@@ -1094,6 +1137,131 @@ async def post_message(client: OmniClient, args: dict[str, Any]) -> Any:
     if 200 <= status < 300:
         return {"posted": True, "session_id": session_id, "status": status}
     return {"error": f"Could not post to {session_id}: {_message(status, data)}"}
+
+
+ORCH_LABEL = "ae.orch"
+FORK_SOURCE_LABEL = "omnigent.fork.source_id"
+_REFUSAL_TAIL = " Reid can answer it in the parent chat's action dock."
+
+
+def _refuse(why: str) -> dict[str, Any]:
+    return {"error": f"Could not answer the child's question: {why}.{_REFUSAL_TAIL}"}
+
+
+def _question_key(question: dict[str, Any]) -> str:
+    """The key the web card files an answer under: the question's id, else its text."""
+    qid = question.get("id")
+    return qid if isinstance(qid, str) and qid else str(question.get("question", ""))
+
+
+def _answer_content(
+    questions: list[dict[str, Any]], answers: Any
+) -> tuple[dict[str, Any] | None, str]:
+    """The ``content`` the web card posts for AskUserQuestion answers, or why *answers* is wrong.
+
+    The shape is ``askUserQuestion.ts``'s: a flat ``{question id or text: label | [labels]}``
+    map with every question answered; a multi-select question takes a list.
+    """
+    keys = [_question_key(q) for q in questions]
+    if not isinstance(answers, dict) or not answers:
+        return None, "answers is missing; pass one entry per question, keys " + json.dumps(keys)
+    unknown = [key for key in answers if key not in keys]
+    missing = [key for key in keys if key not in answers]
+    if unknown or missing:
+        return None, f"answers must have exactly the keys {json.dumps(keys)}"
+    content: dict[str, Any] = {}
+    for question, key in zip(questions, keys, strict=True):
+        value = answers[key]
+        if question.get("multiSelect") is True:
+            picked = [value] if isinstance(value, str) else value
+            if (
+                not isinstance(picked, list)
+                or not picked
+                or not all(isinstance(v, str) and v.strip() for v in picked)
+            ):
+                return None, f"the answer to {key!r} must be a non-empty list of strings"
+            content[key] = list(dict.fromkeys(picked))
+        else:
+            if not isinstance(value, str) or not value.strip():
+                return None, f"the answer to {key!r} must be one non-empty string"
+            content[key] = value
+    return content, ""
+
+
+def _plain_question(params: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """The questions of a plain AskUserQuestion prompt, else ``None`` for every other kind.
+
+    A tool permission, plan approval (ExitPlanMode), Codex command and MCP form or write
+    approval carry no ``ask_user_question`` payload, or carry one of their own markers beside it.
+    """
+    payload = params.get("ask_user_question")
+    questions = payload.get("questions") if isinstance(payload, dict) else None
+    if not isinstance(questions, list) or not questions:
+        return None
+    if params.get("exit_plan_mode") or params.get("command"):
+        return None
+    meta = params.get("_meta")
+    if isinstance(meta, dict) and meta.get("codex_approval_kind"):
+        return None
+    if not all(isinstance(q, dict) for q in questions):
+        return None
+    return questions
+
+
+async def answer_child_question(client: OmniClient, args: dict[str, Any]) -> Any:
+    """Pass Reid's answer to a family child's AskUserQuestion; refuse every other prompt."""
+    # The lead is the calling session itself, never a caller-supplied id.
+    parent = _caller_session()
+    if not parent:
+        return _refuse(
+            "could not find this session's own id (OMNIGENT_RUNNER_PRIMARY_SESSION_ID is not set)"
+        )
+    child = str(args["child_session_id"])
+    elicitation_id = str(args["elicitation_id"])
+    status, roles = await client.call("GET", "/v1/ae/roles")
+    if status != 200 or not isinstance(roles, dict):
+        return _refuse(f"could not read the relay setting ({_message(status, roles)})")
+    if roles.get("child_relay") is False:
+        return _refuse("Reid turned off 'Lead relays answers to child questions'")
+    status, session = await client.call("GET", f"/v1/sessions/{child}")
+    if status != 200 or not isinstance(session, dict):
+        return _refuse(f"could not read the child session ({_message(status, session)})")
+    session_labels = session.get("labels")
+    labels = session_labels if isinstance(session_labels, dict) else {}
+    owner = str(labels.get(ORCH_LABEL, "")).strip()
+    if labels.get(FORK_SOURCE_LABEL) or session.get("parent_session_id") or owner != parent:
+        return _refuse(f"{child} is not a session {parent} started")
+    pending = session.get("pending_elicitations")
+    event = next(
+        (
+            e
+            for e in (pending if isinstance(pending, list) else [])
+            if isinstance(e, dict) and e.get("elicitation_id") == elicitation_id
+        ),
+        None,
+    )
+    if event is None:
+        return {"error": f"Already answered: {elicitation_id} is not pending on {child}."}
+    params = event.get("params")
+    questions = _plain_question(params if isinstance(params, dict) else {})
+    if questions is None:
+        return _refuse(
+            "only a question the child asked can be relayed, not a tool permission, plan "
+            "approval, command or MCP prompt"
+        )
+    if args.get("cancel") is True:
+        body: dict[str, Any] = {"action": "decline"}
+    else:
+        content, why = _answer_content(questions, args.get("answers"))
+        if content is None:
+            return {"error": f"Could not answer the child's question: {why}."}
+        body = {"action": "accept", "content": content}
+    status, data = await client.call(
+        "POST", f"/v1/sessions/{child}/elicitations/{elicitation_id}/resolve", json_body=body
+    )
+    if 200 <= status < 300:
+        return {"answered": True, "child_session_id": child, "elicitation_id": elicitation_id}
+    return {"error": f"Could not answer the child's question: {_message(status, data)}"}
 
 
 async def schedule_checkin(client: OmniClient, args: dict[str, Any]) -> Any:
@@ -1452,6 +1620,7 @@ HANDLERS = {
     "omni_transcript": omni_transcript,
     "create_session": create_session,
     "post_message": post_message,
+    "answer_child_question": answer_child_question,
     "schedule_checkin": schedule_checkin,
     "list_prs": list_prs,
     "report_review": report_review,

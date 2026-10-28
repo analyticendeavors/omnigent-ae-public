@@ -26,10 +26,19 @@ Click the ring to open the usage popover. A bar shows what fills the context win
 
 <p align="center"><img src="../media/usage-popover-account.jpg" alt="Limits for the session's own account"></p>
 
-Each Claude session records which account it runs on, and the popover reads the limits for that account, so a session on a backup login shows the backup's windows and not the default login's. The account's label appears beside the plan name.
+Each Claude session records which account it runs on, and the popover reads the limits for that account, so a session on a backup login shows the backup's windows and not the default login's. The runner labels the session with its login at every launch, so a restart on another login shows the right numbers at once. The account's label appears beside the plan name.
 
 **Where:** The usage popover, on the line that names Claude Code, the plan and the account.<br>
-**Built from:** core patch [`0078`](../../patches/0078-ae-patch-Record-each-Claude-session-s-account-beside.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+**Built from:** core patches [`0078`](../../patches/0078-ae-patch-Record-each-Claude-session-s-account-beside.patch), [`0208`](../../patches/0208-ae-patch-Show-a-chat-s-live-Claude-login-in-the-Usag.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+
+## Check any login's limits
+
+<p align="center"><img src="../media/usage-account-switcher.webp" alt="Check any login's limits"></p>
+
+The account name in the usage popover and in the session rail's Usage card is a menu of every Claude login on the host, each with its plan, and the one this chat runs on is marked This chat. Pick another and the card shows that login's windows and credits; the chat itself stays on its own login. The choice lasts while you look at that chat. Codex cards stay plain.
+
+**Where:** The account name on the plan line of the usage popover or the rail's Usage card.<br>
+**Built from:** core patch [`0208`](../../patches/0208-ae-patch-Show-a-chat-s-live-Claude-login-in-the-Usag.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
 ## Several Claude logins per host
 
@@ -58,14 +67,23 @@ An admin adds company Claude accounts once on the server, and every user's host 
 **Where:** Settings > AI accounts, in the Shared group below the host's own logins.<br>
 **Built from:** core patches [`0117`](../../patches/0117-ae-patch-List-the-admin-s-shared-Claude-accounts-in-.patch), [`0127`](../../patches/0127-ae-patch-Manage-shared-Claude-accounts-from-Settings.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
-## Pick the account when forking
+## Move a chat to another login
 
-<p align="center"><img src="../media/accounts-fork-picker.webp" alt="Pick the account when forking"></p>
+<p align="center"><img src="../media/accounts-move-chat.webp" alt="Move a chat to another login"></p>
 
-Omnigent switches a running session to another harness or model by forking it. The fork dialog adds a Claude account row, so the copy can run on another login or a shared account while the original keeps its own. It defaults to Same as this session and names that account.
+The composer's Account menu now has two groups. Under This chat, the login the chat runs on is ticked, and picking another restarts the chat's Claude terminal on it and resumes the same conversation; its next reply re-reads the conversation, which uses extra tokens on that subscription. A chat in the middle of a reply is refused, with the reason under the rows. Under New chats, the pick sets the login for chats you start later, and changing it asks whether to move every open chat too (Only new chats, or Move all chats). Move all chats moves idle chats, four at a time, and skips a chat that is mid-reply; the result line names each skipped chat and why. A restart never moves a chat to the new-chat default.
+
+**Where:** The composer's model menu > Account, in a Claude Code chat.<br>
+**Built from:** core patch [`0209`](../../patches/0209-ae-patch-Switch-a-Claude-chat-s-login-in-place-and-k.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+
+## Copy a chat to another login
+
+<p align="center"><img src="../media/accounts-fork-picker.webp" alt="Copy a chat to another login"></p>
+
+Omnigent switches a running session to another harness or model by forking it. The fork dialog adds a Claude account row, so the copy can run on another login or a shared account while the original keeps its own. It defaults to Same as this session and names that account. The usage gate in the action dock offers it as Copy to another login, next to Switch account, which moves the chat in place.
 
 **Where:** The composer's model menu > Claude Code > Switch harness, then Claude account.<br>
-**Built from:** core patch [`0099`](../../patches/0099-ae-patch-Pick-the-Claude-account-when-forking-a-Clau.patch)
+**Built from:** core patches [`0099`](../../patches/0099-ae-patch-Pick-the-Claude-account-when-forking-a-Clau.patch), [`0209`](../../patches/0209-ae-patch-Switch-a-Claude-chat-s-login-in-place-and-k.patch)
 
 ---
 

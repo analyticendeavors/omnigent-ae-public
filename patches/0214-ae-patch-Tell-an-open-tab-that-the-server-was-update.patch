@@ -1,0 +1,558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 16:18:53 -0700
+Subject: [PATCH 214/220] [ae-patch] Tell an open tab that the server was
+ updated, with a Reload toast
+
+---
+ web/src/components/AeReloadNotice.test.tsx | 100 +++++++++
+ web/src/components/AeReloadNotice.tsx      |  34 +++
+ web/src/lib/aeBuildCheck.test.ts           | 240 +++++++++++++++++++++
+ web/src/lib/aeBuildCheck.ts                | 122 +++++++++++
+ web/src/shell/AppShell.tsx                 |   2 +
+ 5 files changed, 498 insertions(+)
+ create mode 100644 web/src/components/AeReloadNotice.test.tsx
+ create mode 100644 web/src/components/AeReloadNotice.tsx
+ create mode 100644 web/src/lib/aeBuildCheck.test.ts
+ create mode 100644 web/src/lib/aeBuildCheck.ts
+
+diff --git a/web/src/components/AeReloadNotice.test.tsx b/web/src/components/AeReloadNotice.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..235b0a3edb5779da0291e69bbe348a0c201e72cb
+--- /dev/null
++++ b/web/src/components/AeReloadNotice.test.tsx
+@@ -0,0 +1,100 @@
++import { act, render } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import { AE_BUILD_CHECK_INTERVAL_MS, resetAnnouncedBuildsForTests } from "@/lib/aeBuildCheck";
++import { EmbeddedProvider } from "@/lib/embedded";
++
++const mocks = vi.hoisted(() => ({ toast: Object.assign(vi.fn(), { dismiss: vi.fn() }) }));
++vi.mock("sonner", () => ({ toast: mocks.toast }));
++
++import { AeReloadNotice } from "./AeReloadNotice";
++
++const html = (name: string) => `<script type="module" crossorigin src="./assets/${name}"></script>`;
++
++describe("AeReloadNotice", () => {
++  const fetchMock = vi.fn();
++  const serve = (name: string) =>
++    fetchMock.mockResolvedValue({ ok: true, text: async () => html(name) });
++  const tick = (ms: number) => act(() => vi.advanceTimersByTimeAsync(ms));
++
++  beforeEach(() => {
++    vi.useFakeTimers();
++    resetAnnouncedBuildsForTests();
++    mocks.toast.mockReset();
++    mocks.toast.dismiss.mockReset();
++    fetchMock.mockReset();
++    vi.stubGlobal("fetch", fetchMock);
++    const script = document.createElement("script");
++    script.type = "module";
++    script.setAttribute("src", "./assets/index-OLD.js");
++    document.head.appendChild(script);
++  });
++  afterEach(() => {
++    document.head.querySelectorAll("script").forEach((s) => s.remove());
++    vi.unstubAllGlobals();
++    vi.useRealTimers();
++  });
++
++  it("renders nothing and stays quiet while the build is the same", async () => {
++    serve("index-OLD.js");
++    const { container } = render(<AeReloadNotice />);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(container.innerHTML).toBe("");
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++
++  it("shows one persistent toast for a new build, and Later keeps it quiet for that build", async () => {
++    serve("index-NEW1.js");
++    render(<AeReloadNotice />);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 3);
++    expect(mocks.toast).toHaveBeenCalledTimes(1);
++    const [title, options] = mocks.toast.mock.calls[0];
++    expect(title).toBe("OmniGent was updated.");
++    expect(options).toMatchObject({
++      id: "ae-reload-notice",
++      description: "Reload to get the new version.",
++      duration: Number.POSITIVE_INFINITY,
++      action: { label: "Reload" },
++      cancel: { label: "Later" },
++    });
++    options.cancel.onClick();
++    expect(mocks.toast.dismiss).toHaveBeenCalledWith("ae-reload-notice");
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(mocks.toast).toHaveBeenCalledTimes(1);
++    serve("index-NEW2.js");
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(mocks.toast).toHaveBeenCalledTimes(2);
++  });
++
++  it("stops checking after unmount", async () => {
++    serve("index-NEW1.js");
++    const { unmount } = render(<AeReloadNotice />);
++    unmount();
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it("stays quiet for a build after Later even when the component remounts", async () => {
++    serve("index-NEW1.js");
++    const first = render(<AeReloadNotice />);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(mocks.toast).toHaveBeenCalledTimes(1);
++    mocks.toast.mock.calls[0][1].cancel.onClick();
++    first.unmount();
++    render(<AeReloadNotice />);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(mocks.toast).toHaveBeenCalledTimes(1);
++  });
++
++  it("does not check at all when embedded", async () => {
++    serve("index-NEW1.js");
++    render(
++      <EmbeddedProvider>
++        <AeReloadNotice />
++      </EmbeddedProvider>,
++    );
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(fetchMock).not.toHaveBeenCalled();
++    expect(mocks.toast).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/components/AeReloadNotice.tsx b/web/src/components/AeReloadNotice.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8b8f176d16613fa326a2223dd155779d84eea08c
+--- /dev/null
++++ b/web/src/components/AeReloadNotice.tsx
+@@ -0,0 +1,34 @@
++import { useEffect } from "react";
++import { toast } from "sonner";
++
++import { useIsEmbedded } from "@/lib/embedded";
++import { startBuildCheck } from "@/lib/aeBuildCheck";
++
++const TOAST_ID = "ae-reload-notice";
++
++/**
++ * Shows one persistent "OmniGent was updated" toast when the server serves a
++ * newer build than this tab runs (patch 0214). Renders nothing itself and never
++ * reloads on its own. "Later" dismisses it for that build; a different, newer
++ * build shows it again.
++ */
++export function AeReloadNotice() {
++  const embedded = useIsEmbedded();
++  useEffect(
++    () =>
++      embedded
++        ? undefined
++        : startBuildCheck(() => {
++            toast("OmniGent was updated.", {
++              id: TOAST_ID,
++              description: "Reload to get the new version.",
++              duration: Number.POSITIVE_INFINITY,
++              testId: "ae-reload-notice",
++              action: { label: "Reload", onClick: () => window.location.reload() },
++              cancel: { label: "Later", onClick: () => toast.dismiss(TOAST_ID) },
++            });
++          }),
++    [embedded],
++  );
++  return null;
++}
+diff --git a/web/src/lib/aeBuildCheck.test.ts b/web/src/lib/aeBuildCheck.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2a1f069ad63e1552ba38e687c72c36cbead2efb2
+--- /dev/null
++++ b/web/src/lib/aeBuildCheck.test.ts
+@@ -0,0 +1,240 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++import {
++  AE_BUILD_CHECK_INTERVAL_MS,
++  AE_BUILD_CHECK_THROTTLE_MS,
++  AE_BUILD_CHECK_TIMEOUT_MS,
++  entryNameFromSrc,
++  extractEntryName,
++  ownEntryName,
++  shouldNotify,
++  resetAnnouncedBuildsForTests,
++  startBuildCheck,
++} from "./aeBuildCheck";
++
++const hostState = vi.hoisted(() => ({ config: {} as { fetcher?: unknown } }));
++vi.mock("@/lib/host", async (importOriginal) => ({
++  ...(await importOriginal<Record<string, unknown>>()),
++  getOmnigentHostConfig: () => hostState.config,
++}));
++
++// The head of a real built index.html (v0.18.0): relative src, crossorigin.
++const BUILT = `<!doctype html><html><head>
++<link rel="icon" href="./favicon.svg">
++<script type="module" crossorigin src="./assets/index-DRGsCGFe.js"></script>
++<link rel="modulepreload" crossorigin href="./assets/rolldown-runtime-CNC7AqOf.js">
++</head><body><div id="root"></div></body></html>`;
++
++const page = (name: string) => BUILT.replace("index-DRGsCGFe.js", name);
++
++describe("extractEntryName", () => {
++  it("reads the entry from a real built index.html", () => {
++    expect(extractEntryName(BUILT)).toBe("index-DRGsCGFe.js");
++  });
++  it("reads an absolute src", () => {
++    expect(extractEntryName('<script type="module" src="/assets/index-AbC_1-x.js"></script>')).toBe(
++      "index-AbC_1-x.js",
++    );
++  });
++  it("returns null for the dev page, a modulepreload and plain text", () => {
++    expect(extractEntryName('<script type="module" src="/src/main.tsx"></script>')).toBeNull();
++    expect(extractEntryName('<link rel="modulepreload" href="./assets/index-X.js">')).toBeNull();
++    expect(extractEntryName("")).toBeNull();
++  });
++  it("ignores a chunk that is not the index entry", () => {
++    expect(entryNameFromSrc("./assets/shiki-Yl5JeILm.js")).toBeNull();
++    expect(entryNameFromSrc(null)).toBeNull();
++  });
++});
++
++describe("shouldNotify", () => {
++  it("needs both names, a difference and an unannounced name", () => {
++    expect(shouldNotify("a.js", "b.js", new Set())).toBe(true);
++    expect(shouldNotify("a.js", "a.js", new Set())).toBe(false);
++    expect(shouldNotify(null, "b.js", new Set())).toBe(false);
++    expect(shouldNotify("a.js", null, new Set())).toBe(false);
++    expect(shouldNotify("a.js", "b.js", new Set(["b.js"]))).toBe(false);
++  });
++});
++
++describe("startBuildCheck", () => {
++  const fetchMock = vi.fn();
++  const served = (html: string, ok = true) =>
++    fetchMock.mockResolvedValue({ ok, text: async () => html });
++  const tick = async (ms: number) => {
++    await vi.advanceTimersByTimeAsync(ms);
++  };
++
++  beforeEach(() => {
++    vi.useFakeTimers();
++    fetchMock.mockReset();
++    resetAnnouncedBuildsForTests();
++    hostState.config = {};
++    vi.stubGlobal("fetch", fetchMock);
++    const script = document.createElement("script");
++    script.type = "module";
++    script.setAttribute("src", "./assets/index-DRGsCGFe.js");
++    document.head.appendChild(script);
++  });
++  afterEach(() => {
++    document.head.querySelectorAll("script").forEach((s) => s.remove());
++    vi.unstubAllGlobals();
++    vi.useRealTimers();
++  });
++
++  it("finds the page's own entry in the DOM", () => {
++    expect(ownEntryName()).toBe("index-DRGsCGFe.js");
++  });
++
++  it("does not fire for the same name", async () => {
++    served(BUILT);
++    const cb = vi.fn();
++    const stop = startBuildCheck(cb);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(fetchMock).toHaveBeenCalledWith(
++      expect.anything(),
++      expect.objectContaining({ cache: "no-store" }),
++    );
++    expect(cb).not.toHaveBeenCalled();
++    stop();
++  });
++
++  it("fires once per new name", async () => {
++    served(page("index-NEW1.js"));
++    const cb = vi.fn();
++    const stop = startBuildCheck(cb);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 3);
++    expect(cb).toHaveBeenCalledTimes(1);
++    expect(cb).toHaveBeenCalledWith("index-NEW1.js");
++    served(page("index-NEW2.js"));
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(cb).toHaveBeenCalledTimes(2);
++    stop();
++  });
++
++  it("never fires on a failed fetch, a non-200 answer or a missing entry", async () => {
++    const cb = vi.fn();
++    const stop = startBuildCheck(cb);
++    fetchMock.mockRejectedValue(new Error("offline"));
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    served(page("index-NEW1.js"), false);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    served('<script type="module" src="/src/main.tsx"></script>');
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(cb).not.toHaveBeenCalled();
++    stop();
++  });
++
++  it("checks on focus, throttled to once per 30 seconds", async () => {
++    served(BUILT);
++    const stop = startBuildCheck(vi.fn());
++    window.dispatchEvent(new Event("focus"));
++    await tick(0);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    window.dispatchEvent(new Event("focus"));
++    await tick(1000);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    await tick(AE_BUILD_CHECK_THROTTLE_MS);
++    document.dispatchEvent(new Event("visibilitychange"));
++    await tick(0);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    stop();
++  });
++
++  it("does not check without an entry name in the page (dev server)", async () => {
++    document.head.querySelectorAll("script").forEach((s) => s.remove());
++    served(page("index-NEW1.js"));
++    const cb = vi.fn();
++    const stop = startBuildCheck(cb);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(fetchMock).not.toHaveBeenCalled();
++    stop();
++  });
++
++  it("stops its timers and listeners on cleanup", async () => {
++    served(page("index-NEW1.js"));
++    const cb = vi.fn();
++    const stop = startBuildCheck(cb);
++    stop();
++    window.dispatchEvent(new Event("focus"));
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(fetchMock).not.toHaveBeenCalled();
++    expect(cb).not.toHaveBeenCalled();
++    expect(vi.getTimerCount()).toBe(0);
++  });
++
++  it("starts nothing when a host fetcher is installed (embedded or desktop)", async () => {
++    hostState.config = { fetcher: fetchMock };
++    served(page("index-NEW1.js"));
++    const cb = vi.fn();
++    const stop = startBuildCheck(cb);
++    window.dispatchEvent(new Event("focus"));
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(fetchMock).not.toHaveBeenCalled();
++    expect(cb).not.toHaveBeenCalled();
++    stop();
++    hostState.config = {};
++  });
++
++  it("skips ticks while the tab is hidden and fetches again once visible", async () => {
++    served(BUILT);
++    const vis = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
++    const stop = startBuildCheck(vi.fn());
++    await tick(AE_BUILD_CHECK_INTERVAL_MS * 2);
++    expect(fetchMock).not.toHaveBeenCalled();
++    vis.mockReturnValue("visible");
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    stop();
++    vis.mockRestore();
++  });
++
++  it("never fetches twice at once for a tick and a focus event", async () => {
++    let release: (v: unknown) => void = () => {};
++    fetchMock.mockReturnValue(
++      new Promise((r) => {
++        release = r;
++      }),
++    );
++    const stop = startBuildCheck(vi.fn());
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    window.dispatchEvent(new Event("focus"));
++    await tick(AE_BUILD_CHECK_THROTTLE_MS);
++    window.dispatchEvent(new Event("focus"));
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    release({ ok: true, text: async () => BUILT });
++    await tick(0);
++    stop();
++  });
++
++  it("routes the interval tick through the throttle", async () => {
++    served(BUILT);
++    const stop = startBuildCheck(vi.fn());
++    window.dispatchEvent(new Event("focus"));
++    await tick(0);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    stop();
++  });
++
++  it("aborts a fetch that never settles and fetches again on the next tick", async () => {
++    let signal: AbortSignal | undefined;
++    fetchMock.mockImplementation(
++      (_url: string, init: RequestInit) =>
++        new Promise((_resolve, reject) => {
++          signal = init.signal ?? undefined;
++          signal?.addEventListener("abort", () => reject(new Error("aborted")));
++        }),
++    );
++    const stop = startBuildCheck(vi.fn());
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(signal?.aborted).toBe(false);
++    await tick(AE_BUILD_CHECK_TIMEOUT_MS);
++    expect(signal?.aborted).toBe(true);
++    await tick(AE_BUILD_CHECK_INTERVAL_MS);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    stop();
++  });
++});
+diff --git a/web/src/lib/aeBuildCheck.ts b/web/src/lib/aeBuildCheck.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4a49fe5082cbe9e3331876a6f5cfd4cbb4251b4c
+--- /dev/null
++++ b/web/src/lib/aeBuildCheck.ts
+@@ -0,0 +1,122 @@
++import { getOmnigentHostConfig } from "@/lib/host";
++import { authenticatedFetch } from "@/lib/identity";
++
++// Detects that the server was redeployed while this tab kept running the page
++// it loaded (patch 0214). The built index.html names its entry script with a
++// content hash (`./assets/index-DRGsCGFe.js`); a deploy changes that name, so
++// comparing the name this tab loaded with the one the server serves now tells
++// whether the tab is stale. Pure functions are exported for tests.
++
++/** How often the server's start page is fetched while the tab is open. */
++export const AE_BUILD_CHECK_INTERVAL_MS = 2 * 60 * 1000;
++/** Focus and visibility checks run at most this often. */
++export const AE_BUILD_CHECK_THROTTLE_MS = 30 * 1000;
++/** A fetch that has not settled by then is aborted, so one stuck request never silences the check. */
++export const AE_BUILD_CHECK_TIMEOUT_MS = 15 * 1000;
++
++const ENTRY_NAME = /(?:^|\/)(index-[A-Za-z0-9_-]+\.js)(?:[?#].*)?$/;
++
++/** The entry script's file name when `src` is the built `index-HASH.js`, else null. */
++export function entryNameFromSrc(src: string | null | undefined): string | null {
++  if (!src) return null;
++  const match = ENTRY_NAME.exec(src);
++  return match ? match[1] : null;
++}
++
++/** The entry script name in a served index.html, or null (dev server, unknown shape). */
++export function extractEntryName(html: string): string | null {
++  const tags = html.match(/<script\b[^>]*>/gi) ?? [];
++  for (const tag of tags) {
++    if (!/\btype\s*=\s*["']module["']/i.test(tag)) continue;
++    const src = /\bsrc\s*=\s*["']([^"']+)["']/i.exec(tag);
++    const name = entryNameFromSrc(src ? src[1] : null);
++    if (name) return name;
++  }
++  return null;
++}
++
++/** The entry script name of the page this tab is running. */
++export function ownEntryName(doc: Document = document): string | null {
++  const scripts = doc.querySelectorAll<HTMLScriptElement>('script[type="module"][src]');
++  for (const script of Array.from(scripts)) {
++    const name = entryNameFromSrc(script.getAttribute("src"));
++    if (name) return name;
++  }
++  return null;
++}
++
++/** True when the server serves a different entry than the tab runs and this name was not announced yet. */
++export function shouldNotify(
++  own: string | null,
++  served: string | null,
++  announced: ReadonlySet<string>,
++): boolean {
++  return own !== null && served !== null && served !== own && !announced.has(served);
++}
++
++// Names already announced. Module scope, so a remount (the shell re-rendering
++// under a new route tree) never shows the same build's toast again after Later.
++const announced = new Set<string>();
++
++/** Forgets every announced name. Tests only. */
++export function resetAnnouncedBuildsForTests(): void {
++  announced.clear();
++}
++
++/**
++ * Starts the checks; returns a cleanup. `onNewBuild` fires once per new name.
++ * A failed fetch, a non-200 answer or a page without an entry name never fires.
++ * Nothing starts when a host fetcher is installed (embedded or desktop): the
++ * host owns the document and the network path there.
++ */
++export function startBuildCheck(onNewBuild: (name: string) => void): () => void {
++  if (getOmnigentHostConfig().fetcher) return () => {};
++  const own = ownEntryName();
++  if (own === null) return () => {};
++  let lastCheck = Number.NEGATIVE_INFINITY;
++  let inFlight = false;
++  let stopped = false;
++
++  const check = async () => {
++    if (inFlight) return;
++    inFlight = true;
++    lastCheck = Date.now();
++    // A controller and setTimeout rather than AbortSignal.timeout, so fake timers can drive it.
++    const controller = new AbortController();
++    const abortTimer = setTimeout(() => controller.abort(), AE_BUILD_CHECK_TIMEOUT_MS);
++    try {
++      const response = await authenticatedFetch("/", {
++        cache: "no-store",
++        signal: controller.signal,
++      });
++      if (!response.ok || stopped) return;
++      const served = extractEntryName(await response.text());
++      if (stopped || served === null || !shouldNotify(own, served, announced)) return;
++      announced.add(served);
++      onNewBuild(served);
++    } catch {
++      // Offline or the server is restarting: try again next time.
++    } finally {
++      clearTimeout(abortTimer);
++      inFlight = false;
++    }
++  };
++
++  const throttled = () => {
++    if (document.visibilityState === "hidden") return;
++    if (Date.now() - lastCheck >= AE_BUILD_CHECK_THROTTLE_MS) void check();
++  };
++  const onVisibility = () => {
++    if (document.visibilityState === "visible") throttled();
++  };
++
++  const timer = setInterval(throttled, AE_BUILD_CHECK_INTERVAL_MS);
++  document.addEventListener("visibilitychange", onVisibility);
++  window.addEventListener("focus", throttled);
++  return () => {
++    stopped = true;
++    clearInterval(timer);
++    document.removeEventListener("visibilitychange", onVisibility);
++    window.removeEventListener("focus", throttled);
++  };
++}
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 7154be826fff2bdc884c89c9006daccfeb6f4f47..9308b8597bd1de7540b1687ec6ea53b61cabc2f8 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -140,6 +140,7 @@ import { ImportReviewGate } from "@/components/onboarding/HostImportReview";
+ import { CommandPalette } from "./CommandPalette";
+ import { RecentSessionsSwitcher } from "./RecentSessionsSwitcher";
+ import { Toaster } from "@/components/ui/sonner";
++import { AeReloadNotice } from "@/components/AeReloadNotice";
+ import { CloseShellDialog } from "./CloseShellDialog";
+ import { ForkSessionDialog } from "./ForkSessionDialog";
+ import { ForkDialogContextProvider, type ForkDialogContextValue } from "./ForkDialogContext";
+@@ -2869,6 +2870,7 @@ export function AppShell() {
+             }}
+           />
+           <AeMoveAllChatsDialog />
++          <AeReloadNotice />
+         </ForkDialogContextProvider>
+       </TerminalFirstContextProvider>
+     </FileViewerContext.Provider>

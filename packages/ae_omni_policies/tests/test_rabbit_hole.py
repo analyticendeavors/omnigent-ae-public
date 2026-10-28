@@ -131,6 +131,107 @@ def test_a_store_outage_counts_but_does_not_ask(monkeypatch: pytest.MonkeyPatch)
     assert rabbit_hole(hours=4, turns=2)(_event({TURNS_KEY: 5})) == COUNTED
 
 
+# ── A family child follows its lead's answer (2026-10-27) ────────────
+
+OVER = {TURNS_KEY: 5}
+CHILD_ACKED = {
+    "result": "ALLOW",
+    "state_updates": [
+        {"key": TURNS_KEY, "action": "increment", "value": 1},
+        {"key": ACK_KEY, "action": "set", "value": "1"},
+    ],
+}
+
+
+class _FamilyStore:
+    def __init__(
+        self, rows: dict[str, Conversation], owners: dict[str, str] | None = None
+    ) -> None:
+        self.rows = rows
+        self.owners = owners or {}
+        self.broken = False
+        self.owner_error = False
+
+    def get_conversation(self, conversation_id: str) -> Conversation | None:
+        if self.broken and conversation_id == "conv_lead":
+            raise OperationalError("select", {}, Exception("locked"))
+        return self.rows.get(conversation_id)
+
+    def get_session_owner(self, conversation_id: str, owner_only: bool = False) -> str | None:
+        if self.owner_error:
+            raise OperationalError("select", {}, Exception("locked"))
+        return self.owners.get(conversation_id, "reid")
+
+
+def _family(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    lead_state: dict[str, Any] | None = None,
+    child_labels: dict[str, str] | None = None,
+    lead: bool = True,
+    owners: dict[str, str] | None = None,
+) -> _FamilyStore:
+    child = _conv()
+    child.labels = child_labels if child_labels is not None else {labels.ORCH: "conv_lead"}
+    rows = {"conv_a": child}
+    if lead:
+        lead_row = _conv(id="conv_lead", title="Lead")
+        lead_row.session_state = lead_state or {}
+        rows["conv_lead"] = lead_row
+    family = _FamilyStore(rows, owners)
+    monkeypatch.setattr(sessions, "current_session_id", lambda: "conv_a")
+    monkeypatch.setattr(sessions, "get_conversation_store", lambda: family)
+    return family
+
+
+def _asks(response: dict[str, Any] | None) -> bool:
+    return response is not None and response["result"] == "ASK"
+
+
+def test_a_child_of_an_accepted_lead_is_allowed_and_gets_its_own_ack(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _family(monkeypatch, lead_state={ACK_KEY: "1"})
+    assert rabbit_hole(hours=4, turns=2)(_event(OVER)) == CHILD_ACKED
+
+
+def test_a_child_of_an_unaccepted_lead_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    _family(monkeypatch, lead_state={TURNS_KEY: 90})
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+
+
+def test_a_child_under_the_threshold_is_only_counted(monkeypatch: pytest.MonkeyPatch) -> None:
+    _family(monkeypatch, lead_state={ACK_KEY: "1"})
+    assert rabbit_hole(hours=4, turns=60)(_event(OVER)) == COUNTED
+
+
+def test_a_foreign_owner_or_missing_lead_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    _family(
+        monkeypatch,
+        lead_state={ACK_KEY: "1"},
+        owners={"conv_a": "reid", "conv_lead": "someone-else"},
+    )
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+    _family(monkeypatch, lead=False)
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+
+
+def test_a_fork_or_unlabelled_session_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    fork = {labels.ORCH: "conv_lead", "omnigent.fork.source_id": "conv_other"}
+    _family(monkeypatch, lead_state={ACK_KEY: "1"}, child_labels=fork)
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+    _family(monkeypatch, lead_state={ACK_KEY: "1"}, child_labels={labels.ORCH: "1"})
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+    _family(monkeypatch, lead_state={ACK_KEY: "1"}, child_labels={})
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+
+
+def test_a_store_error_reading_the_lead_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    family = _family(monkeypatch, lead_state={ACK_KEY: "1"})
+    family.broken = True
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+
+
 def test_thresholds_must_not_be_negative() -> None:
     with pytest.raises(ValueError, match="thresholds"):
         rabbit_hole(hours=-1)
@@ -216,3 +317,15 @@ def test_a_merge_watcher_note_is_neither_counted_nor_asked(
     event["data"] = {"user_content": "keep going"}
     response = policy(event)
     assert response is not None and response["result"] == "ASK"
+
+
+def test_a_failed_owner_read_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    family = _family(monkeypatch, lead_state={ACK_KEY: "1"})
+    family.owner_error = True
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
+
+
+def test_a_missing_owner_asks(monkeypatch: pytest.MonkeyPatch) -> None:
+    family = _family(monkeypatch, lead_state={ACK_KEY: "1"})
+    family.get_session_owner = lambda *_a, **_k: None  # type: ignore[method-assign]
+    assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))

@@ -110,6 +110,24 @@ Settings > Roles ends with Preset insights. Its switch, "Collect run logs and re
 **Where:** Preset insights, the last block of Settings > Roles.<br>
 **Built from:** core patches [`0181`](../../patches/0181-ae-patch-Tell-the-lead-to-report-its-final-review-an.patch), [`0182`](../../patches/0182-ae-patch-Add-preset-insights-block-to-Settings-Roles.patch), [`0195`](../../patches/0195-ae-patch-Add-a-review-frequency-to-Settings-Roles-We.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
+## Session links read as titles
+
+<p align="center"><img src="../media/family-session-link-title.jpg" alt="Session links read as titles"></p>
+
+When a lead's message names another session by its bare URL, the link reads as that session's title instead of a long address, so "The builder is on the retry fix in Await the gateway mock before asserting" says which session it means. The title is looked up once per session and kept for a few minutes. While it loads, or if the lookup fails, the link reads "session" and the first eight characters of its id. A link you write with your own text keeps that text, and a click opens the session inside the app.
+
+**Where:** Any chat message that holds a link to another session.<br>
+**Built from:** core patches [`0203`](../../patches/0203-ae-patch-Show-a-session-s-title-for-a-bare-session-l.patch), [`0205`](../../patches/0205-ae-patch-Fix-the-review-findings-on-session-link-tit.patch)
+
+## A helper's questions reach the lead
+
+<p align="center"><img src="../media/family-child-ask.jpg" alt="A helper's questions reach the lead"></p>
+
+When a session the lead started asks a question or needs a permission, the prompt also appears in the lead's action dock, under the helper's title with an Open chat link. The strip shows the helper's name and the question, and Answer opens the real card in the tray. Your answer goes back to the helper that asked, so you never open its chat to unblock it. A setting in Settings > General > Sessions turns the mirror off.
+
+**Where:** The action dock in the composer bar of the lead's chat.<br>
+**Built from:** core patch [`0210`](../../patches/0210-ae-patch-Show-a-session-s-questions-and-prompts-in-i.patch)
+
 ---
 
 Next: [Triage and policies](triage-and-policies.md)

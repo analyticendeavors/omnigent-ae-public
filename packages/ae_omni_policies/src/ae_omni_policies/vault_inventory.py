@@ -2,7 +2,7 @@
 
 Why: the Box health card answers "does this box have what it needs" for the 17
 keys the box pulls. Reid also wants the whole inventory: every secret across
-``ae-secrets-vault`` and the website's vault, which ones expire, which have not
+the box's vault (``AE_VAULT_NAME``) and the website's vault, which ones expire, which have not
 changed in half a year, and which live in both vaults and so must be rotated
 twice (the global CLAUDE.md names two). The concept page
 (``secrets-vault-concept.html``, approved 2026-10-23) laid out the card.
@@ -132,6 +132,8 @@ class Inventory(BaseModel):
     read_at: str | None
     stale: bool
     box_vault: str
+    configured: bool = True
+    """False only when there is no stored reading and ``AE_VAULT_NAME`` is unset on the server."""
     vaults: list[VaultView]
     owners_editable: bool = False
     """Whether an owner set from the card survives a restart."""
@@ -302,8 +304,15 @@ def view(
     :param owners: Owner by ``<vault>/<name>`` (``secret_owners.py``).
     :param alerts: Open alert by ``<vault>/<name>`` (``secret_alerts.infos``).
     """
+    configured_name = secrets_meta.box_vault()
     if reading is None:
-        return Inventory(read_at=None, stale=True, box_vault=secrets_meta.VAULT, vaults=[])
+        return Inventory(
+            read_at=None,
+            stale=True,
+            box_vault=configured_name or "",
+            configured=configured_name is not None,
+            vaults=[],
+        )
     vaults = [(reading.vault, reading.secrets, True)] + [
         (name, secrets, False) for name, secrets in reading.vaults.items()
     ]

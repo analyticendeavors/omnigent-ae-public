@@ -1,0 +1,600 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:13:39 -0700
+Subject: [PATCH 216/220] [ae-patch] List pop-up dialogs in browser snapshots
+ and screenshot a browser pane that is off screen
+
+browser_snapshot stopped walking at the first element that failed its
+visibility check, so a modal rendered into a zero-size or display:contents
+portal root never appeared in the tree. Only display:none, opacity 0 or a
+zero-area box that clips its overflow now hide a subtree; an element is
+listed when it is itself visible. The walk also enters open shadow roots and
+same-origin iframes.
+
+browser_screenshot called capturePage() on the conversation's view even when
+the pane was not showing it. A detached WebContentsView never resolves
+capturePage() on Electron 42 (the agent saw the 30 s action timeout) and a
+never-attached one returns an empty image. The new aeBrowserCapture.js stages
+a detached view at the bottom of the window's child views with one pixel
+inside the window, captures (retrying for up to 1 s while the image is
+empty), and restores it. Every capture is capped at 10 s with an error that
+says to open the chat's browser pane.
+---
+ web/electron/src/aeBrowserCapture.js          | 161 +++++++++++++++++
+ web/electron/src/browserIpc.js                |  17 +-
+ web/electron/src/main.js                      |   1 +
+ web/electron/test/aeBrowserCapture.test.js    | 163 ++++++++++++++++++
+ .../useBrowserAgentRelay.snapshot.test.ts     |  99 +++++++++++
+ web/src/hooks/useBrowserAgentRelay.ts         |  36 ++--
+ 6 files changed, 459 insertions(+), 18 deletions(-)
+ create mode 100644 web/electron/src/aeBrowserCapture.js
+ create mode 100644 web/electron/test/aeBrowserCapture.test.js
+ create mode 100644 web/src/hooks/useBrowserAgentRelay.snapshot.test.ts
+
+diff --git a/web/electron/src/aeBrowserCapture.js b/web/electron/src/aeBrowserCapture.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..67ff96d745af23abb22dc3f9685307f4ad9ba669
+--- /dev/null
++++ b/web/electron/src/aeBrowserCapture.js
+@@ -0,0 +1,161 @@
++// Screenshot capture for the embedded browser pane (AE patch, 2026-10-27).
++//
++// Why: browserViewRegistry keeps only the ACTIVE conversation's WebContentsView
++// attached to the window. On Electron 42, `capturePage()` on a view that was
++// attached and then detached NEVER resolves (the agent saw a 30 s "browser
++// action timed out"), and on a view that was never attached it resolves with an
++// empty 0x0 image. So the agent's `browser_screenshot` failed whenever the
++// user was looking at another chat.
++//
++// Fix: stage a detached view at the bottom of the window's child views with
++// only its top-left pixel inside the window (invisible to the user, but the
++// compositor still paints it), capture, then put it back exactly as it was.
++// A never-painted view is empty for the first ~50 ms, so we retry briefly.
++
++"use strict";
++
++/** @param {number} ms */
++const defaultWait = (ms) =>
++  new Promise((resolve) => {
++    setTimeout(resolve, ms);
++  });
++
++const EMPTY_ERROR = "the browser view has not painted yet; retry in a moment";
++
++/** @param {{ isEmpty?: () => boolean, getSize?: () => {width:number,height:number} } | null} image */
++function isEmptyImage(image) {
++  if (!image) return true;
++  try {
++    if (typeof image.isEmpty === "function" && image.isEmpty()) return true;
++    if (typeof image.getSize === "function") {
++      const s = image.getSize();
++      if (!s || !s.width || !s.height) return true;
++    }
++  } catch {
++    return true;
++  }
++  return false;
++}
++
++/** Race one capturePage() call against a timeout. Throws a tagged error on timeout. */
++function capturePageWithTimeout(view, timeoutMs) {
++  let timer = null;
++  const timeout = new Promise((_, reject) => {
++    timer = setTimeout(() => {
++      const err = new Error(
++        `screenshot timed out after ${Math.round(timeoutMs / 1000)} s: the browser view did not paint. ` +
++          "Open this chat's browser pane in the Omnigent desktop app and retry.",
++      );
++      err.aeTimeout = true;
++      reject(err);
++    }, timeoutMs);
++  });
++  return Promise.race([view.webContents.capturePage(), timeout]).finally(() => clearTimeout(timer));
++}
++
++function isAttached(win, view) {
++  if (!win) return true; // cannot tell; keep the old behavior (plus the timeout)
++  try {
++    return win.contentView.children.includes(view);
++  } catch {
++    return true;
++  }
++}
++
++function contentSize(win) {
++  if (typeof win.getContentBounds === "function") {
++    const b = win.getContentBounds();
++    if (b && b.width && b.height) return { width: b.width, height: b.height };
++  }
++  if (typeof win.getContentSize === "function") {
++    const [width, height] = win.getContentSize();
++    return { width, height };
++  }
++  return { width: 0, height: 0 };
++}
++
++async function captureOnce({ registry, conversationId, entry, win, timeoutMs, retryMs, maxWaitMs, wait }) {
++  const view = entry.view;
++  const toResult = (image) => ({
++    ok: true,
++    dataUrl: `data:image/png;base64,${image.toPNG().toString("base64")}`,
++  });
++
++  if (isAttached(win, view)) {
++    const image = await capturePageWithTimeout(view, timeoutMs);
++    return isEmptyImage(image) ? { ok: false, error: EMPTY_ERROR } : toResult(image);
++  }
++
++  const savedBounds = view.getBounds();
++  const savedVisible = typeof view.getVisible === "function" ? view.getVisible() : true;
++  const winSize = contentSize(win);
++  const width = savedBounds && savedBounds.width ? savedBounds.width : winSize.width;
++  const height = savedBounds && savedBounds.height ? savedBounds.height : winSize.height;
++  try {
++    view.setBounds({ x: winSize.width - 1, y: winSize.height - 1, width, height });
++    if (!savedVisible) view.setVisible(true);
++    win.contentView.addChildView(view, 0);
++
++    let image = await capturePageWithTimeout(view, timeoutMs);
++    let waited = 0;
++    while (isEmptyImage(image) && waited < maxWaitMs) {
++      // Sequential on purpose: each retry follows the previous paint attempt.
++      // oxlint-disable-next-line no-await-in-loop
++      await wait(retryMs);
++      waited += retryMs;
++      // oxlint-disable-next-line no-await-in-loop
++      image = await capturePageWithTimeout(view, timeoutMs);
++    }
++    return isEmptyImage(image) ? { ok: false, error: EMPTY_ERROR } : toResult(image);
++  } finally {
++    if (registry.activeConversationId() !== conversationId) {
++      try {
++        win.contentView.removeChildView(view);
++      } catch {
++        /* window or view already gone */
++      }
++      try {
++        view.setBounds(savedBounds);
++        if (!savedVisible) view.setVisible(false);
++      } catch {
++        /* view destroyed */
++      }
++    } else {
++      // The user switched to this chat mid-capture; setActive re-attached it.
++      try {
++        entry.boundsController.resync();
++      } catch {
++        /* view destroyed */
++      }
++    }
++  }
++}
++
++/**
++ * Capture a conversation's browser view as a PNG data URL, even when the view
++ * is detached because another chat is active. Never throws.
++ *
++ * @returns {Promise<{ ok: true, dataUrl: string } | { ok: false, error: string }>}
++ */
++function captureBrowserView({
++  registry,
++  conversationId,
++  entry,
++  win,
++  timeoutMs = 10000,
++  retryMs = 50,
++  maxWaitMs = 1000,
++  wait = defaultWait,
++}) {
++  const run = () =>
++    captureOnce({ registry, conversationId, entry, win, timeoutMs, retryMs, maxWaitMs, wait }).catch(
++      (e) => ({ ok: false, error: e && e.message ? e.message : String(e) }),
++    );
++  // One capture at a time per view so two screenshots cannot stage it twice.
++  const prev = entry.aeCaptureChain || Promise.resolve();
++  const next = prev.then(run, run);
++  entry.aeCaptureChain = next;
++  return next;
++}
++
++module.exports = { captureBrowserView };
+diff --git a/web/electron/src/browserIpc.js b/web/electron/src/browserIpc.js
+index 38a186a0947b1915e50d22b2a1405a0e640d3118..e001a622a43bd4aa0b4230f8973760a42829b3f1 100644
+--- a/web/electron/src/browserIpc.js
++++ b/web/electron/src/browserIpc.js
+@@ -9,6 +9,7 @@
+ 
+ const crypto = require("node:crypto");
+ const { buildDesignModeScript } = require("./designModeScript");
++const { captureBrowserView } = require("./aeBrowserCapture");
+ 
+ // Max age of a real native input event for a design-mode submit marker to be
+ // honored (see the gesture gate below). Covers click/Enter → console.log.
+@@ -255,6 +256,8 @@ function makeDesignModeInputHandler(gestureState) {
+  * @param {(event: Electron.IpcMainInvokeEvent) =>
+  *          (import('./browserViewRegistry').Registry | null)} deps.getRegistryForEvent
+  *        Resolves the sender window's own browser-view registry.
++ * @param {(event: Electron.IpcMainInvokeEvent) => (Electron.BrowserWindow | null)} [deps.getHostWindowForEvent]
++ *        Resolves the sender's host window; screenshots stage a detached view in it.
+  */
+ function registerBrowserIpc({
+   ipcMain,
+@@ -263,6 +266,7 @@ function registerBrowserIpc({
+   getAgentContextForEvent = () => null,
+   recoverAgentNavigationForEvent = async () => false,
+   getAgentNavigationHintForEvent = () => null,
++  getHostWindowForEvent = () => null,
+ }) {
+   /**
+    * Resolve the sender's registry after the privileged-origin gate. Returns
+@@ -410,13 +414,12 @@ function registerBrowserIpc({
+     const { conversationId } = args ?? {};
+     const entry = g.registry.get(conversationId);
+     if (!entry) return { ok: false, error: "No browser view" };
+-    try {
+-      const image = await entry.view.webContents.capturePage();
+-      const dataUrl = `data:image/png;base64,${image.toPNG().toString("base64")}`;
+-      return { ok: true, dataUrl };
+-    } catch (e) {
+-      return { ok: false, error: e && e.message ? e.message : String(e) };
+-    }
++    return captureBrowserView({
++      registry: g.registry,
++      conversationId,
++      entry,
++      win: getHostWindowForEvent(event),
++    });
+   });
+ 
+   // Run relay-template JS in the conversation's view. PRIVATE to the relay's
+diff --git a/web/electron/src/main.js b/web/electron/src/main.js
+index 8449f65ea2c5955f9e3ba620d5a3ccffde2e3a2d..716553e8419aa2653c089eedc077a2a14b85de54 100644
+--- a/web/electron/src/main.js
++++ b/web/electron/src/main.js
+@@ -4827,6 +4827,7 @@ function registerIpc() {
+     ipcMain,
+     isPinnedOriginSender,
+     getRegistryForEvent: browserRegistryForSender,
++    getHostWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
+     getAgentContextForEvent: (event, sourceHostId) => ({
+       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
+       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
+diff --git a/web/electron/test/aeBrowserCapture.test.js b/web/electron/test/aeBrowserCapture.test.js
+new file mode 100644
+index 0000000000000000000000000000000000000000..a3b4a60c186df580d33b803ad098fc950d0b2810
+--- /dev/null
++++ b/web/electron/test/aeBrowserCapture.test.js
+@@ -0,0 +1,163 @@
++// Tests for src/aeBrowserCapture.js, run with `node --test`. Fake view, window
++// and image objects; no Electron.
++
++const { describe, it } = require("node:test");
++const assert = require("node:assert/strict");
++
++const { captureBrowserView } = require("../src/aeBrowserCapture");
++
++const png = (empty) => ({
++  isEmpty: () => empty,
++  getSize: () => (empty ? { width: 0, height: 0 } : { width: 10, height: 10 }),
++  toPNG: () => Buffer.from("PNG"),
++});
++const DATA_URL = `data:image/png;base64,${Buffer.from("PNG").toString("base64")}`;
++
++/** captures: array of "empty" | "full" | "hang" | Error, consumed in order (last repeats). */
++function setup({ attached = false, captures = ["full"], active = null, visible = true } = {}) {
++  const log = [];
++  let bounds = { x: 5, y: 6, width: 300, height: 200 };
++  let vis = visible;
++  let n = 0;
++  const view = {
++    getBounds: () => ({ ...bounds }),
++    setBounds: (b) => {
++      bounds = { ...b };
++      log.push(["setBounds", { ...b }]);
++    },
++    getVisible: () => vis,
++    setVisible: (v) => {
++      vis = v;
++      log.push(["setVisible", v]);
++    },
++    webContents: {
++      capturePage: () => {
++        log.push(["capture", { ...bounds }]);
++        const step = captures[Math.min(n++, captures.length - 1)];
++        if (step === "hang") return new Promise(() => {});
++        if (step instanceof Error) return Promise.reject(step);
++        return Promise.resolve(png(step === "empty"));
++      },
++    },
++  };
++  const children = attached ? [view] : [];
++  const win = {
++    contentView: {
++      children,
++      addChildView: (v, i) => {
++        children.splice(i ?? children.length, 0, v);
++        log.push(["add", i]);
++      },
++      removeChildView: (v) => {
++        children.splice(children.indexOf(v), 1);
++        log.push(["remove"]);
++      },
++    },
++    getContentBounds: () => ({ x: 0, y: 0, width: 1000, height: 700 }),
++  };
++  const entry = {
++    view,
++    boundsController: { resync: () => log.push(["resync"]) },
++  };
++  const registry = { activeConversationId: () => active };
++  const state = () => ({ bounds, vis, children });
++  return { log, view, win, entry, registry, state };
++}
++
++const run = (s, extra = {}) =>
++  captureBrowserView({
++    registry: s.registry,
++    conversationId: "c1",
++    entry: s.entry,
++    win: s.win,
++    wait: async () => {},
++    ...extra,
++  });
++
++describe("captureBrowserView", () => {
++  it("captures an attached view without touching children", async () => {
++    const s = setup({ attached: true, active: "c1" });
++    const r = await run(s);
++    assert.deepEqual(r, { ok: true, dataUrl: DATA_URL });
++    assert.deepEqual(
++      s.log.map((l) => l[0]),
++      ["capture"],
++    );
++  });
++
++  it("stages a detached view at index 0 offscreen and restores it", async () => {
++    const s = setup({ active: "other", visible: false });
++    const r = await run(s);
++    assert.equal(r.ok, true);
++    const add = s.log.findIndex((l) => l[0] === "add");
++    assert.equal(s.log[add][1], 0);
++    const cap = s.log.find((l) => l[0] === "capture");
++    assert.deepEqual(cap[1], { x: 999, y: 699, width: 300, height: 200 });
++    assert.equal(s.state().children.length, 0);
++    assert.deepEqual(s.state().bounds, { x: 5, y: 6, width: 300, height: 200 });
++    assert.equal(s.state().vis, false);
++  });
++
++  it("uses the window size when saved bounds are empty", async () => {
++    const s = setup({ active: "other" });
++    s.view.setBounds({ x: 0, y: 0, width: 0, height: 0 });
++    await run(s);
++    const cap = s.log.find((l) => l[0] === "capture");
++    assert.deepEqual(cap[1], { x: 999, y: 699, width: 1000, height: 700 });
++  });
++
++  it("retries a never-painted view until it paints", async () => {
++    const s = setup({ active: "other", captures: ["empty", "empty", "full"] });
++    const r = await run(s);
++    assert.equal(r.ok, true);
++    assert.equal(s.log.filter((l) => l[0] === "capture").length, 3);
++  });
++
++  it("errors and cleans up when still empty after maxWaitMs", async () => {
++    const s = setup({ active: "other", captures: ["empty"] });
++    const r = await run(s, { retryMs: 50, maxWaitMs: 100 });
++    assert.equal(r.ok, false);
++    assert.match(r.error, /not painted yet/);
++    assert.equal(s.state().children.length, 0);
++    assert.deepEqual(s.state().bounds, { x: 5, y: 6, width: 300, height: 200 });
++  });
++
++  it("leaves the view attached and resyncs when the chat became active", async () => {
++    const s = setup({ active: "c1" });
++    const r = await run(s);
++    assert.equal(r.ok, true);
++    assert.equal(s.state().children.length, 1);
++    assert.ok(s.log.some((l) => l[0] === "resync"));
++    assert.ok(!s.log.some((l) => l[0] === "remove"));
++  });
++
++  it("times out on a hang and cleans up", async () => {
++    const s = setup({ active: "other", captures: ["hang"] });
++    const r = await run(s, { timeoutMs: 20 });
++    assert.equal(r.ok, false);
++    assert.match(r.error, /screenshot timed out after 0 s/);
++    assert.equal(s.state().children.length, 0);
++    assert.deepEqual(s.state().bounds, { x: 5, y: 6, width: 300, height: 200 });
++  });
++
++  it("reports a 10 s timeout message by default seconds", async () => {
++    const s = setup({ attached: true, active: "c1", captures: ["hang"] });
++    const r = await run(s, { timeoutMs: 1000 });
++    assert.match(r.error, /timed out after 1 s: the browser view did not paint/);
++  });
++
++  it("returns the rejection message and cleans up", async () => {
++    const s = setup({ active: "other", captures: [new Error("UnknownVizError")] });
++    const r = await run(s);
++    assert.deepEqual(r, { ok: false, error: "UnknownVizError" });
++    assert.equal(s.state().children.length, 0);
++  });
++
++  it("serializes concurrent captures of one view", async () => {
++    const s = setup({ active: "other" });
++    const [a, b] = await Promise.all([run(s), run(s)]);
++    assert.equal(a.ok && b.ok, true);
++    const seq = s.log.map((l) => l[0]).filter((k) => k === "add" || k === "remove");
++    assert.deepEqual(seq, ["add", "remove", "add", "remove"]);
++  });
++});
+diff --git a/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts b/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ff19278d8dea4648fdd2147191443220b06cf01c
+--- /dev/null
++++ b/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts
+@@ -0,0 +1,99 @@
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++
++import { SNAPSHOT_JS } from "./useBrowserAgentRelay";
++
++// jsdom has no layout, so size comes from a `data-size="WxH"` attribute
++// (default 100x20) on the element.
++const realRect = Element.prototype.getBoundingClientRect;
++
++beforeEach(() => {
++  Element.prototype.getBoundingClientRect = function (this: Element) {
++    const [w, h] = (this.getAttribute("data-size") ?? "100x20").split("x").map(Number);
++    return { x: 0, y: 0, top: 0, left: 0, right: w, bottom: h, width: w, height: h, toJSON() {} };
++  };
++});
++
++afterEach(() => {
++  Element.prototype.getBoundingClientRect = realRect;
++  document.body.innerHTML = "";
++});
++
++function snapshot(): { tree: string } {
++  return JSON.parse((0, eval)(SNAPSHOT_JS));
++}
++
++const DIALOG = `
++  <div role="dialog" style="position:fixed">
++    <h2>Add link</h2>
++    <input type="radio" aria-label="YouTube">
++    <input placeholder="Title">
++  </div>`;
++
++describe("SNAPSHOT_JS visibility walk", () => {
++  it("lists a dialog rendered inside a zero-size portal root", () => {
++    document.body.innerHTML = `<h1>hello</h1><div data-size="0x0" style="position:absolute">${DIALOG}</div>`;
++    const { tree } = snapshot();
++    expect(tree).toContain('heading "hello"');
++    expect(tree).toContain('dialog');
++    expect(tree).toContain('heading "Add link"');
++    expect(tree).toContain('radio "YouTube"');
++    expect(tree).toContain('textbox "Title"');
++  });
++
++  it("lists children of a display:contents wrapper", () => {
++    document.body.innerHTML = `<div data-size="0x0" style="display:contents"><button>Go</button></div>`;
++    expect(snapshot().tree).toContain('button "Go"');
++  });
++
++  it("skips children of a zero-height overflow:hidden container", () => {
++    document.body.innerHTML = `<div data-size="100x0" style="overflow-x:hidden;overflow-y:hidden"><button>Hidden</button></div><button>Shown</button>`;
++    const { tree } = snapshot();
++    expect(tree).not.toContain("Hidden");
++    expect(tree).toContain("Shown");
++  });
++
++  it("skips display:none and opacity:0 subtrees", () => {
++    document.body.innerHTML = `
++      <div style="display:none"><button>NoneBtn</button></div>
++      <div style="opacity:0"><button>FadedBtn</button></div>
++      <button>Visible</button>`;
++    const { tree } = snapshot();
++    expect(tree).not.toContain("NoneBtn");
++    expect(tree).not.toContain("FadedBtn");
++    expect(tree).toContain("Visible");
++  });
++
++  it("does not list a visibility:hidden element itself", () => {
++    document.body.innerHTML = `<button style="visibility:hidden">Ghost</button><button>Real</button>`;
++    const { tree } = snapshot();
++    expect(tree).not.toContain("Ghost");
++    expect(tree).toContain("Real");
++  });
++
++  it("walks open shadow roots", () => {
++    document.body.innerHTML = `<div id="host"></div>`;
++    const root = document.getElementById("host")!.attachShadow({ mode: "open" });
++    root.innerHTML = `<button>InShadow</button>`;
++    expect(snapshot().tree).toContain('button "InShadow"');
++  });
++
++  it("walks a same-origin iframe body", () => {
++    document.body.innerHTML = `<iframe></iframe>`;
++    const frame = document.querySelector("iframe")!;
++    // The frame is another realm: give its Element.prototype the same size stub.
++    (frame.contentWindow as unknown as Window & typeof globalThis).Element.prototype.getBoundingClientRect =
++      Element.prototype.getBoundingClientRect;
++    const doc = frame.contentDocument!;
++    doc.body.innerHTML = `<button>InFrame</button>`;
++    expect(snapshot().tree).toContain('button "InFrame"');
++  });
++
++  it("keeps refs for portal content in window.__omni_refs__", () => {
++    document.body.innerHTML = `<div data-size="0x0">${DIALOG}</div>`;
++    const { tree } = snapshot();
++    const ref = Number(/radio "YouTube" \[ref=(\d+)\]/.exec(tree)![1]);
++    const refs = (window as unknown as { __omni_refs__: Map<number, WeakRef<Element>> })
++      .__omni_refs__;
++    expect(refs.get(ref)!.deref()).toBe(document.querySelector('input[type="radio"]'));
++  });
++});
+diff --git a/web/src/hooks/useBrowserAgentRelay.ts b/web/src/hooks/useBrowserAgentRelay.ts
+index a8125e07507be64ab5c2b75c20af9c10a4452ca9..68ebf81ee0fbbc554c48b39b62053ef961963862 100644
+--- a/web/src/hooks/useBrowserAgentRelay.ts
++++ b/web/src/hooks/useBrowserAgentRelay.ts
+@@ -94,7 +94,7 @@ function jsNumber(n: number): string {
+  *  Snapshot REPLACES the ref map — two agents on one page collide (known limit,
+  *  but the snapshot_id check turns a mis-click into a clean error).
+  *  Returns JSON: `{ snapshot_id, url, title, tree }`. */
+-const SNAPSHOT_JS = `(() => {
++export const SNAPSHOT_JS = `(() => {
+   const snapshotId = (crypto && crypto.randomUUID) ? crypto.randomUUID() : ('snap-' + Date.now() + '-' + Math.random().toString(36).slice(2, 10));
+   window.__omni_refs__ = new Map();
+   window.__omni_snapshot_id__ = snapshotId;
+@@ -162,20 +162,24 @@ const SNAPSHOT_JS = `(() => {
+     return text.trim().replace(/\\s+/g, ' ').slice(0, 80);
+   }
+ 
+-  function isVisible(el) {
+-    if (!el.getBoundingClientRect) return false;
+-    const style = window.getComputedStyle(el);
+-    if (style.display === 'none' || style.visibility === 'hidden') return false;
+-    if (style.opacity === '0') return false;
+-    const rect = el.getBoundingClientRect();
+-    return rect.width > 0 && rect.height > 0;
++  // A zero-size or display:contents box (e.g. a modal portal root) does not hide
++  // its position:fixed children; only display:none, opacity:0 or a clipped
++  // zero-area box does. The element itself is emitted only when it is visible.
++  function hidesSubtree(style, rect) {
++    if (style.display === 'none' || style.opacity === '0') return true;
++    if (style.display === 'contents') return false;
++    return (rect.width === 0 && style.overflowX !== 'visible') ||
++      (rect.height === 0 && style.overflowY !== 'visible');
+   }
+ 
+   function walk(el, depth) {
+-    if (!(el instanceof Element)) return;
+-    if (!isVisible(el)) return;
++    if (!el || el.nodeType !== 1 || !el.getBoundingClientRect) return;
++    const style = (el.ownerDocument && el.ownerDocument.defaultView || window).getComputedStyle(el);
++    const rect = el.getBoundingClientRect();
++    if (hidesSubtree(style, rect)) return;
++    const visible = style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+     const role = getRole(el);
+-    const picked = role !== null && role !== 'generic';
++    const picked = visible && role !== null && role !== 'generic';
+     let childDepth = depth;
+     if (picked) {
+       const ref = ++nextRef;
+@@ -191,6 +195,16 @@ const SNAPSHOT_JS = `(() => {
+     for (const child of el.children) {
+       walk(child, childDepth);
+     }
++    if (el.shadowRoot) {
++      for (const child of el.shadowRoot.children) walk(child, childDepth);
++    }
++    const tag = el.tagName && el.tagName.toLowerCase();
++    if (tag === 'iframe' || tag === 'frame') {
++      try {
++        const body = el.contentDocument && el.contentDocument.body;
++        if (body) walk(body, childDepth);
++      } catch (e) { /* cross-origin frame */ }
++    }
+   }
+ 
+   if (document.body) walk(document.body, 0);

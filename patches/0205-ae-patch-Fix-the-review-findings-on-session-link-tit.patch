@@ -1,0 +1,258 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 21:35:16 -0700
+Subject: [PATCH 205/220] [ae-patch] Fix the review findings on session link
+ titles and paste repair
+
+Key the title by session id, show it only when the text is the href's own session, cache with a TTL and a short failure memory, keep attachments ahead of the paste repair, survive a throwing execCommand, and leave one-space custom URLs alone.
+---
+ .../blocks/AeSessionLink.title.test.tsx       | 26 ++++++++++++
+ web/src/components/blocks/AeSessionLink.tsx   |  3 +-
+ web/src/hooks/useComposerAttachments.test.tsx | 17 ++++++++
+ web/src/hooks/useComposerAttachments.ts       | 29 +++++++++-----
+ web/src/lib/aePasteRepair.test.ts             |  1 +
+ web/src/lib/aePasteRepair.ts                  |  4 ++
+ web/src/lib/aeSessionTitles.ts                | 40 ++++++++++++++-----
+ 7 files changed, 99 insertions(+), 21 deletions(-)
+
+diff --git a/web/src/components/blocks/AeSessionLink.title.test.tsx b/web/src/components/blocks/AeSessionLink.title.test.tsx
+index 88afd910ae43c7736dbce9da750ddb00c92c2073..f3f445224cb75211832e09dcc1c484f427d35cbb 100644
+--- a/web/src/components/blocks/AeSessionLink.title.test.tsx
++++ b/web/src/components/blocks/AeSessionLink.title.test.tsx
+@@ -81,3 +81,29 @@ it("looks a session up once for repeated links", async () => {
+   await screen.findAllByText("Once");
+   expect(getSessionSlim).toHaveBeenCalledTimes(1);
+ });
++
++it("keeps explicit text that names a different session than the href", () => {
++  const other = "https://omnigent.go-ae.org/c/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
++  link(other);
++  expect(screen.getByRole("link").textContent).toBe(other);
++  expect(getSessionSlim).not.toHaveBeenCalled();
++});
++
++it("never shows the first session's title after the link is reused for another", async () => {
++  getSessionSlim.mockImplementation((id: string) =>
++    id === ID ? Promise.resolve({ title: "First" }) : Promise.reject(new Error("403")),
++  );
++  const second = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
++  const node = (id: string) => (
++    <MemoryRouter>
++      <SessionRouteLink route={`/c/${id}`} href={`https://x.ts.net:8010/c/${id}`}>
++        {`https://x.ts.net:8010/c/${id}`}
++      </SessionRouteLink>
++    </MemoryRouter>
++  );
++  const view = render(node(ID));
++  await screen.findByText("First");
++  view.rerender(node(second));
++  await vi.waitFor(() => expect(getSessionSlim).toHaveBeenCalledWith(second));
++  expect(screen.getByRole("link").textContent).toBe("session bbbbbbbb");
++});
+diff --git a/web/src/components/blocks/AeSessionLink.tsx b/web/src/components/blocks/AeSessionLink.tsx
+index 21a1e794a0765b2ca644530812f7230ee62a2dc3..86e68075a1689a261044825aebe630ff113382ef 100644
+--- a/web/src/components/blocks/AeSessionLink.tsx
++++ b/web/src/components/blocks/AeSessionLink.tsx
+@@ -35,7 +35,8 @@ export function SessionRouteLink({
+ }: AnchorProps & { route: string }) {
+   const navigate = useNavigate();
+   const location = useLocation();
+-  const bare = typeof children === "string" && sessionLinkRoute(children.trim()) !== null;
++  // Bare only when the text is the very session the href points at.
++  const bare = typeof children === "string" && sessionLinkRoute(children.trim()) === route;
+   const title = useSessionLinkTitle(route, bare);
+   return (
+     <a
+diff --git a/web/src/hooks/useComposerAttachments.test.tsx b/web/src/hooks/useComposerAttachments.test.tsx
+index cfdcd400e838e02b82e2ef52d5abc78c62f9230e..2b45724a7154761e2b79881443810dbc7b59ae9c 100644
+--- a/web/src/hooks/useComposerAttachments.test.tsx
++++ b/web/src/hooks/useComposerAttachments.test.tsx
+@@ -169,6 +169,23 @@ describe("useComposerAttachments", () => {
+     expect(result.current.files).toEqual([]);
+   });
+ 
++  it("onPaste falls back to a range insert when execCommand throws", () => {
++    Object.defineProperty(document, "execCommand", {
++      configurable: true,
++      value: () => {
++        throw new Error("nope");
++      },
++    });
++    const { result } = renderHook(() => useComposerAttachments());
++    const { event } = pasteEvent({ text: "thread:%20ok%0Aa:%20b" });
++    const field = document.createElement("textarea");
++    (event as unknown as { currentTarget: HTMLTextAreaElement }).currentTarget = field;
++
++    act(() => result.current.onPaste(event));
++
++    expect(field.value).toBe("thread: ok\na: b");
++  });
++
+   it("onPaste ignores non-file kinds and null file payloads", () => {
+     const { result } = renderHook(() => useComposerAttachments());
+     const { event, preventDefault } = pasteEvent({ text: "hi", nullFile: true });
+diff --git a/web/src/hooks/useComposerAttachments.ts b/web/src/hooks/useComposerAttachments.ts
+index 923d4ac7c8e9fced4512f922824804160bfae235..19992fc9a0075907b939ab767f0da59365d6f341 100644
+--- a/web/src/hooks/useComposerAttachments.ts
++++ b/web/src/hooks/useComposerAttachments.ts
+@@ -93,17 +93,6 @@ export function useComposerAttachments({
+ 
+   const onPaste = useCallback(
+     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+-      const repaired = repairEncodedNote(e.clipboardData?.getData("text/plain") ?? "");
+-      if (repaired !== null) {
+-        e.preventDefault();
+-        // insertText keeps the controlled textarea's state and undo stack in step.
+-        if (!document.execCommand("insertText", false, repaired)) {
+-          const field = e.currentTarget;
+-          field.setRangeText(repaired, field.selectionStart, field.selectionEnd, "end");
+-          field.dispatchEvent(new Event("input", { bubbles: true }));
+-        }
+-        return;
+-      }
+       const items = e.clipboardData?.items;
+       if (!items) return;
+       const pasted: File[] = [];
+@@ -115,6 +104,24 @@ export function useComposerAttachments({
+       if (pasted.length > 0) {
+         e.preventDefault();
+         addFiles(pasted);
++        return;
++      }
++      const repaired = repairEncodedNote(e.clipboardData?.getData("text/plain") ?? "");
++      if (repaired !== null) {
++        e.preventDefault();
++        // insertText keeps the controlled textarea's state and undo stack in step.
++        let inserted = false;
++        try {
++          inserted = document.execCommand("insertText", false, repaired);
++        } catch {
++          // Deprecated API; the range fallback below covers an engine that throws.
++        }
++        if (!inserted) {
++          const field = e.currentTarget;
++          field.setRangeText(repaired, field.selectionStart, field.selectionEnd, "end");
++          field.dispatchEvent(new Event("input", { bubbles: true }));
++        }
++        return;
+       }
+     },
+     [addFiles],
+diff --git a/web/src/lib/aePasteRepair.test.ts b/web/src/lib/aePasteRepair.test.ts
+index be9d719d3a9bb3d7a128863e976f16d2e8c202aa..cc74f94897f015fe45060d45ce68be5310dcfea9 100644
+--- a/web/src/lib/aePasteRepair.test.ts
++++ b/web/src/lib/aePasteRepair.test.ts
+@@ -22,6 +22,7 @@ describe("repairEncodedNote", () => {
+     expect(repairEncodedNote("thread: already plain")).toBeNull();
+     expect(repairEncodedNote("hello%20world")).toBeNull();
+     expect(repairEncodedNote("")).toBeNull();
++    expect(repairEncodedNote("obsidian:%20Note")).toBeNull();
+   });
+ 
+   it("returns null for a malformed escape", () => {
+diff --git a/web/src/lib/aePasteRepair.ts b/web/src/lib/aePasteRepair.ts
+index 7a3ee07f0717917c796edac3e38ec44d3f91783c..4603f2191020769add923d1a687d09edb9f3d85e 100644
+--- a/web/src/lib/aePasteRepair.ts
++++ b/web/src/lib/aePasteRepair.ts
+@@ -6,11 +6,15 @@
+ // undo. The scheme's case is lost for good; everything else is restored.
+ 
+ const ENCODED_NOTE = /^[a-z][a-z0-9+.-]*:(?:%20|%0A)\S*$/;
++// A note has many words; a custom URL with one escaped space (obsidian:%20Note)
++// is left alone.
++const ESCAPED_BREAK = /%20|%0A/g;
+ 
+ /** The decoded text for a note the clipboard encoded as a URL, else null. */
+ export function repairEncodedNote(pasted: string): string | null {
+   const text = pasted.trim();
+   if (!ENCODED_NOTE.test(text)) return null;
++  if ((text.match(ESCAPED_BREAK)?.length ?? 0) < 3) return null;
+   try {
+     return decodeURIComponent(text);
+   } catch {
+diff --git a/web/src/lib/aeSessionTitles.ts b/web/src/lib/aeSessionTitles.ts
+index cd7521937a507ceeb87a30e47fe51a3920d85628..efe33f83248f399335a347dcf9334fc3fdaa72c9 100644
+--- a/web/src/lib/aeSessionTitles.ts
++++ b/web/src/lib/aeSessionTitles.ts
+@@ -7,7 +7,14 @@ import { getSessionSlim } from "./sessionsApi";
+ 
+ const SESSION_ID = /\/c\/([0-9a-f]{32})/i;
+ 
+-const titles = new Map<string, string>();
++// A title is trusted for a few minutes (a rename shows up on the next mount after
++// that); a failed lookup is not retried for 30 seconds, so a reply full of links
++// to an unreadable session asks once.
++const TITLE_TTL_MS = 5 * 60_000;
++const FAILURE_TTL_MS = 30_000;
++
++const titles = new Map<string, { title: string; at: number }>();
++const failures = new Map<string, number>();
+ const pending = new Map<string, Promise<string>>();
+ 
+ /** `session <first 8 chars>`: the label while a lookup runs or after it fails. */
+@@ -20,18 +27,29 @@ function sessionIdOf(route: string): string | null {
+   return SESSION_ID.exec(route)?.[1]?.toLowerCase() ?? null;
+ }
+ 
++function cachedTitle(id: string): string | null {
++  const hit = titles.get(id);
++  return hit !== undefined && Date.now() - hit.at < TITLE_TTL_MS ? hit.title : null;
++}
++
+ async function loadTitle(id: string): Promise<string> {
+-  const cached = titles.get(id);
+-  if (cached !== undefined) return cached;
++  const cached = cachedTitle(id);
++  if (cached !== null) return cached;
++  const failedAt = failures.get(id);
++  if (failedAt !== undefined && Date.now() - failedAt < FAILURE_TTL_MS) return "";
+   let inflight = pending.get(id);
+   if (inflight === undefined) {
+     inflight = getSessionSlim(id)
+       .then((session) => {
+         const title = session.title?.trim() ?? "";
+-        if (title !== "") titles.set(id, title);
++        if (title === "") failures.set(id, Date.now());
++        else titles.set(id, { title, at: Date.now() });
+         return title;
+       })
+-      .catch(() => "")
++      .catch(() => {
++        failures.set(id, Date.now());
++        return "";
++      })
+       .finally(() => pending.delete(id));
+     pending.set(id, inflight);
+   }
+@@ -45,23 +63,27 @@ async function loadTitle(id: string): Promise<string> {
+  */
+ export function useSessionLinkTitle(route: string, enabled: boolean): string | null {
+   const id = sessionIdOf(route);
+-  const [title, setTitle] = useState<string | null>(() => (id ? (titles.get(id) ?? null) : null));
++  // Keyed by id, so a link that is reused for another session never shows the
++  // first session's title.
++  const [found, setFound] = useState<{ id: string; title: string } | null>(null);
+   useEffect(() => {
+     if (!enabled || id === null) return;
+     let live = true;
+-    void loadTitle(id).then((found) => {
+-      if (live && found !== "") setTitle(found);
++    void loadTitle(id).then((title) => {
++      if (live && title !== "") setFound({ id, title });
+     });
+     return () => {
+       live = false;
+     };
+   }, [enabled, id]);
+   if (!enabled || id === null) return null;
+-  return title ?? sessionLinkFallbackLabel(route);
++  const own = found !== null && found.id === id ? found.title : null;
++  return own ?? cachedTitle(id) ?? sessionLinkFallbackLabel(route);
+ }
+ 
+ /** Test hook: forget every cached title. */
+ export function resetSessionTitleCache(): void {
+   titles.clear();
++  failures.clear();
+   pending.clear();
+ }
