@@ -1,0 +1,399 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:54:57 -0700
+Subject: [PATCH 212/220] [ae-patch] Keep the composer's buttons inside it in
+ narrow split panes
+
+---
+ .../components/composer/ChatComposer.test.tsx |  57 +++++++++-
+ web/src/components/composer/ChatComposer.tsx  |  31 ++++--
+ .../components/composer/ComposerControls.tsx  |   1 +
+ web/src/lib/aeComposerTight.test.tsx          | 101 ++++++++++++++++++
+ web/src/lib/aeComposerTight.ts                |  27 +++++
+ web/src/pages/ChatPage.composer.test.tsx      |   3 +-
+ web/src/pages/ChatPage.tsx                    |  35 +++---
+ 7 files changed, 233 insertions(+), 22 deletions(-)
+ create mode 100644 web/src/lib/aeComposerTight.test.tsx
+ create mode 100644 web/src/lib/aeComposerTight.ts
+
+diff --git a/web/src/components/composer/ChatComposer.test.tsx b/web/src/components/composer/ChatComposer.test.tsx
+index b08f1c1e9d99c24e49dc1afca318c023c2118b77..a6bcd7b270ba5b897eeb1e705f2005e5f46d56d9 100644
+--- a/web/src/components/composer/ChatComposer.test.tsx
++++ b/web/src/components/composer/ChatComposer.test.tsx
+@@ -384,6 +384,7 @@ describe("ChatComposer label collapse", () => {
+   // Width of a group once its label is hidden and only the icon remains.
+   const ICON_WIDTH = 40;
+   const ROW_PADDING = 16;
++  const TIER_SAVING = 10;
+ 
+   afterEach(() => {
+     StubResizeObserver.callbacks = [];
+@@ -414,8 +415,13 @@ describe("ChatComposer label collapse", () => {
+     for (const group of [screen.getByTestId("leading"), screen.getByTestId("trailing")]) {
+       Object.defineProperty(group, "scrollWidth", {
+         configurable: true,
+-        get: () =>
+-          row.dataset.labels === "collapsed" ? ICON_WIDTH : (group.textContent?.length ?? 0) * 10,
++        get: () => {
++          if (row.dataset.labels !== "collapsed") return (group.textContent?.length ?? 0) * 10;
++          // Each tier saves width in the trailing group, as the real CSS does.
++          const saved = group === screen.getByTestId("trailing") ? TIER_SAVING : 0;
++          const tiers = ["snug", "tight", "tighter"].filter((tier) => tier in row.dataset).length;
++          return ICON_WIDTH - saved * tiers;
++        },
+       });
+     }
+     return { row, layout, rerender: (next: typeof actions) => view.rerender(composer(next)) };
+@@ -452,6 +458,53 @@ describe("ChatComposer label collapse", () => {
+     expect(row).not.toHaveAttribute("data-labels");
+   });
+ 
++  it("squeezes the row first, then marks it tight, then tighter, only while the icons overflow", () => {
++    const { row, layout } = renderMeasuredComposer({
++      leading: <span>Bypass permissions</span>,
++      trailing: <span>Fable 5.1 xHigh</span>,
++    });
++    const tiers = () => ["snug", "tight", "tighter"].map((tier) => tier in row.dataset);
++    // The fit test allows 1 px of rounding. jsdom's column gap is 0, so two icons need 2 x 40 = 80 (the 24 px label gap does not count).
++    layout.rowWidth = 2 * ICON_WIDTH + ROW_PADDING;
++    fireResize();
++    expect(row).toHaveAttribute("data-labels", "collapsed");
++    expect(tiers()).toEqual([false, false, false]);
++    layout.rowWidth = 2 * ICON_WIDTH + ROW_PADDING - 2;
++    fireResize();
++    expect(tiers()).toEqual([true, false, false]);
++    layout.rowWidth = 2 * ICON_WIDTH + ROW_PADDING - TIER_SAVING - 2;
++    fireResize();
++    expect(tiers()).toEqual([true, true, false]);
++    layout.rowWidth = 2 * ICON_WIDTH + ROW_PADDING - 2 * TIER_SAVING - 2;
++    fireResize();
++    expect(tiers()).toEqual([true, true, true]);
++    layout.rowWidth = 2 * ICON_WIDTH + ROW_PADDING;
++    fireResize();
++    expect(tiers()).toEqual([false, false, false]);
++  });
++
++  it("re-measures a tight row when the host badge goes offline, so it comes back", async () => {
++    const { row, layout } = renderMeasuredComposer({
++      leading: <span>Bypass permissions</span>,
++      trailing: <span data-testid="host" data-host-status="online" />,
++    });
++    const host = screen.getByTestId("host");
++    // The trailing group sheds 10 px when snug, and 30 more while tight hides an online badge.
++    Object.defineProperty(screen.getByTestId("trailing"), "scrollWidth", {
++      configurable: true,
++      get: () =>
++        ICON_WIDTH -
++        ("snug" in row.dataset ? TIER_SAVING : 0) -
++        ("tight" in row.dataset && host.dataset.hostStatus === "online" ? 30 : 0),
++    });
++    layout.rowWidth = 60 + ROW_PADDING;
++    fireResize();
++    expect(row).toHaveAttribute("data-tight");
++    expect(row).not.toHaveAttribute("data-tighter");
++    host.dataset.hostStatus = "offline";
++    await waitFor(() => expect(row).toHaveAttribute("data-tighter"));
++  });
++
+   it("re-measures when the controls inside the row change", async () => {
+     const { row, layout, rerender } = renderMeasuredComposer({
+       leading: <span>Manual</span>,
+diff --git a/web/src/components/composer/ChatComposer.tsx b/web/src/components/composer/ChatComposer.tsx
+index 6826946d86f1dc16837cf311a88a4428504e992d..07b817d6c8edd3a3a4e5467a37a670074f523f01 100644
+--- a/web/src/components/composer/ChatComposer.tsx
++++ b/web/src/components/composer/ChatComposer.tsx
+@@ -1,3 +1,4 @@
++import { COMPOSER_TIGHT_TIERS } from "@/lib/aeComposerTight";
+ import {
+   forwardRef,
+   useLayoutEffect,
+@@ -202,16 +203,34 @@ function useCollapsedComposerLabels(
+       // Not laid out yet (hidden, or jsdom): keep the current verdict.
+       if (!(available > 0)) return;
+       delete row.dataset.labels;
+-      const gap = Math.max(parseFloat(style.columnGap) || 0, COMPOSER_LABELS_MIN_GAP_PX);
+-      if (leading.scrollWidth + trailing.scrollWidth + gap > available)
+-        row.dataset.labels = "collapsed";
++      for (const tier of COMPOSER_TIGHT_TIERS) row.removeAttribute(`data-${tier}`);
++      const needed = () => leading.scrollWidth + trailing.scrollWidth;
++      if (needed() + Math.max(parseFloat(style.columnGap) || 0, COMPOSER_LABELS_MIN_GAP_PX) <= available)
++        return;
++      row.dataset.labels = "collapsed";
++      // Icons alone still overflow the row's real gap (a narrow pane or a small
++      // phone): squeeze the gaps first, then hide secondary controls, one tier at
++      // a time until the groups fit. `style` is live, so the gap is read afresh.
++      for (const tier of COMPOSER_TIGHT_TIERS) {
++        // 1 px of tolerance: the widths are rounded, and a fit that close is a fit.
++        if (needed() + (parseFloat(style.columnGap) || 0) <= available + 1) break;
++        row.setAttribute(`data-${tier}`, "");
++      }
+     };
+     measure();
+     if (typeof ResizeObserver === "undefined") return;
+     const resizeObserver = new ResizeObserver(measure);
+     resizeObserver.observe(width);
+     const mutationObserver = new MutationObserver(measure);
+-    mutationObserver.observe(row, { childList: true, characterData: true, subtree: true });
++    // A host going offline or a take starting changes which controls a tight row
++    // keeps; none of these attributes is one the measure writes, so it cannot loop.
++    mutationObserver.observe(row, {
++      childList: true,
++      characterData: true,
++      subtree: true,
++      attributes: true,
++      attributeFilter: ["data-host-status", "aria-pressed", "aria-busy"],
++    });
+     return () => {
+       resizeObserver.disconnect();
+       mutationObserver.disconnect();
+@@ -499,7 +518,7 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
+       <div
+         ref={ref}
+         className={cn(
+-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 pt-1 pb-2",
++          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 data-[snug]:gap-0 pt-1 pb-2",
+           COMPOSER_CONTENT_INSET_CLASS,
+           className,
+         )}
+@@ -517,7 +536,7 @@ export const ComposerActionGroup = forwardRef<
+     <div
+       ref={ref}
+       className={cn(
+-        "flex min-w-0 items-center gap-1",
++        "flex min-w-0 items-center gap-1 group-data-[snug]/composer-actions:gap-0.5",
+         side === "left" ? "flex-none overflow-visible" : "ml-auto max-w-full shrink-0",
+         className,
+       )}
+diff --git a/web/src/components/composer/ComposerControls.tsx b/web/src/components/composer/ComposerControls.tsx
+index 06aecb748c7168f08fc909a8fd3dc871ecaa89c3..fd0ae741f8e31d6db7663fe56db67532324c18b9 100644
+--- a/web/src/components/composer/ComposerControls.tsx
++++ b/web/src/components/composer/ComposerControls.tsx
+@@ -109,6 +109,7 @@ export const ComposerHostTrigger = forwardRef<
+       type="button"
+       aria-label={label}
+       title={label}
++      data-host-status={status}
+       className={cn(
+         "flex h-8 w-11 shrink-0 cursor-pointer items-center justify-center gap-0.5 rounded-lg bg-transparent pl-1 pr-2 text-muted-foreground transition-colors hover:bg-muted/70 hover:text-foreground data-[state=open]:bg-muted data-[state=open]:text-foreground dark:hover:bg-muted/50 disabled:cursor-default md:h-7",
+         className,
+diff --git a/web/src/lib/aeComposerTight.test.tsx b/web/src/lib/aeComposerTight.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..3088be1906da7f875520236ced7400983fd68c0f
+--- /dev/null
++++ b/web/src/lib/aeComposerTight.test.tsx
+@@ -0,0 +1,101 @@
++import { transform } from "lightningcss";
++import { compile } from "tailwindcss";
++import { cleanup, render, screen } from "@testing-library/react";
++import { afterEach, beforeAll, describe, expect, it } from "vitest";
++import { ComposerHostTrigger } from "@/components/composer/ComposerControls";
++import {
++  COMPOSER_TIGHT_HOST_WRAPPER_CLASS,
++  COMPOSER_TIGHT_MIC_CLASS,
++  COMPOSER_TIGHTER_WRAPPER_CLASS,
++} from "./aeComposerTight";
++
++// The three class strings are compiled by Tailwind itself and injected, so the
++// assertions read the real computed display of each control, not the class names.
++beforeAll(async () => {
++  const compiler = await compile("@tailwind utilities;");
++  const style = document.createElement("style");
++  // jsdom cannot read CSS nesting, so lower it to flat selectors first.
++  const nested = compiler.build([
++    ...COMPOSER_TIGHT_MIC_CLASS.split(" "),
++    ...COMPOSER_TIGHT_HOST_WRAPPER_CLASS.split(" "),
++    ...COMPOSER_TIGHTER_WRAPPER_CLASS.split(" "),
++  ]);
++  style.textContent = new TextDecoder().decode(
++    transform({
++      filename: "tight.css",
++      code: new TextEncoder().encode(nested),
++      targets: { chrome: 90 << 16 },
++    }).code,
++  );
++  document.head.appendChild(style);
++});
++afterEach(cleanup);
++
++function renderRow(opts: {
++  tight: boolean;
++  tighter?: boolean;
++  host: "online" | "offline";
++  listening?: boolean;
++  connecting?: boolean;
++}) {
++  const attrs: Record<string, string> = {};
++  if (opts.tight) attrs["data-tight"] = "";
++  if (opts.tighter) attrs["data-tighter"] = "";
++  render(
++    <div className="group/composer-actions" {...attrs}>
++      <span className={COMPOSER_TIGHTER_WRAPPER_CLASS}>
++        <button type="button" aria-label="Roles preset" />
++      </span>
++      <span className={COMPOSER_TIGHT_HOST_WRAPPER_CLASS}>
++        <ComposerHostTrigger label="Host" status={opts.host} />
++      </span>
++      <button
++        type="button"
++        aria-label="Voice dictation"
++        aria-pressed={opts.listening ?? false}
++        aria-busy={opts.connecting ?? false}
++        className={COMPOSER_TIGHT_MIC_CLASS}
++      />
++    </div>,
++  );
++  const shown = (name: string) => getComputedStyle(screen.getByLabelText(name)).display !== "none";
++  const hostShown = () => {
++    const wrapper = screen.getByLabelText("Host").parentElement as HTMLElement;
++    return getComputedStyle(wrapper).display !== "none";
++  };
++  return { mic: () => shown("Voice dictation"), host: hostShown };
++}
++
++describe("tight composer action row", () => {
++  it("hides the mic and an online host badge when tight, healthy and idle", () => {
++    const row = renderRow({ tight: true, host: "online" });
++    expect(row.mic()).toBe(false);
++    expect(row.host()).toBe(false);
++  });
++
++  it("keeps the host badge while the host is not online", () => {
++    const row = renderRow({ tight: true, host: "offline" });
++    expect(row.host()).toBe(true);
++    expect(row.mic()).toBe(false);
++  });
++
++  it("keeps the mic while a take is recording or starting", () => {
++    expect(renderRow({ tight: true, host: "online", listening: true }).mic()).toBe(true);
++    cleanup();
++    expect(renderRow({ tight: true, host: "online", connecting: true }).mic()).toBe(true);
++  });
++
++  it("shows everything when the row is not tight", () => {
++    const row = renderRow({ tight: false, host: "online" });
++    expect(row.mic()).toBe(true);
++    expect(row.host()).toBe(true);
++  });
++
++  it("hides the roles preset control only in the tighter tier", () => {
++    renderRow({ tight: true, host: "online" });
++    expect(getComputedStyle(screen.getByLabelText("Roles preset").parentElement as HTMLElement).display).not.toBe("none");
++    cleanup();
++    renderRow({ tight: true, tighter: true, host: "online" });
++    expect(getComputedStyle(screen.getByLabelText("Roles preset").parentElement as HTMLElement).display).toBe("none");
++  });
++});
+diff --git a/web/src/lib/aeComposerTight.ts b/web/src/lib/aeComposerTight.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..409d064bf65f3886f20a920ce4abb6e983f07247
+--- /dev/null
++++ b/web/src/lib/aeComposerTight.ts
+@@ -0,0 +1,27 @@
++// Narrow split panes (omnigent-ae patch P212, 2026-10-27): a split pane is an
++// iframe about 340 to 360 px wide, so the composer's action row cannot hold
++// every control even with its text labels collapsed, and the Send or Interrupt
++// button poked past the composer's border. When the icons alone still overflow
++// the row's real gap, `useCollapsedComposerLabels` sets `data-tight` on the row
++// and these classes hide the two secondary controls; if that is not enough
++// (a control that must stay visible is still there) it sets `data-tighter` and
++// the roles preset control goes too, so the primary button always stays inside.
++//
++// Nothing the user needs is hidden: the host badge stays while the host is not
++// online (it carries Reconnect), and the mic stays while a take is starting or
++// recording (it is the stop button). The dictation hotkey is bound to the
++// mounted mic, so it keeps working while the button is hidden.
++
++/** Hides the mic in a tight row unless a take is recording or starting. */
++export const COMPOSER_TIGHT_MIC_CLASS =
++  "group-data-[tight]/composer-actions:not-aria-pressed:not-aria-[busy=true]:hidden";
++
++/** Wrapper (no layout of its own) that hides the host badge in a tight row while the host is online. */
++export const COMPOSER_TIGHT_HOST_WRAPPER_CLASS =
++  "contents group-data-[tight]/composer-actions:has-[[data-host-status=online]]:hidden";
++
++/** Wrapper that hides the roles preset control only in the tighter tier. */
++export const COMPOSER_TIGHTER_WRAPPER_CLASS = "contents group-data-[tighter]/composer-actions:hidden";
++
++/** Tiers in the order the action row applies them: squeeze the gaps, hide the mic and host badge, then the roles preset. */
++export const COMPOSER_TIGHT_TIERS = ["snug", "tight", "tighter"] as const;
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 3ff2491afd6548e088cf1045fe966b1848614f5f..784195884bd5055def51fe14eafe7b781d977e37 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -2851,7 +2851,8 @@ describe("Composer shared visible controls", () => {
+     expect(leading).toContainElement(screen.getByRole("button", { name: "Add" }));
+     const harnessPicker = screen.getByTestId("composer-config-gear");
+     expect(screen.queryByTestId("composer-settings")).toBeNull();
+-    expect(trailing.firstElementChild).toContainElement(harnessPicker);
++    // The team control sits in a wrapper span ahead of the picker's div (patch 0212).
++    expect(trailing.querySelector(":scope > div")).toContainElement(harnessPicker);
+     expect(actions.children).toHaveLength(3);
+     expect(workspace).toHaveClass("mx-3", "h-7", "md:h-[37px]", "rounded-t-2xl");
+     expect(textarea().closest("form")).toHaveClass(
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 577a7d0436789dc96637a5e63aa553eb5cb194c4..6d47ef1fc56178ec1f0ce80a5192d80f94cdbfb7 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -232,6 +232,11 @@ import {
+   type WorkspaceFile,
+ } from "@/hooks/useWorkspaceChangedFiles";
+ import { ComposerMicButton } from "@/components/ComposerMicButton";
++import {
++  COMPOSER_TIGHT_HOST_WRAPPER_CLASS,
++  COMPOSER_TIGHT_MIC_CLASS,
++  COMPOSER_TIGHTER_WRAPPER_CLASS,
++} from "@/lib/aeComposerTight";
+ import { ComposerAttachments } from "@/components/ComposerAttachments";
+ import { isCostRoutingSession, isSubagentRoutingSession } from "@/components/CostRoutingControl";
+ import {
+@@ -3883,12 +3888,14 @@ function ComposerImpl(
+                 }
+               />
+               {!subAgentLabel && composerSessionId && (
+-                <HostBadge
+-                  sessionId={composerSessionId}
+-                  appearance="composer"
+-                  readOnly={isReadOnly}
+-                  onReconnect={onShowReconnectHelp}
+-                />
++                <span className={COMPOSER_TIGHT_HOST_WRAPPER_CLASS}>
++                  <HostBadge
++                    sessionId={composerSessionId}
++                    appearance="composer"
++                    readOnly={isReadOnly}
++                    onReconnect={onShowReconnectHelp}
++                  />
++                </span>
+               )}
+               {(showClaudePermissionMode || showCodexApprovalMode) && (
+                 <ComposerPermissionPicker
+@@ -3908,12 +3915,14 @@ function ComposerImpl(
+           trailing: (
+             <>
+               {composerSessionId && (
+-                <SessionTeamControl
+-                  key={composerSessionId}
+-                  sessionId={composerSessionId}
+-                  disabled={isReadOnly || unreachable || configBusy}
+-                  working={isWorking}
+-                />
++                <span className={COMPOSER_TIGHTER_WRAPPER_CLASS}>
++                  <SessionTeamControl
++                    key={composerSessionId}
++                    sessionId={composerSessionId}
++                    disabled={isReadOnly || unreachable || configBusy}
++                    working={isWorking}
++                  />
++                </span>
+               )}
+               <div className="flex min-w-0 items-center rounded-lg">
+                 <SessionHarnessPicker
+@@ -3948,7 +3957,7 @@ function ComposerImpl(
+                 />
+               </div>
+               <ComposerMicButton
+-                className="size-8 md:size-7"
++                className={cn("size-8 md:size-7", COMPOSER_TIGHT_MIC_CLASS)}
+                 enableHotkey
+                 disabled={disabled || isReadOnly || hasPendingElicitation || composerLockedByBtw}
+                 onVoiceStart={() => {

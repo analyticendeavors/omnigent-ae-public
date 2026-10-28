@@ -26,10 +26,10 @@ Each pane has a picker at the top that lists your sessions by name. A pane on a 
 
 <p align="center"><img src="../media/split-four-up.jpg" alt="Four live sessions at once"></p>
 
-Every pane stays live: one session streams its reply while another waits on your approval, and you can answer it in place. Closing a pane never stops its session, and Open alone shows a pane's session by itself.
+Every pane stays live: one session streams its reply while another waits on your approval, and you can answer it in place. Closing a pane never stops its session, and Open alone shows a pane's session by itself. In a pane about as narrow as a four-up column, the composer drops the voice button and host badge and tightens its gaps, so Send and Interrupt stay inside the composer instead of running past its edge. In the narrowest panes the roles preset control is hidden too.
 
 **Where:** Add pane in the split view's top bar; Open alone and Close on each pane's strip.<br>
-**Built from:** core patch [`0005`](../../patches/0005-ae-patch-Add-a-split-view-that-shows-up-to-four-sess.patch)
+**Built from:** core patches [`0005`](../../patches/0005-ae-patch-Add-a-split-view-that-shows-up-to-four-sess.patch), [`0212`](../../patches/0212-ae-patch-Keep-the-composer-s-buttons-inside-it-in-na.patch)
 
 ## Layout presets
 

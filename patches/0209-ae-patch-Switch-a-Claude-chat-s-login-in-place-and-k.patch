@@ -1,0 +1,2078 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 12:09:41 -0700
+Subject: [PATCH 209/220] [ae-patch] Switch a Claude chat's login in place and
+ keep a chat on the login it started with
+
+A relaunch reads the login the chat last launched on when no pick is stored, so a restart never moves it to the new-chat default. A claude_account_change event restarts the chat's Claude terminal (refused while a reply or approval runs). The composer Account menu gets This chat and New chats groups, a changed new-chat login asks whether to move every open chat, and the usage-limit dock switches this chat in place with a separate copy to another login.
+---
+ .../claude_native/ae_launch_account.py        |  22 ++
+ omnigent/runner/ae_claude_account.py          | 188 ++++++++++++++++
+ omnigent/runner/app.py                        |  25 +++
+ omnigent/runner/native/orchestration.py       |  13 ++
+ .../claude_native/test_ae_launch_account.py   |  35 +++
+ tests/runner/test_ae_claude_account.py        | 210 ++++++++++++++++++
+ web/src/components/AeActionDock.test.tsx      |  51 ++++-
+ web/src/components/AeActionDock.tsx           | 136 ++++++++++--
+ web/src/hooks/useAeLimitGate.ts               |  15 +-
+ web/src/hooks/useAeSwitchClaudeAccount.ts     |  13 ++
+ web/src/lib/aeActionDock.ts                   |   8 +-
+ web/src/lib/aeActionDockIcons.ts              |   5 +-
+ web/src/lib/aeClaudeAccount.test.ts           |  56 +++++
+ web/src/lib/aeClaudeAccount.ts                | 101 +++++++++
+ web/src/lib/aeLimitGate.ts                    |  33 +++
+ web/src/lib/aeMoveAllChats.ts                 |  40 ++++
+ web/src/lib/aePickDefaultClaudeAccount.ts     |  31 +++
+ web/src/pages/ChatPage.tsx                    |   7 +-
+ web/src/shell/AeClaudeAccountSubmenu.tsx      |  38 +++-
+ web/src/shell/AeMoveAllChatsDialog.test.tsx   |  93 ++++++++
+ web/src/shell/AeMoveAllChatsDialog.tsx        |  80 +++++++
+ .../AeSessionClaudeAccountGroup.test.tsx      | 158 +++++++++++++
+ web/src/shell/AeSessionClaudeAccountGroup.tsx | 129 +++++++++++
+ web/src/shell/AeSharedClaudeAccountsGroup.tsx |  17 +-
+ web/src/shell/AppShell.tsx                    |   2 +
+ web/src/shell/ClaudeAccounts.tsx              |  25 +--
+ 26 files changed, 1453 insertions(+), 78 deletions(-)
+ create mode 100644 omnigent/runner/ae_claude_account.py
+ create mode 100644 tests/runner/test_ae_claude_account.py
+ create mode 100644 web/src/hooks/useAeSwitchClaudeAccount.ts
+ create mode 100644 web/src/lib/aeClaudeAccount.test.ts
+ create mode 100644 web/src/lib/aeClaudeAccount.ts
+ create mode 100644 web/src/lib/aeMoveAllChats.ts
+ create mode 100644 web/src/lib/aePickDefaultClaudeAccount.ts
+ create mode 100644 web/src/shell/AeMoveAllChatsDialog.test.tsx
+ create mode 100644 web/src/shell/AeMoveAllChatsDialog.tsx
+ create mode 100644 web/src/shell/AeSessionClaudeAccountGroup.test.tsx
+ create mode 100644 web/src/shell/AeSessionClaudeAccountGroup.tsx
+
+diff --git a/omnigent/harnesses/claude_native/ae_launch_account.py b/omnigent/harnesses/claude_native/ae_launch_account.py
+index 06e22358c972e0e34002a51482435359ce1c6ece..270611a4dc5c2bb2ac03cf22f236cf0c3b8926a3 100644
+--- a/omnigent/harnesses/claude_native/ae_launch_account.py
++++ b/omnigent/harnesses/claude_native/ae_launch_account.py
+@@ -33,6 +33,28 @@ _logger = logging.getLogger(__name__)
+ ACCOUNT_LIVE_LABEL = "ae.claude_account"
+ 
+ 
++def locked_launch_account(
++    server_label: str | None, live_label: str | None, *, provider_auth: bool
++) -> str | None:
++    """
++    The login a terminal launches on: a chat stays on the one it started with.
++
++    The server's label (a fork's pick, or a switch made in place) wins. Without
++    one, the live label of the last launch keeps a restart (a deploy, an idle
++    close) from moving the chat to the host's new default. A chat with no label
++    yet, or one on provider credentials, launches as before.
++
++    :param server_label: ``omnigent.claude_native.account``, or ``None``.
++    :param live_label: ``ae.claude_account`` from the last launch, or ``None``.
++    :param provider_auth: Whether the launch carries provider credentials.
++    :returns: The account name (``""`` is the default login), or ``None`` for the
++        host's selected login.
++    """
++    if server_label is not None or provider_auth:
++        return server_label
++    return live_label
++
++
+ def write_launch_account(bridge_dir: Path, terminal_env: Mapping[str, str]) -> None:
+     """
+     Record the account the terminal is about to run on.
+diff --git a/omnigent/runner/ae_claude_account.py b/omnigent/runner/ae_claude_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..88f719d14463a02b8c97ca51783336e22ba1024e
+--- /dev/null
++++ b/omnigent/runner/ae_claude_account.py
+@@ -0,0 +1,188 @@
++"""Switch a claude-native session to another Claude login, in place.
++
++The login is fixed when the terminal launches, so a switch restarts it: the
++server stores the new login on the session first, then sends this runner
++``{"type": "claude_account_change"}``. The runner closes the Claude pane and
++starts it again, and the launch reads the stored login. Claude resumes the same
++conversation; every login shares ``~/.claude/projects``, so its next reply
++re-reads the transcript (extra tokens on that subscription).
++
++Answers, the way ``ae_fast_mode`` does:
++
++``200 {"relaunched": true}``
++    The pane was closed (if there was one) and a new one is running.
++``400``
++    The session does not run Claude Code.
++``409``
++    A reply or an approval is in progress, the old terminal would not close, or
++    the new one did not start; ``{"error": <code>, "detail": <sentence>}``.
++    Nothing is closed in the first case.
++
++While a switch runs the session is marked switching: a turn that arrives waits
++(bounded) for the new pane instead of starting on the one being closed, and the
++idle reaper leaves the pane alone.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import contextlib
++import logging
++import weakref
++from collections.abc import Awaitable, Callable, Mapping
++from typing import TYPE_CHECKING, Any
++
++from fastapi.responses import JSONResponse, Response
++
++from omnigent.entities.session_resources import terminal_resource_id
++
++if TYPE_CHECKING:
++    from omnigent.terminals import TerminalRegistry
++
++_logger = logging.getLogger(__name__)
++
++CHANGE_EVENT = "claude_account_change"
++_CLAUDE_NATIVE = "claude-native"
++_TERMINAL_NAME = "claude"
++
++BUSY_DETAIL = "Claude is mid-reply or waiting on an approval. Stop it or answer it, then switch."
++NOT_CLAUDE_DETAIL = "Only a Claude Code chat has a Claude login to switch."
++NOT_STARTED_DETAIL = (
++    "Claude did not start on that login. Pick another login, or check this host's Claude accounts."
++)
++
++NOT_CLOSED_DETAIL = "Claude's old terminal would not close. Try the switch again."
++# Longest a turn waits for a switch to finish; past it the turn goes ahead.
++SWITCH_WAIT_S = 100.0
++
++CloseTerminal = Callable[[str, str], Awaitable[bool]]
++EnsureTerminal = Callable[[str, str | None], Awaitable[None]]
++PublishEvent = Callable[[str, Mapping[str, object]], None]
++
++# One switch at a time per session; an entry lives while a switch holds it.
++_locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
++# Sessions whose terminal is being replaced, each with an event set when that ends.
++_switching: dict[str, asyncio.Event] = {}
++
++
++def is_switching(conversation_id: str) -> bool:
++    """Whether a switch is replacing this session's terminal right now."""
++    return conversation_id in _switching
++
++
++async def wait_while_switching(conversation_id: str, timeout_s: float = SWITCH_WAIT_S) -> None:
++    """
++    Hold a turn until the session's switch (if any) has finished, at most *timeout_s*.
++
++    A turn that starts mid-switch then finds the new pane, not the one being closed.
++    """
++    event = _switching.get(conversation_id)
++    if event is not None:
++        with contextlib.suppress(TimeoutError):
++            await asyncio.wait_for(event.wait(), timeout_s)
++
++
++def _error(status_code: int, code: str, detail: str) -> JSONResponse:
++    return JSONResponse(status_code=status_code, content={"error": code, "detail": detail})
++
++
++def session_is_busy(conversation_id: str, *, turn_in_flight: bool) -> bool:
++    """
++    Whether a reply or an approval is in progress, the reaper's busy signals.
++
++    :param conversation_id: Session id, e.g. ``"conv_abc123"``.
++    :param turn_in_flight: The runner's own view: an active turn, or a native pane
++        status of running or waiting.
++    """
++    from omnigent.harnesses.claude_native.bridge import approval_wait_is_fresh
++
++    return turn_in_flight or approval_wait_is_fresh(conversation_id)
++
++
++async def handle_claude_account_change(
++    conversation_id: str,
++    *,
++    harness: str | None,
++    turn_in_flight: Callable[[], bool],
++    terminal_registry: TerminalRegistry | None,
++    close_terminal: CloseTerminal,
++    ensure_terminal: EnsureTerminal,
++    publish_event: PublishEvent,
++) -> Response:
++    """
++    Restart the session's Claude terminal so it launches on the stored login.
++
++    :param conversation_id: Session id, e.g. ``"conv_abc123"``.
++    :param harness: The session's canonical harness, or ``None`` when not loaded.
++    :param turn_in_flight: Whether the runner sees an active turn or a running pane;
++        read after the session is marked switching, so no turn slips in unseen.
++    :param terminal_registry: The runner's terminal registry.
++    :param close_terminal: Closes a terminal resource by session and resource id.
++    :param ensure_terminal: Starts the native terminal again (the turn self-heal).
++    :param publish_event: The runner's per-session event emitter.
++    :returns: ``200 {"relaunched": true}`` or an error response.
++    """
++    if harness != _CLAUDE_NATIVE:
++        return _error(400, "claude_account_unsupported", NOT_CLAUDE_DETAIL)
++    lock = _locks.get(conversation_id)
++    if lock is None:
++        lock = _locks[conversation_id] = asyncio.Lock()
++    async with lock:
++        done = _switching[conversation_id] = asyncio.Event()
++        try:
++            return await _replace_terminal(
++                conversation_id,
++                turn_in_flight=turn_in_flight,
++                terminal_registry=terminal_registry,
++                close_terminal=close_terminal,
++                ensure_terminal=ensure_terminal,
++                publish_event=publish_event,
++            )
++        finally:
++            _switching.pop(conversation_id, None)
++            done.set()
++
++
++async def _replace_terminal(
++    conversation_id: str,
++    *,
++    turn_in_flight: Callable[[], bool],
++    terminal_registry: TerminalRegistry | None,
++    close_terminal: CloseTerminal,
++    ensure_terminal: EnsureTerminal,
++    publish_event: PublishEvent,
++) -> Response:
++    """Close the pane seen now and start another; the session is already marked switching."""
++    from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
++
++    def current() -> Any:
++        if terminal_registry is None:
++            return None
++        return terminal_registry.get(conversation_id, _TERMINAL_NAME, "main")
++
++    if session_is_busy(conversation_id, turn_in_flight=turn_in_flight()):
++        return _error(409, "claude_account_busy", BUSY_DETAIL)
++    pane = current()
++    if pane is not None:
++        try:
++            await close_terminal(conversation_id, terminal_resource_id(_TERMINAL_NAME, "main"))
++        finally:
++            if current() is not pane:
++                _publish_terminal_deleted_event(
++                    conversation_id=conversation_id,
++                    terminal_name=_TERMINAL_NAME,
++                    session_key="main",
++                    publish_event=publish_event,
++                )
++        if current() is pane:
++            return _error(409, "claude_account_not_closed", NOT_CLOSED_DETAIL)
++    await ensure_terminal(conversation_id, _CLAUDE_NATIVE)
++    started = current()
++    if started is None or started is pane or not await started.is_alive():
++        _logger.warning(
++            "claude account switch: no live new terminal after relaunch for session=%s",
++            conversation_id,
++            extra={"session_id": conversation_id},
++        )
++        return _error(409, "claude_account_not_started", NOT_STARTED_DETAIL)
++    return JSONResponse({"relaunched": True})
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index 5397ef4e027b5f6d9e27908e5af1342b6f56c1f1..41650d8e27e37b48fc41fb3c182477b5a00e0579 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -85,6 +85,7 @@ from omnigent.runner.acp_subagent_sessions import (
+     _mint_acp_subagent_child,
+     _post_acp_subagent_tool_call,
+ )
++from omnigent.runner.ae_claude_account import is_switching, wait_while_switching
+ from omnigent.runner.app_support import (
+     SpecResolver,
+     _client_safe_error_detail,
+@@ -5181,6 +5182,8 @@ def create_runner_app(
+             and name not in _spec_names
+         )
+ 
++        # A login switch is replacing the pane; start on the new one.
++        await wait_while_switching(conv)
+         await _ensure_native_terminal_for_turn(conv, harness_name)
+ 
+         startup_envelope = _fresh_session_init_envelope(conv)
+@@ -6795,6 +6798,26 @@ def create_runner_app(
+                 turn_in_flight=_native_turn_in_flight,
+             )
+ 
++        if body_type == "claude_account_change":
++            from omnigent.runner.ae_claude_account import handle_claude_account_change
++
++            return await handle_claude_account_change(
++                conversation_id,
++                harness=_session_harness_name(conversation_id),
++                turn_in_flight=lambda: (
++                    conversation_id in _active_turns
++                    or _native_turn_in_flight(conversation_id)
++                    or (
++                        process_manager is not None
++                        and process_manager.has_active_turn(conversation_id)
++                    )
++                ),
++                terminal_registry=resource_registry.terminal_registry,
++                close_terminal=resource_registry.close_terminal,
++                ensure_terminal=_ensure_native_terminal_for_turn,
++                publish_event=_publish_event,
++            )
++
+         if body_type == "plan_mode_change":
+             harness = _session_harness_name(conversation_id)
+             if harness == "codex-native":
+@@ -7640,6 +7663,8 @@ def create_runner_app(
+ 
+         async def _native_pane_is_busy(pane: PaneRef) -> bool:
+             conv_id = pane.conversation_id
++            if is_switching(conv_id):
++                return True
+             if conv_id in _active_turns or (
+                 process_manager is not None and process_manager.has_active_turn(conv_id)
+             ):
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 875d077a565e8be93810cbc4aee8df77638081e0..a563cdc820c7426b5ab650ef0ddb809c470da729 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -8057,6 +8057,8 @@ class _ClaudeSessionLaunchMetadata:
+     fork_source_external_id: str | None = None
+     fork_carry_history: bool = False
+     claude_account: str | None = None
++    #: The login the terminal last launched on (``ae.claude_account``), which a relaunch keeps.
++    live_claude_account: str | None = None
+     #: Both routing fields come from ``routing_class_from_snapshot``, so an
+     #: auto-harness session always reads as routing-enabled too. Deriving them
+     #: separately was the bug: a sub-agent child of a routed parent carries the
+@@ -8079,6 +8081,7 @@ def _claude_launch_metadata_from_envelope(
+     session_init: RunnerSessionInitEnvelope,
+ ) -> _ClaudeSessionLaunchMetadata:
+     """Project Claude launch metadata without server callbacks."""
++    from omnigent.harnesses.claude_native.ae_launch_account import ACCOUNT_LIVE_LABEL
+     from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.runner.subagent_routing import routing_class_from_snapshot
+     from omnigent.stores.conversation_store import (
+@@ -8106,6 +8109,7 @@ def _claude_launch_metadata_from_envelope(
+         ),
+         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+         claude_account=snapshot.labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
++        live_claude_account=snapshot.labels.get(ACCOUNT_LIVE_LABEL),
+     )
+ 
+ 
+@@ -8114,6 +8118,7 @@ async def _load_legacy_claude_launch_metadata(
+     session_id: str,
+ ) -> _ClaudeSessionLaunchMetadata:
+     """Fetch Claude launch metadata for servers predating the init envelope."""
++    from omnigent.harnesses.claude_native.ae_launch_account import ACCOUNT_LIVE_LABEL
+     from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.runner.subagent_routing import routing_class_from_snapshot
+     from omnigent.stores.conversation_store import (
+@@ -8174,6 +8179,7 @@ async def _load_legacy_claude_launch_metadata(
+         ),
+         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+         claude_account=labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
++        live_claude_account=labels.get(ACCOUNT_LIVE_LABEL),
+     )
+     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
+     _logger.info(
+@@ -8882,6 +8888,7 @@ async def _auto_create_claude_terminal(
+     # ambient env (the CLI path records these at prepare time; the runner
+     # resolves its config only after the bridge exists).
+     from omnigent.harnesses.claude_native.ae_launch_account import (
++        locked_launch_account,
+         record_launch_account,
+         write_launch_account,
+     )
+@@ -9014,6 +9021,12 @@ async def _auto_create_claude_terminal(
+     if resolved_claude is not None:
+         validate_claude_hook_interpreter_compatibility(resolved_claude)
+ 
++    # A relaunch stays on the login the chat started with, not the host's new default.
++    claude_account = locked_launch_account(
++        claude_account,
++        launch_metadata.live_claude_account,
++        provider_auth=claude_config is not None,
++    )
+     claude_terminal_env_unset = _claude_terminal_env_unset(claude_config, claude_account)
+     claude_terminal_env = build_native_claude_terminal_env(
+         claude_config, account_name=claude_account
+diff --git a/tests/harnesses/claude_native/test_ae_launch_account.py b/tests/harnesses/claude_native/test_ae_launch_account.py
+index fb030ff0886f7e4719f2f2681ee715007ee245f9..25c57b6e15846d2f40b5ac7696ba8c1a840a95fb 100644
+--- a/tests/harnesses/claude_native/test_ae_launch_account.py
++++ b/tests/harnesses/claude_native/test_ae_launch_account.py
+@@ -72,3 +72,38 @@ async def test_a_failed_label_does_not_fail_the_launch(caplog: pytest.LogCapture
+         await record_launch_account(client, "conv_abc", {"OMNIGENT_CLAUDE_ACCOUNT": "AE Backup"})
+ 
+     assert "could not label session conv_abc" in caplog.text
++
++
++def test_a_chat_keeps_the_login_it_started_with() -> None:
++    from omnigent.harnesses.claude_native.ae_launch_account import locked_launch_account
++
++    # The server label (a fork's pick or a switch) wins over the last launch.
++    assert locked_launch_account("Backup", "Work", provider_auth=False) == "Backup"
++    assert locked_launch_account("", "Work", provider_auth=False) == ""
++    # No server label: the last launch's login stands, "" being the default login.
++    assert locked_launch_account(None, "Work", provider_auth=False) == "Work"
++    assert locked_launch_account(None, "", provider_auth=False) == ""
++    # A chat never launched keeps today's behaviour (the host's selected login).
++    assert locked_launch_account(None, None, provider_auth=False) is None
++    # Provider credentials own authentication, so the live label never applies.
++    assert locked_launch_account(None, "", provider_auth=True) is None
++
++
++async def test_launch_metadata_carries_the_live_label_beside_the_server_label() -> None:
++    from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
++    from omnigent.runner.native.orchestration import _load_legacy_claude_launch_metadata
++
++    labels = {ACCOUNT_LIVE_LABEL: "Work", CLAUDE_ACCOUNT_LABEL_KEY: "Backup"}
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, json={"labels": labels})
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://server"
++    ) as client:
++        both = await _load_legacy_claude_launch_metadata(client, "conv_abc")
++        del labels[CLAUDE_ACCOUNT_LABEL_KEY]
++        live_only = await _load_legacy_claude_launch_metadata(client, "conv_abc")
++
++    assert (both.claude_account, both.live_claude_account) == ("Backup", "Work")
++    assert (live_only.claude_account, live_only.live_claude_account) == (None, "Work")
+diff --git a/tests/runner/test_ae_claude_account.py b/tests/runner/test_ae_claude_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..538f1aa2a02f01dabca7d439c211b966d0357c74
+--- /dev/null
++++ b/tests/runner/test_ae_claude_account.py
+@@ -0,0 +1,210 @@
++"""Tests for switching a claude-native session's login in place (the runner side)."""
++
++from __future__ import annotations
++
++import json
++from typing import Any
++
++import pytest
++
++from omnigent.harnesses.claude_native import bridge as claude_native_bridge
++from omnigent.runner.ae_claude_account import (
++    BUSY_DETAIL,
++    NOT_CLAUDE_DETAIL,
++    NOT_STARTED_DETAIL,
++    handle_claude_account_change,
++)
++
++SESSION_ID = "conv_switch"
++
++
++class _Terminal:
++    def __init__(self, alive: bool = True) -> None:
++        self.alive = alive
++
++    async def is_alive(self) -> bool:
++        return self.alive
++
++
++class _Registry:
++    def __init__(self, pane: _Terminal | None) -> None:
++        self.pane = pane
++
++    def get(self, conversation_id: str, terminal_name: str, session_key: str) -> _Terminal | None:
++        assert (conversation_id, terminal_name, session_key) == (SESSION_ID, "claude", "main")
++        return self.pane
++
++
++class _Runner:
++    """Records the order of close, delete event and ensure; ensure starts a pane."""
++
++    def __init__(self, registry: _Registry, *, starts: bool = True) -> None:
++        self.registry = registry
++        self.starts = starts
++        self.calls: list[str] = []
++        self.events: list[dict[str, Any]] = []
++
++    async def close(self, session_id: str, terminal_id: str) -> bool:
++        self.calls.append(f"close:{session_id}:{terminal_id}")
++        self.registry.pane = None
++        return True
++
++    async def ensure(self, session_id: str, harness: str | None) -> None:
++        self.calls.append(f"ensure:{session_id}:{harness}")
++        if self.starts:
++            self.registry.pane = _Terminal()
++
++    def publish(self, session_id: str, event: Any) -> None:
++        self.calls.append("deleted")
++        self.events.append(dict(event))
++
++
++async def _switch(
++    runner: _Runner, *, harness: str | None = "claude-native", busy: bool = False
++) -> tuple[int, dict[str, Any]]:
++    response = await handle_claude_account_change(
++        SESSION_ID,
++        harness=harness,
++        turn_in_flight=lambda: busy,
++        terminal_registry=runner.registry,  # type: ignore[arg-type]
++        close_terminal=runner.close,
++        ensure_terminal=runner.ensure,
++        publish_event=runner.publish,
++    )
++    return response.status_code, json.loads(bytes(response.body))
++
++
++@pytest.fixture(autouse=True)
++def _no_approval(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(claude_native_bridge, "approval_wait_is_fresh", lambda _sid: False)
++
++
++async def test_an_idle_pane_is_closed_then_started_again() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner)
++    assert (status, body) == (200, {"relaunched": True})
++    assert [c.split(":")[0] for c in runner.calls] == ["close", "deleted", "ensure"]
++    assert runner.calls[0].startswith(f"close:{SESSION_ID}:")
++    assert runner.events[0]["type"] == "session.resource.deleted"
++
++
++async def test_no_pane_goes_straight_to_ensure() -> None:
++    runner = _Runner(_Registry(None))
++    status, _body = await _switch(runner)
++    assert status == 200
++    assert [c.split(":")[0] for c in runner.calls] == ["ensure"]
++
++
++async def test_a_running_turn_refuses_and_closes_nothing() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, busy=True)
++    assert (status, body["detail"]) == (409, BUSY_DETAIL)
++    assert runner.calls == []
++
++
++async def test_a_parked_approval_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(claude_native_bridge, "approval_wait_is_fresh", lambda _sid: True)
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner)
++    assert (status, body["detail"]) == (409, BUSY_DETAIL)
++    assert runner.calls == []
++
++
++async def test_a_session_that_is_not_claude_native_is_a_400() -> None:
++    for harness in ("codex-native", None):
++        runner = _Runner(_Registry(_Terminal()))
++        status, body = await _switch(runner, harness=harness)
++        assert (status, body["detail"]) == (400, NOT_CLAUDE_DETAIL)
++        assert runner.calls == []
++
++
++async def test_a_terminal_that_does_not_start_is_a_409() -> None:
++    runner = _Runner(_Registry(_Terminal()), starts=False)
++    status, body = await _switch(runner)
++    assert (status, body["detail"]) == (409, NOT_STARTED_DETAIL)
++
++
++async def test_a_turn_arriving_mid_switch_waits_for_the_new_pane() -> None:
++    import asyncio
++
++    from omnigent.runner.ae_claude_account import is_switching, wait_while_switching
++
++    runner = _Runner(_Registry(_Terminal()))
++    in_ensure = asyncio.Event()
++    release = asyncio.Event()
++    plain_ensure = runner.ensure
++
++    async def slow_ensure(session_id: str, harness: str | None) -> None:
++        in_ensure.set()
++        await release.wait()
++        await plain_ensure(session_id, harness)
++
++    runner.ensure = slow_ensure  # type: ignore[method-assign]
++    switch = asyncio.create_task(_switch(runner))
++    await in_ensure.wait()
++    assert is_switching(SESSION_ID)
++    seen_pane: list[_Terminal | None] = []
++
++    async def turn() -> None:
++        await wait_while_switching(SESSION_ID)
++        seen_pane.append(runner.registry.pane)
++
++    turn_task = asyncio.create_task(turn())
++    await asyncio.sleep(0)
++    assert not turn_task.done()  # held while the pane is being replaced
++    release.set()
++    assert (await switch)[0] == 200
++    await turn_task
++    assert seen_pane == [runner.registry.pane] and seen_pane[0] is not None
++    assert not is_switching(SESSION_ID)
++
++
++async def test_a_turn_waits_no_longer_than_its_bound() -> None:
++    import asyncio
++
++    from omnigent.runner import ae_claude_account as module
++
++    module._switching[SESSION_ID] = asyncio.Event()
++    try:
++        await asyncio.wait_for(module.wait_while_switching(SESSION_ID, 0.01), 1.0)
++    finally:
++        module._switching.pop(SESSION_ID, None)
++
++
++async def test_a_pane_that_stays_registered_is_not_reported_as_switched() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    pane = runner.registry.pane
++
++    async def stuck_close(session_id: str, terminal_id: str) -> bool:
++        runner.calls.append("close")
++        return True  # claims success, but the same instance is still registered
++
++    runner.close = stuck_close  # type: ignore[method-assign]
++    status, body = await _switch(runner)
++    assert status == 409 and body["error"] == "claude_account_not_closed"
++    assert runner.registry.pane is pane
++    assert not any(c.startswith("ensure") for c in runner.calls)
++
++
++async def test_a_turn_admitted_after_the_mark_is_seen_by_the_busy_check() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    state = {"busy": False}
++
++    def turn_in_flight() -> bool:
++        # Read after the switching mark; a turn that landed meanwhile is counted.
++        from omnigent.runner.ae_claude_account import is_switching
++
++        assert is_switching(SESSION_ID)
++        return state["busy"]
++
++    state["busy"] = True
++    response = await handle_claude_account_change(
++        SESSION_ID,
++        harness="claude-native",
++        turn_in_flight=turn_in_flight,
++        terminal_registry=runner.registry,  # type: ignore[arg-type]
++        close_terminal=runner.close,
++        ensure_terminal=runner.ensure,
++        publish_event=runner.publish,
++    )
++    assert response.status_code == 409 and runner.calls == []
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 6c0f3addac764e1f7e78f3608ccc4dd5d7b930e8..0f0a18c7689f0c1794c0c8df295128d07312007c 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -598,14 +598,20 @@ const TWO_LOGINS = [
+   { family: "claude-oauth-active", source: "AE Default", env_var: "" },
+   { family: "claude-oauth", source: "Personal", env_var: "personal" },
+ ];
++const THREE_LOGINS = [...TWO_LOGINS, { family: "claude-oauth", source: "Shared", env_var: "team" }];
+ 
+ function serveLimits(answer: () => unknown, logins: unknown[] = TWO_LOGINS) {
+-  vi.mocked(authenticatedFetch).mockImplementation((input: URL | RequestInfo) => {
+-    const path = String(input);
+-    if (path.startsWith("/v1/ae/limits")) return json(answer());
+-    if (path.includes("/credentials/detected")) return json({ credentials: logins });
+-    return json({ error: { message: "nope" } }, 404);
+-  });
++  vi.mocked(authenticatedFetch).mockImplementation(
++    (input: URL | RequestInfo, init?: RequestInit) => {
++      const path = String(input);
++      if (init?.method === "PUT" && path.endsWith("/claude-account")) {
++        return json({ account: JSON.parse(String(init.body)).account, relaunched: true });
++      }
++      if (path.startsWith("/v1/ae/limits")) return json(answer());
++      if (path.includes("/credentials/detected")) return json({ credentials: logins });
++      return json({ error: { message: "nope" } }, 404);
++    },
++  );
+ }
+ 
+ function Where() {
+@@ -657,6 +663,7 @@ describe("AeActionDock usage gate", () => {
+     expect(lead.textContent).toContain("AE Default is at 92% of its weekly limit, resets");
+     expect(within(lead).getByTestId("ae-dock-limit-model")).toBeTruthy();
+     expect(await within(lead).findByTestId("ae-dock-limit-account")).toBeTruthy();
++    expect(within(lead).getByTestId("ae-dock-limit-copy")).toBeTruthy();
+     expect(within(lead).getByTestId("ae-dock-limit-new")).toBeTruthy();
+     expect(within(lead).getByTestId("ae-dock-dismiss")).toBeTruthy();
+   });
+@@ -673,13 +680,40 @@ describe("AeActionDock usage gate", () => {
+     const { onSwitchModel, openForkDialog } = renderLimitDock();
+     fireEvent.click(await screen.findByTestId("ae-dock-limit-model"));
+     expect(onSwitchModel).toHaveBeenCalledTimes(1);
++    // The primary button moves this chat in place; the fork dialog is the second action.
+     fireEvent.click(await screen.findByTestId("ae-dock-limit-account"));
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        "/v1/ae/sessions/s1/claude-account",
++        expect.objectContaining({ method: "PUT", body: JSON.stringify({ account: "personal" }) }),
++      ),
++    );
++    expect(openForkDialog).not.toHaveBeenCalled();
++    fireEvent.click(await screen.findByTestId("ae-dock-limit-copy"));
+     expect(openForkDialog).toHaveBeenCalledTimes(1);
+     expect(screen.getByTestId("where").textContent).toBe("/c/s1");
+     fireEvent.click(screen.getByTestId("ae-dock-limit-new"));
+     expect(screen.getByTestId("where").textContent).toBe("/");
+   });
+ 
++  it("opens a menu of logins when more than one other login exists", async () => {
++    serveLimits(() => limitsAnswer(95), THREE_LOGINS);
++    renderLimitDock();
++    const button = await screen.findByTestId("ae-dock-limit-account");
++    expect(authenticatedFetch).not.toHaveBeenCalledWith(
++      "/v1/ae/sessions/s1/claude-account",
++      expect.anything(),
++    );
++    fireEvent.pointerDown(button, { button: 0, pointerType: "mouse" });
++    fireEvent.click(await screen.findByTestId("ae-dock-limit-account-team"));
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        "/v1/ae/sessions/s1/claude-account",
++        expect.objectContaining({ body: JSON.stringify({ account: "team" }) }),
++      ),
++    );
++  });
++
+   it("hides Switch account with no other login", async () => {
+     serveLimits(() => limitsAnswer(95), [TWO_LOGINS[0]]);
+     renderLimitDock();
+@@ -704,7 +738,7 @@ describe("AeActionDock usage gate", () => {
+     ["cannot be forked", { canFork: false }],
+     ["has a fork restriction", { disabledReason: "Forking is off for this session." }],
+   ] as const) {
+-    it(`hides Switch account when the session ${why}`, async () => {
++    it(`hides Copy to another login when the session ${why}`, async () => {
+       serveLimits(() => limitsAnswer(95));
+       renderLimitDock(opts);
+       await screen.findByTestId("ae-dock-limit-new");
+@@ -713,7 +747,8 @@ describe("AeActionDock usage gate", () => {
+           expect.stringContaining("/credentials/detected"),
+         ),
+       );
+-      expect(screen.queryByTestId("ae-dock-limit-account")).toBeNull();
++      expect(screen.getByTestId("ae-dock-limit-account")).toBeTruthy();
++      expect(screen.queryByTestId("ae-dock-limit-copy")).toBeNull();
+     });
+   }
+ 
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index a0322307934da4724dbe62457a1ce13d2ddefc89..d8b39ab000eeb5aa28739e18c2e28f7bbb12edcc 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -7,19 +7,36 @@
+ // feed is scrolled. Nothing waiting draws nothing.
+ 
+ import { QueryClientContext, useIsMutating, useQueryClient } from "@tanstack/react-query";
+-import { type RefObject, useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
++import {
++  type RefObject,
++  forwardRef,
++  useContext,
++  useEffect,
++  useLayoutEffect,
++  useRef,
++  useState,
++} from "react";
+ import { ConfirmMerge, MERGED_TEXT } from "@/components/AePrCards";
+ import { AePrLinkHoverCard } from "@/components/AePrLinkHoverCard";
+ import { COMPOSER_CONTENT_INSET_CLASS } from "@/components/composer/ChatComposer";
+ import { Button } from "@/components/ui/button";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
++import { showToast } from "@/components/ui/toast";
+ import { useAeActionDockItems, useAeQuestionsOnScreen } from "@/hooks/useAeActionDockItems";
+ import { useAeDockLift } from "@/hooks/useAeDockLift";
+ import { useAeMarkReady } from "@/hooks/useAeMarkReady";
++import { useAeSwitchClaudeAccount } from "@/hooks/useAeSwitchClaudeAccount";
+ import { useAeUpdateBranch } from "@/hooks/useAeUpdateBranch";
+ import {
+   type AeBranchUpdate,
+   type AeDockDraft,
+   type AeDockItem,
++  type AeDockLimit,
+   type AeDockKind,
+   type AeDockWaiting,
+   aeBranchUpdatePending,
+@@ -32,6 +49,7 @@ import {
+ } from "@/lib/aeActionDock";
+ import {
+   AE_ICON_ARROW_DOWN,
++  AE_ICON_ARROWS_EXCHANGE,
+   AE_ICON_CHEVRON_UP,
+   AE_ICON_GAUGE,
+   AE_ICON_HELP_CIRCLE,
+@@ -81,7 +99,12 @@ const ACTION = "h-6 shrink-0 px-2 text-xs";
+ /** What the limit item's buttons do; ChatPage supplies the model menu opener. */
+ export interface AeLimitActions {
+   onSwitchModel?: () => void;
+-  onSwitchAccount?: () => void;
++  /** Moves this chat to the login in place (it restarts and resumes). */
++  onSwitchAccount?: (account: string, label: string) => void;
++  /** Copies this chat to another login (the fork dialog). */
++  onCopyAccount?: () => void;
++  /** A switch is running. */
++  switching?: boolean;
+ }
+ 
+ /** Scroll the feed to the pending question's card. */
+@@ -223,34 +246,88 @@ function NewChatButton({ inList }: { inList: boolean }) {
+   );
+ }
+ 
+-function LimitButton({
+-  icon,
+-  label,
+-  short,
+-  inList,
+-  onClick,
+-  testId,
+-}: {
+-  icon: AeTablerIconNode;
+-  label: string;
+-  short: string;
+-  inList: boolean;
+-  onClick: () => void;
+-  testId: string;
+-}) {
++const LimitButton = forwardRef<
++  HTMLButtonElement,
++  {
++    icon: AeTablerIconNode;
++    label: string;
++    short: string;
++    inList: boolean;
++    onClick?: () => void;
++    testId: string;
++    title?: string;
++    disabled?: boolean;
++  }
++>(function LimitButton({ icon, label, short, inList, onClick, testId, title, ...rest }, ref) {
+   return (
+     <Button
++      ref={ref}
+       variant="outline"
+       className={cn(ACTION, "w-6 px-0 md:w-auto md:px-2")}
+       aria-label={label}
+-      title={label}
++      title={title ?? label}
+       onClick={onClick}
+       data-testid={testId}
++      {...rest}
+     >
+       <AeTablerSvg node={icon} className="size-3" />
+       <span className="hidden md:inline">{inList ? label : short}</span>
+     </Button>
+   );
++});
++
++/** Switch this chat's login in place: one button for one other login, else a menu of them. */
++function SwitchAccountButton({
++  item,
++  limitActions,
++  inList,
++}: {
++  item: AeDockLimit;
++  limitActions: AeLimitActions;
++  inList: boolean;
++}) {
++  const { accountChoices } = item;
++  const switchTo = limitActions.onSwitchAccount;
++  if (!switchTo || accountChoices.length === 0) return null;
++  const common = {
++    icon: AE_ICON_ARROWS_EXCHANGE,
++    label: "Switch account",
++    short: "Account",
++    inList,
++    testId: "ae-dock-limit-account",
++    disabled: limitActions.switching,
++  };
++  if (accountChoices.length === 1) {
++    const [only] = accountChoices;
++    return (
++      <LimitButton
++        {...common}
++        title={`Restart this chat on ${only.label} and resume it. The next reply re-reads the conversation (extra tokens).`}
++        onClick={() => switchTo(only.account, only.label)}
++      />
++    );
++  }
++  return (
++    <DropdownMenu>
++      <DropdownMenuTrigger asChild>
++        <LimitButton
++          {...common}
++          title="Restart this chat on another login and resume it. The next reply re-reads the conversation (extra tokens)."
++        />
++      </DropdownMenuTrigger>
++      <DropdownMenuContent align="end" data-testid="ae-dock-limit-account-menu">
++        {accountChoices.map((choice) => (
++          <DropdownMenuItem
++            key={choice.account}
++            onSelect={() => switchTo(choice.account, choice.label)}
++            data-testid={`ae-dock-limit-account-${choice.account || "default"}`}
++          >
++            {choice.label}
++          </DropdownMenuItem>
++        ))}
++      </DropdownMenuContent>
++    </DropdownMenu>
++  );
+ }
+ 
+ function ItemActions({
+@@ -283,14 +360,18 @@ function ItemActions({
+               testId="ae-dock-limit-model"
+             />
+           )}
+-          {item.canSwitchAccount && limitActions.onSwitchAccount && (
++          {item.canSwitchAccount && (
++            <SwitchAccountButton item={item} limitActions={limitActions} inList={inList} />
++          )}
++          {item.canCopyAccount && limitActions.onCopyAccount && (
+             <LimitButton
+               icon={AE_ICON_USER_SHARE}
+-              label="Switch account"
+-              short="Account"
++              label="Copy to another login"
++              short="Copy"
+               inList={inList}
+-              onClick={limitActions.onSwitchAccount}
+-              testId="ae-dock-limit-account"
++              title="Fork this chat, history included, onto another login. This chat stays where it is."
++              onClick={limitActions.onCopyAccount}
++              testId="ae-dock-limit-copy"
+             />
+           )}
+           <NewChatButton inList={inList} />
+@@ -507,10 +588,17 @@ export function AeActionDock({
+ 
+ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?: () => void }) {
+   const forkDialog = useForkDialog();
++  const switchAccount = useAeSwitchClaudeAccount(sessionId);
+   const limitActions: AeLimitActions = {
+     onSwitchModel,
++    onSwitchAccount: (account, label) =>
++      switchAccount.mutate(account, {
++        onSuccess: () => showToast(`This chat now runs on ${label}.`),
++        onError: (failure) => showToast(failure.message),
++      }),
++    switching: switchAccount.isPending,
+     // A full clone of this session, history included; the dialog's account row picks the login.
+-    onSwitchAccount: forkDialog ? () => forkDialog.openForkDialog() : undefined,
++    onCopyAccount: forkDialog ? () => forkDialog.openForkDialog() : undefined,
+   };
+   const questionsOnScreen = useAeQuestionsOnScreen();
+   const { items, dismiss } = useAeActionDockItems(sessionId, questionsOnScreen);
+diff --git a/web/src/hooks/useAeLimitGate.ts b/web/src/hooks/useAeLimitGate.ts
+index 8d9eaa20d985fa5b97b490ad7716e043fa7d728c..1d58c46fa5db8bba9bedd794f4789a3e233dbc0f 100644
+--- a/web/src/hooks/useAeLimitGate.ts
++++ b/web/src/hooks/useAeLimitGate.ts
+@@ -9,13 +9,13 @@ import { useAePickedClaudeAccount } from "@/hooks/useAePickedClaudeAccount";
+ import { useDetectedCredentials } from "@/hooks/useHosts";
+ import { useSession } from "@/hooks/useSession";
+ import type { AeDockLimit } from "@/lib/aeActionDock";
++import { aeChatAccount } from "@/lib/aeClaudeAccount";
+ import {
+   type AeLimitDismissal,
+-  aeHasOtherClaudeAccount,
+   aeLimitGate,
+   aeLimitGateDismiss,
++  aeOtherClaudeAccounts,
+ } from "@/lib/aeLimitGate";
+-import { AE_CLAUDE_ACCOUNT_LABEL } from "@/shell/AeForkClaudeAccount";
+ import { useForkDialog } from "@/shell/ForkDialogContext";
+ import { useChatStore } from "@/store/chatStore";
+ 
+@@ -76,10 +76,9 @@ export function useAeLimitGate(sessionId: string | undefined): {
+     Boolean(forkDialog?.canFork) &&
+     !forkDialog?.disabledReason &&
+     forkDialog?.currentSessionId === sessionId;
+-  const canSwitchAccount =
+-    claude &&
+-    forkable &&
+-    aeHasOtherClaudeAccount(credentials.data ?? [], session?.labels?.[AE_CLAUDE_ACCOUNT_LABEL]);
++  const accountChoices = claude
++    ? aeOtherClaudeAccounts(credentials.data ?? [], aeChatAccount(session?.labels))
++    : [];
+   return {
+     item: {
+       kind: "limit",
+@@ -87,7 +86,9 @@ export function useAeLimitGate(sessionId: string | undefined): {
+       anchor: `limit:${gate.windowKey}`,
+       order: 0,
+       gate,
+-      canSwitchAccount,
++      canSwitchAccount: accountChoices.length > 0,
++      accountChoices,
++      canCopyAccount: accountChoices.length > 0 && forkable,
+     },
+     dismiss: () => {
+       // Another chat may have dismissed since this one mounted: start from storage.
+diff --git a/web/src/hooks/useAeSwitchClaudeAccount.ts b/web/src/hooks/useAeSwitchClaudeAccount.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f8f32ccc3865a9ffbb60028032d8aac7b0a62fd
+--- /dev/null
++++ b/web/src/hooks/useAeSwitchClaudeAccount.ts
+@@ -0,0 +1,13 @@
++// Switch one chat's Claude login in place (omnigent-ae, 2026-10-27). The chat's
++// snapshot is re-read afterwards so every picker shows the new login.
++
++import { useMutation, useQueryClient } from "@tanstack/react-query";
++import { aeRefreshChatAccount, putAeClaudeAccount } from "@/lib/aeClaudeAccount";
++
++export function useAeSwitchClaudeAccount(sessionId: string | null | undefined) {
++  const queryClient = useQueryClient();
++  return useMutation({
++    mutationFn: (account: string) => putAeClaudeAccount(sessionId ?? "", account),
++    onSettled: () => aeRefreshChatAccount(queryClient, sessionId ?? null),
++  });
++}
+diff --git a/web/src/lib/aeActionDock.ts b/web/src/lib/aeActionDock.ts
+index 279d8c76b4e7e62a1ded57516f57b7aedc87b345..ff627ce3ca4eab0d3387dfd4ede23441744b4fac 100644
+--- a/web/src/lib/aeActionDock.ts
++++ b/web/src/lib/aeActionDock.ts
+@@ -2,7 +2,7 @@
+ // first. Pure, so ordering, badges, hiding and the deploy lifecycle are
+ // unit-tested (aeActionDock.test.ts). omnigent-ae, 2026-10-20.
+ 
+-import { type AeLimitGate, aeLimitGateShort } from "@/lib/aeLimitGate";
++import { type AeAccountChoice, type AeLimitGate, aeLimitGateShort } from "@/lib/aeLimitGate";
+ import { type AePrDeploy, aeHasDeployState } from "@/lib/aePrDeploy";
+ import { type AePrReceipt, aePrReceipt } from "@/lib/aePrReceipt";
+ import { type AePrCard, aeCiText, aeReadyToMerge } from "@/lib/aePrs";
+@@ -100,8 +100,12 @@ export interface AeDockDeploy extends ItemBase {
+ export interface AeDockLimit extends ItemBase {
+   kind: "limit";
+   gate: AeLimitGate;
+-  /** A fork onto another account is possible: a Claude session, another login, fork allowed. */
++  /** The chat can move to another login in place: a Claude session with another login to go to. */
+   canSwitchAccount: boolean;
++  /** The logins it can move to. */
++  accountChoices: AeAccountChoice[];
++  /** A copy on another login is possible too: the same, and a fork is allowed. */
++  canCopyAccount: boolean;
+ }
+ 
+ export type AeDockItem =
+diff --git a/web/src/lib/aeActionDockIcons.ts b/web/src/lib/aeActionDockIcons.ts
+index f961a052d66ea106da31043ec5a378fbebb84d7c..5690cbc25a753a546ee4e8ccebf68f92f57321fe 100644
+--- a/web/src/lib/aeActionDockIcons.ts
++++ b/web/src/lib/aeActionDockIcons.ts
+@@ -38,7 +38,10 @@ export const AE_ICON_SPARKLES = paths(
+   "M16 18a2 2 0 0 1 2 2a2 2 0 0 1 2 -2a2 2 0 0 1 -2 -2a2 2 0 0 1 -2 2m0 -12a2 2 0 0 1 2 2a2 2 0 0 1 2 -2a2 2 0 0 1 -2 -2a2 2 0 0 1 -2 2m-7 12a6 6 0 0 1 6 -6a6 6 0 0 1 -6 -6a6 6 0 0 1 -6 6a6 6 0 0 1 6 6",
+ );
+ 
+-/** `user-share`: switch account. */
++/** `arrows-exchange`: switch this chat to another login. */
++export const AE_ICON_ARROWS_EXCHANGE = paths("M7 10h14l-4 -4", "M17 14h-14l4 4");
++
++/** `user-share`: copy this chat to another login. */
+ export const AE_ICON_USER_SHARE = paths(
+   "M8 7a4 4 0 1 0 8 0a4 4 0 0 0 -8 0",
+   "M6 21v-2a4 4 0 0 1 4 -4h3",
+diff --git a/web/src/lib/aeClaudeAccount.test.ts b/web/src/lib/aeClaudeAccount.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d0cfd76272370dccef6ef3a802d3f8f8f5851187
+--- /dev/null
++++ b/web/src/lib/aeClaudeAccount.test.ts
+@@ -0,0 +1,56 @@
++import { describe, expect, it } from "vitest";
++import { aeChatAccount, aeMoveAllSummary } from "./aeClaudeAccount";
++import { aeOtherClaudeAccounts } from "./aeLimitGate";
++import { askAeMoveAll, dismissAeMoveAll } from "./aeMoveAllChats";
++
++describe("aeChatAccount", () => {
++  it("prefers the stored pick over the last launch, and treats an empty pick as the default", () => {
++    expect(aeChatAccount({ "ae.claude_account": "B" })).toBe("B");
++    expect(aeChatAccount({ "omnigent.claude_native.account": "", "ae.claude_account": "B" })).toBe(
++      "",
++    );
++    expect(aeChatAccount({})).toBeUndefined();
++    expect(aeChatAccount(null)).toBeUndefined();
++  });
++});
++
++describe("aeMoveAllSummary", () => {
++  it("names the moved count and each skipped chat", () => {
++    expect(
++      aeMoveAllSummary({
++        moved: ["a"],
++        skipped: [
++          { id: "b", title: "Fix CI", reason: "mid-reply" },
++          { id: "c", title: "Docs", reason: "Claude account selection requires a connected host." },
++        ],
++        pending: [],
++      }),
++    ).toBe(
++      "Moved 1 chat; 2 skipped: Fix CI is mid-reply, Docs: Claude account selection requires a connected host.",
++    );
++    expect(aeMoveAllSummary({ moved: ["a", "b"], skipped: [], pending: [] })).toBe("Moved 2 chats");
++  });
++});
++
++describe("aeOtherClaudeAccounts", () => {
++  const rows = [
++    { family: "claude-oauth-active", source: "AE Default", env_var: "" },
++    { family: "claude-oauth", source: "Backup", env_var: "Backup" },
++  ];
++  it("lists the logins other than the chat's own, else other than the selected one", () => {
++    expect(aeOtherClaudeAccounts(rows, "Backup")).toEqual([{ account: "", label: "AE Default" }]);
++    expect(aeOtherClaudeAccounts(rows, undefined)).toEqual([
++      { account: "Backup", label: "Backup" },
++    ]);
++  });
++  it("lists none on provider credentials", () => {
++    expect(aeOtherClaudeAccounts([...rows, { family: "claude-provider-env" }], "")).toEqual([]);
++  });
++});
++
++describe("askAeMoveAll", () => {
++  it("is a store the shell's dialog reads", () => {
++    askAeMoveAll({ account: "", label: "AE Default", hostId: undefined });
++    dismissAeMoveAll();
++  });
++});
+diff --git a/web/src/lib/aeClaudeAccount.ts b/web/src/lib/aeClaudeAccount.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..4ab2a9f3b31c9907aaabc8b36e76b9b4d3b68744
+--- /dev/null
++++ b/web/src/lib/aeClaudeAccount.ts
+@@ -0,0 +1,101 @@
++// Switching a Claude chat's login in place, or every open chat's (omnigent-ae,
++// 2026-10-27). A chat stays on the login it started with; `PUT
++// /v1/ae/sessions/{id}/claude-account` stores a new one and restarts the chat's
++// Claude terminal on it, `POST /v1/ae/claude-account/move-all` does that for
++// every open chat the caller owns (packages/ae_omni_policies/.../claude_account.py).
++
++import type { QueryClient } from "@tanstack/react-query";
++import { authenticatedFetch } from "@/lib/identity";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
++
++/** The login a fork or an in-place switch stored on the session (server-internal label). */
++export const AE_SERVER_ACCOUNT_LABEL = "omnigent.claude_native.account";
++/** The login the chat's terminal last launched on; "" is the default login. */
++export const AE_LIVE_ACCOUNT_LABEL = "ae.claude_account";
++
++export const AE_THIS_CHAT_HEADING = "This chat";
++export const AE_NEW_CHATS_HEADING = "New chats";
++export const AE_THIS_CHAT_HINT =
++  "Restarts this chat on that login and resumes it. Its next reply re-reads the conversation, which costs extra tokens on that subscription.";
++export const AE_THIS_CHAT_BUSY_HINT =
++  "Claude is replying. Wait for the reply, or stop it, then switch.";
++
++export const AE_MOVE_ALL_CAUTION =
++  "Each moved chat restarts on the new login and resumes its conversation; its next reply re-reads the conversation, which costs extra tokens on that subscription. Chats that are mid-reply are skipped.";
++
++export interface AeSwitchAnswer {
++  account: string;
++  /** False when no runner is bound (the next launch uses the login) or the restart is unconfirmed. */
++  relaunched: boolean;
++  pending?: boolean;
++}
++
++export interface AeMoveAllAnswer {
++  moved: string[];
++  skipped: { id: string; title: string; reason: string }[];
++  /** Still switching when the server answered; they finish on their own. */
++  pending: { id: string; title: string; reason: string }[];
++}
++
++/** Re-read a chat's labels and its Usage numbers after its login changed. */
++export function aeRefreshChatAccount(queryClient: QueryClient, sessionId: string | null): void {
++  void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
++  if (sessionId) void queryClient.invalidateQueries({ queryKey: ["ae-limits", sessionId] });
++}
++
++/** The login a chat is on: the stored pick, else the last launch's, else unknown (`undefined`). */
++export function aeChatAccount(
++  labels: Record<string, string> | null | undefined,
++): string | undefined {
++  const held = labels ?? {};
++  return held[AE_SERVER_ACCOUNT_LABEL] ?? held[AE_LIVE_ACCOUNT_LABEL];
++}
++
++export async function putAeClaudeAccount(
++  sessionId: string,
++  account: string,
++): Promise<AeSwitchAnswer> {
++  const res = await authenticatedFetch(
++    `/v1/ae/sessions/${encodeURIComponent(sessionId)}/claude-account`,
++    {
++      method: "PUT",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ account }),
++    },
++  );
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  return (await res.json()) as AeSwitchAnswer;
++}
++
++export async function moveAllAeClaudeChats(
++  account: string,
++  hostId: string | undefined,
++): Promise<AeMoveAllAnswer> {
++  const res = await authenticatedFetch("/v1/ae/claude-account/move-all", {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify(hostId ? { account, host_id: hostId } : { account }),
++  });
++  if (!res.ok) throw await apiErrorFromResponse(res);
++  const body = (await res.json()) as Partial<AeMoveAllAnswer> | null;
++  return { moved: body?.moved ?? [], skipped: body?.skipped ?? [], pending: body?.pending ?? [] };
++}
++
++/** One line for the result, e.g. "Moved 4 chats; 1 skipped: Fix CI is mid-reply". */
++export function aeMoveAllSummary(answer: AeMoveAllAnswer): string {
++  const count = answer.moved.length;
++  const moved = `Moved ${count} ${count === 1 ? "chat" : "chats"}`;
++  const parts: string[] = [];
++  if (answer.pending.length > 0) {
++    parts.push(
++      `${answer.pending.length} still switching: ${answer.pending.map((s) => s.title).join(", ")}`,
++    );
++  }
++  if (answer.skipped.length > 0) {
++    const why = answer.skipped.map((s) =>
++      s.reason === "mid-reply" ? `${s.title} is mid-reply` : `${s.title}: ${s.reason}`,
++    );
++    parts.push(`${answer.skipped.length} skipped: ${why.join(", ")}`);
++  }
++  return parts.length === 0 ? moved : `${moved}; ${parts.join("; ")}`;
++}
+diff --git a/web/src/lib/aeLimitGate.ts b/web/src/lib/aeLimitGate.ts
+index d22364b1db1489ce4eb95c48c8acf6c1bf5c3137..9974f28fa5d6913710ef8e8c95279bb09358b20f 100644
+--- a/web/src/lib/aeLimitGate.ts
++++ b/web/src/lib/aeLimitGate.ts
+@@ -190,6 +190,39 @@ export function aeLimitGateShort(gate: AeLimitGate): string {
+ export interface AeLimitCredentialRow {
+   family: string;
+   env_var?: string | null;
++  /** The login's display name. */
++  source?: string | null;
++}
++
++/** A Claude login a chat can move to. */
++export interface AeAccountChoice {
++  /** The login's id; "" is the default login. */
++  account: string;
++  label: string;
++}
++
++/**
++ * The Claude logins other than the one this chat runs on, in the host's order;
++ * none on a host signed in with provider credentials. `currentAccount` is the
++ * chat's login; without one it runs on the host's selected login.
++ */
++export function aeOtherClaudeAccounts(
++  rows: readonly AeLimitCredentialRow[],
++  currentAccount: string | null | undefined,
++): AeAccountChoice[] {
++  if (rows.some((row) => row.family.startsWith("claude-provider"))) return [];
++  const logins = rows.filter((row) => row.family.startsWith("claude-oauth"));
++  const active = logins.find((row) => row.family === "claude-oauth-active");
++  const current = currentAccount ?? active?.env_var ?? "";
++  const seen = new Set<string>();
++  const choices: AeAccountChoice[] = [];
++  for (const row of logins) {
++    const account = row.env_var ?? "";
++    if (account === current || seen.has(account)) continue;
++    seen.add(account);
++    choices.push({ account, label: row.source || (account === "" ? "Default login" : account) });
++  }
++  return choices;
+ }
+ 
+ /**
+diff --git a/web/src/lib/aeMoveAllChats.ts b/web/src/lib/aeMoveAllChats.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c18e51ad81473173e12e4679ffebc875fe315924
+--- /dev/null
++++ b/web/src/lib/aeMoveAllChats.ts
+@@ -0,0 +1,40 @@
++// The "Move all open chats?" question that follows a change of the Claude login
++// new chats use (omnigent-ae, 2026-10-27). The pickers (composer menu, Settings)
++// unmount when they close, so the question lives in this small store and one
++// dialog mounted in the app shell shows it.
++
++import { useSyncExternalStore } from "react";
++
++export interface AeMoveAllRequest {
++  /** The login's id; "" is the default login. */
++  account: string;
++  label: string;
++  hostId: string | undefined;
++}
++
++let current: AeMoveAllRequest | null = null;
++const listeners = new Set<() => void>();
++
++function emit(next: AeMoveAllRequest | null): void {
++  current = next;
++  for (const listener of listeners) listener();
++}
++
++/** Ask the user whether to move every open chat to the login just picked for new chats. */
++export function askAeMoveAll(request: AeMoveAllRequest): void {
++  emit(request);
++}
++
++export function dismissAeMoveAll(): void {
++  emit(null);
++}
++
++export function useAeMoveAllRequest(): AeMoveAllRequest | null {
++  return useSyncExternalStore(
++    (listener) => {
++      listeners.add(listener);
++      return () => listeners.delete(listener);
++    },
++    () => current,
++  );
++}
+diff --git a/web/src/lib/aePickDefaultClaudeAccount.ts b/web/src/lib/aePickDefaultClaudeAccount.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..9078e86a3eb7feaba767befa5f75366701a71fd3
+--- /dev/null
++++ b/web/src/lib/aePickDefaultClaudeAccount.ts
+@@ -0,0 +1,31 @@
++// Pick the Claude login new chats use, then ask whether every open chat should
++// move to it too (omnigent-ae, 2026-10-27). Wraps the `claude-oauth-select`
++// write the composer menu and Settings both make.
++
++import { askAeMoveAll } from "@/lib/aeMoveAllChats";
++import type { StoreCredentialInput } from "@/hooks/useHosts";
++
++interface SelectMutation {
++  mutate: (
++    input: StoreCredentialInput,
++    options: { onSuccess?: () => void; onError?: (error: Error) => void },
++  ) => void;
++}
++
++export function aePickDefaultClaudeAccount(store: SelectMutation, hostId: string | undefined) {
++  return (
++    account: string,
++    label: string,
++    callbacks: { onSuccess?: () => void; onError?: (error: Error) => void } = {},
++  ) =>
++    store.mutate(
++      { harness: "claude-native", kind: "claude-oauth-select", account_name: account },
++      {
++        onSuccess: () => {
++          callbacks.onSuccess?.();
++          askAeMoveAll({ account, label, hostId });
++        },
++        onError: callbacks.onError,
++      },
++    );
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 5ac397e68c41240465bd5742613c582b4477b0ae..df25338d58a75bd33c25341cb69786c094443756 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -4746,7 +4746,12 @@ function SessionHarnessPicker({
+     <div onKeyDown={pickModelByDigit} data-testid="composer-agent-config-content">
+       {showClaudeAccounts && (
+         <>
+-          <AeClaudeAccountSubmenu host={accountHost} disabled={picksBusy} />
++          <AeClaudeAccountSubmenu
++            host={accountHost}
++            disabled={picksBusy}
++            sessionId={conversationId}
++            turnBusy={busy}
++          />
+           {showModels && <DropdownMenuSeparator />}
+         </>
+       )}
+diff --git a/web/src/shell/AeClaudeAccountSubmenu.tsx b/web/src/shell/AeClaudeAccountSubmenu.tsx
+index c4ef69d74f704b3f495637a674ac5e996433655c..4f08523a8da654a28b84397e9713bed32bf90501 100644
+--- a/web/src/shell/AeClaudeAccountSubmenu.tsx
++++ b/web/src/shell/AeClaudeAccountSubmenu.tsx
+@@ -13,8 +13,11 @@ import {
+ } from "@/components/ui/dropdown-menu";
+ import { useDetectedCredentials, useStoreCredential, type Host } from "@/hooks/useHosts";
+ import { AE_MENU_NOTE_CLASS, AE_MENU_ROW_CLASS, AE_MENU_WIDTH_CLASS } from "@/lib/aeMenuRow";
++import { aePickDefaultClaudeAccount } from "@/lib/aePickDefaultClaudeAccount";
+ import { AeSharedAccountMarker, aeIsSharedAccount } from "@/lib/aeSharedClaudeAccounts";
++import { isTempConvId } from "@/lib/tempConversationId";
+ import { cn } from "@/lib/utils";
++import { AeChatAccountName, AeThisChatAccounts } from "./AeSessionClaudeAccountGroup";
+ 
+ /** The row changes the host's default for new chats; a running chat keeps its login. */
+ export const AE_ACCOUNT_SCOPE = "For new chats. This chat keeps the login it started with.";
+@@ -23,16 +26,23 @@ export function AeClaudeAccountSubmenu({
+   host,
+   disabled = false,
+   scope = AE_ACCOUNT_SCOPE,
++  sessionId,
++  turnBusy = false,
+ }: {
+   host: Host | null | undefined;
+   /** Another configuration change is running. */
+   disabled?: boolean;
+   /** What the pick applies to, shown above the rows and as the row's tooltip. */
+   scope?: string;
++  /** Inside a chat: its login gets a "This chat" group above the new-chat default. */
++  sessionId?: string | null;
++  /** A reply is running in that chat, so it cannot be switched now. */
++  turnBusy?: boolean;
+ }) {
+   const [error, setError] = useState<string | null>(null);
+   const accounts = useDetectedCredentials(host?.host_id, !!host);
+   const store = useStoreCredential(host?.host_id ?? "");
++  const pickDefault = aePickDefaultClaudeAccount(store, host?.host_id);
+   if (!host) return null;
+   const rows = (accounts.data ?? []).filter((row) => row.family.startsWith("claude-oauth"));
+   const active = rows.find((row) => row.family === "claude-oauth-active");
+@@ -44,6 +54,14 @@ export function AeClaudeAccountSubmenu({
+     : rows.length === 0
+       ? "Loading…"
+       : (active?.source ?? "Default CLI account");
++  // A chat on provider credentials has no subscription login to switch, and a new
++  // chat's `temp:` id has no server session to switch yet.
++  const chatSession =
++    rows.length > 0 &&
++    !isTempConvId(sessionId) &&
++    !(accounts.data ?? []).some((row) => row.family.startsWith("claude-provider"))
++      ? sessionId
++      : null;
+   return (
+     <DropdownMenuSub>
+       <DropdownMenuSubTrigger
+@@ -56,10 +74,17 @@ export function AeClaudeAccountSubmenu({
+           className="ml-auto min-w-0 truncate text-muted-foreground"
+           data-testid="composer-claude-account-value"
+         >
+-          {value}
++          {sessionId && !isTempConvId(sessionId) && !unavailable ? (
++            <AeChatAccountName sessionId={sessionId} rows={rows} fallback={value} />
++          ) : (
++            value
++          )}
+         </span>
+       </DropdownMenuSubTrigger>
+       <DropdownMenuSubContent className={cn(AE_MENU_WIDTH_CLASS, "max-h-[70vh] overflow-y-auto")}>
++        {chatSession && (
++          <AeThisChatAccounts sessionId={chatSession} rows={rows} turnBusy={turnBusy} />
++        )}
+         <p
+           className={cn(AE_MENU_NOTE_CLASS, "px-2 pt-1 pb-1.5 text-xs text-muted-foreground")}
+           data-testid="composer-claude-account-scope"
+@@ -78,14 +103,9 @@ export function AeClaudeAccountSubmenu({
+               onSelect={(event) => event.preventDefault()}
+               onCheckedChange={() => {
+                 setError(null);
+-                store.mutate(
+-                  {
+-                    harness: "claude-native",
+-                    kind: "claude-oauth-select",
+-                    account_name: accountId,
+-                  },
+-                  { onError: (failure) => setError(failure.message) },
+-                );
++                pickDefault(accountId, row.source, {
++                  onError: (failure) => setError(failure.message),
++                });
+               }}
+               data-testid={`composer-claude-account-${accountId || "default"}`}
+             >
+diff --git a/web/src/shell/AeMoveAllChatsDialog.test.tsx b/web/src/shell/AeMoveAllChatsDialog.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fdc0b2bc3c11b07c6ccf2668f75c4b58eeab089
+--- /dev/null
++++ b/web/src/shell/AeMoveAllChatsDialog.test.tsx
+@@ -0,0 +1,93 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { AeMoveAllChatsDialog } from "./AeMoveAllChatsDialog";
++import { askAeMoveAll, dismissAeMoveAll } from "@/lib/aeMoveAllChats";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
++import { showToast } from "@/components/ui/toast";
++import { authenticatedFetch } from "@/lib/identity";
++
++const json = (body: unknown, status = 200) =>
++  Promise.resolve(new Response(JSON.stringify(body), { status }));
++
++beforeEach(() => {
++  vi.mocked(authenticatedFetch).mockReset();
++  vi.mocked(showToast).mockReset();
++});
++afterEach(() => act(() => dismissAeMoveAll()));
++
++let queryClient: QueryClient;
++
++function ask() {
++  queryClient = new QueryClient();
++  render(
++    <QueryClientProvider client={queryClient}>
++      <AeMoveAllChatsDialog />
++    </QueryClientProvider>,
++  );
++  act(() => askAeMoveAll({ account: "AE Backup", label: "AE Backup", hostId: "host" }));
++}
++
++describe("AeMoveAllChatsDialog", () => {
++  it("asks with the caution and focuses Only new chats", async () => {
++    ask();
++    expect(await screen.findByText("Move all open chats to AE Backup?")).toBeTruthy();
++    expect(screen.getByText(/costs extra tokens on that subscription/)).toBeTruthy();
++    expect(screen.getByText(/Chats that are mid-reply are skipped/)).toBeTruthy();
++    await waitFor(() =>
++      expect(document.activeElement).toBe(screen.getByTestId("ae-move-all-keep")),
++    );
++  });
++
++  it("Only new chats closes without calling the server", async () => {
++    ask();
++    fireEvent.click(await screen.findByTestId("ae-move-all-keep"));
++    await waitFor(() => expect(screen.queryByTestId("ae-move-all-dialog")).toBeNull());
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++  });
++
++  it("Move all chats posts the login and reports one line", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({
++        moved: ["a", "b", "c", "d"],
++        skipped: [{ id: "e", title: "Fix CI", reason: "mid-reply" }],
++        pending: [{ id: "f", title: "Slow chat", reason: "still switching" }],
++      }),
++    );
++    ask();
++    const invalidate = vi.spyOn(queryClient, "invalidateQueries");
++    fireEvent.click(await screen.findByTestId("ae-move-all-confirm"));
++    await waitFor(() =>
++      expect(showToast).toHaveBeenCalledWith(
++        "Moved 4 chats; 1 still switching: Slow chat; 1 skipped: Fix CI is mid-reply",
++      ),
++    );
++    // Every moved (or still switching) chat re-reads its labels and its Usage numbers.
++    for (const id of ["a", "b", "c", "d", "f"]) {
++      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", id] });
++      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["ae-limits", id] });
++    }
++    expect(invalidate).not.toHaveBeenCalledWith({ queryKey: ["session", "e"] });
++    expect(authenticatedFetch).toHaveBeenCalledWith(
++      "/v1/ae/claude-account/move-all",
++      expect.objectContaining({
++        method: "POST",
++        body: JSON.stringify({ account: "AE Backup", host_id: "host" }),
++      }),
++    );
++    expect(screen.queryByTestId("ae-move-all-dialog")).toBeNull();
++  });
++
++  it("reports a failed move", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "Could not move." } }, 500),
++    );
++    ask();
++    fireEvent.click(await screen.findByTestId("ae-move-all-confirm"));
++    await waitFor(() =>
++      expect(showToast).toHaveBeenCalledWith(expect.stringContaining("Could not")),
++    );
++  });
++});
+diff --git a/web/src/shell/AeMoveAllChatsDialog.tsx b/web/src/shell/AeMoveAllChatsDialog.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..77b130ae04af93ce489ec151a8373a2d4148d09f
+--- /dev/null
++++ b/web/src/shell/AeMoveAllChatsDialog.tsx
+@@ -0,0 +1,80 @@
++// "Move all open chats to <login>?" (omnigent-ae, 2026-10-27). Shown after the
++// login for new chats changes; mounted once in the app shell. "Only new chats"
++// holds the initial focus, so Enter keeps the pick as it was before this existed.
++
++import { useQueryClient } from "@tanstack/react-query";
++import { useRef } from "react";
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { showToast } from "@/components/ui/toast";
++import {
++  AE_MOVE_ALL_CAUTION,
++  aeMoveAllSummary,
++  aeRefreshChatAccount,
++  moveAllAeClaudeChats,
++} from "@/lib/aeClaudeAccount";
++import { dismissAeMoveAll, useAeMoveAllRequest } from "@/lib/aeMoveAllChats";
++
++export function AeMoveAllChatsDialog() {
++  const request = useAeMoveAllRequest();
++  const queryClient = useQueryClient();
++  const keepRef = useRef<HTMLButtonElement>(null);
++  const moveAll = () => {
++    if (!request) return;
++    const { account, hostId } = request;
++    dismissAeMoveAll();
++    moveAllAeClaudeChats(account, hostId).then(
++      (answer) => {
++        for (const id of [...answer.moved, ...answer.pending.map((p) => p.id)]) {
++          aeRefreshChatAccount(queryClient, id);
++        }
++        showToast(aeMoveAllSummary(answer));
++      },
++      (failure: unknown) =>
++        showToast(failure instanceof Error ? failure.message : "Could not move the open chats."),
++    );
++  };
++  return (
++    <Dialog open={request !== null} onOpenChange={(open) => !open && dismissAeMoveAll()}>
++      <DialogContent
++        data-testid="ae-move-all-dialog"
++        onOpenAutoFocus={(event) => {
++          event.preventDefault();
++          keepRef.current?.focus();
++        }}
++      >
++        <DialogHeader>
++          <DialogTitle>Move all open chats to {request?.label}?</DialogTitle>
++          <DialogDescription>{AE_MOVE_ALL_CAUTION}</DialogDescription>
++        </DialogHeader>
++        <DialogFooter>
++          <Button
++            ref={keepRef}
++            type="button"
++            variant="outline"
++            onClick={dismissAeMoveAll}
++            title="Keep every open chat on the login it has; only new chats use this one"
++            data-testid="ae-move-all-keep"
++          >
++            Only new chats
++          </Button>
++          <Button
++            type="button"
++            onClick={moveAll}
++            title="Restart each open chat on this login"
++            data-testid="ae-move-all-confirm"
++          >
++            Move all chats
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/web/src/shell/AeSessionClaudeAccountGroup.test.tsx b/web/src/shell/AeSessionClaudeAccountGroup.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f81d3a44696a471ce5bfab083cf1dbc384e5b679
+--- /dev/null
++++ b/web/src/shell/AeSessionClaudeAccountGroup.test.tsx
+@@ -0,0 +1,158 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { fireEvent, render, screen, waitFor } from "@testing-library/react";
++import { beforeEach, describe, expect, it, vi } from "vitest";
++import { AeClaudeAccountSubmenu } from "./AeClaudeAccountSubmenu";
++import { DropdownMenu, DropdownMenuContent } from "@/components/ui/dropdown-menu";
++import type { Host } from "@/hooks/useHosts";
++import { dismissAeMoveAll } from "@/lib/aeMoveAllChats";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++import { authenticatedFetch } from "@/lib/identity";
++
++const mutate = vi.fn();
++let rows: { family: string; source: string; env_var: string }[] = [];
++let labels: Record<string, string> = {};
++vi.mock("@/hooks/useHosts", () => ({
++  useDetectedCredentials: () => ({ data: rows, isError: false, isSuccess: true }),
++  useStoreCredential: () => ({ mutate, isPending: false }),
++}));
++vi.mock("@/hooks/useSession", () => ({
++  useSession: () => ({ session: { id: "s1", hostId: "host", labels }, isLoading: false }),
++}));
++
++const host = { host_id: "host", name: "Laptop" } as Host;
++const json = (body: unknown, status = 200) =>
++  Promise.resolve(new Response(JSON.stringify(body), { status }));
++
++let qc: QueryClient;
++
++function renderMenu(turnBusy = false, sessionId = "s1") {
++  qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  render(
++    <QueryClientProvider client={qc}>
++      <DropdownMenu open>
++        <DropdownMenuContent>
++          <AeClaudeAccountSubmenu host={host} sessionId={sessionId} turnBusy={turnBusy} />
++        </DropdownMenuContent>
++      </DropdownMenu>
++    </QueryClientProvider>,
++  );
++  fireEvent.keyDown(screen.getByTestId("composer-claude-account"), { key: "ArrowRight" });
++}
++
++beforeEach(() => {
++  mutate.mockReset();
++  vi.mocked(authenticatedFetch).mockReset();
++  dismissAeMoveAll();
++  labels = { "ae.claude_account": "AE Backup" };
++  rows = [
++    { family: "claude-oauth-active", source: "AE Default", env_var: "" },
++    { family: "claude-oauth", source: "AE Backup", env_var: "AE Backup" },
++  ];
++});
++
++describe("Account submenu inside a chat", () => {
++  it("has a This chat group ticked by the live label and a New chats group below it", () => {
++    renderMenu();
++    expect(screen.getByTestId("composer-claude-account-chat")).toHaveTextContent("This chat");
++    expect(screen.getByTestId("composer-claude-account-new")).toHaveTextContent("New chats");
++    const backup = screen.getByTestId("composer-claude-account-chat-AE Backup");
++    expect(backup).toHaveAttribute("role", "menuitemradio");
++    expect(backup).toHaveAttribute("aria-checked", "true");
++    expect(screen.getByTestId("composer-claude-account-chat-default")).toHaveAttribute(
++      "aria-checked",
++      "false",
++    );
++    // The new-chat rows are the host default (the active row), a separate list.
++    expect(screen.getByTestId("composer-claude-account-default")).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++    expect(screen.getByTestId("composer-claude-account-value")).toHaveTextContent("AE Backup");
++  });
++
++  it("the server label outranks the live label", () => {
++    labels = { "omnigent.claude_native.account": "", "ae.claude_account": "AE Backup" };
++    renderMenu();
++    expect(screen.getByTestId("composer-claude-account-chat-default")).toHaveAttribute(
++      "aria-checked",
++      "true",
++    );
++  });
++
++  it("picking a login calls the PUT, then re-reads the chat and its Usage", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => json({ account: "", relaunched: true }));
++    renderMenu();
++    const invalidate = vi.spyOn(qc, "invalidateQueries");
++    fireEvent.click(screen.getByTestId("composer-claude-account-chat-default"));
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        "/v1/ae/sessions/s1/claude-account",
++        expect.objectContaining({ method: "PUT", body: JSON.stringify({ account: "" }) }),
++      ),
++    );
++    await waitFor(() => {
++      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "s1"] });
++      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["ae-limits", "s1"] });
++    });
++  });
++
++  it("names a removed login as unavailable, never as the host's active one", () => {
++    labels = { "omnigent.claude_native.account": "Gone" };
++    renderMenu();
++    const value = screen.getByTestId("composer-claude-account-value");
++    expect(value).toHaveTextContent("Gone (unavailable)");
++    expect(value).not.toHaveTextContent("AE Default");
++    expect(screen.getByTestId("composer-claude-account-unavailable")).toHaveClass(
++      "text-destructive",
++    );
++  });
++
++  it("gives a new chat's temp id no This chat group and shows the new-chat default", () => {
++    renderMenu(false, "temp:new-1");
++    expect(screen.queryByTestId("composer-claude-account-chat")).toBeNull();
++    expect(screen.queryByTestId("composer-claude-account-new")).toBeNull();
++    expect(screen.getByTestId("composer-claude-account-value")).toHaveTextContent("AE Default");
++  });
++
++  it("shows the server's refusal under the rows", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "Claude is mid-reply or waiting on an approval." } }, 409),
++    );
++    renderMenu();
++    fireEvent.click(screen.getByTestId("composer-claude-account-chat-default"));
++    expect(await screen.findByTestId("composer-claude-account-chat-error")).toHaveTextContent(
++      "mid-reply",
++    );
++  });
++
++  it("is disabled with the reason while a reply runs", () => {
++    renderMenu(true);
++    const row = screen.getByTestId("composer-claude-account-chat-default");
++    expect(row).toHaveAttribute("aria-disabled", "true");
++    expect(screen.getByTestId("composer-claude-account-chat-busy")).toHaveTextContent(
++      "Claude is replying",
++    );
++    fireEvent.click(row);
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++  });
++
++  it("hides This chat for a chat on provider credentials", () => {
++    rows = [...rows, { family: "claude-provider-env", source: "Gateway", env_var: "X" }];
++    renderMenu();
++    expect(screen.queryByTestId("composer-claude-account-chat")).toBeNull();
++    expect(screen.queryByTestId("composer-claude-account-new")).toBeNull();
++  });
++
++  it("picking a new-chat default asks whether to move every open chat", () => {
++    mutate.mockImplementation((_input: unknown, options: { onSuccess?: () => void }) =>
++      options.onSuccess?.(),
++    );
++    renderMenu();
++    fireEvent.click(screen.getByTestId("composer-claude-account-AE Backup"));
++    expect(mutate).toHaveBeenCalledWith(
++      { harness: "claude-native", kind: "claude-oauth-select", account_name: "AE Backup" },
++      expect.anything(),
++    );
++  });
++});
+diff --git a/web/src/shell/AeSessionClaudeAccountGroup.tsx b/web/src/shell/AeSessionClaudeAccountGroup.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..189fe5044174fa278d998ac82148ff77a6cf12ef
+--- /dev/null
++++ b/web/src/shell/AeSessionClaudeAccountGroup.tsx
+@@ -0,0 +1,129 @@
++// The "This chat" group of the composer's Account submenu (omnigent-ae,
++// 2026-10-27): the Claude login this chat runs on, ticked, and a pick restarts
++// the chat on that login (`PUT /v1/ae/sessions/{id}/claude-account`). A pick is
++// refused while a reply runs, or when the server says no; the reason shows
++// under the rows. The "New chats" heading below it belongs to the same split.
++
++import {
++  DropdownMenuLabel,
++  DropdownMenuRadioGroup,
++  DropdownMenuRadioItem,
++  DropdownMenuSeparator,
++} from "@/components/ui/dropdown-menu";
++import { useAeSwitchClaudeAccount } from "@/hooks/useAeSwitchClaudeAccount";
++import type { DetectedCredential } from "@/hooks/useHosts";
++import { useSession } from "@/hooks/useSession";
++import {
++  AE_NEW_CHATS_HEADING,
++  AE_THIS_CHAT_BUSY_HINT,
++  AE_THIS_CHAT_HEADING,
++  AE_THIS_CHAT_HINT,
++  aeChatAccount,
++} from "@/lib/aeClaudeAccount";
++import { AE_MENU_NOTE_CLASS } from "@/lib/aeMenuRow";
++import { AeSharedAccountMarker, aeIsSharedAccount } from "@/lib/aeSharedClaudeAccounts";
++import { cn } from "@/lib/utils";
++
++// Radix radio values are never empty here: "" is the default login's id.
++const DEFAULT_VALUE = "__default__";
++const UNKNOWN_VALUE = "__unknown__";
++const toValue = (account: string) => (account === "" ? DEFAULT_VALUE : account);
++
++const RADIO_ROW_CLASS =
++  "min-h-8 pr-2! pl-7! whitespace-normal break-words [&>[data-slot=dropdown-menu-radio-item-indicator]]:right-auto [&>[data-slot=dropdown-menu-radio-item-indicator]]:left-1.5";
++
++/**
++ * The login name the trigger shows for this chat, or `fallback` while it is
++ * unknown. A login the host no longer lists shows as unavailable, never as the
++ * host's active one.
++ */
++export function AeChatAccountName({
++  sessionId,
++  rows,
++  fallback,
++}: {
++  sessionId: string;
++  rows: readonly DetectedCredential[];
++  fallback: string;
++}) {
++  const { session } = useSession(sessionId);
++  const account = aeChatAccount(session?.labels);
++  if (account === undefined) return fallback;
++  const row = rows.find((r) => (r.env_var ?? "") === account);
++  if (row) return row.source;
++  const name = account === "" ? "Default login" : account.replace(/^shared:/, "");
++  return (
++    <span className="text-destructive" data-testid="composer-claude-account-unavailable">
++      {name} (unavailable)
++    </span>
++  );
++}
++
++export function AeThisChatAccounts({
++  sessionId,
++  rows,
++  turnBusy,
++}: {
++  sessionId: string;
++  rows: readonly DetectedCredential[];
++  /** A reply is running, so the chat cannot restart. */
++  turnBusy: boolean;
++}) {
++  const { session } = useSession(sessionId);
++  const change = useAeSwitchClaudeAccount(sessionId);
++  const current = aeChatAccount(session?.labels);
++  const disabled = turnBusy || change.isPending;
++  return (
++    <>
++      <DropdownMenuLabel className="px-2 py-1 text-xs" data-testid="composer-claude-account-chat">
++        {AE_THIS_CHAT_HEADING}
++      </DropdownMenuLabel>
++      <DropdownMenuRadioGroup
++        value={current === undefined ? UNKNOWN_VALUE : toValue(current)}
++        aria-label={AE_THIS_CHAT_HEADING}
++      >
++        {rows.map((row) => {
++          const accountId = row.env_var ?? "";
++          return (
++            <DropdownMenuRadioItem
++              key={accountId}
++              value={toValue(accountId)}
++              disabled={disabled}
++              title={turnBusy ? AE_THIS_CHAT_BUSY_HINT : AE_THIS_CHAT_HINT}
++              className={cn(RADIO_ROW_CLASS, "flex items-center gap-2")}
++              onSelect={(event) => {
++                event.preventDefault();
++                if (accountId !== current) change.mutate(accountId);
++              }}
++              data-testid={`composer-claude-account-chat-${accountId || "default"}`}
++            >
++              <span className="min-w-0 flex-1 truncate">{row.source}</span>
++              {aeIsSharedAccount(accountId) && <AeSharedAccountMarker />}
++            </DropdownMenuRadioItem>
++          );
++        })}
++      </DropdownMenuRadioGroup>
++      {turnBusy && (
++        <p
++          className={cn(AE_MENU_NOTE_CLASS, "px-2 py-1 text-xs text-muted-foreground")}
++          data-testid="composer-claude-account-chat-busy"
++        >
++          {AE_THIS_CHAT_BUSY_HINT}
++        </p>
++      )}
++      {change.error && (
++        <p
++          role="alert"
++          className={cn(AE_MENU_NOTE_CLASS, "px-2 py-1 text-xs text-destructive")}
++          data-testid="composer-claude-account-chat-error"
++        >
++          {change.error.message}
++        </p>
++      )}
++      <DropdownMenuSeparator />
++      <DropdownMenuLabel className="px-2 py-1 text-xs" data-testid="composer-claude-account-new">
++        {AE_NEW_CHATS_HEADING}
++      </DropdownMenuLabel>
++    </>
++  );
++}
+diff --git a/web/src/shell/AeSharedClaudeAccountsGroup.tsx b/web/src/shell/AeSharedClaudeAccountsGroup.tsx
+index f0beef679015ab8cb26d0c80eb1d5391385ab151..20ef21a4005290f90aa2b4373277b495cd4c17b7 100644
+--- a/web/src/shell/AeSharedClaudeAccountsGroup.tsx
++++ b/web/src/shell/AeSharedClaudeAccountsGroup.tsx
+@@ -23,6 +23,7 @@ import {
+   aeRelabelSharedClaudeAccount,
+   aeRemoveSharedClaudeAccount,
+ } from "@/lib/aeSharedClaudeAccounts";
++import { aePickDefaultClaudeAccount } from "@/lib/aePickDefaultClaudeAccount";
+ import { AE_PENCIL_ICON } from "@/lib/aePolicyEdit";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+@@ -79,6 +80,7 @@ export function AeSharedClaudeAccountsGroup({
+   onChanged: () => void;
+ }) {
+   const store = useStoreCredential(hostId);
++  const pickDefault = aePickDefaultClaudeAccount(store, hostId);
+   const invalidateAllHosts = useInvalidateDetectedCredentials();
+   const [list, setList] = useState<AeSharedClaudeAccountList | null>(null);
+   const [readError, setReadError] = useState<string | null>(null);
+@@ -261,17 +263,10 @@ export function AeSharedClaudeAccountsGroup({
+                     className="h-auto min-h-8 min-w-0 flex-1 whitespace-normal break-words"
+                     disabled={store.isPending || busy || isSelected}
+                     onClick={() =>
+-                      store.mutate(
+-                        {
+-                          harness: "claude-native",
+-                          kind: "claude-oauth-select",
+-                          account_name: row.account,
+-                        },
+-                        {
+-                          onSuccess: () => say("Account selected for new chats.", false),
+-                          onError: (error) => say(error.message, true),
+-                        },
+-                      )
++                      pickDefault(row.account, row.label, {
++                        onSuccess: () => say("Account selected for new chats.", false),
++                        onError: (error) => say(error.message, true),
++                      })
+                     }
+                   >
+                     {row.label}
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 11da52c69c5f9f287c6b2b31009d01b556b8e133..7154be826fff2bdc884c89c9006daccfeb6f4f47 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -12,6 +12,7 @@ import {
+ import { useQueryClient } from "@tanstack/react-query";
+ import { toast } from "sonner";
+ import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
++import { AeMoveAllChatsDialog } from "@/shell/AeMoveAllChatsDialog";
+ import { CANVAS_CONVERSATION_MIN_WIDTH, CanvasWorkspace } from "@/canvas/CanvasWorkspace";
+ import { isCanvasPathname } from "@/canvas/canvasNavigation";
+ import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
+@@ -2867,6 +2868,7 @@ export function AppShell() {
+               bottom: updateOverlayToastOffset(updateOverlayHeight),
+             }}
+           />
++          <AeMoveAllChatsDialog />
+         </ForkDialogContextProvider>
+       </TerminalFirstContextProvider>
+     </FileViewerContext.Provider>
+diff --git a/web/src/shell/ClaudeAccounts.tsx b/web/src/shell/ClaudeAccounts.tsx
+index 59a01772255e22d4f5ef4f1935aa3434ca109db3..8c0c77fb1ee79fc16e82c0c695483b906a7911cc 100644
+--- a/web/src/shell/ClaudeAccounts.tsx
++++ b/web/src/shell/ClaudeAccounts.tsx
+@@ -5,6 +5,7 @@ import { useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import { Input } from "@/components/ui/input";
+ import { useDetectedCredentials, useStoreCredential, type Host } from "@/hooks/useHosts";
++import { aePickDefaultClaudeAccount } from "@/lib/aePickDefaultClaudeAccount";
+ import { AeSharedAccountMarker, aeIsSharedAccount } from "@/lib/aeSharedClaudeAccounts";
+ 
+ /** Host-owned subscription choices; no token is returned by the discovery API. */
+@@ -25,6 +26,7 @@ export function ClaudeAccounts({
+   const [accountLabel, setAccountLabel] = useState("");
+   const accounts = useDetectedCredentials(host?.host_id, !!host);
+   const store = useStoreCredential(host?.host_id ?? "");
++  const pickDefault = aePickDefaultClaudeAccount(store, host?.host_id);
+   const addAccount = () => {
+     if (store.isPending || !name.trim() || !token.trim()) return;
+     store.mutate(
+@@ -106,23 +108,16 @@ export function ClaudeAccounts({
+                   }
+                   disabled={store.isPending || row.family === "claude-oauth-active"}
+                   onClick={() =>
+-                    store.mutate(
+-                      {
+-                        harness: "claude-native",
+-                        kind: "claude-oauth-select",
+-                        account_name: accountId,
++                    pickDefault(accountId, displayLabel, {
++                      onSuccess: () => {
++                        setMessageIsError(false);
++                        setMessage("Account selected for new chats.");
+                       },
+-                      {
+-                        onSuccess: () => {
+-                          setMessageIsError(false);
+-                          setMessage("Account selected for new chats.");
+-                        },
+-                        onError: (error) => {
+-                          setMessageIsError(true);
+-                          setMessage(error.message);
+-                        },
++                      onError: (error) => {
++                        setMessageIsError(true);
++                        setMessage(error.message);
+                       },
+-                    )
++                    })
+                   }
+                 >
+                   {displayLabel}

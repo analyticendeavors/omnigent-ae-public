@@ -173,6 +173,8 @@ from ae_omni_policies import (
     __version__,
     auto_archive,
     azure_cost,
+    child_wake,
+    claude_account,
     cost_targets,
     databricks,
     deploy_hold,
@@ -1086,16 +1088,35 @@ async def limits_view(
     is today's, not the session's, so an older session must not take it. A
     forked session's own server label (``omnigent.claude_native.account``)
     outranks the hint, is trusted as it is, and has no age limit. Both are
-    ignored for a session the caller cannot open, and ``account`` alone,
-    with no ``session_id``, does nothing.
+    ignored for a session the caller cannot open.
+
+    The runner's live label (``ae.claude_account``, 2026-10-27) names the login
+    the session's terminal last launched on, relaunches included, and outranks
+    every other source: live label, then the relay's entry, the fork label, the
+    hint, nothing. It must name a login the host lists (or the default, ``""``)
+    but has no age limit.
+
+    ``account`` with no session (none given, one the caller cannot open, or a
+    new chat's ``temp:`` id; 2026-10-27) answers the Claude entry for that
+    login alone, which the Usage card's subscription switcher asks for: the
+    host reading for the default login, else the login's newest stored reading,
+    else empty with a note. A login the host does not list gets empty windows and a note naming it.
     """
     named: str | None = limits.UNSET
+    live: str | None = limits.UNSET
     trusted = False
-    if session_id is not None and not await _may_open_session(request, user, session_id):
+    if session_id is not None and (
+        session_id.startswith("temp:") or not await _may_open_session(request, user, session_id)
+    ):
         session_id = None
-    if session_id is not None:
+    if session_id is None and account is not None:
+        named = account or None
+    elif session_id is not None:
         conv = await _session_for_limits(session_id)
-        stamped = (conv.labels or {}).get(CLAUDE_ACCOUNT_LABEL_KEY) if conv is not None else None
+        labels = (conv.labels or {}) if conv is not None else {}
+        stamped = labels.get(CLAUDE_ACCOUNT_LABEL_KEY)
+        if (live_label := labels.get(limits.ACCOUNT_LIVE_LABEL)) is not None:
+            live = live_label or None
         if stamped is not None:
             named, trusted = stamped or None, True
         elif account is not None and conv is not None:
@@ -1103,7 +1124,7 @@ async def limits_view(
             if 0 <= age <= LIMITS_HINT_WINDOW_S:
                 named = account or None
     return await asyncio.to_thread(
-        limits.store().view, session_id=session_id, account=named, trusted=trusted
+        limits.store().view, session_id=session_id, account=named, trusted=trusted, live=live
     )
 
 
@@ -4109,8 +4130,13 @@ async def databricks_refresh(
 DEBUG_ROUTERS: list[tuple[APIRouter, str, list[str]]] = [
     (router, "/v1/ae", ["ae"]),
     (shared_accounts_routes.router, "/v1/ae", ["ae"]),
+    # Switch a chat's Claude login in place, or every open chat's (2026-10-27).
+    (claude_account.router, "/v1/ae", ["ae"]),
     # No routes: included for its lifespan, which runs the merge watcher (2026-10-21).
     (merge_watch.lifespan_router, "", ["ae"]),
+    # No routes: included for its lifespan, which wakes an idle lead
+    # when its child's prompt is answered (2026-10-28).
+    (child_wake.lifespan_router, "", ["ae"]),
     # No routes: loads the Azure card's saved reading at boot (2026-10-22).
     (azure_cost.lifespan_router, "", ["ae"]),
     # No routes: seeds the cost targets and runs their hourly check (2026-10-25).

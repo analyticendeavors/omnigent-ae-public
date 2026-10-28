@@ -524,8 +524,61 @@ async def _post() -> str:
     return await merge_watch.post_live(None, _FixedIdentity(), "conv_a", "note")  # type: ignore[arg-type]
 
 
+@pytest.fixture
+def outside_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(merge_watch, "_in_container", lambda: False)
+
+
+async def test_a_deleted_worktree_is_dropped_outside_a_container(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outside_container: None
+) -> None:
+    for gone in (tmp_path / "gone" / "inner", tmp_path / "gone"):
+        calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": str(gone)}))
+        assert await _post() == "drop"
+        assert calls == ["GET"]
+
+
+async def test_a_file_in_place_of_the_workspace_is_dropped(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outside_container: None
+) -> None:
+    file = tmp_path / "file"
+    file.write_text("x")
+    _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": str(file)}))
+    assert await _post() == "drop"
+
+
+async def test_a_missing_host_path_posts_inside_a_container(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(merge_watch, "_in_container", lambda: True)
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": "/home/reid/x"}))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
+@pytest.mark.parametrize("workspace", ["relative/dir", "C:\\Users\\x"])
+async def test_a_path_that_is_not_absolute_posix_posts(
+    monkeypatch: pytest.MonkeyPatch, outside_container: None, workspace: str
+) -> None:
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": workspace}))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
+async def test_a_stat_permission_error_posts(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outside_container: None
+) -> None:
+    def deny(path: str) -> None:
+        raise PermissionError(path)
+
+    monkeypatch.setattr(merge_watch.os, "stat", deny)
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": str(tmp_path)}))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
 async def test_a_gone_workspace_is_dropped_without_a_post(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, outside_container: None
 ) -> None:
     gone = httpx.Response(200, json={"workspace": str(tmp_path / "deleted-worktree")})
     calls = _fake_call(monkeypatch, get=gone)

@@ -49,6 +49,13 @@ A long press on a phone terminal offers no Paste, so the web terminal shows a Pa
 **Where:** The clipboard button at the top right of a shell, from the session menu's Shells.<br>
 **Built from:** core patches [`0016`](../../patches/0016-ae-patch-Add-a-Paste-button-to-the-web-terminal-on-t.patch), [`0017`](../../patches/0017-ae-patch-Fix-the-terminal-Paste-button-s-review-find.patch)
 
+## Paste a note copied on the iPhone
+
+Copying a note on an iPhone can put it on the clipboard as an encoded link instead of the text you copied, and a plain paste then drops that link into the composer. The composer now restores the original text first. When the clipboard also carries the exact text, it pastes that, and it handles an encoded copy that ends in a newline. There is nothing to switch on; paste into the composer as usual.
+
+**Where:** Paste into the composer on an iPhone.<br>
+**Built from:** core patches [`0204`](../../patches/0204-ae-patch-Restore-a-copied-note-the-iPhone-clipboard-.patch), [`0205`](../../patches/0205-ae-patch-Fix-the-review-findings-on-session-link-tit.patch), [`0206`](../../patches/0206-ae-patch-Paste-the-exact-note-when-an-iPhone-clipboa.patch), [`0207`](../../patches/0207-ae-patch-Repair-a-copied-note-whose-encoded-URL-copy.patch)
+
 ## Waiting pull requests keep their state
 
 <p align="center"><img src="../media/phone-dock-waiting.webp" alt="Waiting pull requests keep their state"></p>

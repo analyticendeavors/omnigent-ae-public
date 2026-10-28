@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 19:20:50 -0700
+Subject: [PATCH 217/220] [ae-patch] Fix the review findings on browser
+ snapshots and off-screen screenshots
+
+Review fixes for the previous patch. A capture now checks that the registry
+still holds the same entry, so a chat closed (or closed and reopened) during a
+queued or staged capture is never staged or left attached. When the chat
+becomes active mid-capture the staging position is undone before resync,
+which applies nothing until the pane has sent bounds. The retry loop runs on
+one clock, so slow empty paints share the 10 s budget instead of looping for
+minutes. The snapshot no longer enters a visibility:hidden frame's document,
+enters at most 3 nested frames, and stops at 2000 lines or 50000 visited
+elements with a truncation note.
+---
+ web/electron/src/aeBrowserCapture.js          | 27 +++++++---
+ web/electron/test/aeBrowserCapture.test.js    | 49 ++++++++++++++++++-
+ .../useBrowserAgentRelay.snapshot.test.ts     | 18 +++++++
+ web/src/hooks/useBrowserAgentRelay.ts         | 17 +++++--
+ 4 files changed, 96 insertions(+), 15 deletions(-)
+
+diff --git a/web/electron/src/aeBrowserCapture.js b/web/electron/src/aeBrowserCapture.js
+index 67ff96d745af23abb22dc3f9685307f4ad9ba669..24e88c484b60155a7e6fe43d647a83e32861673e 100644
+--- a/web/electron/src/aeBrowserCapture.js
++++ b/web/electron/src/aeBrowserCapture.js
+@@ -38,12 +38,12 @@ function isEmptyImage(image) {
+ }
+ 
+ /** Race one capturePage() call against a timeout. Throws a tagged error on timeout. */
+-function capturePageWithTimeout(view, timeoutMs) {
++function capturePageWithTimeout(view, timeoutMs, budgetMs = timeoutMs) {
+   let timer = null;
+   const timeout = new Promise((_, reject) => {
+     timer = setTimeout(() => {
+       const err = new Error(
+-        `screenshot timed out after ${Math.round(timeoutMs / 1000)} s: the browser view did not paint. ` +
++        `screenshot timed out after ${Math.round(budgetMs / 1000)} s: the browser view did not paint. ` +
+           "Open this chat's browser pane in the Omnigent desktop app and retry.",
+       );
+       err.aeTimeout = true;
+@@ -74,7 +74,13 @@ function contentSize(win) {
+   return { width: 0, height: 0 };
+ }
+ 
++const CLOSED_ERROR = "this chat's browser view was closed";
++
+ async function captureOnce({ registry, conversationId, entry, win, timeoutMs, retryMs, maxWaitMs, wait }) {
++  // A capture queued behind another may start after the chat's view was closed
++  // (or closed and reopened as a new entry); never stage a dead view.
++  const isLive = () => registry.get(conversationId) === entry;
++  if (!isLive()) return { ok: false, error: CLOSED_ERROR };
+   const view = entry.view;
+   const toResult = (image) => ({
+     ok: true,
+@@ -96,19 +102,21 @@ async function captureOnce({ registry, conversationId, entry, win, timeoutMs, re
+     if (!savedVisible) view.setVisible(true);
+     win.contentView.addChildView(view, 0);
+ 
+-    let image = await capturePageWithTimeout(view, timeoutMs);
+-    let waited = 0;
+-    while (isEmptyImage(image) && waited < maxWaitMs) {
++    // One clock for the whole capture: retries start only within maxWaitMs and
++    // share timeoutMs, so slow empty paints cannot keep the view staged for minutes.
++    const start = Date.now();
++    const remaining = () => Math.max(1, timeoutMs - (Date.now() - start));
++    let image = await capturePageWithTimeout(view, remaining(), timeoutMs);
++    while (isEmptyImage(image) && Date.now() - start < maxWaitMs) {
+       // Sequential on purpose: each retry follows the previous paint attempt.
+       // oxlint-disable-next-line no-await-in-loop
+       await wait(retryMs);
+-      waited += retryMs;
+       // oxlint-disable-next-line no-await-in-loop
+-      image = await capturePageWithTimeout(view, timeoutMs);
++      image = await capturePageWithTimeout(view, remaining(), timeoutMs);
+     }
+     return isEmptyImage(image) ? { ok: false, error: EMPTY_ERROR } : toResult(image);
+   } finally {
+-    if (registry.activeConversationId() !== conversationId) {
++    if (!isLive() || registry.activeConversationId() !== conversationId) {
+       try {
+         win.contentView.removeChildView(view);
+       } catch {
+@@ -122,7 +130,10 @@ async function captureOnce({ registry, conversationId, entry, win, timeoutMs, re
+       }
+     } else {
+       // The user switched to this chat mid-capture; setActive re-attached it.
++      // Undo the staging position first: resync applies nothing until the pane
++      // has sent bounds.
+       try {
++        view.setBounds(savedBounds);
+         entry.boundsController.resync();
+       } catch {
+         /* view destroyed */
+diff --git a/web/electron/test/aeBrowserCapture.test.js b/web/electron/test/aeBrowserCapture.test.js
+index a3b4a60c186df580d33b803ad098fc950d0b2810..8c258a7246bf6fcafbdc780042e7fab312a77cfd 100644
+--- a/web/electron/test/aeBrowserCapture.test.js
++++ b/web/electron/test/aeBrowserCapture.test.js
+@@ -59,9 +59,16 @@ function setup({ attached = false, captures = ["full"], active = null, visible =
+     view,
+     boundsController: { resync: () => log.push(["resync"]) },
+   };
+-  const registry = { activeConversationId: () => active };
++  let live = entry;
++  const registry = {
++    activeConversationId: () => active,
++    get: (id) => (id === "c1" ? live : null),
++  };
+   const state = () => ({ bounds, vis, children });
+-  return { log, view, win, entry, registry, state };
++  const close = () => {
++    live = null;
++  };
++  return { log, view, win, entry, registry, state, close };
+ }
+ 
+ const run = (s, extra = {}) =>
+@@ -129,6 +136,44 @@ describe("captureBrowserView", () => {
+     assert.equal(s.state().children.length, 1);
+     assert.ok(s.log.some((l) => l[0] === "resync"));
+     assert.ok(!s.log.some((l) => l[0] === "remove"));
++    // The staging position is undone before resync, which applies nothing
++    // until the pane has sent bounds.
++    assert.deepEqual(s.state().bounds, { x: 5, y: 6, width: 300, height: 200 });
++  });
++
++  it("counts slow empty captures against the retry budget", async () => {
++    const s = setup({ active: "other", captures: ["empty"] });
++    const slow = s.view.webContents.capturePage;
++    s.view.webContents.capturePage = () =>
++      new Promise((resolve) => {
++        setTimeout(() => resolve(slow()), 30);
++      });
++    const r = await run(s, { maxWaitMs: 50 });
++    assert.equal(r.ok, false);
++    assert.ok(s.log.filter((l) => l[0] === "capture").length <= 3);
++    assert.equal(s.state().children.length, 0);
++  });
++
++  it("refuses a view that was closed before its queued capture started", async () => {
++    const s = setup({ active: "other" });
++    s.close();
++    const r = await run(s);
++    assert.equal(r.ok, false);
++    assert.match(r.error, /was closed/);
++    assert.ok(!s.log.some((l) => l[0] === "add" || l[0] === "capture"));
++  });
++
++  it("removes a staged view whose chat was closed mid-capture, even if reopened", async () => {
++    const s = setup({ active: "c1", captures: ["empty", "full"] });
++    // Closed and reopened as a new entry for the same chat while staged.
++    const r = await run(s, {
++      wait: async () => {
++        s.close();
++      },
++    });
++    assert.equal(r.ok, true);
++    assert.equal(s.state().children.length, 0);
++    assert.ok(!s.log.some((l) => l[0] === "resync"));
+   });
+ 
+   it("times out on a hang and cleans up", async () => {
+diff --git a/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts b/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts
+index ff19278d8dea4648fdd2147191443220b06cf01c..49e09a4499e71fd76e2e87f54c5a2e1681d25d9d 100644
+--- a/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts
++++ b/web/src/hooks/useBrowserAgentRelay.snapshot.test.ts
+@@ -88,6 +88,24 @@ describe("SNAPSHOT_JS visibility walk", () => {
+     expect(snapshot().tree).toContain('button "InFrame"');
+   });
+ 
++  it("skips the document of a visibility:hidden iframe", () => {
++    document.body.innerHTML = `<iframe style="visibility:hidden"></iframe><button>Shown</button>`;
++    const frame = document.querySelector("iframe")!;
++    (frame.contentWindow as unknown as Window & typeof globalThis).Element.prototype.getBoundingClientRect =
++      Element.prototype.getBoundingClientRect;
++    frame.contentDocument!.body.innerHTML = `<button>InHiddenFrame</button>`;
++    const { tree } = snapshot();
++    expect(tree).toContain('button "Shown"');
++    expect(tree).not.toContain("InHiddenFrame");
++  });
++
++  it("stops at 2000 lines and says the snapshot was truncated", () => {
++    document.body.innerHTML = "<button>b</button>".repeat(2100);
++    const lines = snapshot().tree.split("\n");
++    expect(lines).toHaveLength(2001);
++    expect(lines[2000]).toBe('- note "snapshot truncated: the page is too large"');
++  });
++
+   it("keeps refs for portal content in window.__omni_refs__", () => {
+     document.body.innerHTML = `<div data-size="0x0">${DIALOG}</div>`;
+     const { tree } = snapshot();
+diff --git a/web/src/hooks/useBrowserAgentRelay.ts b/web/src/hooks/useBrowserAgentRelay.ts
+index 68ebf81ee0fbbc554c48b39b62053ef961963862..18f1a9c2e079b021b9deb8c252ee5a29e1283d88 100644
+--- a/web/src/hooks/useBrowserAgentRelay.ts
++++ b/web/src/hooks/useBrowserAgentRelay.ts
+@@ -100,6 +100,9 @@ export const SNAPSHOT_JS = `(() => {
+   window.__omni_snapshot_id__ = snapshotId;
+   let nextRef = 0;
+   const lines = [];
++  // Hidden subtrees are walked now, so bound the work on a huge page.
++  let visits = 0;
++  let truncated = false;
+ 
+   const TAG_ROLE = {
+     a: 'link', button: 'button', textarea: 'textbox', select: 'combobox',
+@@ -172,8 +175,9 @@ export const SNAPSHOT_JS = `(() => {
+       (rect.height === 0 && style.overflowY !== 'visible');
+   }
+ 
+-  function walk(el, depth) {
++  function walk(el, depth, frames = 0) {
+     if (!el || el.nodeType !== 1 || !el.getBoundingClientRect) return;
++    if (lines.length >= 2000 || ++visits > 50000) { truncated = true; return; }
+     const style = (el.ownerDocument && el.ownerDocument.defaultView || window).getComputedStyle(el);
+     const rect = el.getBoundingClientRect();
+     if (hidesSubtree(style, rect)) return;
+@@ -193,21 +197,24 @@ export const SNAPSHOT_JS = `(() => {
+       childDepth = depth + 1;
+     }
+     for (const child of el.children) {
+-      walk(child, childDepth);
++      walk(child, childDepth, frames);
+     }
+     if (el.shadowRoot) {
+-      for (const child of el.shadowRoot.children) walk(child, childDepth);
++      for (const child of el.shadowRoot.children) walk(child, childDepth, frames);
+     }
+     const tag = el.tagName && el.tagName.toLowerCase();
+-    if (tag === 'iframe' || tag === 'frame') {
++    // At most 3 nested frames, so a page that embeds itself cannot recurse.
++    // A frame's document does not inherit the frame's own visibility.
++    if ((tag === 'iframe' || tag === 'frame') && visible && frames < 3) {
+       try {
+         const body = el.contentDocument && el.contentDocument.body;
+-        if (body) walk(body, childDepth);
++        if (body) walk(body, childDepth, frames + 1);
+       } catch (e) { /* cross-origin frame */ }
+     }
+   }
+ 
+   if (document.body) walk(document.body, 0);
++  if (truncated) lines.push('- note "snapshot truncated: the page is too large"');
+ 
+   return JSON.stringify({
+     snapshot_id: snapshotId,

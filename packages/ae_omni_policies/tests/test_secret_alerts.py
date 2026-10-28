@@ -26,7 +26,7 @@ APP_ID = "6daa04d7-48f1-4a76-942f-4b92e6ce7542"
 CFG = secret_alerts.Config(
     on=True, off_reason=None, list_name="AE Work", time="09:00", tz="America/Los_Angeles"
 )
-BOX = "ae-secrets-vault"
+BOX = "kv-example-box"
 WEB = "kv-example-web"
 
 

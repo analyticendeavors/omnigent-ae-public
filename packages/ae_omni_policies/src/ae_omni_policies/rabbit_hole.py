@@ -15,6 +15,18 @@ start has no clock, so only the turn threshold applies to it. Sub-agent
 conversations are never counted or asked: they run inside their parent's
 slot. A note the server posts to continue existing work (the merge watcher's,
 :mod:`ae_omni_policies.continuation`, 2026-10-21) is neither counted nor asked.
+
+A family child follows its lead's answer (decided 2026-10-27). A child is a top-level
+session whose ``ae.orch`` label names its lead (``valid_lead_id`` in upstream's
+``ae_family_prompts``: a session id other than ``""`` or ``"1"``, no fork label, no
+parent, the lead exists and has the child's owner). Past a threshold, a child whose lead
+already accepted the check (its own persisted ``_ae_rabbit_ack``, read from the lead's
+conversation row) is allowed and records its own ack, so later turns skip the lookup;
+without that, each child's ask would hold every message, the lead's ``post_message``
+included, until Reid accepted in the child. A lead that declined or was never asked
+leaves no ack, so the child asks on its own; a foreign or missing lead (both owners are
+read strictly, so a failed owner read asks), a fork, and any store read failure ask as
+before, never a silent allow. No setting.
 """
 
 from __future__ import annotations
@@ -22,6 +34,7 @@ from __future__ import annotations
 import logging
 import time
 
+from omnigent.entities.conversation import Conversation
 from omnigent.policies.schema import (
     PolicyCallable,
     PolicyEvent,
@@ -64,6 +77,40 @@ def reason_text(
     )
 
 
+def lead_accepted(row: Conversation | None) -> bool:
+    """Whether *row* is a family child whose lead has accepted the rabbit-hole check.
+
+    :param row: The session being evaluated.
+    :returns: ``True`` only when the row's ``ae.orch`` names a valid lead (same rule as
+        upstream's ``valid_lead_id``) whose persisted ``session_state`` holds the ack;
+        ``False`` for anything else, including a store read failure.
+    """
+    if row is None:
+        return False
+    try:
+        from omnigent.server.ae_family_prompts import valid_lead_id
+
+        store = sessions.get_conversation_store()
+        lead_id = valid_lead_id(row, store)
+        lead = store.get_conversation(lead_id) if lead_id else None
+        if lead is None:
+            return False
+        # valid_lead_id's owner check swallows lookup errors and reads "local" for both
+        # sides, so two failed reads would look like the same owner. Read both strictly.
+        child_owner = store.get_session_owner(row.id, owner_only=True)
+        lead_owner = store.get_session_owner(lead.id, owner_only=True)
+    except (*STORE_ERRORS, ImportError, AttributeError):
+        _logger.warning("rabbit_hole could not verify the lead; asking", exc_info=True)
+        return False
+    except Exception:  # noqa: BLE001 (any failed owner read must fall back to asking)
+        _logger.warning("rabbit_hole owner lookup failed; asking", exc_info=True)
+        return False
+    if not (isinstance(child_owner, str) and child_owner and child_owner == lead_owner):
+        return False
+    state = lead.session_state if lead is not None else None
+    return isinstance(state, dict) and bool(state.get(ACK_KEY))
+
+
 def rabbit_hole(hours: float = 4, turns: int = 60) -> PolicyCallable:
     """Factory: propose a check-in once a session runs past *hours* or *turns*.
 
@@ -104,6 +151,11 @@ def rabbit_hole(hours: float = 4, turns: int = 60) -> PolicyCallable:
             return counted
         if row is not None and not sessions.is_top_level(row):
             return None
+        if lead_accepted(row):
+            return {
+                "result": "ALLOW",
+                "state_updates": [*updates, {"key": ACK_KEY, "action": "set", "value": "1"}],
+            }
         title = sessions.display_title(row) if row is not None else "this session"
         return {
             "result": "ASK",
@@ -114,4 +166,4 @@ def rabbit_hole(hours: float = 4, turns: int = 60) -> PolicyCallable:
     return evaluate
 
 
-__all__ = ["ACK_KEY", "TURNS_KEY", "rabbit_hole", "reason_text"]
+__all__ = ["ACK_KEY", "TURNS_KEY", "lead_accepted", "rabbit_hole", "reason_text"]

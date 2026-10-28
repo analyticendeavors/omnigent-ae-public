@@ -35,6 +35,7 @@ EXPECTED = {
             "list_parked",
             "create_session",
             "post_message",
+            "answer_child_question",
             "schedule_checkin",
             "list_prs",
             "set_session_model",

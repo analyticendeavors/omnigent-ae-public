@@ -1,0 +1,168 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 26 Oct 2026 21:29:31 -0700
+Subject: [PATCH 204/220] [ae-patch] Restore a copied note the iPhone clipboard
+ encoded as a URL when it is pasted into the composer
+
+Text that opens with 'WORD: ' can come back from an iPhone clipboard as a lowercased, percent-encoded URL (thread:%20a%0ASTATE:%20b). The composer's paste handler now undoes that exact shape and inserts the decoded text; real URLs and ordinary text paste unchanged.
+---
+ web/src/hooks/useComposerAttachments.test.tsx | 16 +++++++++-
+ web/src/hooks/useComposerAttachments.ts       | 12 ++++++++
+ web/src/lib/aePasteRepair.test.ts             | 30 +++++++++++++++++++
+ web/src/lib/aePasteRepair.ts                  | 19 ++++++++++++
+ web/src/pages/ChatPage.composer.test.tsx      |  2 +-
+ web/src/shell/NewChatDialog.test.tsx          |  2 +-
+ 6 files changed, 78 insertions(+), 3 deletions(-)
+ create mode 100644 web/src/lib/aePasteRepair.test.ts
+ create mode 100644 web/src/lib/aePasteRepair.ts
+
+diff --git a/web/src/hooks/useComposerAttachments.test.tsx b/web/src/hooks/useComposerAttachments.test.tsx
+index a50075920224b6f6d814a2a3b041e8b822b41144..cfdcd400e838e02b82e2ef52d5abc78c62f9230e 100644
+--- a/web/src/hooks/useComposerAttachments.test.tsx
++++ b/web/src/hooks/useComposerAttachments.test.tsx
+@@ -43,7 +43,8 @@ function pasteEvent({
+     // they must be skipped, not attached.
+     items.push({ kind: "file", type: "image/png", getAsFile: () => null });
+   }
+-  const event = { clipboardData: { items }, preventDefault };
++  const getData = (type: string) => (type === "text/plain" ? (text ?? "") : "");
++  const event = { clipboardData: { items, getData }, preventDefault };
+   return {
+     event: event as unknown as React.ClipboardEvent<HTMLTextAreaElement>,
+     preventDefault,
+@@ -155,6 +156,19 @@ describe("useComposerAttachments", () => {
+     expect(result.current.files).toEqual([]);
+   });
+ 
++  it("onPaste inserts a note the clipboard encoded as a URL, decoded", () => {
++    const insertText = vi.fn(() => true);
++    Object.defineProperty(document, "execCommand", { configurable: true, value: insertText });
++    const { result } = renderHook(() => useComposerAttachments());
++    const { event, preventDefault } = pasteEvent({ text: "thread:%20a-b%0ASTATE:%20ok" });
++
++    act(() => result.current.onPaste(event));
++
++    expect(preventDefault).toHaveBeenCalledTimes(1);
++    expect(insertText).toHaveBeenCalledWith("insertText", false, "thread: a-b\nSTATE: ok");
++    expect(result.current.files).toEqual([]);
++  });
++
+   it("onPaste ignores non-file kinds and null file payloads", () => {
+     const { result } = renderHook(() => useComposerAttachments());
+     const { event, preventDefault } = pasteEvent({ text: "hi", nullFile: true });
+diff --git a/web/src/hooks/useComposerAttachments.ts b/web/src/hooks/useComposerAttachments.ts
+index 2111bcd3ee71d3ac5c4f5429649b69159d7c52ba..923d4ac7c8e9fced4512f922824804160bfae235 100644
+--- a/web/src/hooks/useComposerAttachments.ts
++++ b/web/src/hooks/useComposerAttachments.ts
+@@ -1,5 +1,6 @@
+ import { useCallback, useRef, useState } from "react";
+ import { validateAttachments } from "@/lib/attachments";
++import { repairEncodedNote } from "@/lib/aePasteRepair";
+ 
+ export interface UseComposerAttachmentsOptions {
+   /**
+@@ -92,6 +93,17 @@ export function useComposerAttachments({
+ 
+   const onPaste = useCallback(
+     (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
++      const repaired = repairEncodedNote(e.clipboardData?.getData("text/plain") ?? "");
++      if (repaired !== null) {
++        e.preventDefault();
++        // insertText keeps the controlled textarea's state and undo stack in step.
++        if (!document.execCommand("insertText", false, repaired)) {
++          const field = e.currentTarget;
++          field.setRangeText(repaired, field.selectionStart, field.selectionEnd, "end");
++          field.dispatchEvent(new Event("input", { bubbles: true }));
++        }
++        return;
++      }
+       const items = e.clipboardData?.items;
+       if (!items) return;
+       const pasted: File[] = [];
+diff --git a/web/src/lib/aePasteRepair.test.ts b/web/src/lib/aePasteRepair.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..be9d719d3a9bb3d7a128863e976f16d2e8c202aa
+--- /dev/null
++++ b/web/src/lib/aePasteRepair.test.ts
+@@ -0,0 +1,30 @@
++import { describe, expect, it } from "vitest";
++import { repairEncodedNote } from "./aePasteRepair";
++
++describe("repairEncodedNote", () => {
++  it("restores a note the clipboard encoded as a URL", () => {
++    const encoded =
++      "thread:%20session-link-titles%0ASTATE:%20Reid%20asked,%20from%20his%20phone,%20that%20a%20link%20read%20as%20%5Btitle%5D(url)%20%22x%22%20%3Cid%3E%0ANEXT:%20go";
++    expect(repairEncodedNote(encoded)).toBe(
++      'thread: session-link-titles\nSTATE: Reid asked, from his phone, that a link read as [title](url) "x" <id>\nNEXT: go',
++    );
++  });
++
++  it("restores non-ASCII text and a literal percent sign", () => {
++    expect(repairEncodedNote("note:%20QUADRANT:%20feature%20%C2%B7%20EST:%20100%25")).toBe(
++      "note: QUADRANT: feature · EST: 100%",
++    );
++  });
++
++  it("leaves real URLs and ordinary text alone", () => {
++    expect(repairEncodedNote("https://a.b/c%20d")).toBeNull();
++    expect(repairEncodedNote("mailto:me@a.b?subject=hi%20there")).toBeNull();
++    expect(repairEncodedNote("thread: already plain")).toBeNull();
++    expect(repairEncodedNote("hello%20world")).toBeNull();
++    expect(repairEncodedNote("")).toBeNull();
++  });
++
++  it("returns null for a malformed escape", () => {
++    expect(repairEncodedNote("thread:%20bad%E0%A4")).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aePasteRepair.ts b/web/src/lib/aePasteRepair.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a3ee07f0717917c796edac3e38ec44d3f91783c
+--- /dev/null
++++ b/web/src/lib/aePasteRepair.ts
+@@ -0,0 +1,19 @@
++// An iPhone can hand the composer a copied note as a percent-encoded URL: text
++// that opens with `Word: ` parses as a URL with a scheme, so the clipboard comes
++// back lowercased with every space and newline as %20 and %0A
++// ("THREAD: a\nNEXT: b" arrives as "thread:%20a%0ANEXT:%20b"). Real URLs never
++// carry an encoded space right after the scheme colon, so that shape is safe to
++// undo. The scheme's case is lost for good; everything else is restored.
++
++const ENCODED_NOTE = /^[a-z][a-z0-9+.-]*:(?:%20|%0A)\S*$/;
++
++/** The decoded text for a note the clipboard encoded as a URL, else null. */
++export function repairEncodedNote(pasted: string): string | null {
++  const text = pasted.trim();
++  if (!ENCODED_NOTE.test(text)) return null;
++  try {
++    return decodeURIComponent(text);
++  } catch {
++    return null;
++  }
++}
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index b89bd753d1c4a5d03ecf1be66058c887d6c14c10..3ff2491afd6548e088cf1045fe966b1848614f5f 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -5003,7 +5003,7 @@ describe("Composer paste", () => {
+     for (const file of files) {
+       items.push({ kind: "file", type: file.type, getAsFile: () => file });
+     }
+-    return { clipboardData: { items } };
++    return { clipboardData: { items, getData: () => "" } };
+   }
+ 
+   it("leaves a text-only paste to the browser", () => {
+diff --git a/web/src/shell/NewChatDialog.test.tsx b/web/src/shell/NewChatDialog.test.tsx
+index 8dd702547ba3d64f370a608a2380d43088c60f42..f4a9c8b7a33ea31b0f8dfa124c8a33fca11cf3c4 100644
+--- a/web/src/shell/NewChatDialog.test.tsx
++++ b/web/src/shell/NewChatDialog.test.tsx
+@@ -8492,7 +8492,7 @@ describe("NewChatLandingScreen paste", () => {
+     for (const file of files) {
+       items.push({ kind: "file", type: file.type, getAsFile: () => file });
+     }
+-    return { clipboardData: { items } };
++    return { clipboardData: { items, getData: () => "" } };
+   }
+ 
+   it("leaves a text-only paste to the browser", () => {

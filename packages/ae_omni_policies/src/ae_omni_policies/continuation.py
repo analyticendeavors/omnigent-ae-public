@@ -13,6 +13,12 @@ typed prompt. Two of them would stop it:
 - the rabbit hole asks once a session passes four hours or 60 prompts, which
   a session waiting on a merge often has.
 
+The child wake (:mod:`ae_omni_policies.child_wake`, 2026-10-28) posts a second
+kind: when Reid answers a family child's prompt in the lead's action dock and the
+lead is idle, one line (``Child prompt answered: <title> (<id>...): Reid picked
+<choice>.``) tells the lead to carry on. It passes the same
+three gates for the same reason.
+
 A merge note is neither a new task nor another turn of Reid's, so the slot cap
 lets it through without claiming a slot, and the rabbit hole and the fork
 classifier abstain on it (no turn counted, no model call).
@@ -34,15 +40,31 @@ import re
 #: Every note the merge watcher posts starts with this.
 MERGE_WATCH_PREFIX = "Merge watcher: "
 _MERGE_WATCH = re.compile(r"^Merge watcher: PR #[1-9][0-9]* \(")
+#: Every note the child wake posts starts with this (2026-10-28).
+CHILD_WAKE_PREFIX = "Child prompt answered: "
+#: Caps of the note's title and picked label; :mod:`ae_omni_policies.child_wake` cuts to them.
+TITLE_CAP = 60
+PICK_CAP = 80
+_CHILD_WAKE = re.compile(
+    rf"^Child prompt answered: [^\n]{{1,{TITLE_CAP}}} \([0-9A-Za-z_]{{4}}\.\.\.\): "
+    rf"Reid picked [^\n.]{{1,{PICK_CAP}}}\.$"
+)
 
 
 def is_system_continuation(text: str) -> bool:
     """Whether *text* is a note the server posted to continue existing work.
 
     :param text: The request's user text (``request_user_text``).
-    :returns: ``True`` for a merge watcher note.
+    :returns: ``True`` for a merge watcher note or a child wake note.
     """
-    return _MERGE_WATCH.match(text.lstrip()) is not None
+    head = text.strip()
+    return _MERGE_WATCH.match(head) is not None or _CHILD_WAKE.match(head) is not None
 
 
-__all__ = ["MERGE_WATCH_PREFIX", "is_system_continuation"]
+__all__ = [
+    "CHILD_WAKE_PREFIX",
+    "MERGE_WATCH_PREFIX",
+    "PICK_CAP",
+    "TITLE_CAP",
+    "is_system_continuation",
+]

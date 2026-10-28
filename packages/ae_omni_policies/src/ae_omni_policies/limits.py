@@ -539,6 +539,12 @@ NO_WINDOWS_NOTE = (
 NO_ACCOUNT_READING_NOTE = (
     "No reading yet for {account}; it shows after this session's first reply."
 )
+# The same gap seen from the Usage card's subscription switcher, where no session is asked about.
+NO_LOGIN_READING_NOTE = "No reading yet for {account}; it shows once a chat on that login replies."
+# Session label the runner stamps at every terminal launch with its login ("" is the default).
+# Twin of ACCOUNT_LIVE_LABEL in omnigent/harnesses/claude_native/ae_launch_account.py (an upstream
+# patch); this package cannot import it at an older pin, so keep the two strings in step.
+ACCOUNT_LIVE_LABEL = "ae.claude_account"
 
 
 def _known_label(snapshot: LimitSnapshot) -> str | None:
@@ -583,33 +589,47 @@ def _account_answer(
 
 
 def _resolve_account(
-    snapshot: LimitSnapshot, session_id: str, account: str | None, trusted: bool
+    snapshot: LimitSnapshot,
+    session_id: str | None,
+    account: str | None,
+    trusted: bool,
+    live: str | None = UNSET,
 ) -> tuple[bool, str | None]:
     """Which account *session_id* runs on, if it can be told: (known, account).
 
-    The relay's entry for the session wins, then the label or hint the caller
-    passed (``UNSET`` when it passed none). A hint for an account the host does
-    not list as signed in is no answer; a label (*trusted*) was checked when the
-    session was forked and stands as it is.
+    The runner's live label (*live*) wins when it names a login the host lists
+    (or the default); then the relay's entry for the session, then the label or
+    hint the caller passed (``UNSET`` when it passed none). A hint for an
+    account the host does not list as signed in is no answer; a label
+    (*trusted*) was checked when the session was forked and stands as it is.
+    With no *session_id* (the card viewing another login) only *account* counts.
     """
-    own = next((s for s in snapshot.sessions if s.conversation_id == session_id), None)
+    signed_in = {k.account for k in snapshot.known_accounts}
+    if live is not UNSET and (live is None or live in signed_in):
+        return True, live
+    own = _own_entry(snapshot, session_id)
     if own is not None:
         return True, own.account
     if account is UNSET:
         return False, None
-    listed = any(k.account == account for k in snapshot.known_accounts)
-    if account is not None and not trusted and not listed:
+    if account is not None and not trusted and account not in signed_in:
         return False, None
     return True, account
 
 
+def _own_entry(snapshot: LimitSnapshot, session_id: str | None) -> SessionLimits | None:
+    """The relay's entry for *session_id*, if it posted one."""
+    return next((s for s in snapshot.sessions if s.conversation_id == session_id), None)
+
+
 def session_view(
     snapshot: LimitSnapshot,
-    session_id: str,
+    session_id: str | None,
     *,
     account: str | None = UNSET,
     trusted: bool = False,
     readings: Mapping[AccountKey, AccountUsage] | None = None,
+    live: str | None = UNSET,
 ) -> LimitSnapshot:
     """The Claude snapshot as one session sees it: its account's windows, not the host's.
 
@@ -629,22 +649,58 @@ def session_view(
     or empty with :data:`NO_ACCOUNT_READING_NOTE`, never the host reading of
     another account.
 
+    *live* (2026-10-27) is the login the runner stamped when the session's
+    terminal last launched. It outranks the relay's entry, which lags up to a
+    relay tick and can predate a relaunch on another login: the entry's windows
+    count only when its account is the resolved one, else the answer is the
+    resolved account's stored reading.
+
+    With *session_id* ``None`` (2026-10-27) the answer is *account*'s own view,
+    for the card's subscription switcher: the host reading when *account* is
+    the default login and the host reading is its, else its stored reading,
+    else empty with :data:`NO_LOGIN_READING_NOTE`. An account the host does not
+    list gets empty windows and that note naming it (2026-10-27), never the box-wide windows.
+
     :param snapshot: The stored Claude snapshot.
-    :param session_id: The OmniGent session asking, e.g. ``"conv_abc"``.
+    :param session_id: The OmniGent session asking, e.g. ``"conv_abc"``, or
+        ``None`` to ask about *account* alone.
     :param account: The account the session was created on, ``None`` for the
         default login; left out when nothing names it.
     :param trusted: Whether *account* is the server's own label for the session
         (checked at fork time) rather than a caller's hint, so it needs no
         entry in ``known_accounts``.
     :param readings: The store's newest reading per (harness, account).
+    :param live: The runner's launch-time label, ``None`` for the default
+        login; ``UNSET`` when the session has none.
     :returns: *snapshot* unchanged when no account can be told, or the session
         is on the default login and the host reading is the default login's too.
     """
     held = readings or {}
-    known, name = _resolve_account(snapshot, session_id, account, trusted)
+    if (
+        session_id is None
+        and account is not UNSET
+        and account is not None
+        and account not in {k.account for k in snapshot.known_accounts}
+    ):
+        # A login the host does not list: say so, never show the box-wide windows.
+        label = account.removeprefix(SHARED_PREFIX)[:120]
+        return snapshot.model_copy(
+            update={
+                "windows": [],
+                "note": NO_LOGIN_READING_NOTE.format(account=label),
+                "account": account,
+                "account_label": label,
+                "plan": None,
+                "credits": None,
+                "hint": BACKUP_HINT,
+            }
+        )
+    known, name = _resolve_account(snapshot, session_id, account, trusted, live)
     if not known or (name is None and snapshot.account is None):
         return snapshot
-    own = next((s for s in snapshot.sessions if s.conversation_id == session_id), None)
+    own = _own_entry(snapshot, session_id)
+    if own is not None and own.account != name:
+        own = None
     if own is not None and own.windows:
         update: dict[str, Any] = {
             "source": "statusline",
@@ -664,13 +720,14 @@ def session_view(
     label = label or next((k.label for k in snapshot.known_accounts if k.account == name), None)
     if label is None and name is not None:
         label = name.removeprefix(SHARED_PREFIX)[:120]
+    empty_note = NO_ACCOUNT_READING_NOTE if session_id is not None else NO_LOGIN_READING_NOTE
     update = {
         "source": "statusline",
         "observed_at": own.observed_at if own is not None else snapshot.observed_at,
         "windows": [],
         "note": NO_WINDOWS_NOTE
         if own is not None
-        else NO_ACCOUNT_READING_NOTE.format(account=label or name or DEFAULT_LABEL),
+        else empty_note.format(account=label or name or DEFAULT_LABEL),
         "account": name,
         "account_label": label,
     }
@@ -1070,13 +1127,16 @@ class LimitStore:
         session_id: str | None = None,
         account: str | None = UNSET,
         trusted: bool = False,
+        live: str | None = UNSET,
     ) -> dict[str, Any]:
         """What ``GET /v1/ae/limits`` answers: every harness, ``null`` when never seen.
 
         With *session_id* the Claude entry is that session's view (:func:`session_view`).
         *account* names the account the session runs on (``None`` is the default
         login), left out when nothing names it; *trusted* marks it as the
-        server's label for the session rather than a caller's hint.
+        server's label for the session rather than a caller's hint; *live* is
+        the runner's launch-time label. With *account* and no *session_id* the
+        Claude entry is that account's own view.
         """
         with self._lock:
             self._load()
@@ -1087,13 +1147,14 @@ class LimitStore:
                     harnesses[harness] = None
                     continue
                 snapshot = entry["snapshot"]
-                if harness == "claude" and session_id is not None:
+                if harness == "claude" and (session_id is not None or account is not UNSET):
                     snapshot = session_view(
                         snapshot,
                         session_id,
                         account=account,
                         trusted=trusted,
                         readings=self._accounts,
+                        live=live,
                     )
                 # The host's login list is the Accounts route's alone, but its
                 # label names the login the answer describes (2026-10-21): the

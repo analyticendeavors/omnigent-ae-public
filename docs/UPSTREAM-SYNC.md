@@ -376,7 +376,7 @@ warns and passes. To add it:
    https://github.com/organizations/analyticendeavors/settings/personal-access-token-requests.
 5. Paste it as `PATCH_BOT_TOKEN` at
    https://github.com/analyticendeavors/omnigent-ae/settings/secrets/actions/new, and
-   keep the value in Key Vault `ae-secrets-vault` as `patch-bot-token` for the next
+   keep the value in the box's Key Vault (`AE_VAULT_NAME`) as `patch-bot-token` for the next
    rotation.
 6. Check it: Actions, Patch rebase, Run workflow with an open patch PR's number.
 

@@ -56,7 +56,7 @@ A chat that has sat idle in reference for ten minutes, with nothing running and 
 
 ## The rabbit-hole check
 
-Once a session passes four hours or sixty prompts, its next prompt asks before it runs. Accepting covers the rest of that session, so it costs one click, at the moment a long session is most likely to have drifted. Its approval card gives the reason and folds the held request's code under Show details, as the slot cap's warning card does.
+Once a session passes four hours or sixty prompts, its next prompt asks before it runs. Accepting covers the rest of that session, so it costs one click, at the moment a long session is most likely to have drifted. Its approval card gives the reason and folds the held request's code under Show details, as the slot cap's warning card does. A helper that a lead started (a family child) follows its lead's answer: once the lead has accepted the check, the helper's next prompt runs without asking again. If the lead declined or was never asked, the helper asks for itself, and so does any helper whose lead the server cannot verify.
 
 **Where:** An approval card in the chat; the hours and prompts are parameters on Settings > Global Policies.<br>
 **Built from:** core patch [`0156`](../../patches/0156-ae-patch-Fold-a-request-phase-approval-card-s-code-u.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)

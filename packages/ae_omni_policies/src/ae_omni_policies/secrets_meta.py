@@ -59,7 +59,14 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-VAULT = "ae-secrets-vault"
+VAULT_ENV = "AE_VAULT_NAME"
+"""The variable naming the box's Key Vault; the name lives in the box's env only."""
+
+
+def box_vault() -> str | None:
+    """The box's Key Vault name from ``AE_VAULT_NAME``, or ``None`` when it is unset or empty."""
+    return os.environ.get(VAULT_ENV, "").strip() or None
+
 
 STATE_FILE_ENV = "AE_SECRETS_META_FILE"
 DATA_DIR = Path("/data")
@@ -113,6 +120,11 @@ SOURCE_PATTERN = re.compile(r"^entra:[0-9a-fA-F]{8}-(?:[0-9a-fA-F]{4}-){3}[0-9a-
 
 GITHUB_VAULT_NAME = "omnigent-ae-github-token"
 """The vault secret behind AE_GITHUB_TOKEN; its source expiry comes from GitHub's own header."""
+
+
+def _default_vault() -> str:
+    return box_vault() or ""
+
 
 VAULT_PATTERN = r"^[0-9A-Za-z-]{3,24}$"
 """A Key Vault name; keeps a posted name from reshaping the links built from it."""
@@ -250,7 +262,9 @@ class VaultPost(BaseModel):
 class MetaPost(BaseModel):
     """The relay's body: the box vault's secrets, the other vaults', and the host's keys."""
 
-    vault: str = Field(default=VAULT, pattern=VAULT_PATTERN)
+    vault: str = Field(
+        default_factory=_default_vault, validate_default=True, pattern=VAULT_PATTERN
+    )
     """The vault the box pulls from; the Edit links point at it."""
     secrets: list[SecretMeta] = Field(max_length=MAX_SECRETS)
     vaults: list[VaultPost] = Field(default_factory=list, max_length=4)
@@ -282,7 +296,10 @@ class Reading(BaseModel):
     def _read_at_utc(cls, value: datetime) -> datetime:
         return value.replace(tzinfo=UTC) if value.tzinfo is None else value.astimezone(UTC)
 
-    vault: str = Field(default=VAULT, pattern=VAULT_PATTERN)
+    vault: str = Field(
+        default_factory=_default_vault, validate_default=True, pattern=VAULT_PATTERN
+    )
+    """Defaults to ``AE_VAULT_NAME``; with neither, the reading fails to load (card: not read)."""
     secrets: dict[str, SecretMeta]
     vaults: dict[str, dict[str, SecretMeta]] = Field(default_factory=dict)
     """The other vaults' secrets by vault name; empty from a relay older than 2026-10-23."""
@@ -454,7 +471,8 @@ def words(key: str, reading: Reading | None, now: datetime) -> Words:
     if vault_name is None:
         return Words()
     rotate_url, rotate_hint = ROTATE.get(vault_name, (None, DEFAULT_HINT))
-    edit = edit_url(reading.vault if reading else VAULT, vault_name)
+    vault = reading.vault if reading else box_vault()
+    edit = edit_url(vault, vault_name) if vault else None
     out = Words(
         vault_name=vault_name,
         edit_url=edit,
@@ -548,7 +566,7 @@ __all__ = [
     "ROTATE",
     "SOON_DAYS",
     "STATE_FILE_ENV",
-    "VAULT",
+    "VAULT_ENV",
     "VAULT_HOST_SUFFIX",
     "VAULT_NAMES",
     "VAULT_PATTERN",
@@ -559,6 +577,7 @@ __all__ = [
     "SecretsMetaStore",
     "VaultPost",
     "Words",
+    "box_vault",
     "carry_forward",
     "days_until",
     "edit_url",

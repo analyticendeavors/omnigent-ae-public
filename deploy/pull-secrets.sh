@@ -28,20 +28,37 @@
 # `uv tool install azure-cli` puts one in ~/.local/bin without sudo, then
 # `az login --use-device-code`.
 #
-# The Key Vault names below were checked against ae-secrets-vault on
+# The Key Vault names below were checked against the box's vault on
 # 2026-09-24: the Cloudflare Access service token for task-store lives under
 # cf-access-svc-taskstore-*, and claude-code-oauth-token exists. A wrong name
 # fails loudly at the fetch, naming it; fix the variable here, not the vault.
 # The Postgres password is new with this deployment and has to be created
 # first:
-#   az keyvault secret set --vault-name ae-secrets-vault \
+#   az keyvault secret set --vault-name "$AE_VAULT_NAME" \
 #     --name omnigent-ae-postgres-password --value "$(openssl rand -hex 24)"
 set -euo pipefail
 
 # shellcheck source=scripts/_lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../scripts/_lib.sh"
 
-VAULT="${AE_VAULT_NAME:-ae-secrets-vault}"
+# AE_VAULT_NAME comes from the environment, else from config/host.env, read the way
+# deploy/vault-source-tags.sh reads it (plain KEY=VALUE lines, never sourced, only this key).
+VAULT="${AE_VAULT_NAME:-}"
+if [ -z "$VAULT" ] && [ -r "$(dirname "${BASH_SOURCE[0]}")/../config/host.env" ]; then
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      AE_VAULT_NAME=*) ;;
+      *) continue ;;
+    esac
+    value="${line#*=}"
+    case "$value" in
+      \"*\") value="${value#\"}" value="${value%\"}" ;;
+      \'*\') value="${value#\'}" value="${value%\'}" ;;
+    esac
+    VAULT="$value"
+  done <"$(dirname "${BASH_SOURCE[0]}")/../config/host.env"
+fi
 KV_POSTGRES_PASSWORD="${KV_POSTGRES_PASSWORD:-omnigent-ae-postgres-password}"
 KV_CF_ACCESS_CLIENT_ID="${KV_CF_ACCESS_CLIENT_ID:-cf-access-svc-taskstore-client-id}"
 KV_CF_ACCESS_CLIENT_SECRET="${KV_CF_ACCESS_CLIENT_SECRET:-cf-access-svc-taskstore-client-secret}"
@@ -211,6 +228,7 @@ main() {
     *) die "unknown argument '$1' (try --help)" ;;
   esac
 
+  [ -n "$VAULT" ] || die "AE_VAULT_NAME is not set (environment or config/host.env): name the Key Vault to read from (config/host.env.example)"
   command -v az >/dev/null 2>&1 || die "az is not on PATH. Without sudo: uv tool install azure-cli; then az login --use-device-code."
   az account show >/dev/null 2>&1 || die "az is not logged in. Run: az login --use-device-code (a browser on any device finishes it), then rerun."
   [ -d "$ENV_DIR" ] || die "$ENV_DIR does not exist. If /secure is not mounted, the TPM unlock failed: see home-server/secure-volume/README.md in agents-and-automation."

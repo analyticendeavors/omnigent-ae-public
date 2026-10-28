@@ -61,6 +61,7 @@ import json
 import logging
 import os
 import re
+import stat
 import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -742,13 +743,25 @@ async def discover_live(app: FastAPI, identity: OwnerIdentity, watched: set[str]
 _WORKSPACE_GONE_RE = re.compile(r"workspace_missing|workspace no longer exists", re.IGNORECASE)
 
 
+def _in_container() -> bool:
+    """Whether this server runs in a Docker or Podman container."""
+    return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
+
+
 async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str) -> bool:
-    """True when the session names a workspace directory that is gone from disk.
+    """True when the session names a workspace directory that is gone from this disk.
 
     A post to such a session makes the server relaunch the runner in the deleted
-    worktree, and the user sees a "workspace no longer exists" pill. The server and
-    the host share this box, so ``os.path.isdir`` answers. Anything unknown (the read
-    fails, no workspace field) is not gone: the post goes ahead as before.
+    worktree, and the user sees a "workspace no longer exists" pill. A local check
+    only means something when the server shares the host's filesystem. On 2026-10-28
+    the server ran in a container that mounts only ``/data`` and ships an empty
+    ``/home``, so every host workspace read as missing and four notes into live
+    sessions were dropped (/home/reid and /home/reid/worktrees/pass-2026-run). So the
+    check is off in a container (the box's Docker deployment): the 4xx
+    ``workspace_missing`` rule in :func:`post_live` is the guard there. It is also
+    skipped for a path that is not absolute POSIX (``C:\\...``, relative). Anything
+    else unknown (the read fails, no workspace field, a stat error other than "not
+    found") is not gone: the post goes ahead as before.
     """
     try:
         response = await _call(app, "GET", f"/v1/sessions/{session_id}", headers)
@@ -757,7 +770,16 @@ async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str
         workspace = response.json().get("workspace")
     except (httpx.HTTPError, ValueError, AttributeError):
         return False
-    return isinstance(workspace, str) and bool(workspace.strip()) and not os.path.isdir(workspace)
+    if not isinstance(workspace, str) or not workspace.strip():
+        return False
+    if not workspace.startswith("/") or _in_container():
+        return False
+    try:
+        return not stat.S_ISDIR(os.stat(workspace).st_mode)
+    except (FileNotFoundError, NotADirectoryError):
+        return True
+    except OSError:
+        return False
 
 
 async def post_live(

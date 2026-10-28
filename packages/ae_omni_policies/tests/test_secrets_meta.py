@@ -271,14 +271,17 @@ async def test_post_checks_the_origin_like_limits(client: httpx.AsyncClient) -> 
     assert relay.status_code == 200, relay.text
 
 
-def test_links_follow_the_vault_the_relay_read() -> None:
+def test_links_follow_the_vault_the_relay_read(monkeypatch: pytest.MonkeyPatch) -> None:
     reading = secrets_meta.Reading(read_at=NOW, vault="other-vault", secrets={})
     got = secrets_meta.words("POSTGRES_PASSWORD", reading, NOW)
     assert (
         f"other-vault{secrets_meta.VAULT_HOST_SUFFIX}/secrets/omnigent-ae-postgres-password"
         in (got.edit_url or "")
     )
-    assert secrets_meta.MetaPost(secrets=[]).vault == secrets_meta.VAULT
+    assert secrets_meta.MetaPost(secrets=[]).vault == "kv-example-box"
+    monkeypatch.delenv("AE_VAULT_NAME")
+    with pytest.raises(ValueError):
+        secrets_meta.MetaPost(secrets=[])
     with pytest.raises(ValueError):
         secrets_meta.MetaPost(vault="x.evil.example/", secrets=[])
     body = secrets_relay.read_vault("other-vault", az_bin="az", runner=_runner(AZ_ANSWER))
@@ -345,3 +348,46 @@ async def test_the_relay_exits_nonzero_and_posts_nothing_for_an_empty_match() ->
     )
     assert code == 1
     assert posted == []
+
+
+def test_an_unset_vault_name_fails_the_relay_and_shows_the_card_unconfigured(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from ae_omni_policies import vault_inventory
+
+    monkeypatch.delenv("AE_VAULT_NAME", raising=False)
+    monkeypatch.delenv("AE_EXTRA_VAULTS", raising=False)
+    assert secrets_relay.main([]) == 1
+    assert "AE_VAULT_NAME is not set" in capsys.readouterr().err
+    got = vault_inventory.view(None, NOW)
+    assert got.configured is False and got.box_vault == ""
+    assert secrets_meta.words("POSTGRES_PASSWORD", None, NOW).edit_url is None
+
+
+def test_an_unset_vault_name_still_proposes_tags_for_the_extra_vaults(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    seen: list[list[str]] = []
+
+    def fake(*, vaults: list[str], **_: object) -> int:
+        seen.append(list(vaults))
+        return 0
+
+    monkeypatch.delenv("AE_VAULT_NAME", raising=False)
+    monkeypatch.setenv("AE_EXTRA_VAULTS", "kv-example-web")
+    monkeypatch.setattr(secrets_relay, "run_propose", fake)
+    assert secrets_relay.main(["--propose-tags"]) == 1
+    assert seen == [["kv-example-web"]]
+    assert "AE_VAULT_NAME is not set" in capsys.readouterr().err
+
+
+def test_a_stored_reading_counts_as_configured_even_with_the_server_env_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ae_omni_policies import vault_inventory
+
+    reading = _reading()
+    monkeypatch.delenv("AE_VAULT_NAME", raising=False)
+    got = vault_inventory.view(reading, NOW)
+    assert got.configured is True
+    assert got.vaults

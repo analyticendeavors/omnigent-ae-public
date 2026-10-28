@@ -327,12 +327,18 @@ class _PresetList(_Strict):
     )
     # Absent until the user sets it; left out of the stored JSON and the views while None.
     insights: Insights | None = None
+    # Family settings (2026-10-27), top level and not per preset: whether a lead's chat shows its
+    # children's prompts in the action dock, and whether the lead may relay Reid's answer to a
+    # child's question. Absent until the user sets them, and absent reads as on.
+    child_prompts: StrictBool | None = None
+    child_relay: StrictBool | None = None
 
     @model_serializer(mode="wrap")
     def _without_absent_insights(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
-        if data.get("insights") is None:
-            data.pop("insights", None)
+        for key in ("insights", "child_prompts", "child_relay"):
+            if data.get(key) is None:
+                data.pop(key, None)
         return data
 
     @model_validator(mode="after")
@@ -700,6 +706,19 @@ class RolePrefsStore:
             self._load()
             return with_new_starters(self._current(user))
 
+    def family_flags(self, user: str) -> tuple[bool, bool]:
+        """*user*'s family settings as ``(child_prompts, child_relay)``; both on when never set.
+
+        Read by the server's family prompt mirror and the ``answer_child_question`` tool, so it
+        skips the starters work :meth:`get` does.
+        """
+        with self._lock:
+            self._load()
+            state = self._states.get(user)
+        if state is None:
+            return True, True
+        return state.child_prompts is not False, state.child_relay is not False
+
     def all_states(self) -> dict[str, RolesState]:
         """Every user's saved presets (valid entries only), each with new starters appended.
 
@@ -748,6 +767,16 @@ class RolePrefsStore:
                 # Absent keeps the saved setting; an explicit null clears it.
                 insights=(
                     body.insights if "insights" in body.model_fields_set else current.insights
+                ),
+                child_prompts=(
+                    body.child_prompts
+                    if "child_prompts" in body.model_fields_set
+                    else current.child_prompts
+                ),
+                child_relay=(
+                    body.child_relay
+                    if "child_relay" in body.model_fields_set
+                    else current.child_relay
                 ),
             )
             old_entry = self._users.get(user)

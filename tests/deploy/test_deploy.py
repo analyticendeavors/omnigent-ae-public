@@ -26,6 +26,14 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
+
+
+@pytest.fixture(autouse=True)
+def _vault_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """pull-secrets.sh has no default vault; the scripts under test inherit this one."""
+    monkeypatch.setenv("AE_VAULT_NAME", "kv-example-box")
+
+
 CONFIG = ROOT / "config"
 UPSTREAM_COMPOSE = ROOT / "upstream" / "deploy" / "docker" / "docker-compose.yaml"
 OVERRIDE = DEPLOY / "docker-compose.override.yml"
@@ -494,7 +502,7 @@ def test_pull_secrets_never_echoes_a_value_and_writes_atomically() -> None:
         "fabric-capacities-key",
     ):
         assert name in text
-    assert "--vault-name" in text and "ae-secrets-vault" in text
+    assert "--vault-name" in text and "AE_VAULT_NAME" in text
     assert (
         'install -m "$MODE" -o "$OWNER" -g "$GROUP"' in text and 'mv -f "$dst.tmp" "$dst"' in text
     )
@@ -552,6 +560,49 @@ def test_pull_secrets_help_and_check_run_without_a_vault(tmp_path: Path) -> None
     assert checked.returncode == 1
     assert "MISSING AE_CF_ACCESS_CLIENT_SECRET" in checked.stdout
     assert "x" not in [line.split()[-1] for line in checked.stdout.splitlines() if "ok" in line]
+
+
+def _script_tree(tmp_path: Path, host_env: str | None) -> Path:
+    """A copy of pull-secrets.sh with its lib and, optionally, a config/host.env beside it."""
+    (tmp_path / "deploy").mkdir()
+    (tmp_path / "scripts").mkdir()
+    shutil.copy(DEPLOY / "pull-secrets.sh", tmp_path / "deploy" / "pull-secrets.sh")
+    shutil.copy(ROOT / "scripts" / "_lib.sh", tmp_path / "scripts" / "_lib.sh")
+    if host_env is not None:
+        (tmp_path / "config").mkdir()
+        (tmp_path / "config" / "host.env").write_text(host_env)
+    return tmp_path / "deploy" / "pull-secrets.sh"
+
+
+def test_pull_secrets_without_a_vault_name_stops_naming_the_variable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AE_VAULT_NAME")
+    script = _script_tree(tmp_path, "OTHER=1\n")
+    run = subprocess.run([str(script)], capture_output=True, text=True, check=False)
+    assert run.returncode != 0
+    assert "AE_VAULT_NAME is not set" in run.stderr
+
+
+@pytest.mark.parametrize(
+    "line", ["AE_VAULT_NAME=kv-example-box", 'AE_VAULT_NAME="kv-example-box"']
+)
+def test_pull_secrets_reads_the_vault_name_from_host_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, line: str
+) -> None:
+    monkeypatch.delenv("AE_VAULT_NAME")
+    script = _script_tree(tmp_path, f"OTHER=1\n{line}\n")
+    run = subprocess.run([str(script)], capture_output=True, text=True, check=False)
+    assert "AE_VAULT_NAME is not set" not in run.stderr
+
+
+def test_pull_secrets_prefers_the_exported_vault_name_over_host_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_VAULT_NAME", "kv-example-box")
+    script = _script_tree(tmp_path, "AE_VAULT_NAME=kv-from-file\n")
+    run = subprocess.run([str(script)], capture_output=True, text=True, check=False)
+    assert "AE_VAULT_NAME is not set" not in run.stderr
 
 
 def test_pull_secrets_full_run_writes_both_files_and_leaves_no_temp_copy(
@@ -1369,3 +1420,14 @@ def test_nothing_deployed_runs_from_the_working_checkout() -> None:
     ]
     for path in deployed:
         assert "/home/reid/repos/omnigent-ae" not in path.read_text(), path.name
+
+
+def test_pull_secrets_without_a_vault_name_stops_and_names_the_variable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AE_VAULT_NAME")
+    ran = subprocess.run(
+        [str(DEPLOY / "pull-secrets.sh")], capture_output=True, text=True, check=False
+    )
+    assert ran.returncode != 0
+    assert "AE_VAULT_NAME is not set" in ran.stderr

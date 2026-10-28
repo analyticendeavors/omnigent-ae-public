@@ -877,3 +877,37 @@ def test_ultra_is_stored_for_an_agent_slot_only() -> None:
     planner["roles"]["planner"] = {"mode": "fixed", "model": "claude-opus-5-5", "effort": "ultra"}
     with pytest.raises(ValidationError):
         RolesPut.model_validate(_body(presets=[planner]))
+
+
+def test_family_settings_read_on_when_never_set_and_stay_out_of_the_stored_json(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "roles.json"
+    store = RolePrefsStore(path)
+    assert store.family_flags("u") == (True, True)
+    result = store.put("u", RolesPut.model_validate(_body()))
+    assert result.state.child_prompts is None and result.state.child_relay is None
+    assert store.family_flags("u") == (True, True)
+    assert "child_prompts" not in json.loads(path.read_text())["users"]["u"]
+    assert "child_relay" not in role_prefs.view(result.state)
+
+
+def test_family_settings_round_trip_and_absent_keeps(tmp_path: Path) -> None:
+    path = tmp_path / "roles.json"
+    store = RolePrefsStore(path)
+    first = store.put("u", RolesPut.model_validate(_body(child_prompts=False)))
+    assert first.state.child_prompts is False
+    assert role_prefs.view(first.state)["child_prompts"] is False
+    assert store.family_flags("u") == (False, True)
+    # A save that does not mention them keeps both.
+    second = store.put("u", RolesPut.model_validate(_body(revision=1, child_relay=False)))
+    assert second.state.child_prompts is False and second.state.child_relay is False
+    third = store.put("u", RolesPut.model_validate(_body(revision=2)))
+    assert RolePrefsStore(path).family_flags("u") == (False, False)
+    assert third.state.revision == 3
+    # An explicit null clears one back to on; other users are untouched.
+    store.put("u", RolesPut.model_validate(_body(revision=3, child_prompts=None)))
+    assert RolePrefsStore(path).family_flags("u") == (True, False)
+    assert store.family_flags("other") == (True, True)
+    with pytest.raises(ValidationError):
+        RolesPut.model_validate(_body(child_prompts="no"))

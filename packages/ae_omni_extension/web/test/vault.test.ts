@@ -79,7 +79,7 @@ function view(vault: string, secrets: VaultSecret[], extra: Partial<VaultView> =
 
 function inventory(): VaultInventory {
   const box = view(
-    "ae-secrets-vault",
+    "kv-example-box",
     [
       secret("omnigent-ae-github-token", { on_box: true, box_key: "AE_GITHUB_TOKEN" }),
       secret("hubspot-access-token", { both_vaults: true, untouched: true, updated_days: 183 }),
@@ -105,7 +105,7 @@ function inventory(): VaultInventory {
     },
   );
   const web = view("kv-example-web", [secret("hubspot-access-token", { both_vaults: true })]);
-  return { read_at: "2026-10-23T14:07:00Z", stale: false, box_vault: "ae-secrets-vault", vaults: [box, web] };
+  return { read_at: "2026-10-23T14:07:00Z", stale: false, box_vault: "kv-example-box", vaults: [box, web] };
 }
 
 const ok = (body: unknown): Reply => ({ ok: true, status: 200, body });
@@ -220,6 +220,15 @@ describe("the words", () => {
     calm.vaults = calm.vaults.map((v) => ({ ...v, counts: { ...v.counts, soon: 0 }, needs_you: [] }));
     expect(vaultTile(calm, null).health).toBe("ok");
     expect(vaultTile({ ...calm, vaults: [] }, null).value).toBe("Not read");
+    const unset = { ...calm, vaults: [], configured: false };
+    expect(vaultTile(unset, null)).toMatchObject({
+      value: "Not read",
+      note: "vault not configured (AE_VAULT_NAME)",
+      health: "attention",
+    });
+    const stale = vaultTile({ ...calm, stale: true }, null);
+    expect(stale.value).toBe("4 + 1");
+    expect(stale.health).toBe("attention");
   });
 });
 
@@ -228,10 +237,10 @@ describe("the card", () => {
     const { context } = stubContext([ok(inventory())]);
     const node = await mount(context);
     expect(all(node, ".vault-tab").map((tab) => tab.textContent)).toEqual([
-      "ae-secrets-vault4",
+      "kv-example-box4",
       "kv-example-web1",
     ]);
-    expect(q(node, '.vault-tab[aria-pressed="true"]')?.dataset.vault).toBe("ae-secrets-vault");
+    expect(q(node, '.vault-tab[aria-pressed="true"]')?.dataset.vault).toBe("kv-example-box");
     expect(all(node, ".vault-stat-n").map((n) => n.textContent)).toEqual(["0", "1", "2", "1"]);
     expect(all(node, ".vault-need").map((row) => [row.dataset.name, row.dataset.kind])).toEqual([
       ["azure-cost-client-secret", "soon"],
@@ -338,7 +347,7 @@ describe("the card", () => {
     expect(q(node, ".vault-carried")?.textContent).toMatch(
       /^kv-example-web could not be read on the last run; showing its list from Oct 2[01]\.$/,
     );
-    q<HTMLButtonElement>(node, '.vault-tab[data-vault="ae-secrets-vault"]')?.click();
+    q<HTMLButtonElement>(node, '.vault-tab[data-vault="kv-example-box"]')?.click();
     expect(q(node, ".vault-carried")).toBeNull();
   });
 
@@ -398,7 +407,7 @@ function owned(): VaultInventory {
     list: "AE",
     time: "09:00",
     tz: "America/Los_Angeles",
-    next: { vault: "ae-secrets-vault", name: "azure-cost-client-secret", alarm_at: "2026-11-20T17:00:00Z" },
+    next: { vault: "kv-example-box", name: "azure-cost-client-secret", alarm_at: "2026-11-20T17:00:00Z" },
     open: 1,
   };
   return answer;
@@ -438,7 +447,7 @@ describe("owner words", () => {
   it("puts the next alarm and the no-owner count on the tile", () => {
     const tile = vaultTile(owned(), null);
     expect(tile.note).toMatch(/^1 expiring · alarm set Nov 2[01] · 2 have no owner$/);
-    expect(tile.title).toBe("ae-secrets-vault: 4, kv-example-web: 1; 1 untouched 180d+");
+    expect(tile.title).toBe("kv-example-box: 4, kv-example-web: 1; 1 untouched 180d+");
     const one = owned();
     one.alerts = { ...one.alerts!, next: null };
     one.vaults[1]!.counts.no_owner = 0;
@@ -507,7 +516,7 @@ describe("owners on the card", () => {
     expect(q(node, ".vault-owner-status")?.textContent).toBe("Saving...");
     await flush();
     await flush();
-    expect(saves).toEqual([{ vault: "ae-secrets-vault", names: ["hubspot-access-token"], owner: ANN }]);
+    expect(saves).toEqual([{ vault: "kv-example-box", names: ["hubspot-access-token"], owner: ANN }]);
     expect(request.mock.calls.filter(([r]) => r.path === "/v1/ae/vault/people")).toHaveLength(1);
     expect(q(node, ".vault-detail")).toBeNull();
     expect(q(node, '.vault-row[data-name="hubspot-access-token"] .vault-owner')?.textContent).toBe("AL");
@@ -544,7 +553,7 @@ describe("owners on the card", () => {
     select.dispatchEvent(new Event("change"));
     await flush();
     expect(saves).toEqual([
-      { vault: "ae-secrets-vault", names: ["azure-cost-client-secret", "azure-other-secret"], owner: BO },
+      { vault: "kv-example-box", names: ["azure-cost-client-secret", "azure-other-secret"], owner: BO },
     ]);
     expect(q(node, ".vault-owner-error")?.textContent).toBe(
       "Not saved: The owner file could not be saved; check /data on the box.",

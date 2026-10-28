@@ -31,14 +31,32 @@ When an agent asks a question and you have scrolled away from its card, the ques
 **Where:** The strip, whenever an agent's question is off screen.<br>
 **Built from:** core patches [`0137`](../../patches/0137-ae-patch-Add-an-action-dock-above-the-composer-for-q.patch), [`0144`](../../patches/0144-ae-patch-Keep-merges-and-deploys-in-the-action-dock-.patch)
 
+## Questions from sessions this chat started
+
+<p align="center"><img src="../media/dock-child-prompt.webp" alt="Questions from sessions this chat started"></p>
+
+A lead that starts other sessions used to leave their questions and tool permission prompts in the child chats. They now show in the lead's dock, ranked right after its own questions: the bar reads the child's title and the question ("Lockfile audit: lockfile asks: Rewrite package-lock.json for the 14 bumped packages?"), or "2 child prompts" when another kind leads. Open the list and each prompt appears as its real card, with its own buttons, the child's title and an Open chat link. The answer goes to the child, not to the lead, and the card leaves the dock once it is answered. These prompts never appear in the lead's transcript, and they do not lock the lead's composer. Two switches in Settings > General > Sessions control this: "Child prompts in this chat" (on by default) shows them, and "Lead relays answers to child questions" (on by default) lets the lead pass your answer to a child's question with its `answer_child_question` tool. That tool refuses tool permissions, plan approvals, commands and MCP prompts, which stay yours to answer in the dock. A question from an MCP server (a Power BI model asking you to confirm a change, for one) now reaches the chat the same way, as a form with the server's own choices, instead of only the terminal. When you answer a child's prompt in the dock while the lead is idle, the lead gets one line in its chat naming the child and the choice you picked, so it carries on without you typing "continue". A lead that is mid-turn gets the line when its turn ends within 30 seconds, and none after that.
+
+**Where:** The strip and its list in the lead's chat; Settings > General > Sessions.<br>
+**Built from:** core patches [`0210`](../../patches/0210-ae-patch-Show-a-session-s-questions-and-prompts-in-i.patch), [`0211`](../../patches/0211-ae-patch-Park-an-MCP-server-s-own-question-as-a-pend.patch), [`0218`](../../patches/0218-ae-patch-Tell-registered-observers-when-the-server-a.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+
+## One button per choice
+
+<p align="center"><img src="../media/dock-child-choice.jpg" alt="One button per choice"></p>
+
+A prompt that asks for one choice from a short list, such as an MCP server asking you to confirm a change, shows one button per answer instead of a dropdown and Submit. The buttons drop the words every answer shares at the end, so "Continue the operation" and "Decline the operation" read Continue and Decline, and the full wording stays in the tooltip. A Reject button still shows unless one of the choices already declines (a value or label starting with no, decline, cancel, deny or reject). A form with more fields, an optional field or more than four values keeps its usual controls.
+
+**Where:** Any approval card or dock prompt that asks for a single required choice.<br>
+**Built from:** core patch [`0213`](../../patches/0213-ae-patch-Show-a-single-choice-form-prompt-as-one-but.patch)
+
 ## Usage gate
 
 <p align="center"><img src="../media/dock-usage-gate.webp" alt="Usage gate"></p>
 
-When the account a chat runs on reaches 90% of its 5-hour or weekly limit, the dock says so ("Backup is at 93% of its 5-hour limit, resets 11:58 AM") and offers New chat, plus Switch model where the chat has a model menu and Switch account on a Claude chat that can fork to another login. It never blocks sending. A dismissal holds for that account until the window resets.
+When the account a chat runs on reaches 90% of its 5-hour or weekly limit, the dock says so ("Backup is at 93% of its 5-hour limit, resets 11:58 AM") and offers New chat, plus Switch model where the chat has a model menu and, on a Claude chat, Switch account and Copy to another login. Switch account restarts this chat on another login and resumes it (a menu when there is more than one to pick; the next reply re-reads the conversation, which uses extra tokens), and Copy to another login forks the chat, history included, onto the login you pick. Switch account shows only when another login exists, and Copy to another login only when the chat can be forked as well. It never blocks sending. A dismissal holds for that account until the window resets.
 
 **Where:** The strip and the opened list, in a Claude Code or Codex chat near a plan limit.<br>
-**Built from:** core patch [`0142`](../../patches/0142-ae-patch-Show-a-usage-limit-item-in-the-action-dock-.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+**Built from:** core patches [`0142`](../../patches/0142-ae-patch-Show-a-usage-limit-item-in-the-action-dock-.patch), [`0209`](../../patches/0209-ae-patch-Switch-a-Claude-chat-s-login-in-place-and-k.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
 ## Every open pull request with its state
 

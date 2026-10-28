@@ -1060,6 +1060,8 @@ export interface VaultInventory {
   read_at: string | null;
   stale: boolean;
   box_vault: string;
+  /** False when no vault name is set on the server and nothing has been read yet. */
+  configured?: boolean;
   vaults: VaultView[];
   /** False when the server cannot save owners (no /data): the pickers are hidden. */
   owners_editable?: boolean;

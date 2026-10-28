@@ -53,7 +53,7 @@ Since 2026-10-23 the secrets block is "Secrets on this box" and starts collapsed
 
 ## Key Vault
 
-Every secret in both Key Vaults (`ae-secrets-vault` and the website's `kv-example-web`), by name. A switch picks the vault; four numbers count the expired ones, those expiring inside 60 days, those with no expiry set and those unchanged for 180 days or more; Needs you lists the few worth a look, worst first, including any secret whose two copies were changed apart and so needs rotating in both vaults. Show all opens a search box, filters (On box, Both vaults, No expiry, 180d+) and the secrets grouped by the first word of their name, with groups folded until you open one or search. App secrets tagged to their Entra app, and the server's GitHub token, show the issuer's end date when it comes first ("from Entra", "from GitHub"). Admins only: the names say which services we use. Values never leave Key Vault; the daily check on the box reads names and dates (`deploy/README.md`, Secret expiry dates).
+Every secret in both Key Vaults (the main vault and the website's `kv-example-web`), by name. A switch picks the vault; four numbers count the expired ones, those expiring inside 60 days, those with no expiry set and those unchanged for 180 days or more; Needs you lists the few worth a look, worst first, including any secret whose two copies were changed apart and so needs rotating in both vaults. Show all opens a search box, filters (On box, Both vaults, No expiry, 180d+) and the secrets grouped by the first word of their name, with groups folded until you open one or search. App secrets tagged to their Entra app, and the server's GitHub token, show the issuer's end date when it comes first ("from Entra", "from GitHub"). Admins only: the names say which services we use. Values never leave Key Vault; the daily check on the box reads names and dates (`deploy/README.md`, Secret expiry dates).
 
 Since 2026-10-23 every secret can have an owner, an OmniGent member picked from the member list: open a row (or a group's "Set owner for all") to set it. Rows and Needs you lines show the owner's initials, the filters count each owner and "No owner", and the counts say how many have none. The server also files a task in the task app, with a 09:00 alarm that rings on the phone, when a secret's expiry is 30 days away, moves that alarm at 7 days and when it expires, and closes the task once the secret is rotated; Needs you says when an alarm is set and the tile says when the next one rings (`deploy/README.md`, Expiry alerts).
 
@@ -108,6 +108,15 @@ Stock Omnigent lets an admin switch a global policy on or off. The fork adds Edi
 
 **Where:** Settings > Global Policies: the pencil on a policy with parameters.<br>
 **Built from:** core patches [`0094`](../../patches/0094-ae-patch-Check-a-global-policy-s-factory_params-by-b.patch), [`0095`](../../patches/0095-ae-patch-Edit-a-global-policy-s-parameters-on-the-Gl.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+
+## Open tabs hear about an update
+
+<p align="center"><img src="../media/reload-notice.jpg" alt="Open tabs hear about an update"></p>
+
+Stock Omnigent keeps running the page a tab loaded, so a fix deployed to the server stays invisible until someone reloads. The fork checks the server's start page every two minutes and whenever the window comes back into view. When the server runs a newer build, a toast says Omnigent was updated, with Reload and Later. Later keeps that tab on the page it has until the next update.
+
+**Where:** Any open tab, after the server is redeployed.<br>
+**Built from:** core patches [`0214`](../../patches/0214-ae-patch-Tell-an-open-tab-that-the-server-was-update.patch), [`0215`](../../patches/0215-ae-patch-Spell-Omnigent-the-usual-way-in-the-Reload-.patch)
 
 ---
 
