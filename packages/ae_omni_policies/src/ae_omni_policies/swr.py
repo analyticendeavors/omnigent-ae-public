@@ -1,7 +1,7 @@
 """A small stale-while-revalidate cache for the Dashboard's slow reads.
 
-Why (2026-09-26): Reid waited 3 to 5 seconds on every open of the Dashboard
-on his iPhone. Measured on the box that day with his login (two GETs each):
+Why (2026-09-26): the owner waited 3 to 5 seconds on every open of the Dashboard
+on their iPhone. Measured on the box that day with their login (two GETs each):
 ``/v1/ae/prs`` 2321 ms cold and 12 ms warm (the tracked-PR scan, one loopback
 per session), ``/v1/ae/lot?status=open`` about 320 ms on every call
 (task-store through Cloudflare, uncached), ``/v1/ae/lot/tags?icons=true``

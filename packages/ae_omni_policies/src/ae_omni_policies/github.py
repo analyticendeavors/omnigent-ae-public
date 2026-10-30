@@ -1,7 +1,7 @@
 """GitHub client for the Your move pull requests and the PR cards' Merge button.
 
-Added 2026-09-24. Reid merges from his phone and kept asking
-which pull requests were his to act on; the server had no GitHub credential,
+Added 2026-09-24. The owner merges from their phone and kept asking
+which pull requests were theirs to act on; the server had no GitHub credential,
 so this reads an optional one from the environment:
 
 - ``AE_GITHUB_TOKEN``: a fine-grained personal access token on the repos

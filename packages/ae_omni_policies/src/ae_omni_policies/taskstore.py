@@ -2,7 +2,7 @@
 
 Source: ``task-store-worker/src/index.ts`` in analyticendeavors/ae-claude-skills.
 The worker (a Cloudflare Worker behind Microsoft OAuth) is how chat surfaces
-reach Reid's task app; this client is how the OmniGent server reaches it, with
+reach the owner's task app; this client is how the OmniGent server reaches it, with
 the same outbound credential: a Cloudflare Access service token in
 ``CF-Access-Client-Id`` / ``CF-Access-Client-Secret``. The store answers as the
 machine principal ``service:<client-id>.access``, which may GET, POST and PATCH
@@ -18,7 +18,7 @@ learned (worker README, "Things the code knows"):
 - one retry on 5xx, never on 4xx; a transport retry only where a second attempt
   cannot double-write (every GET, and ``POST /buckets``);
 - the Parking Lot list must have ``surface: "parking"`` or every parked task
-  lands on Reid's phone as a reminder.
+  lands on the owner's phone as a reminder.
 
 Two places deliberately differ from the worker: the 1010 check runs before the
 JSON parse (the worker's own copy sits after it and can never fire on the HTML
@@ -641,7 +641,7 @@ class TaskStoreClient:
             else:
                 warnings.append(
                     f"The task was filed but the issue link did not attach ({linked.error}). "
-                    f"Give Reid the issue URL inline: {fields.issue_url}"
+                    f"Give the user the issue URL inline: {fields.issue_url}"
                 )
 
         return {
@@ -734,7 +734,7 @@ class TaskStoreClient:
         tool of the same name. The store answers ``{"tags": [{"name", "icon",
         "color"}], "colors": [...], "counts": {name: n | {"tasks": n}}}``; the
         worker flattens that to one row per tag with its task count and sorts
-        by use, so a gate message proposes tags Reid already filters on.
+        by use, so a gate message proposes tags the owner already filters on.
 
         2026-09-25 (issue 28): each row also carries the tag's ``color`` (a
         name from the app's palette, e.g. ``teal``) and ``icon`` (a Tabler icon
@@ -804,7 +804,7 @@ class TaskStoreClient:
                 "issue_url": issue_url,
                 "instruction": (
                     "The task and the issue both exist, but nothing joins them. Report the "
-                    "task as filed and give Reid the issue URL inline."
+                    "task as filed and give the user the issue URL inline."
                 ),
             }
         link_id = linked.data.get("id") if isinstance(linked.data, dict) else None

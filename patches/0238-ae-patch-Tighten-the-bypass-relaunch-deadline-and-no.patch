@@ -1,0 +1,654 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:13:41 -0700
+Subject: [PATCH 238/260] [ae-patch] Tighten the bypass relaunch deadline and
+ notices
+
+The 70 s restart deadline now starts once the session lock is held, and a switch queued more than 15 s behind another answers a busy refusal without touching the pane. Any 504 from the runner path counts as an unknown outcome, not a refusal. The PATCH response carries permission_switch (switched, restarted or unconfirmed) so the composer says restarted only after a restart and shows a plain notice when the mode was not read.
+---
+ omnigent/runner/ae_bypass_relaunch.py         | 34 +++++++------
+ omnigent/runner/ae_claude_account.py          | 47 ++++++++++++-----
+ .../routes/sessions/ae_bypass_switch.py       | 32 ++++++++----
+ .../server/routes/sessions/routes_core.py     |  9 +++-
+ omnigent/server/schemas.py                    |  6 +++
+ openapi.json                                  | 17 +++++++
+ tests/runner/test_ae_bypass_relaunch.py       | 50 +++++++++++++++++++
+ .../integration/test_sessions_endpoints.py    |  6 ++-
+ web/src/lib/claudePermissionMode.test.ts      | 32 ++++++++++++
+ web/src/lib/claudePermissionMode.ts           | 21 ++++++++
+ web/src/lib/sessionsApi.ts                    |  3 ++
+ web/src/lib/types.ts                          |  2 +
+ web/src/pages/ChatPage.composer.test.tsx      | 30 +++++++++++
+ web/src/pages/ChatPage.tsx                    | 21 ++++----
+ web/src/store/chatStore.ts                    |  3 +-
+ 15 files changed, 261 insertions(+), 52 deletions(-)
+
+diff --git a/omnigent/runner/ae_bypass_relaunch.py b/omnigent/runner/ae_bypass_relaunch.py
+index 969367c16c877be7911d8c10e7cdce84760d3b43..ad7c3e18fe1e516ef787202de990f57a63c91cbf 100644
+--- a/omnigent/runner/ae_bypass_relaunch.py
++++ b/omnigent/runner/ae_bypass_relaunch.py
+@@ -24,13 +24,13 @@ Answers to ``{"type": "permission_mode_change"}`` for such a switch:
+     up in the new mode, so the server must not roll anything back.
+ 
+ The whole restart, including the read of the new pane's mode, runs inside the
+-session's switching lock under one deadline, so no turn is injected before the
+-read and two quick switches cannot interleave.
++session's switching lock under one deadline counted from when the lock is held
++(a switch queued too long behind another answers 409 busy instead), so no turn
++is injected before the read and two quick switches cannot interleave.
+ """
+ 
+ from __future__ import annotations
+ 
+-import asyncio
+ import time
+ from collections.abc import Awaitable, Callable
+ from pathlib import Path
+@@ -53,8 +53,11 @@ if TYPE_CHECKING:
+ BYPASS = "bypassPermissions"
+ # Longest the new pane gets to show its permission-mode footer.
+ SETTLE_TIMEOUT_S = 15.0
+-# The whole restart and settle; well under the server's 90 s forward budget.
++# The restart and settle, counted from when the session's lock is held.
+ RELAUNCH_DEADLINE_S = 70.0
++# Longest a switch waits behind another one before it answers busy; with the
++# deadline above it stays under the server's 90 s forward budget.
++LOCK_WAIT_S = 15.0
+ 
+ BYPASS_REFUSALS = Refusals(
+     busy_code="claude_bypass_busy",
+@@ -163,18 +166,17 @@ async def handle_claude_relaunch_switch(
+         return JSONResponse(content)
+ 
+     try:
+-        return await asyncio.wait_for(
+-            relaunch_claude_terminal(
+-                conversation_id,
+-                turn_in_flight=turn_in_flight,
+-                terminal_registry=terminal_registry,
+-                close_terminal=close_terminal,
+-                ensure_terminal=ensure_terminal,
+-                publish_event=publish_event,
+-                refusals=BYPASS_REFUSALS,
+-                finish=finish,
+-            ),
+-            RELAUNCH_DEADLINE_S,
++        return await relaunch_claude_terminal(
++            conversation_id,
++            turn_in_flight=turn_in_flight,
++            terminal_registry=terminal_registry,
++            close_terminal=close_terminal,
++            ensure_terminal=ensure_terminal,
++            publish_event=publish_event,
++            refusals=BYPASS_REFUSALS,
++            finish=finish,
++            deadline_s=RELAUNCH_DEADLINE_S,
++            lock_wait_s=LOCK_WAIT_S,
+         )
+     except TimeoutError:
+         return JSONResponse(
+diff --git a/omnigent/runner/ae_claude_account.py b/omnigent/runner/ae_claude_account.py
+index 4e2fa875aab2724d29a62d993e59d5cf51016b24..3476e4bda9b8d382f600df16e932614556718f82 100644
+--- a/omnigent/runner/ae_claude_account.py
++++ b/omnigent/runner/ae_claude_account.py
+@@ -177,6 +177,8 @@ async def relaunch_claude_terminal(
+     publish_event: PublishEvent,
+     refusals: Refusals,
+     finish: Callable[[], Awaitable[Response]] | None = None,
++    deadline_s: float | None = None,
++    lock_wait_s: float | None = None,
+ ) -> Response:
+     """
+     Restart a claude-native session's terminal, one relaunch at a time per session.
+@@ -194,6 +196,10 @@ async def relaunch_claude_terminal(
+     :param refusals: The codes and sentences for the 409 answers.
+     :param finish: Runs inside the lock, after the new terminal is up and before the
+         session stops being marked switching; its response replaces the plain 200.
++    :param deadline_s: Longest the restart and *finish* may take once the lock is held;
++        ``TimeoutError`` escapes when it runs out. ``None`` is unbounded.
++    :param lock_wait_s: Longest to wait for the lock behind another relaunch; past it
++        the answer is the busy refusal and nothing was touched. ``None`` waits.
+     :returns: ``200 {"relaunched": true}``, the *finish* response, or a 409 response.
+     """
+     lock = _locks.get(conversation_id)
+@@ -202,19 +208,34 @@ async def relaunch_claude_terminal(
+     _queued[conversation_id] = _queued.get(conversation_id, 0) + 1
+     done = _switching.setdefault(conversation_id, asyncio.Event())
+     try:
+-        async with lock:
+-            response = await _replace_terminal(
+-                conversation_id,
+-                turn_in_flight=turn_in_flight,
+-                terminal_registry=terminal_registry,
+-                close_terminal=close_terminal,
+-                ensure_terminal=ensure_terminal,
+-                publish_event=publish_event,
+-                refusals=refusals,
+-            )
+-            if finish is not None and response.status_code == 200:
+-                return await finish()
+-            return response
++        if lock_wait_s is None:
++            await lock.acquire()
++        else:
++            try:
++                await asyncio.wait_for(lock.acquire(), lock_wait_s)
++            except TimeoutError:
++                return _error(409, refusals.busy_code, refusals.busy_detail)
++        try:
++
++            async def restart() -> Response:
++                response = await _replace_terminal(
++                    conversation_id,
++                    turn_in_flight=turn_in_flight,
++                    terminal_registry=terminal_registry,
++                    close_terminal=close_terminal,
++                    ensure_terminal=ensure_terminal,
++                    publish_event=publish_event,
++                    refusals=refusals,
++                )
++                if finish is not None and response.status_code == 200:
++                    return await finish()
++                return response
++
++            if deadline_s is None:
++                return await restart()
++            return await asyncio.wait_for(restart(), deadline_s)
++        finally:
++            lock.release()
+     finally:
+         _queued[conversation_id] -= 1
+         if _queued[conversation_id] <= 0:
+diff --git a/omnigent/server/routes/sessions/ae_bypass_switch.py b/omnigent/server/routes/sessions/ae_bypass_switch.py
+index ba90fcded4b499afa15e15c7848e0c15ff0d18f3..f677f92ba46fc84769b53603885dc470d5cf96b2 100644
+--- a/omnigent/server/routes/sessions/ae_bypass_switch.py
++++ b/omnigent/server/routes/sessions/ae_bypass_switch.py
+@@ -25,7 +25,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ from collections.abc import Sequence
+-from typing import Any
++from typing import Any, Literal
+ 
+ import httpx
+ 
+@@ -40,13 +40,12 @@ from omnigent.stores.conversation_store import ConversationStore
+ 
+ BYPASS_MODE = "bypassPermissions"
+ 
++SwitchOutcome = Literal["switched", "restarted", "unconfirmed"]
++
+ # A relaunch closes the pane, starts Claude again and reads its mode, which the
+ # runner bounds at 70 s; this is the server's wait for that answer.
+ RELAUNCH_FORWARD_TIMEOUT_S = 90.0
+ 
+-# The runner answers 504 with this code when its own deadline ran out mid-restart.
+-RUNNER_TIMEOUT_CODE = "claude_bypass_timeout"
+-
+ 
+ def args_request_bypass(args: Sequence[str] | None) -> bool:
+     """
+@@ -186,13 +185,28 @@ async def _forward(
+ 
+ 
+ def _runner_timed_out(result: _RunnerForwardResult) -> bool:
+-    if result.status_code != 504:
+-        return False
++    # The runner answers 504 when its own deadline ran out mid-restart; a gateway
++    # or tunnel in front of it answers 504 when it gave up waiting. Either way the
++    # restart may still be going, so no 504 is a refusal.
++    return result.status_code == 504
++
++
++def switch_outcome(result: _RunnerForwardResult | None) -> SwitchOutcome:
++    """
++    Name what the runner did, for the PATCH response.
++
++    :param result: The runner's 2xx answer.
++    :returns: ``"unconfirmed"`` when Claude restarted but its mode was not read,
++        ``"restarted"`` when it restarted, else ``"switched"`` (shift+tab, or
++        already in the mode).
++    """
++    if relaunch_unconfirmed(result):
++        return "unconfirmed"
+     try:
+-        body = json.loads(result.body)
++        body = json.loads(result.body) if result is not None else None
+     except (TypeError, ValueError):
+-        return False
+-    return isinstance(body, dict) and body.get("error") == RUNNER_TIMEOUT_CODE
++        body = None
++    return "restarted" if isinstance(body, dict) and body.get("relaunched") is True else "switched"
+ 
+ 
+ async def switch_claude_permission_mode(
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 8282450ca8fa7b69fe778aeecb180394164c7dec..22e21e25116cf2e340927c53d48f308645e5e48d 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -189,8 +189,10 @@ from omnigent.server.routes._sessions.orchestration import (
+     ensure_runner_connected,
+ )
+ from omnigent.server.routes.sessions.ae_bypass_switch import (
++    SwitchOutcome,
+     relaunch_unconfirmed,
+     switch_claude_permission_mode,
++    switch_outcome,
+ )
+ from omnigent.server.routes.sessions.ae_live_account_label import (
+     reject_live_account_seed,
+@@ -3050,6 +3052,7 @@ def register_core_routes(
+                 _codex_plan_enabled,
+                 _runner_result,
+             )
++        _permission_switch: SwitchOutcome | None = None
+         if requested_permission_mode is not None and live_forward:
+             # omnigent-ae: every claude-native switch pins the target in the launch args
+             # first (the runner may restart the pane, which reads them) and gets the
+@@ -3082,6 +3085,8 @@ def register_core_routes(
+                 requested_permission_mode,
+                 _mode_result,
+             )
++            if _claude_switch:
++                _permission_switch = switch_outcome(_mode_result)
+             # A restart whose mode could not be read keeps the pinned args (the pane
+             # launched from them) and stamps no label; the forwarder corrects it.
+             if not (_claude_switch and relaunch_unconfirmed(_mode_result)):
+@@ -3235,7 +3240,7 @@ def register_core_routes(
+         # PATCH callers consume only the snapshot's scalar fields (clients
+         # hydrate transcripts via GET /sessions/{id}/items), so skip the
+         # items read — it dominated this response's size and build time.
+-        return await _get_session_snapshot(
++        _snapshot = await _get_session_snapshot(
+             conversation_store,
+             session_id,
+             level,
+@@ -3248,6 +3253,8 @@ def register_core_routes(
+             viewer_id=user_id,
+             request=request,
+         )
++        _snapshot.permission_switch = _permission_switch
++        return _snapshot
+ 
+     # ── POST /sessions/{source_id}/fork ─────────────────────────
+ 
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index cee27e72e9007ea3f24360b2d5f59b0b0a033103..9605f844b056517ebdcd53815785650a5cb385d8 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -2127,6 +2127,11 @@ class SessionResponse(BaseModel):
+         ``["--dangerously-skip-permissions"]``. ``None`` for
+         non-native sessions or a native session launched with none.
+         Lets the launcher reproduce the command on resume.
++    :param permission_switch: Set only on the ``PATCH`` response of a Claude
++        permission-mode change: ``"switched"`` (shift+tab, or already in the
++        mode), ``"restarted"`` (Claude was restarted in the same chat) or
++        ``"unconfirmed"`` (restarted, but the mode it landed in could not be
++        read, so the label is unchanged until the forwarder reads it).
+     :param pending_elicitations: Outstanding approval prompts on
+         this session at the moment the snapshot was built — the
+         original ``response.elicitation_request`` event dicts.
+@@ -2238,6 +2243,7 @@ class SessionResponse(BaseModel):
+     last_task_error: dict[str, str] | None = None
+     external_session_id: str | None = None
+     terminal_launch_args: list[str] | None = None
++    permission_switch: Literal["switched", "restarted", "unconfirmed"] | None = None
+     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)
+     # Un-consumed web-composer user messages on native-terminal
+     # sessions at snapshot time, each ``{"pending_id", "content"}``.
+diff --git a/openapi.json b/openapi.json
+index b8168e2a6836bf1834aa28e7bbd814c69b926314..83901c33f8793643deba947548bae2008d3ae65e 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -7836,6 +7836,23 @@
+             "description": "The requesting user's numeric permission level on this session: `1` = read, `2` = edit, `3` = manage. `None` when permissions are disabled (single-user mode without a permission store).",
+             "title": "Permission Level"
+           },
++          "permission_switch": {
++            "anyOf": [
++              {
++                "enum": [
++                  "switched",
++                  "restarted",
++                  "unconfirmed"
++                ],
++                "type": "string"
++              },
++              {
++                "type": "null"
++              }
++            ],
++            "description": "Set only on the `PATCH` response of a Claude permission-mode change: `\"switched\"` (shift+tab, or already in the mode), `\"restarted\"` (Claude was restarted in the same chat) or `\"unconfirmed\"` (restarted, but the mode it landed in could not be read, so the label is unchanged until the forwarder reads it).",
++            "title": "Permission Switch"
++          },
+           "project_id": {
+             "anyOf": [
+               {
+diff --git a/tests/runner/test_ae_bypass_relaunch.py b/tests/runner/test_ae_bypass_relaunch.py
+index efdb057b6469cafc4d179deee42c42cca061968b..8e3c36e19ad6d12e62cddc454dbdac34e78a9b8f 100644
+--- a/tests/runner/test_ae_bypass_relaunch.py
++++ b/tests/runner/test_ae_bypass_relaunch.py
+@@ -300,3 +300,53 @@ async def test_a_turn_waits_through_two_queued_relaunches() -> None:
+     await turn_task
+     assert finished_when_turn_woke == [2]
+     assert not is_switching(SESSION_ID)
++
++
++async def test_a_switch_queued_too_long_answers_busy_and_touches_nothing(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(ae_bypass_relaunch, "LOCK_WAIT_S", 0.05)
++    runner = _Runner(_Registry(_Terminal()))
++    entered = asyncio.Event()
++    release = asyncio.Event()
++    plain_ensure = runner.ensure
++
++    async def gated_ensure(session_id: str, harness: str | None) -> None:
++        entered.set()
++        await release.wait()
++        await plain_ensure(session_id, harness)
++
++    runner.ensure = gated_ensure  # type: ignore[method-assign]
++    first = asyncio.create_task(_switch(runner, target=BYPASS, current="auto", settled=BYPASS))
++    await entered.wait()
++    calls_before = list(runner.calls)
++    status, body = await _switch(runner, target="plan", current=BYPASS, settled="plan")
++    assert (status, body["error"]) == (409, "claude_bypass_busy")
++    assert runner.calls == calls_before  # the queued switch closed and started nothing
++    release.set()
++    assert (await first)[0] == 200
++
++
++async def test_the_deadline_starts_when_the_lock_is_held(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A switch that waits for the lock longer than the deadline still gets all of it."""
++    monkeypatch.setattr(ae_bypass_relaunch, "RELAUNCH_DEADLINE_S", 0.3)
++    monkeypatch.setattr(ae_bypass_relaunch, "LOCK_WAIT_S", 5.0)
++    runner = _Runner(_Registry(_Terminal()))
++    plain_ensure = runner.ensure
++    ensures = 0
++
++    async def slow_first_ensure(session_id: str, harness: str | None) -> None:
++        nonlocal ensures
++        ensures += 1
++        if ensures == 1:
++            await asyncio.sleep(0.25)
++        await plain_ensure(session_id, harness)
++
++    runner.ensure = slow_first_ensure  # type: ignore[method-assign]
++    first = asyncio.create_task(_switch(runner, target=BYPASS, current="auto", settled=BYPASS))
++    await asyncio.sleep(0.05)
++    second = await _switch(runner, target="plan", current=BYPASS, settled="plan")
++    assert (await first)[0] == 200
++    assert second[0] == 200  # waited about 0.2 s for the lock, past 0.3 s in total
+diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
+index 3ff6f7c5a49ab656b87fbc8102dfd676c736765d..97858537e88cc7f91d912854fbbf858071ea3b68 100644
+--- a/tests/server/integration/test_sessions_endpoints.py
++++ b/tests/server/integration/test_sessions_endpoints.py
+@@ -11501,6 +11501,7 @@ async def test_patch_permission_mode_pins_args_before_the_long_forward(
+         runner_response=httpx.Response(200, json={"permission_mode": requested}),
+     )
+     assert resp.status_code == 200, resp.text
++    assert resp.json()["permission_switch"] == "switched"
+     assert events == ["pin", "forward"]
+     assert timeouts == [90.0]
+     assert snapshot["terminal_launch_args"] == ["--model", "opus", "--permission-mode", requested]
+@@ -11578,8 +11579,9 @@ async def test_patch_permission_mode_refusal_or_no_runner_restores_args_and_labe
+         httpx.Response(
+             504, json={"error": "claude_bypass_timeout", "detail": "Still restarting."}
+         ),
++        httpx.Response(504, text="Gateway Timeout"),
+     ],
+-    ids=["read_timeout", "runner_deadline"],
++    ids=["read_timeout", "runner_deadline", "gateway_504"],
+ )
+ @pytest.mark.parametrize(
+     ("requested", "label", "launch_args", "kept"),
+@@ -11642,6 +11644,7 @@ async def test_patch_permission_mode_relaunch_records_the_mode_the_pane_reached(
+         ),
+     )
+     assert resp.status_code == 200, resp.text
++    assert resp.json()["permission_switch"] == "restarted"
+     assert snapshot["labels"][_LABEL_KEY] == "default"
+     assert snapshot["terminal_launch_args"] == ["--permission-mode", "default"]
+ 
+@@ -11665,6 +11668,7 @@ async def test_patch_permission_mode_unread_mode_keeps_the_pin_and_stamps_nothin
+         runner_response=httpx.Response(200, json={"relaunched": True}),
+     )
+     assert resp.status_code == 200, resp.text
++    assert resp.json()["permission_switch"] == "unconfirmed"
+     assert resp.json()["labels"][_LABEL_KEY] == "auto"
+     assert snapshot["labels"][_LABEL_KEY] == "auto"
+     assert snapshot["terminal_launch_args"] == ["--permission-mode", "bypassPermissions"]
+diff --git a/web/src/lib/claudePermissionMode.test.ts b/web/src/lib/claudePermissionMode.test.ts
+index bff8461ff39282de29f5c7b0f588e9047b8058bc..a012392a558f256f33cbf1316e1204cb9dec41b8 100644
+--- a/web/src/lib/claudePermissionMode.test.ts
++++ b/web/src/lib/claudePermissionMode.test.ts
+@@ -5,10 +5,42 @@ import {
+   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+   claudePermissionModeFromSession,
+   claudePermissionModeLabel,
++  claudePermissionSwitchNotice,
+   isClaudeNativeSession,
+   isSwitchableClaudePermissionMode,
+ } from "@/lib/claudePermissionMode";
+ 
++describe("claudePermissionSwitchNotice", () => {
++  it("is silent when the switch landed where asked", () => {
++    expect(claudePermissionSwitchNotice("plan", "plan", "restarted")).toBeNull();
++    expect(claudePermissionSwitchNotice("plan", "plan", "switched")).toBeNull();
++  });
++
++  it("says only that Claude restarted when its mode was not read", () => {
++    expect(claudePermissionSwitchNotice("plan", "auto", "unconfirmed")).toBe(
++      "Claude restarted; its mode will show once it is read.",
++    );
++  });
++
++  it("says restarted only after a restart", () => {
++    expect(claudePermissionSwitchNotice("plan", "auto", "restarted")).toBe(
++      "Claude restarted but is in Auto, not Plan.",
++    );
++    expect(claudePermissionSwitchNotice("plan", "auto", "switched")).toBe(
++      "Claude is in Auto, not Plan.",
++    );
++    expect(claudePermissionSwitchNotice("plan", "auto", undefined)).toBe(
++      "Claude is in Auto, not Plan.",
++    );
++  });
++
++  it("keeps the managed-setting hint for a bypass request that was restarted", () => {
++    expect(claudePermissionSwitchNotice("bypassPermissions", "default", "restarted")).toBe(
++      "Claude restarted but stayed in Manual. A managed setting on this host may turn bypass off.",
++    );
++  });
++});
++
+ describe("claudePermissionMode", () => {
+   it("offers only shift+tab-reachable modes for a running session", () => {
+     // dontAsk is never in Claude's cycle — offering it would produce a switch
+diff --git a/web/src/lib/claudePermissionMode.ts b/web/src/lib/claudePermissionMode.ts
+index 96299389a0243674dc4138910c8d4cff7b41eb3a..769e8f138999300b3c5f4e8961b39061e473a939 100644
+--- a/web/src/lib/claudePermissionMode.ts
++++ b/web/src/lib/claudePermissionMode.ts
+@@ -78,6 +78,27 @@ export function claudePermissionModeLabel(mode: string | null | undefined): stri
+   return CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === mode)?.label ?? mode;
+ }
+ 
++/**
++ * The notice to show after a Claude permission switch, or `null` when it landed
++ * where it was asked to. `outcome` is what the server says the runner did:
++ * `"restarted"` (Claude restarted in the same chat), `"unconfirmed"` (restarted,
++ * mode not yet read) or `"switched"` (shift+tab).
++ */
++export function claudePermissionSwitchNotice(
++  requested: string,
++  reached: string | null | undefined,
++  outcome: "switched" | "restarted" | "unconfirmed" | undefined,
++): string | null {
++  if (outcome === "unconfirmed") return "Claude restarted; its mode will show once it is read.";
++  if (!reached || reached === requested) return null;
++  const was = claudePermissionModeLabel(reached);
++  if (outcome !== "restarted")
++    return `Claude is in ${was}, not ${claudePermissionModeLabel(requested)}.`;
++  return requested === "bypassPermissions"
++    ? `Claude restarted but stayed in ${was}. A managed setting on this host may turn bypass off.`
++    : `Claude restarted but is in ${was}, not ${claudePermissionModeLabel(requested)}.`;
++}
++
+ /**
+  * The permission mode a running claude-native session is in, or `null` when
+  * it cannot be determined.
+diff --git a/web/src/lib/sessionsApi.ts b/web/src/lib/sessionsApi.ts
+index 8be41d1912596be46d95ed9a31e92e0ed0694d6b..7fa9802a5067c2050823dcb00f98bb310dc09b56 100644
+--- a/web/src/lib/sessionsApi.ts
++++ b/web/src/lib/sessionsApi.ts
+@@ -160,6 +160,8 @@ interface SessionResponseWire {
+    * a later mode switch is reflected in `labels`, not here.
+    */
+   terminal_launch_args?: string[] | null;
++  /** PATCH of a Claude permission mode only: what the runner did. */
++  permission_switch?: "switched" | "restarted" | "unconfirmed" | null;
+   /** Worktree branch; ``null`` when the session uses no worktree. */
+   git_branch?: string | null;
+   items?: SessionItem[];
+@@ -336,6 +338,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
+     labels: wire.labels,
+     workspace: wire.workspace ?? null,
+     terminalLaunchArgs: wire.terminal_launch_args ?? null,
++    permissionSwitch: wire.permission_switch ?? undefined,
+     gitBranch: wire.git_branch ?? null,
+     items: wire.items ?? [],
+     queuedItems: wire.queued_items,
+diff --git a/web/src/lib/types.ts b/web/src/lib/types.ts
+index a5adbb0709c19bda620fa231a757f28ae213922e..5883e89c7d0e79c3d917ae6b7dfe5415782ea768 100644
+--- a/web/src/lib/types.ts
++++ b/web/src/lib/types.ts
+@@ -337,6 +337,8 @@ export interface Session {
+    * via `claudePermissionModeFromSession` rather than from these args.
+    */
+   terminalLaunchArgs?: string[] | null;
++  /** PATCH of a Claude permission mode only: what the runner did. */
++  permissionSwitch?: "switched" | "restarted" | "unconfirmed";
+   /**
+    * Git branch checked out in a server-created worktree, e.g.
+    * ``"feature/login"``. ``null`` when the session uses no worktree.
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 7a7c6d890cb17587e5a6790f40066474c48198e9..e95741b7c10df6280600130ea5236f157d93a07d 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -3130,6 +3130,7 @@ describe("Composer shared visible controls", () => {
+       .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+       .mockImplementation(async () => {
+         useChatStore.setState({ claudePermissionMode: "default" });
++        return "restarted";
+       });
+     renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
+@@ -3149,6 +3150,7 @@ describe("Composer shared visible controls", () => {
+       .spyOn(useChatStore.getState(), "setClaudePermissionMode")
+       .mockImplementation(async () => {
+         useChatStore.setState({ claudePermissionMode: "bypassPermissions" });
++        return "restarted";
+       });
+     renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
+     fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
+@@ -3157,6 +3159,34 @@ describe("Composer shared visible controls", () => {
+     await screen.findByText("Claude restarted but is in Bypass permissions, not Plan.");
+     expect(screen.queryByText(/managed setting/)).toBeNull();
+   });
++
++  it("does not claim a mismatch when the restarted mode is not read yet", async () => {
++    useChatStore.setState({ conversationId: "unread", claudePermissionMode: "auto" });
++    const setClaude = vi
++      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
++      .mockResolvedValue("unconfirmed");
++    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
++    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
++    fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
++    await waitFor(() => expect(setClaude).toHaveBeenCalledWith("plan"));
++    await screen.findByText("Claude restarted; its mode will show once it is read.");
++    expect(screen.queryByText(/not Plan/)).toBeNull();
++  });
++
++  it("drops the word restarted for a plain switch that landed elsewhere", async () => {
++    useChatStore.setState({ conversationId: "cycled", claudePermissionMode: "auto" });
++    const setClaude = vi
++      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
++      .mockImplementation(async () => {
++        useChatStore.setState({ claudePermissionMode: "acceptEdits" });
++        return "switched";
++      });
++    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
++    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
++    fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
++    await waitFor(() => expect(setClaude).toHaveBeenCalledWith("plan"));
++    await screen.findByText("Claude is in Accept edits, not Plan.");
++  });
+ });
+ 
+ describe("Composer background tasks", () => {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index c2be1fbf568ab1fee0e1ad5b77f554af9df64a92..cd3b276870e4ff3b07ceda4613fd9d6958590f1a 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -273,6 +273,7 @@ import { supportsEffortControl } from "@/lib/sessionCapabilities";
+ import {
+   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
+   claudePermissionModeLabel,
++  claudePermissionSwitchNotice,
+   isClaudeNativeSession,
+ } from "@/lib/claudePermissionMode";
+ import {
+@@ -2506,20 +2507,18 @@ function ComposerImpl(
+     const sourceSessionId = useChatStore.getState().conversationId;
+     try {
+       const store = useChatStore.getState();
+-      if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
++      let switched: Awaited<ReturnType<typeof store.setClaudePermissionMode>>;
++      if (showClaudePermissionMode) switched = await store.setClaudePermissionMode(mode);
+       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
+       if (useChatStore.getState().conversationId === sourceSessionId) {
+-        // omnigent-ae: Claude can land in another mode than asked (a managed setting
+-        // strips bypass; a restart whose mode could not be read keeps the old label).
+-        const reached = useChatStore.getState().claudePermissionMode;
+-        const differs =
+-          showClaudePermissionMode && !devinPermissionControl && !!reached && reached !== mode;
+         setCommandError(
+-          !differs
+-            ? null
+-            : mode === "bypassPermissions"
+-              ? `Claude restarted but stayed in ${claudePermissionModeLabel(reached)}. A managed setting on this host may turn bypass off.`
+-              : `Claude restarted but is in ${claudePermissionModeLabel(reached)}, not ${claudePermissionModeLabel(mode)}.`,
++          showClaudePermissionMode && !devinPermissionControl
++            ? claudePermissionSwitchNotice(
++                mode,
++                useChatStore.getState().claudePermissionMode,
++                switched,
++              )
++            : null,
+         );
+       }
+     } catch (error) {
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index ea584ff043609fcc2fec27341e7efe39f073d0a4..4edcc1f4368c17c0ffbbe6c97f97e4413177de12 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -1294,7 +1294,7 @@ export interface ChatActions {
+    * callers surface the error rather than assuming the switch landed.
+    * No-ops when there is no active conversation.
+    */
+-  setClaudePermissionMode: (mode: string) => Promise<void>;
++  setClaudePermissionMode: (mode: string) => Promise<Session["permissionSwitch"]>;
+   /**
+    * Switch a running codex-native session's approval/sandbox mode (e.g. to
+    * ``"full-access"``). Rejects when the live Codex thread could not accept the
+@@ -3328,6 +3328,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
+     try {
+       const session = await updateSession(conversationId, { claudePermissionMode: mode });
+       patchSet({ claudePermissionMode: claudePermissionModeFromSession(session) ?? "" });
++      return session.permissionSwitch;
+     } catch (err) {
+       patchSet({ claudePermissionMode: previous });
+       throw err;

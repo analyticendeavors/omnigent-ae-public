@@ -1,5 +1,5 @@
-// Your move (2026-09-24): everything waiting on Reid, readable on a phone.
-// Reid runs several sessions at once and merges from his phone and
+// Your move (2026-09-24): everything waiting on the owner, readable on a phone.
+// The owner runs several sessions at once and merges from their phone and
 // kept asking "what's left"; this answers "what is waiting on
 // me right now" from `GET /v1/ae/your-move`, each item with the one button
 // that resolves it.
@@ -14,7 +14,7 @@
 //   approvals       an approval or question outstanding; Open answers it in
 //                   the session (upstream's Inbox answers it too)
 //   due             lot items resurfacing today or overdue, with Resume
-//   pull requests   open PRs by or awaiting Reid with CI state, a Merge
+//   pull requests   open PRs by or awaiting the owner with CI state, a Merge
 //                   button and Open on GitHub (Copy link until 2026-09-27,
 //                   when core patch P25 let the host open GitHub pull
 //                   request URLs for the sandboxed frame; openLink.ts)
@@ -22,7 +22,7 @@
 //
 // Merge on the pull request cards (2026-09-24): Open PRs lists only pull
 // requests a session tracks, and the ones a subagent or another session opened
-// often are not tracked, so Reid saw green, mergeable pull requests here with
+// often are not tracked, so the owner saw green, mergeable pull requests here with
 // only Copy link. Each card now has the Open PRs card's Merge button, confirm
 // step and merged card (prs.ts). The full card (merge gate, head SHA, methods)
 // is read from `GET /v1/ae/prs/{owner}/{repo}/{number}` only when Merge is

@@ -543,7 +543,7 @@ def test_statusline_script_saves_stdin_and_chains(tmp_path: Path) -> None:
 # ── second pass (2026-09-24): bridge captures, get_usage, the merged rows ──
 
 # `get_usage` as the 2.1.282 CLI answers it for a Max login with the profile
-# scope (the control response body; values illustrative, not Reid's).
+# scope (the control response body; values illustrative, not the owner's).
 USAGE_REPLY: dict[str, Any] = {
     "session": {"total_cost_usd": 0, "model_usage": {}},
     "subscription_type": "max",
@@ -1119,22 +1119,22 @@ async def test_route_answers_one_sessions_view(client: httpx.AsyncClient) -> Non
 async def test_route_answers_a_session_only_to_a_caller_who_may_open_it(
     client: httpx.AsyncClient, ae_permissions: set[str]
 ) -> None:
-    reid = {"X-Forwarded-Email": "reid@example.com"}
-    steve = {"X-Forwarded-Email": "steve@example.com"}
-    client.headers.update(reid)
-    sid = (await create_test_session(client, title="Reid on the backup"))["id"]
+    owner = {"X-Forwarded-Email": "owner@example.com"}
+    member = {"X-Forwarded-Email": "member@example.com"}
+    client.headers.update(owner)
+    sid = (await create_test_session(client, title="Owner on the backup"))["id"]
     del client.headers["X-Forwarded-Email"]
     own = [_window("five_hour", 25), _window("seven_day", 4)]
     host = _host("statusline+usage", _own(sid, account="Backup", windows=own))
     posted = await client.post(
-        "/v1/ae/limits/claude", json=host.model_dump(mode="json"), headers=reid
+        "/v1/ae/limits/claude", json=host.model_dump(mode="json"), headers=owner
     )
     assert posted.status_code == 200, posted.text
 
-    plain = (await client.get("/v1/ae/limits", headers=steve)).json()["harnesses"]["claude"]
-    mine = await client.get("/v1/ae/limits", params={"session_id": sid}, headers=reid)
+    plain = (await client.get("/v1/ae/limits", headers=member)).json()["harnesses"]["claude"]
+    mine = await client.get("/v1/ae/limits", params={"session_id": sid}, headers=owner)
     assert mine.json()["harnesses"]["claude"]["account"] == "Backup"
-    theirs = await client.get("/v1/ae/limits", params={"session_id": sid}, headers=steve)
+    theirs = await client.get("/v1/ae/limits", params={"session_id": sid}, headers=member)
     assert theirs.status_code == 200, theirs.text
     assert theirs.json()["harnesses"]["claude"] == plain
 
@@ -1275,8 +1275,8 @@ def test_merge_lists_signed_in_accounts_without_a_reading_in_order() -> None:
     host = _host("statusline+usage", _reading("Zed", 3, 5, 5)).model_copy(
         update={
             "known_accounts": [
-                limits.KnownAccount(account=None, label="Reid main"),
-                limits.KnownAccount(account="Personal", label="Reid personal"),
+                limits.KnownAccount(account=None, label="Owner main"),
+                limits.KnownAccount(account="Personal", label="Owner personal"),
                 limits.KnownAccount(account="shared:Team", label="Team (shared)"),
             ]
         }
@@ -1285,8 +1285,8 @@ def test_merge_lists_signed_in_accounts_without_a_reading_in_order() -> None:
     store.put(codex_snapshot(CODEX_RESULT, NOW))
     rows = store.accounts({"shared:Team": "AE Team", "shared:Ops": "Ops"})
     assert [(r.harness, r.account, r.label) for r in rows] == [
-        ("claude", None, "Reid main"),
-        ("claude", "Personal", "Reid personal"),
+        ("claude", None, "Owner main"),
+        ("claude", "Personal", "Owner personal"),
         ("claude", "shared:Team", "AE Team (shared)"),
         ("claude", "shared:Ops", "Ops (shared)"),
         ("claude", "Zed", "Zed label"),
@@ -1353,7 +1353,7 @@ async def test_accounts_route_merges_and_says_nothing_secret(
     monkeypatch.setenv(shared_accounts.KEY_ENV, Fernet.generate_key().decode())
     token = "sk-ant-oat01-" + "a" * 40
     shared = shared_accounts.SharedAccountsStore(tmp_path / "shared.json")
-    shared.add("Team", "AE Team", token, "reid@example.com")
+    shared.add("Team", "AE Team", token, "owner@example.com")
     shared_accounts.reset_store(shared)
     try:
         empty = await client.get("/v1/ae/limits/accounts")
@@ -1415,7 +1415,7 @@ async def test_accounts_route_merges_and_says_nothing_secret(
             "live_sessions",
         }
         text = answer.text
-        for secret in ("reid@example.com", token, "sk-ant", "created_by", "@"):
+        for secret in ("owner@example.com", token, "sk-ant", "created_by", "@"):
             assert secret not in text
     finally:
         shared_accounts.reset_store()

@@ -57,6 +57,8 @@ const paused = (): FabricCapacity => ({
 function stubContext(replies: Record<string, Reply[]>) {
   const request = vi.fn(async ({ path }: { method: string; path: string; body?: unknown }) => {
     const queue = replies[path] ?? [];
+    // Who sees what (2026-10-28) is asked before the page draws: an admin, unless a test says.
+    if (path === "/v1/ae/access" && !queue.length) return ok({ admin: true, box_admin: true });
     return (
       queue.shift() ?? {
         ok: false,
@@ -86,7 +88,9 @@ function gatedContext() {
   const request = vi.fn(
     ({ path }: { method: string; path: string; body?: unknown }) =>
       new Promise<Reply>((resolve) => {
-        (waiting[path] ??= []).push(resolve);
+        // Who sees what (2026-10-28) is asked before anything draws: an admin, at once.
+        if (path === "/v1/ae/access") resolve(ok({ admin: true, box_admin: true }));
+        else (waiting[path] ??= []).push(resolve);
       }),
   );
   const context = {
@@ -1211,5 +1215,43 @@ describe("the capacity fleet (2026-10-21)", () => {
   it("keeps the size picker inside the meta line, where it wraps on a phone", () => {
     expect(css).toMatch(/\.fabric-size \{[^}]*max-width: 100%/);
     expect(css).toMatch(/\.card-fabric \.fabric-size \{[^}]*min-height: 44px/);
+  });
+});
+
+describe("a signed-in non-admin (2026-10-28)", () => {
+  it("gets one quiet line and no more reads", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+    const { context, request } = stubContext({ "/v1/ae/fabric": [denied, denied] });
+    await activateFabric(context);
+    await flush();
+    expect(document.body.textContent).toContain("Fabric capacities are for admins.");
+    expect(document.body.textContent).not.toContain("Fabric capacities could not be read");
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(request.mock.calls.filter(([call]) => call.path === "/v1/ae/fabric")).toHaveLength(1);
+  });
+});
+
+describe("a false admin_only answer (2026-10-28)", () => {
+  it("is looked at again in five minutes and the cards come back on a 200", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+      const { context, request } = stubContext({
+        "/v1/ae/fabric": [denied, ok(overview([{ name: "aeprod", state: "Active", can_suspend: true }]))],
+      });
+      await activateFabric(context);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(document.body.textContent).toContain("Fabric capacities are for admins.");
+      const reads = () => request.mock.calls.filter(([call]) => call.path === "/v1/ae/fabric").length;
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      expect(reads()).toBe(1);
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(reads()).toBe(2);
+      expect(document.body.textContent).not.toContain("Fabric capacities are for admins.");
+      expect(document.querySelector('[data-capacity="aeprod"]')).not.toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

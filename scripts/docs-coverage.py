@@ -6,7 +6,7 @@
 The public release runs this before it opens the "Release <tag>" pull request
 (agents-and-automation home-server/omnigent-ae/public-release/sync-public.sh
 prepare), so the README's showcase and docs/features keep up with the patch
-series once per public release, never on every merge. Reid asked for exactly that
+series once per public release, never on every merge. The owner asked for exactly that
 cadence: the feature docs and the tour stay in sync per public release, not in dev.
 
 Patches are matched by their file name without the number, so a renumbered patch

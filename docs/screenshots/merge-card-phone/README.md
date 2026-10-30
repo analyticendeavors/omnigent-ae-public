@@ -8,7 +8,7 @@ side rather than Cancel as a text button under Confirm; the Dashboard's buttons 
 "Mark session done" with a "frees a slot" hint instead of "Set this session to
 review". They were not retaken: the box has no headless browser.
 
-Why: Reid's iPhone screenshots of the chat's inline pull request card. Collapsed, a
+Why: the owner's iPhone screenshots of the chat's inline pull request card. Collapsed, a
 small Merge button sat bottom left beside an empty half row. On the confirm step the
 two merge methods were boxed buttons with the same shape and weight as Confirm merge
 and Cancel, so the step read as four actions in a 2x2 grid and the chosen method was

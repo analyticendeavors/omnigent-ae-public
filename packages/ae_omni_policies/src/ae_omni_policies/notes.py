@@ -25,7 +25,7 @@ from zoneinfo import ZoneInfo
 Quadrant = Literal["hotfix", "feature", "admin"]
 
 # The gate's QUADRANT words mapped to the store's two axes. Not the textbook
-# Eisenhower ordering: urgent-only sits directly under Q1 in the app (Reid,
+# Eisenhower ordering: urgent-only sits directly under Q1 in the app (the owner,
 # 2026-08-13), so ``feature`` is Q3 and ``admin`` Q2. Never send a priority;
 # the store overwrites it from the axes.
 QUADRANT_AXES: dict[str, dict[str, int]] = {
@@ -34,7 +34,7 @@ QUADRANT_AXES: dict[str, dict[str, int]] = {
     "admin": {"urgent": 1, "important": 0},  # Q2
 }
 
-# Days until a parked fork resurfaces (Reid, 2026-08-30). "Come back and
+# Days until a parked fork resurfaces (the owner, 2026-08-30). "Come back and
 # decide", not "do it by then".
 RESURFACE_DAYS: dict[str, int] = {"hotfix": 3, "feature": 30, "admin": 14}
 

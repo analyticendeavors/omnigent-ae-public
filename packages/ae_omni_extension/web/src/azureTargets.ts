@@ -1,4 +1,4 @@
-// Cost targets on the Admin Center's Azure card (2026-10-25): limits Reid sets on
+// Cost targets on the Admin Center's Azure card (2026-10-25): limits the owner sets on
 // spend or on a running Fabric capacity, each with a status, and a phone alarm
 // from the server (cost_targets.py) when one is crossed.
 //
@@ -8,7 +8,7 @@
 // limits are set, switched and removed. The extension host sends only GET, POST and
 // PATCH, so saving and deleting are POSTs (api.ts).
 //
-// Layout (2026-10-26, Reid's concept A): the section starts folded to one line, a
+// Layout (2026-10-26, the owner's concept A): the section starts folded to one line, a
 // chevron, "Targets", the counts and, pushed right on the same row, a chip for each
 // target that is over, one green chip when all is well, or one amber chip when targets
 // cannot be checked. Only the first chip shows, then "+N more" for the rest, so the

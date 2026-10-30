@@ -52,9 +52,9 @@ def test_status_and_request_round_trip_through_the_files(tmp_path: Path) -> None
         2,
         NOW + 300,
     )
-    store.request("reid", now=NOW)
-    assert again.read_request() == Ask(requested_at=NOW, requested_by="reid")
-    assert again.take() == Ask(requested_at=NOW, requested_by="reid")
+    store.request("owner", now=NOW)
+    assert again.read_request() == Ask(requested_at=NOW, requested_by="owner")
+    assert again.take() == Ask(requested_at=NOW, requested_by="owner")
     assert again.take() is None
     assert not (tmp_path / "data" / host_relink.REQUEST_FILE_NAME).exists()
     assert [p.name for p in (tmp_path / "data").iterdir()] == [host_relink.STATUS_FILE_NAME]
@@ -144,7 +144,7 @@ def test_a_failed_report_says_why() -> None:
 
 def test_a_connected_host_hides_the_button_whatever_the_helper_said() -> None:
     old = Status(phase="sent", updated_at=NOW - 10, expires_at=NOW + 200)
-    shown = host_relink.view(BOX, old, Ask(NOW - 5, "reid"), now=NOW)
+    shown = host_relink.view(BOX, old, Ask(NOW - 5, "owner"), now=NOW)
     assert shown.state == "connected"
     assert shown.can_request is False and shown.requested is False
     assert shown.expires_at is None and shown.streak == 0
@@ -176,10 +176,10 @@ def test_a_step_in_progress_disables_the_button_until_it_goes_stale() -> None:
 
 
 def test_a_pending_request_disables_the_button_and_says_when_it_is_untaken() -> None:
-    shown = host_relink.view(OFFLINE, None, Ask(NOW - 30, "reid"), now=NOW)
+    shown = host_relink.view(OFFLINE, None, Ask(NOW - 30, "owner"), now=NOW)
     assert shown.requested is True and shown.can_request is False
     assert shown.request_untaken is False
-    late = host_relink.view(OFFLINE, None, Ask(NOW - 600, "reid"), now=NOW)
+    late = host_relink.view(OFFLINE, None, Ask(NOW - 600, "owner"), now=NOW)
     assert late.request_untaken is True
 
 
@@ -255,9 +255,9 @@ def test_cli_refuses_bad_input_with_exit_2(argv: list[str]) -> None:
 def test_cli_take_prints_and_removes_the_request(capsys: pytest.CaptureFixture[str]) -> None:
     assert host_relink.main(["take"]) == 0
     assert capsys.readouterr().out == "none\n"
-    host_relink.store().request("Reid Havens", now=NOW)
+    host_relink.store().request("Owner Person", now=NOW)
     assert host_relink.main(["take"]) == 0
-    assert capsys.readouterr().out == f"request {NOW} Reid_Havens\n"
+    assert capsys.readouterr().out == f"request {NOW} Owner_Person\n"
     assert host_relink.store().read_request() is None
 
 

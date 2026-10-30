@@ -62,9 +62,9 @@ Inside one chat, the fork puts the session's details in a rail beside it, has th
 </tr>
 </table>
 
-- [Session rail](session-rail.md): A rail beside the chat, Its own toggle, Choose what a session shows when it opens, Triage card, Context that waits for Claude, Context categories, Connectors, Agents, Usage for this session's account
+- [Session rail](session-rail.md): A rail beside the chat, Its own toggle, Choose what a session shows when it opens, Triage card, Context that waits for Claude, Context categories, Connectors, Agents, Child chats, Usage for this session's account
 - [Composer](composer.md): Prompt suggestions, Ranked alternatives, Model versions and Previous models, A one-column model menu, The effort a session runs at, Fast mode, Blurred command and file menus, Token defrag while compacting
-- [Action dock](action-dock.md): One strip in the composer bar, The opened list, A waiting question, Questions from sessions this chat started, One button per choice, Usage gate, Every open pull request with its state, Update branch, Drafts with Mark ready, Hover preview, Merge from the dock, The confirm, shown whole, Deploy tracking
+- [Action dock](action-dock.md): One strip in the composer bar, The opened list, A waiting question, Questions from sessions this chat started, Compact a big chat, One button per choice, Usage gate, Every usage window on hover, Every open pull request with its state, Update branch, Drafts with Mark ready, Hover preview, Merge from the dock, The confirm, shown whole, Deploy tracking
 
 ## Agents and pull requests
 
@@ -91,8 +91,8 @@ Running many sessions means watching plan limits and accounts. The fork shows us
 </tr>
 </table>
 
-- [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login
-- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Key Vault, Git repos, Every account's limits, Compute and spend, Presets card, Edit a global policy's parameters, Open tabs hear about an update
+- [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login, A relaunch keeps Claude's transcript
+- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Key Vault, Git repos, Every account's limits, Compute and spend, Presets card, Family cost card, Edit a global policy's parameters, Open tabs hear about an update
 
 ## On the phone
 
@@ -105,4 +105,4 @@ Omnigent runs in a phone browser. The fork makes the parts you need away from a 
 </tr>
 </table>
 
-- [Phone](phone.md): Session Dashboard on a phone, Status and Move fold in the session menu, Run a code block in the session's shell, Risky commands named before they run, A Paste button in the terminal, Paste a note copied on the iPhone, Waiting pull requests keep their state, Merge from the action dock, Merged pull requests on one line
+- [Phone](phone.md): Session Dashboard on a phone, Status and Move fold in the session menu, Run a code block in the session's shell, Risky commands named before they run, A Paste button in the terminal, Paste a note copied on the iPhone, Download a file a chat names, Waiting pull requests keep their state, Merge from the action dock, Merged pull requests on one line

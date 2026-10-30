@@ -1,15 +1,15 @@
 // The Admin Center's Fabric section (2026-10-16, renamed 2026-10-18): one card
 // per Fabric capacity, with Wake, Off and Keep awake.
 //
-// Why: Reid wanted the aetraining wake button inside omnigent-ae, next to the
-// Dashboard, with room for more capacity buttons; Off was added at his
+// Why: the owner wanted the aetraining wake button inside omnigent-ae, next to the
+// Dashboard, with room for more capacity buttons; Off was added at their
 // request, guarded by a separate suspend key so holders of the shared wake
 // link can only wake. The page is the extension's `fabric` view, reached from
 // its one nav row (plugin.py); the server reads each capacity through its
 // Logic App (`GET /v1/ae/fabric`, ae_omni_policies/fabric.py) and never hands
 // the page a URL or a key.
 //
-// Second pass the same day (Reid approved the mockup): one compact row per
+// Second pass the same day (the owner approved the mockup): one compact row per
 // capacity. A status dot, the name and a small state pill; a muted meta line
 // (SKU, region, price an hour, how long it has been up and what that cost,
 // when it sleeps if idle); the actions at the right as 32 px icon buttons
@@ -33,7 +33,7 @@
 // action gave. After a wake or a suspend the card shows the state the Logic
 // App answered (Waking, Suspending) and the next read comes 15 s later, not at
 // once: ARM can still report Paused for a few seconds after a resume starts,
-// which would put Wake back under Reid's thumb.
+// which would put Wake back under the owner's thumb.
 //
 // Third pass (2026-10-16, review fixes): the page holds no copy of the
 // runbook's rule. The server sends each keep awake choice's new sleep time
@@ -70,7 +70,7 @@
 // page now reads Deploys, Box host, Shared Claude accounts, Fabric capacity,
 // Databricks, Secrets.
 //
-// 2026-10-20, the dashboard redesign (Reid approved concept C): the page
+// 2026-10-20, the dashboard redesign (the owner approved concept C): the page
 // drops its 720 px column and uses the pane's width. Under a header (the
 // title, when the newest answer arrived, and one refresh button that runs
 // every section's normal read) sits a strip of status tiles (tiles.ts), then
@@ -90,7 +90,7 @@
 // no longer reads that list.
 //
 // 2026-10-21 (the capacity fleet): with the shared capacities Logic App set up,
-// the server lists every Fabric capacity Reid has, not only the ones with a
+// the server lists every Fabric capacity the owner has, not only the ones with a
 // wake Logic App, so the Compute card draws one row per capacity it returns,
 // never a fixed count. Each row's SKU in the meta line becomes a size picker
 // while the capacity is Active or Paused; picking a size opens the same ask
@@ -99,19 +99,23 @@
 // and only its Resize button sends the call. Start and Pause go through the fleet
 // on the server for every row; keep awake, the sleep time and the links stay
 // on the rows that have them. A list the server could only partly read says so
-// above the rows. Reid asked for Pause and Start, so the buttons, their
+// above the rows. The owner asked for Pause and Start, so the buttons, their
 // confirm sentences and their toasts say so (the routes keep wake and suspend).
 
 import type { Disposable, ExtensionContext } from "@omnigent/extension-sdk";
 import "./style.css";
 import {
+  type AccessView,
   describeError,
+  ADMIN_RECHECK_MS,
+  isAdminOnly,
   type FabricActionResult,
   type FabricCapacity,
   type FabricOverview,
   fabricAction,
   fabricKeepAwake,
   fabricScale,
+  fetchAccess,
   fetchFabric,
 } from "./api";
 import { accountsSection, activateAccounts, deactivateAccounts } from "./accounts";
@@ -128,6 +132,7 @@ import {
 } from "./databricks";
 import { activateDeploys, deactivateDeploys, deploysSection } from "./deploys";
 import { announce, button, el, empty, notice, replaceChildren } from "./dom";
+import { activateBoxHealth, boxHealthSection, deactivateBoxHealth } from "./boxHealth";
 import { activateHost, deactivateHost, hostSection } from "./host";
 import {
   boltIcon,
@@ -147,6 +152,7 @@ import {
 import { copyText } from "./lot";
 import { activateSecrets, deactivateSecrets, secretsSection } from "./secrets";
 import { activateGit, deactivateGit, gitSection } from "./git";
+import { activateFamilyCost, deactivateFamilyCost, familyCostSection } from "./familyCost";
 import { activatePresets, deactivatePresets, presetsSection } from "./presets";
 import { activateVault, deactivateVault, loadVaultView, vaultSection } from "./vault";
 import { loadSectionState } from "./sections";
@@ -536,6 +542,10 @@ export function capacityLinks(capacity: FabricCapacity): { label: string; url: s
 interface PageState {
   data: FabricOverview | null;
   error: unknown;
+  /** The server answered admin_only (2026-10-28): one quiet line, and no more polls. */
+  adminOnly: boolean;
+  /** When admin_only was last answered, for the 5 minute look-again. */
+  adminSince: number;
   refreshedAt: number | null;
   /** The confirm step that is open, per capacity; it survives a re-render. */
   confirming: Map<string, Action>;
@@ -1078,6 +1088,12 @@ function render(page: Page): void {
   const focusKey = page.list.contains(active) ? active?.dataset.focusKey : undefined;
   // An open links menu comes back on the redrawn card (cards.ts holdMenus).
   const restoreMenus = holdMenus();
+  if (state.adminOnly) {
+    replaceChildren(page.status, []);
+    replaceChildren(page.list, [el("p", { class: "meta" }, "Fabric capacities are for admins.")]);
+    restoreMenus();
+    return;
+  }
   replaceChildren(page.status, [
     state.error
       ? notice(
@@ -1128,9 +1144,131 @@ let active = false;
 /** Bumped by every activate, so one that was overtaken during its awaits stops. */
 let activations = 0;
 
+/**
+ * Who sees what (2026-10-28): the server's answer from `/v1/ae/access`, or null when
+ * it cannot be read, so a server older than the box monitor still draws the whole
+ * page for everyone, as before. Hiding cards is not access control (the server
+ * decides what each route answers); it keeps a box admin who is not an OmniGent
+ * admin from a page of "admins only" lines, and from requests that would be refused.
+ */
+/** How long to wait before asking who the caller is a second time. */
+export const ACCESS_RETRY_MS = 3000;
+
+async function readAccess(context: ExtensionContext): Promise<AccessView | null> {
+  const attempt = async (): Promise<AccessView | "error"> => {
+    try {
+      return await fetchAccess(context);
+    } catch {
+      return "error";
+    }
+  };
+  const first = await attempt();
+  if (first !== "error" && first.admin) return first;
+  // The server decides admin by asking itself who the caller is, and that call can fail
+  // for a moment and answer "not an admin" to a real one (2026-10-28, review of PR 389).
+  // A failed read and any answer without admin (a box admin's too, since an OmniGent admin
+  // whose probe failed would be left on the box-only page) are asked once more before the
+  // page believes them.
+  await new Promise((resolve) => setTimeout(resolve, ACCESS_RETRY_MS));
+  const second = await attempt();
+  // A second failure keeps what the first answer said (a box admin stays on the box-only
+  // page); with no answer at all the page draws as before.
+  if (second === "error") return first === "error" ? null : first;
+  return second;
+}
+
+/** The theme, kept in step with the host's, for the pages that do not run the full setup. */
+async function followTheme(context: ExtensionContext, mine: number): Promise<void> {
+  const theme = await context.theme.getCurrent();
+  document.documentElement.dataset.theme = theme.theme;
+  const subscription = await context.theme.subscribe((next) => {
+    document.documentElement.dataset.theme = next.theme;
+  });
+  if (!active || mine !== activations) {
+    subscription.dispose();
+    return;
+  }
+  themeSubscription = subscription;
+}
+
+/** A page for someone who may see nothing of the Admin Center. */
+async function activateNoAccess(context: ExtensionContext, root: HTMLElement, mine: number) {
+  stopBoard?.();
+  stopBoard = null;
+  resetTiles();
+  root.replaceChildren(
+    el(
+      "main",
+      { class: "fabric admin" },
+      el("header", { class: "fabric-top" }, el("h1", { class: "fabric-h" }, "Admin Center")),
+      el(
+        "p",
+        { class: "meta admin-noaccess" },
+        "The Admin Center is for admins. Ask an admin if you need access.",
+      ),
+    ),
+  );
+  active = true;
+  await followTheme(context, mine);
+}
+
+/**
+ * The page for a box admin who is not an OmniGent admin (2026-10-28): the Box
+ * health card with only the monitor in it, and its tile. No other section
+ * starts, so nothing is requested that the server would refuse.
+ */
+async function activateBoxOnly(
+  context: ExtensionContext,
+  root: HTMLElement,
+  mine: number,
+): Promise<void> {
+  stopBoard?.();
+  resetTiles();
+  const monitor = boxHealthSection();
+  const box = adminCard(
+    "box",
+    "Box health",
+    shieldCheckIcon(),
+    [monitor.querySelector(".bh-refreshed")],
+    monitor,
+  );
+  const updated = el("p", { class: "meta admin-updated" });
+  const tiles = el("div", { class: "admin-tiles" });
+  // One card: nothing to drag, so the grip and Reset layout stay out (style.css).
+  const board = el("div", { class: "admin-board", "data-single": "true" });
+  const again = button("", { title: "Read everything again", onClick: () => refreshAll() });
+  again.classList.add("btn-icon", "admin-refresh");
+  again.setAttribute("aria-label", "Read everything again");
+  again.replaceChildren(refreshIcon());
+  const main = el(
+    "main",
+    { class: "fabric admin" },
+    el("header", { class: "fabric-top" }, el("h1", { class: "fabric-h" }, "Admin Center"), updated, again),
+    tiles,
+    board,
+  );
+  root.replaceChildren(main);
+  mountTiles(tiles, updated);
+  const layout = mountBoard(main, board, { box });
+  stopBoard = layout.stop;
+  active = true;
+  await Promise.all([loadSectionState(context), loadBoardLayout(context)]);
+  layout.refold();
+  await followTheme(context, mine);
+  if (!active || mine !== activations) return;
+  activateBoxHealth(context, box);
+}
+
 export async function activateFabric(context: ExtensionContext): Promise<void> {
   const root = document.getElementById("root");
   if (!root) throw new Error("Extension root is missing");
+  const mine = ++activations;
+  const access = await readAccess(context);
+  if (mine !== activations) return;
+  if (access && !access.admin) {
+    if (access.box_admin) return activateBoxOnly(context, root, mine);
+    return activateNoAccess(context, root, mine);
+  }
   stopBoard?.();
   resetTiles();
   const status = el("div", { class: "page-status", "aria-live": "polite" });
@@ -1149,14 +1287,17 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const databricks = databricksSection();
   const strip = databricksStrip();
   const host = hostSection();
+  const monitor = boxHealthSection();
   const secrets = secretsSection();
   const accountsBody = accountsSection();
   const azureBody = azureSection();
   const vaultBody = vaultSection();
   const gitBody = gitSection();
   const presetsBody = presetsSection();
+  const familyBody = familyCostSection();
   // The card headers carry one "Updated" each: Fabric's on Compute, the host's on Box health.
   databricks.querySelector(".dbx-refreshed")?.remove();
+  monitor.querySelector(".bh-refreshed")?.remove();
   secrets.querySelector(".secrets-refreshed")?.remove();
   const compute = adminCard(
     "compute",
@@ -1202,11 +1343,19 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     [presetsBody.querySelector(".presets-refreshed")],
     presetsBody,
   );
+  const family = adminCard(
+    "family",
+    "Family cost",
+    coinIcon(),
+    [familyBody.querySelector(".family-refreshed")],
+    familyBody,
+  );
   const box = adminCard(
     "box",
     "Box health",
     shieldCheckIcon(),
-    [host.querySelector(".host-refreshed")],
+    [host.querySelector(".host-chip"), host.querySelector(".host-refreshed")],
+    monitor,
     host,
     secrets,
   );
@@ -1240,13 +1389,15 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     vault,
     git,
     presets,
+    family,
   });
   stopBoard = layout.stop;
   active = true;
-  const mine = ++activations;
   const state: PageState = {
     data: null,
     error: null,
+    adminOnly: false,
+    adminSince: 0,
     refreshedAt: null,
     confirming: new Map(),
     keeping: new Map(),
@@ -1262,14 +1413,23 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   let followUp: number | null = null;
   const refresh = (): Promise<void> => {
     if (reading) return reading;
+    if (state.adminOnly && Date.now() - state.adminSince < ADMIN_RECHECK_MS) return Promise.resolve();
     const begin = ++state.clock;
     reading = fetchFabric(context)
       .then(
         (data) => {
           state.data = freshRows(data, state.data, begin, state.lastAction);
           state.error = null;
+          state.adminOnly = false;
         },
         (error: unknown) => {
+          if (isAdminOnly(error)) {
+            state.adminOnly = true;
+            state.adminSince = Date.now();
+            state.data = null;
+            state.error = null;
+            return;
+          }
           // The last good cards stay, with the failure said once above them.
           state.error = error;
         },
@@ -1301,7 +1461,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
         ? setTimeout(() => {
             // A hidden tab does not poll; visibilitychange reads on return.
             if (document.visibilityState === "visible") void refresh();
-          }, delay)
+          }, state.adminOnly ? ADMIN_RECHECK_MS : delay)
         : null;
     },
     afterAction: (delay, whenReading) => {
@@ -1311,7 +1471,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   };
   page.render();
 
-  // The theme, and which cards Reid folded on his phone (a local read; the
+  // The theme, and which cards the owner folded on their phone (a local read; the
   // defaults without it), asked for together.
   const [theme] = await Promise.all([
     context.theme.getCurrent(),
@@ -1336,6 +1496,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   // seconds for activation.
   void refresh();
   activateDeploys(context, deploys);
+  activateBoxHealth(context, box);
   activateHost(context, box);
   activateDatabricks(context, compute, strip);
   activateSecrets(context, secrets);
@@ -1344,6 +1505,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   activateVault(context, vault);
   activateGit(context, git);
   activatePresets(context, presets);
+  activateFamilyCost(context, family);
   const live = () => active && mine === activations;
   registerRefresh("fabric", () => (live() ? refresh() : undefined));
   onFocus = () => {
@@ -1356,7 +1518,9 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
 
 export function deactivateFabric(): void {
   active = false;
+  activations++;
   deactivateDeploys();
+  deactivateBoxHealth();
   deactivateHost();
   deactivateDatabricks();
   deactivateSecrets();
@@ -1365,6 +1529,7 @@ export function deactivateFabric(): void {
   deactivateVault();
   deactivateGit();
   deactivatePresets();
+  deactivateFamilyCost();
   stopBoard?.();
   stopBoard = null;
   resetTiles();

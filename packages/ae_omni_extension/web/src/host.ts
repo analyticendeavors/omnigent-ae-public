@@ -1,5 +1,5 @@
 // The Admin Center's Box host section (2026-10-20): whether the box host is
-// connected to the server, and a button that sends Reid a reconnect link when
+// connected to the server, and a button that sends the owner a reconnect link when
 // it is not.
 //
 // Why: when the server rejects the host's credential (the 2026-10-20
@@ -7,7 +7,7 @@
 // can start. The fix is `omnigent login` on the box, a sign-in link opened
 // within five minutes, then a host restart. deploy/host-relink.sh does that
 // by itself after 30 straight rejections or a failed host unit; this card
-// shows how far it got and lets Reid ask for a link sooner. The server keeps the state
+// shows how far it got and lets the owner ask for a link sooner. The server keeps the state
 // (`/v1/ae/host`, ae_omni_policies/host_relink.py).
 //
 // One card in the Fabric row's style (.card-fabric): a dot, the host's name
@@ -33,6 +33,8 @@ import type { ExtensionContext } from "@omnigent/extension-sdk";
 import {
   AeRequestError,
   describeError,
+  ADMIN_RECHECK_MS,
+  isAdminOnly,
   fetchHostStatus,
   type HostStatus,
   requestHostRelink,
@@ -206,6 +208,10 @@ interface SectionState {
   /** When the status arrived, for counting a link down. */
   at: number;
   error: unknown;
+  /** The server answered admin_only (2026-10-28): one quiet line, and no more polls. */
+  adminOnly: boolean;
+  /** When admin_only was last answered, for the 5 minute look-again. */
+  adminSince: number;
   asking: boolean;
   /** When the latest ask started or ended (see `clock`). */
   lastAction: number;
@@ -219,6 +225,8 @@ interface Section {
   list: HTMLElement;
   status: HTMLElement;
   refreshed: HTMLElement;
+  /** The header's live status chip: dot, name, state pill (2026-10-29). */
+  chip: HTMLElement;
   live: () => boolean;
   render: () => void;
   refresh: () => Promise<void>;
@@ -269,18 +277,68 @@ function card(section: Section, status: HostStatus, now: number): HTMLElement {
   return node;
 }
 
+/** Fill the header chip: the dot, the name and the state, in place (the same element on every draw). */
+function drawChip(section: Section): void {
+  const { chip, state } = section;
+  const { status } = state;
+  // Words and class first; the chip is a live region, and a redraw with the same words (the
+  // countdown draws every second) would be announced again, so it is left alone then.
+  let cls = "host-chip";
+  let words: string[] = [];
+  if (!state.adminOnly && !status) {
+    cls = "host-chip fabric-unknown";
+    words = [state.error ? "Unknown" : "Reading..."];
+  } else if (!state.adminOnly && status) {
+    cls = `host-chip fabric-${toneOf(status.state)}`;
+    words = [status.host?.name || "Box host", stateText(status.state)];
+  }
+  const sig = words.join("\n");
+  if (chip.className === cls && chip.dataset.sig === sig) return;
+  chip.className = cls;
+  chip.dataset.sig = sig;
+  if (!state.adminOnly && !status) {
+    replaceChildren(chip, [
+      el("span", { class: "fabric-dot", "aria-hidden": "true" }),
+      el("span", { class: "fabric-state" }, words[0]),
+    ]);
+  } else if (status) {
+    replaceChildren(chip, [
+      el("span", { class: "fabric-dot", "aria-hidden": "true" }),
+      el("span", { class: "host-chip-name" }, words[0]),
+      el("span", { class: "fabric-state" }, words[1]),
+    ]);
+  } else {
+    replaceChildren(chip, []);
+  }
+}
+
+/** Whether the host has anything beyond the chip to show: facts, notices or the button. */
+function hasDetail(status: HostStatus, now: number, section: Section): boolean {
+  return (
+    metaItems(status, section.state.at, now).length > 0 ||
+    noticeTexts(status).length > 0 ||
+    buttonLabel(status) !== null
+  );
+}
+
 function render(section: Section): void {
   const { state } = section;
   const now = Date.now();
+  drawChip(section);
+  if (state.adminOnly) {
+    replaceChildren(section.list, [el("p", { class: "meta" }, "The box host is for admins.")]);
+    section.refreshed.textContent = "";
+    return;
+  }
   if (!state.status) {
     replaceChildren(section.list, [
       state.error
         ? notice(`The host status could not be read (${describeError(state.error)}).`, "error")
-        : el("p", { class: "meta" }, "Reading..."),
+        : null,
     ]);
   } else {
     replaceChildren(section.list, [
-      card(section, state.status, now),
+      hasDetail(state.status, now, section) ? card(section, state.status, now) : null,
       state.error
         ? notice(`The host status could not be read (${describeError(state.error)}).`, "error")
         : null,
@@ -336,6 +394,7 @@ export function hostSection(): HTMLElement {
   return el(
     "div",
     { class: "admin-block admin-host" },
+    el("span", { class: "host-chip", "aria-live": "polite", title: "Box host" }),
     el("p", { class: "meta refreshed host-refreshed" }),
     el("section", { class: "cards fabric-list host-list", "aria-label": "Box host" }),
     el("div", { class: "page-status host-status", "aria-live": "polite" }),
@@ -352,7 +411,8 @@ export function activateHost(context: ExtensionContext, root: HTMLElement): void
   const list = root.querySelector<HTMLElement>(".host-list");
   const status = root.querySelector<HTMLElement>(".host-status");
   const refreshed = root.querySelector<HTMLElement>(".host-refreshed");
-  if (!list || !status || !refreshed) throw new Error("Box host section is missing");
+  const chip = root.querySelector<HTMLElement>(".host-chip");
+  if (!list || !status || !refreshed || !chip) throw new Error("Box host section is missing");
   const mine = ++generation;
   const live = () => generation === mine;
   if (onFocus) {
@@ -363,6 +423,8 @@ export function activateHost(context: ExtensionContext, root: HTMLElement): void
     status: null,
     at: 0,
     error: null,
+    adminOnly: false,
+    adminSince: 0,
     asking: false,
     lastAction: 0,
     clock: 0,
@@ -375,12 +437,14 @@ export function activateHost(context: ExtensionContext, root: HTMLElement): void
     list,
     status,
     refreshed,
+    chip,
     live,
     render: () => {
       if (live()) render(section);
     },
     refresh: () => {
       if (reading) return reading;
+      if (state.adminOnly && Date.now() - state.adminSince < ADMIN_RECHECK_MS) return Promise.resolve();
       lastRead = Date.now();
       const begin = ++state.clock;
       reading = fetchHostStatus(context)
@@ -391,8 +455,16 @@ export function activateHost(context: ExtensionContext, root: HTMLElement): void
             state.status = answer;
             state.at = Date.now();
             state.error = null;
+            state.adminOnly = false;
           },
           (error: unknown) => {
+            if (live() && isAdminOnly(error)) {
+              state.adminOnly = true;
+              state.adminSince = Date.now();
+              state.status = null;
+              state.error = null;
+              return;
+            }
             // The last good card stays, with the failure said under it.
             if (live()) state.error = error ?? new Error("Request failed");
           },
@@ -413,7 +485,7 @@ export function activateHost(context: ExtensionContext, root: HTMLElement): void
     schedule: () => {
       if (!live()) return;
       if (timer) clearTimeout(timer);
-      const delay = nextDelay(state.status);
+      const delay = state.adminOnly ? ADMIN_RECHECK_MS : nextDelay(state.status);
       timer = setTimeout(() => {
         if (!live() || document.visibilityState !== "visible") return;
         // A countdown redraws every second but reads only every 15 s.

@@ -18,6 +18,8 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
+from ae_omni_policies import model_log
+
 EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max", "ultra")
 FAMILIES: tuple[str, ...] = ("haiku", "sonnet", "opus", "fable")
 # A session on its agent's default effort ranks as medium, for comparison only.
@@ -25,7 +27,7 @@ DEFAULT_EFFORT = "medium"
 
 Kind = Literal["raise", "lower", "same"]
 Status = Literal["changed", "needs_approval", "refused", "unchanged"]
-Approved = Literal["auto", "reid", "user"]
+Approved = Literal["auto", "owner", "user"]
 
 _FAMILY = re.compile(r"(haiku|sonnet|opus|fable)", re.IGNORECASE)
 # Used when the preset sets no rules (lead-picks): ask about everything, never step down.
@@ -82,8 +84,8 @@ LAST_CAP = 256
 REASON_CAP = 80
 _KIND_SHORT = {"raise": "r", "lower": "l"}
 _KIND_LONG = {"r": "raise", "l": "lower"}
-_APPROVED_SHORT = {"auto": "a", "reid": "r", "user": "u"}
-_APPROVED_LONG = {"a": "auto", "r": "reid", "u": "user"}
+_APPROVED_SHORT = {"auto": "a", "owner": "r", "user": "u"}
+_APPROVED_LONG = {"a": "auto", "r": "owner", "u": "user"}
 
 
 def last_change_label(
@@ -174,7 +176,7 @@ def parse_last(value: str | None) -> dict[str, Any] | None:
         "reason": data.get("r") or "",
         "at": at,
         "caller": data.get("c"),
-        "approved": _APPROVED_LONG.get(data.get("p"), data.get("p")),
+        "approved": model_log.normalize_approved(_APPROVED_LONG.get(data.get("p"), data.get("p"))),
         "undo": _pair(data["u"]) if "u" in data else old,
         "undone": bool(data.get("x")),
     }
@@ -212,7 +214,7 @@ def decide(
         (``lower`` or ``same`` means it is going back to where the chat started).
     :param codex: The target is a Codex child.
     :param model_changes: The request changes the model, not only the effort.
-    :param confirmed: Reid already approved this exact move.
+    :param confirmed: The owner already approved this exact move.
     :param agent_unknown: The target's agent could not be read, so it might be Codex.
     """
     if kind == "same":
@@ -241,7 +243,7 @@ def decide(
     asks = rule == "ask" or (counted and raises >= cap)
     if asks and not confirmed:
         return Decision("needs_approval", counted=counted)
-    return Decision("changed", counted=counted, approved="reid" if asks else "auto")
+    return Decision("changed", counted=counted, approved="owner" if asks else "auto")
 
 
 def display(model: str | None, effort: str | None) -> str:

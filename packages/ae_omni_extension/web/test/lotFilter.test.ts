@@ -158,7 +158,7 @@ describe("the lot's search bar and cards", () => {
     );
   }
 
-  it("filters as Reid types, remembers it per device, and keeps the field across a refresh", async () => {
+  it("filters as the owner types, remembers it per device, and keeps the field across a refresh", async () => {
     vi.useFakeTimers();
     const { context, set } = stubContext();
     await loadLotFilter(context);

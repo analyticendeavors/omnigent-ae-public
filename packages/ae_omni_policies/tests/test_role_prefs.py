@@ -128,7 +128,7 @@ def test_starters_use_real_catalog_ids() -> None:
 
 
 def test_a_never_saved_user_gets_the_first_four_pinned_and_the_rest_not() -> None:
-    state = RolePrefsStore(None).get("reid")
+    state = RolePrefsStore(None).get("owner")
     assert [(p.id, p.pinned) for p in state.presets] == [
         *((i, True) for i in _PINNED),
         *((i, False) for i in _NEW),
@@ -136,7 +136,7 @@ def test_a_never_saved_user_gets_the_first_four_pinned_and_the_rest_not() -> Non
 
 
 def test_a_never_saved_user_reads_the_starters() -> None:
-    state = RolePrefsStore(None).get("reid")
+    state = RolePrefsStore(None).get("owner")
     assert state.revision == 0
     assert state.default_preset == "balanced"
     assert state.apply_start_on is True
@@ -331,8 +331,8 @@ def test_a_user_who_saved_keeps_their_single_reviewer_balanced(tmp_path: Path) -
         "presets": [old],
         "starters_seen": [*_PINNED, *_NEW],
     }
-    path.write_text(json.dumps({"version": 1, "users": {"reid": entry}}))
-    state = RolePrefsStore(path).get("reid")
+    path.write_text(json.dumps({"version": 1, "users": {"owner": entry}}))
+    state = RolePrefsStore(path).get("owner")
     assert state.revision == 4
     assert [p.id for p in state.presets] == ["balanced"]
     assert state.presets[0].roles.reviewer.model_dump()["mode"] == "fixed"
@@ -373,36 +373,36 @@ def test_store_round_trips_through_the_file(tmp_path: Path) -> None:
     path = tmp_path / "state" / "roles.json"
     first = RolePrefsStore(path)
     body = RolesPut.model_validate(_body(apply_start_on=False))
-    result = first.put("reid", body)
+    result = first.put("owner", body)
     assert result.conflict is False
     assert result.state.revision == 1
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["version"] == 1
-    entry = raw["users"]["reid"]
+    entry = raw["users"]["owner"]
     assert entry["revision"] == 1
     assert entry["updated_at"]
     assert entry["default_preset"] == "mine"
     assert entry["apply_start_on"] is False
-    again = RolePrefsStore(path).get("reid")
+    again = RolePrefsStore(path).get("owner")
     assert again.model_dump() == result.state.model_dump()
-    assert RolePrefsStore(path).get("steve").revision == 0
+    assert RolePrefsStore(path).get("member").revision == 0
 
 
 def test_stale_revision_conflicts_with_the_current_state() -> None:
     store = RolePrefsStore(None)
-    store.put("reid", RolesPut.model_validate(_body()))
-    stale = store.put("reid", RolesPut.model_validate(_body(presets=[_preset("other")])))
+    store.put("owner", RolesPut.model_validate(_body()))
+    stale = store.put("owner", RolesPut.model_validate(_body(presets=[_preset("other")])))
     assert stale.conflict is True
     assert stale.state.revision == 1
     assert [p.id for p in stale.state.presets] == ["mine"]
-    ok = store.put("reid", RolesPut.model_validate(_body(1, [_preset("other")])))
+    ok = store.put("owner", RolesPut.model_validate(_body(1, [_preset("other")])))
     assert ok.state.revision == 2
 
 
 def test_a_first_put_must_be_based_on_revision_0() -> None:
     store = RolePrefsStore(None)
-    assert store.put("reid", RolesPut.model_validate(_body(3))).conflict is True
-    assert store.get("reid").revision == 0
+    assert store.put("owner", RolesPut.model_validate(_body(3))).conflict is True
+    assert store.get("owner").revision == 0
 
 
 def test_a_failed_save_rolls_back_and_raises(
@@ -414,16 +414,16 @@ def test_a_failed_save_rolls_back_and_raises(
     monkeypatch.setattr(role_prefs.tempfile, "mkstemp", refuse)
     store = RolePrefsStore(tmp_path / "roles.json")
     with pytest.raises(role_prefs.RolesSaveError):
-        store.put("reid", RolesPut.model_validate(_body()))
-    assert store.get("reid").revision == 0
-    assert store.get("reid").presets[0].id == "save-tokens"
+        store.put("owner", RolesPut.model_validate(_body()))
+    assert store.get("owner").revision == 0
+    assert store.get("owner").presets[0].id == "save-tokens"
 
 
 def test_a_corrupt_file_is_moved_aside(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
     path = tmp_path / "roles.json"
     path.write_text("{not json", encoding="utf-8")
     with caplog.at_level(logging.WARNING):
-        assert RolePrefsStore(path).get("reid").revision == 0
+        assert RolePrefsStore(path).get("owner").revision == 0
     assert "moved it to" in caplog.text
     assert list(tmp_path.glob("roles.json.corrupt-*"))
 
@@ -431,15 +431,15 @@ def test_a_corrupt_file_is_moved_aside(tmp_path: Path, caplog: pytest.LogCapture
 def test_an_invalid_entry_serves_starters_at_its_revision(tmp_path: Path) -> None:
     path = tmp_path / "roles.json"
     bad = {"revision": 4, "default_preset": "gone", "apply_start_on": True, "presets": []}
-    path.write_text(json.dumps({"version": 1, "users": {"reid": bad}}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 1, "users": {"owner": bad}}), encoding="utf-8")
     store = RolePrefsStore(path)
-    state = store.get("reid")
+    state = store.get("owner")
     assert state.revision == 4
     assert state.default_preset == "balanced"
     # The bad entry stays in the file until the user saves on top of it.
-    store.put("steve", RolesPut.model_validate(_body()))
-    assert json.loads(path.read_text(encoding="utf-8"))["users"]["reid"] == bad
-    assert store.put("reid", RolesPut.model_validate(_body(4))).state.revision == 5
+    store.put("member", RolesPut.model_validate(_body()))
+    assert json.loads(path.read_text(encoding="utf-8"))["users"]["owner"] == bad
+    assert store.put("owner", RolesPut.model_validate(_body(4))).state.revision == 5
 
 
 def _old_entry(presets: list[dict[str, Any]], revision: int = 2) -> dict[str, Any]:
@@ -458,30 +458,30 @@ def _old_entry(presets: list[dict[str, Any]], revision: int = 2) -> dict[str, An
 def test_a_user_who_saved_before_solo_gets_it_once(tmp_path: Path) -> None:
     path = tmp_path / "roles.json"
     entry = _old_entry([_preset("mine"), _preset("balanced")])
-    path.write_text(json.dumps({"version": 1, "users": {"reid": entry}}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 1, "users": {"owner": entry}}), encoding="utf-8")
     store = RolePrefsStore(path)
-    state = store.get("reid")
+    state = store.get("owner")
     assert [p.id for p in state.presets] == ["mine", "balanced", "solo", *_NEW]
     assert state.revision == 2
     assert state.starters_seen == ["save-tokens", "balanced", "yolo", "solo", *_NEW]
     # No pins were saved, so what the user had is pinned and the new starters are not.
     assert [p.pinned for p in state.presets] == [True, True, True, False, False, False]
     # Reading never writes the file.
-    assert "starters_seen" not in json.loads(path.read_text(encoding="utf-8"))["users"]["reid"]
+    assert "starters_seen" not in json.loads(path.read_text(encoding="utf-8"))["users"]["owner"]
     # Deleting it and saving records it as seen: it does not come back.
-    seen = store.get("reid").starters_seen
-    store.put("reid", RolesPut.model_validate(_body(2, [_preset("mine")], starters_seen=seen)))
-    assert [p.id for p in store.get("reid").presets] == ["mine"]
-    assert [p.id for p in RolePrefsStore(path).get("reid").presets] == ["mine"]
-    saved = json.loads(path.read_text(encoding="utf-8"))["users"]["reid"]
+    seen = store.get("owner").starters_seen
+    store.put("owner", RolesPut.model_validate(_body(2, [_preset("mine")], starters_seen=seen)))
+    assert [p.id for p in store.get("owner").presets] == ["mine"]
+    assert [p.id for p in RolePrefsStore(path).get("owner").presets] == ["mine"]
+    saved = json.loads(path.read_text(encoding="utf-8"))["users"]["owner"]
     assert "solo" in saved["starters_seen"]
 
 
 def test_a_saved_state_with_a_pin_keeps_its_pins_apart_from_the_append(tmp_path: Path) -> None:
     path = tmp_path / "roles.json"
     entry = _old_entry([_preset("mine", pinned=True), _preset("balanced")])
-    path.write_text(json.dumps({"version": 1, "users": {"reid": entry}}), encoding="utf-8")
-    state = RolePrefsStore(path).get("reid")
+    path.write_text(json.dumps({"version": 1, "users": {"owner": entry}}), encoding="utf-8")
+    state = RolePrefsStore(path).get("owner")
     assert [(p.id, p.pinned) for p in state.presets][:2] == [("mine", True), ("balanced", False)]
     assert [p.id for p in state.presets][2:] == ["solo", *_NEW]
     assert [p.pinned for p in state.presets if p.id in _NEW] == [False, False, False]
@@ -491,31 +491,31 @@ def test_a_state_that_has_seen_every_starter_is_never_repinned(tmp_path: Path) -
     path = tmp_path / "roles.json"
     entry = _old_entry([_preset("mine", pinned=False), _preset("balanced", pinned=False)])
     entry["starters_seen"] = [*_PINNED, *_NEW]
-    path.write_text(json.dumps({"version": 1, "users": {"reid": entry}}), encoding="utf-8")
-    state = RolePrefsStore(path).get("reid")
+    path.write_text(json.dumps({"version": 1, "users": {"owner": entry}}), encoding="utf-8")
+    state = RolePrefsStore(path).get("owner")
     assert [(p.id, p.pinned) for p in state.presets] == [("mine", False), ("balanced", False)]
 
 
 def test_a_stale_save_does_not_mark_solo_seen(tmp_path: Path) -> None:
     path = tmp_path / "roles.json"
     entry = _old_entry([_preset("mine"), _preset("balanced")])
-    path.write_text(json.dumps({"version": 1, "users": {"reid": entry}}), encoding="utf-8")
+    path.write_text(json.dumps({"version": 1, "users": {"owner": entry}}), encoding="utf-8")
     store = RolePrefsStore(path)
     # A client that read before Solo existed sends no starters_seen and no Solo.
-    store.put("reid", RolesPut.model_validate(_body(2, [_preset("mine")])))
-    saved = json.loads(path.read_text(encoding="utf-8"))["users"]["reid"]
+    store.put("owner", RolesPut.model_validate(_body(2, [_preset("mine")])))
+    saved = json.loads(path.read_text(encoding="utf-8"))["users"]["owner"]
     assert "solo" not in saved["starters_seen"]
-    assert [p.id for p in store.get("reid").presets] == ["mine", "solo", *_NEW]
+    assert [p.id for p in store.get("owner").presets] == ["mine", "solo", *_NEW]
 
 
 def test_a_user_who_already_has_a_solo_preset_gets_no_second_one() -> None:
     store = RolePrefsStore(None)
     store._loaded = True
-    store._users["reid"] = _old_entry([_preset("solo", title="My solo")])
-    store._states["reid"] = role_prefs.RolesState.model_validate(
-        {k: v for k, v in store._users["reid"].items() if k != "updated_at"}
+    store._users["owner"] = _old_entry([_preset("solo", title="My solo")])
+    store._states["owner"] = role_prefs.RolesState.model_validate(
+        {k: v for k, v in store._users["owner"].items() if k != "updated_at"}
     )
-    state = store.get("reid")
+    state = store.get("owner")
     assert [(p.id, p.title) for p in state.presets][:1] == [("solo", "My solo")]
     assert [p.id for p in state.presets].count("solo") == 1
     assert "solo" in (state.starters_seen or [])
@@ -525,20 +525,20 @@ def test_a_full_list_gets_the_new_starter_once_there_is_room() -> None:
     store = RolePrefsStore(None)
     store._loaded = True
     full = [_preset(f"p{n}") for n in range(role_prefs.MAX_PRESETS)]
-    store._users["reid"] = _old_entry(full)
-    store._states["reid"] = role_prefs.RolesState.model_validate(
-        {k: v for k, v in store._users["reid"].items() if k != "updated_at"}
+    store._users["owner"] = _old_entry(full)
+    store._states["owner"] = role_prefs.RolesState.model_validate(
+        {k: v for k, v in store._users["owner"].items() if k != "updated_at"}
     )
-    state = store.get("reid")
+    state = store.get("owner")
     assert len(state.presets) == role_prefs.MAX_PRESETS
     assert "solo" not in (state.starters_seen or [])
     # Saving the full list keeps it unoffered; freeing a slot offers it.
     body = _body(2, [p.model_dump() for p in state.presets])
-    store.put("reid", RolesPut.model_validate(body))
-    assert "solo" not in (store.get("reid").starters_seen or [])
-    store.put("reid", RolesPut.model_validate(_body(3, [_preset("p0")])))
+    store.put("owner", RolesPut.model_validate(body))
+    assert "solo" not in (store.get("owner").starters_seen or [])
+    store.put("owner", RolesPut.model_validate(_body(3, [_preset("p0")])))
     # That save was based on a read with no room, so Solo is offered on the next read.
-    assert [p.id for p in store.get("reid").presets] == ["p0", "solo", *_NEW]
+    assert [p.id for p in store.get("owner").presets] == ["p0", "solo", *_NEW]
 
 
 def test_a_full_list_unpinned_by_hand_is_not_repinned_as_room_frees() -> None:
@@ -546,18 +546,18 @@ def test_a_full_list_unpinned_by_hand_is_not_repinned_as_room_frees() -> None:
     store._loaded = True
     # One slot free: only Solo fits on this read, so nothing pin-era is offered yet.
     almost = [_preset(f"p{n}") for n in range(role_prefs.MAX_PRESETS - 2)]
-    store._users["reid"] = _old_entry(almost)
-    store._states["reid"] = role_prefs.RolesState.model_validate(
-        {k: v for k, v in store._users["reid"].items() if k != "updated_at"}
+    store._users["owner"] = _old_entry(almost)
+    store._states["owner"] = role_prefs.RolesState.model_validate(
+        {k: v for k, v in store._users["owner"].items() if k != "updated_at"}
     )
-    state = store.get("reid")
+    state = store.get("owner")
     assert [p.id for p in state.presets][-2:] == ["solo", "think-it-through"]
     assert all(p.pinned for p in state.presets[:-1])
     # The user unpins everything, saves, then frees a slot.
     unpinned = [{**p.model_dump(), "pinned": False} for p in state.presets[:-1]]
     body = _body(2, unpinned, starters_seen=state.starters_seen)
-    store.put("reid", RolesPut.model_validate(body))
-    state = store.get("reid")
+    store.put("owner", RolesPut.model_validate(body))
+    state = store.get("owner")
     assert state.presets[-1].id == "deep-debug"
     assert not any(p.pinned for p in state.presets)
 
@@ -565,11 +565,11 @@ def test_a_full_list_unpinned_by_hand_is_not_repinned_as_room_frees() -> None:
 def test_a_full_list_is_not_pinned_while_no_starter_fits() -> None:
     store = RolePrefsStore(None)
     store._loaded = True
-    store._users["reid"] = _old_entry([_preset(f"p{n}") for n in range(role_prefs.MAX_PRESETS)])
-    store._states["reid"] = role_prefs.RolesState.model_validate(
-        {k: v for k, v in store._users["reid"].items() if k != "updated_at"}
+    store._users["owner"] = _old_entry([_preset(f"p{n}") for n in range(role_prefs.MAX_PRESETS)])
+    store._states["owner"] = role_prefs.RolesState.model_validate(
+        {k: v for k, v in store._users["owner"].items() if k != "updated_at"}
     )
-    state = store.get("reid")
+    state = store.get("owner")
     assert not any(p.pinned for p in state.presets)
     assert not any(s in (state.starters_seen or []) for s in _NEW)
 
@@ -669,11 +669,11 @@ async def test_two_users_are_kept_apart(
 ) -> None:
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER")
     auth.reset_provider_cache()
-    reid = {"X-Forwarded-Email": "reid@example.com"}
-    steve = {"X-Forwarded-Email": "steve@example.com"}
-    assert (await client.put("/v1/ae/roles", json=_body(), headers=reid)).status_code == 200
-    assert (await client.get("/v1/ae/roles", headers=steve)).json()["revision"] == 0
-    assert (await client.get("/v1/ae/roles", headers=reid)).json()["default_preset"] == "mine"
+    owner = {"X-Forwarded-Email": "owner@example.com"}
+    member = {"X-Forwarded-Email": "member@example.com"}
+    assert (await client.put("/v1/ae/roles", json=_body(), headers=owner)).status_code == 200
+    assert (await client.get("/v1/ae/roles", headers=member)).json()["revision"] == 0
+    assert (await client.get("/v1/ae/roles", headers=owner)).json()["default_preset"] == "mine"
 
 
 def test_default_review_rules_are_not_written() -> None:
@@ -911,3 +911,32 @@ def test_family_settings_round_trip_and_absent_keeps(tmp_path: Path) -> None:
     assert store.family_flags("other") == (True, True)
     with pytest.raises(ValidationError):
         RolesPut.model_validate(_body(child_prompts="no"))
+
+
+def test_lead_handoff_tokens_default_round_trip_and_left_out_when_absent(tmp_path: Path) -> None:
+    path = tmp_path / "roles.json"
+    store = RolePrefsStore(path)
+    assert store.lead_handoff_tokens("u") == role_prefs.DEFAULT_HANDOFF_TOKENS == 300_000
+    saved = store.put("u", RolesPut.model_validate(_body()))
+    assert saved.state.lead_handoff_tokens is None
+    assert "lead_handoff_tokens" not in json.loads(path.read_text())["users"]["u"]
+    assert "lead_handoff_tokens" not in role_prefs.view(saved.state)
+    # Set, saved, reloaded from disk.
+    store.put("u", RolesPut.model_validate(_body(revision=1, lead_handoff_tokens=150_000)))
+    assert RolePrefsStore(path).lead_handoff_tokens("u") == 150_000
+    assert role_prefs.view(store.get("u"))["lead_handoff_tokens"] == 150_000
+    # A save that does not mention it keeps it; 0 is off and is kept as 0, not as absent.
+    store.put("u", RolesPut.model_validate(_body(revision=2)))
+    assert RolePrefsStore(path).lead_handoff_tokens("u") == 150_000
+    store.put("u", RolesPut.model_validate(_body(revision=3, lead_handoff_tokens=0)))
+    assert RolePrefsStore(path).lead_handoff_tokens("u") == 0
+    # An explicit null returns to the default; other users never moved.
+    store.put("u", RolesPut.model_validate(_body(revision=4, lead_handoff_tokens=None)))
+    assert RolePrefsStore(path).lead_handoff_tokens("u") == 300_000
+    assert RolePrefsStore(path).lead_handoff_tokens("other") == 300_000
+
+
+@pytest.mark.parametrize("bad", [-1, 5_000_001, 1.5, "300000", True])
+def test_lead_handoff_tokens_refuses_bad_values(bad: object) -> None:
+    with pytest.raises(ValueError):
+        RolesPut.model_validate(_body(lead_handoff_tokens=bad))

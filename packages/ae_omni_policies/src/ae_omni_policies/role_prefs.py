@@ -1,6 +1,6 @@
 """Each user's role presets: which model and effort every role gets, kept on the server.
 
-Reid asked on 2026-10-23 (role routing) to stop restating "Opus plans,
+The owner asked on 2026-10-23 (role routing) to stop restating "Opus plans,
 Sonnet builds, Haiku polls" in every prompt and pick it once instead. A preset
 names a model and effort for each role (lead, planner, reviewer, builder,
 helper) plus three rules about changing models mid-task. Settings > Roles edits
@@ -44,6 +44,9 @@ shape is ``{"version": 1, "users": {"<user>": {"revision": n, "updated_at":
 "<iso utc>", "default_preset": id, "apply_start_on": bool, "presets": [...],
 "starters_seen": [id, ...], "insights": {"enabled", "weeks", "scope", "show"}}}}``
 (``insights``, added 2026-10-24, is optional and left out until set; ``preset_runs`` reads it).
+The Family cost card's settings (2026-10-29) sit beside it, top level and left out until set:
+``family_cost_unit`` (``tokens`` or ``dollars``), ``runaway_family_tokens`` and
+``runaway_family_usd``.
 Where it lives: :data:`STATE_FILE_ENV` when set; else ``/data/ae-roles.json``
 when ``/data`` is a directory; else memory only.
 """
@@ -66,6 +69,7 @@ from pydantic import (
     ConfigDict,
     Field,
     StrictBool,
+    StrictFloat,
     StrictInt,
     ValidationError,
     field_validator,
@@ -79,6 +83,14 @@ STATE_FILE_ENV = "AE_ROLES_STATE_FILE"
 DATA_DIR = Path("/data")
 DATA_FILE_NAME = "ae-roles.json"
 MAX_PRESETS = 30
+#: Lead handoff threshold (2026-10-29): the default, and the largest value a user may save.
+DEFAULT_HANDOFF_TOKENS = 300_000
+MAX_HANDOFF_TOKENS = 5_000_000
+#: Family cost card (2026-10-29): the unit it leads with, and the largest runaway amounts saved.
+MAX_RUNAWAY_TOKENS = 1_000_000_000
+MAX_RUNAWAY_USD = 100_000
+DEFAULT_RUNAWAY_TOKENS = 5_000_000
+DEFAULT_RUNAWAY_USD = 25.0
 CODE_NOT_SAVED = "roles_not_saved"
 DEFAULT_PRESET = "balanced"
 SOLO_PRESET = "solo"
@@ -174,7 +186,7 @@ class AgentReviewer(_Strict):
 
 ReviewerSlot = Annotated[AutoRole | FixedRole | AgentReviewer, Field(discriminator="mode")]
 
-# Planner, builder and helper take the same picker as a reviewer minus other agents (Reid,
+# Planner, builder and helper take the same picker as a reviewer minus other agents (the owner,
 # 2026-10-26): Auto, a Claude model, the session's, or a Codex child session. Other agents run
 # outside the family (no slot cap, no ae.role), so a non-Codex agent slot is refused here.
 WorkerSetting = Annotated[
@@ -328,15 +340,34 @@ class _PresetList(_Strict):
     # Absent until the user sets it; left out of the stored JSON and the views while None.
     insights: Insights | None = None
     # Family settings (2026-10-27), top level and not per preset: whether a lead's chat shows its
-    # children's prompts in the action dock, and whether the lead may relay Reid's answer to a
+    # children's prompts in the action dock, and whether the lead may relay the owner's answer to a
     # child's question. Absent until the user sets them, and absent reads as on.
     child_prompts: StrictBool | None = None
     child_relay: StrictBool | None = None
+    # Lead handoff (2026-10-29): tokens of context at which a top-level chat is nudged to hand
+    # off to a fresh lead; 0 turns it off. Absent until set, and absent reads as 300000.
+    lead_handoff_tokens: StrictInt | None = Field(default=None, ge=0, le=MAX_HANDOFF_TOKENS)
+    # Family cost card (2026-10-29): the number it shows first ("tokens" when absent), and the
+    # spend today that flags a family as a runaway, one value per unit so switching the unit does
+    # not turn 5M tokens into $5M. Absent reads as 5M tokens or $25; 0 turns the flag off.
+    family_cost_unit: Literal["tokens", "dollars"] | None = None
+    runaway_family_tokens: StrictInt | None = Field(default=None, ge=0, le=MAX_RUNAWAY_TOKENS)
+    runaway_family_usd: StrictInt | StrictFloat | None = Field(
+        default=None, ge=0, le=MAX_RUNAWAY_USD
+    )
 
     @model_serializer(mode="wrap")
     def _without_absent_insights(self, handler: Any) -> dict[str, Any]:
         data = handler(self)
-        for key in ("insights", "child_prompts", "child_relay"):
+        for key in (
+            "insights",
+            "child_prompts",
+            "child_relay",
+            "lead_handoff_tokens",
+            "family_cost_unit",
+            "runaway_family_tokens",
+            "runaway_family_usd",
+        ):
             if data.get(key) is None:
                 data.pop(key, None)
         return data
@@ -349,6 +380,29 @@ class _PresetList(_Strict):
             raise ValueError(f"preset ids must be unique; repeated: {', '.join(repeated)}")
         if self.default_preset not in ids:
             raise ValueError(f"default_preset {self.default_preset!r} is not one of the presets")
+        return self
+
+
+class FamilyCostSettings(_Strict):
+    """The body of ``POST /family-cost/settings``: the Family cost card's own fields.
+
+    The extension cannot PUT, and the whole list is not the card's to resend, so the route
+    merges these into the saved state. A field left out keeps its saved value; at least one
+    must be present.
+    """
+
+    family_cost_unit: Literal["tokens", "dollars"] | None = None
+    runaway_family_tokens: StrictInt | None = Field(default=None, ge=0, le=MAX_RUNAWAY_TOKENS)
+    runaway_family_usd: StrictInt | StrictFloat | None = Field(
+        default=None, ge=0, le=MAX_RUNAWAY_USD
+    )
+
+    @model_validator(mode="after")
+    def _something_to_save(self) -> FamilyCostSettings:
+        if not self.model_fields_set or all(
+            getattr(self, name) is None for name in self.model_fields_set
+        ):
+            raise ValueError("send at least one of the family cost settings")
         return self
 
 
@@ -719,6 +773,37 @@ class RolePrefsStore:
             return True, True
         return state.child_prompts is not False, state.child_relay is not False
 
+    def lead_handoff_tokens(self, user: str) -> int:
+        """*user*'s lead handoff threshold in tokens; the default (300000) when never set.
+
+        0 means off. Read by the lead handoff sweep (:mod:`ae_omni_policies.lead_handoff`).
+        """
+        with self._lock:
+            self._load()
+            state = self._states.get(user)
+        if state is None or state.lead_handoff_tokens is None:
+            return DEFAULT_HANDOFF_TOKENS
+        return state.lead_handoff_tokens
+
+    def family_cost_settings(self, user: str) -> tuple[str, float, float]:
+        """*user*'s ``(unit, runaway tokens, runaway dollars)``; the defaults when never set.
+
+        Read by the Family cost card's route (:mod:`ae_omni_policies.family_cost`), so it skips the
+        starters work :meth:`get` does.
+        """
+        with self._lock:
+            self._load()
+            state = self._states.get(user)
+        if state is None:
+            return "tokens", DEFAULT_RUNAWAY_TOKENS, DEFAULT_RUNAWAY_USD
+        return (
+            state.family_cost_unit or "tokens",
+            DEFAULT_RUNAWAY_TOKENS
+            if state.runaway_family_tokens is None
+            else state.runaway_family_tokens,
+            DEFAULT_RUNAWAY_USD if state.runaway_family_usd is None else state.runaway_family_usd,
+        )
+
     def all_states(self) -> dict[str, RolesState]:
         """Every user's saved presets (valid entries only), each with new starters appended.
 
@@ -777,6 +862,26 @@ class RolePrefsStore:
                     body.child_relay
                     if "child_relay" in body.model_fields_set
                     else current.child_relay
+                ),
+                lead_handoff_tokens=(
+                    body.lead_handoff_tokens
+                    if "lead_handoff_tokens" in body.model_fields_set
+                    else current.lead_handoff_tokens
+                ),
+                family_cost_unit=(
+                    body.family_cost_unit
+                    if "family_cost_unit" in body.model_fields_set
+                    else current.family_cost_unit
+                ),
+                runaway_family_tokens=(
+                    body.runaway_family_tokens
+                    if "runaway_family_tokens" in body.model_fields_set
+                    else current.runaway_family_tokens
+                ),
+                runaway_family_usd=(
+                    body.runaway_family_usd
+                    if "runaway_family_usd" in body.model_fields_set
+                    else current.runaway_family_usd
                 ),
             )
             old_entry = self._users.get(user)

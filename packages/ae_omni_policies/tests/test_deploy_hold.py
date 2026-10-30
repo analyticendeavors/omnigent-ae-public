@@ -41,13 +41,13 @@ def test_set_writes_the_file_and_reads_back(tmp_path: Path) -> None:
     path = tmp_path / "state" / "hold.json"
     store = DeployHoldStore(path)
     assert store.read(now=NOW).hold is None
-    hold = store.set(2, "reid", now=NOW)
-    assert (hold.until, hold.set_at, hold.set_by) == (NOW + 7200, NOW, "reid")
+    hold = store.set(2, "owner", now=NOW)
+    assert (hold.until, hold.set_at, hold.set_by) == (NOW + 7200, NOW, "owner")
     assert json.loads(path.read_text(encoding="utf-8")) == {
         "version": 1,
         "until": NOW + 7200,
         "set_at": NOW,
-        "set_by": "reid",
+        "set_by": "owner",
     }
     again = DeployHoldStore(path).read(now=NOW + 60)
     assert again.hold == hold and again.error is None
@@ -55,23 +55,23 @@ def test_set_writes_the_file_and_reads_back(tmp_path: Path) -> None:
 
 def test_set_replaces_the_hold_in_force(tmp_path: Path) -> None:
     store = DeployHoldStore(tmp_path / "hold.json")
-    store.set(3, "reid", now=NOW)
-    store.set(1, "steve", now=NOW + 600)
+    store.set(3, "owner", now=NOW)
+    store.set(1, "member", now=NOW + 600)
     hold = store.read(now=NOW + 700).hold
     assert hold is not None
-    assert (hold.until, hold.set_by) == (NOW + 600 + 3600, "steve")
+    assert (hold.until, hold.set_by) == (NOW + 600 + 3600, "member")
 
 
 @pytest.mark.parametrize("hours", [0, 4, -1])
 def test_set_refuses_hours_outside_the_choices(hours: int) -> None:
     with pytest.raises(ValueError, match="one of"):
-        DeployHoldStore(None).set(hours, "reid", now=NOW)
+        DeployHoldStore(None).set(hours, "owner", now=NOW)
 
 
 def test_clear_removes_the_file_and_is_idempotent(tmp_path: Path) -> None:
     path = tmp_path / "hold.json"
     store = DeployHoldStore(path)
-    store.set(1, "reid", now=NOW)
+    store.set(1, "owner", now=NOW)
     before = store.clear(now=NOW + 5)
     assert before.hold is not None and before.hold.until == NOW + 3600
     assert not path.exists()
@@ -81,7 +81,7 @@ def test_clear_removes_the_file_and_is_idempotent(tmp_path: Path) -> None:
 
 def test_an_expired_hold_reads_as_none(tmp_path: Path) -> None:
     store = DeployHoldStore(tmp_path / "hold.json")
-    store.set(1, "reid", now=NOW)
+    store.set(1, "owner", now=NOW)
     assert store.read(now=NOW + 3599).hold is not None
     expired = store.read(now=NOW + 3600)
     assert expired.hold is None and expired.error is None
@@ -92,9 +92,9 @@ def test_an_expired_hold_reads_as_none(tmp_path: Path) -> None:
     [
         ("{not json", "not valid JSON"),
         ([1, 2], "expected a JSON object"),
-        ({"version": 2, "until": NOW + 60, "set_at": NOW, "set_by": "reid"}, "version"),
-        ({"version": 1, "until": "soon", "set_at": NOW, "set_by": "reid"}, "until"),
-        ({"version": 1, "until": NOW + 60, "set_at": True, "set_by": "reid"}, "set_at"),
+        ({"version": 2, "until": NOW + 60, "set_at": NOW, "set_by": "owner"}, "version"),
+        ({"version": 1, "until": "soon", "set_at": NOW, "set_by": "owner"}, "until"),
+        ({"version": 1, "until": NOW + 60, "set_at": True, "set_by": "owner"}, "set_at"),
         ({"version": 1, "until": NOW + 60, "set_at": NOW, "set_by": ""}, "set_by"),
         ({"version": 1, "until": NOW + 60, "set_at": NOW}, "set_by"),
     ],
@@ -114,9 +114,9 @@ def test_a_corrupt_file_reads_as_none_with_the_reason(
 def test_a_hold_longer_than_the_cap_is_corrupt(tmp_path: Path) -> None:
     path = tmp_path / "hold.json"
     cap = deploy_hold.MAX_HOURS * 3600 + 60
-    _write(path, {"version": 1, "until": NOW + cap, "set_at": NOW, "set_by": "reid"})
+    _write(path, {"version": 1, "until": NOW + cap, "set_at": NOW, "set_by": "owner"})
     assert DeployHoldStore(path).read(now=NOW).hold is not None, "the minute of slack is kept"
-    _write(path, {"version": 1, "until": NOW + cap + 1, "set_at": NOW, "set_by": "reid"})
+    _write(path, {"version": 1, "until": NOW + cap + 1, "set_at": NOW, "set_by": "owner"})
     reading = DeployHoldStore(path).read(now=NOW)
     assert reading.hold is None
     assert reading.error is not None and "longer than 3 hours" in reading.error
@@ -126,7 +126,7 @@ def test_a_hold_ending_too_far_from_now_is_corrupt(tmp_path: Path) -> None:
     # 2026-10-19: the box clock jumped back after the set, or the file was edited by hand.
     path = tmp_path / "hold.json"
     far = 3 * 3600 + 60
-    body = {"version": 1, "until": NOW + 3 * 3600, "set_at": NOW, "set_by": "reid"}
+    body = {"version": 1, "until": NOW + 3 * 3600, "set_at": NOW, "set_by": "owner"}
     _write(path, body)
     assert DeployHoldStore(path).read(now=NOW).hold is not None, "exactly 3 hours is held"
     _write(path, {**body, "until": NOW + far + 60, "set_at": NOW + 3600})
@@ -138,10 +138,10 @@ def test_a_hold_ending_too_far_from_now_is_corrupt(tmp_path: Path) -> None:
 
 def test_clear_reads_and_removes_under_one_lock(tmp_path: Path) -> None:
     store = DeployHoldStore(tmp_path / "hold.json")
-    store.set(1, "reid", now=NOW)
+    store.set(1, "owner", now=NOW)
     with store._lock:  # an RLock: the read inside clear re-enters it
         before = store.clear(now=NOW + 1)
-    assert before.hold is not None and before.hold.set_by == "reid"
+    assert before.hold is not None and before.hold.set_by == "owner"
     assert store.read(now=NOW + 1).hold is None
 
 
@@ -158,7 +158,7 @@ def test_an_out_of_range_time_is_corrupt(
     reason: str,
 ) -> None:
     path = tmp_path / "hold.json"
-    _write(path, {"version": 1, "until": until, "set_at": set_at, "set_by": "reid"})
+    _write(path, {"version": 1, "until": until, "set_at": set_at, "set_by": "owner"})
     reading = DeployHoldStore(path).read(now=NOW)
     assert reading.hold is None
     assert reading.error is not None and reason in reading.error
@@ -174,14 +174,14 @@ def test_a_blank_user_is_stored_as_local(tmp_path: Path) -> None:
     reading = store.read(now=NOW)
     assert reading.error is None and reading.hold is not None
     assert reading.hold.set_by == "local"
-    assert store.set(1, " reid ", now=NOW).set_by == "reid"
+    assert store.set(1, " owner ", now=NOW).set_by == "owner"
 
 
 def test_setting_or_clearing_replaces_a_corrupt_file(tmp_path: Path) -> None:
     path = tmp_path / "hold.json"
     _write(path, "{not json")
     store = DeployHoldStore(path)
-    store.set(1, "reid", now=NOW)
+    store.set(1, "owner", now=NOW)
     assert store.read(now=NOW).error is None
     _write(path, "{not json")
     assert store.clear(now=NOW).error is not None
@@ -199,7 +199,7 @@ def test_an_unreadable_path_is_an_error_not_a_crash(tmp_path: Path) -> None:
 
 def test_without_a_path_the_hold_stays_in_memory() -> None:
     store = DeployHoldStore(None)
-    store.set(2, "reid", now=NOW)
+    store.set(2, "owner", now=NOW)
     assert store.read(now=NOW).hold is not None
     assert DeployHoldStore(None).read(now=NOW).hold is None
     store.clear()
@@ -220,8 +220,8 @@ def test_default_path_follows_env_then_data_dir(
 def test_the_write_is_atomic_and_leaves_no_temp_file(tmp_path: Path) -> None:
     path = tmp_path / "hold.json"
     store = DeployHoldStore(path)
-    store.set(1, "reid", now=NOW)
-    store.set(3, "reid", now=NOW + 1)
+    store.set(1, "owner", now=NOW)
+    store.set(3, "owner", now=NOW + 1)
     assert sorted(p.name for p in tmp_path.iterdir()) == ["hold.json"]
 
 
@@ -230,28 +230,28 @@ def test_a_failed_write_raises_and_keeps_what_was_there(
 ) -> None:
     path = tmp_path / "hold.json"
     store = DeployHoldStore(path)
-    store.set(1, "reid", now=NOW)
+    store.set(1, "owner", now=NOW)
 
     def refuse(_src: str, _dst: object) -> None:
         raise OSError(28, "No space left on device")
 
     monkeypatch.setattr(deploy_hold.os, "replace", refuse)
     with pytest.raises(DeployHoldSaveError, match="could not write"):
-        store.set(3, "steve", now=NOW + 1)
+        store.set(3, "member", now=NOW + 1)
     hold = store.read(now=NOW + 1).hold
-    assert hold is not None and hold.set_by == "reid"
+    assert hold is not None and hold.set_by == "owner"
     assert sorted(p.name for p in tmp_path.iterdir()) == ["hold.json"], "the temp file went"
 
 
 def test_view_shapes_the_answer() -> None:
     held = deploy_hold.view(
-        deploy_hold.Reading(deploy_hold.Hold(NOW + 7200, NOW, "reid")), now=NOW + 60
+        deploy_hold.Reading(deploy_hold.Hold(NOW + 7200, NOW, "owner")), now=NOW + 60
     )
     assert held.model_dump() == {
         "held": True,
         "until": "2026-10-20T04:40:00Z",
         "set_at": "2026-10-20T02:40:00Z",
-        "set_by": "reid",
+        "set_by": "owner",
         "remaining_s": 7140,
         "choices": [1, 2, 3],
         "error": None,
@@ -284,9 +284,9 @@ def test_cli_prints_the_hold_with_spaces_in_the_name_replaced(
     path = tmp_path / "hold.json"
     monkeypatch.setenv(deploy_hold.STATE_FILE_ENV, str(path))
     deploy_hold.reset_store()
-    deploy_hold.store().set(2, " Reid  Havens\t", now=NOW)
+    deploy_hold.store().set(2, " Owner  Person\t", now=NOW)
     assert deploy_hold.main(now=NOW + 1) == 0
-    assert capsys.readouterr().out == f"held {NOW + 7200} Reid_Havens\n"
+    assert capsys.readouterr().out == f"held {NOW + 7200} Owner_Person\n"
     assert deploy_hold.main(now=NOW + 7200) == 0
     assert capsys.readouterr().out == "none\n", "expired is none"
 
@@ -311,11 +311,11 @@ def test_cli_runs_as_a_module(tmp_path: Path) -> None:
     run = [sys.executable, "-m", "ae_omni_policies.deploy_hold"]
     nothing = subprocess.run(run, env=env, capture_output=True, text=True, timeout=120)
     assert (nothing.returncode, nothing.stdout.splitlines()[-1]) == (0, "none")
-    DeployHoldStore(path).set(1, "reid")
+    DeployHoldStore(path).set(1, "owner")
     held = subprocess.run(run, env=env, capture_output=True, text=True, timeout=120)
     assert held.returncode == 0, held.stderr
     word, until, user = held.stdout.splitlines()[-1].split(" ")
-    assert (word, user) == ("held", "reid") and until.isdigit()
+    assert (word, user) == ("held", "owner") and until.isdigit()
     _write(path, "[]")
     broken = subprocess.run(run, env=env, capture_output=True, text=True, timeout=120)
     assert broken.returncode == 2 and broken.stdout == ""
@@ -328,10 +328,10 @@ def test_cli_exits_2_for_a_hold_ending_too_far_from_now(
     path = tmp_path / "hold.json"
     monkeypatch.setenv(deploy_hold.STATE_FILE_ENV, str(path))
     deploy_hold.reset_store()
-    body = {"version": 1, "until": NOW + 3 * 3600, "set_at": NOW, "set_by": "reid"}
+    body = {"version": 1, "until": NOW + 3 * 3600, "set_at": NOW, "set_by": "owner"}
     _write(path, body)
     assert deploy_hold.main(now=NOW) == 0
-    assert capsys.readouterr().out == f"held {NOW + 3 * 3600} reid\n"
+    assert capsys.readouterr().out == f"held {NOW + 3 * 3600} owner\n"
     _write(path, {**body, "until": NOW + 3 * 3600 + 120, "set_at": NOW + 3600})
     assert deploy_hold.main(now=NOW) == 2
     out = capsys.readouterr()

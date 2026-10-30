@@ -216,7 +216,7 @@ def test_force_tags_a_docs_only_commit(repo: Repo) -> None:
 @pytest.mark.parametrize("annotated", [True, False])
 @pytest.mark.parametrize("force", [False, True])
 def test_a_tagged_commit_is_never_tagged_again(repo: Repo, annotated: bool, force: bool) -> None:
-    """Covers a tag Reid pushes by hand before the workflow runs, of either kind."""
+    """Covers a tag the owner pushes by hand before the workflow runs, of either kind."""
     repo.tag("ae-v0.13.0.3")
     repo.change("patches/0004-status.patch")
     repo.tag("ae-v0.13.0.4", annotated=annotated)

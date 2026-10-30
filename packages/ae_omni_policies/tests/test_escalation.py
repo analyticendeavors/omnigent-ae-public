@@ -76,7 +76,7 @@ def test_the_ask_rule_needs_approval_for_raise_and_lower() -> None:
     assert _decide(ask).status == "needs_approval"
     assert _decide(ask, kind="lower").status == "needs_approval"
     done = _decide(ask, confirmed=True)
-    assert (done.status, done.approved, done.counted) == ("changed", "reid", True)
+    assert (done.status, done.approved, done.counted) == ("changed", "owner", True)
 
 
 def test_the_tell_rule_applies_and_counts_raises_only() -> None:
@@ -88,7 +88,7 @@ def test_the_tell_rule_applies_and_counts_raises_only() -> None:
 
 def test_the_cap_reached_needs_approval_unless_confirmed() -> None:
     assert _decide(raises=1).status == "needs_approval"
-    assert _decide(raises=1, confirmed=True).approved == "reid"
+    assert _decide(raises=1, confirmed=True).approved == "owner"
     # A lower move never meets the cap.
     assert _decide(raises=5, kind="lower").status == "changed"
 
@@ -296,8 +296,8 @@ async def test_confirmed_bypasses_approval(client: httpx.AsyncClient, world: _Wo
     done = (
         await _post(client, "conv_kid", model=OPUS, reason="r", caller="conv_lead", confirmed=True)
     ).json()
-    assert (done["status"], done["approved"], done["counted"]) == ("changed", "reid", True)
-    assert world.lines()[0]["approved"] == "reid"
+    assert (done["status"], done["approved"], done["counted"]) == ("changed", "owner", True)
+    assert world.lines()[0]["approved"] == "owner"
 
 
 async def test_the_lead_steps_down_and_climbs_back_free(
@@ -381,7 +381,7 @@ def _model_server(seen: list[dict[str, Any]]) -> Any:
 ARGS = {"session_id": "conv_kid", "model": OPUS, "effort": "high", "reason": "CI keeps failing"}
 
 
-async def test_set_session_model_confirms_after_reid_accepts(
+async def test_set_session_model_confirms_after_owner_accepts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_lead")
@@ -399,7 +399,7 @@ async def test_set_session_model_confirms_after_reid_accepts(
         create_server(_model_server(seen)), elicitation_callback=accept
     ) as session:
         answer = _payload(await session.call_tool("set_session_model", ARGS))
-    assert (answer["status"], answer["approved"]) == ("changed", "reid")
+    assert (answer["status"], answer["approved"]) == ("changed", "owner")
     assert [bool(b.get("confirmed")) for b in seen] == [False, True]
     assert seen[0]["caller"] == "conv_lead" and seen[0]["model"] == OPUS
     assert asked[0].requestedSchema["properties"]["choice"]["enum"][0].endswith("(Recommended)")
@@ -425,7 +425,7 @@ async def test_set_session_model_declined_and_without_pop_ups(
     ) as session:
         plain = _payload(await session.call_tool("set_session_model", ARGS))
     assert plain["status"] == "needs_approval"
-    assert plain["instruction"].startswith("Ask Reid in chat")
+    assert plain["instruction"].startswith("Ask the user in chat")
 
 
 # ── review fixes ──
@@ -583,7 +583,7 @@ def test_model_last_stays_under_the_cap_with_a_long_reason() -> None:
         reason="x" * 5000,
         at=1_800_000_000,
         caller="conv_" + "a" * 40,
-        approved="reid",
+        approved="owner",
         undo=(SONNET, "medium"),
         undone=False,
     )
@@ -600,7 +600,7 @@ def test_model_last_real_length_values_lose_nothing() -> None:
         reason=reason,
         at=1_800_000_000,
         caller=caller,
-        approved="reid",
+        approved="owner",
         undo=(SONNET, "medium"),
         undone=True,
     )
@@ -612,7 +612,7 @@ def test_model_last_real_length_values_lose_nothing() -> None:
         "reason": reason,
         "at": 1_800_000_000,
         "caller": caller,
-        "approved": "reid",
+        "approved": "owner",
         "undo": {"model": SONNET, "effort": "medium"},
         "undone": True,
     }
@@ -863,3 +863,20 @@ async def test_review_report_checks_insights_for_the_leads_owner(
     body = {"reviewers_run": 1, "findings_returned": 1, "findings_fixed": 1}
     answer = await client.post("/v1/ae/sessions/conv_lead/review-report", json=body)
     assert answer.json()["status"] == "stored" and asked == ["the-owner"]
+
+
+def test_legacy_approver_value_reads_as_owner() -> None:
+    legacy = "".join(("re", "id"))  # what records carried before 2026-10-28
+    assert model_log.normalize_approved(legacy) == "owner"
+    assert model_log.normalize_approved("auto") == "auto"
+    assert model_log.normalize({"approved": legacy, "kind": "raise"}) == {
+        "approved": "owner",
+        "kind": "raise",
+    }
+    assert model_log.normalize({"kind": "raise"}) == {"kind": "raise"}
+    assert (
+        escalation.parse_last(
+            json.dumps({"f": [SONNET, "low"], "t": [OPUS, "low"], "a": 1, "p": legacy})
+        )["approved"]
+        == "owner"
+    )

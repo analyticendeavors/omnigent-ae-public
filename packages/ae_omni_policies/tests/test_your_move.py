@@ -81,7 +81,7 @@ def _pull(number: int, author: str, reviewers: list[str], sha: str, **extra: Any
     }
 
 
-async def test_sessions_that_need_reid_are_grouped_by_kind(client: httpx.AsyncClient) -> None:
+async def test_sessions_that_need_owner_are_grouped_by_kind(client: httpx.AsyncClient) -> None:
     store = get_conversation_store()
     gate = await _session(
         client,
@@ -247,22 +247,22 @@ async def test_pulls_without_a_token_say_how_to_turn_them_on(client: httpx.Async
     assert not github_route.called
 
 
-async def test_pulls_by_or_awaiting_reid_with_ci_state(
+async def test_pulls_by_or_awaiting_owner_with_ci_state(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
 ) -> None:
     monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
     monkeypatch.setenv("AE_GITHUB_REPOS", "analyticendeavors/omnigent-ae, not a repo")
-    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-reid-havens")
+    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-owner")
     repo = "/repos/analyticendeavors/omnigent-ae"
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
         listed = mock.get(f"{GH}{repo}/pulls").respond(
             200,
             json=[
-                _pull(21, "ae-reid-havens", [], "a" * 40),
-                _pull(22, "someone", ["ae-reid-havens"], "b" * 40),
+                _pull(21, "ae-owner", [], "a" * 40),
+                _pull(22, "someone", ["ae-owner"], "b" * 40),
                 _pull(23, "someone", ["another"], "c" * 40),
-                _pull(24, "AE-Reid-Havens", [], "d" * 40, draft=True),
+                _pull(24, "AE-Owner", [], "d" * 40, draft=True),
             ],
         )
         mock.get(f"{GH}{repo}/commits/{'a' * 40}/check-runs").respond(
@@ -305,11 +305,11 @@ async def test_one_repo_failing_keeps_the_other(
     monkeypatch.setenv(
         "AE_GITHUB_REPOS", "analyticendeavors/omnigent-ae,analyticendeavors/agents-and-automation"
     )
-    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-reid-havens")
+    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-owner")
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
         mock.get(f"{GH}/repos/analyticendeavors/omnigent-ae/pulls").respond(
-            200, json=[_pull(5, "ae-reid-havens", [], "e" * 40)]
+            200, json=[_pull(5, "ae-owner", [], "e" * 40)]
         )
         mock.get(
             f"{GH}/repos/analyticendeavors/omnigent-ae/commits/{'e' * 40}/check-runs"
@@ -444,7 +444,7 @@ async def test_pulls_keep_their_own_cache_through_fresh(
 ) -> None:
     monkeypatch.setenv("AE_GITHUB_TOKEN", TOKEN)
     monkeypatch.setenv("AE_GITHUB_REPOS", "analyticendeavors/omnigent-ae")
-    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-reid-havens")
+    monkeypatch.setenv("AE_GITHUB_LOGIN", "ae-owner")
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
         listed = mock.get(f"{GH}/repos/analyticendeavors/omnigent-ae/pulls").respond(200, json=[])
@@ -456,25 +456,25 @@ async def test_pulls_keep_their_own_cache_through_fresh(
 async def test_each_user_sees_only_their_own_sessions(
     client: httpx.AsyncClient, ae_permissions: set[str]
 ) -> None:
-    reid = {"X-Forwarded-Email": "reid@example.com"}
-    steve = {"X-Forwarded-Email": "steve@example.com"}
-    client.headers.update(reid)
-    mine = await _session(client, "Reid review", {labels.STATUS: "review"})
-    await _session(client, "Reid steward", {labels.STATUS: "reference"}, name="steward")
-    client.headers.update(steve)
-    theirs = await _session(client, "Steve review", {labels.STATUS: "blocked"})
+    owner = {"X-Forwarded-Email": "owner@example.com"}
+    member = {"X-Forwarded-Email": "member@example.com"}
+    client.headers.update(owner)
+    mine = await _session(client, "Owner review", {labels.STATUS: "review"})
+    await _session(client, "Owner steward", {labels.STATUS: "reference"}, name="steward")
+    client.headers.update(member)
+    theirs = await _session(client, "Member review", {labels.STATUS: "blocked"})
     del client.headers["X-Forwarded-Email"]
 
     with respx.mock(assert_all_called=False) as mock:
         _mock_store(mock)
         # Back to back, inside the cache's few seconds: one caller's answer
         # is never served to the other.
-        for_reid = (await client.get("/v1/ae/your-move", headers=reid)).json()
-        for_steve = (await client.get("/v1/ae/your-move", headers=steve)).json()
-        again = (await client.get("/v1/ae/your-move", headers=reid)).json()
-    assert [row["id"] for row in for_reid["sessions"]["items"]] == [mine]
-    assert [row["id"] for row in for_steve["sessions"]["items"]] == [theirs]
+        for_owner = (await client.get("/v1/ae/your-move", headers=owner)).json()
+        for_member = (await client.get("/v1/ae/your-move", headers=member)).json()
+        again = (await client.get("/v1/ae/your-move", headers=owner)).json()
+    assert [row["id"] for row in for_owner["sessions"]["items"]] == [mine]
+    assert [row["id"] for row in for_member["sessions"]["items"]] == [theirs]
     assert again["cached"] is True
     assert [row["id"] for row in again["sessions"]["items"]] == [mine]
-    assert for_reid["steward"]["brief"]["title"] == "Reid steward"
-    assert for_steve["steward"]["brief"] is None
+    assert for_owner["steward"]["brief"]["title"] == "Owner steward"
+    assert for_member["steward"]["brief"] is None

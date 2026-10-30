@@ -1,0 +1,2063 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 09:17:55 -0700
+Subject: [PATCH 244/260] [ae-patch] Fix the review findings on the transcript
+ keep: decide it by the server frontier
+
+The first version kept the local Claude transcript when every toolu_ call id and the last
+user text of the server items appeared in it. Review showed that accepts a file that
+disagrees with the server: edited or retried turns, changed tool output, compaction, a
+short last message that matches an earlier one, a chat with no tools.
+
+The forwarder now records the server item count and last item id each time it moves its
+cursor, next to the cursor's offset and fingerprint. A cold relaunch keeps the file only
+when the cursor and that record still describe it, the server still holds exactly the
+recorded frontier, the file ends cleanly and the image repair of a rebuild would change
+nothing. The old forwarder is cancelled before its final cursor is read, and the cursor
+and outcome travel in a context object instead of module state. Everything else rebuilds.
+---
+ .../harnesses/claude_native/ae_resume_keep.py | 576 +++++++----
+ omnigent/harnesses/claude_native/forwarder.py |  30 +-
+ omnigent/harnesses/claude_native/main.py      |  43 +-
+ omnigent/runner/native/orchestration.py       |  29 +-
+ .../claude_native/test_ae_resume_keep.py      | 900 ++++++++++++++----
+ ...pp_sessions_native_terminals_autocreate.py |   6 +-
+ 6 files changed, 1155 insertions(+), 429 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/ae_resume_keep.py b/omnigent/harnesses/claude_native/ae_resume_keep.py
+index a5281cdb1f02ff99275369fbaf68fd612f900cc7..7e9f99385ea858322af98c6a0a7c0e86ecc8abd8 100644
+--- a/omnigent/harnesses/claude_native/ae_resume_keep.py
++++ b/omnigent/harnesses/claude_native/ae_resume_keep.py
+@@ -1,33 +1,41 @@
+ """
+-Keep a session's Claude transcript on a cold relaunch when it already covers the server.
++Keep a session's Claude transcript on a cold relaunch when the server has seen nothing it lacks.
+ 
+ Every cold relaunch (a deploy, a host restart, an idle chat woken, a relaunch after an
+ account or model switch) used to overwrite ``~/.claude/projects/<dir>/<sid>.jsonl`` with
+ a transcript rebuilt from server items. The rebuilt bytes differ from what Claude sent
+ before, so the next API call wrote the whole history (150k to 800k tokens) to the
+-prompt cache at the write price. When the file on disk can be resumed and covers the
+-server history, resuming from it keeps those bytes, and the cache read stays a read.
+-
+-"Covers" means every ``toolu_*`` call id in the server items appears in the file and
+-the last server user text appears in a user record there. The file can also be ahead
+-of the server (the forwarder lagged when the runner died), and ``start_at_end`` would
+-then skip those rows in the UI. So the forwarder's own cursor is read before the
+-launch wipes it: a cursor that still matches the file seeds the forwarder at the
+-offset it had reached, and with no usable cursor the file must match the server
+-exactly (same ``toolu_*`` ids, same last user text) or the transcript is rebuilt.
+-
+-A transcript that is missing under the current workspace dir (the folder moved or
+-was recreated) is looked up under every project dir and copied with its ``cwd``
+-rewritten, under the same covers check.
++prompt cache at the write price.
++
++Whether the file on disk can stand in for a rebuild is decided by identity, never by
++matching content. Each time the forwarder advances its cursor it also records the server
++*frontier* it has seen (the number of items the conversation holds and the id of the
++last one) in ``ae_transcript_frontier.json`` next to the cursor, with the offset and
++fingerprint of the file it describes. A cold relaunch keeps the file only when:
++
++* the forwarder cursor exists, the bytes before its offset still hash to its fingerprint,
++  and the frontier record describes that same cursor;
++* the server's item count and last item id still equal the frontier (so the server gained
++  or changed nothing the forwarder had not accounted for: a retried or edited turn, an item
++  from another harness or a message typed in the web UI all force a rebuild);
++* the file ends in a newline, every line after the cursor parses as JSON and the image and
++  ``toolUseResult`` repair a rebuild would make has nothing to change.
++
++The forwarder then starts at the cursor's offset, because the rows after it are by
++construction absent from the server. A file missing under the current workspace dir is
++looked up under every project dir and copied with ``cwd`` rewritten under the same test,
++the offset mapped by line count. Anything else (no cursor, no frontier, a mismatch, an
++exception) rebuilds exactly as before.
+ """
+ 
+ from __future__ import annotations
+ 
++import asyncio
+ import contextlib
++import copy
+ import json
+ import logging
+ import os
+-import re
+ import urllib.parse
+ from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import dataclass
+@@ -46,18 +54,16 @@ KEPT = "kept"
+ COPIED = "copied"
+ REBUILT = "rebuilt"
+ 
+-_TOOL_ID_RE = re.compile(r"toolu_[A-Za-z0-9]+")
+-_MAX_PENDING_OUTCOMES = 256
+-
+-
+-class _StaleTranscriptError(Exception):
+-    """A transcript holds a record only a rebuild repairs."""
++FRONTIER_FILE = "ae_transcript_frontier.json"
++_ITEMS_PAGE = 1000
++_MAX_PAGES = 50
++_MAX_OWN_IDS = 1024
+ 
+ 
+ @dataclass(frozen=True)
+ class ForwardCursor:
+     """
+-    What the transcript forwarder had reached, read before a launch wipes its state.
++    What the transcript forwarder had reached.
+ 
+     :param transcript_path: File the cursor was recorded against.
+     :param byte_offset: Bytes of that file already forwarded.
+@@ -69,6 +75,25 @@ class ForwardCursor:
+     fingerprint: str
+ 
+ 
++@dataclass(frozen=True)
++class Frontier:
++    """
++    The server state the forwarder had seen when its cursor stood at one offset.
++
++    :param transcript_path: File the cursor was recorded against.
++    :param byte_offset: Cursor offset the record belongs to.
++    :param fingerprint: Fingerprint of the bytes before *byte_offset*.
++    :param item_count: Number of items the conversation held.
++    :param last_item_id: Id of the last of them.
++    """
++
++    transcript_path: Path
++    byte_offset: int
++    fingerprint: str
++    item_count: int
++    last_item_id: str
++
++
+ @dataclass(frozen=True)
+ class ResumeOutcome:
+     """
+@@ -83,13 +108,39 @@ class ResumeOutcome:
+     forward_offset: int | None = None
+ 
+ 
+-_pending: dict[str, ResumeOutcome] = {}
+-_cursors: dict[str, ForwardCursor] = {}
++@dataclass
++class ResumeContext:
++    """
++    What one cold relaunch knows, handed down the call chain and back up as an object.
++
++    :param bridge_dir: Bridge directory holding the forwarder state.
++    :param cursor: The final forwarder cursor of the old forwarder, or ``None``.
++    :param frontier: The final frontier record, or ``None``.
++    :param server_frontier: Item count and last item id of the history this launch
++        fetched, set once the launch has it.
++    :param outcome: Set by the launch: how the transcript was obtained.
++    :param pending_frontier: The record to write once the launch has its transcript
++        (see :func:`settle_resume`); the old record is deleted when the context is read.
++    """
++
++    bridge_dir: Path
++    cursor: ForwardCursor | None = None
++    frontier: Frontier | None = None
++    server_frontier: tuple[int, str] | None = None
++    outcome: ResumeOutcome | None = None
++    pending_frontier: Frontier | None = None
++
++
++def _same_path(left: Path, right: Path) -> bool:
++    try:
++        return left.resolve() == right.resolve()
++    except OSError:
++        return left == right
+ 
+ 
+ def read_forward_cursor(bridge_dir: Path) -> ForwardCursor | None:
+     """
+-    Read the forwarder cursor from *bridge_dir*, which the launch is about to wipe.
++    Read the forwarder cursor from *bridge_dir*.
+ 
+     :param bridge_dir: Native Claude bridge directory.
+     :returns: The cursor, or ``None`` when there is none or it carries no byte offset
+@@ -106,126 +157,238 @@ def read_forward_cursor(bridge_dir: Path) -> ForwardCursor | None:
+     return ForwardCursor(state.transcript_path, state.byte_offset, state.cursor_fingerprint)
+ 
+ 
+-def remember_cursor(session_id: str, cursor: ForwardCursor | None) -> None:
++def read_frontier(bridge_dir: Path) -> Frontier | None:
++    """
++    Read the frontier record from *bridge_dir*.
++
++    :param bridge_dir: Native Claude bridge directory.
++    :returns: The record, or ``None`` when absent or malformed.
++    """
++    try:
++        raw = json.loads((bridge_dir / FRONTIER_FILE).read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return None
++    if not isinstance(raw, dict):
++        return None
++    path = raw.get("transcript_path")
++    offset = raw.get("byte_offset")
++    fingerprint = raw.get("cursor_fingerprint")
++    count = raw.get("item_count")
++    last = raw.get("last_item_id")
++    if not (
++        isinstance(path, str)
++        and isinstance(offset, int)
++        and isinstance(fingerprint, str)
++        and isinstance(count, int)
++        and isinstance(last, str)
++        and last
++    ):
++        return None
++    return Frontier(Path(path), offset, fingerprint, count, last)
++
++
++def write_frontier(bridge_dir: Path, frontier: Frontier) -> None:
+     """
+-    Hold the forwarder cursor read before a launch wipes it, for :func:`try_keep`.
++    Write the frontier record atomically.
++
++    :param bridge_dir: Native Claude bridge directory.
++    :param frontier: What to record.
++    """
++    from omnigent.harnesses.claude_native.forwarder import _write_json_atomic
++
++    _write_json_atomic(
++        bridge_dir / FRONTIER_FILE,
++        {
++            "transcript_path": str(frontier.transcript_path),
++            "byte_offset": frontier.byte_offset,
++            "cursor_fingerprint": frontier.fingerprint,
++            "item_count": frontier.item_count,
++            "last_item_id": frontier.last_item_id,
++        },
++    )
++
++
++def read_context(bridge_dir: Path, *, forwarder_stopped: bool = True) -> ResumeContext:
++    """
++    Read the old forwarder's final cursor and frontier for a cold relaunch.
++
++    Call it after the old forwarder has been cancelled and awaited, and before the
++    launch wipes its state, so a cursor written while it was being cancelled is the one
++    used.
++
++    :param bridge_dir: Native Claude bridge directory.
++    :param forwarder_stopped: ``False`` when the old forwarder may still be running; the
++        context then carries no cursor and the launch rebuilds. The frontier record is
++        deleted either way.
++    :returns: The context for this launch.
++    """
++    ctx = ResumeContext(bridge_dir=bridge_dir)
++    if forwarder_stopped:
++        ctx.cursor = read_forward_cursor(bridge_dir)
++        ctx.frontier = read_frontier(bridge_dir)
++    # The record belongs to the cursor the launch is about to wipe. Delete it now, so a
++    # launch that never reaches :func:`settle_resume` (history unavailable, no transcript,
++    # an exception) leaves none behind for a fresh cursor to inherit; only a keep, a copy
++    # or a rebuild writes the next one.
++    with contextlib.suppress(OSError):
++        (bridge_dir / FRONTIER_FILE).unlink()
++    return ctx
++
++
++# Ids the forwarder's own posts returned that no frontier record has yet absorbed, per
++# session. Process-local bookkeeping of the forwarder itself (it is never read by a
++# launch) so a post made in an earlier, interrupted poll is not mistaken for a foreign item.
++_own_ids: dict[str, list[str]] = {}
++
++
++def note_posted(session_id: str, item_id: object) -> None:
++    """
++    Remember the id the server gave an item the forwarder posted.
+ 
+     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+-    :param cursor: What :func:`read_forward_cursor` returned; ``None`` clears any held one.
++    :param item_id: The ``item_id`` of the post's response; anything else is ignored.
+     """
+-    _cursors.pop(session_id, None)
+-    if cursor is None:
++    if not isinstance(item_id, str) or not item_id:
+         return
+-    while len(_cursors) >= _MAX_PENDING_OUTCOMES:
+-        _cursors.pop(next(iter(_cursors)))
+-    _cursors[session_id] = cursor
+-
+-
+-def _normalize(text: str) -> str:
+-    return " ".join(text.split())
+-
+-
+-def _content_text(content: object) -> str:
+-    """Text of a message ``content`` that is a string or a list of blocks."""
+-    if isinstance(content, str):
+-        return content
+-    if not isinstance(content, list):
+-        return ""
+-    parts: list[str] = []
+-    for block in content:
+-        if isinstance(block, dict) and isinstance(block.get("text"), str):
+-            parts.append(block["text"])
+-    return "\n".join(parts)
+-
+-
+-def _server_tool_ids_and_last_user(items: Sequence[Mapping[str, object]]) -> tuple[set[str], str]:
+-    tool_ids: set[str] = set()
+-    last_user = ""
+-    for item in items:
+-        call_id = item.get("call_id")
+-        if isinstance(call_id, str) and call_id.startswith("toolu_"):
+-            tool_ids.add(call_id)
+-        if item.get("type") == "message" and item.get("role") == "user":
+-            text = _normalize(_content_text(item.get("content")))
+-            if text:
+-                last_user = text
+-    return tool_ids, last_user
+-
+-
+-def _scan_transcript(path: Path, probe: str) -> tuple[set[str], str, bool]:
++    ids = _own_ids.setdefault(session_id, [])
++    ids.append(item_id)
++    del ids[:-_MAX_OWN_IDS]
++
++
++def forget_session(session_id: str) -> None:
+     """
+-    Read a transcript once.
+-
+-    :param path: Claude transcript JSONL.
+-    :param probe: Normalized user text to look for, or ``""`` for none.
+-    :returns: Every ``toolu_*`` id in it, the normalized text of its last user text
+-        record, and whether any user record's text holds *probe*. A record carrying the
+-        old rebuild's duplicated image payload (``toolUseResult`` as a string that holds
+-        base64) is reported by raising :class:`_StaleTranscriptError`, so the rebuild
+-        repairs it.
++    Drop the forwarder's own-post ids for a session whose forwarder has ended.
++
++    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+     """
+-    tool_ids: set[str] = set()
+-    last_user = ""
+-    found = not probe
+-    with path.open("r", encoding="utf-8", errors="replace") as handle:
+-        for line in handle:
+-            if "toolu_" in line:
+-                tool_ids.update(_TOOL_ID_RE.findall(line))
+-            if '"user"' not in line:
+-                continue
+-            try:
+-                record = json.loads(line)
+-            except ValueError:
+-                continue
+-            if not isinstance(record, dict) or record.get("type") != "user":
+-                continue
+-            tool_use_result = record.get("toolUseResult")
+-            if isinstance(tool_use_result, str) and '"base64"' in tool_use_result:
+-                raise _StaleTranscriptError(path)
+-            message = record.get("message")
+-            if not isinstance(message, dict):
+-                continue
+-            text = _normalize(_content_text(message.get("content")))
+-            if not text:
+-                continue
+-            last_user = text
+-            if probe and probe in text:
+-                found = True
+-    return tool_ids, last_user, found
++    _own_ids.pop(session_id, None)
+ 
+ 
+-def _covers(path: Path, items: Sequence[Mapping[str, object]], *, exact: bool) -> bool:
++async def _items_after(client: httpx.AsyncClient, session_id: str, after: str) -> list[str] | None:
++    ids: list[str] = []
++    cursor = after
++    for _ in range(_MAX_PAGES):
++        resp = await client.get(
++            f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/items",
++            params={"limit": _ITEMS_PAGE, "order": "asc", "after": cursor},
++        )
++        if resp.status_code != 200:
++            return None
++        payload = resp.json()
++        data = payload.get("data") if isinstance(payload, dict) else None
++        if not isinstance(data, list):
++            return None
++        batch = [
++            row["id"] for row in data if isinstance(row, dict) and isinstance(row.get("id"), str)
++        ]
++        if len(batch) != len(data):
++            return None
++        ids.extend(batch)
++        if not payload.get("has_more") or not batch:
++            return ids
++        cursor = batch[-1]
++    return None
++
++
++async def record_frontier(
++    client: httpx.AsyncClient,
++    bridge_dir: Path,
++    session_id: str,
++    cursor: ForwardCursor,
++) -> None:
+     """
+-    Whether *path* holds everything the server items do.
++    Record the server frontier for the cursor the forwarder has just persisted.
+ 
+-    :param path: Candidate transcript.
+-    :param items: Server session items.
+-    :param exact: Also require the file to hold no ``toolu_*`` id and no later user
+-        text that the server lacks, for when nothing says how far the forwarder got.
+-    :returns: ``True`` when the transcript can stand in for a rebuild.
++    Called by the forwarder after it posts rows and writes its cursor. It advances the
++    previous record by the items created since, and only when every one of them is an item
++    the forwarder itself posted; any other item leaves the record behind, so the next cold
++    relaunch sees a mismatch and rebuilds. It never creates a record from nothing: with no
++    previous record (a session started before this existed, or a launch that did not settle)
++    nothing is written, because a record made at a cursor the forwarder seeded itself would
++    vouch for rows the server never received. Never raises.
++
++    :param client: Omnigent HTTP client.
++    :param bridge_dir: Native Claude bridge directory.
++    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
++    :param cursor: The cursor just persisted.
+     """
+-    server_ids, server_last = _server_tool_ids_and_last_user(items)
+-    if not server_ids and not server_last:
+-        return False
+     try:
+-        file_ids, file_last, found = _scan_transcript(path, server_last)
+-    except _StaleTranscriptError:
+-        return False
+-    if not server_ids <= file_ids or not found:
+-        return False
+-    if exact:
+-        return file_ids == server_ids and (not server_last or server_last in file_last)
+-    return True
++        previous = read_frontier(bridge_dir)
++        if previous is None:
++            _own_ids.pop(session_id, None)
++            return
++        if (
++            _same_path(previous.transcript_path, cursor.transcript_path)
++            and previous.byte_offset == cursor.byte_offset
++            and previous.fingerprint == cursor.fingerprint
++        ):
++            return
++        delta = await _items_after(client, session_id, previous.last_item_id)
++        if delta is None:
++            return
++        own = _own_ids.get(session_id, [])
++        if any(item_id not in own for item_id in delta):
++            return
++        write_frontier(
++            bridge_dir,
++            Frontier(
++                cursor.transcript_path,
++                cursor.byte_offset,
++                cursor.fingerprint,
++                previous.item_count + len(delta),
++                delta[-1] if delta else previous.last_item_id,
++            ),
++        )
++        absorbed = set(delta)
++        _own_ids[session_id] = [item_id for item_id in own if item_id not in absorbed]
++    except Exception:  # noqa: BLE001 - a missed record only costs a later keep
++        _logger.debug(
++            "claude-native: could not record the server frontier for %s",
++            session_id,
++            exc_info=True,
++        )
+ 
+ 
+-def _cursor_matches(path: Path, cursor: ForwardCursor | None) -> bool:
+-    if cursor is None or cursor.transcript_path != path:
+-        return False
++def _cursor_matches(path: Path, cursor: ForwardCursor) -> bool:
+     from omnigent.harnesses.claude_native.forwarder import _jsonl_cursor_fingerprint
+ 
+     return _jsonl_cursor_fingerprint(path, cursor.byte_offset) == cursor.fingerprint
+ 
+ 
++def _tail_complete(path: Path, byte_offset: int) -> bool:
++    """Whether *path* ends in a newline and every line after *byte_offset* parses as JSON."""
++    size = path.stat().st_size
++    if size == 0 or byte_offset > size:
++        return False
++    with path.open("rb") as handle:
++        handle.seek(size - 1)
++        if handle.read(1) != b"\n":
++            return False
++        handle.seek(byte_offset)
++        for line in handle:
++            if not line.strip():
++                continue
++            if not isinstance(json.loads(line), dict):
++                return False
++    return True
++
++
++def _sanitizer_changes_nothing(path: Path, sanitize_record: Callable[[dict], None]) -> bool:
++    """Whether the rebuild's image and ``toolUseResult`` repair leaves every record as is."""
++    with path.open("r", encoding="utf-8") as handle:
++        for line in handle:
++            if "tool_result" not in line and "toolUseResult" not in line:
++                continue
++            record = json.loads(line)
++            if not isinstance(record, dict):
++                continue
++            probe = copy.deepcopy(record)
++            sanitize_record(probe)
++            if probe != record:
++                return False
++    return True
++
++
+ def _offset_after_lines(path: Path, lines: int) -> int:
+     offset = 0
+     with path.open("rb") as handle:
+@@ -238,11 +401,20 @@ def _offset_after_lines(path: Path, lines: int) -> int:
+ 
+ 
+ def _lines_before(path: Path, byte_offset: int) -> int:
++    count = 0
++    remaining = byte_offset
+     with path.open("rb") as handle:
+-        return handle.read(byte_offset).count(b"\n")
++        while remaining > 0:
++            chunk = handle.read(min(remaining, 1 << 20))
++            if not chunk:
++                break
++            count += chunk.count(b"\n")
++            remaining -= len(chunk)
++    return count
+ 
+ 
+-def try_keep(
++async def try_keep(
++    ctx: ResumeContext,
+     *,
+     session_id: str,
+     items: Sequence[Mapping[str, object]],
+@@ -252,34 +424,37 @@ def try_keep(
+     is_resumable: Callable[[Path], bool],
+     find_transcript: Callable[..., Path | None],
+     copy_transcript: Callable[..., None],
++    sanitize_record: Callable[[dict], None],
+ ) -> Path | None:
+     """
+-    Use the transcript already on disk instead of rebuilding it, when it covers the server.
++    Use the transcript already on disk instead of rebuilding it, when the test above passes.
+ 
++    :param ctx: This launch's context; its ``outcome`` is set when the file is used.
+     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+-    :param items: Server session items for the conversation.
++    :param items: Server session items for the conversation, as fetched for this launch.
+     :param target: Where ``claude --resume`` reads the transcript for this workspace.
+-    :param external_session_id: Claude session id, e.g.
+-        ``"<claude-session-uuid>"``.
++    :param external_session_id: Claude session id, e.g. ``"<claude-session-uuid>"``.
+     :param workspace: Resolved directory Claude runs in.
+     :param is_resumable: ``_is_resumable_claude_transcript``.
+     :param find_transcript: ``_find_claude_transcript``.
+     :param copy_transcript: ``_copy_transcript_with_cwd``.
++    :param sanitize_record: ``_sanitize_cloned_tool_result_record``.
+     :returns: *target* when it is now a transcript to resume from, or ``None`` when the
+-        caller should rebuild as before. The cursor :func:`remember_cursor` held is used
+-        up, and the path taken is left for :func:`take_outcome`.
++        caller should rebuild as before. Any exception also gives ``None``. The file work
++        runs in a worker thread, so a large transcript does not stall the runner's loop.
+     """
+     try:
+-        return _try_keep(
+-            session_id=session_id,
++        return await asyncio.to_thread(
++            _try_keep,
++            ctx,
+             items=items,
+             target=target,
+             external_session_id=external_session_id,
+             workspace=workspace,
+-            cursor=_cursors.pop(session_id, None),
+             is_resumable=is_resumable,
+             find_transcript=find_transcript,
+             copy_transcript=copy_transcript,
++            sanitize_record=sanitize_record,
+         )
+     except Exception:  # noqa: BLE001 - any doubt means the old rebuild
+         _logger.warning(
+@@ -288,37 +463,58 @@ def try_keep(
+             exc_info=True,
+             extra={"session_id": session_id},
+         )
++        ctx.outcome = None
+         return None
+ 
+ 
+ def _try_keep(
++    ctx: ResumeContext,
+     *,
+-    session_id: str,
+     items: Sequence[Mapping[str, object]],
+     target: Path,
+     external_session_id: str,
+     workspace: Path,
+-    cursor: ForwardCursor | None,
+     is_resumable: Callable[[Path], bool],
+     find_transcript: Callable[..., Path | None],
+     copy_transcript: Callable[..., None],
++    sanitize_record: Callable[[dict], None],
+ ) -> Path | None:
+-    if target.is_file():
+-        if not is_resumable(target):
++    cursor, frontier = ctx.cursor, ctx.frontier
++    if cursor is None or frontier is None or not items:
++        return None
++    last_id = items[-1].get("id")
++    if frontier.item_count != len(items) or frontier.last_item_id != last_id:
++        return None
++    if (
++        not _same_path(frontier.transcript_path, cursor.transcript_path)
++        or frontier.byte_offset != cursor.byte_offset
++        or frontier.fingerprint != cursor.fingerprint
++    ):
++        return None
++
++    copying = not target.is_file()
++    if copying:
++        source = find_transcript(external_session_id, exclude=target)
++        if source is None or not _same_path(source, cursor.transcript_path):
+             return None
+-        usable = _cursor_matches(target, cursor)
+-        if not _covers(target, items, exact=not usable):
++    else:
++        source = target
++        if not _same_path(target, cursor.transcript_path):
+             return None
+-        offset = cursor.byte_offset if usable and cursor is not None else None
+-        _remember(session_id, ResumeOutcome(KEPT, offset))
+-        return target
+-
+-    source = find_transcript(external_session_id, exclude=target)
+-    if source is None or not is_resumable(source):
++    if not is_resumable(source) or not _cursor_matches(source, cursor):
++        return None
++    if not _tail_complete(source, cursor.byte_offset):
+         return None
+-    usable = _cursor_matches(source, cursor)
+-    if not _covers(source, items, exact=not usable):
++    if not _sanitizer_changes_nothing(source, sanitize_record):
+         return None
++
++    if not copying:
++        ctx.pending_frontier = frontier
++        ctx.outcome = ResumeOutcome(KEPT, cursor.byte_offset)
++        return target
++
++    from omnigent.harnesses.claude_native.forwarder import _jsonl_cursor_fingerprint
++
+     target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+     tmp = target.with_suffix(".jsonl.tmp")
+     try:
+@@ -327,77 +523,95 @@ def _try_keep(
+     finally:
+         with contextlib.suppress(FileNotFoundError):
+             tmp.unlink()
+-    offset = None
+-    if usable and cursor is not None:
+-        # The copy rewrites every line, so the bytes shift but the lines do not.
+-        offset = _offset_after_lines(target, _lines_before(source, cursor.byte_offset))
+-    _remember(session_id, ResumeOutcome(COPIED, offset))
++    # The copy rewrites every line, so the bytes shift but the lines do not.
++    offset = _offset_after_lines(target, _lines_before(source, cursor.byte_offset))
++    fingerprint = _jsonl_cursor_fingerprint(target, offset)
++    if fingerprint is None:
++        target.unlink()
++        return None
++    ctx.pending_frontier = Frontier(
++        target, offset, fingerprint, frontier.item_count, frontier.last_item_id
++    )
++    ctx.outcome = ResumeOutcome(COPIED, offset)
+     return target
+ 
+ 
+-def note_rebuilt(session_id: str) -> None:
++def note_rebuilt(ctx: ResumeContext, items: Sequence[Mapping[str, object]]) -> None:
+     """
+     Record that this launch rebuilt the transcript from server items.
+ 
+-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+-    """
+-    _remember(session_id, ResumeOutcome(REBUILT))
+-
+-
+-def _remember(session_id: str, outcome: ResumeOutcome) -> None:
+-    _pending.pop(session_id, None)
+-    while len(_pending) >= _MAX_PENDING_OUTCOMES:
+-        _pending.pop(next(iter(_pending)))
+-    _pending[session_id] = outcome
+-
+-
+-def take_outcome(session_id: str) -> ResumeOutcome | None:
+-    """
+-    Return and clear the outcome of the last transcript preparation for a session.
+-
+-    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+-    :returns: The outcome, or ``None`` when no cold resume ran.
++    :param ctx: This launch's context.
++    :param items: The server items the rebuild used.
+     """
+-    return _pending.pop(session_id, None)
++    last_id = items[-1].get("id") if items else None
++    ctx.server_frontier = (len(items), last_id) if isinstance(last_id, str) and last_id else None
++    ctx.outcome = ResumeOutcome(REBUILT)
+ 
+ 
+ async def settle_resume(
+     server_client: httpx.AsyncClient,
+     session_id: str,
++    ctx: ResumeContext,
++    transcript: Path,
+     measured_prefix_bytes: int | None,
+     labels: Mapping[str, str] | None,
+ ) -> int | None:
+     """
+     Label the session with the path its cold relaunch took and pick the forwarder offset.
+ 
++    The frontier record the launch deleted when it read its context is written back here
++    (the same one for a keep, the remapped one for a copy, a first one for a rebuild), so
++    the next cold relaunch has one to test and a launch that never gets here leaves none.
+     Never fails a launch: a label that cannot be written is logged.
+ 
+     :param server_client: The runner's Omnigent client.
+     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
++    :param ctx: This launch's context.
++    :param transcript: The transcript the launch resumes from.
+     :param measured_prefix_bytes: Size of the transcript measured before Claude starts.
+     :param labels: The session's labels as the launch saw them, for the running count;
+         ``None`` starts the count over.
+     :returns: The byte offset the forwarder should start from: the recorded cursor when
+         a kept or copied transcript was ahead of it, otherwise *measured_prefix_bytes*.
+     """
+-    outcome = take_outcome(session_id)
++    outcome = ctx.outcome
+     if outcome is None:
+         return measured_prefix_bytes
+     try:
+-        count = int((labels or {}).get(RESUME_COUNT_LABEL, "0")) + 1
++        pending = ctx.pending_frontier
++        if outcome.mode == REBUILT and ctx.server_frontier and measured_prefix_bytes is not None:
++            from omnigent.harnesses.claude_native.forwarder import _jsonl_cursor_fingerprint
++
++            fingerprint = _jsonl_cursor_fingerprint(transcript, measured_prefix_bytes)
++            if fingerprint is not None:
++                count, last_id = ctx.server_frontier
++                pending = Frontier(transcript, measured_prefix_bytes, fingerprint, count, last_id)
++        # With no measured size the forwarder seeds from the live end of the file, which can
++        # be past rows the server lacks; a record written now would vouch for them.
++        if pending is not None and measured_prefix_bytes is not None:
++            write_frontier(ctx.bridge_dir, pending)
++    except Exception:  # noqa: BLE001 - a missed record only costs a later keep
++        _logger.warning(
++            "claude-native: could not record the server frontier for %s",
++            session_id,
++            exc_info=True,
++            extra={"session_id": session_id},
++        )
++    try:
++        count_now = int((labels or {}).get(RESUME_COUNT_LABEL, "0")) + 1
+     except ValueError:
+-        count = 1
++        count_now = 1
+     _logger.info(
+         "claude-native: cold resume of %s used the %s transcript; resume=%d",
+         session_id,
+         outcome.mode,
+-        count,
++        count_now,
+         extra={"session_id": session_id},
+     )
+     try:
+         resp = await server_client.patch(
+             f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}",
+-            json={"labels": {RESUME_LABEL: outcome.mode, RESUME_COUNT_LABEL: str(count)}},
++            json={"labels": {RESUME_LABEL: outcome.mode, RESUME_COUNT_LABEL: str(count_now)}},
+             params={"include_usage": "false"},
+             timeout=10.0,
+         )
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 525b088123c4bb202fd0ba7b82b5b8fe50c95c68..f78987606aa977c8c18cec7090af0dfe0f3e9b46 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -21,6 +21,7 @@ import httpx
+ from omnigent.debug_logging import debug_event
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.errors import ErrorCode
++from omnigent.harnesses.claude_native import ae_resume_keep
+ from omnigent.harnesses.claude_native.ae_pane_progress import (
+     ProgressRelayState,
+     clear_progress_on_rotation,
+@@ -4876,10 +4877,13 @@ async def _forward_available_items(
+         if retry_tracker.retry_delay_s(retry_key) is not None:
+             return updated
+         try:
+-            await _post_external_conversation_item(
+-                client,
+-                session_id=session_id,
+-                item=item,
++            ae_resume_keep.note_posted(
++                session_id,
++                await _post_external_conversation_item(
++                    client,
++                    session_id=session_id,
++                    item=item,
++                ),
+             )
+         except httpx.HTTPError as exc:
+             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
+@@ -5010,6 +5014,15 @@ async def _forward_available_items(
+         pending_settled_response_id=dedupe.pending_settled_response_id,
+     )
+     await _write_forward_state_async(bridge_dir, updated)
++    if updated.byte_offset is not None and updated.cursor_fingerprint is not None:
++        await ae_resume_keep.record_frontier(
++            client,
++            bridge_dir,
++            session_id,
++            ae_resume_keep.ForwardCursor(
++                updated.transcript_path, updated.byte_offset, updated.cursor_fingerprint
++            ),
++        )
+     # POST usage AFTER items so the ring never leads the transcript.
+     # Best-effort: a failed post is retried on the next poll.
+     #
+@@ -5438,14 +5451,15 @@ async def _post_external_conversation_item(
+     *,
+     session_id: str,
+     item: ClaudeTranscriptItem,
+-) -> None:
++) -> str | None:
+     """
+     Post one mirrored transcript item to the Sessions API.
+ 
+     :param client: Omnigent HTTP client.
+     :param session_id: Omnigent session/conversation id.
+     :param item: Transcript-derived conversation item.
+-    :returns: None.
++    :returns: The store id the server gave the item, or ``None`` when the response
++        carried none.
+     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
+     """
+     from omnigent.runtime import telemetry
+@@ -5487,6 +5501,10 @@ async def _post_external_conversation_item(
+             },
+         )
+         resp.raise_for_status()
++        try:
++            return resp.json().get("item_id")
++        except (ValueError, AttributeError):
++            return None
+ 
+ 
+ async def _post_external_output_text_delta(
+diff --git a/omnigent/harnesses/claude_native/main.py b/omnigent/harnesses/claude_native/main.py
+index 3e9e02fa4cfb16e0d34c945fff5f00d782e94032..da7cde1624ab6a2794b3799c35d4d14e027beb35 100644
+--- a/omnigent/harnesses/claude_native/main.py
++++ b/omnigent/harnesses/claude_native/main.py
+@@ -5338,6 +5338,7 @@ async def _ensure_local_claude_resume_transcript(
+     external_session_id: str,
+     workspace: Path,
+     bridge_dir: Path | None = None,
++    ae_resume: ae_resume_keep.ResumeContext | None = None,
+ ) -> Path | None:
+     """
+     Refresh Claude Code's local JSONL transcript for cold resume.
+@@ -5364,6 +5365,9 @@ async def _ensure_local_claude_resume_transcript(
+         what Claude computes.
+     :param bridge_dir: Launch bridge path identifying the attachment cache.
+         Defaults to the legacy session-id bridge when omitted.
++    :param ae_resume: The launch's resume context (final forwarder cursor and
++        frontier). Given, the transcript on disk may be kept or copied instead of
++        rebuilt, and the path taken is set on it; ``None`` always rebuilds.
+     :returns: Path to the local transcript that was written; ``None`` if
+         *external_session_id* is not a safe transcript stem, or if the AP
+         history yields no resumable records (an empty transcript would make
+@@ -5405,27 +5409,30 @@ async def _ensure_local_claude_resume_transcript(
+     # fetch the bytes back so the rebuilt transcript can reference a
+     # live local file instead of silently dropping the attachment.
+     items = await resolve_session_item_file_references(client, session_id=session_id, items=items)
+-    kept = ae_resume_keep.try_keep(
+-        session_id=session_id,
+-        items=items,
+-        target=target,
+-        external_session_id=external_session_id,
+-        workspace=current,
+-        is_resumable=_is_resumable_claude_transcript,
+-        find_transcript=_find_claude_transcript,
+-        copy_transcript=_copy_transcript_with_cwd,
+-    )
+-    if kept is not None:
+-        # A rebuild also re-materializes the attachment files its records point at.
+-        _claude_transcript_records_from_session_items(
+-            items,
++    if ae_resume is not None:
++        kept = await ae_resume_keep.try_keep(
++            ae_resume,
+             session_id=session_id,
++            items=items,
++            target=target,
+             external_session_id=external_session_id,
+-            cwd=current,
+-            bridge_dir=bridge_dir or bridge_dir_for_conversation_id(session_id),
++            workspace=current,
++            is_resumable=_is_resumable_claude_transcript,
++            find_transcript=_find_claude_transcript,
++            copy_transcript=_copy_transcript_with_cwd,
++            sanitize_record=_sanitize_cloned_tool_result_record,
+         )
+-        return kept
+-    ae_resume_keep.note_rebuilt(session_id)
++        if kept is not None:
++            # A rebuild also re-materializes the attachment files its records point at.
++            _claude_transcript_records_from_session_items(
++                items,
++                session_id=session_id,
++                external_session_id=external_session_id,
++                cwd=current,
++                bridge_dir=bridge_dir or bridge_dir_for_conversation_id(session_id),
++            )
++            return kept
++        ae_resume_keep.note_rebuilt(ae_resume, items)
+     records = _claude_transcript_records_from_session_items(
+         items,
+         session_id=session_id,
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index fd45f13fc5b94240adb642ceca47a6b83b2fc055..6675e097f6b116d4e9470e15527bc3f302e530e8 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -191,7 +191,7 @@ class _CodexNativeModelOptionsNotReady(RuntimeError):
+     """Raised when Codex model options are requested before bridge startup."""
+ 
+ 
+-async def _cancel_auto_forwarder_task(session_id: str) -> None:
++async def _cancel_auto_forwarder_task(session_id: str) -> bool:
+     """
+     Cancel and await the session's registered transcript forwarder, if any.
+ 
+@@ -203,11 +203,15 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
+     for external conversation items).
+ 
+     :param session_id: Session/conversation id, e.g. ``"conv_abc123"``.
+-    :returns: None.
++    :returns: ``True`` when no forwarder is left running, ``False`` when a cancelled one
++        did not finish in time.
+     """
++    from omnigent.harnesses.claude_native import ae_resume_keep
++
+     task = _AUTO_FORWARDER_TASKS.pop(session_id, None)
+     if task is None or task.done():
+-        return
++        ae_resume_keep.forget_session(session_id)
++        return True
+     task.cancel()
+     # asyncio.wait absorbs the CancelledError and bounds the wait on a hung cancellation.
+     _done, pending = await asyncio.wait({task}, timeout=_AUTO_FORWARDER_CANCEL_TIMEOUT_S)
+@@ -217,6 +221,8 @@ async def _cancel_auto_forwarder_task(session_id: str) -> None:
+             session_id,
+             _AUTO_FORWARDER_CANCEL_TIMEOUT_S,
+         )
++    ae_resume_keep.forget_session(session_id)
++    return not pending
+ 
+ 
+ async def teardown_codex_native_app_server(session_id: str) -> None:
+@@ -8413,13 +8419,6 @@ async def _auto_create_claude_terminal(
+     )
+ 
+     _pre_wipe_claude_sid = _read_csid_pre_wipe(_bridge_dir_for_bridge_id(bridge_id))
+-    from omnigent.harnesses.claude_native import ae_resume_keep
+-
+-    # The forwarder cursor goes the same way, so a kept transcript that is ahead of
+-    # the server can be forwarded from where the cursor stopped.
+-    ae_resume_keep.remember_cursor(
+-        session_id, ae_resume_keep.read_forward_cursor(_bridge_dir_for_bridge_id(bridge_id))
+-    )
+     # Resolved once here and reused below (env_spec) so the bridge's own
+     # sys_os_* tools and the terminal process see the same sandbox — the
+     # agent's declared os_env.sandbox, already overridden by any
+@@ -8433,7 +8432,12 @@ async def _auto_create_claude_terminal(
+     )
+     # Cancel any surviving forwarder BEFORE wiping its cursor/seen state, else it
+     # re-posts with fresh dedup state alongside the forwarder spawned below.
+-    await _cancel_auto_forwarder_task(session_id)
++    _ae_forwarder_stopped = await _cancel_auto_forwarder_task(session_id)
++    # Read the old forwarder's final cursor and frontier now that it has stopped, and
++    # before the reset below wipes them, so a keep sees what it wrote while cancelling.
++    from omnigent.harnesses.claude_native import ae_resume_keep
++
++    _ae_resume = ae_resume_keep.read_context(bridge_dir, forwarder_stopped=_ae_forwarder_stopped)
+     reset_transcript_forward_state(bridge_dir)
+     _logger.info(
+         "Claude terminal bridge prepared: session=%s",
+@@ -8524,12 +8528,15 @@ async def _auto_create_claude_terminal(
+                 external_session_id=session_external_id,
+                 workspace=Path(workspace).resolve(),
+                 bridge_dir=bridge_dir,
++                ae_resume=_ae_resume,
+             )
+             if _transcript is not None:
+                 resume_external_session_id = session_external_id
+                 resume_prefix_bytes = await ae_resume_keep.settle_resume(
+                     server_client,
+                     session_id,
++                    _ae_resume,
++                    _transcript,
+                     _measured_prefix_bytes(_transcript),
+                     session_init.snapshot.labels if session_init is not None else None,
+                 )
+diff --git a/tests/harnesses/claude_native/test_ae_resume_keep.py b/tests/harnesses/claude_native/test_ae_resume_keep.py
+index 82b2a6cac1420cb03ab0fb51bebe71c6d7f2f98b..cd61f4188569990d2eb08a6af76dc52005f8fb6e 100644
+--- a/tests/harnesses/claude_native/test_ae_resume_keep.py
++++ b/tests/harnesses/claude_native/test_ae_resume_keep.py
+@@ -1,321 +1,799 @@
+-"""A cold relaunch keeps a local Claude transcript that already covers the server (omnigent-ae)."""
++"""A cold relaunch keeps a Claude transcript only when the server frontier matches."""
+ 
+ from __future__ import annotations
+ 
++import copy
+ import json
++from dataclasses import dataclass, field
+ from pathlib import Path
++from typing import Any
+ 
+ import httpx
+ import pytest
+ 
+ from omnigent.harnesses.claude_native import ae_resume_keep as keep
++from omnigent.harnesses.claude_native import forwarder
+ from omnigent.harnesses.claude_native import main as claude_native
+-from omnigent.harnesses.claude_native.forwarder import _jsonl_cursor_fingerprint
++from omnigent.runner.native import orchestration
+ 
+ SID = "sid123"
+-WORKSPACE = Path("/work/some-repo")
++CONV = "conv_abc"
++B64 = "iVBORw0KGgo" + "D" * 5000 + "="
++IMAGE = {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": B64}}
+ 
+-ITEMS = [
+-    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "list files"}]},
+-    {"type": "function_call", "name": "Bash", "call_id": "toolu_01A", "arguments": "{}"},
+-    {"type": "function_call_output", "call_id": "toolu_01A", "output": "a.txt"},
+-    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "ok"}]},
+-    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "now read a"}]},
+-]
+ 
+-
+-def _user(text: str, cwd: str = "/work/some-repo") -> dict[str, object]:
+-    return {"type": "user", "cwd": cwd, "message": {"role": "user", "content": text}}
++def _user_row(uuid: str, text: str, cwd: str) -> dict[str, Any]:
++    return {
++        "type": "user",
++        "uuid": uuid,
++        "cwd": cwd,
++        "message": {"role": "user", "content": text},
++    }
+ 
+ 
+-def _tool_use(call_id: str) -> dict[str, object]:
++def _assistant_row(uuid: str, text: str, cwd: str) -> dict[str, Any]:
+     return {
+         "type": "assistant",
+-        "cwd": "/work/some-repo",
++        "uuid": uuid,
++        "cwd": cwd,
+         "message": {
+             "role": "assistant",
+-            "content": [{"type": "tool_use", "id": call_id, "name": "Bash", "input": {}}],
++            "model": "claude-opus-4-8",
++            "content": [{"type": "text", "text": text}],
+         },
+     }
+ 
+ 
+-def _tool_result(call_id: str) -> dict[str, object]:
+-    return {
+-        "type": "user",
+-        "cwd": "/work/some-repo",
+-        "message": {
+-            "role": "user",
+-            "content": [{"type": "tool_result", "tool_use_id": call_id, "content": "a.txt"}],
+-        },
+-    }
++@dataclass
++class FakeServer:
++    """The conversation store: items with ids, served and appended like the real routes."""
++
++    items: list[dict[str, Any]] = field(default_factory=list)
++    patches: list[dict[str, Any]] = field(default_factory=list)
++
++    def add(self, item: dict[str, Any]) -> str:
++        item_id = f"item_{len(self.items)}"
++        self.items.append({"id": item_id, **item})
++        return item_id
++
++    def handle(self, request: httpx.Request) -> httpx.Response:
++        path = request.url.path
++        if request.method == "GET" and path.endswith("/items"):
++            params = request.url.params
++            order = params.get("order", "asc")
++            rows = list(self.items) if order == "asc" else list(reversed(self.items))
++            after = params.get("after")
++            if after is not None:
++                ids = [row["id"] for row in rows]
++                rows = rows[ids.index(after) + 1 :] if after in ids else []
++            limit = int(params.get("limit", "100"))
++            return httpx.Response(200, json={"data": rows[:limit], "has_more": len(rows) > limit})
++        if request.method == "PATCH":
++            self.patches.append(json.loads(request.content))
++            return httpx.Response(200, json={})
++        body = json.loads(request.content)
++        if body.get("type") == "external_conversation_item":
++            data = body["data"]
++            item_id = self.add({"type": data["item_type"], **data["item_data"]})
++            return httpx.Response(202, json={"queued": False, "item_id": item_id})
++        return httpx.Response(202, json={})
++
++
++@dataclass
++class Env:
++    root: Path
++    server: FakeServer
++
++    @property
++    def workspace(self) -> Path:
++        return self.root / "ws"
++
++    @property
++    def bridge(self) -> Path:
++        return self.root / "bridge"
++
++    @property
++    def projects(self) -> Path:
++        return self.root / "projects"
++
++    def transcript(self, workspace: Path | None = None) -> Path:
++        name = claude_native._sanitize_claude_project_name(str(workspace or self.workspace))
++        return self.projects / name / f"{SID}.jsonl"
++
++    def client(self) -> httpx.AsyncClient:
++        return httpx.AsyncClient(
++            transport=httpx.MockTransport(self.server.handle), base_url="http://test"
++        )
+ 
+ 
+-def _write(path: Path, rows: list[dict[str, object]]) -> None:
++def _write(path: Path, rows: list[dict[str, Any]]) -> None:
+     path.parent.mkdir(parents=True, exist_ok=True)
+-    path.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
++    path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+ 
+ 
+-def _covering_rows() -> list[dict[str, object]]:
+-    return [
+-        _user("list files"),
+-        _tool_use("toolu_01A"),
+-        _tool_result("toolu_01A"),
+-        _user("now read a"),
+-    ]
++def _append(path: Path, rows: list[dict[str, Any]]) -> None:
++    with path.open("a", encoding="utf-8") as handle:
++        for row in rows:
++            handle.write(json.dumps(row) + "\n")
+ 
+ 
+-def _page(items: list[dict[str, object]]) -> httpx.Response:
+-    return httpx.Response(200, json={"data": items, "has_more": False})
++@pytest.fixture(autouse=True)
++def _no_own_ids() -> Any:
++    keep._own_ids.clear()
++    yield
++    keep._own_ids.clear()
+ 
+ 
+ @pytest.fixture
+-def projects(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+-    root = tmp_path / "projects"
+-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", root)
+-    keep._pending.clear()
+-    keep._cursors.clear()
+-    return root
++def env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Env:
++    environment = Env(tmp_path, FakeServer())
++    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", environment.projects)
++    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _: {})
++    environment.bridge.mkdir()
++    return environment
++
++
++def _seed(env: Env, *, workspace: Path | None = None) -> Path:
++    """
++    What a launch leaves behind: a transcript, the forwarder cursor at its end and the
++    frontier record for it, with one server item standing for the history.
++    """
++    workspace = workspace or env.workspace
++    path = env.transcript(workspace)
++    _write(
++        path,
++        [_user_row("u0", "hello", str(workspace)), _assistant_row("a0", "hi", str(workspace))],
++    )
++    env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]}
++    )
++    offset = path.stat().st_size
++    fingerprint = forwarder._jsonl_cursor_fingerprint(path, offset)
++    assert fingerprint is not None
++    forwarder._write_forward_state(
++        env.bridge,
++        forwarder.TranscriptForwardState(
++            transcript_path=path,
++            line_cursor=2,
++            byte_offset=offset,
++            cursor_fingerprint=fingerprint,
++        ),
++    )
++    keep.write_frontier(
++        env.bridge, keep.Frontier(path, offset, fingerprint, len(env.server.items), "item_0")
++    )
++    return path
++
++
++async def _forward(env: Env) -> None:
++    """Run the real forwarder over whatever Claude has written since its cursor."""
++    state = forwarder._read_forward_state(env.bridge)
++    assert state is not None
++    async with env.client() as client:
++        await forwarder._forward_available_items(
++            client=client,
++            session_id=CONV,
++            bridge_dir=env.bridge,
++            agent_name="claude-native-ui",
++            state=state,
++            retry_tracker=forwarder._PostRetryTracker(),
++            dedupe=forwarder._ForwardDedupeState(),
++        )
+ 
+ 
+-def _target(projects: Path) -> Path:
+-    return projects / claude_native._sanitize_claude_project_name(str(WORKSPACE)) / f"{SID}.jsonl"
++def _restart_forwarder_at(env: Env, path: Path, offset: int) -> None:
++    """What the relaunched forwarder starts from: a fresh cursor at *offset*."""
++    forwarder.reset_transcript_forward_state(env.bridge)
++    forwarder._write_forward_state(
++        env.bridge,
++        forwarder.TranscriptForwardState(
++            transcript_path=path,
++            line_cursor=0,
++            byte_offset=offset,
++            cursor_fingerprint=forwarder._jsonl_cursor_fingerprint(path, offset),
++        ),
++    )
+ 
+ 
+-async def _ensure(
+-    items: list[dict[str, object]], cursor: keep.ForwardCursor | None = None
+-) -> Path | None:
+-    keep.remember_cursor("conv_abc", cursor)
+-    transport = httpx.MockTransport(lambda request: _page(items))
+-    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+-        return await claude_native._ensure_local_claude_resume_transcript(
++async def _relaunch(
++    env: Env, *, workspace: Path | None = None, stopped: bool = True
++) -> tuple[Path | None, keep.ResumeContext]:
++    """A cold relaunch up to the transcript: read the old forwarder's state, then resume."""
++    ctx = keep.read_context(env.bridge, forwarder_stopped=stopped)
++    async with env.client() as client:
++        written = await claude_native._ensure_local_claude_resume_transcript(
+             client,
+-            session_id="conv_abc",
++            session_id=CONV,
+             external_session_id=SID,
+-            workspace=WORKSPACE,
++            workspace=workspace or env.workspace,
++            bridge_dir=env.bridge,
++            ae_resume=ctx,
+         )
++    return written, ctx
+ 
+ 
+-def _cursor(path: Path, offset: int) -> keep.ForwardCursor:
+-    fingerprint = _jsonl_cursor_fingerprint(path, offset)
+-    assert fingerprint is not None
+-    return keep.ForwardCursor(path, offset, fingerprint)
++async def _settle(env: Env, written: Path | None, ctx: keep.ResumeContext) -> int | None:
++    """What the runner does with its transcript: label, write the record, pick the offset."""
++    assert written is not None
++    async with env.client() as client:
++        return await keep.settle_resume(client, CONV, ctx, written, written.stat().st_size, None)
++
++
++def _mode(ctx: keep.ResumeContext) -> str | None:
++    return ctx.outcome.mode if ctx.outcome is not None else None
++
++
++def _posted_texts(server: FakeServer) -> list[str]:
++    texts: list[str] = []
++    for item in server.items[1:]:
++        content = item.get("content")
++        if isinstance(content, list):
++            texts.extend(block.get("text", "") for block in content if isinstance(block, dict))
++    return texts
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_kept_when_the_file_covers_the_server_items(projects: Path) -> None:
+-    target = _target(projects)
+-    _write(target, _covering_rows())
+-    before = target.read_bytes()
+-    stamp = target.stat().st_mtime_ns
++async def test_kept_when_the_frontier_matches_and_the_tail_is_forwarded_once(env: Env) -> None:
++    path = _seed(env)
++    _append(path, [_user_row("u1", "list files", str(env.workspace))])
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    await _forward(env)
++    assert len(env.server.items) == 3
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert (frontier.item_count, frontier.last_item_id) == (3, "item_2")
++    # Claude writes more rows the forwarder has not read yet; the server lacks them.
++    _append(path, [_assistant_row("a2", "tail one", str(env.workspace))])
++    _append(path, [_assistant_row("a3", "tail two", str(env.workspace))])
++    before = path.read_bytes()
++
++    written, ctx = await _relaunch(env)
++
++    assert written == path
++    assert path.read_bytes() == before
++    assert ctx.outcome == keep.ResumeOutcome(keep.KEPT, frontier.byte_offset)
++    assert len(env.server.items) == 3
++    # The record was deleted when the context was read and comes back with the settle.
++    assert keep.read_frontier(env.bridge) is None
++    assert await _settle(env, written, ctx) == frontier.byte_offset
++    assert keep.read_frontier(env.bridge) == frontier
++    # The relaunch resumes the forwarder at the cursor offset: each tail row posts once.
++    _restart_forwarder_at(env, path, frontier.byte_offset)
++    await _forward(env)
++    await _forward(env)
++    assert len(env.server.items) == 5
++    advanced = keep.read_frontier(env.bridge)
++    assert advanced is not None
++    assert (advanced.item_count, advanced.last_item_id) == (5, "item_4")
++    assert _posted_texts(env.server).count("tail one") == 1
++    assert _posted_texts(env.server).count("tail two") == 1
+ 
+-    written = await _ensure(ITEMS)
+ 
+-    assert written == target
+-    assert target.read_bytes() == before
+-    assert target.stat().st_mtime_ns == stamp
+-    outcome = keep.take_outcome("conv_abc")
+-    assert outcome == keep.ResumeOutcome(keep.KEPT, None)
++@pytest.mark.asyncio
++async def test_rebuilt_when_the_server_gained_an_item_after_the_cursor(env: Env) -> None:
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    await _forward(env)
++    # A message typed in the web UI reaches the server, not yet Claude's file.
++    env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "yes"}]}
++    )
++    count = len(env.server.items)
++
++    written, ctx = await _relaunch(env)
++
++    assert written == path
++    assert _mode(ctx) == keep.REBUILT
++    assert "yes" in path.read_text(encoding="utf-8")
++    # The rebuilt file already holds every server item, so nothing is forwarded twice.
++    _restart_forwarder_at(env, path, path.stat().st_size)
++    await _forward(env)
++    assert len(env.server.items) == count
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_rebuilt_when_a_tool_call_id_is_missing_from_the_file(projects: Path) -> None:
+-    target = _target(projects)
+-    _write(target, [_user("list files"), _user("now read a")])
++async def test_rebuilt_when_a_retried_turn_has_the_same_count_but_another_last_id(
++    env: Env,
++) -> None:
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "first try", str(env.workspace))])
++    await _forward(env)
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    # The turn was retried: same number of items, a different last one.
++    env.server.items[-1] = {**env.server.items[-1], "id": "item_retry"}
++    assert len(env.server.items) == frontier.item_count
+ 
+-    written = await _ensure(ITEMS)
++    _written, ctx = await _relaunch(env)
+ 
+-    assert written == target
+-    assert "toolu_01A" in target.read_text(encoding="utf-8")
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++    assert _mode(ctx) == keep.REBUILT
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_rebuilt_when_the_last_user_text_is_missing_from_the_file(projects: Path) -> None:
+-    target = _target(projects)
+-    _write(target, _covering_rows()[:-1])
++async def test_rebuilt_when_the_bytes_before_the_cursor_changed(env: Env) -> None:
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "newer", str(env.workspace))])
++    await _forward(env)
++    # A no-tool chat whose file was replaced by one of the same length: every line is still
++    # complete JSON and the cursor still sits on a line break, but the bytes before it are
++    # not the ones its fingerprint was taken over.
++    original = path.read_bytes()
++    replaced = original.replace(b"newer", b"newex")
++    assert replaced != original
++    assert len(replaced) == len(original)
++    path.write_bytes(replaced)
++
++    _written, ctx = await _relaunch(env)
++
++    assert _mode(ctx) == keep.REBUILT
+ 
+-    await _ensure(ITEMS)
+ 
+-    assert "now read a" in target.read_text(encoding="utf-8")
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "tail",
++    [
++        pytest.param('{"type":"assistant","uuid":"p', id="partial-line"),
++        pytest.param(
++            json.dumps(_assistant_row("a2", "no newline", "/x")), id="no-trailing-newline"
++        ),
++    ],
++)
++async def test_rebuilt_when_the_last_line_is_incomplete(env: Env, tail: str) -> None:
++    path = _seed(env)
++    with path.open("a", encoding="utf-8") as handle:
++        handle.write(tail)
++
++    _written, ctx = await _relaunch(env)
++
++    assert _mode(ctx) == keep.REBUILT
++
++
++def _image_records() -> dict[str, dict[str, Any]]:
++    def record(content: object, tool_use_result: object) -> dict[str, Any]:
++        return {
++            "type": "user",
++            "uuid": "r1",
++            "cwd": "/x",
++            "message": {
++                "role": "user",
++                "content": [{"type": "tool_result", "tool_use_id": "toolu_1", "content": content}],
++            },
++            "toolUseResult": tool_use_result,
++        }
++
++    truncated = '[{"type":"image","source":{"type":"base64","media_type":"image/png","data":"'
++    truncated += "iVBORw0KGgo" + "D" * 5000
++    return {
++        "dict": record([IMAGE], {"type": "image", "source": {"data": B64}}),
++        "list": record([IMAGE], json.dumps([IMAGE])),
++        "truncated": record(truncated, truncated),
++    }
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_rebuilt_when_the_local_file_is_not_resumable(projects: Path) -> None:
+-    target = _target(projects)
+-    target.parent.mkdir(parents=True)
+-    target.write_text("not json\n", encoding="utf-8")
++@pytest.mark.parametrize("form", ["dict", "list", "truncated"])
++async def test_rebuilt_when_the_sanitizer_would_change_the_file(env: Env, form: str) -> None:
++    record = _image_records()[form]
++    probe = copy.deepcopy(record)
++    claude_native._sanitize_cloned_tool_result_record(probe)
++    assert probe != record, "the fixture must be something the sanitizer repairs"
++    path = _seed(env)
++    # The bad row sits BEFORE the cursor too: the whole file must be clean to keep.
++    rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
++    _write(path, [rows[0], record, rows[1]])
++    offset = path.stat().st_size
++    _restart_forwarder_at(env, path, offset)
++    fingerprint = forwarder._jsonl_cursor_fingerprint(path, offset)
++    assert fingerprint is not None
++    keep.write_frontier(env.bridge, keep.Frontier(path, offset, fingerprint, 1, "item_0"))
+ 
+-    await _ensure(ITEMS)
++    _written, ctx = await _relaunch(env)
+ 
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++    assert _mode(ctx) == keep.REBUILT
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_copied_when_the_file_sits_under_an_old_workspace_dir(projects: Path) -> None:
+-    old = projects / "-old-workspace" / f"{SID}.jsonl"
+-    _write(old, [{**row, "cwd": "/old/workspace"} for row in _covering_rows()])
++async def test_a_file_the_sanitizer_leaves_alone_is_kept(env: Env) -> None:
++    path = _seed(env)
++    _append(
++        path,
++        [
++            {
++                "type": "user",
++                "uuid": "r2",
++                "cwd": str(env.workspace),
++                "message": {
++                    "role": "user",
++                    "content": [
++                        {"type": "tool_result", "tool_use_id": "toolu_2", "content": "ok"}
++                    ],
++                },
++                "toolUseResult": "ok",
++            }
++        ],
++    )
+ 
+-    written = await _ensure(ITEMS)
++    _written, ctx = await _relaunch(env)
+ 
+-    target = _target(projects)
+-    assert written == target
+-    rows = [json.loads(line) for line in target.read_text(encoding="utf-8").splitlines()]
+-    assert {row["cwd"] for row in rows} == {str(WORKSPACE)}
+-    assert rows[0]["message"]["content"] == "list files"
+-    assert old.is_file()
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.COPIED, None)
++    assert _mode(ctx) == keep.KEPT
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_rebuilt_when_the_old_workspace_copy_does_not_cover(projects: Path) -> None:
+-    old = projects / "-old-workspace" / f"{SID}.jsonl"
+-    _write(old, [_user("list files")])
++@pytest.mark.parametrize("missing", ["cursor", "frontier"])
++async def test_rebuilt_without_a_cursor_or_a_recorded_frontier(env: Env, missing: str) -> None:
++    path = _seed(env)
++    if missing == "cursor":
++        forwarder.reset_transcript_forward_state(env.bridge)
++    else:
++        (env.bridge / keep.FRONTIER_FILE).unlink()
++    before = path.read_bytes()
+ 
+-    await _ensure(ITEMS)
++    _written, ctx = await _relaunch(env)
+ 
+-    assert "toolu_01A" in _target(projects).read_text(encoding="utf-8")
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++    assert _mode(ctx) == keep.REBUILT
++    assert path.read_bytes() != before
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_a_file_ahead_of_the_server_is_kept_and_forwarded_from_the_cursor(
+-    projects: Path,
++async def test_rebuilt_when_the_old_forwarder_may_still_be_running(env: Env) -> None:
++    _seed(env)
++
++    _written, ctx = await _relaunch(env, stopped=False)
++
++    assert ctx.cursor is None
++    assert _mode(ctx) == keep.REBUILT
++
++
++@pytest.mark.asyncio
++async def test_an_exception_in_the_keep_path_falls_back_to_a_rebuild(
++    env: Env, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+-    target = _target(projects)
+-    rows = _covering_rows()
+-    _write(target, rows)
+-    forwarded = target.stat().st_size
+-    # The forwarder lagged at a crash: the file holds a turn the server never got.
+-    with target.open("a", encoding="utf-8") as handle:
+-        handle.write(json.dumps(_tool_use("toolu_02B")) + "\n")
+-        handle.write(json.dumps(_user("a later prompt")) + "\n")
++    path = _seed(env)
++
++    def boom(*_args: object, **_kwargs: object) -> bool:
++        raise RuntimeError("disk trouble")
+ 
+-    written = await _ensure(ITEMS, _cursor(target, forwarded))
++    monkeypatch.setattr(keep, "_tail_complete", boom)
++    before = path.read_bytes()
+ 
+-    assert written == target
+-    assert "toolu_02B" in target.read_text(encoding="utf-8")
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.KEPT, forwarded)
++    written, ctx = await _relaunch(env)
++
++    assert written == path
++    assert _mode(ctx) == keep.REBUILT
++    assert path.read_bytes() != before
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_a_file_ahead_of_the_server_with_no_cursor_is_rebuilt(projects: Path) -> None:
+-    target = _target(projects)
+-    _write(target, [*_covering_rows(), _tool_use("toolu_02B"), _user("a later prompt")])
++async def test_copied_from_an_old_workspace_dir_when_the_frontier_matches(env: Env) -> None:
++    old_ws = env.root / "old-ws"
++    old_path = _seed(env, workspace=old_ws)
++    _append(old_path, [_assistant_row("a1", "done", str(old_ws))])
++    await _forward(env)
++    cursor = keep.read_forward_cursor(env.bridge)
++    assert cursor is not None
++    _append(old_path, [_assistant_row("a2", "tail", str(old_ws))])
++    new_target = env.transcript()
++    assert not new_target.exists()
++
++    written, ctx = await _relaunch(env)
++
++    assert written == new_target
++    assert old_path.is_file()
++    rows = [json.loads(line) for line in new_target.read_text(encoding="utf-8").splitlines()]
++    assert {row["cwd"] for row in rows} == {str(env.workspace)}
++    assert ctx.outcome is not None
++    assert ctx.outcome.mode == keep.COPIED
++    # The offset is mapped by line count: everything before the tail row.
++    assert ctx.outcome.forward_offset is not None
++    head = new_target.read_bytes()[: ctx.outcome.forward_offset]
++    assert head.count(b"\n") == old_path.read_bytes()[: cursor.byte_offset].count(b"\n")
++    assert rows[-1]["uuid"] == "a2"
++    assert new_target.read_bytes()[ctx.outcome.forward_offset :].count(b"\n") == 1
++    # The frontier record describes the copy once the launch settles, so the next relaunch
++    # can keep it.
++    assert keep.read_frontier(env.bridge) is None
++    await _settle(env, written, ctx)
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert frontier.transcript_path == new_target
++    assert frontier.byte_offset == ctx.outcome.forward_offset
++    assert len(env.server.items) == 2
++    _restart_forwarder_at(env, new_target, ctx.outcome.forward_offset)
++    await _forward(env)
++    assert len(env.server.items) == 3
+ 
+-    await _ensure(ITEMS)
+ 
+-    assert "toolu_02B" not in target.read_text(encoding="utf-8")
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++@pytest.mark.asyncio
++async def test_not_copied_when_the_old_workspace_file_is_behind_the_server(env: Env) -> None:
++    old_ws = env.root / "old-ws"
++    _seed(env, workspace=old_ws)
++    env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "more"}]}
++    )
++
++    written, ctx = await _relaunch(env)
++
++    assert written == env.transcript()
++    assert _mode(ctx) == keep.REBUILT
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_a_stale_cursor_counts_as_no_cursor(projects: Path) -> None:
+-    target = _target(projects)
+-    _write(target, [*_covering_rows(), _tool_use("toolu_02B")])
+-    stale = _cursor(target, target.stat().st_size)
+-    target.write_text(target.read_text(encoding="utf-8").replace("toolu_02B", "toolu_02C"))
++async def test_a_foreign_item_leaves_the_frontier_behind(env: Env) -> None:
++    path = _seed(env)
++    env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "other"}]}
++    )
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    await _forward(env)
+ 
+-    await _ensure(ITEMS, stale)
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert frontier.item_count == 1
+ 
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++    _written, ctx = await _relaunch(env)
++
++    assert _mode(ctx) == keep.REBUILT
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_copied_file_ahead_of_the_server_maps_the_cursor_to_the_copy(
+-    projects: Path,
++async def test_the_final_cursor_of_a_forwarder_that_advances_while_cancelled_is_used(
++    env: Env, monkeypatch: pytest.MonkeyPatch
+ ) -> None:
+-    old = projects / "-old-workspace" / f"{SID}.jsonl"
+-    rows = [{**row, "cwd": "/old/workspace"} for row in _covering_rows()]
+-    _write(old, rows)
+-    forwarded = old.stat().st_size
+-    with old.open("a", encoding="utf-8") as handle:
+-        handle.write(json.dumps({**_user("a later prompt"), "cwd": "/old/workspace"}) + "\n")
+-
+-    await _ensure(ITEMS, _cursor(old, forwarded))
+-
+-    target = _target(projects)
+-    outcome = keep.take_outcome("conv_abc")
+-    assert outcome is not None
+-    assert outcome.mode == keep.COPIED
+-    assert outcome.forward_offset is not None
+-    # Everything before the offset is what the server has; the later prompt is after it.
+-    forwarded_text = target.read_bytes()[: outcome.forward_offset].decode("utf-8")
+-    assert "now read a" in forwarded_text
+-    assert "a later prompt" not in forwarded_text
+-    assert "a later prompt" in target.read_text(encoding="utf-8")
+-
+-
+-def test_read_forward_cursor_reads_the_forwarder_state(tmp_path: Path) -> None:
+-    transcript = tmp_path / "t.jsonl"
+-    _write(transcript, _covering_rows())
+-    offset = transcript.stat().st_size
+-    fingerprint = _jsonl_cursor_fingerprint(transcript, offset)
+-    (tmp_path / "transcript_forwarder.json").write_text(
+-        json.dumps(
+-            {
+-                "transcript_path": str(transcript),
+-                "line_cursor": 4,
+-                "byte_offset": offset,
+-                "cursor_fingerprint": fingerprint,
+-            }
+-        ),
+-        encoding="utf-8",
+-    )
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "before cancel", str(env.workspace))])
++    stale = keep.read_forward_cursor(env.bridge)
++    assert stale is not None
++
++    class Cancelling:
++        """A forwarder task that finishes one more poll while it is being cancelled."""
++
++        def __init__(self) -> None:
++            self.cancelled = False
++
++        def done(self) -> bool:
++            return self.cancelled
++
++        def cancel(self) -> bool:
++            self.cancelled = True
++            return True
++
++        def __await__(self) -> Any:
++            return _forward(env).__await__()
++
++    async def wait(tasks: set[Any], timeout: float) -> tuple[set[Any], set[Any]]:
++        for pending in tasks:
++            await pending
++        return set(tasks), set()
++
++    monkeypatch.setattr(orchestration.asyncio, "wait", wait)
++    monkeypatch.setitem(orchestration._AUTO_FORWARDER_TASKS, CONV, Cancelling())
++
++    stopped = await orchestration._cancel_auto_forwarder_task(CONV)
++    ctx = keep.read_context(env.bridge, forwarder_stopped=stopped)
++
++    assert stopped is True
++    assert ctx.cursor is not None
++    assert ctx.cursor.byte_offset > stale.byte_offset
++    assert ctx.frontier is not None
++    assert ctx.frontier.byte_offset == ctx.cursor.byte_offset
++    assert ctx.frontier.item_count == len(env.server.items) == 2
++    async with env.client() as client:
++        written = await claude_native._ensure_local_claude_resume_transcript(
++            client,
++            session_id=CONV,
++            external_session_id=SID,
++            workspace=env.workspace,
++            bridge_dir=env.bridge,
++            ae_resume=ctx,
++        )
++    assert written == path
++    assert _mode(ctx) == keep.KEPT
++
++
++@pytest.mark.asyncio
++async def test_a_cancel_that_times_out_reports_a_running_forwarder(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    class Stuck:
++        def done(self) -> bool:
++            return False
++
++        def cancel(self) -> bool:
++            return True
++
++    async def wait(tasks: set[Any], timeout: float) -> tuple[set[Any], set[Any]]:
++        return set(), set(tasks)
++
++    monkeypatch.setattr(orchestration.asyncio, "wait", wait)
++    monkeypatch.setitem(orchestration._AUTO_FORWARDER_TASKS, CONV, Stuck())
++    keep.note_posted(CONV, "item_1")
++
++    assert await orchestration._cancel_auto_forwarder_task(CONV) is False
++    assert CONV not in keep._own_ids
+ 
+-    assert keep.read_forward_cursor(tmp_path) == keep.ForwardCursor(
+-        transcript, offset, fingerprint
+-    )
+-    assert keep.read_forward_cursor(tmp_path / "missing") is None
++
++@pytest.mark.asyncio
++async def test_no_context_always_rebuilds(env: Env) -> None:
++    path = _seed(env)
++    before = path.read_bytes()
++    async with env.client() as client:
++        written = await claude_native._ensure_local_claude_resume_transcript(
++            client,
++            session_id=CONV,
++            external_session_id=SID,
++            workspace=env.workspace,
++            bridge_dir=env.bridge,
++        )
++
++    assert written == path
++    assert path.read_bytes() != before
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_settle_labels_the_session_and_picks_the_forwarder_offset() -> None:
+-    patches: list[dict[str, object]] = []
++async def test_settle_labels_the_session_seeds_a_rebuilt_frontier_and_survives_a_failed_write(
++    env: Env,
++) -> None:
++    _seed(env)
++    (env.bridge / keep.FRONTIER_FILE).unlink()
++    written, ctx = await _relaunch(env)
++    assert written is not None
++    assert _mode(ctx) == keep.REBUILT
++    size = written.stat().st_size
++
++    async with env.client() as client:
++        offset = await keep.settle_resume(
++            client, CONV, ctx, written, size, {keep.RESUME_COUNT_LABEL: "2"}
++        )
+ 
+-    def handler(request: httpx.Request) -> httpx.Response:
+-        patches.append(json.loads(request.content))
+-        return httpx.Response(200, json={})
++    assert offset == size
++    assert env.server.patches == [
++        {"labels": {keep.RESUME_LABEL: keep.REBUILT, keep.RESUME_COUNT_LABEL: "3"}}
++    ]
++    seeded = keep.read_frontier(env.bridge)
++    assert seeded is not None
++    assert (seeded.byte_offset, seeded.item_count, seeded.last_item_id) == (size, 1, "item_0")
++    # The next relaunch keeps what this one rebuilt.
++    _restart_forwarder_at(env, written, size)
++    _again, second = await _relaunch(env)
++    assert _mode(second) == keep.KEPT
+ 
+-    keep._pending.clear()
+-    keep._remember("conv_abc", keep.ResumeOutcome(keep.KEPT, 40))
+-    transport = httpx.MockTransport(handler)
+-    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+-        offset = await keep.settle_resume(client, "conv_abc", 100, {keep.RESUME_COUNT_LABEL: "2"})
+-        # No outcome pending (a path that never prepared a transcript): nothing is written.
+-        untouched = await keep.settle_resume(client, "conv_abc", 100, None)
++    def refuse(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(500, json={})
+ 
+-    assert offset == 40
+-    assert untouched == 100
+-    assert patches == [{"labels": {keep.RESUME_LABEL: "kept", keep.RESUME_COUNT_LABEL: "3"}}]
++    transport = httpx.MockTransport(refuse)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as failing:
++        assert await keep.settle_resume(failing, CONV, second, written, size, None) == size
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_settle_survives_a_failed_label_write() -> None:
+-    keep._pending.clear()
+-    keep._remember("conv_abc", keep.ResumeOutcome(keep.REBUILT))
+-    transport = httpx.MockTransport(lambda request: httpx.Response(500))
+-    async with httpx.AsyncClient(transport=transport, base_url="https://example.com") as client:
+-        offset = await keep.settle_resume(client, "conv_abc", 100, None)
++async def test_no_outcome_is_left_behind_when_history_is_unavailable(env: Env) -> None:
++    path = _seed(env)
++
++    def down(request: httpx.Request) -> httpx.Response:
++        return httpx.Response(503, json={})
++
++    ctx = keep.read_context(env.bridge)
++    transport = httpx.MockTransport(down)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        written = await claude_native._ensure_local_claude_resume_transcript(
++            client,
++            session_id=CONV,
++            external_session_id=SID,
++            workspace=env.workspace,
++            bridge_dir=env.bridge,
++            ae_resume=ctx,
++        )
+ 
+-    assert offset == 100
++    assert written == path
++    assert ctx.outcome is None
++    assert keep.read_frontier(env.bridge) is None
+ 
+ 
+ @pytest.mark.asyncio
+-async def test_rebuilt_when_the_file_carries_the_old_duplicated_image(projects: Path) -> None:
+-    target = _target(projects)
+-    image = {"type": "image", "source": {"type": "base64", "data": "AAAA"}}
+-    stale = {
+-        "type": "user",
+-        "message": {
+-            "role": "user",
+-            "content": [{"type": "tool_result", "tool_use_id": "toolu_01A", "content": [image]}],
+-        },
+-        "toolUseResult": json.dumps([image]),
+-    }
+-    _write(target, [_user("list files"), _tool_use("toolu_01A"), stale, _user("now read a")])
++@pytest.mark.parametrize("early", ["history-unavailable", "no-records"])
++async def test_a_launch_that_never_settles_leaves_no_record_to_vouch_for_a_fresh_cursor(
++    env: Env, early: str
++) -> None:
++    path = _seed(env)
++    old_size = path.stat().st_size
++    # Claude wrote rows after the old cursor that the server never received.
++    _append(path, [_assistant_row("a1", "never posted", str(env.workspace))])
++    if early == "no-records":
++        env.server.items.clear()
++
++    def down(request: httpx.Request) -> httpx.Response:
++        if early == "history-unavailable":
++            return httpx.Response(503, json={})
++        return env.server.handle(request)
++
++    ctx = keep.read_context(env.bridge)
++    transport = httpx.MockTransport(down)
++    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
++        written = await claude_native._ensure_local_claude_resume_transcript(
++            client,
++            session_id=CONV,
++            external_session_id=SID,
++            workspace=env.workspace,
++            bridge_dir=env.bridge,
++            ae_resume=ctx,
++        )
++    assert (written is None) == (early == "no-records")
++    assert keep.read_frontier(env.bridge) is None
++
++    # The forwarder seeds a fresh cursor at the end of the file, skipping the unposted row,
++    # then posts the next batch: with no record to advance, none is created.
++    env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "x"}]}
++    )
++    _restart_forwarder_at(env, path, path.stat().st_size)
++    _append(path, [_assistant_row("a2", "posted", str(env.workspace))])
++    await _forward(env)
++    assert path.stat().st_size > old_size
++    assert keep.read_frontier(env.bridge) is None
++    assert not (env.bridge / keep.FRONTIER_FILE).exists()
++
++    _written, second = await _relaunch(env)
+ 
+-    await _ensure(ITEMS)
++    assert _mode(second) == keep.REBUILT
+ 
+-    assert "AAAA" not in target.read_text(encoding="utf-8")
+-    assert keep.take_outcome("conv_abc") == keep.ResumeOutcome(keep.REBUILT)
++
++@pytest.mark.asyncio
++async def test_the_keep_checks_run_off_the_event_loop(
++    env: Env, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    import threading
++
++    _seed(env)
++    threads: list[int] = []
++    real = keep._tail_complete
++
++    def spy(path: Path, byte_offset: int) -> bool:
++        threads.append(threading.get_ident())
++        return real(path, byte_offset)
++
++    monkeypatch.setattr(keep, "_tail_complete", spy)
++
++    _written, ctx = await _relaunch(env)
++
++    assert _mode(ctx) == keep.KEPT
++    assert threads
++    assert threads[0] != threading.get_ident()
++
++
++def test_lines_are_counted_in_chunks_across_a_large_prefix(tmp_path: Path) -> None:
++    path = tmp_path / "big.jsonl"
++    line = b'{"k":"' + b"x" * 998 + b'"}\n'
++    path.write_bytes(line * 3000)
++    assert keep._lines_before(path, len(line) * 2500 + 3) == 2500
++    assert keep._lines_before(path, 10**9) == 3000
++    assert keep._lines_before(path, 0) == 0
++
++
++def test_own_post_ids_are_dropped_when_the_forwarder_ends() -> None:
++    keep.note_posted(CONV, "item_1")
++    keep.note_posted(CONV, None)
++    assert keep._own_ids[CONV] == ["item_1"]
++    keep.forget_session(CONV)
++    assert CONV not in keep._own_ids
++
++
++@pytest.mark.asyncio
++async def test_no_record_is_written_when_the_transcript_size_could_not_be_measured(
++    env: Env,
++) -> None:
++    path = _seed(env)
++    written, ctx = await _relaunch(env)
++    assert written == path
++    assert _mode(ctx) == keep.KEPT
++
++    async with env.client() as client:
++        offset = await keep.settle_resume(client, CONV, ctx, path, None, None)
++
++    assert offset is None
++    assert keep.read_frontier(env.bridge) is None
++    # The forwarder falls back to the live end of the file; the next launch must not trust it.
++    _restart_forwarder_at(env, path, path.stat().st_size)
++    _append(path, [_assistant_row("a1", "unposted", str(env.workspace))])
++    await _forward(env)
++    _written, second = await _relaunch(env)
++    assert _mode(second) == keep.REBUILT
+diff --git a/tests/runner/test_app_sessions_native_terminals_autocreate.py b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+index bf09c8dcca6b3e1a9066ccd7576ed65b2bf88a97..37fb1d9556a80ba29f6b7cb2e1b4ce8f816ae08a 100644
+--- a/tests/runner/test_app_sessions_native_terminals_autocreate.py
++++ b/tests/runner/test_app_sessions_native_terminals_autocreate.py
+@@ -2185,10 +2185,11 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
+         external_session_id: str,
+         workspace: Path,
+         bridge_dir: Path,
++        ae_resume: Any = None,
+     ) -> Path:
+         """Record the resume id and return a transcript path."""
+         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
+-        del client, session_id, workspace
++        del client, session_id, workspace, ae_resume
+         synth_calls.append(external_session_id)
+         return tmp_path / f"{external_session_id}.jsonl"
+ 
+@@ -2465,9 +2466,10 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
+         external_session_id: str,
+         workspace: Path,
+         bridge_dir: Path,
++        ae_resume: Any = None,
+     ) -> Path:
+         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
+-        del client, session_id, workspace
++        del client, session_id, workspace, ae_resume
+         synth_calls.append(external_session_id)
+         return tmp_path / f"{external_session_id}.jsonl"
+ 

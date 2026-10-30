@@ -1,7 +1,7 @@
 """Who owns each Key Vault secret, set from the Admin Center's Key Vault card (2026-10-23).
 
-Why: secrets will be split between Reid and Steve (and others later), and the
-expiry alerts (``secret_alerts.py``) should say whose secret it is. Reid asked to
+Why: secrets will be split between the owner and the second box user (and others later), and the
+expiry alerts (``secret_alerts.py``) should say whose secret it is. The owner asked to
 see the owner at a glance on the card and to set it there for secrets that have
 none yet.
 
@@ -12,7 +12,7 @@ never writes the vault, and a tag copy beside this file would drift. The trade,
 accepted on the plan page: the owner does not show in the Azure portal.
 
 A secret with no owner is counted on the card, so the gaps close over time; its
-alerts go to the task app the server files into, which today is Reid's.
+alerts go to the task app the server files into, which today is the owner's.
 """
 
 from __future__ import annotations
@@ -45,7 +45,7 @@ def key_of(vault: str, name: str) -> str:
 
 
 def display_name(user_id: str) -> str:
-    """``reid.havens@example.com`` reads as "Reid Havens"; the id itself when it has no words."""
+    """``owner.person@example.com`` reads as "Owner Person"; the id itself when it has no words."""
     local = user_id.split("@", 1)[0]
     words = [word for word in re.split(r"[._-]+", local) if word]
     return " ".join(word[:1].upper() + word[1:] for word in words) or user_id

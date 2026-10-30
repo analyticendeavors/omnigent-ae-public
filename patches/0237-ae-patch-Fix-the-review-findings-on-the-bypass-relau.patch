@@ -1,0 +1,1260 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 00:04:00 -0700
+Subject: [PATCH 237/260] [ae-patch] Fix the review findings on the bypass
+ relaunch switch
+
+Every claude-native permission change now pins the target in the launch args and gets the long forward budget, so a stale label can no longer relaunch Plan back into bypass. The runner relaunches when the pane mode is unknown, bounds the whole restart at 70 s, and reads the new mode inside the switching lock. The server restores the old args only after a definite refusal or an unreached runner; an unknown outcome keeps whichever pin does not ask for bypass and leaves the label alone. A restart whose mode could not be read keeps the pin and stamps no label. wait_while_switching now waits through queued relaunches. The composer names the mode Claude is in when it differs from the request.
+---
+ omnigent/runner/ae_bypass_relaunch.py         |  78 ++++--
+ omnigent/runner/ae_claude_account.py          |  37 ++-
+ .../routes/sessions/ae_bypass_switch.py       | 233 +++++++++++++++---
+ .../server/routes/sessions/routes_core.py     | 100 ++++----
+ tests/runner/test_ae_bypass_relaunch.py       |  89 ++++++-
+ ...test_app_sessions_native_events_options.py |  10 +-
+ .../integration/test_sessions_endpoints.py    | 170 ++++++++++---
+ tests/server/test_ae_bypass_switch.py         | 131 ++++++++++
+ web/src/pages/ChatPage.composer.test.tsx      |  18 ++
+ web/src/pages/ChatPage.tsx                    |  13 +-
+ 10 files changed, 723 insertions(+), 156 deletions(-)
+ create mode 100644 tests/server/test_ae_bypass_switch.py
+
+diff --git a/omnigent/runner/ae_bypass_relaunch.py b/omnigent/runner/ae_bypass_relaunch.py
+index 7f7284920908275b34bd77d87350b5c690f7daff..969367c16c877be7911d8c10e7cdce84760d3b43 100644
+--- a/omnigent/runner/ae_bypass_relaunch.py
++++ b/omnigent/runner/ae_bypass_relaunch.py
+@@ -19,10 +19,19 @@ Answers to ``{"type": "permission_mode_change"}`` for such a switch:
+ ``409``
+     A reply or an approval is in progress, the old terminal would not close, or
+     the new one did not start; ``{"error": <code>, "detail": <sentence>}``.
++``504``
++    The restart outran :data:`RELAUNCH_DEADLINE_S`; the pane may still be coming
++    up in the new mode, so the server must not roll anything back.
++
++The whole restart, including the read of the new pane's mode, runs inside the
++session's switching lock under one deadline, so no turn is injected before the
++read and two quick switches cannot interleave.
+ """
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import time
+ from collections.abc import Awaitable, Callable
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+@@ -44,6 +53,8 @@ if TYPE_CHECKING:
+ BYPASS = "bypassPermissions"
+ # Longest the new pane gets to show its permission-mode footer.
+ SETTLE_TIMEOUT_S = 15.0
++# The whole restart and settle; well under the server's 90 s forward budget.
++RELAUNCH_DEADLINE_S = 70.0
+ 
+ BYPASS_REFUSALS = Refusals(
+     busy_code="claude_bypass_busy",
+@@ -58,16 +69,21 @@ BYPASS_REFUSALS = Refusals(
+ )
+ 
+ 
++RUNNER_TIMEOUT_CODE = "claude_bypass_timeout"
++TIMEOUT_DETAIL = "Claude is still restarting. The mode shown will update when it settles."
++
++
+ def needs_relaunch(target_mode: str, current_mode: str | None) -> bool:
+     """
+     Whether a switch to *target_mode* restarts the pane.
+ 
+     :param target_mode: Mode asked for, e.g. ``"plan"``.
+-    :param current_mode: Mode the pane renders now, or ``None`` when unknown.
+-    :returns: ``True`` when the target is bypass, or the pane is in bypass and
+-        the switch leaves it.
++    :param current_mode: Mode the pane renders now, or ``None`` when unknown
++        (no pane, or no footer), which the shift+tab cycler cannot work from.
++    :returns: ``True`` when the target is bypass, the pane is in bypass, or its
++        mode is unknown.
+     """
+-    return target_mode == BYPASS or current_mode == BYPASS
++    return target_mode == BYPASS or current_mode in (BYPASS, None)
+ 
+ 
+ def read_settled_mode_blocking(bridge_dir: Path, timeout_s: float) -> str | None:
+@@ -82,15 +98,22 @@ def read_settled_mode_blocking(bridge_dir: Path, timeout_s: float) -> str | None
+         the pane never showed one.
+     """
+     from omnigent.harnesses.claude_native.bridge import (
++        _capture_pane,
++        _claude_prompt_rendered,
+         _read_settled_permission_mode,
+-        _wait_for_claude_prompt_ready,
+         _wait_for_tmux_info,
+     )
+ 
++    # The bridge's own prompt gate stretches a short budget to its slow-boot
++    # floor (180 s), so poll the pane here against a deadline this call honours.
++    deadline = time.monotonic() + timeout_s
+     try:
+         info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+         socket_path, tmux_target = info["socket_path"], info["tmux_target"]
+-        _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=timeout_s)
++        while not _claude_prompt_rendered(_capture_pane(socket_path, tmux_target)):
++            if time.monotonic() >= deadline:
++                return None
++            time.sleep(0.25)
+         return _read_settled_permission_mode(socket_path, tmux_target)
+     except RuntimeError:
+         return None
+@@ -131,19 +154,30 @@ async def handle_claude_relaunch_switch(
+         )
+     if await current_mode() == target_mode:
+         return JSONResponse({"permission_mode": target_mode, "relaunched": False})
+-    response = await relaunch_claude_terminal(
+-        conversation_id,
+-        turn_in_flight=turn_in_flight,
+-        terminal_registry=terminal_registry,
+-        close_terminal=close_terminal,
+-        ensure_terminal=ensure_terminal,
+-        publish_event=publish_event,
+-        refusals=BYPASS_REFUSALS,
+-    )
+-    if not 200 <= response.status_code < 300:
+-        return response
+-    mode = await settled_mode()
+-    content: dict[str, object] = {"relaunched": True}
+-    if mode is not None:
+-        content["permission_mode"] = mode
+-    return JSONResponse(content)
++
++    async def finish() -> Response:
++        mode = await settled_mode()
++        content: dict[str, object] = {"relaunched": True}
++        if mode is not None:
++            content["permission_mode"] = mode
++        return JSONResponse(content)
++
++    try:
++        return await asyncio.wait_for(
++            relaunch_claude_terminal(
++                conversation_id,
++                turn_in_flight=turn_in_flight,
++                terminal_registry=terminal_registry,
++                close_terminal=close_terminal,
++                ensure_terminal=ensure_terminal,
++                publish_event=publish_event,
++                refusals=BYPASS_REFUSALS,
++                finish=finish,
++            ),
++            RELAUNCH_DEADLINE_S,
++        )
++    except TimeoutError:
++        return JSONResponse(
++            status_code=504,
++            content={"error": RUNNER_TIMEOUT_CODE, "detail": TIMEOUT_DETAIL},
++        )
+diff --git a/omnigent/runner/ae_claude_account.py b/omnigent/runner/ae_claude_account.py
+index 8dde3e3f81e536c32224af492f11db737af8326e..4e2fa875aab2724d29a62d993e59d5cf51016b24 100644
+--- a/omnigent/runner/ae_claude_account.py
++++ b/omnigent/runner/ae_claude_account.py
+@@ -28,6 +28,7 @@ from __future__ import annotations
+ import asyncio
+ import contextlib
+ import logging
++import time
+ import weakref
+ from collections.abc import Awaitable, Callable, Mapping
+ from dataclasses import dataclass
+@@ -86,6 +87,9 @@ PublishEvent = Callable[[str, Mapping[str, object]], None]
+ _locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
+ # Sessions whose terminal is being replaced, each with an event set when that ends.
+ _switching: dict[str, asyncio.Event] = {}
++# Relaunches holding or queued for a session's lock, so the mark outlasts the gap
++# between one relaunch ending and the next taking the lock.
++_queued: dict[str, int] = {}
+ 
+ 
+ def is_switching(conversation_id: str) -> bool:
+@@ -98,11 +102,16 @@ async def wait_while_switching(conversation_id: str, timeout_s: float = SWITCH_W
+     Hold a turn until the session's switch (if any) has finished, at most *timeout_s*.
+ 
+     A turn that starts mid-switch then finds the new pane, not the one being closed.
++    It re-reads the mark after each wake, so a second queued relaunch is waited for too;
++    *timeout_s* bounds the whole wait.
+     """
+-    event = _switching.get(conversation_id)
+-    if event is not None:
++    deadline = time.monotonic() + timeout_s
++    while (event := _switching.get(conversation_id)) is not None:
++        remaining = deadline - time.monotonic()
++        if remaining <= 0:
++            return
+         with contextlib.suppress(TimeoutError):
+-            await asyncio.wait_for(event.wait(), timeout_s)
++            await asyncio.wait_for(event.wait(), remaining)
+ 
+ 
+ def _error(status_code: int, code: str, detail: str) -> JSONResponse:
+@@ -167,6 +176,7 @@ async def relaunch_claude_terminal(
+     ensure_terminal: EnsureTerminal,
+     publish_event: PublishEvent,
+     refusals: Refusals,
++    finish: Callable[[], Awaitable[Response]] | None = None,
+ ) -> Response:
+     """
+     Restart a claude-native session's terminal, one relaunch at a time per session.
+@@ -182,15 +192,18 @@ async def relaunch_claude_terminal(
+     :param ensure_terminal: Starts the native terminal again.
+     :param publish_event: The runner's per-session event emitter.
+     :param refusals: The codes and sentences for the 409 answers.
+-    :returns: ``200 {"relaunched": true}`` or a 409 response.
++    :param finish: Runs inside the lock, after the new terminal is up and before the
++        session stops being marked switching; its response replaces the plain 200.
++    :returns: ``200 {"relaunched": true}``, the *finish* response, or a 409 response.
+     """
+     lock = _locks.get(conversation_id)
+     if lock is None:
+         lock = _locks[conversation_id] = asyncio.Lock()
+-    async with lock:
+-        done = _switching[conversation_id] = asyncio.Event()
+-        try:
+-            return await _replace_terminal(
++    _queued[conversation_id] = _queued.get(conversation_id, 0) + 1
++    done = _switching.setdefault(conversation_id, asyncio.Event())
++    try:
++        async with lock:
++            response = await _replace_terminal(
+                 conversation_id,
+                 turn_in_flight=turn_in_flight,
+                 terminal_registry=terminal_registry,
+@@ -199,7 +212,13 @@ async def relaunch_claude_terminal(
+                 publish_event=publish_event,
+                 refusals=refusals,
+             )
+-        finally:
++            if finish is not None and response.status_code == 200:
++                return await finish()
++            return response
++    finally:
++        _queued[conversation_id] -= 1
++        if _queued[conversation_id] <= 0:
++            _queued.pop(conversation_id, None)
+             _switching.pop(conversation_id, None)
+             done.set()
+ 
+diff --git a/omnigent/server/routes/sessions/ae_bypass_switch.py b/omnigent/server/routes/sessions/ae_bypass_switch.py
+index 6c16575c115cff9abbdf3d60ece5e50261d83d91..ba90fcded4b499afa15e15c7848e0c15ff0d18f3 100644
+--- a/omnigent/server/routes/sessions/ae_bypass_switch.py
++++ b/omnigent/server/routes/sessions/ae_bypass_switch.py
+@@ -1,36 +1,115 @@
+-"""Server half of the bypass-permissions switch: pin the launch args around a relaunch.
+-
+-Claude's shift+tab cycle only reaches bypass on a pane launched into it, so the
+-runner restarts the pane with ``--permission-mode`` for any switch into or out
+-of bypass. The restarted pane rebuilds its args from the session row, so the
+-server pins the target mode there before it forwards the change, and puts the
+-old args back when the runner refuses.
++"""Server half of the Claude permission switch: pin the launch args around a relaunch.
++
++Claude's shift+tab cycle only reaches bypass on a pane launched into it, and a
++pane launched into it passes through bypass whenever it cycles, so the runner
++restarts the pane with ``--permission-mode`` for a switch into or out of bypass,
++and for a pane whose mode it cannot read. The server cannot tell which switch it
++is looking at (the stored label can be stale), so every claude-native permission
++change goes through here: the target mode is pinned in the session's launch args
++before the runner is called, because the restarted pane rebuilds its args from
++the session row.
++
++What happens to the pin depends on what the runner did:
++
++* answered 2xx: the pin stays (the caller re-pins with the confirmed mode);
++* refused with a non-2xx answer, or never reached: the old args are put back;
++* outcome unknown (read timeout, cancellation, any other failure): the runner may
++  still be finishing, so keep whichever of the old and pinned args does not ask
++  for bypass. Never leave a bypass pin nobody confirmed, and never restore a
++  bypass pin when the switch was leaving bypass. The label stays as it is; the
++  forwarder's footer observation stamps the mode the pane really reached.
+ """
+ 
+ from __future__ import annotations
+ 
+ import asyncio
+-
+-from omnigent.server.routes._sessions.helpers import _pin_claude_permission_launch_args
++import json
++from collections.abc import Sequence
++from typing import Any
++
++import httpx
++
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.server.routes._sessions.helpers import (
++    _get_runner_client,
++    _pin_claude_permission_launch_args,
++    _require_permission_mode_forward,
++    _RunnerForwardResult,
++)
+ from omnigent.stores.conversation_store import ConversationStore
+ 
+ BYPASS_MODE = "bypassPermissions"
+ 
+-# A relaunch closes the pane, starts Claude again and waits for its prompt, so
+-# it outlasts the default forward budget.
++# A relaunch closes the pane, starts Claude again and reads its mode, which the
++# runner bounds at 70 s; this is the server's wait for that answer.
+ RELAUNCH_FORWARD_TIMEOUT_S = 90.0
+ 
++# The runner answers 504 with this code when its own deadline ran out mid-restart.
++RUNNER_TIMEOUT_CODE = "claude_bypass_timeout"
++
++
++def args_request_bypass(args: Sequence[str] | None) -> bool:
++    """
++    Say whether Claude launch args start the pane in bypass.
++
++    :param args: Launch args, e.g. ``["--permission-mode", "bypassPermissions"]``, or ``None``.
++    :returns: ``True`` for the standalone skip flag or a last ``--permission-mode`` of bypass.
++    """
++    mode: str | None = None
++    items = list(args or ())
++    for index, arg in enumerate(items):
++        if arg == "--dangerously-skip-permissions":
++            mode = BYPASS_MODE
++        elif arg == "--permission-mode" and index + 1 < len(items):
++            mode = items[index + 1]
++        elif arg.startswith("--permission-mode="):
++            mode = arg.split("=", 1)[1]
++    return mode == BYPASS_MODE
++
++
++def args_to_keep_when_unsure(previous: list[str] | None, pinned: list[str]) -> list[str]:
++    """
++    Pick the launch args to leave behind when the runner's outcome is unknown.
++
++    :param previous: Args before the pin, or ``None`` for none.
++    :param pinned: Args with the target mode pinned.
++    :returns: The pinned args unless they ask for bypass; else the previous args
++        unless they do; else the pinned args (nothing to choose between).
++    """
++    if not args_request_bypass(pinned):
++        return pinned
++    if not args_request_bypass(previous):
++        return list(previous or [])
++    return pinned
++
+ 
+-def server_needs_relaunch(requested: str, current_label: str | None) -> bool:
++def relaunch_unconfirmed(result: _RunnerForwardResult | None) -> bool:
+     """
+-    Say whether a permission-mode change restarts the Claude pane.
++    Say whether the runner restarted Claude but could not read the mode it landed in.
+ 
+-    :param requested: Mode asked for, e.g. ``"plan"``.
+-    :param current_label: The session's recorded permission-mode label, or
+-        ``None`` when it has none.
+-    :returns: ``True`` when the target is bypass or the session is in bypass.
++    :param result: The runner's answer.
++    :returns: ``True`` for a 2xx that says ``relaunched`` and names no mode.
+     """
+-    return requested == BYPASS_MODE or current_label == BYPASS_MODE
++    if result is None or not 200 <= result.status_code < 300:
++        return False
++    try:
++        body = json.loads(result.body)
++    except (TypeError, ValueError):
++        return False
++    if not isinstance(body, dict) or body.get("relaunched") is not True:
++        return False
++    mode = body.get("permission_mode")
++    return not (isinstance(mode, str) and mode)
++
++
++async def _write_args(
++    session_id: str, conversation_store: ConversationStore, args: list[str]
++) -> None:
++    await asyncio.to_thread(
++        conversation_store.update_conversation,
++        session_id,
++        terminal_launch_args=args,
++    )
+ 
+ 
+ async def pin_relaunch_launch_args(
+@@ -38,22 +117,22 @@ async def pin_relaunch_launch_args(
+     conversation_store: ConversationStore,
+     current_args: list[str] | None,
+     mode: str,
+-) -> list[str] | None:
++) -> tuple[list[str] | None, list[str]]:
+     """
+     Write ``--permission-mode <mode>`` to the session's launch args.
+ 
++    A cold launch that starts between this write and the runner's answer also
++    starts in *mode*; that window is accepted.
++
+     :param session_id: Session id, e.g. ``"conv_abc123"``.
+     :param conversation_store: Store holding the session row.
+     :param current_args: The row's launch args before the pin, or ``None``.
+     :param mode: Mode the restarted pane must launch with, e.g. ``"bypassPermissions"``.
+-    :returns: The previous args, to hand to :func:`restore_launch_args`.
++    :returns: The previous args and the pinned args.
+     """
+-    await asyncio.to_thread(
+-        conversation_store.update_conversation,
+-        session_id,
+-        terminal_launch_args=_pin_claude_permission_launch_args(current_args, mode),
+-    )
+-    return current_args
++    pinned = _pin_claude_permission_launch_args(current_args, mode)
++    await _write_args(session_id, conversation_store, pinned)
++    return current_args, pinned
+ 
+ 
+ async def restore_launch_args(
+@@ -71,8 +150,102 @@ async def restore_launch_args(
+     :param conversation_store: Store holding the session row.
+     :param previous: Args returned by the pin call, or ``None`` for none.
+     """
+-    await asyncio.to_thread(
+-        conversation_store.update_conversation,
+-        session_id,
+-        terminal_launch_args=list(previous) if previous else [],
++    await _write_args(session_id, conversation_store, list(previous) if previous else [])
++
++
++async def _forward(
++    session_id: str,
++    runner_router: Any,
++    event: dict[str, Any],
++) -> tuple[_RunnerForwardResult | None, bool]:
++    """
++    Post *event* to the session's runner.
++
++    :returns: The runner's answer (``None`` when none came) and whether the
++        runner was reached at all. Not reaching it is certain only for a
++        missing client or a connect failure; a read timeout leaves it unknown.
++    """
++    from omnigent.runtime import get_runner_client
++
++    client = await _get_runner_client(session_id, runner_router)
++    if client is None:
++        client = get_runner_client()
++    if client is None:
++        return None, False
++    try:
++        resp = await client.post(
++            f"/v1/sessions/{session_id}/events",
++            json=event,
++            timeout=RELAUNCH_FORWARD_TIMEOUT_S,
++        )
++    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout):
++        return None, False
++    except (httpx.HTTPError, ConnectionError):
++        return None, True
++    return _RunnerForwardResult(status_code=resp.status_code, body=resp.text), True
++
++
++def _runner_timed_out(result: _RunnerForwardResult) -> bool:
++    if result.status_code != 504:
++        return False
++    try:
++        body = json.loads(result.body)
++    except (TypeError, ValueError):
++        return False
++    return isinstance(body, dict) and body.get("error") == RUNNER_TIMEOUT_CODE
++
++
++async def switch_claude_permission_mode(
++    session_id: str,
++    conversation_store: ConversationStore,
++    runner_router: Any,
++    current_args: list[str] | None,
++    mode: str,
++) -> _RunnerForwardResult:
++    """
++    Pin *mode* in the launch args, ask the runner to switch, and settle the args.
++
++    :param session_id: Session id, e.g. ``"conv_abc123"``.
++    :param conversation_store: Store holding the session row.
++    :param runner_router: Router that resolves the session's runner, or ``None``.
++    :param current_args: The row's launch args before the switch.
++    :param mode: Requested permission mode, e.g. ``"plan"``.
++    :returns: The runner's 2xx answer.
++    :raises OmnigentError: When the runner refused or was not reached (the old
++        args are back), or when the outcome is unknown (see the module text).
++    """
++    previous, pinned = await pin_relaunch_launch_args(
++        session_id, conversation_store, current_args, mode
+     )
++
++    async def keep_safe_args() -> None:
++        # Shielded: a cancelled request must still leave the row in a safe state.
++        await asyncio.shield(
++            _write_args(session_id, conversation_store, args_to_keep_when_unsure(previous, pinned))
++        )
++
++    try:
++        result, reached = await _forward(
++            session_id,
++            runner_router,
++            {"type": "permission_mode_change", "permission_mode": mode},
++        )
++    except BaseException:
++        await keep_safe_args()
++        raise
++    if result is not None and _runner_timed_out(result):
++        result, reached = None, True
++    if result is None and reached:
++        await keep_safe_args()
++        raise OmnigentError(
++            f"Could not confirm the switch to {mode} mode for session {session_id!r}. "
++            "Claude may still be restarting; the mode shown will update when it settles.",
++            code=ErrorCode.RUNNER_UNAVAILABLE,
++        )
++    try:
++        _require_permission_mode_forward(session_id, mode, result)
++    except OmnigentError:
++        await asyncio.shield(restore_launch_args(session_id, conversation_store, previous))
++        raise
++    assert result is not None  # _require_permission_mode_forward raised otherwise
++    return result
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 1119d6b4106d7d1e9f7330754583727d0270312c..8282450ca8fa7b69fe778aeecb180394164c7dec 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -189,10 +189,8 @@ from omnigent.server.routes._sessions.orchestration import (
+     ensure_runner_connected,
+ )
+ from omnigent.server.routes.sessions.ae_bypass_switch import (
+-    RELAUNCH_FORWARD_TIMEOUT_S,
+-    pin_relaunch_launch_args,
+-    restore_launch_args,
+-    server_needs_relaunch,
++    relaunch_unconfirmed,
++    switch_claude_permission_mode,
+ )
+ from omnigent.server.routes.sessions.ae_live_account_label import (
+     reject_live_account_seed,
+@@ -3053,63 +3051,61 @@ def register_core_routes(
+                 _runner_result,
+             )
+         if requested_permission_mode is not None and live_forward:
+-            # omnigent-ae: into or out of bypass the runner restarts Claude, and the
+-            # new pane reads its mode from the row, so pin it before the forward.
+-            _relaunch_switch = server_needs_relaunch(
+-                requested_permission_mode,
+-                updated.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY),
+-            )
+-            _args_before_relaunch = (
+-                await pin_relaunch_launch_args(
++            # omnigent-ae: every claude-native switch pins the target in the launch args
++            # first (the runner may restart the pane, which reads them) and gets the
++            # long budget; see ae_bypass_switch for what happens to the pin afterwards.
++            _claude_switch = (
++                updated.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
++                == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE
++            )
++            if _claude_switch:
++                _mode_result = await switch_claude_permission_mode(
+                     session_id,
+                     conversation_store,
++                    runner_router,
+                     updated.terminal_launch_args,
+                     requested_permission_mode,
+                 )
+-                if _relaunch_switch
+-                else None
+-            )
+-            _mode_result = await _forward_session_change_to_runner(
+-                session_id,
+-                runner_router,
+-                {
+-                    "type": "permission_mode_change",
+-                    "permission_mode": requested_permission_mode,
+-                },
+-                **({"timeout_s": RELAUNCH_FORWARD_TIMEOUT_S} if _relaunch_switch else {}),
+-            )
++            else:
++                _mode_result = await _forward_session_change_to_runner(
++                    session_id,
++                    runner_router,
++                    {
++                        "type": "permission_mode_change",
++                        "permission_mode": requested_permission_mode,
++                    },
++                )
+             # Raises unless the runner confirms the switch, so the label can
+             # never claim a mode Claude isn't in. Stores the mode it reached.
+-            try:
+-                _confirmed_permission_mode = _require_permission_mode_forward(
+-                    session_id,
+-                    requested_permission_mode,
+-                    _mode_result,
++            _confirmed_permission_mode = _require_permission_mode_forward(
++                session_id,
++                requested_permission_mode,
++                _mode_result,
++            )
++            # A restart whose mode could not be read keeps the pinned args (the pane
++            # launched from them) and stamps no label; the forwarder corrects it.
++            if not (_claude_switch and relaunch_unconfirmed(_mode_result)):
++                labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = (
++                    _confirmed_permission_mode
+                 )
+-            except OmnigentError:
+-                if _relaunch_switch:
+-                    await restore_launch_args(
+-                        session_id, conversation_store, _args_before_relaunch
+-                    )
+-                raise
+-            labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
+-            # The launcher restores the mode from terminal_launch_args, not the
+-            # label above, so pin the confirmed mode there too — otherwise a
+-            # relaunch reopens in the launch mode, which is Claude's default
+-            # (manual) for a session created without --permission-mode. Merge
+-            # against ``updated`` (the post-write row), not the pre-update
+-            # snapshot, so a combined PATCH that also set terminal_launch_args
+-            # keeps those.
+-            _merged_permission_args = _pin_claude_permission_launch_args(
+-                updated.terminal_launch_args,
+-                _confirmed_permission_mode,
+-            )
+-            if updated.terminal_launch_args != _merged_permission_args:
+-                await asyncio.to_thread(
+-                    conversation_store.update_conversation,
+-                    session_id,
+-                    terminal_launch_args=_merged_permission_args,
++                # The launcher restores the mode from terminal_launch_args, not the
++                # label above, so pin the confirmed mode there too — otherwise a
++                # relaunch reopens in the launch mode, which is Claude's default
++                # (manual) for a session created without --permission-mode. Merge
++                # against ``updated`` (the post-write row), not the pre-update
++                # snapshot, so a combined PATCH that also set terminal_launch_args
++                # keeps those.
++                _merged_permission_args = _pin_claude_permission_launch_args(
++                    updated.terminal_launch_args,
++                    _confirmed_permission_mode,
+                 )
++                # The claude path already wrote its pin, so ``updated`` is stale there.
++                if _claude_switch or updated.terminal_launch_args != _merged_permission_args:
++                    await asyncio.to_thread(
++                        conversation_store.update_conversation,
++                        session_id,
++                        terminal_launch_args=_merged_permission_args,
++                    )
+         if requested_codex_approval_mode is not None and live_forward:
+             _approval_result = await _forward_session_change_to_runner(
+                 session_id,
+diff --git a/tests/runner/test_ae_bypass_relaunch.py b/tests/runner/test_ae_bypass_relaunch.py
+index 91f2bcc002667ab8ba4f4ff2d911998f98937928..efdb057b6469cafc4d179deee42c42cca061968b 100644
+--- a/tests/runner/test_ae_bypass_relaunch.py
++++ b/tests/runner/test_ae_bypass_relaunch.py
+@@ -9,6 +9,7 @@ from typing import Any
+ import pytest
+ 
+ from omnigent.harnesses.claude_native import bridge as claude_native_bridge
++from omnigent.runner import ae_bypass_relaunch
+ from omnigent.runner.ae_bypass_relaunch import (
+     BYPASS,
+     BYPASS_REFUSALS,
+@@ -207,9 +208,95 @@ async def test_a_turn_arriving_mid_relaunch_waits_for_the_new_pane() -> None:
+         ("plan", BYPASS, True),
+         ("default", BYPASS, True),
+         ("plan", "auto", False),
+-        ("plan", None, False),
++        ("plan", None, True),  # pane mode unknown: the cycler has nothing to start from
+         ("auto", "default", False),
+     ],
+ )
+ def test_needs_relaunch_truth_table(target: str, current: str | None, expected: bool) -> None:
+     assert needs_relaunch(target, current) is expected
++
++
++async def test_the_mode_is_read_inside_the_lock_before_turns_are_released() -> None:
++    from omnigent.runner.ae_claude_account import is_switching
++
++    runner = _Runner(_Registry(_Terminal()))
++    seen: list[bool] = []
++
++    async def current_mode() -> str | None:
++        return "auto"
++
++    async def settled_mode() -> str | None:
++        seen.append(is_switching(SESSION_ID))
++        return BYPASS
++
++    response = await handle_claude_relaunch_switch(
++        SESSION_ID,
++        target_mode=BYPASS,
++        harness="claude-native",
++        current_mode=current_mode,
++        settled_mode=settled_mode,
++        turn_in_flight=lambda: False,
++        terminal_registry=runner.registry,  # type: ignore[arg-type]
++        close_terminal=runner.close,
++        ensure_terminal=runner.ensure,
++        publish_event=runner.publish,
++    )
++    assert response.status_code == 200
++    assert seen == [True]
++    assert not is_switching(SESSION_ID)
++
++
++async def test_a_restart_past_its_deadline_is_a_504_and_releases_the_session(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    from omnigent.runner.ae_claude_account import is_switching
++
++    monkeypatch.setattr(ae_bypass_relaunch, "RELAUNCH_DEADLINE_S", 0.05)
++    runner = _Runner(_Registry(_Terminal()))
++
++    async def stuck_ensure(session_id: str, harness: str | None) -> None:
++        await asyncio.sleep(5)
++
++    runner.ensure = stuck_ensure  # type: ignore[method-assign]
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled=BYPASS)
++    assert (status, body["error"]) == (504, "claude_bypass_timeout")
++    assert not is_switching(SESSION_ID)
++
++
++async def test_a_turn_waits_through_two_queued_relaunches() -> None:
++    from omnigent.runner.ae_claude_account import is_switching, wait_while_switching
++
++    runner = _Runner(_Registry(_Terminal()))
++    entered = asyncio.Event()
++    release = asyncio.Event()
++    plain_ensure = runner.ensure
++    ensures = 0
++
++    async def gated_ensure(session_id: str, harness: str | None) -> None:
++        nonlocal ensures
++        ensures += 1
++        if ensures == 1:
++            entered.set()
++            await release.wait()
++        await plain_ensure(session_id, harness)
++
++    runner.ensure = gated_ensure  # type: ignore[method-assign]
++    first = asyncio.create_task(_switch(runner, target=BYPASS, current="auto", settled=BYPASS))
++    await entered.wait()
++    second = asyncio.create_task(_switch(runner, target="plan", current=BYPASS, settled="plan"))
++    await asyncio.sleep(0)
++    finished_when_turn_woke: list[int] = []
++
++    async def turn() -> None:
++        await wait_while_switching(SESSION_ID)
++        finished_when_turn_woke.append(ensures)
++
++    turn_task = asyncio.create_task(turn())
++    await asyncio.sleep(0)
++    release.set()
++    assert (await first)[0] == 200
++    assert is_switching(SESSION_ID) or second.done()
++    assert (await second)[0] == 200
++    await turn_task
++    assert finished_when_turn_woke == [2]
++    assert not is_switching(SESSION_ID)
+diff --git a/tests/runner/test_app_sessions_native_events_options.py b/tests/runner/test_app_sessions_native_events_options.py
+index b08584069e12e8e1a94232edf9cf6581ed0a214b..7f6cc9cdc40114abeb8a0a8a75d287e009edb757 100644
+--- a/tests/runner/test_app_sessions_native_events_options.py
++++ b/tests/runner/test_app_sessions_native_events_options.py
+@@ -273,6 +273,7 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
+         return mode
+ 
+     monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
++    monkeypatch.setattr(claude_native_bridge, "read_permission_mode", lambda _dir: "default")
+ 
+     native_spec = _harness_spec("claude-native")
+ 
+@@ -301,13 +302,15 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize(
+     ("target", "pane_mode"),
+-    [("bypassPermissions", "auto"), ("plan", "bypassPermissions")],
++    [("bypassPermissions", "auto"), ("plan", "bypassPermissions"), ("plan", None)],
+ )
+ async def test_events_permission_mode_change_into_or_out_of_bypass_relaunches(
+-    monkeypatch: pytest.MonkeyPatch, target: str, pane_mode: str
++    monkeypatch: pytest.MonkeyPatch, target: str, pane_mode: str | None
+ ) -> None:
+     """
+-    A switch into or out of bypass restarts the pane; the shift+tab cycle is never used.
++    A switch into or out of bypass, or from a pane whose mode is unknown, restarts it.
++
++    The shift+tab cycle is never used for these.
+ 
+     Bypass is not in the cycle of a pane launched without it, and a pane
+     launched into it passes through bypass when it cycles, so the runner hands
+@@ -415,6 +418,7 @@ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
+         raise RuntimeError("The mode is not available in this session's cycle.")
+ 
+     monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
++    monkeypatch.setattr(claude_native_bridge, "read_permission_mode", lambda _dir: "default")
+ 
+     native_spec = _harness_spec("claude-native")
+ 
+diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
+index b380e455d1345ce64b77822cb2d475ada51ac6fa..3ff6f7c5a49ab656b87fbc8102dfd676c736765d 100644
+--- a/tests/server/integration/test_sessions_endpoints.py
++++ b/tests/server/integration/test_sessions_endpoints.py
+@@ -11421,32 +11421,35 @@ async def _patch_with_relaunch_probe(
+     requested: str,
+     label: str | None,
+     launch_args: list[str] | None,
+-    runner_response: httpx.Response,
++    runner_response: httpx.Response | Exception,
+ ) -> tuple[httpx.Response, dict[str, Any], list[str], list[float]]:
+     """
+     PATCH a Claude session's permission mode and record what the runner forward saw.
+ 
++    :param runner_response: What the fake runner answers, or an exception it raises.
+     :returns: The PATCH response, the session snapshot afterwards, the events
+         in the order ``pin`` (launch args written) and ``forward`` (runner
+         called), and the read timeouts of the forwards.
+     """
+-    from omnigent.server.routes.sessions import routes_core
++    from omnigent.server.routes.sessions import ae_bypass_switch
+ 
+     events: list[str] = []
+     timeouts: list[float] = []
+-    real_pin = routes_core.pin_relaunch_launch_args
++    real_pin = ae_bypass_switch.pin_relaunch_launch_args
+ 
+-    async def _pin(*args: Any, **kwargs: Any) -> list[str] | None:
++    async def _pin(*args: Any, **kwargs: Any) -> Any:
+         events.append("pin")
+         return await real_pin(*args, **kwargs)
+ 
+-    monkeypatch.setattr(routes_core, "pin_relaunch_launch_args", _pin)
++    monkeypatch.setattr(ae_bypass_switch, "pin_relaunch_launch_args", _pin)
+ 
+     def _handler(request: httpx.Request) -> httpx.Response:
+         if request.method != "POST":
+             return httpx.Response(204)
+         events.append("forward")
+         timeouts.append(request.extensions["timeout"]["read"])
++        if isinstance(runner_response, Exception):
++            raise runner_response
+         return runner_response
+ 
+     labels = {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"}
+@@ -11464,22 +11467,30 @@ async def _patch_with_relaunch_probe(
+     return resp, snapshot, events, timeouts
+ 
+ 
++_LABEL_KEY = "omnigent.claude_native.permission_mode"
++
++
+ @pytest.mark.parametrize(
+     ("requested", "label"),
+-    [("bypassPermissions", "auto"), ("plan", "bypassPermissions")],
+-    ids=["into_bypass", "out_of_bypass"],
++    [
++        ("bypassPermissions", "auto"),
++        ("plan", "bypassPermissions"),
++        ("plan", "auto"),
++        ("plan", None),
++    ],
++    ids=["into_bypass", "out_of_bypass", "between_cycle_modes", "no_label"],
+ )
+-async def test_patch_permission_mode_relaunch_pins_args_before_the_long_forward(
++async def test_patch_permission_mode_pins_args_before_the_long_forward(
+     client: httpx.AsyncClient,
+     monkeypatch: pytest.MonkeyPatch,
+     requested: str,
+-    label: str,
++    label: str | None,
+ ) -> None:
+     """
+-    Into or out of bypass the launch args are pinned first and the forward gets 90 s.
++    Every Claude switch pins the target first and gets the 90 s budget.
+ 
+-    The runner restarts Claude, and the new pane reads its mode from the row,
+-    so the pin has to land before the runner is called.
++    The runner may restart Claude (the new pane reads its mode from the row),
++    and the stored label cannot say whether it will, so the server does not try.
+     """
+     resp, snapshot, events, timeouts = await _patch_with_relaunch_probe(
+         client,
+@@ -11493,25 +11504,25 @@ async def test_patch_permission_mode_relaunch_pins_args_before_the_long_forward(
+     assert events == ["pin", "forward"]
+     assert timeouts == [90.0]
+     assert snapshot["terminal_launch_args"] == ["--model", "opus", "--permission-mode", requested]
+-    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == requested
++    assert snapshot["labels"][_LABEL_KEY] == requested
+ 
+ 
+-async def test_patch_permission_mode_between_cycle_modes_keeps_the_short_forward(
++async def test_patch_permission_mode_stale_label_still_pins_the_target(
+     client: httpx.AsyncClient,
+     monkeypatch: pytest.MonkeyPatch,
+ ) -> None:
+-    """Auto to plan neither pins ahead of the forward nor stretches its budget."""
+-    resp, _snapshot, events, timeouts = await _patch_with_relaunch_probe(
++    """A missing label with the pane really in bypass must not pin bypass for a Plan request."""
++    resp, snapshot, events, _timeouts = await _patch_with_relaunch_probe(
+         client,
+         monkeypatch,
+         requested="plan",
+-        label="auto",
+-        launch_args=None,
+-        runner_response=httpx.Response(200, json={"permission_mode": "plan"}),
++        label=None,
++        launch_args=["--permission-mode", "bypassPermissions"],
++        runner_response=httpx.Response(200, json={"permission_mode": "plan", "relaunched": True}),
+     )
+     assert resp.status_code == 200, resp.text
+-    assert events == ["forward"]
+-    assert timeouts == [5.0]
++    assert events == ["pin", "forward"]
++    assert snapshot["terminal_launch_args"] == ["--permission-mode", "plan"]
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -11525,32 +11536,94 @@ async def test_patch_permission_mode_between_cycle_modes_keeps_the_short_forward
+     ],
+     ids=["had_a_flag", "flagless"],
+ )
+-async def test_patch_permission_mode_relaunch_refusal_restores_args_and_label(
++@pytest.mark.parametrize(
++    "refusal",
++    [
++        httpx.Response(
++            409, json={"error": "claude_bypass_busy", "detail": "Claude is mid-reply."}
++        ),
++        httpx.ConnectError("no route"),
++    ],
++    ids=["runner_409", "not_reached"],
++)
++async def test_patch_permission_mode_refusal_or_no_runner_restores_args_and_label(
+     client: httpx.AsyncClient,
+     monkeypatch: pytest.MonkeyPatch,
+     launch_args: list[str] | None,
+     restored: list[str],
++    refusal: httpx.Response | Exception,
+ ) -> None:
+-    """A runner 409 puts the launch args back, keeps the label, and carries the detail."""
++    """A definite refusal, or a runner never reached, puts the launch args back."""
+     resp, snapshot, events, _timeouts = await _patch_with_relaunch_probe(
+         client,
+         monkeypatch,
+         requested="bypassPermissions",
+         label="auto",
+         launch_args=launch_args,
+-        runner_response=httpx.Response(
+-            409,
+-            json={"error": "claude_bypass_busy", "detail": "Claude is mid-reply."},
+-        ),
++        runner_response=refusal,
+     )
+     assert resp.status_code == 503, resp.text
+-    assert "Claude is mid-reply." in resp.text
++    if isinstance(refusal, httpx.Response):
++        assert "Claude is mid-reply." in resp.text
+     assert events == ["pin", "forward"]
+-    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
++    assert snapshot["labels"][_LABEL_KEY] == "auto"
+     assert (snapshot["terminal_launch_args"] or []) == restored
+-    assert "--dangerously-skip-permissions" not in (snapshot["terminal_launch_args"] or [])
+-    if launch_args is None:
+-        assert "--permission-mode" not in (snapshot["terminal_launch_args"] or [])
++    assert "bypassPermissions" not in (snapshot["terminal_launch_args"] or [])
++
++
++@pytest.mark.parametrize(
++    "unknown",
++    [
++        httpx.ReadTimeout("slow"),
++        httpx.Response(
++            504, json={"error": "claude_bypass_timeout", "detail": "Still restarting."}
++        ),
++    ],
++    ids=["read_timeout", "runner_deadline"],
++)
++@pytest.mark.parametrize(
++    ("requested", "label", "launch_args", "kept"),
++    [
++        # Into bypass: never leave a bypass pin nobody confirmed.
++        (
++            "bypassPermissions",
++            "auto",
++            ["--permission-mode", "auto"],
++            ["--permission-mode", "auto"],
++        ),
++        ("bypassPermissions", "auto", None, []),
++        # Out of bypass: never restore the bypass pin; keep the non-bypass target.
++        (
++            "plan",
++            "bypassPermissions",
++            ["--model", "opus", "--permission-mode", "bypassPermissions"],
++            ["--model", "opus", "--permission-mode", "plan"],
++        ),
++    ],
++    ids=["into_bypass", "into_bypass_flagless", "out_of_bypass"],
++)
++async def test_patch_permission_mode_unknown_outcome_keeps_a_safe_pin_and_label(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++    unknown: httpx.Response | Exception,
++    requested: str,
++    label: str,
++    launch_args: list[str] | None,
++    kept: list[str],
++) -> None:
++    """When the runner may still be finishing, no unconfirmed bypass pin survives."""
++    resp, snapshot, _events, _timeouts = await _patch_with_relaunch_probe(
++        client,
++        monkeypatch,
++        requested=requested,
++        label=label,
++        launch_args=launch_args,
++        runner_response=unknown,
++    )
++    assert resp.status_code == 503, resp.text
++    assert "may still be restarting" in resp.text
++    assert snapshot["labels"][_LABEL_KEY] == label
++    assert (snapshot["terminal_launch_args"] or []) == kept
+ 
+ 
+ async def test_patch_permission_mode_relaunch_records_the_mode_the_pane_reached(
+@@ -11564,13 +11637,39 @@ async def test_patch_permission_mode_relaunch_records_the_mode_the_pane_reached(
+         requested="bypassPermissions",
+         label="auto",
+         launch_args=None,
+-        runner_response=httpx.Response(200, json={"permission_mode": "default"}),
++        runner_response=httpx.Response(
++            200, json={"permission_mode": "default", "relaunched": True}
++        ),
+     )
+     assert resp.status_code == 200, resp.text
+-    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "default"
++    assert snapshot["labels"][_LABEL_KEY] == "default"
+     assert snapshot["terminal_launch_args"] == ["--permission-mode", "default"]
+ 
+ 
++async def test_patch_permission_mode_unread_mode_keeps_the_pin_and_stamps_nothing(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """
++    A restart whose footer could not be read keeps the pinned args and the old label.
++
++    The pane launched from the pin, so the pin stays; the label is the
++    forwarder's to correct, not something to fill with the requested mode.
++    """
++    resp, snapshot, _events, _timeouts = await _patch_with_relaunch_probe(
++        client,
++        monkeypatch,
++        requested="bypassPermissions",
++        label="auto",
++        launch_args=None,
++        runner_response=httpx.Response(200, json={"relaunched": True}),
++    )
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["labels"][_LABEL_KEY] == "auto"
++    assert snapshot["labels"][_LABEL_KEY] == "auto"
++    assert snapshot["terminal_launch_args"] == ["--permission-mode", "bypassPermissions"]
++
++
+ @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+ async def test_patch_permission_mode_requires_live_runner_before_persisting(
+     client: httpx.AsyncClient,
+@@ -11629,7 +11728,8 @@ async def test_patch_permission_mode_requires_live_runner_before_persisting(
+     assert resp.status_code == 503, resp.text
+     assert "Could not switch to auto mode" in resp.text
+     assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+-    assert snapshot["terminal_launch_args"] is None
++    # The pin is taken back; a session that had no args is left with none.
++    assert not snapshot["terminal_launch_args"]
+ 
+ 
+ async def test_patch_permission_mode_silent_skips_the_switch_without_crashing(
+diff --git a/tests/server/test_ae_bypass_switch.py b/tests/server/test_ae_bypass_switch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91d58ae60e2c9f6836ed4e52c0d675510533f819
+--- /dev/null
++++ b/tests/server/test_ae_bypass_switch.py
+@@ -0,0 +1,131 @@
++"""Tests for the server half of the Claude permission switch (launch-arg pinning)."""
++
++from __future__ import annotations
++
++import asyncio
++from typing import Any
++
++import pytest
++
++from omnigent.errors import OmnigentError
++from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
++from omnigent.server.routes.sessions import ae_bypass_switch
++from omnigent.server.routes.sessions.ae_bypass_switch import (
++    args_request_bypass,
++    args_to_keep_when_unsure,
++    relaunch_unconfirmed,
++    switch_claude_permission_mode,
++)
++
++BYPASS_ARGS = ["--permission-mode", "bypassPermissions"]
++
++
++class _Store:
++    """Records every launch-args write."""
++
++    def __init__(self) -> None:
++        self.writes: list[list[str]] = []
++
++    def update_conversation(self, session_id: str, *, terminal_launch_args: list[str]) -> None:
++        self.writes.append(list(terminal_launch_args))
++
++
++@pytest.mark.parametrize(
++    ("args", "expected"),
++    [
++        (None, False),
++        ([], False),
++        (["--permission-mode", "plan"], False),
++        (BYPASS_ARGS, True),
++        (["--permission-mode=bypassPermissions"], True),
++        (["--dangerously-skip-permissions"], True),
++        (["--permission-mode", "bypassPermissions", "--permission-mode", "plan"], False),
++    ],
++)
++def test_args_request_bypass(args: list[str] | None, expected: bool) -> None:
++    assert args_request_bypass(args) is expected
++
++
++@pytest.mark.parametrize(
++    ("previous", "pinned", "kept"),
++    [
++        (["--permission-mode", "auto"], BYPASS_ARGS, ["--permission-mode", "auto"]),
++        (None, BYPASS_ARGS, []),
++        (BYPASS_ARGS, ["--permission-mode", "plan"], ["--permission-mode", "plan"]),
++        (
++            ["--permission-mode", "auto"],
++            ["--permission-mode", "plan"],
++            ["--permission-mode", "plan"],
++        ),
++        (BYPASS_ARGS, BYPASS_ARGS, BYPASS_ARGS),
++    ],
++)
++def test_args_to_keep_when_unsure(
++    previous: list[str] | None, pinned: list[str], kept: list[str]
++) -> None:
++    assert args_to_keep_when_unsure(previous, pinned) == kept
++
++
++@pytest.mark.parametrize(
++    ("status", "body", "expected"),
++    [
++        (200, '{"relaunched": true}', True),
++        (200, '{"relaunched": true, "permission_mode": ""}', True),
++        (200, '{"relaunched": true, "permission_mode": "plan"}', False),
++        (200, '{"permission_mode": "plan"}', False),
++        (200, "not json", False),
++        (409, '{"relaunched": true}', False),
++    ],
++)
++def test_relaunch_unconfirmed(status: int, body: str, expected: bool) -> None:
++    assert relaunch_unconfirmed(_RunnerForwardResult(status_code=status, body=body)) is expected
++    assert relaunch_unconfirmed(None) is False
++
++
++async def test_a_cancelled_forward_leaves_the_safe_args_and_propagates(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Cancelling mid-forward must not strand an unconfirmed bypass pin."""
++
++    async def _cancelled(*_args: Any, **_kwargs: Any) -> Any:
++        raise asyncio.CancelledError
++
++    monkeypatch.setattr(ae_bypass_switch, "_forward", _cancelled)
++    store = _Store()
++    with pytest.raises(asyncio.CancelledError):
++        await switch_claude_permission_mode(
++            "conv_x",
++            store,
++            None,
++            ["--permission-mode", "auto"],
++            "bypassPermissions",  # type: ignore[arg-type]
++        )
++    await asyncio.sleep(0)  # let the shielded write finish
++    assert store.writes == [BYPASS_ARGS, ["--permission-mode", "auto"]]
++
++
++async def test_a_cancelled_forward_when_leaving_bypass_keeps_the_new_pin(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    async def _cancelled(*_args: Any, **_kwargs: Any) -> Any:
++        raise asyncio.CancelledError
++
++    monkeypatch.setattr(ae_bypass_switch, "_forward", _cancelled)
++    store = _Store()
++    with pytest.raises(asyncio.CancelledError):
++        await switch_claude_permission_mode("conv_x", store, None, BYPASS_ARGS, "plan")  # type: ignore[arg-type]
++    await asyncio.sleep(0)
++    assert store.writes[-1] == ["--permission-mode", "plan"]
++
++
++async def test_a_runner_never_reached_restores_a_session_that_had_no_args(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    async def _unreached(*_args: Any, **_kwargs: Any) -> Any:
++        return None, False
++
++    monkeypatch.setattr(ae_bypass_switch, "_forward", _unreached)
++    store = _Store()
++    with pytest.raises(OmnigentError):
++        await switch_claude_permission_mode("conv_x", store, None, None, "bypassPermissions")  # type: ignore[arg-type]
++    assert store.writes == [BYPASS_ARGS, []]
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index eb04e30398b1eae0998b6bdb2ff4b49add5195c7..7a7c6d890cb17587e5a6790f40066474c48198e9 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -3139,6 +3139,24 @@ describe("Composer shared visible controls", () => {
+       "Claude restarted but stayed in Manual. A managed setting on this host may turn bypass off.",
+     );
+   });
++
++  it("names the mode Claude is in when a non-bypass switch lands elsewhere", async () => {
++    useChatStore.setState({
++      conversationId: "plan-mismatch",
++      claudePermissionMode: "bypassPermissions",
++    });
++    const setClaude = vi
++      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
++      .mockImplementation(async () => {
++        useChatStore.setState({ claudePermissionMode: "bypassPermissions" });
++      });
++    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
++    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
++    fireEvent.click(screen.getByTestId("composer-permission-option-plan"));
++    await waitFor(() => expect(setClaude).toHaveBeenCalledWith("plan"));
++    await screen.findByText("Claude restarted but is in Bypass permissions, not Plan.");
++    expect(screen.queryByText(/managed setting/)).toBeNull();
++  });
+ });
+ 
+ describe("Composer background tasks", () => {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 2136e8eaa9e57b22596bff72979cc67a78f487e6..c2be1fbf568ab1fee0e1ad5b77f554af9df64a92 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -2509,12 +2509,17 @@ function ComposerImpl(
+       if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
+       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
+       if (useChatStore.getState().conversationId === sourceSessionId) {
+-        // omnigent-ae: a restart into bypass can land elsewhere when a managed setting strips it.
++        // omnigent-ae: Claude can land in another mode than asked (a managed setting
++        // strips bypass; a restart whose mode could not be read keeps the old label).
+         const reached = useChatStore.getState().claudePermissionMode;
++        const differs =
++          showClaudePermissionMode && !devinPermissionControl && !!reached && reached !== mode;
+         setCommandError(
+-          showClaudePermissionMode && mode === "bypassPermissions" && reached !== mode
+-            ? `Claude restarted but stayed in ${claudePermissionModeLabel(reached)}. A managed setting on this host may turn bypass off.`
+-            : null,
++          !differs
++            ? null
++            : mode === "bypassPermissions"
++              ? `Claude restarted but stayed in ${claudePermissionModeLabel(reached)}. A managed setting on this host may turn bypass off.`
++              : `Claude restarted but is in ${claudePermissionModeLabel(reached)}, not ${claudePermissionModeLabel(mode)}.`,
+         );
+       }
+     } catch (error) {

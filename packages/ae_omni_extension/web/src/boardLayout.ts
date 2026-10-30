@@ -1,8 +1,8 @@
 // Where each Admin Center card sits (2026-10-22): the default columns, the
-// arrangement Reid saved by dragging, and the pure steps that move a card.
+// arrangement the owner saved by dragging, and the pure steps that move a card.
 //
 // Why: the cards sit in fixed column stacks (board.ts), and the default left
-// holes under the short columns. Reid asked for the Box health card under
+// holes under the short columns. The owner asked for the Box health card under
 // Deploys and Databricks credit under Azure spend, and to be able to drag a
 // card elsewhere. The arrangement is saved per column count (two and three;
 // a phone is one column and is not arranged), in the SDK's `storage.user`

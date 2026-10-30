@@ -1,4 +1,4 @@
-// The Admin Center's Key Vault card (2026-10-23, the concept Reid approved
+// The Admin Center's Key Vault card (2026-10-23, the concept the owner approved
 // that day): every secret in both vaults, the box's (`AE_VAULT_NAME`) and
 // the website's, by name. Names and dates only: the server answers from
 // the box's daily reading (`GET /v1/ae/vault`, ae_omni_policies/
@@ -32,7 +32,7 @@
 //
 // Owners (2026-10-23, secret expiry alerts): every secret can have an owner,
 // an OmniGent user, so the server's 30 day, 7 day and expired alerts reach the
-// person who rotates it; a secret with no owner alerts Reid. Rows and Needs
+// person who rotates it; a secret with no owner alerts the box owner. Rows and Needs
 // you lines carry the owner's initials (a dashed "?" for none), the chips gain
 // one per owner plus "No owner", and a click on a row opens a strip under it
 // with an owner select and the Edit link. A group header's "Set owner for all
@@ -73,18 +73,18 @@ export const FILTERS: ReadonlyArray<{ id: Filter; label: string }> = [
   { id: "old", label: "180d+" },
 ];
 
-export const NO_OWNER = "No owner (alerts go to Reid)";
+export const NO_OWNER = "No owner (alerts go to the box owner)";
 
 // ── words ───────────────────────────────────────────────────────────────────
 
-/** An owner id's local part in words: "reid.havens@..." is "Reid Havens". */
+/** An owner id's local part in words: "owner.person@..." is "Owner Person". */
 export function ownerName(id: string): string {
   const words = (id.split("@")[0] ?? "").split(/[._+-]+/).filter(Boolean);
   if (!words.length) return id;
   return words.map((word) => word[0]!.toUpperCase() + word.slice(1)).join(" ");
 }
 
-/** The avatar's letters: "reid.havens" is "RH"; a one-word name gives one letter. */
+/** The avatar's letters: "owner.person" is "OP"; a one-word name gives one letter. */
 export function ownerInitials(id: string): string {
   const words = ownerName(id).split(" ");
   const last = words.length > 1 ? (words[words.length - 1]![0] ?? "") : "";
@@ -288,9 +288,9 @@ interface State {
   at: number;
   filter: Filter;
   query: string;
-  /** Groups Reid opened, per vault ("vault/group"). */
+  /** Groups the owner opened, per vault ("vault/group"). */
   openGroups: Set<string>;
-  /** Groups Reid folded while a search or filter opens every match; cleared when it changes. */
+  /** Groups the owner folded while a search or filter opens every match; cleared when it changes. */
   closedGroups: Set<string>;
   /** The open owner strip: "row:vault/name" under a row, "group:vault/group" under a group header. */
   picker: string | null;

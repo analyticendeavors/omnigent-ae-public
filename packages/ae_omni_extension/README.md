@@ -10,7 +10,7 @@ move page land on it. The Dashboard has no nav row of its own: the sidebar's
 "Dashboard n/3" row (patch P7, which renamed P1's Slots row) links to the `lot` route
 and carries the slot count, which a contribution's static label cannot. The
 extension's one nav row is the Admin Center's (2026-10-16 as Fabric Admin, below), at
-`/extensions/analyticendeavors.parking-lot/fabric`. Why one Dashboard page: Reid found "Your move", "Parking Lot" and "Slots"
+`/extensions/analyticendeavors.parking-lot/fabric`. Why one Dashboard page: the owner found "Your move", "Parking Lot" and "Slots"
 three entries for one feature (2026-09-24); the review and the plan are
 `docs/design/dashboard-review.md`.
 
@@ -38,7 +38,7 @@ Blocked sections list them again.
 | Section | Source | Actions |
 |---|---|---|
 | Header | `GET /v1/ae/capacity` for the slots; the pull requests, Your move and the lot as loaded below; `GET /v1/ae/release`; `GET /v1/ae/limits` | Flow or Brief (remembered); a slot block opens its session; a row or a link opens its section |
-| Your move | `GET /v1/ae/your-move`: open gates, approvals outstanding, lot items due today or overdue, pull requests without a card below, the steward's brief (blocked and review have their own sections) | a gate: Do it now, Write a note, Save for later, Drop it in place (they post A, B, C, close; labelled A, B, C, Close until 2026-09-27, when Reid asked for labels that say what each does), then Open; an approval: Open; due: Resume; a pull request: Merge, the same button and confirm as Open PRs (2026-09-24, below), and Open on GitHub and a small Copy (Copy link alone until 2026-09-27) |
+| Your move | `GET /v1/ae/your-move`: open gates, approvals outstanding, lot items due today or overdue, pull requests without a card below, the steward's brief (blocked and review have their own sections) | a gate: Do it now, Write a note, Save for later, Drop it in place (they post A, B, C, close; labelled A, B, C, Close until 2026-09-27, when the owner asked for labels that say what each does), then Open; an approval: Open; due: Resume; a pull request: Merge, the same button and confirm as Open PRs (2026-09-24, below), and Open on GitHub and a small Copy (Copy link alone until 2026-09-27) |
 | Open PRs | `GET /v1/ae/prs`: every open pull request a session tracks (upstream's per-session tracking), as a card with CI counts, mergeability, review state and the sessions it came from (2026-09-24) | Merge (off with the server's reason; asks once on one row: the method toggle when the repo allows both, Confirm merge, Cancel (2026-09-26); afterwards Mark session done with a "frees a slot" hint, which sets the session to review, only when that merge was the session's last open pull request, else a muted "N more open pull requests in this session." line (2026-09-25, `web/src/reviewOffer.ts`; labelled Set session to review until 2026-09-26)); Open on GitHub and a small Copy (Copy link alone until 2026-09-27) |
 | Working n/3 | `ae.status=working` (the slots); chips for "gate open" and "n unfiled" | Open; Park (opens the park form with the session chosen, so a park leaves a note); Review; Blocked |
 | Blocked | working with an approval outstanding, or `ae.status=blocked`; holds no slot | Open, Working |
@@ -77,7 +77,7 @@ remembered per user in `storage.user` (key `header.view`):
 The first build of both views (https://github.com/analyticendeavors/omnigent-ae/pull/111 and
 https://github.com/analyticendeavors/omnigent-ae/pull/115) drifted from the concepts: text in
 place of the usage bars, a seven-day lot strip, age bars, round dots. On 2026-10-17
-Reid asked for them exactly as drawn, so this is that. One part of concept 3 is not
+The owner asked for them exactly as drawn, so this is that. One part of concept 3 is not
 data the server has: the release's deadline ("held to 09:52"), which lives in the
 box's auto-update state, so the row says how many sessions hold it instead. The pips
 are hidden from screen readers; each row's text says the same.
@@ -94,13 +94,13 @@ newer tag exists: a pin, a rolled-back tag or a hold on the box is out of view, 
 never claims an install. The brief calls a pull request ready only when its card would
 (open, Merge allowed, no conflicts, checks passed or none), and the header leaves out
 one just merged from the page. A section folded as empty is named as text, not a
-link, and the header draws its title alone until the remembered view is read. Reid picked flow
+link, and the header draws its title alone until the remembered view is read. The owner picked flow
 with a toggle to the brief from three concepts on 2026-10-17.
 
 ## Admin Center (2026-10-16 as Fabric Admin; renamed 2026-10-18)
 
-Why: Reid wanted the aetraining wake button, and room for more capacity buttons,
-inside omnigent-ae next to the Dashboard. Off was added at his request, guarded by a
+Why: the owner wanted the aetraining wake button, and room for more capacity buttons,
+inside omnigent-ae next to the Dashboard. Off was added at their request, guarded by a
 separate suspend key so holders of the shared wake link can only wake.
 
 Renamed 2026-10-18: the page is the hub for admin sections still to come (Databricks
@@ -141,7 +141,7 @@ draws it: `main.ts` picks the page by the view the host names at activation.
   `aetraining-wake-url`, `deploy/pull-secrets.sh`).
 - **Phone.** One column with 16 px gutters at 375 px.
 
-**Second pass, 2026-10-16 (extension 0.3.0).** Reid approved a compact mockup: the
+**Second pass, 2026-10-16 (extension 0.3.0).** The owner approved a compact mockup: the
 first pass's buttons were oversized for what they do.
 
 - **One row per capacity.** A status dot, the name and a small state pill; a muted
@@ -184,7 +184,7 @@ rule, which changed the same day (keep awake has its own `keepAwakeUntil`).
   stacking context through `container-type`).
 - **Touch.** Every action is 44 px under `pointer: coarse`, 8 px apart.
 
-**Capacity fleet, 2026-10-21.** Reid wanted every Fabric capacity he has on the
+**Capacity fleet, 2026-10-21.** The owner wanted every Fabric capacity they have on the
 Compute card, each with its size, state, Pause or Start, and a resize. With the
 server's `AE_FABRIC_CAPACITIES_URL` and `AE_FABRIC_CAPACITIES_KEY` set, `GET
 /v1/ae/fabric` returns one row per capacity the shared Logic App lists, and the
@@ -219,7 +219,7 @@ The first `section.admin-section`, above Fabric capacity, built by
 from `GET /v1/ae/release`, the same route as the Dashboard header. A newer release
 adds "ae-vX is waiting to deploy", plus "for N busy sessions" when sessions are
 mid-turn. Below that, the hold from `GET /v1/ae/deploy/hold`: "On hold until 9:46
-PM, set by reid" and the time left, or "Deploys run automatically. A hold pauses
+PM, set by the owner" and the time left, or "Deploys run automatically. A hold pauses
 them for up to 3 hours and ends on its own."
 
 Hold 1 h, 2 h and 3 h (`POST /v1/ae/deploy/hold` with `{"hours": N}`) set a hold
@@ -254,7 +254,7 @@ page: the SDK's `navigation.openPage` opens only the extension's own pages.
 
 ### Dashboard layout (2026-10-20)
 
-Reid approved concept C. The page uses the pane's width. Under the header (title,
+The owner approved concept C. The page uses the pane's width. Under the header (title,
 "Updated", one refresh button that runs every section's normal read) sits a tile strip
 (`tiles.ts`): Release, Deploy hold, Box host, Fabric, Databricks, Secrets and Shared
 accounts, each with a coloured left edge by health. Each section builds its own tile from
@@ -275,7 +275,7 @@ default, personal and shared ones) and the Codex login, grouped Claude then Code
 row is the label, the plan when known, a 5-hour and a weekly bar with the percent and
 the reset time (amber from 70%, red from 90%), the live sessions on it and the reading's
 age ("as of 3h ago", or "no reading yet" for a signed-in account the relay has not read).
-Why: Reid runs several accounts, and their usage was visible only one session at a time.
+Why: the owner runs several accounts, and their usage was visible only one session at a time.
 The Shared tile becomes the Accounts tile: the account count and the fullest window,
 coloured by the same steps, still noting "Manage in Settings". On a phone the folded
 card names the fullest account and its percent. Columns: three are Deploys over credit,
@@ -292,7 +292,7 @@ distinct use, in first-seen order, so a feature that needs two keys ("Microsoft 
 and required, grey when one is missing and optional, green otherwise; its tooltip lists
 each key behind it with its state. The counts (the "10 of 10" tile, the pill, the folded
 summary) still count keys. The Deploys hold line and the Deploy hold tile now show only
-the part of the holder's address before the "@" ("by reid.havens"), with the full address
+the part of the holder's address before the "@" ("by owner.person"), with the full address
 in the tooltip; a holder with no "@" shows whole. The name in the hold line never wraps
 mid-word.
 
@@ -335,7 +335,7 @@ pages.
 
 ## Your move (2026-09-24)
 
-Why: Reid runs several sessions at once, merges from his phone,
+Why: the owner runs several sessions at once, merges from their phone,
 and kept asking "what's left". The section answers "what is waiting on me right
 now" from one route, `GET /v1/ae/your-move` (`ae_omni_policies/your_move.py`),
 which reads signals that already exist and adds no prompt rule. It was a page of
@@ -353,7 +353,7 @@ request in a new tab, came with core patch P25 (below).
 
 ### Open on GitHub (2026-09-27)
 
-Why: Reid works from an iPhone (Safari) and a Windows laptop (Firefox) and hates copy
+Why: the owner works from an iPhone (Safari) and a Windows laptop (Firefox) and hates copy
 and paste; every pull request card offered only Copy link, because the frame is
 `sandbox="allow-scripts"` and upstream's `navigation.openExternal` opened only URLs
 the host handed out itself (the Dashboard's pull requests come from the AE routes).
@@ -382,7 +382,7 @@ always a working path; on a phone-narrow card it keeps its own width. A merged c
 Dismiss is its own `.actions.pr-dismiss` group at the row's end, so the "frees a slot"
 hint stays beside Mark session done.
 
-2026-09-28: Reid asked why the URL printed on a Your move pull request row was not a
+2026-09-28: the owner asked why the URL printed on a Your move pull request row was not a
 link. It is now a link-styled button (`urlLinkButton`: monospace, the accent colour,
 underlined on hover, `aria-label` "Open <url> on GitHub") that opens the pull request
 the same way Open on GitHub does, blocked-tab fallback included. It is the only bare
@@ -391,7 +391,7 @@ show a task-store link, and the fallback's URL stays selectable text for copying
 
 ### One status row on pull request cards (2026-09-27)
 
-Reid's second note that the cards waste space (with core patch P26 for the chat's
+The owner's second note that the cards waste space (with core patch P26 for the chat's
 card): an Open PRs card put its chips, the reason Merge is off, the "from" line and
 the buttons on separate full-width rows. `statusRow` in `web/src/prs.ts` now puts the
 chips (Your move: its CI line), the reason or a merged card's result and notes, and
@@ -405,7 +405,7 @@ tighter (8 px by 12 px padding, 6 px between rows).
 
 Why: Open PRs lists only pull requests a session tracks through upstream's
 per-session registry, and the ones a subagent or another session opened often are
-not tracked. On 2026-09-24 Reid, on his iPhone, saw Open PRs at 0 while Your move
+not tracked. On 2026-09-24 the owner, on their iPhone, saw Open PRs at 0 while Your move
 listed green, mergeable pull requests with nothing but Copy link.
 
 Each Your move pull request card now carries the Open PRs card's Merge button,
@@ -438,7 +438,7 @@ it otherwise), so it offers none. Open on GitHub and Copy stay (Copy link alone 
 
 ## Tags, repo and search (2026-09-25)
 
-Reid's feedback on the lot (https://github.com/analyticendeavors/omnigent-ae/issues/28),
+The owner's feedback on the lot (https://github.com/analyticendeavors/omnigent-ae/issues/28),
 read mostly on an iPhone.
 
 - **Tags.** Every tag a task carries shows, in a row under the card's header that
@@ -461,7 +461,7 @@ read mostly on an iPhone.
 
 ## Lot cards and Resume (2026-09-24)
 
-Redesigned after the first box deploy (Reid's feedback: Resume sat awkwardly on
+Redesigned after the first box deploy (the owner's feedback: Resume sat awkwardly on
 each card, the cards left the right half empty, Reference sat alone in the lower
 right, and Resume landed on an empty session). A card is compact by default: one
 header row with the quadrant icon, the title, a meta line (resurface date, up to
@@ -488,7 +488,7 @@ text and everything else keeps working. No emoji anywhere; icons are lucide
 (working CirclePlay, blocked CirclePause, review CircleCheck, parked CircleParking,
 reference Archive; hotfix Flame, feature Sparkles, admin ClipboardList; capacity
 Gauge). Single column at 375 to 430 px with 44 px targets; two columns from 720 px. Buttons
-(`.btn`) are 32 px tall with a mouse and 40 px on a touch screen (2026-09-26: Reid
+(`.btn`) are 32 px tall with a mouse and 40 px on a touch screen (2026-09-26: the owner
 found Merge, Copy link, Open / Park / Review / Blocked and Resume too tall at desktop
 width).
 

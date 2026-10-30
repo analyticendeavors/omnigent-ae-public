@@ -2,7 +2,7 @@
 // whether a newer one is waiting, and a hold that pauses the box's automatic
 // deploys for 1, 2 or 3 hours.
 //
-// Why: a deploy restarts the server, and Reid kept stopping the auto-update
+// Why: a deploy restarts the server, and the owner kept stopping the auto-update
 // timer by hand before a demo or a long run, then had to remember to start it
 // again. A hold set here ends on its own. The server keeps it
 // (`/v1/ae/deploy/hold`, ae_omni_policies/deploy_hold.py) and

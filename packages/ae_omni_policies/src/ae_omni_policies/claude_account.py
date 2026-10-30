@@ -18,6 +18,12 @@ clients, so only this server writes it. The checks are the fork's
 (``validate_fork_claude_account``): a Claude native chat with no provider
 credentials, on a connected host the caller owns, with a login that host lists.
 
+``include_children`` on the PUT (added 2026-10-28) adds a ``children`` list and moves
+the chat's family children too: the sessions whose ``ae.orch`` label names it, and
+theirs, owned by the same user. A fork and a sub-agent never move with the parent.
+Each child goes through the same :func:`switch`; one that is mid-reply is skipped and
+listed, not failed.
+
 Runner answers: 2xx is ``relaunched``; a refusal (a reply or approval in
 progress, a terminal that would not start) puts the old label back and passes
 through; no runner bound keeps the label (the next launch uses it); no answer
@@ -30,6 +36,7 @@ import asyncio
 import json
 import logging
 import weakref
+from collections.abc import Callable
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Path, Request
@@ -61,6 +68,8 @@ _NOT_A_LOGIN_CHAT = ("Claude native target", "provider authentication")
 MOVE_ALL_CONCURRENCY = 4
 MOVE_ALL_CAP_S = 120.0
 _background: set[asyncio.Task[Any]] = set()
+# The owner a store without per-user sessions (single user, no auth) reports.
+LOCAL_OWNER = "local"
 
 _SESSION_PATH = Annotated[str, Path(min_length=1, max_length=128)]
 _locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
@@ -73,6 +82,12 @@ class AccountBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     account: StrictStr
+
+
+class SwitchBody(AccountBody):
+    """Body of the PUT: ``include_children`` also moves the chat's family children."""
+
+    include_children: bool = False
 
 
 class MoveAllBody(AccountBody):
@@ -199,7 +214,7 @@ async def _may_write(user: str | None, session_id: str) -> bool:
 async def put_claude_account(
     request: Request,
     session_id: _SESSION_PATH,
-    body: AccountBody,
+    body: SwitchBody,
     user: Annotated[str | None, Depends(require_ae_user)],
 ) -> dict[str, Any] | JSONResponse:
     """Switch the chat's Claude login and restart its terminal on it.
@@ -208,6 +223,13 @@ async def put_claude_account(
     ``"pending": true`` when the runner did not answer in time; 409 when a reply
     or approval is in progress; 400, 403 or 409 from the fork checks when the
     chat or host cannot use the login.
+
+    With ``include_children`` the answer also holds ``children``
+    (``{"moved", "skipped", "pending"}``, each a list of ``{id, title}`` rows, the
+    last two with a ``reason``; ``error`` is added when the cascade itself failed and
+    no child was attempted). It runs only after the chat's own switch went
+    through or is pending; a refused chat leaves its children alone. The status is
+    202 only when the chat itself is pending.
     """
     from ae_omni_policies import router as ae_router
 
@@ -226,9 +248,95 @@ async def put_claude_account(
         raise OmnigentError(
             refused.detail, code=_RUNNER_CODES.get(refused.status, ErrorCode.RUNNER_UNAVAILABLE)
         ) from refused
+    if body.include_children:
+        try:
+            answer["children"] = await _switch_children(request, user, conv, body.account)
+        except Exception:  # noqa: BLE001 (the chat already switched; its answer must survive)
+            _logger.warning(
+                "claude-account: child cascade failed for %s", session_id, exc_info=True
+            )
+            answer["children"] = {
+                "moved": [],
+                "skipped": [],
+                "pending": [],
+                "error": "children not attempted",
+            }
     if answer.get("pending"):
         return JSONResponse(status_code=202, content=answer)
     return answer
+
+
+def _session_owner(store: Any, session_id: str) -> str | None:
+    """Who owns *session_id*: ``local`` only for a store with no owners at all (single user).
+
+    ``None`` when the lookup fails or finds no owner, which excludes the chat.
+    """
+    getter = getattr(store, "get_session_owner", None)
+    if not callable(getter):
+        return LOCAL_OWNER
+    try:
+        owner = getter(session_id, owner_only=True)
+    except Exception:  # noqa: BLE001 (an unreadable owner must exclude the chat)
+        _logger.warning("claude-account: owner lookup failed for %s", session_id, exc_info=True)
+        return None
+    return owner if isinstance(owner, str) and owner else None
+
+
+def _descendants(root: str, rows: list[Any], owner_of: Callable[[str], str | None]) -> list[Any]:
+    """The family below *root*: breadth first over ``ae.orch``, nearest first, loop-safe.
+
+    Stops :data:`sessions.FAMILY_DEPTH` levels down. Every row must share the root's
+    owner (``ae.orch`` is not reserved, so a session can name any lead), and the
+    root itself is never listed.
+    """
+    owner = owner_of(root)
+    if owner is None:
+        return []
+    seen = {root}
+    found: list[Any] = []
+    level = [root]
+    for _ in range(sessions.FAMILY_DEPTH):
+        nxt: list[str] = []
+        for parent_id in level:
+            for child in sessions.children_of(rows, parent_id):
+                if child.id in seen or owner_of(child.id) != owner:
+                    continue
+                seen.add(child.id)
+                found.append(child)
+                nxt.append(child.id)
+        if not nxt:
+            break
+        level = nxt
+    return found
+
+
+async def _switch_children(
+    request: Request, user: str | None, parent: Any, account: str
+) -> dict[str, list[dict[str, str]]]:
+    """Move the parent's family children to *account*; the route's ``children`` answer."""
+    from ae_omni_policies import router as ae_router
+
+    rows = await asyncio.to_thread(
+        sessions.list_top_level, accessible_by=ae_router._acl_user(user)
+    )
+    store = get_conversation_store()
+
+    def owner_of(session_id: str) -> str | None:
+        return _session_owner(store, session_id)
+
+    family = await asyncio.to_thread(_descendants, parent.id, rows, owner_of)
+    todo = []
+    for child in family:
+        if child.agent_id is None or current_account(child.labels) == account:
+            continue
+        if await _may_write(user, child.id):
+            todo.append(child)
+    moved, skipped, pending = await _move_many(request, user, todo, account)
+    return {
+        "moved": [{"id": c.id, "title": c.title or c.id} for c in moved],
+        "skipped": skipped,
+        "pending": pending,
+    }
 
 
 @router.post(
@@ -264,22 +372,34 @@ async def move_all_claude_chats(
         if not await _may_write(user, conv.id):
             continue
         todo.append(conv)
+    moved, skipped, pending = await _move_many(request, user, todo, body.account)
+    return {"moved": [conv.id for conv in moved], "skipped": skipped, "pending": pending}
+
+
+async def _move_many(
+    request: Request, user: str | None, convs: list[Any], account: str
+) -> tuple[list[Any], list[dict[str, str]], list[dict[str, str]]]:
+    """Switch *convs* a few at a time: ``(moved chats, skipped rows, still-pending rows)``.
+
+    Answers after :data:`MOVE_ALL_CAP_S`; a chat not done by then is listed pending and
+    finishes alone. Chats with no Claude login to move are left out of all three.
+    """
     gate = asyncio.Semaphore(MOVE_ALL_CONCURRENCY)
 
     async def one(conv: Any) -> tuple[str, dict[str, str] | None]:
         async with gate:
-            return await _move_one(request, user, conv, body.account)
+            return await _move_one(request, user, conv, account)
 
-    tasks = {conv.id: asyncio.create_task(one(conv)) for conv in todo}
+    tasks = {conv.id: asyncio.create_task(one(conv)) for conv in convs}
     _background.update(tasks.values())
     for task in tasks.values():
         task.add_done_callback(_background.discard)
     if tasks:
         await asyncio.wait(tasks.values(), timeout=MOVE_ALL_CAP_S)
-    moved: list[str] = []
+    moved: list[Any] = []
     skipped: list[dict[str, str]] = []
     pending: list[dict[str, str]] = []
-    for conv in todo:
+    for conv in convs:
         task = tasks[conv.id]
         if not task.done():
             # Left running (a cancelled switch could strand its label); the chat finishes alone.
@@ -289,10 +409,10 @@ async def move_all_claude_chats(
             continue
         outcome, row = task.result()
         if outcome == "moved":
-            moved.append(conv.id)
+            moved.append(conv)
         elif row is not None:
             skipped.append(row)
-    return {"moved": moved, "skipped": skipped, "pending": pending}
+    return moved, skipped, pending
 
 
 async def _move_one(
@@ -303,6 +423,9 @@ async def _move_one(
     def row(reason: str) -> dict[str, str]:
         return {"id": conv.id, "title": conv.title or conv.id, "reason": reason}
 
+    # Access may have been revoked since the list was built; check fresh, just before the write.
+    if not await _may_write(user, conv.id):
+        return "ignored", None
     try:
         await switch(request, user, conv, account)
     except Refused as refused:

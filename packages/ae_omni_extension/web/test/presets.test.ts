@@ -525,7 +525,7 @@ function suggestion(
     id: "sg_1",
     review_id: "rv_1",
     review_session: "s9",
-    owner: "reid",
+    owner: "owner",
     kind: "own",
     preset_id: "deep",
     preset_title: "Deep debug",
@@ -547,7 +547,7 @@ function suggestion(
 const review = {
   id: "rv_1",
   session: "s9",
-  owner: "reid",
+  owner: "owner",
   at: "2026-10-20T07:30:00Z",
   summary: "",
   count: 3,
@@ -557,7 +557,7 @@ const review = {
 function suggestionContext(
   everyone: PresetSuggestion[],
   actions: Record<string, Reply> = {},
-  own: PresetSuggestion[] = everyone.filter((s) => s.owner === "reid"),
+  own: PresetSuggestion[] = everyone.filter((s) => s.owner === "owner"),
 ) {
   const posted: string[] = [];
   const request = vi.fn(
@@ -838,21 +838,21 @@ describe("suggestions", () => {
       at: "2026-10-06T07:30:00Z",
     };
     const view = visibleSuggestions({
-      reviews: [older, review, { ...review, id: "rv_s", owner: "steve", at: "2026-10-01T00:00:00Z" }],
+      reviews: [older, review, { ...review, id: "rv_s", owner: "member", at: "2026-10-01T00:00:00Z" }],
       suggestions: [
         suggestion({ id: "nc_old", kind: "no_change", review_id: "rv_0", can_apply: false }),
         suggestion({ id: "nc_new", kind: "no_change", review_id: "rv_1", can_apply: false }),
-        // Steve's only review is older than reid's, yet it is his newest.
+        // The member's only review is older than the owner's, yet it is the newest.
         suggestion({
-          id: "nc_steve",
+          id: "nc_member",
           kind: "no_change",
-          owner: "steve",
+          owner: "member",
           review_id: "rv_s",
           can_apply: false,
         }),
       ],
     });
-    expect(view.items.map((s) => s.id)).toEqual(["nc_new", "nc_steve"]);
+    expect(view.items.map((s) => s.id)).toEqual(["nc_new", "nc_member"]);
     expect(view.open).toBe(0);
   });
 
@@ -905,12 +905,12 @@ describe("suggestions", () => {
   it("says For <owner> only on someone else's row, and offers no Apply there", async () => {
     const { context } = suggestionContext([
       suggestion(),
-      suggestion({ id: "sg_2", owner: "steve", can_apply: false }),
+      suggestion({ id: "sg_2", owner: "member", can_apply: false }),
     ]);
     const node = await mount(context);
     const rows = node.querySelectorAll(".presets-suggestion");
     expect(rows[0].textContent).not.toContain("For ");
-    expect(rows[1].textContent).toContain("For steve");
+    expect(rows[1].textContent).toContain("For member");
     expect(labels(rows[1])).toEqual(["Dismiss"]);
   });
 

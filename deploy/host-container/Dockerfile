@@ -17,9 +17,9 @@
 # upstream.lock.
 #
 # Not installed on purpose: packages/ae_omni_policies. Its MCP server (the
-# `ae` tools: park_fork, omni_capacity, ...) files into Reid's task-store and
-# reads Reid's slots; a second user's sessions have no business there, and the
-# scheduled agents that need it run on Reid's host only.
+# `ae` tools: park_fork, omni_capacity, ...) files into the owner's task-store and
+# reads the owner's slots; a second user's sessions have no business there, and the
+# scheduled agents that need it run on the owner's host only.
 ARG BASE=omnigent-ae-host-base:local
 FROM ${BASE}
 
@@ -28,11 +28,18 @@ FROM ${BASE}
 ARG CLAUDE_CODE_VERSION=2.1.304
 # Azure CLI in its own venv, so its dependency set never touches omnigent's.
 ARG AZURE_CLI_VERSION=2.91.0
-# The in-container user. Not 1000 (reid on the box) and not root, so a file
+# The in-container user. Not 1000 (<user> on the box) and not root, so a file
 # that ever did cross the boundary would belong to nobody on the box.
 ARG AGENT_UID=61000
 
 USER root
+
+# jq: register-team-mcp.sh (deploy/host-config-sync.sh) builds its `claude mcp add`
+# commands with it (2026-10-29).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends jq \
+ && rm -rf /var/lib/apt/lists/* \
+ && jq --version
 
 RUN npm install -g --no-audit --no-fund "@anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}" \
  && npm cache clean --force \

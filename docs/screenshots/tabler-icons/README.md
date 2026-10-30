@@ -6,7 +6,7 @@ plus patches P1 to P15) with its web SPA built from the patched tree,
 projects were created through `POST /v1/projects`: three with Tabler icons
 (`tabler:briefcase`, `tabler:chart-bar`, `tabler:rocket`), one with an emoji saved the
 old way (`🔥`) and one with no icon. Playwright Chromium at device scale factor 2,
-1440x900 and 390x844 (the phone at the width of Reid's iPhone, touch on).
+1440x900 and 390x844 (the phone at the width of the owner's iPhone, touch on).
 
 - `*-sidebar.png`: the Projects group. Tabler icons draw in the folder's box and color,
   the emoji project keeps its emoji, and the project without an icon keeps the folder.

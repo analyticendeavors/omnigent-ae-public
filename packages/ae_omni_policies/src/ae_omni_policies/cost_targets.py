@@ -1,7 +1,7 @@
 """Cost targets for the Admin Center's Azure card: a limit you set, a phone alarm when crossed.
 
 Added 2026-10-25. The Azure card shows spend, but only to someone who opens it, and a Fabric
-capacity left running costs $0.72 an hour while nobody looks. Reid sets limits on the card
+capacity left running costs $0.72 an hour while nobody looks. The owner sets limits on the card
 (*Targets*); when spend or a running capacity crosses one, the server files a task-store task with
 an alarm, the way :mod:`.secret_alerts` does for expiring secrets.
 

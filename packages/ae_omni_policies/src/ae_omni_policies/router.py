@@ -32,6 +32,10 @@ preset rows with a newer model in the same family, read only. The preset review 
 suggestion per such row (at most three a review).
 2026-10-24 (Admin Center, Presets card) added ``GET /presets?days=7|30``
 (:mod:`ae_omni_policies.preset_stats`), admins only.
+2026-10-29 (Admin Center, Family cost card) added ``GET /family-cost?days=7|30``
+(:mod:`ae_omni_policies.family_cost`): each session family's spend; admins see all, others
+their own.
+Its ``POST /family-cost/settings`` saves the card's "Show cost as" and "Runaway family".
 2026-10-22 (Admin Center, Azure card) added ``GET /azure-cost``
 (:mod:`ae_omni_policies.azure_cost`).
 2026-10-25 added ``GET /azure-cost/targets``, ``PUT`` and ``DELETE
@@ -81,7 +85,7 @@ and reviews, and a Merge button that is POST-only, JSON-only, origin-checked
 and pinned to the head SHA the card showed.
 
 2026-09-24 added ``GET /your-move`` (:mod:`ae_omni_policies.your_move`): one
-payload of everything waiting on Reid (sessions that need him, lot items due,
+payload of everything waiting on the owner (sessions that need them, lot items due,
 the steward's latest brief, pull requests), each source isolated.
 
 2026-09-24 (plan limits) added ``GET /limits`` and ``POST /limits/{harness}``:
@@ -94,7 +98,7 @@ reading, for the Admin Center's Accounts card (``limits.LimitStore.accounts``).
 
 2026-09-24 (after the first box deploy) added ``POST /lot/{task_id}/session``:
 Resume used to copy the block and open a blank composer, and the copy failed
-silently in the sandboxed frame, so Reid landed on an empty session. The route
+silently in the sandboxed frame, so the owner landed on an empty session. The route
 now creates the session itself, the way the web composer does, and posts the
 block as its first user message.
 
@@ -158,10 +162,10 @@ from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
-from fastapi import APIRouter, Depends, Path, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
 from fastapi.responses import JSONResponse
 from omnigent.entities.conversation import Conversation
-from omnigent.errors import ErrorCode
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
 from omnigent.runtime import get_agent_store, get_conversation_store
 from omnigent.server.auth import RESERVED_USER_LOCAL, resolve_auth_header
@@ -173,6 +177,8 @@ from ae_omni_policies import (
     __version__,
     auto_archive,
     azure_cost,
+    box_health,
+    box_health_cleanup,
     child_wake,
     claude_account,
     cost_targets,
@@ -180,10 +186,12 @@ from ae_omni_policies import (
     deploy_hold,
     escalation,
     fabric,
+    family_cost,
     git_center,
     github,
     host_relink,
     labels,
+    lead_handoff,
     limits,
     merge_watch,
     model_log,
@@ -286,6 +294,7 @@ def _with_refresh_error(answer: dict[str, Any], failed: str | None) -> dict[str,
 CODE_NOT_CONFIGURED = "task_store_not_configured"
 CODE_STORE_UNAVAILABLE = "task_store_unavailable"
 CODE_UNFILED = "task_store_unfiled"
+CODE_ADMIN_UNKNOWN = "admin_unknown"
 CODE_REPLY_NOT_POSTED = "gate_reply_not_posted"
 CODE_RESUME_NO_TARGET = "resume_no_target"
 CODE_RESUME_NOT_CREATED = "resume_session_not_created"
@@ -526,13 +535,23 @@ async def _loopback_post(request: Request, path: str, body: dict[str, Any]) -> h
 async def _admin_only(request: Request, user: str | None, action: str) -> JSONResponse | None:
     """``None`` for an OmniGent admin, else the 403 ``shared_accounts_routes`` answers.
 
-    Admin is ``GET /v1/me`` asked as the caller (``shared_accounts_routes.admin_probe``),
+    Admin is ``GET /v1/me`` asked as the caller (``shared_accounts_routes.admin_state``),
     so a single-user runtime's one user passes and a signed-in non-admin does not.
     Added 2026-10-21 (pre-publication audit A3): merging with the server's GitHub
     token and holding deploys are admin actions once a second account exists.
+    When ``/v1/me`` cannot be asked (2026-10-28) the answer is a retriable 503, so a slow
+    loopback never turns an admin into a refused non-admin.
     """
-    if await shared_accounts_routes.admin_probe(request, user):
+    verdict = await shared_accounts_routes.admin_state(request, user)
+    if verdict is True:
         return None
+    if verdict is None:
+        return _error(
+            503,
+            CODE_ADMIN_UNKNOWN,
+            f"Could not check whether you can {action}: the server's own sign-in check "
+            "did not answer. Retry in a few seconds.",
+        )
     return _error(
         403,
         shared_accounts_routes.CODE_ADMIN_ONLY,
@@ -564,15 +583,34 @@ def _acl_user(user: str | None) -> str | None:
     return None if user is None or user == RESERVED_USER_LOCAL else user
 
 
+async def _own_session_ids(who: str | None) -> set[str] | None:
+    """The ids of the top-level sessions *who* may open; ``None`` on a single-user runtime."""
+    if who is None:
+        return None
+    rows = await asyncio.to_thread(lambda: sessions.list_top_level(accessible_by=who))
+    return {row.id for row in rows}
+
+
 @router.get("/health")
-async def health() -> dict[str, Any]:
-    """Liveness plus whether task-store is configured (not whether it answers)."""
+async def health(request: Request) -> dict[str, Any]:
+    """Liveness plus whether task-store is configured (not whether it answers).
+
+    Open to a caller without an identity, as a liveness check is; the task store's URL
+    is the box owner's, so only a caller known to be an admin sees it (2026-10-28).
+    """
     settings = Settings.from_env()
-    return {
-        "ok": True,
-        "version": __version__,
-        "task_store": {"url": settings.app_url, "configured": settings.configured},
-    }
+    try:
+        who = await require_ae_user(request)
+    except (OmnigentError, HTTPException):
+        return {
+            "ok": True,
+            "version": __version__,
+            "task_store": {"configured": settings.configured},
+        }
+    task_store: dict[str, Any] = {"configured": settings.configured}
+    if await shared_accounts_routes.is_admin(request, who):
+        task_store["url"] = settings.app_url
+    return {"ok": True, "version": __version__, "task_store": task_store}
 
 
 @router.get("/schedule-defaults")
@@ -604,8 +642,11 @@ async def capacity(
     holds a slot, 2026-09-25). ``unlabelled_running`` catches sessions the slot
     cap has not placed yet.
     """
-    rows, rules = await asyncio.gather(
-        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.resolve)
+    who = _acl_user(user)
+    rows, rules, mine = await asyncio.gather(
+        asyncio.to_thread(sessions.list_top_level),
+        asyncio.to_thread(slot_limit.resolve),
+        _own_session_ids(who),
     )
     limit, helpers = rules.limit, rules.helpers_count
     by_id = {row.id: row for row in rows}
@@ -642,13 +683,24 @@ async def capacity(
             by_status[item.status].append(item.as_dict())
         elif item.status is None and item.live_status == "running":
             by_status["unlabelled_running"].append(item.as_dict())
+    # The counts above are the box's; the rows are the caller's (2026-10-28): a title and a
+    # NEXT line say what someone is working on, which another user must not read.
+    slots_used = sum(1 for row in by_status["working"] if helpers or not row["helper"])
+    others_working = 0
+    if mine is not None:
+        others_working = sum(1 for row in by_status["working"] if row["id"] not in mine)
+        by_status = {
+            name: [row for row in rows_ if row["id"] in mine] for name, rows_ in by_status.items()
+        }
     return {
         "limit": limit,
         "helpers_count": helpers,
         "own_helper": own_helper,
+        # Working sessions of other users: in slots_used, never listed (2026-10-28).
+        "others_working": others_working,
         # One slot per lead (2026-10-23): its helpers hold none, unless Settings counts
         # them (2026-10-26); a helper whose lead is not working holds nothing when off.
-        "slots_used": sum(1 for row in by_status["working"] if helpers or not row["helper"]),
+        "slots_used": slots_used,
         "now": local_now.isoformat(timespec="seconds"),
         "today": local_now.date().isoformat(),
         "timezone": settings.tz,
@@ -657,25 +709,43 @@ async def capacity(
 
 
 @router.get("/release")
-async def release_view() -> dict[str, Any]:
+async def release_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any]:
     """The release the box runs, the newest tagged, and the sessions a deploy waits on.
 
-    For the Session Dashboard's release row (``release.py``, 2026-10-17).
+    For the Session Dashboard's release row (``release.py``, 2026-10-17). A non-admin
+    reads the same row with ``env_missing`` emptied (2026-10-28): the names of server
+    settings are the admin's.
     """
-    return await release.status()
+    answer = await release.status()
+    if await shared_accounts_routes.is_admin(request, user):
+        return answer
+    return {**answer, "env_missing": []}
 
 
 @router.get("/prs/{owner}/{repo}/{number}/deploy", response_model=None)
 async def pull_request_deploy(
-    owner: str, repo: str, number: Annotated[int, Path(ge=1)]
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    owner: str,
+    repo: str,
+    number: Annotated[int, Path(ge=1)],
+    session_id: Annotated[str | None, Query(max_length=120)] = None,
 ) -> dict[str, Any] | JSONResponse:
     """Whether the running release contains a merged pull request (``pr_deploy.py``).
 
     For the chat's action dock and merged row (2026-10-20). GitHub off or
     failing answers ``state: unknown`` with the reason in ``error``, not an error.
+    A non-admin is answered only for a pull request their sessions track
+    (:func:`_untracked_pull`, 2026-10-28): it reads with the server's token.
     """
     if (bad := _bad_repo(owner, repo)) is not None:
         return bad
+    if (
+        refused := await _untracked_pull(request, user, owner, repo, number, session_id)
+    ) is not None:
+        return refused
     return await pr_deploy.status(f"{owner}/{repo}", number)
 
 
@@ -784,21 +854,22 @@ def _host_reading() -> tuple[host_relink.Status | None, host_relink.Request | No
     return status, asked, "; ".join(problems) or None
 
 
-@router.get("/host")
+@router.get("/host", response_model=None)
 async def host_view(
     request: Request, user: Annotated[str | None, Depends(require_ae_user)]
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """The box host's connection and the reconnect helper's last report (``host_relink.py``).
 
-    ``can_act`` says whether the caller may ask for a reconnect link (2026-10-22).
+    Admin only (2026-10-28): it is the box's sign-in state, which only an admin can act
+    on. ``can_act`` is therefore true on every 200 (kept for the card, 2026-10-22).
     """
-    (host, host_error), can_act = await asyncio.gather(
-        _box_host(request), shared_accounts_routes.admin_probe(request, user)
-    )
+    if (refused := await _admin_only(request, user, "see the box host")) is not None:
+        return refused
+    host, host_error = await _box_host(request)
     status, asked, read_error = await asyncio.to_thread(_host_reading)
     error = "; ".join(item for item in (host_error, read_error) if item) or None
     answer = host_relink.view(host, status, asked, error=error).model_dump()
-    return {**answer, "can_act": can_act}
+    return {**answer, "can_act": True}
 
 
 @router.post(
@@ -848,9 +919,16 @@ async def host_relink_request(
     return {**answer, "can_act": True}
 
 
-@router.get("/secrets")
-async def secrets_view(_user: Annotated[str | None, Depends(require_ae_user)]) -> dict[str, Any]:
-    """Each server secret by name with whether the server has it (``secrets_health.py``)."""
+@router.get("/secrets", response_model=None)
+async def secrets_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Each server secret by name with whether the server has it (``secrets_health.py``).
+
+    Admin only (2026-10-28): the names say which services the box uses.
+    """
+    if (refused := await _admin_only(request, user, "see the server's secrets")) is not None:
+        return refused
     return secrets_health.view().model_dump()
 
 
@@ -889,6 +967,218 @@ async def secrets_meta_post(
         )
     _start_alerts()
     return {"kept": kept}
+
+
+async def _box_admin(request: Request, user: str | None) -> bool:
+    """Whether the caller may read the box monitor: an OmniGent admin, or named in
+    ``AE_BOX_ADMINS`` (sign-in logins, compared in lower case)."""
+    return await shared_accounts_routes.is_admin(request, user) or box_health.is_box_admin(user)
+
+
+@router.get("/access")
+async def access_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, bool]:
+    """What the caller may see of the Admin Center (2026-10-28). Never lists other admins."""
+    admin = await shared_accounts_routes.is_admin(request, user)
+    return {"admin": admin, "box_admin": admin or box_health.is_box_admin(user)}
+
+
+@router.get("/box-health", response_model=None)
+async def box_health_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """The box monitor: heat, CPU, memory, storage and bloat, for box admins.
+
+    The relay (``box_health_relay.py``) posts every five minutes; this is the colours
+    and Needs-you lines worked out from its newest reading. It carries no folder,
+    project, session or file names (``box_health.py`` says why).
+    """
+    if not await _box_admin(request, user):
+        return _error(
+            403,
+            shared_accounts_routes.CODE_ADMIN_ONLY,
+            "Only a box admin can see the box health; ask an admin to add your login "
+            "to AE_BOX_ADMINS.",
+        )
+    stored = await asyncio.to_thread(box_health.store().read)
+    now = datetime.now(UTC)
+    record = await asyncio.to_thread(box_health_cleanup.store().read)
+    shown = box_health_cleanup.decorate(
+        box_health.view(stored, now, box_health.config()),
+        stored,
+        record,
+        now,
+        show_login=await shared_accounts_routes.is_admin(request, user),
+    )
+    return shown.model_dump(mode="json")
+
+
+@router.post(
+    "/box-health",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def box_health_post(
+    request: Request,
+    body: box_health.BoxHealthPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Keep the box's newest reading and add it to the day of history.
+
+    OmniGent admin only, like ``/limits``: the box's relay posts with the admin's
+    stored login. A box admin may read the monitor but not write to it.
+    """
+    if (refused := await _admin_only(request, user, "record box health")) is not None:
+        return refused
+    if not box_health_cleanup.labels_allowed(body):
+        return _error(
+            422,
+            box_health_cleanup.CODE_LABEL,
+            "The reading names a user label that is not in AE_BOX_USER_LABELS; fix the box's "
+            "AE_BOX_USERS or add the label to the server's list.",
+        )
+    try:
+        samples = await asyncio.to_thread(box_health.store().put, body)
+    except OSError as exc:
+        _logger.warning("box health not saved: %s", exc)
+        return _error(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"could not save the box reading ({exc.strerror}); check that /data is writable, "
+            "then rerun the relay.",
+        )
+    answer: dict[str, Any] = {"kept": True, "samples": samples}
+    taken = await asyncio.to_thread(box_health_cleanup.store().take, datetime.now(UTC))
+    if taken is not None:
+        answer["cleanup"] = {
+            "id": taken.id,
+            "action": taken.action,
+            "owner": taken.owner,
+            "count": taken.count,
+        }
+    return answer
+
+
+class CleanupBody(BaseModel):
+    action: str
+    owner: str
+    count: int
+
+
+class CleanupCancelBody(BaseModel):
+    pass
+
+
+@router.post(
+    "/box-health/cleanup",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def box_health_cleanup_request(
+    request: Request,
+    body: CleanupBody,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Queue one cleanup for the box's relay to run within five minutes (box admins)."""
+    if not await _box_admin(request, user):
+        return _error(
+            403, shared_accounts_routes.CODE_ADMIN_ONLY, "Only a box admin can run a cleanup."
+        )
+    if body.action not in box_health_cleanup.NAMES:
+        return _error(400, ErrorCode.INVALID_INPUT, "That is not a cleanup this box offers.")
+    now = datetime.now(UTC)
+    stored = await asyncio.to_thread(box_health.store().read)
+    view = box_health.view(stored, now, box_health.config())
+    if view.state != "ok":
+        return _error(
+            409,
+            box_health_cleanup.CODE_STALE,
+            "The box has not posted a fresh reading, so it would not take a cleanup. "
+            "Check that its timer is running, then try again.",
+        )
+    offer = box_health_cleanup.find_offer(stored, body.action, body.owner)
+    if offer is None or offer.count != body.count:
+        return _error(
+            409,
+            box_health_cleanup.CODE_CHANGED,
+            "The numbers changed since you opened the confirm. Check the new numbers and "
+            "try again.",
+        )
+    try:
+        record = await asyncio.to_thread(
+            box_health_cleanup.store().request,
+            action=offer.action,
+            owner=offer.owner,
+            offer=offer,
+            by=user or "unknown",
+            now=now,
+        )
+    except OSError as exc:
+        _logger.warning("box health cleanup not saved: %s", exc)
+        return _error(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"could not save the cleanup request ({exc.strerror}); check that /data is writable.",
+        )
+    if record is None:
+        return _error(
+            409,
+            box_health_cleanup.CODE_BUSY,
+            "Another cleanup is already queued or running. Wait for it to finish.",
+        )
+    box_health_cleanup.audit(user or "unknown", offer.action, offer.owner, offer.count)
+    return {"queued": True, "id": record.id}
+
+
+@router.post(
+    "/box-health/cleanup/cancel",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def box_health_cleanup_cancel(
+    request: Request,
+    _body: CleanupCancelBody,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Withdraw a cleanup the box has not taken yet (box admins)."""
+    if not await _box_admin(request, user):
+        return _error(
+            403, shared_accounts_routes.CODE_ADMIN_ONLY, "Only a box admin can cancel a cleanup."
+        )
+    outcome = await asyncio.to_thread(box_health_cleanup.store().cancel, datetime.now(UTC))
+    if outcome == "taken":
+        return _error(
+            409,
+            box_health_cleanup.CODE_BUSY,
+            "The box has already taken it; it cannot be cancelled.",
+        )
+    if outcome == "none":
+        return _error(404, ErrorCode.NOT_FOUND, "There is no queued cleanup to cancel.")
+    return {"cancelled": True}
+
+
+@router.post(
+    "/box-health/cleanup/result",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def box_health_cleanup_result(
+    request: Request,
+    body: box_health_cleanup.Result,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The relay's report of a cleanup it ran (OmniGent admin, like the relay's post)."""
+    if (refused := await _admin_only(request, user, "record a box cleanup")) is not None:
+        return refused
+    kept = await asyncio.to_thread(box_health_cleanup.store().finish, body, datetime.now(UTC))
+    if not kept:
+        return _error(
+            409,
+            box_health_cleanup.CODE_CHANGED,
+            "That result is for a request that is not pending.",
+        )
+    return {"kept": True}
 
 
 # A task created with asyncio.create_task is only weakly held; keep it until done.
@@ -1101,6 +1391,13 @@ async def limits_view(
     login alone, which the Usage card's subscription switcher asks for: the
     host reading for the default login, else the login's newest stored reading,
     else empty with a note. A login the host does not list gets empty windows and a note naming it.
+
+    A signed-in non-admin (2026-10-28) is answered by :func:`limits.member_view`:
+    the box host's logins and sessions are the admin's own, so only the Claude
+    entry of a ``shared:`` account, or of a session the relay posted that the
+    caller may open, keeps its readings; Codex is ``null``; ``contexts`` and
+    ``sessions`` hold at most that one session. A single-user runtime's one user
+    is an admin, so nothing changes there.
     """
     named: str | None = limits.UNSET
     live: str | None = limits.UNSET
@@ -1123,9 +1420,15 @@ async def limits_view(
             age = time.time() - conv.created_at
             if 0 <= age <= LIMITS_HINT_WINDOW_S:
                 named = account or None
-    return await asyncio.to_thread(
+    answer = await asyncio.to_thread(
         limits.store().view, session_id=session_id, account=named, trusted=trusted, live=live
     )
+    if await shared_accounts_routes.is_admin(request, user):
+        return answer
+    relayed = session_id is not None and await asyncio.to_thread(
+        limits.store().has_session_entry, session_id
+    )
+    return limits.member_view(answer, session_id=session_id, relayed=relayed)
 
 
 async def _session_for_limits(session_id: str) -> Conversation | None:
@@ -1173,7 +1476,7 @@ def _accounts_view() -> dict[str, Any]:
 
 @router.get("/limits/accounts")
 async def limits_accounts(
-    _user: Annotated[str | None, Depends(require_ae_user)],
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
 ) -> dict[str, Any]:
     """Every signed-in account's newest 5-hour and weekly reading, Claude then Codex.
 
@@ -1184,8 +1487,20 @@ async def limits_accounts(
     since this server runs apart from it) and the shared ones from the
     server's own store, so an account with no reading yet still has a row
     with ``observed_at`` null. Codex has a row once its login has answered.
+
+    A non-admin (2026-10-28) gets only the Claude ``shared:`` rows: every other
+    login belongs to the box host's owner. That keeps the web switcher working.
     """
-    return await asyncio.to_thread(_accounts_view)
+    answer = await asyncio.to_thread(_accounts_view)
+    if await shared_accounts_routes.is_admin(request, user):
+        return answer
+    rows = [
+        row
+        for row in answer["accounts"]
+        if row["harness"] == "claude"
+        and str(row["account"] or "").startswith(limits.SHARED_PREFIX)
+    ]
+    return {**answer, "accounts": rows}
 
 
 async def _may_open_session(request: Request, user: str | None, session_id: str) -> bool:
@@ -1453,7 +1768,7 @@ async def _reviewer_caller(
         who == owner
         and insights is not None
         and insights.scope == "all"
-        and await shared_accounts_routes.admin_probe(request, user)
+        and await shared_accounts_routes.is_admin(request, user)
     )
     return owner, admin
 
@@ -1743,9 +2058,7 @@ async def dismiss_preset_suggestion(
     store = preset_suggestions.store()
     try:
         record = await asyncio.to_thread(store.get, suggestion_id)
-        admin = record.get("owner") != who and await shared_accounts_routes.admin_probe(
-            request, user
-        )
+        admin = record.get("owner") != who and await shared_accounts_routes.is_admin(request, user)
         record = await asyncio.to_thread(store.dismiss, who, suggestion_id, bool(admin))
     except preset_suggestions.SuggestionError as exc:
         return _suggestion_failure(exc)
@@ -2067,21 +2380,26 @@ async def preset_review_status(
 
 @router.get("/your-move")
 async def your_move_view(
+    request: Request,
     user: Annotated[str | None, Depends(require_ae_user)],
     fresh: Annotated[bool, Query()] = False,
 ) -> dict[str, Any]:
-    """Everything waiting on Reid right now; see :mod:`ae_omni_policies.your_move`.
+    """Everything waiting on the owner right now; see :mod:`ae_omni_policies.your_move`.
 
     Always a 200: a source that fails carries its own ``ok: false`` and error,
     so the page renders the rest. ``fresh=true`` skips the few-second cache.
     Sessions are those the caller may open, the steward brief the caller's own
-    (2026-10-21, audit A2).
+    (2026-10-21, audit A2). A non-admin gets no due lot items and no pull requests
+    (2026-10-28): both come from the server's own task-store and GitHub credentials.
     """
-    return await your_move.build(fresh=fresh, user=_acl_user(user))
+    admin = await shared_accounts_routes.admin_state(request, user)
+    return await your_move.build(fresh=fresh, user=_acl_user(user), admin=admin)
 
 
 @router.get("/lot", response_model=None)
 async def lot(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
     status: Annotated[TaskStatus, Query()] = "open",
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
 ) -> dict[str, Any] | JSONResponse:
@@ -2089,7 +2407,12 @@ async def lot(
 
     Stale-while-revalidate for :data:`LOT_TTL_S` (2026-09-26); ``refresh_error``
     is set while a background read is failing and the held lot is served.
+
+    Admin only, with every ``/lot`` route (2026-10-28): the task store is the box
+    owner's own, readable and writable by any signed-in user before.
     """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     settings = Settings.from_env()
     if not settings.configured:
         return _not_configured(settings)
@@ -2107,13 +2430,17 @@ async def lot(
 
 
 @router.post("/lot/park", response_model=None)
-async def park(body: ParkRequest) -> dict[str, Any] | JSONResponse:
+async def park(
+    body: ParkRequest, request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
     """File a parked fork; optionally mark the session parked and point it at the task.
 
     The session is checked before anything is filed, so a wrong id costs a 404
     and not a task nobody asked for. Order after that is the worker's: task,
-    stamp, issue link.
+    stamp, issue link. Admin only (2026-10-28).
     """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     settings = Settings.from_env()
     if not settings.configured:
         return _not_configured(settings)
@@ -2141,14 +2468,18 @@ async def park(body: ParkRequest) -> dict[str, Any] | JSONResponse:
 
 @router.get("/lot/tags", response_model=None)
 async def lot_tags(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
     icons: Annotated[bool, Query()] = False,
 ) -> dict[str, Any] | JSONResponse:
     """The tag vocabulary as the worker's ``list_tags`` returns it, busiest first.
 
     Each row carries the tag's ``color`` and ``icon`` from the app; ``icons=true``
     adds the icons' path data, which the Dashboard's lot cards paint (issue 28).
-    Stale-while-revalidate like ``/lot`` (2026-09-26).
+    Stale-while-revalidate like ``/lot`` (2026-09-26). Admin only (2026-10-28).
     """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     settings = Settings.from_env()
     if not settings.configured:
         return _not_configured(settings)
@@ -2165,14 +2496,21 @@ async def lot_tags(
 
 
 @router.post("/lot/{task_id}/link", response_model=None)
-async def lot_link(task_id: str, body: LinkRequest) -> dict[str, Any] | JSONResponse:
+async def lot_link(
+    task_id: str,
+    body: LinkRequest,
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
     """Attach a URL to a parked task: the worker's ``link_issue``.
 
     The outcome is the worker's, ``linked`` or ``not_linked`` with the
     instruction to hand the URL over inline; a store that refuses the link
     is a 200 with ``not_linked``, not a 502, because the task and the issue
-    both exist and the caller still has a report to write.
+    both exist and the caller still has a report to write. Admin only (2026-10-28).
     """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     settings = Settings.from_env()
     if not settings.configured:
         return _not_configured(settings)
@@ -2189,15 +2527,22 @@ ISSUE_FALLBACK = "The issue closes on the next task-store GitHub sync, within 15
 
 
 @router.post("/lot/{task_id}/complete", response_model=None)
-async def lot_complete(task_id: str, body: CompleteRequest) -> dict[str, Any] | JSONResponse:
+async def lot_complete(
+    task_id: str,
+    body: CompleteRequest,
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
     """Finish a parked task: mark it done (or dropped), then close its linked issue.
 
     Why (2026-09-28): the resumed session used to rely on ``Closes <issue>``
     in its pull request, which GitHub only honours on a merge into the default
     branch; a merge into ``dev`` left both open. The task moves first because
     it is the system of record; a failed issue close is an outcome with the
-    sync as its fallback, not an error.
+    sync as its fallback, not an error. Admin only (2026-10-28).
     """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     settings = Settings.from_env()
     if not settings.configured:
         return _not_configured(settings)
@@ -2271,8 +2616,15 @@ def first_message(resumed: dict[str, Any]) -> str:
 
 
 @router.post("/lot/{task_id}/resume", response_model=None)
-async def resume(task_id: str) -> dict[str, Any] | JSONResponse:
-    """The task's fenced "Resume in Claude" block, to paste into a new session. Reads only."""
+async def resume(
+    task_id: str, request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """The task's fenced "Resume in Claude" block, to paste into a new session. Reads only.
+
+    Admin only (2026-10-28).
+    """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     return await _resume_block(task_id)
 
 
@@ -2385,7 +2737,9 @@ def _message(text: str) -> dict[str, Any]:
 
 
 @router.post("/lot/{task_id}/session", response_model=None)
-async def resume_session(request: Request, task_id: str) -> dict[str, Any] | JSONResponse:
+async def resume_session(
+    request: Request, task_id: str, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
     """Start a session for a parked task, with its Resume in Claude block as the first message.
 
     The message ends by asking the session to call ``complete_task`` with the
@@ -2396,8 +2750,10 @@ async def resume_session(request: Request, task_id: str) -> dict[str, Any] | JSO
     labels and ``ae.task``), then the block as a user message on
     ``POST /v1/sessions/{id}/events``. Every failure answers with the block
     (``block``, ``fenced``) in the error body so the page can show it for a
-    hand paste; a failure after the create also carries ``session_id``.
+    hand paste; a failure after the create also carries ``session_id``. Admin only (2026-10-28).
     """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
     resumed = await _resume_block(task_id)
     if isinstance(resumed, JSONResponse):
         return resumed
@@ -2552,7 +2908,7 @@ class SessionRequest(BaseModel):
     # "ultra" only for a Codex session; create_session rejects it for any other harness.
     effort: Literal["low", "medium", "high", "xhigh", "max", "ultra"] | None = None
     preset: str | None = Field(default=None, pattern=r"^[a-z0-9][a-z0-9-]{0,39}$")
-    # A chat of its own for Reid (a handoff, 2026-10-25): no family, its own slot, role
+    # A chat of its own for the owner (a handoff, 2026-10-25): no family, its own slot, role
     # ``lead`` on ``preset``; ``orchestrator`` is then only the opener.
     standalone: bool = False
 
@@ -3025,20 +3381,28 @@ async def model_changes(
 
 
 @router.get("/sessions")
-async def orchestrated_sessions() -> dict[str, Any]:
+async def orchestrated_sessions(
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any]:
     """Every live top-level session the orchestrator started, with repo, branch and key.
 
     What the orchestrator reads on each check-in to find the session that owns a
     pull request (by ``ae.repo`` and ``ae.branch``) and the ones to close out.
+    Only the sessions the caller may open (2026-10-28); ``slots_used`` is still the box's.
     """
-    rows, rules = await asyncio.gather(
-        asyncio.to_thread(sessions.list_top_level), asyncio.to_thread(slot_limit.resolve)
+    who = _acl_user(user)
+    rows, rules, mine = await asyncio.gather(
+        asyncio.to_thread(sessions.list_top_level),
+        asyncio.to_thread(slot_limit.resolve),
+        _own_session_ids(who),
     )
     limit, helpers = rules.limit, rules.helpers_count
     now = time.time()
     items = []
     for conv in rows:
         if labels.label(conv.labels, labels.ORCH) is None:
+            continue
+        if mine is not None and conv.id not in mine:
             continue
         summary = sessions.summarize(conv, now=now).as_dict()
         items.append(
@@ -3057,6 +3421,9 @@ async def orchestrated_sessions() -> dict[str, Any]:
         "limit": limit,
         "slots_used": sessions.slots_held(
             working, helpers_count=helpers, by_id={row.id: row for row in rows}
+        ),
+        "others_working": (
+            0 if mine is None else sum(1 for conv in working if conv.id not in mine)
         ),
         "items": items,
     }
@@ -3083,7 +3450,7 @@ async def start_session(
       it is (``existing: true``) and nothing is posted.
     - The slots: the same count the slot cap makes (blocked and failed sessions
       hold none), taken under its lock. Full answers 409 with who holds them,
-      unless ``ride_unparked``, which Reid chooses; the session then carries
+      unless ``ride_unparked``, which the owner chooses; the session then carries
       ``ae.overflow=1``. The session is created already ``working``, so the
       slot cap passes its first prompt without counting it twice.
     - The family (2026-10-23): a session started by ``orchestrator`` joins its
@@ -3096,9 +3463,30 @@ async def start_session(
       opened it, and resolves its role (``lead`` when none is given) from the
       preset it opens on rather than the opener's.
     """
+    return await _start_session(request, body, user)
+
+
+async def _start_session(
+    request: Request,
+    body: SessionRequest,
+    user: str | None,
+    *,
+    handoff_from: str | None = None,
+) -> dict[str, Any] | JSONResponse:
+    """:func:`start_session`'s work.
+
+    :param handoff_from: The lead this session takes over from (lead handoff, 2026-10-29). Its
+        family (the lead and the sessions it started) is left out of the slot count, because the
+        handoff frees those slots in the same step, and the new session starts on its Claude login
+        before the brief is posted.
+    """
     rows = await asyncio.to_thread(sessions.list_top_level)
+    # The rows count the box's slots; only the caller's own are looked up or listed
+    # (2026-10-28): a guessed key must not return another user's session.
+    mine = await _own_session_ids(_acl_user(user))
+    visible = rows if mine is None else [row for row in rows if row.id in mine]
     key = _session_key(body)
-    live = _live_session(rows, labels.ORCH_KEY, key)
+    live = _live_session(visible, labels.ORCH_KEY, key)
     if live is not None:
         return _existing(live) | {"key": key}
     parent = labels.orch_parent({labels.ORCH: body.orchestrator} if body.orchestrator else None)
@@ -3149,6 +3537,12 @@ async def start_session(
         spawn.effort = "max"
     body = body.model_copy(update={"harness": spawn.harness})
     family = _family_of_parent(rows, parent)
+    if handoff_from is not None:
+        rows = [
+            row
+            for row in rows
+            if row.id != handoff_from and labels.orch_parent(row.labels) != handoff_from
+        ]
     hold = f"orch:{key}"
     rules = await asyncio.to_thread(slot_limit.resolve)
     cap = rules.family_children if family is not None else 0
@@ -3171,16 +3565,29 @@ async def start_session(
             f"Nothing was started: {len(exc.children)} of this family's sessions are already "
             f"working, the most one lead may run at once ({exc.cap}). Wait for one to finish "
             "or set it to review, then start this one.",
-            working=[sessions.summarize(conv, now=now).as_dict() for conv in exc.children],
+            working=[
+                sessions.summarize(conv, now=now).as_dict()
+                for conv in exc.children
+                if mine is None or conv.id in mine
+            ],
             limit=exc.cap,
         )
     if not held:
         now = time.time()
+        shown = [conv for conv in working if mine is None or conv.id in mine]
+        others = len(working) - len(shown)
+        holders = sessions.held_keys(
+            working, helpers_count=helpers, by_id={row.id: row for row in rows}
+        )
+        # The card names slots, so "another user's" counts their slot holders only.
+        others_held = len([conv for conv in working if conv.id in holders]) - len(
+            [conv for conv in shown if conv.id in holders]
+        )
         return _error(
             409,
             CODE_SLOTS_FULL,
             slot_cap.reason_text(
-                [sessions.summarize(conv, now=now) for conv in working],
+                [sessions.summarize(conv, now=now) for conv in shown if conv.id in holders],
                 limit,
                 "block",
                 None,
@@ -3188,13 +3595,22 @@ async def start_session(
                 used=sessions.slots_held(
                     working, helpers_count=helpers, by_id={row.id: row for row in rows}
                 ),
+                others=others_held,
             ),
-            working=[sessions.summarize(conv, now=now).as_dict() for conv in working],
+            working=[sessions.summarize(conv, now=now).as_dict() for conv in shown],
+            others_working=others,
             limit=limit,
         )
     try:
         return await _create_briefed(
-            request, body, key, overflow=full, parent=parent, spawn=spawn, user=user
+            request,
+            body,
+            key,
+            overflow=full,
+            parent=parent,
+            spawn=spawn,
+            user=user,
+            account_from=handoff_from,
         )
     finally:
         slot_cap.release(hold)
@@ -3218,6 +3634,7 @@ async def _create_briefed(
     parent: str | None,
     spawn: spawn_role.Spawn,
     user: str | None = None,
+    account_from: str | None = None,
 ) -> dict[str, Any] | JSONResponse:
     try:
         agent = await _resume_agent(request, HARNESS_AGENTS[body.harness])
@@ -3271,6 +3688,9 @@ async def _create_briefed(
             CODE_SESSION_NOT_CREATED,
             f"creating the session failed: {created.status_code} {created.text[:200]}",
         )
+    inherited = await _inherit_lead_account(
+        request, user, account_from or parent, session_id, body.harness
+    )
     try:
         posted = await _loopback(
             request, "POST", f"/v1/sessions/{session_id}/events", _message(body.brief)
@@ -3301,21 +3721,375 @@ async def _create_briefed(
         "workspace": workspace,
         "overflow": overflow,
         "labels": session_labels,
+        **inherited,
     }
+
+
+async def _inherit_lead_account(
+    request: Request, user: str | None, parent: str | None, session_id: str, harness: str
+) -> dict[str, Any]:
+    """Start a new Claude child on its lead's current login (2026-10-28).
+
+    Only a child (``parent`` set; a standalone chat has none) of a lead that is pinned
+    to a login (``""``, the host default, counts as pinned). The move goes through
+    :func:`claude_account.switch` on the new child, because ``POST /v1/sessions``
+    refuses the account label. A refusal does not stop the brief: the answer carries
+    ``claude_account`` (the login the child really got, ``None`` if unset) and
+    ``claude_account_note`` saying why. Nothing is added when there is nothing to inherit.
+    """
+    from ae_omni_policies import claude_account
+
+    if parent is None or harness != "claude":
+        return {}
+    try:
+        lead = await _conversation(parent)
+        account = claude_account.current_account(lead.labels if lead else None)
+        if account is None:
+            return {}
+        child = await _conversation(session_id)
+        if child is None:
+            return {}
+        await claude_account.switch(request, user, child, account)
+    except (claude_account.Refused, OmnigentError) as exc:
+        return {
+            "claude_account": await _child_account(session_id),
+            "claude_account_note": f"The new chat is not on its lead's login: {exc}",
+        }
+    except Exception:  # noqa: BLE001 (the brief must still be posted)
+        _logger.warning("create_session: could not move %s to its lead's login", session_id)
+        return {
+            "claude_account": await _child_account(session_id),
+            "claude_account_note": "The new chat is not on its lead's login: the switch failed.",
+        }
+    return {"claude_account": account}
+
+
+async def _child_account(session_id: str) -> str | None:
+    try:
+        child = await _conversation(session_id)
+    except Exception:  # noqa: BLE001 (best effort for a note)
+        return None
+    from ae_omni_policies import claude_account
+
+    return claude_account.current_account(child.labels if child else None)
+
+
+# ── lead handoff (2026-10-29, lead_handoff.py) ───────────────────────────
+
+CODE_HANDOFF_REFUSED = "handoff_refused"
+CODE_HANDOFF_NOT_COMMITTED = "handoff_not_committed"
+_EFFORTS = ("low", "medium", "high", "xhigh", "max")
+_PRESET_ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
+
+
+class HandoffPost(BaseModel):
+    """``POST /v1/ae/sessions/{id}/handoff``: the packet the new lead starts from."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    packet: str = Field(min_length=1, max_length=lead_handoff.PACKET_MAX)
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+
+
+def _handoff_request(old: Conversation, body: HandoffPost) -> SessionRequest:
+    """The create for the new lead: the old lead's host, workspace, model, effort and preset."""
+    held = old.labels or {}
+    preset = labels.label(held, labels.PRESET)
+    repo = labels.label(held, labels.REPO)
+    effort = old.reasoning_effort
+    model = lead_handoff.strip_long_context(old.model_override or old.reported_model)
+    return SessionRequest(
+        title=body.title or old.title or "Lead",
+        brief=body.packet,
+        harness="claude",
+        workspace=old.workspace,
+        host=old.host_id,
+        key=f"handoff:{old.id}",
+        repo=repo if repo and len(repo) >= 3 else None,
+        branch=labels.label(held, labels.BRANCH),
+        role="lead",
+        model=model,
+        effort=effort if effort in _EFFORTS else None,
+        preset=preset if preset and _PRESET_ID.match(preset) else None,
+        standalone=True,
+    )
+
+
+@router.post(
+    "/sessions/{session_id}/handoff",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def hand_off_session(
+    request: Request,
+    session_id: Annotated[str, Path(max_length=120)],
+    body: HandoffPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Move a lead's family to a fresh lead that starts from *body.packet*.
+
+    The order is the point (plan of 2026-10-29): (a) the new lead is created, on the same host,
+    workspace, model (a ``[1m]`` suffix dropped), effort, preset and Claude login, under the key
+    ``handoff:<old id>``; (b) ``ae.handoff_to`` is written on the old lead, the commit point;
+    (c) the children's ``ae.orch``, the scheduled tasks that name the old lead and the old
+    lead's status follow, each step idempotent (:func:`lead_handoff.finish`). A create that
+    fails changes nothing. A repeat call on a lead that carries ``ae.handoff_to`` resumes (c) and
+    returns the same new lead. The whole thing runs under one lock per lead, so the button and
+    the tool at once start one new lead. The caller must own the old lead and every child.
+    """
+    old = await _conversation(session_id)
+    if old is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(
+            403, ErrorCode.FORBIDDEN, f"only the owner can hand off session {session_id}"
+        )
+    async with lead_handoff.lead_lock(session_id):
+        old = await _conversation(session_id)  # read again: a call that held the lock may be done
+        if old is None:
+            return _not_found(f"no session {session_id}")
+        target = lead_handoff.handoff_target(old)
+        resumed = target is not None
+        if resumed and labels.label(old.labels, labels.HANDOFF_DONE):
+            return {
+                "ok": True,
+                "session_id": target,
+                "old_session_id": session_id,
+                "existing": True,
+                "path": f"/c/{target}",
+                "done": True,
+            }
+        rows = await asyncio.to_thread(sessions.list_top_level)
+        for child in lead_handoff.children_of(rows, session_id):
+            if not await _may_write_session(user, child.id):
+                return _error(
+                    403,
+                    ErrorCode.FORBIDDEN,
+                    f"only the owner can hand off session {session_id}: it does not own "
+                    f"its child {child.id}",
+                )
+
+        async def same_owner(other: str) -> bool | None:
+            who = _acl_user(user)
+            if who is None:
+                return True
+            if _permission_store() is None:
+                return None  # no store to ask: unknown, never "not yours"
+            try:
+                return await asyncio.to_thread(_owns_session, who, other)
+            except Exception:  # noqa: BLE001 (cannot tell: unknown, never "not yours")
+                return None
+
+        verdict = (
+            await lead_handoff.target_ok(_conversation, same_owner, target)
+            if target is not None
+            else lead_handoff.TARGET_OK
+        )
+        if verdict == lead_handoff.TARGET_UNKNOWN:
+            return _error(
+                503,
+                CODE_HANDOFF_REFUSED,
+                f"could not tell whether the new lead {target} is still live (a lookup "
+                "failed). Nothing was changed; call hand_off again in a minute.",
+            )
+        if verdict == lead_handoff.TARGET_GONE:
+            async with _loopback_client(request) as http:
+                undone = await lead_handoff.clear_commit(
+                    get_conversation_store(), http, session_id, target
+                )
+            if undone.problems:
+                return _error(
+                    502,
+                    CODE_HANDOFF_REFUSED,
+                    f"the new lead {target} is gone, archived or not yours, and putting the "
+                    f"family back on this chat did not finish: {'; '.join(undone.problems)}. "
+                    "Call hand_off again to retry.",
+                )
+            return _error(
+                409,
+                CODE_HANDOFF_REFUSED,
+                f"the new lead {target} is gone, archived or not yours. The children, tasks and "
+                "status were put back and the handoff mark was cleared; call hand_off again to "
+                "start a fresh lead.",
+            )
+        started: dict[str, Any] = {}
+        if target is None:
+            refused = _handoff_refusal(old)
+            if refused is not None:
+                return refused
+            result = await _start_session(
+                request, _handoff_request(old, body), user, handoff_from=session_id
+            )
+            if isinstance(result, JSONResponse):
+                return result
+            started = result
+            target = str(result["session_id"])
+            # A retry after a failed brief finds the new lead by its key: post the packet now,
+            # and never commit while the brief is unconfirmed.
+            failure = await _confirm_handoff_brief(
+                request, target, body.packet, delivered=not result.get("existing")
+            )
+            if failure is not None:
+                return failure
+            try:
+                await _set_labels(
+                    session_id,
+                    {
+                        labels.HANDOFF_TO: target,
+                        labels.HANDOFF_PREV_STATUS: labels.status_of(old.labels) or labels.WORKING,
+                        labels.HANDOFF: "",
+                        labels.HANDOFF_AT: "",
+                    },
+                )
+            except Exception as exc:  # noqa: BLE001 (the retry finds the same key and commits)
+                _logger.warning("handoff: could not commit %s -> %s", session_id, target)
+                return _error(
+                    500,
+                    CODE_HANDOFF_NOT_COMMITTED,
+                    f"the new lead {target} was started but the old lead was not marked "
+                    f"({exc.__class__.__name__}). Nothing else changed; call hand_off again "
+                    "and it finishes with the same new lead.",
+                    session_id=target,
+                )
+        with contextlib.suppress(Exception):
+            await _set_labels(target, {labels.HANDOFF_FROM: session_id})
+        async with _loopback_client(request) as http:
+            finished = await lead_handoff.finish(
+                get_conversation_store(), http, session_id, target
+            )
+        return {
+            "ok": finished.done,
+            "session_id": target,
+            "old_session_id": session_id,
+            "existing": resumed,
+            "path": f"/c/{target}",
+            "model": started.get("model"),
+            "effort": started.get("effort"),
+            "claude_account": started.get("claude_account"),
+            "claude_account_note": started.get("claude_account_note"),
+            **finished.as_dict(),
+        }
+
+
+async def _confirm_handoff_brief(
+    request: Request, target: str, packet: str, *, delivered: bool
+) -> JSONResponse | None:
+    """Make sure the new lead has its brief, then label it ``ae.handoff_brief=posted``.
+
+    *delivered* is true for a lead this call just created (the create posted the brief). For a
+    lead found by key, the label says whether an earlier try got the brief there; without it
+    the packet is posted now. The label is written only after the post succeeded.
+    """
+    if not delivered:
+        conv = await _conversation(target)
+        if conv is None:
+            return _error(409, CODE_HANDOFF_REFUSED, f"the new lead {target} is gone; retry")
+        if not labels.label(conv.labels, labels.HANDOFF_BRIEF):
+            try:
+                posted = await _loopback(
+                    request, "POST", f"/v1/sessions/{target}/events", _message(packet)
+                )
+                failure = (
+                    None
+                    if posted.status_code < 300
+                    else f"{posted.status_code} {posted.text[:200]}"
+                )
+            except httpx.HTTPError as exc:
+                failure = _transport_failure(exc, "posting the brief")
+            if failure is not None:
+                return _error(
+                    502,
+                    CODE_BRIEF_NOT_POSTED,
+                    f"session {target} started but the brief was not posted: {failure}. "
+                    "Nothing else changed; call hand_off again.",
+                    session_id=target,
+                )
+    with contextlib.suppress(Exception):
+        await _set_labels(target, {labels.HANDOFF_BRIEF: "posted"})
+    return None
+
+
+def _handoff_refusal(old: Conversation) -> JSONResponse | None:
+    """Why *old* cannot hand off, or ``None``."""
+    held = old.labels or {}
+    if old.parent_conversation_id is not None or old.kind != "default" or old.archived:
+        return _error(
+            422, CODE_HANDOFF_REFUSED, "only a top-level chat can hand off; this one is not"
+        )
+    if labels.label(held, lead_handoff.WRAPPER_LABEL) != lead_handoff.CLAUDE_WRAPPER:
+        return _error(422, CODE_HANDOFF_REFUSED, "only a Claude chat can hand off")
+    if labels.orch_parent(held) is not None:
+        return _error(
+            422,
+            CODE_HANDOFF_REFUSED,
+            "this chat is a child of another lead; hand off that lead instead",
+        )
+    if labels.status_of(held) == labels.REFERENCE:
+        return _error(409, CODE_HANDOFF_REFUSED, "this chat is already a reference")
+    if not old.workspace or not old.host_id:
+        return _error(
+            409,
+            CODE_HANDOFF_REFUSED,
+            "this chat has no host and workspace to start the new lead on",
+        )
+    return None
+
+
+@router.post(
+    "/sessions/{session_id}/handoff/snooze",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def snooze_handoff(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: EmptyBody,  # noqa: ARG001 (the route takes {} and nothing else)
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """ "Not now" and Compact: no new suggestion until the context grew another 100k tokens."""
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can change session {session_id}")
+    async with lead_handoff.lead_lock(session_id):
+        # Read again inside the lock: a handoff may have committed while this waited.
+        conv = await _conversation(session_id)
+        if conv is None:
+            return _not_found(f"no session {session_id}")
+        if lead_handoff.handoff_target(conv) is not None:
+            return _error(409, CODE_HANDOFF_REFUSED, "this chat already handed off")
+        if not lead_handoff.is_lead(conv):
+            return _error(
+                409, CODE_HANDOFF_REFUSED, "only a working Claude chat you opened can be snoozed"
+            )
+        tokens = lead_handoff.context_tokens(conv) or 0
+        if tokens <= 0:
+            # A size of 0 would bring the card back at 100k tokens.
+            return _error(409, CODE_HANDOFF_REFUSED, "this chat has no context reading to snooze")
+        await _set_labels(
+            session_id,
+            {labels.HANDOFF: labels.HANDOFF_SNOOZED, labels.HANDOFF_AT: str(tokens)},
+        )
+    return {"ok": True, "session_id": session_id, "snoozed_at": tokens}
 
 
 @router.post("/gate/{session_id}/reply", response_model=None)
 async def gate_reply(
-    request: Request, session_id: str, body: GateReply
+    request: Request,
+    session_id: str,
+    body: GateReply,
+    user: Annotated[str | None, Depends(require_ae_user)],
 ) -> dict[str, Any] | JSONResponse:
     """Answer an open gate: post the letter as the session's next user turn.
 
     The agent wrote the gate and waits for the call; the call is one word. It
     goes through ``POST /v1/sessions/{id}/events`` as the caller, the same way
     a typed reply would, then the session's ``ae.gate`` flips to ``answered``.
+    A session the caller cannot open answers like one that does not exist
+    (2026-10-28), so the route is no oracle for another user's sessions.
     """
     conv = await _conversation(session_id)
-    if conv is None:
+    if conv is None or not await _may_open_session(request, user, session_id):
         return _not_found(f"no session {session_id}")
     gate = labels.label(conv.labels, labels.GATE)
     if gate != labels.GATE_OPEN:
@@ -3359,30 +4133,108 @@ def _bad_repo(owner: str, repo: str) -> JSONResponse | None:
 
 @router.get("/prs")
 async def pull_requests(
-    request: Request, fresh: Annotated[bool, Query()] = False
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    fresh: Annotated[bool, Query()] = False,
 ) -> dict[str, Any]:
     """Every open pull request a session tracks, as a card; see :mod:`ae_omni_policies.prs`.
 
     ``fresh=true`` re-reads which sessions track what; the cards keep their
-    minute-long cache either way (GitHub's rate limit).
+    minute-long cache either way (GitHub's rate limit). The sessions read, and the
+    map kept, are the caller's own (2026-10-28).
     """
 
     async def fetch(path: str) -> httpx.Response:
         return await _loopback(request, "GET", path)
 
-    return await prs.open_pull_requests(fetch, fresh=fresh)
+    return await prs.open_pull_requests(fetch, fresh=fresh, user=_acl_user(user))
+
+
+async def _any_open(request: Request, user: str | None, ids: list[str]) -> bool:
+    """Whether the caller may open at least one of the sessions *ids*."""
+    for session_id in ids:
+        if await _may_open_session(request, user, session_id):
+            return True
+    return False
+
+
+async def _untracked_pull(
+    request: Request,
+    user: str | None,
+    owner: str,
+    repo: str,
+    number: int,
+    session_id: str | None = None,
+) -> JSONResponse | None:
+    """The refusal for a non-admin asking about a pull request none of their sessions tracks.
+
+    These routes read any repo with the server's GitHub token (2026-10-28), so a
+    non-admin is answered only for a pull request a session they may open tracks, with
+    that access checked now. *session_id* (the chat asking) is checked first and alone
+    when it tracks the pull request; else the caller's per-user scan names the tracking
+    sessions, re-read at most once per 30 seconds when it lacks the pull request. An
+    admin, and a single-user runtime's one user, get any.
+    """
+    verdict = await shared_accounts_routes.admin_state(request, user)
+    if verdict is None:
+        return _error(
+            503,
+            CODE_ADMIN_UNKNOWN,
+            "Could not check whether you may see this pull request: the server's own "
+            "sign-in check did not answer. Retry in a few seconds.",
+        )
+    if verdict:
+        return None
+
+    async def fetch(path: str) -> httpx.Response:
+        return await _loopback(request, "GET", path)
+
+    who = _acl_user(user)
+    full = f"{owner}/{repo}"
+    if (
+        session_id is not None
+        and await _may_open_session(request, user, session_id)
+        and await prs.session_tracks(fetch, session_id, full, number)
+    ):
+        return None
+    ids = await prs.tracking_sessions(fetch, full, number, user=who)
+    if await _any_open(request, user, ids):
+        return None
+    # Nothing listed, or none still open to the caller: the scan may be behind. One re-read.
+    if prs.fresh_scan_allowed(who):
+        ids = await prs.tracking_sessions(fetch, full, number, user=who, fresh=True)
+        prs.note_fresh_scan(who)  # only a finished scan uses up the gap
+        if await _any_open(request, user, ids):
+            return None
+    return _error(
+        403,
+        ErrorCode.FORBIDDEN,
+        f"No session you can open tracks {full}#{number}, so its card is not shown to you; "
+        "ask an admin.",
+    )
 
 
 @router.get("/prs/{owner}/{repo}/{number}", response_model=None)
 async def pull_request(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
     owner: str,
     repo: str,
     number: Annotated[int, Path(ge=1)],
     fresh: Annotated[bool, Query()] = False,
+    session_id: Annotated[str | None, Query(max_length=120)] = None,
 ) -> dict[str, Any] | JSONResponse:
-    """One pull request's card (the session's GitHub panel reads this per tracked PR)."""
+    """One pull request's card (the session's GitHub panel reads this per tracked PR).
+
+    A non-admin is answered only for a pull request a session they may open tracks
+    (:func:`_untracked_pull`, 2026-10-28).
+    """
     if (bad := _bad_repo(owner, repo)) is not None:
         return bad
+    if (
+        refused := await _untracked_pull(request, user, owner, repo, number, session_id)
+    ) is not None:
+        return refused
     settings = github.GitHubSettings.from_env()
     if not settings.configured:
         return _github_not_configured()
@@ -3395,14 +4247,24 @@ async def pull_request(
 
 @router.get("/prs/{owner}/{repo}/{number}/compliance", response_model=None)
 async def pull_request_compliance(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
     owner: str,
     repo: str,
     number: Annotated[int, Path(ge=1)],
     fresh: Annotated[bool, Query()] = False,
+    session_id: Annotated[str | None, Query(max_length=120)] = None,
 ) -> dict[str, Any] | JSONResponse:
-    """The latest trusted compliance comment, loaded only when requested."""
+    """The latest trusted compliance comment, loaded only when requested.
+
+    Scoped like the card (:func:`_untracked_pull`, 2026-10-28).
+    """
     if (bad := _bad_repo(owner, repo)) is not None:
         return bad
+    if (
+        refused := await _untracked_pull(request, user, owner, repo, number, session_id)
+    ) is not None:
+        return refused
     settings = github.GitHubSettings.from_env()
     if not settings.configured:
         return _github_not_configured()
@@ -3648,21 +4510,20 @@ def _fabric_failure(exc: fabric.FabricError) -> JSONResponse:
     return _error(exc.status, exc.code, str(exc))
 
 
-@router.get("/fabric")
+@router.get("/fabric", response_model=None)
 async def fabric_view(
     request: Request, user: Annotated[str | None, Depends(require_ae_user)]
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """Every Fabric capacity the environment names, with its state (:mod:`.fabric`).
 
     Always a 200: a capacity whose Logic App fails carries ``error`` on its own
     row. With none configured, ``note`` says how to turn the page on.
-    ``can_act`` says whether the caller may use the actions, so the page hides
-    them from a non-admin (2026-10-22; the action routes refuse one anyway).
+    Admin only (2026-10-28): subscriptions, SKUs and spend. ``can_act`` is true on
+    every 200 (kept for the page, 2026-10-22; the action routes refuse a non-admin too).
     """
-    answer, can_act = await asyncio.gather(
-        fabric.overview(), shared_accounts_routes.admin_probe(request, user)
-    )
-    return {**answer, "can_act": can_act}
+    if (refused := await _admin_only(request, user, "see the Fabric capacities")) is not None:
+        return refused
+    return {**await fabric.overview(), "can_act": True}
 
 
 _FABRIC_ACTION_WORDS = {
@@ -3994,6 +4855,80 @@ async def presets_view(
     return {**answer, "show": show}
 
 
+@router.get("/family-cost", response_model=None)
+async def family_cost_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    days: Annotated[int, Query()] = 7,
+) -> dict[str, Any] | JSONResponse:
+    """What each session family spent in the last 7 or 30 days (:mod:`.family_cost`).
+
+    An OmniGent admin sees every family on every host; anyone else only their own. Never waits on
+    the store: it answers the last sweep (every 15 min), or ``{"state": "warming"}`` before the
+    first one finishes. The answer stays under 30,000 characters (``truncated: true`` when the
+    tail of the ranking was cut). ``unit_default`` and each family's ``flagged`` come from the
+    caller's own "Show cost as" and "Runaway family" settings.
+    """
+    if days not in family_cost.WINDOWS:
+        return _error(422, "invalid_days", "days must be 7 or 30.")
+    verdict = await shared_accounts_routes.admin_state(request, user)
+    if verdict is None:
+        return _error(
+            503,
+            CODE_ADMIN_UNKNOWN,
+            "Could not check whether you can see every family: the server's own sign-in check "
+            "did not answer. Retry in a few seconds.",
+        )
+    who = user or "local"
+    unit, tokens_limit, usd_limit = await asyncio.to_thread(
+        role_prefs.store().family_cost_settings, who
+    )
+    return family_cost.view(
+        days,
+        viewer=user,
+        admin=verdict is True,
+        unit=unit,
+        runaway=usd_limit if unit == "dollars" else tokens_limit,
+        settings={"unit": unit, "runaway_tokens": tokens_limit, "runaway_usd": usd_limit},
+    )
+
+
+@router.post(
+    "/family-cost/settings",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def family_cost_settings_post(
+    body: role_prefs.FamilyCostSettings,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Save the caller's "Show cost as" and "Runaway family" (any subset); the card's own save.
+
+    The extension's host request cannot PUT, so this merges the fields into the caller's saved
+    role state (a retry or two when another device saves in between) instead of the card
+    resending the whole preset list.
+    """
+    who = user or "local"
+    fields = {name: getattr(body, name) for name in body.model_fields_set}
+    for _ in range(3):
+        current = await asyncio.to_thread(role_prefs.store().get, who)
+        put = role_prefs.RolesPut.model_validate({**current.model_dump(), **fields})
+        try:
+            result = await asyncio.to_thread(role_prefs.store().put, who, put)
+        except role_prefs.RolesSaveError as exc:
+            return _error(503, role_prefs.CODE_NOT_SAVED, str(exc))
+        if not result.conflict:
+            unit, tokens_limit, usd_limit = await asyncio.to_thread(
+                role_prefs.store().family_cost_settings, who
+            )
+            return {"unit": unit, "runaway_tokens": tokens_limit, "runaway_usd": usd_limit}
+    return _error(
+        409,
+        ErrorCode.CONFLICT,
+        "The role presets kept changing on another device; try the save again.",
+    )
+
+
 @router.get("/git", response_model=None)
 async def git_view(
     request: Request,
@@ -4010,21 +4945,21 @@ async def git_view(
     return await git_center.overview(fresh=fresh)
 
 
-@router.get("/databricks")
+@router.get("/databricks", response_model=None)
 async def databricks_view(
     request: Request, user: Annotated[str | None, Depends(require_ae_user)]
-) -> dict[str, Any]:
+) -> dict[str, Any] | JSONResponse:
     """The Databricks workspace's warehouses and spend (:mod:`.databricks`).
 
     Always a 200: a listing that fails rides in ``error``. With no credential,
     ``note`` says how to turn the section on. Starts a background spend
     reading only when the warehouse it runs on is already RUNNING and the last
-    attempt is stale; it never starts a warehouse. ``can_act`` as on ``/fabric``.
+    attempt is stale; it never starts a warehouse. Admin only (2026-10-28), a read
+    can wake billing; ``can_act`` as on ``/fabric``.
     """
-    answer, can_act = await asyncio.gather(
-        databricks.overview(), shared_accounts_routes.admin_probe(request, user)
-    )
-    return {**answer, "can_act": can_act}
+    if (refused := await _admin_only(request, user, "see the Databricks warehouses")) is not None:
+        return refused
+    return {**await databricks.overview(), "can_act": True}
 
 
 async def _databricks_action(
@@ -4145,6 +5080,10 @@ DEBUG_ROUTERS: list[tuple[APIRouter, str, list[str]]] = [
     (auto_archive.lifespan_router, "", ["ae"]),
     # No routes: writes the preset run log when a lead's run ends (2026-10-24).
     (preset_runs.lifespan_router, "", ["ae"]),
+    # No routes: nudges a top-level chat past its context threshold to hand off (2026-10-29).
+    (lead_handoff.lifespan_router, "", ["ae"]),
+    # No routes: sums each family's spend every 15 minutes for the Family cost card (2026-10-29).
+    (family_cost.lifespan_router, "", ["ae"]),
 ]
 
 __all__ = [

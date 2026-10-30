@@ -51,7 +51,7 @@ def test_a_limit_set_on_the_page_wins() -> None:
 
 
 def test_a_slot_cap_without_a_limit_leaves_the_environment() -> None:
-    # The seed's slot cap carries only mode and lot_url, as on Reid's box.
+    # The seed's slot cap carries only mode and lot_url, as on Owner's box.
     slot_limit.remember_store(_Store(_policy()))
     assert slot_limit.effective_limit() == 4
 

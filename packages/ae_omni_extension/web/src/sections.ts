@@ -1,4 +1,4 @@
-// Collapsible sections (2026-09-24, after Reid's design feedback): every
+// Collapsible sections (2026-09-24, after the owner's design feedback): every
 // section header on the Dashboard is a toggle, and which sections are open is
 // remembered per section in the SDK's `storage.user` (key `sections.open`,
 // an object of section id to boolean), in memory when that is unavailable.
@@ -15,7 +15,7 @@ import type { ExtensionContext } from "@omnigent/extension-sdk";
 
 export const SECTIONS_KEY = "sections.open";
 
-/** Sections that start closed until Reid opens them once. */
+/** Sections that start closed until the owner opens them once. */
 const CLOSED_BY_DEFAULT = new Set(["reference", "unsorted"]);
 
 const remembered = new Map<string, boolean>();

@@ -1,0 +1,558 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:00:36 -0700
+Subject: [PATCH 239/260] [ae-patch] Add Open and Download to chat file links
+
+---
+ .../routes/sessions/routes_resources.py       |  25 ++++
+ .../e2e_ui/chat/test_chat_file_path_links.py  |  51 ++++++++
+ tests/server/routes/test_session_resources.py | 121 +++++++++++++++++
+ .../blocks/AeChatFileActions.test.tsx         | 123 ++++++++++++++++++
+ .../components/blocks/AeChatFileActions.tsx   | 109 ++++++++++++++++
+ web/src/components/blocks/ChatMarkdown.tsx    |  13 +-
+ 6 files changed, 440 insertions(+), 2 deletions(-)
+ create mode 100644 web/src/components/blocks/AeChatFileActions.test.tsx
+ create mode 100644 web/src/components/blocks/AeChatFileActions.tsx
+
+diff --git a/omnigent/server/routes/sessions/routes_resources.py b/omnigent/server/routes/sessions/routes_resources.py
+index aa3e91db4c7de6182c03b2de2f99cd662c155191..71b250cb48cc6492681cfc75723f45eee06f778d 100644
+--- a/omnigent/server/routes/sessions/routes_resources.py
++++ b/omnigent/server/routes/sessions/routes_resources.py
+@@ -2735,6 +2735,31 @@ def register_resources_routes(
+         qs = urllib.parse.urlencode({**params, **reach})
+         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
+         if download:
++            # A download can be the first action after a managed sandbox sleeps.
++            tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
++            if (
++                conv.host_id is not None
++                and host_registry is not None
++                and host_registry.get(conv.host_id) is None
++                and (
++                    conv.runner_id is None
++                    or tunnel_registry is None
++                    or tunnel_registry.get(conv.runner_id) is None
++                )
++                and not (
++                    runner_router is not None
++                    and await asyncio.to_thread(
++                        runner_router.host_is_on_another_replica, conv.host_id
++                    )
++                )
++            ):
++                _, conv = await ensure_runner_connected(
++                    session_id=conv.id,
++                    conv=conv,
++                    app_state=request.app.state,
++                    conversation_store=conversation_store,
++                    runner_router=runner_router,
++                )
+             return await _stream_download_from_runner(
+                 request,
+                 session_id,
+diff --git a/tests/e2e_ui/chat/test_chat_file_path_links.py b/tests/e2e_ui/chat/test_chat_file_path_links.py
+index a7e92c4db056e5cbd88829e8a1b593c9fbf86311..376766f6928c0697c3d8c8a6b96e93f7b6359fbf 100644
+--- a/tests/e2e_ui/chat/test_chat_file_path_links.py
++++ b/tests/e2e_ui/chat/test_chat_file_path_links.py
+@@ -304,3 +304,54 @@ def test_chat_file_link_opens_on_mobile_tap(
+         )
+     finally:
+         ctx.close()
++
++
++def test_chat_file_link_context_menu_downloads_the_whole_file(
++    page: Page,
++    live_server: str,
++    runner_id: str,
++    tmp_path: Path,
++) -> None:
++    """Right-click on a cited file offers Download, which saves the exact bytes."""
++    payload = bytes(range(256)) * 6000  # about 1.5 MB, past any preview cap
++    clip = tmp_path / "clip.mp4"
++    clip.write_bytes(payload)
++
++    create_resp = post_session_bundle(
++        httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(tmp_path)), timeout=30.0
++    )
++    create_resp.raise_for_status()
++    session_id = create_resp.json()["session_id"]
++    try:
++        bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)
++        httpx.post(
++            f"{live_server}/v1/sessions/{session_id}/events",
++            json={
++                "type": "external_assistant_message",
++                "data": {"agent": _AGENT_NAME, "text": f"Your video is at `{clip}`."},
++            },
++            timeout=10.0,
++        ).raise_for_status()
++
++        page.goto(f"{live_server}/c/{session_id}")
++        link = page.get_by_role("button", name=str(clip))
++        expect(link).to_be_visible(timeout=30_000)
++        link.click(button="right")
++        with page.expect_download() as download_info:
++            page.get_by_role("menuitem", name="Download").click()
++        download = download_info.value
++        assert download.suggested_filename == "clip.mp4"
++        saved = tmp_path / "saved-clip.mp4"
++        download.save_as(saved)
++        assert saved.read_bytes() == payload
++
++        # The same route answers a plain request as an attachment, so a phone
++        # or a bare link click saves rather than plays it.
++        raw = page.request.get(
++            f"{live_server}/v1/sessions/{session_id}/resources/environments/default"
++            f"/filesystem/{str(clip).lstrip('/')}?base=host&download=true"
++        )
++        assert raw.status == 200
++        assert raw.headers["content-disposition"].startswith("attachment")
++    finally:
++        httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+diff --git a/tests/server/routes/test_session_resources.py b/tests/server/routes/test_session_resources.py
+index 491cb371bfbfe97153b7745274f5eb9fc0708ccd..2417010ee3df0a371ef8e4a612cd556071446bb4 100644
+--- a/tests/server/routes/test_session_resources.py
++++ b/tests/server/routes/test_session_resources.py
+@@ -3576,6 +3576,68 @@ async def test_filesystem_download_streams_runner_attachment(
+     assert seen == [("data/big.bin", True, "reach")]
+ 
+ 
++@pytest.mark.asyncio
++async def test_filesystem_download_wakes_an_asleep_runner_first(
++    client: httpx.AsyncClient,
++    app: FastAPI,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    """A download from a chat whose sandbox slept reconnects the runner, then streams."""
++    from unittest.mock import AsyncMock
++
++    from omnigent.server.routes.sessions import routes_resources
++
++    session_id = "79b22ebd2309e48fdeb450c65611d51b"
++    conv = app.state.test_conversation_store._conversations[session_id]
++    conv.host_id = "host_asleep"
++    conv.runner_id = None
++    (tmp_path / "big.bin").write_bytes(b"asleep-bytes")
++    runner = FastAPI()
++
++    @runner.get(_FS_ROUTE)
++    async def _serve(session_id: str, environment_id: str, relative_path: str) -> FileResponse:
++        del session_id, environment_id, relative_path
++        return FileResponse(tmp_path / "big.bin", filename="big.bin")
++
++    wake = AsyncMock(return_value=(None, conv))
++    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
++    async with _runner_app_client(runner):
++        resp = await client.get(_DOWNLOAD_URL)
++
++    wake.assert_awaited_once()
++    assert resp.status_code == 200
++    assert resp.content == b"asleep-bytes"
++
++
++@pytest.mark.asyncio
++async def test_filesystem_download_of_a_live_runner_does_not_wake_it(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++    tmp_path: Path,
++) -> None:
++    """With no host bound there is nothing to wake, so the stream starts at once."""
++    from unittest.mock import AsyncMock
++
++    from omnigent.server.routes.sessions import routes_resources
++
++    (tmp_path / "big.bin").write_bytes(b"live")
++    runner = FastAPI()
++
++    @runner.get(_FS_ROUTE)
++    async def _serve(session_id: str, environment_id: str, relative_path: str) -> FileResponse:
++        del session_id, environment_id, relative_path
++        return FileResponse(tmp_path / "big.bin", filename="big.bin")
++
++    wake = AsyncMock()
++    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
++    async with _runner_app_client(runner):
++        resp = await client.get(_DOWNLOAD_URL)
++
++    assert resp.status_code == 200
++    wake.assert_not_awaited()
++
++
+ @pytest.mark.asyncio
+ async def test_filesystem_download_rejects_runner_without_download_support(
+     client: httpx.AsyncClient,
+@@ -9560,3 +9622,62 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
+         assert client.post_json_calls[-1][0] == f"/v1/sessions/{sid}/events"
+     finally:
+         pending_inputs.reset_for_tests()
++
++
++def _download_auth_app(db_uri: str) -> tuple[FastAPI, str]:
++    """A header-auth app and a session owned by Bob and read-shared to Alice."""
++    from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
++    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
++
++    agent_store = SqlAlchemyAgentStore(db_uri)
++    conv_store = SqlAlchemyConversationStore(db_uri)
++    perms = SqlAlchemyPermissionStore(db_uri)
++    agent_store.create(
++        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
++        name="test-agent",
++        bundle_location="087b7cb7ac30abf4debfaa578d052ec6/bundle",
++    )
++    conv = conv_store.create_conversation(
++        title="Bob's session", agent_id="087b7cb7ac30abf4debfaa578d052ec6"
++    )
++    for user in ("alice@example.com", "bob@example.com"):
++        perms.ensure_user(user)
++    perms.grant("bob@example.com", conv.id, LEVEL_OWNER)
++    perms.grant("alice@example.com", conv.id, LEVEL_READ)
++    app = FastAPI()
++
++    @app.exception_handler(OmnigentError)
++    async def _handle(request: Request, exc: OmnigentError) -> JSONResponse:
++        del request
++        return JSONResponse(
++            status_code=exc.http_status,
++            content={"error": {"code": exc.code, "message": exc.message}},
++        )
++
++    app.include_router(
++        create_sessions_router(
++            conversation_store=conv_store,
++            agent_store=agent_store,
++            auth_provider=UnifiedAuthProvider(source="header"),
++            permission_store=perms,
++        ),
++        prefix="/v1",
++    )
++    return app, conv.id
++
++
++@pytest.mark.asyncio
++async def test_host_absolute_download_is_owner_only(db_uri: str) -> None:
++    """A read-only collaborator gets 403 on a host-absolute download."""
++    app, session_id = _download_auth_app(db_uri)
++    transport = httpx.ASGITransport(app=app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
++        resp = await http.get(
++            f"/v1/sessions/{session_id}/resources/environments/default"
++            "/filesystem/etc/hosts?base=host&download=true",
++            headers={"X-Forwarded-Email": "alice@example.com"},
++        )
++
++    assert resp.status_code == 403
+diff --git a/web/src/components/blocks/AeChatFileActions.test.tsx b/web/src/components/blocks/AeChatFileActions.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..8ad7c7aa7c1bad081759b3f697213a71c84c1e3b
+--- /dev/null
++++ b/web/src/components/blocks/AeChatFileActions.test.tsx
+@@ -0,0 +1,123 @@
++// Open and Download on a file a chat reply names, as inline code and as a link.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { FileViewerContext } from "@/shell/FileViewerContext";
++import { FilePathAwareMessageResponse } from "./ChatMarkdown";
++
++vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
++vi.mock("@/hooks/useFileContent", async (importOriginal) => ({
++  ...(await importOriginal<object>()),
++  downloadWorkspaceFile: vi.fn(),
++}));
++import { showToast } from "@/components/ui/toast";
++import { downloadWorkspaceFile } from "@/hooks/useFileContent";
++
++const downloadMock = vi.mocked(downloadWorkspaceFile);
++const toastMock = vi.mocked(showToast);
++const openFile = vi.fn();
++const fetchMock = vi.fn();
++
++const WORKSPACE = "/home/u/ws";
++const VIEWER = {
++  openFile,
++  openGithubTab: () => {},
++  isChangedPath: (p: string) => p === "clip.mp4",
++  conversationId: "conv_1" as string | undefined,
++  workspaceRoot: WORKSPACE as string | null,
++  workspaceHome: "/home/u",
++};
++
++function setCoarse(coarse: boolean): void {
++  vi.stubGlobal(
++    "matchMedia",
++    (query: string) =>
++      ({
++        matches: coarse && query.includes("coarse"),
++        addEventListener: () => {},
++        removeEventListener: () => {},
++      }) as unknown as MediaQueryList,
++  );
++}
++
++function renderMarkdown(markdown: string): void {
++  const client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
++  render(
++    <QueryClientProvider client={client}>
++      <FileViewerContext.Provider value={VIEWER}>
++        <FilePathAwareMessageResponse>{markdown}</FilePathAwareMessageResponse>
++      </FileViewerContext.Provider>
++    </QueryClientProvider>,
++  );
++}
++
++beforeEach(() => {
++  openFile.mockClear();
++  downloadMock.mockReset();
++  downloadMock.mockResolvedValue(undefined);
++  toastMock.mockReset();
++  fetchMock.mockReset();
++  fetchMock.mockResolvedValue({ ok: true, status: 200, json: async () => ({ data: [] }) });
++  vi.stubGlobal("fetch", fetchMock);
++  setCoarse(false);
++});
++
++afterEach(cleanup);
++
++const FORMS = [
++  ["inline code", `Saved \`${WORKSPACE}/clip.mp4\`.`, `${WORKSPACE}/clip.mp4`],
++  ["markdown link", `[the clip](${WORKSPACE}/clip.mp4)`, "the clip"],
++] as const;
++
++describe.each(FORMS)("%s to a workspace file", (_label, markdown, name) => {
++  it("offers Open and Download on right-click", () => {
++    renderMarkdown(markdown);
++    fireEvent.contextMenu(screen.getByRole("button", { name }));
++    expect(screen.getByRole("menuitem", { name: "Open" })).toBeTruthy();
++    expect(screen.getByRole("menuitem", { name: "Download" })).toBeTruthy();
++  });
++
++  it("downloads the resolved path for this conversation", () => {
++    renderMarkdown(markdown);
++    fireEvent.contextMenu(screen.getByRole("button", { name }));
++    fireEvent.click(screen.getByRole("menuitem", { name: "Download" }));
++    expect(downloadMock).toHaveBeenCalledWith("conv_1", "clip.mp4");
++  });
++
++  it("opens the file from the menu", () => {
++    renderMarkdown(markdown);
++    fireEvent.contextMenu(screen.getByRole("button", { name }));
++    fireEvent.click(screen.getByRole("menuitem", { name: "Open" }));
++    expect(openFile).toHaveBeenCalledWith("clip.mp4");
++  });
++
++  it("shows the download icon only on a coarse pointer", () => {
++    renderMarkdown(markdown);
++    expect(screen.queryByLabelText("Download clip.mp4")).toBeNull();
++    cleanup();
++    setCoarse(true);
++    renderMarkdown(markdown);
++    fireEvent.click(screen.getByLabelText("Download clip.mp4"));
++    expect(downloadMock).toHaveBeenCalledWith("conv_1", "clip.mp4");
++    expect(openFile).not.toHaveBeenCalled();
++  });
++
++  it("toasts when the download fails", async () => {
++    downloadMock.mockRejectedValue(new Error("502 Bad Gateway"));
++    renderMarkdown(markdown);
++    fireEvent.contextMenu(screen.getByRole("button", { name }));
++    fireEvent.click(screen.getByRole("menuitem", { name: "Download" }));
++    await vi.waitFor(() => expect(toastMock).toHaveBeenCalled());
++    expect(toastMock.mock.calls[0][0]).toContain("Download failed: 502 Bad Gateway");
++  });
++});
++
++describe("a dead link", () => {
++  it("has no menu", () => {
++    renderMarkdown("[gone](/home/u/ws/../../etc/passwd)");
++    const dead = screen.queryByRole("button", { name: "gone" });
++    if (dead) fireEvent.contextMenu(dead);
++    expect(screen.queryByRole("menuitem", { name: "Download" })).toBeNull();
++  });
++});
+diff --git a/web/src/components/blocks/AeChatFileActions.tsx b/web/src/components/blocks/AeChatFileActions.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..21ca40955cb9dc14e801740974e497906e254f3a
+--- /dev/null
++++ b/web/src/components/blocks/AeChatFileActions.tsx
+@@ -0,0 +1,109 @@
++// Open and Download for a file a chat reply names (inline code or a markdown
++// link). Right-click, the context-menu key and Shift+F10 open a small menu;
++// touch screens, which have no right-click, get a download icon after the name.
++
++import { useState, useSyncExternalStore, type MouseEvent, type ReactNode } from "react";
++import { createPortal } from "react-dom";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuItem,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
++import { showToast } from "@/components/ui/toast";
++import { downloadWorkspaceFile } from "@/hooks/useFileContent";
++import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
++import { AeTablerSvg } from "@/lib/aeTablerIcon";
++
++/** Tabler `download` (outline, @tabler/icons 3.46.0), inlined. */
++const AE_DOWNLOAD_ICON: AeTablerIconNode = [
++  ["path", { d: "M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" }],
++  ["path", { d: "M7 11l5 5l5 -5" }],
++  ["path", { d: "M12 4l0 12" }],
++];
++
++const COARSE = "(pointer: coarse)";
++
++function subscribeCoarse(callback: () => void): () => void {
++  if (typeof window === "undefined" || !window.matchMedia) return () => {};
++  const query = window.matchMedia(COARSE);
++  query.addEventListener?.("change", callback);
++  return () => query.removeEventListener?.("change", callback);
++}
++
++function isCoarse(): boolean {
++  return typeof window !== "undefined" && !!window.matchMedia && window.matchMedia(COARSE).matches;
++}
++
++/** The download hint a link carries on desktop, where right-click opens the menu. */
++export function aeFileLinkHint(path: string): string {
++  return `${path} (right-click for Download)`;
++}
++
++export function useAeChatFileActions(
++  conversationId: string | undefined,
++  resolvedPath: string,
++  onOpen: (() => void) | null,
++): { onContextMenu: ((event: MouseEvent<HTMLElement>) => void) | undefined; extra: ReactNode } {
++  const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
++  const coarse = useSyncExternalStore(subscribeCoarse, isCoarse, () => false);
++  if (!conversationId || !resolvedPath || !onOpen) return { onContextMenu: undefined, extra: null };
++
++  const download = () => {
++    downloadWorkspaceFile(conversationId, resolvedPath).catch((error: unknown) => {
++      const message = error instanceof Error ? error.message : String(error);
++      showToast(
++        `Download failed: ${message}. If the chat is asleep, send it a message and try again.`,
++      );
++    });
++  };
++  const onContextMenu = (event: MouseEvent<HTMLElement>) => {
++    event.preventDefault();
++    // A keyboard-opened menu has no pointer position; anchor it to the link.
++    const box = event.currentTarget.getBoundingClientRect();
++    setPoint({ x: event.clientX || box.left, y: event.clientY || box.bottom });
++  };
++  const name = resolvedPath.split("/").pop() ?? resolvedPath;
++  const menu =
++    point &&
++    createPortal(
++      <DropdownMenu open modal={false} onOpenChange={(open) => !open && setPoint(null)}>
++        <DropdownMenuTrigger asChild>
++          <span className="fixed" style={{ left: point.x, top: point.y }} />
++        </DropdownMenuTrigger>
++        <DropdownMenuContent align="start" onCloseAutoFocus={(event) => event.preventDefault()}>
++          <DropdownMenuItem onSelect={onOpen}>Open</DropdownMenuItem>
++          <DropdownMenuItem onSelect={download}>Download</DropdownMenuItem>
++        </DropdownMenuContent>
++      </DropdownMenu>,
++      document.body,
++    );
++  const extra = (
++    <>
++      {coarse ? (
++        <span
++          role="button"
++          tabIndex={0}
++          aria-label={`Download ${name}`}
++          title={`Download ${name}`}
++          className="hidden pointer-coarse:inline-block size-[1em] align-[-0.125em] ml-0.5"
++          onClick={(event) => {
++            event.stopPropagation();
++            download();
++          }}
++          onKeyDown={(event) => {
++            if (event.key === "Enter" || event.key === " ") {
++              event.preventDefault();
++              event.stopPropagation();
++              download();
++            }
++          }}
++        >
++          <AeTablerSvg node={AE_DOWNLOAD_ICON} className="size-full" />
++        </span>
++      ) : null}
++      {menu}
++    </>
++  );
++  return { onContextMenu, extra };
++}
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index 92f1c2b99d7faf3c96f7e91c7726831c5833fcf8..b4bbf50bd320aefa2b6ee9abb39de4829ad2ee36 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -28,6 +28,7 @@ import { useThrottledValue } from "@/hooks/useThrottledValue";
+ import { withBasePath } from "@/lib/basePath";
+ import { isNativeShell } from "@/lib/nativeBridge";
+ import { SessionRouteLink } from "@/components/blocks/AeSessionLink";
++import { aeFileLinkHint, useAeChatFileActions } from "@/components/blocks/AeChatFileActions";
+ import { sessionLinkRoute } from "@/lib/aeSessionLinks";
+ import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
+ import { cn } from "@/lib/utils";
+@@ -165,7 +166,9 @@ function WorkspacePathInlineCode({
+   // A backtick span is prose by default (`git status`, `useState`), so a
+   // non-openable one just stays styled inline code — only an explicit
+   // markdown link (WorkspaceFileLink) earns dead-path feedback.
+-  const { open: openWorkspaceFile } = useWorkspaceFileOpener(text);
++  const { open: openWorkspaceFile, resolvedPath } = useWorkspaceFileOpener(text);
++  const conversationId = useFileViewerConversationId();
++  const actions = useAeChatFileActions(conversationId, resolvedPath, openWorkspaceFile);
+ 
+   if (openWorkspaceFile) {
+     // Rendered as an inline <code> (not a <button>): a button is laid out as
+@@ -186,6 +189,8 @@ function WorkspacePathInlineCode({
+           className,
+         )}
+         onClick={openWorkspaceFile}
++        onContextMenu={actions.onContextMenu}
++        title={aeFileLinkHint(resolvedPath)}
+         onKeyDown={(e) => {
+           if (e.key === "Enter" || e.key === " ") {
+             e.preventDefault();
+@@ -195,6 +200,7 @@ function WorkspacePathInlineCode({
+         {...codeProps}
+       >
+         {codeChildren}
++        {actions.extra}
+       </code>
+     );
+   }
+@@ -308,6 +314,7 @@ function WorkspaceFileLink({
+   // Scopes the desktop in-app browser route to this conversation's view.
+   const conversationId = useFileViewerConversationId();
+   const inRouter = useInRouterContext();
++  const actions = useAeChatFileActions(conversationId, resolvedPath, openWorkspaceFile);
+ 
+   if (!path) {
+     // Rebase an app-internal link (e.g. an agent's `/clear` "the new chat"
+@@ -415,8 +422,9 @@ function WorkspaceFileLink({
+       {...props}
+       role="button"
+       tabIndex={0}
+-      title={title ?? path}
++      title={title ?? aeFileLinkHint(resolvedPath)}
+       data-streamdown="link"
++      onContextMenu={actions.onContextMenu}
+       // Dotted underline distinguishes "opens in the FileViewer" from a link
+       // that leaves the app; the rest matches Streamdown so a file link in a
+       // table cell wraps like any other.
+@@ -430,6 +438,7 @@ function WorkspaceFileLink({
+       }}
+     >
+       {children}
++      {actions.extra}
+     </a>
+   );
+ }

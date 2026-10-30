@@ -4,7 +4,7 @@ Added 2026-10-20, after the Microsoft sign-in cutover. When the server rejects
 the box host's credential, the host (``ae-omnigent-host.service``) retries
 forever and logs ``Connection refused (HTTP 403): the host tunnel was
 rejected``. The only fix was by hand: run ``omnigent login`` on the box, get
-the printed sign-in link to Reid within five minutes (the server's login
+the printed sign-in link to the owner within five minutes (the server's login
 ticket lasts 300 s), then restart the host, which keeps its credential in
 memory. The credential lasts 720 h and renews itself, so this is for rare
 failures, but each one meant a terminal on the box.
@@ -515,7 +515,7 @@ def public_link(link: str, environ: Mapping[str, str] | None = None) -> str:
     """*link* moved to the host Microsoft calls back to (``OMNIGENT_OIDC_REDIRECT_URI``).
 
     ``omnigent login`` prints the server URL it was given, the tailnet one, which
-    Reid's phone may not reach; the sign-in has to finish on the callback host
+    the owner's phone may not reach; the sign-in has to finish on the callback host
     anyway (the 2026-10-20 cutover rewrote it by hand). Without the setting the
     link is unchanged.
     """

@@ -16,8 +16,8 @@ from ae_omni_policies import omni, secrets_health, secrets_meta, secrets_relay
 
 PULL_SECRETS = Path(__file__).resolve().parents[3] / "deploy" / "pull-secrets.sh"
 SENTINEL = "sentinel-secret-value-7f3a"
-REID = {"X-Forwarded-Email": "reid@example.com"}
-STEVE = {"X-Forwarded-Email": "steve@example.com"}
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
+OTHER_USER = {"X-Forwarded-Email": "user-b@example.com"}
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
 
 
@@ -79,12 +79,16 @@ def test_a_secret_the_vault_did_not_list_is_unknown_and_a_key_without_a_vault_na
     assert secrets_meta.words("AE_FABRIC_WAKE_URL_OTHER", _reading(), NOW) == secrets_meta.Words()
 
 
-def test_links_name_the_account_and_default_to_the_vault_page() -> None:
+def test_links_name_the_account_and_default_to_the_vault_page(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    account = "1f2e3d4c-" + "aaaa-4bbb-8ccc-" + "0123456789ab"
+    monkeypatch.setenv(secrets_meta.DATABRICKS_ACCOUNT_ENV, account)
     dbx = secrets_meta.words("AE_DATABRICKS_CLIENT_SECRET", None, NOW)
     assert (
         dbx.rotate_url == "https://accounts.cloud.databricks.com/user-management/serviceprincipals"
     )
-    assert "136eebed-4c6e-4d6d-98f9-be90875db944" in (dbx.rotate_hint or "")
+    assert account in (dbx.rotate_hint or "")
     plain = secrets_meta.words("POSTGRES_PASSWORD", None, NOW)
     assert plain.edit_url == plain.rotate_url
     assert plain.edit_url.endswith("/secrets/omnigent-ae-postgres-password")
@@ -92,6 +96,37 @@ def test_links_name_the_account_and_default_to_the_vault_page() -> None:
     assert plain.rotate_hint == secrets_meta.DEFAULT_HINT
     for vault_name in secrets_meta.ROTATE:
         assert vault_name in secrets_meta.KNOWN_NAMES
+
+
+def test_the_databricks_hint_drops_the_account_id_while_the_setting_is_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(secrets_meta.DATABRICKS_ACCOUNT_ENV, raising=False)
+    for key in ("AE_DATABRICKS_CLIENT_ID", "AE_DATABRICKS_CLIENT_SECRET"):
+        dbx = secrets_meta.words(key, None, NOW)
+        assert dbx.rotate_url == (
+            "https://accounts.cloud.databricks.com/user-management/serviceprincipals"
+        )
+        assert "Databricks account Analytic Endeavors (MVP), service principal" in (
+            dbx.rotate_hint or ""
+        )
+        assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-", dbx.rotate_hint or "")
+
+
+def test_the_azure_cost_link_comes_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The Entra app id is a real tenant id, so only the box's env holds it (2026-10-28)."""
+    app = "00000000-0000-0000-0000-000000000003"
+    monkeypatch.delenv(secrets_meta.AZURE_COST_APP_ENV, raising=False)
+    unset = secrets_meta.words("AE_AZURE_COST_CLIENT_SECRET", None, NOW)
+    assert unset.rotate_url == unset.edit_url, "the portal link is hidden while unset"
+    assert app not in (unset.rotate_hint or "")
+    monkeypatch.setenv(secrets_meta.AZURE_COST_APP_ENV, app)
+    named = secrets_meta.words("AE_AZURE_COST_CLIENT_SECRET", None, NOW)
+    assert named.rotate_url == secrets_meta.ENTRA_CREDENTIALS_URL.format(app_id=app)
+    assert app in (named.rotate_hint or "")
+    assert secrets_relay.known_sources()[secrets_meta.AZURE_COST_SECRET] == app
+    monkeypatch.delenv(secrets_meta.AZURE_COST_APP_ENV)
+    assert secrets_meta.AZURE_COST_SECRET not in secrets_relay.known_sources()
 
 
 def test_stale_means_old_or_never() -> None:
@@ -153,13 +188,15 @@ async def test_post_is_admin_only_and_checks_the_body(
     client: httpx.AsyncClient, ae_admins: set[str]
 ) -> None:
     body = {"secrets": [{"name": "omnigent-ae-github-token", "expires": NOW.isoformat()}]}
-    assert (await client.post("/v1/ae/secrets/meta", json=body, headers=STEVE)).status_code == 403
-    ok = await client.post("/v1/ae/secrets/meta", json=body, headers=REID)
+    assert (
+        await client.post("/v1/ae/secrets/meta", json=body, headers=OTHER_USER)
+    ).status_code == 403
+    ok = await client.post("/v1/ae/secrets/meta", json=body, headers=OWNER)
     assert ok.status_code == 200, ok.text
     assert ok.json() == {"kept": 1}
-    bad = await client.post("/v1/ae/secrets/meta", json={"secrets": "nope"}, headers=REID)
+    bad = await client.post("/v1/ae/secrets/meta", json={"secrets": "nope"}, headers=OWNER)
     assert bad.status_code == 422
-    seen = await client.get("/v1/ae/secrets", headers=REID)
+    seen = await client.get("/v1/ae/secrets", headers=OWNER)
     row = next(r for r in seen.json()["optional"] if r["key"] == "AE_GITHUB_TOKEN")
     assert row["expires"] is not None
 
@@ -293,7 +330,7 @@ async def test_an_extreme_date_is_a_422_not_a_500(
 ) -> None:
     for when in ("0001-01-01T00:00:00+05:00", "9999-12-31T23:59:59-05:00", "1900-01-01T00:00:00Z"):
         body = {"secrets": [{"name": "omnigent-ae-github-token", "expires": when}]}
-        got = await client.post("/v1/ae/secrets/meta", json=body, headers=REID)
+        got = await client.post("/v1/ae/secrets/meta", json=body, headers=OWNER)
         assert got.status_code == 422, (when, got.text)
 
 
@@ -316,7 +353,7 @@ async def test_a_naive_date_in_the_state_file_reads_as_utc(
         encoding="utf-8",
     )
     secrets_meta.reset_store(secrets_meta.SecretsMetaStore(path))
-    got = await client.get("/v1/ae/secrets", headers=REID)
+    got = await client.get("/v1/ae/secrets", headers=OWNER)
     assert got.status_code == 200, got.text
     row = next(r for r in got.json()["optional"] if r["key"] == "AE_GITHUB_TOKEN")
     assert row["expiry_state"] == "ok"

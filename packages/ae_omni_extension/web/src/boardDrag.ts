@@ -26,7 +26,7 @@
 // rebuilt around the cards, and the drag listens on the document with the
 // pointer captured by the grip, so a fast drag out of the frame still ends.
 
-import type { CardId } from "./board";
+import type { CardId, CardSet } from "./board";
 import {
   type Direction,
   dropTarget,
@@ -172,7 +172,7 @@ function begin(
 }
 
 /** Make the cards of *board* draggable by their grips; the returned function undoes it. */
-export function enableDrag(board: HTMLElement, cards: Record<CardId, HTMLElement>): () => void {
+export function enableDrag(board: HTMLElement, cards: CardSet): () => void {
   let cancelActive: (() => void) | null = null;
   const live = board.ownerDocument.createElement("div");
   live.className = "sr-only";

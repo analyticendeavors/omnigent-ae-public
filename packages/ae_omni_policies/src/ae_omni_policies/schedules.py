@@ -5,10 +5,10 @@ and the Tasks page (``web/src/pages/TasksPage.tsx``) lists them. So the
 steward and the shutdown note are declared here as data and written by
 :func:`seed`, which ``scripts/seed-schedules.py`` runs as
 ``just schedules-seed <server-url>``. Idempotent by name: list first, create
-what is missing, patch what drifted, leave the rest alone (a task Reid paused
+what is missing, patch what drifted, leave the rest alone (a task the owner paused
 stays paused; ``state`` is never sent). Written 2026-09-23 (Phase 5).
 
-Times decided 2026-09-23 (Reid): the steward on weekdays at 08:00 and the
+Times decided 2026-09-23 (the owner): the steward on weekdays at 08:00 and the
 shutdown note on weekdays at 17:30, both in the server's own zone
 (``AE_TASK_STORE_TZ``, read through ``GET /v1/ae/schedule-defaults`` since 2026-10-22;
 ``America/Los_Angeles`` on the box), as RRULEs in
@@ -118,7 +118,7 @@ SCHEDULES: tuple[Schedule, ...] = (STEWARD, SHUTDOWN)
 # hour and a rule must fire at least twice, so a check-in is hourly or slower
 # and a one-off "in 20 minutes" is not possible; every fire starts a fresh
 # orchestrator session, which hands the check-in to the orchestrator session
-# Reid is talking to when there is one, so its context carries over.
+# The owner is talking to when there is one, so its context carries over.
 CHECKIN_NAME = "AE orchestrator check-in"
 CHECKIN_AGENT = "orchestrator"
 MAX_CHECKIN_HOURS = 24
@@ -148,7 +148,7 @@ def checkin_prompt(session_id: str | None, note: str | None) -> str:
         lines.append(f"Focus: {' '.join(note.split())}")
     if session_id:
         lines.append(
-            f"Hand it to the orchestrator session Reid talks to: call post_message once "
+            f"Hand it to the orchestrator session the person talks to: call post_message once "
             f'with session_id {session_id} and the text "Check-in: run your check-in now." '
             "Then stop. Only if that call fails, run the check-in yourself as your "
             "instructions describe."
@@ -179,7 +179,7 @@ def checkin_schedule(
 # The fields a patch compares. ``state``, ``host_id`` and ``workspace`` are
 # left to the person: pausing a task or pinning it to a host is theirs. So is
 # ``keep_runs`` (patch P29, 2026-10-13): a task never given one keeps its
-# newest five run sessions, and a reseed must not undo a change Reid made.
+# newest five run sessions, and a reseed must not undo a change the owner made.
 MANAGED_FIELDS = ("prompt", "rrule", "agent_id", "timezone", "max_cost_usd")
 
 
@@ -302,7 +302,7 @@ async def seed(
             continue
         drift = {key: body[key] for key in MANAGED_FIELDS if row.get(key) != body[key]}
         # Fill a missing project, never replace one: moving a task to another
-        # project is Reid's call and a reseed must not undo it. A server without
+        # project is the owner's call and a reseed must not undo it. A server without
         # the task-project patch has no project_id key and is left alone.
         if project_id is not None and "project_id" in row and row["project_id"] is None:
             drift["project_id"] = project_id

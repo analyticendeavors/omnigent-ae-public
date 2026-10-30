@@ -2,17 +2,18 @@
 # One user's OmniGent host container on the box: build it, run it, sign it in
 # (2026-10-20, deploy/README.md "Second user's host (container)").
 #
-#   deploy/host-container.sh steve build      # the host and egress images, tagged like the server
-#   deploy/host-container.sh steve up -d      # start or update (what the user unit runs; builds if missing)
-#   deploy/host-container.sh steve login      # prints the sign-in link the user opens
-#   deploy/host-container.sh steve logs -f host
-#   deploy/host-container.sh steve ps
-#   deploy/host-container.sh steve shell      # a bash shell inside, as the container's user
-#   deploy/host-container.sh steve stop | down
+#   deploy/host-container.sh member build      # the host and egress images, tagged like the server
+#   deploy/host-container.sh member up -d      # start or update (what the user unit runs; builds if missing)
+#   deploy/host-container.sh member login      # prints the sign-in link the user opens
+#   deploy/host-container.sh member logs -f host
+#   deploy/host-container.sh member ps
+#   deploy/host-container.sh member shell      # a bash shell inside, as the container's user
+#   deploy/host-container.sh member stop | down
+#   deploy/host-container.sh member sync-config [--dry-run]   # the shared AE skills, rules, MCP and settings
 #
-# Anything after the user that is not build, login or shell goes to
+# Anything after the user that is not build, login, shell or sync-config goes to
 # `docker compose` for the project omnigent-host-<user>, like compose.sh does
-# for the server. As reid (in the docker group), no sudo.
+# for the server. As <user> (in the docker group), no sudo.
 #
 # Reads two settings from config/server.env, and nothing else from it:
 # OMNIGENT_IMAGE_TAG (the images are tagged with the server's release, so the
@@ -29,6 +30,14 @@ usage() { die "usage: deploy/host-container.sh <user> build|login|shell|<docker 
 HOST_USER="$1"
 shift
 [[ "$HOST_USER" =~ ^[a-z][a-z0-9-]{0,30}$ ]] || die "user '$HOST_USER' must be lower-case letters, digits and dashes (it names the containers, network and volume)"
+
+# sync-config (2026-10-28): the shared AE setup into the user's volume. It reads
+# nothing from the server's settings and never touches the compose project, so it
+# runs before those are needed (deploy/host-config-sync.sh).
+if [ "$1" = sync-config ]; then
+  shift
+  exec "$(dirname "${BASH_SOURCE[0]}")/host-config-sync.sh" "$HOST_USER" "$@"
+fi
 
 SERVER_SETTINGS="${AE_SERVER_SETTINGS:-$ROOT/config/server.env}"
 COMPOSE_FILE="$ROOT/deploy/host-container/docker-compose.yml"

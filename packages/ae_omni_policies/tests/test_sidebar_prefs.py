@@ -53,14 +53,14 @@ def test_normalize_rejects_more_than_500_after_dedupe() -> None:
 def test_store_persists_across_instances(tmp_path: Path) -> None:
     path = tmp_path / "state" / "sidebar.json"
     first = SidebarOrderStore(path)
-    assert first.get("reid").model_dump() == {"order": [], "revision": 0}
-    assert first.put("reid", [A, B], 0).state.revision == 1
+    assert first.get("owner").model_dump() == {"order": [], "revision": 0}
+    assert first.put("owner", [A, B], 0).state.revision == 1
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["version"] == 1
-    assert raw["users"]["reid"]["order"] == [A, B]
-    assert raw["users"]["reid"]["revision"] == 1
-    assert raw["users"]["reid"]["updated_at"]
-    again = SidebarOrderStore(path).get("reid")
+    assert raw["users"]["owner"]["order"] == [A, B]
+    assert raw["users"]["owner"]["revision"] == 1
+    assert raw["users"]["owner"]["updated_at"]
+    again = SidebarOrderStore(path).get("owner")
     assert again.model_dump() == {"order": [A, B], "revision": 1}
 
 
@@ -70,7 +70,7 @@ def test_store_moves_a_corrupt_file_aside_with_a_warning(
     path = tmp_path / "sidebar.json"
     path.write_text("{not json", encoding="utf-8")
     with caplog.at_level(logging.WARNING):
-        assert SidebarOrderStore(path).get("reid").model_dump() == {"order": [], "revision": 0}
+        assert SidebarOrderStore(path).get("owner").model_dump() == {"order": [], "revision": 0}
     assert "moved it to" in caplog.text
     assert list(tmp_path.glob("sidebar.json.corrupt-*"))
 
@@ -98,16 +98,16 @@ def test_a_corrupt_file_survives_the_next_put(tmp_path: Path) -> None:
     path = tmp_path / "sidebar.json"
     path.write_text("{not json", encoding="utf-8")
     store = SidebarOrderStore(path)
-    assert store.put("reid", [A], 0).state.revision == 1
+    assert store.put("owner", [A], 0).state.revision == 1
     kept = list(tmp_path.glob("sidebar.json.corrupt-*"))
     assert [p.read_text(encoding="utf-8") for p in kept] == ["{not json"]
-    assert SidebarOrderStore(path).get("reid").order == [A]
+    assert SidebarOrderStore(path).get("owner").order == [A]
 
 
 def test_a_wrong_shape_file_is_also_kept(tmp_path: Path) -> None:
     path = tmp_path / "sidebar.json"
     path.write_text("[1, 2]", encoding="utf-8")
-    SidebarOrderStore(path).get("reid")
+    SidebarOrderStore(path).get("owner")
     assert not path.exists()
     assert len(list(tmp_path.glob("sidebar.json.corrupt-*"))) == 1
 
@@ -123,8 +123,8 @@ def test_a_bad_file_that_cannot_move_is_never_overwritten(
 
     monkeypatch.setattr(sidebar_prefs.os, "replace", refuse)
     store = SidebarOrderStore(path)
-    assert store.put("reid", [A], 0).state.revision == 1
-    assert store.get("reid").order == [A]
+    assert store.put("owner", [A], 0).state.revision == 1
+    assert store.get("owner").order == [A]
     assert path.read_text(encoding="utf-8") == "{not json"
 
 
@@ -152,24 +152,24 @@ def test_a_failed_save_rolls_back_and_raises(
     _failing_writes(monkeypatch)
     store = SidebarOrderStore(tmp_path / "sidebar.json")
     with pytest.raises(sidebar_prefs.SidebarSaveError):
-        store.put("reid", [A], 0)
-    assert store.get("reid").model_dump() == {"order": [], "revision": 0}
+        store.put("owner", [A], 0)
+    assert store.get("owner").model_dump() == {"order": [], "revision": 0}
 
 
 def test_store_without_a_path_stays_in_memory(tmp_path: Path) -> None:
     store = SidebarOrderStore(None)
-    assert store.put("reid", [A], 0).state.revision == 1
-    assert store.get("reid").order == [A]
-    assert SidebarOrderStore(None).get("reid").order == []
+    assert store.put("owner", [A], 0).state.revision == 1
+    assert store.get("owner").order == [A]
+    assert SidebarOrderStore(None).get("owner").order == []
 
 
 def test_put_conflicts_on_a_stale_revision() -> None:
     store = SidebarOrderStore(None)
-    store.put("reid", [A], 0)
-    stale = store.put("reid", [B], 0)
+    store.put("owner", [A], 0)
+    stale = store.put("owner", [B], 0)
     assert stale.conflict is True
     assert stale.state.model_dump() == {"order": [A], "revision": 1}
-    assert store.put("reid", [B, A], 1).state.revision == 2
+    assert store.put("owner", [B, A], 1).state.revision == 2
 
 
 def test_default_path_follows_env_then_data_dir(
@@ -284,15 +284,15 @@ async def test_two_users_are_kept_apart(
 ) -> None:
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER")
     auth.reset_provider_cache()
-    reid = {"X-Forwarded-Email": "reid@example.com"}
-    steve = {"X-Forwarded-Email": "steve@example.com"}
+    owner = {"X-Forwarded-Email": "owner@example.com"}
+    member = {"X-Forwarded-Email": "member@example.com"}
     assert (
-        await client.put("/v1/ae/sidebar", json={"order": [A], "revision": 0}, headers=reid)
+        await client.put("/v1/ae/sidebar", json={"order": [A], "revision": 0}, headers=owner)
     ).status_code == 200
-    assert (await client.get("/v1/ae/sidebar", headers=steve)).json() == {
+    assert (await client.get("/v1/ae/sidebar", headers=member)).json() == {
         "order": [],
         "revision": 0,
     }
-    other = await client.put("/v1/ae/sidebar", json={"order": [B], "revision": 0}, headers=steve)
+    other = await client.put("/v1/ae/sidebar", json={"order": [B], "revision": 0}, headers=member)
     assert other.json() == {"order": [B], "revision": 1}
-    assert (await client.get("/v1/ae/sidebar", headers=reid)).json()["order"] == [A]
+    assert (await client.get("/v1/ae/sidebar", headers=owner)).json()["order"] == [A]

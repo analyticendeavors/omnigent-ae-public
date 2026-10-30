@@ -1,13 +1,13 @@
 """When each server secret expires, kept from the box's Key Vault reading (2026-10-23).
 
 Why: the Admin Center's Server secrets list (``secrets_health.py``) says which
-keys the server has; Reid also wants to see which ones expire, when, and where
+keys the server has; the owner also wants to see which ones expire, when, and where
 to rotate them, so a secret does not lapse unseen (the Databricks CLI secret,
 2026-10-23, had no reminder at all).
 
 The server never reads Key Vault: the vault uses access policies, and giving
 the live container a vault login only for dates is more reach than the card
-needs. The box does the reading instead. ``secrets_relay.py`` runs as reid on
+needs. The box does the reading instead. ``secrets_relay.py`` runs as the owner on
 a daily timer, lists the vault's secrets (``az keyvault secret list`` returns
 attributes only, never a value) and posts name, enabled, expires and updated
 for the names below to ``POST /v1/ae/secrets/meta``. This module keeps that
@@ -21,7 +21,7 @@ the box's vault and of each extra vault (``AE_EXTRA_VAULTS``), and the file
 keeps all of them, so ``vault_inventory.py`` can list every key we own. Until then
 the post was cut down to the names below. Every name now lands in ``/data`` and an
 admin-only route; names say which services we use, values never leave Key Vault.
-Reid accepted that trade on the concept page. The relay also says, by key name
+The owner accepted that trade on the concept page. The relay also says, by key name
 only, whether the host's env file has its Claude token (``host``).
 
 Source expiry (2026-10-23): a vault secret tagged ``ae-source=entra:<appId>``
@@ -61,6 +61,12 @@ from pydantic import BaseModel, Field, field_validator
 
 VAULT_ENV = "AE_VAULT_NAME"
 """The variable naming the box's Key Vault; the name lives in the box's env only."""
+
+AZURE_COST_SECRET = "azure-cost-client-secret"
+AZURE_COST_APP_ENV = "AE_AZURE_COST_APP_ID"
+DATABRICKS_ACCOUNT_ENV = "AE_DATABRICKS_ACCOUNT_ID"
+"""The Entra app id of the Azure cost reader. A real tenant identifier, so it is not in the
+source tree (2026-10-28): the box's env names it, and the Entra link is hidden while unset."""
 
 
 def box_vault() -> str | None:
@@ -153,20 +159,14 @@ ROTATE: dict[str, tuple[str, str]] = {
     ),
     "databricks-mvp-client-id": (
         "https://accounts.cloud.databricks.com/user-management/serviceprincipals",
-        "Databricks account Analytic Endeavors (MVP), 136eebed-4c6e-4d6d-98f9-be90875db944, "
+        "Databricks account Analytic Endeavors (MVP){account}, "
         "service principal ae-admin-center. The client ID does not change; rotate the secret.",
     ),
     "databricks-mvp-client-secret": (
         "https://accounts.cloud.databricks.com/user-management/serviceprincipals",
-        "Databricks account Analytic Endeavors (MVP), 136eebed-4c6e-4d6d-98f9-be90875db944, "
+        "Databricks account Analytic Endeavors (MVP){account}, "
         "service principal ae-admin-center, Secrets tab. "
         "Check the account name before you generate one.",
-    ),
-    "azure-cost-client-secret": (
-        "https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationMenuBlade/~/Credentials/"
-        "appId/7f123a12-dc5d-47ae-97aa-2458d1adabc3",
-        "Entra app ae-omnigent-azure-cost (7f123a12-dc5d-47ae-97aa-2458d1adabc3), "
-        "Certificates and secrets.",
     ),
 }
 
@@ -236,12 +236,32 @@ ENTRA_CREDENTIALS_URL = (
 )
 
 
+def rotate_for(name: str) -> tuple[str | None, str] | None:
+    """:data:`ROTATE`'s entry for a vault secret. The Azure cost app's Entra link is built from
+    ``AE_AZURE_COST_APP_ID`` and is ``None`` (the vault page opens instead) while that is unset.
+    The Databricks hints name the account id from ``AE_DATABRICKS_ACCOUNT_ID`` and leave it out
+    while that is unset (2026-10-29)."""
+    if name == AZURE_COST_SECRET:
+        app_id = os.environ.get(AZURE_COST_APP_ENV, "").strip()
+        if not app_id:
+            return None, "Entra app ae-omnigent-azure-cost, Certificates and secrets."
+        return (
+            ENTRA_CREDENTIALS_URL.format(app_id=app_id),
+            f"Entra app ae-omnigent-azure-cost ({app_id}), Certificates and secrets.",
+        )
+    entry = ROTATE.get(name)
+    if entry is not None and "{account}" in entry[1]:
+        account = os.environ.get(DATABRICKS_ACCOUNT_ENV, "").strip()
+        entry = (entry[0], entry[1].replace("{account}", f", {account}" if account else ""))
+    return entry
+
+
 def rotate_link(meta: SecretMeta, vault: str) -> tuple[str, str]:
     """Where *meta* is rotated and what that page is: :data:`ROTATE`, else the Entra
     app its source tag names (2026-10-23, the expiry alerts), else its Key Vault page."""
-    known = ROTATE.get(meta.name)
+    known = rotate_for(meta.name)
     if known is not None:
-        return known
+        return known[0] or edit_url(vault, meta.name), known[1]
     if meta.source and meta.source.startswith("entra:"):
         app_id = meta.source.removeprefix("entra:")
         return (
@@ -470,7 +490,7 @@ def words(key: str, reading: Reading | None, now: datetime) -> Words:
     vault_name = VAULT_NAMES.get(key) or HOST_VAULT_NAMES.get(key)
     if vault_name is None:
         return Words()
-    rotate_url, rotate_hint = ROTATE.get(vault_name, (None, DEFAULT_HINT))
+    rotate_url, rotate_hint = rotate_for(vault_name) or (None, DEFAULT_HINT)
     vault = reading.vault if reading else box_vault()
     edit = edit_url(vault, vault_name) if vault else None
     out = Words(

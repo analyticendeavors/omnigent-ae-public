@@ -16,7 +16,7 @@
 #   1. With --tip, SHA must be the commit REF points at (the current tip of
 #      main); an older commit is skipped, the newer one's run tags it.
 #   2. A commit that already carries any ae-v* tag is skipped (idempotent;
-#      also covers a tag Reid pushed by hand).
+#      also covers a tag the owner pushed by hand).
 #   3. Unless --force, something that ships must have changed since the
 #      newest ae-v* tag reachable from SHA: packages/, config/, agents/,
 #      deploy/Dockerfile, patches/, upstream.lock or the upstream submodule

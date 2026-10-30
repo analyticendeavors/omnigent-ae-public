@@ -369,7 +369,7 @@ describe("who moves next", () => {
     expect(rows[0]).toMatchObject({ title: "2 alerts to fix: a, b", meta: "web · worst is critical" });
   });
 
-  it("files the rest as lines that are not Reid's to move", () => {
+  it("files the rest as lines that are not the owner's to move", () => {
     const { quiet, ready, oldBranches } = analyze(busy(), NOW);
     const line = (who: string) => quiet.find((l) => l.who === who);
     expect(quiet.map((l) => l.who)).toEqual(["GitHub", "CI", "Sweep", "Drafts", "Recent branches", "Kept", "View only"]);
@@ -537,7 +537,7 @@ describe("the card", () => {
     expect(getTile("git")?.health).toBe("ok");
   });
 
-  it("colours the header warn when rows need Reid but no alert needs a fix", async () => {
+  it("colours the header warn when rows need the owner but no alert needs a fix", async () => {
     const data = calm({ repos: [repo("contoso/web", { prs: [pr(1)] })] });
     const { context } = stubContext([ok(data)]);
     const node = await mount(context);

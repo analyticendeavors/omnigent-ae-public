@@ -206,8 +206,7 @@ describe("the section", () => {
     const { context } = stubContext({ [GET]: [ok(connected())] });
     const node = await mount(context);
     expect(pill(node)).toBe("Connected");
-    expect(node.querySelector(".card-fabric")?.classList.contains("fabric-on")).toBe(true);
-    expect(node.querySelector(".fabric-row-solo")).not.toBeNull();
+    expect(node.querySelector(".card-fabric")).toBeNull();
     expect(buttons(node)).toEqual([]);
     expect(notices(node)).toEqual([]);
     expect(node.querySelector(".host-refreshed")?.textContent).toMatch(/^Updated /);
@@ -296,6 +295,87 @@ describe("the section", () => {
   });
 });
 
+describe("the header chip (2026-10-29)", () => {
+  const chipOf = (node: ParentNode) => node.querySelector<HTMLElement>(".host-chip")!;
+  const list = (node: ParentNode) => node.querySelector<HTMLElement>(".host-list")!;
+
+  it("shows the dot, the name and Connected when connected, and leaves the list empty", async () => {
+    const { context } = stubContext({ [GET]: [ok(connected())] });
+    const node = await mount(context);
+    const chip = chipOf(node);
+    expect(chip.classList.contains("fabric-on")).toBe(true);
+    expect(chip.querySelector(".fabric-dot")).not.toBeNull();
+    expect(chip.querySelector(".host-chip-name")?.textContent).toBe("example-box");
+    expect(chip.querySelector(".fabric-state")?.textContent).toBe("Connected");
+    expect(chip.getAttribute("title")).toBe("Box host");
+    expect(list(node).childElementCount).toBe(0);
+  });
+
+  it("shows Not connected as unknown, with the meta line in the list", async () => {
+    const { context } = stubContext({ [GET]: [ok(status())] });
+    const node = await mount(context);
+    const chip = chipOf(node);
+    expect(chip.classList.contains("fabric-unknown")).toBe(true);
+    expect(chip.querySelector(".fabric-state")?.textContent).toBe("Not connected");
+    expect(meta(list(node))).toEqual(["The host is not connected to the server"]);
+  });
+
+  it("marks a rejected host failed, with the button and the 403 notice in the list", async () => {
+    const { context } = stubContext({ [GET]: [ok(rejected())] });
+    const node = await mount(context);
+    expect(chipOf(node).classList.contains("fabric-failed")).toBe(true);
+    expect(buttons(list(node))[0]?.textContent).toBe(ASK_LABEL);
+    expect(notices(list(node))[0]).toMatch(/HTTP 403/);
+  });
+
+  it("updates in place when a poll flips offline to connected, and empties the list", async () => {
+    const { context } = stubContext({ [GET]: [ok(status()), ok(connected())] });
+    const node = await mount(context);
+    const chip = chipOf(node);
+    expect(list(node).childElementCount).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(POLL_DISCONNECTED_MS);
+    expect(chipOf(node)).toBe(chip);
+    expect(chip.classList.contains("fabric-on")).toBe(true);
+    expect(chip.classList.contains("fabric-unknown")).toBe(false);
+    expect(chip.querySelector(".fabric-state")?.textContent).toBe("Connected");
+    expect(list(node).childElementCount).toBe(0);
+  });
+
+  it("leaves the chip's nodes alone when a redraw has the same words (it is a live region)", async () => {
+    const { context } = stubContext({ [GET]: [ok(sent()), ok(sent())] });
+    const node = await mount(context);
+    const kids = [...chipOf(node).childNodes];
+    expect(kids.length).toBeGreaterThan(0);
+    await vi.advanceTimersByTimeAsync(1000);
+    await vi.advanceTimersByTimeAsync(1000);
+    expect([...chipOf(node).childNodes]).toEqual(kids);
+    kids.forEach((kid, i) => expect(chipOf(node).childNodes[i]).toBe(kid));
+  });
+
+  it("says Reading... before the first answer and Unknown when the first read fails", async () => {
+    const first = stubContext({ [GET]: [failed(500, "boom")] });
+    const node = hostSection();
+    document.getElementById("root")?.appendChild(node);
+    activateHost(first.context, node);
+    expect(chipOf(node).textContent).toBe("Reading...");
+    await flush();
+    expect(chipOf(node).textContent).toBe("Unknown");
+  });
+
+  it("is found when it lives outside the host block, in a card header", async () => {
+    const { context } = stubContext({ [GET]: [ok(connected())] });
+    const block = hostSection();
+    const card = document.createElement("section");
+    const header = document.createElement("header");
+    header.appendChild(block.querySelector(".host-chip")!);
+    card.append(header, block);
+    document.getElementById("root")?.appendChild(card);
+    activateHost(context, card);
+    await flush();
+    expect(header.querySelector(".fabric-state")?.textContent).toBe("Connected");
+  });
+});
+
 describe("an ask and a read already out", () => {
   it("reads again after the ask instead of trusting a read that began before it", async () => {
     const waiting: Record<string, Array<(reply: Reply) => void>> = {};
@@ -330,5 +410,33 @@ describe("an ask and a read already out", () => {
     answer(GET, ok(asked));
     await flush();
     expect(buttons(node)[0]?.textContent).toBe("Asking the box...");
+  });
+});
+
+describe("a signed-in non-admin (2026-10-28)", () => {
+  it("gets one quiet line and no more reads", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+    const { context, request } = stubContext({ [GET]: [denied, denied] });
+    const node = await mount(context);
+    expect(node.textContent).toContain("The box host is for admins.");
+    expect(notices(node)).toEqual([]);
+    window.dispatchEvent(new Event("focus"));
+    await vi.advanceTimersByTimeAsync(POLL_CONNECTED_MS * 2);
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a false admin_only answer (2026-10-28)", () => {
+  it("is looked at again in five minutes and the card comes back on a 200", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+    const { context, request } = stubContext({ [GET]: [denied, ok(connected())] });
+    const node = await mount(context);
+    expect(node.textContent).toContain("The box host is for admins.");
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    expect(request).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(node.textContent).not.toContain("is for admins");
+    expect(pill(node)).toBeTruthy();
   });
 });

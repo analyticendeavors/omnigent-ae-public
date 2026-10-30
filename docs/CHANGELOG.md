@@ -88,7 +88,7 @@ Tailscale; `ae-omnigent-dump` at 02:40 local, ahead of the box's restic run at 0
 and outside its timer collision map; `ae-omnigent-host`, a user unit running
 upstream's own foreground service entry, which is what `omnigent host enable` writes,
 not `--background`, whose detached daemon systemd could not supervise),
-`pull-secrets.sh` (Key Vault to the two env files, 640 root:reid, atomically, no
+`pull-secrets.sh` (Key Vault to the two env files, 640 root:<user>, atomically, no
 value ever echoed; the vault names are the handoff's proposal and unverified),
 `backup-omnigent.sh` (a consistent `pg_dump`, newest seven), `install-host.sh` (the
 host's Python through `uv`, from the pinned submodule) and `README.md`, the runbook
@@ -119,7 +119,7 @@ Claude app), and travel mode with only an iPhone (rewritten
 2026-09-24; it said laptop before): code in Claude Code on the web, box work in a
 session on the box's host, root steps through Cockpit's terminal, what still needs
 a keyboard, a pre-trip checklist with one reboot at home, and what to do when the box
-is unreachable. Done when Reid opens the
+is unreachable. Done when the owner opens the
 lot on the phone and resumes a parked task into a session on a host; that last step
 needs the box and a person, and is the checklist's final line.
 
@@ -186,7 +186,7 @@ before. Screenshots at 1440x900 of every preset and the picker are in
 `docs/screenshots/split-panes/`.
 
 Run on box (2026-09-25): the eleventh core patch, `patches/0011` (P11, web). A
-session on a host often replies with a shell command that Reid used to copy by hand
+session on a host often replies with a shell command that the owner used to copy by hand
 into a shell, usually on the phone. Assistant code blocks tagged bash, sh, shell,
 zsh, console or powershell, or untagged blocks that read as commands, now carry a
 Run button beside upstream's copy button, for the owner of a session whose agent
@@ -208,7 +208,7 @@ output, Run hides while a block is still streaming, and the terminal gets the fo
 after a Run so a sudo password can be typed straight away.
 
 Release on merge (2026-09-24): `.github/workflows/release.yml` makes a merge to
-`main` the whole release, for when Reid has only a laptop and Claude web
+`main` the whole release, for when the owner has only a laptop and Claude web
 sessions cannot push tags. When CI passes on a push to `main`
 it tags the tip `ae-vX.Y.Z.N` (the next N for the pinned upstream tag, 1 after a
 sync), but only when something that ships changed since the last tag and the commit
@@ -217,11 +217,11 @@ image; the box's auto-update timer deploys it. Docs-only and tests-only merges m
 no tag; to ship one anyway, or re-ship, run the Release workflow on `main` with
 `force` on.
 
-Your move (2026-09-24): no core patch. One screen of everything waiting on Reid,
-because across a long day he kept asking what was left and will merge from his phone.
+Your move (2026-09-24): no core patch. One screen of everything waiting on the owner,
+because across a long day they kept asking what was left and will merge from their phone.
 `GET /v1/ae/your-move` (`ae_omni_policies/your_move.py`) aggregates
-sessions that need him (an open gate, an approval outstanding, `blocked`, `review`),
-lot items resurfacing today or overdue, the steward's latest brief and his open pull
+sessions that need them (an open gate, an approval outstanding, `blocked`, `review`),
+lot items resurfacing today or overdue, the steward's latest brief and their open pull
 requests with CI state, each source isolated so one failure shows inline and the rest
 render, cached five seconds (pull requests sixty). The extension gains a "Your move"
 page, first in the AE nav, and a compact block on top of the Parking Lot page. Pull
@@ -256,15 +256,15 @@ the plan-limits screenshot set (removed before publication) and the usage-panel 
 `patches/0018` (P18, web, 2026-09-24) colors the ring as the context fills, as
 Claude Code desktop does (warning from 60%, destructive from 80%; the popover's
 Context window bar uses the same steps), and gives the prompt cache bar under it its
-own colors and a caption, because Reid read that bar as a second meter.
+own colors and a caption, because the owner read that bar as a second meter.
 
 Shorter usage popover and light tooltips (2026-10-14): `patches/0040` and `patches/0041`
-(P40, P41, web). Reid found the popover too tall (933 px with his numbers, so it
+(P40, P41, web). The owner found the popover too tall (933 px with their numbers, so it
 scrolled) and sent Claude Desktop's context popover as the model. It now opens on the
 context header over one bar with the prompt cache parts joined into it, each plan limit
 takes two lines (label, reset and percent, then the bar), and the other plan and the
 collaborators sit behind "See detailed breakdown"; the explainers moved behind
-tap-to-open info toggles. Folded it is 371 px. He also read the light-mode tooltips, a
+tap-to-open info toggles. Folded it is 371 px. They also read the light-mode tooltips, a
 near-black box with white text, as a dark-mode bug: patch 0041 gives every tooltip the
 popover surface in both themes, the style upstream's skill pills already used.
 `docs/PLAN-LIMITS.md` ("The shorter popover") has the details; screenshots in
@@ -274,7 +274,7 @@ never have a reading) are gone, rows read by name, a missing reading is one "No 
 yet" line, model ids read as names, and a 1M Claude Code window shows how far it is from
 auto-compact (`docs/PLAN-LIMITS.md`, "The cleaner breakdown").
 
-Fast mode switch (2026-10-14): `patches/0044` (P44, server, runner and web). Reid asked
+Fast mode switch (2026-10-14): `patches/0044` (P44, server, runner and web). The owner asked
 for Claude Desktop's fast mode toggle in the model menu. A Claude session's model menu
 now ends with a Fast mode switch ("Faster Opus output; bills usage credits"), enabled on
 Opus 5.5, Opus 5 and Opus 4.8 only. It reads the session's state each time the menu
@@ -297,7 +297,7 @@ model, model picks wait for a pending flip, and a flip never starts a terminal.
 Screenshots in `docs/screenshots/fast-mode/`.
 
 Agents pane like Claude Desktop's Background tasks (2026-10-16): `patches/0055` (P55,
-web). Reid sent the Agents graph drawn as one top-down tree about 2000 px wide, which
+web). The owner sent the Agents graph drawn as one top-down tree about 2000 px wide, which
 the tall right pane shrank to dots, with "feels like the agents graph should have a
 left/right option as the pane on right is usually taller", and Claude Desktop's
 Background tasks pane as the model. The graph now runs left to right whenever the pane
@@ -316,7 +316,7 @@ a pan; all six are fixed in the same patch. Screenshots in
 `docs/screenshots/agents-pane/`.
 
 Agents pane Model column (2026-10-16): `patches/0063` (P63, server, runner and web).
-After the redesign went live Reid sent the pane with every Model cell empty and each
+After the redesign went live the owner sent the pane with every Model cell empty and each
 status dot floating in that gap ("still seems the same??"). The routed model was the
 only source, and agents are rarely routed. Child session rows now carry the model the
 agent actually ran on: the harness's own report, else the model its own usage was
@@ -327,10 +327,10 @@ before it stay blank. Claude ids print as names ("Sonnet 5.5"), other ids as the
 harness spells them ("gpt-6-astra"), and the status dot sits right of Time. Screenshots
 in `docs/screenshots/agents-pane/model-*.png`.
 
-Session rail (2026-10-17): `patches/0071` (P71, web, runner and server). Reid sent
+Session rail (2026-10-17): `patches/0071` (P71, web, runner and server). The owner sent
 Claude Desktop's session rail and Codex's usage popover and asked for the popover's
-detail to move into a pane beside the chat that he can reorder, plus triage,
-schedules and the files he sent. A toggle in the chat header (on a phone, "Session
+detail to move into a pane beside the chat that they can reorder, plus triage,
+schedules and the files they sent. A toggle in the chat header (on a phone, "Session
 rail" in the session menu) opens a column of folding sections about the open session:
 Triage (a status switch, time since it started, an open gate with the Dashboard's
 four buttons, the absorbed and unfiled lines and the next step), Environment (host,
@@ -355,7 +355,7 @@ the session-rail screenshot set (removed before publication); the data paths are
 session rail").
 
 Session activity indicator (2026-10-17): `patches/0074` (P74, web and server). Mid-build
-of the session rail Reid asked "are you still working? I can't tell": a session row
+of the session rail the owner asked "are you still working? I can't tell": a session row
 showed a spinner only while its turn ran, so a session whose turn had ended while
 agents, a background shell or a check-in were still going looked finished, and a long
 silent step looked frozen. Every session list row and websocket update now carries
@@ -374,8 +374,8 @@ naming what finished and what starts next. Screenshots in
 the session-activity screenshot set (removed before publication).
 
 Hover status (2026-10-20, `patches/0116`, web): hovering a session in the sidebar now
-says what it is doing without opening it. Reid asked for a brief preview of whether a
-session is waiting or working, so he would not have to click into each one. The hover
+says what it is doing without opening it. The owner asked for a brief preview of whether a
+session is waiting or working, so they would not have to click into each one. The hover
 card gains a status block under the title, read from the row's own state so it always
 matches the row's icon: "Working" with the turn's elapsed time and current step, "Quiet
 for 9m" with the last step, "Waiting on you" with the open question or the step awaiting
@@ -386,23 +386,23 @@ every 5 seconds so an open card follows the session.
 
 Phone session menu (2026-10-20, `patches/0121` and `0122`, web): on a phone, long-pressing
 a session or opening its menu showed every Status value and every Move item, about 20 rows,
-and the menu ran off the screen (Reid's screenshot that day). Status and Move are now one
+and the menu ran off the screen (the owner's screenshot that day). Status and Move are now one
 row each, Status showing the current value ("Working" with its icon); tapping either opens
 its items in place under it, one at a time, so the menu is 11 rows closed and 16 with Status
-open. Reid picked this over drill-in pages and a bottom sheet from mockups. Desktop keeps
+open. The owner picked this over drill-in pages and a bottom sheet from mockups. Desktop keeps
 its side flyouts.
 
 PR link previews (2026-10-20, `patches/0118`, web): resting the pointer on any GitHub
 pull request link in chat opens a small card with the state (Open, Draft, Merged,
 Closed), repo and number, title, author, lines added and removed, files changed and,
-while it is open, its checks. Reid wanted a glance at each pull request a session
+while it is open, its checks. The owner wanted a glance at each pull request a session
 reports as done before opening it. The card reads the merge card's `/v1/ae/prs` data and
 shares its cache; it fetches only once opened. Touch screens have no hover, so a tap
 still just opens the link.
 
-Effort shown when none was picked (2026-10-20, `patches/0119`, runner and web): Reid
+Effort shown when none was picked (2026-10-20, `patches/0119`, runner and web): the owner
 could not tell a Claude session's effort before changing it, since the composer's Effort
-menu showed no level and no check when he had never picked one. Claude Code then takes
+menu showed no level and no check when they had never picked one. Claude Code then takes
 `effortLevel` from its settings, which the web never saw. At each launch without
 `--effort` the runner now reads that level the way Claude does (managed policy, the
 workspace's `.claude/settings.local.json` and `.claude/settings.json`, then the launch
@@ -417,7 +417,7 @@ during launch. A session picks this up at its next launch.
 Model check placement (2026-10-20, `patches/0120`, web): in the composer menu's
 two-column model grid the check sat at the right edge of the picked model's cell,
 beside the next column's model, so a session on Opus 5.5 looked like it was on Haiku
-5.5 (Reid's screenshot). The check now sits before the model's name.
+5.5 (the owner's screenshot). The check now sits before the model's name.
 
 Per-model default effort (2026-10-20, `patches/0124`, runner and web): the first
 release (`0119`) read only a top-level `effortLevel`, but Claude Code 2.1.304 keeps
@@ -431,7 +431,7 @@ session picks this up at its next launch.
 
 Prompt suggestions (2026-10-20, `patches/0123`, harness, server and web;
 https://github.com/analyticendeavors/omnigent-ae/issues/45): after each finished Claude
-turn the web composer shows a guess at Reid's next message as grey ghost text, the way
+turn the web composer shows a guess at the owner's next message as grey ghost text, the way
 Claude Code's own terminal does in print mode. Tab, or a tap on its "Tab to use" chip
 ("Tap to use" below 640 px), fills it into the box; nothing is ever sent. A tap on the grey
 text focuses the box as usual. Typing hides it, Esc dismisses it until the next turn, the
@@ -459,9 +459,27 @@ moment a subagent starts running, and at startup it sweeps the subagents still m
 running: one silent for an hour with no recorded return settles to finished, the rest
 get the check back for the time remaining.
 
+Disconnected subagents after a restart (2026-10-30, `patches/0254`, server): a subagent
+killed mid-tool-call kept reading Running for another hour after every runner restart or
+deploy. The restarted runner re-sends the dead subagent's old items and reports it
+running; the server stores nothing new but restarted the full 60-minute settle from that
+moment. The settle now counts from the subagent's newest stored item, so a restart that
+brings only old items settles it at once. A settled subagent now reads grey
+"Disconnected" under Finished, not "Done", and a real resume clears that. A subagent
+waiting on a background task is timed out the same way, but one blocked on a question or
+an approval from you is never settled. The hour is the default of
+`OMNIGENT_AE_CLAUDE_SUBAGENT_STALE_AFTER_S`. One limit: a live subagent inside a single
+tool call longer than that reads Disconnected until its next record arrives.
+
+A follow-up (`patches/0255`, server) closes a race in that settle: if the subagent
+resumed while the Disconnected mark was being written, the mark could overwrite the
+resume. The settle now checks again after each step and backs off, clearing its mark.
+The startup sweep also covers subagents a restart left waiting. The environment value
+must be a finite number of seconds; `inf` and `nan` are ignored.
+
 Merged PR fold (2026-10-20, `patches/0129`, web): a finished session ended on three
 full Merged cards under its last message, about 550 px that repeated the TLDR's links
-and needed nothing from Reid. Merged and closed pull requests under one assistant
+and needed nothing from the owner. Merged and closed pull requests under one assistant
 message now fold into a single row ("3 merged #167 #161 #169"); opening it lists one
 titled line per pull request, and opening a line shows that pull request's full card
 with Review details and the AE compliance review. Open and draft pull requests keep
@@ -471,7 +489,7 @@ page reloads, so its after-merge note and "Mark session done" do not jump into t
 one merged anywhere else folds within 30 seconds, and a closed one that is reopened
 comes back as a card.
 
-Prompt suggestions in every session (2026-10-20, `patches/0128`, harness only; Reid's
+Prompt suggestions in every session (2026-10-20, `patches/0128`, harness only; the owner's
 call after https://github.com/analyticendeavors/omnigent-ae/pull/164 shipped with a skip
 for named Claude accounts): the ghost text now also follows a Claude session on a named
 account such as "AE Backup", and a Codex session. A named-account session's side call runs
@@ -499,6 +517,26 @@ rail also reads the same live list as the Agents tab, which used to show a resum
 as running a minute before the rail did. The time shown still counts from the first launch:
 a resume leaves no trace the list can read.
 
+Child chats in the rail's Agents card (2026-10-29, `patches/0256`, web): the sessions a chat
+starts with `create_session` ran outside every card in the rail, so a lead had to scan the
+sidebar to learn which helper was working, done or stuck. The Agents card now opens with a
+Child chats part when the open chat has such children (sessions whose `ae.orch` label names
+it; forks are left out). A child waiting on you is pinned first with its question and two
+buttons: Answer opens the action dock's tray at that child's prompt, which is the one real
+card for it, and falls back to opening the child's chat when the prompt is not mirrored
+here; Open chat goes to the child. The other children are rows with a role badge, what
+the child is doing (its newest step), its last reply or error, and a time; closed ones fold
+under one "N closed" toggle. The header counts them ("1 needs you · 1 running"), subagents
+sit under their own heading, and the card no longer reads "No agents have run" while child
+chats exist. The total line is now "This chat and its helpers" and adds the child chats'
+spend: they are standalone sessions, so the lead's own usage does not include them (checked
+live: every family child reads no parent session). Archived children are read on their own (one read of up to 600 newest
+archived sessions shared by every chat, kept a minute, read again when a child leaves the open
+list) and fold under "N closed" with the reference ones; a live row always beats the archived
+read. The fold says when the read hit its cap or failed. Answer scrolls
+the tray to that child's own prompt. Known limit: no pull request chip on a row, because a
+row's pull request is not in the list data.
+
 Merged PR row links and carets (2026-10-20, `patches/0131`, web): in the folded row of
 merged pull requests, the numbers ("#173 #172 #175") were plain text, and the opened
 list's lines gave no sign that they open. Each number is now a link to its pull request,
@@ -508,7 +546,7 @@ opens the fold. Each opened line starts with a caret that points right while its
 closed and down while it is open.
 
 Prompt suggestion alternatives (2026-10-20, `patches/0132`, harness, server and web): the
-same single Haiku call now returns up to three different guesses at Reid's next message, best
+same single Haiku call now returns up to three different guesses at the owner's next message, best
 first. The chip reads "Tab to use | 1/3", Alt+] and Alt+[ step through the guesses (a tap on
 the counter does the same on a phone), Tab still takes the one shown, and a long guess wraps
 instead of being cut off. Settings > Chat has Suggestion keys to record other combos; it
@@ -538,7 +576,7 @@ Fast mode toggle. `scripts/claude-effort-defaults.py` prints the default table f
 installed Claude Code binary for the next bump.
 
 Remove a personal Claude login (2026-10-20, `patches/0135`, server, host and web): Settings,
-Claude accounts could rename an extra Claude login but never remove it, so Reid's personal
+Claude accounts could rename an extra Claude login but never remove it, so the owner's personal
 "AE Backup" could not go once the shared one existed. Every personal login now has Remove
 beside Rename, asking once; it deletes the login and its token from the host, and new chats
 fall back to the default CLI login when the removed one was selected. Running chats keep the
@@ -553,12 +591,12 @@ width, and above 1920px the column stays 48rem instead of growing to 56rem, whic
 text at 80ch beside a wide empty strip.
 
 Action dock above the composer (2026-10-20, `patches/0137`, web and server): what waits on
-Reid in a chat was spread over the feed (a question card, a ready merge card far up, a merge
+the owner in a chat was spread over the feed (a question card, a ready merge card far up, a merge
 that has not reached the box yet). One compact line now sits above the composer's workspace
 bar and gathers it: the most urgent item with its button (a question's "Jump to it", a ready
 pull request's Merge, a pending deploy's Admin Center link and dismiss), then a tinted badge
 per other kind and a caret that opens a list of every item (design E1 collapsed, D3b opened,
-D4 deploy tracking, approved by Reid). Merge keeps the card's confirm step inline in the dock.
+D4 deploy tracking, approved by the owner). Merge keeps the card's confirm step inline in the dock.
 An item hides while its own card is on screen, and nothing waiting draws nothing. Deploy lines
 are for omnigent-ae only: `GET /v1/ae/prs/{owner}/{repo}/{n}/deploy`
 (`ae_omni_policies/pr_deploy.py`) says whether the running release contains the pull
@@ -572,30 +610,30 @@ a confirm is open the list drops its height cap, and the line scrolls into view.
 
 Session title in the phone app header (2026-10-21, `patches/0139`, web): in the iOS and
 Android apps the header showed only the sidebar button, the slots chip and the menu, so
-Reid had to open the sidebar to see which session he was in. The app's own top bar only
+the owner had to open the sidebar to see which session they were in. The app's own top bar only
 switches servers. The header now shows the session's title there, cut short with an
 ellipsis when long; the folder icon and sub-agent segments stay hidden, and a sub-agent
 still shows only its Back link.
 
-Run pastes multi-line blocks on tmux 3.6 (2026-10-21, `patches/0143`, server): Reid's Run on an
+Run pastes multi-line blocks on tmux 3.6 (2026-10-21, `patches/0143`, server): the owner's Run on an
 eight-line bash block was refused with "This shell has not turned on bracketed paste". bash
 had turned it on before the browser attached, and the attach seed reads that mode from a tmux
 format that only exists from tmux 3.7; the box runs 3.6a. The seed now infers it for a bash,
 zsh or fish prompt when tmux cannot say, so the browser terminal knows and Run pastes the
 block as one.
 
-Session menu widths and one New Chat menu (2026-10-21, `patches/0140`, web): Reid's
+Session menu widths and one New Chat menu (2026-10-21, `patches/0140`, web): the owner's
 screenshot of the chat's session menu showed empty space between the model names and their
 shortcut digits, and an Account submenu stretched by its one-line scope hint. The session
 menu (304 px), the harness row menu above it (280 px) and the Account (334 px), Effort and
 Previous models submenus now each hug their widest row with a shared 160 px floor; the hint
-wraps under the account rows. Reid then asked for every associated menu to match, so New
+wraps under the account rows. The owner then asked for every associated menu to match, so New
 Chat's Claude Code and Codex picker draws the same one-column menu as a chat (it had
 account chips in a row, effort listed inline and checks on the right). Measured in the real
 app, both places: 214 px session menu, 187 px Account, 160 px Effort and Previous models.
 
 Action dock as one strip (2026-10-21, `patches/0141`, web): with anything waiting the dock
-was its own row above the workspace bar, so the composer carried two strips (69 px). Reid
+was its own row above the workspace bar, so the composer carried two strips (69 px). The owner
 asked whether one would be better, saw the mockups and said build. The dock now lives inside
 the workspace bar (37 px, 28 px on a phone): folder and PR chips, a hairline, the most urgent
 item with its button, the badges, the bar's own right cluster, then the caret. While anything
@@ -606,8 +644,8 @@ Nothing waiting leaves the bar as it was. After the dual review the tray always 
 and closes on Escape, a confirm gets up to half the screen, and a confirm whose item goes
 away closes on its own.
 
-Usage gate in the action dock (2026-10-21, `patches/0142`, web): Reid wanted a prompt before
-a session's account runs into its 5-hour or weekly limit, so he can switch model, account or
+Usage gate in the action dock (2026-10-21, `patches/0142`, web): the owner wanted a prompt before
+a session's account runs into its 5-hour or weekly limit, so they can switch model, account or
 chat instead of paying overage. At 90% of either window the dock shows "AE Default is at 92%
 of its weekly limit, resets Thu 09:00" with Switch model (the composer's model menu), Switch
 account (the fork dialog, history included, where the Claude account row picks the login;
@@ -616,26 +654,26 @@ until that window resets, in every chat on that account.
 
 Action dock keeps merges in view (2026-10-21, `patches/0144`, web): the dock hid an item
 while any sliver of its own card was on screen, so a chat with three pull requests to merge
-showed one at a time and its lead changed as Reid scrolled. Reid reads the dock as what is
+showed one at a time and its lead changed as the owner scrolled. The owner reads the dock as what is
 pending now, not what is off screen. Merges, deploys and the usage item now stay whatever
 the scroll position; only a question still hides while its card is in view, since that card
-floats just above the dock (Reid picked this from mockups). A ready pull request whose card
+floats just above the dock (the owner picked this from mockups). A ready pull request whose card
 is in view shows Merge in both places, and Confirm in either is disabled while the other is
 merging.
 
 PR preview in the action dock (2026-10-21, `patches/0145`, web): hovering a pull request link
 in the chat shows a small preview (state, title, author, size, checks), but the dock's
-`#202` only showed a tooltip and opened GitHub. Reid asked for the same preview there, before
+`#202` only showed a tooltip and opened GitHub. The owner asked for the same preview there, before
 the click. The dock's number now uses the chat's hover card, and its tooltip goes, since it
 would show over the preview.
 
 Merged PR row on one line (2026-10-21, `patches/0146`, web): on a phone the merged pull
 request row's numbers (`#205 #203 #201`) wrapped to a second line beside "3 merged" and the
-deploy status, and Reid said it looked odd. They now stay on one line and scroll sideways
+deploy status, and the owner said it looked odd. They now stay on one line and scroll sideways
 when they do not fit; the count and the opened fold still list every one.
 
 Dock preview opens upward (2026-10-21, `patches/0147`, web): the action dock's pull request
-preview (`0145`) opened downward, over the composer Reid types in. It now opens above the
+preview (`0145`) opened downward, over the composer the owner types in. It now opens above the
 bar, the same way the dock's list opens; chat links keep opening as before.
 
 Fewer gh auth status calls (2026-10-21, `patches/0148`, runner): every read of a session's
@@ -644,7 +682,7 @@ two minutes, so the box ran about four a minute. The answer is now cached for 60
 in one file the host's processes share, with only signed-in answers kept.
 
 Draft pull requests in the action dock (2026-10-21, `patches/0149`, web): the dock listed
-only pull requests ready to merge, so a draft never showed (Reid's report, with #221 as
+only pull requests ready to merge, so a draft never showed (the owner's report, with #221 as
 the example). A draft now gets its own line, "#n draft · x/y checks", after the merges,
 with a Mark ready button; once ready and green it becomes the Merge line.
 
@@ -661,7 +699,7 @@ extensions and nothing else on portal.azure.com; the link reveals no subscriptio
 
 Every open pull request in the action dock (2026-10-22, `patches/0152`, web): the dock
 listed only drafts and pull requests ready to merge, so PR 228 sat outside it while one of
-its twelve checks ran and Reid, having said "merge when ready", had nothing to watch
+its twelve checks ran and the owner, having said "merge when ready", had nothing to watch
 (https://github.com/analyticendeavors/omnigent-ae/pull/228). Every other open pull request
 of the session now gets a waiting line with the thread receipt's word and tone ("checks
 11/12", "conflicts", "1 check failed", "behind main", "review requested"), after the drafts
@@ -678,7 +716,7 @@ waiting line showed only "#240" and its icon. The dock hides a line's detail on 
 because a button beside it names the state (Merge, Mark ready); a waiting line usually has
 no button, so its word ("checks 11/12") now stays.
 
-Slot limit from Settings (2026-10-22, `packages/ae_omni_policies`): Reid runs four slots
+Slot limit from Settings (2026-10-22, `packages/ae_omni_policies`): the owner runs four slots
 and expected to change the number on Settings > Global Policies. The slot cap policy has
 taken a `limit` there since the Edit button (`patches/0095`), but every count in the web
 UI read `AE_SLOT_LIMIT` through `GET /v1/ae/capacity`, so a limit set on the page held
@@ -691,7 +729,7 @@ when its window regains focus once its last read is five minutes old (patch 0014
 cache, whose comment still says the limit moves only at a restart). Without a `limit`
 on the page nothing changes.
 
-Session rail when a session opens (2026-10-22, `patches/0155`, web): Reid wanted the rail,
+Session rail when a session opens (2026-10-22, `patches/0155`, web): the owner wanted the rail,
 not the files panel, when a session opens. "Open the session rail in every session" still
 let a restored workspace panel come back whenever it fit beside the rail, and the rail then
 made way for it. Settings > Chat now asks "When a session opens, show": Session rail (the
@@ -702,17 +740,17 @@ in `docs/PLAN-LIMITS.md` ("When a session opens").
 
 Approval code under Show details (2026-10-22, `patches/0156`, web): on approval cards
 that gate the person's own message (the rabbit-hole check, the slot cap) the JSON under
-the policy's sentence now sits behind a Show details toggle, closed by default; Reid had
+the policy's sentence now sits behind a Show details toggle, closed by default; the owner had
 asked for it on 2026-10-17. Cards that gate what the agent is about to do (a tool call's
 command, a response) keep their code in view, whoever wrote the policy.
 
 Insertion line between lists (2026-10-22, `patches/0157`, web): dragging a session onto a
 row of another project folder, of Sessions, or of another Triage group now shows the
 blue line, and the drop files it there (or sets that group's status), then places it at
-the line in the manual order. Reid asked for it after moving a session out of a project.
+the line in the manual order. The owner asked for it after moving a session out of a project.
 
 Feature docs per public release (2026-10-22, `scripts/docs-coverage.py`): the README's
-showcase and `docs/features` should keep up with the patch series, but Reid wanted that
+showcase and `docs/features` should keep up with the patch series, but the owner wanted that
 once per public release, not on every merge. The script lists the core patches added
 since a release tag that no page under `docs/features` links and
 `docs/features/uncited-patches.txt` does not excuse (review fixes and plumbing, each with
@@ -733,7 +771,7 @@ which also covered `packages/ae_omni_policies/tests/test_pr_deploy.py`). The ser
 from 146 patches to 145, and every patch after `0139` moves down one number.
 
 Rail docking and sidebar grab strip (2026-10-17): `patches/0075` and `0076` (P75, web).
-Reid keeps the OmniGent window narrowed to one side of the screen and asked for the
+The owner keeps the OmniGent window narrowed to one side of the screen and asked for the
 chat to stay visible beside the session rail. The rail floated over the chat below a
 fixed 1280 px window width (1600 px with the workspace panel open), whether or not the
 sidebar was open, so a 1210 px window with the sidebar closed lost the right third of
@@ -741,7 +779,7 @@ the chat and the header's buttons. The rail now docks whenever the window, less 
 open sidebar, the open workspace panel (and its 8 px gap), an open files or logs panel
 and the rail's own 304 px, leaves the chat 480 px (the floor upstream's workspace
 panel already keeps), and floats only below that; with the sidebar closed the chat
-shifts left beside it. Reid also asked to shrink the sidebar instead of only opening
+shifts left beside it. The owner also asked to shrink the sidebar instead of only opening
 or closing it. Upstream already resizes it from its right edge (220 px up to half the
 window), but the grab strip was 4 px wide and invisible until hovered, so it is now
 8 px and draws a line on hover and keyboard focus, and the session list sits 4 px
@@ -798,11 +836,11 @@ chat alone the rail still floats in a narrow window. Details in `docs/PLAN-LIMIT
 ("The session rail").
 
 Split view names and the rail in every session (2026-10-18): `patches/0084` to `0087`
-(web; `0086` and `0087` carry the review's fixes). Reid saw a split view pane picker showing `e264fbf40762483e8162b9da917dea7d`:
+(web; `0086` and `0087` carry the review's fixes). The owner saw a split view pane picker showing `e264fbf40762483e8162b9da917dea7d`:
 the pickers knew only the first page of unarchived sessions, so any other session
 showed its id. A pane outside that page now fetches its own row, and the pickers read
 the session's name, "Loading..." or "Untitled session", with "(archived)" where it
-applies. He also had to reopen the session rail in session after session, because a
+applies. They also had to reopen the session rail in session after session, because a
 session that restored its open workspace panel closed the rail on any window up to
 about 1440 px, and could not tell the rail toggle from the workspace panel toggle. The
 rail toggle and the phone menu item now draw Tabler list-details, and a new setting,
@@ -814,8 +852,8 @@ still swaps with the rail; phones are unchanged. A pane whose row fetch fails, o
 list fails, falls back to its frame's title or "Untitled session", never an endless
 "Loading...". Details in `docs/PLAN-LIMITS.md` ("The session rail").
 
-Every row's waiting state (2026-10-18): `patches/0088` and `0089` (web and server). Reid
-saw the hourglass and the count of agents he was waiting on only on the session he had
+Every row's waiting state (2026-10-18): `patches/0088` and `0089` (web and server). The owner
+saw the hourglass and the count of agents they were waiting on only on the session they had
 open; every other row whose own turn had ended while its agents still worked showed the
 plain spinner. The list row's `status` reads running while any direct child is busy, and
 only the open chat knew the session's own turn was over. Each list row and websocket
@@ -839,7 +877,7 @@ run by `just web-check`.
 Rail loading while Claude starts (2026-10-18): `patches/0091` to `0093` (runner, server
 and web). In a new session the rail's Context and Connectors sections both showed
 "Could not read Claude context. Resume the session, check its MCP connections, and try
-again." with a Try again button until Reid refreshed by hand. The first read raced
+again." with a Try again button until the owner refreshed by hand. The first read raced
 Claude's start (no statusLine reading, session id or live process yet), the runner
 answered that like a real failure and backed off for 30 seconds, and the web cached the
 error for three minutes. Now the runner answers `pending` with the real not-ready
@@ -851,7 +889,7 @@ or refresh reads past the runner's cache. Details in
 `docs/PLAN-LIMITS.md` ("The session rail").
 
 Editing a global policy's parameters (2026-10-18): `patches/0094` and `0095` (server
-and web). Reid asked to edit, delete and change the policies on Settings > Global
+and web). The owner asked to edit, delete and change the policies on Settings > Global
 Policies. The page could switch and delete a stored global policy but not change its
 parameters, because `PATCH /v1/policies/{id}` took only name, handler and enabled. Now
 every stored policy whose registry entry takes parameters has a pencil beside its
@@ -864,10 +902,10 @@ falls back to the factory's default. Policies from the server config's `policies
 keep no controls, as before. Details in `patches/README.md`; screenshots in
 `docs/screenshots/policy-edit/`.
 
-Rail slide (2026-10-18): `patches/0096` (web). With one pane at a time live, Reid's
+Rail slide (2026-10-18): `patches/0096` (web). With one pane at a time live, the owner's
 screen recording caught both panes on screen at once during a swap. The workspace panel
 slides out over 300 ms (width, fade and a 12 px slide, `.workspace-panel-motion` in
-upstream's `index.css`), while the rail appeared at full width at once, so in his
+upstream's `index.css`), while the rail appeared at full width at once, so in their
 1136 px window with the sidebar open the chat dropped from 414 px to 110 px before
 settling at 437 px. Opening the workspace instead made the rail vanish and the chat
 lurch from 437 px to 734 px before shrinking to 414 px. The rail now slides in and out
@@ -913,7 +951,7 @@ Change lead open the same fork dialog.
 
 Saved Absorbed notes (2026-10-19): `patches/0100` (web) and the observer in
 `packages/ae_omni_policies`. The rail's Triage card counted Absorbed: and UNFILED lines
-from labels but found their text only in the messages the chat had loaded, so Reid saw
+from labels but found their text only in the messages the chat had loaded, so the owner saw
 "Absorbed 1" over "The lines are in older messages not loaded here." The observer now
 saves each counted line as a label of its own (`ae.absorbed.1` and on, `ae.unfiled.1` and
 on; a label holds 256 characters, so one per note, the first 20 of each kind), and the
@@ -938,7 +976,7 @@ header swaps still glide.
 Global Policies owned by the page (2026-10-18), no core patch. Settings > Global
 Policies showed the five AE policies with a Config badge and no switch, delete or
 edit, because they ran from the `policies:` block of `config/server.yaml` inside the
-image. Reid asked to manage them there and chose to let the page own them. The block
+image. The owner asked to manage them there and chose to let the page own them. The block
 is now `ae_seed_policies`, and the container's entrypoint wrapper inserts it into the
 policy store, in one transaction, when the store holds none of its policies (matched
 by name or handler; `packages/ae_omni_policies/src/ae_omni_policies/policy_seed.py`).
@@ -952,13 +990,13 @@ seeded policy brings the block back at the next restart. Details in
 
 Sidebar sort modes (2026-10-19): `patches/0102` and `0103` (web), the `GET` and `PUT
 /v1/ae/sidebar` route, and upstream's `sidebar_grouping_ui` release flag, which the
-image's entrypoint now turns on. Reid asked to group sessions by status with clear
+image's entrypoint now turns on. The owner asked to group sessions by status with clear
 separation, or to order them by hand. The sidebar's filter menu gains a Triage grouping
 (Blocked, Working, Review, No status, Parked, Reference, each with its glyph and count,
 then a collapsed Archived group that loads when opened) and a Manual ordering. Manual
 applies inside every list (Sessions, Shared, each project folder, each group): drag a
 row onto another row of the same list, or use the row menu's Move items, which also
-work on a phone. New sessions land on top. The order follows Reid across devices
+work on a phone. New sessions land on top. The order follows the owner across devices
 through `packages/ae_omni_policies/src/ae_omni_policies/sidebar_prefs.py`, kept in
 `/data/ae-sidebar.json`; the grouping choice stays per device, as upstream keeps it.
 Settings > Chat has Reset manual order. `0103` keeps the bulk-select bar inside a narrow
@@ -969,7 +1007,7 @@ Shortcut chips (2026-10-19, `patches/0104`, web): the New session row's hover ch
 size to their label, and the chip hides when the sidebar is too narrow to show it beside
 the label.
 
-Drag in any Ordering (2026-10-20): `patches/0105` (web). Reid first picked the project
+Drag in any Ordering (2026-10-20): `patches/0105` (web). The owner first picked the project
 sort in the Projects header's ⋯ menu, since the session ordering sits behind the filter
 icon, and session drag did nothing. Now dragging a session onto another in its list, or
 the row menu's Move items, works from any Ordering. The first move switches that device
@@ -977,8 +1015,8 @@ to Manual, keeps the list as shown (or the order synced from another device), mo
 that row, and shows a toast saying where to switch back. Older sessions that load later
 stay below the arranged ones instead of jumping to the top.
 
-Status ordering by icon (2026-10-20): `patches/0109` (web). Reid picked Ordering: Status
-and found a session he had checked as Review sitting between two Working ones, because
+Status ordering by icon (2026-10-20): `patches/0109` (web). The owner picked Ordering: Status
+and found a session they had checked as Review sitting between two Working ones, because
 upstream's Status ordering reads live activity (approvals, unread, running, idle), not
 the status icons. It now sorts by the icon first, in the Triage order (Blocked, Working,
 Review, No status, Parked, Reference), then by live activity, then newest first; project
@@ -1032,7 +1070,7 @@ then shows each child session's separate context reading above the account-wide
 plan limits. Missing readings say Unavailable, and switching providers clears the
 old meter immediately. See `docs/PLAN-LIMITS.md` for verification steps.
 
-Dashboard (2026-09-24): the seventh core patch, `patches/0007` (P7, web). Reid found "Your move", "Parking Lot" and
+Dashboard (2026-09-24): the seventh core patch, `patches/0007` (P7, web). The owner found "Your move", "Parking Lot" and
 "Slots" three nav entries for one feature, the difference between parked sessions
 and the Parking Lot unclear, and Reference a long scroll away. After a design
 review (`docs/design/dashboard-review.md`), the extension's two pages are one
@@ -1041,7 +1079,7 @@ P7; the extension contributes no nav row of its own). The page: a sticky bar of 
 then Your move (gates, approvals, due lot items, pull requests, the brief), Working
 n/3, Blocked, the Parking Lot (a parked session shows on its note's card), Review,
 Needs a note (parked with no note, or an unfiled note), Unsorted (no status) and
-Reference. Every section collapses and stays as Reid left it; Reference and Unsorted
+Reference. Every section collapses and stays as the owner left it; Reference and Unsorted
 start closed. Park on a working card opens the park form so a park leaves a note.
 P7 also adds a chip to the session header with the session's status and the slot
 count ("n/3", red at three; a tap opens the Dashboard), so the count is on every
@@ -1053,14 +1091,14 @@ once notification permission is granted, which upstream already asks for on the
 first tap). Before and after screenshots are in
 the dashboard-review screenshot set (removed before publication).
 
-Dashboard layout pass (2026-10-14), no core patch. Reid asked twice that day for the
+Dashboard layout pass (2026-10-14), no core patch. The owner asked twice that day for the
 Dashboard to read better on the desktop and the phone. The first pass
 (https://github.com/analyticendeavors/omnigent-ae/pull/75) folds empty sections into one
 muted "Nothing in:" line, drops their section chips and gives every session card one row
 shape. The second pass rebuilds the layout from a render of a busy day, where the page
 was 2836 px tall at 1400 px and 4091 px on a 390 px phone, the right column ended at a
 quarter of the page, eight lot tasks took 1044 px on the phone, and about 550 px
-repeated what Your move already showed. Reid chose four changes: the Parking Lot heads
+repeated what Your move already showed. The owner chose four changes: the Parking Lot heads
 the right column (Your move, Open PRs, Working and Blocked stay on the left, and the
 phone order is unchanged); each lot task is one line (quadrant icon, title, date or
 "today", a parked marker, the chevron and Resume), with repo, tags, NEXT, the task-store
@@ -1079,15 +1117,15 @@ answer is fresh, the Filters sheet is built from every task, and the menu no lon
 moves focus on a refresh. Out of tree only (`packages/ae_omni_extension/web/src`:
 `main.ts`, `lot.ts`, `cards.ts`, `capacity.ts`, `sessions.ts`, `yourMove.ts`, `dom.ts`,
 `icons.ts`, `style.css`). Before and after screenshots are in
-the dashboard-pass screenshot set (removed before publication). On 2026-10-15 Reid found two layout bugs on his 1080
+the dashboard-pass screenshot set (removed before publication). On 2026-10-15 the owner found two layout bugs on their 1080
 px window: the seventh section chip wrapped to a second row, and a merged card's Dismiss
 dropped to a line of its own under Mark session done. The chips now stay one row on
 every width, scrolling sideways with a fade when they outgrow it (a mouse wheel over
 them scrolls them too), and Dismiss is an icon button in the merged card's head.
 
-Fast open (2026-09-26), no core patch. Reid waited 3 to 5 seconds on every open of
-the Dashboard on his iPhone, looking at an empty page. Measured on the box that day
-with his login (read-only GETs, two each): `/v1/ae/prs` 2321 ms cold and 12 ms warm
+Fast open (2026-09-26), no core patch. The owner waited 3 to 5 seconds on every open of
+the Dashboard on their iPhone, looking at an empty page. Measured on the box that day
+with their login (read-only GETs, two each): `/v1/ae/prs` 2321 ms cold and 12 ms warm
 (the tracked-PR scan, one loopback per session, 40 sessions, 6 at a time, cached a
 minute), `/v1/ae/lot?status=open` about 320 ms on every call (task-store through
 Cloudflare, uncached), `/v1/ae/lot/tags?icons=true` 471 ms cold and 122 ms warm,
@@ -1111,15 +1149,15 @@ answers (`storage.user`, `web/src/snapshot.ts`), dimmed with a "refreshing" line
 every card button off (Merge above all) until that section is re-read.
 
 Gate buttons (2026-09-27): an open gate's buttons read "A", "B", "C" and "Close", and
-Reid asked for each to say what it does. They now read Do it now, Write a note, Save
+the owner asked for each to say what it does. They now read Do it now, Write a note, Save
 for later and Drop it. Only the labels changed: each still posts A, B, C or "close
 it" as the session's next user turn through `POST /v1/ae/gate/{id}/reply`, and its
 tooltip names the letter so it can be matched to the gate's RECOMMEND line. The
 recommended button is not marked, because the observer captures the FORK clause
 (`ae.fork`) and not RECOMMEND. On a phone the gate's buttons wrap two to a row.
 
-PR cards (2026-09-24): the twelfth core patch, `patches/0012` (P12, web). Reid merged
-every pull request by hand on github.com from his phone. Each pull request a session
+PR cards (2026-09-24): the twelfth core patch, `patches/0012` (P12, web). The owner merged
+every pull request by hand on github.com from their phone. Each pull request a session
 tracks (upstream's per-session tracking,
 https://github.com/omnigent-ai/omnigent/pull/6935) is now a card at the top of the
 session's GitHub panel and, compact, under the chat message that names it, and every open one across sessions is a card in the
@@ -1133,7 +1171,7 @@ squash first) and is pinned to the head SHA the card showed; afterwards the card
 offers "Mark session done" (it sets the session to review, which frees a slot), but
 only when that merge closed the session's last open tracked pull request (patch
 `0020`, P20, 2026-09-25: a session that had opened four pull requests was offered
-review after the first merge, while three were still open). On 2026-09-26 Reid sent
+review after the first merge, while three were still open). On 2026-09-26 the owner sent
 screenshots of a 1100 px card: the method buttons sat on one row with Confirm merge
 and Cancel on a second, and a black "Set this session to review" button did not say
 what it does. Patch `0022` (P22, web) puts the confirm step on one row (a compact
@@ -1157,7 +1195,7 @@ fresh). They use `AE_GITHUB_TOKEN`, which now needs write scopes
 the pr-cards screenshot set (removed before publication).
 
 Open on GitHub (2026-09-27): the twenty-fifth core patch, `patches/0025` (P25, web).
-Reid hates copy and paste and works from an iPhone (Safari) and a Windows laptop
+The owner hates copy and paste and works from an iPhone (Safari) and a Windows laptop
 (Firefox), yet every Dashboard pull request card offered only Copy link: the page runs
 in a frame with `sandbox="allow-scripts"`, and the host's `navigation.openExternal`
 opened only URLs it had handed out itself. The patch lets the host also open a
@@ -1187,7 +1225,7 @@ now its own group at the row's end, so the "frees a slot" hint stays beside Mark
 session done.
 
 Recommended merge method (2026-09-28): the twenty-eighth core patch, `patches/0028`
-(P28, web). Reid sent a screenshot of the chat card's confirm step ("Squash and merge
+(P28, web). The owner sent a screenshot of the chat card's confirm step ("Squash and merge
 #60 into main?", Squash ticked) and asked that tapping Merge show which method is
 recommended, select it by default, and keep the other selectable. Squash was always
 preselected, and a squash is wrong when a pull request promotes one long-lived branch
@@ -1216,18 +1254,18 @@ agent's `sys_scheduled_task_create` / `_update` tools, kept in its own table
 (`ae_scheduled_task_project`, created on first use, no Alembic revision). It must name
 one of the owner's projects; null or "" leaves runs unfiled. Each fire files the new
 session with the same store call the sidebar's Move to project uses; a deleted project
-leaves the run unfiled with a warning and never fails the fire. Reid chose a server
+leaves the run unfiled with a warning and never fails the fire. The owner chose a server
 default (2026-10-13): a create that names no project gets the owner's project named by
 `OMNIGENT_SCHEDULED_TASK_DEFAULT_PROJECT` in `config/server.env` (`Automation Notes`),
 stored by id so a rename keeps it. The automation dialog has a Project picker. The
 seeder (`ae_omni_policies/schedules.py`) fills a missing project on the two shipped
-tasks and never replaces one Reid chose.
+tasks and never replaces one the owner chose.
 
 Auto-resume after a host restart (2026-10-13): the thirty-fourth core patch,
 `patches/0034` (P34, server), and `ae_omni_policies/auto_resume.py`. A host restart
 (a deploy, an update, a crash) kills every runner it spawned and comes back with new
 runner ids, so a session that was mid-turn sat at "The connection to the host dropped
-unexpectedly" until Reid clicked Resume, and Resume only relaunched the runner without
+unexpectedly" until the owner clicked Resume, and Resume only relaunched the runner without
 continuing the turn. Upstream already continues an interrupted turn (a "your runner was
 interrupted, continue" prompt), but only for sub-agents whose parent's old runner
 reconnects. P34 is the mechanism: observers run after a host connects, and a
@@ -1244,17 +1282,17 @@ restart three seconds later was skipped. Alive means the server's runner router 
 connected or the connecting host reports the process alive (tunnels can lag the host's).
 Skipped interrupted sessions are logged at INFO.
 A resumed turn may repeat an action whose outcome was lost (the prompt asks the
-agent to check before repeating), the one risk Reid accepted with it.
+agent to check before repeating), the one risk the owner accepted with it.
 
 Scheduled-run retention (2026-10-13): the twenty-ninth core patch, `patches/0029`
 (P29, server), and `ae_omni_policies/retention.py`. Every firing of a scheduled task
 starts a new session, and the steward and the shutdown note fire every weekday, so about
 ten run sessions a week piled up in the sidebar with nothing to reuse or prune them.
-Reid chose automatic retention: after a task fires, keep its newest `keep_runs` run
+The owner chose automatic retention: after a task fires, keep its newest `keep_runs` run
 sessions (default 5, one working week) and delete older ones. `keep_runs` is a field on
 `/v1/scheduled-tasks` (create, patch, get, list) and on the agent's
 `sys_scheduled_task_create` / `_update` tools; null keeps every run, and the seeder never
-sends it, so a value Reid sets survives a reseed. P29 is the mechanism: the setting, kept
+sends it, so a value the owner sets survives a reseed. P29 is the mechanism: the setting, kept
 in its own table (`ae_scheduled_task_retention`, created on first use, no Alembic
 revision), a fire-observer seam awaited after each successful fire, and a request-free
 delete that mirrors `DELETE /v1/sessions/{id}`. The policy is out of tree and fails
@@ -1268,7 +1306,7 @@ the same rules. Retention does not look at projects; patch 0033 above
 files runs into one, and pruning works the same inside it.
 
 Dense PR cards (2026-09-27): the twenty-sixth core patch, `patches/0026` (P26, web),
-Reid's second note that the cards waste space. His screenshot of the compact card
+the owner's second note that the cards waste space. Their screenshot of the compact card
 under a chat message, about 1200 px wide, had every piece on its own full-width row
 with the right two-thirds empty: the chips, a green "Merged #55 (squashed), b0413d6.
 Pull Request successfully merged", a muted "1 more open pull request in this
@@ -1287,7 +1325,7 @@ phone the chips, the reason and the buttons each take a row, the buttons sharing
 theirs.
 
 Calmer PR cards (2026-10-14): the thirty-seventh core patch, `patches/0037` (P37, web).
-Reid sent a screenshot of two chat cards, one with its confirm step open, and asked for
+The owner sent a screenshot of two chat cards, one with its confirm step open, and asked for
 suggestions to make them prettier or better designed. Three outlined chips read as
 buttons, the confirm step nested a "Recommended" pill inside a segment inside a bordered
 box inside the card, and a long title was cut to one line. The header now leads with the
@@ -1302,7 +1340,7 @@ or requested changes. The confirm step is a section of the card under a divider:
 end, Cancel and a button that names the target ("Squash into main", "Merge into main"),
 since the question line that named the base branch is gone. A merged card reads "Merged
 (squashed) b0413d6" in purple and drops the chips, which described the open pull
-request. Reid chose the target on the button, purple for merged and the single Ready
+request. The owner chose the target on the button, purple for merged and the single Ready
 line (2026-10-14). The patch touches only AE files (`AePrCards.tsx`,
 `AeInlinePrCards.tsx`, `aePrs.ts`, their suites) and a new `aePrIcons.ts`; the
 Dashboard's Open PRs cards and Your move pull request rows get the same design out of
@@ -1315,7 +1353,7 @@ GitHub" reads "GitHub" while Copy is a copy icon named "Copy link" at every widt
 Merge, GitHub and Copy share one row.
 
 Lot search and tags (2026-09-25, https://github.com/analyticendeavors/omnigent-ae/issues/28),
-no core patch. Reid reads the lot on his phone and asked for four
+no core patch. The owner reads the lot on their phone and asked for four
 things. Every tag shows on a lot card, wrapping, in task-store's own colour and Tabler
 icon (`GET /v1/ae/lot/tags` rows now carry `color` and `icon`; `?icons=true` adds the
 icons' path data, read once from the app's `/tabler-icons.json` and kept), and a tap
@@ -1331,9 +1369,9 @@ the lot-search screenshot set (removed before publication).
 Fabric Admin (2026-10-16, renamed the Admin Center on 2026-10-18). The page itself is
 extension code; three core patches serve it (`0059`, the Dashboard row no longer lights
 on this page, `0066`, the Azure and Fabric link allowlist, and `0106`, its Databricks
-workspace and warehouse links). Reid wanted the aetraining Fabric
+workspace and warehouse links). The owner wanted the aetraining Fabric
 capacity's wake button, with room for more capacities, inside omnigent-ae next to the
-Dashboard; Off came at his request, guarded by a separate suspend key so holders of
+Dashboard; Off came at their request, guarded by a separate suspend key so holders of
 the shared wake link can only wake. The extension's first nav row (first "Fabric Admin", now "Admin Center",
 in upstream's extension slot) opens a page with a card per capacity, its state, and
 Wake or Off, each asking once on one row. `GET /v1/ae/fabric` and the two POSTs
@@ -1381,7 +1419,7 @@ Compute (the Fabric capacities, then the Databricks warehouses), Databricks cred
 ring of the credit left beside the two bars) and Box health (the host, then the server's
 secrets as chips). Each column is its own stack, and the last card in each one
 stretches, so the columns end on one line. A shared grid would have left a hole under
-each short card, and Reid turned that down. Wide panes get three columns, medium ones
+each short card, and the owner turned that down. Wide panes get three columns, medium ones
 get two, and below 520 px the tiles go away and each card folds to its header line.
 The page remembers each card's fold. Shared accounts now appear only as a count tile,
 because adding and removing them moves to OmniGent's Settings, a page an extension
@@ -1406,7 +1444,7 @@ and reconstruction limits.
 
 Expanded context usage includes a wrapping color legend immediately below the context window bar.
 
-Merge watcher (2026-10-21): a session continues by itself when its pull request merges, as Claude Code Desktop does, so no session waits for Reid to say "merged". `packages/ae_omni_policies/src/ae_omni_policies/merge_watch.py` runs in the server from the app's lifespan (a route-less router in `DEBUG_ROUTERS`; FastAPI merges an included router's lifespan, so no upstream patch). Every 2 minutes it reads which pull requests the sessions touched in the last day (and any still waiting on a watched pull request) track (`prs.tracked_by_session`, the same `resources/github` list that draws the chat's merge cards); every 10 s (Reid's choice over a webhook) it sends one `GET /repos/{repo}/pulls/{n}` with `If-None-Match` per open one, so an unchanged pull request answers 304 and costs no rate limit. A rate-limit 403 or 429 pauses all polls until `retry-after` or `x-ratelimit-reset`; other failures back off that pull request alone. On open to merged, or to closed without merging, it posts one plain-English note into each session that tracks it ("Merge watcher: PR #196 (title) merged at 17:00Z as 11c89f51 by login. URL Continue: delete its branch and worktree, then check the deploy.") through `POST /v1/sessions/{id}/events` in process, as the session's owner (a five-minute token from the server's own provider), which wakes an idle session the way an external post does. The last seen state, ETag and undelivered notes are kept in `/data/ae-merge-watch.json`, written before a post and after each, so a restart neither repeats a note nor misses a merge that landed while the server was down. The slot cap, the rabbit hole and the fork classifier recognize the note by its opening words (`continuation.py`) and let it through without a slot claim, a turn count or a model call. `AE_MERGE_WATCH=0` turns it off. Tests: `packages/ae_omni_policies/tests/test_merge_watch.py`, plus a case each in `test_slot_cap.py`, `test_rabbit_hole.py` and `test_fork_suspect.py`.
+Merge watcher (2026-10-21): a session continues by itself when its pull request merges, as Claude Code Desktop does, so no session waits for the owner to say "merged". `packages/ae_omni_policies/src/ae_omni_policies/merge_watch.py` runs in the server from the app's lifespan (a route-less router in `DEBUG_ROUTERS`; FastAPI merges an included router's lifespan, so no upstream patch). Every 2 minutes it reads which pull requests the sessions touched in the last day (and any still waiting on a watched pull request) track (`prs.tracked_by_session`, the same `resources/github` list that draws the chat's merge cards); every 10 s (the owner's choice over a webhook) it sends one `GET /repos/{repo}/pulls/{n}` with `If-None-Match` per open one, so an unchanged pull request answers 304 and costs no rate limit. A rate-limit 403 or 429 pauses all polls until `retry-after` or `x-ratelimit-reset`; other failures back off that pull request alone. On open to merged, or to closed without merging, it posts one plain-English note into each session that tracks it ("Merge watcher: PR #196 (title) merged at 17:00Z as 11c89f51 by login. URL Continue: delete its branch and worktree, then check the deploy.") through `POST /v1/sessions/{id}/events` in process, as the session's owner (a five-minute token from the server's own provider), which wakes an idle session the way an external post does. The last seen state, ETag and undelivered notes are kept in `/data/ae-merge-watch.json`, written before a post and after each, so a restart neither repeats a note nor misses a merge that landed while the server was down. The slot cap, the rabbit hole and the fork classifier recognize the note by its opening words (`continuation.py`) and let it through without a slot claim, a turn count or a model call. `AE_MERGE_WATCH=0` turns it off. Tests: `packages/ae_omni_policies/tests/test_merge_watch.py`, plus a case each in `test_slot_cap.py`, `test_rabbit_hole.py` and `test_fork_suspect.py`.
 
 Rebase bot settles changelog conflicts (2026-10-21, `scripts/rebase-patches.sh`): the bot merged only the doc files listed in `DOCS`, and `docs/CHANGELOG.md` was not one of them after the build diary moved there (https://github.com/analyticendeavors/omnigent-ae/pull/193), so every patch PR that added a changelog line stopped the bot with "a person has to merge it" (https://github.com/analyticendeavors/omnigent-ae/pull/199, renumbered by hand). `docs/CHANGELOG.md` is now in `DOCS`: where both sides only added lines at the same spot it keeps main's lines and puts the branch's after them, and the renumber rewrites stale patch numbers in the lines the branch added. Test: `tests/deploy/test_patch_rebase.py` (the both-sides case now adds a changelog line on each side; it fails on the old list with that error).
 
@@ -1421,7 +1459,7 @@ caps each read at 3 s, but that cap may not bound a stalled read (a 20 s cap was
 already on the 85 s read), so the guard is this server: a row's state comes from
 the shared Logic App's ARM read, and a failed details probe keeps the last good
 details (without offering keep awake from them).
-Reid also wanted every Fabric capacity he has on the card, each with its SKU, state,
+The owner also wanted every Fabric capacity they have on the card, each with its SKU, state,
 Pause or Start, and a resize. The server still holds no Azure credential: a shared
 Logic App, `la-fabric-capacities`, does the ARM calls, reached with two optional
 secrets, `AE_FABRIC_CAPACITIES_URL` and `AE_FABRIC_CAPACITIES_KEY` (Key Vault
@@ -1447,7 +1485,7 @@ sends the call. Details in `packages/ae_omni_policies/src/ae_omni_policies/fabri
 
 2026-10-23: the dashboard's pull request cards (Open PRs and Your move) gained the dock's two state actions, Mark ready for review on a draft and Update branch on a branch that is behind, each pinned to the head the card showed; each card also opens Review details (size, description, and the AE compliance review with its verdict and whether it covers the current head, read only when opened and kept across redraws; on Your move a Review details button reads the card without starting a merge); Reference lines gained a menu that moves a closed session back to Working or Review. No core patch; extension bundle only.
 
-Secret expiry list (2026-10-23, Reid): the Admin Center's Server secrets chips became
+Secret expiry list (2026-10-23, the owner): the Admin Center's Server secrets chips became
 one row per key with its Key Vault name, its expiry (amber inside 60 days, red once
 past, "no expiry set" otherwise), when it last changed, and Edit and Rotate links. Edit
 is the secret's Azure portal page; Rotate is the system that issues the value, with a
@@ -1464,7 +1502,7 @@ reading exists or the newest is over 36 hours old. There is no Refresh button: t
 already reads again on focus, and `systemctl --user start ae-omnigent-secrets-meta.service`
 refreshes the dates at once. Install steps are in `deploy/README.md` (Secret expiry dates).
 
-Admin Center spend polish (2026-10-23, Reid): the Azure spend card said "Cost Management is
+Admin Center spend polish (2026-10-23, the owner): the Azure spend card said "Cost Management is
 rate limiting." under each of its four subscriptions; it now says it once under the month
 total. `GET /v1/ae/azure-cost` carries `rateLimit` (`retryAt`, the time the next try is due,
 and `goodAt`, when a pass last read any subscription), kept in the state file across a
@@ -1477,7 +1515,7 @@ auto stops in under an hour or never, at most once an hour, and never starts a s
 The card and the tile note show the reading's age ("as of 2 h ago"), amber past 48 hours; the
 manual Refresh button is unchanged. No core patch; the server and the extension bundle only.
 
-Key Vault card (2026-10-23, Reid approved the concept that day): the Admin Center now
+Key Vault card (2026-10-23, the owner approved the concept that day): the Admin Center now
 answers two questions in two places. Box health keeps "does this box have what it
 needs": its secrets block is "Secrets on this box", collapsed by default to the
 counts and a chip per key that needs you (missing, expired, inside 60 days, refused),
@@ -1501,8 +1539,8 @@ store, Fabric Logic Apps, a working OIDC sign-in, success only), as a status cod
 an error class only, and each box row says "worked 2:07 PM" or "failed: 401 at 1:50 PM". No core
 patch; extension bundle and AE package only.
 
-Secret expiry alerts and owners (2026-10-23, Reid approved the plan that day): a
-secret's expiry now reaches Reid's phone. After the box's daily reading lands
+Secret expiry alerts and owners (2026-10-23, the owner approved the plan that day): a
+secret's expiry now reaches the owner's phone. After the box's daily reading lands
 (`POST /v1/ae/secrets/meta`, 06:15), the server files a task-store task for each
 secret whose effective expiry (the card's own, vault or Entra or GitHub) is 30 days
 or fewer away, moves the same task's alarm at 7 days and once more when it expires,
@@ -1521,34 +1559,144 @@ link (the Entra app's Credentials page for a tagged app secret). Also fixed: the
 meta POST's save-failure path named `ErrorCode.INTERNAL`, which does not exist. No
 core patch; extension bundle and AE package only.
 
-Key Vault card fix (2026-10-23, Reid): the card read "The Key Vault inventory could not be read (Server response exceeds the limit)" after PR 304. That PR added a rotate link and hint to every row, which took the answer to 91 KB for 116 secrets; the extension bridge refuses more than 64 KiB. Rows now omit `edit_url` (the page builds the portal link from the vault and secret name) and send `rotate_url` and `rotate_hint` only when the issuer has its own page, and a test holds the answer for 116 secrets under 56 KiB. No core patch; extension bundle and AE package only.
+Key Vault card fix (2026-10-23, the owner): the card read "The Key Vault inventory could not be read (Server response exceeds the limit)" after PR 304. That PR added a rotate link and hint to every row, which took the answer to 91 KB for 116 secrets; the extension bridge refuses more than 64 KiB. Rows now omit `edit_url` (the page builds the portal link from the vault and secret name) and send `rotate_url` and `rotate_hint` only when the issuer has its own page, and a test holds the answer for 116 secrets under 56 KiB. No core patch; extension bundle and AE package only.
 
-Key Vault card, rows in pages (2026-10-24, Reid): PR 306 brought the answer to 51,000 characters, but the card still read "Server response exceeds the limit". The bridge counts two bytes per UTF-16 unit against 64 KiB, so its real cap is 32,768 characters, and PR 306 tested against the wrong number. The card now reads `GET /v1/ae/vault?rows=false` (counts, needs-you list, groups, alerts) and then each vault's rows from the new `GET /v1/ae/vault/rows?vault=<name>&start=<n>`, 25 rows a page, admin only; a test holds the summary and every page under 32,768 characters for 130 worst-case rows. No core patch; extension bundle and AE package only.
+Key Vault card, rows in pages (2026-10-24, the owner): PR 306 brought the answer to 51,000 characters, but the card still read "Server response exceeds the limit". The bridge counts two bytes per UTF-16 unit against 64 KiB, so its real cap is 32,768 characters, and PR 306 tested against the wrong number. The card now reads `GET /v1/ae/vault?rows=false` (counts, needs-you list, groups, alerts) and then each vault's rows from the new `GET /v1/ae/vault/rows?vault=<name>&start=<n>`, 25 rows a page, admin only; a test holds the summary and every page under 32,768 characters for 130 worst-case rows. No core patch; extension bundle and AE package only.
 
-Slot card names the count it would make (2026-10-24, Reid): Reid approved a session at the slot limit and read the card's "Slots full: 4 of 4 working" as if that session were the 4th, so the cap seemed to ask at the limit instead of past it. It had counted right: four others were working and the new one made five. The reason text now reads "Slots full: 4 of 4 taken; this one would make 5 of 4.", on the approval card, the block-mode refusal and the `POST /v1/ae/sessions` 409 alike. No core patch; AE package only.
+Slot card shorter (2026-10-29, the owner): the approval card listed every working session, helpers included, under a count of slots, so "6 of 4 taken" sat above 27 rows and pushed Accept off a phone screen. The card now lists only the sessions that hold a slot (a family is its lead), cuts titles at 48 characters, opens with "Slots full: 6 of 4 taken. Run this as the 7th?", and names the two longest-running sessions as the ones to park. Block mode and the `POST /v1/ae/sessions` 409 keep the "would make 7 of 4" wording and get the same shorter list. No core patch; AE package only. Real buttons and a folded list on the card are a separate patch.
 
-Git repos card (2026-10-24, Reid): after a backlog cleanup across three GitHub accounts took dozens of `gh` queries, Reid asked for one place that shows every repo. Of two mockups (a card in the Admin Center, a standalone page) he picked the card, read only first, with a read-only token per personal account. `GET /v1/ae/git` (admin only, cached 5 minutes) reads the Dependency Sweep's repo list, then per repo one GraphQL query for open pull requests, branches with no open or merged pull request and open Dependabot alerts. Each alert is checked against its lockfile on the default branch, because GitHub's alerts lag the fix by hours and on 2026-10-22 its dependency graph dropped a push outright: that day 38 open alerts were already fixed on main. Those land under "Fixed on main, waiting on GitHub"; only alerts still vulnerable, or whose lockfile cannot be read, count as needing a fix. Before it shipped, Reid asked for mockups of the card itself and picked "Needs you first" out of three (sections, needs you first, by repo): on the day it was built, every one of the 38 open alerts was GitHub lag and three of the four pull requests were drafts or still in CI, so a card that gave each section equal room mostly showed nothing to do. It follows the Key Vault card's shape (numbers, Needs you, Show all). No core patch; extension bundle and AE package only.
+Slot card names the count it would make (2026-10-24, the owner): the owner approved a session at the slot limit and read the card's "Slots full: 4 of 4 working" as if that session were the 4th, so the cap seemed to ask at the limit instead of past it. It had counted right: four others were working and the new one made five. The reason text now reads "Slots full: 4 of 4 taken; this one would make 5 of 4.", on the approval card, the block-mode refusal and the `POST /v1/ae/sessions` 409 alike. No core patch; AE package only.
 
-Cost targets on the Azure card (2026-10-25, Reid): the Azure card shows spend, but only to someone who opens it, and a Fabric capacity left running bills $0.72 an hour while nobody looks. Reid asked to set limits and get a task with a phone alarm when one is crossed. The card now has a Targets panel (add, edit, switch on or off, delete with a confirm in the page) and the server (`cost_targets.py`) judges each target against the reading it already holds: month to date, latest finished day and month-end forecast (the card's pace figure, needing three days of data) for all of Azure, one subscription, one service (month to date only) or one resource (latest finished day only); and hours Active for a Fabric capacity. Two limits shaped it. Cost Management is rate limited and shared, so no query was added: a rate-limited, stale or missing reading makes a target `cannot-evaluate` and files nothing, and a subscription billed in another currency is skipped for USD limits. The reading keeps services by month and resources for nine days, which is why a service has no day figure and a resource no month figure. Fabric's reading has no start time for most capacities, so the hourly check records when it first saw each one Active and counts from there (a recent `resumedAt` wins when it exists). Alerts file one task per target and period (month, data day, or Active episode) in the list named by `AE_COST_ALERT_LIST` (default AE Work), with the 09:00 home-clock alarm the expiry alerts use, or an alarm three minutes out for Fabric; they close when the value falls back, and a spend task from a finished month is left open for a person to tick. A lost state file is rebuilt from each task's "Alert key" line. Defaults seed once, only while the targets file does not exist: month to date over $600 for MVP SC and MVP 2025, over $50 for AnalyticEndeavors and AnalyticEndeavorsTools, any resource over $25 a day, any capacity Active over 6 hours; all can be edited or deleted and stay deleted. The extension host sends only GET, POST and PATCH, so the card saves and deletes with POST (`/azure-cost/targets/{id}` and `/{id}/delete`) while `PUT` and `DELETE` work too. The answer is capped under the bridge's 32,768 characters and a test holds it. No core patch; extension bundle and AE package only.
+Git repos card (2026-10-24, the owner): after a backlog cleanup across three GitHub accounts took dozens of `gh` queries, the owner asked for one place that shows every repo. Of two mockups (a card in the Admin Center, a standalone page) they picked the card, read only first, with a read-only token per personal account. `GET /v1/ae/git` (admin only, cached 5 minutes) reads the Dependency Sweep's repo list, then per repo one GraphQL query for open pull requests, branches with no open or merged pull request and open Dependabot alerts. Each alert is checked against its lockfile on the default branch, because GitHub's alerts lag the fix by hours and on 2026-10-22 its dependency graph dropped a push outright: that day 38 open alerts were already fixed on main. Those land under "Fixed on main, waiting on GitHub"; only alerts still vulnerable, or whose lockfile cannot be read, count as needing a fix. Before it shipped, the owner asked for mockups of the card itself and picked "Needs you first" out of three (sections, needs you first, by repo): on the day it was built, every one of the 38 open alerts was GitHub lag and three of the four pull requests were drafts or still in CI, so a card that gave each section equal room mostly showed nothing to do. It follows the Key Vault card's shape (numbers, Needs you, Show all). No core patch; extension bundle and AE package only.
 
-Child prompts in the lead's dock (2026-10-27, Reid): a lead that started sessions could not see their questions or tool permission prompts without opening each chat, and its pop-up answers to a child's question went nowhere. Patch `0210` mirrors a family child's prompts into its lead's stream and snapshot and lists them in the lead's action dock with their real buttons, resolving in the child; two settings in General > Sessions switch the dock lines and the relay. Out of tree, the `ae` MCP server gains `answer_child_question(child_session_id, elicitation_id, answers?, cancel?)` (`packages/ae_omni_policies/src/ae_omni_policies/mcp.py`), which posts to the child's resolve route with the content shape the web card sends (`askUserQuestion.ts`) and refuses unless the relay setting is on, the child's `ae.orch` names the calling session itself (never a caller-supplied id), the prompt is still pending and it is a plain AskUserQuestion (never a tool permission, plan approval, Codex command or MCP prompt); a second answer reports "Already answered". The orchestrator agent allowlists it and its prompt says to relay a child's question with `ask_reid` and then answer with it. No existing prompt rule told Reid to open a child chat, so none was removed. Decided: dock concept B over a card in the feed, and relaying on by default.
+Cost targets on the Azure card (2026-10-25, the owner): the Azure card shows spend, but only to someone who opens it, and a Fabric capacity left running bills $0.72 an hour while nobody looks. The owner asked to set limits and get a task with a phone alarm when one is crossed. The card now has a Targets panel (add, edit, switch on or off, delete with a confirm in the page) and the server (`cost_targets.py`) judges each target against the reading it already holds: month to date, latest finished day and month-end forecast (the card's pace figure, needing three days of data) for all of Azure, one subscription, one service (month to date only) or one resource (latest finished day only); and hours Active for a Fabric capacity. Two limits shaped it. Cost Management is rate limited and shared, so no query was added: a rate-limited, stale or missing reading makes a target `cannot-evaluate` and files nothing, and a subscription billed in another currency is skipped for USD limits. The reading keeps services by month and resources for nine days, which is why a service has no day figure and a resource no month figure. Fabric's reading has no start time for most capacities, so the hourly check records when it first saw each one Active and counts from there (a recent `resumedAt` wins when it exists). Alerts file one task per target and period (month, data day, or Active episode) in the list named by `AE_COST_ALERT_LIST` (default AE Work), with the 09:00 home-clock alarm the expiry alerts use, or an alarm three minutes out for Fabric; they close when the value falls back, and a spend task from a finished month is left open for a person to tick. A lost state file is rebuilt from each task's "Alert key" line. Defaults seed once, only while the targets file does not exist: month to date over $600 for MVP SC and MVP 2025, over $50 for AnalyticEndeavors and AnalyticEndeavorsTools, any resource over $25 a day, any capacity Active over 6 hours; all can be edited or deleted and stay deleted. The extension host sends only GET, POST and PATCH, so the card saves and deletes with POST (`/azure-cost/targets/{id}` and `/{id}/delete`) while `PUT` and `DELETE` work too. The answer is capped under the bridge's 32,768 characters and a test holds it. No core patch; extension bundle and AE package only.
 
-MCP server questions reach the web (2026-10-27, Reid): a Power BI modeling session asked "Confirm the operation" through Claude Code's `Elicitation` hook, which the wrapper never registered, so the question existed only in the terminal. Patch `0211` registers the hook, parks the question as a normal pending card (the server's schema as a form) and answers Claude with the choice; it also shows in the lead's dock via `0210`. `answer_child_question` refuses it, so only Reid answers an MCP prompt. Every failure leaves the terminal dialog to Claude. URL-mode elicitations stay in the terminal for now.
+Child prompts in the lead's dock (2026-10-27, the owner): a lead that started sessions could not see their questions or tool permission prompts without opening each chat, and its pop-up answers to a child's question went nowhere. Patch `0210` mirrors a family child's prompts into its lead's stream and snapshot and lists them in the lead's action dock with their real buttons, resolving in the child; two settings in General > Sessions switch the dock lines and the relay. Out of tree, the `ae` MCP server gains `answer_child_question(child_session_id, elicitation_id, answers?, cancel?)` (`packages/ae_omni_policies/src/ae_omni_policies/mcp.py`), which posts to the child's resolve route with the content shape the web card sends (`askUserQuestion.ts`) and refuses unless the relay setting is on, the child's `ae.orch` names the calling session itself (never a caller-supplied id), the prompt is still pending and it is a plain AskUserQuestion (never a tool permission, plan approval, Codex command or MCP prompt); a second answer reports "Already answered". The orchestrator agent allowlists it and its prompt says to relay a child's question with `ask_user` and then answer with it. No existing prompt rule told the owner to open a child chat, so none was removed. Decided: dock concept B over a card in the feed, and relaying on by default.
 
-Narrow split panes (2026-10-27, Reid): in a four-pane split each pane is an iframe about 340 to 360 px wide, and the composer's Send or Interrupt button sat up to 39 px past its border because the action row needed 318 px of 266. Patch `0212` squeezes the row's gaps first, then hides the mic and host badge below about 372 px (never while a take records or the host is not online), and re-measures when the host or mic state changes. See `patches/README.md`.
+MCP server questions reach the web (2026-10-27, the owner): a Power BI modeling session asked "Confirm the operation" through Claude Code's `Elicitation` hook, which the wrapper never registered, so the question existed only in the terminal. Patch `0211` registers the hook, parks the question as a normal pending card (the server's schema as a form) and answers Claude with the choice; it also shows in the lead's dock via `0210`. `answer_child_question` refuses it, so only the owner answers an MCP prompt. Every failure leaves the terminal dialog to Claude. URL-mode elicitations stay in the terminal for now.
 
-Choice buttons and a child following its lead (2026-10-27, Reid): an MCP server's "Confirm the operation" Yes / No showed a dropdown with Submit and Reject; Reid wanted one button for either answer. Patch `0213` renders a required field whose schema lists 2 to 4 string choices in `enum` (oneOf and const forms keep the dropdown) as one button per value ("Continue" and "Decline" here, the full text on hover), submitting at once, with a Reject button only when no choice declines (a Yes/No keeps just its two buttons); it applies in the chat, the Inbox and the dock. Out of tree, `rabbit_hole` (`packages/ae_omni_policies/src/ae_omni_policies/rabbit_hole.py`) lets a family child follow its lead: past a threshold, a child whose valid lead (`valid_lead_id`: `ae.orch` names an existing same-owner session, no fork label, no parent; both owners are read strictly, so a failed read asks) has accepted the check is allowed and records its own ack, where before each child held every message, the lead's `post_message` included, until Reid accepted in the child. A lead that declined or was never asked, a foreign or missing lead, a fork and any store read failure still ask. The lead's ack is read from its conversation row's persisted `session_state` (the engine writes it on accept). See `patches/README.md`.
+Narrow split panes (2026-10-27, the owner): in a four-pane split each pane is an iframe about 340 to 360 px wide, and the composer's Send or Interrupt button sat up to 39 px past its border because the action row needed 318 px of 266. Patch `0212` squeezes the row's gaps first, then hides the mic and host badge below about 372 px (never while a take records or the host is not online), and re-measures when the host or mic state changes. See `patches/README.md`.
 
-Reload notice (2026-10-27, Reid): after a deploy an open tab kept running the page it loaded, so a live fix looked unfixed until a manual reload, which happened twice today. Patch `0214` compares the tab's own entry script name with the one the server serves now (every 2 minutes, and on focus or return to the tab) and shows one toast, "OmniGent was updated." with Reload and Later; it never reloads by itself; it does nothing in an embedded or desktop host, and a failed lazy chunk stays with the app's own chunk-error boundary. See `patches/README.md`.
+Choice buttons and a child following its lead (2026-10-27, the owner): an MCP server's "Confirm the operation" Yes / No showed a dropdown with Submit and Reject; the owner wanted one button for either answer. Patch `0213` renders a required field whose schema lists 2 to 4 string choices in `enum` (oneOf and const forms keep the dropdown) as one button per value ("Continue" and "Decline" here, the full text on hover), submitting at once, with a Reject button only when no choice declines (a Yes/No keeps just its two buttons); it applies in the chat, the Inbox and the dock. Out of tree, `rabbit_hole` (`packages/ae_omni_policies/src/ae_omni_policies/rabbit_hole.py`) lets a family child follow its lead: past a threshold, a child whose valid lead (`valid_lead_id`: `ae.orch` names an existing same-owner session, no fork label, no parent; both owners are read strictly, so a failed read asks) has accepted the check is allowed and records its own ack, where before each child held every message, the lead's `post_message` included, until the owner accepted in the child. A lead that declined or was never asked, a foreign or missing lead, a fork and any store read failure still ask. The lead's ack is read from its conversation row's persisted `session_state` (the engine writes it on accept). See `patches/README.md`.
 
-Reload toast spelling (2026-10-27, Reid): the toast from patch `0214` read "OmniGent was updated." Patch `0215` changes it to "Omnigent was updated." (title, doc comment and the test's expected text); nothing else changes.
+Reload notice (2026-10-27, the owner): after a deploy an open tab kept running the page it loaded, so a live fix looked unfixed until a manual reload, which happened twice today. Patch `0214` compares the tab's own entry script name with the one the server serves now (every 2 minutes, and on focus or return to the tab) and shows one toast, "OmniGent was updated." with Reload and Later; it never reloads by itself; it does nothing in an embedded or desktop host, and a failed lazy chunk stays with the app's own chunk-error boundary. See `patches/README.md`.
 
-Browser pane pop-ups and screenshots (2026-10-27, Reid): an agent driving StreamYard in the pane could not see the open "Create live stream" dialog in `browser_snapshot`, and `browser_screenshot` timed out while snapshot and click worked. Patch `0216` lets the snapshot walk on through a zero-size portal root (plus shadow roots and same-origin iframes), and screenshots a view the pane is not showing by staging it one pixel inside the window for the capture, with a 10 s cap and a clear error. Patch `0217` fixes the review findings: a chat closed during a capture, a retry budget that counted only sleeps, hidden frames, and a cap on huge pages.
+Reload toast spelling (2026-10-27, the owner): the toast from patch `0214` read "OmniGent was updated." Patch `0215` changes it to "Omnigent was updated." (title, doc comment and the test's expected text); nothing else changes.
 
-Child prompt wake (2026-10-28, Reid): answering a family child's prompt in the lead's action dock resumed the child but left an idle lead asleep until Reid typed "continue" (child 75db0142 and lead a30d8192 at 01:55Z). Patch `0218` adds an elicitation-observers registry upstream and `child_wake.py` out of tree: when the lead (same owner, not archived or failed) is idle, one `Child prompt answered: <title> (<id4>...): Reid picked <label>.` note is posted into it as its owner, past the slot cap, the rabbit hole and the fork classifier. A busy lead is waited on for up to 30 seconds and read again before each post; a fork, a native subagent, another owner's lead, a repeat or invented verdict, or an unknown action post nothing. See `patches/README.md`.
+Browser pane pop-ups and screenshots (2026-10-27, the owner): an agent driving StreamYard in the pane could not see the open "Create live stream" dialog in `browser_snapshot`, and `browser_screenshot` timed out while snapshot and click worked. Patch `0216` lets the snapshot walk on through a zero-size portal root (plus shadow roots and same-origin iframes), and screenshots a view the pane is not showing by staging it one pixel inside the window for the capture, with a 10 s cap and a clear error. Patch `0217` fixes the review findings: a chat closed during a capture, a retry budget that counted only sleeps, hidden frames, and a cap on huge pages.
 
-Workspace check under Docker (2026-10-28, Reid): the merge watcher's "workspace no longer exists" check (PR 340) read every host path as missing because the server runs in a container that mounts only `/data` and ships an empty `/home`, so four notes into live sessions (/home/reid and a worktree under it) were dropped, and the child wake note with them. `merge_watch._workspace_gone` is now off in a container (`/.dockerenv` or `/run/.containerenv`; the 4xx `workspace_missing` rule guards there) and for a path that is not absolute POSIX; elsewhere a not-found stat means gone and any other stat error means unknown. No patch.
+Child prompt wake (2026-10-28, the owner): answering a family child's prompt in the lead's action dock resumed the child but left an idle lead asleep until the owner typed "continue" (child 75db0142 and lead a30d8192 at 01:55Z). Patch `0218` adds an elicitation-observers registry upstream and `child_wake.py` out of tree: when the lead (same owner, not archived or failed) is idle, one `Child prompt answered: <title> (<id4>...): the owner picked <label>.` note is posted into it as its owner, past the slot cap, the rabbit hole and the fork classifier. A busy lead is waited on for up to 30 seconds and read again before each post; a fork, a native subagent, another owner's lead, a repeat or invented verdict, or an unknown action post nothing. See `patches/README.md`.
 
-Dock limit buttons overlapping on a phone (2026-10-28, Reid): on a phone the limit item's text is hidden, so the dock's width check never saw the row overflow and Model, Account and New chat painted over the merge and waiting badges. The strip now clips to its own width and drops New chat on a phone; the opened list keeps it (patch 0219).
+Workspace check under Docker (2026-10-28, the owner): the merge watcher's "workspace no longer exists" check (PR 340) read every host path as missing because the server runs in a container that mounts only `/data` and ships an empty `/home`, so four notes into live sessions (/home/<user> and a worktree under it) were dropped, and the child wake note with them. `merge_watch._workspace_gone` is now off in a container (`/.dockerenv` or `/run/.containerenv`; the 4xx `workspace_missing` rule guards there) and for a path that is not absolute POSIX; elsewhere a not-found stat means gone and any other stat error means unknown. No patch.
 
-Dock list sideways scrollbar (2026-10-28, Reid): opening the action dock drew a small horizontal scrollbar under the limit buttons because the list used the full labels (Copy to another login) and its row ran wider than the tray. The list uses the strip's short labels now and hides its horizontal overflow (patch 0220).
+Dock limit buttons overlapping on a phone (2026-10-28, the owner): on a phone the limit item's text is hidden, so the dock's width check never saw the row overflow and Model, Account and New chat painted over the merge and waiting badges. The strip now clips to its own width and drops New chat on a phone; the opened list keeps it (patch 0219).
+
+Dock list sideways scrollbar (2026-10-28, the owner): opening the action dock drew a small horizontal scrollbar under the limit buttons because the list used the full labels (Copy to another login) and its row ran wider than the tray. The list uses the strip's short labels now and hides its horizontal overflow (patch 0220).
+
+Limit hover card (2026-10-28, the owner): the dock's limit warning showed one window and nothing about the other models. Hovering its icon, or tapping it on a phone, now opens a card with the login's 5-hour, weekly all-models and per-model weekly usage, bars and reset times, the window behind the warning tagged (patch 0221).
+
+Dashboard Flow / Brief switch dead on a phone (2026-10-28, the owner): in the native iPhone app the shell's header floats lower than the page's fixed top padding, so the header sat over the top of every extension page and took the tap on the switch. The page now starts below the header on a phone (patch 0224).
+
+Question buttons running off the phone screen (2026-10-28, the owner): a pending question's choice buttons kept each long answer on one line, so the card and the whole chat scrolled sideways. The buttons now wrap inside the card (patch 0225).
+
+Model menu submenus off the phone screen (2026-10-28, the owner): the composer model menu's Account, Effort and Previous models flyouts opened past the screen edge on a phone and could not be read. They now stay inside the screen (patch 0226).
+
+Box health monitor (2026-10-28, the owner): on 2026-10-28 the box's `/tmp` (a 62 GB RAM tmpfs capped at 1,048,576 inodes) ran out of inodes because nothing cleaned Claude Code's per-session temp folders, and every Claude Code Bash call failed with ENOSPC for about 15 minutes. A user timer on the box (`ae-omnigent-box-health.timer`, every five minutes) now posts heat, CPU, memory, storage and bloat to `POST /v1/ae/box-health`; the Admin Center's Box health card shows five lines, up to three Needs you lines and a Details dialog, and there is a Box health tile. It covers both box users and the second box user's container with counts, sizes and ages only, never a folder, project, session, branch, worktree or file name. `GET /v1/ae/box-health` is for OmniGent admins and logins named in `AE_BOX_ADMINS`; a box admin who is not an OmniGent admin sees only that card, and `GET /v1/ae/access` says what a caller may see. No `[ae-patch]`: the extension bridge already allowed GET and POST under `/v1/ae/`.
+
+Box health monitor, review round (2026-10-28): the relay no longer posts a mount path, a failed unit's name or a folder path that could name a client or a repository: only `/`, `/tmp`, `/boot`, `/boot/efi`, `/home`, `/var`, `/secure`, `/run` and `/dev/shm` are named (others are "other mount N"), only `ae-*`, systemd and Docker units are named (the rest are counted), and `AE_BOX_HEALTH_DIRS` takes `label=path` and posts the label. Every posted string is plain ASCII and at most 48 characters. Folder listings are read lazily under the entry cap, the fast reading is posted before the slow scans (which now stop at a 150 second deadline), Docker's volume sizes are read once a day, a container walk that timed out counts nothing as stale, and the container user cannot be root. The page asks who the caller is twice before it believes "not an admin", a poll no longer rebuilds the Details button or an open hint, and hints open above a button near the bottom of the screen.
+
+Admin routes for a second user (2026-10-28, the owner): the owner and the second box user may both be admins for the box, but neither may see anything sensitive about the other's work, only what needs cleaning or monitoring. The second box user's chats run on their own host container, so every non-shared login in the limits store, the whole task store and the box's infra pages are the owner's, and several `/v1/ae` reads answered any signed-in user. The second box user has not signed in yet, so nothing had leaked; this closes it first. Admin only now (403 `admin_only`): `GET /host`, `/secrets`, `/fabric`, `/databricks` (their `can_act` is true on every 200) and every `/lot` route (`/lot`, `/lot/tags`, `/lot/park`, `/lot/{id}/link`, `/complete`, `/resume`, `/session`), which was readable and writable by anyone. Scoped to the caller: `GET /limits/accounts` lists only the Claude `shared:` rows; `GET /limits` makes Codex `null` and blanks the Claude entry unless it is a `shared:` account or a session the relay posted that the caller may open, and cuts `contexts` and `sessions` to that one session (`limits.member_view`); `GET /capacity` and `GET /sessions` keep the box's counts, limit and clock but list only the sessions the caller may open; `GET /prs` scans only those sessions and keeps one scan per caller (it was one shared map, so the first caller's pull requests answered everyone's); `GET /prs/{owner}/{repo}/{number}` and `.../compliance` answer a non-admin only for a pull request a session they may open tracks (403 `forbidden` otherwise); `GET /your-move` gives a non-admin no due lot items and no pull requests, which come from the server's own task-store and GitHub credentials; `GET /release` empties `env_missing` for a non-admin. Left open: `/health`, `/schedule-defaults`, `/claude-accounts/shared`, `/prs/{owner}/{repo}/{number}/deploy`. A single-user runtime's one user passes the admin check, so nothing changes there. The Dashboard shows a non-admin "The Parking Lot is for admins." with no park form, no Needs a note list and Park as a plain status move. The slot check in the status menu counts the caller's own working rows for a non-admin; the slot cap policy still enforces the box's limit. No core patch.
+
+Admin routes for a second user, review fixes (2026-10-28, the owner): two reviewers of the change above found more. `POST /sessions` looked up its idempotency key among every user's sessions, so a guessed key returned another person's session; and its `slots_full` and `family_full` 409s named every working session. The lookup now sees only the caller's sessions, and the 409 lists only theirs, with `others_working` and "Plus N of another user's." for the rest. `GET /capacity` and `GET /sessions` keep the rows scoped for admins too, because neither person sees the other's work, admins included; they add `others_working`, a count of other users' working sessions, so `slots_used` (still the box's, and still counting the second box user's against the owner's limit) adds up. A context-only row in the relay's post no longer counts as proof that a reading is a session's own. An admin check that cannot be answered (a slow or failed `/v1/me`) is no longer taken as "not an admin": confirmed answers are kept 30 seconds and reused for up to 10 minutes while the check is down, otherwise admin-only routes answer a retriable 503 `admin_unknown` and `/your-move` is answered redacted and not cached (its cache is keyed by user and admin). The PR routes (card, compliance, and now `/deploy`) accept `?session_id=` for the chat asking, checked against current access and tracking; without one they use the caller's scan, check access to the tracking session each time, re-read at most once per 30 seconds, and serve a scan at most 10 minutes old. `/health` leaves out the task store's URL for anyone who is not a known admin, and `POST /gate/{id}/reply` needs a sign-in and answers a session the caller cannot open exactly like one that does not exist. The Admin Center's Box host, secrets, Fabric and Databricks sections show one quiet line to a non-admin and stop polling.
+
+Admin check and admin sections, second review fixes (2026-10-28, the owner): only a 200 or a 403 from `/v1/me` settles whether someone is an admin; a 401, 408, 429, any other code or a dropped connection is "could not tell" (last confirmed answer if under 10 minutes old, else a 503 `admin_unknown`) and is never remembered as a no. The Admin Center's Box host, secrets, Fabric and Databricks sections that showed "for admins" look again every 5 minutes, and come back on a 200 instead of staying hidden until a reload. A forced pull-request re-scan uses up its 30 seconds only when it finishes, and also runs when every session the old scan listed is closed to the caller now. Known and left: an admin keeps admin routes for up to 10 minutes while `/v1/me` is down, and nothing coalesces or caps concurrent scans at two users.
+
+Rebase on the box health monitor, last touches (2026-10-28, the owner): `GET /access` and the box-health route now ask the cached admin check, so an unanswered `/v1/me` never turns `admin` into null; a box admin who is not an OmniGent admin still gets 200 on `/box-health` and `/access` and 403 on `/host`, `/secrets`, `/fabric`, `/databricks` and `/lot` (pinned by a test), and the box-only Admin Center page starts none of those sections. A 401 from `/v1/me` drops that user's cached admin answer. The secrets section has its own 5-minute look-again timer after `admin_only`. Known and left: two forced pull request re-scans can overlap.
+
+Leak scan before anything leaves the box (2026-10-28, the owner): nothing internal (IPs, hosts, e-mail, home paths, cloud ids, private repository names, secrets, client or person names) may reach the public fork or release, now that the admin portal and the box-health work read box internals and a second person shares the box. The only check was a fixed-string denylist plus nine token shapes, run by hand when a release is prepared, and patch commits reach the public fork at PR time, days before it. `scripts/leak-scan.py` (stdlib only) adds generic classes (tailnet and RFC1918 addresses, `*.ts.net`, e-mail, home paths, Azure and Databricks endpoints, cloud ids, private repository links, a wider secret list, image metadata, OCR when `tesseract` exists) and applies the private denylist when a bundle is supplied. It runs as the new `leaks` CI job (the lines a PR adds, its paths, commit messages, title and body; the whole tree on a push to `main`), as a `pre-push` hook that `just hooks-install` sets for the repository and for `upstream/` (whose pushes go to the public fork), and by hand with `just leak-scan`. It never prints a matched value, fails closed (exit 2) when it cannot run, and takes reviewed false-positive exceptions from `scripts/leak-allowlist.txt` or an inline marker with a reason; neither can clear a denylist, secret or private-key hit. Triage of `main` on the first run found a real app id in three test files and a home path in this file (both replaced) and a handful of real values in generated patches, deploy units and product code that stay allowlisted under `DECISION` lines until they are replaced. Decided: this PR ships warn-only when the denylist secret is missing; a later PR makes that a failure and adds OCR in CI. `docs/LEAK-SCAN.md`.
+
+Leak scan, first review round (2026-10-28, the owner): two independent reviews of the scanner (https://github.com/analyticendeavors/omnigent-ae/pull/390) each reproduced real leaks passing clean, so this round closes them. The scan now reads every commit on its own (a value added and removed in the next commit still reached the public fork), computes a push range against the destination remote only and exits 2 whenever it cannot compute one, shows no matched value through a file, branch or tag name, and catches addresses followed by a slash or preceded by `@`, JSON and `SECRET_KEY` style secrets, `Bearer`, GitLab and Entra client-secret shapes, commit authors that are not noreply addresses, `.local`, `.lan` and `.internal` names, more home-path and repository-link forms, every non-placeholder GUID, binary files, UTF-16 text and more image formats and PDFs. The denylist configuration fails closed (a secret without its hash variable, or a hash mismatch, is exit 2), CI runs the base commit's scanner so a PR cannot print the denylist, and a catch-all allowlist entry is refused: real values are keyed on their sha256 instead. `just fork-push`, an hourly `fork-backstop.yml` and `leak-pr-text.yml` cover pushes that skip the hook and edits to a PR's title or body. The Azure cost app's Entra id left the source tree: set `AE_AZURE_COST_APP_ID` in config/server.env (the card's link) and config/host.env (the relay); unset, that secret's link opens its Key Vault page. `docs/LEAK-SCAN.md`.
+
+Leak scan, second review round (2026-10-28, the owner): the fix check found that a PR could allowlist its own leak, so a PR scan now reads the allowlist from its base commit; an entry the PR adds or changes fails as a finding of its own unless the PR carries the label `leak-allowlist-approved`, applied by a GitHub user id listed in the repository variable `AE_LEAK_ALLOWLIST_APPROVERS` (unset: nobody approves; set it after the merge), and a push that changes the allowlist removes the label. The PR scan moved from `ci.yml` to `leak-pr.yml` (job `leaks`, which re-runs on labels, edits and pushes); `ci.yml` keeps the push-to-main scan. Allowlist entries for e-mail, address, host, cloud id, home path and Azure endpoint classes must be `sha256:` hashes (a wildcard cleared a whole class), the fork backstop keeps no state while the denylist is missing, the secret-assignment pattern is bounded (100 KB took 23 s), a CIDR or version look-alike no longer hides a host address, `git@` is allowed in a commit identity only for GitHub, GitLab and Bitbucket, `fork-push` refuses `--tags`, `--all` and other options that push unscanned refs, letters-only Bearer tokens and passwords with punctuation are caught, and the pre-push hook refuses a bundle with no pinned hash. The Databricks account id and the five relay app ids move to box settings in PR C (decided 2026-10-29). `docs/LEAK-SCAN.md`.
+
+Leak scan on main stopped every release (2026-10-29, the owner): after https://github.com/analyticendeavors/omnigent-ae/pull/390 merged, the push-to-main scan flagged the merge commit's author, the merger's own GitHub address, so main CI failed on every merge and `release.yml` cut no tag for anyone's change. Main's history never goes public: the public mirror is rebuilt under a fixed identity, and pushes to the fork check identity themselves, so that scan now runs `diff --no-identity` and still checks every pushed commit's message and lines. The fork backstop's first run reads every fork branch and ran past the scanner's 120 s limit, so it sets `AE_LEAK_SCAN_SECONDS=900`. `docs/LEAK-SCAN.md`.
+
+Long approval answers (2026-10-29, the owner): an approval pop-up showed each long answer in full on its button, a block of text on desktop, and the plain option picker still let a long answer run past the card on a phone. A button now shows the words before the first colon (else a cut at a word) with the full text in its tooltip, and the option picker wraps inside the card (patches 0234 and 0235).
+
+Box health cleanup buttons (2026-10-29, the owner): a box admin can now clean up from the Box health card. Details has a Cleanup section and a Needs you line gets a Clean up button; both open a confirm step that says whose items, how many and how big. Four cleanups: a user's Claude temp folders older than two days, old test leftovers at the top of `/tmp` (fixed name patterns), review checkouts with no uncommitted changes, and Docker's dangling images and old build cache. The server queues one request (`POST /v1/ae/box-health/cleanup`, cancel at `/cancel`, one at a time, 409 `box_health_busy`, `box_health_stale` or `box_health_changed`); the box's relay (`box_cleanup.py`) finds it in the answer to its next post, runs it as its own user and posts a result (`/cleanup/result`). Each mapped container also ages its own two-day-old temp folders every hour. The box checks that it is not root, that each folder is a real folder it owns, that the whole tree is old, that no process works in it, that the temp guard's lock on a live session is not held, and that the inode did not change. Nothing in a post, a log line, an API answer or the card names a folder, project, session, repository, branch or file. `AE_BOX_HEALTH_CLEANUP=off` hides the buttons and stops the aging. Also: the "cleanup may not be running" line appears only once a stale folder is a day past the line (the daily tmpfiles run explains up to a day), and `AE_BOX_USER_LABELS` lets the server refuse a reading with an unexpected user label. No `[ae-patch]`.
+
+Box health cleanup buttons, review round 1 (2026-10-29): the relay's `--dry-run` no longer removes anything in containers (it reports what it would age as counts). A leftover or review checkout is old only when the newest mtime anywhere in its tree is old, and a tree holding a `.git` anywhere, an entry of another user or another filesystem, or anything unreadable is kept; the proof is repeated under the lock just before removal. A review checkout with a stash or a commit no remote has is kept. Container removals (the button and the hourly aging) now run fixed freshness, working-folder and command-line checks inside the container right before each `rm` batch, and remove nothing when a check cannot finish. The run is bound to the count the admin confirmed (a larger fresh plan refuses with "press again"), an untaken request expires after 15 minutes, a result is accepted only for a request the box took, and one cleanup stops at 100 seconds so a pass stays inside the unit's timeout. Every confirm says the box runs it within 5 minutes; a container offer calls its items "temp folders (Claude sessions and test runs)" and counts both; a Needs-you line gets a button only for an offer of its own owner and kind; `AE_BOX_USER_LABELS` also checks the labels in failed parts; the dialog keeps focus when it redraws.
+
+Box health cleanup buttons, review round 2 (2026-10-29): the container live-use check now requires a cwd line for every pid of the container user (read from each `/proc/<pid>/status`), so a process that hid its links no longer lets its folder go; a gap is looked at once more and then the batch is skipped. The cleanup's deadline now covers every container command, planning included, and the posts wait at most 10 seconds each. A container session or test run with a `.git` anywhere inside is kept, and the host re-checks live use (and, for review checkouts, the git checks) for each candidate right before it is removed.
+
+Fork backstop scans each commit once (2026-10-29, the owner): the hourly Fork backstop on main ran its whole 15 minutes and exited 2. `cmd_fork` listed each branch's commits with only the previous run's tips excluded, so a commit carried by many branches was scanned again for every one; the public fork's branches share most of the roughly 230-commit patch series, so one run scanned tens of thousands of commits instead of a few hundred. It now keeps a map of commit to hits for the run, scans only commits not yet in it, and adds the cached hits to every branch whose range holds the commit, so a hit in a shared commit still names every branch to delete and is reported once. The deadline error also prints the configured limit (`AE_LEAK_SCAN_SECONDS`) instead of a fixed 120 s. `docs/LEAK-SCAN.md`.
+
+Fork backstop leaves out upstream's history (2026-10-29, the owner): the public fork holds copies of upstream's own branches, so after the per-commit dedupe a cold run still had 5,959 unique commits (about 30 minutes at 0.30 s each). `fork --exclude-refs PREFIX` leaves out everything reachable from upstream's heads and tags, which `fork-backstop.yml` now fetches from `UPSTREAM_REPO`; 592 commits remain and a cold run finished in 232 s. In fork mode the e-mail half of commit-identity applies only to `[ae-patch]` commits, the denylist half of identity always runs, and `@outside-patches` denylist entries are skipped, so the 8 historical fork commits that name published values do not list most branches for deletion every hour. `docs/LEAK-SCAN.md`.
+
+Fork backstop, first review round (2026-10-29, the owner): the denylist check on a commit's author and committer no longer depends on the `[ae-patch]` prefix; `--exclude-refs` prefixes are validated (trailing `/`, no overlap with the fork's refs, at least one match); the workflow refuses an empty or wrong `UPSTREAM_REPO` and a fetch that brings no upstream branches; one notice counts the commits whose e-mail was not checked. `docs/LEAK-SCAN.md`.
+
+Box health cleanup follow-ups (2026-10-29): a zombie process of the container user, which has no cwd link and which the container never reaps, no longer stops all container cleanup for good: it is skipped by its state. A status listing with no `Uid` line is treated as a failed read (nothing is removed) instead of "no process of ours". The check's own helper processes are ignored only when their command line is exactly the pinned one, no longer by process name. Each post to the server is cut at 10 seconds in all (httpx's own timeout is per phase), so a pass is bounded as documented: 195 s for the whole pass plus three posts of at most 10 s each, under the unit's 4 minute timeout.
+
+Box health cleanup follow-ups, review round (2026-10-29): a zombie that still has other threads running (its main thread exited) is now a gap, not skipped, because its live threads are not listed and its leader's links are unreadable; only a zombie with `Threads: 1` is skipped. The status listing is read per pid: every pid needs exactly one `Uid`, `State` and `Threads` record and every line must be one of those records or a command line, so a half-read listing, a duplicate or forged record, or a command line that held a newline fails the batch closed. A pinned helper command line now matches only with exactly one trailing NUL, so extra empty arguments no longer match. A cleanup result post that times out is dropped; the card shows the request as lost and the next reading shows the lower counts (accepted).
+
+Box health cleanup follow-ups, last round (2026-10-29): the working-folder listing of the container live-use check is now NUL-framed (`-printf '%p\t%l\0'`) and read strictly. A folder name that holds a newline can no longer print a second line that reads as another process's cwd record and hides its gap; every record must be a well formed `/proc/<pid>/cwd` or `fd/<n>` link, unique, and the listing must end with a NUL, or the batch fails closed. A process now counts as the container user's by real or effective uid, so a setuid-style process also needs a cwd line.
+
+Box health cleanup, capped at the confirmed count (2026-10-29): an admin confirmed 46 Claude temp folders; by run time the box found 47, because the card's count comes from the hourly reading and one more folder had crossed the two-day line. The relay took the request and removed nothing. Folders age past that line all the time, so the refusal would have repeated. A run now removes at most the confirmed count, the oldest first, for the host actions and the container path alike; `docker_prune` takes no count and is unchanged. Age is the newest mtime the scan proved anywhere in the item's tree (a plain file or socket uses its own mtime), ties go by path, and the order is applied before the 5,000-item limit and before the confirmed count, so every limit keeps the oldest; counts and times only, no name leaves the module. Items left over are counted under the new fixed reason `over_confirmed` and the result says "Aged after you confirmed, kept for the next run". The bound that stays: a run never removes more than the admin confirmed, and the server's press-time check (409 when the offer's count differs from the dialog) is unchanged. The `Changed` exception is gone; the server still words an older relay's `CHANGED` code, and its result model now drops a skip word it does not know instead of answering 422, so a relay newer than the server (they ship in one release, so at most one pass during a deploy) never loses a finished result. While that request was queued the other offers were locked with a reason shown only as a button tooltip, which a phone and a disabled button never show; the list and the confirm step now print the reason under the button. No patch.
+
+Box health card redesign (2026-10-29, Option C, revised): the card keeps its data and every control keeps its helper text, and gets a new layout. The host's live status (dot, name, state pill) moves into the card header between the title and "Updated" (a second header line under 480 px of card and on a phone), filled by the host section's own draw so a poll updates it in place. A status line shows the worst state as a pill (`worstOf`: "N need you", "OK", "No reading", tone from the view), the read time and Details; the five readings are tiles; a "Needs you" panel holds each need with its Clean up button at the right and the queued request as its last row with a clock icon; the host block draws only when it has facts, notices or the button; secrets are one full-width block. Rule misses from PR 351 fixed on the way: every nested surface is `--inner` on `--inner-line`, buttons on it use the `--fg 7%` step, the queued stripe gets the accent, the leftover dividers use `--inner-line`, and `.secret-chip` and the `.fabric-state` pills mix their tint with `--inner` or `--card`, not transparent. Web extension only (`boxHealth.ts`, `host.ts`, `fabric.ts`, `icons.ts`, `style.css`), no patch. `docs/features/admin-center.md`.
+
+Chat file links: Download (2026-10-28, the owner): a chat reply that names a box file as inline code or a markdown link opened it in the viewer, but there was no way to save it, and a chat that had gone to sleep answered a download with a 502. Both forms now open a small menu on right-click, the context-menu key or Shift+F10 with Open and Download, and on a touch screen a download icon follows the name. Download reuses the viewer's own download, so the file saves with its real name and every byte. The download route now wakes an asleep runner first, as attachment upload does. New: `AeChatFileActions.tsx`; about 10 lines in `ChatMarkdown.tsx`; the wake in `routes_resources.py`; the vitest suite joins the `web-test` list. Patch 0239; its review fixes are patch 0240. `docs/features/phone.md`.
+
+Names out of fork-added files (2026-10-28): patch `0241` replaces real people's names and the box's host names in the files the patch series added with neutral words (comments say "the owner", tests use example addresses and demo paths). The model-change approval value, which used to equal the owner's first name, is now `owner`: `escalation.py`, `mcp.py` and `model_log.py` write it, and `model_log.normalize` reads a line or label that still carries the old value as `owner` (the old literal is built from parts), applied where the preset runs, preset stats and preset review read the log and where `escalation.parse_last` reads a session label. Web and server ship in one image, so a short skew window maps an unknown value to none. History is not rewritten; the tree is clean going forward.
+
+Check-in relay, review fix (2026-10-28): patch `0242` makes the relay accept both prompt wordings, so scheduled check-ins stored before `0241` keep posting straight into their session, and `schedules.checkin_prompt` writes the neutral wording.
+
+Leak scrub of the repository's own files (2026-10-29): the leak scanner builds the tenant-domain and Key Vault words from parts and no longer lists the personal-account handle (the private denylist blocks it); the systemd units carry an `__AE_HOME__` token that the install step in `deploy/README.md` renders and checks; the secrets relay's known app ids move to `AE_SECRET_SOURCE_APPS` and the Databricks account id to `AE_DATABRICKS_ACCOUNT_ID` (box settings, unset means no known-pair proposal and no account id in the hint); test fixtures use made-up values built from parts; the allowlist entries these fixes retire were deleted, and `docs/LEAK-SCAN.md` now says a PR scan uses the base allowlist. No patch.
+
+Leak scan fails closed (2026-10-29): a missing private denylist secret now fails `ci.yml`, `leak-pr.yml` and `fork-backstop.yml` (`--denylist-missing fail`; the secret and its hash variable are set, in the Actions and Dependabot stores); the PR scan reads the text in changed images with tesseract OCR (base commit's scanner, `media --ocr require`, installed only when an image changed). No patch.
+
+Cold relaunch keeps the Claude transcript (2026-10-29, the owner's token audit): every cold relaunch rewrote the session's transcript file from server items, so the next call re-wrote the whole history to the prompt cache at the write price (a 157,975 token write on a session whose system prompt still hit). The runner now keeps the file on disk when it covers the server history (every `toolu_*` call id and the last user text are in it), copies it from an old workspace dir when it moved, and rebuilds only when it does not cover; a file ahead of the server is forwarded from the forwarder's own cursor, so no row is skipped in the UI. The session carries `ae.claude_native.resume` (`kept`, `copied` or `rebuilt`) and a running `ae.claude_native.resume_count` (patch 0243). Live check after deploy: restart the runner of a session over 100k tokens; the top of its transcript no longer shows rows all stamped in one second, the first call's `cache_read` is about the size of the history, and the label reads `kept`.
+
+Cold relaunch keep decided by identity, review round 1 (2026-10-29, the owner's token audit): the first version of the transcript keep compared tool call ids and the last user text, which both reviewers showed accepts a file that disagrees with the server. The forwarder now records how many items the server held and the id of the last one each time it moves its cursor, and a cold relaunch keeps the file only when the server still holds exactly that, the cursor's bytes still match, the file ends cleanly and the image repair would change nothing; otherwise it rebuilds as before. The old forwarder is cancelled before its final cursor is read. A session that started before this change rebuilds once on its next relaunch, which writes its first record. A launch that returns before it has a transcript leaves no record at all, so a fresh cursor can never inherit one (patch 0244).
+
+Leak scan push range (2026-10-29): updating a branch that merged `main` was refused by the pre-push hook on `main`'s squash commits (their author check is skipped on `main`). An update now also leaves out the destination's default branch; other tracking refs still count as new (second review: a branch deleted on the remote keeps its tracking ref until a prune). No patch.
+
+Fork backstop fails only on new leaks (2026-10-29): the hourly backstop failed every run on 200 soft hits the fork already carried, and each patch rebase mints new shas, so no key built on commits holds. `scripts/leak-fork-baseline.txt` lists those values by class and hash (no commit, path or date); `fork --baseline` counts them and fails only on a value that is not listed, and `fork --write-baseline` regenerates the file from a fresh scan that ignores the allowlist and markers and refuses while any hard hit remains. A baseline never accepts `denylist`, `secret` or `private-key`, and the scanner exits 2 on a file that holds a denylist entry or its hash. A change to the file needs the `leak-allowlist-approved` label (`leak-pr.yml`, three-dot diff; a push voids the approval), the workflow cache key holds the file's hash, and the file stays out of the public release. `docs/LEAK-SCAN.md`.
+
+Transcript keep fires (2026-10-29, fix for the keep of patches 0243 and 0244): live, every frontier record went stale right after it was written, because the server adds a resource event right after each cold relaunch and the keep treated it as a foreign item, so every relaunch rebuilt. Items the transcript rebuild leaves out (resource events, errors, reasoning, native tool, routing, slash command and terminal command rows) no longer stale the record or force a rebuild when they trail it; any other item, including an unknown type, still does. A kept transcript moves its record up to the server's end. After two cold relaunches of the same session the second shows `ae.claude_native.resume = kept` (patch 0245).
+
+Lead handoff at 300k (2026-10-29, the owner's token audit; L1 of the token-saving plan): lead chats were 28% of the box's Claude spend because eight grew past 300k tokens of context and re-read it every turn. A 60 second sweep (`lead_handoff.py`) posts one note into an idle top-level Claude chat whose `omnigent.last_context_tokens` (read only when under 30 minutes old) passes the new `lead_handoff_tokens` setting (300000 by default, 0 off; roles state, top level beside `child_relay`; the "Hand off at" row in Settings, patch 0246). The lead writes a packet and calls the new `hand_off` tool, which posts to `POST /v1/ae/sessions/{id}/handoff`: create the new lead (same host, workspace, model without `[1m]`, effort, preset and Claude login, key `handoff:<old id>`), write `ae.handoff_to` on the old lead (the commit point), then re-point the children's `ae.orch`, rebuild the check-in prompt (`schedules.checkin_prompt`, only when it names the old id) or replace the id in other scheduled tasks, and set the old lead to `reference`. Each step after the commit is idempotent, a repeat call finishes what is left, the sweep repairs a lead left half done, and one lock per lead means the button and the tool at once start one new lead. The slot count is taken with the old family left out, so the handoff works at full slots. `post_message` and `schedule_checkin` follow `ae.handoff_to`. The note passes the slot cap, the rabbit hole and the fork classifier like the merge and child wake notes (`continuation.py`). The L2 button is not in this change. See `docs/features/action-dock.md` and `docs/LABELS.md`.
+
+Lead handoff review round 1 (2026-10-29, two reviewers): the new lead's brief is confirmed before the commit point (`ae.handoff_brief=posted`, written after the post succeeds; a retry that finds the new lead by its key posts the packet first); a handoff is finished only when `ae.handoff_done=1` is written, which needs every step clean, and the sweep repairs every committed lead without it, scheduled tasks included; the target must exist, be live and have the same owner before anything is re-pointed, else the marks are cleared and a retry starts a fresh lead under the same key; `merge_watch.post_live` (merge notes, child wake) follows `ae.handoff_to`, five hops with a loop guard (the watcher's PR records are rebuilt from the live sessions each scan, so forwarding is the whole fix; nothing keyed by session id is moved); the sweep and `/handoff/request` take one lock per lead and re-read the labels inside it, with an in-process set of nudged leads as a backstop; only leads in `working` or `blocked` are nudged; other scheduled tasks get only `session_id <old id>` and `session <old id>` replaced and the tasks that name the old id elsewhere are listed in the answer; `hand_off` tells the old lead to stop; `children_of` ignores a `conv_` prefix.
+
+Lead handoff review round 2 (2026-10-29): a handoff whose new lead died after `finish` had set the old lead to `reference` left the family stuck (a retry was refused as "already a reference", the sweep no longer saw a lead, children and tasks pointed at the dead lead). The commit now stores `ae.handoff_prev_status`, and the undo (`clear_commit`) moves the children back, rewrites the check-in and tasks back, restores the status and only then clears the marks; any problem keeps the marks so the undo repeats. The sweep takes a lead's lock with a 2 second wait and skips a busy lead until the next sweep.
+
+Compact card at 300k (2026-10-29, L2 of the token-saving plan; replaces the hand-off note; the owner's call: always compact, never suggest a new chat): the 60 second sweep no longer posts anything into a chat or waits for it to be idle. Past the owner's `lead_handoff_tokens` it labels a top-level Claude chat `ae.handoff=suggest` with the size in `ae.handoff_at`, and the web shows a card in the action dock above the composer and a line in the rail's Context section: "This chat is at 370k tokens. Every reply re-reads all of it." with Compact (two clicks, the same `/compact` the rail button sends, which does not depend on the model, so it works on 1M models) and Not now. Compact also snoozes, Not now snoozes alone, and a snooze waits for 100,000 more tokens. The label is wiped when the context falls back under the size, the setting is off, or the chat leaves working and blocked; the earlier `nudged` value is rewritten to `suggest`. `POST /v1/ae/sessions/{id}/handoff/request` and the note text are gone; `POST .../handoff` and the `hand_off` tool stay for when the user asks for a new chat. The setting is now "Suggest compacting at", key unchanged (patch 0250). Review round 1 (same day): the web shows the card only for the chats the server may label (top-level, not archived, no `ae.orch` family parent, no fork or side chat, role absent or lead, the Claude native wrapper, working or blocked), so a stale `suggest` label on a child, reviewer or other harness offers nothing; a snooze now survives the chat leaving working or blocked and ends only when the context falls under the size or the setting is 0; the sweep reads the owner, context and decision inside the chat's lock and skips a chat whose owner cannot be resolved; the snooze route re-reads under the lock and answers 409 for a chat that handed off, is not eligible, or has no context reading; a 409 from the snooze (from Not now, or after Compact) is a quiet no-op while other errors still toast; the sweep logs once per chat at INFO when it skips one for want of an owner; the old `Lead handoff:` note text is no longer exempt from the slot cap, the rabbit hole and the fork classifier. Still not checked: whether a native compact refreshes `omnigent.last_context_tokens` before the next reply; the snooze on Compact covers it either way.
+
+Lead handoff review round 3 (2026-10-29): `target_ok` now answers `ok`, `gone` or `unknown`. A store or owner lookup that fails, or an owner that reads as `None` on either side, is `unknown`: the sweep's repair logs at info and changes nothing, and the handoff route answers 503 with retry advice. Only a confirmed missing, archived or different-owner lead is `gone` and runs the undo. A permanent problem in the repair or the undo (a hand-edited check-in, no owner client) warns once per lead per process, then logs at debug.
+
+Stand-in Archive family (2026-10-29, patch 0247): right-clicking a Grouping > Family stand-in row (lead archived or not loaded) now offers Archive family, which archives every non-archived session of that family, so a leftover family can be closed. It confirms first while a session is open.
+
+Stand-in Archive family fix (2026-10-29, patch 0248): Archive family on a stand-in whose root session was missing from the loaded pages found nothing to archive; it now archives the sessions the sidebar shows under the stand-in as well, never the wider family of a re-rooted lead.
+
+Transcript keep recognises its own posts (2026-10-29, second fix for the keep of patches 0243 to 0245): live, the keep still never fired because the runner posts a transcript item over the event tunnel, which names no item id, so the forwarder could not tell its own items from foreign ones and the record never advanced past the seed. The forwarder now derives the id the server gives a post from its source id, a returned id still wins, and a post that failed never counts. When a foreign item holds the record the log says which item and why, once per change. After two cold relaunches of the same session, the first shows the record's item count following the server within a minute and the second shows `ae.claude_native.resume = kept` (patch 0249).
+
+Neutral names in the repo's own files (2026-10-29): the code, comments, docs and test fixtures outside `patches/` and `upstream/` no longer name the box's users. History says "the owner" or "the second box user", model-facing text says "the user", and fixtures use `owner@example.com` and `member@example.com`; tests that check a real value is refused build it from parts at run time. Behaviour changes with it: the orchestrator's pop-up tool is now `ask_user`, and the old name stays a hidden alias (callable, absent from tools/list, `LEGACY_ASK_TOOL` in `mcp.py`) so running sessions and skills keep working until a later PR drops it. The child-wake note reads "the user picked <choice>", and the continuation matcher also accepts any single capitalised word there, so notes already in history still match. The host config sync's personal-marker list moved out of source into a box file (`config/host-scrub.txt`, or `AE_HOST_SCRUB_FILE`; gitignored, with an example), and the sync refuses to run while it is missing or empty. `deploy/pull-secrets.sh` files the secrets under the invoking user's primary group by default (`AE_ENV_GROUP` still overrides). Left as they were: the managed block of CLAUDE.md (generated from ae-claude-skills) and `tests/deploy/fixtures/team-mcp.json` (a byte copy of an ae-claude-skills file that a test compares). Why: defence in depth behind the release scans, and a step toward putting the last names on the private leak denylist (docs/LEAK-SCAN.md).
+
+The hidden alias goes (2026-10-30): the old name of `ask_user`, kept one day as a callable alias outside tools/list, is removed from `mcp.py`; a call by that name now answers as an unknown tool. Nothing on the box or in ae-claude-skills called it, and clients call only the tools that tools/list shows.
+
+Transcript keep survives an image read (2026-10-30, patch 0251): after patch 0249 the keep's record followed the server, yet any session that had viewed an image since its last rebuild still rebuilt on every cold relaunch, because Claude Code's native image-read record carries the image's base64 a second time in `toolUseResult` and the keep refused any file the clone sanitizer would change. The keep now refuses only for a change the model would see, so that one shape stays, and a refused keep logs one INFO line naming the check that failed (ids, counts, types and line numbers only). Live check: Read a PNG in a test session, then cold-relaunch it twice; the second shows `ae.claude_native.resume = kept` and a first call whose cache read is about the history size. A session that still rebuilds shows the new line. If the first call after a keep of a file with an image read writes far more cache than a normal turn, revert the native-shape exemption.
+
+Slots-full approval card (2026-10-29, patch 0252): the slot cap's ask now reads as a decision: the question, then Run as overflow and Decline right under it, then the park hint, with the holding sessions folded behind "Show the N holding slots". The buttons used to sit below a long paragraph and fell off a phone screen.
+
+Slots-full card fixes (2026-10-29, patch 0253): the card no longer mis-splits holder titles that contain a number and a period, reads each holder's detail from the end of its row, appears only for the slot cap's own ask, and drops the holder toggle when only a pending claim holds the slot.
+
+Family cost card (2026-10-29, B1 of the token-saving plan): an Admin Center card ranks each session family's spend over 7 or 30 days. `family_cost.py` sweeps every session's usage every 15 minutes (one process, a `flock`), keeps a per-day snapshot for 35 days in `/data/ae-family-cost.json`, and `GET /v1/ae/family-cost?days=7|30` answers from the last sweep (`warming` until the first). A window is the total now minus the snapshot at its start; a chat started inside the window counts from zero. Checked against Claude transcripts for four families (two with five restarts): within 1.4%; a Claude lead's usage already holds its subagents, a Codex session's native subagents add tokens only (the parent's cost includes them), and there is no cache-write figure. An admin sees every family with a host chip, anyone else their own. "Show cost as" (tokens or dollars) and "Runaway family" (5M tokens or $25 spend today; one amount per unit) are saved per user in the roles state through `POST /v1/ae/family-cost/settings`, because the extension cannot PUT. Out of tree only: no upstream patch.
+
+Family cost review round 1 (2026-10-29, two reviewers): the settings POST now carries the JSON content type and trusted origin checks; the family walk goes up from every session (handoff, `ae.orch`, parent links) so children linked only by parent, subagents of subagents and handoff chains join one family and an orphan is its own lead; a session total that falls adds the sample before it to an offset; days are Pacific time and start at the last sample before midnight; the state file reloads when its mtime changes, and an unreadable one is renamed `.bad-<timestamp>` instead of overwritten.
+
+Bridge dir retention (2026-10-29, patch 0257): the ae-v0.18.0.190 deploy restarted the host and every relaunched chat rebuilt its transcript with the reason "no forwarder cursor". Root cause: the host's startup orphan sweep deleted each claude-native bridge dir, cursor and frontier record included, as soon as its runner was dead; the dir was born again only when the new runner prepared it, two minutes later in the logged case, so the sweep won whenever a relaunch lagged by more than about 3 s. A dead-owner claude-native dir now stays for 7 days after the latest of its owner marker, cursor and frontier record (the window codex-native uses), losing only the runtime files (the six a re-prep unlinks, plus `tool_relay.env`, which holds a token). Archive (the UI and the auto-archive sweep both PATCH `archived=true`) never told the runner to delete its bridge dir, so `_archive_stop` now asks the runner for its resource cleanup before stopping the host runner, and an archived chat's dir goes at once. A cold launch also logs one INFO line saying whether the cursor and the record exist. Two things linger for the same window: the attachment cache at `~/.omnigent/attachments/<hash>` (700), which the sweep removes after the rmtree, and `bridge.json`'s token, the long-lived token re-prep already reuses, both behind the same same-user 700 boundary codex-native already accepts for 7 days. The Admin Center box-health cleanup does not touch these dirs: its `/tmp` litter allowlist and the box's tmpfiles rules name other paths. Live check: after the deploy the host log's `native_bridge_orphans` line keeps claude-native dirs; the next relaunch's keep reason line no longer says "no forwarder cursor"; the restart after that keeps the transcript or names the next failed check.
+
+Question pop-up wrap (2026-10-29, patch 0258): a long unbroken string in an AskUserQuestion question, such as a pull request URL, ran past the right edge of the card on a phone. Root cause: the question sits in a `fieldset`, whose default minimum width is its content width, so the legend could not shrink and the text could not wrap. The section now has `min-w-0`, and the question and option descriptions use `overflow-wrap: anywhere`. Touches `AskUserQuestionForm.tsx` and the `ApprovalCard` suite.
+
+Question option wrap (2026-10-30, patch 0259): review of patch 0258 found that a long unbroken option label still ran past the card, because the label sits in a flex column that also could not shrink. The label and description wrapper now carries `min-w-0` and `overflow-wrap: anywhere`. Touches `AskUserQuestionForm.tsx` and the `ApprovalCard` suite.

@@ -53,7 +53,7 @@ class Rig:
             store=self,
             state=self.state,
             list_rows=self._rows,
-            owner=lambda _id: "reid",
+            owner=lambda _id: "owner",
             insights_on=lambda _user: self.on,
             resolve=lambda _conv: ("balanced", "abc1234567"),
             revision=lambda _user: 7,
@@ -136,7 +136,7 @@ def test_a_lead_in_review_writes_one_line_once(rig: Rig) -> None:
     [line] = rig.lines()
     assert line["session"] == "lead" and line["outcome"] == "review"
     assert (line["user"], line["preset"], line["fingerprint"], line["revision"]) == (
-        "reid",
+        "owner",
         "balanced",
         "abc1234567",
         7,
@@ -339,13 +339,13 @@ def test_insights_enabled_reads_the_users_setting(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(role_prefs, "DATA_DIR", Path("/nonexistent-ae-data"))
     role_prefs.reset_store()
     try:
-        assert preset_runs.insights_enabled("reid") is False
-        current = role_prefs.store().get("reid").model_dump()
+        assert preset_runs.insights_enabled("owner") is False
+        current = role_prefs.store().get("owner").model_dump()
         body = role_prefs.RolesPut.model_validate(
             {**current, "insights": {"enabled": True, "weeks": 4, "scope": "all"}}
         )
-        role_prefs.store().put("reid", body)
-        assert preset_runs.insights_enabled("reid") is True
+        role_prefs.store().put("owner", body)
+        assert preset_runs.insights_enabled("owner") is True
     finally:
         role_prefs.reset_store()
 

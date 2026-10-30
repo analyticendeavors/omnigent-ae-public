@@ -9,7 +9,7 @@ set -euo pipefail
 # What it fixes: when the server turns the host's credential away, the host
 # (ae-omnigent-host.service) keeps retrying, or, if it never connected since
 # it started, gives up after three tries and the unit fails. The fix is
-# `omnigent login` on the box, the printed sign-in link opened by Reid within
+# `omnigent login` on the box, the printed sign-in link opened by the owner within
 # five minutes (the server's login ticket lasts 300 s), then a host RESTART:
 # the host keeps its credential in memory, so a start does nothing on a running
 # unit. The credential lasts 720 h and renews itself, so this is for rare

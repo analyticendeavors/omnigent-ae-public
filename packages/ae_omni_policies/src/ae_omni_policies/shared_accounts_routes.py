@@ -50,6 +50,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 from collections.abc import Awaitable, Callable
 from typing import Annotated, Any
 
@@ -144,15 +145,74 @@ async def ask_as_caller(
     return response
 
 
-async def _probe_admin(request: Request, user: str | None) -> bool:
+async def _probe_admin(request: Request, user: str | None) -> bool | None:
+    """``True``/``False`` as ``/v1/me`` says; ``None`` when it could not be asked or failed.
+
+    Only a 200 and a 403 are answers about this user; a 401, 408, 429, a 5xx, a refused
+    connection or a timeout is not, so an admin is never mistaken for a non-admin by a
+    hiccup (2026-10-28).
+    """
     if user is None or user == RESERVED_USER_LOCAL:
         return True
-    me = await _me(request)
-    return bool(me and me.get("user_id") == user and me.get("is_admin") is True)
+    response = await ask_me(request)
+    if response is None:
+        return None
+    if response.status_code == 403:
+        return False
+    if response.status_code == 401:
+        # The login is no longer accepted (revoked, expired): its cached answer goes too.
+        _admin_seen.pop(user, None)
+        return None
+    if response.status_code != 200:
+        # 401, 408, 429, 5xx and the rest: a hiccup, not an answer about this user.
+        return None
+    try:
+        me = response.json()
+    except ValueError:
+        return None
+    if not isinstance(me, dict):
+        return None
+    return me.get("user_id") == user and me.get("is_admin") is True
 
 
-#: Swapped by tests; production asks ``/v1/me`` as the caller.
-admin_probe: Callable[[Request, str | None], Awaitable[bool]] = _probe_admin
+#: Swapped by tests; production asks ``/v1/me`` as the caller. ``None`` means "could not tell".
+admin_probe: Callable[[Request, str | None], Awaitable[bool | None]] = _probe_admin
+
+#: A confirmed answer is reused this long, and for :data:`ADMIN_STALE_S` when the probe fails.
+ADMIN_TTL_S = 30.0
+ADMIN_STALE_S = 600.0
+_admin_seen: dict[str, tuple[float, bool]] = {}
+
+
+def reset_admin_cache() -> None:
+    """Forget every confirmed admin answer (tests)."""
+    _admin_seen.clear()
+
+
+async def admin_state(request: Request, user: str | None) -> bool | None:
+    """Whether the caller is an admin: ``True``, ``False``, or ``None`` when it cannot be told.
+
+    Confirmed answers are kept per user for :data:`ADMIN_TTL_S`; when the probe fails, the
+    last confirmed one under :data:`ADMIN_STALE_S` old stands, else ``None`` (callers answer
+    a retriable 503 or take the closed side, and never cache that).
+    """
+    if user is None or user == RESERVED_USER_LOCAL:
+        return True
+    now = time.monotonic()
+    held = _admin_seen.get(user)
+    if held is not None and now - held[0] < ADMIN_TTL_S:
+        return held[1]
+    verdict = await admin_probe(request, user)
+    if verdict is None:
+        held = _admin_seen.get(user)  # a 401 may have dropped it
+        return held[1] if held is not None and now - held[0] < ADMIN_STALE_S else None
+    _admin_seen[user] = (now, verdict)
+    return verdict
+
+
+async def is_admin(request: Request, user: str | None) -> bool:
+    """:func:`admin_state` with "could not tell" taken as no."""
+    return await admin_state(request, user) is True
 
 
 async def _probe_session(request: Request, user: str | None) -> bool:
@@ -174,7 +234,7 @@ session_probe: Callable[[Request, str | None], Awaitable[bool]] = _probe_session
 
 
 async def _is_admin(request: Request, user: str | None) -> bool:
-    return await admin_probe(request, user)
+    return await is_admin(request, user)
 
 
 def _who(user: str | None) -> str:
@@ -345,7 +405,10 @@ __all__ = [
     "CODE_BROWSER",
     "FORK_HOOK_REGISTERED",
     "admin_probe",
+    "admin_state",
     "ask_as_caller",
+    "is_admin",
+    "reset_admin_cache",
     "router",
     "session_probe",
 ]

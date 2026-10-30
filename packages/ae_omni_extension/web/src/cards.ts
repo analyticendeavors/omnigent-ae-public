@@ -1,10 +1,10 @@
-// One session row for every section that lists sessions (2026-10-14, Reid's
+// One session row for every section that lists sessions (2026-10-14, the owner's
 // design pass on the Dashboard): Working and Blocked (capacity.ts) and
 // Review, Needs a note and Unsorted (sessions.ts) each drew their own card,
 // and the status buttons (Working, Review, Reference, ...) sat beside Open at
 // the same weight, so every card read as three or four equal actions.
 //
-// Second pass (2026-10-14, Reid's approved spec): a row is the status icon,
+// Second pass (2026-10-14, the owner's approved spec): a row is the status icon,
 // the title, tags and age on one line, then NEXT. The title is the Open
 // control (a button styled as the title); the Open button went. Park and the
 // status moves sit in a "..." menu at the line's right end; a button the

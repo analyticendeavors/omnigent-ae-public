@@ -397,7 +397,7 @@ def build_read(
             if isinstance(agent, dict) and agent.get("session"):
                 family.add(str(agent["session"]))
     model_changes = [
-        _trim_reason(line)
+        _trim_reason(model_log.normalize(line))
         for line in preset_stats._read_jsonl(model_log.log_path())
         if line.get("session") in family and (line.get("at") or 0) >= since
     ]

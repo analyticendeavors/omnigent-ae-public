@@ -12,7 +12,7 @@
 //
 // The card's folded line (the "azure" tile, never drawn in the strip) reads
 // "$412 this month" with the flag count; a flag makes the card amber and so
-// opens it on a phone until Reid folds it. The Open Cost Management button at
+// opens it on a phone until the owner folds it. The Open Cost Management button at
 // the foot asks the host to open the portal's cost analysis page (core patch
 // 0151 admits that one URL); where the host refuses, the URL shows to copy.
 

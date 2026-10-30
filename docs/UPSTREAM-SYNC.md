@@ -459,7 +459,7 @@ why the sync script pushes every pinned tag to the fork.
 
 ### v0.16.0 to v0.18.0 (2026-10-18)
 
-Overdue sync, one jump (Reid's call, 2026-10-18; v0.17.0 skipped as a pin, the way
+Overdue sync, one jump (the owner's call, 2026-10-18; v0.17.0 skipped as a pin, the way
 v0.14.0 was). Upstream moved 541 commits between the tags (254 to v0.17.0, 287 more to
 v0.18.0, `a8676d23e88df7918f4f8ef1c7c4e3186e710354`). This is the first sync run with
 `just sync` itself: `scripts/apply-patches.sh` now passes `--keep-non-patch` (plain
@@ -495,7 +495,7 @@ folded into the patch that owns the code):
 | `0049` browser sign-in | No conflict. `host/frames.py`'s install-harness and store-secret decoders, and the matching two result branches in `routes/host_tunnel.py`'s receive loop, end with the same lines, and the three-way merge put the `login_*` fields on the install-harness side of both | Moved back to the store-secret side, as on the v0.16.0 pin. The decoder was caught by `tests/host/test_connect.py`; the tunnel only by the broad run, since every install-harness result then crashed the host tunnel (`test_hosts_install_harness.py`). |
 | `0053` request-log records | Queued-command attachments: subagent hand-backs and task completions now become hidden `is_meta` items with `subagent_return_id` | The system-queued filter moved below upstream's hand-back branch, so those items survive and peer chatter still never renders as a user bubble. Its tests moved with upstream's to `tests/harnesses/claude_native/`. |
 | `0055` Agents pane | The tree was redrawn (https://github.com/omnigent-ai/omnigent/pull/8970): a root guide line, connectors, a status avatar on the left (`StatusIndicator` removed) | Rows still render through `AeAgentsSections`, which passes each row its index so the guide runs within a section; `AeAgentRowMeta` keeps Model and Time and leaves status to upstream's avatar. |
-| `0062` question dialogs and handoff | Switch-agent retired (https://github.com/omnigent-ai/omnigent/pull/8795): `POST .../switch-agent` answers 410 and `switch_conversation_agent` and `SwitchAgentDialog` are gone | Reid's call (2026-10-18): Switch harness opens upstream's fork dialog, whose route already checks a saved inference snapshot against the target harness. The switch-route, store and test changes dropped; question dialogs unchanged. |
+| `0062` question dialogs and handoff | Switch-agent retired (https://github.com/omnigent-ai/omnigent/pull/8795): `POST .../switch-agent` answers 410 and `switch_conversation_agent` and `SwitchAgentDialog` are gone | the owner's call (2026-10-18): Switch harness opens upstream's fork dialog, whose route already checks a saved inference snapshot against the target harness. The switch-route, store and test changes dropped; question dialogs unchanged. |
 | `0063` Model column | The Claude forwarder tests moved into `tests/harnesses/claude_native/forwarder/` | `test_ae_subagent_model.py` moved there and imports `_support`. |
 | `0067` compact accounts and handoff | Same retirement | The account switch through switch-agent dropped; the label guard, the binding refresh on `session.agent_changed`, compact accounts and Codex `effort_known` kept. Moving a running session to another account is now the new `0099`. |
 | `0071` session rail | The content row is wrapped in `CanvasWorkspace` (https://github.com/omnigent-ai/omnigent/pull/9573); the phone menu gained side chats | The rail mounts as `CanvasWorkspace`'s last child (outside canvas mode it renders the same flex row). The toggle suite's menu props gained the three side-chat fields. |
@@ -524,8 +524,8 @@ below asks a sync to re-check still hold on v0.18.0. PR 127's `PoliciesPage.tsx`
 a three-way merge around an import v0.18.0 added; its server patch has four twin-shape
 hunks (the create and update paths of the schema, the store and `openapi.json` look
 alike), each checked to sit on the update path as on v0.16.0. Two new patches ride along.
-`0098` (2026-10-18, Reid's request) puts the session rail's Absorbed and Unfiled counts
-side by side. `0099` (2026-10-18, Reid's call) picks the Claude account when forking a
+`0098` (2026-10-18, the owner's request) puts the session rail's Absorbed and Unfiled counts
+side by side. `0099` (2026-10-18, the owner's call) picks the Claude account when forking a
 Claude session. The fork request takes `claude_account` (at most 64 characters, like the
 host's account names); `routes/sessions/ae_fork_claude_account.py` checks it with the
 rules the switch route used (a Claude native target with no bound provider credentials,
@@ -549,7 +549,7 @@ What the next sync should watch:
   `onboarding`, `host`, `entities`, `stores`, `extensions`, `policies`) on the patched tree
   and on pristine v0.18.0 and compared the failures; do that again, with `--timeout 120 -p
   no:rerunfailures` (with upstream's 300-second timeout and flaky reruns, a few hung tests
-  kept a run going past 45 minutes). Remove `/tmp/pytest-of-reid/pytest-*` after a killed
+  kept a run going past 45 minutes). Remove `/tmp/pytest-of-<user>/pytest-*` after a killed
   run: three killed runs used up `/tmp`'s inodes on 2026-10-18. A scan for hunks whose
   context and removed lines match more than one place in the file they patch finds the
   candidates in seconds; this sync's were `0049`'s three, `0093`'s `openapi.json` hunk
@@ -636,7 +636,7 @@ Upstream features that overlap ours, and what was kept:
   the runner records the pull requests a session opens (`omnigent/runner/pr_observer.py`,
   `session_prs.py`) and serves them as session resources. Kept Your move's pull
   request section (`ae_omni_policies.github`): it answers a different question
-  (every pull request waiting on Reid across repos, with CI state), and no patch
+  (every pull request waiting on the owner across repos, with CI state), and no patch
   duplicated upstream's.
 - Latest-message errors in the sidebar (https://github.com/omnigent-ai/omnigent/pull/7251):
   upstream's error state renders through `SessionStateBadge`, the row's trailing

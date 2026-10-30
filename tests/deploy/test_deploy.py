@@ -47,9 +47,9 @@ SCRIPTS = sorted(DEPLOY.glob("*.sh"))
 SHELLCHECKED = SCRIPTS + sorted((ROOT / "scripts").glob("*.sh"))
 UNITS = sorted((DEPLOY / "systemd").glob("ae-omnigent*"))
 
-# The one install path the two system units carry (systemd has no home specifier
-# for system units); the user units say %h instead. deploy/README.md, step 6.
-INSTALL_ROOT = "/home/reid/deploy/omnigent-ae"
+# The token the two system units carry for the install path (systemd has no home specifier
+# for system units); the installer renders it. The user units say %h. deploy/README.md, step 6.
+INSTALL_ROOT = "__AE_HOME__"
 # The overlay's env_file follows the checkout: deploy/compose.sh exports these.
 SERVER_SETTINGS_REF = (
     "${AE_SERVER_SETTINGS:?run through deploy/compose.sh, which sets AE_SERVER_SETTINGS}"
@@ -361,7 +361,7 @@ def test_units_parse_and_carry_the_common_keys(unit: Path) -> None:
         for exe in _unit_values(unit, "Service", "ExecStart") + _unit_values(
             unit, "Service", "ExecStop"
         ):
-            assert exe.startswith(("/", "%h/")), (
+            assert exe.startswith(("/", "%h/", INSTALL_ROOT + "/")), (
                 f"{unit.name}: ExecStart/ExecStop must be an absolute path: {exe}"
             )
     else:
@@ -452,6 +452,7 @@ def test_scripts_are_the_expected_set_and_executable() -> None:
         "auto-update.sh",
         "backup-omnigent.sh",
         "compose.sh",
+        "host-config-sync.sh",
         "host-container.sh",
         "host-relink.sh",
         "install-host.sh",
@@ -1419,7 +1420,7 @@ def test_nothing_deployed_runs_from_the_working_checkout() -> None:
         DEPLOY / "docker-compose.override.yml",
     ]
     for path in deployed:
-        assert "/home/reid/repos/omnigent-ae" not in path.read_text(), path.name
+        assert "/repos/omnigent-ae" not in path.read_text(), path.name
 
 
 def test_pull_secrets_without_a_vault_name_stops_and_names_the_variable(
@@ -1431,3 +1432,19 @@ def test_pull_secrets_without_a_vault_name_stops_and_names_the_variable(
     )
     assert ran.returncode != 0
     assert "AE_VAULT_NAME is not set" in ran.stderr
+
+
+def test_system_units_render_to_absolute_paths_with_no_token_left(tmp_path: Path) -> None:
+    """The installer's sed (deploy/README.md, step 6) leaves absolute Exec lines and no home path."""
+    for unit in (
+        DEPLOY / "systemd" / "ae-omnigent.service",
+        DEPLOY / "systemd" / "ae-omnigent-dump.service",
+    ):
+        rendered = unit.read_text().replace(INSTALL_ROOT, str(tmp_path / "deploy" / "omnigent-ae"))
+        assert INSTALL_ROOT not in rendered, unit.name
+        assert "/home/" not in unit.read_text() and "/home/" not in rendered, unit.name
+        out = tmp_path / unit.name
+        out.write_text(rendered)
+        for key in ("ExecStart", "ExecStop"):
+            for exe in _unit_values(out, "Service", key):
+                assert exe.startswith(str(tmp_path) + "/"), f"{unit.name}: {key}: {exe}"

@@ -115,7 +115,7 @@ describe("phone layout guards", () => {
     }
   });
 
-  // 2026-09-26: Reid found the Dashboard's buttons too tall at desktop width.
+  // 2026-09-26: the owner found the Dashboard's buttons too tall at desktop width.
   // One shared rule: 32 px with a mouse, 40 px on a touch screen.
   it("keeps buttons compact with a mouse and thumb-sized on a touch screen", () => {
     expect(block("\n.btn")).toContain("min-height: 32px");

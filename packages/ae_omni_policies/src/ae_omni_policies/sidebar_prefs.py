@@ -1,7 +1,7 @@
 """Each user's manual sidebar order, kept on the server so it follows them across devices.
 
-Reid asked on 2026-10-18 to put sessions in an order of his own choosing and
-to see the same order on his laptop and his phone. Upstream keeps the sidebar
+The owner asked on 2026-10-18 to put sessions in an order of their own choosing and
+to see the same order on their laptop and their phone. Upstream keeps the sidebar
 view (grouping, ordering, filters) per device in ``localStorage``, which cannot
 do that. This module is the server's half: one ordered list of session ids per
 user, with a revision number so two devices that edit at once do not silently

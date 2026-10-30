@@ -1,7 +1,7 @@
 """Give the OIDC session cookie its expiry on page loads, so the iOS app keeps it.
 
-Why (2026-10-20): after the Microsoft sign-in cutover Reid had to sign in again
-through the phone's browser every time he reopened the iOS app. The App Store
+Why (2026-10-20): after the Microsoft sign-in cutover the owner had to sign in again
+through the phone's browser every time they reopened the iOS app. The App Store
 build (0.3.1, 2026-09-24) signs in with the ticket flow (``POST /auth/cli-login``,
 the browser, ``GET /auth/cli-poll``) and installs the token it receives as a
 cookie with no expiry. WebKit treats that as a session cookie and drops it when

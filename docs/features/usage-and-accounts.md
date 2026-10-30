@@ -35,10 +35,10 @@ Each Claude session records which account it runs on, and the popover reads the 
 
 <p align="center"><img src="../media/usage-account-switcher.webp" alt="Check any login's limits"></p>
 
-The account name in the usage popover and in the session rail's Usage card is a menu of every Claude login on the host, each with its plan, and the one this chat runs on is marked This chat. Pick another and the card shows that login's windows and credits; the chat itself stays on its own login. The choice lasts while you look at that chat. Codex cards stay plain.
+The account name in the usage popover and in the session rail's Usage card is a menu of every Claude login on the host, each with its plan, and the one this chat runs on is marked This chat. Pick another and the card shows that login's windows and credits; the chat itself stays on its own login. The choice lasts while you look at that chat. Codex cards stay plain. In the Usage card the title reads just Claude Code, and the plan sits in the login pill beside it ("Backup · Max"), with a people icon for a shared login. A small green dot marks the login this session runs on, and the pill turns amber while the card shows a login other than the chat's own.
 
 **Where:** The account name on the plan line of the usage popover or the rail's Usage card.<br>
-**Built from:** core patch [`0208`](../../patches/0208-ae-patch-Show-a-chat-s-live-Claude-login-in-the-Usag.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+**Built from:** core patches [`0208`](../../patches/0208-ae-patch-Show-a-chat-s-live-Claude-login-in-the-Usag.patch), [`0233`](../../patches/0233-ae-patch-Move-the-plan-into-the-Usage-card-s-login-p.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
 ## Several Claude logins per host
 
@@ -84,6 +84,13 @@ Omnigent switches a running session to another harness or model by forking it. T
 
 **Where:** The composer's model menu > Claude Code > Switch harness, then Claude account.<br>
 **Built from:** core patches [`0099`](../../patches/0099-ae-patch-Pick-the-Claude-account-when-forking-a-Clau.patch), [`0209`](../../patches/0209-ae-patch-Switch-a-Claude-chat-s-login-in-place-and-k.patch)
+
+## A relaunch keeps Claude's transcript
+
+A Claude Code chat restarts its terminal cold after a deploy, a host restart, a wake from idle, or a login or model switch. Stock Omnigent then rebuilt Claude's transcript file from the server's history, and since the rebuilt file never matches what Claude sent before, the next reply wrote the whole conversation to the prompt cache again at the cache-write price. The fork keeps the file Claude already has when it still matches the server: the host records how far the server's history reached when it last wrote to the transcript, and a relaunch keeps the file when the server has added nothing since, apart from items the transcript never holds, such as its own resource and error events. The host keeps that record for seven days after it last changed, even once the chat's runner has stopped, so a relaunch after a host restart can still use it. When a keep is refused, the host log says why and the transcript is rebuilt as before.
+
+**Where:** Nothing to turn on: it applies on every cold relaunch of a Claude Code chat. The reason for a refused keep is in the host's log.<br>
+**Built from:** core patches [`0243`](../../patches/0243-ae-patch-Keep-a-Claude-session-s-transcript-on-a-col.patch), [`0244`](../../patches/0244-ae-patch-Fix-the-review-findings-on-the-transcript-k.patch), [`0245`](../../patches/0245-ae-patch-Let-the-transcript-keep-ignore-the-server-s.patch), [`0249`](../../patches/0249-ae-patch-Recognise-the-forwarder-s-own-posts-when-th.patch), [`0251`](../../patches/0251-ae-patch-Keep-a-transcript-with-a-native-image-read-.patch), [`0257`](../../patches/0257-ae-patch-Keep-a-claude-native-bridge-dir-for-7-days-.patch)
 
 ---
 

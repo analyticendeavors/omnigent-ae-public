@@ -93,7 +93,7 @@ const DATA: YourMove = {
   pulls: {
     ok: true,
     configured: true,
-    login: "ae-reid-havens",
+    login: "ae-owner",
     repos: ["analyticendeavors/omnigent-ae"],
     errors: [],
     items: [
@@ -102,7 +102,7 @@ const DATA: YourMove = {
         number: 23,
         title: "Add the Your move panel",
         url: "https://github.com/analyticendeavors/omnigent-ae/pull/23",
-        author: "ae-reid-havens",
+        author: "ae-owner",
         draft: false,
         updated_at: null,
         why: ["author"],
@@ -123,7 +123,7 @@ function card23(extra: Partial<PrCard> = {}): PrCard {
     title: "Add the Your move panel",
     state: "open",
     draft: false,
-    author: "ae-reid-havens",
+    author: "ae-owner",
     head_ref: "claude/your-move",
     base_ref: "main",
     head_sha: SHA,
@@ -373,7 +373,7 @@ describe("Your move", () => {
       pulls: {
         ok: true,
         configured: false,
-        login: "ae-reid-havens",
+        login: "ae-owner",
         repos: [],
         items: [],
         errors: [],

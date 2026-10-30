@@ -1,12 +1,12 @@
 // The Admin Center's status tile strip (2026-10-20, the dashboard redesign
-// Reid approved as concept C): one small tile per thing the page watches,
+// the owner approved as concept C): one small tile per thing the page watches,
 // across the top of the page, so the state of the box reads at a glance before
 // any card is opened.
 //
 // Why: the page had grown to six sections in one 720 px column, and on a wide
 // pane the answer to "is anything wrong?" sat several scrolls down. The tiles
 // read only what the sections already fetch: each section builds its own tile
-// from its own state (deploys.ts, host.ts, fabric.ts, databricks.ts,
+// from its own state (deploys.ts, boxHealth.ts, host.ts, fabric.ts, databricks.ts,
 // secrets.ts, vault.ts, accounts.ts, git.ts) and hands it here after every draw, so the strip adds no request
 // of its own. A tile has a label with an icon, one value, a muted note and a
 // coloured left edge by health: green ok, amber needs attention, grey idle,
@@ -30,6 +30,7 @@ import { el, replaceChildren } from "./dom";
 import {
   boltIcon,
   databaseIcon,
+  gaugeIcon,
   gitBranchIcon,
   keyIcon,
   lockIcon,
@@ -45,6 +46,7 @@ export type Health = "ok" | "attention" | "idle" | "problem";
 export type TileId =
   | "release"
   | "hold"
+  | "boxhealth"
   | "host"
   | "fabric"
   | "databricks"
@@ -54,7 +56,8 @@ export type TileId =
   | "accounts"
   | "credit"
   | "azure"
-  | "presets";
+  | "presets"
+  | "family";
 
 export interface Tile {
   id: TileId;
@@ -75,6 +78,8 @@ export interface Tile {
 export const TILE_ORDER: ReadonlyArray<{ id: TileId; label: string; icon: () => SVGElement }> = [
   { id: "release", label: "Release", icon: tagIcon },
   { id: "hold", label: "Deploy hold", icon: pauseIcon },
+  // 2026-10-28: the box monitor's tile (boxHealth.ts), a tenth, just before the host's.
+  { id: "boxhealth", label: "Box health", icon: () => gaugeIcon() },
   { id: "host", label: "Box host", icon: serverIcon },
   { id: "fabric", label: "Fabric", icon: () => boltIcon() },
   { id: "databricks", label: "Databricks", icon: databaseIcon },

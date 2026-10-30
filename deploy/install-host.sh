@@ -5,7 +5,7 @@
 # tool, resolves inside it. Phase 6, 2026-09-23. Idempotent; rerun after every
 # upstream sync so the host and the server carry the same version.
 #
-#   deploy/install-host.sh            # as reid, no sudo
+#   deploy/install-host.sh            # as <user>, no sudo
 #   AE_HOST_VENV=/elsewhere deploy/install-host.sh
 #
 # uv, not python3 -m venv: the box has no python3-venv package,
@@ -24,7 +24,7 @@ set -euo pipefail
 VENV="${AE_HOST_VENV:-$HOME/.omnigent-host/venv}"
 PYTHON_VERSION="${AE_HOST_PYTHON:-$(cat "$UPSTREAM_DIR/.python-version" 2>/dev/null || echo 3.12)}"
 
-# uv, claude and codex live in reid's ~/.local/bin and ~/.local/node/bin, which
+# uv, claude and codex live in <user>'s ~/.local/bin and ~/.local/node/bin, which
 # the shells OmniGent starts (and the user units) do not put on PATH
 # (2026-09-24: the first run from a box session died here).
 PATH="$HOME/.local/bin:$HOME/.local/node/bin:$PATH"

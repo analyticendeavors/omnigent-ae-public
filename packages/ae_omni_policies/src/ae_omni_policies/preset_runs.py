@@ -1119,6 +1119,7 @@ def read_model_changes(family: set[str], since: float) -> list[dict[str, Any]]:
             at = _number(entry.get("at"))
             if at is None or at < since:
                 continue
+            entry = model_log.normalize(entry)
             out.append(
                 {
                     key: entry.get(key)

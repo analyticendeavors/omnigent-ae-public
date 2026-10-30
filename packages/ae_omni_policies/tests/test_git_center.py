@@ -623,7 +623,7 @@ async def test_git_route_is_admin_only(client: httpx.AsyncClient, ae_admins: set
     )
     assert refused.status_code == 403, refused.text
     assert refused.json()["error"]["code"] == "admin_only"
-    allowed = await client.get("/v1/ae/git", headers={"X-Forwarded-Email": "reid@example.com"})
+    allowed = await client.get("/v1/ae/git", headers={"X-Forwarded-Email": "owner@example.com"})
     assert allowed.status_code == 200, allowed.text
     assert allowed.json()["configured"] is False
 

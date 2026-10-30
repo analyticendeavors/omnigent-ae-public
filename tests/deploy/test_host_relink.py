@@ -68,7 +68,7 @@ n="$(grep -c '^omnigent ' "$FAKE_CALLS")"
 echo "Opening browser for login: $2/auth/login?ticket=T$n"
 echo "Waiting for authentication..."
 if [ "$outcome" = wait ]; then echo "$$" >>"$FAKE_PIDS"; exec sleep 30; fi
-if [ "$outcome" = ok ]; then echo "Logged in as reid@example.com"; exit 0; fi
+if [ "$outcome" = ok ]; then echo "Logged in as owner@example.com"; exit 0; fi
 echo "Error: Login ticket expired or was rejected. Please try again."
 exit 1
 """
@@ -238,7 +238,7 @@ def test_a_connect_line_ends_the_streak(box: Box) -> None:
 def test_a_request_while_the_server_sees_the_host_offline_runs_the_login(box: Box) -> None:
     # The last journal line says connected; the server knows better.
     box.lines(CONNECTED)
-    box.takes("request 1792520000 reid")
+    box.takes("request 1792520000 owner")
     box.logins("ok")
     box.run("watch", FAKE_ONLINE="offline")
     assert len(box.called("omnigent")) == 1 and len(_restarts(box)) == 1
@@ -246,7 +246,7 @@ def test_a_request_while_the_server_sees_the_host_offline_runs_the_login(box: Bo
 
 def test_a_request_while_the_server_sees_the_host_online_does_nothing(box: Box) -> None:
     box.lines(FIRST)
-    box.takes("request 1792520000 reid")
+    box.takes("request 1792520000 owner")
     result = box.run("watch", FAKE_ONLINE="online")
     assert box.called("omnigent") == [] and _restarts(box) == []
     assert "sees the host online" in result.stderr
@@ -254,7 +254,7 @@ def test_a_request_while_the_server_sees_the_host_online_does_nothing(box: Box) 
 
 def test_a_request_runs_when_the_online_check_fails(box: Box) -> None:
     box.lines("some line")
-    box.takes("request 1792520000 reid")
+    box.takes("request 1792520000 owner")
     box.logins("ok")
     box.run("watch", FAKE_ONLINE="fail")
     assert len(box.called("omnigent")) == 1
@@ -274,7 +274,7 @@ def test_the_healthy_path_never_asks_the_server(box: Box) -> None:
 def test_requests_left_before_or_during_a_loop_are_dropped(box: Box) -> None:
     box.lines(FIRST, every_30th(30))
     # Taken at the loop's start (left before it) and after the restart (left during it).
-    box.takes("none", "request 1 reid", "request 2 reid")
+    box.takes("none", "request 1 owner", "request 2 owner")
     box.logins("ok")
     result = box.run("watch")
     assert len(box.called("omnigent")) == 1 and len(_restarts(box)) == 1

@@ -45,15 +45,24 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("AE_MERGE_WATCH", "0")
     # The auto-archive sweep likewise; only its own tests run it.
     monkeypatch.setenv("AE_AUTO_ARCHIVE", "0")
+    # The family cost sweep likewise; its tests build a Sweeper and call it directly.
+    monkeypatch.setenv("AE_FAMILY_COST", "0")
+    monkeypatch.setenv("AE_FAMILY_COST_FILE", "")
     # Expiry alerts run after every vault reading; only their own tests run them.
     monkeypatch.setenv("AE_SECRET_ALERTS", "off")
     monkeypatch.setenv("AE_SECRET_OWNERS_FILE", "")
     monkeypatch.setenv("AE_SECRET_ALERTS_FILE", "")
     # Cost targets keep their rules and alert state in memory; only their own tests use files.
+    monkeypatch.setenv("AE_BOX_HEALTH_FILE", "")
+    monkeypatch.setenv("AE_BOX_HEALTH_CLEANUP_FILE", "")
+    monkeypatch.delenv("AE_BOX_USER_LABELS", raising=False)
+    monkeypatch.delenv("AE_BOX_ADMINS", raising=False)
     monkeypatch.setenv("AE_COST_TARGETS_FILE", "")
     monkeypatch.setenv("AE_COST_ALERT_STATE_FILE", "")
     from ae_omni_policies import (
         auth,
+        box_health,
+        box_health_cleanup,
         cost_targets,
         prs,
         router,
@@ -76,6 +85,8 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     router.reset_lot_cache()
     prs.reset_cache()
     secrets_meta.reset_store()
+    box_health.reset_store()
+    box_health_cleanup.reset_store()
     secret_owners.reset_store()
     secret_alerts.reset_store()
     cost_targets.reset_stores()
@@ -86,14 +97,24 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     router.reset_lot_cache()
     prs.reset_cache()
     secrets_meta.reset_store()
+    box_health.reset_store()
+    box_health_cleanup.reset_store()
     secret_owners.reset_store()
     secret_alerts.reset_store()
     cost_targets.reset_stores()
 
 
+@pytest.fixture(autouse=True)
+def _fresh_admin_answers() -> None:
+    """No confirmed admin answer outlives its test (``shared_accounts_routes.admin_state``)."""
+    from ae_omni_policies import shared_accounts_routes
+
+    shared_accounts_routes.reset_admin_cache()
+
+
 @pytest.fixture()
 def ae_admins(monkeypatch: pytest.MonkeyPatch) -> set[str]:
-    """Multi-user header auth with reid@example.com the only admin.
+    """Multi-user header auth with owner@example.com the only admin.
 
     The admin question is answered from the returned set instead of ``GET /v1/me``
     (``shared_accounts_routes.admin_probe``, which the admin-only routes ask).
@@ -103,7 +124,9 @@ def ae_admins(monkeypatch: pytest.MonkeyPatch) -> set[str]:
 
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER")
     auth.reset_provider_cache()
-    allowed = {"reid@example.com"}
+    allowed = {"owner@example.com"}
+
+    shared_accounts_routes.reset_admin_cache()
 
     async def probe(_request: Any, user: str | None) -> bool:
         return user in allowed

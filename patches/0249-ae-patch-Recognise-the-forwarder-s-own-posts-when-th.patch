@@ -1,0 +1,787 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 14:48:54 -0700
+Subject: [PATCH 249/260] [ae-patch] Recognise the forwarder's own posts when
+ the tunnel names no item id
+
+A single transcript item goes over the runner's event tunnel, whose acknowledgement carries no item id, so the forwarder never learned the ids of its own posts and every row after the seed looked foreign; the transcript keep's record never advanced and every relaunch rebuilt. The forwarder now derives the id from the post's source id with the server's own formula when the post returns none, a real returned id still wins, and a source id that is empty or over 256 characters is never derived. It records the kind of each item it posts (type, plus role for a message) and counts an id as its own only for a server row of that kind, so a row that reuses the id under another type or role still holds the record. The record logs once per foreign item why it is held, and warns once per session about a post it cannot recognise.
+---
+ .../harnesses/claude_native/ae_resume_keep.py | 159 +++++-
+ omnigent/harnesses/claude_native/forwarder.py |   2 +
+ .../claude_native/test_ae_resume_keep.py      | 454 +++++++++++++++++-
+ 3 files changed, 577 insertions(+), 38 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/ae_resume_keep.py b/omnigent/harnesses/claude_native/ae_resume_keep.py
+index 374ce3d8bc193a5e7f443d5253a0d373fb1e3b95..868a483e4d786984195bf19f7acb9c298ea7ba53 100644
+--- a/omnigent/harnesses/claude_native/ae_resume_keep.py
++++ b/omnigent/harnesses/claude_native/ae_resume_keep.py
+@@ -39,6 +39,7 @@ import json
+ import logging
+ import os
+ import urllib.parse
++import uuid
+ from collections.abc import Callable, Mapping, Sequence
+ from dataclasses import dataclass, replace
+ from pathlib import Path
+@@ -261,23 +262,98 @@ def read_context(bridge_dir: Path, *, forwarder_stopped: bool = True) -> ResumeC
+ 
+ 
+ # Ids the forwarder's own posts returned that no frontier record has yet absorbed, per
+-# session. Process-local bookkeeping of the forwarder itself (it is never read by a
++# session, each with the kind of item that was posted (see :func:`item_kind`; empty when
++# unknown). Process-local bookkeeping of the forwarder itself (it is never read by a
+ # launch) so a post made in an earlier, interrupted poll is not mistaken for a foreign item.
+-_own_ids: dict[str, list[str]] = {}
++# An id counts as own only for a server row of the same kind, so a foreign row that reuses
++# the id (a same source id under another type or role) still holds the record.
++_own_ids: dict[str, dict[str, str]] = {}
+ 
+ 
+-def note_posted(session_id: str, item_id: object) -> None:
++# Longest ``source_id`` the server accepts; it rejects longer ones (and empty ones), so no
++# item was stored for such a post and no id can be derived for it.
++_MAX_SOURCE_ID = 256
++
++# Per session, the (id, type) of the foreign item named by the last "held" line
++# :func:`record_frontier` logged, so one foreign item is logged once, not on every poll and
++# however many own posts follow it. Ids and types only, never item text.
++_MAX_LOGGED_SESSIONS = 1024
++_held_logged: dict[str, tuple[str, str]] = {}
++
++# Sessions already warned about a post that left no id to note.
++_warned_no_id: set[str] = set()
++
++
++def derived_item_id(session_id: str, source_id: str) -> str:
++    """
++    The id the server gives the item it stores for an external post with *source_id*.
++
++    The runner reaches the server over the event tunnel, whose acknowledgement carries no
++    item id, so the forwarder cannot read the id back from the post. The server keys the
++    item's stable id by this formula, so the forwarder derives it. It must stay in step with
++    ``_new_external_conversation_item`` in ``omnigent/server/routes/_sessions/orchestration.py``.
++
++    :param session_id: Omnigent conversation id the item was posted to, e.g. ``"conv_abc123"``.
++    :param source_id: The post's ``source_id``; surrounding whitespace is ignored, as on the
++        server.
++    :return: The item's id: a 32-character lowercase hex string.
++    """
++    return uuid.uuid5(
++        uuid.NAMESPACE_URL, f"omnigent-external-item:{session_id}:{source_id.strip()}"
++    ).hex
++
++
++def item_kind(item_type: object, role: object = None) -> str:
++    """
++    The kind of an item as the server's item list reports it, for telling a row from the
++    one the forwarder posted: the wire type, plus the role for a message.
++
++    :param item_type: Wire item type, e.g. ``"message"`` or ``"function_call"``.
++    :param role: The message role, e.g. ``"assistant"``; ignored for other types.
++    :return: e.g. ``"message:assistant"`` or ``"function_call"``; ``""`` when untyped.
++    """
++    if not isinstance(item_type, str):
++        return ""
++    if item_type == "message" and isinstance(role, str):
++        return f"message:{role}"
++    return item_type
++
++
++def note_posted(
++    session_id: str, item_id: object, source_id: object = None, kind: str = ""
++) -> None:
+     """
+     Remember the id the server gave an item the forwarder posted.
+ 
++    The id the post returned wins. A post over the event tunnel returns none, so the id is
++    derived from *source_id* (see :func:`derived_item_id`); that is safe because ``_own_ids``
++    only whitelists ids that also appear in the server's item list, and the id of a source id
++    this forwarder posted can only be the item the server stored for that post. Call it only
++    after the post succeeded.
++
+     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+     :param item_id: The ``item_id`` of the post's response; anything else is ignored.
++    :param source_id: The ``source_id`` the post carried, used when *item_id* is unusable.
++    :param kind: :func:`item_kind` of the item posted; the id counts as own only for a row of
++        this kind. Empty means any kind.
+     """
+     if not isinstance(item_id, str) or not item_id:
+-        return
+-    ids = _own_ids.setdefault(session_id, [])
+-    ids.append(item_id)
+-    del ids[:-_MAX_OWN_IDS]
++        if isinstance(source_id, str) and source_id.strip() and len(source_id) <= _MAX_SOURCE_ID:
++            item_id = derived_item_id(session_id, source_id)
++        else:
++            if session_id not in _warned_no_id and len(_warned_no_id) < _MAX_LOGGED_SESSIONS:
++                _warned_no_id.add(session_id)
++                _logger.warning(
++                    "claude-native: a posted item for %s has no item id and no usable "
++                    "source id; the transcript keep cannot recognise it",
++                    session_id,
++                )
++            return
++    ids = _own_ids.setdefault(session_id, {})
++    ids.pop(item_id, None)
++    ids[item_id] = kind
++    while len(ids) > _MAX_OWN_IDS:
++        del ids[next(iter(ids))]
+ 
+ 
+ def forget_session(session_id: str) -> None:
+@@ -287,17 +363,51 @@ def forget_session(session_id: str) -> None:
+     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+     """
+     _own_ids.pop(session_id, None)
++    _held_logged.pop(session_id, None)
++    _warned_no_id.discard(session_id)
++
++
++def _log_held(
++    session_id: str,
++    delta: list[tuple[str, str, str]],
++    own: Mapping[str, str],
++    held: int,
++    foreign: int,
++) -> None:
++    """
++    Log, once per change, that the record is held at *held* items by ``delta[foreign]``.
++
++    :param held: The recorded item count, where the frontier stays.
++    :param foreign: Index in *delta* of the first item the forwarder did not post.
++    """
++    item_id, item_type, _kind = delta[foreign]
++    marker = (item_id, item_type)
++    if _held_logged.get(session_id) == marker:
++        return
++    if session_id not in _held_logged and len(_held_logged) >= _MAX_LOGGED_SESSIONS:
++        return
++    _held_logged[session_id] = marker
++    _logger.info(
++        "claude-native: frontier for %s held at %d: item %s (%s) not posted by this "
++        "forwarder; own_ids=%d delta=%d",
++        session_id,
++        held,
++        item_id,
++        item_type or "untyped",
++        len(own),
++        len(delta),
++    )
+ 
+ 
+ async def _items_after(
+     client: httpx.AsyncClient, session_id: str, after: str
+-) -> list[tuple[str, str]] | None:
++) -> list[tuple[str, str, str]] | None:
+     """
+-    The items created after *after* as ``(id, wire type name)`` pairs, or ``None`` when
+-    they could not be read. A missing or non-string type is the empty string, which counts
+-    as part of the transcript.
++    The items created after *after* as ``(id, wire type name, kind)`` triples (see
++    :func:`item_kind`), or ``None`` when they could not be read. A missing or non-string type
++    is the empty string, which counts as part of the transcript.
+     """
+-    ids: list[tuple[str, str]] = []
++    ids: list[tuple[str, str, str]] = []
+     cursor = after
+     for _ in range(_MAX_PAGES):
+         resp = await client.get(
+@@ -311,7 +421,11 @@ async def _items_after(
+         if not isinstance(data, list):
+             return None
+         batch = [
+-            (row["id"], row["type"] if isinstance(row.get("type"), str) else "")
++            (
++                row["id"],
++                row["type"] if isinstance(row.get("type"), str) else "",
++                item_kind(row.get("type"), row.get("role")),
++            )
+             for row in data
+             if isinstance(row, dict) and isinstance(row.get("id"), str)
+         ]
+@@ -350,7 +464,7 @@ async def record_frontier(
+     try:
+         previous = read_frontier(bridge_dir)
+         if previous is None:
+-            _own_ids.pop(session_id, None)
++            forget_session(session_id)
+             return
+         if (
+             _same_path(previous.transcript_path, cursor.transcript_path)
+@@ -361,9 +475,14 @@ async def record_frontier(
+         delta = await _items_after(client, session_id, previous.last_item_id)
+         if delta is None:
+             return
+-        own = _own_ids.get(session_id, [])
+-        if any(item_id not in own and _in_transcript(item_type) for item_id, item_type in delta):
+-            return
++        own = _own_ids.get(session_id, {})
++        for index, (item_id, item_type, kind) in enumerate(delta):
++            recorded = own.get(item_id)
++            is_own = recorded is not None and recorded in ("", kind)
++            if not is_own and _in_transcript(item_type):
++                _log_held(session_id, delta, own, previous.item_count, index)
++                return
++        _held_logged.pop(session_id, None)
+         write_frontier(
+             bridge_dir,
+             Frontier(
+@@ -374,8 +493,10 @@ async def record_frontier(
+                 delta[-1][0] if delta else previous.last_item_id,
+             ),
+         )
+-        absorbed = {item_id for item_id, _ in delta}
+-        _own_ids[session_id] = [item_id for item_id in own if item_id not in absorbed]
++        absorbed = {item_id for item_id, _type, _kind in delta}
++        _own_ids[session_id] = {
++            item_id: kind for item_id, kind in own.items() if item_id not in absorbed
++        }
+     except Exception:  # noqa: BLE001 - a missed record only costs a later keep
+         _logger.debug(
+             "claude-native: could not record the server frontier for %s",
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index f78987606aa977c8c18cec7090af0dfe0f3e9b46..71683f07f71b91a83f9037c248851e6f55e5df8d 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -4884,6 +4884,8 @@ async def _forward_available_items(
+                     session_id=session_id,
+                     item=item,
+                 ),
++                item.source_id,
++                ae_resume_keep.item_kind(item.item_type, item.data.get("role")),
+             )
+         except httpx.HTTPError as exc:
+             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
+diff --git a/tests/harnesses/claude_native/test_ae_resume_keep.py b/tests/harnesses/claude_native/test_ae_resume_keep.py
+index ef3b11a20af1f926778389db66a6b000a2430f2c..3ebf981fcc428564d34241a911054b4a53fdcce3 100644
+--- a/tests/harnesses/claude_native/test_ae_resume_keep.py
++++ b/tests/harnesses/claude_native/test_ae_resume_keep.py
+@@ -4,9 +4,12 @@ from __future__ import annotations
+ 
+ import copy
+ import json
++import logging
++import uuid
+ from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Any
++from unittest.mock import Mock
+ 
+ import httpx
+ import pytest
+@@ -15,6 +18,19 @@ from omnigent.harnesses.claude_native import ae_resume_keep as keep
+ from omnigent.harnesses.claude_native import forwarder
+ from omnigent.harnesses.claude_native import main as claude_native
+ from omnigent.runner.native import orchestration
++from omnigent.runner.transports.ws_tunnel.event_delivery import (
++    RunnerEventDispatcher,
++    TunnelEventClient,
++)
++from omnigent.runner.transports.ws_tunnel.frames import (
++    EventAckFrame,
++    EventBatchFrame,
++    decode_frame,
++)
++from omnigent.runtime import pending_inputs
++from omnigent.server.routes._sessions import orchestration as server_orchestration
++from omnigent.server.schemas import SessionEventInput
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+ 
+ SID = "sid123"
+ CONV = "conv_abc"
+@@ -53,12 +69,42 @@ class FakeServer:
+     source_ids: dict[str, str] = field(default_factory=dict)
+     # Stamped on every forwarded item, as the real server copies it from the queued input.
+     stamp_created_by: str | None = None
+-
+-    def add(self, item: dict[str, Any]) -> str:
+-        item_id = f"item_{len(self.items)}"
++    # Give a posted item the id the real server derives from its source id.
++    derived: bool = False
++    # Whether the 202 names the item. The event tunnel's synthetic 202 never does.
++    return_item_id: bool = True
++    # Store the next post, then lose the response, as a timed-out POST does.
++    lose_next_response: bool = False
++    # Before the next post, a row of this shape already holds the id the post derives.
++    collide_next_post: dict[str, Any] | None = None
++
++    def add(self, item: dict[str, Any], item_id: str | None = None) -> str:
++        item_id = item_id or f"item_{len(self.items)}"
+         self.items.append({"id": item_id, **item})
+         return item_id
+ 
++    def post_item(self, data: dict[str, Any]) -> str:
++        """Store one external item as the server does."""
++        # The real server derives the id from the source id, so a re-post is a no-op.
++        source_id = data.get("source_id")
++        if self.collide_next_post is not None and isinstance(source_id, str):
++            held_id = _server_item_id(CONV, source_id)
++            self.add(self.collide_next_post, held_id)
++            self.source_ids[source_id] = held_id
++            self.collide_next_post = None
++        if isinstance(source_id, str) and source_id in self.source_ids:
++            return self.source_ids[source_id]
++        stamp = {"created_by": self.stamp_created_by} if self.stamp_created_by else {}
++        item_id = self.add(
++            {"type": data["item_type"], **data["item_data"], **stamp},
++            _server_item_id(CONV, source_id)
++            if self.derived and isinstance(source_id, str)
++            else None,
++        )
++        if isinstance(source_id, str):
++            self.source_ids[source_id] = item_id
++        return item_id
++
+     def handle(self, request: httpx.Request) -> httpx.Response:
+         path = request.url.path
+         if request.method == "GET" and path.endswith("/items"):
+@@ -76,21 +122,24 @@ class FakeServer:
+             return httpx.Response(200, json={})
+         body = json.loads(request.content)
+         if body.get("type") == "external_conversation_item":
+-            data = body["data"]
+-            # The real server derives the id from the source id, so a re-post is a no-op.
+-            source_id = data.get("source_id")
+-            if isinstance(source_id, str) and source_id in self.source_ids:
+-                return httpx.Response(
+-                    202, json={"queued": False, "item_id": self.source_ids[source_id]}
+-                )
+-            stamp = {"created_by": self.stamp_created_by} if self.stamp_created_by else {}
+-            item_id = self.add({"type": data["item_type"], **data["item_data"], **stamp})
+-            if isinstance(source_id, str):
+-                self.source_ids[source_id] = item_id
+-            return httpx.Response(202, json={"queued": False, "item_id": item_id})
++            item_id = self.post_item(body["data"])
++            if self.lose_next_response:
++                self.lose_next_response = False
++                raise httpx.ReadTimeout("response lost", request=request)
++            payload: dict[str, Any] = {"queued": False}
++            if self.return_item_id:
++                payload["item_id"] = item_id
++            return httpx.Response(202, json=payload)
+         return httpx.Response(202, json={})
+ 
+ 
++def _server_item_id(session_id: str, source_id: str) -> str:
++    """The server's formula for an external item's id, written out independently of the keep."""
++    return uuid.uuid5(
++        uuid.NAMESPACE_URL, f"omnigent-external-item:{session_id}:{source_id.strip()}"
++    ).hex
++
++
+ @dataclass
+ class Env:
+     root: Path
+@@ -132,8 +181,12 @@ def _append(path: Path, rows: list[dict[str, Any]]) -> None:
+ @pytest.fixture(autouse=True)
+ def _no_own_ids() -> Any:
+     keep._own_ids.clear()
++    keep._held_logged.clear()
++    keep._warned_no_id.clear()
+     yield
+     keep._own_ids.clear()
++    keep._held_logged.clear()
++    keep._warned_no_id.clear()
+ 
+ 
+ @pytest.fixture
+@@ -177,13 +230,13 @@ def _seed(env: Env, *, workspace: Path | None = None) -> Path:
+     return path
+ 
+ 
+-async def _forward(env: Env) -> None:
++async def _forward(env: Env, client: httpx.AsyncClient | None = None) -> None:
+     """Run the real forwarder over whatever Claude has written since its cursor."""
+     state = forwarder._read_forward_state(env.bridge)
+     assert state is not None
+-    async with env.client() as client:
++    async with client or env.client() as active:
+         await forwarder._forward_available_items(
+-            client=client,
++            client=active,
+             session_id=CONV,
+             bridge_dir=env.bridge,
+             agent_name="claude-native-ui",
+@@ -193,6 +246,34 @@ async def _forward(env: Env) -> None:
+         )
+ 
+ 
++def _tunnel_client(
++    env: Env, *, error: str | None = None, retryable: bool = False
++) -> TunnelEventClient:
++    """
++    The runner's real client over a stubbed tunnel: it acks every event as applied (the server
++    stores it, naming no id), or, with *error*, rejects the batch and stores nothing.
++    """
++    dispatcher = RunnerEventDispatcher()
++
++    async def send(text: str) -> None:
++        frame = decode_frame(text)
++        assert isinstance(frame, EventBatchFrame)
++        if error is not None:
++            dispatcher.acknowledge(EventAckFrame(frame.id, 0, error, retryable))
++            return
++        for event in frame.events:
++            if event["type"] == "external_conversation_item":
++                env.server.post_item(event["data"])
++        dispatcher.acknowledge(EventAckFrame(frame.id, len(frame.events)))
++
++    dispatcher.ready(send)
++    return TunnelEventClient(
++        event_dispatcher=dispatcher,
++        transport=httpx.MockTransport(env.server.handle),
++        base_url="http://test",
++    )
++
++
+ def _restart_forwarder_at(env: Env, path: Path, offset: int) -> None:
+     """What the relaunched forwarder starts from: a fresh cursor at *offset*."""
+     forwarder.reset_transcript_forward_state(env.bridge)
+@@ -784,7 +865,7 @@ def test_lines_are_counted_in_chunks_across_a_large_prefix(tmp_path: Path) -> No
+ def test_own_post_ids_are_dropped_when_the_forwarder_ends() -> None:
+     keep.note_posted(CONV, "item_1")
+     keep.note_posted(CONV, None)
+-    assert keep._own_ids[CONV] == ["item_1"]
++    assert keep._own_ids[CONV] == {"item_1": ""}
+     keep.forget_session(CONV)
+     assert CONV not in keep._own_ids
+ 
+@@ -1124,3 +1205,338 @@ def test_the_skipped_set_and_the_rebuilt_types_cover_every_item_type(tmp_path: P
+             bridge_dir=tmp_path,
+         )
+         assert record is None, item_type
++
++
++# ---- the forwarder's own posts are recognised when the post names no item -----------------
++
++
++def _derived_env(env: Env) -> Env:
++    env.server.derived = True
++    env.server.return_item_id = False
++    return env
++
++
++@pytest.mark.asyncio
++async def test_a_tunnel_post_names_no_id_yet_the_record_follows_and_the_next_relaunch_keeps(
++    env: Env,
++) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    _append(path, [_user_row("u1", "list files", str(env.workspace))])
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++
++    await _forward(env, _tunnel_client(env))
++
++    assert len(env.server.items) == 3
++    last_source_id = list(env.server.source_ids)[-1]
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert frontier.item_count == 3
++    assert frontier.last_item_id == _server_item_id(CONV, last_source_id)
++    assert frontier.last_item_id == env.server.items[-1]["id"]
++
++    written, ctx = await _relaunch(env)
++
++    assert _mode(ctx) == keep.KEPT
++    assert written == path
++
++
++@pytest.mark.parametrize(
++    "source_id", ["src-1", "  src-2  ", "a b\tc  d", " x  y ", "claude:abc:uuid-1:0"]
++)
++def test_the_derived_id_is_the_id_the_server_gives_the_item(source_id: str) -> None:
++    body = SessionEventInput(
++        type="external_conversation_item",
++        data={
++            "item_type": "message",
++            "item_data": {
++                "role": "assistant",
++                "content": [{"type": "output_text", "text": "x"}],
++                "agent": "claude-native-ui",
++            },
++            "source_id": source_id,
++        },
++    )
++
++    item = server_orchestration._new_external_conversation_item(CONV, body)
++
++    assert keep.derived_item_id(CONV, source_id) == item.stable_id
++
++
++@pytest.mark.asyncio
++async def test_a_post_that_raised_notes_no_id_and_the_record_stays_behind(
++    env: Env, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++
++    async def fails(*_args: object, **_kwargs: object) -> None:
++        raise httpx.ConnectError("down")
++
++    monkeypatch.setattr(forwarder, "_post_external_conversation_item", fails)
++    await _forward(env)
++
++    assert not keep._own_ids.get(CONV)
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert (frontier.item_count, frontier.last_item_id) == (1, "item_0")
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("rejection", ["tunnel-422", "http-503"])
++async def test_a_rejected_post_notes_no_id(env: Env, rejection: str) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    if rejection == "tunnel-422":
++        client: httpx.AsyncClient = _tunnel_client(env, error="invalid session event")
++    else:
++        # A retryable tunnel ack never surfaces (the dispatcher resends it); the retryable
++        # failure the forwarder sees is the HTTP fallback's 503.
++        def busy(request: httpx.Request) -> httpx.Response:
++            if request.method == "POST":
++                return httpx.Response(503, json={"detail": "busy"})
++            return env.server.handle(request)
++
++        client = httpx.AsyncClient(transport=httpx.MockTransport(busy), base_url="http://test")
++
++    await _forward(env, client)
++
++    assert not keep._own_ids.get(CONV)
++    assert len(env.server.items) == 1
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert (frontier.item_count, frontier.last_item_id) == (1, "item_0")
++
++
++@pytest.mark.asyncio
++async def test_a_retry_that_hits_the_server_dedupe_moves_the_record_once(env: Env) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    # The server stores the item but the forwarder never hears back, so it posts it again.
++    env.server.lose_next_response = True
++    await _forward(env)
++    assert len(env.server.items) == 2
++
++    # The retry goes over the tunnel, which acks the dedupe hit with no id.
++    await _forward(env, _tunnel_client(env))
++
++    assert len(env.server.items) == 2
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert (frontier.item_count, frontier.last_item_id) == (2, env.server.items[-1]["id"])
++
++
++@pytest.mark.asyncio
++async def test_a_server_row_written_after_an_own_post_holds_the_record(env: Env) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "first", str(env.workspace))])
++    await _forward(env, _tunnel_client(env))
++    anchor = keep.read_frontier(env.bridge)
++    assert anchor is not None and anchor.item_count == 2
++    # A drained pending input leaves a server-written user row behind the forwarder's own post.
++    env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "queued"}]}
++    )
++    _append(path, [_assistant_row("a2", "second", str(env.workspace))])
++
++    await _forward(env, _tunnel_client(env))
++
++    assert len(env.server.items) == 4
++    held = keep.read_frontier(env.bridge)
++    assert held is not None
++    assert (held.item_count, held.last_item_id) == (2, anchor.last_item_id)
++    _written, ctx = await _relaunch(env)
++    assert _mode(ctx) == keep.REBUILT
++
++
++@pytest.mark.asyncio
++async def test_a_real_item_id_wins_over_the_derived_one(
++    env: Env, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    path = _seed(env)
++    noted: list[tuple[object, object]] = []
++    real = keep.note_posted
++
++    def spy(session_id: str, item_id: object, source_id: object = None, kind: str = "") -> None:
++        noted.append((item_id, source_id))
++        real(session_id, item_id, source_id, kind)
++
++    monkeypatch.setattr(keep, "note_posted", spy)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++
++    await _forward(env)
++
++    assert [item_id for item_id, _ in noted] == ["item_1"]
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert (frontier.item_count, frontier.last_item_id) == (2, "item_1")
++    keep.note_posted(CONV, "real", "src")
++    assert keep._own_ids[CONV] == {"real": ""}
++
++
++@pytest.mark.asyncio
++async def test_a_foreign_item_after_own_posts_is_logged_once_not_every_poll(
++    env: Env, caplog: pytest.LogCaptureFixture
++) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    foreign = env.server.add(
++        {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "other"}]}
++    )
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    caplog.set_level(logging.INFO, logger=keep.__name__)
++
++    await _forward(env, _tunnel_client(env))
++    # Each later poll that finds the same delta records again; it must not log again.
++    cursor = keep.read_forward_cursor(env.bridge)
++    assert cursor is not None
++    async with env.client() as client:
++        for _ in range(2):
++            await keep.record_frontier(client, env.bridge, CONV, cursor)
++
++    held = [r for r in caplog.records if "held at" in r.getMessage()]
++    assert len(held) == 1
++    message = held[0].getMessage()
++    assert foreign in message
++    assert "held at 1:" in message
++    assert "own_ids=1 delta=2" in message
++    assert "other" not in message
++    # Own posts that follow the same foreign row do not log it again.
++    _append(path, [_assistant_row("a2", "more", str(env.workspace))])
++    await _forward(env, _tunnel_client(env))
++    assert len([r for r in caplog.records if "held at" in r.getMessage()]) == 1
++
++
++def test_a_post_with_no_id_and_no_usable_source_id_notes_nothing_and_warns_once(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    caplog.set_level(logging.WARNING, logger=keep.__name__)
++    for source_id in (None, "", "   ", "x" * 257):
++        keep.note_posted(CONV, None, source_id)
++    keep.note_posted("conv_other", None, None)
++
++    assert CONV not in keep._own_ids
++    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
++    assert len(warnings) == 2
++    assert "x" * 257 not in "".join(r.getMessage() for r in warnings)
++    keep.note_posted(CONV, None, "x" * 256)
++    assert list(keep._own_ids[CONV]) == [keep.derived_item_id(CONV, "x" * 256)]
++    keep.forget_session(CONV)
++    assert CONV not in keep._warned_no_id
++
++
++def test_the_held_log_state_is_capped_and_cleared_with_the_session() -> None:
++    delta = [("item_9", "message", "message:user")]
++    for number in range(keep._MAX_LOGGED_SESSIONS + 5):
++        keep._log_held(f"conv_{number}", delta, {}, 1, 0)
++    assert len(keep._held_logged) == keep._MAX_LOGGED_SESSIONS
++    keep.forget_session("conv_0")
++    assert "conv_0" not in keep._held_logged
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    "colliding",
++    [
++        {"type": "function_call", "name": "Bash"},
++        {"type": "message", "role": "user", "content": []},
++    ],
++    ids=["other-type", "other-role"],
++)
++async def test_a_row_that_reuses_an_own_id_under_another_type_or_role_holds_the_record(
++    env: Env, caplog: pytest.LogCaptureFixture, colliding: dict[str, Any]
++) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    # The server already holds a foreign row under the id this post derives, so the post is
++    # a dedupe hit that the forwarder takes for its own.
++    env.server.collide_next_post = colliding
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    caplog.set_level(logging.INFO, logger=keep.__name__)
++
++    await _forward(env, _tunnel_client(env))
++
++    assert len(env.server.items) == 2
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert (frontier.item_count, frontier.last_item_id) == (1, "item_0")
++    held = [r.getMessage() for r in caplog.records if "held at" in r.getMessage()]
++    assert len(held) == 1
++    assert env.server.items[1]["id"] in held[0]
++    _written, ctx = await _relaunch(env)
++    assert _mode(ctx) == keep.REBUILT
++
++
++@pytest.mark.asyncio
++async def test_a_matching_type_and_role_still_counts_as_own(env: Env) -> None:
++    _derived_env(env)
++    path = _seed(env)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++    env.server.collide_next_post = {
++        "type": "message",
++        "role": "assistant",
++        "content": [{"type": "output_text", "text": "done"}],
++    }
++
++    await _forward(env, _tunnel_client(env))
++
++    frontier = keep.read_frontier(env.bridge)
++    assert frontier is not None
++    assert frontier.item_count == 2
++
++
++@pytest.mark.asyncio
++async def test_a_session_with_no_record_drops_every_per_session_note(env: Env) -> None:
++    path = _seed(env)
++    (env.bridge / keep.FRONTIER_FILE).unlink()
++    keep._own_ids[CONV] = {"item_1": ""}
++    keep._held_logged[CONV] = ("item_1", "message")
++    keep._warned_no_id.add(CONV)
++    _append(path, [_assistant_row("a1", "done", str(env.workspace))])
++
++    await _forward(env)
++
++    assert CONV not in keep._own_ids
++    assert CONV not in keep._held_logged
++    assert CONV not in keep._warned_no_id
++
++
++@pytest.mark.asyncio
++async def test_the_server_stores_a_drained_user_message_and_a_dedupe_hit_under_the_derived_id(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    store = SqlAlchemyConversationStore(db_uri)
++    conv = store.create_conversation(title="Drain")
++    monkeypatch.setattr("omnigent.runtime.session_stream.publish", Mock())
++    # An older queued message and the one this transcript row answers: the drain skips the
++    # first and consumes the second, and the anchor still takes the source-derived id.
++    pending_inputs.record(conv.id, [{"type": "input_text", "text": "Still queued"}])
++    pending_inputs.record(conv.id, [{"type": "input_text", "text": "hello"}])
++    source_id = "claude:abc:user-record:0"
++    body = SessionEventInput(
++        type="external_conversation_item",
++        data={
++            "item_type": "message",
++            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
++            "source_id": source_id,
++        },
++    )
++
++    first = await server_orchestration._persist_external_conversation_item(
++        conv.id, conv, body, store
++    )
++
++    assert first == keep.derived_item_id(conv.id, source_id)
++    stored = store.get_item(conv.id, first)
++    assert stored is not None and stored.type == "message"
++    # A retry of the same source id is a dedupe hit and names the same item.
++    again = await server_orchestration._persist_external_conversation_item(
++        conv.id, conv, body, store
++    )
++    assert again == first
++    rows = [row for row in store.list_items(conv.id).data if row.id == first]
++    assert len(rows) == 1

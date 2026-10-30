@@ -1,0 +1,1471 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:51:17 -0700
+Subject: [PATCH 236/260] [ae-patch] Restart Claude in the same chat to switch
+ into or out of bypass permissions
+
+Picking Bypass permissions on a running claude-native session restarts the Claude pane in the same conversation with --permission-mode bypassPermissions, and leaving bypass restarts it again with the target mode, so no pane keeps a bypass launch around. No session is launched with --allow-dangerously-skip-permissions. The restart is refused while a reply or an approval is in progress.
+---
+ omnigent/runner/ae_bypass_relaunch.py         | 149 ++++++++++++
+ omnigent/runner/ae_claude_account.py          |  70 +++++-
+ omnigent/runner/app.py                        |  52 ++++-
+ .../routes/_session_create_validation.py      |  13 +-
+ omnigent/server/routes/_sessions/common.py    |  17 +-
+ .../routes/sessions/ae_bypass_switch.py       |  78 +++++++
+ .../server/routes/sessions/routes_core.py     |  40 +++-
+ omnigent/server/schemas.py                    |   6 +-
+ openapi.json                                  |   2 +-
+ ...st_permission_picker_marks_current_mode.py |   2 +-
+ .../scheduled/test_scheduled_tasks_page.py    |   5 +-
+ .../test_claude_native_bridge.py              |   8 +-
+ tests/runner/test_ae_bypass_relaunch.py       | 215 ++++++++++++++++++
+ ...test_app_sessions_native_events_options.py | 108 ++++++++-
+ .../integration/test_sessions_endpoints.py    | 184 ++++++++++++++-
+ .../composer/ComposerControls.test.tsx        |  22 ++
+ .../components/composer/ComposerControls.tsx  |   3 +-
+ .../scheduled/CreateScheduledTaskDialog.tsx   |   2 +-
+ web/src/lib/claudePermissionMode.test.ts      |  20 +-
+ web/src/lib/claudePermissionMode.ts           |  17 +-
+ web/src/pages/ChatPage.composer.test.tsx      |  19 ++
+ web/src/pages/ChatPage.tsx                    |  10 +-
+ 22 files changed, 977 insertions(+), 65 deletions(-)
+ create mode 100644 omnigent/runner/ae_bypass_relaunch.py
+ create mode 100644 omnigent/server/routes/sessions/ae_bypass_switch.py
+ create mode 100644 tests/runner/test_ae_bypass_relaunch.py
+
+diff --git a/omnigent/runner/ae_bypass_relaunch.py b/omnigent/runner/ae_bypass_relaunch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7f7284920908275b34bd77d87350b5c690f7daff
+--- /dev/null
++++ b/omnigent/runner/ae_bypass_relaunch.py
+@@ -0,0 +1,149 @@
++"""Switch a running claude-native session into or out of bypass permissions.
++
++Claude's shift+tab cycle reaches bypass only on a pane launched into it, and a
++pane launched into it passes through bypass whenever it cycles and prints
++"plan mode won't ask before most edits or commands" in Plan. So the runner never
++cycles toward or away from bypass: it restarts the Claude pane in the same
++conversation (``--resume``) with ``--permission-mode <target>``, the way an
++account switch does. The server has already pinned the target mode in the
++session's launch args, which the new pane reads.
++
++Answers to ``{"type": "permission_mode_change"}`` for such a switch:
++
++``200 {"permission_mode": <mode>, "relaunched": <bool>}``
++    The pane is in the mode (``relaunched`` false when it already was). The mode
++    is the one the new pane renders, which a managed setting can make differ
++    from the target; the key is absent when no footer appeared.
++``400``
++    The session does not run Claude Code.
++``409``
++    A reply or an approval is in progress, the old terminal would not close, or
++    the new one did not start; ``{"error": <code>, "detail": <sentence>}``.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Awaitable, Callable
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++from fastapi.responses import JSONResponse, Response
++
++from omnigent.runner.ae_claude_account import (
++    NOT_CLAUDE_DETAIL,
++    CloseTerminal,
++    EnsureTerminal,
++    PublishEvent,
++    Refusals,
++    relaunch_claude_terminal,
++)
++
++if TYPE_CHECKING:
++    from omnigent.terminals import TerminalRegistry
++
++BYPASS = "bypassPermissions"
++# Longest the new pane gets to show its permission-mode footer.
++SETTLE_TIMEOUT_S = 15.0
++
++BYPASS_REFUSALS = Refusals(
++    busy_code="claude_bypass_busy",
++    busy_detail=(
++        "Claude is mid-reply or waiting on an approval. Stop it or answer it, "
++        "then pick the mode again."
++    ),
++    not_closed_code="claude_bypass_not_closed",
++    not_closed_detail="Claude's old terminal would not close. Try again.",
++    not_started_code="claude_bypass_not_started",
++    not_started_detail="Claude did not restart. Open the Terminal tab to see why, then try again.",
++)
++
++
++def needs_relaunch(target_mode: str, current_mode: str | None) -> bool:
++    """
++    Whether a switch to *target_mode* restarts the pane.
++
++    :param target_mode: Mode asked for, e.g. ``"plan"``.
++    :param current_mode: Mode the pane renders now, or ``None`` when unknown.
++    :returns: ``True`` when the target is bypass, or the pane is in bypass and
++        the switch leaves it.
++    """
++    return target_mode == BYPASS or current_mode == BYPASS
++
++
++def read_settled_mode_blocking(bridge_dir: Path, timeout_s: float) -> str | None:
++    """
++    Wait for the Claude pane's prompt and read the permission mode it renders.
++
++    Blocking; call it from a worker thread.
++
++    :param bridge_dir: Bridge directory of the session's Claude pane.
++    :param timeout_s: Longest to wait for the pane and its prompt.
++    :returns: The rendered mode, e.g. ``"bypassPermissions"``, or ``None`` when
++        the pane never showed one.
++    """
++    from omnigent.harnesses.claude_native.bridge import (
++        _read_settled_permission_mode,
++        _wait_for_claude_prompt_ready,
++        _wait_for_tmux_info,
++    )
++
++    try:
++        info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
++        socket_path, tmux_target = info["socket_path"], info["tmux_target"]
++        _wait_for_claude_prompt_ready(socket_path, tmux_target, timeout_s=timeout_s)
++        return _read_settled_permission_mode(socket_path, tmux_target)
++    except RuntimeError:
++        return None
++
++
++async def handle_claude_relaunch_switch(
++    conversation_id: str,
++    *,
++    target_mode: str,
++    harness: str | None,
++    current_mode: Callable[[], Awaitable[str | None]],
++    settled_mode: Callable[[], Awaitable[str | None]],
++    turn_in_flight: Callable[[], bool],
++    terminal_registry: TerminalRegistry | None,
++    close_terminal: CloseTerminal,
++    ensure_terminal: EnsureTerminal,
++    publish_event: PublishEvent,
++) -> Response:
++    """
++    Restart the Claude pane in *target_mode*, unless it is already there.
++
++    :param conversation_id: Session id, e.g. ``"conv_abc123"``.
++    :param target_mode: Mode to land in, e.g. ``"bypassPermissions"``.
++    :param harness: The session's canonical harness, or ``None`` when not loaded.
++    :param current_mode: Reads the mode the pane renders now.
++    :param settled_mode: Waits for the new pane's footer and reads its mode.
++    :param turn_in_flight: Whether the runner sees an active turn or a running pane.
++    :param terminal_registry: The runner's terminal registry.
++    :param close_terminal: Closes a terminal resource by session and resource id.
++    :param ensure_terminal: Starts the native terminal again.
++    :param publish_event: The runner's per-session event emitter.
++    :returns: ``200`` with the mode reached, or the relaunch's error response.
++    """
++    if harness != "claude-native":
++        return JSONResponse(
++            status_code=400,
++            content={"error": "claude_bypass_unsupported", "detail": NOT_CLAUDE_DETAIL},
++        )
++    if await current_mode() == target_mode:
++        return JSONResponse({"permission_mode": target_mode, "relaunched": False})
++    response = await relaunch_claude_terminal(
++        conversation_id,
++        turn_in_flight=turn_in_flight,
++        terminal_registry=terminal_registry,
++        close_terminal=close_terminal,
++        ensure_terminal=ensure_terminal,
++        publish_event=publish_event,
++        refusals=BYPASS_REFUSALS,
++    )
++    if not 200 <= response.status_code < 300:
++        return response
++    mode = await settled_mode()
++    content: dict[str, object] = {"relaunched": True}
++    if mode is not None:
++        content["permission_mode"] = mode
++    return JSONResponse(content)
+diff --git a/omnigent/runner/ae_claude_account.py b/omnigent/runner/ae_claude_account.py
+index 88f719d14463a02b8c97ca51783336e22ba1024e..8dde3e3f81e536c32224af492f11db737af8326e 100644
+--- a/omnigent/runner/ae_claude_account.py
++++ b/omnigent/runner/ae_claude_account.py
+@@ -30,6 +30,7 @@ import contextlib
+ import logging
+ import weakref
+ from collections.abc import Awaitable, Callable, Mapping
++from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Any
+ 
+ from fastapi.responses import JSONResponse, Response
+@@ -52,6 +53,28 @@ NOT_STARTED_DETAIL = (
+ )
+ 
+ NOT_CLOSED_DETAIL = "Claude's old terminal would not close. Try the switch again."
++
++
++@dataclass(frozen=True)
++class Refusals:
++    """The 409 codes and sentences a relaunch answers with, so each caller words its own."""
++
++    busy_code: str
++    busy_detail: str
++    not_closed_code: str
++    not_closed_detail: str
++    not_started_code: str
++    not_started_detail: str
++
++
++ACCOUNT_REFUSALS = Refusals(
++    busy_code="claude_account_busy",
++    busy_detail=BUSY_DETAIL,
++    not_closed_code="claude_account_not_closed",
++    not_closed_detail=NOT_CLOSED_DETAIL,
++    not_started_code="claude_account_not_started",
++    not_started_detail=NOT_STARTED_DETAIL,
++)
+ # Longest a turn waits for a switch to finish; past it the turn goes ahead.
+ SWITCH_WAIT_S = 100.0
+ 
+@@ -124,6 +147,43 @@ async def handle_claude_account_change(
+     """
+     if harness != _CLAUDE_NATIVE:
+         return _error(400, "claude_account_unsupported", NOT_CLAUDE_DETAIL)
++    return await relaunch_claude_terminal(
++        conversation_id,
++        turn_in_flight=turn_in_flight,
++        terminal_registry=terminal_registry,
++        close_terminal=close_terminal,
++        ensure_terminal=ensure_terminal,
++        publish_event=publish_event,
++        refusals=ACCOUNT_REFUSALS,
++    )
++
++
++async def relaunch_claude_terminal(
++    conversation_id: str,
++    *,
++    turn_in_flight: Callable[[], bool],
++    terminal_registry: TerminalRegistry | None,
++    close_terminal: CloseTerminal,
++    ensure_terminal: EnsureTerminal,
++    publish_event: PublishEvent,
++    refusals: Refusals,
++) -> Response:
++    """
++    Restart a claude-native session's terminal, one relaunch at a time per session.
++
++    Marks the session switching for the duration, so a turn that arrives waits
++    for the new pane. The caller has already checked the harness and stored
++    whatever the new launch reads.
++
++    :param conversation_id: Session id, e.g. ``"conv_abc123"``.
++    :param turn_in_flight: Whether the runner sees an active turn or a running pane.
++    :param terminal_registry: The runner's terminal registry.
++    :param close_terminal: Closes a terminal resource by session and resource id.
++    :param ensure_terminal: Starts the native terminal again.
++    :param publish_event: The runner's per-session event emitter.
++    :param refusals: The codes and sentences for the 409 answers.
++    :returns: ``200 {"relaunched": true}`` or a 409 response.
++    """
+     lock = _locks.get(conversation_id)
+     if lock is None:
+         lock = _locks[conversation_id] = asyncio.Lock()
+@@ -137,6 +197,7 @@ async def handle_claude_account_change(
+                 close_terminal=close_terminal,
+                 ensure_terminal=ensure_terminal,
+                 publish_event=publish_event,
++                refusals=refusals,
+             )
+         finally:
+             _switching.pop(conversation_id, None)
+@@ -151,6 +212,7 @@ async def _replace_terminal(
+     close_terminal: CloseTerminal,
+     ensure_terminal: EnsureTerminal,
+     publish_event: PublishEvent,
++    refusals: Refusals,
+ ) -> Response:
+     """Close the pane seen now and start another; the session is already marked switching."""
+     from omnigent.runner.tool_dispatch import _publish_terminal_deleted_event
+@@ -161,7 +223,7 @@ async def _replace_terminal(
+         return terminal_registry.get(conversation_id, _TERMINAL_NAME, "main")
+ 
+     if session_is_busy(conversation_id, turn_in_flight=turn_in_flight()):
+-        return _error(409, "claude_account_busy", BUSY_DETAIL)
++        return _error(409, refusals.busy_code, refusals.busy_detail)
+     pane = current()
+     if pane is not None:
+         try:
+@@ -175,14 +237,14 @@ async def _replace_terminal(
+                     publish_event=publish_event,
+                 )
+         if current() is pane:
+-            return _error(409, "claude_account_not_closed", NOT_CLOSED_DETAIL)
++            return _error(409, refusals.not_closed_code, refusals.not_closed_detail)
+     await ensure_terminal(conversation_id, _CLAUDE_NATIVE)
+     started = current()
+     if started is None or started is pane or not await started.is_alive():
+         _logger.warning(
+-            "claude account switch: no live new terminal after relaunch for session=%s",
++            "claude relaunch: no live new terminal after relaunch for session=%s",
+             conversation_id,
+             extra={"session_id": conversation_id},
+         )
+-        return _error(409, "claude_account_not_started", NOT_STARTED_DETAIL)
++        return _error(409, refusals.not_started_code, refusals.not_started_detail)
+     return JSONResponse({"relaunched": True})
+diff --git a/omnigent/runner/app.py b/omnigent/runner/app.py
+index 41650d8e27e37b48fc41fb3c182477b5a00e0579..96c4a8fc6d6b838c0f69b38c2ef2c2e9dd78d573 100644
+--- a/omnigent/runner/app.py
++++ b/omnigent/runner/app.py
+@@ -6798,20 +6798,23 @@ def create_runner_app(
+                 turn_in_flight=_native_turn_in_flight,
+             )
+ 
++        def _claude_turn_busy() -> bool:
++            return (
++                conversation_id in _active_turns
++                or _native_turn_in_flight(conversation_id)
++                or (
++                    process_manager is not None
++                    and process_manager.has_active_turn(conversation_id)
++                )
++            )
++
+         if body_type == "claude_account_change":
+             from omnigent.runner.ae_claude_account import handle_claude_account_change
+ 
+             return await handle_claude_account_change(
+                 conversation_id,
+                 harness=_session_harness_name(conversation_id),
+-                turn_in_flight=lambda: (
+-                    conversation_id in _active_turns
+-                    or _native_turn_in_flight(conversation_id)
+-                    or (
+-                        process_manager is not None
+-                        and process_manager.has_active_turn(conversation_id)
+-                    )
+-                ),
++                turn_in_flight=_claude_turn_busy,
+                 terminal_registry=resource_registry.terminal_registry,
+                 close_terminal=resource_registry.close_terminal,
+                 ensure_terminal=_ensure_native_terminal_for_turn,
+@@ -6853,6 +6856,39 @@ def create_runner_app(
+                         conversation_id,
+                         mode,
+                     )
++                if mode is not None:
++                    # omnigent-ae: into or out of bypass the pane restarts (see the module).
++                    from omnigent.harnesses.claude_native.bridge import (
++                        bridge_dir_for_bridge_id,
++                        read_permission_mode,
++                    )
++                    from omnigent.runner import ae_bypass_relaunch
++
++                    bypass_dir = bridge_dir_for_bridge_id(
++                        await _claude_native_bridge_id_for_session(
++                            server_client=server_client, session_id=conversation_id
++                        )
++                    )
++                    pane_mode = await asyncio.to_thread(read_permission_mode, bypass_dir)
++                    if ae_bypass_relaunch.needs_relaunch(mode, pane_mode):
++                        return await ae_bypass_relaunch.handle_claude_relaunch_switch(
++                            conversation_id,
++                            target_mode=mode,
++                            harness=harness,
++                            current_mode=lambda: asyncio.to_thread(
++                                read_permission_mode, bypass_dir
++                            ),
++                            settled_mode=lambda: asyncio.to_thread(
++                                ae_bypass_relaunch.read_settled_mode_blocking,
++                                bypass_dir,
++                                ae_bypass_relaunch.SETTLE_TIMEOUT_S,
++                            ),
++                            turn_in_flight=_claude_turn_busy,
++                            terminal_registry=resource_registry.terminal_registry,
++                            close_terminal=resource_registry.close_terminal,
++                            ensure_terminal=_ensure_native_terminal_for_turn,
++                            publish_event=_publish_event,
++                        )
+                 return await _handle_claude_native_permission_mode_change(
+                     conversation_id,
+                     mode,
+diff --git a/omnigent/server/routes/_session_create_validation.py b/omnigent/server/routes/_session_create_validation.py
+index 10d06fbc8043489ce904777c842034c26a7026d7..aff0f76b1f6133992843db9a98d7a11cb0641139 100644
+--- a/omnigent/server/routes/_session_create_validation.py
++++ b/omnigent/server/routes/_session_create_validation.py
+@@ -94,8 +94,8 @@ async def resolve_project_session_create(
+ 
+ 
+ # Claude Code's ``--permission-mode`` launch vocabulary — every value the CLI
+-# accepts at start, not just the shift+tab-switchable subset. ``dontAsk`` and
+-# ``bypassPermissions`` are launch-only (rejected on a running-session PATCH),
++# accepts at start, not just the shift+tab-switchable subset. ``dontAsk``
++# is launch-only (rejected on a running-session PATCH),
+ # but a scheduled task launches a fresh session each fire, so all of them are
+ # valid here. Mirrors the frontend's ``CLAUDE_NATIVE_PERMISSION_MODES``.
+ CLAUDE_NATIVE_LAUNCH_PERMISSION_MODES: frozenset[str] = frozenset(
+@@ -162,10 +162,11 @@ def validate_session_permission_mode(permission_mode: str | None) -> str | None:
+     """Validate a persisted per-task permission mode shared by schedules.
+ 
+     A scheduled task fires a fresh native session each run, so the whole launch
+-    vocabulary is allowed (including the launch-only ``dontAsk`` /
+-    ``bypassPermissions``). The value reaches the native CLI as the
+-    ``--permission-mode`` argv element the fire path derives, so reject anything
+-    outside the known set before a row persists it.
++    vocabulary is allowed (including the launch-only ``dontAsk``;
++    ``bypassPermissions`` on a running session restarts Claude). The value
++    reaches the native CLI as the ``--permission-mode`` argv element the fire
++    path derives, so reject anything outside the known set before a row
++    persists it.
+     """
+     if permission_mode is None:
+         return None
+diff --git a/omnigent/server/routes/_sessions/common.py b/omnigent/server/routes/_sessions/common.py
+index c1b60a30348aeb068f6849d9d53901b26d20101a..a5f4b7ac158ca2422e8fab2d44e60ad1702fe787 100644
+--- a/omnigent/server/routes/_sessions/common.py
++++ b/omnigent/server/routes/_sessions/common.py
+@@ -248,17 +248,16 @@ _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY = "omnigent.claude_native.permission_mo
+ 
+ # Permission modes switchable on a running session — the ones Claude
+ # Code's shift+tab cycle can reach. Mirrors
+-# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES``; ``dontAsk`` and
+-# ``bypassPermissions`` are launch-only and rejected on PATCH.
++# ``claude_native_bridge.CYCLEABLE_PERMISSION_MODES`` plus
++# ``bypassPermissions``; ``dontAsk`` is launch-only and rejected on PATCH.
++# Bypass is not in the shift+tab cycle of a pane not launched into it, so the
++# runner restarts the pane with ``--permission-mode`` instead.
+ _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
+-    {"default", "acceptEdits", "plan", "auto"}
++    {"default", "acceptEdits", "plan", "auto", "bypassPermissions"}
+ )
+-# Modes the forwarder can read off the pane footer. A session launched into
+-# ``bypassPermissions`` reports it so the label and picker show the real mode;
+-# it is still not a PATCH target.
+-_CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
+-    "bypassPermissions"
+-}
++# Modes the forwarder can read off the pane footer: the switchable set, so a
++# session in bypass reports it and the label and picker show the real mode.
++_CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES
+ 
+ 
+ _CODEX_NATIVE_SUBAGENT_DISPLAY_FALLBACK = "Codex"
+diff --git a/omnigent/server/routes/sessions/ae_bypass_switch.py b/omnigent/server/routes/sessions/ae_bypass_switch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..6c16575c115cff9abbdf3d60ece5e50261d83d91
+--- /dev/null
++++ b/omnigent/server/routes/sessions/ae_bypass_switch.py
+@@ -0,0 +1,78 @@
++"""Server half of the bypass-permissions switch: pin the launch args around a relaunch.
++
++Claude's shift+tab cycle only reaches bypass on a pane launched into it, so the
++runner restarts the pane with ``--permission-mode`` for any switch into or out
++of bypass. The restarted pane rebuilds its args from the session row, so the
++server pins the target mode there before it forwards the change, and puts the
++old args back when the runner refuses.
++"""
++
++from __future__ import annotations
++
++import asyncio
++
++from omnigent.server.routes._sessions.helpers import _pin_claude_permission_launch_args
++from omnigent.stores.conversation_store import ConversationStore
++
++BYPASS_MODE = "bypassPermissions"
++
++# A relaunch closes the pane, starts Claude again and waits for its prompt, so
++# it outlasts the default forward budget.
++RELAUNCH_FORWARD_TIMEOUT_S = 90.0
++
++
++def server_needs_relaunch(requested: str, current_label: str | None) -> bool:
++    """
++    Say whether a permission-mode change restarts the Claude pane.
++
++    :param requested: Mode asked for, e.g. ``"plan"``.
++    :param current_label: The session's recorded permission-mode label, or
++        ``None`` when it has none.
++    :returns: ``True`` when the target is bypass or the session is in bypass.
++    """
++    return requested == BYPASS_MODE or current_label == BYPASS_MODE
++
++
++async def pin_relaunch_launch_args(
++    session_id: str,
++    conversation_store: ConversationStore,
++    current_args: list[str] | None,
++    mode: str,
++) -> list[str] | None:
++    """
++    Write ``--permission-mode <mode>`` to the session's launch args.
++
++    :param session_id: Session id, e.g. ``"conv_abc123"``.
++    :param conversation_store: Store holding the session row.
++    :param current_args: The row's launch args before the pin, or ``None``.
++    :param mode: Mode the restarted pane must launch with, e.g. ``"bypassPermissions"``.
++    :returns: The previous args, to hand to :func:`restore_launch_args`.
++    """
++    await asyncio.to_thread(
++        conversation_store.update_conversation,
++        session_id,
++        terminal_launch_args=_pin_claude_permission_launch_args(current_args, mode),
++    )
++    return current_args
++
++
++async def restore_launch_args(
++    session_id: str,
++    conversation_store: ConversationStore,
++    previous: list[str] | None,
++) -> None:
++    """
++    Put back the launch args saved by :func:`pin_relaunch_launch_args`.
++
++    ``update_conversation`` reads ``None`` as "leave unchanged", so a session
++    that had no args is restored to an empty list, which launches with no flag.
++
++    :param session_id: Session id, e.g. ``"conv_abc123"``.
++    :param conversation_store: Store holding the session row.
++    :param previous: Args returned by the pin call, or ``None`` for none.
++    """
++    await asyncio.to_thread(
++        conversation_store.update_conversation,
++        session_id,
++        terminal_launch_args=list(previous) if previous else [],
++    )
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index fe19d87226de469ce9957cb2042d2cea61aae46e..1119d6b4106d7d1e9f7330754583727d0270312c 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -188,6 +188,12 @@ from omnigent.server.routes._sessions.orchestration import (
+     _validate_session_model_selection,
+     ensure_runner_connected,
+ )
++from omnigent.server.routes.sessions.ae_bypass_switch import (
++    RELAUNCH_FORWARD_TIMEOUT_S,
++    pin_relaunch_launch_args,
++    restore_launch_args,
++    server_needs_relaunch,
++)
+ from omnigent.server.routes.sessions.ae_live_account_label import (
+     reject_live_account_seed,
+     require_live_account_authority,
+@@ -3047,6 +3053,22 @@ def register_core_routes(
+                 _runner_result,
+             )
+         if requested_permission_mode is not None and live_forward:
++            # omnigent-ae: into or out of bypass the runner restarts Claude, and the
++            # new pane reads its mode from the row, so pin it before the forward.
++            _relaunch_switch = server_needs_relaunch(
++                requested_permission_mode,
++                updated.labels.get(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY),
++            )
++            _args_before_relaunch = (
++                await pin_relaunch_launch_args(
++                    session_id,
++                    conversation_store,
++                    updated.terminal_launch_args,
++                    requested_permission_mode,
++                )
++                if _relaunch_switch
++                else None
++            )
+             _mode_result = await _forward_session_change_to_runner(
+                 session_id,
+                 runner_router,
+@@ -3054,14 +3076,22 @@ def register_core_routes(
+                     "type": "permission_mode_change",
+                     "permission_mode": requested_permission_mode,
+                 },
++                **({"timeout_s": RELAUNCH_FORWARD_TIMEOUT_S} if _relaunch_switch else {}),
+             )
+             # Raises unless the runner confirms the switch, so the label can
+             # never claim a mode Claude isn't in. Stores the mode it reached.
+-            _confirmed_permission_mode = _require_permission_mode_forward(
+-                session_id,
+-                requested_permission_mode,
+-                _mode_result,
+-            )
++            try:
++                _confirmed_permission_mode = _require_permission_mode_forward(
++                    session_id,
++                    requested_permission_mode,
++                    _mode_result,
++                )
++            except OmnigentError:
++                if _relaunch_switch:
++                    await restore_launch_args(
++                        session_id, conversation_store, _args_before_relaunch
++                    )
++                raise
+             labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
+             # The launcher restores the mode from terminal_launch_args, not the
+             # label above, so pin the confirmed mode there too — otherwise a
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 5b19c31d16f72a04eaebdbd43e6c0a2da8e93cf3..cee27e72e9007ea3f24360b2d5f59b0b0a033103 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -2307,8 +2307,10 @@ class UpdateSessionRequest(BaseModel):
+     :param permission_mode: Claude-native permission mode to switch a
+         running session to, e.g. ``"auto"``. Only the modes Claude Code's
+         shift+tab cycle can reach are accepted (``default``,
+-        ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and
+-        ``bypassPermissions`` are launch-only. Only valid for sessions
++        ``acceptEdits``, ``plan``, ``auto``) plus ``bypassPermissions``;
++        ``dontAsk`` is launch-only. ``bypassPermissions``, and any switch
++        out of it, restarts Claude's terminal in the same conversation;
++        refused while a reply or approval is in progress. Only valid for sessions
+         stamped with the claude-native wrapper label. Unlike the other
+         fields here the switch is applied by the live TUI, so a failure
+         to reach the mode is surfaced as an error rather than persisted.
+diff --git a/openapi.json b/openapi.json
+index 379f8a5c78e28926964e9321436d1b2005830979..b8168e2a6836bf1834aa28e7bbd814c69b926314 100644
+--- a/openapi.json
++++ b/openapi.json
+@@ -9591,7 +9591,7 @@
+                 "type": "null"
+               }
+             ],
+-            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
++            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) plus `bypassPermissions`; `dontAsk` is launch-only. `bypassPermissions`, and any switch out of it, restarts Claude's terminal in the same conversation; refused while a reply or approval is in progress. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+             "title": "Permission Mode"
+           },
+           "project_id": {
+diff --git a/tests/e2e_ui/chat/test_permission_picker_marks_current_mode.py b/tests/e2e_ui/chat/test_permission_picker_marks_current_mode.py
+index c51d3a4257be1d159391b82b318b9c8cca2647fb..5b5a45a010eb1df1045cf74398eb4603d2514d2e 100644
+--- a/tests/e2e_ui/chat/test_permission_picker_marks_current_mode.py
++++ b/tests/e2e_ui/chat/test_permission_picker_marks_current_mode.py
+@@ -29,7 +29,7 @@ from playwright.sync_api import Page, expect
+ # The four shift+tab-reachable modes the picker offers (see
+ # CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES in
+ # web/src/lib/claudePermissionMode.ts).
+-_SWITCHABLE_MODES = ["default", "auto", "acceptEdits", "plan"]
++_SWITCHABLE_MODES = ["default", "auto", "acceptEdits", "plan", "bypassPermissions"]
+ _CURRENT_MODE = "auto"
+ _CURRENT_MODE_LABEL = "Auto"
+ # The menu rows render together with the menu itself, so once the menu is open
+diff --git a/tests/e2e_ui/scheduled/test_scheduled_tasks_page.py b/tests/e2e_ui/scheduled/test_scheduled_tasks_page.py
+index cc9b7e6b183a99da976710e8247c2ca5b48b6694..9e2f1c7b23db88d491e8248a69560aec93fcd8bd 100644
+--- a/tests/e2e_ui/scheduled/test_scheduled_tasks_page.py
++++ b/tests/e2e_ui/scheduled/test_scheduled_tasks_page.py
+@@ -684,7 +684,8 @@ def test_scheduled_task_edit_switches_the_harness(
+ # The dialog renders a Permission-mode select alongside Model/Effort, gated on
+ # the same ``permissionMode`` capability (Claude Code). Because an automation
+ # fires a fresh session each run, the whole launch vocabulary is offered —
+-# including the launch-only ``dontAsk`` / ``bypassPermissions``. Left on
++# including ``dontAsk``, which is launch-only (bypass on a running session
++# restarts Claude). Left on
+ # "Default" the field is omitted (agent default); a concrete pick persists
+ # ``permission_mode``, which the fire path turns into the runner's
+ # ``--permission-mode`` launch arg. Like the sibling tests these are LLM-free:
+@@ -749,7 +750,7 @@ def test_scheduled_task_edit_prefills_permission_mode(
+     """The edit dialog prefills the Permission control from the loaded task.
+ 
+     Seeds a Claude Code task carrying ``permission_mode="bypassPermissions"`` (a
+-    launch-only mode, valid for automations), opens its Edit dialog, and asserts
++    mode valid for automations), opens its Edit dialog, and asserts
+     ``task-permission-trigger`` renders the stored pick ("Bypass permissions"),
+     not the "Default" sentinel.
+     """
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 4bcf98a9967a6f6638fc488b8bd8e321f6977e5c..436eae38902e62d750d1f971cedea40670ee14d5 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -5677,13 +5677,15 @@ def test_cycleable_permission_modes_match_the_server_patch_vocabulary() -> None:
+     PATCH validates ``permission_mode`` against its own frozenset before
+     forwarding, so a mode in one set but not the other is either
+     unreachable (rejected at the API after the UI offered it) or
+-    reachable but un-offerable. Pin them together.
++    reachable but un-offerable. Pin them together. Bypass is the one
++    mode outside the cycle: the runner serves it by restarting the pane
++    (``omnigent.runner.ae_bypass_relaunch``), not by shift+tab.
+     """
+     from omnigent.server.routes._sessions.common import _CLAUDE_NATIVE_PERMISSION_MODES
+ 
+-    assert set(claude_native_bridge.CYCLEABLE_PERMISSION_MODES) == set(
++    assert set(claude_native_bridge.CYCLEABLE_PERMISSION_MODES) | {"bypassPermissions"} == set(
+         _CLAUDE_NATIVE_PERMISSION_MODES
+-    ), "Bridge cycleable modes and the Sessions API's accepted modes must match."
++    ), "Bridge cycleable modes (plus bypass) and the Sessions API's accepted modes must match."
+ 
+ 
+ class _FakeModeCycleTmux:
+diff --git a/tests/runner/test_ae_bypass_relaunch.py b/tests/runner/test_ae_bypass_relaunch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..91f2bcc002667ab8ba4f4ff2d911998f98937928
+--- /dev/null
++++ b/tests/runner/test_ae_bypass_relaunch.py
+@@ -0,0 +1,215 @@
++"""Tests for switching a claude-native session into or out of bypass by restarting the pane."""
++
++from __future__ import annotations
++
++import asyncio
++import json
++from typing import Any
++
++import pytest
++
++from omnigent.harnesses.claude_native import bridge as claude_native_bridge
++from omnigent.runner.ae_bypass_relaunch import (
++    BYPASS,
++    BYPASS_REFUSALS,
++    handle_claude_relaunch_switch,
++    needs_relaunch,
++)
++from omnigent.runner.ae_claude_account import NOT_CLAUDE_DETAIL
++
++SESSION_ID = "conv_bypass"
++
++
++class _Terminal:
++    async def is_alive(self) -> bool:
++        return True
++
++
++class _Registry:
++    def __init__(self, pane: _Terminal | None) -> None:
++        self.pane = pane
++
++    def get(self, conversation_id: str, terminal_name: str, session_key: str) -> _Terminal | None:
++        assert (conversation_id, terminal_name, session_key) == (SESSION_ID, "claude", "main")
++        return self.pane
++
++
++class _Runner:
++    """Records close, delete event and ensure; ensure starts a pane."""
++
++    def __init__(self, registry: _Registry, *, starts: bool = True) -> None:
++        self.registry = registry
++        self.starts = starts
++        self.calls: list[str] = []
++
++    async def close(self, session_id: str, terminal_id: str) -> bool:
++        self.calls.append("close")
++        self.registry.pane = None
++        return True
++
++    async def ensure(self, session_id: str, harness: str | None) -> None:
++        self.calls.append("ensure")
++        if self.starts:
++            self.registry.pane = _Terminal()
++
++    def publish(self, session_id: str, event: Any) -> None:
++        self.calls.append("deleted")
++
++
++async def _switch(
++    runner: _Runner,
++    *,
++    target: str,
++    current: str | None,
++    settled: str | None,
++    harness: str | None = "claude-native",
++    busy: bool = False,
++) -> tuple[int, dict[str, Any]]:
++    async def current_mode() -> str | None:
++        return current
++
++    async def settled_mode() -> str | None:
++        runner.calls.append("settled")
++        return settled
++
++    response = await handle_claude_relaunch_switch(
++        SESSION_ID,
++        target_mode=target,
++        harness=harness,
++        current_mode=current_mode,
++        settled_mode=settled_mode,
++        turn_in_flight=lambda: busy,
++        terminal_registry=runner.registry,  # type: ignore[arg-type]
++        close_terminal=runner.close,
++        ensure_terminal=runner.ensure,
++        publish_event=runner.publish,
++    )
++    return response.status_code, json.loads(bytes(response.body))
++
++
++@pytest.fixture(autouse=True)
++def _no_approval(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(claude_native_bridge, "approval_wait_is_fresh", lambda _sid: False)
++
++
++async def test_already_in_the_target_mode_restarts_nothing() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target=BYPASS, current=BYPASS, settled=None)
++    assert (status, body) == (200, {"permission_mode": BYPASS, "relaunched": False})
++    assert runner.calls == []
++
++
++async def test_auto_to_bypass_restarts_the_pane_and_reports_bypass() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled=BYPASS)
++    assert (status, body) == (200, {"permission_mode": BYPASS, "relaunched": True})
++    assert runner.calls == ["close", "deleted", "ensure", "settled"]
++
++
++async def test_bypass_to_plan_restarts_the_pane_and_reports_plan() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target="plan", current=BYPASS, settled="plan")
++    assert (status, body) == (200, {"permission_mode": "plan", "relaunched": True})
++    assert runner.calls == ["close", "deleted", "ensure", "settled"]
++
++
++async def test_a_policy_that_strips_bypass_reports_the_mode_reached() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled="default")
++    assert (status, body) == (200, {"permission_mode": "default", "relaunched": True})
++
++
++async def test_no_footer_omits_the_mode() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled=None)
++    assert (status, body) == (200, {"relaunched": True})
++
++
++async def test_a_running_turn_refuses_and_closes_nothing() -> None:
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled=None, busy=True)
++    assert (status, body["error"], body["detail"]) == (
++        409,
++        "claude_bypass_busy",
++        BYPASS_REFUSALS.busy_detail,
++    )
++    assert runner.calls == []
++
++
++async def test_a_parked_approval_refuses(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setattr(claude_native_bridge, "approval_wait_is_fresh", lambda _sid: True)
++    runner = _Runner(_Registry(_Terminal()))
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled=None)
++    assert (status, body["error"]) == (409, "claude_bypass_busy")
++    assert runner.calls == []
++
++
++async def test_a_session_that_is_not_claude_native_is_a_400() -> None:
++    for harness in ("codex-native", None):
++        runner = _Runner(_Registry(_Terminal()))
++        status, body = await _switch(
++            runner, target=BYPASS, current="auto", settled=None, harness=harness
++        )
++        assert (status, body["detail"]) == (400, NOT_CLAUDE_DETAIL)
++        assert runner.calls == []
++
++
++async def test_a_terminal_that_does_not_start_is_a_409() -> None:
++    runner = _Runner(_Registry(_Terminal()), starts=False)
++    status, body = await _switch(runner, target=BYPASS, current="auto", settled=None)
++    assert (status, body["error"], body["detail"]) == (
++        409,
++        "claude_bypass_not_started",
++        BYPASS_REFUSALS.not_started_detail,
++    )
++    assert "settled" not in runner.calls
++
++
++async def test_a_turn_arriving_mid_relaunch_waits_for_the_new_pane() -> None:
++    from omnigent.runner.ae_claude_account import is_switching, wait_while_switching
++
++    runner = _Runner(_Registry(_Terminal()))
++    in_ensure = asyncio.Event()
++    release = asyncio.Event()
++    plain_ensure = runner.ensure
++
++    async def slow_ensure(session_id: str, harness: str | None) -> None:
++        in_ensure.set()
++        await release.wait()
++        await plain_ensure(session_id, harness)
++
++    runner.ensure = slow_ensure  # type: ignore[method-assign]
++    switch = asyncio.create_task(_switch(runner, target=BYPASS, current="auto", settled=BYPASS))
++    await in_ensure.wait()
++    assert is_switching(SESSION_ID)
++    seen_pane: list[_Terminal | None] = []
++
++    async def turn() -> None:
++        await wait_while_switching(SESSION_ID)
++        seen_pane.append(runner.registry.pane)
++
++    turn_task = asyncio.create_task(turn())
++    await asyncio.sleep(0)
++    assert not turn_task.done()
++    release.set()
++    assert (await switch)[0] == 200
++    await turn_task
++    assert seen_pane[0] is runner.registry.pane and seen_pane[0] is not None
++    assert not is_switching(SESSION_ID)
++
++
++@pytest.mark.parametrize(
++    ("target", "current", "expected"),
++    [
++        (BYPASS, "auto", True),
++        (BYPASS, None, True),
++        (BYPASS, BYPASS, True),
++        ("plan", BYPASS, True),
++        ("default", BYPASS, True),
++        ("plan", "auto", False),
++        ("plan", None, False),
++        ("auto", "default", False),
++    ],
++)
++def test_needs_relaunch_truth_table(target: str, current: str | None, expected: bool) -> None:
++    assert needs_relaunch(target, current) is expected
+diff --git a/tests/runner/test_app_sessions_native_events_options.py b/tests/runner/test_app_sessions_native_events_options.py
+index ef4bd54b7192ebba26500ce88d60f07a779a6d62..b08584069e12e8e1a94232edf9cf6581ed0a214b 100644
+--- a/tests/runner/test_app_sessions_native_events_options.py
++++ b/tests/runner/test_app_sessions_native_events_options.py
+@@ -257,10 +257,11 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
+     ``permission_mode_change`` cycles the pane and returns the settled mode.
+ 
+     Claude Code's ``--permission-mode`` is launch-only, so the runner drives
+-    the TUI's shift+tab cycle via the bridge. The 200 body echoes the mode the
+-    pane actually landed on — the Omnigent server persists that value, so a
+-    regression returning 204 (or dropping the body) would leave the web UI
+-    showing a mode the session isn't in.
++    the TUI's shift+tab cycle via the bridge (bypass restarts the pane
++    instead). The 200 body echoes the mode the pane actually landed on — the
++    Omnigent server persists that value, so a regression returning 204 (or
++    dropping the body) would leave the web UI showing a mode the session
++    isn't in.
+     """
+ 
+     calls: list[str] = []
+@@ -297,6 +298,105 @@ async def test_events_permission_mode_change_on_native_session_switches_and_echo
+     assert calls == ["auto"], f"Expected one switch to auto, got {calls!r}"
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("target", "pane_mode"),
++    [("bypassPermissions", "auto"), ("plan", "bypassPermissions")],
++)
++async def test_events_permission_mode_change_into_or_out_of_bypass_relaunches(
++    monkeypatch: pytest.MonkeyPatch, target: str, pane_mode: str
++) -> None:
++    """
++    A switch into or out of bypass restarts the pane; the shift+tab cycle is never used.
++
++    Bypass is not in the cycle of a pane launched without it, and a pane
++    launched into it passes through bypass when it cycles, so the runner hands
++    the switch to the relaunch handler and never calls ``set_permission_mode``.
++    """
++    from omnigent.runner import ae_bypass_relaunch
++
++    cycled: list[str] = []
++    relaunched: list[str] = []
++
++    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
++        del bridge_dir, timeout_s
++        cycled.append(mode)
++        return mode
++
++    async def _fake_relaunch(conversation_id: str, *, target_mode: str, **_kwargs: Any) -> Any:
++        from fastapi.responses import JSONResponse
++
++        relaunched.append(target_mode)
++        return JSONResponse({"permission_mode": target_mode, "relaunched": True})
++
++    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
++    monkeypatch.setattr(claude_native_bridge, "read_permission_mode", lambda _dir: pane_mode)
++    monkeypatch.setattr(ae_bypass_relaunch, "handle_claude_relaunch_switch", _fake_relaunch)
++
++    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
++
++    async with _runner_client(app) as client:
++        create_resp = await client.post(
++            "/v1/sessions",
++            json={
++                "session_id": "4a99519bd9daa4e9bc2df649fe468522",
++                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
++            },
++        )
++        assert create_resp.status_code == 201, create_resp.text
++        resp = await client.post(
++            "/v1/sessions/4a99519bd9daa4e9bc2df649fe468522/events",
++            json={"type": "permission_mode_change", "permission_mode": target},
++        )
++
++    assert resp.status_code == 200, resp.text
++    assert resp.json() == {"permission_mode": target, "relaunched": True}
++    assert relaunched == [target]
++    assert cycled == []
++
++
++@pytest.mark.asyncio
++async def test_events_permission_mode_change_between_cycle_modes_still_cycles(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Auto to plan never touches the relaunch path; the pane cycles as before."""
++    from omnigent.runner import ae_bypass_relaunch
++
++    cycled: list[str] = []
++
++    def _fake_set_mode(bridge_dir: Any, *, mode: str, timeout_s: float) -> str:
++        del bridge_dir, timeout_s
++        cycled.append(mode)
++        return mode
++
++    async def _no_relaunch(*_args: Any, **_kwargs: Any) -> Any:
++        raise AssertionError("auto to plan must not relaunch the pane")
++
++    monkeypatch.setattr(claude_native_bridge, "set_permission_mode", _fake_set_mode)
++    monkeypatch.setattr(claude_native_bridge, "read_permission_mode", lambda _dir: "auto")
++    monkeypatch.setattr(ae_bypass_relaunch, "handle_claude_relaunch_switch", _no_relaunch)
++
++    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
++
++    async with _runner_client(app) as client:
++        create_resp = await client.post(
++            "/v1/sessions",
++            json={
++                "session_id": "5b00519bd9daa4e9bc2df649fe468533",
++                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
++            },
++        )
++        assert create_resp.status_code == 201, create_resp.text
++        resp = await client.post(
++            "/v1/sessions/5b00519bd9daa4e9bc2df649fe468533/events",
++            json={"type": "permission_mode_change", "permission_mode": "plan"},
++        )
++
++    assert resp.status_code == 200, resp.text
++    assert resp.json() == {"permission_mode": "plan"}
++    assert cycled == ["plan"]
++
++
+ @pytest.mark.asyncio
+ async def test_events_permission_mode_change_returns_503_when_mode_unreachable(
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/server/integration/test_sessions_endpoints.py b/tests/server/integration/test_sessions_endpoints.py
+index 82329c5eea2491fb2a5e8ae4929527932e67f0b5..b380e455d1345ce64b77822cb2d475ada51ac6fa 100644
+--- a/tests/server/integration/test_sessions_endpoints.py
++++ b/tests/server/integration/test_sessions_endpoints.py
+@@ -8645,10 +8645,10 @@ async def test_post_external_permission_mode_change_accepts_bypass_read_back(
+     """
+     A pane reporting bypass lands on the label and rewrites the launch arg.
+ 
+-    Bypass is launch-only and stays rejected as a PATCH target, but a session
+-    launched into it (or cycled back to it inside the TUI) must read back as
+-    bypass, or the picker shows a stale mode and a relaunch reopens in the
+-    mode last recorded instead of the one the pane is in.
++    A session launched into bypass (or cycled back to it inside the TUI)
++    must read back as bypass, or the picker shows a stale mode and a
++    relaunch reopens in the mode last recorded instead of the one the pane
++    is in.
+     """
+     published: list[tuple[str, dict[str, Any]]] = []
+     _capture_published(monkeypatch, published)
+@@ -11208,7 +11208,12 @@ async def test_post_external_codex_approval_mode_change_requires_a_field(
+ 
+ @pytest.mark.parametrize(
+     ("requested_mode", "confirmed_mode"),
+-    [("auto", "auto"), ("default", "default"), ("auto", "acceptEdits")],
++    [
++        ("auto", "auto"),
++        ("default", "default"),
++        ("auto", "acceptEdits"),
++        ("bypassPermissions", "bypassPermissions"),
++    ],
+ )
+ async def test_patch_permission_mode_persists_label_and_forwards_event(
+     client: httpx.AsyncClient,
+@@ -11219,7 +11224,7 @@ async def test_patch_permission_mode_persists_label_and_forwards_event(
+     PATCH ``permission_mode`` forwards the switch and persists what landed.
+ 
+     Claude Code's ``--permission-mode`` is launch-only, so the runner has to
+-    drive the TUI's shift+tab cycle. The server forwards a
++    drive the TUI's shift+tab cycle (or restart the pane, for bypass). The server forwards a
+     ``permission_mode_change`` control event and records the mode the runner
+     reports the pane reached — not the requested one — so a reload shows the
+     session's real mode.
+@@ -11409,6 +11414,163 @@ async def test_patch_permission_mode_replaces_standalone_bypass_flag(
+     assert resp.json()["labels"]["omnigent.claude_native.permission_mode"] == "auto"
+ 
+ 
++async def _patch_with_relaunch_probe(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++    *,
++    requested: str,
++    label: str | None,
++    launch_args: list[str] | None,
++    runner_response: httpx.Response,
++) -> tuple[httpx.Response, dict[str, Any], list[str], list[float]]:
++    """
++    PATCH a Claude session's permission mode and record what the runner forward saw.
++
++    :returns: The PATCH response, the session snapshot afterwards, the events
++        in the order ``pin`` (launch args written) and ``forward`` (runner
++        called), and the read timeouts of the forwards.
++    """
++    from omnigent.server.routes.sessions import routes_core
++
++    events: list[str] = []
++    timeouts: list[float] = []
++    real_pin = routes_core.pin_relaunch_launch_args
++
++    async def _pin(*args: Any, **kwargs: Any) -> list[str] | None:
++        events.append("pin")
++        return await real_pin(*args, **kwargs)
++
++    monkeypatch.setattr(routes_core, "pin_relaunch_launch_args", _pin)
++
++    def _handler(request: httpx.Request) -> httpx.Response:
++        if request.method != "POST":
++            return httpx.Response(204)
++        events.append("forward")
++        timeouts.append(request.extensions["timeout"]["read"])
++        return runner_response
++
++    labels = {"omnigent.ui": "terminal", "omnigent.wrapper": "claude-code-native-ui"}
++    if label is not None:
++        labels["omnigent.claude_native.permission_mode"] = label
++    async with _runtime_runner(_handler):
++        agent = await create_test_agent(client)
++        session = await _create_session(
++            client, agent["id"], labels=labels, terminal_launch_args=launch_args
++        )
++        resp = await client.patch(
++            f"/v1/sessions/{session['id']}", json={"permission_mode": requested}
++        )
++        snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
++    return resp, snapshot, events, timeouts
++
++
++@pytest.mark.parametrize(
++    ("requested", "label"),
++    [("bypassPermissions", "auto"), ("plan", "bypassPermissions")],
++    ids=["into_bypass", "out_of_bypass"],
++)
++async def test_patch_permission_mode_relaunch_pins_args_before_the_long_forward(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++    requested: str,
++    label: str,
++) -> None:
++    """
++    Into or out of bypass the launch args are pinned first and the forward gets 90 s.
++
++    The runner restarts Claude, and the new pane reads its mode from the row,
++    so the pin has to land before the runner is called.
++    """
++    resp, snapshot, events, timeouts = await _patch_with_relaunch_probe(
++        client,
++        monkeypatch,
++        requested=requested,
++        label=label,
++        launch_args=["--model", "opus"],
++        runner_response=httpx.Response(200, json={"permission_mode": requested}),
++    )
++    assert resp.status_code == 200, resp.text
++    assert events == ["pin", "forward"]
++    assert timeouts == [90.0]
++    assert snapshot["terminal_launch_args"] == ["--model", "opus", "--permission-mode", requested]
++    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == requested
++
++
++async def test_patch_permission_mode_between_cycle_modes_keeps_the_short_forward(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Auto to plan neither pins ahead of the forward nor stretches its budget."""
++    resp, _snapshot, events, timeouts = await _patch_with_relaunch_probe(
++        client,
++        monkeypatch,
++        requested="plan",
++        label="auto",
++        launch_args=None,
++        runner_response=httpx.Response(200, json={"permission_mode": "plan"}),
++    )
++    assert resp.status_code == 200, resp.text
++    assert events == ["forward"]
++    assert timeouts == [5.0]
++
++
++@pytest.mark.parametrize(
++    ("launch_args", "restored"),
++    [
++        (
++            ["--model", "opus", "--permission-mode", "auto"],
++            ["--model", "opus", "--permission-mode", "auto"],
++        ),
++        (None, []),
++    ],
++    ids=["had_a_flag", "flagless"],
++)
++async def test_patch_permission_mode_relaunch_refusal_restores_args_and_label(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++    launch_args: list[str] | None,
++    restored: list[str],
++) -> None:
++    """A runner 409 puts the launch args back, keeps the label, and carries the detail."""
++    resp, snapshot, events, _timeouts = await _patch_with_relaunch_probe(
++        client,
++        monkeypatch,
++        requested="bypassPermissions",
++        label="auto",
++        launch_args=launch_args,
++        runner_response=httpx.Response(
++            409,
++            json={"error": "claude_bypass_busy", "detail": "Claude is mid-reply."},
++        ),
++    )
++    assert resp.status_code == 503, resp.text
++    assert "Claude is mid-reply." in resp.text
++    assert events == ["pin", "forward"]
++    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "auto"
++    assert (snapshot["terminal_launch_args"] or []) == restored
++    assert "--dangerously-skip-permissions" not in (snapshot["terminal_launch_args"] or [])
++    if launch_args is None:
++        assert "--permission-mode" not in (snapshot["terminal_launch_args"] or [])
++
++
++async def test_patch_permission_mode_relaunch_records_the_mode_the_pane_reached(
++    client: httpx.AsyncClient,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A managed setting that strips bypass leaves the label and the launch args at default."""
++    resp, snapshot, _events, _timeouts = await _patch_with_relaunch_probe(
++        client,
++        monkeypatch,
++        requested="bypassPermissions",
++        label="auto",
++        launch_args=None,
++        runner_response=httpx.Response(200, json={"permission_mode": "default"}),
++    )
++    assert resp.status_code == 200, resp.text
++    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "default"
++    assert snapshot["terminal_launch_args"] == ["--permission-mode", "default"]
++
++
+ @pytest.mark.parametrize("runner_status", [None, 503], ids=["no_runner", "runner_rejects"])
+ async def test_patch_permission_mode_requires_live_runner_before_persisting(
+     client: httpx.AsyncClient,
+@@ -11501,7 +11663,7 @@ async def test_patch_permission_mode_silent_skips_the_switch_without_crashing(
+     assert "omnigent.claude_native.permission_mode" not in snapshot["labels"]
+ 
+ 
+-@pytest.mark.parametrize("bad_mode", ["dontAsk", "bypassPermissions", "nonsense"])
++@pytest.mark.parametrize("bad_mode", ["dontAsk", "nonsense"])
+ async def test_patch_permission_mode_rejects_modes_the_cycle_cannot_reach(
+     client: httpx.AsyncClient,
+     bad_mode: str,
+@@ -11509,10 +11671,10 @@ async def test_patch_permission_mode_rejects_modes_the_cycle_cannot_reach(
+     """
+     Launch-only modes are rejected rather than forwarded.
+ 
+-    ``dontAsk`` is never in Claude's shift+tab cycle and
+-    ``bypassPermissions`` only joins it when the session launched into it, so
+-    a live switch toward either would wander through unrelated modes before
+-    failing. Reject up front, before touching the runner.
++    ``dontAsk`` is never in Claude's shift+tab cycle, so a live switch toward
++    it would wander through unrelated modes before failing. Reject up front,
++    before touching the runner. ``bypassPermissions`` is accepted and served
++    by restarting the pane.
+     """
+     agent = await create_test_agent(client)
+     session = await _create_session(
+diff --git a/web/src/components/composer/ComposerControls.test.tsx b/web/src/components/composer/ComposerControls.test.tsx
+index 78dcf595d84790f822099d7e4ada54b689de59ef..10e2a239762be3425d557207c188345795af299a 100644
+--- a/web/src/components/composer/ComposerControls.test.tsx
++++ b/web/src/components/composer/ComposerControls.test.tsx
+@@ -1,5 +1,6 @@
+ import { act, fireEvent, render, screen } from "@testing-library/react";
+ import { afterEach, describe, expect, it, vi } from "vitest";
++import { CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES } from "@/lib/claudePermissionMode";
+ import {
+   ComposerHostTrigger,
+   ComposerWorkspaceBar,
+@@ -193,6 +194,27 @@ describe("shared composer controls", () => {
+     }
+   });
+ 
++  it("lists Bypass permissions among the Claude switchable modes with a restart hint", () => {
++    render(
++      <ComposerPermissionPicker
++        label="Permission mode"
++        value="Manual"
++        selectedValue="default"
++        options={CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES}
++        onSelect={vi.fn()}
++      />,
++    );
++    fireEvent.keyDown(screen.getByRole("button", { name: "Permission mode: Manual" }), {
++      key: "ArrowDown",
++    });
++    const row = screen.getByTestId("composer-permission-option-bypassPermissions");
++    expect(row).toHaveTextContent("Bypass permissions");
++    expect(row).toHaveAttribute(
++      "title",
++      "Restarts Claude in this chat, then runs everything with no prompts or safety checks",
++    );
++  });
++
+   it("exposes shared permission concepts without changing harness wire values", () => {
+     const { rerender } = render(
+       <ComposerPermissionPicker
+diff --git a/web/src/components/composer/ComposerControls.tsx b/web/src/components/composer/ComposerControls.tsx
+index fd0ae741f8e31d6db7663fe56db67532324c18b9..06852cd10ba9e40be9062f30639fe50737133e09 100644
+--- a/web/src/components/composer/ComposerControls.tsx
++++ b/web/src/components/composer/ComposerControls.tsx
+@@ -150,7 +150,7 @@ export function ComposerPermissionPicker({
+   value: string;
+   harness?: string | null;
+   selectedValue?: string | null;
+-  options: readonly { value: string; label: string }[];
++  options: readonly { value: string; label: string; description?: string }[];
+   disabled?: boolean;
+   /** Hide the visible value; it stays in the accessible name. */
+   iconOnly?: boolean;
+@@ -205,6 +205,7 @@ export function ComposerPermissionPicker({
+               value={option.value}
+               data-testid={`${testIdPrefix}-permission-option-${option.value}`}
+               data-permission-concept={permissionModeConcept(harness, option.value)}
++              title={option.description}
+               className="whitespace-normal break-words"
+             >
+               {option.label}
+diff --git a/web/src/components/scheduled/CreateScheduledTaskDialog.tsx b/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
+index 4bb45708d4e9720ef0dcbcd3d7c0bf1ec640e15c..8a56dcafa429d6519784ec8cee0667b1a0ced763 100644
+--- a/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
++++ b/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
+@@ -106,7 +106,7 @@ export function CreateScheduledTaskDialog({
+   // are omitted so the fire path uses the agent's configured defaults. Permission
+   // mode is offered for native coding agents that support it (Claude Code); each
+   // fire launches a fresh session, so the whole launch vocabulary is valid —
+-  // including the launch-only `dontAsk` / `bypassPermissions`.
++  // including `dontAsk`, which is launch-only (bypass on a running session restarts Claude).
+   const [pickedAgentId, setPickedAgentId] = useState<string | null>(null);
+   const [pickedModel, setPickedModel] = useState<string>("");
+   const [pickedEffort, setPickedEffort] = useState<string>("");
+diff --git a/web/src/lib/claudePermissionMode.test.ts b/web/src/lib/claudePermissionMode.test.ts
+index 25e02b56c7e47f3a38edc6368ecb5c9d820f5bad..bff8461ff39282de29f5c7b0f588e9047b8058bc 100644
+--- a/web/src/lib/claudePermissionMode.test.ts
++++ b/web/src/lib/claudePermissionMode.test.ts
+@@ -11,15 +11,27 @@ import {
+ 
+ describe("claudePermissionMode", () => {
+   it("offers only shift+tab-reachable modes for a running session", () => {
+-    // dontAsk is never in Claude's cycle and bypassPermissions only joins it
+-    // when the session launched into it — offering either would produce a
+-    // switch the server rejects or the cycler can't reach.
++    // dontAsk is never in Claude's cycle — offering it would produce a switch
++    // the server rejects. Bypass is last: the cycle does not reach it, so the
++    // runner restarts Claude in the same chat to get there.
+     expect(CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.map((m) => m.value)).toEqual([
+       "default",
+       "auto",
+       "acceptEdits",
+       "plan",
++      "bypassPermissions",
+     ]);
++    const bypass = CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES.find(
++      (m) => m.value === "bypassPermissions",
++    );
++    expect(bypass?.label).toBe("Bypass permissions");
++    expect(bypass?.description).toBe(
++      "Restarts Claude in this chat, then runs everything with no prompts or safety checks",
++    );
++    // The start-session list keeps the original wording.
++    expect(
++      CLAUDE_NATIVE_PERMISSION_MODES.find((m) => m.value === "bypassPermissions")?.description,
++    ).toBe("Runs everything; no prompts or safety checks");
+   });
+ 
+   it("still offers the launch-only modes when starting a session", () => {
+@@ -45,7 +57,7 @@ describe("claudePermissionMode", () => {
+   it("accepts only switchable modes", () => {
+     expect(isSwitchableClaudePermissionMode("auto")).toBe(true);
+     expect(isSwitchableClaudePermissionMode("dontAsk")).toBe(false);
+-    expect(isSwitchableClaudePermissionMode("bypassPermissions")).toBe(false);
++    expect(isSwitchableClaudePermissionMode("bypassPermissions")).toBe(true);
+     expect(isSwitchableClaudePermissionMode(undefined)).toBe(false);
+   });
+ 
+diff --git a/web/src/lib/claudePermissionMode.ts b/web/src/lib/claudePermissionMode.ts
+index 28dd1df89130ce1966fe7be1dd4b69ebc7f8a306..96299389a0243674dc4138910c8d4cff7b41eb3a 100644
+--- a/web/src/lib/claudePermissionMode.ts
++++ b/web/src/lib/claudePermissionMode.ts
+@@ -49,10 +49,23 @@ export const CLAUDE_NATIVE_PERMISSION_MODES: ClaudePermissionModeOption[] = [
+   },
+ ];
+ 
+-/** Modes a running session can be switched to (shift+tab-reachable). */
++/**
++ * Modes a running session can be switched to: the shift+tab-reachable ones,
++ * plus bypass. Bypass is not in the cycle of a pane launched without it, so
++ * the runner restarts Claude in the same chat instead (no allow flag is ever
++ * passed at launch); `dontAsk` stays launch-only.
++ */
+ export const CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES: ClaudePermissionModeOption[] =
+   CLAUDE_NATIVE_PERMISSION_MODES.filter((mode) =>
+-    ["default", "acceptEdits", "plan", "auto"].includes(mode.value),
++    ["default", "acceptEdits", "plan", "auto", "bypassPermissions"].includes(mode.value),
++  ).map((mode) =>
++    mode.value === "bypassPermissions"
++      ? {
++          ...mode,
++          description:
++            "Restarts Claude in this chat, then runs everything with no prompts or safety checks",
++        }
++      : mode,
+   );
+ 
+ export function isSwitchableClaudePermissionMode(mode: string | null | undefined): boolean {
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 784195884bd5055def51fe14eafe7b781d977e37..eb04e30398b1eae0998b6bdb2ff4b49add5195c7 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -3120,6 +3120,25 @@ describe("Composer shared visible controls", () => {
+     await waitFor(() => expect(setApproval).toHaveBeenCalledTimes(2));
+     await waitFor(() => expect(screen.queryByText("Could not switch permissions")).toBeNull());
+   });
++
++  it("warns when Claude restarts for bypass but stays in another mode", async () => {
++    useChatStore.setState({
++      conversationId: "bypass-stripped",
++      claudePermissionMode: "default",
++    });
++    const setClaude = vi
++      .spyOn(useChatStore.getState(), "setClaudePermissionMode")
++      .mockImplementation(async () => {
++        useChatStore.setState({ claudePermissionMode: "default" });
++      });
++    renderWithTooltips(<Composer {...composerProps({ showClaudePermissionMode: true })} />);
++    fireEvent.keyDown(screen.getByTestId("composer-permission-chip"), { key: "ArrowDown" });
++    fireEvent.click(screen.getByTestId("composer-permission-option-bypassPermissions"));
++    await waitFor(() => expect(setClaude).toHaveBeenCalledWith("bypassPermissions"));
++    await screen.findByText(
++      "Claude restarted but stayed in Manual. A managed setting on this host may turn bypass off.",
++    );
++  });
+ });
+ 
+ describe("Composer background tasks", () => {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 6d47ef1fc56178ec1f0ce80a5192d80f94cdbfb7..2136e8eaa9e57b22596bff72979cc67a78f487e6 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -2508,7 +2508,15 @@ function ComposerImpl(
+       const store = useChatStore.getState();
+       if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
+       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
+-      if (useChatStore.getState().conversationId === sourceSessionId) setCommandError(null);
++      if (useChatStore.getState().conversationId === sourceSessionId) {
++        // omnigent-ae: a restart into bypass can land elsewhere when a managed setting strips it.
++        const reached = useChatStore.getState().claudePermissionMode;
++        setCommandError(
++          showClaudePermissionMode && mode === "bypassPermissions" && reached !== mode
++            ? `Claude restarted but stayed in ${claudePermissionModeLabel(reached)}. A managed setting on this host may turn bypass off.`
++            : null,
++        );
++      }
+     } catch (error) {
+       if (useChatStore.getState().conversationId === sourceSessionId)
+         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");

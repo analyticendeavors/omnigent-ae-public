@@ -53,7 +53,7 @@ Every open pull request your sessions opened gets a card with its checks, confli
 
 <p align="center"><img src="../media/dashboard-lot.webp" alt="The Parking Lot with Resume"></p>
 
-Parked work is listed by urgency, return date and tag, with search and filters. Open a task to see its repository, tags and next step, and Resume starts a session from its note.
+Parked work is listed by urgency, return date and tag, with search and filters. Open a task to see its repository, tags and next step, and Resume starts a session from its note. Only admins can open it.
 
 **Where:** Parking Lot, the right-hand column of the Session Dashboard. It needs a task service (`AE_TASK_STORE_URL`).<br>
 **Built from:** [`packages/ae_omni_extension`](../../packages/ae_omni_extension); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)

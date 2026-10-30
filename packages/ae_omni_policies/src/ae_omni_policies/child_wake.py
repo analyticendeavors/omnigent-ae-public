@@ -1,9 +1,9 @@
-"""Wake an idle lead when Reid answers its child's prompt (2026-10-28).
+"""Wake an idle lead when the owner answers its child's prompt (2026-10-28).
 
 A lead's action dock shows the prompts of the family children it started (an MCP
-elicitation, a tool permission, a question), and Reid answers them there. The
+elicitation, a tool permission, a question), and the owner answers them there. The
 answer reaches the child, which resumes; but a lead whose turn had already ended
-slept on until Reid typed "continue" (child 75db0142 resumed at 01:55:23Z on
+slept on until the owner typed "continue" (child 75db0142 resumed at 01:55:23Z on
 2026-10-28 and its lead stayed idle).
 
 What happens now: when a verdict is accepted for an elicitation that was pending
@@ -121,7 +121,7 @@ def _enum_label(schema: Mapping[str, Any], value: Any) -> str | None:
 
 
 def picked(data: Mapping[str, Any], pending: Mapping[str, Any]) -> str:
-    """What Reid picked, in words: the enum label or value on accept, else the verdict.
+    """What the owner picked, in words: the enum label or value on accept, else the verdict.
 
     :param data: The verdict payload (``action``, optional ``content``).
     :param pending: The pending ``response.elicitation_request`` event.
@@ -157,7 +157,7 @@ def note_text(child_id: str, title: str | None, choice: str) -> str:
     """
     name = labels.clip(title or "Untitled", TITLE_CAP)
     short = f"{child_id[:4]}..."
-    return f"{CHILD_WAKE_PREFIX}{name} ({short}): Reid picked {choice}."
+    return f"{CHILD_WAKE_PREFIX}{name} ({short}): the user picked {choice}."
 
 
 def lead_state(lead: Any) -> str:

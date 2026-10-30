@@ -3,7 +3,7 @@
 A host restart (a deploy, an update, a crash) kills every runner it spawned,
 and the host comes back with new runner ids. A session that was mid-turn is
 left ``failed`` with ``runner_disconnected`` until someone clicks Resume, and
-Resume only relaunches the runner: the lost turn does not continue. Reid asked
+Resume only relaunches the runner: the lost turn does not continue. The owner asked
 on 2026-10-13 for those sessions to come back by themselves.
 
 Patch P34 gives the seam: an observer run after a host connects, and
@@ -96,6 +96,19 @@ def skip_reason(conv: Conversation, *, host_id: str, now: float) -> str | None:
     if tried is not None and tried == (conv.runner_id or ""):
         return "already tried for this runner"
     return None
+
+
+def resumable_failure(conv: Conversation, now: float) -> bool:
+    """Whether a ``failed`` *conv* is one auto-resume (or upstream's child recovery) would revive.
+
+    2026-10-29, for the auto-archive sweep: upstream's own :func:`_interrupted` (failed with
+    ``runner_disconnected`` / ``runner_failed_to_start``) and the :data:`MAX_AGE_S` window,
+    the same two tests :func:`skip_reason` applies. Archiving such a session before its host
+    reconnects would cost it the interrupted turn, since both recoveries need it unarchived.
+    """
+    from omnigent.server.child_session_recovery import _interrupted
+
+    return _interrupted(conv) and now - conv.updated_at <= MAX_AGE_S
 
 
 _check_failure_logged = False
@@ -200,6 +213,7 @@ __all__ = [
     "MAX_AGE_S",
     "REGISTERED",
     "enabled",
+    "resumable_failure",
     "resume_after_host_connect",
     "runner_alive",
     "skip_reason",

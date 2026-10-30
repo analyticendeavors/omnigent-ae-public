@@ -34,7 +34,7 @@ function card(number: number, extra: Partial<PrCard> = {}): PrCard {
     title: `PR ${number}`,
     state: "open",
     draft: false,
-    author: "ae-reid-havens",
+    author: "ae-owner",
     head_ref: `claude/branch-${number}`,
     base_ref: "main",
     head_sha: SHA,
@@ -80,7 +80,7 @@ const YOUR_MOVE: YourMove = {
   pulls: {
     ok: true,
     configured: true,
-    login: "ae-reid-havens",
+    login: "ae-owner",
     repos: ["analyticendeavors/omnigent-ae"],
     errors: [],
     items: [
@@ -89,7 +89,7 @@ const YOUR_MOVE: YourMove = {
         number: 23,
         title: "Add the Your move panel",
         url: URL_23,
-        author: "ae-reid-havens",
+        author: "ae-owner",
         draft: false,
         updated_at: null,
         why: ["author"],

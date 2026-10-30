@@ -45,6 +45,7 @@ import type { ExtensionContext } from "@omnigent/extension-sdk";
 import {
   AeRequestError,
   describeError,
+  isLotAdminOnly,
   type Lot,
   type LotTask,
   type ParkInput,
@@ -669,6 +670,14 @@ export function renderLot(host: HTMLElement, view: LotView, deps: Deps): void {
   drawn = null;
   if (view.lot === null) {
     const error = view.lotError;
+    if (isLotAdminOnly(error)) {
+      // A signed-in non-admin (2026-10-28): quiet and final, with no park form to file into.
+      target.appendChild(empty("The Parking Lot is for admins."));
+      parkState = null;
+      replaceChildren(host, [node]);
+      restoreFocus();
+      return;
+    }
     if (error instanceof AeRequestError && error.status === 503) {
       target.appendChild(
         notice(`task-store is not configured on this server: ${error.message}`, "info"),

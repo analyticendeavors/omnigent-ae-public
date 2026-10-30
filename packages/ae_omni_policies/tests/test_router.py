@@ -14,10 +14,12 @@ import httpx
 import pytest
 import respx
 from fastapi import FastAPI, Request
+from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
 from omnigent.runtime import get_conversation_store
 from tests.server.helpers import create_test_session
 
-from ae_omni_policies import __version__, auth, deploy_hold, labels, slot_limit
+from ae_omni_policies import __version__, auth, deploy_hold, labels, limits, slot_limit
 from ae_omni_policies import router as router_module
 from ae_omni_policies.taskstore import ORIGIN_SURFACE
 
@@ -77,7 +79,7 @@ async def test_identity_is_required_off_the_single_user_runtime(
     monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER")
     auth.reset_provider_cache()
     assert (await client.get("/v1/ae/health")).status_code == 401
-    ok = await client.get("/v1/ae/health", headers={"X-Forwarded-Email": "reid@example.com"})
+    ok = await client.get("/v1/ae/health", headers={"X-Forwarded-Email": "owner@example.com"})
     assert ok.status_code == 200
 
 
@@ -387,7 +389,7 @@ async def test_gate_reply_posts_the_letter(
     response = await client.post(
         f"/v1/ae/gate/{session_id}/reply",
         json={"route": route},
-        headers={"cookie": "__Host-ap_session=abc", "x-forwarded-email": "reid@example.com"},
+        headers={"cookie": "__Host-ap_session=abc", "x-forwarded-email": "owner@example.com"},
     )
     assert response.status_code == 200, response.text
     assert response.json() == {"posted": True, "route": route, "text": text, "status": 202}
@@ -398,7 +400,7 @@ async def test_gate_reply_posts_the_letter(
         "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
     }
     assert headers["cookie"] == "__Host-ap_session=abc"
-    assert headers["x-forwarded-email"] == "reid@example.com"
+    assert headers["x-forwarded-email"] == "owner@example.com"
     assert _labels(session_id)[labels.GATE] == "answered"
 
 
@@ -458,7 +460,7 @@ async def test_loopback_reaches_the_app_as_the_caller() -> None:
             (b"cookie", b"__Host-ap_session=abc"),
             (b"authorization", b"Bearer t"),
             (b"origin", b"https://ae.example"),
-            (b"x-forwarded-email", b"reid@example.com"),
+            (b"x-forwarded-email", b"owner@example.com"),
             (b"x-other", b"dropped"),
         ],
         "app": echo,
@@ -470,7 +472,7 @@ async def test_loopback_reaches_the_app_as_the_caller() -> None:
     assert got["headers"]["cookie"] == "__Host-ap_session=abc"
     assert got["headers"]["authorization"] == "Bearer t"
     assert got["headers"]["origin"] == "https://ae.example"
-    assert got["headers"]["x-forwarded-email"] == "reid@example.com"
+    assert got["headers"]["x-forwarded-email"] == "owner@example.com"
     assert "x-other" not in got["headers"]
 
 
@@ -1115,6 +1117,140 @@ async def test_start_session_holds_a_slot_creates_and_briefs(
     router_module.slot_cap.release("orch:probe")
 
 
+# ── 2026-10-28: a new child starts on its lead's current login ──
+
+
+@pytest.fixture
+def switched(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, str, dict[str, Any]]]:
+    """Stands in for the new child's row and records each ``claude_account.switch`` call."""
+    from ae_omni_policies import claude_account
+
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    real = router_module._conversation
+
+    async def conversation(session_id: str) -> Any:
+        if session_id == "conv_resumed":
+            return SimpleNamespace(id=session_id, agent_id="ag_native", labels={})
+        return await real(session_id)
+
+    async def switch(_request: Any, _user: Any, conv: Any, account: str) -> dict[str, Any]:
+        calls.append(("SWITCH", conv.id, {"account": account}))
+        return {"account": account, "relaunched": False}
+
+    monkeypatch.setattr(router_module, "_conversation", conversation)
+    monkeypatch.setattr(claude_account, "switch", switch)
+    return calls
+
+
+async def _lead_on(client: httpx.AsyncClient, seed: dict[str, str]) -> str:
+    lead = await _session(client, "Lead", {labels.STATUS: "review"})
+    get_conversation_store().set_labels(lead, seed)
+    return lead
+
+
+async def test_a_child_of_a_lead_on_a_shared_login_starts_on_it_before_its_brief(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    home: list[str],
+    switched: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    from ae_omni_policies import claude_account
+
+    events: list[str] = []
+
+    class _Logged(_App):
+        async def __call__(self, request: Any, method: str, path: str, body: Any = None) -> Any:
+            if (method, path) == ("POST", "/v1/sessions"):
+                events.append("create")
+            elif (method, path) == ("POST", "/v1/sessions/conv_resumed/events"):
+                events.append("brief")
+            return await super().__call__(request, method, path, body)
+
+    recorded = claude_account.switch
+
+    async def ordered_switch(request: Any, user: Any, conv: Any, account: str) -> Any:
+        events.append("switch")
+        return await recorded(request, user, conv, account)
+
+    monkeypatch.setattr(claude_account, "switch", ordered_switch)
+    app = _Logged()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    lead = await _lead_on(client, {CLAUDE_ACCOUNT_LABEL_KEY: "shared:Backup"})
+    # The lead's live login wins over its server label.
+    get_conversation_store().set_labels(lead, {limits.ACCOUNT_LIVE_LABEL: "shared:Backup"})
+    response = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    assert response.status_code == 200, response.text
+    assert response.json()["claude_account"] == "shared:Backup"
+    assert "claude_account_note" not in response.json()
+    assert switched == [("SWITCH", "conv_resumed", {"account": "shared:Backup"})]
+    assert events == ["create", "switch", "brief"]
+
+
+async def test_a_lead_pinned_to_the_default_login_gives_the_child_the_default(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    home: list[str],
+    switched: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    monkeypatch.setattr(router_module, "_loopback", _App())
+    lead = await _lead_on(client, {limits.ACCOUNT_LIVE_LABEL: ""})
+    response = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    assert response.json()["claude_account"] == ""
+    assert switched == [("SWITCH", "conv_resumed", {"account": ""})]
+
+
+async def test_a_lead_with_no_login_gives_the_child_none(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    home: list[str],
+    switched: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    monkeypatch.setattr(router_module, "_loopback", _App())
+    lead = await _lead_on(client, {})
+    response = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    assert response.status_code == 200, response.text
+    assert "claude_account" not in response.json()
+    assert switched == []
+
+
+async def test_a_standalone_chat_inherits_nothing(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    home: list[str],
+    switched: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    monkeypatch.setattr(router_module, "_loopback", _App())
+    lead = await _lead_on(client, {CLAUDE_ACCOUNT_LABEL_KEY: "shared:Backup"})
+    response = await client.post(
+        "/v1/ae/sessions", json=ALONE | {"orchestrator": lead, "standalone": True}
+    )
+    assert response.status_code == 200, response.text
+    assert switched == []
+
+
+async def test_a_refused_switch_still_posts_the_brief_and_returns_the_note(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    home: list[str],
+    switched: list[tuple[str, str, dict[str, Any]]],
+) -> None:
+    from ae_omni_policies import claude_account
+
+    async def refuse(*_args: Any) -> dict[str, Any]:
+        raise OmnigentError("That login is not on this host.", code=ErrorCode.INVALID_INPUT)
+
+    monkeypatch.setattr(claude_account, "switch", refuse)
+    app = _App()
+    monkeypatch.setattr(router_module, "_loopback", app)
+    lead = await _lead_on(client, {CLAUDE_ACCOUNT_LABEL_KEY: "shared:Gone"})
+    response = await client.post("/v1/ae/sessions", json=START | {"orchestrator": lead})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["claude_account"] is None
+    assert "That login is not on this host." in body["claude_account_note"]
+    assert app.calls[-1][:2] == ("POST", "/v1/sessions/conv_resumed/events")
+
+
 async def test_start_session_codex_absolute_workspace_and_derived_key(
     client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch, home: list[str]
 ) -> None:
@@ -1491,51 +1627,51 @@ async def test_deploy_hold_records_the_user_and_logs_both_posts(
     ae_admins: set[str],
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    reid = {"X-Forwarded-Email": "reid@example.com"}
+    owner = {"X-Forwarded-Email": "owner@example.com"}
     assert (await client.get("/v1/ae/deploy/hold")).status_code == 401
     assert (await client.post("/v1/ae/deploy/hold", json={"hours": 1})).status_code == 401
     assert (await client.post("/v1/ae/deploy/resume", json={})).status_code == 401
     with caplog.at_level(logging.INFO, logger=router_module.__name__):
-        held = await client.post("/v1/ae/deploy/hold", json={"hours": 2}, headers=reid)
-        assert held.json()["set_by"] == "reid@example.com"
+        held = await client.post("/v1/ae/deploy/hold", json={"hours": 2}, headers=owner)
+        assert held.json()["set_by"] == "owner@example.com"
         until = held.json()["until"][11:16] + "Z"
-        await client.post("/v1/ae/deploy/resume", json={}, headers=reid)
-        await client.post("/v1/ae/deploy/resume", json={}, headers=reid)
+        await client.post("/v1/ae/deploy/resume", json={}, headers=owner)
+        await client.post("/v1/ae/deploy/resume", json={}, headers=owner)
     lines = [r.getMessage() for r in caplog.records if r.name == router_module.__name__]
-    assert f"deploy hold set for 2h until {until} by reid@example.com" in lines
-    assert f"deploy hold cleared by reid@example.com (was until {until})" in lines
-    assert "deploy hold cleared by reid@example.com (none was on)" in lines
+    assert f"deploy hold set for 2h until {until} by owner@example.com" in lines
+    assert f"deploy hold cleared by owner@example.com (was until {until})" in lines
+    assert "deploy hold cleared by owner@example.com (none was on)" in lines
 
 
 async def test_deploy_hold_is_admin_only(
     client: httpx.AsyncClient, hold_store: None, ae_admins: set[str]
 ) -> None:
-    steve = {"X-Forwarded-Email": "steve@example.com"}
-    reid = {"X-Forwarded-Email": "reid@example.com"}
-    held = await client.post("/v1/ae/deploy/hold", json={"hours": 2}, headers=reid)
+    member = {"X-Forwarded-Email": "member@example.com"}
+    owner = {"X-Forwarded-Email": "owner@example.com"}
+    held = await client.post("/v1/ae/deploy/hold", json={"hours": 2}, headers=owner)
     assert held.status_code == 200, held.text
     refusals = [
-        await client.get("/v1/ae/deploy/hold", headers=steve),
-        await client.post("/v1/ae/deploy/hold", json={"hours": 1}, headers=steve),
-        await client.post("/v1/ae/deploy/resume", json={}, headers=steve),
+        await client.get("/v1/ae/deploy/hold", headers=member),
+        await client.post("/v1/ae/deploy/hold", json={"hours": 1}, headers=member),
+        await client.post("/v1/ae/deploy/resume", json={}, headers=member),
     ]
     for refused in refusals:
         assert refused.status_code == 403, refused.text
         assert refused.json()["error"]["code"] == "admin_only"
     # Nothing a non-admin sent changed the hold.
-    after = (await client.get("/v1/ae/deploy/hold", headers=reid)).json()
+    after = (await client.get("/v1/ae/deploy/hold", headers=owner)).json()
     assert after["held"] is True and after["until"] == held.json()["until"]
 
 
 async def test_azure_cost_is_admin_only(client: httpx.AsyncClient, ae_admins: set[str]) -> None:
     # Tenant spend and resource names are for admins (2026-10-22).
     refused = await client.get(
-        "/v1/ae/azure-cost", headers={"X-Forwarded-Email": "steve@example.com"}
+        "/v1/ae/azure-cost", headers={"X-Forwarded-Email": "member@example.com"}
     )
     assert refused.status_code == 403, refused.text
     assert refused.json()["error"]["code"] == "admin_only"
     allowed = await client.get(
-        "/v1/ae/azure-cost", headers={"X-Forwarded-Email": "reid@example.com"}
+        "/v1/ae/azure-cost", headers={"X-Forwarded-Email": "owner@example.com"}
     )
     assert allowed.status_code == 200, allowed.text
 
@@ -1713,3 +1849,622 @@ async def test_a_non_boolean_helpers_count_is_off(client: httpx.AsyncClient) -> 
         finally:
             slot_limit.remember_store(None)
         assert (body["helpers_count"], body["slots_used"]) == (False, 1)
+
+
+# ── 2026-10-29: lead handoff ──
+
+NEW_LEAD = "conv_resumed"  # what the stubbed create answers with
+
+
+class _HandoffApp(_App):
+    """The loopback stub, plus the notes posted into any session."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.notes: list[tuple[str, str]] = []
+
+    async def __call__(
+        self, request: Request, method: str, path: str, body: dict[str, Any] | None = None
+    ) -> httpx.Response:
+        if (
+            method == "POST"
+            and path.endswith("/events")
+            and path != f"/v1/sessions/{NEW_LEAD}/events"
+        ):
+            text = body["data"]["content"][0]["text"] if body else ""
+            self.notes.append((path.split("/")[3], text))
+            return httpx.Response(self.post_status, json={})
+        return await super().__call__(request, method, path, body)
+
+
+class _Tasks:
+    """The caller's scheduled tasks, behind ``router._loopback_client``."""
+
+    def __init__(self, tasks: list[dict[str, Any]]) -> None:
+        self.tasks = tasks
+        self.patched: list[tuple[str, dict[str, Any]]] = []
+
+    async def get(self, path: str) -> httpx.Response:
+        return httpx.Response(200, json={"scheduled_tasks": self.tasks})
+
+    async def patch(self, path: str, json: dict[str, Any]) -> httpx.Response:
+        self.patched.append((path.rsplit("/", 1)[1], json))
+        return httpx.Response(200, json={})
+
+
+@pytest.fixture
+def handoff(
+    monkeypatch: pytest.MonkeyPatch, home: list[str]
+) -> tuple[_HandoffApp, _Tasks, list[tuple[str, str, dict[str, Any]]]]:
+    """A loopback, a scheduled-task API and the Claude login switch, all stubbed."""
+    import contextlib
+    import dataclasses
+
+    from ae_omni_policies import claude_account
+
+    app = _HandoffApp()
+    tasks = _Tasks([])
+    calls: list[tuple[str, str, dict[str, Any]]] = []
+    real = router_module._conversation
+
+    async def conversation(session_id: str) -> Any:
+        if session_id == NEW_LEAD:
+            return SimpleNamespace(id=session_id, agent_id="ag_native", labels={})
+        found = await real(session_id)
+        if found is not None and labels.label(found.labels, "test.lead"):
+            return dataclasses.replace(
+                found,
+                workspace="/home/user/repos/omnigent-ae",
+                host_id="host_box",
+                model_override="claude-opus-5-5[1m]",
+                reasoning_effort="high",
+            )
+        return found
+
+    async def switch(_request: Any, _user: Any, conv: Any, account: str) -> dict[str, Any]:
+        calls.append(("SWITCH", conv.id, {"account": account}))
+        return {"account": account, "relaunched": False}
+
+    @contextlib.asynccontextmanager
+    async def client_for(_request: Any) -> Any:
+        yield tasks
+
+    monkeypatch.setattr(router_module, "_loopback", app)
+    monkeypatch.setattr(router_module, "_loopback_post", lambda r, p, b: app(r, "POST", p, b))
+    monkeypatch.setattr(router_module, "_conversation", conversation)
+    monkeypatch.setattr(router_module, "_loopback_client", client_for)
+    monkeypatch.setattr(claude_account, "switch", switch)
+    return app, tasks, calls
+
+
+async def _old_lead(client: httpx.AsyncClient, extra: dict[str, str] | None = None) -> str:
+    old = await _session(client, "Session token audit", {labels.STATUS: "working"})
+    seed = {
+        labels.PRESET: "balanced",
+        "omnigent.wrapper": "claude-code-native-ui",
+        "test.lead": "1",
+        CLAUDE_ACCOUNT_LABEL_KEY: "shared:Backup",
+    }
+    get_conversation_store().set_labels(old, seed | (extra or {}))
+    return old
+
+
+def _creates(app: _App) -> list[dict[str, Any]]:
+    return [body for method, path, body in app.calls if (method, path) == ("POST", "/v1/sessions")]
+
+
+async def test_handoff_moves_the_family_to_a_new_lead(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    from ae_omni_policies import schedules
+
+    app, tasks, switch_calls = handoff
+    old = await _old_lead(client)
+    child = await _session(client, "Builder", {labels.ORCH: old, labels.STATUS: "working"})
+    tasks.tasks = [
+        {
+            "id": "t1",
+            "name": schedules.CHECKIN_NAME,
+            "prompt": schedules.checkin_prompt(old, "PR 9"),
+        },
+        {"id": "t2", "name": "Mine", "prompt": f"post to session_id {old}"},
+    ]
+    response = await client.post(
+        f"/v1/ae/sessions/{old}/handoff", json={"packet": "State.\nSTART ON: Opus"}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert (body["session_id"], body["existing"], body["old_session_id"]) == (NEW_LEAD, False, old)
+    assert body["children_moved"] == [child] and body["problems"] == []
+    # Same host, workspace, effort and preset; no [1m]; a fresh key; the packet is the brief.
+    (create,) = _creates(app)
+    assert (
+        create["host_id"] == "host_box" and create["workspace"] == "/home/user/repos/omnigent-ae"
+    )
+    assert create["model_override"] == "claude-opus-5-5" and create["reasoning_effort"] == "high"
+    assert create["labels"][labels.ORCH_KEY] == f"handoff:{old}"
+    assert create["labels"][labels.PRESET] == "balanced"
+    assert create["labels"][labels.ROLE] == "lead" and create["labels"][labels.ORCH] == "1"
+    assert (
+        "POST",
+        f"/v1/sessions/{NEW_LEAD}/events",
+        router_module._message("State.\nSTART ON: Opus"),
+    ) in app.calls
+    # The login is set on the new lead from the old one, before its brief is posted.
+    assert switch_calls == [("SWITCH", NEW_LEAD, {"account": "shared:Backup"})]
+    order = [(m, p) for m, p, _ in app.calls]
+    assert order.index(("POST", "/v1/sessions")) < order.index(
+        ("POST", f"/v1/sessions/{NEW_LEAD}/events")
+    )
+    # Commit point, children, tasks and the old lead's status.
+    assert _labels(old)[labels.HANDOFF_TO] == NEW_LEAD
+    assert _labels(old)[labels.STATUS] == labels.REFERENCE
+    assert _labels(child)[labels.ORCH] == NEW_LEAD
+    assert dict(tasks.patched) == {
+        "t1": {"prompt": schedules.checkin_prompt(NEW_LEAD, "PR 9")},
+        "t2": {"prompt": f"post to session_id {NEW_LEAD}"},
+    }
+
+
+async def test_a_failed_create_changes_nothing(client: httpx.AsyncClient, handoff: Any) -> None:
+    app, tasks, _ = handoff
+    app.create_status = 500
+    old = await _old_lead(client)
+    child = await _session(client, "Builder", {labels.ORCH: old, labels.STATUS: "working"})
+    tasks.tasks = [{"id": "t1", "name": "Mine", "prompt": f"post to session_id {old}"}]
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    assert response.status_code == 502, response.text
+    assert response.json()["error"]["code"] == "session_not_created"
+    assert labels.HANDOFF_TO not in _labels(old) and _labels(old)[labels.STATUS] == "working"
+    assert _labels(child)[labels.ORCH] == old
+    assert tasks.patched == []
+
+
+async def test_a_repeat_call_returns_the_same_lead_and_starts_no_second(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client)
+    first = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    again = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    assert again.status_code == 200, again.text
+    assert again.json()["session_id"] == first.json()["session_id"] and again.json()["existing"]
+    assert len(_creates(app)) == 1
+
+
+async def test_two_handoffs_at_once_start_one_new_lead(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    import asyncio
+
+    app, _, _ = handoff
+    old = await _old_lead(client)
+    both = await asyncio.gather(
+        client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."}),
+        client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."}),
+    )
+    assert [r.status_code for r in both] == [200, 200]
+    assert len({r.json()["session_id"] for r in both}) == 1
+    assert len(_creates(app)) == 1
+
+
+async def test_a_crash_after_the_commit_point_is_finished_by_the_repeat_call(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client, {labels.HANDOFF_TO: NEW_LEAD})  # committed, nothing else done
+    kids = [
+        await _session(client, name, {labels.ORCH: old, labels.STATUS: "working"})
+        for name in ("A", "B")
+    ]
+    get_conversation_store().set_labels(kids[0], {labels.ORCH: NEW_LEAD})  # half re-pointed
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    assert response.status_code == 200, response.text
+    assert response.json()["session_id"] == NEW_LEAD and response.json()["existing"]
+    assert [_labels(k)[labels.ORCH] for k in kids] == [NEW_LEAD, NEW_LEAD]
+    assert _labels(old)[labels.STATUS] == labels.REFERENCE
+    assert _creates(app) == []
+
+
+async def test_the_old_lead_s_slot_is_freed_in_the_same_step(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    # One slot, held by the lead being handed off: a plain create is refused, the handoff is not.
+    old = await _old_lead(client)
+    slot_limit.remember_store(_SlotCapStore(1))
+    try:
+        refused = await client.post("/v1/ae/sessions", json=ALONE)
+        response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    finally:
+        slot_limit.remember_store(None)
+    assert refused.status_code == 409
+    assert response.status_code == 200, response.text
+    assert _labels(old)[labels.STATUS] == labels.REFERENCE
+
+
+@pytest.mark.parametrize(
+    ("extra", "status", "needle"),
+    [
+        ({"omnigent.wrapper": "codex-native-ui"}, 422, "Claude"),
+        ({labels.STATUS: "reference"}, 409, "already a reference"),
+        ({labels.ORCH: "conv_" + "a" * 32}, 422, "child"),
+    ],
+)
+async def test_handoff_refuses_what_cannot_hand_off(
+    client: httpx.AsyncClient, handoff: Any, extra: dict[str, str], status: int, needle: str
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client, extra)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    assert response.status_code == status, response.text
+    assert needle in response.json()["error"]["message"]
+    assert _creates(app) == []
+
+
+async def test_handoff_needs_write_access_to_the_lead_and_every_child(
+    client: httpx.AsyncClient, handoff: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client)
+    child = await _session(client, "Theirs", {labels.ORCH: old, labels.STATUS: "working"})
+    real = router_module._may_write_session
+
+    async def may_write(user: Any, session_id: str) -> bool:
+        return session_id != child and await real(user, session_id)
+
+    monkeypatch.setattr(router_module, "_may_write_session", may_write)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "State."})
+    assert response.status_code == 403, response.text
+    assert _creates(app) == [] and _labels(child)[labels.ORCH] == old
+    assert labels.HANDOFF_TO not in _labels(old)
+    missing = await client.post(f"/v1/ae/sessions/{ABSENT_SESSION}/handoff", json={"packet": "x"})
+    assert missing.status_code == 404
+
+
+async def test_snooze_sets_the_size_and_the_request_route_is_gone(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(
+        client, {"omnigent.last_context_tokens": "352000", labels.HANDOFF: "suggest"}
+    )
+    snoozed = await client.post(f"/v1/ae/sessions/{old}/handoff/snooze", json={})
+    assert snoozed.json()["snoozed_at"] == 352000
+    assert (
+        _labels(old)[labels.HANDOFF] == "snoozed" and _labels(old)[labels.HANDOFF_AT] == "352000"
+    )
+    gone = await client.post(f"/v1/ae/sessions/{old}/handoff/request", json={})
+    assert gone.status_code in (404, 405), gone.text
+    assert app.notes == []
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"omnigent.last_context_tokens": "352000", labels.STATUS: "review"},
+        {"omnigent.last_context_tokens": "352000", labels.ORCH: "conv_" + "a" * 32},
+        {"omnigent.last_context_tokens": "352000", labels.HANDOFF_TO: NEW_LEAD},
+        {},  # no context reading
+        {"omnigent.last_context_tokens": "0"},
+    ],
+)
+async def test_snooze_refuses_an_ineligible_chat_or_a_missing_size(
+    client: httpx.AsyncClient, handoff: Any, extra: dict[str, str]
+) -> None:
+    old = await _old_lead(client, extra)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff/snooze", json={})
+    assert response.status_code == 409, response.text
+    assert _labels(old).get(labels.HANDOFF) in (None, "")
+
+
+async def test_snooze_waiting_on_the_lock_does_not_label_a_lead_that_handed_off(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    import asyncio
+
+    from ae_omni_policies import lead_handoff
+
+    old = await _old_lead(client, {"omnigent.last_context_tokens": "352000"})
+    async with lead_handoff.lead_lock(old):
+        pending = asyncio.ensure_future(
+            client.post(f"/v1/ae/sessions/{old}/handoff/snooze", json={})
+        )
+        await asyncio.sleep(0.1)
+        # The handoff commits while the snooze waits for the lock.
+        get_conversation_store().set_labels(
+            old, {labels.HANDOFF_TO: NEW_LEAD, labels.STATUS: labels.REFERENCE}
+        )
+    response = await pending
+    assert response.status_code == 409, response.text
+    assert _labels(old).get(labels.HANDOFF) in (None, "")
+
+
+# ── 2026-10-29: lead handoff, review round 1 ──
+
+
+async def test_a_lost_brief_is_posted_on_the_retry_before_the_commit(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client)
+    app.post_status = 500
+    failed = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "The packet."})
+    assert failed.status_code == 502, failed.text
+    assert failed.json()["error"]["code"] == "session_brief_not_posted"
+    assert labels.HANDOFF_TO not in _labels(old)
+    # The create did leave a live lead behind under the handoff key, with no brief.
+    new = await _session(
+        client,
+        "Session token audit",
+        {labels.STATUS: "working", labels.ORCH_KEY: f"handoff:{old}"},
+    )
+    app.post_status = 202
+    retry = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "The packet."})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["session_id"] == new
+    assert [text for target, text in app.notes if target == new] == ["The packet."]
+    assert _labels(new)[labels.HANDOFF_BRIEF] == "posted"
+    assert _labels(old)[labels.HANDOFF_TO] == new
+    # A second retry posts nothing more.
+    again = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "The packet."})
+    assert again.status_code == 200 and again.json()["session_id"] == new
+    assert [text for target, text in app.notes if target == new] == ["The packet."]
+
+
+async def test_a_retry_never_commits_while_the_brief_cannot_be_posted(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client)
+    new = await _session(
+        client, "Lead", {labels.STATUS: "working", labels.ORCH_KEY: f"handoff:{old}"}
+    )
+    app.post_status = 500
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert response.status_code == 502, response.text
+    assert labels.HANDOFF_TO not in _labels(old)
+    assert labels.HANDOFF_BRIEF not in _labels(new)
+
+
+async def test_a_dead_target_is_not_moved_to_and_the_mark_is_cleared(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    old = await _old_lead(client, {labels.HANDOFF_TO: ABSENT_SESSION})
+    child = await _session(client, "Builder", {labels.ORCH: old, labels.STATUS: "working"})
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert response.status_code == 409, response.text
+    assert labels.label(_labels(old), labels.HANDOFF_TO) is None
+    assert _labels(child)[labels.ORCH] == old
+    assert _labels(old)[labels.STATUS] == "working"
+    assert _creates(app) == []
+
+
+async def test_a_failed_task_patch_gives_ok_false_and_the_repeat_finishes_it(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    from ae_omni_policies import schedules
+
+    app, tasks, _ = handoff
+    old = await _old_lead(client)
+    tasks.tasks = [
+        {"id": "t1", "name": schedules.CHECKIN_NAME, "prompt": schedules.checkin_prompt(old, None)}
+    ]
+    real_patch = tasks.patch
+
+    async def broken(path: str, json: dict[str, Any]) -> httpx.Response:
+        return httpx.Response(500, json={})
+
+    tasks.patch = broken  # type: ignore[method-assign]
+    first = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert first.status_code == 200 and first.json()["ok"] is False
+    assert first.json()["problems"] and first.json()["done"] is False
+    assert labels.HANDOFF_DONE not in _labels(old)
+    tasks.patch = real_patch  # type: ignore[method-assign]
+    second = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert second.json()["ok"] is True and second.json()["done"] is True
+    assert dict(tasks.patched)["t1"] == {"prompt": schedules.checkin_prompt(NEW_LEAD, None)}
+    assert _labels(old)[labels.HANDOFF_DONE] == "1"
+    assert len(_creates(app)) == 1
+
+
+async def test_label_age_reads_the_label_table_on_the_real_store(
+    client: httpx.AsyncClient,
+) -> None:
+    from ae_omni_policies import lead_handoff
+
+    session = await _session(client, "Aged", {labels.STATUS: "working"})
+    store = get_conversation_store()
+    store.set_labels(session, {"omnigent.last_context_tokens": "123"}, updated_at=1_000)
+    conv = store.get_conversation(session)
+    assert lead_handoff.label_age(store, conv, "omnigent.last_context_tokens", now=1_090.0) == 90.0
+    # A key never written falls back to the row's own age instead of failing.
+    assert lead_handoff.label_age(store, conv, "no.such.label", now=conv.updated_at + 5.0) == 5.0
+
+
+async def test_a_target_archived_after_the_commit_moves_nothing(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    app, _, _ = handoff
+    new = await _session(client, "New lead", {labels.STATUS: "working"})
+    old = await _old_lead(client, {labels.HANDOFF_TO: new})
+    child = await _session(client, "Builder", {labels.ORCH: old, labels.STATUS: "working"})
+    get_conversation_store().update_conversation(new, archived=True)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert response.status_code == 409, response.text
+    assert _labels(child)[labels.ORCH] == old and _labels(old)[labels.STATUS] == "working"
+    assert labels.label(_labels(old), labels.HANDOFF_TO) is None
+    assert _creates(app) == []
+
+
+async def test_a_family_is_put_back_when_the_new_lead_died_after_a_half_finished_handoff(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    from ae_omni_policies import schedules
+
+    app, tasks, _ = handoff
+    dead = await _session(client, "Dead lead", {labels.STATUS: "working"})
+    old = await _old_lead(
+        client,
+        {
+            labels.HANDOFF_TO: dead,
+            labels.HANDOFF_PREV_STATUS: "blocked",
+            labels.STATUS: "reference",
+        },
+    )
+    child = await _session(client, "Builder", {labels.ORCH: dead, labels.STATUS: "working"})
+    tasks.tasks = [
+        {
+            "id": "t1",
+            "name": schedules.CHECKIN_NAME,
+            "prompt": schedules.checkin_prompt(dead, None),
+        },
+        {"id": "t2", "name": "Mine", "prompt": f"post to session_id {dead}"},
+    ]
+    get_conversation_store().update_conversation(dead, archived=True)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert response.status_code == 409, response.text
+    assert _labels(child)[labels.ORCH] == old
+    assert _labels(old)[labels.STATUS] == "blocked"
+    assert labels.label(_labels(old), labels.HANDOFF_TO) is None
+    assert labels.label(_labels(old), labels.HANDOFF_PREV_STATUS) is None
+    assert dict(tasks.patched) == {
+        "t1": {"prompt": schedules.checkin_prompt(old, None)},
+        "t2": {"prompt": f"post to session_id {old}"},
+    }
+    assert _creates(app) == []
+    # A retry is not refused as "already a reference" and starts a fresh lead.
+    retry = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert retry.status_code == 200, retry.text
+    assert retry.json()["session_id"] == NEW_LEAD and len(_creates(app)) == 1
+
+
+async def test_the_commit_stores_the_status_it_replaces(
+    client: httpx.AsyncClient, handoff: Any
+) -> None:
+    old = await _old_lead(client, {labels.STATUS: "blocked"})
+    await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert _labels(old)[labels.HANDOFF_PREV_STATUS] == "blocked"
+
+
+async def test_label_age_sql_path_reads_a_label_row_and_does_not_fall_back(
+    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
+) -> None:
+    from omnigent.db.db_models import SqlConversationLabel, current_workspace_id
+
+    from ae_omni_policies import lead_handoff
+
+    session = await _session(client, "Aged row", {labels.STATUS: "working"})
+    store = get_conversation_store()
+    with store._conv_session_immediate("test_label_age_row") as db:
+        db.add(
+            SqlConversationLabel(
+                workspace_id=current_workspace_id(),
+                conversation_id=session,
+                key="omnigent.last_context_tokens",
+                value="4242",
+                updated_at=5_000,
+            )
+        )
+    conv = store.get_conversation(session)
+    assert conv.updated_at != 5_000
+    with caplog.at_level(logging.WARNING, logger="ae_omni_policies.lead_handoff"):
+        age = lead_handoff.label_age(store, conv, "omnigent.last_context_tokens", now=5_120.0)
+    assert age == 120.0
+    assert "no label age" not in caplog.text
+
+
+async def test_an_unknown_target_answers_503_and_undoes_nothing(
+    client: httpx.AsyncClient, handoff: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, tasks, _ = handoff
+    new = await _session(client, "New lead", {labels.STATUS: "working"})
+    old = await _old_lead(client, {labels.HANDOFF_TO: new, labels.HANDOFF_PREV_STATUS: "working"})
+    child = await _session(client, "Builder", {labels.ORCH: new, labels.STATUS: "working"})
+    # Multi-user: the owner check of the new lead fails to read.
+    monkeypatch.setattr(router_module, "_acl_user", lambda user: "owner")
+
+    def boom(who: str, session_id: str) -> bool:
+        raise RuntimeError("permission store unreachable")
+
+    monkeypatch.setattr(router_module, "_owns_session", boom)
+    real = router_module._may_write_session
+
+    async def may_write(user: Any, session_id: str) -> bool:
+        return True if session_id in (old, child) else await real(user, session_id)
+
+    monkeypatch.setattr(router_module, "_may_write_session", may_write)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert response.status_code == 503, response.text
+    assert "call hand_off again" in response.json()["error"]["message"]
+    assert _labels(old)[labels.HANDOFF_TO] == new, "the commit is kept"
+    assert _labels(child)[labels.ORCH] == new and tasks.patched == []
+    assert _creates(app) == []
+
+
+async def test_no_permission_store_is_unknown_not_a_different_owner(
+    client: httpx.AsyncClient, handoff: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    app, tasks, _ = handoff
+    new = await _session(client, "New lead", {labels.STATUS: "working"})
+    old = await _old_lead(client, {labels.HANDOFF_TO: new, labels.HANDOFF_PREV_STATUS: "working"})
+    child = await _session(client, "Builder", {labels.ORCH: new, labels.STATUS: "working"})
+    # Multi-user, but the permission store cannot be opened: _owns_session would read
+    # that as "not the owner", which must not undo a healthy handoff.
+    monkeypatch.setattr(router_module, "_acl_user", lambda user: "owner")
+    monkeypatch.setattr(router_module, "_permission_store", lambda: None)
+    real = router_module._may_write_session
+
+    async def may_write(user: Any, session_id: str) -> bool:
+        return True if session_id in (old, child) else await real(user, session_id)
+
+    monkeypatch.setattr(router_module, "_may_write_session", may_write)
+    response = await client.post(f"/v1/ae/sessions/{old}/handoff", json={"packet": "P."})
+    assert response.status_code == 503, response.text
+    assert _labels(old)[labels.HANDOFF_TO] == new, "the commit is kept"
+    assert _labels(child)[labels.ORCH] == new and tasks.patched == []
+    assert _creates(app) == []
+
+
+async def _real_sweep(session: str, *, threshold: int = 300_000) -> dict[str, list[str]]:
+    from ae_omni_policies import lead_handoff
+
+    sweeper = lead_handoff.Sweeper(
+        store=get_conversation_store(),
+        owner=lambda _session_id: "owner",
+        threshold=lambda _user: threshold,
+    )
+    return await sweeper.sweep()
+
+
+async def test_the_sweep_labels_suggests_keeps_a_snooze_and_clears_on_the_real_store(
+    client: httpx.AsyncClient,
+) -> None:
+    store = get_conversation_store()
+    session = await _session(client, "Long chat", {labels.STATUS: "working"})
+    store.set_labels(
+        session,
+        {"omnigent.wrapper": "claude-code-native-ui", "omnigent.last_context_tokens": "400000"},
+        updated_at=int(time.time()),
+    )
+    assert session in (await _real_sweep(session))["suggested"]
+    assert _labels(session)[labels.HANDOFF] == "suggest"
+    assert _labels(session)[labels.HANDOFF_AT] == "400000"
+    assert session not in (await _real_sweep(session))["suggested"]
+
+    # Not now at 340k, then the chat goes to review and back: the snooze stays.
+    store.set_labels(session, {labels.HANDOFF: "snoozed", labels.HANDOFF_AT: "340000"})
+    store.set_labels(session, {labels.STATUS: "review"})
+    done = await _real_sweep(session)
+    assert session not in done["cleared"] and session not in done["suggested"]
+    store.set_labels(session, {labels.STATUS: "working"})
+    done = await _real_sweep(session)
+    assert session not in done["suggested"]
+    assert _labels(session)[labels.HANDOFF] == "snoozed"
+
+    # The context falls under the size: the label goes.
+    store.set_labels(
+        session, {"omnigent.last_context_tokens": "90000"}, updated_at=int(time.time())
+    )
+    assert session in (await _real_sweep(session))["cleared"]
+    assert labels.label(_labels(session), labels.HANDOFF) is None

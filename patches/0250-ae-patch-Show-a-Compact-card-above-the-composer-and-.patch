@@ -1,0 +1,1252 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 17:23:16 -0700
+Subject: [PATCH 250/260] [ae-patch] Show a Compact card above the composer and
+ in the rail past the Suggest compacting at size
+
+The server sweep labels a long Claude chat ae.handoff=suggest. The action dock
+gets a context card (ranked after the usage limit) with Compact and Not now,
+the rail's Context section shows the same line and drops its own Compact button
+while the card shows, and CompactButton moves to a file of its own. Compact
+posts the compact event for the open chat, then snoozes the suggestion; both
+buttons go quiet while the chat runs. The Hand off at setting is renamed
+Suggest compacting at, with a new hint.
+---
+ web/src/components/AeActionDock.test.tsx      | 195 +++++++++++++++++-
+ web/src/components/AeActionDock.tsx           |  61 ++++++
+ web/src/components/aeRail/AeCompactButton.tsx |  93 +++++++++
+ .../components/aeRail/AeRailContext.test.tsx  |  69 ++++++-
+ web/src/components/aeRail/AeRailContext.tsx   |  81 ++------
+ .../components/aeRail/aeRailSessionData.ts    |  78 ++++++-
+ web/src/hooks/useAeActionDockItems.ts         |   3 +
+ web/src/hooks/useAeCompactSuggestion.ts       |  30 +++
+ web/src/lib/aeActionDock.ts                   |  17 +-
+ web/src/lib/aeCompactSuggestion.test.ts       | 111 ++++++++++
+ web/src/lib/aeCompactSuggestion.ts            |  96 +++++++++
+ web/src/lib/aeRoles.ts                        |   4 +-
+ web/src/lib/aeSettingHints.ts                 |   4 +-
+ .../settings/AeChildPromptSettings.test.tsx   |   4 +-
+ .../pages/settings/AeChildPromptSettings.tsx  |   8 +-
+ 15 files changed, 771 insertions(+), 83 deletions(-)
+ create mode 100644 web/src/components/aeRail/AeCompactButton.tsx
+ create mode 100644 web/src/hooks/useAeCompactSuggestion.ts
+ create mode 100644 web/src/lib/aeCompactSuggestion.test.ts
+ create mode 100644 web/src/lib/aeCompactSuggestion.ts
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 4d00fa753e95f7c95ae032c0dfc4efd79c359bed..24cfb65c3e90b0b393631bd4f885ebbb479cec1e 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -22,6 +22,7 @@ import { AeActionDock } from "./AeActionDock";
+ import { ComposerWorkspaceBar } from "./composer/ComposerControls";
+ import { ComposerPrLink } from "./composer/ComposerPrLink";
+ 
++const realCompact = useChatStore.getState().compact;
+ const REPO = "analyticendeavors/omnigent-ae";
+ const SHA = "a1b2c3d4e5f60718293a4b5c6d7e8f9012345678";
+ const url = (n: number) => `https://github.com/${REPO}/pull/${n}`;
+@@ -72,13 +73,14 @@ function Questions({ pending }: { pending: Question[] }) {
+   return null;
+ }
+ 
+-function renderDock(texts: string[], pending: Question[] = []) {
++function renderDock(texts: string[], pending: Question[] = [], labels?: Record<string, string>) {
+   useChatStore.setState({
+     conversationId: "s1",
+     blocks: texts.map((text, i) => said(text, `m${i}`)),
+   });
+   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   const tracked = texts.flatMap((text) => text.match(/https:\/\/\S+/g) ?? []);
++  if (labels) qc.setQueryData(["session", "s1"], { labels });
+   qc.setQueryData(["github-info", "s1"], {
+     available: true,
+     prs: tracked.map((u) => ({ url: u })),
+@@ -166,7 +168,13 @@ beforeEach(() => {
+ 
+ afterEach(() => {
+   cleanup();
+-  useChatStore.setState({ conversationId: null, blocks: [] });
++  useChatStore.setState({
++    conversationId: null,
++    blocks: [],
++    status: "idle",
++    sessionStatus: "idle",
++    compact: realCompact,
++  });
+ });
+ 
+ describe("AeActionDock", () => {
+@@ -979,3 +987,186 @@ describe("AeActionDock child prompts", () => {
+     });
+   });
+ });
++
++describe("the Compact card", () => {
++  const SUGGEST = {
++    "ae.handoff": "suggest",
++    "ae.handoff_at": "370000",
++    "ae.status": "working",
++    "omnigent.wrapper": "claude-code-native-ui",
++  };
++  const snoozeCalls = () =>
++    vi.mocked(authenticatedFetch).mock.calls.filter(([u]) => String(u).endsWith("/handoff/snooze"));
++
++  beforeEach(() => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => json({ ok: true }));
++  });
++
++  it("shows the size and Compact and Not now when the label asks", async () => {
++    renderDock([], [], SUGGEST);
++    const lead = await screen.findByTestId("ae-dock-lead");
++    expect(lead.textContent).toContain(
++      "This chat is at 370k tokens. Every reply re-reads all of it.",
++    );
++    expect(within(lead).getByTestId("ae-dock-compact")).toBeTruthy();
++    expect(within(lead).getByTestId("ae-dock-context-later")).toBeTruthy();
++  });
++
++  it("is absent without the label, when snoozed, or for a different open chat", async () => {
++    const none = renderDock([], [], { "ae.status": "working" });
++    await waitFor(() =>
++      expect(none.container.querySelector("[data-testid=ae-dock-lead]")).toBeNull(),
++    );
++    cleanup();
++    const snoozed = renderDock([], [], { ...SUGGEST, "ae.handoff": "snoozed" });
++    expect(snoozed.container.querySelector("[data-testid=ae-dock-lead]")).toBeNull();
++    cleanup();
++    const other = renderDock([], [], SUGGEST);
++    await screen.findByTestId("ae-dock-lead");
++    act(() => useChatStore.setState({ conversationId: "elsewhere" }));
++    await waitFor(() =>
++      expect(other.container.querySelector("[data-testid=ae-dock-lead]")).toBeNull(),
++    );
++  });
++
++  it.each([
++    ["a family child", { "ae.orch": "conv_lead" }],
++    ["a reviewer", { "ae.role": "reviewer" }],
++    ["a fork", { "omnigent.fork.source_id": "conv_x" }],
++    ["a side chat", { "omnigent.side_chat": "1" }],
++    ["a Codex chat", { "omnigent.wrapper": "codex-native-ui" }],
++  ])("shows no card for %s with a stale suggest label", async (_name, extra) => {
++    const view = renderDock([], [], { ...SUGGEST, ...extra });
++    await waitFor(() => expect(authenticatedFetch).not.toHaveBeenCalled());
++    expect(view.container.querySelector("[data-testid=ae-dock-lead]")).toBeNull();
++    expect(view.container.querySelector("[data-testid=ae-dock-compact]")).toBeNull();
++  });
++
++  it("Compact asks twice, compacts the open chat, then snoozes", async () => {
++    const compact = vi.fn(() => Promise.resolve());
++    renderDock([], [], SUGGEST);
++    useChatStore.setState({ compact });
++    const button = await screen.findByTestId("ae-dock-compact");
++    fireEvent.click(button);
++    expect(button.textContent).toBe("Compact now?");
++    expect(compact).not.toHaveBeenCalled();
++    fireEvent.click(button);
++    expect(compact).toHaveBeenCalledTimes(1);
++    await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
++    expect(String(snoozeCalls()[0]![0])).toBe("/v1/ae/sessions/s1/handoff/snooze");
++  });
++
++  it("does not snooze when the compact failed", async () => {
++    const compact = vi.fn(() => Promise.reject(new Error("409 Conflict")));
++    renderDock([], [], SUGGEST);
++    useChatStore.setState({ compact });
++    const button = await screen.findByTestId("ae-dock-compact");
++    fireEvent.click(button);
++    fireEvent.click(button);
++    await screen.findByRole("alert");
++    expect(snoozeCalls()).toHaveLength(0);
++  });
++
++  it("disables Compact while the chat is running", async () => {
++    renderDock([], [], SUGGEST);
++    act(() => useChatStore.setState({ sessionStatus: "running" }));
++    try {
++      expect(await screen.findByTestId("ae-dock-compact")).toBeDisabled();
++    } finally {
++      // The store keeps a per-session copy that the next render of "s1" would restore.
++      act(() => useChatStore.setState({ sessionStatus: "idle" }));
++    }
++  });
++
++  it("Not now posts the snooze and nothing else", async () => {
++    const compact = vi.fn(() => Promise.resolve());
++    renderDock([], [], SUGGEST);
++    useChatStore.setState({ compact });
++    fireEvent.click(await screen.findByTestId("ae-dock-context-later"));
++    await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
++    expect(compact).not.toHaveBeenCalled();
++  });
++
++  it("treats a 409 from Not now as a quiet no-op", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "this chat already handed off" } }, 409),
++    );
++    const seen: unknown[] = [];
++    const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
++    window.addEventListener("omnigent:toast", listen);
++    try {
++      renderDock([], [], SUGGEST);
++      fireEvent.click(await screen.findByTestId("ae-dock-context-later"));
++      await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
++      await waitFor(() => expect(screen.getByTestId("ae-dock-context-later")).not.toBeDisabled());
++      expect(seen).toEqual([]);
++    } finally {
++      window.removeEventListener("omnigent:toast", listen);
++    }
++  });
++
++  it("does not toast when the snooze after Compact gets a 409", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "this chat already handed off" } }, 409),
++    );
++    const seen: unknown[] = [];
++    const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
++    window.addEventListener("omnigent:toast", listen);
++    try {
++      const compact = vi.fn(() => Promise.resolve());
++      renderDock([], [], SUGGEST);
++      useChatStore.setState({ compact });
++      const button = await screen.findByTestId("ae-dock-compact");
++      fireEvent.click(button);
++      fireEvent.click(button);
++      await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
++      await act(async () => {
++        await new Promise<void>((resolve) => {
++          setTimeout(resolve, 20);
++        });
++      });
++      expect(compact).toHaveBeenCalledTimes(1);
++      expect(seen).toEqual([]);
++    } finally {
++      window.removeEventListener("omnigent:toast", listen);
++    }
++  });
++
++  it("toasts when the snooze after Compact fails some other way", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "only the owner" } }, 403),
++    );
++    const seen: unknown[] = [];
++    const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
++    window.addEventListener("omnigent:toast", listen);
++    try {
++      const compact = vi.fn(() => Promise.resolve());
++      renderDock([], [], SUGGEST);
++      useChatStore.setState({ compact });
++      const button = await screen.findByTestId("ae-dock-compact");
++      fireEvent.click(button);
++      fireEvent.click(button);
++      await waitFor(() => expect(seen).toHaveLength(1));
++      expect(String(seen[0])).toContain("could not be snoozed");
++    } finally {
++      window.removeEventListener("omnigent:toast", listen);
++    }
++  });
++
++  it("tells the viewer when Not now is refused", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "only the owner can change session s1" } }, 403),
++    );
++    const seen: unknown[] = [];
++    const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
++    window.addEventListener("omnigent:toast", listen);
++    try {
++      renderDock([], [], SUGGEST);
++      fireEvent.click(await screen.findByTestId("ae-dock-context-later"));
++      await waitFor(() => expect(seen).toHaveLength(1));
++      expect(String(seen[0])).toContain("Could not snooze this chat");
++    } finally {
++      window.removeEventListener("omnigent:toast", listen);
++    }
++  });
++});
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index fb6dece9acd6c4c711b29fcec7c7a466df189211..4643d68aa1d35f1866aa2a61d32dc58730bd0e9c 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -64,7 +64,14 @@ import {
+ import { AE_ICON_CHEVRON_DOWN } from "@/lib/aeAgentsIcons";
+ import { AE_ICON_CHECK, AE_ICON_MERGE, AE_ICON_PR_DRAFT, AE_ICON_PR_OPEN } from "@/lib/aePrIcons";
+ import { AeLimitHoverCard } from "@/components/AeLimitHoverCard";
++import {
++  aeCompactText,
++  aeCompactTokens,
++  aeSnoozeFailureIsQuiet,
++  postAeHandoffSnooze,
++} from "@/lib/aeCompactSuggestion";
+ import { aeLimitGateShort, aeLimitGateText } from "@/lib/aeLimitGate";
++import { AeCompactButton } from "@/components/aeRail/AeCompactButton";
+ import { AE_ADMIN_CENTER_PATH } from "@/lib/aePrDeploy";
+ import type { AeReceiptTone } from "@/lib/aePrReceipt";
+ import { aeCiText } from "@/lib/aePrs";
+@@ -93,6 +100,7 @@ const KIND_STYLE: Record<AeDockKind, { icon: AeTablerIconNode; tone: string; tin
+   question: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
+   childPrompt: { icon: AE_ICON_HELP_CIRCLE, tone: AMBER, tint: "bg-amber-500/15" },
+   limit: { icon: AE_ICON_GAUGE, tone: RED, tint: "bg-red-500/15" },
++  context: { icon: AE_ICON_GAUGE, tone: AMBER, tint: "bg-amber-500/15" },
+   merge: { icon: AE_ICON_PR_OPEN, tone: GREEN, tint: "bg-emerald-500/15" },
+   draft: { icon: AE_ICON_PR_DRAFT, tone: MUTED, tint: "bg-muted" },
+   waiting: { icon: AE_ICON_PR_OPEN, tone: AMBER, tint: "bg-amber-500/15" },
+@@ -163,6 +171,26 @@ function ItemBody({ item, now, expanded }: { item: AeDockItem; now: number; expa
+       </>
+     );
+   }
++  if (item.kind === "context") {
++    const text = aeCompactText(item.tokens);
++    return (
++      <>
++        <span
++          className={cn("min-w-0 truncate", !expanded && "hidden md:inline")}
++          title={text}
++          data-ae-lead-text=""
++          data-testid="ae-dock-context-text"
++        >
++          {text}
++        </span>
++        {!expanded && (
++          <span className="shrink-0 font-semibold whitespace-nowrap md:hidden" title={text}>
++            {aeCompactTokens(item.tokens)} tokens
++          </span>
++        )}
++      </>
++    );
++  }
+   if (item.kind === "question") {
+     return (
+       <span className="min-w-0 truncate" title={item.text} data-ae-lead-text="">
+@@ -410,6 +438,13 @@ function ItemActions({
+           />
+         </>
+       );
++    case "context":
++      return (
++        <>
++          <AeCompactButton sessionId={item.sessionId} testId="ae-dock-compact" />
++          <NotNowButton sessionId={item.sessionId} />
++        </>
++      );
+     case "question":
+       return (
+         <Button
+@@ -469,6 +504,32 @@ function ItemActions({
+   }
+ }
+ 
++/** The Compact card's Not now: snoozes the suggestion until the context grew another 100k. */
++function NotNowButton({ sessionId }: { sessionId: string }) {
++  const [busy, setBusy] = useState(false);
++  return (
++    <Button
++      variant="outline"
++      className={ACTION}
++      disabled={busy}
++      onClick={() => {
++        setBusy(true);
++        postAeHandoffSnooze(sessionId)
++          .catch((reason: unknown) => {
++            if (aeSnoozeFailureIsQuiet(reason)) return;
++            showToast(
++              `Could not snooze this chat: ${reason instanceof Error ? reason.message : String(reason)}`,
++            );
++          })
++          .finally(() => setBusy(false));
++      }}
++      data-testid="ae-dock-context-later"
++    >
++      Not now
++    </Button>
++  );
++}
++
+ /** The card's "Mark ready for review"; marking ready never merges, so no confirm step. */
+ function MarkReadyButton({ item }: { item: AeDockDraft }) {
+   const ready = useAeMarkReady(item.card);
+diff --git a/web/src/components/aeRail/AeCompactButton.tsx b/web/src/components/aeRail/AeCompactButton.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..01a9cb1967ec66ffc5837e8ca7114628e173fd8e
+--- /dev/null
++++ b/web/src/components/aeRail/AeCompactButton.tsx
+@@ -0,0 +1,93 @@
++// Compact, two clicks (omnigent-ae). The rail's Context section and the action
++// dock's Compact card both use it, so it lives in a file of its own: the vitest
++// suites mock whole component modules, and a missing export fails every test that
++// renders them.
++
++import { useEffect, useState } from "react";
++import { Button } from "@/components/ui/button";
++import { showToast } from "@/components/ui/toast";
++import { aeSnoozeFailureIsQuiet, postAeHandoffSnooze } from "@/lib/aeCompactSuggestion";
++import { useChatStore } from "@/store/chatStore";
++
++type CompactPhase = "idle" | "confirm" | "running";
++
++/**
++ * Two clicks within three seconds compact the session, as /compact does. With
++ * `sessionId` (the dock card) it first checks the chat open in the store is that
++ * session, and snoozes the suggestion once the compact went out. Disabled while
++ * the chat is running, as the store refuses a compact then.
++ */
++export function AeCompactButton({
++  sessionId,
++  testId = "ae-rail-compact",
++}: {
++  sessionId?: string;
++  testId?: string;
++}) {
++  const [phase, setPhase] = useState<CompactPhase>("idle");
++  const [error, setError] = useState<string | null>(null);
++  const busy = useChatStore((s) => s.status === "streaming" || s.sessionStatus === "running");
++  useEffect(() => {
++    if (phase !== "confirm") return undefined;
++    const timer = window.setTimeout(() => setPhase("idle"), 3000);
++    return () => window.clearTimeout(timer);
++  }, [phase]);
++  const onClick = () => {
++    if (phase === "idle") {
++      setError(null);
++      setPhase("confirm");
++      return;
++    }
++    if (phase !== "confirm") return;
++    const store = useChatStore.getState();
++    if (sessionId && store.conversationId !== sessionId) {
++      setError("This chat is not open here. Open it, then compact.");
++      setPhase("idle");
++      return;
++    }
++    setPhase("running");
++    store.compact().then(
++      () => {
++        setPhase("idle");
++        if (sessionId) {
++          postAeHandoffSnooze(sessionId).catch((reason: unknown) => {
++            if (aeSnoozeFailureIsQuiet(reason)) return;
++            showToast(
++              `Compacting started, but the card could not be snoozed (${
++                reason instanceof Error ? reason.message : String(reason)
++              }).`,
++            );
++          });
++        }
++      },
++      (reason: unknown) => {
++        const detail = reason instanceof Error ? reason.message : String(reason);
++        setError(
++          `Could not compact the session (${detail}). Try again, or send /compact from the composer.`,
++        );
++        setPhase("idle");
++      },
++    );
++  };
++  return (
++    <>
++      <Button
++        type="button"
++        size="xs"
++        variant={phase === "confirm" ? "destructive" : "outline"}
++        disabled={phase === "running" || busy}
++        title={busy ? "Compact is disabled while a chat is in progress" : undefined}
++        onClick={onClick}
++        data-testid={testId}
++        className="shrink-0"
++      >
++        {phase === "confirm" ? "Compact now?" : phase === "running" ? "Compacting..." : "Compact"}
++      </Button>
++      {error && (
++        <p role="alert" className="basis-full text-xs text-destructive">
++          {error}
++        </p>
++      )}
++    </>
++  );
++}
+diff --git a/web/src/components/aeRail/AeRailContext.test.tsx b/web/src/components/aeRail/AeRailContext.test.tsx
+index 5f10713d4e50173477aedd3d7601d73ee8547b27..395eb451314fd57d186a0f0f931a7c58877ec9be 100644
+--- a/web/src/components/aeRail/AeRailContext.test.tsx
++++ b/web/src/components/aeRail/AeRailContext.test.tsx
+@@ -1,4 +1,14 @@
+-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import {
++  act,
++  cleanup,
++  fireEvent,
++  render as rtlRender,
++  type RenderOptions,
++  screen,
++  waitFor,
++  within,
++} from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+@@ -22,6 +32,18 @@ const contextCalls = () =>
+   vi.mocked(authenticatedFetch).mock.calls.filter(([url]) => String(url).includes("/context-usage"))
+     .length;
+ 
++let queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++
++/** The rail reads the session's labels from the query cache, so every render has one. */
++function render(ui: React.ReactElement, options?: RenderOptions) {
++  return rtlRender(ui, {
++    wrapper: ({ children }) => (
++      <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
++    ),
++    ...options,
++  });
++}
++
+ const realCompact = useChatStore.getState().compact;
+ let sessionCount = 0;
+ let sessionId = "";
+@@ -41,6 +63,7 @@ function setSession(harness: string, extra: Record<string, unknown> = {}) {
+ }
+ 
+ beforeEach(() => {
++  queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+   resetAeContextSnapshots();
+   vi.mocked(authenticatedFetch).mockReset();
+   vi.mocked(authenticatedFetch).mockImplementation(() => json(snapshotNow()));
+@@ -287,3 +310,47 @@ describe("Compact session", () => {
+     expect(screen.queryByTestId("ae-rail-compact")).toBeNull();
+   });
+ });
++
++describe("Compact suggestion line", () => {
++  const SUGGEST = {
++    "ae.handoff": "suggest",
++    "ae.handoff_at": "370000",
++    "ae.status": "working",
++    "omnigent.wrapper": "claude-code-native-ui",
++  };
++
++  function renderSuggested(labels: Record<string, string>) {
++    queryClient.setQueryData(["session", sessionId], { labels });
++    return render(<AeRailContext sessionId={sessionId} />);
++  }
++
++  it("shows the line and drops its own Compact button while the card shows", async () => {
++    setSession("claude-native");
++    renderSuggested(SUGGEST);
++    expect((await screen.findByTestId("ae-rail-compact-suggest")).textContent).toBe(
++      "This chat is at 370k tokens. Every reply re-reads all of it.",
++    );
++    await screen.findByRole("button", { name: /^Categories/ });
++    expect(screen.queryByTestId("ae-rail-compact")).toBeNull();
++  });
++
++  it.each([
++    ["a family child", { "ae.orch": "conv_lead" }],
++    ["a reviewer", { "ae.role": "reviewer" }],
++    ["a fork", { "omnigent.fork.source_id": "conv_x" }],
++    ["a side chat", { "omnigent.side_chat": "1" }],
++    ["a Codex chat", { "omnigent.wrapper": "codex-native-ui" }],
++  ])("shows no line for %s with a stale suggest label", async (_name, extra) => {
++    setSession("claude-native");
++    renderSuggested({ ...SUGGEST, ...extra });
++    await screen.findByRole("button", { name: /^Categories/ });
++    expect(screen.queryByTestId("ae-rail-compact-suggest")).toBeNull();
++  });
++
++  it("keeps its Compact button when no card shows", async () => {
++    setSession("claude-native");
++    renderSuggested({ "ae.status": "working" });
++    await screen.findByTestId("ae-rail-compact");
++    expect(screen.queryByTestId("ae-rail-compact-suggest")).toBeNull();
++  });
++});
+diff --git a/web/src/components/aeRail/AeRailContext.tsx b/web/src/components/aeRail/AeRailContext.tsx
+index 36bd018e5d7af9069a25a8fa4571c24e2f963071..d15859ae47afd1cff5acf1b5360146e4bec457a4 100644
+--- a/web/src/components/aeRail/AeRailContext.tsx
++++ b/web/src/components/aeRail/AeRailContext.tsx
+@@ -3,8 +3,9 @@
+ // auto-compact countdown with Compact beside it, and the snapshot's age. Other
+ // harnesses get the plain context bar from the chat store.
+ 
+-import { useEffect, useState } from "react";
+ import { Button } from "@/components/ui/button";
++import { useAeCompactSuggestion } from "@/hooks/useAeCompactSuggestion";
++import { aeCompactText } from "@/lib/aeCompactSuggestion";
+ import { contextTone } from "@/lib/aeContextTone";
+ import { type AeRailSectionProps, useAeRailSectionActive } from "@/lib/aeSessionRail";
+ import { isNativeHarness } from "@/lib/forkHarness";
+@@ -21,6 +22,7 @@ import {
+   useAeContextSnapshot,
+ } from "../aeContextUsage";
+ import { aeModelName } from "../aeSessionContext";
++import { AeCompactButton } from "./AeCompactButton";
+ import { AeRailSection } from "./AeRailSection";
+ import { AE_RAIL_TONE_TEXT, AeRailBar, AeRailIcon, AeRailMeta, AeRailMuted } from "./aeRailUi";
+ import { useAeRailNow } from "./aeRailNow";
+@@ -59,12 +61,22 @@ export function AeRailContext({ sessionId }: AeRailSectionProps) {
+       : null;
+   const reading = headline ? { used: headline.totalTokens, size: headline.maxTokens } : live;
+   const pct = reading ? (reading.used / reading.size) * 100 : null;
++  const suggestion = useAeCompactSuggestion(sessionId);
++  const cardShown = suggestion.item !== null;
+   return (
+     <AeRailSection
+       id="context"
+       foldedSummary={pct === null ? undefined : `${Math.round(pct)}% used`}
+     >
+       <div className="flex flex-col gap-2 text-sm" data-testid="ae-rail-context">
++        {suggestion.tokens !== null && (
++          <p
++            className="text-xs text-amber-600 dark:text-amber-400"
++            data-testid="ae-rail-compact-suggest"
++          >
++            {aeCompactText(suggestion.tokens)}
++          </p>
++        )}
+         {reading && pct !== null ? (
+           <div className="flex items-baseline justify-between gap-2">
+             <span className={cn("font-semibold", AE_RAIL_TONE_TEXT[contextTone(pct)])}>
+@@ -86,6 +98,7 @@ export function AeRailContext({ sessionId }: AeRailSectionProps) {
+             model={model}
+             active={active}
+             canCompact={canCompact}
++            cardShown={cardShown}
+           />
+         ) : (
+           <>
+@@ -162,12 +175,15 @@ function SnapshotBody({
+   model,
+   active,
+   canCompact,
++  cardShown,
+ }: {
+   data: ContextUsage;
+   snapshot: AeContextSnapshotState;
+   model: string | null;
+   active: boolean;
+   canCompact: boolean;
++  /** The dock's Compact card is showing, so there is no second button here. */
++  cardShown: boolean;
+ }) {
+   const now = useAeRailNow(active);
+   const countdown = contextCountdown(data, data.totalTokens);
+@@ -183,7 +199,7 @@ function SnapshotBody({
+           Some MCP servers are unavailable or still connecting. Their tools may be missing.
+         </AeRailMuted>
+       )}
+-      {(countdown || canCompact) && (
++      {(countdown || (canCompact && !cardShown)) && (
+         <div className="flex flex-wrap items-center justify-between gap-2 border-t border-border pt-2">
+           <span
+             // basis-0 so the line never wraps for the text; it truncates instead.
+@@ -193,7 +209,7 @@ function SnapshotBody({
+           >
+             {countdown}
+           </span>
+-          {canCompact && <CompactButton />}
++          {canCompact && !cardShown && <AeCompactButton />}
+         </div>
+       )}
+       <div className="flex items-center gap-1.5">
+@@ -223,62 +239,3 @@ function SnapshotBody({
+     </>
+   );
+ }
+-
+-type CompactPhase = "idle" | "confirm" | "running";
+-
+-/** Two clicks within three seconds compact the session, as /compact does. */
+-export function CompactButton() {
+-  const [phase, setPhase] = useState<CompactPhase>("idle");
+-  const [error, setError] = useState<string | null>(null);
+-  useEffect(() => {
+-    if (phase !== "confirm") return undefined;
+-    const timer = window.setTimeout(() => setPhase("idle"), 3000);
+-    return () => window.clearTimeout(timer);
+-  }, [phase]);
+-  const onClick = () => {
+-    if (phase === "idle") {
+-      setError(null);
+-      setPhase("confirm");
+-      return;
+-    }
+-    if (phase !== "confirm") return;
+-    setPhase("running");
+-    useChatStore
+-      .getState()
+-      .compact()
+-      .then(
+-        () => setPhase("idle"),
+-        (reason: unknown) => {
+-          const detail = reason instanceof Error ? reason.message : String(reason);
+-          setError(
+-            `Could not compact the session (${detail}). Try again, or send /compact from the composer.`,
+-          );
+-          setPhase("idle");
+-        },
+-      );
+-  };
+-  return (
+-    <>
+-      <Button
+-        type="button"
+-        size="xs"
+-        variant={phase === "confirm" ? "destructive" : "outline"}
+-        disabled={phase === "running"}
+-        onClick={onClick}
+-        data-testid="ae-rail-compact"
+-        className="shrink-0"
+-      >
+-        {phase === "confirm"
+-          ? "Compact now?"
+-          : phase === "running"
+-            ? "Compacting..."
+-            : "Compact"}
+-      </Button>
+-      {error && (
+-        <p role="alert" className="basis-full text-xs text-destructive">
+-          {error}
+-        </p>
+-      )}
+-    </>
+-  );
+-}
+diff --git a/web/src/components/aeRail/aeRailSessionData.ts b/web/src/components/aeRail/aeRailSessionData.ts
+index e72031780dea54ec3952b9094aae002d177bfa24..72dc910eee96cbed9f325a9377b6b94980e49501 100644
+--- a/web/src/components/aeRail/aeRailSessionData.ts
++++ b/web/src/components/aeRail/aeRailSessionData.ts
+@@ -4,7 +4,7 @@
+ // Neither costs a request, and a push or the Status menu's overlay repaints both.
+ 
+ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+-import { useCallback, useMemo, useSyncExternalStore } from "react";
++import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
+ import type { Conversation } from "@/hooks/useConversations";
+ import type { AnyBlock } from "@/lib/blocks";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+@@ -15,13 +15,35 @@ export type AeLabels = Record<string, string>;
+ 
+ const NO_LABELS: AeLabels = {};
+ 
+-/** This session's labels from any cached copy, or `null` when no cache holds it. */
+-export function readAeRailSessionLabels(queryClient: QueryClient, id: string): AeLabels | null {
++/** What the caches know of a session beyond its labels: the facts the Compact card checks. */
++export interface AeRailSessionRow {
++  labels: AeLabels;
++  /** A sub-agent or other child session names its parent. */
++  parentId: string | null;
++  archived: boolean;
++  /** `"sub_agent"` for native child sessions, else `"default"`; `null` when the copy lacks it. */
++  kind: string | null;
++}
++
++function fromConversation(row: Conversation): AeRailSessionRow {
++  return {
++    labels: row.labels ?? NO_LABELS,
++    parentId: row.parent_session_id ?? null,
++    archived: row.archived === true,
++    kind: null,
++  };
++}
++
++/** This session's row from any cached copy, or `null` when no cache holds it. */
++export function readAeRailSessionRow(
++  queryClient: QueryClient,
++  id: string,
++): AeRailSessionRow | null {
+   for (const queryKey of [["conversations"], ["project-sessions"]]) {
+     for (const [, data] of queryClient.getQueriesData<ConversationsInfiniteData>({ queryKey })) {
+       for (const page of data?.pages ?? []) {
+         const row = page.data.find((conversation: Conversation) => conversation.id === id);
+-        if (row) return row.labels ?? NO_LABELS;
++        if (row) return fromConversation(row);
+       }
+     }
+   }
+@@ -29,14 +51,56 @@ export function readAeRailSessionLabels(queryClient: QueryClient, id: string): A
+     "pinned-conversations",
+   ]);
+   const pinnedRow = pinned?.conversations.find((row) => row.id === id);
+-  if (pinnedRow) return pinnedRow.labels ?? NO_LABELS;
++  if (pinnedRow) return fromConversation(pinnedRow);
+   const backfill = queryClient.getQueryData<Conversation | null>(["conversation-backfill", id]);
+-  if (backfill) return backfill.labels ?? NO_LABELS;
++  if (backfill) return fromConversation(backfill);
+   const snapshot = queryClient.getQueryData<Session>(["session", id]);
+-  if (snapshot) return snapshot.labels ?? NO_LABELS;
++  if (snapshot) {
++    return {
++      labels: snapshot.labels ?? NO_LABELS,
++      parentId: snapshot.parentSessionId ?? null,
++      archived: snapshot.archived === true,
++      kind: snapshot.kind ?? null,
++    };
++  }
+   return null;
+ }
+ 
++/** This session's labels from any cached copy, or `null` when no cache holds it. */
++export function readAeRailSessionLabels(queryClient: QueryClient, id: string): AeLabels | null {
++  return readAeRailSessionRow(queryClient, id)?.labels ?? null;
++}
++
++/**
++ * The open session's row, live; `null` until a cache holds the session. The row object is
++ * rebuilt on each read, so the hook returns a stable copy while its fields are unchanged.
++ */
++export function useAeRailSessionRow(id: string): AeRailSessionRow | null {
++  const queryClient = useQueryClient();
++  const subscribe = useCallback(
++    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
++    [queryClient],
++  );
++  const last = useRef<AeRailSessionRow | null>(null);
++  const read = useCallback(() => {
++    const next = readAeRailSessionRow(queryClient, id);
++    const prev = last.current;
++    if (
++      next &&
++      prev &&
++      next.labels === prev.labels &&
++      next.parentId === prev.parentId &&
++      next.archived === prev.archived &&
++      next.kind === prev.kind
++    ) {
++      return prev;
++    }
++    last.current = next;
++    return next;
++  }, [queryClient, id]);
++  return useSyncExternalStore(subscribe, read, read);
++}
++
+ /** The open session's labels, live; `null` until a cache holds the session. */
+ export function useAeRailSessionLabels(id: string): AeLabels | null {
+   const queryClient = useQueryClient();
+diff --git a/web/src/hooks/useAeActionDockItems.ts b/web/src/hooks/useAeActionDockItems.ts
+index 97fefb0640252c9ffe344b8834f6ccacc8566948..436a38ea8e3c83885e1596819afed8e60b528b55 100644
+--- a/web/src/hooks/useAeActionDockItems.ts
++++ b/web/src/hooks/useAeActionDockItems.ts
+@@ -6,6 +6,7 @@
+ import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
+ import { useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+ import { AE_PR_POLL_MS } from "@/components/AePrCards";
++import { useAeCompactSuggestion } from "@/hooks/useAeCompactSuggestion";
+ import { useAeLimitGate } from "@/hooks/useAeLimitGate";
+ import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+ import {
+@@ -294,11 +295,13 @@ export function useAeActionDockItems(
+   const questions = useDockQuestions(sessionId);
+   const childPrompts = useDockChildPrompts(sessionId);
+   const limit = useAeLimitGate(sessionId);
++  const compact = useAeCompactSuggestion(sessionId);
+   const items = aeDockArrange(
+     [
+       ...aeDockQuestions(questions),
+       ...childPrompts,
+       ...(limit.item ? [limit.item] : []),
++      ...(compact.item ? [compact.item] : []),
+       ...aeDockMerges(withCards),
+       ...aeDockDrafts(withCards),
+       ...aeDockWaiting(withCards),
+diff --git a/web/src/hooks/useAeCompactSuggestion.ts b/web/src/hooks/useAeCompactSuggestion.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..8198d7bd5ecdb594ab9812fb8381fd7728934fd3
+--- /dev/null
++++ b/web/src/hooks/useAeCompactSuggestion.ts
+@@ -0,0 +1,30 @@
++// The Compact card's data (omnigent-ae, 2026-10-29): the session labels say
++// whether to suggest, the chat store says whether this pane has that chat open.
++// Labels come from the rail's live cache, so the phone, the desktop and every
++// tab agree.
++
++import { useMemo } from "react";
++import { useAeRailSessionRow } from "@/components/aeRail/aeRailSessionData";
++import type { AeDockContext } from "@/lib/aeActionDock";
++import { aeCompactSuggestion } from "@/lib/aeCompactSuggestion";
++import { useChatStore } from "@/store/chatStore";
++
++export function useAeCompactSuggestion(sessionId: string | undefined): {
++  /** The labels ask for compacting (the rail's line). */
++  tokens: number | null;
++  /** The dock card: the same, and this is the chat open in the store. */
++  item: AeDockContext | null;
++} {
++  const row = useAeRailSessionRow(sessionId ?? "");
++  const open = useChatStore((s) => Boolean(sessionId) && s.conversationId === sessionId);
++  const suggestion = aeCompactSuggestion(row);
++  const tokens = sessionId ? (suggestion?.tokens ?? null) : null;
++  const item = useMemo<AeDockContext | null>(
++    () =>
++      sessionId && open && tokens !== null
++        ? { kind: "context", key: "context", anchor: "context", order: 0, sessionId, tokens }
++        : null,
++    [sessionId, open, tokens],
++  );
++  return { tokens, item };
++}
+diff --git a/web/src/lib/aeActionDock.ts b/web/src/lib/aeActionDock.ts
+index 8659e9baa7cb24bd8459ece869fb0b3f9792b76f..9f117121b891f9d86cb9fa1dd4ac10b63d7ce06b 100644
+--- a/web/src/lib/aeActionDock.ts
++++ b/web/src/lib/aeActionDock.ts
+@@ -3,17 +3,19 @@
+ // unit-tested (aeActionDock.test.ts). omnigent-ae, 2026-10-20.
+ 
+ import type { AeLimitWindow } from "@/components/AePlanLimits";
++import { aeCompactTokens } from "@/lib/aeCompactSuggestion";
+ import { type AeAccountChoice, type AeLimitGate, aeLimitGateShort } from "@/lib/aeLimitGate";
+ import { type AePrDeploy, aeHasDeployState } from "@/lib/aePrDeploy";
+ import { type AePrReceipt, aePrReceipt } from "@/lib/aePrReceipt";
+ import { type AePrCard, aeCiText, aeReadyToMerge } from "@/lib/aePrs";
+ 
+ export type AeDockKind =
+-  "question" | "childPrompt" | "limit" | "merge" | "draft" | "waiting" | "deploy";
++  "question" | "childPrompt" | "limit" | "context" | "merge" | "draft" | "waiting" | "deploy";
+ 
+ /**
+  * Urgency: a question blocks the agent, and so does a prompt from a session this chat
+- * started (listed right after it), a usage limit is about to, a merge
++ * started (listed right after it), a usage limit is about to, a long context
++ * costs on every reply, a merge
+  * waits on a click, a draft on a click before review, an open pull request
+  * that is not ready on checks or a person, a deploy only on time.
+  */
+@@ -21,6 +23,7 @@ export const AE_DOCK_KINDS: readonly AeDockKind[] = [
+   "question",
+   "childPrompt",
+   "limit",
++  "context",
+   "merge",
+   "draft",
+   "waiting",
+@@ -127,10 +130,18 @@ export interface AeDockLimit extends ItemBase {
+   canCopyAccount: boolean;
+ }
+ 
++/** The chat's context passed the "Suggest compacting at" size (aeCompactSuggestion.ts). */
++export interface AeDockContext extends ItemBase {
++  kind: "context";
++  sessionId: string;
++  tokens: number;
++}
++
+ export type AeDockItem =
+   | AeDockQuestion
+   | AeDockChildPrompt
+   | AeDockLimit
++  | AeDockContext
+   | AeDockMerge
+   | AeDockDraft
+   | AeDockWaiting
+@@ -371,6 +382,8 @@ export function aeDockBadgeLabel(
+       return many ? `${items.length} child prompts` : "Child prompt";
+     case "limit":
+       return aeLimitGateShort(first.gate);
++    case "context":
++      return `${aeCompactTokens(first.tokens)} tokens`;
+     case "merge":
+       return many ? `${items.length} to merge` : `#${first.number} ready`;
+     case "draft":
+diff --git a/web/src/lib/aeCompactSuggestion.test.ts b/web/src/lib/aeCompactSuggestion.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..740c68593161177ae85af987da4adfe96acc6793
+--- /dev/null
++++ b/web/src/lib/aeCompactSuggestion.test.ts
+@@ -0,0 +1,111 @@
++import { beforeEach, describe, expect, it, vi } from "vitest";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++
++import { AE_DOCK_KINDS, aeDockBadgeLabel, aeDockSummary } from "@/lib/aeActionDock";
++import { authenticatedFetch } from "@/lib/identity";
++import {
++  aeCompactSuggestion,
++  aeCompactText,
++  aeCompactTokens,
++  postAeHandoffSnooze,
++} from "./aeCompactSuggestion";
++
++const LEAD = {
++  "ae.handoff": "suggest",
++  "ae.handoff_at": "370400",
++  "ae.status": "working",
++  "omnigent.wrapper": "claude-code-native-ui",
++};
++
++describe("aeCompactSuggestion", () => {
++  it("suggests on the suggest label while the chat is working or blocked", () => {
++    expect(aeCompactSuggestion({ labels: LEAD })).toEqual({ tokens: 370400 });
++    expect(aeCompactSuggestion({ labels: { ...LEAD, "ae.status": "blocked" } })).toEqual({
++      tokens: 370400,
++    });
++    expect(aeCompactSuggestion({ labels: { ...LEAD, "ae.status": "review" } })).toBeNull();
++    expect(aeCompactSuggestion({ labels: { ...LEAD, "ae.status": "" } })).toBeNull();
++  });
++
++  it("stays quiet for any other label value, snoozed included", () => {
++    for (const value of ["snoozed", "nudged", ""]) {
++      expect(aeCompactSuggestion({ labels: { ...LEAD, "ae.handoff": value } })).toBeNull();
++    }
++    expect(aeCompactSuggestion(null)).toBeNull();
++  });
++
++  it("accepts a lead role, and an unknown-parent marker on ae.orch", () => {
++    expect(aeCompactSuggestion({ labels: { ...LEAD, "ae.role": "lead" } })).not.toBeNull();
++    expect(aeCompactSuggestion({ labels: { ...LEAD, "ae.orch": "1" } })).not.toBeNull();
++    expect(aeCompactSuggestion({ labels: LEAD, kind: "default", parentId: null })).not.toBeNull();
++  });
++
++  it.each([
++    ["a family child", { labels: { ...LEAD, "ae.orch": "conv_lead" } }],
++    ["a reviewer", { labels: { ...LEAD, "ae.role": "reviewer" } }],
++    ["a builder", { labels: { ...LEAD, "ae.role": "builder" } }],
++    ["a fork", { labels: { ...LEAD, "omnigent.fork.source_id": "conv_x" } }],
++    ["a side chat", { labels: { ...LEAD, "omnigent.side_chat": "1" } }],
++    ["a Codex chat", { labels: { ...LEAD, "omnigent.wrapper": "codex-native-ui" } }],
++    ["a chat with no wrapper", { labels: { ...LEAD, "omnigent.wrapper": "" } }],
++    ["a native child", { labels: LEAD, parentId: "conv_parent" }],
++    ["a sub-agent row", { labels: LEAD, kind: "sub_agent" }],
++    ["an archived chat", { labels: LEAD, archived: true }],
++  ])("shows nothing for %s with a stale suggest label", (_name, row) => {
++    expect(aeCompactSuggestion(row)).toBeNull();
++  });
++
++  it("falls back to the context label when the size is missing", () => {
++    const labels = { ...LEAD, "omnigent.last_context_tokens": "310000" } as Record<string, string>;
++    delete labels["ae.handoff_at"];
++    expect(aeCompactSuggestion({ labels })).toEqual({ tokens: 310000 });
++  });
++
++  it("words the line in thousands", () => {
++    expect(aeCompactTokens(370_400)).toBe("370k");
++    expect(aeCompactText(370_000)).toBe(
++      "This chat is at 370k tokens. Every reply re-reads all of it.",
++    );
++  });
++});
++
++describe("the dock kinds", () => {
++  it("ranks the context card right after the limit", () => {
++    const at = AE_DOCK_KINDS.indexOf("context");
++    expect(at).toBe(AE_DOCK_KINDS.indexOf("limit") + 1);
++    expect(AE_DOCK_KINDS[at + 1]).toBe("merge");
++  });
++
++  it("badges it with its size", () => {
++    const item = {
++      kind: "context" as const,
++      key: "context",
++      anchor: "context",
++      order: 0,
++      sessionId: "s1",
++      tokens: 370_000,
++    };
++    expect(aeDockBadgeLabel([item])).toBe("370k tokens");
++    expect(aeDockSummary([item])?.lead.kind).toBe("context");
++  });
++});
++
++describe("postAeHandoffSnooze", () => {
++  beforeEach(() => vi.mocked(authenticatedFetch).mockReset());
++
++  it("posts an empty body to the session's snooze route", async () => {
++    vi.mocked(authenticatedFetch).mockResolvedValue(new Response("{}", { status: 200 }));
++    await postAeHandoffSnooze("conv a");
++    const [url, init] = vi.mocked(authenticatedFetch).mock.calls[0]!;
++    expect(url).toBe("/v1/ae/sessions/conv%20a/handoff/snooze");
++    expect(init).toMatchObject({ method: "POST", body: "{}" });
++  });
++
++  it("throws on a 403", async () => {
++    vi.mocked(authenticatedFetch).mockResolvedValue(
++      new Response(JSON.stringify({ error: { message: "only the owner" } }), { status: 403 }),
++    );
++    await expect(postAeHandoffSnooze("s1")).rejects.toThrow();
++  });
++});
+diff --git a/web/src/lib/aeCompactSuggestion.ts b/web/src/lib/aeCompactSuggestion.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..87a23208bbe79cd034286011ed44fcd62e05579a
+--- /dev/null
++++ b/web/src/lib/aeCompactSuggestion.ts
+@@ -0,0 +1,96 @@
++// The Compact card's model (omnigent-ae, 2026-10-29): the server sweep
++// (lead_handoff.py) labels a top-level Claude chat `ae.handoff=suggest` once its
++// context passes the owner's "Suggest compacting at" size, with the size in
++// `ae.handoff_at`. The dock and the rail both read it from the cached session row.
++// Pure, so the rules are unit-tested (aeCompactSuggestion.test.ts).
++
++import { authenticatedFetch } from "@/lib/identity";
++import { ApiError, apiErrorFromResponse } from "@/lib/sessionsApi";
++
++export const AE_HANDOFF_KEY = "ae.handoff";
++export const AE_HANDOFF_AT_KEY = "ae.handoff_at";
++const AE_STATUS_LABEL = "ae.status";
++const CONTEXT_KEY = "omnigent.last_context_tokens";
++const CLAUDE_WRAPPER = "claude-code-native-ui";
++
++export interface AeCompactSuggestion {
++  tokens: number;
++}
++
++function positive(raw: string | undefined): number | null {
++  const value = Number.parseInt(raw ?? "", 10);
++  return Number.isFinite(value) && value > 0 ? value : null;
++}
++
++/** The cached facts about a session that the card needs (aeRailSessionData.ts). */
++export interface AeCompactRow {
++  labels: Record<string, string>;
++  parentId?: string | null;
++  archived?: boolean;
++  kind?: string | null;
++}
++
++function held(labels: Record<string, string>, key: string): string | null {
++  const value = labels[key]?.trim();
++  return value ? value : null;
++}
++
++/**
++ * The same chats the server's sweep may label (`lead_handoff.is_lead`): a top-level Claude chat the
++ * user opened, working or blocked. A stale `suggest` label on a family child, a reviewer, a fork,
++ * a side chat, a chat on another harness or a native sub-agent must not offer to compact it.
++ */
++export function aeCompactEligible(row: AeCompactRow): boolean {
++  const { labels } = row;
++  if (row.parentId || row.archived) return false;
++  if (row.kind && row.kind !== "default") return false;
++  // `ae.orch` set to "1" names no parent; any other value is a family child.
++  const orch = held(labels, "ae.orch");
++  if (orch && orch !== "1") return false;
++  if (held(labels, "omnigent.fork.source_id") || held(labels, "omnigent.side_chat")) return false;
++  const role = held(labels, "ae.role");
++  if (role && role !== "lead") return false;
++  if (held(labels, "omnigent.wrapper") !== CLAUDE_WRAPPER) return false;
++  const status = held(labels, AE_STATUS_LABEL);
++  return status === "working" || status === "blocked";
++}
++
++/** The suggestion the row carries, or `null` (see `aeCompactEligible`). */
++export function aeCompactSuggestion(
++  row: AeCompactRow | null | undefined,
++): AeCompactSuggestion | null {
++  if (!row || row.labels[AE_HANDOFF_KEY] !== "suggest" || !aeCompactEligible(row)) return null;
++  const { labels } = row;
++  return { tokens: positive(labels[AE_HANDOFF_AT_KEY]) ?? positive(labels[CONTEXT_KEY]) ?? 0 };
++}
++
++/** "370k": the size in thousands, rounded. */
++export function aeCompactTokens(tokens: number): string {
++  return tokens > 0 ? `${Math.round(tokens / 1000)}k` : "a lot of";
++}
++
++/** The line the card and the rail share. */
++export function aeCompactText(tokens: number): string {
++  return `This chat is at ${aeCompactTokens(tokens)} tokens. Every reply re-reads all of it.`;
++}
++
++/** "Not now" and Compact: no new suggestion until the context grew another 100k tokens. */
++export async function postAeHandoffSnooze(sessionId: string): Promise<void> {
++  const res = await authenticatedFetch(
++    `/v1/ae/sessions/${encodeURIComponent(sessionId)}/handoff/snooze`,
++    {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: "{}",
++    },
++  );
++  if (!res.ok) throw await apiErrorFromResponse(res);
++}
++
++/**
++ * Whether a failed snooze is worth telling the user about. A 409 means the chat handed off, left
++ * work or has no context reading: the label is changing and the card goes by itself.
++ */
++export function aeSnoozeFailureIsQuiet(reason: unknown): boolean {
++  return reason instanceof ApiError && reason.status === 409;
++}
+diff --git a/web/src/lib/aeRoles.ts b/web/src/lib/aeRoles.ts
+index d15fd371668d9f01d663b3a53427c1204b7e35c0..38d905db704076792871ff1d816bea6b643b292e 100644
+--- a/web/src/lib/aeRoles.ts
++++ b/web/src/lib/aeRoles.ts
+@@ -205,11 +205,11 @@ export interface AeRolesDoc {
+   child_prompts?: boolean;
+   /** Let the lead pass an answer to a child's question; absent reads as on. */
+   child_relay?: boolean;
+-  /** Context tokens at which a top-level chat is asked to hand off to a fresh lead; 0 is off, absent reads as 300000. */
++  /** Context tokens at which a top-level chat shows a Compact card; 0 is off, absent reads as 300000. */
+   lead_handoff_tokens?: number | null;
+ }
+ 
+-/** The context size, in tokens, that asks a chat to hand off when the user never set one. */
++/** The context size, in tokens, that shows a chat the Compact card when the user never set one. */
+ export const AE_HANDOFF_DEFAULT_TOKENS = 300_000;
+ 
+ /** What `GET` and `PUT /v1/ae/roles` answer. */
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 6d1deb582b63ebebb315da07644c0e7f3d96f0a7..2b707c3ac7dc89dec05ac6f30fc142b4a1404b48 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -181,8 +181,8 @@ export const AE_SETTING_HINTS = {
+     source: "existing",
+   },
+   "family.handoff": {
+-    label: "Hand off at",
+-    hint: "A chat past this many thousand tokens is asked once to hand off to a fresh lead that takes over its sessions. Default: 300. Off: never.",
++    label: "Suggest compacting at",
++    hint: "Past this many thousand tokens, a chat shows a Compact card above the composer and in the rail. Default: 300. Off: never.",
+     source: "existing",
+   },
+   "chat.suggestion_keys": {
+diff --git a/web/src/pages/settings/AeChildPromptSettings.test.tsx b/web/src/pages/settings/AeChildPromptSettings.test.tsx
+index d9d3d59e47e963b618fcecde4a8bbb91e1bf61e8..5b614b3ce22a15b1c0bf4140613a59a9dfb837eb 100644
+--- a/web/src/pages/settings/AeChildPromptSettings.test.tsx
++++ b/web/src/pages/settings/AeChildPromptSettings.test.tsx
+@@ -106,12 +106,14 @@ describe("AeChildPromptSettings", () => {
+     await waitFor(() => expect(screen.getByTestId("ae-child-prompts-toggle")).not.toBeChecked());
+   });
+ 
+-  it("reads the hand off size as 300 and on when unset, and as off at 0", async () => {
++  it("reads the suggest-compacting size as 300 and on when unset, and as off at 0", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() => json(STATE));
+     mount();
+     const input = await screen.findByTestId("ae-handoff-tokens");
+     await waitFor(() => expect(screen.getByTestId("ae-handoff-toggle")).not.toBeDisabled());
+     expect(input).toHaveValue(300);
++    expect(input).toHaveAttribute("aria-label", "Suggest compacting at, in thousands of tokens");
++    expect(screen.getByTestId("ae-handoff").textContent).toContain("Suggest compacting at");
+     expect(screen.getByTestId("ae-handoff-toggle")).toBeChecked();
+     cleanup();
+     vi.mocked(authenticatedFetch).mockImplementation(() =>
+diff --git a/web/src/pages/settings/AeChildPromptSettings.tsx b/web/src/pages/settings/AeChildPromptSettings.tsx
+index 03f89928fa2f1f237d6437e0998f5f2bb2ede294..dc6dc312ca7738b2d727683c03a977f3ec612427 100644
+--- a/web/src/pages/settings/AeChildPromptSettings.tsx
++++ b/web/src/pages/settings/AeChildPromptSettings.tsx
+@@ -2,8 +2,8 @@
+ // saved with the user's roles on the server (`child_prompts` and `child_relay`, top level, not
+ // per preset), because the server mirrors the prompts and the relay tool checks the second.
+ // An unset value reads as on. Each row's one hint line is also the phone tooltip's text.
+-// The third row (2026-10-29) is "Hand off at": the context size, in thousands of tokens, past which
+-// a top-level chat is asked once to hand off to a fresh lead (`lead_handoff_tokens`, 0 is off).
++// The third row (2026-10-29) is "Suggest compacting at": the context size, in thousands of tokens,
++// past which a top-level chat shows a Compact card (`lead_handoff_tokens`, 0 is off).
+ 
+ import { QueryClientContext } from "@tanstack/react-query";
+ import { useContext, useId, useState } from "react";
+@@ -71,7 +71,7 @@ function Row({ field, hint, testId }: (typeof ROWS)[number]) {
+ const HANDOFF_MIN_K = 50;
+ const HANDOFF_MAX_K = 5000;
+ 
+-/** "Hand off at": an on/off switch and the size in thousands of tokens. */
++/** "Suggest compacting at": an on/off switch and the size in thousands of tokens. */
+ function HandoffRow() {
+   const roles = useAeRoles();
+   const save = useAeRolesSave();
+@@ -124,7 +124,7 @@ function HandoffRow() {
+             min={HANDOFF_MIN_K}
+             max={HANDOFF_MAX_K}
+             step={50}
+-            aria-label="Hand off at, in thousands of tokens"
++            aria-label="Suggest compacting at, in thousands of tokens"
+             aria-describedby={descriptionId}
+             value={draft ?? String(tokens / 1000)}
+             disabled={!state || saving}

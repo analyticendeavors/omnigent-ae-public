@@ -123,7 +123,7 @@ export function playIcon(): SVGElement {
   return decorative(Play, "icon-play", 16);
 }
 
-// Your move (2026-09-24): why a session waits on Reid, and a pull request's CI.
+// Your move (2026-09-24): why a session waits on the owner, and a pull request's CI.
 const WAIT_ICONS: Record<WaitKind, [IconNode, string]> = {
   gate: [Split, "open gate"],
   awaiting: [MessageCircleQuestion, "waiting on an answer"],
@@ -245,7 +245,7 @@ export function closeIcon(): SVGElement {
   return decorative(TABLER_X, "icon-close", 16);
 }
 
-// The pull request cards (2026-10-14, Reid: calmer cards): the head's icon
+// The pull request cards (2026-10-14, the owner: calmer cards): the head's icon
 // names the state in GitHub's colours (open green, draft grey, merged purple,
 // closed red), and each chip shows its tone as a shape, so colour is never the
 // only signal. Tabler outline icons, @tabler/icons 3.46.0.
@@ -572,4 +572,78 @@ const TABLER_CHART_BAR: IconNode = [
 
 export function chartBarIcon(size = 14): SVGElement {
   return decorative(TABLER_CHART_BAR, "icon-chart-bar", size);
+}
+
+// The Box health tile and its monitor (2026-10-28, boxHealth.ts): Tabler gauge.
+const TABLER_GAUGE: IconNode = [
+  ["path", { d: "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" }],
+  ["path", { d: "M11 12a1 1 0 1 0 2 0a1 1 0 1 0 -2 0" }],
+  ["path", { d: "M13.41 10.59l2.59 -2.59" }],
+  ["path", { d: "M7 12a5 5 0 0 1 5 -5" }],
+];
+
+export function gaugeIcon(size = 14): SVGElement {
+  return decorative(TABLER_GAUGE, "icon-gauge", size);
+}
+
+// The small info button on a setting's hint (2026-10-28, hint.ts): Tabler info-circle.
+const TABLER_INFO: IconNode = [
+  ["path", { d: "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" }],
+  ["path", { d: "M12 9h.01" }],
+  ["path", { d: "M11 12h1v4h1" }],
+];
+
+export function infoIcon(size = 14): SVGElement {
+  return decorative(TABLER_INFO, "icon-info", size);
+}
+
+// Tabler's `alert-triangle`, `circle-check` and `clock` outline icons,
+// @tabler/icons 3.46.0: the Box health card's worst-state pill and the queued
+// cleanup request's row (boxHealth.ts, 2026-10-29).
+const TABLER_ALERT_TRIANGLE: IconNode = [
+  ["path", { d: "M12 9v4" }],
+  [
+    "path",
+    {
+      d: "M10.363 3.591l-8.106 13.534a1.914 1.914 0 0 0 1.636 2.871h16.214a1.914 1.914 0 0 0 1.636 -2.87l-8.106 -13.536a1.914 1.914 0 0 0 -3.274 0z",
+    },
+  ],
+  ["path", { d: "M12 16h.01" }],
+];
+const TABLER_CIRCLE_CHECK: IconNode = [
+  ["path", { d: "M12 12m-9 0a9 9 0 1 0 18 0a9 9 0 1 0 -18 0" }],
+  ["path", { d: "M9 12l2 2l4 -4" }],
+];
+const TABLER_CLOCK: IconNode = [
+  ["path", { d: "M3 12a9 9 0 1 0 18 0a9 9 0 0 0 -18 0" }],
+  ["path", { d: "M12 7v5l3 3" }],
+];
+
+export function alertTriangleIcon(): SVGElement {
+  return decorative(TABLER_ALERT_TRIANGLE, "icon-alert", 15);
+}
+
+export function circleCheckIcon(): SVGElement {
+  return decorative(TABLER_CIRCLE_CHECK, "icon-circle-check", 15);
+}
+
+export function queuedClockIcon(): SVGElement {
+  return decorative(TABLER_CLOCK, "icon-queued", 16);
+}
+
+// Tabler's `circle-dashed` outline icon, @tabler/icons 3.46.0: the worst-state pill
+// when there is no reading (boxHealth.ts, 2026-10-29).
+const TABLER_CIRCLE_DASHED: IconNode = [
+  ["path", { d: "M8.56 3.69a9 9 0 0 0 -2.92 1.95" }],
+  ["path", { d: "M3.69 8.56a9 9 0 0 0 -.69 3.44" }],
+  ["path", { d: "M3.69 15.44a9 9 0 0 0 1.95 2.92" }],
+  ["path", { d: "M8.56 20.31a9 9 0 0 0 3.44 .69" }],
+  ["path", { d: "M15.44 20.31a9 9 0 0 0 2.92 -1.95" }],
+  ["path", { d: "M20.31 15.44a9 9 0 0 0 .69 -3.44" }],
+  ["path", { d: "M20.31 8.56a9 9 0 0 0 -1.95 -2.92" }],
+  ["path", { d: "M15.44 3.69a9 9 0 0 0 -3.44 -.69" }],
+];
+
+export function circleDashedIcon(): SVGElement {
+  return decorative(TABLER_CIRCLE_DASHED, "icon-circle-dashed", 15);
 }
