@@ -1,6 +1,6 @@
 """Pull request cards with a Merge button, built on upstream's per-session PR tracking.
 
-Added 2026-09-24. Reid works from his phone and merged every pull request by
+Added 2026-09-24. The owner works from their phone and merged every pull request by
 hand on github.com. The cards put CI, mergeability, reviews and a Merge button
 next to the session that opened the
 pull request (patch P11, the session's GitHub panel) and on the Dashboard
@@ -29,7 +29,7 @@ changes. The route re-checks it on a fresh read and pins the merge to the head
 SHA the card showed, so a push after the card was read is never merged unseen.
 
 Stale-while-revalidate (2026-09-26): the Dashboard opened in 3 to 5 seconds
-on Reid's phone because ``GET /v1/ae/prs`` awaited the tracked-PR scan (2321
+on the owner's phone because ``GET /v1/ae/prs`` awaited the tracked-PR scan (2321
 ms cold, 12 ms warm on the box) whenever the page had been closed for a
 minute. The scan and the list's cards are now served from what is held and
 refreshed in the background (:mod:`ae_omni_policies.swr`); only the first
@@ -63,6 +63,10 @@ CARD_TTL_S = 60.0
 REPO_TTL_S = 600.0
 # Which pull requests each session tracks; the scan is one loopback per session.
 SCAN_TTL_S = 60.0
+# A scan older than this is awaited anew, even when refreshes keep failing (2026-10-28).
+SCAN_MAX_STALE_S = 10 * 60.0
+# A non-admin may force a re-scan of their own sessions this seldom.
+FRESH_SCAN_GAP_S = 30.0
 # One person's sessions: the newest this many are scanned, this many at a time.
 MAX_SESSIONS = 40
 # 12 since 2026-09-26 (was 6): the loopbacks are cheap in-process reads, and
@@ -99,7 +103,11 @@ LoopbackGet = Callable[[str], Awaitable[httpx.Response]]
 
 _cards: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 _repos: dict[str, tuple[float, dict[str, Any]]] = {}
-_scan = SwrCache[None, dict[str, Any]]("pull request scan", SCAN_TTL_S)
+# One scan per caller (2026-10-28): the map is read as the caller, so a map kept for one
+# user must never answer another's request. ``None`` is a single-user runtime.
+_scan = SwrCache[str | None, dict[str, Any]](
+    "pull request scan", SCAN_TTL_S, max_stale_s=SCAN_MAX_STALE_S
+)
 # The list's background card reads (2026-09-26): one per card at most, the
 # last failure per card, and a generation that :func:`forget` bumps so a read
 # that started before a merge never stores the pre-merge card.
@@ -114,6 +122,7 @@ def reset_cache() -> None:
     _cards.clear()
     _repos.clear()
     _scan.reset()
+    _fresh_scans.clear()
     _card_generation += 1
     for task in list(_card_refreshes.values()):
         # RuntimeError: its loop is closed (a finished test).
@@ -305,7 +314,7 @@ def recommend_merge_method(
 ) -> tuple[str | None, str | None]:
     """The method a card recommends, and the one-line reason it shows.
 
-    Added 2026-09-28 at Reid's request: the confirm step preselected squash on
+    Added 2026-09-28 at the owner's request: the confirm step preselected squash on
     every card, and a squash is wrong when a pull request promotes one
     long-lived branch into another (dev into main, a release branch into
     main). Squashing that makes a new commit on the base that the head never
@@ -566,27 +575,83 @@ async def tracked_by_session(
     return by_url, errors, len(chosen)
 
 
-async def scan(fetch: LoopbackGet, *, fresh: bool = False) -> dict[str, Any]:
-    """The tracked-PR map, stale-while-revalidate (2026-09-26).
+async def scan(
+    fetch: LoopbackGet, *, fresh: bool = False, user: str | None = None
+) -> dict[str, Any]:
+    """The tracked-PR map for *user*, stale-while-revalidate (2026-09-26).
 
     Under :data:`SCAN_TTL_S` old it is served as is; older, it is served at
     once while one background scan replaces it; only the first scan after a
     server start is awaited. *fresh* awaits a scan (sharing one in flight).
     A background scan that fails keeps the last map and adds
-    ``refresh_error``.
+    ``refresh_error``. Only the sessions *user* may open are read, and the map
+    is kept per user (2026-10-28); ``None`` reads every session.
     """
 
     async def load() -> dict[str, Any]:
-        rows = await asyncio.to_thread(sessions.list_top_level)
+        rows = await asyncio.to_thread(lambda: sessions.list_top_level(accessible_by=user))
         by_url, errors, scanned = await tracked_by_session(rows, fetch)
         return {"by_url": by_url, "errors": errors, "scanned": scanned}
 
-    answer = await _scan.get(None, load, fresh=fresh)
-    failed = _scan.last_error(None)
+    answer = await _scan.get(user, load, fresh=fresh)
+    failed = _scan.last_error(user)
     return answer if failed is None else {**answer, "refresh_error": failed}
 
 
-async def open_pull_requests(fetch: LoopbackGet, *, fresh: bool = False) -> dict[str, Any]:
+def _matches(url: object, repo: str, number: int) -> bool:
+    parsed = parse_pull_url(url) if isinstance(url, str) else None
+    return parsed is not None and parsed == (repo.lower(), number)
+
+
+async def tracking_sessions(
+    fetch: LoopbackGet, repo: str, number: int, *, user: str | None, fresh: bool = False
+) -> list[str]:
+    """Ids of the sessions *user* may open (at scan time) that track pull request *number*.
+
+    From the per-user scan, which may be stale up to :data:`SCAN_MAX_STALE_S`: it says
+    where to look, never that access still holds; the caller checks that per session.
+    """
+    tracked = await scan(fetch, fresh=fresh, user=user)
+    return [
+        ref["id"]
+        for url, refs in tracked["by_url"].items()
+        if _matches(url, repo, number)
+        for ref in refs
+    ]
+
+
+async def session_tracks(fetch: LoopbackGet, session_id: str, repo: str, number: int) -> bool:
+    """Whether session *session_id* tracks the pull request, asked of its GitHub panel route."""
+    try:
+        response = await fetch(f"/v1/sessions/{session_id}/resources/github")
+        payload = response.json() if response.status_code < 300 else None
+    except (httpx.HTTPError, ValueError):
+        return False
+    entries = (payload.get("prs") if isinstance(payload, dict) else None) or []
+    return any(isinstance(e, dict) and _matches(e.get("url"), repo, number) for e in entries)
+
+
+_fresh_scans: dict[str | None, float] = {}
+
+
+def fresh_scan_allowed(user: str | None) -> bool:
+    """Whether *user* may force a re-scan now: one per :data:`FRESH_SCAN_GAP_S` (2026-10-28).
+
+    Call :func:`note_fresh_scan` when the scan finishes; a failed or empty scan that
+    never got that far does not use up the gap.
+    """
+    last = _fresh_scans.get(user)
+    return last is None or time.monotonic() - last >= FRESH_SCAN_GAP_S
+
+
+def note_fresh_scan(user: str | None) -> None:
+    """Record that *user*'s forced re-scan has finished."""
+    _fresh_scans[user] = time.monotonic()
+
+
+async def open_pull_requests(
+    fetch: LoopbackGet, *, fresh: bool = False, user: str | None = None
+) -> dict[str, Any]:
     """``GET /v1/ae/prs``: every open pull request any session tracks, as cards.
 
     Always a 200 when the token is set: a session that could not be read and a
@@ -596,7 +661,7 @@ async def open_pull_requests(fetch: LoopbackGet, *, fresh: bool = False) -> dict
     settings = github.GitHubSettings.from_env()
     if not settings.configured:
         return {"configured": False, "note": NOT_CONFIGURED, "items": [], "errors": []}
-    tracked = await scan(fetch, fresh=fresh)
+    tracked = await scan(fetch, fresh=fresh, user=user)
     errors: list[dict[str, Any]] = [
         {"session_id": row["session_id"], "message": f"session not read: {row['message']}"}
         for row in tracked["errors"]
@@ -656,9 +721,11 @@ __all__ = [
     "NOT_CONFIGURED",
     "ci_summary",
     "forget",
+    "fresh_scan_allowed",
     "merge_gate",
     "merge_methods",
     "mergeability",
+    "note_fresh_scan",
     "open_pull_requests",
     "parse_pull_url",
     "read_card",
@@ -666,6 +733,8 @@ __all__ = [
     "reset_cache",
     "review_summary",
     "scan",
+    "session_tracks",
     "tracked_by_session",
+    "tracking_sessions",
     "valid_repo",
 ]

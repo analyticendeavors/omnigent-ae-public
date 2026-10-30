@@ -3,7 +3,7 @@
 // 5-hour and weekly use, from `GET /v1/ae/limits/accounts`
 // (ae_omni_policies/limits.py, "Per account").
 //
-// Why: Reid runs several Claude logins and one Codex login, and usage was
+// Why: the owner runs several Claude logins and one Codex login, and usage was
 // visible only per session (the rail's Usage card), so the account nearest its
 // limit was found by opening sessions one by one. This card is the one place
 // that says which account has room.

@@ -10,7 +10,7 @@ request always win; that merge is :func:`resolve`'s last step.
 
 The preset comes from ``omnigent.inner.ae_roles.resolve_roles`` (same server
 process), so a session's own ``ae.team`` choice counts. With no parent session the
-owner's default preset applies. A standalone chat (a handoff the lead opens for Reid,
+owner's default preset applies. A standalone chat (a handoff the lead opens for the owner,
 2026-10-25) is no one's helper: its role comes from the preset it opens on, and the
 opener only lends its own model and effort to a ``session`` role.
 """

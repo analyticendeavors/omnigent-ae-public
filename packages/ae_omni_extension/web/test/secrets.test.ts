@@ -399,7 +399,7 @@ const chipsOf = (node: ParentNode) =>
   [...node.querySelectorAll<HTMLElement>(".secret-chip")].map((chip) => chip.dataset.key);
 
 describe("collapsed and open", () => {
-  it("starts collapsed with one green line when nothing needs Reid", () => {
+  it("starts collapsed with one green line when nothing needs the owner", () => {
     const node = card(status());
     expect(groupsOf(node)?.hidden).toBe(true);
     expect(toggleOf(node)?.getAttribute("aria-expanded")).toBe("false");
@@ -423,7 +423,7 @@ describe("collapsed and open", () => {
     expect(isOpen("secrets-keys", true)).toBe(false);
   });
 
-  it("chips only the keys that need Reid, worst first, and links each to Rotate", () => {
+  it("chips only the keys that need the owner, worst first, and links each to Rotate", () => {
     const answer = status(["POSTGRES_PASSWORD", "AE_DATABRICKS_CLIENT_ID"], {
       AE_GITHUB_TOKEN: { expiry_state: "soon", days_left: 21 },
     });
@@ -440,7 +440,7 @@ describe("collapsed and open", () => {
     expect(node.querySelector(".secret-okline")).toBeNull();
   });
 
-  it("names the nearest expiry when nothing needs Reid", () => {
+  it("names the nearest expiry when nothing needs the owner", () => {
     const answer = status([], {
       AE_GITHUB_TOKEN: { expiry_state: "ok", expires: "2027-05-15T00:00:00Z", days_left: 203 },
     });
@@ -543,5 +543,50 @@ describe("issuer dates", () => {
     expect(fromText({ ...row, expiry_from: "github" })).toBe("from GitHub");
     expect(fromText({ ...row, expiry_from: "vault" })).toBeNull();
     expect(fromText({ ...row, expiry_state: "none" })).toBeNull();
+  });
+});
+
+describe("a signed-in non-admin (2026-10-28)", () => {
+  it("gets one quiet line and no more reads", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+    const { context, request } = stubContext([denied, denied]);
+    const node = await mount(context);
+    expect(node.textContent).toContain("The box's secrets are for admins.");
+    expect(notices(node)).toEqual([]);
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a false admin_only answer (2026-10-28)", () => {
+  it("is looked at again after five minutes and the card comes back on a 200", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+    const { context, request } = stubContext([denied, ok(status())]);
+    const node = await mount(context);
+    expect(node.textContent).toContain("for admins");
+    vi.setSystemTime(NOW + 4 * 60_000);
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(request).toHaveBeenCalledTimes(1);
+    vi.setSystemTime(NOW + 5 * 60_000 + 1000);
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(node.textContent).not.toContain("for admins");
+  });
+});
+
+describe("the secrets look-again timer (2026-10-28)", () => {
+  it("reads once more five minutes after admin_only with no focus event", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "no" } } };
+    const { context, request } = stubContext([denied, ok(status())]);
+    const node = await mount(context);
+    expect(node.textContent).toContain("for admins");
+    await vi.advanceTimersByTimeAsync(4 * 60_000);
+    expect(request).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(61_000);
+    expect(request).toHaveBeenCalledTimes(2);
+    expect(node.textContent).not.toContain("for admins");
   });
 });

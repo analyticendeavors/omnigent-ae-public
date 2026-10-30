@@ -8,7 +8,7 @@ from pathlib import Path
 import httpx
 import pytest
 
-from ae_omni_policies import auth, secrets_health, secrets_meta
+from ae_omni_policies import secrets_health, secrets_meta
 
 PULL_SECRETS = Path(__file__).resolve().parents[3] / "deploy" / "pull-secrets.sh"
 SENTINEL = "sentinel-secret-value-7f3a"
@@ -210,11 +210,14 @@ async def test_route_reads_the_server_environment(
     assert optional == want
 
 
-async def test_route_needs_an_identity(
-    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+async def test_route_needs_an_identity_and_an_admin(
+    client: httpx.AsyncClient, ae_admins: set[str]
 ) -> None:
-    monkeypatch.delenv("OMNIGENT_LOCAL_SINGLE_USER")
-    auth.reset_provider_cache()
     assert (await client.get("/v1/ae/secrets")).status_code == 401
-    reid = {"X-Forwarded-Email": "reid@example.com"}
-    assert (await client.get("/v1/ae/secrets", headers=reid)).status_code == 200
+    owner = {"X-Forwarded-Email": "owner@example.com"}
+    member = {"X-Forwarded-Email": "member@example.com"}
+    assert (await client.get("/v1/ae/secrets", headers=owner)).status_code == 200
+    # Key names say which services the box uses: an admin's page (2026-10-28).
+    refused = await client.get("/v1/ae/secrets", headers=member)
+    assert refused.status_code == 403
+    assert refused.json()["error"]["code"] == "admin_only"

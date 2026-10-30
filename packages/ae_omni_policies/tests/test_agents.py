@@ -39,7 +39,7 @@ EXPECTED = {
             "schedule_checkin",
             "list_prs",
             "set_session_model",
-            "ask_reid",
+            "ask_user",
         ],
     ),
 }
@@ -183,17 +183,17 @@ async def test_builtin_agent_dirs_registers_the_shipped_agents(
     assert "reviewer-codex" not in rows, "off by default: not in the documented env line"
 
 
-def test_the_orchestrator_prompt_carries_reids_rules() -> None:
+def test_the_orchestrator_prompt_carries_the_owners_rules() -> None:
     """Four lines, a full URL for every pull request, pop-ups, never a merge."""
     text = (AGENTS / "orchestrator" / "agent.yaml").read_text(encoding="utf-8")
     for rule in (
         "At most four short lines",
         "give its full URL exactly as a",
-        "ask_reid",
+        "ask_user",
         "the recommended one first",
         "You never merge",
         "never print or store a token",
-        "Never call ask_reid in a scheduled",
+        "Never call ask_user in a scheduled",
         "If gh.available is",
     ):
         assert rule in text, rule

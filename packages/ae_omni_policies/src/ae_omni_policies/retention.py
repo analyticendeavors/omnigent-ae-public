@@ -3,7 +3,7 @@
 Every firing of a scheduled task starts a new session. The steward and the
 shutdown note fire every weekday, so about ten sessions a week piled up in the
 sidebar, all left in ``reference`` or archived, with nothing to reuse or prune
-them. Reid decided on 2026-10-13: after a task fires, keep its newest
+them. The owner decided on 2026-10-13: after a task fires, keep its newest
 ``keep_runs`` run sessions (5 by default, one working week, a per-task field on
 ``/v1/scheduled-tasks``) and delete older ones that are safe to delete.
 
@@ -23,7 +23,7 @@ deleted only when :func:`keep_reason` finds no reason to keep it:
 - it has an approval outstanding, or an open gate (``ae.gate=open``);
 - its ``ae.status`` is ``working``, ``blocked``, ``review`` or ``parked``, or
   it is neither ``reference`` nor archived;
-- its title is no longer the task's name: Reid renamed it, so he kept it.
+- its title is no longer the task's name: the owner renamed it, so they kept it.
 
 No migration: the first firing after deploy walks every run row the task has,
 so the existing backlog goes under the same rules. A task with

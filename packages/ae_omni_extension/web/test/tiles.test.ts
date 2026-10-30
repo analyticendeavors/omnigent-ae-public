@@ -77,7 +77,7 @@ const hold = (over: Partial<DeployHold> = {}): DeployHold => ({
   held: true,
   until: new Date(NOW + 110 * 60_000).toISOString(),
   set_at: new Date(NOW - 70 * 60_000).toISOString(),
-  set_by: "reid",
+  set_by: "Owner",
   remaining_s: 110 * 60,
   choices: [1, 2, 3],
   error: null,
@@ -324,7 +324,7 @@ describe("the board", () => {
   const cards = () =>
     Object.fromEntries(
       (
-        ["deploys", "accounts", "compute", "credit", "azure", "box", "vault", "git", "presets"] as CardId[]
+        ["deploys", "accounts", "compute", "credit", "azure", "box", "vault", "git", "presets", "family"] as CardId[]
       ).map((id) => [
         id,
         adminCard(
@@ -357,20 +357,20 @@ describe("the board", () => {
     expect(columns(board)).toEqual(LAYOUTS[3]);
     // Box health sits under Deploys and Databricks credit under Azure spend (2026-10-22);
     // Key Vault under Box health (2026-10-23); Git repos last in a column (2026-10-24);
-    // Presets right after Deploys (2026-10-24).
+    // Presets right after Deploys (2026-10-24); Family cost right after Presets (2026-10-29).
     expect(columns(board)).toEqual([
-      ["deploys", "presets", "box", "vault"],
+      ["deploys", "presets", "family", "box", "vault"],
       ["accounts", "compute"],
       ["azure", "credit", "git"],
     ]);
     arrange(board, all, 2);
     expect(columns(board)).toEqual([
-      ["deploys", "presets", "box", "compute", "git"],
+      ["deploys", "presets", "family", "box", "compute", "git"],
       ["accounts", "azure", "credit", "vault"],
     ]);
     arrange(board, all, 1);
     expect(columns(board)).toEqual([
-      ["deploys", "presets", "accounts", "compute", "credit", "azure", "box", "vault", "git"],
+      ["deploys", "presets", "family", "accounts", "compute", "credit", "azure", "box", "vault", "git"],
     ]);
     arrange(board, all, 3);
     // Every card is open on a wide page, and its header is not a toggle.

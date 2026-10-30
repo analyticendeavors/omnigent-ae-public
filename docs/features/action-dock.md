@@ -40,14 +40,21 @@ A lead that starts other sessions used to leave their questions and tool permiss
 **Where:** The strip and its list in the lead's chat; Settings > General > Sessions.<br>
 **Built from:** core patches [`0210`](../../patches/0210-ae-patch-Show-a-session-s-questions-and-prompts-in-i.patch), [`0211`](../../patches/0211-ae-patch-Park-an-MCP-server-s-own-question-as-a-pend.patch), [`0218`](../../patches/0218-ae-patch-Tell-registered-observers-when-the-server-a.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
+## Compact a big chat
+
+A chat that grows past 300,000 tokens of context re-reads all of it on every turn, and a chat on a 1M-context model does not compact before about 1M. The token audit of 2026-10-29 found eight leads past 300k (one at 863k) and put lead chats at 28% of the box's Claude spend. So a top-level Claude chat you opened (no parent, not a fork or side chat, with or without children, and working or blocked: a chat in review, parked or a reference is left alone) shows a card once its context passes the size in Settings > General > Sessions > "Suggest compacting at" (thousands of tokens, 300 by default, the switch turns it off). The card sits in the dock above the composer and says "This chat is at 370k tokens. Every reply re-reads all of it."; the rail's Context section shows it on one line ("370k tokens, re-read on every reply."), with the full sentence in its tooltip. Nothing is posted into the chat. Compact asks twice, then sends `/compact` to the chat, and is disabled while the chat is running; it also snoozes the card. Not now snoozes it alone, and a snoozed chat (even one that went to review and came back) waits for the context to grow another 100,000 tokens before the card returns. The card goes away when the context falls back under the size. The size is read from the chat's last context reading and used only when it is under 30 minutes old. A new chat is never suggested; the `hand_off` tool and `POST /v1/ae/sessions/{id}/handoff` stay for when you ask for one.
+
+**Where:** The strip above the composer and the rail's Context section; Settings > General > Sessions, "Suggest compacting at".<br>
+**Built from:** core patches [`0246`](../../patches/0246-ae-patch-Add-the-Hand-off-at-setting-the-context-siz.patch), [`0250`](../../patches/0250-ae-patch-Show-a-Compact-card-above-the-composer-and-.patch), [`0260`](../../patches/0260-ae-patch-Keep-the-rail-s-compact-warning-on-one-line.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies) (`lead_handoff.py` for the sweep and the finishing steps, the routes `POST /v1/ae/sessions/{id}/handoff` and `/handoff/snooze` in `router.py`, the `hand_off` tool in `mcp.py`)
+
 ## One button per choice
 
 <p align="center"><img src="../media/dock-child-choice.jpg" alt="One button per choice"></p>
 
-A prompt that asks for one choice from a short list, such as an MCP server asking you to confirm a change, shows one button per answer instead of a dropdown and Submit. The buttons drop the words every answer shares at the end, so "Continue the operation" and "Decline the operation" read Continue and Decline, and the full wording stays in the tooltip. A Reject button still shows unless one of the choices already declines (a value or label starting with no, decline, cancel, deny or reject). A form with more fields, an optional field or more than four values keeps its usual controls.
+A prompt that asks for one choice from a short list, such as an MCP server asking you to confirm a change, shows one button per answer instead of a dropdown and Submit. The buttons drop the words every answer shares at the end, so "Continue the operation" and "Decline the operation" read Continue and Decline, and the full wording stays in the tooltip. A Reject button still shows unless one of the choices already declines (a value or label starting with no, decline, cancel, deny or reject). When an answer is a long sentence, its button shows the words before the first colon, or the start cut at a whole word, and the full answer stays in the tooltip; two answers that would then read the same keep their full labels. A form with more fields, an optional field or more than four values keeps its usual controls.
 
 **Where:** Any approval card or dock prompt that asks for a single required choice.<br>
-**Built from:** core patch [`0213`](../../patches/0213-ae-patch-Show-a-single-choice-form-prompt-as-one-but.patch)
+**Built from:** core patches [`0213`](../../patches/0213-ae-patch-Show-a-single-choice-form-prompt-as-one-but.patch), [`0234`](../../patches/0234-ae-patch-Show-a-long-approval-answer-as-its-first-cl.patch), [`0235`](../../patches/0235-ae-patch-Keep-distinct-approval-answers-distinct-whe.patch)
 
 ## Usage gate
 
@@ -57,6 +64,15 @@ When the account a chat runs on reaches 90% of its 5-hour or weekly limit, the d
 
 **Where:** The strip and the opened list, in a Claude Code or Codex chat near a plan limit.<br>
 **Built from:** core patches [`0142`](../../patches/0142-ae-patch-Show-a-usage-limit-item-in-the-action-dock-.patch), [`0209`](../../patches/0209-ae-patch-Switch-a-Claude-chat-s-login-in-place-and-k.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
+
+## Every usage window on hover
+
+<p align="center"><img src="../media/dock-limit-hover.webp" alt="Every usage window on hover"></p>
+
+Hover the limit icon at the start of the usage gate's line, or tap it on a phone, and a card lists every window of that login: the 5-hour limit, the weekly limit for all models and each per-model weekly limit, each with a bar, its percentage and when it resets. The window that raised the warning is tagged limit. A window whose reset time has already passed is left out, so the card never shows an old reading. A second tap closes it.
+
+**Where:** The limit icon on the usage gate's line in the action dock.<br>
+**Built from:** core patches [`0221`](../../patches/0221-ae-patch-Show-every-usage-window-in-a-hover-card-on-.patch), [`0222`](../../patches/0222-ae-patch-Make-the-limit-hover-card-readable-by-scree.patch), [`0223`](../../patches/0223-ae-patch-Fix-the-lint-error-in-the-limit-hover-card-.patch)
 
 ## Every open pull request with its state
 

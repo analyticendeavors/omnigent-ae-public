@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Deploy the newest ae-v* image tag on the box by itself, with a health check
 # and a rollback. Run every ten minutes by the user timer
-# deploy/systemd/user/ae-omnigent-auto-update.timer, as reid, no sudo.
+# deploy/systemd/user/ae-omnigent-auto-update.timer, as the deploy user, no sudo.
 # Added 2026-09-24 so that pushing a tag is the whole release: before this,
 # every release ended with a sudo line typed on the box, which a three-week
 # trip with only a laptop cannot rely on.
@@ -61,11 +61,11 @@ set -euo pipefail
 # deploy hold on removes the wait's files, so once the hold ends busy sessions
 # get a fresh two hours: a hold is a pause too.
 #
-# What it needs: reid in the docker group and logged in to ghcr.io
+# What it needs: the deploy user in the docker group and logged in to ghcr.io
 # (`docker login ghcr.io`, once; compose pulls with the invoking user's
 # credentials, and root's login does not help a user unit), read access to
-# /secure/env/omnigent-ae.env (640 root:reid, for compose.sh), and a checkout
-# reid owns. It never reads a secret itself and never calls sudo.
+# /secure/env/omnigent-ae.env (640 root:<user>, for compose.sh), and a checkout
+# the deploy user owns. It never reads a secret itself and never calls sudo.
 
 # shellcheck source=scripts/_lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../scripts/_lib.sh"
@@ -382,7 +382,7 @@ read_deploy_hold() {
 # end in HOLD_UNTIL, who set it in HOLD_BY), else 1. The hold lives in the
 # server's /data volume, under /secure/omnigent on the box, which is
 # root-only, so this user unit cannot read the file directly; it asks the
-# running server's own CLI through compose.sh exec instead (reid is in the
+# running server's own CLI through compose.sh exec instead (the deploy user is in the
 # docker group, like the busy count and run_dump). Only the last line of
 # stdout counts, since the import may print first. It fails open, like the
 # busy count: a read that fails, times out after BUSY_TIMEOUT seconds or
@@ -494,8 +494,8 @@ finish() {
 }
 
 # run_dump: a pg_dump of the running database on stdout. Same command as
-# deploy/backup-omnigent.sh, through compose.sh exec, which reid can run
-# without sudo (docker group, 640 root:reid secrets) exactly like the up -d
+# deploy/backup-omnigent.sh, through compose.sh exec, which the deploy user can run
+# without sudo (docker group, 640 root:<user> secrets) exactly like the up -d
 # below. The single quotes are deliberate: the variables expand inside the
 # container.
 run_dump() {
@@ -511,7 +511,7 @@ run_dump() {
 # so before a deploy that may migrate, the database as the running tag left it
 # goes to $DUMP_DIR/omnigent-<UTC stamp>-<running tag>.sql.gz, newest
 # $DUMP_KEEP kept. Not /secure/omnigent/backups: that is root-only and this
-# runs as reid. Restore: deploy/README.md, "Rollback".
+# runs as the deploy user. Restore: deploy/README.md, "Rollback".
 dump_db() {
   local stamp out tmp old f
   mkdir -p "$DUMP_DIR"
@@ -547,7 +547,7 @@ dump_db() {
   note "dumped the database to $out before the upgrade; ${#old[@]} older dump(s) removed"
 }
 
-[ -w "$SETTINGS" ] || die "cannot write $SETTINGS. Copy config/server.env.example to config/server.env as reid (deploy/README.md, step 3)."
+[ -w "$SETTINGS" ] || die "cannot write $SETTINGS. Copy config/server.env.example to config/server.env as the deploy user (deploy/README.md, step 3)."
 FROM="$(setting OMNIGENT_IMAGE_TAG)"
 [ -n "$FROM" ] || die "$SETTINGS has no OMNIGENT_IMAGE_TAG line; add the running tag (deploy/README.md, step 3)."
 IMAGE="$(setting AE_IMAGE)"
@@ -566,7 +566,7 @@ fi
 retry_host_pending
 
 run_git fetch --quiet --tags origin \
-  || fail fetch-failed "git fetch origin failed in $REPO: $GIT_ERROR (ssh -T git@github.com as reid tests the deploy key)"
+  || fail fetch-failed "git fetch origin failed in $REPO: $GIT_ERROR (ssh -T git@github.com as the deploy user tests the deploy key)"
 
 PIN="$(cat "$STATE_DIR/pin" 2>/dev/null || true)"
 if [ -n "$PIN" ]; then
@@ -622,7 +622,7 @@ if ! pull_out="$(docker pull --quiet "$IMAGE:$TO" 2>&1)"; then
       finish waiting "$IMAGE:$TO is not published yet (image.yml still running?)"
       ;;
     *)
-      fail pull-failed "docker pull $IMAGE:$TO: $(printf '%s' "$pull_out" | tr '\n' ' ') (not logged in? docker login ghcr.io as reid, deploy/README.md \"Automatic updates\")"
+      fail pull-failed "docker pull $IMAGE:$TO: $(printf '%s' "$pull_out" | tr '\n' ' ') (not logged in? docker login ghcr.io as the deploy user, deploy/README.md \"Automatic updates\")"
       ;;
   esac
 fi

@@ -4,11 +4,11 @@ Written 2026-09-24, against `main` at `d0c05c0` (upstream pinned at `v0.13.0`, p
 P1 to P6), with upstream `v0.15.0` read from the sync branch
 (https://github.com/analyticendeavors/omnigent-ae/pull/27, open on this date).
 
-Why: on 2026-09-24 Reid said the AE layer's navigation feels incongruent (Your move,
+Why: on 2026-09-24 the owner said the AE layer's navigation feels incongruent (Your move,
 Parking Lot and Slots are three separate entries for one idea), the slot count should
 be visible everywhere including the phone, the difference between "Parked sessions"
 and the "Parking Lot" is unclear, and the lot page is one long scroll with Reference
-at the bottom. He asked for a holistic review before more features land. This page is
+at the bottom. They asked for a holistic review before more features land. This page is
 that review and the plan it leads to.
 
 Screenshots: the dashboard-review screenshot set (removed before publication), taken from a real server
@@ -44,13 +44,13 @@ session page, and nothing at all on a session page on the phone
 
 ## 2. Problems
 
-### Reid's four
+### The owner's four
 
 1. **Three nav entries for one feature.** "Your move", "Parking Lot" and "Slots 3/3"
    sit next to each other (`desktop-1440x900-nav.png`); two of them open the same page
    (Slots links to the Parking Lot), and the third opens a page whose summary is also
    a block on the second. The feature is the WIP system as a whole: what is running,
-   what waits on Reid, what is parked, what is closed. It has one home, so it gets one
+   what waits on the owner, what is parked, what is closed. It has one home, so it gets one
    entry.
 2. **Slots are not visible where work happens.** The count lives in the sidebar and on
    the lot page. On the phone the sidebar is a drawer, so on a session (where the
@@ -192,9 +192,9 @@ composer, not to a host route. So an approval keeps its card and Open.)
 - the Dashboard's strip.
 
 A fourth: the installed web app's icon badge (`navigator.setAppBadge(slots)`,
-supported by Safari on iOS 16.4 and later for Home Screen apps, which is how Reid
+supported by Safari on iOS 16.4 and later for Home Screen apps, which is how the owner
 opens it on the phone). It needs notification permission on iOS. First proposed as a
-later decision; Reid asked for it the same day, and it shipped as patch P8.
+later decision; the owner asked for it the same day, and it shipped as patch P8.
 
 ### Desktop mockup (1440 wide, sidebar open)
 
@@ -264,7 +264,7 @@ inside the patch are free by rule 1 of `CLAUDE.md`.
 | One nav entry (drop the extension's two nav rows; P1's row becomes "Dashboard n/3") | extension + P7 | 0 now, **-4** at the next sync | the extension contributes no nav row; P7 relabels `AeSlotsPill.tsx` (an AE file). P1's 4-line icon edit to `ExtensionPrimaryNavigation.tsx` loses its user and is dropped when the next sync rebuilds the fork branch (built 2026-09-24 as P7 rather than an amendment to P1, so the published branch was not rewritten) |
 | Session header chip (status plus `n/3`, tap opens the Dashboard) | patch P1 | +2 in `ChatHeader.tsx` (the import and the element in the right cluster, before `PresenceAvatars`) | new file `AeSessionChip.tsx` reusing `useAeSlotCount` and `aeDisplayStatus`; v0.15.0 moved mobile viewer avatars into the session menu (https://github.com/omnigent-ai/omnigent/pull/7987), which frees exactly that space on the phone |
 | Approvals: no second copy of upstream's Inbox | extension | 0 | not possible yet: the SDK has no navigation to a host route such as `/inbox`, so an approval keeps its Your move card with Open; if upstream adds route navigation, the card becomes one line to the Inbox |
-| App icon badge | P8 | 0 | built 2026-09-24 at Reid's request: `lib/aeAppBadge.ts` and one effect in `AeSlotsPill.tsx` |
+| App icon badge | P8 | 0 | built 2026-09-24 at the owner's request: `lib/aeAppBadge.ts` and one effect in `AeSlotsPill.tsx` |
 
 Net: the patch series grows by 2 upstream lines now and shrinks by 4 at the next sync; nothing new needs a
 patch except the header chip. No prompt rule is added (rule 4); "Park" always leaving
@@ -301,14 +301,14 @@ something the agent is told.
    rather than an amendment to P1, because amending P1 would rewrite the published
    fork branch; P1's four-line icon edit to `ExtensionPrimaryNavigation.tsx` stays
    until the next sync rebuilds the branch, and is dropped then (it has no user).
-3. The app icon badge, asked for by Reid the same day: patch P8, no upstream file
+3. The app icon badge, asked for by the owner the same day: patch P8, no upstream file
    touched (`navigator.setAppBadge` from the sidebar row, cleared at zero; on iOS it
    needs the notification permission upstream already requests).
 
 ## 7. Addendum, 2026-09-25: the lot and the header after a day of use
 
-Reid's feedback (https://github.com/analyticendeavors/omnigent-ae/issues/28), mostly
-from his phone. The lot card showed two grey tags and "+1" with room to spare; it now
+The owner's feedback (https://github.com/analyticendeavors/omnigent-ae/issues/28), mostly
+from their phone. The lot card showed two grey tags and "+1" with room to spare; it now
 shows every tag in task-store's own colour and icon, and the repository on the
 collapsed card. The lot gains a search field and a filter sheet (quadrant, overdue or
 this week, tag, repo), remembered per device. This revises one line of section 5:

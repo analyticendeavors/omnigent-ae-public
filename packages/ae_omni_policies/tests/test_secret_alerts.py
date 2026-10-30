@@ -18,11 +18,11 @@ from ae_omni_policies import (
     vault_inventory,
 )
 
-REID = {"X-Forwarded-Email": "reid@example.com"}
-STEVE = {"X-Forwarded-Email": "steve@example.com"}
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
+MEMBER = {"X-Forwarded-Email": "member@example.com"}
 # 05:00 in Los Angeles, before the 09:00 alarm.
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
-APP_ID = "6daa04d7-48f1-4a76-942f-4b92e6ce7542"
+APP_ID = "00000000-0000-0000-0000-000000000001"
 CFG = secret_alerts.Config(
     on=True, off_reason=None, list_name="AE Work", time="09:00", tz="America/Los_Angeles"
 )
@@ -301,12 +301,12 @@ async def test_the_card_shows_the_open_alert_and_the_next_alarm() -> None:
     got = vault_inventory.view(
         reading,
         NOW,
-        owners={f"{BOX}/b": "reid@example.com"},
+        owners={f"{BOX}/b": "owner@example.com"},
         alerts=secret_alerts.infos(state),
     )
     rows = {row.name: row for row in got.vaults[0].secrets}
     assert rows["a"].alert is not None and rows["a"].alert.stage == "30"
-    assert rows["a"].owner is None and rows["b"].owner == "reid@example.com"
+    assert rows["a"].owner is None and rows["b"].owner == "owner@example.com"
     assert got.vaults[0].counts.no_owner == 1
     [need] = got.vaults[0].needs_you
     assert (need.name, need.alarm_at) == ("a", "2026-10-23T16:00:00Z")
@@ -317,17 +317,17 @@ async def test_the_card_shows_the_open_alert_and_the_next_alarm() -> None:
 
 
 def test_owner_names_read_from_the_id() -> None:
-    assert secret_owners.display_name("reid.havens@example.com") == "Reid Havens"
+    assert secret_owners.display_name("owner.person@example.com") == "Owner Person"
     assert secret_owners.display_name("example_owner@example.com") == "Example Owner"
     assert secret_owners.display_name("@x") == "@x"
 
 
 def test_the_owner_file_sets_and_clears(tmp_path: Path) -> None:
     owners = secret_owners.SecretOwnersStore(tmp_path / "owners.json")
-    owners.set(BOX, ["a", "b"], "steve@example.com")
+    owners.set(BOX, ["a", "b"], "member@example.com")
     owners.set(BOX, ["b"], None)
     again = secret_owners.SecretOwnersStore(tmp_path / "owners.json")
-    assert again.read() == {f"{BOX}/a": "steve@example.com"}
+    assert again.read() == {f"{BOX}/a": "member@example.com"}
     assert again.writable and not secret_owners.SecretOwnersStore(None).writable
 
 
@@ -348,26 +348,26 @@ async def test_the_owner_route_is_admin_only_and_checks_names(
     client: httpx.AsyncClient, ae_admins: set[str]
 ) -> None:
     _seed_reading()
-    body = {"vault": BOX, "names": ["a", "b"], "owner": "steve@example.com"}
-    assert (await client.post("/v1/ae/vault/owner", json=body, headers=STEVE)).status_code == 403
-    got = await client.post("/v1/ae/vault/owner", json=body, headers=REID)
+    body = {"vault": BOX, "names": ["a", "b"], "owner": "member@example.com"}
+    assert (await client.post("/v1/ae/vault/owner", json=body, headers=MEMBER)).status_code == 403
+    got = await client.post("/v1/ae/vault/owner", json=body, headers=OWNER)
     assert got.status_code == 200, got.text
     assert got.json() == {
         "updated": 2,
-        "owners": {"a": "steve@example.com", "b": "steve@example.com"},
+        "owners": {"a": "member@example.com", "b": "member@example.com"},
     }
     unknown = {"vault": WEB, "names": ["a"], "owner": None}
-    refused = await client.post("/v1/ae/vault/owner", json=unknown, headers=REID)
+    refused = await client.post("/v1/ae/vault/owner", json=unknown, headers=OWNER)
     assert refused.status_code == 400 and "not in kv-example-web" in refused.text
-    bad = {"vault": BOX, "names": ["a"], "owner": "steve"}
-    assert (await client.post("/v1/ae/vault/owner", json=bad, headers=REID)).status_code == 400
+    bad = {"vault": BOX, "names": ["a"], "owner": "member"}
+    assert (await client.post("/v1/ae/vault/owner", json=bad, headers=OWNER)).status_code == 400
     cleared = await client.post(
-        "/v1/ae/vault/owner", json={"vault": BOX, "names": ["b"], "owner": None}, headers=REID
+        "/v1/ae/vault/owner", json={"vault": BOX, "names": ["b"], "owner": None}, headers=OWNER
     )
     assert cleared.json()["owners"] == {"b": None}
-    view = (await client.get("/v1/ae/vault", headers=REID)).json()
+    view = (await client.get("/v1/ae/vault", headers=OWNER)).json()
     rows = {row["name"]: row for row in view["vaults"][0]["secrets"]}
-    assert rows["a"]["owner"] == "steve@example.com" and rows["b"]["owner"] is None
+    assert rows["a"]["owner"] == "member@example.com" and rows["b"]["owner"] is None
     assert view["vaults"][0]["counts"]["no_owner"] == 1
     assert view["owners_editable"] is False
     assert view["alerts"]["on"] is False
@@ -382,20 +382,20 @@ async def test_the_people_route_passes_on_ids_only(
             200,
             json={
                 "users": [
-                    {"id": "reid@example.com", "is_admin": True, "last_login_at": "x"},
-                    {"id": "steve@example.com", "is_admin": False},
+                    {"id": "owner@example.com", "is_admin": True, "last_login_at": "x"},
+                    {"id": "member@example.com", "is_admin": False},
                     {"no_id": True},
                 ]
             },
         )
 
     monkeypatch.setattr(shared_accounts_routes, "ask_as_caller", users)
-    assert (await client.get("/v1/ae/vault/people", headers=STEVE)).status_code == 403
-    got = await client.get("/v1/ae/vault/people", headers=REID)
+    assert (await client.get("/v1/ae/vault/people", headers=MEMBER)).status_code == 403
+    got = await client.get("/v1/ae/vault/people", headers=OWNER)
     assert got.json() == {
         "users": [
-            {"id": "reid@example.com", "is_admin": True},
-            {"id": "steve@example.com", "is_admin": False},
+            {"id": "owner@example.com", "is_admin": True},
+            {"id": "member@example.com", "is_admin": False},
         ]
     }
 
@@ -403,7 +403,7 @@ async def test_the_people_route_passes_on_ids_only(
         return httpx.Response(404, json={"detail": "Not Found"})
 
     monkeypatch.setattr(shared_accounts_routes, "ask_as_caller", refused)
-    assert (await client.get("/v1/ae/vault/people", headers=REID)).json() == {"users": []}
+    assert (await client.get("/v1/ae/vault/people", headers=OWNER)).json() == {"users": []}
 
 
 # ── review of PR 304 (2026-10-23) ───────────────────────────────────────────
@@ -443,10 +443,10 @@ async def test_re_arming_keeps_what_a_person_wrote_below_the_key() -> None:
     fake, alerts = FakeStore(), secret_alerts.AlertStore(None)
     meta = _secret("a", 20)
     await _run(_reading({"a": meta}), fake, alerts)
-    fake.tasks["T1"]["notes"] += "\n\nAsked Steve to rotate it."
+    fake.tasks["T1"]["notes"] += "\n\nAsked Member to rotate it."
     await _run(_reading({"a": meta}), fake, alerts, now=NOW + timedelta(days=14))
     notes = fake.tasks["T1"]["notes"]
-    assert "stage 7" in notes and notes.endswith("Asked Steve to rotate it.")
+    assert "stage 7" in notes and notes.endswith("Asked Member to rotate it.")
 
 
 def test_an_unreadable_owner_file_is_not_overwritten(tmp_path: Path) -> None:
@@ -454,7 +454,7 @@ def test_an_unreadable_owner_file_is_not_overwritten(tmp_path: Path) -> None:
     path.write_text("{not json", encoding="utf-8")
     owners = secret_owners.SecretOwnersStore(path)
     with pytest.raises(secret_owners.OwnerSaveError):
-        owners.set(BOX, ["a"], "steve@example.com")
+        owners.set(BOX, ["a"], "member@example.com")
     assert path.read_text(encoding="utf-8") == "{not json"
 
 
@@ -489,20 +489,20 @@ async def test_the_card_reads_the_summary_and_rows_in_pages_under_the_bridge_cap
     secrets_meta.reset_store(store)
     secret_owners.reset_store(secret_owners.SecretOwnersStore(None))
     secret_owners.store().set(BOX, names, "someone.with.a.long.name@example-company.com")
-    summary = await client.get("/v1/ae/vault?rows=false", headers=REID)
+    summary = await client.get("/v1/ae/vault?rows=false", headers=OWNER)
     assert summary.status_code == 200 and len(summary.text) < BRIDGE_CHARS
     assert all(view["secrets"] == [] for view in summary.json()["vaults"])
     assert summary.json()["vaults"][0]["count"] == 130
     got: list[str] = []
     start: int | None = 0
     while start is not None:
-        page = await client.get(f"/v1/ae/vault/rows?vault={BOX}&start={start}", headers=REID)
+        page = await client.get(f"/v1/ae/vault/rows?vault={BOX}&start={start}", headers=OWNER)
         assert page.status_code == 200, page.text
         assert len(page.text) < BRIDGE_CHARS, len(page.text)
         body = page.json()
         got += [row["name"] for row in body["secrets"]]
         start = body["next"]
     assert got == sorted(names)
-    assert (await client.get(f"/v1/ae/vault/rows?vault={BOX}", headers=STEVE)).status_code == 403
-    empty = await client.get("/v1/ae/vault/rows?vault=no-such-vault", headers=REID)
+    assert (await client.get(f"/v1/ae/vault/rows?vault={BOX}", headers=MEMBER)).status_code == 403
+    empty = await client.get("/v1/ae/vault/rows?vault=no-such-vault", headers=OWNER)
     assert empty.json() == {"vault": "no-such-vault", "secrets": [], "next": None}

@@ -29,7 +29,13 @@ from tests.server.helpers import create_test_session
 
 from ae_omni_policies import labels, notes
 from ae_omni_policies import mcp as mcp_module
-from ae_omni_policies.mcp import TOOL_NAMES, TOOLS, WRITING_TOOLS, OmniClient, create_server
+from ae_omni_policies.mcp import (
+    TOOL_NAMES,
+    TOOLS,
+    WRITING_TOOLS,
+    OmniClient,
+    create_server,
+)
 from ae_omni_policies.omni import SERVER_URL_ENV, Settings
 from ae_omni_policies.taskstore import ORIGIN_SURFACE, URL_IS
 
@@ -119,10 +125,11 @@ async def test_lists_the_worker_tools_and_ours(omni: OmniClient) -> None:
             "omni_transcript",
             "create_session",
             "post_message",
+            "hand_off",
             "answer_child_question",
             "schedule_checkin",
             "list_prs",
-            "ask_reid",
+            "ask_user",
             "set_session_model",
             "report_review",
             "preset_insights_read",
@@ -462,7 +469,7 @@ ORCHESTRATOR_TOOLS = [
     "schedule_checkin",
     "list_prs",
     "set_session_model",
-    "ask_reid",
+    "ask_user",
 ]
 
 
@@ -484,6 +491,7 @@ def test_the_orchestrator_writes_only_what_it_needs(tmp_path: Path) -> None:
 
 def test_every_new_writer_is_on_writing_tools() -> None:
     assert {
+        "hand_off",
         "create_session",
         "post_message",
         "answer_child_question",
@@ -492,7 +500,7 @@ def test_every_new_writer_is_on_writing_tools() -> None:
         "submit_preset_suggestions",
     } <= WRITING_TOOLS
     assert "preset_insights_read" not in WRITING_TOOLS
-    assert not {"list_prs", "ask_reid"} & WRITING_TOOLS
+    assert not {"list_prs", "ask_user"} & WRITING_TOOLS
     assert set(TOOL_NAMES) >= WRITING_TOOLS
 
 
@@ -637,10 +645,10 @@ async def test_create_session_answers_the_url_slots_full_and_failures() -> None:
         full = _payload(await session.call_tool("create_session", {"title": "T", "brief": "B"}))
         assert full["outcome"] == "slots_full"
         assert full["working"] == [{"id": "conv_a", "title": "A"}]
-        assert "ask_reid" in full["instruction"]
+        assert "ask_user" in full["instruction"]
         family = _payload(await session.call_tool("create_session", {"title": "T", "brief": "B"}))
         assert (family["outcome"], family["limit"]) == ("family_full", 3)
-        assert "ask_reid" not in family["instruction"]
+        assert "ask_user" not in family["instruction"]
         half = _payload(await session.call_tool("create_session", {"title": "T", "brief": "B"}))
         assert half["error"].startswith("Could not start the session: 502 session conv_2")
         assert half["url"] == "http://box.test/c/conv_2"
@@ -1005,7 +1013,7 @@ async def test_list_prs_degrades_plainly_without_gh(monkeypatch: pytest.MonkeyPa
     assert pr["url"] == SERVER_CARD["url"]
     assert pr["attention"] == "rebrief_ci"
     assert pr["sessions"][0]["id"] == "conv_ci"
-    assert "merge" not in pr, "the merge gate is Reid's, not the orchestrator's"
+    assert "merge" not in pr, "the merge gate is the owner's, not the orchestrator's"
     assert [row["id"] for row in answer["sessions"]] == ["conv_fix", "conv_done"]
 
     async with connect(_stub(_server(None))) as session:
@@ -1089,7 +1097,7 @@ async def test_list_prs_merges_gh_matches_owners_and_flags_attention(
     assert any("no access" in error for error in answer["errors"])
 
 
-async def test_ask_reid_is_a_pop_up_with_the_recommendation_first(omni: OmniClient) -> None:
+async def test_ask_user_is_a_pop_up_with_the_recommendation_first(omni: OmniClient) -> None:
     asked: list[types.ElicitRequestParams] = []
 
     async def pick_second(context: Any, params: types.ElicitRequestParams) -> types.ElicitResult:
@@ -1110,7 +1118,7 @@ async def test_ask_reid_is_a_pop_up_with_the_recommendation_first(omni: OmniClie
     async with create_connected_server_and_client_session(
         server, elicitation_callback=pick_second
     ) as session:
-        second = _payload(await session.call_tool("ask_reid", args))
+        second = _payload(await session.call_tool("ask_user", args))
     (params,) = asked
     assert params.message == "Slots are full. What now?"
     assert params.requestedSchema["properties"]["choice"]["enum"] == [
@@ -1122,24 +1130,37 @@ async def test_ask_reid_is_a_pop_up_with_the_recommendation_first(omni: OmniClie
     async with create_connected_server_and_client_session(
         create_server(omni), elicitation_callback=pick_first
     ) as session:
-        first = _payload(await session.call_tool("ask_reid", args))
+        first = _payload(await session.call_tool("ask_user", args))
         # One option is refused by the schema before the handler runs.
-        bad = await session.call_tool("ask_reid", {"question": "?", "options": ["one"]})
+        bad = await session.call_tool("ask_user", {"question": "?", "options": ["one"]})
     assert first == {"answer": "Wait", "action": "accept", "recommended": True}
     assert bad.isError is True
-    assert await mcp_module.ask_reid(None, {"question": " ", "options": ["a", "b"]}) == {
-        "error": "ask_reid needs a question and two to four options"
+    assert await mcp_module.ask_user(None, {"question": " ", "options": ["a", "b"]}) == {
+        "error": "ask_user needs a question and two to four options"
     }
     async with create_connected_server_and_client_session(
         create_server(omni), elicitation_callback=dismiss
     ) as session:
-        declined = _payload(await session.call_tool("ask_reid", args))
+        declined = _payload(await session.call_tool("ask_user", args))
     assert (declined["answer"], declined["action"]) == (None, "decline")
     # A client with no elicitation support: the answer says to ask in chat.
     async with connect(omni) as session:
-        fallback = _payload(await session.call_tool("ask_reid", args))
+        fallback = _payload(await session.call_tool("ask_user", args))
     assert fallback["answer"] is None
     assert fallback["instruction"].startswith("Ask in chat instead")
+
+
+async def test_only_ask_user_answers_the_pop_up(omni: OmniClient) -> None:
+    # The hidden alias kept for running sessions went 2026-10-30, the day after the rename.
+    # Any other ask_ name (built from parts, like the old one) answers as an unknown tool.
+    other = "".join(["ask_", "some", "one"])
+    async with connect(omni) as session:
+        answer = _payload(
+            await session.call_tool(other, {"question": "Which?", "options": ["A", "B"]})
+        )
+    assert answer["error"].startswith(f"unknown tool {other!r}")
+    assert set(mcp_module.SESSION_HANDLERS) == {"ask_user"}
+    assert "ask_user" in TOOL_NAMES
 
 
 async def test_list_prs_reads_reported_urls_so_a_merge_is_seen_without_gh(
@@ -1214,3 +1235,112 @@ async def test_answer_child_question_ignores_a_spoofed_parent_and_needs_a_caller
     none = await _relay(client, answers=ANSWERS)
     assert "own id" in none["error"] and "action dock" in none["error"]
     assert posted == []
+
+
+def _handoff_server(chain: dict[str, str], posted: list[tuple[str, dict[str, Any]]]) -> OmniClient:
+    """Sessions named in *chain* carry ``ae.handoff_to`` pointing at their value."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "GET" and path.startswith("/v1/sessions/"):
+            target = chain.get(path.rsplit("/", 1)[1])
+            return httpx.Response(
+                200, json={"labels": {"ae.handoff_to": target} if target else {}}
+            )
+        if request.method == "POST" and path.endswith("/events"):
+            posted.append((path.split("/")[3], json.loads(request.content)))
+            return httpx.Response(202, json={})
+        return httpx.Response(404, json={})
+
+    return _stub(handler)
+
+
+async def test_post_message_follows_the_handoff_label_to_the_new_lead() -> None:
+    posted: list[tuple[str, dict[str, Any]]] = []
+    client = _handoff_server({"conv_a": "conv_b", "conv_b": "conv_c"}, posted)
+    async with connect(client) as session:
+        answer = _payload(
+            await session.call_tool("post_message", {"session_id": "conv_a", "text": "Check-in"})
+        )
+    assert answer == {
+        "posted": True,
+        "session_id": "conv_c",
+        "status": 202,
+        "forwarded_from": "conv_a",
+    }
+    assert [session_id for session_id, _ in posted] == ["conv_c"]
+
+
+async def test_post_message_handoff_loop_and_long_chain_stop_instead_of_spinning() -> None:
+    posted: list[tuple[str, dict[str, Any]]] = []
+    loop = _handoff_server({"conv_a": "conv_b", "conv_b": "conv_a"}, posted)
+    async with connect(loop) as session:
+        await session.call_tool("post_message", {"session_id": "conv_a", "text": "Hi"})
+    assert [session_id for session_id, _ in posted] == ["conv_b"]
+    posted.clear()
+    chain = {f"conv_{i}": f"conv_{i + 1}" for i in range(20)}
+    async with connect(_handoff_server(chain, posted)) as session:
+        await session.call_tool("post_message", {"session_id": "conv_0", "text": "Hi"})
+    assert [session_id for session_id, _ in posted] == ["conv_5"]
+
+
+async def test_post_message_without_a_handoff_label_goes_where_it_was_sent() -> None:
+    posted: list[tuple[str, dict[str, Any]]] = []
+    async with connect(_handoff_server({}, posted)) as session:
+        answer = _payload(
+            await session.call_tool("post_message", {"session_id": "conv_a", "text": "Hi"})
+        )
+    assert answer == {"posted": True, "session_id": "conv_a", "status": 202}
+
+
+async def test_schedule_checkin_follows_the_handoff_label(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[str | None] = []
+
+    async def no_rows(_http: Any) -> dict[str, Any]:
+        return {}
+
+    async def zone(_http: Any) -> tuple[str, None]:
+        return "UTC", None
+
+    def capture(*_args: Any, session_id: str | None = None, **_kwargs: Any) -> Any:
+        seen.append(session_id)
+        raise ValueError("stop here")
+
+    monkeypatch.setattr(mcp_module.schedules, "list_scheduled", no_rows)
+    monkeypatch.setattr(mcp_module.schedules, "server_defaults", zone)
+    monkeypatch.setattr(mcp_module.schedules, "checkin_schedule", capture)
+    client = _handoff_server({"conv_old": "conv_new"}, [])
+    answer = await mcp_module.schedule_checkin(client, {"session_id": "conv_old"})
+    assert seen == ["conv_new"]
+    assert "Nothing was scheduled" in answer["error"]
+
+
+async def test_hand_off_posts_the_packet_as_the_calling_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_me")
+    sent: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        sent.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(200, json={"ok": True, "session_id": "conv_new"})
+
+    async with connect(_stub(handler)) as session:
+        answer = _payload(
+            await session.call_tool("hand_off", {"packet": "State.\nSTART ON: Opus", "title": "T"})
+        )
+    assert answer == {
+        "ok": True,
+        "session_id": "conv_new",
+        "next": "Handed off to conv_new. Stop now; do not start new work or sessions here.",
+    }
+    assert sent == [
+        ("/v1/ae/sessions/conv_me/handoff", {"packet": "State.\nSTART ON: Opus", "title": "T"})
+    ]
+    monkeypatch.delenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID")
+    monkeypatch.delenv("OMNIGENT_TERMINAL_LAUNCH_SESSION_ID", raising=False)
+    async with connect(_stub(handler)) as session:
+        refused = _payload(await session.call_tool("hand_off", {"packet": "x"}))
+    assert "nothing was handed off" in refused["error"]

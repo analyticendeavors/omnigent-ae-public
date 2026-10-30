@@ -17,7 +17,7 @@
 // changes only across a restart. It is read on activate and on focus, as
 // host.ts does.
 //
-// 2026-10-23, expiry list (Reid): the chips became one row per key, so each
+// 2026-10-23, expiry list (the owner): the chips became one row per key, so each
 // shows its Key Vault name, when the vault says it expires (amber inside 60
 // days, red once past, "no expiry set" otherwise), when it last changed, and
 // Edit and Rotate links (the Azure portal page, and the system that issues the
@@ -34,9 +34,9 @@
 // alone. After every draw it hands the page its Secrets tile (tiles.ts):
 // "11 of 11" keys present, red when a required one is missing.
 //
-// 2026-10-23, the Key Vault card concept (Reid approved): the block is
+// 2026-10-23, the Key Vault card concept (the owner approved): the block is
 // "Secrets on this box" and starts collapsed to three lines, the counts, then
-// a chip for each key that needs Reid (missing, expired, inside 60 days, or
+// a chip for each key that needs the owner (missing, expired, inside 60 days, or
 // refused by its last call), or one green line when none does. "Show 17 keys"
 // opens the rows; open or closed is remembered (sections.ts, id
 // "secrets-keys"). The host's Claude token joins the rows once the box's relay
@@ -47,7 +47,7 @@
 // secrets" jumps to the Key Vault card (vault.ts), where every secret is.
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
-import { describeError, fetchSecrets, type SecretKey, type SecretsStatus } from "./api";
+import { describeError, fetchSecrets, ADMIN_RECHECK_MS, isAdminOnly, type SecretKey, type SecretsStatus } from "./api";
 import { el, notice, replaceChildren } from "./dom";
 import { chevronIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
@@ -139,7 +139,7 @@ export function metaItems(status: SecretsStatus): string[] {
   ];
 }
 
-/** A key that needs Reid, as one chip: what it turns on, and why. */
+/** A key that needs the owner, as one chip: what it turns on, and why. */
 export interface Problem {
   row: SecretKey;
   text: string;
@@ -178,7 +178,7 @@ export function problems(status: SecretsStatus): Problem[] {
   return out.sort((a, b) => (a.tone === b.tone ? 0 : a.tone === "err" ? -1 : 1));
 }
 
-/** The green line when nothing needs Reid: the nearest expiry, or that none is set. */
+/** The green line when nothing needs the owner: the nearest expiry, or that none is set. */
 export function okLine(status: SecretsStatus): string {
   const next = rowsOf(status)
     .filter((row) => row.present && row.expires && (row.days_left ?? -1) >= 0)
@@ -470,7 +470,7 @@ function keyList(title: string, rows: SecretKey[], required: boolean): HTMLEleme
   );
 }
 
-/** A chip for a key that needs Reid; it opens the key's Rotate page when there is one. */
+/** A chip for a key that needs the owner; it opens the key's Rotate page when there is one. */
 function problemChip(problem: Problem): HTMLElement {
   const { row } = problem;
   const parts = [
@@ -596,6 +596,10 @@ interface SectionState {
   status: SecretsStatus | null;
   at: number;
   error: unknown;
+  /** The server answered admin_only (2026-10-28): one quiet line, and no more reads. */
+  adminOnly: boolean;
+  /** When admin_only was last answered, for the 5 minute look-again. */
+  adminSince: number;
   /** What the list last drew, so an unchanged answer is not redrawn. */
   drawn: string;
 }
@@ -603,7 +607,11 @@ interface SectionState {
 function render(list: HTMLElement, refreshed: HTMLElement, state: SectionState): void {
   // Every focus reads again; redrawing an unchanged card would make a screen
   // reader announce its role="alert" notice each time (dual review, 2026-10-20).
-  const drawn = JSON.stringify([state.status, state.error ? describeError(state.error) : null]);
+  const drawn = JSON.stringify([
+    state.status,
+    state.error ? describeError(state.error) : null,
+    state.adminOnly,
+  ]);
   if (drawn !== state.drawn) {
     state.drawn = drawn;
     draw(list, state);
@@ -616,6 +624,10 @@ function render(list: HTMLElement, refreshed: HTMLElement, state: SectionState):
 }
 
 function draw(list: HTMLElement, state: SectionState): void {
+  if (state.adminOnly) {
+    replaceChildren(list, [el("p", { class: "meta" }, "The box's secrets are for admins.")]);
+    return;
+  }
   const failure = state.error
     ? notice(`The secrets could not be read (${describeError(state.error)}).`, "error")
     : null;
@@ -638,10 +650,14 @@ export function secretsSection(): HTMLElement {
 }
 
 let onFocus: (() => void) | null = null;
+/** The look-again after an admin_only answer (2026-10-28). */
+let recheck: ReturnType<typeof setTimeout> | null = null;
 /** Bumped by every activate and deactivate, as in host.ts. */
 let generation = 0;
 
 function stopListening(): void {
+  if (recheck) clearTimeout(recheck);
+  recheck = null;
   if (!onFocus) return;
   window.removeEventListener("focus", onFocus);
   document.removeEventListener("visibilitychange", onFocus);
@@ -657,10 +673,11 @@ export function activateSecrets(context: ExtensionContext, root: HTMLElement): v
   const mine = ++generation;
   const live = () => generation === mine;
   stopListening();
-  const state: SectionState = { status: null, at: 0, error: null, drawn: "" };
+  const state: SectionState = { status: null, at: 0, error: null, adminOnly: false, adminSince: 0, drawn: "" };
   let reading: Promise<void> | null = null;
   const refresh = (): Promise<void> => {
     if (reading) return reading;
+    if (state.adminOnly && Date.now() - state.adminSince < ADMIN_RECHECK_MS) return Promise.resolve();
     reading = fetchSecrets(context)
       .then(
         (answer) => {
@@ -668,13 +685,28 @@ export function activateSecrets(context: ExtensionContext, root: HTMLElement): v
           state.status = answer;
           state.at = Date.now();
           state.error = null;
+          state.adminOnly = false;
         },
         (error: unknown) => {
+          if (live() && isAdminOnly(error)) {
+            state.adminOnly = true;
+            state.adminSince = Date.now();
+            state.status = null;
+            state.error = null;
+            return;
+          }
           if (live()) state.error = error ?? new Error("Request failed");
         },
       )
       .then(() => {
-        if (live()) render(list, refreshed, state);
+        if (!live()) return;
+        render(list, refreshed, state);
+        if (recheck) clearTimeout(recheck);
+        recheck = state.adminOnly
+          ? setTimeout(() => {
+              if (live()) void refresh();
+            }, ADMIN_RECHECK_MS)
+          : null;
       })
       .finally(() => {
         reading = null;

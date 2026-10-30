@@ -8,7 +8,7 @@ own section, with the active provider first. For Claude Code that is the 5-hour 
 per model ("Weekly · Fable"), and usage credits spent of the monthly cap, with the plan
 (for example "Max 20x") beside the name; Codex keeps its own windows. Each row has a
 bar, a percentage and a reset time. The Parking Lot page's capacity strip carries the
-first two windows per harness in one line. Asked for by Reid on 2026-09-24 (parked as
+first two windows per harness in one line. Asked for by the owner on 2026-09-24 (parked as
 https://github.com/analyticendeavors/omnigent-ae/issues/19); the second pass followed a
 screenshot of Claude Code's popover the same day. Before this the way to see them was
 the `>_` terminal and `/usage`.
@@ -225,11 +225,11 @@ leave it open.
 
 ## The ring's color and the prompt cache bar (patch P18, 2026-09-24)
 
-Reid asked from his phone for two changes, and `patches/0018` makes both.
+The owner asked from their phone for two changes, and `patches/0018` makes both.
 
 **The ring changes color near a full context.** Upstream draws the ring grayscale on
 purpose; Claude Code desktop instead warns as the window fills, and that is the cue
-Reid wanted before a compaction or a fresh session. The used arc is grey below 60%,
+the owner wanted before a compaction or a fresh session. The used arc is grey below 60%,
 the theme's warning color from 60% and its destructive color from 80%
 (`web/src/lib/aeContextTone.ts`, `contextTone`), decided on the rounded percentage the
 ring's tooltip prints. The popover's Context window bar uses the same steps, so the
@@ -248,7 +248,7 @@ grey; never warning or destructive, which mean nearly full), the legend keeps it
 dots, and a caption above it reads "How those tokens were billed (prompt cache)". The
 parts are scaled to the whole window, so together they end where the bar above ends.
 
-What Reid expected there was a `/context`-style breakdown of what fills the window
+What the owner expected there was a `/context`-style breakdown of what fills the window
 (system prompt, tools, memory files, messages). The status line payload carries only
 the window size and the three input counts above, so that breakdown would need a new
 source (for example Claude Code's `/context` output per session), and the popover does
@@ -256,7 +256,7 @@ not invent it.
 
 ## The shorter popover (patch 0040, 2026-10-14)
 
-Reid found the popover too tall (933 px with his numbers, so it scrolled), picked five
+The owner found the popover too tall (933 px with their numbers, so it scrolled), picked five
 fixes and then sent Claude Desktop's context popover as the model to follow. Patch
 0040 changes only `AePlanLimits.tsx` and its suites.
 
@@ -276,13 +276,13 @@ fixes and then sent Claude Desktop's context popover as the model to follow. Pat
   "See detailed breakdown", folded again each time the popover opens.
 - The two explainer sentences sit behind info toggles beside the headings; a tap shows
   them, since a phone has no hover.
-- The popover is 22rem wide. With Reid's numbers it is 371 px folded and 591 px open.
+- The popover is 22rem wide. With the owner's numbers it is 371 px folded and 591 px open.
 
 ## The cleaner breakdown (patch 0047, 2026-10-15)
 
-Reid's screenshot of the detailed breakdown on 2026-10-15 showed rows like
+The owner's screenshot of the detailed breakdown on 2026-10-15 showed rows like
 "general-purpose:a45b4b1759d6fb802", each "Unavailable" with a sentence and a repeated
-"Claude Code" line, and he asked for the detail Claude's own surfaces give. Those rows
+"Claude Code" line, and they asked for the detail Claude's own surfaces give. Those rows
 were Claude Code's own subagents: they run inside its process, and Claude Code reports
 no context for them.
 
@@ -417,10 +417,10 @@ The expanded context window shows its color legend directly beneath the bar. Fre
 
 ## The session rail (patch 0071, 2026-10-17)
 
-Reid sent Claude Desktop's session rail and Codex's usage popover on 2026-10-17 and
+The owner sent Claude Desktop's session rail and Codex's usage popover on 2026-10-17 and
 asked for the popover to keep basic bars while the full context, the environment,
-connectors, outputs and changes move to a pane beside the chat that he can reorder.
-Before the build he added triage, schedules and the files he sent.
+connectors, outputs and changes move to a pane beside the chat that they can reorder.
+Before the build they added triage, schedules and the files they sent.
 
 The popover now shows, in order: the context window figure over one bar, colored by
 category once a fresh snapshot exists for a claude-native session (otherwise the prompt
@@ -456,7 +456,7 @@ The rail (`web/src/shell/AeSessionRail.tsx`, sections in `web/src/components/aeR
   group, closed until opened and remembered per browser, newest first, eight shown;
   rows cleared in the Agents tab stay hidden here too.
   "No agents have run in this session." means the list loaded empty; "Nothing running
-  now." means only finished ones exist. Reid asked on 2026-10-20 to see running agents
+  now." means only finished ones exist. The owner asked on 2026-10-20 to see running agents
   and a separate Finished group without opening the Agents tab; the old single count
   dropped a subagent the moment it finished, so a loaded list looked like an empty one.
   Any row opens the Agents tab.
@@ -497,7 +497,7 @@ in upstream's `index.css`). It slides in from width 0 through `@starting-style` 
 mounted for the 300 ms slide out (`data-state="closed"`, `inert`). Both slides start
 in the same frame, since the one-pane rule settles in a layout effect, so the chat's
 width moves straight from one value to the other. Before this, the rail appeared at full
-width beside a workspace panel still sliding out, and Reid's recording caught both on
+width beside a workspace panel still sliding out, and the owner's recording caught both on
 screen with the chat squeezed to 110 px. A rail making way for the workspace panel as it
 opens slides out in its own row. It leaves at once instead when it would float even
 without the panel (it would slide across it), beside a files or logs panel (those take
@@ -512,7 +512,7 @@ toggle, a link, a tab) and snaps it on a session restore. The shell passes that 
 2026-10-19). Before it, a switch to a session whose panel was saved open, with "Open the
 session rail in every session" off, squeezed the chat to 181 px for about 280 ms.
 
-Open in every session (patches 0085 and 0087, 2026-10-18, on by default): Reid had to
+Open in every session (patches 0085 and 0087, 2026-10-18, on by default): the owner had to
 reopen the rail in session after session, because a session that restored its open
 workspace panel closed the rail on any window up to about 1440 px wide. With the
 preference on, a desktop rail opens whenever the user opens or switches to a session.
@@ -533,7 +533,7 @@ device, and older saved layouts load with it on; Settings > Chat, a section adde
 chat options, carries the switch "Open the session rail in every session". Off, the rail
 behaves as before.
 
-When a session opens (patch 0155, 2026-10-22, Session rail by default): Reid still saw
+When a session opens (patch 0155, 2026-10-22, Session rail by default): the owner still saw
 sessions open on the files panel, not the rail. On a wide window the restore rule kept a
 panel that fit, and before a resize measured it the shell's first restore assumed the
 panel's 240 px minimum, so the panel came back and the rail made way for it. The switch
@@ -556,10 +556,10 @@ default. Patch 0087 replaced it with the restore rule.
 
 The toggle's icon (patch 0085, 2026-10-18): the header toggle drew Tabler
 layout-sidebar-right-expand and -collapse, a box with a divider, beside the workspace
-panel's lucide panel-right, also a box with a divider, and Reid could not tell them
+panel's lucide panel-right, also a box with a divider, and the owner could not tell them
 apart. The toggle and the phone menu's "Session rail" item now draw Tabler
 list-details, one shape for both states; the button's pressed state and fill show
-whether the rail is open. Reid picked list-details over info-square-rounded and
+whether the rail is open. The owner picked list-details over info-square-rounded and
 report-analytics from a sheet of real header shots.
 
 Cost: a section fetches only while the rail (or the sheet) is open, the section
@@ -610,9 +610,9 @@ the session-rail screenshot set (removed before publication).
 
 ## Usage per session account (patches 0078 and 0079, 2026-10-17)
 
-Reid runs sessions on a backup Claude account ("AE Backup", a `claude setup-token`
+The owner runs sessions on a backup Claude account ("AE Backup", a `claude setup-token`
 token the runner injects as `CLAUDE_CODE_OAUTH_TOKEN`, patch 0046) and noticed on
-2026-10-17 that the session rail's Usage showed his default login's numbers instead:
+2026-10-17 that the session rail's Usage showed their default login's numbers instead:
 weekly 100% on the default login where the backup stood at 4%. The relay kept one
 Claude reading per host and overwrote it with `get_usage`, which reads only the stored
 default login, and `GET /v1/ae/limits` could not tell sessions apart.
@@ -682,7 +682,7 @@ account None / AE Default at 19:44, then `shared:AE Backup` after the 19:45 tick
   reading of another account. A backup account drops the plan and credits and keeps
   the backup hint. A backup session with no windows of its own now shows the account's
   newest reading, taken from another session on it, at that reading's time, with a note
-  that says so (Reid's call, 2026-10-26: a stale number from the right account beats
+  that says so (the owner's call, 2026-10-26: a stale number from the right account beats
   none). An account with no reading at all gets empty windows and "No reading yet for
   <label>; it shows after this session's first reply."
 - `account=` without `session_id` does nothing; no web caller needs it.
@@ -694,7 +694,7 @@ until its first render, as before.
 
 ## Accounts summary (2026-10-21)
 
-Reid runs several Claude logins (the default, personal ones, shared ones) and one
+The owner runs several Claude logins (the default, personal ones, shared ones) and one
 Codex login. Usage was visible only per session (the rail's Usage card,
 `GET /v1/ae/limits?session_id=`), so finding the account with room meant opening
 sessions one by one. The Admin Center's Accounts card now lists every signed-in
@@ -745,9 +745,19 @@ account in one place.
   reading yet"). It reads every minute while visible and on focus.
 
 Gaps: an idle account's numbers are as old as its last status line; nothing probes an
-account without a session (Reid's call, 2026-10-21). The login list rides the Claude
+account without a session (the owner's call, 2026-10-21). The login list rides the Claude
 post, so a host with no Claude reading at all (no status line, no usage answer) posts
 no list either, and only the shared accounts show. The live session counts are as old
 as the relay's last post. A relay newer than its server gets 422 for every Claude post
 until the server runs this version (the `known_accounts` field): deploy the server
 first, as `auto-update.sh` does, and never roll the server back alone.
+
+## Who sees which readings (2026-10-28, the owner)
+
+The owner and the second box user may both be admins for the box, but neither may see anything sensitive about the other's work. The relay runs on the box host, which is the owner's, and posts as the admin; the second box user's chats run on their own host container. So every login in the store except the `shared:` ones is the owner's, and so is every session in `contexts` and `sessions`.
+
+- **An admin** (`shared_accounts_routes.admin_probe`, which a single-user runtime's one user always passes) reads `GET /v1/ae/limits` and `/limits/accounts` as described above.
+- **A signed-in non-admin** reads `limits.member_view` of the same answer: Codex is `null` (its one login is the box's); the Claude entry keeps its readings only when its `account` is a `shared:` account, or when `session_id` (checked against upstream's access rule, never a `temp:` id) names a session the relay posted, which means one running on the box host that was shared with the caller. Otherwise `windows` is empty, `plan`, `credits`, `account` and `account_label` are null, and `note` says "This server reads usage only for the box host's own logins and the shared accounts; this login's usage is not read here." `contexts` and `sessions` shrink to that one session or empty. `GET /limits/accounts` lists only the Claude `shared:` rows. The composer's picker (`?account=shared:team`, with or without a `temp:` session id) and `GET /claude-accounts/shared` still work, so a second user can still choose and read a shared account.
+- A shared row's `live_sessions` still counts every session the relay saw on it, the owner's included: a number, the monitoring kind of data.
+- A box host session that has not replied yet reads as blank for a non-admin, which matters only if the owner shares one with the second box user.
+- Only a status-line entry in the relay's `sessions` list proves a reading is a session's own (`LimitStore.has_session_entry`); a row that appears only in `contexts` leaves a non-admin with the blank answer (review fix, 2026-10-28).

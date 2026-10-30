@@ -1,7 +1,7 @@
 """Every secret in both Key Vaults, for the Admin Center's Key Vault card (2026-10-23).
 
 Why: the Box health card answers "does this box have what it needs" for the 17
-keys the box pulls. Reid also wants the whole inventory: every secret across
+keys the box pulls. The owner also wants the whole inventory: every secret across
 the box's vault (``AE_VAULT_NAME``) and the website's vault, which ones expire, which have not
 changed in half a year, and which live in both vaults and so must be rotated
 twice (the global CLAUDE.md names two). The concept page

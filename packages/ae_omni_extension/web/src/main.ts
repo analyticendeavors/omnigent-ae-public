@@ -1,7 +1,7 @@
 // The Session Dashboard (2026-09-24 as the Dashboard, renamed 2026-10-17;
 // docs/design/dashboard-review.md): one page for
 // the three-slot system, replacing the Parking Lot page and the Your move page
-// (omnigent-ae Phase 3, 2026-09-23; Your move, 2026-09-24), which Reid found
+// (omnigent-ae Phase 3, 2026-09-23; Your move, 2026-09-24), which the owner found
 // incongruent as separate entries. Top to bottom:
 //
 //   header      the Session Dashboard header (header.ts, 2026-10-17): a
@@ -30,17 +30,17 @@
 // width: the section chips (wrapping on a wide screen instead of scrolling)
 // and the plan limits.
 //
-// Declutter (2026-10-14, Reid's design pass): a section with nothing in it
+// Declutter (2026-10-14, the owner's design pass): a section with nothing in it
 // no longer draws a card in either column, nor a chip in the jump bar (a
 // zero chip pointed at a heading that could not open). One muted line at the
 // end, "Nothing in: Open PRs, Needs a note", says which ones are empty.
 //
-// Second pass (2026-10-14, Reid's approved spec): the Parking Lot heads the
+// Second pass (2026-10-14, the owner's approved spec): the Parking Lot heads the
 // right column; sections and rows lose their frames; a session row's title
 // opens it and its status moves sit in a "..." menu; and what Your move
 // shows is not repeated in Working, Blocked or the lot.
 //
-// Fast open (2026-09-26): Reid waited 3 to 5 seconds on every open on his
+// Fast open (2026-09-26): the owner waited 3 to 5 seconds on every open on their
 // iPhone because the first render awaited all seven calls, so the slowest
 // (the pull request scan, 2321 ms cold on the box) set the wait. Now each
 // section renders as soon as its own call settles, and before any call lands
@@ -64,6 +64,7 @@ import {
   fetchPrs,
   fetchSessions,
   fetchYourMove,
+  isLotAdminOnly,
   type Lot,
   type LotTags,
   type Session,
@@ -255,12 +256,16 @@ function headerData(
 function render(
   hosts: Hosts,
   state: State,
-  deps: {
+  appDeps: {
     context: ExtensionContext;
     refresh: (fresh?: boolean) => Promise<void>;
     parkSession: (sessionId: string) => void;
   },
 ): void {
+  // A non-admin has no Parking Lot (2026-10-28): nothing to file a note into, so no
+  // Park form button and no "Needs a note" list; Park on a working card sets the status.
+  const lotAdminOnly = isLotAdminOnly(state.lotError);
+  const deps = lotAdminOnly ? { ...appDeps, parkSession: undefined } : appDeps;
   // An open "..." menu and the focus on one, put back once the page is drawn
   // (2026-10-14, review): the last step below.
   const keepMenus = holdMenus();
@@ -320,13 +325,13 @@ function render(
   );
   renderReview(hosts.review, state.sessions, deps);
   const openTasks = state.lot ? new Set(state.lot.tasks.map((task) => task.id)) : null;
-  renderNeedsNote(hosts.needsNote, state.sessions, openTasks, deps);
+  renderNeedsNote(hosts.needsNote, lotAdminOnly ? [] : state.sessions, openTasks, deps);
   renderUnsorted(hosts.unsorted, state.sessions, deps);
   renderReference(hosts.reference, state.sessions, deps);
   const folded = foldEmpties(hosts, state);
   // Your move as drawn above: worked out once per paint (2026-10-14, review).
   renderHeader(hosts.head, deps.context, headerData(state, yourMove, folded, state.ready), () =>
-    render(hosts, state, deps),
+    render(hosts, state, appDeps),
   );
   replaceChildren(hosts.footer, [
     state.refreshedAt === null

@@ -63,7 +63,7 @@ def pull(number: int, **extra: Any) -> dict[str, Any]:
         "draft": False,
         "mergeable": True,
         "mergeable_state": "clean",
-        "user": {"login": "ae-reid-havens"},
+        "user": {"login": "ae-owner"},
         "head": {"ref": f"claude/branch-{number}", "sha": SHA},
         "base": {"ref": "main"},
         "requested_reviewers": [],
@@ -275,7 +275,7 @@ async def test_a_scan_that_fails_keeps_the_last_cards_and_says_so(
         await client.get("/v1/ae/prs")
         monkeypatch.setattr(prs._scan, "ttl_s", 0.0)
 
-        def broken() -> list[Any]:
+        def broken(**_kwargs: Any) -> list[Any]:
             raise RuntimeError("store gone")
 
         monkeypatch.setattr(prs.sessions, "list_top_level", broken)
@@ -799,12 +799,12 @@ async def test_pull_request_writes_are_admin_only(
     with respx.mock(assert_all_called=False) as mock:
         mock.route(host="api.github.com").respond(404, json={"message": "Not Found"})
         refused = await client.post(
-            path, json={"sha": SHA}, headers={"X-Forwarded-Email": "steve@example.com"}
+            path, json={"sha": SHA}, headers={"X-Forwarded-Email": "member@example.com"}
         )
         assert not mock.calls
         # An admin gets past the gate to GitHub (here a 404, so a 502).
         admitted = await client.post(
-            path, json={"sha": SHA}, headers={"X-Forwarded-Email": "reid@example.com"}
+            path, json={"sha": SHA}, headers={"X-Forwarded-Email": "owner@example.com"}
         )
         assert mock.calls
     assert refused.status_code == 403, refused.text
@@ -1352,3 +1352,203 @@ async def test_new_routes_report_missing_credentials(
         assert not mock.calls
     assert response.status_code == 503
     assert response.json()["error"]["code"] == prs.CODE_NOT_CONFIGURED
+
+
+# ── a non-admin and the server's GitHub token (2026-10-28) ─────────────
+
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
+MEMBER = {"X-Forwarded-Email": "member@example.com"}
+
+
+def mock_access(mock: respx.MockRouter, session_id: str, *, allowed: bool = True) -> None:
+    """The access check a non-admin's PR read makes of a session (``GET /v1/sessions/{id}``)."""
+    mock.get(url__startswith=f"{SELF}/v1/sessions/{session_id}?").respond(
+        200 if allowed else 403, json={}
+    )
+
+
+async def _session_of(client: httpx.AsyncClient, who: dict[str, str], title: str) -> str:
+    client.headers.update(who)
+    try:
+        return await session(client, title, "working")
+    finally:
+        del client.headers["X-Forwarded-Email"]
+
+
+async def test_a_non_admin_reads_only_the_pull_requests_their_sessions_track(
+    client: httpx.AsyncClient, ae_permissions: set[str]
+) -> None:
+    mine = await _session_of(client, MEMBER, "Member's PR")
+    theirs = await _session_of(client, OWNER, "Owner's PR")
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, mine, [pr_url(5)])
+        mock_tracked(mock, theirs, [pr_url(6)])
+        mock_access(mock, mine)
+        mock_access(mock, theirs, allowed=False)
+        mock_card(mock, 5)
+        mock_card(mock, 6)
+        mock.get(f"{GH}/repos/{REPO}/issues/5/comments").respond(200, json=[])
+        listed = (await client.get("/v1/ae/prs", headers=MEMBER)).json()
+        own = await client.get(f"/v1/ae/prs/{REPO}/5", headers=MEMBER)
+        own_compliance = await client.get(f"/v1/ae/prs/{REPO}/5/compliance", headers=MEMBER)
+        other = await client.get(f"/v1/ae/prs/{REPO}/6", headers=MEMBER)
+        other_compliance = await client.get(f"/v1/ae/prs/{REPO}/6/compliance", headers=MEMBER)
+        admin = await client.get(f"/v1/ae/prs/{REPO}/6", headers=OWNER)
+    assert [card["number"] for card in listed["items"]] == [5]
+    assert [error.get("session_id") for error in listed["errors"]] == []
+    assert own.status_code == 200, own.text
+    assert own_compliance.status_code == 200, own_compliance.text
+    for refused in (other, other_compliance):
+        assert refused.status_code == 403, refused.text
+        assert refused.json()["error"]["code"] == "forbidden"
+    assert admin.status_code == 200, admin.text
+
+
+async def test_one_users_scan_never_answers_another(
+    client: httpx.AsyncClient, ae_permissions: set[str]
+) -> None:
+    theirs = await _session_of(client, OWNER, "Owner's PR")
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, theirs, [pr_url(6)])
+        mock_card(mock, 6)
+        assert [
+            c["number"] for c in (await client.get("/v1/ae/prs", headers=OWNER)).json()["items"]
+        ] == [6]
+        assert (await client.get("/v1/ae/prs", headers=MEMBER)).json()["items"] == []
+
+
+async def test_the_asking_chat_vouches_for_its_own_pull_request(
+    client: httpx.AsyncClient, ae_permissions: set[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # An older chat falls outside the newest sessions a scan reads (2026-10-28).
+    monkeypatch.setattr(prs, "MAX_SESSIONS", 0)
+    mine = await _session_of(client, MEMBER, "Old chat")
+    theirs = await _session_of(client, OWNER, "Owner's chat")
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, mine, [pr_url(5)])
+        mock_tracked(mock, theirs, [pr_url(5)])
+        mock_access(mock, mine)
+        mock_access(mock, theirs, allowed=False)
+        mock_card(mock, 5)
+        url = f"/v1/ae/prs/{REPO}/5"
+        assert (await client.get(url, headers=MEMBER)).status_code == 403
+        vouched = await client.get(url, params={"session_id": mine}, headers=MEMBER)
+        borrowed = await client.get(url, params={"session_id": theirs}, headers=MEMBER)
+    assert vouched.status_code == 200, vouched.text
+    assert borrowed.status_code == 403, borrowed.text
+
+
+async def test_a_miss_rescans_at_most_once_in_thirty_seconds(
+    client: httpx.AsyncClient, ae_permissions: set[str]
+) -> None:
+    mine = await _session_of(client, MEMBER, "Member's PR")
+    with respx.mock(assert_all_called=False) as mock:
+        route = mock_tracked(mock, mine, [pr_url(5)])
+        mock_card(mock, 9)
+        first = await client.get(f"/v1/ae/prs/{REPO}/9", headers=MEMBER)
+        after_first = route.call_count
+        second = await client.get(f"/v1/ae/prs/{REPO}/9", headers=MEMBER)
+        third = await client.get(f"/v1/ae/prs/{REPO}/8", headers=MEMBER)
+    assert first.status_code == second.status_code == third.status_code == 403
+    assert after_first == 2  # the scan, then one fresh scan
+    assert route.call_count == after_first  # later misses answer from the last scan
+
+
+async def test_a_revoked_session_no_longer_vouches_for_a_stale_scan(
+    client: httpx.AsyncClient, ae_permissions: set[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ae_omni_policies import router as router_module
+
+    mine = await _session_of(client, MEMBER, "Shared then revoked")
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, mine, [pr_url(5)])
+        mock_access(mock, mine)
+        mock_card(mock, 5)
+        mock.get(f"{GH}/repos/{REPO}/issues/5/comments").respond(200, json=[])
+        for route in ("", "/compliance"):
+            assert (
+                await client.get(f"/v1/ae/prs/{REPO}/5{route}", headers=MEMBER)
+            ).status_code == 200
+        real = router_module._may_open_session
+
+        async def revoked(request: Any, user: str | None, session_id: str) -> bool:
+            return False if session_id == mine else await real(request, user, session_id)
+
+        monkeypatch.setattr(router_module, "_may_open_session", revoked)
+        for route in ("", "/compliance"):
+            gone = await client.get(f"/v1/ae/prs/{REPO}/5{route}", headers=MEMBER)
+            assert gone.status_code == 403, gone.text
+
+
+async def test_the_deploy_check_is_scoped_like_the_card(
+    client: httpx.AsyncClient, ae_permissions: set[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ae_omni_policies import router as router_module
+
+    async def status(repo: str, number: int) -> dict[str, Any]:
+        return {"state": "unknown", "repo": repo, "number": number}
+
+    monkeypatch.setattr(router_module.pr_deploy, "status", status)
+    mine = await _session_of(client, MEMBER, "Member's PR")
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, mine, [pr_url(5)])
+        mock_access(mock, mine)
+        own = await client.get(f"/v1/ae/prs/{REPO}/5/deploy", headers=MEMBER)
+        other = await client.get(f"/v1/ae/prs/{REPO}/6/deploy", headers=MEMBER)
+        admin = await client.get(f"/v1/ae/prs/{REPO}/6/deploy", headers=OWNER)
+    assert own.status_code == 200 and admin.status_code == 200
+    assert other.status_code == 403
+
+
+async def test_a_failed_scan_does_not_use_up_the_thirty_seconds(
+    client: httpx.AsyncClient, ae_permissions: set[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mine = await _session_of(client, MEMBER, "Member's PR")
+    real = prs.tracking_sessions
+    calls: list[bool] = []
+
+    async def flaky(fetch: Any, repo: str, number: int, **kwargs: Any) -> list[str]:
+        calls.append(bool(kwargs.get("fresh")))
+        if kwargs.get("fresh") and calls.count(True) == 1:
+            raise RuntimeError("scan failed")
+        return await real(fetch, repo, number, **kwargs)
+
+    monkeypatch.setattr(prs, "tracking_sessions", flaky)
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, mine, [pr_url(5)])
+        mock_access(mock, mine)
+        mock_card(mock, 9)
+        with pytest.raises(RuntimeError):
+            await client.get(f"/v1/ae/prs/{REPO}/9", headers=MEMBER)
+        assert prs.fresh_scan_allowed("member@example.com")
+        again = await client.get(f"/v1/ae/prs/{REPO}/9", headers=MEMBER)
+    assert again.status_code == 403
+    assert calls.count(True) == 2
+    assert not prs.fresh_scan_allowed("member@example.com")
+
+
+async def test_a_scan_whose_sessions_are_all_closed_to_the_caller_gets_one_rescan(
+    client: httpx.AsyncClient, ae_permissions: set[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ae_omni_policies import router as router_module
+
+    old = await _session_of(client, MEMBER, "Revoked")
+    new = await _session_of(client, MEMBER, "Replacement")
+    with respx.mock(assert_all_called=False) as mock:
+        route_old = mock_tracked(mock, old, [pr_url(5)])
+        route_new = mock_tracked(mock, new, [])
+        mock_access(mock, old)
+        mock_access(mock, new)
+        mock_card(mock, 5)
+        assert (await client.get(f"/v1/ae/prs/{REPO}/5", headers=MEMBER)).status_code == 200
+        real = router_module._may_open_session
+
+        async def only_new(request: Any, user: str | None, session_id: str) -> bool:
+            return False if session_id == old else await real(request, user, session_id)
+
+        monkeypatch.setattr(router_module, "_may_open_session", only_new)
+        route_old.respond(200, json={"prs": []})
+        route_new.respond(200, json={"prs": [{"url": pr_url(5), "relationship": "created"}]})
+        # The listed session is closed now; the re-scan finds the one that is still open.
+        moved = await client.get(f"/v1/ae/prs/{REPO}/5", headers=MEMBER)
+    assert moved.status_code == 200, moved.text

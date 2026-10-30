@@ -25,7 +25,7 @@ function card(
     title: `PR ${number}`,
     state: "open",
     draft: false,
-    author: "ae-reid-havens",
+    author: "ae-owner",
     head_ref: `claude/branch-${number}`,
     base_ref: "main",
     head_sha: SHA,

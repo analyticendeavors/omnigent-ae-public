@@ -55,6 +55,25 @@ MODEL_LAST = "ae.model_last"
 RAISES = "ae.raises"
 RAISE_CAP = "ae.raise_cap"
 ROLE_IDS = ("lead", "planner", "reviewer", "builder", "helper")
+# Lead handoff (lead_handoff.py, 2026-10-29): ``ae.handoff`` is ``suggest`` (the web shows a
+# Compact card) or ``snoozed`` with the context size it happened at in ``ae.handoff_at``;
+# ``ae.handoff_to`` on the old lead names the lead that took over (the commit point),
+# ``ae.handoff_from`` on the new lead names the old one.
+HANDOFF = "ae.handoff"
+HANDOFF_AT = "ae.handoff_at"
+HANDOFF_TO = "ae.handoff_to"
+HANDOFF_FROM = "ae.handoff_from"
+# ``posted`` on the new lead once its brief (the packet) was delivered; ``1`` on the old lead once
+# every step after the commit point ran with no problem (the sweep never repairs it again).
+HANDOFF_BRIEF = "ae.handoff_brief"
+HANDOFF_DONE = "ae.handoff_done"
+# The old lead's status before the handoff, written with ``ae.handoff_to`` so a handoff whose
+# new lead died can put it back.
+HANDOFF_PREV_STATUS = "ae.handoff_prev_status"
+HANDOFF_SUGGEST = "suggest"
+# Written by the earlier version that posted a note into the chat; the sweep rewrites it.
+HANDOFF_NUDGED = "nudged"
+HANDOFF_SNOOZED = "snoozed"
 # The runner id an automatic resume was last tried for (auto_resume.py, 2026-10-13).
 AUTORESUME = "ae.autoresume"
 

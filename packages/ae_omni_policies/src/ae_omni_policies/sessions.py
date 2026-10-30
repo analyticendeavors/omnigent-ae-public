@@ -133,7 +133,7 @@ def working_sessions(rows: Sequence[Conversation]) -> list[Conversation]:
 
 # How far up the ae.orch chain a family root is looked for: a lead's children
 # start their own children rarely, and a cycle must end.
-_FAMILY_DEPTH = 8
+FAMILY_DEPTH = 8
 
 
 def family_key(conv: Conversation, by_id: Mapping[str, Conversation]) -> str:
@@ -145,7 +145,7 @@ def family_key(conv: Conversation, by_id: Mapping[str, Conversation]) -> str:
     key = conv.id
     seen = {key}
     parent = labels.orch_parent(conv.labels)
-    for _ in range(_FAMILY_DEPTH):
+    for _ in range(FAMILY_DEPTH):
         if parent is None or parent in seen:
             break
         key = parent
@@ -153,6 +153,18 @@ def family_key(conv: Conversation, by_id: Mapping[str, Conversation]) -> str:
         row = by_id.get(key)
         parent = labels.orch_parent(row.labels) if row is not None else None
     return key
+
+
+def children_of(rows: Sequence[Conversation], parent_id: str) -> list[Conversation]:
+    """The rows that are family children of *parent_id*: ``ae.orch`` names it.
+
+    Upstream's ``lead_id_of`` rules: never a fork, never a row with a
+    ``parent_conversation_id`` (an upstream sub-agent), never a row naming itself.
+    The caller checks that the owners match.
+    """
+    from omnigent.server.ae_family_prompts import lead_id_of
+
+    return [row for row in rows if lead_id_of(row) == parent_id]
 
 
 def family_keys(rows: Sequence[Conversation]) -> dict[str, str]:
@@ -171,7 +183,7 @@ def is_helper(conv: Conversation, by_id: Mapping[str, Conversation] | None = Non
     if parent is None:
         return False
     seen = {conv.id}
-    for _ in range(_FAMILY_DEPTH):
+    for _ in range(FAMILY_DEPTH):
         if parent in seen:
             return parent != conv.id  # a loop through this row means no lead above it
         seen.add(parent)
@@ -316,6 +328,7 @@ __all__ = [
     "MAX_ROWS",
     "PAGE_SIZE",
     "SessionSummary",
+    "children_of",
     "current_conversation_id",
     "display_title",
     "family_children_working",

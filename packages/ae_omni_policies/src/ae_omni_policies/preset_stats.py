@@ -373,7 +373,7 @@ def read_fallback_runs(
     for entry in _read_jsonl(model_log.log_path()):
         at = _num(entry.get("at"))
         if entry.get("session") in ids and at is not None and since <= at <= until:
-            changes.setdefault(str(entry["session"]), []).append(entry)
+            changes.setdefault(str(entry["session"]), []).append(model_log.normalize(entry))
     runs = []
     for conv, updated in convs:
         usage = preset_runs._usage(conv)

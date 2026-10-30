@@ -630,7 +630,7 @@ describe("helpers", () => {
     expect(lotCounts(tasks, "2026-10-30")).toEqual({ soon: 3, overdue: 1 });
   });
 
-  it("writes days as Reid's concepts do, with no comma", () => {
+  it("writes days as the owner's concepts do, with no comma", () => {
     expect(monthDay("2026-10-19")).toMatch(/^\S+ 19$/);
     expect(dayLabel("2026-10-19")).toMatch(/^\S+ \S+ 19$/);
   });

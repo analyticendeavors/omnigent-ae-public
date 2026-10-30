@@ -1,6 +1,6 @@
 """Plan limits: the subscription windows Claude Code and Codex report, one shape for both.
 
-Reid asked on 2026-09-24 for what Claude Code's ``/usage`` shows (the 5-hour
+The owner asked on 2026-09-24 for what Claude Code's ``/usage`` shows (the 5-hour
 window, the weekly window, reset times, percent used) and the Codex
 equivalent, one click away from the context ring in a session's composer,
 instead of opening the ``>_`` terminal and typing ``/usage``. This module is
@@ -65,7 +65,7 @@ relay's next tick.
 
 Per account (2026-10-21, the Admin Center's Accounts card): the store also
 keeps the newest reading per (harness, account), so an account with no live
-session still shows its last numbers and their age. Reid runs several Claude
+session still shows its last numbers and their age. The owner runs several Claude
 logins (the default, personal ones, shared ones) and one Codex login, and
 until then usage was visible only per session. The Claude host reading fills
 the default login (or the backup account it names), each ``sessions`` entry
@@ -736,6 +736,52 @@ def session_view(
     return snapshot.model_copy(update=update)
 
 
+NOT_SHARED_NOTE = (
+    "This server reads usage only for the box host's own logins and the shared accounts; "
+    "this login's usage is not read here."
+)
+
+
+def member_view(view: dict[str, Any], *, session_id: str | None, relayed: bool) -> dict[str, Any]:
+    """*view* (:meth:`LimitStore.view`) as a signed-in non-admin may read it (2026-10-28).
+
+    The box host's logins and sessions are the admin's own, so a second user
+    sees only what is theirs or shared: Codex is ``null`` (its one login is the
+    box's); the Claude entry stays only when it describes a ``shared:`` account,
+    or *session_id* (already access-checked, never a ``temp:`` id) is a session
+    the relay posted (*relayed*), which runs on the box host; otherwise it keeps
+    its clock and ``source`` but loses windows, plan, credits and login name.
+    ``contexts`` and ``sessions`` shrink to *session_id*'s own entry.
+
+    :param view: What :meth:`LimitStore.view` returned; not changed.
+    :param session_id: The session the caller asked about and may open, if any.
+    :param relayed: Whether the relay has posted an entry for *session_id*.
+    """
+    harnesses = dict(view["harnesses"])
+    harnesses["codex"] = None
+    claude = harnesses.get("claude")
+    if claude is not None:
+        account = claude.get("account")
+        shared = isinstance(account, str) and account.startswith(SHARED_PREFIX)
+        claude = dict(claude)
+        if not shared and not (session_id is not None and relayed):
+            claude.update(
+                windows=[],
+                plan=None,
+                credits=None,
+                account=None,
+                account_label=None,
+                hint=None,
+                note=NOT_SHARED_NOTE,
+            )
+        for key in ("contexts", "sessions"):
+            claude[key] = [
+                row for row in claude.get(key, []) if row.get("conversation_id") == session_id
+            ]
+        harnesses["claude"] = claude
+    return {**view, "harnesses": harnesses}
+
+
 # ── Codex ───────────────────────────────────────────────────────────────
 
 
@@ -1166,6 +1212,18 @@ class LimitStore:
                 harnesses[harness] = body
         return {"now": (now or datetime.now(UTC)).isoformat(), "harnesses": harnesses}
 
+    def has_session_entry(self, session_id: str) -> bool:
+        """Whether the held Claude post has a status-line entry for *session_id*."""
+        with self._lock:
+            self._load()
+            entry = self._entries.get("claude")
+        if entry is None:
+            return False
+        snapshot: LimitSnapshot = entry["snapshot"]
+        # Only a status-line entry proves the reading is the session's own: a
+        # context-only row would still carry the host's default-login windows.
+        return any(row.conversation_id == session_id for row in snapshot.sessions)
+
     def accounts(self, shared: Mapping[str, str] | None = None) -> list[AccountUsage]:
         """Every account to show (:func:`merge_accounts`), with the held Claude post's counts.
 
@@ -1226,6 +1284,7 @@ __all__ = [
     "HARNESSES",
     "MAX_ACCOUNTS",
     "MAX_CONTEXTS",
+    "NOT_SHARED_NOTE",
     "NO_ACCOUNT_READING_NOTE",
     "NO_WINDOWS_NOTE",
     "PROFILE_HINT",
@@ -1244,6 +1303,7 @@ __all__ = [
     "claude_snapshot",
     "codex_snapshot",
     "headline_windows",
+    "member_view",
     "merge_accounts",
     "reset_store",
     "session_context",

@@ -5,7 +5,7 @@
 // numbers and one row per preset. A row opens a pop-up with that preset's
 // recent runs; a run's title opens its session.
 //
-// Why: Reid picks presets by feel and had no way to see that one costs three
+// Why: the owner picks presets by feel and had no way to see that one costs three
 // times another without finishing faster. The server (`GET /v1/ae/presets`,
 // preset_stats.py, admins only) answers from a cache and computes in the
 // background, so the first read after a restart says "Reading" and the next

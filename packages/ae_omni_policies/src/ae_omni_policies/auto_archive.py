@@ -1,13 +1,14 @@
 """The auto-archive sweep: a chat left in ``reference`` leaves the session list on its own.
 
-Added 2026-10-24. Reid closes a finished chat by setting ``ae.status`` to
-``reference``; it then sat in his list until he archived it by hand. A sweep
-every :data:`SWEEP_INTERVAL_S` archives it for him.
+Added 2026-10-24. The owner closes a finished chat by setting ``ae.status`` to
+``reference``; it then sat in their list until they archived it by hand. A sweep
+every :data:`SWEEP_INTERVAL_S` archives it for them.
 
 A session is archived when ALL hold: it is top level (no parent, kind
 ``default``), not archived, ``ae.status`` is ``reference``, it is idle
 (:func:`ae_omni_policies.retention.live_state`: no running turn, sub-agent or
-background shell), no approval is outstanding, no gate is open, and it has been
+background shell; a ``failed`` session, runner gone, counts as idle, see
+:func:`blocker`), no approval is outstanding, no gate is open, and it has been
 in ``reference`` for :data:`DEFAULT_MINUTES` (``AE_AUTO_ARCHIVE_MINUTES``).
 
 "In reference since" is the first sweep that saw the status, kept in
@@ -38,11 +39,11 @@ Children follow their lead (2026-10-24). Once a lead is archived, by this sweep 
 hand, its still-open descendants are archived too: top-level sessions whose ``ae.orch``
 chain leads to it, and sessions whose ``parent_conversation_id`` is it or a descendant
 (a Codex reviewer started with ``sys_session_create`` stays a child). A child that is
-not idle (running, approval, open gate), or is shared, is left, and its lead is looked
-at again next sweep. Only leads archived this pass or recorded in the state file are
-walked, then dropped once nothing is left open under them. Unarchiving a lead does not
-bring its children back. A lead archived by hand is found through the ``ae.orch``
-parent of a listed member, or through the parent of an idle plain child (kind
+busy (running, approval, open gate; a failed one counts as idle), or is shared, is left,
+and its lead is looked at again next sweep. Only leads archived this pass or recorded in
+the state file are walked, then dropped once nothing is left open under them. Unarchiving
+a lead does not bring its children back. A lead archived by hand is found through the ``ae.orch``
+parent of a listed member, or through the parent of a plain child that is not running (kind
 ``sub_agent``, at most :data:`MAX_CHILD_ROWS` rows read per sweep, each parent looked up once);
 an archived row is not listed, so a lead with neither is not found. The walk goes down
 through every child whatever its own outcome, so an idle grandchild under a busy or
@@ -78,7 +79,7 @@ from typing import Any
 import httpx
 from fastapi import APIRouter, FastAPI
 
-from ae_omni_policies import labels, merge_watch, retention
+from ae_omni_policies import auto_resume, labels, merge_watch, retention
 
 _logger = logging.getLogger(__name__)
 
@@ -322,10 +323,21 @@ def is_candidate(conv: Any) -> bool:
     )
 
 
-def blocker(conv: Any, live: str) -> str | None:
-    """Why *conv* must not be archived now (beyond the clock); ``None`` when it may be."""
-    if live != retention.IDLE:
+def blocker(conv: Any, live: str, now: float) -> str | None:
+    """Why *conv* must not be archived now (beyond the clock); ``None`` when it may be.
+
+    2026-10-29: only a running session blocks. A ``failed`` one (runner gone, nothing
+    running) is archived like an idle one; treating it as busy restarted its clock every
+    sweep and left the children of an archived lead open forever. Exception, same day: a
+    failed session that :func:`auto_resume.resumable_failure` says a host reconnect would
+    still revive (``runner_disconnected`` or ``runner_failed_to_start``, touched within
+    ``auto_resume.MAX_AGE_S``) waits, because both recoveries need it unarchived and a deploy
+    would otherwise lose its interrupted turn. Past that window it is archived.
+    """
+    if live == retention.RUNNING:
         return live
+    if live == retention.FAILED and auto_resume.resumable_failure(conv, now):
+        return "resumable"
     if (getattr(conv, "pending_elicitation_count", 0) or 0) > 0:
         return "approval outstanding"
     if labels.label(conv.labels, labels.GATE) == labels.GATE_OPEN:
@@ -429,7 +441,7 @@ class Sweeper:
         due: list[tuple[str, Any, float]] = []
         for session_id, row in in_reference.items():
             try:
-                why = blocker(row, await self._live(self._store, row))
+                why = blocker(row, await self._live(self._store, row), self._clock())
             except Exception:
                 _logger.exception("auto-archive: cannot read the state of %s", session_id)
                 continue
@@ -497,7 +509,11 @@ class Sweeper:
         return rows
 
     def _idle_plain_children(self) -> list[Any]:
-        """Open sub-agent rows that are not busy, from the newest :data:`MAX_CHILD_ROWS` read."""
+        """Open sub-agent rows whose status is not ``running``, newest MAX_CHILD_ROWS read.
+
+        ``failed`` counts, and so does ``waiting``; a waiting child is still left alone later,
+        because :func:`retention.live_state` reads it as running.
+        """
         rows: list[Any] = []
         after: str | None = None
         # Bound the rows read, not only the rows kept: busy sub-agents would page on otherwise.
@@ -512,7 +528,7 @@ class Sweeper:
                 accessible_by=None,
             )
             rows.extend(
-                row for row in page.data if getattr(row, "live_status", None) in (None, "idle")
+                row for row in page.data if getattr(row, "live_status", None) != retention.RUNNING
             )
             if not page.has_more or not page.last_id or len(rows) >= MAX_CHILD_ROWS:
                 break
@@ -575,7 +591,7 @@ class Sweeper:
         if conv is None or getattr(conv, "archived", False):
             return SKIPPED
         try:
-            why = blocker(conv, await self._live(self._store, conv))
+            why = blocker(conv, await self._live(self._store, conv), self._clock())
         except Exception:
             _logger.exception("auto-archive: cannot read the state of child %s", child_id)
             return FAILED
@@ -609,7 +625,7 @@ class Sweeper:
         now = self._clock()
         if now - min(_updated(conv), now) < self._wait_s:
             return SKIPPED  # a turn landed after the list was read
-        why = blocker(conv, await self._live(self._store, conv))
+        why = blocker(conv, await self._live(self._store, conv), self._clock())
         if why is not None:
             _logger.debug("auto-archive: %s stays (%s)", session_id, why)
             return SKIPPED

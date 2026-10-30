@@ -191,6 +191,7 @@ optional, and each says what is missing instead of failing:
 | Fabric capacities in the Admin Center | `AE_FABRIC_WAKE_URL_<NAME>`, `AE_FABRIC_SUSPEND_KEY_<NAME>`; for every capacity with Pause, Start and resize, `AE_FABRIC_CAPACITIES_URL` and `AE_FABRIC_CAPACITIES_KEY` (2026-10-21) | `GET /v1/ae/fabric` says how to add one; a capacity with no suspend key has Wake only; without the fleet pair only the wake URL capacities show and resize answers 409 |
 | Databricks spend in the Admin Center | `AE_DATABRICKS_HOST`, `AE_DATABRICKS_CLIENT_ID`, `AE_DATABRICKS_CLIENT_SECRET` | the section is off; `GET /v1/ae/databricks` says how to add them |
 | Azure spend card in the Admin Center | `AE_AZURE_COST_SUBSCRIPTIONS`, `AE_AZURE_COST_TENANT_ID`, `AE_AZURE_COST_CLIENT_ID`, `AE_AZURE_COST_CLIENT_SECRET` | the card is off; `GET /v1/ae/azure-cost` says how to add them |
+| Box health monitor in the Admin Center (2026-10-28) | server: `AE_BOX_ADMINS` and the `AE_BOX_HEALTH_*` thresholds; the box relay (`ae-omnigent-box-health.timer`): `AE_BOX_USERS` and the `AE_BOX_HEALTH_*` scan settings in `config/host.env` | the card says no reading has arrived and shows the command that starts the timer; only OmniGent admins and logins in `AE_BOX_ADMINS` see it. Cleanup buttons (2026-10-29): `AE_BOX_HEALTH_CLEANUP` (box, default `on`), `AE_BOX_USER_LABELS` and `AE_BOX_HEALTH_CLEANUP_FILE` (server); off hides the buttons |
 | the policy model (fork classifier) | the `llm:` block in `config/server.yaml` | the classifier abstains |
 | Azure Key Vault | none in the server; `deploy/pull-secrets.sh` only | nothing: the server reads environment variables, so fill the secrets file another way |
 
@@ -231,12 +232,13 @@ packages/ae_omni_extension the Dashboard (the Parking Lot and Your move pages un
 agents/                   steward, shutdown, orchestrator and reviewer-codex as single-file agent.yaml specs (OMNIGENT_BUILTIN_AGENT_DIRS)
 config/server.yaml        the server config that loads the AE layer (policy_modules, debug_router_modules, ae_seed_policies (the Global Policies page's first-boot seed since 2026-10-18), the commented llm: examples, the agents' environment)
 config/*.env.example      every variable the server (server.env.example) and the box host (host.env.example) read; the box copies them to config/*.env, gitignored
-scripts/                  check-lock, apply-patches, export-patches, rebase-patches, sync-upstream, next-release-tag, regen-golden-note, port-triage-fixtures, backfill-triage-notes, claude-effort-defaults, seed-schedules, ae-health, docs-coverage (plus _lib.sh)
+scripts/                  fork-push (leak scan, then push to the public fork), check-lock, apply-patches, export-patches, rebase-patches, sync-upstream, next-release-tag, regen-golden-note, port-triage-fixtures, backfill-triage-notes, claude-effort-defaults, seed-schedules, leak-scan (with leak-allowlist.txt and the hooks/pre-push hook; docs/LEAK-SCAN.md), ae-health, docs-coverage (plus _lib.sh)
 justfile                  every command in one place; CI calls the same recipes
 deploy/                   the box: Dockerfile (stage 2 of the image), docker-compose.override.yml, compose.sh, auto-update.sh, systemd/ (four units, plus the auto-update and plan limits timers under user/), ae-limits-statusline.sh, pull-secrets.sh, backup-omnigent.sh, install-host.sh, host-container.sh and host-container/ (the second user's host), host-relink.sh, README.md (the deploy guide)
 tests/deploy/             what a machine with no Docker daemon and no systemd can prove about deploy/ and the release workflow (run by `just test`)
 ruff.toml                 the package rule set for tests/ and scripts/ae-health.py
 docs/LABELS.md            the ae.* session label vocabulary
+docs/LEAK-SCAN.md         what the leak scan blocks, where it runs, how to clear a false positive (2026-10-28)
 docs/PLAN-LIMITS.md       where the Claude Code and Codex plan limits come from, the relay, turning it on (2026-09-24)
 docs/screenshots/         evidence per phase (phase-2: the sidebar; plan-limits: the popover and the strip; usage-panel: the full popover and the login hint; each at 1009x719, 375x667, 430x932)
 docs/UPSTREAM-SYNC.md     the sync procedure and what CI enforces
@@ -244,7 +246,7 @@ docs/CHANGELOG.md         the history, newest first
 docs/design/              design notes (dashboard-review.md)
 docs/features/            the feature gallery: one page per area, each feature with its clip or screenshot, where to find it, and the core patch or package that builds it
 docs/media/               the gallery's animated WebP clips, screenshots and the README banner, cut from renders of the fork's real UI on made-up data
-.github/workflows/        ci.yml (patches, upstream-smoke, python, web, image, rules) image.yml (publish on an ae-v* tag), release.yml (tag main after green CI) and patch-rebase.yml (rebase open patch PRs after a merge)
+.github/workflows/        ci.yml (patches, upstream-smoke, python, web, image, rules, leaks) leak-pr.yml (the `leaks` check of a pull request, re-run on edits and on the allowlist approval label) fork-backstop.yml (hourly scan of the public fork's branches) image.yml (publish on an ae-v* tag), release.yml (tag main after green CI) and patch-rebase.yml (rebase open patch PRs after a merge)
 CLAUDE.md                 rules for Claude sessions here, plus the managed branch-discipline block
 ```
 
@@ -300,7 +302,7 @@ just schedules-seed https://<box-hostname>.<tailnet>.ts.net:8010                
 | `steward` | claude-sdk | weekdays 08:00, server's `AE_TASK_STORE_TZ` | `list_parked`, `omni_capacity`; box memory's read tools | nothing: one brief, lot items resurfacing today and the working sessions with elapsed time |
 | `shutdown` | claude-sdk | weekdays 17:30, server's `AE_TASK_STORE_TZ` | `omni_capacity`, `omni_transcript`; box memory's read tools | nothing: one THREAD / STATE / NEXT / SLOT / QUADRANT note per working session; the operator flips the status from the Parking Lot page |
 | `reviewer-codex` | codex | on request, off by default | none (read-only `os_env`) | nothing: findings with file and line |
-| `orchestrator` | claude-sdk | when the operator talks to it; its own hourly check-in | `omni_capacity`, `omni_transcript`, `omni_set_status`, `list_parked`, `create_session`, `post_message`, `answer_child_question`, `schedule_checkin`, `list_prs`, `ask_reid` | sessions it starts and briefs, messages to them, its one check-in schedule, review on merged work; never a merge |
+| `orchestrator` | claude-sdk | when the operator talks to it; its own hourly check-in | `omni_capacity`, `omni_transcript`, `omni_set_status`, `list_parked`, `create_session`, `post_message`, `answer_child_question`, `schedule_checkin`, `list_prs`, `ask_user` | sessions it starts and briefs, messages to them, its one check-in schedule, review on merged work; never a merge |
 
 Where a run happens is decided at fire time: a task with no pinned host runs on the
 owner's online host and defaults its workspace to that host's home directory, and
@@ -326,7 +328,7 @@ and it runs box sessions the way a cloud Claude Code orchestrator does
 Its session tools go through `POST /v1/ae/sessions` (a slot held first under the slot cap's own lock,
 idempotent by `ae.orch_key`) and `GET /v1/ae/sessions`; `list_prs` reads the
 server's cards and `gh` on the host (`ae_omni_policies/gh.py`, read only);
-`ask_reid` is an MCP elicitation, so decisions arrive as pop-ups. A box whose
+`ask_user` is an MCP elicitation, so decisions arrive as pop-ups. A box whose
 `config/server.env` predates it still registers it: the image's entrypoint appends
 `/opt/ae/agents/orchestrator` to `OMNIGENT_BUILTIN_AGENT_DIRS` (`AE_EXTRA_AGENTS=off`
 stops that). No seeding: the orchestrator writes its own check-in schedule.
@@ -370,6 +372,7 @@ reachability checks and the known gaps) is "Second user's host (container)" in
 | `web-test` | `just web-test <n>/4` in four parallel jobs: the vitest suites the patch series adds or touches are green, split with vitest's `--shard` so the web suites take about 4 minutes, not 10 (split out of `web` 2026-10-20) |
 | `image` | the two-stage image builds; `omni --version` prints the pinned version; the extension catalog lists `analyticendeavors.parking-lot` and `doctor` resolves its bundle; both AE packages import; the agent specs are at `/opt/ae/agents` |
 | `rules` | the managed block in `CLAUDE.md` matches its source in ae-claude-skills |
+| `leaks` | `scripts/leak-scan.py` finds no internal identifier (IP, host, e-mail, home path, cloud id, private repository link, secret, binary or image metadata, a commit author that is not a noreply address, or a string from the private denylist) in any commit a PR brings (each one on its own, so a value added and removed still fails), its paths, messages, title and body; on a push to `main` it also scans the pushed commits and the whole tree. The base commit's scanner and allowlist run on a PR (`leak-pr.yml`); an allowlist entry a PR adds fails unless an approver labels it. Without the denylist secret it warns and runs the generic classes only. `docs/LEAK-SCAN.md` (added 2026-10-28) |
 
 `.github/workflows/image.yml` runs on a tag push `ae-vX.Y.Z.N` (and by hand as a dry
 run). It builds the two stages exactly as the `image` job does, runs the same smoke
@@ -436,6 +439,8 @@ Never in the repo. The workflows read these repository secrets:
 |---|---|---|
 | `RULES_SOURCE_TOKEN` | `rules` job (private repository only) | fine-grained PAT, Contents: read on `analyticendeavors/ae-claude-skills`. Without it the job only checks that the managed markers are present, warns, and passes; with it, any drift from the source fails the PR. |
 | `PATCH_BOT_TOKEN` | `patch-rebase.yml` | fine-grained PAT on `analyticendeavors/omnigent-ae` and `analyticendeavors/omnigent`: Contents, Pull requests and Workflows read and write. `GITHUB_TOKEN` cannot push to the fork, and its pushes start no CI. Without it the workflow warns and passes. Setup: `docs/UPSTREAM-SYNC.md`, "Patch rebase bot". |
+| `AE_LEAK_DENYLIST_B64` (secret) and `AE_LEAK_DENYLIST_SHA256` (variable) | `leaks` jobs (`ci.yml` on a push, `leak-pr.yml` on a PR), `fork-backstop.yml` (private repository only) | the private denylist bundle as one base64 line, and the sha256 of its decoded text. A secret without the variable, or a mismatch, fails the job. Without the secret they warn and run the generic classes only. Set both together; `docs/LEAK-SCAN.md`. |
+| `AE_LEAK_ALLOWLIST_APPROVERS` (variable) and the label `leak-allowlist-approved` | `leak-pr.yml` | comma-separated numeric GitHub user ids who may approve a PR's new allowlist entries by applying the label. Unset or empty means nobody can, so new entries always fail. A push that changes `scripts/leak-allowlist.txt` removes the label. Not created yet; `docs/LEAK-SCAN.md` (added 2026-10-28). |
 
 The other direction, ae-claude-skills stamping this repo, uses its own
 `RULES_SYNC_TOKEN`, which must list this repository. `image.yml` needs no secret:

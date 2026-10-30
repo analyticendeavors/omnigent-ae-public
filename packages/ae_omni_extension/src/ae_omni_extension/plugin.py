@@ -32,7 +32,7 @@ YOUR_MOVE_PAGE_ID = f"{EXTENSION_ID}.your-move"
 YOUR_MOVE_ROUTE = "your-move"
 # Admin Center (2026-10-16 as Fabric Admin; renamed 2026-10-18): the Fabric
 # capacities' Wake and Off buttons (aetraining first, room for more), on a
-# page of its own with the extension's one nav row. Reid wanted it inside
+# page of its own with the extension's one nav row. The owner wanted it inside
 # omnigent-ae next to the Dashboard; the row sits in upstream's extension slot
 # between Inbox and Usage. The Dashboard keeps patch P7's sidebar row and no nav row here.
 FABRIC_PAGE_ID = f"{EXTENSION_ID}.fabric"
@@ -50,7 +50,7 @@ REQUIRES_OMNIGENT = ">=0.18,<0.20"
 def get_manifest() -> ExtensionManifest:
     """The declarative contribution: the Dashboard (two routes to one page) and the Admin Center.
 
-    Reid found "Your move", "Parking Lot" and "Slots" three entries for one
+    The owner found "Your move", "Parking Lot" and "Slots" three entries for one
     feature (2026-09-24). The Dashboard's one entry is patch P7's "Dashboard
     n/3" row in the sidebar, which links to ``PAGE_ROUTE``. The Admin Center
     (2026-10-16, first called Fabric Admin) is a separate page with the

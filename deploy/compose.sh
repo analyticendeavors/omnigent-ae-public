@@ -21,9 +21,9 @@
 #                                config/secrets.env whenever that exists
 #                                (README.md "Quick start", 2026-10-22).
 #                                AE_SERVER_SECRETS names any other file.
-# Both are readable by root and by reid (640 root:reid), so the same command
+# Both are readable by root and by <user> (640 root:<user>), so the same command
 # works under sudo for the system unit and unprivileged for a look at the logs
-# when reid is in the docker group.
+# when <user> is in the docker group.
 #
 # Compose files, in order: upstream's, deploy/docker-compose.override.yml, and
 # config/compose.local.yml when it exists (this machine's own additions, such

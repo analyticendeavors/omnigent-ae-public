@@ -198,6 +198,15 @@ async function call<T>(
   return response.body as T;
 }
 
+/** A 403 admin_only (2026-10-28): a section for admins read by someone else, not a failure. */
+export const isAdminOnly = (error: unknown): boolean =>
+  error instanceof AeRequestError && error.status === 403 && error.code === "admin_only";
+
+export const isLotAdminOnly = isAdminOnly;
+
+/** After an admin_only answer a section looks again this seldom; a 200 brings it back (2026-10-28). */
+export const ADMIN_RECHECK_MS = 5 * 60_000;
+
 export const fetchCapacity = (context: ExtensionContext) =>
   call<Capacity>(context, "GET", "/v1/ae/capacity");
 
@@ -368,7 +377,7 @@ export interface SourceError {
 
 export type WaitKind = "gate" | "awaiting" | "blocked" | "review";
 
-/** A session that waits on Reid (ae_omni_policies.your_move.waiting_sessions). */
+/** A session that waits on the owner (ae_omni_policies.your_move.waiting_sessions). */
 export interface WaitingSession {
   id: string;
   title: string;
@@ -898,6 +907,281 @@ export const fetchHostStatus = (context: ExtensionContext) =>
 export const requestHostRelink = (context: ExtensionContext) =>
   call<HostStatus>(context, "POST", "/v1/ae/host/relink", {});
 
+// ── Admin Center, who sees what (2026-10-28): `/v1/ae/access` ──
+
+/** What the caller may see of the Admin Center; the server never lists other admins. */
+export interface AccessView {
+  /** An OmniGent admin: every card. */
+  admin: boolean;
+  /** An admin, or a login named in the server's AE_BOX_ADMINS: the Box health monitor. */
+  box_admin: boolean;
+}
+
+export const fetchAccess = (context: ExtensionContext) =>
+  call<AccessView>(context, "GET", "/v1/ae/access");
+
+// ── Admin Center, Box health monitor (2026-10-28): `/v1/ae/box-health` ──
+
+export type BoxTone = "green" | "amber" | "red" | "grey";
+
+export interface BoxNeed {
+  key: string;
+  area: string;
+  tone: "amber" | "red";
+  text: string;
+  detail: string;
+  /** The user label the line is about, if one. */
+  owner: string | null;
+  /** The cleanup this line can be fixed with, if the box offers one (2026-10-28). */
+  action?: BoxCleanupActionId | null;
+}
+
+/** The four cleanups the box can run (2026-10-28, Box health PR 2). */
+export type BoxCleanupActionId =
+  | "claude_scratch"
+  | "tmp_litter"
+  | "review_checkouts"
+  | "docker_prune";
+
+/** One cleanup the box offers now; *confirm* is the server's full text, shown as is. */
+export interface BoxActionOffer {
+  id: BoxCleanupActionId;
+  /** A user label, or "all" for docker_prune. */
+  owner: string;
+  /** Whose items: the box itself, a mapped container, or the whole box (Docker). */
+  where?: "box" | "container" | "all";
+  /** Button text, e.g. "Remove 268 folders". */
+  label: string;
+  count: number;
+  files: number;
+  bytes: number;
+  confirm: string;
+  can_run: boolean;
+  why_not: string | null;
+  hint: string;
+}
+
+export type BoxCleanupStateName =
+  | "queued"
+  | "untaken"
+  | "expired"
+  | "running"
+  | "lost"
+  | "done"
+  | "failed"
+  | "cancelled";
+
+export interface BoxCleanupState {
+  state: BoxCleanupStateName;
+  action: string;
+  owner: string;
+  /** "Claude temp folders". */
+  label: string;
+  by: string;
+  requested_at: string;
+  taken_at: string | null;
+  finished_at: string | null;
+  result: null | {
+    removed: number;
+    bytes_freed: number;
+    skipped: Record<string, number>;
+    errors: string[];
+    partial: boolean;
+  };
+  /** A ready-made plain sentence for the card; shown as is. */
+  message: string;
+  can_cancel: boolean;
+  can_retry: boolean;
+}
+
+export interface BoxArea {
+  id: "heat" | "cpu" | "memory" | "storage" | "bloat";
+  label: string;
+  tone: BoxTone;
+  /** 24 characters or fewer: it has to fit a 200 px card. */
+  value: string;
+  title: string;
+}
+
+export interface BoxClaudeRoot {
+  where: "tmp" | "cache" | "container";
+  exists?: boolean;
+  readable: boolean;
+  projects?: number;
+  sessions?: number;
+  stale_sessions?: number;
+  files?: number;
+  bytes?: number;
+  stale_files?: number;
+  stale_bytes?: number;
+  oldest_days?: number;
+  top_age_days?: number;
+  partial?: boolean;
+  had_unreadable?: boolean;
+}
+
+export interface BoxLitterGroup {
+  group: string;
+  entries: number;
+  stale: number;
+  /** Plain files only: a litter folder is never opened. */
+  bytes?: number;
+  partial?: boolean;
+}
+
+export interface BoxUser {
+  label: string;
+  kind: "box" | "container";
+  running?: boolean | null;
+  writable_b?: number | null;
+  home_b?: number | null;
+  claude: BoxClaudeRoot[];
+  pytest?: {
+    exists: boolean;
+    readable: boolean;
+    entries: number;
+    stale: number;
+    files: number;
+    bytes: number;
+  } | null;
+  litter: BoxLitterGroup[];
+  worktrees?: {
+    count: number;
+    bytes?: number | null;
+    older_14d: number;
+    with_changes?: number | null;
+    partial: boolean;
+  } | null;
+}
+
+export interface BoxMount {
+  path: string;
+  fstype: string;
+  size_b: number;
+  used_b: number;
+  space_pct: number | null;
+  inodes: number | null;
+  inodes_used: number | null;
+  inodes_pct: number | null;
+}
+
+export interface BoxSetting {
+  name: string;
+  side: "server" | "host";
+  value: string;
+  hint: string;
+}
+
+export interface BoxHistory {
+  step_s: number;
+  end: string | null;
+  cpu_c: Array<number | null>;
+  nvme_c: Array<number | null>;
+  load1: Array<number | null>;
+  mem_pct: Array<number | null>;
+  disk_pct: Array<number | null>;
+}
+
+export interface BoxGuard {
+  running: boolean;
+  locked: number;
+  failed: number;
+  age_s: number | null;
+  claude_processes: number;
+  claude_unmatched: number;
+  claude_remote: number;
+}
+
+export interface BoxHealthDetails {
+  heat?: {
+    cpu_c: number | null;
+    nvme_c: number | null;
+    chassis_c: number | null;
+    gpu_c: number | null;
+    gpu_power_w: number | null;
+  };
+  cpu?: {
+    threads: number;
+    load1: number;
+    load5: number;
+    load15: number;
+    busy_pct: number | null;
+    psi_some_avg60: number | null;
+  };
+  memory?: {
+    total_b: number;
+    used_b: number;
+    used_pct: number | null;
+    shmem_b: number;
+    swap_total_b: number;
+    swap_free_b: number;
+    tmpfs: Array<{ path: string; used_b: number }>;
+  };
+  mounts?: BoxMount[];
+  users?: BoxUser[];
+  docker?: {
+    images: number;
+    images_b: number;
+    images_reclaim_b: number;
+    volumes: number;
+    volumes_b: number;
+    build_cache_b: number;
+    build_reclaim_b: number;
+  } | null;
+  /** Each folder by the label the box's setting gave it; its path is never sent. */
+  dirs?: Array<{ label: string; bytes: number; files: number; partial: boolean }>;
+  journal_b?: number | null;
+  stale_days?: number | null;
+  guard?: BoxGuard;
+  system?: {
+    uptime_s: number | null;
+    failed_units: string[];
+    failed_user_units: string[];
+    /** Failed units that may not be named (anything but ae-, systemd and docker units). */
+    failed_units_other?: number;
+    failed_user_units_other?: number;
+  };
+  failed_parts?: string[];
+  cleanup?: {
+    enabled: boolean;
+    auto_aged: Array<{ owner: string; count: number }>;
+  };
+}
+
+export interface BoxHealthView {
+  state: "ok" | "missing" | "stale";
+  tone: BoxTone;
+  read_at: string | null;
+  age_s: number | null;
+  slow_read_at: string | null;
+  slow_age_s: number | null;
+  host: string | null;
+  needs: BoxNeed[];
+  areas: BoxArea[];
+  details: BoxHealthDetails;
+  /** Cleanups on offer; missing from an older server. */
+  actions?: BoxActionOffer[];
+  /** The latest cleanup request; null or missing when none. */
+  cleanup?: BoxCleanupState | null;
+  history: BoxHistory;
+  settings: BoxSetting[];
+  /** The command that starts the box timer; sent only while there is no reading. */
+  setup: string | null;
+}
+
+export const fetchBoxHealth = (context: ExtensionContext) =>
+  call<BoxHealthView>(context, "GET", "/v1/ae/box-health");
+
+/** Ask the box to run a cleanup. 409 codes: box_health_busy, box_health_stale, box_health_changed. */
+export const requestBoxCleanup = (
+  context: ExtensionContext,
+  body: { action: BoxCleanupActionId; owner: string; count: number },
+) => call<unknown>(context, "POST", "/v1/ae/box-health/cleanup", body);
+
+/** Withdraw a queued request; 409 once the box has taken it. */
+export const cancelBoxCleanup = (context: ExtensionContext) =>
+  call<unknown>(context, "POST", "/v1/ae/box-health/cleanup/cancel", {});
+
 // ── Admin Center, Secrets section (2026-10-20): `/v1/ae/secrets` ──
 
 /** How close a secret is to its Key Vault expiry; "unknown" until the box's reading arrives. */
@@ -1002,7 +1286,7 @@ export interface VaultSecret {
   rotate_hint?: string | null;
   /**
    * The secret's owner, an OmniGent user id (2026-10-23, secret expiry
-   * alerts); null for no owner, when alerts go to Reid. Absent from a server
+   * alerts); null for no owner, when alerts go to the owner. Absent from a server
    * older than the owners, which hides the avatars.
    */
   owner?: string | null;
@@ -1506,6 +1790,70 @@ export const fetchAzureCost = (context: ExtensionContext) =>
 
 export const fetchPresets = (context: ExtensionContext, days: number) =>
   call<PresetsAnswer>(context, "GET", `/v1/ae/presets?days=${days}`);
+
+// ── Family cost (2026-10-29): `GET /v1/ae/family-cost?days=7|30` (family_cost.py) ───
+
+export type CostUnit = "tokens" | "dollars";
+
+export interface FamilyRole {
+  /** lead (incl. its subagents), builder, reviewer, codex or other. */
+  role: string;
+  sessions: number;
+  cost_usd: number;
+  tokens_total: number;
+}
+
+export interface FamilyRow {
+  lead_id: string;
+  title: string;
+  /** The host's name; empty when the lead has none. */
+  host: string;
+  owner: string;
+  status: string;
+  cost_usd: number;
+  /** `input` includes cache writes: the session keeps no separate figure. */
+  tokens: { input: number; output: number; cache_read: number; total: number };
+  today: { cost_usd: number; tokens_total: number };
+  by_role: FamilyRole[];
+  sessions: number;
+  lead_context_tokens: number | null;
+  restarts: number;
+  flagged: boolean;
+}
+
+/** The viewer's saved "Show cost as" and "Runaway family" (one runaway value per unit). */
+export interface FamilyCostSettings {
+  unit: CostUnit;
+  runaway_tokens: number;
+  runaway_usd: number;
+}
+
+export interface FamilyCostAnswer {
+  state: "warming" | "ready";
+  days: number;
+  unit_default: CostUnit;
+  settings?: FamilyCostSettings;
+  computed_at?: string;
+  /** The first day the stored history covers, for the window's older sessions. */
+  history_since?: string | null;
+  /** True while that history is shorter than the window. */
+  partial?: boolean;
+  families?: FamilyRow[];
+  totals?: { families: number; cost_usd: number; tokens_total: number; flagged: number };
+  truncated?: boolean;
+}
+
+export const fetchFamilyCost = (context: ExtensionContext, days: number) =>
+  call<FamilyCostAnswer>(context, "GET", `/v1/ae/family-cost?days=${days}`);
+
+export const saveFamilyCostSettings = (
+  context: ExtensionContext,
+  fields: {
+    family_cost_unit?: CostUnit;
+    runaway_family_tokens?: number;
+    runaway_family_usd?: number;
+  },
+) => call<FamilyCostSettings>(context, "POST", "/v1/ae/family-cost/settings", fields);
 
 // ── Newer models (2026-10-26, model nudge): newer_models.py ─
 

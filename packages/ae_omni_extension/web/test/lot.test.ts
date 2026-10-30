@@ -1,6 +1,6 @@
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { Lot, LotTask, Session } from "../src/api";
+import { AeRequestError, isLotAdminOnly, type Lot, type LotTask, type Session } from "../src/api";
 import { EXPANDED_KEY, loadLotState, type LotView, renderLot, resetLotState } from "../src/lot";
 import { resetLotFilter } from "../src/lotFilter";
 import { setTagStyles } from "../src/tags";
@@ -291,5 +291,23 @@ describe("the lot card", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // 2026-10-28: the lot is the box owner's task store; a signed-in non-admin gets a 403.
+  it("tells a non-admin the lot is for admins, with no park form and no error wall", () => {
+    const { context } = stubContext(() => ({ ok: true, status: 200, body: {} }));
+    const denied = new AeRequestError(403, {
+      error: { code: "admin_only", message: "Only an OmniGent admin can use the Parking Lot." },
+    });
+    expect(isLotAdminOnly(denied)).toBe(true);
+    expect(isLotAdminOnly(new AeRequestError(403, { error: { code: "forbidden" } }))).toBe(false);
+    expect(isLotAdminOnly(new AeRequestError(503, { error: { code: "admin_only" } }))).toBe(false);
+    render(context, host, { lot: null, lotError: denied });
+    expect(host.textContent).toContain("The Parking Lot is for admins.");
+    expect(host.querySelector(".notice-error, .flash")).toBeNull();
+    expect(host.querySelector("#park")).toBeNull();
+    // Back to admin: the form returns on the next paint.
+    render(context, host);
+    expect(host.querySelector("#park")).not.toBeNull();
   });
 });

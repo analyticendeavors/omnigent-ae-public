@@ -124,11 +124,12 @@ def test_warn_mode_asks_with_the_three_titles(store: _Store) -> None:
     result = slot_cap(mode="warn")(_request())
     assert result is not None and result["result"] == "ASK"
     reason = result["reason"]
-    assert reason.startswith("Slots full: 3 of 3 taken; this one would make 4 of 3. ")
+    assert reason.startswith("Slots full: 3 of 3 taken. Run this as the 4th? ")
     assert "1. Fix pricing padding (next: verify light mode)" in reason
     assert "2. Renewal note (elapsed 10m)" in reason
     assert "3. CSV export header (elapsed under a minute)" in reason
-    assert "Accept to run one more (marked overflow)" in reason
+    assert "To park one instead, the longest running: Fix pricing padding or Renewal" in reason
+    assert "Accept to run it as overflow" in reason
     assert result["set_labels"][labels.OVERFLOW] == "1"
     assert result["set_labels"][labels.STATUS] == "working"
 
@@ -352,7 +353,7 @@ def test_reserve_counts_like_the_policy_and_release_frees_it() -> None:
     # The held claim counts: a second create in the same instant finds the slots full.
     held, full, _, pending = slot_cap_module.reserve("orch:b", rows, 3)
     assert (held, full, pending) == (False, True, 1)
-    # Reid chose to run one more: held, and flagged as past the limit.
+    # The owner chose to run one more: held, and flagged as past the limit.
     held, full, _, _ = slot_cap_module.reserve("orch:b", rows, 3, riding=True)
     assert (held, full) == (True, True)
     slot_cap_module.release("orch:a")
@@ -378,6 +379,18 @@ def test_a_merge_watcher_note_passes_full_slots_without_a_claim(store: _Store, m
     assert store.calls == []
     # The same slots still hold a typed prompt, and a note's words mid-message are not a note.
     typed = slot_cap(mode=mode)(_request("Merged it, Merge watcher: PR #196 (x)", own))
+    assert typed is not None and typed["result"] in ("ASK", "DENY")
+
+
+@pytest.mark.parametrize("mode", ["warn", "block"])
+def test_the_old_lead_handoff_words_get_no_exemption(store: _Store, mode: str) -> None:
+    # The sweep no longer posts that note, so a prompt starting with its words is ordinary.
+    store.rows = THREE
+    own = {labels.STATUS: "review"}
+    store.own[OWN] = _conv(OWN, "Audit", own)
+    typed = slot_cap(mode=mode)(
+        _request("Lead handoff: this chat's context is about 412,000 tokens.", own)
+    )
     assert typed is not None and typed["result"] in ("ASK", "DENY")
 
 
@@ -825,3 +838,63 @@ def test_a_self_parent_or_orch_cycle_counts_as_a_lead() -> None:
 def test_slots_held_takes_helpers_count_by_keyword_only() -> None:
     with pytest.raises(TypeError):
         sessions.slots_held([], {}, True)  # type: ignore[misc]
+
+
+def test_the_card_lists_slot_holders_only_and_trims_long_titles() -> None:
+    long_title = "Builder: account switch cascades to child chats and every open tab"
+    rows = [
+        _working("lead", long_title, NOW - 900),
+        _child("k1", "Child one", "lead", NOW - 600),
+        _child("k2", "Child two", "lead", NOW - 300),
+    ]
+    working = sessions.working_sessions(rows)
+    held = sessions.held_keys(working, by_id={row.id: row for row in rows})
+    shown = [sessions.summarize(row, now=NOW) for row in working if row.id in held]
+    text = slot_cap_module.reason_text(shown, 1, "warn", None, used=len(held))
+    assert text.startswith("Slots full: 1 of 1 taken. Run this as the 2nd? 1. Builder: account")
+    assert "..." in text and long_title not in text
+    assert "Child one" not in text and "Child two" not in text
+
+
+def test_ordinals() -> None:
+    ordinal = slot_cap_module._ordinal
+    assert [ordinal(n) for n in (1, 2, 3, 4, 7, 11, 12, 13, 21, 22, 112)] == [
+        "1st",
+        "2nd",
+        "3rd",
+        "4th",
+        "7th",
+        "11th",
+        "12th",
+        "13th",
+        "21st",
+        "22nd",
+        "112th",
+    ]
+
+
+def test_the_park_suggestion_names_one_session_when_only_one_is_listed() -> None:
+    working = [sessions.summarize(_working("lead", "Lead", NOW - 900), now=NOW)]
+    text = slot_cap_module.reason_text(working, 1, "warn", None, used=1)
+    assert "To park one instead, the longest running: Lead." in text
+    assert slot_cap_module.reason_text([], 1, "warn", None, used=1).count("longest") == 0
+
+
+def test_the_warn_text_keeps_the_shape_the_web_card_parses() -> None:
+    # web/src/lib/aeSlotsFull.ts splits this text on these exact sentences (2026-10-29);
+    # reword one here and that parser, and its fixtures, change with it.
+    working = [
+        sessions.summarize(_working("a", "Alpha (draft). Two", NOW - 100_800), now=NOW),
+        sessions.summarize(_working("b", "Beta", NOW - 600, **{labels.NEXT: "do x"}), now=NOW),
+    ]
+    text = slot_cap_module.reason_text(
+        working, 2, "warn", "https://lot.example/p", pending=1, used=2, others=1
+    )
+    assert text == (
+        "Slots full: 3 of 2 taken. Run this as the 4th? "
+        "1. Alpha (draft). Two (elapsed 1d 4h) 2. Beta (next: do x) "
+        "Plus 1 of another user's. 1 more claimed a slot a moment ago. "
+        "To park one instead, the longest running: Alpha (draft). Two or Beta. "
+        "Accept to run it as overflow, or decline, then "
+        "park one in the Parking Lot (https://lot.example/p) or flip one to review."
+    )

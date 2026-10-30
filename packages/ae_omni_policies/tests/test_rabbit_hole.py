@@ -160,7 +160,7 @@ class _FamilyStore:
     def get_session_owner(self, conversation_id: str, owner_only: bool = False) -> str | None:
         if self.owner_error:
             raise OperationalError("select", {}, Exception("locked"))
-        return self.owners.get(conversation_id, "reid")
+        return self.owners.get(conversation_id, "owner")
 
 
 def _family(
@@ -209,7 +209,7 @@ def test_a_foreign_owner_or_missing_lead_asks(monkeypatch: pytest.MonkeyPatch) -
     _family(
         monkeypatch,
         lead_state={ACK_KEY: "1"},
-        owners={"conv_a": "reid", "conv_lead": "someone-else"},
+        owners={"conv_a": "owner", "conv_lead": "someone-else"},
     )
     assert _asks(rabbit_hole(hours=4, turns=2)(_event(OVER)))
     _family(monkeypatch, lead=False)
@@ -307,7 +307,7 @@ async def test_the_ask_is_held_once_and_accept_acknowledges(
 def test_a_merge_watcher_note_is_neither_counted_nor_asked(
     store: dict[str, Conversation],
 ) -> None:
-    # 2026-10-21: the merge watcher's note continues the work; it is not Reid's turn.
+    # 2026-10-21: the merge watcher's note continues the work; it is not Owner's turn.
     policy = rabbit_hole(hours=4, turns=60)
     event = _event({TURNS_KEY: 80}, {labels.STARTED: str(NOW - 9 * HOUR)})
     event["data"] = {"user_content": "Merge watcher: PR #7 (Fix it) merged at 09:00Z as abc."}
@@ -315,6 +315,17 @@ def test_a_merge_watcher_note_is_neither_counted_nor_asked(
     event["data"] = "Merge watcher: PR #7 (Fix it) was closed without merging."
     assert policy(event) is None
     event["data"] = {"user_content": "keep going"}
+    response = policy(event)
+    assert response is not None and response["result"] == "ASK"
+
+
+def test_the_old_lead_handoff_words_are_an_ordinary_prompt(
+    store: dict[str, Conversation],
+) -> None:
+    # The sweep no longer posts that note, so nothing trusted starts with those words.
+    policy = rabbit_hole(hours=4, turns=60)
+    event = _event({TURNS_KEY: 80}, {labels.STARTED: str(NOW - 9 * HOUR)})
+    event["data"] = {"user_content": "Lead handoff: this chat's context is about 412,000 tokens."}
     response = policy(event)
     assert response is not None and response["result"] == "ASK"
 

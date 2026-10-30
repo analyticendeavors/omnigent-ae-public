@@ -11,8 +11,12 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from omnigent.server.routes._sessions.common import (
+    _LAST_TASK_ERROR_CODE_LABEL_KEY,
+    _LAST_TASK_ERROR_MESSAGE_LABEL_KEY,
+)
 
-from ae_omni_policies import auto_archive, labels
+from ae_omni_policies import auto_archive, auto_resume, labels
 from ae_omni_policies.auto_archive import StateFile, Sweeper
 
 WAIT = 600.0
@@ -28,6 +32,7 @@ class Conv:
     pending_elicitation_count: int = 0
     title: str = "done chat"
     updated_at: int = 0
+    live_status: str | None = None
 
 
 class Rig:
@@ -122,14 +127,13 @@ async def test_a_flip_out_of_reference_resets_the_clock() -> None:
     "mutate",
     [
         lambda rig, c: rig.live.__setitem__(c.id, "running"),
-        lambda rig, c: rig.live.__setitem__(c.id, "failed"),
         lambda rig, c: setattr(c, "pending_elicitation_count", 1),
         lambda rig, c: c.labels.__setitem__(labels.GATE, labels.GATE_OPEN),
         lambda rig, c: setattr(c, "parent_conversation_id", "parent"),
         lambda rig, c: setattr(c, "kind", "task"),
         lambda rig, c: setattr(c, "archived", True),
     ],
-    ids=["running", "failed", "approval", "gate", "child", "other-kind", "archived"],
+    ids=["running", "approval", "gate", "child", "other-kind", "archived"],
 )
 async def test_what_it_leaves_alone(mutate: Any) -> None:
     rig = Rig()
@@ -353,7 +357,7 @@ async def test_an_unarchived_session_is_not_archived_again_until_it_leaves_refer
     await rig.sweep()
     assert await rig.sweep(WAIT) == ["a"]
     assert rig.sweeper.archived_by_sweep == {"a"}
-    conv.archived = False  # Reid unarchives it; still in reference
+    conv.archived = False  # the owner unarchives it; still in reference
     assert await rig.sweep(WAIT * 3) == []
     assert rig.sweeper.archived_by_sweep == {"a"}
     conv.labels = {labels.STATUS: labels.WORKING}
@@ -537,6 +541,29 @@ async def test_an_archived_leads_idle_children_archive_with_it(
     assert rig.convs["busy"].archived
 
 
+async def test_a_failed_reference_session_is_archived_after_the_clock() -> None:
+    rig = Rig()
+    rig.add(Conv("a"))
+    rig.live["a"] = "failed"
+    assert await rig.sweep() == []
+    assert await rig.sweep(WAIT - 1) == []
+    assert await rig.sweep(1) == ["a"]
+    assert rig.convs["a"].archived
+
+
+async def test_a_failed_child_of_an_archived_lead_archives_with_it() -> None:
+    rig = Rig()
+    rig.add(Conv("lead"))
+    rig.add(Conv("dead", {labels.STATUS: labels.WORKING, labels.ORCH: "lead"}))
+    rig.add(Conv("busy", {labels.STATUS: labels.WORKING, labels.ORCH: "lead"}))
+    rig.live["dead"] = "failed"
+    rig.live["busy"] = "running"
+    await rig.sweep()
+    assert await rig.sweep(WAIT) == ["lead"]
+    assert rig.convs["dead"].archived
+    assert not rig.convs["busy"].archived
+
+
 async def test_children_of_a_lead_archived_by_hand_archive_too() -> None:
     rig = Rig()
     rig.add(Conv("lead", archived=True))
@@ -564,6 +591,67 @@ async def test_a_lead_archived_by_hand_is_found_through_a_plain_child() -> None:
     assert not rig.convs["live"].archived and not rig.convs["busy"].archived
     # Each distinct parent is looked up once in the plain-child pass.
     assert lookups.count("lead") <= 2
+
+
+async def test_a_lead_archived_by_hand_is_found_through_a_failed_plain_child() -> None:
+    rig = Rig()
+    rig.add(Conv("lead", {labels.STATUS: labels.WORKING}))
+    rig.add(
+        Conv("dead", {}, parent_conversation_id="lead", kind="sub_agent", live_status="failed")
+    )
+    rig.convs["lead"].archived = True
+    rig.live["dead"] = "failed"  # agrees with Conv.live_status above
+    assert await rig.sweep() == []
+    assert rig.archived == ["dead"]
+
+
+async def test_running_and_waiting_plain_children_are_not_archived() -> None:
+    rig = Rig()
+    rig.add(Conv("lead", archived=True))
+    for name in ("run", "wait"):
+        rig.add(Conv(name, {}, parent_conversation_id="lead", kind="sub_agent", live_status=name))
+    rig.live["run"] = "running"
+    rig.live["wait"] = "running"  # live_state reads waiting as running
+    await rig.sweep()
+    assert rig.archived == []
+
+
+def _failed(code: str) -> dict[str, str]:
+    return {
+        _LAST_TASK_ERROR_CODE_LABEL_KEY: code,
+        _LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "boom",
+    }
+
+
+@pytest.mark.parametrize("code", ["runner_disconnected", "runner_failed_to_start"])
+async def test_a_resumable_failure_waits_in_both_paths_until_past_the_window(code: str) -> None:
+    rig = Rig()
+    ref = rig.add(Conv("ref", live_status="failed"))
+    ref.labels.update(_failed(code))
+    rig.add(Conv("lead"))
+    kid = rig.add(Conv("kid", {labels.STATUS: labels.WORKING, labels.ORCH: "lead"}))
+    kid.live_status = "failed"
+    kid.labels.update(_failed(code))
+    rig.live["ref"] = rig.live["kid"] = "failed"
+    rig.convs["lead"].live_status = "idle"
+    rig.convs["lead"].archived = True
+    ref.updated_at = kid.updated_at = int(rig.now)  # touched just now
+    await rig.sweep()
+    assert await rig.sweep(WAIT * 2) == []
+    assert rig.archived == []
+    # Past auto_resume.MAX_AGE_S nothing would revive them any more.
+    await rig.sweep(auto_resume.MAX_AGE_S)
+    assert set(rig.archived) == {"ref", "kid"}
+
+
+async def test_a_failure_with_another_error_code_is_archived() -> None:
+    rig = Rig()
+    conv = rig.add(Conv("a", live_status="failed"))
+    conv.labels.update(_failed("model_error"))
+    rig.live["a"] = "failed"
+    conv.updated_at = int(rig.now)
+    await rig.sweep()
+    assert await rig.sweep(WAIT) == ["a"]
 
 
 async def test_the_walk_goes_down_through_a_busy_or_archived_child() -> None:

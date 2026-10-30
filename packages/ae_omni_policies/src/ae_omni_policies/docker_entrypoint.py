@@ -47,7 +47,7 @@ from typing import Any
 
 UPSTREAM_ENTRYPOINT = os.environ.get("AE_UPSTREAM_ENTRYPOINT", "/app/entrypoint.py")
 # Agents every release registers even when config/server.env on the box names
-# only the older ones (2026-09-25, the orchestrator). That file is Reid's, and
+# only the older ones (2026-09-25, the orchestrator). That file is the owner's, and
 # the auto-update never rewrites its agent line, so a new agent listed only in
 # config/server.env.example would reach the box by hand at best. Appended to
 # OMNIGENT_BUILTIN_AGENT_DIRS here when the directory is in the image and not
@@ -57,7 +57,7 @@ EXTRA_AGENTS_ENV = "AE_EXTRA_AGENTS"
 EXTRA_AGENT_DIRS = ("/opt/ae/agents/orchestrator", "/opt/ae/agents/preset-reviewer")
 # Release features every build turns on even though config/server.env on the box
 # lists only the older ones (2026-10-19, sidebar grouping and manual order). That
-# file is Reid's unmanaged one and the auto-update rewrites only the image tag,
+# file is the owner's unmanaged one and the auto-update rewrites only the image tag,
 # so a flag set there would reach the box by hand at best. Appended to
 # OMNIGENT_FEATURES here when the installed omnigent knows the name: upstream
 # raises on an unknown name at startup and plans to retire this flag around

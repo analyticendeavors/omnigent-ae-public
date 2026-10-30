@@ -1,5 +1,5 @@
 // Tag chips in task-store's own colours and icons (2026-09-25,
-// https://github.com/analyticendeavors/omnigent-ae/issues/28). Reid saw two
+// https://github.com/analyticendeavors/omnigent-ae/issues/28). The owner saw two
 // grey chips and "+1" on each lot card; the app paints every tag with the
 // colour and Tabler icon chosen in its tag manager. `GET /v1/ae/lot/tags?icons=true`
 // carries both (the colour's palette name, the icon's path data), and this

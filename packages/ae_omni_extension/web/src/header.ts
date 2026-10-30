@@ -14,7 +14,7 @@
 //          and a muted footer: usage, the release, the counts.
 //
 // Both follow the two concepts in session-dashboard-header-concepts.html as
-// drawn: Reid picked 3 with a toggle to 2 on 2026-10-17, and a first build
+// drawn: the owner picked 3 with a toggle to 2 on 2026-10-17, and a first build
 // that drifted from them (text rows, a lot strip, age bars) was redone to
 // match. The pips are decoration for sight (aria-hidden); each row's text
 // says the same thing in words. A row or a link that names a section opens
@@ -435,7 +435,7 @@ function releaseSteps(release: Release): HTMLElement {
   return pipRow(["is-unknown", "is-unknown", "is-unknown"]);
 }
 
-/** A pip per item waiting on Reid, "+n" past MOVE_PIPS; one grey pip when clear. */
+/** A pip per item waiting on the owner, "+n" past MOVE_PIPS; one grey pip when clear. */
 function movePips(count: number): HTMLElement {
   if (count === 0) return pipRow([""]);
   return pipRow(

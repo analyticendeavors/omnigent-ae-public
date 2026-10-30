@@ -26,10 +26,10 @@ from ae_omni_policies import (
 )
 
 SENTINEL = "sentinel-secret-value-7f3a"
-REID = {"X-Forwarded-Email": "reid@example.com"}
-STEVE = {"X-Forwarded-Email": "steve@example.com"}
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
+OTHER_USER = {"X-Forwarded-Email": "user-b@example.com"}
 NOW = datetime(2026, 10, 23, 12, 0, tzinfo=UTC)
-APP_ID = "7f123a12-dc5d-47ae-97aa-2458d1adabc3"
+APP_ID = "00000000-0000-0000-0000-000000000002"
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +66,7 @@ APPS = [
         "hint": SENTINEL[:3],
     },
     {
-        "appId": "6daa04d7-48f1-4a76-942f-4b92e6ce7542",
+        "appId": "00000000-0000-0000-0000-000000000001",
         "displayName": "AE Security Auditor",
         "ends": [],
     },
@@ -190,7 +190,7 @@ def _oidc_app(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_tag_proposals_match_known_pairs_and_names_and_skip_tagged_ones() -> None:
     apps = [
         secrets_relay.App(APP_ID, "ae-omnigent-azure-cost", (NOW,)),
-        secrets_relay.App("6daa04d7-48f1-4a76-942f-4b92e6ce7542", "AE Security Auditor", ()),
+        secrets_relay.App("00000000-0000-0000-0000-000000000001", "AE Security Auditor", ()),
         secrets_relay.App("00000000-0000-0000-0000-000000000001", "AE OmniGent", ()),
     ]
     vaults = {
@@ -287,7 +287,7 @@ async def test_github_calls_record_the_token_and_its_expiry() -> None:
         if request.url.path == "/user":
             return httpx.Response(
                 200,
-                json={"login": "reid"},
+                json={"login": "owner"},
                 headers={key_health.GITHUB_EXPIRY_HEADER: "2026-12-01 10:00:00 UTC"},
             )
         return httpx.Response(401, json={"message": SENTINEL})
@@ -494,8 +494,8 @@ async def test_the_vault_route_is_admin_only_and_carries_no_value(
         )
     )
     secrets_meta.reset_store(store)
-    assert (await client.get("/v1/ae/vault", headers=STEVE)).status_code == 403
-    got = await client.get("/v1/ae/vault", headers=REID)
+    assert (await client.get("/v1/ae/vault", headers=OTHER_USER)).status_code == 403
+    got = await client.get("/v1/ae/vault", headers=OWNER)
     assert got.status_code == 200, got.text
     body = got.json()
     assert SENTINEL not in got.text
@@ -620,20 +620,42 @@ def test_an_old_state_file_still_loads(tmp_path: Path) -> None:
     assert vault_inventory.view(got, NOW).vaults[0].count == 1
 
 
+def _fake_app_id(n: int) -> str:
+    """A made-up app id built from parts at run time (2026-10-29: no id sits in the source)."""
+    return f"{n:08x}-" + "aaaa-4bbb-8ccc-" + f"{n:012x}"
+
+
+# Made-up app ids standing in for the real ones; the first four pair with the KNOWN_SOURCES
+# secrets through AE_SECRET_SOURCE_APPS, the last two are apps no secret is known to use.
+FAKE_M365, FAKE_BRIDGE, FAKE_SHORTENER, FAKE_CONNECTORS, FAKE_SANDBOX, FAKE_FUAM = (
+    _fake_app_id(n) for n in range(1, 7)
+)
 REAL_APPS = [
-    ("9d9eeebc-93d2-44c6-b9a0-9b713a6adc20", "M365 MCP Server (AE)"),
-    ("6daa04d7-48f1-4a76-942f-4b92e6ce7542", "AE Security Auditor"),
-    ("00000000-0000-0000-0000-000000000001", "AE OmniGent"),
-    ("26e70cab-a5fb-427a-8244-b82f49239f47", "ae-fabric-sandbox-sp"),
-    ("b51fea8a-c190-4f31-9cfe-1b0ea64b8f29", "AE Task Bridge"),
-    ("e812277e-186b-4d11-bd3c-dcc48857317e", "Cloudflare Access - AE Shortener"),
+    (FAKE_M365, "M365 MCP Server (AE)"),
+    (_fake_app_id(7), "AE Security Auditor"),
+    (_fake_app_id(8), "AE OmniGent"),
+    (FAKE_SANDBOX, "ae-fabric-sandbox-sp"),
+    (FAKE_BRIDGE, "AE Task Bridge"),
+    (FAKE_SHORTENER, "Cloudflare Access - AE Shortener"),
     (APP_ID, "ae-omnigent-azure-cost"),
-    ("8df6aa5d-82ad-48a0-bb70-75515545377d", "AE MCP Connectors"),
-    ("c265143e-581e-41e0-a55c-c8483b03549d", "FUAM Service Principal"),
+    (FAKE_CONNECTORS, "AE MCP Connectors"),
+    (FAKE_FUAM, "FUAM Service Principal"),
 ]
+SOURCE_APPS = ",".join(
+    f"{secret}={app}"
+    for secret, app in (
+        ("ae-client-secret", FAKE_M365),
+        ("devops-bridge-client-secret", FAKE_BRIDGE),
+        ("cf-access-azure-client-secret", FAKE_SHORTENER),
+        ("esignatures-oauth-ms-client-secret", FAKE_CONNECTORS),
+    )
+)
 
 
-def test_the_dry_run_proposes_all_eight_pairs() -> None:
+def test_the_dry_run_proposes_all_eight_pairs(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AE_AZURE_COST_APP_ID", APP_ID)
+    monkeypatch.setenv("AE_SECRET_SOURCE_APPS", SOURCE_APPS)
+    monkeypatch.setenv("AE_OIDC_APP_ID", _fake_app_id(8))
     apps = [secrets_relay.App(app_id, name, (NOW,)) for app_id, name in REAL_APPS]
     names = [
         "ae-auditor-client-secret",
@@ -662,6 +684,22 @@ def test_the_dry_run_proposes_all_eight_pairs() -> None:
         "cf-access-azure-client-secret": "Cloudflare Access - AE Shortener",
         "esignatures-oauth-ms-client-secret": "AE MCP Connectors",
     }
+
+
+def test_unset_source_apps_leave_the_four_known_secrets_without_a_proposal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("AE_SECRET_SOURCE_APPS", raising=False)
+    monkeypatch.delenv("AE_AZURE_COST_APP_ID", raising=False)
+    monkeypatch.delenv("AE_OIDC_APP_ID", raising=False)
+    apps = [secrets_relay.App(app_id, name, (NOW,)) for app_id, name in REAL_APPS]
+    four = list(secrets_relay.KNOWN_SOURCES)
+    assert len(four) == 4
+    proposals, _ = secrets_relay.propose_tags(
+        {"kv-example-box": [{"name": name, "tags": {}} for name in four]}, apps
+    )
+    assert proposals == []
+    assert secrets_relay.known_sources() == {}
 
 
 # ── call sites record the key's outcome ─────────────────────────────────────

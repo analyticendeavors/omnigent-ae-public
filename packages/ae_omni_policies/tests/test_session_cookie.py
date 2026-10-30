@@ -22,7 +22,7 @@ PAGE = {"sec-fetch-dest": "document", "accept": "text/html"}
 
 
 def token(exp: int = NOW + 3600, secret: bytes = SECRET, **extra: object) -> str:
-    claims = {"sub": "reid@example.com", "iat": NOW, "exp": exp, **extra}
+    claims = {"sub": "owner@example.com", "iat": NOW, "exp": exp, **extra}
     return jwt.encode(claims, secret, algorithm="HS256")
 
 

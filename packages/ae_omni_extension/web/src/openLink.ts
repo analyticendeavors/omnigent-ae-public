@@ -1,6 +1,6 @@
 // Open on GitHub (2026-09-27): the buttons on every pull request card (Open
 // PRs, Your move) that open the pull request in the device's browser. They
-// replaced Copy link, because Reid works from an iPhone and a Windows laptop
+// replaced Copy link, because the owner works from an iPhone and a Windows laptop
 // and copy, switch app, paste into the address bar was the slowest step of a
 // merge done on GitHub.
 //
@@ -21,7 +21,7 @@
 // the host round trip iOS no longer counts the tap, and the write fails. A
 // small Copy button beside Open on GitHub stays as the path that always works.
 //
-// 2026-09-28: Reid asked why the URL printed on a Your move row was not a
+// 2026-09-28: the owner asked why the URL printed on a Your move row was not a
 // link. The URL text is now a link-styled button (`urlLinkButton`) that takes
 // the same path as Open on GitHub, fallback included.
 //

@@ -1,6 +1,6 @@
 """The slot limit every count reads: the Settings page first, then ``AE_SLOT_LIMIT``.
 
-Added 2026-10-22. Reid raised his slot cap to four and expected to change it on
+Added 2026-10-22. The owner raised their slot cap to four and expected to change it on
 Settings > Global Policies. The slot cap policy has taken a ``limit`` there since
 patch 0095's Edit, but every count in the web UI read ``AE_SLOT_LIMIT`` through
 ``GET /v1/ae/capacity``, so a limit set on the page held prompts at one number

@@ -1,6 +1,6 @@
 // The last good answer of each slow call, per device (2026-09-26).
 //
-// Why: Reid waited 3 to 5 seconds on every open of the Dashboard on his
+// Why: the owner waited 3 to 5 seconds on every open of the Dashboard on their
 // iPhone, looking at an empty page. The page now paints what this device saw
 // last as soon as it opens, marked as refreshing with its actions off, and
 // replaces each section as its call lands (main.ts).

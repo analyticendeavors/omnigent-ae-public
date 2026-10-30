@@ -18,8 +18,8 @@ import pytest
 from ae_omni_policies import azure_cost, cost_targets, taskstore
 from ae_omni_policies.cost_targets import Known, Rule, RuleBody, RuleError, Scope
 
-REID = {"X-Forwarded-Email": "reid@example.com"}
-STEVE = {"X-Forwarded-Email": "steve@example.com"}
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
+MEMBER = {"X-Forwarded-Email": "member@example.com"}
 # Wednesday noon UTC; finished days run through 2026-10-20.
 NOW = datetime(2026, 10, 21, 12, 0, tzinfo=UTC)
 CFG = cost_targets.Config(
@@ -877,21 +877,21 @@ async def test_targets_routes_are_admin_only(
 ) -> None:
     body = {"name": "x", "scope": {"kind": "all"}, "measure": "month_to_date", "limit": 10}
     refusals = [
-        await client.get("/v1/ae/azure-cost/targets", headers=STEVE),
-        await client.put("/v1/ae/azure-cost/targets/t1", json=body, headers=STEVE),
-        await client.delete("/v1/ae/azure-cost/targets/t1", headers=STEVE),
+        await client.get("/v1/ae/azure-cost/targets", headers=MEMBER),
+        await client.put("/v1/ae/azure-cost/targets/t1", json=body, headers=MEMBER),
+        await client.delete("/v1/ae/azure-cost/targets/t1", headers=MEMBER),
     ]
     for refused in refusals:
         assert refused.status_code == 403, refused.text
         assert refused.json()["error"]["code"] == "admin_only"
-    allowed = await client.get("/v1/ae/azure-cost/targets", headers=REID)
+    allowed = await client.get("/v1/ae/azure-cost/targets", headers=OWNER)
     assert allowed.status_code == 200, allowed.text
 
 
 async def test_targets_crud_and_status(
     client: httpx.AsyncClient, ae_admins: set[str], azure_snapshot: None
 ) -> None:
-    first = await client.get("/v1/ae/azure-cost/targets", headers=REID)
+    first = await client.get("/v1/ae/azure-cost/targets", headers=OWNER)
     assert first.status_code == 200, first.text
     listed = first.json()
     ids = {r["id"] for r in listed["rules"]}
@@ -910,43 +910,43 @@ async def test_targets_crud_and_status(
         "measure": "month_to_date",
         "limit": 5000,
     }
-    saved = await client.put("/v1/ae/azure-cost/targets/t-all", json=body, headers=REID)
+    saved = await client.put("/v1/ae/azure-cost/targets/t-all", json=body, headers=OWNER)
     assert saved.status_code == 200, saved.text
     assert saved.json()["rule"]["status"] == "ok" and saved.json()["rule"]["value"] == 840.0
     replaced = await client.put(
-        "/v1/ae/azure-cost/targets/t-all", json={**body, "limit": 100}, headers=REID
+        "/v1/ae/azure-cost/targets/t-all", json={**body, "limit": 100}, headers=OWNER
     )
     assert replaced.json()["rule"]["status"] == "over"
-    again = (await client.get("/v1/ae/azure-cost/targets", headers=REID)).json()
+    again = (await client.get("/v1/ae/azure-cost/targets", headers=OWNER)).json()
     assert sum(1 for r in again["rules"] if r["id"] == "t-all") == 1
 
     bad = await client.put(
         "/v1/ae/azure-cost/targets/t-bad",
         json={**body, "scope": {"kind": "subscription", "name": "Nope"}},
-        headers=REID,
+        headers=OWNER,
     )
     assert bad.status_code == 422 and "Pick one from the list" in bad.json()["error"]["message"]
     nan = await client.put(
-        "/v1/ae/azure-cost/targets/t-bad", json={**body, "limit": 0}, headers=REID
+        "/v1/ae/azure-cost/targets/t-bad", json={**body, "limit": 0}, headers=OWNER
     )
     assert nan.status_code == 422
 
     # The extension host sends only GET, POST and PATCH, so the card uses these two.
     via_post = await client.post(
-        "/v1/ae/azure-cost/targets/t-post", json={**body, "limit": 77}, headers=REID
+        "/v1/ae/azure-cost/targets/t-post", json={**body, "limit": 77}, headers=OWNER
     )
     assert via_post.status_code == 200 and via_post.json()["rule"]["limit"] == 77
-    deleted_post = await client.post("/v1/ae/azure-cost/targets/t-post/delete", headers=REID)
+    deleted_post = await client.post("/v1/ae/azure-cost/targets/t-post/delete", headers=OWNER)
     assert deleted_post.status_code == 200 and deleted_post.json()["deleted"] == "t-post"
-    steve = await client.post("/v1/ae/azure-cost/targets/t-post/delete", headers=STEVE)
-    assert steve.status_code == 403
-    gone = await client.delete("/v1/ae/azure-cost/targets/t-all", headers=REID)
+    member = await client.post("/v1/ae/azure-cost/targets/t-post/delete", headers=MEMBER)
+    assert member.status_code == 403
+    gone = await client.delete("/v1/ae/azure-cost/targets/t-all", headers=OWNER)
     assert gone.status_code == 200 and gone.json()["deleted"] == "t-all"
-    missing = await client.delete("/v1/ae/azure-cost/targets/t-all", headers=REID)
+    missing = await client.delete("/v1/ae/azure-cost/targets/t-all", headers=OWNER)
     assert missing.status_code == 404
     # The seeded defaults stay deleted.
-    await client.delete("/v1/ae/azure-cost/targets/seed-resource-day", headers=REID)
-    final = (await client.get("/v1/ae/azure-cost/targets", headers=REID)).json()
+    await client.delete("/v1/ae/azure-cost/targets/seed-resource-day", headers=OWNER)
+    final = (await client.get("/v1/ae/azure-cost/targets", headers=OWNER)).json()
     assert "seed-resource-day" not in {r["id"] for r in final["rules"]}
 
 
@@ -959,7 +959,7 @@ async def test_targets_report_an_unreadable_file(
     path = tmp_path / "rules.json"
     path.write_text("{oops", encoding="utf-8")
     cost_targets.reset_stores(cost_targets.RuleStore(path))
-    response = await client.get("/v1/ae/azure-cost/targets", headers=REID)
+    response = await client.get("/v1/ae/azure-cost/targets", headers=OWNER)
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "cost_targets_unreadable"
     assert path.read_text(encoding="utf-8") == "{oops"
@@ -992,7 +992,7 @@ async def test_the_targets_answer_stays_under_the_bridge_limit_with_a_rate_limit
         )
     )
     cost_targets.reset_stores(store)
-    response = await client.get("/v1/ae/azure-cost/targets", headers=REID)
+    response = await client.get("/v1/ae/azure-cost/targets", headers=OWNER)
     assert response.status_code == 200, response.text
     assert len(response.text) < 32_768, len(response.text)
     assert "rate limiting" in response.text
@@ -1027,7 +1027,7 @@ async def test_the_targets_answer_stays_under_the_bridge_limit(
         )
     )
     cost_targets.reset_stores(store)
-    response = await client.get("/v1/ae/azure-cost/targets", headers=REID)
+    response = await client.get("/v1/ae/azure-cost/targets", headers=OWNER)
     assert response.status_code == 200, response.text
     assert len(response.text) < 32_768, len(response.text)
     assert len(response.json()["rules"]) == 50

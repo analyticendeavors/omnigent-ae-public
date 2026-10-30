@@ -3,7 +3,7 @@
 Until 2026-10-18 the AE policies sat under the server config's ``policies:``
 key. Upstream loads that key into ``RuntimeCaps.default_policies`` at boot and
 shows the entries read-only on Settings > Global Policies: no switch, no
-delete, no edit. Reid asked to manage them on that page and chose (2026-10-18)
+delete, no edit. The owner asked to manage them on that page and chose (2026-10-18)
 to let the page own them, so they now live in the policy store as ordinary
 global policies: the page's switch, trash and Edit buttons (Edit from
 patch 0095) work on them, and a change made there survives deploys.

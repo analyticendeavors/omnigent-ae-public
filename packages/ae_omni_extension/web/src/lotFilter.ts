@@ -1,6 +1,6 @@
 // Search and filters over the Parking Lot (2026-09-25,
-// https://github.com/analyticendeavors/omnigent-ae/issues/28). Reid mostly
-// reads the lot on his phone, so the bar is one search
+// https://github.com/analyticendeavors/omnigent-ae/issues/28). The owner mostly
+// reads the lot on their phone, so the bar is one search
 // field and a Filters button; the button opens a sheet of chips (quadrant,
 // resurface date, tag, repo) inline under the bar, never a modal.
 //

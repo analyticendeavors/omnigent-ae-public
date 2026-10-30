@@ -4,8 +4,8 @@ Taken with the box's headless Chromium (`chrome-headless-shell` 1223) from a sma
 Vite page that mounts upstream's `SubagentsPanel` on seeded query data: one Claude
 Code root, nine finished Claude Code subagents, two running ones and one running
 agent OmniGent launched (the only row with a Stop square), plus a four-item task
-list. The names and times are illustrative, not Reid's. The pane is 620x1100, the
-shape of the right rail on Reid's screen, and 375x812 for the phone shots.
+list. The names and times are illustrative, not the owner's. The pane is 620x1100, the
+shape of the right rail on the owner's screen, and 375x812 for the phone shots.
 
 - `before-graph-dark.png`, `before-list-dark.png`: upstream before patch 0054.
   The graph is one top-down row of ten nodes shrunk to dots; the list is in spawn
@@ -18,7 +18,7 @@ shape of the right rail on Reid's screen, and 375x812 for the phone shots.
 - `after-list-dark.png`: Running with the Task, Model and Time header, Finished folded
   to "Finished 9", and the Plan section.
 - `model-before-codex-dark.png`, `model-after-codex-dark.png` (2026-10-16, patch
-  0063): a Codex session's finished collaborators at 450x760, the shape of Reid's
+  0063): a Codex session's finished collaborators at 450x760, the shape of the owner's
   report. Before, every Model cell is empty and the dots float in that gap; after, each
   row shows its model and the dot sits right of Time.
 - `model-before-list-dark.png`, `model-after-list-dark.png`, `model-after-list-light.png`,

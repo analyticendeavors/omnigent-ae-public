@@ -65,7 +65,7 @@ const held = (extra: Partial<DeployHold> = {}): DeployHold => ({
   held: true,
   until: UNTIL,
   set_at: "2026-10-20T01:46:00Z",
-  set_by: "reid",
+  set_by: "Owner",
   remaining_s: 72 * 60,
   choices: [1, 2, 3],
   error: null,
@@ -90,6 +90,8 @@ type Call = { method: string; path: string; body?: unknown };
 function stubContext(replies: Record<string, Reply[]>) {
   const request = vi.fn(async ({ method, path }: Call) => {
     const queue = replies[`${method} ${path}`] ?? [];
+    // Who sees what (2026-10-28) is asked before the page draws: an admin, unless a test says.
+    if (path === "/v1/ae/access" && !queue.length) return ok({ admin: true, box_admin: true });
     return queue.shift() ?? failed(500, `no reply queued for ${path}`);
   });
   const context = {
@@ -304,8 +306,8 @@ describe("the section on the page", () => {
       title: `Held by ${email}`,
     });
     // A value with no "@" shows whole, with no tooltip to add.
-    expect(holdLines(held({ set_by: "reid" }), null, NOW)[0]?.by?.name).toBe("reid");
-    expect(holdTile(held({ set_by: "reid" }), null, NOW, NOW).title).toBeUndefined();
+    expect(holdLines(held({ set_by: "Owner" }), null, NOW)[0]?.by?.name).toBe("Owner");
+    expect(holdTile(held({ set_by: "Owner" }), null, NOW, NOW).title).toBeUndefined();
   });
 
   it("draws the holder in a span that never breaks and carries the address", async () => {
@@ -328,7 +330,7 @@ describe("the section on the page", () => {
     expect(lines(node)).toEqual([
       "ae-v0.18.0.5 \u2192 ae-v0.18.0.6 queued",
       "Waiting for the hold to end",
-      `Held until ${whenText(Date.parse(UNTIL), NOW)} by reid`,
+      `Held until ${whenText(Date.parse(UNTIL), NOW)} by Owner`,
       "1 h 12 min left",
     ]);
     expect(mutedLines(node)).toEqual(["Waiting for the hold to end"]);
@@ -420,7 +422,7 @@ describe("hold and resume", () => {
     const until = whenText(Date.parse("2026-10-20T04:34:00Z"), NOW);
     expect(statusOf(node)).toBe(`Deploys are on hold until ${until}.`);
     expect(node.querySelector(".deploy-status .notice-ok")).not.toBeNull();
-    expect(lines(node).slice(-2)).toEqual([`Held until ${until} by reid`, "2 h left"]);
+    expect(lines(node).slice(-2)).toEqual([`Held until ${until} by Owner`, "2 h left"]);
     expect(buttonNames(node)).toEqual(["Hold 1 h", "Hold 2 h", "Hold 3 h", "Resume"]);
     expect(buttons(node).some((item) => item.disabled)).toBe(false);
     // The hold came with the answer; the release is read again.

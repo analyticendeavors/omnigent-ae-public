@@ -44,7 +44,7 @@ def line(
 ) -> dict[str, Any]:
     return {
         "session": f"s{n}",
-        "user": "reid@example.com",
+        "user": "owner@example.com",
         "title": f"Run {n}",
         "preset": preset,
         "run_key": run_key or f"s{n}:{n}:review",
@@ -472,7 +472,7 @@ async def test_route_answers_each_callers_own_show(
 
     monkeypatch.setenv(role_prefs.STATE_FILE_ENV, str(tmp_path / "roles.json"))
     role_prefs.reset_store()
-    ae_admins.add("steve@example.com")
+    ae_admins.add("member@example.com")
     monkeypatch.setattr(preset_stats, "_spawn", lambda d, g=0: None)
     first = role_prefs.starters()[0]
     body = {
@@ -482,16 +482,16 @@ async def test_route_answers_each_callers_own_show(
         "presets": [first],
         "insights": {"enabled": True, "weeks": 4, "scope": "own", "show": "tokens"},
     }
-    role_prefs.store().put("reid@example.com", role_prefs.RolesPut.model_validate(body))
-    reid = await client.get(
-        "/v1/ae/presets?days=7", headers={"X-Forwarded-Email": "reid@example.com"}
+    role_prefs.store().put("owner@example.com", role_prefs.RolesPut.model_validate(body))
+    owner = await client.get(
+        "/v1/ae/presets?days=7", headers={"X-Forwarded-Email": "owner@example.com"}
     )
-    steve = await client.get(
-        "/v1/ae/presets?days=7", headers={"X-Forwarded-Email": "steve@example.com"}
+    member = await client.get(
+        "/v1/ae/presets?days=7", headers={"X-Forwarded-Email": "member@example.com"}
     )
     role_prefs.reset_store()
-    assert reid.json()["show"] == "tokens"
-    assert steve.json()["show"] == "both"
+    assert owner.json()["show"] == "tokens"
+    assert member.json()["show"] == "both"
 
 
 async def test_route_is_admin_only_and_validates_days(
@@ -499,17 +499,17 @@ async def test_route_is_admin_only_and_validates_days(
 ) -> None:
     monkeypatch.setattr(preset_stats, "_spawn", lambda d, g=0: None)
     refused = await client.get(
-        "/v1/ae/presets", headers={"X-Forwarded-Email": "steve@example.com"}
+        "/v1/ae/presets", headers={"X-Forwarded-Email": "member@example.com"}
     )
     assert refused.status_code == 403
     assert refused.json()["error"]["code"] == "admin_only"
-    reid = {"X-Forwarded-Email": "reid@example.com"}
+    owner = {"X-Forwarded-Email": "owner@example.com"}
     for bad in ("5", "abc", "0"):
-        assert (await client.get(f"/v1/ae/presets?days={bad}", headers=reid)).status_code == 422
-    ok = await client.get("/v1/ae/presets?days=7", headers=reid)
+        assert (await client.get(f"/v1/ae/presets?days={bad}", headers=owner)).status_code == 422
+    ok = await client.get("/v1/ae/presets?days=7", headers=owner)
     assert ok.status_code == 200
     assert ok.json() == {"state": "warming", "days": 7, "show": "both"}
-    default = await client.get("/v1/ae/presets", headers=reid)
+    default = await client.get("/v1/ae/presets", headers=owner)
     assert default.json()["days"] == 30
 
 

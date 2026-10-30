@@ -1,11 +1,11 @@
 """Databricks warehouses and spend for the Admin Center's Databricks section.
 
-Added 2026-10-19, from Reid's Admin Center roadmap: after the Fabric
+Added 2026-10-19, from the owner's Admin Center roadmap: after the Fabric
 capacities, Databricks compute and a spend strip, built on the AWS MVP
 account and its prepaid credit. The workspace
 is serverless only, so the section lists its SQL warehouses with Start and
 Stop and reads what the credit has paid for so far. The account console
-shows one credit with an expiry date, while Reid believes it resets
+shows one credit with an expiry date, while the owner believes it resets
 monthly, so the strip shows both this month's spend and the spend since the
 credit started, each against the credit; the cadence setting only picks which
 one is the headline.

@@ -36,6 +36,7 @@ What is in this directory:
 | `host-relink.sh`, `systemd/user/ae-omnigent-host-relink.service` | the host's reconnect: a sign-in link and a host restart when the server rejects it (Re-login, Host relink) |
 | `host-container.sh`, `host-container/` | a second user's host as a container: the images, the compose project with its egress proxy, the sign-in (Second user's host (container)) |
 | `systemd/user/ae-omnigent-host-container@.service` | user unit template: one user's host container project, `up -d` and `down` |
+| `host-config-sync.sh`, `host-config-sync.py`, `systemd/user/ae-host-config-sync@.service`, `.timer` | the shared AE setup pushed into a second user's host container, scanned twice, every 30 minutes (Syncing the shared AE setup) |
 
 The layout once installed, with the defaults the scripts and units ship with:
 
@@ -113,8 +114,8 @@ Compose reads the env file with `$` interpolation, so no value may contain a
 Azure Key Vault as `<user>` and places the files through sudo, atomically, so a
 failed run leaves the previous files in place. Its defaults are AE's, except the vault
 (`AE_VAULT_NAME`, required, no default; the shell's value, else the one in `config/host.env`), the secret names (the `KV_*` variables at the top of the
-script) and the files' group (`AE_ENV_GROUP`, which must exist; use `<user>`'s
-group). It fetches one named Fabric capacity and the shared capacities Logic App. It fetches, and `--check`
+script) and the files' group (`AE_ENV_GROUP`, which must exist; it defaults to the
+invoking user's primary group since 2026-10-29). It fetches one named Fabric capacity and the shared capacities Logic App. It fetches, and `--check`
 requires, all five server keys in the table's required column (the OIDC and
 task-store pairs included) whichever features you use, and it rewrites the whole file,
 so a key added by hand is lost on the next run unless the vault holds it too.
@@ -404,20 +405,27 @@ check but never push or tag.
 
 ### 6. Units and the first start
 
-The two system units name the checkout by an absolute path, because systemd
-has no home specifier for system units. The shipped default is
-`/home/reid/deploy/omnigent-ae`; set `AE_HOME` to your clone and render the
-units while copying them. The user units need no rendering but do assume the
+The two system units carry an `__AE_HOME__` token for the checkout path,
+because systemd has no home specifier for system units; set `AE_HOME` to your
+clone and render the units while copying them. The user units need no rendering but do assume the
 clone is at `~/deploy/omnigent-ae` (they name `%h/deploy/omnigent-ae`), so
 another path means editing them too:
 
 ```bash
-AE_HOME=$HOME/deploy/omnigent-ae   # the clone on this host
-for u in ae-omnigent.service ae-omnigent-dump.service; do
-  sed "s|/home/reid/deploy/omnigent-ae|$AE_HOME|g" "deploy/systemd/$u" | sudo tee "/etc/systemd/system/$u" >/dev/null
-done
-sudo cp deploy/systemd/ae-omnigent-dump.timer /etc/systemd/system/
-sudo systemctl daemon-reload
+(
+  set -e
+  AE_HOME=$HOME/deploy/omnigent-ae   # the clone on this host
+  out=$(mktemp -d)
+  trap 'rm -rf "$out"' EXIT
+  for u in ae-omnigent.service ae-omnigent-dump.service; do
+    sed "s|__AE_HOME__|$AE_HOME|g" "deploy/systemd/$u" > "$out/$u"
+    if grep -q __AE_HOME__ "$out/$u"; then echo "$u: token left" >&2; exit 1; fi
+    systemd-analyze verify "$out/$u"   # must print nothing
+    sudo install -m 644 "$out/$u" "/etc/systemd/system/$u"
+  done
+) &&
+  sudo cp deploy/systemd/ae-omnigent-dump.timer /etc/systemd/system/ &&
+  sudo systemctl daemon-reload
 ```
 
 Bring the stack up by hand the first time, so the pull and the migrations are
@@ -907,13 +915,117 @@ systemctl --user enable --now ae-omnigent-limits.timer
 journalctl --user -u ae-omnigent-limits -n 20
 ```
 
+## Box health relay
+
+The Admin Center's Box health card shows heat, CPU, memory, storage and bloat for the box
+and its two users. It exists because `/tmp` (a 62 GB RAM tmpfs capped at 1,048,576 inodes)
+ran out of inodes on 2026-10-28 and every Claude Code Bash call failed for about 15
+minutes; the box now ages Claude's temp folders out after two days (tmpfiles rule, and
+`ae-claude-tmp-guard` protects live sessions), and this relay makes the state visible.
+Once, as `<user>` (the box's admin login must be stored: `omnigent login`):
+
+```
+# 1. the relay module in the host venv (the auto-update does this on a release
+#    that changes packages/ae_omni_policies)
+deploy/install-host.sh
+# 2. in config/host.env: the users map, see config/host.env.example. On the box:
+#    AE_BOX_USERS=1000=owner,1001=member,container:omnigent-host-member=member
+# 3. look before it posts; the output holds counts, sizes and ages only
+~/.omnigent-host/venv/bin/python -m ae_omni_policies.box_health_relay --dry-run
+# 4. the timer, every five minutes
+cp deploy/systemd/user/ae-omnigent-box-health.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ae-omnigent-box-health.timer
+journalctl --user -u ae-omnigent-box-health -n 20
+```
+
+`AE_BOX_USERS` maps box user ids and host containers to the names the card shows.
+Unlisted ids of 1000 or more show their login and no container is measured. A container
+is touched only when it is named there, and only by the relay's fixed table of
+read-only commands (`CONTAINER_COMMANDS` in `box_health_relay.py`): `docker exec -u agent
+<container> timeout N find ...` or `du`, plus `docker ps --size`, `docker inspect` and
+`docker system df -v`. Every command is an argument list with no shell, runs as the
+container user (`agent`), never root, carries `timeout`, and is cut at a line cap; only
+`find -printf` metadata is read, never file contents, and the names it prints stay in the
+relay's memory. Mounts are posted by name only from a short safe list and any other as "other mount N"; failed units by name only when they are `ae-*`, systemd's or Docker's (the rest are counted); `AE_BOX_HEALTH_DIRS` is `label=path` and only the label is posted. The owner's docker group membership is already root-equivalent on the box;
+this adds no new power, but it does mean the relay can see the metadata of the second box user's
+container files. Nothing posted names a folder, project, session, branch, worktree or file.
+
+The fast reading is posted first, every five minutes. The slow scans run about hourly under one 150 second deadline, and a second post carries them; whatever the deadline skips is named as a failed part. `docker system df -v`, which is heavy, runs at most once a day and its answer is cached.
+
+The `/tmp` leftovers are counted from one `lstat` per top-level entry and no folder is
+opened: Ubuntu's stock rule (`q /tmp 1777 root root 10d`) counts a folder's access time, so
+listing litter would keep it alive. Claude's temp roots are walked, because the box's
+two-day rule for them ignores folder access times.
+
+### Cleanup buttons and container aging (2026-10-29)
+
+A box admin's Clean up button queues one request in the server (`/data/ae-box-health-cleanup.json`);
+the relay finds it in the answer to its next post, runs it in that pass and posts the result,
+then rescans so the card shows the new numbers. Test it without deleting anything (`box_health_relay --dry-run` removes nothing either, in
+containers or on the host, and prints what it would age as counts):
+
+```
+~/.omnigent-host/venv/bin/python -m ae_omni_policies.box_cleanup --dry-run
+```
+
+It prints counts only. The four actions are `claude_scratch` (`<root>/<project>/<session>` folders
+under the Claude temp roots), `tmp_litter` (top-level `/tmp` names on a fixed allowlist, such as
+`sec-appr-*`), `review_checkouts` (`/tmp/<name>-review.<id>` clones with no uncommitted changes)
+and `docker_prune` (dangling images and build cache older than two days; never volumes or
+containers). Every one runs as the relay's user, refuses to run as root, takes only direct children
+that are not symlinks and that this user owns, proves the whole tree older than two days (a walk
+that hits its cap leaves the folder alone), skips any folder a process works in, takes a
+non-blocking `flock` on each session folder (the temp guard holds a lock on every live session, so a
+live one fails the try and is kept), and checks the folder's inode again just before removing it.
+A folder is old only when the newest mtime anywhere in its tree is old (a nested edit does not move
+a folder's own mtime); a tree that holds a `.git` anywhere (a review checkout may have only its own
+top-level one), an entry of another user, an entry on another filesystem, or anything unreadable is
+kept, and the proof is repeated under the lock just before removal. A review checkout is also kept
+when it has a stash or a commit no remote has, and when any git call fails or times out. A run stops
+after 5,000 items or 120 seconds and says so, and the whole cleanup stops at 100 seconds so a pass
+stays inside the unit's 4 minute timeout (every container command, planning included, gets only the time left; each post waits at most 10 seconds). The relay hands the server's confirmed count to the run:
+when the fresh plan is larger, only that many of the oldest items (by the newest file inside each, ties by path) are removed, the rest are counted as
+"aged after you confirmed" and stay for the next run (an item that crossed the two-day line since the card was read no longer
+turns the press into a no-op); a request the box has not taken in 15 minutes expires.
+
+Before every `rm` batch in a container the relay runs three fixed read-only checks as `agent`
+(`find <paths> -newermt @<cutoff> -print`; `find /proc ... -printf '%p\t%l\0'` (NUL-framed, so a folder name holding a newline cannot forge a second record; every record must be well formed and unique, or the batch fails closed) for the container user's
+working folders and open files, with `id -u` and a `grep` of every `/proc/<pid>/status` so each pid of that
+user (by real or effective uid) must show a cwd line (a process that set PR_SET_DUMPABLE=0 hides its links; a gap is looked at once more
+and then nothing in the batch is removed, which also means one long-lived non-dumpable process would stop the
+aging; a zombie, state Z, holds nothing and has no cwd link, so it is skipped, but only when it has one thread
+(`Threads: 1`): a process whose main thread exited while others run also shows Z, its live threads are not listed,
+and it stays a gap; the check's own `timeout`, `find` and `grep` are skipped only when their command line, read in
+the same listing, is exactly the pinned one; every pid in the listing must have exactly one `Uid`, `State` and
+`Threads` record, and every line must be one of the anchored records, so a half-read listing or a command line that
+holds a newline (grep splits it into several lines, which could forge a record) fails the batch closed: a rare, safe
+stall until the next hour); `find /proc/*/cmdline -exec cat {} +` for session uuids on command
+lines, `--resume` and `--session-id` as the host temp guard does). A path changed since the cutoff, one a
+process works in or has open (or that sits inside one), or whose session uuid is on a command line, is kept;
+a check that fails or is cut short removes nothing in that batch. The relay can read those command
+lines (never stored or posted: only whether a uuid appears). If the posted result of a cleanup times out (each post is cut at 10 seconds), the cleanup has already happened and the
+result is dropped with one line in the journal: the card then shows the request as lost, and the next reading shows the
+lower counts. This is accepted. A mapped container's folders then go
+through one more fixed command, `docker exec -u agent <container>
+timeout 120 rm -rf --one-file-system -- <paths>`, 200 paths at a time, and only paths that match
+`/tmp/claude-<n>/<project>/<session uuid>` or `/tmp/pytest-of-agent/pytest-<n>`. The relay does
+this on its own every hour for each mapped container (the same two-day rule) and on a button press.
+`AE_BOX_HEALTH_CLEANUP=off` in `config/host.env` stops both and hides the buttons. A container that
+hit a walk cap or an unreadable folder removes nothing. Another user's host-side `/tmp` folders are
+never offered: only the box's root tmpfiles rule can age them.
+
+Let the second box user see the monitor only after they have signed in once, so the exact
+login is known: add it to `AE_BOX_ADMINS` in `config/server.env` and recreate the server
+container. A box admin who is not an OmniGent admin sees only this card.
+
 ## Secret expiry dates
 
 The Admin Center's Server secrets list shows, for each key, when the vault says its
 secret expires, when it last changed, and Edit and Rotate links (2026-10-23). The
 server never reads Key Vault (the vault uses access policies, and a live container
 should not hold a vault login for dates), so a daily user timer on the box does the
-reading as reid: `python -m ae_omni_policies.secrets_relay` runs `az keyvault secret
+reading as the owner: `python -m ae_omni_policies.secrets_relay` runs `az keyvault secret
 list` (attributes only; it never calls `secret show`) and posts name, enabled, expires
 and updated to `POST /v1/ae/secrets/meta` (until 2026-10-23 only for the names this
 deployment maps to its keys; now for every secret, below). No value, length or hash is read or sent. The server keeps
@@ -946,7 +1058,7 @@ an hour on 2026-10-23.
 Since the Key Vault card (2026-10-23) the relay posts every secret of both vaults:
 the box's (`AE_VAULT_NAME`, no default; the relay exits 1 with one log line when it is unset, and `--propose-tags` still runs for the extra vaults) and each extra one
 (`AE_EXTRA_VAULTS`, comma-separated, default empty, so no extra vault; set it in `config/host.env`, which the relay unit loads, to add the website's vault). It also says, by key name only, whether `/secure/env/omnigent-host.env`
-(`AE_HOST_ENV_FILE`) has `CLAUDE_CODE_OAUTH_TOKEN`; the file is 640 root:reid, so reid
+(`AE_HOST_ENV_FILE`) has `CLAUDE_CODE_OAUTH_TOKEN`; the file is 640 root:<user>, so <user>
 can read it, and only a yes or no leaves the relay. A part it cannot read (an extra
 vault, the host's file, the Entra dates) is named in the journal and left out, the
 rest is posted, and the run exits 1 so the timer shows it.
@@ -983,8 +1095,8 @@ read. The server's own GitHub calls do the same for `AE_GITHUB_TOKEN` from GitHu
 is ae-omnigent-azure-cost, omnigent-oidc-client-secret is AE OmniGent, the server's
 `OMNIGENT_OIDC_CLIENT_ID`), or a secret whose name, less its `-client-secret` ending,
 has every word in exactly one app's display name. Already tagged secrets are left
-alone, and anything unsure is left out (add it to `KNOWN_SOURCES` in
-`secrets_relay.py` once its app is known). The script reads `AE_VAULT_NAME` and `AE_EXTRA_VAULTS` from the
+alone, and anything unsure is left out (add its name to `KNOWN_SOURCES` in
+`secrets_relay.py` and its app to `AE_SECRET_SOURCE_APPS` once the app is known). The script reads `AE_VAULT_NAME` and `AE_EXTRA_VAULTS` from the
 `config/host.env` next to it and prints which file it used; that is the relay unit's file
 only when run from the deployed tree (`~/deploy/omnigent-ae`), so run it there.
 
@@ -1279,6 +1391,138 @@ terminal), `gh auth login --web` and `az login --use-device-code` themselves; ea
 prints a link they open in their browser, and the result stays in their volume.
 Credentials they would rather hand over go in `config/hosts/<name>.env`
 (`host-container/user.env.example`), never one of the first user's.
+
+### Syncing the shared AE setup
+
+The container starts empty, so the AE skills, team rules, MCP servers and a few
+settings reach it from the box, on a timer, with a scan that stops anything
+personal to the first user from going. Added 2026-10-28.
+
+The content scan refuses any synced file that holds a personal marker. Since
+2026-10-29 the list of markers is not in source, so the repository names no one: it
+is a plain text file on the box, `config/host-scrub.txt` under the repo root
+(gitignored), or the path in `AE_HOST_SCRUB_FILE`. Copy
+`config/host-scrub.txt.example` and fill in the owner's real values: one marker per
+line, `#` comments, and `path<TAB>value` for a marker allowed in one repo path only
+(the brand rulebook). While the file is missing, unreadable or has no marker lines,
+the sync refuses to run, so write it before the first sync. Matching ignores case,
+spacing, slash direction and zero-width characters.
+
+```bash
+deploy/host-container.sh <name> sync-config --dry-run   # plan and scan; sends and changes nothing
+deploy/host-container.sh <name> sync-config             # do it now
+
+# the timer, every 30 minutes (installing it is a separate, deliberate step):
+cp deploy/systemd/user/ae-host-config-sync@.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ae-host-config-sync@<name>.timer
+journalctl --user -u ae-host-config-sync@<name> -n 20
+```
+
+**Source.** `refs/remotes/origin/main` of the box's ae-claude-skills clone
+(`AE_SKILLS_CLONE`, default `~/repos/ae-claude-skills`), read with `git archive`,
+never the working tree and never a local `main` (which may hold unmerged work), so
+uncommitted or unmerged edits cannot leak. If `origin/main` is missing the sync
+fails. The script prints the commit it syncs, warns when that commit is more than
+six hours old, and never fetches; `ae-rules-sync.timer` keeps the clone current
+every 30 minutes. The target is always the container `omnigent-host-<name>`; only
+tests may override it, and only with a `synctest-` name. A stopped or missing
+container is a one-line skip (exit 0); any other docker error (daemon down, no
+permission) fails the run.
+
+**What is synced** (all as the container's `agent` user, uid 61000, nothing as
+root; the container is never started, stopped or restarted):
+
+| From the repo | To `/home/agent/.claude/` |
+|---|---|
+| each skill folder `claude-config/skills-manifest.txt` marks `team` with surface `any` or `linux` | `skills/<name>/`, each with an empty `.ae-managed` marker, replaced whole through a swap folder outside `skills/` (`~/.claude/.ae-sync/swap/`) that an interrupted run recovers from |
+| `claude-config/team-CLAUDE.md` (required) | `ae-team/CLAUDE.md`; `CLAUDE.md` is created only when missing, holding `@~/.claude/ae-team/CLAUDE.md` |
+| `claude-config/team-settings.json` | merged into `settings.json` (see Settings merge below) |
+| `claude-config/team-mcp.json`, `scripts/register-team-mcp.sh` | `ae-team/scripts/team-mcp.json` (next to the script, where it looks) and `ae-team/scripts/register-team-mcp.sh`, which then runs (it is idempotent; it needs `jq`, which the host image installs since 2026-10-29, and `claude`; without either the sync prints one `REGISTRATION SKIPPED:` line naming it, still exits 0, and the servers stay unregistered until the image is rebuilt) |
+| each server's `sync_paths`, and `claude-config/mcp/` | `ae-team/mcp/<the same repo path>` (for example `ae-team/mcp/claude-config/mcp/pbi-mcp.sh`), replaced whole, `node_modules` kept |
+
+Each `team-mcp.json` server's `setup` commands run in the first `sync_paths` folder
+(for example `npm ci --omit=dev`, through the egress proxy) only when that folder
+or the commands changed since the last good run.
+
+**The manifest contract.** Lines are `<path> <scope> <surface>` (`#` comments;
+scope `team` or `personal`; surface `any`, `linux` or `windows`). Only `team`
+with `any` or `linux` is synced. A missing or unparsable manifest, a listed path
+that is not a folder, or a missing `team-CLAUDE.md` stops the sync: it never
+falls back to copying everything. A manifest that has rows but none with scope
+`team` and surface `any` or `linux` also fails (a mis-edited column must not
+remove every managed skill). A missing settings, MCP or register file is skipped
+with a warning. A skill name listed twice keeps the first.
+
+**Settings merge.** `team-settings.json` may carry only `env`, `enabledPlugins`,
+`extraKnownMarketplaces`, `allowedMcpServers` and `deniedMcpServers`; any other
+top-level key (`permissions`, `hooks`, `model`, `statusLine`, `autoMode`,
+`apiKeyHelper`, `awsAuthRefresh`, `sandbox`, `enableAllProjectMcpServers`, ...)
+and any `env` key starting `ANTHROPIC_` refuses the whole file. The merge into
+the user's `settings.json` is deep: objects merge per leaf with the team value
+winning, lists are unioned (the user's entries first, then new team entries, de-duplicated by
+`serverName` or `serverUrl` for the MCP lists), and every key the user has and the
+team file does not name is untouched. The existing file's mode is kept (a new
+file is 0600), the write is atomic, and a lock covers the read-merge-write. A
+`settings.json` that is not valid JSON is left untouched, the sync prints
+`SETTINGS NOT MERGED:` and exits non-zero.
+
+**Locks and limits.** One sync per user runs at a time on the box (a lock under
+`$XDG_RUNTIME_DIR`, else `~/.cache`, independent of `TMPDIR`) and one inside the
+container (a second run there is skipped with a line). Each run extracts into its
+own directory under `~/.claude/.ae-sync/` and removes it when it ends. Setup
+commands and the register script are killed after 600 seconds. Known limits, left
+as they are: files are placed one at a time, so a run caught mid-way (a stopped
+container) leaves some new and some old files until the next run; a path that
+changes between file and folder between two runs can fail the placement; the
+synced MCP folders (`sync_paths`) are mirrored, so a file a user adds inside one
+is deleted on the next run (`node_modules` is kept); a dangling
+`~/.claude/CLAUDE.md` symlink is not repaired; `.env.example` is refused like any
+`.env.*`; `jq` in the image is whatever Debian ships, not pinned.
+
+**The scan** (lists at the top of `host-config-sync.py`) runs on the archive
+before a byte is streamed, and again inside the container over the extracted
+copy before anything is placed. It fails, naming the file and the marker, when:
+a path has a deny name (matched in any letter case, so `History.jsonl` and `.SSH`
+count). Two splits (2026-10-29): the plain-English folders
+Claude's own home uses (`projects/`, `sessions/`, `session-env/`,
+`file-history/`, `plans/`, `paste-cache/`, `shell-snapshots/`, `state/`) are
+refused only at the root of the synced tree, so a skill's own
+`.../src/ae/state/` is ordinary code and passes; the secrets-like names are
+refused at any depth (`.credentials.json`, `history.jsonl`, `settings.json`,
+`settings.local.json`, `mcp-needs-auth-cache.json`, `policy-limits`,
+`remote-settings`, `global-CLAUDE.md`, `claude-ai-profile-paste.md`,
+`memory-backup`, `link-memory.sh`, `hb-get.sh`, `node_modules/`, `.env` and
+`.env.*`, `.azure`, `.config/gh`, `.omnigent`, `.codex`, `.ssh`); a file's content
+holds a personal marker after normalising it the way ae-claude-skills
+`scripts/check-skills-manifest.py` does (Unicode NFKC, zero-width characters
+removed, lower case, runs of `/` and `\` as one `/`, spaces around `@` removed,
+all whitespace as one space, so a marker wrapped over lines still matches; UTF-8,
+16 and 32 text with a BOM is decoded, other NUL-bearing text is read with the
+NULs dropped, and a text file that cannot be decoded fails the scan rather than
+being skipped). The markers are the owner's mail addresses, home and Windows paths,
+dev account name, Key Vault secret names, tenant and account ids, the second
+company's name, `onedrive`, `.claude/memory` and their checkout root; the exact
+strings are in the box's scrub file (below), with one exemption (the brand
+guide's generated rulebook may name the second company); a
+member is a link or device; or
+the file list differs from what the allowlist predicts. A hit exits non-zero
+before the container changes. It looks for those names and strings only, so a
+personal fact in other words (a first name, a client name) passes; the manifest
+and the reviewed contents of the repo are what keep those out.
+
+**A user's own files.** A skill folder without `.ae-managed` is never touched,
+even when it has a team skill's name (the team skill is skipped with a warning).
+`~/.claude/CLAUDE.md` is never overwritten; if it loses the import line the sync
+warns and leaves it. `settings.json` gains only what `team-settings.json` names
+(Settings merge above). A managed skill that leaves the allowlist is removed;
+nothing else is, and the swap artifacts never sit inside `skills/`, so a user's
+folder with any name, even `.ae-new-x`, is never touched.
+
+**Not synced, and why.** Anything marked `personal` or `windows`; every
+credential, history, session, plan and memory file (deny list above); the first
+user's global rules and statusline, which are theirs; `permissions`, `hooks`,
+`model` and the other refused settings keys, which are each user's call.
 
 ### After a release
 

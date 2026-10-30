@@ -1,6 +1,6 @@
 // Open PRs (2026-09-24): every open pull request a session tracks, as a card
-// with CI, mergeability, reviews and a Merge button. Reid merged every pull
-// request by hand on github.com from his phone; this puts the merge next to the
+// with CI, mergeability, reviews and a Merge button. The owner merged every pull
+// request by hand on github.com from their phone; this puts the merge next to the
 // sessions that opened them.
 //
 // Which pull requests: upstream's per-session tracking
@@ -13,7 +13,7 @@
 // card that is not already in review or reference and has no other open pull
 // request (reviewOffer.ts, 2026-09-25).
 //
-// 2026-09-26, from Reid's screenshots: the confirm step is one row (a
+// 2026-09-26, from the owner's screenshots: the confirm step is one row (a
 // segmented method toggle, Confirm merge, Cancel) that wraps to two only on a
 // narrow card, and the offer reads "Mark session done" with a "frees a slot"
 // hint, because "Set session to review" did not say what it does.
@@ -26,7 +26,7 @@
 // since core patch P25 the host opens a github.com pull request URL for the
 // page, in the device's default browser.
 //
-// Recommended method (2026-09-28): Reid asked the confirm step to say which
+// Recommended method (2026-09-28): the owner asked the confirm step to say which
 // method to use. The server decides (recommend_merge_method in
 // ae_omni_policies.prs: a merge commit when the head is a long-lived branch
 // such as dev or release/x, else squash); the toggle opens on that method, its
@@ -41,13 +41,13 @@
 //
 // Shared with Your move (2026-09-24): a pull request no session tracks (one a
 // subagent or another session opened) is listed only under Your move, which
-// had Copy link and nothing else, so Reid could see a green pull request on
-// his phone and not merge it. The Merge button, its confirm step and the
+// had Copy link and nothing else, so the owner could see a green pull request on
+// their phone and not merge it. The Merge button, its confirm step and the
 // merged card are exported here (mergeButton, keepConfirm, mergeWhy,
 // mergedCards) so both sections merge the same way; each merged card stays in
 // the section it was merged from.
 //
-// Calmer cards (2026-10-14, Reid: "make this prettier", with the chat's card in
+// Calmer cards (2026-10-14, the owner: "make this prettier", with the chat's card in
 // core patch P37): the outlined chips read as buttons and the confirm step was
 // a box inside the card. The head's icon names the state (merged is purple);
 // a card whose Merge is live and clean says "Ready to merge" in one line, and

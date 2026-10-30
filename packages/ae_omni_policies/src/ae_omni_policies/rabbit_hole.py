@@ -8,7 +8,7 @@ the turn count and the session's title. Accepting acknowledges it for the
 session (no second ask); declining drops that prompt, which is the human's
 cue to park or hand off first. Propose, never lecture (decided 2026-09-23).
 
-``hours: 0`` turns the policy off, Reid's switch; ``turns: 0`` drops the turn
+``hours: 0`` turns the policy off, the owner's switch; ``turns: 0`` drops the turn
 threshold and keeps the time one. Elapsed time is measured from ``ae.started``
 (the slot cap writes it when the session claims a slot); a session with no
 start has no clock, so only the turn threshold applies to it. Sub-agent
@@ -23,7 +23,7 @@ parent, the lead exists and has the child's owner). Past a threshold, a child wh
 already accepted the check (its own persisted ``_ae_rabbit_ack``, read from the lead's
 conversation row) is allowed and records its own ack, so later turns skip the lookup;
 without that, each child's ask would hold every message, the lead's ``post_message``
-included, until Reid accepted in the child. A lead that declined or was never asked
+included, until the owner accepted in the child. A lead that declined or was never asked
 leaves no ack, so the child asks on its own; a foreign or missing lead (both owners are
 read strictly, so a failed owner read asks), a fork, and any store read failure ask as
 before, never a silent allow. No setting.

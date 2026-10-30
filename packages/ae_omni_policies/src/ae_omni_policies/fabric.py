@@ -1,7 +1,7 @@
 """Fabric capacities for the Admin Center's Fabric section: status, wake, suspend and keep awake.
 
-Added 2026-10-16. Reid wanted the aetraining wake button inside omnigent-ae,
-next to the Dashboard, with room for more capacities later; Off came at his
+Added 2026-10-16. The owner wanted the aetraining wake button inside omnigent-ae,
+next to the Dashboard, with room for more capacities later; Off came at their
 request the same day. Each capacity sits behind its own Azure Logic App
 (built in agents-and-automation), which holds the Azure credential and does
 the ARM call; this server only holds the Logic App's URL.
@@ -68,7 +68,7 @@ answer back. A refresh that fails keeps the last rows and shows the error the
 way a live GET does (``fleetError``, or the row's own ``error``); a bug in the refresh is logged
 by class name only.
 
-2026-10-16, second pass (Reid approved the compact row design): the probe
+2026-10-16, second pass (the owner approved the compact row design): the probe
 answer may also carry ``sku``, ``region``, ``capacityId`` (the ARM resource
 id), ``hourlyUsd``, ``resumedAt`` (the last successful resume),
 ``keepAwakeSince``, ``quietSince``, ``maxHours`` and ``nextCheckAt`` (the
@@ -112,9 +112,9 @@ as a 504). agents-and-automation caps each read at 3 s, but that cap may not
 bound a stalled read: the 85 s read already ran under a 20 s cap. So the guard
 is this server: a row's state comes from the fleet's ARM read below, and a
 failed or slow details probe keeps the last good details (never offering keep
-awake from them). Reid also wanted every
-Fabric capacity he has (three subscriptions today), each with its SKU, state,
-Pause or Start, and a resize behind a confirm. Design he approved: this server
+awake from them). The owner also wanted every
+Fabric capacity they have (three subscriptions today), each with its SKU, state,
+Pause or Start, and a resize behind a confirm. Design they approved: this server
 still holds no Azure credential; one shared Logic App, ``la-fabric-capacities``,
 does the ARM calls. Two optional secrets turn it on:
 

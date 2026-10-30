@@ -26,10 +26,10 @@ Every row has a Model column with the model the helper actually ran on, written 
 
 <p align="center"><img src="../media/agents-running.webp" alt="Running until the lead records its return"></p>
 
-A Claude Code subagent goes quiet between steps, and stock Omnigent read each pause as finished, so rows flickered between Running and Finished. The fork keeps a subagent under Running until its parent records the return. A subagent that died before its first pause, or across a server restart, still settles instead of reading Running forever.
+A Claude Code subagent goes quiet between steps, and stock Omnigent read each pause as finished, so rows flickered between Running and Finished. The fork keeps a subagent under Running until its parent records the return. A subagent that died before its first pause, or across a server restart, still settles instead of reading Running forever. After a runner restart or a deploy, a subagent that died mid-step no longer reads Running for another hour: its quiet time counts from its last real activity, not from the old items the restart sent again, and once that passes the limit (an hour by default, `OMNIGENT_AE_CLAUDE_SUBAGENT_STALE_AFTER_S` in seconds) it moves under Finished as Disconnected. A real resume clears that. A subagent waiting on your answer to a prompt is never settled this way.
 
-**Where:** The Agents tab, and the sidebar's waiting count.<br>
-**Built from:** core patches [`0112`](../../patches/0112-ae-patch-Keep-a-Claude-Code-subagent-running-until-i.patch), [`0125`](../../patches/0125-ae-patch-Settle-a-Claude-subagent-that-died-before-i.patch)
+**Where:** The Agents tab and the rail's Agents card, and the sidebar's waiting count.<br>
+**Built from:** core patches [`0112`](../../patches/0112-ae-patch-Keep-a-Claude-Code-subagent-running-until-i.patch), [`0125`](../../patches/0125-ae-patch-Settle-a-Claude-subagent-that-died-before-i.patch), [`0254`](../../patches/0254-ae-patch-Mark-a-Claude-Code-subagent-disconnected-wh.patch), [`0255`](../../patches/0255-ae-patch-Keep-a-subagent-s-settle-from-overwriting-a.patch)
 
 ## Failed helpers
 
@@ -62,7 +62,7 @@ A helper session that is closed drops out of its parent's count at once, so the 
 
 <p align="center"><img src="../media/agents-roles-spend.jpg" alt="Role, model, effort and spend per agent"></p>
 
-Each agent on the rail's Agents card and in the Agents tab shows its role, its model with a colored dot, its effort and what it spent, then a total line, "This chat and its agents", with a thin bar split by model family. A helper the lead raised carries an amber arrow. The role comes from the start of the agent's description ("Builder A: ..."), and the lead is told to name one on every helper it starts. Sessions the lead starts with `create_session` show in Grouping > Family instead (see [Roles presets](roles-presets.md)).
+Each agent on the rail's Agents card and in the Agents tab shows its role, its model with a colored dot, its effort and what it spent, then a total line, "This chat and its helpers" (which also adds the spend of the chat's family child chats on the rail card), with a thin bar split by model family. A helper the lead raised carries an amber arrow. The role comes from the start of the agent's description ("Builder A: ..."), and the lead is told to name one on every helper it starts. Sessions the lead starts with `create_session` show in Grouping > Family instead (see [Roles presets](roles-presets.md)).
 
 **Where:** The Agents card in the session rail, and the Agents tab.<br>
 **Built from:** core patches [`0172`](../../patches/0172-ae-patch-Show-each-agent-s-role-model-effort-and-tok.patch), [`0173`](../../patches/0173-ae-patch-Show-each-agent-s-spend-as-estimated-cost-w.patch)

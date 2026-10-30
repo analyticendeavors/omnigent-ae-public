@@ -12,12 +12,14 @@ slots), ``omni_set_status`` (``ae.status`` on a session) and
 
 2026-09-25 added the orchestrator agent's five: ``create_session``,
 ``post_message``, ``schedule_checkin``, ``list_prs`` (the server's cards plus
-``gh`` on the host, :mod:`ae_omni_policies.gh`) and ``ask_reid`` (an MCP
+``gh`` on the host, :mod:`ae_omni_policies.gh`) and ``ask_user`` (an MCP
 elicitation, which OmniGent shows as a pop-up). The first three write and sit
 on :data:`WRITING_TOOLS`. ``report_review`` (2026-10-24) records a lead's final review counts
 for the preset run log (:mod:`ae_omni_policies.preset_runs`) and is a writer too.
 ``preset_insights_read`` and ``submit_preset_suggestions`` (2026-10-24) are the scheduled
-preset reviewer's pair; the second writes.
+preset reviewer's pair; the second writes. ``hand_off`` (2026-10-29) is the lead's call to move
+its family to a fresh lead (:mod:`ae_omni_policies.lead_handoff`); it writes, and
+``post_message`` and ``schedule_checkin`` follow ``ae.handoff_to`` to the new lead.
 
 Every tool is a thin HTTP call to the OmniGent server with the token
 ``omnigent login`` stored (or ``OMNIGENT_TOKEN``), through
@@ -74,7 +76,7 @@ _ITEMS_PER_MESSAGE = 4
 
 NOT_LINKED_INSTRUCTION = (
     "The task and the issue both exist, but nothing joins them. Report the task as "
-    "filed and give Reid the issue URL inline."
+    "filed and give the user the issue URL inline."
 )
 
 # ── the worker's schemas, verbatim ───────────────────────────────────────
@@ -86,7 +88,7 @@ PARK_FORK_SCHEMA: dict[str, Any] = {
             "type": "string",
             "description": (
                 "The gate's FORK: clause, naming the fork in one line. It becomes the bold "
-                "line at the top of the note, which is what Reid reads when scanning the "
+                "line at the top of the note, which is what the user reads when scanning the "
                 "lot weeks later. Defaults to the first sentence of state."
             ),
         },
@@ -155,7 +157,7 @@ PARK_FORK_SCHEMA: dict[str, Any] = {
             "items": {"type": "string"},
             "description": (
                 "Domain tags beyond `parked`, which is always added here and never needs "
-                "sending. Propose these in the gate's own message so Reid sees them before "
+                "sending. Propose these in the gate's own message so the user sees them before "
                 "anything is written, and take them from the vocabulary list_tags returns "
                 "rather than inventing near-duplicates. Lowercased and deduped here."
             ),
@@ -295,7 +297,7 @@ CREATE_SESSION_SCHEMA: dict[str, Any] = {
     "properties": {
         "title": {
             "type": "string",
-            "description": "The session title Reid sees: a name for the work, not a sentence.",
+            "description": "The session title the user sees: a name for the work, not a sentence.",
         },
         "brief": {
             "type": "string",
@@ -371,21 +373,40 @@ CREATE_SESSION_SCHEMA: dict[str, Any] = {
         "ride_unparked": {
             "type": "boolean",
             "description": (
-                "Start it past the slot limit. Only after Reid picked that in ask_reid; the "
+                "Start it past the slot limit. Only after the user picked that in ask_user; the "
                 "session is marked overflow."
             ),
         },
         "standalone": {
             "type": "boolean",
             "description": (
-                "Open a chat of its own for Reid instead of a helper (a handoff): it joins "
+                "Open a chat of its own for the user instead of a helper (a handoff): it joins "
                 "no family, holds its own slot, and runs as lead on preset (your default "
                 "preset when left out). Pass key (or a distinct title) for each handoff, or "
-                "a live chat with the same title is returned. Give its link to Reid."
+                "a live chat with the same title is returned. Give its link to the user."
             ),
         },
     },
     "required": ["title", "brief"],
+    "additionalProperties": False,
+}
+
+HAND_OFF_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "packet": {
+            "type": "string",
+            "description": (
+                "The handoff packet the new lead starts from: project state, decisions and why, "
+                "files and their status, the exact next step, open questions, a START ON line."
+            ),
+        },
+        "title": {
+            "type": "string",
+            "description": "The new chat's title. Defaults to this chat's title.",
+        },
+    },
+    "required": ["packet"],
     "additionalProperties": False,
 }
 
@@ -490,7 +511,7 @@ LIST_PRS_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
-ASK_REID_SCHEMA: dict[str, Any] = {
+ASK_USER_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "question": {"type": "string", "description": "One decision, one line."},
@@ -642,7 +663,9 @@ SET_SESSION_MODEL_SCHEMA: dict[str, Any] = {
         "reason": {
             "type": "string",
             "maxLength": 200,
-            "description": "One plain sentence on why, shown to Reid in the notice and the log.",
+            "description": (
+                "One plain sentence on why, shown to the user in the notice and the log."
+            ),
         },
     },
     "required": ["session_id", "reason"],
@@ -654,7 +677,8 @@ TOOLS: list[types.Tool] = [
         name="park_fork",
         description=(
             "Route C of the fork-triage gate: file a parked fork as a task in the Parking Lot "
-            "list of Reid's task-store. Call it only after Reid answers C at the gate, and "
+            "list of the user's task-store. Call it only after the user answers C at the "
+            "gate, and "
             "call it FIRST: task, then the GitHub issue (repo-scoped forks only), then "
             "link_issue to point the task back at it. That order is load-bearing. A failed "
             "issue leaves a visible task; the reverse leaves an issue pointing at nothing. "
@@ -667,9 +691,9 @@ TOOLS: list[types.Tool] = [
     types.Tool(
         name="list_tags",
         description=(
-            "Reid's existing tag vocabulary, with how many tasks carry each one. Read this "
+            "The user's existing tag vocabulary, with how many tasks carry each one. Read this "
             "BEFORE proposing tags in a fork-triage gate message, so the suggestion comes "
-            "from tags he already uses instead of minting a near-duplicate nobody can "
+            "from tags they already use instead of minting a near-duplicate nobody can "
             "filter on. `parked` is added by park_fork and never needs proposing."
         ),
         inputSchema=LIST_TAGS_SCHEMA,
@@ -680,7 +704,7 @@ TOOLS: list[types.Tool] = [
             "Point an already-parked task at the GitHub issue opened for it. This is the "
             "third and last step of route C for a repo-scoped fork: park_fork, then the "
             "issue, then this. Pass the task id park_fork returned and the URL the issue "
-            "creation returned. If it fails, hand Reid the issue URL inline rather than "
+            "creation returned. If it fails, hand the user the issue URL inline rather than "
             "leaving the two silently unconnected."
         ),
         inputSchema=LINK_ISSUE_SCHEMA,
@@ -744,7 +768,7 @@ TOOLS: list[types.Tool] = [
             "the limit it answers slots_full with who holds them (blocked and failed sessions "
             "hold none). Idempotent by key: a retry returns the live session (existing: true). "
             "Pass role (planner, reviewer, builder, helper) for the model and effort your "
-            "preset sets for that role, or standalone to open a handoff chat for Reid. "
+            "preset sets for that role, or standalone to open a handoff chat for the user. "
             "Returns the session id and its URL."
         ),
         inputSchema=CREATE_SESSION_SCHEMA,
@@ -758,12 +782,23 @@ TOOLS: list[types.Tool] = [
         inputSchema=POST_MESSAGE_SCHEMA,
     ),
     types.Tool(
+        name="hand_off",
+        description=(
+            "Hand this chat off to a fresh lead that starts from your handoff packet. The new "
+            "chat gets this chat's host, workspace, model, effort, preset and Claude login; "
+            "its children, check-in and slot move to it, and this chat becomes a reference. "
+            "Call it only when the user asks for a new chat, after the packet is written. A "
+            "repeat call returns the same new chat."
+        ),
+        inputSchema=HAND_OFF_SCHEMA,
+    ),
+    types.Tool(
         name="answer_child_question",
         description=(
-            "Pass Reid's answer to a question (AskUserQuestion) that a session you started is "
-            "waiting on. Ask Reid first with ask_reid. Never for tool permissions, plan "
-            "approval, commands or MCP prompts: those are Reid's to answer in the dock. "
-            "Refuses when Reid turned relaying off, the session is not yours, or the question "
+            "Pass the user's answer to a question (AskUserQuestion) that a session you started is "
+            "waiting on. Ask the user first with ask_user. Never for tool permissions, plan "
+            "approval, commands or MCP prompts: those are the user's to answer in the dock. "
+            "Refuses when the user turned relaying off, the session is not yours, or the question "
             "is no longer pending."
         ),
         inputSchema=ANSWER_CHILD_QUESTION_SCHEMA,
@@ -787,19 +822,20 @@ TOOLS: list[types.Tool] = [
         inputSchema=LIST_PRS_SCHEMA,
     ),
     types.Tool(
-        name="ask_reid",
+        name="ask_user",
         description=(
-            "Ask Reid one decision as a pop-up (an elicitation) and wait for the answer. "
-            "Recommended option first. Answers with his pick, or with how to ask in chat "
+            "Ask the user one decision as a pop-up (an elicitation) and wait for the answer. "
+            "Recommended option first. Answers with their pick, or with how to ask in chat "
             "when pop-ups are not available."
         ),
-        inputSchema=ASK_REID_SCHEMA,
+        inputSchema=ASK_USER_SCHEMA,
     ),
     types.Tool(
         name="set_session_model",
         description=(
             "Change the model or effort of your own session or one you started, under your "
-            "preset's rules. It may apply at once and tell Reid, ask him first in a pop-up, or "
+            "preset's rules. It may apply at once and tell the user, ask them first in a "
+            "pop-up, or "
             "be refused; the answer says which. A Codex helper takes effort changes only."
         ),
         inputSchema=SET_SESSION_MODEL_SCHEMA,
@@ -843,6 +879,7 @@ WRITING_TOOLS: frozenset[str] = frozenset(
         "omni_set_status",
         "create_session",
         "post_message",
+        "hand_off",
         "answer_child_question",
         "schedule_checkin",
         "set_session_model",
@@ -1074,7 +1111,7 @@ async def omni_transcript(client: OmniClient, args: dict[str, Any]) -> Any:
 
 
 def session_url(settings: Settings, path: str | None) -> str | None:
-    """The session's page on the server Reid opens, from the route's ``/c/<id>`` path."""
+    """The session's page on the server the owner opens, from the route's ``/c/<id>`` path."""
     if not path or not settings.server_url:
         return None
     return f"{settings.server_url}{path}"
@@ -1104,10 +1141,10 @@ async def create_session(client: OmniClient, args: dict[str, Any]) -> Any:
         }
     if status == 409 and isinstance(error, dict):
         instruction = (
-            "Nothing was started. Give Reid the handoff note as a block to paste into a new "
-            "chat, and tell him every slot is taken."
+            "Nothing was started. Give the user the handoff note as a block to paste into a new "
+            "chat, and tell them every slot is taken."
             if body.get("standalone")
-            else "Nothing was started. Ask Reid with ask_reid: wait for a slot (recommended), "
+            else "Nothing was started. Ask the user with ask_user: wait for a slot (recommended), "
             "park one of the working sessions, or start it anyway with ride_unparked."
         )
         return {
@@ -1124,6 +1161,30 @@ async def create_session(client: OmniClient, args: dict[str, Any]) -> Any:
     return answer
 
 
+#: Hops of ``ae.handoff_to`` a message or check-in follows (a chain, with a loop guard).
+HANDOFF_HOPS = 5
+HANDOFF_TO_LABEL = "ae.handoff_to"
+
+
+async def follow_handoff(client: OmniClient, session_id: str) -> str:
+    """The lead that took over *session_id*, following ``ae.handoff_to`` up to five hops.
+
+    A session without the label, an unreadable one, a loop and a chain past the cap all stop
+    where they are, so the message still goes to the last session reached.
+    """
+    seen = {session_id}
+    current = session_id
+    for _ in range(HANDOFF_HOPS):
+        status, session = await client.call("GET", f"/v1/sessions/{current}")
+        held = session.get("labels") if status == 200 and isinstance(session, dict) else None
+        target = str(held.get(HANDOFF_TO_LABEL, "")).strip() if isinstance(held, dict) else ""
+        if not target or target in seen:
+            break
+        seen.add(target)
+        current = target
+    return current
+
+
 async def post_message(client: OmniClient, args: dict[str, Any]) -> Any:
     session_id = str(args["session_id"])
     text = str(args["text"])
@@ -1133,15 +1194,39 @@ async def post_message(client: OmniClient, args: dict[str, Any]) -> Any:
         "type": "message",
         "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
     }
-    status, data = await client.call("POST", f"/v1/sessions/{session_id}/events", json_body=event)
+    target = await follow_handoff(client, session_id)
+    status, data = await client.call("POST", f"/v1/sessions/{target}/events", json_body=event)
     if 200 <= status < 300:
-        return {"posted": True, "session_id": session_id, "status": status}
-    return {"error": f"Could not post to {session_id}: {_message(status, data)}"}
+        answer: dict[str, Any] = {"posted": True, "session_id": target, "status": status}
+        if target != session_id:
+            answer["forwarded_from"] = session_id
+        return answer
+    return {"error": f"Could not post to {target}: {_message(status, data)}"}
+
+
+async def hand_off(client: OmniClient, args: dict[str, Any]) -> Any:
+    """Hand the calling chat off to a fresh lead (``POST /v1/ae/sessions/{id}/handoff``)."""
+    caller = _caller_session()
+    if not caller:
+        return {"error": _NO_OWN_ID.format(done="handed off")}
+    body = {key: args[key] for key in ("packet", "title") if args.get(key)}
+    status, data = await client.call("POST", f"/v1/ae/sessions/{caller}/handoff", json_body=body)
+    if status != 200 or not isinstance(data, dict):
+        return {"error": f"Could not hand off: {_message(status, data)}"}
+    new = data.get("session_id")
+    if data.get("ok") is False:
+        data["next"] = (
+            f"Handoff to {new} started but not finished: {data.get('problems')}. "
+            "Call hand_off again to finish it; do not start new work here."
+        )
+    else:
+        data["next"] = f"Handed off to {new}. Stop now; do not start new work or sessions here."
+    return data
 
 
 ORCH_LABEL = "ae.orch"
 FORK_SOURCE_LABEL = "omnigent.fork.source_id"
-_REFUSAL_TAIL = " Reid can answer it in the parent chat's action dock."
+_REFUSAL_TAIL = " The user can answer it in the parent chat's action dock."
 
 
 def _refuse(why: str) -> dict[str, Any]:
@@ -1209,7 +1294,7 @@ def _plain_question(params: dict[str, Any]) -> list[dict[str, Any]] | None:
 
 
 async def answer_child_question(client: OmniClient, args: dict[str, Any]) -> Any:
-    """Pass Reid's answer to a family child's AskUserQuestion; refuse every other prompt."""
+    """Pass the owner's answer to a family child's AskUserQuestion; refuse every other prompt."""
     # The lead is the calling session itself, never a caller-supplied id.
     parent = _caller_session()
     if not parent:
@@ -1222,7 +1307,7 @@ async def answer_child_question(client: OmniClient, args: dict[str, Any]) -> Any
     if status != 200 or not isinstance(roles, dict):
         return _refuse(f"could not read the relay setting ({_message(status, roles)})")
     if roles.get("child_relay") is False:
-        return _refuse("Reid turned off 'Lead relays answers to child questions'")
+        return _refuse("the user turned off 'Lead relays answers to child questions'")
     status, session = await client.call("GET", f"/v1/sessions/{child}")
     if status != 200 or not isinstance(session, dict):
         return _refuse(f"could not read the child session ({_message(status, session)})")
@@ -1281,12 +1366,16 @@ async def schedule_checkin(client: OmniClient, args: dict[str, Any]) -> Any:
             return {"name": schedules.CHECKIN_NAME, "id": existing["id"], "action": "paused"}
         zone, _ = await schedules.server_defaults(http)
         until_raw = str(args.get("until") or "").strip()
+        # A lead that handed off must not point the check-in back at itself (2026-10-29).
+        target = str(args.get("session_id") or "").strip()
+        if target:
+            target = await follow_handoff(client, target)
         try:
             until = date.fromisoformat(until_raw) if until_raw else None
             schedule = schedules.checkin_schedule(
                 int(args.get("every_hours") or 1),
                 until=until,
-                session_id=str(args.get("session_id") or "").strip() or None,
+                session_id=target or None,
                 note=str(args.get("note") or "").strip() or None,
                 timezone=zone,
             )
@@ -1463,12 +1552,12 @@ async def list_prs(client: OmniClient, args: dict[str, Any]) -> Any:
     }
 
 
-async def ask_reid(session: Any, args: dict[str, Any]) -> Any:
+async def ask_user(session: Any, args: dict[str, Any]) -> Any:
     question = " ".join(str(args.get("question") or "").split())
     options = [" ".join(str(option).split()) for option in args.get("options") or []]
     options = [option for option in options if option]
     if not question or not 2 <= len(options) <= 4:
-        return {"error": "ask_reid needs a question and two to four options"}
+        return {"error": "ask_user needs a question and two to four options"}
     shown = [f"{options[0]} (Recommended)", *options[1:]]
     schema = {
         "type": "object",
@@ -1490,7 +1579,7 @@ async def ask_reid(session: Any, args: dict[str, Any]) -> Any:
             "instruction": fallback,
         }
     if result.action != "accept":
-        return {"answer": None, "action": result.action, "instruction": "Reid dismissed it."}
+        return {"answer": None, "action": result.action, "instruction": "The user dismissed it."}
     picked = str((result.content or {}).get("choice") or "")
     if picked in shown:
         picked = options[shown.index(picked)]
@@ -1498,7 +1587,7 @@ async def ask_reid(session: Any, args: dict[str, Any]) -> Any:
 
 
 async def set_session_model(client: OmniClient, session: Any, args: dict[str, Any]) -> Any:
-    """Change a session's model or effort; on ``needs_approval`` ask Reid, and on a yes confirm."""
+    """Change a session's model or effort; on ``needs_approval`` ask the owner, then confirm."""
     session_id = str(args["session_id"])
     body = {
         key: args.get(key)
@@ -1511,7 +1600,7 @@ async def set_session_model(client: OmniClient, session: Any, args: dict[str, An
         return {
             "error": (
                 "Could not find this session's own id (OMNIGENT_RUNNER_PRIMARY_SESSION_ID is "
-                "not set), so nothing was changed. Ask Reid to change the model in the picker."
+                "not set), so nothing was changed. Ask the user to change the model in the picker."
             )
         }
     body["caller"] = caller
@@ -1523,14 +1612,15 @@ async def set_session_model(client: OmniClient, session: Any, args: dict[str, An
         return data
     options = list(data.get("options") or [])
     if len(options) < 2:
-        return data | {"instruction": "Ask Reid in chat whether to make this change."}
-    asked = await ask_reid(session, {"question": data.get("question"), "options": options})
+        return data | {"instruction": "Ask the user in chat whether to make this change."}
+    asked = await ask_user(session, {"question": data.get("question"), "options": options})
     if "reason" in asked:
         # No pop-ups on this client: hand the question back for the chat.
         return data | {
             "instruction": (
-                "Ask Reid in chat: the question on one line, then the two options, recommended "
-                "first. If he says yes, call set_session_model again."
+                "Ask the user in chat: the question on one line, then the two options, "
+                "recommended "
+                "first. If they say yes, call set_session_model again."
             )
         }
     if asked.get("answer") != options[0]:
@@ -1539,7 +1629,7 @@ async def set_session_model(client: OmniClient, session: Any, args: dict[str, An
     if status != 200 or not isinstance(confirmed, dict):
         return {"error": f"Could not change the model: {_message(status, confirmed)}"}
     if confirmed.get("status") == "changed":
-        confirmed["approved"] = "reid"
+        confirmed["approved"] = "owner"
     return confirmed
 
 
@@ -1620,6 +1710,7 @@ HANDLERS = {
     "omni_transcript": omni_transcript,
     "create_session": create_session,
     "post_message": post_message,
+    "hand_off": hand_off,
     "answer_child_question": answer_child_question,
     "schedule_checkin": schedule_checkin,
     "list_prs": list_prs,
@@ -1627,9 +1718,9 @@ HANDLERS = {
     "preset_insights_read": preset_insights_read,
     "submit_preset_suggestions": submit_preset_suggestions,
 }
-# Tools that talk to Reid through the MCP session, not the server.
-SESSION_HANDLERS = {"ask_reid": ask_reid}
-# Tools that need both: the server for the change and the MCP session to ask Reid.
+# Tools that talk to the owner through the MCP session, not the server.
+SESSION_HANDLERS = {"ask_user": ask_user}
+# Tools that need both: the server for the change and the MCP session to ask the owner.
 CLIENT_SESSION_HANDLERS = {"set_session_model": set_session_model}
 
 

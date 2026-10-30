@@ -1,0 +1,225 @@
+# ============================================================
+# Leak scan of a pull request (2026-10-28)
+#
+# Every commit the PR brings (each on its own), its paths, commit messages, title and body.
+# This used to be a job of ci.yml; it lives here so it re-runs when the title or body is
+# edited and when the approval label changes, without a title edit cancelling a build.
+#
+# Trust boundary (second review, 2026-10-28):
+#   - the BASE commit's scanner runs, never the PR's own, so a PR cannot make it print the
+#     denylist; a base without a scanner (the PR that introduced it) falls back to the head's;
+#   - the BASE commit's allowlist is in force. An entry the PR adds or changes clears
+#     nothing and is itself a failing finding, unless the PR carries the label
+#     leak-allowlist-approved applied by an approver: the actor of the latest `labeled`
+#     event for it must have a numeric GitHub user id listed in the repository variable
+#     AE_LEAK_ALLOWLIST_APPROVERS (comma separated). Unset or empty: nobody approves;
+#   - a push that changes the allowlist voids the approval. The check compares the
+#     allowlist file at github.event.before with the one at the new head (both set by
+#     GitHub, so commit dates cannot forge them) and removes the label. A synchronize run
+#     has a concurrency group of its own, so another event cannot cancel the removal.
+#   - scripts/leak-fork-baseline.txt (the values the fork backstop accepts) follows the same
+#     rule as the allowlist: a PR that changes it, adding or removing a line, fails unless the
+#     label is on it, and a push that changes it voids the approval (2026-10-29).
+# Editing .github/workflows/ or scripts/leak-scan.py in a PR still changes what the PR's own
+# run does: the fix is a ruleset with required review on those paths. docs/LEAK-SCAN.md
+# ============================================================
+
+name: Leak scan of the pull request
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled, ready_for_review]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+# A synchronize run must finish (it removes a stale approval), so its group holds the pushed
+# sha and it is never cancelled; every other event shares one group and the newest wins.
+concurrency:
+  group: leak-pr-${{ github.event.pull_request.number }}-${{ github.event.action == 'synchronize' && github.event.after || 'other' }}
+  cancel-in-progress: ${{ github.event.action != 'synchronize' }}
+
+jobs:
+  leaks:
+    name: leaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Checkout the pull request head
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check out the base commit's scanner
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base-scanner
+          persist-credentials: false
+      - name: Decide whether the allowlist change is approved
+        id: approval
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
+          BEFORE_SHA: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          APPROVERS: ${{ vars.AE_LEAK_ALLOWLIST_APPROVERS }}
+          RETARGETED: ${{ github.event.changes.base != null }}
+          LABEL: leak-allowlist-approved
+        run: |
+          set -euo pipefail
+          approved=false
+          labels="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name')"
+          if printf '%s\n' "$labels" | grep -qxF "$LABEL"; then
+            # The latest `labeled` event for the label names who applied it.
+            actor="$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/events" \
+              --jq '.[] | select(.event == "labeled") | [.label.name, (.actor.id | tostring)] | @tsv' |
+              awk -F '\t' -v label="$LABEL" '$1 == label { id = $2 } END { print id }')"
+            ids=",$(printf '%s' "$APPROVERS" | tr -d '[:space:]'),"
+            if [ -n "$actor" ] && [ "$ids" != ",," ] && [[ "$ids" == *",$actor,"* ]]; then
+              approved=true
+            else
+              echo "::notice::The label is on the PR but its latest applier is not a listed approver (AE_LEAK_ALLOWLIST_APPROVERS), so it counts for nothing."
+            fi
+          fi
+          void=""
+          if [ "$approved" = "true" ] && [ "$ACTION" = "synchronize" ]; then
+            if ! git cat-file -e "$BEFORE_SHA^{commit}" 2>/dev/null; then
+              git fetch --no-tags --quiet origin "$BEFORE_SHA" 2>/dev/null || true
+            fi
+            for file in scripts/leak-allowlist.txt scripts/leak-fork-baseline.txt; do
+              old="$(git rev-parse -q --verify "$BEFORE_SHA:$file" 2>/dev/null || echo unknown-before)"
+              new="$(git rev-parse -q --verify "$HEAD_SHA:$file" 2>/dev/null || echo none)"
+              if [ "$old" != "$new" ]; then
+                void="A push changed the allowlist or the fork baseline"
+              fi
+            done
+          fi
+          # Retargeting the PR changes the base the allowlist is read from, so the approval
+          # given for the old base no longer covers it.
+          if [ "$approved" = "true" ] && [ "$ACTION" = "edited" ] && [ "$RETARGETED" = "true" ]; then
+            void="The PR was retargeted"
+          fi
+          if [ -n "$void" ]; then
+            approved=false
+            gh api -X DELETE "repos/$REPO/issues/$PR_NUMBER/labels/$LABEL" --silent || true
+            if gh api "repos/$REPO/issues/$PR_NUMBER/labels" --jq '.[].name' | grep -qxF "$LABEL"; then
+              echo "::error::$void but the approval label could not be removed. Remove $LABEL by hand."
+              exit 1
+            fi
+            echo "::notice::$void, so the approval label was removed; an approver must apply it again."
+          fi
+          echo "approved=$approved" >> "$GITHUB_OUTPUT"
+      - name: Require approval for a change to the fork baseline
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          APPROVED: ${{ steps.approval.outputs.approved }}
+        run: |
+          set -euo pipefail
+          # Three dots: what the PR changed since it left the base, not what the base gained
+          # since. It runs from the PR's own workflow, so it also covers the PR that adds the file.
+          status=0
+          git diff --quiet "$BASE_SHA...$HEAD_SHA" -- scripts/leak-fork-baseline.txt || status=$?
+          if [ "$status" -gt 1 ]; then
+            echo "::error::Could not compare scripts/leak-fork-baseline.txt between the base and the head."
+            exit 1
+          fi
+          if [ "$status" -eq 1 ]; then
+            if [ "$APPROVED" != "true" ]; then
+              echo "::error::This PR changes scripts/leak-fork-baseline.txt, the list of values the fork backstop accepts. A change needs the leak-allowlist-approved label from an approver (AE_LEAK_ALLOWLIST_APPROVERS)."
+              exit 1
+            fi
+            echo "::notice::The fork baseline changed and an approver applied the label."
+          fi
+      - name: Scan the commits, paths, title and body
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          APPROVED: ${{ steps.approval.outputs.approved }}
+          PRIVATE_REPO: ${{ github.repository_id == 1366749882 }}
+          DENYLIST_B64: ${{ secrets.AE_LEAK_DENYLIST_B64 }}
+          DENYLIST_SHA256: ${{ vars.AE_LEAK_DENYLIST_SHA256 }}
+        run: |
+          set -euo pipefail
+          # The later OCR step reads this value from the environment.
+          echo "PRIVATE_REPO=$PRIVATE_REPO" >> "$GITHUB_ENV"
+          scanner=scripts/leak-scan.py
+          if [ -f base-scanner/scripts/leak-scan.py ]; then
+            scanner=base-scanner/scripts/leak-scan.py
+          fi
+          args=()
+          if [ "$PRIVATE_REPO" = "true" ]; then
+            # A set secret with no hash variable, or a hash that differs, fails the job, and so
+            # does a missing secret (2026-10-29: a warning let the generic classes pass a PR
+            # in a clone with no denylist, and the secret is set now).
+            args=(--denylist-b64-env DENYLIST_B64 --denylist-sha256-env DENYLIST_SHA256 --denylist-missing fail)
+          fi
+          diff_args=(--base "$BASE_SHA" --head "$HEAD_SHA" --title-env PR_TITLE --body-env PR_BODY)
+          if [ "$APPROVED" = "true" ]; then
+            diff_args+=(--allowlist-approved)
+          fi
+          python3 "$scanner" "${args[@]}" diff "${diff_args[@]}"
+      - name: List the images the pull request adds or changes
+        id: images
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Deleted files are skipped (--diff-filter=d). The suffixes are the scanner's MEDIA_SUFFIXES minus
+          # .heic, .heif and .avif, which the runner's tesseract cannot read (--ocr require would fail them).
+          list="$RUNNER_TEMP/changed-images.txt"
+          : > "$list"
+          while IFS= read -r -d '' name; do
+            case "${name,,}" in
+              *.png|*.jpg|*.jpeg|*.webp|*.gif|*.tif|*.tiff)
+                printf '%s\0' "$name" >> "$list" ;;
+            esac
+          done < <(git diff --name-only --no-renames --diff-filter=d -z "$BASE_SHA...$HEAD_SHA")
+          if [ -s "$list" ]; then
+            echo "any=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "any=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Install tesseract
+        if: steps.images.outputs.any == 'true'
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends tesseract-ocr webp
+      - name: Read the text in the changed images
+        if: steps.images.outputs.any == 'true'
+        timeout-minutes: 25
+        env:
+          # The scanner's own deadline (120 s by default) would stop a PR with several
+          # animated clips; keep it just under the step's 25 minutes.
+          AE_LEAK_SCAN_SECONDS: "1440"
+          DENYLIST_B64: ${{ secrets.AE_LEAK_DENYLIST_B64 }}
+          DENYLIST_SHA256: ${{ vars.AE_LEAK_DENYLIST_SHA256 }}
+        run: |
+          set -euo pipefail
+          # The base commit's scanner and allowlist, as in the diff scan above. A hit fails
+          # the job; the scanner never prints the matched text.
+          scanner=scripts/leak-scan.py
+          allow=()
+          if [ -f base-scanner/scripts/leak-scan.py ]; then
+            scanner=base-scanner/scripts/leak-scan.py
+          fi
+          if [ -f base-scanner/scripts/leak-allowlist.txt ]; then
+            allow=(--allowlist base-scanner/scripts/leak-allowlist.txt)
+          fi
+          : "${PRIVATE_REPO:?PRIVATE_REPO is unset; the scan step must set it}"
+          args=()
+          if [ "$PRIVATE_REPO" = "true" ]; then
+            args=(--denylist-b64-env DENYLIST_B64 --denylist-sha256-env DENYLIST_SHA256 --denylist-missing fail)
+          fi
+          mapfile -d '' files < "$RUNNER_TEMP/changed-images.txt"
+          python3 "$scanner" "${allow[@]}" "${args[@]}" media --ocr require -- "${files[@]}"

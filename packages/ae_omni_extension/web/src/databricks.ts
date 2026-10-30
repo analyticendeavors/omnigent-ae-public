@@ -2,8 +2,8 @@
 // warehouse, with Start and Stop, and a spend strip that weighs what the
 // workspace has used against its credit, when one is set.
 //
-// Why: Reid's Databricks workspace (AWS, serverless only) runs on a
-// prepaid credit, and a SQL warehouse bills for every minute it is up. He wanted to see
+// Why: the owner's Databricks workspace (AWS, serverless only) runs on a
+// prepaid credit, and a SQL warehouse bills for every minute it is up. They wanted to see
 // both on the page that already wakes the Fabric capacity, from the iPhone as
 // much as the laptop, rather than signing in to the account console. The
 // server reads the workspace with a service principal (`GET /v1/ae/databricks`,
@@ -18,7 +18,7 @@
 // URL it refuses, and then the URL shows as text to copy, as in fabric.ts.
 //
 // The spend strip shows two bars, this month's spend and the spend since the
-// credit started, each "$x of $credit". Reid believes the credit resets monthly,
+// credit started, each "$x of $credit". The owner believes the credit resets monthly,
 // while the account console shows one credit for a year, so both are shown and
 // the server's cadence only picks which leads. Billing data lags hours, so the
 // strip says "as of" the newest usage row. Reading spend needs a running
@@ -57,6 +57,8 @@ import {
   type DatabricksWarehouse,
   databricksWarehouseAction,
   describeError,
+  ADMIN_RECHECK_MS,
+  isAdminOnly,
   fetchDatabricks,
   refreshDatabricksSpend,
 } from "./api";
@@ -434,6 +436,10 @@ export function creditTile(data: DatabricksOverview | null): Tile {
 interface SectionState {
   data: DatabricksOverview | null;
   error: unknown;
+  /** The server answered admin_only (2026-10-28): one quiet line, and no more polls. */
+  adminOnly: boolean;
+  /** When admin_only was last answered, for the 5 minute look-again. */
+  adminSince: number;
   refreshedAt: number | null;
   /** The confirm step that is open, per warehouse id; it survives a re-render. */
   confirming: Map<string, Action>;
@@ -898,6 +904,12 @@ function render(section: Section): void {
   const data = state.data;
   const now = Date.now();
   const hostNote = state.linkNote.get("host");
+  if (state.adminOnly) {
+    replaceChildren(section.status, []);
+    replaceChildren(section.list, [el("p", { class: "meta" }, "Databricks is for admins.")]);
+    replaceChildren(section.strip, []);
+    return;
+  }
   replaceChildren(section.status, [
     hostNote ? linkNotice(hostNote) : null,
     state.error
@@ -1021,6 +1033,8 @@ export function activateDatabricks(
   const state: SectionState = {
     data: null,
     error: null,
+    adminOnly: false,
+    adminSince: 0,
     refreshedAt: null,
     confirming: new Map(),
     failed: new Map(),
@@ -1037,6 +1051,7 @@ export function activateDatabricks(
   let followUp: number | null = null;
   const refresh = (): Promise<void> => {
     if (reading) return reading;
+    if (state.adminOnly && Date.now() - state.adminSince < ADMIN_RECHECK_MS) return Promise.resolve();
     const begin = ++state.clock;
     reading = fetchDatabricks(context)
       .then(
@@ -1049,8 +1064,16 @@ export function activateDatabricks(
             state.spendAction,
           );
           state.error = null;
+          state.adminOnly = false;
         },
         (error: unknown) => {
+          if (isAdminOnly(error)) {
+            state.adminOnly = true;
+            state.adminSince = Date.now();
+            state.data = null;
+            state.error = null;
+            return;
+          }
           // The last good rows stay, with the failure said once above them.
           state.error = error;
         },
@@ -1085,7 +1108,7 @@ export function activateDatabricks(
       timer = setTimeout(() => {
         // A hidden tab does not poll; visibilitychange reads on return.
         if (live() && document.visibilityState === "visible") void refresh();
-      }, delay);
+      }, state.adminOnly ? ADMIN_RECHECK_MS : delay);
     },
     afterAction: (delay) => {
       if (reading) followUp = Math.min(followUp ?? delay, delay);

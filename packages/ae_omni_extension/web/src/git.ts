@@ -1,14 +1,14 @@
 // The Admin Center's Git repos card (2026-10-24): every repo across the
-// GitHub accounts the box can read, sorted by who moves next. Only what Reid
+// GitHub accounts the box can read, sorted by who moves next. Only what the owner
 // must decide gets a row under "Needs you"; GitHub lag, CI, drafts, the
 // sweep's own pull requests and view-only repos fold into one quiet "Not
 // yours to move" box. Same shape as the Key Vault card (vault.ts): four
 // numbers, Needs you, a Show all list with search and chips. Data comes from
 // `GET /v1/ae/git` (ae_omni_policies/git.py, admins only).
 //
-// Why: Reid keeps repos under several accounts; the pull requests, stale
+// Why: the owner keeps repos under several accounts; the pull requests, stale
 // branches and alerts GitHub has not cleared lived on four different pages,
-// and a list of everything hid the two things that needed him. This card is
+// and a list of everything hid the two things that needed them. This card is
 // read only: every row is a link to GitHub, and the only buttons are the
 // card's own (more, Show all, the chips) and the page's refresh. Links open
 // the way the pull request cards open theirs (openLink.ts): through the host,
@@ -193,7 +193,7 @@ function quietLine(who: QuietLine["who"], items: QuietItem[], sep = ", "): Quiet
   return [{ who, items: items.slice(0, QUIET_SHOWN), more: Math.max(0, items.length - QUIET_SHOWN), sep }];
 }
 
-/** Sort everything the card knows into rows for Reid and lines that are not his to move. */
+/** Sort everything the card knows into rows for the owner and lines that are not theirs to move. */
 export function analyze(data: GitOverview, now = Date.now()): Analysis {
   const needs: Need[] = [];
   const github: QuietItem[] = [];

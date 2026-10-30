@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 23:12:59 -0700
+Subject: [PATCH 240/260] [ae-patch] Fix the review findings on 0236
+
+Only an owner or edit collaborator can wake a sleeping sandbox for a download, and the download waits for a managed relaunch to settle first, as upload does. The file menu no longer lets its clicks and keys reach the link underneath, the touch icon sits beside the link instead of inside it, the right-click hint shows on fine pointers only, and the tests cover each.
+---
+ .../routes/sessions/routes_resources.py       |  19 +++-
+ .../e2e_ui/chat/test_chat_file_path_links.py  |   4 +-
+ tests/server/routes/test_session_resources.py |  32 +++++-
+ .../blocks/AeChatFileActions.test.tsx         |  27 ++++-
+ .../components/blocks/AeChatFileActions.tsx   |  79 ++++++++------
+ web/src/components/blocks/ChatMarkdown.tsx    | 102 +++++++++---------
+ 6 files changed, 174 insertions(+), 89 deletions(-)
+
+diff --git a/omnigent/server/routes/sessions/routes_resources.py b/omnigent/server/routes/sessions/routes_resources.py
+index 71b250cb48cc6492681cfc75723f45eee06f778d..cbc10430a44c3976a4ea123025c5fd7f5063e9c1 100644
+--- a/omnigent/server/routes/sessions/routes_resources.py
++++ b/omnigent/server/routes/sessions/routes_resources.py
+@@ -2736,9 +2736,26 @@ def register_resources_routes(
+         runner_rel = _runner_path_segment(relative_path, absolute=absolute)
+         if download:
+             # A download can be the first action after a managed sandbox sleeps.
++            # Waking costs the owner a sandbox, so it needs edit access, as upload does.
++            can_wake = owner
++            if not can_wake:
++                try:
++                    await _validate_session(session_id, request, LEVEL_EDIT)
++                    can_wake = True
++                except OmnigentError:
++                    can_wake = False
++            tracker = getattr(request.app.state, "managed_launches", None)
++            launch = tracker.get(conv.id) if tracker is not None else None
++            if can_wake and launch is not None and conv.host_id is None and conv.runner_id is None:
++                await _await_settled_managed_launch(launch)
++                refreshed = await asyncio.to_thread(conversation_store.get_conversation, conv.id)
++                if refreshed is None:
++                    raise _session_not_found()
++                conv = refreshed
+             tunnel_registry = getattr(request.app.state, "tunnel_registry", None)
+             if (
+-                conv.host_id is not None
++                can_wake
++                and conv.host_id is not None
+                 and host_registry is not None
+                 and host_registry.get(conv.host_id) is None
+                 and (
+diff --git a/tests/e2e_ui/chat/test_chat_file_path_links.py b/tests/e2e_ui/chat/test_chat_file_path_links.py
+index 376766f6928c0697c3d8c8a6b96e93f7b6359fbf..3b31e5188ddcbc11091c00fd3019834db138c671 100644
+--- a/tests/e2e_ui/chat/test_chat_file_path_links.py
++++ b/tests/e2e_ui/chat/test_chat_file_path_links.py
+@@ -334,13 +334,15 @@ def test_chat_file_link_context_menu_downloads_the_whole_file(
+         ).raise_for_status()
+ 
+         page.goto(f"{live_server}/c/{session_id}")
+-        link = page.get_by_role("button", name=str(clip))
++        link = page.get_by_role("button", name=str(clip), exact=True)
+         expect(link).to_be_visible(timeout=30_000)
+         link.click(button="right")
+         with page.expect_download() as download_info:
+             page.get_by_role("menuitem", name="Download").click()
+         download = download_info.value
+         assert download.suggested_filename == "clip.mp4"
++        # Download must not also open the file viewer through the link underneath.
++        assert "file=" not in page.url
+         saved = tmp_path / "saved-clip.mp4"
+         download.save_as(saved)
+         assert saved.read_bytes() == payload
+diff --git a/tests/server/routes/test_session_resources.py b/tests/server/routes/test_session_resources.py
+index 2417010ee3df0a371ef8e4a612cd556071446bb4..934bd35037beb3193cb41932c4b9f890e537f606 100644
+--- a/tests/server/routes/test_session_resources.py
++++ b/tests/server/routes/test_session_resources.py
+@@ -9624,7 +9624,7 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
+         pending_inputs.reset_for_tests()
+ 
+ 
+-def _download_auth_app(db_uri: str) -> tuple[FastAPI, str]:
++def _download_auth_app(db_uri: str, host_registry: object | None = None) -> tuple[FastAPI, str]:
+     """A header-auth app and a session owned by Bob and read-shared to Alice."""
+     from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
+     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+@@ -9662,12 +9662,42 @@ def _download_auth_app(db_uri: str) -> tuple[FastAPI, str]:
+             agent_store=agent_store,
+             auth_provider=UnifiedAuthProvider(source="header"),
+             permission_store=perms,
++            host_registry=host_registry,  # type: ignore[arg-type]
+         ),
+         prefix="/v1",
+     )
++    if host_registry is not None:
++        conv_store.set_host_id(conv.id, "5d0c7b1e9a3f4c28b6e1f0a2d4c8e7b3", workspace="/ws")
++        conv_store.update_conversation(conv.id, share_workspace_files=True)
+     return app, conv.id
+ 
+ 
++@pytest.mark.asyncio
++async def test_view_only_sharer_download_does_not_wake_the_sandbox(
++    db_uri: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A view-only collaborator may read shared files but never wakes the owner's sandbox."""
++    from unittest.mock import AsyncMock, MagicMock
++
++    from omnigent.server.routes.sessions import routes_resources
++
++    registry = MagicMock()
++    registry.get.return_value = None
++    wake = AsyncMock()
++    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
++    app, session_id = _download_auth_app(db_uri, host_registry=registry)
++    transport = httpx.ASGITransport(app=app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://server") as http:
++        resp = await http.get(
++            f"/v1/sessions/{session_id}/resources/environments/default"
++            "/filesystem/clip.mp4?download=true",
++            headers={"X-Forwarded-Email": "alice@example.com"},
++        )
++
++    wake.assert_not_awaited()
++    assert resp.status_code == 502
++
++
+ @pytest.mark.asyncio
+ async def test_host_absolute_download_is_owner_only(db_uri: str) -> None:
+     """A read-only collaborator gets 403 on a host-absolute download."""
+diff --git a/web/src/components/blocks/AeChatFileActions.test.tsx b/web/src/components/blocks/AeChatFileActions.test.tsx
+index 8ad7c7aa7c1bad081759b3f697213a71c84c1e3b..2980a25a80a5481975d044d44f66d253072d18a9 100644
+--- a/web/src/components/blocks/AeChatFileActions.test.tsx
++++ b/web/src/components/blocks/AeChatFileActions.test.tsx
+@@ -83,6 +83,7 @@ describe.each(FORMS)("%s to a workspace file", (_label, markdown, name) => {
+     fireEvent.contextMenu(screen.getByRole("button", { name }));
+     fireEvent.click(screen.getByRole("menuitem", { name: "Download" }));
+     expect(downloadMock).toHaveBeenCalledWith("conv_1", "clip.mp4");
++    expect(openFile).not.toHaveBeenCalled();
+   });
+ 
+   it("opens the file from the menu", () => {
+@@ -103,7 +104,24 @@ describe.each(FORMS)("%s to a workspace file", (_label, markdown, name) => {
+     expect(openFile).not.toHaveBeenCalled();
+   });
+ 
+-  it("toasts when the download fails", async () => {
++  it("keeps the link name and puts the touch icon beside it, not inside", () => {
++    setCoarse(true);
++    renderMarkdown(markdown);
++    const link = screen.getByRole("button", { name });
++    const icon = screen.getByLabelText("Download clip.mp4");
++    expect(link.contains(icon)).toBe(false);
++  });
++
++  it("adds the right-click hint on a fine pointer only", () => {
++    renderMarkdown(markdown);
++    expect(screen.getByRole("button", { name }).getAttribute("title")).toContain("right-click");
++    cleanup();
++    setCoarse(true);
++    renderMarkdown(markdown);
++    expect(screen.getByRole("button", { name }).getAttribute("title")).not.toContain("right-click");
++  });
++
++  it("toasts when the native-shell blob download rejects", async () => {
+     downloadMock.mockRejectedValue(new Error("502 Bad Gateway"));
+     renderMarkdown(markdown);
+     fireEvent.contextMenu(screen.getByRole("button", { name }));
+@@ -116,8 +134,9 @@ describe.each(FORMS)("%s to a workspace file", (_label, markdown, name) => {
+ describe("a dead link", () => {
+   it("has no menu", () => {
+     renderMarkdown("[gone](/home/u/ws/../../etc/passwd)");
+-    const dead = screen.queryByRole("button", { name: "gone" });
+-    if (dead) fireEvent.contextMenu(dead);
+-    expect(screen.queryByRole("menuitem", { name: "Download" })).toBeNull();
++    const dead = screen.getByText("gone");
++    const notPrevented = fireEvent.contextMenu(dead);
++    expect(notPrevented).toBe(true);
++    expect(screen.queryByRole("menuitem")).toBeNull();
+   });
+ });
+diff --git a/web/src/components/blocks/AeChatFileActions.tsx b/web/src/components/blocks/AeChatFileActions.tsx
+index 21ca40955cb9dc14e801740974e497906e254f3a..33e999953a7c5fedde4c46cdc8fa8ea1250a4622 100644
+--- a/web/src/components/blocks/AeChatFileActions.tsx
++++ b/web/src/components/blocks/AeChatFileActions.tsx
+@@ -35,21 +35,29 @@ function isCoarse(): boolean {
+   return typeof window !== "undefined" && !!window.matchMedia && window.matchMedia(COARSE).matches;
+ }
+ 
+-/** The download hint a link carries on desktop, where right-click opens the menu. */
+-export function aeFileLinkHint(path: string): string {
+-  return `${path} (right-click for Download)`;
++export interface AeChatFileActions {
++  onContextMenu: ((event: MouseEvent<HTMLElement>) => void) | undefined;
++  /** The title text: the right-click hint is added on fine pointers only. */
++  hint: (base: string) => string;
++  /** The menu; render it inside the link (it is portaled and stops its events). */
++  extra: ReactNode;
++  /** The touch download icon; render it as a sibling after the link. */
++  after: ReactNode;
+ }
+ 
+ export function useAeChatFileActions(
+   conversationId: string | undefined,
+   resolvedPath: string,
+   onOpen: (() => void) | null,
+-): { onContextMenu: ((event: MouseEvent<HTMLElement>) => void) | undefined; extra: ReactNode } {
++): AeChatFileActions {
+   const [point, setPoint] = useState<{ x: number; y: number } | null>(null);
+   const coarse = useSyncExternalStore(subscribeCoarse, isCoarse, () => false);
+-  if (!conversationId || !resolvedPath || !onOpen) return { onContextMenu: undefined, extra: null };
++  if (!conversationId || !resolvedPath || !onOpen) {
++    return { onContextMenu: undefined, hint: (base) => base, extra: null, after: null };
++  }
+ 
+   const download = () => {
++    // Only the native-shell blob path can reject; a desktop download resolves before any response.
+     downloadWorkspaceFile(conversationId, resolvedPath).catch((error: unknown) => {
+       const message = error instanceof Error ? error.message : String(error);
+       showToast(
+@@ -71,39 +79,42 @@ export function useAeChatFileActions(
+         <DropdownMenuTrigger asChild>
+           <span className="fixed" style={{ left: point.x, top: point.y }} />
+         </DropdownMenuTrigger>
+-        <DropdownMenuContent align="start" onCloseAutoFocus={(event) => event.preventDefault()}>
++        <DropdownMenuContent
++          align="start"
++          onCloseAutoFocus={(event) => event.preventDefault()}
++          // The menu is portaled but still a React child of the link: keep its events off the link.
++          onClick={(event) => event.stopPropagation()}
++          onKeyDown={(event) => event.stopPropagation()}
++          onPointerDown={(event) => event.stopPropagation()}
++        >
+           <DropdownMenuItem onSelect={onOpen}>Open</DropdownMenuItem>
+           <DropdownMenuItem onSelect={download}>Download</DropdownMenuItem>
+         </DropdownMenuContent>
+       </DropdownMenu>,
+       document.body,
+     );
+-  const extra = (
+-    <>
+-      {coarse ? (
+-        <span
+-          role="button"
+-          tabIndex={0}
+-          aria-label={`Download ${name}`}
+-          title={`Download ${name}`}
+-          className="hidden pointer-coarse:inline-block size-[1em] align-[-0.125em] ml-0.5"
+-          onClick={(event) => {
+-            event.stopPropagation();
+-            download();
+-          }}
+-          onKeyDown={(event) => {
+-            if (event.key === "Enter" || event.key === " ") {
+-              event.preventDefault();
+-              event.stopPropagation();
+-              download();
+-            }
+-          }}
+-        >
+-          <AeTablerSvg node={AE_DOWNLOAD_ICON} className="size-full" />
+-        </span>
+-      ) : null}
+-      {menu}
+-    </>
+-  );
+-  return { onContextMenu, extra };
++  const after = coarse ? (
++    <span
++      role="button"
++      tabIndex={0}
++      aria-label={`Download ${name}`}
++      title={`Download ${name}`}
++      className="inline-block size-[1em] align-[-0.125em] ml-0.5 cursor-pointer"
++      onClick={(event) => {
++        event.stopPropagation();
++        download();
++      }}
++      onKeyDown={(event) => {
++        if (event.key === "Enter" || event.key === " ") {
++          event.preventDefault();
++          event.stopPropagation();
++          download();
++        }
++      }}
++    >
++      <AeTablerSvg node={AE_DOWNLOAD_ICON} className="size-full" />
++    </span>
++  ) : null;
++  const hint = (base: string) => (coarse ? base : `${base} (right-click for Download)`);
++  return { onContextMenu, hint, extra: menu, after };
+ }
+diff --git a/web/src/components/blocks/ChatMarkdown.tsx b/web/src/components/blocks/ChatMarkdown.tsx
+index b4bbf50bd320aefa2b6ee9abb39de4829ad2ee36..a84378800ceb5580f14d775316060ad128aab820 100644
+--- a/web/src/components/blocks/ChatMarkdown.tsx
++++ b/web/src/components/blocks/ChatMarkdown.tsx
+@@ -28,7 +28,7 @@ import { useThrottledValue } from "@/hooks/useThrottledValue";
+ import { withBasePath } from "@/lib/basePath";
+ import { isNativeShell } from "@/lib/nativeBridge";
+ import { SessionRouteLink } from "@/components/blocks/AeSessionLink";
+-import { aeFileLinkHint, useAeChatFileActions } from "@/components/blocks/AeChatFileActions";
++import { useAeChatFileActions } from "@/components/blocks/AeChatFileActions";
+ import { sessionLinkRoute } from "@/lib/aeSessionLinks";
+ import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
+ import { cn } from "@/lib/utils";
+@@ -177,31 +177,34 @@ function WorkspacePathInlineCode({
+     // wraps like the surrounding text; role/tabIndex/keydown restore the
+     // button semantics.
+     return (
+-      <code
+-        role="button"
+-        tabIndex={0}
+-        data-streamdown="inline-code"
+-        // Keep the base inline-code class/props (merge, don't replace) so the
+-        // link only adds the underline affordance on top of Streamdown's
+-        // styling and any caller-provided attributes survive.
+-        className={cn(
+-          "font-mono text-ui text-link underline decoration-dotted underline-offset-2 transition-colors cursor-pointer",
+-          className,
+-        )}
+-        onClick={openWorkspaceFile}
+-        onContextMenu={actions.onContextMenu}
+-        title={aeFileLinkHint(resolvedPath)}
+-        onKeyDown={(e) => {
+-          if (e.key === "Enter" || e.key === " ") {
+-            e.preventDefault();
+-            openWorkspaceFile();
+-          }
+-        }}
+-        {...codeProps}
+-      >
+-        {codeChildren}
+-        {actions.extra}
+-      </code>
++      <>
++        <code
++          role="button"
++          tabIndex={0}
++          data-streamdown="inline-code"
++          // Keep the base inline-code class/props (merge, don't replace) so the
++          // link only adds the underline affordance on top of Streamdown's
++          // styling and any caller-provided attributes survive.
++          className={cn(
++            "font-mono text-ui text-link underline decoration-dotted underline-offset-2 transition-colors cursor-pointer",
++            className,
++          )}
++          onClick={openWorkspaceFile}
++          onContextMenu={actions.onContextMenu}
++          title={actions.hint(resolvedPath)}
++          onKeyDown={(e) => {
++            if (e.key === "Enter" || e.key === " ") {
++              e.preventDefault();
++              openWorkspaceFile();
++            }
++          }}
++          {...codeProps}
++        >
++          {codeChildren}
++          {actions.extra}
++        </code>
++        {actions.after}
++      </>
+     );
+   }
+   // Match Streamdown's default inline-code styling so non-path inline code
+@@ -418,28 +421,31 @@ function WorkspaceFileLink({
+   // No href: the parked fragment would still navigate on cmd/middle-click, and
+   // no URL opens the FileViewer. role/tabIndex/onKeyDown restore button semantics.
+   return (
+-    <a
+-      {...props}
+-      role="button"
+-      tabIndex={0}
+-      title={title ?? aeFileLinkHint(resolvedPath)}
+-      data-streamdown="link"
+-      onContextMenu={actions.onContextMenu}
+-      // Dotted underline distinguishes "opens in the FileViewer" from a link
+-      // that leaves the app; the rest matches Streamdown so a file link in a
+-      // table cell wraps like any other.
+-      className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
+-      onClick={openWorkspaceFile}
+-      onKeyDown={(e) => {
+-        if (e.key === "Enter" || e.key === " ") {
+-          e.preventDefault();
+-          openWorkspaceFile();
+-        }
+-      }}
+-    >
+-      {children}
+-      {actions.extra}
+-    </a>
++    <>
++      <a
++        {...props}
++        role="button"
++        tabIndex={0}
++        title={title ?? actions.hint(path)}
++        data-streamdown="link"
++        onContextMenu={actions.onContextMenu}
++        // Dotted underline distinguishes "opens in the FileViewer" from a link
++        // that leaves the app; the rest matches Streamdown so a file link in a
++        // table cell wraps like any other.
++        className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
++        onClick={openWorkspaceFile}
++        onKeyDown={(e) => {
++          if (e.key === "Enter" || e.key === " ") {
++            e.preventDefault();
++            openWorkspaceFile();
++          }
++        }}
++      >
++        {children}
++        {actions.extra}
++      </a>
++      {actions.after}
++    </>
+   );
+ }
+ 

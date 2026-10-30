@@ -385,14 +385,14 @@ async def test_the_note_reaches_the_events_route_as_the_owner(
     # retry); as someone else the same post is refused and dropped.
     from tests.server.helpers import create_test_session
 
-    client.headers.update({"X-Forwarded-Email": "reid@example.com"})
+    client.headers.update({"X-Forwarded-Email": "owner@example.com"})
     sid = (await create_test_session(client, title="Ship the card"))["id"]
     del client.headers["X-Forwarded-Email"]
     identity = merge_watch.OwnerIdentity()
-    assert identity.owner(sid) == "reid@example.com"
+    assert identity.owner(sid) == "owner@example.com"
     note = "Merge watcher: PR #196 (Add an Accounts card) merged at 08:00Z as 11c89f51."
     assert await merge_watch.post_live(app, identity, sid, note) == "retry"
-    monkeypatch.setattr(identity, "owner", lambda _sid: "steve@example.com")
+    monkeypatch.setattr(identity, "owner", lambda _sid: "member@example.com")
     assert await merge_watch.post_live(app, identity, sid, note) == "drop"
     monkeypatch.setattr(identity, "owner", lambda _sid: None)
     assert await merge_watch.post_live(app, identity, sid, note) == "drop"
@@ -551,7 +551,7 @@ async def test_a_missing_host_path_posts_inside_a_container(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(merge_watch, "_in_container", lambda: True)
-    calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": "/home/reid/x"}))
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json={"workspace": "/home/u/x"}))
     assert await _post() == "posted"
     assert calls == ["GET", "POST"]
 

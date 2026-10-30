@@ -97,6 +97,8 @@ function overview(
 function stubContext(replies: Record<string, Reply[]>, refuseLinks = false) {
   const request = vi.fn(async ({ path }: { method: string; path: string; body?: unknown }) => {
     const queue = replies[path] ?? [];
+    // Who sees what (2026-10-28) is asked before the page draws: an admin, unless a test says.
+    if (path === "/v1/ae/access" && !queue.length) return ok({ admin: true, box_admin: true });
     return (
       queue.shift() ?? {
         ok: false,
@@ -901,5 +903,42 @@ describe("the spend breakdown (2026-10-22)", () => {
     expect(section.querySelector(".notice-error")).toBeNull();
     expect(section.querySelectorAll(".dbx-bar")).toHaveLength(2);
     expect(section.querySelector(".dbx-breakdown")).toBeNull();
+  });
+});
+
+describe("a signed-in non-admin (2026-10-28)", () => {
+  it("gets one quiet line and no more reads", async () => {
+    const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+    const { context, request } = stubContext({ "/v1/ae/databricks": [denied, denied] });
+    const node = await mount(context);
+    expect(node.textContent).toContain("Databricks is for admins.");
+    expect(node.querySelector(".notice")).toBeNull();
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("a false admin_only answer (2026-10-28)", () => {
+  it("is looked at again in five minutes and the rows come back on a 200", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const denied: Reply = { ok: false, status: 403, body: { error: { code: "admin_only", message: "Only an OmniGent admin can see this; ask an admin to do it." } } };
+      const { context, request } = stubContext({
+        "/v1/ae/databricks": [denied, ok(overview([warehouse()]))],
+      });
+      const node = frame();
+      document.getElementById("root")?.appendChild(node);
+      activateDatabricks(context, node);
+      await vi.advanceTimersByTimeAsync(0);
+      expect(node.textContent).toContain("Databricks is for admins.");
+      await vi.advanceTimersByTimeAsync(4 * 60_000);
+      expect(request).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(61_000);
+      expect(request).toHaveBeenCalledTimes(2);
+      expect(node.textContent).not.toContain("Databricks is for admins.");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1017,7 +1017,7 @@ def test_script_never_uses_sudo_or_reads_the_secrets_itself() -> None:
 # ── the deploy hold (2026-10-19) ───────────────────────────────────────────
 
 
-def _held(seconds: int = 3600, by: str = "reid") -> tuple[str, str]:
+def _held(seconds: int = 3600, by: str = "owner") -> tuple[str, str]:
     until = int(time.time()) + seconds
     return f"held {until} {by}", time.strftime("%H:%MZ", time.gmtime(until))
 
@@ -1032,7 +1032,7 @@ def test_a_new_tag_while_held_records_on_hold_and_moves_nothing(box: Box) -> Non
     assert result.returncode == 0, result.stderr
     last = box.last()
     assert "from=ae-v0.13.0.1 to=none result=on-hold" in last
-    assert f"held until {ends} by reid" in last
+    assert f"held until {ends} by owner" in last
     assert box.tag() == "ae-v0.13.0.1"
     assert box.calls() == [], "no pull, no compose, no rebuild"
     assert box.git(box.box, "rev-parse", "HEAD") == head, "the checkout stays put"
@@ -1064,7 +1064,7 @@ def test_a_held_pass_leaves_a_pending_host_rebuild_alone(box: Box) -> None:
     [
         ("exit:2", "(exit 2)"),
         ("garbage", "(got: garbage)"),
-        ("held soon reid", "(got: held soon reid)"),
+        ("held soon owner", "(got: held soon owner)"),
         ("held 123", "(got: held 123)"),
     ],
 )
@@ -1111,14 +1111,14 @@ def test_a_hold_set_during_the_pull_stops_before_the_tag_is_written(box: Box) ->
     # still stops the pass, taking the old clock with it.
     (box.state / "deferred").write_text(f"ae-v0.13.0.1 {int(time.time()) - 7300}\n")
     (box.state / "deferred-host").write_text(f"ae-v0.13.0.1 {int(time.time()) - 600}\n")
-    line, ends = _held(7200, "steve")
+    line, ends = _held(7200, "member")
     plan = box.tmp / "hold-plan"
     plan.write_text(f"none\n{line}\n")
     result = box.run(FAKE_HOLD_PLAN=str(plan), FAKE_BUSY="1")
     assert result.returncode == 0, result.stderr
     last = box.last()
     assert "to=ae-v0.13.0.2 result=on-hold" in last
-    assert f"ae-v0.13.0.2 deploys after the hold set by steve ends at {ends}" in last
+    assert f"ae-v0.13.0.2 deploys after the hold set by member ends at {ends}" in last
     assert f"docker pull --quiet {IMAGE}:ae-v0.13.0.2" in box.calls()
     assert box.compose_ups() == []
     assert box.tag() == "ae-v0.13.0.1"
@@ -1154,7 +1154,7 @@ def test_the_default_hold_read_asks_the_server_through_compose(box: Box) -> None
     line, ends = _held()
     result = box.run(AE_AUTO_UPDATE_DEPLOY_HOLD="", FAKE_HOLD_EXEC=line)
     assert result.returncode == 0, result.stderr
-    assert f"held until {ends} by reid" in box.last(), "the last stdout line counts"
+    assert f"held until {ends} by owner" in box.last(), "the last stdout line counts"
     (read,) = [c for c in box.calls() if "deploy_hold" in c]
     assert " exec -T omnigent python -m ae_omni_policies.deploy_hold" in read
     assert box.tag() == "ae-v0.13.0.1"
@@ -1172,8 +1172,12 @@ def _unit(path: Path) -> configparser.RawConfigParser:
 
 def test_user_units_are_the_expected_set() -> None:
     assert sorted(p.name for p in USER_UNITS.iterdir()) == [
+        "ae-host-config-sync@.service",
+        "ae-host-config-sync@.timer",
         "ae-omnigent-auto-update.service",
         "ae-omnigent-auto-update.timer",
+        "ae-omnigent-box-health.service",
+        "ae-omnigent-box-health.timer",
         "ae-omnigent-host-container@.service",
         "ae-omnigent-host-relink.service",
         "ae-omnigent-limits.service",
@@ -1199,6 +1203,28 @@ def test_limits_relay_units_run_the_module_every_five_minutes() -> None:
     path = USER_UNITS / "ae-omnigent-limits.timer"
     t = _unit(path)
     assert t.get("Timer", "OnCalendar") == "*:0/5"
+    assert t.get("Install", "WantedBy") == "timers.target"
+    assert "local time" in path.read_text()
+
+
+def test_box_health_relay_units_run_the_module_every_five_minutes() -> None:
+    # The box health monitor (deploy/README.md "Box health relay", 2026-10-28).
+    s = _unit(USER_UNITS / "ae-omnigent-box-health.service")
+    assert s.get("Service", "Type") == "oneshot"
+    assert s.get("Service", "ExecStart") == (
+        "%h/.omnigent-host/venv/bin/python -m ae_omni_policies.box_health_relay"
+    )
+    assert s.get("Service", "EnvironmentFile") == "-%h/deploy/omnigent-ae/config/host.env"
+    assert "/usr/bin" in s.get("Service", "Environment")
+    assert (s.get("Service", "Nice"), s.get("Service", "IOSchedulingClass")) == ("10", "idle")
+    assert s.get("Service", "TimeoutStartSec") == "4min"
+    assert not s.has_option("Service", "User"), "a user unit names no User="
+    assert not s.has_section("Install"), "the timer starts it"
+    path = USER_UNITS / "ae-omnigent-box-health.timer"
+    t = _unit(path)
+    assert t.get("Timer", "OnCalendar") == "*:0/5"
+    assert t.get("Timer", "RandomizedDelaySec") == "30"
+    assert t.get("Timer", "OnBootSec") == "2min"
     assert t.get("Install", "WantedBy") == "timers.target"
     assert "local time" in path.read_text()
 

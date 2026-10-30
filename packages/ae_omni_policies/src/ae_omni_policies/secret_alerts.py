@@ -1,8 +1,8 @@
 """Phone alarms before a Key Vault secret expires, as task-store tasks (2026-10-23).
 
 Why: the Key Vault card shows what expires, but only to someone who opens the
-Admin Center. Reid wants his phone to say so first. The task app pushes an alarm
-to his phone for any task with a due time (its ``reminder_at``), so the server
+Admin Center. The owner wants their phone to say so first. The task app pushes an alarm
+to their phone for any task with a due time (its ``reminder_at``), so the server
 files a task with one.
 
 When: right after the box's daily reading lands (``POST /v1/ae/secrets/meta``,
@@ -21,7 +21,7 @@ ticked done stays done; the next stage files a fresh one.
 The alarm is 09:00 on the home clock (``AE_TASK_STORE_TZ``), kept as "My clock"
 like the task-store worker's ``create_task``; a reading after 09:00 sets the next
 day's. Tasks land in the list named by ``AE_SECRET_ALERT_LIST`` ("AE Work" on
-the box, Reid's pick until a DevOps board is chosen) and carry the ``ae`` tag
+the box, the owner's pick until a DevOps board is chosen) and carry the ``ae`` tag
 when the app has it. ``AE_SECRET_ALERTS=off`` turns all of it off, and a server
 with no task store configured never files anything.
 

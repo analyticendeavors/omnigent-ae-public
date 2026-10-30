@@ -7,7 +7,7 @@ secrets list catch up at once; ``--dry-run`` prints what it would post and
 posts nothing.
 
 The server never reads Key Vault (``secrets_meta.py`` says why), so this runs as
-reid, where ``az login`` lives, and sends name, enabled, expires and updated for
+the owner, where ``az login`` lives, and sends name, enabled, expires and updated for
 the vault names the server maps to its keys. ``az keyvault secret list`` returns
 attributes only; this module never calls ``secret show``, so no value is read at
 any point, and anything the list returns beyond those four fields is dropped
@@ -89,32 +89,46 @@ APPS_QUERY = (
 TAGS_QUERY = "[].{name:name,tags:tags}"
 
 # Vault secrets whose Entra app the name alone does not say (2026-10-23).
-KNOWN_SOURCES: dict[str, str] = {  # plus OIDC_SOURCE_NAME, from the environment
-    # ROTATE in secrets_meta.py names the same app.
-    "azure-cost-client-secret": "7f123a12-dc5d-47ae-97aa-2458d1adabc3",
+KNOWN_SOURCES: tuple[str, ...] = (  # plus OIDC_SOURCE_NAME, from the environment
+    # azure-cost-client-secret: its app id comes from AE_AZURE_COST_APP_ID (known_sources).
     # Matched by the lead on 2026-10-23, each app credential's start time within a
-    # minute of the secret's creation, and approved by Reid. hc-client-secret stays
-    # out: its app is most likely in another tenant.
-    "ae-client-secret": "9d9eeebc-93d2-44c6-b9a0-9b713a6adc20",  # M365 MCP Server (AE)
-    "devops-bridge-client-secret": "b51fea8a-c190-4f31-9cfe-1b0ea64b8f29",  # AE Task Bridge
-    # Cloudflare Access - AE Shortener
-    "cf-access-azure-client-secret": "e812277e-186b-4d11-bd3c-dcc48857317e",
-    # AE MCP Connectors
-    "esignatures-oauth-ms-client-secret": "8df6aa5d-82ad-48a0-bb70-75515545377d",
-}
+    # minute of the secret's creation, and approved by the owner. hc-client-secret stays
+    # out: its app is most likely in another tenant. The app ids are real tenant
+    # identifiers, so they come from AE_SECRET_SOURCE_APPS (2026-10-29), not from here.
+    "ae-client-secret",  # M365 MCP Server (AE)
+    "devops-bridge-client-secret",  # AE Task Bridge
+    "cf-access-azure-client-secret",  # Cloudflare Access - AE Shortener
+    "esignatures-oauth-ms-client-secret",  # AE MCP Connectors
+)
+SOURCE_APPS_ENV = "AE_SECRET_SOURCE_APPS"
 OIDC_APP_ENV = "AE_OIDC_APP_ID"
+AZURE_COST_APP_ENV = "AE_AZURE_COST_APP_ID"
+AZURE_COST_SECRET = "azure-cost-client-secret"
 OIDC_SOURCE_NAME = "omnigent-oidc-client-secret"
 
 
 def known_sources() -> dict[str, str]:
     """KNOWN_SOURCES plus the server's OIDC client app, which the environment names.
 
-    The app id is a real tenant identifier, so it is not in the source tree: set
-    ``AE_OIDC_APP_ID`` (the same id as OMNIGENT_OIDC_CLIENT_ID in config/server.env)
-    on the relay's unit.
+    The app ids are real tenant identifiers, so they are not in the source tree: set
+    ``AE_OIDC_APP_ID`` (the same id as OMNIGENT_OIDC_CLIENT_ID in config/server.env) and
+    ``AE_AZURE_COST_APP_ID`` (the Azure cost reader's app) on the relay's unit. The other known
+    pairs come from ``AE_SECRET_SOURCE_APPS``, ``<vault secret>=<app id>`` comma-separated;
+    while it is unset those secrets get no known-pair proposal.
     """
+    known: dict[str, str] = {}
+    for pair in os.environ.get(SOURCE_APPS_ENV, "").split(","):
+        secret, _, pair_app = pair.partition("=")
+        secret, pair_app = secret.strip(), pair_app.strip()
+        if secret in KNOWN_SOURCES and pair_app:
+            known[secret] = pair_app
     app_id = os.environ.get(OIDC_APP_ENV, "").strip()
-    return {**KNOWN_SOURCES, OIDC_SOURCE_NAME: app_id} if app_id else dict(KNOWN_SOURCES)
+    if app_id:
+        known[OIDC_SOURCE_NAME] = app_id
+    cost_app = os.environ.get(AZURE_COST_APP_ENV, "").strip()
+    if cost_app:
+        known[AZURE_COST_SECRET] = cost_app
+    return known
 
 
 SECRET_SUFFIXES = ("-client-secret", "-sp-secret", "-secret")

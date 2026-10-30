@@ -76,6 +76,15 @@ Agents shows each collaborator's own context reading, then Claude Code's own sub
 **Where:** The Agents section of the session rail; Open the Agents tab at its end.<br>
 **Built from:** core patches [`0071`](../../patches/0071-ae-patch-Add-a-session-rail-beside-the-chat-and-slim.patch), [`0111`](../../patches/0111-ae-patch-List-running-and-finished-Claude-Code-subag.patch), [`0130`](../../patches/0130-ae-patch-Show-a-failed-subagent-under-its-own-Failed.patch)
 
+## Child chats
+
+<p align="center"><img src="../media/rail-child-chats.webp" alt="Child chats"></p>
+
+A chat that started other chats lists them first on the Agents card, under Child chats. A child that waits on you is pinned at the top with its question, an Answer button and Open chat; Answer opens the action dock at that child's prompt, so you reply without leaving the lead; when the lead's dock does not hold that prompt, Answer opens the child chat instead. Every other child is a row with its role badge, what it is doing or its last reply, and how long ago, and closed ones fold under "N closed". The card's total line, "This chat and its helpers", adds the child chats' spend to the lead's.
+
+**Where:** The Agents card in the session rail, in a chat that started other chats.<br>
+**Built from:** core patch [`0256`](../../patches/0256-ae-patch-Show-the-chat-s-child-chats-in-the-rail-Age.patch)
+
 ## Usage for this session's account
 
 <p align="center"><img src="../media/rail-usage.jpg" alt="Usage for this session's account"></p>

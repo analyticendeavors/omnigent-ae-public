@@ -1,7 +1,7 @@
-"""``GET /v1/ae/your-move``: everything waiting on Reid, in one payload.
+"""``GET /v1/ae/your-move``: everything waiting on the owner, in one payload.
 
-Why (Reid, 2026-09-24): across a long day he kept asking "what's left", runs
-several sessions at once and merges from his phone.
+Why (the owner, 2026-09-24): across a long day they kept asking "what's left", runs
+several sessions at once and merges from their phone.
 This answers "what is waiting on me right now" from signals that already
 exist; it adds no prompt rule (CLAUDE.md rule 4) and writes nothing.
 
@@ -72,7 +72,8 @@ KINDS = (KIND_GATE, KIND_AWAITING, KIND_BLOCKED, KIND_REVIEW)
 
 # Keyed by the caller (``None`` on a single-user runtime), so one user's
 # sessions are never served to another.
-_cache: dict[str | None, tuple[float, dict[str, Any]]] = {}
+# Keyed by the caller and whether they are an admin, so a redacted answer never serves an admin.
+_cache: dict[tuple[str | None, bool | None], tuple[float, dict[str, Any]]] = {}
 _pulls_cache: tuple[float, dict[str, Any]] | None = None
 
 
@@ -93,7 +94,7 @@ def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
 
 
 def session_kinds(conv: Conversation) -> list[str]:
-    """Every reason *conv* waits on Reid, most urgent first; empty when it does not."""
+    """Every reason *conv* waits on the owner, most urgent first; empty when it does not."""
     kinds: list[str] = []
     if labels.label(conv.labels, labels.GATE) == labels.GATE_OPEN:
         kinds.append(KIND_GATE)
@@ -108,7 +109,7 @@ def session_kinds(conv: Conversation) -> list[str]:
 
 
 def waiting_sessions(rows: list[Conversation], *, now: float) -> list[dict[str, Any]]:
-    """The rows that wait on Reid, grouped by kind in :data:`KINDS` order, oldest wait first."""
+    """The rows that wait on the owner, by kind in :data:`KINDS` order, oldest wait first."""
     found: list[dict[str, Any]] = []
     for conv in rows:
         kinds = session_kinds(conv)
@@ -260,6 +261,10 @@ async def _read_pulls() -> dict[str, Any]:
     }
 
 
+async def _members(part: dict[str, Any]) -> dict[str, Any]:
+    return part
+
+
 async def _isolated(name: str, source: Callable[[], Awaitable[dict[str, Any]]]) -> dict[str, Any]:
     """Run one source; any exception becomes that source's error, never the route's."""
     try:
@@ -270,15 +275,31 @@ async def _isolated(name: str, source: Callable[[], Awaitable[dict[str, Any]]]) 
         return _error("source_failed", f"{name} could not be read ({type(exc).__name__}).")
 
 
-async def build(*, fresh: bool = False, user: str | None = None) -> dict[str, Any]:
+def _members_lot(today: str) -> dict[str, Any]:
+    """The lot part a non-admin is shown: nothing due, since the task store is the admin's."""
+    return {"ok": True, "today": today, "items": [], "note": "The Parking Lot is for admins."}
+
+
+def _members_pulls() -> dict[str, Any]:
+    """The pull request part a non-admin is shown: none (the server token reads the box repos)."""
+    return {"ok": True, "configured": True, "login": "", "repos": [], "items": [], "errors": []}
+
+
+async def build(
+    *, fresh: bool = False, user: str | None = None, admin: bool | None = True
+) -> dict[str, Any]:
     """The whole answer, from the cache when it is under :data:`CACHE_TTL_S` old.
 
     :param fresh: Skip the cached answer.
     :param user: The caller, whose sessions alone are read; ``None`` reads every
         session (a single-user runtime).
+    :param admin: Whether the caller is an OmniGent admin; ``None`` when that could not be
+        told, which is answered like a non-admin and never cached. A non-admin gets no due lot
+        items and no pull requests (2026-10-28): both are read with the server's own
+        task-store and GitHub credentials, the box owner's.
     """
     now = time.time()
-    held = _cache.get(user)
+    held = _cache.get((user, admin))
     if not fresh and held is not None and now - held[0] < CACHE_TTL_S:
         return {**held[1], "cached": True}
     tz = Settings.from_env().tz
@@ -286,9 +307,11 @@ async def build(*, fresh: bool = False, user: str | None = None) -> dict[str, An
     today = local_now.date().isoformat()
     session_part, lot_part, steward_part, pulls_part = await asyncio.gather(
         _isolated("sessions", lambda: sessions_source(now, user)),
-        _isolated("lot", lambda: lot_source(today)),
+        _isolated("lot", lambda: lot_source(today))
+        if admin is True
+        else _members(_members_lot(today)),
         _isolated("steward", lambda: steward_source(user)),
-        _isolated("pulls", pulls_source),
+        _isolated("pulls", pulls_source) if admin is True else _members(_members_pulls()),
     )
     total = 0
     if session_part.get("ok"):
@@ -307,7 +330,8 @@ async def build(*, fresh: bool = False, user: str | None = None) -> dict[str, An
         "steward": steward_part,
         "pulls": pulls_part,
     }
-    _cache[user] = (now, answer)
+    if admin is not None:
+        _cache[(user, admin)] = (now, answer)
     return {**answer, "cached": False}
 
 

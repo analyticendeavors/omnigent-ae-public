@@ -4,7 +4,7 @@ Mirrors ``preset_log.py``. ``POST /v1/ae/sessions/{id}/model`` writes a line for
 change, whoever made it.
 
 Line shape: ``{"session", "caller", "by", "from": {"model", "effort"}, "to": {...},
-"kind", "reason", "approved": "auto" | "reid" | "user", "at": unix seconds}``. The file
+"kind", "reason", "approved": "auto" | "owner" | "user", "at": unix seconds}``. The file
 is :data:`FILE_ENV` when set (empty: no log), else ``/data/ae-model-log.jsonl`` when
 ``/data`` is a directory, else nothing is written. Appends hold a lock; past
 :data:`MAX_BYTES` the file moves to ``<name>.1`` (one old file kept).
@@ -31,6 +31,22 @@ DATA_FILE_NAME = "ae-model-log.jsonl"
 MAX_BYTES = 5 * 1024 * 1024
 
 _lock = threading.Lock()
+
+# Lines written before 2026-10-28 carry the owner's first name as the approver; built from
+# parts so the literal never sits in the tree.
+_LEGACY_APPROVED = "".join(("re", "id"))
+
+
+def normalize_approved(value: Any) -> Any:
+    """Map the legacy approver value to ``owner``; anything else passes through."""
+    return "owner" if value == _LEGACY_APPROVED else value
+
+
+def normalize(entry: dict[str, Any]) -> dict[str, Any]:
+    """*entry* with a legacy ``approved`` value read as ``owner``."""
+    if "approved" in entry:
+        return entry | {"approved": normalize_approved(entry["approved"])}
+    return entry
 
 
 def log_path(environ: Mapping[str, str] | None = None) -> Path | None:

@@ -22,10 +22,16 @@ class _Store:
 
     def __init__(self, chats: dict[str, dict[str, str]]) -> None:
         self.chats = chats
+        self.owners: dict[str, str] = {}
+        self.parents: dict[str, str] = {}
+
+    def get_session_owner(self, session_id: str, *, owner_only: bool = False) -> str:
+        return self.owners.get(session_id, "owner")
 
     def _conv(self, session_id: str) -> Any:
         return SimpleNamespace(
             id=session_id,
+            parent_conversation_id=self.parents.get(session_id),
             agent_id="agent",
             host_id="host",
             title=f"Chat {session_id}",
@@ -306,3 +312,200 @@ async def test_move_all_reports_a_slow_chat_as_pending_and_it_finishes_alone(
     ]
     await asyncio.sleep(0.5)
     assert world.store.chats["conv_b"][KEY] == "Backup"
+
+
+async def _put_family(
+    client: httpx.AsyncClient, session_id: str, account: str = "Backup"
+) -> httpx.Response:
+    return await client.put(
+        f"/v1/ae/sessions/{session_id}/claude-account",
+        json={"account": account, "include_children": True},
+    )
+
+
+def _family(world: SimpleNamespace) -> None:
+    """conv_a leads conv_c, which leads conv_d; all one owner and writable."""
+    world.store.chats["conv_c"] = {"ae.orch": "conv_a"}
+    world.store.chats["conv_d"] = {"ae.orch": "conv_c"}
+    world.owned.update({"conv_c", "conv_d"})
+
+
+async def test_the_flag_moves_children_and_grandchildren(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    response = await _put_family(client, "conv_a")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["relaunched"] is True
+    assert body["children"] == {
+        "moved": [
+            {"id": "conv_c", "title": "Chat conv_c"},
+            {"id": "conv_d", "title": "Chat conv_d"},
+        ],
+        "skipped": [],
+        "pending": [],
+    }
+    assert world.store.chats["conv_d"][KEY] == "Backup"
+    assert world.store.chats["conv_b"] == {}
+
+
+async def test_a_busy_child_is_listed_with_its_title_and_reason(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.runner.answers["conv_c"] = (409, {"error": "claude_account_busy", "detail": "Busy."})
+    body = (await _put_family(client, "conv_a")).json()
+    assert body["children"]["skipped"] == [
+        {"id": "conv_c", "title": "Chat conv_c", "reason": "mid-reply"}
+    ]
+    assert [row["id"] for row in body["children"]["moved"]] == ["conv_d"]
+    assert KEY not in world.store.chats["conv_c"]
+
+
+async def test_a_refused_parent_leaves_its_children_alone(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.runner.answers["conv_a"] = (409, {"error": "claude_account_busy", "detail": "Busy."})
+    assert (await _put_family(client, "conv_a")).status_code == 409
+    assert world.store.chats["conv_c"] == {"ae.orch": "conv_a"}
+    assert sorted(sent[0] for sent in world.runner.sent) == ["conv_a"]
+
+
+async def test_a_pending_parent_still_moves_its_children_and_answers_202(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.runner.answers["conv_a"] = None
+    response = await _put_family(client, "conv_a")
+    assert response.status_code == 202
+    assert response.json()["pending"] is True
+    assert [row["id"] for row in response.json()["children"]["moved"]] == ["conv_c", "conv_d"]
+
+
+async def test_an_orch_loop_ends(client: httpx.AsyncClient, world: SimpleNamespace) -> None:
+    world.store.chats["conv_c"] = {"ae.orch": "conv_a"}
+    world.store.chats["conv_a"]["ae.orch"] = "conv_c"
+    world.owned.add("conv_c")
+    body = (await _put_family(client, "conv_a")).json()
+    assert [row["id"] for row in body["children"]["moved"]] == ["conv_c"]
+
+
+async def test_a_fork_and_a_sub_agent_of_a_child_stay_put(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    # A fork copies its source's ae.orch; a sub-agent is a top-level row with a parent.
+    world.store.chats["conv_f"] = {"ae.orch": "conv_a", "omnigent.fork.source_id": "conv_c"}
+    world.store.chats["conv_s"] = {"ae.orch": "conv_a"}
+    world.store.parents["conv_s"] = "conv_a"
+    world.owned.update({"conv_f", "conv_s"})
+    body = (await _put_family(client, "conv_a")).json()
+    assert [row["id"] for row in body["children"]["moved"]] == ["conv_c", "conv_d"]
+    assert KEY not in world.store.chats["conv_f"] and KEY not in world.store.chats["conv_s"]
+
+
+async def test_another_users_session_naming_the_lead_is_never_moved(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.store.owners["conv_c"] = "stranger"
+    # An admin passes the write check on the stranger's session; the owner check stops it.
+    body = (await _put_family(client, "conv_a")).json()
+    assert body["children"] == {"moved": [], "skipped": [], "pending": []}
+    assert world.store.chats["conv_c"] == {"ae.orch": "conv_a"}
+    assert "conv_c" not in [sent[0] for sent in world.runner.sent]
+
+
+async def test_children_the_caller_cannot_write_are_left_out(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.owned.discard("conv_c")
+    body = (await _put_family(client, "conv_a")).json()
+    assert [row["id"] for row in body["children"]["moved"]] == ["conv_d"]
+    assert body["children"]["skipped"] == []
+
+
+async def test_non_claude_and_same_login_children_are_left_out(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.refusals["conv_c"] = OmnigentError(
+        "Claude account selection requires a Claude native target.", code=ErrorCode.INVALID_INPUT
+    )
+    world.store.chats["conv_d"][limits.ACCOUNT_LIVE_LABEL] = "Backup"
+    body = (await _put_family(client, "conv_a")).json()
+    assert body["children"] == {"moved": [], "skipped": [], "pending": []}
+
+
+async def test_without_the_flag_the_answer_has_no_children_key(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    response = await _put(client, "conv_a", "Backup")
+    assert response.json() == {"account": "Backup", "relaunched": True}
+    assert world.store.chats["conv_c"] == {"ae.orch": "conv_a"}
+    assert [sent[0] for sent in world.runner.sent] == ["conv_a"]
+
+
+async def test_a_cascade_failure_keeps_the_parents_answer(
+    client: httpx.AsyncClient, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _family(world)
+
+    def broken(**_kw: Any) -> list[Any]:
+        raise RuntimeError("store down")
+
+    monkeypatch.setattr(claude_account.sessions, "list_top_level", broken)
+    response = await _put_family(client, "conv_a")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["relaunched"] is True
+    assert body["children"] == {
+        "moved": [],
+        "skipped": [],
+        "pending": [],
+        "error": "children not attempted",
+    }
+    assert world.store.chats["conv_a"][KEY] == "Backup"
+
+
+async def test_access_revoked_after_the_list_is_built_writes_no_label(
+    client: httpx.AsyncClient, world: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _family(world)
+    real = claude_account.sessions.list_top_level
+
+    def revoke_after_listing(**kw: Any) -> list[Any]:
+        rows = real(**kw)
+        world.owned.discard("conv_c")
+        return rows
+
+    monkeypatch.setattr(claude_account.sessions, "list_top_level", revoke_after_listing)
+    state = {"first": True}
+
+    async def may_write(_user: Any, session_id: str) -> bool:
+        # The queueing check still passes; only the check before the write fails.
+        if session_id == "conv_c" and state["first"]:
+            state["first"] = False
+            return True
+        return session_id in world.owned
+
+    monkeypatch.setattr(router_module, "_may_write_session", may_write)
+    body = (await _put_family(client, "conv_a")).json()
+    assert [row["id"] for row in body["children"]["moved"]] == ["conv_d"]
+    assert body["children"]["skipped"] == []
+    assert KEY not in world.store.chats["conv_c"]
+    assert "conv_c" not in [sent[0] for sent in world.runner.sent]
+
+
+async def test_a_store_without_owners_is_single_user_and_an_ownerless_lookup_excludes() -> None:
+    assert claude_account._session_owner(object(), "conv_x") == claude_account.LOCAL_OWNER
+
+    class _NoOwner:
+        def get_session_owner(self, _sid: str, *, owner_only: bool = False) -> None:
+            return None
+
+    assert claude_account._session_owner(_NoOwner(), "conv_x") is None

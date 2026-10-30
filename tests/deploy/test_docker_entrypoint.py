@@ -225,7 +225,7 @@ def test_config_kwargs_reads_both_keys_and_skips_absent_ones() -> None:
         "policy_modules": ["ae_omni_policies"],
         "debug_router_modules": ["ae_omni_policies.router"],
     }
-    assert config_kwargs({"admins": ["reid"]}) == {}
+    assert config_kwargs({"admins": ["owner"]}) == {}
 
 
 def test_explicit_kwargs_win_over_the_config(monkeypatch, tmp_path: Path) -> None:
@@ -405,7 +405,7 @@ def test_a_spec_that_cannot_be_rendered_is_skipped_not_fatal(
 
 
 def test_sidebar_grouping_is_turned_on_without_touching_the_box_line() -> None:
-    """config/server.env is Reid's file and names harness_install only; the image adds the rest."""
+    """config/server.env is the owner's file and names harness_install only; the image adds the rest."""
     from ae_omni_policies import docker_entrypoint
 
     known = ("harness_install", "sidebar_grouping_ui")

@@ -1,0 +1,1328 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 18:57:06 -0700
+Subject: [PATCH 256/260] [ae-patch] Show the chat's child chats in the rail
+ Agents card, with an Answer button for one that waits on you
+
+---
+ web/src/components/AeActionDock.test.tsx      |  32 ++
+ web/src/components/AeActionDock.tsx           |  19 +-
+ .../components/aeRail/AeRailAgents.test.tsx   | 216 +++++++++
+ web/src/components/aeRail/AeRailAgents.tsx    |  59 ++-
+ .../components/aeRail/AeRailChildChats.tsx    | 436 ++++++++++++++++++
+ web/src/components/aeRail/aeRailUi.tsx        |  16 +-
+ web/src/lib/aeDockReveal.ts                   |  28 ++
+ web/src/lib/aeRailChildChats.test.ts          |  69 +++
+ web/src/lib/aeRailChildChats.ts               |  68 +++
+ web/src/shell/AeAgentMeta.tsx                 |  49 +-
+ web/src/shell/AeAgentsUsage.test.tsx          |  32 +-
+ 11 files changed, 1002 insertions(+), 22 deletions(-)
+ create mode 100644 web/src/components/aeRail/AeRailChildChats.tsx
+ create mode 100644 web/src/lib/aeDockReveal.ts
+ create mode 100644 web/src/lib/aeRailChildChats.test.ts
+ create mode 100644 web/src/lib/aeRailChildChats.ts
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 24cfb65c3e90b0b393631bd4f885ebbb479cec1e..7136eca4e0e57b369635191673bcdfe5d59b0d7f 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -18,6 +18,7 @@ import { dismissAeSwitchFamily, useAeSwitchFamilyRequest } from "@/lib/aeSwitchF
+ import type { AePrCard } from "@/lib/aePrs";
+ import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
+ import { useChatStore } from "@/store/chatStore";
++import { aeRevealDock } from "@/lib/aeDockReveal";
+ import { AeActionDock } from "./AeActionDock";
+ import { ComposerWorkspaceBar } from "./composer/ComposerControls";
+ import { ComposerPrLink } from "./composer/ComposerPrLink";
+@@ -899,6 +900,37 @@ describe("AeActionDock child prompts", () => {
+     expect(screen.queryByTestId("ae-dock-jump")).toBeNull();
+   });
+ 
++  it("opens the tray when the rail asks to reveal the child prompts", async () => {
++    renderChildDock([ask]);
++    await screen.findByTestId("ae-dock-lead");
++    expect(screen.queryByTestId("ae-dock-child-prompt")).toBeNull();
++    act(() => aeRevealDock("childPrompt"));
++    expect(await screen.findByTestId("ae-dock-child-prompt")).toBeTruthy();
++  });
++
++  it("scrolls the tray to the child the rail names, not the first waiting one", async () => {
++    // jsdom has no layout: give each line a top of 100 per position.
++    const top = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "offsetTop");
++    Object.defineProperty(HTMLElement.prototype, "offsetTop", {
++      configurable: true,
++      get(this: HTMLElement) {
++        return this.parentElement ? [...this.parentElement.children].indexOf(this) * 100 : 0;
++      },
++    });
++    try {
++      renderChildDock([ask, permission]);
++      await screen.findByTestId("ae-dock-lead");
++      act(() => aeRevealDock("childPrompt", "conv_other"));
++      const list = await screen.findByTestId("ae-dock-list");
++      await waitFor(() => expect(list.scrollTop).toBe(100));
++      act(() => aeRevealDock("childPrompt", "conv_child"));
++      await waitFor(() => expect(list.scrollTop).toBe(0));
++    } finally {
++      if (top) Object.defineProperty(HTMLElement.prototype, "offsetTop", top);
++      else delete (HTMLElement.prototype as { offsetTop?: number }).offsetTop;
++    }
++  });
++
+   it("opens a tray with each prompt's real card, the child's title and an open link", async () => {
+     renderChildDock([ask, permission]);
+     fireEvent.click(await screen.findByTestId("ae-dock-caret"));
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index 4643d68aa1d35f1866aa2a61d32dc58730bd0e9c..10f8e336de06fedd087bfa4633c7f60fb676578c 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -18,6 +18,7 @@ import {
+ } from "react";
+ import { ConfirmMerge, MERGED_TEXT } from "@/components/AePrCards";
+ import { AeDockChildPrompt } from "@/components/AeDockChildPrompt";
++import { useAeDockReveal } from "@/lib/aeDockReveal";
+ import { AePrLinkHoverCard } from "@/components/AePrLinkHoverCard";
+ import { COMPOSER_CONTENT_INSET_CLASS } from "@/components/composer/ChatComposer";
+ import { Button } from "@/components/ui/button";
+@@ -713,6 +714,7 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+   const [open, setOpen] = useState(false);
+   const [confirming, setConfirming] = useState<string | null>(null);
+   const [scrollTo, setScrollTo] = useState<AeDockKind | null>(null);
++  const [scrollChild, setScrollChild] = useState<string | null>(null);
+   const listRef = useRef<HTMLUListElement>(null);
+   const [tray, setTray] = useState<HTMLDivElement | null>(null);
+   useAeDockLift(tray);
+@@ -720,13 +722,25 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+   const badgesRef = useRef<HTMLDivElement>(null);
+   const [compact, setCompact] = useState(false);
+   const openedForConfirm = useRef(false);
++  // The rail's Answer button opens the tray at the line it names.
++  useAeDockReveal((kind, childId) => {
++    openedForConfirm.current = false;
++    setConfirming(null);
++    setOpen(true);
++    setScrollTo(kind);
++    setScrollChild(childId ?? null);
++  });
+   const now = Date.now();
+   useLayoutEffect(() => {
+     if (!open || !scrollTo || !listRef.current) return;
+-    const line = listRef.current.querySelector<HTMLElement>(`[data-kind="${scrollTo}"]`);
++    const lines = listRef.current.querySelectorAll<HTMLElement>(`[data-kind="${scrollTo}"]`);
++    // A reveal naming a child goes to that child's line, else to the first of the kind.
++    const line =
++      (scrollChild && [...lines].find((el) => el.dataset.child === scrollChild)) || lines[0];
+     if (line) listRef.current.scrollTop = line.offsetTop;
+     setScrollTo(null);
+-  }, [open, scrollTo]);
++    setScrollChild(null);
++  }, [open, scrollTo, scrollChild]);
+   // Escape closes the tray, and abandons a confirm in it.
+   useEffect(() => {
+     if (!open) return;
+@@ -901,6 +915,7 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+               <li
+                 key={item.key}
+                 data-kind={item.kind}
++                data-child={item.kind === "childPrompt" ? item.childId : undefined}
+                 className={cn(index > 0 && "border-t border-border/60")}
+                 data-testid="ae-dock-line"
+               >
+diff --git a/web/src/components/aeRail/AeRailAgents.test.tsx b/web/src/components/aeRail/AeRailAgents.test.tsx
+index aaa57cc82ea7c889bcf73312ed03862fb2eacbca..84399acc886c475410c92785cbc6b27639fde49f 100644
+--- a/web/src/components/aeRail/AeRailAgents.test.tsx
++++ b/web/src/components/aeRail/AeRailAgents.test.tsx
+@@ -9,12 +9,15 @@ import {
+   waitFor,
+   within,
+ } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+ 
+ import { authenticatedFetch } from "@/lib/identity";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
++import { useAeDockReveal } from "@/lib/aeDockReveal";
++import { useChatStore } from "@/store/chatStore";
+ import { AeRailAgents, aeRailAgentsSummary } from "./AeRailAgents";
+ 
+ /** A fresh QueryClient per render, retries off, as the app's provider supplies one. */
+@@ -362,3 +365,216 @@ describe("AeRailAgents failed subagents", () => {
+     expect(aeRailAgentsSummary(0, 0, 0)).toBeUndefined();
+   });
+ });
++
++describe("AeRailAgents child chats", () => {
++  const family = (id: string, extra: Record<string, unknown> = {}) => ({
++    id,
++    object: "conversation",
++    title: `Child ${id}`,
++    created_at: 0,
++    updated_at: 1_000,
++    labels: { "ae.orch": "lead", "ae.role": "builder" },
++    permission_level: null,
++    status: "idle",
++    ...extra,
++  });
++
++  function routeFamily(rows: object[], archived: object[] | "fail" = [], archivedMore = false) {
++    vi.mocked(authenticatedFetch).mockImplementation((input) => {
++      const url = String(input);
++      if (url.startsWith("/v1/sessions?")) {
++        if (url.includes("visibility=archived")) {
++          if (archived === "fail") return json({ detail: "boom" }, 500);
++          return json({
++            object: "list",
++            data: archived,
++            has_more: archivedMore,
++            last_id: archivedMore ? "next" : null,
++          });
++        }
++        return json({ object: "list", data: rows, has_more: false, last_id: null });
++      }
++      if (/^\/v1\/sessions\/[^/?]+\/items\?/.test(url)) {
++        return json({ object: "list", data: [] });
++      }
++      if (url.split("?")[0] === "/v1/ae/limits") return json({ now: "", harnesses: {} });
++      if (url.endsWith("/child_sessions")) return json({ object: "list", data: [] });
++      const id = url.match(/^\/v1\/sessions\/([^/?]+)\?/)?.[1] ?? "";
++      return json({ id, agent_id: "a", status: "idle", created_at: 0 });
++    });
++  }
++
++  const view = () =>
++    render(
++      <MemoryRouter>
++        <AeRailAgents sessionId="lead" />
++      </MemoryRouter>,
++    );
++
++  beforeEach(() => {
++    window.localStorage.removeItem("ae.rail.agents.childClosedOpen");
++    useChatStore.setState({ conversationId: "lead", blocks: [] });
++  });
++
++  it("pins a child waiting on you, lists the others and folds the closed ones", async () => {
++    routeFamily(
++      [
++        family("asks", { pending_elicitations_count: 1 }),
++        family("busy", { status: "running" }),
++        family("fin"),
++        family("gone", { labels: { "ae.orch": "lead", "ae.status": "reference" } }),
++      ],
++      [family("shelved", { archived: true })],
++    );
++    view();
++    const pinned = await screen.findByTestId("ae-rail-child-needs");
++    expect(pinned.textContent).toContain("Child asks");
++    const rows = screen.getAllByTestId("ae-rail-child-chat");
++    expect(rows.map((r) => r.getAttribute("data-session"))).toEqual(["busy", "fin"]);
++    expect(within(pinned).getByTestId("ae-rail-child-open").getAttribute("href")).toBe("/c/asks");
++    expect(screen.queryByText("No agents have run in this session.")).toBeNull();
++    expect(screen.getByText("1 needs you · 1 running · 1 finished")).toBeTruthy();
++    // The heading counts every open child, the waiting one included.
++    expect(screen.getByText("Child chats").nextElementSibling?.textContent).toBe("3");
++    // An archived child folds under the closed toggle with the reference one.
++    await screen.findByText("2 closed");
++    expect(screen.queryByTestId("ae-rail-child-closed-row")).toBeNull();
++    fireEvent.click(screen.getByTestId("ae-rail-child-closed-toggle"));
++    expect(screen.getAllByTestId("ae-rail-child-closed-row").map((r) => r.textContent)).toEqual(
++      expect.arrayContaining(["Child gone", "Child shelved"]),
++    );
++    expect(screen.getByLabelText("Answer Child asks")).toBeTruthy();
++  });
++
++  it("shows no child section when this chat started none", async () => {
++    routeFamily([family("other", { labels: { "ae.orch": "someone-else" } })]);
++    view();
++    expect(await screen.findByText("No agents have run in this session.")).toBeTruthy();
++    expect(screen.queryByTestId("ae-rail-child-chats")).toBeNull();
++  });
++
++  it("Answer opens the dock when the prompt is mirrored here, else the child's chat", async () => {
++    routeFamily([family("asks", { pending_elicitations_count: 1 })]);
++    useChatStore.setState({
++      conversationId: "lead",
++      blocks: [
++        {
++          type: "elicitation",
++          elicitationId: "e1",
++          targetSessionId: "asks",
++          familyChild: { title: "Child asks" },
++          status: "pending",
++        } as never,
++      ],
++    });
++    const seen: string[] = [];
++    function Listener() {
++      useAeDockReveal((kind, childId) => seen.push(kind, childId ?? ""));
++      return null;
++    }
++    render(<Listener />);
++    view();
++    const answer = await screen.findByTestId("ae-rail-child-answer");
++    expect(answer.tagName).toBe("BUTTON");
++    fireEvent.click(answer);
++    expect(seen).toEqual(["childPrompt", "asks"]);
++    cleanup();
++    useChatStore.setState({ conversationId: "lead", blocks: [] });
++    view();
++    const link = await screen.findByTestId("ae-rail-child-answer");
++    expect(link.tagName).toBe("A");
++    expect(link.getAttribute("href")).toBe("/c/asks");
++  });
++
++  it("lets a live row beat a stale archived read", async () => {
++    routeFamily([family("back")], [family("back", { archived: true })]);
++    view();
++    await screen.findByTestId("ae-rail-child-chat");
++    expect(screen.getByTestId("ae-rail-child-chat").getAttribute("data-session")).toBe("back");
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        expect.stringContaining("visibility=archived"),
++        expect.anything(),
++      ),
++    );
++    expect(screen.queryByTestId("ae-rail-child-closed-toggle")).toBeNull();
++  });
++
++  it("reads the archived list again when a child leaves the open list", async () => {
++    const live = [family("a"), family("b")];
++    const archived: object[] = [];
++    routeFamily(live, archived);
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    rtlRender(
++      <QueryClientProvider client={client}>
++        <MemoryRouter>
++          <AeRailAgents sessionId="lead" />
++        </MemoryRouter>
++      </QueryClientProvider>,
++    );
++    await waitFor(() => expect(screen.getAllByTestId("ae-rail-child-chat")).toHaveLength(2));
++    expect(screen.queryByTestId("ae-rail-child-closed-toggle")).toBeNull();
++    // "b" is archived: the stream drops it from the open list, the server now lists it archived.
++    archived.push(family("b", { archived: true }));
++    act(() => {
++      client.setQueryData(["conversations", "", false], {
++        pages: [{ data: [live[0]], has_more: false, last_id: null, first_id: null }],
++        pageParams: [undefined],
++      });
++    });
++    expect(await screen.findByText("1 closed")).toBeTruthy();
++  });
++
++  it("says when the archived read failed or stopped at its page cap", async () => {
++    routeFamily([family("a")], "fail");
++    view();
++    expect((await screen.findByTestId("ae-rail-child-archived-note")).textContent).toBe(
++      "Could not load archived chats.",
++    );
++    cleanup();
++    routeFamily([family("a")], [], true);
++    view();
++    expect((await screen.findByTestId("ae-rail-child-archived-note")).textContent).toContain(
++      "older archived not counted",
++    );
++  });
++
++  it("shows the failed archived note even when the chat has no other child", async () => {
++    routeFamily([], "fail");
++    view();
++    expect((await screen.findByTestId("ae-rail-child-archived-note")).textContent).toBe(
++      "Could not load archived chats.",
++    );
++    expect(screen.queryByText("No agents have run in this session.")).toBeNull();
++  });
++
++  it("says nothing about a page cap when the chat has no child to fold", async () => {
++    routeFamily([], [], true);
++    view();
++    expect(await screen.findByText("No agents have run in this session.")).toBeTruthy();
++    expect(screen.queryByTestId("ae-rail-child-archived-note")).toBeNull();
++  });
++
++  it("does not read the archived list again when the rail moves to another chat", async () => {
++    routeFamily([family("a"), family("b"), family("c", { labels: { "ae.orch": "other" } })]);
++    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++    const invalidate = vi.spyOn(client, "invalidateQueries");
++    const tree = (id: string) => (
++      <QueryClientProvider client={client}>
++        <MemoryRouter>
++          <AeRailAgents sessionId={id} />
++        </MemoryRouter>
++      </QueryClientProvider>
++    );
++    const { rerender } = rtlRender(tree("lead"));
++    await waitFor(() => expect(screen.getAllByTestId("ae-rail-child-chat")).toHaveLength(2));
++    rerender(tree("other"));
++    await waitFor(() => expect(screen.getAllByTestId("ae-rail-child-chat")).toHaveLength(1));
++    const archivedReads = invalidate.mock.calls.filter(
++      ([filter]) =>
++        JSON.stringify((filter as { queryKey?: unknown })?.queryKey) ===
++        JSON.stringify(["ae-rail-child-chats-archived"]),
++    );
++    expect(archivedReads).toHaveLength(0);
++  });
++});
+diff --git a/web/src/components/aeRail/AeRailAgents.tsx b/web/src/components/aeRail/AeRailAgents.tsx
+index c14fadc415323494018218cd0d0e110bd60976f7..5d1af6e75d9d0681f47c9a6662a03bea4e5c5d2d 100644
+--- a/web/src/components/aeRail/AeRailAgents.tsx
++++ b/web/src/components/aeRail/AeRailAgents.tsx
+@@ -4,7 +4,7 @@
+ // finished ones under their own Finished group. Rows come from the same live
+ // child list the Agents tab reads, so the two always agree.
+ 
+-import { useState } from "react";
++import { useMemo, useState } from "react";
+ import { RunningDot } from "@/components/RunningDot";
+ import { type ChildSessionInfo, useChildSessions } from "@/hooks/useChildSessions";
+ import { type AeRailSectionProps, useAeRailSectionActive } from "@/lib/aeSessionRail";
+@@ -16,6 +16,7 @@ import {
+   splitAgentSections,
+ } from "@/shell/aeAgentsPaneModel";
+ import {
++  type AeFamilyUsageRequest,
+   AeAgentMetaLine,
+   AeAgentMetaProvider,
+   AeAgentsTotal,
+@@ -34,6 +35,7 @@ import {
+   isNativeSubagent,
+   useAeSessionContexts,
+ } from "../aeSessionContext";
++import { AeRailChildChats, useAeRailChildChats } from "./AeRailChildChats";
+ import { AeRailSection } from "./AeRailSection";
+ import { useAeRailNow } from "./aeRailNow";
+ import { useAeSubagentSteps } from "./aeRailSubagentSteps";
+@@ -198,8 +200,10 @@ export function aeRailAgentsSummary(
+   running: number,
+   failed: number,
+   finished: number,
++  needsYou = 0,
+ ): string | undefined {
+   const parts = [
++    needsYou > 0 ? `${needsYou} ${needsYou === 1 ? "needs" : "need"} you` : null,
+     running > 0 ? `${running} running` : null,
+     failed > 0 ? `${failed} failed` : null,
+     finished > 0 ? `${finished} finished` : null,
+@@ -222,6 +226,7 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+   // The Agents tab's own list, kept live by the session stream between polls.
+   // Folded, it only reads the cached list, so the folded summary keeps its counts.
+   const { children } = useChildSessions(sessionId, POLL_MS, active);
++  const childChats = useAeRailChildChats(sessionId, active);
+   const [finishedOpen, setFinishedOpen] = useState(readFinishedOpen);
+   const openTab = useAeRailOpenWorkspaceTab();
+   const openAgents = openTab ? () => openTab("subagents") : undefined;
+@@ -251,12 +256,24 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+   const hidden = sessions.hidden ?? 0;
+   const failed = failedSubagents.length;
+   const subagentCount = runningSubagents.length + failed + finishedSubagents.length;
+-  const empty = rows.length === 0 && subagentCount === 0;
++  const childChatCount = childChats.open.length + childChats.closed.length;
++  const empty =
++    rows.length === 0 &&
++    subagentCount === 0 &&
++    childChatCount === 0 &&
++    childChats.archivedNote !== "failed";
+   const toggleFinished = () => {
+     writeFinishedOpen(!finishedOpen);
+     setFinishedOpen(!finishedOpen);
+   };
+-  const summary = aeRailAgentsSummary(running, failed, finished);
++  const childErrors = childChats.open.filter((c) => c.status === "error").length;
++  const childDone = childChats.open.filter((c) => c.status === "done").length;
++  const summary = aeRailAgentsSummary(
++    running + childChats.working,
++    failed + childErrors,
++    finished + childDone,
++    childChats.needs.length,
++  );
+   const byId = new Map(children.map((c) => [c.id, c] as const));
+   const collaboratorIds = new Set(rows.map((r) => r.entry.key));
+   const shownRows = [
+@@ -265,12 +282,32 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+     ...(finishedOpen ? finishedSubagents.slice(0, MAX_FINISHED) : []),
+     ...children.filter((c) => collaboratorIds.has(c.id)),
+   ];
+-  const meta = useAeAgentMeta(sessionId, shownRows, running > 0);
++  // Child chats run outside this chat's spawn tree, so their spend is read on its own.
++  const familyUsage = useMemo<AeFamilyUsageRequest[]>(
++    () => [
++      ...childChats.open.map((c) => ({
++        id: c.row.id,
++        stamp: c.row.updated_at,
++        done: c.status === "done",
++      })),
++      ...childChats.closed.map((row) => ({ id: row.id, stamp: row.updated_at, done: true })),
++    ],
++    [childChats],
++  );
++  const meta = useAeAgentMeta(
++    sessionId,
++    shownRows,
++    running > 0 || childChats.working > 0,
++    familyUsage,
++  );
+   return (
+     <AeRailSection id="agents" summary={summary}>
+       <AeAgentMetaProvider meta={meta}>
+         <div className="flex flex-col gap-2 text-sm" data-testid="ae-rail-agents">
+-          {!empty && running === 0 && <AeRailMuted>Nothing running now.</AeRailMuted>}
++          <AeRailChildChats sessionId={sessionId} model={childChats} active={active} nowMs={now} />
++          {!empty && running === 0 && childChats.working === 0 && (
++            <AeRailMuted>Nothing running now.</AeRailMuted>
++          )}
+           {rows.map(({ entry, running: live }) => {
+             const pct = entry.reading ? (entry.reading.used / entry.reading.size) * 100 : null;
+             const detail = [who(entry), live ? null : "finished"].filter(Boolean).join(" · ");
+@@ -303,6 +340,11 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+               </div>
+             );
+           })}
++          {childChatCount > 0 && subagentCount > 0 && (
++            <div className="pt-1 text-xs uppercase tracking-wide text-muted-foreground">
++              Subagents
++            </div>
++          )}
+           {runningSubagents.length > 0 && (
+             <div className="flex flex-col">
+               {runningSubagents.map((child) => (
+@@ -388,7 +430,12 @@ export function AeRailAgents({ sessionId }: AeRailSectionProps) {
+               {sessions.loading ? "Loading agents…" : "No agents have run in this session."}
+             </AeRailMuted>
+           )}
+-          <AeAgentsTotal as="div" rootSessionId={sessionId} childIds={children.map((c) => c.id)} />
++          <AeAgentsTotal
++            as="div"
++            rootSessionId={sessionId}
++            childIds={children.map((c) => c.id)}
++            familyIds={familyUsage.map((f) => f.id)}
++          />
+         </div>
+       </AeAgentMetaProvider>
+     </AeRailSection>
+diff --git a/web/src/components/aeRail/AeRailChildChats.tsx b/web/src/components/aeRail/AeRailChildChats.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..68bdc16bcb50cc58a8bf2b6ed480c74995bdc472
+--- /dev/null
++++ b/web/src/components/aeRail/AeRailChildChats.tsx
+@@ -0,0 +1,436 @@
++// The Agents card's "Child chats" part (omnigent-ae, 2026-10-29): the family child
++// sessions this chat started. A child waiting on the user is pinned first with its
++// question and an Answer button; the rest are rows with a role badge, a status line and a
++// time; closed ones fold under one toggle. The model: lib/aeRailChildChats.ts.
++
++import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
++import { useEffect, useMemo, useRef, useState } from "react";
++import { RunningDot } from "@/components/RunningDot";
++import {
++  type Conversation,
++  fetchConversationsPage,
++  useConversations,
++} from "@/hooks/useConversations";
++import { aeAgentRole } from "@/lib/aeAgentRole";
++import { AE_CLOSED_CAPPED_NOTE, aeGroupArchived } from "@/lib/aeFamilyClosed";
++import { aeFamilyPrompts } from "@/lib/aeFamilyPrompts";
++import { AE_FAMILY_BADGES } from "@/lib/aeFamilyBadge";
++import { aeRevealDock } from "@/lib/aeDockReveal";
++import {
++  type AeChildChat,
++  type AeChildChatsModel,
++  aeChildChatsOf,
++  buildAeChildChats,
++} from "@/lib/aeRailChildChats";
++import { type AeSessionPeek, fetchAeSessionPeek } from "@/lib/aeSessionPeek";
++import { aeDuration } from "@/lib/aeSessionActivity";
++import { Link, useLocation } from "@/lib/routing";
++import { sessionNavigationSearch } from "@/lib/sessionNavigation";
++import { cn } from "@/lib/utils";
++import { useChatStore } from "@/store/chatStore";
++import { AE_RAIL_TONE_TEXT, AeRailIcon, AeRailMuted } from "./aeRailUi";
++
++/** The peek's own cadence; the card never reads faster while it is showing. */
++const PEEK_POLL_MS = 15_000;
++const MAX_CLOSED = 8;
++const CLOSED_OPEN_KEY = "ae.rail.agents.childClosedOpen";
++
++function readClosedOpen(): boolean {
++  try {
++    return window.localStorage.getItem(CLOSED_OPEN_KEY) === "1";
++  } catch {
++    return false;
++  }
++}
++
++function writeClosedOpen(open: boolean): void {
++  try {
++    window.localStorage.setItem(CLOSED_OPEN_KEY, open ? "1" : "0");
++  } catch {
++    // Blocked storage: the choice lasts until the page reloads.
++  }
++}
++
++const EMPTY_MODEL: AeChildChatsModel = {
++  open: [],
++  closed: [],
++  needs: [],
++  working: 0,
++  archivedNote: null,
++};
++
++const ARCHIVED_STALE_MS = 60_000;
++const ARCHIVED_LIMIT = 200;
++const ARCHIVED_PAGES = 3;
++
++const ARCHIVED_KEY = ["ae-rail-child-chats-archived"] as const;
++
++interface ArchivedRead {
++  rows: Conversation[];
++  /** The read stopped at its page cap with more left. */
++  capped: boolean;
++}
++
++/**
++ * The archived sessions, one read shared by every chat (the list endpoint cannot filter by
++ * label, so the card groups them by lead itself). The open list never holds archived rows.
++ * A failed refetch keeps the last good read.
++ */
++function useArchivedRead(active: boolean) {
++  const queryClient = useQueryClient();
++  return useQuery({
++    queryKey: ARCHIVED_KEY,
++    enabled: active,
++    staleTime: ARCHIVED_STALE_MS,
++    refetchOnWindowFocus: true,
++    retry: false,
++    queryFn: async ({ signal }): Promise<ArchivedRead> => {
++      const rows: Conversation[] = [];
++      let after: string | undefined;
++      let more = false;
++      for (let page = 0; page < ARCHIVED_PAGES; page += 1) {
++        // eslint-disable-next-line no-await-in-loop -- each page needs the previous cursor
++        const got = await fetchConversationsPage({
++          searchQuery: "",
++          includeArchived: true,
++          visibility: "archived",
++          queryClient,
++          signal,
++          limit: ARCHIVED_LIMIT,
++          after,
++        });
++        rows.push(...(got.data ?? []));
++        more = got.has_more && got.last_id !== null;
++        if (!more) break;
++        after = got.last_id ?? undefined;
++      }
++      return { rows, capped: more };
++    },
++  });
++}
++
++/**
++ * The chat's child chats, read from the conversation list the sidebar keeps loaded
++ * (live through its stream and reconcile) plus a read of the archived ones.
++ */
++export function useAeRailChildChats(sessionId: string, active: boolean): AeChildChatsModel {
++  // Folded, it only reads the cached lists, so the folded summary keeps its counts.
++  const { data } = useConversations("", false, { enabled: active });
++  const queryClient = useQueryClient();
++  const archived = useArchivedRead(active);
++  const archivedData = archived.data;
++  const archivedFailed = archived.isError && !archivedData;
++  const model = useMemo(() => {
++    if (!data) return EMPTY_MODEL;
++    const rows = new Map<string, Conversation>();
++    for (const page of data.pages) for (const row of page.data ?? []) rows.set(row.id, row);
++    // A live row is newer than any archived read: an unarchived child leaves the fold at once.
++    const mine = aeGroupArchived(archivedData?.rows ?? [], new Set([sessionId]));
++    for (const row of mine.get(sessionId) ?? []) {
++      if (!rows.has(row.id)) rows.set(row.id, { ...row, archived: true });
++    }
++    const built = buildAeChildChats([...rows.values()], sessionId);
++    const archivedNote: AeChildChatsModel["archivedNote"] = archivedFailed
++      ? "failed"
++      : archivedData?.capped
++        ? "capped"
++        : null;
++    return archivedNote ? { ...built, archivedNote } : built;
++  }, [data, archivedData, archivedFailed, sessionId]);
++  // A child that leaves the open list was archived (or deleted): read the archived list
++  // again so it lands in the fold instead of vanishing.
++  const liveIds = useMemo(
++    () => aeChildChatsOf(data?.pages.flatMap((page) => page.data ?? []) ?? [], sessionId),
++    [data, sessionId],
++  );
++  const seen = useRef<{ session: string; ids: ReadonlySet<string> }>({
++    session: sessionId,
++    ids: new Set(),
++  });
++  useEffect(() => {
++    const now = new Set(liveIds.map((row) => row.id));
++    // Another chat's ids are not departures: a switch starts a fresh baseline.
++    const left =
++      seen.current.session === sessionId && [...seen.current.ids].some((id) => !now.has(id));
++    seen.current = { session: sessionId, ids: now };
++    if (left && active) void queryClient.invalidateQueries({ queryKey: ARCHIVED_KEY });
++  }, [liveIds, sessionId, active, queryClient]);
++  return model;
++}
++
++function usePeeks(open: readonly AeChildChat[], active: boolean) {
++  const results = useQueries({
++    queries: open.map(({ row, status }) => ({
++      queryKey: ["ae-rail-child-peek", row.id, status, row.updated_at],
++      queryFn: ({ signal }: { signal: AbortSignal }) => fetchAeSessionPeek(row.id, signal),
++      enabled: active,
++      staleTime: PEEK_POLL_MS,
++      // A finished child's newest items no longer change.
++      refetchInterval:
++        active && (status === "working" || status === "needs") ? PEEK_POLL_MS : false,
++      retry: false,
++      placeholderData: (previous: AeSessionPeek | undefined) => previous,
++    })),
++  });
++  const out = new Map<string, AeSessionPeek>();
++  results.forEach((result, index) => {
++    if (result.data) out.set(open[index].row.id, result.data);
++  });
++  return out;
++}
++
++function RoleBadge({ labels }: { labels: Record<string, string> }) {
++  const role = aeAgentRole({ labels });
++  const badge = role ? AE_FAMILY_BADGES[role] : undefined;
++  if (!badge) return <span aria-hidden className="size-4 shrink-0" />;
++  return (
++    <span
++      aria-hidden
++      className={cn(
++        "mt-0.5 flex size-4 shrink-0 items-center justify-center rounded text-[10px] font-bold",
++        badge.className,
++      )}
++    >
++      {badge.letter}
++    </span>
++  );
++}
++
++function useChildLink(childId: string) {
++  const { search } = useLocation();
++  return { pathname: `/c/${childId}`, search: sessionNavigationSearch(search) };
++}
++
++/** How long a working child has been on its turn, else how long ago it last changed. */
++function childTime(child: AeChildChat, peek: AeSessionPeek | undefined, nowMs: number): string {
++  if (child.status === "working" && peek?.turnStartedAt) {
++    return aeDuration(nowMs - peek.turnStartedAt, true);
++  }
++  return `${aeDuration(nowMs - child.row.updated_at * 1000, true)} ago`;
++}
++
++function StatusLine({ child, peek }: { child: AeChildChat; peek: AeSessionPeek | undefined }) {
++  if (child.status === "working") {
++    return (
++      <span className="flex min-w-0 items-center gap-1.5 text-xs text-muted-foreground">
++        <RunningDot className="size-2.5" />
++        <span className="shrink-0 font-medium">Working</span>
++        {peek?.step && <span className="truncate">{peek.step}</span>}
++      </span>
++    );
++  }
++  if (child.status === "error") {
++    return (
++      <span className="block truncate text-xs text-destructive">
++        <span className="font-medium">Error</span>
++        {peek?.lastError ? ` ${peek.lastError}` : ""}
++      </span>
++    );
++  }
++  return (
++    <span className="block truncate text-xs text-muted-foreground">
++      <span aria-hidden className="mr-1.5 inline-block size-1.5 rounded-full bg-emerald-500" />
++      <span className="font-medium">Done</span>
++      {peek?.lastReply ? ` ${peek.lastReply}` : ""}
++    </span>
++  );
++}
++
++function ChildRow({
++  child,
++  peek,
++  nowMs,
++}: {
++  child: AeChildChat;
++  peek: AeSessionPeek | undefined;
++  nowMs: number;
++}) {
++  const to = useChildLink(child.row.id);
++  const title = child.row.title ?? child.row.id;
++  return (
++    <Link
++      to={to}
++      componentId="rail.child_chats.open"
++      title={`Open ${title}`}
++      className="-mx-1.5 flex w-[calc(100%+0.75rem)] items-start gap-2 rounded-md px-1.5 py-1 hover:bg-muted"
++      data-testid="ae-rail-child-chat"
++      data-session={child.row.id}
++      data-status={child.status}
++    >
++      <RoleBadge labels={child.row.labels} />
++      <span className="min-w-0 flex-1">
++        <span className="flex items-baseline gap-2">
++          <span className="min-w-0 flex-1 truncate">{title}</span>
++          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
++            {childTime(child, peek, nowMs)}
++          </span>
++        </span>
++        <StatusLine child={child} peek={peek} />
++      </span>
++    </Link>
++  );
++}
++
++const BUTTON =
++  "rounded-md px-2.5 py-0.5 text-xs font-semibold focus-visible:outline focus-visible:outline-2";
++
++function NeedsYou({
++  child,
++  peek,
++  sessionId,
++  nowMs,
++}: {
++  child: AeChildChat;
++  peek: AeSessionPeek | undefined;
++  sessionId: string;
++  nowMs: number;
++}) {
++  const to = useChildLink(child.row.id);
++  const title = child.row.title ?? child.row.id;
++  // The parent mirrors the child's prompt into its action dock; without it, open the child.
++  const inDock = useChatStore(
++    (s) =>
++      s.conversationId === sessionId &&
++      aeFamilyPrompts(s.blocks).some((block) => block.targetSessionId === child.row.id),
++  );
++  return (
++    <div
++      className="rounded-lg border border-amber-500/40 bg-amber-500/10 px-2.5 py-2"
++      data-testid="ae-rail-child-needs"
++      data-session={child.row.id}
++    >
++      <div className="flex items-baseline gap-2">
++        <span aria-hidden className="mt-1 size-2 shrink-0 self-center rounded-full bg-warning" />
++        <span className="min-w-0 flex-1 truncate font-medium">{title}</span>
++        <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
++          {childTime(child, peek, nowMs)}
++        </span>
++      </div>
++      <p className={cn("mt-0.5 text-xs", peek?.question ? undefined : AE_RAIL_TONE_TEXT.warning)}>
++        {peek?.question ?? "Waiting on you"}
++      </p>
++      <div className="mt-1.5 flex gap-1.5">
++        {inDock ? (
++          <button
++            type="button"
++            onClick={() => aeRevealDock("childPrompt", child.row.id)}
++            aria-label={`Answer ${title}`}
++            className={cn(BUTTON, "bg-amber-600 text-white hover:bg-amber-700")}
++            data-testid="ae-rail-child-answer"
++          >
++            Answer
++          </button>
++        ) : (
++          <Link
++            to={to}
++            componentId="rail.child_chats.answer"
++            aria-label={`Answer ${title}`}
++            className={cn(BUTTON, "bg-amber-600 text-white hover:bg-amber-700")}
++            data-testid="ae-rail-child-answer"
++          >
++            Answer
++          </Link>
++        )}
++        <Link
++          to={to}
++          componentId="rail.child_chats.open_needs"
++          aria-label={`Open chat ${title}`}
++          className={cn(BUTTON, "border border-border text-muted-foreground hover:bg-muted")}
++          data-testid="ae-rail-child-open"
++        >
++          Open chat
++        </Link>
++      </div>
++    </div>
++  );
++}
++
++function ClosedRow({ title, id }: { title: string; id: string }) {
++  const to = useChildLink(id);
++  return (
++    <Link
++      to={to}
++      componentId="rail.child_chats.open_closed"
++      className="-mx-1.5 block w-[calc(100%+0.75rem)] truncate rounded-md px-1.5 py-1 text-xs text-muted-foreground hover:bg-muted"
++      data-testid="ae-rail-child-closed-row"
++    >
++      {title}
++    </Link>
++  );
++}
++
++export function AeRailChildChats({
++  sessionId,
++  model,
++  active,
++  nowMs,
++}: {
++  sessionId: string;
++  model: AeChildChatsModel;
++  active: boolean;
++  nowMs: number;
++}) {
++  const [closedOpen, setClosedOpen] = useState(readClosedOpen);
++  const peeks = usePeeks(model.open, active);
++  const toggleClosed = () => {
++    writeClosedOpen(!closedOpen);
++    setClosedOpen(!closedOpen);
++  };
++  // A failed archived read shows even with no other child: the chat's only children may be
++  // archived. A capped read says nothing alone, since the cap is not about this chat.
++  if (model.open.length === 0 && model.closed.length === 0 && model.archivedNote !== "failed") {
++    return null;
++  }
++  // A child waiting on the user is pinned above; the list holds the rest.
++  const listed = model.open.filter((c) => c.status !== "needs");
++  return (
++    <div className="flex flex-col gap-1.5" data-testid="ae-rail-child-chats">
++      {model.needs.map((child) => (
++        <NeedsYou
++          key={child.row.id}
++          child={child}
++          peek={peeks.get(child.row.id)}
++          sessionId={sessionId}
++          nowMs={nowMs}
++        />
++      ))}
++      {model.open.length > 0 && (
++        <div className="flex items-center justify-between pt-1 text-xs uppercase tracking-wide text-muted-foreground">
++          <span>Child chats</span>
++          <span className="tabular-nums">{model.open.length}</span>
++        </div>
++      )}
++      {listed.map((child) => (
++        <ChildRow key={child.row.id} child={child} peek={peeks.get(child.row.id)} nowMs={nowMs} />
++      ))}
++      {model.closed.length > 0 && (
++        <div className="flex flex-col border-t border-border/60 pt-1">
++          <button
++            type="button"
++            onClick={toggleClosed}
++            aria-expanded={closedOpen}
++            data-testid="ae-rail-child-closed-toggle"
++            className="-mx-1.5 flex min-h-7 w-[calc(100%+0.75rem)] items-center gap-1 rounded-md px-1.5 text-left text-xs text-muted-foreground hover:bg-muted"
++          >
++            <AeRailIcon name={closedOpen ? "chevronDown" : "chevronRight"} className="size-3.5" />
++            <span>{model.closed.length} closed</span>
++          </button>
++          {closedOpen &&
++            model.closed
++              .slice(0, MAX_CLOSED)
++              .map((row) => <ClosedRow key={row.id} id={row.id} title={row.title ?? row.id} />)}
++          {closedOpen && model.closed.length > MAX_CLOSED && (
++            <AeRailMuted>{model.closed.length - MAX_CLOSED} more in the sidebar.</AeRailMuted>
++          )}
++        </div>
++      )}
++      {model.archivedNote && (
++        <AeRailMuted data-testid="ae-rail-child-archived-note">
++          {model.archivedNote === "failed"
++            ? "Could not load archived chats."
++            : `Archived chats: ${AE_CLOSED_CAPPED_NOTE.trim().replace(/^\(|\)$/g, "")}.`}
++        </AeRailMuted>
++      )}
++    </div>
++  );
++}
+diff --git a/web/src/components/aeRail/aeRailUi.tsx b/web/src/components/aeRail/aeRailUi.tsx
+index febdb2035577a3a5dfb06d334847917c1253a152..8b91bb700fc51390e4f8aa2babc174f6862b2476 100644
+--- a/web/src/components/aeRail/aeRailUi.tsx
++++ b/web/src/components/aeRail/aeRailUi.tsx
+@@ -100,8 +100,20 @@ export function AeRailBar({
+ }
+ 
+ /** A quiet line: an empty state, a hint, or what the section cannot know. */
+-export function AeRailMuted({ children, className }: { children: ReactNode; className?: string }) {
+-  return <p className={cn("py-1 text-xs text-muted-foreground", className)}>{children}</p>;
++export function AeRailMuted({
++  children,
++  className,
++  "data-testid": testId,
++}: {
++  children: ReactNode;
++  className?: string;
++  "data-testid"?: string;
++}) {
++  return (
++    <p className={cn("py-1 text-xs text-muted-foreground", className)} data-testid={testId}>
++      {children}
++    </p>
++  );
+ }
+ 
+ /** Small muted text for timestamps, counts and sources. */
+diff --git a/web/src/lib/aeDockReveal.ts b/web/src/lib/aeDockReveal.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..041d555d85dfad80bb1c0bd88e8fb527cb443d06
+--- /dev/null
++++ b/web/src/lib/aeDockReveal.ts
+@@ -0,0 +1,28 @@
++// A tiny event so a control outside the action dock (the rail's Answer button) can ask
++// the dock to open its tray and scroll to a kind of line, or to one child's line (omnigent-ae, 2026-10-29).
++// Nothing is stored: a reveal with no dock mounted is simply lost.
++
++import { useEffect, useRef } from "react";
++import type { AeDockKind } from "@/lib/aeActionDock";
++
++type Listener = (kind: AeDockKind, childId?: string) => void;
++
++const listeners = new Set<Listener>();
++
++/** Ask any mounted dock to open its tray at the first line of `kind`, or at `childId`'s. */
++export function aeRevealDock(kind: AeDockKind, childId?: string): void {
++  for (const listener of [...listeners]) listener(kind, childId);
++}
++
++/** Run `onReveal` for each reveal while the caller is mounted. */
++export function useAeDockReveal(onReveal: Listener): void {
++  const latest = useRef(onReveal);
++  latest.current = onReveal;
++  useEffect(() => {
++    const listener: Listener = (kind, childId) => latest.current(kind, childId);
++    listeners.add(listener);
++    return () => {
++      listeners.delete(listener);
++    };
++  }, []);
++}
+diff --git a/web/src/lib/aeRailChildChats.test.ts b/web/src/lib/aeRailChildChats.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d72ec9745a19c462f364f32a0a31e5cdfa31acae
+--- /dev/null
++++ b/web/src/lib/aeRailChildChats.test.ts
+@@ -0,0 +1,69 @@
++import { describe, expect, it } from "vitest";
++import type { Conversation } from "@/hooks/useConversations";
++import { buildAeChildChats } from "./aeRailChildChats";
++
++function row(id: string, extra: Partial<Conversation> = {}, labels: Record<string, string> = {}) {
++  return {
++    id,
++    object: "conversation",
++    title: id,
++    created_at: 0,
++    updated_at: 100,
++    labels: { "ae.orch": "lead", ...labels },
++    permission_level: null,
++    status: "idle",
++    ...extra,
++  } as Conversation;
++}
++
++describe("buildAeChildChats", () => {
++  it("keeps only direct children, never forks, the lead itself or other families", () => {
++    const model = buildAeChildChats(
++      [
++        row("a"),
++        row("fork", {}, { "omnigent.fork.source_id": "x" }),
++        row("other", {}, { "ae.orch": "elsewhere" }),
++        row("lead", {}, { "ae.orch": "lead" }),
++        row("grand", {}, { "ae.orch": "a" }),
++        row("none", {}, { "ae.orch": "1" }),
++      ],
++      "lead",
++    );
++    expect(model.open.map((c) => c.row.id)).toEqual(["a"]);
++  });
++
++  it("orders needs-you, then working, then the rest newest first", () => {
++    const model = buildAeChildChats(
++      [
++        row("old-done", { updated_at: 10 }),
++        row("new-done", { updated_at: 90 }),
++        row("busy", { status: "running", updated_at: 50 }),
++        row("asks", { pending_elicitations_count: 1, updated_at: 5 }),
++        row("broke", { status: "failed", updated_at: 40 }),
++      ],
++      "lead",
++    );
++    expect(model.open.map((c) => [c.row.id, c.status])).toEqual([
++      ["asks", "needs"],
++      ["busy", "working"],
++      ["new-done", "done"],
++      ["broke", "error"],
++      ["old-done", "done"],
++    ]);
++    expect(model.needs.map((c) => c.row.id)).toEqual(["asks"]);
++    expect(model.working).toBe(1);
++  });
++
++  it("folds reference and archived children into closed, newest first", () => {
++    const model = buildAeChildChats(
++      [
++        row("ref", { updated_at: 1 }, { "ae.status": "reference" }),
++        row("arch", { updated_at: 2, archived: true }),
++        row("live"),
++      ],
++      "lead",
++    );
++    expect(model.open.map((c) => c.row.id)).toEqual(["live"]);
++    expect(model.closed.map((r) => r.id)).toEqual(["arch", "ref"]);
++  });
++});
+diff --git a/web/src/lib/aeRailChildChats.ts b/web/src/lib/aeRailChildChats.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..17265b8646c471f36f0236eb34514586e28bfe70
+--- /dev/null
++++ b/web/src/lib/aeRailChildChats.ts
+@@ -0,0 +1,68 @@
++// The rail Agents card's "Child chats" model (omnigent-ae, 2026-10-29): the family
++// child sessions the open chat started, split into open and closed, each open one with
++// a status, ordered so what waits on the user comes first. Pure: the card reads the
++// conversation rows and hands them in. The card: components/aeRail/AeRailChildChats.tsx.
++
++import type { Conversation } from "@/hooks/useConversations";
++import { getSessionState } from "@/hooks/useSessionState";
++import { AE_FORK_SOURCE_KEY, aeOrchParent } from "@/lib/aeFamily";
++import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
++
++export type AeChildChatStatus = "needs" | "working" | "error" | "done";
++
++export interface AeChildChat {
++  row: Conversation;
++  status: AeChildChatStatus;
++}
++
++export interface AeChildChatsModel {
++  /** Open children, needs-you first, then working, then the rest, each newest first. */
++  open: AeChildChat[];
++  /** Closed children (reference or archived), newest first. */
++  closed: Conversation[];
++  /** The open children waiting on the user, in the same order. */
++  needs: AeChildChat[];
++  working: number;
++  /** What the archived read could not tell: it hit its page cap, or failed with nothing cached. */
++  archivedNote: "capped" | "failed" | null;
++}
++
++const ORDER: Record<AeChildChatStatus, number> = { needs: 0, working: 1, error: 2, done: 2 };
++
++export function aeChildChatStatus(row: Conversation): AeChildChatStatus {
++  const state = getSessionState(row);
++  if (state?.kind === "awaiting") return "needs";
++  if (state?.kind === "running" || state?.kind === "starting") return "working";
++  if (state?.kind === "error" || state?.kind === "disconnected") return "error";
++  return "done";
++}
++
++/** The direct children `sessionId` started; a fork of a session is new work, not a helper. */
++export function aeChildChatsOf(rows: readonly Conversation[], sessionId: string): Conversation[] {
++  return rows.filter(
++    (row) =>
++      row.id !== sessionId &&
++      aeOrchParent(row.labels) === sessionId &&
++      !row.labels?.[AE_FORK_SOURCE_KEY],
++  );
++}
++
++export function buildAeChildChats(
++  rows: readonly Conversation[],
++  sessionId: string,
++): AeChildChatsModel {
++  const children = aeChildChatsOf(rows, sessionId);
++  const newestFirst = (a: Conversation, b: Conversation) => b.updated_at - a.updated_at;
++  const open = children
++    .filter((row) => !aeIsClosedMember(row))
++    .map((row) => ({ row, status: aeChildChatStatus(row) }))
++    .sort((a, b) => ORDER[a.status] - ORDER[b.status] || newestFirst(a.row, b.row));
++  const closed = children.filter(aeIsClosedMember).sort(newestFirst);
++  return {
++    open,
++    closed,
++    needs: open.filter((c) => c.status === "needs"),
++    working: open.filter((c) => c.status === "working").length,
++    archivedNote: null,
++  };
++}
+diff --git a/web/src/shell/AeAgentMeta.tsx b/web/src/shell/AeAgentMeta.tsx
+index abc3ba2ae4222ad136e3ab403926703a1968cd10..41cb3b7e5cdd5c09ff1e26bb32cfb8d58171903d 100644
+--- a/web/src/shell/AeAgentMeta.tsx
++++ b/web/src/shell/AeAgentMeta.tsx
+@@ -53,10 +53,20 @@ function useNativeInputs(rootSessionId: string): Readonly<Record<string, AeNativ
+  * the native inputs. A stopped row is read once; running rows and the lead
+  * read again every 30 s while anything runs.
+  */
++const NO_IDS: readonly never[] = [];
++
++export interface AeFamilyUsageRequest {
++  id: string;
++  stamp: string | number;
++  done?: boolean;
++}
++
+ export function useAeAgentMeta(
+   rootSessionId: string,
+   shown: readonly ChildSessionInfo[],
+   live: boolean,
++  /** Family child chats: separate sessions the lead's usage does not cover. */
++  family: readonly AeFamilyUsageRequest[] = NO_IDS,
+ ) {
+   const sessions = useMemo(
+     () => [
+@@ -66,10 +76,11 @@ export function useAeAgentMeta(
+         stamp: `${a.current_task_status ?? ""}${a.busy ? "b" : ""}`,
+         done: isChildFinished(a),
+       })),
++      ...family,
+     ],
+-    [rootSessionId, shown],
++    [rootSessionId, shown, family],
+   );
+-  const usage = useAeSessionUsages(sessions, { enabled: shown.length > 0, live });
++  const usage = useAeSessionUsages(sessions, { enabled: shown.length + family.length > 0, live });
+   const inputs = useNativeInputs(rootSessionId);
+   return { usage, inputs };
+ }
+@@ -186,16 +197,19 @@ export function AeAgentMetaLine({
+ }
+ 
+ /**
+- * "This chat and its agents" with a bar split by model family. The lead's
++ * "This chat and its helpers" with a bar split by model family. The lead's
+  * usage covers its subagents, so its own share is what is left after them.
+  */
+ export function AeAgentsTotal({
+   rootSessionId,
+   childIds,
++  familyIds = NO_IDS,
+   as: Tag = "li",
+ }: {
+   rootSessionId: string;
+   childIds: readonly string[];
++  /** Family child chats. They run outside the lead's spawn tree, so they add to its usage. */
++  familyIds?: readonly string[];
+   as?: "li" | "div";
+ }) {
+   const usage = useContext(UsageContext);
+@@ -204,7 +218,7 @@ export function AeAgentsTotal({
+   if (!lead || mode === "off") return null;
+   // Cost is the measure; tokens stand in only when the lead reports no cost.
+   // Both mode needs one number, so it uses cost only when every session has one.
+-  const allRead = [lead, ...childIds.map((id) => usage.get(id))];
++  const allRead = [lead, ...[...childIds, ...familyIds].map((id) => usage.get(id))];
+   const byCost =
+     mode === "cost"
+       ? lead.costUsd !== null
+@@ -217,11 +231,17 @@ export function AeAgentsTotal({
+   const known = childIds.map((id) => usage.get(id)).filter((u): u is AeSessionUsage => !!u);
+   const childSum = known.reduce((sum, u) => sum + measure(u), 0);
+   // Every child here is in the lead's spawn tree, so its usage already holds them.
+-  // The max covers a lead read that is older than the children's.
+-  const total = Math.max(leadValue, childSum);
++  const familyKnown = familyIds
++    .filter((id) => !childIds.includes(id))
++    .map((id) => usage.get(id))
++    .filter((u): u is AeSessionUsage => !!u);
++  const familySum = familyKnown.reduce((sum, u) => sum + measure(u), 0);
++  // The max covers a lead read that is older than the children's; family spend stays apart.
++  const spawnTotal = Math.max(leadValue, childSum);
++  const total = spawnTotal + familySum;
+   // With an unread child (a folded group), the lead's share cannot be told apart.
+   // Float residue under half a cent is a true zero.
+-  const rest = Math.max(0, total - childSum);
++  const rest = Math.max(0, spawnTotal - childSum);
+   const own = known.length === childIds.length ? (rest < 0.005 ? 0 : rest) : null;
+   // A stale lead read has no trustworthy split, so the children's stand in.
+   const byFamily: Record<string, number> = childSum > leadValue ? {} : { ...leadFamilies };
+@@ -233,16 +253,23 @@ export function AeAgentsTotal({
+     }
+   }
+   // Tokens mode: sessions without a count leave the total short, so it ends in "+".
+-  const noCount = byTokens ? [lead, ...known].filter((u) => aeUsageSpentTokens(u) === null) : [];
++  const noCount = byTokens
++    ? [lead, ...known, ...familyKnown].filter((u) => aeUsageSpentTokens(u) === null)
++    : [];
+   const plus = noCount.length > 0 ? "+" : "";
+   const fmt = (n: number) => (byCost ? aeFormatCost(n) : `${aeFormatTokens(n)}${plus} tokens`);
++  for (const u of familyKnown) {
++    for (const [family, n] of Object.entries(byCost ? u.costByFamily : u.byFamily)) {
++      byFamily[family] = (byFamily[family] ?? 0) + (n ?? 0);
++    }
++  }
+   // Tokens only when every model in the lead and the rows read reports them.
+   const tokenTotal =
+-    byCost && lead.tokens !== null && known.every((u) => u.tokens !== null)
++    byCost && lead.tokens !== null && [...known, ...familyKnown].every((u) => u.tokens !== null)
+       ? Math.max(
+           lead.tokens,
+           known.reduce((sum, u) => sum + (u.tokens ?? 0), 0),
+-        )
++        ) + familyKnown.reduce((sum, u) => sum + (u.tokens ?? 0), 0)
+       : null;
+   if (total <= 0) return null;
+   const sum = Object.values(byFamily).reduce((a, b) => a + b, 0) || 1;
+@@ -252,7 +279,7 @@ export function AeAgentsTotal({
+   return (
+     <Tag data-testid="agents-total" className="mt-1 border-t border-border/60 px-2.5 py-2 text-xs">
+       <div className="text-muted-foreground">
+-        This chat and its agents:{" "}
++        This chat and its helpers:{" "}
+         <b
+           className="font-medium text-foreground tabular-nums"
+           title={
+diff --git a/web/src/shell/AeAgentsUsage.test.tsx b/web/src/shell/AeAgentsUsage.test.tsx
+index ed2eda0b383706b6d1ac3245a36f1caa72fbc925..3eaea18403e180b8a3b9afb96a5ebd53e552b816 100644
+--- a/web/src/shell/AeAgentsUsage.test.tsx
++++ b/web/src/shell/AeAgentsUsage.test.tsx
+@@ -3,7 +3,7 @@ import { cleanup, render, screen, waitFor } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type { ChildSessionInfo } from "@/hooks/useChildSessions";
+ import { useChatStore } from "@/store/chatStore";
+-import { AeAgentMetaLine } from "./AeAgentMeta";
++import { AeAgentMetaLine, AeAgentMetaProvider, AeAgentsTotal, useAeAgentMeta } from "./AeAgentMeta";
+ import { AeAgentsSections } from "./AeAgentsSections";
+ 
+ const usageMock = vi.hoisted(() => vi.fn());
+@@ -427,3 +427,33 @@ describe("AeAgentMetaLine raise marks", () => {
+     expect(screen.queryByTestId("subagent-cap-reached")).toBeNull();
+   });
+ });
++
++describe("Agents total with family child chats", () => {
++  const FAMILY = [{ id: "fam", stamp: 1 }];
++  function Total() {
++    const meta = useAeAgentMeta("conv_root", [], false, FAMILY);
++    return (
++      <AeAgentMetaProvider meta={meta}>
++        <AeAgentsTotal as="div" rootSessionId="conv_root" childIds={[]} familyIds={["fam"]} />
++      </AeAgentMetaProvider>
++    );
++  }
++
++  it("adds the child chats on top and keeps their spend out of the lead's share", async () => {
++    usageMock.mockImplementation(async (id: string) =>
++      id === "conv_root"
++        ? usage("claude-sonnet-5-5", 100_000, 0)
++        : usage("claude-opus-4-8", 300_000, 0),
++    );
++    render(
++      <QueryClientProvider client={new QueryClient()}>
++        <Total />
++      </QueryClientProvider>,
++    );
++    await waitFor(() => expect(screen.getByTestId("agents-total").textContent).toContain("$4.00"));
++    const total = screen.getByTestId("agents-total").textContent ?? "";
++    expect(total).toContain("This chat and its helpers");
++    expect(total).toContain("(lead $1.00)");
++    expect(total).toContain("Opus 75%");
++  });
++});

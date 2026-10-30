@@ -20,8 +20,8 @@ from ae_omni_policies import github, preset_review, preset_runs, preset_suggesti
 from ae_omni_policies import router as router_module
 from ae_omni_policies.role_prefs import RolePrefsStore
 
-REID = {"X-Forwarded-Email": "reid@example.com"}
-STEVE = {"X-Forwarded-Email": "steve@example.com"}
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
+MEMBER = {"X-Forwarded-Email": "member@example.com"}
 INSIGHTS = {"enabled": True, "weeks": 2, "scope": "all"}
 SONNET_HIGH = {"mode": "fixed", "model": role_prefs.SONNET, "effort": "high"}
 
@@ -210,32 +210,32 @@ async def test_the_read_checks_the_session_in_order(
 async def test_the_read_answers_the_owner_own_scope_and_admin_all(
     client: httpx.AsyncClient, world: World, ae_admins: set[str]
 ) -> None:
-    await _enable(client, REID)
-    await _enable(client, STEVE)
-    sid = world.reviewer(owner="reid@example.com")
-    read = await client.post(f"/v1/ae/sessions/{sid}/preset-insights", json={}, headers=REID)
+    await _enable(client, OWNER)
+    await _enable(client, MEMBER)
+    sid = world.reviewer(owner="owner@example.com")
+    read = await client.post(f"/v1/ae/sessions/{sid}/preset-insights", json={}, headers=OWNER)
     body = read.json()
     assert read.status_code == 200 and body["due"] is True and body["scope"] == "admin"
-    assert sorted(body["presets"]["users"]) == ["reid@example.com", "steve@example.com"]
+    assert sorted(body["presets"]["users"]) == ["member@example.com", "owner@example.com"]
     # An own-scope setting, or a non-admin owner, reads only their own presets.
-    await _enable(client, REID, scope="own")
+    await _enable(client, OWNER, scope="own")
     own = (
-        await client.post(f"/v1/ae/sessions/{sid}/preset-insights", json={}, headers=REID)
+        await client.post(f"/v1/ae/sessions/{sid}/preset-insights", json={}, headers=OWNER)
     ).json()
     assert own["due"] is True and own["scope"] == "own"
-    assert list(own["presets"]["users"]) == ["reid@example.com"]
-    sid2 = world.reviewer("conv_steve", owner="steve@example.com")
-    steve = await client.post(f"/v1/ae/sessions/{sid2}/preset-insights", json={}, headers=STEVE)
-    assert steve.json()["scope"] == "own"
-    assert list(steve.json()["presets"]["users"]) == ["steve@example.com"]
+    assert list(own["presets"]["users"]) == ["owner@example.com"]
+    sid2 = world.reviewer("conv_member", owner="member@example.com")
+    member = await client.post(f"/v1/ae/sessions/{sid2}/preset-insights", json={}, headers=MEMBER)
+    assert member.json()["scope"] == "own"
+    assert list(member.json()["presets"]["users"]) == ["member@example.com"]
 
 
 async def test_a_caller_who_is_not_the_owner_is_never_admin(
     client: httpx.AsyncClient, world: World, ae_admins: set[str]
 ) -> None:
-    await _enable(client, STEVE)
-    sid = world.reviewer(owner="steve@example.com")
-    read = await client.post(f"/v1/ae/sessions/{sid}/preset-insights", json={}, headers=REID)
+    await _enable(client, MEMBER)
+    sid = world.reviewer(owner="member@example.com")
+    read = await client.post(f"/v1/ae/sessions/{sid}/preset-insights", json={}, headers=OWNER)
     assert read.json()["scope"] == "own"
 
 
@@ -328,20 +328,20 @@ async def test_apply_after_the_preset_changed_is_a_409(
 async def test_the_actions_need_the_right_user(
     client: httpx.AsyncClient, world: World, ae_admins: set[str]
 ) -> None:
-    sugs = await _filed(client, world, STEVE)
+    sugs = await _filed(client, world, MEMBER)
     own_id, starter_id = sugs["own"]["id"], sugs["starter"]["id"]
-    wrong = await client.post(f"/v1/ae/preset-suggestions/{own_id}/apply", json={}, headers=REID)
+    wrong = await client.post(f"/v1/ae/preset-suggestions/{own_id}/apply", json={}, headers=OWNER)
     assert wrong.status_code == 403 and wrong.json()["error"]["code"] == "not_owner"
-    undo = await client.post(f"/v1/ae/preset-suggestions/{own_id}/undo", json={}, headers=REID)
+    undo = await client.post(f"/v1/ae/preset-suggestions/{own_id}/undo", json={}, headers=OWNER)
     assert undo.status_code == 403
-    # The admin sees everyone's with all=true; Steve may not.
-    everyone = await client.get("/v1/ae/preset-suggestions?all=true", headers=REID)
+    # The admin sees everyone's with all=true; a member may not.
+    everyone = await client.get("/v1/ae/preset-suggestions?all=true", headers=OWNER)
     assert len(everyone.json()["suggestions"]) == 2
     assert everyone.json()["suggestions"][0]["can_apply"] is False
-    denied = await client.get("/v1/ae/preset-suggestions?all=true", headers=STEVE)
+    denied = await client.get("/v1/ae/preset-suggestions?all=true", headers=MEMBER)
     assert denied.status_code == 403
-    # Reid has none of his own.
-    assert (await client.get("/v1/ae/preset-suggestions", headers=REID)).json()[
+    # The owner has none of their own.
+    assert (await client.get("/v1/ae/preset-suggestions", headers=OWNER)).json()[
         "suggestions"
     ] == []
     # A non-owner non-admin cannot dismiss; the admin can.
@@ -352,14 +352,14 @@ async def test_the_actions_need_the_right_user(
     )
     assert nope.status_code == 403
     gone = await client.post(
-        f"/v1/ae/preset-suggestions/{starter_id}/dismiss", json={}, headers=REID
+        f"/v1/ae/preset-suggestions/{starter_id}/dismiss", json={}, headers=OWNER
     )
     assert gone.status_code == 200 and gone.json()["suggestion"]["status"] == "dismissed"
     again = await client.post(
-        f"/v1/ae/preset-suggestions/{starter_id}/dismiss", json={}, headers=STEVE
+        f"/v1/ae/preset-suggestions/{starter_id}/dismiss", json={}, headers=MEMBER
     )
     assert again.status_code == 409
-    missing = await client.post("/v1/ae/preset-suggestions/sg_x/dismiss", json={}, headers=REID)
+    missing = await client.post("/v1/ae/preset-suggestions/sg_x/dismiss", json={}, headers=OWNER)
     assert missing.status_code == 404
 
 
@@ -369,12 +369,12 @@ async def test_the_issue_route_is_admin_only_and_posts_to_the_private_repo(
     ae_admins: set[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sugs = await _filed(client, world, STEVE)
+    sugs = await _filed(client, world, MEMBER)
     sid = sugs["starter"]["id"]
     url = f"/v1/ae/preset-suggestions/{sid}/issue"
-    assert (await client.post(url, json={}, headers=STEVE)).status_code == 403
+    assert (await client.post(url, json={}, headers=MEMBER)).status_code == 403
     monkeypatch.delenv("AE_GITHUB_TOKEN", raising=False)
-    off = await client.post(url, json={}, headers=REID)
+    off = await client.post(url, json={}, headers=OWNER)
     assert off.status_code == 503 and off.json()["error"]["code"] == "github_off"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
     monkeypatch.delenv("AE_GITHUB_API_URL", raising=False)
@@ -387,7 +387,7 @@ async def test_the_issue_route_is_admin_only_and_posts_to_the_private_repo(
         route.respond(
             201, json={"html_url": "https://github.com/analyticendeavors/omnigent-ae/issues/9"}
         )
-        ok = await client.post(url, json={}, headers=REID)
+        ok = await client.post(url, json={}, headers=OWNER)
         sent = json.loads(route.calls[0].request.content)
     assert ok.status_code == 200, ok.text
     assert ok.json()["suggestion"]["status"] == "issue_opened"
@@ -399,9 +399,9 @@ async def test_the_issue_route_is_admin_only_and_posts_to_the_private_repo(
     assert lines[4] == "Changes:" and lines[5] == "none (no field)" and lines[6] == "```"
     assert lines[7].startswith("From: preset review ") and "session conv_rev" in lines[7]
     # A second try on the now-issued suggestion is refused; an own one is too.
-    assert (await client.post(url, json={}, headers=REID)).status_code == 409
+    assert (await client.post(url, json={}, headers=OWNER)).status_code == 409
     own_url = f"/v1/ae/preset-suggestions/{sugs['own']['id']}/issue"
-    assert (await client.post(own_url, json={}, headers=REID)).status_code == 409
+    assert (await client.post(own_url, json={}, headers=OWNER)).status_code == 409
 
 
 async def test_the_issue_route_reports_a_github_failure_and_a_custom_repo(
@@ -410,7 +410,7 @@ async def test_the_issue_route_reports_a_github_failure_and_a_custom_repo(
     ae_admins: set[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sugs = await _filed(client, world, REID)
+    sugs = await _filed(client, world, OWNER)
     url = f"/v1/ae/preset-suggestions/{sugs['starter']['id']}/issue"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
     monkeypatch.setenv("AE_PRESET_ISSUE_REPO", "acme/private")
@@ -420,9 +420,9 @@ async def test_the_issue_route_reports_a_github_failure_and_a_custom_repo(
         mock.post("https://api.github.com/repos/acme/private/issues").respond(
             403, json={"message": "no"}
         )
-        failed = await client.post(url, json={}, headers=REID)
+        failed = await client.post(url, json={}, headers=OWNER)
     assert failed.status_code == 502 and failed.json()["error"]["code"] == "github_failed"
-    still = (await client.get("/v1/ae/preset-suggestions", headers=REID)).json()
+    still = (await client.get("/v1/ae/preset-suggestions", headers=OWNER)).json()
     assert {s["status"] for s in still["suggestions"] if s["kind"] == "starter"} == {"open"}
 
 
@@ -626,20 +626,20 @@ async def test_a_public_issue_repo_is_refused_and_the_answer_is_cached(
     ae_admins: set[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sugs = await _filed(client, world, REID)
+    sugs = await _filed(client, world, OWNER)
     url = f"/v1/ae/preset-suggestions/{sugs['starter']['id']}/issue"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
     monkeypatch.delenv("AE_GITHUB_API_URL", raising=False)
     monkeypatch.delenv("AE_PRESET_ISSUE_REPO", raising=False)
     with respx.mock(assert_all_called=False) as mock:
         create = _starter_issue_mocks(mock, private=False)
-        refused = await client.post(url, json={}, headers=REID)
-        again = await client.post(url, json={}, headers=REID)
+        refused = await client.post(url, json={}, headers=OWNER)
+        again = await client.post(url, json={}, headers=OWNER)
         gets = [c for c in mock.calls if c.request.method == "GET"]
     assert refused.status_code == 409 and refused.json()["error"]["code"] == "repo_not_private"
     assert again.status_code == 409 and len(gets) == 1  # cached for 10 minutes
     assert not create.called
-    listed = (await client.get("/v1/ae/preset-suggestions", headers=REID)).json()
+    listed = (await client.get("/v1/ae/preset-suggestions", headers=OWNER)).json()
     assert {s["status"] for s in listed["suggestions"] if s["kind"] == "starter"} == {"open"}
 
 
@@ -649,14 +649,14 @@ async def test_a_second_click_during_an_open_issue_is_409_in_progress(
     ae_admins: set[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sugs = await _filed(client, world, REID)
+    sugs = await _filed(client, world, OWNER)
     sid = sugs["starter"]["id"]
     url = f"/v1/ae/preset-suggestions/{sid}/issue"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
     monkeypatch.delenv("AE_GITHUB_API_URL", raising=False)
     monkeypatch.delenv("AE_PRESET_ISSUE_REPO", raising=False)
     preset_suggestions.store().reserve_issue(sid)
-    second = await client.post(url, json={}, headers=REID)
+    second = await client.post(url, json={}, headers=OWNER)
     assert second.status_code == 409 and second.json()["error"]["code"] == "issue_in_progress"
     preset_suggestions.store().release_issue(sid)
 
@@ -664,14 +664,14 @@ async def test_a_second_click_during_an_open_issue_is_409_in_progress(
 async def test_the_issue_body_fences_the_reviewer_text_and_defuses_mentions() -> None:
     record = {
         "preset_title": "Mine @team",
-        "why": "ask @reid ```` now [x](http://e.com) ![i](http://e.com/i.png) org/repo#7",
+        "why": "ask @owner ```` now [x](http://e.com) ![i](http://e.com/i.png) org/repo#7",
         "saving": "20 min [link](http://e.com)",
         "created_at": "2026-10-24T00:00:00Z",
         "review_session": "conv_rev",
         "changes": [{"path": "rules.helpers", "value": "``` @bob"}],
     }
     body = router_module._issue_body(record)
-    assert "@reid" not in body and "@\u200breid" in body and "@\u200bteam" in body
+    assert "@owner" not in body and "@\u200bowner" in body and "@\u200bteam" in body
     lines = body.splitlines()
     fence = lines[0]
     assert set(fence) == {"`"} and len(fence) >= 5  # longer than the ```` in the why
@@ -692,7 +692,7 @@ async def test_a_failed_issue_call_puts_the_suggestion_back_to_open(
     ae_admins: set[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sugs = await _filed(client, world, REID)
+    sugs = await _filed(client, world, OWNER)
     url = f"/v1/ae/preset-suggestions/{sugs['starter']['id']}/issue"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
     monkeypatch.delenv("AE_GITHUB_API_URL", raising=False)
@@ -700,9 +700,9 @@ async def test_a_failed_issue_call_puts_the_suggestion_back_to_open(
     with respx.mock() as mock:
         create = _starter_issue_mocks(mock)
         create.respond(500, json={"message": "down"})
-        failed = await client.post(url, json={}, headers=REID)
+        failed = await client.post(url, json={}, headers=OWNER)
     assert failed.status_code == 502
-    listed = (await client.get("/v1/ae/preset-suggestions", headers=REID)).json()
+    listed = (await client.get("/v1/ae/preset-suggestions", headers=OWNER)).json()
     assert {s["status"] for s in listed["suggestions"] if s["kind"] == "starter"} == {"open"}
 
 
@@ -778,7 +778,7 @@ async def test_a_stale_issue_reservation_counts_as_free(
     ae_admins: set[str],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    sugs = await _filed(client, world, REID)
+    sugs = await _filed(client, world, OWNER)
     sid = sugs["starter"]["id"]
     url = f"/v1/ae/preset-suggestions/{sid}/issue"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
@@ -790,7 +790,7 @@ async def test_a_stale_issue_reservation_counts_as_free(
     with respx.mock() as mock:
         create = _starter_issue_mocks(mock)
         create.respond(201, json={"html_url": "https://github.com/a/b/issues/3"})
-        done = await client.post(url, json={}, headers=REID)
+        done = await client.post(url, json={}, headers=OWNER)
     assert done.status_code == 200, done.text
     assert done.json()["suggestion"]["status"] == "issue_opened"
 
@@ -802,7 +802,7 @@ async def test_a_mark_failure_after_the_issue_is_retried_and_logs_the_url(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    sugs = await _filed(client, world, REID)
+    sugs = await _filed(client, world, OWNER)
     sid = sugs["starter"]["id"]
     url = f"/v1/ae/preset-suggestions/{sid}/issue"
     monkeypatch.setenv("AE_GITHUB_TOKEN", "gh-test")
@@ -821,18 +821,18 @@ async def test_a_mark_failure_after_the_issue_is_retried_and_logs_the_url(
     issue = "https://github.com/a/b/issues/4"
     with respx.mock() as mock, caplog.at_level("WARNING"):
         _starter_issue_mocks(mock).respond(201, json={"html_url": issue})
-        retried = await client.post(url, json={}, headers=REID)
+        retried = await client.post(url, json={}, headers=OWNER)
         assert retried.status_code == 200, retried.text
         assert retried.json()["suggestion"]["issue_url"] == issue
     assert issue in caplog.text
     # Two failures in a row: the answer is the failure, and the URL is in the log.
-    sugs2 = await _filed(client, world, REID, sid="conv_rev2")
+    sugs2 = await _filed(client, world, OWNER, sid="conv_rev2")
     fails["left"] = 2
     caplog.clear()
     with respx.mock(assert_all_called=False) as mock, caplog.at_level("WARNING"):
         _starter_issue_mocks(mock).respond(201, json={"html_url": issue})
         failed = await client.post(
-            f"/v1/ae/preset-suggestions/{sugs2['starter']['id']}/issue", json={}, headers=REID
+            f"/v1/ae/preset-suggestions/{sugs2['starter']['id']}/issue", json={}, headers=OWNER
         )
     assert failed.status_code == 503
     assert issue in caplog.text and "could not be recorded" in caplog.text

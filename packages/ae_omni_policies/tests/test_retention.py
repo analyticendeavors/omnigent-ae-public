@@ -244,7 +244,7 @@ async def test_never_a_session_neither_reference_nor_archived(world: World) -> N
     assert world.exists(unplaced)
 
 
-async def test_never_a_session_reid_renamed(world: World) -> None:
+async def test_never_a_session_owner_renamed(world: World) -> None:
     task = world.task()
     renamed = world.run(task, title="Steward brief, keep for the Q4 review")
     just_fired = world.run(task)

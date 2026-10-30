@@ -1,10 +1,10 @@
 // The Admin Center's cards and their columns (2026-10-20, the dashboard
-// redesign Reid approved as concept C): four cards under the tile strip
+// redesign the owner approved as concept C): four cards under the tile strip
 // (tiles.ts), Deploys, Compute (Fabric capacities and Databricks warehouses),
 // Databricks credit and Box health (the host and the server's secrets).
 //
 // Why fixed column stacks and not one shared grid: in a grid a short card
-// leaves a hole under it until the tallest card in its row ends, and Reid
+// leaves a hole under it until the tallest card in its row ends, and the owner
 // rejected the mockup that did that. Each column here is a flex stack whose
 // last card stretches, so every column ends on the same line. Which card goes
 // in which column depends on the page's width, so the cards move between
@@ -15,7 +15,7 @@
 //     Accounts over Azure spend over Databricks credit;
 //   one column (a phone): Deploys, Accounts, Compute, Databricks credit,
 //     Azure spend, Box health.
-// 2026-10-22: the Azure spend card (azure.ts) joined. The same day Reid chose
+// 2026-10-22: the Azure spend card (azure.ts) joined. The same day the owner chose
 // the columns above (Box health under Deploys, Databricks credit under Azure
 // spend, which closes the holes the old defaults left) and asked to drag a
 // card elsewhere: on two and three columns each header has a grip
@@ -28,15 +28,21 @@
 // three columns, last in the left on two, and last on a phone.
 // 2026-10-24: the Presets card (presets.ts) joined, right after Deploys in the
 // first column on three and two columns, and after Deploys on a phone.
+// 2026-10-29: the Family cost card (familyCost.ts) joined, right after Presets in the first column
+// on three and two columns and after Presets on a phone.
 // 2026-10-21: the Accounts card (accounts.ts) joined, at the head of the
 // middle column, where the account nearest its limit reads first.
+// 2026-10-28: the Box health card opens with the box monitor (boxHealth.ts), and its
+// tile heads the card's folded line, so a hot or full box unfolds the card on a phone.
+// A box admin who is not an OmniGent admin gets a board of that one card (fabric.ts),
+// and its grip and the Reset layout button have nothing to move.
 // The width comes from a ResizeObserver on the page (the window's resize where
 // there is none); moving a card keeps the focus on the control that had it.
 //
 // On a phone each card folds to its header line (tap to open), with the
 // card's tile values on that line so a folded card still says how it is.
 // Open or folded is remembered per card through sections.ts (ids "admin-*").
-// Until Reid picks, Deploys starts open and the others start folded unless
+// Until the owner picks, Deploys starts open and the others start folded unless
 // they need attention (a tile amber or red: the host not connected, a secret
 // missing). On a wider page every card is open and the header is not a toggle.
 
@@ -47,7 +53,10 @@ import { foldIcon, gripIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
 import { getTile, type Health, onTiles, type TileId, worst } from "./tiles";
 
-export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets";
+export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets" | "family";
+
+/** The cards a board holds; a box admin's page holds only the Box health card. */
+export type CardSet = Partial<Record<CardId, HTMLElement>>;
 
 export const THREE_COLUMNS_PX = 1040;
 export const TWO_COLUMNS_PX = 520;
@@ -55,15 +64,15 @@ export const TWO_COLUMNS_PX = 520;
 /** The cards in each column, by column count. */
 export const LAYOUTS: Defaults = {
   3: [
-    ["deploys", "presets", "box", "vault"],
+    ["deploys", "presets", "family", "box", "vault"],
     ["accounts", "compute"],
     ["azure", "credit", "git"],
   ],
   2: [
-    ["deploys", "presets", "box", "compute", "git"],
+    ["deploys", "presets", "family", "box", "compute", "git"],
     ["accounts", "azure", "credit", "vault"],
   ],
-  1: [["deploys", "presets", "accounts", "compute", "credit", "azure", "box", "vault", "git"]],
+  1: [["deploys", "presets", "family", "accounts", "compute", "credit", "azure", "box", "vault", "git"]],
 };
 
 /** The tiles whose health and values a card's folded header line carries. */
@@ -73,10 +82,11 @@ export const CARD_TILES: Record<CardId, TileId[]> = {
   compute: ["fabric", "databricks"],
   credit: ["credit"],
   azure: ["azure"],
-  box: ["host", "secrets"],
+  box: ["boxhealth", "host", "secrets"],
   vault: ["vault"],
   git: ["git"],
   presets: ["presets"],
+  family: ["family"],
 };
 
 export function columnsFor(width: number): 1 | 2 | 3 {
@@ -89,7 +99,7 @@ export function cardHealth(id: CardId): Health {
   return worst(CARD_TILES[id].flatMap((tile) => getTile(tile)?.health ?? []));
 }
 
-/** Where a card starts on a phone until Reid opens or folds it once. */
+/** Where a card starts on a phone until the owner opens or folds it once. */
 export function openByDefault(id: CardId): boolean {
   if (id === "deploys") return true;
   const health = cardHealth(id);
@@ -240,7 +250,7 @@ function applyFold(card: HTMLElement, phone: boolean): void {
  */
 export function arrange(
   board: HTMLElement,
-  cards: Record<CardId, HTMLElement>,
+  cards: CardSet,
   n: 1 | 2 | 3,
   force = false,
 ): void {
@@ -265,13 +275,13 @@ export function arrange(
 /**
  * Lay the cards out in *board* by the width of *page*, again whenever it
  * changes and whenever a tile changes (a card that turns red unfolds unless
- * Reid folded it himself). `refold` applies the remembered folds once they are
+ * the owner folded it themselves). `refold` applies the remembered folds once they are
  * read; `stop` stops listening.
  */
 export function mountBoard(
   page: HTMLElement,
   board: HTMLElement,
-  cards: Record<CardId, HTMLElement>,
+  cards: CardSet,
 ): { stop: () => void; refold: () => void } {
   let width = page.clientWidth || window.innerWidth;
   const layout = (force = false) => arrange(board, cards, columnsFor(width), force);

@@ -13,7 +13,7 @@ the answer is safe to render on a page and to log.
 The key lists mirror ``SERVER_KEYS`` and ``SERVER_OPTIONAL_KEYS`` in
 ``deploy/pull-secrets.sh``; ``tests/test_secrets_health.py`` parses the script
 and fails on any difference, so a key added there has to be added here too.
-Reid chose a mirrored list with that test on 2026-10-20 over shipping the
+The owner chose a mirrored list with that test on 2026-10-20 over shipping the
 script in the image or a shared key file, which would have changed the deploy
 script and the Dockerfile. The host's ``CLAUDE_CODE_OAUTH_TOKEN`` is left out:
 it lives in the host's own file, which the server never sees.

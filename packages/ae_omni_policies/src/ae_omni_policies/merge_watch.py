@@ -1,7 +1,7 @@
 """The merge watcher: a session continues by itself when its pull request merges.
 
 Added 2026-10-21. Claude Code Desktop notices a merge on GitHub and carries on
-within seconds; in OmniGent every session asked Reid to say "merged" first.
+within seconds; in OmniGent every session asked the owner to say "merged" first.
 This module closes that gap for every session on the server.
 
 What it watches: the pull requests attached to sessions, the same
@@ -75,7 +75,7 @@ from typing import Any, Literal
 import httpx
 from fastapi import APIRouter, FastAPI
 
-from ae_omni_policies import auth, github, prs, sessions
+from ae_omni_policies import auth, github, labels, prs, sessions
 from ae_omni_policies.continuation import MERGE_WATCH_PREFIX
 
 _logger = logging.getLogger(__name__)
@@ -85,7 +85,7 @@ STATE_FILE_ENV = "AE_MERGE_WATCH_FILE"
 DATA_DIR = Path("/data")
 DATA_FILE_NAME = "ae-merge-watch.json"
 
-#: Seconds between polls of the open pull requests (approved by Reid, 2026-10-21).
+#: Seconds between polls of the open pull requests (approved by the owner, 2026-10-21).
 POLL_INTERVAL_S = 10.0
 #: Seconds between reads of which pull requests the sessions track. Each read asks
 #: the session's runner or host, which looks the pull request up with ``gh``, so
@@ -756,7 +756,7 @@ async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str
     only means something when the server shares the host's filesystem. On 2026-10-28
     the server ran in a container that mounts only ``/data`` and ships an empty
     ``/home``, so every host workspace read as missing and four notes into live
-    sessions were dropped (/home/reid and /home/reid/worktrees/pass-2026-run). So the
+    sessions were dropped (/home/u and /home/u/worktrees/run). So the
     check is off in a container (the box's Docker deployment): the 4xx
     ``workspace_missing`` rule in :func:`post_live` is the guard there. It is also
     skipped for a path that is not absolute POSIX (``C:\\...``, relative). Anything
@@ -782,10 +782,46 @@ async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str
         return False
 
 
+#: Hops of ``ae.handoff_to`` a post follows, the same cap ``post_message`` has.
+HANDOFF_HOPS = 5
+
+
+def _handoff_target(session_id: str) -> str:
+    """The lead that took over *session_id* (``ae.handoff_to``), following up to five hops.
+
+    A session without the label, an unreadable one and a loop stop where they are. Lead handoff
+    (2026-10-29): a merge or child wake note for the old lead must reach the new one, not wake a
+    300k reference chat.
+    """
+    from omnigent.runtime import get_conversation_store
+
+    try:
+        store = get_conversation_store()
+    except Exception:  # noqa: BLE001 (no store: post to where we are)
+        return session_id
+    seen = {session_id}
+    current = session_id
+    for _ in range(HANDOFF_HOPS):
+        try:
+            conv = store.get_conversation(current)
+        except Exception:  # noqa: BLE001 (post to where we are)
+            break
+        target = labels.label(conv.labels if conv else None, labels.HANDOFF_TO)
+        if not target or target in seen:
+            break
+        seen.add(target)
+        current = target
+    return current
+
+
 async def post_live(
     app: FastAPI, identity: OwnerIdentity, session_id: str, text: str
 ) -> PostOutcome:
-    """``POST /v1/sessions/{id}/events`` with *text* as a user message, as the owner."""
+    """``POST /v1/sessions/{id}/events`` with *text* as a user message, as the owner.
+
+    A session that handed off to a new lead is not posted to: its ``ae.handoff_to`` is followed.
+    """
+    session_id = await asyncio.to_thread(_handoff_target, session_id)
     headers = await identity.headers(session_id)
     if headers is None:
         _logger.warning(

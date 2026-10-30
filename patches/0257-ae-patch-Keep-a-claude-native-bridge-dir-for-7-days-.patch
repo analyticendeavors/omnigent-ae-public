@@ -1,0 +1,700 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 20:08:22 -0700
+Subject: [PATCH 257/260] [ae-patch] Keep a claude-native bridge dir for 7 days
+ after its runner dies, so a relaunch can keep the transcript
+
+The host's startup orphan sweep removed the whole claude-native bridge dir, including
+the forwarder cursor and the frontier record, whenever a relaunch lagged the sweep by a
+few seconds. The relaunch then found no cursor and rebuilt the transcript.
+
+The sweep now keeps a dead-owner dir until owner.pid and whichever of
+transcript_forwarder.json and ae_transcript_frontier.json exist are all older than 7
+days (the window codex-native uses). A kept dir loses only the runtime files: the six a
+re-prep unlinks (server.json, state.json, hooks.jsonl, observer_hook.stderr,
+tool_relay.json, tmux.json) plus tool_relay.env, which holds a token. A cold launch logs
+which of the cursor and the record exist, as booleans, sizes and times.
+
+Archiving a session now asks its runner to clean up the session's resources before the
+host runner is stopped, so an archived chat's bridge dir and attachment cache go at once
+instead of waiting out the window.
+---
+ .../claude_native/ae_bridge_retention.py      |  62 +++++
+ .../harnesses/claude_native/ae_resume_keep.py |  27 +-
+ omnigent/harnesses/claude_native/bridge.py    |  24 +-
+ omnigent/native/native_bridge_common.py       |   8 +
+ omnigent/runner/native/orchestration.py       |   4 +-
+ .../routes/_sessions/ae_archive_cleanup.py    |  42 +++
+ .../server/routes/_sessions/orchestration.py  |   4 +-
+ .../claude_native/test_ae_bridge_retention.py | 263 ++++++++++++++++++
+ .../test_claude_native_bridge.py              |   6 +
+ .../test_claude_native_lifecycle.py           |   3 +
+ .../test_ae_archive_bridge_cleanup.py         |  73 +++++
+ 11 files changed, 511 insertions(+), 5 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_bridge_retention.py
+ create mode 100644 omnigent/server/routes/_sessions/ae_archive_cleanup.py
+ create mode 100644 tests/harnesses/claude_native/test_ae_bridge_retention.py
+ create mode 100644 tests/server/integration/test_ae_archive_bridge_cleanup.py
+
+diff --git a/omnigent/harnesses/claude_native/ae_bridge_retention.py b/omnigent/harnesses/claude_native/ae_bridge_retention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..99da0ef1a888885e3eeb88e096f67cb424c6cd40
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_bridge_retention.py
+@@ -0,0 +1,62 @@
++"""Retention for dead-owner claude-native bridge dirs.
++
++A host restart kills every runner at once, and the runner that relaunches a chat can lag
++the host's startup orphan sweep by seconds. The sweep used to remove the whole bridge dir,
++so the forwarder cursor and the frontier record a cold relaunch keeps the transcript from
++were gone before the relaunch looked. This keeps a dead-owner dir for seven days after its
++last activity, the same window codex-native uses, and drops only the runtime files a
++re-prep would drop anyway.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import time
++from collections.abc import Iterable
++from pathlib import Path
++
++from omnigent.native import native_bridge_common
++
++ORPHAN_RETENTION_SECONDS = 7 * 24 * 60 * 60
++
++
++def retention_expired(bridge_dir: Path) -> bool:
++    """
++    Return whether a dead-owner claude-native bridge dir has been idle for 7 days.
++
++    Idle means the ``owner.pid`` marker and whichever of the forwarder cursor and the
++    frontier record exist are all older than the window. A missing cursor or record does
++    not hold the dir, and a stat error keeps it.
++
++    :param bridge_dir: Bridge dir whose owner is already known to be dead.
++    :returns: ``True`` when the dir may be removed.
++    """
++    from omnigent.harnesses.claude_native.ae_resume_keep import FRONTIER_FILE
++    from omnigent.harnesses.claude_native.forwarder import _FORWARDER_STATE_FILE
++
++    cutoff = time.time() - ORPHAN_RETENTION_SECONDS
++    for name in (native_bridge_common.OWNER_PID_FILENAME, _FORWARDER_STATE_FILE, FRONTIER_FILE):
++        try:
++            if (bridge_dir / name).stat().st_mtime > cutoff:
++                return False
++        except FileNotFoundError:
++            if name == native_bridge_common.OWNER_PID_FILENAME:
++                return False
++        except OSError:
++            return False
++    return True
++
++
++def drop_runtime_files(bridge_dir: Path, filenames: Iterable[str]) -> None:
++    """
++    Unlink the per-launch runtime files from a bridge dir the sweep is keeping.
++
++    A pane that outlived the host restart must not read a stale server URL before the
++    relaunch re-prepares the dir.
++
++    :param bridge_dir: Kept bridge dir.
++    :param filenames: Runtime files to remove, e.g. ``("server.json", "tmux.json")``.
++    """
++    for name in filenames:
++        with contextlib.suppress(OSError):
++            (bridge_dir / name).unlink()
+diff --git a/omnigent/harnesses/claude_native/ae_resume_keep.py b/omnigent/harnesses/claude_native/ae_resume_keep.py
+index 8e0589b4898e1e61f568822bb41ba4c35f649d4d..6fa0034be9ecab0b26469a5cc12fadc76d49a013 100644
+--- a/omnigent/harnesses/claude_native/ae_resume_keep.py
++++ b/omnigent/harnesses/claude_native/ae_resume_keep.py
+@@ -244,7 +244,28 @@ def write_frontier(bridge_dir: Path, frontier: Frontier) -> None:
+     )
+ 
+ 
+-def read_context(bridge_dir: Path, *, forwarder_stopped: bool = True) -> ResumeContext:
++def _log_cold_launch_files(bridge_dir: Path, session_id: str) -> None:
++    """Log which of the cursor and the frontier record exist: booleans, sizes and times only."""
++    from omnigent.harnesses.claude_native.forwarder import _FORWARDER_STATE_FILE
++
++    parts = []
++    for label, name in (("cursor", _FORWARDER_STATE_FILE), ("frontier", FRONTIER_FILE)):
++        try:
++            info = (bridge_dir / name).stat()
++            parts.append(f"{label}=present size={info.st_size} mtime={int(info.st_mtime)}")
++        except OSError:
++            parts.append(f"{label}=absent")
++    _logger.info(
++        "claude-native: cold launch for %s: %s",
++        session_id,
++        ", ".join(parts),
++        extra={"session_id": session_id},
++    )
++
++
++def read_context(
++    bridge_dir: Path, *, forwarder_stopped: bool = True, session_id: str | None = None
++) -> ResumeContext:
+     """
+     Read the old forwarder's final cursor and frontier for a cold relaunch.
+ 
+@@ -256,9 +277,13 @@ def read_context(bridge_dir: Path, *, forwarder_stopped: bool = True) -> ResumeC
+     :param forwarder_stopped: ``False`` when the old forwarder may still be running; the
+         context then carries no cursor and the launch rebuilds. The frontier record is
+         deleted either way.
++    :param session_id: Conversation id, e.g. ``"conv_abc123"``; when given, one INFO line
++        records which of the cursor and the frontier record exist before they are read.
+     :returns: The context for this launch.
+     """
+     ctx = ResumeContext(bridge_dir=bridge_dir)
++    if session_id is not None:
++        _log_cold_launch_files(bridge_dir, session_id)
+     if forwarder_stopped:
+         ctx.cursor = read_forward_cursor(bridge_dir)
+         ctx.frontier = read_frontier(bridge_dir)
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 1c11b3213da6d4730e2e489eae463792475e1d51..8c878b6a75342a7d58292b504ef058bd8581461a 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -68,6 +68,7 @@ from filelock import FileLock
+ from filelock import Timeout as FileLockTimeout
+ 
+ from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
++from omnigent.harnesses.claude_native import ae_bridge_retention
+ from omnigent.harnesses.claude_native import delivery_diagnostics
+ from omnigent.harnesses.claude_native import transcript_filters
+ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+@@ -1797,7 +1798,11 @@ def prepare_bridge_dir(
+ 
+ def prune_orphaned_bridge_dirs() -> int:
+     """
+-    Remove claude-native bridge dirs whose owner process is provably dead.
++    Remove claude-native bridge dirs whose owner is dead and that sat idle for 7 days.
++
++    A dir inside the window keeps its forwarder cursor and frontier record, so a relaunch
++    after a host restart can keep the transcript, and loses only the runtime files re-prep
++    would unlink, plus ``tool_relay.env`` (``ae_bridge_retention``).
+ 
+     Delegates to the shared sweep against this harness's bridge root; the
+     global maintenance calls it (via ``native_bridge_common.reap_orphaned_native_bridge_dirs``)
+@@ -1806,7 +1811,22 @@ def prune_orphaned_bridge_dirs() -> int:
+ 
+     :returns: The number of orphaned bridge dirs removed.
+     """
+-    return native_bridge_common.prune_orphaned_dirs(_BRIDGE_ROOT)
++    return native_bridge_common.prune_orphaned_dirs(
++        _BRIDGE_ROOT,
++        should_prune=ae_bridge_retention.retention_expired,
++        on_keep=functools.partial(
++            ae_bridge_retention.drop_runtime_files,
++            filenames=(
++                _SERVER_FILE,
++                _STATE_FILE,
++                _HOOKS_FILE,
++                OBSERVER_HOOK_STDERR_FILE,
++                _TOOL_RELAY_FILE,
++                _TOOL_RELAY_ENV_FILE,
++                _TMUX_FILE,
++            ),
++        ),
++    )
+ 
+ 
+ def claude_global_config_path(
+diff --git a/omnigent/native/native_bridge_common.py b/omnigent/native/native_bridge_common.py
+index 744c45685c8feb207229eed04b9c573b4a459f0f..e68854a7cdead11a2def002aa3c1c14e92dcad64 100644
+--- a/omnigent/native/native_bridge_common.py
++++ b/omnigent/native/native_bridge_common.py
+@@ -89,6 +89,7 @@ def prune_orphaned_dirs(
+     bridge_root: Path,
+     *,
+     should_prune: Callable[[Path], bool] | None = None,
++    on_keep: Callable[[Path], None] | None = None,
+ ) -> int:
+     """
+     Remove per-session bridge dirs under *bridge_root* whose owner is dead.
+@@ -115,6 +116,8 @@ def prune_orphaned_dirs(
+     :param should_prune: Optional harness-specific eligibility predicate called
+         only after the owner is proven dead. ``None`` removes every dead-owner
+         directory.
++    :param on_keep: Optional hook called, under the cleanup lock, for a dead-owner
++        directory *should_prune* decided to keep.
+     :returns: The number of orphaned bridge dirs removed.
+     """
+     if not bridge_root.exists():
+@@ -143,6 +146,11 @@ def prune_orphaned_dirs(
+                     _logger.exception("Error checking orphaned bridge dir %s", entry)
+                     continue
+                 if not eligible:
++                    if on_keep is not None:
++                        try:
++                            on_keep(entry)
++                        except Exception:
++                            _logger.exception("Error keeping orphaned bridge dir %s", entry)
+                     continue
+             try:
+                 confirmed_pid = int(marker.read_text(encoding="utf-8").strip())
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 6675e097f6b116d4e9470e15527bc3f302e530e8..212214739fcf8bbf71fff06efa5915f2caac7b87 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -8437,7 +8437,9 @@ async def _auto_create_claude_terminal(
+     # before the reset below wipes them, so a keep sees what it wrote while cancelling.
+     from omnigent.harnesses.claude_native import ae_resume_keep
+ 
+-    _ae_resume = ae_resume_keep.read_context(bridge_dir, forwarder_stopped=_ae_forwarder_stopped)
++    _ae_resume = ae_resume_keep.read_context(
++        bridge_dir, forwarder_stopped=_ae_forwarder_stopped, session_id=session_id
++    )
+     reset_transcript_forward_state(bridge_dir)
+     _logger.info(
+         "Claude terminal bridge prepared: session=%s",
+diff --git a/omnigent/server/routes/_sessions/ae_archive_cleanup.py b/omnigent/server/routes/_sessions/ae_archive_cleanup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..b133585ead304939516241c2b8b0e5bb88d6906c
+--- /dev/null
++++ b/omnigent/server/routes/_sessions/ae_archive_cleanup.py
+@@ -0,0 +1,42 @@
++"""Ask the runner to clean up an archived session's resources.
++
++Archive stops the pane and the host runner but never told the runner to delete the
++session's native bridge dir, attachment cache and bridge token. That did not matter while
++the host's next startup sweep removed every dead-owner dir; the sweep now keeps one for 7
++days (``claude_native.ae_bridge_retention``), so archive asks for the cleanup itself,
++while the runner is still reachable.
++"""
++
++from __future__ import annotations
++
++import logging
++
++_logger = logging.getLogger(__name__)
++
++_CLEANUP_TIMEOUT_S = 15.0
++
++
++async def request_runner_resource_cleanup(session_id: str) -> None:
++    """
++    Best-effort ``DELETE /v1/sessions/{id}/resources`` on the runner that holds *session_id*.
++
++    An offline, unbound or wedged runner is skipped; the session is archived either way.
++
++    :param session_id: Archived session id, e.g. ``"conv_abc123"``.
++    """
++    from omnigent.server.routes import sessions as _facade
++
++    try:
++        runner_client = await _facade._get_runner_client_for_resource_access(session_id)
++        if runner_client is None:
++            return
++        await runner_client.delete(
++            f"/v1/sessions/{session_id}/resources", timeout=_CLEANUP_TIMEOUT_S
++        )
++    except Exception:  # noqa: BLE001 - archive must not fail on a wedged runner
++        _logger.debug(
++            "Archive resource cleanup failed for %s",
++            session_id,
++            exc_info=True,
++            extra={"session_id": session_id},
++        )
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index af6c677e32c74f0b629af9fc94e08daf21d8f7f0..e0a08db02192b21fdf4fc9bfafa30ec62cd39e7f 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -169,7 +169,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_agent,
+     validate_session_model_metadata,
+ )
+-from omnigent.server.routes._sessions import ae_session_suggestion
++from omnigent.server.routes._sessions import ae_archive_cleanup, ae_session_suggestion
+ from omnigent.server.routes._sessions.ae_session_activity import (
+     session_active_child_count,
+     session_background_task_count,
+@@ -958,6 +958,8 @@ async def _archive_stop(
+     _pending_archive_stops.pop(session_id, None)
+ 
+     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
++    # The runner deletes the session's bridge dir while it is still reachable.
++    await ae_archive_cleanup.request_runner_resource_cleanup(session_id)
+     if conv.host_id and conv.runner_id:
+         try:
+             await _stop_host_runner_intentionally(
+diff --git a/tests/harnesses/claude_native/test_ae_bridge_retention.py b/tests/harnesses/claude_native/test_ae_bridge_retention.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..38648b2e73f66b04ace87b789723480d232ebb18
+--- /dev/null
++++ b/tests/harnesses/claude_native/test_ae_bridge_retention.py
+@@ -0,0 +1,263 @@
++"""A host restart's orphan sweep keeps a claude-native bridge dir for 7 days."""
++
++from __future__ import annotations
++
++import logging
++import os
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++import pytest
++
++from omnigent.harnesses.claude_native import ae_bridge_retention as retention
++from omnigent.harnesses.claude_native import ae_resume_keep as keep
++from omnigent.harnesses.claude_native import bridge, forwarder
++from omnigent.native import native_bridge_common
++from tests.runner.helpers import NullServerClient
++
++CONV = "conv_x"
++DAY = 24 * 60 * 60
++RUNTIME_FILES = (
++    "server.json",
++    "state.json",
++    "hooks.jsonl",
++    "observer_hook.stderr",
++    "tool_relay.json",
++    "tool_relay.env",
++    "tmux.json",
++)
++
++
++@pytest.fixture(autouse=True)
++def _bridge_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
++    root = tmp_path / "claude-native"
++    root.mkdir(mode=0o700)
++    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
++    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", root / "approval-waits")
++    return root
++
++
++def _dead_pid() -> int:
++    proc = subprocess.Popen([sys.executable, "-c", "pass"])
++    proc.wait()
++    return proc.pid
++
++
++def _prepared(tmp_path: Path, *, with_files: bool = True) -> Path:
++    """Prepare the dir for CONV, write the cursor and the record, and orphan it."""
++    bridge_dir = bridge.prepare_bridge_dir(CONV, workspace=tmp_path)
++    if with_files:
++        forwarder._write_forward_state(
++            bridge_dir,
++            forwarder.TranscriptForwardState(
++                transcript_path=tmp_path / "t.jsonl",
++                line_cursor=3,
++                byte_offset=120,
++                cursor_fingerprint="fp",
++            ),
++        )
++        keep.write_frontier(
++            bridge_dir, keep.Frontier(tmp_path / "t.jsonl", 120, "fp", 2, "item_2")
++        )
++    (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(str(_dead_pid()))
++    return bridge_dir
++
++
++def _age(bridge_dir: Path, days: float, *names: str) -> None:
++    when = time.time() - days * DAY
++    for name in names or (
++        native_bridge_common.OWNER_PID_FILENAME,
++        forwarder._FORWARDER_STATE_FILE,
++        keep.FRONTIER_FILE,
++    ):
++        if (bridge_dir / name).exists():
++            os.utime(bridge_dir / name, (when, when))
++
++
++def test_relaunch_after_the_sweep_still_has_the_cursor_and_the_record(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++    assert bridge.prepare_bridge_dir(CONV, workspace=tmp_path) == bridge_dir
++
++    ctx = keep.read_context(bridge.bridge_dir_for_conversation_id(CONV))
++    assert ctx.cursor is not None
++    assert ctx.frontier is not None
++    assert ctx.frontier.last_item_id == "item_2"
++
++
++def test_dir_idle_past_seven_days_is_pruned(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    _age(bridge_dir, 8)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 1
++    assert not bridge_dir.exists()
++
++
++def test_recent_cursor_holds_a_dir_whose_marker_is_old(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    _age(bridge_dir, 8, native_bridge_common.OWNER_PID_FILENAME, keep.FRONTIER_FILE)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++
++
++def test_recent_record_holds_a_dir_whose_marker_is_old(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    _age(bridge_dir, 8, native_bridge_common.OWNER_PID_FILENAME, forwarder._FORWARDER_STATE_FILE)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++
++
++@pytest.mark.parametrize("missing", [forwarder._FORWARDER_STATE_FILE, keep.FRONTIER_FILE])
++def test_a_missing_cursor_or_record_counts_as_expired(tmp_path: Path, missing: str) -> None:
++    bridge_dir = _prepared(tmp_path)
++    (bridge_dir / missing).unlink()
++    _age(bridge_dir, 8)
++
++    assert retention.retention_expired(bridge_dir) is True
++    assert bridge.prune_orphaned_bridge_dirs() == 1
++
++
++def test_a_recent_marker_alone_holds_a_dir_with_no_cursor_or_record(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path, with_files=False)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++    assert bridge_dir.exists()
++
++
++def _stamp(bridge_dir: Path, mtime: float) -> None:
++    for name in (
++        native_bridge_common.OWNER_PID_FILENAME,
++        forwarder._FORWARDER_STATE_FILE,
++        keep.FRONTIER_FILE,
++    ):
++        os.utime(bridge_dir / name, (mtime, mtime))
++
++
++def test_exactly_seven_days_old_is_expired_and_a_second_younger_is_not(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    now = 2_000_000_000.0
++    monkeypatch.setattr(retention.time, "time", lambda: now)
++    bridge_dir = _prepared(tmp_path)
++
++    _stamp(bridge_dir, now - 7 * DAY)
++    assert retention.retention_expired(bridge_dir) is True
++
++    _stamp(bridge_dir, now - 7 * DAY + 1)
++    assert retention.retention_expired(bridge_dir) is False
++
++
++def test_a_future_mtime_keeps_the_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    now = 2_000_000_000.0
++    monkeypatch.setattr(retention.time, "time", lambda: now)
++    bridge_dir = _prepared(tmp_path)
++
++    _stamp(bridge_dir, now + 3600)
++
++    assert retention.retention_expired(bridge_dir) is False
++
++
++def test_a_stat_error_keeps_the_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
++    bridge_dir = _prepared(tmp_path)
++    _age(bridge_dir, 8)
++    real_stat = Path.stat
++
++    def _stat(self: Path, *args: object, **kwargs: object) -> os.stat_result:
++        if self.name == keep.FRONTIER_FILE:
++            raise PermissionError(13, "denied")
++        return real_stat(self, *args, **kwargs)
++
++    monkeypatch.setattr(Path, "stat", _stat)
++
++    assert retention.retention_expired(bridge_dir) is False
++
++
++def test_a_dir_with_no_owner_marker_is_untouched(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).unlink()
++    _age(bridge_dir, 30)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++    assert bridge_dir.exists()
++
++
++def test_a_live_owner_is_never_pruned_past_the_window(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(str(os.getpid()))
++    _age(bridge_dir, 30)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++    assert bridge_dir.exists()
++
++
++def test_a_reused_pid_reads_alive_so_the_dir_is_kept(tmp_path: Path) -> None:
++    """Existing behaviour: a pid another process now holds is indistinguishable from the owner."""
++    bridge_dir = _prepared(tmp_path)
++    (bridge_dir / native_bridge_common.OWNER_PID_FILENAME).write_text(str(os.getppid()))
++    _age(bridge_dir, 30)
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++
++
++def test_the_keep_path_unlinks_exactly_the_runtime_files(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    for name in RUNTIME_FILES:
++        (bridge_dir / name).write_text("{}")
++    (bridge_dir / "permission_hook.json").write_text("{}")
++    before = {p.name for p in bridge_dir.iterdir()}
++    assert set(RUNTIME_FILES) == {
++        bridge._SERVER_FILE,
++        bridge._STATE_FILE,
++        bridge._HOOKS_FILE,
++        bridge.OBSERVER_HOOK_STDERR_FILE,
++        bridge._TOOL_RELAY_FILE,
++        bridge._TOOL_RELAY_ENV_FILE,
++        bridge._TMUX_FILE,
++    }
++
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++
++    assert before - {p.name for p in bridge_dir.iterdir()} == set(RUNTIME_FILES)
++    assert {p.name for p in bridge_dir.iterdir()} - before == set()
++
++
++def test_the_sweep_skips_a_dir_whose_cleanup_lock_is_held(tmp_path: Path) -> None:
++    bridge_dir = _prepared(tmp_path)
++    _age(bridge_dir, 8)
++
++    with bridge.native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
++        assert bridge.prune_orphaned_bridge_dirs() == 0
++    assert bridge_dir.exists()
++    assert bridge.prune_orphaned_bridge_dirs() == 1
++
++
++async def test_an_explicit_delete_removes_a_kept_dir_at_once(tmp_path: Path) -> None:
++    from omnigent.runner.native.orchestration import _delete_native_bridge_dirs
++
++    bridge_dir = _prepared(tmp_path)
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++
++    await _delete_native_bridge_dirs(server_client=NullServerClient(), session_id=CONV)  # type: ignore[arg-type]
++
++    assert not bridge_dir.exists()
++
++
++def test_the_cold_launch_line_carries_booleans_sizes_and_times_only(
++    tmp_path: Path, caplog: pytest.LogCaptureFixture
++) -> None:
++    bridge_dir = _prepared(tmp_path)
++    (bridge_dir / keep.FRONTIER_FILE).unlink()
++
++    with caplog.at_level(logging.INFO, logger=keep.__name__):
++        keep.read_context(bridge_dir, session_id=CONV)
++
++    lines = [r.getMessage() for r in caplog.records if "cold launch" in r.getMessage()]
++    assert len(lines) == 1
++    assert lines[0].startswith(f"claude-native: cold launch for {CONV}: cursor=present size=")
++    assert "frontier=absent" in lines[0]
++    assert str(tmp_path) not in lines[0]
++    assert "t.jsonl" not in lines[0]
++    assert "fp" not in lines[0].split("cursor=")[1].replace("present", "").replace("mtime", "")
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 436eae38902e62d750d1f971cedea40670ee14d5..5fa31979b11b4c858ebaeeef3c92b2ac3261df85 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -12291,6 +12291,12 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
+     unmarked_dir = root / "unmarked"
+     unmarked_dir.mkdir()
+ 
++    # A dead owner inside the 7-day window is kept; past it the dir goes.
++    assert prune_orphaned_bridge_dirs() == 0
++    assert dead_dir.exists()
++    eight_days_ago = time.time() - 8 * 24 * 60 * 60
++    os.utime(dead_dir / "owner.pid", (eight_days_ago, eight_days_ago))
++
+     pruned = prune_orphaned_bridge_dirs()
+ 
+     assert pruned == 1
+diff --git a/tests/harnesses/claude_native/test_claude_native_lifecycle.py b/tests/harnesses/claude_native/test_claude_native_lifecycle.py
+index da51498cd982072b3ea174866cf3c4e3bef3d5c0..493c2a60f73269d7aa3f9228b4d4eac75560025c 100644
+--- a/tests/harnesses/claude_native/test_claude_native_lifecycle.py
++++ b/tests/harnesses/claude_native/test_claude_native_lifecycle.py
+@@ -436,6 +436,9 @@ def test_prepare_bridge_dir_preserves_launch_evidence_until_bridge_cleanup(
+     assert bridge.prune_orphaned_bridge_dirs() == 0
+ 
+     monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
++    assert bridge.prune_orphaned_bridge_dirs() == 0
++    eight_days_ago = time.time() - 8 * 24 * 60 * 60
++    os.utime(directory / "owner.pid", (eight_days_ago, eight_days_ago))
+     assert bridge.prune_orphaned_bridge_dirs() == 1
+     assert not directory.exists()
+     assert _read(launch)["read_status"] == "not_found"
+diff --git a/tests/server/integration/test_ae_archive_bridge_cleanup.py b/tests/server/integration/test_ae_archive_bridge_cleanup.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7b8a74e2aa2d586de451295858199b3708dc2238
+--- /dev/null
++++ b/tests/server/integration/test_ae_archive_bridge_cleanup.py
+@@ -0,0 +1,73 @@
++"""Archiving a session deletes its claude-native bridge dir at once, not after 7 days."""
++
++from __future__ import annotations
++
++from pathlib import Path
++from unittest.mock import patch
++
++import httpx
++import pytest
++
++from omnigent.harnesses.claude_native import bridge
++from omnigent.inner.native_attachments import attachment_cache_dir
++from omnigent.runner import create_runner_app
++from omnigent.server.routes import sessions as _sessions_facade
++from tests.runner.helpers import NullServerClient
++from tests.server.helpers import create_test_session
++from tests.server.integration.test_sessions_archive import _drain_detached_stops
++
++pytestmark = pytest.mark.asyncio
++
++
++@pytest.fixture(autouse=True)
++def _no_archive_stop_grace() -> object:
++    with patch.object(_sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
++        yield
++
++
++async def test_archive_through_the_server_deletes_the_runners_bridge_dir(
++    client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    root = tmp_path / "claude-native"
++    root.mkdir(mode=0o700)
++    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
++    monkeypatch.setattr(bridge, "_APPROVAL_WAIT_ROOT", root / "approval-waits")
++
++    session = await create_test_session(client, name="archive-bridge-cleanup")
++    session_id = session["id"]
++    bridge_dir = bridge.prepare_bridge_dir(session_id, workspace=tmp_path)
++    cache_dir = attachment_cache_dir(bridge_dir)
++    cache_dir.mkdir(parents=True)
++    assert (bridge_dir / "bridge.json").exists()
++
++    runner_app = create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
++    transport = httpx.ASGITransport(app=runner_app)
++    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner_client:
++
++        async def _runner_for(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
++            return runner_client
++
++        with patch.object(_sessions_facade, "_get_runner_client_for_resource_access", _runner_for):
++            resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
++            await _drain_detached_stops()
++
++    assert resp.status_code == 200
++    assert not bridge_dir.exists()
++    assert not cache_dir.exists()
++
++
++async def test_archive_still_completes_when_the_runner_cleanup_fails(
++    client: httpx.AsyncClient,
++) -> None:
++    session = await create_test_session(client, name="archive-cleanup-fails")
++    session_id = session["id"]
++
++    async def _boom(*_args: object, **_kwargs: object) -> httpx.AsyncClient:
++        raise ConnectionError("runner offline")
++
++    with patch.object(_sessions_facade, "_get_runner_client_for_resource_access", _boom):
++        resp = await client.patch(f"/v1/sessions/{session_id}", json={"archived": True})
++        await _drain_detached_stops()
++
++    assert resp.status_code == 200
++    assert resp.json()["archived"] is True

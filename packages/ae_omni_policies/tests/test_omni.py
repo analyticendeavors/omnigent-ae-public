@@ -56,7 +56,7 @@ def write_logins(directory: Path, logins: dict[str, str]) -> None:
     """``auth_tokens.json`` in upstream's shape: server URL to a session record."""
     directory.mkdir(parents=True, exist_ok=True)
     data = {
-        url: {"token": tok, "user_id": "reid", "expires_at": FAR_FUTURE}
+        url: {"token": tok, "user_id": "owner", "expires_at": FAR_FUTURE}
         for url, tok in logins.items()
     }
     (directory / "auth_tokens.json").write_text(json.dumps(data), encoding="utf-8")

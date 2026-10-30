@@ -418,3 +418,13 @@ async def test_seed_files_rows_made_before_the_default_project_existed(
     assert [row["changed"] for row in result] == [["project_id"], ["project_id"]]
     rows = await _listed(client)
     assert {rows[s.name]["project_id"] for s in schedules.SCHEDULES} == {notes.id}
+
+
+def test_checkin_prompt_is_the_text_the_server_relays_directly() -> None:
+    from omnigent.server.scheduled.checkin_relay import CHECKIN_TEXT, parse_checkin
+
+    plain = schedules.checkin_prompt("conv_orch", None)
+    assert parse_checkin(plain) == ("conv_orch", CHECKIN_TEXT)
+    noted = schedules.checkin_prompt("conv_orch", " PASS 2026\n deck ")
+    assert parse_checkin(noted) == ("conv_orch", f"{CHECKIN_TEXT} Focus: PASS 2026 deck")
+    assert parse_checkin(schedules.checkin_prompt(None, "x")) is None

@@ -8,7 +8,7 @@
 // 2026-09-23; a stale button after the gate was answered elsewhere shows the
 // 409 text.
 //
-// Labels (2026-09-27): the buttons read "A", "B", "C" and "Close" until Reid
+// Labels (2026-09-27): the buttons read "A", "B", "C" and "Close" until the owner
 // asked for each to say what it does, so they now read as plain actions. Only
 // the visible label changed: the route, and so the letter posted, is the same,
 // and the tooltip names the letter so it still matches the gate's RECOMMEND

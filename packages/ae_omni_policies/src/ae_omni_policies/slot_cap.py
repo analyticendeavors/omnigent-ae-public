@@ -37,7 +37,7 @@ Decisions this encodes (2026-09-23):
   :mod:`ae_omni_policies.continuation`, 2026-10-21) passes without a count
   and without claiming a slot: it is not a new task.
 - A member of a family (a session with an ``ae.orch`` parent) is never held or
-  dropped (2026-10-24, Reid: the parent is the single session, driving the rest).
+  dropped (2026-10-24, the owner: the parent is the single session, driving the rest).
   It is claimed like any first prompt so it shows as working, whether or not its
   lead is working, and past ``family_children`` busy members it carries
   ``ae.overflow=1`` instead of asking. ``family_children_working`` counts busy
@@ -156,7 +156,7 @@ def reserve(
     :param key: Any string that is not a conversation id, unique per create.
     :param rows: Top-level sessions (:func:`sessions.list_top_level`).
     :param limit: The slot limit.
-    :param riding: Reid chose to run one more past the limit.
+    :param riding: the owner chose to run one more past the limit.
     :param family: The family the new session joins (:func:`sessions.family_key` of
         the session starting it). One that already holds a slot gives it no new one.
     :param family_cap: Children that family may have working at once, counting
@@ -214,6 +214,22 @@ def _claim(overflow: bool = False) -> dict[str, str]:
     return writes
 
 
+TITLE_MAX = 48
+
+
+def _short(title: str) -> str:
+    """*title* cut to :data:`TITLE_MAX` characters, so one long chat name cannot wrap the card."""
+    return title if len(title) <= TITLE_MAX else title[: TITLE_MAX - 3].rstrip() + "..."
+
+
+def _ordinal(number: int) -> str:
+    """``4`` as ``4th``, ``11`` as ``11th``, ``22`` as ``22nd``."""
+    if 10 <= number % 100 <= 20:
+        return f"{number}th"
+    suffix = {1: "st", 2: "nd", 3: "rd"}.get(number % 10, "th")
+    return f"{number}{suffix}"
+
+
 def reason_text(
     working: list[sessions.SessionSummary],
     limit: int,
@@ -221,6 +237,7 @@ def reason_text(
     lot_url: str | None,
     pending: int = 0,
     used: int | None = None,
+    others: int = 0,
 ) -> str:
     """The context a held or dropped prompt carries: who holds the slots and the way out.
 
@@ -230,15 +247,26 @@ def reason_text(
     :param lot_url: Optional link to the Parking Lot page.
     :param pending: Claims made a moment ago whose rows do not show them yet.
     :param used: Slots held, when that is not one per session: a family holds one.
+    :param others: Working sessions of other users, counted but not named.
     """
+    # The warn text is split back into parts by upstream/web/src/lib/aeSlotsFull.ts (the
+    # approval card); keep its sentences and single-space joins, or change both together.
     held = len(working) if used is None else used
     taken = held + pending
-    # "4 of 4 working" read as if the held session were the 4th (2026-10-24, Reid):
+    # "4 of 4 working" read as if the held session were the 4th (2026-10-24, the owner):
     # name the count it would make, so the card plainly asks only past the limit.
-    lines = [f"Slots full: {taken} of {limit} taken; this one would make {taken + 1} of {limit}."]
+    if mode == "block":
+        lines = [
+            f"Slots full: {taken} of {limit} taken; this one would make {taken + 1} of {limit}."
+        ]
+    else:
+        # The owner, 2026-10-29: the card opens with the question, so it reads as a decision.
+        lines = [f"Slots full: {taken} of {limit} taken. Run this as the {_ordinal(taken + 1)}?"]
     for index, item in enumerate(working, start=1):
         detail = f"next: {item.next}" if item.next else f"elapsed {item.elapsed}"
-        lines.append(f"{index}. {item.title} ({detail})")
+        lines.append(f"{index}. {_short(item.title)} ({detail})")
+    if others:
+        lines.append(f"Plus {others} of another user's.")
     if pending:
         lines.append(f"{pending} more claimed a slot a moment ago.")
     lot = f"Park one in the Parking Lot ({lot_url})" if lot_url else "Park one in the Parking Lot"
@@ -248,8 +276,11 @@ def reason_text(
             f'"{RIDE_UNPARKED}" to run one more.'
         )
     else:
+        oldest = [_short(item.title) for item in working[:2]]
+        if oldest:
+            lines.append(f"To park one instead, the longest running: {' or '.join(oldest)}.")
         lines.append(
-            "Accept to run one more (marked overflow), or decline, then "
+            "Accept to run it as overflow, or decline, then "
             f"{lot[0].lower()}{lot[1:]} or flip one to review."
         )
     return " ".join(lines)
@@ -365,7 +396,7 @@ def slot_cap(
             pending_count = claims
 
         reason = reason_text(
-            [sessions.summarize(item, now=now) for item in working],
+            [sessions.summarize(item, now=now) for item in working if item.id in held],
             limit,
             mode,
             lot_url,

@@ -6,7 +6,8 @@
 #   deploy/pull-secrets.sh          # fetch and (re)write both files
 #   deploy/pull-secrets.sh --check  # report which keys each file holds, no values
 #
-# Writes, 640 root:reid, atomically (a temp file in the same directory, then
+# Writes, 640 root:<group> (AE_ENV_GROUP; default: the invoking user's primary
+# group, $(id -gn)), atomically (a temp file in the same directory, then
 # mv), so a reader never sees a half-written file and a failed run leaves the
 # previous one in place:
 #
@@ -21,7 +22,7 @@
 # the .example files), never here. The OIDC pair (2026-10-14,
 # deploy/README.md, "Adding an OIDC provider"): rotating the cookie key voids every login grant.
 #
-# Run it as reid, where `az login` lives: the fetch happens unprivileged, in a
+# Run it as the deploy user, where `az login` lives: the fetch happens unprivileged, in a
 # private temp directory, and only the placement into /secure/env goes through
 # sudo (install, then mv). Root never runs `az`; secrets never pass through
 # argv or the log. The box has no `az` of its own (secure-volume/README.md):
@@ -103,7 +104,7 @@ ENV_DIR="${AE_SECURE_ENV_DIR:-/secure/env}"
 SERVER_ENV="$ENV_DIR/omnigent-ae.env"
 HOST_ENV="$ENV_DIR/omnigent-host.env"
 OWNER="${AE_ENV_OWNER:-root}"
-GROUP="${AE_ENV_GROUP:-reid}"
+GROUP="${AE_ENV_GROUP:-$(id -gn)}"
 MODE=640
 
 # The OIDC pair is required: leaving it out on a vault error would fail the
@@ -232,6 +233,9 @@ main() {
   command -v az >/dev/null 2>&1 || die "az is not on PATH. Without sudo: uv tool install azure-cli; then az login --use-device-code."
   az account show >/dev/null 2>&1 || die "az is not logged in. Run: az login --use-device-code (a browser on any device finishes it), then rerun."
   [ -d "$ENV_DIR" ] || die "$ENV_DIR does not exist. If /secure is not mounted, the TPM unlock failed: see home-server/secure-volume/README.md in agents-and-automation."
+  if [ -z "${AE_ENV_GROUP:-}" ] && [ "$(id -u)" -eq 0 ]; then
+    die "run this as the deploy user, not as root (it calls sudo itself), or set AE_ENV_GROUP"
+  fi
   getent group "$GROUP" >/dev/null || die "group '$GROUP' does not exist on this machine (AE_ENV_GROUP overrides it)"
 
   # Script-global on purpose: the EXIT trap runs after main returns, when a

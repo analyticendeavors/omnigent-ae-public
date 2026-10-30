@@ -17,8 +17,8 @@ import respx
 
 from ae_omni_policies import auth
 
-STEVE = {"X-Forwarded-Email": "steve@example.com"}
-REID = {"X-Forwarded-Email": "reid@example.com"}
+MEMBER = {"X-Forwarded-Email": "member@example.com"}
+OWNER = {"X-Forwarded-Email": "owner@example.com"}
 WAREHOUSE = "0123456789abcdef"
 SNAPSHOT = {
     "harness": "claude",
@@ -46,9 +46,9 @@ async def test_compute_relink_and_limits_writes_are_admin_only(
 ) -> None:
     with respx.mock(assert_all_called=False) as mock:
         mock.route().respond(500)
-        refused = await client.post(path, json=body, headers=STEVE)
+        refused = await client.post(path, json=body, headers=MEMBER)
         assert not mock.calls
-        admitted = await client.post(path, json=body, headers=REID)
+        admitted = await client.post(path, json=body, headers=OWNER)
     assert refused.status_code == 403, refused.text
     assert refused.json()["error"]["code"] == "admin_only"
     # Past the gate an admin meets whatever comes next (unconfigured here), never the gate.
@@ -56,15 +56,16 @@ async def test_compute_relink_and_limits_writes_are_admin_only(
 
 
 @pytest.mark.parametrize("path", ["/v1/ae/fabric", "/v1/ae/databricks", "/v1/ae/host"])
-async def test_the_compute_and_host_views_say_who_can_act(
+async def test_the_compute_and_host_views_are_for_admins(
     client: httpx.AsyncClient, ae_admins: set[str], path: str
 ) -> None:
-    # The page hides the action buttons on can_act false (2026-10-22); the reading stays.
-    member = await client.get(path, headers=STEVE)
-    admin = await client.get(path, headers=REID)
-    assert member.status_code == 200, member.text
+    # Subscriptions, spend and the box's sign-in state: an admin's reading (2026-10-28,
+    # it was a reading with can_act false for a member until then).
+    member = await client.get(path, headers=MEMBER)
+    admin = await client.get(path, headers=OWNER)
+    assert member.status_code == 403, member.text
+    assert member.json()["error"]["code"] == "admin_only"
     assert admin.status_code == 200, admin.text
-    assert member.json()["can_act"] is False
     assert admin.json()["can_act"] is True
 
 
@@ -87,25 +88,25 @@ async def test_a_credential_the_app_no_longer_accepts_is_a_401(
     client: httpx.AsyncClient, ae_admins: set[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     asked: list[str] = []
-    accepted = {"reid@example.com"}
+    accepted = {"owner@example.com"}
 
     async def check(_request: Any, user: str) -> bool:
         asked.append(user)
         return user in accepted
 
     monkeypatch.setattr(auth, "session_check", check)
-    revoked = await client.get("/v1/ae/sidebar", headers=STEVE)
-    again = await client.get("/v1/ae/sidebar", headers=STEVE)
+    revoked = await client.get("/v1/ae/sidebar", headers=MEMBER)
+    again = await client.get("/v1/ae/sidebar", headers=MEMBER)
     assert revoked.status_code == 401, revoked.text
     assert again.status_code == 401
     # A no is never cached: each request asks again.
-    assert asked == ["steve@example.com", "steve@example.com"]
+    assert asked == ["member@example.com", "member@example.com"]
 
-    first = await client.get("/v1/ae/sidebar", headers=REID)
-    second = await client.get("/v1/ae/sidebar", headers=REID)
+    first = await client.get("/v1/ae/sidebar", headers=OWNER)
+    second = await client.get("/v1/ae/sidebar", headers=OWNER)
     assert (first.status_code, second.status_code) == (200, 200), first.text
     # A yes is trusted for SESSION_CHECK_TTL_S, so the second request does not ask.
-    assert asked.count("reid@example.com") == 1
+    assert asked.count("owner@example.com") == 1
 
 
 async def test_a_yes_expires_after_the_ttl(
@@ -118,9 +119,9 @@ async def test_a_yes_expires_after_the_ttl(
 
     monkeypatch.setattr(auth, "session_check", check)
     monkeypatch.setattr(auth, "SESSION_CHECK_TTL_S", 0.0)
-    assert (await client.get("/v1/ae/sidebar", headers=REID)).status_code == 200
+    assert (await client.get("/v1/ae/sidebar", headers=OWNER)).status_code == 200
     # Account disabled since: the next request asks again and is refused.
-    assert (await client.get("/v1/ae/sidebar", headers=REID)).status_code == 401
+    assert (await client.get("/v1/ae/sidebar", headers=OWNER)).status_code == 401
 
 
 async def test_the_real_check_asks_the_apps_own_provider(
@@ -128,7 +129,7 @@ async def test_the_real_check_asks_the_apps_own_provider(
 ) -> None:
     # ae_permissions gives the app its own multi-user (header) provider.
     monkeypatch.setattr(auth, "session_check", auth._app_accepts)
-    response = await client.get("/v1/ae/sidebar", headers=STEVE)
+    response = await client.get("/v1/ae/sidebar", headers=MEMBER)
     assert response.status_code == 200, response.text
 
 
@@ -149,9 +150,9 @@ async def test_two_bearer_tokens_of_one_user_never_share_a_cached_yes(
         return request.headers.get("authorization") == "Bearer good"
 
     monkeypatch.setattr(auth, "session_check", check)
-    good = await client.get("/v1/ae/sidebar", headers={**REID, "Authorization": "Bearer good"})
+    good = await client.get("/v1/ae/sidebar", headers={**OWNER, "Authorization": "Bearer good"})
     revoked = await client.get(
-        "/v1/ae/sidebar", headers={**REID, "Authorization": "Bearer revoked"}
+        "/v1/ae/sidebar", headers={**OWNER, "Authorization": "Bearer revoked"}
     )
     assert good.status_code == 200, good.text
     assert revoked.status_code == 401, revoked.text
@@ -164,7 +165,7 @@ async def test_no_answer_from_the_app_is_a_503_not_a_sign_out(
         return None
 
     monkeypatch.setattr(auth, "session_check", check)
-    response = await client.get("/v1/ae/sidebar", headers=REID)
+    response = await client.get("/v1/ae/sidebar", headers=OWNER)
     assert response.status_code == 503, response.text
 
 

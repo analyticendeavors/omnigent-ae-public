@@ -1,0 +1,329 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 13:06:40 -0700
+Subject: [PATCH 232/260] [ae-patch] Post a scheduled orchestrator check-in
+ straight into its named session
+
+---
+ omnigent/server/app.py                       |   2 +
+ omnigent/server/scheduled/checkin_relay.py   | 108 ++++++++++++++
+ omnigent/server/scheduled/fire.py            |   7 +
+ tests/server/scheduled/test_checkin_relay.py | 142 +++++++++++++++++++
+ 4 files changed, 259 insertions(+)
+ create mode 100644 omnigent/server/scheduled/checkin_relay.py
+ create mode 100644 tests/server/scheduled/test_checkin_relay.py
+
+diff --git a/omnigent/server/app.py b/omnigent/server/app.py
+index 3675a7882c19feaca9ff4282b28c414f612c84ce..cf72d7cd7adebab3240f9c9e477571bd151fb4e5 100644
+--- a/omnigent/server/app.py
++++ b/omnigent/server/app.py
+@@ -1736,6 +1736,7 @@ def create_app(
+         # the run — all fire-and-forget so the timer re-arms immediately.
+         scheduled_task_scheduler: ScheduledTaskScheduler | None = None
+         if scheduled_task_store is not None:
++            from omnigent.server.scheduled.checkin_relay import build_session_poster
+             from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+ 
+             fire_deps = FireDeps(
+@@ -1758,6 +1759,7 @@ def create_app(
+                 managed_launches=app_inst.state.managed_launches,
+                 app_state=app_inst.state,
+                 project_store=project_store,
++                post_session_message=build_session_poster(app_inst, auth_provider),
+             )
+             on_fire = build_on_fire(fire_deps)
+             # The manual "run now" trigger reuses the same fire path (dispatch /
+diff --git a/omnigent/server/scheduled/checkin_relay.py b/omnigent/server/scheduled/checkin_relay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0d1b92fbbf03017dcd89a47185a02871aa77cd2b
+--- /dev/null
++++ b/omnigent/server/scheduled/checkin_relay.py
+@@ -0,0 +1,108 @@
++"""Post a scheduled orchestrator check-in straight into the session it names.
++
++The check-in prompt (written by the ``schedule_checkin`` tool) tells a fresh
++session to relay one message to an orchestrator session. When that prompt names
++a live session, the fire posts the message itself, as the owner's next user
++turn, and creates no session. Any other case returns False and the caller runs
++the ordinary fresh-session fire.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import re
++from collections.abc import Awaitable, Callable
++from typing import Any
++
++import httpx
++
++from omnigent.entities import ScheduledTask
++
++_logger = logging.getLogger(__name__)
++
++CHECKIN_TEXT = "Check-in: run your check-in now."
++_MINT_TTL_S = 300
++_POST_TIMEOUT_S = 30.0
++_PROMPT = re.compile(
++    r"^Scheduled orchestrator check-in\.(?: Focus: (?P<note>.*?))?"
++    r" Hand it to the orchestrator session Reid talks to: call post_message once"
++    r" with session_id (?P<session_id>\S+) and the text ",
++    re.DOTALL,
++)
++
++# ``(owner user id, session id, text)``; raises when the post is not accepted.
++PostSessionMessage = Callable[[str | None, str, str], Awaitable[None]]
++
++
++def parse_checkin(prompt: str) -> tuple[str, str] | None:
++    """The target session id and the message to post, or None for any other prompt."""
++    match = _PROMPT.match(prompt)
++    if match is None:
++        return None
++    text = CHECKIN_TEXT
++    if match["note"]:
++        text = f"{text} Focus: {match['note']}"
++    return match["session_id"], text
++
++
++def build_session_poster(app: Any, auth_provider: Any | None) -> PostSessionMessage:
++    """A poster that sends a user message through the server's own events route.
++
++    Going through the route keeps every rule a typed message has: access check,
++    policies, and queueing behind a turn that is still running.
++    """
++
++    async def post(user_id: str | None, session_id: str, text: str) -> None:
++        headers: dict[str, str] = {}
++        if auth_provider is not None and user_id:
++            token = auth_provider.mint_runner_token(user_id, _MINT_TTL_S)
++            if token:
++                headers["Authorization"] = f"Bearer {token}"
++        event = {
++            "type": "message",
++            "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},
++        }
++        async with httpx.AsyncClient(
++            transport=httpx.ASGITransport(app=app),
++            base_url="http://checkin.internal",
++            headers=headers,
++            timeout=_POST_TIMEOUT_S,
++        ) as client:
++            response = await client.post(f"/v1/sessions/{session_id}/events", json=event)
++        response.raise_for_status()
++
++    return post
++
++
++async def relay_checkin(deps: Any, task: ScheduledTask) -> bool:
++    """Post the check-in into its named session; False means fire a fresh session.
++
++    :returns: True only when the message was accepted. A prompt that names no
++        session, a session that is missing or archived, no poster wired, and a
++        failed post all return False.
++    """
++    poster: PostSessionMessage | None = getattr(deps, "post_session_message", None)
++    parsed = parse_checkin(task.prompt)
++    if poster is None or parsed is None:
++        return False
++    session_id, text = parsed
++    try:
++        conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
++        if conv is None or getattr(conv, "archived", False):
++            _logger.info(
++                "check-in %s: session %s is missing or archived; firing a fresh session",
++                task.id,
++                session_id,
++            )
++            return False
++        await poster(task.user_id, session_id, text)
++    except Exception:  # noqa: BLE001 - any failure falls back to a fresh session
++        _logger.warning(
++            "check-in %s: could not post to session %s; firing a fresh session",
++            task.id,
++            session_id,
++            exc_info=True,
++        )
++        return False
++    return True
+diff --git a/omnigent/server/scheduled/fire.py b/omnigent/server/scheduled/fire.py
+index 63d796bde86a6c3c18e6552b32a50c111c1ab6f7..151d96b0ca4d126969e85bdef20cf3375d783d64 100644
+--- a/omnigent/server/scheduled/fire.py
++++ b/omnigent/server/scheduled/fire.py
+@@ -67,6 +67,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_model_metadata,
+     validate_session_permission_mode,
+ )
++from omnigent.server.scheduled.checkin_relay import relay_checkin
+ from omnigent.server.scheduled.retention import notify_fire_observers
+ from omnigent.server.scheduled.task_project import file_fired_session
+ from omnigent.server.schemas import SessionEventInput
+@@ -151,6 +152,9 @@ class FireDeps:
+     # ``None`` (tests, embedders) leaves every fired session private.
+     app_state: Any | None = None
+     project_store: Any | None = None
++    # Posts a check-in into the session it names (see ``checkin_relay``); ``None``
++    # always fires a fresh session.
++    post_session_message: Any | None = None
+ 
+ 
+ @dataclass
+@@ -388,6 +392,9 @@ async def _run_fire_for_task(
+                 error_code="owner_deleted",
+             )
+             return
++        if await relay_checkin(deps, task):
++            await _record_run(deps, task, None, scheduled_at, status="succeeded")
++            return
+         managed = task.execution_target == "managed_sandbox"
+         if not managed and task.execution_target != "connected_host":
+             _logger.info(
+diff --git a/tests/server/scheduled/test_checkin_relay.py b/tests/server/scheduled/test_checkin_relay.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..be7a6b03118ca4b3ea86edbc21ed7d7f87c9620c
+--- /dev/null
++++ b/tests/server/scheduled/test_checkin_relay.py
+@@ -0,0 +1,142 @@
++"""A scheduled orchestrator check-in posts into its named session and opens no new one."""
++
++from __future__ import annotations
++
++from typing import Any
++
++import pytest
++from fastapi import FastAPI, Request
++
++from omnigent.server.scheduled.checkin_relay import (
++    CHECKIN_TEXT,
++    build_session_poster,
++    parse_checkin,
++)
++from omnigent.server.scheduled.fire import build_on_fire
++from tests.server.scheduled.test_fire import (
++    FakeConversationStore,
++    FakeScheduledTaskStore,
++    _deps,
++    _drain,
++    _FakeConversation,
++    _task,
++)
++
++SESSION = "aa29ab15f9da4d9b92ecd58f5e53f9fe"
++# The exact text the schedule_checkin tool wrote before this change.
++PLAIN = (
++    "Scheduled orchestrator check-in. Hand it to the orchestrator session Reid talks to: "
++    f'call post_message once with session_id {SESSION} and the text "{CHECKIN_TEXT}" '
++    "Then stop. Only if that call fails, run the check-in yourself as your "
++    "instructions describe."
++)
++FOCUS = PLAIN.replace("check-in. Hand", "check-in. Focus: PASS 2026 deck redesign Hand")
++
++
++class _Conversations(FakeConversationStore):
++    def __init__(self, found: _FakeConversation | None) -> None:
++        super().__init__()
++        self.found = found
++
++    def get_conversation(self, conversation_id: str) -> Any:
++        return self.found
++
++
++class _ArchivedConv(_FakeConversation):
++    archived = True
++
++
++def _poster(posts: list[tuple[Any, str, str]], fail: bool = False) -> Any:
++    async def post(user_id: str | None, session_id: str, text: str) -> None:
++        posts.append((user_id, session_id, text))
++        if fail:
++            raise RuntimeError("409")
++
++    return post
++
++
++async def _fire(
++    prompt: str, conv: Any, posts: list[Any], *, fail: bool = False
++) -> tuple[FakeScheduledTaskStore, _Conversations, list[Any]]:
++    store = FakeScheduledTaskStore(rows={"task_1": _task(prompt=prompt, user_id="reid")})
++    convs = _Conversations(conv)
++    launched: list[Any] = []
++
++    async def _launch(c: Any, t: Any) -> None:
++        launched.append(c)
++
++    deps = _deps(store, conversation_store=convs)
++    deps.post_session_message = _poster(posts, fail)
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++    return store, convs, launched
++
++
++def test_parse_reads_session_and_focus() -> None:
++    assert parse_checkin(PLAIN) == (SESSION, CHECKIN_TEXT)
++    assert parse_checkin(FOCUS) == (SESSION, f"{CHECKIN_TEXT} Focus: PASS 2026 deck redesign")
++    assert parse_checkin("Scheduled orchestrator check-in. Run the check-in.") is None
++    assert parse_checkin("do the thing") is None
++
++
++@pytest.mark.asyncio
++async def test_live_session_gets_direct_post_and_no_session_is_created() -> None:
++    posts: list[Any] = []
++    store, convs, launched = await _fire(PLAIN, _FakeConversation(SESSION, "ag_1"), posts)
++    assert posts == [("reid", SESSION, CHECKIN_TEXT)]
++    assert convs.created == [] and launched == []
++    assert [r["status"] for r in store.runs] == ["succeeded"]
++    assert store.runs[0].get("conversation_id") is None
++
++
++@pytest.mark.asyncio
++async def test_focus_note_rides_in_the_posted_text() -> None:
++    posts: list[Any] = []
++    await _fire(FOCUS, _FakeConversation(SESSION, "ag_1"), posts)
++    assert posts[0][2] == f"{CHECKIN_TEXT} Focus: PASS 2026 deck redesign"
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("conv", [None, _ArchivedConv(SESSION, "ag_1")])
++async def test_missing_or_archived_session_falls_back_to_a_fresh_session(conv: Any) -> None:
++    posts: list[Any] = []
++    _, convs, launched = await _fire(PLAIN, conv, posts)
++    assert posts == []
++    assert len(convs.created) == 1 and len(launched) == 1
++
++
++@pytest.mark.asyncio
++async def test_failed_post_falls_back_to_a_fresh_session() -> None:
++    posts: list[Any] = []
++    _, convs, launched = await _fire(PLAIN, _FakeConversation(SESSION, "ag_1"), posts, fail=True)
++    assert len(posts) == 1
++    assert len(convs.created) == 1 and len(launched) == 1
++
++
++@pytest.mark.asyncio
++async def test_prompt_without_session_id_fires_a_fresh_session() -> None:
++    posts: list[Any] = []
++    prompt = "Scheduled orchestrator check-in. Run the check-in, then stop."
++    _, convs, _ = await _fire(prompt, _FakeConversation(SESSION, "ag_1"), posts)
++    assert posts == [] and len(convs.created) == 1
++
++
++@pytest.mark.asyncio
++async def test_poster_sends_a_user_message_to_the_events_route_as_the_owner() -> None:
++    seen: list[tuple[str, str | None, Any]] = []
++    app = FastAPI()
++
++    @app.post("/v1/sessions/{session_id}/events", status_code=202)
++    async def events(session_id: str, request: Request) -> dict[str, bool]:
++        seen.append((session_id, request.headers.get("authorization"), await request.json()))
++        return {"ok": True}
++
++    class _Auth:
++        def mint_runner_token(self, user_id: str, ttl: int) -> str:
++            return f"tok-{user_id}"
++
++    await build_session_poster(app, _Auth())("reid", SESSION, CHECKIN_TEXT)
++    session_id, auth, body = seen[0]
++    assert (session_id, auth) == (SESSION, "Bearer tok-reid")
++    assert body["type"] == "message"
++    assert body["data"]["content"][0]["text"] == CHECKIN_TEXT

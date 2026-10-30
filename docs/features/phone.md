@@ -56,6 +56,13 @@ Copying a note on an iPhone can put it on the clipboard as an encoded link inste
 **Where:** Paste into the composer on an iPhone.<br>
 **Built from:** core patches [`0204`](../../patches/0204-ae-patch-Restore-a-copied-note-the-iPhone-clipboard-.patch), [`0205`](../../patches/0205-ae-patch-Fix-the-review-findings-on-session-link-tit.patch), [`0206`](../../patches/0206-ae-patch-Paste-the-exact-note-when-an-iPhone-clipboa.patch), [`0207`](../../patches/0207-ae-patch-Repair-a-copied-note-whose-encoded-URL-copy.patch)
 
+## Download a file a chat names
+
+A chat reply that names a file on the box, in backticks or as a link, already opened it in the file viewer. It now also downloads it. On a computer, right-click the name (or press the context-menu key or Shift+F10) and pick Download; on a phone, tap the small download icon after the name. The file saves with its own name and its full size. A download from a chat that has gone to sleep wakes it first.
+
+**Where:** The file names in a chat reply.<br>
+**Built from:** core patch [`0239`](../../patches/0239-ae-patch-Add-Open-and-Download-to-chat-file-links.patch)
+
 ## Waiting pull requests keep their state
 
 <p align="center"><img src="../media/phone-dock-waiting.webp" alt="Waiting pull requests keep their state"></p>

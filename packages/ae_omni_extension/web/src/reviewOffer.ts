@@ -1,5 +1,5 @@
 // Which sessions a merged Open PRs card offers "Set to review" (2026-09-25).
-// Review means a session is done and frees one of Reid's three slots, so the
+// Review means a session is done and frees one of the owner's three slots, so the
 // offer belongs after the merge of a session's last open pull request, not
 // after the first of several: on 2026-09-25 a session that had opened four
 // pull requests was offered review after the first merge while three were

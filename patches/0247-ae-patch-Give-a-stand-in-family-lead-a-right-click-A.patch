@@ -1,0 +1,376 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 29 Oct 2026 16:34:43 -0700
+Subject: [PATCH 247/260] [ae-patch] Give a stand-in family lead a right-click
+ Archive family
+
+---
+ web/src/shell/AeFamilyArchive.tsx         | 149 ++++++++++++++++------
+ web/src/shell/AeFamilyTree.tsx            |  89 ++++++++-----
+ web/src/shell/Sidebar.aeFamilies.test.tsx |  46 +++++++
+ 3 files changed, 207 insertions(+), 77 deletions(-)
+
+diff --git a/web/src/shell/AeFamilyArchive.tsx b/web/src/shell/AeFamilyArchive.tsx
+index 8d50b6281c23da8ee0ffc5a2d778d0cbbe24da73..28261c41c8c79deebfd74d825b2fa438888a85e6 100644
+--- a/web/src/shell/AeFamilyArchive.tsx
++++ b/web/src/shell/AeFamilyArchive.tsx
+@@ -8,6 +8,9 @@
+ // The sessions to archive come from a fresh read of the session list, not the
+ // sidebar's rows: those stop at the loaded pages and a search, and the tree
+ // keeps its objects across updates that only change a worktree or a time.
++//
++// A stand-in row (a family whose lead is archived or not loaded) archives the
++// family's remaining sessions the same way since 2026-10-29: `useAeStandInArchive`.
+ 
+ import { useQueryClient } from "@tanstack/react-query";
+ import {
+@@ -38,6 +41,7 @@ import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
+ import type { AeFamilyTree } from "@/lib/aeFamilyTree";
+ import { AeFamilyContext } from "@/lib/aeFamilyView";
+ import { useNavigate, useParams } from "@/lib/routing";
++import { useArchiveWorktreePrompt } from "@/shell/ArchiveWorktreeDialog";
+ import { showArchiveUndoToast } from "@/shell/archiveUndoToast";
+ 
+ export const AE_FAMILY_ARCHIVE_CONFIRM =
+@@ -73,22 +77,11 @@ type RequestArchive = (
+ ) => void;
+ 
+ /**
+- * A lead's archive. `archiveFamily(alone)` archives the session with every one
+- * under it. With `gate: "tree"` (a sidebar row) only a lead in Grouping >
+- * Family's tree reads its family, and any other row calls `alone` at once; with
+- * `gate: "read"` (the chat header) every archive reads it. Once a read is done
+- * the archive runs here, never through `alone`: the caller's closure is from
+- * the click, and by then another session may be open. The caller renders
+- * `source` and `dialog`.
++ * The bulk archive and its open-session confirm, shared by a lead's archive and
++ * a stand-in's. *activeId* is read when the archive runs, so it is the open
++ * session then, not the one at the click.
+  */
+-export function useAeFamilyArchive(
+-  lead: Conversation,
+-  requestArchive: RequestArchive,
+-  { gate }: { gate: "tree" | "read" },
+-): { archiveFamily: (alone: () => void) => void; source: ReactNode; dialog: ReactNode } {
+-  const seen = useRef<Seen>({ tree: null, activeId: undefined });
+-  // A second Archive click while the read runs does nothing.
+-  const reading = useRef(false);
++function useArchiveAll(requestArchive: RequestArchive, activeId: () => string | undefined) {
+   const [pending, setPending] = useState<Conversation[] | null>(null);
+   const bulkArchive = useBulkArchiveConversations();
+   const queryClient = useQueryClient();
+@@ -98,8 +91,8 @@ export function useAeFamilyArchive(
+     requestArchive(all, (deleteWorktreeIds) => {
+       // The rows leave the list optimistically and this one unmounts; leave
+       // and offer Undo now, as the bulk bar does.
+-      const { activeId } = seen.current;
+-      if (activeId && all.some((c) => c.id === activeId)) navigate("/", { replace: true });
++      const active = activeId();
++      if (active && all.some((c) => c.id === active)) navigate("/", { replace: true });
+       // mutateAsync's promise settles after this row unmounts; a mutate callback would not.
+       bulkArchive
+         .mutateAsync({ ids: all.map((c) => c.id), archived: true, deleteWorktreeIds })
+@@ -113,31 +106,6 @@ export function useAeFamilyArchive(
+       showArchiveUndoToast(queryClient, all, navigate);
+     });
+ 
+-  const archiveFamily = (alone: () => void) => {
+-    if (gate === "tree") {
+-      const treeLead = seen.current.tree?.leads.get(lead.id);
+-      if (!treeLead || treeLead.standIn) {
+-        alone();
+-        return;
+-      }
+-    }
+-    if (reading.current) return;
+-    reading.current = true;
+-    aeReadFamilySessions(queryClient)
+-      .finally(() => {
+-        reading.current = false;
+-      })
+-      .then(
+-        (rows) => {
+-          const { children, open } = aeFamilyArchiveTargets(rows, lead.id);
+-          const all = [lead, ...children];
+-          if (open > 0) setPending(all);
+-          else archiveAll(all);
+-        },
+-        () => showToast("Couldn't read the family's sessions, so nothing was archived. Try again."),
+-      );
+-  };
+-
+   const dialog = (
+     <Dialog open={pending !== null} onOpenChange={(open) => !open && setPending(null)}>
+       {pending !== null && (
+@@ -165,5 +133,102 @@ export function useAeFamilyArchive(
+       )}
+     </Dialog>
+   );
++  return { archiveAll, ask: setPending, dialog };
++}
++
++/**
++ * A stand-in's archive: every session of the family under *root* that is not
++ * archived yet. The lead is among them only when it exists; an unknown lead id
++ * is never sent. The caller renders `dialog` (the confirm and the worktree
++ * prompt).
++ */
++export function useAeStandInArchive(root: string): {
++  archiveFamily: () => void;
++  dialog: ReactNode;
++} {
++  const worktreePrompt = useArchiveWorktreePrompt();
++  const { conversationId } = useParams<{ conversationId: string }>();
++  const activeId = useRef(conversationId);
++  activeId.current = conversationId;
++  const reading = useRef(false);
++  const { archiveAll, ask, dialog } = useArchiveAll(
++    worktreePrompt.requestArchive,
++    () => activeId.current,
++  );
++  const queryClient = useQueryClient();
++
++  const archiveFamily = () => {
++    if (reading.current) return;
++    reading.current = true;
++    aeReadFamilySessions(queryClient)
++      .finally(() => {
++        reading.current = false;
++      })
++      .then(
++        (rows) => {
++          const all = aeFamilyOf(rows, root).filter((c) => c.archived !== true);
++          if (all.length === 0) showToast("Nothing left to archive in this family.");
++          else if (all.some((c) => !aeIsClosedMember(c))) ask(all);
++          else archiveAll(all);
++        },
++        () => showToast("Couldn't read the family's sessions, so nothing was archived. Try again."),
++      );
++  };
++  return {
++    archiveFamily,
++    dialog: (
++      <>
++        {worktreePrompt.dialog}
++        {dialog}
++      </>
++    ),
++  };
++}
++
++/**
++ * A lead's archive. `archiveFamily(alone)` archives the session with every one
++ * under it. With `gate: "tree"` (a sidebar row) only a lead in Grouping >
++ * Family's tree reads its family, and any other row calls `alone` at once; with
++ * `gate: "read"` (the chat header) every archive reads it. Once a read is done
++ * the archive runs here, never through `alone`: the caller's closure is from
++ * the click, and by then another session may be open. The caller renders
++ * `source` and `dialog`.
++ */
++export function useAeFamilyArchive(
++  lead: Conversation,
++  requestArchive: RequestArchive,
++  { gate }: { gate: "tree" | "read" },
++): { archiveFamily: (alone: () => void) => void; source: ReactNode; dialog: ReactNode } {
++  const seen = useRef<Seen>({ tree: null, activeId: undefined });
++  // A second Archive click while the read runs does nothing.
++  const reading = useRef(false);
++  const { archiveAll, ask, dialog } = useArchiveAll(requestArchive, () => seen.current.activeId);
++  const queryClient = useQueryClient();
++
++  const archiveFamily = (alone: () => void) => {
++    if (gate === "tree") {
++      const treeLead = seen.current.tree?.leads.get(lead.id);
++      if (!treeLead || treeLead.standIn) {
++        alone();
++        return;
++      }
++    }
++    if (reading.current) return;
++    reading.current = true;
++    aeReadFamilySessions(queryClient)
++      .finally(() => {
++        reading.current = false;
++      })
++      .then(
++        (rows) => {
++          const { children, open } = aeFamilyArchiveTargets(rows, lead.id);
++          const all = [lead, ...children];
++          if (open > 0) ask(all);
++          else archiveAll(all);
++        },
++        () => showToast("Couldn't read the family's sessions, so nothing was archived. Try again."),
++      );
++  };
++
+   return { archiveFamily, source: <Source into={seen} />, dialog };
+ }
+diff --git a/web/src/shell/AeFamilyTree.tsx b/web/src/shell/AeFamilyTree.tsx
+index 5ad4ea0be11e786714301614954aaa50244335cd..9e6f28784a9637f8ce32a63b588a5e14cbd49973 100644
+--- a/web/src/shell/AeFamilyTree.tsx
++++ b/web/src/shell/AeFamilyTree.tsx
+@@ -46,9 +46,16 @@ import {
+   type AeTreeRow,
+   toggleAeFamilyFold,
+ } from "@/lib/aeFamilyTree";
++import {
++  ContextMenu,
++  ContextMenuContent,
++  ContextMenuItem,
++  ContextMenuTrigger,
++} from "@/components/ui/context-menu";
+ import { AeFamilyContext } from "@/lib/aeFamilyView";
+ import { cn } from "@/lib/utils";
+ import { AeFamilyDotButton } from "@/shell/AeFamilyDot";
++import { useAeStandInArchive } from "@/shell/AeFamilyArchive";
+ import { SIDEBAR_ROW } from "@/shell/sidebarStyles";
+ 
+ // Half the 16px status icon past the row's left padding: the icon's center at depth 0.
+@@ -363,43 +370,55 @@ function StandIn({
+   const { family } = lead;
+   const known = lead.standIn!.lead;
+   const archived = known?.archived === true;
++  const { archiveFamily, dialog } = useAeStandInArchive(family.root);
+   return (
+     <li className="group relative" data-testid="ae-family-stand-in" data-family={family.root}>
+-      <Link
+-        to={`/c/${family.root}`}
+-        componentId="sidebar.family_lead"
+-        title={known ? undefined : "Open the lead session"}
+-        onClick={onNavigate}
+-        className={cn(
+-          SIDEBAR_ROW,
+-          "relative flex w-full items-center pr-2 text-left text-muted-foreground transition-colors",
+-          ROW_HOVER,
+-        )}
+-      >
+-        {!lead.folded && lead.count > 0 && (
+-          <Lines row={{ family, depth: 0, through: [], more: false, stem: true }} />
+-        )}
+-        {archived ? (
+-          <ArchiveIcon className="ui-icon mr-1.5" aria-hidden="true" />
+-        ) : known ? null : (
+-          <GhostIcon className="ui-icon mr-1.5" aria-hidden="true" />
+-        )}
+-        <AeFamilyDotButton
+-          family={family}
+-          isLead
+-          dashed={!known}
+-          hint={aeFamilyHint({ family, isLead: true, forked: false, parentTitle: null })}
+-        />
+-        <span className={cn("min-w-0 truncate", !known && "italic")}>
+-          {known ? (known.title ?? known.id) : "Lead not loaded"}
+-        </span>
+-        {archived && (
+-          <span className="ml-1.5 shrink-0 rounded bg-foreground/[0.07] px-1.5 text-[11px]">
+-            Archived
+-          </span>
+-        )}
+-        <FoldChevron lead={lead} />
+-      </Link>
++      <ContextMenu>
++        <ContextMenuTrigger asChild>
++          <Link
++            to={`/c/${family.root}`}
++            componentId="sidebar.family_lead"
++            title={known ? undefined : "Open the lead session"}
++            onClick={onNavigate}
++            className={cn(
++              SIDEBAR_ROW,
++              "relative flex w-full items-center pr-2 text-left text-muted-foreground transition-colors",
++              ROW_HOVER,
++            )}
++          >
++            {!lead.folded && lead.count > 0 && (
++              <Lines row={{ family, depth: 0, through: [], more: false, stem: true }} />
++            )}
++            {archived ? (
++              <ArchiveIcon className="ui-icon mr-1.5" aria-hidden="true" />
++            ) : known ? null : (
++              <GhostIcon className="ui-icon mr-1.5" aria-hidden="true" />
++            )}
++            <AeFamilyDotButton
++              family={family}
++              isLead
++              dashed={!known}
++              hint={aeFamilyHint({ family, isLead: true, forked: false, parentTitle: null })}
++            />
++            <span className={cn("min-w-0 truncate", !known && "italic")}>
++              {known ? (known.title ?? known.id) : "Lead not loaded"}
++            </span>
++            {archived && (
++              <span className="ml-1.5 shrink-0 rounded bg-foreground/[0.07] px-1.5 text-[11px]">
++                Archived
++              </span>
++            )}
++            <FoldChevron lead={lead} />
++          </Link>
++        </ContextMenuTrigger>
++        <ContextMenuContent className="min-w-40">
++          <ContextMenuItem onSelect={archiveFamily}>
++            <ArchiveIcon className="ui-icon" aria-hidden="true" />
++            Archive family
++          </ContextMenuItem>
++        </ContextMenuContent>
++      </ContextMenu>
++      {dialog}
+     </li>
+   );
+ }
+diff --git a/web/src/shell/Sidebar.aeFamilies.test.tsx b/web/src/shell/Sidebar.aeFamilies.test.tsx
+index 0dd990c3209803573df7bd0414a61f1748555f19..1bb4e2a8e65e52deca493f9690fd0b244e49af1a 100644
+--- a/web/src/shell/Sidebar.aeFamilies.test.tsx
++++ b/web/src/shell/Sidebar.aeFamilies.test.tsx
+@@ -796,6 +796,52 @@ describe("Grouping > Family", () => {
+       expect(mocks.archiveOne).not.toHaveBeenCalled();
+     });
+ 
++    describe("a stand-in lead", () => {
++      /** The lead is on no page the sidebar or the archive read, so the family shows a stand-in. */
++      const standIn = (children: Conversation[], unlisted: Conversation[] = []) => {
++        const rows = [...children, mine(row("PASS deck", 20))];
++        useConvMock.mockImplementation(() => conversationPage(rows));
++        mocks.archived.mockImplementation(async ({ visibility }: { visibility?: string }) =>
++          visibility === "archived"
++            ? { data: [] }
++            : { data: [...rows, ...unlisted], has_more: false, last_id: null },
++        );
++        setView({ grouping: "family" });
++        renderSidebar();
++        fireEvent.contextMenu(screen.getByTestId("ae-family-stand-in").querySelector("a")!);
++      };
++      const chooseArchive = () => fireEvent.click(screen.getByText("Archive family"));
++
++      it("offers Archive family on right-click and archives the closed sessions, never the unknown lead", async () => {
++        standIn([child("Escalation tool", "reference"), child("Families PR", "reference")]);
++        chooseArchive();
++        await waitFor(() => expect(mocks.archiveMany).toHaveBeenCalledTimes(1));
++        expect(screen.queryByTestId("ae-family-archive-confirm")).toBeNull();
++        expect(archivedIds()).toEqual([sid("Escalation tool"), sid("Families PR")]);
++        expect(archivedIds()).not.toContain(lead);
++        expect(mocks.archiveMany.mock.calls[0][0].archived).toBe(true);
++      });
++
++      it("asks first while a session is open, then archives them all", async () => {
++        standIn([child("Escalation tool", "reference")], [child("Older helper", "working")]);
++        chooseArchive();
++        const confirm = await screen.findByTestId("ae-family-archive-confirm");
++        expect(mocks.archiveMany).not.toHaveBeenCalled();
++        fireEvent.click(within(confirm).getByRole("button", { name: "Archive" }));
++        expect(archivedIds()).toEqual([sid("Escalation tool"), sid("Older helper")]);
++      });
++
++      it("skips sessions that are already archived", async () => {
++        standIn([
++          child("Escalation tool", "reference"),
++          { ...child("Families PR", "reference"), archived: true },
++        ]);
++        chooseArchive();
++        await waitFor(() => expect(mocks.archiveMany).toHaveBeenCalledTimes(1));
++        expect(archivedIds()).toEqual([sid("Escalation tool")]);
++      });
++    });
++
+     it("archives a session with no family alone", () => {
+       family([child("Escalation tool", "working"), child("Families PR", "working")]);
+       renderSidebar();
