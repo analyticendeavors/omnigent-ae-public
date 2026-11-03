@@ -269,6 +269,7 @@ def test_egress_proxy_refuses_private_and_tailnet_destinations() -> None:
     assert rules[-1] == "http_access deny all"
 
 
+@pytest.mark.docker
 def test_merged_compose_config(tmp_path: Path) -> None:
     """``docker compose config`` over upstream's file plus the override, with the
     env-file variables pointed at temp copies, must yield one omnigent

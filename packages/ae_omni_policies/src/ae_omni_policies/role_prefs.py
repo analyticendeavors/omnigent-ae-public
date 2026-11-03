@@ -38,6 +38,15 @@ Balanced and YOLO ship with Codex as Reviewer 2; a user who
 already saved keeps the presets they saved and gets the new starters only
 through "Restore starters".
 
+Reviewer personas (2026-11-01, ``personas.py``): a reviewer slot may name a persona by id
+(``"persona": "security"``), a purpose, instructions and a ``when`` of ``always`` or ``risky``.
+Five are built in (read in ``GET /roles`` as ``builtin_personas``) and the user's own sit in
+the optional ``personas`` list (at most 20, left out of the stored JSON until set, kept when a
+``PUT`` leaves it out). The slot's model and effort override the persona's, and a Claude slot
+with a persona may leave them out. Reviewer 1 cannot use a persona that runs only when risky.
+Every starter ends with the ``security`` persona; a user who already saved keeps the
+presets they saved.
+
 Same storage rules as ``sidebar_prefs.py``: one revision per user so two
 devices that edit at once get a conflict instead of a silent overwrite. The file
 shape is ``{"version": 1, "users": {"<user>": {"revision": n, "updated_at":
@@ -68,6 +77,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StrictBool,
     StrictFloat,
     StrictInt,
@@ -76,6 +86,8 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+
+from ae_omni_policies import personas as persona_defs
 
 _logger = logging.getLogger(__name__)
 
@@ -163,6 +175,35 @@ class FixedRole(_Strict):
 RoleSetting = Annotated[AutoRole | SessionRole | FixedRole, Field(discriminator="mode")]
 
 
+class FixedReviewer(_Strict):
+    """A Claude reviewer slot (a native subagent): a model and effort, or a persona's.
+
+    ``persona`` (2026-11-01) names a reviewer persona (``personas.py``); the slot's own model
+    and effort override the persona's, and a slot with a persona may leave them out. Without a
+    persona both are required, as before. A slot with no persona serializes as it always did.
+    """
+
+    mode: Literal["fixed"]
+    model: str | None = Field(default=None, pattern=_MODEL_ID)
+    effort: Effort | None = None
+    persona: str | None = Field(default=None, pattern=persona_defs.ID_PATTERN)
+
+    @model_validator(mode="after")
+    def _model_unless_persona(self) -> FixedReviewer:
+        if self.persona is None and (self.model is None or self.effort is None):
+            raise ValueError("a reviewer needs a model and an effort, or a persona")
+        return self
+
+    @model_serializer(mode="wrap")
+    def _serialize_slot(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        return {
+            k: v
+            for k, v in data.items()
+            if not (v is None and k in ("persona", "model", "effort"))
+        }
+
+
 class AgentReviewer(_Strict):
     """A reviewer slot run by another agent (Codex and so on) as a fresh child session."""
 
@@ -176,6 +217,15 @@ class AgentReviewer(_Strict):
     # None: the agent's default model or effort.
     model: str | None = Field(default=None, pattern=_MODEL_ID)
     effort: AgentEffort | None = None
+    # A reviewer persona (2026-11-01, ``personas.py``); the slot's model and effort override it.
+    persona: str | None = Field(default=None, pattern=persona_defs.ID_PATTERN)
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler: SerializerFunctionWrapHandler) -> dict[str, Any]:
+        data = handler(self)
+        if data.get("persona") is None:
+            data.pop("persona", None)
+        return data
 
     @model_validator(mode="after")
     def _named(self) -> AgentReviewer:
@@ -184,7 +234,7 @@ class AgentReviewer(_Strict):
         return self
 
 
-ReviewerSlot = Annotated[AutoRole | FixedRole | AgentReviewer, Field(discriminator="mode")]
+ReviewerSlot = Annotated[AutoRole | FixedReviewer | AgentReviewer, Field(discriminator="mode")]
 
 # Planner, builder and helper take the same picker as a reviewer minus other agents (the owner,
 # 2026-10-26): Auto, a Claude model, the session's, or a Codex child session. Other agents run
@@ -201,6 +251,12 @@ def is_codex_agent(slot: object) -> bool:
     )
 
 
+_FIRST_REVIEWER_RISKY = (
+    "reviewer 1 must always run (it takes the fix checks), so it cannot use the "
+    "{name} persona, which runs only when the diff is risky; use it on a later reviewer"
+)
+
+
 class MultiReviewer(_Strict):
     """One to three reviewers, run independently on the same diff and merged by the lead."""
 
@@ -211,6 +267,10 @@ class MultiReviewer(_Strict):
     def _auto_first_only(self) -> MultiReviewer:
         if any(isinstance(slot, AutoRole) for slot in self.reviewers[1:]):
             raise ValueError("only reviewer 1 can be auto; name a model or agent for the others")
+        first = getattr(self.reviewers[0], "persona", None)
+        built_in = persona_defs.builtin(first) if first else None
+        if built_in is not None and built_in.when == "risky":
+            raise ValueError(_FIRST_REVIEWER_RISKY.format(name=built_in.name))
         return self
 
 
@@ -355,6 +415,11 @@ class _PresetList(_Strict):
     runaway_family_usd: StrictInt | StrictFloat | None = Field(
         default=None, ge=0, le=MAX_RUNAWAY_USD
     )
+    # The user's own reviewer personas (2026-11-01, ``personas.py``); the built-in ones are
+    # not stored. Absent until the user adds one, and left out of the stored JSON while None.
+    personas: list[persona_defs.Persona] | None = Field(
+        default=None, max_length=persona_defs.MAX_PERSONAS
+    )
 
     @model_serializer(mode="wrap")
     def _without_absent_insights(self, handler: Any) -> dict[str, Any]:
@@ -367,6 +432,7 @@ class _PresetList(_Strict):
             "family_cost_unit",
             "runaway_family_tokens",
             "runaway_family_usd",
+            "personas",
         ):
             if data.get(key) is None:
                 data.pop(key, None)
@@ -380,6 +446,21 @@ class _PresetList(_Strict):
             raise ValueError(f"preset ids must be unique; repeated: {', '.join(repeated)}")
         if self.default_preset not in ids:
             raise ValueError(f"default_preset {self.default_preset!r} is not one of the presets")
+        return self
+
+    @model_validator(mode="after")
+    def _personas_and_first_reviewer(self) -> _PresetList:
+        mine = self.personas or []
+        persona_defs.check_user_personas(mine)
+        risky = {p.id: p.name for p in mine if p.when == "risky"}
+        for preset in self.presets:
+            reviewer = preset.roles.reviewer
+            first = reviewer.reviewers[0] if isinstance(reviewer, MultiReviewer) else None
+            name = risky.get(getattr(first, "persona", None) or "")
+            if name:
+                raise ValueError(
+                    f"preset {preset.id!r}: " + _FIRST_REVIEWER_RISKY.format(name=name)
+                )
         return self
 
 
@@ -429,6 +510,18 @@ def _reviewers(*slots: dict[str, Any]) -> dict[str, Any]:
     return {"mode": "multi", "reviewers": list(slots)}
 
 
+def _security(model: str | None = None, effort: str | None = None) -> dict[str, Any]:
+    """The security persona as a reviewer slot; it runs only when the diff is risky.
+
+    With no model the slot takes the persona's (Opus, high); Save tokens overrides it.
+    """
+    return {
+        "mode": "fixed",
+        **({"model": model, "effort": effort} if model else {}),
+        "persona": "security",
+    }
+
+
 def _codex(effort: str) -> dict[str, Any]:
     return {
         "mode": "agent",
@@ -453,7 +546,7 @@ STARTERS: tuple[Preset, ...] = tuple(
             "roles": {
                 "lead": _SESSION,
                 "planner": _fixed(SONNET, "high"),
-                "reviewer": _fixed(HAIKU, "medium"),
+                "reviewer": _reviewers(_fixed(HAIKU, "medium"), _security(SONNET, "medium")),
                 "builder": _fixed(HAIKU, "medium"),
                 "helper": _fixed(HAIKU, "low"),
             },
@@ -471,7 +564,7 @@ STARTERS: tuple[Preset, ...] = tuple(
             "roles": {
                 "lead": _SESSION,
                 "planner": _fixed(OPUS, "high"),
-                "reviewer": _reviewers(_fixed(SONNET, "medium"), _codex("medium")),
+                "reviewer": _reviewers(_fixed(SONNET, "medium"), _codex("medium"), _security()),
                 "builder": _fixed(SONNET, "medium"),
                 "helper": _fixed(HAIKU, "low"),
             },
@@ -489,7 +582,7 @@ STARTERS: tuple[Preset, ...] = tuple(
             "roles": {
                 "lead": _SESSION,
                 "planner": _fixed(OPUS, "high"),
-                "reviewer": _fixed(SONNET, "medium"),
+                "reviewer": _reviewers(_fixed(SONNET, "medium"), _security()),
                 "builder": _fixed(SONNET, "medium"),
                 "helper": _fixed(HAIKU, "low"),
             },
@@ -511,7 +604,7 @@ STARTERS: tuple[Preset, ...] = tuple(
             "is around to approve a raise.",
             "roles": {
                 **{role: _fixed(FABLE, "max") for role in ROLES},
-                "reviewer": _reviewers(_fixed(FABLE, "max"), _codex("xhigh")),
+                "reviewer": _reviewers(_fixed(FABLE, "max"), _codex("xhigh"), _security()),
             },
             "rules": {"raise_or_lower": "off", "lead_steps_down": False, "auto_raises": 0},
         },
@@ -526,7 +619,7 @@ STARTERS: tuple[Preset, ...] = tuple(
             "roles": {
                 "lead": _SESSION,
                 "planner": _fixed(OPUS, "xhigh"),
-                "reviewer": _reviewers(_fixed(OPUS, "high"), _codex("high")),
+                "reviewer": _reviewers(_fixed(OPUS, "high"), _codex("high"), _security()),
                 "builder": _fixed(SONNET, "medium"),
                 "helper": _fixed(HAIKU, "low"),
             },
@@ -543,7 +636,7 @@ STARTERS: tuple[Preset, ...] = tuple(
             "roles": {
                 "lead": _SESSION,
                 "planner": _fixed(OPUS, "high"),
-                "reviewer": _reviewers(_fixed(OPUS, "high"), _codex("high")),
+                "reviewer": _reviewers(_fixed(OPUS, "high"), _codex("high"), _security()),
                 "builder": _fixed(OPUS, "high"),
                 "helper": _fixed(SONNET, "low"),
             },
@@ -554,13 +647,13 @@ STARTERS: tuple[Preset, ...] = tuple(
             "title": "Quick fix",
             "icon": "bolt",
             "color": "blue",
-            "description": "Sonnet low, one reviewer, Haiku helps",
+            "description": "Sonnet low, one reviewer plus a Sonnet security check on risky diffs",
             "when_to_use": "Small, clear changes such as a copy fix, a config value or a "
             "one-file bug: the cheapest preset that still reviews.",
             "roles": {
                 "lead": _SESSION,
                 "planner": _fixed(SONNET, "low"),
-                "reviewer": _fixed(SONNET, "low"),
+                "reviewer": _reviewers(_fixed(SONNET, "low"), _security(SONNET, "medium")),
                 "builder": _fixed(SONNET, "low"),
                 "helper": _fixed(HAIKU, "low"),
             },
@@ -624,6 +717,11 @@ def with_new_starters(state: RolesState) -> RolesState:
     return state.model_copy(update={"presets": presets, "starters_seen": seen})
 
 
+def find_persona(state: _PresetList, persona_id: str) -> persona_defs.Persona | None:
+    """The persona a reviewer slot names (a built-in, else one of the user's); ``None`` if gone."""
+    return persona_defs.find(persona_id, state.personas)
+
+
 def validate_custom(raw: object) -> dict[str, Any]:
     """Check a per-session ``custom`` block from the ``ae.team`` label.
 
@@ -635,6 +733,14 @@ def validate_custom(raw: object) -> dict[str, Any]:
         return Custom.model_validate(raw).model_dump()
     except ValidationError as exc:
         raise ValueError(str(exc)) from exc
+
+
+class RolesInvalid(ValueError):
+    """A save whose merged state is invalid, e.g. a risky saved persona moved to reviewer 1.
+
+    Added with the review fixes (patch 0278): a ``PUT`` that leaves ``personas`` out keeps the
+    stored list, so the body alone can pass while the merged state fails. Routes answer 422.
+    """
 
 
 class RolesSaveError(OSError):
@@ -824,6 +930,7 @@ class RolePrefsStore:
         :param body: The validated new list and the revision it was based on.
         :returns: The new state at ``body.revision + 1``, or the current state
             with ``conflict`` set when the held revision differs.
+        :raises RolesInvalid: When the merged state fails validation (nothing changed).
         :raises RolesSaveError: When the file could not be written (nothing changed).
         """
         with self._lock:
@@ -843,47 +950,55 @@ class RolePrefsStore:
                 *(starter.id for starter in STARTERS if starter.id in in_list),
             ]
             seen = list(dict.fromkeys(offered))
-            state = RolesState(
-                revision=current.revision + 1,
-                default_preset=body.default_preset,
-                apply_start_on=body.apply_start_on,
-                presets=[preset.model_copy(deep=True) for preset in body.presets],
-                starters_seen=seen,
-                # Absent keeps the saved setting; an explicit null clears it.
-                insights=(
-                    body.insights if "insights" in body.model_fields_set else current.insights
-                ),
-                child_prompts=(
-                    body.child_prompts
-                    if "child_prompts" in body.model_fields_set
-                    else current.child_prompts
-                ),
-                child_relay=(
-                    body.child_relay
-                    if "child_relay" in body.model_fields_set
-                    else current.child_relay
-                ),
-                lead_handoff_tokens=(
-                    body.lead_handoff_tokens
-                    if "lead_handoff_tokens" in body.model_fields_set
-                    else current.lead_handoff_tokens
-                ),
-                family_cost_unit=(
-                    body.family_cost_unit
-                    if "family_cost_unit" in body.model_fields_set
-                    else current.family_cost_unit
-                ),
-                runaway_family_tokens=(
-                    body.runaway_family_tokens
-                    if "runaway_family_tokens" in body.model_fields_set
-                    else current.runaway_family_tokens
-                ),
-                runaway_family_usd=(
-                    body.runaway_family_usd
-                    if "runaway_family_usd" in body.model_fields_set
-                    else current.runaway_family_usd
-                ),
-            )
+            try:
+                state = RolesState(
+                    revision=current.revision + 1,
+                    default_preset=body.default_preset,
+                    apply_start_on=body.apply_start_on,
+                    presets=[preset.model_copy(deep=True) for preset in body.presets],
+                    starters_seen=seen,
+                    # Absent keeps the saved setting; an explicit null clears it.
+                    insights=(
+                        body.insights if "insights" in body.model_fields_set else current.insights
+                    ),
+                    child_prompts=(
+                        body.child_prompts
+                        if "child_prompts" in body.model_fields_set
+                        else current.child_prompts
+                    ),
+                    child_relay=(
+                        body.child_relay
+                        if "child_relay" in body.model_fields_set
+                        else current.child_relay
+                    ),
+                    lead_handoff_tokens=(
+                        body.lead_handoff_tokens
+                        if "lead_handoff_tokens" in body.model_fields_set
+                        else current.lead_handoff_tokens
+                    ),
+                    family_cost_unit=(
+                        body.family_cost_unit
+                        if "family_cost_unit" in body.model_fields_set
+                        else current.family_cost_unit
+                    ),
+                    runaway_family_tokens=(
+                        body.runaway_family_tokens
+                        if "runaway_family_tokens" in body.model_fields_set
+                        else current.runaway_family_tokens
+                    ),
+                    runaway_family_usd=(
+                        body.runaway_family_usd
+                        if "runaway_family_usd" in body.model_fields_set
+                        else current.runaway_family_usd
+                    ),
+                    # Absent keeps the saved personas; a list (even empty) replaces them.
+                    personas=(
+                        body.personas if "personas" in body.model_fields_set else current.personas
+                    ),
+                )
+            except ValidationError as exc:
+                first = exc.errors()[0]["msg"]
+                raise RolesInvalid(first.removeprefix("Value error, ")) from exc
             old_entry = self._users.get(user)
             old_state = self._states.get(user)
             self._users[user] = {
@@ -909,7 +1024,11 @@ class RolePrefsStore:
 
 def view(state: RolesState) -> dict[str, Any]:
     """The JSON ``GET /roles`` and ``PUT /roles`` answer with: the state plus the starters."""
-    return {**state.model_dump(), "starters": starters()}
+    return {
+        **state.model_dump(),
+        "starters": starters(),
+        "builtin_personas": persona_defs.builtin_view(),
+    }
 
 
 def _default_path() -> Path | None:
@@ -959,9 +1078,11 @@ __all__ = [
     "Preset",
     "PutResult",
     "RolePrefsStore",
+    "RolesInvalid",
     "RolesPut",
     "RolesSaveError",
     "RolesState",
+    "find_persona",
     "never_saved",
     "reset_store",
     "starters",

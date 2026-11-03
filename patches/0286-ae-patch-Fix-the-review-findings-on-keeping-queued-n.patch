@@ -1,0 +1,712 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:10:40 -0800
+Subject: [PATCH 286/289] [ae-patch] Fix the review findings on keeping queued
+ notes through a reload
+
+Review fixes to the previous patch (2026-11-01).
+
+Split view runs each pane as a same-origin frame in one tab, and those
+frames share one sessionStorage, so every pane wrote the same queue
+document and tab id: panes overwrote each other's notes, and a pane reload
+found the lock held by a sibling and deleted every pane's notes with a
+false "other tab" toast. A split pane now suffixes the storage key and the
+tab-id key (and so the lock name) with its frame name, which the frame
+keeps across a reload; the /split parent keeps the plain keys.
+
+Ownership is now per note, not per document. Each stored note carries the
+user it was queued under (null when identity was not known yet), and a
+write never relabels it. At restore a note of the verified current user is
+owned, a note of another user is dropped and counted, a note of a user the
+page cannot verify is carried through every write untouched and never
+restored, and a note queued before identity was known comes back only as a
+Retry.
+
+Attachment names kept in module memory by stable id are merged back into
+every write, so a second reload still names the attachments. Only this
+page's own lock wait running out counts as another tab; any other lock
+error takes the no-Web-Locks path. A tab whose lock another tab holds no
+longer deletes the notes: they come back waiting for Retry, with a toast
+that is true either way. Removed notes drop their first-seen time, and the
+toast no longer pluralises "had" with itself. New tests cover split panes,
+the identity cases, two reloads with attachments and a lock error.
+---
+ web/src/lib/aeQueuePersist.test.ts | 202 ++++++++++++++++++++++++++---
+ web/src/lib/aeQueuePersist.ts      | 201 ++++++++++++++++++----------
+ 2 files changed, 319 insertions(+), 84 deletions(-)
+
+diff --git a/web/src/lib/aeQueuePersist.test.ts b/web/src/lib/aeQueuePersist.test.ts
+index b88c3c0a60249f861af9d90c8b4f1a3227a38a0a..5d3377e29ebc42b1aa5edb36ca1f3f17097f0a83 100644
+--- a/web/src/lib/aeQueuePersist.test.ts
++++ b/web/src/lib/aeQueuePersist.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type * as Identity from "@/lib/identity";
++import { AE_SPLIT_PANE_NAME_PREFIX } from "@/lib/aeSplitLayout";
+ import { serializeReplyDraft } from "@/lib/replyDraft";
+ import { useChatStore, type QueuedMessage } from "@/store/chatStore";
+ import {
+@@ -12,13 +13,17 @@ import {
+   installAeQueuePersist,
+ } from "./aeQueuePersist";
+ 
+-const identity = vi.hoisted(() => ({ userId: null as string | null }));
++/** `current` is what getCurrentUserId says now; `resolve` is the /v1/me probe. */
++const identity = vi.hoisted(() => ({
++  current: null as string | null,
++  resolve: null as null | (() => Promise<string | null>),
++}));
+ vi.mock("@/lib/identity", async (importOriginal) => {
+   const actual = await importOriginal<typeof Identity>();
+   return {
+     ...actual,
+-    getCurrentUserId: () => identity.userId,
+-    resolveIdentity: () => Promise.resolve(identity.userId),
++    getCurrentUserId: () => identity.current,
++    resolveIdentity: () => identity.resolve?.() ?? Promise.resolve(identity.current),
+   };
+ });
+ 
+@@ -109,10 +114,7 @@ function entry(text: string, extra: Record<string, unknown> = {}) {
+ }
+ 
+ function seed(entries: unknown[], extra: Record<string, unknown> = {}) {
+-  sessionStorage.setItem(
+-    AE_QUEUE_STORAGE_KEY,
+-    JSON.stringify({ v: 1, userId: null, entries, ...extra }),
+-  );
++  sessionStorage.setItem(AE_QUEUE_STORAGE_KEY, JSON.stringify({ v: 1, entries, ...extra }));
+ }
+ 
+ const queue = (): QueuedMessage[] => useChatStore.getState().queuedMessages;
+@@ -126,7 +128,8 @@ async function install() {
+ beforeEach(() => {
+   sessionStorage.clear();
+   persist.reset({ lockWaitMs: 20 });
+-  identity.userId = null;
++  identity.current = null;
++  identity.resolve = null;
+   locks = new FakeLocks();
+   setLocks(locks);
+   toasts.length = 0;
+@@ -317,27 +320,52 @@ describe("restore", () => {
+     expect(toasts[0]).toContain("another tab");
+   });
+ 
+-  it("leaves notes owned by another tab there, clears this copy and takes a new tab id", async () => {
++  it("brings back notes whose lock another tab holds as Retry only, and takes a new tab id", async () => {
+     const info = vi.spyOn(console, "info").mockImplementation(() => {});
+     seed([entry("a"), entry("b")]);
+     sessionStorage.setItem(AE_QUEUE_TAB_ID_KEY, "tab1");
+     locks.holdElsewhere(`${AE_QUEUE_LOCK_PREFIX}:tab1`);
+     await install();
+-    expect(queue()).toEqual([]);
+-    expect(sessionStorage.getItem(AE_QUEUE_STORAGE_KEY)).toBeNull();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([
++      ["a", true],
++      ["b", true],
++    ]);
++    expect(stored().map((e) => e.text)).toEqual(["a", "b"]);
+     const tabId = sessionStorage.getItem(AE_QUEUE_TAB_ID_KEY);
+     expect(tabId).not.toBe("tab1");
+     expect(locks.held.has(`${AE_QUEUE_LOCK_PREFIX}:${tabId}`)).toBe(true);
+-    expect(toasts).toEqual(["2 queued notes stay in the other tab this one was copied from."]);
+-    expect(info).toHaveBeenCalledWith(expect.stringContaining("otherTab=2"));
++    expect(toasts).toEqual([
++      "2 queued notes came back from before the reload. They may also be waiting in a tab this " +
++        "one was copied from; use Retry only for ones that never arrived.",
++    ]);
++    expect(info).toHaveBeenCalledWith(expect.stringContaining("ownership=other-tab"));
+   });
+ 
+-  it("drops notes stored for another signed-in user", async () => {
+-    vi.spyOn(console, "info").mockImplementation(() => {});
+-    identity.userId = "bob";
+-    seed([entry("a")], { userId: "alice" });
++  it("treats a lock error as no Web Locks, not as another tab", async () => {
++    vi.spyOn(locks, "request").mockImplementation(() =>
++      Promise.reject(new DOMException("denied", "SecurityError")),
++    );
++    seed([entry("a")]);
++    sessionStorage.setItem(AE_QUEUE_TAB_ID_KEY, "tab1");
+     await install();
+-    expect(queue()).toEqual([]);
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([["a", true]]);
++    expect(stored().map((e) => e.text)).toEqual(["a"]);
++    expect(sessionStorage.getItem(AE_QUEUE_TAB_ID_KEY)).toBe("tab1");
++    expect(toasts).toHaveLength(1);
++    expect(toasts[0]).toContain("cannot tell whether another tab");
++  });
++
++  it("keeps attachment names and the attachment reason through two reloads", async () => {
++    seed([entry("file", { fileNames: ["a.png", "b.pdf"] })]);
++    await install();
++    expect(stored()[0]!.fileNames).toEqual(["a.png", "b.pdf"]);
++    persist.reset({ lockWaitMs: 20 });
++    setChat();
++    toasts.length = 0;
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([["file", true]]);
++    expect(stored()[0]!.fileNames).toEqual(["a.png", "b.pdf"]);
++    expect(toasts[0]).toContain("had attachments");
+   });
+ 
+   it("keeps firstSeenAt through a restore and later writes", async () => {
+@@ -379,3 +407,141 @@ describe("restore", () => {
+     expect(sessionStorage.getItem(AE_QUEUE_STORAGE_KEY)).toBeNull();
+   });
+ });
++
++describe("identity", () => {
++  function deferred() {
++    let resolve: (value: string | null) => void = () => {};
++    const promise = new Promise<string | null>((r) => {
++      resolve = r;
++    });
++    return { promise, resolve };
++  }
++
++  it("drops another user's note and counts it", async () => {
++    const info = vi.spyOn(console, "info").mockImplementation(() => {});
++    identity.current = "bob";
++    seed([entry("a", { userId: "alice" }), entry("b", { userId: "bob" })]);
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([["b", undefined]]);
++    expect(stored().map((e) => [e.text, e.userId])).toEqual([["b", "bob"]]);
++    expect(info).toHaveBeenCalledWith(expect.stringContaining("otherUser=1"));
++  });
++
++  it("waits for a delayed identity, and a note queued meanwhile is this page's user's", async () => {
++    const probe = deferred();
++    identity.resolve = () => probe.promise;
++    seed([entry("a", { userId: "alice" })]);
++    installAeQueuePersist();
++    useChatStore.getState().enqueueMessage("b");
++    expect(stored().map((e) => [e.text, e.userId])).toEqual([
++      ["a", "alice"],
++      ["b", null],
++    ]);
++    identity.current = "alice";
++    probe.resolve("alice");
++    await persist.restored();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([
++      ["a", undefined],
++      ["b", undefined],
++    ]);
++    expect(stored().map((e) => [e.text, e.userId])).toEqual([
++      ["a", "alice"],
++      ["b", "alice"],
++    ]);
++  });
++
++  it("a second reload during the identity wait relabels nobody", async () => {
++    identity.resolve = () => new Promise(() => {});
++    seed([entry("a", { userId: "alice" })]);
++    installAeQueuePersist();
++    useChatStore.getState().enqueueMessage("b");
++    // The page dies with identity still unknown, and the next one learns it is alice.
++    persist.reset({ lockWaitMs: 20 });
++    setChat();
++    identity.resolve = null;
++    identity.current = "alice";
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([
++      ["a", undefined],
++      ["b", true],
++    ]);
++    expect(stored().map((e) => [e.text, e.userId])).toEqual([
++      ["a", "alice"],
++      ["b", null],
++    ]);
++    expect(toasts[0]).toContain("before the signed-in user was known");
++  });
++
++  it("carries a user's note untouched while identity cannot be verified", async () => {
++    const info = vi.spyOn(console, "info").mockImplementation(() => {});
++    seed([entry("a", { userId: "alice" })]);
++    await install();
++    expect(queue()).toEqual([]);
++    useChatStore.getState().enqueueMessage("b");
++    expect(stored().map((e) => [e.text, e.userId])).toEqual([
++      ["a", "alice"],
++      ["b", null],
++    ]);
++    expect(info).toHaveBeenCalledWith(expect.stringContaining("carried=1"));
++  });
++
++  it("restores normally when identity is unknown both when queued and now", async () => {
++    seed([entry("a", { userId: null })]);
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([["a", undefined]]);
++    expect(toasts).toEqual([]);
++  });
++});
++
++describe("split view panes", () => {
++  const parent = Object.getOwnPropertyDescriptor(window, "parent");
++
++  function asPane(name: string) {
++    Object.defineProperty(window, "parent", { value: {}, configurable: true });
++    window.name = name;
++  }
++
++  afterEach(() => {
++    if (parent) Object.defineProperty(window, "parent", parent);
++    else Reflect.deleteProperty(window, "parent");
++    window.name = "";
++  });
++
++  const read = (key: string) =>
++    (
++      JSON.parse(sessionStorage.getItem(key) ?? '{"entries":[]}') as {
++        entries: { text: string }[];
++      }
++    ).entries.map((e) => e.text);
++
++  it("keeps each pane's notes apart and a pane reload restores its own", async () => {
++    const one = `${AE_SPLIT_PANE_NAME_PREFIX}-1`;
++    const two = `${AE_SPLIT_PANE_NAME_PREFIX}-2`;
++    asPane(one);
++    await install();
++    useChatStore.getState().enqueueMessage("pane one");
++
++    // A second frame in the same tab: same sessionStorage, its own keys and lock.
++    persist.reset({ lockWaitMs: 20 });
++    setChat();
++    asPane(two);
++    await install();
++    expect(queue()).toEqual([]);
++    useChatStore.getState().enqueueMessage("pane two");
++    expect(read(`${AE_QUEUE_STORAGE_KEY}:${one}`)).toEqual(["pane one"]);
++    expect(read(`${AE_QUEUE_STORAGE_KEY}:${two}`)).toEqual(["pane two"]);
++    expect(sessionStorage.getItem(AE_QUEUE_STORAGE_KEY)).toBeNull();
++    const twoTab = sessionStorage.getItem(`${AE_QUEUE_TAB_ID_KEY}:${two}`);
++    expect(sessionStorage.getItem(`${AE_QUEUE_TAB_ID_KEY}:${one}`)).not.toBe(twoTab);
++
++    // Pane one reloads while pane two keeps running and holding its own lock.
++    persist.reset({ lockWaitMs: 20 });
++    locks.holdElsewhere(`${AE_QUEUE_LOCK_PREFIX}:${twoTab}`);
++    setChat();
++    asPane(one);
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([["pane one", undefined]]);
++    expect(read(`${AE_QUEUE_STORAGE_KEY}:${two}`)).toEqual(["pane two"]);
++    expect(toasts).toEqual([]);
++  });
++});
+diff --git a/web/src/lib/aeQueuePersist.ts b/web/src/lib/aeQueuePersist.ts
+index 65e003716776ffdb28e05bbe3470eac677d92b6f..b1efdec1e379bc5995e33ad451d9f409bd7aecb6 100644
+--- a/web/src/lib/aeQueuePersist.ts
++++ b/web/src/lib/aeQueuePersist.ts
+@@ -6,23 +6,30 @@
+ //
+ // This module mirrors the queue into sessionStorage (per tab; it survives a reload and usually a
+ // tab discard) on every change, and puts it back once per page. A Web Lock named after a per-tab
+-// id decides who owns the stored copy: a duplicated tab copies sessionStorage, and only the tab
+-// that still holds the lock may send those notes. Restored notes flush through the existing
+-// queue paths only (the chat page's flush and `flushBackgroundQueues`); nothing here sends.
++// id decides who owns the stored copy: a duplicated tab copies sessionStorage, and a copy whose
++// lock another tab still holds comes back waiting for Retry, never sent on its own. Restored
++// notes flush through the existing queue paths only (the chat page's flush and
++// `flushBackgroundQueues`); nothing here sends.
++//
++// Split view runs each pane as a same-origin frame in the same tab, and those frames share one
++// sessionStorage, so a pane keys its storage and its tab id by its frame name (review fix,
++// 2026-11-01). Each note records the signed-in user it was queued under; a note is never handed
++// to another user and its owner is never rewritten.
+ //
+ // Kept out: attachments (File objects cannot be stored; their names come back and the note waits
+ // for Retry), notes older than an hour (they wait for Retry), and anything across devices.
+ 
+ import { showToast } from "@/components/ui/toast";
++import { isAeSplitPane } from "@/lib/aeSplitLayout";
+ import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
+ import { randomUUID } from "@/lib/randomUUID";
+ import { readComposerDraft } from "@/lib/replyDraft";
+ import { isTempConvId } from "@/lib/tempConversationId";
+ import { useChatStore, type QueuedMessage } from "@/store/chatStore";
+ 
+-/** sessionStorage key of the stored queue document. */
++/** sessionStorage key of the stored queue document (a split pane adds `:<frame name>`). */
+ export const AE_QUEUE_STORAGE_KEY = "omnigent:ae-queued-messages:v1";
+-/** sessionStorage key of this tab's id (a duplicated tab copies it). */
++/** sessionStorage key of this tab's id (a duplicated tab copies it; a split pane adds its name). */
+ export const AE_QUEUE_TAB_ID_KEY = "omnigent:ae-queue-tab-id:v1";
+ /** Web Lock name prefix; the full name is the prefix plus the tab id. */
+ export const AE_QUEUE_LOCK_PREFIX = "omnigent:ae-queue-owner";
+@@ -50,24 +57,33 @@ interface StoredEntry {
+   fileNames?: string[];
+   /** When this page first saw the note; stamped once per note and never refreshed. */
+   firstSeenAt: number;
++  /** The signed-in user the note was queued under; null when identity was not known yet. */
++  userId: string | null;
+ }
+ 
+ interface StoredDoc {
+   v: number;
+-  userId: string | null;
+   entries: StoredEntry[];
+ }
+ 
+ // Module state: one restore per page, whatever mounts and unmounts.
+ let started = false;
+ let restoring = false;
++let docKey = AE_QUEUE_STORAGE_KEY;
++let tabIdKey = AE_QUEUE_TAB_ID_KEY;
++/** Stored notes not restored yet: every write keeps them until the restore decides. */
+ let pendingEntries: StoredEntry[] = [];
+-let storedUserId: string | null = null;
++/** Notes of a user this page cannot verify: written back untouched, never restored. */
++let carriedEntries: StoredEntry[] = [];
+ let unsubscribe: (() => void) | null = null;
+ let restorePromise: Promise<void> = Promise.resolve();
+ let lockWaitMs = AE_QUEUE_LOCK_WAIT_MS;
+ let warnedCap = false;
+ const firstSeen = new Map<string, number>();
++/** Owner of each restored note, kept as stored so a write never relabels it. */
++const restoredOwners = new Map<string, string | null>();
++/** Attachment names of restored notes, whose File objects a reload could not keep. */
++const lostFileNames = new Map<string, string[]>();
+ let persistedKeys = new Set<string>();
+ const heldLocks: (() => void)[] = [];
+ 
+@@ -83,6 +99,15 @@ function storage(): Storage | null {
+   }
+ }
+ 
++/** A split pane's frame name, or null outside a pane (the /split parent included). */
++function paneScope(): string | null {
++  try {
++    return isAeSplitPane() && window.name !== "" ? window.name : null;
++  } catch {
++    return null;
++  }
++}
++
+ function isRecord(value: unknown): value is Record<string, unknown> {
+   return typeof value === "object" && value !== null && !Array.isArray(value);
+ }
+@@ -93,7 +118,8 @@ function readEntry(raw: unknown): StoredEntry | null {
+   if (typeof text !== "string" || typeof conversationId !== "string") return null;
+   if (conversationId === "" || isTempConvId(conversationId)) return null;
+   if (typeof firstSeenAt !== "number" || !Number.isFinite(firstSeenAt)) return null;
+-  const entry: StoredEntry = { text, conversationId, firstSeenAt };
++  const userId = typeof raw.userId === "string" ? raw.userId : null;
++  const entry: StoredEntry = { text, conversationId, firstSeenAt, userId };
+   if (typeof raw.agentId === "string") entry.agentId = raw.agentId;
+   if (typeof raw.stableId === "string" && raw.stableId !== "") entry.stableId = raw.stableId;
+   if (raw.command === "compact") entry.command = "compact";
+@@ -110,7 +136,7 @@ function readEntry(raw: unknown): StoredEntry | null {
+ /** The stored document, or null when it is missing, malformed or another version. */
+ function readDoc(): StoredDoc | null {
+   try {
+-    const raw = storage()?.getItem(AE_QUEUE_STORAGE_KEY);
++    const raw = storage()?.getItem(docKey);
+     if (!raw) return null;
+     const doc: unknown = JSON.parse(raw);
+     if (!isRecord(doc) || doc.v !== DOC_VERSION || !Array.isArray(doc.entries)) return null;
+@@ -119,7 +145,7 @@ function readDoc(): StoredDoc | null {
+       const entry = readEntry(item);
+       if (entry !== null) entries.push(entry);
+     }
+-    return { v: DOC_VERSION, userId: typeof doc.userId === "string" ? doc.userId : null, entries };
++    return { v: DOC_VERSION, entries };
+   } catch {
+     return null;
+   }
+@@ -132,10 +158,13 @@ function toStored(message: QueuedMessage, now: number): StoredEntry {
+     seen = now;
+     firstSeen.set(key, seen);
+   }
++  // A note queued in this page belongs to this page's user; a restored one keeps its owner.
++  const userId = restoredOwners.has(key) ? restoredOwners.get(key)! : getCurrentUserId();
+   const entry: StoredEntry = {
+     text: message.text,
+     conversationId: message.conversationId,
+     firstSeenAt: seen,
++    userId,
+   };
+   if (message.agentId !== undefined) entry.agentId = message.agentId;
+   if (message.stableId !== undefined) entry.stableId = message.stableId;
+@@ -143,16 +172,25 @@ function toStored(message: QueuedMessage, now: number): StoredEntry {
+   if (message.replyDraft !== undefined) entry.replyDraft = message.replyDraft;
+   if (message.requiresRetry === true) entry.requiresRetry = true;
+   const names = (message.files ?? []).map((f) => f.name);
++  const lost = lostFileNames.get(key);
+   if (names.length > 0) entry.fileNames = names;
++  else if (lost !== undefined) entry.fileNames = lost;
+   return entry;
+ }
+ 
+-/** Write the queue (plus any notes still waiting to be restored) to storage, now. */
++/** Write the queue (plus notes still waiting or carried) to storage, now. */
+ function writeQueue(queue: readonly QueuedMessage[]): void {
+   const now = Date.now();
++  const live = queue.filter((m) => !isTempConvId(m.conversationId));
++  // A note that left the queue gets a fresh first-seen time if it ever comes back.
++  const liveKeys = new Set(live.map(noteKey));
++  for (const key of firstSeen.keys()) {
++    if (!liveKeys.has(key)) firstSeen.delete(key);
++  }
+   const candidates: StoredEntry[] = [
+     ...pendingEntries,
+-    ...queue.filter((m) => !isTempConvId(m.conversationId)).map((m) => toStored(m, now)),
++    ...carriedEntries,
++    ...live.map((m) => toStored(m, now)),
+   ];
+   // Notes already stored always stay; new ones join only while there is room.
+   let room = AE_QUEUE_MAX_STORED - candidates.filter((e) => persistedKeys.has(noteKey(e))).length;
+@@ -179,15 +217,11 @@ function writeQueue(queue: readonly QueuedMessage[]): void {
+     const store = storage();
+     if (store === null) return;
+     if (kept.length === 0) {
+-      store.removeItem(AE_QUEUE_STORAGE_KEY);
++      store.removeItem(docKey);
+       return;
+     }
+-    const doc: StoredDoc = {
+-      v: DOC_VERSION,
+-      userId: getCurrentUserId() ?? storedUserId,
+-      entries: kept,
+-    };
+-    store.setItem(AE_QUEUE_STORAGE_KEY, JSON.stringify(doc));
++    const doc: StoredDoc = { v: DOC_VERSION, entries: kept };
++    store.setItem(docKey, JSON.stringify(doc));
+   } catch {
+     // Storage full or unavailable: the queue still works in memory.
+   }
+@@ -208,34 +242,49 @@ function newTabId(): string {
+ function readTabId(): string {
+   try {
+     const store = storage();
+-    const existing = store?.getItem(AE_QUEUE_TAB_ID_KEY);
++    const existing = store?.getItem(tabIdKey);
+     if (existing) return existing;
+     const id = newTabId();
+-    store?.setItem(AE_QUEUE_TAB_ID_KEY, id);
++    store?.setItem(tabIdKey, id);
+     return id;
+   } catch {
+     return newTabId();
+   }
+ }
+ 
+-/** Hold `name` for the page's lifetime; resolve true once held, false if not granted in `waitMs`. */
+-function holdTabLock(name: string, waitMs: number | null): Promise<boolean> {
++type LockResult = "held" | "timeout" | "error";
++
++/**
++ * Hold `name` for the page's lifetime. "timeout" only when this call's own wait ran out (the
++ * lock is held elsewhere); any other failure is "error".
++ */
++function holdTabLock(name: string, waitMs: number | null): Promise<LockResult> {
+   return new Promise((settle) => {
+     const controller = waitMs === null ? null : new AbortController();
+     const timer =
+       controller === null || waitMs === null ? null : setTimeout(() => controller.abort(), waitMs);
+-    navigator.locks
+-      .request(name, controller === null ? {} : { signal: controller.signal }, () => {
+-        if (timer !== null) clearTimeout(timer);
+-        settle(true);
+-        return new Promise<void>((release) => {
+-          heldLocks.push(release);
++    try {
++      navigator.locks
++        .request(name, controller === null ? {} : { signal: controller.signal }, () => {
++          if (timer !== null) clearTimeout(timer);
++          settle("held");
++          return new Promise<void>((release) => {
++            heldLocks.push(release);
++          });
++        })
++        .catch((error: unknown) => {
++          if (timer !== null) clearTimeout(timer);
++          // Only this call's own wait running out means another tab holds the lock (a DOMException
++          // is not an Error instance in every runtime, so read its name).
++          const timedOut =
++            controller?.signal.aborted === true &&
++            (error as { name?: unknown } | null)?.name === "AbortError";
++          settle(timedOut ? "timeout" : "error");
+         });
+-      })
+-      .catch(() => {
+-        if (timer !== null) clearTimeout(timer);
+-        settle(false);
+-      });
++    } catch {
++      if (timer !== null) clearTimeout(timer);
++      settle("error");
++    }
+   });
+ }
+ 
+@@ -243,26 +292,22 @@ type Ownership = "owned" | "other-tab" | "no-locks";
+ 
+ async function claimOwnership(): Promise<Ownership> {
+   if (!webLocksAvailable()) return "no-locks";
++  const result = await holdTabLock(`${AE_QUEUE_LOCK_PREFIX}:${readTabId()}`, lockWaitMs);
++  if (result === "held") return "owned";
++  if (result === "error") return "no-locks";
++  // Another live (or frozen) tab holds this id: this tab was copied from it. Take a fresh id so
++  // this tab's own notes have an owner from now on.
++  const fresh = newTabId();
+   try {
+-    if (await holdTabLock(`${AE_QUEUE_LOCK_PREFIX}:${readTabId()}`, lockWaitMs)) return "owned";
+-    // Another live (or frozen) tab holds this id: it was duplicated from this one. Take a fresh
+-    // id so this tab's own notes have an owner from now on.
+-    const fresh = newTabId();
+-    try {
+-      storage()?.setItem(AE_QUEUE_TAB_ID_KEY, fresh);
+-    } catch {
+-      // Without storage the next reload mints another id; nothing to keep.
+-    }
+-    void holdTabLock(`${AE_QUEUE_LOCK_PREFIX}:${fresh}`, null);
+-    return "other-tab";
++    storage()?.setItem(tabIdKey, fresh);
+   } catch {
+-    return "no-locks";
++    // Without storage the next reload mints another id; nothing to keep.
+   }
++  void holdTabLock(`${AE_QUEUE_LOCK_PREFIX}:${fresh}`, null);
++  return "other-tab";
+ }
+ 
+ async function currentIdentity(): Promise<string | null> {
+-  // Only a stored document that names a user needs the comparison; skip the probe otherwise.
+-  if (pendingEntries.length === 0 || storedUserId === null) return getCurrentUserId();
+   try {
+     return await resolveIdentity();
+   } catch {
+@@ -277,10 +322,18 @@ function plural(n: number, one: string, many: string): string {
+ async function restore(): Promise<void> {
+   const [ownership, userId] = await Promise.all([claimOwnership(), currentIdentity()]);
+   const entries = pendingEntries;
+-  const identityMismatch =
+-    storedUserId !== null && userId !== null && storedUserId !== userId ? entries.length : 0;
+-  const otherTab = ownership === "other-tab" && identityMismatch === 0 ? entries.length : 0;
+-  const usable = identityMismatch > 0 || otherTab > 0 ? [] : entries;
++
++  // Ownership is per note: a note of another user is dropped, a note of a user this page
++  // cannot verify is carried untouched, and a note queued before identity was known may come
++  // back only as a Retry.
++  const usable: StoredEntry[] = [];
++  const carried: StoredEntry[] = [];
++  let otherUser = 0;
++  for (const entry of entries) {
++    if (entry.userId !== null && userId === null) carried.push(entry);
++    else if (entry.userId !== null && entry.userId !== userId) otherUser += 1;
++    else usable.push(entry);
++  }
+ 
+   const now = Date.now();
+   const current = useChatStore.getState().queuedMessages;
+@@ -290,18 +343,24 @@ async function restore(): Promise<void> {
+   let withFiles = 0;
+   let tooOld = 0;
+   let wasRetry = 0;
++  let unknownOwner = 0;
+   for (const entry of usable) {
+     const stableId = entry.stableId ?? randomUUID().replace(/-/g, "");
+     if (currentIds.has(stableId)) continue;
+     currentIds.add(stableId);
+     firstSeen.set(stableId, entry.firstSeenAt);
++    restoredOwners.set(stableId, entry.userId);
++    if (entry.fileNames !== undefined) lostFileNames.set(stableId, entry.fileNames);
+     const hasFiles = (entry.fileNames?.length ?? 0) > 0;
+     const old = now - entry.firstSeenAt >= AE_QUEUE_AUTO_SEND_MAX_AGE_MS;
+-    const sendsItself = ownership === "owned" && !hasFiles && !old && entry.requiresRetry !== true;
++    const ownerUnknown = entry.userId === null && userId !== null;
++    const sendsItself =
++      ownership === "owned" && !hasFiles && !old && !ownerUnknown && entry.requiresRetry !== true;
+     if (sendsItself) auto += 1;
+-    else if (entry.requiresRetry === true) wasRetry += 1;
+     else if (hasFiles) withFiles += 1;
+     else if (old) tooOld += 1;
++    else if (ownerUnknown) unknownOwner += 1;
++    else if (entry.requiresRetry === true) wasRetry += 1;
+     restored.push({
+       queueId: `${AE_QUEUE_RESTORED_ID_PREFIX}${stableId}`,
+       text: entry.text,
+@@ -314,8 +373,9 @@ async function restore(): Promise<void> {
+     });
+   }
+ 
+-  // The window is over: from here the store alone is what gets written.
++  // The window is over: from here the store and the carried notes are what gets written.
+   pendingEntries = [];
++  carriedEntries = carried;
+   restoring = false;
+   if (restored.length > 0) {
+     useChatStore.setState((s) => ({
+@@ -331,27 +391,31 @@ async function restore(): Promise<void> {
+   if (entries.length > 0) {
+     console.info(
+       `${LOG_PREFIX} restore: stored=${entries.length} restored=${restored.length} auto=${auto} ` +
+-        `heldBack=${heldBack} otherTab=${otherTab} identityMismatch=${identityMismatch} ownership=${ownership}`,
++        `heldBack=${heldBack} carried=${carried.length} otherUser=${otherUser} ownership=${ownership}`,
+     );
+   }
+ 
+-  if (otherTab > 0) {
++  if (heldBack === 0) return;
++  if (ownership === "other-tab") {
+     showToast(
+-      `${plural(otherTab, "queued note stays", "queued notes stay")} in the other tab this one was copied from.`,
++      `${plural(restored.length, "queued note came", "queued notes came")} back from before the reload. ` +
++        `${restored.length === 1 ? "It" : "They"} may also be waiting in a tab this one was copied from; ` +
++        "use Retry only for ones that never arrived.",
+     );
+     return;
+   }
+-  if (heldBack === 0) return;
+   const reasons: string[] = [];
+   if (ownership === "no-locks") {
+     reasons.push("this browser cannot tell whether another tab already holds them");
+   } else {
+     if (withFiles > 0)
+-      reasons.push(
+-        `${plural(withFiles, "had", "had")} attachments that a reload cannot keep (attach them again)`,
+-      );
++      reasons.push(`${withFiles} had attachments that a reload cannot keep (attach them again)`);
+     if (tooOld > 0) reasons.push(`${plural(tooOld, "was", "were")} queued over an hour ago`);
+     if (wasRetry > 0) reasons.push(`${plural(wasRetry, "was", "were")} already waiting for Retry`);
++    if (unknownOwner > 0)
++      reasons.push(
++        `${plural(unknownOwner, "was", "were")} queued before the signed-in user was known`,
++      );
+   }
+   showToast(
+     `${plural(restored.length, "queued note came", "queued notes came")} back after the reload. ` +
+@@ -367,10 +431,11 @@ async function restore(): Promise<void> {
+ export function installAeQueuePersist(): () => void {
+   if (!started) {
+     started = true;
++    const scope = paneScope();
++    docKey = scope === null ? AE_QUEUE_STORAGE_KEY : `${AE_QUEUE_STORAGE_KEY}:${scope}`;
++    tabIdKey = scope === null ? AE_QUEUE_TAB_ID_KEY : `${AE_QUEUE_TAB_ID_KEY}:${scope}`;
+     // Read before the write subscription exists, so the first write cannot wipe what is stored.
+-    const doc = readDoc();
+-    pendingEntries = doc?.entries ?? [];
+-    storedUserId = doc?.userId ?? null;
++    pendingEntries = readDoc()?.entries ?? [];
+     persistedKeys = new Set(pendingEntries.map(noteKey));
+     restoring = true;
+     restorePromise = restore().catch((error: unknown) => {
+@@ -400,12 +465,16 @@ export const aeQueuePersistTestHooks = {
+     for (const release of heldLocks.splice(0)) release();
+     started = false;
+     restoring = false;
++    docKey = AE_QUEUE_STORAGE_KEY;
++    tabIdKey = AE_QUEUE_TAB_ID_KEY;
+     pendingEntries = [];
+-    storedUserId = null;
++    carriedEntries = [];
+     restorePromise = Promise.resolve();
+     lockWaitMs = opts.lockWaitMs ?? AE_QUEUE_LOCK_WAIT_MS;
+     warnedCap = false;
+     firstSeen.clear();
++    restoredOwners.clear();
++    lostFileNames.clear();
+     persistedKeys = new Set();
+   },
+ };

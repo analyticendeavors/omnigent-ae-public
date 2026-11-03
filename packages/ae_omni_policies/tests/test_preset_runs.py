@@ -48,6 +48,8 @@ class Rig:
         self.now = NOW
         self.on = True
         self.empty: set[str] = set()
+        self.unreadable: set[str] = set()
+        self.item_reads: list[str] = []
         self.state = StateFile(tmp_path / "state.json")
         self.sweeper = Sweeper(
             store=self,
@@ -88,11 +90,17 @@ class Rig:
         return SimpleNamespace(data=data, has_more=False, last_id=None)
 
     def list_items(self, conversation_id: str, **kw: Any) -> Any:
+        if conversation_id in self.unreadable:
+            raise RuntimeError("items unreadable")
         # A chat with no recorded calls still has one message unless it is listed in `empty`.
         default = [] if conversation_id in self.empty else [SimpleNamespace(data=None)]
-        return SimpleNamespace(
-            data=self.calls.get(conversation_id, default), has_more=False, last_id=None
-        )
+        self.item_reads.append(conversation_id)
+        # Like the store: `calls` holds the items oldest first; `order` and `limit` apply.
+        items = list(self.calls.get(conversation_id, default))
+        if kw.get("order", "asc") == "desc":
+            items.reverse()
+        limit = kw.get("limit", 100)
+        return SimpleNamespace(data=items[:limit], has_more=len(items) > limit, last_id=None)
 
     def sweep(self) -> list[str]:
         return self.sweeper.sweep_sync()
@@ -272,28 +280,189 @@ def test_agents_cost_and_review_are_collected(rig: Rig) -> None:
     assert line["lead"]["model"] == "opus"
 
 
-def test_a_running_child_idle_for_fifteen_minutes_is_marked_hung_and_it_sticks(rig: Rig) -> None:
+def item(kind: str, created_at: float) -> SimpleNamespace:
+    return SimpleNamespace(type=kind, created_at=int(created_at), data=None)
+
+
+def hang_rig(
+    rig: Rig, last: SimpleNamespace | None, *, extra: dict[str, str] | None = None, **kid: Any
+) -> list[str]:
+    """A working lead with one running child whose newest item is *last*; the hung child ids."""
+    rig.add(Conv("lead", status(labels.WORKING)))
+    rig.add(
+        Conv(
+            "kid",
+            status(labels.WORKING) | {labels.ORCH: "lead"} | (extra or {}),
+            live_status=kid.pop("live_status", "running"),
+            updated_at=int(NOW) - 5000,
+            **kid,
+        )
+    )
+    if last is not None:
+        rig.calls["kid"] = [last]
+    rig.sweep()
+    with rig.state.locked() as data:
+        return list(data["hung"])
+
+
+def test_a_child_that_delivered_its_report_and_went_silent_is_not_hung(rig: Rig) -> None:
+    assert hang_rig(rig, item("message", NOW - 5000)) == []
+
+
+def test_a_child_with_a_tool_result_last_is_not_hung(rig: Rig) -> None:
+    assert hang_rig(rig, item("function_call_output", NOW - 5000)) == []
+
+
+def test_an_unanswered_tool_call_flags_a_helper_after_thirty_minutes(rig: Rig) -> None:
+    assert hang_rig(rig, item("function_call", NOW - 1799)) == []
+    rig.calls["kid"] = [item("function_call", NOW - 1800)]
+    rig.sweep()
+    with rig.state.locked() as data:
+        assert data["hung"] == {"kid": "lead"}
+
+
+def test_a_builder_needs_forty_five_minutes(rig: Rig) -> None:
+    builder = {labels.ROLE: "builder"}
+    assert hang_rig(rig, item("function_call", NOW - 2699), extra=builder) == []
+    rig.calls["kid"] = [item("function_call", NOW - 2700)]
+    rig.sweep()
+    with rig.state.locked() as data:
+        assert data["hung"] == {"kid": "lead"}
+
+
+def test_a_codex_child_needs_forty_five_minutes(rig: Rig) -> None:
+    assert hang_rig(rig, item("function_call", NOW - 2000), agent_id="codex") == []
+    rig.calls["kid"] = [item("function_call", NOW - 2700)]
+    rig.sweep()
+    with rig.state.locked() as data:
+        assert data["hung"] == {"kid": "lead"}
+
+
+def test_the_age_is_the_last_item_not_updated_at(rig: Rig) -> None:
+    # updated_at is old, but the child made a tool call a minute ago: it is working.
+    assert hang_rig(rig, item("function_call", NOW - 60)) == []
+
+
+def test_review_reference_and_idle_children_are_not_hung(rig: Rig) -> None:
+    stale = item("function_call", NOW - 5000)
+    assert hang_rig(rig, stale, live_status="idle") == []
+    for ended in (labels.REVIEW, labels.REFERENCE):
+        rig.convs["kid"].labels = status(ended) | {labels.ORCH: "lead"}
+        rig.convs["kid"].live_status = "running"
+        rig.sweep()
+        with rig.state.locked() as data:
+            assert data["hung"] == {}
+
+
+def test_an_unreadable_child_is_not_hung(rig: Rig) -> None:
+    rig.unreadable.add("kid")
+    assert hang_rig(rig, None) == []
+    assert rig.convs["kid"].id in rig.convs  # the sweep survived the read error
+
+
+def test_a_child_with_no_items_is_not_hung(rig: Rig) -> None:
+    rig.empty.add("kid")
+    assert hang_rig(rig, None) == []
+
+
+def test_a_hung_child_sticks_and_the_line_carries_hang_rule_two(rig: Rig) -> None:
+    assert hang_rig(rig, item("function_call", NOW - 4000)) == ["kid"]
+    rig.calls["kid"] = [item("message", NOW)]  # it answered later; the mark stays
+    rig.convs["kid"].live_status = "idle"
+    rig.convs["lead"].labels = status(labels.REVIEW)
+    rig.sweep()
+    [line] = rig.lines()
+    assert line["hang_rule"] == preset_runs.HANG_RULE == 2
+    assert [a["hung"] for a in line["agents"]] == [True]
+    with rig.state.locked() as data:
+        assert data["hung"] == {}
+
+
+def test_a_native_builder_subagent_uses_the_builder_limit(rig: Rig) -> None:
+    desc = {preset_runs._NATIVE_DESCRIPTION: "Builder A: fix the login test"}
+    assert hang_rig(rig, item("function_call", NOW - 2000), extra=desc) == []
+    rig.calls["kid"] = [item("function_call", NOW - 2700)]
+    rig.sweep()
+    with rig.state.locked() as data:
+        assert data["hung"] == {"kid": "lead"}
+
+
+def test_the_newest_item_decides_not_the_oldest(rig: Rig) -> None:
+    stale = [item("message", NOW - 9000), item("function_call", NOW - 4000)]
+    rig.calls["kid"] = stale
+    assert hang_rig(rig, None) == ["kid"]
+
+
+def test_an_old_tool_call_followed_by_a_newer_message_is_not_hung(rig: Rig) -> None:
+    rig.calls["kid"] = [item("function_call", NOW - 9000), item("message", NOW - 4000)]
+    assert hang_rig(rig, None) == []
+
+
+def test_a_child_waiting_on_a_running_orch_child_is_not_hung(rig: Rig) -> None:
+    rig.add(
+        Conv(
+            "grandkid",
+            status(labels.WORKING) | {labels.ORCH: "kid"},
+            live_status="running",
+            updated_at=int(NOW) - 5,
+        )
+    )
+    assert hang_rig(rig, item("function_call", NOW - 4000)) == []
+
+
+def test_a_child_waiting_on_a_running_native_subagent_is_not_hung(rig: Rig) -> None:
+    rig.add(Conv("sub", parent_conversation_id="kid", kind="sub_agent", live_status="running"))
+    assert hang_rig(rig, item("function_call", NOW - 4000)) == []
+
+
+def test_a_child_whose_own_children_are_all_done_is_hung(rig: Rig) -> None:
+    rig.add(Conv("sub", parent_conversation_id="kid", kind="sub_agent", live_status="idle"))
+    assert hang_rig(rig, item("function_call", NOW - 4000)) == ["kid"]
+
+
+def test_a_child_reached_two_ways_is_read_once(rig: Rig) -> None:
+    # "kid" has both the ae.orch label and the parent link to the lead.
+    rig.add(Conv("lead", status(labels.WORKING)))
+    rig.add(
+        Conv(
+            "kid",
+            status(labels.WORKING) | {labels.ORCH: "lead"},
+            parent_conversation_id="lead",
+            live_status="running",
+            updated_at=int(NOW) - 5000,
+        )
+    )
+    rig.calls["kid"] = [item("message", NOW - 5000)]
+    rig.sweep()
+    assert rig.item_reads.count("kid") == 1
+
+
+def test_a_recently_updated_child_costs_no_item_read(rig: Rig) -> None:
     rig.add(Conv("lead", status(labels.WORKING)))
     rig.add(
         Conv(
             "kid",
             status(labels.WORKING) | {labels.ORCH: "lead"},
             live_status="running",
-            updated_at=int(NOW) - 899,
+            updated_at=int(NOW) - 100,
         )
     )
     rig.sweep()
-    with rig.state.locked() as data:
-        assert data["hung"] == {}
-    rig.now = NOW + 2
+    assert "kid" not in rig.item_reads
+
+
+def test_a_failing_hang_check_does_not_abort_the_visit(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def boom(*_a: Any, **_k: Any) -> list[str]:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(rig.sweeper, "_hung_ids", boom)
+    rig.add(Conv("lead", status(labels.WORKING)))
+    rig.add(Conv("kid", status(labels.WORKING) | {labels.ORCH: "lead"}, live_status="running"))
     rig.sweep()
-    rig.convs["kid"].live_status = "idle"
-    rig.convs["lead"].labels = status(labels.REVIEW)
-    rig.sweep()
-    [line] = rig.lines()
-    assert [a["hung"] for a in line["agents"]] == [True]
     with rig.state.locked() as data:
-        assert data["hung"] == {}
+        assert data["hung"] == {} and "lead" in data["live"]
 
 
 def test_a_report_for_a_lead_survives_until_its_line(rig: Rig) -> None:

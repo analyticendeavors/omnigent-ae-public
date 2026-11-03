@@ -1,0 +1,270 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 16:31:03 -0800
+Subject: [PATCH 281/289] [ae-patch] Fix the fix-check findings on the queued
+ Compact safe point
+
+Fix-check fixes to the previous patch (2026-11-01).
+
+A user_message block without content made isPrepareMessage throw
+(JSON.stringify(undefined) has no includes) inside advance() after the phase
+was set to preparing but before any timer was armed, so the plan could sit
+in preparing forever, and the web test run exited 1 on an unhandled
+rejection while "still sees a failure when the transcript is replaced by a
+shorter one mid-turn" passed vacuously. A block with no content is now not a
+prepare message, both timers are armed before the send-time snapshot, and the
+quiet timer catches a rejected advance() and fails the plan with a toast. The
+test's fixtures get content and it asserts the failure toast again.
+
+The anchor must follow the newest block at send time, matched by object or
+by server item id so a rehydrate keeps it: an older compact's prepare
+message loaded by scrolling back while this plan's message is in flight is
+no longer taken for the anchor. A prepare message that lands only after its
+own turn's idle edge (a late consumed event or snapshot merge) now counts
+once a turn ran and a completed response_end follows it, instead of waiting
+out the 15 minute limit. New tests cover a contentless user message, the
+scrolled-back prepare message, the late landing, and a prepare message that
+lands while its turn is already running.
+---
+ web/src/lib/aeCompactPlan.test.ts | 79 +++++++++++++++++++++++++++++--
+ web/src/lib/aeCompactPlan.ts      | 66 +++++++++++++++++++++-----
+ 2 files changed, 131 insertions(+), 14 deletions(-)
+
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+index 9869000ea3256c4b8d130a200d3dd9843b62ca14..d41834f749af32088acfd03df66c031a420f78d7 100644
+--- a/web/src/lib/aeCompactPlan.test.ts
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -324,19 +324,31 @@ describe("queued compact", () => {
+   it("still sees a failure when the transcript is replaced by a shorter one mid-turn", async () => {
+     setChat({
+       blocks: [
+-        { type: "user_message", ctx: { responseId: "r0" } },
+-        { type: "user_message", ctx: { responseId: "r0" } },
+-        { type: "user_message", ctx: { responseId: "r1" } },
++        { type: "user_message", content: [], ctx: { responseId: "r0" } },
++        { type: "user_message", content: [], ctx: { responseId: "r0" } },
++        { type: "user_message", content: [], ctx: { responseId: "r1" } },
+       ],
+     });
+     startAeCompactPlan(ID);
+     await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
+     setChat({
+       sessionStatus: "idle",
+       blocks: [prepBlock(), { type: "response_end", status: "failed", ctx: { responseId: "r2" } }],
+     });
+     await tick(2000);
+     expect(compact).not.toHaveBeenCalled();
++    expect(toasts.join("\n")).toContain("did not finish saving its notes cleanly");
++  });
++
++  it("treats a user message without content as no prepare message", async () => {
++    setChat({ blocks: [{ type: "user_message", ctx: { responseId: "r0", itemId: null } }] });
++    startAeCompactPlan(ID);
++    await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
++    setChat({ sessionStatus: "idle" });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
+   });
+ 
+   it("judges only what follows the prepare message when it is in the transcript", async () => {
+@@ -467,4 +479,65 @@ describe("queued compact", () => {
+     expect(compact).not.toHaveBeenCalled();
+     expect(toasts.join("\n")).toContain("took too long");
+   });
++
++  it("ignores an older prepare message loaded by scrolling back after the send", async () => {
++    const last = {
++      type: "response_end",
++      status: "completed",
++      ctx: { responseId: "r1", itemId: "item_r1" },
++    };
++    setChat({ blocks: [last] });
++    send.mockImplementation(() => new Promise<void>(() => {}));
++    startAeCompactPlan(ID);
++    await tick(2000);
++    // History loads older items in front: an earlier compact's prepare message among them.
++    setChat({ blocks: [prepBlock("item_older"), { ...last }] });
++    status("running", { responseId: "r_note" });
++    await tick(3000);
++    status("idle", { responseId: "r_note", backgroundTaskCount: 1 });
++    status("idle");
++    await tick(10_000);
++    expect(compact).not.toHaveBeenCalled();
++    consumePrep();
++    status("running", { responseId: "r2" });
++    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++  });
++
++  it("counts a prepare message that lands only after its own turn went idle", async () => {
++    send.mockImplementation(() => Promise.resolve());
++    startAeCompactPlan(ID);
++    await tick(2000);
++    status("running", { responseId: "r2" });
++    await tick(4000);
++    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
++    await tick(3000);
++    expect(compact).not.toHaveBeenCalled();
++    // A snapshot merge brings the message and its finished reply at once.
++    setChat({
++      sessionStatus: "idle",
++      blocks: [
++        ...blocksNow(),
++        prepBlock(),
++        { type: "response_end", status: "completed", ctx: { responseId: "r2" } },
++      ],
++    });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++  });
++
++  it("counts a prepare message that lands while its turn is already running", async () => {
++    send.mockImplementation(() => Promise.resolve());
++    startAeCompactPlan(ID);
++    await tick(2000);
++    status("running", { responseId: "r2" });
++    await tick(1000);
++    consumePrep();
++    await tick(4000);
++    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
++    status("idle");
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++  });
+ });
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+index e093b696b3ce4f09cd020c1d88625098197d9d26..7a08892d7f2fe7f3d5e8fde53bcd3dde2d454fc3 100644
+--- a/web/src/lib/aeCompactPlan.ts
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -48,6 +48,12 @@ interface Plan {
+    */
+   seenBlocks: WeakSet<object>;
+   seenItems: Set<string>;
++  /**
++   * The newest block at send time, and the newest server item id: the anchor must follow them,
++   * so an older prepare message loaded by scrolling back is never taken for this plan's.
++   */
++  sendTail: object | null;
++  sendTailItem: string | null;
+   stableTimer: ReturnType<typeof setTimeout> | null;
+   limitTimer: ReturnType<typeof setTimeout> | null;
+   startTimer: ReturnType<typeof setTimeout> | null;
+@@ -76,20 +82,37 @@ function safeNow(s: StoreState, conversationId: string): boolean {
+   return !s.queuedMessages.some((m) => m.conversationId === conversationId);
+ }
+ 
++/** A block with no content is not a prepare message. */
+ function isPrepareMessage(b: StoreState["blocks"][number]): boolean {
+   return (
+     b.type === "user_message" &&
+-    JSON.stringify(b.content).includes(AE_COMPACT_PREP_TEXT.slice(0, 40))
++    JSON.stringify(b.content ?? null).includes(AE_COMPACT_PREP_TEXT.slice(0, 40))
+   );
+ }
+ 
++/**
++ * Where the transcript stood at send time: the index of the send-time tail, found by object or
++ * by server item id so a rehydrate keeps it, or -1 when neither is there (an empty or replaced
++ * transcript, where only the send-time exclusions apply).
++ */
++function sendBoundary(blocks: StoreState["blocks"], plan: Plan): number {
++  if (!plan.sendTail && !plan.sendTailItem) return -1;
++  for (let index = blocks.length - 1; index >= 0; index--) {
++    const b = blocks[index]!;
++    if (b === plan.sendTail) return index;
++    if (plan.sendTailItem && b.ctx.itemId === plan.sendTailItem) return index;
++  }
++  return -1;
++}
++
+ /**
+  * Where this plan's prepare message sits in the transcript, or -1 while it is not there yet. It
+  * lands only once the runner consumed it (`session_input_consumed`), and keeps its server item id
+  * however history loads or shrinks; a prepare message that was there at send time is not it.
+  */
+ function prepareAnchor(blocks: StoreState["blocks"], plan: Plan): number {
+-  for (let index = blocks.length - 1; index >= 0; index--) {
++  const boundary = sendBoundary(blocks, plan);
++  for (let index = blocks.length - 1; index > boundary; index--) {
+     const b = blocks[index]!;
+     if (!isPrepareMessage(b) || plan.seenBlocks.has(b)) continue;
+     if (b.ctx.itemId && plan.seenItems.has(b.ctx.itemId)) continue;
+@@ -142,11 +165,7 @@ async function advance(conversationId: string) {
+     plan.phase = "preparing";
+     plan.sawRunning = false;
+     plan.sawTurn = false;
+-    for (const b of store.blocks) {
+-      if (!isPrepareMessage(b)) continue;
+-      plan.seenBlocks.add(b);
+-      if (b.ctx.itemId) plan.seenItems.add(b.ctx.itemId);
+-    }
++    // Both timers are armed first, so a plan can never sit in "preparing" with nothing to end it.
+     plan.limitTimer = setTimeout(
+       () => fail(conversationId, "Compact cancelled: the chat took too long to save its notes."),
+       AE_COMPACT_PREP_LIMIT_MS,
+@@ -161,6 +180,14 @@ async function advance(conversationId: string) {
+         fail(conversationId, "Compact cancelled: the chat never started saving its notes.");
+       }
+     }, AE_COMPACT_START_LIMIT_MS);
++    plan.sendTail = store.blocks.at(-1) ?? null;
++    plan.sendTailItem = null;
++    for (const b of store.blocks) {
++      if (b.ctx.itemId) plan.sendTailItem = b.ctx.itemId;
++      if (!isPrepareMessage(b)) continue;
++      plan.seenBlocks.add(b);
++      if (b.ctx.itemId) plan.seenItems.add(b.ctx.itemId);
++    }
+     emit();
+     try {
+       await store.send(AE_COMPACT_PREP_TEXT, agentId, undefined, {
+@@ -184,11 +211,22 @@ async function advance(conversationId: string) {
+     return;
+   }
+   if (plan.phase !== "preparing") return;
+-  // Idle, but the prepare turn has not been seen running: keep waiting; the start timer and the
+-  // 15 minute limit end it.
+-  if (!plan.sawTurn) return;
+   const anchor = prepareAnchor(store.blocks, plan);
+   if (anchor < 0) return;
++  // The prepare turn was not seen running with its message in place. A message that lands only
++  // after its own turn's idle edge (a late consumed event or snapshot merge) still counts once a
++  // turn ran and a completed response follows it; otherwise keep waiting, and the start timer and
++  // the 15 minute limit end it.
++  if (
++    !plan.sawTurn &&
++    !(
++      plan.sawRunning &&
++      store.blocks
++        .slice(anchor + 1)
++        .some((b) => b.type === "response_end" && b.status === "completed")
++    )
++  )
++    return;
+   // A turn that failed, was cancelled, or raised an error did not finish saving: compact nothing.
+   const failed = store.blocks
+     .slice(anchor + 1)
+@@ -227,7 +265,11 @@ function schedule(conversationId: string, plan: Plan) {
+   if (plan.stableTimer) clearTimeout(plan.stableTimer);
+   plan.stableTimer = setTimeout(() => {
+     plan.stableTimer = null;
+-    void advance(conversationId);
++    advance(conversationId).catch((error: unknown) => {
++      if (plans.get(conversationId) === plan && plan.phase !== "compacting") {
++        fail(conversationId, `Compact cancelled: something went wrong (${reason(error)}).`);
++      }
++    });
+   }, AE_COMPACT_STABLE_MS);
+ }
+ 
+@@ -268,6 +310,8 @@ export function startAeCompactPlan(conversationId: string, onCompacted?: () => v
+     sawTurn: false,
+     seenBlocks: new WeakSet(),
+     seenItems: new Set(),
++    sendTail: null,
++    sendTailItem: null,
+     stableTimer: null,
+     limitTimer: null,
+     startTimer: null,

@@ -131,7 +131,8 @@ def test_apply_changes_sets_validates_and_leaves_the_input_alone() -> None:
 
 
 def test_a_reviewer_slot_path_needs_that_slot() -> None:
-    before = _preset("mine")  # balanced: two reviewers
+    before = _preset("mine")  # balanced: three reviewers, the last one the security slot
+    before["roles"]["reviewer"]["reviewers"] = before["roles"]["reviewer"]["reviewers"][:2]
     after = ps.apply_changes(
         before,
         [
@@ -513,6 +514,24 @@ def test_a_failed_swap_puts_the_status_back(
     with pytest.raises(ps.SuggestionError):
         sugs.undo("ann", record["id"], roles=roles, now=NOW)
     assert sugs.get(record["id"])["status"] == "applied"
+
+
+def test_an_invalid_merged_state_is_a_422_and_the_suggestion_stays_open(
+    sugs: ps.SuggestionStore, roles: RolePrefsStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    record = _applied(sugs, roles)
+
+    def invalid(*_a: Any, **_k: Any) -> Any:
+        raise role_prefs.RolesInvalid(
+            "preset 'mine': reviewer 1 must always run (it takes the fix"
+        )
+
+    monkeypatch.setattr(roles, "put", invalid)
+    with pytest.raises(ps.SuggestionError) as err:
+        sugs.apply("ann", record["id"], roles=roles, now=NOW)
+    assert (err.value.status, err.value.code) == (422, "invalid_preset")
+    assert "reviewer 1 must always run" in err.value.message
+    assert sugs.get(record["id"])["status"] == "open"
 
 
 def test_a_stuck_apply_whose_preset_never_changed_rolls_back(

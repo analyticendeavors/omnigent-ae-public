@@ -30,6 +30,8 @@
 // first column on three and two columns, and after Deploys on a phone.
 // 2026-10-29: the Family cost card (familyCost.ts) joined, right after Presets in the first column
 // on three and two columns and after Presets on a phone.
+// 2026-10-30: the Family cost card folded into the Presets card, now "Spend", as its Families tab;
+// a saved arrangement that still names "family" loads without it (boardLayout.ts drops unknown ids).
 // 2026-10-21: the Accounts card (accounts.ts) joined, at the head of the
 // middle column, where the account nearest its limit reads first.
 // 2026-10-28: the Box health card opens with the box monitor (boxHealth.ts), and its
@@ -53,7 +55,7 @@ import { foldIcon, gripIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
 import { getTile, type Health, onTiles, type TileId, worst } from "./tiles";
 
-export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets" | "family";
+export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets";
 
 /** The cards a board holds; a box admin's page holds only the Box health card. */
 export type CardSet = Partial<Record<CardId, HTMLElement>>;
@@ -64,15 +66,15 @@ export const TWO_COLUMNS_PX = 520;
 /** The cards in each column, by column count. */
 export const LAYOUTS: Defaults = {
   3: [
-    ["deploys", "presets", "family", "box", "vault"],
+    ["deploys", "presets", "box", "vault"],
     ["accounts", "compute"],
     ["azure", "credit", "git"],
   ],
   2: [
-    ["deploys", "presets", "family", "box", "compute", "git"],
+    ["deploys", "presets", "box", "compute", "git"],
     ["accounts", "azure", "credit", "vault"],
   ],
-  1: [["deploys", "presets", "family", "accounts", "compute", "credit", "azure", "box", "vault", "git"]],
+  1: [["deploys", "presets", "accounts", "compute", "credit", "azure", "box", "vault", "git"]],
 };
 
 /** The tiles whose health and values a card's folded header line carries. */
@@ -85,8 +87,7 @@ export const CARD_TILES: Record<CardId, TileId[]> = {
   box: ["boxhealth", "host", "secrets"],
   vault: ["vault"],
   git: ["git"],
-  presets: ["presets"],
-  family: ["family"],
+  presets: ["presets", "family"],
 };
 
 export function columnsFor(width: number): 1 | 2 | 3 {

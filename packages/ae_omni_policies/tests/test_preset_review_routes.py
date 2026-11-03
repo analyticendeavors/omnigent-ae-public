@@ -317,6 +317,7 @@ async def test_apply_after_the_preset_changed_is_a_409(
     sugs = await _filed(client, world, {})
     state = (await client.get("/v1/ae/roles")).json()
     state.pop("starters")
+    state.pop("builtin_personas")
     state["presets"][0]["description"] = "edited by hand"
     assert (await client.put("/v1/ae/roles", json=state)).status_code == 200
     refused = await client.post(f"/v1/ae/preset-suggestions/{sugs['own']['id']}/apply", json={})

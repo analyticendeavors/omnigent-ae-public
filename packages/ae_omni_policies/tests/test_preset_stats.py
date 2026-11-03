@@ -41,8 +41,9 @@ def line(
     changes: list[dict[str, Any]] | None = None,
     run_key: str | None = None,
     review: dict[str, Any] | None = None,
+    hang_rule: int | None = 2,
 ) -> dict[str, Any]:
-    return {
+    out = {
         "session": f"s{n}",
         "user": "owner@example.com",
         "title": f"Run {n}",
@@ -57,6 +58,9 @@ def line(
         "review": review or {"reported": False, "reviewer_sessions": 0},
         "at": int(NOW - age_days * DAY),
     }
+    if hang_rule is not None:
+        out["hang_rule"] = hang_rule
+    return out
 
 
 def write(path: Path, lines: list[dict[str, Any]]) -> None:
@@ -716,3 +720,48 @@ def test_tokens_change_needs_tokens_on_half_the_runs_of_each_window(_files: Path
     prior_bare = [line(20 + i, age_days=9) for i in range(3)]
     write(_files, [full[0], full[1], full[2], *prior_bare])
     assert preset_stats.compute(7, now=NOW)["kpis"]["tokens_change_pct"] is None
+
+
+# -- hang rule 2 and short runs (2026-10-30)
+
+
+def test_hang_flags_on_lines_without_hang_rule_two_count_as_no_hangs(_files: Path) -> None:
+    old = [line(i, hang_rule=None, agents=[hung("builder")]) for i in range(3)]
+    old += [line(10 + i, hang_rule=1, agents=[hung("builder")]) for i in range(3)]
+    write(_files, old)
+    view = preset_stats.compute(30, now=NOW)
+    assert view["takeaways"] == []
+    assert view["kpis"]["hung_runs"] == 0
+    assert all(r["flags"] == [] for r in view["presets"][0]["recent"])
+    assert view["presets"][0]["hung_runs"] == 0
+    write(_files, [line(i, agents=[hung("builder")]) for i in range(3)])
+    view = preset_stats.compute(30, now=NOW)
+    assert view["kpis"]["hung_runs"] == 3 and view["presets"][0]["hung_runs"] == 3
+    why = view["takeaways"][0]["why"]
+    assert "Stopped mid tool call" in why and "45 minutes (builders, Codex)" in why
+    assert "30 (others)" in why
+
+
+def test_runs_under_three_minutes_are_left_out_of_comparisons(_files: Path) -> None:
+    # Five real runs of "a" against five smoke tests of "b": no takeaway, KPIs count all ten.
+    write(_files, _runs("a", 5, 0, cost=9.0, wall=1800) + _runs("b", 5, 10, cost=0.1, wall=100))
+    view = preset_stats.compute(30, now=NOW)
+    assert view["takeaways"] == []
+    assert view["kpis"]["runs"] == 10
+    assert {p["id"]: p["runs"] for p in view["presets"]} == {"a": 5, "b": 5}
+
+
+def test_a_run_with_no_wall_time_is_left_out_of_comparisons(_files: Path) -> None:
+    runs = _runs("a", 5, 0, cost=9.0) + _runs("b", 5, 10, cost=1.0)
+    runs[0]["wall_s"] = None
+    write(_files, runs)
+    assert not any(t["id"] == "cost:a" for t in preset_stats.compute(30, now=NOW)["takeaways"])
+
+
+def test_short_runs_on_the_rest_side_do_not_dilute_the_comparison(_files: Path) -> None:
+    lines = _runs("a", 5, 0, cost=9.0) + _runs("b", 5, 10, cost=3.0)
+    lines += _runs("c", 20, 30, cost=0.01, wall=60)
+    write(_files, lines)
+    got = [t for t in preset_stats.compute(30, now=NOW)["takeaways"] if t["id"] == "cost:a"]
+    assert got and "$3.00" in got[0]["why"]
+    assert "under 3 minutes are left out" in got[0]["why"]

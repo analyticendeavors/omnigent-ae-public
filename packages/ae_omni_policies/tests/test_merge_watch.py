@@ -621,3 +621,72 @@ async def test_a_workspace_missing_refusal_is_dropped_not_retried(
         post=httpx.Response(409, json=body),
     )
     assert await _post() == "drop"
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        {"archived": True, "workspace": "/home/u/x", "labels": {}},
+        {"archived": False, "labels": {"ae.role": "reviewer", "ae.status": "reference"}},
+        {"archived": False, "labels": {"ae.role": "helper"}},
+        {"archived": False, "labels": {"ae.orch": "654398e2785d482aaca4b4732d238804"}},
+        {"archived": False, "labels": {}, "parent_session_id": "conv_parent"},
+        {
+            "archived": False,
+            "labels": {"ae.role": "builder", "ae.orch": "conv_lead", "ae.status": "reference"},
+        },
+    ],
+)
+async def test_an_archived_or_finished_helper_chat_is_not_woken_in_a_container(
+    monkeypatch: pytest.MonkeyPatch, session: dict[str, Any]
+) -> None:
+    # The container cannot see the host's disk, so the workspace check is off there; waking
+    # such a chat relaunches its runner in a deleted worktree and fails it.
+    monkeypatch.setattr(merge_watch, "_in_container", lambda: True)
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json=session))
+    assert await _post() == "drop"
+    assert calls == ["GET"]
+
+
+@pytest.mark.parametrize("role", ["lead", "planner", "builder"])
+async def test_a_lead_planner_or_builder_chat_still_gets_the_note(
+    monkeypatch: pytest.MonkeyPatch, role: str
+) -> None:
+    monkeypatch.setattr(merge_watch, "_in_container", lambda: True)
+    session = {"archived": False, "workspace": "/home/u/x", "labels": {"ae.role": role}}
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json=session))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        {"archived": False, "labels": {"ae.orch": "1"}},
+        {"archived": False, "labels": {}},
+        {"archived": False, "labels": {"ae.role": "builder", "ae.orch": "conv_lead"}},
+        {"archived": False, "labels": {"ae.role": "lead", "ae.status": "reference"}},
+    ],
+)
+async def test_a_top_level_or_builder_chat_without_a_finished_role_gets_the_note(
+    monkeypatch: pytest.MonkeyPatch, session: dict[str, Any]
+) -> None:
+    monkeypatch.setattr(merge_watch, "_in_container", lambda: True)
+    calls = _fake_call(monkeypatch, get=httpx.Response(200, json=session))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]
+
+
+async def test_a_dropped_note_is_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    # A drop ends the note for that session: _deliver records it as notified, never retries.
+    monkeypatch.setattr(merge_watch, "_in_container", lambda: True)
+    _fake_call(monkeypatch, get=httpx.Response(200, json={"archived": True, "labels": {}}))
+    assert await _post() == "drop"
+
+
+async def test_an_unreadable_session_still_gets_the_note(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = _fake_call(monkeypatch, get=httpx.Response(500))
+    assert await _post() == "posted"
+    assert calls == ["GET", "POST"]

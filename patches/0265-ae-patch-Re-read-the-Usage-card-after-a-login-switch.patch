@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 15:13:58 -0700
+Subject: [PATCH 265/289] [ae-patch] Re-read the Usage card after a login
+ switch until the runner stamps the new login
+
+The server answers the card from the runner's launch-time label, which is written only after the terminal relaunches, so the single re-read after the switch saw the old login and the next one came 60 s later. Re-read the Usage numbers again at 2, 5, 12 and 30 s.
+---
+ web/src/hooks/useAeSwitchClaudeAccount.ts | 13 +++++-
+ web/src/lib/aeClaudeAccount.test.ts       | 48 ++++++++++++++++++++++-
+ web/src/lib/aeClaudeAccount.ts            | 26 ++++++++++++
+ web/src/shell/AeMoveAllChatsDialog.tsx    |  4 +-
+ web/src/shell/AeSwitchFamilyDialog.tsx    |  6 +--
+ 5 files changed, 88 insertions(+), 9 deletions(-)
+
+diff --git a/web/src/hooks/useAeSwitchClaudeAccount.ts b/web/src/hooks/useAeSwitchClaudeAccount.ts
+index 3dcef658794dfa4e98bac4a8b05566e6ae4fb79f..d39b71b42283864f4001770288f427666c6a3b4f 100644
+--- a/web/src/hooks/useAeSwitchClaudeAccount.ts
++++ b/web/src/hooks/useAeSwitchClaudeAccount.ts
+@@ -1,15 +1,24 @@
+ // Switch one chat's Claude login in place (omnigent-ae, 2026-10-27). The chat's
+ // snapshot is re-read afterwards so every picker shows the new login.
+ // `includeChildren` (2026-10-28) moves the chat's family children with it.
++// The Usage numbers are re-read a few more times (2026-10-30): the runner stamps the new
++// login only after it relaunches the terminal, after the switch has answered.
+ 
++import { useEffect, useRef } from "react";
+ import { useMutation, useQueryClient } from "@tanstack/react-query";
+-import { aeRefreshChatAccount, putAeClaudeAccount } from "@/lib/aeClaudeAccount";
++import { aeRefreshChatAccountSoon, putAeClaudeAccount } from "@/lib/aeClaudeAccount";
+ 
+ export function useAeSwitchClaudeAccount(sessionId: string | null | undefined) {
+   const queryClient = useQueryClient();
++  const cancelRef = useRef<() => void>(() => {});
++  // Stop the pending re-reads when the chat changes or the component goes away.
++  useEffect(() => () => cancelRef.current(), [sessionId]);
+   return useMutation({
+     mutationFn: ({ account, includeChildren }: { account: string; includeChildren?: boolean }) =>
+       putAeClaudeAccount(sessionId ?? "", account, includeChildren === true),
+-    onSettled: () => aeRefreshChatAccount(queryClient, sessionId ?? null),
++    onSettled: () => {
++      cancelRef.current();
++      cancelRef.current = aeRefreshChatAccountSoon(queryClient, sessionId ?? null);
++    },
+   });
+ }
+diff --git a/web/src/lib/aeClaudeAccount.test.ts b/web/src/lib/aeClaudeAccount.test.ts
+index ee32760332aacc3e5ac5e95e03c0a4ffce151f85..d14cae823a513a8cad0288ee780bfaa038a961a4 100644
+--- a/web/src/lib/aeClaudeAccount.test.ts
++++ b/web/src/lib/aeClaudeAccount.test.ts
+@@ -1,5 +1,12 @@
+-import { describe, expect, it } from "vitest";
+-import { aeChatAccount, aeMoveAllSummary, aeSwitchSummary } from "./aeClaudeAccount";
++import type { QueryClient } from "@tanstack/react-query";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  AE_ACCOUNT_FOLLOW_UP_DELAYS_MS,
++  aeChatAccount,
++  aeMoveAllSummary,
++  aeRefreshChatAccountSoon,
++  aeSwitchSummary,
++} from "./aeClaudeAccount";
+ import { aeOtherClaudeAccounts } from "./aeLimitGate";
+ import { askAeMoveAll, dismissAeMoveAll } from "./aeMoveAllChats";
+ 
+@@ -106,3 +113,40 @@ describe("aeSwitchSummary", () => {
+     ).toBe("This chat now runs on Backup; 1 child chat moved; 1 skipped: Docs: needs a host");
+   });
+ });
++
++describe("aeRefreshChatAccountSoon", () => {
++  afterEach(() => vi.useRealTimers());
++
++  const limitsCalls = (spy: ReturnType<typeof vi.fn>) =>
++    spy.mock.calls.filter(([arg]) => arg?.queryKey?.[0] === "ae-limits").length;
++
++  it("re-reads the Usage numbers now and at each follow-up delay", () => {
++    vi.useFakeTimers();
++    const invalidate = vi.fn();
++    const client = { invalidateQueries: invalidate } as unknown as QueryClient;
++    aeRefreshChatAccountSoon(client, "s1");
++    expect(limitsCalls(invalidate)).toBe(1);
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "s1"] });
++    vi.advanceTimersByTime(Math.max(...AE_ACCOUNT_FOLLOW_UP_DELAYS_MS));
++    expect(limitsCalls(invalidate)).toBe(1 + AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.length);
++    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["ae-limits", "s1"] });
++  });
++
++  it("stops re-reading once cancelled", () => {
++    vi.useFakeTimers();
++    const invalidate = vi.fn();
++    const client = { invalidateQueries: invalidate } as unknown as QueryClient;
++    const cancel = aeRefreshChatAccountSoon(client, "s1");
++    vi.advanceTimersByTime(AE_ACCOUNT_FOLLOW_UP_DELAYS_MS[0]);
++    cancel();
++    vi.advanceTimersByTime(60_000);
++    expect(limitsCalls(invalidate)).toBe(2);
++  });
++
++  it("schedules nothing without a session", () => {
++    vi.useFakeTimers();
++    const invalidate = vi.fn();
++    aeRefreshChatAccountSoon({ invalidateQueries: invalidate } as unknown as QueryClient, null);
++    expect(vi.getTimerCount()).toBe(0);
++  });
++});
+diff --git a/web/src/lib/aeClaudeAccount.ts b/web/src/lib/aeClaudeAccount.ts
+index bac5107c956cefbce56bd5b13f01d3d1260e5989..0f4c7afada2aafbe8d17740854196d7909ecf957 100644
+--- a/web/src/lib/aeClaudeAccount.ts
++++ b/web/src/lib/aeClaudeAccount.ts
+@@ -61,6 +61,32 @@ export function aeRefreshChatAccount(queryClient: QueryClient, sessionId: string
+   if (sessionId) void queryClient.invalidateQueries({ queryKey: ["ae-limits", sessionId] });
+ }
+ 
++/**
++ * When to re-read the Usage numbers after a switch (ms after it settled). The server answers
++ * from the runner's launch-time label, which the runner stamps only after the terminal
++ * relaunches, so the first re-read can still see the old login (2026-10-30).
++ */
++export const AE_ACCOUNT_FOLLOW_UP_DELAYS_MS = [2000, 5000, 12000, 30000];
++
++/**
++ * `aeRefreshChatAccount` now, then the Usage numbers again at each follow-up delay so the card
++ * catches the runner's stamp. Returns a function that cancels the pending re-reads.
++ */
++export function aeRefreshChatAccountSoon(
++  queryClient: QueryClient,
++  sessionId: string | null,
++): () => void {
++  aeRefreshChatAccount(queryClient, sessionId);
++  if (!sessionId) return () => {};
++  const timers = AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.map((delay) =>
++    setTimeout(
++      () => void queryClient.invalidateQueries({ queryKey: ["ae-limits", sessionId] }),
++      delay,
++    ),
++  );
++  return () => timers.forEach(clearTimeout);
++}
++
+ /** The login a chat is on: the stored pick, else the last launch's, else unknown (`undefined`). */
+ export function aeChatAccount(
+   labels: Record<string, string> | null | undefined,
+diff --git a/web/src/shell/AeMoveAllChatsDialog.tsx b/web/src/shell/AeMoveAllChatsDialog.tsx
+index 77b130ae04af93ce489ec151a8373a2d4148d09f..341ed928477aeccc4b29cb20954e14b5d74971e8 100644
+--- a/web/src/shell/AeMoveAllChatsDialog.tsx
++++ b/web/src/shell/AeMoveAllChatsDialog.tsx
+@@ -17,7 +17,7 @@ import { showToast } from "@/components/ui/toast";
+ import {
+   AE_MOVE_ALL_CAUTION,
+   aeMoveAllSummary,
+-  aeRefreshChatAccount,
++  aeRefreshChatAccountSoon,
+   moveAllAeClaudeChats,
+ } from "@/lib/aeClaudeAccount";
+ import { dismissAeMoveAll, useAeMoveAllRequest } from "@/lib/aeMoveAllChats";
+@@ -33,7 +33,7 @@ export function AeMoveAllChatsDialog() {
+     moveAllAeClaudeChats(account, hostId).then(
+       (answer) => {
+         for (const id of [...answer.moved, ...answer.pending.map((p) => p.id)]) {
+-          aeRefreshChatAccount(queryClient, id);
++          aeRefreshChatAccountSoon(queryClient, id);
+         }
+         showToast(aeMoveAllSummary(answer));
+       },
+diff --git a/web/src/shell/AeSwitchFamilyDialog.tsx b/web/src/shell/AeSwitchFamilyDialog.tsx
+index f1cd58e96ff06362f94dd896cfc3c5460360d9b6..85b161d59b234ec1edc1468930358a8a652a6ac1 100644
+--- a/web/src/shell/AeSwitchFamilyDialog.tsx
++++ b/web/src/shell/AeSwitchFamilyDialog.tsx
+@@ -15,7 +15,7 @@ import {
+ } from "@/components/ui/dialog";
+ import { showToast } from "@/components/ui/toast";
+ import {
+-  aeRefreshChatAccount,
++  aeRefreshChatAccountSoon,
+   aeSwitchSummary,
+   aeSwitchedChildIds,
+   putAeClaudeAccount,
+@@ -40,7 +40,7 @@ export function AeSwitchFamilyDialog() {
+     putAeClaudeAccount(sessionId, account, includeChildren).then(
+       (answer) => {
+         for (const id of [sessionId, ...aeSwitchedChildIds(answer)]) {
+-          aeRefreshChatAccount(queryClient, id);
++          aeRefreshChatAccountSoon(queryClient, id);
+         }
+         const kids = answer.children;
+         // A skipped or slow child stays on screen until dismissed, so it can be retried.
+@@ -48,7 +48,7 @@ export function AeSwitchFamilyDialog() {
+         showToast(aeSwitchSummary(label, answer), lingers ? { duration: 0 } : undefined);
+       },
+       (failure: unknown) => {
+-        aeRefreshChatAccount(queryClient, sessionId);
++        aeRefreshChatAccountSoon(queryClient, sessionId);
+         showToast(failure instanceof Error ? failure.message : "Could not switch the login.");
+       },
+     );

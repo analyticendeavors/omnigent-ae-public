@@ -13,7 +13,7 @@ import pytest
 from pydantic import ValidationError
 
 from ae_omni_policies import auth, role_prefs
-from ae_omni_policies.role_prefs import RolePrefsStore, RolesPut
+from ae_omni_policies.role_prefs import RolePrefsStore, RolesPut, RolesState
 
 
 @pytest.fixture(autouse=True)
@@ -52,6 +52,7 @@ _CODEX = {
     "effort": None,
 }
 _REVIEW_DEFAULTS = {"review_merge": "merged", "reviewer_unavailable": "run_rest"}
+_SECURITY = {"mode": "fixed", "persona": "security"}
 _PINNED = ["save-tokens", "balanced", "solo", "yolo"]
 _NEW = ["think-it-through", "deep-debug", "quick-fix"]
 
@@ -70,6 +71,7 @@ def test_starters_use_real_catalog_ids() -> None:
         "reviewers": [
             {"mode": "fixed", "model": "claude-sonnet-5-5", "effort": "medium"},
             _CODEX | {"effort": "medium"},
+            _SECURITY,
         ],
     }
     assert balanced["helper"] == {"mode": "fixed", "model": "claude-haiku-5-5", "effort": "low"}
@@ -78,7 +80,7 @@ def test_starters_use_real_catalog_ids() -> None:
     assert all(r == fable for role, r in yolo["roles"].items() if role != "reviewer")
     assert yolo["roles"]["reviewer"] == {
         "mode": "multi",
-        "reviewers": [fable, _CODEX | {"effort": "xhigh"}],
+        "reviewers": [fable, _CODEX | {"effort": "xhigh"}, _SECURITY],
     }
     assert yolo["rules"] == {
         "raise_or_lower": "off",
@@ -92,12 +94,24 @@ def test_starters_use_real_catalog_ids() -> None:
         "auto_raises": 1,
         "helpers": "any",
     }
-    assert by_id["save-tokens"]["roles"]["reviewer"]["mode"] == "fixed"
+    assert by_id["save-tokens"]["roles"]["reviewer"] == {
+        "mode": "multi",
+        "reviewers": [
+            {"mode": "fixed", "model": "claude-haiku-5-5", "effort": "medium"},
+            {**_SECURITY, "model": "claude-sonnet-5-5", "effort": "medium"},
+        ],
+    }
     solo = by_id["solo"]
-    # Solo keeps one reviewer: its Helpers rule allows no child sessions.
+    # Solo's reviewers are both native subagents: its Helpers rule allows no child sessions.
     assert solo["roles"] == {
         **by_id["balanced"]["roles"],
-        "reviewer": {"mode": "fixed", "model": "claude-sonnet-5-5", "effort": "medium"},
+        "reviewer": {
+            "mode": "multi",
+            "reviewers": [
+                {"mode": "fixed", "model": "claude-sonnet-5-5", "effort": "medium"},
+                _SECURITY,
+            ],
+        },
     }
     assert solo["rules"] == {**by_id["balanced"]["rules"], "helpers": "own"}
     assert (solo["title"], solo["color"]) == ("Solo", "slate")
@@ -112,7 +126,12 @@ def test_starters_use_real_catalog_ids() -> None:
     )
     assert think["roles"]["planner"] == {"mode": "fixed", "model": opus, "effort": "xhigh"}
     assert think["roles"]["builder"] == {"mode": "fixed", "model": sonnet, "effort": "medium"}
-    assert [s["mode"] for s in think["roles"]["reviewer"]["reviewers"]] == ["fixed", "agent"]
+    assert [s["mode"] for s in think["roles"]["reviewer"]["reviewers"]] == [
+        "fixed",
+        "agent",
+        "fixed",
+    ]
+    assert think["roles"]["reviewer"]["reviewers"][2] == _SECURITY
     assert think["rules"]["lead_steps_down"] is True
     debug = by_id["deep-debug"]
     assert (debug["title"], debug["icon"], debug["color"]) == ("Deep debug", "bug", "amber")
@@ -122,7 +141,12 @@ def test_starters_use_real_catalog_ids() -> None:
     quick = by_id["quick-fix"]
     assert (quick["title"], quick["icon"], quick["color"]) == ("Quick fix", "bolt", "blue")
     low = {"mode": "fixed", "model": sonnet, "effort": "low"}
-    assert all(quick["roles"][r] == low for r in ("planner", "reviewer", "builder"))
+    assert all(quick["roles"][r] == low for r in ("planner", "builder"))
+    # The budget presets run the security persona on Sonnet, not the persona's Opus high.
+    assert quick["roles"]["reviewer"] == {
+        "mode": "multi",
+        "reviewers": [low, {**_SECURITY, "model": "claude-sonnet-5-5", "effort": "medium"}],
+    }
     assert quick["rules"]["helpers"] == "own"
     assert all(p["roles"]["lead"] == {"mode": "session"} for p in (think, debug, quick))
 
@@ -288,6 +312,184 @@ def test_reviewer_slots_are_checked(reviewers: list[Any], fragment: str) -> None
     assert fragment in str(caught.value)
 
 
+_OPUS = {"mode": "fixed", "model": "claude-opus-5-5", "effort": "high"}
+
+
+def _reviewers_of(preset: dict[str, Any], *slots: dict[str, Any], **top: Any) -> RolesPut:
+    preset["roles"]["reviewer"] = {"mode": "multi", "reviewers": list(slots)}
+    return RolesPut.model_validate(_body(presets=[preset], **top))
+
+
+def _persona(id: str = "docs", **over: Any) -> dict[str, Any]:
+    return {
+        "id": id,
+        "name": "Docs",
+        "purpose": "Check the docs match the change",
+        "instructions": "Read the docs the diff touches.\nFlag claims the code no longer backs.",
+        **over,
+    }
+
+
+def test_slots_without_a_persona_are_unchanged_and_write_no_persona_key() -> None:
+    put = _reviewers_of(_preset("a"), _OPUS, _CODEX)
+    dumped = put.presets[0].roles.reviewer.model_dump()
+    assert dumped["reviewers"][0] == _OPUS
+    assert "persona" not in dumped["reviewers"][1]
+    assert put.model_dump().get("personas") is None
+
+
+@pytest.mark.parametrize("second", [_OPUS, _CODEX, {"mode": "fixed"}])
+def test_a_later_slot_can_name_a_persona(second: dict[str, Any]) -> None:
+    put = _reviewers_of(_preset("a"), _OPUS, {**second, "persona": "security"})
+    assert put.presets[0].roles.reviewer.model_dump()["reviewers"][1]["persona"] == "security"
+
+
+def test_a_persona_slot_may_leave_its_model_out_but_others_may_not() -> None:
+    _reviewers_of(_preset("a"), {"mode": "fixed", "persona": "tests"})
+    with pytest.raises(ValidationError, match="model and an effort, or a persona"):
+        _reviewers_of(_preset("a"), _OPUS, {"mode": "fixed"})
+    with pytest.raises(ValidationError):
+        _reviewers_of(_preset("a"), _OPUS, {"mode": "fixed", "model": "claude-opus-5-5"})
+
+
+@pytest.mark.parametrize("first", [{"mode": "fixed"}, _CODEX])
+def test_reviewer_one_cannot_use_a_risky_builtin_persona(first: dict[str, Any]) -> None:
+    for risky in ("security", "accessibility"):
+        with pytest.raises(ValidationError, match="reviewer 1 must always run"):
+            _reviewers_of(_preset("a"), {**first, "persona": risky})
+    _reviewers_of(_preset("a"), {**first, "persona": "general"})
+    _reviewers_of(_preset("a"), {**first, "persona": "general"}, {**first, "persona": "security"})
+
+
+def test_reviewer_one_cannot_use_a_risky_user_persona() -> None:
+    preset = _preset("a")
+    with pytest.raises(ValidationError, match="reviewer 1 must always run"):
+        _reviewers_of(
+            preset, {"mode": "fixed", "persona": "docs"}, personas=[_persona(when="risky")]
+        )
+    _reviewers_of(_preset("a"), {"mode": "fixed", "persona": "docs"}, personas=[_persona()])
+
+
+def test_a_slot_naming_a_missing_persona_is_valid() -> None:
+    _reviewers_of(_preset("a"), _OPUS, {"mode": "fixed", "persona": "gone-away"})
+
+
+def test_a_persona_id_is_a_slug() -> None:
+    with pytest.raises(ValidationError):
+        _reviewers_of(_preset("a"), _OPUS, {**_OPUS, "persona": "Not A Slug"})
+
+
+def test_instructions_may_hold_a_tab_and_the_other_texts_say_why_they_refuse_one() -> None:
+    put = _reviewers_of(
+        _preset("a"), _OPUS, personas=[_persona(instructions="Check:\n\t- one\n\t- two")]
+    )
+    assert put.personas[0].instructions.startswith("Check:\n\t-")
+    with pytest.raises(ValidationError, match="new lines and tabs are fine in instructions"):
+        _reviewers_of(_preset("a"), _OPUS, personas=[_persona(purpose="a\tb")])
+    with pytest.raises(ValidationError, match=r"instructions cannot contain a control character"):
+        _reviewers_of(_preset("a"), _OPUS, personas=[_persona(instructions="a\x07b")])
+
+
+def test_a_put_that_omits_personas_cannot_put_a_stored_risky_persona_on_reviewer_one(
+    tmp_path: Path,
+) -> None:
+    store = RolePrefsStore(tmp_path / "roles.json")
+    risky = _persona(when="risky")
+    assert not store.put("u", RolesPut.model_validate(_body(personas=[risky]))).conflict
+    preset = _preset("a")
+    preset["roles"]["reviewer"] = {
+        "mode": "multi",
+        "reviewers": [{"mode": "fixed", "persona": "docs"}],
+    }
+    body = RolesPut.model_validate(_body(revision=1, presets=[preset]))
+    assert "personas" not in body.model_fields_set
+    with pytest.raises(role_prefs.RolesInvalid, match="reviewer 1 must always run"):
+        store.put("u", body)
+    assert store.get("u").revision == 1
+
+
+def test_user_personas_are_saved_and_kept_when_a_put_leaves_them_out(tmp_path: Path) -> None:
+    store = RolePrefsStore(tmp_path / "roles.json")
+    first = store.put("u", RolesPut.model_validate(_body(personas=[_persona()])))
+    assert [p.id for p in first.state.personas or []] == ["docs"]
+    again = store.put("u", RolesPut.model_validate(_body(revision=1)))
+    assert [p.id for p in again.state.personas or []] == ["docs"]
+    cleared = store.put("u", RolesPut.model_validate(_body(revision=2, personas=[])))
+    assert cleared.state.personas == []
+    reread = RolePrefsStore(tmp_path / "roles.json").get("u")
+    assert reread.personas == []
+
+
+@pytest.mark.parametrize(
+    ("personas", "fragment"),
+    [
+        ([_persona("security")], "built-in persona"),
+        ([_persona("general")], "built-in persona"),
+        ([_persona("a"), _persona("a")], "must be unique"),
+        ([_persona(f"p{i}") for i in range(21)], "at most 20"),
+        ([_persona(name="")], "at least 1"),
+        ([_persona(name="x" * 41)], "at most 40"),
+        ([_persona(purpose="x" * 201)], "at most 200"),
+        ([_persona(instructions="x" * 1001)], "at most 1000"),
+        ([_persona(instructions="")], "at least 1"),
+        ([_persona(name="a\nb")], "control character"),
+        ([_persona(purpose="a\nb")], "control character"),
+        ([_persona(trigger="a\nb")], "control character"),
+        ([_persona(instructions="a\rb")], "control character"),
+        ([_persona(instructions="a\x00b")], "control character"),
+        ([_persona(instructions="a\u2028b")], "invisible or direction"),
+        ([_persona(name="a\u202eb")], "invisible or direction"),
+        ([_persona(purpose="a\u200bb")], "invisible or direction"),
+        ([_persona(trigger="a\u2066b")], "invisible or direction"),
+        ([_persona(instructions="a\ufeffb")], "invisible or direction"),
+        ([_persona(name="a\tb")], "control character"),
+        ([_persona(name="   ")], "cannot be blank"),
+        ([_persona(instructions=" \n ")], "cannot be blank"),
+        ([_persona(trigger="  ")], "cannot be blank"),
+        ([_persona(when="sometimes")], "when"),
+        ([_persona(effort="huge")], "effort"),
+        ([_persona(id="Bad Id")], "pattern"),
+        ([_persona(extra=1)], "extra"),
+    ],
+)
+def test_user_personas_are_checked(personas: list[dict[str, Any]], fragment: str) -> None:
+    with pytest.raises(ValidationError) as caught:
+        RolesPut.model_validate(_body(personas=personas))
+    assert fragment in str(caught.value)
+
+
+def test_instructions_may_hold_newlines_and_a_full_length_persona_is_valid() -> None:
+    put = RolesPut.model_validate(
+        _body(personas=[_persona(instructions="a\nb\n" + "x" * 990, name="n" * 40)])
+    )
+    assert put.personas is not None
+    assert "\n" in put.personas[0].instructions
+
+
+def test_builtin_personas_are_always_present_and_read_only() -> None:
+    view = role_prefs.view(RolePrefsStore().get("someone"))
+    ids = [p["id"] for p in view["builtin_personas"]]
+    assert ids == ["general", "security", "performance", "tests", "accessibility"]
+    by_id = {p["id"]: p for p in view["builtin_personas"]}
+    assert by_id["general"]["when"] == "always"
+    assert (by_id["security"]["model"], by_id["security"]["effort"]) == (
+        "claude-opus-5-5",
+        "high",
+    )
+    assert by_id["security"]["when"] == "risky"
+    assert "public repo" in by_id["security"]["trigger"]
+    assert "attack path" in by_id["security"]["instructions"]
+    assert by_id["accessibility"]["when"] == "risky"
+    assert "personas" not in view  # built-ins are never stored per user
+
+
+def test_find_persona_prefers_builtins_and_then_the_users_own() -> None:
+    state = RolesState.model_validate({**_body(personas=[_persona()]), "revision": 0})
+    assert role_prefs.find_persona(state, "security").name == "Security"  # type: ignore[union-attr]
+    assert role_prefs.find_persona(state, "docs").name == "Docs"  # type: ignore[union-attr]
+    assert role_prefs.find_persona(state, "gone") is None
+
+
 @pytest.mark.parametrize("role", ["planner", "builder", "helper", "lead"])
 def test_only_the_reviewer_takes_several(role: str) -> None:
     preset = _preset("a")
@@ -342,7 +544,17 @@ def test_a_never_saved_user_gets_two_reviewers_in_balanced() -> None:
     state = RolePrefsStore().get("someone")
     balanced = next(p for p in state.presets if p.id == "balanced")
     assert state.revision == 0
-    assert [s.mode for s in balanced.roles.reviewer.reviewers] == ["fixed", "agent"]
+    assert [s.mode for s in balanced.roles.reviewer.reviewers] == ["fixed", "agent", "fixed"]
+
+
+def test_every_starter_ends_with_the_security_persona_slot() -> None:
+    for starter in role_prefs.starters():
+        slots = starter["roles"]["reviewer"]["reviewers"]
+        assert 2 <= len(slots) <= role_prefs.MAX_REVIEWERS
+        assert all("persona" not in slot for slot in slots[:-1])
+        assert slots[-1]["persona"] == "security"
+        assert "when" not in slots[-1]
+        assert "focus" not in slots[-1]
 
 
 def test_validate_custom_keeps_the_helpers_rule() -> None:
@@ -615,6 +827,25 @@ async def test_stale_revision_is_a_409_with_the_current_state(client: httpx.Asyn
     assert error["revision"] == 1
     assert [p["id"] for p in error["presets"]] == ["mine"]
     assert error["default_preset"] == "mine"
+
+
+async def test_a_put_that_leaves_personas_out_cannot_break_a_stored_persona_rule(
+    client: httpx.AsyncClient,
+) -> None:
+    saved = await client.put("/v1/ae/roles", json=_body(personas=[_persona(when="risky")]))
+    assert saved.status_code == 200
+    preset = _preset("mine")
+    preset["roles"]["reviewer"] = {
+        "mode": "multi",
+        "reviewers": [{"mode": "fixed", "persona": "docs"}],
+    }
+    # No "personas" key: the stored list is kept, and merged with it the body is invalid.
+    refused = await client.put("/v1/ae/roles", json=_body(1, presets=[preset]))
+    assert refused.status_code == 422
+    error = refused.json()["error"]
+    assert error["code"] == "invalid_input"
+    assert "reviewer 1 must always run" in error["message"]
+    assert (await client.get("/v1/ae/roles")).json()["revision"] == 1
 
 
 async def test_invalid_bodies_are_refused(client: httpx.AsyncClient) -> None:

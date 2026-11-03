@@ -92,6 +92,13 @@ A Claude Code chat restarts its terminal cold after a deploy, a host restart, a 
 **Where:** Nothing to turn on: it applies on every cold relaunch of a Claude Code chat. The reason for a refused keep is in the host's log.<br>
 **Built from:** core patches [`0243`](../../patches/0243-ae-patch-Keep-a-Claude-session-s-transcript-on-a-col.patch), [`0244`](../../patches/0244-ae-patch-Fix-the-review-findings-on-the-transcript-k.patch), [`0245`](../../patches/0245-ae-patch-Let-the-transcript-keep-ignore-the-server-s.patch), [`0249`](../../patches/0249-ae-patch-Recognise-the-forwarder-s-own-posts-when-th.patch), [`0251`](../../patches/0251-ae-patch-Keep-a-transcript-with-a-native-image-read-.patch), [`0257`](../../patches/0257-ae-patch-Keep-a-claude-native-bridge-dir-for-7-days-.patch)
 
+## Pin a scheduled task to one login
+
+An automation can name the Claude account every run signs in with, so a job that publishes somewhere only one account can reach does not run on whichever login the host has active when it fires. The automation dialog's Claude account field offers "Follow the active account" (the default, which stores no pin), the host's logins and the server's shared accounts. Saving checks that the host holds the login when the host is connected; a run whose pinned account the host no longer has fails at launch with "The selected Claude account is unavailable on this host." and never falls back to another account. A pinned login the host no longer reports shows in the field with "(not listed)" after its name ("Default login (not listed)" for the default login). Only Claude-native automations take a pin, and a pin on any other agent is refused at save; the field is hidden for runs in a managed sandbox, and moving a task to a sandbox or another agent drops the pin. The task tools `sys_scheduled_task_create` and `sys_scheduled_task_update` take it as `claude_account`.
+
+**Where:** Scheduled tasks, then New automation or Edit automation: the Claude account field.<br>
+**Built from:** core patches [`0288`](../../patches/0288-ae-patch-Pin-a-scheduled-task-to-one-Claude-account.patch), [`0289`](../../patches/0289-ae-patch-Fix-the-review-findings-on-the-scheduled-ta.patch)
+
 ---
 
 Previous: [Pull requests](pull-requests.md) &middot; Next: [Admin Center](admin-center.md)

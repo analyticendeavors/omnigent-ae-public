@@ -1,0 +1,963 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 10:22:37 -0800
+Subject: [PATCH 288/289] [ae-patch] Pin a scheduled task to one Claude account
+
+Every fired session signed in with the host-wide active Claude account, so
+the Weekly design rulebook sync (which publishes to a claude.ai artifact the
+main account owns) ran on AE Backup on 2026-11-02 and failed its artifact
+check. A task may now name an account; the fire path stamps it as
+omnigent.claude_native.account, the label a fork's account pick already sets
+and the runner already reads at Claude launch.
+
+The pin lives in its own table (ae_scheduled_task_account, created on first
+use) like project_id and keep_runs, so there is no Alembic revision. No row
+means no pin and the fire path is unchanged; "" pins the default login. A
+pinned account the host lacks fails the run at launch and never falls back.
+The create and update routes check the name against the task's host when that
+host is connected. The create and update scheduled-task tools take
+claude_account, and the automation dialog has a Claude account field (hidden
+for sandbox runs).
+---
+ omnigent/entities/scheduled_task.py           |   4 +
+ omnigent/runner/tool_dispatch.py              |   2 +
+ omnigent/server/routes/scheduled_tasks.py     |  35 +++-
+ omnigent/server/scheduled/fire.py             |   3 +
+ omnigent/server/scheduled/task_account.py     | 182 ++++++++++++++++++
+ omnigent/tools/builtins/scheduled_tasks.py    |  15 ++
+ .../test_scheduled_tasks_routes.py            |  45 +++++
+ tests/server/scheduled/test_task_account.py   | 120 ++++++++++++
+ .../AeTaskClaudeAccountField.test.tsx         |  67 +++++++
+ .../scheduled/AeTaskClaudeAccountField.tsx    |  76 ++++++++
+ .../CreateScheduledTaskDialog.test.tsx        |   1 +
+ .../scheduled/CreateScheduledTaskDialog.tsx   |  22 +++
+ web/src/lib/aeTaskClaudeAccount.ts            |  31 +++
+ web/src/lib/scheduledTasksApi.ts              |  10 +
+ 14 files changed, 608 insertions(+), 5 deletions(-)
+ create mode 100644 omnigent/server/scheduled/task_account.py
+ create mode 100644 tests/server/scheduled/test_task_account.py
+ create mode 100644 web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx
+ create mode 100644 web/src/components/scheduled/AeTaskClaudeAccountField.tsx
+ create mode 100644 web/src/lib/aeTaskClaudeAccount.ts
+
+diff --git a/omnigent/entities/scheduled_task.py b/omnigent/entities/scheduled_task.py
+index d8e882929c2aae383bdbcfc1ef4df1fcb595694e..0a2de0b86d892c6eb7bc995fddf59ffa0b0e1860 100644
+--- a/omnigent/entities/scheduled_task.py
++++ b/omnigent/entities/scheduled_task.py
+@@ -80,6 +80,9 @@ class ScheduledTask:
+         resolved from :mod:`omnigent.server.scheduled.retention`.
+     :param project_id: The project each run session is filed into, or ``None``.
+         Resolved from :mod:`omnigent.server.scheduled.task_project`.
++    :param claude_account: The Claude account run sessions are pinned to, ``""``
++        for the default login, or ``None`` to follow the host's active account.
++        Resolved from :mod:`omnigent.server.scheduled.task_account`.
+     """
+ 
+     id: str
+@@ -106,6 +109,7 @@ class ScheduledTask:
+     account_generation: str | None = None
+     keep_runs: int | None = DEFAULT_KEEP_RUNS
+     project_id: str | None = None
++    claude_account: str | None = None
+ 
+ 
+ @dataclass
+diff --git a/omnigent/runner/tool_dispatch.py b/omnigent/runner/tool_dispatch.py
+index 29c4916745d469adb8d5d2c4f2fc10b1f34158c4..90bea1608705c304db5c4a9fc5203679df433479 100644
+--- a/omnigent/runner/tool_dispatch.py
++++ b/omnigent/runner/tool_dispatch.py
+@@ -4632,6 +4632,7 @@ _SCHEDULED_TASK_CREATE_FIELDS = (
+     "permission_mode",
+     "keep_runs",
+     "project_id",
++    "claude_account",
+     "workspace",
+     "host_id",
+     "execution_target",
+@@ -4649,6 +4650,7 @@ _SCHEDULED_TASK_UPDATE_FIELDS = (
+     "max_cost_usd",
+     "keep_runs",
+     "project_id",
++    "claude_account",
+     "workspace",
+     "host_id",
+     "execution_target",
+diff --git a/omnigent/server/routes/scheduled_tasks.py b/omnigent/server/routes/scheduled_tasks.py
+index 19ddce171291a81ae06bff9eb4a9f9b5dbed3b8f..85b5a5c38bf2f91f9c3d093960bd012f7dd4b35f 100644
+--- a/omnigent/server/routes/scheduled_tasks.py
++++ b/omnigent/server/routes/scheduled_tasks.py
+@@ -36,7 +36,7 @@ from omnigent.server.routes._session_create_validation import (
+     validate_session_model_metadata,
+     validate_session_permission_mode,
+ )
+-from omnigent.server.scheduled import retention, task_project
++from omnigent.server.scheduled import retention, task_account, task_project
+ from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+ from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
+ from omnigent.stores import AgentStore, ConversationStore, PermissionStore
+@@ -74,6 +74,9 @@ class CreateScheduledTaskRequest(BaseModel):
+     keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)
+     # Project each run session is filed into; omitted uses the server default.
+     project_id: str | None = None
++    # Claude account every run signs in with; "" is the default login, omitted
++    # follows the host's active account.
++    claude_account: str | None = Field(default=None, max_length=64)
+     # Optional: no PINNED host/workspace. When both are unset the fire path
+     # resolves the owner's online host at fire time and defaults the workspace to
+     # that host's home directory (a failed run is recorded if none is online) —
+@@ -117,6 +120,7 @@ class UpdateScheduledTaskRequest(BaseModel):
+     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+     keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)  # null keeps all
+     project_id: str | None = None  # null or "" leaves runs unfiled
++    claude_account: str | None = Field(default=None, max_length=64)  # null clears the pin
+     workspace: str | None = Field(default=None, min_length=1)
+     host_id: str | None = Field(default=None, min_length=1)
+     execution_target: str | None = Field(default=None, min_length=1)
+@@ -144,6 +148,13 @@ class UpdateScheduledTaskRequest(BaseModel):
+         return self
+ 
+ 
++def _with_settings(store: Any, tasks: list[ScheduledTask]) -> list[ScheduledTask]:
++    """*tasks* with the settings kept beside the table (keep_runs, project, account)."""
++    return task_account.with_account(
++        store, task_project.with_project(store, retention.with_keep_runs(store, tasks))
++    )
++
++
+ def _to_response(
+     task: ScheduledTask,
+     *,
+@@ -179,6 +190,7 @@ def _to_response(
+         "max_cost_usd": task.max_cost_usd,
+         "keep_runs": task.keep_runs,
+         "project_id": task.project_id,
++        "claude_account": task.claude_account,
+         "workspace": task.workspace,
+         "host_id": task.host_id,
+         "execution_target": task.execution_target,
+@@ -413,6 +425,8 @@ def create_scheduled_tasks_router(
+             project_id = _owned_project_id(body.project_id, owner_id)
+         else:
+             project_id = task_project.default_project_id(project_store, owner_id)
++        if body.claude_account is not None:
++            await task_account.validate_account(request, body.claude_account, body.host_id)
+         bound = await _bind_agent(agent, owner_id)
+         try:
+             task = store.create(
+@@ -438,7 +452,9 @@ def create_scheduled_tasks_router(
+         if "keep_runs" in body.model_fields_set:
+             retention.set_keep_runs(store, task.id, body.keep_runs)
+         task_project.set_project(store, task.id, project_id)
+-        task = task_project.with_project(store, retention.with_keep_runs(store, [task]))[0]
++        if body.claude_account is not None:
++            task_account.set_account(store, task.id, body.claude_account)
++        task = _with_settings(store, [task])[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.add(task)
+@@ -465,7 +481,7 @@ def create_scheduled_tasks_router(
+         owner = _owner(request)
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+         tasks = [t for t in store.list(owner_user_id=owner_id) if _owns_task(t, owner_id)]
+-        tasks = task_project.with_project(store, retention.with_keep_runs(store, tasks))
++        tasks = _with_settings(store, tasks)
+         task_ids = [t.id for t in tasks]
+         running = store.list_running_runs_for_tasks(task_ids)
+         # Force-fail stale orphans FIRST so the completion badge below reports a
+@@ -493,7 +509,7 @@ def create_scheduled_tasks_router(
+         owner = _owner(request)
+         owner_id = None if owner == RESERVED_USER_LOCAL else owner
+         task = _require_owned(scheduled_task_id, owner_id)
+-        task = task_project.with_project(store, retention.with_keep_runs(store, [task]))[0]
++        task = _with_settings(store, [task])[0]
+         running = store.list_running_runs_for_tasks([task.id])
+         force_fail_stale_runs(store, running)
+         latest_status = store.list_latest_run_status_for_tasks([task.id])
+@@ -604,6 +620,12 @@ def create_scheduled_tasks_router(
+         keep_runs = fields.pop("keep_runs", None)
+         project_set = "project_id" in fields
+         project_id = _owned_project_id(fields.pop("project_id", None), owner_id)
++        account_set = "claude_account" in fields
++        claude_account = fields.pop("claude_account", None)
++        if claude_account is not None:
++            await task_account.validate_account(
++                request, claude_account, fields.get("host_id") or existing.host_id
++            )
+         target_agent_id = fields.get("agent_id") or existing.agent_id
+         agent_changed = target_agent_id != existing.agent_id
+         new_copy: Agent | None = None
+@@ -701,7 +723,9 @@ def create_scheduled_tasks_router(
+             retention.set_keep_runs(store, updated.id, keep_runs)
+         if project_set:
+             task_project.set_project(store, updated.id, project_id)
+-        updated = task_project.with_project(store, retention.with_keep_runs(store, [updated]))[0]
++        if account_set:
++            task_account.set_account(store, updated.id, claude_account)
++        updated = _with_settings(store, [updated])[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.update(updated)
+@@ -724,6 +748,7 @@ def create_scheduled_tasks_router(
+         store.delete(scheduled_task_id)
+         retention.forget_keep_runs(store, scheduled_task_id)
+         task_project.forget_project(store, scheduled_task_id)
++        task_account.forget_account(store, scheduled_task_id)
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+             scheduler.remove(scheduled_task_id)
+diff --git a/omnigent/server/scheduled/fire.py b/omnigent/server/scheduled/fire.py
+index 151d96b0ca4d126969e85bdef20cf3375d783d64..bda876895a56aeb0d3eb7e7854c9e357c8a2ce1e 100644
+--- a/omnigent/server/scheduled/fire.py
++++ b/omnigent/server/scheduled/fire.py
+@@ -69,6 +69,7 @@ from omnigent.server.routes._session_create_validation import (
+ )
+ from omnigent.server.scheduled.checkin_relay import relay_checkin
+ from omnigent.server.scheduled.retention import notify_fire_observers
++from omnigent.server.scheduled.task_account import pin_fired_session
+ from omnigent.server.scheduled.task_project import file_fired_session
+ from omnigent.server.schemas import SessionEventInput
+ 
+@@ -888,6 +889,8 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
+     if labels:
+         await asyncio.to_thread(deps.conversation_store.set_labels, conv.id, labels)
+         conv.labels.update(labels)
++    # A task pinned to a Claude account launches on it, not the host's active one.
++    conv.labels.update(await pin_fired_session(deps, task, conv.id))
+     return conv
+ 
+ 
+diff --git a/omnigent/server/scheduled/task_account.py b/omnigent/server/scheduled/task_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3aa052373b0be653fd6cc7750dd1cc18daa31423
+--- /dev/null
++++ b/omnigent/server/scheduled/task_account.py
+@@ -0,0 +1,182 @@
++"""The Claude account a scheduled task's run sessions are pinned to.
++
++Without a pin every fired session signs in with the host-wide active Claude
++account, so a task that needs one account (it owns a claude.ai artifact the run
++publishes to) breaks the day the host switches to a backup. A task may name an
++account; the fire path stamps it on the new session as the label the runner
++reads at Claude launch, the same label a fork's account pick sets.
++
++- **The setting.** ``claude_account`` is stored beside ``scheduled_tasks`` in
++  its own table rather than as a column, so carrying it needs no Alembic
++  revision: the table is created on first use. No row means no pin, and the
++  fire path then behaves exactly as before. The empty string is a real pin: it
++  names the default CLI login ("AE Default").
++- **The fire.** :func:`pin_fired_session` stamps the label. A pinned account
++  the host lacks fails the run at launch with "The selected Claude account is
++  unavailable on this host."; it never falls back to another account.
++- **The check.** :func:`validate_account` rejects an account name the task's
++  host (when pinned to one and connected) does not report, and one the server
++  does not hold as a shared account. A host that is offline or not pinned
++  skips the check; the fire-time failure covers it.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++import threading
++from dataclasses import replace
++from typing import TYPE_CHECKING, Any
++
++from sqlalchemy import Column, Integer, MetaData, String, Table, delete, select
++from sqlalchemy.engine import Engine
++
++from omnigent.db.db_models import current_workspace_id
++from omnigent.db.query_context import query_name_scope
++from omnigent.entities.scheduled_task import ScheduledTask
++from omnigent.errors import ErrorCode, OmnigentError
++from omnigent.onboarding.ae_shared_claude_accounts import known_on_server
++from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
++
++if TYPE_CHECKING:
++    from fastapi import Request
++
++    from omnigent.server.scheduled.fire import FireDeps
++
++_logger = logging.getLogger(__name__)
++
++_metadata = MetaData()
++_account_table = Table(
++    "ae_scheduled_task_account",
++    _metadata,
++    Column("workspace_id", Integer, primary_key=True),
++    Column("scheduled_task_id", String(32), primary_key=True),
++    Column("claude_account", String(64), nullable=False),
++)
++# custom-lint: disable-next=workspace-scoped-cache -- schema readiness is shared per engine
++_ready_engines: set[int] = set()
++_ready_lock = threading.Lock()
++# Stores without a database (test fakes) keep the setting in memory, keyed by
++# store identity, workspace and task.
++# custom-lint: disable-next=workspace-scoped-cache -- each key includes the workspace id
++_memory: dict[tuple[int, int, str], str] = {}
++
++_ACCOUNT_FAMILIES = frozenset({"claude-oauth", "claude-oauth-active"})
++
++
++def _engine_for(store: Any) -> Engine | None:
++    """The store's database engine with the account table created, or ``None``."""
++    location = getattr(store, "storage_location", None)
++    if not isinstance(location, str) or "://" not in location:
++        return None
++    from omnigent.db.utils import get_or_create_engine
++
++    engine = get_or_create_engine(location)
++    with _ready_lock:
++        if id(engine) not in _ready_engines:
++            with query_name_scope("omnigent.scheduled_task_account.create_table"):
++                _metadata.create_all(engine, tables=[_account_table], checkfirst=True)
++            _ready_engines.add(id(engine))
++    return engine
++
++
++def accounts_for(store: Any, task_ids: list[str]) -> dict[str, str | None]:
++    """Each task's pinned account in the current workspace, ``None`` when unpinned."""
++    ids = list(dict.fromkeys(task_ids))
++    workspace = current_workspace_id()
++    found: dict[str, str] = {}
++    engine = _engine_for(store)
++    if engine is None:
++        for task_id in ids:
++            key = (id(store), workspace, task_id)
++            if key in _memory:
++                found[task_id] = _memory[key]
++    elif ids:
++        stmt = select(_account_table.c.scheduled_task_id, _account_table.c.claude_account).where(
++            _account_table.c.workspace_id == workspace,
++            _account_table.c.scheduled_task_id.in_(ids),
++        )
++        with query_name_scope("omnigent.scheduled_task_account.select"), engine.connect() as conn:
++            found = {row[0]: row[1] for row in conn.execute(stmt)}
++    return {task_id: found.get(task_id) for task_id in ids}
++
++
++def with_account(store: Any, tasks: list[ScheduledTask]) -> list[ScheduledTask]:
++    """*tasks* with ``claude_account`` filled in from the account table."""
++    resolved = accounts_for(store, [task.id for task in tasks])
++    return [replace(task, claude_account=resolved[task.id]) for task in tasks]
++
++
++def set_account(store: Any, task_id: str, account: str | None) -> None:
++    """Pin *task_id* to *account* in the current workspace; ``None`` clears the pin."""
++    workspace = current_workspace_id()
++    engine = _engine_for(store)
++    if engine is None:
++        key = (id(store), workspace, task_id)
++        if account is None:
++            _memory.pop(key, None)
++        else:
++            _memory[key] = account
++        return
++    where = (
++        _account_table.c.workspace_id == workspace,
++        _account_table.c.scheduled_task_id == task_id,
++    )
++    with query_name_scope("omnigent.scheduled_task_account.upsert"), engine.begin() as conn:
++        conn.execute(delete(_account_table).where(*where))
++        if account is not None:
++            conn.execute(
++                _account_table.insert().values(
++                    workspace_id=workspace, scheduled_task_id=task_id, claude_account=account
++                )
++            )
++
++
++def forget_account(store: Any, task_id: str) -> None:
++    """Drop *task_id*'s pin (the task was deleted)."""
++    set_account(store, task_id, None)
++
++
++async def validate_account(request: Request, account: str, host_id: str | None) -> None:
++    """Raise 400 unless *account* is one the task's host or the server holds.
++
++    :param request: The create or update request, for the host registry.
++    :param account: Account name from the request; ``""`` is the default login.
++    :param host_id: The host the task is pinned to, or ``None`` when unpinned.
++    :raises OmnigentError: 400 naming the account when the connected host lacks it.
++    """
++    if not account or known_on_server(account):
++        return
++    registry = getattr(request.app.state, "host_registry", None)
++    host_conn = registry.get(host_id) if registry is not None and host_id else None
++    if host_conn is None:
++        return  # Offline or unpinned host: the fire-time launch error covers it.
++    from omnigent.server.routes.hosts import _proxy_detect_credentials
++
++    detected = await _proxy_detect_credentials(host_registry=registry, host_conn=host_conn)
++    available = {
++        item.get("env_var") or ""
++        for item in detected.get("credentials", [])
++        if item.get("family") in _ACCOUNT_FAMILIES
++    }
++    if account not in available:
++        raise OmnigentError(
++            f"Claude account {account!r} is unavailable on the task's host. "
++            "Pick an account the host lists, or clear the pin.",
++            code=ErrorCode.INVALID_INPUT,
++        )
++
++
++async def pin_fired_session(
++    deps: FireDeps, task: ScheduledTask, conversation_id: str
++) -> dict[str, str]:
++    """Stamp the task's pinned account on a fired session; ``{}`` when unpinned.
++
++    :returns: The labels written, so the caller can mirror them on its copy.
++    """
++    account = accounts_for(deps.scheduled_task_store, [task.id])[task.id]
++    if account is None:
++        return {}
++    labels = {CLAUDE_ACCOUNT_LABEL_KEY: account}
++    await asyncio.to_thread(deps.conversation_store.set_labels, conversation_id, labels)
++    return labels
+diff --git a/omnigent/tools/builtins/scheduled_tasks.py b/omnigent/tools/builtins/scheduled_tasks.py
+index ea07d234105501d7462ee8f39696490564560da7..d08904f45cbabdfa46e378f511fa5f2bca32f18e 100644
+--- a/omnigent/tools/builtins/scheduled_tasks.py
++++ b/omnigent/tools/builtins/scheduled_tasks.py
+@@ -126,6 +126,14 @@ class SysScheduledTaskCreateTool(Tool):
+                                 "server's default project; null leaves runs unfiled."
+                             ),
+                         },
++                        "claude_account": {
++                            "type": "string",
++                            "description": (
++                                "Claude account every run signs in with, by its id (for example "
++                                "'shared:AE Backup'); an empty string is the default login. "
++                                "Omit to follow the host's active account."
++                            ),
++                        },
+                         "workspace": {
+                             "type": "string",
+                             "description": (
+@@ -271,6 +279,13 @@ class SysScheduledTaskUpdateTool(Tool):
+                                 "empty string leaves runs unfiled."
+                             ),
+                         },
++                        "claude_account": {
++                            "type": "string",
++                            "description": (
++                                "New Claude account every run signs in with; an empty string is "
++                                "the default login. Null follows the host's active account."
++                            ),
++                        },
+                         "workspace": {
+                             "type": "string",
+                             "description": "New existing absolute runner start path.",
+diff --git a/tests/server/integration/test_scheduled_tasks_routes.py b/tests/server/integration/test_scheduled_tasks_routes.py
+index bc8008ee6126e3cdef4745afada5e7cfae1275ad..9e776266379df14f11af8552a565893a5308aa80 100644
+--- a/tests/server/integration/test_scheduled_tasks_routes.py
++++ b/tests/server/integration/test_scheduled_tasks_routes.py
+@@ -1906,3 +1906,48 @@ async def test_default_project_applies_only_when_create_omits_one(
+     assert deleted.status_code == 200
+     store = SqlAlchemyScheduledTaskStore(db_uri)
+     assert task_project.project_ids_for(store, [task_id]) == {task_id: None}
++
++
++# ── claude_account ───────────────────────────────────────────────────────
++
++
++async def test_claude_account_round_trips_and_clears(auth_client: httpx.AsyncClient) -> None:
++    created = await auth_client.post(
++        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
++    )
++    assert created.status_code == 200, created.text
++    task_id = created.json()["id"]
++    assert created.json()["claude_account"] is None
++
++    # The default login is the empty string, and it is a pin, not "no pin".
++    pinned = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"claude_account": ""}, headers=_headers()
++    )
++    assert pinned.status_code == 200, pinned.text
++    assert pinned.json()["claude_account"] == ""
++    got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
++    assert got.json()["claude_account"] == ""
++    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
++    [row] = [t for t in listed.json()["scheduled_tasks"] if t["id"] == task_id]
++    assert row["claude_account"] == ""
++
++    # Patching another field leaves the pin alone; null clears it.
++    renamed = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"name": "renamed"}, headers=_headers()
++    )
++    assert renamed.json()["claude_account"] == ""
++    cleared = await auth_client.patch(
++        f"/v1/scheduled-tasks/{task_id}", json={"claude_account": None}, headers=_headers()
++    )
++    assert cleared.status_code == 200, cleared.text
++    assert cleared.json()["claude_account"] is None
++
++
++async def test_claude_account_can_be_set_on_create(auth_client: httpx.AsyncClient) -> None:
++    resp = await auth_client.post(
++        "/v1/scheduled-tasks",
++        json=_create_body(claude_account="shared:AE Default"),
++        headers=_headers(),
++    )
++    assert resp.status_code == 200, resp.text
++    assert resp.json()["claude_account"] == "shared:AE Default"
+diff --git a/tests/server/scheduled/test_task_account.py b/tests/server/scheduled/test_task_account.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..85705749aa7dd327072c85dcd4c075ed0182d072
+--- /dev/null
++++ b/tests/server/scheduled/test_task_account.py
+@@ -0,0 +1,120 @@
++"""Tests for :mod:`omnigent.server.scheduled.task_account`.
++
++The ``claude_account`` pin (its own table, unset by default, ``""`` a real pin),
++the host check on create and update, and stamping the account label on a fired
++session without changing anything for an unpinned task.
++"""
++
++from __future__ import annotations
++
++from types import SimpleNamespace
++from typing import Any
++
++import pytest
++
++from omnigent.errors import OmnigentError
++from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
++from omnigent.server.scheduled import task_account
++from omnigent.server.scheduled.fire import build_on_fire
++from tests.server.scheduled.test_fire import (
++    FakeScheduledTaskStore,
++    _deps,
++    _drain,
++    _task,
++)
++
++
++async def _launch(conv: Any, task: Any) -> None:
++    return None
++
++
++# ── The setting ──────────────────────────────────────────────────────────
++
++
++def test_account_round_trips_and_forgets_in_sqlite(db_uri: str) -> None:
++    from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
++        SqlAlchemyScheduledTaskStore,
++    )
++
++    store = SqlAlchemyScheduledTaskStore(db_uri)
++    assert task_account.accounts_for(store, ["a", "b"]) == {"a": None, "b": None}
++    task_account.set_account(store, "a", "shared:AE Default")
++    task_account.set_account(store, "b", "")
++    task_account.set_account(store, "c", "x")
++    task_account.set_account(store, "c", None)
++    # "" is a real pin (the default login), distinct from no pin.
++    assert task_account.accounts_for(store, ["a", "b", "c"]) == {
++        "a": "shared:AE Default",
++        "b": "",
++        "c": None,
++    }
++    task_account.forget_account(store, "a")
++    assert task_account.accounts_for(store, ["a"]) == {"a": None}
++
++
++def test_with_account_fills_the_entity() -> None:
++    store = FakeScheduledTaskStore(rows={})
++    task_account.set_account(store, "task_1", "")
++    [task] = task_account.with_account(store, [_task()])
++    assert task.claude_account == ""
++
++
++# ── The check ────────────────────────────────────────────────────────────
++
++
++def _request(host_conn: Any, creds: list[dict[str, str]]) -> Any:
++    registry = SimpleNamespace(get=lambda host_id: host_conn if host_id == "h1" else None)
++    app = SimpleNamespace(state=SimpleNamespace(host_registry=registry))
++    return SimpleNamespace(app=app), creds
++
++
++@pytest.mark.asyncio
++async def test_validate_rejects_an_account_the_connected_host_lacks(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    request, creds = _request(object(), [{"family": "claude-oauth", "env_var": "Work"}])
++
++    async def _detect(**_: Any) -> dict[str, Any]:
++        return {"credentials": creds}
++
++    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_detect_credentials", _detect)
++    await task_account.validate_account(request, "Work", "h1")
++    with pytest.raises(OmnigentError, match="unavailable on the task's host"):
++        await task_account.validate_account(request, "Nope", "h1")
++
++
++@pytest.mark.asyncio
++async def test_validate_skips_when_the_host_is_offline_or_unpinned() -> None:
++    request, _ = _request(None, [])
++    await task_account.validate_account(request, "Anything", "h1")
++    await task_account.validate_account(request, "Anything", None)
++    await task_account.validate_account(request, "", "h1")
++
++
++# ── The fire ─────────────────────────────────────────────────────────────
++
++
++@pytest.mark.asyncio
++@pytest.mark.parametrize("account", ["shared:AE Default", ""])
++async def test_fire_stamps_the_pinned_account(account: str) -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    task_account.set_account(store, "task_1", account)
++    deps = _deps(store)
++
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++
++    assert deps.conversation_store.label_writes["conv_1"][CLAUDE_ACCOUNT_LABEL_KEY] == account
++    assert store.runs[-1]["status"] == "running"
++
++
++@pytest.mark.asyncio
++async def test_fire_without_a_pin_writes_no_account_label() -> None:
++    store = FakeScheduledTaskStore(rows={"task_1": _task()})
++    deps = _deps(store)
++
++    await build_on_fire(deps, launch_dispatch=_launch)(0, "task_1")
++    await _drain()
++
++    written = deps.conversation_store.label_writes.get("conv_1", {})
++    assert CLAUDE_ACCOUNT_LABEL_KEY not in written
+diff --git a/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx b/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..81c74b40d5258851565cd05ca36d47f031ef12a1
+--- /dev/null
++++ b/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx
+@@ -0,0 +1,67 @@
++import { render, screen } from "@testing-library/react";
++import { describe, expect, it, vi } from "vitest";
++import { AeTaskClaudeAccountField } from "@/components/scheduled/AeTaskClaudeAccountField";
++import {
++  DEFAULT_LOGIN_ACCOUNT,
++  FOLLOW_ACTIVE_ACCOUNT,
++  accountChoiceFor,
++  claudeAccountInput,
++} from "@/lib/aeTaskClaudeAccount";
++
++vi.mock("@/hooks/useHosts", () => ({
++  useDetectedCredentials: () => ({
++    data: [
++      { family: "claude-oauth", env_var: "", source: "AE Default" },
++      { family: "claude-oauth", env_var: "shared:AE Backup", source: "AE Backup" },
++    ],
++  }),
++}));
++
++describe("accountChoiceFor", () => {
++  it("maps no pin, the default login and a named account", () => {
++    expect(accountChoiceFor(null)).toBe(FOLLOW_ACTIVE_ACCOUNT);
++    expect(accountChoiceFor(undefined)).toBe(FOLLOW_ACTIVE_ACCOUNT);
++    expect(accountChoiceFor("")).toBe(DEFAULT_LOGIN_ACCOUNT);
++    expect(accountChoiceFor("shared:AE Backup")).toBe("shared:AE Backup");
++  });
++});
++
++describe("claudeAccountInput", () => {
++  it("omits the key on create when following the active account", () => {
++    expect(claudeAccountInput(FOLLOW_ACTIVE_ACCOUNT, undefined, false)).toEqual({});
++  });
++  it("pins the default login as an empty string", () => {
++    expect(claudeAccountInput(DEFAULT_LOGIN_ACCOUNT, undefined, false)).toEqual({
++      claudeAccount: "",
++    });
++  });
++  it("sends nothing on edit when the pick did not change", () => {
++    expect(claudeAccountInput(DEFAULT_LOGIN_ACCOUNT, "", true)).toEqual({});
++    expect(claudeAccountInput(FOLLOW_ACTIVE_ACCOUNT, null, true)).toEqual({});
++  });
++  it("clears the pin on edit with null", () => {
++    expect(claudeAccountInput(FOLLOW_ACTIVE_ACCOUNT, "shared:AE Backup", true)).toEqual({
++      claudeAccount: null,
++    });
++  });
++});
++
++describe("AeTaskClaudeAccountField", () => {
++  it("shows the pinned account and the keep-pinned hint", () => {
++    render(
++      <AeTaskClaudeAccountField value="shared:AE Backup" onValueChange={() => {}} hostId="h1" />,
++    );
++    expect(screen.getByTestId("task-claude-account-trigger")).toBeTruthy();
++    expect(screen.getByText(/even when the host switches/)).toBeTruthy();
++  });
++  it("explains that following the active account has no pin", () => {
++    render(
++      <AeTaskClaudeAccountField
++        value={FOLLOW_ACTIVE_ACCOUNT}
++        onValueChange={() => {}}
++        hostId="h1"
++      />,
++    );
++    expect(screen.getByText(/whichever Claude account the host has active/)).toBeTruthy();
++  });
++});
+diff --git a/web/src/components/scheduled/AeTaskClaudeAccountField.tsx b/web/src/components/scheduled/AeTaskClaudeAccountField.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..f3841ce812a4a159f7c7ce5d150a0a46f1aad295
+--- /dev/null
++++ b/web/src/components/scheduled/AeTaskClaudeAccountField.tsx
+@@ -0,0 +1,76 @@
++// The Claude account picker on the automation dialog: which login every run
++// signs in with. "Follow the active account" stores no pin, so a run uses
++// whichever account the host has selected when it fires.
++import { Label } from "@/components/scheduled/Label";
++import {
++  Select,
++  SelectContent,
++  SelectItem,
++  SelectTrigger,
++  SelectValue,
++} from "@/components/ui/select";
++import { useDetectedCredentials } from "@/hooks/useHosts";
++import { DEFAULT_LOGIN_ACCOUNT, FOLLOW_ACTIVE_ACCOUNT } from "@/lib/aeTaskClaudeAccount";
++import { AeSharedAccountMarker, aeIsSharedAccount } from "@/lib/aeSharedClaudeAccounts";
++import { aeForkClaudeAccounts } from "@/shell/AeForkClaudeAccount";
++
++/**
++ * @param value - The picked choice (see `accountChoiceFor`).
++ * @param hostId - The host whose logins are listed; `undefined` lists the server's shared accounts only.
++ */
++export function AeTaskClaudeAccountField({
++  value,
++  onValueChange,
++  hostId,
++  onSelectOpenChange,
++}: {
++  value: string;
++  onValueChange: (value: string) => void;
++  hostId: string | undefined;
++  onSelectOpenChange?: (open: boolean) => void;
++}) {
++  const { data: credentials = [] } = useDetectedCredentials(hostId, true);
++  const accounts = aeForkClaudeAccounts(credentials);
++  // A saved pin the host no longer lists stays visible rather than silently changing.
++  const known =
++    value === FOLLOW_ACTIVE_ACCOUNT ||
++    value === DEFAULT_LOGIN_ACCOUNT ||
++    accounts.some((choice) => choice.account === value);
++  return (
++    <div className="flex flex-col gap-1.5" data-testid="task-claude-account-field">
++      <Label htmlFor="task-claude-account">Claude account</Label>
++      <Select
++        value={value}
++        componentId="tasks.scheduled.claude_account"
++        onValueChange={onValueChange}
++        onOpenChange={onSelectOpenChange}
++      >
++        <SelectTrigger
++          id="task-claude-account"
++          data-testid="task-claude-account-trigger"
++          className="w-full"
++        >
++          <SelectValue />
++        </SelectTrigger>
++        <SelectContent position="popper" align="start">
++          <SelectItem value={FOLLOW_ACTIVE_ACCOUNT}>Follow the active account</SelectItem>
++          {!known && <SelectItem value={value}>{value} (not listed)</SelectItem>}
++          {accounts.map((choice) => (
++            <SelectItem
++              key={choice.account || DEFAULT_LOGIN_ACCOUNT}
++              value={choice.account === "" ? DEFAULT_LOGIN_ACCOUNT : choice.account}
++            >
++              {choice.label}
++              {aeIsSharedAccount(choice.account) && <AeSharedAccountMarker />}
++            </SelectItem>
++          ))}
++        </SelectContent>
++      </Select>
++      <p className="text-sm text-muted-foreground">
++        {value === FOLLOW_ACTIVE_ACCOUNT
++          ? "Each run uses whichever Claude account the host has active when it fires."
++          : "Every run signs in with this account, even when the host switches to another."}
++      </p>
++    </div>
++  );
++}
+diff --git a/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx b/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx
+index f97c0e8323bb43ecec771248c837265e5cce3de2..7d8c8df466af6cc852ea686f946caf592ff9d599 100644
+--- a/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx
++++ b/web/src/components/scheduled/CreateScheduledTaskDialog.test.tsx
+@@ -31,6 +31,7 @@ vi.mock("@/hooks/useAvailableAgents", () => ({ useAvailableAgents: vi.fn() }));
+ vi.mock("@/hooks/useHosts", () => ({
+   useHosts: vi.fn(),
+   useHostModelOptions: vi.fn(() => ({ data: undefined })),
++  useDetectedCredentials: vi.fn(() => ({ data: [] })),
+ }));
+ vi.mock("@/hooks/useScheduledTasks", () => ({
+   useCreateScheduledTask: vi.fn(),
+diff --git a/web/src/components/scheduled/CreateScheduledTaskDialog.tsx b/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
+index 8a56dcafa429d6519784ec8cee0667b1a0ced763..2b54d0ad40a1b0916ab52af020fd3f1eabc075a6 100644
+--- a/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
++++ b/web/src/components/scheduled/CreateScheduledTaskDialog.tsx
+@@ -30,6 +30,12 @@ import {
+   initialProjectChoice,
+   projectIdInput,
+ } from "@/components/scheduled/AeTaskProjectField";
++import { AeTaskClaudeAccountField } from "@/components/scheduled/AeTaskClaudeAccountField";
++import {
++  FOLLOW_ACTIVE_ACCOUNT,
++  accountChoiceFor,
++  claudeAccountInput,
++} from "@/lib/aeTaskClaudeAccount";
+ import { WorkspacePickerDialog } from "@/shell/WorkspacePickerDialog";
+ import { AgentHarnessPicker } from "@/shell/NewChatDialog";
+ import { useAvailableAgents, type AvailableAgent } from "@/hooks/useAvailableAgents";
+@@ -218,6 +224,7 @@ export function CreateScheduledTaskDialog({
+   // pickers. Only offered when the server advertises managed sandboxes.
+   const [sandboxMode, setSandboxMode] = useState(false);
+   const [projectChoice, setProjectChoice] = useState<string>(DEFAULT_PROJECT);
++  const [accountChoice, setAccountChoice] = useState<string>(FOLLOW_ACTIVE_ACCOUNT);
+   const [error, setError] = useState<string | null>(null);
+   const [scheduleUnsupported, setScheduleUnsupported] = useState(false);
+ 
+@@ -245,6 +252,7 @@ export function CreateScheduledTaskDialog({
+         setWorkspace(editingTask.workspace ?? "");
+         setSandboxMode(editingTask.executionTarget === "managed_sandbox");
+         setProjectChoice(initialProjectChoice(editingTask.projectId, true));
++        setAccountChoice(accountChoiceFor(editingTask.claudeAccount));
+       } else {
+         setName(initialName ?? "");
+         setPrompt(initialPrompt ?? "");
+@@ -258,6 +266,7 @@ export function CreateScheduledTaskDialog({
+         setWorkspace("");
+         setSandboxMode(false);
+         setProjectChoice(DEFAULT_PROJECT);
++        setAccountChoice(FOLLOW_ACTIVE_ACCOUNT);
+       }
+       setError(null);
+     }
+@@ -340,6 +349,10 @@ export function CreateScheduledTaskDialog({
+           ? { workspace: workspace.trim() }
+           : {}),
+         ...projectIdInput(projectChoice, editingTask ? (editingTask.projectId ?? null) : undefined),
++        // A sandbox run has no host login to pin.
++        ...(sandboxMode
++          ? {}
++          : claudeAccountInput(accountChoice, editingTask?.claudeAccount, isEdit)),
+       };
+       if (editingTask) {
+         // Thread model/effort ONLY when the agent supports them. Each control's
+@@ -643,6 +656,15 @@ export function CreateScheduledTaskDialog({
+             onSelectOpenChange={handleSelectOpenChange}
+           />
+ 
++          {!sandboxMode && (
++            <AeTaskClaudeAccountField
++              value={accountChoice}
++              onValueChange={setAccountChoice}
++              hostId={hostId || hostOptions[0]?.host_id}
++              onSelectOpenChange={handleSelectOpenChange}
++            />
++          )}
++
+           {error && (
+             <div
+               role="alert"
+diff --git a/web/src/lib/aeTaskClaudeAccount.ts b/web/src/lib/aeTaskClaudeAccount.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..469031cbb1c652feaa82518fa4999ceea3ecfada
+--- /dev/null
++++ b/web/src/lib/aeTaskClaudeAccount.ts
+@@ -0,0 +1,31 @@
++// The Claude account a scheduled task is pinned to. Shared by the automation
++// dialog and its account field; kept out of both component files so a test that
++// mocks one component module never drops these exports.
++
++/** Select value for "no pin": runs follow the host's active Claude account. */
++export const FOLLOW_ACTIVE_ACCOUNT = "__follow_active_account__";
++/** Select value for the default CLI login, which the wire names with "". */
++export const DEFAULT_LOGIN_ACCOUNT = "__default_login__";
++
++/** The picker's value for a task's stored pin (`null` or `undefined` is no pin). */
++export function accountChoiceFor(account: string | null | undefined): string {
++  if (account === null || account === undefined) return FOLLOW_ACTIVE_ACCOUNT;
++  return account === "" ? DEFAULT_LOGIN_ACCOUNT : account;
++}
++
++/**
++ * The `claudeAccount` key to send for *choice*. A new task with no pin omits
++ * it; an edit sends it only when the pick changed from *original* (`undefined`
++ * on create). `null` clears the pin and `""` pins the default login.
++ */
++export function claudeAccountInput(
++  choice: string,
++  original: string | null | undefined,
++  isEdit: boolean,
++): { claudeAccount?: string | null } {
++  const next =
++    choice === FOLLOW_ACTIVE_ACCOUNT ? null : choice === DEFAULT_LOGIN_ACCOUNT ? "" : choice;
++  if (next === (original ?? null)) return {};
++  if (!isEdit && next === null) return {};
++  return { claudeAccount: next };
++}
+diff --git a/web/src/lib/scheduledTasksApi.ts b/web/src/lib/scheduledTasksApi.ts
+index e34d9675de02c32aeb04646543d795c6ba51937a..af46846408509f0a78a31bcbe30a9c7fb957a75b 100644
+--- a/web/src/lib/scheduledTasksApi.ts
++++ b/web/src/lib/scheduledTasksApi.ts
+@@ -59,6 +59,8 @@ export interface ScheduledTask {
+   executionTarget: ScheduledTaskExecutionTarget;
+   /** Project each run session is filed into, or `null` for unfiled runs. */
+   projectId?: string | null;
++  /** Claude account every run signs in with; `""` is the default login, `null` follows the active account. */
++  claudeAccount?: string | null;
+   state: ScheduledTaskState;
+   /** Epoch seconds of the last fire, or `null` if it has never fired. */
+   lastRunAt: number | null;
+@@ -118,6 +120,8 @@ export interface CreateScheduledTaskInput {
+    * project; `null` leaves runs unfiled.
+    */
+   projectId?: string | null;
++  /** Claude account to pin runs to (`""` is the default login). Omit to follow the host's active account. */
++  claudeAccount?: string | null;
+ }
+ 
+ /**
+@@ -149,6 +153,8 @@ export interface UpdateScheduledTaskInput {
+   executionTarget?: ScheduledTaskExecutionTarget;
+   /** New project for run sessions; `null` leaves runs unfiled. */
+   projectId?: string | null;
++  /** New pinned Claude account; `null` follows the host's active account. */
++  claudeAccount?: string | null;
+   state?: ScheduledTaskState;
+ }
+ 
+@@ -170,6 +176,7 @@ interface ScheduledTaskWire {
+   host_id: string | null;
+   execution_target: ScheduledTaskExecutionTarget;
+   project_id?: string | null;
++  claude_account?: string | null;
+   state: ScheduledTaskState;
+   last_run_at: number | null;
+   last_run_status: ScheduledTaskRunStatus | null;
+@@ -247,6 +254,7 @@ function taskFromWire(wire: ScheduledTaskWire): ScheduledTask {
+     hostId: wire.host_id,
+     executionTarget: wire.execution_target,
+     projectId: wire.project_id ?? null,
++    claudeAccount: wire.claude_account ?? null,
+     state: wire.state,
+     lastRunAt: wire.last_run_at,
+     lastRunStatus: wire.last_run_status,
+@@ -309,6 +317,7 @@ export async function createScheduledTask(input: CreateScheduledTaskInput): Prom
+   if (input.hostId != null) body.host_id = input.hostId;
+   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
+   if (input.projectId !== undefined) body.project_id = input.projectId;
++  if (input.claudeAccount !== undefined) body.claude_account = input.claudeAccount;
+   const res = await authenticatedFetch("/v1/scheduled-tasks", {
+     method: "POST",
+     headers: { "Content-Type": "application/json" },
+@@ -339,6 +348,7 @@ export async function updateScheduledTask(
+   if (input.hostId !== undefined) body.host_id = input.hostId;
+   if (input.executionTarget !== undefined) body.execution_target = input.executionTarget;
+   if (input.projectId !== undefined) body.project_id = input.projectId ?? "";
++  if (input.claudeAccount !== undefined) body.claude_account = input.claudeAccount;
+   if (input.state !== undefined) body.state = input.state;
+   const res = await authenticatedFetch(`/v1/scheduled-tasks/${encodeURIComponent(id)}`, {
+     method: "PATCH",

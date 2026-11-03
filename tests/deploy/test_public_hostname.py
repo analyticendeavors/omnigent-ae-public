@@ -1,4 +1,4 @@
-"""The second hostname: omnigent.go-ae.org through Cloudflare (2026-09-24).
+"""The second hostname: a public hostname through Cloudflare (2026-09-24).
 
 AE's own runbook for it lives in a private repository (moved out of deploy/ on
 2026-10-21). What a checkout can prove about it:

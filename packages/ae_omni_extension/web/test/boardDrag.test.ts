@@ -88,6 +88,14 @@ describe("the saved arrangement", () => {
     expect(hasArrangement()).toBe(false);
   });
 
+  it("loads a layout saved before the Family cost card folded into Presets, without it", async () => {
+    const old = { "3": [["deploys", "presets", "family", "box"], ["accounts", "compute"], ["azure", "credit"]] };
+    await loadBoardLayout(storageContext(old).context);
+    const flat = arrangement(3, LAYOUTS, [...IDS, "presets"]).flat();
+    expect(flat).not.toContain("family");
+    expect(flat).toContain("presets");
+  });
+
   it("saves under one key, per column count, and tells listeners", async () => {
     const { context, set } = storageContext(undefined);
     await loadBoardLayout(context);

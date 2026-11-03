@@ -1,0 +1,106 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:48:46 -0700
+Subject: [PATCH 271/289] [ae-patch] Anchor the queued Compact's failure check
+ on the prepare message
+
+Response ids can be empty or reused, so judging the prepare turn by id could hide a
+failed turn or cancel on old history. The check now looks only at blocks after the
+prepare message itself when it is in the transcript, and falls back to the
+blocks-and-responses snapshot taken at send time when it is not.
+---
+ web/src/lib/aeCompactPlan.test.ts | 34 +++++++++++++++++++++++++++++++
+ web/src/lib/aeCompactPlan.ts      | 29 +++++++++++++++++++++-----
+ 2 files changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+index 3559c69eb657a29243394a68d8e852d2d2918b5d..4d04a813e05c39e384c835a0bcfbf30b495d2d16 100644
+--- a/web/src/lib/aeCompactPlan.test.ts
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -290,4 +290,38 @@ describe("queued compact", () => {
+     await tick(2000);
+     expect(compact).not.toHaveBeenCalled();
+   });
++
++  it("judges only what follows the prepare message when it is in the transcript", async () => {
++    startAeCompactPlan(ID);
++    await tick(2000);
++    const prep = {
++      type: "user_message",
++      content: [{ type: "input_text", text: AE_COMPACT_PREP_TEXT }],
++      ctx: { responseId: "" },
++    };
++    // An old non-info error with an empty id, rehydrated as a new object, is history, not this turn.
++    setChat({
++      sessionStatus: "idle",
++      blocks: [{ type: "error", level: "error", message: "old", ctx: { responseId: "" } }, prep],
++    });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++  });
++
++  it("catches a failure that carries a reused response id once it follows the prepare message", async () => {
++    setChat({ blocks: [{ type: "user_message", content: [], ctx: { responseId: "r1" } }] });
++    startAeCompactPlan(ID);
++    await tick(2000);
++    const prep = {
++      type: "user_message",
++      content: [{ type: "input_text", text: AE_COMPACT_PREP_TEXT }],
++      ctx: { responseId: "r1" },
++    };
++    setChat({
++      sessionStatus: "idle",
++      blocks: [prep, { type: "response_end", status: "failed", ctx: { responseId: "r1" } }],
++    });
++    await tick(2000);
++    expect(compact).not.toHaveBeenCalled();
++  });
+ });
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+index 74edbc224151a2a06d008af08300018ae43931e6..fb581322aca76248051294185c3a068aa30c8f2f 100644
+--- a/web/src/lib/aeCompactPlan.ts
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -57,6 +57,27 @@ function safeNow(s: StoreState, conversationId: string): boolean {
+   return !s.queuedMessages.some((m) => m.conversationId === conversationId);
+ }
+ 
++/**
++ * The blocks the prepare turn added. They follow the prepare message itself, which stays found
++ * however history loads or shrinks; without it, whatever was not in the transcript at send time.
++ */
++function blocksOfPrepareTurn(blocks: StoreState["blocks"], plan: Plan): StoreState["blocks"] {
++  let anchor = -1;
++  blocks.forEach((b, index) => {
++    if (
++      b.type === "user_message" &&
++      JSON.stringify(b.content).includes(AE_COMPACT_PREP_TEXT.slice(0, 40))
++    ) {
++      anchor = index;
++    }
++  });
++  if (anchor >= 0) return blocks.slice(anchor + 1);
++  return blocks.filter(
++    (b) =>
++      !plan.seenBlocks.has(b) && !(b.ctx.responseId && plan.seenResponses.has(b.ctx.responseId)),
++  );
++}
++
+ function clearTimers(plan: Plan) {
+   if (plan.stableTimer) clearTimeout(plan.stableTimer);
+   if (plan.limitTimer) clearTimeout(plan.limitTimer);
+@@ -142,12 +163,10 @@ async function advance(conversationId: string) {
+   // Idle, but the prepare turn has not been seen running: the start timer decides.
+   if (!plan.sawTurn) return;
+   // A turn that failed, was cancelled, or raised an error did not finish saving: compact nothing.
+-  const failed = store.blocks.some(
++  const failed = blocksOfPrepareTurn(store.blocks, plan).some(
+     (b) =>
+-      !plan.seenBlocks.has(b) &&
+-      !(b.ctx.responseId && plan.seenResponses.has(b.ctx.responseId)) &&
+-      ((b.type === "response_end" && b.status !== "completed") ||
+-        (b.type === "error" && b.level !== "info")),
++      (b.type === "response_end" && b.status !== "completed") ||
++      (b.type === "error" && b.level !== "info"),
+   );
+   if (failed) {
+     fail(

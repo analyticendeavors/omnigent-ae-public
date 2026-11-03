@@ -7,6 +7,7 @@ task app is an in-memory fake.
 
 from __future__ import annotations
 
+import functools
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -868,8 +869,14 @@ async def test_the_loop_survives_a_failing_pass(monkeypatch: pytest.MonkeyPatch)
 
 @pytest.fixture
 def azure_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    snap = _snapshot(at=datetime.now(UTC) - timedelta(minutes=5))
+    # The readings are October 2026 data, so the routes read the clock as NOW
+    # (2026-10-21). On the real clock month_to_date drops to zero once the month
+    # changes and every status reads "ok" (CI went red on 2026-11-01).
+    snap = _snapshot(at=NOW - timedelta(minutes=5))
     monkeypatch.setattr(azure_cost, "snapshot", lambda environ=None: snap)
+    for name in ("view_now", "row_now", "known_now"):
+        pinned = functools.partial(getattr(cost_targets, name), now=NOW)
+        monkeypatch.setattr(cost_targets, name, pinned)
 
 
 async def test_targets_routes_are_admin_only(

@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 19:16:45 -0800
+Subject: [PATCH 287/289] [ae-patch] Tell the user when queued notes wait for
+ sign-in, and fix the 0282 notes
+
+Fix-check fixes to the previous patch (2026-11-01).
+
+Notes carried because the current identity could not be verified were held
+with no toast (only console.info said carried=N), and the restore awaited
+resolveIdentity() with no cap, so a /v1/me call that hung right after a
+deploy held the notes silently for the page's life; retyping them meant a
+later reload sent both. The identity wait is now capped at 10 s, after
+which the identity counts as unverifiable, and any carried notes get one
+toast saying they wait until sign-in is confirmed, to reload rather than
+retype. New tests cover a hanging probe hitting the cap, a failed probe
+with stored owned notes, and a toast that counts only carried notes.
+---
+ web/src/lib/aeQueuePersist.test.ts | 41 +++++++++++++++++++++++++++++-
+ web/src/lib/aeQueuePersist.ts      | 23 +++++++++++++++--
+ 2 files changed, 61 insertions(+), 3 deletions(-)
+
+diff --git a/web/src/lib/aeQueuePersist.test.ts b/web/src/lib/aeQueuePersist.test.ts
+index 5d3377e29ebc42b1aa5edb36ca1f3f17097f0a83..c88731fa34bacf4bdf35c8df666717a6ab3006da 100644
+--- a/web/src/lib/aeQueuePersist.test.ts
++++ b/web/src/lib/aeQueuePersist.test.ts
+@@ -472,7 +472,11 @@ describe("identity", () => {
+     expect(toasts[0]).toContain("before the signed-in user was known");
+   });
+ 
+-  it("carries a user's note untouched while identity cannot be verified", async () => {
++  const carriedToast =
++    "from before the reload is waiting until your sign-in is confirmed. " +
++    "Reload the page to bring them back; don't retype them.";
++
++  it("carries a user's note untouched while identity cannot be verified, and says so", async () => {
+     const info = vi.spyOn(console, "info").mockImplementation(() => {});
+     seed([entry("a", { userId: "alice" })]);
+     await install();
+@@ -483,6 +487,41 @@ describe("identity", () => {
+       ["b", null],
+     ]);
+     expect(info).toHaveBeenCalledWith(expect.stringContaining("carried=1"));
++    expect(toasts).toEqual([`1 queued note ${carriedToast}`]);
++  });
++
++  it("stops waiting for a hanging identity at the cap and carries the notes", async () => {
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    persist.reset({ lockWaitMs: 20, identityWaitMs: 30 });
++    identity.resolve = () => new Promise(() => {});
++    seed([entry("a", { userId: "alice" }), entry("b", { userId: "alice" })]);
++    await install();
++    expect(queue()).toEqual([]);
++    expect(stored().map((e) => e.text)).toEqual(["a", "b"]);
++    expect(toasts).toEqual([
++      "2 queued notes from before the reload are waiting until your sign-in is confirmed. " +
++        "Reload the page to bring them back; don't retype them.",
++    ]);
++  });
++
++  it("carries owned notes when the identity probe fails, counting only the carried ones", async () => {
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    identity.resolve = () => Promise.reject(new Error("unreachable"));
++    seed([
++      entry("a", { userId: "alice" }),
++      entry("b", { userId: null, fileNames: ["x.png"] }),
++      entry("c", { userId: null }),
++    ]);
++    await install();
++    // Unknown both ways: restored under the normal rules; the attachment one waits for Retry.
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([
++      ["b", true],
++      ["c", undefined],
++    ]);
++    expect(stored().map((e) => e.text)).toEqual(["a", "b", "c"]);
++    expect(toasts).toHaveLength(2);
++    expect(toasts[0]).toBe(`1 queued note ${carriedToast}`);
++    expect(toasts[1]).toContain("had attachments");
+   });
+ 
+   it("restores normally when identity is unknown both when queued and now", async () => {
+diff --git a/web/src/lib/aeQueuePersist.ts b/web/src/lib/aeQueuePersist.ts
+index b1efdec1e379bc5995e33ad451d9f409bd7aecb6..c7d09155b73d49b0655a6c6f22a16f20ebfef869 100644
+--- a/web/src/lib/aeQueuePersist.ts
++++ b/web/src/lib/aeQueuePersist.ts
+@@ -35,6 +35,8 @@ export const AE_QUEUE_TAB_ID_KEY = "omnigent:ae-queue-tab-id:v1";
+ export const AE_QUEUE_LOCK_PREFIX = "omnigent:ae-queue-owner";
+ /** How long a restore waits for the tab lock (a reload's dying page frees it almost at once). */
+ export const AE_QUEUE_LOCK_WAIT_MS = 1000;
++/** How long a restore waits for `/v1/me`; past it the identity counts as unverifiable. */
++export const AE_QUEUE_IDENTITY_WAIT_MS = 10_000;
+ /** A restored note older than this waits for Retry instead of sending on its own. */
+ export const AE_QUEUE_AUTO_SEND_MAX_AGE_MS = 60 * 60_000;
+ /** At most this many notes are stored; past it new ones stay in memory only. */
+@@ -78,6 +80,7 @@ let carriedEntries: StoredEntry[] = [];
+ let unsubscribe: (() => void) | null = null;
+ let restorePromise: Promise<void> = Promise.resolve();
+ let lockWaitMs = AE_QUEUE_LOCK_WAIT_MS;
++let identityWaitMs = AE_QUEUE_IDENTITY_WAIT_MS;
+ let warnedCap = false;
+ const firstSeen = new Map<string, number>();
+ /** Owner of each restored note, kept as stored so a write never relabels it. */
+@@ -307,11 +310,19 @@ async function claimOwnership(): Promise<Ownership> {
+   return "other-tab";
+ }
+ 
++/** The signed-in user, or null when it cannot be verified (failed, or no answer in time). */
+ async function currentIdentity(): Promise<string | null> {
++  let timer: ReturnType<typeof setTimeout> | null = null;
++  // A `/v1/me` that hangs (say right after a deploy) must not hold the restore for the page's life.
++  const timeout = new Promise<null>((settle) => {
++    timer = setTimeout(() => settle(null), identityWaitMs);
++  });
+   try {
+-    return await resolveIdentity();
++    return await Promise.race([resolveIdentity(), timeout]);
+   } catch {
+     return getCurrentUserId();
++  } finally {
++    if (timer !== null) clearTimeout(timer);
+   }
+ }
+ 
+@@ -395,6 +406,13 @@ async function restore(): Promise<void> {
+     );
+   }
+ 
++  if (carried.length > 0) {
++    showToast(
++      `${plural(carried.length, "queued note", "queued notes")} from before the reload ` +
++        `${carried.length === 1 ? "is" : "are"} waiting until your sign-in is confirmed. ` +
++        "Reload the page to bring them back; don't retype them.",
++    );
++  }
+   if (heldBack === 0) return;
+   if (ownership === "other-tab") {
+     showToast(
+@@ -459,7 +477,7 @@ export function installAeQueuePersist(): () => void {
+ export const aeQueuePersistTestHooks = {
+   restored: (): Promise<void> => restorePromise,
+   isRestoring: (): boolean => restoring,
+-  reset(opts: { lockWaitMs?: number } = {}): void {
++  reset(opts: { lockWaitMs?: number; identityWaitMs?: number } = {}): void {
+     unsubscribe?.();
+     unsubscribe = null;
+     for (const release of heldLocks.splice(0)) release();
+@@ -471,6 +489,7 @@ export const aeQueuePersistTestHooks = {
+     carriedEntries = [];
+     restorePromise = Promise.resolve();
+     lockWaitMs = opts.lockWaitMs ?? AE_QUEUE_LOCK_WAIT_MS;
++    identityWaitMs = opts.identityWaitMs ?? AE_QUEUE_IDENTITY_WAIT_MS;
+     warnedCap = false;
+     firstSeen.clear();
+     restoredOwners.clear();

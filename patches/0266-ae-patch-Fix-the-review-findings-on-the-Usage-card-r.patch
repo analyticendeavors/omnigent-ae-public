@@ -1,0 +1,397 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 16:59:01 -0700
+Subject: [PATCH 266/289] [ae-patch] Fix the review findings on the Usage card
+ re-reads after a login switch
+
+Keep the follow-up re-reads in a per-chat module-level schedule so closing the composer menu does not cancel them, schedule them only after a switch that went through, add a 60 s tail, and cover the hook and the family dialog's failure path with tests.
+---
+ .../hooks/useAeSwitchClaudeAccount.test.tsx   | 112 ++++++++++++++++++
+ web/src/hooks/useAeSwitchClaudeAccount.ts     |  20 ++--
+ web/src/lib/aeClaudeAccount.test.ts           |  55 ++++++---
+ web/src/lib/aeClaudeAccount.ts                |  38 ++++--
+ web/src/shell/AeMoveAllChatsDialog.tsx        |   2 +
+ web/src/shell/AeSwitchFamilyDialog.test.tsx   |  21 ++++
+ web/src/shell/AeSwitchFamilyDialog.tsx        |   4 +-
+ 7 files changed, 212 insertions(+), 40 deletions(-)
+ create mode 100644 web/src/hooks/useAeSwitchClaudeAccount.test.tsx
+
+diff --git a/web/src/hooks/useAeSwitchClaudeAccount.test.tsx b/web/src/hooks/useAeSwitchClaudeAccount.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..d69edb910185996d766c0e496adacb127b05eaa4
+--- /dev/null
++++ b/web/src/hooks/useAeSwitchClaudeAccount.test.tsx
+@@ -0,0 +1,112 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, renderHook } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { AE_ACCOUNT_FOLLOW_UP_DELAYS_MS } from "@/lib/aeClaudeAccount";
++import { authenticatedFetch } from "@/lib/identity";
++import { useAeSwitchClaudeAccount } from "./useAeSwitchClaudeAccount";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++
++const json = (body: unknown, status = 200) =>
++  Promise.resolve(new Response(JSON.stringify(body), { status }));
++
++let queryClient: QueryClient;
++const wrapper = ({ children }: { children: ReactNode }) => (
++  <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
++);
++
++// The card's real key is three parts (session, named account); the ["ae-limits", id] prefix must match it.
++const limitsKey = (id: string) => ["ae-limits", id, null];
++const stale = (id: string) => queryClient.getQueryState(limitsKey(id))?.isInvalidated === true;
++const seed = (id: string) => queryClient.setQueryData(limitsKey(id), { ok: true });
++const limitsCalls = (spy: ReturnType<typeof vi.spyOn>, id: string) =>
++  spy.mock.calls.filter(([a]: unknown[]) => {
++    const key = (a as { queryKey?: unknown[] } | undefined)?.queryKey;
++    return key?.[0] === "ae-limits" && key?.[1] === id;
++  }).length;
++
++beforeEach(() => {
++  vi.useFakeTimers();
++  vi.mocked(authenticatedFetch).mockReset();
++  queryClient = new QueryClient();
++});
++afterEach(() => {
++  vi.runOnlyPendingTimers();
++  vi.useRealTimers();
++});
++
++async function switchTo(result: { current: ReturnType<typeof useAeSwitchClaudeAccount> }) {
++  await act(async () => {
++    await result.current.mutateAsync({ account: "Backup" }).catch(() => {});
++  });
++}
++
++const total = AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.length;
++const last = AE_ACCOUNT_FOLLOW_UP_DELAYS_MS[total - 1];
++
++describe("useAeSwitchClaudeAccount", () => {
++  it("re-reads once now and again at each delay after a switch that went through", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ account: "Backup", relaunched: true }),
++    );
++    seed("s1");
++    const spy = vi.spyOn(queryClient, "invalidateQueries");
++    const { result } = renderHook(() => useAeSwitchClaudeAccount("s1"), { wrapper });
++    await switchTo(result);
++    expect(limitsCalls(spy, "s1")).toBe(1);
++    expect(stale("s1")).toBe(true);
++    await act(async () => {
++      vi.advanceTimersByTime(last);
++    });
++    expect(limitsCalls(spy, "s1")).toBe(1 + total);
++  });
++
++  it("a rejected switch re-reads once and schedules no follow-ups", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ error: { message: "Chat is busy." } }, 409),
++    );
++    const spy = vi.spyOn(queryClient, "invalidateQueries");
++    const { result } = renderHook(() => useAeSwitchClaudeAccount("s1"), { wrapper });
++    await switchTo(result);
++    await act(async () => {
++      vi.advanceTimersByTime(last * 2);
++    });
++    expect(limitsCalls(spy, "s1")).toBe(1);
++  });
++
++  it("keeps re-reading after the hook unmounts (the composer menu closes)", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ account: "Backup", relaunched: true }),
++    );
++    const spy = vi.spyOn(queryClient, "invalidateQueries");
++    const { result, unmount } = renderHook(() => useAeSwitchClaudeAccount("s1"), { wrapper });
++    await switchTo(result);
++    unmount();
++    await act(async () => {
++      vi.advanceTimersByTime(last);
++    });
++    expect(limitsCalls(spy, "s1")).toBe(1 + total);
++  });
++
++  it("a second switch for the same chat replaces the first schedule; another chat keeps its own", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ account: "Backup", relaunched: true }),
++    );
++    const spy = vi.spyOn(queryClient, "invalidateQueries");
++    const one = renderHook(() => useAeSwitchClaudeAccount("s1"), { wrapper });
++    const two = renderHook(() => useAeSwitchClaudeAccount("s2"), { wrapper });
++    await switchTo(one.result);
++    await switchTo(two.result);
++    await act(async () => {
++      vi.advanceTimersByTime(AE_ACCOUNT_FOLLOW_UP_DELAYS_MS[0]);
++    });
++    await switchTo(one.result);
++    await act(async () => {
++      vi.advanceTimersByTime(last);
++    });
++    // s1: immediate, first schedule's 2 s read, immediate again, then one full schedule.
++    expect(limitsCalls(spy, "s1")).toBe(2 + 1 + total);
++    expect(limitsCalls(spy, "s2")).toBe(1 + total);
++  });
++});
+diff --git a/web/src/hooks/useAeSwitchClaudeAccount.ts b/web/src/hooks/useAeSwitchClaudeAccount.ts
+index d39b71b42283864f4001770288f427666c6a3b4f..804ef880e934cdc8255b5b689ce7491e566ec18e 100644
+--- a/web/src/hooks/useAeSwitchClaudeAccount.ts
++++ b/web/src/hooks/useAeSwitchClaudeAccount.ts
+@@ -1,24 +1,24 @@
+ // Switch one chat's Claude login in place (omnigent-ae, 2026-10-27). The chat's
+ // snapshot is re-read afterwards so every picker shows the new login.
+ // `includeChildren` (2026-10-28) moves the chat's family children with it.
+-// The Usage numbers are re-read a few more times (2026-10-30): the runner stamps the new
+-// login only after it relaunches the terminal, after the switch has answered.
++// After a switch that went through, the Usage numbers are re-read a few more times
++// (2026-10-30): the runner stamps the new login only after it relaunches the terminal.
+ 
+-import { useEffect, useRef } from "react";
+ import { useMutation, useQueryClient } from "@tanstack/react-query";
+-import { aeRefreshChatAccountSoon, putAeClaudeAccount } from "@/lib/aeClaudeAccount";
++import {
++  aeRefreshChatAccount,
++  aeRefreshChatAccountSoon,
++  putAeClaudeAccount,
++} from "@/lib/aeClaudeAccount";
+ 
+ export function useAeSwitchClaudeAccount(sessionId: string | null | undefined) {
+   const queryClient = useQueryClient();
+-  const cancelRef = useRef<() => void>(() => {});
+-  // Stop the pending re-reads when the chat changes or the component goes away.
+-  useEffect(() => () => cancelRef.current(), [sessionId]);
+   return useMutation({
+     mutationFn: ({ account, includeChildren }: { account: string; includeChildren?: boolean }) =>
+       putAeClaudeAccount(sessionId ?? "", account, includeChildren === true),
+-    onSettled: () => {
+-      cancelRef.current();
+-      cancelRef.current = aeRefreshChatAccountSoon(queryClient, sessionId ?? null);
++    onSuccess: () => {
++      aeRefreshChatAccountSoon(queryClient, sessionId ?? null);
+     },
++    onSettled: () => aeRefreshChatAccount(queryClient, sessionId ?? null),
+   });
+ }
+diff --git a/web/src/lib/aeClaudeAccount.test.ts b/web/src/lib/aeClaudeAccount.test.ts
+index d14cae823a513a8cad0288ee780bfaa038a961a4..d35390761a61b16c84162bd4c37e57359d55fc69 100644
+--- a/web/src/lib/aeClaudeAccount.test.ts
++++ b/web/src/lib/aeClaudeAccount.test.ts
+@@ -115,38 +115,57 @@ describe("aeSwitchSummary", () => {
+ });
+ 
+ describe("aeRefreshChatAccountSoon", () => {
+-  afterEach(() => vi.useRealTimers());
+-
+-  const limitsCalls = (spy: ReturnType<typeof vi.fn>) =>
+-    spy.mock.calls.filter(([arg]) => arg?.queryKey?.[0] === "ae-limits").length;
++  afterEach(() => {
++    vi.runOnlyPendingTimers();
++    vi.useRealTimers();
++  });
+ 
+-  it("re-reads the Usage numbers now and at each follow-up delay", () => {
++  const limitsCalls = (spy: ReturnType<typeof vi.fn>, id: string) =>
++    spy.mock.calls.filter(
++      ([arg]) => arg?.queryKey?.[0] === "ae-limits" && arg?.queryKey?.[1] === id,
++    ).length;
++  const fake = () => {
+     vi.useFakeTimers();
+     const invalidate = vi.fn();
+-    const client = { invalidateQueries: invalidate } as unknown as QueryClient;
++    return { invalidate, client: { invalidateQueries: invalidate } as unknown as QueryClient };
++  };
++
++  it("re-reads the chat and its Usage numbers at each follow-up delay, and nothing before", () => {
++    const { invalidate, client } = fake();
+     aeRefreshChatAccountSoon(client, "s1");
+-    expect(limitsCalls(invalidate)).toBe(1);
++    expect(invalidate).not.toHaveBeenCalled();
++    AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.forEach((delay, n) => {
++      vi.advanceTimersByTime(n === 0 ? delay : delay - AE_ACCOUNT_FOLLOW_UP_DELAYS_MS[n - 1]);
++      expect(limitsCalls(invalidate, "s1")).toBe(n + 1);
++    });
+     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "s1"] });
+-    vi.advanceTimersByTime(Math.max(...AE_ACCOUNT_FOLLOW_UP_DELAYS_MS));
+-    expect(limitsCalls(invalidate)).toBe(1 + AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.length);
+-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["ae-limits", "s1"] });
++    expect(AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.at(-1)).toBe(60000);
+   });
+ 
+   it("stops re-reading once cancelled", () => {
+-    vi.useFakeTimers();
+-    const invalidate = vi.fn();
+-    const client = { invalidateQueries: invalidate } as unknown as QueryClient;
++    const { invalidate, client } = fake();
+     const cancel = aeRefreshChatAccountSoon(client, "s1");
+     vi.advanceTimersByTime(AE_ACCOUNT_FOLLOW_UP_DELAYS_MS[0]);
+     cancel();
+-    vi.advanceTimersByTime(60_000);
+-    expect(limitsCalls(invalidate)).toBe(2);
++    vi.advanceTimersByTime(120_000);
++    expect(limitsCalls(invalidate, "s1")).toBe(1);
++  });
++
++  it("replaces an earlier schedule for the same chat and keeps other chats' own", () => {
++    const { invalidate, client } = fake();
++    aeRefreshChatAccountSoon(client, "s1");
++    aeRefreshChatAccountSoon(client, "s2");
++    vi.advanceTimersByTime(3000);
++    aeRefreshChatAccountSoon(client, "s1");
++    vi.advanceTimersByTime(120_000);
++    // s1: one re-read from the first schedule (2 s), then a full second schedule.
++    expect(limitsCalls(invalidate, "s1")).toBe(1 + AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.length);
++    expect(limitsCalls(invalidate, "s2")).toBe(AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.length);
+   });
+ 
+   it("schedules nothing without a session", () => {
+-    vi.useFakeTimers();
+-    const invalidate = vi.fn();
+-    aeRefreshChatAccountSoon({ invalidateQueries: invalidate } as unknown as QueryClient, null);
++    const { client } = fake();
++    aeRefreshChatAccountSoon(client, null);
+     expect(vi.getTimerCount()).toBe(0);
+   });
+ });
+diff --git a/web/src/lib/aeClaudeAccount.ts b/web/src/lib/aeClaudeAccount.ts
+index 0f4c7afada2aafbe8d17740854196d7909ecf957..289faff1f76e2496c92ec0c5bdf5c08b1c33e4f0 100644
+--- a/web/src/lib/aeClaudeAccount.ts
++++ b/web/src/lib/aeClaudeAccount.ts
+@@ -62,29 +62,45 @@ export function aeRefreshChatAccount(queryClient: QueryClient, sessionId: string
+ }
+ 
+ /**
+- * When to re-read the Usage numbers after a switch (ms after it settled). The server answers
++ * When to re-read the Usage numbers after a switch (ms after it succeeded). The server answers
+  * from the runner's launch-time label, which the runner stamps only after the terminal
+- * relaunches, so the first re-read can still see the old login (2026-10-30).
++ * relaunches, so the first re-read can still see the old login (2026-10-30). The 60 s tail
++ * covers a slow relaunch (a pending switch, a busy host, a move-all over many chats).
+  */
+-export const AE_ACCOUNT_FOLLOW_UP_DELAYS_MS = [2000, 5000, 12000, 30000];
++export const AE_ACCOUNT_FOLLOW_UP_DELAYS_MS = [2000, 5000, 12000, 30000, 60000];
++
++// One schedule per chat, held outside React: the composer menu that starts a switch unmounts
++// when it closes, and the re-reads must outlive it. A timer that fires after the user left the
++// chat is harmless, an inactive query is only marked stale.
++const followUps = new Map<string, () => void>();
+ 
+ /**
+- * `aeRefreshChatAccount` now, then the Usage numbers again at each follow-up delay so the card
+- * catches the runner's stamp. Returns a function that cancels the pending re-reads.
++ * Re-read the chat's Usage numbers again at each follow-up delay, so the card catches the
++ * runner's stamp. Call it after a switch succeeded (and after the immediate
++ * `aeRefreshChatAccount`). A repeat call for the same chat replaces its earlier schedule.
++ * Returns a function that cancels the pending re-reads.
+  */
+ export function aeRefreshChatAccountSoon(
+   queryClient: QueryClient,
+   sessionId: string | null,
+ ): () => void {
+-  aeRefreshChatAccount(queryClient, sessionId);
+   if (!sessionId) return () => {};
++  followUps.get(sessionId)?.();
+   const timers = AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.map((delay) =>
+-    setTimeout(
+-      () => void queryClient.invalidateQueries({ queryKey: ["ae-limits", sessionId] }),
+-      delay,
+-    ),
++    setTimeout(() => {
++      void queryClient.invalidateQueries({ queryKey: ["session", sessionId] });
++      void queryClient.invalidateQueries({ queryKey: ["ae-limits", sessionId] });
++      if (delay === AE_ACCOUNT_FOLLOW_UP_DELAYS_MS[AE_ACCOUNT_FOLLOW_UP_DELAYS_MS.length - 1]) {
++        if (followUps.get(sessionId) === cancel) followUps.delete(sessionId);
++      }
++    }, delay),
+   );
+-  return () => timers.forEach(clearTimeout);
++  const cancel = () => {
++    timers.forEach(clearTimeout);
++    if (followUps.get(sessionId) === cancel) followUps.delete(sessionId);
++  };
++  followUps.set(sessionId, cancel);
++  return cancel;
+ }
+ 
+ /** The login a chat is on: the stored pick, else the last launch's, else unknown (`undefined`). */
+diff --git a/web/src/shell/AeMoveAllChatsDialog.tsx b/web/src/shell/AeMoveAllChatsDialog.tsx
+index 341ed928477aeccc4b29cb20954e14b5d74971e8..d4e9d9a0e3d744ed6207e3fa2fc3a9087b28940c 100644
+--- a/web/src/shell/AeMoveAllChatsDialog.tsx
++++ b/web/src/shell/AeMoveAllChatsDialog.tsx
+@@ -17,6 +17,7 @@ import { showToast } from "@/components/ui/toast";
+ import {
+   AE_MOVE_ALL_CAUTION,
+   aeMoveAllSummary,
++  aeRefreshChatAccount,
+   aeRefreshChatAccountSoon,
+   moveAllAeClaudeChats,
+ } from "@/lib/aeClaudeAccount";
+@@ -33,6 +34,7 @@ export function AeMoveAllChatsDialog() {
+     moveAllAeClaudeChats(account, hostId).then(
+       (answer) => {
+         for (const id of [...answer.moved, ...answer.pending.map((p) => p.id)]) {
++          aeRefreshChatAccount(queryClient, id);
+           aeRefreshChatAccountSoon(queryClient, id);
+         }
+         showToast(aeMoveAllSummary(answer));
+diff --git a/web/src/shell/AeSwitchFamilyDialog.test.tsx b/web/src/shell/AeSwitchFamilyDialog.test.tsx
+index 64c8b7bd323a8f8b6ce5371ea6394780a90d9f3d..986272697ac8b6579699d54c41b8d907fb60f80b 100644
+--- a/web/src/shell/AeSwitchFamilyDialog.test.tsx
++++ b/web/src/shell/AeSwitchFamilyDialog.test.tsx
+@@ -92,6 +92,27 @@ describe("AeSwitchFamilyDialog", () => {
+     await waitFor(() => expect(screen.queryByTestId("ae-switch-family-dialog")).toBeNull());
+   });
+ 
++  it("a failed switch re-reads once and schedules no follow-ups", async () => {
++    vi.useFakeTimers({ shouldAdvanceTime: true });
++    try {
++      vi.mocked(authenticatedFetch).mockImplementation(() =>
++        json({ error: { message: "Chat is busy." } }, 409),
++      );
++      ask();
++      const invalidate = vi.spyOn(queryClient, "invalidateQueries");
++      fireEvent.click(await screen.findByTestId("ae-switch-family-both"));
++      await waitFor(() => expect(showToast).toHaveBeenCalled());
++      expect(invalidate).toHaveBeenCalledWith({ queryKey: ["ae-limits", "s1"] });
++      const before = invalidate.mock.calls.length;
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(120_000);
++      });
++      expect(invalidate.mock.calls.length).toBe(before);
++    } finally {
++      vi.useRealTimers();
++    }
++  });
++
+   it("keeps a failed cascade on screen with the not-switched line", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() =>
+       json({
+diff --git a/web/src/shell/AeSwitchFamilyDialog.tsx b/web/src/shell/AeSwitchFamilyDialog.tsx
+index 85b161d59b234ec1edc1468930358a8a652a6ac1..332cafead4c25d2f3f715645a768a5727336eaa7 100644
+--- a/web/src/shell/AeSwitchFamilyDialog.tsx
++++ b/web/src/shell/AeSwitchFamilyDialog.tsx
+@@ -15,6 +15,7 @@ import {
+ } from "@/components/ui/dialog";
+ import { showToast } from "@/components/ui/toast";
+ import {
++  aeRefreshChatAccount,
+   aeRefreshChatAccountSoon,
+   aeSwitchSummary,
+   aeSwitchedChildIds,
+@@ -40,6 +41,7 @@ export function AeSwitchFamilyDialog() {
+     putAeClaudeAccount(sessionId, account, includeChildren).then(
+       (answer) => {
+         for (const id of [sessionId, ...aeSwitchedChildIds(answer)]) {
++          aeRefreshChatAccount(queryClient, id);
+           aeRefreshChatAccountSoon(queryClient, id);
+         }
+         const kids = answer.children;
+@@ -48,7 +50,7 @@ export function AeSwitchFamilyDialog() {
+         showToast(aeSwitchSummary(label, answer), lingers ? { duration: 0 } : undefined);
+       },
+       (failure: unknown) => {
+-        aeRefreshChatAccountSoon(queryClient, sessionId);
++        aeRefreshChatAccount(queryClient, sessionId);
+         showToast(failure instanceof Error ? failure.message : "Could not switch the login.");
+       },
+     );

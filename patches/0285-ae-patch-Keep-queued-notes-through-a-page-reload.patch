@@ -1,0 +1,865 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 18:54:22 -0800
+Subject: [PATCH 285/289] [ae-patch] Keep queued notes through a page reload
+
+A message sent while the chat is busy waits in the client-side queue
+(queuedMessages) until the turn ends, and that queue lived only in page
+memory. A reload, a phone tab discard, the chunk-error auto-reload or the
+"Omnigent was updated" reload during a long turn lost it without a word; on
+2026-11-01 a note went this way during a 28-minute turn.
+
+New aeQueuePersist.ts mirrors the queue into sessionStorage
+(omnigent:ae-queued-messages:v1) synchronously on every queuedMessages
+change, storing every field but the File objects (their names are kept) and
+a firstSeenAt stamped once per note. Temp conversations are not stored, and
+past 50 notes new ones stay in memory only while the stored ones stay.
+
+Once per page it puts the notes back. Storage is read before the write
+subscription exists, and every write keeps those notes until the restore is
+done, so a second reload during the restore cannot wipe them. A Web Lock
+named after a per-tab id (kept in sessionStorage) decides ownership: a
+reload waits up to a second for the dying page to free it; a duplicated tab
+finds it held, takes a fresh id and leaves the notes to the tab that has
+them, with a toast. Owned notes come back ahead of anything queued, keyed
+q_ae_<stableId> with their stable id kept so the server append stays
+idempotent. A fresh text-only note sends through the existing flush paths;
+one with attachments, one over an hour old, one already waiting for Retry,
+or any note in a browser without Web Locks comes back waiting for Retry,
+with one toast saying why. A notes document written for another signed-in
+user is dropped. QueueFlushProvider installs it, which covers the main app
+and the embed entry.
+---
+ web/src/hooks/QueueFlushProvider.tsx |   4 +
+ web/src/lib/aeQueuePersist.test.ts   | 381 +++++++++++++++++++++++++
+ web/src/lib/aeQueuePersist.ts        | 411 +++++++++++++++++++++++++++
+ 3 files changed, 796 insertions(+)
+ create mode 100644 web/src/lib/aeQueuePersist.test.ts
+ create mode 100644 web/src/lib/aeQueuePersist.ts
+
+diff --git a/web/src/hooks/QueueFlushProvider.tsx b/web/src/hooks/QueueFlushProvider.tsx
+index 20d7e255140dba0385f2289a38ca009840b864fb..f40a291efe090c104b95aefb1835f43eb7919b66 100644
+--- a/web/src/hooks/QueueFlushProvider.tsx
++++ b/web/src/hooks/QueueFlushProvider.tsx
+@@ -2,6 +2,7 @@ import { useQueryClient } from "@tanstack/react-query";
+ import { useEffect } from "react";
+ import type { ReactNode } from "react";
+ 
++import { installAeQueuePersist } from "@/lib/aeQueuePersist";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ /**
+@@ -24,6 +25,9 @@ export function QueueFlushProvider({ children }: { children: ReactNode }) {
+   const queuedMessages = useChatStore((s) => s.queuedMessages);
+   const flushBackgroundQueues = useChatStore((s) => s.flushBackgroundQueues);
+ 
++  // omnigent-ae: keep the queue through a reload (restores once per page, before the flushes).
++  useEffect(() => installAeQueuePersist(), []);
++
+   // Re-evaluate whenever the queue itself changes (e.g. a message enqueued in
+   // another conversation, or one drained here).
+   useEffect(() => {
+diff --git a/web/src/lib/aeQueuePersist.test.ts b/web/src/lib/aeQueuePersist.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b88c3c0a60249f861af9d90c8b4f1a3227a38a0a
+--- /dev/null
++++ b/web/src/lib/aeQueuePersist.test.ts
+@@ -0,0 +1,381 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import type * as Identity from "@/lib/identity";
++import { serializeReplyDraft } from "@/lib/replyDraft";
++import { useChatStore, type QueuedMessage } from "@/store/chatStore";
++import {
++  AE_QUEUE_AUTO_SEND_MAX_AGE_MS,
++  AE_QUEUE_LOCK_PREFIX,
++  AE_QUEUE_MAX_STORED,
++  AE_QUEUE_STORAGE_KEY,
++  AE_QUEUE_TAB_ID_KEY,
++  aeQueuePersistTestHooks as persist,
++  installAeQueuePersist,
++} from "./aeQueuePersist";
++
++const identity = vi.hoisted(() => ({ userId: null as string | null }));
++vi.mock("@/lib/identity", async (importOriginal) => {
++  const actual = await importOriginal<typeof Identity>();
++  return {
++    ...actual,
++    getCurrentUserId: () => identity.userId,
++    resolveIdentity: () => Promise.resolve(identity.userId),
++  };
++});
++
++const CONV = "conv_queue";
++
++/** Web Locks with exclusive named locks, abort signals and an "another tab" hold. */
++class FakeLocks {
++  held = new Set<string>();
++  waiters = new Map<string, (() => void)[]>();
++
++  private grant<T>(name: string, cb: (lock: { name: string }) => T | Promise<T>): Promise<T> {
++    this.held.add(name);
++    const done = Promise.resolve(cb({ name }));
++    void done.finally(() => this.free(name));
++    return done;
++  }
++
++  private free(name: string): void {
++    this.held.delete(name);
++    const next = this.waiters.get(name)?.shift();
++    next?.();
++  }
++
++  request<T>(
++    name: string,
++    opts: { signal?: AbortSignal },
++    cb: (lock: { name: string }) => T | Promise<T>,
++  ): Promise<T> {
++    if (!this.held.has(name)) return this.grant(name, cb);
++    return new Promise<T>((resolve, reject) => {
++      const waiter = () => {
++        this.grant(name, cb).then(resolve, reject);
++      };
++      const queue = this.waiters.get(name) ?? [];
++      queue.push(waiter);
++      this.waiters.set(name, queue);
++      opts.signal?.addEventListener("abort", () => {
++        const at = queue.indexOf(waiter);
++        if (at !== -1) queue.splice(at, 1);
++        reject(new DOMException("aborted", "AbortError"));
++      });
++    });
++  }
++
++  /** Another tab holds `name` until the returned release runs. */
++  holdElsewhere(name: string): () => void {
++    this.held.add(name);
++    return () => this.free(name);
++  }
++}
++
++let locks: FakeLocks;
++let send: ReturnType<typeof vi.fn>;
++const toasts: string[] = [];
++const listen = (event: Event) => toasts.push(String((event as CustomEvent).detail.content));
++
++function setLocks(value: FakeLocks | undefined) {
++  Object.defineProperty(navigator, "locks", { value, configurable: true });
++}
++
++function setChat(patch: Record<string, unknown> = {}) {
++  useChatStore.setState({
++    conversationId: CONV,
++    boundAgentId: "agent_1",
++    status: "idle",
++    // Running, so an enqueue does not flush on the spot.
++    sessionStatus: "running",
++    queuedMessages: [],
++    ...patch,
++  } as never);
++}
++
++function stored(): Record<string, unknown>[] {
++  const raw = sessionStorage.getItem(AE_QUEUE_STORAGE_KEY);
++  if (raw === null) return [];
++  return (JSON.parse(raw) as { entries: Record<string, unknown>[] }).entries;
++}
++
++function entry(text: string, extra: Record<string, unknown> = {}) {
++  return {
++    text,
++    conversationId: CONV,
++    agentId: "agent_1",
++    stableId: `sid_${text}`,
++    firstSeenAt: Date.now(),
++    ...extra,
++  };
++}
++
++function seed(entries: unknown[], extra: Record<string, unknown> = {}) {
++  sessionStorage.setItem(
++    AE_QUEUE_STORAGE_KEY,
++    JSON.stringify({ v: 1, userId: null, entries, ...extra }),
++  );
++}
++
++const queue = (): QueuedMessage[] => useChatStore.getState().queuedMessages;
++
++async function install() {
++  const stop = installAeQueuePersist();
++  await persist.restored();
++  return stop;
++}
++
++beforeEach(() => {
++  sessionStorage.clear();
++  persist.reset({ lockWaitMs: 20 });
++  identity.userId = null;
++  locks = new FakeLocks();
++  setLocks(locks);
++  toasts.length = 0;
++  window.addEventListener("omnigent:toast", listen);
++  send = vi.fn(() => Promise.resolve());
++  useChatStore.setState({ send } as never);
++  setChat();
++});
++
++afterEach(() => {
++  persist.reset();
++  window.removeEventListener("omnigent:toast", listen);
++  vi.restoreAllMocks();
++  setLocks(undefined);
++});
++
++describe("writes", () => {
++  it("enqueue, dequeue, reorder and clear each update storage", async () => {
++    await install();
++    const s = useChatStore.getState();
++    s.enqueueMessage("one");
++    s.enqueueMessage("two");
++    s.enqueueMessage("three");
++    expect(stored().map((e) => e.text)).toEqual(["one", "two", "three"]);
++    const [one, two, three] = queue();
++    useChatStore.getState().reorderQueuedMessage(three!.queueId, one!.queueId);
++    expect(stored().map((e) => e.text)).toEqual(["three", "one", "two"]);
++    useChatStore.getState().dequeueMessage(two!.queueId);
++    expect(stored().map((e) => e.text)).toEqual(["three", "one"]);
++    useChatStore.getState().clearQueuedMessages(CONV);
++    expect(sessionStorage.getItem(AE_QUEUE_STORAGE_KEY)).toBeNull();
++  });
++
++  it("stores every field but the files, whose names are kept", async () => {
++    await install();
++    const file = new File(["x"], "notes.txt", { type: "text/plain" });
++    useChatStore.getState().enqueueMessage("with file", [file]);
++    const [saved] = stored();
++    const [live] = queue();
++    expect(saved).toMatchObject({
++      text: "with file",
++      conversationId: CONV,
++      agentId: "agent_1",
++      stableId: live!.stableId,
++      fileNames: ["notes.txt"],
++    });
++    expect(saved).not.toHaveProperty("files");
++    expect(typeof saved!.firstSeenAt).toBe("number");
++  });
++
++  it("swallows a quota error", async () => {
++    await install();
++    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
++      throw new DOMException("full", "QuotaExceededError");
++    });
++    expect(() => useChatStore.getState().enqueueMessage("one")).not.toThrow();
++    expect(queue()).toHaveLength(1);
++  });
++
++  it("does not store notes for a temp conversation", async () => {
++    await install();
++    setChat({ conversationId: "temp:abc" });
++    useChatStore.getState().enqueueMessage("temp note");
++    expect(queue()).toHaveLength(1);
++    expect(stored()).toEqual([]);
++  });
++
++  it("past the cap keeps every stored note and stops storing new ones", async () => {
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    seed(Array.from({ length: AE_QUEUE_MAX_STORED }, (_, i) => entry(`n${i}`)));
++    await install();
++    expect(stored()).toHaveLength(AE_QUEUE_MAX_STORED);
++    useChatStore.getState().enqueueMessage("extra");
++    useChatStore.getState().enqueueMessage("extra2");
++    expect(queue()).toHaveLength(AE_QUEUE_MAX_STORED + 2);
++    expect(stored()).toHaveLength(AE_QUEUE_MAX_STORED);
++    expect(stored().map((e) => e.text)).toEqual(
++      Array.from({ length: AE_QUEUE_MAX_STORED }, (_, i) => `n${i}`),
++    );
++    expect(warn).toHaveBeenCalledTimes(1);
++  });
++});
++
++describe("restore", () => {
++  it("restores nothing and throws nothing for malformed or wrong-version storage", async () => {
++    sessionStorage.setItem(AE_QUEUE_STORAGE_KEY, "{not json");
++    await expect(install()).resolves.toBeTypeOf("function");
++    expect(queue()).toEqual([]);
++
++    persist.reset({ lockWaitMs: 20 });
++    seed([entry("a")], { v: 2 });
++    await install();
++    expect(queue()).toEqual([]);
++
++    persist.reset({ lockWaitMs: 20 });
++    sessionStorage.setItem(AE_QUEUE_STORAGE_KEY, JSON.stringify({ v: 1, entries: [42, null] }));
++    await install();
++    expect(queue()).toEqual([]);
++  });
++
++  it("restores in stored order ahead of current notes, keyed by stable id", async () => {
++    seed([entry("a"), entry("b")]);
++    setChat({
++      queuedMessages: [
++        { queueId: "q_9", text: "live", conversationId: CONV, stableId: "sid_live" },
++      ],
++    });
++    await install();
++    expect(queue().map((m) => [m.queueId, m.text, m.stableId, m.requiresRetry])).toEqual([
++      ["q_ae_sid_a", "a", "sid_a", undefined],
++      ["q_ae_sid_b", "b", "sid_b", undefined],
++      ["q_9", "live", "sid_live", undefined],
++    ]);
++    expect(toasts).toEqual([]);
++  });
++
++  it("mints a stable id for a stored note without one", async () => {
++    seed([{ text: "old", conversationId: CONV, firstSeenAt: Date.now() }]);
++    await install();
++    const [m] = queue();
++    expect(m!.stableId).toMatch(/^[0-9a-f]{32}$/);
++    expect(m!.queueId).toBe(`q_ae_${m!.stableId}`);
++  });
++
++  it("keeps a reply draft through a reload", async () => {
++    const draft = { quotes: [{ before: "", text: "quoted" }], text: "answer" };
++    const text = serializeReplyDraft(draft);
++    await install();
++    useChatStore.getState().enqueueMessage(text, undefined, { version: 1, ...draft });
++    persist.reset({ lockWaitMs: 20 });
++    setChat();
++    await install();
++    expect(queue()[0]?.replyDraft).toEqual({ version: 1, ...draft });
++  });
++
++  it("restores once when installed twice", async () => {
++    seed([entry("a")]);
++    const stop = await install();
++    stop();
++    await install();
++    expect(queue().map((m) => m.text)).toEqual(["a"]);
++  });
++
++  it("keeps the stored notes in every write during the lock wait", async () => {
++    seed([entry("a")]);
++    sessionStorage.setItem(AE_QUEUE_TAB_ID_KEY, "tab1");
++    const release = locks.holdElsewhere(`${AE_QUEUE_LOCK_PREFIX}:tab1`);
++    persist.reset({ lockWaitMs: 1000 });
++    installAeQueuePersist();
++    expect(persist.isRestoring()).toBe(true);
++    useChatStore.getState().enqueueMessage("new");
++    expect(stored().map((e) => e.text)).toEqual(["a", "new"]);
++    useChatStore.getState().clearQueuedMessages(CONV);
++    expect(stored().map((e) => e.text)).toEqual(["a"]);
++    // The dying page lets go: this tab owns the notes.
++    release();
++    await persist.restored();
++    expect(queue().map((m) => m.text)).toEqual(["a"]);
++    expect(stored().map((e) => e.text)).toEqual(["a"]);
++  });
++
++  it("auto-sends a fresh text note and holds back old, attached and lockless ones", async () => {
++    const now = Date.now();
++    seed([
++      entry("fresh"),
++      entry("old", { firstSeenAt: now - AE_QUEUE_AUTO_SEND_MAX_AGE_MS - 1 }),
++      entry("file", { fileNames: ["a.png"] }),
++    ]);
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([
++      ["fresh", undefined],
++      ["old", true],
++      ["file", true],
++    ]);
++    expect(toasts).toHaveLength(1);
++    expect(toasts[0]).toContain("3 queued notes came back");
++    expect(toasts[0]).toContain("2 wait for Retry");
++    expect(toasts[0]).toContain("attachments");
++    expect(toasts[0]).toContain("over an hour ago");
++  });
++
++  it("holds every note back when the browser has no Web Locks", async () => {
++    setLocks(undefined);
++    seed([entry("a")]);
++    await install();
++    expect(queue().map((m) => [m.text, m.requiresRetry])).toEqual([["a", true]]);
++    expect(toasts).toHaveLength(1);
++    expect(toasts[0]).toContain("another tab");
++  });
++
++  it("leaves notes owned by another tab there, clears this copy and takes a new tab id", async () => {
++    const info = vi.spyOn(console, "info").mockImplementation(() => {});
++    seed([entry("a"), entry("b")]);
++    sessionStorage.setItem(AE_QUEUE_TAB_ID_KEY, "tab1");
++    locks.holdElsewhere(`${AE_QUEUE_LOCK_PREFIX}:tab1`);
++    await install();
++    expect(queue()).toEqual([]);
++    expect(sessionStorage.getItem(AE_QUEUE_STORAGE_KEY)).toBeNull();
++    const tabId = sessionStorage.getItem(AE_QUEUE_TAB_ID_KEY);
++    expect(tabId).not.toBe("tab1");
++    expect(locks.held.has(`${AE_QUEUE_LOCK_PREFIX}:${tabId}`)).toBe(true);
++    expect(toasts).toEqual(["2 queued notes stay in the other tab this one was copied from."]);
++    expect(info).toHaveBeenCalledWith(expect.stringContaining("otherTab=2"));
++  });
++
++  it("drops notes stored for another signed-in user", async () => {
++    vi.spyOn(console, "info").mockImplementation(() => {});
++    identity.userId = "bob";
++    seed([entry("a")], { userId: "alice" });
++    await install();
++    expect(queue()).toEqual([]);
++  });
++
++  it("keeps firstSeenAt through a restore and later writes", async () => {
++    const first = Date.now() - 5 * 60_000;
++    seed([entry("a", { firstSeenAt: first })]);
++    await install();
++    expect(stored()[0]!.firstSeenAt).toBe(first);
++    useChatStore.getState().enqueueMessage("b");
++    expect(stored()[0]!.firstSeenAt).toBe(first);
++    const second = stored()[1]!.firstSeenAt;
++    vi.spyOn(Date, "now").mockReturnValue(Date.now() + 10_000);
++    useChatStore.getState().enqueueMessage("c");
++    expect(
++      stored()
++        .map((e) => e.firstSeenAt)
++        .slice(0, 2),
++    ).toEqual([first, second]);
++  });
++
++  it("a restored note waits for the agent, then flushes once with its stable id", async () => {
++    seed([entry("a")]);
++    setChat({ boundAgentId: null, sessionStatus: "idle" });
++    await install();
++    useChatStore.getState().maybeFlushQueuedHead();
++    expect(send).not.toHaveBeenCalled();
++    expect(queue()).toHaveLength(1);
++
++    useChatStore.setState({ boundAgentId: "agent_1" } as never);
++    useChatStore.getState().maybeFlushQueuedHead();
++    useChatStore.getState().maybeFlushQueuedHead();
++    expect(send).toHaveBeenCalledTimes(1);
++    expect(send).toHaveBeenCalledWith(
++      "a",
++      "agent_1",
++      undefined,
++      expect.objectContaining({ stableId: "sid_a", pinnedConversationId: CONV }),
++    );
++    expect(queue()).toEqual([]);
++    expect(sessionStorage.getItem(AE_QUEUE_STORAGE_KEY)).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeQueuePersist.ts b/web/src/lib/aeQueuePersist.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..65e003716776ffdb28e05bbe3470eac677d92b6f
+--- /dev/null
++++ b/web/src/lib/aeQueuePersist.ts
+@@ -0,0 +1,411 @@
++// Queued notes survive a reload (omnigent-ae, 2026-11-01). A message sent while the chat is
++// busy waits in the client-side queue (`queuedMessages` in chatStore) until the turn ends. That
++// queue lived only in page memory, so a reload, a phone tab discard, the chunk-error auto-reload
++// or the "Omnigent was updated" reload during a long turn lost it without a word: on 2026-11-01 a
++// note went this way during a 28-minute turn.
++//
++// This module mirrors the queue into sessionStorage (per tab; it survives a reload and usually a
++// tab discard) on every change, and puts it back once per page. A Web Lock named after a per-tab
++// id decides who owns the stored copy: a duplicated tab copies sessionStorage, and only the tab
++// that still holds the lock may send those notes. Restored notes flush through the existing
++// queue paths only (the chat page's flush and `flushBackgroundQueues`); nothing here sends.
++//
++// Kept out: attachments (File objects cannot be stored; their names come back and the note waits
++// for Retry), notes older than an hour (they wait for Retry), and anything across devices.
++
++import { showToast } from "@/components/ui/toast";
++import { getCurrentUserId, resolveIdentity } from "@/lib/identity";
++import { randomUUID } from "@/lib/randomUUID";
++import { readComposerDraft } from "@/lib/replyDraft";
++import { isTempConvId } from "@/lib/tempConversationId";
++import { useChatStore, type QueuedMessage } from "@/store/chatStore";
++
++/** sessionStorage key of the stored queue document. */
++export const AE_QUEUE_STORAGE_KEY = "omnigent:ae-queued-messages:v1";
++/** sessionStorage key of this tab's id (a duplicated tab copies it). */
++export const AE_QUEUE_TAB_ID_KEY = "omnigent:ae-queue-tab-id:v1";
++/** Web Lock name prefix; the full name is the prefix plus the tab id. */
++export const AE_QUEUE_LOCK_PREFIX = "omnigent:ae-queue-owner";
++/** How long a restore waits for the tab lock (a reload's dying page frees it almost at once). */
++export const AE_QUEUE_LOCK_WAIT_MS = 1000;
++/** A restored note older than this waits for Retry instead of sending on its own. */
++export const AE_QUEUE_AUTO_SEND_MAX_AGE_MS = 60 * 60_000;
++/** At most this many notes are stored; past it new ones stay in memory only. */
++export const AE_QUEUE_MAX_STORED = 50;
++/** Prefix of a restored note's queue id. */
++export const AE_QUEUE_RESTORED_ID_PREFIX = "q_ae_";
++
++const DOC_VERSION = 1;
++const LOG_PREFIX = "[ae-queue-persist]";
++
++/** One stored note: every QueuedMessage field except `files`, which becomes names only. */
++interface StoredEntry {
++  text: string;
++  conversationId: string;
++  agentId?: string;
++  stableId?: string;
++  command?: "compact";
++  replyDraft?: QueuedMessage["replyDraft"];
++  requiresRetry?: boolean;
++  fileNames?: string[];
++  /** When this page first saw the note; stamped once per note and never refreshed. */
++  firstSeenAt: number;
++}
++
++interface StoredDoc {
++  v: number;
++  userId: string | null;
++  entries: StoredEntry[];
++}
++
++// Module state: one restore per page, whatever mounts and unmounts.
++let started = false;
++let restoring = false;
++let pendingEntries: StoredEntry[] = [];
++let storedUserId: string | null = null;
++let unsubscribe: (() => void) | null = null;
++let restorePromise: Promise<void> = Promise.resolve();
++let lockWaitMs = AE_QUEUE_LOCK_WAIT_MS;
++let warnedCap = false;
++const firstSeen = new Map<string, number>();
++let persistedKeys = new Set<string>();
++const heldLocks: (() => void)[] = [];
++
++function noteKey(entry: { stableId?: string; queueId?: string; text: string }): string {
++  return entry.stableId ?? entry.queueId ?? entry.text;
++}
++
++function storage(): Storage | null {
++  try {
++    return typeof window === "undefined" ? null : window.sessionStorage;
++  } catch {
++    return null;
++  }
++}
++
++function isRecord(value: unknown): value is Record<string, unknown> {
++  return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function readEntry(raw: unknown): StoredEntry | null {
++  if (!isRecord(raw)) return null;
++  const { text, conversationId, firstSeenAt } = raw;
++  if (typeof text !== "string" || typeof conversationId !== "string") return null;
++  if (conversationId === "" || isTempConvId(conversationId)) return null;
++  if (typeof firstSeenAt !== "number" || !Number.isFinite(firstSeenAt)) return null;
++  const entry: StoredEntry = { text, conversationId, firstSeenAt };
++  if (typeof raw.agentId === "string") entry.agentId = raw.agentId;
++  if (typeof raw.stableId === "string" && raw.stableId !== "") entry.stableId = raw.stableId;
++  if (raw.command === "compact") entry.command = "compact";
++  const replyDraft = readComposerDraft({ text, replyDraft: raw.replyDraft })?.replyDraft;
++  if (replyDraft !== undefined) entry.replyDraft = replyDraft;
++  if (raw.requiresRetry === true) entry.requiresRetry = true;
++  if (Array.isArray(raw.fileNames)) {
++    const names = raw.fileNames.filter((n): n is string => typeof n === "string");
++    if (names.length > 0) entry.fileNames = names;
++  }
++  return entry;
++}
++
++/** The stored document, or null when it is missing, malformed or another version. */
++function readDoc(): StoredDoc | null {
++  try {
++    const raw = storage()?.getItem(AE_QUEUE_STORAGE_KEY);
++    if (!raw) return null;
++    const doc: unknown = JSON.parse(raw);
++    if (!isRecord(doc) || doc.v !== DOC_VERSION || !Array.isArray(doc.entries)) return null;
++    const entries: StoredEntry[] = [];
++    for (const item of doc.entries) {
++      const entry = readEntry(item);
++      if (entry !== null) entries.push(entry);
++    }
++    return { v: DOC_VERSION, userId: typeof doc.userId === "string" ? doc.userId : null, entries };
++  } catch {
++    return null;
++  }
++}
++
++function toStored(message: QueuedMessage, now: number): StoredEntry {
++  const key = noteKey(message);
++  let seen = firstSeen.get(key);
++  if (seen === undefined) {
++    seen = now;
++    firstSeen.set(key, seen);
++  }
++  const entry: StoredEntry = {
++    text: message.text,
++    conversationId: message.conversationId,
++    firstSeenAt: seen,
++  };
++  if (message.agentId !== undefined) entry.agentId = message.agentId;
++  if (message.stableId !== undefined) entry.stableId = message.stableId;
++  if (message.command !== undefined) entry.command = message.command;
++  if (message.replyDraft !== undefined) entry.replyDraft = message.replyDraft;
++  if (message.requiresRetry === true) entry.requiresRetry = true;
++  const names = (message.files ?? []).map((f) => f.name);
++  if (names.length > 0) entry.fileNames = names;
++  return entry;
++}
++
++/** Write the queue (plus any notes still waiting to be restored) to storage, now. */
++function writeQueue(queue: readonly QueuedMessage[]): void {
++  const now = Date.now();
++  const candidates: StoredEntry[] = [
++    ...pendingEntries,
++    ...queue.filter((m) => !isTempConvId(m.conversationId)).map((m) => toStored(m, now)),
++  ];
++  // Notes already stored always stay; new ones join only while there is room.
++  let room = AE_QUEUE_MAX_STORED - candidates.filter((e) => persistedKeys.has(noteKey(e))).length;
++  const kept: StoredEntry[] = [];
++  let overCap = false;
++  for (const entry of candidates) {
++    if (persistedKeys.has(noteKey(entry))) {
++      kept.push(entry);
++    } else if (room > 0) {
++      kept.push(entry);
++      room -= 1;
++    } else {
++      overCap = true;
++    }
++  }
++  if (overCap && !warnedCap) {
++    warnedCap = true;
++    console.warn(
++      `${LOG_PREFIX} more than ${AE_QUEUE_MAX_STORED} queued notes: the newest ones are not kept through a reload`,
++    );
++  }
++  persistedKeys = new Set(kept.map(noteKey));
++  try {
++    const store = storage();
++    if (store === null) return;
++    if (kept.length === 0) {
++      store.removeItem(AE_QUEUE_STORAGE_KEY);
++      return;
++    }
++    const doc: StoredDoc = {
++      v: DOC_VERSION,
++      userId: getCurrentUserId() ?? storedUserId,
++      entries: kept,
++    };
++    store.setItem(AE_QUEUE_STORAGE_KEY, JSON.stringify(doc));
++  } catch {
++    // Storage full or unavailable: the queue still works in memory.
++  }
++}
++
++function webLocksAvailable(): boolean {
++  return (
++    typeof navigator !== "undefined" &&
++    typeof navigator.locks !== "undefined" &&
++    typeof navigator.locks.request === "function"
++  );
++}
++
++function newTabId(): string {
++  return randomUUID().replace(/-/g, "");
++}
++
++function readTabId(): string {
++  try {
++    const store = storage();
++    const existing = store?.getItem(AE_QUEUE_TAB_ID_KEY);
++    if (existing) return existing;
++    const id = newTabId();
++    store?.setItem(AE_QUEUE_TAB_ID_KEY, id);
++    return id;
++  } catch {
++    return newTabId();
++  }
++}
++
++/** Hold `name` for the page's lifetime; resolve true once held, false if not granted in `waitMs`. */
++function holdTabLock(name: string, waitMs: number | null): Promise<boolean> {
++  return new Promise((settle) => {
++    const controller = waitMs === null ? null : new AbortController();
++    const timer =
++      controller === null || waitMs === null ? null : setTimeout(() => controller.abort(), waitMs);
++    navigator.locks
++      .request(name, controller === null ? {} : { signal: controller.signal }, () => {
++        if (timer !== null) clearTimeout(timer);
++        settle(true);
++        return new Promise<void>((release) => {
++          heldLocks.push(release);
++        });
++      })
++      .catch(() => {
++        if (timer !== null) clearTimeout(timer);
++        settle(false);
++      });
++  });
++}
++
++type Ownership = "owned" | "other-tab" | "no-locks";
++
++async function claimOwnership(): Promise<Ownership> {
++  if (!webLocksAvailable()) return "no-locks";
++  try {
++    if (await holdTabLock(`${AE_QUEUE_LOCK_PREFIX}:${readTabId()}`, lockWaitMs)) return "owned";
++    // Another live (or frozen) tab holds this id: it was duplicated from this one. Take a fresh
++    // id so this tab's own notes have an owner from now on.
++    const fresh = newTabId();
++    try {
++      storage()?.setItem(AE_QUEUE_TAB_ID_KEY, fresh);
++    } catch {
++      // Without storage the next reload mints another id; nothing to keep.
++    }
++    void holdTabLock(`${AE_QUEUE_LOCK_PREFIX}:${fresh}`, null);
++    return "other-tab";
++  } catch {
++    return "no-locks";
++  }
++}
++
++async function currentIdentity(): Promise<string | null> {
++  // Only a stored document that names a user needs the comparison; skip the probe otherwise.
++  if (pendingEntries.length === 0 || storedUserId === null) return getCurrentUserId();
++  try {
++    return await resolveIdentity();
++  } catch {
++    return getCurrentUserId();
++  }
++}
++
++function plural(n: number, one: string, many: string): string {
++  return `${n} ${n === 1 ? one : many}`;
++}
++
++async function restore(): Promise<void> {
++  const [ownership, userId] = await Promise.all([claimOwnership(), currentIdentity()]);
++  const entries = pendingEntries;
++  const identityMismatch =
++    storedUserId !== null && userId !== null && storedUserId !== userId ? entries.length : 0;
++  const otherTab = ownership === "other-tab" && identityMismatch === 0 ? entries.length : 0;
++  const usable = identityMismatch > 0 || otherTab > 0 ? [] : entries;
++
++  const now = Date.now();
++  const current = useChatStore.getState().queuedMessages;
++  const currentIds = new Set(current.map((m) => m.stableId).filter((id) => id !== undefined));
++  const restored: QueuedMessage[] = [];
++  let auto = 0;
++  let withFiles = 0;
++  let tooOld = 0;
++  let wasRetry = 0;
++  for (const entry of usable) {
++    const stableId = entry.stableId ?? randomUUID().replace(/-/g, "");
++    if (currentIds.has(stableId)) continue;
++    currentIds.add(stableId);
++    firstSeen.set(stableId, entry.firstSeenAt);
++    const hasFiles = (entry.fileNames?.length ?? 0) > 0;
++    const old = now - entry.firstSeenAt >= AE_QUEUE_AUTO_SEND_MAX_AGE_MS;
++    const sendsItself = ownership === "owned" && !hasFiles && !old && entry.requiresRetry !== true;
++    if (sendsItself) auto += 1;
++    else if (entry.requiresRetry === true) wasRetry += 1;
++    else if (hasFiles) withFiles += 1;
++    else if (old) tooOld += 1;
++    restored.push({
++      queueId: `${AE_QUEUE_RESTORED_ID_PREFIX}${stableId}`,
++      text: entry.text,
++      conversationId: entry.conversationId,
++      stableId,
++      ...(entry.agentId !== undefined ? { agentId: entry.agentId } : {}),
++      ...(entry.command !== undefined ? { command: entry.command } : {}),
++      ...(entry.replyDraft !== undefined ? { replyDraft: entry.replyDraft } : {}),
++      ...(sendsItself ? {} : { requiresRetry: true }),
++    });
++  }
++
++  // The window is over: from here the store alone is what gets written.
++  pendingEntries = [];
++  restoring = false;
++  if (restored.length > 0) {
++    useChatStore.setState((s) => ({
++      queuedMessages: [
++        ...restored,
++        ...s.queuedMessages.filter((m) => !restored.some((r) => r.stableId === m.stableId)),
++      ],
++    }));
++  }
++  writeQueue(useChatStore.getState().queuedMessages);
++
++  const heldBack = restored.length - auto;
++  if (entries.length > 0) {
++    console.info(
++      `${LOG_PREFIX} restore: stored=${entries.length} restored=${restored.length} auto=${auto} ` +
++        `heldBack=${heldBack} otherTab=${otherTab} identityMismatch=${identityMismatch} ownership=${ownership}`,
++    );
++  }
++
++  if (otherTab > 0) {
++    showToast(
++      `${plural(otherTab, "queued note stays", "queued notes stay")} in the other tab this one was copied from.`,
++    );
++    return;
++  }
++  if (heldBack === 0) return;
++  const reasons: string[] = [];
++  if (ownership === "no-locks") {
++    reasons.push("this browser cannot tell whether another tab already holds them");
++  } else {
++    if (withFiles > 0)
++      reasons.push(
++        `${plural(withFiles, "had", "had")} attachments that a reload cannot keep (attach them again)`,
++      );
++    if (tooOld > 0) reasons.push(`${plural(tooOld, "was", "were")} queued over an hour ago`);
++    if (wasRetry > 0) reasons.push(`${plural(wasRetry, "was", "were")} already waiting for Retry`);
++  }
++  showToast(
++    `${plural(restored.length, "queued note came", "queued notes came")} back after the reload. ` +
++      `${plural(heldBack, "waits", "wait")} for Retry: ${reasons.join("; ")}.`,
++  );
++}
++
++/**
++ * Mirror the message queue into sessionStorage and, the first time per page, put back what a
++ * reload left there. Returns the cleanup for the write subscription; the restore and the tab lock
++ * live for the page.
++ */
++export function installAeQueuePersist(): () => void {
++  if (!started) {
++    started = true;
++    // Read before the write subscription exists, so the first write cannot wipe what is stored.
++    const doc = readDoc();
++    pendingEntries = doc?.entries ?? [];
++    storedUserId = doc?.userId ?? null;
++    persistedKeys = new Set(pendingEntries.map(noteKey));
++    restoring = true;
++    restorePromise = restore().catch((error: unknown) => {
++      // Never lose the stored notes to a failed restore: they stay in storage for the next load.
++      restoring = false;
++      console.warn(`${LOG_PREFIX} restore failed`, error);
++    });
++  }
++  unsubscribe?.();
++  const stop = useChatStore.subscribe((state, prev) => {
++    if (state.queuedMessages !== prev.queuedMessages) writeQueue(state.queuedMessages);
++  });
++  unsubscribe = stop;
++  return () => {
++    stop();
++    if (unsubscribe === stop) unsubscribe = null;
++  };
++}
++
++/** Test helpers: wait for the restore, reset module state, shorten the lock wait. */
++export const aeQueuePersistTestHooks = {
++  restored: (): Promise<void> => restorePromise,
++  isRestoring: (): boolean => restoring,
++  reset(opts: { lockWaitMs?: number } = {}): void {
++    unsubscribe?.();
++    unsubscribe = null;
++    for (const release of heldLocks.splice(0)) release();
++    started = false;
++    restoring = false;
++    pendingEntries = [];
++    storedUserId = null;
++    restorePromise = Promise.resolve();
++    lockWaitMs = opts.lockWaitMs ?? AE_QUEUE_LOCK_WAIT_MS;
++    warnedCap = false;
++    firstSeen.clear();
++    persistedKeys = new Set();
++  },
++};

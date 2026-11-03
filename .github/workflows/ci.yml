@@ -17,10 +17,11 @@
 #                   image.yml to what a runner can check (Phase 6)
 #   web             upstream's web workspace, with the patch series applied,
 #                   passes its own lint and type-check (added 2026-09-23 with
-#                   Phase 2, the first patch); the Parking Lot page's
-#                   committed bundle matches a fresh build (Phase 3)
-#   web-test        the vitest suites the patches add or touch are green, in
-#                   four parallel shards (split out of web 2026-10-20)
+#                   Phase 2, the first patch); the vitest suites the patches
+#                   add or touch are green (one job again since 2026-11-01,
+#                   after four shards cost more billed minutes than they
+#                   saved); the Parking Lot page's committed bundle matches a
+#                   fresh build (Phase 3)
 #   image           the two-stage image builds; `omni --version` inside it
 #                   prints the pinned version; the extension catalog lists the
 #                   Parking Lot page with its bundle resolved; the AE packages
@@ -43,6 +44,12 @@
 #                   A pull request is scanned by leak-pr.yml instead, so the
 #                   scan re-runs when its approval label changes. docs/LEAK-SCAN.md
 #
+# Box routing (2026-11-01, off until the repository variable CI_BOX_RUNNER is "on"):
+# the five jobs above except image and leaks can run on the owner's box, plus one
+# job that exists only while routing is on ("Box watchdog"); the docker-marked
+# tests run as extra steps of the image job. ci-box-fallback.yml reruns a lost run
+# on GitHub. All of it is in deploy/ci-runner/README.md.
+#
 # Why an EMPTY patch series gets all of this (2026-09-11): upstream ships a
 # minor release weekly, so the sync machinery has to be proven before the first
 # patch exists. A sync that breaks it is then caught by the sync PR itself, not
@@ -56,14 +63,20 @@ on:
     types: [opened, synchronize, reopened]
   push:
     branches: [main]
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: "Where the test jobs run: auto follows the CI_BOX_RUNNER variable, box forces the box runners, hosted forces GitHub-hosted runners"
+        type: choice
+        options: [auto, box, hosted]
+        default: auto
 
 permissions:
   contents: read
 
 # One run per PR at a time; a new push supersedes the stale run.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.sha }}
+  group: ci-${{ github.event.pull_request.number || (github.event_name == 'workflow_dispatch' && github.run_id) || github.sha }}
   cancel-in-progress: true
 
 env:
@@ -74,7 +87,7 @@ env:
 jobs:
   patches:
     name: Patch series matches and applies
-    runs-on: ubuntu-latest
+    runs-on: &box_runs_on ${{ github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) && fromJSON('["self-hosted","ae-box"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
       - name: Checkout with the upstream submodule
@@ -128,7 +141,7 @@ jobs:
 
   upstream-smoke:
     name: Upstream policy and extension suites
-    runs-on: ubuntu-latest
+    runs-on: *box_runs_on
     timeout-minutes: 30
     steps:
       - name: Checkout with the upstream submodule
@@ -142,7 +155,7 @@ jobs:
           python-version-file: upstream/.python-version
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: upstream/uv.lock
@@ -157,7 +170,7 @@ jobs:
 
   python:
     name: AE package lint and tests
-    runs-on: ubuntu-latest
+    runs-on: *box_runs_on
     timeout-minutes: 30
     steps:
       - name: Checkout with the upstream submodule
@@ -171,7 +184,7 @@ jobs:
           python-version-file: upstream/.python-version
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           enable-cache: true
           cache-dependency-glob: upstream/uv.lock
@@ -185,16 +198,25 @@ jobs:
       # actionlint over the workflows, and skips each with a warning when the
       # tool is absent; here both must be present so the checks run. shellcheck
       # ships in the ubuntu-latest image (installed from apt only if not); the
-      # actionlint binary comes from its PyPI wrapper, version-pinned.
-      - name: Install shellcheck and actionlint
+      # actionlint binary comes from its PyPI wrapper, version-pinned. The webp
+      # package gives test_leak_scan.py the real anim_dump, so its GIF and WebP
+      # frame tests run against the binary instead of skipping.
+      - name: Install shellcheck, webp and actionlint
         run: |
           set -euo pipefail
-          if ! command -v shellcheck >/dev/null 2>&1; then
+          if command -v shellcheck >/dev/null && command -v cwebp >/dev/null; then
+            echo "shellcheck and webp already installed"
+          else
+            if ! command -v shellcheck >/dev/null 2>&1; then
+              sudo apt-get update -qq
+              sudo apt-get install -y -qq --no-install-recommends shellcheck
+            fi
             sudo apt-get update -qq
-            sudo apt-get install -y -qq --no-install-recommends shellcheck
+            sudo apt-get install -y -qq --no-install-recommends webp
           fi
           shellcheck --version | head -2
-          uv tool install actionlint-py==1.7.12.25
+          command -v anim_dump
+          uv tool install --force actionlint-py==1.7.12.25
           bin_dir="$(uv tool dir --bin)"
           echo "$bin_dir" >> "$GITHUB_PATH"
           "$bin_dir/actionlint" --version
@@ -202,7 +224,13 @@ jobs:
       - name: Lint the AE packages
         run: just lint
 
+      # On a box runner the docker-backed deploy tests are deselected (the runner
+      # user has no docker access, on purpose); steps of the image job run them on
+      # a GitHub-hosted runner instead. DEPLOY_MARKER is empty on
+      # GitHub-hosted runners, so the same step runs everything there.
       - name: Run the AE package suites
+        env:
+          DEPLOY_MARKER: ${{ github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) && 'not docker' || '' }}
         run: just test
 
       - name: The Parking Lot extension is installed and its bundle resolves
@@ -210,7 +238,7 @@ jobs:
 
   web:
     name: Web workspace lint, type-check, extension bundle
-    runs-on: ubuntu-latest
+    runs-on: *box_runs_on
     timeout-minutes: 30
     steps:
       - name: Checkout with the upstream submodule
@@ -218,69 +246,46 @@ jobs:
         with:
           submodules: true
 
-      - name: Set up Node (upstream's Dockerfile and CI pin node 22)
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "22"
-
       # The version is upstream's `packageManager` field in upstream/package.json,
       # read by pnpm's own action, pinned by commit like every other action here,
       # in place of `npm install -g` (2026-10-22: Scorecard Pinned-Dependencies on
-      # the public repo counts a global npm install as unpinned).
+      # the public repo counts a global npm install as unpinned). It runs before
+      # setup-node because `cache: pnpm` needs pnpm on the PATH.
       - name: Install pnpm
         uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           package_json_file: upstream/package.json
+
+      - name: Set up Node (upstream's Dockerfile and CI pin node 22)
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          cache: pnpm
+          cache-dependency-path: upstream/pnpm-lock.yaml
 
       - name: Install just
         uses: ./.github/actions/install-just
       - name: Lint and type-check
         run: just web-lint
 
+      # The web-check vitest list, in this one job. It was four parallel shards
+      # from 2026-10-20 to save wall-clock time, but each shard repeated the
+      # checkout, node and pnpm install, which cost more billed minutes than the
+      # time it saved. `just web-test` defaults to the whole list (shard 1/1).
+      - name: The P1 and P2 vitest suites
+        if: ${{ !cancelled() }}
+        run: just web-test
+
       # The bundle in git must be what the source builds; a rebuild that
       # changes it means someone edited web/src without running `just ext-build`.
       - name: The Parking Lot page's committed bundle matches a fresh build
+        if: ${{ !cancelled() }}
         run: just ext-build
-
-  # The web-check vitest list in four parallel shards (vitest --shard). One run
-  # of the whole list took about 5 of the web job's 10 minutes; split 2026-10-20.
-  web-test:
-    name: Web P1 and P2 suites (shard ${{ matrix.shard }} of 4)
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [1, 2, 3, 4]
-    steps:
-      - name: Checkout with the upstream submodule
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-
-      - name: Set up Node (upstream's Dockerfile and CI pin node 22)
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: "22"
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
-        with:
-          package_json_file: upstream/package.json
-
-      - name: Install just
-        uses: ./.github/actions/install-just
-      - name: Run this shard of the P1 and P2 suites
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          set -euo pipefail
-          just web-test "$SHARD/4"
 
   image:
     name: Two-stage image runs the pinned version
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - name: Checkout with the upstream submodule
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -344,10 +349,37 @@ jobs:
           ext_pkg="$(docker run --rm omnigent-ae:ci python -c "import ae_omni_extension; print(ae_omni_extension.__version__)")"
           echo "ae_omni_extension: $ext_pkg"
 
+      # Box routing only (see deploy/ci-runner/README.md): the python job deselects the
+      # docker-marked tests on a box runner, so they run here, in a job the merge gate
+      # already requires. With routing off these steps are skipped.
+      - name: Set up Python for the docker-backed deploy tests
+        if: ${{ !cancelled() && github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version-file: upstream/.python-version
+
+      - name: Set up uv for the docker-backed deploy tests
+        if: ${{ !cancelled() && github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) }}
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          enable-cache: true
+          cache-dependency-glob: upstream/uv.lock
+
+      - name: Install just for the docker-backed deploy tests
+        if: ${{ !cancelled() && github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) }}
+        uses: ./.github/actions/install-just
+      - name: Install upstream's locked test environment for the docker-backed deploy tests
+        if: ${{ !cancelled() && github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) }}
+        run: just setup
+
+      - name: Docker-backed deploy tests (only the tests marked docker)
+        if: ${{ !cancelled() && github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) }}
+        run: cd upstream && uv run --no-sync pytest ../tests/deploy -q -p no:cacheprovider -m docker
+
   rules:
     name: Branch-discipline block matches its source
     if: github.repository == 'analyticendeavors/omnigent-ae'
-    runs-on: ubuntu-latest
+    runs-on: *box_runs_on
     timeout-minutes: 5
     steps:
       - name: Checkout
@@ -415,3 +447,116 @@ jobs:
               --base "$BEFORE_SHA" --head "$GITHUB_SHA"
           fi
           python3 scripts/leak-scan.py "${args[@]}" tree --ref HEAD
+
+  # ---- box routing (off while the repository variable CI_BOX_RUNNER is not "on") ----
+  # deploy/ci-runner/README.md holds the install, the kill switch and the drills.
+  # This job carries the routing expression as its `if:`, so with routing off it is
+  # skipped and bills nothing.
+  #
+  # A job queued for a runner that is not there waits 24 hours. This one watches the
+  # five box-eligible jobs of THIS attempt. Every 30 s: if they are still queued and no
+  # job anywhere in the repository is running on an ae-box-* runner (the box looks off),
+  # it cancels the run once they have been queued 2 minutes. If the box is alive but busy
+  # it keeps waiting, up to 30 minutes. ci-box-fallback.yml then reruns on GitHub.
+  # An API error is retried and, if it persists, counts as "unknown" and is polled again;
+  # unknown for 2 minutes cancels too. It never fails the job.
+  box-watchdog:
+    name: Box watchdog
+    if: ${{ github.run_attempt == '1' && contains(format(',{0},', vars.CI_BOX_AUTHORS), format(',{0},', github.event.pull_request.user.login || github.actor)) && (inputs.runner == 'box' || (vars.CI_BOX_RUNNER == 'on' && inputs.runner != 'hosted' && !startsWith(github.head_ref, 'dependabot/'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    permissions:
+      actions: write
+    steps:
+      - name: Wait for the box jobs to start
+        id: wait
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -uo pipefail
+          # Display names of the jobs that run on the box; keep in step with ci.yml.
+          names='["Patch series matches and applies","Upstream policy and extension suites","AE package lint and tests","Web workspace lint, type-check, extension bundle","Branch-discipline block matches its source"]'
+          api() { # gh api with 3 tries and backoff; prints the body, returns 1 if all fail
+            local n out
+            for n in 1 2 3; do
+              if out="$(gh api "$@" 2>/dev/null)"; then printf '%s' "$out"; return 0; fi
+              sleep $((n * 3))
+            done
+            return 1
+          }
+          start=$SECONDS
+          last_ok=$SECONDS
+          queued_since=""
+          alive=0
+          next_check=0
+          while :; do
+            if jobs_json="$(api --paginate "repos/${REPO}/actions/runs/${RUN_ID}/attempts/${ATTEMPT}/jobs?per_page=100" --jq '.jobs[]' | jq -s .)" && [ -n "$jobs_json" ]; then
+              last_ok=$SECONDS
+              waiting="$(jq -r --argjson names "$names" '[.[] | select(.name as $n | $names | index($n)) | select(.status != "in_progress" and .status != "completed") | .name] | join("; ")' <<<"$jobs_json")"
+              seen="$(jq -r --argjson names "$names" '[.[] | select(.name as $n | $names | index($n))] | length' <<<"$jobs_json")"
+              if [ "$seen" -ge 5 ] && [ -z "$waiting" ]; then
+                echo "all box jobs started"
+                echo "stuck=false" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              [ -n "$queued_since" ] || queued_since=$SECONDS
+              # Box alive? A box job of this run already running on an ae-box-* runner says yes.
+              if jq -e '[.[] | select(.runner_name | type == "string" and startswith("ae-box-"))] | length > 0' >/dev/null <<<"$jobs_json"; then
+                alive=1
+              elif [ "$SECONDS" -ge "$next_check" ] && [ $((SECONDS - queued_since)) -ge 60 ]; then
+                # One list of in-progress runs per check (at most 5 runs' jobs read), every 2.5 minutes.
+                next_check=$((SECONDS + 150))
+                alive=0
+                if runs="$(api "repos/${REPO}/actions/runs?status=in_progress&per_page=20" --jq '[.workflow_runs[] | select(.name == "CI" and .id != '"${RUN_ID}"') | .id] | .[0:5] | .[]')"; then
+                  for rid in $runs; do
+                    if other="$(api "repos/${REPO}/actions/runs/${rid}/jobs?per_page=100" --jq '[.jobs[] | select(.status == "in_progress") | .runner_name] | map(select(. != null and startswith("ae-box-"))) | length')" && [ "${other:-0}" -gt 0 ]; then
+                      alive=1
+                      break
+                    fi
+                  done
+                fi
+              fi
+              waited=$((SECONDS - queued_since))
+              if [ "$alive" -eq 0 ] && [ "$waited" -ge 120 ]; then
+                echo "::warning::box jobs queued for ${waited}s and no ae-box-* runner is running a job: the box looks off (${waiting})"
+                echo "stuck=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if [ "$waited" -ge 1800 ]; then
+                echo "::warning::box jobs still queued after 30 minutes although the box is busy (${waiting})"
+                echo "stuck=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            else
+              echo "::notice::job status unknown (API error), polling again"
+              if [ $((SECONDS - last_ok)) -ge 120 ]; then
+                echo "::warning::job status unknown for 2 minutes; cancelling so the fallback can rerun on GitHub"
+                echo "stuck=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            if [ $((SECONDS - start)) -ge 2100 ]; then
+              echo "stuck=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 30
+          done
+
+      - name: "Cancel: box jobs never started"
+        if: ${{ steps.wait.outputs.stuck == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          echo "The box runners did not pick up the test jobs in time. Cancelled this run; the fallback workflow reruns it once on GitHub-hosted runners." | tee -a "$GITHUB_STEP_SUMMARY"
+          for n in 1 2 3; do
+            if gh api -X POST "repos/${REPO}/actions/runs/${RUN_ID}/cancel"; then exit 0; fi
+            sleep $((n * 3))
+          done
+          echo "::error::Could not cancel this run after 3 tries. Cancel it by hand, or use Re-run all jobs: attempt 2 always runs on GitHub-hosted runners."
+          exit 1

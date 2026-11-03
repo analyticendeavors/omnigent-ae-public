@@ -1,0 +1,144 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:47:53 -0700
+Subject: [PATCH 270/289] [ae-patch] Judge the prepare turn by blocks it added,
+ not by array position
+
+The failure check kept an index into the transcript, which shifts when older
+history loads and can shrink on rehydrate. It now ignores any block, or any
+response, that was already there when the prepare message went out, so history
+can neither cancel a good compact nor hide a failed prepare turn.
+---
+ web/src/lib/aeCompactPlan.test.ts | 45 +++++++++++++++++++++++++------
+ web/src/lib/aeCompactPlan.ts      | 26 +++++++++++-------
+ 2 files changed, 53 insertions(+), 18 deletions(-)
+
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+index 04fc32a08d7bc44067d2ea49256cdf971df28a3a..3559c69eb657a29243394a68d8e852d2d2918b5d 100644
+--- a/web/src/lib/aeCompactPlan.test.ts
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -234,9 +234,18 @@ describe("queued compact", () => {
+     expect(done).toHaveBeenCalledTimes(1);
+   });
+   it.each([
+-    ["the turn ended failed", [{ type: "response_end", status: "failed" }]],
+-    ["the turn was cancelled", [{ type: "response_end", status: "cancelled" }]],
+-    ["the turn raised an error", [{ type: "error", level: "error", message: "boom" }]],
++    [
++      "the turn ended failed",
++      [{ type: "response_end", status: "failed", ctx: { responseId: "r2" } }],
++    ],
++    [
++      "the turn was cancelled",
++      [{ type: "response_end", status: "cancelled", ctx: { responseId: "r2" } }],
++    ],
++    [
++      "the turn raised an error",
++      [{ type: "error", level: "error", message: "boom", ctx: { responseId: "" } }],
++    ],
+   ])("compacts nothing when %s", async (_name, blocks) => {
+     startAeCompactPlan(ID);
+     await tick(2000);
+@@ -246,19 +255,39 @@ describe("queued compact", () => {
+     expect(toasts.join("\n")).toContain("did not finish saving its notes cleanly");
+   });
+ 
+-  it("still compacts after a clean finish, and ignores blocks from before the send", async () => {
+-    setChat({ blocks: [{ type: "response_end", status: "failed" }] });
++  it("still compacts after a clean finish, and ignores history that was there before the send", async () => {
++    const old = { type: "response_end", status: "failed", ctx: { responseId: "r1" } };
++    setChat({ blocks: [old] });
+     startAeCompactPlan(ID);
+     await tick(2000);
+     setChat({
+       sessionStatus: "idle",
+       blocks: [
+-        { type: "response_end", status: "failed" },
+-        { type: "response_end", status: "completed" },
+-        { type: "error", level: "info", message: "note" },
++        // Rehydrated copy of the old block: a new object, the same response.
++        { ...old },
++        { type: "response_end", status: "completed", ctx: { responseId: "r2" } },
++        { type: "error", level: "info", message: "note", ctx: { responseId: "r2" } },
+       ],
+     });
+     await tick(2000);
+     expect(compact).toHaveBeenCalledTimes(1);
+   });
++
++  it("still sees a failure when the transcript is replaced by a shorter one mid-turn", async () => {
++    setChat({
++      blocks: [
++        { type: "user_message", ctx: { responseId: "r0" } },
++        { type: "user_message", ctx: { responseId: "r0" } },
++        { type: "user_message", ctx: { responseId: "r1" } },
++      ],
++    });
++    startAeCompactPlan(ID);
++    await tick(2000);
++    setChat({
++      sessionStatus: "idle",
++      blocks: [{ type: "response_end", status: "failed", ctx: { responseId: "r2" } }],
++    });
++    await tick(2000);
++    expect(compact).not.toHaveBeenCalled();
++  });
+ });
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+index 02e55636e96b3ca10665e9e6408ef85d36c9e87a..74edbc224151a2a06d008af08300018ae43931e6 100644
+--- a/web/src/lib/aeCompactPlan.ts
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -29,7 +29,9 @@ export const AE_COMPACT_PREP_LIMIT_MS = 15 * 60_000;
+ interface Plan {
+   phase: AeCompactPhase;
+   sawTurn: boolean;
+-  blocksAtSend: number;
++  /** What the transcript held when the prepare message went out: history is not this turn's. */
++  seenBlocks: WeakSet<object>;
++  seenResponses: Set<string>;
+   stableTimer: ReturnType<typeof setTimeout> | null;
+   limitTimer: ReturnType<typeof setTimeout> | null;
+   startTimer: ReturnType<typeof setTimeout> | null;
+@@ -98,7 +100,10 @@ async function advance(conversationId: string) {
+     }
+     plan.phase = "preparing";
+     plan.sawTurn = false;
+-    plan.blocksAtSend = store.blocks.length;
++    for (const b of store.blocks) {
++      plan.seenBlocks.add(b);
++      if (b.ctx.responseId) plan.seenResponses.add(b.ctx.responseId);
++    }
+     plan.limitTimer = setTimeout(
+       () => fail(conversationId, "Compact cancelled: the chat took too long to save its notes."),
+       AE_COMPACT_PREP_LIMIT_MS,
+@@ -137,13 +142,13 @@ async function advance(conversationId: string) {
+   // Idle, but the prepare turn has not been seen running: the start timer decides.
+   if (!plan.sawTurn) return;
+   // A turn that failed, was cancelled, or raised an error did not finish saving: compact nothing.
+-  const failed = store.blocks
+-    .slice(plan.blocksAtSend)
+-    .some(
+-      (b) =>
+-        (b.type === "response_end" && b.status !== "completed") ||
+-        (b.type === "error" && b.level !== "info"),
+-    );
++  const failed = store.blocks.some(
++    (b) =>
++      !plan.seenBlocks.has(b) &&
++      !(b.ctx.responseId && plan.seenResponses.has(b.ctx.responseId)) &&
++      ((b.type === "response_end" && b.status !== "completed") ||
++        (b.type === "error" && b.level !== "info")),
++  );
+   if (failed) {
+     fail(
+       conversationId,
+@@ -205,7 +210,8 @@ export function startAeCompactPlan(conversationId: string, onCompacted?: () => v
+   const plan: Plan = {
+     phase: "queued",
+     sawTurn: false,
+-    blocksAtSend: 0,
++    seenBlocks: new WeakSet(),
++    seenResponses: new Set(),
+     stableTimer: null,
+     limitTimer: null,
+     startTimer: null,

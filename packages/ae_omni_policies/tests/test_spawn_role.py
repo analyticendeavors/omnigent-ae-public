@@ -601,3 +601,56 @@ def test_the_tool_schemas_offer_ultra_and_the_ladder_ranks_it_last() -> None:
         assert "ultra" in tool.inputSchema["properties"]["effort"]["enum"], tool.name
     assert escalation.EFFORTS[-1] == "ultra"
     assert escalation.classify("gpt-6-sol", "max", "gpt-6-sol", "ultra") == "raise"
+
+
+def test_a_persona_slot_takes_the_personas_model_and_effort_when_it_leaves_them_out() -> None:
+    reviewers = [
+        _fixed("claude-sonnet-5-5", "medium"),
+        {"mode": "fixed", "persona": "security"},
+        {"mode": "fixed", "persona": "security", "model": "claude-haiku-5-5"},
+        {"mode": "fixed", "persona": "gone-away", "model": "claude-haiku-5-5"},
+        {"mode": "agent", "agent": "x", "name": "X", "persona": "security"},
+    ]
+    effective = _preset(reviewer={"mode": "multi", "reviewers": reviewers})
+    out = spawn_role._fill_personas(effective, "someone")
+    got = out["preset"]["roles"]["reviewer"]["reviewers"]
+    assert got[0] == reviewers[0]
+    assert (got[1]["model"], got[1]["effort"]) == ("claude-opus-5-5", "high")
+    assert (got[2]["model"], got[2]["effort"]) == ("claude-haiku-5-5", "high")
+    assert got[3] == reviewers[3]
+    # Another agent keeps its own model: a persona's model is a Claude one.
+    assert got[4] == reviewers[4]
+    # The input is not changed, and a preset without personas comes back as it is.
+    assert "model" not in reviewers[1]
+    plain = _preset()
+    assert spawn_role._fill_personas(plain, "someone") is plain
+
+
+def test_a_persona_without_an_effort_spawns_at_medium_and_one_without_a_model_is_auto(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    from ae_omni_policies import personas
+
+    mine = [
+        personas.Persona(
+            id="docs", name="Docs", purpose="Docs", model="claude-haiku-5-5", instructions="x"
+        ),
+        personas.Persona(id="bare", name="Bare", purpose="Bare", instructions="x"),
+    ]
+    monkeypatch.setattr(
+        role_prefs, "store", lambda: SimpleNamespace(get=lambda _u: SimpleNamespace(personas=mine))
+    )
+    reviewers = [
+        _fixed("claude-sonnet-5-5", "medium"),
+        {"mode": "fixed", "persona": "docs"},
+        {"mode": "fixed", "persona": "bare"},
+    ]
+    out = spawn_role._fill_personas(
+        _preset(reviewer={"mode": "multi", "reviewers": reviewers}), "u"
+    )
+    got = out["preset"]["roles"]["reviewer"]["reviewers"]
+    # The lead notice also reads a missing effort as medium, and a model-less slot as a plain pick.
+    assert (got[1]["model"], got[1]["effort"]) == ("claude-haiku-5-5", "medium")
+    assert got[2] == {"mode": "auto", "persona": "bare"}

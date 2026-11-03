@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:07:22 -0800
+Subject: [PATCH 279/289] [ae-patch] Let a queued Compact run while background
+ shells are still running
+
+The queued Compact (the rail's Context button and the action dock's Compact
+card) only advanced when the session was idle with no background shell. A
+claude-native chat ends a turn as `waiting` while a background shell still
+runs, and the page's shell tally stays sticky until the next Stop hook, so a
+lead chat with a CI wait or watcher running kept its Compact queued forever.
+
+safeNow() now treats `waiting` like `idle` and no longer looks at background
+shells: they outlive turns, survive /compact, and the TUI accepts /compact
+while they run. A streaming turn, any other session status and a queued
+message for the chat still hold the plan back. The tests that pinned the old
+rule now assert those are safe points, and a regression test drives the real
+store reducer through a claude-native turn end with a shell still running
+(2026-11-01).
+---
+ web/src/lib/aeCompactPlan.test.ts | 49 +++++++++++++++++++++++++++++--
+ web/src/lib/aeCompactPlan.ts      | 24 ++++++++++-----
+ 2 files changed, 63 insertions(+), 10 deletions(-)
+
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+index 4d04a813e05c39e384c835a0bcfbf30b495d2d16..33d9157ed5886126be37a8d517768ce03d1127f7 100644
+--- a/web/src/lib/aeCompactPlan.test.ts
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -1,5 +1,5 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { useChatStore } from "@/store/chatStore";
++import { handleSessionEvent, useChatStore } from "@/store/chatStore";
+ import {
+   AE_COMPACT_PREP_TEXT,
+   AE_COMPACT_PREP_LIMIT_MS,
+@@ -88,14 +88,27 @@ describe("queued compact", () => {
+     expect(send).toHaveBeenCalledTimes(1);
+   });
+ 
++  // Background shells outlive turns and survive /compact, and `waiting` is the turn end a
++  // claude-native chat publishes while one still runs: none of them holds a compact back.
+   it.each([
+     ["a background shell is running", { backgroundTasks: [{ status: "running" }] }],
+     ["an older runner reports only a shell count", { backgroundTaskCount: 1 }],
+-    ["the chat waits on the user", { sessionStatus: "waiting" }],
++    ["the turn ended with a shell still running", { sessionStatus: "waiting" }],
++  ])("is a safe point while %s", async (_name, patch) => {
++    setChat(patch);
++    startAeCompactPlan(ID);
++    await tick(1999);
++    expect(send).not.toHaveBeenCalled();
++    await tick(1);
++    expect(send).toHaveBeenCalledTimes(1);
++  });
++
++  it.each([
+     [
+       "a message is queued ahead",
+       { queuedMessages: [{ queueId: "q1", text: "next", conversationId: ID }] },
+     ],
++    ["the session is launching", { sessionStatus: "launching" }],
+   ])("is not a safe point while %s", async (_name, patch) => {
+     setChat(patch);
+     startAeCompactPlan(ID);
+@@ -324,4 +337,36 @@ describe("queued compact", () => {
+     await tick(2000);
+     expect(compact).not.toHaveBeenCalled();
+   });
++
++  it("runs after a claude-native turn ends with a background shell still running", async () => {
++    // Driven through the real store reducer with the event shapes a claude-native chat sends.
++    const status = (value: string, extra: Record<string, unknown> = {}) =>
++      handleSessionEvent({
++        type: "session_status",
++        conversationId: ID,
++        status: value,
++        ...extra,
++      } as never);
++    send.mockImplementation(() => Promise.resolve());
++    useChatStore.setState({ activeResponse: null } as never);
++    status("running", { responseId: "r1" });
++    startAeCompactPlan(ID);
++    await tick(10_000);
++    expect(send).not.toHaveBeenCalled();
++    // Stop hook: the turn ended, a shell (a CI wait) still runs. Then the bare PTY idle edge,
++    // which leaves the shell tally sticky.
++    status("waiting", { responseId: "r1", backgroundTaskCount: 1 });
++    status("idle");
++    expect(useChatStore.getState().backgroundTaskCount).toBe(1);
++    await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
++    expect(send.mock.calls[0]![0]).toBe(AE_COMPACT_PREP_TEXT);
++    // The prepare turn runs and ends with the shell still running.
++    status("running", { responseId: "r2" });
++    await tick(5000);
++    expect(compact).not.toHaveBeenCalled();
++    status("waiting", { responseId: "r2", backgroundTaskCount: 1 });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++  });
+ });
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+index fb581322aca76248051294185c3a068aa30c8f2f..f2d61a41ae0563840226db88adf7e0dd25d0756f 100644
+--- a/web/src/lib/aeCompactPlan.ts
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -1,9 +1,13 @@
+ // Queued compact (omnigent-ae). Clicking Compact never compacts on the spot: it queues a
+-// plan for the open chat. At a safe point (the chat idle and quiet) the chat gets one
+-// normal turn that asks it to save what is worth keeping, and only when that turn ends
+-// does the compact event go out. The plan lives in the page: a reload forgets it, and
++// plan for the open chat. At a safe point (no turn running and nothing queued) the chat
++// gets one normal turn that asks it to save what is worth keeping, and only when that turn
++// ends does the compact event go out. The plan lives in the page: a reload forgets it, and
+ // nothing compacts by accident.
+ //
++// Background shells do not hold a plan back (2026-11-01). A shell outlives the turn that
++// started it and survives /compact, and the page's shell tally stays sticky until the next
++// turn ends, so a lead chat with a CI wait running kept its Compact queued forever.
++//
+ // The driver is module level, not a component effect, so folding the rail or losing the
+ // dock card never drops a queued compact.
+ 
+@@ -48,12 +52,16 @@ function emit() {
+ 
+ type StoreState = ReturnType<typeof useChatStore.getState>;
+ 
+-/** Idle and quiet: no turn, nothing waiting on the user, no background shell, nothing queued. */
++/**
++ * A turn end: no turn streaming or running, nothing queued for this chat. `waiting` counts as
++ * idle, because it is the turn-end status a claude-native chat publishes while a background
++ * shell still runs (the store's message queue treats it the same way). Background shells are
++ * not looked at: they outlive turns, survive /compact, and their tally stays sticky until the
++ * next turn ends.
++ */
+ function safeNow(s: StoreState, conversationId: string): boolean {
+   if (s.status === "streaming") return false;
+-  if (s.sessionStatus !== "idle") return false;
+-  if (s.backgroundTaskCount > 0 || s.backgroundTasks.some((t) => t.status === "running"))
+-    return false;
++  if (s.sessionStatus !== "idle" && s.sessionStatus !== "waiting") return false;
+   return !s.queuedMessages.some((m) => m.conversationId === conversationId);
+ }
+ 
+@@ -200,7 +208,7 @@ function schedule(conversationId: string, plan: Plan) {
+   }, AE_COMPACT_STABLE_MS);
+ }
+ 
+-/** Runs on every store change: re-arms the quiet timer while idle, cancels it while busy. */
++/** Runs on every store change: re-arms the quiet timer at a turn end, cancels it while busy. */
+ function onStore() {
+   const store = useChatStore.getState();
+   for (const [conversationId, plan] of [...plans]) {

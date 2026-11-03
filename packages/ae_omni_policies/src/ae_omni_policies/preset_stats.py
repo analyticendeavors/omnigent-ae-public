@@ -25,14 +25,20 @@ each carries ``metric``: cost, tokens, time or hang, and the card hides the metr
 not pick, so up to six come back). The card prints the text it is given, so the rules live here
 and nowhere else:
 
+Rules 1 to 3 leave out runs whose ``wall_s`` is under :data:`MIN_COMPARE_WALL_S` (3 minutes) or
+null, on both sides: smoke tests of a preset made it look 22 times costlier than the rest
+(2026-10-30). The KPIs and the per-preset table still count every run. Rule 4 counts hangs only
+from lines with ``hang_rule`` of at least :data:`MIN_HANG_RULE` (2); older lines used a rule
+that flagged children that had already delivered their report.
+
 1. Cost: a preset with at least :data:`MIN_PRESET_RUNS` runs whose median cost is at least
    :data:`GAP` (25%) above or below the median of every other preset's runs, when those other
    presets have at least :data:`MIN_PRESET_RUNS` runs between them. The text adds whether it
    also finished faster (:data:`TIME_NOISE`, 10%, is "no faster").
 2. Time: the same rule on median wall time, when rule 1 did not fire for that preset.
 3. Tokens: rule 1 on tokens per run (same thresholds; runs without tokens do not count).
-4. Hangs: an agent role (Codex counted on its own) hung in at least :data:`MIN_HANG_RUNS`
-   runs.
+4. Hangs: an agent role (Codex counted on its own) stopped mid tool call with no result (see
+   :mod:`ae_omni_policies.preset_runs`) in at least :data:`MIN_HANG_RUNS` runs.
 
 The gap that ranks a takeaway is the larger/smaller ratio for rules 1 and 2 and the hung run
 count over :data:`MIN_HANG_RUNS` plus 1 for rule 3.
@@ -69,6 +75,12 @@ MIN_PRESET_RUNS = 5
 GAP = 0.25
 #: Inside this fraction a time difference reads as "no faster" / "about the same".
 TIME_NOISE = 0.10
+#: Runs shorter than this (180 s) are left out of the cost, time and token comparisons: they are
+#: smoke tests, and comparing a preset's real runs with them gave a 22x token gap (2026-10-30).
+MIN_COMPARE_WALL_S = 180
+#: The first ``hang_rule`` of a run-log line whose hang marks mean a stop; lines without it used
+#: the 15 minute idle rule, which flagged 168 finished subagents out of 176 in a 7 day log.
+MIN_HANG_RULE = 2
 #: Runs a role must hang in before the hang takeaway fires.
 MIN_HANG_RUNS = 3
 MAX_TAKEAWAYS = 3
@@ -77,6 +89,7 @@ MAX_RECENT = 50
 CUSTOM_ID = "custom"
 LEAD_PICKS_ID = "lead-picks"
 _DAY = 86400.0
+SHORT_NOTE = "Runs under 3 minutes are left out."
 
 #: A recompute running longer than this is treated as hung and replaced.
 STUCK_S = 300.0
@@ -244,7 +257,8 @@ def run_from_line(line: Mapping[str, Any]) -> dict[str, Any]:
         str(a.get("session")): str(a.get("role") or "agent") for a in agents if a.get("session")
     }
     changes = [c for c in (line.get("model_changes") or []) if isinstance(c, dict)]
-    hung = [_role_name(a) for a in agents if a.get("hung")]
+    rule = _num(line.get("hang_rule")) or 0
+    hung = [_role_name(a) for a in agents if a.get("hung")] if rule >= MIN_HANG_RULE else []
     return {
         "session": line.get("session"),
         "title": line.get("title") or "",
@@ -467,7 +481,8 @@ def takeaways(runs: list[dict[str, Any]], names: Mapping[str, str]) -> list[dict
     """The fixed-rule takeaways for *runs* (see the module docstring), at most three."""
     by_preset: dict[str, list[dict[str, Any]]] = {}
     for run in runs:
-        by_preset.setdefault(run["preset"], []).append(run)
+        if (run["wall_s"] or 0) >= MIN_COMPARE_WALL_S:
+            by_preset.setdefault(run["preset"], []).append(run)
     found: list[tuple[float, dict[str, Any]]] = []
     for pid, mine in by_preset.items():
         rest = [r for other, rs in by_preset.items() if other != pid for r in rs]
@@ -507,7 +522,8 @@ def takeaways(runs: list[dict[str, Any]], names: Mapping[str, str]) -> list[dict
                             "text": head,
                             "why": (
                                 f"That is {len(mine_t)} runs, median {_tokens_text(mt)} tokens "
-                                f"against {_tokens_text(rt)}. The rest is {len(rest_t)} runs."
+                                f"against {_tokens_text(rt)}. The rest is {len(rest_t)} runs. "
+                                f"{SHORT_NOTE}"
                             ),
                             "preset": pid,
                         },
@@ -544,7 +560,7 @@ def takeaways(runs: list[dict[str, Any]], names: Mapping[str, str]) -> list[dict
                         "metric": "cost",
                         "level": "warn" if mc > rc else "info",
                         "text": f"{head} {tail}",
-                        "why": why + f". The rest is {len(rest_c)} runs.",
+                        "why": why + f". The rest is {len(rest_c)} runs. {SHORT_NOTE}",
                         "preset": pid,
                     },
                 )
@@ -569,7 +585,7 @@ def takeaways(runs: list[dict[str, Any]], names: Mapping[str, str]) -> list[dict
                         "text": head,
                         "why": (
                             f"That is {len(mine_w)} runs, median {_minutes(mw)} against "
-                            f"{_minutes(rw)}. The rest is {len(rest_w)} runs."
+                            f"{_minutes(rw)}. The rest is {len(rest_w)} runs. {SHORT_NOTE}"
                         ),
                         "preset": pid,
                     },
@@ -595,7 +611,9 @@ def takeaways(runs: list[dict[str, Any]], names: Mapping[str, str]) -> list[dict
                     "level": "warn",
                     "text": f"{role} hung {len(hung_runs)} times",
                     "why": (
-                        f"No update for {int(preset_runs.HANG_AFTER_S // 60)} minutes in "
+                        "Stopped mid tool call with no result for "
+                        f"{int(preset_runs.HANG_AFTER_BUILDER_S // 60)} minutes (builders, Codex) "
+                        f"or {int(preset_runs.HANG_AFTER_S // 60)} (others) in "
                         f"{len(hung_runs)} runs. Presets: {listing}."
                     ),
                     "preset": max(presets, key=lambda p: presets[p]),

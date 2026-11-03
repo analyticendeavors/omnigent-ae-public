@@ -11,6 +11,15 @@
 # scripts/leak-fork-baseline.txt and are counted, not failed; only a new value fails. The
 # saved state (branch and tip pairs) is now a speed-up: it advances only after a run with no
 # new hit, and losing it costs one full rescan (about 190 s against 900 s with no baseline).
+#
+# Gate (2026-11-01): most hourly runs found nothing new and still cost about 4 billed
+# minutes. A cheap first step now computes a STATE (the fork's branch tips, the denylist,
+# its expected hash, the baseline, the allowlist, upstream.lock and the scanner) and compares it with the STATE of the last clean full
+# scan; when they match, every other step is skipped and the run finishes green. The 03:xx
+# UTC run ignores the gate and the scanned-commit cache, so every fork commit is rescanned
+# once a day, and any run is forced full when the last clean full scan is over 26 hours
+# old. A manual run uses the gate only with use_gate=true. The new STATE is saved only
+# after a clean scan, so a red result stays red until it is fixed.
 # docs/LEAK-SCAN.md
 # ============================================================
 
@@ -19,7 +28,12 @@ name: Fork backstop
 on:
   schedule:
     - cron: "17 * * * *" # every hour at :17, UTC, so the local time on the box does not matter
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      use_gate:
+        description: "Skip the scan when the fork, denylist, baseline and scanner are unchanged since the last clean scan (a test of the hourly gate)"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -37,13 +51,95 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Restore the last clean gate state
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # The same path as the save step below: a cache entry is found only by an equal path.
+          path: fork-backstop-gate/state.txt
+          key: fork-backstop-clean-${{ github.run_id }}
+          restore-keys: fork-backstop-clean-
+      - name: Gate on the fork, denylist, baseline and scanner
+        id: gate
+        env:
+          EVENT: ${{ github.event_name }}
+          USE_GATE: ${{ inputs.use_gate }}
+          DENYLIST_B64: ${{ secrets.AE_LEAK_DENYLIST_B64 }}
+          DENYLIST_SHA256: ${{ vars.AE_LEAK_DENYLIST_SHA256 }}
+        run: |
+          set -euo pipefail
+          fork="$(sed -n 's/^AE_FORK=//p' upstream.lock)"
+          # The denylist is only hashed here, never printed.
+          denylist_hash="$(printf '%s' "$DENYLIST_B64" | sha256sum | cut -d' ' -f1)"
+          # Every input the scan's verdict depends on goes into the fingerprint: the fork's
+          # branch tips, the denylist and its expected-hash variable (a mismatch must fail the
+          # next run, not skip), the baseline, the allowlist, the scanner and upstream.lock
+          # (it names the fork, the upstream project and the base commit).
+          fork_tips="$(git ls-remote "$fork" 'refs/heads/*' | LC_ALL=C sort | sha256sum | cut -d' ' -f1)"
+          expected_hash="$(printf '%s' "$DENYLIST_SHA256" | sha256sum | cut -d' ' -f1)"
+          baseline_hash="$(sha256sum scripts/leak-fork-baseline.txt | cut -d' ' -f1)"
+          allowlist_hash="$(sha256sum scripts/leak-allowlist.txt | cut -d' ' -f1)"
+          scanner_hash="$(sha256sum scripts/leak-scan.py | cut -d' ' -f1)"
+          lock_hash="$(sha256sum upstream.lock | cut -d' ' -f1)"
+          state="$(printf '%s\n' "$fork_tips" "$denylist_hash" "$expected_hash" "$baseline_hash" "$allowlist_hash" "$scanner_hash" "$lock_hash" | sha256sum | cut -d' ' -f1)"
+          mkdir -p fork-backstop-gate
+          now="$(date -u +%s)"
+          # The saved state is two lines: the fingerprint, then the epoch of the last clean
+          # FULL scan. A full scan is forced when that epoch is missing or over 26 hours old,
+          # so a delayed or dropped 03:xx cron cannot skip the daily rescan for days.
+          last_full=""
+          if [ -f fork-backstop-gate/state.txt ]; then
+            last_full="$(sed -n '2p' fork-backstop-gate/state.txt)"
+          fi
+          overdue=false
+          case "$last_full" in
+            ''|*[!0-9]*) overdue=true ;;
+            *) if [ $((now - last_full)) -gt 93600 ]; then overdue=true; fi ;;
+          esac
+          # Scheduled runs use the gate, except the 03:xx UTC run and an overdue run.
+          gated=false
+          full=false
+          if [ "$EVENT" = "schedule" ]; then
+            gated=true
+            if [ "$(date -u +%H)" = "03" ]; then
+              gated=false
+              full=true
+            fi
+          elif [ "$USE_GATE" = "true" ]; then
+            gated=true
+          fi
+          if [ "$overdue" = "true" ]; then
+            gated=false
+            full=true
+          fi
+          # A full scan stamps now; any other clean run carries the old epoch forward.
+          if [ "$full" = "true" ]; then
+            stamp="$now"
+          else
+            stamp="$last_full"
+          fi
+          printf '%s\n%s\n' "$state" "$stamp" > fork-backstop-gate/new-state.txt
+          skip=false
+          if [ "$gated" = "true" ] && [ -f fork-backstop-gate/state.txt ] \
+            && [ "$(sed -n '1p' fork-backstop-gate/state.txt)" = "$state" ]; then
+            skip=true
+          fi
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "full=$full" >> "$GITHUB_OUTPUT"
+          echo "gated=$gated full=$full overdue=$overdue skip=$skip"
+          if [ "$skip" = "true" ]; then
+            echo "Nothing changed since the last clean full scan; skipping the scan."
+          fi
       - name: Restore the last clean tips
+        if: steps.gate.outputs.skip != 'true' && steps.gate.outputs.full != 'true'
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: fork-backstop-state
-          key: fork-backstop-${{ hashFiles('scripts/leak-fork-baseline.txt') }}-${{ github.run_id }}
-          restore-keys: fork-backstop-${{ hashFiles('scripts/leak-fork-baseline.txt') }}-
+          # The key carries the baseline, the allowlist, the denylist and the scanner, so a change to any of
+          # them rescans old commits (the denylist and scanner were missing from it before).
+          key: fork-backstop-${{ hashFiles('scripts/leak-fork-baseline.txt') }}-${{ hashFiles('scripts/leak-allowlist.txt') }}-${{ vars.AE_LEAK_DENYLIST_SHA256 }}-${{ hashFiles('scripts/leak-scan.py') }}-${{ github.run_id }}
+          restore-keys: fork-backstop-${{ hashFiles('scripts/leak-fork-baseline.txt') }}-${{ hashFiles('scripts/leak-allowlist.txt') }}-${{ vars.AE_LEAK_DENYLIST_SHA256 }}-${{ hashFiles('scripts/leak-scan.py') }}-
       - name: Scan the fork's branches
+        if: steps.gate.outputs.skip != 'true'
         env:
           DENYLIST_B64: ${{ secrets.AE_LEAK_DENYLIST_B64 }}
           DENYLIST_SHA256: ${{ vars.AE_LEAK_DENYLIST_SHA256 }}
@@ -82,3 +178,15 @@ jobs:
             fork --base "$base" --state "$workspace/fork-backstop-state/tips.txt" \
             --baseline "$workspace/scripts/leak-fork-baseline.txt" \
             --exclude-refs refs/remotes/upstream/ --exclude-refs refs/remotes/upstream-tags/
+      # Saved only after a clean scan (a failed step above skips it), so a red result stays red.
+      - name: Save the clean gate state
+        if: steps.gate.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          mv fork-backstop-gate/new-state.txt fork-backstop-gate/state.txt
+      - name: Keep the clean gate state
+        if: steps.gate.outputs.skip != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fork-backstop-gate/state.txt
+          key: fork-backstop-clean-${{ github.run_id }}
