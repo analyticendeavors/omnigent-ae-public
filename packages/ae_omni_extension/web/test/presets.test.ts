@@ -16,6 +16,9 @@ import {
   deactivatePresets,
   duration,
   FALLBACK_NOTE,
+  FOLD_KEY,
+  insightsLine,
+  presetsLine,
   modelTone,
   POLL_MS,
   presetsSection,
@@ -24,6 +27,7 @@ import {
   runStartText,
   footnote,
   shownTakeaways,
+  suggestionsLine,
   suggestionActions,
   TOKENS_NOTE,
   tokensChange,
@@ -35,6 +39,7 @@ import {
   updatedText,
   WARMING_POLL_MS,
 } from "../src/presets";
+import { resetSpend } from "../src/spend";
 import { getTile, resetTiles } from "../src/tiles";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
@@ -164,6 +169,10 @@ function stubContext(replies: Reply[]) {
 
 const flush = () => vi.advanceTimersByTimeAsync(0);
 
+/** The footnotes live in the card header's info icon (2026-10-30), not under the table. */
+const footnoteOf = (node: HTMLElement) =>
+  node.querySelector(".spend-info [data-hint]")?.getAttribute("data-hint");
+
 async function mount(context: ExtensionContext): Promise<HTMLElement> {
   const node = presetsSection();
   document.getElementById("root")?.appendChild(node);
@@ -180,6 +189,7 @@ beforeEach(() => {
   vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
   vi.setSystemTime(NOW);
   window.localStorage.clear();
+  resetSpend();
   newerReply = failed(404, "x", "no newer models here");
   resetTiles();
 });
@@ -328,6 +338,7 @@ describe("the toggle", () => {
 
 describe("the pop-up", () => {
   it("opens on a row click with the runs, opens a session, and Escape closes it", async () => {
+    window.localStorage.setItem(FOLD_KEY + "presets", "open");
     const { context, openSession } = stubContext([ok(answer())]);
     const node = await mount(context);
     const first = node.querySelector<HTMLElement>(".presets-row");
@@ -676,9 +687,8 @@ describe("Cost, Tokens or Both", () => {
       "Deep debug uses 3.0x the tokens of the rest",
       "Codex hung 3 times",
     ]);
-    expect(node.querySelector(".presets-foot")?.textContent).toBe(
-      TOKENS_NOTE,
-    );
+    expect(footnoteOf(node)).toBe(TOKENS_NOTE);
+    expect(node.querySelector(".presets-foot")).toBeNull();
     first?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     const pop = document.querySelector(".presets-pop");
     const popHeads = [...(pop?.querySelectorAll("th") ?? [])].map(
@@ -713,7 +723,7 @@ describe("Cost, Tokens or Both", () => {
       "Deep debug costs 3.2x the rest and finishes no faster",
       "Codex hung 3 times",
     ]);
-    expect(node.querySelector(".presets-foot")?.textContent).toBe(COST_NOTE);
+    expect(footnoteOf(node)).toBe(COST_NOTE);
     node
       .querySelector(".presets-row")
       ?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
@@ -744,9 +754,7 @@ describe("Cost, Tokens or Both", () => {
       first?.querySelector("svg.azure-spark")?.getAttribute("aria-label"),
     ).toContain("daily cost");
     expect(node.querySelectorAll(".presets-take")).toHaveLength(3);
-    expect(node.querySelector(".presets-foot")?.textContent).toBe(
-      footnote("both"),
-    );
+    expect(footnoteOf(node)).toBe(footnote("both"));
     first?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     const popHeads = [
       ...document.querySelectorAll(".presets-pop th"),
@@ -1038,5 +1046,150 @@ describe("the newer model notice", () => {
     const { context } = stubContext([ok(answer())]);
     expect((await mount(context)).querySelector(".presets-nudge")).not.toBeNull();
     vi.restoreAllMocks();
+  });
+});
+
+// ── the two folds (2026-10-30) ──────────────────────────────────────────────
+
+const take = (id: string, level: "warn" | "info") => ({
+  id,
+  level,
+  text: `Take ${id}`,
+  why: "Why.",
+  preset: "deep",
+});
+const head = (node: HTMLElement, fold: string) =>
+  node.querySelector<HTMLButtonElement>(`.presets-fold-head[data-fold="${fold}"]`);
+const bodyOf = (button: HTMLElement) => document.getElementById(button.getAttribute("aria-controls")!)!;
+const textOf = (parts: unknown[]) =>
+  parts.map((p) => (typeof p === "string" ? p : ((p as HTMLElement | null)?.textContent ?? ""))).join("");
+const lineOf = (node: HTMLElement, fold: string) => head(node, fold)?.textContent;
+
+describe("the insight and suggestion folds", () => {
+  it("starts closed, with the summary numbers and the table still open", async () => {
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const button = head(node, "insights")!;
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(bodyOf(button).hidden).toBe(true);
+    expect(button.getAttribute("aria-controls")).toBe(bodyOf(button).id);
+    expect(button.querySelector("svg")).not.toBeNull();
+    // The KPI tiles are always open; the table is a fold of its own, closed too.
+    expect(node.querySelector<HTMLElement>(".presets-kpis, .presets-kpi")?.closest("[hidden]") ?? null).toBeNull();
+    const table = head(node, "presets")!;
+    expect(table.getAttribute("aria-expanded")).toBe("false");
+    expect(bodyOf(table).hidden).toBe(true);
+    expect(bodyOf(table).querySelector(".presets-table")).not.toBeNull();
+  });
+
+  it("writes the preset table's line: the count and the most used by runs", async () => {
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    // The fixture has two presets; "row()" has the most runs.
+    const text = lineOf(node, "presets")!;
+    expect(text).toMatch(/^2 presets, .+ most used \(\d+ runs?\)$/);
+    expect(presetsLine([{ ...row(), runs: 1 }]).length).toBe(1);
+    expect(textOf(presetsLine([{ ...row(), runs: 1 }]))).toBe(`1 preset, ${row().name} most used (1 run)`);
+    expect(textOf(presetsLine([{ ...row(), runs: 0 }]))).toBe("1 preset");
+    expect(textOf(presetsLine([]))).toBe("0 presets");
+    // Remembered like the others, and opening it shows the table.
+    head(node, "presets")!.click();
+    expect(window.localStorage.getItem(FOLD_KEY + "presets")).toBe("open");
+  });
+
+  it("draws no table fold when there are no presets", async () => {
+    const { context } = stubContext([ok(answer({ presets: [], takeaways: [] }))]);
+    const node = await mount(context);
+    expect(head(node, "presets")).toBeNull();
+    expect(node.querySelector(".empty")?.textContent).toContain("No runs in the last");
+  });
+
+  it("counts insights and warnings, singular and plural, and leaves out a zero warning part", async () => {
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    expect(lineOf(node, "insights")).toBe("1 insight, 1 warning");
+    expect(node.querySelector(".presets-fold-warn")?.textContent).toBe(", 1 warning");
+    expect(insightsLine([take("a", "info"), take("b", "warn"), take("c", "warn")] as never)
+      .map((c) => (typeof c === "string" ? c : (c as HTMLElement | null)?.textContent ?? ""))
+      .join("")).toBe("3 insights, 2 warnings");
+    deactivatePresets();
+    const calm = stubContext([ok(answer({ takeaways: [take("a", "info"), take("b", "info")] }))]);
+    document.body.replaceChildren();
+    const root = document.createElement("div");
+    root.id = "root";
+    document.body.appendChild(root);
+    const other = await mount(calm.context);
+    expect(lineOf(other, "insights")).toBe("2 insights");
+    expect(other.querySelector(".presets-fold-warn")).toBeNull();
+  });
+
+  it("opens and closes on a click and remembers it", async () => {
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const button = head(node, "insights")!;
+    button.click();
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(bodyOf(button).hidden).toBe(false);
+    expect(window.localStorage.getItem(FOLD_KEY + "insights")).toBe("open");
+    button.click();
+    expect(bodyOf(button).hidden).toBe(true);
+    expect(window.localStorage.getItem(FOLD_KEY + "insights")).toBe("closed");
+  });
+
+  it("opens again where the viewer left it", async () => {
+    window.localStorage.setItem(FOLD_KEY + "insights", "open");
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const button = head(node, "insights")!;
+    expect(button.getAttribute("aria-expanded")).toBe("true");
+    expect(bodyOf(button).hidden).toBe(false);
+  });
+
+  it("keeps an open fold open and the focus on its button through a poll", async () => {
+    // The second answer differs, so the body is rebuilt.
+    const next = answer();
+    next.takeaways = [...next.takeaways!, take("x", "info")] as never;
+    const { context } = stubContext([ok(answer()), ok(next)]);
+    const node = await mount(context);
+    const button = head(node, "insights")!;
+    button.click();
+    button.focus();
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    const again = head(node, "insights")!;
+    expect(again).not.toBe(button);
+    expect(again.textContent).toBe("2 insights, 1 warning");
+    expect(again.getAttribute("aria-expanded")).toBe("true");
+    expect(bodyOf(again).hidden).toBe(false);
+    expect(document.activeElement).toBe(again);
+  });
+
+  it("draws no fold when there are no takeaways or suggestions", async () => {
+    const { context } = stubContext([ok(answer({ takeaways: [] }))]);
+    const node = await mount(context);
+    expect(head(node, "insights")).toBeNull();
+    expect(node.querySelector(".presets-suggestions")).toBeNull();
+  });
+
+  it("folds the suggestions too: one line with the review day, the count and its age", async () => {
+    const { context } = suggestionContext([suggestion()]);
+    const node = await mount(context);
+    await flush();
+    const button = head(node, "suggestions")!;
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    expect(button.textContent).toBe("Oct 20 review: 1 suggestion, 4 days old");
+    expect(bodyOf(button).hidden).toBe(true);
+    button.click();
+    expect(bodyOf(button).querySelector(".presets-suggestions-h")?.textContent).toBe(
+      "Suggestions from Oct 20 review, 1 open",
+    );
+    // The two folds are remembered apart.
+    expect(window.localStorage.getItem(FOLD_KEY + "insights")).toBeNull();
+  });
+
+  it("writes the age in days, today under one day", () => {
+    const at = "2026-10-24T07:30:00Z";
+    expect(suggestionsLine(at, 2, NOW)).toBe("Oct 24 review: 2 suggestions, today");
+    expect(suggestionsLine("2026-10-23T07:30:00Z", 1, NOW)).toBe("Oct 23 review: 1 suggestion, 1 day old");
+    expect(suggestionsLine(null, 1, NOW)).toBe("Latest review: 1 suggestion");
   });
 });

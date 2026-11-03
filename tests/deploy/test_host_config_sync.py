@@ -192,6 +192,7 @@ def lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 # ── host side: no container needed ──
 
 
+@pytest.mark.docker
 def test_dry_run_lists_the_allowlist_and_sends_nothing(tmp_path: Path, lock_dir: Path) -> None:
     repo = make_repo(tmp_path, {})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -205,6 +206,7 @@ def test_dry_run_lists_the_allowlist_and_sends_nothing(tmp_path: Path, lock_dir:
     assert "nothing was sent or changed" in r.stdout
 
 
+@pytest.mark.docker
 def test_a_missing_manifest_aborts(tmp_path: Path, lock_dir: Path) -> None:
     repo = make_repo(tmp_path, {"claude-config/skills-manifest.txt": None})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -221,6 +223,7 @@ def test_a_missing_manifest_aborts(tmp_path: Path, lock_dir: Path) -> None:
         "# only a comment\n",
     ],
 )
+@pytest.mark.docker
 def test_an_unparsable_manifest_aborts(tmp_path: Path, lock_dir: Path, manifest: str) -> None:
     repo = make_repo(tmp_path, {"claude-config/skills-manifest.txt": manifest})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -228,6 +231,7 @@ def test_an_unparsable_manifest_aborts(tmp_path: Path, lock_dir: Path, manifest:
     assert "skills-manifest.txt" in r.stderr
 
 
+@pytest.mark.docker
 def test_a_manifest_path_that_is_not_a_folder_aborts(tmp_path: Path, lock_dir: Path) -> None:
     repo = make_repo(tmp_path, {"claude-config/skills-manifest.txt": "skills/ghost team any\n"})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -273,6 +277,7 @@ def test_a_marker_in_a_team_file_aborts_before_anything_is_sent(
         "youtube-refresh-token-hc",
     ],
 )
+@pytest.mark.docker
 def test_every_personal_marker_aborts(tmp_path: Path, lock_dir: Path, marker: str) -> None:
     repo = make_repo(tmp_path, {"skills/linuxy/notes.md": f"see {marker} for it\n"})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -298,6 +303,7 @@ def test_every_personal_marker_aborts(tmp_path: Path, lock_dir: Path, marker: st
         "skills/alpha/memory-backup/a.md",
     ],
 )
+@pytest.mark.docker
 def test_every_deny_path_aborts(tmp_path: Path, lock_dir: Path, path: str) -> None:
     repo = make_repo(tmp_path, {path: "harmless\n"})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -320,6 +326,7 @@ def test_every_deny_path_aborts(tmp_path: Path, lock_dir: Path, path: str) -> No
         "skills/alpha/session-env/x.md",
     ],
 )
+@pytest.mark.docker
 def test_plain_english_folder_names_pass_when_nested(
     tmp_path: Path, lock_dir: Path, path: str
 ) -> None:
@@ -367,6 +374,7 @@ def test_team_settings_with_a_refused_key_aborts(tmp_path: Path, lock_dir: Path)
     assert "hooks" in r.stderr
 
 
+@pytest.mark.docker
 def test_a_symlink_in_the_archive_aborts(tmp_path: Path, lock_dir: Path) -> None:
     repo = make_repo(tmp_path, {})
     (repo / "skills/alpha/link").symlink_to("/etc/passwd")
@@ -387,6 +395,7 @@ def test_the_working_tree_is_never_read(tmp_path: Path, lock_dir: Path) -> None:
     assert "new-untracked" not in r.stdout
 
 
+@pytest.mark.docker
 def test_origin_main_is_required_and_a_local_main_is_never_used(
     tmp_path: Path, lock_dir: Path
 ) -> None:
@@ -397,6 +406,7 @@ def test_origin_main_is_required_and_a_local_main_is_never_used(
     assert "refs/remotes/origin/main does not exist" in r.stderr
 
 
+@pytest.mark.docker
 def test_an_old_origin_main_warns_but_syncs(tmp_path: Path, lock_dir: Path) -> None:
     repo = make_repo(tmp_path, {}, age_hours=8)
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -406,6 +416,7 @@ def test_an_old_origin_main_warns_but_syncs(tmp_path: Path, lock_dir: Path) -> N
     assert "hours old" not in fresh.stderr
 
 
+@pytest.mark.docker
 def test_a_container_that_is_not_running_is_a_skipped_sync(tmp_path: Path, lock_dir: Path) -> None:
     if shutil.which("docker") is None:
         pytest.skip("docker is not installed here")
@@ -422,6 +433,7 @@ def test_container_names_are_limited(tmp_path: Path, lock_dir: Path) -> None:
     assert "omnigent-host-<name>" in r.stderr
 
 
+@pytest.mark.docker
 def test_host_container_dispatches_sync_config(tmp_path: Path, lock_dir: Path) -> None:
     repo = make_repo(tmp_path, {})
     env = {**os.environ, "AE_SKILLS_CLONE": str(repo), "AE_SYNC_CONTAINER": "synctest-none"}
@@ -1021,6 +1033,7 @@ def _fake_docker(tmp_path: Path, body: str) -> dict[str, str]:
     return {"PATH": f"{bindir}:{os.environ['PATH']}"}
 
 
+@pytest.mark.docker
 def test_a_docker_error_is_a_failure_not_a_skipped_sync(tmp_path: Path, lock_dir: Path) -> None:
     env = _fake_docker(
         tmp_path,
@@ -1032,6 +1045,7 @@ def test_a_docker_error_is_a_failure_not_a_skipped_sync(tmp_path: Path, lock_dir
     assert "sync skipped" not in r.stdout
 
 
+@pytest.mark.docker
 def test_a_missing_container_is_the_one_line_skip(tmp_path: Path, lock_dir: Path) -> None:
     env = _fake_docker(tmp_path, 'echo "Error: No such object: x" >&2; exit 1\n')
     r = run_sync(make_repo(tmp_path, {}), "synctest-none", env=env)
@@ -1165,6 +1179,7 @@ MARKER_VARIANTS = {
 
 
 @pytest.mark.parametrize("text", list(MARKER_VARIANTS.values()), ids=list(MARKER_VARIANTS))
+@pytest.mark.docker
 def test_marker_variants_abort(tmp_path: Path, lock_dir: Path, text: str) -> None:
     repo = make_repo(tmp_path, {"skills/alpha/notes.md": text + "\n"})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -1185,12 +1200,14 @@ def test_bom_encoded_files_are_decoded_and_scanned(
     assert "personal marker" in r.stderr
 
 
+@pytest.mark.docker
 def test_bomless_utf16_is_scanned_with_the_nuls_dropped(tmp_path: Path, lock_dir: Path) -> None:
     data = ("see " + HOME_PATH + "\n").encode("utf-16-le")
     repo = make_repo(tmp_path, {"skills/alpha/notes.txt": data})
     assert run_sync(repo, "synctest-none", "--dry-run").returncode != 0
 
 
+@pytest.mark.docker
 def test_an_undecodable_text_file_fails_instead_of_being_skipped(
     tmp_path: Path, lock_dir: Path
 ) -> None:
@@ -1200,6 +1217,7 @@ def test_an_undecodable_text_file_fails_instead_of_being_skipped(
     assert "notes.md" in r.stderr and "not valid UTF-8" in r.stderr
 
 
+@pytest.mark.docker
 def test_a_real_png_is_skipped_but_a_fake_one_is_scanned(tmp_path: Path, lock_dir: Path) -> None:
     png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) + HOME_PATH.encode()
     ok = make_repo(tmp_path, {"skills/alpha/pic.png": png})
@@ -1208,6 +1226,7 @@ def test_a_real_png_is_skipped_but_a_fake_one_is_scanned(tmp_path: Path, lock_di
     assert run_sync(fake, "synctest-none", "--dry-run").returncode != 0
 
 
+@pytest.mark.docker
 def test_the_brand_rulebook_may_name_the_second_company(tmp_path: Path, lock_dir: Path) -> None:
     brand = "skills/analytic-endeavors-brand-guidelines"
     files = {
@@ -1235,6 +1254,7 @@ def test_the_brand_rulebook_may_name_the_second_company(tmp_path: Path, lock_dir
         "skills/alpha/POLICY-LIMITS.json",
     ],
 )
+@pytest.mark.docker
 def test_deny_names_match_in_any_case(tmp_path: Path, lock_dir: Path, path: str) -> None:
     repo = make_repo(tmp_path, {path: "harmless\n"})
     r = run_sync(repo, "synctest-none", "--dry-run")
@@ -1259,6 +1279,7 @@ def test_deny_names_match_in_any_case(tmp_path: Path, lock_dir: Path, path: str)
     ],
     ids=lambda d: next(iter(d)) + ("-" + next(iter(d["env"])) if "env" in d else ""),
 )
+@pytest.mark.docker
 def test_team_settings_outside_the_allowlist_are_refused(
     tmp_path: Path, lock_dir: Path, settings: dict
 ) -> None:
@@ -1268,6 +1289,7 @@ def test_team_settings_outside_the_allowlist_are_refused(
     assert "team-settings.json" in r.stderr
 
 
+@pytest.mark.docker
 def test_a_manifest_with_no_team_rows_fails_the_plan(tmp_path: Path, lock_dir: Path) -> None:
     manifest = "skills/alpha personal any\nskills/linuxy team windows\n"
     repo = make_repo(tmp_path, {"claude-config/skills-manifest.txt": manifest})
@@ -1276,6 +1298,7 @@ def test_a_manifest_with_no_team_rows_fails_the_plan(tmp_path: Path, lock_dir: P
     assert "none is scope team" in r.stderr
 
 
+@pytest.mark.docker
 def test_literal_pathspecs_keep_a_glob_in_the_manifest_from_matching(
     tmp_path: Path, lock_dir: Path
 ) -> None:
@@ -1330,6 +1353,7 @@ def test_scan_dir_refuses_a_symlinked_directory(tmp_path: Path) -> None:
 # ── the scrub file: missing, unreadable or empty means the sync refuses to run ──
 
 
+@pytest.mark.docker
 def test_a_missing_scrub_file_refuses_and_says_what_to_write(
     tmp_path: Path, lock_dir: Path
 ) -> None:
@@ -1345,6 +1369,7 @@ def test_a_missing_scrub_file_refuses_and_says_what_to_write(
 @pytest.mark.parametrize(
     "body", ["", "\n\n", "# only a comment\n\n"], ids=["empty", "blank", "comment"]
 )
+@pytest.mark.docker
 def test_an_empty_scrub_file_refuses(tmp_path: Path, lock_dir: Path, body: str) -> None:
     repo = make_repo(tmp_path, {})
     empty = tmp_path / "empty-scrub.txt"

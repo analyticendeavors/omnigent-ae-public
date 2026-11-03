@@ -39,9 +39,13 @@ subagent) and ``hung``. A native subagent's role is read from its Agent tool des
 model and effort come from the lead's own Agent or Task call, matched by tool use id, null when
 not found (bounded read, :data:`MAX_ITEM_PAGES` pages).
 
-**Hang flag.** Each sweep marks a running child that has not updated for
-:data:`HANG_AFTER_S` (900) seconds as hung. The mark is sticky for the run and is recorded
-before upstream's 60 minute idle settle hides it.
+**Hang flag.** Each sweep marks a running child as hung when its last conversation item is a
+tool call with no result after it and that item is at least :data:`HANG_AFTER_BUILDER_S` (45
+minutes; builders and Codex children) or :data:`HANG_AFTER_S` (30 minutes; others) old. A child
+labelled ``review`` or ``reference`` is never marked. The mark is sticky for the run and is
+recorded before upstream's 60 minute idle settle hides it. Every line carries ``hang_rule`` 2
+(2026-10-30); lines without it used the old rule (no update for 15 minutes), which flagged
+children that had already delivered their report, so readers ignore their hang marks.
 
 **Review report.** ``POST /v1/ae/sessions/{id}/review-report`` (the ``report_review`` tool)
 stores ``reviewers_run``, ``findings_returned`` and ``findings_fixed`` in the state file until
@@ -93,7 +97,17 @@ STATE_FILE_NAME = "ae-preset-runs-state.json"
 MAX_BYTES = 5 * 1024 * 1024
 
 SWEEP_INTERVAL_S = 60.0
-HANG_AFTER_S = 900.0
+#: A running child whose last item is an unanswered tool call is hung after this long, counted
+#: from that item (2026-10-30). The old rule counted ``updated_at`` from 15 minutes, which tool
+#: calls and a delivered report do not move: 168 of 176 flagged subagents in a 7 day log had
+#: finished.
+HANG_AFTER_S = 1800.0
+#: The same for builders and Codex children, whose single tool calls (a build, a test run) run
+#: long without being stuck.
+HANG_AFTER_BUILDER_S = 2700.0
+#: Version of the hang rule written on every line as ``hang_rule``; the insight stats count hangs
+#: only from lines at 2 or above.
+HANG_RULE = 2
 #: A lead first seen already ended is logged only if it ended this recently (two sweeps and a
 #: margin); older ones are marked written without a line, so turning the feature on or losing
 #: the state file does not backfill history.
@@ -856,6 +870,7 @@ class Sweeper:
             "review": self._review_block(report, reviewers),
             "outcome": outcome,
             "files_touched": None,
+            "hang_rule": HANG_RULE,
         }
 
     # -- the sweep
@@ -932,6 +947,13 @@ class Sweeper:
                 _logger.warning("preset runs: no children for %s", lead_id, exc_info=True)
                 children = []
             with self._state.locked() as data:
+                already = set(data["hung"])
+            try:
+                hung_now = self._hung_ids([*kids, *children], already, now, orch_by_parent)
+            except Exception:  # noqa: BLE001 (a hang check must not abort the sweep of this run)
+                _logger.warning("preset runs: hang check failed for %s", lead_id, exc_info=True)
+                hung_now = []
+            with self._state.locked() as data:
                 live = data["live"].get(lead_id)
                 if live is None:
                     live = data["live"][lead_id] = {"kids": [], "snap": snap}
@@ -940,7 +962,8 @@ class Sweeper:
                     if kid.id not in kid_ids and len(kid_ids) < MAX_KIDS:
                         kid_ids.append(kid.id)
                 live["kids"] = kid_ids
-                self._mark_hung(data, lead_id, [*kids, *children], now)
+                for child_id in hung_now:
+                    data["hung"].setdefault(child_id, lead_id)
             return SKIPPED
         with self._state.locked() as data:
             if data["ended"].get(lead_id) is not None:
@@ -1072,13 +1095,76 @@ class Sweeper:
         except Exception:  # noqa: BLE001 (cannot tell, so log it)
             return False
 
-    @staticmethod
-    def _mark_hung(data: dict[str, Any], lead_id: str, candidates: list[Any], now: float) -> None:
-        """Mark running children that have not moved for :data:`HANG_AFTER_S` (sticky)."""
+    def _hung_ids(
+        self,
+        candidates: list[Any],
+        already: set[str],
+        now: float,
+        orch_by_parent: Mapping[str, list[Any]],
+    ) -> list[str]:
+        """Ids of running children stopped mid tool call for :data:`HANG_AFTER_S` or longer.
+
+        ``updated_at`` is only a cheap prefilter: a child updated more recently than the
+        shorter limit cannot be hung, so neither its role nor its items are read. Past it, the
+        newest item decides: a ``function_call`` with nothing after it, older than the limit, is
+        a stop; a message or a tool result means the child answered. A child with a running
+        child of its own is waiting on that work (its Agent call has no result yet), so it is
+        not flagged. A child whose items or children cannot be read is not flagged
+        (2026-10-30).
+        """
+        out: list[str] = []
+        seen: set[str] = set()
         for child in candidates:
-            running = getattr(child, "live_status", None) == "running"
-            if running and now - _time(child, "updated_at") >= HANG_AFTER_S:
-                data["hung"].setdefault(child.id, lead_id)
+            if child.id in seen or child.id in already:
+                continue  # reachable through ae.orch and the parent link: read once
+            seen.add(child.id)
+            if getattr(child, "live_status", None) != "running":
+                continue
+            if labels.status_of(child.labels) in _END_STATUSES:
+                continue
+            idle = now - _time(child, "updated_at")
+            if idle < HANG_AFTER_S:
+                continue
+            role = labels.label(child.labels, labels.ROLE) or native_role(
+                child.labels.get(_NATIVE_DESCRIPTION)
+            )
+            slow = role == "builder" or self._agent_name(child) == role_prefs.CODEX_AGENT_NAME
+            limit = HANG_AFTER_BUILDER_S if slow else HANG_AFTER_S
+            if idle < limit:
+                continue
+            try:
+                page = self._store.list_items(child.id, limit=1, order="desc")
+                last = page.data[0] if page.data else None
+            except Exception:  # noqa: BLE001 (an unreadable child is not flagged)
+                _logger.debug("preset runs: could not read %s's items", child.id, exc_info=True)
+                continue
+            if last is None or getattr(last, "type", None) != "function_call":
+                continue
+            if now - (_number(getattr(last, "created_at", None)) or now) < limit:
+                continue
+            if self._has_running_child(child, orch_by_parent):
+                continue
+            out.append(child.id)
+        return out
+
+    def _has_running_child(self, child: Any, orch_by_parent: Mapping[str, list[Any]]) -> bool:
+        """Whether *child* has a running child of its own; true when that cannot be read.
+
+        Asked only of a child already past every other test, so the store read is rare.
+        """
+        if any(
+            getattr(k, "live_status", None) == "running" for k in orch_by_parent.get(child.id, [])
+        ):
+            return True
+        try:
+            rows = self._children(child.id)
+        except Exception:  # noqa: BLE001 (cannot tell, so do not flag)
+            _logger.debug("preset runs: could not read %s's children", child.id, exc_info=True)
+            return True
+        return any(
+            getattr(k, "live_status", None) == "running" and not getattr(k, "archived", False)
+            for k in rows
+        )
 
     async def sweep(self) -> list[str]:
         return await asyncio.to_thread(self.sweep_sync)

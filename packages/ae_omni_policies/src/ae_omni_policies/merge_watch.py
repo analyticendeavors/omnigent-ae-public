@@ -748,7 +748,59 @@ def _in_container() -> bool:
     return os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv")
 
 
-async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str) -> bool:
+async def _read_session(
+    app: FastAPI, headers: dict[str, str], session_id: str
+) -> dict[str, Any] | None:
+    """The session as the server describes it, or ``None`` when it cannot be read."""
+    try:
+        response = await _call(app, "GET", f"/v1/sessions/{session_id}", headers)
+        if response.status_code >= 300:
+            return None
+        body = response.json()
+    except (httpx.HTTPError, ValueError, AttributeError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
+#: Roles whose chats end with their verdict: a merge note means nothing to them.
+FINISHED_ROLES = ("reviewer", "helper")
+
+
+def _not_notified(session: Mapping[str, Any]) -> str | None:
+    """Why *session* is not told about a merge (2026-10-31), or ``None`` to tell it.
+
+    A post wakes a session, and the server relaunches the runner of a stopped one. For an
+    archived chat, or a review or helper chat (or a child with no role) at merge time, the
+    worktree is usually gone by then (the lead removes it on the same note), so the relaunch
+    fails: the chat turns red with "workspace path does not exist" although nothing was wrong
+    with it. The note is dropped before it can wake such a chat. The server runs in a container
+    on the box, where :func:`_workspace_gone` cannot see the host's disk, so this is the guard
+    there. Found when both review chats of PR 440 and PR 442 failed within seconds of the merge.
+    """
+    if session.get("archived") is True:
+        return "archived"
+    session_labels = session.get("labels")
+    if not isinstance(session_labels, Mapping):
+        return None
+    role = labels.label(session_labels, labels.ROLE)
+    if role in FINISHED_ROLES:
+        return "a review or helper chat"
+    child = bool(
+        labels.orch_parent(session_labels)
+        or session.get("parent_session_id")
+        or session.get("parent_conversation_id")
+    )
+    # A child started without a role (a native sub-agent, a Codex reviewer from sys_session_create)
+    # is a helper too: it hangs off a parent and has no role to say otherwise.
+    if child and role is None:
+        return "a child chat with no role"
+    # A child that closed itself (any role, builders included) has nothing left to do.
+    if child and labels.status_of(session_labels) == "reference":
+        return "a finished child chat"
+    return None
+
+
+def _workspace_gone(session: Mapping[str, Any]) -> bool:
     """True when the session names a workspace directory that is gone from this disk.
 
     A post to such a session makes the server relaunch the runner in the deleted
@@ -757,19 +809,13 @@ async def _workspace_gone(app: FastAPI, headers: dict[str, str], session_id: str
     the server ran in a container that mounts only ``/data`` and ships an empty
     ``/home``, so every host workspace read as missing and four notes into live
     sessions were dropped (/home/u and /home/u/worktrees/run). So the
-    check is off in a container (the box's Docker deployment): the 4xx
-    ``workspace_missing`` rule in :func:`post_live` is the guard there. It is also
+    check is off in a container (the box's Docker deployment): :func:`_not_notified` and the
+    4xx ``workspace_missing`` rule in :func:`post_live` are the guards there. It is also
     skipped for a path that is not absolute POSIX (``C:\\...``, relative). Anything
-    else unknown (the read fails, no workspace field, a stat error other than "not
-    found") is not gone: the post goes ahead as before.
+    else unknown (no workspace field, a stat error other than "not found") is not gone:
+    the post goes ahead as before.
     """
-    try:
-        response = await _call(app, "GET", f"/v1/sessions/{session_id}", headers)
-        if response.status_code >= 300:
-            return False
-        workspace = response.json().get("workspace")
-    except (httpx.HTTPError, ValueError, AttributeError):
-        return False
+    workspace = session.get("workspace")
     if not isinstance(workspace, str) or not workspace.strip():
         return False
     if not workspace.startswith("/") or _in_container():
@@ -830,11 +876,18 @@ async def post_live(
             session_id,
         )
         return "drop"
-    if await _workspace_gone(app, headers, session_id):
-        _logger.info(
-            "merge watcher: the workspace of %s no longer exists; the note is dropped", session_id
-        )
-        return "drop"
+    session = await _read_session(app, headers, session_id)
+    if session is not None:
+        skip = _not_notified(session)
+        if skip is not None:
+            _logger.info("merge watcher: %s is %s; the note is dropped", session_id, skip)
+            return "drop"
+        if _workspace_gone(session):
+            _logger.info(
+                "merge watcher: the workspace of %s no longer exists; the note is dropped",
+                session_id,
+            )
+            return "drop"
     body = {
         "type": "message",
         "data": {"role": "user", "content": [{"type": "input_text", "text": text}]},

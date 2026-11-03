@@ -203,7 +203,8 @@ def answer(rig: Rig, **kw: Any) -> dict[str, Any]:
         "viewer": "a@x.test",
         "admin": False,
         "unit": "tokens",
-        "runaway": 0.0,
+        "runaway_tokens": 0.0,
+        "runaway_usd": 0.0,
     }
     args.update(kw)
     return family_cost.view(state=rig.state, **args)
@@ -250,29 +251,34 @@ def test_rank_follows_the_chosen_unit() -> None:
     assert row["cost_usd"] == pytest.approx(5.0) and row["tokens"]["total"] == 100
 
 
-def test_runaway_flag_uses_spend_today_in_the_chosen_unit() -> None:
+def test_runaway_flag_trips_on_either_amount_and_zero_turns_one_off() -> None:
     rig = two_owners()
     # Both were created before today and have no earlier snapshot, so today's spend is zero.
-    assert answer(rig, admin=True, unit="tokens", runaway=50)["totals"]["flagged"] == 0
+    assert answer(rig, admin=True, runaway_tokens=50)["totals"]["flagged"] == 0
     rig.now = NOW + 3600
     rig.tops = [
         Row("mine", usage(5.0 + 1.0, 100 + 400, 0, 0), {}, title="mine"),
         Row("theirs", usage(30.0 + 40.0, 10 + 5, 0, 0), {}, title="theirs"),
     ]
     rig.sweep()
-    tokens = answer(rig, admin=True, unit="tokens", runaway=300)
-    assert {f["lead_id"]: f["flagged"] for f in tokens["families"]} == {
+
+    def flags(**kw: Any) -> dict[str, bool]:
+        return {f["lead_id"]: f["flagged"] for f in answer(rig, admin=True, **kw)["families"]}
+
+    # Tokens alone flag "mine" (400 today), dollars alone flag "theirs" ($40 today).
+    assert flags(runaway_tokens=300) == {"mine": True, "theirs": False}
+    assert flags(runaway_usd=25) == {"mine": False, "theirs": True}
+    # Both set: either one flags, whichever unit ranks the list.
+    assert flags(runaway_tokens=300, runaway_usd=25) == {"mine": True, "theirs": True}
+    assert flags(unit="dollars", runaway_tokens=300, runaway_usd=25) == {
         "mine": True,
-        "theirs": False,
-    }
-    dollars = answer(rig, admin=True, unit="dollars", runaway=25)
-    assert {f["lead_id"]: f["flagged"] for f in dollars["families"]} == {
-        "mine": False,
         "theirs": True,
     }
-    assert dollars["totals"]["flagged"] == 1
-    off = answer(rig, admin=True, unit="dollars", runaway=0)
-    assert not any(f["flagged"] for f in off["families"])
+    assert answer(rig, admin=True, runaway_tokens=300, runaway_usd=25)["totals"]["flagged"] == 2
+    # 0 turns that one off; both 0 flags nothing.
+    assert flags(runaway_tokens=0, runaway_usd=25) == {"mine": False, "theirs": True}
+    assert flags(runaway_tokens=300, runaway_usd=0) == {"mine": True, "theirs": False}
+    assert not any(flags(runaway_tokens=0, runaway_usd=0).values())
 
 
 def test_the_answer_is_cut_to_fit_and_says_so() -> None:
@@ -509,7 +515,7 @@ def test_the_day_is_pacific_and_starts_at_the_last_sample_before_midnight() -> N
         rig.families(7)
         and family_cost._day(datetime(2026, 10, 29, 0, 5, tzinfo=tz).timestamp()) == "2026-10-29"
     )
-    view = answer(rig, days=7, admin=True, runaway=1)
+    view = answer(rig, days=7, admin=True, runaway_tokens=1)
     assert view["families"][0]["today"]["cost_usd"] == pytest.approx(10.0)
     # 06:00 UTC on the 29th is still the 28th in Pacific time.
     assert family_cost._day(datetime(2026, 10, 29, 6, 0, tzinfo=family_cost.UTC).timestamp()) == (
@@ -541,7 +547,13 @@ def test_another_process_sees_what_the_sweeping_one_wrote(tmp_path: Path) -> Non
     assert reader.load()["at"] == NOW
     assert (
         family_cost.build_answer(
-            reader.load(), days=7, viewer=None, admin=True, unit="tokens", runaway=0
+            reader.load(),
+            days=7,
+            viewer=None,
+            admin=True,
+            unit="tokens",
+            runaway_tokens=0,
+            runaway_usd=0,
         )["state"]
         == "ready"
     )

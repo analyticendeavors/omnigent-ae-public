@@ -89,6 +89,45 @@ def _harness_of(conv: Any) -> str:
     return "codex" if wrapper == "codex-native-ui" else "claude"
 
 
+def _fill_personas(effective: dict[str, Any], owner: str) -> dict[str, Any]:
+    """*effective* with each reviewer slot's missing model and effort taken from its persona.
+
+    A slot that names a persona may leave the model and effort out (2026-11-01); the persona
+    then supplies them. A persona that no longer exists leaves the slot as it is.
+    """
+    preset = effective.get("preset")
+    setting = (
+        ((preset or {}).get("roles") or {}).get("reviewer") if isinstance(preset, dict) else None
+    )
+    if not isinstance(setting, dict) or setting.get("mode") != "multi":
+        return effective
+    slots = setting.get("reviewers") or []
+    if not any(isinstance(s, dict) and s.get("persona") for s in slots):
+        return effective
+    try:
+        state = role_prefs.store().get(owner)
+    except Exception:  # noqa: BLE001 (an unreadable store leaves the slots as saved)
+        return effective
+
+    def fill(slot: Any) -> Any:
+        if not isinstance(slot, dict) or not slot.get("persona"):
+            return slot
+        found = role_prefs.find_persona(state, str(slot["persona"]))
+        if found is None or slot.get("mode") != "fixed":
+            return slot
+        model = slot.get("model") or found.model
+        if not model:
+            # The lead notice reads this slot as a plain reviewer on the lead's pick; so does
+            # the spawn (review fix, patch 0278).
+            return {"mode": "auto", "persona": slot["persona"]}
+        # A missing effort is medium, as the lead notice says (review fix, patch 0278).
+        return {**slot, "model": model, "effort": slot.get("effort") or found.effort or "medium"}
+
+    filled = {**setting, "reviewers": [fill(s) for s in slots]}
+    roles = {**preset["roles"], "reviewer": filled}
+    return {**effective, "preset": {**preset, "roles": roles}}
+
+
 def _from_role(
     role: str, effective: dict[str, Any], parent: Any | None, harness: str | None = None
 ) -> Spawn:
@@ -154,6 +193,7 @@ def resolve(
         effective = {"preset": chosen} if chosen is not None else {}
     else:
         effective = _effective(parent, owner)
+    effective = _fill_personas(effective, owner)
     out = _from_role(role, effective, parent, harness) if role else Spawn()
     if harness and harness != out.harness:
         out.model = out.effort = None

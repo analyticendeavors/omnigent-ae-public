@@ -430,10 +430,15 @@ change, how it was settled. That log is what keeps the patches tiny over time.
 upstream's `tests/server/test_openapi_drift.py` (since 2026-10-14),
 `tests/server/routes/test_ae_fork_claude_account.py` from patch P99 (since 2026-10-18), `tests/onboarding/test_ae_shared_claude_accounts.py` from patch P117 (since 2026-10-20), the policy edit suites from P94 (`tests/server/routes/test_ae_default_policy_params.py`, `tests/server/routes/test_default_policies.py`, `tests/server/integration/test_default_policy_routes.py`, `tests/stores/test_ae_update_default_factory_params.py`, since 2026-10-18), `-m "not databricks"`) |
 | `python` | `just setup`, `just lint`, `just test`, `just ext-doctor`: both AE packages' ruff pass and suites on upstream's venv and server fixtures; the extension's manifest is accepted and its bundle resolves |
-| `web` | `just web-lint`: `pnpm install --frozen-lockfile --filter web` in the patched tree, then upstream's `lint` and `type-check` over the whole SPA; then `just ext-build`, which rebuilds the Parking Lot bundle and fails if the committed `dist/` differs |
-| `web-test` | `just web-test <n>/4` in four parallel shards (vitest `--shard`): vitest over the suites the patches add or touch (the AE helpers and components, every `Sidebar` suite, the extension navigation map, the extension host services, the SDK page drain, and since 2026-10-14 the ChatPage composer, mention and statusLine suites, which had failed unseen since patch 0030). Split out of `web` on 2026-10-20: one run of the whole list took about 5 of that job's 10 minutes. `just web-check` still runs both halves locally |
+| `web` | `just web-lint`: `pnpm install --frozen-lockfile --filter web` in the patched tree, then upstream's `lint` and `type-check` over the whole SPA; then `just web-test`: vitest over the suites the patches add or touch (the AE helpers and components, every `Sidebar` suite, the extension navigation map, the extension host services, the SDK page drain, and since 2026-10-14 the ChatPage composer, mention and statusLine suites, which had failed unseen since patch 0030); then `just ext-build`, which rebuilds the Parking Lot bundle and fails if the committed `dist/` differs. The vitest half ran as four parallel `web-test` shards from 2026-10-20 to 2026-11-01; each shard repeated the install and cost more billed minutes than it saved, so it is one job again |
 | `image` | stage 1 from `upstream/deploy/docker/Dockerfile`, stage 2 from `deploy/Dockerfile`; `omni --version` must print the pinned version; `omni extensions list` must name `analyticendeavors.parking-lot` and `doctor` must resolve its bundle; both AE packages must import |
 | `rules` | on the private repository only (the public export drops the block): the managed block in `CLAUDE.md` matches `claude-config/BRANCH-DISCIPLINE-CLAUDE-RULES.md` in ae-claude-skills (needs the `RULES_SOURCE_TOKEN` secret; without it the job checks only the markers, warns, and passes) |
+
+The `patches`, `upstream-smoke`, `python`, `web` and `rules` jobs can run on self-hosted runners
+on the owner's box (since 2026-11-01), switched by the repository variable `CI_BOX_RUNNER`
+(off while unset), with `ci-box-fallback.yml` rerunning a lost run on GitHub-hosted runners.
+Tests marked `docker` run as extra steps of the `image` job instead. See
+`deploy/ci-runner/README.md`.
 
 ## Shallow checkouts
 

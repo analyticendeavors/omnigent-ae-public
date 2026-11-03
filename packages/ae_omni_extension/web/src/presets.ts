@@ -13,7 +13,9 @@
 // totals only, no takeaways, and the card says so in one line.
 //
 // The 7 d / 30 d choice is remembered per viewer in localStorage (30 d first).
-// Cost is an estimate at API rates; on a subscription it shows where usage
+// 2026-10-30: this card became "Spend", the Family cost card (familyCost.ts) its second tab. The
+// tab bar, the one 7 d / 30 d toggle and the one info icon (every footnote of both panels) live
+// here; what the panels share is in spend.ts. Cost is an estimate at API rates; on a subscription it shows where usage
 // goes, not what the invoice says.
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
@@ -39,15 +41,33 @@ import {
 } from "./api";
 import { sparkline, money } from "./azure";
 import { button, type Child, el, notice, replaceChildren } from "./dom";
+import { familyCostSection } from "./familyCost";
+import { hint } from "./hint";
 import { closeIcon } from "./icons";
+import { fold, foldLine } from "./fold";
+
+export { FOLD_KEY, loadFold } from "./fold";
+import {
+  DAYS_KEY,
+  DEFAULT_DAYS,
+  flaggedCount,
+  loadDays,
+  notesText,
+  onSpend,
+  resetSpend,
+  setNotes,
+  setSpendDays,
+  syncDays,
+  WINDOWS,
+} from "./spend";
 import { registerRefresh, setTile, staleTile, type Tile } from "./tiles";
+
+export { DAYS_KEY, DEFAULT_DAYS, loadDays, WINDOWS };
 
 export const POLL_MS = 60_000;
 /** While the server computes its first answer, so the numbers show in seconds. */
 export const WARMING_POLL_MS = 4_000;
-export const DAYS_KEY = "presets.days";
-export const DEFAULT_DAYS = 30;
-export const WINDOWS = [7, 30] as const;
+export const TAB_KEY = "spend.tab";
 export const FALLBACK_NOTE =
   "Detailed run logging is off, so this uses session totals only.";
 /** A server answer older than this means its refresh is failing (it recomputes every 5 min). */
@@ -56,7 +76,7 @@ export const COST_NOTE =
   "Cost is estimated at API rates. On a subscription it shows where usage goes, not what the invoice says.";
 
 export const TOKENS_NOTE =
-  "Tokens are input and output tokens, summed over the lead and its helpers; cache reads are not counted.";
+  "Preset tokens are input and output tokens, summed over the lead and its helpers; cache reads are not counted.";
 
 export const NEWER_KEY = "presets.newer.dismissed";
 export const NEWER_HINT =
@@ -334,6 +354,14 @@ interface Parts {
   body: HTMLElement;
   refreshed: HTMLElement;
   toggle: HTMLElement;
+  /** The warning pill on the Families tab, and the header's info icon. */
+  pill: HTMLElement;
+  info: HTMLElement;
+}
+
+/** "3 over today"; empty when no family is over its limit. */
+export function pillText(count: number): string {
+  return count > 0 ? `${count} over today` : "";
 }
 
 function kpi(
@@ -408,10 +436,34 @@ export function shownTakeaways(view: PresetsAnswer): PresetTakeaway[] {
     .slice(0, 3);
 }
 
+// ── folds (2026-10-30) ──────────────────────────────────────────────────────
+// The insight callouts and the review's suggestions are closed to one line by default, so the
+// Presets tab is about 620 px tall instead of 1,070 px. Each fold's state is remembered per
+// viewer; a poll rebuilds the body, so the state is read from here on every draw.
+
+/** "3 insights, 2 warnings": the warning part only when some are warnings. */
+export function insightsLine(items: readonly PresetTakeaway[]): Child[] {
+  const warns = items.filter((take) => take.level === "warn").length;
+  return [
+    plural(items.length, "insight"),
+    warns ? el("span", { class: "presets-fold-warn" }, `, ${plural(warns, "warning")}`) : null,
+  ];
+}
+
+/** "Oct 25 review: 1 suggestion, 5 days old"; "today" under a day. */
+export function suggestionsLine(at: string | null, count: number, now = Date.now()): string {
+  const day = reviewDay(at);
+  const head = `${day ? `${day} review` : "Latest review"}: ${plural(count, "suggestion")}`;
+  const then = at ? Date.parse(at) : NaN;
+  if (Number.isNaN(then)) return head;
+  const age = Math.max(0, Math.floor((now - then) / 86_400_000));
+  return `${head}, ${age < 1 ? "today" : `${plural(age, "day")} old`}`;
+}
+
 function takeaways(state: State, view: PresetsAnswer): HTMLElement | null {
   const items = shownTakeaways(view);
   if (!items.length) return null;
-  return el(
+  const list = el(
     "div",
     { class: "presets-takes" },
     ...items.map((take) => {
@@ -434,6 +486,7 @@ function takeaways(state: State, view: PresetsAnswer): HTMLElement | null {
       );
     }),
   );
+  return fold("insights", "presets-insights", insightsLine(items), list);
 }
 
 // ── the suggestions from the scheduled review (preset_suggestions.py) ──────
@@ -595,18 +648,23 @@ function suggestionRow(state: State, s: PresetSuggestion): HTMLElement {
 function suggestions(state: State): HTMLElement | null {
   const { at, items, open } = visibleSuggestions(state.suggestions);
   if (!items.length) return null;
-  return el(
-    "div",
-    { class: "presets-suggestions" },
-    el(
-      "h3",
-      { class: "presets-suggestions-h" },
-      `Suggestions from ${reviewDay(at) || "the latest"} review, ${open} open`,
-    ),
+  return fold(
+    "suggestions",
+    "presets-suggestions",
+    [suggestionsLine(at, items.length)],
     el(
       "div",
-      { class: "presets-takes" },
-      ...items.map((s) => suggestionRow(state, s)),
+      {},
+      el(
+        "h3",
+        { class: "presets-suggestions-h" },
+        `Suggestions from ${reviewDay(at) || "the latest"} review, ${open} open`,
+      ),
+      el(
+        "div",
+        { class: "presets-takes" },
+        ...items.map((s) => suggestionRow(state, s)),
+      ),
     ),
   );
 }
@@ -704,7 +762,7 @@ function presetRow(state: State, row: PresetRow, show: Show): HTMLElement {
   return tr;
 }
 
-function table(state: State, view: PresetsAnswer): HTMLElement {
+function tableBody(state: State, view: PresetsAnswer): HTMLElement {
   const show = showOf(view);
   const head = [
     "Preset",
@@ -751,6 +809,20 @@ function table(state: State, view: PresetsAnswer): HTMLElement {
   );
 }
 
+/** "5 presets, Balanced most used (168 runs)": the row with the most runs is the most used. */
+export function presetsLine(rows: readonly PresetRow[]): Child[] {
+  const top = rows.reduce<PresetRow | null>((best, row) => (!best || row.runs > best.runs ? row : best), null);
+  const count = plural(rows.length, "preset");
+  if (!top || top.runs <= 0) return [count];
+  return [foldLine(`${count},`, top.name, `most used (${plural(top.runs, "run")})`)];
+}
+
+function table(state: State, view: PresetsAnswer): HTMLElement | null {
+  const rows = view.presets ?? [];
+  if (!rows.length) return null;
+  return fold("presets", "presets-table-fold", presetsLine(rows), tableBody(state, view));
+}
+
 /** The one plain line under the table for the viewer's pick. */
 export function footnote(show: Show): string {
   if (show === "tokens") return TOKENS_NOTE;
@@ -761,6 +833,14 @@ export function footnote(show: Show): string {
 function drawBody(parts: Parts, state: State): void {
   const view = state.answer;
   const lines: Child[] = [];
+  // A poll rebuilds the body; a focused fold button stays focused.
+  const active = document.activeElement;
+  const focusedFold =
+    active instanceof HTMLElement && parts.body.contains(active)
+      ? active.closest<HTMLElement>("[data-fold]")?.dataset.fold
+      : undefined;
+  // The footnote moved into the card header's info icon (2026-10-30); only a table has one.
+  const noted: string[] = [];
   if (!state.adminOnly) lines.push(newerNotice(state));
   if (state.adminOnly) {
     lines.push(el("p", { class: "empty" }, "Preset insights are for admins."));
@@ -793,10 +873,14 @@ function drawBody(parts: Parts, state: State): void {
       takeaways(state, view),
       suggestions(state),
       table(state, view),
-      el("p", { class: "meta presets-foot" }, footnote(showOf(view))),
     );
+    noted.push(footnote(showOf(view)));
   }
+  setNotes("presets", noted);
   replaceChildren(parts.body, lines);
+  if (focusedFold) {
+    parts.body.querySelector<HTMLElement>(`[data-fold="${focusedFold}"]`)?.focus();
+  }
 }
 
 function drawToggle(
@@ -821,7 +905,7 @@ function drawToggle(
       choice.addEventListener("click", () => {
         if (state.days === days) return;
         state.days = days;
-        saveDays(days);
+        setSpendDays(days);
         state.answer = null;
         state.error = null;
         closePopup(state, false);
@@ -1011,20 +1095,25 @@ function openPopup(state: State, presetId: string, opener: HTMLElement): void {
 
 // ── remembered choice ───────────────────────────────────────────────────────
 
-export function loadDays(): number {
+export type SpendTab = "presets" | "families";
+export const TABS: readonly { id: SpendTab; label: string }[] = [
+  { id: "presets", label: "Presets" },
+  { id: "families", label: "Families" },
+];
+
+export function loadTab(): SpendTab {
   try {
-    const raw = window.localStorage.getItem(DAYS_KEY);
-    const days = Number(raw);
-    if ((WINDOWS as readonly number[]).includes(days)) return days;
+    const raw = window.localStorage.getItem(TAB_KEY);
+    if (raw === "presets" || raw === "families") return raw;
   } catch {
-    // No storage in this frame: the default.
+    // No storage in this frame: the Presets tab.
   }
-  return DEFAULT_DAYS;
+  return "presets";
 }
 
-function saveDays(days: number): void {
+function saveTab(tab: SpendTab): void {
   try {
-    window.localStorage.setItem(DAYS_KEY, String(days));
+    window.localStorage.setItem(TAB_KEY, tab);
   } catch {
     // Kept in memory until the page closes.
   }
@@ -1032,29 +1121,109 @@ function saveDays(days: number): void {
 
 // ── the card ────────────────────────────────────────────────────────────────
 
-/** The Presets card's body; activatePresets fills it. */
+let tabCounter = 0;
+
+/**
+ * The Spend card's body: a tab bar (Presets | Families) with the one 7 d / 30 d toggle, then a
+ * panel per tab. The Families panel is the Family cost card's body (familyCostSection);
+ * activatePresets fills the first, activateFamilyCost the second. The tab bar follows the WAI-ARIA
+ * tabs pattern: roving tabindex, Left and Right wrap, Home and End jump.
+ */
 export function presetsSection(): HTMLElement {
+  const uid = ++tabCounter;
+  const chosen = loadTab();
+  const tabs = TABS.map((tab) => {
+    const node = el(
+      "button",
+      {
+        type: "button",
+        role: "tab",
+        class: "spend-tab",
+        id: `spend-${uid}-tab-${tab.id}`,
+        "aria-controls": `spend-${uid}-panel-${tab.id}`,
+        "data-tab": tab.id,
+      },
+      el("span", { class: "spend-tab-label" }, tab.label),
+      tab.id === "families" ? el("span", { class: "spend-tab-pill", hidden: true }) : null,
+    );
+    return node;
+  });
+  const panels = TABS.map((tab) =>
+    el(
+      "div",
+      {
+        role: "tabpanel",
+        class: `spend-panel spend-panel-${tab.id}`,
+        id: `spend-${uid}-panel-${tab.id}`,
+        "aria-labelledby": `spend-${uid}-tab-${tab.id}`,
+        // A panel with no focusable child still takes focus, as the tabs pattern asks.
+        tabindex: "0",
+      },
+      ...(tab.id === "presets"
+        ? [el("div", { class: "page-status presets-status" }), el("div", { class: "presets-body" })]
+        : [familyCostSection()]),
+    ),
+  );
+  const select = (id: SpendTab, focus: boolean) => {
+    TABS.forEach((tab, at) => {
+      const on = tab.id === id;
+      const node = tabs[at]!;
+      node.setAttribute("aria-selected", String(on));
+      node.tabIndex = on ? 0 : -1;
+      node.classList.toggle("is-on", on);
+      panels[at]!.hidden = !on;
+      if (on && focus) node.focus();
+    });
+  };
+  tabs.forEach((node, at) => {
+    node.addEventListener("click", () => {
+      saveTab(TABS[at]!.id);
+      select(TABS[at]!.id, false);
+    });
+    node.addEventListener("keydown", (event) => {
+      const key = (event as KeyboardEvent).key;
+      const to =
+        key === "ArrowRight"
+          ? (at + 1) % TABS.length
+          : key === "ArrowLeft"
+            ? (at + TABS.length - 1) % TABS.length
+            : key === "Home"
+              ? 0
+              : key === "End"
+                ? TABS.length - 1
+                : -1;
+      if (to < 0) return;
+      event.preventDefault();
+      saveTab(TABS[to]!.id);
+      select(TABS[to]!.id, true);
+    });
+  });
+  select(chosen, false);
   return el(
     "div",
     { class: "admin-block admin-presets" },
+    // The card header takes these two (fabric.ts): the info icon beside the title, the time at
+    // the right.
+    el("span", { class: "spend-info" }),
+    el("p", { class: "meta refreshed presets-refreshed" }),
     el(
       "div",
       { class: "presets-top" },
-      el("p", { class: "meta refreshed presets-refreshed" }),
+      el("div", { class: "spend-tabs", role: "tablist", "aria-label": "Spend" }, ...tabs),
       el("div", {
         class: "presets-toggle",
         role: "group",
         "aria-label": "Window",
       }),
     ),
-    el("div", { class: "page-status presets-status" }),
-    el("div", { class: "presets-body" }),
+    ...panels,
   );
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null;
 let onFocus: (() => void) | null = null;
 let closeActive: (() => void) | null = null;
+let unsubscribe: (() => void)[] = [];
 /** Bumped by every activate and deactivate, as in accounts.ts. */
 let generation = 0;
 
@@ -1063,6 +1232,8 @@ function stop(): void {
   timer = null;
   closeActive?.();
   closeActive = null;
+  for (const off of unsubscribe) off();
+  unsubscribe = [];
   if (!onFocus) return;
   window.removeEventListener("focus", onFocus);
   document.removeEventListener("visibilitychange", onFocus);
@@ -1083,6 +1254,8 @@ export function activatePresets(
     status: find(".presets-status"),
     body: find(".presets-body"),
     toggle: find(".presets-toggle"),
+    pill: find(".spend-tab-pill"),
+    info: find(".spend-info"),
     // In the card the header carries the time, so this one may have moved.
     refreshed: root.querySelector<HTMLElement>(".presets-refreshed") ?? el("p"),
   };
@@ -1091,7 +1264,7 @@ export function activatePresets(
   stop();
   const state: State = {
     context,
-    days: loadDays(),
+    days: syncDays(),
     answer: null,
     error: null,
     adminOnly: false,
@@ -1106,6 +1279,20 @@ export function activatePresets(
     popup: null,
   };
   closeActive = () => closePopup(state, false);
+  // The Families panel reports its flagged count and both panels their footnotes.
+  let infoText = "";
+  const paintPill = () => {
+    const text = pillText(flaggedCount());
+    parts.pill.textContent = text;
+    parts.pill.hidden = !text;
+  };
+  const paintInfo = () => {
+    const text = notesText();
+    if (text === infoText) return;
+    infoText = text;
+    replaceChildren(parts.info, [text ? hint(text, "the cost and token notes") : null]);
+  };
+  unsubscribe = [onSpend("flagged", paintPill), onSpend("notes", paintInfo)];
   let said = "";
   const draw = () => {
     const message = state.error ? describeError(state.error) : "";
@@ -1120,6 +1307,8 @@ export function activatePresets(
     drawToggle(parts, state, draw, () => void refresh());
     // A pop-up open over a redraw keeps its own copy of the rows; only the table is rebuilt.
     drawBody(parts, state);
+    paintPill();
+    paintInfo();
     paintStatus();
   };
   // The time shown is the server's `asOf`, never this browser's clock.
@@ -1240,4 +1429,7 @@ export function activatePresets(
 export function deactivatePresets(): void {
   generation++;
   stop();
+  // 2026-10-30: the pill, the flagged count and the footnotes belong to the page that drew them;
+  // a reactivated page must not show the last page's.
+  resetSpend();
 }

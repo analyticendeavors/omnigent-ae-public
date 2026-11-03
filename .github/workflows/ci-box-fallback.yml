@@ -1,0 +1,117 @@
+# ============================================================
+# CI box fallback
+#
+# ci.yml sends the test jobs to the box runners when the repository variable
+# CI_BOX_RUNNER is "on" (deploy/ci-runner/README.md). When that run is lost
+# because the box went away, this workflow reruns it ONCE on GitHub-hosted
+# runners (attempt 2 never routes to the box: ci.yml requires run_attempt == 1).
+#
+# It reruns only for a lost box, never for an ordinary test failure:
+#   (a) the watchdog job's step "Cancel: box jobs never started" ran, or
+#   (b) a failed box-eligible job carries a lost-runner annotation.
+# And only while the run's commit is still current (a newer push supersedes it).
+#
+# The job-level `if:` keeps this free while routing is off: no job starts, so
+# nothing is billed. workflow_run fires only from the default branch, so this
+# file is exercised after it merges.
+# ============================================================
+
+name: CI box fallback
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  rerun:
+    name: Rerun on GitHub when the box was lost
+    if: >-
+      github.repository == 'analyticendeavors/omnigent-ae' &&
+      github.event.workflow_run.run_attempt == 1 &&
+      (github.event.workflow_run.conclusion == 'cancelled' || github.event.workflow_run.conclusion == 'failure') &&
+      (vars.CI_BOX_RUNNER == 'on' || github.event.workflow_run.event == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+      contents: read
+      checks: read
+      pull-requests: read
+    steps:
+      - name: Decide and rerun
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_EVENT: ${{ github.event.workflow_run.event }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+        run: |
+          set -euo pipefail
+          say() { echo "$*" | tee -a "$GITHUB_STEP_SUMMARY"; }
+
+          jobs_json="$(gh api --paginate "repos/${REPO}/actions/runs/${RUN_ID}/attempts/1/jobs?per_page=100" --jq '.jobs[]' | jq -s .)"
+
+          # Display names of the jobs that run on the box; keep in step with ci.yml.
+          names='["Patch series matches and applies","Upstream policy and extension suites","AE package lint and tests","Web workspace lint, type-check, extension bundle","Branch-discipline block matches its source"]'
+
+          reason=""
+          # (a) The watchdog cancelled the run. Cancelling the run also cancels the
+          # watchdog job while that step is still finishing, so its conclusion can
+          # read success or cancelled; a step that never started reads skipped.
+          wd="$(jq -r '[.[] | select(.name == "Box watchdog") | .steps[]? | select(.name == "Cancel: box jobs never started") | .conclusion][0] // "none"' <<<"$jobs_json")"
+          if [ "$wd" = "success" ] || [ "$wd" = "cancelled" ]; then
+            reason="the watchdog cancelled the run because the box jobs never started"
+          fi
+
+          # (b) A failed box-eligible job whose annotations show a lost runner.
+          if [ -z "$reason" ]; then
+            urls="$(jq -r --argjson names "$names" '.[] | select(.name as $n | $names | index($n)) | select(.conclusion == "failure" or .conclusion == "cancelled") | .check_run_url' <<<"$jobs_json")"
+            for url in $urls; do
+              if ! notes="$(gh api --paginate "${url#https://api.github.com/}/annotations" --jq '.[].message')"; then
+                say "Warning: could not read the annotations of ${url##*/}; treating it as an ordinary failure."
+                notes=""
+              fi
+              if grep -qiE 'lost communication with the server|received a shutdown signal|self-hosted runner.*lost' <<<"$notes"; then
+                reason="a box job lost its runner (${url##*/})"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$reason" ]; then
+            say "No rerun: the run failed or was cancelled, but not because the box was lost (ordinary test failure or a manual cancel)."
+            exit 0
+          fi
+
+          # The run must still be the latest word on its commit.
+          case "$RUN_EVENT" in
+            pull_request)
+              if [ -z "$PR_NUMBER" ]; then say "No rerun: ${reason}, but the run names no pull request to check the head of."; exit 0; fi
+              current="$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq .head.sha)"
+              ;;
+            push)
+              current="$(gh api "repos/${REPO}/commits/main" --jq .sha)"
+              if [ "$HEAD_BRANCH" != "main" ]; then current="not-main"; fi
+              ;;
+            workflow_dispatch)
+              current="$HEAD_SHA"
+              ;;
+            *)
+              current="unknown-event"
+              ;;
+          esac
+          if [ "$current" != "$HEAD_SHA" ]; then
+            say "No rerun: ${reason}, but the head moved on (run ${HEAD_SHA}, now ${current}); the newer run covers it."
+            exit 0
+          fi
+
+          say "Rerunning run ${RUN_ID} once on GitHub-hosted runners: ${reason}."
+          if [ "$RUN_EVENT" = push ]; then
+            say "Note: this was a push to main. A rerun started with the workflow token may not fire the Release workflow; if Release does not start after attempt 2 passes, run it by dispatch (deploy/ci-runner/README.md, drill 7)."
+          fi
+          gh api -X POST "repos/${REPO}/actions/runs/${RUN_ID}/rerun"

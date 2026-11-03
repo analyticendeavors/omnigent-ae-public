@@ -1111,6 +1111,10 @@ PNG_KEEP = {
 }
 PNG_META = {b"tEXt", b"zTXt", b"iTXt", b"eXIf", b"iCCP"}
 WEBP_KEEP = {b"VP8 ", b"VP8L", b"VP8X", b"ALPH", b"ANIM", b"ANMF"}
+GIF_MAGIC = (b"GIF87a", b"GIF89a")
+# Frames the OCR step will dump from one file, counted from the file bytes before anything is
+# dumped. `media --max-run-frames N` adds a total across the run (the PR check sets it).
+MAX_OCR_FRAMES = 1000
 JPEG_DROP = {0xE1, *range(0xE2, 0xF0), 0xFE}
 TIFF_TAGS = {
     0x010E: "description",
@@ -1190,7 +1194,9 @@ def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, int, int]], int]
     if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
         raise ValueError("not a WebP")
     (riff,) = struct.unpack("<I", data[4:8])
-    limit = min(len(data), 8 + riff)
+    if 8 + riff > len(data):
+        raise ValueError("RIFF size past the end of the file")
+    limit = 8 + riff
     chunks = []
     at = 12
     while at < limit:
@@ -1206,35 +1212,130 @@ def _webp_chunks(data: bytes) -> tuple[list[tuple[bytes, bytes, int, int]], int]
     return chunks, len(data) - (8 + riff)
 
 
-def _gif_findings(data: bytes) -> list[MediaFinding]:
-    if data[:6] not in (b"GIF87a", b"GIF89a") or len(data) < 13:
+def _webp_sub_chunks(body: bytes) -> list[bytes]:
+    """The kinds of the sub-chunks inside an ANMF body, after its 16-byte frame header."""
+    if len(body) < 16:
+        raise ValueError("short ANMF")
+    kinds = []
+    at = 16
+    while at < len(body):
+        if at + 8 > len(body):
+            raise ValueError("truncated sub-chunk")
+        (length,) = struct.unpack("<I", body[at + 4 : at + 8])
+        if at + 8 + length > len(body):
+            raise ValueError("sub-chunk past its frame")
+        kinds.append(body[at : at + 4])
+        at += 8 + length + (length & 1)
+    return kinds
+
+
+def _alpha_placement_ok(kinds: list[bytes]) -> bool:
+    """At most one ALPH, and it sits directly before a lossy VP8 image."""
+    alphas = [i for i, kind in enumerate(kinds) if kind == b"ALPH"]
+    if len(alphas) > 1:
+        return False
+    return not alphas or (alphas[0] + 1 < len(kinds) and kinds[alphas[0] + 1] == b"VP8 ")
+
+
+def _webp_layout_findings(
+    chunks: list[tuple[bytes, bytes, int, int]], data: bytes
+) -> list[MediaFinding]:
+    """Structure only, no decoding: a WebP holds one image per frame. libwebp's still decoder
+    reads the first image and ignores the rest, so a second image would never reach OCR. Every
+    encoder in use (cwebp, img2webp, Pillow, ffmpeg) writes the plain layouts accepted here.
+    The key is the file's own hash, so an allowlist line covers that exact file only."""
+    key = "file:" + hashlib.sha256(data).hexdigest()
+    rules: list[str] = []
+
+    def add(rule: str) -> None:
+        if rule not in rules:
+            rules.append(rule)
+
+    kinds = [c[0] for c in chunks]
+    images = (b"VP8 ", b"VP8L")
+    if not kinds or kinds[0] not in (b"VP8 ", b"VP8L", b"VP8X"):
+        add("webp-layout")
+    elif kinds[0] != b"VP8X":
+        for kind in kinds[1:]:
+            add("webp-extra-image" if kind in (*images, b"ALPH", b"ANMF") else "webp-layout")
+    else:
+        flags = chunks[0][1][:1]
+        animated = bool(flags and flags[0] & 0x02)
+        frames = [c for c in chunks if c[0] == b"ANMF"]
+        if kinds.count(b"VP8X") != 1 or len(chunks[0][1]) < 10:
+            add("webp-layout")
+        if (
+            kinds.count(b"ANIM") > 1
+            or animated != bool(frames)
+            or (not animated and b"ANIM" in kinds)
+        ):
+            add("webp-layout")
+        top = [k for k in kinds if k in (*images, b"ALPH")]
+        if animated:
+            if top:
+                add("webp-extra-image")
+            for _, body, _, _ in frames:
+                subs = _webp_sub_chunks(body)
+                count = sum(1 for k in subs if k in images)
+                if any(k not in (*images, b"ALPH") for k in subs):
+                    add("webp-unknown-chunk")
+                if count > 1:
+                    add("webp-extra-image")
+                elif count == 0 or not _alpha_placement_ok(subs):
+                    add("webp-layout")
+        else:
+            count = sum(1 for k in kinds if k in images)
+            if count > 1:
+                add("webp-extra-image")
+            elif count == 0 or not _alpha_placement_ok(kinds):
+                add("webp-layout")
+    return [MediaFinding(rule, key) for rule in rules]
+
+
+def _gif_blocks(data: bytes) -> list[tuple[str, bytes]]:
+    """The GIF's blocks in order: ('image', b''), ('extension', label + application id) and a
+    last ('trailer', b'1') when bytes follow the trailer, else ('trailer', b'')."""
+    if data[:6] not in GIF_MAGIC or len(data) < 13:
         raise ValueError("not a GIF")
-    found = []
+    blocks: list[tuple[str, bytes]] = []
     flags = data[10]
     at = 13 + (3 * (2 << (flags & 7)) if flags & 0x80 else 0)
-
     while at < len(data):
         block = data[at]
         if block == 0x3B:
-            if at + 1 < len(data):
-                found.append(MediaFinding("gif-trailing-data", ""))
-            return found
+            blocks.append(("trailer", b"1" if at + 1 < len(data) else b""))
+            return blocks
         if block == 0x21 and at + 2 < len(data):
             label = data[at + 1]
-            if label == 0xFE:
-                found.append(MediaFinding("gif-comment", ""))
-            elif label == 0xFF:
-                app = data[at + 3 : at + 14]
-                if not app.startswith((b"NETSCAPE2.0", b"ANIMEXTS1.0")):
-                    found.append(MediaFinding("gif-application", ""))
-            elif label not in (0xF9,):
-                found.append(MediaFinding("gif-extension", ""))
+            blocks.append(("extension", bytes([label]) + data[at + 3 : at + 14]))
             at = _gif_skip(data, at)
         elif block == 0x2C:
+            blocks.append(("image", b""))
             at = _gif_image_end(data, at)
         else:
             raise ValueError("bad block")
     raise ValueError("no trailer")
+
+
+def _gif_findings(data: bytes) -> list[MediaFinding]:
+    found = []
+    for kind, info in _gif_blocks(data):
+        if kind == "trailer" and info:
+            found.append(MediaFinding("gif-trailing-data", ""))
+        elif kind == "extension":
+            label = info[0]
+            if label == 0xFE:
+                found.append(MediaFinding("gif-comment", ""))
+            elif label == 0xFF:
+                if not info[1:].startswith((b"NETSCAPE2.0", b"ANIMEXTS1.0")):
+                    found.append(MediaFinding("gif-application", ""))
+            elif label not in (0xF9,):
+                found.append(MediaFinding("gif-extension", ""))
+    return found
+
+
+def _gif_frame_count(data: bytes) -> int:
+    return sum(1 for kind, _ in _gif_blocks(data) if kind == "image")
 
 
 def _gif_skip(data: bytes, at: int) -> int:
@@ -1302,8 +1403,45 @@ def pdf_findings(data: bytes) -> list[MediaFinding]:
     return found
 
 
+def sniff_image(data: bytes) -> str:
+    """The suffix an image's own bytes call for ('' when they are not PNG, JPEG, WebP, GIF, TIFF
+    or BMP)."""
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return ".png"
+    if data[:3] == b"\xff\xd8\xff":
+        return ".jpg"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return ".webp"
+    if data[:6] in GIF_MAGIC:
+        return ".gif"
+    if data[:4] in (b"II*\x00", b"MM\x00*"):
+        return ".tif"
+    if (
+        data[:2] == b"BM"
+        and len(data) >= 18
+        and data[6:10] == b"\0\0\0\0"
+        and struct.unpack("<I", data[14:18])[0] in (12, 40, 52, 56, 64, 108, 124)
+    ):
+        return ".bmp"
+    return ""
+
+
 def media_findings(path: str, data: bytes) -> list[MediaFinding]:
+    """Findings by the file's suffix and, when its bytes are another image format, by the bytes
+    too, so a WebP or GIF renamed to .png, .ico or .map is read as what it is."""
     suffix = PurePosixPath(path).suffix.lower()
+    kinds = [suffix]
+    sniffed = sniff_image(data)
+    same = {(".jpg", ".jpeg"), (".tif", ".tiff")}
+    if sniffed and sniffed != suffix and (sniffed, suffix) not in same:
+        kinds.append(sniffed)
+    found = []
+    for kind in kinds:
+        found += _media_for(kind, data)
+    return found
+
+
+def _media_for(suffix: str, data: bytes) -> list[MediaFinding]:
     found = []
     try:
         if suffix == ".png":
@@ -1349,6 +1487,7 @@ def media_findings(path: str, data: bytes) -> list[MediaFinding]:
                     found.append(MediaFinding("webp-unknown-chunk", kind.decode("latin-1")))
             if trailing > 0:
                 found.append(MediaFinding("webp-trailing-data", ""))
+            found += _webp_layout_findings(chunks, data)
         elif suffix == ".gif":
             found += _gif_findings(data)
         elif suffix in (".tif", ".tiff"):
@@ -1358,7 +1497,7 @@ def media_findings(path: str, data: bytes) -> list[MediaFinding]:
         elif suffix == ".pdf":
             found += pdf_findings(data)
     except (ValueError, struct.error, IndexError):
-        found.append(MediaFinding("unparseable", "unparseable"))
+        found.append(MediaFinding("unparseable", "file:" + hashlib.sha256(data).hexdigest()))
     return found
 
 
@@ -1431,6 +1570,47 @@ def _is_animated_webp(data: bytes) -> bool:
     )
 
 
+def _is_gif(data: bytes) -> bool:
+    return data[:6] in GIF_MAGIC
+
+
+def ocr_frame_count(data: bytes) -> int:
+    """How many frames the OCR step would dump for these bytes (0 for a still image), counted
+    without decoding anything. A GIF whose blocks cannot be walked is a ScanError."""
+    if _is_gif(data):
+        try:
+            return _gif_frame_count(data)
+        except (ValueError, struct.error, IndexError) as err:
+            raise ScanError(
+                "A GIF is defective (its blocks do not parse), so its frames cannot be counted "
+                "or read. Re-export the GIF, or use --ocr off."
+            ) from err
+    if _is_animated_webp(data):
+        chunks, _ = _webp_chunks(data)
+        return sum(1 for c in chunks if c[0] == b"ANMF")
+    return 0
+
+
+def check_frame_budget(frames: list[tuple[str, int]], max_run: int | None = None) -> None:
+    """ScanError when one file (always) or the whole run (when *max_run* is set) has too many
+    frames; nothing is dumped yet."""
+    total = 0
+    for shown, count in frames:
+        if count > MAX_OCR_FRAMES:
+            raise ScanError(
+                f"{shown} has {count} frames; the limit is {MAX_OCR_FRAMES} per file. "
+                "Shorten the clip or lower its frame rate, and split the PR if needed."
+            )
+        total += count
+    if max_run is not None and total > max_run:
+        biggest = max(frames, key=lambda f: f[1])
+        raise ScanError(
+            f"These images have {total} frames in all; the limit is {max_run} per run "
+            f"(the largest is {biggest[0]} with {biggest[1]}). Split the PR so each run reads "
+            "fewer frames."
+        )
+
+
 def _tesseract_run(exe: str, image: Path, *, single_thread: bool = False) -> str:
     # Frames are read four at a time, so each tesseract keeps to one thread.
     env = {**os.environ, "OMP_THREAD_LIMIT": "1"} if single_thread else None
@@ -1450,12 +1630,13 @@ def _tesseract_run(exe: str, image: Path, *, single_thread: bool = False) -> str
     return done.stdout
 
 
-def _ocr_animated(exe: str, image: Path, tmp: str) -> str:
-    """Text from every distinct frame of an animated WebP, dumped to PNGs with anim_dump."""
+def _ocr_frames(exe: str, image: Path, tmp: str, kind: str) -> str:
+    """Text from every distinct frame of a GIF or animated WebP (*kind*, used in messages),
+    dumped to composited PNGs with anim_dump."""
     dump = shutil.which("anim_dump")
     if not dump:
         raise ScanError(
-            "anim_dump is not installed, so an animated WebP cannot be read. Install the "
+            f"anim_dump is not installed, so a {kind} cannot be read. Install the "
             "webp package (apt install webp) or use --ocr off."
         )
     folder = Path(tmp) / "frames"
@@ -1469,19 +1650,24 @@ def _ocr_animated(exe: str, image: Path, tmp: str) -> str:
         )
     except (subprocess.TimeoutExpired, OSError) as err:
         raise ScanError(
-            f"anim_dump could not read an animated WebP ({type(err).__name__}). "
+            f"anim_dump could not read a {kind} ({type(err).__name__}). "
             "Rerun with --ocr off or fix the webp install."
         ) from err
     if done.returncode != 0:
         raise ScanError(
-            f"anim_dump failed on an animated WebP (exit {done.returncode}). Rerun with "
-            "--ocr off or fix the webp install."
+            f"anim_dump failed on a {kind} (exit {done.returncode}): a defective GIF or WebP, "
+            "or a broken webp install. Rerun with --ocr off or fix the webp install."
         )
     frames: dict[str, Path] = {}
     for frame in sorted(folder.glob("*.png")):
         frames.setdefault(hashlib.sha256(frame.read_bytes()).hexdigest(), frame)
     if not frames:
-        raise ScanError("anim_dump wrote no frames for an animated WebP. Rerun with --ocr off.")
+        raise ScanError(f"anim_dump wrote no frames for a {kind}. Rerun with --ocr off.")
+    if len(list(folder.glob("*.png"))) > MAX_OCR_FRAMES:
+        raise ScanError(
+            f"anim_dump wrote more than {MAX_OCR_FRAMES} frames for a {kind}. Shorten the clip "
+            "or split the PR."
+        )
     pool = ThreadPoolExecutor(max_workers=4)
     try:
         texts = list(
@@ -1489,7 +1675,7 @@ def _ocr_animated(exe: str, image: Path, tmp: str) -> str:
         )
     except subprocess.TimeoutExpired as err:
         raise ScanError(
-            "tesseract timed out on a frame of an animated WebP. Rerun with --ocr off."
+            f"tesseract timed out on a frame of a {kind}. Rerun with --ocr off."
         ) from err
     finally:
         # One failed frame fails the scan, so the frames still queued are not read.
@@ -1500,7 +1686,8 @@ def _ocr_animated(exe: str, image: Path, tmp: str) -> str:
 def ocr_text(path: str, data: bytes) -> str | None:
     """Text tesseract reads from the image, or None when it is not installed.
 
-    An animated WebP is dumped to PNG frames first, since tesseract decodes only still WebP.
+    A GIF or animated WebP is dumped to composited PNG frames first, since tesseract decodes
+    only still images. The frame limits are checked from the bytes before anything is dumped.
     """
     exe = shutil.which("tesseract")
     if not exe:
@@ -1508,8 +1695,9 @@ def ocr_text(path: str, data: bytes) -> str | None:
     with tempfile.TemporaryDirectory() as tmp:
         image = Path(tmp) / ("image" + PurePosixPath(path).suffix.lower())
         image.write_bytes(data)
-        if _is_animated_webp(data):
-            return _ocr_animated(exe, image, tmp)
+        if _is_gif(data) or _is_animated_webp(data):
+            check_frame_budget([(PurePosixPath(path).name, ocr_frame_count(data))])
+            return _ocr_frames(exe, image, tmp, "GIF" if _is_gif(data) else "animated WebP")
         return _tesseract_run(exe, image)
 
 
@@ -1600,7 +1788,11 @@ def scan_blob(
 ) -> list[Hit]:
     hits = scanner.scan_path(path, commit)
     suffix = PurePosixPath(path).suffix.lower()
-    if suffix in MEDIA_SUFFIXES or suffix == ".pdf":
+    if (
+        suffix in MEDIA_SUFFIXES
+        or suffix == ".pdf"
+        or (suffix in SAFE_BINARY_SUFFIXES and sniff_image(data))
+    ):
         return hits + scan_media(scanner, path, data, commit)
     text = decode(data)
     if text is None:
@@ -1812,7 +2004,22 @@ def cmd_text(args: argparse.Namespace, scanner: Scanner, git: Git) -> list[Hit]:
     return hits
 
 
+def _media_frame_budget(args: argparse.Namespace, scanner: Scanner) -> None:
+    """Count every file's frames from its bytes before the first one is read or dumped."""
+    if args.ocr == "off" or not shutil.which("tesseract"):
+        return
+    counts = []
+    for name in args.files:
+        try:
+            data = Path(name).read_bytes()
+        except OSError:
+            continue  # the main loop reports it
+        counts.append((scanner.disp(name), ocr_frame_count(data)))
+    check_frame_budget(counts, args.max_run_frames)
+
+
 def cmd_media(args: argparse.Namespace, scanner: Scanner, git: Git) -> list[Hit]:  # noqa: ARG001
+    _media_frame_budget(args, scanner)
     hits = []
     for name in args.files:
         shown = scanner.disp(name)
@@ -2222,6 +2429,13 @@ def build_parser() -> argparse.ArgumentParser:
     media.add_argument("files", nargs="+")
     media.add_argument("--strip", action="store_true")
     media.add_argument("--ocr", choices=["auto", "off", "require"], default="auto")
+    media.add_argument(
+        "--max-run-frames",
+        type=int,
+        default=None,
+        metavar="N",
+        help="refuse a run whose OCR would read more than N frames in all (default: no total)",
+    )
     push = sub.add_parser("push", help="git pre-push mode: refs on stdin, remote name first")
     _common(push, top=False)
     push.add_argument("remote", nargs="*")

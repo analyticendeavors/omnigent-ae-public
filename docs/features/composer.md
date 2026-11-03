@@ -76,6 +76,13 @@ While a conversation compacts, a strip of colored token blocks sorts itself in t
 **Where:** The composer tray during /compact or an automatic compaction. Turn it off in Settings > Chat.<br>
 **Built from:** core patch [`0097`](../../patches/0097-ae-patch-Play-a-token-defrag-in-the-composer-tray-wh.patch)
 
+## Queued notes survive a reload
+
+A message you send while the chat is busy waits in the queue above the composer until the turn ends. The fork keeps up to 50 of those notes in the tab's session storage (each split-view pane keeps its own), so a reload, a phone discarding the tab, the automatic reload after a failed page chunk, or the reload an update notice asks for no longer loses them; past 50, newer notes stay in memory only and a reload loses them. After the reload each note comes back in its order, ahead of anything queued since. A text note under an hour old, queued under your sign-in in this tab, sends on its own as before. Any other note comes back waiting for Retry, with one toast saying why: one with attachments (attachments are not kept), an older one, one that already needed Retry, every note in a tab copied from another (they may also be waiting in the tab it came from), and every note when the browser cannot tell whether another tab holds them. A note waiting for Retry holds back the notes behind it in that chat until you retry or remove it. Each note remembers who queued it: one queued by someone else signed in on that browser is dropped, and when your sign-in cannot be confirmed within 10 seconds your notes wait, with a toast that says to reload rather than retype them. A note queued before the page knew who was signed in has no owner, so after the reload it comes back, waiting for Retry, to whoever is signed in then. A closed tab that is never reopened loses its notes, and nothing crosses devices.
+
+**Where:** The queued notes above the composer, after a reload.<br>
+**Built from:** core patches [`0285`](../../patches/0285-ae-patch-Keep-queued-notes-through-a-page-reload.patch), [`0286`](../../patches/0286-ae-patch-Fix-the-review-findings-on-keeping-queued-n.patch), [`0287`](../../patches/0287-ae-patch-Tell-the-user-when-queued-notes-wait-for-si.patch)
+
 ---
 
 Previous: [Session rail](session-rail.md) &middot; Next: [Action dock](action-dock.md)

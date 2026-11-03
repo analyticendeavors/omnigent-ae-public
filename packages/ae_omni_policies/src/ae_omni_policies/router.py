@@ -1688,6 +1688,8 @@ async def roles_put(
     old = (await asyncio.to_thread(role_prefs.store().get, who)).insights
     try:
         result = await asyncio.to_thread(role_prefs.store().put, who, body)
+    except role_prefs.RolesInvalid as exc:
+        return _error(422, ErrorCode.INVALID_INPUT, str(exc))
     except role_prefs.RolesSaveError as exc:
         return _error(503, role_prefs.CODE_NOT_SAVED, str(exc))
     if result.conflict:
@@ -4867,7 +4869,7 @@ async def family_cost_view(
     the store: it answers the last sweep (every 15 min), or ``{"state": "warming"}`` before the
     first one finishes. The answer stays under 30,000 characters (``truncated: true`` when the
     tail of the ranking was cut). ``unit_default`` and each family's ``flagged`` come from the
-    caller's own "Show cost as" and "Runaway family" settings.
+    caller's own settings: a family is flagged when its spend today passes either runaway amount.
     """
     if days not in family_cost.WINDOWS:
         return _error(422, "invalid_days", "days must be 7 or 30.")
@@ -4888,7 +4890,8 @@ async def family_cost_view(
         viewer=user,
         admin=verdict is True,
         unit=unit,
-        runaway=usd_limit if unit == "dollars" else tokens_limit,
+        runaway_tokens=tokens_limit,
+        runaway_usd=usd_limit,
         settings={"unit": unit, "runaway_tokens": tokens_limit, "runaway_usd": usd_limit},
     )
 
@@ -4915,6 +4918,8 @@ async def family_cost_settings_post(
         put = role_prefs.RolesPut.model_validate({**current.model_dump(), **fields})
         try:
             result = await asyncio.to_thread(role_prefs.store().put, who, put)
+        except role_prefs.RolesInvalid as exc:
+            return _error(422, ErrorCode.INVALID_INPUT, str(exc))
         except role_prefs.RolesSaveError as exc:
             return _error(503, role_prefs.CODE_NOT_SAVED, str(exc))
         if not result.conflict:

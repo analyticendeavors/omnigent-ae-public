@@ -153,19 +153,30 @@ def webp(*, exif: bool, xmp: bool) -> bytes:
     return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WEBP" + body
 
 
-def animated_webp(*, anim: bool = True) -> bytes:
-    """A WebP with the animation structure only; it has to parse, not decode."""
+def riff_chunk(kind: bytes, body: bytes, *, pad: bool = True) -> bytes:
+    pad_byte = b"\0" if (len(body) & 1 and pad) else b""
+    return kind + struct.pack("<I", len(body)) + body + pad_byte
 
-    def chunk(kind: bytes, body: bytes) -> bytes:
-        pad = b"\0" if len(body) & 1 else b""
-        return kind + struct.pack("<I", len(body)) + body + pad
 
-    body = chunk(b"VP8X", bytes([0x02]) + b"\0" * 9)
-    if anim:
-        body += chunk(b"ANIM", b"\0" * 6) + chunk(b"ANMF", b"\0" * 16 + b"pixeldata12")
-    else:
-        body += chunk(b"VP8 ", b"pixeldata12")
+def riff(*chunks: bytes) -> bytes:
+    body = b"".join(chunks)
     return b"RIFF" + struct.pack("<I", 4 + len(body)) + b"WEBP" + body
+
+
+def anmf(*subs: bytes) -> bytes:
+    """One animation frame: the 16-byte header, then its sub-chunks."""
+    return riff_chunk(b"ANMF", b"\0" * 16 + b"".join(subs))
+
+
+def animated_webp(*, anim: bool = True, frames: int = 1) -> bytes:
+    """A WebP with the animation structure only; it has to parse, not decode."""
+    chunks = [riff_chunk(b"VP8X", bytes([0x02]) + b"\0" * 9)]
+    if anim:
+        chunks.append(riff_chunk(b"ANIM", b"\0" * 6))
+        chunks += [anmf(riff_chunk(b"VP8 ", b"pixeldata12")) for _ in range(frames)]
+    else:
+        chunks.append(riff_chunk(b"VP8 ", b"pixeldata12"))
+    return riff(*chunks)
 
 
 # --- the classes -----------------------------------------------------------------------
@@ -603,9 +614,10 @@ def _fake_ocr_bin(
             "for n, body in enumerate((b'one', b'one', b'two')):\n"
             "    open(f'{a[1]}/{a[3]}{n:04d}.png', 'wb').write(body)\n",
         )
-    base = str(Path(shutil.which("git") or "/usr/bin/git").parent)
-    path = f"{fake_bin}{os.pathsep}{base}"
-    return {**os.environ, "PATH": path}, log
+    # Only git is linked in, so a real anim_dump or tesseract elsewhere on PATH is never found.
+    real_git = shutil.which("git") or "/usr/bin/git"
+    (fake_bin / "git").symlink_to(real_git)
+    return {**os.environ, "PATH": str(fake_bin)}, log
 
 
 def test_an_animated_webp_is_read_frame_by_frame(tmp_path: Path) -> None:
@@ -643,7 +655,10 @@ def test_the_vp8x_animation_flag_alone_takes_the_animated_path(tmp_path: Path) -
     image = tmp_path / "a.webp"
     image.write_bytes(animated_webp(anim=False))
     proc = scan("media", "--ocr", "require", str(image), env=env)
-    assert len(hit_lines(proc)) == 2, proc.stderr
+    # two frames of text, plus the layout and the top-level image of a file that says animated
+    assert len(hit_lines(proc)) == 4, proc.stderr
+    assert "media-metadata webp-layout" in proc.stdout
+    assert "media-metadata webp-extra-image" in proc.stdout
     assert len(log.read_text().splitlines()) == 2
 
 
@@ -1393,7 +1408,9 @@ def test_the_pr_scan_reads_changed_images_with_the_base_scanner() -> None:
     assert "${PRIVATE_REPO:?" in body and body.index("${PRIVATE_REPO:?") < body.index(
         '"$PRIVATE_REPO" = "true"'
     ), "an unset flag stops the job instead of running the generic classes"
-    assert "media --ocr require -- " in body, "a name that starts with a dash is not an option"
+    assert "media --ocr require --max-run-frames 4000 -- " in body, (
+        "the PR check caps the run total; a name that starts with a dash is not an option"
+    )
     assert "repository_id" not in str(ocr), "the repository id is computed once, in the scan step"
     assert "--denylist-b64-env DENYLIST_B64" in body and "--denylist-missing fail" in body
     assert "base-scanner/scripts/leak-allowlist.txt" in body, "the base allowlist is in force"
@@ -1415,6 +1432,16 @@ def test_the_image_listing_picks_changed_images_only(tmp_path: Path) -> None:
     (repo.path / "new\nline.gif").write_text("l")
     (repo.path / "phone.heic").write_text("h")
     (repo.path / "notes.md").write_text("n")
+    # images are also found by their first bytes, whatever the suffix
+    (repo.path / "hidden.woff").write_bytes(riff(riff_chunk(b"VP8 ", b"pixeldata12")))
+    (repo.path / "odd name.map").write_bytes(_gif())
+    (repo.path / "disguised.ico").write_bytes(png())
+    (repo.path / "photo.ttf").write_bytes(jpeg((0xE0, b"JFIF\0")))
+    (repo.path / "real.woff2").write_bytes(b"wOF2" + b"\0" * 40)
+    (repo.path / "empty.ico").write_bytes(b"")
+    (repo.path / "scan.dat").write_bytes(_tiff(0x0100))
+    (repo.path / "bitmap.dat").write_bytes(_bmp())
+    (repo.path / "notbmp.dat").write_bytes(b"BMW is a car maker, not an image, just text")
     repo.git("add", "-A")
     repo.git("commit", "-q", "-m", "Change things")
     head = repo.git("rev-parse", "HEAD")
@@ -1438,8 +1465,19 @@ def test_the_image_listing_picks_changed_images_only(tmp_path: Path) -> None:
     assert out.read_text().strip() == "any=true"
     listed = (tmp_path / "changed-images.txt").read_bytes().split(b"\0")[:-1]
     assert sorted(listed) == sorted(
-        [b"new.PNG", b"with space.jpeg", b"-dash.png", b"new\nline.gif"]
-    ), "heic, heif and avif are left to the metadata scan"
+        [
+            b"new.PNG",
+            b"with space.jpeg",
+            b"-dash.png",
+            b"new\nline.gif",
+            b"hidden.woff",
+            b"odd name.map",
+            b"disguised.ico",
+            b"photo.ttf",
+            b"scan.dat",
+            b"bitmap.dat",
+        ]
+    ), "heic, heif and avif are left to the metadata scan; renamed images are found by bytes"
     # A change with no image sets any=false.
     out.write_text("")
     env = {
@@ -1556,11 +1594,11 @@ def test_utf16_text_is_decoded_before_it_is_scanned(tmp_path: Path) -> None:
     assert proc.returncode == 1 and "lan-ip" in proc.stdout
 
 
-def _gif(*, comment: bool = False, trailing: bool = False) -> bytes:
+def _gif(*, comment: bool = False, trailing: bool = False, frames: int = 1) -> bytes:
     out = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0x80, 0, 0) + b"\x00\x00\x00\xff\xff\xff"
     if comment:
         out += b"\x21\xfe\x05hello\x00"
-    out += b"\x2c" + struct.pack("<HHHHB", 0, 0, 1, 1, 0) + b"\x02\x02\x44\x01\x00"
+    out += (b"\x2c" + struct.pack("<HHHHB", 0, 0, 1, 1, 0) + b"\x02\x02\x44\x01\x00") * frames
     out += b"\x3b"
     return out + (b"junk" if trailing else b"")
 
@@ -2936,8 +2974,15 @@ def test_the_backstop_passes_the_baseline_and_keys_its_cache_on_it() -> None:
     steps = _backstop_wf()["jobs"]["scan"]["steps"]
     run = next(s["run"] for s in steps if "UPSTREAM" in s.get("run", ""))
     assert '--baseline "$workspace/scripts/leak-fork-baseline.txt"' in run
-    cache = next(s for s in steps if "actions/cache" in s.get("uses", ""))["with"]
-    key = "fork-backstop-${{ hashFiles('scripts/leak-fork-baseline.txt') }}-"
+    # The scanned-tips cache (actions/cache@); the gate state uses cache/restore and cache/save.
+    cache = next(s for s in steps if "actions/cache@" in s.get("uses", ""))["with"]
+    # Every input of the verdict is in the key, so a change to any of them rescans old commits.
+    key = (
+        "fork-backstop-${{ hashFiles('scripts/leak-fork-baseline.txt') }}-"
+        "${{ hashFiles('scripts/leak-allowlist.txt') }}-"
+        "${{ vars.AE_LEAK_DENYLIST_SHA256 }}-"
+        "${{ hashFiles('scripts/leak-scan.py') }}-"
+    )
     assert cache["key"] == key + "${{ github.run_id }}" and cache["restore-keys"] == key
 
 
@@ -3025,3 +3070,364 @@ def test_the_docs_describe_the_fork_baseline() -> None:
         "public release",
     ):
         assert needle in section, needle
+
+
+# --- GIF frames, frame limits, WebP layout -----------------------------------------------------
+
+
+def test_a_gif_is_read_frame_by_frame(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    image = tmp_path / "a.gif"
+    image.write_bytes(_gif(frames=3))
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert len(hit_lines(proc)) == 2, proc.stderr  # two distinct fake frames
+    no_value_echoed(proc, "7.8.9")
+    lines = log.read_text().splitlines()
+    assert len(lines) == 2 and all(line.endswith(" 1") for line in lines)
+
+
+def test_a_single_frame_gif_still_goes_through_anim_dump(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    image = tmp_path / "a.gif"
+    image.write_bytes(_gif())
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert len(hit_lines(proc)) == 2, "the fake anim_dump wrote its three frames"
+    assert all(line.endswith(" 1") for line in log.read_text().splitlines())
+
+
+def test_a_gif_without_anim_dump_fails_closed(tmp_path: Path) -> None:
+    env, _ = _fake_ocr_bin(tmp_path, dump=False)
+    image = tmp_path / "a.gif"
+    image.write_bytes(_gif(frames=2))
+    for mode in ("require", "auto"):
+        proc = scan("media", "--ocr", mode, str(image), env=env)
+        assert proc.returncode == 2 and "webp" in proc.stderr, mode
+
+
+def test_a_gif_is_found_by_its_bytes_not_its_name(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    image = tmp_path / "a.png"
+    image.write_bytes(_gif(frames=2))
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert len(log.read_text().splitlines()) == 2, "the frames were read, not the file"
+    assert "media-metadata unparseable" in proc.stdout
+
+
+def test_a_failing_anim_dump_on_a_gif_is_a_failure(tmp_path: Path) -> None:
+    env, _ = _fake_ocr_bin(tmp_path, dump_exit=3)
+    image = tmp_path / "a.gif"
+    image.write_bytes(_gif(frames=2))
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert proc.returncode == 2 and "anim_dump failed" in proc.stderr
+    assert "defective GIF or WebP" in proc.stderr
+
+
+def test_a_gif_frame_tesseract_cannot_read_fails_the_scan(tmp_path: Path) -> None:
+    env, _ = _fake_ocr_bin(tmp_path, fail_on="f0002.png")
+    image = tmp_path / "a.gif"
+    image.write_bytes(_gif(frames=2))
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert proc.returncode == 2 and "tesseract failed" in proc.stderr
+
+
+def test_a_truncated_gif_is_defective_and_never_dumped(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    image = tmp_path / "a.gif"
+    image.write_bytes(_gif(frames=2)[:-9])
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert "Traceback" not in proc.stderr
+    assert proc.returncode == 2 and "defective" in proc.stderr
+    assert not log.exists(), "nothing was read"
+
+
+def test_too_many_frames_in_one_file_is_refused_before_any_dump(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    for name, data in (
+        ("a.webp", animated_webp(frames=1001)),
+        ("b.gif", _gif(frames=1001)),
+    ):
+        image = tmp_path / name
+        image.write_bytes(data)
+        proc = scan("media", "--ocr", "require", str(image), env=env)
+        assert proc.returncode == 2, name
+        assert "1001 frames" in proc.stderr and "split the PR" in proc.stderr, name
+    assert not log.exists(), "anim_dump and tesseract never ran"
+    ok = tmp_path / "c.gif"
+    ok.write_bytes(_gif(frames=1000))
+    assert (
+        scan("media", "--ocr", "require", str(ok), env=env).returncode == 1
+    )  # text hits, no error
+
+
+def _isolated_env(tmp_path: Path) -> dict:
+    """A PATH holding only git, so no tesseract or anim_dump from the host is found."""
+    bin_dir = tmp_path / "isolated"
+    bin_dir.mkdir()
+    (bin_dir / "git").symlink_to(shutil.which("git") or "/usr/bin/git")
+    return {**os.environ, "PATH": str(bin_dir)}
+
+
+def _five_big_gifs(tmp_path: Path) -> list[str]:
+    files = []
+    for n in range(5):
+        image = tmp_path / f"g{n}.gif"
+        image.write_bytes(_gif(frames=900))
+        files.append(str(image))
+    return files
+
+
+def test_the_run_total_of_frames_is_limited_only_when_asked(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    files = _five_big_gifs(tmp_path)
+    proc = scan("media", "--ocr", "require", "--max-run-frames", "4000", *files, env=env)
+    assert proc.returncode == 2 and "4500 frames in all" in proc.stderr
+    assert "split the pr" in proc.stderr.lower() and "g0.gif" in proc.stderr
+    assert not log.exists(), "refused before any dump"
+    # With tesseract absent nothing is dumped, so the total does not apply.
+    bare = _isolated_env(tmp_path)
+    assert (
+        scan("media", "--ocr", "auto", "--max-run-frames", "4000", *files, env=bare).returncode
+        == 0
+    )
+
+
+def test_without_the_run_flag_there_is_no_run_total(tmp_path: Path) -> None:
+    env, log = _fake_ocr_bin(tmp_path)
+    files = _five_big_gifs(tmp_path)  # 4500 frames across five files, 900 each
+    proc = scan("media", "--ocr", "require", *files, env=env)
+    assert "frames in all" not in proc.stderr and proc.returncode == 1
+    assert log.exists(), "the files were read"
+
+
+def _layout_rules(tmp_path: Path, data: bytes, name: str = "a.webp") -> list[str]:
+    return _media_rules(tmp_path, name, data)
+
+
+def _vp8() -> bytes:
+    return riff_chunk(b"VP8 ", b"pixeldata12")
+
+
+def _vp8l() -> bytes:
+    return riff_chunk(b"VP8L", b"pixeldata12")
+
+
+def _vp8x(flags: int = 0x00) -> bytes:
+    return riff_chunk(b"VP8X", bytes([flags]) + b"\0" * 9)
+
+
+def test_webp_layouts_that_hide_an_image_are_flagged_even_with_ocr_off(tmp_path: Path) -> None:
+    alph = riff_chunk(b"ALPH", b"alpha")
+    cases = {
+        "simple VP8L + VP8": (riff(_vp8l(), _vp8()), ["webp-extra-image"]),
+        "VP8X with two VP8": (riff(_vp8x(), _vp8(), _vp8()), ["webp-extra-image"]),
+        "ALPH after VP8": (riff(_vp8x(0x10), _vp8(), alph), ["webp-layout"]),
+        "two ALPH": (riff(_vp8x(0x10), alph, alph, _vp8()), ["webp-layout"]),
+        "ALPH before VP8L": (riff(_vp8x(0x10), alph, _vp8l()), ["webp-layout"]),
+        "animated with top-level VP8L": (
+            riff(_vp8x(0x02), riff_chunk(b"ANIM", b"\0" * 6), _vp8l(), anmf(_vp8())),
+            ["webp-extra-image"],
+        ),
+        "two images in one ANMF": (
+            riff(_vp8x(0x02), riff_chunk(b"ANIM", b"\0" * 6), anmf(_vp8(), _vp8l())),
+            ["webp-extra-image"],
+        ),
+        "unknown sub-chunk in an ANMF": (
+            riff(
+                _vp8x(0x02),
+                riff_chunk(b"ANIM", b"\0" * 6),
+                anmf(riff_chunk(b"ZZZZ", b"xx"), _vp8()),
+            ),
+            ["webp-unknown-chunk"],
+        ),
+        "ALPH after VP8 inside an ANMF": (
+            riff(_vp8x(0x02), riff_chunk(b"ANIM", b"\0" * 6), anmf(_vp8(), alph)),
+            ["webp-layout"],
+        ),
+        "ANMF with the flag clear": (
+            riff(_vp8x(0x00), riff_chunk(b"ANIM", b"\0" * 6), anmf(_vp8())),
+            ["webp-layout"],
+        ),
+        "first chunk is not an image": (
+            riff(riff_chunk(b"ZZZZ", b"xx"), _vp8()),
+            ["webp-layout", "webp-unknown-chunk"],
+        ),
+        "VP8X still with an unknown chunk before VP8": (
+            riff(_vp8x(), riff_chunk(b"ZZZZ", b"xx"), _vp8()),
+            ["webp-unknown-chunk"],
+        ),
+        "simple VP8 + EXIF": (
+            riff(_vp8(), riff_chunk(b"EXIF", b"Exif\0\0data")),
+            ["webp-exif", "webp-layout"],
+        ),
+    }
+    for label, (data, expected) in cases.items():
+        assert _layout_rules(tmp_path, data) == expected, label
+
+
+def test_plain_webp_layouts_pass(tmp_path: Path) -> None:
+    alph = riff_chunk(b"ALPH", b"alpha")
+    assert _layout_rules(tmp_path, riff(_vp8())) == []
+    assert _layout_rules(tmp_path, riff(_vp8l())) == []
+    assert _layout_rules(tmp_path, riff(_vp8x(0x10), alph, _vp8())) == []
+    assert _layout_rules(tmp_path, animated_webp(frames=3)) == []
+    framed = riff(_vp8x(0x12), riff_chunk(b"ANIM", b"\0" * 6), anmf(alph, _vp8()), anmf(_vp8l()))
+    assert _layout_rules(tmp_path, framed) == []
+
+
+def test_webp_chunk_padding_and_riff_sizes(tmp_path: Path) -> None:
+    odd = riff_chunk(b"VP8 ", b"pixeldata1")  # even body; use odd below
+    assert _layout_rules(tmp_path, riff(odd)) == []
+    # an odd body with its pad byte, and without the pad at the end of the file
+    assert _layout_rules(tmp_path, riff(riff_chunk(b"VP8 ", b"pixeldata123"))) == []
+    unpadded = riff(riff_chunk(b"VP8 ", b"pixeldata123", pad=False))
+    assert _layout_rules(tmp_path, unpadded) == []
+    padded = riff(riff_chunk(b"VP8 ", b"pixeldata123"))
+    # RIFF size smaller than the file: the bytes past it are trailing data
+    short = bytearray(padded + _vp8l())
+    assert _layout_rules(tmp_path, bytes(short)) == ["webp-trailing-data"]
+    # RIFF size past the end of the file: truncated, so unparseable
+    big = bytearray(padded)
+    struct.pack_into("<I", big, 4, len(padded) + 100)
+    assert _layout_rules(tmp_path, bytes(big)) == ["unparseable"]
+
+
+def test_a_damaged_anmf_is_unparseable(tmp_path: Path) -> None:
+    head = [_vp8x(0x02), riff_chunk(b"ANIM", b"\0" * 6)]
+    assert _layout_rules(tmp_path, riff(*head, riff_chunk(b"ANMF", b"\0" * 10))) == ["unparseable"]
+    past = riff_chunk(b"ANMF", b"\0" * 16 + b"VP8 " + struct.pack("<I", 500) + b"xx")
+    assert _layout_rules(tmp_path, riff(*head, past)) == ["unparseable"]
+
+
+def test_a_layout_finding_is_allowlisted_by_file_hash_only(tmp_path: Path) -> None:
+    data = riff(_vp8l(), _vp8())
+    path = tmp_path / "a.webp"
+    path.write_bytes(data)
+    hashed = scan(*NO_ALLOW, "media", "--ocr", "off", "--hash-hits", str(path))
+    found = re.search(r"sha256:([0-9a-f]{64})", hashed.stdout)
+    assert found
+    allow = write(tmp_path / "allow.txt", f"media-metadata sha256:{found.group(1)} # reviewed\n")
+    assert scan("--allowlist", str(allow), "media", "--ocr", "off", str(path)).returncode == 0
+    other = tmp_path / "b.webp"
+    other.write_bytes(riff(_vp8l(), riff_chunk(b"VP8 ", b"differentdat")))
+    assert scan("--allowlist", str(allow), "media", "--ocr", "off", str(other)).returncode == 1
+
+
+def test_a_renamed_image_is_read_by_its_bytes(tmp_path: Path) -> None:
+    hidden = riff(_vp8l(), _vp8())
+    for name in ("a.ico", "b.map", "c.woff", "d.ttf", "e.png"):
+        rules = _media_rules(tmp_path, name, hidden)
+        assert "webp-extra-image" in rules, name
+    assert _media_rules(tmp_path, "f.ico", _gif(comment=True)) == ["gif-comment"]
+    assert _media_rules(tmp_path, "g.map", png((b"tEXt", b"k\0v"))) == ["png-tEXt"]
+    assert _media_rules(tmp_path, "h.woff2", b"wOF2" + b"\0" * 40) == []
+
+
+def _bmp() -> bytes:
+    header = b"BM" + struct.pack("<IHHI", 58, 0, 0, 54)
+    return header + struct.pack("<IiiHHIIiiII", 40, 1, 1, 1, 24, 0, 4, 0, 0, 0, 0) + b"\0" * 4
+
+
+def test_a_renamed_tiff_or_bmp_is_read_by_its_bytes(tmp_path: Path) -> None:
+    mod = load_scanner()
+    assert mod.sniff_image(_bmp()) == ".bmp" and mod.sniff_image(_tiff(0x013B)) == ".tif"
+    assert mod.sniff_image(b"BMW is a car maker, not an image") == ""
+    assert _media_rules(tmp_path, "a.ico", _tiff(0x013B)) == ["tiff-artist"]
+    assert _media_rules(tmp_path, "b.map", _tiff(0x013B)) == ["tiff-artist"]
+    assert _media_rules(tmp_path, "c.ico", _bmp()) == []
+    assert _media_rules(tmp_path, "d.tiff", _tiff(0x013B)) == ["tiff-artist"], "no double count"
+
+
+def test_a_renamed_tiff_is_found_by_the_diff_scan(tmp_path: Path) -> None:
+    repo = Repo(tmp_path / "r")
+    base = repo.commit("Base", a="x\n")
+    (repo.path / "icon.ico").write_bytes(_tiff(0x013B))
+    (repo.path / "bmp.ico").write_bytes(_bmp())
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "Add")
+    proc = scan(*diff_args(repo, base), cwd=repo.path)
+    shown = hit_lines(proc)
+    assert any(h.startswith("icon.ico@") and "tiff-artist" in h for h in shown), proc.stdout
+    assert not any(h.startswith("bmp.ico") for h in shown)
+
+
+def test_an_unparseable_finding_is_keyed_to_the_file_hash(tmp_path: Path) -> None:
+    path = tmp_path / "a.png"
+    path.write_bytes(b"not an image")
+    hashed = scan(*NO_ALLOW, "media", "--ocr", "off", "--hash-hits", str(path))
+    found = re.search(r"sha256:([0-9a-f]{64})", hashed.stdout)
+    assert found
+    allow = write(tmp_path / "allow.txt", f"media-metadata sha256:{found.group(1)} # reviewed\n")
+    assert scan("--allowlist", str(allow), "media", "--ocr", "off", str(path)).returncode == 0
+    path.write_bytes(b"another non-image")
+    assert scan("--allowlist", str(allow), "media", "--ocr", "off", str(path)).returncode == 1
+
+
+def test_a_renamed_image_is_found_by_the_diff_scan(tmp_path: Path) -> None:
+    repo = Repo(tmp_path / "r")
+    base = repo.commit("Base", a="x\n")
+    (repo.path / "font.woff").write_bytes(riff(_vp8l(), _vp8()))
+    repo.git("add", "-A")
+    repo.git("commit", "-q", "-m", "Add")
+    proc = scan(*diff_args(repo, base), cwd=repo.path)
+    assert any("webp-extra-image" in h for h in hit_lines(proc)), proc.stdout
+
+
+def test_every_committed_webp_has_a_plain_layout() -> None:
+    mod = load_scanner()
+    files = sorted((ROOT / "docs" / "media").glob("*.webp"))
+    assert files, "docs/media holds the committed WebPs"
+    bad = []
+    for file in files:
+        rules = {f.rule for f in mod.media_findings(file.name, file.read_bytes())}
+        if rules & {"webp-layout", "webp-extra-image", "webp-unknown-chunk", "unparseable"}:
+            bad.append(file.name)
+    assert bad == []
+
+
+# The real anim_dump (webp package), on tiny generated files; skipped where it is not installed.
+real_dump = pytest.mark.skipif(shutil.which("anim_dump") is None, reason="anim_dump not installed")
+
+
+def _real_dump_env(tmp_path: Path) -> tuple[dict, Path]:
+    env, log = _fake_ocr_bin(tmp_path, dump=False)
+    dump = shutil.which("anim_dump")
+    assert dump
+    env["PATH"] = f"{env['PATH']}{os.pathsep}{Path(dump).parent}"
+    return env, log
+
+
+def _coloured_gif(*pixels: int) -> bytes:
+    """A 1x1 GIF per entry of *pixels* (palette index 0 to 3), so the frames differ."""
+    lzw = {0: 0x44, 1: 0x4C, 2: 0x54, 3: 0x5C}
+    palette = b"\x00\x00\x00\xff\xff\xff\xff\x00\x00\x00\x00\xff"
+    out = b"GIF89a" + struct.pack("<HHBBB", 1, 1, 0x81, 0, 0) + palette
+    for pixel in pixels:
+        out += b"\x2c" + struct.pack("<HHHHB", 0, 0, 1, 1, 0)
+        out += b"\x02\x02" + bytes([lzw[pixel]]) + b"\x01\x00"
+    return out + b"\x3b"
+
+
+@real_dump
+def test_the_real_anim_dump_reads_every_frame_of_a_gif(tmp_path: Path) -> None:
+    env, log = _real_dump_env(tmp_path)
+    image = tmp_path / "a.gif"
+    data = _coloured_gif(0, 1, 2)
+    image.write_bytes(data)
+    assert load_scanner().ocr_frame_count(data) == 3, "the byte walker sees three frames"
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert proc.returncode == 1, proc.stderr
+    assert len(log.read_text().splitlines()) == 3, "three different frames, three reads"
+    # and identical frames still dedupe to one read
+    log.unlink()
+    image.write_bytes(_coloured_gif(1, 1, 1))
+    scan("media", "--ocr", "require", str(image), env=env)
+    assert len(log.read_text().splitlines()) == 1
+
+
+@real_dump
+def test_the_real_anim_dump_rejects_a_defective_webp(tmp_path: Path) -> None:
+    env, _ = _real_dump_env(tmp_path)
+    image = tmp_path / "a.webp"
+    image.write_bytes(animated_webp(frames=2))  # parses, but the pixel data is not a bitstream
+    proc = scan("media", "--ocr", "require", str(image), env=env)
+    assert proc.returncode == 2 and "anim_dump" in proc.stderr

@@ -154,9 +154,11 @@ upstream's API-only landing page (`omnigent/server/static/api_only_landing.html`
 not the app. The build upstream's `setup.py` runs when `OMNIGENT_SKIP_WEB_UI` is
 unset is `pnpm install` followed by `pnpm --filter web run build`, both from
 `upstream/`, writing `upstream/omnigent/server/static/web-ui/`; after it, `just dev`
-serves the UI from that directory. Not yet documented: that local path has not been
-walked end to end from a fresh clone, so the supported way to run the fork with its
-UI is the published image (Quick start, above). To build your own, `just image` builds it (upstream's server image from the patched
+serves the UI from that directory. Walked end to end from a fresh clone of the
+public repo on 2026-10-31: `just setup`, the two `pnpm` commands, then `just dev`
+served the app at `http://127.0.0.1:6767/` and `/v1/ae/health` answered 200. A
+local server keeps its SQLite database, artifacts and pid files under `~/.omnigent`. The
+published image (Quick start, above) stays the supported way to run the fork. To build your own, `just image` builds it (upstream's server image from the patched
 tree, then the AE layer), `just image-smoke` proves it, and `deploy/README.md` is
 how to run it with compose.
 
@@ -266,7 +268,7 @@ just lint             # ruff over packages/ with upstream's rule set
 just test             # the AE packages' suites, on upstream's venv and fixtures
 just upstream-smoke   # upstream's policy and extension suites in our tree
 just web-check        # upstream's web lint and type-check, plus the vitest suites the patch series adds or touches (the list is the `web-test` recipe)
-just web-test 2/4     # one shard of those vitest suites (vitest --shard), as each CI web-test job runs them
+just web-test 2/4     # one shard of those vitest suites (vitest --shard); CI runs them all in the web job (`just web-test`)
 just ext-build        # rebuild the Parking Lot page's bundle (pnpm) and fail if the committed dist drifted
 just ext-doctor       # omni extensions list, omni extensions doctor analyticendeavors.parking-lot
 just dev              # omnigent server --config config/server.yaml, the page served from the package root on disk
@@ -368,11 +370,15 @@ reachability checks and the known gaps) is "Second user's host (container)" in
 | `patches` | the committed `patches/` match a fresh export, and the series applies onto the pristine tag and reproduces the fork branch tree |
 | `upstream-smoke` | upstream's `tests/policies` and `tests/extensions` pass in the pinned tree, plus `tests/server/test_item_observers.py`, the suite patch P3 adds |
 | `python` | `just lint`, `just test` and `just ext-doctor`: both AE packages against the pinned tree, on upstream's fixtures (the MCP server over the memory transport and a real stdio subprocess, the agent YAMLs through upstream's loader, the schedule seed against the app with the agents registered); `tests/deploy` over the compose override (`docker compose config` on the merged files), the systemd units, the scripts (`bash -n`, shellcheck), `image.yml` and `release.yml` (the repo's standards, actionlint) and the release tag decision in `scripts/next-release-tag.sh`; the extension installs and its bundle resolves |
-| `web` | `just web-lint` and `just ext-build`: upstream's web workspace, patches applied, passes its own lint and type-check, and the Parking Lot page's committed bundle matches a fresh build (node 22, pnpm 11.15.1 pinned) |
-| `web-test` | `just web-test <n>/4` in four parallel jobs: the vitest suites the patch series adds or touches are green, split with vitest's `--shard` so the web suites take about 4 minutes, not 10 (split out of `web` 2026-10-20) |
+| `web` | `just web-lint`, `just web-test` and `just ext-build`: upstream's web workspace, patches applied, passes its own lint and type-check, the vitest suites the patch series adds or touches are green, and the Parking Lot page's committed bundle matches a fresh build (node 22, pnpm 11.15.1 pinned). The vitest suites ran as four parallel jobs from 2026-10-20 to 2026-11-01; each repeated the install and cost more billed minutes than it saved |
 | `image` | the two-stage image builds; `omni --version` prints the pinned version; the extension catalog lists `analyticendeavors.parking-lot` and `doctor` resolves its bundle; both AE packages import; the agent specs are at `/opt/ae/agents` |
 | `rules` | the managed block in `CLAUDE.md` matches its source in ae-claude-skills |
 | `leaks` | `scripts/leak-scan.py` finds no internal identifier (IP, host, e-mail, home path, cloud id, private repository link, secret, binary or image metadata, a commit author that is not a noreply address, or a string from the private denylist) in any commit a PR brings (each one on its own, so a value added and removed still fails), its paths, messages, title and body; on a push to `main` it also scans the pushed commits and the whole tree. The base commit's scanner and allowlist run on a PR (`leak-pr.yml`); an allowlist entry a PR adds fails unless an approver labels it. Without the denylist secret it warns and runs the generic classes only. `docs/LEAK-SCAN.md` (added 2026-10-28) |
+
+Since 2026-11-01 the `patches`, `upstream-smoke`, `python`, `web` and `rules` jobs can run on
+self-hosted runners on the owner's box, with an automatic rerun on GitHub-hosted runners when
+the box is lost. It is off until the repository variable `CI_BOX_RUNNER` is `on`; the install,
+the kill switch and the drills are in `deploy/ci-runner/README.md`. The job names above do not change.
 
 `.github/workflows/image.yml` runs on a tag push `ae-vX.Y.Z.N` (and by hand as a dry
 run). It builds the two stages exactly as the `image` job does, runs the same smoke

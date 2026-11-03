@@ -1,0 +1,769 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 11:44:03 -0700
+Subject: [PATCH 268/289] [ae-patch] Queue Compact for a safe point and have
+ the chat save its notes first
+
+Compact no longer fires on the spot, and it works while the chat is running. Two
+clicks queue it for the open chat. When the chat is idle and quiet (no turn, no
+background shell, nothing waiting on the user or queued ahead) for two seconds, it
+gets one normal turn asking it to save what is worth keeping to memory or a
+handoff note; when that turn ends, the compact event goes out. The button shows
+Cancel while queued or saving, a failed step compacts nothing and says why, and
+leaving the chat drops the plan. The plan lives in the page, so a reload forgets it.
+---
+ web/src/components/AeActionDock.test.tsx      |  52 +++--
+ web/src/components/aeRail/AeCompactButton.tsx | 109 +++++----
+ .../components/aeRail/AeRailContext.test.tsx  |  22 +-
+ web/src/lib/aeCompactPlan.test.ts             | 174 ++++++++++++++
+ web/src/lib/aeCompactPlan.ts                  | 221 ++++++++++++++++++
+ 5 files changed, 501 insertions(+), 77 deletions(-)
+ create mode 100644 web/src/lib/aeCompactPlan.test.ts
+ create mode 100644 web/src/lib/aeCompactPlan.ts
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index ab4de9146e61e87c0baf800d3d242c0f23d79135..d887b4501d10b4f5e21f11d5b1cfa86974f3be1f 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -1,9 +1,15 @@
+ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import type * as PlanModule from "@/lib/aeCompactPlan";
+ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+ import { MemoryRouter, useLocation } from "react-router-dom";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++// The plan itself is covered in aeCompactPlan.test.ts; here the card only has to start it.
++vi.mock("@/lib/aeCompactPlan", async (importOriginal) => {
++  const real = await importOriginal<typeof PlanModule>();
++  return { ...real, startAeCompactPlan: vi.fn(real.startAeCompactPlan) };
++});
+ // The family read behind Switch account; the rows are the session list it would find.
+ const familyRows = vi.hoisted(() => ({ rows: [] as unknown[] }));
+ vi.mock("@/lib/aeFamilyRead", () => ({
+@@ -18,6 +24,7 @@ import { dismissAeSwitchFamily, useAeSwitchFamilyRequest } from "@/lib/aeSwitchF
+ import type { AePrCard } from "@/lib/aePrs";
+ import { ForkDialogContextProvider } from "@/shell/ForkDialogContext";
+ import { useChatStore } from "@/store/chatStore";
++import { resetAeCompactPlans, startAeCompactPlan } from "@/lib/aeCompactPlan";
+ import { aeRevealDock } from "@/lib/aeDockReveal";
+ import { AE_ACCOUNT_FOLLOW_UP_DELAYS_MS } from "@/lib/aeClaudeAccount";
+ import { AeActionDock } from "./AeActionDock";
+@@ -1059,6 +1066,11 @@ describe("the Compact card", () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() => json({ ok: true }));
+   });
+ 
++  afterEach(() => {
++    resetAeCompactPlans();
++    vi.mocked(startAeCompactPlan).mockClear();
++  });
++
+   it("shows the size and Compact and Not now when the label asks", async () => {
+     renderDock([], [], SUGGEST);
+     const lead = await screen.findByTestId("ae-dock-lead");
+@@ -1116,36 +1128,45 @@ describe("the Compact card", () => {
+     expect(view.container.querySelector("[data-testid=ae-dock-compact]")).toBeNull();
+   });
+ 
+-  it("Compact asks twice, compacts the open chat, then snoozes", async () => {
+-    const compact = vi.fn(() => Promise.resolve());
++  it("Compact asks twice, queues a compact for the open chat, then snoozes once it ran", async () => {
++    let ran: (() => void) | undefined;
++    vi.mocked(startAeCompactPlan).mockImplementationOnce((_id, done) => {
++      ran = done;
++    });
+     renderDock([], [], SUGGEST);
+-    useChatStore.setState({ compact });
+     const button = await screen.findByTestId("ae-dock-compact");
+     fireEvent.click(button);
+     expect(button.textContent).toBe("Compact now?");
+-    expect(compact).not.toHaveBeenCalled();
++    expect(startAeCompactPlan).not.toHaveBeenCalled();
+     fireEvent.click(button);
+-    expect(compact).toHaveBeenCalledTimes(1);
++    expect(startAeCompactPlan).toHaveBeenCalledTimes(1);
++    expect(vi.mocked(startAeCompactPlan).mock.calls[0]![0]).toBe("s1");
++    // Queued is not compacted: nothing is snoozed until the compact went out.
++    expect(snoozeCalls()).toHaveLength(0);
++    ran?.();
+     await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
+     expect(String(snoozeCalls()[0]![0])).toBe("/v1/ae/sessions/s1/handoff/snooze");
+   });
+ 
+-  it("does not snooze when the compact failed", async () => {
+-    const compact = vi.fn(() => Promise.reject(new Error("409 Conflict")));
++  it("a queued Compact shows Cancel, and a click cancels it", async () => {
+     renderDock([], [], SUGGEST);
+-    useChatStore.setState({ compact });
+     const button = await screen.findByTestId("ae-dock-compact");
+     fireEvent.click(button);
+     fireEvent.click(button);
+-    await screen.findByRole("alert");
+-    expect(snoozeCalls()).toHaveLength(0);
++    await waitFor(() => expect(button.textContent).toBe("Cancel compact"));
++    expect(button.getAttribute("data-compact-plan")).toBe("queued");
++    fireEvent.click(button);
++    await waitFor(() => expect(button.textContent).toBe("Compact"));
+   });
+ 
+-  it("disables Compact while the chat is running", async () => {
++  it("offers to queue Compact while the chat is running instead of disabling it", async () => {
+     renderDock([], [], SUGGEST);
+     act(() => useChatStore.setState({ sessionStatus: "running" }));
+     try {
+-      expect(await screen.findByTestId("ae-dock-compact")).toBeDisabled();
++      const button = await screen.findByTestId("ae-dock-compact");
++      expect(button).not.toBeDisabled();
++      fireEvent.click(button);
++      expect(button.textContent).toBe("Queue compact?");
+     } finally {
+       // The store keeps a per-session copy that the next render of "s1" would restore.
+       act(() => useChatStore.setState({ sessionStatus: "idle" }));
+@@ -1187,9 +1208,8 @@ describe("the Compact card", () => {
+     const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
+     window.addEventListener("omnigent:toast", listen);
+     try {
+-      const compact = vi.fn(() => Promise.resolve());
++      vi.mocked(startAeCompactPlan).mockImplementationOnce((_id, done) => done?.());
+       renderDock([], [], SUGGEST);
+-      useChatStore.setState({ compact });
+       const button = await screen.findByTestId("ae-dock-compact");
+       fireEvent.click(button);
+       fireEvent.click(button);
+@@ -1199,7 +1219,6 @@ describe("the Compact card", () => {
+           setTimeout(resolve, 20);
+         });
+       });
+-      expect(compact).toHaveBeenCalledTimes(1);
+       expect(seen).toEqual([]);
+     } finally {
+       window.removeEventListener("omnigent:toast", listen);
+@@ -1214,9 +1233,8 @@ describe("the Compact card", () => {
+     const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
+     window.addEventListener("omnigent:toast", listen);
+     try {
+-      const compact = vi.fn(() => Promise.resolve());
++      vi.mocked(startAeCompactPlan).mockImplementationOnce((_id, done) => done?.());
+       renderDock([], [], SUGGEST);
+-      useChatStore.setState({ compact });
+       const button = await screen.findByTestId("ae-dock-compact");
+       fireEvent.click(button);
+       fireEvent.click(button);
+diff --git a/web/src/components/aeRail/AeCompactButton.tsx b/web/src/components/aeRail/AeCompactButton.tsx
+index 01a9cb1967ec66ffc5837e8ca7114628e173fd8e..251ba891ef25ce87a327b828eaee9d63938c36f8 100644
+--- a/web/src/components/aeRail/AeCompactButton.tsx
++++ b/web/src/components/aeRail/AeCompactButton.tsx
+@@ -1,21 +1,19 @@
+-// Compact, two clicks (omnigent-ae). The rail's Context section and the action
+-// dock's Compact card both use it, so it lives in a file of its own: the vitest
+-// suites mock whole component modules, and a missing export fails every test that
+-// renders them.
++// Compact, queued (omnigent-ae). The rail's Context section and the action dock's
++// Compact card both use it, so it lives in a file of its own: the vitest suites mock
++// whole component modules, and a missing export fails every test that renders them.
+ 
+ import { useEffect, useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import { showToast } from "@/components/ui/toast";
+ import { aeSnoozeFailureIsQuiet, postAeHandoffSnooze } from "@/lib/aeCompactSuggestion";
++import { cancelAeCompactPlan, startAeCompactPlan, useAeCompactPlan } from "@/lib/aeCompactPlan";
+ import { useChatStore } from "@/store/chatStore";
+ 
+-type CompactPhase = "idle" | "confirm" | "running";
+-
+ /**
+- * Two clicks within three seconds compact the session, as /compact does. With
+- * `sessionId` (the dock card) it first checks the chat open in the store is that
+- * session, and snoozes the suggestion once the compact went out. Disabled while
+- * the chat is running, as the store refuses a compact then.
++ * Two clicks within three seconds queue a compact. It never runs on the spot: at a safe
++ * point the chat first saves what is worth keeping, then compacts (see aeCompactPlan.ts).
++ * A queued compact shows Cancel. With `sessionId` (the dock card) it first checks the chat
++ * open in the store is that session, and snoozes the suggestion once the compact went out.
+  */
+ export function AeCompactButton({
+   sessionId,
+@@ -24,64 +22,83 @@ export function AeCompactButton({
+   sessionId?: string;
+   testId?: string;
+ }) {
+-  const [phase, setPhase] = useState<CompactPhase>("idle");
++  const [confirming, setConfirming] = useState(false);
+   const [error, setError] = useState<string | null>(null);
++  const openId = useChatStore((s) => s.conversationId);
+   const busy = useChatStore((s) => s.status === "streaming" || s.sessionStatus === "running");
++  const targetId = sessionId ?? openId;
++  const plan = useAeCompactPlan(targetId);
+   useEffect(() => {
+-    if (phase !== "confirm") return undefined;
+-    const timer = window.setTimeout(() => setPhase("idle"), 3000);
++    if (!confirming) return undefined;
++    const timer = window.setTimeout(() => setConfirming(false), 3000);
+     return () => window.clearTimeout(timer);
+-  }, [phase]);
++  }, [confirming]);
+   const onClick = () => {
+-    if (phase === "idle") {
++    if (plan === "queued" || plan === "preparing") {
++      if (targetId) cancelAeCompactPlan(targetId);
++      return;
++    }
++    if (plan === "compacting") return;
++    if (!confirming) {
+       setError(null);
+-      setPhase("confirm");
++      setConfirming(true);
+       return;
+     }
+-    if (phase !== "confirm") return;
+-    const store = useChatStore.getState();
+-    if (sessionId && store.conversationId !== sessionId) {
++    setConfirming(false);
++    if (!openId || (sessionId && openId !== sessionId)) {
+       setError("This chat is not open here. Open it, then compact.");
+-      setPhase("idle");
+       return;
+     }
+-    setPhase("running");
+-    store.compact().then(
+-      () => {
+-        setPhase("idle");
+-        if (sessionId) {
+-          postAeHandoffSnooze(sessionId).catch((reason: unknown) => {
+-            if (aeSnoozeFailureIsQuiet(reason)) return;
+-            showToast(
+-              `Compacting started, but the card could not be snoozed (${
+-                reason instanceof Error ? reason.message : String(reason)
+-              }).`,
+-            );
+-          });
+-        }
+-      },
+-      (reason: unknown) => {
+-        const detail = reason instanceof Error ? reason.message : String(reason);
+-        setError(
+-          `Could not compact the session (${detail}). Try again, or send /compact from the composer.`,
+-        );
+-        setPhase("idle");
+-      },
++    startAeCompactPlan(
++      openId,
++      sessionId
++        ? () => {
++            postAeHandoffSnooze(sessionId).catch((reason: unknown) => {
++              if (aeSnoozeFailureIsQuiet(reason)) return;
++              showToast(
++                `Compacting started, but the card could not be snoozed (${
++                  reason instanceof Error ? reason.message : String(reason)
++                }).`,
++              );
++            });
++          }
++        : undefined,
+     );
+   };
++  const label =
++    plan === "queued"
++      ? "Cancel compact"
++      : plan === "preparing"
++        ? "Saving notes... Cancel"
++        : plan === "compacting"
++          ? "Compacting..."
++          : confirming
++            ? busy
++              ? "Queue compact?"
++              : "Compact now?"
++            : "Compact";
++  const title =
++    plan === "queued"
++      ? "Compact is queued. The chat saves its notes when it goes idle, then compacts."
++      : plan === "preparing"
++        ? "The chat is saving its notes. It compacts when that turn ends."
++        : busy
++          ? "The chat is running. Compact waits for a safe point."
++          : undefined;
+   return (
+     <>
+       <Button
+         type="button"
+         size="xs"
+-        variant={phase === "confirm" ? "destructive" : "outline"}
+-        disabled={phase === "running" || busy}
+-        title={busy ? "Compact is disabled while a chat is in progress" : undefined}
++        variant={confirming ? "destructive" : "outline"}
++        disabled={plan === "compacting"}
++        title={title}
+         onClick={onClick}
+         data-testid={testId}
++        data-compact-plan={plan ?? undefined}
+         className="shrink-0"
+       >
+-        {phase === "confirm" ? "Compact now?" : phase === "running" ? "Compacting..." : "Compact"}
++        {label}
+       </Button>
+       {error && (
+         <p role="alert" className="basis-full text-xs text-destructive">
+diff --git a/web/src/components/aeRail/AeRailContext.test.tsx b/web/src/components/aeRail/AeRailContext.test.tsx
+index b04dc486d60dc3d3a6a86c7967d6c4b72f8a599d..a725874714646f943eef0d73354ba54b85b42298 100644
+--- a/web/src/components/aeRail/AeRailContext.test.tsx
++++ b/web/src/components/aeRail/AeRailContext.test.tsx
+@@ -16,6 +16,7 @@ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
+ import { authenticatedFetch } from "@/lib/identity";
+ import { useAeSessionRailStore } from "@/lib/aeSessionRail";
+ import { useChatStore } from "@/store/chatStore";
++import { resetAeCompactPlans } from "@/lib/aeCompactPlan";
+ import { resetAeContextSnapshots } from "../aeContextUsage";
+ import { SNAPSHOT } from "../aeRailTestFixtures";
+ import { AeRailContext } from "./AeRailContext";
+@@ -254,7 +255,9 @@ describe("AeRailContext", () => {
+ });
+ 
+ describe("Compact session", () => {
+-  it("asks once, then compacts on the second click", async () => {
++  afterEach(() => resetAeCompactPlans());
++
++  it("asks once, then queues the compact on the second click, and a third cancels it", async () => {
+     const compact = vi.fn(() => Promise.resolve());
+     setSession("claude-native", { compact });
+     render(<AeRailContext sessionId={sessionId} />);
+@@ -262,10 +265,13 @@ describe("Compact session", () => {
+     expect(button.textContent).toBe("Compact");
+     fireEvent.click(button);
+     expect(button.textContent).toBe("Compact now?");
++    fireEvent.click(button);
++    // Queued, not compacted: the chat saves its notes at a safe point first.
++    await waitFor(() => expect(button.textContent).toBe("Cancel compact"));
+     expect(compact).not.toHaveBeenCalled();
+     fireEvent.click(button);
+-    expect(compact).toHaveBeenCalledTimes(1);
+     await waitFor(() => expect(button.textContent).toBe("Compact"));
++    expect(compact).not.toHaveBeenCalled();
+   });
+ 
+   it("drops the confirmation after three seconds", async () => {
+@@ -286,18 +292,6 @@ describe("Compact session", () => {
+     expect(compact).not.toHaveBeenCalled();
+   });
+ 
+-  it("says what failed when compaction is refused", async () => {
+-    const compact = vi.fn(() => Promise.reject(new Error("409 Conflict")));
+-    setSession("claude-native", { compact });
+-    render(<AeRailContext sessionId={sessionId} />);
+-    const button = await screen.findByTestId("ae-rail-compact");
+-    fireEvent.click(button);
+-    fireEvent.click(button);
+-    expect((await screen.findByRole("alert")).textContent).toBe(
+-      "Could not compact the session (409 Conflict). Try again, or send /compact from the composer.",
+-    );
+-  });
+-
+   it("reads nothing from the store for a session the composer is not on", async () => {
+     vi.mocked(authenticatedFetch).mockImplementation(() => json(snapshotNow()));
+     setSession("claude-native");
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..530fb0951d855b9ef5320bc147683637828923b3
+--- /dev/null
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -0,0 +1,174 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { useChatStore } from "@/store/chatStore";
++import {
++  AE_COMPACT_PREP_TEXT,
++  AE_COMPACT_START_LIMIT_MS,
++  cancelAeCompactPlan,
++  resetAeCompactPlans,
++  startAeCompactPlan,
++} from "./aeCompactPlan";
++
++const ID = "conv_plan";
++
++function setChat(patch: Record<string, unknown> = {}) {
++  useChatStore.setState({
++    conversationId: ID,
++    boundAgentId: "agent_1",
++    status: "idle",
++    sessionStatus: "idle",
++    backgroundTasks: [],
++    queuedMessages: [],
++    ...patch,
++  } as never);
++}
++
++const toasts: string[] = [];
++const listen = (event: Event) => toasts.push(String((event as CustomEvent).detail.content));
++
++let send: ReturnType<typeof vi.fn>;
++let compact: ReturnType<typeof vi.fn>;
++
++async function tick(ms: number) {
++  await vi.advanceTimersByTimeAsync(ms);
++}
++
++beforeEach(() => {
++  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
++  toasts.length = 0;
++  window.addEventListener("omnigent:toast", listen);
++  // A real turn flips the session to running as soon as the message lands.
++  send = vi.fn(() => {
++    setChat({ sessionStatus: "running" });
++    return Promise.resolve();
++  });
++  compact = vi.fn(() => Promise.resolve());
++  useChatStore.setState({ send, compact } as never);
++  setChat();
++});
++
++afterEach(() => {
++  resetAeCompactPlans();
++  window.removeEventListener("omnigent:toast", listen);
++  vi.useRealTimers();
++});
++
++describe("queued compact", () => {
++  it("asks the chat to save its notes at a safe point, then compacts when that turn ends", async () => {
++    const done = vi.fn();
++    startAeCompactPlan(ID, done);
++    expect(send).not.toHaveBeenCalled();
++    await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
++    expect(send.mock.calls[0]![0]).toBe(AE_COMPACT_PREP_TEXT);
++    expect(send.mock.calls[0]![1]).toBe("agent_1");
++    expect(compact).not.toHaveBeenCalled();
++    // The prepare turn ends.
++    setChat({ sessionStatus: "idle" });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++    expect(done).toHaveBeenCalledTimes(1);
++  });
++
++  it("waits out a running turn and only counts quiet time from its end", async () => {
++    setChat({ status: "streaming", sessionStatus: "running" });
++    startAeCompactPlan(ID);
++    await tick(10_000);
++    expect(send).not.toHaveBeenCalled();
++    setChat();
++    await tick(1500);
++    // Busy again before the quiet period ran out: the clock restarts.
++    setChat({ sessionStatus: "running" });
++    setChat();
++    await tick(1500);
++    expect(send).not.toHaveBeenCalled();
++    await tick(500);
++    expect(send).toHaveBeenCalledTimes(1);
++  });
++
++  it.each([
++    ["a background shell is running", { backgroundTasks: [{ status: "running" }] }],
++    ["the chat waits on the user", { sessionStatus: "waiting" }],
++    [
++      "a message is queued ahead",
++      { queuedMessages: [{ queueId: "q1", text: "next", conversationId: ID }] },
++    ],
++  ])("is not a safe point while %s", async (_name, patch) => {
++    setChat(patch);
++    startAeCompactPlan(ID);
++    await tick(10_000);
++    expect(send).not.toHaveBeenCalled();
++    setChat();
++    await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
++  });
++
++  it("queues one compact per chat", async () => {
++    startAeCompactPlan(ID);
++    startAeCompactPlan(ID);
++    await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
++  });
++
++  it("cancels cleanly before the safe point", async () => {
++    startAeCompactPlan(ID);
++    cancelAeCompactPlan(ID);
++    await tick(10_000);
++    expect(send).not.toHaveBeenCalled();
++    expect(compact).not.toHaveBeenCalled();
++  });
++
++  it("cancels while the chat is saving its notes, and never compacts", async () => {
++    startAeCompactPlan(ID);
++    await tick(2000);
++    cancelAeCompactPlan(ID);
++    setChat({ sessionStatus: "idle" });
++    await tick(10_000);
++    expect(compact).not.toHaveBeenCalled();
++  });
++
++  it("drops the plan, with a toast, when the user leaves the chat", async () => {
++    startAeCompactPlan(ID);
++    setChat({ conversationId: "conv_other" });
++    await tick(10_000);
++    expect(send).not.toHaveBeenCalled();
++    expect(toasts.join("\n")).toContain("you left the chat");
++  });
++
++  it("compacts nothing when the prepare turn never starts", async () => {
++    send.mockImplementation(() => Promise.resolve());
++    startAeCompactPlan(ID);
++    await tick(2000);
++    expect(send).toHaveBeenCalledTimes(1);
++    await tick(AE_COMPACT_START_LIMIT_MS + 4000);
++    expect(compact).not.toHaveBeenCalled();
++    expect(toasts.join("\n")).toContain("never started saving its notes");
++  });
++
++  it("compacts nothing when the prepare message cannot be sent", async () => {
++    send.mockImplementation(() => Promise.reject(new Error("503 Unavailable")));
++    startAeCompactPlan(ID);
++    await tick(2000);
++    expect(compact).not.toHaveBeenCalled();
++    expect(toasts.join("\n")).toContain("503 Unavailable");
++  });
++
++  it("compacts nothing when the chat has no agent to ask", async () => {
++    setChat({ boundAgentId: null });
++    startAeCompactPlan(ID);
++    await tick(2000);
++    expect(send).not.toHaveBeenCalled();
++    expect(toasts.join("\n")).toContain("no agent");
++  });
++
++  it("says what failed when the compact is refused, and does not call the after hook", async () => {
++    compact.mockImplementation(() => Promise.reject(new Error("409 Conflict")));
++    const done = vi.fn();
++    startAeCompactPlan(ID, done);
++    await tick(2000);
++    setChat({ sessionStatus: "idle" });
++    await tick(2000);
++    expect(compact).toHaveBeenCalledTimes(1);
++    expect(done).not.toHaveBeenCalled();
++    expect(toasts.join("\n")).toContain("Could not compact the session (409 Conflict)");
++  });
++});
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..b274c0be6c3ab18fd05b5420d2acf4f71a9d0f38
+--- /dev/null
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -0,0 +1,221 @@
++// Queued compact (omnigent-ae). Clicking Compact never compacts on the spot: it queues a
++// plan for the open chat. At a safe point (the chat idle and quiet) the chat gets one
++// normal turn that asks it to save what is worth keeping, and only when that turn ends
++// does the compact event go out. The plan lives in the page: a reload forgets it, and
++// nothing compacts by accident.
++//
++// The driver is module level, not a component effect, so folding the rail or losing the
++// dock card never drops a queued compact.
++
++import { useSyncExternalStore } from "react";
++import { showToast } from "@/components/ui/toast";
++import { useChatStore } from "@/store/chatStore";
++
++export type AeCompactPhase = "queued" | "preparing" | "compacting";
++
++/** The text the chat gets at the safe point. */
++export const AE_COMPACT_PREP_TEXT =
++  "Compaction runs right after this turn. Save anything worth keeping to memory or a handoff note now: " +
++  "decisions and why, open work, file paths, what to do next. Start no new work and do not compact yourself. " +
++  "Reply with one line, 'ready', when you are done.";
++
++/** The chat must stay idle this long before a step goes ahead (turns hand off to queued work). */
++export const AE_COMPACT_STABLE_MS = 2000;
++/** The prepare turn never started within this long: give up, compact nothing. */
++export const AE_COMPACT_START_LIMIT_MS = 30_000;
++/** The prepare turn never finished within this long: give up, compact nothing. */
++export const AE_COMPACT_PREP_LIMIT_MS = 15 * 60_000;
++
++interface Plan {
++  phase: AeCompactPhase;
++  sawBusy: boolean;
++  preparingSince: number;
++  stableTimer: ReturnType<typeof setTimeout> | null;
++  limitTimer: ReturnType<typeof setTimeout> | null;
++  onCompacted?: () => void;
++}
++
++const plans = new Map<string, Plan>();
++const listeners = new Set<() => void>();
++let unsubscribe: (() => void) | null = null;
++
++function emit() {
++  for (const listener of listeners) listener();
++}
++
++type StoreState = ReturnType<typeof useChatStore.getState>;
++
++/** Idle and quiet: no turn, nothing waiting on the user, no background shell, nothing queued. */
++function safeNow(s: StoreState, conversationId: string): boolean {
++  if (s.status === "streaming") return false;
++  if (s.sessionStatus !== "idle") return false;
++  if (s.backgroundTasks.some((t) => t.status === "running")) return false;
++  return !s.queuedMessages.some((m) => m.conversationId === conversationId);
++}
++
++function clearTimers(plan: Plan) {
++  if (plan.stableTimer) clearTimeout(plan.stableTimer);
++  if (plan.limitTimer) clearTimeout(plan.limitTimer);
++  plan.stableTimer = null;
++  plan.limitTimer = null;
++}
++
++function finish(conversationId: string) {
++  const plan = plans.get(conversationId);
++  if (!plan) return;
++  clearTimers(plan);
++  plans.delete(conversationId);
++  if (plans.size === 0 && unsubscribe) {
++    unsubscribe();
++    unsubscribe = null;
++  }
++  emit();
++}
++
++function fail(conversationId: string, message: string) {
++  finish(conversationId);
++  showToast(message);
++}
++
++function reason(error: unknown): string {
++  return error instanceof Error ? error.message : String(error);
++}
++
++async function advance(conversationId: string) {
++  const plan = plans.get(conversationId);
++  if (!plan) return;
++  const store = useChatStore.getState();
++  if (store.conversationId !== conversationId || !safeNow(store, conversationId)) return;
++  if (plan.phase === "queued") {
++    const agentId = store.boundAgentId;
++    if (agentId === null) {
++      fail(conversationId, "Compact cancelled: this chat has no agent to ask to save its notes.");
++      return;
++    }
++    plan.phase = "preparing";
++    plan.sawBusy = false;
++    plan.preparingSince = Date.now();
++    plan.limitTimer = setTimeout(
++      () => fail(conversationId, "Compact cancelled: the chat took too long to save its notes."),
++      AE_COMPACT_PREP_LIMIT_MS,
++    );
++    emit();
++    // If the prepare turn never shows as running, this re-checks until the start limit.
++    schedule(conversationId, plan);
++    try {
++      await store.send(AE_COMPACT_PREP_TEXT, agentId, undefined, {
++        onError: (error: unknown) => {
++          if (plans.get(conversationId) === plan) {
++            fail(
++              conversationId,
++              `Compact cancelled: could not ask the chat to save its notes (${reason(error)}).`,
++            );
++          }
++        },
++      });
++    } catch (error) {
++      if (plans.get(conversationId) === plan) {
++        fail(
++          conversationId,
++          `Compact cancelled: could not ask the chat to save its notes (${reason(error)}).`,
++        );
++      }
++    }
++    return;
++  }
++  if (plan.phase !== "preparing") return;
++  if (!plan.sawBusy) {
++    // Idle before the prepare turn ever showed as running: wait for it, up to the start limit.
++    if (Date.now() - plan.preparingSince > AE_COMPACT_START_LIMIT_MS) {
++      fail(conversationId, "Compact cancelled: the chat never started saving its notes.");
++    } else {
++      schedule(conversationId, plan);
++    }
++    return;
++  }
++  plan.phase = "compacting";
++  if (plan.limitTimer) clearTimeout(plan.limitTimer);
++  plan.limitTimer = null;
++  emit();
++  try {
++    await store.compact();
++    const done = plan.onCompacted;
++    finish(conversationId);
++    done?.();
++  } catch (error) {
++    fail(
++      conversationId,
++      `Could not compact the session (${reason(error)}). Try again, or send /compact from the composer.`,
++    );
++  }
++}
++
++function schedule(conversationId: string, plan: Plan) {
++  if (plan.stableTimer) clearTimeout(plan.stableTimer);
++  plan.stableTimer = setTimeout(() => {
++    plan.stableTimer = null;
++    void advance(conversationId);
++  }, AE_COMPACT_STABLE_MS);
++}
++
++/** Runs on every store change: re-arms the quiet timer while idle, cancels it while busy. */
++function onStore() {
++  const store = useChatStore.getState();
++  for (const [conversationId, plan] of [...plans]) {
++    if (plan.phase === "compacting") continue;
++    if (store.conversationId !== conversationId) {
++      fail(conversationId, "Compact cancelled: you left the chat before it ran.");
++      continue;
++    }
++    if (safeNow(store, conversationId)) {
++      if (!plan.stableTimer) schedule(conversationId, plan);
++    } else {
++      if (plan.stableTimer) clearTimeout(plan.stableTimer);
++      plan.stableTimer = null;
++      if (plan.phase === "preparing") plan.sawBusy = true;
++    }
++  }
++}
++
++/** Queue a compact for the chat. A chat that already has one queued is left alone. */
++export function startAeCompactPlan(conversationId: string, onCompacted?: () => void): void {
++  if (plans.has(conversationId)) return;
++  const plan: Plan = {
++    phase: "queued",
++    sawBusy: false,
++    preparingSince: 0,
++    stableTimer: null,
++    limitTimer: null,
++    onCompacted,
++  };
++  plans.set(conversationId, plan);
++  unsubscribe ??= useChatStore.subscribe(onStore);
++  emit();
++  onStore();
++}
++
++/** Cancel a plan before it compacts. Once the compact event is going out it cannot be stopped. */
++export function cancelAeCompactPlan(conversationId: string): void {
++  const plan = plans.get(conversationId);
++  if (!plan || plan.phase === "compacting") return;
++  finish(conversationId);
++}
++
++/** Where the chat's plan stands, or `null` when none is queued. */
++export function useAeCompactPlan(conversationId: string | null | undefined): AeCompactPhase | null {
++  return useSyncExternalStore(
++    (listener) => {
++      listeners.add(listener);
++      return () => {
++        listeners.delete(listener);
++      };
++    },
++    () => (conversationId ? (plans.get(conversationId)?.phase ?? null) : null),
++    () => null,
++  );
++}
++
++/** Test helper: drop every plan without a toast. */
++export function resetAeCompactPlans(): void {
++  for (const id of [...plans.keys()]) finish(id);
++}

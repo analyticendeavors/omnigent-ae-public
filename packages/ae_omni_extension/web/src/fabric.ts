@@ -152,7 +152,7 @@ import {
 import { copyText } from "./lot";
 import { activateSecrets, deactivateSecrets, secretsSection } from "./secrets";
 import { activateGit, deactivateGit, gitSection } from "./git";
-import { activateFamilyCost, deactivateFamilyCost, familyCostSection } from "./familyCost";
+import { activateFamilyCost, deactivateFamilyCost } from "./familyCost";
 import { activatePresets, deactivatePresets, presetsSection } from "./presets";
 import { activateVault, deactivateVault, loadVaultView, vaultSection } from "./vault";
 import { loadSectionState } from "./sections";
@@ -1294,7 +1294,6 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const vaultBody = vaultSection();
   const gitBody = gitSection();
   const presetsBody = presetsSection();
-  const familyBody = familyCostSection();
   // The card headers carry one "Updated" each: Fabric's on Compute, the host's on Box health.
   databricks.querySelector(".dbx-refreshed")?.remove();
   monitor.querySelector(".bh-refreshed")?.remove();
@@ -1338,17 +1337,10 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   );
   const presets = adminCard(
     "presets",
-    "Presets",
+    "Spend",
     chartBarIcon(16),
-    [presetsBody.querySelector(".presets-refreshed")],
+    [presetsBody.querySelector(".spend-info"), presetsBody.querySelector(".presets-refreshed")],
     presetsBody,
-  );
-  const family = adminCard(
-    "family",
-    "Family cost",
-    coinIcon(),
-    [familyBody.querySelector(".family-refreshed")],
-    familyBody,
   );
   const box = adminCard(
     "box",
@@ -1389,7 +1381,6 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     vault,
     git,
     presets,
-    family,
   });
   stopBoard = layout.stop;
   active = true;
@@ -1505,7 +1496,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   activateVault(context, vault);
   activateGit(context, git);
   activatePresets(context, presets);
-  activateFamilyCost(context, family);
+  activateFamilyCost(context, presets);
   const live = () => active && mine === activations;
   registerRefresh("fabric", () => (live() ? refresh() : undefined));
   onFocus = () => {

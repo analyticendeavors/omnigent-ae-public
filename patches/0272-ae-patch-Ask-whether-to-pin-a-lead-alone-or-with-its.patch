@@ -1,0 +1,1294 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 13:01:06 -0700
+Subject: [PATCH 272/289] [ae-patch] Ask whether to pin a lead alone or with
+ its whole family, and keep the tree in Pinned
+
+Pinning or unpinning a session that leads a family now asks, in a dialog,
+whether to take only the parent or the whole family. Settings > Chat > Pin a
+lead's family has three choices: Ask each time (the new default; the old Off
+reads as this), Always the whole family (the old On) and Only the parent.
+Pinned draws a pinned family as a tree at its lead's pin slot, and dragging
+the lead moves the whole family.
+---
+ web/src/lib/aeFamilyTree.test.ts              |  35 ++++
+ web/src/lib/aeFamilyTree.ts                   |  65 +++++++
+ web/src/lib/aePinFamily.ts                    |  30 +--
+ web/src/lib/aePinFamilyChoice.ts              |  53 ++++++
+ web/src/lib/aeSettingHints.ts                 |   4 +-
+ .../settings/AeChatSettingsSection.test.tsx   |  16 +-
+ web/src/pages/settings/AePinFamilySetting.tsx |  27 +--
+ web/src/shell/AeFamilyTree.tsx                |   9 +
+ web/src/shell/AePinFamilyChoice.test.tsx      |  76 ++++++++
+ web/src/shell/AePinFamilyChoice.tsx           |  57 ++++++
+ web/src/shell/AppShell.tsx                    |   2 +
+ web/src/shell/HeaderConversationMenu.test.tsx |  11 +-
+ .../shell/Sidebar.aePinnedFamilies.test.tsx   | 176 ++++++++++++++++++
+ web/src/shell/Sidebar.rowActions.test.tsx     |  11 +-
+ web/src/shell/Sidebar.tsx                     |  84 ++++++---
+ web/src/shell/aePinFamily.test.ts             | 115 +++++++++++-
+ web/src/shell/aePinFamily.ts                  |  51 +++--
+ 17 files changed, 735 insertions(+), 87 deletions(-)
+ create mode 100644 web/src/lib/aePinFamilyChoice.ts
+ create mode 100644 web/src/shell/AePinFamilyChoice.test.tsx
+ create mode 100644 web/src/shell/AePinFamilyChoice.tsx
+ create mode 100644 web/src/shell/Sidebar.aePinnedFamilies.test.tsx
+
+diff --git a/web/src/lib/aeFamilyTree.test.ts b/web/src/lib/aeFamilyTree.test.ts
+index 966920890aee11891d75a64c5c16e5a3664169c9..47df41fd0bc256ed26d526ea84b994df99500f66 100644
+--- a/web/src/lib/aeFamilyTree.test.ts
++++ b/web/src/lib/aeFamilyTree.test.ts
+@@ -7,6 +7,7 @@ import {
+   AE_FAMILIES_SECTION,
+   AE_FAMILY_REST_SECTION,
+   aeFamilyTree,
++  aePinnedTree,
+   aeWithFamiliesSection,
+   resetAeFamilyFoldsCache,
+   toggleAeFamilyFold,
+@@ -391,3 +392,37 @@ describe("aeFamilyTree closed rows", () => {
+     expect(tree.leads.get("lead")!.archivedCapped).toBe(true);
+   });
+ });
++
++describe("aePinnedTree", () => {
++  const tree = (pinned: Conversation[], folded: string[] = []) =>
++    aePinnedTree(pinned, aeFamilies(pinned, true), new Set(folded));
++
++  it("seats a family at its lead's pin slot, children under it in tree order", () => {
++    const pinned = [row("lead"), row("solo"), row("kid", orch("lead")), row("grand", orch("kid"))];
++    const out = tree(pinned);
++    expect(out.rows.map((c) => c.id)).toEqual(["lead", "kid", "grand", "solo"]);
++    expect(out.top.map((c) => c.id)).toEqual(["lead", "solo"]);
++    expect([...out.children]).toEqual(["kid", "grand"]);
++    expect(out.tree?.rows.get("grand")?.depth).toBe(2);
++  });
++
++  it("leaves a child pinned without its lead, a lone lead and a reference session flat", () => {
++    const pinned = [
++      row("kid", orch("gone")),
++      row("lone"),
++      row("lead2"),
++      row("ref", { ...orch("lead2"), "ae.status": "reference" }),
++    ];
++    const out = tree([...pinned, row("other", orch("lone-x"))]);
++    expect(out.tree).toBeNull();
++    expect(out.rows.map((c) => c.id)).toEqual(["kid", "lone", "lead2", "ref", "other"]);
++    expect(out.top).toHaveLength(5);
++  });
++
++  it("keeps only the lead of a folded family", () => {
++    const out = tree([row("lead"), row("kid", orch("lead")), row("solo")], ["lead"]);
++    expect(out.rows.map((c) => c.id)).toEqual(["lead", "solo"]);
++    expect(out.top.map((c) => c.id)).toEqual(["lead", "solo"]);
++    expect([...out.children]).toEqual(["kid"]);
++  });
++});
+diff --git a/web/src/lib/aeFamilyTree.ts b/web/src/lib/aeFamilyTree.ts
+index f3ec686bb52bd8754e4c857db7900e9946b13b4c..81ee102e5e8cfd00650b2f57a82900b113298d43 100644
+--- a/web/src/lib/aeFamilyTree.ts
++++ b/web/src/lib/aeFamilyTree.ts
+@@ -19,6 +19,8 @@ import {
+ import { aeStatusOf } from "@/lib/aeLabels";
+ 
+ export const AE_FAMILIES_SECTION = "Families";
++/** The Pinned section, whose pinned families draw as trees (`aePinnedTree`). */
++export const AE_PINNED_SECTION = "Pinned";
+ export const AE_FAMILY_REST_SECTION = "Standalone";
+ export const AE_FAMILY_SECTIONS = [AE_FAMILIES_SECTION, AE_FAMILY_REST_SECTION] as const;
+ export const AE_FAMILIES_HINT =
+@@ -433,3 +435,66 @@ export function useAeStableTree(tree: AeFamilyTree | null): AeFamilyTree | null
+   }
+   return kept.current.tree;
+ }
++
++/**
++ * The Pinned section as a list of trees (omnigent-ae, 2026-10-31): *pinned*
++ * (in pin order) with each family whose lead is pinned drawn as its lead and
++ * the pinned open sessions under it, at the lead's pin slot. A session pinned
++ * without its lead, a reference session and a lead with nothing pinned under
++ * it stay flat rows. `top` is the draggable order: leads and flat rows;
++ * `children` the rows that move only with their lead.
++ */
++export function aePinnedTree(
++  pinned: readonly Conversation[],
++  families: AeFamilies,
++  folded: ReadonlySet<string>,
++): {
++  rows: Conversation[];
++  top: Conversation[];
++  children: ReadonlySet<string>;
++  tree: AeFamilyTree | null;
++} {
++  const pinnedIds = new Set(pinned.map((c) => c.id));
++  const rootOf = (c: Conversation) => families.byRow.get(c.id)?.family.root;
++  const under = new Map<string, number>();
++  const joins = (c: Conversation) => {
++    const root = rootOf(c);
++    return root !== undefined && pinnedIds.has(root) && (c.id === root || !aeIsClosedMember(c));
++  };
++  for (const c of pinned) {
++    const root = rootOf(c);
++    if (joins(c) && c.id !== root) under.set(root!, (under.get(root!) ?? 0) + 1);
++  }
++  const inTree = pinned.filter((c) => joins(c) && (under.get(rootOf(c)!) ?? 0) > 0);
++  if (inTree.length === 0) {
++    return { rows: [...pinned], top: [...pinned], children: new Set(), tree: null };
++  }
++  const inTreeIds = new Set(inTree.map((c) => c.id));
++  const { sessions, tree } = aeFamilyTree(inTree, families, { folded, byLead: true });
++  const blocks = new Map<string, Conversation[]>();
++  for (const c of sessions) {
++    const root = tree.rows.get(c.id)?.family.root ?? c.id;
++    const block = blocks.get(root);
++    if (block) block.push(c);
++    else blocks.set(root, [c]);
++  }
++  const rows: Conversation[] = [];
++  const top: Conversation[] = [];
++  const children = new Set<string>();
++  for (const c of pinned) {
++    const row = tree.rows.get(c.id);
++    if (!row && inTreeIds.has(c.id)) {
++      // Folded away under its lead.
++      children.add(c.id);
++    } else if (!row) {
++      rows.push(c);
++      top.push(c);
++    } else if (row.depth === 0) {
++      rows.push(...blocks.get(row.family.root)!);
++      top.push(c);
++    } else {
++      children.add(c.id);
++    }
++  }
++  return { rows, top, children, tree };
++}
+diff --git a/web/src/lib/aePinFamily.ts b/web/src/lib/aePinFamily.ts
+index e63f519a1e0e34dacccab92f0599695fd39e9dc1..c1c80f3334c2afeebf1296d39fc92dbc10dacec9 100644
+--- a/web/src/lib/aePinFamily.ts
++++ b/web/src/lib/aePinFamily.ts
+@@ -1,25 +1,33 @@
+-// Settings > Chat > Pin a lead's family (omnigent-ae, 2026-10-26): whether
+-// pinning a family's lead also pins its open sessions, and unpinning it unpins
+-// the family. Device-local, off by default. The cascade: shell/aePinFamily.ts.
++// Settings > Chat > Pin a lead's family (omnigent-ae, 2026-10-26; three choices
++// 2026-10-31): what pinning a family's lead does with its open sessions, and
++// unpinning with its pinned ones. "ask" (default) asks each time, "family"
++// always takes the whole family, "parent" only the lead. Device-local. The
++// older "on" reads as "family" and "off" as "ask". The cascade and the dialog:
++// shell/aePinFamily.ts, shell/AePinFamilyChoice.tsx.
+ 
+ import { useSyncExternalStore } from "react";
+ 
+ const STORAGE_KEY = "omnigent:ae-pin-family";
+ 
+-export function readAePinFamily(): boolean {
+-  if (typeof window === "undefined") return false;
++export type AePinFamilyMode = "ask" | "family" | "parent";
++
++export function readAePinFamily(): AePinFamilyMode {
++  if (typeof window === "undefined") return "ask";
+   try {
+-    return window.localStorage.getItem(STORAGE_KEY) === "on";
++    const stored = window.localStorage.getItem(STORAGE_KEY);
++    if (stored === "family" || stored === "on") return "family";
++    if (stored === "parent") return "parent";
+   } catch {
+-    return false;
++    // Storage unreadable: the default.
+   }
++  return "ask";
+ }
+ 
+ const listeners = new Set<() => void>();
+ 
+-export function writeAePinFamily(on: boolean): void {
++export function writeAePinFamily(mode: AePinFamilyMode): void {
+   try {
+-    window.localStorage.setItem(STORAGE_KEY, on ? "on" : "off");
++    window.localStorage.setItem(STORAGE_KEY, mode);
+   } catch {
+     // A local preference; losing it is harmless.
+   }
+@@ -38,6 +46,6 @@ function subscribe(listener: () => void): () => void {
+   };
+ }
+ 
+-export function useAePinFamily(): boolean {
+-  return useSyncExternalStore(subscribe, readAePinFamily, () => false);
++export function useAePinFamily(): AePinFamilyMode {
++  return useSyncExternalStore(subscribe, readAePinFamily, () => "ask");
+ }
+diff --git a/web/src/lib/aePinFamilyChoice.ts b/web/src/lib/aePinFamilyChoice.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..aae42e67d45644ced2bb9f4d42571a88226ef61a
+--- /dev/null
++++ b/web/src/lib/aePinFamilyChoice.ts
+@@ -0,0 +1,53 @@
++// The "pin only the parent, or the whole family?" question (omnigent-ae,
++// 2026-10-31): a one-slot store the cascade (shell/aePinFamily.ts) asks
++// through and the dialog (shell/AePinFamilyChoice.tsx) answers. Kept in lib/ so
++// both files share it without importing a component.
++
++import { useSyncExternalStore } from "react";
++
++export type AePinFamilyAnswer = "parent" | "family" | "cancel";
++
++export interface AePinFamilyQuestion {
++  /** Whether the lead is being pinned or unpinned. */
++  action: "pin" | "unpin";
++  /** The lead's title, shown in the dialog. */
++  title: string | null;
++}
++
++let current: { question: AePinFamilyQuestion; resolve: (answer: AePinFamilyAnswer) => void } | null =
++  null;
++const listeners = new Set<() => void>();
++
++function emit(): void {
++  listeners.forEach((listener) => listener());
++}
++
++/** Asks; resolves with the answer, or "cancel" when closed or replaced by a newer question. */
++export function askPinFamily(question: AePinFamilyQuestion): Promise<AePinFamilyAnswer> {
++  current?.resolve("cancel");
++  return new Promise((resolve) => {
++    current = { question, resolve };
++    emit();
++  });
++}
++
++export function answerPinFamily(answer: AePinFamilyAnswer): void {
++  const open = current;
++  if (!open) return;
++  current = null;
++  emit();
++  open.resolve(answer);
++}
++
++function subscribe(listener: () => void): () => void {
++  listeners.add(listener);
++  return () => {
++    listeners.delete(listener);
++  };
++}
++
++const snapshot = () => current?.question ?? null;
++
++export function usePinFamilyQuestion(): AePinFamilyQuestion | null {
++  return useSyncExternalStore(subscribe, snapshot, () => null);
++}
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 2b707c3ac7dc89dec05ac6f30fc142b4a1404b48..fa0f08924379b2699b0600a2771d28049c28a179 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -25,7 +25,7 @@ export const AE_SPEND_SHORT =
+   "Tokens (default): new input plus output. Cost: API-rate estimate. Both: each. Off: none.";
+ /** The one-line description under "Pin a lead's family". */
+ export const AE_PIN_FAMILY_SHORT =
+-  "Yes pins a lead's open sessions with it. No (default) pins only the lead.";
++  "Ask each time (default), take the whole family always, or pin only the parent.";
+ 
+ const EFFORT = "Effort: low is fastest, max is slowest.";
+ 
+@@ -167,7 +167,7 @@ export const AE_SETTING_HINTS = {
+   },
+   "chat.pin_family": {
+     label: "Pin a lead's family",
+-    hint: "Yes: also pins its open sessions, or none if pin spots run short. No (default): lead only. Unpinning removes all pinned members, closed too.",
++    hint: "Ask (default): choose each time. Whole family: pins its open sessions too, or none if spots run short. Parent: lead only.",
+     source: "existing",
+   },
+   "family.child_prompts": {
+diff --git a/web/src/pages/settings/AeChatSettingsSection.test.tsx b/web/src/pages/settings/AeChatSettingsSection.test.tsx
+index b7269c359a319898edb61a26bcd9b625400248d2..d5a1bf3f99b6198408d0e57c9315443518144cbb 100644
+--- a/web/src/pages/settings/AeChatSettingsSection.test.tsx
++++ b/web/src/pages/settings/AeChatSettingsSection.test.tsx
+@@ -82,16 +82,18 @@ describe("AeChatSettingsSection", () => {
+     );
+   });
+ 
+-  it("offers Pin a lead's family, off by default, and saves the choice", () => {
++  it("offers Pin a lead's family, asking by default, and saves the choice", () => {
+     renderAt("/settings/chat", <AeChatSettingsSection />);
+     expect(screen.getByRole("radiogroup", { name: "Pin a lead's family" })).toBeInTheDocument();
+     expect(screen.getByRole("button", { name: "About Pin a lead's family" })).toBeInTheDocument();
+-    expect(screen.getByTestId("ae-pin-family-no")).toHaveAttribute("aria-checked", "true");
+-    fireEvent.click(screen.getByTestId("ae-pin-family-yes"));
+-    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("on");
+-    expect(screen.getByTestId("ae-pin-family-yes")).toHaveAttribute("aria-checked", "true");
+-    fireEvent.click(screen.getByTestId("ae-pin-family-no"));
+-    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("off");
++    expect(screen.getByTestId("ae-pin-family-ask")).toHaveAttribute("aria-checked", "true");
++    fireEvent.click(screen.getByTestId("ae-pin-family-family"));
++    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("family");
++    expect(screen.getByTestId("ae-pin-family-family")).toHaveAttribute("aria-checked", "true");
++    fireEvent.click(screen.getByTestId("ae-pin-family-parent"));
++    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("parent");
++    fireEvent.click(screen.getByTestId("ae-pin-family-ask"));
++    expect(window.localStorage.getItem("omnigent:ae-pin-family")).toBe("ask");
+   });
+ 
+   it("is what /settings/chat renders", () => {
+diff --git a/web/src/pages/settings/AePinFamilySetting.tsx b/web/src/pages/settings/AePinFamilySetting.tsx
+index d0d8c6a1e5fd134a34fc868d003337752dbf47fd..1c6a3bf5ff33b74b475d0ece77908f3fedc2e6f0 100644
+--- a/web/src/pages/settings/AePinFamilySetting.tsx
++++ b/web/src/pages/settings/AePinFamilySetting.tsx
+@@ -6,21 +6,24 @@ import { useId } from "react";
+ import { SettingsLabel } from "@/components/SettingsLabel";
+ import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+ import { AE_PIN_FAMILY_SHORT, aeHint } from "@/lib/aeSettingHints";
+-import { useAePinFamily, writeAePinFamily } from "@/lib/aePinFamily";
++import { type AePinFamilyMode, useAePinFamily, writeAePinFamily } from "@/lib/aePinFamily";
+ 
+-type Choice = "yes" | "no";
+-
+-const CARDS: { value: Choice; label: string; title: string }[] = [
++const CARDS: { value: AePinFamilyMode; label: string; title: string }[] = [
++  {
++    value: "ask",
++    label: "Ask each time",
++    title: "Pinning or unpinning a lead asks whether to take its family too.",
++  },
+   {
+-    value: "yes",
+-    label: "Yes",
++    value: "family",
++    label: "Always the whole family",
+     title: "Pinning a lead pins its open sessions; unpinning it unpins the family.",
+   },
+-  { value: "no", label: "No", title: "Pinning a lead pins only the lead." },
++  { value: "parent", label: "Only the parent", title: "Pinning a lead pins only the lead." },
+ ];
+ 
+ export function AePinFamilySetting() {
+-  const on = useAePinFamily();
++  const mode = useAePinFamily();
+   const labelId = useId();
+   return (
+     <div data-testid="ae-pin-family" className="flex flex-col gap-3">
+@@ -30,12 +33,12 @@ export function AePinFamilySetting() {
+         description={AE_PIN_FAMILY_SHORT}
+         tooltipDescription={aeHint("chat.pin_family")}
+       />
+-      <CardRadioGroup<Choice>
++      <CardRadioGroup<AePinFamilyMode>
+         labelledBy={labelId}
+-        value={on ? "yes" : "no"}
+-        onSelect={(value) => writeAePinFamily(value === "yes")}
++        value={mode}
++        onSelect={writeAePinFamily}
+         componentId="settings.chat.pin_family"
+-        className="grid grid-cols-1 gap-3 sm:grid-cols-2"
++        className="grid grid-cols-1 gap-3 sm:grid-cols-3"
+         cardClassName="items-center gap-2 p-4"
+         items={CARDS.map((card) => ({
+           value: card.value,
+diff --git a/web/src/shell/AeFamilyTree.tsx b/web/src/shell/AeFamilyTree.tsx
+index 9486dc427fcd336e49718b9cd9b45eecee5ee994..fbc6712cac911acb8c7466c2790f8c368b872e26 100644
+--- a/web/src/shell/AeFamilyTree.tsx
++++ b/web/src/shell/AeFamilyTree.tsx
+@@ -38,6 +38,7 @@ import { AeConversationStatusIcon } from "@/components/AeStatusIcon";
+ import {
+   AE_FAMILIES_HINT,
+   AE_FAMILIES_SECTION,
++  AE_PINNED_SECTION,
+   AE_FAMILY_REST_SECTION,
+   AE_FAMILY_TREE_STEP,
+   type AeClosedEntry,
+@@ -540,6 +541,14 @@ export function AeFamilyTreeSlot({
+   children: ReactNode;
+ }) {
+   const { tree } = useContext(AeFamilyContext);
++  // Pinned draws its pinned families as trees (`aePinnedTree`); other rows stay plain.
++  if (tree && section === AE_PINNED_SECTION) {
++    return tree.rows.has(conversationId) ? (
++      <InFamilies.Provider value>{children}</InFamilies.Provider>
++    ) : (
++      children
++    );
++  }
+   if (!tree || section !== AE_FAMILIES_SECTION) return children;
+   const closed = tree.closed.get(conversationId);
+   if (closed) {
+diff --git a/web/src/shell/AePinFamilyChoice.test.tsx b/web/src/shell/AePinFamilyChoice.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7398ed704bc6ff93abae28a9e8e46005064eac14
+--- /dev/null
++++ b/web/src/shell/AePinFamilyChoice.test.tsx
+@@ -0,0 +1,76 @@
++// The pin-family dialog (omnigent-ae, 2026-10-31): shows what was asked, each
++// button answers, Escape cancels, and a new question replaces an open one.
++
++import { act, render, screen } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { describe, expect, it } from "vitest";
++import { answerPinFamily, askPinFamily } from "@/lib/aePinFamilyChoice";
++import { AePinFamilyChoiceHost } from "./AePinFamilyChoice";
++
++describe("AePinFamilyChoiceHost", () => {
++  it("renders nothing until asked", () => {
++    render(<AePinFamilyChoiceHost />);
++    expect(screen.queryByRole("dialog")).toBeNull();
++  });
++
++  it("asks about a pin and resolves with the button pressed", async () => {
++    render(<AePinFamilyChoiceHost />);
++    let answer: Promise<string> = Promise.resolve("");
++    act(() => {
++      answer = askPinFamily({ action: "pin", title: "Lead chat" });
++    });
++    expect(
++      await screen.findByRole("dialog", {
++        name: "Pin only the parent, or the parent and its whole family?",
++      }),
++    ).toBeInTheDocument();
++    expect(screen.getByText(/Lead chat/)).toBeInTheDocument();
++    await userEvent.click(screen.getByRole("button", { name: "Pin the whole family" }));
++    await expect(answer).resolves.toBe("family");
++    expect(screen.queryByRole("dialog")).toBeNull();
++  });
++
++  it("words the unpin question and answers the parent button", async () => {
++    render(<AePinFamilyChoiceHost />);
++    let answer: Promise<string> = Promise.resolve("");
++    act(() => {
++      answer = askPinFamily({ action: "unpin", title: null });
++    });
++    expect(
++      await screen.findByRole("dialog", { name: "Unpin only the parent, or the whole family?" }),
++    ).toBeInTheDocument();
++    await userEvent.click(screen.getByRole("button", { name: "Unpin only the parent" }));
++    await expect(answer).resolves.toBe("parent");
++  });
++
++  it("cancels on the Cancel button and on Escape", async () => {
++    render(<AePinFamilyChoiceHost />);
++    let first: Promise<string> = Promise.resolve("");
++    act(() => {
++      first = askPinFamily({ action: "pin", title: "x" });
++    });
++    await userEvent.click(await screen.findByRole("button", { name: "Cancel" }));
++    await expect(first).resolves.toBe("cancel");
++
++    let second: Promise<string> = Promise.resolve("");
++    act(() => {
++      second = askPinFamily({ action: "pin", title: "x" });
++    });
++    await screen.findByRole("dialog");
++    await userEvent.keyboard("{Escape}");
++    await expect(second).resolves.toBe("cancel");
++    expect(screen.queryByRole("dialog")).toBeNull();
++  });
++
++  it("cancels an open question when a newer one is asked", async () => {
++    let first: Promise<string> = Promise.resolve("");
++    act(() => {
++      first = askPinFamily({ action: "pin", title: "a" });
++    });
++    act(() => {
++      void askPinFamily({ action: "unpin", title: "b" });
++    });
++    await expect(first).resolves.toBe("cancel");
++    act(() => answerPinFamily("cancel"));
++  });
++});
+diff --git a/web/src/shell/AePinFamilyChoice.tsx b/web/src/shell/AePinFamilyChoice.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..52c261cdacab1b1764a53bcca97ab3988f28a030
+--- /dev/null
++++ b/web/src/shell/AePinFamilyChoice.tsx
+@@ -0,0 +1,57 @@
++// The "pin only the parent, or the whole family?" dialog (omnigent-ae,
++// 2026-10-31). One host, mounted once in the app shell, shows whatever
++// `askPinFamily` (lib/aePinFamilyChoice.ts) asked. Radix's dialog supplies the
++// focus trap, focus return and Escape; closing any other way is Cancel.
++
++import { Button } from "@/components/ui/button";
++import {
++  Dialog,
++  DialogContent,
++  DialogDescription,
++  DialogFooter,
++  DialogHeader,
++  DialogTitle,
++} from "@/components/ui/dialog";
++import { answerPinFamily, usePinFamilyQuestion } from "@/lib/aePinFamilyChoice";
++
++export function AePinFamilyChoiceHost() {
++  const question = usePinFamilyQuestion();
++  const pin = question?.action !== "unpin";
++  return (
++    <Dialog open={question !== null} onOpenChange={(open) => !open && answerPinFamily("cancel")}>
++      <DialogContent showCloseButton={false} data-testid="ae-pin-family-dialog">
++        <DialogHeader>
++          <DialogTitle>
++            {pin
++              ? "Pin only the parent, or the parent and its whole family?"
++              : "Unpin only the parent, or the whole family?"}
++          </DialogTitle>
++          <DialogDescription>
++            {question?.title
++              ? `"${question.title}" leads a family of sessions.`
++              : "This session leads a family of sessions."}
++          </DialogDescription>
++        </DialogHeader>
++        <DialogFooter>
++          <Button
++            variant="ghost"
++            data-testid="ae-pin-family-dialog-cancel"
++            onClick={() => answerPinFamily("cancel")}
++          >
++            Cancel
++          </Button>
++          <Button
++            variant="outline"
++            data-testid="ae-pin-family-dialog-parent"
++            onClick={() => answerPinFamily("parent")}
++          >
++            {pin ? "Pin only the parent" : "Unpin only the parent"}
++          </Button>
++          <Button data-testid="ae-pin-family-dialog-family" onClick={() => answerPinFamily("family")}>
++            {pin ? "Pin the whole family" : "Unpin the whole family"}
++          </Button>
++        </DialogFooter>
++      </DialogContent>
++    </Dialog>
++  );
++}
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 82a40475fd2d588d66ad0bfbdcf2e5f0f0fb54a4..8cbb07843d5b72b101b4dfcd925b92555f38aac4 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -13,6 +13,7 @@ import { useQueryClient } from "@tanstack/react-query";
+ import { toast } from "sonner";
+ import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
+ import { AeMoveAllChatsDialog } from "@/shell/AeMoveAllChatsDialog";
++import { AePinFamilyChoiceHost } from "@/shell/AePinFamilyChoice";
+ import { AeSwitchFamilyDialog } from "@/shell/AeSwitchFamilyDialog";
+ import { CANVAS_CONVERSATION_MIN_WIDTH, CanvasWorkspace } from "@/canvas/CanvasWorkspace";
+ import { isCanvasPathname } from "@/canvas/canvasNavigation";
+@@ -2872,6 +2873,7 @@ export function AppShell() {
+           />
+           <AeMoveAllChatsDialog />
+           <AeSwitchFamilyDialog />
++          <AePinFamilyChoiceHost />
+           <AeReloadNotice />
+         </ForkDialogContextProvider>
+       </TerminalFirstContextProvider>
+diff --git a/web/src/shell/HeaderConversationMenu.test.tsx b/web/src/shell/HeaderConversationMenu.test.tsx
+index 76b174f55802f2cfc84330dab6c9ce3b17ee7e0e..9eff24a166dc7a9d373e68d8012d1191a720edc6 100644
+--- a/web/src/shell/HeaderConversationMenu.test.tsx
++++ b/web/src/shell/HeaderConversationMenu.test.tsx
+@@ -211,12 +211,15 @@ describe("HeaderConversationMenu", () => {
+     expect(screen.getByRole("menuitem", { name: "Pin" })).toHaveFocus();
+   });
+ 
+-  it("runs pin and mark-unread actions for the active session", () => {
++  it("runs pin and mark-unread actions for the active session", async () => {
+     renderMenu();
+ 
+     openMenu();
+     fireEvent.click(screen.getByRole("menuitem", { name: "Pin" }));
+-    expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true });
++    // Pinning first looks for a family to ask about.
++    await waitFor(() =>
++      expect(mocks.togglePinned).toHaveBeenCalledWith({ id: "conv-1", pinned: true }),
++    );
+ 
+     openMenu();
+     fireEvent.click(screen.getByRole("menuitem", { name: "Mark as unread" }));
+@@ -230,7 +233,9 @@ describe("HeaderConversationMenu", () => {
+ 
+     openMenu();
+     fireEvent.click(screen.getByRole("menuitem", { name: "Unpin" }));
+-    expect(mocks.togglePinnedAsync).toHaveBeenCalledWith({ id: "conv-1", pinned: false });
++    await waitFor(() =>
++      expect(mocks.togglePinnedAsync).toHaveBeenCalledWith({ id: "conv-1", pinned: false }),
++    );
+     await waitFor(() =>
+       expect(toast).toHaveBeenCalledWith(
+         "Unpinned session",
+diff --git a/web/src/shell/Sidebar.aePinnedFamilies.test.tsx b/web/src/shell/Sidebar.aePinnedFamilies.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..c46a2de5963ee23ffe015fe0a2ad819dab52010b
+--- /dev/null
++++ b/web/src/shell/Sidebar.aePinnedFamilies.test.tsx
+@@ -0,0 +1,176 @@
++// Pinned keeps a family's tree (omnigent-ae, 2026-10-31):
++//   1. A pinned lead lists its pinned open sessions under it, indented, at the
++//      lead's pin slot, whatever the sessions' own pin values.
++//   2. A session pinned without its lead stays a flat row.
++//   3. A family with every member pinned is gone from Families.
++//   4. Dragging a lead moves its whole family; a child is no drop target.
++//   5. The lead's chevron folds its pinned sessions away.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, cleanup, fireEvent, render, screen, within } from "@testing-library/react";
++import { MemoryRouter } from "react-router-dom";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { TooltipProvider } from "@/components/ui/tooltip";
++import { SidebarDataProvider } from "@/hooks/useSidebarData";
++import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
++import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
++import { resetAeFamilyFoldsCache } from "@/lib/aeFamilyTree";
++import { conversation as conv, conversationPage } from "@/test/sidebarMockHelpers";
++import { Sidebar } from "./Sidebar";
++
++vi.mock("@/hooks/useScopeCache", () => import("@/test/mockScopeCache"));
++
++const mocks = vi.hoisted(() => ({
++  pinned: [] as ReturnType<typeof conv>[],
++  pinFn: vi.fn(),
++  reorderPins: vi.fn(),
++}));
++
++vi.mock("@/hooks/useConversations", async () => {
++  const { conversationHooksMock } = await import("@/test/sidebarMockHelpers");
++  return {
++    ...conversationHooksMock(),
++    useProjects: vi.fn(() => ({ data: [] })),
++    usePinnedConversations: () => ({
++      data: { conversations: mocks.pinned, filterHonored: true },
++      isSuccess: true,
++    }),
++    useTogglePinnedConversation: () => ({ mutate: vi.fn(), mutateAsync: mocks.pinFn }),
++    useReorderPinnedConversations: () => ({ mutate: mocks.reorderPins }),
++  };
++});
++vi.mock("@/components/PermissionsModal", () => ({ PermissionsModal: () => null }));
++
++import { useConversations } from "@/hooks/useConversations";
++
++const ROW_HEIGHT = 30;
++const pin = (value: number, extra: Record<string, string> = {}) => ({
++  labels: { "omnigent.pinned": String(value), ...extra },
++});
++
++function renderTree(grouping = "default") {
++  localStorage.setItem(
++    "omnigent:sidebar-view",
++    JSON.stringify({ grouping, ordering: "updated", show: [] }),
++  );
++  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  return render(
++    <QueryClientProvider client={qc}>
++      <SidebarDataProvider>
++        <TooltipProvider>
++          <MemoryRouter initialEntries={["/"]}>
++            <CapabilitiesProvider
++              info={{
++                ...FALLBACK_SERVER_INFO,
++                features: { ...FALLBACK_SERVER_INFO.features, sidebar_grouping_ui: true },
++              }}
++            >
++              <Sidebar open={true} onClose={vi.fn()} />
++            </CapabilitiesProvider>
++          </MemoryRouter>
++        </TooltipProvider>
++      </SidebarDataProvider>
++    </QueryClientProvider>,
++  );
++}
++
++const ids = () =>
++  [...document.querySelectorAll("li[data-sidebar-session-id]")].map((li) =>
++    li.getAttribute("data-sidebar-session-id"),
++  );
++const rowOf = (id: string) =>
++  document.querySelector<HTMLElement>(`li[data-sidebar-session-id="${id}"]`)!;
++
++// jsdom has no layout: stack the session rows for dnd-kit's pointer collision.
++function stubRowRects() {
++  return vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (
++    this: Element,
++  ) {
++    const index = [...document.querySelectorAll("li[data-sidebar-session-id]")].indexOf(this);
++    return index < 0
++      ? new DOMRect(0, 0, 0, 0)
++      : new DOMRect(0, index * ROW_HEIGHT, 200, ROW_HEIGHT);
++  });
++}
++
++async function drag(sourceId: string, targetId: string) {
++  const at = (id: string) => ({ clientX: 50, clientY: ids().indexOf(id) * ROW_HEIGHT + 15 });
++  const start = at(sourceId);
++  const target = at(targetId);
++  fireEvent.mouseDown(rowOf(sourceId), { button: 0, ...start });
++  fireEvent.mouseMove(document, { clientX: start.clientX, clientY: start.clientY - 10 });
++  await act(async () => {
++    fireEvent.mouseMove(document, target);
++  });
++  const insertion = screen.queryByTestId("pin-order-insertion") !== null;
++  await act(async () => {
++    fireEvent.mouseUp(document, target);
++  });
++  return insertion;
++}
++
++beforeEach(() => {
++  localStorage.clear();
++  resetAeFamilyFoldsCache();
++  // The lead (pinned first), a solo pin, then the lead's child pinned last.
++  mocks.pinned = [
++    conv("lead", pin(1000)),
++    conv("solo", pin(1001)),
++    conv("kid", pin(1002, { "ae.orch": "lead" })),
++  ];
++  vi.mocked(useConversations).mockImplementation(() => conversationPage([conv("other")]));
++  stubRowRects();
++});
++
++afterEach(() => {
++  fireEvent.mouseUp(document);
++  cleanup();
++  vi.restoreAllMocks();
++  vi.clearAllMocks();
++});
++
++describe("Pinned families", () => {
++  it("lists a pinned lead's pinned session under it, indented, at the lead's slot", () => {
++    renderTree();
++    expect(ids().slice(0, 3)).toEqual(["lead", "kid", "solo"]);
++    expect(within(rowOf("kid")).getByTestId("ae-family-indent")).toHaveAttribute("data-depth", "1");
++    expect(within(rowOf("solo")).queryByTestId("ae-family-indent")).toBeNull();
++    expect(within(rowOf("lead")).queryByTestId("ae-family-indent")).toBeNull();
++  });
++
++  it("keeps a session pinned without its lead as a flat row", () => {
++    mocks.pinned = [conv("solo", pin(1001)), conv("kid", pin(1002, { "ae.orch": "lead" }))];
++    vi.mocked(useConversations).mockImplementation(() =>
++      conversationPage([conv("lead"), conv("other")]),
++    );
++    renderTree();
++    expect(ids().slice(0, 2)).toEqual(["solo", "kid"]);
++    expect(within(rowOf("kid")).queryByTestId("ae-family-indent")).toBeNull();
++  });
++
++  it("takes a fully pinned family out of Families", () => {
++    vi.mocked(useConversations).mockImplementation(() =>
++      conversationPage([conv("other"), conv("kid", { labels: { "ae.orch": "lead" } })]),
++    );
++    renderTree("family");
++    expect(ids().filter((id) => id === "lead" || id === "kid")).toEqual(["lead", "kid"]);
++    expect(document.querySelector('[data-section="Families"]')).toHaveTextContent("Families0");
++    expect(ids().filter((id) => id === "kid")).toHaveLength(1);
++  });
++
++  it("moves the whole family when its lead is dragged, and takes no drop on a child", async () => {
++    renderTree();
++    expect(await drag("solo", "kid")).toBe(false);
++    expect(mocks.reorderPins).not.toHaveBeenCalled();
++
++    expect(await drag("lead", "solo")).toBe(true);
++    expect(mocks.reorderPins).toHaveBeenCalledExactlyOnceWith([{ id: "lead", pinnedAt: 1002 }]);
++  });
++
++  it("folds a pinned lead's sessions away from its chevron", () => {
++    renderTree();
++    fireEvent.click(within(rowOf("lead")).getByTestId("ae-family-fold"));
++    expect(ids().slice(0, 2)).toEqual(["lead", "solo"]);
++    expect(rowOf("kid")).toBeNull();
++  });
++});
+diff --git a/web/src/shell/Sidebar.rowActions.test.tsx b/web/src/shell/Sidebar.rowActions.test.tsx
+index 6ce57f6ab28ea265826b7fdfde3fb11a613385dd..cb1a36c6bf6a9442a619d889f8705833a34800d5 100644
+--- a/web/src/shell/Sidebar.rowActions.test.tsx
++++ b/web/src/shell/Sidebar.rowActions.test.tsx
+@@ -386,7 +386,7 @@ describe("quick pin/unpin hover button", () => {
+     expect(screen.getByTestId("new-project")).toBeInTheDocument();
+   });
+ 
+-  it("toggles the pin without opening the kebab menu, moving the row under Pinned", () => {
++  it("toggles the pin without opening the kebab menu, moving the row under Pinned", async () => {
+     renderSidebar();
+ 
+     // No "Pinned" section to start; the row lives under Recent.
+@@ -406,7 +406,8 @@ describe("quick pin/unpin hover button", () => {
+     // The row is now grouped under a "Pinned" header, and the quick button
+     // flips to its unpin affordance — both prove the toggle ran through the
+     // sidebar's pin state (not just a local no-op).
+-    const pinnedHeader = screen.getByText("Pinned");
++    // Pinning first looks for a family to ask about, so the move lands a tick later.
++    const pinnedHeader = await screen.findByText("Pinned");
+     const pinnedSection = pinnedHeader.closest("section")!;
+     expect(within(pinnedSection).getByText("My Session")).toBeInTheDocument();
+     expect(screen.getByTestId("quick-pin-conversation")).toHaveAttribute(
+@@ -420,7 +421,7 @@ describe("quick pin/unpin hover button", () => {
+ 
+     // Clicking again unpins: the Pinned section disappears.
+     fireEvent.click(screen.getByTestId("quick-pin-conversation"));
+-    expect(screen.queryByText("Pinned")).toBeNull();
++    await waitFor(() => expect(screen.queryByText("Pinned")).toBeNull());
+   });
+ 
+   it.each([
+@@ -434,7 +435,7 @@ describe("quick pin/unpin hover button", () => {
+     expect(await screen.findByRole("tooltip")).toHaveTextContent(label);
+   });
+ 
+-  it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", () => {
++  it("also offers Pin in the kebab menu (mobile affordance) and toggles the same pin state", async () => {
+     renderSidebar();
+ 
+     expect(screen.queryByText("Pinned")).toBeNull();
+@@ -449,7 +450,7 @@ describe("quick pin/unpin hover button", () => {
+     expect(pinItem).toHaveTextContent("Pin");
+     fireEvent.click(pinItem);
+ 
+-    const pinnedHeader = screen.getByText("Pinned");
++    const pinnedHeader = await screen.findByText("Pinned");
+     const pinnedSection = pinnedHeader.closest("section")!;
+     expect(within(pinnedSection).getByText("My Session")).toBeInTheDocument();
+     expect(mocks.pinnedStore.ids).toContain("conv_1");
+diff --git a/web/src/shell/Sidebar.tsx b/web/src/shell/Sidebar.tsx
+index e6543669b510ba2378bea87ba557bb4d0dbfd693..fdad00efe852f7ed34ba0a5e5bfcafd45230416d 100644
+--- a/web/src/shell/Sidebar.tsx
++++ b/web/src/shell/Sidebar.tsx
+@@ -257,7 +257,9 @@ import {
+ import { AE_TRIAGE_GROUPS } from "@/lib/aeTriage";
+ import { AeFamilyContext, type AeFamilyView, useAeFamilies } from "@/lib/aeFamilyView";
+ import {
++  AE_PINNED_SECTION,
+   aeFamilyTree,
++  aePinnedTree,
+   aeWithFamiliesSection,
+   useAeEffectiveFolds,
+   useAeFamilyFolds,
+@@ -402,6 +404,8 @@ const PinSavingContext = createContext(false);
+ // `draggingId` is the session being dragged; `overId` the row it's over.
+ const PinOrderContext = createContext<{
+   ids: string[];
++  /** Pinned family members, who move only with their lead: no drag, no drop target. */
++  fixed: ReadonlySet<string>;
+   draggingId: string | null;
+   overId: string | null;
+ } | null>(null);
+@@ -1842,7 +1846,10 @@ function ConversationList({
+   );
+   const families = useAeFamilies(
+     familyRows,
+-    view.familyDots || view.grouping === "family" || familyFilter !== null,
++    view.familyDots ||
++      view.grouping === "family" ||
++      familyFilter !== null ||
++      pinnedConversationIds.length > 0,
+     view.grouping === "family",
+   );
+   // Another display (Shared, Archived) starts unfiltered.
+@@ -2164,6 +2171,13 @@ function ConversationList({
+ 
+   const aeTree = useAeStableTree(loadedSections.aeTree);
+   const treeView = useMemo(() => ({ ...familyView, tree: aeTree }), [familyView, aeTree]);
++  // Pinned keeps each pinned family's tree, at its lead's pin slot.
++  const pinnedLayout = useMemo(
++    () => aePinnedTree(loadedSections.pinned, families, familyFolds),
++    [loadedSections.pinned, families, familyFolds],
++  );
++  const pinnedTree = useAeStableTree(pinnedLayout.tree);
++  const pinnedView = useMemo(() => ({ ...familyView, tree: pinnedTree }), [familyView, pinnedTree]);
+   // A stand-in lead draws as its own entry; it is no session to navigate to or select.
+   const standIns = loadedSections.aeTree?.unlisted;
+   const config = useContext(SidebarConfigContext);
+@@ -2382,7 +2396,7 @@ function ConversationList({
+         return;
+       }
+       if (action.kind === "reorder-pin") {
+-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
++        const writes = pinOrderWrites(pinnedLayout.top, dragged.id, action.targetId);
+         if (writes.length > 0) reorderPins(writes);
+         return;
+       }
+@@ -2390,7 +2404,7 @@ function ConversationList({
+         // Pin into the dropped-on slot; the new pin goes through the pin toggle
+         // (cap / ownership checks), and only once it's accepted are any
+         // renumbered neighbours rewritten through the batch.
+-        const writes = pinOrderWrites(sections.pinned, dragged.id, action.targetId);
++        const writes = pinOrderWrites(pinnedLayout.top, dragged.id, action.targetId);
+         const pin = writes.find((w) => w.id === dragged.id);
+         const rest = writes.filter((w) => w.id !== dragged.id);
+         // Chain on this call's own promise: per-call mutate callbacks are dropped
+@@ -2425,7 +2439,7 @@ function ConversationList({
+       onTogglePinned,
+       projects,
+       saveOrder,
+-      sections.pinned,
++      pinnedLayout.top,
+       pinAt,
+       reorderPins,
+     ],
+@@ -2551,7 +2565,7 @@ function ConversationList({
+     // `sections` is already scoped to the active tab, so the same Pinned /
+     // Projects / Sessions walk covers both tabs (Projects is empty on shared).
+     return [
+-      ...visible("Pinned", sections.pinned),
++      ...visible("Pinned", pinnedLayout.rows),
+       ...sections.projectGroups.flatMap((g) => projectVisible(g.name, g.conversations)),
+       ...visible("Shared", sections.shared),
+       ...(sessionGroups
+@@ -2560,7 +2574,14 @@ function ConversationList({
+     ]
+       .filter((c) => !standIns?.has(c.id))
+       .map((c) => c.id);
+-  }, [sections, sessionGroups, effectiveCollapsedSections, expandedProjects, standIns]);
++  }, [
++    sections,
++    sessionGroups,
++    pinnedLayout.rows,
++    effectiveCollapsedSections,
++    expandedProjects,
++    standIns,
++  ]);
+   // Getter for the shift-select range, built on demand (at click time). Scopes
+   // to whichever section is selectable: the flat Sessions list, or the sessions
+   // across expanded project folders (in render order). For projects scope the
+@@ -2594,20 +2615,21 @@ function ConversationList({
+   // Cmd/Ctrl+1..9/0 jumps to the first ten pinned sessions (desktop only;
+   // see the hook). Empty when the Pinned section is collapsed.
+   const pinnedSessionIds = useMemo(
+-    () => (collapsedSections.includes("Pinned") ? [] : sections.pinned.map((c) => c.id)),
+-    [sections.pinned, collapsedSections],
++    () => (collapsedSections.includes("Pinned") ? [] : pinnedLayout.rows.map((c) => c.id)),
++    [pinnedLayout.rows, collapsedSections],
+   );
+   usePinnedSessionHotkeys(pinnedSessionIds, activeId);
+   const pinOrder = useMemo(
+     () =>
+       pinReorderEnabled && !pinWriting
+         ? {
+-            ids: sections.pinned.map((c) => c.id),
++            ids: pinnedLayout.top.map((c) => c.id),
++            fixed: pinnedLayout.children,
+             draggingId: activeDrag?.id ?? null,
+             overId: overPin,
+           }
+         : null,
+-    [pinReorderEnabled, pinWriting, sections.pinned, activeDrag, overPin],
++    [pinReorderEnabled, pinWriting, pinnedLayout, activeDrag, overPin],
+   );
+ 
+   // Pinned membership is server-authoritative (the `omnigent.pinned` label),
+@@ -2852,20 +2874,22 @@ function ConversationList({
+                     // an unpinned session; outline-only highlight.
+                     <PinDropZone active={activeDrag != null && !activeDrag.isPinned}>
+                       <PinOrderContext.Provider value={pinOrder}>
+-                        <ConversationSection
+-                          title="Pinned"
+-                          conversations={sections.pinned}
+-                          activeConversationId={displayedActiveId}
+-                          pinnedConversationIds={pinnedConversationIds}
+-                          collapsed={effectiveCollapsedSections.includes("Pinned")}
+-                          onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
+-                          onRowClick={onRowClick}
+-                          onTogglePinned={onTogglePinned}
+-                          selectionMode={false}
+-                          selectedIds={selectedIds}
+-                          onToggleSelected={onToggleSelected}
+-                          onProjectAssigned={expandProject}
+-                        />
++                        <AeFamilyContext.Provider value={pinnedView}>
++                          <ConversationSection
++                            title={AE_PINNED_SECTION}
++                            conversations={pinnedLayout.rows}
++                            activeConversationId={displayedActiveId}
++                            pinnedConversationIds={pinnedConversationIds}
++                            collapsed={effectiveCollapsedSections.includes("Pinned")}
++                            onToggleCollapsed={() => effectiveToggleSectionCollapsed("Pinned")}
++                            onRowClick={onRowClick}
++                            onTogglePinned={onTogglePinned}
++                            selectionMode={false}
++                            selectedIds={selectedIds}
++                            onToggleSelected={onToggleSelected}
++                            onProjectAssigned={expandProject}
++                          />
++                        </AeFamilyContext.Provider>
+                       </PinOrderContext.Provider>
+                     </PinDropZone>
+                   )}
+@@ -4997,6 +5021,7 @@ function ConversationRowImpl({
+   // onto "Chats" unfiles it; onto "Pinned" pins it. The list-level <DndContext>
+   // routes the drop; the row only advertises itself and its source project +
+   // pinned state via the draggable `data`.
++  const pinOrder = useContext(PinOrderContext);
+   const {
+     listeners: dragListeners,
+     setNodeRef: setDragNodeRef,
+@@ -5004,7 +5029,13 @@ function ConversationRowImpl({
+   } = useDraggable({
+     id: conversation.id,
+     data: { type: "session", label, project: currentProject, isPinned },
+-    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
++    disabled:
++      !isOwner ||
++      selectionMode ||
++      isArchived ||
++      isEditing ||
++      isProvisionalRow ||
++      pinOrder?.fixed.has(conversation.id) === true,
+   });
+   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
+   // on the same anchor still fires a click); swallow that one click so a drag
+@@ -5023,11 +5054,10 @@ function ConversationRowImpl({
+     return () => clearTimeout(timer);
+   }, [isDragging]);
+   // In the Pinned section each row is also a reorder target for other pins.
+-  const pinOrder = useContext(PinOrderContext);
+   const { setNodeRef: setPinOrderNodeRef } = useDroppable({
+     id: `pin-order:${conversation.id}`,
+     data: { type: "pin-order", id: conversation.id },
+-    disabled: !pinOrder || !isPinned,
++    disabled: !pinOrder || !isPinned || pinOrder.fixed.has(conversation.id),
+   });
+   const { setNodeRef: setAeOrderNodeRef, insertion: aeOrderInsertion } = useAeOrderRow(
+     conversation.id,
+diff --git a/web/src/shell/aePinFamily.test.ts b/web/src/shell/aePinFamily.test.ts
+index 990ab65eac2aeb19c83e00a558a86d2d0fa01596..ba058d7e7da316825a88631957bce6436eb231c8 100644
+--- a/web/src/shell/aePinFamily.test.ts
++++ b/web/src/shell/aePinFamily.test.ts
+@@ -1,20 +1,24 @@
+-// Pin a lead's family (omnigent-ae, 2026-10-26):
+-//   1. Setting off: the single toggle runs, with no read.
++// Pin a lead's family (omnigent-ae, 2026-10-26; the question 2026-10-31):
++//   1. Setting "parent": the single toggle runs, with no read and no question.
+ //   2. On: pinning a lead pins it and its open sessions, lead first; reference,
+ //      archived and already pinned sessions are left alone.
+ //   3. On: a family that needs more pin spots than are free pins nothing and says so.
+ //   4. On: unpinning the lead unpins every pinned session of the family, with one Undo
+ //      that re-pins them at their old values.
+ //   5. On: a session started by another, or one that leads nothing, toggles alone.
+-//   6. A failed read changes nothing and says so; a double click reads once.
++//   6. A failed read changes nothing and says so (when asking, it toggles alone); a double click reads once.
+ //   7. Without shared pins, only the viewer's sessions count and get pinned.
+ //   8. A member the sidebar has not loaded is seeded into the cache before its pin.
++//   9. Setting "ask" (the default, and the old "off"): a dialog first; each button, Cancel,
++//      and no question for a lead with nothing to bring along. The old "on" is "family".
+ 
+ import { QueryClient } from "@tanstack/react-query";
++import { renderHook } from "@testing-library/react";
+ import { type Mock, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import type * as ConversationsModule from "@/hooks/useConversations";
+ import { PINNED_CONVERSATIONS_KEY, type Conversation } from "@/hooks/useConversations";
+-import { writeAePinFamily } from "@/lib/aePinFamily";
++import { readAePinFamily, writeAePinFamily } from "@/lib/aePinFamily";
++import { answerPinFamily, usePinFamilyQuestion } from "@/lib/aePinFamilyChoice";
+ import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+ 
+ const mocks = vi.hoisted(() => ({ read: vi.fn(), toast: vi.fn(), showToast: vi.fn() }));
+@@ -99,7 +103,8 @@ const settle = () =>
+ 
+ beforeEach(() => {
+   window.localStorage.clear();
+-  writeAePinFamily(true);
++  writeAePinFamily("family");
++  answerPinFamily("cancel");
+   resetAePinFamilyForTests();
+   queryClient = new QueryClient();
+   pinned({});
+@@ -115,8 +120,8 @@ afterEach(() => {
+ });
+ 
+ describe("aeTogglePinFamily", () => {
+-  it("toggles alone, with no read, while the setting is off", () => {
+-    writeAePinFamily(false);
++  it("toggles alone, with no read, while the setting is parent", () => {
++    writeAePinFamily("parent");
+     sessionList([LEAD, child("a")]);
+     toggle(LEAD, false);
+     expect(alone).toHaveBeenCalledTimes(1);
+@@ -307,4 +312,100 @@ describe("aeTogglePinFamily", () => {
+     // Two slices per read: open and archived.
+     expect(mocks.read).toHaveBeenCalledTimes(2);
+   });
++
++  describe("asking", () => {
++    const question = () => renderHook(() => usePinFamilyQuestion()).result.current;
++
++    beforeEach(() => writeAePinFamily("ask"));
++
++    it("reads the old stored values: on is family, off is ask, nothing is ask", () => {
++      window.localStorage.setItem("omnigent:ae-pin-family", "on");
++      expect(readAePinFamily()).toBe("family");
++      window.localStorage.setItem("omnigent:ae-pin-family", "off");
++      expect(readAePinFamily()).toBe("ask");
++      window.localStorage.clear();
++      expect(readAePinFamily()).toBe("ask");
++    });
++
++    it("asks before pinning; the whole family pins every open session", async () => {
++      sessionList([LEAD, child("a")]);
++      toggle(LEAD, false);
++      await vi.waitFor(() => expect(question()).toEqual({ action: "pin", title: "lead" }));
++      expect(writePin).not.toHaveBeenCalled();
++      answerPinFamily("family");
++      await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++      expect(alone).not.toHaveBeenCalled();
++    });
++
++    it("pins only the parent when asked to", async () => {
++      sessionList([LEAD, child("a")]);
++      toggle(LEAD, false);
++      await vi.waitFor(() => expect(question()).not.toBeNull());
++      answerPinFamily("parent");
++      await vi.waitFor(() => expect(alone).toHaveBeenCalledTimes(1));
++      expect(writePin).not.toHaveBeenCalled();
++    });
++
++    it("does nothing on Cancel", async () => {
++      sessionList([LEAD, child("a")]);
++      toggle(LEAD, false);
++      await vi.waitFor(() => expect(question()).not.toBeNull());
++      answerPinFamily("cancel");
++      await settle();
++      expect(alone).not.toHaveBeenCalled();
++      expect(writePin).not.toHaveBeenCalled();
++      expect(question()).toBeNull();
++    });
++
++    it("asks before unpinning; the whole family unpins, only the parent runs alone", async () => {
++      sessionList([LEAD, child("a")]);
++      pinned({ lead: 1, a: 2 });
++      toggle(LEAD, true);
++      await vi.waitFor(() => expect(question()).toEqual({ action: "unpin", title: "lead" }));
++      answerPinFamily("family");
++      await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++      expect(writePin.mock.calls.map(([w]) => w)).toEqual([
++        { id: "lead", pinned: false },
++        { id: "a", pinned: false },
++      ]);
++
++      resetAePinFamilyForTests();
++      writePin.mockClear();
++      toggle(LEAD, true);
++      await vi.waitFor(() => expect(question()).not.toBeNull());
++      answerPinFamily("parent");
++      await vi.waitFor(() => expect(alone).toHaveBeenCalledTimes(1));
++      expect(writePin).not.toHaveBeenCalled();
++    });
++
++    it("does not ask for a lead with no open session, or none pinned to unpin", async () => {
++      sessionList([LEAD, child("ref", "reference")]);
++      toggle(LEAD, false);
++      await vi.waitFor(() => expect(alone).toHaveBeenCalledTimes(1));
++      expect(question()).toBeNull();
++
++      resetAePinFamilyForTests();
++      sessionList([LEAD, child("a")]);
++      pinned({ lead: 1 });
++      toggle(LEAD, true);
++      await vi.waitFor(() => expect(alone).toHaveBeenCalledTimes(2));
++      expect(question()).toBeNull();
++    });
++
++    it("falls back to the single toggle when the family cannot be read", async () => {
++      mocks.read.mockRejectedValue(new Error("offline"));
++      toggle(LEAD, false);
++      await vi.waitFor(() => expect(alone).toHaveBeenCalledTimes(1));
++      expect(mocks.showToast).not.toHaveBeenCalled();
++      expect(question()).toBeNull();
++    });
++
++    it("does not ask while the setting is family", async () => {
++      writeAePinFamily("family");
++      sessionList([LEAD, child("a")]);
++      toggle(LEAD, false);
++      await vi.waitFor(() => expect(writePin).toHaveBeenCalledTimes(2));
++      expect(question()).toBeNull();
++    });
++  });
+ });
+diff --git a/web/src/shell/aePinFamily.ts b/web/src/shell/aePinFamily.ts
+index 0287afb9c8738cf7d85679e89eb909af6ddffd14..5b15e4a6409f293f75ba2892cbf498e5e60e30c2 100644
+--- a/web/src/shell/aePinFamily.ts
++++ b/web/src/shell/aePinFamily.ts
+@@ -1,11 +1,14 @@
+-// Pin and unpin a family with its lead (omnigent-ae, 2026-10-26). With
+-// Settings > Chat > "Pin a lead's family" on (lib/aePinFamily.ts), pinning a
+-// session that leads a family also pins its open sessions (not reference or
+-// archived ones), lead first so the family lists together in Pinned; a family
+-// that needs more pin spots than are free pins nothing and says so. Unpinning
+-// the lead unpins every pinned session of the family, with one Undo. With the
+-// setting off, or for a session that leads no family, `alone` runs the single
+-// pin or unpin as before. The family comes from a fresh read (lib/aeFamilyRead.ts).
++// Pin and unpin a family with its lead (omnigent-ae, 2026-10-26; the question
++// 2026-10-31). Settings > Chat > "Pin a lead's family" (lib/aePinFamily.ts) is
++// "ask" (a dialog each time), "family" (always) or "parent" (never). Taking the
++// family, pinning a session that leads one also pins its open sessions (not
++// reference or archived ones), lead first so the family lists together in
++// Pinned; a family that needs more pin spots than are free pins nothing and
++// says so. Unpinning the lead unpins every pinned session of the family, with
++// one Undo. Only the parent, or a session that leads no family or has nothing
++// to bring along, runs `alone`, the single pin or unpin, with no question.
++// The family comes from a fresh read (lib/aeFamilyRead.ts); when asking, a
++// failed read falls back to the single pin or unpin.
+ 
+ import type { QueryClient } from "@tanstack/react-query";
+ import { toast } from "sonner";
+@@ -19,6 +22,7 @@ import { aeFamilyParent } from "@/lib/aeFamily";
+ import { aeIsClosedMember } from "@/lib/aeFamilyClosed";
+ import { aeFamilyOf, aeReadFamilySessions } from "@/lib/aeFamilyRead";
+ import { readAePinFamily } from "@/lib/aePinFamily";
++import { askPinFamily } from "@/lib/aePinFamilyChoice";
+ import { getCurrentUserId } from "@/lib/identity";
+ import { PINNED_LABEL_KEY } from "@/lib/sessionListCache";
+ import { sessionVisibility } from "@/lib/sessionVisibility";
+@@ -205,7 +209,8 @@ export function aeTogglePinFamily({
+   includeShared: boolean;
+   alone: () => void;
+ }): void {
+-  if (!readAePinFamily()) {
++  const mode = readAePinFamily();
++  if (mode === "parent") {
+     alone();
+     return;
+   }
+@@ -229,25 +234,45 @@ export function aeTogglePinFamily({
+           alone();
+           return undefined;
+         }
++        const title = lead.title ?? null;
++        const cascade = async (takeFamily: () => Promise<void>) => {
++          if (mode === "ask") {
++            const answer = await askPinFamily({ action: pinned ? "unpin" : "pin", title });
++            if (answer === "cancel") return;
++            if (answer === "parent") {
++              alone();
++              return;
++            }
++          }
++          await takeFamily();
++        };
+         if (pinned) {
+           const now = pinnedNow(queryClient);
+           if (!others.some((c) => now.has(c.id))) {
+             alone();
+             return undefined;
+           }
+-          return unpinFamily(queryClient, writePin, family, lead);
++          return cascade(() => unpinFamily(queryClient, writePin, family, lead));
+         }
+         const open = others.filter((c) => c.archived !== true && !aeIsClosedMember(c));
+         if (open.length === 0) {
+           alone();
+           return undefined;
+         }
+-        return pinFamily(queryClient, writePin, family, session.id, pinCap, includeShared);
++        return cascade(() =>
++          pinFamily(queryClient, writePin, family, session.id, pinCap, includeShared),
++        );
+       },
+-      () =>
++      () => {
++        // Asking is the default, so a failed read must not stop a plain pin.
++        if (mode === "ask") {
++          alone();
++          return;
++        }
+         showToast(
+           `Couldn't read the family's sessions, so nothing was ${pinned ? "unpinned" : "pinned"}. Try again.`,
+-        ),
++        );
++      },
+     );
+ }
+ 

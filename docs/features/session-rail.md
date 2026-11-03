@@ -53,7 +53,7 @@ While Claude Code is still starting, Context shows a loading line and retries qu
 
 <p align="center"><img src="../media/rail-context-fold.webp" alt="Context categories"></p>
 
-Context reads Claude Code's own breakdown of the window: how much each category uses, and how much room is left before auto-compact, with a Compact button beside it. The category rows fold under Categories, shut by default with a count at its end. Opened, each row carries the same color as its part of the bar, and deferred tools sit inside the fold, marked as costing nothing until Claude loads them.
+Context reads Claude Code's own breakdown of the window: how much each category uses, and how much room is left before auto-compact, with a Compact button beside it, which queues the compact for a safe point and has the chat save its notes first (see [Action dock](action-dock.md)). The category rows fold under Categories, shut by default with a count at its end. Opened, each row carries the same color as its part of the bar, and deferred tools sit inside the fold, marked as costing nothing until Claude loads them.
 
 **Where:** Categories in the Context section of the session rail.<br>
 **Built from:** core patches [`0064`](../../patches/0064-ae-patch-Label-context-window-colors-directly-beneat.patch), [`0065`](../../patches/0065-ae-patch-Match-context-legend-colors-to-detailed-cat.patch), [`0071`](../../patches/0071-ae-patch-Add-a-session-rail-beside-the-chat-and-slim.patch), [`0113`](../../patches/0113-ae-patch-Fold-the-rail-s-context-category-rows-under.patch), [`0114`](../../patches/0114-ae-patch-Move-deferred-tools-inside-the-rail-s-Categ.patch), [`0115`](../../patches/0115-ae-patch-Tidy-the-rail-s-Categories-fold-no-gap-whil.patch)

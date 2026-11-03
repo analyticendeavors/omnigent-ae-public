@@ -1,0 +1,693 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 12:17:41 -0800
+Subject: [PATCH 276/289] [ae-patch] Add a conditional security reviewer slot
+ to roles presets
+
+A reviewer slot may carry when: risky and focus: security. The lead notice
+lists such a slot in its numbered position with an explicit trigger list and
+says to skip it, and merge the rest as usual, when the diff is not risky. The
+web editor gets a runs select (not on Reviewer 1) and a focus select on every
+slot, each with a hint. Slots without the fields render exactly as before.
+---
+ omnigent/inner/ae_reviewers.py                |  71 ++++++++++--
+ tests/inner/test_ae_roles.py                  | 101 +++++++++++++++++-
+ web/src/lib/aeReviewers.test.ts               |  60 +++++++++++
+ web/src/lib/aeReviewers.ts                    |  63 +++++++++--
+ web/src/lib/aeSettingHints.test.ts            |  15 +++
+ web/src/lib/aeSettingHints.ts                 |  10 ++
+ .../pages/settings/AeReviewerRows.test.tsx    |  49 +++++++++
+ web/src/pages/settings/AeReviewerRows.tsx     |  83 +++++++++++++-
+ 8 files changed, 436 insertions(+), 16 deletions(-)
+
+diff --git a/omnigent/inner/ae_reviewers.py b/omnigent/inner/ae_reviewers.py
+index 05341409e8529f8989661fa1a9bdbe386ff02e8e..587ab08d046a898564e02881d5dd253428ee9617 100644
+--- a/omnigent/inner/ae_reviewers.py
++++ b/omnigent/inner/ae_reviewers.py
+@@ -19,6 +19,12 @@ lead's own subagents (``own``) cannot start child sessions, so its agent slots
+ are named as skipped. The planner, builder and helper settings may also be a Codex
+ slot (2026-10-26, :func:`worker_text`); the same rule skips it.
+ 
++A Claude or agent slot may also carry ``when: "risky"`` and ``focus: "security"``
++(2026-11-01). A risky slot runs only when the diff touches the areas in
++:data:`RISKY_TRIGGERS`; a security-focus slot reviews security alone and reports only
++issues with a concrete attack path. Slot 1 never carries ``when``: it takes the fix
++checks. A slot with neither field renders exactly as before.
++
+ :func:`ae_roles.render_roles` calls :func:`reviewer_lines` for the preset in
+ force and :func:`reviewers_short` for each lead-picks line.
+ """
+@@ -39,6 +45,16 @@ CODEX_AGENT_NAME = "codex-native-ui"
+ _LABEL = "Reviewer (reviews, verifying a finding, fix checks)"
+ _LABEL_MANY = "Reviewers (final review of a build)"
+ 
++RISKY_TRIGGERS = (
++    "authentication or OAuth, secrets or key vaults, MCP servers, HTTP endpoints or "
++    "Workers, parsing of outside input, permissions or policies, or anything bound for "
++    "the public repo"
++)
++_SECURITY_BRIEF = (
++    "brief it from the security-audit skill's focused-review mode and have it report "
++    "only issues with a concrete attack path"
++)
++
+ ModelText = Callable[[object, object], str]
+ 
+ 
+@@ -158,6 +174,30 @@ def _claude(slot: dict[str, object], model_text: ModelText, current: object) ->
+     return f"{model_text(slot, current)} (native subagent)"
+ 
+ 
++def _is_risky(slot: dict[str, object]) -> bool:
++    return slot.get("when") == "risky"
++
++
++def _is_security(slot: dict[str, object]) -> bool:
++    return slot.get("focus") == "security"
++
++
++def _scope(slot: dict[str, object]) -> str:
++    """What a slot's ``focus`` and ``when`` add to its listing; empty for a plain slot."""
++    parts = ["security only"] if _is_security(slot) else []
++    if _is_risky(slot):
++        parts.append(f"run only when the diff touches {RISKY_TRIGGERS}")
++    if _is_security(slot):
++        parts.append(_SECURITY_BRIEF)
++    return ", ".join(parts)
++
++
++def _slot_text(slot: dict[str, object], model_text: ModelText, current: object) -> str:
++    base = _agent(slot) if _is_agent(slot) else _claude(slot, model_text, current)
++    scope = _scope(slot)
++    return f"{base}, {scope}" if scope else base
++
++
+ def _split(
+     found: list[dict[str, object]], rules: dict[str, object]
+ ) -> tuple[list[dict[str, object]], str]:
+@@ -216,10 +256,12 @@ def reviewer_lines(
+             one = f"{_agent(usable[0])}; a review never goes to an existing session"
+         else:
+             one = model_text(usable[0], current)
++        if usable and _scope(usable[0]):
++            one += f", {_scope(usable[0])}"
+         note = f" ({skip_note})" if skip_note else ""
+         return [f"- {_LABEL}: {one}{note}."]
+     listed = " ".join(
+-        f"{index}. {_agent(slot) if _is_agent(slot) else _claude(slot, model_text, current)}."
++        f"{index}. {_slot_text(slot, model_text, current)}."
+         for index, slot in enumerate(usable, start=1)
+     )
+     lists = (
+@@ -234,6 +276,15 @@ def reviewer_lines(
+     )
+     if skip_note:
+         unavailable += f" {skip_note[0].upper()}{skip_note[1:]}."
++    risky = [index for index, slot in enumerate(usable, start=1) if _is_risky(slot)]
++    skipped_when = (
++        f" Reviewer{'s' if len(risky) > 1 else ''} {' and '.join(map(str, risky))} "
++        f"{'run' if len(risky) > 1 else 'runs'} only when the diff is risky as listed; "
++        "when it is not, skip "
++        f"{'them' if len(risky) > 1 else 'it'}, say so in one line, and merge the rest as usual."
++        if risky
++        else ""
++    )
+     return [
+         f"- {_LABEL_MANY}: {listed}",
+         "  These reviewers replace the /dual-review offer; run them when the work is done, "
+@@ -243,7 +294,7 @@ def reviewer_lines(
+         "handing work to the team, for reviews only. Then merge into one verdict: dedupe, "
+         "mark agreements, settle each disagreement with a one-line reason, rank by severity, "
+         f"{lists}.",
+-        f"  Fix checks and verifying one finding: reviewer 1 only. {unavailable}",
++        f"  Fix checks and verifying one finding: reviewer 1 only. {unavailable}{skipped_when}",
+     ]
+ 
+ 
+@@ -260,11 +311,13 @@ def reviewers_short(setting: object, rules: object, current: object, model_text:
+     found = slots(setting)
+     if not found:
+         return f"reviewer {model_text(setting, current)}"
+-    if not any(_is_agent(slot) for slot in found) and len(found) < 2:
++    if not any(_is_agent(slot) or _is_security(slot) for slot in found) and len(found) < 2:
+         return f"reviewer {model_text(found[0], current)}"
+     usable, skip_note = _split(found, rules)
+     names = [
+-        _agent(slot, brief=True) if _is_agent(slot) else model_text(slot, current)
++        (_agent(slot, brief=True) if _is_agent(slot) else model_text(slot, current))
++        + (" (security only, only when the diff is risky)" if _is_risky(slot) else "")
++        + (" (security only)" if _is_security(slot) and not _is_risky(slot) else "")
+         for slot in usable
+     ]
+     text = f"reviewer{'s' if len(names) > 1 else ''} {' + '.join(names) or 'your pick'}"
+@@ -285,7 +338,9 @@ def several(setting: object) -> bool:
+ 
+ def explained(setting: object) -> bool:
+     """Whether a lead-picks line for *setting* needs :data:`MANY_PICKS` to make sense."""
+-    return several(setting) or any(_is_agent(slot) for slot in slots(setting))
++    return several(setting) or any(
++        _is_agent(slot) or _is_security(slot) for slot in slots(setting)
++    )
+ 
+ 
+ MANY_PICKS = (
+@@ -295,5 +350,9 @@ MANY_PICKS = (
+     "agreements, settle disagreements, rank by severity; unless the line says otherwise, "
+     "keep each list under it and, for a reviewer that cannot start, skip it and say so. "
+     "Agents run as a fresh session each review, never an existing one; fix checks go "
+-    "to reviewer 1."
++    "to reviewer 1. A reviewer marked security only reviews security alone; one marked "
++    "only when the diff is risky runs only when the diff touches authentication or OAuth, "
++    "secrets or key vaults, MCP servers, HTTP endpoints or Workers, parsing of outside "
++    "input, permissions or policies, or anything bound for the public repo, otherwise skip "
++    "it and merge the rest as usual."
+ )
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 2cc3463957c289a7c2efc74d002d8f90beaafbc0..2a36979bc21e2b49ef43b5e0a67731dc591ff201 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -344,8 +344,12 @@ def test_balanced_wording_matches_the_contract(prefs: dict[str, Any]) -> None:
+         "Roles preset: Balanced. Name a role for each helper you start and give a native "
+         "subagent that role's model and effort. Native subagents (Claude's Agent tool) take "
+         "a tier alias (opus, sonnet, haiku, fable) and an effort. For a separate session, "
+-        "name its role in the brief. " + ae_roles._SESSION_ROLE + " " + ae_roles._SUBAGENT_ROLE
+-        + " " + ae_roles._REPORT_REVIEW,
++        "name its role in the brief. "
++        + ae_roles._SESSION_ROLE
++        + " "
++        + ae_roles._SUBAGENT_ROLE
++        + " "
++        + ae_roles._REPORT_REVIEW,
+         "- Lead: you, on the session model.",
+         "- Planner (design, architecture, unknown root cause): opus, high.",
+         "- Reviewer (reviews, verifying a finding, fix checks): sonnet, medium.",
+@@ -693,6 +697,99 @@ def test_junk_reviewer_values_render_safely() -> None:
+         assert "- Reviewer (reviews, verifying a finding, fix checks): your pick." in text
+ 
+ 
++OPUS_HIGH = {"mode": "fixed", "model": "claude-opus-5-5", "effort": "high"}
++SECURITY = {**OPUS_HIGH, "when": "risky", "focus": "security"}
++_TRIGGERS = (
++    "authentication or OAuth, secrets or key vaults, MCP servers, HTTP endpoints or "
++    "Workers, parsing of outside input, permissions or policies, or anything bound for "
++    "the public repo"
++)
++
++
++def test_a_risky_security_slot_renders_in_its_numbered_position() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM, CODEX, SECURITY)
++    lines = (render_roles({"preset": preset, "custom": False, "current": CURRENT}) or "").split(
++        "\n"
++    )
++    assert len(lines) == 9
++    assert lines[3].endswith(
++        f" 3. opus, high (native subagent), security only, run only when the diff touches "
++        f"{_TRIGGERS}, brief it from the security-audit skill's focused-review mode and have "
++        "it report only issues with a concrete attack path."
++    )
++    assert lines[3].startswith("- Reviewers (final review of a build): 1. sonnet, medium")
++    assert lines[5].endswith(
++        "Reviewer 3 runs only when the diff is risky as listed; when it is not, skip it, "
++        "say so in one line, and merge the rest as usual."
++    )
++
++
++def test_one_always_on_slot_and_one_risky_slot_read_correctly() -> None:
++    preset = _with_reviewers(SONNET_MEDIUM, SECURITY)
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert (
++        "1. sonnet, medium (native subagent). 2. opus, high (native subagent), security only"
++        in text
++    )
++    assert "when it is not, skip it, say so in one line, and merge the rest as usual." in text
++    assert "Fix checks and verifying one finding: reviewer 1 only." in text
++
++
++def test_a_security_slot_that_always_runs_has_no_skip_line() -> None:
++    always = {**OPUS_HIGH, "focus": "security"}
++    text = render_roles(
++        {"preset": _with_reviewers(SONNET_MEDIUM, always), "custom": False, "current": CURRENT}
++    )
++    assert "2. opus, high (native subagent), security only, brief it from the" in (text or "")
++    assert "run only when the diff touches" not in (text or "")
++    assert "skip it, say so" not in (text or "")
++
++
++def test_a_risky_agent_slot_is_scoped_too() -> None:
++    text = render_roles(
++        {
++            "preset": _with_reviewers(SONNET_MEDIUM, {**CODEX, "when": "risky"}),
++            "custom": False,
++            "current": CURRENT,
++        }
++    )
++    assert f"its default model), run only when the diff touches {_TRIGGERS}." in (text or "")
++
++
++def test_slots_without_the_new_fields_render_unchanged() -> None:
++    text = render_roles(
++        {
++            "preset": _with_reviewers(SONNET_MEDIUM, {**OPUS_HIGH, "when": "always"}),
++            "custom": False,
++            "current": CURRENT,
++        }
++    )
++    assert "2. opus, high (native subagent)." in (text or "")
++    assert "run only when" not in (text or "")
++
++
++def test_a_lone_usable_risky_slot_keeps_its_scope() -> None:
++    preset = _with_reviewers(CODEX, SECURITY, helpers="own")
++    text = render_roles({"preset": preset, "custom": False, "current": CURRENT}) or ""
++    assert f"opus, high, security only, run only when the diff touches {_TRIGGERS}" in text
++
++
++def test_lead_picks_name_the_risky_security_slot(prefs: dict[str, Any]) -> None:
++    prefs["presets"] = [
++        BALANCED,
++        _with_reviewers(SONNET_MEDIUM, SECURITY) | {"id": "two", "title": "Two"},
++    ]
++    roles = resolve_roles(conversation(team_label(roles={"preset": "lead-picks"})), owner_store())
++    lines = (render_roles(roles) or "").split("\n")
++    assert (
++        "reviewers sonnet, medium + opus, high (security only, only when the diff is risky);"
++        in lines[2]
++    )
++    assert lines[-1].startswith("Reviewers named with an agent or with several: run all")
++    assert "A reviewer marked security only reviews security alone" in lines[-1]
++    assert len(lines) < 12
++
++
+ def test_real_balanced_starter_carries_codex(monkeypatch: pytest.MonkeyPatch) -> None:
+     role_prefs = pytest.importorskip("ae_omni_policies.role_prefs")
+     starter = next(p for p in role_prefs.starters() if p["id"] == "balanced")
+diff --git a/web/src/lib/aeReviewers.test.ts b/web/src/lib/aeReviewers.test.ts
+index 229f5d9366dc14bb5cd6c518fde76a7a7d0b7fe7..c913b83af9a1e419992575ee80d929da1e3ca22e 100644
+--- a/web/src/lib/aeReviewers.test.ts
++++ b/web/src/lib/aeReviewers.test.ts
+@@ -15,6 +15,7 @@ import {
+   aeReviewerNumbers,
+   aeReviewsCard,
+   aeReviewerSummary,
++  aeWithReviewScope,
+   aeWriteReviewers,
+ } from "./aeReviewers";
+ 
+@@ -233,3 +234,62 @@ describe("aeReviewers", () => {
+     });
+   });
+ });
++
++describe("the security reviewer slot", () => {
++  const opus = { mode: "fixed" as const, model: "claude-opus-5-5", effort: "high" as const };
++  const security = { ...opus, when: "risky" as const, focus: "security" as const };
++
++  it("parses and writes back when and focus on a later slot, Claude or agent", () => {
++    const value = { mode: "multi", reviewers: [opus, { ...codex, agent_name: null }, security] };
++    expect(aeParseReviewerMulti(value)).toEqual(value);
++    const agent = { ...codex, agent_name: null, when: "risky", focus: "security" };
++    expect(aeParseReviewerMulti({ mode: "multi", reviewers: [opus, agent] })?.reviewers[1]).toEqual(
++      agent,
++    );
++    expect(aeWriteReviewers([opus, security])).toEqual({
++      mode: "multi",
++      reviewers: [opus, security],
++    });
++  });
++
++  it("leaves slots without the fields exactly as they were", () => {
++    const parsed = aeParseReviewerMulti({ mode: "multi", reviewers: [opus, opus] });
++    expect(parsed?.reviewers[1]).toStrictEqual(opus);
++  });
++
++  it("refuses a risky first slot and values the server would refuse", () => {
++    expect(
++      aeParseReviewerMulti({ mode: "multi", reviewers: [{ ...opus, when: "risky" }] }),
++    ).toBeNull();
++    for (const bad of [{ when: "sometimes" }, { focus: "speed" }]) {
++      expect(
++        aeParseReviewerMulti({ mode: "multi", reviewers: [opus, { ...opus, ...bad }] }),
++      ).toBeNull();
++    }
++  });
++
++  it("accepts a first slot that is security only and always runs", () => {
++    const first = { ...opus, when: "always" as const, focus: "security" as const };
++    expect(aeParseReviewerMulti({ mode: "multi", reviewers: [first] })?.reviewers[0]).toEqual(
++      first,
++    );
++  });
++
++  it("keeps a lone security-only slot in the multi shape", () => {
++    const lone = { ...opus, focus: "security" as const };
++    expect(aeWriteReviewers([lone])).toEqual({ mode: "multi", reviewers: [lone] });
++    expect(aeWriteReviewers([opus])).toEqual(opus);
++  });
++
++  it("sets and clears the scope, leaving the default unwritten", () => {
++    expect(aeWithReviewScope(opus, { when: "risky", focus: "security" })).toEqual(security);
++    expect(aeWithReviewScope(security, { when: "always" })).toStrictEqual(opus);
++    expect(aeWithReviewScope({ mode: "auto" }, { when: "risky" })).toEqual({ mode: "auto" });
++  });
++
++  it("names the scope in the summary", () => {
++    expect(aeReviewerSummary({ mode: "multi", reviewers: [opus, security] })).toBe(
++      "Opus 5.5 high + Opus 5.5 high, security only, only if risky",
++    );
++  });
++});
+diff --git a/web/src/lib/aeReviewers.ts b/web/src/lib/aeReviewers.ts
+index 514521dfbc6d95edbb7d856ea0c504b73582681d..8fdf5bec026b9e69eb6e9bda33d94830bf50cfc8 100644
+--- a/web/src/lib/aeReviewers.ts
++++ b/web/src/lib/aeReviewers.ts
+@@ -28,7 +28,19 @@ export const AE_CODEX_AGENT_ID = "16a06503889b0c3034496821afd41b9e";
+ export const AE_CODEX_AGENT_NAME = "codex-native-ui";
+ const AGENT_NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+ 
+-export interface AeReviewerAgentSlot {
++/**
++ * Conditional security review (2026-11-01): "risky" runs the slot only when the diff
++ * touches security-relevant areas (never slot 1, which takes the fix checks); "security"
++ * reviews security alone. Absent reads as always, and a general review.
++ */
++export type AeReviewWhen = "always" | "risky";
++export type AeReviewFocus = "security";
++export interface AeReviewScope {
++  when?: AeReviewWhen;
++  focus?: AeReviewFocus;
++}
++
++export interface AeReviewerAgentSlot extends AeReviewScope {
+   mode: "agent";
+   agent: string;
+   /** The agent's registered name ("codex-native-ui"); the live id is found by it when set. */
+@@ -42,7 +54,9 @@ export interface AeReviewerAgentSlot {
+ }
+ 
+ export type AeReviewerSlot =
+-  { mode: "auto" } | { mode: "fixed"; model: string; effort: AeRoleEffort } | AeReviewerAgentSlot;
++  | { mode: "auto" }
++  | ({ mode: "fixed"; model: string; effort: AeRoleEffort } & AeReviewScope)
++  | AeReviewerAgentSlot;
+ 
+ export interface AeReviewerMulti {
+   mode: "multi";
+@@ -89,14 +103,32 @@ function isAgentEffort(value: unknown): value is AeAgentEffort {
+   return (AE_AGENT_EFFORTS as readonly unknown[]).includes(value);
+ }
+ 
++/** The `when` and `focus` a stored slot carries; null when either holds a value the server refuses. */
++function parseScope(value: Record<string, unknown>, index: number): AeReviewScope | null {
++  const { when, focus } = value;
++  if (when != null && when !== "always" && when !== "risky") return null;
++  if (focus != null && focus !== "security") return null;
++  // Slot 1 takes the fix checks, so it always runs.
++  if (when === "risky" && index === 0) return null;
++  return {
++    ...(when ? { when } : {}),
++    ...(focus ? { focus } : {}),
++  };
++}
++
+ function parseSlot(value: unknown, index: number): AeReviewerSlot | null {
+   if (!isObject(value)) return null;
+   if (value.mode === "auto") return index === 0 ? { mode: "auto" } : null;
+   if (value.mode === "fixed") {
+     if (typeof value.model !== "string" || !value.model || !isEffort(value.effort)) return null;
+-    return { mode: "fixed", model: value.model, effort: value.effort };
++    const scope = parseScope(value, index);
++    return scope && { mode: "fixed", model: value.model, effort: value.effort, ...scope };
++  }
++  if (value.mode === "agent") {
++    const scope = parseScope(value, index);
++    const slot = scope && aeParseAgentSlot(value);
++    return slot && { ...slot, ...scope };
+   }
+-  if (value.mode === "agent") return aeParseAgentSlot(value);
+   return null;
+ }
+ 
+@@ -149,7 +181,9 @@ export function aeWriteReviewers(slots: readonly AeReviewerSlot[]): AeReviewerSe
+     .filter((slot, i) => slot.mode !== "auto" || i === 0)
+     .slice(0, AE_REVIEWERS_MAX);
+   if (kept.length === 0) return { mode: "auto" };
+-  if (kept.length === 1 && kept[0].mode !== "agent") return kept[0];
++  // A lone slot with a security focus keeps the multi shape: the plain setting has no focus.
++  if (kept.length === 1 && kept[0].mode !== "agent" && !("focus" in kept[0] && kept[0].focus))
++    return kept[0];
+   return { mode: "multi", reviewers: kept };
+ }
+ 
+@@ -159,11 +193,26 @@ export function aeReviewerRowLabel(setting: AeReviewerSetting): string {
+ }
+ 
+ function slotSummary(slot: AeReviewerSlot): string {
+-  if (slot.mode === "fixed") return `${aeModelLabel(slot.model)} ${slot.effort}`;
+-  if (slot.mode === "agent") return slot.name;
++  const scope =
++    slot.mode === "auto"
++      ? ""
++      : `${slot.focus === "security" ? ", security only" : ""}${slot.when === "risky" ? ", only if risky" : ""}`;
++  if (slot.mode === "fixed") return `${aeModelLabel(slot.model)} ${slot.effort}${scope}`;
++  if (slot.mode === "agent") return `${slot.name}${scope}`;
+   return "auto";
+ }
+ 
++/** A copy of `slot` with its review scope set; "always" and a general review are left unwritten. */
++export function aeWithReviewScope(slot: AeReviewerSlot, scope: AeReviewScope): AeReviewerSlot {
++  if (slot.mode === "auto") return slot;
++  const { when: _when, focus: _focus, ...rest } = slot;
++  return {
++    ...rest,
++    ...(scope.when === "risky" ? { when: "risky" as const } : {}),
++    ...(scope.focus === "security" ? { focus: "security" as const } : {}),
++  } as AeReviewerSlot;
++}
++
+ /** "Sonnet 5.5 medium + Codex". */
+ export function aeReviewerSummary(setting: AeReviewerSetting): string {
+   return aeReviewerList(setting).map(slotSummary).join(" + ");
+diff --git a/web/src/lib/aeSettingHints.test.ts b/web/src/lib/aeSettingHints.test.ts
+index e971947cdbdadb47f8220a41357f09330c8820ea..b012c1df89b775b151490753c8cb1f3a8a608b16 100644
+--- a/web/src/lib/aeSettingHints.test.ts
++++ b/web/src/lib/aeSettingHints.test.ts
+@@ -20,6 +20,8 @@ const CHOICES = [
+   "rules.lead_steps_down",
+   "rules.auto_raises",
+   "rules.helpers",
++  "reviewer.when",
++  "reviewer.focus",
+   "rules.review_merge",
+   "rules.reviewer_unavailable",
+   "insights.show",
+@@ -81,3 +83,16 @@ describe("the Older models hint", () => {
+     expect(hint.length).toBeLessThanOrEqual(AE_HINT_MAX);
+   });
+ });
++
++describe("the security reviewer hints", () => {
++  it("say what each choice does, and that Reviewer 1 always runs", () => {
++    const when = AE_SETTING_HINTS["reviewer.when"].hint;
++    expect(when).toContain("Always (default)");
++    expect(when).toContain("Only if risky");
++    expect(when).toContain("Not Reviewer 1");
++    const focus = AE_SETTING_HINTS["reviewer.focus"].hint;
++    expect(focus).toContain("General review (default)");
++    expect(focus).toContain("Security only");
++    expect(focus).toContain("concrete attack path");
++  });
++});
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index fa0f08924379b2699b0600a2771d28049c28a179..9931a74826dd29bcfa5347ed429c0a13e0e7884a 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -65,6 +65,16 @@ export const AE_SETTING_HINTS = {
+     hint: "Earlier versions sit under Older models. The group with the model you use now opens on its own, so it is never hidden.",
+     source: "tooltip",
+   },
++  "reviewer.when": {
++    label: "Reviewer runs",
++    hint: "Always (default): every final review. Only if risky: skipped unless the diff touches auth, secrets, endpoints or policies. Not Reviewer 1.",
++    source: "tooltip",
++  },
++  "reviewer.focus": {
++    label: "Reviewer focus",
++    hint: "General review (default) looks at everything. Security only checks for security issues and reports only those with a concrete attack path.",
++    source: "tooltip",
++  },
+   "reviewer.add": {
+     label: "Adding reviewers",
+     hint: "Adds a reviewer, up to 3. The new one is Codex on its Sol model if ready, else a Claude model not used yet. The x removes one.",
+diff --git a/web/src/pages/settings/AeReviewerRows.test.tsx b/web/src/pages/settings/AeReviewerRows.test.tsx
+index d93245a0f76165f0cb061988e76e69dc05c36951..47cf84236d9c703488fd3908b137b085f674df95 100644
+--- a/web/src/pages/settings/AeReviewerRows.test.tsx
++++ b/web/src/pages/settings/AeReviewerRows.test.tsx
+@@ -659,4 +659,53 @@ describe("Codex reviewers in the one dropdown", () => {
+     expect(add).toHaveAttribute("title", "Codex host is offline");
+     expect(add).toHaveTextContent("codex host is offline");
+   });
++
++  describe("the security reviewer controls", () => {
++    const security = { ...sonnet, when: "risky" as const, focus: "security" as const };
++
++    it("offers when and focus on a later slot, and focus only on slot 1", () => {
++      render(<Harness initial={{ mode: "multi", reviewers: [sonnet, sonnet] }} onSave={vi.fn()} />);
++      expect(screen.getByLabelText("Reviewer 2 runs")).toBeInstanceOf(HTMLSelectElement);
++      expect(screen.getByLabelText("Reviewer 2 focus")).toBeInstanceOf(HTMLSelectElement);
++      expect(screen.getByLabelText("Reviewer 1 focus")).toBeInstanceOf(HTMLSelectElement);
++      expect(screen.queryByLabelText("Reviewer 1 runs")).toBeNull();
++      expect(screen.getAllByTestId("ae-hint-reviewer.when")).toHaveLength(1);
++      expect(screen.getAllByTestId("ae-hint-reviewer.focus")).toHaveLength(2);
++    });
++
++    it("writes when and focus onto the slot, and nothing for the defaults", () => {
++      const onSave = vi.fn();
++      render(<Harness initial={{ mode: "multi", reviewers: [sonnet, sonnet] }} onSave={onSave} />);
++      fireEvent.change(screen.getByLabelText("Reviewer 2 runs"), { target: { value: "risky" } });
++      expect(onSave).toHaveBeenLastCalledWith({
++        mode: "multi",
++        reviewers: [sonnet, { ...sonnet, when: "risky" }],
++      });
++      fireEvent.change(screen.getByLabelText("Reviewer 2 focus"), {
++        target: { value: "security" },
++      });
++      expect(onSave).toHaveBeenLastCalledWith({ mode: "multi", reviewers: [sonnet, security] });
++      fireEvent.change(screen.getByLabelText("Reviewer 2 runs"), { target: { value: "always" } });
++      expect(onSave).toHaveBeenLastCalledWith({
++        mode: "multi",
++        reviewers: [sonnet, { ...sonnet, focus: "security" }],
++      });
++    });
++
++    it("shows a saved security slot and keeps a lone security-only slot in the multi shape", () => {
++      const onSave = vi.fn();
++      render(
++        <Harness initial={{ mode: "multi", reviewers: [sonnet, security] }} onSave={onSave} />,
++      );
++      expect(screen.getByLabelText("Reviewer 2 runs")).toHaveValue("risky");
++      expect(screen.getByLabelText("Reviewer 2 focus")).toHaveValue("security");
++      fireEvent.change(screen.getByLabelText("Reviewer 1 focus"), {
++        target: { value: "security" },
++      });
++      expect(onSave).toHaveBeenLastCalledWith({
++        mode: "multi",
++        reviewers: [{ ...sonnet, focus: "security" }, security],
++      });
++    });
++  });
+ });
+diff --git a/web/src/pages/settings/AeReviewerRows.tsx b/web/src/pages/settings/AeReviewerRows.tsx
+index a41b636b2126221f3746b0c0dc857e9555cdc59f..aa1a36287f21646f4cd588a019553ea150150a14 100644
+--- a/web/src/pages/settings/AeReviewerRows.tsx
++++ b/web/src/pages/settings/AeReviewerRows.tsx
+@@ -34,6 +34,7 @@ import {
+   aeReviewerRowLabel,
+   aeReviewerUnavailableOf,
+   aeReviewMergeOf,
++  aeWithReviewScope,
+   aeWriteReviewers,
+ } from "@/lib/aeReviewers";
+ import { AE_ROLE_LABELS, type AeRoleEffort, type AeRoleRules, aeHelpersOf } from "@/lib/aeRoles";
+@@ -146,6 +147,72 @@ function AgentDetails({
+   );
+ }
+ 
++// Conditional security review (2026-11-01): when the slot runs, and what it looks at. Slot 1
++// has no "when" (it takes the fix checks, so it always runs). Native selects, as its neighbours.
++function ScopeControls({
++  slot,
++  index,
++  label,
++  disabled,
++  onChange,
++}: {
++  slot: AeReviewerSlot;
++  index: number;
++  label: string;
++  disabled: boolean;
++  onChange: (slot: AeReviewerSlot) => void;
++}) {
++  if (slot.mode === "auto") return null;
++  const selectClass =
++    "min-w-0 rounded-md border border-input bg-background px-1.5 py-1 text-xs text-foreground";
++  const when = slot.when === "risky" ? "risky" : "always";
++  const focus = slot.focus === "security" ? "security" : "general";
++  return (
++    <div className="flex min-w-0 flex-wrap items-center gap-1.5">
++      {index > 0 && (
++        <>
++          <select
++            aria-label={`${label} runs`}
++            value={when}
++            disabled={disabled}
++            onChange={(e) =>
++              onChange(
++                aeWithReviewScope(slot, {
++                  when: e.target.value as "always" | "risky",
++                  focus: slot.focus,
++                }),
++              )
++            }
++            className={selectClass}
++          >
++            <option value="always">Always</option>
++            <option value="risky">Only if the diff is risky</option>
++          </select>
++          <AeHint id="reviewer.when" />
++        </>
++      )}
++      <select
++        aria-label={`${label} focus`}
++        value={focus}
++        disabled={disabled}
++        onChange={(e) =>
++          onChange(
++            aeWithReviewScope(slot, {
++              when: slot.when,
++              focus: e.target.value === "security" ? "security" : undefined,
++            }),
++          )
++        }
++        className={selectClass}
++      >
++        <option value="general">General review</option>
++        <option value="security">Security only</option>
++      </select>
++      <AeHint id="reviewer.focus" />
++    </div>
++  );
++}
++
+ /** The dropdown's value for a Codex model, and the one for "no model named". */
+ const rowValue = (row: NativeModelOption) => row.model ?? row.id;
+ 
+@@ -201,7 +268,14 @@ function SlotRow({
+     disabled,
+     usedBy,
+     // A reviewer slot never offers the session model, so the pick is always a slot.
+-    onChange: (next) => onChange(next as AeReviewerSlot),
++    // Picking another model keeps the slot's scope (when it runs and its focus).
++    onChange: (next) =>
++      onChange(
++        aeWithReviewScope(next as AeReviewerSlot, {
++          when: "when" in slot ? slot.when : undefined,
++          focus: "focus" in slot ? slot.focus : undefined,
++        }),
++      ),
+   });
+   const { agentSlot, agentState, trigger, bar } = pick;
+   const agentOption = agentState?.option ?? null;
+@@ -237,6 +311,13 @@ function SlotRow({
+             <span className="text-xs text-muted-foreground">The lead chooses</span>
+           )}
+           {chip}
++          <ScopeControls
++            slot={slot}
++            index={index}
++            label={label}
++            disabled={disabled}
++            onChange={onChange}
++          />
+           {agentSlot && loaded && agentState && agentState.status !== "ready" && (
+             <span data-testid={`ae-reviewer-tag-${index + 1}`} className="flex items-center gap-1">
+               <Tag tone="amber">

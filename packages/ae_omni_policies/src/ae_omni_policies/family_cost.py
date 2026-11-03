@@ -647,13 +647,17 @@ def build_answer(
     viewer: str | None,
     admin: bool,
     unit: str,
-    runaway: float,
+    runaway_tokens: float,
+    runaway_usd: float,
     settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The route's answer from the last sweep's *data*: scoped to the viewer, ranked by *unit*.
 
-    *runaway* is the viewer's threshold in *unit* for a family's spend today (0 turns it off);
-    *settings* is the viewer's three saved values, echoed so the card can show them.
+    A family is flagged when its spend today passes *runaway_tokens* or *runaway_usd*, whichever
+    comes first (0 turns that one off); *unit* only picks the ranking. 2026-10-30: either amount
+    flags, because the unit shown first used to pick the one threshold that applied and a runaway
+    in the other unit went unflagged. *settings* is the viewer's three saved values, echoed so the
+    card can show them.
     """
     entry = (data.get("families") or {}).get(str(days))
     at = data.get("at")
@@ -664,8 +668,10 @@ def build_answer(
     for fam in entry.get("families", []):
         if not admin and (viewer is None or fam.get("owner") != viewer):
             continue
-        spend_today = fam["today"]["cost_usd"] if dollars else fam["today"]["tokens_total"]
-        rows.append({**fam, "flagged": runaway > 0 and spend_today >= runaway})
+        today = fam["today"]
+        over_tokens = runaway_tokens > 0 and today["tokens_total"] >= runaway_tokens
+        over_usd = runaway_usd > 0 and today["cost_usd"] >= runaway_usd
+        rows.append({**fam, "flagged": over_tokens or over_usd})
     rows.sort(key=lambda f: -(f["cost_usd"] if dollars else f["tokens"]["total"]))
     totals = {
         "families": len(rows),
@@ -697,13 +703,21 @@ def view(
     viewer: str | None,
     admin: bool,
     unit: str,
-    runaway: float,
+    runaway_tokens: float,
+    runaway_usd: float,
     settings: Mapping[str, Any] | None = None,
     state: StateFile | None = None,
 ) -> dict[str, Any]:
     data = (state or shared_state()).load()
     return build_answer(
-        data, days=days, viewer=viewer, admin=admin, unit=unit, runaway=runaway, settings=settings
+        data,
+        days=days,
+        viewer=viewer,
+        admin=admin,
+        unit=unit,
+        runaway_tokens=runaway_tokens,
+        runaway_usd=runaway_usd,
+        settings=settings,
     )
 
 

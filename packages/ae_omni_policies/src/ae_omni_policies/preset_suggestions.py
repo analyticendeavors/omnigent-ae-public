@@ -787,6 +787,8 @@ class SuggestionStore:
             )
             try:
                 result = roles.put(user, put)
+            except role_prefs.RolesInvalid as exc:
+                raise SuggestionError(422, "invalid_preset", str(exc)) from exc
             except role_prefs.RolesSaveError as exc:
                 raise SuggestionError(503, role_prefs.CODE_NOT_SAVED, str(exc)) from exc
             if not result.conflict:

@@ -1,0 +1,436 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 2 Nov 2026 11:10:34 -0800
+Subject: [PATCH 289/289] [ae-patch] Fix the review findings on the
+ scheduled-task account pin
+
+Three reviewers (Sonnet, Opus security, Codex) found:
+- A PATCH that set claude_account with a host_id asked that host which
+  accounts it holds before the ownership check, so another user's host could
+  be probed. The pin is now checked after the host's ownership check.
+- A pin outlived a move to a managed sandbox, to another agent or to another
+  host. It is now dropped on a sandbox or agent switch unless the request
+  sets one, and re-checked against the new host; a sandbox task cannot be
+  pinned.
+- A task on a Claude SDK or other non-Claude-Code agent could be pinned, but
+  only claude-native reads the label, so it ran on the active account. A pin
+  now needs a claude-native agent.
+- shared: plus a 64-character name is 71 characters; the limit and column
+  are now 80.
+- The update tool schema now allows null, the only way to clear a pin.
+- The form showed a blank trigger for a default-login pin the host does not
+  list; a create that cannot store its pin now deletes the task.
+---
+ omnigent/server/routes/scheduled_tasks.py     | 67 +++++++++++++++++--
+ omnigent/server/scheduled/task_account.py     | 35 +++++++++-
+ omnigent/tools/builtins/scheduled_tasks.py    |  2 +-
+ .../test_scheduled_tasks_routes.py            | 67 +++++++++++++++++++
+ tests/server/scheduled/test_task_account.py   | 36 ++++++++++
+ .../AeTaskClaudeAccountField.test.tsx         | 34 ++++++++--
+ .../scheduled/AeTaskClaudeAccountField.tsx    | 15 +++--
+ 7 files changed, 235 insertions(+), 21 deletions(-)
+
+diff --git a/omnigent/server/routes/scheduled_tasks.py b/omnigent/server/routes/scheduled_tasks.py
+index 85b5a5c38bf2f91f9c3d093960bd012f7dd4b35f..0f911ec2bff4b5dcc716528e22ad1a334f92e1be 100644
+--- a/omnigent/server/routes/scheduled_tasks.py
++++ b/omnigent/server/routes/scheduled_tasks.py
+@@ -76,7 +76,7 @@ class CreateScheduledTaskRequest(BaseModel):
+     project_id: str | None = None
+     # Claude account every run signs in with; "" is the default login, omitted
+     # follows the host's active account.
+-    claude_account: str | None = Field(default=None, max_length=64)
++    claude_account: str | None = Field(default=None, max_length=task_account.MAX_ACCOUNT_LENGTH)
+     # Optional: no PINNED host/workspace. When both are unset the fire path
+     # resolves the owner's online host at fire time and defaults the workspace to
+     # that host's home directory (a failed run is recorded if none is online) —
+@@ -120,7 +120,9 @@ class UpdateScheduledTaskRequest(BaseModel):
+     max_cost_usd: float | None = Field(default=None, gt=0)  # null clears the cap
+     keep_runs: int | None = Field(default=None, ge=1, le=retention.MAX_KEEP_RUNS)  # null keeps all
+     project_id: str | None = None  # null or "" leaves runs unfiled
+-    claude_account: str | None = Field(default=None, max_length=64)  # null clears the pin
++    claude_account: str | None = Field(
++        default=None, max_length=task_account.MAX_ACCOUNT_LENGTH
++    )  # null clears the pin
+     workspace: str | None = Field(default=None, min_length=1)
+     host_id: str | None = Field(default=None, min_length=1)
+     execution_target: str | None = Field(default=None, min_length=1)
+@@ -426,6 +428,12 @@ def create_scheduled_tasks_router(
+         else:
+             project_id = task_project.default_project_id(project_store, owner_id)
+         if body.claude_account is not None:
++            if body.execution_target == "managed_sandbox":
++                raise OmnigentError(
++                    "A managed-sandbox task cannot be pinned to a Claude account.",
++                    code=ErrorCode.INVALID_INPUT,
++                )
++            await task_account.validate_agent_supports_account(agent, agent_cache)
+             await task_account.validate_account(request, body.claude_account, body.host_id)
+         bound = await _bind_agent(agent, owner_id)
+         try:
+@@ -453,7 +461,14 @@ def create_scheduled_tasks_router(
+             retention.set_keep_runs(store, task.id, body.keep_runs)
+         task_project.set_project(store, task.id, project_id)
+         if body.claude_account is not None:
+-            task_account.set_account(store, task.id, body.claude_account)
++            try:
++                task_account.set_account(store, task.id, body.claude_account)
++            except Exception:
++                # Never leave an unpinned task that would fire on the active account.
++                store.delete(task.id)
++                if bound.id != agent.id:
++                    agent_store.delete(bound.id)
++                raise
+         task = _with_settings(store, [task])[0]
+         scheduler = _scheduler(request)
+         if scheduler is not None:
+@@ -622,10 +637,6 @@ def create_scheduled_tasks_router(
+         project_id = _owned_project_id(fields.pop("project_id", None), owner_id)
+         account_set = "claude_account" in fields
+         claude_account = fields.pop("claude_account", None)
+-        if claude_account is not None:
+-            await task_account.validate_account(
+-                request, claude_account, fields.get("host_id") or existing.host_id
+-            )
+         target_agent_id = fields.get("agent_id") or existing.agent_id
+         agent_changed = target_agent_id != existing.agent_id
+         new_copy: Agent | None = None
+@@ -677,6 +688,43 @@ def create_scheduled_tasks_router(
+                 _MANAGED_SANDBOX_WITH_HOST_MSG,
+                 code=ErrorCode.INVALID_INPUT,
+             )
++        account_settled = False
++
++        async def _settle_account() -> tuple[bool, str | None]:
++            """The pin to store after this PATCH, checked against the host it will run on.
++
++            A pin follows the task's host and agent: it is dropped when the task moves
++            to a managed sandbox (no host login to pin) or to another agent unless the
++            request sets one, and is re-checked when the host changes. Runs only after
++            the host's ownership check, so no other user's host is probed.
++            """
++            nonlocal account_settled
++            account_settled = True
++            new_host = None if switching_to_managed else fields.get("host_id", existing.host_id)
++            if account_set:
++                pin, write = claude_account, True
++            else:
++                pin = task_account.accounts_for(store, [existing.id])[existing.id]
++                write = False
++                if pin is not None and (switching_to_managed or agent_changed):
++                    pin, write = None, True
++            if switching_to_managed and pin is not None:
++                raise OmnigentError(
++                    "A managed-sandbox task cannot be pinned to a Claude account.",
++                    code=ErrorCode.INVALID_INPUT,
++                )
++            if pin is not None and (account_set or agent_changed or new_host != existing.host_id):
++                pin_agent = await validate_session_agent(
++                    user_id=owner_id,
++                    agent_id=target_agent_id,
++                    agent_store=agent_store,
++                    permission_store=permission_store,
++                    conversation_store=conversation_store,
++                )
++                await task_account.validate_agent_supports_account(pin_agent, agent_cache)
++                await task_account.validate_account(request, pin, new_host)
++            return write, pin
++
+         if agent_changed or {"workspace", "host_id", "execution_target"}.intersection(fields):
+             # On a switch this runs the full create-time gauntlet against the NEW
+             # agent: existence + bindability, and the pinned workspace re-checked
+@@ -706,10 +754,15 @@ def create_scheduled_tasks_router(
+                 fields["workspace"] = None
+             elif "workspace" in fields:
+                 fields["workspace"] = workspace
++            # After the host's ownership check above and before the agent copy is
++            # bound, so a refused pin leaves nothing behind.
++            account_set, claude_account = await _settle_account()
+             if agent_changed:
+                 bound = await _bind_agent(agent, owner_id)
+                 fields["agent_id"] = bound.id
+                 new_copy = bound if bound.id != agent.id else None
++        if not account_settled:
++            account_set, claude_account = await _settle_account()
+         try:
+             updated = store.update(scheduled_task_id, **fields)
+             if updated is None:
+diff --git a/omnigent/server/scheduled/task_account.py b/omnigent/server/scheduled/task_account.py
+index 3aa052373b0be653fd6cc7750dd1cc18daa31423..e83aee91161b22eba1419d798e6fe4ad0bb44a9c 100644
+--- a/omnigent/server/scheduled/task_account.py
++++ b/omnigent/server/scheduled/task_account.py
+@@ -45,13 +45,16 @@ if TYPE_CHECKING:
+ 
+ _logger = logging.getLogger(__name__)
+ 
++#: ``shared:`` plus a 64-character name is 71; leave room.
++MAX_ACCOUNT_LENGTH = 80
++
+ _metadata = MetaData()
+ _account_table = Table(
+     "ae_scheduled_task_account",
+     _metadata,
+     Column("workspace_id", Integer, primary_key=True),
+     Column("scheduled_task_id", String(32), primary_key=True),
+-    Column("claude_account", String(64), nullable=False),
++    Column("claude_account", String(MAX_ACCOUNT_LENGTH), nullable=False),
+ )
+ # custom-lint: disable-next=workspace-scoped-cache -- schema readiness is shared per engine
+ _ready_engines: set[int] = set()
+@@ -180,3 +183,33 @@ async def pin_fired_session(
+     labels = {CLAUDE_ACCOUNT_LABEL_KEY: account}
+     await asyncio.to_thread(deps.conversation_store.set_labels, conversation_id, labels)
+     return labels
++
++
++async def validate_agent_supports_account(agent: Any, agent_cache: Any) -> None:
++    """Reject a pin on an agent that is not Claude Code native.
++
++    Only the claude-native harness reads the account label at launch; a Claude
++    SDK, Codex or other task would run on the host's active account while the
++    task claims a pin. When the harness cannot be resolved the check is skipped
++    (the same fail-open as the permission-mode gate).
++
++    :raises OmnigentError: 400 when the agent's harness is resolved and is not claude-native.
++    """
++    if agent is None or agent_cache is None or getattr(agent, "bundle_location", None) is None:
++        return
++    from omnigent.harness_aliases import canonicalize_harness
++
++    try:
++        loaded = await asyncio.to_thread(agent_cache.load, agent.id, agent.bundle_location)
++        executor = getattr(loaded.spec, "executor", None)
++        raw = (executor.config.get("harness") or executor.type) if executor is not None else None
++        harness = canonicalize_harness(raw) or raw
++    except Exception:
++        _logger.exception("Failed to load agent spec for Claude account gating")
++        return
++    if harness != "claude-native":
++        raise OmnigentError(
++            "A Claude account pin needs a Claude Code agent; this task's agent runs on "
++            f"{harness or 'another harness'}. Clear the pin or pick a Claude Code agent.",
++            code=ErrorCode.INVALID_INPUT,
++        )
+diff --git a/omnigent/tools/builtins/scheduled_tasks.py b/omnigent/tools/builtins/scheduled_tasks.py
+index d08904f45cbabdfa46e378f511fa5f2bca32f18e..47e770346cd7d2ebf60c82af51d4905d7b55acfa 100644
+--- a/omnigent/tools/builtins/scheduled_tasks.py
++++ b/omnigent/tools/builtins/scheduled_tasks.py
+@@ -280,7 +280,7 @@ class SysScheduledTaskUpdateTool(Tool):
+                             ),
+                         },
+                         "claude_account": {
+-                            "type": "string",
++                            "type": ["string", "null"],
+                             "description": (
+                                 "New Claude account every run signs in with; an empty string is "
+                                 "the default login. Null follows the host's active account."
+diff --git a/tests/server/integration/test_scheduled_tasks_routes.py b/tests/server/integration/test_scheduled_tasks_routes.py
+index 9e776266379df14f11af8552a565893a5308aa80..d929f018c44b1eed88ed386f75e462a07914a6a9 100644
+--- a/tests/server/integration/test_scheduled_tasks_routes.py
++++ b/tests/server/integration/test_scheduled_tasks_routes.py
+@@ -1951,3 +1951,70 @@ async def test_claude_account_can_be_set_on_create(auth_client: httpx.AsyncClien
+     )
+     assert resp.status_code == 200, resp.text
+     assert resp.json()["claude_account"] == "shared:AE Default"
++
++
++async def test_claude_account_pin_is_dropped_when_the_task_moves_to_a_sandbox(
++    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
++) -> None:
++    """A managed sandbox has no host login to pin: the pin goes with the switch."""
++    _make_user(db_uri)
++
++    class _Cfg:
++        managed_launch_supported = True
++
++    auth_app.state.sandbox_config = _Cfg()
++    try:
++        created = (
++            await auth_client.post(
++                "/v1/scheduled-tasks",
++                json=_create_body(claude_account="shared:AE Default"),
++                headers=_headers(),
++            )
++        ).json()
++        assert created["claude_account"] == "shared:AE Default"
++        moved = await auth_client.patch(
++            f"/v1/scheduled-tasks/{created['id']}",
++            json={"execution_target": "managed_sandbox"},
++            headers=_headers(),
++        )
++        assert moved.status_code == 200, moved.text
++        assert moved.json()["claude_account"] is None
++        # A sandbox task cannot be pinned, on create or update.
++        refused = await auth_client.patch(
++            f"/v1/scheduled-tasks/{created['id']}",
++            json={"claude_account": ""},
++            headers=_headers(),
++        )
++        assert refused.status_code == 400, refused.text
++    finally:
++        auth_app.state.sandbox_config = None
++
++
++async def test_claude_account_check_never_probes_a_host_the_caller_does_not_own(
++    auth_app: FastAPI,
++    auth_client: httpx.AsyncClient,
++    db_uri: str,
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """Ownership is checked before the host is asked which accounts it holds."""
++    _make_user(db_uri, email="alice@example.com")
++    _make_user(db_uri, email="bob@example.com")
++    body = _create_body()
++    del body["workspace"]
++    del body["host_id"]
++    created = (await auth_client.post("/v1/scheduled-tasks", json=body, headers=_headers())).json()
++    _register_host(auth_app, "eeee5555ffff6666aaaa7777bbbb8888", "bob@example.com")
++    probed: list[object] = []
++
++    async def _detect(**kwargs: object) -> dict[str, object]:
++        probed.append(kwargs)
++        return {"credentials": []}
++
++    monkeypatch.setattr("omnigent.server.routes.hosts._proxy_detect_credentials", _detect)
++    denied = await auth_client.patch(
++        f"/v1/scheduled-tasks/{created['id']}",
++        json={"host_id": "eeee5555ffff6666aaaa7777bbbb8888", "claude_account": "Work"},
++        headers=_headers("alice@example.com"),
++    )
++    assert denied.status_code == 403, denied.text
++    assert probed == []
+diff --git a/tests/server/scheduled/test_task_account.py b/tests/server/scheduled/test_task_account.py
+index 85705749aa7dd327072c85dcd4c075ed0182d072..d660e49796998b01416d62a5803f4083284fb125 100644
+--- a/tests/server/scheduled/test_task_account.py
++++ b/tests/server/scheduled/test_task_account.py
+@@ -118,3 +118,39 @@ async def test_fire_without_a_pin_writes_no_account_label() -> None:
+ 
+     written = deps.conversation_store.label_writes.get("conv_1", {})
+     assert CLAUDE_ACCOUNT_LABEL_KEY not in written
++
++
++# ── The agent gate ───────────────────────────────────────────────────────
++
++
++class _Cache:
++    def __init__(self, executor: Any) -> None:
++        self._executor = executor
++
++    def load(self, agent_id: str, bundle: str) -> Any:
++        return SimpleNamespace(spec=SimpleNamespace(executor=self._executor))
++
++
++_AGENT = SimpleNamespace(id="ag_1", bundle_location="/bundle")
++
++
++@pytest.mark.asyncio
++async def test_pin_needs_a_claude_code_agent() -> None:
++    native = SimpleNamespace(config={"harness": "claude-native"}, type="x")
++    sdk = SimpleNamespace(config={"harness": "claude-sdk"}, type="x")
++    await task_account.validate_agent_supports_account(_AGENT, _Cache(native))
++    with pytest.raises(OmnigentError, match="needs a Claude Code agent"):
++        await task_account.validate_agent_supports_account(_AGENT, _Cache(sdk))
++
++
++@pytest.mark.asyncio
++async def test_agent_gate_skips_what_it_cannot_resolve() -> None:
++    await task_account.validate_agent_supports_account(None, None)
++    await task_account.validate_agent_supports_account(_AGENT, None)
++    await task_account.validate_agent_supports_account(
++        SimpleNamespace(id="ag_1", bundle_location=None), _Cache(None)
++    )
++
++
++def test_a_shared_account_with_a_64_character_name_fits() -> None:
++    assert len("shared:" + "a" * 64) <= task_account.MAX_ACCOUNT_LENGTH
+diff --git a/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx b/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx
+index 81c74b40d5258851565cd05ca36d47f031ef12a1..54b5758c26fd63cdad71bfa3639bed3e1db6b68c 100644
+--- a/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx
++++ b/web/src/components/scheduled/AeTaskClaudeAccountField.test.tsx
+@@ -1,5 +1,5 @@
+ import { render, screen } from "@testing-library/react";
+-import { describe, expect, it, vi } from "vitest";
++import { beforeEach, describe, expect, it, vi } from "vitest";
+ import { AeTaskClaudeAccountField } from "@/components/scheduled/AeTaskClaudeAccountField";
+ import {
+   DEFAULT_LOGIN_ACCOUNT,
+@@ -8,15 +8,22 @@ import {
+   claudeAccountInput,
+ } from "@/lib/aeTaskClaudeAccount";
+ 
++const { detected } = vi.hoisted(() => ({
++  detected: {
++    rows: [] as { family: string; env_var: string; source: string }[],
++  },
++}));
+ vi.mock("@/hooks/useHosts", () => ({
+-  useDetectedCredentials: () => ({
+-    data: [
+-      { family: "claude-oauth", env_var: "", source: "AE Default" },
+-      { family: "claude-oauth", env_var: "shared:AE Backup", source: "AE Backup" },
+-    ],
+-  }),
++  useDetectedCredentials: () => ({ data: detected.rows }),
+ }));
+ 
++beforeEach(() => {
++  detected.rows = [
++    { family: "claude-oauth", env_var: "", source: "AE Default" },
++    { family: "claude-oauth", env_var: "shared:AE Backup", source: "AE Backup" },
++  ];
++});
++
+ describe("accountChoiceFor", () => {
+   it("maps no pin, the default login and a named account", () => {
+     expect(accountChoiceFor(null)).toBe(FOLLOW_ACTIVE_ACCOUNT);
+@@ -64,4 +71,17 @@ describe("AeTaskClaudeAccountField", () => {
+     );
+     expect(screen.getByText(/whichever Claude account the host has active/)).toBeTruthy();
+   });
++  it("never renders a blank trigger for a default-login pin the host does not list", () => {
++    detected.rows = [{ family: "claude-oauth", env_var: "shared:AE Backup", source: "AE Backup" }];
++    render(
++      <AeTaskClaudeAccountField
++        value={DEFAULT_LOGIN_ACCOUNT}
++        onValueChange={() => {}}
++        hostId="h1"
++      />,
++    );
++    expect(screen.getByTestId("task-claude-account-trigger").textContent).toContain(
++      "Default login (not listed)",
++    );
++  });
+ });
+diff --git a/web/src/components/scheduled/AeTaskClaudeAccountField.tsx b/web/src/components/scheduled/AeTaskClaudeAccountField.tsx
+index f3841ce812a4a159f7c7ce5d150a0a46f1aad295..01aeaeaf6d4f791878fced16b5b28062f9a26d6d 100644
+--- a/web/src/components/scheduled/AeTaskClaudeAccountField.tsx
++++ b/web/src/components/scheduled/AeTaskClaudeAccountField.tsx
+@@ -31,11 +31,10 @@ export function AeTaskClaudeAccountField({
+ }) {
+   const { data: credentials = [] } = useDetectedCredentials(hostId, true);
+   const accounts = aeForkClaudeAccounts(credentials);
+-  // A saved pin the host no longer lists stays visible rather than silently changing.
++  const listed = (account: string) => accounts.some((choice) => choice.account === account);
+   const known =
+-    value === FOLLOW_ACTIVE_ACCOUNT ||
+-    value === DEFAULT_LOGIN_ACCOUNT ||
+-    accounts.some((choice) => choice.account === value);
++    value === FOLLOW_ACTIVE_ACCOUNT || (value !== DEFAULT_LOGIN_ACCOUNT && listed(value));
++  const defaultListed = listed("");
+   return (
+     <div className="flex flex-col gap-1.5" data-testid="task-claude-account-field">
+       <Label htmlFor="task-claude-account">Claude account</Label>
+@@ -54,7 +53,13 @@ export function AeTaskClaudeAccountField({
+         </SelectTrigger>
+         <SelectContent position="popper" align="start">
+           <SelectItem value={FOLLOW_ACTIVE_ACCOUNT}>Follow the active account</SelectItem>
+-          {!known && <SelectItem value={value}>{value} (not listed)</SelectItem>}
++          {/* A saved pin the host no longer lists stays visible, never a blank trigger. */}
++          {!known && value !== DEFAULT_LOGIN_ACCOUNT && (
++            <SelectItem value={value}>{value} (not listed)</SelectItem>
++          )}
++          {value === DEFAULT_LOGIN_ACCOUNT && !defaultListed && (
++            <SelectItem value={DEFAULT_LOGIN_ACCOUNT}>Default login (not listed)</SelectItem>
++          )}
+           {accounts.map((choice) => (
+             <SelectItem
+               key={choice.account || DEFAULT_LOGIN_ACCOUNT}

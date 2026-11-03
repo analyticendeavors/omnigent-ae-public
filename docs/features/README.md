@@ -63,7 +63,7 @@ Inside one chat, the fork puts the session's details in a rail beside it, has th
 </table>
 
 - [Session rail](session-rail.md): A rail beside the chat, Its own toggle, Choose what a session shows when it opens, Triage card, Context that waits for Claude, Context categories, Connectors, Agents, Child chats, Usage for this session's account
-- [Composer](composer.md): Prompt suggestions, Ranked alternatives, Model versions and Previous models, A one-column model menu, The effort a session runs at, Fast mode, Blurred command and file menus, Token defrag while compacting
+- [Composer](composer.md): Prompt suggestions, Ranked alternatives, Model versions and Previous models, A one-column model menu, The effort a session runs at, Fast mode, Blurred command and file menus, Token defrag while compacting, Queued notes survive a reload
 - [Action dock](action-dock.md): One strip in the composer bar, The opened list, A waiting question, Questions from sessions this chat started, Compact a big chat, One button per choice, Usage gate, Every usage window on hover, Every open pull request with its state, Update branch, Drafts with Mark ready, Hover preview, Merge from the dock, The confirm, shown whole, Deploy tracking
 
 ## Agents and pull requests
@@ -91,8 +91,8 @@ Running many sessions means watching plan limits and accounts. The fork shows us
 </tr>
 </table>
 
-- [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login, A relaunch keeps Claude's transcript
-- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Key Vault, Git repos, Every account's limits, Compute and spend, Presets card, Family cost card, Edit a global policy's parameters, Open tabs hear about an update
+- [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login, A relaunch keeps Claude's transcript, Pin a scheduled task to one login
+- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Key Vault, Git repos, Every account's limits, Compute and spend, Spend card: presets, Spend card: families, Edit a global policy's parameters, Open tabs hear about an update
 
 ## On the phone
 
