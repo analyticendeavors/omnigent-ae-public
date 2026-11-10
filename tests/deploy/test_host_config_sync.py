@@ -181,6 +181,16 @@ def scrub_file(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.Mon
     return path
 
 
+@pytest.fixture(autouse=True)
+def runtime_dir(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Path:
+    # The script takes its per-user host lock under $XDG_RUNTIME_DIR. A private one
+    # per test keeps parallel workers (pytest-xdist, since 2026-11-09) and a real
+    # sync on the same machine out of each other's lock ("already running; skipped").
+    d = tmp_path_factory.mktemp("run")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(d))
+    return d
+
+
 @pytest.fixture
 def lock_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     d = tmp_path / "tmp"

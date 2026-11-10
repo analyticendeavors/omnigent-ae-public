@@ -40,7 +40,7 @@ from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
-from ae_omni_policies import box_health
+from ae_omni_policies import box_cleanup, box_health
 
 _logger = logging.getLogger("ae_omni_policies.box_health_cleanup")
 
@@ -330,8 +330,12 @@ def confirm_text(offer: box_health.OfferItem, stale_days: float) -> str:
     and the up-to-five-minute wait."""
     days = f"{stale_days:g}"
     size = box_health.size_words(offer.bytes)
-    n = box_health.count_words(offer.count)
+    # A capped offer reads "Remove 5,000 of UserA's 14k ...": one run's count, then the total.
+    n = box_health.count_words(_run_count(offer))
     whose = _possessive(offer.owner, offer.where)
+    if offer.count > box_cleanup.MAX_ITEMS:
+        whose = f"{whose} {box_health.count_words(offer.count)}"
+    more = _more_note(offer)
     if offer.action == "claude_scratch":
         what = (
             "temp folders (Claude sessions and test runs)"
@@ -340,9 +344,9 @@ def confirm_text(offer: box_health.OfferItem, stale_days: float) -> str:
         )
         return (
             f"Remove {n} of {whose} {what} older than {days} days, about {size} "
-            f"in {box_health.count_words(offer.files)} items? Folders changed in the last "
+            f"in {box_health.counted(offer.files, 'item')}? Folders changed in the last "
             f"{days} days, folders in use and anything not owned by the cleanup user are left "
-            f"alone. This cannot be undone. {WAIT}"
+            f"alone. This cannot be undone.{more} {WAIT}"
         )
     if offer.action == "tmp_litter":
         groups = ", ".join(f"{g.group} {box_health.count_words(g.count)}" for g in offer.groups)
@@ -351,13 +355,13 @@ def confirm_text(offer: box_health.OfferItem, stale_days: float) -> str:
             f"Remove {n} of {whose} test leftovers older than {days} days from the top of "
             f"/tmp{tail}? Only these name patterns, only files {offer.owner} owns, never git "
             f"checkouts, and a folder with anything changed lately is kept. This cannot be "
-            f"undone. {WAIT}"
+            f"undone.{more} {WAIT}"
         )
     if offer.action == "review_checkouts":
         return (
             f"Remove up to {n} of {whose} review checkouts in /tmp older than {days} days? "
             "A checkout with uncommitted changes, a stash or a commit no remote has is kept. "
-            f"This cannot be undone. {WAIT}"
+            f"This cannot be undone.{more} {WAIT}"
         )
     return (
         f"Remove dangling Docker images and build cache older than {days} days, up to about "
@@ -365,15 +369,42 @@ def confirm_text(offer: box_health.OfferItem, stale_days: float) -> str:
     )
 
 
+def _run_count(offer: box_health.OfferItem) -> int:
+    """How many items one run removes: every run stops at ``box_cleanup.MAX_ITEMS``, oldest
+    first, so a larger offer takes more than one press (2026-11-05: a "Remove 14k items"
+    press removed 5,000)."""
+    return min(offer.count, box_cleanup.MAX_ITEMS)
+
+
+def _run_words(offer: box_health.OfferItem) -> str:
+    """The count one run removes, with the full count after it when the cap cuts it short:
+    ``268``, or ``up to 5,000 of 14k``."""
+    run = box_health.count_words(_run_count(offer))
+    if offer.count <= box_cleanup.MAX_ITEMS:
+        return run
+    # "up to": entries skipped by the age, owner and lock checks still spend the cap.
+    return f"up to {run} of {box_health.count_words(offer.count)}"
+
+
+def _more_note(offer: box_health.OfferItem) -> str:
+    """The sentence a capped offer adds to its confirm text; empty when one run does it all."""
+    if offer.count <= box_cleanup.MAX_ITEMS:
+        return ""
+    cap = box_health.count_words(box_cleanup.MAX_ITEMS)
+    return f" One run removes at most {cap}, oldest first; press again for the rest."
+
+
+NOUNS = {"claude_scratch": "folder", "tmp_litter": "item", "review_checkouts": "checkout"}
+"""The singular noun each count-based action's button and result line use."""
+
+
 def button_text(offer: box_health.OfferItem) -> str:
-    n = box_health.count_words(offer.count)
-    if offer.action == "claude_scratch":
-        return f"Remove {n} folders"
-    if offer.action == "tmp_litter":
-        return f"Remove {n} items"
-    if offer.action == "review_checkouts":
-        return f"Remove {n} checkouts"
-    return "Prune Docker"
+    if offer.action == "docker_prune":
+        return "Prune Docker"
+    noun = NOUNS[offer.action]
+    # The noun follows the count it sits next to: "Remove 1 folder", "Remove up to 5,000 of
+    # 14k items" (plural, since the total is over the cap).
+    return f"Remove {_run_words(offer)} {noun if offer.count == 1 else noun + 's'}"
 
 
 HINTS = {
@@ -414,10 +445,8 @@ def message_of(record: Record, state: str, *, show_login: bool) -> str:
         freed = box_health.size_words(result.bytes_freed)
         if record.action == "docker_prune":
             return f"Pruned Docker, freed {freed}, at {at} UTC"
-        noun = {"claude_scratch": "folders", "tmp_litter": "items"}.get(record.action, "checkouts")
-        return (
-            f"Removed {box_health.count_words(result.removed)} {noun}, freed {freed}, at {at} UTC"
-        )
+        noun = NOUNS.get(record.action, "checkout")
+        return f"Removed {box_health.counted(result.removed, noun)}, freed {freed}, at {at} UTC"
     words = {
         "DISABLED": "cleanup is switched off on the box",
         "REFUSED": "the box refused to run it",
@@ -503,9 +532,16 @@ def decorate(
         "auto_aged": [a.model_dump() for a in posted.auto_aged] if posted else [],
     }
     needs = [n.model_copy(update={"action": _need_action(n.key, offers)}) for n in view.needs]
+    every = [n.model_copy(update={"action": _need_action(n.key, offers)}) for n in view.all_needs]
     del cfg
     return view.model_copy(
-        update={"actions": actions, "cleanup": cleanup, "details": details, "needs": needs}
+        update={
+            "actions": actions,
+            "cleanup": cleanup,
+            "details": details,
+            "needs": needs,
+            "all_needs": every,
+        }
     )
 
 

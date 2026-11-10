@@ -21,9 +21,17 @@ Configuration, all from the server environment (no real names ship in the repo):
 - ``AE_GIT_KEEP_BRANCHES``: comma-separated ``owner/repo:branch`` kept on purpose; they
   stay listed (``kept: true``) but are not old branches (2026-10-24).
 - ``AE_GIT_TOKEN_<OWNER>``: a read-only token per owner (owner upper-cased, every
-  run of non-alphanumerics as ``_``); an owner without one falls back to
-  ``AE_GITHUB_TOKEN``. Secrets: never logged, never returned.
+  run of non-alphanumerics as ``_``); an owner without one uses the token saved for it in the
+  Cards panel (:mod:`ae_omni_policies.card_secrets`, 2026-11-08), then ``AE_GITHUB_TOKEN``.
+  Secrets: never logged, never returned.
 - ``AE_GITHUB_API_URL``: the API origin, as :mod:`ae_omni_policies.github`.
+
+Two scopes (2026-11-08, card setup PR 3): ``company`` is the list above, read with company
+tokens and shown to every admin; ``mine`` is one admin's own list (:mod:`ae_omni_policies.
+git_personal`), read only with that admin's own token for each repo's account, never a company
+token, ``AE_GITHUB_TOKEN`` or another user's token, and only from the fixed ``api.github.com``.
+The cache, the failed-first-load memory and the last good answer are keyed by (scope, login), so
+no answer ever crosses users.
 
 The answer is cached with :class:`~ae_omni_policies.swr.SwrCache` (300 s). Lockfile
 reads are cached by (repo, manifest path, default-branch commit), so a quiet repo
@@ -33,8 +41,11 @@ costs no lockfile calls on the next load.
 from __future__ import annotations
 
 import asyncio
+import contextvars
+import hashlib
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -45,7 +56,7 @@ from urllib.parse import quote
 
 import httpx
 
-from ae_omni_policies import github
+from ae_omni_policies import admin_cards, card_config, card_secrets, git_personal, github
 from ae_omni_policies.swr import SwrCache
 
 _logger = logging.getLogger(__name__)
@@ -59,6 +70,8 @@ TITLE_MAX = 120
 MAX_PRS = 50
 MAX_ALERTS = 100
 MAX_BRANCHES = 50
+#: Branch comparisons (ahead counts) one load may make; the answer is no longer capped first.
+MAX_FILL_AHEAD = 100
 # The extension bridge refuses 32,768 characters; stay well under.
 SIZE_BUDGET = 28_000
 # A first load that failed for every repo is remembered this long, so card opens do not
@@ -73,10 +86,18 @@ KEEP_ENV = "AE_GIT_KEEP_BRANCHES"
 TOKEN_PREFIX = "AE_GIT_TOKEN_"
 DEFAULT_WORKFLOW = "dependency-sweep.yml"
 
+SCOPE_COMPANY = "company"
+SCOPE_MINE = "mine"
+#: Personal reads go here and nowhere else: a typed-in token is never sent to an address a
+#: setting can change.
+PERSONAL_API_URL = "https://api.github.com"
+#: Swapped by tests; production passes no transport.
+TRANSPORT: httpx.AsyncBaseTransport | None = None
+
 NOT_CONFIGURED = (
     "The Git repos card is off: set AE_GIT_SWEEP_CONFIG (owner/repo:path of a Dependency "
-    "Sweep config) and/or AE_GIT_REPOS (comma-separated owner/repo) in the server's "
-    "environment, then restart the stack."
+    "Sweep config) and/or AE_GIT_REPOS (comma-separated owner/repo) in the Cards panel "
+    "(Git repos, Setup), or in the server's environment, which overrides the panel."
 )
 
 _SEVERITY_ORDER = {"CRITICAL": 0, "HIGH": 1, "MODERATE": 2, "LOW": 3}
@@ -88,19 +109,49 @@ query($owner: String!, $name: String!) {
     pushedAt
     isArchived
     pullRequests(states: OPEN, first: 50) {
+      pageInfo { hasNextPage }
       nodes {
         number title url isDraft mergeStateStatus author { login } updatedAt headRefName
-        commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+        isCrossRepository authorAssociation
+        commits(last: 1) {
+          nodes {
+            commit {
+              oid
+              statusCheckRollup {
+                state
+                contexts(first: 20) {
+                  totalCount
+                  nodes {
+                    __typename
+                    ... on CheckRun {
+                      name
+                      conclusion
+                      status
+                      completedAt
+                      checkSuite {
+                        app { slug }
+                        workflowRun { workflow { name } }
+                      }
+                    }
+                    ... on StatusContext { context state }
+                  }
+                }
+              }
+            }
+          }
+        }
       }
     }
     refs(refPrefix: "refs/heads/", first: 100) {
+      pageInfo { hasNextPage }
       nodes {
         name
-        target { ... on Commit { committedDate } }
+        target { ... on Commit { oid committedDate } }
         associatedPullRequests(first: 5, states: [OPEN, MERGED]) { totalCount }
       }
     }
     vulnerabilityAlerts(states: OPEN, first: 100) {
+      pageInfo { hasNextPage }
       nodes {
         number createdAt vulnerableManifestPath
         securityVulnerability {
@@ -139,22 +190,31 @@ def _split_repos(raw: str | None) -> list[str]:
 class Settings:
     """What to read and with which tokens; all from the environment."""
 
+    scope = SCOPE_COMPANY
+    login: str | None = None
+
     def __init__(self, environ: Mapping[str, str] | None = None) -> None:
         env = os.environ if environ is None else environ
         self._env = env
+        # A token saved in the Cards panel is honoured only when the process environment is read
+        # (a caller that passes its own mapping, as the tests do, gets exactly that mapping).
+        self._saved_ok = env is os.environ
         self.api_url = (env.get(github.API_URL_ENV) or "").strip().rstrip("/") or github.API_URL
-        raw = (env.get(SWEEP_CONFIG_ENV) or "").strip()
+        # Typed-in settings (2026-11-07): the environment still wins, see card_config.
+        raw = (card_config.value(SWEEP_CONFIG_ENV, environ) or "").strip()
         self.sweep_repo: str | None = None
         self.sweep_path: str | None = None
         repo, _, path = raw.partition(":")
         if github._REPO.match(repo.strip()) and path.strip():
             self.sweep_repo, self.sweep_path = repo.strip(), path.strip().lstrip("/")
-        self.extra_repos = _split_repos(env.get(REPOS_ENV))
-        self.view_only = _split_repos(env.get(VIEW_ONLY_ENV))
-        self.workflow = (env.get(WORKFLOW_ENV) or "").strip() or DEFAULT_WORKFLOW
+        self.extra_repos = _split_repos(card_config.value(REPOS_ENV, environ))
+        self.view_only = _split_repos(card_config.value(VIEW_ONLY_ENV, environ))
+        self.workflow = (
+            card_config.value(WORKFLOW_ENV, environ) or ""
+        ).strip() or DEFAULT_WORKFLOW
         self.sweep_set = bool(raw)
         self.kept: set[tuple[str, str]] = set()
-        for item in (env.get(KEEP_ENV) or "").split(","):
+        for item in (card_config.value(KEEP_ENV, environ) or "").split(","):
             kept_repo, _, kept_branch = item.strip().partition(":")
             if github._REPO.match(kept_repo.strip()) and kept_branch.strip():
                 self.kept.add((kept_repo.strip().lower(), kept_branch.strip()))
@@ -166,12 +226,34 @@ class Settings:
     def configured(self) -> bool:
         return self.sweep_set or bool(self.extra_repos) or bool(self.view_only)
 
+    def group_of(self, repo: str) -> str:
+        """The account a repo's token belongs to: its owner for the company list."""
+        return repo.partition("/")[0]
+
+    def identity(self, repo: str) -> str:  # noqa: ARG002 (the personal override needs *repo*)
+        """Whose credential reads *repo*: ``company``, or ``user/<login>/<account>`` (personal)."""
+        return "company"
+
     def token_for(self, owner: str) -> str:
+        """The company token for *owner*: its environment variable, then the one saved in the
+        Cards panel, then ``AE_GITHUB_TOKEN``."""
         own = (self._env.get(owner_env_name(owner)) or "").strip()
-        return own or (self._env.get(github.TOKEN_ENV) or "").strip()
+        if own:
+            return own
+        if self._saved_ok:
+            try:
+                saved = card_secrets.get_token(card_secrets.company_id(owner))
+            except card_secrets.CardSecretsError:
+                saved = None
+            if saved:
+                return saved
+        return (self._env.get(github.TOKEN_ENV) or "").strip()
 
     def no_token_note(self, owner: str) -> str:
-        return f"No token: set {owner_env_name(owner)} in the server's secrets file."
+        return (
+            f"No token: set {owner_env_name(owner)} in the server's environment, or add one "
+            "in the Cards panel (Git repos, Company tokens)."
+        )
 
     @property
     def graphql_url(self) -> str:
@@ -179,6 +261,70 @@ class Settings:
         if self.api_url.endswith("/api/v3"):
             return self.api_url[: -len("v3")] + "graphql"
         return self.api_url + "/graphql"
+
+
+class PersonalSettings(Settings):
+    """One admin's own list: their repos, each read with their token for that repo's account.
+
+    No sweep, no workflow, no kept branches, nothing view only. The token for a repo is the one
+    this login saved for the repo's account (:func:`git_personal.token_for`) and nothing else:
+    never a company token, never ``AE_GITHUB_TOKEN``. The API address is fixed.
+    """
+
+    scope = SCOPE_MINE
+
+    def __init__(self, login: str, repos: Sequence[Mapping[str, str]]) -> None:
+        self._env = {}
+        self._saved_ok = False
+        self.login = login
+        self.api_url = PERSONAL_API_URL
+        self.sweep_repo = None
+        self.sweep_path = None
+        self.workflow = DEFAULT_WORKFLOW
+        self.sweep_set = False
+        self.view_only = []
+        self.kept = set()
+        self._accounts: dict[str, str] = {}
+        self.extra_repos = []
+        for item in repos:
+            repo = str(item.get("repo") or "")
+            if github._REPO.match(repo) and repo.lower() not in self._accounts:
+                self._accounts[repo.lower()] = str(item.get("account") or "").lower()
+                self.extra_repos.append(repo)
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.extra_repos)
+
+    def group_of(self, repo: str) -> str:
+        return self._accounts.get(repo.lower(), "")
+
+    def identity(self, repo: str) -> str:
+        return f"user/{self.login}/{self.group_of(repo)}"
+
+    def token_for(self, owner: str) -> str:
+        """The login's own token for GitHub account *owner* (here the account, not the owner)."""
+        return git_personal.token_for(self.login or "", owner) if owner else ""
+
+    def no_token_note(self, owner: str) -> str:
+        return (
+            f"No token saved for {owner or 'this repo'}: connect it again in the Cards panel "
+            "(Git repos, My GitHub accounts)."
+        )
+
+
+# A personal load says so, so an error tells the admin to reconnect their account rather than
+# to set a company variable. A ContextVar because the repo reads run as separate tasks.
+_personal_load: contextvars.ContextVar[bool] = contextvars.ContextVar(
+    "ae_git_personal_load", default=False
+)
+
+
+def _token_name(owner: str) -> str:
+    """What an error tells the admin to replace."""
+    if _personal_load.get():
+        return f"your token for {owner} in the Cards panel (My GitHub accounts)"
+    return f"{owner_env_name(owner)} (or AE_GITHUB_TOKEN)"
 
 
 # ── version ranges ────────────────────────────────────────────────────────────
@@ -342,7 +488,7 @@ def _status_note(status: int, what: str, owner: str) -> str:
     if status == 401:
         return (
             f"GitHub refused the token for {owner} (401): it is expired or wrong; "
-            f"replace {owner_env_name(owner)} (or AE_GITHUB_TOKEN)."
+            f"replace {_token_name(owner)}."
         )
     if status == 403:
         return (
@@ -400,13 +546,15 @@ def _cut(text: str | None, limit: int) -> str:
 
 # ── the load ──────────────────────────────────────────────────────────────────
 
-# (repo lower, lockfile path, default-branch oid) to the parsed index. Only readings
-# that finished are kept (a network failure is retried on the next load).
-_lock_cache: dict[tuple[str, str, str], Index | None] = {}
+# (credential identity, repo lower, lockfile path, default-branch oid) to the parsed index. The
+# identity (:meth:`Settings.identity`) is part of the key because GitHub answers by token: what
+# one login's token could read, or got a 404 for, says nothing about another's or the company's.
+# Only readings that finished are kept (a network failure is retried on the next load).
+_lock_cache: dict[tuple[str, str, str, str], Index | None] = {}
 _LOCK_CACHE_MAX = 300
 # A 404 is kept for an hour only: GitHub answers 404 for a private repo when the token lacks
 # Contents read, so a fixed token must be picked up without waiting for a push (2026-10-24).
-_lock_missing: dict[tuple[str, str, str], float] = {}
+_lock_missing: dict[tuple[str, str, str, str], float] = {}
 NOT_FOUND_TTL_S = 3600.0
 
 
@@ -414,6 +562,17 @@ def reset_lock_cache() -> None:
     _lock_cache.clear()
     _lock_missing.clear()
     _commit_cache.clear()
+
+
+def drop_identity(prefix: str) -> None:
+    """Forget the cached lockfile readings of every credential identity starting with *prefix*.
+
+    Called when a token is saved or cleared: ``company`` for the company's, ``user/<login>/`` for
+    one login's.
+    """
+    for cache in (_lock_cache, _lock_missing, _commit_cache):
+        for key in [k for k in cache if k[0].startswith(prefix)]:
+            del cache[key]
 
 
 async def _read_index(
@@ -426,7 +585,7 @@ async def _read_index(
     path: str,
     oid: str,
 ) -> Index | None:
-    key = (repo.lower(), path, oid)
+    key = (settings.identity(repo), repo.lower(), path, oid)
     if key in _lock_cache:
         return _lock_cache[key]
     missed = _lock_missing.get(key)
@@ -459,7 +618,7 @@ async def _read_index(
 
 # (repo lower, lockfile path, default-branch oid) to the date of the last commit on the default
 # branch that touched that lockfile; only readings that finished are kept.
-_commit_cache: dict[tuple[str, str, str], str | None] = {}
+_commit_cache: dict[tuple[str, str, str, str], str | None] = {}
 
 
 async def _lockfile_commit_date(
@@ -472,7 +631,7 @@ async def _lockfile_commit_date(
     path: str,
     oid: str,
 ) -> str | None:
-    key = (repo.lower(), path, oid)
+    key = (settings.identity(repo), repo.lower(), path, oid)
     if key in _commit_cache:
         return _commit_cache[key]
     url = (
@@ -508,8 +667,128 @@ def _bucket(
     return "waiting", installed
 
 
+_FAILED_RUNS = frozenset(
+    {"FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED"}
+)
+_FAILED_STATUS = frozenset({"FAILURE", "ERROR"})
+_PASSED_RUNS = frozenset({"SUCCESS", "NEUTRAL"})
+#: Runs that leave a check green without standing in for a cancelled one.
+_OK_RUNS = _PASSED_RUNS | {"SKIPPED"}
+
+
+def _run_key(node: dict[str, Any]) -> tuple[str, str, str]:
+    """A check run's identity: its app, its workflow and its full name, so two workflows (or
+    two apps) publishing the same job name never stand in for each other."""
+    suite = node.get("checkSuite") if isinstance(node.get("checkSuite"), dict) else {}
+    app = (suite.get("app") or {}).get("slug") if isinstance(suite.get("app"), dict) else None
+    run = suite.get("workflowRun") if isinstance(suite.get("workflowRun"), dict) else {}
+    workflow = (
+        (run.get("workflow") or {}).get("name") if isinstance(run.get("workflow"), dict) else None
+    )
+    return (str(app or ""), str(workflow or ""), str(node.get("name") or ""))
+
+
+def _superseded(nodes: list[Any]) -> set[int]:
+    """The ids of the cancelled check runs a later passed run of the same check stands for.
+
+    GitHub counts every cancelled run as a failure. A concurrency group cancels the duplicate
+    runs one push starts, and the run that finishes stands for the check (a leak scan,
+    2026-11-06). A cancel counts as superseded only when a run with the same app, workflow and
+    name passed and finished at or after it, so a person cancelling the newest run after an
+    older one passed still shows. A missing time never supersedes.
+    """
+    passed: dict[tuple[str, str, str], str] = {}
+    for node in nodes:
+        if isinstance(node, dict) and node.get("__typename") != "StatusContext":
+            done = node.get("completedAt")
+            if node.get("conclusion") in _PASSED_RUNS and isinstance(done, str) and done:
+                key = _run_key(node)
+                passed[key] = max(passed.get(key, ""), done)
+    out: set[int] = set()
+    for node in nodes:
+        if not isinstance(node, dict) or node.get("__typename") == "StatusContext":
+            continue
+        done = node.get("completedAt")
+        if node.get("conclusion") != "CANCELLED" or not isinstance(done, str) or not done:
+            continue
+        latest = passed.get(_run_key(node))
+        if latest is not None and latest >= done:
+            out.add(id(node))
+    return out
+
+
+def _failing_checks(rollup: Any) -> list[str] | None:
+    """The sorted names of the failing checks on a head commit, ``None`` when unknowable.
+
+    ``None`` (not a short list) when GitHub has more than the 20 checks the query reads, so a
+    truncated list never looks like a change (plan 3.2, 2026-11-03). A cancelled run a later
+    passed run of the same check stands for is not failing (``_superseded``).
+    """
+    if not isinstance(rollup, dict):
+        return []
+    contexts = rollup.get("contexts") or {}
+    nodes = contexts.get("nodes") or []
+    if int(contexts.get("totalCount") or 0) > len(nodes):
+        return None
+    superseded = _superseded(nodes)
+    names: set[str] = set()
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        if node.get("__typename") == "StatusContext":
+            if node.get("state") in _FAILED_STATUS:
+                names.add(_cut(node.get("context"), 80))
+        elif node.get("conclusion") in _FAILED_RUNS and id(node) not in superseded:
+            names.add(_cut(node.get("name"), 80))
+    return sorted(n for n in names if n)
+
+
+def _checks_state(rollup: Any, failing: list[str] | None) -> Any:
+    """GitHub's rollup state, with a FAILURE that only superseded cancelled runs caused undone.
+
+    The state changes only when every check is accounted for: each run passed, is unfinished, or
+    is a superseded cancel, and each status is SUCCESS or unfinished. Then it is PENDING while
+    anything is unfinished and SUCCESS otherwise. Any other value (STALE, a conclusion GitHub
+    adds later) keeps GitHub's own state, so nothing unknown ever reads green.
+    """
+    if not isinstance(rollup, dict):
+        return None
+    state = rollup.get("state")
+    if state not in _FAILED_STATUS or failing != []:
+        return state
+    nodes = (rollup.get("contexts") or {}).get("nodes") or []
+    if not nodes:
+        return state
+    superseded = _superseded(nodes)
+    pending = False
+    for node in nodes:
+        if not isinstance(node, dict):
+            return state
+        if node.get("__typename") == "StatusContext":
+            if node.get("state") in ("PENDING", "EXPECTED"):
+                pending = True
+            elif node.get("state") != "SUCCESS":
+                return state
+        elif node.get("status") not in (None, "COMPLETED") or node.get("conclusion") is None:
+            pending = True
+        elif node.get("conclusion") not in _OK_RUNS and id(node) not in superseded:
+            return state
+    return "PENDING" if pending else "SUCCESS"
+
+
+def wire(value: Any) -> Any:
+    """*value* without the ``_facts`` the Needs you list keeps (they never go to the page)."""
+    if isinstance(value, dict):
+        return {k: wire(v) for k, v in value.items() if k != "_facts"}
+    if isinstance(value, list):
+        return [wire(v) for v in value]
+    return value
+
+
 def _repo_error(repo: dict[str, Any], note: str) -> dict[str, Any]:
-    repo.update(error=_cut(note, 240), prs=[], alerts=[], branches=[])
+    repo.update(
+        error=_cut(note, 240), prs=[], alerts=[], branches=[], _facts={"prs": {}, "branches": {}}
+    )
     return repo
 
 
@@ -569,7 +848,7 @@ async def _load_repo(
                 return _repo_error(
                     row,
                     f"The token cannot read Dependabot alerts for {repo}: add the Dependabot "
-                    f"alerts (read) permission to {owner_env_name(owner)} (or AE_GITHUB_TOKEN).",
+                    f"alerts (read) permission to {_token_name(owner)}.",
                 )
             if errors:
                 return _repo_error(row, f"GitHub reported an error reading {repo}; try again.")
@@ -600,13 +879,28 @@ async def _fill_repo(
     row["pushed_at"] = data.get("pushedAt")
 
     prs = []
+    # Facts the Needs you list keys on (head commit, failing check names, branch heads). They
+    # ride in the cached row but never go to the page (:func:`wire`): the answer is size-capped.
+    facts: dict[str, Any] = {"prs": {}, "branches": {}}
+    row["_facts"] = facts
+    # A connection with a next page was read in part: an item missing from it is not known to
+    # be gone, so the repo's scope is unclean (dismissals kept, "?" shown) (2026-11-03).
+    if any(
+        ((data.get(name) or {}).get("pageInfo") or {}).get("hasNextPage")
+        for name in ("pullRequests", "refs", "vulnerabilityAlerts")
+    ):
+        facts["truncated"] = True
     for node in (data.get("pullRequests") or {}).get("nodes") or []:
         if not node:
             continue
         commits = (node.get("commits") or {}).get("nodes") or []
-        rollup = (
-            ((commits[0] or {}).get("commit") or {}).get("statusCheckRollup") if commits else None
-        )
+        commit = (commits[0] or {}).get("commit") or {} if commits else {}
+        rollup = commit.get("statusCheckRollup")
+        failing = _failing_checks(rollup)
+        facts["prs"][str(node.get("number"))] = {
+            "sha": str(commit.get("oid") or ""),
+            "failing": failing,
+        }
         prs.append(
             {
                 "number": node.get("number"),
@@ -614,8 +908,12 @@ async def _fill_repo(
                 "url": node.get("url"),
                 "draft": bool(node.get("isDraft")),
                 "merge_state": node.get("mergeStateStatus") or "UNKNOWN",
-                "checks": (rollup or {}).get("state"),
+                "checks": _checks_state(rollup, failing),
                 "author": (node.get("author") or {}).get("login"),
+                # Only an explicit false means the head is in this repository; a missing or odd
+                # value counts as a fork, so a Fix never runs code it cannot vouch for.
+                "cross_repo": node.get("isCrossRepository") is not False,
+                "author_association": node.get("authorAssociation"),
                 "updated_at": node.get("updatedAt"),
             }
         )
@@ -629,6 +927,7 @@ async def _fill_repo(
             continue
         if ((node.get("associatedPullRequests") or {}).get("totalCount") or 0) > 0:
             continue
+        facts["branches"][bname] = str((node.get("target") or {}).get("oid") or "")
         branches.append(
             {
                 "name": _cut(bname, TITLE_MAX),
@@ -713,12 +1012,29 @@ async def _fill_repo(
     return row
 
 
+def _surfaceable(repo: dict[str, Any], when: float) -> list[dict[str, Any]]:
+    """The repo's branches :func:`needs` would turn into an item (not kept, old enough).
+
+    Only these cost a compare call; the order (oldest first) is kept.
+    """
+    out = []
+    for branch in repo["branches"]:
+        if branch.get("kept"):
+            continue
+        at = _stamp(branch.get("last_commit_at"))
+        if not math.isnan(at) and when - at > OLD_BRANCH_DAYS * 86400:
+            out.append(branch)
+    return out
+
+
 async def _fill_ahead(
     client: httpx.AsyncClient,
     settings: Settings,
     repo: dict[str, Any],
     token: str,
     sem: asyncio.Semaphore,
+    limit: int,
+    when: float,
 ) -> None:
     owner = repo["repo"].partition("/")[0]
 
@@ -737,7 +1053,13 @@ async def _fill_ahead(
                 branch["ahead"] = None
 
     if repo["default_branch"]:
-        await asyncio.gather(*(one(b) for b in repo["branches"]))
+        wanted = _surfaceable(repo, when)
+        picked = wanted[:limit]
+        if len(picked) < len(wanted):
+            # A branch the list would show, left uncompared, makes the repo's scope unclean
+            # (like a paginated read).
+            repo.setdefault("_facts", {})["truncated"] = True
+        await asyncio.gather(*(one(b) for b in picked))
 
 
 async def _load_sweep(
@@ -752,7 +1074,8 @@ async def _load_sweep(
     config_error: str | None = None
     if settings.sweep_repo is None or settings.sweep_path is None:
         sweep["error"] = (
-            "AE_GIT_SWEEP_CONFIG is not owner/repo:path; fix it in the server's environment."
+            "AE_GIT_SWEEP_CONFIG is not owner/repo:path; fix it in the Cards panel, or in the "
+            "server's environment if it is set there (the environment overrides the panel)."
         )
         return sweep, repos, catch_up, sweep["error"]
     repo = settings.sweep_repo
@@ -827,7 +1150,7 @@ def _dedupe(settings: Settings, config_repos: Sequence[str]) -> list[tuple[str, 
 
 def _size(payload: Any) -> int:
     # The extension bridge counts UTF-16 code units, so an emoji is two.
-    text = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    text = json.dumps(wire(payload), ensure_ascii=False, separators=(",", ":"))
     return len(text.encode("utf-16-le", errors="surrogatepass")) // 2
 
 
@@ -877,20 +1200,34 @@ async def load(
             "totals": _totals([]),
             "repos": [],
             "sweep": None,
+            "scope": settings.scope,
         }
+    marker = _personal_load.set(settings.scope == SCOPE_MINE)
+    try:
+        return await _load_configured(settings, stamp, transport, now)
+    finally:
+        _personal_load.reset(marker)
+
+
+async def _load_configured(
+    settings: Settings,
+    stamp: str,
+    transport: httpx.AsyncBaseTransport | None,
+    now: datetime | None,
+) -> dict[str, Any]:
     sem = asyncio.Semaphore(CONCURRENCY)
     async with httpx.AsyncClient(transport=transport) as client:
         sweep, config_repos, catch_up, config_error = await _load_sweep(client, settings)
         pairs = _dedupe(settings, config_repos)
         owners: dict[str, str] = {}
         for repo, _ in pairs:
-            owners.setdefault(repo.partition("/")[0].lower(), repo.partition("/")[0])
+            owners.setdefault(settings.group_of(repo).lower(), settings.group_of(repo))
         tokens = {key: settings.token_for(owner) for key, owner in owners.items()}
 
         async def run(repo: str, view_only: bool) -> dict[str, Any]:
-            token = tokens[repo.partition("/")[0].lower()]
+            token = tokens[settings.group_of(repo).lower()]
             if not token:
-                note = settings.no_token_note(repo.partition("/")[0])
+                note = settings.no_token_note(settings.group_of(repo))
                 return _repo_error(
                     {
                         "repo": repo,
@@ -906,26 +1243,43 @@ async def load(
         rows = list(await asyncio.gather(*(run(r, v) for r, v in pairs)))
         rows = [r for r in rows if not r.pop("archived", False)]
         live = [r["repo"] for r in rows]
+        for r in rows:
+            r["scope"] = settings.scope
 
         def count(r: dict[str, Any]) -> int:
             return len(r["prs"]) + len(r["alerts"]) + len(r["branches"])
 
         rows.sort(key=lambda r: (r["view_only"], count(r) == 0, -count(r), r["repo"].lower()))
-        # Caps across the lists. Fix alerts and non-draft PRs are kept first, across all repos;
-        # the totals above still count everything.
+        # The answer is kept whole: the Needs you list reads every alert and branch. Only the
+        # Git card's page is cut to fit (:func:`page`). Totals count everything.
         totals = _totals(rows)
-        cut = _cap(rows, "prs", MAX_PRS, lambda p: 1 if p["draft"] else 0)
-        cut |= _cap(rows, "alerts", MAX_ALERTS, lambda a: 0 if a["bucket"] == "fix" else 1)
-        cut |= _cap(rows, "branches", MAX_BRANCHES, lambda _b: 0)
         for r in rows:
             for alert in r["alerts"]:
                 alert.pop("_full_package", None)
                 alert.pop("_full_manifest", None)
+        # Compare calls are bounded per load, oldest branches first (the list is oldest first).
+        # Only branches the Needs you list would show are compared.
+        when = (now or datetime.now(UTC)).timestamp()
+        budget = MAX_FILL_AHEAD
+        todo: list[tuple[dict[str, Any], int]] = []
+        for r in rows:
+            if r["branches"] and not r["error"]:
+                want = len(_surfaceable(r, when)) if r["default_branch"] else 0
+                take = min(want, budget)
+                budget -= take
+                todo.append((r, take))
         await asyncio.gather(
             *(
-                _fill_ahead(client, settings, r, tokens[r["repo"].partition("/")[0].lower()], sem)
-                for r in rows
-                if r["branches"] and not r["error"]
+                _fill_ahead(
+                    client,
+                    settings,
+                    r,
+                    tokens[settings.group_of(r["repo"]).lower()],
+                    sem,
+                    take,
+                    when,
+                )
+                for r, take in todo
             )
         )
         for r in rows:
@@ -934,7 +1288,7 @@ async def load(
 
     accounts = []
     for key, owner in owners.items():
-        count_all = sum(1 for repo in live if repo.partition("/")[0].lower() == key)
+        count_all = sum(1 for repo in live if settings.group_of(repo).lower() == key)
         accounts.append(
             {
                 "owner": owner,
@@ -952,11 +1306,39 @@ async def load(
         "totals": totals,
         "repos": rows,
         "sweep": sweep,
+        "scope": settings.scope,
     }
-    if cut:
-        payload["list_cut"] = True
-    _fit(payload)
     return payload
+
+
+# The paged copy of the last answer handed to :func:`page`, per cache key. The held answer keeps
+# a strong reference, so its identity cannot be reused by another object. A hit needs the very
+# same repo list, so one key's page can never be served for another's answer.
+_page_memo: dict[str, tuple[Any, Any, dict[str, Any]]] = {}
+
+
+def page(answer: dict[str, Any], memo_key: str | None = "git") -> dict[str, Any]:
+    """The answer cut to fit the Git card's page (caps, then the bridge's size budget).
+
+    A fresh copy (:func:`wire`, so no ``_facts``); the held answer is never changed. Memoized
+    on the answer's repo list and error, so a last-good copy of the same read hits. *memo_key*
+    is the answer's cache key (:func:`cache_key`); ``None`` skips the memo (a merged answer).
+    """
+    repos, error = answer.get("repos"), answer.get("error")
+    held = _page_memo.get(memo_key) if memo_key is not None else None
+    if held is not None and held[0] is repos and held[1] == error:
+        return held[2]
+    paged: dict[str, Any] = wire(answer)
+    rows = paged["repos"]
+    cut = _cap(rows, "prs", MAX_PRS, lambda p: 1 if p["draft"] else 0)
+    cut |= _cap(rows, "alerts", MAX_ALERTS, lambda a: 0 if a["bucket"] == "fix" else 1)
+    cut |= _cap(rows, "branches", MAX_BRANCHES, lambda _b: 0)
+    if cut:
+        paged["list_cut"] = True
+    _fit(paged)
+    if memo_key is not None:
+        _page_memo[memo_key] = (repos, error, paged)
+    return paged
 
 
 def _cap(
@@ -1013,13 +1395,81 @@ def _describe(exc: BaseException) -> str:
 _cache = SwrCache[str, dict[str, Any]]("git repos", TTL_S, describe=_describe)
 
 
-# (monotonic time, answer) of the last first-ever load that failed for every repo.
-_failed: tuple[float, dict[str, Any]] | None = None
+def company_owners(environ: Mapping[str, str] | None = None) -> list[str]:
+    """The GitHub accounts of the company repo list, as first written, without any read.
+
+    From ``AE_GIT_SWEEP_CONFIG``'s own repo, ``AE_GIT_REPOS``, ``AE_GIT_VIEW_ONLY`` and the
+    accounts of the held company answer (which includes the sweep config's repos). Case-
+    insensitive, in first-seen order.
+    """
+    settings = Settings(environ)
+    repos = [*([settings.sweep_repo] if settings.sweep_repo else []), *settings.extra_repos]
+    names = [r.partition("/")[0] for r in [*repos, *settings.view_only]]
+    held = _cache.peek("git")
+    names += [str(a.get("owner") or "") for a in (held or {}).get("accounts") or []]
+    seen: dict[str, str] = {}
+    for name in names:
+        if name:
+            seen.setdefault(name.lower(), name)
+    return list(seen.values())
+
+
+def cache_key(scope: str = SCOPE_COMPANY, login: str | None = None) -> str:
+    """The key of one (scope, login) in the cache and in the failed-load memory.
+
+    ``"git"`` for the company list, ``"git-mine:<login>"`` for one admin's own.
+    """
+    if scope == SCOPE_MINE:
+        if not login:
+            raise ValueError("a personal read names the login")
+        return f"git-mine:{login}"
+    return "git"
+
+
+def _settings_for(scope: str, login: str | None) -> Settings:
+    if scope != SCOPE_MINE:
+        return Settings()
+    assert login
+    if not git_personal.is_active_admin(login):
+        return PersonalSettings(login, [])
+    return PersonalSettings(login, git_personal.store().get(login)[1])
+
+
+# (monotonic time, answer) of the last first-ever load per key that failed for every repo.
+_failed: dict[str, tuple[float, dict[str, Any]]] = {}
+# Bumped by reset_cache() and invalidate(): a read that began before a settings save must not
+# leave its failed first-load memory behind for the new settings (2026-11-07). One counter for
+# everything and one per key, so a personal save touches only that login.
+_epoch = 0
+_key_epoch: dict[str, int] = {}
+
+
+def _epoch_of(key: str) -> tuple[int, int]:
+    return _epoch, _key_epoch.get(key, 0)
+
+
+def invalidate(login: str | None = None) -> None:
+    """After a Git setting or token is saved in the panel: forget one scope's answers.
+
+    Without *login*, the company list's (a company setting or token changed); with it, that
+    login's own (they saved or cleared a personal account). Unlike :func:`reset_cache` this
+    cancels nothing: a read in flight finishes for the caller that asked, but stores nothing and
+    leaves no failed-load memory, so the next request reads with the new settings.
+    """
+    key = cache_key(SCOPE_MINE, login) if login else cache_key()
+    drop_identity(f"user/{login}/" if login else "company")
+    _key_epoch[key] = _key_epoch.get(key, 0) + 1
+    _failed.pop(key, None)
+    _page_memo.pop(key, None)
+    _cache.forget(key)
 
 
 def reset_cache() -> None:
-    global _failed
-    _failed = None
+    global _epoch
+    _epoch += 1
+    _failed.clear()
+    _page_memo.clear()
+    _key_epoch.clear()
     _cache.reset()
     reset_lock_cache()
 
@@ -1030,37 +1480,60 @@ def _with_last_good(held: dict[str, Any], why: str) -> dict[str, Any]:
     return {**held, "error": f"Showing the last good read{when}: {why}"}
 
 
-async def overview(*, fresh: bool = False) -> dict[str, Any]:
-    """The answer for ``GET /v1/ae/git``: cached 300 s, a failed load keeps the last good one."""
-    settings = Settings()
+async def overview(
+    *,
+    fresh: bool = False,
+    scope: str = SCOPE_COMPANY,
+    login: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """The answer for one scope: cached 300 s, a failed load keeps the last good one.
+
+    *scope* ``"company"`` is the server's list; ``"mine"`` is *login*'s own, read with their own
+    tokens. Everything held (answer, failed-first-load memory, last good answer) is keyed by
+    (scope, login), so one login's answer is never served to another. *transport* is for tests.
+    """
+    key = cache_key(scope, login)
+    settings = _settings_for(scope, login)
+    transport = transport or TRANSPORT
+
+    def loaded(use: Settings) -> Any:
+        if transport is None:
+            return load(use)
+        return load(use, transport=transport)
+
     if not settings.configured:
-        return await load(settings)
+        return await loaded(settings)
 
     async def do_load() -> dict[str, Any]:
-        answer = await load(settings)
+        answer = await loaded(settings)
         # A load that read repos and got an error from every one is an outage, not news:
         # raise so the cache keeps the last good answer.
         if answer["repos"] and all(r["error"] for r in answer["repos"]):
             raise _AllFailed(answer)
         return answer
 
-    global _failed
-    if not fresh and _failed is not None and _cache.peek("git") is None:
-        if time.monotonic() - _failed[0] < FAILED_MEMORY_S:
-            return _failed[1]
-        _failed = None
+    epoch = _epoch_of(key)
+    failed = _failed.get(key)
+    if not fresh and failed is not None and _cache.peek(key) is None:
+        if time.monotonic() - failed[0] < FAILED_MEMORY_S:
+            return failed[1]
+        _failed.pop(key, None)
     try:
-        value = await _cache.get("git", do_load, fresh=fresh)
+        value = await _cache.get(key, do_load, fresh=fresh)
     except Exception as exc:  # noqa: BLE001 - the card answers with an error line instead
         _logger.warning("git card: load failed (%s)", type(exc).__name__)
-        held = _cache.peek("git")
+        held = _cache.peek(key)
         if held is not None:
             return _with_last_good(held, _describe(exc))
         if isinstance(exc, _AllFailed):
-            failed = {**exc.payload, "error": str(exc)}
-            _failed = (time.monotonic(), failed)
-            return failed
-        answer = await load(Settings({}))
+            failed_answer = {**exc.payload, "error": str(exc)}
+            if epoch == _epoch_of(key):
+                _failed[key] = (time.monotonic(), failed_answer)
+            return failed_answer
+        answer = await loaded(
+            PersonalSettings(login or "", []) if scope == SCOPE_MINE else Settings({})
+        )
         answer.update(
             configured=True,
             setup=None,
@@ -1070,10 +1543,564 @@ async def overview(*, fresh: bool = False) -> dict[str, Any]:
             error=f"The Git repos read failed ({type(exc).__name__}); try again.",
         )
         return answer
-    _failed = None
-    why = _cache.last_error("git")
+    if epoch == _epoch_of(key):
+        _failed.pop(key, None)
+    why = _cache.last_error(key)
     # A value served while its refresh failed (an error is set only when the value is older).
     return _with_last_good(value, why) if why else value
 
 
-__all__ = ["Settings", "in_range", "load", "overview", "owner_env_name", "reset_cache"]
+def merge(company: dict[str, Any], mine: dict[str, Any]) -> dict[str, Any]:
+    """An admin's All view: the company answer and their own, a repo in both shown once.
+
+    The duplicate is dropped from the personal side (the company row stays, under Company),
+    except when the company row has an error and the personal row read fine. The dedupe is by
+    repo name, case-insensitive, and happens here only. Totals are recomputed for the merged
+    rows. Fresh copies; neither held answer is changed. Personal rows keep ``scope: "mine"`` and
+    company rows ``scope: "company"``. ``accounts`` lists both scopes (each entry carries its
+    ``scope``), ``error`` is the company's else the personal one's, and
+    ``configured`` is true when either side is.
+    """
+    theirs = {str(r["repo"]).lower(): r for r in mine.get("repos") or []}
+    own = {str(r["repo"]).lower() for r in company.get("repos") or []}
+    rows = []
+    for row in company.get("repos") or []:
+        # The company row wins, unless it failed to read and the admin's own token read it fine:
+        # then the working row is the one worth showing (it keeps its "mine" scope).
+        personal = theirs.get(str(row["repo"]).lower())
+        if personal is not None and row.get("error") and not personal.get("error"):
+            rows.append(personal)
+        else:
+            rows.append(row)
+    rows += [r for r in mine.get("repos") or [] if str(r["repo"]).lower() not in own]
+    rows.sort(key=lambda r: (r["view_only"], _count(r) == 0, -_count(r), r["repo"].lower()))
+    accounts = [
+        *({**a, "scope": SCOPE_COMPANY} for a in company.get("accounts") or []),
+        *({**a, "scope": SCOPE_MINE} for a in mine.get("accounts") or []),
+    ]
+    return {
+        "configured": bool(company.get("configured") or mine.get("configured")),
+        "setup": company.get("setup") if not mine.get("configured") else None,
+        "updated_at": max(str(company.get("updated_at") or ""), str(mine.get("updated_at") or "")),
+        "error": company.get("error") or mine.get("error"),
+        "accounts": accounts,
+        "totals": _totals(rows),
+        "repos": rows,
+        "sweep": company.get("sweep"),
+        "scope": "all",
+        **({"list_cut": True} if company.get("list_cut") or mine.get("list_cut") else {}),
+    }
+
+
+def _count(r: dict[str, Any]) -> int:
+    return len(r["prs"]) + len(r["alerts"]) + len(r["branches"])
+
+
+# ── Needs you (2026-11-03, Admin Center v1.5) ─────────────────────────────────
+
+#: A waiting alert older than this is stuck (GitHub's alerts lag a fix by hours).
+STUCK_HOURS = 24
+#: A branch with no PR, not kept, whose last commit is older than this is an old branch.
+OLD_BRANCH_DAYS = 14
+#: The Dependency Sweep runs every 6 hours; no run started for 8 is late.
+SWEEP_LATE_HOURS = 8
+_SEVERITIES = ("CRITICAL", "HIGH", "MODERATE", "LOW")
+_RANK = {"urgent": 0, "review": 1}
+_ID_SUBJECT_MAX = 100
+
+
+def _plural(n: int, one: str, many: str | None = None) -> str:
+    return f"{n} {one if n == 1 else (many or one + 's')}"
+
+
+def _stamp(iso: str | None) -> float:
+    """Epoch seconds of an ISO time, ``nan`` when it is missing or unreadable."""
+    if not iso:
+        return float("nan")
+    try:
+        return datetime.fromisoformat(str(iso).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return float("nan")
+
+
+def _when_short(iso: str, now: float) -> str:
+    at = _stamp(iso)
+    if math.isnan(at):
+        return ""
+    moment = datetime.fromtimestamp(at, UTC)
+    if moment.date() == datetime.fromtimestamp(now, UTC).date():
+        return moment.strftime("%H:%M UTC")
+    return f"{moment.strftime('%b')} {moment.day}"
+
+
+def _age_text(iso: str | None, now: float) -> str:
+    at = _stamp(iso)
+    if math.isnan(at):
+        return ""
+    days = max(0, int((now - at) // 86400))
+    if days == 0:
+        return "today"
+    if days < 14:
+        return _plural(days, "day")
+    if days < 60:
+        return _plural(days // 7, "week")
+    if days < 730:
+        return _plural(days // 30, "month")
+    return _plural(days // 365, "year")
+
+
+def _ago(iso: str | None, now: float) -> str:
+    age = _age_text(iso, now)
+    return age if age in ("today", "") else f"{age} ago"
+
+
+def _short_name(repo: str) -> str:
+    return repo.partition("/")[2] or repo
+
+
+def _subject(text: str) -> str:
+    """*text* for an id: short, with a hash when it had to be cut (ids become label values)."""
+    if len(text) <= _ID_SUBJECT_MAX:
+        return text
+    return text[: _ID_SUBJECT_MAX - 9] + "~" + hashlib.sha1(text.encode()).hexdigest()[:8]
+
+
+def _package_list(alerts: list[dict[str, Any]]) -> str:
+    names = list(dict.fromkeys(str(a.get("package") or "") for a in alerts))
+    shown = ", ".join(names[:3])
+    return f"{shown} and {len(names) - 3} more" if len(names) > 3 else shown
+
+
+def error_code(note: str | None) -> str:
+    """A repo or account error as a short code (state keeps the code, never the sentence)."""
+    text = (note or "").lower()
+    for needle, code in (
+        ("no token", "no_token"),
+        ("rate limit", "rate_limited"),
+        ("dependabot alerts", "alerts_permission"),
+        ("did not answer", "no_answer"),
+        ("unreadable", "unreadable"),
+        ("not found", "not_found"),
+        ("cannot", "refused"),
+    ):
+        if needle in text:
+            return code
+    return "error"
+
+
+def _namespace(login: str | None) -> str:
+    """The prefix of a Needs you item id and scope id: ``git``, or ``git-mine:<login>``."""
+    return f"git-mine:{login}" if login else "git"
+
+
+def needs(
+    overview: Mapping[str, Any], now: float | None = None, *, login: str | None = None
+) -> list[dict[str, Any]]:
+    """What needs the owner on the Git card: a port of ``analyze()`` in ``git.ts`` (2026-11-03).
+
+    One rule set serves the badge and the card, so the card draws this list rather than its
+    own. Each item is ``{id, kind, tone, title, meta, url, state, scope}``: *tone* is
+    ``urgent`` for the card's err rows and ``review`` for its accent and warn rows, *state* is
+    the small canonical fact set the "worse" rule compares (never a time or an "ago" text),
+    and *scope* names the read that vouches for the item's absence. Worst first, in
+    ``analyze()``'s order inside a tone. ``tests/test_git_center.py`` and ``git.test.ts`` pin
+    the ids against the old TypeScript rules.
+
+    With *login* (a personal answer) the item ids read ``git-mine:<login>:<rest>`` and the
+    scope ids ``git-mine:<login>:repo:<owner/name>``, so one admin's items can never collide
+    with, or be found as, another's or the company's.
+    """
+    when = time.time() if now is None else now
+    space = _namespace(login)
+    repos = [r for r in overview.get("repos") or [] if not r.get("view_only")]
+    head: list[dict[str, Any]] = []
+    pr_rows: list[dict[str, Any]] = []
+    stuck_rows: list[dict[str, Any]] = []
+    branch_rows: list[dict[str, Any]] = []
+
+    def item(kind: str, tone: str, subject: str, scope: str, **fields: Any) -> dict[str, Any]:
+        return {
+            "id": f"{space}:{kind}:{_subject(subject)}",
+            "kind": kind,
+            "tone": tone,
+            "scope": space + scope[len("git") :],
+            **fields,
+        }
+
+    explained: set[str] = set()
+    for account in overview.get("accounts") or []:
+        if account.get("connected"):
+            continue
+        note = account.get("note") or "No token for this account."
+        explained.add(note)
+        owner = str(account.get("owner") or "")
+        head.append(
+            item(
+                "account",
+                "urgent",
+                owner,
+                "git:accounts",
+                title=f"{owner} is not connected",
+                meta=note,
+                url=f"https://github.com/{owner}",
+                state={"owner": owner, "error": "no_token"},
+            )
+        )
+    for repo in repos:
+        if repo.get("error") and repo["error"] not in explained:
+            head.append(
+                item(
+                    "repo-error",
+                    "urgent",
+                    repo["repo"],
+                    f"git:repo:{repo['repo']}",
+                    title=f"{repo['repo']} could not be read",
+                    meta=repo["error"],
+                    url=repo.get("url") or f"https://github.com/{repo['repo']}",
+                    state={"repo": repo["repo"], "error": error_code(repo["error"])},
+                )
+            )
+
+    sweep = overview.get("sweep")
+    runs = (sweep or {}).get("runs") or []
+    latest = runs[0] if runs else None
+    if sweep and not latest and not sweep.get("error"):
+        head.append(
+            item(
+                "sweep",
+                "urgent",
+                "dependency-sweep",
+                "git:sweep",
+                title="No Dependency Sweep runs found",
+                meta="The workflow is set up but has no runs yet",
+                url=sweep.get("url") or "",
+                state={"issue": "none", "run": None},
+            )
+        )
+    if sweep and latest:
+        started = _stamp(latest.get("created_at"))
+        run_id = latest.get("id")
+        if (latest.get("conclusion") or "") in ("failure", "timed_out", "startup_failure"):
+            head.append(
+                item(
+                    "sweep",
+                    "urgent",
+                    "dependency-sweep",
+                    "git:sweep",
+                    title="The latest Dependency Sweep failed",
+                    meta=f"Started {_when_short(latest.get('created_at') or '', when)}",
+                    url=latest.get("url") or "",
+                    state={"issue": "failed", "run": run_id},
+                )
+            )
+        elif not math.isnan(started) and when - started > SWEEP_LATE_HOURS * 3600:
+            hours = int((when - started) // 3600)
+            head.append(
+                item(
+                    "sweep",
+                    "urgent",
+                    "dependency-sweep",
+                    "git:sweep",
+                    title=f"No Dependency Sweep has started in {_plural(hours, 'hour')}",
+                    meta="It runs every 6 hours; the last one started "
+                    f"{_when_short(latest.get('created_at') or '', when)}",
+                    url=latest.get("url") or "",
+                    state={"issue": "late", "run": run_id},
+                )
+            )
+
+    for repo in repos:
+        name = _short_name(repo["repo"])
+        scope = f"git:repo:{repo['repo']}"
+        facts = repo.get("_facts") or {}
+        alerts = repo.get("alerts") or []
+        fix = [a for a in alerts if a.get("bucket") == "fix"]
+        if fix:
+            worst = next(
+                (lvl for lvl in _SEVERITIES if any(a.get("severity") == lvl for a in fix)), None
+            )
+            head.append(
+                item(
+                    "alerts-fix",
+                    "urgent",
+                    repo["repo"],
+                    scope,
+                    title=f"{_plural(len(fix), 'alert')} to fix: {_package_list(fix)}",
+                    meta=f"{name} · worst is {worst.lower()}" if worst else name,
+                    url=f"https://github.com/{repo['repo']}/security/dependabot",
+                    state={
+                        "repo": repo["repo"],
+                        "alerts": sorted(int(a.get("number") or 0) for a in fix),
+                        "severity": worst,
+                    },
+                )
+            )
+        stuck: list[dict[str, Any]] = []
+        for alert in (a for a in alerts if a.get("bucket") == "waiting"):
+            since = _stamp(alert.get("waiting_since") or alert.get("created_at"))
+            if not math.isnan(since) and when - since > STUCK_HOURS * 3600:
+                stuck.append(alert)
+        if stuck:
+            oldest = sorted(
+                (a.get("waiting_since") or a.get("created_at") or "" for a in stuck),
+                key=lambda v: (math.isnan(_stamp(v)), _stamp(v)),
+            )[0]
+            stuck_rows.append(
+                item(
+                    "alerts-stuck",
+                    "review",
+                    repo["repo"],
+                    scope,
+                    title=f"{_plural(len(stuck), 'alert')} fixed on {repo.get('default_branch')}, "
+                    "still open on GitHub",
+                    meta=f"{name} · stuck {_age_text(oldest, when)} · a lockfile push or "
+                    "GitHub Support clears them",
+                    url=f"https://github.com/{repo['repo']}/security/dependabot",
+                    state={
+                        "repo": repo["repo"],
+                        "alerts": sorted(int(a.get("number") or 0) for a in stuck),
+                    },
+                )
+            )
+        for pr in repo.get("prs") or []:
+            if pr.get("draft"):
+                continue
+            number = pr.get("number")
+            fact = (facts.get("prs") or {}).get(str(number)) or {}
+            sha = str(fact.get("sha") or "")
+            checks = pr.get("checks")
+            merge = pr.get("merge_state") or "UNKNOWN"
+            failing = checks in ("FAILURE", "ERROR")
+            conflicts = merge == "DIRTY"
+            subject = f"{repo['repo']}#{number}"
+            url = pr.get("url") or ""
+            if failing or conflicts:
+                words = ", ".join(
+                    w for w, on in (("checks failing", failing), ("conflicts", conflicts)) if on
+                )
+                pr_rows.append(
+                    item(
+                        "pr-failing",
+                        "urgent",
+                        subject,
+                        scope,
+                        title=f"Fix #{number} {pr.get('title')}",
+                        meta=f"{name} · {words}",
+                        url=url,
+                        cross_repo=bool(pr.get("cross_repo", True)),
+                        state={
+                            "repo": repo["repo"],
+                            "number": number,
+                            "sha": sha,
+                            "failing": fact.get("failing") if failing else [],
+                            "conflicts": conflicts,
+                        },
+                    )
+                )
+            elif merge == "CLEAN":
+                green = "checks green" if checks == "SUCCESS" else _checks_text(checks)
+                pr_rows.append(
+                    item(
+                        "pr-ready",
+                        "review",
+                        subject,
+                        scope,
+                        title=f"Merge #{number} {pr.get('title')}",
+                        meta=f"{name} · {green}, no conflicts",
+                        url=url,
+                        state={"repo": repo["repo"], "number": number, "sha": sha},
+                    )
+                )
+            elif (
+                merge == "UNSTABLE"
+                or checks == "PENDING"
+                # The sweep rebases and re-reads these itself; BLOCKED is a review it won't give.
+                or (_is_dependabot(pr) and merge in ("BEHIND", "UNKNOWN"))
+            ):
+                continue
+            elif merge in ("BEHIND", "BLOCKED"):
+                behind = merge == "BEHIND"
+                pr_rows.append(
+                    item(
+                        "pr-update",
+                        "review",
+                        subject,
+                        scope,
+                        title=(
+                            f"Update #{number} {pr.get('title')}"
+                            if behind
+                            else f"#{number} {pr.get('title')} is blocked"
+                        ),
+                        meta=(
+                            f"{name} · behind {repo.get('default_branch')}"
+                            if behind
+                            else f"{name} · waiting on a review or a required check"
+                        ),
+                        url=url,
+                        cross_repo=bool(pr.get("cross_repo", True)),
+                        state={
+                            "repo": repo["repo"],
+                            "number": number,
+                            "sha": sha,
+                            "merge": merge,
+                        },
+                    )
+                )
+        old: list[tuple[float, dict[str, Any]]] = []
+        for branch in repo.get("branches") or []:
+            if branch.get("kept"):
+                continue
+            at = _stamp(branch.get("last_commit_at"))
+            # A branch with no readable date is not called old: nothing says it is.
+            if not math.isnan(at) and when - at > OLD_BRANCH_DAYS * 86400:
+                old.append((at, branch))
+        for at, branch in old:
+            ahead = branch.get("ahead")
+            bname = str(branch.get("name") or "")
+            branch_rows.append(
+                {
+                    "_at": at,
+                    **item(
+                        "branch",
+                        "review",
+                        f"{repo['repo']}:{bname}",
+                        scope,
+                        title=(
+                            f"{bname} has {_plural(ahead, 'commit')} and no PR"
+                            if ahead
+                            else f"{bname}, no PR"
+                        ),
+                        meta=f"{name} · last commit {_ago(branch.get('last_commit_at'), when)}",
+                        url=branch.get("url") or "",
+                        state={
+                            "repo": repo["repo"],
+                            "branch": bname,
+                            "sha": str((facts.get("branches") or {}).get(bname) or ""),
+                        },
+                    ),
+                }
+            )
+    # Old branches sort oldest first across repos, as the card did.
+    branch_rows.sort(key=lambda row: row["_at"])
+    for row in branch_rows:
+        del row["_at"]
+    ordered = [*head, *pr_rows, *stuck_rows, *branch_rows]
+    ordered.sort(key=lambda row: _RANK[row["tone"]])  # stable: the order built above stands
+    return ordered
+
+
+def _checks_text(checks: str | None) -> str:
+    if checks == "SUCCESS":
+        return "checks passed"
+    if checks in ("FAILURE", "ERROR"):
+        return "checks failing"
+    if checks in ("PENDING", "EXPECTED"):
+        return "checks running"
+    return "no checks"
+
+
+def _is_dependabot(pr: Mapping[str, Any]) -> bool:
+    return str(pr.get("author") or "").lower().startswith("dependabot")
+
+
+def scope_ids(overview: Mapping[str, Any], login: str | None = None) -> list[dict[str, Any]]:
+    """The reads behind :func:`needs`: ``{id, ok}`` per repo, the accounts and the sweep.
+
+    A scope is not ``ok`` when its read failed or when the lists were cut to fit the page,
+    since an item missing from either is not known to be gone. With *login*, the ids are the
+    personal ones (:func:`needs`).
+    """
+    space = _namespace(login)
+    cut = bool(overview.get("list_cut"))
+    out = [{"id": f"{space}:accounts", "ok": bool(overview.get("configured"))}]
+    for repo in overview.get("repos") or []:
+        if repo.get("view_only"):
+            continue
+        truncated = bool((repo.get("_facts") or {}).get("truncated"))
+        out.append(
+            {
+                "id": f"{space}:repo:{repo['repo']}",
+                "ok": not repo.get("error") and not cut and not truncated,
+            }
+        )
+    sweep = overview.get("sweep")
+    if sweep is not None:
+        out.append({"id": f"{space}:sweep", "ok": not sweep.get("error")})
+    return out
+
+
+async def cached(
+    *, kick: bool = True, scope: str = SCOPE_COMPANY, login: str | None = None
+) -> tuple[dict[str, Any] | None, float | None, str | None]:
+    """(held answer, its age in seconds, why the last refresh failed): the badge's read.
+
+    Nothing is awaited: ``(None, None, ...)`` when nothing is held yet. With *kick*, a missing
+    or past-TTL answer starts one background :func:`overview` (single-flight in the cache), so
+    the next read is fresh; this never passes ``fresh=True``. A personal read (*scope*
+    ``"mine"``) names the *login* it is for and sees only that login's own answer.
+    """
+    key = cache_key(scope, login)
+    held = _cache.peek(key)
+    age = _cache.age_s(key)
+    if kick and (held is None or (age is not None and age >= TTL_S)):
+        _kick(scope, login)
+    return held, age, _cache.last_error(key)
+
+
+async def refresh_due(scope: str = SCOPE_COMPANY, login: str | None = None) -> bool:
+    """Whether :func:`cached` with *kick* would start a background read now."""
+    key = cache_key(scope, login)
+    if not _settings_for(scope, login).configured or _cache.refreshing(key):
+        return False
+    age = _cache.age_s(key)
+    return _cache.peek(key) is None or (age is not None and age >= TTL_S)
+
+
+_kicked: set[asyncio.Task[Any]] = set()
+
+
+def _kick(scope: str = SCOPE_COMPANY, login: str | None = None) -> None:
+    key = cache_key(scope, login)
+    # A switched-off Git card reads nothing, for anyone: re-checked here because a scheduled
+    # refresh may have been queued before the switch.
+    if admin_cards.all_off("git") or not _settings_for(scope, login).configured:
+        return
+    if _cache.refreshing(key):
+        return
+
+    async def run() -> None:
+        if admin_cards.all_off("git"):
+            return
+        try:
+            await overview(scope=scope, login=login)
+        except Exception as exc:  # noqa: BLE001 (a background refresh never raises into a route)
+            _logger.warning("git needs: background read failed (%s)", type(exc).__name__)
+
+    try:
+        task = asyncio.get_running_loop().create_task(run())
+    except RuntimeError:
+        return
+    _kicked.add(task)
+    task.add_done_callback(_kicked.discard)
+
+
+__all__ = [
+    "SCOPE_COMPANY",
+    "SCOPE_MINE",
+    "PersonalSettings",
+    "Settings",
+    "cache_key",
+    "cached",
+    "in_range",
+    "invalidate",
+    "load",
+    "merge",
+    "needs",
+    "overview",
+    "owner_env_name",
+    "page",
+    "refresh_due",
+    "reset_cache",
+    "scope_ids",
+    "wire",
+]

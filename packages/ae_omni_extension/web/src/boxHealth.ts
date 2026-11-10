@@ -40,6 +40,7 @@ import {
   fetchBoxHealth,
   requestBoxCleanup,
 } from "./api";
+import { attentionCount, needsButton, onAttention, sourceRead } from "./attentionStore";
 import { openDialog } from "./dialog";
 import { el, notice, replaceChildren } from "./dom";
 import { HINT_MAX, hint } from "./hint";
@@ -174,8 +175,8 @@ export function tileOf(view: BoxHealthView | null, error: unknown): Tile {
   const note =
     view.state === "missing"
       ? "the box timer has not run"
-      : view.needs.length > 1
-        ? `${view.needs.length} need you`
+      : needCount(view) > 1
+        ? `${needCount(view)} need you`
         : `Read ${agoText(view.age_s)}`;
   return {
     id: "boxhealth",
@@ -188,11 +189,26 @@ export function tileOf(view: BoxHealthView | null, error: unknown): Tile {
   };
 }
 
+/**
+ * How many things on this box need the owner. The panel's count (Needs you, source "box") once it
+ * has been read, so the pill, the tile and the panel agree; the monitor's own list before that.
+ */
+export function needCount(view: BoxHealthView): number {
+  return attentionCount("box") ?? view.needs.length;
+}
+
 /** The status line's pill: the worst state in the tile's own words, in the server's tone. */
-export function worstOf(view: BoxHealthView): { text: string; tone: BoxTone } {
-  const text =
-    view.state === "missing" ? "No reading" : view.needs.length ? `${view.needs.length} need you` : "OK";
-  return { text, tone: view.tone };
+export function worstOf(view: BoxHealthView): { text: string; tone: BoxTone; title?: string } {
+  if (view.state === "missing") return { text: "No reading", tone: view.tone };
+  const n = needCount(view);
+  if (n) return { text: `${n} need you`, tone: view.tone };
+  if (!view.needs.length) return { text: "OK", tone: view.tone };
+  // The monitor still has needs, but the panel counts none: say why instead of reading "OK" in amber.
+  return {
+    text: "0 need you",
+    tone: view.tone,
+    title: "The monitor still lists problems, but each one is dismissed or a chat is working on it.",
+  };
 }
 
 // ── the summary section ─────────────────────────────────────────────────────
@@ -212,25 +228,6 @@ function tileRow(area: BoxArea): HTMLElement {
     el("span", { class: "bh-tile-l" }, dot(area.tone), el("span", { class: "bh-lbl" }, area.label)),
     el("span", { class: "bh-val" }, area.value),
   );
-}
-
-function needRow(need: BoxNeed, view: BoxHealthView): HTMLElement {
-  const offer = offerForNeed(view, need);
-  const row = el(
-    "li",
-    { class: `bh-need bh-t-${need.tone}`, title: need.detail || undefined },
-    dot(need.tone),
-    el("span", { class: "bh-need-text" }, need.text),
-  );
-  if (offer) {
-    const button = tipped(
-      el("button", { type: "button", class: "btn btn-quiet bh-act bh-need-act", "aria-haspopup": "dialog" }, "Clean up"),
-      BOX_HEALTH_HINTS.cleanUp,
-    );
-    button.addEventListener("click", () => openDetails(view, button, offer));
-    row.appendChild(button);
-  }
-  return row;
 }
 
 // ── cleanup (2026-10-28, Box health PR 2) ───────────────────────────────────
@@ -468,8 +465,9 @@ function confirmNode(offer: BoxActionOffer): HTMLElement {
 const WORST_HINT = "The worst state on this box right now";
 
 /** Draw the pill's icon and words, and its tone class. */
-function setWorst(pill: HTMLElement, worst: { text: string; tone: BoxTone }): void {
+function setWorst(pill: HTMLElement, worst: { text: string; tone: BoxTone; title?: string }): void {
   pill.className = `bh-worst bh-worst-${worst.tone}`;
+  pill.title = worst.title ?? WORST_HINT;
   const icon =
     worst.tone === "green" ? circleCheckIcon() : worst.tone === "grey" ? circleDashedIcon() : alertTriangleIcon();
   replaceChildren(pill, [icon, worst.text]);
@@ -498,6 +496,7 @@ export function summaryNode(
     "div",
     { class: "bh-status" },
     pill,
+    el("span", { class: "bh-needs-slot" }, summary.missing ? null : needsButton("box")),
     el(
       "span",
       { class: "bh-when" },
@@ -515,7 +514,7 @@ export function summaryNode(
   return root;
 }
 
-/** The part of the summary under its header: the missing-reading line, the needs, the areas. */
+/** The part of the summary under its header: the missing-reading line, the areas, the link to Needs you. */
 function restNodes(view: BoxHealthView): Node[] {
   const summary = summaryOf(view);
   const nodes: Node[] = [];
@@ -523,13 +522,9 @@ function restNodes(view: BoxHealthView): Node[] {
     nodes.push(el("p", { class: "bh-empty" }, "No reading from the box yet."));
     if (view.setup) nodes.push(el("code", { class: "bh-setup" }, view.setup));
   }
+  // 2026-11-03: the needs are listed once, in the Needs you panel (attention.ts); the card
+  // keeps a line that opens the panel filtered to the box, and the cleanup request below.
   const todo: Node[] = [];
-  if (summary.needs.length) {
-    todo.push(el("ul", { class: "bh-needs" }, ...summary.needs.map((n) => needRow(n, view))));
-    if (summary.more) {
-      todo.push(el("p", { class: "bh-more" }, `+${summary.more} more in Details`));
-    }
-  }
   const cleanup = cleanupStateNode(view, false);
   if (cleanup) {
     todo.push(cleanup);
@@ -537,7 +532,7 @@ function restNodes(view: BoxHealthView): Node[] {
     if (failure) todo.push(failure);
   }
   nodes.push(el("ul", { class: "bh-tiles" }, ...summary.areas.map(tileRow)));
-  if (todo.length) nodes.push(el("div", { class: "bh-todo" }, el("p", { class: "bh-todo-h" }, "Needs you"), ...todo));
+  if (todo.length) nodes.push(el("div", { class: "bh-todo" }, el("p", { class: "bh-todo-h" }, "Cleanup request"), ...todo));
   return nodes;
 }
 
@@ -553,6 +548,8 @@ export function updateSummary(root: HTMLElement, view: BoxHealthView): void {
   if (age) age.textContent = summary.age;
   const pill = root.querySelector<HTMLElement>(".bh-worst");
   if (pill) setWorst(pill, worstOf(view));
+  const slot = root.querySelector(".bh-needs-slot");
+  if (slot) replaceChildren(slot, [summary.missing ? null : needsButton("box")]);
   const rest = root.querySelector(".bh-rest");
   if (rest) replaceChildren(rest, restNodes(view));
 }
@@ -1107,6 +1104,32 @@ export function openDetails(
   drawDialog();
 }
 
+/** The latest view the section drew, for a Clean up button that lives in the Needs you panel. */
+let lastView: BoxHealthView | null = null;
+
+/**
+ * Open the Clean up confirm for the Needs you panel's row (2026-11-03): the same dialog,
+ * confirm text and request path as the card's own button had. The offer is matched to the
+ * latest reading by action, owner and where; false when the card has no such offer (the
+ * reading moved on), so the caller can say to look again.
+ */
+export function openCleanup(
+  offer: { id: string; owner: string; where?: string },
+  opener: HTMLElement | null,
+): boolean {
+  const view = lastView;
+  if (!view) return false;
+  const match = offersOf(view).find(
+    (o) =>
+      o.id === offer.id &&
+      o.owner === offer.owner &&
+      (o.id === "docker_prune" || (o.where ?? "box") === (offer.where ?? "box")),
+  );
+  if (!match) return false;
+  openDetails(view, opener, match);
+  return true;
+}
+
 // ── the section ─────────────────────────────────────────────────────────────
 
 interface SectionState {
@@ -1116,6 +1139,8 @@ interface SectionState {
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null;
+/** The unsubscribe from the Needs you store: the card's link line follows the panel's reads. */
+let stopAttention: (() => void) | null = null;
 let onFocus: (() => void) | null = null;
 /** Bumped by every activate and deactivate, as in host.ts. */
 let generation = 0;
@@ -1177,9 +1202,14 @@ export function activateBoxHealth(context: ExtensionContext, root: HTMLElement):
     document.removeEventListener("visibilitychange", onFocus);
   }
   const state: SectionState = { view: null, at: 0, error: null };
+  stopAttention?.();
+  stopAttention = onAttention(() => {
+    if (live() && state.view) draw();
+  });
   let reading: Promise<void> | null = null;
   const draw = () => {
     if (!live()) return;
+    lastView = state.view;
     render(body, refreshed, state);
     if (state.view) syncDialog(state.view);
   };
@@ -1210,6 +1240,8 @@ export function activateBoxHealth(context: ExtensionContext, root: HTMLElement):
       .then(() => {
         draw();
         schedule();
+        // The Needs you list is built from this reading: read it again now (debounced).
+        sourceRead();
       })
       .finally(() => {
         reading = null;
@@ -1236,6 +1268,9 @@ export function activateBoxHealth(context: ExtensionContext, root: HTMLElement):
 
 export function deactivateBoxHealth(): void {
   generation++;
+  stopAttention?.();
+  stopAttention = null;
+  lastView = null;
   if (timer) clearTimeout(timer);
   timer = null;
   dialog?.close();

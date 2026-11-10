@@ -23,6 +23,8 @@ import {
   toneOf,
 } from "../src/secrets";
 import { isOpen, resetSectionState } from "../src/sections";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -588,5 +590,22 @@ describe("the secrets look-again timer (2026-10-28)", () => {
     await vi.advanceTimersByTimeAsync(61_000);
     expect(request).toHaveBeenCalledTimes(2);
     expect(node.textContent).not.toContain("for admins");
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+
+    const node = card(status());
+    const link = () => node.querySelector(".fabric-acts .needs-link-btn");
+    expect(link()).toBeNull();
+    setAttention(needOverview([needItem("secrets-1", { source: "secrets", kind: "secret-missing" })]));
+    expect(link()?.textContent).toBe("See in Needs you");
+    setAttention(needOverview([]));
+    expect(link()).toBeNull();
   });
 });

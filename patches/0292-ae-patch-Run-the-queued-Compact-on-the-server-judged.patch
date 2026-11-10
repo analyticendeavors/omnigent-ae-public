@@ -1,0 +1,1714 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:38:50 -0800
+Subject: [PATCH 292/333] [ae-patch] Run the queued Compact on the server,
+ judged by the Stop hook's turn end
+
+Queued Compact lived only in the open page, so leaving the chat cancelled it and a long silent think read as a turn end. The server now owns the plan. This patch adds omnigent/server/ae_turn_edges.py, a registry that hands every status edge, interrupt and the claude-native Stop hook's completed idle (turn_completed, which the server never stored) to observers, with one-line hooks in _publish_status, _publish_interrupted and routes_events. The web side becomes a thin client of /v1/ae/sessions/{id}/compact (aeCompactPlan.ts, AeCompactButton.tsx) and the caller tests follow.
+---
+ omnigent/server/ae_turn_edges.py              |  94 +++
+ omnigent/server/routes/_sessions/helpers.py   |  10 +-
+ .../server/routes/sessions/routes_events.py   |   7 +-
+ tests/server/test_ae_turn_edges.py            | 134 ++++
+ web/src/components/AeActionDock.test.tsx      |  91 +--
+ web/src/components/aeRail/AeCompactButton.tsx |  35 +-
+ .../components/aeRail/AeRailContext.test.tsx  |   9 +
+ web/src/lib/aeCompactPlan.test.ts             | 649 ++++--------------
+ web/src/lib/aeCompactPlan.ts                  | 445 ++++--------
+ 9 files changed, 573 insertions(+), 901 deletions(-)
+ create mode 100644 omnigent/server/ae_turn_edges.py
+ create mode 100644 tests/server/test_ae_turn_edges.py
+
+diff --git a/omnigent/server/ae_turn_edges.py b/omnigent/server/ae_turn_edges.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5091b23a6375da3a468b9bb8b515ebdd0375bb86
+--- /dev/null
++++ b/omnigent/server/ae_turn_edges.py
+@@ -0,0 +1,94 @@
++"""Observers of session turn edges: running, idle (completed), failed, interrupted.
++
++A small registry the server calls at the points where a session's turn state
++changes: every :func:`omnigent.server.routes._sessions.helpers._publish_status`
++call, every interrupt, and the claude-native forwarder's ``Stop`` hook edge (an
++``external_session_status`` ``idle`` carrying ``turn_completed=True``). That
++last flag is neither stored nor published on the ``session.status`` stream, so
++a module that must know a real turn ended (not a PTY-quiet guess) has nowhere
++else to hook.
++
++Observers run inline and synchronously, each wrapped so whatever it raises is
++logged and dropped. They must be O(1) and must never block: ``_publish_status``
++runs on the request path and sometimes off the event loop, so an observer may
++be called from a worker thread and must guard its own state with a lock.
++
++The registry is process-local, like :mod:`omnigent.server.item_observers`,
++and empty until something registers. It imports nothing from
++``omnigent.server`` so any module can import it without a cycle.
++"""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Callable
++from dataclasses import dataclass
++
++_log = logging.getLogger(__name__)
++
++
++@dataclass(frozen=True)
++class TurnEdge:
++    """One turn-state edge of a session.
++
++    :param session_id: The conversation id, e.g. ``"conv_abc123"``.
++    :param status: ``running``, ``waiting``, ``idle``, ``failed`` or ``interrupted``.
++    :param response_id: The response id the edge carried, if any.
++    :param turn_completed: ``True`` only for the Stop hook's idle edge.
++    """
++
++    session_id: str
++    status: str
++    response_id: str | None = None
++    turn_completed: bool = False
++
++
++TurnEdgeObserver = Callable[[TurnEdge], None]
++
++_observers: list[TurnEdgeObserver] = []
++
++
++def register_turn_edge_observer(fn: TurnEdgeObserver) -> None:
++    """Add *fn* to the observers called on every edge; registering twice is a no-op."""
++    if fn not in _observers:
++        _observers.append(fn)
++
++
++def unregister_turn_edge_observer(fn: TurnEdgeObserver) -> None:
++    """Remove *fn*; an unknown callable is ignored."""
++    if fn in _observers:
++        _observers.remove(fn)
++
++
++def reset_turn_edge_observers() -> None:
++    """Drop every observer (tests)."""
++    _observers.clear()
++
++
++def notify_turn_edge(
++    session_id: str,
++    status: str,
++    *,
++    response_id: str | None = None,
++    turn_completed: bool = False,
++) -> None:
++    """Hand one edge to every observer; an observer's failure never reaches the caller."""
++    if not _observers:
++        return
++    edge = TurnEdge(session_id, status, response_id, turn_completed)
++    for observer in list(_observers):
++        try:
++            observer(edge)
++        except Exception:  # noqa: BLE001 — an observer must never break a status publish
++            name = getattr(observer, "__qualname__", None) or repr(observer)
++            _log.exception("turn edge observer %s failed for session=%s", name, session_id)
++
++
++__all__ = [
++    "TurnEdge",
++    "TurnEdgeObserver",
++    "notify_turn_edge",
++    "register_turn_edge_observer",
++    "reset_turn_edge_observers",
++    "unregister_turn_edge_observer",
++]
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index db44549f12c7409cd3badf3c9e61b18e30e4eeae..6b4e10575948b7ec9ba9c90e5388ae98989e4bf3 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -102,7 +102,13 @@ from omnigent.runtime import (
+ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.runtime.policies.engine import PolicyEngine
+ from omnigent.runtime.tool_output import cap_tool_output
+-from omnigent.server import ae_family_prompts, presence, session_live_state, shutdown_state
++from omnigent.server import (
++    ae_family_prompts,
++    ae_turn_edges,
++    presence,
++    session_live_state,
++    shutdown_state,
++)
+ from omnigent.server._elicitation_registry import (
+     _harness_elicitation_owners,
+     _harness_parked_elicitations,
+@@ -4919,6 +4925,7 @@ def _publish_status(
+     :param failure_context: Untrusted optional native evidence, normalized at
+         the failure-log boundary. Malformed values cannot reject the status edge.
+     """
++    ae_turn_edges.notify_turn_edge(session_id, status, response_id=response_id)
+     # ``failed`` is sticky against a trailing ``idle``. A turn error is
+     # terminal — it must not be silently downgraded to ``idle`` by a
+     # follow-on quiescence signal. This matters for claude-native: the
+@@ -5463,6 +5470,7 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
+     :param response_id: Optional response id for terminal-backed
+         interrupted turns, e.g. ``"codex_turn_abc123"``.
+     """
++    ae_turn_edges.notify_turn_edge(session_id, "interrupted", response_id=response_id)
+     event = SessionInterruptedEvent(
+         type="session.interrupted",
+         data=SessionInterruptedPayload(
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 392e17a8f314fa2e87ea71f01c90d0428770b3a1..156f080b73ba1f36f616d7e9ea47a7670a8f1e56 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -68,7 +68,7 @@ from omnigent.runtime import (
+ )
+ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.runtime.policies.approval import _ELICITATION_MODE
+-from omnigent.server import presence
++from omnigent.server import ae_turn_edges, presence
+ from omnigent.server._elicitation_registry import (
+     _harness_elicitation_owners,
+     _harness_elicitation_registry,
+@@ -1550,6 +1550,7 @@ def register_events_routes(
+         if body.type == _STOP_SESSION_TYPE:
+             # Fence the cancelled turn, same as interrupt.
+             _interrupt_fenced_sessions.add(session_id)
++            ae_turn_edges.notify_turn_edge(session_id, "interrupted")
+             # Harness-agnostic forward: the runner kills the external
+             # process for harnesses that have one (claude-native
+             # hard-kills its tmux pane) and 204s otherwise. Unlike the
+@@ -2046,6 +2047,10 @@ def register_events_routes(
+                 background_tasks=bg_tasks,
+                 blocked_on=blocked_on,
+             )
++            if status == "idle" and data.get("turn_completed") is True:
++                ae_turn_edges.notify_turn_edge(
++                    session_id, "idle", response_id=response_id, turn_completed=True
++                )
+             await note_claude_subagent_status(conv, status, conversation_store)
+             if (
+                 conv.parent_conversation_id is not None
+diff --git a/tests/server/test_ae_turn_edges.py b/tests/server/test_ae_turn_edges.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..ecfc7e043c6bbc90d9bbb29e53bb60de887c197c
+--- /dev/null
++++ b/tests/server/test_ae_turn_edges.py
+@@ -0,0 +1,134 @@
++"""The turn-edge registry and its three call sites.
++
++``omnigent.server.ae_turn_edges`` hands every session status edge, every
++interrupt, and the claude-native Stop hook's completed idle to observers. The
++contract under test: ``_publish_status`` notifies with the status it was given,
++the ``external_session_status`` route adds a ``turn_completed`` idle after the
++plain one, ``_publish_interrupted`` notifies ``interrupted``, and an observer
++that raises never breaks the publish.
++"""
++
++from __future__ import annotations
++
++import logging
++from collections.abc import Iterator
++
++import httpx
++import pytest
++
++from omnigent.server import ae_turn_edges
++from omnigent.server.ae_turn_edges import (
++    TurnEdge,
++    notify_turn_edge,
++    register_turn_edge_observer,
++    reset_turn_edge_observers,
++    unregister_turn_edge_observer,
++)
++from omnigent.server.routes._sessions.helpers import _publish_interrupted, _publish_status
++from omnigent.server.routes.sessions import routes_events
++from tests.server.helpers import create_test_agent
++
++pytestmark = pytest.mark.timeout(30)
++
++
++@pytest.fixture(autouse=True)
++def _clean_registry() -> Iterator[None]:
++    reset_turn_edge_observers()
++    yield
++    reset_turn_edge_observers()
++
++
++def test_publish_status_notifies_with_the_status_it_was_given() -> None:
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++
++    _publish_status("conv_edges_a", "running", response_id="resp_1")
++
++    assert seen == [TurnEdge("conv_edges_a", "running", "resp_1", False)]
++
++
++def test_publish_interrupted_notifies_interrupted() -> None:
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++
++    _publish_interrupted("conv_edges_b", response_id="resp_2")
++
++    assert seen == [TurnEdge("conv_edges_b", "interrupted", "resp_2", False)]
++
++
++def test_registration_is_idempotent_and_reversible() -> None:
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++    register_turn_edge_observer(seen.append)
++    notify_turn_edge("conv_edges_c", "idle", turn_completed=True)
++    assert seen == [TurnEdge("conv_edges_c", "idle", None, True)]
++
++    unregister_turn_edge_observer(seen.append)
++    unregister_turn_edge_observer(seen.append)
++    notify_turn_edge("conv_edges_c", "idle")
++    assert len(seen) == 1
++
++
++def test_a_failing_observer_never_breaks_the_publish(caplog: pytest.LogCaptureFixture) -> None:
++    def broken(edge: TurnEdge) -> None:
++        raise RuntimeError("observer exploded")
++
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(broken)
++    register_turn_edge_observer(seen.append)
++
++    with caplog.at_level(logging.ERROR, logger=ae_turn_edges.__name__):
++        _publish_status("conv_edges_d", "running")
++
++    assert [edge.status for edge in seen] == ["running"]
++    assert any("broken failed for session=conv_edges_d" in r.getMessage() for r in caplog.records)
++
++
++@pytest.fixture
++def _no_runner(monkeypatch: pytest.MonkeyPatch) -> None:
++    """The route forwards the edge to the session's runner; these sessions have none."""
++
++    async def forward(*args: object, **kwargs: object) -> dict[str, object]:
++        return {}
++
++    monkeypatch.setattr(routes_events, "_forward_session_change_to_runner", forward)
++
++
++@pytest.mark.usefixtures("_no_runner")
++async def test_a_completed_idle_arrives_after_the_plain_idle(client: httpx.AsyncClient) -> None:
++    agent = await create_test_agent(client, name="edges-route")
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert created.status_code == 201, created.text
++    session_id = created.json()["id"]
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={
++            "type": "external_session_status",
++            "data": {"status": "idle", "response_id": "resp_stop", "turn_completed": True},
++        },
++    )
++    assert resp.status_code in (200, 202, 204), resp.text
++
++    mine = [edge for edge in seen if edge.session_id == session_id]
++    assert [(e.status, e.turn_completed) for e in mine] == [("idle", False), ("idle", True)]
++    assert mine[1].response_id == "resp_stop"
++
++
++@pytest.mark.usefixtures("_no_runner")
++async def test_an_idle_without_the_flag_is_not_a_completed_turn(client: httpx.AsyncClient) -> None:
++    agent = await create_test_agent(client, name="edges-route-bare")
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    session_id = created.json()["id"]
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={"type": "external_session_status", "data": {"status": "idle"}},
++    )
++    assert resp.status_code in (200, 202, 204), resp.text
++
++    assert [edge.turn_completed for edge in seen if edge.session_id == session_id] == [False]
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index d887b4501d10b4f5e21f11d5b1cfa86974f3be1f..7b6607420ad3e68b5647567de33576eb39c771da 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -1062,8 +1062,27 @@ describe("the Compact card", () => {
+   const snoozeCalls = () =>
+     vi.mocked(authenticatedFetch).mock.calls.filter(([u]) => String(u).endsWith("/handoff/snooze"));
+ 
++  // The compact routes keep a phase the way the server does; every other call answers ok.
++  const serveCompact = () => {
++    let phase: string | null = null;
++    vi.mocked(authenticatedFetch).mockImplementation(
++      (input: URL | RequestInfo, init?: RequestInit) => {
++        if (!String(input).endsWith("/compact")) return json({ ok: true });
++        if (init?.method === "POST") {
++          phase = "queued";
++          return json({ session_id: "s1", phase }, 202);
++        }
++        if (init?.method === "DELETE") {
++          phase = null;
++          return json({ session_id: "s1", phase });
++        }
++        return json({ session_id: "s1", phase, failure: null });
++      },
++    );
++  };
++
+   beforeEach(() => {
+-    vi.mocked(authenticatedFetch).mockImplementation(() => json({ ok: true }));
++    serveCompact();
+   });
+ 
+   afterEach(() => {
+@@ -1128,11 +1147,7 @@ describe("the Compact card", () => {
+     expect(view.container.querySelector("[data-testid=ae-dock-compact]")).toBeNull();
+   });
+ 
+-  it("Compact asks twice, queues a compact for the open chat, then snoozes once it ran", async () => {
+-    let ran: (() => void) | undefined;
+-    vi.mocked(startAeCompactPlan).mockImplementationOnce((_id, done) => {
+-      ran = done;
+-    });
++  it("Compact asks twice and queues a compact with snooze for the card's chat", async () => {
+     renderDock([], [], SUGGEST);
+     const button = await screen.findByTestId("ae-dock-compact");
+     fireEvent.click(button);
+@@ -1140,12 +1155,10 @@ describe("the Compact card", () => {
+     expect(startAeCompactPlan).not.toHaveBeenCalled();
+     fireEvent.click(button);
+     expect(startAeCompactPlan).toHaveBeenCalledTimes(1);
+-    expect(vi.mocked(startAeCompactPlan).mock.calls[0]![0]).toBe("s1");
+-    // Queued is not compacted: nothing is snoozed until the compact went out.
++    expect(vi.mocked(startAeCompactPlan).mock.calls[0]).toEqual(["s1", { snooze: true }]);
++    // The server snoozes after it compacted: the page never posts a snooze for Compact.
++    await waitFor(() => expect(button.textContent).toBe("Cancel compact"));
+     expect(snoozeCalls()).toHaveLength(0);
+-    ran?.();
+-    await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
+-    expect(String(snoozeCalls()[0]![0])).toBe("/v1/ae/sessions/s1/handoff/snooze");
+   });
+ 
+   it("a queued Compact shows Cancel, and a click cancels it", async () => {
+@@ -1200,49 +1213,21 @@ describe("the Compact card", () => {
+     }
+   });
+ 
+-  it("does not toast when the snooze after Compact gets a 409", async () => {
+-    vi.mocked(authenticatedFetch).mockImplementation(() =>
+-      json({ error: { message: "this chat already handed off" } }, 409),
++  it("shows the server's refusal under the Compact button", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(
++      (input: URL | RequestInfo, init?: RequestInit) =>
++        String(input).endsWith("/compact") && init?.method === "POST"
++          ? json(
++              { error: { code: "ae_compact_unsupported", message: "Send /compact instead." } },
++              422,
++            )
++          : json({ phase: null, failure: null }),
+     );
+-    const seen: unknown[] = [];
+-    const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
+-    window.addEventListener("omnigent:toast", listen);
+-    try {
+-      vi.mocked(startAeCompactPlan).mockImplementationOnce((_id, done) => done?.());
+-      renderDock([], [], SUGGEST);
+-      const button = await screen.findByTestId("ae-dock-compact");
+-      fireEvent.click(button);
+-      fireEvent.click(button);
+-      await waitFor(() => expect(snoozeCalls()).toHaveLength(1));
+-      await act(async () => {
+-        await new Promise<void>((resolve) => {
+-          setTimeout(resolve, 20);
+-        });
+-      });
+-      expect(seen).toEqual([]);
+-    } finally {
+-      window.removeEventListener("omnigent:toast", listen);
+-    }
+-  });
+-
+-  it("toasts when the snooze after Compact fails some other way", async () => {
+-    vi.mocked(authenticatedFetch).mockImplementation(() =>
+-      json({ error: { message: "only the owner" } }, 403),
+-    );
+-    const seen: unknown[] = [];
+-    const listen = (event: Event) => seen.push((event as CustomEvent).detail.content);
+-    window.addEventListener("omnigent:toast", listen);
+-    try {
+-      vi.mocked(startAeCompactPlan).mockImplementationOnce((_id, done) => done?.());
+-      renderDock([], [], SUGGEST);
+-      const button = await screen.findByTestId("ae-dock-compact");
+-      fireEvent.click(button);
+-      fireEvent.click(button);
+-      await waitFor(() => expect(seen).toHaveLength(1));
+-      expect(String(seen[0])).toContain("could not be snoozed");
+-    } finally {
+-      window.removeEventListener("omnigent:toast", listen);
+-    }
++    renderDock([], [], SUGGEST);
++    const button = await screen.findByTestId("ae-dock-compact");
++    fireEvent.click(button);
++    fireEvent.click(button);
++    expect((await screen.findByRole("alert")).textContent).toBe("Send /compact instead.");
+   });
+ 
+   it("tells the viewer when Not now is refused", async () => {
+diff --git a/web/src/components/aeRail/AeCompactButton.tsx b/web/src/components/aeRail/AeCompactButton.tsx
+index 251ba891ef25ce87a327b828eaee9d63938c36f8..6c2be6b3b86223f82ceb784d9bd4b10e30d88498 100644
+--- a/web/src/components/aeRail/AeCompactButton.tsx
++++ b/web/src/components/aeRail/AeCompactButton.tsx
+@@ -4,16 +4,16 @@
+ 
+ import { useEffect, useState } from "react";
+ import { Button } from "@/components/ui/button";
+-import { showToast } from "@/components/ui/toast";
+-import { aeSnoozeFailureIsQuiet, postAeHandoffSnooze } from "@/lib/aeCompactSuggestion";
+ import { cancelAeCompactPlan, startAeCompactPlan, useAeCompactPlan } from "@/lib/aeCompactPlan";
+ import { useChatStore } from "@/store/chatStore";
+ 
++const reason = (e: unknown) => (e instanceof Error ? e.message : String(e));
++
+ /**
+- * Two clicks within three seconds queue a compact. It never runs on the spot: at a safe
+- * point the chat first saves what is worth keeping, then compacts (see aeCompactPlan.ts).
+- * A queued compact shows Cancel. With `sessionId` (the dock card) it first checks the chat
+- * open in the store is that session, and snoozes the suggestion once the compact went out.
++ * Two clicks within three seconds queue a compact. It never runs on the spot: the server
++ * waits for the end of a real turn, has the chat save what is worth keeping, then compacts
++ * (see aeCompactPlan.ts), whether or not this chat stays open. A queued compact shows Cancel.
++ * With `sessionId` (the dock card) the server also snoozes the suggestion once it compacted.
+  */
+ export function AeCompactButton({
+   sessionId,
+@@ -35,7 +35,7 @@ export function AeCompactButton({
+   }, [confirming]);
+   const onClick = () => {
+     if (plan === "queued" || plan === "preparing") {
+-      if (targetId) cancelAeCompactPlan(targetId);
++      if (targetId) cancelAeCompactPlan(targetId).catch((e: unknown) => setError(reason(e)));
+       return;
+     }
+     if (plan === "compacting") return;
+@@ -45,24 +45,9 @@ export function AeCompactButton({
+       return;
+     }
+     setConfirming(false);
+-    if (!openId || (sessionId && openId !== sessionId)) {
+-      setError("This chat is not open here. Open it, then compact.");
+-      return;
+-    }
+-    startAeCompactPlan(
+-      openId,
+-      sessionId
+-        ? () => {
+-            postAeHandoffSnooze(sessionId).catch((reason: unknown) => {
+-              if (aeSnoozeFailureIsQuiet(reason)) return;
+-              showToast(
+-                `Compacting started, but the card could not be snoozed (${
+-                  reason instanceof Error ? reason.message : String(reason)
+-                }).`,
+-              );
+-            });
+-          }
+-        : undefined,
++    if (!targetId) return;
++    startAeCompactPlan(targetId, { snooze: Boolean(sessionId) }).catch((e: unknown) =>
++      setError(reason(e)),
+     );
+   };
+   const label =
+diff --git a/web/src/components/aeRail/AeRailContext.test.tsx b/web/src/components/aeRail/AeRailContext.test.tsx
+index a725874714646f943eef0d73354ba54b85b42298..12b4daad5d230b2853b98092a145c842d04a088c 100644
+--- a/web/src/components/aeRail/AeRailContext.test.tsx
++++ b/web/src/components/aeRail/AeRailContext.test.tsx
+@@ -259,6 +259,15 @@ describe("Compact session", () => {
+ 
+   it("asks once, then queues the compact on the second click, and a third cancels it", async () => {
+     const compact = vi.fn(() => Promise.resolve());
++    let phase: string | null = null;
++    vi.mocked(authenticatedFetch).mockImplementation(
++      (input: URL | RequestInfo, init?: RequestInit) => {
++        if (!String(input).endsWith("/compact")) return json(snapshotNow());
++        if (init?.method === "POST") phase = "queued";
++        if (init?.method === "DELETE") phase = null;
++        return json({ phase, failure: null }, init?.method === "POST" ? 202 : 200);
++      },
++    );
+     setSession("claude-native", { compact });
+     render(<AeRailContext sessionId={sessionId} />);
+     const button = await screen.findByTestId("ae-rail-compact");
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+index d41834f749af32088acfd03df66c031a420f78d7..33a442c0a3e6a9ade9d0c342d5ff639d3c434182 100644
+--- a/web/src/lib/aeCompactPlan.test.ts
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -1,543 +1,168 @@
++import { act, renderHook } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { handleSessionEvent, useChatStore } from "@/store/chatStore";
++
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
++
++import { showToast } from "@/components/ui/toast";
++import { authenticatedFetch } from "@/lib/identity";
+ import {
+-  AE_COMPACT_PREP_TEXT,
+-  AE_COMPACT_PREP_LIMIT_MS,
+-  AE_COMPACT_START_LIMIT_MS,
++  AE_COMPACT_POLL_MS,
+   cancelAeCompactPlan,
+   resetAeCompactPlans,
+   startAeCompactPlan,
++  useAeCompactPlan,
+ } from "./aeCompactPlan";
+ 
+-const ID = "conv_plan";
+-
+-/** Resets the chat to idle; the transcript is kept unless `blocks` is given. */
+-function setChat(patch: Record<string, unknown> = {}) {
+-  useChatStore.setState({
+-    conversationId: ID,
+-    boundAgentId: "agent_1",
+-    status: "idle",
+-    sessionStatus: "idle",
+-    backgroundTasks: [],
+-    backgroundTaskCount: 0,
+-    blocks: useChatStore.getState().blocks,
+-    queuedMessages: [],
+-    ...patch,
+-  } as never);
+-}
+-
+-/** The prepare message as the transcript shows it once the runner consumed it. */
+-function prepBlock(itemId: string | null = "item_prep", responseId = "") {
+-  return {
+-    type: "user_message",
+-    content: [{ type: "input_text", text: AE_COMPACT_PREP_TEXT }],
+-    ctx: { responseId, itemId },
+-  };
+-}
+-
+-const blocksNow = () => useChatStore.getState().blocks as unknown[];
+-
+-/** Claude-native status edges, through the real store reducer. */
+-const status = (value: string, extra: Record<string, unknown> = {}) =>
+-  handleSessionEvent({
+-    type: "session_status",
+-    conversationId: ID,
+-    status: value,
+-    ...extra,
+-  } as never);
+-
+-/** The runner consumed the prepare message: its committed block lands in the transcript. */
+-const consumePrep = (itemId = "item_prep") =>
+-  handleSessionEvent({
+-    type: "session_input_consumed",
+-    itemId,
+-    itemType: "message",
+-    data: {
+-      role: "user",
+-      user_authored: true,
+-      content: [{ type: "input_text", text: AE_COMPACT_PREP_TEXT }],
+-    },
+-  } as never);
+-
+-const toasts: string[] = [];
+-const listen = (event: Event) => toasts.push(String((event as CustomEvent).detail.content));
++const ID = "conv_1";
++const PATH = `/v1/ae/sessions/${ID}/compact`;
++
++const json = (body: unknown, status = 200) =>
++  Promise.resolve(
++    new Response(JSON.stringify(body), {
++      status,
++      headers: { "Content-Type": "application/json" },
++    }),
++  );
++
++const calls = (method: string, tail = "") =>
++  vi
++    .mocked(authenticatedFetch)
++    .mock.calls.filter(
++      ([u, init]) => String(u) === PATH + tail && (init?.method ?? "GET") === method,
++    );
+ 
+-let send: ReturnType<typeof vi.fn>;
+-let compact: ReturnType<typeof vi.fn>;
++/** What the next GET answers; the test moves it like the server would. */
++const server = { phase: null as string | null, failure: null as unknown };
+ 
+-async function tick(ms: number) {
+-  await vi.advanceTimersByTimeAsync(ms);
++async function tick(ms = 0) {
++  await act(async () => {
++    await vi.advanceTimersByTimeAsync(ms);
++  });
+ }
+ 
+ beforeEach(() => {
+-  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+-  toasts.length = 0;
+-  window.addEventListener("omnigent:toast", listen);
+-  // A real turn: the runner consumes the message and the session runs.
+-  send = vi.fn(() => {
+-    setChat({ sessionStatus: "running", blocks: [...blocksNow(), prepBlock()] });
+-    return Promise.resolve();
++  vi.useFakeTimers();
++  server.phase = null;
++  server.failure = null;
++  vi.mocked(authenticatedFetch).mockReset();
++  vi.mocked(showToast).mockReset();
++  vi.mocked(authenticatedFetch).mockImplementation((_input, init) => {
++    if (init?.method === "POST" && String(_input).endsWith("/seen")) return json({ ok: true });
++    if (init?.method === "POST") return json({ session_id: ID, phase: "queued" }, 202);
++    if (init?.method === "DELETE") return json({ session_id: ID, phase: null });
++    return json({ session_id: ID, phase: server.phase, failure: server.failure });
+   });
+-  compact = vi.fn(() => Promise.resolve());
+-  useChatStore.setState({ send, compact, activeResponse: null } as never);
+-  setChat({ blocks: [] });
+ });
+ 
+ afterEach(() => {
+   resetAeCompactPlans();
+-  window.removeEventListener("omnigent:toast", listen);
+   vi.useRealTimers();
+ });
+ 
+-describe("queued compact", () => {
+-  it("asks the chat to save its notes at a safe point, then compacts when that turn ends", async () => {
+-    const done = vi.fn();
+-    startAeCompactPlan(ID, done);
+-    expect(send).not.toHaveBeenCalled();
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    expect(send.mock.calls[0]![0]).toBe(AE_COMPACT_PREP_TEXT);
+-    expect(send.mock.calls[0]![1]).toBe("agent_1");
+-    expect(compact).not.toHaveBeenCalled();
+-    // The prepare turn ends.
+-    setChat({ sessionStatus: "idle" });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-    expect(done).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("waits out a running turn and only counts quiet time from its end", async () => {
+-    setChat({ status: "streaming", sessionStatus: "running" });
+-    startAeCompactPlan(ID);
+-    await tick(10_000);
+-    expect(send).not.toHaveBeenCalled();
+-    setChat();
+-    await tick(1500);
+-    // Busy again before the quiet period ran out: the clock restarts.
+-    setChat({ sessionStatus: "running" });
+-    setChat();
+-    await tick(1500);
+-    expect(send).not.toHaveBeenCalled();
+-    await tick(500);
+-    expect(send).toHaveBeenCalledTimes(1);
+-  });
+-
+-  // Background shells outlive turns and survive /compact, and `waiting` is the turn end a
+-  // claude-native chat publishes while one still runs: none of them holds a compact back.
+-  it.each([
+-    ["a background shell is running", { backgroundTasks: [{ status: "running" }] }],
+-    ["an older runner reports only a shell count", { backgroundTaskCount: 1 }],
+-    ["the turn ended with a shell still running", { sessionStatus: "waiting" }],
+-  ])("is a safe point while %s", async (_name, patch) => {
+-    setChat(patch);
+-    startAeCompactPlan(ID);
+-    await tick(1999);
+-    expect(send).not.toHaveBeenCalled();
+-    await tick(1);
+-    expect(send).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it.each([
+-    [
+-      "a message is queued ahead",
+-      { queuedMessages: [{ queueId: "q1", text: "next", conversationId: ID }] },
+-    ],
+-    ["the session is launching", { sessionStatus: "launching" }],
+-  ])("is not a safe point while %s", async (_name, patch) => {
+-    setChat(patch);
+-    startAeCompactPlan(ID);
+-    await tick(10_000);
+-    expect(send).not.toHaveBeenCalled();
+-    setChat();
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("queues one compact per chat", async () => {
+-    startAeCompactPlan(ID);
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("cancels cleanly before the safe point", async () => {
+-    startAeCompactPlan(ID);
+-    cancelAeCompactPlan(ID);
+-    await tick(10_000);
+-    expect(send).not.toHaveBeenCalled();
+-    expect(compact).not.toHaveBeenCalled();
+-  });
+-
+-  it("cancels while the chat is saving its notes, and never compacts", async () => {
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    cancelAeCompactPlan(ID);
+-    setChat({ sessionStatus: "idle" });
+-    await tick(10_000);
+-    expect(compact).not.toHaveBeenCalled();
+-  });
+-
+-  it("drops the plan, with a toast, when the user leaves the chat", async () => {
+-    startAeCompactPlan(ID);
+-    setChat({ conversationId: "conv_other" });
+-    await tick(10_000);
+-    expect(send).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("you left the chat");
+-  });
+-
+-  it("compacts nothing when the prepare turn never starts", async () => {
+-    send.mockImplementation(() => Promise.resolve());
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    await tick(AE_COMPACT_START_LIMIT_MS + 4000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("never started saving its notes");
+-  });
+-
+-  it("compacts nothing when the prepare message cannot be sent", async () => {
+-    send.mockImplementation(() => Promise.reject(new Error("503 Unavailable")));
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("503 Unavailable");
+-  });
+-
+-  it("compacts nothing when the chat has no agent to ask", async () => {
+-    setChat({ boundAgentId: null });
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(send).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("no agent");
+-  });
+-
+-  it("says what failed when the compact is refused, and does not call the after hook", async () => {
+-    compact.mockImplementation(() => Promise.reject(new Error("409 Conflict")));
+-    const done = vi.fn();
+-    startAeCompactPlan(ID, done);
+-    await tick(2000);
+-    setChat({ sessionStatus: "idle" });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-    expect(done).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("Could not compact the session (409 Conflict)");
+-  });
+-  it("does not count a send-latch blip or a background shell as the prepare turn", async () => {
+-    // Busy states other than the server reporting the session running prove nothing.
+-    send.mockImplementation(() => {
+-      setChat({ status: "streaming" });
+-      setChat({ status: "idle", backgroundTasks: [{ status: "running" }] });
+-      setChat();
+-      return Promise.resolve();
+-    });
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    await tick(AE_COMPACT_START_LIMIT_MS + 4000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("never started saving its notes");
+-  });
+-
+-  it("gives up when the prepare turn runs past the limit", async () => {
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    // Running, and it never ends.
+-    await tick(AE_COMPACT_PREP_LIMIT_MS + 1000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("took too long");
+-  });
+-
+-  it("waits for a message the user sends during the prepare turn", async () => {
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    setChat({
+-      sessionStatus: "idle",
+-      queuedMessages: [{ queueId: "q1", text: "also this", conversationId: ID }],
++describe("aeCompactPlan (thin client)", () => {
++  it("POSTs the snooze flag and the hook reads queued", async () => {
++    const { result } = renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    expect(result.current).toBeNull();
++    await act(async () => {
++      await startAeCompactPlan(ID, { snooze: true });
+     });
+-    await tick(5000);
+-    expect(compact).not.toHaveBeenCalled();
+-    setChat({ sessionStatus: "running", queuedMessages: [] });
+-    setChat({ sessionStatus: "idle" });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
++    expect(result.current).toBe("queued");
++    const post = calls("POST")[0]!;
++    expect(JSON.parse(String(post[1]?.body))).toEqual({ snooze: true });
+   });
+ 
+-  it("cannot be cancelled once the compact event is going out", async () => {
+-    let finishCompact: () => void = () => {};
+-    compact.mockImplementation(
+-      () =>
+-        new Promise<void>((resolve) => {
+-          finishCompact = resolve;
+-        }),
++  it("adopts the phase a 409 names", async () => {
++    const { result } = renderHook(() => useAeCompactPlan(ID));
++    vi.mocked(authenticatedFetch).mockImplementationOnce(() =>
++      json({ error: { code: "ae_compact_queued", message: "queued", phase: "preparing" } }, 409),
+     );
+-    const done = vi.fn();
+-    startAeCompactPlan(ID, done);
+-    await tick(2000);
+-    setChat({ sessionStatus: "idle" });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-    cancelAeCompactPlan(ID);
+-    finishCompact();
+-    await tick(0);
+-    expect(done).toHaveBeenCalledTimes(1);
+-  });
+-  it.each([
+-    [
+-      "the turn ended failed",
+-      [{ type: "response_end", status: "failed", ctx: { responseId: "r2" } }],
+-    ],
+-    [
+-      "the turn was cancelled",
+-      [{ type: "response_end", status: "cancelled", ctx: { responseId: "r2" } }],
+-    ],
+-    [
+-      "the turn raised an error",
+-      [{ type: "error", level: "error", message: "boom", ctx: { responseId: "" } }],
+-    ],
+-  ])("compacts nothing when %s", async (_name, blocks) => {
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    setChat({ sessionStatus: "idle", blocks: [...blocksNow(), ...blocks] });
+-    await tick(2000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("did not finish saving its notes cleanly");
+-  });
+-
+-  it("still compacts after a clean finish, and ignores history that was there before the send", async () => {
+-    const old = { type: "response_end", status: "failed", ctx: { responseId: "r1" } };
+-    setChat({ blocks: [old] });
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    setChat({
+-      sessionStatus: "idle",
+-      blocks: [
+-        // Rehydrated copy of the old block: a new object, the same response.
+-        { ...old },
+-        prepBlock(),
+-        { type: "response_end", status: "completed", ctx: { responseId: "r2" } },
+-        { type: "error", level: "info", message: "note", ctx: { responseId: "r2" } },
+-      ],
+-    });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("still sees a failure when the transcript is replaced by a shorter one mid-turn", async () => {
+-    setChat({
+-      blocks: [
+-        { type: "user_message", content: [], ctx: { responseId: "r0" } },
+-        { type: "user_message", content: [], ctx: { responseId: "r0" } },
+-        { type: "user_message", content: [], ctx: { responseId: "r1" } },
+-      ],
+-    });
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    setChat({
+-      sessionStatus: "idle",
+-      blocks: [prepBlock(), { type: "response_end", status: "failed", ctx: { responseId: "r2" } }],
++    await act(async () => {
++      await startAeCompactPlan(ID);
+     });
+-    await tick(2000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("did not finish saving its notes cleanly");
+-  });
+-
+-  it("treats a user message without content as no prepare message", async () => {
+-    setChat({ blocks: [{ type: "user_message", ctx: { responseId: "r0", itemId: null } }] });
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    setChat({ sessionStatus: "idle" });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
++    expect(result.current).toBe("preparing");
+   });
+ 
+-  it("judges only what follows the prepare message when it is in the transcript", async () => {
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    const prep = {
+-      type: "user_message",
+-      content: [{ type: "input_text", text: AE_COMPACT_PREP_TEXT }],
+-      ctx: { responseId: "" },
+-    };
+-    // An old non-info error with an empty id, rehydrated as a new object, is history, not this turn.
+-    setChat({
+-      sessionStatus: "idle",
+-      blocks: [{ type: "error", level: "error", message: "old", ctx: { responseId: "" } }, prep],
+-    });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("catches a failure that carries a reused response id once it follows the prepare message", async () => {
+-    setChat({ blocks: [{ type: "user_message", content: [], ctx: { responseId: "r1" } }] });
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    const prep = {
+-      type: "user_message",
+-      content: [{ type: "input_text", text: AE_COMPACT_PREP_TEXT }],
+-      ctx: { responseId: "r1" },
+-    };
+-    setChat({
+-      sessionStatus: "idle",
+-      blocks: [prep, { type: "response_end", status: "failed", ctx: { responseId: "r1" } }],
++  it("rejects with the server's message on a 422", async () => {
++    vi.mocked(authenticatedFetch).mockImplementationOnce(() =>
++      json({ error: { code: "ae_compact_unsupported", message: "Send /compact instead." } }, 422),
++    );
++    await expect(startAeCompactPlan(ID)).rejects.toThrow("Send /compact instead.");
++  });
++
++  it("polls every 1.5 s through the phases to null, then stops", async () => {
++    server.phase = "queued";
++    const { result } = renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    expect(result.current).toBe("queued");
++    server.phase = "preparing";
++    await tick(AE_COMPACT_POLL_MS);
++    expect(result.current).toBe("preparing");
++    server.phase = "compacting";
++    await tick(AE_COMPACT_POLL_MS);
++    expect(result.current).toBe("compacting");
++    server.phase = null;
++    await tick(AE_COMPACT_POLL_MS);
++    expect(result.current).toBeNull();
++    const seen = calls("GET").length;
++    await tick(AE_COMPACT_POLL_MS * 4);
++    expect(calls("GET")).toHaveLength(seen);
++  });
++
++  it("toasts a stored failure once and acknowledges it once, over two polls", async () => {
++    server.phase = "queued";
++    renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    server.failure = { id: "f1", message: "Compact cancelled: nope.", at: 1 };
++    await tick(AE_COMPACT_POLL_MS);
++    await tick(AE_COMPACT_POLL_MS);
++    expect(showToast).toHaveBeenCalledTimes(1);
++    expect(showToast).toHaveBeenCalledWith("Compact cancelled: nope.");
++    expect(calls("POST", "/seen")).toHaveLength(1);
++    expect(JSON.parse(String(calls("POST", "/seen")[0]![1]?.body))).toEqual({ failure_id: "f1" });
++  });
++
++  it("cancel DELETEs and the phase becomes null; a 409 keeps compacting", async () => {
++    server.phase = "queued";
++    const { result } = renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    await act(async () => {
++      await cancelAeCompactPlan(ID);
+     });
+-    await tick(2000);
+-    expect(compact).not.toHaveBeenCalled();
+-  });
+-
+-  // Driven through the real store reducer with the event shapes a claude-native chat gets. The
+-  // server reports a Stop with a shell still running as `idle` with a shell count (a non-codex
+-  // `waiting` is rewritten), then the PTY's bare `idle` edge leaves the count sticky.
+-  it("runs after a claude-native turn ends with a background shell still running", async () => {
+-    send.mockImplementation(() => Promise.resolve());
+-    status("running", { responseId: "r1" });
+-    startAeCompactPlan(ID);
+-    await tick(10_000);
+-    expect(send).not.toHaveBeenCalled();
+-    status("idle", { responseId: "r1", backgroundTaskCount: 1 });
+-    status("idle");
+-    expect(useChatStore.getState().backgroundTaskCount).toBe(1);
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    expect(send.mock.calls[0]![0]).toBe(AE_COMPACT_PREP_TEXT);
+-    // The prepare message lands, its turn runs and ends with the shell still running.
+-    consumePrep();
+-    status("running", { responseId: "r2" });
+-    await tick(5000);
+-    expect(compact).not.toHaveBeenCalled();
+-    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
+-    status("idle");
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  // Compatibility: `waiting` still reaches the page from SDK orchestrators parked on sub-agents
+-  // and from codex-native children.
+-  it("treats a waiting turn end like idle", async () => {
+-    send.mockImplementation(() => Promise.resolve());
+-    status("running", { responseId: "r1" });
+-    startAeCompactPlan(ID);
+-    status("waiting", { responseId: "r1", backgroundTaskCount: 1 });
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    consumePrep();
+-    status("running", { responseId: "r2" });
+-    status("waiting", { responseId: "r2", backgroundTaskCount: 1 });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("does not take a turn that ran before the prepare message landed for the prepare turn", async () => {
+-    // The send stays in flight: the runner has not consumed the prepare message yet.
+-    send.mockImplementation(() => new Promise<void>(() => {}));
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    expect(send).toHaveBeenCalledTimes(1);
+-    // A shell's task notification wakes the chat for a turn of its own.
+-    status("running", { responseId: "r_note" });
+-    await tick(3000);
+-    status("idle", { responseId: "r_note", backgroundTaskCount: 1 });
+-    status("idle");
+-    await tick(10_000);
+-    expect(compact).not.toHaveBeenCalled();
+-    // Past the start limit the plan is still alive: a turn did start.
+-    await tick(30_000);
+-    expect(toasts).toEqual([]);
+-    consumePrep();
+-    status("running", { responseId: "r2" });
+-    await tick(5000);
+-    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
+-    status("idle");
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("ignores a prepare message an earlier compact left in the transcript", async () => {
+-    const old = prepBlock("item_old");
+-    setChat({ blocks: [old] });
+-    send.mockImplementation(() => Promise.resolve());
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    // History reloads (a new object, the same item) and another turn runs and ends.
+-    setChat({ sessionStatus: "running", blocks: [{ ...old }] });
+-    setChat({ sessionStatus: "idle" });
+-    await tick(10_000);
+-    expect(compact).not.toHaveBeenCalled();
+-    setChat({ sessionStatus: "running", blocks: [...blocksNow(), prepBlock("item_new")] });
+-    setChat({ sessionStatus: "idle" });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("compacts nothing when the prepare message never lands", async () => {
+-    send.mockImplementation(() => Promise.resolve());
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    setChat({ sessionStatus: "running" });
+-    setChat({ sessionStatus: "idle" });
+-    await tick(AE_COMPACT_PREP_LIMIT_MS + 1000);
+-    expect(compact).not.toHaveBeenCalled();
+-    expect(toasts.join("\n")).toContain("took too long");
+-  });
+-
+-  it("ignores an older prepare message loaded by scrolling back after the send", async () => {
+-    const last = {
+-      type: "response_end",
+-      status: "completed",
+-      ctx: { responseId: "r1", itemId: "item_r1" },
+-    };
+-    setChat({ blocks: [last] });
+-    send.mockImplementation(() => new Promise<void>(() => {}));
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    // History loads older items in front: an earlier compact's prepare message among them.
+-    setChat({ blocks: [prepBlock("item_older"), { ...last }] });
+-    status("running", { responseId: "r_note" });
+-    await tick(3000);
+-    status("idle", { responseId: "r_note", backgroundTaskCount: 1 });
+-    status("idle");
+-    await tick(10_000);
+-    expect(compact).not.toHaveBeenCalled();
+-    consumePrep();
+-    status("running", { responseId: "r2" });
+-    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("counts a prepare message that lands only after its own turn went idle", async () => {
+-    send.mockImplementation(() => Promise.resolve());
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    status("running", { responseId: "r2" });
+-    await tick(4000);
+-    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
+-    await tick(3000);
+-    expect(compact).not.toHaveBeenCalled();
+-    // A snapshot merge brings the message and its finished reply at once.
+-    setChat({
+-      sessionStatus: "idle",
+-      blocks: [
+-        ...blocksNow(),
+-        prepBlock(),
+-        { type: "response_end", status: "completed", ctx: { responseId: "r2" } },
+-      ],
++    expect(calls("DELETE")).toHaveLength(1);
++    expect(result.current).toBeNull();
++
++    vi.mocked(authenticatedFetch).mockImplementationOnce(() =>
++      json(
++        { error: { code: "ae_compact_sending", message: "going out", phase: "compacting" } },
++        409,
++      ),
++    );
++    await act(async () => {
++      await cancelAeCompactPlan(ID);
+     });
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
+-  });
+-
+-  it("counts a prepare message that lands while its turn is already running", async () => {
+-    send.mockImplementation(() => Promise.resolve());
+-    startAeCompactPlan(ID);
+-    await tick(2000);
+-    status("running", { responseId: "r2" });
+-    await tick(1000);
+-    consumePrep();
+-    await tick(4000);
+-    status("idle", { responseId: "r2", backgroundTaskCount: 1 });
+-    status("idle");
+-    await tick(2000);
+-    expect(compact).toHaveBeenCalledTimes(1);
++    expect(result.current).toBe("compacting");
++  });
++
++  it("two hooks on one id share one poller", async () => {
++    server.phase = "queued";
++    renderHook(() => useAeCompactPlan(ID));
++    renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    const first = calls("GET").length;
++    expect(first).toBe(1);
++    await tick(AE_COMPACT_POLL_MS);
++    expect(calls("GET")).toHaveLength(first + 1);
++  });
++
++  it("resetAeCompactPlans stops the timers", async () => {
++    server.phase = "queued";
++    renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    resetAeCompactPlans();
++    const seen = calls("GET").length;
++    await tick(AE_COMPACT_POLL_MS * 3);
++    expect(calls("GET")).toHaveLength(seen);
+   });
+ });
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+index 7a08892d7f2fe7f3d5e8fde53bcd3dde2d454fc3..73f27c74c7b1cb887c0600a00af4e6c6547be27c 100644
+--- a/web/src/lib/aeCompactPlan.ts
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -1,350 +1,177 @@
+-// Queued compact (omnigent-ae). Clicking Compact never compacts on the spot: it queues a
+-// plan for the open chat. At a safe point (no turn running and nothing queued) the chat
+-// gets one normal turn that asks it to save what is worth keeping, and only when that turn
+-// ends does the compact event go out. The plan lives in the page: a reload forgets it, and
+-// nothing compacts by accident.
+-//
+-// Background shells do not hold a plan back (2026-11-01). A shell outlives the turn that
+-// started it and survives /compact, and the server reports a turn that ends with a shell still
+-// running as `idle` with a shell count that stays sticky until the next turn ends, so a lead chat
+-// with a CI wait running kept its Compact queued forever.
+-//
+-// The prepare turn is the one that carries the prepare message. Another turn (a shell's task
+-// notification, a scheduled prompt, a sub-agent hand-back) can run while that message is still in
+-// flight or buffered by the runner, so nothing counts until the prepare message itself is in the
+-// transcript (2026-11-01).
+-//
+-// The driver is module level, not a component effect, so folding the rail or losing the
+-// dock card never drops a queued compact.
++// Queued compact (omnigent-ae), the page's side. The plan lives on the server, which saves the
++// chat's notes at the end of a real turn and then compacts, so it survives leaving the chat, a
++// reload, closing the tab and a deploy. This file only asks the server to queue or cancel, and
++// polls the plan's phase while one exists. The driver is
++// packages/ae_omni_policies/src/ae_omni_policies/compact_queue.py.
+ 
+-import { useSyncExternalStore } from "react";
++import { useCallback, useSyncExternalStore } from "react";
+ import { showToast } from "@/components/ui/toast";
+-import { useChatStore } from "@/store/chatStore";
++import { authenticatedFetch } from "@/lib/identity";
++import { apiErrorFromResponse } from "@/lib/sessionsApi";
+ 
+ export type AeCompactPhase = "queued" | "preparing" | "compacting";
+ 
+-/** The text the chat gets at the safe point. */
+-export const AE_COMPACT_PREP_TEXT =
+-  "Compaction runs right after this turn. Save anything worth keeping to memory or a handoff note now: " +
+-  "decisions and why, open work, file paths, what to do next. Start no new work and do not compact yourself. " +
+-  "Reply with one line, 'ready', when you are done.";
++/** How often the page asks the server for the phase while a plan exists. */
++export const AE_COMPACT_POLL_MS = 1500;
+ 
+-/** The chat must stay idle this long before a step goes ahead (turns hand off to queued work). */
+-export const AE_COMPACT_STABLE_MS = 2000;
+-/** The prepare turn never started within this long: give up, compact nothing. */
+-export const AE_COMPACT_START_LIMIT_MS = 30_000;
+-/** The prepare turn never finished within this long: give up, compact nothing. */
+-export const AE_COMPACT_PREP_LIMIT_MS = 15 * 60_000;
+-
+-interface Plan {
+-  phase: AeCompactPhase;
+-  /** Any turn ran after the prepare message went out: only the 30 s start timer reads it. */
+-  sawRunning: boolean;
+-  /** The session ran while the prepare message was in the transcript: the prepare turn. */
+-  sawTurn: boolean;
+-  /**
+-   * The prepare messages the transcript already held at send time (an earlier compact's), by
+-   * object and by server item id: neither is this plan's anchor.
+-   */
+-  seenBlocks: WeakSet<object>;
+-  seenItems: Set<string>;
+-  /**
+-   * The newest block at send time, and the newest server item id: the anchor must follow them,
+-   * so an older prepare message loaded by scrolling back is never taken for this plan's.
+-   */
+-  sendTail: object | null;
+-  sendTailItem: string | null;
+-  stableTimer: ReturnType<typeof setTimeout> | null;
+-  limitTimer: ReturnType<typeof setTimeout> | null;
+-  startTimer: ReturnType<typeof setTimeout> | null;
+-  onCompacted?: () => void;
++interface Entry {
++  phase: AeCompactPhase | null;
++  refs: number;
++  timer: ReturnType<typeof setInterval> | null;
++  toasted: Set<string>;
++  /** Bumped by the page's own POST and DELETE, so a GET started before them cannot undo them. */
++  rev: number;
++  listeners: Set<() => void>;
+ }
+ 
+-const plans = new Map<string, Plan>();
+-const listeners = new Set<() => void>();
+-let unsubscribe: (() => void) | null = null;
+-
+-function emit() {
+-  for (const listener of listeners) listener();
+-}
+-
+-type StoreState = ReturnType<typeof useChatStore.getState>;
+-
+-/**
+- * A turn end: no turn streaming or running, nothing queued for this chat. Background shells are
+- * not looked at: they outlive turns, survive /compact, and their count on an `idle` status stays
+- * sticky until the next turn ends. `waiting` counts as idle for parity with the store's message
+- * queue (`maybeFlushQueuedHead`), which treats it as free to take a turn.
+- */
+-function safeNow(s: StoreState, conversationId: string): boolean {
+-  if (s.status === "streaming") return false;
+-  if (s.sessionStatus !== "idle" && s.sessionStatus !== "waiting") return false;
+-  return !s.queuedMessages.some((m) => m.conversationId === conversationId);
++interface Failure {
++  id: string;
++  message: string;
+ }
+ 
+-/** A block with no content is not a prepare message. */
+-function isPrepareMessage(b: StoreState["blocks"][number]): boolean {
+-  return (
+-    b.type === "user_message" &&
+-    JSON.stringify(b.content ?? null).includes(AE_COMPACT_PREP_TEXT.slice(0, 40))
+-  );
+-}
++const entries = new Map<string, Entry>();
+ 
+-/**
+- * Where the transcript stood at send time: the index of the send-time tail, found by object or
+- * by server item id so a rehydrate keeps it, or -1 when neither is there (an empty or replaced
+- * transcript, where only the send-time exclusions apply).
+- */
+-function sendBoundary(blocks: StoreState["blocks"], plan: Plan): number {
+-  if (!plan.sendTail && !plan.sendTailItem) return -1;
+-  for (let index = blocks.length - 1; index >= 0; index--) {
+-    const b = blocks[index]!;
+-    if (b === plan.sendTail) return index;
+-    if (plan.sendTailItem && b.ctx.itemId === plan.sendTailItem) return index;
+-  }
+-  return -1;
+-}
++const url = (id: string, tail = "") => `/v1/ae/sessions/${encodeURIComponent(id)}/compact${tail}`;
+ 
+-/**
+- * Where this plan's prepare message sits in the transcript, or -1 while it is not there yet. It
+- * lands only once the runner consumed it (`session_input_consumed`), and keeps its server item id
+- * however history loads or shrinks; a prepare message that was there at send time is not it.
+- */
+-function prepareAnchor(blocks: StoreState["blocks"], plan: Plan): number {
+-  const boundary = sendBoundary(blocks, plan);
+-  for (let index = blocks.length - 1; index > boundary; index--) {
+-    const b = blocks[index]!;
+-    if (!isPrepareMessage(b) || plan.seenBlocks.has(b)) continue;
+-    if (b.ctx.itemId && plan.seenItems.has(b.ctx.itemId)) continue;
+-    return index;
++function entryFor(id: string): Entry {
++  let entry = entries.get(id);
++  if (!entry) {
++    entry = { phase: null, refs: 0, timer: null, toasted: new Set(), rev: 0, listeners: new Set() };
++    entries.set(id, entry);
+   }
+-  return -1;
++  return entry;
+ }
+ 
+-function clearTimers(plan: Plan) {
+-  if (plan.stableTimer) clearTimeout(plan.stableTimer);
+-  if (plan.limitTimer) clearTimeout(plan.limitTimer);
+-  if (plan.startTimer) clearTimeout(plan.startTimer);
+-  plan.stableTimer = null;
+-  plan.limitTimer = null;
+-  plan.startTimer = null;
++function setPhase(id: string, phase: AeCompactPhase | null): void {
++  const entry = entryFor(id);
++  if (entry.phase === phase) return;
++  entry.phase = phase;
++  for (const listener of entry.listeners) listener();
++  syncTimer(id);
+ }
+ 
+-function finish(conversationId: string) {
+-  const plan = plans.get(conversationId);
+-  if (!plan) return;
+-  clearTimers(plan);
+-  plans.delete(conversationId);
+-  if (plans.size === 0 && unsubscribe) {
+-    unsubscribe();
+-    unsubscribe = null;
++function syncTimer(id: string): void {
++  const entry = entryFor(id);
++  const wanted = entry.phase !== null && entry.refs > 0;
++  if (wanted && entry.timer === null) {
++    entry.timer = setInterval(() => void refresh(id), AE_COMPACT_POLL_MS);
++  } else if (!wanted && entry.timer !== null) {
++    clearInterval(entry.timer);
++    entry.timer = null;
+   }
+-  emit();
+-}
+-
+-function fail(conversationId: string, message: string) {
+-  finish(conversationId);
+-  showToast(message);
+-}
+-
+-function reason(error: unknown): string {
+-  return error instanceof Error ? error.message : String(error);
+ }
+ 
+-async function advance(conversationId: string) {
+-  const plan = plans.get(conversationId);
+-  if (!plan) return;
+-  const store = useChatStore.getState();
+-  if (store.conversationId !== conversationId || !safeNow(store, conversationId)) return;
+-  if (plan.phase === "queued") {
+-    const agentId = store.boundAgentId;
+-    if (agentId === null) {
+-      fail(conversationId, "Compact cancelled: this chat has no agent to ask to save its notes.");
+-      return;
+-    }
+-    plan.phase = "preparing";
+-    plan.sawRunning = false;
+-    plan.sawTurn = false;
+-    // Both timers are armed first, so a plan can never sit in "preparing" with nothing to end it.
+-    plan.limitTimer = setTimeout(
+-      () => fail(conversationId, "Compact cancelled: the chat took too long to save its notes."),
+-      AE_COMPACT_PREP_LIMIT_MS,
+-    );
+-    // Only the server reporting the session running proves a turn started; a busy blip from the
+-    // send latch, a background shell or a queued message does not. Any turn keeps the plan alive
+-    // here (the prepare message may wait behind it); the 15 minute limit ends a plan whose
+-    // prepare turn never comes.
+-    plan.startTimer = setTimeout(() => {
+-      plan.startTimer = null;
+-      if (!plan.sawRunning && !plan.sawTurn) {
+-        fail(conversationId, "Compact cancelled: the chat never started saving its notes.");
+-      }
+-    }, AE_COMPACT_START_LIMIT_MS);
+-    plan.sendTail = store.blocks.at(-1) ?? null;
+-    plan.sendTailItem = null;
+-    for (const b of store.blocks) {
+-      if (b.ctx.itemId) plan.sendTailItem = b.ctx.itemId;
+-      if (!isPrepareMessage(b)) continue;
+-      plan.seenBlocks.add(b);
+-      if (b.ctx.itemId) plan.seenItems.add(b.ctx.itemId);
+-    }
+-    emit();
+-    try {
+-      await store.send(AE_COMPACT_PREP_TEXT, agentId, undefined, {
+-        onError: (error: unknown) => {
+-          if (plans.get(conversationId) === plan) {
+-            fail(
+-              conversationId,
+-              `Compact cancelled: could not ask the chat to save its notes (${reason(error)}).`,
+-            );
+-          }
+-        },
+-      });
+-    } catch (error) {
+-      if (plans.get(conversationId) === plan) {
+-        fail(
+-          conversationId,
+-          `Compact cancelled: could not ask the chat to save its notes (${reason(error)}).`,
+-        );
+-      }
+-    }
+-    return;
++async function refresh(id: string): Promise<void> {
++  const rev = entryFor(id).rev;
++  let res: Response;
++  try {
++    res = await authenticatedFetch(url(id));
++  } catch {
++    return; // keep the last phase and keep polling
+   }
+-  if (plan.phase !== "preparing") return;
+-  const anchor = prepareAnchor(store.blocks, plan);
+-  if (anchor < 0) return;
+-  // The prepare turn was not seen running with its message in place. A message that lands only
+-  // after its own turn's idle edge (a late consumed event or snapshot merge) still counts once a
+-  // turn ran and a completed response follows it; otherwise keep waiting, and the start timer and
+-  // the 15 minute limit end it.
+-  if (
+-    !plan.sawTurn &&
+-    !(
+-      plan.sawRunning &&
+-      store.blocks
+-        .slice(anchor + 1)
+-        .some((b) => b.type === "response_end" && b.status === "completed")
+-    )
+-  )
+-    return;
+-  // A turn that failed, was cancelled, or raised an error did not finish saving: compact nothing.
+-  const failed = store.blocks
+-    .slice(anchor + 1)
+-    .some(
+-      (b) =>
+-        (b.type === "response_end" && b.status !== "completed") ||
+-        (b.type === "error" && b.level !== "info"),
+-    );
+-  if (failed) {
+-    fail(
+-      conversationId,
+-      "Compact cancelled: the chat did not finish saving its notes cleanly, so nothing was compacted.",
+-    );
++  if (res.status === 403 || res.status === 404) {
++    if (entryFor(id).rev === rev) setPhase(id, null);
+     return;
+   }
+-  plan.phase = "compacting";
+-  if (plan.limitTimer) clearTimeout(plan.limitTimer);
+-  plan.limitTimer = null;
+-  emit();
++  if (!res.ok) return;
++  let body: { phase?: AeCompactPhase | null; failure?: Failure | null };
+   try {
+-    // A shell that finishes between the quiet window and this call wakes the chat into a new
+-    // turn; Claude Code queues the typed /compact and runs it after that turn.
+-    await store.compact();
+-    const done = plan.onCompacted;
+-    finish(conversationId);
+-    done?.();
+-  } catch (error) {
+-    fail(
+-      conversationId,
+-      `Could not compact the session (${reason(error)}). Try again, or send /compact from the composer.`,
+-    );
++    body = (await res.json()) as typeof body;
++  } catch {
++    return;
++  }
++  if (entryFor(id).rev !== rev) return;
++  setPhase(id, body.phase ?? null);
++  const failure = body.failure;
++  if (failure && !entryFor(id).toasted.has(failure.id)) {
++    entryFor(id).toasted.add(failure.id);
++    showToast(failure.message);
++    authenticatedFetch(url(id, "/seen"), {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body: JSON.stringify({ failure_id: failure.id }),
++    }).catch(() => undefined);
+   }
+ }
+ 
+-function schedule(conversationId: string, plan: Plan) {
+-  if (plan.stableTimer) clearTimeout(plan.stableTimer);
+-  plan.stableTimer = setTimeout(() => {
+-    plan.stableTimer = null;
+-    advance(conversationId).catch((error: unknown) => {
+-      if (plans.get(conversationId) === plan && plan.phase !== "compacting") {
+-        fail(conversationId, `Compact cancelled: something went wrong (${reason(error)}).`);
+-      }
+-    });
+-  }, AE_COMPACT_STABLE_MS);
++/** The phase a 409 names in its error body, if any. */
++async function phaseOfConflict(res: Response): Promise<AeCompactPhase | null> {
++  try {
++    const body = (await res.clone().json()) as { error?: { phase?: AeCompactPhase } };
++    return body.error?.phase ?? null;
++  } catch {
++    return null;
++  }
+ }
+ 
+-/** Runs on every store change: re-arms the quiet timer at a turn end, cancels it while busy. */
+-function onStore() {
+-  const store = useChatStore.getState();
+-  for (const [conversationId, plan] of [...plans]) {
+-    if (plan.phase === "compacting") continue;
+-    if (store.conversationId !== conversationId) {
+-      fail(conversationId, "Compact cancelled: you left the chat before it ran.");
+-      continue;
+-    }
+-    // The prepare turn is the session running while this plan's prepare message is in the
+-    // transcript: a turn that ran and ended before the message landed was some other turn.
+-    if (plan.phase === "preparing" && !plan.sawTurn && store.sessionStatus === "running") {
+-      plan.sawRunning = true;
+-      if (prepareAnchor(store.blocks, plan) >= 0) {
+-        plan.sawTurn = true;
+-        if (plan.startTimer) clearTimeout(plan.startTimer);
+-        plan.startTimer = null;
+-      }
+-    }
+-    if (safeNow(store, conversationId)) {
+-      if (!plan.stableTimer) schedule(conversationId, plan);
+-    } else {
+-      if (plan.stableTimer) clearTimeout(plan.stableTimer);
+-      plan.stableTimer = null;
++/** Queue a compact for the chat on the server. Rejects with the server's reason. */
++export async function startAeCompactPlan(
++  conversationId: string,
++  options?: { snooze?: boolean },
++): Promise<void> {
++  const res = await authenticatedFetch(url(conversationId), {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ snooze: Boolean(options?.snooze) }),
++  });
++  entryFor(conversationId).rev += 1;
++  if (res.ok) {
++    setPhase(conversationId, "queued");
++    return;
++  }
++  if (res.status === 409) {
++    const phase = await phaseOfConflict(res);
++    if (phase) {
++      setPhase(conversationId, phase);
++      return;
+     }
+   }
++  throw await apiErrorFromResponse(res);
+ }
+ 
+-/** Queue a compact for the chat. A chat that already has one queued is left alone. */
+-export function startAeCompactPlan(conversationId: string, onCompacted?: () => void): void {
+-  if (plans.has(conversationId)) return;
+-  const plan: Plan = {
+-    phase: "queued",
+-    sawRunning: false,
+-    sawTurn: false,
+-    seenBlocks: new WeakSet(),
+-    seenItems: new Set(),
+-    sendTail: null,
+-    sendTailItem: null,
+-    stableTimer: null,
+-    limitTimer: null,
+-    startTimer: null,
+-    onCompacted,
+-  };
+-  plans.set(conversationId, plan);
+-  unsubscribe ??= useChatStore.subscribe(onStore);
+-  emit();
+-  onStore();
+-}
+-
+-/** Cancel a plan before it compacts. Once the compact event is going out it cannot be stopped. */
+-export function cancelAeCompactPlan(conversationId: string): void {
+-  const plan = plans.get(conversationId);
+-  if (!plan || plan.phase === "compacting") return;
+-  finish(conversationId);
+-}
+-
+-/** Where the chat's plan stands, or `null` when none is queued. */
+-export function useAeCompactPlan(conversationId: string | null | undefined): AeCompactPhase | null {
+-  return useSyncExternalStore(
+-    (listener) => {
+-      listeners.add(listener);
++/** Cancel the chat's queued compact. Once the compact is going out it cannot be cancelled. */
++export async function cancelAeCompactPlan(conversationId: string): Promise<void> {
++  const res = await authenticatedFetch(url(conversationId), { method: "DELETE" });
++  entryFor(conversationId).rev += 1;
++  if (res.ok) {
++    setPhase(conversationId, null);
++    return;
++  }
++  if (res.status === 409) {
++    setPhase(conversationId, "compacting");
++    return;
++  }
++  throw await apiErrorFromResponse(res);
++}
++
++/** The chat's compact phase, or null when none is queued. */
++export function useAeCompactPlan(conversationId: string | null): AeCompactPhase | null {
++  // A stable subscribe: React resubscribes whenever it changes, and each subscribe may fetch.
++  const subscribe = useCallback(
++    (listener: () => void) => {
++      if (!conversationId) return () => undefined;
++      const entry = entryFor(conversationId);
++      entry.listeners.add(listener);
++      entry.refs += 1;
++      if (entry.refs === 1) void refresh(conversationId);
++      syncTimer(conversationId);
+       return () => {
+-        listeners.delete(listener);
++        entry.listeners.delete(listener);
++        entry.refs -= 1;
++        syncTimer(conversationId);
+       };
+     },
+-    () => (conversationId ? (plans.get(conversationId)?.phase ?? null) : null),
+-    () => null,
++    [conversationId],
++  );
++  return useSyncExternalStore(subscribe, () =>
++    conversationId ? (entries.get(conversationId)?.phase ?? null) : null,
+   );
+ }
+ 
+-/** Test helper: drop every plan without a toast. */
++/** Forget every plan and stop every poll (tests). */
+ export function resetAeCompactPlans(): void {
+-  for (const id of [...plans.keys()]) finish(id);
++  for (const entry of entries.values()) {
++    if (entry.timer !== null) clearInterval(entry.timer);
++  }
++  entries.clear();
+ }

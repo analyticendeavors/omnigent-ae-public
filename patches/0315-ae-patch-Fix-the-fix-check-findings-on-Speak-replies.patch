@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 16:05:57 -0800
+Subject: [PATCH 315/333] [ae-patch] Fix the fix-check findings on Speak
+ replies (0314)
+
+A code block phrase was spoken twice, once when its fence closed while
+streaming and again from the final. It is now keyed by its place in the message
+(the sentence before it), so the second occurrence is skipped and a later code
+block after a different sentence is still spoken.
+
+The spoken set was reseeded from every final already in the chat, so a reply
+that said "Done." after an earlier "Done." went silent. It now holds only the
+current turn's sentences: existing finals are marked handled and in-flight
+sources start at their current length, and a send no longer carries the old
+turn's sentences over (a late final of the old turn is ignored).
+
+Fast answers no longer writes an effort after an await when the chat on screen
+has changed or the chat is read-only.
+
+A pending queue that is rebuilt (more than one entry added at once, or earlier
+entries gone) is not counted as a send, and offsets for sources no longer in the
+chat are dropped.
+
+Added 2026-11-08.
+---
+ .../components/AeSpeakRepliesButton.test.tsx  | 21 +++++
+ web/src/components/AeSpeakRepliesButton.tsx   | 15 +++-
+ web/src/hooks/useAeSpeakReplies.test.ts       | 80 ++++++++++++++++++
+ web/src/hooks/useAeSpeakReplies.ts            | 82 +++++++++++++------
+ 4 files changed, 169 insertions(+), 29 deletions(-)
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index cd308762b3cc996f2415994567daff779835afec..6ac594d5fb4d029f96ec99095b7dd00830c9a807 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -219,4 +219,25 @@ describe("AeSpeakRepliesButton", () => {
+     await openMenu();
+     expect(screen.getByTestId("ae-speak-stop")).toHaveAttribute("data-disabled");
+   });
++
++  it("skips the restore when the chat switched during the await", async () => {
++    let release: () => void = () => {};
++    setEffort.mockImplementationOnce(
++      () =>
++        new Promise<void>((resolve) => {
++          release = resolve;
++        }),
++    );
++    renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    useChatStore.setState({ conversationId: "c2" } as never);
++    release();
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, 10);
++    });
++    expect(setEffort).toHaveBeenCalledTimes(1);
++  });
+ });
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index e32e9ce92ff7465a960e59f64bf252ba36ba36fb..5f3fc81cde9f3ca161750c239fc35d87619e7120 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -109,6 +109,13 @@ function SpeakRepliesControl({
+   const effortRef = useRef(currentEffort);
+   effortRef.current = currentEffort;
+   const busyRef = useRef(false);
++  const availableRef = useRef(fastAvailable);
++  availableRef.current = fastAvailable;
++  // The effort belongs to the chat on screen: never write it after the view moved on.
++  const mayTouchEffort = useCallback(
++    () => availableRef.current && useChatStore.getState().conversationId === chatId,
++    [chatId],
++  );
+ 
+   const applyFast = useCallback(async () => {
+     if (busyRef.current || readFastAnswersState(chatId)) return;
+@@ -125,13 +132,13 @@ function SpeakRepliesControl({
+       writeFastAnswersState(chatId, { previousEffort });
+     } else {
+       // Turned off while the change was in flight: put the effort back.
+-      await setChatEffort(previousEffort).catch(() => {});
++      if (mayTouchEffort()) await setChatEffort(previousEffort).catch(() => {});
+     }
+-  }, [chatId]);
++  }, [chatId, mayTouchEffort]);
+ 
+   const revertFast = useCallback(async () => {
+     const state = readFastAnswersState(chatId);
+-    if (!state) return;
++    if (!state || !mayTouchEffort()) return;
+     // An effort the user changed by hand since stays as they left it.
+     if (effortRef.current === FAST_EFFORT) {
+       try {
+@@ -141,7 +148,7 @@ function SpeakRepliesControl({
+       }
+     }
+     clearFastAnswersState(chatId);
+-  }, [chatId]);
++  }, [chatId, mayTouchEffort]);
+ 
+   // Effort levels can arrive after the toggle, so apply whenever it is wanted and not yet applied.
+   useEffect(() => {
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 8472b2d8c154a7f6c3a01f7cb977d61b95d70601..787d4d6fc0c7f4c6d4d7bf1b815c52b73bb21263 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -298,4 +298,84 @@ describe("useAeSpeakReplies", () => {
+     setStore({ ...send(0), blocks: [userBlock] });
+     expect(synth.cancelCount).toBe(cancels);
+   });
++
++  it("speaks a code block phrase once when a streamed message is finalized", () => {
++    mount();
++    const text = "Run this:\n\n```ps\nInvoke\n```\n";
++    setStore({ blocks: [live("r1", text)] });
++    flush();
++    setStore({ blocks: [final("r1", "m1", "Run this:\n\n```ps\nInvoke\n```")] });
++    flush();
++    expect(
++      synth
++        .texts()
++        .join(" ")
++        .match(/Code block skipped/g),
++    ).toHaveLength(1);
++  });
++
++  it("speaks a second code block after a different sentence", () => {
++    mount();
++    setStore({
++      blocks: [final("r1", "m1", "One.\n\n```a\nx\n```\n\nTwo.\n\n```b\ny\n```")],
++    });
++    flush();
++    expect(
++      synth
++        .texts()
++        .join(" ")
++        .match(/Code block skipped/g),
++    ).toHaveLength(2);
++  });
++
++  it("speaks a code block in a second message of the same turn", () => {
++    mount();
++    const m1 = final("r1", "m1", "Alpha.\n\n```a\nx\n```");
++    const m2 = final("r1", "m2", "Beta.\n\n```b\ny\n```");
++    setStore({ blocks: [m1] });
++    flush();
++    setStore({ blocks: [m1, m2] });
++    flush();
++    expect(
++      synth
++        .texts()
++        .join(" ")
++        .match(/Code block skipped/g),
++    ).toHaveLength(2);
++  });
++
++  it("speaks two turns whose replies are both Done.", () => {
++    mount();
++    setStore({ status: "streaming", ...send(1) });
++    setStore({ blocks: [final("r1", "m1", "Done.")] });
++    flush();
++    setStore({ ...send(2) });
++    setStore({ blocks: [final("r1", "m1", "Done."), final("r2", "m2", "Done.")] });
++    flush();
++    expect(synth.texts()).toEqual(["Done.", "Done."]);
++  });
++
++  it("speaks a reply that repeats a sentence from history", () => {
++    setStore({ blocks: [final("h", "h1", "Done.", { createdAtS: 5 })] });
++    mount();
++    setStore({
++      blocks: [final("h", "h1", "Done.", { createdAtS: 5 }), final("r1", "m1", "Done.")],
++    });
++    flush();
++    expect(synth.texts()).toEqual(["Done."]);
++  });
++
++  it("does not count a rebuilt pending queue as a send, but a later send is", () => {
++    mount();
++    setStore({ status: "streaming", blocks: [live("r1", "One. Two")] });
++    flush();
++    const cancels = synth.cancelCount;
++    setStore(send(3));
++    expect(synth.cancelCount).toBe(cancels);
++    setStore({ conversationId: "c2" });
++    setStore({ conversationId: "c1", ...send(5) });
++    expect(synth.cancelCount).toBe(cancels);
++    setStore(send(6));
++    expect(synth.cancelCount).toBeGreaterThan(cancels);
++  });
+ });
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 9346b0f755c90b806ab560891868be8973c4e48a..e282709e6f9f437dc3b246ba04019c1f3c6444bb 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -26,6 +26,7 @@ function getSpeaker(): Speaker {
+ }
+ 
+ const CODE_BLOCK_KEY = normalizeSentence(CODE_BLOCK_PHRASE);
++const MESSAGE_START = "^";
+ 
+ interface FinalText {
+   key: string;
+@@ -107,6 +108,9 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+     const handled = new Set<string>();
+     const knownResponses = new Set<string>();
+     const offsets = new Map<string, number>();
++    const trails = new Map<string, { last: string }>();
++    // Responses still streaming when the user sent: their late finals are old-turn text.
++    const staleResponses = new Set<string>();
+     // Sentences already spoken this turn, so a final never repeats its preview.
+     const spoken = new Set<string>();
+     let cueTimer: ReturnType<typeof setTimeout> | null = null;
+@@ -114,36 +118,47 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+     let synced = false;
+     let prevStatus: "idle" | "streaming" = "idle";
+     let prevPending = 0;
++    let prevIds: string[] = [];
+     let prevUserBlocks = 0;
+ 
+     const clearCue = () => {
+       if (cueTimer !== null) clearTimeout(cueTimer);
+       cueTimer = null;
+     };
+-    const speakNew = (markdown: string) => {
+-      // A reply joined mid-sentence leaves the sentence's end mark at the start.
++    // `trail.last` is the key of the sentence before the next one in the same message,
++    // so a code block phrase is keyed by its place in the message, not by its text.
++    const sentenceKeys = (markdown: string, start: string) => {
++      let last = start;
+       const text = speechTextFromMarkdown(markdown.replace(/^[.!?\s]+/, ""));
++      return splitSentences(text).flatMap((sentence) => {
++        const norm = normalizeSentence(sentence);
++        if (norm === "") return [];
++        const key = norm === CODE_BLOCK_KEY ? `code@${last}` : norm;
++        last = key;
++        return [{ sentence, key }];
++      });
++    };
++    const speakNew = (markdown: string, trail: { last: string }) => {
+       const fresh: string[] = [];
+-      for (const sentence of splitSentences(text)) {
+-        const key = normalizeSentence(sentence);
+-        if (key === "") continue;
+-        if (key === CODE_BLOCK_KEY) {
+-          fresh.push(sentence);
+-        } else if (!spoken.has(key)) {
+-          spoken.add(key);
+-          fresh.push(sentence);
+-        }
++      for (const { sentence, key } of sentenceKeys(markdown, trail.last)) {
++        trail.last = key;
++        if (spoken.has(key)) continue;
++        spoken.add(key);
++        fresh.push(sentence);
+       }
+       if (fresh.length === 0) return;
+       spokenThisTurn = true;
+       clearCue();
+       speaker.speak(fresh.join(" "), optsRef.current);
+     };
+-    // Everything already on screen counts as handled so it is never read back.
+-    const snapshot = (blocks: readonly AnyBlock[]) => {
++    // Existing finals are handled and in-flight sources start at their current length, so
++    // nothing already on screen is read back. Only a live source seeds the spoken set, and
++    // only when tracking starts or reconnects: a send must not carry the old turn over.
++    const snapshot = (blocks: readonly AnyBlock[], seedLive: boolean) => {
+       handled.clear();
+       knownResponses.clear();
+       offsets.clear();
++      trails.clear();
+       spoken.clear();
+       for (const b of blocks) if (b.ctx.itemId) handled.add(b.ctx.itemId);
+       const scan = scanBlocks(blocks);
+@@ -152,14 +167,13 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+         knownResponses.add(source.responseId);
+         offsets.set(key, source.raw.length);
+         const { ready } = completeSentences(stripTldr(source.raw));
+-        for (const sentence of splitSentences(speechTextFromMarkdown(ready))) {
+-          spoken.add(normalizeSentence(sentence));
+-        }
+-      }
+-      for (const f of scan.finals) {
+-        for (const sentence of splitSentences(speechTextFromMarkdown(stripTldr(f.fullText)))) {
+-          spoken.add(normalizeSentence(sentence));
++        const trail = { last: MESSAGE_START };
++        for (const { key: k } of sentenceKeys(ready, trail.last)) {
++          trail.last = k;
++          if (seedLive) spoken.add(k);
+         }
++        trails.set(key, trail);
++        if (!seedLive) staleResponses.add(source.responseId);
+       }
+     };
+ 
+@@ -174,18 +188,26 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+         synced = true;
+         prevStatus = state.status;
+         prevPending = pending;
++        prevIds = state.pendingUserMessages.map((m) => m.tempId);
+         prevUserBlocks = scan.userBlocks;
+-        snapshot(state.blocks);
++        staleResponses.clear();
++        snapshot(state.blocks, true);
+         return;
+       }
+       // A promoted pending message shrinks the queue as its bubble appears; that is not a send.
++      // A real send adds one entry and keeps the others; a rebuilt queue is not a send.
++      const ids = state.pendingUserMessages.map((m) => m.tempId);
++      const grew = pending > prevPending;
++      const rebuilt =
++        grew && (pending - prevPending > 1 || prevIds.some((id) => !ids.includes(id)));
+       const sent =
+-        pending > prevPending || (scan.userBlocks > prevUserBlocks && pending >= prevPending);
++        (grew && !rebuilt) || (scan.userBlocks > prevUserBlocks && pending >= prevPending);
++      prevIds = ids;
+       prevPending = pending;
+       prevUserBlocks = scan.userBlocks;
+       if (sent) {
+         speaker.stop();
+-        snapshot(state.blocks);
++        snapshot(state.blocks, false);
+         spokenThisTurn = false;
+         clearCue();
+         cueTimer = setTimeout(() => {
+@@ -201,6 +223,8 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+       if (state.status === "idle" && prevStatus === "streaming") clearCue();
+       prevStatus = state.status;
+ 
++      for (const key of [...offsets.keys()]) if (!scan.sources.has(key)) offsets.delete(key);
++      for (const key of [...trails.keys()]) if (!scan.sources.has(key)) trails.delete(key);
+       for (const [key, source] of scan.sources) {
+         knownResponses.add(source.responseId);
+         const offset = offsets.get(key) ?? 0;
+@@ -208,14 +232,20 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+         const { ready } = completeSentences(stripped.slice(offset));
+         if (ready === "") continue;
+         offsets.set(key, offset + ready.length);
+-        speakNew(ready);
++        let trail = trails.get(key);
++        if (!trail) {
++          trail = { last: MESSAGE_START };
++          trails.set(key, trail);
++        }
++        speakNew(ready, trail);
+       }
+       for (const f of scan.finals) {
+         if (handled.has(f.key)) continue;
+         // A final from a refetch counts only when part of it was streamed live here.
+         if (f.fromHistory && !knownResponses.has(f.responseId)) continue;
+         handled.add(f.key);
+-        speakNew(stripTldr(f.fullText));
++        if (staleResponses.has(f.responseId)) continue;
++        speakNew(stripTldr(f.fullText), { last: MESSAGE_START });
+       }
+     };
+ 
+@@ -228,6 +258,8 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+       handled.clear();
+       knownResponses.clear();
+       offsets.clear();
++      trails.clear();
++      staleResponses.clear();
+       spoken.clear();
+     };
+   }, [enabled, chatId]);

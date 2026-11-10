@@ -771,6 +771,25 @@ async def test_report_review_tool_passes_its_call_id(monkeypatch: pytest.MonkeyP
     assert answer["status"] == "repeat" and seen == [args]
 
 
+async def test_report_review_tool_passes_personas(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OMNIGENT_RUNNER_PRIMARY_SESSION_ID", "conv_lead")
+    seen: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(json.loads(request.content))
+        return httpx.Response(200, json={"ok": True})
+
+    args = {
+        "reviewers_run": 2,
+        "findings_returned": 5,
+        "findings_fixed": 4,
+        "personas": ["general", "security"],
+    }
+    async with create_connected_server_and_client_session(create_server(_stub(handler))) as s:
+        await s.call_tool("report_review", args)
+    assert seen == [args]
+
+
 async def test_review_report_route_adds_up_and_follows_a_child_to_its_lead(
     client: httpx.AsyncClient, world: _World, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

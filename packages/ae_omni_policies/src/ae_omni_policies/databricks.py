@@ -107,7 +107,7 @@ from urllib.parse import quote, quote_plus, urlencode
 
 import httpx
 
-from ae_omni_policies import USER_AGENT, key_health
+from ae_omni_policies import USER_AGENT, card_config, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -363,10 +363,10 @@ def _warn_credit(problems: tuple[str, ...]) -> None:
 
 def credit(environ: Mapping[str, str] | None = None) -> Credit:
     """The credit settings; there is no credit unless the amount and both dates read."""
-    env = _env(environ)
-    raw_usd = (env.get(CREDIT_USD_ENV) or "").strip()
-    raw_start = (env.get(CREDIT_START_ENV) or "").strip()
-    raw_end = (env.get(CREDIT_END_ENV) or "").strip()
+    # Typed-in settings (2026-11-07): the environment still wins, see card_config.
+    raw_usd = (card_config.value(CREDIT_USD_ENV, environ) or "").strip()
+    raw_start = (card_config.value(CREDIT_START_ENV, environ) or "").strip()
+    raw_end = (card_config.value(CREDIT_END_ENV, environ) or "").strip()
     try:
         usd: float | None = float(raw_usd)
     except ValueError:
@@ -388,7 +388,7 @@ def credit(environ: Mapping[str, str] | None = None) -> Credit:
     _warn_credit(tuple(problems))
     if usd is None or start is None or end is None or start > end:
         usd, start, end = None, None, None
-    cadence = (env.get(CREDIT_CADENCE_ENV) or "").strip().lower()
+    cadence = (card_config.value(CREDIT_CADENCE_ENV, environ) or "").strip().lower()
     kind: Cadence = "monthly" if cadence == "monthly" else "once"
     return Credit(usd=usd, cadence=kind, start=start, end=end)
 
@@ -852,6 +852,9 @@ _MISSING = object()
 _spend: dict[str, Any] = {}
 _spend_path: Path | None | object = _MISSING
 _reading: asyncio.Task[None] | None = None
+# Bumped by invalidate(): a spend reading that began under an older credit window discards its
+# result instead of recording it against the new window (2026-11-07).
+_spend_generation = 0
 
 
 def _blank_spend() -> dict[str, Any]:
@@ -1283,13 +1286,20 @@ async def _read_spend(
         records nothing, and the next ``GET`` decides again.
     """
     state = _state()
+    generation = _spend_generation
     if only_if_running and not await _still_running(ws, warehouse_id, transport):
         return
     good = False
     started = _monotonic()
     try:
         outcome = await _run_statement(ws, settings, warehouse_id, transport)
+        if generation != _spend_generation:
+            return
     except asyncio.CancelledError:
+        # A reading for an older credit window writes nothing, so a cancel that lands during a
+        # save cannot stamp an attempt time or an error over the new window (2026-11-07).
+        if generation != _spend_generation:
+            raise
         # Shutdown or reset: record the attempt so the strip does not wait on
         # a reading that is gone, then let the cancellation through.
         state.update(
@@ -1301,10 +1311,14 @@ async def _read_spend(
         _save(_spend_path if isinstance(_spend_path, Path) else None, state)
         raise
     except DatabricksError as exc:
+        if generation != _spend_generation:
+            return
         status: SpendStatus = "no_access" if exc.code == CODE_NO_ACCESS else "error"
         _logger.warning("databricks spend reading failed: %s", exc)
         state.update(status=status, message=str(exc))
     except Exception as exc:  # noqa: BLE001 - a background task must record, not vanish
+        if generation != _spend_generation:
+            return
         # The exception's text could carry anything, so only its class is named.
         _logger.warning("databricks spend reading failed (%s)", type(exc).__name__)
         state.update(status="error", message=f"The spend reading failed ({type(exc).__name__}).")
@@ -1335,7 +1349,7 @@ async def _read_spend(
     # Saved before the breakdown, so a good (billed) totals reading survives a kill during it.
     _save(_spend_path if isinstance(_spend_path, Path) else None, state)
     if good:
-        await _read_breakdown(ws, settings, warehouse_id, transport, started, state)
+        await _read_breakdown(ws, settings, warehouse_id, transport, started, state, generation)
 
 
 async def _read_breakdown(
@@ -1345,12 +1359,17 @@ async def _read_breakdown(
     transport: httpx.AsyncBaseTransport | None,
     started: float,
     state: dict[str, Any],
+    generation: int,
 ) -> None:
     """The breakdown after good totals (module note): rows, or none and a ``note``; saved."""
     path = _spend_path if isinstance(_spend_path, Path) else None
     try:
         rows = await _run_breakdown(ws, settings, warehouse_id, transport, started)
+        if generation != _spend_generation:
+            return
     except asyncio.CancelledError:
+        if generation != _spend_generation:
+            raise
         # The totals are already saved: record why the rows are missing, then let it through.
         state.update(
             breakdownNote="The breakdown was stopped before it finished; Refresh to try again."
@@ -1358,9 +1377,13 @@ async def _read_breakdown(
         _save(path, state)
         raise
     except DatabricksError as exc:
+        if generation != _spend_generation:
+            return
         _logger.warning("databricks spend breakdown failed: %s", exc)
         state.update(breakdownNote=f"Breakdown unavailable: {exc} The totals are complete.")
     except Exception as exc:  # noqa: BLE001 - the totals must still be kept
+        if generation != _spend_generation:
+            return
         _logger.warning("databricks spend breakdown failed (%s)", type(exc).__name__)
         state.update(
             breakdownNote=f"Breakdown unavailable ({type(exc).__name__}). The totals are complete."
@@ -1496,6 +1519,20 @@ async def refresh(
         )
     _begin_reading(ws, settings, chosen["id"], transport)
     return spend_view(settings, chosen["id"])
+
+
+def invalidate() -> None:
+    """After a credit setting is saved in the panel (2026-11-07): start over for the new window.
+
+    The credit itself is read from the settings on every request, and the spend totals are
+    keyed on the credit window (:func:`spend_view`). This also clears the last attempt time, so
+    the next GET reads the new window at once instead of waiting out the hour, and discards a
+    reading still in flight for the old window when it ends (the generation).
+    """
+    global _spend_generation
+    _spend_generation += 1
+    forget()
+    _state()["attemptedAt"] = None
 
 
 def reset() -> None:

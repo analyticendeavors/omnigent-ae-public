@@ -1,0 +1,419 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 09:38:25 -0800
+Subject: [PATCH 303/333] [ae-patch] Add navigation.share so the Social card
+ can open the device share sheet with text and one image
+
+---
+ sdks/web-extension/src/index.ts               |  13 ++
+ .../extensions/rpc/validation.aeShare.test.ts |  55 ++++++++
+ web/src/extensions/rpc/validation.ts          |  22 ++-
+ web/src/extensions/services/aeShare.ts        |  89 ++++++++++++
+ web/src/extensions/services/registry.ts       |   1 +
+ .../useExtensionHostServices.aeShare.test.tsx | 132 ++++++++++++++++++
+ .../services/useExtensionHostServices.ts      |   5 +
+ 7 files changed, 316 insertions(+), 1 deletion(-)
+ create mode 100644 web/src/extensions/rpc/validation.aeShare.test.ts
+ create mode 100644 web/src/extensions/services/aeShare.ts
+ create mode 100644 web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx
+
+diff --git a/sdks/web-extension/src/index.ts b/sdks/web-extension/src/index.ts
+index e2bdf3abc8155ec584f7465ffee24e3d84268426..c589105b29eae8fbbc4a4e097e351625bfd05813 100644
+--- a/sdks/web-extension/src/index.ts
++++ b/sdks/web-extension/src/index.ts
+@@ -80,6 +80,16 @@ export interface ExtensionContext {
+     openNewSession(options?: { projectId?: string }): Promise<void>;
+     /** Opens an https URL the host handed out (e.g. a pull request) in a new tab. */
+     openExternal(url: string): Promise<void>;
++    /**
++     * Opens the device's share sheet with text and, optionally, one jpeg or png (at most 5 MB).
++     * Rejects with `ShareUnavailable` (no share sheet), `ShareCancelled` (closed) or
++     * `ShareFailed`. `files_dropped` means the sheet took the text only.
++     */
++    share(options: {
++      text?: string;
++      title?: string;
++      files?: Blob[];
++    }): Promise<{ shared: true; files_dropped?: true }>;
+   };
+   theme: {
+     getCurrent(): Promise<ThemeInfo>;
+@@ -253,6 +263,9 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
+       async openExternal(url) {
+         await request("navigation.openExternal", { url });
+       },
++      share(options) {
++        return request<{ shared: true; files_dropped?: true }>("navigation.share", options);
++      },
+     },
+     theme: {
+       getCurrent: () => request<ThemeInfo>("theme.getCurrent", {}),
+diff --git a/web/src/extensions/rpc/validation.aeShare.test.ts b/web/src/extensions/rpc/validation.aeShare.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..72f3d37b0bb3aa17b690d3c5c99d2d6982140a5d
+--- /dev/null
++++ b/web/src/extensions/rpc/validation.aeShare.test.ts
+@@ -0,0 +1,55 @@
++// omnigent-ae patch (2026-11-07): a `navigation.share` request may carry one Blob; no other
++// request may, and the rest of the share request keeps the usual budget.
++import { describe, expect, it } from "vitest";
++import { EXTENSION_RPC_SOURCE, type ExtensionIdentity } from "./protocol";
++import { isExtensionInboundMessage } from "./validation";
++
++const identity: ExtensionIdentity = {
++  extensionId: "acme.board",
++  pageId: "acme.board.home",
++  view: "home",
++  nonce: "n",
++  apiVersion: 1,
++};
++
++const request = (method: string, params: unknown) => ({
++  ...identity,
++  source: EXTENSION_RPC_SOURCE,
++  type: "request",
++  requestId: "n-1",
++  method,
++  params,
++});
++const blob = () => new Blob([new Uint8Array(200_000)], { type: "image/jpeg" });
++
++describe("navigation.share files", () => {
++  it("lets one Blob through, however large", () => {
++    expect(
++      isExtensionInboundMessage(request("navigation.share", { text: "a", files: [blob()] }), identity),
++    ).toBe(true);
++  });
++
++  it("refuses two files, a non-Blob file and a Blob on any other method", () => {
++    expect(
++      isExtensionInboundMessage(
++        request("navigation.share", { text: "a", files: [blob(), blob()] }),
++        identity,
++      ),
++    ).toBe(false);
++    expect(
++      isExtensionInboundMessage(request("navigation.share", { text: "a", files: ["x"] }), identity),
++    ).toBe(false);
++    expect(
++      isExtensionInboundMessage(request("navigation.openExternal", { files: [blob()] }), identity),
++    ).toBe(false);
++  });
++
++  it("holds the rest of the share request to the usual budget", () => {
++    expect(
++      isExtensionInboundMessage(
++        request("navigation.share", { text: "x".repeat(40_000), files: [blob()] }),
++        identity,
++      ),
++    ).toBe(false);
++  });
++});
+diff --git a/web/src/extensions/rpc/validation.ts b/web/src/extensions/rpc/validation.ts
+index 704993190c927a963dd094b7c7e6cb8e1022815f..61a5fe6b069e8ee5047532cc94958257b9fbb1d2 100644
+--- a/web/src/extensions/rpc/validation.ts
++++ b/web/src/extensions/rpc/validation.ts
+@@ -60,6 +60,26 @@ export function isExtensionSessionPageWithinBudget(value: unknown): boolean {
+   );
+ }
+ 
++// omnigent-ae patch (2026-11-07): `navigation.share` may carry one image as a Blob, which the
++// budget walk refuses by design. The Blob is taken out before the walk (the host checks its
++// type and its 5 MB cap when it shares); the rest of the request is held to the same budget.
++function isRequestWithinBudget(message: Record<string, unknown>): boolean {
++  const params = message.params as Record<string, unknown> | null | undefined;
++  if (
++    message.type === "request" &&
++    message.method === "navigation.share" &&
++    params &&
++    typeof params === "object" &&
++    Array.isArray(params.files)
++  ) {
++    if (params.files.length > 1 || !params.files.every((file) => file instanceof Blob)) {
++      return false;
++    }
++    return isExtensionPayloadWithinBudget({ ...message, params: { ...params, files: [] } });
++  }
++  return isExtensionPayloadWithinBudget(message);
++}
++
+ export function isExtensionInboundMessage(
+   value: unknown,
+   identity: ExtensionIdentity,
+@@ -76,7 +96,7 @@ export function isExtensionInboundMessage(
+   ) {
+     return false;
+   }
+-  if (!isExtensionPayloadWithinBudget(value)) return false;
++  if (!isRequestWithinBudget(message)) return false;
+   if (message.type === "ready") return true;
+   if (message.type === "incompatible") return typeof message.sdkApiVersion === "number";
+   if (message.type === "error") return typeof message.message === "string";
+diff --git a/web/src/extensions/services/aeShare.ts b/web/src/extensions/services/aeShare.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..6eb95dbe1f206e66bd93158cd7d142b41305e6f6
+--- /dev/null
++++ b/web/src/extensions/services/aeShare.ts
+@@ -0,0 +1,89 @@
++// omnigent-ae patch (2026-11-07): `navigation.share` hands text, and one image, to the
++// browser's own share sheet. The Social card runs in a sandboxed frame that cannot call
++// `navigator.share` or open the LinkedIn app, and the Home Screen app opens outside links in
++// Safari's in-app view, which iOS never passes to an installed app. The share sheet does
++// reach it. The host calls `navigator.share` itself, the way `openExternal` calls
++// `window.open`, from the same tap, so the frame's sandbox and CSP stay as they are.
++import { ExtensionHostServiceError } from "./errors";
++
++/** The longest text one share may carry, counted in code points. */
++export const AE_SHARE_MAX_TEXT = 3000;
++/** The longest title, in code points. */
++export const AE_SHARE_MAX_TITLE = 200;
++/** The largest image, in bytes. */
++export const AE_SHARE_MAX_FILE_BYTES = 5 * 1024 * 1024;
++const FILE_TYPES = new Set(["image/jpeg", "image/png"]);
++
++export interface AeShareResult {
++  shared: true;
++  /** The device's share sheet cannot take the image, so only the text went. */
++  files_dropped?: true;
++}
++
++function codePoints(value: string): number {
++  let count = 0;
++  for (const _ of value) count += 1;
++  return count;
++}
++
++function invalid(message: string): ExtensionHostServiceError {
++  return new ExtensionHostServiceError("InvalidParams", message);
++}
++
++function textField(value: unknown, name: string, max: number): string | undefined {
++  if (value === undefined) return undefined;
++  if (typeof value !== "string") throw invalid(`${name} must be a string`);
++  if (codePoints(value) > max) throw invalid(`${name} is longer than ${max} characters`);
++  return value;
++}
++
++/** The File to share: a Blob of an allowed type under the size cap, named for the sheet. */
++function fileFrom(value: unknown): File {
++  if (!(value instanceof Blob)) throw invalid("files must hold a File or Blob");
++  if (!FILE_TYPES.has(value.type)) throw invalid("the image must be image/jpeg or image/png");
++  if (value.size > AE_SHARE_MAX_FILE_BYTES) throw invalid("the image is larger than 5 MB");
++  if (value instanceof File) return value;
++  return new File([value], value.type === "image/png" ? "image.png" : "image.jpg", {
++    type: value.type,
++  });
++}
++
++export async function aeShare(params: Record<string, unknown>): Promise<AeShareResult> {
++  const text = textField(params.text, "text", AE_SHARE_MAX_TEXT);
++  const title = textField(params.title, "title", AE_SHARE_MAX_TITLE);
++  const rawFiles = params.files;
++  if (rawFiles !== undefined && (!Array.isArray(rawFiles) || rawFiles.length > 1)) {
++    throw invalid("files must be a list of at most one image");
++  }
++  const files = (rawFiles ?? []).map(fileFrom);
++  if (text === undefined && title === undefined && files.length === 0) {
++    throw invalid("share needs text, a title or an image");
++  }
++  if (typeof navigator.share !== "function") {
++    throw new ExtensionHostServiceError("ShareUnavailable", "This browser has no share sheet");
++  }
++  const data: ShareData = {};
++  if (text !== undefined) data.text = text;
++  if (title !== undefined) data.title = title;
++  let filesDropped = false;
++  if (files.length > 0) {
++    if (typeof navigator.canShare === "function" && navigator.canShare({ files })) {
++      data.files = files;
++    } else {
++      filesDropped = true;
++    }
++  }
++  if (filesDropped && data.text === undefined && data.title === undefined) {
++    throw new ExtensionHostServiceError("ShareUnavailable", "This share sheet cannot take images");
++  }
++  try {
++    await navigator.share(data);
++  } catch (error) {
++    if (error instanceof DOMException && error.name === "AbortError") {
++      throw new ExtensionHostServiceError("ShareCancelled", "The share sheet was closed");
++    }
++    const detail = error instanceof Error ? error.message : String(error);
++    throw new ExtensionHostServiceError("ShareFailed", `The share sheet failed: ${detail}`);
++  }
++  return filesDropped ? { shared: true, files_dropped: true } : { shared: true };
++}
+diff --git a/web/src/extensions/services/registry.ts b/web/src/extensions/services/registry.ts
+index 05c8339509d3ae028314b375224a235a42289e33..362557869c1237b2778212877b31e761dd27208b 100644
+--- a/web/src/extensions/services/registry.ts
++++ b/web/src/extensions/services/registry.ts
+@@ -5,6 +5,7 @@ export const HOST_METHOD_PERMISSIONS = {
+   "navigation.openSession": "navigation",
+   "navigation.openNewSession": "navigation",
+   "navigation.openExternal": "navigation",
++  "navigation.share": "navigation",
+   "theme.getCurrent": null,
+   "theme.subscribe": null,
+   "storage.user.get": "storage.user",
+diff --git a/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx b/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7fd93127e3902be457bee98771dbc4d7490e6a8f
+--- /dev/null
++++ b/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx
+@@ -0,0 +1,132 @@
++// omnigent-ae patch (2026-11-07): `navigation.share` opens the device's share sheet with
++// text and one image. It needs the navigation permission, and it names its failures.
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { renderHook } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import type { ExtensionCatalogItem } from "../types";
++
++vi.mock("@/lib/routing", () => ({ useNavigate: () => vi.fn() }));
++vi.mock("@/lib/identity", () => ({
++  authenticatedFetch: vi.fn(),
++  resolveIdentity: async () => "user@example.com",
++}));
++vi.mock("@/lib/host", () => ({ getOmnigentServerIdentity: () => "server-a" }));
++vi.mock("next-themes", () => ({ useTheme: () => ({ resolvedTheme: "dark" }) }));
++
++import { useExtensionHostServices } from "./useExtensionHostServices";
++
++function extensionWith(permissions: ExtensionCatalogItem["permissions"]): ExtensionCatalogItem {
++  return {
++    object: "extension",
++    id: "acme.board",
++    display_name: "Board",
++    distribution: "acme-board",
++    version: "1.0.0",
++    extension_api: 1,
++    status: "enabled",
++    permissions,
++    pages: [{ id: "acme.board.home", title: "Home", route: "home", view: "home" }],
++    primary_navigation: [],
++    browser: {
++      declared: true,
++      has_styles: false,
++      digest: "digest",
++      script_url: "/script",
++      style_url: null,
++    },
++  };
++}
++
++const queryClient = new QueryClient();
++const wrapper = ({ children }: { children: ReactNode }) => (
++  <QueryClientProvider client={queryClient}>{children}</QueryClientProvider>
++);
++const signal = () => new AbortController().signal;
++
++function share(permissions: ExtensionCatalogItem["permissions"] = ["navigation"]) {
++  const { result } = renderHook(() => useExtensionHostServices(extensionWith(permissions)), {
++    wrapper,
++  });
++  return result.current.methods["navigation.share"];
++}
++
++const image = (type = "image/jpeg", size = 10) =>
++  new File([new Uint8Array(size)], "post.jpg", { type });
++
++function setNavigator(share: unknown, canShare?: unknown): void {
++  Object.defineProperty(navigator, "share", { value: share, configurable: true });
++  Object.defineProperty(navigator, "canShare", { value: canShare, configurable: true });
++}
++
++afterEach(() => {
++  Reflect.deleteProperty(navigator, "share");
++  Reflect.deleteProperty(navigator, "canShare");
++});
++
++describe("navigation.share", () => {
++  it("needs the navigation permission", () => {
++    expect(share(["sessions.read"])).toBeUndefined();
++    expect(share()).toBeTypeOf("function");
++  });
++
++  it("shares text and the image together when the sheet takes files", async () => {
++    const sheet = vi.fn().mockResolvedValue(undefined);
++    setNavigator(sheet, () => true);
++    const file = image();
++    await expect(
++      share()?.({ text: "Hello", title: "T", files: [file] }, signal()),
++    ).resolves.toEqual({ shared: true });
++    expect(sheet).toHaveBeenCalledWith({ text: "Hello", title: "T", files: [file] });
++  });
++
++  it("shares the text alone and says the image was dropped when canShare refuses files", async () => {
++    const sheet = vi.fn().mockResolvedValue(undefined);
++    setNavigator(sheet, () => false);
++    await expect(
++      share()?.({ text: "Hello", files: [image()] }, signal()),
++    ).resolves.toEqual({ shared: true, files_dropped: true });
++    expect(sheet).toHaveBeenCalledWith({ text: "Hello" });
++  });
++
++  it("rejects ShareUnavailable when the browser has no share sheet", async () => {
++    await expect(share()?.({ text: "Hello" }, signal())).rejects.toMatchObject({
++      code: "ShareUnavailable",
++    });
++  });
++
++  it("rejects ShareCancelled on an AbortError and ShareFailed on anything else", async () => {
++    setNavigator(vi.fn().mockRejectedValue(new DOMException("closed", "AbortError")));
++    await expect(share()?.({ text: "Hello" }, signal())).rejects.toMatchObject({
++      code: "ShareCancelled",
++    });
++    setNavigator(vi.fn().mockRejectedValue(new Error("boom")));
++    await expect(share()?.({ text: "Hello" }, signal())).rejects.toMatchObject({
++      code: "ShareFailed",
++    });
++  });
++
++  it.each([
++    ["text over 3,000 code points", { text: "x".repeat(3001) }],
++    ["a title over 200", { text: "a", title: "x".repeat(201) }],
++    ["nothing to share", {}],
++    ["two files", { text: "a", files: [image(), image()] }],
++    ["a gif", { text: "a", files: [image("image/gif")] }],
++    ["an image over 5 MB", { text: "a", files: [image("image/jpeg", 5 * 1024 * 1024 + 1)] }],
++    ["a string as a file", { text: "a", files: ["data:image/png;base64,AA=="] }],
++  ])("refuses %s", async (_name, params) => {
++    const sheet = vi.fn().mockResolvedValue(undefined);
++    setNavigator(sheet, () => true);
++    await expect(share()?.(params, signal())).rejects.toMatchObject({ code: "InvalidParams" });
++    expect(sheet).not.toHaveBeenCalled();
++  });
++
++  it("counts code points, not UTF-16 units", async () => {
++    const sheet = vi.fn().mockResolvedValue(undefined);
++    setNavigator(sheet, () => true);
++    // 3,000 astral characters are 6,000 UTF-16 units but 3,000 code points.
++    await expect(share()?.({ text: "\u{1D5D4}".repeat(3000) }, signal())).resolves.toEqual({
++      shared: true,
++    });
++  });
++});
+diff --git a/web/src/extensions/services/useExtensionHostServices.ts b/web/src/extensions/services/useExtensionHostServices.ts
+index ba8f22d6d9c8e33625b88d370d554a81c156e06a..8872376cc190789db24289f379886db07e59bdb8 100644
+--- a/web/src/extensions/services/useExtensionHostServices.ts
++++ b/web/src/extensions/services/useExtensionHostServices.ts
+@@ -15,6 +15,7 @@ import {
+ import { fetchPullRequestInfo } from "@/hooks/usePullRequests";
+ import { useNavigate } from "@/lib/routing";
+ import type { ExtensionCatalogItem, ExtensionPullRequest } from "../types";
++import { aeShare } from "./aeShare";
+ import { ExtensionHostServiceError } from "./errors";
+ import { grantedHostMethods } from "./registry";
+ import {
+@@ -142,6 +143,10 @@ export function useExtensionHostServices(extension: ExtensionCatalogItem) {
+         aeOpenExternalWindow(url);
+         return null;
+       },
++      "navigation.share": async (params: unknown, signal: AbortSignal) => {
++        throwIfAborted(signal);
++        return aeShare(objectParams(params));
++      },
+       "navigation.openNewSession": async (params: unknown, signal: AbortSignal) => {
+         throwIfAborted(signal);
+         const projectId = params === undefined ? undefined : objectParams(params).projectId;

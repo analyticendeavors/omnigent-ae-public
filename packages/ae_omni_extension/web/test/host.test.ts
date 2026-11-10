@@ -2,6 +2,7 @@
 // connected, what deploy/host-relink.sh last reported, and the button that
 // asks it for a reconnect link. Every call is mocked: the routes are GET
 // /v1/ae/host and POST /v1/ae/host/relink.
+import { getTile } from "../src/tiles";
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { HostStatus } from "../src/api";
@@ -21,6 +22,8 @@ import {
   stateText,
   toneOf,
 } from "../src/host";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -420,6 +423,8 @@ describe("a signed-in non-admin (2026-10-28)", () => {
     const node = await mount(context);
     expect(node.textContent).toContain("The box host is for admins.");
     expect(notices(node)).toEqual([]);
+    // The tile has reported, as idle, so the header verdict can tell the section answered.
+    expect(getTile("host")).toMatchObject({ value: "Admins only", health: "idle" });
     window.dispatchEvent(new Event("focus"));
     await vi.advanceTimersByTimeAsync(POLL_CONNECTED_MS * 2);
     expect(request).toHaveBeenCalledTimes(1);
@@ -438,5 +443,22 @@ describe("a false admin_only answer (2026-10-28)", () => {
     expect(request).toHaveBeenCalledTimes(2);
     expect(node.textContent).not.toContain("is for admins");
     expect(pill(node)).toBeTruthy();
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+    const { context } = stubContext({ [GET]: [ok(rejected())] });
+    const node = await mount(context);
+    const link = () => node.querySelector(".needs-link");
+    expect(link()?.textContent).toBe("Reading Needs you...");
+    setAttention(needOverview([needItem("host-1", { source: "host", kind: "host-failed" })]));
+    expect(link()?.textContent).toBe("1 in Needs you");
+    setAttention(needOverview([]));
+    expect(link()?.textContent).toBe("Nothing needs you.");
   });
 });

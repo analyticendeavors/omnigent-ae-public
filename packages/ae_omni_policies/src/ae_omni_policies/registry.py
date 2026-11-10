@@ -82,6 +82,15 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         ),
     },
     {
+        "handler": "ae_omni_policies.voice.voice_style",
+        "kind": "callable",
+        "name": "AE Voice Mode",
+        "description": (
+            "While a chat's ae.voice label is 'on', each message you send carries one extra "
+            "line asking for a short, plain, spoken-style reply. Off by default."
+        ),
+    },
+    {
         "handler": "ae_omni_policies.fork_suspect.fork_suspect",
         "kind": "factory",
         "name": "AE Fork Suspect",

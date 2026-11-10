@@ -1,30 +1,48 @@
-// The Admin Center's card arrangement (2026-10-22): the saved layout read
-// defensively, the pure steps that move a card, the drag and its keyboard twin,
-// and the Reset layout button. jsdom does no layout, so a drag is driven with
-// stubbed rectangles.
+// The Admin Center's card arrangement (2026-10-22): the saved layout read defensively, the pure
+// steps that move a card, the drag and its keyboard twin, and the Reset layout button. jsdom does
+// no layout, so a drag is driven with stubbed rectangles. Since 2026-11-07 (packed board) the cards
+// sit in n packed columns under Needs you, move anywhere on the board, and the save is per column
+// count under `board.packed`.
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { adminCard, arrange, type CardId, LAYOUTS, mountBoard } from "../src/board";
+import { adminCard, arrange, type CardId, mountBoard } from "../src/board";
 import { currentLayout, layoutResetButton } from "../src/boardDrag";
 import {
-  arrangement,
   dropTarget,
   hasArrangement,
   LAYOUT_KEY,
   loadBoardLayout,
   moveCard,
   onLayoutChange,
+  packedArrangement,
+  packLayout,
   resetArrangement,
   resetBoardLayoutState,
   setArrangement,
 } from "../src/boardLayout";
+import { DOMAINS } from "../src/tiles";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
 
-const IDS: CardId[] = ["deploys", "accounts", "compute", "credit", "azure", "box"];
-/** The default columns as the board draws them from IDS (the fixture has no Key Vault card). */
-const shown = (n: 2 | 3) => LAYOUTS[n].map((col) => col.filter((id) => IDS.includes(id)));
+/** Every card the board tests use, in board order (Ship, Box, Cloud, Accounts). */
+const BOARD_IDS: CardId[] = [
+  "deploys",
+  "git",
+  "social",
+  "box",
+  "home-security",
+  "compute",
+  "credit",
+  "azure",
+  "vault",
+  "decision",
+  "accounts",
+  "presets",
+];
+/** What the board packs by default for *n* columns. */
+const packed = (n: 2 | 3 | 4) => packLayout(n, BOARD_IDS);
+const layoutOf = (board: HTMLElement) => currentLayout(board);
 
 function storageContext(initial?: unknown) {
   const set = vi.fn(async () => undefined);
@@ -43,44 +61,43 @@ afterEach(() => {
 });
 
 describe("the saved arrangement", () => {
-  it("is the default until something is saved, and a phone is never arranged", () => {
-    expect(arrangement(3, LAYOUTS, IDS)).toEqual(LAYOUTS[3]);
-    setArrangement(3, [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]]);
-    expect(arrangement(1, LAYOUTS, IDS)).toEqual(LAYOUTS[1]);
-    // Saved for three columns only: two columns keep their default.
-    expect(arrangement(2, LAYOUTS, IDS)).toEqual(LAYOUTS[2]);
-    expect(arrangement(3, LAYOUTS, IDS)[0]).toEqual(["box"]);
+  it("is the packed default until something is saved, per column count", () => {
+    expect(DOMAINS.flatMap((d) => d.cards)).toEqual(expect.arrayContaining(BOARD_IDS));
+    expect(packedArrangement(3, BOARD_IDS)).toEqual(packed(3));
+    const mine = [["azure"], ["compute", "credit"], BOARD_IDS.filter((id) => !["azure", "compute", "credit"].includes(id))];
+    setArrangement(3, mine as CardId[][]);
+    expect(packedArrangement(3, BOARD_IDS)).toEqual(mine);
+    expect(packedArrangement(2, BOARD_IDS)).toEqual(packed(2));
+    expect(packedArrangement(4, BOARD_IDS)).toEqual(packed(4));
   });
 
-  it("drops a card the page no longer has, a repeat, and puts a missing card in its default column", () => {
-    setArrangement(3, [
-      ["deploys", "gone", "deploys"],
-      ["accounts", "compute"],
-      ["azure"],
-    ] as unknown as CardId[][]);
-    expect(arrangement(3, LAYOUTS, IDS)).toEqual([
-      // box defaults to the first column, credit to the third.
-      ["deploys", "box"],
-      ["accounts", "compute"],
-      ["azure", "credit"],
-    ]);
+  it("drops an unknown card and a repeat, and places a missing card in the shortest column", () => {
+    setArrangement(2, [["deploys", "gone", "deploys"], ["git"]] as unknown as CardId[][]);
+    // box is missing: column 1 is 420 + 160, column 2 is 490, so it goes to column 2.
+    expect(packedArrangement(2, ["deploys", "git", "box"])).toEqual([["deploys"], ["git", "box"]]);
   });
 
-  it("ignores an arrangement of the wrong shape or with no known card", () => {
-    setArrangement(3, [["deploys"], ["accounts"]]);
-    expect(arrangement(3, LAYOUTS, IDS)).toEqual(LAYOUTS[3]);
+  it("ignores an arrangement with the wrong column count or no known card", () => {
+    setArrangement(3, [["deploys"], ["git"]]);
+    expect(packedArrangement(3, BOARD_IDS)).toEqual(packed(3));
     setArrangement(3, [["x"], ["y"], ["z"]] as unknown as CardId[][]);
-    expect(arrangement(3, LAYOUTS, IDS)).toEqual(LAYOUTS[3]);
+    expect(packedArrangement(3, BOARD_IDS)).toEqual(packed(3));
   });
 
-  it("is read from storage, and a bad value is ignored", async () => {
-    const good = { "3": [["box"], ["deploys"], ["azure"]] };
-    const { context } = storageContext({ ...good, "2": "nope" });
+  it("is read from the new key per count; a bad count is ignored on its own", async () => {
+    const mine = [["azure"], ["compute"], []];
+    const { context, get } = storageContext({ "3": mine, "2": "nope", "4": [[1]] });
     await loadBoardLayout(context);
-    expect(hasArrangement()).toBe(true);
-    expect(arrangement(3, LAYOUTS, IDS)[0]).toEqual(["box"]);
+    expect(get).toHaveBeenCalledWith("board.packed");
+    expect(hasArrangement(3)).toBe(true);
+    expect(hasArrangement(2)).toBe(false);
+    expect(hasArrangement(4)).toBe(false);
     resetBoardLayoutState();
     await loadBoardLayout(storageContext([1, 2]).context);
+    expect(hasArrangement()).toBe(false);
+    // A save with the wrong number of columns, or with no card, is not on the page: no Reset layout.
+    resetBoardLayoutState();
+    await loadBoardLayout(storageContext({ "2": [["deploys"]], "3": [[], [], []], "4": [] }).context);
     expect(hasArrangement()).toBe(false);
     resetBoardLayoutState();
     const broken = { storage: { user: { get: () => Promise.reject(new Error("no")) } } };
@@ -88,12 +105,15 @@ describe("the saved arrangement", () => {
     expect(hasArrangement()).toBe(false);
   });
 
-  it("loads a layout saved before the Family cost card folded into Presets, without it", async () => {
-    const old = { "3": [["deploys", "presets", "family", "box"], ["accounts", "compute"], ["azure", "credit"]] };
-    await loadBoardLayout(storageContext(old).context);
-    const flat = arrangement(3, LAYOUTS, [...IDS, "presets"]).flat();
-    expect(flat).not.toContain("family");
-    expect(flat).toContain("presets");
+  it("never reads the old per-group board.layout", async () => {
+    const old = { "3": { ship: [["deploys"], [], []] } };
+    const get = vi.fn(async (key: string) => (key === "board.layout" ? old : undefined));
+    const set = vi.fn(async () => undefined);
+    await loadBoardLayout({ storage: { user: { get, set } } } as unknown as ExtensionContext);
+    expect(get).toHaveBeenCalledTimes(1);
+    expect(get).not.toHaveBeenCalledWith("board.layout");
+    expect(hasArrangement()).toBe(false);
+    expect(set).not.toHaveBeenCalled();
   });
 
   it("saves under one key, per column count, and tells listeners", async () => {
@@ -102,10 +122,16 @@ describe("the saved arrangement", () => {
     const heard = vi.fn();
     onLayoutChange(heard);
     setArrangement(2, [["box"], ["deploys"]]);
+    expect(LAYOUT_KEY).toBe("board.packed");
     expect(set).toHaveBeenCalledWith(LAYOUT_KEY, { "2": [["box"], ["deploys"]] });
+    setArrangement(4, [["box"], [], [], ["deploys"]]);
+    expect(set).toHaveBeenLastCalledWith(LAYOUT_KEY, {
+      "2": [["box"], ["deploys"]],
+      "4": [["box"], [], [], ["deploys"]],
+    });
     resetArrangement();
     expect(set).toHaveBeenLastCalledWith(LAYOUT_KEY, {});
-    expect(heard).toHaveBeenCalledTimes(2);
+    expect(heard).toHaveBeenCalledTimes(3);
     expect(hasArrangement()).toBe(false);
   });
 });
@@ -165,24 +191,27 @@ describe("moving a card", () => {
   });
 });
 
-function makeBoard(n: 2 | 3 = 3) {
+
+const WIDTH: Record<2 | 3 | 4, number> = { 2: 900, 3: 1400, 4: 1800 };
+
+function makeBoard(n: 2 | 3 | 4 = 3) {
+  const main = document.createElement("main");
+  const attention = document.createElement("section");
+  attention.id = "needs-you";
   const board = document.createElement("div");
   board.className = "admin-board";
-  document.body.appendChild(board);
+  main.append(attention, board);
+  document.body.appendChild(main);
   const cards = Object.fromEntries(
-    IDS.map((id) => [
+    BOARD_IDS.map((id) => [
       id,
       adminCard(id, id, document.createElementNS("http://www.w3.org/2000/svg", "svg"), [], "body"),
     ]),
   ) as Record<CardId, HTMLElement>;
-  const layout = mountBoardAt(board, cards, n);
-  return { board, cards, layout };
-}
-
-function mountBoardAt(board: HTMLElement, cards: Record<CardId, HTMLElement>, n: 2 | 3) {
   const page = document.createElement("div");
-  Object.defineProperty(page, "clientWidth", { value: n === 3 ? 1400 : 900 });
-  return mountBoard(page, board, cards);
+  Object.defineProperty(page, "clientWidth", { value: WIDTH[n] });
+  const layout = mountBoard(page, board, cards, attention);
+  return { board, cards, layout, attention };
 }
 
 const grip = (card: HTMLElement) =>
@@ -203,11 +232,11 @@ function stubRect(node: Element, left: number, top: number, width: number, heigh
     }) as DOMRect;
 }
 
-/** Give the current columns and cards fixed boxes: 300 wide columns, 100 high cards, 10 apart. */
+/** Fixed boxes: 300 wide columns 310 apart, 100 high children (Needs you included), 110 apart. */
 function stubLayout(board: HTMLElement) {
-  [...board.children].forEach((col, c) => {
-    stubRect(col, c * 310, 0, 300, 600);
-    [...col.children].forEach((card, r) => stubRect(card, c * 310, r * 110, 300, 100));
+  [...board.querySelectorAll(":scope > .admin-col")].forEach((col, c) => {
+    stubRect(col, c * 310, 0, 300, 2000);
+    [...col.children].forEach((child, r) => stubRect(child, c * 310, r * 110, 300, 100));
   });
 }
 
@@ -216,59 +245,85 @@ const fire = (target: EventTarget, type: string, x = 0, y = 0, extra: object = {
     new MouseEvent(type, { bubbles: true, cancelable: true, clientX: x, clientY: y, ...extra }),
   );
 
+const needsFirst = (board: HTMLElement) =>
+  expect(board.querySelector(":scope > .admin-col")?.firstElementChild?.id).toBe("needs-you");
+
 describe("the grips", () => {
-  it("sit in every card's header, are named for their card, and are hidden on one column by style", () => {
-    const { cards } = makeBoard();
-    for (const id of IDS) {
+  it("sit in every card's header and are named for their card; Needs you has none", () => {
+    const { board, cards, attention } = makeBoard();
+    for (const id of BOARD_IDS) {
       const found = grip(cards[id]);
       expect(found.closest(".admin-card-top")).not.toBeNull();
       expect(found.getAttribute("aria-label")).toContain(`Move ${id}`);
     }
+    expect(attention.querySelector(".admin-grip")).toBeNull();
+    needsFirst(board);
   });
 });
 
 describe("dragging", () => {
-  it("lifts the card, moves a dashed slot with the pointer, and saves the drop", () => {
-    const { board, cards } = makeBoard();
+  it("lifts the card, moves a dashed slot with the pointer, and saves the whole board's columns", () => {
+    const { board, cards } = makeBoard(3);
     stubLayout(board);
     const heard = vi.fn();
     onLayoutChange(heard);
-    fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
-    expect(cards.deploys.classList.contains("is-dragging")).toBe(true);
+    const homeColumn = layoutOf(board).findIndex((col) => col.includes("azure"));
+    fire(grip(cards.azure), "pointerdown", 330, 120, { button: 0 });
+    expect(cards.azure.classList.contains("is-dragging")).toBe(true);
     expect(board.classList.contains("is-sorting")).toBe(true);
-    expect(board.querySelector(".admin-slot")).not.toBeNull();
-    // Over the third column, above its first card: that is where the slot goes.
+    // Over the third column, above its first card: the slot goes first there.
     fire(document, "pointermove", 700, 10);
     const slot = board.querySelector(".admin-slot") as HTMLElement;
     expect(slot.parentElement).toBe(board.children[2]);
-    expect(slot.nextElementSibling).toBe(cards.azure);
-    expect(cards.deploys.style.left).toBe("680px");
+    expect(cards.azure.style.left).toBe(`${700 - 330 + homeColumn * 310}px`);
     fire(document, "pointerup", 700, 10);
-    expect(currentLayout(board)).toEqual([
-      ["box"],
-      ["accounts", "compute"],
-      ["deploys", "azure", "credit"],
-    ]);
-    expect(arrangement(3, LAYOUTS, IDS)[2]).toEqual(["deploys", "azure", "credit"]);
+    const now = layoutOf(board);
+    expect(now[2][0]).toBe("azure");
+    expect(now.flat().sort()).toEqual([...BOARD_IDS].sort());
+    expect(packedArrangement(3, BOARD_IDS)).toEqual(now);
     expect(heard).toHaveBeenCalledTimes(1);
     expect(board.querySelector(".admin-slot")).toBeNull();
     expect(board.classList.contains("is-sorting")).toBe(false);
-    expect(cards.deploys.classList.contains("is-dragging")).toBe(false);
-    expect(cards.deploys.style.left).toBe("");
+    expect(cards.azure.classList.contains("is-dragging")).toBe(false);
+    expect(cards.azure.style.left).toBe("");
+    needsFirst(board);
+  });
+
+  it("moves a card to any column, whatever its group", () => {
+    const { board, cards } = makeBoard(3);
+    const before = layoutOf(board);
+    const home = before.findIndex((col) => col.includes("deploys"));
+    const target = home === 0 ? 1 : 0;
+    stubLayout(board);
+    fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
+    fire(document, "pointermove", target * 310 + 50, 1500);
+    fire(document, "pointerup", target * 310 + 50, 1500);
+    const after = layoutOf(board);
+    expect(after[target].at(-1)).toBe("deploys");
+    expect(after.some((col, i) => i !== target && col.includes("deploys"))).toBe(false);
+  });
+
+  it("never drops above Needs you: index 0 of column 1 is just under it", () => {
+    const { board, cards } = makeBoard(3);
+    stubLayout(board);
+    fire(grip(cards.azure), "pointerdown", 330, 120, { button: 0 });
+    fire(document, "pointermove", 50, 5);
+    fire(document, "pointerup", 50, 5);
+    needsFirst(board);
+    expect(layoutOf(board)[0][0]).toBe("azure");
+    expect((board.children[0].children[1] as HTMLElement).dataset.card).toBe("azure");
   });
 
   it("drops into the middle of a column by the cards' middles", () => {
-    const { board, cards } = makeBoard();
+    const { board, cards } = makeBoard(3);
+    const column = layoutOf(board)[1];
+    const mover = column.at(-1) as CardId;
     stubLayout(board);
-    fire(grip(cards.box), "pointerdown", 20, 120, { button: 0 });
-    // Column two holds accounts (0 to 100) and compute (110 to 210); y 150 is past accounts' middle only.
-    fire(document, "pointermove", 400, 150);
-    fire(document, "pointerup", 400, 150);
-    expect(currentLayout(board)).toEqual([
-      ["deploys"],
-      ["accounts", "box", "compute"],
-      ["azure", "credit"],
-    ]);
+    fire(grip(cards[mover]), "pointerdown", 330, 120, { button: 0 });
+    // Column two's first card spans 0 to 100 (middle 50); y 70 is past it.
+    fire(document, "pointermove", 330 + 50, 70);
+    fire(document, "pointerup", 380, 70);
+    expect(layoutOf(board)[1].indexOf(mover)).toBe(1);
   });
 
   it("takes the keyboard into the frame, so Escape reaches a drag the page started", () => {
@@ -283,12 +338,13 @@ describe("dragging", () => {
   it("puts nothing anywhere on Escape or a cancelled pointer", () => {
     const { board, cards } = makeBoard();
     stubLayout(board);
+    const before = layoutOf(board);
     fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
     fire(document, "pointermove", 700, 10);
     document.dispatchEvent(
       new KeyboardEvent("keydown", { key: "Escape", bubbles: true, cancelable: true }),
     );
-    expect(currentLayout(board)).toEqual(shown(3));
+    expect(layoutOf(board)).toEqual(before);
     expect(hasArrangement()).toBe(false);
     expect(board.querySelector(".admin-slot")).toBeNull();
     expect(cards.deploys.classList.contains("is-dragging")).toBe(false);
@@ -296,13 +352,12 @@ describe("dragging", () => {
     fire(document, "pointercancel");
     expect(hasArrangement()).toBe(false);
     expect(board.querySelector(".admin-slot")).toBeNull();
-    // After a finished drag the document no longer follows the pointer.
     fire(document, "pointermove", 700, 10);
     expect(cards.deploys.style.left).toBe("");
   });
 
   it("ignores a secondary button, a press off the grip, and a one column board", () => {
-    const { board, cards } = makeBoard();
+    const { board, cards, attention } = makeBoard();
     stubLayout(board);
     fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 2 });
     expect(board.querySelector(".admin-slot")).toBeNull();
@@ -310,7 +365,7 @@ describe("dragging", () => {
       button: 0,
     });
     expect(board.querySelector(".admin-slot")).toBeNull();
-    arrange(board, cards, 1);
+    arrange(board, cards, 1, false, attention);
     fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
     expect(board.querySelector(".admin-slot")).toBeNull();
   });
@@ -328,76 +383,85 @@ describe("the keyboard", () => {
   const press = (target: Element, key: string) =>
     target.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true }));
 
-  it("moves a card with the arrow keys, keeps the focus on its grip, and saves", () => {
-    const { board, cards } = makeBoard();
-    const first = grip(cards.deploys);
-    first.focus();
-    press(first, "ArrowDown");
-    expect(currentLayout(board)[0]).toEqual(["box", "deploys"]);
-    expect(document.activeElement).toBe(grip(cards.deploys));
-    press(grip(cards.deploys), "ArrowRight");
-    expect(currentLayout(board)).toEqual([
-      ["box"],
-      ["accounts", "deploys", "compute"],
-      ["azure", "credit"],
-    ]);
-    expect(arrangement(3, LAYOUTS, IDS)[0]).toEqual(["box"]);
-    // A move that goes nowhere changes nothing and is not saved again.
+  it("moves a card left and right across the whole board, keeps the focus on its grip, and saves", () => {
+    const { board, cards } = makeBoard(3);
+    const start = layoutOf(board);
+    const id = start[1][0];
+    const g = grip(cards[id]);
+    g.focus();
+    press(g, "ArrowLeft");
+    expect(layoutOf(board)[0]).toContain(id);
+    expect(layoutOf(board)[0][0]).toBe(id);
+    expect(document.activeElement).toBe(grip(cards[id]));
+    needsFirst(board);
+    press(grip(cards[id]), "ArrowRight");
+    press(grip(cards[id]), "ArrowRight");
+    expect(layoutOf(board)[2]).toContain(id);
+    expect(packedArrangement(3, BOARD_IDS)).toEqual(layoutOf(board));
+  });
+
+  it("moves a card up and down inside its column", () => {
+    const { board, cards } = makeBoard(3);
+    const col = layoutOf(board)[1];
+    press(grip(cards[col[0]]), "ArrowDown");
+    expect(layoutOf(board)[1].slice(0, 2)).toEqual([col[1], col[0]]);
+  });
+
+  it("does nothing at the edges: nothing goes above Needs you, left of column 1 or right of the last", () => {
+    const { board, cards } = makeBoard(3);
     const heard = vi.fn();
     onLayoutChange(heard);
-    press(grip(cards.azure), "ArrowRight");
+    const first = layoutOf(board)[0][0];
+    press(grip(cards[first]), "ArrowUp");
+    press(grip(cards[first]), "ArrowLeft");
+    const last = layoutOf(board)[2].at(-1) as CardId;
+    press(grip(cards[last]), "ArrowRight");
+    press(grip(cards[last]), "ArrowDown");
+    press(grip(cards[last]), "a");
     expect(heard).not.toHaveBeenCalled();
-    press(grip(cards.azure), "a");
-    expect(heard).not.toHaveBeenCalled();
+    needsFirst(board);
   });
 });
 
 describe("a saved arrangement on the board", () => {
   it("is laid out when it loads after the page, and again after a reset", async () => {
     const { board } = makeBoard();
-    expect(currentLayout(board)).toEqual(shown(3));
-    const saved = { "3": [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]] };
-    await loadBoardLayout(storageContext(saved).context);
-    expect(currentLayout(board)[0]).toEqual(["box"]);
+    expect(layoutOf(board)).toEqual(packed(3));
+    const rest = BOARD_IDS.filter((id) => id !== "azure");
+    await loadBoardLayout(storageContext({ "3": [["azure"], rest, []] }).context);
+    expect(layoutOf(board)).toEqual([["azure"], rest, []]);
     resetArrangement();
-    expect(currentLayout(board)).toEqual(shown(3));
+    expect(layoutOf(board)).toEqual(packed(3));
   });
 
-  it("keeps two and three columns apart", () => {
-    const { board, cards } = makeBoard(3);
-    setArrangement(3, [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]]);
-    arrange(board, cards, 2);
-    expect(currentLayout(board)).toEqual(shown(2));
+  it("keeps each column count apart", () => {
+    const { board, cards, attention } = makeBoard(3);
+    setArrangement(3, [["azure"], ["compute", "credit"], []]);
+    arrange(board, cards, 2, false, attention);
+    expect(layoutOf(board)).toEqual(packed(2));
+    arrange(board, cards, 4, false, attention);
+    expect(layoutOf(board)).toEqual(packed(4));
   });
 });
 
 describe("Reset layout", () => {
-  it("shows only while something is saved and the board has columns", () => {
-    const { board, cards } = makeBoard();
+  it("shows only while something is saved for the column count, and clears every count", () => {
+    const { board, cards, attention } = makeBoard();
     const node = layoutResetButton(board);
     document.body.appendChild(node);
     expect(node.hidden).toBe(true);
-    setArrangement(3, [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]]);
+    setArrangement(3, [["azure"], ["compute", "credit"], []]);
     expect(node.hidden).toBe(false);
-    arrange(board, cards, 1);
+    arrange(board, cards, 1, false, attention);
     expect(node.hidden).toBe(true);
-    arrange(board, cards, 3);
+    arrange(board, cards, 2, false, attention);
+    expect(node.hidden).toBe(true);
+    arrange(board, cards, 3, false, attention);
     expect(node.hidden).toBe(false);
     node.click();
     expect(hasArrangement()).toBe(false);
     expect(node.hidden).toBe(true);
-    expect(currentLayout(board)).toEqual(shown(3));
-  });
-
-  it("shows only for a column count that has its own arrangement", () => {
-    const { board, cards } = makeBoard();
-    const node = layoutResetButton(board);
-    document.body.appendChild(node);
-    setArrangement(3, [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]]);
-    arrange(board, cards, 2);
-    expect(node.hidden).toBe(true);
-    arrange(board, cards, 3);
-    expect(node.hidden).toBe(false);
+    expect(layoutOf(board)).toEqual(packed(3));
   });
 });
 
@@ -425,38 +489,37 @@ const cardsIn = (board: HTMLElement) => [...board.querySelectorAll<HTMLElement>(
 
 describe("a drag that the board outlives", () => {
   it("is cancelled, not committed, when the columns are rebuilt under it", () => {
-    const { board, cards } = makeBoard();
+    const { board, cards, attention } = makeBoard();
     stubLayout(board);
     fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
     fire(document, "pointermove", 700, 10);
     // A breakpoint: two columns replace three while the card is lifted.
-    arrange(board, cards, 2);
+    arrange(board, cards, 2, false, attention);
     expect(board.querySelector(".admin-slot")).toBeNull();
     expect(board.classList.contains("is-sorting")).toBe(false);
     expect(cards.deploys.classList.contains("is-dragging")).toBe(false);
     expect(cards.deploys.style.left).toBe("");
     fire(document, "pointerup", 700, 10);
     expect(hasArrangement()).toBe(false);
-    // Every card is on the board exactly once.
-    expect(cardsIn(board)).toHaveLength(6);
-    expect(new Set(cardsIn(board)).size).toBe(6);
-    expect(currentLayout(board)).toEqual(shown(2));
+    expect(cardsIn(board)).toHaveLength(BOARD_IDS.length);
+    expect(new Set(cardsIn(board)).size).toBe(BOARD_IDS.length);
+    expect(layoutOf(board)).toEqual(packed(2));
   });
 
   it("goes on when the board only reflows at the same column count", () => {
-    const { board, cards } = makeBoard();
+    const { board, cards, attention } = makeBoard();
     stubLayout(board);
     fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
     fire(document, "pointermove", 700, 10);
-    // A scrollbar narrowing the page: nothing is rebuilt, so no event fires.
     const heard = vi.fn();
     board.addEventListener("admin-arranged", heard);
-    arrange(board, cards, 3);
+    arrange(board, cards, 3, false, attention);
     expect(heard).not.toHaveBeenCalled();
     expect(board.querySelector(".admin-slot")).not.toBeNull();
     expect(cards.deploys.classList.contains("is-dragging")).toBe(true);
     fire(document, "pointerup", 700, 10);
-    expect(arrangement(3, LAYOUTS, IDS)[2]).toEqual(["deploys", "azure", "credit"]);
+    expect(layoutOf(board)[2][0]).toBe("deploys");
+    expect(hasArrangement(3)).toBe(true);
   });
 
   it("ignores an arrow key pressed during a pointer drag", () => {
@@ -476,13 +539,13 @@ describe("a drag that the board outlives", () => {
     stubLayout(board);
     fire(grip(cards.deploys), "pointerdown", 20, 20, { button: 0 });
     fire(document, "pointermove", 700, 10);
-    const saved = { "3": [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]] };
-    await loadBoardLayout(storageContext(saved).context);
+    const rest = BOARD_IDS.filter((id) => id !== "azure");
+    await loadBoardLayout(storageContext({ "3": [["azure"], rest, []] }).context);
     expect(board.querySelector(".admin-slot")).toBeNull();
     expect(cards.deploys.classList.contains("is-dragging")).toBe(false);
     fire(document, "pointerup", 700, 10);
-    expect(currentLayout(board)[0]).toEqual(["box"]);
-    expect(cardsIn(board)).toHaveLength(6);
+    expect(layoutOf(board)[0]).toEqual(["azure"]);
+    expect(cardsIn(board)).toHaveLength(BOARD_IDS.length);
   });
 
   it("is cancelled when the board is stopped", () => {
@@ -502,25 +565,26 @@ describe("one pointer at a time", () => {
   it("ignores another finger's move, drop and cancel, and a second grip pressed meanwhile", () => {
     const { board, cards } = makeBoard();
     stubLayout(board);
+    const home = layoutOf(board).findIndex((col) => col.includes("deploys"));
     firePointer(grip(cards.deploys), "pointerdown", 1, 20, 20, { button: 0 });
     const slot = board.querySelector(".admin-slot") as HTMLElement;
-    expect(slot.parentElement).toBe(board.children[0]);
-    // A second finger moves over the third column, and presses another grip.
-    firePointer(document, "pointermove", 2, 700, 10);
-    expect(slot.parentElement).toBe(board.children[0]);
+    expect(slot.parentElement).toBe(board.children[home]);
+    // A second finger moves over another column, and presses another grip.
+    const other = home === 2 ? 1 : 2;
+    firePointer(document, "pointermove", 2, other * 310 + 50, 10);
+    expect(slot.parentElement).toBe(board.children[home]);
     firePointer(grip(cards.azure), "pointerdown", 2, 700, 20, { button: 0 });
     expect(board.querySelectorAll(".admin-slot")).toHaveLength(1);
     expect(cards.azure.classList.contains("is-dragging")).toBe(false);
-    // It lifts and drops without ending the first finger's drag.
     firePointer(document, "pointerup", 2, 700, 10);
     firePointer(document, "pointercancel", 2);
     expect(cards.deploys.classList.contains("is-dragging")).toBe(true);
     expect(hasArrangement()).toBe(false);
     // The first finger still drives it.
-    firePointer(document, "pointermove", 1, 700, 10);
-    expect(slot.parentElement).toBe(board.children[2]);
-    firePointer(document, "pointerup", 1, 700, 10);
-    expect(currentLayout(board)[2]).toEqual(["deploys", "azure", "credit"]);
+    firePointer(document, "pointermove", 1, other * 310 + 50, 10);
+    expect(slot.parentElement).toBe(board.children[other]);
+    firePointer(document, "pointerup", 1, other * 310 + 50, 10);
+    expect(layoutOf(board)[other]).toContain("deploys");
   });
 });
 
@@ -530,14 +594,11 @@ describe("a keyboard move is said aloud", () => {
     const live = board.nextElementSibling as HTMLElement;
     expect(live.getAttribute("role")).toBe("status");
     expect(live.classList.contains("sr-only")).toBe(true);
-    grip(cards.deploys).dispatchEvent(
-      new KeyboardEvent("keydown", { key: "ArrowDown", bubbles: true, cancelable: true }),
+    const id = layoutOf(board)[1][0];
+    grip(cards[id]).dispatchEvent(
+      new KeyboardEvent("keydown", { key: "ArrowLeft", bubbles: true, cancelable: true }),
     );
-    expect(live.textContent).toBe("deploys moved to column 1, position 2.");
-    grip(cards.deploys).dispatchEvent(
-      new KeyboardEvent("keydown", { key: "ArrowRight", bubbles: true, cancelable: true }),
-    );
-    expect(live.textContent).toBe("deploys moved to column 2, position 2.");
+    expect(live.textContent).toBe(`${id} moved to column 1, position 1.`);
   });
 });
 
@@ -549,20 +610,16 @@ describe("a change made before the stored arrangement arrives", () => {
     const context = { storage: { user: { get, set } } } as unknown as ExtensionContext;
     return { context, set, release: (value: unknown) => release(value) };
   }
-  const mine = [["box"], ["deploys", "accounts", "compute"], ["azure", "credit"]] as CardId[][];
+  const mine = [["azure"], ["compute", "credit"], []] as CardId[][];
 
   it("wins over what the read returns, for its own column count only", async () => {
     const { context, set, release } = slowStorage();
     const loading = loadBoardLayout(context);
     setArrangement(3, mine);
-    release({
-      "3": [["credit"], ["accounts", "compute"], ["box", "deploys", "azure"]],
-      "2": [["box"], ["deploys"]],
-    });
+    release({ "3": [["credit"], ["azure"], ["compute"]], "2": [["azure", "credit"], ["compute"]] });
     await loading;
-    expect(arrangement(3, LAYOUTS, IDS)[0]).toEqual(["box"]);
-    // Two columns were not touched, so the stored arrangement applies there.
-    expect(arrangement(2, LAYOUTS, IDS)[0][0]).toBe("box");
+    expect(packedArrangement(3, ["azure", "compute", "credit"])[0]).toEqual(["azure"]);
+    expect(packedArrangement(2, ["azure", "compute", "credit"])[0]).toEqual(["azure", "credit"]);
     expect(set).toHaveBeenLastCalledWith(LAYOUT_KEY, expect.objectContaining({ "3": mine }));
   });
 
@@ -570,7 +627,7 @@ describe("a change made before the stored arrangement arrives", () => {
     const { context, release } = slowStorage();
     const loading = loadBoardLayout(context);
     resetArrangement();
-    release({ "3": mine, "2": [["box"], ["deploys"]] });
+    release({ "3": mine, "2": [["azure", "credit"], ["compute"]] });
     await loading;
     expect(hasArrangement()).toBe(false);
   });

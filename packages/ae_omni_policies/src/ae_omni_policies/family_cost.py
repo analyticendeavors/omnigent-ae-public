@@ -596,7 +596,12 @@ class Sweeper:
                 "cache_read": int(sums[3]),
                 "total": int(total),
             },
-            "today": {"cost_usd": round(today[0], 4), "tokens_total": int(sum(today[1:]))},
+            "today": {
+                "cost_usd": round(today[0], 4),
+                "tokens_total": int(sum(today[1:])),
+                # The token flag skips cache reads: a long chat re-reads its context every turn.
+                "flag_tokens": int(today[1] + today[2]),
+            },
             "by_role": sorted(
                 (
                     {
@@ -669,7 +674,9 @@ def build_answer(
         if not admin and (viewer is None or fam.get("owner") != viewer):
             continue
         today = fam["today"]
-        over_tokens = runaway_tokens > 0 and today["tokens_total"] >= runaway_tokens
+        # A snapshot written before "flag_tokens" existed falls back to the full total.
+        flag_tokens = today.get("flag_tokens", today["tokens_total"])
+        over_tokens = runaway_tokens > 0 and flag_tokens >= runaway_tokens
         over_usd = runaway_usd > 0 and today["cost_usd"] >= runaway_usd
         rows.append({**fam, "flagged": over_tokens or over_usd})
     rows.sort(key=lambda f: -(f["cost_usd"] if dollars else f["tokens"]["total"]))

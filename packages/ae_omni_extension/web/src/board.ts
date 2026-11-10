@@ -38,6 +38,20 @@
 // tile heads the card's folded line, so a hot or full box unfolds the card on a phone.
 // A box admin who is not an OmniGent admin gets a board of that one card (fabric.ts),
 // and its grip and the Reset layout button have nothing to move.
+// 2026-11-06 (phase 4 of the redesign): the cards sit under four group headings, Ship, Box,
+// Cloud and Accounts, the same four as the status pills (tiles.ts DOMAINS, whose `cards` list is the
+// one source of which group a card is in). Why: the pills said "Cloud" but the cards under it were
+// scattered, so a click on a pill had no place to land. Each group is a heading over the same n
+// column stacks, so card widths line up from group to group; a card moves only inside its group
+// (boardDrag.ts), and the saved arrangement is per group (boardLayout.ts). An integration the
+// server says is not configured (Tile.notSetUp) leaves the board and is named in one line at the
+// end; a group left with no card draws no heading. A box admin's one-card board has no groups.
+// 2026-11-07: the Decision model card (decision.ts) joined the Cloud group, after Key Vault.
+// 2026-11-07 (packed board): from two columns up the group sections are gone. Needs you is the first
+// tile of column 1 and every card goes into the shortest column by its guessed height, each with a
+// small group tag; a fourth column starts at 1,720 px. Why: the owner said "UI still seems to waste
+// a ton here" at 16:9 and 4:3; the sections left holes and an empty half beside Needs you. The
+// arrangement is saved per column count for the whole board (boardLayout.ts); a phone is unchanged.
 // The width comes from a ResizeObserver on the page (the window's resize where
 // there is none); moving a card keeps the focus on the control that had it.
 //
@@ -48,49 +62,52 @@
 // they need attention (a tile amber or red: the host not connected, a secret
 // missing). On a wider page every card is open and the header is not a toggle.
 
-import { arrangement, type Defaults, onLayoutChange } from "./boardLayout";
+import { type Layout, onLayoutChange, packedArrangement } from "./boardLayout";
 import { enableDrag } from "./boardDrag";
 import { type Child, el } from "./dom";
-import { foldIcon, gripIcon } from "./icons";
+import { cardGone, cardHidden, CARD_TILES, getCards, onCardState } from "./cardState";
+import { foldIcon, gripIcon, settingsIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
-import { getTile, type Health, onTiles, type TileId, worst } from "./tiles";
+import { DOMAINS, type DomainId, getTile, type Health, onTiles, worst } from "./tiles";
 
-export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets";
+export type CardId = "deploys" | "accounts" | "compute" | "credit" | "azure" | "box" | "vault" | "git" | "presets" | "social" | "decision" | "home-security";
 
 /** The cards a board holds; a box admin's page holds only the Box health card. */
 export type CardSet = Partial<Record<CardId, HTMLElement>>;
 
+export const FOUR_COLUMNS_PX = 1720;
 export const THREE_COLUMNS_PX = 1040;
 export const TWO_COLUMNS_PX = 520;
 
-/** The cards in each column, by column count. */
-export const LAYOUTS: Defaults = {
-  3: [
-    ["deploys", "presets", "box", "vault"],
-    ["accounts", "compute"],
-    ["azure", "credit", "git"],
-  ],
-  2: [
-    ["deploys", "presets", "box", "compute", "git"],
-    ["accounts", "azure", "credit", "vault"],
-  ],
-  1: [["deploys", "presets", "accounts", "compute", "credit", "azure", "box", "vault", "git"]],
+/** The cards in each group on a phone (one column); wider pages pack the board instead. */
+export const GROUP_LAYOUTS: Record<1, Record<DomainId, Layout>> = {
+  1: {
+    ship: [["deploys", "git", "social"]],
+    box: [["box", "home-security"]],
+    cloud: [["compute", "credit", "azure", "vault", "decision"]],
+    money: [["accounts", "presets"]],
+  },
 };
 
-/** The tiles whose health and values a card's folded header line carries. */
-export const CARD_TILES: Record<CardId, TileId[]> = {
-  deploys: ["hold", "release"],
-  accounts: ["accounts"],
-  compute: ["fabric", "databricks"],
-  credit: ["credit"],
-  azure: ["azure"],
-  box: ["boxhealth", "host", "secrets"],
-  vault: ["vault"],
-  git: ["git"],
-  presets: ["presets", "family"],
-};
+/** The group a card is in (tiles.ts DOMAINS.cards). */
+export function groupOf(id: CardId): DomainId {
+  return DOMAINS.find((domain) => domain.cards.includes(id))?.id ?? "ship";
+}
 
-export function columnsFor(width: number): 1 | 2 | 3 {
+const domainLabel = (group: DomainId): string => DOMAINS.find((d) => d.id === group)?.label ?? group;
+
+/** True when the server said every integration behind a card is not configured (Tile.notSetUp). */
+export function cardNotSetUp(id: CardId): boolean {
+  return CARD_TILES[id].every((tile) => getTile(tile)?.notSetUp === true);
+}
+
+export { CARD_TILES };
+
+/** The event a card's gear raises (bubbles); fabric.ts opens the Cards panel at that card. */
+export const CARD_SETTINGS_EVENT = "admin-card-settings";
+
+export function columnsFor(width: number): 1 | 2 | 3 | 4 {
+  if (width >= FOUR_COLUMNS_PX) return 4;
   if (width >= THREE_COLUMNS_PX) return 3;
   return width >= TWO_COLUMNS_PX ? 2 : 1;
 }
@@ -193,14 +210,32 @@ export function adminCard(
     "aria-label": `Move ${title}. Drag, or use the arrow keys.`,
   });
   grip.appendChild(gripIcon());
+  // The gear opens the Cards panel at this card (2026-11-07); the board needs no context, so it
+  // only raises an event that fabric.ts listens for.
+  const gear = el("button", {
+    type: "button",
+    class: "admin-gear",
+    title: "Card settings",
+    "aria-label": `Settings for ${title}`,
+  });
+  gear.appendChild(settingsIcon(16));
+  gear.addEventListener("click", () => {
+    gear.dispatchEvent(new CustomEvent(CARD_SETTINGS_EVENT, { bubbles: true, detail: id }));
+  });
   const node = el(
     "section",
-    { class: `admin-card admin-card-${id}`, "data-card": id, "aria-labelledby": `admin-${id}-h` },
+    {
+      class: `admin-card admin-card-${id}`,
+      "data-card": id,
+      "data-group": groupOf(id),
+      "aria-labelledby": `admin-${id}-h` },
+    el("span", { class: "admin-card-tag" }, domainLabel(groupOf(id))),
     el(
       "header",
       { class: "admin-card-top" },
-      el("h2", { class: "admin-card-h", id: `admin-${id}-h` }, toggle),
+      el("h3", { class: "admin-card-h", id: `admin-${id}-h` }, toggle),
       ...extra,
+      gear,
       grip,
     ),
     el("div", { class: "admin-card-body", id: `admin-${id}-body` }, ...body),
@@ -210,8 +245,34 @@ export function adminCard(
     if (board?.dataset.columns !== "1") return;
     setOpen(storageId(id), node.classList.contains("is-folded"));
     applyFold(node, true);
+    pairShelf(board);
   });
   return node;
+}
+
+/**
+ * The two-up shelf (phone option 2, 2026-11-07): in a one-column stack, runs of two or more folded
+ * cards in a row are marked `is-half` in pairs, so each pair sits side by side. A run of three
+ * pairs its first two; an odd last card stays full width. Wider layouts have no halves.
+ */
+export function pairShelf(board: HTMLElement): void {
+  const one = board.dataset.columns === "1";
+  for (const col of board.querySelectorAll<HTMLElement>(".admin-col")) {
+    const run: HTMLElement[] = [];
+    const flush = () => {
+      for (let i = 0; i + 1 < run.length; i += 2) {
+        run[i].classList.add("is-half");
+        run[i + 1].classList.add("is-half");
+      }
+      run.length = 0;
+    };
+    for (const card of col.querySelectorAll<HTMLElement>(":scope > .admin-card")) {
+      card.classList.remove("is-half");
+      if (one && card.classList.contains("is-folded")) run.push(card);
+      else flush();
+    }
+    flush();
+  }
 }
 
 /** Fold or open one card for the current layout. */
@@ -249,26 +310,154 @@ function applyFold(card: HTMLElement, phone: boolean): void {
  * only a rebuild takes its column away. A tile changing health does not come
  * through here (mountBoard refolds), only a width change does.
  */
+/** The title a card shows, for the footer line. */
+const titleOf = (cards: CardSet, id: CardId): string =>
+  cards[id]?.querySelector(".admin-card-title")?.textContent ?? id;
+
+function shortDate(iso: string | null): string {
+  const when = iso ? new Date(iso) : null;
+  return when && !Number.isNaN(when.getTime())
+    ? when.toLocaleDateString(undefined, { month: "short", day: "numeric" })
+    : "";
+}
+
+/**
+ * The line under the board (2026-11-07): "Turned off: Social (by <login>, Nov 7). Hidden for you:
+ * Spend. Not set up on this server: Key Vault." Each part shows only when it has cards, and a
+ * "Cards settings" button opens the panel. Hidden when no part has cards.
+ */
+export function footerNote(cards: CardSet): HTMLElement {
+  const ids = Object.keys(cards) as CardId[];
+  const rows = getCards()?.cards ?? [];
+  // Only a card with a row in the answer is "turned off": one the answer does not list (a private
+  // card this server never named) leaves the board without being mentioned.
+  const off = ids.filter((id) => rows.some((r) => r.id === id && !r.on));
+  const hiddenIds = ids.filter((id) => cardHidden(id) && !off.includes(id));
+  const notSet = ids.filter((id) => !cardGone(id) && cardNotSetUp(id));
+  const offText = off.map((id) => {
+    const row = rows.find((r) => r.id === id);
+    const day = shortDate(row?.changed_at ?? null);
+    const by = row?.changed_by ? ` (by ${row.changed_by}${day ? `, ${day}` : ""})` : "";
+    return `${titleOf(cards, id)}${by}`;
+  });
+  const parts = [
+    offText.length ? `Turned off: ${offText.join(", ")}.` : "",
+    hiddenIds.length ? `Hidden for you: ${hiddenIds.map((id) => titleOf(cards, id)).join(", ")}.` : "",
+    notSet.length ? `Not set up on this server: ${notSet.map((id) => titleOf(cards, id)).join(", ")}.` : "",
+  ].filter(Boolean);
+  const settings = el(
+    "button",
+    {
+      type: "button",
+      class: "btn btn-quiet admin-notset-open",
+      title: "Open the Cards panel to turn cards on or off, hide one for yourself, or see how to set one up",
+    },
+    "Cards settings",
+  );
+  settings.addEventListener("click", () => {
+    settings.dispatchEvent(new CustomEvent(CARD_SETTINGS_EVENT, { bubbles: true, detail: null }));
+  });
+  const note = el("p", { class: "admin-notset" }, `${parts.join(" ")} `, settings);
+  note.hidden = parts.length === 0;
+  return note;
+}
+
 export function arrange(
   board: HTMLElement,
   cards: CardSet,
-  n: 1 | 2 | 3,
+  n: 1 | 2 | 3 | 4,
   force = false,
+  attention?: HTMLElement,
 ): void {
   const rebuilt = force || board.dataset.columns !== String(n);
   if (rebuilt) {
     const focused = document.activeElement as HTMLElement | null;
-    const known = Object.keys(cards) as CardId[];
-    const columns = arrangement(n, LAYOUTS, known).map((ids) =>
-      el("div", { class: "admin-col" }, ...ids.map((id) => cards[id])),
+    const inAttention = !!focused && !!attention?.contains(focused);
+    const wasInside = !!focused && board.contains(focused) && !inAttention;
+    const here = (Object.keys(cards) as CardId[]).filter(
+      (id) => !cardNotSetUp(id) && !cardGone(id),
     );
-    board.replaceChildren(...columns);
+    const refocus = (note: HTMLElement) => {
+      if (wasInside && focused && !board.contains(focused)) {
+        // The old footer or card is gone: the new footer takes the focus, or the board when it
+        // is hidden (nothing is left unset), so it never falls back to the page body.
+        note.tabIndex = -1;
+        if (!note.hidden) note.focus({ preventScroll: true });
+        else {
+          board.tabIndex = -1;
+          board.focus({ preventScroll: true });
+        }
+      }
+    };
+    if (board.dataset.single !== undefined) {
+      // A box admin's board: n columns, the card in the first, no groups (2026-11-06).
+      const columns = Array.from({ length: n }, (_, at) =>
+        el("div", { class: "admin-col" }, ...(at === 0 ? here.map((id) => cards[id]) : [])),
+      );
+      board.replaceChildren(...columns);
+    } else if (n !== 1) {
+      // Packed (2026-11-07): n column stacks, Needs you first in column 1, then the footer.
+      const order = DOMAINS.flatMap((domain) => domain.cards.filter((id): id is CardId => here.includes(id as CardId)));
+      for (const id of here) if (!order.includes(id)) order.push(id);
+      const columns = packedArrangement(n, order).map((ids, at) =>
+        el(
+          "div",
+          { class: "admin-col" },
+          ...(at === 0 && attention ? [attention] : []),
+          ...ids.map((id) => cards[id]),
+        ),
+      );
+      const note = footerNote(cards);
+      board.replaceChildren(...columns, note);
+      board.dataset.packed = "";
+      refocus(note);
+    } else {
+      // A phone: the group sections as before, and Needs you right before the board.
+      if (attention && attention.nextElementSibling !== board) board.before(attention);
+      const sections: HTMLElement[] = [];
+      for (const domain of DOMAINS) {
+        const known = here.filter((id) => groupOf(id) === domain.id);
+        if (!known.length) continue;
+        const columns = GROUP_LAYOUTS[1][domain.id]
+          .map((ids) => ids.filter((id) => known.includes(id)))
+          .filter((ids) => ids.length > 0)
+          .map((ids) => el("div", { class: "admin-col" }, ...ids.map((id) => cards[id])));
+        const groupNode = el(
+          "section",
+          { class: "admin-group", "data-group": domain.id },
+          el(
+            "h2",
+            { class: "admin-group-h" },
+            domain.icon(),
+            domain.label,
+            el("span", { class: "admin-group-line" }),
+          ),
+          el("div", { class: "admin-group-cols" }, ...columns),
+        );
+        // It spans (and divides into) only its own columns; the board packs the rest around it.
+        groupNode.style.gridColumn = `span ${columns.length}`;
+        (groupNode.querySelector(".admin-group-cols") as HTMLElement).style.setProperty(
+          "--cols",
+          String(columns.length),
+        );
+        sections.push(groupNode);
+      }
+      const note = footerNote(cards);
+      board.replaceChildren(...sections, note);
+      delete board.dataset.packed;
+      refocus(note);
+    }
     board.dataset.columns = String(n);
-    if (focused && focused !== document.activeElement && board.contains(focused)) {
+    if (
+      focused &&
+      focused !== document.activeElement &&
+      (board.contains(focused) || !!attention?.contains(focused))
+    ) {
       focused.focus({ preventScroll: true });
     }
   }
   for (const card of Object.values(cards)) applyFold(card, n === 1);
+  pairShelf(board);
   // The Reset layout button shows or hides with the column count (fabric.ts).
   if (rebuilt) board.dispatchEvent(new Event("admin-arranged"));
 }
@@ -283,19 +472,34 @@ export function mountBoard(
   page: HTMLElement,
   board: HTMLElement,
   cards: CardSet,
+  attention?: HTMLElement,
 ): { stop: () => void; refold: () => void } {
   let width = page.clientWidth || window.innerWidth;
-  const layout = (force = false) => arrange(board, cards, columnsFor(width), force);
+  const notSet = () =>
+    (Object.keys(cards) as CardId[]).filter((id) => cardNotSetUp(id) || cardGone(id)).sort().join(",");
+  let lastNotSet = notSet();
+  const layout = (force = false) => {
+    lastNotSet = notSet();
+    arrange(board, cards, columnsFor(width), force, attention);
+  };
   const refold = () => {
     for (const card of Object.values(cards)) applyFold(card, board.dataset.columns === "1");
+    pairShelf(board);
   };
   layout();
-  const stopTiles = onTiles(refold);
+  // A card that becomes (or stops being) not set up joins or leaves the board; anything else refolds.
+  const stopTiles = onTiles(() => {
+    if (notSet() !== lastNotSet) layout(true);
+    else refold();
+  });
   const stopLayout = onLayoutChange(() => layout(true));
+  // A card turned off, switched back on, hidden or shown joins or leaves the board (2026-11-07).
+  const stopCards = onCardState(() => layout(true));
   const stopDrag = enableDrag(board, cards);
   const stopAll = () => {
     stopTiles();
     stopLayout();
+    stopCards();
     stopDrag();
   };
   if (typeof ResizeObserver !== "undefined") {

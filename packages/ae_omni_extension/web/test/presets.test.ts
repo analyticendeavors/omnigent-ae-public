@@ -436,6 +436,47 @@ describe("review round 1", () => {
     expect(getTile("presets")?.health).toBe("attention");
   });
 
+  it("says refreshing, not failing, while the server computes (2026-11-07)", async () => {
+    const old = new Date(NOW - STALE_MS - 60_000).toISOString();
+    const view = { ...answer(), asOf: old, refreshing: true };
+    expect(updatedText(view, NOW)).toMatch(/, refreshing$/);
+    expect(updatedText(view, NOW)).not.toContain("refresh failing");
+    const tile = presetsTile(view, null, 30, NOW);
+    expect(tile.health).toBe("ok");
+    expect(tile.note).toContain("refreshing");
+    expect(tile.note).not.toContain("refresh failing");
+    const plain = presetsTile({ ...answer(), asOf: old }, null, 30, NOW);
+    expect(plain.health).toBe("attention");
+    expect(plain.note).toContain("refresh failing");
+  });
+
+  it("polls fast while the answer is refreshing (2026-11-07)", async () => {
+    const { context, request } = stubContext([
+      ok(answer({ refreshing: true })),
+      ok(answer()),
+    ]);
+    await mount(context);
+    expect(request).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(WARMING_POLL_MS);
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("drops back to the normal rate after a failed poll while refreshing (2026-11-07)", async () => {
+    const { context, request } = stubContext([
+      ok(answer({ refreshing: true })),
+      failed(502, "x", "server down"),
+      ok(answer()),
+    ]);
+    await mount(context);
+    await vi.advanceTimersByTimeAsync(WARMING_POLL_MS);
+    expect(request).toHaveBeenCalledTimes(2);
+    // The failed poll keeps the last answer and its flag: the next poll waits the full minute.
+    await vi.advanceTimersByTimeAsync(WARMING_POLL_MS * 2);
+    expect(request).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(request).toHaveBeenCalledTimes(3);
+  });
+
   it("shows no time at all without an asOf", async () => {
     expect(updatedText(answer({ asOf: null }), NOW)).toBe("");
     expect(updatedText(answer({ asOf: "garbage" }), NOW)).toBe("");

@@ -37,6 +37,20 @@ scan after a server start, and a card never read, are awaited. ``fresh=true``
 still awaits a scan (a merge and the MCP ``list_prs`` tool rely on it). A
 card on the list can be up to :data:`CARD_TTL_S` plus one poll old, which is
 safe because Merge re-reads the gate fresh and refuses a moved head.
+
+Settled cards keep longer (2026-11-08): the session's GitHub panel polls the
+card of every pull request in its registry every 30 seconds, merged ones
+included, and the registry keeps merged pull requests on purpose. With one
+TTL for every card, a lead session holding dozens of merged pull
+requests cost about 130 calls a minute (four per card per minute), which used
+up the token's 5,000 an hour about 40 minutes into every hour and broke every
+``gh`` call on the box that shares the token. A merged card now keeps
+:data:`MERGED_CARD_TTL_S` (finite, because the panel still shows CI, reviews
+and the title on a merged card, so a late check run or a title edit shows the
+same day) and a closed one :data:`CLOSED_CARD_TTL_S` (a reopen shows within
+that). ``fresh=true`` still reads anew. The four card reads are conditional
+(:mod:`ae_omni_policies.github`, ``If-None-Match``), so an open card that has
+not changed is answered with a 304, which does not count against the limit.
 """
 
 from __future__ import annotations
@@ -60,6 +74,9 @@ _logger = logging.getLogger(__name__)
 
 # Cards (four GitHub calls each) and the repo settings (one call), per process.
 CARD_TTL_S = 60.0
+# A settled card changes rarely; see "Settled cards keep longer" above (2026-11-08).
+MERGED_CARD_TTL_S = 6 * 3600.0
+CLOSED_CARD_TTL_S = 15 * 60.0
 REPO_TTL_S = 600.0
 # Which pull requests each session tracks; the scan is one loopback per session.
 SCAN_TTL_S = 60.0
@@ -131,6 +148,7 @@ def reset_cache() -> None:
     _card_refreshes.clear()
     _card_errors.clear()
     pr_compliance.reset_cache()
+    github.reset_etag_cache()
 
 
 def valid_repo(owner: str, repo: str) -> bool:
@@ -381,6 +399,16 @@ async def _repo_settings(client: github.GitHubClient, repo: str) -> dict[str, An
     return settings
 
 
+def _card_ttl(card: dict[str, Any]) -> float:
+    """How long *card* is served from the cache: longer once the pull request is settled."""
+    state = card.get("state")
+    if state == "merged":
+        return MERGED_CARD_TTL_S
+    if state == "closed":
+        return CLOSED_CARD_TTL_S
+    return CARD_TTL_S
+
+
 async def read_card(
     client: github.GitHubClient, repo: str, number: int, *, fresh: bool = False
 ) -> dict[str, Any]:
@@ -391,22 +419,30 @@ async def read_card(
     key = (repo.lower(), number)
     now = time.monotonic()
     held = _cards.get(key)
-    if not fresh and held is not None and now - held[0] < CARD_TTL_S:
+    if not fresh and held is not None and now - held[0] < _card_ttl(held[1]):
         return held[1]
     generation = _card_generation
-    card = await _read_card_now(client, repo, number)
+    # A fresh read (Merge, Ready, Update branch, a person's refresh) sends no ETag (2026-11-08).
+    card = await _read_card_now(client, repo, number, conditional=not fresh)
     if generation == _card_generation:
         _cards[key] = (time.monotonic(), card)
         _card_errors.pop(key, None)
     return card
 
 
-async def _read_card_now(client: github.GitHubClient, repo: str, number: int) -> dict[str, Any]:
-    """Read one card from GitHub, bypassing and not touching the card cache."""
-    pull = await client.pull(repo, number)
+async def _read_card_now(
+    client: github.GitHubClient, repo: str, number: int, *, conditional: bool = True
+) -> dict[str, Any]:
+    """Read one card from GitHub, bypassing and not touching the card cache.
+
+    *conditional* sends the stored ETags (a 304 is free); ``False`` always takes
+    GitHub's newest 200, and still stores its ETag for the next poll.
+    """
+    pull = await client.pull(repo, number, conditional=conditional)
     if pull_state(pull) == "open" and pull.get("mergeable") is None:
         await asyncio.sleep(MERGEABLE_RETRY_S)
-        pull = await client.pull(repo, number)
+        # Never a 304 here: the retry wants GitHub's newest answer (2026-11-08).
+        pull = await client.pull(repo, number, conditional=False)
     sha = str((pull.get("head") or {}).get("sha") or "")
 
     async def optional(call: Awaitable[list[dict[str, Any]]]) -> list[dict[str, Any]] | None:
@@ -416,9 +452,13 @@ async def _read_card_now(client: github.GitHubClient, repo: str, number: int) ->
             return None
 
     reviews, runs, statuses, settings = await asyncio.gather(
-        optional(client.reviews(repo, number)),
-        optional(client.check_runs(repo, sha)) if sha else asyncio.sleep(0, []),
-        optional(client.statuses(repo, sha)) if sha else asyncio.sleep(0, []),
+        optional(client.reviews(repo, number, conditional=conditional)),
+        optional(client.check_runs(repo, sha, conditional=conditional))
+        if sha
+        else asyncio.sleep(0, []),
+        optional(client.statuses(repo, sha, conditional=conditional))
+        if sha
+        else asyncio.sleep(0, []),
         _repo_settings(client, repo),
     )
     ci = ci_summary(runs or [], statuses or [])
@@ -682,7 +722,7 @@ async def open_pull_requests(
             if held is not None:
                 # Stale-while-revalidate (2026-09-26): the held card now, a
                 # fresh one on a later poll. Merge re-reads the gate fresh.
-                if time.monotonic() - held[0] >= CARD_TTL_S:
+                if time.monotonic() - held[0] >= _card_ttl(held[1]):
                     _refresh_card_later(settings, repo, number)
                 card = held[1]
                 failed = _card_errors.get(key)

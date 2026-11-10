@@ -1,0 +1,175 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 11:57:47 -0800
+Subject: [PATCH 293/333] [ae-patch] Fix the review findings on the queued
+ Compact server run
+
+A failure the page toasted was marked seen before POST /seen succeeded and /seen was never retried, so a reload after a failed /seen toasted the same failure again. aeCompactPlan.ts now remembers toasted failure ids in localStorage (every access in try/catch) and keeps polling, retrying /seen on each poll, until the server has no failure for the chat.
+---
+ web/src/lib/aeCompactPlan.test.ts | 36 +++++++++++++++++--
+ web/src/lib/aeCompactPlan.ts      | 59 +++++++++++++++++++++++++------
+ 2 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/web/src/lib/aeCompactPlan.test.ts b/web/src/lib/aeCompactPlan.test.ts
+index 33a442c0a3e6a9ade9d0c342d5ff639d3c434182..11036c09dfad951338b44b905496e772f136c505 100644
+--- a/web/src/lib/aeCompactPlan.test.ts
++++ b/web/src/lib/aeCompactPlan.test.ts
+@@ -33,7 +33,7 @@ const calls = (method: string, tail = "") =>
+     );
+ 
+ /** What the next GET answers; the test moves it like the server would. */
+-const server = { phase: null as string | null, failure: null as unknown };
++const server = { phase: null as string | null, failure: null as unknown, seenFails: false };
+ 
+ async function tick(ms = 0) {
+   await act(async () => {
+@@ -45,10 +45,16 @@ beforeEach(() => {
+   vi.useFakeTimers();
+   server.phase = null;
+   server.failure = null;
++  server.seenFails = false;
++  window.localStorage.clear();
+   vi.mocked(authenticatedFetch).mockReset();
+   vi.mocked(showToast).mockReset();
+   vi.mocked(authenticatedFetch).mockImplementation((_input, init) => {
+-    if (init?.method === "POST" && String(_input).endsWith("/seen")) return json({ ok: true });
++    if (init?.method === "POST" && String(_input).endsWith("/seen")) {
++      if (server.seenFails) return Promise.reject(new Error("offline"));
++      server.failure = null; // the server forgets a failure once it is acknowledged
++      return json({ ok: true });
++    }
+     if (init?.method === "POST") return json({ session_id: ID, phase: "queued" }, 202);
+     if (init?.method === "DELETE") return json({ session_id: ID, phase: null });
+     return json({ session_id: ID, phase: server.phase, failure: server.failure });
+@@ -123,6 +129,32 @@ describe("aeCompactPlan (thin client)", () => {
+     expect(JSON.parse(String(calls("POST", "/seen")[0]![1]?.body))).toEqual({ failure_id: "f1" });
+   });
+ 
++  it("keeps polling and retries /seen until it lands, without toasting twice", async () => {
++    server.failure = { id: "f2", message: "Compact cancelled: later.", at: 1 };
++    server.seenFails = true;
++    const first = renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    expect(showToast).toHaveBeenCalledTimes(1);
++    expect(calls("POST", "/seen")).toHaveLength(1);
++    // A reload: the page starts over, but the toasted id survives in localStorage.
++    first.unmount();
++    resetAeCompactPlans();
++    renderHook(() => useAeCompactPlan(ID));
++    await tick();
++    expect(showToast).toHaveBeenCalledTimes(1);
++    expect(calls("POST", "/seen")).toHaveLength(2);
++    // The poll goes on with no plan, and /seen is tried again; once it lands the poll stops.
++    await tick(AE_COMPACT_POLL_MS);
++    expect(calls("POST", "/seen")).toHaveLength(3);
++    server.seenFails = false;
++    await tick(AE_COMPACT_POLL_MS);
++    expect(calls("POST", "/seen")).toHaveLength(4);
++    const seen = calls("GET").length;
++    await tick(AE_COMPACT_POLL_MS * 3);
++    expect(calls("GET").length).toBeLessThanOrEqual(seen + 1);
++    expect(showToast).toHaveBeenCalledTimes(1);
++  });
++
+   it("cancel DELETEs and the phase becomes null; a 409 keeps compacting", async () => {
+     server.phase = "queued";
+     const { result } = renderHook(() => useAeCompactPlan(ID));
+diff --git a/web/src/lib/aeCompactPlan.ts b/web/src/lib/aeCompactPlan.ts
+index 73f27c74c7b1cb887c0600a00af4e6c6547be27c..a606f07935d4290f25ff0f5f2de7ef11fcec375e 100644
+--- a/web/src/lib/aeCompactPlan.ts
++++ b/web/src/lib/aeCompactPlan.ts
+@@ -16,6 +16,8 @@ export const AE_COMPACT_POLL_MS = 1500;
+ 
+ interface Entry {
+   phase: AeCompactPhase | null;
++  /** The server still holds a failure for this chat, so the poll goes on until /seen lands. */
++  failureOpen: boolean;
+   refs: number;
+   timer: ReturnType<typeof setInterval> | null;
+   toasted: Set<string>;
+@@ -31,12 +33,43 @@ interface Failure {
+ 
+ const entries = new Map<string, Entry>();
+ 
++const TOASTED_KEY = "ae.compact.toasted";
++const TOASTED_KEEP = 20;
++
++/** Failure ids already toasted in this browser, so a reload does not toast one twice. */
++function readToasted(): string[] {
++  try {
++    const raw = window.localStorage.getItem(TOASTED_KEY);
++    const parsed: unknown = raw ? JSON.parse(raw) : [];
++    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : [];
++  } catch {
++    return [];
++  }
++}
++
++function rememberToasted(id: string): void {
++  try {
++    const ids = [...readToasted().filter((v) => v !== id), id].slice(-TOASTED_KEEP);
++    window.localStorage.setItem(TOASTED_KEY, JSON.stringify(ids));
++  } catch {
++    // The page works without it; the in-memory set still stops a repeat within this load.
++  }
++}
++
+ const url = (id: string, tail = "") => `/v1/ae/sessions/${encodeURIComponent(id)}/compact${tail}`;
+ 
+ function entryFor(id: string): Entry {
+   let entry = entries.get(id);
+   if (!entry) {
+-    entry = { phase: null, refs: 0, timer: null, toasted: new Set(), rev: 0, listeners: new Set() };
++    entry = {
++      phase: null,
++      failureOpen: false,
++      refs: 0,
++      timer: null,
++      toasted: new Set(),
++      rev: 0,
++      listeners: new Set(),
++    };
+     entries.set(id, entry);
+   }
+   return entry;
+@@ -52,7 +85,7 @@ function setPhase(id: string, phase: AeCompactPhase | null): void {
+ 
+ function syncTimer(id: string): void {
+   const entry = entryFor(id);
+-  const wanted = entry.phase !== null && entry.refs > 0;
++  const wanted = (entry.phase !== null || entry.failureOpen) && entry.refs > 0;
+   if (wanted && entry.timer === null) {
+     entry.timer = setInterval(() => void refresh(id), AE_COMPACT_POLL_MS);
+   } else if (!wanted && entry.timer !== null) {
+@@ -81,17 +114,23 @@ async function refresh(id: string): Promise<void> {
+     return;
+   }
+   if (entryFor(id).rev !== rev) return;
++  const failure = body.failure ?? null;
++  entryFor(id).failureOpen = failure !== null;
+   setPhase(id, body.phase ?? null);
+-  const failure = body.failure;
+-  if (failure && !entryFor(id).toasted.has(failure.id)) {
+-    entryFor(id).toasted.add(failure.id);
++  syncTimer(id);
++  if (!failure) return;
++  const entry = entryFor(id);
++  if (!entry.toasted.has(failure.id) && !readToasted().includes(failure.id)) {
+     showToast(failure.message);
+-    authenticatedFetch(url(id, "/seen"), {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json" },
+-      body: JSON.stringify({ failure_id: failure.id }),
+-    }).catch(() => undefined);
+   }
++  entry.toasted.add(failure.id);
++  rememberToasted(failure.id);
++  // Until /seen lands the server keeps the failure, so every poll tries again.
++  authenticatedFetch(url(id, "/seen"), {
++    method: "POST",
++    headers: { "Content-Type": "application/json" },
++    body: JSON.stringify({ failure_id: failure.id }),
++  }).catch(() => undefined);
+ }
+ 
+ /** The phase a 409 names in its error body, if any. */

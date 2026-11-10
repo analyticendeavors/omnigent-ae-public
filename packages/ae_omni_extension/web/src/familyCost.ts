@@ -32,6 +32,7 @@ import {
   type FamilyRow,
 } from "./api";
 import { money } from "./azure";
+import { liveNeedsLink } from "./attentionStore";
 import { el, notice, replaceChildren } from "./dom";
 import { fold, foldLine } from "./fold";
 import { hint } from "./hint";
@@ -64,7 +65,7 @@ export const LIST_MAX_PX = 420;
 export const UNIT_HINT =
   "Which number each family row shows, and how they rank; the other appears on hover.";
 export const RUNAWAY_HINT =
-  "Either amount flags a family whose spend today passes it. Counts the lead, children, subagents and Codex reviewers. 0 or blank turns it off.";
+  "Either amount flags a family whose spend today passes it. Tokens skip cache reads. Counts the lead and helpers. 0 or blank turns it off.";
 export const COST_NOTE =
   "Dollars are estimated at API rates. On a subscription they show where usage goes, not what the invoice says.";
 export const TOKENS_NOTE =
@@ -261,7 +262,9 @@ export function shortDollars(value: number): string {
 /** Which of the two amounts *row*'s spend today has passed (an amount of 0 is off). */
 export function passed(row: FamilyRow, settings: FamilyCostSettings): { tokens: boolean; usd: boolean } {
   return {
-    tokens: settings.runaway_tokens > 0 && row.today.tokens_total >= settings.runaway_tokens,
+    tokens:
+      settings.runaway_tokens > 0 &&
+      (row.today.flag_tokens ?? row.today.tokens_total) >= settings.runaway_tokens,
     usd: settings.runaway_usd > 0 && row.today.cost_usd >= settings.runaway_usd,
   };
 }
@@ -400,6 +403,7 @@ export function familyTile(
     id: "family",
     value: plural(totals.families, "family", "families"),
     summary: `${plural(totals.families, "family", "families")}, ${sum} in ${days} d`,
+    brief: over > 0 ? `${plural(over, "runaway")} today` : plural(totals.families, "family", "families"),
     note:
       over > 0
         ? `${plural(over, "runaway")} · ${sum} in ${days} d`
@@ -574,7 +578,10 @@ function drawBody(parts: Parts, state: State, redraw: () => void): void {
   const line = needsYou(answer, state.settings);
   replaceChildren(
     parts.needs,
-    [line ? el("p", { class: "family-needs", role: "note" }, `Needs you: ${line}`) : null],
+    [
+      line ? el("p", { class: "family-needs", role: "note" }, `Needs you: ${line}`) : null,
+      liveNeedsLink("family"),
+    ],
   );
   if (!answer || answer.state === "warming") {
     parts.filterBox.hidden = true;

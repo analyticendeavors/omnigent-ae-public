@@ -14,7 +14,6 @@ import {
   deactivateGit,
   gitSection,
   gitTile,
-  NEEDS_SHOWN,
   OLD_BRANCH_DAYS,
   pullPill,
   STUCK_HOURS,
@@ -22,7 +21,9 @@ import {
   summaryWords,
   whenShort,
 } from "../src/git";
+import { getFilter, resetAttention, setAttention } from "../src/attentionStore";
 import { getTile, resetTiles } from "../src/tiles";
+import { item, many, overview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -206,10 +207,10 @@ const q = <T extends HTMLElement = HTMLElement>(node: ParentNode, sel: string) =
   node.querySelector<T>(sel);
 const all = (node: ParentNode, sel: string) => [...node.querySelectorAll<HTMLElement>(sel)];
 const text = (node: ParentNode, sel: string) => q(node, sel)?.textContent;
-const kinds = (data: GitOverview) => analyze(data, NOW).needs.map((need) => need.kind);
 
 beforeEach(() => {
   resetTiles();
+  resetAttention();
   document.body.replaceChildren();
   const root = document.createElement("div");
   root.id = "root";
@@ -220,6 +221,7 @@ beforeEach(() => {
 
 afterEach(() => {
   deactivateGit();
+  resetAttention();
   vi.useRealTimers();
 });
 
@@ -250,124 +252,10 @@ describe("words", () => {
   });
 });
 
-describe("who moves next", () => {
-  it("sorts err first, then the ready pull request, then warn, each in its rule order", () => {
-    expect(kinds(busy())).toEqual([
-      "account", // fabrikam has no token
-      "repo-error", // northwind/broken; fabrikam/site is explained by the account row
-      "alerts-fix",
-      "pr-failing",
-      "pr-ready",
-      "pr-update", // #13 behind
-      "pr-update", // #18 blocked
-      "alerts-stuck",
-      "branch",
-    ]);
-  });
-
-  it("writes the rows the way the design shows them", () => {
-    const rows = analyze(busy(), NOW).needs;
-    const row = (kind: string, i = 0) => rows.filter((r) => r.kind === kind)[i]!;
-    expect(row("account")).toMatchObject({ title: "fabrikam is not connected", go: "Repo", tone: "err" });
-    expect(row("account").meta).toMatch(/AE_GIT_TOKEN_FABRIKAM/);
-    expect(row("repo-error")).toMatchObject({ title: "northwind/broken could not be read", go: "Repo" });
-    expect(row("alerts-fix")).toMatchObject({
-      title: "1 alert to fix: lodash",
-      meta: "web · worst is high",
-      go: "Alerts",
-      url: "https://github.com/contoso/web/security/dependabot",
-    });
-    expect(row("pr-failing")).toMatchObject({ title: "Fix #16 Bump thing 16", meta: "web · checks failing, conflicts", go: "Open" });
-    expect(row("pr-ready")).toMatchObject({
-      title: "Merge #12 Bump thing 12",
-      meta: "web · checks green, no conflicts",
-      tone: "accent",
-      url: "https://github.com/contoso/web/pull/12",
-    });
-    expect(row("pr-update", 0)).toMatchObject({ title: "Update #13 Bump thing 13", meta: "web · behind main" });
-    expect(row("pr-update", 1).title).toBe("#18 Bump thing 18 is blocked");
-    expect(row("alerts-stuck")).toMatchObject({
-      title: "2 alerts fixed on main, still open on GitHub",
-      meta: "web · stuck 3 days · a lockfile push or GitHub Support clears them",
-      go: "Alerts",
-    });
-    expect(row("branch")).toMatchObject({
-      title: "feat/old has 61 commits and no PR",
-      meta: "web · last commit 2 months ago",
-      go: "Branch",
-      url: "https://github.com/contoso/web/tree/feat/old",
-    });
-  });
-
-  it("puts ready pull requests behind every err row and ahead of every warn row", () => {
-    const data = calm({
-      repos: [
-        repo("contoso/web", { prs: [pr(1), pr(2, { merge_state: "BEHIND" }), pr(3, { checks: "FAILURE" })] }),
-      ],
-    });
-    expect(kinds(data)).toEqual(["pr-failing", "pr-ready", "pr-update"]);
-  });
-
-  it("says a branch has no commit count when ahead is not set", () => {
-    const data = calm({ repos: [repo("contoso/web", { branches: [branch("feat/x", 30 * DAY, { ahead: null })] })] });
-    expect(analyze(data, NOW).needs[0]!.title).toBe("feat/x, no PR");
-    const zero = calm({ repos: [repo("contoso/web", { branches: [branch("feat/x", 30 * DAY, { ahead: 0 })] })] });
-    expect(analyze(zero, NOW).needs[0]!.title).toBe("feat/x, no PR");
-  });
-
-  it("sorts old branches oldest first across repos", () => {
-    const data = calm({
-      repos: [
-        repo("contoso/web", { branches: [branch("b-mid", 40 * DAY), branch("b-old", 200 * DAY)] }),
-        repo("contoso/api", { branches: [branch("b-older", 400 * DAY)] }),
-      ],
-    });
-    expect(analyze(data, NOW).needs.map((n) => n.title.split(",")[0])).toEqual(["b-older", "b-old", "b-mid"]);
-  });
-
-  it("thresholds: stuck after 24 hours, old after 14 days, late after 8 hours", () => {
-    expect(STUCK_HOURS).toBe(24);
-    expect(OLD_BRANCH_DAYS).toBe(14);
-    expect(SWEEP_LATE_HOURS).toBe(8);
-    const waiting = (ageMs: number, fields: Partial<GitAlert> = {}) =>
-      calm({ repos: [repo("contoso/web", { alerts: [alert(1, "undici", "waiting", { waiting_since: before(ageMs), created_at: before(ageMs), ...fields })] })] });
-    expect(kinds(waiting(24 * HOUR))).toEqual([]);
-    expect(kinds(waiting(24 * HOUR + 1))).toEqual(["alerts-stuck"]);
-    // Without waiting_since the alert's own created_at is the clock.
-    expect(kinds(waiting(30 * HOUR, { waiting_since: null }))).toEqual(["alerts-stuck"]);
-    // An older server sends neither: nothing says it is stuck.
-    expect(kinds(waiting(30 * HOUR, { waiting_since: undefined, created_at: undefined }))).toEqual([]);
-
-    const branches = (ageMs: number | null) => calm({ repos: [repo("contoso/web", { branches: [branch("feat/x", ageMs)] })] });
-    expect(kinds(branches(14 * DAY))).toEqual([]);
-    expect(kinds(branches(14 * DAY + 1))).toEqual(["branch"]);
-    expect(kinds(branches(null))).toEqual([]);
-
-    const sweep = (ageMs: number, conclusion: string | null = "success") =>
-      calm({ sweep: { url: "https://github.com/contoso/automation/actions/workflows/dependency-sweep.yml", runs: [run(1, ageMs, conclusion)], error: null } });
-    expect(kinds(sweep(8 * HOUR))).toEqual([]);
-    expect(kinds(sweep(8 * HOUR + 1))).toEqual(["sweep"]);
-    expect(analyze(sweep(9 * HOUR), NOW).needs[0]).toMatchObject({ title: "No Dependency Sweep has started in 9 hours", go: "Run" });
-    expect(analyze(sweep(HOUR, "failure"), NOW).needs[0]).toMatchObject({ title: "The latest Dependency Sweep failed", go: "Run" });
-    expect(kinds(sweep(HOUR, null))).toEqual([]);
-  });
-
-  it("leaves the sweep alone when it is null or unreadable", () => {
-    expect(kinds(calm({ sweep: null }))).toEqual([]);
-    expect(kinds(calm({ sweep: { url: "https://github.com/contoso/automation", runs: [], error: "boom" } }))).toEqual([]);
-  });
-
-  it("does not count view-only repos, and groups a repo's fix alerts into one row", () => {
-    const data = calm({
-      repos: [
-        repo("contoso/web", { alerts: [alert(1, "a", "fix"), alert(2, "b", "fix", { severity: "CRITICAL" })] }),
-        repo("northwind/legacy", { view_only: true, alerts: [alert(9, "x", "fix")], prs: [pr(4, { checks: "FAILURE" })] }),
-      ],
-    });
-    const rows = analyze(data, NOW).needs;
-    expect(rows).toHaveLength(1);
-    expect(rows[0]).toMatchObject({ title: "2 alerts to fix: a, b", meta: "web · worst is critical" });
-  });
+describe("the lines that are not the owner's to move", () => {
+  // The rows for the owner come from the server now (git_center.py `needs()`, pinned by
+  // gitParity.test.ts); what stays in the card is the other half of the old sort.
+  const quietOf = (data: GitOverview) => analyze(data, NOW).quiet;
 
   it("files the rest as lines that are not the owner's to move", () => {
     const { quiet, ready, oldBranches } = analyze(busy(), NOW);
@@ -386,18 +274,35 @@ describe("who moves next", () => {
     expect(oldBranches).toBe(1);
   });
 
-  it("makes a Needs-you row of a configured sweep that has no runs", () => {
-    const url = "https://github.com/contoso/automation/actions/workflows/dependency-sweep.yml";
-    const none = calm({ sweep: { url, runs: [], error: null } });
-    expect(analyze(none, NOW).needs).toEqual([
-      expect.objectContaining({ kind: "sweep", tone: "err", title: "No Dependency Sweep runs found", url }),
-    ]);
-    expect(gitTile(none, null, NOW).health).toBe("problem");
+  it("thresholds: an alert is stuck after 24 hours, a branch old after 14 days", () => {
+    expect(STUCK_HOURS).toBe(24);
+    expect(OLD_BRANCH_DAYS).toBe(14);
+    expect(SWEEP_LATE_HOURS).toBe(8);
+    const waiting = (ageMs: number, fields: Partial<GitAlert> = {}) =>
+      calm({ repos: [repo("contoso/web", { alerts: [alert(1, "undici", "waiting", { waiting_since: before(ageMs), created_at: before(ageMs), ...fields })] })] });
+    // Stuck alerts are a Needs you row; only the ones still inside the lag stay in the quiet box.
+    expect(quietOf(waiting(24 * HOUR)).map((l) => l.who)).toEqual(["GitHub"]);
+    expect(quietOf(waiting(24 * HOUR + 1))).toEqual([]);
+    expect(quietOf(waiting(30 * HOUR, { waiting_since: null }))).toEqual([]);
+    // An older server sends neither date: nothing says it is stuck.
+    expect(quietOf(waiting(30 * HOUR, { waiting_since: undefined, created_at: undefined })).map((l) => l.who)).toEqual(["GitHub"]);
+
+    const branches = (ageMs: number | null) => calm({ repos: [repo("contoso/web", { branches: [branch("feat/x", ageMs)] })] });
+    expect(analyze(branches(14 * DAY), NOW).oldBranches).toBe(0);
+    expect(analyze(branches(14 * DAY + 1), NOW).oldBranches).toBe(1);
+    expect(analyze(branches(null), NOW).oldBranches).toBe(0);
   });
 
-  it("copes with a pull request whose author is null", () => {
-    const data = calm({ repos: [repo("contoso/web", { prs: [pr(1, { author: null, merge_state: "BEHIND" })] })] });
-    expect(kinds(data)).toEqual(["pr-update"]);
+  it("does not count view-only repos in the quiet counts", () => {
+    const data = calm({
+      repos: [
+        repo("contoso/web", { prs: [pr(1)] }),
+        repo("northwind/legacy", { view_only: true, alerts: [alert(9, "x", "fix")], prs: [pr(4)] }),
+      ],
+    });
+    const { ready, quiet } = analyze(data, NOW);
+    expect(ready).toBe(1);
+    expect(quiet.map((l) => l.who)).toEqual(["View only"]);
   });
 
   it("sends a Dependabot PR to the Sweep line only when it is BEHIND or UNKNOWN", () => {
@@ -406,14 +311,19 @@ describe("who moves next", () => {
     const sweepOnly = (state: string) =>
       calm({ repos: [repo("contoso/web", { prs: [bot(1, state)] })] });
     for (const state of ["BEHIND", "UNKNOWN"]) {
-      expect(kinds(sweepOnly(state))).toEqual([]);
-      expect(analyze(sweepOnly(state), NOW).quiet[0]!.who).toBe("Sweep");
+      expect(quietOf(sweepOnly(state))[0]!.who).toBe("Sweep");
     }
-    expect(analyze(sweepOnly("BLOCKED"), NOW).needs[0]).toMatchObject({ kind: "pr-update", title: "#1 Bump thing 1 is blocked" });
-    expect(kinds(calm({ repos: [repo("contoso/web", { prs: [bot(1, "BEHIND", "FAILURE")] })] }))).toEqual(["pr-failing"]);
-    expect(kinds(calm({ repos: [repo("contoso/web", { prs: [bot(1, "DIRTY")] })] }))).toEqual(["pr-failing"]);
+    // BLOCKED, failing and conflicting ones are rows for the owner, not quiet lines.
+    expect(quietOf(sweepOnly("BLOCKED"))).toEqual([]);
+    expect(quietOf(calm({ repos: [repo("contoso/web", { prs: [bot(1, "BEHIND", "FAILURE")] })] }))).toEqual([]);
+    expect(quietOf(calm({ repos: [repo("contoso/web", { prs: [bot(1, "DIRTY")] })] }))).toEqual([]);
     const pending = calm({ repos: [repo("contoso/web", { prs: [bot(1, "BEHIND", "PENDING")] })] });
-    expect(analyze(pending, NOW).quiet[0]!.who).toBe("CI");
+    expect(quietOf(pending)[0]!.who).toBe("CI");
+  });
+
+  it("copes with a pull request whose author is null", () => {
+    const data = calm({ repos: [repo("contoso/web", { prs: [pr(1, { author: null, merge_state: "BEHIND" })] })] });
+    expect(quietOf(data)).toEqual([]);
   });
 
   it("names three drafts, then how many more", () => {
@@ -426,32 +336,61 @@ describe("who moves next", () => {
 
   it("does not count a kept branch as old, however old", () => {
     const data = calm({ repos: [repo("contoso/web", { branches: [branch("keep", 500 * DAY, { kept: true })] })] });
-    expect(kinds(data)).toEqual([]);
     expect(analyze(data, NOW).oldBranches).toBe(0);
+    expect(quietOf(data)[0]!.who).toBe("Kept");
+  });
+
+  it("no longer builds Needs you rows (the server does)", () => {
+    expect(Object.keys(analyze(busy(), NOW)).sort()).toEqual(["oldBranches", "quiet", "ready"]);
   });
 });
 
 describe("the summary and the tile", () => {
-  it("says how many need you and how many alerts to fix", () => {
-    expect(summaryWords(busy(), NOW)).toBe("9 need you, 1 alert to fix".replace("10", String(analyze(busy(), NOW).needs.length)));
-    expect(summaryWords(calm(), NOW)).toBe("Nothing needs you");
-    const one = calm({ repos: [repo("contoso/web", { prs: [pr(1)] })] });
-    expect(summaryWords(one, NOW)).toBe("1 needs you, 0 alerts to fix");
+  const withGit = (n: number, urgent = n) =>
+    setAttention(
+      overview([
+        ...many(urgent, "pr-failing"),
+        ...many(n - urgent, "pr-update", { tone: "review" }),
+        item("box-x", { source: "box", kind: "heat" }),
+      ]),
+    );
+
+  it("says how many need you and how many alerts to fix, from the Needs you count", () => {
+    expect(summaryWords(busy())).toBe("1 alert to fix");
+    withGit(9);
+    expect(summaryWords(busy())).toBe("9 need you, 1 alert to fix");
+    withGit(1);
+    expect(summaryWords(calm())).toBe("1 needs you, 0 alerts to fix");
+    setAttention(overview([item("box-x", { source: "box", kind: "heat" })]));
+    expect(summaryWords(calm())).toBe("Nothing needs you");
   });
 
-  it("is a problem with an err row, attention with only other rows, ok when clear", () => {
-    expect(gitTile(busy(), null, NOW)).toMatchObject({ health: "problem", note: "1 to fix, 3 waiting on GitHub" });
-    const warn = calm({ repos: [repo("contoso/web", { prs: [pr(2, { merge_state: "BEHIND" })] })] });
-    expect(gitTile(warn, null, NOW)).toMatchObject({ health: "attention", value: "1 need you" });
-    const ready = calm({ repos: [repo("contoso/web", { prs: [pr(1)] })] });
-    expect(gitTile(ready, null, NOW).health).toBe("attention");
-    expect(gitTile(calm(), null, NOW)).toMatchObject({ health: "ok", value: "All clear" });
+  it("is a problem with an urgent item, attention with only review items, ok when clear", () => {
+    withGit(9);
+    expect(gitTile(busy(), null)).toMatchObject({ health: "problem", note: "1 to fix, 3 waiting on GitHub", value: "9 need you", brief: "9 need you" });
+    withGit(1, 0);
+    expect(gitTile(calm(), null)).toMatchObject({ health: "attention", value: "1 need you" });
+    setAttention(overview([]));
+    expect(gitTile(calm(), null)).toMatchObject({ health: "ok", value: "All clear", brief: "Git clear" });
+  });
+
+  it("does not count an item a working chat is on, but counts one a finished chat holds", () => {
+    const hold = { session_id: "s1", title: "Chat", path: "/s/s1" };
+    setAttention(overview([item("a", { working: hold })]));
+    expect(gitTile(calm(), null)).toMatchObject({ health: "ok", value: "All clear" });
+    setAttention(overview([item("a", { working: { ...hold, status: "waiting" } })]));
+    expect(gitTile(calm(), null)).toMatchObject({ health: "problem", value: "1 need you" });
+  });
+
+  it("waits for the Needs you read before it says anything about the count", () => {
+    expect(gitTile(calm(), null)).toMatchObject({ health: "idle", value: "Reading..." });
   });
 
   it("is at least attention when the answer carries an error or the sweep could not be read", () => {
-    expect(gitTile(calm({ error: "The sweep config is not readable JSON." }), null, NOW)).toMatchObject({ health: "attention", value: "All clear" });
+    setAttention(overview([]));
+    expect(gitTile(calm({ error: "The sweep config is not readable JSON." }), null)).toMatchObject({ health: "attention", value: "All clear" });
     const sweep = { url: "https://github.com/contoso/automation", runs: [], error: "boom" };
-    expect(gitTile(calm({ sweep }), null, NOW).health).toBe("attention");
+    expect(gitTile(calm({ sweep }), null).health).toBe("attention");
   });
 
   it("is idle when not set up, and handles no answer", () => {
@@ -463,7 +402,18 @@ describe("the summary and the tile", () => {
 });
 
 describe("the card", () => {
-  it("draws the numbers, the first five rows and the quiet box", async () => {
+  /** The panel's answer: *n* Git items (urgent unless *review*), plus one Box item the card ignores. */
+  const gitItems = (n: number, review = 0) =>
+    setAttention(
+      overview([
+        ...many(n - review, "pr-failing"),
+        ...many(review, "pr-update", { tone: "review" }),
+        item("box-x", { source: "box", kind: "heat" }),
+      ]),
+    );
+
+  it("draws the numbers, one Needs you link and the quiet box", async () => {
+    gitItems(9);
     const { context } = stubContext([ok(busy())]);
     const node = await mount(context);
 
@@ -478,12 +428,10 @@ describe("the card", () => {
     expect(q(node, '[data-stat="fix"]')?.className).toContain("stat-err");
     expect(q(node, '[data-stat="old"]')?.className).toContain("stat-warn");
 
-    const rows = all(node, ".git-need");
-    expect(rows).toHaveLength(NEEDS_SHOWN);
-    expect(rows.map((r) => r.dataset.kind)).toEqual(["account", "repo-error", "alerts-fix", "pr-failing", "pr-ready"]);
-    expect(rows[4]!.className).toContain("need-accent");
-    expect(text(rows[0]!, ".git-go")).toBe("Repo");
-    expect(q<HTMLAnchorElement>(rows[4]!, ".git-go")?.href).toBe("https://github.com/contoso/web/pull/12");
+    // The rows moved to the Needs you panel; the card says how many and links there.
+    expect(q(node, ".git-need")).toBeNull();
+    expect(text(node, ".git-needs-wrap .git-h")).toBe("Needs you");
+    expect(text(node, ".needs-link-btn")).toBe("9 in Needs you");
 
     const quiet = all(node, ".git-quiet-line");
     expect(quiet.map((l) => text(l, ".git-quiet-who"))).toEqual(["GitHub", "CI", "Sweep", "Drafts", "Recent branches", "Kept", "View only"]);
@@ -506,40 +454,54 @@ describe("the card", () => {
     expect(getTile("git")?.value).toBe("9 need you");
   });
 
-  it("expands the rest in place with the more button, and folds back", async () => {
+  it("opens the Needs you panel filtered to Git from the link", async () => {
+    gitItems(2);
+    const panel = document.createElement("section");
+    panel.id = "needs-you";
+    const scroll = vi.fn();
+    panel.scrollIntoView = scroll;
+    document.body.appendChild(panel);
     const { context } = stubContext([ok(busy())]);
     const node = await mount(context);
-    const more = q(node, ".git-more")!;
-    expect(more.textContent).toBe("4 more");
-    more.click();
-    expect(all(node, ".git-need")).toHaveLength(9);
-    expect(text(node, ".git-more")).toBe("Show fewer");
-    q(node, ".git-more")!.click();
-    expect(all(node, ".git-need")).toHaveLength(NEEDS_SHOWN);
+    expect(getFilter()).toBeNull();
+    q(node, ".needs-link-btn")!.click();
+    expect(getFilter()).toBe("git");
+    expect(scroll).toHaveBeenCalled();
   });
 
-  it("has no more button for five rows or fewer", async () => {
-    const data = calm({ repos: [repo("contoso/web", { prs: [pr(1), pr(2), pr(3), pr(4), pr(5)] })] });
-    const { context } = stubContext([ok(data)]);
+  it("follows the panel's read: a count arriving later redraws the line, the summary and the tile", async () => {
+    const { context } = stubContext([ok(busy())]);
     const node = await mount(context);
-    expect(all(node, ".git-need")).toHaveLength(5);
-    expect(q(node, ".git-more")).toBeNull();
+    expect(text(node, ".needs-link")).toBe("Reading Needs you...");
+    expect(text(node, ".git-summary")).toBe("1 alert to fix");
+    gitItems(3);
+    expect(text(node, ".needs-link-btn")).toBe("3 in Needs you");
+    expect(text(node, ".git-summary")).toBe("3 need you, 1 alert to fix");
+    expect(getTile("git")?.value).toBe("3 need you");
+  });
+
+  it("says Needs you could not be read when the panel's read failed and nothing came before", async () => {
+    setAttention(null, new Error("down"));
+    const { context } = stubContext([ok(busy())]);
+    const node = await mount(context);
+    expect(text(node, ".needs-link")).toBe("Needs you could not be read.");
   });
 
   it("says Nothing needs you and hides the quiet box when it is empty", async () => {
+    setAttention(overview([]));
     const { context } = stubContext([ok(calm())]);
     const node = await mount(context);
     expect(text(node, ".git-summary")).toBe("Nothing needs you");
-    expect(text(node, ".git-okline")).toBe("Nothing needs you.");
-    expect(q(node, ".git-need")).toBeNull();
+    expect(text(node, ".needs-link-none")).toBe("Nothing needs you.");
+    expect(q(node, ".needs-link-btn")).toBeNull();
     expect(q<HTMLElement>(node, ".git-quiet")?.hidden).toBe(true);
     expect(q(node, ".git-summary")?.className).not.toMatch(/is-/);
     expect(getTile("git")?.health).toBe("ok");
   });
 
-  it("colours the header warn when rows need the owner but no alert needs a fix", async () => {
-    const data = calm({ repos: [repo("contoso/web", { prs: [pr(1)] })] });
-    const { context } = stubContext([ok(data)]);
+  it("colours the header warn when items need the owner but no alert needs a fix", async () => {
+    gitItems(1, 1);
+    const { context } = stubContext([ok(calm({ repos: [repo("contoso/web", { prs: [pr(1)] })] }))]);
     const node = await mount(context);
     expect(q(node, ".git-summary")?.className).toContain("is-warn");
   });
@@ -565,12 +527,10 @@ describe("the card", () => {
     expect(text(b, ".git-sweep")).toBe("Dependency Sweep could not be read: Not Found");
   });
 
-  it("draws a failed or late sweep as a needs row and its dot by conclusion", async () => {
+  it("draws the sweep's dot by its conclusion", async () => {
     const url = "https://github.com/contoso/automation/actions/workflows/dependency-sweep.yml";
     const { context } = stubContext([ok(calm({ sweep: { url, runs: [run(7, HOUR, "failure")], error: null } }))]);
     const node = await mount(context);
-    expect(q(node, ".git-need")?.dataset.kind).toBe("sweep");
-    expect(text(node, ".git-need-title")).toBe("The latest Dependency Sweep failed");
     expect(q(node, ".git-sweep .git-dot")?.className).toContain("git-dot-err");
   });
 
@@ -584,14 +544,14 @@ describe("the card", () => {
   it("opens a link through the host, and shows the URL when the host refuses", async () => {
     const { context, openExternal } = stubContext([ok(busy())]);
     const node = await mount(context);
-    const link = q<HTMLAnchorElement>(node, '.git-need[data-kind="pr-ready"] .git-go')!;
+    const link = q<HTMLAnchorElement>(node, '.git-quiet-line[data-who="Drafts"] .git-link')!;
     link.click();
     await flush();
-    expect(openExternal).toHaveBeenCalledWith("https://github.com/contoso/web/pull/12");
+    expect(openExternal).toHaveBeenCalledWith("https://github.com/contoso/web/pull/14");
     openExternal.mockRejectedValueOnce(new Error("PopupBlocked"));
     link.click();
     await flush();
-    expect(text(node, ".link-copy")).toBe("https://github.com/contoso/web/pull/12");
+    expect(text(node, ".link-copy")).toBe("https://github.com/contoso/web/pull/14");
   });
 
   it("keeps the last answer and says so when a later read fails", async () => {
@@ -600,7 +560,7 @@ describe("the card", () => {
     window.dispatchEvent(new Event("focus"));
     await flush();
     expect(text(node, ".git-status")).toMatch(/could not be read/);
-    expect(q(node, ".git-need")).not.toBeNull();
+    expect(q(node, ".git-stat")).not.toBeNull();
     expect(getTile("git")?.note).toMatch(/last answer/);
   });
 

@@ -1,0 +1,135 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 21:56:54 -0800
+Subject: [PATCH 323/333] [ae-patch] Fix the Voice mode second fix-check
+ findings: slow first mic start, multi-pick done sentence
+
+The backstop for a mic start that reports nothing fired at 5 s, but the first server take cold-loads the speech model for about 40 s. A healthy first start would have been cancelled and Voice mode would have ended on "Mic unavailable". The backstop is now a named 60 s constant, and the speaker keeps saying "Starting the mic" while it waits.
+
+A multi-select sentence such as "one and three, I'm done" dropped the second pick, because the whole remainder was used whenever it matched anything at all. Both the whole and the trimmed remainder are now tried and the one with more picks wins, the whole one on a tie, so "merge it done" still picks "Merge it".
+
+A mic start that takes the Web Speech path no longer leaves the controller's start flag set, and a stop during such a start no longer leaves a cancel flag that nothing clears.
+---
+ web/src/components/ComposerMicButton.tsx |  5 +++-
+ web/src/hooks/useAeVoiceMode.test.tsx    | 36 +++++++++++++++++++++---
+ web/src/hooks/useAeVoiceMode.ts          | 14 ++++++---
+ 3 files changed, 46 insertions(+), 9 deletions(-)
+
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 4410d8a55ae989fc7850374f8b2b019a2a455cd4..d1f817fbfd68d45f6bcd9f1ec809c5328a64a07a 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -488,6 +488,8 @@ export const ComposerMicButton = ({
+     const recognition = recognitionRef.current;
+     if (!recognition) return false;
+     transitionRef.current = true;
++    // The Web Speech path has no server start to consume the controller's flag.
++    controllerStartRef.current = false;
+     try {
+       if (isListening) recognition.stop();
+       else recognition.start();
+@@ -527,7 +529,8 @@ export const ComposerMicButton = ({
+         } else if (requestedRef.current) {
+           // Still connecting: cancel the start, or drop the stream the moment it connects.
+           requestedRef.current = false;
+-          withdrawRef.current = true;
++          // Only a server start still connecting needs the flag; nothing clears it otherwise.
++          if (serverBusyRef.current) withdrawRef.current = true;
+           try {
+             recognitionRef.current?.stop();
+           } catch {
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index dbb70bacfbc3636302ee08b035981b2f21e93527..a6e1845b244a2065db010ed3dbccdad594fbd22f 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -13,7 +13,7 @@ import {
+ } from "@/lib/aeVoiceMode";
+ import { useChatStore } from "@/store/chatStore";
+ import { installFakeSpeech, removeFakeSpeech, type FakeSynth } from "@/test/fakeSpeech";
+-import { useAeVoiceMode } from "./useAeVoiceMode";
++import { MIC_START_NET_MS, useAeVoiceMode } from "./useAeVoiceMode";
+ 
+ const CARD = {
+   type: "elicitation",
+@@ -455,18 +455,46 @@ describe("useAeVoiceMode", () => {
+     expect(fetch).not.toHaveBeenCalled();
+   });
+ 
+-  it("treats a start that stays silent for 5 s as failed, retries once, then gives up", () => {
++  it("treats a start that stays silent past the net as failed, retries once, then gives up", () => {
+     autoConnect = false;
+     mount();
+     expect(controller.current.start).toHaveBeenCalledTimes(1);
+-    act(() => void vi.advanceTimersByTime(5000));
++    act(() => void vi.advanceTimersByTime(MIC_START_NET_MS));
+     expect(getVoiceSnapshot("c1").phase).not.toBe("listening");
+     act(() => void vi.advanceTimersByTime(1000));
+     expect(controller.current.start).toHaveBeenCalledTimes(2);
+-    act(() => void vi.advanceTimersByTime(5000));
++    act(() => void vi.advanceTimersByTime(MIC_START_NET_MS));
+     expect(getVoiceSnapshot("c1").phase).toBe("unavailable");
+   });
+ 
++  it("a slow but healthy first start is not a failure and keeps saying Starting the mic", () => {
++    autoConnect = false;
++    const { result } = mount();
++    act(() => void vi.advanceTimersByTime(40_000));
++    expect(getVoiceSnapshot("c1").phase).toBe("starting");
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++    expect(controller.current.stop).not.toHaveBeenCalled();
++    act(() => void result.current.onListening(true));
++    expect(getVoiceSnapshot("c1").phase).toBe("listening");
++    act(() => void vi.advanceTimersByTime(MIC_START_NET_MS));
++    expect(getVoiceSnapshot("c1").phase).toBe("listening");
++  });
++
++  it("keeps both picks of a multi-pick sentence that ends in a done phrase", () => {
++    const three = {
++      ...CARD,
++      askUserQuestion: {
++        questions: [{ ...CARD.askUserQuestion.questions[0], multiSelect: true }],
++      },
++    };
++    useChatStore.setState({ blocks: [three] } as never);
++    const { result } = mount();
++    act(() => void result.current.onFinal("one and three, I'm done"));
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
++      "How should it deploy?": ["Force it", "Hold it"],
++    });
++  });
++
+   it("makes the start again when the mic is wanted before its own stop has finished", () => {
+     const { result, rerender } = mount();
+     act(() => void result.current.onListening(true));
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index c736ae864c1011a028e4d4131c7bacc388aeee62..4601cdf63ed01d0fc5447022fa527289a829120f 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -26,8 +26,11 @@ import { useChatStore } from "@/store/chatStore";
+ const SEND_WAIT_MS = 5000;
+ /** One retry of a mic start that failed. */
+ const MIC_RETRY_MS = 1000;
+-/** A start that has neither succeeded nor failed by now counts as failed. */
+-const MIC_START_NET_MS = 5000;
++/**
++ * Backstop for a start that produced no report at all. Long on purpose: the first server
++ * take cold-loads the speech model, which can take about 40 s, and that is not a failure.
++ */
++export const MIC_START_NET_MS = 60_000;
+ const LABEL_KEY = "ae.voice";
+ 
+ export interface UseAeVoiceModeArgs {
+@@ -374,8 +377,11 @@ export function useAeVoiceMode({
+         const { done, rest, raw } = splitDone(text);
+         // The whole remainder first ("merge it done" for a "Merge it" option); filler is
+         // trimmed only when nothing matched.
+-        let hits = matchSpokenOptions(raw, names).map((i) => names[i]);
+-        if (hits.length === 0) hits = matchSpokenOptions(rest, names).map((i) => names[i]);
++        // Both are tried and the one with more picks wins, the whole remainder on a tie:
++        // "one and three, I'm done" keeps both picks, "merge it done" keeps "Merge it".
++        const fromRaw = matchSpokenOptions(raw, names).map((i) => names[i]);
++        const fromRest = matchSpokenOptions(rest, names).map((i) => names[i]);
++        const hits = fromRest.length > fromRaw.length ? fromRest : fromRaw;
+         if (hits.length === 0 && rest.trim() !== "" && mayCustom) {
+           state.custom = `${state.custom} ${rest}`.trim();
+         }

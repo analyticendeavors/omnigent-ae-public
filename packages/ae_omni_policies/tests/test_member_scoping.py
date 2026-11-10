@@ -137,6 +137,9 @@ async def test_every_lot_route_is_admin_only(
         ("POST", "/v1/ae/lot/park", PARK_BODY),
         ("POST", "/v1/ae/lot/T1/link", {"url": "https://github.com/a/b/issues/1"}),
         ("POST", "/v1/ae/lot/T1/complete", {"status": "done"}),
+        ("GET", "/v1/ae/lot/lists", None),
+        ("POST", "/v1/ae/lot/create", {"title": "Check the scan"}),
+        ("POST", "/v1/ae/lot/T1/cancel", None),
         ("POST", "/v1/ae/lot/T1/resume", None),
         ("POST", "/v1/ae/lot/T1/session", None),
     ]
@@ -540,7 +543,7 @@ async def test_a_box_admin_who_is_not_an_omnigent_admin_keeps_only_the_box_monit
     access = await client.get("/v1/ae/access", headers=MEMBER)
     assert box.status_code == 200, box.text
     assert access.status_code == 200, access.text
-    assert access.json() == {"admin": False, "box_admin": True}
+    assert access.json() == {"admin": False, "box_admin": True, "box_on": True}
     for path in ("/host", "/secrets", "/fabric", "/databricks", "/lot"):
         refused = await client.get(f"/v1/ae{path}", headers=MEMBER)
         assert refused.status_code == 403, (path, refused.text)

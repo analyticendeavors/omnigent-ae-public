@@ -1,0 +1,449 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 17:20:46 -0800
+Subject: [PATCH 317/333] [ae-patch] Fix the review findings on the Speak
+ replies menu and cloud voices
+
+One engine now speaks a whole response: its first spoken sentence locks the
+voice, so the cloud list arriving or a menu pick mid-reply applies from the
+next response and the device and cloud queues never overlap.
+
+A stopped cloud playback's late completion no longer clears the next
+playback's handlers. A failed voice list is retried instead of cached, with
+one request in flight. A bare stored voice from before the prefixes counts as
+no choice once the server has cloud voices; an explicit device choice wins.
+The Voice hint names the real default. Tests cover each.
+
+2026-11-09.
+---
+ .../components/AeSpeakRepliesButton.test.tsx  | 42 +++++++++++++++
+ web/src/components/AeSpeakRepliesButton.tsx   | 12 +++--
+ web/src/hooks/useAeSpeakReplies.test.ts       | 54 +++++++++++++++++++
+ web/src/hooks/useAeSpeakReplies.ts            | 25 +++++++--
+ web/src/lib/aeCloudVoice.test.ts              | 42 ++++++++++++++-
+ web/src/lib/aeCloudVoice.ts                   | 30 ++++++++---
+ web/src/lib/aeSettingHints.ts                 |  2 +-
+ web/src/lib/aeSpeakReplies.ts                 |  6 +++
+ 8 files changed, 195 insertions(+), 18 deletions(-)
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index ce46c5bf4eceb847e594c6e5b34811c822fe30bb..51cd337b0a95233002e568c31c16cae04e77af1d 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -266,6 +266,48 @@ describe("AeSpeakRepliesButton", () => {
+     );
+   });
+ 
++  it("treats a bare stored value as no choice once the server has cloud voices", async () => {
++    window.localStorage.setItem("omnigent:ae-speak-voice", "Plain");
++    serveCloudVoices(CLOUD);
++    renderButton();
++    await openMenu();
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-speak-voice-trigger")).toHaveTextContent("Ava"),
++    );
++  });
++
++  it("keeps an explicit device choice when the server has cloud voices", async () => {
++    window.localStorage.setItem("omnigent:ae-speak-voice", "device:Plain");
++    serveCloudVoices(CLOUD);
++    renderButton();
++    await openMenu();
++    await waitFor(() => expect(fetch).toHaveBeenCalled());
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-speak-voice-trigger")).toHaveTextContent("Plain"),
++    );
++  });
++
++  it("adds the cloud voices to an open Voice sub-menu when the list arrives late", async () => {
++    resetCloudVoicesCache();
++    let answer: (r: Response) => void = () => {};
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(
++        () =>
++          new Promise<Response>((resolve) => {
++            answer = resolve;
++          }),
++      ),
++    );
++    renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-voice-trigger"));
++    expect(screen.queryByText("Natural (cloud)")).toBeNull();
++    answer(new Response(JSON.stringify({ voices: CLOUD }), { status: 200 }));
++    expect(await screen.findByText("Natural (cloud)")).toBeInTheDocument();
++    expect(screen.getAllByTestId("ae-speak-voice-option")[0]).toHaveTextContent("Ava");
++  });
++
+   it("reads a bare stored value from before as a device voice", async () => {
+     window.localStorage.setItem("omnigent:ae-speak-voice", "Plain");
+     renderButton();
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 0e2392e564333ff6433a2606182f26ca2d6d775b..ed1436958b6c82af0c1c93d353a19b14d93646d9 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -36,6 +36,7 @@ import {
+   readFastEnabled,
+   readRate,
+   readSpeakReplies,
++  isLegacyVoiceChoice,
+   readVoiceChoice,
+   type VoiceChoice,
+   voiceLabel,
+@@ -131,6 +132,7 @@ function SpeakRepliesControl({
+   const [on, setOn] = useState(() => readSpeakReplies(chatId));
+   const [fastEnabled, setFastEnabled] = useState(readFastEnabled);
+   const [stored, setStored] = useState(readVoiceChoice);
++  const [legacy, setLegacy] = useState(isLegacyVoiceChoice);
+   const [cloudVoices, setCloudVoices] = useState<CloudVoice[]>([]);
+   const [rate, setRate] = useState(readRate);
+   const [voices, setVoices] = useState(listVoices);
+@@ -155,11 +157,12 @@ function SpeakRepliesControl({
+ 
+   // A stored cloud voice the server no longer offers, or none stored: first cloud voice, else the device's.
+   const deviceDefault = pickDefaultVoice(voices);
++  // A bare value from before the prefixes is no choice once the server has cloud voices.
+   const voice: VoiceChoice | null =
+-    stored?.kind === "device"
+-      ? stored
+-      : stored && cloudVoices.some((v) => v.id === stored.id)
+-        ? stored
++    stored?.kind === "device" && !(legacy && cloudVoices.length > 0)
++      ? { kind: "device", id: stored.id }
++      : stored?.kind === "cloud" && cloudVoices.some((v) => v.id === stored.id)
++        ? { kind: "cloud", id: stored.id }
+         : cloudVoices[0]
+           ? { kind: "cloud", id: cloudVoices[0].id }
+           : deviceDefault
+@@ -291,6 +294,7 @@ function SpeakRepliesControl({
+                 const [kind, ...rest] = key.split(":");
+                 const next = { kind: kind as VoiceChoice["kind"], id: rest.join(":") };
+                 writeVoiceChoice(next);
++                setLegacy(false);
+                 setStored(next);
+               }}
+             >
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 8e2d9af4da9b855fb5a7e51e552cb4bea65d2424..8e742e9238ad01ad0511764957bdd3419b940a0e 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -72,6 +72,60 @@ afterEach(() => {
+   useChatStore.setState({ conversationId: null, blocks: [], status: "idle" } as never);
+ });
+ 
++type Choice = { kind: "cloud" | "device"; id: string } | null;
++const CLOUD_CHOICE: Choice = { kind: "cloud", id: "en-US-AvaMultilingualNeural" };
++
++// A request that stays open until stop() aborts it, as the real fetch does.
++const hangingFetch = () =>
++  vi.fn(
++    (_url: string, init?: RequestInit) =>
++      new Promise<Response>((_resolve, reject) => {
++        init?.signal?.addEventListener("abort", () => reject(new DOMException("x", "AbortError")));
++      }),
++  );
++
++describe("useAeSpeakReplies engine choice", () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++  });
++
++  it("sends a device choice to the device speaker, not the server", () => {
++    const fetchMock = hangingFetch();
++    vi.stubGlobal("fetch", fetchMock);
++    mount(true, "c1", { kind: "device", id: "v1" });
++    setStore({ blocks: [final("r1", "item-1", "Whole reply.")] });
++    flush();
++    expect(synth.texts()).toEqual(["Whole reply."]);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it.each([
++    ["the cloud list arriving", null, CLOUD_CHOICE],
++    ["a menu pick", { kind: "device", id: "v1" } as Choice, CLOUD_CHOICE],
++  ])("keeps the first engine for a response when %s changes the voice", (_n, first, next) => {
++    const fetchMock = hangingFetch();
++    vi.stubGlobal("fetch", fetchMock);
++    const hook = renderHook(
++      (p: { voice: Choice }) => useAeSpeakReplies({ chatId: "c1", enabled: true, rate: 1, ...p }),
++      { initialProps: { voice: first } },
++    );
++    setStore({ blocks: [live("r1", "One. Two")] });
++    flush();
++    expect(synth.texts()).toEqual(["One."]);
++    hook.rerender({ voice: next });
++    setStore({ blocks: [final("r1", "item-1", "One. Two. Three.")] });
++    flush();
++    expect(synth.texts()).toEqual(["One.", "Two. Three."]);
++    expect(fetchMock).not.toHaveBeenCalled();
++    setStore({
++      blocks: [final("r1", "item-1", "One. Two. Three."), final("r2", "item-2", "Next.")],
++    });
++    flush();
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    expect(synth.texts()).toEqual(["One.", "Two. Three."]);
++  });
++});
++
+ describe("useAeSpeakReplies", () => {
+   it("sends a cloud voice's sentences to the server, not the device", () => {
+     const fetchMock = vi.fn(() => new Promise<Response>(() => {}));
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 56d69b94bec35e6ee75f9c9209858a0c6d395233..c75fd50e1cf2c121354be527aff8c28aac82c64f 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -64,6 +64,7 @@ function say(text: string, voice: VoiceChoice | null, rate: number): void {
+ 
+ const CODE_BLOCK_KEY = normalizeSentence(CODE_BLOCK_PHRASE);
+ const MESSAGE_START = "^";
++const CUE_LOCK = "\0cue";
+ 
+ interface FinalText {
+   key: string;
+@@ -175,7 +176,18 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+         return [{ sentence, key }];
+       });
+     };
+-    const speakNew = (markdown: string, trail: { last: string }) => {
++    // One engine per response: its first spoken sentence locks the voice for the rest of it
++    // (and its final), so a late cloud list or a menu pick never overlaps the two queues.
++    const locks = new Map<string, VoiceChoice | null>();
++    const lockFor = (responseId: string): VoiceChoice | null => {
++      if (!locks.has(responseId)) {
++        const cue = locks.get(CUE_LOCK);
++        const first = [...locks.keys()].every((k) => k === CUE_LOCK);
++        locks.set(responseId, first && cue !== undefined ? cue : optsRef.current.voice);
++      }
++      return locks.get(responseId) ?? null;
++    };
++    const speakNew = (markdown: string, trail: { last: string }, responseId: string) => {
+       const fresh: string[] = [];
+       for (const { sentence, key } of sentenceKeys(markdown, trail.last)) {
+         trail.last = key;
+@@ -186,7 +198,7 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+       if (fresh.length === 0) return;
+       spokenThisTurn = true;
+       clearCue();
+-      say(fresh.join(" "), optsRef.current.voice, optsRef.current.rate);
++      say(fresh.join(" "), lockFor(responseId), optsRef.current.rate);
+     };
+     // Existing finals are handled and in-flight sources start at their current length, so
+     // nothing already on screen is read back. Only a live source seeds the spoken set, and
+@@ -197,6 +209,7 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+       offsets.clear();
+       trails.clear();
+       spoken.clear();
++      locks.clear();
+       for (const b of blocks) if (b.ctx.itemId) handled.add(b.ctx.itemId);
+       const scan = scanBlocks(blocks);
+       for (const f of scan.finals) handled.add(f.key);
+@@ -251,7 +264,8 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+           cueTimer = null;
+           if (!spokenThisTurn) {
+             spokenThisTurn = true;
+-            say(WORKING_CUE_TEXT, optsRef.current.voice, optsRef.current.rate);
++            if (!locks.has(CUE_LOCK)) locks.set(CUE_LOCK, optsRef.current.voice);
++            say(WORKING_CUE_TEXT, locks.get(CUE_LOCK) ?? null, optsRef.current.rate);
+           }
+         }, WORKING_CUE_DELAY_MS);
+         prevStatus = state.status;
+@@ -274,7 +288,7 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+           trail = { last: MESSAGE_START };
+           trails.set(key, trail);
+         }
+-        speakNew(ready, trail);
++        speakNew(ready, trail, source.responseId);
+       }
+       for (const f of scan.finals) {
+         if (handled.has(f.key)) continue;
+@@ -282,7 +296,7 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+         if (f.fromHistory && !knownResponses.has(f.responseId)) continue;
+         handled.add(f.key);
+         if (staleResponses.has(f.responseId)) continue;
+-        speakNew(stripTldr(f.fullText), { last: MESSAGE_START });
++        speakNew(stripTldr(f.fullText), { last: MESSAGE_START }, f.responseId);
+       }
+     };
+ 
+@@ -298,6 +312,7 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+       trails.clear();
+       staleResponses.clear();
+       spoken.clear();
++      locks.clear();
+     };
+   }, [enabled, chatId]);
+ 
+diff --git a/web/src/lib/aeCloudVoice.test.ts b/web/src/lib/aeCloudVoice.test.ts
+index d1e2e05a83c009aa72484b83bb2d9fd63b7bc51d..1923c704f897e9f26d5bd3f8fd444a839e56b576 100644
+--- a/web/src/lib/aeCloudVoice.test.ts
++++ b/web/src/lib/aeCloudVoice.test.ts
+@@ -14,9 +14,10 @@ class FakeAudio {
+   constructor() {
+     FakeAudio.last = this;
+   }
++  static plays: Promise<void>[] = [];
+   play() {
+     this.played.push(this.src);
+-    return Promise.resolve();
++    return FakeAudio.plays.shift() ?? Promise.resolve();
+   }
+   pause() {
+     this.pauses++;
+@@ -86,6 +87,7 @@ beforeEach(() => {
+   pending = [];
+   urls = [];
+   FakeAudio.last = null;
++  FakeAudio.plays = [];
+   resetCloudVoicesCache();
+   fetchMock = vi.fn((input: string, init?: RequestInit) => {
+     if (String(input).endsWith("/tts/voices")) {
+@@ -132,6 +134,20 @@ describe("fetchCloudVoices", () => {
+   });
+ });
+ 
++describe("fetchCloudVoices retry", () => {
++  it("does not cache a 503: the next call fetches again", async () => {
++    fetchMock.mockResolvedValueOnce(new Response("no", { status: 503 }));
++    expect(await fetchCloudVoices()).toEqual([]);
++    expect(await fetchCloudVoices()).toEqual([{ id: "a", name: "Ava" }]);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("keeps one request in flight", async () => {
++    await Promise.all([fetchCloudVoices(), fetchCloudVoices()]);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++});
++
+ describe("createCloudSpeaker", () => {
+   // 220 char chunks: use long sentences so each is its own chunk.
+   const sentence = (c: string) => `${c.repeat(150)}.`;
+@@ -231,4 +247,28 @@ describe("createCloudSpeaker", () => {
+     expect(cb).toHaveBeenCalledTimes(2);
+     off();
+   });
++  it("a stopped playback's late play() rejection leaves the next playback alone", async () => {
++    const speaker = createCloudSpeaker(new FakeDevice());
++    let rejectOld: (e: Error) => void = () => {};
++    FakeAudio.plays.push(
++      new Promise<void>((_, reject) => {
++        rejectOld = reject;
++      }),
++    );
++    speaker.speak("First.", OPTS);
++    await settle();
++    pending[0].resolve(mp3());
++    await settle();
++    speaker.stop();
++    speaker.speak("Second.", OPTS);
++    await settle();
++    pending[1].resolve(mp3());
++    await settle();
++    expect(FakeAudio.last?.played.length).toBe(2);
++    rejectOld(new Error("interrupted"));
++    await settle();
++    FakeAudio.last?.end();
++    await settle();
++    expect(speaker.speaking()).toBe(false);
++  });
+ });
+diff --git a/web/src/lib/aeCloudVoice.ts b/web/src/lib/aeCloudVoice.ts
+index 77f65d96cbb09f81880c4f04c35df9ef8d2a31ac..29314785a1bada4602c8c16b8b877004dd58625f 100644
+--- a/web/src/lib/aeCloudVoice.ts
++++ b/web/src/lib/aeCloudVoice.ts
+@@ -14,25 +14,33 @@ export interface CloudVoice {
+ 
+ const LOOKAHEAD = 2;
+ 
+-let voicesCache: Promise<CloudVoice[]> | null = null;
++// Only a successful list is kept; a failure is retried by the next call, one request at a time.
++let voicesCache: CloudVoice[] | null = null;
++let voicesInflight: Promise<CloudVoice[]> | null = null;
+ 
+ export function resetCloudVoicesCache(): void {
+   voicesCache = null;
++  voicesInflight = null;
+ }
+ 
+ /** The server's natural voices; empty when it offers none or cannot be reached. */
+ export function fetchCloudVoices(): Promise<CloudVoice[]> {
+-  voicesCache ??= (async () => {
++  if (voicesCache) return Promise.resolve(voicesCache);
++  voicesInflight ??= (async () => {
+     try {
+       const response = await authenticatedFetch(withBasePath("/v1/ae/tts/voices"));
+       if (response.status !== 200) return [];
+       const body = (await response.json()) as { voices?: CloudVoice[] };
+-      return Array.isArray(body.voices) ? body.voices : [];
++      const list = Array.isArray(body.voices) ? body.voices : [];
++      voicesCache = list;
++      return list;
+     } catch {
+       return [];
++    } finally {
++      voicesInflight = null;
+     }
+   })();
+-  return voicesCache;
++  return voicesInflight;
+ }
+ 
+ interface Item {
+@@ -86,15 +94,23 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+     }
+   };
+ 
++  let playToken = 0;
+   const play = (blob: Blob): Promise<boolean> => {
+     audio ??= new Audio();
+     const el = audio;
+     const url = URL.createObjectURL(blob);
++    const token = ++playToken;
+     return new Promise<boolean>((resolve) => {
++      // A late call from a stopped playback must not touch the next one's handlers.
++      let settled = false;
+       const finish = (ok: boolean) => {
+-        el.onended = null;
+-        el.onerror = null;
+-        release = null;
++        if (settled) return;
++        settled = true;
++        if (token === playToken) {
++          el.onended = null;
++          el.onerror = null;
++          release = null;
++        }
+         URL.revokeObjectURL(url);
+         resolve(ok);
+       };
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index c0e74817cc9b10d752608fa67d92aa1522bbb4cc..74699375194529b49d132039b659c9a87d8d6a4d 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -247,7 +247,7 @@ export const AE_SETTING_HINTS = {
+   },
+   "voice.voice": {
+     label: "Voice",
+-    hint: "Natural voices come from the cloud when the server has them; the rest are this device's. Saved per device. Default: the first natural voice.",
++    hint: "Natural voices come from the server when it has them; others are this device's. Saved per device. Default: first natural voice, else best.",
+     source: "existing",
+   },
+   "voice.rate": {
+diff --git a/web/src/lib/aeSpeakReplies.ts b/web/src/lib/aeSpeakReplies.ts
+index 2e839da5d0af551cdaa77031422983c18131702c..4385db22160c79132f4d84d7c5594598c472a3dc 100644
+--- a/web/src/lib/aeSpeakReplies.ts
++++ b/web/src/lib/aeSpeakReplies.ts
+@@ -89,6 +89,12 @@ export function readVoiceChoice(): VoiceChoice | null {
+   return { kind: "device", id: raw };
+ }
+ 
++/** True when the stored value predates the `cloud:` and `device:` prefixes. */
++export function isLegacyVoiceChoice(): boolean {
++  const raw = getItem(SPEAK_VOICE_KEY);
++  return !!raw && !/^(cloud|device):./.test(raw);
++}
++
+ export function writeVoiceChoice(choice: VoiceChoice | null): void {
+   setItem(SPEAK_VOICE_KEY, choice === null ? null : `${choice.kind}:${choice.id}`);
+ }

@@ -907,6 +907,10 @@ def overview(days: int) -> dict[str, Any]:
 
     With no cache and a recorded failure the answer is ``{"state": "error", "note": ...}``
     (HTTP 200); the card shows the note and keeps polling at its normal rate.
+
+    2026-11-07: the first answer after an idle stretch is the old one while the new one
+    computes, so a cached view carries ``"refreshing": True`` while a recompute for its
+    window is running (never otherwise); the page must not call that answer failing.
     """
     with _mu:
         loaded = _state["loaded"]
@@ -925,12 +929,20 @@ def overview(days: int) -> dict[str, Any]:
         recently_failed = failed is not None and time.monotonic() - failed < RETRY_S
         running = _state["running"].get(days)
         stuck = running is not None and time.monotonic() - running[0] >= STUCK_S
+        if stuck:
+            # A recompute that hangs never raises, so record it as a failure: the answer then
+            # stops saying "refreshing" and the page says the refresh is failing (2026-11-07).
+            # A later good answer clears it, as for any failure.
+            _state["errors"][days] = f"TimeoutError: recompute still running after {STUCK_S:.0f} s"
         if stale and (running is None or stuck) and not recently_failed:
             _state["gen"] += 1
             gen = _state["gen"]
             _state["running"][days] = (time.monotonic(), gen)
             start = True
         error = _state["errors"].get(days)
+        # A failure since the last good answer keeps saying failing, so a recompute that fails
+        # every time does not flip between "refreshing" and "refresh failing".
+        refreshing = (start or (running is not None and not stuck)) and error is None
     if start:
         try:
             _spawn(days, gen)
@@ -942,7 +954,10 @@ def overview(days: int) -> dict[str, Any]:
         if error:
             return {"state": "error", "days": days, "note": f"Could not read the runs ({error})"}
         return {"state": "warming", "days": days}
-    return dict(entry["view"])
+    view = dict(entry["view"])
+    if refreshing:
+        view["refreshing"] = True
+    return view
 
 
 def reset() -> None:

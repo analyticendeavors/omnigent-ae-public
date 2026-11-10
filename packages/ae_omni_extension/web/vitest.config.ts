@@ -7,6 +7,8 @@ import { resolve } from "node:path";
 export default {
   resolve: {
     alias: {
+      // serverBridge.test.ts imports upstream's real request parser, which imports this module.
+      "@/lib/identity": resolve(import.meta.dirname, "test/stubs/identity.ts"),
       "@omnigent/extension-sdk": resolve(
         import.meta.dirname,
         "../../../upstream/sdks/web-extension/src/index.ts",

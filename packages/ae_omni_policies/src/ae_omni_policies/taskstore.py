@@ -36,7 +36,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import date
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Literal
 from urllib.parse import quote_plus, urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -50,15 +50,21 @@ from ae_omni_policies.notes import (
     PARKING_SURFACE,
     QUADRANT_AXES,
     RESURFACE_DAYS,
+    TIME_ONLY,
     NoteFields,
     build_notes,
+    build_task_notes,
     estimate_for,
+    home_clock_instant,
     is_real_date,
     next_from_notes,
     normalize_tags,
+    normalize_task_tags,
+    one_line,
     repo_slug,
     resurface_date,
     summary_for,
+    task_estimate,
 )
 
 _logger = logging.getLogger(__name__)
@@ -70,6 +76,9 @@ REQUEST_TIMEOUT_S = 10.0
 # Distinct from the worker's "fork-triage" so a task's origin says which door
 # filed it. The re-read after a failed create matches on it.
 ORIGIN_SURFACE = "omnigent-ae"
+# How far before a create call began a row may be stamped and still be that call's
+# (the store's clock is not this host's).
+CREATED_SKEW_S = 60
 
 REDIRECT_ERROR = (
     "Cloudflare Access redirected to its login page, so it did not accept the service "
@@ -197,6 +206,24 @@ class ParkFields:
     tags: list[str] | None = None
     due_date: str | None = None
     issue_url: str | None = None
+
+
+@dataclass(frozen=True)
+class ReminderFields:
+    """``create_task``'s inputs: an ordinary task or reminder the user asked for directly.
+
+    Field names follow the worker's ``create_task`` schema.
+    """
+
+    title: str
+    list_name: str | None = None
+    due_date: str | None = None
+    due_time: str | None = None
+    notes: str | None = None
+    checklist: list[str] | None = None
+    tags: list[str] | None = None
+    quadrant: str | None = None
+    est: str | None = None
 
 
 def form_component(value: str) -> str:
@@ -667,6 +694,44 @@ class TaskStoreClient:
             "warnings": warnings,
         }
 
+    async def _find_reminder(
+        self, body: dict[str, Any], sent_at: datetime
+    ) -> dict[str, Any] | None:
+        """The task a failed :meth:`create_reminder` may have left behind, or ``None``.
+
+        Matches everything the request set that a repeat of it would also set (title,
+        origin, due, list and note), and only a task created since the call began, so
+        an older identical task is never mistaken for the new one. A row whose
+        ``created_at`` cannot be read is judged on the other fields alone.
+        """
+        recheck = await self.list_tasks("open")
+        if not recheck.ok or not isinstance(recheck.data, dict):
+            return None
+        floor = sent_at - timedelta(seconds=CREATED_SKEW_S)
+        matches: list[dict[str, Any]] = []
+        for task in recheck.data.get("tasks") or []:
+            if not (
+                isinstance(task, dict)
+                and task.get("title") == body["title"]
+                and task.get("origin_surface") == ORIGIN_SURFACE
+                and (task.get("due_at") or None) == body["due_at"]
+                and (task.get("bucket_id") or None) == body["bucket_id"]
+                and (task.get("notes") or "") == body["notes"]
+            ):
+                continue
+            try:
+                made = datetime.fromisoformat(str(task.get("created_at")).replace("Z", "+00:00"))
+            except ValueError:
+                matches.append(task)
+                continue
+            if made.tzinfo is None:
+                made = made.replace(tzinfo=UTC)
+            if made >= floor:
+                matches.append(task)
+        return (
+            max(matches, key=lambda task: str(task.get("created_at") or "")) if matches else None
+        )
+
     async def _find_created(self, title: str, notes: str) -> dict[str, Any] | None:
         """The task a failed create may have left behind: same title, same note, ours, newest.
 
@@ -843,6 +908,218 @@ class TaskStoreClient:
             "issue_url": issue_url_of(task.get("links")),
         }
 
+    async def list_lists(self) -> dict[str, Any]:
+        """The visible lists by exact name: the worker's ``list_lists``.
+
+        :returns: ``{"count", "lists"}``, or ``{"error"}`` when the store cannot answer.
+        """
+        listed = await self.list_buckets()
+        if not listed.ok:
+            return {"error": f"Could not read the lists: {listed.error}"}
+        payload = listed.data if isinstance(listed.data, dict) else {}
+        lists = [
+            {
+                "id": bucket.get("id"),
+                "name": bucket.get("name"),
+                "kind": bucket.get("kind"),
+                "surface": bucket.get("surface"),
+            }
+            for bucket in payload.get("buckets") or []
+            if isinstance(bucket, dict) and not bucket.get("hidden")
+        ]
+        return {"count": len(lists), "lists": lists}
+
+    async def create_reminder(
+        self, fields: ReminderFields, *, now: datetime | None = None
+    ) -> dict[str, Any]:
+        """Create a task or reminder the user asked for: the worker's ``create_task``.
+
+        A ``due_time`` sets ``reminder_at`` to the same instant, which is what the
+        task app pushes to the phone; a date alone is an all-day task with no push.
+        A create is never resent blind (no idempotency key): a call that never came
+        back is re-read by title and due instead.
+
+        :param fields: The title and the optional extras.
+        :param now: Override for "now", used only to warn about a time already past.
+        :returns: ``{"outcome": "created", ...}`` or ``{"outcome": "not_created",
+            "reason", ...}``. Never raises.
+        """
+
+        def refuse(reason: str, **extra: Any) -> dict[str, Any]:
+            return {"outcome": "not_created", "reason": reason, **extra}
+
+        warnings: list[str] = []
+        title = one_line(fields.title)
+        if not title:
+            return refuse("A title is required.")
+        day = (fields.due_date or "").strip()
+        clock = (fields.due_time or "").strip()
+        if clock and not day:
+            return refuse("due_time needs a due_date.")
+        if day and not is_real_date(day):
+            return refuse(f'due_date "{fields.due_date}" is not a real YYYY-MM-DD date.')
+        if clock and not TIME_ONLY.match(clock):
+            return refuse(f'due_time "{fields.due_time}" is not HH:MM on a 24-hour clock.')
+        if fields.quadrant is not None and fields.quadrant not in QUADRANT_AXES:
+            return refuse(
+                f'quadrant "{fields.quadrant}" is not one of {", ".join(QUADRANT_AXES)}.'
+            )
+
+        bucket: dict[str, Any] | None = None
+        wanted = (fields.list_name or "").strip()
+        if wanted:
+            listed = await self.list_buckets()
+            if not listed.ok:
+                return refuse(f"Could not read the lists ({listed.error}).")
+            payload = listed.data if isinstance(listed.data, dict) else {}
+            visible = [
+                b
+                for b in payload.get("buckets") or []
+                if isinstance(b, dict) and not b.get("hidden")
+            ]
+            hits = [
+                b for b in visible if str(b.get("name") or "").strip().lower() == wanted.lower()
+            ]
+            if len(hits) != 1:
+                return refuse(
+                    f'More than one list is called "{wanted}".'
+                    if hits
+                    else f'No list is called "{wanted}".',
+                    lists=[b.get("name") for b in visible],
+                    instruction=(
+                        "Ask the user which list they mean, then call again with its exact name."
+                    ),
+                )
+            bucket = hits[0]
+
+        due_at: str | None = None
+        reminder_at: str | None = None
+        if day and clock:
+            due_at = reminder_at = home_clock_instant(day, clock, self.settings.tz)
+            at = datetime.fromisoformat(due_at.replace("Z", "+00:00"))
+            if at <= (now or datetime.now(UTC)):
+                warnings.append(
+                    "That time has already passed, so no reminder will be pushed. "
+                    "The task is filed anyway."
+                )
+        elif day:
+            due_at = f"{day}T00:00:00Z"
+
+        body: dict[str, Any] = {
+            "title": title,
+            "notes": build_task_notes(fields.notes, fields.checklist),
+            "kind": "task",
+            "status": "open",
+            "tags": normalize_task_tags(fields.tags),
+            "origin_surface": ORIGIN_SURFACE,
+            "bucket_id": bucket.get("id") if bucket else None,
+            "due_at": due_at,
+            "due_is_all_day": 1 if due_at and not reminder_at else 0,
+            "reminder_at": reminder_at,
+            "floating": 1,
+        }
+        if fields.quadrant:
+            body.update(QUADRANT_AXES[fields.quadrant])
+        estimate = task_estimate(fields.est)
+        if estimate:
+            body["estimate"] = estimate
+
+        sent_at = datetime.now(UTC)
+        created = await self.create_task(body)
+        if not created.ok and created.kind in ("transport", "server"):
+            # The POST may well have landed: a timeout, or a 5xx from the edge after
+            # the origin committed. There is no idempotency key, so re-read instead of
+            # resending: a second alarm on the phone is worse than one "add it by hand".
+            match = await self._find_reminder(body, sent_at)
+            if match is not None:
+                warnings.append(
+                    f"The create call failed ({created.error}) but the task was there on "
+                    "re-read; not sent twice."
+                )
+                created = Result(ok=True, status=201, data=match)
+        if not created.ok:
+            return refuse(
+                created.error,
+                instruction=(
+                    "Tell the user the task was not created, and give them the title, "
+                    "list, date and time to add by hand."
+                ),
+            )
+
+        task = created.data if isinstance(created.data, dict) else {}
+        task_id = task.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            return refuse(f"the store answered {created.status} without a task id")
+        tz = self.settings.tz
+        return {
+            "outcome": "created",
+            "task_id": task_id,
+            "title": task.get("title") or title,
+            "url": self.view_url(
+                str(task.get("title") or title), bucket.get("id") if bucket else None
+            ),
+            "url_is": (
+                f"the {bucket.get('name')} list, searched down to this task (the app has no "
+                "per-task route)"
+                if bucket
+                else "every task, searched down to this one (the app has no per-task route)"
+            ),
+            "list": {"id": bucket.get("id"), "name": bucket.get("name")} if bucket else None,
+            "due": (f"{day} {clock} ({tz})" if clock else f"{day}, all day") if day else None,
+            "reminder": (
+                f"pushed at {day} {clock} ({tz})" if reminder_at else "none: no time was given"
+            ),
+            "quadrant": task.get("quadrant"),
+            "estimate": task.get("estimate"),
+            "tags": task.get("tags"),
+            "warnings": warnings,
+        }
+
+    async def cancel(self, task_id: str) -> dict[str, Any]:
+        """Cancel (drop) an open task this connector created; it never erases anything.
+
+        The task app refuses ``DELETE`` from a machine credential on purpose, so
+        "delete a reminder" means status ``dropped``: the task leaves the user's lists,
+        its alarm stops (the push query skips dropped tasks), and they can reopen it
+        in the app. Refuses anything this connector did not create, a parked fork
+        (``complete_task`` finishes those and closes their issue), or a task that is
+        no longer open, so it cannot drop a task the user made or is working.
+
+        :param task_id: The task's id, as ``create_task`` or ``list_parked`` gave it.
+        :returns: ``{"outcome": "cancelled", ...}`` or ``{"outcome": "not_cancelled",
+            "task_id", "reason"}``. Never raises.
+        """
+
+        def refuse(reason: str) -> dict[str, Any]:
+            return {"outcome": "not_cancelled", "task_id": task_id, "reason": reason}
+
+        read = await self.get_task(task_id)
+        if not read.ok:
+            return refuse(read.error)
+        task = read.data if isinstance(read.data, dict) else {}
+        if task.get("origin_surface") != ORIGIN_SURFACE:
+            return refuse(
+                "That task was not created by this connector, so it is the user's to change "
+                "in the app."
+            )
+        if "parked" in (task.get("tags") or []):
+            return refuse(
+                "That is a parked fork. Finish it with complete_task, which also closes its "
+                "GitHub issue; cancelling would leave the issue open."
+            )
+        if task.get("kind") != "task" or task.get("status") != "open":
+            return refuse(f"Only an open task can be cancelled; this one is {task.get('status')}.")
+        patched = await self.patch_task(task_id, {"status": "dropped"})
+        if not patched.ok:
+            return refuse(patched.error)
+        return {
+            "outcome": "cancelled",
+            "task_id": task_id,
+            "title": task.get("title"),
+            "status": "dropped",
+            "undo": "Reopen it in the task app; nothing was deleted.",
+        }
+
     def _present(self, task: dict[str, Any], bucket_id: str) -> dict[str, Any]:
         due_at = task.get("due_at")
         return {
@@ -869,6 +1146,7 @@ __all__ = [
     "ORIGIN_SURFACE",
     "USER_AGENT",
     "ParkFields",
+    "ReminderFields",
     "Result",
     "Settings",
     "TaskStoreClient",

@@ -1,0 +1,341 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 08:51:41 -0800
+Subject: [PATCH 330/333] [ae-patch] Read a chat's running Claude login before
+ its stored pick, and say when a switch waits for the next message
+
+A switch on a chat with no running terminal stores the new login for its next
+start, so the stored pick and the running login differ until then. The web read
+the stored pick first while the server reads the running login first, so the
+Switch account button offered the login the chat already ran on, and each tap
+flipped the stored pick back and forth without restarting anything.
+
+aeChatAccount now reads the running login first, as the server does. The menu
+sends a switch unless the login is both running and stored, so picking the
+running login puts it back as the stored one. A switch the server answers with
+queued (no terminal running) toasts "This chat starts on X at its next
+message" instead of "now runs on X".
+---
+ web/src/components/AeActionDock.test.tsx      | 19 ++++++-
+ web/src/components/AeActionDock.tsx           |  3 +-
+ web/src/lib/aeClaudeAccount.test.ts           | 32 ++++++++++-
+ web/src/lib/aeClaudeAccount.ts                | 22 ++++++--
+ .../AeSessionClaudeAccountGroup.test.tsx      | 53 ++++++++++++++++++-
+ web/src/shell/AeSessionClaudeAccountGroup.tsx | 16 +++++-
+ 6 files changed, 135 insertions(+), 10 deletions(-)
+
+diff --git a/web/src/components/AeActionDock.test.tsx b/web/src/components/AeActionDock.test.tsx
+index 7b6607420ad3e68b5647567de33576eb39c771da..62fefd8718659a6f1dd79fca3500266be642a515 100644
+--- a/web/src/components/AeActionDock.test.tsx
++++ b/web/src/components/AeActionDock.test.tsx
+@@ -656,7 +656,9 @@ function renderLimitDock({
+   noModelMenu = false,
+   onSwitchModel = vi.fn(),
+   openForkDialog = vi.fn(),
++  labels = {},
+ }: {
++  labels?: Record<string, string>;
+   harness?: string;
+   canFork?: boolean;
+   disabledReason?: string;
+@@ -666,7 +668,7 @@ function renderLimitDock({
+ } = {}) {
+   useChatStore.setState({ conversationId: "s1", blocks: [], sessionHarness: harness });
+   const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+-  qc.setQueryData(["session", "s1"], { id: "s1", hostId: "h1", labels: {} });
++  qc.setQueryData(["session", "s1"], { id: "s1", hostId: "h1", labels });
+   render(
+     <QueryClientProvider client={qc}>
+       <MemoryRouter initialEntries={["/c/s1"]}>
+@@ -767,6 +769,21 @@ describe("AeActionDock usage gate", () => {
+     expect(screen.getByTestId("ask").textContent).toBe("");
+   });
+ 
++  it("offers the login other than the one the chat runs on, not other than a stored pick", async () => {
++    // Move all stored the default on a chat that was not running; its terminal is still on Personal.
++    serveLimits(() => limitsAnswer(95));
++    renderLimitDock({
++      labels: { "omnigent.claude_native.account": "", "ae.claude_account": "personal" },
++    });
++    fireEvent.click(await screen.findByTestId("ae-dock-limit-account"));
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        "/v1/ae/sessions/s1/claude-account",
++        expect.objectContaining({ body: JSON.stringify({ account: "" }) }),
++      ),
++    );
++  });
++
+   it("a switch that went through re-reads this chat's Usage on the follow-up schedule", async () => {
+     vi.useFakeTimers({ shouldAdvanceTime: true });
+     try {
+diff --git a/web/src/components/AeActionDock.tsx b/web/src/components/AeActionDock.tsx
+index 800317ea19de454c6af1516b43bdece720ffaa5e..f4ac4415f9efbe509569f916e9764a885f8b6136 100644
+--- a/web/src/components/AeActionDock.tsx
++++ b/web/src/components/AeActionDock.tsx
+@@ -76,6 +76,7 @@ import { AeCompactButton } from "@/components/aeRail/AeCompactButton";
+ import { AE_ADMIN_CENTER_PATH } from "@/lib/aePrDeploy";
+ import type { AeReceiptTone } from "@/lib/aePrReceipt";
+ import { aeCiText } from "@/lib/aePrs";
++import { aeSwitchSummary } from "@/lib/aeClaudeAccount";
+ import { aeSwitchOrAsk } from "@/lib/aeSwitchFamily";
+ import { AeTablerSvg } from "@/lib/aeTablerIcon";
+ import type { AeTablerIconNode } from "@/lib/aeTablerIconData";
+@@ -699,7 +700,7 @@ function Dock({ sessionId, onSwitchModel }: { sessionId?: string; onSwitchModel?
+         switchAccount.mutate(
+           { account },
+           {
+-            onSuccess: () => showToast(`This chat now runs on ${label}.`),
++            onSuccess: (answer) => showToast(aeSwitchSummary(label, answer)),
+             onError: (failure) => showToast(failure.message),
+           },
+         ),
+diff --git a/web/src/lib/aeClaudeAccount.test.ts b/web/src/lib/aeClaudeAccount.test.ts
+index d35390761a61b16c84162bd4c37e57359d55fc69..76c1065a53c31e59ce38f22cd68bbd78803e392d 100644
+--- a/web/src/lib/aeClaudeAccount.test.ts
++++ b/web/src/lib/aeClaudeAccount.test.ts
+@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
+ import {
+   AE_ACCOUNT_FOLLOW_UP_DELAYS_MS,
+   aeChatAccount,
++  aeChatAccountSettled,
+   aeMoveAllSummary,
+   aeRefreshChatAccountSoon,
+   aeSwitchSummary,
+@@ -11,16 +12,39 @@ import { aeOtherClaudeAccounts } from "./aeLimitGate";
+ import { askAeMoveAll, dismissAeMoveAll } from "./aeMoveAllChats";
+ 
+ describe("aeChatAccount", () => {
+-  it("prefers the stored pick over the last launch, and treats an empty pick as the default", () => {
++  it("prefers the last launch over a stored pick, as the server does", () => {
+     expect(aeChatAccount({ "ae.claude_account": "B" })).toBe("B");
++    // A pick stored while the chat was not running is not its login until it starts.
+     expect(aeChatAccount({ "omnigent.claude_native.account": "", "ae.claude_account": "B" })).toBe(
++      "B",
++    );
++    expect(aeChatAccount({ "ae.claude_account": "", "omnigent.claude_native.account": "B" })).toBe(
+       "",
+     );
++    expect(aeChatAccount({ "omnigent.claude_native.account": "" })).toBe("");
+     expect(aeChatAccount({})).toBeUndefined();
+     expect(aeChatAccount(null)).toBeUndefined();
+   });
+ });
+ 
++describe("aeChatAccountSettled", () => {
++  it("is true only when the chat runs on the login and has no other one stored", () => {
++    expect(aeChatAccountSettled({ "ae.claude_account": "B" }, "B")).toBe(true);
++    expect(
++      aeChatAccountSettled(
++        { "omnigent.claude_native.account": "B", "ae.claude_account": "B" },
++        "B",
++      ),
++    ).toBe(true);
++    // Running on B with the default stored: picking B again puts B back as the stored login.
++    expect(
++      aeChatAccountSettled({ "omnigent.claude_native.account": "", "ae.claude_account": "B" }, "B"),
++    ).toBe(false);
++    expect(aeChatAccountSettled({ "ae.claude_account": "B" }, "")).toBe(false);
++    expect(aeChatAccountSettled({}, "")).toBe(false);
++  });
++});
++
+ describe("aeMoveAllSummary", () => {
+   it("names the moved count and each skipped chat", () => {
+     expect(
+@@ -69,6 +93,12 @@ describe("aeSwitchSummary", () => {
+     expect(aeSwitchSummary("Backup", own)).toBe("This chat now runs on Backup.");
+   });
+ 
++  it("says the chat starts on the login next time when no terminal was running", () => {
++    expect(aeSwitchSummary("Backup", { account: "B", relaunched: false, queued: true })).toBe(
++      "This chat starts on Backup at its next message.",
++    );
++  });
++
+   it("counts moved children and names each skipped or slow one", () => {
+     expect(
+       aeSwitchSummary("Backup", {
+diff --git a/web/src/lib/aeClaudeAccount.ts b/web/src/lib/aeClaudeAccount.ts
+index 289faff1f76e2496c92ec0c5bdf5c08b1c33e4f0..7a50b3436340429fcf0e54e1fc406f7a86fc1e7a 100644
+--- a/web/src/lib/aeClaudeAccount.ts
++++ b/web/src/lib/aeClaudeAccount.ts
+@@ -44,6 +44,8 @@ export interface AeSwitchAnswer {
+   /** False when no runner is bound (the next launch uses the login) or the restart is unconfirmed. */
+   relaunched: boolean;
+   pending?: boolean;
++  /** The chat has no running terminal: the login is stored and the chat starts on it next time. */
++  queued?: boolean;
+   /** Present only when the switch asked for the children too. */
+   children?: AeChildrenAnswer;
+ }
+@@ -103,12 +105,24 @@ export function aeRefreshChatAccountSoon(
+   return cancel;
+ }
+ 
+-/** The login a chat is on: the stored pick, else the last launch's, else unknown (`undefined`). */
++/**
++ * The login a chat is on: the last launch's, else the stored pick, else unknown (`undefined`).
++ * Same order as the server: a pick stored while the chat was not running is not its login yet.
++ */
+ export function aeChatAccount(
+   labels: Record<string, string> | null | undefined,
+ ): string | undefined {
+   const held = labels ?? {};
+-  return held[AE_SERVER_ACCOUNT_LABEL] ?? held[AE_LIVE_ACCOUNT_LABEL];
++  return held[AE_LIVE_ACCOUNT_LABEL] ?? held[AE_SERVER_ACCOUNT_LABEL];
++}
++
++/** Whether the chat both runs on `account` and has it stored, so a switch to it changes nothing. */
++export function aeChatAccountSettled(
++  labels: Record<string, string> | null | undefined,
++  account: string,
++): boolean {
++  const stored = (labels ?? {})[AE_SERVER_ACCOUNT_LABEL];
++  return aeChatAccount(labels) === account && (stored === undefined || stored === account);
+ }
+ 
+ export async function putAeClaudeAccount(
+@@ -168,7 +182,9 @@ const plural = (count: number, noun: string) => `${count} ${noun}${count === 1 ?
+  * Reviewer is mid-reply". Without a `children` answer it is the plain one-chat line.
+  */
+ export function aeSwitchSummary(label: string, answer: AeSwitchAnswer): string {
+-  const own = `This chat now runs on ${label}`;
++  const own = answer.queued
++    ? `This chat starts on ${label} at its next message`
++    : `This chat now runs on ${label}`;
+   const kids = answer.children;
+   if (!kids) return `${own}.`;
+   if (kids.error) return `${own}; its child chats were not switched`;
+diff --git a/web/src/shell/AeSessionClaudeAccountGroup.test.tsx b/web/src/shell/AeSessionClaudeAccountGroup.test.tsx
+index 3fda4b9ad14f639a120460bc4e3fab6e5cb65d0b..af32e8621a8ba4d65bd4a5ec6354a1c555d175ea 100644
+--- a/web/src/shell/AeSessionClaudeAccountGroup.test.tsx
++++ b/web/src/shell/AeSessionClaudeAccountGroup.test.tsx
+@@ -9,11 +9,13 @@ import { dismissAeMoveAll } from "@/lib/aeMoveAllChats";
+ import { dismissAeSwitchFamily, useAeSwitchFamilyRequest } from "@/lib/aeSwitchFamily";
+ 
+ vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
++vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
+ const familyRows = vi.hoisted(() => ({ rows: [] as unknown[] }));
+ vi.mock("@/lib/aeFamilyRead", () => ({
+   aeReadFamilySessions: () => Promise.resolve(familyRows.rows),
+   aeFamilyOf: () => [],
+ }));
++import { showToast } from "@/components/ui/toast";
+ import { authenticatedFetch } from "@/lib/identity";
+ 
+ const mutate = vi.fn();
+@@ -58,6 +60,7 @@ function renderMenu(turnBusy = false, sessionId = "s1") {
+ beforeEach(() => {
+   mutate.mockReset();
+   vi.mocked(authenticatedFetch).mockReset();
++  vi.mocked(showToast).mockReset();
+   dismissAeMoveAll();
+   dismissAeSwitchFamily();
+   familyRows.rows = [];
+@@ -88,13 +91,59 @@ describe("Account submenu inside a chat", () => {
+     expect(screen.getByTestId("composer-claude-account-value")).toHaveTextContent("AE Backup");
+   });
+ 
+-  it("the server label outranks the live label", () => {
++  it("ticks the login the chat runs on, not a pick stored while it was not running", () => {
+     labels = { "omnigent.claude_native.account": "", "ae.claude_account": "AE Backup" };
+     renderMenu();
+-    expect(screen.getByTestId("composer-claude-account-chat-default")).toHaveAttribute(
++    expect(screen.getByTestId("composer-claude-account-chat-AE Backup")).toHaveAttribute(
+       "aria-checked",
+       "true",
+     );
++    expect(screen.getByTestId("composer-claude-account-chat-default")).toHaveAttribute(
++      "aria-checked",
++      "false",
++    );
++  });
++
++  it("picking the running login puts it back when another login is stored", async () => {
++    labels = { "omnigent.claude_native.account": "", "ae.claude_account": "AE Backup" };
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ account: "AE Backup", relaunched: false }),
++    );
++    renderMenu();
++    fireEvent.click(screen.getByTestId("composer-claude-account-chat-AE Backup"));
++    await waitFor(() =>
++      expect(authenticatedFetch).toHaveBeenCalledWith(
++        "/v1/ae/sessions/s1/claude-account",
++        expect.objectContaining({ body: JSON.stringify({ account: "AE Backup" }) }),
++      ),
++    );
++  });
++
++  it("sends nothing for the login the chat already runs on and has stored", () => {
++    labels = { "omnigent.claude_native.account": "AE Backup", "ae.claude_account": "AE Backup" };
++    renderMenu();
++    fireEvent.click(screen.getByTestId("composer-claude-account-chat-AE Backup"));
++    expect(authenticatedFetch).not.toHaveBeenCalled();
++  });
++
++  it("says where a chat with no running terminal starts next", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() =>
++      json({ account: "", relaunched: false, queued: true }),
++    );
++    renderMenu();
++    fireEvent.click(screen.getByTestId("composer-claude-account-chat-default"));
++    await waitFor(() =>
++      expect(showToast).toHaveBeenCalledWith("This chat starts on AE Default at its next message."),
++    );
++  });
++
++  it("adds no toast when the chat restarted on the login", async () => {
++    vi.mocked(authenticatedFetch).mockImplementation(() => json({ account: "", relaunched: true }));
++    renderMenu();
++    fireEvent.click(screen.getByTestId("composer-claude-account-chat-default"));
++    await waitFor(() => expect(authenticatedFetch).toHaveBeenCalled());
++    await act(async () => {});
++    expect(showToast).not.toHaveBeenCalled();
+   });
+ 
+   it("picking a login calls the PUT, then re-reads the chat and its Usage", async () => {
+diff --git a/web/src/shell/AeSessionClaudeAccountGroup.tsx b/web/src/shell/AeSessionClaudeAccountGroup.tsx
+index 91869462212c29b4b093faa3e4c02cac9fc297fa..06e98da57e373ed6ff381e6e91e066b50805575d 100644
+--- a/web/src/shell/AeSessionClaudeAccountGroup.tsx
++++ b/web/src/shell/AeSessionClaudeAccountGroup.tsx
+@@ -11,6 +11,7 @@ import {
+   DropdownMenuRadioItem,
+   DropdownMenuSeparator,
+ } from "@/components/ui/dropdown-menu";
++import { showToast } from "@/components/ui/toast";
+ import { useAeSwitchClaudeAccount } from "@/hooks/useAeSwitchClaudeAccount";
+ import type { DetectedCredential } from "@/hooks/useHosts";
+ import { useSession } from "@/hooks/useSession";
+@@ -20,6 +21,8 @@ import {
+   AE_THIS_CHAT_HEADING,
+   AE_THIS_CHAT_HINT,
+   aeChatAccount,
++  aeChatAccountSettled,
++  aeSwitchSummary,
+ } from "@/lib/aeClaudeAccount";
+ import { AE_MENU_NOTE_CLASS } from "@/lib/aeMenuRow";
+ import { aeSwitchOrAsk } from "@/lib/aeSwitchFamily";
+@@ -96,11 +99,20 @@ export function AeThisChatAccounts({
+               className={cn(RADIO_ROW_CLASS, "flex items-center gap-2")}
+               onSelect={(event) => {
+                 event.preventDefault();
+-                if (accountId === current) return;
++                if (aeChatAccountSettled(session?.labels, accountId)) return;
+                 aeSwitchOrAsk(
+                   queryClient,
+                   { sessionId, account: accountId, label: row.source },
+-                  () => change.mutate({ account: accountId }),
++                  () =>
++                    change.mutate(
++                      { account: accountId },
++                      {
++                        // The tick stays on the running login, so say where the chat starts next.
++                        onSuccess: (answer) => {
++                          if (answer.queued) showToast(aeSwitchSummary(row.source, answer));
++                        },
++                      },
++                    ),
+                 );
+               }}
+               data-testid={`composer-claude-account-chat-${accountId || "default"}`}

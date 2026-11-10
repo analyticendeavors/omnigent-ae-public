@@ -444,6 +444,61 @@ def test_fresh_cache_does_not_refresh_and_old_cache_does(
     assert started == [30]
 
 
+def test_stale_cache_with_refresh_in_flight_says_refreshing(
+    _files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    started: list[int] = []
+    monkeypatch.setattr(preset_stats, "_spawn", lambda d, g=0: started.append(d))
+    now = [1000.0]
+    monkeypatch.setattr(preset_stats.time, "time", lambda: now[0])
+    preset_stats._state["loaded"] = True
+    view = {"state": "ready", "marker": 1}
+    preset_stats._state["windows"]["30"] = {"at": 1000.0, "view": view}
+    assert "refreshing" not in preset_stats.overview(30)  # fresh
+    now[0] = 1000.0 + preset_stats.CACHE_TTL_S
+    first = preset_stats.overview(30)
+    assert first["marker"] == 1 and first["refreshing"] is True and started == [30]
+    again = preset_stats.overview(30)  # one already running, not stuck
+    assert again["refreshing"] is True and started == [30]
+    assert "refreshing" not in view  # cached dict untouched
+    assert "refreshing" not in preset_stats._state["windows"]["30"]["view"]
+
+
+def test_hung_recompute_stops_saying_refreshing(
+    _files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A recompute that never returns is recorded as failed once it passes STUCK_S, so the
+    # answer stops saying refreshing; the retry it starts still runs (2026-11-07).
+    started: list[int] = []
+    monkeypatch.setattr(preset_stats, "_spawn", lambda d, g=0: started.append(d))
+    clock = [5000.0]
+    monkeypatch.setattr(preset_stats.time, "monotonic", lambda: clock[0])
+    preset_stats._state["loaded"] = True
+    preset_stats._state["windows"]["30"] = {"at": 0.0, "view": {"state": "ready", "marker": 1}}
+    assert preset_stats.overview(30)["refreshing"] is True and started == [30]
+    clock[0] += preset_stats.STUCK_S
+    second = preset_stats.overview(30)
+    assert "refreshing" not in second and second["marker"] == 1
+    assert started == [30, 30]  # superseded and retried
+    assert preset_stats._state["errors"][30].startswith("TimeoutError")
+    assert "refreshing" not in preset_stats.overview(30)  # the retry runs, still not refreshing
+
+
+def test_recently_failed_refresh_is_not_refreshing(
+    _files: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(preset_stats, "_spawn", lambda d, g=0: None)
+    preset_stats._state["loaded"] = True
+    preset_stats._state["windows"]["30"] = {"at": 0.0, "view": {"state": "ready", "marker": 1}}
+    preset_stats._state["failed"][30] = preset_stats.time.monotonic()
+    assert "refreshing" not in preset_stats.overview(30)
+    # Past RETRY_S a retry starts, but a failure since the last good answer still says failing.
+    preset_stats._state["failed"][30] = preset_stats.time.monotonic() - preset_stats.RETRY_S - 1
+    preset_stats._state["errors"][30] = "RuntimeError: store down"
+    assert "refreshing" not in preset_stats.overview(30)
+    assert 30 in preset_stats._state["running"]
+
+
 def test_failed_refresh_keeps_old_answer_and_backs_off(
     _files: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

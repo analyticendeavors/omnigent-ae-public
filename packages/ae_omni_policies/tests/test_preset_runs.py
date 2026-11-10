@@ -265,7 +265,9 @@ def test_agents_cost_and_review_are_collected(rig: Rig) -> None:
         "seconds": 2940,
         "cost_usd": None,
         "hung": False,
+        "persona": None,
     }
+    assert agents["rev"]["persona"] == "codex"
     assert agents["sub2"]["role"] == "unknown" and agents["sub2"]["model"] is None
     assert line["cost"]["by_model"]["opus"]["usd"] == 3.0
     assert line["cost"]["total_usd"] == 3.5
@@ -275,6 +277,22 @@ def test_agents_cost_and_review_are_collected(rig: Rig) -> None:
         "findings_returned": 6,
         "findings_fixed": 5,
         "reviewer_sessions": 1,
+        "rounds": [
+            {
+                "round": 1,
+                "reviewers": 2,
+                "personas": None,
+                "findings_returned": 5,
+                "findings_fixed": 4,
+            },
+            {
+                "round": 2,
+                "reviewers": 1,
+                "personas": None,
+                "findings_returned": 1,
+                "findings_fixed": 1,
+            },
+        ],
     }
     assert [c["session"] for c in line["model_changes"]] == ["lead"]
     assert line["lead"]["model"] == "opus"
@@ -479,6 +497,59 @@ def test_a_line_without_a_report_says_so(rig: Rig) -> None:
     rig.sweep()
     review = rig.lines()[0]["review"]
     assert review["reported"] is False and review["reviewers_run"] is None
+
+
+def lead_picks_line(rig: Rig, advisor_on: Any, session: str = "lead") -> dict[str, Any]:
+    rig.sweeper._resolve = lambda _conv: ("lead-picks", None)
+    rig.sweeper._advisor_on = advisor_on
+    rig.add(Conv(session, status(labels.REVIEW)))
+    rig.sweep()
+    return next(line for line in rig.lines() if line["session"] == session)
+
+
+def test_a_lead_picks_line_says_whether_the_advisor_was_available(rig: Rig) -> None:
+    seen: list[str | None] = []
+
+    def on(user: str | None) -> bool:
+        seen.append(user)
+        return True
+
+    line = lead_picks_line(rig, on)
+    assert line["advisor_on"] is True and line["advisor"] == []
+    assert seen == ["owner"]
+
+
+def test_a_lead_picks_line_says_off_when_the_advisor_is_off_or_broken(rig: Rig) -> None:
+    assert lead_picks_line(rig, lambda _user: False)["advisor_on"] is False
+
+    def boom(_user: str | None) -> bool:
+        raise RuntimeError("broken")
+
+    # A fresh session: the first one already has its line, so only a new run reaches `boom`.
+    assert lead_picks_line(rig, boom, "lead-two")["advisor_on"] is False
+
+
+def test_a_fixed_preset_line_has_no_advisor_on_field(rig: Rig) -> None:
+    rig.sweeper._advisor_on = lambda _user: True
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    rig.sweep()
+    assert "advisor_on" not in rig.lines()[0]
+
+
+def test_the_default_advisor_check_is_false_on_any_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from ae_omni_policies import decision_advisor
+
+    monkeypatch.setattr(decision_advisor, "available", lambda owner: owner == "owner")
+    assert preset_runs.advisor_available("owner") is True
+    assert preset_runs.advisor_available("other") is False
+
+    def boom(owner: str | None) -> bool:
+        raise RuntimeError("broken")
+
+    monkeypatch.setattr(decision_advisor, "available", boom)
+    assert preset_runs.advisor_available("owner") is False
 
 
 def test_the_default_resolver_names_custom_and_fingerprints_the_behaviour(
@@ -815,3 +886,139 @@ def test_the_run_key_carries_the_outcome_and_survives_a_zero_time(rig: Rig) -> N
         first = data["ended"]["a"]["run_key"]
     assert first == "a:0:review"
     assert rig.sweeper._ended_entry("a", "archived", 0.0, NOW)["run_key"] == "a:0:archived"
+
+
+def test_rounds_accumulate_across_calls_and_skip_a_repeated_call_id(rig: Rig) -> None:
+    preset_runs.record_review(
+        rig.state, "lead", 2, 5, 4, call_id="r1", personas=["general", "security"]
+    )
+    preset_runs.record_review(rig.state, "lead", 9, 9, 9, call_id="r1")
+    preset_runs.record_review(rig.state, "lead", 1, 0, 0, personas=["Bad Id", "/a/path"])
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    rig.sweep()
+    review = rig.lines()[0]["review"]
+    assert [r["round"] for r in review["rounds"]] == [1, 2]
+    assert review["rounds"][0]["personas"] == ["general", "security"]
+    assert review["rounds"][1]["personas"] is None
+    assert review["reviewers_run"] == 3
+
+
+def test_a_late_report_adds_a_round_to_the_amended_line(rig: Rig) -> None:
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    preset_runs.record_review(rig.state, "lead", 1, 2, 1)
+    rig.sweep()
+    rig.now += 60
+    result = preset_runs.record_review(rig.state, "lead", 2, 3, 3, now=rig.now)
+    assert result["status"] == "amended"
+    last = rig.lines()[-1]
+    assert [r["round"] for r in last["review"]["rounds"]] == [1, 2]
+    assert last["review"]["rounds"][1]["findings_returned"] == 3
+
+
+def test_a_run_without_a_report_has_no_rounds(rig: Rig) -> None:
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    rig.sweep()
+    assert rig.lines()[0]["review"]["rounds"] == []
+    assert rig.lines()[0]["files_touched"] is None
+
+
+def test_reviewer_persona_mapping() -> None:
+    f = preset_runs.reviewer_persona
+    assert f("codex", "reviewer", "x") == "codex"
+    assert f("subagent", "reviewer", "Reviewer: security pass over the diff") == "security"
+    assert f("subagent", "reviewer", "Reviewer A: check it") == "general"
+    assert f("session", "reviewer", None) == "general"
+    assert f("subagent", "builder", "Builder: security fix") is None
+    assert f("subagent", "unknown", "security") is None
+
+
+def test_reviewer_rows_carry_a_persona(rig: Rig) -> None:
+    rig.add(Conv("lead", status(labels.WORKING)))
+    rig.add(
+        Conv(
+            "sub",
+            parent_conversation_id="lead",
+            kind="sub_agent",
+            labels={"omnigent.claude_native.description": "Reviewer: security look"},
+        )
+    )
+    rig.sweep()
+    rig.convs["lead"].labels = status(labels.REVIEW)
+    rig.sweep()
+    assert rig.lines()[0]["agents"][0]["persona"] == "security"
+
+
+def test_step_downs_carry_raised_back_s(rig: Rig) -> None:
+    rig.add(Conv("lead", status(labels.WORKING)))
+    rig.sweep()
+    for kind, at in (("lower", 10), ("raise", 70), ("lower", 100), ("raise", 105)):
+        model_log.append(
+            {"session": "lead", "from": {}, "to": {}, "kind": kind}, now=NOW - 1000 + at
+        )
+    model_log.append({"session": "lead", "from": {}, "to": {}, "kind": "lower"}, now=NOW - 5)
+    model_log.append({"session": "other", "from": {}, "to": {}, "kind": "raise"}, now=NOW - 900)
+    rig.convs["lead"].labels = status(labels.REVIEW)
+    rig.sweep()
+    changes = rig.lines()[0]["model_changes"]
+    assert [c["raised_back_s"] for c in changes] == [60, None, 5, None, None]
+
+
+def test_old_lines_without_the_new_fields_still_read() -> None:
+    from ae_omni_policies import preset_stats
+
+    old = {
+        "session": "s",
+        "preset": "balanced",
+        "review": {
+            "reported": True,
+            "reviewers_run": 1,
+            "findings_returned": 1,
+            "findings_fixed": 1,
+            "reviewer_sessions": 1,
+        },
+        "agents": [{"session": "a", "kind": "session", "role": "reviewer"}],
+        "model_changes": [{"session": "s", "kind": "lower", "at": 1}],
+    }
+    run = preset_stats.run_from_line(old)
+    assert run["preset"] == "balanced"
+    assert preset_stats.agents_text(old["agents"])
+
+
+def test_a_legacy_stored_report_keeps_rounds_null(rig: Rig) -> None:
+    with rig.state.locked() as data:
+        data["reports"]["lead"] = {
+            "reviewers_run": 2,
+            "findings_returned": 3,
+            "findings_fixed": 1,
+            "calls": 1,
+        }
+    preset_runs.record_review(rig.state, "lead", 1, 1, 1)
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    rig.sweep()
+    review = rig.lines()[0]["review"]
+    assert review["rounds"] is None and review["reviewers_run"] == 3
+
+
+def test_a_legacy_amended_line_keeps_rounds_null(rig: Rig) -> None:
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    rig.sweep()
+    with rig.state.locked() as data:
+        line = data["ended"]["lead"]["line"]
+        line["review"] = {"reported": True, "reviewers_run": 2, "findings_returned": 3}
+    preset_runs.record_review(rig.state, "lead", 1, 1, 1, now=rig.now + 60)
+    assert rig.lines()[-1]["review"]["rounds"] is None
+
+
+def test_a_fresh_run_and_an_unreported_line_start_their_rounds(rig: Rig) -> None:
+    rig.add(Conv("lead", status(labels.REVIEW)))
+    rig.sweep()
+    assert rig.lines()[0]["review"]["rounds"] == []
+    preset_runs.record_review(rig.state, "lead", 1, 1, 1, now=rig.now + 60)
+    assert [r["round"] for r in rig.lines()[-1]["review"]["rounds"]] == [1]
+
+
+def test_persona_matches_a_hyphenated_word_and_drops_duplicate_slugs() -> None:
+    assert (
+        preset_runs.reviewer_persona("subagent", "reviewer", "security-focused pass") == "security"
+    )
+    assert preset_runs._clean_personas(["a", "b", "a"]) == ["a", "b"]

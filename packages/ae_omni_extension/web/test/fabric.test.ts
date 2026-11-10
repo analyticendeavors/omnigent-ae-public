@@ -90,6 +90,8 @@ function gatedContext() {
       new Promise<Reply>((resolve) => {
         // Who sees what (2026-10-28) is asked before anything draws: an admin, at once.
         if (path === "/v1/ae/access") resolve(ok({ admin: true, box_admin: true }));
+        // The card state is not part of what these tests gate (2026-11-07): a refusal at once.
+        else if (path === "/v1/ae/cards") resolve({ ok: false, status: 500, body: {} });
         else (waiting[path] ??= []).push(resolve);
       }),
   );
@@ -349,7 +351,8 @@ describe("the Admin Center page", () => {
     await flush();
     // Since the dashboard redesign (2026-10-20) the card's heading names it.
     const heading = document.getElementById("admin-compute-h");
-    expect(heading?.tagName).toBe("H2");
+    // A card heading is an h3 under its group's h2 since 2026-11-06.
+    expect(heading?.tagName).toBe("H3");
     expect(heading?.textContent).toBe("Compute");
     const card = heading?.closest(".admin-card");
     expect(card?.getAttribute("aria-labelledby")).toBe("admin-compute-h");
@@ -1253,5 +1256,134 @@ describe("a false admin_only answer (2026-10-28)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("integrations the server says are not configured (2026-11-06)", () => {
+  const cardIds = () =>
+    [...document.querySelectorAll<HTMLElement>(".admin-card")].map((card) => card.dataset.card);
+  const footer = () => document.querySelector<HTMLElement>(".admin-notset");
+  const denied: Reply = {
+    ok: false,
+    status: 403,
+    body: { error: { code: "admin_only", message: "Only an OmniGent admin can see Azure spend." } },
+  };
+
+  it("drops the Azure card when the server says configured false, and names it in the footer", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok(overview([paused()]))],
+      "/v1/ae/azure-cost": [ok({ configured: false, note: "Azure spend is not configured." })],
+    });
+    await activateFabric(context);
+    await flush();
+    expect(cardIds()).not.toContain("azure");
+    expect(cardIds()).toContain("compute");
+    expect(footer()?.hidden).toBe(false);
+    expect(footer()?.textContent).toContain("Not set up on this server: Azure spend");
+    expect(footer()?.querySelector("button")?.textContent).toBe("Cards settings");
+    expect(document.querySelector(".admin-board")?.lastElementChild).toBe(footer());
+    // The Cloud group still has Compute, which keeps its tag.
+    expect(document.querySelector('.admin-card[data-card="compute"] .admin-card-tag')?.textContent).toBe("Cloud");
+  });
+
+  it("keeps the Azure card and draws no footer when the answer is admins only", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok(overview([paused()]))],
+      "/v1/ae/azure-cost": [denied],
+    });
+    await activateFabric(context);
+    await flush();
+    expect(cardIds()).toContain("azure");
+    expect(footer()?.hidden).toBe(true);
+  });
+
+  it("shows the Compute card again, with its error, when a read fails after not configured", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok({ configured: false, capacities: [], note: "No Fabric." }), { ok: false, status: 502, body: { error: { code: "bad", message: "down" } } }],
+      "/v1/ae/databricks": [ok({ configured: false, warehouses: [], spend: null })],
+    });
+    await activateFabric(context);
+    await flush();
+    expect(cardIds()).not.toContain("compute");
+    expect(footer()?.textContent).toContain("Compute");
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(cardIds()).toContain("compute");
+    expect(footer()?.hidden === true || !(footer()?.textContent ?? "").includes("Compute")).toBe(true);
+  });
+
+  it("moves focus to the new footer when the board is rebuilt around a focused footer", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok(overview([paused()]))],
+      "/v1/ae/azure-cost": [ok({ configured: false, note: "Azure spend is not configured." })],
+    });
+    await activateFabric(context);
+    await flush();
+    const old = footer() as HTMLElement;
+    old.tabIndex = -1;
+    old.focus();
+    expect(document.activeElement).toBe(old);
+    window.dispatchEvent(new Event("resize"));
+    // A saved layout arriving rebuilds the board.
+    const { resetArrangement } = await import("../src/boardLayout");
+    resetArrangement();
+    expect(footer()).not.toBe(old);
+    expect(document.activeElement).toBe(footer());
+  });
+
+  it("keeps the focus on the board when the focused footer goes away", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok({ configured: false, capacities: [], note: "No Fabric." }), ok(overview([paused()]))],
+      "/v1/ae/databricks": [ok({ configured: false, warehouses: [], spend: null })],
+    });
+    await activateFabric(context);
+    await flush();
+    const old = footer() as HTMLElement;
+    old.tabIndex = -1;
+    old.focus();
+    window.dispatchEvent(new Event("focus"));
+    await flush();
+    expect(footer()?.hidden).toBe(true);
+    expect(document.activeElement).toBe(document.querySelector(".admin-board"));
+  });
+
+  it("keeps Compute when only Fabric is not configured", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok({ configured: false, capacities: [], note: "No Fabric." })],
+      "/v1/ae/databricks": [ok({ configured: true, warehouses: [], spend: null })],
+    });
+    await activateFabric(context);
+    await flush();
+    expect(cardIds()).toContain("compute");
+    expect(footer()?.textContent ?? "").not.toContain("Compute");
+  });
+
+  it("drops Compute and the credit card when neither Fabric nor Databricks is configured", async () => {
+    const { context } = stubContext({
+      "/v1/ae/fabric": [ok({ configured: false, capacities: [], note: "No Fabric." })],
+      "/v1/ae/databricks": [ok({ configured: false, warehouses: [], spend: null })],
+    });
+    await activateFabric(context);
+    await flush();
+    expect(cardIds()).not.toContain("compute");
+    expect(cardIds()).not.toContain("credit");
+    expect(footer()?.textContent).toMatch(/Not set up on this server: Compute, Databricks credit/);
+  });
+
+  it("draws no group headings and no footer for a box admin's one-card board", async () => {
+    const { context } = stubContext({
+      // The page asks twice before it believes a non-admin (fabric.ts readAccess).
+      "/v1/ae/access": [ok({ admin: false, box_admin: true }), ok({ admin: false, box_admin: true })],
+    });
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const activating = activateFabric(context);
+    await vi.advanceTimersByTimeAsync(3000);
+    await activating;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(cardIds()).toEqual(["box"]);
+    expect(document.querySelector(".admin-group")).toBeNull();
+    expect(document.querySelector(".admin-group-h")).toBeNull();
+    expect(footer()).toBeNull();
+    expect(document.querySelectorAll(".admin-board > .admin-col").length).toBeGreaterThan(0);
   });
 });

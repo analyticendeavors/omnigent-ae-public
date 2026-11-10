@@ -174,7 +174,7 @@ from urllib.parse import quote, quote_plus, urlsplit
 
 import httpx
 
-from ae_omni_policies import USER_AGENT, key_health
+from ae_omni_policies import USER_AGENT, card_config, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -374,9 +374,9 @@ def fleet(environ: Mapping[str, str] | None = None) -> Fleet | None:
 
 def usd_per_cu_hour(environ: Mapping[str, str] | None = None) -> float:
     """``AE_FABRIC_USD_PER_CU_HOUR``, or the default when unset or not a sane price."""
-    env = os.environ if environ is None else environ
     try:
-        rate = float((env.get(USD_PER_CU_ENV) or "").strip())
+        # Typed in the panel (2026-11-07) when the environment has none.
+        rate = float((card_config.value(USD_PER_CU_ENV, environ) or "").strip())
     except ValueError:
         return DEFAULT_USD_PER_CU_HOUR
     return rate if math.isfinite(rate) and 0 < rate < 100 else DEFAULT_USD_PER_CU_HOUR
@@ -898,6 +898,21 @@ _last: tuple[float, dict[str, Any]] | None = None
 _last_generation = 0
 # The one background refresh in flight, if any.
 _refresh_task: asyncio.Task[None] | None = None
+
+
+def invalidate_rate() -> None:
+    """After the price per capacity-unit hour is saved in the panel (2026-11-07).
+
+    Only the whole-answer and fleet caches go: the rate is applied when an answer is built, so
+    nothing per capacity needs reading again. A refresh in flight is discarded by the
+    generations when it ends.
+    """
+    global _fleet_cache, _fleet_generation, _last, _last_generation, _refresh_task
+    _last = None
+    _refresh_task = None
+    _last_generation += 1
+    _fleet_generation += 1
+    _fleet_cache = None
 
 
 def forget(name: str | None = None) -> None:

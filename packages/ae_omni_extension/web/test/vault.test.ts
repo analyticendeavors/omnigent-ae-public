@@ -22,6 +22,8 @@ import {
   vaultTile,
   VIEW_KEY,
 } from "../src/vault";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -213,22 +215,69 @@ describe("the words", () => {
   it("builds the tile: both counts, amber when something needs a look", () => {
     expect(vaultTile(inventory(), null)).toMatchObject({
       value: "4 + 1",
-      note: "1 expiring, 1 untouched 180d+",
+      note: "1 to check · 1 expiring, 1 untouched 180d+",
+      brief: "1 expiring",
       health: "attention",
     });
+    const four = inventory();
+    four.vaults = four.vaults.map((v, i) => ({
+      ...v,
+      needs_you: i === 0 ? [1, 2, 3, 4].map((n) => ({ name: `s${n}`, kind: "both" as const, text: "x" })) : [],
+    }));
+    expect(vaultTile(four, null).note).toMatch(/^4 to check · /);
+    // The answer carries the first 6 needs, worst first: a cut list with no untouched need
+    // may hide more checks, so the count says "+"; one that reaches untouched is exact.
+    const need = (kind: "soon" | "both" | "untouched", n: number) => ({ name: `${kind}${n}`, kind, text: "x" });
+    const cut = inventory();
+    cut.vaults = cut.vaults.map((v, i) => ({
+      ...v,
+      needs_you: i === 0 ? [need("soon", 1), need("soon", 2), ...[1, 2, 3, 4].map((n) => need("both", n))] : [],
+      needs_you_total: i === 0 ? 9 : 0,
+    }));
+    expect(vaultTile(cut, null).note).toMatch(/^4\+ to check · /);
+    const exact = inventory();
+    exact.vaults = exact.vaults.map((v, i) => ({
+      ...v,
+      needs_you: i === 0 ? [...[1, 2, 3, 4, 5].map((n) => need("both", n)), need("untouched", 1)] : [],
+      needs_you_total: i === 0 ? 9 : 0,
+    }));
+    expect(vaultTile(exact, null).note).toMatch(/^5 to check · /);
+    const none = inventory();
+    none.vaults = none.vaults.map((v) => ({ ...v, needs_you: [] }));
+    expect(vaultTile(none, null).note).toBe("1 expiring, 1 untouched 180d+");
     const calm = inventory();
     calm.vaults = calm.vaults.map((v) => ({ ...v, counts: { ...v.counts, soon: 0 }, needs_you: [] }));
     expect(vaultTile(calm, null).health).toBe("ok");
     expect(vaultTile({ ...calm, vaults: [] }, null).value).toBe("Not read");
     const unset = { ...calm, vaults: [], configured: false };
+    // Not configured is not a fault (2026-11-06): idle, and the card leaves the board.
     expect(vaultTile(unset, null)).toMatchObject({
-      value: "Not read",
+      value: "Not set up",
       note: "vault not configured (AE_VAULT_NAME)",
-      health: "attention",
+      health: "idle",
+      notSetUp: true,
     });
+    // The box not reporting stays amber and keeps the card.
+    const silent = vaultTile({ ...calm, vaults: [] }, null);
+    expect(silent).toMatchObject({ value: "Not read", note: "the box has not reported", health: "attention" });
+    expect(silent.notSetUp).toBeUndefined();
     const stale = vaultTile({ ...calm, stale: true }, null);
     expect(stale.value).toBe("4 + 1");
     expect(stale.health).toBe("attention");
+    expect(stale.brief).toBe("vault reading old");
+  });
+
+  it("names the reason in the pill brief, never 0 expiring on an amber tile", () => {
+    expect(vaultTile(inventory(), null).brief).toMatch(/^\d+ expiring$/);
+    const crossed = inventory();
+    crossed.vaults = crossed.vaults.map((v) => ({
+      ...v,
+      counts: { ...v.counts, soon: 0, expired: 0 },
+      needs_you: v.needs_you.filter((need) => need.kind !== "soon"),
+    }));
+    const tile = vaultTile(crossed, null);
+    expect(tile.health).toBe("attention");
+    expect(tile.brief).toBe("1 secret to check");
   });
 });
 
@@ -446,12 +495,12 @@ describe("owner words", () => {
 
   it("puts the next alarm and the no-owner count on the tile", () => {
     const tile = vaultTile(owned(), null);
-    expect(tile.note).toMatch(/^1 expiring · alarm set Nov 2[01] · 2 have no owner$/);
+    expect(tile.note).toMatch(/^1 to check · 1 expiring · alarm set Nov 2[01] · 2 have no owner$/);
     expect(tile.title).toBe("kv-example-box: 4, kv-example-web: 1; 1 untouched 180d+");
     const one = owned();
     one.alerts = { ...one.alerts!, next: null };
     one.vaults[1]!.counts.no_owner = 0;
-    expect(vaultTile(one, null).note).toBe("1 expiring · 1 has no owner");
+    expect(vaultTile(one, null).note).toBe("1 to check · 1 expiring · 1 has no owner");
   });
 });
 
@@ -619,5 +668,22 @@ describe("owners on the card", () => {
     expect(q<HTMLSelectElement>(node, ".vault-owner-select")?.value).toBe(ANN);
     again()?.click();
     expect(q(node, ".vault-detail")).toBeNull();
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+    const { context } = stubContext([ok(inventory())]);
+    const node = await mount(context);
+    const link = () => node.querySelector(".needs-link");
+    expect(link()?.textContent).toBe("Reading Needs you...");
+    setAttention(needOverview([needItem("vault-1", { source: "vault", kind: "vault-expired" })]));
+    expect(link()?.textContent).toBe("1 in Needs you");
+    setAttention(needOverview([]));
+    expect(link()?.textContent).toBe("Nothing needs you.");
   });
 });

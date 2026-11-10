@@ -101,6 +101,10 @@ VAULT_NAMES: dict[str, str] = {
     "AE_AZURE_COST_CLIENT_ID": "azure-cost-client-id",
     "AE_AZURE_COST_CLIENT_SECRET": "azure-cost-client-secret",
     "AE_SHARED_ACCOUNTS_KEY": "omnigent-ae-shared-accounts-key",
+    "AE_CARD_SECRETS_KEY": "ae-card-secrets-key",
+    "AE_DECISION_API_KEY": "foundry-decision-api-key",
+    "AE_DECISION_ENDPOINT": "foundry-decision-endpoint",
+    "AE_SPEECH_KEY": "azure-speech-key",
 }
 
 KNOWN_NAMES = frozenset(VAULT_NAMES.values())

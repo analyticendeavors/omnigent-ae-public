@@ -21,6 +21,10 @@ three gates for the same reason. (A lead handoff note was a third kind on 2026-1
 sweep no longer posts one, so it is no longer recognized: a prompt that starts with its
 words is an ordinary prompt.)
 
+The queued Compact (:mod:`ae_omni_policies.compact_queue`, 2026-11-06) posts a third kind: the
+save-your-notes prompt (:data:`COMPACT_PREP_TEXT`) it sends before the compact. It is matched
+whole, so words added before it make it an ordinary prompt.
+
 A merge note is neither a new task nor another turn of the owner's, so the slot cap
 lets it through without claiming a slot, and the rabbit hole and the fork
 classifier abstain on it (no turn counted, no model call).
@@ -53,18 +57,31 @@ _CHILD_WAKE = re.compile(
 )
 
 
+#: The prompt the queued Compact posts so the chat saves its notes before compacting.
+COMPACT_PREP_TEXT = (
+    "Compaction runs right after this turn. Save anything worth keeping to memory or a handoff "
+    "note now: decisions and why, open work, file paths, what to do next. Start no new work and "
+    "do not compact yourself. Reply with one line, 'ready', when you are done."
+)
+
+
 def is_system_continuation(text: str) -> bool:
     """Whether *text* is a note the server posted to continue existing work.
 
     :param text: The request's user text (``request_user_text``).
-    :returns: ``True`` for a merge watcher or child wake note.
+    :returns: ``True`` for a merge watcher note, a child wake note or the Compact save prompt.
     """
     head = text.strip()
-    return _MERGE_WATCH.match(head) is not None or _CHILD_WAKE.match(head) is not None
+    return (
+        _MERGE_WATCH.match(head) is not None
+        or _CHILD_WAKE.match(head) is not None
+        or head == COMPACT_PREP_TEXT
+    )
 
 
 __all__ = [
     "CHILD_WAKE_PREFIX",
+    "COMPACT_PREP_TEXT",
     "MERGE_WATCH_PREFIX",
     "PICK_CAP",
     "TITLE_CAP",

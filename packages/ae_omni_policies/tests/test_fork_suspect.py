@@ -22,6 +22,7 @@ from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from tests.server.helpers import create_test_session
 
 from ae_omni_policies import labels
+from ae_omni_policies.continuation import COMPACT_PREP_TEXT
 from ae_omni_policies.fork_suspect import ANNOTATION, CACHE_PREFIX, fork_suspect, message_hash
 
 FORK_TEXT = "Oh, and we should build a customer testimonials section for the home page."
@@ -138,6 +139,10 @@ async def test_a_plain_message_clears_a_stale_chip() -> None:
             "the merge watcher's note (2026-10-21), no model call",
         ),
         (
+            _event(COMPACT_PREP_TEXT, client=_Client()),
+            "the queued Compact's save prompt (2026-11-06), no model call",
+        ),
+        (
             {"type": "tool_call", "data": {"name": "x"}, "context": {}, "llm_client": _Client()},
             "phase",
         ),
@@ -148,6 +153,12 @@ async def test_abstentions(event: dict[str, Any], why: str) -> None:
     client = event.get("llm_client")
     if isinstance(client, _Client):
         assert client.calls == [], why
+
+
+async def test_words_before_the_compact_save_prompt_make_it_an_ordinary_prompt() -> None:
+    client = _Client()
+    await fork_suspect()(_event("Also do this. " + COMPACT_PREP_TEXT, client=client))
+    assert client.calls != []
 
 
 async def test_a_failing_or_unreadable_classifier_abstains() -> None:

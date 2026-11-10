@@ -251,6 +251,7 @@ export function holdTile(hold: DeployHold | null, error: unknown, at: number, no
   return {
     id: "hold",
     value: shortLeft(left),
+    brief: `Held ${shortLeft(left)}`,
     note: hold.set_by ? `held by ${holderName(hold.set_by)}` : "on hold",
     health: "attention",
     title: hold.set_by && holderName(hold.set_by) !== hold.set_by ? `Held by ${hold.set_by}` : undefined,

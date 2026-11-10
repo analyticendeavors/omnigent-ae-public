@@ -78,7 +78,12 @@ export function azureTile(
   reading: boolean,
   error: unknown,
   rateLimit: AzureCostAnswer["rateLimit"] = null,
+  adminOnly = false,
 ): Tile {
+  if (!configured && error && !adminOnly) {
+    // A read that failed after a "not configured" answer proves nothing: show the failure.
+    return { id: "azure", value: "Could not read", note: "", health: "attention", summary: "Could not read" };
+  }
   if (!configured) {
     return {
       id: "azure",
@@ -86,6 +91,8 @@ export function azureTile(
       note: "not set up",
       health: "idle",
       summary: "Not set up",
+      // An admins-only answer also sets configured=false, but that is not "not set up" (2026-11-06).
+      ...(adminOnly || error ? {} : { notSetUp: true as const }),
     };
   }
   if (!view) {
@@ -105,6 +112,8 @@ export function azureTile(
   if (flags) parts.push(flags === 1 ? "1 flag" : `${flags} flags`);
   else if (failed) parts.push(failed === 1 ? "1 not read" : `${failed} not read`);
   // Unread subscriptions carry no error of their own while limited, so the tile says it.
+  // 2026-11-07: a rate limit is temporary and the totals are the last good reading, so it is
+  // not a thing to act on and does not make the tile amber; the note still says it.
   if (rateLimit) parts.push("rate limited");
   // Health stays as is: the totals are complete, but "no flags" would read as checked.
   if (view.subscriptions.some((sub) => sub.counted && sub.note)) {
@@ -115,7 +124,7 @@ export function azureTile(
     id: "azure",
     value: money(view.month.spent, view.currency),
     note: parts.slice(1).join(" · ") || (delta ? `pace ${delta}` : ""),
-    health: flags || failed || rateLimit ? "attention" : "ok",
+    health: flags || failed ? "attention" : "ok",
     summary: parts.join(" · "),
   };
 }
@@ -383,7 +392,7 @@ function render(parts: Parts, state: SectionState): void {
   parts.refreshed.textContent = state.asOf
     ? `Updated ${new Date(state.asOf).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
     : "";
-  const tile = azureTile(state.view, state.configured, state.reading, state.error, state.rateLimit);
+  const tile = azureTile(state.view, state.configured, state.reading, state.error, state.rateLimit, state.adminOnly);
   setTile(state.view ? staleTile(tile, state.error) : tile, state.asOf || undefined);
 }
 

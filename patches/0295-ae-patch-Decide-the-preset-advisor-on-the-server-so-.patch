@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 6 Nov 2026 13:20:16 -0800
+Subject: [PATCH 295/333] [ae-patch] Decide the preset advisor on the server so
+ a terminal host renders the line
+
+The advisor line read decision_advisor.available() at render time, but a
+terminal-mode host renders the lead's notice with no AE_DECISION_* env, so the
+line was dropped. _resolve_roles now stores advisor: true when it is available
+and _advisor_line reads only that flag. advisor_owner no longer rides in the
+notice metadata.
+---
+ omnigent/inner/ae_roles.py   | 30 ++++++++++++++--------
+ tests/inner/test_ae_roles.py | 49 ++++++++++++++++++++++++++++++++++++
+ 2 files changed, 68 insertions(+), 11 deletions(-)
+
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index 55c746cff2f1db842e72d436c6bf1ff14ba67baa..551492b9b808ba9c8da8d6c7061f6a478b2e0a35 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -235,15 +235,17 @@ def _resolve_roles(conv: Conversation, store: ConversationStore) -> dict[str, An
+         chosen_id = SOLO
+     if chosen_id == LEAD_PICKS:
+         shown = presets[:LEAD_PICKS_SHOWN]
+-        return {
++        picks: dict[str, Any] = {
+             "lead_picks": True,
+             "presets": [
+                 {**_summary(p), "when_to_use": str(p.get("when_to_use") or "")[:200]}
+                 for p in shown
+             ],
+             "more": len(presets) - len(shown),
+-            "advisor_owner": _owner(conv, store),
+         }
++        if _advisor_available(_owner(conv, store)):
++            picks["advisor"] = True
++        return picks
+     if chosen_id in by_id:
+         preset = _summary(by_id[chosen_id])
+         custom = override.get("custom") if override else None
+@@ -546,17 +548,23 @@ _REPORT_REVIEW = (
+ )
+ 
+ 
+-def _advisor_line(roles: dict[str, Any]) -> str | None:
+-    """The line telling the lead to ask the Decision-1 advisor first, when it is available."""
++def _advisor_available(owner: str) -> bool:
++    """Whether the Decision-1 advisor is on for this owner. Server side only: the host has no env."""
+     try:
+         from ae_omni_policies import decision_advisor
+-    except ImportError:
+-        return None
+-    owner = roles.get("advisor_owner")
+-    try:
+-        if not isinstance(owner, str) or not decision_advisor.available(owner):
+-            return None
+-    except Exception:  # noqa: BLE001 (a broken advisor must never block a turn)
++
++        return bool(decision_advisor.available(owner))
++    except Exception:  # noqa: BLE001 (a missing or broken advisor must never block a turn)
++        return False
++
++
++def _advisor_line(roles: dict[str, Any]) -> str | None:
++    """The line telling the lead to ask the Decision-1 advisor first, when the flag is set.
++
++    The server decides availability when it builds the roles; this only reads the flag, because
++    a terminal-mode host renders the notice with no AE_DECISION_* settings.
++    """
++    if roles.get("advisor") is not True:
+         return None
+     return (
+         "Before picking, call advise_preset with a one-line neutral summary of the task (no "
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index 26362c31354192c7a8eda2a7f863752182be7e65..3b969e35fcf15ac0f33b6f011149b84028b8a361 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import copy
+ import json
++import sys
+ from pathlib import Path
+ from typing import Any
+ from unittest.mock import Mock
+@@ -231,6 +232,54 @@ def test_lead_picks_has_no_advisor_line_when_it_is_off_or_broken(
+     assert "advise_preset" not in render()
+ 
+ 
++def test_the_advisor_line_renders_in_a_process_that_cannot_see_the_advisor(
++    prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """The host renders the notice with no AE_DECISION_* env, so the flag alone must decide."""
++    from ae_omni_policies import decision_advisor
++
++    prefs["presets"] = [BALANCED, YOLO]
++    monkeypatch.setattr(decision_advisor, "available", lambda owner: True)
++    labels = team_label(roles={"preset": "lead-picks"})
++    roles = resolve_roles(conversation(labels), owner_store())
++    assert roles["advisor"] is True
++
++    monkeypatch.setattr(decision_advisor, "available", lambda owner: False)
++    assert "advise_preset" in (render_roles(roles) or "")
++    monkeypatch.setitem(sys.modules, "ae_omni_policies.decision_advisor", None)
++    monkeypatch.setitem(sys.modules, "ae_omni_policies", None)
++    lines = (render_roles(roles) or "").splitlines()
++    assert lines[1].startswith("Before picking, call advise_preset")
++
++
++def test_resolve_roles_sets_the_advisor_flag_only_when_available(
++    prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from ae_omni_policies import decision_advisor
++
++    prefs["presets"] = [BALANCED, YOLO]
++    labels = team_label(roles={"preset": "lead-picks"})
++
++    def resolved() -> dict[str, Any]:
++        return resolve_roles(conversation(labels), owner_store())
++
++    monkeypatch.setattr(decision_advisor, "available", lambda owner: True)
++    roles = resolved()
++    assert roles["advisor"] is True
++    assert "advisor_owner" not in roles
++
++    monkeypatch.setattr(decision_advisor, "available", lambda owner: False)
++    roles = resolved()
++    assert "advisor" not in roles
++    assert "advisor_owner" not in roles
++
++    def boom(owner: str) -> bool:
++        raise RuntimeError("broken")
++
++    monkeypatch.setattr(decision_advisor, "available", boom)
++    assert "advisor" not in resolved()
++
++
+ def test_a_fixed_preset_never_gets_the_advisor_line(
+     prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+ ) -> None:

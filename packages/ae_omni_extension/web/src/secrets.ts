@@ -48,6 +48,8 @@
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { describeError, fetchSecrets, ADMIN_RECHECK_MS, isAdminOnly, type SecretKey, type SecretsStatus } from "./api";
+import { goToCard } from "./cardNav";
+import { liveNeedsButton } from "./attentionStore";
 import { el, notice, replaceChildren } from "./dom";
 import { chevronIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
@@ -512,17 +514,6 @@ function applyKeysOpen(node: HTMLElement, open: boolean, total: number): void {
   }
 }
 
-/** Scroll to the Key Vault card, opening it on a phone (board.ts folds cards there). */
-function goToVault(): void {
-  const vault = document.querySelector<HTMLElement>('.admin-card[data-card="vault"]');
-  if (!vault) return;
-  if (vault.classList.contains("is-folded")) {
-    vault.querySelector<HTMLButtonElement>(".admin-card-toggle")?.click();
-  }
-  vault.scrollIntoView({ block: "start", behavior: "smooth" });
-  vault.querySelector<HTMLElement>(".admin-card-toggle")?.focus({ preventScroll: true });
-}
-
 export function card(status: SecretsStatus): HTMLElement {
   const total = rowsOf(status).length;
   const found = problems(status);
@@ -537,7 +528,7 @@ export function card(status: SecretsStatus): HTMLElement {
     { type: "button", class: "secret-vault-link" },
     "All vault secrets \u2192",
   );
-  vaultLink.addEventListener("click", goToVault);
+  vaultLink.addEventListener("click", () => goToCard("vault"));
   const node = el(
     "article",
     { class: `card card-fabric secrets-card ${TONE_CLASS[toneOf(status)]}` },
@@ -551,7 +542,7 @@ export function card(status: SecretsStatus): HTMLElement {
         el("span", { class: "fabric-name" }, "Secrets on this box"),
         el("span", { class: "fabric-state" }, pillText(status)),
       ),
-      el("div", { class: "fabric-acts" }),
+      el("div", { class: "fabric-acts" }, liveNeedsButton("secrets")),
       el(
         "p",
         { class: "fabric-meta" },

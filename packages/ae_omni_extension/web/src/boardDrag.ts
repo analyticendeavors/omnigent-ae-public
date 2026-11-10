@@ -1,7 +1,7 @@
 // Dragging an Admin Center card to another place (2026-10-22, boardLayout.ts
 // keeps the result).
 //
-// The grip in a card's header starts a drag on two or three columns. The card
+// The grip in a card's header starts a drag on two or more columns. The card
 // lifts out of the flow (position: fixed, under the pointer) and a dashed slot
 // the card's size takes its place; the pointer picks the column and the place
 // in it, and the slot moves there, so the other cards slide to make room. A
@@ -19,6 +19,10 @@
 // on, and the lifted card takes the width of its slot. Stopping the board
 // cancels it too.
 //
+// 2026-11-07 (packed board): a card moves anywhere on the board (board.ts), so the drop columns
+// are `.admin-board[data-packed] > .admin-col` and the layout a drop saves is the whole board's
+// for this column count. Needs you has no grip, never moves, and nothing drops above it.
+//
 // The grip also takes the arrow keys (up and down in the column, left and
 // right to the next column), so the page can be arranged without a mouse; each
 // move is said in a visually hidden live region after the board.
@@ -33,6 +37,7 @@ import {
   hasArrangement,
   type Layout,
   moveCard,
+  type Packed,
   resetArrangement,
   setArrangement,
 } from "./boardLayout";
@@ -45,9 +50,15 @@ const KEYS: Record<string, Direction> = {
   ArrowRight: "right",
 };
 
-/** The cards in each column of *board* as they sit in the page now. */
+const isPacked = (board: HTMLElement): boolean => board.dataset.packed !== undefined;
+
+/** The board's columns: the `.admin-col` stacks of a packed board. */
+const columnsOf = (board: HTMLElement): HTMLElement[] =>
+  [...board.children].filter((col): col is HTMLElement => col.classList.contains("admin-col"));
+
+/** The cards in each column of the packed *board* as they sit in the page now (Needs you is no card). */
 export function currentLayout(board: HTMLElement): Layout {
-  return [...board.children].map((col) =>
+  return columnsOf(board).map((col) =>
     [...col.children].flatMap((card) => {
       const id = (card as HTMLElement).dataset.card;
       return id ? [id as CardId] : [];
@@ -55,14 +66,17 @@ export function currentLayout(board: HTMLElement): Layout {
   );
 }
 
-const arranged = (board: HTMLElement): 2 | 3 | null => {
+/** Whether *child* is the Needs you tile, which no card drops above. */
+const isNeedsYou = (child: Element): boolean => child.id === "needs-you";
+
+const arranged = (board: HTMLElement): Packed | null => {
   const n = Number(board.dataset.columns);
-  return n === 2 || n === 3 ? n : null;
+  return isPacked(board) && (n === 2 || n === 3 || n === 4) ? n : null;
 };
 
 function begin(
   board: HTMLElement,
-  n: 2 | 3,
+  n: Packed,
   card: HTMLElement,
   grip: HTMLElement,
   start: PointerEvent,
@@ -99,14 +113,14 @@ function begin(
     // The slot sits in a column, so its width follows a reflow the drag outlived.
     const slotWidth = slot.getBoundingClientRect().width;
     if (slotWidth > 0) card.style.width = `${slotWidth}px`;
-    const columns = [...board.children] as HTMLElement[];
+    const columns = columnsOf(board);
     const boxes = columns.map((col) => {
       const rect = col.getBoundingClientRect();
       return {
         left: rect.left,
         right: rect.right,
         cards: [...col.children]
-          .filter((child) => child !== card && child !== slot)
+          .filter((child) => child !== card && child !== slot && !isNeedsYou(child))
           .map((child) => {
             const r = child.getBoundingClientRect();
             return { top: r.top, bottom: r.bottom };
@@ -114,8 +128,9 @@ function begin(
       };
     });
     const { column, index } = dropTarget(boxes, event.clientX, event.clientY);
+    // Index 0 of column 1 is just under Needs you, never above it.
     const others = [...columns[column].children].filter(
-      (child) => child !== card && child !== slot,
+      (child) => child !== card && child !== slot && !isNeedsYou(child),
     );
     const before = others[index] ?? null;
     const target = columns[column];
@@ -143,7 +158,7 @@ function begin(
       // Already released.
     }
     // The columns the slot sat in may have been replaced mid-drag (see the header).
-    const save = commit && slot.isConnected && board.dataset.columns === String(n);
+    const save = commit && slot.isConnected && board.contains(slot) && board.dataset.columns === String(n);
     if (save) slot.replaceWith(card);
     else slot.remove();
     card.classList.remove("is-dragging");

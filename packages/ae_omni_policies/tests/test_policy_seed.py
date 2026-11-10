@@ -1,6 +1,6 @@
 """The Global Policies page owns the AE policies; config/server.yaml only seeds them.
 
-Since 2026-10-18 the five AE policies sit under ``ae_seed_policies:`` and
+Since 2026-10-18 the six AE policies sit under ``ae_seed_policies:`` and
 ``ae_omni_policies.policy_seed`` inserts them into the policy store when it
 holds none of them, matched by name or handler (the container runs it through
 ``docker_entrypoint``). These tests pin the real config's seed, that rule, the
@@ -43,6 +43,7 @@ EXPECTED = [
     ),
     SeedPolicy("ae_rabbit_hole", RABBIT_HOLE, {"hours": 4, "turns": 60}),
     SeedPolicy("ae_observer_fallback", "ae_omni_policies.observer.observe", None),
+    SeedPolicy("ae_voice_style", "ae_omni_policies.voice.voice_style", None),
 ]
 
 
@@ -67,7 +68,7 @@ def _add(store: SqlAlchemyPolicyStore, name: str, handler: str, fill: str) -> No
     store.create_default(policy_id=fill * 32, name=name, type="python", handler=handler)
 
 
-def test_the_server_config_seeds_the_five_ae_policies_in_order() -> None:
+def test_the_server_config_seeds_the_six_ae_policies_in_order() -> None:
     cfg = _server_config()
     assert parse_seed(cfg) == EXPECTED
     # Under `policies:` as well they would run twice: once from the image, once from the store.
@@ -81,7 +82,7 @@ def test_the_server_config_seed_passes_the_create_checks() -> None:
 
 def test_an_empty_store_gets_the_seed_in_config_order(store: SqlAlchemyPolicyStore) -> None:
     ids = seed_policies(store, _server_config(), MODULES)
-    assert len(ids) == 5
+    assert len(ids) == 6
     assert _rows(store) == EXPECTED
     assert [p.id for p in store.list_defaults()] == ids
     assert all(p.enabled and p.type == "python" for p in store.list_defaults())
@@ -97,7 +98,7 @@ def test_a_global_policy_with_another_handler_does_not_block_the_seed(
     store: SqlAlchemyPolicyStore,
 ) -> None:
     _add(store, "made_on_the_page", "omnigent.policies.builtins.safety.ask_on_os_tools", "a")
-    assert len(seed_policies(store, _server_config(), MODULES)) == 5
+    assert len(seed_policies(store, _server_config(), MODULES)) == 6
     rows = _rows(store)
     assert (
         SeedPolicy("made_on_the_page", "omnigent.policies.builtins.safety.ask_on_os_tools", None)
@@ -137,7 +138,7 @@ def test_deleting_every_seeded_policy_brings_the_seed_back(store: SqlAlchemyPoli
     seed_policies(store, _server_config(), MODULES)
     for policy in store.list_defaults():
         store.delete_default(policy.id)
-    assert len(seed_policies(store, _server_config(), MODULES)) == 5
+    assert len(seed_policies(store, _server_config(), MODULES)) == 6
     assert _rows(store) == EXPECTED
 
 
@@ -173,14 +174,14 @@ def test_a_value_the_factory_rejects_fails_and_writes_nothing(
 def test_a_failed_insert_leaves_no_partial_seed(
     store: SqlAlchemyPolicyStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The inserts share one transaction, so the next boot still seeds all five."""
-    clash = ["c" * 32, "d" * 32, "c" * 32, "e" * 32, "f" * 32]
+    """The inserts share one transaction, so the next boot still seeds all six."""
+    clash = ["c" * 32, "d" * 32, "c" * 32, "e" * 32, "f" * 32, "1" * 32]
     monkeypatch.setattr(policy_seed, "seed_ids", lambda count: clash[:count])
     with pytest.raises(Exception, match=r"(?i)unique|identity|conflict"):
         seed_policies(store, _server_config(), MODULES)
     assert store.list_defaults() == []
     monkeypatch.undo()
-    assert len(seed_policies(store, _server_config(), MODULES)) == 5
+    assert len(seed_policies(store, _server_config(), MODULES)) == 6
 
 
 @pytest.mark.parametrize(

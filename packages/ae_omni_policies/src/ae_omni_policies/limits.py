@@ -1063,6 +1063,8 @@ class LimitStore:
         self._entries: dict[str, dict[str, Any]] = {}
         self._accounts: dict[AccountKey, AccountUsage] = {}
         self._loaded = False
+        self.load_failed = False
+        """The state file exists but could not be read, so no rows is not "no account"."""
 
     def _load(self) -> None:
         if self._loaded:
@@ -1076,8 +1078,10 @@ class LimitStore:
             return
         except (OSError, json.JSONDecodeError) as exc:
             _logger.warning("ae limits: ignoring unreadable %s: %s", self._path, exc)
+            self.load_failed = True
             return
         if not isinstance(raw, dict):
+            self.load_failed = True
             return
         for harness in HARNESSES:
             entry = raw.get(harness)

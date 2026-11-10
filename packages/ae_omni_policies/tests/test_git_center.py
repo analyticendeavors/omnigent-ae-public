@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
@@ -465,7 +467,7 @@ async def test_one_repo_failing_leaves_the_others() -> None:
     assert len(web["prs"]) == 1 and web["error"] is None
     assert "401" in api["error"] and "AE_GIT_TOKEN_FABRIKAM" in api["error"]
     assert out["totals"]["repo_errors"] == 1
-    assert TOKEN not in json.dumps(out)
+    assert TOKEN not in json.dumps(git_center.wire(out))
 
 
 async def test_alert_permission_error_names_the_fix() -> None:
@@ -583,14 +585,183 @@ async def test_worst_case_stays_under_the_bridge_limit() -> None:
             ],
         )
     fake.ahead = {f"feature/{'b' * 60}-{i}": i for i in range(20)}
-    out = await run(fake, {"AE_GIT_REPOS": ",".join(names), "AE_GITHUB_TOKEN": TOKEN})
-    text = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+    full = await run(fake, {"AE_GIT_REPOS": ",".join(names), "AE_GITHUB_TOKEN": TOKEN})
+    assert "list_cut" not in full  # the held answer is whole
+    out = git_center.page(full)
+    text = json.dumps(git_center.wire(out), ensure_ascii=False, separators=(",", ":"))
     assert len(text) < 30_000
     assert out["totals"]["prs"] == 400 and out["totals"]["alerts_fix"] == 1200
     assert out["list_cut"] is True
     assert all(len(p["title"]) <= 120 for r in out["repos"] for p in r["prs"])
     # Default JSONResponse (spaced separators) is still under the 32,768 limit.
-    assert len(json.dumps(out, ensure_ascii=False)) < 32_768
+    assert len(json.dumps(git_center.wire(out), ensure_ascii=False)) < 32_768
+
+
+async def _big_answer(branches: int = 60) -> dict[str, Any]:
+    fake = Fake()
+    fake.repos["contoso/web"] = repo_data(
+        prs=[pr(i + 1, "T" * 300) for i in range(60)],
+        refs=[
+            ref(f"feature/{'b' * 60}-{i}", date=f"2026-0{1 + i % 9}-01T00:00:00Z")
+            for i in range(branches)
+        ],
+        alerts=[
+            alert(i + 1, "p" * 80 + str(i), manifest="m/" * 60 + "yarn.lock") for i in range(130)
+        ],
+    )
+    return await run(fake, {"AE_GIT_REPOS": "contoso/web", "AE_GITHUB_TOKEN": TOKEN})
+
+
+async def test_the_held_answer_is_whole_and_the_needs_list_reads_all_of_it() -> None:
+    full = await _big_answer()
+    assert "list_cut" not in full
+    repo = full["repos"][0]
+    assert (len(repo["prs"]), len(repo["alerts"]), len(repo["branches"])) == (60, 130, 60)
+    items = git_center.needs(full, 1_800_000_000.0)
+    fix = next(i for i in items if i["kind"] == "alerts-fix")
+    assert fix["title"].startswith("130 alerts to fix")
+    assert any(i["kind"] == "branch" for i in items)
+    assert all(s["ok"] for s in git_center.scope_ids(full))
+    assert not any("_full_" in k for a in repo["alerts"] for k in a)
+
+
+async def test_page_cuts_a_copy_and_leaves_the_held_answer_alone() -> None:
+    full = await _big_answer()
+    before = json.dumps(full, sort_keys=True)
+    paged = git_center.page(full)
+    assert json.dumps(full, sort_keys=True) == before
+    assert paged["list_cut"] is True and paged["totals"] == full["totals"]
+    assert git_center._size(paged) <= git_center.SIZE_BUDGET
+    assert len(paged["repos"][0]["alerts"]) < 130
+    assert "_facts" not in paged["repos"][0]
+    assert git_center.page(full) is paged  # memoized on the same read
+    # A last-good copy (new dict, same repos) hits the memo; a new read does not.
+    assert git_center.page({**full, "error": None}) is paged
+    other = await _big_answer()
+    assert git_center.page(other) is not paged
+    # A paged answer, if one ever reached the Needs you list, stays unclean.
+    repo_scopes = [s["ok"] for s in git_center.scope_ids(paged) if s["id"].startswith("git:repo:")]
+    assert repo_scopes == [False]
+
+
+async def test_page_matches_the_old_cut_for_a_plain_load() -> None:
+    fake = Fake()
+    fake.repos["contoso/web"] = repo_data(prs=[pr(i + 1) for i in range(60)])
+    full = await run(fake, {"AE_GIT_REPOS": "contoso/web", "AE_GITHUB_TOKEN": TOKEN})
+    paged = git_center.page(full)
+    assert paged["list_cut"] is True
+    assert [p["number"] for p in paged["repos"][0]["prs"]] == [
+        p["number"] for p in full["repos"][0]["prs"]
+    ][: git_center.MAX_PRS]
+    assert paged["totals"]["prs"] == 60
+    small = git_center.page(await run(Fake(), {"AE_GIT_REPOS": "", "AE_GITHUB_TOKEN": TOKEN}))
+    assert "list_cut" not in small
+
+
+async def test_branch_comparisons_are_bounded_and_the_repo_goes_unclean() -> None:
+    fake = Fake()
+    count = git_center.MAX_FILL_AHEAD + 20
+    fake.repos["contoso/web"] = repo_data(
+        refs=[
+            ref(f"old/{i:03d}", date=f"2026-01-01T00:{i // 60:02d}:{i % 60:02d}Z")
+            for i in range(count)
+        ]
+    )
+    out = await run(fake, {"AE_GIT_REPOS": "contoso/web", "AE_GITHUB_TOKEN": TOKEN})
+    assert sum("/compare/" in c for c in fake.calls) == git_center.MAX_FILL_AHEAD
+    assert len(out["repos"][0]["branches"]) == count
+    repo_scopes = [s["ok"] for s in git_center.scope_ids(out) if s["id"].startswith("git:repo:")]
+    assert repo_scopes == [False]
+
+
+def _old_refs(prefix: str, n: int, date: str = "2026-01-01T00:00:00Z") -> list[dict[str, Any]]:
+    return [ref(f"{prefix}/{i:03d}", date=date) for i in range(n)]
+
+
+async def test_the_compare_budget_is_spent_across_repos_and_the_tail_goes_unclean() -> None:
+    fake = Fake()
+    for name in ("contoso/a", "contoso/b", "contoso/c"):
+        fake.repos[name] = repo_data(refs=_old_refs("old", 60))
+    env = {"AE_GIT_REPOS": "contoso/a,contoso/b,contoso/c", "AE_GITHUB_TOKEN": TOKEN}
+    out = await run(fake, env)
+    per_repo = {
+        r: sum(f"/repos/{r}/compare/" in c for c in fake.calls)
+        for r in ("contoso/a", "contoso/b", "contoso/c")
+    }
+    assert sum(per_repo.values()) == git_center.MAX_FILL_AHEAD
+    assert sorted(per_repo.values()) == [0, 40, 60]
+    marked = {r["repo"]: bool(r["_facts"].get("truncated")) for r in out["repos"]}
+    assert sum(marked.values()) == 2  # the repo that got 40 and the one that got 0
+    assert all(marked[name] for name in per_repo if per_repo[name] < 60)
+
+
+async def test_a_counted_repo_gets_its_compares_before_a_view_only_repo_gets_any() -> None:
+    """Rows sort view-only last and the budget loop walks that order (2026-11-04, Part B1)."""
+    fake = Fake()
+    fake.repos["contoso/a"] = repo_data(refs=_old_refs("old", 70))
+    fake.repos["northwind/lib"] = repo_data(refs=_old_refs("view", 60))
+    env = {
+        "AE_GIT_REPOS": "contoso/a",
+        "AE_GIT_VIEW_ONLY": "northwind/lib",
+        "AE_GITHUB_TOKEN": TOKEN,
+    }
+    await run(fake, env)
+    counted = sum("/repos/contoso/a/compare/" in c for c in fake.calls)
+    viewing = sum("/repos/northwind/lib/compare/" in c for c in fake.calls)
+    assert (counted, viewing) == (70, git_center.MAX_FILL_AHEAD - 70)
+    # A counted repo that wants more than the whole budget leaves a view-only repo none.
+    fake = Fake()
+    fake.repos["contoso/a"] = repo_data(refs=_old_refs("old", git_center.MAX_FILL_AHEAD + 5))
+    fake.repos["northwind/lib"] = repo_data(refs=_old_refs("view", 60))
+    await run(fake, env)
+    assert sum("/repos/contoso/a/compare/" in c for c in fake.calls) == git_center.MAX_FILL_AHEAD
+    assert not any("/repos/northwind/lib/compare/" in c for c in fake.calls)
+
+
+async def test_a_failed_compare_changes_only_the_branch_title_not_its_id_or_fingerprint() -> None:
+    """``ahead`` is ``None`` after a failed compare; the item keeps its id and state (Part B2)."""
+    env = {"AE_GIT_REPOS": "contoso/web", "AE_GITHUB_TOKEN": TOKEN}
+    when = datetime(2026, 11, 3, tzinfo=UTC)
+    answers = []
+    for ahead in ({}, {"old/000": 4}):
+        fake = Fake()
+        fake.repos["contoso/web"] = repo_data(refs=_old_refs("old", 1))
+        fake.ahead = ahead
+        out = await load(Settings(env), transport=fake.transport, now=when)
+        answers.append(out)
+    failed, counted = (
+        next(r for r in git_center.needs(out, when.timestamp()) if r["kind"] == "branch")
+        for out in answers
+    )
+    assert answers[0]["repos"][0]["branches"][0]["ahead"] is None
+    assert answers[1]["repos"][0]["branches"][0]["ahead"] == 4
+    assert failed["id"] == counted["id"] == "git:branch:contoso/web:old/000"
+    assert failed["state"] == counted["state"]
+    assert set(failed["state"]) == {"repo", "branch", "sha"}
+    assert failed["title"] == "old/000, no PR"
+    assert counted["title"] == "old/000 has 4 commits and no PR"
+
+
+async def test_young_and_kept_branches_cost_no_compare() -> None:
+    fake = Fake()
+    young = _old_refs("young", 5, date="2026-11-03T00:00:00Z")
+    fake.repos["contoso/web"] = repo_data(refs=[*young, *_old_refs("keep", 5)])
+    env = {
+        "AE_GIT_REPOS": "contoso/web",
+        "AE_GITHUB_TOKEN": TOKEN,
+        "AE_GIT_KEEP_BRANCHES": ",".join(f"contoso/web:keep/{i:03d}" for i in range(5)),
+    }
+    out = await load(
+        Settings(env), transport=fake.transport, now=datetime(2026, 11, 4, tzinfo=UTC)
+    )
+    assert not any("/compare/" in c for c in fake.calls)
+    assert not out["repos"][0]["_facts"].get("truncated")
+    # With the keep list gone, only the old ones are compared; the young ones still are not.
+    fake.calls.clear()
+    git_center.reset_cache()
+    env.pop("AE_GIT_KEEP_BRANCHES")
+    await load(Settings(env), transport=fake.transport, now=datetime(2026, 11, 4, tzinfo=UTC))
+    assert sum("/compare/" in c for c in fake.calls) == 5
 
 
 def test_size_counts_utf16_units() -> None:
@@ -608,8 +779,10 @@ async def test_emoji_titles_are_fitted_by_utf16_units() -> None:
                 alert(i + 1, "\U0001f600" * 100 + str(i), manifest="yarn.lock") for i in range(10)
             ],
         )
-    out = await run(fake, {"AE_GIT_REPOS": ",".join(names), "AE_GITHUB_TOKEN": TOKEN})
-    text = json.dumps(out, ensure_ascii=False, separators=(",", ":"))
+    out = git_center.page(
+        await run(fake, {"AE_GIT_REPOS": ",".join(names), "AE_GITHUB_TOKEN": TOKEN})
+    )
+    text = json.dumps(git_center.wire(out), ensure_ascii=False, separators=(",", ":"))
     assert len(text.encode("utf-16-le")) // 2 < 30_000
     assert out["list_cut"] is True
 
@@ -815,7 +988,7 @@ async def test_fix_alerts_survive_the_alert_cap_and_list_cut_is_set() -> None:
             **{f"p{k}": "7.30.1" for k in range(1, 121)}
         )
     env = {"AE_GIT_REPOS": "contoso/web,fabrikam/api", "AE_GITHUB_TOKEN": TOKEN}
-    out = await run(fake, env)
+    out = git_center.page(await run(fake, env))
     shown = [a for r in out["repos"] for a in r["alerts"]]
     assert len(shown) <= 100
     assert out["totals"]["alerts_fix"] == 1 and any(a["bucket"] == "fix" for a in shown)
@@ -827,7 +1000,9 @@ async def test_ready_prs_survive_the_pr_cap_before_drafts() -> None:
     drafts = [{**pr(i), "isDraft": True} for i in range(1, 61)]
     fake.repos["contoso/web"] = repo_data(prs=drafts)
     fake.repos["fabrikam/api"] = repo_data(prs=[pr(500)])
-    out = await run(fake, {"AE_GIT_REPOS": "contoso/web,fabrikam/api", "AE_GITHUB_TOKEN": TOKEN})
+    out = git_center.page(
+        await run(fake, {"AE_GIT_REPOS": "contoso/web,fabrikam/api", "AE_GITHUB_TOKEN": TOKEN})
+    )
     shown = [p for r in out["repos"] for p in r["prs"]]
     assert len(shown) == 50 and any(not p["draft"] for p in shown)
     assert out["list_cut"] is True
@@ -904,3 +1079,216 @@ async def test_archived_repos_are_not_counted_in_accounts() -> None:
     out = await run(fake, NOW_ENV)
     counts = {a["owner"]: a["repos"] for a in out["accounts"]}
     assert counts["contoso"] == 1 and counts["fabrikam"] == 0
+
+
+# ── Needs you: the port of analyze() and the facts the query now reads (2026-11-03) ─────────
+
+GOLDEN = Path(__file__).parents[2] / "ae_omni_extension/web/test/fixtures/git-parity.json"
+
+
+def test_needs_gives_the_same_ids_and_tones_as_the_old_typescript_rules() -> None:
+    """One golden file, two ports: ``gitParity.test.ts`` pins the old rules to it."""
+    golden = json.loads(GOLDEN.read_text())
+    assert golden["expected"].keys() == golden["scenarios"].keys()
+    for name, scenario in golden["scenarios"].items():
+        got = git_center.needs(scenario["overview"], golden["now"] / 1000)
+        assert [{"id": n["id"], "tone": n["tone"]} for n in got] == golden["expected"][name], name
+
+
+async def test_the_query_reads_head_commits_failing_check_names_and_branch_heads() -> None:
+    fake = Fake()
+    failing = pr(5)
+    failing["commits"] = {
+        "nodes": [
+            {
+                "commit": {
+                    "oid": "abc123",
+                    "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                            "totalCount": 4,
+                            "nodes": [
+                                {
+                                    "__typename": "CheckRun",
+                                    "name": "unit",
+                                    "conclusion": "FAILURE",
+                                },
+                                {
+                                    "__typename": "CheckRun",
+                                    "name": "lint",
+                                    "conclusion": "SUCCESS",
+                                },
+                                {
+                                    "__typename": "StatusContext",
+                                    "context": "ci/legacy",
+                                    "state": "ERROR",
+                                },
+                                {
+                                    "__typename": "CheckRun",
+                                    "name": "e2e",
+                                    "conclusion": "TIMED_OUT",
+                                },
+                            ],
+                        },
+                    },
+                }
+            }
+        ]
+    }
+    many = pr(6)
+    many["commits"] = {
+        "nodes": [
+            {
+                "commit": {
+                    "oid": "def456",
+                    "statusCheckRollup": {
+                        "state": "FAILURE",
+                        "contexts": {
+                            "totalCount": 25,
+                            "nodes": [
+                                {"__typename": "CheckRun", "name": "a", "conclusion": "FAILURE"}
+                            ],
+                        },
+                    },
+                }
+            }
+        ]
+    }
+    old_ref = ref("feature/x", date="2026-01-01T00:00:00Z")
+    old_ref["target"]["oid"] = "headsha"
+    fake.repos["contoso/web"] = repo_data(prs=[failing, many], refs=[old_ref])
+    out = await run(fake, {"AE_GIT_REPOS": "contoso/web", "AE_GITHUB_TOKEN": TOKEN})
+    facts = out["repos"][0]["_facts"]
+    assert facts["prs"]["5"] == {"sha": "abc123", "failing": ["ci/legacy", "e2e", "unit"]}
+    # More than the 20 checks the query reads: the names are unknowable, never a short list.
+    assert facts["prs"]["6"] == {"sha": "def456", "failing": None}
+    assert facts["branches"] == {"feature/x": "headsha"}
+    assert "_facts" not in json.dumps(git_center.wire(out))
+    assert "abc123" not in json.dumps(git_center.wire(out))
+
+
+def _run(
+    name: str, conclusion: str | None, at: str | None = None, workflow: str = "CI"
+) -> dict[str, Any]:
+    return {
+        "__typename": "CheckRun",
+        "name": name,
+        "conclusion": conclusion,
+        "status": "COMPLETED" if conclusion else "IN_PROGRESS",
+        "completedAt": at,
+        "checkSuite": {
+            "app": {"slug": "github-actions"},
+            "workflowRun": {"workflow": {"name": workflow}},
+        },
+    }
+
+
+def _rollup_pr(number: int, state: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
+    node = pr(number)
+    node["commits"] = {
+        "nodes": [
+            {
+                "commit": {
+                    "oid": f"sha{number}",
+                    "statusCheckRollup": {
+                        "state": state,
+                        "contexts": {"totalCount": len(runs), "nodes": runs},
+                    },
+                }
+            }
+        ]
+    }
+    return node
+
+
+async def test_a_cancelled_duplicate_of_a_passed_check_is_not_a_failing_pr() -> None:
+    # 2026-11-06: one push started three leaks scans, the concurrency group cancelled two,
+    # the third passed, and GitHub's rollup read FAILURE with every check green.
+    t1, t2, t3 = "2026-11-06T04:10:18Z", "2026-11-06T04:10:26Z", "2026-11-06T04:10:48Z"
+    fake = Fake()
+    fake.repos["contoso/web"] = repo_data(
+        prs=[
+            _rollup_pr(
+                1,
+                "FAILURE",
+                [
+                    _run("leaks", "CANCELLED", t1),
+                    _run("leaks", "SUCCESS", t3),
+                    _run("leaks", "CANCELLED", t2),
+                    _run("unit", "SKIPPED", t1),
+                ],
+            ),
+            # A cancel with no passed run of its check still fails.
+            _rollup_pr(2, "FAILURE", [_run("leaks", "CANCELLED", t1), _run("unit", None)]),
+            # Superseded cancel with a run still going: pending, not green.
+            _rollup_pr(
+                3,
+                "FAILURE",
+                [_run("leaks", "CANCELLED", t1), _run("leaks", "SUCCESS", t2), _run("unit", None)],
+            ),
+            _rollup_pr(
+                4, "FAILURE", [_run("leaks", "CANCELLED", t1), _run("unit", "FAILURE", t1)]
+            ),
+            # Same job name in another workflow never stands in for the cancelled one.
+            _rollup_pr(
+                5,
+                "FAILURE",
+                [_run("build", "CANCELLED", t1, "Release"), _run("build", "SUCCESS", t3, "CI")],
+            ),
+            # A person cancelled the newest run after an older one passed: still failing.
+            _rollup_pr(
+                6, "FAILURE", [_run("leaks", "SUCCESS", t1), _run("leaks", "CANCELLED", t3)]
+            ),
+            # A conclusion the code does not classify keeps GitHub's own state.
+            _rollup_pr(
+                7,
+                "FAILURE",
+                [
+                    _run("leaks", "CANCELLED", t1),
+                    _run("leaks", "SUCCESS", t2),
+                    _run("old", "STALE", t1),
+                ],
+            ),
+        ]
+    )
+    out = await run(fake, {"AE_GIT_REPOS": "contoso/web", "AE_GITHUB_TOKEN": TOKEN})
+    repo = out["repos"][0]
+    assert {n: f["failing"] for n, f in repo["_facts"]["prs"].items()} == {
+        "1": [],
+        "2": ["leaks"],
+        "3": [],
+        "4": ["leaks", "unit"],
+        "5": ["build"],
+        "6": ["leaks"],
+        "7": [],
+    }
+    assert {p["number"]: p["checks"] for p in repo["prs"]} == {
+        1: "SUCCESS",
+        2: "FAILURE",
+        3: "PENDING",
+        4: "FAILURE",
+        5: "FAILURE",
+        6: "FAILURE",
+        7: "FAILURE",
+    }
+    flagged = {
+        i["state"]["number"]
+        for i in git_center.needs(out, 1_800_000_000.0)
+        if i["kind"] == "pr-failing"
+    }
+    assert flagged == {2, 4, 5, 6, 7}
+
+
+def test_a_failure_with_no_checks_to_account_for_keeps_githubs_state() -> None:
+    assert (
+        git_center._checks_state({"state": "FAILURE", "contexts": {"nodes": []}}, []) == "FAILURE"
+    )
+
+
+def test_error_codes_are_short_and_carry_no_sentence() -> None:
+    assert git_center.error_code("No token: set AE_GIT_TOKEN_X") == "no_token"
+    assert (
+        git_center.error_code("Rate limited by GitHub for a/b; try again later.") == "rate_limited"
+    )
+    assert git_center.error_code("GitHub did not answer for a/b (X); try again.") == "no_answer"
+    assert git_center.error_code("something else") == "error"

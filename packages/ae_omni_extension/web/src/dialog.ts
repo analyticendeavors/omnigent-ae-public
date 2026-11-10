@@ -73,6 +73,8 @@ export function openDialog(options: DialogOptions): OpenDialog {
       // An open hint takes this Escape first (its own listener, registered later, closes
       // it); the next one closes the dialog.
       if (hasOpenHint()) return;
+      // An open menu or popover inside the card (Social's filter and More) takes it first.
+      if (card.querySelector("[data-menu-open]")) return;
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();

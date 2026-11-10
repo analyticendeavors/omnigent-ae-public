@@ -661,3 +661,20 @@ def test_an_offset_for_a_deleted_session_is_dropped() -> None:
     rig.sweep()  # still in the last sample
     rig.sweep()
     assert "gone" not in rig.state.load()["offsets"]
+
+
+def test_token_flag_leaves_cache_reads_out() -> None:
+    rig = two_owners()
+    rig.now = NOW + 3600
+    # "mine" spends 100 input + 50 output and re-reads 5,000 cached tokens today.
+    rig.tops = [Row("mine", usage(5.0, 100 + 100, 50, 5_000), {}, title="mine")]
+    rig.sweep()
+    fam = answer(rig, admin=True)["families"][0]
+    assert fam["today"]["flag_tokens"] == 150
+    assert fam["today"]["tokens_total"] == 5_150
+
+    def flagged(limit: float) -> bool:
+        return answer(rig, admin=True, runaway_tokens=limit)["families"][0]["flagged"]
+
+    assert not flagged(1_000)  # cache reads alone would have passed 1,000
+    assert flagged(150)

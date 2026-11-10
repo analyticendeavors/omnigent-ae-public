@@ -30,14 +30,45 @@ is already in the lead's), ``agents`` (the whole family by ``ae.orch`` and paren
 family),
 ``review`` (the lead's ``report_review`` calls plus ``reviewer_sessions`` counted from
 ``ae.role`` ``reviewer`` children), ``outcome`` (the ending status, or ``archived``),
-``files_touched`` (always null), ``at``.
+``files_touched`` (always null, see below), ``advisor_on`` (lead-picks runs only: true when the
+Decision-1 advisor was available for the owner, so ``advisor: []`` with it true marks a skipped
+call; never raised, false on any error; absent for other presets; added 2026-11-06), ``at``.
 
 Each agent: ``session`` (id, null for a native subagent), ``kind`` (``session``, ``codex`` or
 ``subagent``), ``role``, ``model``, ``effort``, ``seconds``, ``cost_usd`` (null for a native
-subagent) and ``hung``. A native subagent's role is read from its Agent tool description by
-:func:`native_role` (a port of ``aeAgentRole.ts``), ``unknown`` when it does not match; its
-model and effort come from the lead's own Agent or Task call, matched by tool use id, null when
-not found (bounded read, :data:`MAX_ITEM_PAGES` pages).
+subagent), ``hung`` and ``persona`` (added 2026-11-06, see below). A native subagent's role is
+read from its Agent tool description by :func:`native_role` (a port of ``aeAgentRole.ts``),
+``unknown`` when it does not match; its model and effort come from the lead's own Agent or Task
+call, matched by tool use id, null when not found (bounded read, :data:`MAX_ITEM_PAGES` pages).
+
+**Labels for Decision-1 replay and shadow scoring (2026-11-06).** All additive; a reader of an
+older line finds the key missing and treats it as unknown. Numbers, booleans and fixed labels
+only, never a path or message text.
+
+- ``agents[].persona``: the reviewer persona of a reviewer row, else null. No session records
+  its persona (the spawn only passes the slot's model and effort), so the label is inferred from
+  what is stored: a Codex child is ``codex`` (the agent it runs); a row whose role is
+  ``reviewer`` is the built-in persona id (``security`` and so on, :mod:`personas`) found as a
+  whole word in a native subagent's Agent tool description or a session's title, else
+  ``general``; a row whose role is not ``reviewer`` or is ``unknown`` is null. A user's own
+  persona id is not known to this module and reads as ``general``. The round's ``personas``
+  (below) is the lead's own statement and is more exact when it was passed.
+- ``review.rounds``: one entry per ``report_review`` call that was counted (a repeated
+  ``call_id`` adds none): ``round`` (1, 2, ...), ``reviewers``, ``personas`` (the persona ids
+  the lead passed in the optional ``personas`` argument, else null), ``findings_returned`` and
+  ``findings_fixed``; at most :data:`MAX_ROUNDS`. The summed fields beside it are unchanged. An
+  older line has no ``rounds``; a run with no report has ``[]``. ``rounds`` is null when the
+  run's earlier calls were counted before this field existed (a stored report or an amended
+  line with totals but no ``rounds`` key): the history is missing, so null is kept on later
+  calls and is never shown as a complete list.
+- ``files_touched`` stays null. The only source on the server is the lead's own ``function_call``
+  items (Edit and Write paths), which leaves out every child session, native subagent and shell
+  edit, so a count from it would understate and mislead. A later policy hook on file-editing tool
+  calls should keep a per-family set of hashed paths in the run state and write its size here.
+- ``model_changes[].raised_back_s``: on a step-down (``kind`` ``lower``), the seconds from it to
+  the next ``raise`` in the same session, null when none follows in the log; null on other kinds.
+  Null means no raise had been logged by the time the run line was written; it does not mean the
+  lead never raised back.
 
 **Hang flag.** Each sweep marks a running child as hung when its last conversation item is a
 tool call with no result after it and that item is at least :data:`HANG_AFTER_BUILDER_S` (45
@@ -117,6 +148,11 @@ AMEND_WINDOW_S = 1800.0
 #: How many review round names (``call_id``) a run remembers to catch a repeated call. A run
 #: has a handful of rounds; 100 ids of at most 100 characters keep one lead under 10 KB.
 MAX_CALL_IDS = 100
+#: Review rounds kept per run (a run has a handful; the cap bounds the state file).
+MAX_ROUNDS = 30
+#: A persona id the lead passes to ``report_review``: a short slug, nothing free-form.
+PERSONA_ID = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
+MAX_ROUND_PERSONAS = 20
 #: How much of the end of the log is checked for a run's ``run_key`` before appending.
 TAIL_BYTES = 64 * 1024
 #: Family size cap (sessions plus native subagents) and how far down the family is walked.
@@ -208,6 +244,18 @@ def native_role(description: str | None) -> str:
         return UNKNOWN
     found = match.group(1).lower()
     return found if found in labels.ROLE_IDS else UNKNOWN
+
+
+def reviewer_persona(kind: str, role: str | None, text: str | None) -> str | None:
+    """The persona label of an agent row (see the module docstring); ``None`` if not a reviewer."""
+    if role != "reviewer":
+        return None
+    if kind == "codex":
+        return "codex"
+    from ae_omni_policies import personas
+
+    words = {w for w in re.split(r"[^a-z0-9]+", (text or "").lower()) if w}
+    return next((p.id for p in personas.BUILTIN_PERSONAS if p.id in words), "general")
 
 
 def fingerprint(roles: object, rules: object) -> str:
@@ -370,17 +418,38 @@ class StateFile:
         self._write(data)
 
     @contextlib.contextmanager
-    def locked(self) -> Iterator[dict[str, Any]]:
+    def locked(self, wait_s: float | None = None) -> Iterator[dict[str, Any]]:
         """Yield the state to change in place; it is saved when the block ends, error or not,
-        but only if it changed (a partial change is safe: an end is marked only after its line)."""
-        with self._thread:
+        but only if it changed (a partial change is safe: an end is marked only after its line).
+
+        With *wait_s*, a lock not won within that many seconds raises ``TimeoutError`` instead
+        of blocking (the advisor's best-effort log, which must never hold up a reply).
+        """
+        if not self._thread.acquire(timeout=-1 if wait_s is None else wait_s):
+            raise TimeoutError("preset runs: the state is busy")
+        try:
             handle = None
             if self.path is not None:
                 try:
                     lock_path = self.path.with_name(self.path.name + ".io.lock")
                     lock_path.parent.mkdir(parents=True, exist_ok=True)
                     handle = open(lock_path, "a")  # noqa: SIM115 (closed below)
-                    fcntl.flock(handle, fcntl.LOCK_EX)
+                    if wait_s is None:
+                        fcntl.flock(handle, fcntl.LOCK_EX)
+                    else:
+                        deadline = time.monotonic() + wait_s
+                        while True:
+                            try:
+                                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except BlockingIOError:
+                                if time.monotonic() >= deadline:
+                                    handle.close()
+                                    handle = None
+                                    raise TimeoutError("preset runs: the state is busy") from None
+                                time.sleep(0.01)
+                except TimeoutError:
+                    raise
                 except OSError as exc:
                     _logger.warning("preset runs: cannot lock the state (%r); going on", exc)
                     if handle is not None:
@@ -397,6 +466,8 @@ class StateFile:
             finally:
                 if handle is not None:
                     handle.close()
+        finally:
+            self._thread.release()
 
 
 def enabled(environ: Mapping[str, str] | None = None) -> bool:
@@ -482,6 +553,51 @@ def _with_call_id(ids: list[str], call_id: str | None) -> list[str]:
 _REVIEW_KEYS = ("reviewers_run", "findings_returned", "findings_fixed")
 
 
+def _clean_personas(personas: object) -> list[str] | None:
+    """The persona ids worth keeping from a ``report_review`` call, else ``None``."""
+    if not isinstance(personas, (list, tuple)):
+        return None
+    kept = list(dict.fromkeys(p for p in personas if isinstance(p, str) and PERSONA_ID.match(p)))
+    return kept[:MAX_ROUND_PERSONAS] or None
+
+
+def _rounds(holder: Mapping[str, Any] | None, *, counted: bool) -> list[dict[str, Any]] | None:
+    """The rounds kept in *holder*; ``None`` for a legacy holder.
+
+    *counted* says the holder's totals already include earlier ``report_review`` calls. With no
+    ``rounds`` key that is a legacy holder (written before 2026-11-06) whose history is missing,
+    so it reads ``None`` and stays ``None``; a holder with no earlier calls starts at ``[]``.
+    """
+    rounds = holder.get("rounds") if isinstance(holder, Mapping) else None
+    if isinstance(rounds, list):
+        return [r for r in rounds if isinstance(r, dict)]
+    if rounds is None and (counted or (isinstance(holder, Mapping) and "rounds" in holder)):
+        return None
+    return []
+
+
+def _add_round(
+    rounds: list[dict[str, Any]] | None,
+    reviewers_run: int,
+    findings_returned: int,
+    findings_fixed: int,
+    personas: object,
+) -> list[dict[str, Any]] | None:
+    """*rounds* with one more entry (numbered by how many calls came before); capped.
+
+    ``None`` stays ``None``: the earlier history is missing, so a list would look complete."""
+    if rounds is None:
+        return None
+    entry = {
+        "round": len(rounds) + 1,
+        "reviewers": reviewers_run,
+        "personas": _clean_personas(personas),
+        "findings_returned": findings_returned,
+        "findings_fixed": findings_fixed,
+    }
+    return [*rounds, entry][:MAX_ROUNDS]
+
+
 def record_review(
     state: StateFile,
     lead_id: str,
@@ -490,6 +606,7 @@ def record_review(
     findings_fixed: int,
     *,
     call_id: str | None = None,
+    personas: list[str] | None = None,
     insights_on: bool = True,
     now: float | None = None,
     lead_now: tuple[str | None, float] | None = None,
@@ -509,6 +626,9 @@ def record_review(
     *call_id* names the review round. Added 2026-10-25 after a lead called the tool twice for
     one round and its run read 14 reviewers instead of 9
     (https://github.com/analyticendeavors/omnigent-ae/issues/328).
+
+    *personas* (2026-11-06) names the reviewer personas the round ran; it only labels the round
+    in ``review.rounds`` and is dropped unless every kept entry is a short slug.
     """
     if not insights_on:
         return {
@@ -552,6 +672,13 @@ def record_review(
                 "reviewers_run": _sum(old.get("reviewers_run"), reviewers_run),
                 "findings_returned": _sum(old.get("findings_returned"), findings_returned),
                 "findings_fixed": _sum(old.get("findings_fixed"), findings_fixed),
+                "rounds": _add_round(
+                    _rounds(old, counted=bool(old.get("reported"))),
+                    reviewers_run,
+                    findings_returned,
+                    findings_fixed,
+                    personas,
+                ),
             }
             amended = line | {"review": review, "rev": _sum(line.get("rev"), 1)}
             if not append(amended, now=stamp):
@@ -568,21 +695,82 @@ def record_review(
             return {
                 "status": "repeat",
                 "note": f"review round {call_id!r} was already counted; nothing was added",
-                "totals": {k: v for k, v in report.items() if k not in ("at", "call_ids")},
+                "totals": {
+                    k: v
+                    for k, v in report.items()
+                    if k not in ("at", "call_ids", "advisor", "rounds")
+                },
             }
         report["call_ids"] = _with_call_id(seen, call_id)
         report["reviewers_run"] += reviewers_run
         report["findings_returned"] += findings_returned
         report["findings_fixed"] += findings_fixed
+        report["rounds"] = _add_round(
+            _rounds(report, counted=bool(report.get("calls"))),
+            reviewers_run,
+            findings_returned,
+            findings_fixed,
+            personas,
+        )
         report["calls"] += 1
         report["at"] = stamp
         data["reports"][lead_id] = report
-        totals = {k: v for k, v in report.items() if k not in ("at", "call_ids")}
+        totals = {
+            k: v for k, v in report.items() if k not in ("at", "call_ids", "advisor", "rounds")
+        }
         return {"status": "stored", "note": "kept for the run's line", "totals": totals}
+
+
+ADVISOR_MAX = 10  # advisor entries kept per run
+ADVISOR_LOCK_WAIT_S = 0.25
+
+
+def record_advice(
+    state: StateFile,
+    lead_id: str,
+    entry: dict[str, Any],
+    *,
+    insights_on: bool = True,
+    now: float | None = None,
+) -> bool:
+    """Keep one advisor entry for the lead's run line (``advisor: [...]``, at most
+    :data:`ADVISOR_MAX`). Nothing is kept while the owner's insights are off. Added 2026-11-06.
+    """
+    if not insights_on:
+        return False
+    stamp = time.time() if now is None else now
+    try:
+        with state.locked(wait_s=ADVISOR_LOCK_WAIT_S) as data:
+            return _add_advice(data, lead_id, entry, stamp)
+    except TimeoutError:
+        return False  # busy: the entry is skipped rather than delaying anything
+
+
+def _add_advice(data: dict[str, Any], lead_id: str, entry: dict[str, Any], stamp: float) -> bool:
+    report = data["reports"].get(lead_id)
+    if not isinstance(report, dict):
+        report = {"reviewers_run": 0, "findings_returned": 0, "findings_fixed": 0, "calls": 0}
+    advice = report.get("advisor") if isinstance(report.get("advisor"), list) else []
+    if len(advice) >= ADVISOR_MAX:
+        return False
+    report["advisor"] = [*advice, entry]
+    report["at"] = stamp
+    data["reports"][lead_id] = report
+    return True
 
 
 # ---------------------------------------------------------------------------
 # The sweep
+
+
+def advisor_available(user: str | None) -> bool:
+    """Whether the Decision-1 advisor is on for *user*; false on any error."""
+    try:
+        from ae_omni_policies import decision_advisor
+
+        return bool(decision_advisor.available(user))
+    except Exception:  # noqa: BLE001 (a run line must never fail over this field)
+        return False
 
 
 class Sweeper:
@@ -598,6 +786,7 @@ class Sweeper:
         insights_on: Callable[[str | None], bool] = insights_enabled,
         resolve: Callable[[Any], tuple[str | None, str | None]] | None = None,
         revision: Callable[[str], int | None] = _revision,
+        advisor_on: Callable[[str | None], bool] = advisor_available,
         agent_name: Callable[[Any], str | None] | None = None,
         write: Callable[..., bool] = append,
         model_changes: Callable[[set[str], float], list[dict[str, Any]]] | None = None,
@@ -611,6 +800,7 @@ class Sweeper:
         self._insights_on = insights_on
         self._resolve = resolve or (lambda conv: resolve_preset(store, conv))
         self._revision = revision
+        self._advisor_on = advisor_on
         self._agent_name = agent_name or self._default_agent_name
         self._write = write
         self._model_changes = model_changes or read_model_changes
@@ -702,6 +892,11 @@ class Sweeper:
             "seconds": _seconds(conv, now),
             "cost_usd": usd,
             "hung": conv.id in hung,
+            "persona": reviewer_persona(
+                "codex" if codex else "session",
+                labels.label(conv.labels, labels.ROLE),
+                _title(conv),
+            ),
         }
 
     def _native_rows(
@@ -729,6 +924,11 @@ class Sweeper:
                     "seconds": _seconds(row, now),
                     "cost_usd": None,
                     "hung": row.id in hung,
+                    "persona": reviewer_persona(
+                        "subagent",
+                        native_role(row.labels.get(_NATIVE_DESCRIPTION)),
+                        row.labels.get(_NATIVE_DESCRIPTION),
+                    ),
                 }
             )
         return out
@@ -807,12 +1007,16 @@ class Sweeper:
 
     @staticmethod
     def _review_block(report: Mapping[str, Any], reviewers: int) -> dict[str, Any]:
+        # An advisor-only report (no review call yet) is not a review report.
+        if report and not report.get("calls"):
+            report = {}
         return {
             "reported": bool(report),
             "reviewers_run": report.get("reviewers_run"),
             "findings_returned": report.get("findings_returned"),
             "findings_fixed": report.get("findings_fixed"),
             "reviewer_sessions": reviewers,
+            "rounds": _rounds(report, counted=bool(report)),
         }
 
     def build_line(
@@ -850,7 +1054,7 @@ class Sweeper:
         report = (state.get("reports") or {}).get(lead.id) or {}
         reviewers = sum(1 for c in sessions if labels.label(c.labels, labels.ROLE) == "reviewer")
         family_ids = {lead.id} | {c.id for c in sessions}
-        return {
+        line: dict[str, Any] = {
             "session": lead.id,
             "user": user,
             "title": _title(lead),
@@ -868,10 +1072,17 @@ class Sweeper:
             + self._native_rows(lead.id, natives, hung, now),
             "model_changes": self._model_changes(family_ids, started),
             "review": self._review_block(report, reviewers),
+            "advisor": list(report.get("advisor") or []),
             "outcome": outcome,
             "files_touched": None,
             "hang_rule": HANG_RULE,
         }
+        if preset == "lead-picks":
+            try:
+                line["advisor_on"] = bool(self._advisor_on(user))
+            except Exception:  # noqa: BLE001
+                line["advisor_on"] = False
+        return line
 
     # -- the sweep
 
@@ -1065,6 +1276,7 @@ class Sweeper:
             # A report that arrived while the line was built still goes on it.
             report = data["reports"].get(lead.id) or {}
             line["review"] = self._review_block(report, line["review"]["reviewer_sessions"])
+            line["advisor"] = list(report.get("advisor") or [])
             result = WROTE
             if logged_rev(run_key) is not None:
                 result = SKIPPED  # a crash between the append and the state save
@@ -1212,7 +1424,26 @@ def read_model_changes(family: set[str], since: float) -> list[dict[str, Any]]:
                     for key in ("session", "from", "to", "kind", "approved", "at")
                 }
             )
+    for i, change in enumerate(out):
+        change["raised_back_s"] = _raised_back(out, i) if change.get("kind") == "lower" else None
     return out
+
+
+def _raised_back(changes: list[dict[str, Any]], index: int) -> int | None:
+    """Seconds from the step-down at *index* to the next raise in the same session, else None."""
+    down = changes[index]
+    start = _number(down.get("at"))
+    if start is None:
+        return None
+    ups = [
+        at - start
+        for c in changes[index + 1 :]
+        if c.get("session") == down.get("session")
+        and c.get("kind") == "raise"
+        and (at := _number(c.get("at"))) is not None
+        and at >= start
+    ]
+    return int(min(ups)) if ups else None
 
 
 # ---------------------------------------------------------------------------

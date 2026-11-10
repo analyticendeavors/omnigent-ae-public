@@ -2157,6 +2157,119 @@ async def test_snooze_refuses_an_ineligible_chat_or_a_missing_size(
     assert _labels(old).get(labels.HANDOFF) in (None, "")
 
 
+@pytest.fixture
+def compact_driver(monkeypatch: pytest.MonkeyPatch) -> Any:
+    """A running queued-Compact driver whose collaborators are stubs (2026-11-06)."""
+    from ae_omni_policies import compact_queue
+
+    async def post(_sid: str, _body: dict[str, Any]) -> tuple[int, str]:
+        return 202, ""
+
+    async def snooze(_sid: str) -> int:
+        return 1
+
+    driver = compact_queue.CompactQueue(
+        store=compact_queue.StateFile(None),
+        book=compact_queue.EdgeBook(),
+        post=post,
+        snooze=snooze,
+        pending=lambda _sid: [],
+        live_status=lambda _sid: "running",
+        list_items=lambda _sid, **_kw: [],
+    )
+    monkeypatch.setattr(compact_queue, "_current", driver)
+    return driver
+
+
+async def _claude_chat(client: httpx.AsyncClient) -> str:
+    sid = await _session(client, "Long chat", {labels.STATUS: "working"})
+    get_conversation_store().set_labels(sid, {"omnigent.wrapper": "claude-code-native-ui"})
+    return sid
+
+
+async def test_compact_routes_queue_report_conflict_and_cancel(
+    client: httpx.AsyncClient, compact_driver: Any
+) -> None:
+    sid = await _claude_chat(client)
+    got = await client.get(f"/v1/ae/sessions/{sid}/compact")
+    assert got.status_code == 200 and got.json() == {
+        "session_id": sid,
+        "phase": None,
+        "failure": None,
+    }
+    queued = await client.post(f"/v1/ae/sessions/{sid}/compact", json={"snooze": True})
+    assert queued.status_code == 202 and queued.json()["phase"] == "queued"
+    assert compact_driver.plans[sid].snooze is True
+    again = await client.post(f"/v1/ae/sessions/{sid}/compact", json={})
+    assert again.status_code == 409
+    assert again.json()["error"]["code"] == "ae_compact_queued"
+    assert again.json()["error"]["phase"] == "queued"
+    assert (await client.get(f"/v1/ae/sessions/{sid}/compact")).json()["phase"] == "queued"
+    cancelled = await client.delete(f"/v1/ae/sessions/{sid}/compact")
+    assert cancelled.status_code == 200 and cancelled.json()["phase"] is None
+    assert (await client.delete(f"/v1/ae/sessions/{sid}/compact")).status_code == 200
+
+
+async def test_compact_refuses_a_chat_that_is_not_claude_code(
+    client: httpx.AsyncClient, compact_driver: Any
+) -> None:
+    sid = await _session(client, "Codex chat", {labels.STATUS: "working"})
+    response = await client.post(f"/v1/ae/sessions/{sid}/compact", json={})
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["code"] == "ae_compact_unsupported"
+    assert compact_driver.plans == {}
+
+
+async def test_compact_cancel_is_refused_while_the_compact_goes_out(
+    client: httpx.AsyncClient, compact_driver: Any
+) -> None:
+    sid = await _claude_chat(client)
+    await client.post(f"/v1/ae/sessions/{sid}/compact", json={})
+    compact_driver.plans[sid].phase = "compacting"
+    response = await client.delete(f"/v1/ae/sessions/{sid}/compact")
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "ae_compact_sending"
+    assert response.json()["error"]["phase"] == "compacting"
+
+
+async def test_compact_seen_clears_a_failure_and_a_non_owner_gets_403(
+    client: httpx.AsyncClient, compact_driver: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = await _claude_chat(client)
+    compact_driver._store_failure(sid, "Compact cancelled: x.")
+    shown = (await client.get(f"/v1/ae/sessions/{sid}/compact")).json()["failure"]
+    assert shown["message"] == "Compact cancelled: x."
+    ack = await client.post(
+        f"/v1/ae/sessions/{sid}/compact/seen", json={"failure_id": shown["id"]}
+    )
+    assert ack.status_code == 200 and ack.json() == {"ok": True}
+    assert (await client.get(f"/v1/ae/sessions/{sid}/compact")).json()["failure"] is None
+
+    async def nobody(_user: Any, _sid: str) -> bool:
+        return False
+
+    monkeypatch.setattr(router_module, "_may_write_session", nobody)
+    for call in (
+        client.get(f"/v1/ae/sessions/{sid}/compact"),
+        client.post(f"/v1/ae/sessions/{sid}/compact", json={}),
+        client.delete(f"/v1/ae/sessions/{sid}/compact"),
+        client.post(f"/v1/ae/sessions/{sid}/compact/seen", json={"failure_id": "x"}),
+    ):
+        assert (await call).status_code == 403
+    absent = await client.get(f"/v1/ae/sessions/{ABSENT_SESSION}/compact")
+    assert absent.status_code in (403, 404)
+
+
+async def test_compact_is_503_when_the_driver_is_off(client: httpx.AsyncClient) -> None:
+    from ae_omni_policies import compact_queue
+
+    assert compact_queue.current() is None
+    sid = await _claude_chat(client)
+    off = await client.post(f"/v1/ae/sessions/{sid}/compact", json={})
+    assert off.status_code == 503 and off.json()["error"]["code"] == "ae_compact_off"
+    assert (await client.get(f"/v1/ae/sessions/{sid}/compact")).json()["phase"] is None
+
+
 async def test_snooze_waiting_on_the_lock_does_not_label_a_lead_that_handed_off(
     client: httpx.AsyncClient, handoff: Any
 ) -> None:
@@ -2468,3 +2581,40 @@ async def test_the_sweep_labels_suggests_keeps_a_snooze_and_clears_on_the_real_s
     )
     assert session in (await _real_sweep(session))["cleared"]
     assert labels.label(_labels(session), labels.HANDOFF) is None
+
+
+async def test_voice_route_writes_and_clears_the_label(client: httpx.AsyncClient) -> None:
+    sid = await _session(client, "Talking")
+    on = await client.post(f"/v1/ae/sessions/{sid}/voice", json={"on": True})
+    assert on.status_code == 200 and on.json() == {"ok": True, "on": True}
+    assert _labels(sid).get(labels.VOICE) == "on"
+    off = await client.post(f"/v1/ae/sessions/{sid}/voice", json={"on": False})
+    assert off.status_code == 200
+    assert _labels(sid).get(labels.VOICE) == ""
+
+
+async def test_voice_route_rejects_a_bad_body_and_an_unknown_session(
+    client: httpx.AsyncClient,
+) -> None:
+    sid = await _session(client, "Talking")
+    assert (await client.post(f"/v1/ae/sessions/{sid}/voice", json={})).status_code == 422
+    assert (
+        await client.post(f"/v1/ae/sessions/{sid}/voice", json={"on": True, "x": 1})
+    ).status_code == 422
+    assert (
+        await client.post("/v1/ae/sessions/conv_nope/voice", json={"on": True})
+    ).status_code == 404
+
+
+async def test_voice_route_refuses_a_caller_who_does_not_own_the_session(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = await _session(client, "Talking")
+
+    async def not_owner(_user: str | None, _session_id: str) -> bool:
+        return False
+
+    monkeypatch.setattr(router_module, "_may_write_session", not_owner)
+    refused = await client.post(f"/v1/ae/sessions/{sid}/voice", json={"on": True})
+    assert refused.status_code == 403, refused.text
+    assert labels.VOICE not in _labels(sid)

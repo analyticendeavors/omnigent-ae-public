@@ -64,6 +64,7 @@ import {
 } from "./api";
 import { sparkline } from "./azure";
 import { ring } from "./board";
+import { liveNeedsLink } from "./attentionStore";
 import { announce, button, el, empty, notice, replaceChildren } from "./dom";
 import { externalLinkIcon, type FabricTone, refreshIcon, startIcon, stopIcon } from "./icons";
 import { copyText } from "./lot";
@@ -354,15 +355,20 @@ function headlineUsd(spend: DatabricksSpend): number | null {
   return spendBars(spend)[0]?.usd ?? null;
 }
 
-/** The credit's health: a problem once spent, attention past three quarters. */
-export function creditHealth(spend: DatabricksSpend | null, now = Date.now()): Health {
+/**
+ * The credit's health: a problem once spent, attention past three quarters.
+ * 2026-11-07: an old reading alone is not amber. The cost guard never wakes a
+ * stopped warehouse to read spend, so an old reading is expected and not a thing
+ * to act on (the "as of" note still shows its age). Tradeoff: spend outside the
+ * warehouse stays unseen until a refresh.
+ */
+export function creditHealth(spend: DatabricksSpend | null): Health {
   if (!spend) return "idle";
   if (spend.status === "error" || spend.status === "no_access") return "attention";
   const used = headlineUsd(spend);
   if (!hasCredit(spend) || used == null || spend.creditUsd <= 0) return "idle";
   if (used >= spend.creditUsd) return "problem";
-  // Amber also when the numbers are two days old, however much credit is left.
-  return used >= spend.creditUsd * 0.75 || readingIsStale(spend, now) ? "attention" : "ok";
+  return used >= spend.creditUsd * 0.75 ? "attention" : "ok";
 }
 
 /** The Databricks tile: the first warehouse's state, the headline spend of the credit. */
@@ -377,7 +383,7 @@ export function databricksTile(data: DatabricksOverview | null, error: unknown):
     };
   }
   if (!data.configured) {
-    return { id: "databricks", value: "Not set up", note: "", health: "idle", dot: true };
+    return { id: "databricks", value: "Not set up", note: "", health: "idle", dot: true, notSetUp: true };
   }
   const first = data.warehouses[0];
   const spend = data.spend;
@@ -412,6 +418,11 @@ export function databricksTile(data: DatabricksOverview | null, error: unknown):
     value:
       data.warehouses.length > 1 ? `${first.name}: ${stateText(first.state)}` : stateText(first.state),
     summary: `warehouse ${stateText(first.state).toLowerCase()}`,
+    // A credit that needs a look says so; otherwise the warehouse's state.
+    brief:
+      credit !== "ok" && spend && hasCredit(spend) && used != null
+        ? `${dollars(used)} of ${dollars(spend.creditUsd)} credit`
+        : `Databricks ${stateText(first.state).toLowerCase()}`,
     note,
     // A credit that is merely fine does not turn a stopped warehouse green.
     health: worst([warehouse, credit === "ok" ? "idle" : credit]),
@@ -420,14 +431,17 @@ export function databricksTile(data: DatabricksOverview | null, error: unknown):
 }
 
 /** The credit card's folded line and health ("$100 left"), as a tile the strip does not show. */
-export function creditTile(data: DatabricksOverview | null): Tile {
+export function creditTile(data: DatabricksOverview | null, error: unknown = null): Tile {
   const spend = data?.spend ?? null;
   const used = spend ? headlineUsd(spend) : null;
   return {
     id: "credit",
     value: spend && hasCredit(spend) && used != null ? `${dollars(Math.max(0, spend.creditUsd - used))} left` : "",
+    brief: spend && hasCredit(spend) && used != null ? `${dollars(used)} of ${dollars(spend.creditUsd)} credit` : undefined,
     note: "",
     health: creditHealth(spend),
+    // The server said Databricks is not configured: no credit card either (2026-11-06).
+    ...(data?.configured === false && !error ? { notSetUp: true as const } : {}),
   };
 }
 
@@ -876,6 +890,7 @@ function spendStrip(section: Section, spend: DatabricksSpend, now: number): HTML
         : null,
     hasNumbers ? breakdownBlock(spend) : null,
     spend.note ? el("p", { class: "dbx-asof dbx-note" }, spend.note) : null,
+    hasCredit(spend) ? liveNeedsLink("databricks") : null,
   );
   if (status) {
     if (quiet) node.appendChild(el("p", { class: "dbx-asof dbx-reading" }, status));
@@ -908,6 +923,8 @@ function render(section: Section): void {
     replaceChildren(section.status, []);
     replaceChildren(section.list, [el("p", { class: "meta" }, "Databricks is for admins.")]);
     replaceChildren(section.strip, []);
+    setTile({ id: "databricks", value: "Admins only", note: "", health: "idle" });
+    setTile({ id: "credit", value: "Admins only", note: "", health: "idle" });
     return;
   }
   replaceChildren(section.status, [
@@ -960,7 +977,7 @@ function render(section: Section): void {
     section.refreshed.textContent = `Updated ${clockTime(state.refreshedAt)}`;
     section.refreshed.title = `Again in ${nextDelay(data) / 1000} s or on focus.`;
   }
-  setTile(creditTile(data));
+  setTile(creditTile(data, state.error));
   const tile = databricksTile(data, state.error);
   setTile(
     data ? staleTile(tile, state.error) : tile,
