@@ -28,6 +28,8 @@ def test_upstream_scan_picks_up_the_module() -> None:
         }
         hurry = get_entry("ae_omni_policies.hurry.hurry_modes")
         assert hurry is not None and hurry.kind == "callable"
+        voice = get_entry("ae_omni_policies.voice.voice_style")
+        assert voice is not None and voice.kind == "callable" and voice.name == "AE Voice Mode"
         suspect = get_entry("ae_omni_policies.fork_suspect.fork_suspect")
         assert suspect is not None and suspect.kind == "factory"
         assert set(suspect.params_schema["properties"]) == {"min_chars", "annotate_prompt"}

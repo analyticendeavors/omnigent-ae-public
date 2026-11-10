@@ -1,0 +1,635 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:06:34 -0800
+Subject: [PATCH 311/333] [ae-patch] Notify slot, status, label and effort
+ hooks only for their own query keys
+
+A session switch fires hundreds of query-cache events, and four AE hooks re-scanned the
+whole cache on every one. They now subscribe through subscribeToQueryKeys, which wakes
+only for added, removed or updated queries under the keys each hook reads. The
+OpenTelemetry setup moves to telemetryOtel.ts behind a dynamic import, so zone.js no
+longer loads on every page when tracing is off.
+---
+ web/src/components/AeSessionChip.test.tsx     | 14 +++
+ web/src/components/AeSessionChip.tsx          |  3 +-
+ web/src/components/AeSlotsPill.tsx            | 13 ++-
+ .../aeRail/aeRailSessionData.test.tsx         | 90 +++++++++++++++++++
+ .../components/aeRail/aeRailSessionData.ts    | 22 +++--
+ web/src/lib/aeEffortDefault.test.ts           | 28 +++++-
+ web/src/lib/aeEffortDefault.ts                |  4 +-
+ web/src/lib/aeQueryCacheSubscribe.test.ts     | 58 ++++++++++++
+ web/src/lib/aeQueryCacheSubscribe.ts          | 19 ++++
+ web/src/lib/telemetry.test.ts                 | 32 +++++--
+ web/src/lib/telemetry.ts                      | 55 +-----------
+ web/src/lib/telemetryOtel.ts                  | 54 +++++++++++
+ 12 files changed, 325 insertions(+), 67 deletions(-)
+ create mode 100644 web/src/components/aeRail/aeRailSessionData.test.tsx
+ create mode 100644 web/src/lib/aeQueryCacheSubscribe.test.ts
+ create mode 100644 web/src/lib/aeQueryCacheSubscribe.ts
+ create mode 100644 web/src/lib/telemetryOtel.ts
+
+diff --git a/web/src/components/AeSessionChip.test.tsx b/web/src/components/AeSessionChip.test.tsx
+index aaca8fc7fe282db40e29f79b9cd74fc93069cf28..9444693831c4233a2b66996a85056609b46753b8 100644
+--- a/web/src/components/AeSessionChip.test.tsx
++++ b/web/src/components/AeSessionChip.test.tsx
+@@ -74,6 +74,20 @@ describe("AeSessionChip", () => {
+     expect(chip).toHaveAttribute("data-full", "false");
+   });
+ 
++  it("repaints when the session's row changes in the conversations cache", () => {
++    const qc = new QueryClient();
++    qc.setQueryData(["conversations", "", false], pages([row("p")]));
++    renderChip(qc, "p");
++    expect(screen.getByTestId("ae-session-chip")).toHaveAccessibleName(/^Working;/);
++    act(() => {
++      qc.setQueryData(
++        ["conversations", "", false],
++        pages([row("p", { labels: { "ae.status": "parked" } })]),
++      );
++    });
++    expect(screen.getByTestId("ae-session-chip")).toHaveAccessibleName(/^Parked;/);
++  });
++
+   it("turns red at the limit and shows the count alone for an unknown session", () => {
+     const qc = new QueryClient();
+     renderChip(qc, "elsewhere");
+diff --git a/web/src/components/AeSessionChip.tsx b/web/src/components/AeSessionChip.tsx
+index 387df50699a228c9d6dbc74c9a30f4cf58376e8f..4aaa5ae60dafeb75da79e81ecb8180d3fa337ae8 100644
+--- a/web/src/components/AeSessionChip.tsx
++++ b/web/src/components/AeSessionChip.tsx
+@@ -13,6 +13,7 @@ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+ import { useCallback, useSyncExternalStore } from "react";
+ import type { Conversation } from "@/hooks/useConversations";
+ import { AE_PARKING_LOT_PATH, aeDisplayStatus, type AeStatus } from "@/lib/aeLabels";
++import { subscribeToQueryKeys } from "@/lib/aeQueryCacheSubscribe";
+ import { useAeSlotLimit } from "@/lib/aeSlotLimit";
+ import { Link } from "@/lib/routing";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+@@ -36,7 +37,7 @@ export function readAeSessionStatus(queryClient: QueryClient, id: string): AeSta
+ function useAeSessionStatus(id: string): AeStatus | null {
+   const queryClient = useQueryClient();
+   const subscribe = useCallback(
+-    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
++    (onChange: () => void) => subscribeToQueryKeys(queryClient, [["conversations"]], onChange),
+     [queryClient],
+   );
+   const read = useCallback(() => readAeSessionStatus(queryClient, id), [queryClient, id]);
+diff --git a/web/src/components/AeSlotsPill.tsx b/web/src/components/AeSlotsPill.tsx
+index 2ba62c56313d93eccc2d8074095a1b4645c4adb5..10ba0cb5a7e21db720dcc37a64d5141be9cfbade 100644
+--- a/web/src/components/AeSlotsPill.tsx
++++ b/web/src/components/AeSlotsPill.tsx
+@@ -17,7 +17,13 @@ import { LayoutDashboardIcon } from "lucide-react";
+ import { type QueryClient, useQueryClient } from "@tanstack/react-query";
+ import { type MouseEvent, useCallback, useEffect, useSyncExternalStore } from "react";
+ import { AE_PARKING_LOT_PATH, countAeSlots, isAeDashboardPath } from "@/lib/aeLabels";
+-import { readAeHelpersCount, useAeHelpersCount, useAeSlotLimit } from "@/lib/aeSlotLimit";
++import {
++  AE_HELPERS_COUNT_QUERY_KEY,
++  readAeHelpersCount,
++  useAeHelpersCount,
++  useAeSlotLimit,
++} from "@/lib/aeSlotLimit";
++import { subscribeToQueryKeys } from "@/lib/aeQueryCacheSubscribe";
+ import { syncAeAppBadge } from "@/lib/aeAppBadge";
+ import { AE_COUNT_PILL, AE_COUNT_PILL_ALERT, AE_COUNT_PILL_QUIET } from "@/lib/aeCountPill";
+ import { useLocation } from "@/lib/routing";
+@@ -33,11 +39,12 @@ export function readAeSlotCount(queryClient: QueryClient): number {
+   return countAeSlots(rows, readAeHelpersCount(queryClient));
+ }
+ 
+-/** Subscribes to the query cache; the snapshot is a number, so React skips unchanged counts. */
++/** Subscribes to the list and helpers-count queries; the snapshot is a number, so React skips unchanged counts. */
+ export function useAeSlotCount(): number {
+   const queryClient = useQueryClient();
+   const subscribe = useCallback(
+-    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
++    (onChange: () => void) =>
++      subscribeToQueryKeys(queryClient, [["conversations"], AE_HELPERS_COUNT_QUERY_KEY], onChange),
+     [queryClient],
+   );
+   const read = useCallback(() => readAeSlotCount(queryClient), [queryClient]);
+diff --git a/web/src/components/aeRail/aeRailSessionData.test.tsx b/web/src/components/aeRail/aeRailSessionData.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..68f40892135210250a8cb733de0cb450f73c0279
+--- /dev/null
++++ b/web/src/components/aeRail/aeRailSessionData.test.tsx
+@@ -0,0 +1,90 @@
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, renderHook } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { describe, expect, it } from "vitest";
++import type { Conversation } from "@/hooks/useConversations";
++import { useAeRailSessionLabels, useAeRailSessionRow } from "./aeRailSessionData";
++
++function conversation(id: string, labels: Record<string, string>): Conversation {
++  return {
++    id,
++    object: "conversation",
++    title: id,
++    created_at: 1,
++    updated_at: 1,
++    labels,
++    permission_level: null,
++  };
++}
++
++function list(rows: Conversation[]) {
++  return {
++    pages: [{ data: rows, first_id: null, last_id: null, has_more: false }],
++    pageParams: [undefined],
++  };
++}
++
++function setup() {
++  const qc = new QueryClient();
++  const wrapper = ({ children }: { children: ReactNode }) => (
++    <QueryClientProvider client={qc}>{children}</QueryClientProvider>
++  );
++  return { qc, wrapper };
++}
++
++describe("useAeRailSessionLabels", () => {
++  it("repaints when the conversations list changes", () => {
++    const { qc, wrapper } = setup();
++    qc.setQueryData(["conversations", "", false], list([conversation("a", { k: "1" })]));
++    const { result } = renderHook(() => useAeRailSessionLabels("a"), { wrapper });
++    expect(result.current).toEqual({ k: "1" });
++    act(() => {
++      qc.setQueryData(["conversations", "", false], list([conversation("a", { k: "2" })]));
++    });
++    expect(result.current).toEqual({ k: "2" });
++  });
++
++  it("follows the session snapshot, and a new id", () => {
++    const { qc, wrapper } = setup();
++    const { result, rerender } = renderHook(({ id }) => useAeRailSessionLabels(id), {
++      wrapper,
++      initialProps: { id: "a" },
++    });
++    expect(result.current).toBeNull();
++    act(() => {
++      qc.setQueryData(["session", "a"], { labels: { s: "1" } });
++    });
++    expect(result.current).toEqual({ s: "1" });
++    act(() => {
++      qc.setQueryData(["session", "b"], { labels: { s: "b" } });
++    });
++    expect(result.current).toEqual({ s: "1" });
++    rerender({ id: "b" });
++    expect(result.current).toEqual({ s: "b" });
++  });
++});
++
++describe("useAeRailSessionRow", () => {
++  it("repaints from the pinned list and the backfill row", () => {
++    const { qc, wrapper } = setup();
++    const { result } = renderHook(() => useAeRailSessionRow("a"), { wrapper });
++    expect(result.current).toBeNull();
++    act(() => {
++      qc.setQueryData(["pinned-conversations"], { conversations: [conversation("a", { p: "1" })] });
++    });
++    expect(result.current?.labels).toEqual({ p: "1" });
++    act(() => {
++      qc.setQueryData(["conversations", "", false], list([conversation("a", { c: "1" })]));
++    });
++    expect(result.current?.labels).toEqual({ c: "1" });
++  });
++
++  it("repaints from the backfill row when nothing else holds the session", () => {
++    const { qc, wrapper } = setup();
++    const { result } = renderHook(() => useAeRailSessionRow("a"), { wrapper });
++    act(() => {
++      qc.setQueryData(["conversation-backfill", "a"], conversation("a", { b: "1" }));
++    });
++    expect(result.current?.labels).toEqual({ b: "1" });
++  });
++});
+diff --git a/web/src/components/aeRail/aeRailSessionData.ts b/web/src/components/aeRail/aeRailSessionData.ts
+index 72dc910eee96cbed9f325a9377b6b94980e49501..484089c17a2d641fc3e03c649f72fda705444f27 100644
+--- a/web/src/components/aeRail/aeRailSessionData.ts
++++ b/web/src/components/aeRail/aeRailSessionData.ts
+@@ -3,9 +3,10 @@
+ // the backfill row, then the session snapshot), and the chat's loaded blocks.
+ // Neither costs a request, and a push or the Status menu's overlay repaints both.
+ 
+-import { type QueryClient, useQueryClient } from "@tanstack/react-query";
++import { type QueryClient, type QueryKey, useQueryClient } from "@tanstack/react-query";
+ import { useCallback, useMemo, useRef, useSyncExternalStore } from "react";
+ import type { Conversation } from "@/hooks/useConversations";
++import { subscribeToQueryKeys } from "@/lib/aeQueryCacheSubscribe";
+ import type { AnyBlock } from "@/lib/blocks";
+ import type { ConversationsInfiniteData } from "@/lib/sessionListCache";
+ import type { Session } from "@/lib/types";
+@@ -34,6 +35,17 @@ function fromConversation(row: Conversation): AeRailSessionRow {
+   };
+ }
+ 
++/** The query keys `readAeRailSessionRow` reads for a session. */
++function railSessionKeys(id: string): QueryKey[] {
++  return [
++    ["conversations"],
++    ["project-sessions"],
++    ["pinned-conversations"],
++    ["conversation-backfill", id],
++    ["session", id],
++  ];
++}
++
+ /** This session's row from any cached copy, or `null` when no cache holds it. */
+ export function readAeRailSessionRow(
+   queryClient: QueryClient,
+@@ -78,8 +90,8 @@ export function readAeRailSessionLabels(queryClient: QueryClient, id: string): A
+ export function useAeRailSessionRow(id: string): AeRailSessionRow | null {
+   const queryClient = useQueryClient();
+   const subscribe = useCallback(
+-    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
+-    [queryClient],
++    (onChange: () => void) => subscribeToQueryKeys(queryClient, railSessionKeys(id), onChange),
++    [queryClient, id],
+   );
+   const last = useRef<AeRailSessionRow | null>(null);
+   const read = useCallback(() => {
+@@ -105,8 +117,8 @@ export function useAeRailSessionRow(id: string): AeRailSessionRow | null {
+ export function useAeRailSessionLabels(id: string): AeLabels | null {
+   const queryClient = useQueryClient();
+   const subscribe = useCallback(
+-    (onChange: () => void) => queryClient.getQueryCache().subscribe(onChange),
+-    [queryClient],
++    (onChange: () => void) => subscribeToQueryKeys(queryClient, railSessionKeys(id), onChange),
++    [queryClient, id],
+   );
+   const read = useCallback(() => readAeRailSessionLabels(queryClient, id), [queryClient, id]);
+   return useSyncExternalStore(subscribe, read, read);
+diff --git a/web/src/lib/aeEffortDefault.test.ts b/web/src/lib/aeEffortDefault.test.ts
+index e63c7f65f23e132f6a1a25c5c5e3b9018edb5bd3..62c4678c4df62c7bf976908972313901aa10dcd5 100644
+--- a/web/src/lib/aeEffortDefault.test.ts
++++ b/web/src/lib/aeEffortDefault.test.ts
+@@ -1,12 +1,16 @@
+-import { QueryClient } from "@tanstack/react-query";
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, renderHook } from "@testing-library/react";
++import { createElement, type ReactNode } from "react";
+ import { describe, expect, it } from "vitest";
+ import {
++  AE_EFFORT_DEFAULT_LABEL,
+   aeClaudeCodeDefaultEffort,
+   aeClaudeEffortLabel,
+   aeEffortDefaultFor,
+   aeEffortResolved,
+   aeEffortSourceTag,
+   readAeEffortDefault,
++  useAeEffortDefault,
+ } from "./aeEffortDefault";
+ 
+ function cacheWith(labels: Record<string, string>) {
+@@ -34,6 +38,28 @@ describe("readAeEffortDefault", () => {
+   });
+ });
+ 
++describe("useAeEffortDefault", () => {
++  it("repaints when the session's labels change in the conversations cache", () => {
++    const qc = cacheWith({ [AE_EFFORT_DEFAULT_LABEL]: "high" });
++    const wrapper = ({ children }: { children: ReactNode }) =>
++      createElement(QueryClientProvider, { client: qc }, children);
++    const { result } = renderHook(() => useAeEffortDefault("conv_1"), { wrapper });
++    expect(result.current).toBe("high");
++    act(() => {
++      qc.setQueryData(["conversations", "all"], {
++        pages: [{ data: [{ id: "conv_1", labels: { [AE_EFFORT_DEFAULT_LABEL]: "max" } }] }],
++        pageParams: [null],
++      });
++    });
++    expect(result.current).toBe("max");
++  });
++
++  it("is null without a query client", () => {
++    const { result } = renderHook(() => useAeEffortDefault("conv_1"));
++    expect(result.current).toBeNull();
++  });
++});
++
+ describe("aeEffortDefaultFor", () => {
+   const levels = JSON.stringify({ "*": "medium", "claude-opus-5-5": "high" });
+ 
+diff --git a/web/src/lib/aeEffortDefault.ts b/web/src/lib/aeEffortDefault.ts
+index a8b7f85305cb003d992d251f126e77c12af2ddf8..34ddebf896eda4e2ec39183302ad56053b0d2270 100644
+--- a/web/src/lib/aeEffortDefault.ts
++++ b/web/src/lib/aeEffortDefault.ts
+@@ -7,6 +7,7 @@
+ import { type QueryClient, QueryClientContext } from "@tanstack/react-query";
+ import { useCallback, useContext, useSyncExternalStore } from "react";
+ import type { Conversation } from "@/hooks/useConversations";
++import { subscribeToQueryKeys } from "@/lib/aeQueryCacheSubscribe";
+ import { aeClaudeVersion } from "@/lib/aeClaudeModels";
+ import { comparableModelId } from "@/lib/codexNativeModels";
+ import { normalizeEffortLabel } from "@/lib/composerModelLabel";
+@@ -37,7 +38,8 @@ export function readAeEffortDefault(queryClient: QueryClient, id: string): strin
+ export function useAeEffortDefault(id: string | null): string | null {
+   const queryClient = useContext(QueryClientContext);
+   const subscribe = useCallback(
+-    (onChange: () => void) => queryClient?.getQueryCache().subscribe(onChange) ?? (() => {}),
++    (onChange: () => void) =>
++      queryClient ? subscribeToQueryKeys(queryClient, [["conversations"]], onChange) : () => {},
+     [queryClient],
+   );
+   const read = useCallback(
+diff --git a/web/src/lib/aeQueryCacheSubscribe.test.ts b/web/src/lib/aeQueryCacheSubscribe.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..16724d75f90ccdf510832ea70f32382656e4c951
+--- /dev/null
++++ b/web/src/lib/aeQueryCacheSubscribe.test.ts
+@@ -0,0 +1,58 @@
++import { QueryClient } from "@tanstack/react-query";
++import { describe, expect, it, vi } from "vitest";
++import { subscribeToQueryKeys } from "./aeQueryCacheSubscribe";
++
++describe("subscribeToQueryKeys", () => {
++  it("fires for a matching key and a longer key under the prefix", () => {
++    const client = new QueryClient();
++    const onChange = vi.fn();
++    subscribeToQueryKeys(client, [["conversations"]], onChange);
++    client.setQueryData(["conversations"], 1);
++    expect(onChange).toHaveBeenCalled();
++    onChange.mockClear();
++    client.setQueryData(["conversations", "list", { a: 1 }], 1);
++    expect(onChange).toHaveBeenCalled();
++    onChange.mockClear();
++    client.setQueryData(["conversations", "list", { a: 1 }], 2);
++    expect(onChange).toHaveBeenCalled();
++  });
++
++  it("matches any of several keys", () => {
++    const client = new QueryClient();
++    const onChange = vi.fn();
++    subscribeToQueryKeys(client, [["conversations"], ["ae", "helpers-count"]], onChange);
++    client.setQueryData(["ae", "helpers-count"], true);
++    expect(onChange).toHaveBeenCalled();
++  });
++
++  it("does not fire for a non-matching key", () => {
++    const client = new QueryClient();
++    const onChange = vi.fn();
++    subscribeToQueryKeys(client, [["conversations"]], onChange);
++    client.setQueryData(["session", "a"], 1);
++    client.setQueryData(["ae", "helpers-count"], true);
++    expect(onChange).not.toHaveBeenCalled();
++  });
++
++  it("does not fire for observer-only events", () => {
++    const client = new QueryClient();
++    client.setQueryData(["conversations"], 1);
++    const onChange = vi.fn();
++    subscribeToQueryKeys(client, [["conversations"]], onChange);
++    const query = client.getQueryCache().find({ queryKey: ["conversations"] })!;
++    const observer = { onQueryUpdate: () => {} } as never;
++    query.addObserver(observer);
++    query.removeObserver(observer);
++    client.getQueryCache().notify({ type: "observerResultsUpdated", query });
++    expect(onChange).not.toHaveBeenCalled();
++  });
++
++  it("stops after unsubscribe", () => {
++    const client = new QueryClient();
++    const onChange = vi.fn();
++    const unsubscribe = subscribeToQueryKeys(client, [["conversations"]], onChange);
++    unsubscribe();
++    client.setQueryData(["conversations"], 1);
++    expect(onChange).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/lib/aeQueryCacheSubscribe.ts b/web/src/lib/aeQueryCacheSubscribe.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d645120fc30f58bba5455b3ecb999951af548e1f
+--- /dev/null
++++ b/web/src/lib/aeQueryCacheSubscribe.ts
+@@ -0,0 +1,19 @@
++// A query-cache subscription that wakes only for the keys a hook reads. A bare
++// `getQueryCache().subscribe(onChange)` fires for every cache event, and a
++// session switch fires hundreds (each fetch adds, updates and re-notifies its
++// observers), so each hook re-scanned the cache on events it could not care about.
++
++import { type QueryClient, type QueryKey, partialMatchKey } from "@tanstack/react-query";
++
++/** Calls `onChange` when a query under one of `keys` is added, removed or updated. */
++export function subscribeToQueryKeys(
++  queryClient: QueryClient,
++  keys: readonly QueryKey[],
++  onChange: () => void,
++): () => void {
++  return queryClient.getQueryCache().subscribe((event) => {
++    if (event.type !== "added" && event.type !== "removed" && event.type !== "updated") return;
++    const queryKey = event.query.queryKey;
++    if (keys.some((key) => partialMatchKey(queryKey, key))) onChange();
++  });
++}
+diff --git a/web/src/lib/telemetry.test.ts b/web/src/lib/telemetry.test.ts
+index 8ea62ddd7149384b83370653b737f559525f1cdb..6d06dc1f2fcd5ba92cace74954b7ae9c199ff4b6 100644
+--- a/web/src/lib/telemetry.test.ts
++++ b/web/src/lib/telemetry.test.ts
+@@ -54,12 +54,19 @@ afterEach(() => {
+   vi.resetModules();
+ });
+ 
++// Lets the dynamic import in initBrowserTelemetry settle before asserting a non-call.
++const flushImports = () =>
++  new Promise<void>((resolve) => {
++    setTimeout(resolve, 20);
++  });
++
+ describe("initBrowserTelemetry", () => {
+   it("no-ops when no collector endpoint is configured", async () => {
+     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "");
+     const { initBrowserTelemetry } = await import("./telemetry");
+ 
+     initBrowserTelemetry();
++    await flushImports();
+ 
+     // With no collector, nothing is registered — production builds without
+     // a backend pay zero overhead and never patch fetch.
+@@ -67,13 +74,25 @@ describe("initBrowserTelemetry", () => {
+     expect(m.registerInstrumentations).not.toHaveBeenCalled();
+   });
+ 
++  it("does not load the OpenTelemetry module when no endpoint is configured", async () => {
++    vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "");
++    const { initBrowserTelemetry } = await import("./telemetry");
++
++    initBrowserTelemetry();
++    await flushImports();
++
++    // zone.js loads with the SDK, so the module must stay unloaded.
++    expect(m.ZoneContextManager).not.toHaveBeenCalled();
++    expect(m.OTLPTraceExporter).not.toHaveBeenCalled();
++  });
++
+   it("registers a provider + fetch/XHR instrumentation when an endpoint is set", async () => {
+     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
+     const { initBrowserTelemetry } = await import("./telemetry");
+ 
+     initBrowserTelemetry();
++    await vi.waitFor(() => expect(m.WebTracerProvider).toHaveBeenCalledTimes(1));
+ 
+-    expect(m.WebTracerProvider).toHaveBeenCalledTimes(1);
+     expect(m.register).toHaveBeenCalledTimes(1);
+     // Traces post to the collector's /v1/traces path.
+     expect(m.OTLPTraceExporter).toHaveBeenCalledWith({
+@@ -90,6 +109,8 @@ describe("initBrowserTelemetry", () => {
+ 
+     initBrowserTelemetry();
+     initBrowserTelemetry();
++    await vi.waitFor(() => expect(m.WebTracerProvider).toHaveBeenCalled());
++    await flushImports();
+ 
+     expect(m.WebTracerProvider).toHaveBeenCalledTimes(1);
+   });
+@@ -99,9 +120,10 @@ describe("initBrowserTelemetry", () => {
+     const { initBrowserTelemetry } = await import("./telemetry");
+ 
+     initBrowserTelemetry();
+-
+-    expect(m.OTLPTraceExporter).toHaveBeenCalledWith({
+-      url: "http://localhost:4318/v1/traces",
+-    });
++    await vi.waitFor(() =>
++      expect(m.OTLPTraceExporter).toHaveBeenCalledWith({
++        url: "http://localhost:4318/v1/traces",
++      }),
++    );
+   });
+ });
+diff --git a/web/src/lib/telemetry.ts b/web/src/lib/telemetry.ts
+index 961b1900529c9bb6290caccedac05a0dbe730c66..d605585ce48a0fef5fa6d0409432d999496debd0 100644
+--- a/web/src/lib/telemetry.ts
++++ b/web/src/lib/telemetry.ts
+@@ -12,23 +12,14 @@
+ // is a no-op — no provider, no patched fetch, zero overhead — so production
+ // builds without a collector are unaffected.
+ 
+-import { ZoneContextManager } from "@opentelemetry/context-zone";
+-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
+-import { registerInstrumentations } from "@opentelemetry/instrumentation";
+-import { FetchInstrumentation } from "@opentelemetry/instrumentation-fetch";
+-import { XMLHttpRequestInstrumentation } from "@opentelemetry/instrumentation-xml-http-request";
+-import { resourceFromAttributes } from "@opentelemetry/resources";
+-import { BatchSpanProcessor, WebTracerProvider } from "@opentelemetry/sdk-trace-web";
+-import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
+-
+ let initialized = false;
+ 
+ /**
+  * Initialize browser tracing if a collector endpoint is configured.
+  *
+- * Idempotent and safe to call once at app startup (before any request is
+- * made, so fetch/XHR are patched in time). No-op when
+- * `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is unset.
++ * Idempotent and safe to call once at app startup. No-op when
++ * `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is unset. The SDK loads on demand, so with
++ * tracing on, requests made before the import resolves are not traced.
+  */
+ export function initBrowserTelemetry(): void {
+   if (initialized) return;
+@@ -38,43 +29,5 @@ export function initBrowserTelemetry(): void {
+   initialized = true;
+ 
+   const serviceName = import.meta.env.VITE_OTEL_SERVICE_NAME?.trim() || "omni-web";
+-
+-  const exporter = new OTLPTraceExporter({
+-    // OTLP/HTTP traces are posted to the collector's `/v1/traces` path.
+-    url: `${endpoint.replace(/\/$/, "")}/v1/traces`,
+-  });
+-
+-  const provider = new WebTracerProvider({
+-    resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: serviceName }),
+-    spanProcessors: [new BatchSpanProcessor(exporter)],
+-  });
+-
+-  // ZoneContextManager keeps the active span across async boundaries
+-  // (promises, timers) so child spans nest correctly in the browser.
+-  provider.register({ contextManager: new ZoneContextManager() });
+-
+-  // Propagate `traceparent` to same-origin API calls (the default) and,
+-  // explicitly, to this app's own origin — scoped so the header is never
+-  // attached to unrelated third-party requests (analytics, CDNs).
+-  const propagateTraceHeaderCorsUrls = [new RegExp(`^${escapeRegExp(window.location.origin)}`)];
+-
+-  registerInstrumentations({
+-    instrumentations: [
+-      new FetchInstrumentation({
+-        propagateTraceHeaderCorsUrls,
+-        clearTimingResources: true,
+-      }),
+-      new XMLHttpRequestInstrumentation({ propagateTraceHeaderCorsUrls }),
+-    ],
+-  });
+-}
+-
+-/**
+- * Escape a string for safe use inside a RegExp.
+- *
+- * @param value Raw string, e.g. an origin like `https://app.example.com`.
+- * @returns The string with regex metacharacters escaped.
+- */
+-function escapeRegExp(value: string): string {
+-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++  void import("./telemetryOtel").then((mod) => mod.startBrowserTelemetry(endpoint, serviceName));
+ }
+diff --git a/web/src/lib/telemetryOtel.ts b/web/src/lib/telemetryOtel.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..1e7efaf9ba09c576e758812b442e0933f8ab00c1
+--- /dev/null
++++ b/web/src/lib/telemetryOtel.ts
+@@ -0,0 +1,54 @@
++// The OpenTelemetry setup behind `initBrowserTelemetry`, in its own module so
++// the SDK (and zone.js, which wraps every timer and event listener once loaded)
++// is only fetched when a collector endpoint is configured.
++
++import { ZoneContextManager } from "@opentelemetry/context-zone";
++import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
++import { registerInstrumentations } from "@opentelemetry/instrumentation";
++import { FetchInstrumentation } from "@opentelemetry/instrumentation-fetch";
++import { XMLHttpRequestInstrumentation } from "@opentelemetry/instrumentation-xml-http-request";
++import { resourceFromAttributes } from "@opentelemetry/resources";
++import { BatchSpanProcessor, WebTracerProvider } from "@opentelemetry/sdk-trace-web";
++import { ATTR_SERVICE_NAME } from "@opentelemetry/semantic-conventions";
++
++/** Starts tracing against the collector at `endpoint`. Call once. */
++export function startBrowserTelemetry(endpoint: string, serviceName: string): void {
++  const exporter = new OTLPTraceExporter({
++    // OTLP/HTTP traces are posted to the collector's `/v1/traces` path.
++    url: `${endpoint.replace(/\/$/, "")}/v1/traces`,
++  });
++
++  const provider = new WebTracerProvider({
++    resource: resourceFromAttributes({ [ATTR_SERVICE_NAME]: serviceName }),
++    spanProcessors: [new BatchSpanProcessor(exporter)],
++  });
++
++  // ZoneContextManager keeps the active span across async boundaries
++  // (promises, timers) so child spans nest correctly in the browser.
++  provider.register({ contextManager: new ZoneContextManager() });
++
++  // Propagate `traceparent` to same-origin API calls (the default) and,
++  // explicitly, to this app's own origin — scoped so the header is never
++  // attached to unrelated third-party requests (analytics, CDNs).
++  const propagateTraceHeaderCorsUrls = [new RegExp(`^${escapeRegExp(window.location.origin)}`)];
++
++  registerInstrumentations({
++    instrumentations: [
++      new FetchInstrumentation({
++        propagateTraceHeaderCorsUrls,
++        clearTimingResources: true,
++      }),
++      new XMLHttpRequestInstrumentation({ propagateTraceHeaderCorsUrls }),
++    ],
++  });
++}
++
++/**
++ * Escape a string for safe use inside a RegExp.
++ *
++ * @param value Raw string, e.g. an origin like `https://app.example.com`.
++ * @returns The string with regex metacharacters escaped.
++ */
++function escapeRegExp(value: string): string {
++  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
++}

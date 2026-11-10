@@ -394,7 +394,7 @@ another owner or registry fails the run
 pushing unless its `push` input is on and the chosen ref is an `ae-v*` tag, so a
 branch build never lands in the registry under a name the box would pull. Since
 2026-09-24 the tag push is the whole deploy: a user timer on the box
-(`deploy/auto-update.sh`, every ten minutes) picks up the newest `ae-v*` tag on
+(`deploy/auto-update.sh`, every minute) picks up the newest `ae-v*` tag on
 `main`, pulls it, starts it, checks `/health` and rolls back on failure
 (`deploy/README.md`, "Automatic updates"). AE's package is private, so AE's host user
 is logged in to ghcr.io with a `read:packages` token.

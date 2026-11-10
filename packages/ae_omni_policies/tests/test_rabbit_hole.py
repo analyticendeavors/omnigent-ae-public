@@ -319,6 +319,21 @@ def test_a_merge_watcher_note_is_neither_counted_nor_asked(
     assert response is not None and response["result"] == "ASK"
 
 
+def test_the_compact_save_prompt_is_neither_counted_nor_asked(
+    store: dict[str, Conversation],
+) -> None:
+    # 2026-11-06: the queued Compact posts it; words added before it make an ordinary prompt.
+    from ae_omni_policies.continuation import COMPACT_PREP_TEXT
+
+    policy = rabbit_hole(hours=4, turns=60)
+    event = _event({TURNS_KEY: 80}, {labels.STARTED: str(NOW - 9 * HOUR)})
+    event["data"] = {"user_content": COMPACT_PREP_TEXT}
+    assert policy(event) is None
+    event["data"] = {"user_content": "Also do this. " + COMPACT_PREP_TEXT}
+    response = policy(event)
+    assert response is not None and response["result"] == "ASK"
+
+
 def test_the_old_lead_handoff_words_are_an_ordinary_prompt(
     store: dict[str, Conversation],
 ) -> None:

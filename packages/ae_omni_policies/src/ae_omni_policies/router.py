@@ -41,6 +41,18 @@ Its ``POST /family-cost/settings`` saves the card's "Show cost as" and "Runaway 
 2026-10-25 added ``GET /azure-cost/targets``, ``PUT`` and ``DELETE
 /azure-cost/targets/{id}`` (:mod:`ae_omni_policies.cost_targets`): limits on spend and
 on a running Fabric capacity, with a task-store alarm when one is crossed.
+2026-11-03 (Admin Center v1.5) added ``GET /attention``, ``GET /attention/summary`` and
+``POST /attention/dismiss``, ``.../restore`` and ``.../session`` (the id in the body)
+(:mod:`ae_omni_policies.attention`): the Needs you list across the cards (Git repos and Box
+health in phase 1), per-person dismissals, and a Review chat on one item. Admins see every
+source, box admins Box health only; an id outside the caller's sources is a 404.
+2026-11-09 added ``GET /tts/voices`` and ``POST /tts`` (:mod:`ae_omni_policies.tts`): natural
+voices for Speak replies through Azure Speech, one sentence to mp3, signed in, rate limited.
+2026-11-08 added ``GET /home-security`` (:mod:`ae_omni_policies.home_security`): the home
+app's Security tab in one line, for the Admin Center's Home security card.
+2026-11-07 added ``GET /decision`` (:mod:`ae_omni_policies.decision_status`): whether the judge
+model is on for the caller, why not, its calls today and its points' modes. Signed in,
+numbers and labels only.
 2026-10-19 (Admin Center, Databricks) added ``GET /databricks``,
 ``POST /databricks/warehouses/{id}/start`` and ``.../stop``, and
 ``POST /databricks/spend/refresh`` (:mod:`ae_omni_policies.databricks`): the
@@ -147,6 +159,7 @@ as admin.
 from __future__ import annotations
 
 import asyncio
+import collections
 import contextlib
 import functools
 import hashlib
@@ -157,38 +170,60 @@ import re
 import time
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime, timedelta
+from datetime import date as date_type
 from typing import Annotated, Any, Literal
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Path, Query, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from omnigent.entities.conversation import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
+from omnigent.inner import ae_roles
 from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
-from omnigent.runtime import get_agent_store, get_conversation_store
+from omnigent.runtime import get_agent_store, get_conversation_store, pending_inputs
 from omnigent.server.auth import RESERVED_USER_LOCAL, resolve_auth_header
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, StrictStr
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
 
 from ae_omni_policies import (
     __version__,
+    admin_cards,
+    agent_judge,
+    attention,
+    attention_dismissals,
     auto_archive,
     azure_cost,
     box_health,
     box_health_cleanup,
+    card_config,
+    card_secrets,
     child_wake,
     claude_account,
+    compact_queue,
     cost_targets,
     databricks,
+    decision_advisor,
+    decision_status,
     deploy_hold,
     escalation,
     fabric,
     family_cost,
     git_center,
+    git_personal,
+    git_tokens,
     github,
+    home_security,
     host_relink,
     labels,
     lead_handoff,
@@ -216,15 +251,19 @@ from ae_omni_policies import (
     sidebar_prefs,
     slot_cap,
     slot_limit,
+    social,
+    social_visual,
     spawn_role,
+    tts,
     vault_inventory,
     your_move,
 )
-from ae_omni_policies.auth import require_ae_user
+from ae_omni_policies.auth import require_ae_user, require_browser_caller
 from ae_omni_policies.notes import resume_block_from_notes
 from ae_omni_policies.swr import SwrCache
 from ae_omni_policies.taskstore import (
     ParkFields,
+    ReminderFields,
     Settings,
     TaskStoreClient,
     TaskStoreError,
@@ -294,6 +333,7 @@ def _with_refresh_error(answer: dict[str, Any], failed: str | None) -> dict[str,
 CODE_NOT_CONFIGURED = "task_store_not_configured"
 CODE_STORE_UNAVAILABLE = "task_store_unavailable"
 CODE_UNFILED = "task_store_unfiled"
+CODE_NOT_CREATED = "task_store_not_created"
 CODE_ADMIN_UNKNOWN = "admin_unknown"
 CODE_REPLY_NOT_POSTED = "gate_reply_not_posted"
 CODE_RESUME_NO_TARGET = "resume_no_target"
@@ -386,6 +426,38 @@ class CompleteRequest(BaseModel):
 
     status: Literal["done", "dropped"] = "done"
     summary: str = ""
+
+
+class ReminderRequest(BaseModel):
+    """``POST /v1/ae/lot/create``: the worker's ``create_task`` inputs.
+
+    ``list`` is the worker's field name; it is ``list_name`` in code.
+    """
+
+    model_config = ConfigDict(populate_by_name=True, extra="forbid")
+
+    title: str = Field(min_length=1, max_length=300)
+    list_name: str | None = Field(default=None, alias="list", max_length=200)
+    due_date: str | None = None
+    due_time: str | None = None
+    notes: str | None = Field(default=None, max_length=20_000)
+    checklist: list[str] | None = Field(default=None, max_length=50)
+    tags: list[str] | None = Field(default=None, max_length=20)
+    quadrant: Literal["hotfix", "feature", "admin"] | None = None
+    est: str | None = Field(default=None, max_length=100)
+
+    def fields(self) -> ReminderFields:
+        return ReminderFields(
+            title=self.title,
+            list_name=self.list_name,
+            due_date=self.due_date,
+            due_time=self.due_time,
+            notes=self.notes,
+            checklist=self.checklist,
+            tags=self.tags,
+            quadrant=self.quadrant,
+            est=self.est,
+        )
 
 
 class KeepAwakeRequest(BaseModel):
@@ -749,6 +821,57 @@ async def pull_request_deploy(
     return await pr_deploy.status(f"{owner}/{repo}", number)
 
 
+class TtsRequest(BaseModel):
+    """One sentence to speak, with a voice from ``tts.VOICES`` and a rate from ``tts.RATES``."""
+
+    model_config = ConfigDict(extra="forbid")
+    text: str
+    voice: str
+    rate: float
+
+
+@router.get("/tts/voices", response_model=None)
+async def tts_voices() -> dict[str, Any]:
+    """The natural voices on offer; an empty list when the server has no speech key."""
+    if not tts.configured():
+        return {"voices": []}
+    return {"voices": [{"id": v.id, "name": v.name} for v in tts.VOICES]}
+
+
+@router.post(
+    "/tts",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def tts_speak(
+    body: TtsRequest,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> Response:
+    """The mp3 for one sentence. Signed in only: the desktop app has no browser proof."""
+    if not body.text.strip() or len(body.text) > tts.MAX_TEXT:
+        return JSONResponse(
+            status_code=422, content={"error": f"Text must be 1 to {tts.MAX_TEXT} characters."}
+        )
+    if body.voice not in tts.voice_ids() or body.rate not in tts.RATES:
+        return JSONResponse(status_code=422, content={"error": "Unknown voice or rate."})
+    if not tts.configured():
+        return JSONResponse(status_code=503, content={"error": "Natural voices are not set up."})
+    if not tts.take_token(user):
+        return JSONResponse(
+            status_code=429, content={"error": "Too many speech requests. Try again shortly."}
+        )
+    if not tts.charge_chars(user, len(body.text)):
+        return JSONResponse(
+            status_code=429,
+            content={"error": "Your daily voice budget is used up. It resets within 24 hours."},
+        )
+    try:
+        audio = await tts.synthesize(body.text, body.voice, body.rate)
+    except tts.TtsUnavailable as exc:
+        return JSONResponse(status_code=503, content={"error": str(exc)})
+    return Response(content=audio, media_type="audio/mpeg", headers={"Cache-Control": "no-store"})
+
+
 @router.get("/deploy/hold", response_model=None)
 async def deploy_hold_view(
     request: Request,
@@ -981,7 +1104,12 @@ async def access_view(
 ) -> dict[str, bool]:
     """What the caller may see of the Admin Center (2026-10-28). Never lists other admins."""
     admin = await shared_accounts_routes.is_admin(request, user)
-    return {"admin": admin, "box_admin": admin or box_health.is_box_admin(user)}
+    # box_on is a boolean only: a box admin's page says Box health is off instead of drawing it.
+    return {
+        "admin": admin,
+        "box_admin": admin or box_health.is_box_admin(user),
+        "box_on": admin_cards.is_on("box"),
+    }
 
 
 @router.get("/box-health", response_model=None)
@@ -1232,6 +1360,8 @@ async def vault_view(
     """
     if (refused := await _admin_only(request, user, "see the Key Vault inventory")) is not None:
         return refused
+    if admin_cards.all_off("vault"):
+        return admin_cards.off_answer("vault")
     inventory = await _vault_inventory()
     if not rows:
         for view in inventory.vaults:
@@ -1253,6 +1383,8 @@ async def vault_rows(
     """
     if (refused := await _admin_only(request, user, "see the Key Vault inventory")) is not None:
         return refused
+    if admin_cards.all_off("vault"):
+        return admin_cards.off_answer("vault")
     inventory = await _vault_inventory()
     secrets = next((view.secrets for view in inventory.vaults if view.vault == vault), [])
     page = secrets[start : start + VAULT_ROWS_PAGE]
@@ -1277,6 +1409,8 @@ async def vault_people(
     """
     if (refused := await _admin_only(request, user, "list who can own a secret")) is not None:
         return refused
+    if admin_cards.all_off("vault"):
+        return admin_cards.off_answer("vault")
     response = await shared_accounts_routes.ask_as_caller(request, "/auth/users")
     users: list[dict[str, Any]] = []
     if response is not None and response.status_code == 200:
@@ -1440,16 +1574,6 @@ async def _session_for_limits(session_id: str) -> Conversation | None:
         return None
 
 
-def _shared_labels() -> dict[str, str] | None:
-    """Shared account id (``shared:<name>``) to its label; ``None`` if the store is unreadable."""
-    try:
-        views = shared_accounts.store().views()
-    except shared_accounts.SharedAccountsError as exc:
-        _logger.warning("limits accounts: shared accounts not read: %s", exc)
-        return None
-    return {view.account: view.label for view in views}
-
-
 def _account_row(reading: limits.AccountUsage) -> dict[str, Any]:
     """One Accounts card row: labels, plan, percents and reset times; never an email or token."""
     five, week = limits.headline_windows(reading.windows)
@@ -1467,7 +1591,7 @@ def _account_row(reading: limits.AccountUsage) -> dict[str, Any]:
 
 
 def _accounts_view() -> dict[str, Any]:
-    rows = limits.store().accounts(_shared_labels())
+    rows = limits.store().accounts(shared_accounts.labels_or_none())
     return {
         "now": datetime.now(UTC).isoformat(),
         "accounts": [_account_row(row) for row in rows],
@@ -2577,6 +2701,78 @@ async def lot_complete(
     return outcome
 
 
+@router.get("/lot/lists", response_model=None)
+async def lot_lists(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """The task app's visible lists by exact name, so ``create_task`` can name one.
+
+    Admin only, with every ``/lot`` route.
+    """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
+    settings = Settings.from_env()
+    if not settings.configured:
+        return _not_configured(settings)
+    async with TaskStoreClient(settings) as client:
+        answer = await client.list_lists()
+    if "error" in answer:
+        return _error(502, CODE_STORE_UNAVAILABLE, str(answer["error"]))
+    return answer
+
+
+@router.post("/lot/create", response_model=None)
+async def lot_create(
+    body: ReminderRequest, request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Create an ordinary task or reminder: the worker's ``create_task``.
+
+    A ``due_time`` sets the alarm the task app pushes to the phone. Admin only,
+    with every ``/lot`` route. The task carries this connector's origin, which is
+    what lets :func:`lot_cancel` drop it later and nothing else.
+    """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
+    settings = Settings.from_env()
+    if not settings.configured:
+        return _not_configured(settings)
+    async with TaskStoreClient(settings) as client:
+        outcome = await client.create_reminder(body.fields())
+    # Before the answer, created or not: a failed create may still have made a task.
+    forget_lot()
+    if outcome.get("outcome") != "created":
+        return _error(
+            502,
+            CODE_NOT_CREATED,
+            str(outcome.get("reason") or "task-store did not create the task"),
+            outcome="not_created",
+            lists=outcome.get("lists"),
+            instruction=outcome.get("instruction"),
+        )
+    return outcome
+
+
+@router.post("/lot/{task_id}/cancel", response_model=None)
+async def lot_cancel(
+    task_id: str, request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Cancel an open task this server created: status ``dropped``, never a delete.
+
+    The task app refuses ``DELETE`` from a machine credential on purpose, so this
+    is a PATCH the credential is already allowed. A task made by anything else, or
+    no longer open, comes back ``not_cancelled`` and is left alone. Admin only.
+    """
+    if (refused := await _admin_only(request, user, "use the Parking Lot")) is not None:
+        return refused
+    settings = Settings.from_env()
+    if not settings.configured:
+        return _not_configured(settings)
+    async with TaskStoreClient(settings) as client:
+        outcome = await client.cancel(task_id)
+    forget_lot()
+    return outcome
+
+
 async def _resume_block(task_id: str) -> dict[str, Any] | JSONResponse:
     """The task's Resume in Claude block, or the error response that explains its absence."""
     settings = Settings.from_env()
@@ -2994,6 +3190,34 @@ async def set_session_preset(
     return {"ok": True, "preset": body.preset}
 
 
+class VoicePost(BaseModel):
+    """``POST /v1/ae/sessions/{id}/voice``: whether Voice mode is on for the chat."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    on: bool
+
+
+@router.post(
+    "/sessions/{session_id}/voice",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def set_session_voice(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: VoicePost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Write ``ae.voice`` ("on" or "") so the voice policy adds the spoken-style line."""
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can change session {session_id}")
+    await _set_labels(session_id, {labels.VOICE: "on" if body.on else ""})
+    return {"ok": True, "on": body.on}
+
+
 class ReviewReportPost(BaseModel):
     """``POST /v1/ae/sessions/{id}/review-report``: what a lead's final review found."""
 
@@ -3003,6 +3227,10 @@ class ReviewReportPost(BaseModel):
     findings_returned: int = Field(ge=0, le=10000)
     findings_fixed: int = Field(ge=0, le=10000)
     call_id: str | None = Field(default=None, min_length=1, max_length=100)
+    # Reviewer persona ids this round ran (2026-11-06): labels the round in the run log.
+    personas: list[Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,39}$")]] | None = Field(
+        default=None, max_length=20
+    )
 
 
 @router.post(
@@ -3053,11 +3281,303 @@ async def post_review_report(
             body.findings_returned,
             body.findings_fixed,
             call_id=body.call_id,
+            personas=body.personas,
             insights_on=insights_on,
             lead_now=(lead_status, preset_runs._time(conv, "updated_at")),
         )
     )
     return {"ok": True, "session_id": lead_id, **result}
+
+
+ADVISE_MESSAGE_PAGES = 5  # pages of 100 items read for the no-passthrough check
+_ADVISE_TASKS: set[asyncio.Task[Any]] = set()
+
+
+class _TranscriptUnreadable(Exception):
+    """The user's messages could not all be read, so passthrough cannot be ruled out."""
+
+
+MAX_JUDGE_CHILDREN = (
+    100  # direct children (family and sub-agent) read for the copy check; more fails closed
+)
+
+
+def _is_injected(data: Any) -> bool:
+    """True for a stored user item the bridge stamped as harness-written (2026-11-06).
+
+    A subagent hand-back or task notification carries ``is_meta`` (set from Claude's origin
+    field) or a ``subagent_return_id``. Text is never trusted for this: an owner can paste or
+    type any prefix, so only the stamp counts.
+    """
+    return getattr(data, "is_meta", None) is True or bool(
+        getattr(data, "subagent_return_id", None)
+    )
+
+
+def _user_texts(session_id: str, *, allow_empty: bool = False) -> list[str]:
+    """Every user message text in the session except harness-stamped ones, queued ones included.
+
+    A message sits in ``pending_inputs`` (memory) until the harness takes it, and only then
+    becomes a ``role="user"`` item, so both are read; pending inputs are always counted. A
+    stored item stamped by the bridge (:func:`_is_injected`) is skipped: it is not the owner's
+    words. Raises :class:`_TranscriptUnreadable` when the page cap is hit with more items
+    left, or when nothing is left (a session of only stamped messages fails closed) unless
+    ``allow_empty``.
+    """
+    store = get_conversation_store()
+    texts: list[str] = []
+    after: str | None = None
+    for _ in range(ADVISE_MESSAGE_PAGES):
+        page = store.list_items(session_id, limit=100, after=after, order="desc", type="message")
+        for item in page.data:
+            data = getattr(item, "data", None)
+            if getattr(data, "role", None) != "user" or _is_injected(data):
+                continue
+            texts.extend(
+                block["text"]
+                for block in getattr(data, "content", None) or []
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            )
+        if not page.has_more:
+            break
+        if not page.last_id:
+            raise _TranscriptUnreadable
+        after = page.last_id
+    else:
+        raise _TranscriptUnreadable  # the cap ended the loop with items left
+    for pending in pending_inputs.snapshot_for(session_id):
+        texts.extend(
+            block["text"]
+            for block in pending.get("content") or []
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    if not texts and not allow_empty:
+        raise _TranscriptUnreadable
+    return texts
+
+
+# Wrapper label upstream stamps on a Claude Code Agent-tool sub-agent's mirror row. It is
+# client-writable, so it only picks which child cap a row counts toward, never what is read.
+CLAUDE_SUBAGENT_WRAPPER = "claude-code-native-ui-subagent"
+MAX_JUDGE_MIRRORS = 400  # sub-agent mirror children read for the copy check; more fails closed
+LEAD_SENT_PAGES = 20  # pages of 100 tool calls read for the lead's own outgoing text
+LEAD_SENT_MIN = 20  # shorter tool-call strings are never treated as the lead's own text
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _is_mirror(row: Any) -> bool:
+    return getattr(row, "kind", None) == "sub_agent" and (
+        (getattr(row, "labels", None) or {}).get("omnigent.wrapper") == CLAUDE_SUBAGENT_WRAPPER
+    )
+
+
+# Tools whose string arguments land in a child as a user message (a sub-agent prompt, a brief,
+# a follow-up). Matched on the name's last part, so MCP prefixes from any harness match too.
+DELIVERY_TOOLS = frozenset(
+    {"Agent", "Task", "SendMessage", "create_session", "post_message", "sys_session_send"}
+)
+
+
+def _delivers(name: Any) -> bool:
+    if not isinstance(name, str):
+        return False
+    return re.split(r"__|\.", name)[-1] in DELIVERY_TOOLS
+
+
+def _lead_sent(session_id: str) -> collections.Counter[str]:
+    """How many times the lead delivered each text to a child (2026-11-06).
+
+    Only :data:`DELIVERY_TOOLS` count, and each delivery cancels one equal child message, so
+    an owner message typed into a child stays counted even when the lead echoes it: the echo
+    adds its own copy. Reading too few pages only leaves more text counted (safe).
+    """
+    store = get_conversation_store()
+    sent: collections.Counter[str] = collections.Counter()
+    after: str | None = None
+    for _ in range(LEAD_SENT_PAGES):
+        page = store.list_items(
+            session_id, limit=100, after=after, order="desc", type="function_call"
+        )
+        for item in page.data:
+            data = getattr(item, "data", None)
+            if not _delivers(getattr(data, "name", None)):
+                continue
+            try:
+                args = json.loads(getattr(data, "arguments", "") or "{}")
+            except ValueError:
+                continue
+            if isinstance(args, dict):
+                sent.update(  # a set: one delivery cancels at most one copy of each text
+                    {
+                        _norm(v)
+                        for v in args.values()
+                        if isinstance(v, str) and len(v) >= LEAD_SENT_MIN
+                    }
+                )
+        if not page.has_more or not page.last_id:
+            break
+        after = page.last_id
+    return sent
+
+
+def _child_texts(session_id: str) -> list[str]:
+    """Owner texts of the session's direct children (2026-11-06).
+
+    The owner can type into a child chat, and the child's hand-back quoting it is skipped in
+    the lead, so the child's own transcript is read too. Each text the lead delivered to a
+    child (a sub-agent prompt, a brief, a follow-up; :func:`_lead_sent`) cancels one equal
+    child message; everything else, queued inputs included, is counted. No label decides
+    what is read. Raises :class:`_TranscriptUnreadable` past
+    :data:`MAX_JUDGE_CHILDREN` other children or :data:`MAX_JUDGE_MIRRORS` sub-agent mirrors,
+    or when any child cannot be read.
+    """
+    store = get_conversation_store()
+    me = store.get_conversation(session_id)
+    if me is None:
+        raise _TranscriptUnreadable
+    bare = session_id.removeprefix("conv_")
+    try:
+        # Archived children and every owner's rows count; a child is never older than its lead.
+        rows = sessions.list_since(getattr(me, "created_at", 0) or 0, store)
+    except sessions.ScanTooLong:
+        raise _TranscriptUnreadable from None
+    kids = [
+        row
+        for row in rows
+        if row.id.removeprefix("conv_") != bare
+        and (
+            (labels.orch_parent(row.labels) or "").removeprefix("conv_") == bare
+            or (getattr(row, "parent_conversation_id", None) or "").removeprefix("conv_") == bare
+        )
+    ]
+    mirrors = sum(1 for row in kids if _is_mirror(row))
+    if len(kids) - mirrors > MAX_JUDGE_CHILDREN or mirrors > MAX_JUDGE_MIRRORS:
+        raise _TranscriptUnreadable
+    if not kids:
+        return []
+    budget = _lead_sent(session_id)
+    texts: list[str] = []
+    for kid in kids:
+        for text in _user_texts(kid.id, allow_empty=True):
+            key = _norm(text)
+            if budget[key] > 0:
+                budget[key] -= 1  # the lead's own delivered copy
+            else:
+                texts.append(text)
+    return texts
+
+
+async def _log_advice(session_id: str, owner: str | None, entry: dict[str, Any]) -> None:
+    """Best effort: never delays the reply, never raises."""
+    try:
+        insights_on = await asyncio.to_thread(preset_runs.insights_enabled, owner)
+        await asyncio.to_thread(
+            preset_runs.record_advice,
+            preset_runs.shared_state(),
+            session_id,
+            entry,
+            insights_on=insights_on,
+        )
+    except Exception:  # noqa: BLE001 (the lead has its answer; a missed log line is fine)
+        _logger.warning("advisor: could not log the entry for %s", session_id, exc_info=True)
+
+
+@router.post(
+    "/sessions/{session_id}/advise",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def post_advise(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: decision_advisor.AdviseRequest,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Ask the judge model which preset fits the task (``advise_preset``). Added 2026-11-06.
+
+    Only the session's owner, only in a lead-picks session. Every failure answers 200 with
+    ``decide_yourself`` and a reason code; the lead goes on and picks itself.
+    """
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can advise session {session_id}")
+    owner = await asyncio.to_thread(_owner_identity.owner, session_id) or user
+    if ae_roles._is_child(conv):  # a helper is not a lead, whatever its label says
+        return {"verdict": decision_advisor.DECIDE_YOURSELF, "reason": "helper"}
+    try:
+        resolved = await asyncio.to_thread(ae_roles.resolve_roles, conv, get_conversation_store())
+    except Exception:  # noqa: BLE001 (a turn is never blocked)
+        resolved = {}
+    if resolved.get("lead_picks") is not True:
+        return {"verdict": decision_advisor.DECIDE_YOURSELF, "reason": "not_lead_picks"}
+    presets = [p for p in resolved.get("presets") or [] if isinstance(p, dict)]
+    try:
+        texts = await asyncio.to_thread(_user_texts, session_id)
+        texts += await asyncio.to_thread(_child_texts, session_id)
+    except Exception:  # noqa: BLE001 (cannot prove no passthrough, so send nothing)
+        return {"verdict": decision_advisor.DECIDE_YOURSELF, "reason": "no_transcript"}
+    reply, entry = await decision_advisor.advise(
+        body, presets, texts, owner=owner, session=session_id
+    )
+    task = asyncio.create_task(_log_advice(session_id, owner, entry))
+    _ADVISE_TASKS.add(task)
+    task.add_done_callback(_ADVISE_TASKS.discard)
+    return reply
+
+
+@router.post(
+    "/sessions/{session_id}/judge",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def post_judge(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: agent_judge.JudgeRequest,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """A guarded typed judgment for any session (``ask_judge``). Added 2026-11-06.
+
+    Same owner check as ``post_advise``, but every role may ask (lead, helper, builder,
+    reviewer, planner). Every failure answers 200 with ``error`` and ``low_confidence``.
+    """
+    conv = await _conversation(session_id)
+    if conv is None:
+        return _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return _error(403, ErrorCode.FORBIDDEN, f"only the owner can ask for session {session_id}")
+    owner = await asyncio.to_thread(_owner_identity.owner, session_id) or user
+    try:
+        texts = await asyncio.to_thread(_user_texts, session_id)
+        texts += await asyncio.to_thread(_child_texts, session_id)
+        # A helper's own transcript is a brief; the user's words are in its lead's. Read every
+        # ancestor (up to five hops) and fail closed if one cannot be read.
+        hop, up = conv, 0
+        while up < 5 and (
+            ae_roles._is_child(hop)
+            or labels.orch_parent(hop.labels)
+            or getattr(hop, "parent_conversation_id", None)
+        ):
+            parent = labels.orch_parent(hop.labels) or getattr(hop, "parent_conversation_id", None)
+            if not parent:
+                raise _TranscriptUnreadable
+            texts += await asyncio.to_thread(_user_texts, parent)
+            parent_conv = await _conversation(parent)
+            if parent_conv is None:
+                raise _TranscriptUnreadable
+            hop, up = parent_conv, up + 1
+    except Exception:  # noqa: BLE001 (cannot prove no passthrough, so send nothing)
+        return {"answer": None, "probs": {}, "low_confidence": True, "error": "no_transcript"}
+    return await agent_judge.run(
+        body,
+        session=session_id,
+        owner=owner,
+        role=labels.label(conv.labels, labels.ROLE),
+        user_messages=texts,
+    )
 
 
 class ModelPost(BaseModel):
@@ -3474,8 +3994,12 @@ async def _start_session(
     user: str | None,
     *,
     handoff_from: str | None = None,
+    extra_labels: dict[str, str] | None = None,
 ) -> dict[str, Any] | JSONResponse:
     """:func:`start_session`'s work.
+
+    :param extra_labels: More labels for the new session (the Needs you item it works on,
+        2026-11-03); they never override the ``ae.*`` labels the create sets itself.
 
     :param handoff_from: The lead this session takes over from (lead handoff, 2026-10-29). Its
         family (the lead and the sessions it started) is left out of the slot count, because the
@@ -3613,6 +4137,7 @@ async def _start_session(
             spawn=spawn,
             user=user,
             account_from=handoff_from,
+            extra_labels=extra_labels,
         )
     finally:
         slot_cap.release(hold)
@@ -3637,6 +4162,7 @@ async def _create_briefed(
     spawn: spawn_role.Spawn,
     user: str | None = None,
     account_from: str | None = None,
+    extra_labels: dict[str, str] | None = None,
 ) -> dict[str, Any] | JSONResponse:
     try:
         agent = await _resume_agent(request, HARNESS_AGENTS[body.harness])
@@ -3666,6 +4192,8 @@ async def _create_briefed(
     session_labels[labels.PRESET] = spawn.preset
     if body.preset:
         session_labels[_TEAM_LABEL] = spawn_role.team_label(spawn.preset)
+    for name, value in (extra_labels or {}).items():
+        session_labels.setdefault(name, value)
     create = {
         "agent_id": agent["id"],
         "host_id": host["host_id"],
@@ -4053,26 +4581,158 @@ async def snooze_handoff(
         return _not_found(f"no session {session_id}")
     if not await _may_write_session(user, session_id):
         return _error(403, ErrorCode.FORBIDDEN, f"only the owner can change session {session_id}")
-    async with lead_handoff.lead_lock(session_id):
-        # Read again inside the lock: a handoff may have committed while this waited.
-        conv = await _conversation(session_id)
-        if conv is None:
-            return _not_found(f"no session {session_id}")
-        if lead_handoff.handoff_target(conv) is not None:
-            return _error(409, CODE_HANDOFF_REFUSED, "this chat already handed off")
-        if not lead_handoff.is_lead(conv):
-            return _error(
-                409, CODE_HANDOFF_REFUSED, "only a working Claude chat you opened can be snoozed"
-            )
-        tokens = lead_handoff.context_tokens(conv) or 0
-        if tokens <= 0:
-            # A size of 0 would bring the card back at 100k tokens.
-            return _error(409, CODE_HANDOFF_REFUSED, "this chat has no context reading to snooze")
-        await _set_labels(
-            session_id,
-            {labels.HANDOFF: labels.HANDOFF_SNOOZED, labels.HANDOFF_AT: str(tokens)},
+    result = await lead_handoff.snooze(session_id)
+    if isinstance(result, tuple):
+        status, code, message = result
+        return _error(status, code, message)
+    return {"ok": True, "session_id": session_id, "snoozed_at": result}
+
+
+# ── queued Compact (2026-11-06): the server saves the chat's notes, then compacts ──
+
+CODE_COMPACT_UNSUPPORTED = "ae_compact_unsupported"
+CODE_COMPACT_QUEUED = "ae_compact_queued"
+CODE_COMPACT_SENDING = "ae_compact_sending"
+CODE_COMPACT_OFF = "ae_compact_off"
+
+
+class CompactQueueBody(BaseModel):
+    """Queue a Compact; ``snooze`` also snoozes the dock card's suggestion after it ran."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    snooze: bool = False
+
+
+class CompactSeenBody(BaseModel):
+    """The page showed a stored failure."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    failure_id: Annotated[str, Field(max_length=64)]
+
+
+def _compact_view(session_id: str) -> dict[str, Any]:
+    driver = compact_queue.current()
+    phase, failure = driver.state(session_id) if driver is not None else (None, None)
+    return {
+        "session_id": session_id,
+        "phase": phase,
+        "failure": (
+            {"id": failure.id, "message": failure.message, "at": failure.at} if failure else None
+        ),
+    }
+
+
+async def _compact_session(
+    session_id: str, user: str | None
+) -> tuple[Conversation | None, JSONResponse | None]:
+    """The chat, or the 404 / 403 answer."""
+    conv = await _conversation(session_id)
+    if conv is None:
+        return None, _not_found(f"no session {session_id}")
+    if not await _may_write_session(user, session_id):
+        return None, _error(
+            403, ErrorCode.FORBIDDEN, f"only the owner can change session {session_id}"
         )
-    return {"ok": True, "session_id": session_id, "snoozed_at": tokens}
+    return conv, None
+
+
+@router.get("/sessions/{session_id}/compact", response_model=None)
+async def get_compact(
+    session_id: Annotated[str, Path(max_length=120)],
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Where the chat's queued Compact stands, and a failure the page has not shown yet."""
+    _, refused = await _compact_session(session_id, user)
+    if refused is not None:
+        return refused
+    return _compact_view(session_id)
+
+
+@router.post(
+    "/sessions/{session_id}/compact",
+    response_model=None,
+    status_code=202,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def queue_compact(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: CompactQueueBody,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Queue a Compact: at the end of a real turn the chat saves its notes, then compacts."""
+    conv, refused = await _compact_session(session_id, user)
+    if refused is not None or conv is None:
+        return refused or _not_found(f"no session {session_id}")
+    if labels.label(conv.labels or {}, lead_handoff.WRAPPER_LABEL) != lead_handoff.CLAUDE_WRAPPER:
+        return _error(
+            422,
+            CODE_COMPACT_UNSUPPORTED,
+            "Queued Compact runs only in Claude Code chats. "
+            "Send /compact from the composer instead.",
+        )
+    driver = compact_queue.current()
+    if driver is None:
+        return _error(
+            503,
+            CODE_COMPACT_OFF,
+            f"Queued Compact is off on this server ({compact_queue.ENABLED_ENV}=0).",
+        )
+    try:
+        driver.queue(session_id, snooze=body.snooze)
+    except compact_queue.AlreadyQueued as exc:
+        return _error(
+            409, CODE_COMPACT_QUEUED, "A compact is already queued for this chat.", phase=exc.phase
+        )
+    return {"session_id": session_id, "phase": "queued"}
+
+
+@router.delete(
+    "/sessions/{session_id}/compact",
+    response_model=None,
+    dependencies=[Depends(require_trusted_origin)],
+)
+async def cancel_compact(
+    session_id: Annotated[str, Path(max_length=120)],
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Cancel the chat's queued Compact (also fine when there is none)."""
+    _, refused = await _compact_session(session_id, user)
+    if refused is not None:
+        return refused
+    driver = compact_queue.current()
+    if driver is not None:
+        try:
+            driver.cancel(session_id)
+        except compact_queue.CompactSending:
+            return _error(
+                409,
+                CODE_COMPACT_SENDING,
+                "The compact is already going out and cannot be cancelled.",
+                phase="compacting",
+            )
+    return {"session_id": session_id, "phase": None}
+
+
+@router.post(
+    "/sessions/{session_id}/compact/seen",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def compact_seen(
+    session_id: Annotated[str, Path(max_length=120)],
+    body: CompactSeenBody,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The page showed the stored failure: forget it."""
+    _, refused = await _compact_session(session_id, user)
+    if refused is not None:
+        return refused
+    driver = compact_queue.current()
+    if driver is not None:
+        driver.ack(session_id, body.failure_id)
+    return {"ok": True}
 
 
 @router.post("/gate/{session_id}/reply", response_model=None)
@@ -4306,7 +4966,8 @@ async def update_pull_request_branch(
     full = f"{owner}/{repo}"
     async with github.GitHubClient(settings) as client:
         try:
-            pull = await client.pull(full, number)
+            # A write's gate reads GitHub's newest answer, never a 304 (2026-11-08).
+            pull = await client.pull(full, number, conditional=False)
         except github.GitHubError as exc:
             return _error(502, prs.CODE_GITHUB_FAILED, str(exc))
         if (pull.get("head") or {}).get("sha") != body.sha:
@@ -4376,7 +5037,8 @@ async def ready_pull_request(
     full = f"{owner}/{repo}"
     async with github.GitHubClient(settings) as client:
         try:
-            pull = await client.pull(full, number)
+            # A write's gate reads GitHub's newest answer, never a 304 (2026-11-08).
+            pull = await client.pull(full, number, conditional=False)
         except github.GitHubError as exc:
             return _error(502, prs.CODE_GITHUB_FAILED, str(exc))
         head_sha = (pull.get("head") or {}).get("sha")
@@ -4525,6 +5187,8 @@ async def fabric_view(
     """
     if (refused := await _admin_only(request, user, "see the Fabric capacities")) is not None:
         return refused
+    if admin_cards.all_off("compute"):
+        return admin_cards.off_answer("compute")
     return {**await fabric.overview(), "can_act": True}
 
 
@@ -4718,6 +5382,23 @@ def _databricks_not_configured() -> JSONResponse:
     return _error(409, databricks.CODE_NOT_CONFIGURED, databricks.not_configured_note())
 
 
+@router.get("/home-security", response_model=None)
+async def home_security_view(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The home app's security status in one compact object; admins only (2026-11-08).
+
+    Reads the home app's ``/api/security?lite=1`` at most once a minute and never raises
+    (:mod:`.home_security`); without ``AE_HOME_SECURITY_URL`` the card is off.
+    """
+    if (refused := await _admin_only(request, user, "see home security")) is not None:
+        return refused
+    if admin_cards.all_off("home-security"):
+        return admin_cards.off_answer("home-security")
+    return await home_security.overview()
+
+
 @router.get("/azure-cost", response_model=None)
 async def azure_cost_view(
     request: Request,
@@ -4732,6 +5413,8 @@ async def azure_cost_view(
     """
     if (refused := await _admin_only(request, user, "see Azure spend")) is not None:
         return refused
+    if admin_cards.all_off("azure"):
+        return admin_cards.off_answer("azure")
     return await azure_cost.overview()
 
 
@@ -4747,6 +5430,8 @@ async def azure_cost_targets_view(
     """
     if (refused := await _admin_only(request, user, "see cost targets")) is not None:
         return refused
+    if admin_cards.all_off("azure"):
+        return admin_cards.off_answer("azure")
     try:
         data = await asyncio.to_thread(cost_targets.load_rules)
     except cost_targets.RulesFileError as exc:
@@ -4939,15 +5624,1463 @@ async def git_view(
     request: Request,
     user: Annotated[str | None, Depends(require_ae_user)],
     fresh: bool = False,
+    scope: Annotated[Literal["company", "mine", "all"], Query()] = "all",
 ) -> dict[str, Any] | JSONResponse:
     """Every configured repo's open PRs, Dependabot alerts and stray branches; admins only.
 
     Read only (:mod:`.git_center`), cached 300 s; ``?fresh=true`` awaits a new load.
     Admins only (2026-10-24): it carries repo names and security alerts.
+
+    ``?scope=`` (2026-11-08): ``company`` is the server's list, read with company tokens;
+    ``mine`` is the caller's own list, read only with their own tokens; ``all`` (the default)
+    merges the two, a repo in both shown once under Company. Every row carries its ``scope``.
     """
     if (refused := await _admin_only(request, user, "see the Git repos")) is not None:
         return refused
-    return await git_center.overview(fresh=fresh)
+    if admin_cards.all_off("git"):
+        return admin_cards.off_answer("git")
+    if scope == "company":
+        return git_center.page(await git_center.overview(fresh=fresh))
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    await asyncio.to_thread(git_personal.store().touch, login)
+    if scope == "mine":
+        mine = await git_center.overview(fresh=fresh, scope=git_center.SCOPE_MINE, login=login)
+        return git_center.page(mine, git_center.cache_key(git_center.SCOPE_MINE, login))
+    mine, company = await asyncio.gather(
+        git_center.overview(fresh=fresh, scope=git_center.SCOPE_MINE, login=login),
+        git_center.overview(fresh=fresh),
+    )
+    return git_center.page(git_center.merge(company, mine), None)
+
+
+# ── Git: company tokens and each admin's own list (2026-11-08, card setup PR 3) ─────────────
+
+
+def _git_login(user: str | None) -> str | JSONResponse:
+    """The caller's sign-in id as a personal-list key, or the refusal when it cannot be one."""
+    login = (user or "").strip() or RESERVED_USER_LOCAL
+    if not card_secrets.valid_login(login):
+        return _error(
+            422,
+            ErrorCode.INVALID_INPUT,
+            "Your sign-in id cannot name a personal Git list (it holds a slash or a control "
+            "character).",
+        )
+    return login
+
+
+async def _git_gate(request: Request, user: str | None, action: str) -> JSONResponse | None:
+    """The admin check, then the Git-card-off check, every route below starts with."""
+    if (refused := await _admin_only(request, user, action)) is not None:
+        return refused
+    if admin_cards.all_off("git"):
+        return JSONResponse(admin_cards.off_answer("git"))
+    return None
+
+
+#: The fields each token-carrying or personal Git POST takes, by kind. The body is read as raw
+#: JSON and checked in :func:`_git_body`, never by pydantic: FastAPI's stock 422 carries the
+#: offending ``input`` (a pasted token with a missing neighbour field would come straight back),
+#: and no check below ever puts a value, or an unknown field's name, in an answer.
+_GIT_FIELDS: dict[str, dict[str, str]] = {
+    "check": {"token": "any"},
+    "save": {"token": "any", "repos": "names", "revision": "revision"},
+    "repos": {"repos": "picks", "revision": "revision"},
+    "account": {"account": "name"},
+    "login": {"login": "login"},
+    "company_token": {"owner": "name", "token": "any"},
+    "owner": {"owner": "name"},
+}
+_GIT_REPOS_MAX = 300
+
+
+def _git_field_problem(kind: str, value: Any) -> str | None:
+    """What is wrong with *value* for a field of *kind* (a sentence with no value in it)."""
+    if kind == "any":
+        return None
+    if kind == "name":
+        return None if isinstance(value, str) and len(value) <= 60 else "a short text"
+    if kind == "login":
+        return None if isinstance(value, str) and len(value) <= 200 else "a short text"
+    if kind == "revision":
+        ok = isinstance(value, int) and not isinstance(value, bool) and value >= 0
+        return None if ok else "a whole number, 0 or more"
+    if kind == "names":
+        ok = (
+            isinstance(value, list)
+            and len(value) <= _GIT_REPOS_MAX
+            and all(isinstance(x, str) and len(x) <= 140 for x in value)
+        )
+        return None if ok else f"a list of at most {_GIT_REPOS_MAX} owner/name texts"
+    if kind == "picks":
+        ok = (
+            isinstance(value, list)
+            and len(value) <= _GIT_REPOS_MAX
+            and all(
+                isinstance(x, dict)
+                and set(x) == {"repo", "account"}
+                and isinstance(x["repo"], str)
+                and len(x["repo"]) <= 140
+                and isinstance(x["account"], str)
+                and len(x["account"]) <= 60
+                for x in value
+            )
+        )
+        return None if ok else f"a list of at most {_GIT_REPOS_MAX} objects with repo and account"
+    return "valid"
+
+
+async def _git_body(request: Request, route: str) -> dict[str, Any] | JSONResponse:
+    """The JSON object a Git POST sent, checked field by field, or the 422 to answer with.
+
+    Answers name only the route's own field names, never a value or a name the caller made up.
+    """
+    spec = _GIT_FIELDS[route]
+    try:
+        body = json.loads(await request.body())
+    except (ValueError, UnicodeDecodeError):
+        return _error(422, ErrorCode.INVALID_INPUT, "The body must be a JSON object.")
+    if not isinstance(body, dict):
+        return _error(422, ErrorCode.INVALID_INPUT, "The body must be a JSON object.")
+    missing = [name for name in spec if name not in body]
+    if missing:
+        return _error(
+            422,
+            ErrorCode.INVALID_INPUT,
+            f"Missing field: {', '.join(missing)}. Nothing was saved.",
+        )
+    if set(body) - set(spec):
+        return _error(
+            422,
+            ErrorCode.INVALID_INPUT,
+            f"The body may only hold: {', '.join(spec)}. Nothing was saved.",
+        )
+    for name, kind in spec.items():
+        if (problem := _git_field_problem(kind, body[name])) is not None:
+            return _error(
+                422, ErrorCode.INVALID_INPUT, f"{name} must be {problem}. Nothing was saved."
+            )
+    return body
+
+
+_GITHUB_ACCOUNT = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+
+
+def _git_mine_state(login: str) -> dict[str, Any]:
+    """``GET /git/mine``'s answer: the caller's accounts (never a token) and repo picks."""
+    revision, repos = git_personal.store().get(login)
+    metas = card_secrets.list_meta(card_secrets.user_prefix(login))
+    accounts = []
+    for record_id, meta in metas.items():
+        account = record_id.rsplit("/", 1)[1]
+        accounts.append(
+            {
+                "account": account,
+                "github_login": meta.get("github_login"),
+                "saved_at": meta.get("saved_at"),
+                "expires_at": meta.get("expires_at"),
+                "unreadable": bool(meta.get("unreadable")),
+                "repos": sum(1 for r in repos if r["account"] == account),
+            }
+        )
+    return {
+        "key_configured": card_secrets.key_configured(),
+        "revision": revision,
+        "accounts": accounts,
+        "repos": repos,
+    }
+
+
+def _git_secrets_failure(exc: card_secrets.CardSecretsError) -> JSONResponse:
+    return _error(exc.status_code, exc.code, str(exc))
+
+
+def _git_mine_answer(login: str) -> dict[str, Any] | JSONResponse:
+    try:
+        return _git_mine_state(login)
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+
+
+def _git_conflict(login: str) -> JSONResponse:
+    current = _git_mine_answer(login)
+    if isinstance(current, JSONResponse):
+        return current  # the stores could not be read: answer that error, not a 500
+    return _error(
+        409,
+        ErrorCode.CONFLICT,
+        "Your Git list was changed on another device; the list below is what is saved now.",
+        current=current,
+    )
+
+
+@router.get("/git/mine", response_model=None)
+async def git_mine_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """The caller's own GitHub accounts and repo picks; admins only, and only their own.
+
+    Never a token. ``accounts`` lists each saved account with its GitHub login, saved and expiry
+    dates, whether it can still be decrypted and how many repos use it. Also notes that the
+    caller opened the Git card (the background refresh reads the lists of recent callers), and
+    clears the lists of people who are no longer members.
+    """
+    if (refused := await _git_gate(request, user, "see your own Git list")) is not None:
+        return refused
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    await git_personal.sync_roster(request, caller=login)
+    await asyncio.to_thread(git_personal.store().touch, login)
+    return await asyncio.to_thread(_git_mine_answer, login)
+
+
+@router.post(
+    "/git/mine/check",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_mine_check(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Check a pasted token with GitHub and list what it can see. Saves nothing.
+
+    Answers ``{github_login, expires_at, repos: [{repo, private}], already: [repo]}``: the
+    account the token belongs to, when it expires, the repos it can read (at most 300) and
+    which of them the caller already has under that account. No answer or log line holds any
+    part of the token.
+    """
+    if (refused := await _git_gate(request, user, "check a GitHub token")) is not None:
+        return refused
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    body = await _git_body(request, "check")
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        token = git_tokens.check_token(body["token"])
+        github_login, expires = await git_tokens.verify(token)
+        visible = await git_tokens.visible_repos(token)
+    except git_tokens.TokenError as exc:
+        return _error(exc.status_code, exc.code, str(exc))
+    account = github_login.lower()
+    held = git_personal.store().get(login)[1]
+    return {
+        "github_login": github_login,
+        "expires_at": expires,
+        "repos": visible,
+        "already": [r["repo"] for r in held if r["account"] == account],
+    }
+
+
+@router.post(
+    "/git/mine/save",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_mine_save(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Save a token (encrypted) and the repos picked for its account; replaces that account's
+    earlier picks and keeps the other accounts' repos.
+
+    The account is the GitHub login GitHub reports for the token, lower-cased. 409
+    ``card_secrets_key_missing`` without ``AE_CARD_SECRETS_KEY``; 409 with the current list on a
+    stale ``revision``; 422 past 30 personal repos, or for a name that is not ``owner/name``.
+    The list is written first (its revision check decides), then the token; a token that cannot
+    be written puts the old list back, so a refused save never changes the saved token.
+    """
+    if (refused := await _git_gate(request, user, "save a GitHub token")) is not None:
+        return refused
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    body = await _git_body(request, "save")
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        card_secrets.require_key()
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    try:
+        token = git_tokens.check_token(body["token"])
+        github_login, expires = await git_tokens.verify(token)
+    except git_tokens.TokenError as exc:
+        return _error(exc.status_code, exc.code, str(exc))
+    account = github_login.lower()
+    record = card_secrets.user_id(login, account)
+    async with git_personal.login_lock(login):
+        revision, held = git_personal.store().get(login)
+        if revision != body["revision"]:
+            return _git_conflict(login)
+        picks = [{"repo": repo, "account": account} for repo in body["repos"]]
+        try:
+            merged = git_personal.normalize([r for r in held if r["account"] != account] + picks)
+        except ValueError as exc:
+            return _error(422, ErrorCode.INVALID_INPUT, f"Your repos: {exc}.")
+        try:
+            result = await asyncio.to_thread(
+                git_personal.store().put, login, merged, body["revision"]
+            )
+        except git_personal.PersonalSaveError as exc:
+            return _error(500, git_personal.CODE_NOT_SAVED, str(exc))
+        if result.conflict:
+            return _git_conflict(login)
+        try:
+            await asyncio.to_thread(
+                card_secrets.put,
+                record,
+                token,
+                saved_by=login,
+                github_login=github_login,
+                expires_at=expires,
+            )
+        except card_secrets.CardSecretsError as exc:
+            # The token did not change; put the list back so no pick points at a token that
+            # was never saved.
+            with contextlib.suppress(git_personal.PersonalSaveError):
+                await asyncio.to_thread(git_personal.store().put, login, held, result.revision)
+            git_center.invalidate(login)
+            return _git_secrets_failure(exc)
+    git_center.invalidate(login)
+    _logger.info("ae git: %s saved GitHub account %s (%d repos)", login, account, len(picks))
+    return await asyncio.to_thread(_git_mine_answer, login)
+
+
+@router.post(
+    "/git/mine/repos",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_mine_repos(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Replace the caller's whole repo list (remove some, or add a typed ``owner/name`` under an
+    account they have saved). An account with no saved token for the caller is 422."""
+    if (refused := await _git_gate(request, user, "change your Git list")) is not None:
+        return refused
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    body = await _git_body(request, "repos")
+    if isinstance(body, JSONResponse):
+        return body
+    try:
+        repos = git_personal.normalize(body["repos"])
+        metas = card_secrets.list_meta(card_secrets.user_prefix(login))
+    except ValueError as exc:
+        return _error(422, ErrorCode.INVALID_INPUT, f"Your repos: {exc}.")
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    saved = {record_id.rsplit("/", 1)[1] for record_id in metas}
+    missing = sorted({r["account"] for r in repos} - saved)
+    if missing:
+        return _error(
+            422,
+            ErrorCode.INVALID_INPUT,
+            f"You have no saved token for {', '.join(missing)[:120]}: connect that account first.",
+        )
+    async with git_personal.login_lock(login):
+        try:
+            result = await asyncio.to_thread(
+                git_personal.store().put, login, repos, body["revision"]
+            )
+        except git_personal.PersonalSaveError as exc:
+            return _error(500, git_personal.CODE_NOT_SAVED, str(exc))
+        if result.conflict:
+            return _git_conflict(login)
+    git_center.invalidate(login)
+    _logger.info("ae git: %s changed their repo list (%d repos)", login, len(repos))
+    return await asyncio.to_thread(_git_mine_answer, login)
+
+
+@router.post(
+    "/git/mine/clear",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_mine_clear(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Delete the caller's token for one GitHub account and that account's repos.
+
+    The repos go first and the token after, so a list that could not be written keeps its token.
+    A list that keeps conflicting (three tries) answers 409 and removes nothing.
+    """
+    if (refused := await _git_gate(request, user, "remove a GitHub account")) is not None:
+        return refused
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    body = await _git_body(request, "account")
+    if isinstance(body, JSONResponse):
+        return body
+    account = body["account"].strip().lower()
+    if not _GITHUB_ACCOUNT.fullmatch(account):
+        return _error(422, ErrorCode.INVALID_INPUT, "That is not a GitHub account name.")
+    record = card_secrets.user_id(login, account)
+    try:
+        async with git_personal.login_lock(login):
+            had_repos = False
+            for _attempt in range(3):
+                revision, held = git_personal.store().get(login)
+                rest = [r for r in held if r["account"] != account]
+                if len(rest) == len(held):
+                    break
+                had_repos = True
+                result = await asyncio.to_thread(git_personal.store().put, login, rest, revision)
+                if not result.conflict:
+                    break
+            else:
+                return _git_conflict(login)
+            had_token = await asyncio.to_thread(card_secrets.delete, record)
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    except git_personal.PersonalSaveError as exc:
+        return _error(500, git_personal.CODE_NOT_SAVED, str(exc))
+    git_center.invalidate(login)
+    if not had_token and not had_repos:
+        return _not_found("You have no saved GitHub account with that name.")
+    _logger.info("ae git: %s removed GitHub account %s", login, account)
+    return await asyncio.to_thread(_git_mine_answer, login)
+
+
+def _git_users_answer(me: str) -> dict[str, Any]:
+    """Other admins' personal lists as counts only: login, accounts connected, repos listed."""
+    counts = git_personal.store().counts()
+    accounts: dict[str, int] = {}
+    for record_id in card_secrets.list_meta("user/"):
+        accounts[record_id.split("/")[1]] = accounts.get(record_id.split("/")[1], 0) + 1
+    rows = []
+    for login in sorted({*counts, *accounts}):
+        if login == me:
+            continue
+        rows.append(
+            {
+                "login": login,
+                "accounts": accounts.get(login, 0),
+                "repos": counts.get(login, (0, 0))[1],
+            }
+        )
+    return {"users": rows}
+
+
+@router.get("/git/users", response_model=None)
+async def git_users_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Who else has a personal Git list, for offboarding: counts only, never a repo name, an
+    account or a token. Admins only."""
+    if (refused := await _git_gate(request, user, "see who has a personal Git list")) is not None:
+        return refused
+    login = _git_login(user)
+    if isinstance(login, JSONResponse):
+        return login
+    await git_personal.sync_roster(request, caller=login)
+    try:
+        return await asyncio.to_thread(_git_users_answer, login)
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+
+
+@router.post(
+    "/git/users/clear",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_users_clear(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Offboarding: drop another person's personal list and every token saved under their id.
+
+    Not for yourself (use ``/git/mine/clear`` per account)."""
+    if (refused := await _git_gate(request, user, "clear someone's Git tokens")) is not None:
+        return refused
+    me = _git_login(user)
+    if isinstance(me, JSONResponse):
+        return me
+    body = await _git_body(request, "login")
+    if isinstance(body, JSONResponse):
+        return body
+    target = body["login"].strip()
+    if target == me:
+        return _error(
+            422,
+            ErrorCode.INVALID_INPUT,
+            "That is you: remove your own accounts under My GitHub accounts.",
+        )
+    if not card_secrets.valid_login(target):
+        return _error(422, ErrorCode.INVALID_INPUT, "That is not a sign-in id.")
+    try:
+        before = await asyncio.to_thread(_git_users_answer, me)
+        if target not in {row["login"] for row in before["users"]}:
+            return _not_found("No one by that sign-in id has a personal Git list.")
+        await asyncio.to_thread(git_personal.clear_user, target)
+        answer = await asyncio.to_thread(_git_users_answer, me)
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    except git_personal.PersonalSaveError as exc:
+        return _error(500, git_personal.CODE_NOT_SAVED, str(exc))
+    git_center.invalidate(target)
+    _logger.info("ae git: %s cleared the personal Git tokens of %s", me, target)
+    return answer
+
+
+def _company_owner(owner: str) -> str | JSONResponse:
+    """*owner* as the company list spells it, or the refusal."""
+    name = owner.strip()
+    if not _GITHUB_ACCOUNT.fullmatch(name):
+        return _error(422, ErrorCode.INVALID_INPUT, "That is not a GitHub account name.")
+    known = {o.lower(): o for o in git_center.company_owners()}
+    if name.lower() not in known:
+        return _error(
+            422,
+            ErrorCode.INVALID_INPUT,
+            "That account is not in the company repo list: add one of its repos under "
+            "Repositories first.",
+        )
+    return known[name.lower()]
+
+
+def _company_tokens_answer() -> dict[str, Any]:
+    return {"key_configured": card_secrets.key_configured(), "owners": admin_cards.token_owners()}
+
+
+@router.post(
+    "/git/company/token",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_company_token(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Save the company's read-only token for one GitHub account (encrypted); admins only.
+
+    The account must be in the company repo list. 409 ``set_in_environment`` when
+    ``AE_GIT_TOKEN_<OWNER>`` is set (the environment wins); 409 ``card_secrets_key_missing``
+    without ``AE_CARD_SECRETS_KEY``. Company tokens typed here follow the personal rule
+    (fine-grained only); the environment still takes any kind.
+    """
+    if (refused := await _git_gate(request, user, "save a company GitHub token")) is not None:
+        return refused
+    who = _git_login(user)
+    if isinstance(who, JSONResponse):
+        return who
+    body = await _git_body(request, "company_token")
+    if isinstance(body, JSONResponse):
+        return body
+    owner = _company_owner(body["owner"])
+    if isinstance(owner, JSONResponse):
+        return owner
+    if (os.environ.get(git_center.owner_env_name(owner)) or "").strip():
+        return _error(
+            409,
+            "set_in_environment",
+            f"{git_center.owner_env_name(owner)} is set in the server's environment; change "
+            "it there.",
+        )
+    try:
+        card_secrets.require_key()
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    try:
+        token = git_tokens.check_token(body["token"])
+        github_login, expires = await git_tokens.verify(token)
+    except git_tokens.TokenError as exc:
+        return _error(exc.status_code, exc.code, str(exc))
+    try:
+        await asyncio.to_thread(
+            card_secrets.put,
+            card_secrets.company_id(owner),
+            token,
+            saved_by=who,
+            github_login=github_login,
+            expires_at=expires,
+        )
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    git_center.invalidate()
+    _logger.info("ae git: %s saved the company token for %s", who, owner)
+    return await asyncio.to_thread(_company_tokens_answer)
+
+
+@router.post(
+    "/git/company/clear",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def git_company_clear(
+    request: Request,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Delete the saved company token for one GitHub account; admins only."""
+    if (refused := await _git_gate(request, user, "clear a company GitHub token")) is not None:
+        return refused
+    who = _git_login(user)
+    if isinstance(who, JSONResponse):
+        return who
+    body = await _git_body(request, "owner")
+    if isinstance(body, JSONResponse):
+        return body
+    owner = body["owner"].strip().lower()
+    if not _GITHUB_ACCOUNT.fullmatch(owner):
+        return _error(422, ErrorCode.INVALID_INPUT, "That is not a GitHub account name.")
+    try:
+        gone = await asyncio.to_thread(card_secrets.delete, card_secrets.company_id(owner))
+    except card_secrets.CardSecretsError as exc:
+        return _git_secrets_failure(exc)
+    if not gone:
+        return _not_found("No company token is saved for that account.")
+    git_center.invalidate()
+    _logger.info("ae git: %s cleared the company token for %s", who, owner)
+    return await asyncio.to_thread(_company_tokens_answer)
+
+
+# ── Social (2026-11-06, Admin Center Social card; social.py) ───────────────────────────────
+
+
+class _SocialId(BaseModel):
+    """A body that names one slot; ids go in the body because the bridge refuses ``:``/``/``/``#``
+    in a path."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=social.SLOT_ID)
+
+
+class _SocialPosted(_SocialId):
+    url: str | None = Field(default=None, pattern=r"^https://\S{1,490}$")
+
+
+class _SocialReschedule(_SocialId):
+    due: datetime
+
+
+class _SocialDraftEdit(_SocialId):
+    text: str = Field(min_length=1, max_length=social.MAX_DRAFT)
+    topic: str | None = Field(default=None, max_length=social.MAX_TOPIC)
+
+
+class _SocialExpert(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    date: date_type
+
+
+class _SocialDrafts(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    drafts: list[social.DraftIn] = Field(default_factory=list, max_length=60)
+    errors: list[social.DraftErrorIn] = Field(default_factory=list, max_length=60)
+
+
+async def _social_mutate(change: Any) -> dict[str, Any] | JSONResponse:
+    """Run *change* on the social state; its refusals and a file that will not save as answers."""
+    try:
+        return await asyncio.to_thread(social.store().mutate, change)
+    except social.SocialError as exc:
+        code = {404: ErrorCode.NOT_FOUND, 409: ErrorCode.CONFLICT}.get(
+            exc.status, ErrorCode.INVALID_INPUT
+        )
+        return _error(exc.status, code, exc.message)
+    except OSError as exc:
+        _logger.warning("social state not saved: %s", exc)
+        return _error(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"could not save the social state ({exc}); check that /data is writable and retry.",
+        )
+
+
+async def _social_read() -> social.State | JSONResponse:
+    try:
+        return await asyncio.to_thread(social.store().read)
+    except OSError as exc:
+        _logger.warning("social state not read: %s", exc)
+        return _error(
+            500,
+            ErrorCode.INTERNAL_ERROR,
+            f"could not read the social state ({exc}); fix or remove the file and retry.",
+        )
+
+
+@router.get("/social", response_model=None)
+async def social_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """The Social card: score, gaps, rules, tools and the slots from last Monday to four weeks
+    out, each with a draft preview (under the bridge's 32,768-character cap; ``truncated``)."""
+    if (refused := await _admin_only(request, user, "see the Social card")) is not None:
+        return refused
+    if admin_cards.all_off("social"):
+        return admin_cards.off_answer("social")
+    state = await _social_read()
+    if isinstance(state, JSONResponse):
+        return state
+    return social.view(state, social.utcnow())
+
+
+@router.get("/social/week", response_model=None)
+async def social_week(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Open slots due within a week with no draft, with their context, for the weekly drafter."""
+    if (refused := await _admin_only(request, user, "read the Social drafting list")) is not None:
+        return refused
+    if admin_cards.all_off("social"):
+        return admin_cards.off_answer("social")
+    state = await _social_read()
+    if isinstance(state, JSONResponse):
+        return state
+    return social.week_context(state, social.utcnow())
+
+
+@router.get("/social/week-redraft", response_model=None)
+async def social_week_redraft(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """``/social/week`` plus the open slots whose draft is the drafter's own and unedited
+    (``redraft: true``), for a rewrite after the starter rules change (2026-11-07)."""
+    if (refused := await _admin_only(request, user, "read the Social drafting list")) is not None:
+        return refused
+    state = await _social_read()
+    if isinstance(state, JSONResponse):
+        return state
+    return social.week_context(state, social.utcnow(), redraft=True)
+
+
+@router.get("/social/visual/{slot_id}/{part}", response_model=None)
+async def social_visual_part(
+    request: Request,
+    user: Annotated[str | None, Depends(require_ae_user)],
+    slot_id: Annotated[str, Path(pattern=social.SLOT_ID)],
+    part: Annotated[int, Path(ge=0, le=1000)],
+) -> dict[str, Any] | JSONResponse:
+    """One base64 piece of the picture a post shares (a public upload's thumbnail, or a tool's
+    image), at most 24,000 characters so the answer stays under the bridge's cap. The frame
+    cannot fetch images, so the server does, from a short allowlist (``social_visual.py``)."""
+    if (refused := await _admin_only(request, user, "read a Social post image")) is not None:
+        return refused
+    state = await _social_read()
+    if isinstance(state, JSONResponse):
+        return state
+    try:
+        key, urls, hosts = social.visual_source(state, slot_id, social.utcnow())
+        picture = await social_visual.fetch(key, urls, hosts)
+        return social_visual.chunk(picture, part)
+    except social.SocialError as exc:
+        return _error(exc.status, ErrorCode.NOT_FOUND, exc.message)
+    except social_visual.VisualError as exc:
+        code = {404: ErrorCode.NOT_FOUND, 400: ErrorCode.INVALID_INPUT}.get(
+            exc.status, ErrorCode.INTERNAL_ERROR
+        )
+        return _error(exc.status, code, exc.message)
+
+
+_SOCIAL_POST = {
+    "response_model": None,
+    "dependencies": [Depends(require_json_content_type), Depends(require_trusted_origin)],
+}
+
+
+@router.post("/social/slot", **_SOCIAL_POST)
+async def social_slot(
+    request: Request,
+    body: _SocialId,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """One slot with its full draft."""
+    if (refused := await _admin_only(request, user, "read a social post")) is not None:
+        return refused
+    state = await _social_read()
+    if isinstance(state, JSONResponse):
+        return state
+    try:
+        return social.slot_detail(state, body.id)
+    except social.SocialError as exc:
+        return _not_found(exc.message)
+
+
+@router.post("/social/uploads", **_SOCIAL_POST)
+async def social_uploads(
+    request: Request,
+    body: social.UploadsPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The box relay's YouTube reading (``social_relay.py``); a failed channel keeps its items."""
+    if (refused := await _admin_only(request, user, "record the YouTube reading")) is not None:
+        return refused
+    now = social.utcnow()
+
+    def change(state: social.State) -> dict[str, Any]:
+        social.apply_uploads(state, body, now)
+        return {}
+
+    if isinstance(result := await _social_mutate(change), JSONResponse):
+        return result
+    state = await _social_read()
+    if isinstance(state, JSONResponse):
+        return state
+    return {
+        "slots": len(state.slots),
+        "uploads": {ch: len(r.items) for ch, r in state.uploads.items()},
+    }
+
+
+@router.post("/social/posted", **_SOCIAL_POST)
+async def social_posted(
+    request: Request,
+    body: _SocialPosted,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    if (refused := await _admin_only(request, user, "mark a social post posted")) is not None:
+        return refused
+    now = social.utcnow()
+    return await _social_mutate(
+        lambda s: social.mark_posted(s, body.id, body.url, now) or {"ok": True}
+    )
+
+
+@router.post("/social/reopen", **_SOCIAL_POST)
+async def social_reopen(
+    request: Request,
+    body: _SocialId,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    if (refused := await _admin_only(request, user, "reopen a social post")) is not None:
+        return refused
+    return await _social_mutate(lambda s: social.reopen(s, body.id) or {"ok": True})
+
+
+@router.post("/social/skip", **_SOCIAL_POST)
+async def social_skip(
+    request: Request,
+    body: _SocialId,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    if (refused := await _admin_only(request, user, "skip a social post")) is not None:
+        return refused
+    return await _social_mutate(lambda s: social.skip(s, body.id) or {"ok": True})
+
+
+@router.post("/social/reschedule", **_SOCIAL_POST)
+async def social_reschedule(
+    request: Request,
+    body: _SocialReschedule,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    if (refused := await _admin_only(request, user, "move a social post")) is not None:
+        return refused
+    now = social.utcnow()
+    return await _social_mutate(
+        lambda s: social.reschedule(s, body.id, body.due, now) or {"ok": True}
+    )
+
+
+@router.post("/social/draft", **_SOCIAL_POST)
+async def social_draft(
+    request: Request,
+    body: _SocialDraftEdit,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Reid's edit of a draft: kept by the weekly drafter from then on."""
+    if (refused := await _admin_only(request, user, "edit a social draft")) is not None:
+        return refused
+    now = social.utcnow()
+    return await _social_mutate(
+        lambda s: social.edit_draft(s, body.id, body.text, body.topic, now) or {"ok": True}
+    )
+
+
+@router.post("/social/expert", **_SOCIAL_POST)
+async def social_expert(
+    request: Request,
+    body: _SocialExpert,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Add one expert-post slot on a day."""
+    if (refused := await _admin_only(request, user, "add a social post")) is not None:
+        return refused
+    now = social.utcnow()
+    return await _social_mutate(lambda s: {"id": social.add_expert(s, body.date, now)})
+
+
+@router.post("/social/rules", **_SOCIAL_POST)
+async def social_rules(
+    request: Request,
+    body: social.RulesPatch,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    if (refused := await _admin_only(request, user, "change the Social rules")) is not None:
+        return refused
+
+    def change(state: social.State) -> dict[str, Any]:
+        try:
+            social.apply_rules(state, body)
+        except ValueError as exc:
+            raise social.SocialError(422, f"those rules are not valid: {exc}") from exc
+        return {"rules": state.rules.model_dump(mode="json")}
+
+    return await _social_mutate(change)
+
+
+@router.post("/social/tools", **_SOCIAL_POST)
+async def social_tools(
+    request: Request,
+    body: social.ToolsPost,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    if (refused := await _admin_only(request, user, "change the Social tools")) is not None:
+        return refused
+
+    def change(state: social.State) -> dict[str, Any]:
+        state.tools = list(body.tools)
+        return {"tools": len(state.tools)}
+
+    return await _social_mutate(change)
+
+
+@router.post("/social/drafts", **_SOCIAL_POST)
+async def social_drafts(
+    request: Request,
+    body: _SocialDrafts,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """The weekly drafter's drafts; one by Reid, or edited, is never overwritten."""
+    if (refused := await _admin_only(request, user, "write social drafts")) is not None:
+        return refused
+    now = social.utcnow()
+    return await _social_mutate(lambda s: social.apply_drafts(s, body.drafts, body.errors, now))
+
+
+# ── Needs you (2026-11-03, Admin Center v1.5; attention.py) ─────────────────────────────────
+
+
+#: Item ids hold ":", "/" and "#", which the extension bridge's route pattern refuses in a
+#: path, so every attention action takes its id in the body (2026-11-03, review round 1).
+_ATTENTION_ID = Field(min_length=3, max_length=300)
+
+
+class AttentionDismiss(BaseModel):
+    """``POST /v1/ae/attention/dismiss``: the item's id and an optional reason (Box items:
+    a fixed list)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = _ATTENTION_ID
+    reason: str | None = Field(default=None, max_length=attention_dismissals.REASON_MAX)
+
+
+class AttentionRestore(BaseModel):
+    """``POST /v1/ae/attention/restore``: the id of a dismissed item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = _ATTENTION_ID
+
+
+class AttentionSession(BaseModel):
+    """``POST /v1/ae/attention/session``: open a Review or a Fix chat on one item."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = _ATTENTION_ID
+    action: Literal["review", "fix"]
+    ride_unparked: bool = False
+
+
+class AttentionBatch(BaseModel):
+    """``POST /v1/ae/attention/batch``: one Review chat on every item of one kind line, or of one
+    whole source (``source``; the line key "host" equals the source key "host", so a source batch
+    needs its own field). Exactly one of the two."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    line: str | None = Field(default=None, min_length=1, max_length=40)
+    source: str | None = Field(default=None, min_length=1, max_length=40)
+    ids: list[str] = Field(min_length=1, max_length=attention.BATCH_MAX)
+    ride_unparked: bool = False
+
+    @model_validator(mode="after")
+    def _one_group_key(self) -> AttentionBatch:
+        if (self.line is None) == (self.source is None):
+            raise ValueError("give exactly one of line and source")
+        return self
+
+    @field_validator("ids")
+    @classmethod
+    def _ids_valid(cls, value: list[str]) -> list[str]:
+        if len(set(value)) != len(value):
+            raise ValueError("ids must not repeat")
+        if any(not 3 <= len(item) <= 300 for item in value):
+            raise ValueError("each id must be 3 to 300 characters")
+        return value
+
+
+CODE_ATTENTION_NOT_DISMISSIBLE = "attention_not_dismissible"
+CODE_ATTENTION_UNREADABLE = "attention_dismissals_unreadable"
+CODE_ATTENTION_NO_ACTION = "attention_no_such_action"
+CODE_ATTENTION_BATCH_EMPTY = "attention_batch_empty"
+
+
+async def _attention_viewer(
+    request: Request, user: str | None
+) -> tuple[str, tuple[str, ...], bool]:
+    """(login, sources, may start chats) for the caller.
+
+    An OmniGent admin sees every source and may start chats; a box admin (``AE_BOX_ADMINS``)
+    sees Box health only and starts none; anyone else sees nothing and nothing is read for them.
+    """
+    login = user or RESERVED_USER_LOCAL
+    if await shared_accounts_routes.is_admin(request, user):
+        # A source whose card is off is not the viewer's to read (2026-11-07, card setup).
+        off = admin_cards.off_sources()
+        return login, tuple(s for s in attention.SOURCES if s not in off), True
+    if box_health.is_box_admin(user):
+        # Box health switched off by an admin takes its Needs you items from a box admin too.
+        return login, tuple(s for s in ("box",) if s not in admin_cards.off_sources()), False
+    return login, (), False
+
+
+async def _owns(conv: Conversation, who: str | None) -> bool:
+    """Whether *who* OWNS the session (an owner check, not a grant check); true on a
+    single-user runtime. Another user can grant the admin a session they made, so a grant must
+    not let that session hold a Needs you item (2026-11-04, review)."""
+    if who is None:
+        return True
+    return await asyncio.to_thread(_owner_identity.owner, conv.id) == who
+
+
+# A chat that finished its review (status review) still holds the item, but the answer is waiting
+# on the owner, so it counts in Needs you (2026-11-08). Working and unset statuses do not count.
+_HOLDING_STATUSES = (*_LIVE_STATUSES, labels.REVIEW)
+
+
+async def _attention_holders(
+    user: str | None, *, finished: bool = False
+) -> dict[str, Conversation]:
+    """Needs you id to the caller's own live chat on it (a single Review or a Review all).
+
+    *finished* also takes chats that reached review: the list shows them (as waiting on the
+    owner), but they must not stop a new Review or Fix from starting."""
+    who = _acl_user(user)
+    mine = await _own_session_ids(who)
+    rows = await asyncio.to_thread(sessions.list_top_level)
+    held: dict[str, Conversation] = {}
+    for conv in rows:
+        if mine is not None and conv.id not in mine:
+            continue
+        if labels.status_of(conv.labels) not in (
+            _HOLDING_STATUSES if finished else _LIVE_STATUSES
+        ):
+            continue
+        item_ids = labels.attention_ids(conv.labels)
+        if not item_ids or not await _owns(conv, who):
+            continue
+        for item_id in item_ids:
+            # A chat still working wins over a blocked one, and both over a finished one, so a
+            # new Review started after an old one finished shows as working, not waiting.
+            ahead = held.get(item_id)
+            if ahead is None or _holder_rank(conv) < _holder_rank(ahead):
+                held[item_id] = conv
+    return held
+
+
+def _holder_rank(conv: Conversation) -> int:
+    status = labels.status_of(conv.labels)
+    return 2 if status == labels.REVIEW else 1 if status == labels.BLOCKED else 0
+
+
+def _held_view(conv: Conversation) -> dict[str, Any]:
+    status = labels.status_of(conv.labels)
+    return {
+        "session_id": conv.id,
+        "title": conv.title,
+        "path": f"/c/{conv.id}",
+        # "working": the chat is still on it (not counted). "waiting": it blocked or finished,
+        # so the owner has to act (counted).
+        "status": "waiting" if status in (labels.BLOCKED, labels.REVIEW) else "working",
+    }
+
+
+async def _attention_working(user: str | None) -> dict[str, dict[str, Any]]:
+    """Needs you id to the caller's chat on it, working or waiting on them (see _held_view)."""
+    return {
+        k: _held_view(conv) for k, conv in (await _attention_holders(user, finished=True)).items()
+    }
+
+
+@router.get("/attention", response_model=None)
+async def attention_list(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Everything that needs the caller, across the cards they may see (admins; box admins).
+
+    Reads caches only. A caller who may see no source gets an empty list and nothing is read.
+    """
+    login, sources, can_chat = await _attention_viewer(request, user)
+    held = await _attention_working(user) if sources else {}
+    now = datetime.now(UTC)
+    answer = await attention.listing(login, sources, now, working=held)
+    return {**answer, "can_chat": can_chat}
+
+
+@router.get("/attention/summary", response_model=None)
+async def attention_summary(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """The sidebar badge's counts and what could not be read (no item text). Caches only."""
+    login, sources, can_chat = await _attention_viewer(request, user)
+    held = await _attention_working(user) if sources else {}
+    answer = await attention.summary(login, sources, datetime.now(UTC), working=held)
+    return {**answer, "can_chat": can_chat}
+
+
+def _attention_missing(item_id: str) -> JSONResponse:
+    return _not_found(
+        f"No Needs you item {item_id[:80]!r} is open for you. It may be fixed already; reload "
+        "the list."
+    )
+
+
+@router.post(
+    "/attention/dismiss",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def attention_dismiss(
+    request: Request,
+    body: AttentionDismiss,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Hide one item for the caller until it gets worse or expires (3 days urgent, 14 review)."""
+    item_id = body.id
+    login, sources, _ = await _attention_viewer(request, user)
+    now = datetime.now(UTC)
+    item, _reading = await attention.find(item_id, sources, now, login=login)
+    if item is None:
+        return _attention_missing(item_id)
+    if not item["dismissible"]:
+        return _error(
+            409,
+            CODE_ATTENTION_NOT_DISMISSIBLE,
+            "A stale or unreadable reading cannot be dismissed: it says the other lines may be "
+            "out of date. Fix the box's timer or relay instead.",
+        )
+    try:
+        reason = attention_dismissals.clean_reason(item["source"], body.reason)
+    except attention_dismissals.ReasonRefused as exc:
+        return _error(422, ErrorCode.INVALID_INPUT, str(exc))
+    try:
+        record = await attention_dismissals.store().dismiss(
+            login,
+            item_id,
+            source=item["source"],
+            scope=item["scope"],
+            tone=item["tone"],
+            state=item["state"],
+            reason=reason,
+            now=now,
+        )
+    except attention_dismissals.DismissalsUnreadable as exc:
+        return _error(503, CODE_ATTENTION_UNREADABLE, str(exc))
+    return {"id": item_id, "expires_at": record["expires_at"], "reason": reason}
+
+
+@router.post(
+    "/attention/restore",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def attention_restore(
+    request: Request,
+    body: AttentionRestore,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Show a dismissed item again (the Undo toast and the Dismissed fold's Restore)."""
+    item_id = body.id
+    login, sources, _ = await _attention_viewer(request, user)
+    if item_id.split(":", 1)[0] not in sources:
+        return _attention_missing(item_id)
+    try:
+        found = await attention_dismissals.store().restore(login, item_id)
+    except attention_dismissals.DismissalsUnreadable as exc:
+        return _error(503, CODE_ATTENTION_UNREADABLE, str(exc))
+    if not found:
+        return _not_found(f"{item_id[:80]!r} is not dismissed; it may have come back already.")
+    return {"id": item_id, "restored": True}
+
+
+@router.post(
+    "/attention/session",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def attention_session(
+    request: Request,
+    body: AttentionSession,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Open a Review or Fix chat on one item: standalone, briefed on the server, one per item.
+
+    The key is ``attn-<hash of the id>-<action>``, so a second click returns the live chat, even
+    after the item's state changed. An item held by any live chat of the caller's (a Review, a
+    Review all or a Fix) returns that chat: a Fix never starts beside a running Review. A Fix on
+    a kind without ``fix`` in its actions answers 422. Slots full answers 409 with the holders
+    and the brief (for Copy brief); ``ride_unparked`` is set only by the explicit "Start anyway"
+    click. Admins only: a box admin who is not an OmniGent admin gets Dismiss and Clean up, not
+    chats.
+    """
+    item_id = body.id
+    _login, sources, can_chat = await _attention_viewer(request, user)
+    if item_id.split(":", 1)[0] not in sources:
+        return _attention_missing(item_id)
+    if item_id.startswith("git-mine:"):
+        # Personal items take Dismiss only: a chat or a merge acts as the box's GitHub login.
+        return _error(422, CODE_ATTENTION_NO_ACTION, attention.PERSONAL_REFUSAL)
+    if not can_chat:
+        return _error(
+            403,
+            shared_accounts_routes.CODE_ADMIN_ONLY,
+            "Only an OmniGent admin can start a chat on a Needs you item; ask an admin to "
+            "start it.",
+        )
+    now = datetime.now(UTC)
+    item, reading = await attention.find(item_id, sources, now, login=_login)
+    if item is None or (
+        reading is not None
+        and item_id not in {i["id"] for i in await attention.open_items(_login, [reading], now)}
+    ):
+        # Gone, or dismissed by this caller: a chat is not started on what the list hides.
+        return _attention_missing(item_id)
+    if body.action not in item["actions"]:
+        return _error(
+            422,
+            CODE_ATTENTION_NO_ACTION,
+            f"This item has no {body.action} chat: use the button on its row.",
+        )
+    holder = (await _attention_holders(user)).get(item_id)
+    if holder is not None:
+        # One chat per item, however it was started (2026-11-04): a second click, or a Review
+        # all that already took this item, gets that chat back.
+        # ``holder_action`` says which button started that chat, so a Fix click that met a
+        # running Review is not shown as a started Fix (2026-11-05).
+        return {
+            **_existing(holder),
+            "item_id": item_id,
+            "holder_action": holder.labels.get(labels.ATTENTION_ACTION) or "review",
+        }
+    read_at = next(
+        (s.read_at for s in (reading.scopes if reading else []) if s.id == item["scope"]), None
+    )
+    fixing = body.action == "fix"
+    brief = attention.fix_brief(item, read_at) if fixing else attention.brief_for(item, read_at)
+    model, effort = attention.model_for(item["kind"])
+    # A Fix chat gets no ``repo``: that label only names the owner of a PR for the orchestrator,
+    # and a Fix finds or clones the repository itself (2026-11-05, plan review).
+    repo = "" if fixing else str(item["state"].get("repo") or "").lower()
+    request_body = SessionRequest(
+        title=attention.chat_title(item, body.action),
+        brief=brief,
+        standalone=True,
+        key=attention.session_key(item_id, body.action),
+        model=model,
+        effort=effort,
+        repo=repo if len(repo) >= 3 else None,
+        ride_unparked=body.ride_unparked,
+    )
+    result = await _start_session(
+        request,
+        request_body,
+        user,
+        extra_labels={
+            labels.ATTENTION: item_id,
+            labels.ATTENTION_FP: item["fingerprint"],
+            **({labels.ATTENTION_ACTION: "fix"} if fixing else {}),
+        },
+    )
+    if isinstance(result, JSONResponse):
+        if result.status_code == 409:
+            payload = json.loads(result.body)
+            if (payload.get("error") or {}).get("code") == CODE_SLOTS_FULL:
+                payload["error"]["brief"] = brief
+                return JSONResponse(status_code=409, content=payload)
+        return result
+    return {**result, "item_id": item_id}
+
+
+@router.post(
+    "/attention/batch",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def attention_batch(
+    request: Request,
+    body: AttentionBatch,
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any] | JSONResponse:
+    """Review all (2026-11-04): one chat briefed on every item of one kind line.
+
+    The ids must share one source and each item's kind must belong to ``line``. The source is
+    read once; the eligible items are the ones found, with a Review, and not dismissed by the
+    caller. The key hashes the sorted eligible ids before any held item is dropped, so the same
+    click twice returns the live chat; items another live chat already holds are left out of the
+    brief (one chat per item). Nothing eligible answers 409 ``attention_batch_empty``. Slots full
+    answers 409 with the brief, as ``/attention/session`` does. Admins only.
+    """
+    if body.source == "git-mine" or any(i.startswith("git-mine:") for i in body.ids):
+        # Review all leaves personal items out: they only take Dismiss.
+        return _error(422, CODE_ATTENTION_NO_ACTION, attention.PERSONAL_REFUSAL)
+    if body.source is not None:
+        if body.source not in attention.SOURCES:
+            return _error(
+                422,
+                CODE_ATTENTION_NO_ACTION,
+                f"{body.source[:40]!r} is not a source of the Needs you list.",
+            )
+        line_source = body.source
+        line_name = attention.SOURCE_NAMES[body.source]
+        line_kinds = tuple(
+            kind for _name, kinds in attention.LINES[body.source].values() for kind in kinds
+        )
+    else:
+        found_line = next(
+            (
+                (src, attention.line_of(src, body.line or ""))
+                for src in attention.SOURCES
+                if attention.line_of(src, body.line or "")
+            ),
+            None,
+        )
+        if found_line is None or found_line[1] is None:
+            return _error(
+                422,
+                CODE_ATTENTION_NO_ACTION,
+                f"{(body.line or '')[:40]!r} is not a line of the Needs you list.",
+            )
+        line_source, (line_name, line_kinds) = found_line[0], found_line[1]
+    where = line_name if body.source is not None else f"the {line_name} line"
+    where_this = f"{line_name}" if body.source is not None else "this line"
+    _login, sources, can_chat = await _attention_viewer(request, user)
+    prefixes = {item_id.split(":", 1)[0] for item_id in body.ids}
+    if len(prefixes) != 1 or next(iter(prefixes)) not in sources:
+        return _attention_missing(body.ids[0])
+    prefix = next(iter(prefixes))
+    if not can_chat:
+        return _error(
+            403,
+            shared_accounts_routes.CODE_ADMIN_ONLY,
+            "Only an OmniGent admin can start a chat on Needs you items; ask an admin to "
+            "start it.",
+        )
+    if prefix != line_source:
+        return _error(
+            422,
+            CODE_ATTENTION_NO_ACTION,
+            f"These items are not in {where}; use the button on that line.",
+        )
+    now = datetime.now(UTC)
+    reading = await attention.read_sources([prefix], now, login=_login)
+    if not reading:
+        # The line's card was switched off between the page and this call.
+        return _attention_missing(body.ids[0])
+    reading_one = reading[0]
+    wanted = set(body.ids)
+    in_reading = {i["id"]: i for i in reading_one.items if i["id"] in wanted}
+    stray = [i for i in in_reading.values() if i["kind"] not in line_kinds]
+    if stray:
+        return _error(
+            422,
+            CODE_ATTENTION_NO_ACTION,
+            f"Some items are not in {where}; reload the list and try again.",
+        )
+    open_ = {
+        i["id"]
+        for i in await attention.open_items(_login, [reading_one], now)
+        if i["id"] in wanted
+    }
+    # Body order stands: the page sends the line's rows worst first.
+    eligible = [
+        in_reading[item_id]
+        for item_id in body.ids
+        if item_id in open_ and "review" in in_reading[item_id]["actions"]
+    ]
+    if not eligible:
+        return _error(
+            409,
+            CODE_ATTENTION_BATCH_EMPTY,
+            f"Every item in {where_this} is dismissed, gone or has no Review; refresh the list.",
+        )
+    key = attention.batch_key([i["id"] for i in eligible])
+    holders = await _attention_holders(user)
+    held_by = {holders[i["id"]].id: holders[i["id"]] for i in eligible if i["id"] in holders}
+    kept = [i for i in eligible if i["id"] not in holders]
+    if not kept:
+        # The chat a first click started on part of this set carries the full set's key.
+        rows = await asyncio.to_thread(sessions.list_top_level)
+        who = _acl_user(user)
+        mine = await _own_session_ids(who)
+        visible = rows if mine is None else [row for row in rows if row.id in mine]
+        live = _live_session(visible, labels.ORCH_KEY, key)
+        if live is not None and await _owns(live, who):
+            return {**_existing(live), "key": key}
+        if len(held_by) == 1:
+            return {**_existing(next(iter(held_by.values()))), "key": key}
+        return _error(
+            409,
+            CODE_ATTENTION_BATCH_EMPTY,
+            f"Every item in {where_this} already has a chat on it; open those chats instead.",
+        )
+    read_ats = [
+        next((s.read_at for s in reading_one.scopes if s.id == item["scope"]), None)
+        for item in kept
+    ]
+    brief = attention.batch_brief(
+        kept, read_ats, line_name, prefix, whole_source=body.source is not None
+    )
+    model, effort = attention.batch_model(kept)
+    extra = {labels.attention_key(n): item["id"] for n, item in enumerate(kept, start=1)}
+    extra[labels.ATTENTION_BATCH] = str(len(kept))
+    request_body = SessionRequest(
+        title=attention.batch_title(kept),
+        brief=brief,
+        standalone=True,
+        key=key,
+        model=model,
+        effort=effort,
+        ride_unparked=body.ride_unparked,
+    )
+    result = await _start_session(request, request_body, user, extra_labels=extra)
+    if isinstance(result, JSONResponse):
+        if result.status_code == 409:
+            payload = json.loads(result.body)
+            if (payload.get("error") or {}).get("code") == CODE_SLOTS_FULL:
+                payload["error"]["brief"] = brief
+                return JSONResponse(status_code=409, content=payload)
+        return result
+    return {**result, "item_ids": [i["id"] for i in kept]}
+
+
+@router.get("/decision", response_model=None)
+async def decision_view(
+    user: Annotated[str | None, Depends(require_ae_user)],
+) -> dict[str, Any]:
+    """Whether the Decision-1 judge model is on for the caller, and why not (``decision_status``).
+
+    Added 2026-11-07 for the Admin Center's Decision model card and for the MCP server, which
+    hides ``advise_preset`` and ``ask_judge`` unless ``available`` is true. Signed in, not
+    admin only: an owner's agents read it as that owner. Numbers and labels only, cached 60 s.
+    """
+    return await asyncio.to_thread(decision_status.status, user)
 
 
 @router.get("/databricks", response_model=None)
@@ -4964,6 +7097,8 @@ async def databricks_view(
     """
     if (refused := await _admin_only(request, user, "see the Databricks warehouses")) is not None:
         return refused
+    if admin_cards.all_off("compute", "credit"):
+        return admin_cards.off_answer("compute")
     return {**await databricks.overview(), "can_act": True}
 
 
@@ -5064,6 +7199,192 @@ async def databricks_refresh(
     return spend
 
 
+# ── Admin Center cards (2026-11-07, card setup; admin_cards.py) ─────────────────────────────
+
+
+class _CardSwitch(BaseModel):
+    """The body of ``POST /cards/state``: one card, on or off, and the revision it was based on."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StrictStr = Field(max_length=40)
+    on: bool
+    revision: StrictInt = Field(ge=0)
+
+
+@router.get("/cards", response_model=None)
+async def cards_view(
+    request: Request, user: Annotated[str | None, Depends(require_ae_user)]
+) -> dict[str, Any] | JSONResponse:
+    """Every card this server shows, whether it is on, and what is set up; admins only.
+
+    Setup status is presence only ("set" or "missing"): no value of any field, secret or not,
+    is ever returned. A damaged state file reads as ``state_ok`` false with the defaults.
+    """
+    if (refused := await _admin_only(request, user, "see the card settings")) is not None:
+        return refused
+    return await asyncio.to_thread(admin_cards.view)
+
+
+@router.post(
+    "/cards/state",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def cards_switch(
+    request: Request,
+    body: _CardSwitch,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Turn a card on or off for everyone on this server; an admin in a browser only.
+
+    A stale ``revision`` answers 409 with the current state. A private card the server did not
+    opt in to answers 404, as an id that does not exist.
+    """
+    if (refused := await _admin_only(request, user, "turn a card on or off")) is not None:
+        return refused
+    if not admin_cards.exists(body.id):
+        return _error(404, admin_cards.CODE_UNKNOWN_CARD, "No card has that id.")
+    who = (user or "").strip() or "local"
+    try:
+        snapshot = await asyncio.to_thread(
+            admin_cards.store().set_on, body.id, body.on, who, body.revision
+        )
+    except admin_cards.CardsConflict as conflict:
+        return _error(
+            409,
+            admin_cards.CODE_CONFLICT,
+            "The cards were changed elsewhere; the list below is what is saved now.",
+            current=admin_cards.view(snap=conflict.state),
+        )
+    except admin_cards.CardsUnreadable as exc:
+        return _error(503, admin_cards.CODE_UNREADABLE, str(exc))
+    except admin_cards.CardsSaveError as exc:
+        return _error(500, admin_cards.CODE_NOT_SAVED, str(exc))
+    return admin_cards.view(snap=snapshot)
+
+
+class _CardSettings(BaseModel):
+    """The body of ``POST /cards/settings``: values typed for one card, and the revision.
+
+    ``values`` maps a variable name to its new text, or ``null`` to clear the saved value. Its
+    members are checked in the handler, not by pydantic, because pydantic's own 422 echoes the
+    offending input and a pasted value must never be echoed back (2026-11-07).
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: StrictStr
+    values: dict[str, Any]
+    revision: StrictInt = Field(ge=0)
+
+
+_SETTINGS_FIELDS_MAX = 20
+
+
+def _settings_problems(
+    card: admin_cards.Card, values: dict[str, Any]
+) -> tuple[dict[str, admin_cards.Field_], dict[str, str | None], JSONResponse | None]:
+    """Check each name and value; the first problem comes back as the answer to send."""
+    by_env = {item.env: item for item in card.fields}
+    items: dict[str, admin_cards.Field_] = {}
+    changes: dict[str, str | None] = {}
+    if not values or len(values) > _SETTINGS_FIELDS_MAX:
+        return items, changes, _error(422, "invalid_settings", "Send between 1 and 20 settings.")
+    for name, raw in values.items():
+        shown = name[:60]
+        item = by_env.get(name)
+        if item is None:
+            return (
+                items,
+                changes,
+                _error(422, "unknown_setting", f"{shown!r} is not a setting of this card."),
+            )
+        if not item.editable:
+            where = (
+                "Set on the host, in config/host.env."
+                if item.host
+                else "Set it in the server's environment."
+            )
+            return (
+                items,
+                changes,
+                _error(422, "not_editable", f"{name} cannot be changed here. {where}"),
+            )
+        if raw is not None and not isinstance(raw, str):
+            return items, changes, _error(422, "invalid_setting", f"{name} must be text or null.")
+        items[name] = item
+        try:
+            changes[name] = None if raw is None else card_config.normalize(item, raw)
+        except card_config.InvalidValue as exc:
+            return items, changes, _error(422, "invalid_setting", f"{name} {exc}")
+    return items, changes, None
+
+
+@router.post(
+    "/cards/settings",
+    response_model=None,
+    dependencies=[Depends(require_json_content_type), Depends(require_trusted_origin)],
+)
+async def cards_settings(
+    request: Request,
+    body: _CardSettings,
+    user: Annotated[str | None, Depends(require_browser_caller)],
+) -> dict[str, Any] | JSONResponse:
+    """Save or clear the non-secret settings of one card; an admin in a browser only.
+
+    Refused: an unknown card or a private one this server did not name (404); a field that is
+    not editable (422, naming it); a field the server's environment sets (409, the environment
+    wins); a bad value (422, stating the rule). A stale ``revision`` answers 409 with the
+    current state. The log line names the card, the variables and the login, never a value.
+    """
+    if (refused := await _admin_only(request, user, "change a card's settings")) is not None:
+        return refused
+    if not admin_cards.exists(body.id):
+        return _error(404, admin_cards.CODE_UNKNOWN_CARD, "No card has that id.")
+    card = admin_cards.BY_ID[body.id]
+    items, changes, problem = _settings_problems(card, body.values)
+    if problem is not None:
+        return problem
+    for name, item in items.items():
+        if admin_cards.field_source(item, os.environ, None) == "env":
+            return _error(
+                409,
+                "set_in_environment",
+                f"{name} is set in the server's environment; change it there.",
+            )
+    if body.id == "credit":
+        # The window is checked on the values that would be in effect after this save.
+        def effective(name: str) -> str | None:
+            return changes[name] if name in changes else card_config.value(name)
+
+        try:
+            card_config.check_credit_window(
+                effective("AE_DATABRICKS_CREDIT_START"), effective("AE_DATABRICKS_CREDIT_END")
+            )
+        except card_config.InvalidValue as exc:
+            return _error(422, "invalid_setting", f"AE_DATABRICKS_CREDIT_START {exc}")
+    who = (user or "").strip() or "local"
+    try:
+        snapshot = await asyncio.to_thread(
+            admin_cards.store().set_settings, body.id, changes, who, body.revision
+        )
+    except admin_cards.CardsConflict as conflict:
+        return _error(
+            409,
+            admin_cards.CODE_CONFLICT,
+            "The cards were changed elsewhere; the list below is what is saved now.",
+            current=admin_cards.view(snap=conflict.state),
+        )
+    except admin_cards.CardsUnreadable as exc:
+        return _error(503, admin_cards.CODE_UNREADABLE, str(exc))
+    except admin_cards.CardsSaveError as exc:
+        return _error(500, admin_cards.CODE_NOT_SAVED, str(exc))
+    if snapshot["revision"] != body.revision:  # a no-op save changed nothing to forget
+        await asyncio.to_thread(card_config.invalidate, body.id)
+    return admin_cards.view(snap=snapshot)
+
+
 # Consumed by ``create_app(debug_router_modules=...)``. The shared Claude accounts
 # (2026-10-20) are a router of their own: their token route reads identity itself,
 # without the cookie, so it cannot sit behind this router's blanket dependency.
@@ -5074,6 +7395,8 @@ DEBUG_ROUTERS: list[tuple[APIRouter, str, list[str]]] = [
     (claude_account.router, "/v1/ae", ["ae"]),
     # No routes: included for its lifespan, which runs the merge watcher (2026-10-21).
     (merge_watch.lifespan_router, "", ["ae"]),
+    # No routes: runs the queued Compact on the server (2026-11-06).
+    (compact_queue.lifespan_router, "", ["ae"]),
     # No routes: included for its lifespan, which wakes an idle lead
     # when its child's prompt is answered (2026-10-28).
     (child_wake.lifespan_router, "", ["ae"]),
@@ -5081,6 +7404,8 @@ DEBUG_ROUTERS: list[tuple[APIRouter, str, list[str]]] = [
     (azure_cost.lifespan_router, "", ["ae"]),
     # No routes: seeds the cost targets and runs their hourly check (2026-10-25).
     (cost_targets.lifespan_router, "", ["ae"]),
+    # No routes: the five-minute cleanup of Needs you dismissals (2026-11-03).
+    (attention.lifespan_router, "", ["ae"]),
     # No routes: archives chats left in reference for ten minutes (2026-10-24).
     (auto_archive.lifespan_router, "", ["ae"]),
     # No routes: writes the preset run log when a lead's run ends (2026-10-24).

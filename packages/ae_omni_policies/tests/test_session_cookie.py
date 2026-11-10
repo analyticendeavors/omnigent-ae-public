@@ -118,6 +118,9 @@ def test_requests_that_are_left_alone(path: str, headers: dict[str, str]) -> Non
         token(grant_id="g1"),  # a device grant's token
         "not-a-jwt",
     ],
+    # Fixed ids: the tokens carry the current second, and pytest-xdist refuses a run
+    # whose workers collected different test ids (2026-11-09).
+    ids=["other-key", "expired", "delegated-scope", "device-grant", "not-a-jwt"],
 )
 def test_a_cookie_that_is_not_a_live_browser_session_gets_nothing(value: str) -> None:
     response = client().get("/", headers={**PAGE, "cookie": f"{NAME}={value}"})

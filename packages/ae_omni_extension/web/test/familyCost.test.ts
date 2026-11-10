@@ -47,6 +47,8 @@ import { HINT_MAX } from "../src/hint";
 import { FOLD_KEY } from "../src/fold";
 import { flaggedCount, resetSpend } from "../src/spend";
 import { getTile, resetTiles } from "../src/tiles";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -330,6 +332,18 @@ describe("Needs you", () => {
     expect(flaggedFamilies(answer(), off).map((r) => r.lead_id)).toEqual(["lead-b"]);
     expect(flaggedFamilies(answer(), { ...off, runaway_usd: 0 })).toEqual([]);
   });
+
+  it("checks the token flag against input plus output, not cache reads", () => {
+    const base = answer();
+    const rows = (base.families ?? []).map((r) =>
+      r.lead_id === "lead-a" ? { ...r, today: { ...r.today, flag_tokens: 200_000 } } : r,
+    );
+    const tokensOnly = { ...settings, runaway_tokens: 1_000_000, runaway_usd: 0 };
+    // lead-a's 4M tokens today are nearly all cache reads: 200K of them count.
+    expect(flaggedFamilies({ ...base, families: rows }, tokensOnly)).toEqual([]);
+    // A snapshot without flag_tokens falls back to the full total.
+    expect(flaggedFamilies(base, tokensOnly).map((r) => r.lead_id)).toEqual(["lead-a"]);
+  });
 });
 
 describe("the tile", () => {
@@ -344,6 +358,9 @@ describe("the tile", () => {
     const hot = familyTile(answer(), null, "tokens", 7, NOW);
     expect(hot).toMatchObject({ health: "attention" });
     expect(hot.note).toBe("1 runaway · 92.4M tokens in 7 d");
+    // The pill line says the runaway, not the token figure the note repeats.
+    expect(hot.brief).toBe("1 runaway today");
+    expect(ready.brief).toBe("2 families");
     expect(familyTile(answer(), null, "dollars", 7, NOW).note).toBe("1 runaway · $58.50 in 7 d");
     expect(
       familyTile(answer({ settings: quiet }), null, "tokens", 7, NOW + STALE_MS + 60_000).health,
@@ -992,5 +1009,22 @@ describe("the families fold", () => {
     famHead(node)!.focus();
     await vi.advanceTimersByTimeAsync(POLL_MS);
     expect(document.activeElement).toBe(famHead(node));
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const link = () => node.querySelector(".needs-link");
+    expect(link()?.textContent).toBe("Reading Needs you...");
+    setAttention(needOverview([needItem("family-1", { source: "family", kind: "family-over" })]));
+    expect(link()?.textContent).toBe("1 in Needs you");
+    setAttention(needOverview([]));
+    expect(link()?.textContent).toBe("Nothing needs you.");
   });
 });

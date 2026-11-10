@@ -543,7 +543,21 @@ __all__ = [
     "encrypt",
     "is_known_account",
     "key_configured",
+    "labels_or_none",
     "reset_store",
     "store",
     "valid_name",
 ]
+
+
+def labels_or_none() -> dict[str, str] | None:
+    """Shared account id (``shared:<name>``) to its label; ``None`` if the store is unreadable.
+
+    One reader for the Accounts card's route and the Needs you list (2026-11-06).
+    """
+    try:
+        views = store().views()
+    except SharedAccountsError as exc:
+        _logger.warning("limits accounts: shared accounts not read: %s", exc)
+        return None
+    return {view.account: view.label for view in views}

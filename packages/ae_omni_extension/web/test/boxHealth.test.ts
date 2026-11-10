@@ -4,6 +4,7 @@
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { BoxActionOffer, BoxCleanupState, BoxHealthView, BoxUser } from "../src/api";
+import { getFilter, resetAttention, setAttention } from "../src/attentionStore";
 import { cardHealth, openByDefault } from "../src/board";
 import {
   activateBoxHealth,
@@ -16,6 +17,7 @@ import {
   detailsBody,
   FAST_POLL_MS,
   offerForNeed,
+  openCleanup,
   openDetails,
   sizeText,
   sparkline,
@@ -28,6 +30,7 @@ import {
 import { ACCESS_RETRY_MS, activateFabric, deactivateFabric } from "../src/fabric";
 import { HINT_MAX, hasOpenHint } from "../src/hint";
 import { getTile, resetTiles } from "../src/tiles";
+import { item, overview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -129,6 +132,7 @@ beforeEach(() => {
   root.id = "root";
   document.body.appendChild(root);
   resetTiles();
+  resetAttention();
 });
 
 afterEach(() => {
@@ -136,6 +140,7 @@ afterEach(() => {
   deactivateBoxHealth();
   deactivateFabric();
   resetTiles();
+  resetAttention();
   vi.restoreAllMocks();
 });
 
@@ -160,7 +165,9 @@ describe("the summary", () => {
     expect(s.needs.map((n) => n.text)).toEqual(["Need 1", "Need 2", "Need 3"]);
     expect(s.more).toBe(2);
     const node = summaryNode(v, () => {});
-    expect(node.querySelector(".bh-more")?.textContent).toBe("+2 more in Details");
+    // The needs are listed once, in the Needs you panel; the card no longer draws them.
+    expect(node.querySelector(".bh-need")).toBeNull();
+    expect(node.querySelector(".bh-more")).toBeNull();
     expect([...node.querySelectorAll(".bh-tile .bh-lbl")].map((n) => n.textContent)).toEqual([
       "Heat",
       "CPU",
@@ -170,20 +177,61 @@ describe("the summary", () => {
     ]);
   });
 
-  it("puts the status line first, then the five tiles, then the Needs you panel", () => {
+  it("puts the status line first, then the five tiles, then the link to the Needs you panel", () => {
+    setAttention(overview([item("b1", { source: "box", kind: "heat" }), item("g1")]));
     const node = summaryNode(view({ needs: [need(1)] }), () => {});
     expect([...node.children].map((n) => n.className)).toEqual(["bh-status", "bh-rest"]);
     const kids = [...node.querySelector(".bh-rest")!.children].map((n) => n.className);
-    expect(kids).toEqual(["bh-tiles", "bh-todo"]);
+    expect(kids).toEqual(["bh-tiles"]);
     expect(node.querySelector(".bh-age")?.textContent).toBe("read 3 m ago");
     expect(node.querySelectorAll(".bh-tiles > .bh-tile[title]")).toHaveLength(5);
     expect(node.querySelector(".bh-tile")?.getAttribute("aria-label")).toBe("Heat: CPU 91C · SSD 49C");
-    expect(node.querySelector(".bh-todo .bh-todo-h")?.textContent).toBe("Needs you");
-    expect(node.querySelectorAll(".bh-todo .bh-need")).toHaveLength(1);
+    // One box item in the panel (the Git one is not this card's): the header pill and button.
+    expect(node.querySelector(".bh-worst")?.textContent).toContain("1 need you");
+    expect(node.querySelector(".bh-status .needs-link-btn")?.textContent).toBe("See in Needs you");
+    expect(node.querySelector(".bh-todo")).toBeNull();
   });
 
-  it("draws no Needs you panel when nothing needs the reader", () => {
+  it("counts the pill from the panel once it has read, and explains a zero", () => {
+    const v = view({ tone: "amber", needs: [need(1), need(2)] });
+    // Before the panel's read: the monitor's own count.
+    expect(worstOf(v)).toMatchObject({ text: "2 need you" });
+    // One box item open, one held by a working chat: the panel counts one.
+    setAttention(
+      overview([
+        item("b1", { source: "box", kind: "heat" }),
+        item("b2", { source: "box", kind: "units", working: { session_id: "s", title: "t", path: "/s/s" } }),
+      ]),
+    );
+    expect(worstOf(v)).toEqual({ text: "1 need you", tone: "amber" });
+    // A long answer cut rows to fit: the server's full count wins over the rows left.
+    setAttention(
+      overview([item("b1", { source: "box", kind: "heat" })], {
+        more: 3,
+        counts: { urgent: 0, review: 4, by_source: { box: { urgent: 0, review: 4 } } },
+      }),
+    );
+    expect(worstOf(v)).toMatchObject({ text: "4 need you" });
+    // Nothing counts: not "OK" in amber, and the title says why.
+    setAttention(overview([]));
+    const zero = worstOf(v);
+    expect(zero).toMatchObject({ text: "0 need you", tone: "amber" });
+    expect(zero.title).toMatch(/dismissed or a chat is working/);
+    expect(worstOf(view())).toEqual({ text: "OK", tone: "green" });
+  });
+
+  it("opens the panel filtered to the box from the link", () => {
+    setAttention(overview([item("b1", { source: "box", kind: "heat" })]));
     const node = summaryNode(view(), () => {});
+    node.querySelector<HTMLButtonElement>(".needs-link-btn")!.click();
+    expect(getFilter()).toBe("box");
+  });
+
+  it("shows no button before the panel's read or when it lists nothing for the box", () => {
+    expect(summaryNode(view(), () => {}).querySelector(".needs-link-btn")).toBeNull();
+    setAttention(overview([]));
+    const node = summaryNode(view(), () => {});
+    expect(node.querySelector(".needs-link-btn")).toBeNull();
     expect(node.querySelector(".bh-todo")).toBeNull();
     expect(node.querySelectorAll(".bh-tile")).toHaveLength(5);
   });
@@ -257,6 +305,27 @@ describe("the tile", () => {
     expect(bad).toMatchObject({ value: "Need 1", health: "problem", note: "2 need you" });
     expect(tileOf(view({ state: "missing", tone: "grey" }), null).health).toBe("idle");
     expect(tileOf(null, new Error("x")).health).toBe("attention");
+  });
+
+  it("is amber and names the scan when the cleanup count stopped early", () => {
+    const capped = {
+      key: "scan:capped",
+      area: "bloat",
+      tone: "amber" as const,
+      text: "Temp folder count stopped early",
+      detail: "The cleanup scan reached its file or time limit.",
+      owner: null,
+      action: null,
+      facts: { metric: 500000 },
+    };
+    const v = view({ tone: "amber", needs: [capped] });
+    v.areas[4].tone = "amber";
+    expect(tileOf(v, null)).toMatchObject({
+      value: "Temp folder count stopped early",
+      summary: "Temp folder count stopped early",
+      health: "attention",
+    });
+    expect(worstOf(v)).toMatchObject({ text: "1 need you", tone: "amber" });
   });
 
   it("makes the card a problem, and unfolds it on a phone, when it is red", async () => {
@@ -337,14 +406,18 @@ describe("who sees what", () => {
     const { context, paths } = stubContext({
       "/v1/ae/access": [ok({ admin: false, box_admin: true })],
       "/v1/ae/box-health": [ok(view())],
+      // The Needs you panel carries the card's Clean up now; the server answers a box admin the box's items only.
+      "/v1/ae/attention": [ok(overview([item("b1", { source: "box", kind: "heat" })], { sources: ["box"], can_chat: false }))],
     });
     await activateFabric(context);
     await flush();
     expect(document.querySelectorAll("[data-card]")).toHaveLength(1);
     expect(document.querySelector("[data-card]")?.getAttribute("data-card")).toBe("box");
-    expect(document.querySelectorAll("[data-tile]")).toHaveLength(1);
-    expect(document.querySelector("[data-tile]")?.getAttribute("data-tile")).toBe("boxhealth");
-    expect(new Set(paths())).toEqual(new Set(["/v1/ae/access", "/v1/ae/box-health"]));
+    // The pill strip shows only the Box pill, from the one tile the page has.
+    expect(document.querySelectorAll("[data-pill]")).toHaveLength(1);
+    expect(document.querySelector("[data-pill]")?.getAttribute("data-pill")).toBe("box");
+    expect(new Set(paths())).toEqual(new Set(["/v1/ae/access", "/v1/ae/box-health", "/v1/ae/attention"]));
+    expect(document.querySelector("#needs-you")).not.toBeNull();
     expect(document.querySelector(".admin-grip")).not.toBeNull();
     expect(document.querySelector(".admin-board")?.hasAttribute("data-single")).toBe(true);
     expect(document.querySelector(".admin-reset")).toBeNull();
@@ -436,7 +509,7 @@ describe("who sees what", () => {
     expect(document.querySelectorAll("[data-card]").length).toBeGreaterThan(5);
     const body = document.querySelector('[data-card="box"] .admin-card-body')!;
     expect(body.firstElementChild?.className).toContain("admin-boxhealth");
-    expect(document.querySelector('[data-tile="boxhealth"]')).not.toBeNull();
+    expect(document.querySelector('[data-pill="box"]')).not.toBeNull();
   });
 
   it("draws the page as before when /v1/ae/access cannot be read, even on a second try", async () => {
@@ -498,7 +571,7 @@ describe("the dialog and the poll", () => {
     updateSummary(first, view({ state: "stale", tone: "amber", age_s: 2520, needs: [need(1)] }));
     expect(first.querySelector(".bh-status")).toBe(head);
     expect(first.classList.contains("is-stale")).toBe(true);
-    expect(first.querySelectorAll(".bh-need")).toHaveLength(1);
+    expect(first.querySelectorAll(".needs-link")).toHaveLength(0);
     expect(first.querySelector(".bh-age")?.textContent).toBe("read 42 m ago");
   });
 
@@ -665,18 +738,26 @@ describe("cleanup offers", () => {
     expect(offerForNeed(v, n(null, "UserA"))).toBeNull();
   });
 
-  it("puts Clean up on a Needs line with a matching offer, and opens the confirm", () => {
-    const v = withActions({
-      needs: [{ ...need(1), action: "claude_scratch", owner: "UserA" }, { ...need(2), action: "tmp_litter", owner: "UserB" }, need(3)],
-    });
-    const node = summaryNode(v, () => {});
-    document.body.appendChild(node);
-    const buttons = node.querySelectorAll<HTMLButtonElement>(".bh-need-act");
-    expect(buttons).toHaveLength(1);
-    expect(buttons[0].parentElement?.lastElementChild).toBe(buttons[0]);
-    expect(buttons[0].getAttribute("data-hint")).toBe(BOX_HEALTH_HINTS.cleanUp);
-    buttons[0].click();
+  it("opens the same Clean up confirm for a row of the Needs you panel", async () => {
+    vi.useFakeTimers();
+    const { context } = stubContext({ "/v1/ae/box-health": [ok(withActions())] });
+    const root = boxHealthSection();
+    document.body.appendChild(root);
+    // Before the card has read the box there is nothing to match the row against.
+    expect(openCleanup({ id: "claude_scratch", owner: "UserA" }, null)).toBe(false);
+    activateBoxHealth(context, root);
+    await vi.advanceTimersByTimeAsync(0);
+    const opener = document.createElement("button");
+    document.body.appendChild(opener);
+    expect(openCleanup({ id: "claude_scratch", owner: "UserB" }, opener)).toBe(false);
+    expect(openCleanup({ id: "claude_scratch", owner: "UserA", where: "box" }, opener)).toBe(true);
     expect(document.querySelector(".bh-confirm-text")?.textContent).toBe(FOUR[0].confirm);
+    expect(document.querySelectorAll(".bh-confirm .bh-act")).toHaveLength(2);
+  });
+
+  it("puts no Clean up button on the card's own summary any more", () => {
+    const v = withActions({ needs: [{ ...need(1), action: "claude_scratch", owner: "UserA" }] });
+    expect(summaryNode(v, () => {}).querySelector(".bh-need-act")).toBeNull();
   });
 });
 
@@ -700,6 +781,7 @@ describe("cleanup states", () => {
       () => {},
     );
     const panel = node.querySelector(".bh-todo")!;
+    expect(panel.querySelector(".bh-todo-h")?.textContent).toBe("Cleanup request");
     const row = panel.lastElementChild!;
     expect(row.classList.contains("bh-c-queued")).toBe(true);
     expect(row.firstElementChild?.getAttribute("aria-hidden")).toBe("true");

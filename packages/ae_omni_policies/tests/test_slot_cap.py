@@ -383,6 +383,21 @@ def test_a_merge_watcher_note_passes_full_slots_without_a_claim(store: _Store, m
 
 
 @pytest.mark.parametrize("mode", ["warn", "block"])
+def test_the_compact_save_prompt_passes_full_slots_and_words_before_it_do_not(
+    store: _Store, mode: str
+) -> None:
+    # 2026-11-06: the queued Compact's save prompt continues work; it must not turn into a card.
+    from ae_omni_policies.continuation import COMPACT_PREP_TEXT
+
+    store.rows = THREE
+    own = {labels.STATUS: "review"}
+    store.own[OWN] = _conv(OWN, "Ship the card", own)
+    assert slot_cap(mode=mode)(_request(COMPACT_PREP_TEXT, own)) == {"result": "ALLOW"}
+    typed = slot_cap(mode=mode)(_request("Also do this. " + COMPACT_PREP_TEXT, own))
+    assert typed is not None and typed["result"] in ("ASK", "DENY")
+
+
+@pytest.mark.parametrize("mode", ["warn", "block"])
 def test_the_old_lead_handoff_words_get_no_exemption(store: _Store, mode: str) -> None:
     # The sweep no longer posts that note, so a prompt starting with its words is ordinary.
     store.rows = THREE

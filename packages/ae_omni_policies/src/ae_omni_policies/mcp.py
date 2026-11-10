@@ -5,7 +5,10 @@ exposes the tools in :data:`TOOLS`. Four are the task-store worker's, names, inp
 and output shapes unchanged (``task-store-worker/src/index.ts`` in
 analyticendeavors/ae-claude-skills): ``park_fork``, ``link_issue``,
 ``list_tags``, ``list_parked``. ``complete_task`` (2026-09-28) finishes a
-parked task and closes its issue in one call. Three are this fork's: ``omni_capacity`` (the
+parked task and closes its issue in one call. ``create_task``, ``list_lists`` and
+``cancel_task`` (2026-11-03) are the worker's reminder tools, ported so a box session can set a
+phone alarm; ``cancel_task`` is this fork's own, a drop and never a delete, because the task app
+refuses DELETE from a machine credential. Three are this fork's: ``omni_capacity`` (the
 slots), ``omni_set_status`` (``ae.status`` on a session) and
 ``omni_transcript`` (a session's newest messages). Written 2026-09-23
 (Phase 5).
@@ -51,9 +54,11 @@ import json
 import logging
 import os
 import sys
+import time
 from collections.abc import Sequence
 from datetime import date
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 from mcp import types
@@ -530,6 +535,75 @@ ASK_USER_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+ADVISE_PRESET_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "summary": {
+            "type": "string",
+            "minLength": 10,
+            "maxLength": 160,
+            "description": (
+                "One line describing the task in neutral words. No client, person or product "
+                "names, no quoted text, no paths, links or numbers."
+            ),
+        },
+        "files": {"type": "integer", "minimum": 0, "maximum": 10000},
+        "repos": {"type": "integer", "minimum": 0, "maximum": 20},
+        "kind": {"type": "string", "enum": ["code", "docs", "data", "ops", "research", "other"]},
+        "needs_design": {"type": "boolean"},
+        "has_tests": {"type": "boolean"},
+    },
+    "required": ["summary"],
+    "additionalProperties": False,
+}
+
+ASK_JUDGE_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["yes_no", "choice", "score"]},
+        "question": {
+            "type": "string",
+            "minLength": 5,
+            "maxLength": 160,
+            "description": (
+                "One neutral line of your own words. Never the user's message, names, client or "
+                "company names, paths, links, quotes or secrets."
+            ),
+        },
+        "options": {
+            "type": "array",
+            "maxItems": 6,
+            "description": "For choice: two to six options, each a key and a one-line text.",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "key": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"},
+                    "description": {"type": "string", "maxLength": 100},
+                },
+                "required": ["key", "description"],
+                "additionalProperties": False,
+            },
+        },
+        "levels": {
+            "type": "array",
+            "maxItems": 8,
+            "items": {"type": "string", "maxLength": 40},
+            "description": "For score: two to eight ordered levels, lowest first.",
+        },
+        "facts": {
+            "type": "object",
+            "maxProperties": 12,
+            "description": (
+                "Optional context: lower_snake_case keys with number, boolean or short neutral "
+                "word values."
+            ),
+            "additionalProperties": {"type": ["integer", "number", "boolean", "string"]},
+        },
+    },
+    "required": ["kind", "question"],
+    "additionalProperties": False,
+}
+
 REPORT_REVIEW_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -556,6 +630,15 @@ REPORT_REVIEW_SCHEMA: dict[str, Any] = {
                 "A name for this review round, e.g. 'final review' or 'fix check 2'. A second "
                 "call with a name already counted in this run is ignored, so a repeated call "
                 "never counts twice."
+            ),
+        },
+        "personas": {
+            "type": "array",
+            "maxItems": 20,
+            "items": {"type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,39}$"},
+            "description": (
+                "The reviewer persona ids this round ran, e.g. ['general', 'security'] or "
+                "['codex']. Optional; ids only."
             ),
         },
     },
@@ -672,6 +755,96 @@ SET_SESSION_MODEL_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+CREATE_TASK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "title": {
+            "type": "string",
+            "description": (
+                "The task's title, as the user will scan it in a list. A name, not a paragraph."
+            ),
+        },
+        "list": {
+            "type": "string",
+            "description": (
+                "Name of an existing list (list_lists shows them), matched case-insensitively. "
+                "Left out, the task lands in no list."
+            ),
+        },
+        "due_date": {
+            "type": "string",
+            "description": "YYYY-MM-DD, the day on the user's home clock.",
+        },
+        "due_time": {
+            "type": "string",
+            "description": (
+                "HH:MM on a 24-hour clock, the user's home time (the server's AE_TASK_STORE_TZ). "
+                "Needs due_date. Makes the task timed and sets its alarm to the same moment, "
+                "which pushes to their phone. Leave it out for an all-day date with no push."
+            ),
+        },
+        "notes": {
+            "type": "string",
+            "description": (
+                "Markdown under the title: what to do and anything needed to do it, such as a "
+                "command or a link."
+            ),
+        },
+        "checklist": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Optional steps, rendered as a checklist at the top of the note. Supply one "
+                "only for 2+ discrete steps."
+            ),
+        },
+        "tags": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": (
+                "Tags from the vocabulary list_tags returns, never new near-duplicates. "
+                "Lowercased and deduped here."
+            ),
+        },
+        "quadrant": {
+            "type": "string",
+            "enum": ["hotfix", "feature", "admin"],
+            "description": (
+                "Optional urgent x important call, mapped as in park_fork: both is hotfix, "
+                "important only is feature, urgent only is admin. Left out, the store files it "
+                "in Q4, its answer for 'nothing was said'."
+            ),
+        },
+        "est": {
+            "type": "string",
+            "description": (
+                "Optional size: 'minutes', 'about an hour', or the store's own 15, 30, 45 or "
+                "60plus."
+            ),
+        },
+    },
+    "required": ["title"],
+    "additionalProperties": False,
+}
+
+LIST_LISTS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {},
+    "additionalProperties": False,
+}
+
+CANCEL_TASK_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "task_id": {
+            "type": "string",
+            "description": "The id create_task returned for the reminder or task to cancel.",
+        },
+    },
+    "required": ["task_id"],
+    "additionalProperties": False,
+}
+
 TOOLS: list[types.Tool] = [
     types.Tool(
         name="park_fork",
@@ -728,6 +901,40 @@ TOOLS: list[types.Tool] = [
             "on a merge into dev. Report the task and issue URLs it returns."
         ),
         inputSchema=COMPLETE_TASK_SCHEMA,
+    ),
+    types.Tool(
+        name="create_task",
+        description=(
+            'Create a task or reminder the user asks for directly ("remind me to...", "make a '
+            'task for...") in any existing list of their task app. Use this for those, not '
+            "park_fork, which is only for route C of the fork gate and files into the Parking "
+            "Lot with no time. A due_time sets the alarm, which is what pushes a reminder to "
+            "their phone; a date alone is an all-day task with no push. Lists are matched by "
+            "exact name, case aside, and never created here: an unknown name comes back with "
+            "the real names so you can ask them. Returns the task id and a URL that opens it "
+            "in the app; report those, never a URL you composed yourself."
+        ),
+        inputSchema=CREATE_TASK_SCHEMA,
+    ),
+    types.Tool(
+        name="list_lists",
+        description=(
+            "The lists in the user's task app by exact name, so create_task can name one. "
+            "Hidden lists are left out."
+        ),
+        inputSchema=LIST_LISTS_SCHEMA,
+    ),
+    types.Tool(
+        name="cancel_task",
+        description=(
+            "Cancel a task or reminder this server created with create_task, the way "
+            '"delete that reminder" is meant. It marks the task dropped: it leaves the '
+            "user's lists and its phone alarm stops, and they can reopen it in the app. "
+            "Nothing is erased; the task app refuses deletes from this credential on purpose. "
+            "It refuses a task the user made themselves, a parked fork (complete_task finishes "
+            "those and closes their issue), or one that is no longer open, and says so."
+        ),
+        inputSchema=CANCEL_TASK_SCHEMA,
     ),
     types.Tool(
         name="omni_capacity",
@@ -851,6 +1058,31 @@ TOOLS: list[types.Tool] = [
         inputSchema=REPORT_REVIEW_SCHEMA,
     ),
     types.Tool(
+        name="advise_preset",
+        description=(
+            "Lead-picks sessions only: ask the Decision-1 advisor which preset fits the task. "
+            "Send a one-line neutral summary (no client, person or product names, no quoted "
+            "text) and rough counts. Answers use (with the preset id) or decide_yourself."
+        ),
+        inputSchema=ADVISE_PRESET_SCHEMA,
+    ),
+    types.Tool(
+        name="ask_judge",
+        description=(
+            "Ask the Decision-1 judge model for a quick typed judgment, any role. Use it to pick "
+            "between named options (kind choice, 2 to 6 options), for a yes/no gate such as "
+            "running the full suite or only scoped tests, asking for review now or fixing more, "
+            "or being ready to hand off (kind yes_no), or to score a size or risk on ordered "
+            "levels (kind score). Write the question in neutral words of your own: never paste "
+            "the user's message, and never include names, client or company names, paths, links "
+            "or secrets; the server refuses the call and names a reason code. Put numbers and "
+            "booleans in facts. It returns answer and probs (probabilities, not reasons). "
+            "low_confidence true, or an error, means decide yourself. At most 20 calls an hour "
+            "per session."
+        ),
+        inputSchema=ASK_JUDGE_SCHEMA,
+    ),
+    types.Tool(
         name="preset_insights_read",
         description=(
             "Preset reviewer only: read how role presets performed since the last review "
@@ -876,6 +1108,8 @@ WRITING_TOOLS: frozenset[str] = frozenset(
         "park_fork",
         "link_issue",
         "complete_task",
+        "create_task",
+        "cancel_task",
         "omni_set_status",
         "create_session",
         "post_message",
@@ -884,6 +1118,8 @@ WRITING_TOOLS: frozenset[str] = frozenset(
         "schedule_checkin",
         "set_session_model",
         "report_review",
+        "advise_preset",
+        "ask_judge",
         "submit_preset_suggestions",
     }
 )
@@ -922,6 +1158,8 @@ class OmniClient:
     def __init__(self, settings: Settings, *, http: httpx.AsyncClient | None = None) -> None:
         self.settings = settings
         self._http = http
+        #: (expires at monotonic time, answer) of the last judge availability read.
+        self.judge_seen: tuple[float, bool] | None = None
 
     def _client(self) -> httpx.AsyncClient:
         if self._http is None:
@@ -1038,6 +1276,39 @@ async def complete_task(client: OmniClient, args: dict[str, Any]) -> Any:
     if status == 200 and isinstance(data, dict):
         return data
     return {"outcome": "not_completed", "task_id": task_id, "reason": _message(status, data)}
+
+
+async def create_task(client: OmniClient, args: dict[str, Any]) -> Any:
+    status, data = await client.call("POST", "/v1/ae/lot/create", json_body=args)
+    if status == 200 and isinstance(data, dict):
+        return data
+    error = data.get("error") if isinstance(data, dict) else None
+    error = error if isinstance(error, dict) else {}
+    return {
+        "outcome": "not_created",
+        "reason": _message(status, data),
+        "lists": error.get("lists"),
+        "instruction": error.get("instruction")
+        or (
+            "Tell the user the task was not created, and give them the title, list, date and time "
+            "to add by hand."
+        ),
+    }
+
+
+async def list_lists(client: OmniClient, args: dict[str, Any]) -> Any:  # noqa: ARG001
+    status, data = await client.call("GET", "/v1/ae/lot/lists")
+    if status == 200 and isinstance(data, dict):
+        return data
+    return {"error": f"Could not read the lists: {_message(status, data)}"}
+
+
+async def cancel_task(client: OmniClient, args: dict[str, Any]) -> Any:
+    task_id = str(args["task_id"])
+    status, data = await client.call("POST", f"/v1/ae/lot/{quote(task_id, safe='')}/cancel")
+    if status == 200 and isinstance(data, dict):
+        return data
+    return {"outcome": "not_cancelled", "task_id": task_id, "reason": _message(status, data)}
 
 
 async def omni_capacity(client: OmniClient, args: dict[str, Any]) -> Any:  # noqa: ARG001
@@ -1650,6 +1921,8 @@ async def report_review(client: OmniClient, args: dict[str, Any]) -> Any:
     body = {key: args.get(key) for key in REPORT_REVIEW_SCHEMA["required"]}
     if args.get("call_id") is not None:
         body["call_id"] = args["call_id"]
+    if args.get("personas") is not None:
+        body["personas"] = args["personas"]
     status, data = await client.call(
         "POST", f"/v1/ae/sessions/{caller}/review-report", json_body=body
     )
@@ -1699,12 +1972,39 @@ async def submit_preset_suggestions(client: OmniClient, args: dict[str, Any]) ->
     return data
 
 
+async def advise_preset(client: OmniClient, args: dict[str, Any]) -> Any:
+    """Ask the advisor which preset fits, as the calling session. The key stays on the server."""
+    caller = _caller_session()
+    if not caller:
+        return {"verdict": "decide_yourself", "reason": "no_session_id"}
+    body = {k: args[k] for k in ADVISE_PRESET_SCHEMA["properties"] if k in args}
+    status, data = await client.call("POST", f"/v1/ae/sessions/{caller}/advise", json_body=body)
+    if status != 200 or not isinstance(data, dict):
+        return {"verdict": "decide_yourself", "reason": "error"}
+    return data
+
+
+async def ask_judge(client: OmniClient, args: dict[str, Any]) -> Any:
+    """Ask the judge as the calling session. The key stays on the server."""
+    caller = _caller_session()
+    if not caller:
+        return {"answer": None, "probs": {}, "low_confidence": True, "error": "no_session_id"}
+    body = {k: args[k] for k in ASK_JUDGE_SCHEMA["properties"] if k in args}
+    status, data = await client.call("POST", f"/v1/ae/sessions/{caller}/judge", json_body=body)
+    if status != 200 or not isinstance(data, dict):
+        return {"answer": None, "probs": {}, "low_confidence": True, "error": "error"}
+    return data
+
+
 HANDLERS = {
     "park_fork": park_fork,
     "list_tags": list_tags,
     "link_issue": link_issue,
     "list_parked": list_parked,
     "complete_task": complete_task,
+    "create_task": create_task,
+    "list_lists": list_lists,
+    "cancel_task": cancel_task,
     "omni_capacity": omni_capacity,
     "omni_set_status": omni_set_status,
     "omni_transcript": omni_transcript,
@@ -1715,6 +2015,8 @@ HANDLERS = {
     "schedule_checkin": schedule_checkin,
     "list_prs": list_prs,
     "report_review": report_review,
+    "advise_preset": advise_preset,
+    "ask_judge": ask_judge,
     "preset_insights_read": preset_insights_read,
     "submit_preset_suggestions": submit_preset_suggestions,
 }
@@ -1724,13 +2026,46 @@ SESSION_HANDLERS = {"ask_user": ask_user}
 CLIENT_SESSION_HANDLERS = {"set_session_model": set_session_model}
 
 
+#: Tools that exist only while the Decision-1 judge model is available to the caller.
+JUDGE_TOOLS: frozenset[str] = frozenset({"advise_preset", "ask_judge"})
+JUDGE_CACHE_S = 60.0
+#: A read that failed (no answer, or a status other than 200) is retried sooner.
+JUDGE_FAIL_CACHE_S = 5.0
+JUDGE_TIMEOUT_S = 2.0
+
+
+async def _judge_available(client: OmniClient) -> bool:
+    """Whether ``GET /v1/ae/decision`` says ``available``; any other answer is no.
+
+    Added 2026-11-07: agents never see the judge tools while the model is off. Cached 60 s (5 s
+    when the read failed) per client, read with a 2 s timeout. A chat already open keeps the
+    list it was given.
+    """
+    now = time.monotonic()
+    hit = client.judge_seen
+    if hit and hit[0] > now:
+        return hit[1]
+    try:
+        status, data = await asyncio.wait_for(
+            client.call("GET", "/v1/ae/decision"), timeout=JUDGE_TIMEOUT_S
+        )
+        readable = status == 200 and isinstance(data, dict)
+        ok = readable and data.get("available") is True
+    except Exception:  # noqa: BLE001 (unreadable means hidden)
+        readable, ok = False, False
+    client.judge_seen = (now + (JUDGE_CACHE_S if readable else JUDGE_FAIL_CACHE_S), ok)
+    return ok
+
+
 def create_server(client: OmniClient) -> Server:
     """The MCP server over *client*: every tool in :data:`TOOLS`, each answer a JSON text block."""
     server: Server = Server(SERVER_NAME)
 
     @server.list_tools()
     async def _list_tools() -> list[types.Tool]:
-        return list(TOOLS)
+        if await _judge_available(client):
+            return list(TOOLS)
+        return [tool for tool in TOOLS if tool.name not in JUDGE_TOOLS]
 
     @server.call_tool()
     async def _call_tool(

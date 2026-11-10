@@ -184,3 +184,142 @@ describe("phone layout guards", () => {
     expect(wide).toMatch(/\.hd-cap \{\s*display: flex;/);
   });
 });
+
+// 2026-11-03: a real browser showed Needs you never folding. `.attn-rows` and `.attn-children`
+// say `display: flex`, which beats the `hidden` attribute folding sets, and jsdom applies no CSS,
+// so no behaviour test could see it. Every .attn rule that sets a display must be beaten by a
+// [hidden] rule: its own, or the panel's scoped `.attn [hidden]`.
+describe("Needs you folding survives the stylesheet", () => {
+  const plain = css.replace(/\/\*[\s\S]*?\*\//g, "");
+  const rules = [...plain.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({
+    selector: m[1]!.trim(),
+    body: m[2]!,
+  }));
+  const displaying = rules.filter(
+    (r) => /(^|,)\s*\.attn[\w-]*\b/.test(r.selector) && /display:\s*(?!none)[\w-]+/.test(r.body),
+  );
+
+  it("finds the rules this guards", () => {
+    const selectors = displaying.map((r) => r.selector);
+    expect(selectors.some((s) => s.includes(".attn-rows"))).toBe(true);
+    expect(selectors.some((s) => s.includes(".attn-children"))).toBe(true);
+  });
+
+  it("has a [hidden] rule that wins over every .attn display rule", () => {
+    const scoped = rules.find((r) => r.selector === ".attn [hidden]");
+    expect(scoped, "the .attn [hidden] rule").toBeDefined();
+    expect(scoped!.body).toMatch(/display:\s*none\s*!important/);
+  });
+
+  it("never makes an .attn display rule !important (it would beat the [hidden] rule)", () => {
+    for (const rule of displaying) expect(rule.body, rule.selector).not.toMatch(/display:[^;]*!important/);
+  });
+
+  it("hides the worst-item words on a phone instead of clipping them to a letter", () => {
+    const at = css.indexOf("@media (max-width: 520px) {\n  .attn-line .attn-worst");
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(css.slice(at, css.indexOf("}\n}", at))).toContain("display: none");
+    expect(block(".attn-worst")).toContain("min-width: 8ch");
+  });
+});
+
+// 2026-11-06: four status pills replaced the ten tiles.
+describe("status pills", () => {
+  it("lays four pills in one row, and two by two under 760 px of the page", () => {
+    expect(block(".admin-tiles")).toContain("repeat(4, minmax(0, 1fr))");
+    const at = css.indexOf("@container admin (max-width: 760px) {\n  .admin-tiles {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(css.slice(at, css.indexOf("}\n}", at))).toContain("repeat(2, minmax(0, 1fr))");
+  });
+
+  it("keeps the strip on a phone: nothing hides .admin-tiles any more", () => {
+    expect(css).not.toMatch(/@container admin \(width < 520px\) \{\s*\.admin-tiles \{\s*display: none/);
+  });
+
+  it("drops the rules that only served the old tiles, and keeps the Deploy hold bar", () => {
+    for (const gone of [".admin-tiles > .tile", ".tile-value", ".tile-label", ".tile-note", ".tile-dot"]) {
+      expect(css, gone).not.toContain(`${gone} {`);
+    }
+    expect(css).toContain(".tile-bar {");
+  });
+
+  it("tints a problem pill from --err, with no hard-coded colour", () => {
+    expect(block(".pill-problem")).toContain("color-mix(in srgb, var(--err)");
+    expect(block(".pill-attention")).toContain("var(--warn-bg)");
+  });
+
+  it("opens the popover on hover and keyboard focus only, and never clips it", () => {
+    expect(block(".pill-pop")).toContain("display: none");
+    expect(css).toContain(".pill:focus-visible + .pill-pop {");
+    const at = css.indexOf("@media (hover: hover) {\n  .pill-wrap:hover .pill-pop {");
+    expect(at, "the hover rule sits inside @media (hover: hover)").toBeGreaterThanOrEqual(0);
+    expect(css.indexOf(".pill-wrap:hover")).toBeGreaterThan(css.indexOf("@media (hover: hover)"));
+    expect(block(".pill-wrap")).not.toMatch(/overflow/);
+    expect(block(".pill")).not.toMatch(/overflow/);
+  });
+
+  it("wraps the pill line to two lines instead of one ellipsized line", () => {
+    const rule = block(".pill-line");
+    expect(rule).toContain("-webkit-line-clamp: 2");
+    expect(rule).toContain("line-clamp: 2");
+    expect(rule).not.toContain("white-space: nowrap");
+    // Under 520 px the brief is one line (2026-11-07).
+    const at = css.indexOf("@container admin (width < 520px) {\n  .pill-line {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    expect(css.slice(at, css.indexOf("\n}\n", at))).toContain("-webkit-line-clamp: 1");
+  });
+
+  it("makes the status boxes one height and leaves the host to reserve the phone's top band", () => {
+    expect(block(".pill")).toContain("height: 100%");
+    expect(css).not.toContain("padding-top: 52px");
+  });
+
+  it("puts the verdict on its own line under the title on a narrow page", () => {
+    const at = css.indexOf("@container admin (max-width: 519px) {\n  .fabric.admin .fabric-top {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const rules = css.slice(at, css.indexOf("\n}\n\n", at));
+    expect(rules).toContain("flex-wrap: wrap");
+    expect(rules).toContain("flex: 1 0 100%");
+  });
+
+  // 2026-11-06 (phase 4): the cards sit under group headings.
+  it("lays the board out as groups, each with the column grid, and wraps the Not set up line", () => {
+    const board = block(".admin-board");
+    // 2026-11-07 (D1): a grid of the page's columns that packs groups first-fit.
+    expect(board).toContain("display: grid");
+    expect(board).toContain("grid-auto-flow: row dense");
+    expect(board).toContain("gap: 22px 14px");
+    expect(css).not.toContain(".admin-col > .admin-card:last-child {\n  flex: 1;");
+    // The group's stacks and the box-admin board keep today's grid.
+    const start = css.indexOf(".admin-group-cols,");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const grid = css.slice(start, css.indexOf("}", start));
+    expect(grid).toContain(".admin-board[data-single]");
+    expect(grid).toContain("grid-template-columns: repeat(var(--cols), minmax(0, 1fr))");
+    expect(grid).toContain("gap: 14px");
+    expect(grid).toContain("align-items: start");
+    const heading = block(".admin-group-h");
+    expect(heading).toContain("letter-spacing: 0.07em");
+    expect(heading).toContain("text-transform: uppercase");
+    expect(heading).toContain("var(--muted)");
+    expect(block(".admin-group-line")).toContain("var(--line)");
+    const notset = block(".admin-notset");
+    expect(notset).toContain("overflow-wrap: anywhere");
+    expect(notset).toContain("1px dashed var(--line)");
+  });
+
+  // 2026-11-07 (packed board): four columns, the group tag, Needs you as a tile, the flash ring.
+  it("has a fourth column, a tag shown only when packed, and no 360 px Needs you grid", () => {
+    expect(block('.admin-board[data-columns="4"]')).toContain("--cols: 4");
+    expect(block(".admin-card-tag")).toContain("display: none");
+    const tag = block(".admin-board[data-packed] .admin-card-tag");
+    expect(tag).toContain("font-size: 11px");
+    expect(tag).toContain("font-weight: 650");
+    expect(tag).toContain("letter-spacing: 0.08em");
+    expect(tag).toContain("var(--muted)");
+    expect(css).not.toContain("minmax(360px, 1fr)");
+    expect(block(".admin-board[data-packed] .attn-tree")).toContain("flex-direction: column");
+    expect(block(".admin-board[data-packed] .attn-review-source")).toContain("margin-left: auto");
+    expect(block(".admin-card.is-flash")).toContain("var(--accent)");
+  });
+});

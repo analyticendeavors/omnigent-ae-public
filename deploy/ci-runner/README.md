@@ -75,10 +75,23 @@ minute. The unit also sets `ProtectHome=tmpfs` with only the `ghrunner` user's h
 `ProtectSystem=full`, `PrivateTmp` and `NoNewPrivileges`, so a job sees that home,
 `/usr`, `/opt` and its own `/tmp`, not the owner's home.
 
+Each runner also has its own tool cache, `toolcache-N` in the `ghrunner` home, which its unit
+mounts at `/opt/hostedtoolcache` (set as `RUNNER_TOOL_CACHE` and `AGENT_TOOLSDIRECTORY` in
+that runner's `.env`). That is the path actions/setup-python's prebuilt Pythons are linked
+against: unpacked in a runner's own `_work/_tool`, they load `libpython` only through
+`LD_LIBRARY_PATH`, so every test that starts Python with a clean environment failed (the
+first parity drill, 2026-11-07). One cache per runner, not one shared cache, because setup
+actions replace a version directory without a lock: two runners filling a shared cache at
+once could leave a complete marker beside a half-copied tree. On the host,
+`/opt/hostedtoolcache` stays an empty, root-owned mount point.
+
 Run it again any time: it checks each runner's version and registration, reconfigures or
 upgrades only the ones that are missing or out of date, and restarts only the units it
 changed; a unit running a job, unchanged, is left alone. A rerun needs no token file unless
-a runner must be registered.
+a runner must be registered. A runner it does change is restarted even mid-job (that job
+turns red, and its rerun goes to GitHub), so run it while no box job is running. The first
+rerun after the tool cache change (2026-11-07) changes the unit and every runner's `.env`,
+so it restarts all five.
 
 Then set the allowed authors (once; a comma list of the two logins, no spaces). The drills
 need this first; on its own it changes nothing while `CI_BOX_RUNNER` is unset:
@@ -127,8 +140,11 @@ see where its jobs ran with
    # when "AE package lint and tests" shows in_progress:
    ssh -t <user>@<box> "sudo systemctl stop 'ghrunner@*'"
    ```
-   Pass: the job fails with a lost-runner annotation, the fallback reruns the run, attempt 2
-   passes. Start the units again, then prove the negative on a throwaway branch:
+   Pass: the job fails, the fallback reruns the run, attempt 2 passes. A clean stop like this
+   one (or a reboot) leaves only "The operation was canceled." on a job that concludes
+   failure; a power cut leaves "lost communication with the server" once GitHub gives up on
+   the runner. The fallback reruns on either (2026-11-07: before it knew the first, drill 4
+   stayed red). Start the units again, then prove the negative on a throwaway branch:
    ```bash
    git switch -c drill/failing-test origin/main
    printf 'def test_drill_fails():\n    assert False\n' > tests/deploy/test_drill_fail.py

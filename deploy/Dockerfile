@@ -36,7 +36,11 @@ COPY packages/ae_omni_extension /opt/ae/packages/ae_omni_extension
 COPY config/server.yaml /opt/ae/config/server.yaml
 COPY config/server.env.example /opt/ae/config/server.env.example
 COPY agents /opt/ae/agents
+# Server dictation (the composer mic in the desktop app): upstream's dictation extra,
+# pinned as upstream/pyproject.toml pins it. Models live on the data volume (deploy/README.md,
+# "Dictation"). 2026-11-09.
 RUN pip install --no-cache-dir /opt/ae/packages/ae_omni_policies /opt/ae/packages/ae_omni_extension \
+    "sherpa-onnx>=1.13,<2" "sherpa-onnx-core>=1.13,<2" "numpy>=1.24,<3" \
  && python -c "import ae_omni_policies, ae_omni_extension, ae_omni_policies.mcp" \
  && test -f /opt/ae/agents/steward/agent.yaml \
  && test -f /opt/ae/agents/shutdown/agent.yaml \

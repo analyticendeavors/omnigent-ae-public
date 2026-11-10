@@ -1,8 +1,10 @@
 // The Admin Center's Git repos card (2026-10-24): every repo across the
-// GitHub accounts the box can read, sorted by who moves next. Only what the owner
-// must decide gets a row under "Needs you"; GitHub lag, CI, drafts, the
-// sweep's own pull requests and view-only repos fold into one quiet "Not
-// yours to move" box. Same shape as the Key Vault card (vault.ts): four
+// GitHub accounts the box can read, sorted by who moves next. Since 2026-11-03 the
+// "who moves next" rows are listed once, in the Needs you panel (attention.ts, built
+// on the server from the same rules); the card keeps one line, "N in Needs you", that
+// opens the panel filtered to it. GitHub lag, CI, drafts, the
+// sweep's own pull requests and view-only repos still fold into one quiet "Not
+// yours to move" box here. Same shape as the Key Vault card (vault.ts): four
 // numbers, Needs you, a Show all list with search and chips. Data comes from
 // `GET /v1/ae/git` (ae_omni_policies/git.py, admins only).
 //
@@ -26,12 +28,13 @@ import {
   describeError,
   fetchGit,
   type GitAlert,
-  type GitBranch,
   type GitOverview,
   type GitPull,
   type GitRepo,
   type GitRun,
+  type GitScope,
 } from "./api";
+import { attentionCount, needsLink, onAttention, sourceRead, urgentCount } from "./attentionStore";
 import { el, notice, replaceChildren } from "./dom";
 import { chevronIcon, searchIcon } from "./icons";
 import { openOrShow } from "./openLink";
@@ -44,14 +47,14 @@ export const STUCK_HOURS = 24;
 export const OLD_BRANCH_DAYS = 14;
 /** The Dependency Sweep runs every 6 hours; no run started for 8 is late (2026-10-24). */
 export const SWEEP_LATE_HOURS = 8;
-/** Needs-you rows shown before the "N more" button. */
-export const NEEDS_SHOWN = 5;
 /** Names listed on a Not-yours line before "and N more". */
 const QUIET_SHOWN = 3;
 
 const HOUR = 3_600_000;
 const DAY = 86_400_000;
 const VIEW_KEY = "git.view";
+/** The Company, Mine, All switch, remembered per viewer (2026-11-08). */
+const SCOPE_KEY = "git.scope";
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -130,40 +133,13 @@ function runTone(run: GitRun): Tone {
   return "muted";
 }
 
-const SEVERITY = ["CRITICAL", "HIGH", "MODERATE", "LOW"];
-
-/** "undici, @azure/msal-node" for a repo's alerts, three packages then a count. */
-function packageList(alerts: GitAlert[]): string {
-  const names = [...new Set(alerts.map((alert) => alert.package))];
-  const shown = names.slice(0, 3).join(", ");
-  return names.length > 3 ? `${shown} and ${names.length - 3} more` : shown;
-}
-
 /** Repos the card acts on: view-only ones are listed on their own and left out of totals. */
 const live = (data: GitOverview): GitRepo[] => data.repos.filter((repo) => !repo.view_only);
 
-// ── who moves next ──────────────────────────────────────────────────────────
-
-export type NeedTone = "err" | "accent" | "warn";
-
-export interface Need {
-  kind:
-    | "account"
-    | "repo-error"
-    | "sweep"
-    | "alerts-fix"
-    | "pr-failing"
-    | "pr-ready"
-    | "pr-update"
-    | "alerts-stuck"
-    | "branch";
-  tone: NeedTone;
-  title: string;
-  meta: string;
-  /** The link word: Open, Alerts, Branch, Run or Repo. */
-  go: string;
-  url: string;
-}
+// ── the quiet lines ─────────────────────────────────────────────────────────
+// The rows for the owner moved to the server (git_center.py `needs()`) and the Needs you
+// panel. What stays here is the other half of the old sort: the lines that are not the
+// owner's to move, and the two numbers the stats row needs.
 
 export interface QuietItem {
   text: string;
@@ -179,136 +155,40 @@ export interface QuietLine {
 }
 
 export interface Analysis {
-  /** Worst first: err, then the ready pull requests, then warn. */
-  needs: Need[];
   ready: number;
   oldBranches: number;
   quiet: QuietLine[];
 }
-
-const RANK: Record<NeedTone, number> = { err: 0, accent: 1, warn: 2 };
 
 function quietLine(who: QuietLine["who"], items: QuietItem[], sep = ", "): QuietLine[] {
   if (!items.length) return [];
   return [{ who, items: items.slice(0, QUIET_SHOWN), more: Math.max(0, items.length - QUIET_SHOWN), sep }];
 }
 
-/** Sort everything the card knows into rows for the owner and lines that are not theirs to move. */
+/** Sort what is not the owner's to move into lines, and count the ready pull requests and old branches. */
 export function analyze(data: GitOverview, now = Date.now()): Analysis {
-  const needs: Need[] = [];
   const github: QuietItem[] = [];
   const ci: QuietItem[] = [];
   const drafts: QuietItem[] = [];
-  const recent: GitBranch[] = [];
-  const old: Array<{ repo: GitRepo; branch: GitBranch; at: number }> = [];
-  const stuckRows: Need[] = [];
-  const prRows: Need[] = [];
+  let recent = 0;
+  let old = 0;
   let kept = 0;
   let sweepPrs = 0;
   const sweepRepos = new Set<string>();
   let ready = 0;
 
-  // An account without a token says so once; a repo whose error is that note adds nothing.
-  const explained = new Set<string>();
-  for (const account of data.accounts) {
-    if (account.connected) continue;
-    const note = account.note ?? "No token for this account.";
-    explained.add(note);
-    needs.push({
-      kind: "account",
-      tone: "err",
-      title: `${account.owner} is not connected`,
-      meta: note,
-      go: "Repo",
-      url: `https://github.com/${account.owner}`,
-    });
-  }
-  for (const repo of live(data)) {
-    if (repo.error && !explained.has(repo.error)) {
-      needs.push({
-        kind: "repo-error",
-        tone: "err",
-        title: `${repo.repo} could not be read`,
-        meta: repo.error,
-        go: "Repo",
-        url: repo.url,
-      });
-    }
-  }
-
-  const latest = data.sweep?.runs[0];
-  if (data.sweep && !latest && !data.sweep.error) {
-    // A configured sweep that has never run is as wrong as one that stopped.
-    needs.push({
-      kind: "sweep",
-      tone: "err",
-      title: "No Dependency Sweep runs found",
-      meta: "The workflow is set up but has no runs yet",
-      go: "Run",
-      url: data.sweep.url,
-    });
-  }
-  if (data.sweep && latest) {
-    const started = stamp(latest.created_at);
-    if (["failure", "timed_out", "startup_failure"].includes(latest.conclusion ?? "")) {
-      needs.push({
-        kind: "sweep",
-        tone: "err",
-        title: "The latest Dependency Sweep failed",
-        meta: `Started ${whenShort(latest.created_at, now)}`,
-        go: "Run",
-        url: latest.url,
-      });
-    } else if (now - started > SWEEP_LATE_HOURS * HOUR) {
-      const hours = Math.floor((now - started) / HOUR);
-      needs.push({
-        kind: "sweep",
-        tone: "err",
-        title: `No Dependency Sweep has started in ${plural(hours, "hour")}`,
-        meta: `It runs every 6 hours; the last one started ${whenShort(latest.created_at, now)}`,
-        go: "Run",
-        url: latest.url,
-      });
-    }
-  }
-
   for (const repo of live(data)) {
     const name = shortName(repo.repo);
-    const fix = repo.alerts.filter((alert) => alert.bucket === "fix");
-    if (fix.length) {
-      const worst = SEVERITY.find((level) => fix.some((alert) => alert.severity === level));
-      needs.push({
-        kind: "alerts-fix",
-        tone: "err",
-        title: `${plural(fix.length, "alert")} to fix: ${packageList(fix)}`,
-        meta: worst ? `${name} · worst is ${worst.toLowerCase()}` : name,
-        go: "Alerts",
-        url: dependabotUrl(repo.repo),
-      });
-    }
-
-    const stuck: GitAlert[] = [];
     const lagging: GitAlert[] = [];
     for (const alert of repo.alerts.filter((a) => a.bucket === "waiting")) {
       const since = stamp(alert.waiting_since ?? alert.created_at);
-      (!Number.isNaN(since) && now - since > STUCK_HOURS * HOUR ? stuck : lagging).push(alert);
-    }
-    const oldestSince = (alerts: GitAlert[]) =>
-      alerts
-        .map((alert) => alert.waiting_since ?? alert.created_at ?? null)
-        .sort((a, b) => stamp(a) - stamp(b))[0];
-    if (stuck.length) {
-      stuckRows.push({
-        kind: "alerts-stuck",
-        tone: "warn",
-        title: `${plural(stuck.length, "alert")} fixed on ${repo.default_branch}, still open on GitHub`,
-        meta: `${name} · stuck ${ageText(oldestSince(stuck), now)} · a lockfile push or GitHub Support clears them`,
-        go: "Alerts",
-        url: dependabotUrl(repo.repo),
-      });
+      if (!(!Number.isNaN(since) && now - since > STUCK_HOURS * HOUR)) lagging.push(alert);
     }
     if (lagging.length) {
-      const when = ago(oldestSince(lagging), now);
+      const oldest = lagging
+        .map((alert) => alert.waiting_since ?? alert.created_at ?? null)
+        .sort((a, b) => stamp(a) - stamp(b))[0];
+      const when = ago(oldest, now);
       github.push({
         text: `${plural(lagging.length, "alert")} in ${name}, fixed on ${repo.default_branch}${when ? ` ${when}` : ""}`,
         url: dependabotUrl(repo.repo),
@@ -324,48 +204,15 @@ export function analyze(data: GitOverview, now = Date.now()): Analysis {
       const failing = pr.checks === "FAILURE" || pr.checks === "ERROR";
       const conflicts = pr.merge_state === "DIRTY";
       if (pr.merge_state === "CLEAN") ready += 1;
-      if (failing || conflicts) {
-        prRows.push({
-          kind: "pr-failing",
-          tone: "err",
-          title: `Fix #${pr.number} ${pr.title}`,
-          meta: `${name} · ${[failing ? "checks failing" : "", conflicts ? "conflicts" : ""].filter(Boolean).join(", ")}`,
-          go: "Open",
-          url: pr.url,
-        });
-      } else if (pr.merge_state === "CLEAN") {
-        prRows.push({
-          kind: "pr-ready",
-          tone: "accent",
-          title: `Merge #${pr.number} ${pr.title}`,
-          meta: `${name} · ${pr.checks === "SUCCESS" ? "checks green" : checksText(pr.checks)}, no conflicts`,
-          go: "Open",
-          url: pr.url,
-        });
-      } else if (pr.merge_state === "UNSTABLE" || pr.checks === "PENDING") {
+      if (failing || conflicts || pr.merge_state === "CLEAN") continue;
+      if (pr.merge_state === "UNSTABLE" || pr.checks === "PENDING") {
         ci.push({ text: `${label} ${checksText("PENDING")}`, url: pr.url });
       } else if (isDependabot(pr) && (pr.merge_state === "BEHIND" || pr.merge_state === "UNKNOWN")) {
         // The sweep rebases and re-reads these on its own; BLOCKED is a review it will not give.
         sweepPrs += 1;
         sweepRepos.add(repo.repo);
-      } else if (pr.merge_state === "BEHIND") {
-        prRows.push({
-          kind: "pr-update",
-          tone: "warn",
-          title: `Update #${pr.number} ${pr.title}`,
-          meta: `${name} · behind ${repo.default_branch}`,
-          go: "Open",
-          url: pr.url,
-        });
-      } else if (pr.merge_state === "BLOCKED") {
-        prRows.push({
-          kind: "pr-update",
-          tone: "warn",
-          title: `#${pr.number} ${pr.title} is blocked`,
-          meta: `${name} · waiting on a review or a required check`,
-          go: "Open",
-          url: pr.url,
-        });
+      } else if (pr.merge_state === "BEHIND" || pr.merge_state === "BLOCKED") {
+        // A row for the owner: the Needs you panel lists it.
       } else {
         // UNKNOWN, HAS_HOOKS or no state yet: GitHub is still working it out.
         ci.push({ text: `${label} ${checksText(pr.checks)}`, url: pr.url });
@@ -379,25 +226,10 @@ export function analyze(data: GitOverview, now = Date.now()): Analysis {
       }
       const at = stamp(branch.last_commit_at);
       // A branch with no readable date is not called old: nothing says it is.
-      if (!Number.isNaN(at) && now - at > OLD_BRANCH_DAYS * DAY) old.push({ repo, branch, at });
-      else recent.push(branch);
+      if (!Number.isNaN(at) && now - at > OLD_BRANCH_DAYS * DAY) old += 1;
+      else recent += 1;
     }
   }
-
-  old.sort((a, b) => a.at - b.at);
-  const branchRows: Need[] = old.map(({ repo, branch }) => ({
-    kind: "branch",
-    tone: "warn",
-    title: branch.ahead
-      ? `${branch.name} has ${plural(branch.ahead, "commit")} and no PR`
-      : `${branch.name}, no PR`,
-    meta: `${shortName(repo.repo)} · last commit ${ago(branch.last_commit_at, now)}`,
-    go: "Branch",
-    url: branch.url,
-  }));
-
-  // Array.sort is stable: inside one rank the order built above stands.
-  const all = [...needs, ...prRows, ...stuckRows, ...branchRows].sort((a, b) => RANK[a.tone] - RANK[b.tone]);
 
   const quiet: QuietLine[] = [
     ...quietLine("GitHub", github, "; "),
@@ -406,9 +238,9 @@ export function analyze(data: GitOverview, now = Date.now()): Analysis {
       ? quietLine("Sweep", [{ text: `${plural(sweepPrs, "Dependabot PR")} in ${plural(sweepRepos.size, "repo")}` }])
       : []),
     ...quietLine("Drafts", drafts),
-    ...(recent.length
+    ...(recent
       ? quietLine("Recent branches", [
-          { text: `${plural(recent.length, "branch", "branches")} with no PR, last commit within ${OLD_BRANCH_DAYS} days` },
+          { text: `${plural(recent, "branch", "branches")} with no PR, last commit within ${OLD_BRANCH_DAYS} days` },
         ])
       : []),
     ...(kept
@@ -425,17 +257,19 @@ export function analyze(data: GitOverview, now = Date.now()): Analysis {
       "; ",
     ),
   ];
-  return { needs: all, ready, oldBranches: old.length, quiet };
+  return { ready, oldBranches: old, quiet };
 }
 
 /** "8 need you, 0 alerts to fix": the header line; "Nothing needs you" when it is quiet. */
-export function summaryWords(data: GitOverview, now = Date.now()): string {
-  const n = analyze(data, now).needs.length;
+export function summaryWords(data: GitOverview): string {
+  const n = attentionCount("git");
+  const fix = plural(data.totals.alerts_fix, "alert");
+  if (n === null) return `${fix} to fix`;
   if (n === 0) return "Nothing needs you";
-  return `${n === 1 ? "1 needs you" : `${n} need you`}, ${plural(data.totals.alerts_fix, "alert")} to fix`;
+  return `${n === 1 ? "1 needs you" : `${n} need you`}, ${fix} to fix`;
 }
 
-export function gitTile(data: GitOverview | null, error: unknown, now = Date.now()): Tile {
+export function gitTile(data: GitOverview | null, error: unknown): Tile {
   if (!data) {
     const forbidden = error instanceof AeRequestError && error.status === 403;
     return {
@@ -446,18 +280,24 @@ export function gitTile(data: GitOverview | null, error: unknown, now = Date.now
     };
   }
   if (!data.configured) {
-    return { id: "git", value: "Not set up", note: "no repos listed", health: "idle" };
+    return { id: "git", value: "Not set up", note: "no repos listed", health: "idle", notSetUp: true };
   }
-  const needs = analyze(data, now).needs;
-  const health: Health = needs.some((need) => need.tone === "err")
-    ? "problem"
-    : needs.length > 0 || data.error || data.sweep?.error
-      ? "attention"
-      : "ok";
+  // The count is the panel's (the server's rules); before its first read the tile waits for it.
+  const n = attentionCount("git");
+  const urgent = urgentCount("git") ?? 0;
+  const health: Health =
+    urgent > 0
+      ? "problem"
+      : (n ?? 0) > 0 || data.error || data.sweep?.error
+        ? "attention"
+        : n === null
+          ? "idle"
+          : "ok";
   return {
     id: "git",
-    value: needs.length ? `${needs.length} need you` : "All clear",
-    summary: summaryWords(data, now),
+    value: n === null ? "Reading..." : n ? `${n} need you` : "All clear",
+    summary: summaryWords(data),
+    brief: n === null ? undefined : n ? (n === 1 ? "1 needs you" : `${n} need you`) : "Git clear",
     note: `${data.totals.alerts_fix} to fix, ${data.totals.alerts_waiting} waiting on GitHub`,
     health,
   };
@@ -479,13 +319,22 @@ const CHIPS: Array<{ id: Chip; label: string }> = [
 interface Remembered {
   open: boolean;
   chip: Chip;
+  scope: GitScope;
 }
+
+const SCOPES: Array<{ id: GitScope; label: string; title: string }> = [
+  { id: "company", label: "Company", title: "The company's repos, read with the company's tokens" },
+  { id: "mine", label: "Mine", title: "Your own repos, read with your own GitHub tokens" },
+  { id: "all", label: "All", title: "Both lists; a repo in both shows once, under Company" },
+];
+
+const isScope = (value: unknown): value is GitScope => SCOPES.some((scope) => scope.id === value);
 
 const isChip = (value: unknown): value is Chip => CHIPS.some((chip) => chip.id === value);
 
 /** Read the remembered view; the defaults without storage or with something odd in it. */
 async function loadView(context: ExtensionContext): Promise<Remembered> {
-  const view: Remembered = { open: false, chip: "active" };
+  const view: Remembered = { open: false, chip: "active", scope: "all" };
   try {
     const found = await context.storage.user.get<unknown>(VIEW_KEY);
     if (found && typeof found === "object" && !Array.isArray(found)) {
@@ -496,7 +345,23 @@ async function loadView(context: ExtensionContext): Promise<Remembered> {
   } catch {
     // No storage: the defaults, kept in memory until the page closes.
   }
+  try {
+    const scope = await context.storage.user.get<unknown>(SCOPE_KEY);
+    if (isScope(scope)) view.scope = scope;
+  } catch {
+    // The same: All, kept in memory until the page closes.
+  }
   return view;
+}
+
+function saveScope(context: ExtensionContext, scope: GitScope): void {
+  try {
+    context.storage.user.set(SCOPE_KEY, scope).catch(() => {
+      // storage.user unavailable: kept in memory until the page closes.
+    });
+  } catch {
+    // Refused before a promise was made.
+  }
 }
 
 function saveView(context: ExtensionContext, view: Remembered): void {
@@ -504,6 +369,7 @@ function saveView(context: ExtensionContext, view: Remembered): void {
     context.storage.user.set(VIEW_KEY, { open: view.open, chip: view.chip }).catch(() => {
       // storage.user unavailable: kept in memory until the page closes.
     });
+
   } catch {
     // The same, refused before a promise was made.
   }
@@ -517,15 +383,18 @@ interface State {
   at: number;
   open: boolean;
   chip: Chip;
+  /** Which list the card shows (Company, Mine, All). */
+  scope: GitScope;
+  /** Called by the switch; set by activateGit. */
+  switchScope: (scope: GitScope) => void;
   query: string;
-  /** Every needs-you row, not just the first NEEDS_SHOWN. */
-  needsAll: boolean;
   openGroups: Set<string>;
   closedGroups: Set<string>;
 }
 
 interface Parts {
   root: HTMLElement;
+  scope: HTMLElement;
   summary: HTMLElement;
   status: HTMLElement;
   refreshed: HTMLElement;
@@ -564,7 +433,7 @@ function ghLink(
 
 type Linker = (url: string, className: string, ...children: Array<Node | string>) => HTMLElement;
 
-function dot(tone: Tone | NeedTone): HTMLElement {
+function dot(tone: Tone): HTMLElement {
   return el("span", { class: `git-dot git-dot-${tone}`, "aria-hidden": "true" });
 }
 
@@ -585,43 +454,39 @@ function drawStats(parts: Parts, data: GitOverview, analysis: Analysis): void {
   ]);
 }
 
-function needRow(need: Need, link: Linker): HTMLElement {
-  return el(
-    "li",
-    { class: `git-need need-${need.tone}`, "data-kind": need.kind },
-    dot(need.tone),
-    el(
-      "div",
-      { class: "git-need-text" },
-      el("span", { class: "git-need-title" }, need.title),
-      el("span", { class: "git-need-meta" }, need.meta),
-    ),
-    link(need.url, "git-link git-go", need.go),
-  );
-}
-
-function drawNeeds(parts: Parts, state: State, analysis: Analysis, link: Linker, redraw: () => void): void {
-  const { needs } = analysis;
-  const shown = state.needsAll ? needs : needs.slice(0, NEEDS_SHOWN);
-  const hidden = needs.length - shown.length;
-  const more =
-    needs.length > NEEDS_SHOWN
-      ? el(
-          "button",
-          { type: "button", class: "linkish git-more", "aria-expanded": String(state.needsAll) },
-          state.needsAll ? "Show fewer" : `${hidden} more`,
-        )
-      : null;
-  more?.addEventListener("click", () => {
-    state.needsAll = !state.needsAll;
-    redraw();
-  });
+function drawNeeds(parts: Parts, state: State): void {
+  // Personal items are their own source (git-mine): only their owner is ever sent them, and they
+  // take Dismiss and Open on GitHub only, so they get their own line here.
+  const mine = state.scope === "company" ? 0 : (attentionCount("git-mine") ?? 0);
   replaceChildren(parts.needs, [
     el("h3", { class: "git-h" }, "Needs you"),
-    needs.length
-      ? el("ul", { class: "git-needs", "aria-label": "Needs you" }, ...shown.map((need) => needRow(need, link)))
-      : el("p", { class: "git-okline" }, dot("ok"), "Nothing needs you."),
-    more,
+    state.scope === "mine" ? null : needsLink("git"),
+    mine > 0 || state.scope === "mine"
+      ? el("div", { class: "git-needs-mine" }, el("span", { class: "meta" }, "My Git repos: "), needsLink("git-mine"))
+      : null,
+  ]);
+}
+
+function drawScope(parts: Parts, state: State): void {
+  replaceChildren(parts.scope, [
+    ...SCOPES.map(({ id, label, title }) => {
+      const on = state.scope === id;
+      const node = el(
+        "button",
+        {
+          type: "button",
+          class: `git-scope-btn${on ? " is-on" : ""}`,
+          "aria-pressed": String(on),
+          "data-scope": id,
+          title,
+        },
+        label,
+      );
+      node.addEventListener("click", () => {
+        if (state.scope !== id) state.switchScope(id);
+      });
+      return node;
+    }),
   ]);
 }
 
@@ -847,6 +712,7 @@ function drawList(parts: Parts, state: State, data: GitOverview, now: number, li
       { type: "button", class: "git-group-head", "aria-expanded": String(open), "data-repo": repo.repo },
       chevronIcon(),
       el("span", { class: "git-group-name", title: repo.repo }, shortName(repo.repo)),
+      repo.scope === "mine" ? el("span", { class: "git-tag git-tag-mine", title: "From your own list" }, "Mine") : null,
       el("span", { class: "git-group-sum" }, words),
     );
     head.addEventListener("click", () => {
@@ -883,6 +749,7 @@ function draw(parts: Parts, state: State, context: ExtensionContext, remember: (
   const data = state.data;
   const link: Linker = (url, className, ...children) => ghLink(context, parts.root, url, className, ...children);
   const redraw = () => draw(parts, state, context, remember);
+  drawScope(parts, state);
   if (!data || !data.configured) {
     parts.summary.textContent = "";
     parts.summary.className = "git-summary";
@@ -897,20 +764,27 @@ function draw(parts: Parts, state: State, context: ExtensionContext, remember: (
         ? state.error
           ? null
           : el("p", { class: "meta" }, "Reading...")
-        : el("p", { class: "meta git-setup" }, data.setup ?? "Git repos are not set up on this box."),
+        : el(
+            "p",
+            { class: "meta git-setup" },
+            data.setup ??
+              (state.scope === "mine"
+                ? "You have no personal repos yet. Add a GitHub account in Cards, under Git."
+                : "Git repos are not set up on this box."),
+          ),
     ]);
   } else {
     const analysis = analyze(data, now);
     const err = data.totals.alerts_fix > 0;
-    parts.summary.textContent = summaryWords(data, now);
-    parts.summary.className = `git-summary${err ? " is-err" : analysis.needs.length ? " is-warn" : ""}`;
+    parts.summary.textContent = summaryWords(data);
+    parts.summary.className = `git-summary${err ? " is-err" : (attentionCount("git") ?? 0) > 0 ? " is-warn" : ""}`;
     replaceChildren(parts.notes, [
       // The sweep config failing to read leaves only the extra repos listed.
       data.error ? el("p", { class: "git-warn" }, data.error) : null,
       data.list_cut ? el("p", { class: "meta" }, "Lists shortened to fit; the counts include everything.") : null,
     ]);
     drawStats(parts, data, analysis);
-    drawNeeds(parts, state, analysis, link, redraw);
+    drawNeeds(parts, state);
     drawQuiet(parts, analysis, link);
     drawSweep(parts, data, now, link);
     drawFooter(parts, state, data, () => {
@@ -920,7 +794,7 @@ function draw(parts: Parts, state: State, context: ExtensionContext, remember: (
     });
     drawList(parts, state, data, now, link, redraw, remember);
   }
-  const tile = gitTile(state.data, state.error, now);
+  const tile = gitTile(state.data, state.error);
   setTile(state.data ? staleTile(tile, state.error) : tile, state.at || undefined);
 }
 
@@ -945,6 +819,7 @@ export function gitSection(): HTMLElement {
   return el(
     "div",
     { class: "admin-block admin-git" },
+    el("div", { class: "git-scope", role: "group", "aria-label": "Which repos to show" }),
     el("p", { class: "meta refreshed git-refreshed" }),
     el("div", { class: "page-status git-status" }),
     el("p", { class: "git-summary" }),
@@ -963,10 +838,14 @@ export function gitSection(): HTMLElement {
 }
 
 let onFocus: (() => void) | null = null;
+/** The unsubscribe from the Needs you store: the card's count follows the panel's reads. */
+let stopAttention: (() => void) | null = null;
 /** Bumped by every activate and deactivate, as in accounts.ts. */
 let generation = 0;
 
 function stopListening(): void {
+  stopAttention?.();
+  stopAttention = null;
   if (!onFocus) return;
   window.removeEventListener("focus", onFocus);
   document.removeEventListener("visibilitychange", onFocus);
@@ -983,6 +862,7 @@ export function activateGit(context: ExtensionContext, root: HTMLElement): void 
   // In the card the header carries the time, so this one may have moved.
   const parts: Parts = {
     root: root.matches(".admin-git") ? root : find(".admin-git"),
+    scope: find(".git-scope"),
     summary: find(".git-summary"),
     status: find(".git-status"),
     refreshed: root.querySelector<HTMLElement>(".git-refreshed") ?? el("p"),
@@ -1006,8 +886,24 @@ export function activateGit(context: ExtensionContext, root: HTMLElement): void 
     at: 0,
     open: false,
     chip: "active",
+    scope: "all",
+    switchScope: (scope) => {
+      if (!current()) return;
+      // A read of the other list still on its way must not land on this one.
+      readSeq++;
+      reading = null;
+      state.scope = scope;
+      state.data = null;
+      state.error = null;
+      state.at = 0;
+      drawn = "";
+      state.openGroups.clear();
+      state.closedGroups.clear();
+      saveScope(context, scope);
+      draw(parts, state, context, remember);
+      void refresh();
+    },
     query: "",
-    needsAll: false,
     openGroups: new Set(),
     closedGroups: new Set(),
   };
@@ -1019,23 +915,28 @@ export function activateGit(context: ExtensionContext, root: HTMLElement): void 
     draw(parts, state, context, remember);
   };
   let reading: Promise<void> | null = null;
+  let readSeq = 0;
   let drawn = "";
   const refresh = (): Promise<void> => {
     if (reading) return reading;
-    reading = fetchGit(context)
+    const seq = ++readSeq;
+    const live = () => current() && seq === readSeq;
+    reading = fetchGit(context, state.scope)
       .then(
         (answer) => {
-          if (!current()) return;
+          if (!live()) return;
           state.data = answer;
           state.at = Date.now();
           state.error = null;
         },
         (error: unknown) => {
-          if (current()) state.error = error ?? new Error("Request failed");
+          if (live()) state.error = error ?? new Error("Request failed");
         },
       )
       .then(() => {
-        if (!current()) return;
+        if (!live()) return;
+        // The Needs you list is built from this answer: read it again now (debounced).
+        sourceRead();
         // An unchanged answer is not redrawn, so a focused link stays put. The quarter hour is
         // in the key because the stuck, old and late rules move with the clock.
         const next = JSON.stringify([
@@ -1053,18 +954,33 @@ export function activateGit(context: ExtensionContext, root: HTMLElement): void 
         }
       })
       .finally(() => {
-        reading = null;
+        if (seq === readSeq) reading = null;
       });
     return reading;
   };
   draw(parts, state, context, remember);
+  stopAttention = onAttention(() => {
+    if (current()) draw(parts, state, context, remember);
+  });
+  // The remembered scope decides what the first read asks for, so the view loads first.
   void loadView(context).then((view) => {
     if (!current()) return;
     state.open = view.open;
     state.chip = view.chip;
+    if (view.scope !== state.scope) {
+      // A read of the default scope may already be on its way (a focus event, a refresh
+      // button); it must not land under the remembered one, as in switchScope.
+      readSeq++;
+      reading = null;
+      state.scope = view.scope;
+      state.data = null;
+      state.error = null;
+      state.at = 0;
+      drawn = "";
+    }
     draw(parts, state, context, remember);
+    void refresh();
   });
-  void refresh();
   registerRefresh("git", () => (current() ? refresh() : undefined));
   onFocus = () => {
     if (document.visibilityState === "visible") void refresh();

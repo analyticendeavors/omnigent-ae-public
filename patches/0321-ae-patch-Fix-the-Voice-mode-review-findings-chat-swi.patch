@@ -1,0 +1,1496 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 21:35:27 -0800
+Subject: [PATCH 321/333] [ae-patch] Fix the Voice mode review findings: chat
+ switch, mic handshake, muted finals, spoken answers
+
+Review of the Voice mode patch found these, all fixed here.
+
+Leaving a chat inside the 0.6 s grace no longer sends the new chat's draft: every timer, the pending card and the send wait are dropped when the chat changes. The mic handle now remembers a start that is still connecting, so stopping it cancels the start or drops the stream the moment it connects, and it reports every real change to Voice mode, including a failed start and the server's stream limit. A failed start is retried once after a second, then the speaker says "Mic unavailable" and Voice mode stays on; "Listening" shows only while the mic really listens.
+
+Sound heard while the chat is busy, the voice is talking or the mic is returning is kept out of the draft. The send mute now follows the chat's own status (queued, running or streaming) instead of a five second timer, and a send the composer would refuse mutes nothing. A card that takes no answer of its own is never answered with the person's words.
+
+Spoken answers are matched more strictly: a number counts only in a short answer made of number words, a label said after "not", "don't" or "never" is not picked, and "ok done" or "I'm done" end a multi-select card without leaving a stray answer. The browser switch is compared with the session's ae.voice label when a chat opens, and a failed label write is retried once. A tap on the speaker while it talks silences the rest of that reply until the next send, and the mic returns 0.3 s later.
+---
+ .../components/AeSpeakRepliesButton.test.tsx  |  29 +-
+ web/src/components/AeSpeakRepliesButton.tsx   |  15 +-
+ web/src/components/ComposerMicButton.test.tsx |  62 ++++-
+ web/src/components/ComposerMicButton.tsx      |  50 +++-
+ web/src/hooks/useAeSpeakReplies.test.ts       |  24 ++
+ web/src/hooks/useAeSpeakReplies.ts            |   4 +
+ web/src/hooks/useAeVoiceMode.test.tsx         | 254 +++++++++++++++++-
+ web/src/hooks/useAeVoiceMode.ts               | 229 +++++++++++++---
+ web/src/lib/aeSettingHints.ts                 |   2 +-
+ web/src/lib/aeVoiceMode.test.ts               |  90 ++++++-
+ web/src/lib/aeVoiceMode.ts                    | 135 +++++++---
+ web/src/pages/ChatPage.tsx                    |  13 +-
+ 12 files changed, 810 insertions(+), 97 deletions(-)
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 6e794ccf9f0a71c896d2c9f4de90e86e40bc61c3..e6b3a838e41d9547bb76ae8c8220eb343b699105 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -372,7 +372,7 @@ describe("Voice mode on the speaker button", () => {
+     await user.click(screen.getByTestId("ae-speak-replies"));
+     expect(getVoiceSnapshot("c1").on).toBe(true);
+     expect(screen.getByTestId("ae-speak-replies")).toHaveAttribute("aria-pressed", "true");
+-    expect(screen.getByTestId("ae-voice-phase")).toHaveTextContent("Listening");
++    expect(screen.getByTestId("ae-voice-phase")).toHaveTextContent("Starting the mic");
+     const post = vi
+       .mocked(fetch)
+       .mock.calls.find(([url]) => String(url).includes("/v1/ae/sessions/c1/voice"));
+@@ -392,6 +392,33 @@ describe("Voice mode on the speaker button", () => {
+     expect(screen.getByTestId("ae-voice-phase")).toHaveTextContent("Speaking, tap to stop");
+   });
+ 
++  it("shows the words for the mic phases", async () => {
++    renderButton();
++    const user = userEvent.setup();
++    await user.click(screen.getByTestId("ae-speak-replies"));
++    for (const [phase, word] of [
++      ["listening", "Listening"],
++      ["paused", "Mic stopped"],
++      ["unavailable", "Mic unavailable"],
++    ] as const) {
++      act(() => setVoicePhase("c1", phase));
++      expect(screen.getByTestId("ae-voice-phase")).toHaveTextContent(word);
++    }
++  });
++
++  it("a tap while speaking stops the reply, keeps Voice mode on and silences the rest of the turn", async () => {
++    const synth = installFakeSpeech();
++    renderButton();
++    const user = userEvent.setup();
++    await user.click(screen.getByTestId("ae-speak-replies"));
++    act(() => getVoiceSnapshot("c1").speak?.("A sentence."));
++    await waitFor(() => expect(getVoiceSnapshot("c1").speaking).toBe(true));
++    const cancels = synth.cancelCount;
++    await user.click(screen.getByTestId("ae-speak-replies"));
++    expect(synth.cancelCount).toBeGreaterThan(cancels);
++    expect(getVoiceSnapshot("c1")).toMatchObject({ on: true, barged: true });
++  });
++
+   it("the menu opens from the caret with the Voice mode row on top", async () => {
+     renderButton();
+     const user = await openMenu();
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index be51237a5e5b4c12e88715d57ddaddc214ec8a16..6f2b3c04e85e5aa3f86dc6cbee800845d3074f25 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -48,6 +48,7 @@ import {
+ } from "@/lib/aeSpeakReplies";
+ import {
+   registerVoiceSpeaker,
++  setVoiceBarged,
+   setVoiceOn,
+   setVoiceSpeaking,
+   useVoiceSnapshot,
+@@ -60,7 +61,10 @@ const MAX_VOICES = 12;
+ 
+ const PHASE_WORD: Record<VoicePhase, string> = {
+   off: "",
++  starting: "Starting the mic",
+   listening: "Listening",
++  paused: "Mic stopped",
++  unavailable: "Mic unavailable",
+   thinking: "Working on it",
+   speaking: "Speaking, tap to stop",
+ };
+@@ -269,8 +273,11 @@ function SpeakRepliesControl({
+     // eslint-disable-next-line react-hooks/exhaustive-deps
+   }, [voiceMode.on]);
+   const tapSpeaker = () => {
+-    if (voiceMode.on && speaking) stop();
+-    else toggleVoice(!voiceMode.on);
++    if (voiceMode.on && speaking) {
++      // A barge-in: stop now and stay quiet for the rest of this turn.
++      setVoiceBarged(chatId, true);
++      stop();
++    } else toggleVoice(!voiceMode.on);
+   };
+ 
+   const toggleFast = (next: boolean) => {
+@@ -299,7 +306,9 @@ function SpeakRepliesControl({
+           aria-hidden
+           className={cn(
+             "mr-1 hidden text-xs sm:inline",
+-            voiceMode.phase === "thinking" ? "text-amber-500" : "text-teal-500",
++            voiceMode.phase === "thinking" || voiceMode.phase === "unavailable"
++              ? "text-amber-500"
++              : "text-teal-500",
+           )}
+         >
+           {phaseWord}
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index c2392a32213dc0211dd477ebf66333c6666e72ae..6de1224fe6532c446a70be31d45333fb1b7b956b 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -21,7 +21,7 @@ import { act, cleanup, fireEvent, render, screen } from "@testing-library/react"
+ import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
+ import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
+ import type { ServerInfo } from "@/lib/capabilities";
+-import type { DictationSessionEvents } from "@/lib/dictation";
++import { DictationBusyError as BusyError, type DictationSessionEvents } from "@/lib/dictation";
+ import { ComposerMicButton } from "./ComposerMicButton";
+ 
+ // Controllable DictationSession stand-in for the server-mode tests. The
+@@ -498,6 +498,66 @@ describe("ComposerMicButton (server dictation)", () => {
+     expect(showToastMock).toHaveBeenCalledWith(message);
+   });
+ 
++  it("a stop while the start is still connecting never leaves a listening stream", async () => {
++    let resolveStart!: (s: SessionStub) => void;
++    sessionStartMock = vi.fn((events: DictationSessionEvents) => {
++      sessionEvents = events;
++      return new Promise<SessionStub>((resolve) => {
++        resolveStart = resolve;
++      });
++    });
++    const controller = { current: null as AeMicController | null };
++    const onListeningChange = vi.fn();
++    renderServerMode({ controller, onListeningChange });
++    await act(async () => controller.current?.start());
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).toHaveBeenCalledTimes(1);
++    act(() => controller.current?.stop());
++    await act(async () => {
++      resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
++    });
++    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
++    expect(controller.current?.isListening()).toBe(false);
++    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
++      "aria-pressed",
++      "false",
++    );
++    expect(onListeningChange).not.toHaveBeenCalledWith(true);
++    // A later start works as normal.
++    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++      sessionEvents = events;
++      return { stop: sessionStopMock, cancel: sessionCancelMock };
++    });
++    await act(async () => controller.current?.start());
++    expect(controller.current?.isListening()).toBe(true);
++    expect(onListeningChange).toHaveBeenLastCalledWith(true);
++  });
++
++  it("tells Voice mode when a start fails, including the server's stream limit", async () => {
++    sessionStartMock = vi.fn(async () => {
++      throw new BusyError();
++    });
++    const controller = { current: null as AeMicController | null };
++    const onListeningChange = vi.fn();
++    renderServerMode({ controller, onListeningChange });
++    await act(async () => controller.current?.start());
++    expect(onListeningChange).toHaveBeenCalledWith(false);
++    expect(controller.current?.isListening()).toBe(false);
++    // The request flag is released: a second start is allowed.
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("tells Voice mode when the mic is stopped from the button", async () => {
++    const controller = { current: null as AeMicController | null };
++    const onListeningChange = vi.fn();
++    renderServerMode({ controller, onListeningChange });
++    await clickMic();
++    expect(onListeningChange).toHaveBeenLastCalledWith(true);
++    await clickMic();
++    expect(onListeningChange).toHaveBeenLastCalledWith(false);
++  });
++
+   it("a mid-take transport error resets state and surfaces the failure", async () => {
+     const onInterim = vi.fn();
+     renderServerMode({ onInterim });
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 70021b98ff7e52f777e42b41d7a69dd6d1ea7193..ff804810bb3e02266e74462a117297ae2d11e055 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -142,6 +142,11 @@ export const ComposerMicButton = ({
+   onTranscriptRef.current = onTranscript;
+   const onInterimRef = useRef(onInterim);
+   onInterimRef.current = onInterim;
++  // Voice mode: a start asked for but not yet listening, and a stop that arrived meanwhile.
++  const requestedRef = useRef(false);
++  const withdrawRef = useRef(false);
++  const onListeningChangeRef = useRef(onListeningChange);
++  onListeningChangeRef.current = onListeningChange;
+   // Synced refs so the mount-time listeners call the latest callbacks.
+   const onVoiceStartRef = useRef(onVoiceStart);
+   onVoiceStartRef.current = onVoiceStart;
+@@ -213,6 +218,8 @@ export const ComposerMicButton = ({
+     const handleError = (event: Event) => {
+       if (serverTakeOwnsState()) return;
+       transitionRef.current = false;
++      requestedRef.current = false;
++      onListeningChangeRef.current?.(false);
+       const err = (event as SpeechRecognitionErrorEventLike).error;
+       // "network" means the recognizer's cloud backend refused us —
+       // always the case in Electron/plain Chromium, occasionally a
+@@ -418,12 +425,22 @@ export const ComposerMicButton = ({
+           }
+           reportError("Voice input failed. Please try again.");
+           setIsListening(false);
++          requestedRef.current = false;
+         },
+       });
+-      sessionRef.current = next;
+-      setError(null);
+-      setIsListening(true);
++      if (withdrawRef.current) {
++        // Voice mode stopped the mic while it was still connecting: drop the stream at once.
++        withdrawRef.current = false;
++        next.cancel();
++        setIsListening(false);
++      } else {
++        sessionRef.current = next;
++        setError(null);
++        setIsListening(true);
++      }
+     } catch (startError) {
++      requestedRef.current = false;
++      onListeningChangeRef.current?.(false);
+       reportError(
+         startError instanceof DictationBusyError
+           ? "Voice input is busy. Please try again shortly."
+@@ -478,10 +495,25 @@ export const ComposerMicButton = ({
+     if (!controller) return;
+     controller.current = {
+       start: () => {
+-        if (!listeningRef.current) toggle();
++        if (listeningRef.current || requestedRef.current) return;
++        requestedRef.current = true;
++        withdrawRef.current = false;
++        toggle();
+       },
+       stop: () => {
+-        if (listeningRef.current) toggle();
++        if (listeningRef.current) {
++          requestedRef.current = false;
++          toggle();
++        } else if (requestedRef.current) {
++          // Still connecting: cancel the start, or drop the stream the moment it connects.
++          requestedRef.current = false;
++          withdrawRef.current = true;
++          try {
++            recognitionRef.current?.stop();
++          } catch {
++            // Not started yet; nothing to stop.
++          }
++        }
+       },
+       isListening: () => listeningRef.current,
+     };
+@@ -489,9 +521,13 @@ export const ComposerMicButton = ({
+       controller.current = null;
+     };
+   }, [controller, toggle]);
++  const prevListening = useRef(isListening);
+   useEffect(() => {
+-    onListeningChange?.(isListening);
+-  }, [isListening, onListeningChange]);
++    if (isListening) requestedRef.current = false;
++    if (prevListening.current === isListening) return;
++    prevListening.current = isListening;
++    onListeningChangeRef.current?.(isListening);
++  }, [isListening]);
+ 
+   // ⌘⌥V toggles dictation from anywhere — same as clicking the button. Enabled
+   // whenever dictation could run (Web Speech OR the server path) and the
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 8e742e9238ad01ad0511764957bdd3419b940a0e..018d1b89918805160c0f66f3d88c45c6237e6ced 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -1,6 +1,7 @@
+ import { act, renderHook } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { WORKING_CUE_DELAY_MS, WORKING_CUE_TEXT } from "@/lib/aeSpeakReplies";
++import { getVoiceSnapshot, resetVoiceStore, setVoiceBarged } from "@/lib/aeVoiceMode";
+ import { type AnyBlock, LIVE_ITEM_PREFIX } from "@/lib/blocks";
+ import { useChatStore } from "@/store/chatStore";
+ import { type FakeSynth, installFakeSpeech, removeFakeSpeech } from "@/test/fakeSpeech";
+@@ -454,3 +455,26 @@ describe("useAeSpeakReplies", () => {
+     expect(synth.cancelCount).toBeGreaterThan(cancels);
+   });
+ });
++
++describe("useAeSpeakReplies after a tap on the speaker", () => {
++  beforeEach(() => resetVoiceStore());
++
++  it("speaks nothing more of the reply, and speaks again after the next send", () => {
++    mount();
++    setStore({ blocks: [live("r1", "One. Two")] });
++    flush();
++    expect(synth.texts()).toEqual(["One."]);
++    act(() => setVoiceBarged("c1", true));
++    setStore({ blocks: [live("r1", "One. Two. Three. Fo")] });
++    flush();
++    setStore({ blocks: [final("r1", "item-1", "One. Two. Three. Four.")] });
++    flush();
++    expect(synth.texts()).toEqual(["One."]);
++    setStore(send(1));
++    flush();
++    expect(getVoiceSnapshot("c1").barged).toBe(false);
++    setStore({ blocks: [live("r2", "Next one. More")] });
++    flush();
++    expect(synth.texts()).toEqual(["One.", "Next one."]);
++  });
++});
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 0501d6c3882cb7c656d278737c1882f3f074cbe5..68bfee4897555b9d9cc21417c62fd563ae0406a0 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -18,6 +18,7 @@ import {
+   splitSentences,
+   stripTldr,
+ } from "@/lib/aeSpeechText";
++import { getVoiceSnapshot, setVoiceBarged } from "@/lib/aeVoiceMode";
+ import { type AnyBlock, LIVE_ITEM_PREFIX } from "@/lib/blocks";
+ import { useChatStore } from "@/store/chatStore";
+ 
+@@ -198,6 +199,8 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+         fresh.push(sentence);
+       }
+       if (fresh.length === 0) return;
++      // A tap on the speaker silenced this turn: the sentences count as read, none is spoken.
++      if (getVoiceSnapshot(chatId).barged) return;
+       spokenThisTurn = true;
+       clearCue();
+       say(fresh.join(" "), lockFor(responseId), optsRef.current.rate);
+@@ -258,6 +261,7 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+       prevPending = pending;
+       prevUserBlocks = scan.userBlocks;
+       if (sent) {
++        setVoiceBarged(chatId, false);
+         speaker.stop();
+         snapshot(state.blocks, false);
+         spokenThisTurn = false;
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 933873cec8b077da44ae2f4e0a071806a687d456..1c4bba528ba4cecc779304c78c861dd3d99050dc 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -6,6 +6,7 @@ import {
+   registerVoiceSpeaker,
+   RESUME_MS,
+   resetVoiceStore,
++  setVoiceBarged,
+   setVoiceOn,
+   setVoiceSpeaking,
+   getVoiceSnapshot,
+@@ -38,10 +39,12 @@ const CARD = {
+ 
+ let synth: FakeSynth;
+ let listening = false;
++// False leaves a start "connecting": isListening stays false until the test says otherwise.
++let autoConnect = true;
+ const controller = {
+   current: {
+     start: vi.fn(() => {
+-      listening = true;
++      if (autoConnect) listening = true;
+     }),
+     stop: vi.fn(() => {
+       listening = false;
+@@ -52,12 +55,26 @@ const controller = {
+ const submit = vi.fn();
+ const submitApproval = vi.fn(() => Promise.resolve());
+ 
+-function mount(initial: { value?: string; status?: string } = {}) {
+-  return renderHook(
+-    (props: { value: string; status: string }) =>
+-      useAeVoiceMode({ chatId: "c1", controller, submit, ...props }),
+-    { initialProps: { value: initial.value ?? "", status: initial.status ?? "idle" } },
+-  );
++interface MountProps {
++  chatId: string;
++  value: string;
++  status: string;
++  canSend: boolean;
++  labels?: Record<string, string> | null;
++  submit: () => void;
++}
++
++function mount(initial: Partial<MountProps> = {}) {
++  return renderHook((props: MountProps) => useAeVoiceMode({ controller, ...props }), {
++    initialProps: {
++      chatId: "c1",
++      value: "",
++      status: "idle",
++      canSend: true,
++      submit,
++      ...initial,
++    } as MountProps,
++  });
+ }
+ 
+ beforeEach(() => {
+@@ -65,6 +82,7 @@ beforeEach(() => {
+   window.localStorage.clear();
+   resetVoiceStore();
+   listening = false;
++  autoConnect = true;
+   controller.current.start.mockClear();
+   controller.current.stop.mockClear();
+   submit.mockClear();
+@@ -141,10 +159,10 @@ describe("useAeVoiceMode", () => {
+ 
+   it("keeps the mic off while the reply streams", () => {
+     const { rerender } = mount({ value: "hi", status: "idle" });
+-    rerender({ value: "", status: "streaming" });
++    rerender({ chatId: "c1", value: "", status: "streaming", canSend: true, submit });
+     expect(controller.current.stop).toHaveBeenCalled();
+     controller.current.start.mockClear();
+-    rerender({ value: "", status: "idle" });
++    rerender({ chatId: "c1", value: "", status: "idle", canSend: true, submit });
+     act(() => void vi.advanceTimersByTime(RESUME_MS));
+     expect(controller.current.start).toHaveBeenCalledTimes(1);
+   });
+@@ -218,4 +236,222 @@ describe("useAeVoiceMode", () => {
+     act(() => void vi.advanceTimersByTime(2000));
+     expect(submit).not.toHaveBeenCalled();
+   });
++
++  it("a chat switch inside the grace window sends nothing for either chat", () => {
++    setVoiceOn("c2", true);
++    const submitB = vi.fn();
++    const { result, rerender } = mount({ value: "hello from A" });
++    act(() => void result.current.onFinal("hello from A"));
++    act(() => void vi.advanceTimersByTime(300));
++    rerender({ chatId: "c2", value: "draft in B", status: "idle", canSend: true, submit: submitB });
++    act(() => void vi.advanceTimersByTime(2000));
++    expect(submit).not.toHaveBeenCalled();
++    expect(submitB).not.toHaveBeenCalled();
++  });
++
++  it("withdraws a start that is still connecting when the mic is no longer wanted", () => {
++    autoConnect = false;
++    const { result } = mount();
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++    expect(listening).toBe(false);
++    controller.current.stop.mockClear();
++    act(() => setVoiceSpeaking("c1", true));
++    expect(controller.current.stop).toHaveBeenCalled();
++    act(() => void result.current.onListening(false));
++    expect(getVoiceSnapshot("c1").phase).toBe("speaking");
++  });
++
++  it("retries a failed start once, then says the mic is unavailable, never Listening", () => {
++    autoConnect = false;
++    const { result } = mount();
++    expect(getVoiceSnapshot("c1").phase).toBe("starting");
++    act(() => void result.current.onListening(false));
++    expect(getVoiceSnapshot("c1").phase).not.toBe("listening");
++    act(() => void vi.advanceTimersByTime(999));
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++    act(() => void vi.advanceTimersByTime(1));
++    expect(controller.current.start).toHaveBeenCalledTimes(2);
++    act(() => void result.current.onListening(false));
++    expect(getVoiceSnapshot("c1").phase).toBe("unavailable");
++    expect(getVoiceSnapshot("c1").on).toBe(true);
++    act(() => void result.current.onListening(true));
++    expect(getVoiceSnapshot("c1").phase).toBe("listening");
++  });
++
++  it("shows Listening only once the mic reports it, and Mic stopped after a hand stop", () => {
++    const { result } = mount();
++    expect(getVoiceSnapshot("c1").phase).toBe("starting");
++    act(() => void result.current.onListening(true));
++    expect(getVoiceSnapshot("c1").phase).toBe("listening");
++    act(() => {
++      listening = false;
++      result.current.onListening(false);
++    });
++    expect(getVoiceSnapshot("c1").phase).toBe("paused");
++  });
++
++  it("keeps finals and partials out of the draft while speaking, and sends nothing", () => {
++    const { result } = mount({ value: "hello" });
++    act(() => setVoiceSpeaking("c1", true));
++    let final = false;
++    let partial = false;
++    act(() => {
++      final = result.current.onFinal("and the spoken reply words");
++      partial = result.current.onPartial("and the");
++    });
++    expect(final).toBe(true);
++    expect(partial).toBe(true);
++    act(() => void vi.advanceTimersByTime(3000));
++    expect(submit).not.toHaveBeenCalled();
++  });
++
++  it("a final in the resume window is still kept out of the draft", () => {
++    const { result, rerender } = mount({ status: "streaming" });
++    rerender({ chatId: "c1", value: "", status: "idle", canSend: true, submit });
++    act(() => void vi.advanceTimersByTime(RESUME_MS - 50));
++    let used = false;
++    act(() => {
++      used = result.current.onFinal("late words");
++    });
++    expect(used).toBe(true);
++  });
++
++  it("stays muted through a slow start of the turn, then resumes after it ends", () => {
++    const { result, rerender } = mount({ value: "hello" });
++    act(() => void result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS));
++    expect(submit).toHaveBeenCalledTimes(1);
++    // The message is queued; streaming begins only at 8 s.
++    act(() => useChatStore.setState({ pendingUserMessages: [{ tempId: "t1" }] } as never));
++    controller.current.start.mockClear();
++    act(() => void vi.advanceTimersByTime(5300));
++    expect(controller.current.start).not.toHaveBeenCalled();
++    act(() => void vi.advanceTimersByTime(2700));
++    rerender({ chatId: "c1", value: "", status: "streaming", canSend: true, submit });
++    act(() => useChatStore.setState({ pendingUserMessages: [] } as never));
++    act(() => void vi.advanceTimersByTime(20_000));
++    expect(controller.current.start).not.toHaveBeenCalled();
++    rerender({ chatId: "c1", value: "", status: "idle", canSend: true, submit });
++    act(() => void vi.advanceTimersByTime(RESUME_MS));
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++  });
++
++  it("a send the composer would refuse does not mute the mic", () => {
++    const { result } = mount({ value: "hello", canSend: false });
++    controller.current.stop.mockClear();
++    act(() => void result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS + 10));
++    expect(submit).not.toHaveBeenCalled();
++    expect(controller.current.stop).not.toHaveBeenCalled();
++    expect(getVoiceSnapshot("c1").phase).not.toBe("thinking");
++  });
++
++  it("lets go by itself if the send never showed a turn", () => {
++    const { result } = mount({ value: "/clear" });
++    act(() => void result.current.onFinal("clear"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS));
++    expect(submit).toHaveBeenCalledTimes(1);
++    expect(getVoiceSnapshot("c1").phase).toBe("thinking");
++    controller.current.start.mockClear();
++    act(() => void vi.advanceTimersByTime(5000));
++    act(() => void vi.advanceTimersByTime(RESUME_MS));
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++  });
++
++  it("after a tap on the speaker the mic returns while the reply still streams", () => {
++    mount({ status: "streaming" });
++    expect(controller.current.stop).toHaveBeenCalled();
++    controller.current.start.mockClear();
++    act(() => setVoiceBarged("c1", true));
++    act(() => void vi.advanceTimersByTime(RESUME_MS));
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++  });
++
++  it("never sends a custom answer on a card that says isOther is false", () => {
++    const closed = {
++      ...CARD,
++      askUserQuestion: {
++        questions: [{ ...CARD.askUserQuestion.questions[0], isOther: false }],
++      },
++    };
++    useChatStore.setState({ blocks: [closed] } as never);
++    const { result } = mount();
++    act(() => void result.current.onFinal("ask me tomorrow"));
++    act(() => void vi.advanceTimersByTime(10_000));
++    expect(submitApproval).not.toHaveBeenCalled();
++    act(() => void result.current.onFinal("hold it"));
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
++      "How should it deploy?": "Hold it",
++    });
++  });
++
++  it("a card answered by a click leaves the pending custom answer inert", () => {
++    useChatStore.setState({ blocks: [CARD] } as never);
++    const { result } = mount();
++    act(() => void result.current.onFinal("ask me tomorrow"));
++    act(() => useChatStore.setState({ blocks: [] } as never));
++    act(() => void vi.advanceTimersByTime(5000));
++    expect(submitApproval).not.toHaveBeenCalled();
++  });
++
++  it.each(["ok done", "all done", "I'm done"])(
++    "submits exactly the picks when a multi-select card ends with %s",
++    (ending) => {
++      const multi = {
++        ...CARD,
++        askUserQuestion: {
++          questions: [{ ...CARD.askUserQuestion.questions[0], multiSelect: true }],
++        },
++      };
++      useChatStore.setState({ blocks: [multi] } as never);
++      const { result } = mount();
++      act(() => void result.current.onFinal("one"));
++      act(() => void result.current.onFinal("three"));
++      act(() => void result.current.onFinal(ending));
++      expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
++        "How should it deploy?": ["Force it", "Hold it"],
++      });
++    },
++  );
++
++  it("reads and answers a two-question card in sequence", () => {
++    const speaker = createSpeaker();
++    registerVoiceSpeaker("c1", (t) => speaker.speak(t, { voiceURI: null, rate: 1 }));
++    const second = {
++      question: "Which branch?",
++      multiSelect: false,
++      options: [{ label: "Main" }, { label: "Dev" }],
++    };
++    const two = {
++      ...CARD,
++      askUserQuestion: { questions: [CARD.askUserQuestion.questions[0], second] },
++    };
++    useChatStore.setState({ blocks: [two] } as never);
++    const { result } = mount();
++    act(() => void vi.advanceTimersByTime(50));
++    act(() => void result.current.onFinal("one"));
++    expect(submitApproval).not.toHaveBeenCalled();
++    act(() => void vi.advanceTimersByTime(50));
++    expect(synth.texts().at(-1)).toBe("Question. Which branch? One, Main. Two, Dev.");
++    act(() => void result.current.onFinal("dev"));
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
++      "How should it deploy?": "Force it",
++      "Which branch?": "Dev",
++    });
++  });
++
++  it("posts the switch when the session's label disagrees with it", () => {
++    setVoiceOn("c1", false);
++    vi.mocked(fetch).mockClear();
++    mount({ labels: { "ae.voice": "on" } });
++    const calls = vi.mocked(fetch).mock.calls;
++    expect(calls).toHaveLength(1);
++    expect(JSON.parse(String((calls[0][1] as RequestInit).body))).toEqual({ on: false });
++  });
++
++  it("leaves the label alone when it agrees", () => {
++    vi.mocked(fetch).mockClear();
++    mount({ labels: { "ae.voice": "on" } });
++    expect(fetch).not.toHaveBeenCalled();
++  });
+ });
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 2aa602ad7dc0874e8ccf958f65d8eeed66e097c9..db22f6bc634e8f80c076c4f3f8dbf5fe7336f572 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -5,6 +5,7 @@
+ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
+ import {
+   type AeMicController,
++  customAllowed,
+   GRACE_MS,
+   isPendingElicitation,
+   matchSpokenOption,
+@@ -15,13 +16,17 @@ import {
+   RESUME_MS,
+   setVoicePhase,
+   splitDone,
+-  type VoicePhase,
++  syncVoiceLabel,
+   useVoiceSnapshot,
++  type VoicePhase,
+ } from "@/lib/aeVoiceMode";
+ import { useChatStore } from "@/store/chatStore";
+ 
+-/** If the chat never starts streaming after a send, stop waiting for it. */
++/** If the chat never shows a turn after a send, stop waiting for it. */
+ const SEND_WAIT_MS = 5000;
++/** One retry of a mic start that failed. */
++const MIC_RETRY_MS = 1000;
++const LABEL_KEY = "ae.voice";
+ 
+ export interface UseAeVoiceModeArgs {
+   chatId: string | null;
+@@ -31,15 +36,23 @@ export interface UseAeVoiceModeArgs {
+   value: string;
+   /** Sends the draft exactly as the Send button does. */
+   submit: () => void;
++  /** False while the composer would refuse a send (locked, disabled, a card pending). */
++  canSend: boolean;
++  /** The session's labels once loaded; the server's `ae.voice` is compared with the switch. */
++  labels?: Record<string, string> | null;
+ }
+ 
+ export interface AeVoiceMode {
+   on: boolean;
+   phase: VoicePhase;
++  /** A question card Voice mode is answering; the mic stays live for it. */
++  cardActive: boolean;
+   /** A final sentence arrived; true when Voice mode used it (the draft should not take it). */
+   onFinal: (text: string) => boolean;
+-  /** A partial arrived; true when Voice mode is answering a card and the draft should not take it. */
++  /** A partial arrived; true when Voice mode used it (the draft should not take it). */
+   onPartial: (text: string) => boolean;
++  /** The mic reports it started or stopped listening (or failed to start). */
++  onListening: (listening: boolean) => void;
+ }
+ 
+ interface CardState {
+@@ -56,34 +69,61 @@ export function useAeVoiceMode({
+   status,
+   value,
+   submit,
++  canSend,
++  labels,
+ }: UseAeVoiceModeArgs): AeVoiceMode {
+   const voice = useVoiceSnapshot(chatId);
+-  const { on, speaking } = voice;
++  const { on, speaking, barged } = voice;
+   const block = useChatStore((s) =>
+     s.blocks.find((b) => isPendingElicitation(b, s.conversationId)),
+   );
++  const sessionRunning = useChatStore((s) => s.sessionStatus === "running");
++  const queued = useChatStore((s) => s.pendingUserMessages.length > 0);
+   const questions = on ? questionsOf(block?.type === "elicitation" ? block : undefined) : null;
+   const cardActive = questions !== null;
+ 
+   const [awaiting, setAwaiting] = useState(false);
+   const [ready, setReady] = useState(true);
+-  const sawStreaming = useRef(false);
++  const [micListening, setMicListening] = useState(false);
++  const [micFailed, setMicFailed] = useState(false);
++  const [micStopped, setMicStopped] = useState(false);
+   const sendTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const graceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const card = useRef<CardState | null>(null);
++  // The mic's own report of a start in flight, our stop, and failures so far this cycle.
++  const startPending = useRef(false);
++  const stopAsked = useRef(false);
++  const failures = useRef(0);
+ 
+-  const waiting = !cardActive && (awaiting || status === "streaming");
++  // A turn is under way once the chat streams, the session runs, or the message is queued.
++  const busy = status === "streaming" || sessionRunning || queued;
++  const waiting = !cardActive && !barged && (awaiting || busy);
+   const muted = on && (speaking || waiting);
+-  const wantListen = on && !muted && ready;
++  const quiet = muted || !ready;
++  const wantListen = on && !quiet;
+ 
+-  const latest = useRef({ value, submit, muted, questions, speak: voice.speak, block });
++  const latest = useRef({
++    value,
++    submit,
++    canSend,
++    muted,
++    quiet,
++    wantListen,
++    micListening,
++    questions,
++    speak: voice.speak,
++  });
+   latest.current = {
+     value,
+     submit,
++    canSend,
+     muted,
++    quiet,
++    wantListen,
++    micListening,
+     questions,
+     speak: voice.speak,
+-    block: block?.type === "elicitation" ? block : undefined,
+   };
+   const readyRef = useRef(ready);
+   readyRef.current = ready;
+@@ -93,23 +133,44 @@ export function useAeVoiceMode({
+     graceTimer.current = null;
+   }, []);
+ 
+-  // A send is in flight until the chat has streamed and gone idle again.
+-  useEffect(() => {
+-    if (!awaiting) return;
+-    if (status === "streaming") sawStreaming.current = true;
+-    else if (sawStreaming.current) {
+-      setAwaiting(false);
+-      sawStreaming.current = false;
+-    }
+-  }, [awaiting, status]);
++  // Another chat: nothing started for the old one may fire for the new one.
+   useEffect(
+     () => () => {
+-      if (sendTimer.current !== null) clearTimeout(sendTimer.current);
+       clearGrace();
++      if (sendTimer.current !== null) clearTimeout(sendTimer.current);
++      if (retryTimer.current !== null) clearTimeout(retryTimer.current);
++      sendTimer.current = null;
++      retryTimer.current = null;
++      card.current = null;
++      startPending.current = false;
++      stopAsked.current = false;
++      failures.current = 0;
++      setAwaiting(false);
++      setMicFailed(false);
++      setMicStopped(false);
+     },
+-    [clearGrace],
++    [chatId, clearGrace],
+   );
+ 
++  // Make the server's label agree with this browser's switch, once per chat.
++  const labelValue = labels ? labels[LABEL_KEY] : undefined;
++  const labelKnown = labels !== undefined && labels !== null;
++  useEffect(() => {
++    if (chatId && labelKnown) syncVoiceLabel(chatId, labelValue === "on");
++    // Once per chat: later label refreshes follow the switch, they do not lead it.
++    // eslint-disable-next-line react-hooks/exhaustive-deps
++  }, [chatId, labelKnown]);
++
++  // A send hands over to the chat's own status the moment a turn shows; it lets go by
++  // itself only when no turn ever showed (the send did not happen).
++  useEffect(() => {
++    if (awaiting && busy) {
++      setAwaiting(false);
++      if (sendTimer.current !== null) clearTimeout(sendTimer.current);
++      sendTimer.current = null;
++    }
++  }, [awaiting, busy]);
++
+   // The mic comes back RESUME_MS after the chat goes quiet.
+   useEffect(() => {
+     if (muted) {
+@@ -121,21 +182,82 @@ export function useAeVoiceMode({
+     return () => clearTimeout(t);
+   }, [muted]);
+ 
++  const startMic = useCallback(() => {
++    const mic = controller.current;
++    if (!mic || mic.isListening()) return;
++    startPending.current = true;
++    stopAsked.current = false;
++    mic.start();
++  }, [controller]);
++
+   const wasOn = useRef(on);
+   useEffect(() => {
+     const mic = controller.current;
+     if (!on) {
+       clearGrace();
+       // Turning the switch off hands the mic back, quiet.
+-      if (wasOn.current && mic?.isListening()) mic.stop();
++      if (wasOn.current && mic) {
++        stopAsked.current = mic.isListening() || startPending.current;
++        startPending.current = false;
++        mic.stop();
++      }
+       wasOn.current = false;
++      failures.current = 0;
++      setMicFailed(false);
++      setMicStopped(false);
+       return;
+     }
+     wasOn.current = true;
+     if (!mic) return;
+-    if (wantListen && !mic.isListening()) mic.start();
+-    else if (!wantListen && mic.isListening()) mic.stop();
+-  }, [on, wantListen, controller, clearGrace]);
++    if (wantListen) {
++      // A new listening cycle: an earlier failure or hand-stop is forgotten.
++      setMicStopped(false);
++      if (!mic.isListening() && !startPending.current) {
++        failures.current = 0;
++        setMicFailed(false);
++        startMic();
++      }
++    } else {
++      stopAsked.current = mic.isListening() || startPending.current;
++      startPending.current = false;
++      if (retryTimer.current !== null) clearTimeout(retryTimer.current);
++      retryTimer.current = null;
++      // A start still connecting is withdrawn too, not only a live stream.
++      mic.stop();
++    }
++  }, [on, wantListen, chatId, controller, clearGrace, startMic]);
++
++  const onListening = useCallback(
++    (listening: boolean) => {
++      if (listening) {
++        startPending.current = false;
++        failures.current = 0;
++        setMicFailed(false);
++        setMicStopped(false);
++        setMicListening(true);
++        return;
++      }
++      setMicListening(false);
++      if (startPending.current) {
++        // The start never reached listening: try once more, then say so.
++        startPending.current = false;
++        failures.current += 1;
++        if (failures.current === 1) {
++          retryTimer.current = setTimeout(() => {
++            retryTimer.current = null;
++            if (latest.current.wantListen && !latest.current.micListening) startMic();
++          }, MIC_RETRY_MS);
++        } else {
++          setMicFailed(true);
++        }
++      } else if (!stopAsked.current && latest.current.wantListen) {
++        // Stopped from outside (the mic button, the hotkey): leave it stopped.
++        setMicStopped(true);
++      }
++      stopAsked.current = false;
++    },
++    [startMic],
++  );
+ 
+   useEffect(() => {
+     if (!chatId) return;
+@@ -145,18 +267,26 @@ export function useAeVoiceMode({
+         ? "speaking"
+         : waiting
+           ? "thinking"
+-          : "listening";
++          : micListening
++            ? "listening"
++            : micFailed
++              ? "unavailable"
++              : micStopped
++                ? "paused"
++                : "starting";
+     setVoicePhase(chatId, phase);
+-  }, [chatId, on, speaking, waiting]);
++  }, [chatId, on, speaking, waiting, micListening, micFailed, micStopped]);
+ 
+   const send = useCallback(() => {
++    const now = latest.current;
++    if (!now.canSend) return;
+     setAwaiting(true);
+-    sawStreaming.current = false;
+     if (sendTimer.current !== null) clearTimeout(sendTimer.current);
+     sendTimer.current = setTimeout(() => {
+-      if (!sawStreaming.current) setAwaiting(false);
++      sendTimer.current = null;
++      setAwaiting(false);
+     }, SEND_WAIT_MS);
+-    latest.current.submit();
++    now.submit();
+   }, []);
+ 
+   // A new question card: read it aloud, one question at a time.
+@@ -203,24 +333,35 @@ export function useAeVoiceMode({
+       const qs = latest.current.questions;
+       const q = qs?.[state.index];
+       if (!q) return;
+-      const labels = q.options.map((o) => o.label);
++      const names = q.options.map((o) => o.label);
++      const mayCustom = customAllowed(q);
+       if (q.multiSelect) {
++        // An option literally called "Done" is a pick, not the end of picking.
++        const whole = matchSpokenOption(text, names);
++        if (whole !== null && splitDone(names[whole]).done) {
++          if (!state.picked.includes(names[whole])) state.picked.push(names[whole]);
++          return;
++        }
+         const { done, rest } = splitDone(text);
+-        const hits = matchSpokenOptions(rest, labels).map((i) => labels[i]);
+-        if (hits.length === 0 && rest.trim() !== "")
++        const hits = matchSpokenOptions(rest, names).map((i) => names[i]);
++        if (hits.length === 0 && rest.trim() !== "" && mayCustom) {
+           state.custom = `${state.custom} ${rest}`.trim();
++        }
+         for (const h of hits) if (!state.picked.includes(h)) state.picked.push(h);
+         if (done && (state.picked.length > 0 || state.custom !== "")) {
+           answerCard(state, state.custom ? [...state.picked, state.custom] : [...state.picked]);
+         }
+         return;
+       }
+-      const index = matchSpokenOption(text, labels);
++      const index = matchSpokenOption(text, names);
+       if (index !== null) {
+         state.custom = "";
+-        answerCard(state, labels[index]);
++        clearGrace();
++        answerCard(state, names[index]);
+         return;
+       }
++      // A card that takes no words of the person's own keeps listening for an option.
++      if (!mayCustom) return;
+       // No option matched: after the grace the words go in as the card's own answer.
+       state.custom = `${state.custom} ${text}`.trim();
+       clearGrace();
+@@ -235,17 +376,22 @@ export function useAeVoiceMode({
+   const onFinal = useCallback(
+     (text: string): boolean => {
+       if (!on) return false;
++      const now = latest.current;
+       const state = card.current;
+-      if (state && latest.current.questions) {
+-        if (!latest.current.muted) onCardFinal(state, text);
++      if (state && now.questions) {
++        if (!now.quiet) onCardFinal(state, text);
++        return true;
++      }
++      // Sound heard while the chat is busy or the voice is talking never reaches the draft.
++      if (now.quiet) {
++        clearGrace();
+         return true;
+       }
+-      if (latest.current.muted) return false;
+       clearGrace();
+       graceTimer.current = setTimeout(() => {
+         graceTimer.current = null;
+-        const now = latest.current;
+-        if (now.muted || now.value.trim() === "") return;
++        const current = latest.current;
++        if (current.quiet || current.value.trim() === "") return;
+         send();
+       }, GRACE_MS);
+       return false;
+@@ -256,10 +402,11 @@ export function useAeVoiceMode({
+   const onPartial = useCallback(
+     (_text: string): boolean => {
+       clearGrace();
+-      return on && card.current !== null && latest.current.questions !== null;
++      if (!on) return false;
++      return latest.current.quiet || (card.current !== null && latest.current.questions !== null);
+     },
+     [on, clearGrace],
+   );
+ 
+-  return { on, phase: voice.phase, onFinal, onPartial };
++  return { on, phase: voice.phase, cardActive, onFinal, onPartial, onListening };
+ }
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 4395d10ed506a6789879a8426c50864a97a6fd13..f85c7b768a2968d29eba646781293b59968eb268 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -238,7 +238,7 @@ export const AE_SETTING_HINTS = {
+   "voice.mode": {
+     label: "Voice mode",
+     hint: "Hands-free: the mic listens, a pause sends, replies are spoken, a tap stops a reply. Off by default; per chat.",
+-    source: "existing",
++    source: "tooltip",
+   },
+   "voice.speak": {
+     label: "Speak replies",
+diff --git a/web/src/lib/aeVoiceMode.test.ts b/web/src/lib/aeVoiceMode.test.ts
+index ff5bbb9e0c6997d7776a5b1af1d57e1709b28518..d18591e41d0f422dceb3cc7f7dc3e96f21c46409 100644
+--- a/web/src/lib/aeVoiceMode.test.ts
++++ b/web/src/lib/aeVoiceMode.test.ts
+@@ -1,13 +1,16 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
++  customAllowed,
+   getVoiceSnapshot,
+   isDoneWord,
+   matchSpokenOption,
+   matchSpokenOptions,
+   questionSpeech,
+   readVoiceMode,
++  POST_RETRY_MS,
+   resetVoiceStore,
+   setVoiceOn,
++  syncVoiceLabel,
+   splitDone,
+ } from "./aeVoiceMode";
+ 
+@@ -38,6 +41,22 @@ describe("matchSpokenOption", () => {
+     expect(matchSpokenOption("force it", LABELS)).toBe(0);
+   });
+ 
++  it("takes a number only from a short answer made of number words", () => {
++    expect(matchSpokenOption("no one has access yet", LABELS)).toBeNull();
++    expect(matchSpokenOption("first check the logs", LABELS)).toBeNull();
++    expect(matchSpokenOption("none", LABELS)).toBeNull();
++    expect(matchSpokenOption("one", LABELS)).toBe(0);
++    expect(matchSpokenOption("I'll take the second one please", LABELS)).toBe(1);
++  });
++
++  it("does not pick a label that was said after a negation", () => {
++    expect(matchSpokenOption("don't merge yet", ["Merge", "Hold"])).toBeNull();
++    expect(matchSpokenOption("not now", ["Now", "Later"])).toBeNull();
++    expect(matchSpokenOption("never hold it", ["Hold it", "Go"])).toBeNull();
++    expect(matchSpokenOption("no", ["Yes", "No"])).toBe(1);
++    expect(matchSpokenOption("merge it", ["Merge", "Hold"])).toBe(0);
++  });
++
+   it("returns null for no match, an unclear one or a number out of range", () => {
+     expect(matchSpokenOption("what about next week", LABELS)).toBeNull();
+     expect(matchSpokenOption("do it", LABELS)).toBeNull();
+@@ -60,6 +79,17 @@ describe("matchSpokenOptions and done", () => {
+     expect(splitDone("one and three done")).toEqual({ done: true, rest: "one and three" });
+     expect(splitDone("two")).toEqual({ done: false, rest: "two" });
+   });
++
++  it.each(["ok done", "all done", "I'm done", "okay, that's all", "right, that's it"])(
++    "leaves no words behind %s",
++    (said) => {
++      expect(splitDone(said)).toEqual({ done: true, rest: "" });
++    },
++  );
++
++  it("keeps the picks that come before the closing words", () => {
++    expect(splitDone("one and three, ok I'm done")).toEqual({ done: true, rest: "one and three" });
++  });
+ });
+ 
+ describe("questionSpeech", () => {
+@@ -84,7 +114,7 @@ describe("the per-chat switch", () => {
+   it("is off by default, remembered per chat, and tells the server", () => {
+     expect(getVoiceSnapshot("c1").on).toBe(false);
+     setVoiceOn("c1", true);
+-    expect(getVoiceSnapshot("c1")).toMatchObject({ on: true, phase: "listening" });
++    expect(getVoiceSnapshot("c1")).toMatchObject({ on: true, phase: "starting" });
+     expect(readVoiceMode("c1")).toBe(true);
+     expect(readVoiceMode("c2")).toBe(false);
+     const call = vi.mocked(fetch).mock.calls[0];
+@@ -95,3 +125,61 @@ describe("the per-chat switch", () => {
+     expect(getVoiceSnapshot("c1").phase).toBe("off");
+   });
+ });
++
++describe("custom answers", () => {
++  it("are allowed unless the question says isOther is false", () => {
++    expect(customAllowed({})).toBe(true);
++    expect(customAllowed({ isOther: true })).toBe(true);
++    expect(customAllowed({ isOther: false })).toBe(false);
++  });
++});
++
++describe("keeping the server label in step", () => {
++  beforeEach(() => {
++    vi.useFakeTimers();
++    window.localStorage.clear();
++    resetVoiceStore();
++  });
++  afterEach(() => {
++    vi.useRealTimers();
++    vi.unstubAllGlobals();
++  });
++
++  it("posts the local switch when the label disagrees, and does nothing when it agrees", async () => {
++    const fetchMock = vi.fn(() => Promise.resolve(new Response("{}", { status: 200 })));
++    vi.stubGlobal("fetch", fetchMock);
++    syncVoiceLabel("c1", true);
++    await vi.advanceTimersByTimeAsync(0);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    const init = (fetchMock.mock.calls[0] as unknown as [string, RequestInit])[1];
++    expect(JSON.parse(String(init.body))).toEqual({ on: false });
++    fetchMock.mockClear();
++    syncVoiceLabel("c1", false);
++    await vi.advanceTimersByTimeAsync(0);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++
++  it("retries a failed write once after two seconds", async () => {
++    const fetchMock = vi
++      .fn()
++      .mockRejectedValueOnce(new Error("offline"))
++      .mockResolvedValue(new Response("{}", { status: 200 }));
++    vi.stubGlobal("fetch", fetchMock);
++    setVoiceOn("c1", true);
++    await vi.advanceTimersByTimeAsync(0);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    await vi.advanceTimersByTimeAsync(POST_RETRY_MS);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    await vi.advanceTimersByTimeAsync(10_000);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++
++  it("gives up after the one retry", async () => {
++    const fetchMock = vi.fn(() => Promise.resolve(new Response("no", { status: 500 })));
++    vi.stubGlobal("fetch", fetchMock);
++    setVoiceOn("c1", true);
++    await vi.advanceTimersByTimeAsync(POST_RETRY_MS + 10);
++    await vi.advanceTimersByTimeAsync(10_000);
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++  });
++});
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index 188c1169258dafbe7e546598810b6adf5b0980fd..971cffe606fea9f8cce7c85a2655651824a35ef9 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -17,7 +17,8 @@ export const GRACE_MS = 600;
+ /** Gap after the last spoken sentence before the mic comes back. */
+ export const RESUME_MS = 300;
+ 
+-export type VoicePhase = "off" | "listening" | "thinking" | "speaking";
++export type VoicePhase =
++  "off" | "starting" | "listening" | "paused" | "unavailable" | "thinking" | "speaking";
+ 
+ /** What the composer mic exposes so Voice mode can start and stop it. */
+ export interface AeMicController {
+@@ -33,6 +34,8 @@ export interface VoiceSnapshot {
+   speaking: boolean;
+   /** Speaks one line through the chat's voice (registered by the speaker button). */
+   speak: ((text: string) => void) | null;
++  /** The person tapped to stop a reply: nothing more is spoken until the next send. */
++  barged: boolean;
+ }
+ 
+ const KEY = "omnigent:ae-voice-mode:";
+@@ -66,14 +69,14 @@ export function writeVoiceMode(chatId: string, on: boolean): void {
+ 
+ const states = new Map<string, VoiceSnapshot>();
+ const listeners = new Set<() => void>();
+-const OFF: VoiceSnapshot = { on: false, phase: "off", speaking: false, speak: null };
++const OFF: VoiceSnapshot = { on: false, phase: "off", speaking: false, speak: null, barged: false };
+ 
+ export function getVoiceSnapshot(chatId: string | null): VoiceSnapshot {
+   if (chatId === null) return OFF;
+   let state = states.get(chatId);
+   if (!state) {
+     const on = readVoiceMode(chatId);
+-    state = { ...OFF, on, phase: on ? "listening" : "off" };
++    state = { ...OFF, on, phase: on ? "starting" : "off" };
+     states.set(chatId, state);
+   }
+   return state;
+@@ -106,22 +109,44 @@ export function resetVoiceStore(): void {
+   listeners.forEach((cb) => cb());
+ }
+ 
+-/** Tell the server, which adds the spoken-style line to each message while it is on. */
+-export async function postVoiceLabel(chatId: string, on: boolean): Promise<void> {
++/** Wait before the one retry of a label write that failed. */
++export const POST_RETRY_MS = 2000;
++
++async function postOnce(chatId: string, on: boolean): Promise<boolean> {
+   try {
+-    await authenticatedFetch(withBasePath(`/v1/ae/sessions/${encodeURIComponent(chatId)}/voice`), {
+-      method: "POST",
+-      headers: { "content-type": "application/json" },
+-      body: JSON.stringify({ on }),
+-    });
++    const response = await authenticatedFetch(
++      withBasePath(`/v1/ae/sessions/${encodeURIComponent(chatId)}/voice`),
++      {
++        method: "POST",
++        headers: { "content-type": "application/json" },
++        body: JSON.stringify({ on }),
++      },
++    );
++    return response.ok;
+   } catch {
+-    // The switch still works without the style line.
++    return false;
+   }
+ }
+ 
++/** Tell the server, which adds the spoken-style line to each message while it is on. */
++export async function postVoiceLabel(chatId: string, on: boolean): Promise<void> {
++  if (await postOnce(chatId, on)) return;
++  await new Promise<void>((resolve) => {
++    setTimeout(resolve, POST_RETRY_MS);
++  });
++  // The switch may have moved on while waiting: write what it says now.
++  await postOnce(chatId, getVoiceSnapshot(chatId).on);
++}
++
++/** Once per chat, make the server's label agree with this browser's switch. */
++export function syncVoiceLabel(chatId: string, labelOn: boolean): void {
++  if (getVoiceSnapshot(chatId).on !== labelOn)
++    void postVoiceLabel(chatId, getVoiceSnapshot(chatId).on);
++}
++
+ export function setVoiceOn(chatId: string, on: boolean): void {
+   writeVoiceMode(chatId, on);
+-  patch(chatId, { on, phase: on ? "listening" : "off" });
++  patch(chatId, { on, phase: on ? "starting" : "off", barged: false });
+   void postVoiceLabel(chatId, on);
+ }
+ 
+@@ -129,6 +154,11 @@ export function setVoicePhase(chatId: string, phase: VoicePhase): void {
+   patch(chatId, { phase });
+ }
+ 
++/** A tap on the speaker while it talks: stop, and stay quiet until the next send. */
++export function setVoiceBarged(chatId: string, barged: boolean): void {
++  patch(chatId, { barged });
++}
++
+ export function setVoiceSpeaking(chatId: string, speaking: boolean): void {
+   patch(chatId, { speaking });
+ }
+@@ -223,32 +253,51 @@ function words(text: string): string[] {
+     .filter(Boolean);
+ }
+ 
+-function hasPhrase(haystack: string[], needle: string[]): boolean {
+-  if (needle.length === 0 || needle.length > haystack.length) return false;
+-  for (let i = 0; i + needle.length <= haystack.length; i++) {
+-    if (needle.every((w, j) => haystack[i + j] === w)) return true;
+-  }
+-  return false;
++const NEGATORS = new Set(["not", "dont", "no", "never", "cant", "wont"]);
++
++function isNumberToken(t: string, count: number): boolean {
++  const n = ORDINAL_WORDS[t] ?? (/^\d+$/.test(t) ? Number(t) : NUMBER_WORDS[t]);
++  return n !== undefined && n >= 1 && n <= count;
+ }
+ 
+ function numberIn(tokens: string[], count: number): number | null {
++  // Only a short utterance made of nothing but number words counts: "no one has access yet"
++  // and "first check the logs" are sentences, not picks. "none" is not a number.
++  const content = tokens.filter((t) => !STOP_WORDS.has(t));
++  if (content.length === 0 || content.length > 4) return null;
++  if (!content.every((t) => isNumberToken(t, count))) return null;
+   // "the second one" holds both an ordinal and a bare number word: the ordinal wins.
+-  for (const t of tokens) {
++  for (const t of content) {
+     const n = ORDINAL_WORDS[t];
+-    if (n !== undefined && n <= count) return n - 1;
++    if (n !== undefined) return n - 1;
+   }
+-  for (const t of tokens) {
++  for (const t of content) {
+     const n = /^\d+$/.test(t) ? Number(t) : NUMBER_WORDS[t];
+-    if (n !== undefined && n >= 1 && n <= count) return n - 1;
++    if (n !== undefined) return n - 1;
+   }
+   return null;
+ }
+ 
++/** Whether the word at *at* has "not", "don't", "no" or "never" within the two words before it. */
++function negatedAt(tokens: string[], at: number): boolean {
++  return tokens.slice(Math.max(0, at - 2), at).some((t) => NEGATORS.has(t));
++}
++
++/** Where the label's words sit in the utterance, or -1; a negated place does not count. */
++function phraseAt(haystack: string[], needle: string[]): number {
++  if (needle.length === 0) return -1;
++  for (let i = 0; i + needle.length <= haystack.length; i++) {
++    if (needle.every((w, j) => haystack[i + j] === w) && !negatedAt(haystack, i)) return i;
++  }
++  return -1;
++}
++
+ /**
+  * The index of the option a spoken answer names, or null. Order: a label said
+  * whole, then a number or ordinal ("two", "2", "the first one", "option two"),
+  * then a label whose every word was said, then a short answer made only of one
+- * label's words ("force it" for "Force it when the image lands").
++ * label's words ("force it" for "Force it when the image lands"). A label said
++ * after "not", "don't", "no" or "never" is not a pick.
+  */
+ export function matchSpokenOption(transcript: string, labels: readonly string[]): number | null {
+   const said = words(transcript);
+@@ -257,7 +306,7 @@ export function matchSpokenOption(transcript: string, labels: readonly string[])
+ 
+   let whole = -1;
+   parts.forEach((p, i) => {
+-    if (hasPhrase(said, p) && (whole < 0 || p.length > parts[whole].length)) whole = i;
++    if (phraseAt(said, p) >= 0 && (whole < 0 || p.length > parts[whole].length)) whole = i;
+   });
+   if (whole >= 0) return whole;
+ 
+@@ -265,7 +314,11 @@ export function matchSpokenOption(transcript: string, labels: readonly string[])
+   if (numbered !== null) return numbered;
+ 
+   const all = parts.flatMap((p, i) =>
+-    p.length > 0 && p.every((w) => said.includes(w)) ? [i] : [],
++    p.length > 0 &&
++    p.every((w) => said.includes(w)) &&
++    !p.some((w) => negatedAt(said, said.indexOf(w)))
++      ? [i]
++      : [],
+   );
+   if (all.length > 0) {
+     const longest = Math.max(...all.map((i) => parts[i].length));
+@@ -274,7 +327,7 @@ export function matchSpokenOption(transcript: string, labels: readonly string[])
+   }
+ 
+   const content = said.filter((w) => !STOP_WORDS.has(w));
+-  if (content.length === 0 || said.length > 4) return null;
++  if (content.length === 0 || said.length > 4 || said.some((w) => NEGATORS.has(w))) return null;
+   const subset = parts.flatMap((p, i) => (content.every((w) => p.includes(w)) ? [i] : []));
+   return subset.length === 1 ? subset[0] : null;
+ }
+@@ -290,24 +343,39 @@ export function matchSpokenOptions(transcript: string, labels: readonly string[]
+ }
+ 
+ const DONE_PHRASES = [
+-  "done",
+   "thats all",
+   "that is all",
+   "thats it",
+   "that is it",
++  "all done",
+   "finished",
+   "submit",
+-  "all done",
+-];
++  "done",
++].sort((a, b) => b.split(" ").length - a.split(" ").length);
++const DONE_FILLER = new Set([
++  "ok",
++  "okay",
++  "im",
++  "all",
++  "thats",
++  "it",
++  "so",
++  "and",
++  "well",
++  "right",
++]);
+ 
+-/** The transcript without a closing "done", and whether it had one. */
++/** The transcript without a closing "done" and the filler around it, and whether it had one. */
+ export function splitDone(transcript: string): { done: boolean; rest: string } {
+   const said = words(transcript);
+   for (const phrase of DONE_PHRASES) {
+     const p = phrase.split(" ");
+     const end = said.length - p.length;
+     if (end >= 0 && p.every((w, i) => said[end + i] === w)) {
+-      return { done: true, rest: said.slice(0, end).join(" ") };
++      const rest = said.slice(0, end);
++      while (rest.length > 0 && DONE_FILLER.has(rest[rest.length - 1])) rest.pop();
++      while (rest.length > 0 && DONE_FILLER.has(rest[0])) rest.shift();
++      return { done: true, rest: rest.join(" ") };
+     }
+   }
+   return { done: false, rest: transcript };
+@@ -342,6 +410,11 @@ export function isPendingElicitation(
+   );
+ }
+ 
++/** A card with `isOther` set to false takes no words of the person's own. */
++export function customAllowed(q: { isOther?: boolean }): boolean {
++  return q.isOther !== false;
++}
++
+ /** The key a card's answers use: the question's id, else its text. */
+ export function questionKey(q: { id?: string; question: string }): string {
+   return q.id && q.id.length > 0 ? q.id : q.question;
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index d36b2d6509b8aea3ef6e4417b7b49879dade0584..b1d217bc5ea7eae890c785bb77f596f3bf66f554 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3554,6 +3554,13 @@ function ComposerImpl(
+     status,
+     value,
+     submit,
++    canSend: !(
++      composerLockedByBtw ||
++      disabled ||
++      sendDisabledReason !== null ||
++      hasPendingElicitation
++    ),
++    labels: composerSession?.labels,
+   });
+ 
+   return (
+@@ -3993,10 +4000,11 @@ function ComposerImpl(
+                 className={cn("size-8 md:size-7", COMPOSER_TIGHT_MIC_CLASS)}
+                 enableHotkey
+                 controller={micController}
++                onListeningChange={voice.onListening}
+                 disabled={
+                   disabled ||
+                   isReadOnly ||
+-                  (hasPendingElicitation && !voice.on) ||
++                  (hasPendingElicitation && !voice.cardActive) ||
+                   composerLockedByBtw
+                 }
+                 onVoiceStart={() => {
+@@ -4920,7 +4928,8 @@ function SessionHarnessPicker({
+                     ) : (
+                       (effortWord(effort) ?? effort)
+                     ),
+-                  checked: !routingOn && effort === (selectedEffort ?? effortResolved?.level ?? null),
++                  checked:
++                    !routingOn && effort === (selectedEffort ?? effortResolved?.level ?? null),
+                   disabled: routingOn || picksBusy || pendingModelChange !== null,
+                   onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                   testId: `composer-agent-effort-${effort}`,

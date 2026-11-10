@@ -17,6 +17,8 @@ import {
 } from "../src/accounts";
 import type { AccountRow, AccountsAnswer, AccountWindow } from "../src/api";
 import { getTile, resetTiles } from "../src/tiles";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -305,5 +307,22 @@ describe("the section", () => {
     window.dispatchEvent(new Event("focus"));
     await vi.advanceTimersByTimeAsync(2 * POLL_MS);
     expect(request).toHaveBeenCalledTimes(1);
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+    const { context } = stubContext([ok(answer([row()]))]);
+    const node = await mount(context);
+    const link = () => node.querySelector(".needs-link");
+    expect(link()?.textContent).toBe("Reading Needs you...");
+    setAttention(needOverview([needItem("accounts-1", { source: "accounts", kind: "account-full" })]));
+    expect(link()?.textContent).toBe("1 in Needs you");
+    setAttention(needOverview([]));
+    expect(link()?.textContent).toBe("Nothing needs you.");
   });
 });

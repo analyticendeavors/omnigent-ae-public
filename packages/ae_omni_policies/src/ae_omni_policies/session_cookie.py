@@ -30,6 +30,13 @@ follows upstream's rule, including the ``OMNIGENT_DOMAIN`` fallback; it is
 installed only when the auth source is ``oidc``; ``/auth/`` is matched under a
 base path too.
 
+iOS note (2026-11-08, https://github.com/analyticendeavors/omnigent-ae/issues/506): the iOS app
+0.3.1 installs the CLI sign-in token as its cookie, and that token has no browser proof
+(:mod:`ae_omni_policies.browser_proof`), so the app loses the browser-only writes (card
+switches and GitHub token saves) after that change; a browser does them. Everything else in
+the app keeps working. This module never adds the proof, on purpose: a re-send must not turn
+a token a CLI holds into a browser's.
+
 Installed by :mod:`ae_omni_policies.docker_entrypoint` when the server runs
 with OIDC. Drop it once an App Store build ships native sign-in (iOS 0.3.2 or
 later): check the app's version, then remove this module and its install line.

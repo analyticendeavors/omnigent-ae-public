@@ -272,8 +272,18 @@ export function answerIsStale(
   view: PresetsAnswer | null | undefined,
   now = Date.now(),
 ): boolean {
+  if (view?.refreshing) return false; // 2026-11-07: the server is computing the new answer
   const asOf = answerTime(view);
   return asOf > 0 && now - asOf > STALE_MS;
+}
+
+/** Old answer while the server computes a new one (2026-11-07): "refreshing", not failing. */
+function answerIsRefreshing(
+  view: PresetsAnswer | null | undefined,
+  now = Date.now(),
+): boolean {
+  const asOf = answerTime(view);
+  return !!view?.refreshing && asOf > 0 && now - asOf > STALE_MS;
 }
 
 /** The server's `asOf` as epoch ms; 0 when there is none (never the client clock). */
@@ -293,7 +303,12 @@ export function updatedText(
     hour: "numeric",
     minute: "2-digit",
   });
-  return `Updated ${time}${answerIsStale(view, now) ? ", refresh failing" : ""}`;
+  const tail = answerIsStale(view, now)
+    ? ", refresh failing"
+    : answerIsRefreshing(view, now)
+      ? ", refreshing"
+      : "";
+  return `Updated ${time}${tail}`;
 }
 
 export function presetsTile(
@@ -314,11 +329,13 @@ export function presetsTile(
   }
   const { runs, cost } = view.kpis;
   const stale = answerIsStale(view, now);
+  const refreshing = answerIsRefreshing(view, now);
   return {
     id: "presets",
     value: plural(runs, "run"),
     summary: `${plural(runs, "run")}, ${money(cost)} in ${days} d`,
-    note: `${money(cost)} in ${days} days${stale ? " \u00b7 refresh failing" : ""}`,
+    brief: `${plural(runs, "run")} in ${days} d`,
+    note: `${money(cost)} in ${days} days${stale ? " \u00b7 refresh failing" : refreshing ? " \u00b7 refreshing" : ""}`,
     health: stale ? "attention" : "ok",
   };
 }
@@ -1333,7 +1350,11 @@ export function activatePresets(
         if (document.visibilityState === "visible") void refresh();
         else schedule();
       },
-      state.answer?.state === "warming" ? WARMING_POLL_MS : POLL_MS,
+      // 2026-11-07: poll fast while the server computes the new answer, but not after a failed
+      // poll, which keeps the last answer (and its flag).
+      state.answer?.state === "warming" || (state.answer?.refreshing && !state.error)
+        ? WARMING_POLL_MS
+        : POLL_MS,
     );
   };
   const refresh = (): Promise<void> => {

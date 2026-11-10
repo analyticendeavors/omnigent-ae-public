@@ -602,6 +602,13 @@ SETTINGS: tuple[Setting, ...] = (
         "host",
     ),
     Setting(
+        "AE_BOX_HEALTH_GROUP_MAX_ENTRIES",
+        "100000",
+        "The most entries one chat temp folder may use of the scan cap; past it only that "
+        "folder reads at least.",
+        "host",
+    ),
+    Setting(
         "AE_BOX_HEALTH_WALK_MAX_SECONDS",
         "30",
         "The most seconds one scan spends per folder. Past it the count is marked partial.",
@@ -887,6 +894,9 @@ class Need(BaseModel):
     owner: str | None = None
     action: str | None = None
     """The cleanup action that clears this line, when the box offers one (PR 2)."""
+    facts: dict[str, Any] = Field(default_factory=dict, exclude=True)
+    """Numbers and names the Needs you list keys its "worse" rule on (2026-11-03). Never sent to
+    the page: the card shows the text, and the list holds only what the card already shows."""
 
 
 class Area(BaseModel):
@@ -924,6 +934,8 @@ class BoxHealthView(BaseModel):
     slow_age_s: int | None = None
     host: str | None = None
     needs: list[Need] = Field(default_factory=list)
+    all_needs: list[Need] = Field(default_factory=list, exclude=True)
+    """Every line, uncapped (``needs`` keeps the card's 12): the Needs you list counts them all."""
     areas: list[Area] = Field(default_factory=list)
     details: dict[str, Any] = Field(default_factory=dict)
     history: History = Field(default_factory=History)
@@ -952,6 +964,14 @@ def size_words(value: float | None) -> str:
             amount = value / factor
             return f"{amount:.0f} {unit}" if amount >= 10 else f"{amount:.1f} {unit}"
     return f"{int(value)} B"
+
+
+def counted(value: float, noun: str, plural: str | None = None) -> str:
+    """A count and its noun, singular for exactly one: ``1 folder``, ``268 folders``,
+    ``14k items`` (2026-11-05: the card read "Remove 1 folders"). *noun* is the singular;
+    *plural* defaults to it plus ``s`` (pass ``/tmp entries`` for ``/tmp entry``)."""
+    many = noun + "s" if plural is None else plural
+    return f"{count_words(value)} {noun if value == 1 else many}"
 
 
 def count_words(value: float) -> str:
@@ -1031,6 +1051,66 @@ def _sorted_needs(needs: list[tuple[float, Need]]) -> list[Need]:
     return [need for _, need in needs]
 
 
+#: Failed parts of the relay's fast pass; every other failed part belongs to the slow scans.
+FAST_PARTS = frozenset({"sensors", "cpu", "memory", "mounts", "units"})
+
+
+def _partial_rows(slow: Any) -> list[Any]:
+    """Every scanned row of the slow reading that reports a capped or cut count."""
+    rows: list[Any] = []
+    for user in slow.users:
+        groups = [
+            *user.claude,
+            *user.litter,
+            *([user.pytest] if user.pytest else []),
+            *([user.worktrees] if user.worktrees else []),
+        ]
+        rows.extend(g for g in groups if getattr(g, "partial", False))
+    rows.extend(d for d in slow.dirs if d.partial)
+    return rows
+
+
+def scan_unreadable(slow: Any) -> bool:
+    """Whether any slow-scan row could not read part of what it counts (2026-11-06, review).
+
+    An unreadable Claude or pytest root, a Claude root with an unreadable folder, or a litter
+    group with unreadable entries. Another user's folder is often unreadable by design, so this
+    is not a read failure and adds no need; it only keeps the Bloat scope from vouching that a
+    dismissed temp item is gone (``attention.slow_unclean``).
+    """
+    for user in slow.users:
+        for root in user.claude:
+            if not root.readable or root.had_unreadable:
+                return True
+        if user.pytest is not None and not user.pytest.readable:
+            return True
+        if any(group.unreadable for group in user.litter):
+            return True
+    return False
+
+
+def scan_certainty(
+    stored: Stored, now: datetime
+) -> Literal["ok", "capped", "late", "cut", "missing"]:
+    """How far the slow cleanup scan can be believed (2026-11-06, one rule for box health).
+
+    ``missing``: the box has posted no slow scan. ``cut``: a part outside the fast pass failed.
+    ``late``: the scan is older than three of its own intervals. ``capped``: a count stopped at its
+    entry or time limit, so it is at least what is shown. Checked in that order. Only ``missing``
+    and ``cut`` mean the reading itself cannot be trusted; ``late`` and ``capped`` are named
+    needs on the card.
+    """
+    post = stored.reading
+    slow = post.slow
+    if slow is None:
+        return "missing"
+    if any(part not in FAST_PARTS for part in post.failed):
+        return "cut"
+    if (now - slow.read_at).total_seconds() > 3 * slow.slow_minutes * 60:
+        return "late"
+    return "capped" if _partial_rows(slow) else "ok"
+
+
 def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> BoxHealthView:
     """The card's answer: colours, the Needs-you lines, details and a day of history."""
     cfg = cfg or config()
@@ -1064,9 +1144,21 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
         text: str,
         detail: str = "",
         owner: str | None = None,
+        facts: dict[str, Any] | None = None,
     ) -> None:
         needs.append(
-            (score, Need(key=key, area=area, tone=tone, text=text, detail=detail, owner=owner))
+            (
+                score,
+                Need(
+                    key=key,
+                    area=area,
+                    tone=tone,
+                    text=text,
+                    detail=detail,
+                    owner=owner,
+                    facts=facts or {},
+                ),
+            )
         )
 
     if stale:
@@ -1296,6 +1388,7 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
                     tone,  # type: ignore[arg-type]
                     f"{_clip(mount.path, 20)} {kind} {pct:.0f}%",
                     f"{mount.path}: {detail}.",
+                    facts={"metric": pct},
                 )
     if worst is None:
         storage_value = "not read"
@@ -1362,13 +1455,14 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
                         f"claude:{owner}:{root.where}:{user.kind}",
                         "bloat",
                         "amber",
-                        f"{who}: {root.stale_sessions} Claude temp folders older than "
-                        f"{days_words} days",
+                        f"{who}: {counted(root.stale_sessions, 'Claude temp folder')} older "
+                        f"than {days_words} days",
                         f"{_where_words(root.where)}: {root.stale_sessions} of {root.sessions} "
                         f"session folders, {size_words(root.stale_bytes)} in "
-                        f"{count_words(root.stale_files)} items. "
+                        f"{counted(root.stale_files, 'item')}. "
                         "The two-day cleanup may not be running.",
                         owner,
+                        facts={"metric": float(root.stale_sessions)},
                     )
             stale_litter = sum(g.stale for g in user.litter)
             litter_total += stale_litter
@@ -1382,6 +1476,7 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
                     f"{who}: {count_words(stale_litter)} old /tmp entries",
                     f"Top-level /tmp entries older than {days_words} days.",
                     owner,
+                    facts={"metric": float(stale_litter)},
                 )
             users_out.append(_user_details(user))
         if slow.docker is not None:
@@ -1395,6 +1490,7 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
                     "amber",
                     f"Docker can free {size_words(reclaim)}",
                     "Unused images and build cache.",
+                    facts={"metric": reclaim / GIB},
                 )
         bloat_value = (
             f"{count_words(stale_total)} stale · {count_words(litter_total)} in /tmp"
@@ -1402,12 +1498,35 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
             else "Nothing stale"
         )
         bloat_title = (
-            f"{stale_total} Claude temp folders and {litter_total} /tmp entries older than "
-            f"{days_words} days"
+            f"{counted(stale_total, 'Claude temp folder')} and "
+            f"{counted(litter_total, '/tmp entry', '/tmp entries')} older than {days_words} days"
         )
         slow_age = int((now - slow.read_at).total_seconds())
         if slow_age > 3 * slow.slow_minutes * 60:
             bloat_title += f" (scans from {ago_words(slow_age)})"
+        certainty = scan_certainty(stored, now)
+        if certainty == "capped":
+            bloat_tone = _worse(bloat_tone, "amber")
+            add(
+                4e5,
+                "scan:capped",
+                "bloat",
+                "amber",
+                "Temp folder count stopped early",
+                "The cleanup scan reached its file or time limit, so counts are at least what "
+                "is shown and folders past that point are not counted or cleaned.",
+            )
+        elif certainty == "late":
+            bloat_tone = _worse(bloat_tone, "amber")
+            add(
+                4e5,
+                "scan:late",
+                "bloat",
+                "amber",
+                "Cleanup scan is late",
+                f"The last cleanup scan was {ago_words(slow_age)}, so the counts may be out "
+                "of date.",
+            )
     else:
         bloat_value, bloat_title = "not read", "The box has not posted its slow scans yet"
     areas["bloat"] = Area(
@@ -1476,6 +1595,13 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
             "amber",
             f"{total} failed unit{'s' if total != 1 else ''}: {shown}{tail}{others}",
             "systemd reports these units failed.",
+            facts={
+                "units": sorted(units),
+                # A name failing in both managers is listed as a system unit, so its brief gives
+                # the sudo command; a user-side failure that remains shows on the next read.
+                "user_units": sorted(set(post.failed_user_units) - set(post.failed_units)),
+                "other": other_units,
+            },
         )
     details["system"] = {
         "uptime_s": post.uptime_s,
@@ -1504,8 +1630,8 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
         )
     details["failed_parts"] = list(post.failed)
 
-    ordered = _sorted_needs(needs)
-    ordered = ordered[:12]
+    every = _sorted_needs(needs)
+    ordered = every[:12]
     ordering = ["heat", "cpu", "memory", "storage", "bloat"]
     area_list = [areas[a] for a in ordering if a in areas]
     overall: Tone = "green"
@@ -1525,6 +1651,7 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
         slow_age_s=int((now - slow.read_at).total_seconds()) if slow else None,
         host=post.host,
         needs=ordered,
+        all_needs=every,
         areas=area_list,
         details=details,
         history=_downsample(stored.history),

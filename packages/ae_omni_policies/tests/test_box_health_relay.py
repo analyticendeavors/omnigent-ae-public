@@ -1835,3 +1835,127 @@ def test_a_container_session_with_a_git_checkout_inside_is_never_removed(
         home=str(tmp_path),
     )
     assert button["skipped"].get("git") == 1 and button["removed"] == 1
+
+
+def test_auto_clean_host_runs_each_action_and_survives_a_failure(monkeypatch):
+    from ae_omni_policies import box_cleanup
+    from ae_omni_policies import box_health_relay as relay
+
+    calls: list[str] = []
+
+    seen: list[float] = []
+
+    def fake(action, **kw):
+        calls.append(action)
+        seen.append(kw["stale_days"])
+        if action == "tmp_litter":
+            raise box_cleanup.Refused("nope")
+        return box_cleanup.Outcome(removed=2)
+
+    monkeypatch.setattr(box_cleanup, "host_run", fake)
+    settings = relay.settings_from_env()
+    settings.cleanup, settings.dry_run = True, False
+    out = relay.auto_clean_host(settings, relay.SubprocessRunner(), now=0.0, home="/nonexistent")
+    settings.stale_days = 0.05
+    out = relay.auto_clean_host(settings, relay.SubprocessRunner(), now=0.0, home="/nonexistent")
+    assert calls[-2:] == ["claude_scratch", "tmp_litter"]
+    assert "docker_prune" not in calls
+    assert out == {"claude_scratch": 2}
+    assert min(seen) >= 2.0
+
+
+def test_auto_clean_host_does_nothing_when_cleanup_is_off(monkeypatch):
+    from ae_omni_policies import box_cleanup
+    from ae_omni_policies import box_health_relay as relay
+
+    monkeypatch.setattr(box_cleanup, "host_run", lambda *a, **k: pytest.fail("ran"))
+    settings = relay.settings_from_env()
+    settings.cleanup = False
+    assert relay.auto_clean_host(settings, relay.SubprocessRunner(), now=0.0, home="/x") == {}
+
+
+def test_auto_clean_host_stops_starting_actions_once_the_budget_is_spent(monkeypatch):
+    from ae_omni_policies import box_cleanup
+    from ae_omni_policies import box_health_relay as relay
+
+    calls: list[str] = []
+
+    def fake(action, **_kw):
+        calls.append(action)
+        return box_cleanup.Outcome(removed=1)
+
+    monkeypatch.setattr(box_cleanup, "host_run", fake)
+    monkeypatch.setattr(relay, "AUTO_CLEAN_DEADLINE_S", 0.0)
+    settings = relay.settings_from_env()
+    settings.cleanup, settings.dry_run = True, False
+    assert relay.auto_clean_host(settings, relay.SubprocessRunner(), now=0.0, home="/x") == {}
+    assert calls == []
+
+
+def test_auto_clean_host_logs_what_it_removed_and_kept(monkeypatch, caplog):
+    from collections import Counter
+
+    from ae_omni_policies import box_cleanup
+    from ae_omni_policies import box_health_relay as relay
+
+    def fake(action, **_kw):
+        return box_cleanup.Outcome(
+            removed=3, skipped=Counter({"locked": 5, "recent": 0, "/home/x/secret": 2})
+        )
+
+    monkeypatch.setattr(box_cleanup, "host_run", fake)
+    settings = relay.settings_from_env()
+    settings.cleanup, settings.dry_run = True, False
+    with caplog.at_level("WARNING"):
+        relay.auto_clean_host(settings, relay.SubprocessRunner(), now=0.0, home="/x")
+    assert "auto clean claude_scratch: removed 3; kept: locked 5\n" in caplog.text + "\n"
+    assert "auto clean tmp_litter: removed 3" in caplog.text
+    assert "recent" not in caplog.text
+    assert "secret" not in caplog.text
+    assert len(caplog.records) == 2
+
+
+def test_the_group_share_setting_has_a_default_and_bounds() -> None:
+    assert relay.settings_from_env({}).group_max_entries == 100000
+    assert (
+        relay.settings_from_env({"AE_BOX_HEALTH_GROUP_MAX_ENTRIES": "2500"}).group_max_entries
+        == 2500
+    )
+    for bad in ("5", "999999999999"):
+        env = {"AE_BOX_HEALTH_GROUP_MAX_ENTRIES": bad}
+        assert relay.settings_from_env(env).group_max_entries == 100000
+
+
+def test_the_group_share_reaches_the_scans_and_the_auto_clean(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from ae_omni_policies import box_cleanup
+
+    seen: dict[str, list[int]] = {"claude": [], "pytest": [], "clean": []}
+    real_claude = box_health_scan.scan_claude_root
+    real_pytest = box_health_scan.scan_pytest_root
+
+    def claude(*a: Any, **k: Any) -> Any:
+        seen["claude"].append(k["group_max_entries"])
+        return real_claude(*a, **k)
+
+    def pytest_root(*a: Any, **k: Any) -> Any:
+        seen["pytest"].append(k["group_max_entries"])
+        return real_pytest(*a, **k)
+
+    def host_run(_action: str, **k: Any) -> Any:
+        seen["clean"].append(k["group_max_entries"])
+        return box_cleanup.Outcome(removed=0)
+
+    monkeypatch.setattr(box_health_scan, "scan_claude_root", claude)
+    monkeypatch.setattr(box_health_scan, "scan_pytest_root", pytest_root)
+    monkeypatch.setattr(box_cleanup, "host_run", host_run)
+    fake_tree(tmp_path)
+    settings = settings_for(tmp_path, AE_BOX_HEALTH_GROUP_MAX_ENTRIES="2500")
+    post, _state, _failed = collect(tmp_path, FakeRunner(container_answers()), settings=settings)
+    assert seen["claude"] and set(seen["claude"]) == {2500}
+    assert set(seen["pytest"]) <= {2500}
+    assert post.slow.settings["AE_BOX_HEALTH_GROUP_MAX_ENTRIES"] == "2500"
+    settings.cleanup, settings.dry_run = True, False
+    relay.auto_clean_host(settings, relay.SubprocessRunner(), now=0.0, home="/nonexistent")
+    assert seen["clean"] and set(seen["clean"]) == {2500}

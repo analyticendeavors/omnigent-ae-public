@@ -8,9 +8,11 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import socket
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -345,6 +347,52 @@ def test_the_litter_patterns_match_only_the_shapes_the_box_has() -> None:
     bad = ["sec-appr-", "sec-appr-AbC12", "sec-appr-AbC1234", "media-AbC123/x", "sec-appr-AbC12\n"]
     assert all(box_cleanup.litter_group(n) for n in ok)
     assert not any(box_cleanup.litter_group(n) for n in bad)
+
+
+def test_names_a_person_would_choose_are_not_litter() -> None:
+    human = [
+        "media-backup",
+        "media-Photos",
+        "plex-backup",
+        "plex-Movies",
+        "dfs-backup",
+        "dfs-Backup",
+        "sec-report",
+        "sec-Report",
+        "tmpdownload",
+        "tmpbackups",
+        "tmp_scripts",
+        "tmp_archive",
+        "omnigent-osenv-backup",
+        "omnigent-codex-skills-Backup",
+    ]
+    random = [
+        "media-a1b2c3",
+        "media-aBcdef",
+        "sec-appr-AbCdEf",
+        "sec-appr-abcde5",
+        "tmp1abcdefg",
+        "tmpab_cdef9",
+        "omnigent-osenv-x7Yz2Q",
+        "omnigent-codex-skills-aBcdef",
+    ]
+    assert not any(box_cleanup.litter_group(n) for n in human)
+    assert all(box_cleanup.litter_group(n) for n in random)
+
+
+def test_a_capital_in_position_one_alone_is_not_enough() -> None:
+    assert not box_cleanup.litter_group("media-Abcdef")
+    assert box_cleanup.litter_group("media-abcdeF")
+
+
+def test_accepted_residual_risk_names_with_a_digit_still_match() -> None:
+    # A name with a digit in the six characters (media-Photo1) or in the tmp tail
+    # (tmpbackups1) looks like a random suffix, so it matches. Accepted: /tmp on the box is a
+    # RAM tmpfs wiped at every boot, and systemd's tmp.conf (q /tmp 1777 root root 10d)
+    # already removes any entry unread for 10 days regardless of name; the sweep only
+    # shortens that to two days.
+    assert box_cleanup.litter_group("media-Photo1")
+    assert box_cleanup.litter_group("tmpbackups1")
 
 
 # ── review_checkouts ────────────────────────────────────────────────────────
@@ -764,3 +812,344 @@ def test_an_accumulated_group_with_a_git_path_is_not_stale() -> None:
     assert [key[1] for key, _f, _b, _n in groups] == [UUID_B] and skipped["git"] == 1
     scan = box_health_scan.aggregate_claude(lines, now=NOW, stale_days=2)
     assert scan.stale_sessions == 1
+
+
+# ── the unattended sweep (--sweep) ──────────────────────────────────────────
+
+
+def sweep_tree(tmp: Path) -> dict[str, Path]:
+    """An old matching folder plus everything the sweep must keep, on a temp folder."""
+    tmp.mkdir(parents=True, exist_ok=True)
+    made = {
+        "old": old_dir_with(tmp, "media-AbC123", "sub/old.txt", 5),
+        "recent": old_dir_with(tmp, "sec-appr-Zz9Yx8", "sub/new.txt", 0.1),
+        "human": old_dir_with(tmp, "media-backup", "sub/old.txt", 5),
+        "git": old_dir_with(tmp, "dfs-AbC123", "work/.git/HEAD", 5),
+    }
+    link = tmp / "plex-AbC123"
+    link.symlink_to(tmp_target(tmp))
+    made["link"] = link
+    return made
+
+
+def tmp_target(tmp: Path) -> Path:
+    target = tmp.parent / "elsewhere"
+    put(target / "keep.txt")
+    return target
+
+
+def run_main(monkeypatch: pytest.MonkeyPatch, tmp: Path | None, argv: list[str]) -> int:
+    if tmp is not None:
+        real = box_cleanup.sweep
+        monkeypatch.setattr(box_cleanup, "sweep", lambda **kw: real(**{**kw, "tmp": str(tmp)}))
+    return box_cleanup.main(argv)
+
+
+def test_sweep_runs_tmp_litter_only_with_no_expected_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake(*a: object, **kw: object) -> box_cleanup.Outcome:
+        seen.append((a, kw))
+        return box_cleanup.Outcome()
+
+    monkeypatch.setattr(box_cleanup, "host_run", fake)
+    assert box_cleanup.main(["--sweep"]) == 0
+    ((args, kw),) = seen
+    assert args == ("tmp_litter",)
+    assert kw["roots"] == [] and kw["tmp"] == "/tmp" and kw["expected"] is None
+    assert kw["stale_days"] == 2
+
+
+def test_sweep_stale_days_never_goes_below_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[float] = []
+
+    def fake(*_a: object, **kw: object) -> box_cleanup.Outcome:
+        seen.append(kw["stale_days"])  # type: ignore[arg-type]
+        return box_cleanup.Outcome()
+
+    monkeypatch.setattr(box_cleanup, "host_run", fake)
+    box_cleanup.main(["--sweep", "--stale-days", "0.01"])
+    box_cleanup.main(["--sweep", "--stale-days", "7"])
+    assert seen == [2.0, 7]
+    assert seen[1] == 7.0 and isinstance(seen[1], float)
+
+
+@pytest.mark.parametrize("argv", [[], ["--dry-run", "--sweep"], ["--stale-days", "3"]])
+def test_exactly_one_of_dry_run_and_sweep_is_required(argv: list[str]) -> None:
+    with pytest.raises(SystemExit) as stop:
+        box_cleanup.main(argv)
+    assert stop.value.code == 2
+
+
+def test_sweep_removes_old_litter_keeps_the_rest_and_prints_no_names(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp = tmp_path / "tmp"
+    made = sweep_tree(tmp)
+    assert run_main(monkeypatch, tmp, ["--sweep"]) == 0
+    assert not made["old"].exists()
+    for key in ("recent", "human", "git"):
+        assert made[key].exists(), key
+    assert made["link"].is_symlink() and (tmp.parent / "elsewhere" / "keep.txt").exists()
+    out = capsys.readouterr().out
+    line = json.loads(out)
+    assert line["removed"] == 1 and line["errors"] == {} and line["partial"] is False
+    assert line["groups"] == {"media-*": 1}
+    for name in [*os.listdir(tmp), "media-AbC123", "sub", "old.txt"]:
+        assert name not in out
+
+
+def test_sweep_exits_2_when_refused(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    def refuse(*_a: object, **_kw: object) -> box_cleanup.Outcome:
+        raise box_cleanup.Refused("the cleanup refuses to run as root")
+
+    monkeypatch.setattr(box_cleanup, "host_run", refuse)
+    assert box_cleanup.main(["--sweep"]) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_sweep_exits_1_when_every_removal_errored(monkeypatch: pytest.MonkeyPatch) -> None:
+    done = box_cleanup.Outcome(errors=["EACCES"])
+    monkeypatch.setattr(box_cleanup, "host_run", lambda *_a, **_kw: done)
+    assert box_cleanup.main(["--sweep"]) == 1
+    done.removed = 1
+    assert box_cleanup.main(["--sweep"]) == 0
+
+
+# ── sweep() on a temp folder ────────────────────────────────────────────────
+
+
+def stale(path: Path, days: float = 5) -> Path:
+    age(path, days)
+    return path
+
+
+def run_sweep(tmp: Path) -> box_cleanup.Outcome:
+    return box_cleanup.sweep(tmp=str(tmp), now=NOW)
+
+
+def free_pid() -> int:
+    for pid in range(4_000_000, 4_000_000 - 5000, -1):
+        if not os.path.exists(f"/proc/{pid}"):
+            return pid
+    raise AssertionError("no unused pid found")
+
+
+def test_sweep_removes_a_stale_matching_fifo_file_and_socket(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    os.mkfifo(tmp / "media-a1b2c3")
+    put(tmp / "sec-AbC123")
+    monkeypatch.chdir(tmp)  # keeps the socket path under the 107-byte limit
+    sock = socket.socket(socket.AF_UNIX)
+    sock.bind("plex-a1b2c3")
+    sock.close()
+    for name in ("media-a1b2c3", "sec-AbC123", "plex-a1b2c3"):
+        stale(tmp / name)
+    keep = put(tmp / "media-backup")
+    stale(keep)
+    outcome = run_sweep(tmp)
+    assert outcome.removed == 3 and not outcome.errors
+    assert sorted(os.listdir(tmp)) == ["media-backup"]
+    assert outcome.removed_groups == {"media-*": 1, "sec-*": 1, "plex-*": 1}
+
+
+def test_sweep_keeps_a_debug_socket_of_a_live_process_and_removes_a_dead_one(
+    tmp_path: Path,
+) -> None:
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    live = f"dotnet-diagnostic-{os.getpid()}-1-socket"
+    live_pipe = f"clr-debug-pipe-{os.getpid()}-1-in"
+    dead = f"dotnet-diagnostic-{free_pid()}-1-socket"
+    dead_pipe = f"clr-debug-pipe-{free_pid()}-1-out"
+    for name in (live, live_pipe, dead, dead_pipe):
+        stale(put(tmp / name))
+    outcome = run_sweep(tmp)
+    assert outcome.removed == 2 and outcome.skipped["alive"] == 2
+    assert sorted(os.listdir(tmp)) == sorted([live, live_pipe])
+
+
+def read_only_folder_in_litter(tmp: Path) -> Path:
+    folder = tmp / "media-AbC123"
+    put(folder / "locked" / "f")
+    age_tree(folder, 5)
+    (folder / "locked").chmod(0o555)
+    return folder
+
+
+def test_a_read_only_subfolder_gives_exit_0_when_something_else_was_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tmp = tmp_path / "tmp"
+    folder = read_only_folder_in_litter(tmp)
+    stale(put(tmp / "sec-AbC123"))
+    try:
+        assert run_main(monkeypatch, tmp, ["--sweep"]) == 0
+    finally:
+        (folder / "locked").chmod(0o755)
+    assert not (tmp / "sec-AbC123").exists() and folder.exists()
+
+
+def test_a_read_only_subfolder_gives_exit_1_when_nothing_was_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    tmp = tmp_path / "tmp"
+    folder = read_only_folder_in_litter(tmp)
+    try:
+        assert run_main(monkeypatch, tmp, ["--sweep"]) == 1
+    finally:
+        (folder / "locked").chmod(0o755)
+    line = json.loads(capsys.readouterr().out)
+    assert line["removed"] == 0 and "EACCES" in line["errors"]
+
+
+def test_sweep_refuses_a_temp_folder_that_is_a_link_or_missing(tmp_path: Path) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    for bad in (link, tmp_path / "missing"):
+        with pytest.raises(box_cleanup.Refused, match="missing or not a real folder"):
+            run_sweep(bad)
+
+
+def test_sweep_exits_2_for_a_temp_folder_that_is_a_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real)
+    assert run_main(monkeypatch, link, ["--sweep"]) == 2
+    assert "refused" in capsys.readouterr().err
+
+
+def test_an_entry_swapped_after_the_check_is_skipped(tmp_path: Path) -> None:
+    tmp = tmp_path / "tmp"
+    tmp.mkdir()
+    stale(put(tmp / "media-AbC123"))
+    plan = litter(tmp)
+    # Rename the checked file away rather than deleting it: a deleted file's inode number
+    # can be handed straight to the replacement, which would make the swap invisible.
+    (tmp / "media-AbC123").rename(tmp / "kept-aside")
+    stale(put(tmp / "media-AbC123"))
+    outcome = box_cleanup.run_plan(plan, box_cleanup.Remover([str(tmp)], ME))
+    assert outcome.removed == 0 and outcome.skipped["changed"] == 1
+    assert (tmp / "media-AbC123").exists() and (tmp / "kept-aside").exists()
+
+
+# ── each session gets its own share of the cap (2026-11-06) ─────────────────
+
+
+def big_session(root: Path, uuid: str, count: int = 300) -> Path:
+    path = root / f"-{SECRET}" / uuid
+    for i in range(count):
+        put(path / "tasks" / f"f{i}")
+    age_tree(path, 5)
+    age(path.parent, 5)
+    return path
+
+
+def share_plan(root: Path, budget: box_health_scan.Budget, share: int = 50) -> box_cleanup.Plan:
+    return box_cleanup.plan_claude_scratch(
+        [str(root)],
+        now=NOW,
+        stale_days=2,
+        uid=ME,
+        budget=budget,
+        clock=box_cleanup.Clock(),
+        group_max_entries=share,
+    )
+
+
+def test_a_session_over_its_share_no_longer_stops_the_planning_of_the_rest(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude"
+    big = big_session(root, UUID_A)
+    small = [session(root, f"3f2a1c00-1111-4222-8333-44445555666{i}") for i in range(5)]
+    budget = box_health_scan.Budget(10_000, 30)
+    plan = share_plan(root, budget)
+    assert not budget.exhausted
+    assert plan.count == 5 and plan.partial and plan.skipped["unproven"] == 1
+    assert {c.path for c in plan.candidates} == {str(p) for p in small}
+    outcome = run(plan, root)
+    assert outcome.removed == 5 and big.exists()
+
+
+def test_the_parent_budget_running_out_still_stops_planning(tmp_path: Path) -> None:
+    root = tmp_path / "claude"
+    for i in range(5):
+        session(root, f"3f2a1c00-1111-4222-8333-44445555666{i}")
+    budget = box_health_scan.Budget(7, 30)
+    plan = share_plan(root, budget, share=100)
+    assert budget.exhausted and plan.partial and plan.count < 5
+    assert plan.skipped["unproven"] == 1
+
+
+def test_a_session_inside_its_share_is_planned_and_the_remover_re_proves_it(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "claude"
+    path = big_session(root, UUID_A, count=60)
+    plan = share_plan(root, box_health_scan.Budget(10_000, 30), share=100)
+    assert plan.count == 1 and not plan.partial
+    assert run(plan, root).removed == 1 and not path.exists()
+
+
+def test_the_default_share_is_what_the_remover_can_re_prove() -> None:
+    assert box_health_scan.GROUP_MAX_ENTRIES == box_cleanup.WALK_ENTRIES
+
+
+def test_host_run_and_the_dry_run_pass_the_share_on(tmp_path: Path) -> None:
+    root = tmp_path / "claude"
+    big_session(root, UUID_A)
+    session(root, UUID_B)
+    common: dict[str, Any] = {
+        "roots": [str(root)],
+        "tmp": str(tmp_path / "tmp"),
+        "now": NOW,
+        "stale_days": 2,
+        "max_entries": 10_000,
+        "max_seconds": 10,
+        "proc": str(tmp_path / "proc"),
+        "locks_path": str(tmp_path / "locks"),
+    }
+    counts = box_cleanup.dry_run_counts(**common, group_max_entries=50)
+    scratch_counts = counts["claude_scratch"]
+    assert scratch_counts["count"] == 1 and scratch_counts["partial"] is True
+    outcome = box_cleanup.host_run(
+        "claude_scratch",
+        **common,
+        group_max_entries=50,
+    )
+    assert outcome.removed == 1
+
+
+def test_a_share_above_the_remover_default_is_planned_and_removed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(box_cleanup, "WALK_ENTRIES", 100)
+    root = tmp_path / "claude"
+    path = big_session(root, UUID_A, count=150)
+    outcome = box_cleanup.host_run(
+        "claude_scratch",
+        roots=[str(root)],
+        tmp=str(tmp_path / "tmp"),
+        now=NOW,
+        stale_days=2,
+        max_entries=10_000,
+        max_seconds=10,
+        proc=str(tmp_path / "proc"),
+        locks_path=str(tmp_path / "locks"),
+        group_max_entries=300,
+    )
+    assert outcome.removed == 1 and not path.exists()
+    assert not outcome.skipped.get("unproven")

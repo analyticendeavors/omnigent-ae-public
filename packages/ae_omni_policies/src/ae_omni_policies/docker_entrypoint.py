@@ -23,6 +23,14 @@ Since 2026-10-20 it also adds :mod:`ae_omni_policies.session_cookie` to the app
 when the server signs in with OIDC, so the iOS app keeps its sign-in across
 launches.
 
+Since 2026-11-08 it also adds :mod:`ae_omni_policies.browser_proof` for OIDC and accounts
+sign-in: a second cookie that proves a session cookie came from a browser, which the
+browser-only gate requires (https://github.com/analyticendeavors/omnigent-ae/issues/506).
+
+Since 2026-11-09 it also adds :mod:`ae_omni_policies.desktop_signin` for OIDC sign-in (the only
+mode with ``/auth/native-token``): it records the desktop app's own sign-in so the same gate
+accepts it, while CLI, bootstrap, runner and device tokens stay refused.
+
 Since 2026-10-21 it fills the Graphiti MCP URL into the shipped agent specs
 before upstream registers them (:func:`render_agent_dirs`). Upstream's
 single-file loader never expands ``${VAR}``, and the runner loads the
@@ -279,6 +287,12 @@ def install() -> None:
         from ae_omni_policies.session_cookie import install as install_cookie_expiry
 
         install_cookie_expiry(app, os.environ)
+        from ae_omni_policies.browser_proof import install as install_browser_proof
+
+        install_browser_proof(app, os.environ)
+        from ae_omni_policies.desktop_signin import install as install_desktop_signin
+
+        install_desktop_signin(app, os.environ, permission_store=kwargs.get("permission_store"))
         return app
 
     create_app._ae_wrapped = True  # type: ignore[attr-defined]

@@ -10,7 +10,7 @@ from typing import Any
 import httpx
 import pytest
 
-from ae_omni_policies import box_health, box_health_cleanup
+from ae_omni_policies import box_cleanup, box_health, box_health_cleanup
 from ae_omni_policies.box_health import (
     BoxHealthPost,
     ClaudeRoot,
@@ -447,3 +447,40 @@ async def test_a_label_in_a_failed_part_is_checked_too(
     odd["failed"] = ["container Mallory cleanup"]
     refused = await client.post("/v1/ae/box-health", json=odd)
     assert refused.status_code == 422 and "Mallory" not in refused.text
+
+
+def _litter_offer(count: int) -> box_health.OfferItem:
+    return box_health.OfferItem(
+        action="tmp_litter", owner="UserA", where="box", count=count, files=count, bytes=4096
+    )
+
+
+def test_a_capped_offer_says_what_one_run_removes() -> None:
+    # 2026-11-05: the button read "Remove 14k items" and one press removed 5,000, the
+    # per-run cap; the label and the confirm now say so.
+    offer = _litter_offer(14_000)
+    assert box_health_cleanup.button_text(offer) == "Remove up to 5,000 of 14k items"
+    text = box_health_cleanup.confirm_text(offer, 2)
+    assert text.startswith("Remove 5,000 of UserA's 14k test leftovers older than 2 days")
+    assert "One run removes at most 5,000, oldest first; press again for the rest." in text
+
+
+def test_an_offer_within_the_cap_reads_as_before() -> None:
+    offer = _litter_offer(box_cleanup.MAX_ITEMS)
+    assert box_health_cleanup.button_text(offer) == "Remove 5,000 items"
+    text = box_health_cleanup.confirm_text(offer, 2)
+    assert text.startswith("Remove 5,000 of UserA's test leftovers")
+    assert "press again" not in text
+
+
+def test_a_count_of_one_reads_singular() -> None:
+    # 2026-11-05: the card read "Remove 1 folders".
+    one = box_health.OfferItem(action="claude_scratch", owner="UserA", count=1, files=1, bytes=8)
+    assert box_health_cleanup.button_text(one) == "Remove 1 folder"
+    assert "in 1 item?" in box_health_cleanup.confirm_text(one, 2)
+    two = one.model_copy(update={"count": 2, "files": 2})
+    assert box_health_cleanup.button_text(two) == "Remove 2 folders"
+    assert box_health.counted(1, "checkout") == "1 checkout"
+    assert box_health.counted(14_000, "item") == "14k items"
+    assert box_health.counted(1, "/tmp entry", "/tmp entries") == "1 /tmp entry"
+    assert box_health.counted(2, "/tmp entry", "/tmp entries") == "2 /tmp entries"

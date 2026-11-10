@@ -189,11 +189,12 @@ describe("the rate-limit sentence", () => {
 });
 
 describe("the tile", () => {
-  it("goes amber and says so while Cost Management is rate limiting", () => {
+  it("stays ok and says so while Cost Management is rate limiting", () => {
     const limit = { retryAt: null, goodAt: null };
     const tile = azureTile(view(), true, false, null, limit);
-    expect(tile.health).toBe("attention");
-    expect(tile.note).toBe("rate limited");
+    expect(tile.health).toBe("ok");
+    expect(tile.note).toContain("rate limited");
+    expect(azureTile(view({ flags: [flag] }), true, false, null, limit).health).toBe("attention");
     expect(azureTile(view(), true, false, null).health).toBe("ok");
   });
 
@@ -301,6 +302,15 @@ describe("the card", () => {
     const node = await mount(context);
     expect(node.querySelector(".empty")?.textContent).toBe(note);
     expect(getTile("azure")).toMatchObject({ value: "Off", health: "idle" });
+  });
+
+  it("does not keep calling it not set up after a later read fails (2026-11-06 review)", async () => {
+    const { context } = stubContext([ok({ configured: false, note: "Not configured." }), failed(502, "upstream down")]);
+    await mount(context);
+    expect(getTile("azure")?.notSetUp).toBe(true);
+    await vi.advanceTimersByTimeAsync(POLL_MS);
+    expect(getTile("azure")).toMatchObject({ value: "Could not read", health: "attention" });
+    expect(getTile("azure")?.notSetUp).toBeUndefined();
   });
 
   it("tells a non-admin quietly that Azure spend is for admins, and stops asking", async () => {

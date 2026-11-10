@@ -3,6 +3,7 @@
 // spend strip (two bars against the credit, the headline per cadence, "as of"
 // the billing data, and its no access, never read and reading states). A GET
 // never wakes a warehouse: only Refresh posts a reading.
+import { getTile } from "../src/tiles";
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DatabricksOverview, DatabricksSpend, DatabricksWarehouse } from "../src/api";
@@ -39,6 +40,8 @@ import {
 } from "../src/databricks";
 import { activateFabric, deactivateFabric } from "../src/fabric";
 import css from "../src/style.css?raw";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -291,13 +294,17 @@ describe("the pieces", () => {
     expect(readAgeText(now - 3 * 86_400_000, now)).toBe("3 d ago");
   });
 
-  it("turns amber past 48 hours: the line, and the credit's health", () => {
+  it("flags a reading past 48 hours as stale, but the credit's health ignores age", () => {
     const now = Date.parse("2026-10-23T15:10:00Z");
     expect(readingIsStale(spend({ readAt: "2026-10-21T15:11:00Z" }), now)).toBe(false);
     expect(readingIsStale(spend({ readAt: "2026-10-21T15:10:00Z" }), now)).toBe(true);
     expect(readingIsStale(spend({ readAt: null }), now)).toBe(false);
-    expect(creditHealth(spend({ readAt: "2026-10-21T15:10:00Z" }), now)).toBe("attention");
-    expect(creditHealth(spend({ readAt: "2026-10-23T14:10:00Z" }), now)).toBe("ok");
+    expect(creditHealth(spend({ readAt: "2026-10-21T15:10:00Z" }))).toBe("ok");
+    expect(creditHealth(spend({ readAt: "2026-10-23T14:10:00Z" }))).toBe("ok");
+    expect(creditHealth(spend({ readAt: "2026-10-21T15:10:00Z", status: "error" }))).toBe("attention");
+    const old = "2026-10-21T15:10:00Z";
+    expect(creditHealth(spend({ readAt: old, monthUsd: 380, totalUsd: 380 }))).toBe("attention");
+    expect(creditHealth(spend({ readAt: old, monthUsd: 510, totalUsd: 510 }))).toBe("problem");
   });
 
   it("puts the reading's age in the tile note", () => {
@@ -913,6 +920,8 @@ describe("a signed-in non-admin (2026-10-28)", () => {
     const node = await mount(context);
     expect(node.textContent).toContain("Databricks is for admins.");
     expect(node.querySelector(".notice")).toBeNull();
+    expect(getTile("databricks")).toMatchObject({ value: "Admins only", health: "idle" });
+    expect(getTile("credit")).toMatchObject({ value: "Admins only", health: "idle" });
     window.dispatchEvent(new Event("focus"));
     await flush();
     expect(request).toHaveBeenCalledTimes(1);
@@ -940,5 +949,22 @@ describe("a false admin_only answer (2026-10-28)", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+    const { context } = stubContext({ [PATH]: [ok(overview([warehouse()]))] });
+    const node = await mount(context);
+    const link = () => node.querySelector(".needs-link");
+    expect(link()?.textContent).toBe("Reading Needs you...");
+    setAttention(needOverview([needItem("databricks-1", { source: "databricks", kind: "credit-over" })]));
+    expect(link()?.textContent).toBe("1 in Needs you");
+    setAttention(needOverview([]));
+    expect(link()?.textContent).toBe("Nothing needs you.");
   });
 });

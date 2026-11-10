@@ -478,6 +478,182 @@ async def test_a_card_is_cached_until_fresh(client: httpx.AsyncClient) -> None:
         assert routes["repo"].call_count == 1
 
 
+MERGED = {"state": "closed", "merged": True, "merged_at": "2026-11-08T10:00:00Z"}
+
+
+async def test_a_merged_card_is_read_again_only_after_its_own_longer_ttl(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The session panel polls every card every 30 s, merged ones included (2026-11-08).
+    with respx.mock(assert_all_called=False) as mock:
+        routes = mock_card(mock, 5, pull_extra=MERGED)
+        first = (await client.get(f"/v1/ae/prs/{REPO}/5")).json()
+        assert first["state"] == "merged"
+        monkeypatch.setattr(prs, "CARD_TTL_S", 0.0)
+        await client.get(f"/v1/ae/prs/{REPO}/5")
+        assert routes["pull"].call_count == 1
+        assert routes["runs"].call_count == 1
+        monkeypatch.setattr(prs, "MERGED_CARD_TTL_S", 0.0)
+        await client.get(f"/v1/ae/prs/{REPO}/5")
+        assert routes["pull"].call_count == 2
+        monkeypatch.setattr(prs, "MERGED_CARD_TTL_S", 6 * 3600.0)
+        await client.get(f"/v1/ae/prs/{REPO}/5?fresh=true")
+        assert routes["pull"].call_count == 3
+
+
+async def test_a_closed_card_is_read_again_only_after_its_own_ttl(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        routes = mock_card(mock, 5, pull_extra={"state": "closed"})
+        assert (await client.get(f"/v1/ae/prs/{REPO}/5")).json()["state"] == "closed"
+        monkeypatch.setattr(prs, "CARD_TTL_S", 0.0)
+        await client.get(f"/v1/ae/prs/{REPO}/5")
+        assert routes["pull"].call_count == 1
+        monkeypatch.setattr(prs, "CLOSED_CARD_TTL_S", 0.0)
+        await client.get(f"/v1/ae/prs/{REPO}/5")
+        assert routes["pull"].call_count == 2
+
+
+async def test_the_list_never_re_reads_a_merged_card_in_the_background(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sid = await session(client, "Long lead", "working")
+    with respx.mock(assert_all_called=False) as mock:
+        mock_tracked(mock, sid, [pr_url(5), pr_url(6)])
+        open_card = mock_card(mock, 5)
+        merged_card = mock_card(mock, 6, pull_extra=MERGED)
+        await client.get("/v1/ae/prs")
+        monkeypatch.setattr(prs, "CARD_TTL_S", 0.0)
+        listed = (await client.get("/v1/ae/prs")).json()
+        await _until(lambda: open_card["pull"].call_count == 2 and not prs._card_refreshes)
+    assert [card["number"] for card in listed["items"]] == [5]
+    assert merged_card["pull"].call_count == 1
+    assert merged_card["reviews"].call_count == 1
+
+
+# ── conditional reads (2026-11-08) ──────────────────────────────────────
+
+
+def etagged(
+    mock: respx.MockRouter, url: str, body: Any, tag: str
+) -> tuple[respx.Route, list[str | None]]:
+    """A GitHub read that answers 304 to its own ETag; records each If-None-Match sent."""
+    sent: list[str | None] = []
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        sent.append(request.headers.get("if-none-match"))
+        if request.headers.get("if-none-match") == tag:
+            return httpx.Response(304, headers={"etag": tag})
+        return httpx.Response(200, json=body, headers={"etag": tag})
+
+    return mock.get(url).mock(side_effect=answer), sent
+
+
+def etagged_card(mock: respx.MockRouter, number: int) -> dict[str, list[str | None]]:
+    runs = [{"status": "completed", "conclusion": "success"}]
+    reads = {
+        "pull": (f"{GH}/repos/{REPO}/pulls/{number}", pull(number)),
+        "reviews": (f"{GH}/repos/{REPO}/pulls/{number}/reviews", []),
+        "runs": (f"{GH}/repos/{REPO}/commits/{SHA}/check-runs", {"check_runs": runs}),
+        "statuses": (f"{GH}/repos/{REPO}/commits/{SHA}/status", {"statuses": []}),
+    }
+    mock.get(f"{GH}/repos/{REPO}").respond(200, json={"allow_squash_merge": True})
+    return {
+        name: etagged(mock, url, body, f'W/"{name}-1"')[1] for name, (url, body) in reads.items()
+    }
+
+
+async def test_an_unchanged_card_is_polled_with_its_etags(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with respx.mock(assert_all_called=False) as mock:
+        sent = etagged_card(mock, 5)
+        first = (await client.get(f"/v1/ae/prs/{REPO}/5")).json()
+        monkeypatch.setattr(prs, "CARD_TTL_S", 0.0)
+        again = (await client.get(f"/v1/ae/prs/{REPO}/5")).json()
+        assert {name: seen[0] for name, seen in sent.items()} == dict.fromkeys(sent)
+        # Every one of the four reads sent its ETag, and every 304 served the stored body.
+        assert {name: seen[1] for name, seen in sent.items()} == {
+            name: f'W/"{name}-1"' for name in sent
+        }
+        assert again == first
+        assert again["ci"]["state"] == "passing"
+        # A changed pull answers 200 with a new ETag, and the card shows it.
+        etagged(mock, f"{GH}/repos/{REPO}/pulls/5", pull(5, title="Renamed"), 'W/"pull-2"')
+        renamed = (await client.get(f"/v1/ae/prs/{REPO}/5")).json()
+    assert renamed["title"] == "Renamed"
+
+
+async def test_a_fresh_read_sends_no_etag_and_still_stores_the_new_one(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Merge, Ready and Update branch read fresh: their gates never act on a 304.
+    with respx.mock(assert_all_called=False) as mock:
+        sent = etagged_card(mock, 5)
+        await client.get(f"/v1/ae/prs/{REPO}/5")
+        prs.github.reset_etag_cache()
+        await client.get(f"/v1/ae/prs/{REPO}/5?fresh=true")
+        assert {name: seen[1] for name, seen in sent.items()} == dict.fromkeys(sent)
+        monkeypatch.setattr(prs, "CARD_TTL_S", 0.0)
+        await client.get(f"/v1/ae/prs/{REPO}/5")
+    assert {name: seen[2] for name, seen in sent.items()} == {
+        name: f'W/"{name}-1"' for name in sent
+    }
+
+
+async def test_a_null_mergeability_is_retried_once_not_on_every_poll(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sent: list[str | None] = []
+    answers = iter([pull(5, mergeable=None), pull(5)])
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        tag = request.headers.get("if-none-match")
+        sent.append(tag)
+        if tag == 'W/"p2"':
+            return httpx.Response(304, headers={"etag": tag})
+        return httpx.Response(200, json=next(answers), headers={"etag": f'W/"p{len(sent)}"'})
+
+    with respx.mock(assert_all_called=False) as mock:
+        mock_card(mock, 5)
+        mock.get(f"{GH}/repos/{REPO}/pulls/5").mock(side_effect=answer)
+        card = (await client.get(f"/v1/ae/prs/{REPO}/5")).json()
+        monkeypatch.setattr(prs, "CARD_TTL_S", 0.0)
+        polled = (await client.get(f"/v1/ae/prs/{REPO}/5")).json()
+    # The retry sends no ETag but stores its answer's, so the next poll is one 304.
+    assert sent == [None, None, 'W/"p2"']
+    assert card["mergeable"]["state"] == polled["mergeable"]["state"] == "clean"
+
+
+async def test_two_answers_from_one_etag_are_separate_objects() -> None:
+    settings = prs.github.GitHubSettings.from_env()
+    with respx.mock(assert_all_called=False) as mock:
+        etagged(mock, f"{GH}/repos/{REPO}/pulls/5", pull(5), 'W/"pull-1"')
+        async with prs.github.GitHubClient(settings) as gh:
+            first = await gh.pull(REPO, 5)
+            first["title"] = "changed by a caller"
+            second = await gh.pull(REPO, 5)
+            third = await gh.pull(REPO, 5)
+    assert second["title"] == "PR 5"
+    assert second is not third
+
+
+def test_the_etag_store_drops_its_oldest_bodies_past_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    github = prs.github
+    monkeypatch.setattr(github, "ETAG_CACHE_MAX_BYTES", 10)
+    first = github._etag_key(GH, "/a", None)
+    second = github._etag_key(GH, "/b", {"per_page": 100})
+    github._remember_etag(first, '"a"', b"12345")
+    github._remember_etag(second, '"b"', b"123456")
+    assert list(github._etags) == [second]
+    github._remember_etag(first, '"a"', b"12345678901")
+    assert first not in github._etags
+    assert github._etag_bytes == 6
+
+
 async def test_a_check_read_that_fails_keeps_the_button_off(client: httpx.AsyncClient) -> None:
     with respx.mock(assert_all_called=False) as mock:
         mock_card(mock, 5)

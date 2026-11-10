@@ -76,6 +76,43 @@ def list_top_level(
     return rows[:MAX_ROWS]
 
 
+class ScanTooLong(Exception):
+    """:func:`list_since` passed its row cap before reaching the cut-off time."""
+
+
+def list_since(
+    created_after: float, store: Any | None = None, *, cap: int = 5000
+) -> list[Conversation]:
+    """Every conversation created at or after *created_after*: archived and sub-agent rows too.
+
+    For checks that must not miss a row (2026-11-06, the judge copy check reads a session's
+    children): unlike :func:`list_top_level` it keeps archived rows and every owner's rows,
+    and it raises :class:`ScanTooLong` instead of silently stopping at a cap.
+    """
+    store = store if store is not None else get_conversation_store()
+    rows: list[Conversation] = []
+    after: str | None = None
+    while True:
+        page = store.list_conversations(
+            limit=PAGE_SIZE,
+            after=after,
+            kind=None,  # sub-agent children too: the owner can type into a Codex side chat
+            include_archived=True,
+            order="desc",
+            sort_by="created_at",
+            accessible_by=None,
+        )
+        for row in page.data:
+            if (getattr(row, "created_at", 0) or 0) < created_after:
+                return rows
+            rows.append(row)
+            if len(rows) > cap:
+                raise ScanTooLong
+        if not page.has_more or not page.last_id:
+            return rows
+        after = page.last_id
+
+
 def current_conversation_id() -> str | None:
     """The conversation the request being handled belongs to, or ``None`` off a session route."""
     return current_session_id()
@@ -327,6 +364,7 @@ __all__ = [
     "IDLE",
     "MAX_ROWS",
     "PAGE_SIZE",
+    "ScanTooLong",
     "SessionSummary",
     "children_of",
     "current_conversation_id",
@@ -340,6 +378,7 @@ __all__ = [
     "is_failed",
     "is_helper",
     "is_top_level",
+    "list_since",
     "list_top_level",
     "own_row",
     "slots_held",

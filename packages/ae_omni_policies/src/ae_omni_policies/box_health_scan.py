@@ -36,6 +36,9 @@ DAY_S = 86400.0
 
 UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 
+GROUP_MAX_ENTRIES = 100_000
+"""Default share of a scan's entry cap one group (a Claude session, a pytest run) may use."""
+
 Entry = tuple[tuple[str, ...], bool, float, int]
 """A path below a scan's root as name parts, whether it is a folder, its mtime and its size."""
 
@@ -52,13 +55,36 @@ class Budget:
         self.entries_left = max_entries
         self._clock = clock
         self._deadline = clock() + max_seconds
+        self.parent: Budget | None = None
         self.exhausted = False
         self.partial = False
+        self.capped = False
+        """Set on a child whose own share ran out; the parent is untouched."""
+
+    def child(self, max_entries: int) -> Budget:
+        """A share of this budget for one group: its own entry cap, and every entry it
+        counts is spent from this budget too (so this budget's entry cap and seconds cap
+        still bind). Running out of the share marks only the child ``exhausted``,
+        ``partial`` and ``capped``; this budget stays open for the next group."""
+        kid = Budget(max_entries, 0.0, self._clock)
+        kid.parent = self
+        return kid
 
     def spend(self) -> bool:
         """Count one entry; ``False`` once the entry cap or the seconds cap is spent."""
         if self.exhausted:
             return False
+        parent = self.parent
+        if parent is not None:
+            # The share is checked first so a refused entry never costs the parent.
+            if self.entries_left <= 0:
+                self.exhausted = self.partial = self.capped = True
+                return False
+            if not parent.spend():
+                self.exhausted = self.partial = True
+                return False
+            self.entries_left -= 1
+            return True
         if self.entries_left <= 0 or self._clock() > self._deadline:
             self.exhausted = True
             self.partial = True
@@ -272,6 +298,7 @@ def scan_tree(
     stale_days: float,
     budget: Budget,
     group_depth: int,
+    group_max_entries: int = GROUP_MAX_ENTRIES,
     locks: frozenset[tuple[int, int, int]] = frozenset(),
     live: frozenset[str] | set[str] = frozenset(),
 ) -> TreeScan:
@@ -281,7 +308,9 @@ def scan_tree(
     ``readable=False`` with the folder's own age, which is all the box can say about
     another user's folder. *group_depth* is how many name parts make a group (2 for
     a Claude session, 1 for a pytest run); the walk goes group by group so a cap
-    that stops one marks only that group unproven.
+    that stops one marks only that group unproven. Each group walks under its own
+    share of *budget* (*group_max_entries*): a group past its share is marked unproven
+    and the walk goes on with the next group; only *budget* itself running out ends it.
     """
     try:
         top = os.lstat(root)
@@ -303,7 +332,7 @@ def scan_tree(
         for entry in handle:
             if not budget.spend():
                 break
-            _visit_level1(acc, entry, group_depth, budget, locks, live)
+            _visit_level1(acc, entry, key, group_depth, budget, group_max_entries, locks, live)
             if budget.exhausted:
                 break
     scan = acc.finish(now, stale_days, partial=budget.partial)
@@ -314,8 +343,10 @@ def scan_tree(
 def _visit_level1(
     acc: Accumulator,
     entry: os.DirEntry[str],
+    key: GroupKey,
     group_depth: int,
     budget: Budget,
+    group_max_entries: int,
     locks: frozenset[tuple[int, int, int]],
     live: frozenset[str] | set[str],
 ) -> None:
@@ -329,9 +360,12 @@ def _visit_level1(
     if not is_dir:
         return
     if group_depth == 1:
-        _feed(acc, entry.path, (entry.name,), budget, group=(entry.name,))
+        group = key((entry.name,))
+        # Only a real group (a pytest run) gets a share; any other folder is a loose tree.
+        share = budget.child(group_max_entries) if group is not None else budget
+        _feed(acc, entry.path, (entry.name,), share, group=group)
     elif entry.name.startswith("-"):
-        _feed_level2(acc, entry.path, entry.name, budget, locks, live)
+        _feed_level2(acc, entry.path, entry.name, budget, group_max_entries, locks, live)
     else:
         _feed(acc, entry.path, (entry.name,), budget, group=None)
 
@@ -344,13 +378,20 @@ def _feed(
     *,
     group: tuple[str, ...] | None,
 ) -> None:
-    """Add the tree below *path* to *acc*; mark *group* unproven if the walk was cut short."""
+    """Add the tree below *path* to *acc*; mark *group* unproven if the walk was cut short.
+
+    *budget* is the group's share (a child) or the scan budget itself for a loose tree; a
+    share is folded back into its parent's ``partial`` so the scan still reads "at least".
+    """
     before = budget.partial
     budget.partial = False
     for rel, is_dir, mtime, size in iter_tree(path, budget):
         acc.add((*prefix, *rel), is_dir, mtime, size)
     cut = budget.partial
     budget.partial = before or cut
+    parent = budget.parent
+    if parent is not None and cut:
+        parent.partial = True
     if cut:
         acc.partial = True
         if group is not None:
@@ -362,6 +403,7 @@ def _feed_level2(
     path: str,
     project: str,
     budget: Budget,
+    group_max_entries: int,
     locks: frozenset[tuple[int, int, int]],
     live: frozenset[str] | set[str],
 ) -> None:
@@ -389,7 +431,8 @@ def _feed_level2(
                 ident = (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
                 if key is not None and (child.path in live or ident in locks):
                     acc.mark_held(key)
-                _feed(acc, child.path, parts, budget, group=key)
+                share = budget.child(group_max_entries) if key is not None else budget
+                _feed(acc, child.path, parts, share, group=key)
             if budget.exhausted:
                 return
 
@@ -400,6 +443,7 @@ def scan_claude_root(
     now: float,
     stale_days: float,
     budget: Budget,
+    group_max_entries: int = GROUP_MAX_ENTRIES,
     locks: frozenset[tuple[int, int, int]] = frozenset(),
     live: frozenset[str] | set[str] = frozenset(),
 ) -> TreeScan:
@@ -410,6 +454,7 @@ def scan_claude_root(
         stale_days=stale_days,
         budget=budget,
         group_depth=2,
+        group_max_entries=group_max_entries,
         locks=locks,
         live=live,
     )
@@ -503,9 +548,22 @@ def read_locks(path: str = "/proc/locks") -> frozenset[tuple[int, int, int]]:
     return frozenset(out)
 
 
-def scan_pytest_root(root: str, *, now: float, stale_days: float, budget: Budget) -> TreeScan:
+def scan_pytest_root(
+    root: str,
+    *,
+    now: float,
+    stale_days: float,
+    budget: Budget,
+    group_max_entries: int = GROUP_MAX_ENTRIES,
+) -> TreeScan:
     return scan_tree(
-        root, pytest_key, now=now, stale_days=stale_days, budget=budget, group_depth=1
+        root,
+        pytest_key,
+        now=now,
+        stale_days=stale_days,
+        budget=budget,
+        group_depth=1,
+        group_max_entries=group_max_entries,
     )
 
 
@@ -691,6 +749,7 @@ def scan_tmp(root: str, *, now: float, stale_days: float, budget: Budget) -> Tmp
 
 
 __all__ = [
+    "GROUP_MAX_ENTRIES",
     "LITTER_GROUPS",
     "Accumulator",
     "Budget",

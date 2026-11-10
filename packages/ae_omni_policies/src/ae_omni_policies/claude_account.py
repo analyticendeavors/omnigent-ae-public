@@ -5,12 +5,12 @@ launch keeps the last login), so moving it is a deliberate act: this module
 stores the new login on the session, then asks the chat's runner to restart its
 Claude terminal, which resumes the same conversation on the new subscription.
 
-======================================================  ====================================
-Route                                                   Answers
-======================================================  ====================================
-``PUT  /sessions/{id}/claude-account``                  ``{"account", "relaunched"}``
-``POST /claude-account/move-all``                       ``{"moved", "skipped", "pending"}``
-======================================================  ====================================
+========================================  ==============================================
+Route                                     Answers
+========================================  ==============================================
+``PUT  /sessions/{id}/claude-account``    ``{"account", "relaunched"}``
+``POST /claude-account/move-all``         ``{"moved", "skipped", "pending", "queued"}``
+========================================  ==============================================
 
 The login rides on the session as ``omnigent.claude_native.account``, the label
 a fork's pick uses and the runner reads at launch. It is server-internal for
@@ -26,8 +26,10 @@ listed, not failed.
 
 Runner answers: 2xx is ``relaunched``; a refusal (a reply or approval in
 progress, a terminal that would not start) puts the old label back and passes
-through; no runner bound keeps the label (the next launch uses it); no answer
-within the budget is a 202, because the restart may have happened.
+through; no runner bound keeps the label (the next launch uses it) and answers
+``"queued": true`` (added 2026-11-09, so the web says the chat moves at its next
+message rather than now); no answer within the budget is a 202, because the
+restart may have happened.
 """
 
 from __future__ import annotations
@@ -74,6 +76,9 @@ LOCAL_OWNER = "local"
 _SESSION_PATH = Annotated[str, Path(min_length=1, max_length=128)]
 _locks: weakref.WeakValueDictionary[str, asyncio.Lock] = weakref.WeakValueDictionary()
 _RUNNER_CODES = {400: ErrorCode.INVALID_INPUT, 409: ErrorCode.CONFLICT}
+# Marks a switch answered with no terminal running: the chat starts on the login next time.
+_QUEUED = {"queued": True}
+QUEUED_REASON = "starts at its next message"
 
 
 class AccountBody(BaseModel):
@@ -177,17 +182,21 @@ async def switch(request: Request, user: str | None, conv: Any, account: str) ->
         labels = conv.labels or {}
         old = labels.get(CLAUDE_ACCOUNT_LABEL_KEY)
         old_live = labels.get(limits.ACCOUNT_LIVE_LABEL)
-        if old == account and current_account(labels) == account:
-            return {"account": account, "relaunched": False}
-        await asyncio.to_thread(
-            get_conversation_store().set_labels, conv.id, {CLAUDE_ACCOUNT_LABEL_KEY: account}
-        )
-        if current_account(labels) == account:
-            # The terminal already runs on it; the label above just locks the chat there.
-            return {"account": account, "relaunched": False}
         runner_router = get_server_runner_router()
-        if await facade._get_runner_client(conv.id, runner_router) is None:
+        bound = await facade._get_runner_client(conv.id, runner_router) is not None
+        if old != account:
+            await asyncio.to_thread(
+                get_conversation_store().set_labels, conv.id, {CLAUDE_ACCOUNT_LABEL_KEY: account}
+            )
+        if old_live == account and old in (None, account):
+            # The terminal last launched on it and no other login is stored: nothing to restart.
             return {"account": account, "relaunched": False}
+        if old_live is None and old == account:
+            # Never stamped: a launch reads the stored pick, so a running terminal is on it.
+            return {"account": account, "relaunched": False, **({} if bound else _QUEUED)}
+        if not bound:
+            # No terminal is running: the next launch reads the label (``queued`` tells the web).
+            return {"account": account, "relaunched": False, **_QUEUED}
         result = await facade._forward_session_change_to_runner(
             conv.id, runner_router, {"type": CHANGE_EVENT}, timeout_s=FORWARD_TIMEOUT_S
         )
@@ -197,7 +206,18 @@ async def switch(request: Request, user: str | None, conv: Any, account: str) ->
         if not 200 <= result.status_code < 300:
             await _restore(conv.id, old, old_live)
             raise _refusal(result.status_code, result.body)
+        # The runner relaunched on the stored pick; stamp it here too, since its own stamp
+        # is best effort and a missed one would leave the web showing the old login.
+        await asyncio.to_thread(
+            get_conversation_store().set_labels, conv.id, {limits.ACCOUNT_LIVE_LABEL: account}
+        )
         return {"account": account, "relaunched": True}
+
+
+def settled(labels: dict[str, str] | None, account: str) -> bool:
+    """Whether the chat runs on *account* with no other login stored: a switch changes nothing."""
+    stored = (labels or {}).get(CLAUDE_ACCOUNT_LABEL_KEY)
+    return current_account(labels) == account and stored in (None, account)
 
 
 async def _may_write(user: str | None, session_id: str) -> bool:
@@ -219,14 +239,16 @@ async def put_claude_account(
 ) -> dict[str, Any] | JSONResponse:
     """Switch the chat's Claude login and restart its terminal on it.
 
-    Owner only (an admin counts). 200 ``{"account", "relaunched"}``; 202 with
+    Owner only (an admin counts). 200 ``{"account", "relaunched"}`` (plus
+    ``"queued": true`` when no terminal is running to restart); 202 with
     ``"pending": true`` when the runner did not answer in time; 409 when a reply
     or approval is in progress; 400, 403 or 409 from the fork checks when the
     chat or host cannot use the login.
 
     With ``include_children`` the answer also holds ``children``
-    (``{"moved", "skipped", "pending"}``, each a list of ``{id, title}`` rows, the
-    last two with a ``reason``; ``error`` is added when the cascade itself failed and
+    (``{"moved", "skipped", "pending", "queued"}``, each a list of ``{id, title}`` rows,
+    the last three with a ``reason``; a queued child had no terminal running and starts
+    on the login at its next message; ``error`` is added when the cascade itself failed and
     no child was attempted). It runs only after the chat's own switch went
     through or is pending; a refused chat leaves its children alone. The status is
     202 only when the chat itself is pending.
@@ -259,6 +281,7 @@ async def put_claude_account(
                 "moved": [],
                 "skipped": [],
                 "pending": [],
+                "queued": [],
                 "error": "children not attempted",
             }
     if answer.get("pending"):
@@ -327,15 +350,16 @@ async def _switch_children(
     family = await asyncio.to_thread(_descendants, parent.id, rows, owner_of)
     todo = []
     for child in family:
-        if child.agent_id is None or current_account(child.labels) == account:
+        if child.agent_id is None or settled(child.labels, account):
             continue
         if await _may_write(user, child.id):
             todo.append(child)
-    moved, skipped, pending = await _move_many(request, user, todo, account)
+    moved, skipped, pending, queued = await _move_many(request, user, todo, account)
     return {
         "moved": [{"id": c.id, "title": c.title or c.id} for c in moved],
         "skipped": skipped,
         "pending": pending,
+        "queued": queued,
     }
 
 
@@ -354,7 +378,8 @@ async def move_all_claude_chats(
     Chats already on the login are left alone; a chat in the middle of a reply,
     or that the fork checks refuse, is listed in ``skipped`` with its reason. A
     chat not finished within :data:`MOVE_ALL_CAP_S` is listed in ``pending``
-    and keeps switching.
+    and keeps switching. A chat with no terminal running is listed in ``queued``:
+    its login is stored and it starts on it at its next message.
     Chats that have no Claude login to move (other harnesses, provider
     credentials) are not listed at all.
     """
@@ -367,19 +392,26 @@ async def move_all_claude_chats(
     for conv in rows:
         if conv.agent_id is None or (body.host_id and conv.host_id != body.host_id):
             continue
-        if current_account(conv.labels) == body.account:
+        if settled(conv.labels, body.account):
             continue
         if not await _may_write(user, conv.id):
             continue
         todo.append(conv)
-    moved, skipped, pending = await _move_many(request, user, todo, body.account)
-    return {"moved": [conv.id for conv in moved], "skipped": skipped, "pending": pending}
+    moved, skipped, pending, queued = await _move_many(request, user, todo, body.account)
+    return {
+        "moved": [conv.id for conv in moved],
+        "skipped": skipped,
+        "pending": pending,
+        "queued": queued,
+    }
 
 
 async def _move_many(
     request: Request, user: str | None, convs: list[Any], account: str
-) -> tuple[list[Any], list[dict[str, str]], list[dict[str, str]]]:
-    """Switch *convs* a few at a time: ``(moved chats, skipped rows, still-pending rows)``.
+) -> tuple[list[Any], list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
+    """Switch *convs* a few at a time: ``(moved, skipped rows, still-pending rows, queued rows)``.
+
+    A queued chat had no terminal running: its login is stored and it starts on it next time.
 
     Answers after :data:`MOVE_ALL_CAP_S`; a chat not done by then is listed pending and
     finishes alone. Chats with no Claude login to move are left out of all three.
@@ -399,6 +431,7 @@ async def _move_many(
     moved: list[Any] = []
     skipped: list[dict[str, str]] = []
     pending: list[dict[str, str]] = []
+    queued: list[dict[str, str]] = []
     for conv in convs:
         task = tasks[conv.id]
         if not task.done():
@@ -410,15 +443,17 @@ async def _move_many(
         outcome, row = task.result()
         if outcome == "moved":
             moved.append(conv)
+        elif outcome == "queued" and row is not None:
+            queued.append(row)
         elif row is not None:
             skipped.append(row)
-    return moved, skipped, pending
+    return moved, skipped, pending, queued
 
 
 async def _move_one(
     request: Request, user: str | None, conv: Any, account: str
 ) -> tuple[str, dict[str, str] | None]:
-    """One chat of a move-all: ``("moved"|"skipped"|"ignored", the skipped row)``."""
+    """One chat of a move-all: ``("moved"|"queued"|"skipped"|"ignored", its row)``."""
 
     def row(reason: str) -> dict[str, str]:
         return {"id": conv.id, "title": conv.title or conv.id, "reason": reason}
@@ -427,7 +462,7 @@ async def _move_one(
     if not await _may_write(user, conv.id):
         return "ignored", None
     try:
-        await switch(request, user, conv, account)
+        answer = await switch(request, user, conv, account)
     except Refused as refused:
         return "skipped", row(BUSY_REASON if refused.code == BUSY_CODE else refused.detail)
     except OmnigentError as exc:
@@ -437,4 +472,6 @@ async def _move_one(
     except Exception:  # noqa: BLE001 (one chat's failure must not stop the rest)
         _logger.warning("move-all: could not switch %s", conv.id, exc_info=True)
         return "skipped", row("could not be switched")
+    if answer.get("queued"):
+        return "queued", row(QUEUED_REASON)
     return "moved", None

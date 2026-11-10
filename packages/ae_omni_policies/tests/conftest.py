@@ -58,18 +58,42 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.delenv("AE_BOX_USER_LABELS", raising=False)
     monkeypatch.delenv("AE_BOX_ADMINS", raising=False)
     monkeypatch.setenv("AE_COST_TARGETS_FILE", "")
+    # Needs you dismissals stay in memory and the five-minute cleanup loop is off; only
+    # test_attention.py runs either.
+    monkeypatch.setenv("AE_ATTENTION_DISMISSALS_FILE", "")
+    monkeypatch.setenv("AE_ATTENTION_TIDY", "0")
     monkeypatch.setenv("AE_COST_ALERT_STATE_FILE", "")
+    # The Social card keeps its state in memory unless a test points the file somewhere.
+    monkeypatch.setenv("AE_SOCIAL_FILE", "")
+    # The card switches stay in memory, and no private card is opted in (2026-11-07).
+    monkeypatch.setenv("AE_ADMIN_CARDS_FILE", "")
+    monkeypatch.delenv("AE_PRIVATE_CARDS", raising=False)
+    # Saved GitHub tokens and personal Git lists stay in memory; no key is set unless a test does.
+    monkeypatch.setenv("AE_CARD_SECRETS_FILE", "")
+    monkeypatch.setenv("AE_GIT_PERSONAL_FILE", "")
+    monkeypatch.delenv("AE_CARD_SECRETS_KEY", raising=False)
+    # Recorded desktop sign-ins stay in memory; test_desktop_signin.py points the file at tmp_path.
+    monkeypatch.setenv("AE_DESKTOP_SIGNINS_FILE", "")
+    monkeypatch.delenv("AE_DESKTOP_SIGNIN_REAUTH", raising=False)
     from ae_omni_policies import (
+        admin_cards,
+        attention_dismissals,
         auth,
         box_health,
         box_health_cleanup,
+        card_secrets,
         cost_targets,
+        decision_status,
+        desktop_signin,
+        git_center,
+        git_personal,
         prs,
         router,
         secret_alerts,
         secret_owners,
         secrets_meta,
         slot_cap,
+        social,
         taskstore,
     )
 
@@ -84,12 +108,20 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     # The lot, tag and pull request caches outlive a request (2026-09-26).
     router.reset_lot_cache()
     prs.reset_cache()
+    decision_status.reset()
     secrets_meta.reset_store()
     box_health.reset_store()
     box_health_cleanup.reset_store()
     secret_owners.reset_store()
     secret_alerts.reset_store()
     cost_targets.reset_stores()
+    attention_dismissals.reset_store()
+    git_center.reset_cache()
+    social.reset_store()
+    admin_cards.reset_store()
+    card_secrets.reset_store()
+    git_personal.reset_store()
+    desktop_signin.reset_store()
     yield
     auth.reset_provider_cache()
     slot_cap.reset_pending_claims()
@@ -102,6 +134,12 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     secret_owners.reset_store()
     secret_alerts.reset_store()
     cost_targets.reset_stores()
+    attention_dismissals.reset_store()
+    git_center.reset_cache()
+    admin_cards.reset_store()
+    card_secrets.reset_store()
+    git_personal.reset_store()
+    desktop_signin.reset_store()
 
 
 @pytest.fixture(autouse=True)

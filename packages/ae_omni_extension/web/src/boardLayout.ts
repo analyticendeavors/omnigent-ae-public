@@ -1,35 +1,36 @@
-// Where each Admin Center card sits (2026-10-22): the default columns, the
-// arrangement the owner saved by dragging, and the pure steps that move a card.
+// Where each Admin Center card sits (2026-10-22), and since 2026-11-07 one packed board.
 //
-// Why: the cards sit in fixed column stacks (board.ts), and the default left
-// holes under the short columns. The owner asked for the Box health card under
-// Deploys and Databricks credit under Azure spend, and to be able to drag a
-// card elsewhere. The arrangement is saved per column count (two and three;
-// a phone is one column and is not arranged), in the SDK's `storage.user`
-// like the card folds (sections.ts), so dragging on a wide page never changes
-// the two-column view.
+// Why: the cards sit in column stacks (board.ts). On two or more columns the board is packed:
+// Needs you is the first tile of column 1, then every card goes into the shortest column by its
+// guessed height. The owner can drag a card anywhere on the board; that arrangement is saved per
+// column count (2, 3 and 4), for the whole board, in the SDK's `storage.user` like the card
+// folds (sections.ts). A phone is one column and is not arranged.
 //
-// A saved arrangement is read defensively: a card id the page no longer has is
-// dropped, a card listed twice keeps its first place, and a card the saved
-// arrangement lacks (one added after it was saved) goes to its default
-// column. An arrangement that is the wrong shape or has no known card left is
-// ignored, so a bad value can never leave the page without a card.
+// 2026-11-07 (packed board): the saved value moved to a new key, `board.packed`, shaped
+// {"2": [[..],[..]], "3": [...], "4": [...]} (only the counts the owner dragged). The old
+// per-group `board.layout` is no longer read and not deleted, so a revert gets it back.
+//
+// A saved arrangement is read defensively: a card id the board no longer has is dropped, a card
+// listed twice keeps its first place, and a card the save lacks (one added after it was saved)
+// goes to the shortest column by guess. A value that is the wrong shape, the wrong column count
+// or has no known card left is ignored, so a bad value can never leave the page without a card.
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import type { CardId } from "./board";
 
-export const LAYOUT_KEY = "board.layout";
+export const LAYOUT_KEY = "board.packed";
 
-export type Columns = 1 | 2 | 3;
+export type Columns = 1 | 2 | 3 | 4;
+export type Packed = 2 | 3 | 4;
 export type Layout = CardId[][];
-export type Defaults = Record<Columns, Layout>;
 export type Direction = "up" | "down" | "left" | "right";
 
-type Saved = Partial<Record<"2" | "3", string[][]>>;
+type Key = "2" | "3" | "4";
+const KEYS: readonly Key[] = ["2", "3", "4"];
 
-let saved: Saved = {};
+let saved: Partial<Record<Key, string[][]>> = {};
 /** Column counts changed on the page before the stored arrangement arrived; they win over it. */
-const touched = new Set<"2" | "3">();
+const touched = new Set<Key>();
 let persist: (() => void) | null = null;
 const listeners = new Set<() => void>();
 
@@ -60,17 +61,19 @@ export async function loadBoardLayout(context: ExtensionContext): Promise<void> 
   try {
     const found = await context.storage.user.get<unknown>(LAYOUT_KEY);
     if (found && typeof found === "object" && !Array.isArray(found)) {
-      const next: Saved = {};
+      const next: Partial<Record<Key, string[][]>> = {};
       let changed = false;
-      for (const key of ["2", "3"] as const) {
+      for (const key of KEYS) {
         // A drag or a reset made while the read was out is newer than what it read.
         if (touched.has(key)) {
           if (saved[key]) next[key] = saved[key];
           continue;
         }
-        const columns = (found as Record<string, unknown>)[key];
-        if (isColumns(columns)) {
-          next[key] = columns;
+        const entry = (found as Record<string, unknown>)[key];
+        // Only a save the board would use counts: one column per column and at least one card,
+        // or Reset layout would show for a layout that is not on the page.
+        if (isColumns(entry) && entry.length === Number(key) && entry.some((col) => col.length > 0)) {
+          next[key] = entry;
           changed = true;
         }
       }
@@ -79,16 +82,71 @@ export async function loadBoardLayout(context: ExtensionContext): Promise<void> 
       if (changed) notify();
     }
   } catch {
-    // Same as a failed write: the default layout.
+    // Same as a failed write: the packed default.
   }
 }
 
-/** The columns for *n*: the saved arrangement mended against *known*, else the default. */
-export function arrangement(n: Columns, defaults: Defaults, known: readonly CardId[]): Layout {
-  const base = defaults[n];
-  if (n === 1) return base;
-  const mine = saved[String(n) as "2" | "3"];
-  if (!mine || mine.length !== n) return base;
+/**
+ * How tall each card is on the packed board, in px, measured live 2026-11-07 at about 435 px a
+ * card (three columns on a 4:3 screen; narrower cards are taller, so these err tall). Unsaved
+ * cards are placed by these alone (never by what is rendered), so where a card goes depends only
+ * on the card set and the column count and never moves after render.
+ */
+export const CARD_HEIGHT_GUESS: Record<CardId, number> = {
+  deploys: 194,
+  git: 504,
+  social: 511,
+  box: 549,
+  accounts: 430,
+  presets: 398,
+  compute: 493,
+  credit: 256,
+  azure: 747,
+  vault: 621,
+  decision: 282,
+  // 2026-11-08: three rows and a link line, about the Decision card's height.
+  "home-security": 260,
+};
+
+/** A card's guessed height; a card with no guess counts as this. */
+export const DEFAULT_CARD_HEIGHT = 300;
+export const guessHeight = (id: CardId): number => CARD_HEIGHT_GUESS[id] ?? DEFAULT_CARD_HEIGHT;
+
+/** The Needs you tile at the head of column 1 (2026-11-07), sources folded: 360 to 466 px live. 360 packed best at 2, 3 and 4 columns in the live check. */
+export const NEEDS_YOU_HEIGHT_GUESS = 360;
+
+/** Put *id* into the shortest of *columns* (ties go left), by *heights* so far. */
+function place(columns: Layout, heights: number[], id: CardId, heightOf: (id: CardId) => number): void {
+  let best = 0;
+  for (let i = 1; i < columns.length; i += 1) if (heights[i] < heights[best]) best = i;
+  columns[best].push(id);
+  heights[best] += heightOf(id);
+}
+
+/** *ids* in order, each into the shortest column so far; column 1 starts with the Needs you tile. */
+export function packLayout(
+  n: Packed,
+  ids: readonly CardId[],
+  heightOf: (id: CardId) => number = guessHeight,
+): Layout {
+  const columns: Layout = Array.from({ length: n }, () => []);
+  const heights = new Array<number>(n).fill(0);
+  heights[0] = NEEDS_YOU_HEIGHT_GUESS;
+  for (const id of ids) place(columns, heights, id, heightOf);
+  return columns;
+}
+
+/**
+ * The columns of the packed board for *n*: the saved arrangement mended against *known* (the cards
+ * on the board, in default order), else packed by guess. Always *n* columns.
+ */
+export function packedArrangement(
+  n: Packed,
+  known: readonly CardId[],
+  heightOf: (id: CardId) => number = guessHeight,
+): Layout {
+  const mine = saved[String(n) as Key];
+  if (!mine || mine.length !== n) return packLayout(n, known, heightOf);
   const seen = new Set<string>();
   const columns = mine.map((col) =>
     col.filter((id) => {
@@ -97,36 +155,31 @@ export function arrangement(n: Columns, defaults: Defaults, known: readonly Card
       return true;
     }),
   ) as Layout;
-  if (seen.size === 0) return base;
-  for (const id of known) {
-    if (seen.has(id)) continue;
-    columns[
-      Math.max(
-        0,
-        base.findIndex((col) => col.includes(id)),
-      )
-    ].push(id);
-  }
+  if (seen.size === 0) return packLayout(n, known, heightOf);
+  const heights = columns.map((col, at) =>
+    col.reduce((sum, id) => sum + heightOf(id), at === 0 ? NEEDS_YOU_HEIGHT_GUESS : 0),
+  );
+  for (const id of known) if (!seen.has(id)) place(columns, heights, id, heightOf);
   return columns;
 }
 
-/** Remember *layout* for *n* columns and tell the board. */
-export function setArrangement(n: 2 | 3, layout: Layout): void {
-  touched.add(String(n) as "2" | "3");
-  saved = { ...saved, [String(n)]: layout.map((col) => [...col]) };
+/** Remember *layout* as the board's columns for *n* columns, the other counts untouched, and tell the board. */
+export function setArrangement(n: Packed, layout: Layout): void {
+  const key = String(n) as Key;
+  touched.add(key);
+  saved = { ...saved, [key]: layout.map((col) => [...col]) };
   write();
 }
 
-/** Forget every saved arrangement: the default layout again. */
+/** Forget every saved arrangement: the packed default again. */
 export function resetArrangement(): void {
-  touched.add("2");
-  touched.add("3");
+  for (const key of KEYS) touched.add(key);
   saved = {};
   write();
 }
 
 /** Whether an arrangement is saved, for *n* columns when given, for any width otherwise. */
-export function hasArrangement(n?: 2 | 3): boolean {
+export function hasArrangement(n?: Packed): boolean {
   return n === undefined ? Object.keys(saved).length > 0 : String(n) in saved;
 }
 

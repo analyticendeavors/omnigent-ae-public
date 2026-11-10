@@ -53,6 +53,7 @@ class _Runner:
 
     def __init__(self) -> None:
         self.bound = True
+        self.unbound: set[str] = set()
         self.answers: dict[str, tuple[int, dict[str, str]] | None] = {}
         self.delays: dict[str, float] = {}
         self.in_flight = 0
@@ -76,7 +77,7 @@ def world(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
             raise refusals[source.id]
 
     async def bound(_session_id: str, _router: Any, **_kw: Any) -> Any:
-        return object() if runner.bound else None
+        return object() if runner.bound and _session_id not in runner.unbound else None
 
     async def forward(
         session_id: str, _router: Any, event: dict[str, Any], timeout_s: float = 5.0
@@ -182,9 +183,48 @@ async def test_no_runner_keeps_the_label(
     world.runner.bound = False
     response = await _put(client, "conv_a", "Backup")
     assert response.status_code == 200
-    assert response.json() == {"account": "Backup", "relaunched": False}
+    assert response.json() == {"account": "Backup", "relaunched": False, "queued": True}
     assert world.store.chats["conv_a"][KEY] == "Backup"
     assert world.runner.sent == []
+
+
+async def test_a_repeated_switch_with_no_terminal_and_no_stamp_stays_queued(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    world.runner.bound = False
+    await _put(client, "conv_a", "Backup")
+    response = await _put(client, "conv_a", "Backup")
+    assert response.json() == {"account": "Backup", "relaunched": False, "queued": True}
+
+
+async def test_picking_the_live_login_over_another_stored_one_with_no_terminal_is_queued(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    # Move all stored Backup while the chat was idle; picking Work again cancels that.
+    world.runner.bound = False
+    world.store.chats["conv_a"].update({KEY: "Backup", limits.ACCOUNT_LIVE_LABEL: "Work"})
+    response = await _put(client, "conv_a", "Work")
+    assert response.json() == {"account": "Work", "relaunched": False, "queued": True}
+    assert world.store.chats["conv_a"][KEY] == "Work"
+
+
+async def test_a_stale_live_label_with_another_login_stored_restarts_the_terminal(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    # The runner's own stamp failed after a restart onto Backup, so the live label still says Work.
+    world.store.chats["conv_a"].update({KEY: "Backup", limits.ACCOUNT_LIVE_LABEL: "Work"})
+    response = await _put(client, "conv_a", "Work")
+    assert response.json() == {"account": "Work", "relaunched": True}
+    assert [sent[0] for sent in world.runner.sent] == ["conv_a"]
+
+
+async def test_a_relaunch_stamps_the_live_label(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    world.store.chats["conv_a"].update({KEY: "Work", limits.ACCOUNT_LIVE_LABEL: "Work"})
+    response = await _put(client, "conv_a", "Backup")
+    assert response.json() == {"account": "Backup", "relaunched": True}
+    assert world.store.chats["conv_a"][limits.ACCOUNT_LIVE_LABEL] == "Backup"
 
 
 async def test_an_unanswered_restart_is_a_pending_202(
@@ -262,6 +302,7 @@ async def test_move_all_moves_idle_chats_skips_busy_and_leaves_same_login(
         "moved": ["conv_a"],
         "skipped": [{"id": "conv_b", "title": "Chat conv_b", "reason": "mid-reply"}],
         "pending": [],
+        "queued": [],
     }
     assert sorted(sent[0] for sent in world.runner.sent) == ["conv_a", "conv_b"]
     assert world.store.chats["conv_b"] == {}
@@ -345,6 +386,7 @@ async def test_the_flag_moves_children_and_grandchildren(
         ],
         "skipped": [],
         "pending": [],
+        "queued": [],
     }
     assert world.store.chats["conv_d"][KEY] == "Backup"
     assert world.store.chats["conv_b"] == {}
@@ -413,7 +455,7 @@ async def test_another_users_session_naming_the_lead_is_never_moved(
     world.store.owners["conv_c"] = "stranger"
     # An admin passes the write check on the stranger's session; the owner check stops it.
     body = (await _put_family(client, "conv_a")).json()
-    assert body["children"] == {"moved": [], "skipped": [], "pending": []}
+    assert body["children"] == {"moved": [], "skipped": [], "pending": [], "queued": []}
     assert world.store.chats["conv_c"] == {"ae.orch": "conv_a"}
     assert "conv_c" not in [sent[0] for sent in world.runner.sent]
 
@@ -437,7 +479,7 @@ async def test_non_claude_and_same_login_children_are_left_out(
     )
     world.store.chats["conv_d"][limits.ACCOUNT_LIVE_LABEL] = "Backup"
     body = (await _put_family(client, "conv_a")).json()
-    assert body["children"] == {"moved": [], "skipped": [], "pending": []}
+    assert body["children"] == {"moved": [], "skipped": [], "pending": [], "queued": []}
 
 
 async def test_without_the_flag_the_answer_has_no_children_key(
@@ -467,6 +509,7 @@ async def test_a_cascade_failure_keeps_the_parents_answer(
         "moved": [],
         "skipped": [],
         "pending": [],
+        "queued": [],
         "error": "children not attempted",
     }
     assert world.store.chats["conv_a"][KEY] == "Backup"
@@ -509,3 +552,46 @@ async def test_a_store_without_owners_is_single_user_and_an_ownerless_lookup_exc
             return None
 
     assert claude_account._session_owner(_NoOwner(), "conv_x") is None
+
+
+async def test_children_with_no_terminal_are_listed_queued_not_moved(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    _family(world)
+    world.runner.unbound.add("conv_d")
+    body = (await _put_family(client, "conv_a")).json()
+    assert [row["id"] for row in body["children"]["moved"]] == ["conv_c"]
+    assert body["children"]["queued"] == [
+        {"id": "conv_d", "title": "Chat conv_d", "reason": "starts at its next message"}
+    ]
+    assert world.store.chats["conv_d"][KEY] == "Backup"
+
+
+async def test_a_family_switch_resets_a_child_whose_stored_pick_differs(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    # A child runs on Work with Backup stored for its next start; switching the family to Work
+    # must store Work on it too, or its next message launches on Backup.
+    _family(world)
+    world.runner.bound = False
+    world.store.chats["conv_c"].update({KEY: "Backup", limits.ACCOUNT_LIVE_LABEL: "Work"})
+    world.store.chats["conv_d"].update({KEY: "Work", limits.ACCOUNT_LIVE_LABEL: "Work"})
+    body = (await _put_family(client, "conv_a", "Work")).json()
+    assert [row["id"] for row in body["children"]["queued"]] == ["conv_c"]
+    assert body["children"]["moved"] == []
+    assert world.store.chats["conv_c"][KEY] == "Work"
+
+
+async def test_move_all_lists_chats_with_no_terminal_as_queued(
+    client: httpx.AsyncClient, world: SimpleNamespace
+) -> None:
+    world.runner.unbound.add("conv_b")
+    world.store.chats["conv_a"].update({KEY: "Backup", limits.ACCOUNT_LIVE_LABEL: "Work"})
+    response = await client.post("/v1/ae/claude-account/move-all", json={"account": "Work"})
+    body = response.json()
+    # conv_a runs on Work but has Backup stored, so it is reset (with a restart) too.
+    assert body["moved"] == ["conv_a"]
+    assert body["queued"] == [
+        {"id": "conv_b", "title": "Chat conv_b", "reason": "starts at its next message"}
+    ]
+    assert world.store.chats["conv_a"][KEY] == "Work"

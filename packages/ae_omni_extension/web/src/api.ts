@@ -195,6 +195,15 @@ async function call<T>(
 ): Promise<T> {
   const response = await context.server.request({ method, path, body });
   if (!response.ok) throw new AeRequestError(response.status, response.body);
+  // A card turned off answers {"off": true} with no data (2026-11-07). Every section already treats
+  // an admin_only answer as a quiet "nothing to show here" that it looks at again in a few minutes,
+  // so an off card takes that path instead of rendering a body it has no fields for.
+  const maybeOff = response.body as { off?: unknown; card?: unknown } | null;
+  if (maybeOff?.off === true && typeof maybeOff.card === "string") {
+    throw new AeRequestError(403, {
+      error: { code: "admin_only", message: "This card is turned off on this server." },
+    });
+  }
   return response.body as T;
 }
 
@@ -813,6 +822,57 @@ export interface DatabricksOverview {
   can_act: boolean;
 }
 
+// ── Admin Center, Decision model card (2026-11-07): `GET /v1/ae/decision` ──
+
+export type DecisionReason =
+  | "not_enabled"
+  | "no_endpoint"
+  | "no_key"
+  | "no_denylist"
+  | "no_users"
+  | "not_allowed";
+
+/** Numbers and labels only; the server never sends the endpoint, key, users or denylist. */
+export interface DecisionStatus {
+  configured: boolean;
+  /** Any of the settings is set, or it is enabled; false means nothing was tried (2026-11-07). */
+  set_up?: boolean;
+  enabled: boolean;
+  available: boolean;
+  /** Only when not available. */
+  reason?: DecisionReason;
+  model: string | null;
+  /** A YYYY-MM-DD date, or null. */
+  retires: string | null;
+  calls_today: number;
+  daily_cap: number;
+  /** An ISO time while the circuit breaker is open. */
+  paused_until: string | null;
+  points: Array<{ name: string; mode: "off" | "shadow" | "live" }>;
+  shadow: { would_act_7d: number; lines_7d: number };
+  /** The class name of a read the server could not finish. */
+  error?: string;
+}
+
+/** A few labels and one count; the server never sends alert text, device names or addresses. */
+export interface HomeSecurityStatus {
+  reachable: boolean;
+  stale: boolean;
+  lastScan: string | null;
+  alerts: number;
+  firewalla: { api: "up" | "down" | "unknown"; boxOnline: boolean | null; checkedAt: string | null } | null;
+  /** An https link on a .firewalla.net host, or null. */
+  portalUrl: string | null;
+  link: string | null;
+  readAt: string;
+}
+
+export const fetchHomeSecurity = (context: ExtensionContext) =>
+  call<HomeSecurityStatus>(context, "GET", "/v1/ae/home-security");
+
+export const fetchDecision = (context: ExtensionContext) =>
+  call<DecisionStatus>(context, "GET", "/v1/ae/decision");
+
 export const fetchDatabricks = (context: ExtensionContext) =>
   call<DatabricksOverview>(context, "GET", "/v1/ae/databricks");
 
@@ -915,6 +975,8 @@ export interface AccessView {
   admin: boolean;
   /** An admin, or a login named in the server's AE_BOX_ADMINS: the Box health monitor. */
   box_admin: boolean;
+  /** Whether the Box health card is on; a box admin's page says so when it is off (2026-11-07). */
+  box_on?: boolean;
 }
 
 export const fetchAccess = (context: ExtensionContext) =>
@@ -1572,6 +1634,8 @@ export interface PresetsAnswer {
   days: number;
   mode?: "log" | "fallback";
   asOf?: string | null;
+  /** True while the server computes a new answer and this one is the old cached view (2026-11-07). */
+  refreshing?: boolean;
   /** The caller's own pick for the card; absent from an older server's answer (both). */
   show?: "cost" | "tokens" | "both";
   kpis?: {
@@ -1731,6 +1795,9 @@ export interface GitBranch {
   kept?: boolean;
 }
 
+/** Which of the two repo lists the Git card shows (2026-11-08): `all` merges them. */
+export type GitScope = "company" | "mine" | "all";
+
 export interface GitRepo {
   repo: string;
   url: string;
@@ -1738,6 +1805,8 @@ export interface GitRepo {
   view_only: boolean;
   pushed_at: string | null;
   error: string | null;
+  /** "mine" for a repo from the caller's own list; "company" (or absent on an older server). */
+  scope?: GitScope;
   prs: GitPull[];
   alerts: GitAlert[];
   branches: GitBranch[];
@@ -1780,10 +1849,355 @@ export interface GitOverview {
   sweep: GitSweep | null;
   /** Set when the server trimmed the lists to fit the bridge; the totals stay complete. */
   list_cut?: boolean;
+  scope?: GitScope;
 }
 
-export const fetchGit = (context: ExtensionContext) =>
-  call<GitOverview>(context, "GET", "/v1/ae/git");
+/** `all` sends no query: it is the server's default, and an older server knows no other. */
+export const fetchGit = (context: ExtensionContext, scope: GitScope = "all") =>
+  call<GitOverview>(context, "GET", scope === "all" ? "/v1/ae/git" : `/v1/ae/git?scope=${scope}`);
+
+// ── Social (2026-11-06): `/v1/ae/social` (ae_omni_policies/social.py, admins only) ───────────
+// A slot id holds no ":" but the bridge refuses "/" and "#" in a path, so the id travels in the
+// JSON body of every write, like Needs you.
+
+export interface SocialSlot {
+  id: string;
+  kind: "video" | "short" | "live" | "community" | "tool" | "expert";
+  platform: "linkedin" | "yt_community";
+  channel: "ae" | "hc" | null;
+  anchor: string | null;
+  due: string;
+  skippable: boolean;
+  state: "planned" | "posted" | "skipped";
+  rescheduled: boolean;
+  orphan: boolean;
+  draft_error: string | null;
+  title: string | null;
+  tool: string | null;
+  /** The upload's or the tool's link (the starter text carries it); absent from an older server. */
+  url?: string | null;
+  has_draft: boolean;
+  draft_preview: string | null;
+  /** A fingerprint of the whole draft (absent without one, or from an older server). */
+  draft_rev?: string;
+  topic: string | null;
+  draft_by: "auto" | "reid" | null;
+  posted: { at: string; url: string | null; via: string } | null;
+  /** The picture that goes in the share sheet with the text (2026-11-07); absent without one. */
+  /** `key` is the picture's identity (the video id, or the tool image link): the card re-fetches when it changes. */
+  visual?: { kind: "thumbnail" | "tool"; key?: string };
+  /** Why an upload has no picture yet ("The thumbnail shows once the video is public."). */
+  visual_note?: string;
+}
+
+export interface SocialGap {
+  read_failed: boolean;
+  error: string | null;
+  stale: boolean;
+  upload_gap: boolean;
+}
+
+export interface SocialScore {
+  week_posted: number;
+  week_target: number;
+  on_pace: boolean;
+  promoted: number;
+  promoted_of: number;
+  missed: number;
+  streak: number;
+  best_streak: number;
+  on_time_pct: number | null;
+  on_time_of: number;
+  community_30d: { posted: number; total: number };
+  weeks: Array<{ week: string; start: string; posted: number; state?: "first" | "before_start" }>;
+  /** The week that holds the first YouTube read: never counted, so not "on pace" or "behind". */
+  first_week: boolean;
+  /** Uploads that went public with no post, newest first (at most 6; `unposted_total` is all). */
+  unposted: Array<{
+    id: string;
+    kind: SocialSlot["kind"];
+    platform: SocialSlot["platform"];
+    channel: "ae" | "hc" | null;
+    title: string | null;
+    due: string;
+  }>;
+  unposted_total: number;
+  rotation: Array<{ id: string; name: string; last: string | null; next: string | null }>;
+  /** Public or scheduled uploads per channel over the next 14 days. */
+  pace: Record<string, { long: number; short: number; live: number }>;
+}
+
+export interface SocialRules {
+  video_li: boolean;
+  video_community: boolean;
+  short_li: boolean;
+  short_li_days: number;
+  live_li: boolean;
+  tool_every_days: number;
+  expert_per_week: number;
+  expert_weekday: number;
+  li_weekly_target: number;
+  gap_days: number;
+  alarm_hhmm: string;
+  tz: string;
+}
+
+export interface SocialTool {
+  id: string;
+  name: string;
+  url: string;
+  note: string | null;
+  active: boolean;
+  /** An https link to the picture a post about this tool shares; null shares text only. */
+  image?: string | null;
+}
+
+export interface SocialView {
+  rules: SocialRules;
+  tools: SocialTool[];
+  uploads_meta: Record<string, { read_at: string | null; ok: boolean; error: string | null; count: number }>;
+  gaps: Record<string, SocialGap>;
+  score: SocialScore;
+  slots: SocialSlot[];
+  slot_count: number;
+  truncated: boolean;
+  channel_ids: Record<string, string>;
+  /** The channels' names as a post says them (starter text); absent from an older server. */
+  channel_names?: Record<string, string>;
+}
+
+export interface SocialSlotDetail extends SocialSlot {
+  draft: { text: string; topic: string | null; by: string; edited: boolean } | null;
+}
+
+export const fetchSocial = (context: ExtensionContext) =>
+  call<SocialView>(context, "GET", "/v1/ae/social");
+
+export const fetchSocialSlot = (context: ExtensionContext, id: string) =>
+  call<SocialSlotDetail>(context, "POST", "/v1/ae/social/slot", { id });
+
+/** One base64 piece of a post's picture; the server keeps each answer under the bridge's cap. */
+export interface SocialVisualPart {
+  type: string;
+  size: number;
+  parts: number;
+  part: number;
+  data: string;
+}
+
+export const fetchSocialVisual = (context: ExtensionContext, id: string, part: number) =>
+  call<SocialVisualPart>(context, "GET", `/v1/ae/social/visual/${id}/${part}`);
+
+export const markSocialPosted = (context: ExtensionContext, id: string, url?: string) =>
+  call<{ ok: boolean }>(context, "POST", "/v1/ae/social/posted", url ? { id, url } : { id });
+
+export const saveSocialDraft = (context: ExtensionContext, id: string, text: string, topic?: string | null) =>
+  call<{ ok: boolean }>(context, "POST", "/v1/ae/social/draft", topic ? { id, text, topic } : { id, text });
+
+export const skipSocial = (context: ExtensionContext, id: string) =>
+  call<{ ok: boolean }>(context, "POST", "/v1/ae/social/skip", { id });
+
+export const reopenSocial = (context: ExtensionContext, id: string) =>
+  call<{ ok: boolean }>(context, "POST", "/v1/ae/social/reopen", { id });
+
+export const rescheduleSocial = (context: ExtensionContext, id: string, due: string) =>
+  call<{ ok: boolean }>(context, "POST", "/v1/ae/social/reschedule", { id, due });
+
+export const saveSocialRules = (context: ExtensionContext, rules: Partial<SocialRules>) =>
+  call<{ rules: SocialRules }>(context, "POST", "/v1/ae/social/rules", rules);
+
+export const saveSocialTools = (context: ExtensionContext, tools: SocialTool[]) =>
+  call<{ tools: number }>(context, "POST", "/v1/ae/social/tools", { tools });
+
+// ── Needs you (2026-11-03): `/v1/ae/attention` (ae_omni_policies/attention.py) ───
+// An item id holds ":", "/" and "#", which the host bridge's route pattern refuses in a path
+// (upstream web/src/extensions/services/serverRequest.ts AE_ROUTE), so every POST carries the id
+// in its body (review round 1, 2026-11-03).
+
+export type AttentionSource =
+  | "git"
+  | "git-mine"
+  | "box"
+  | "host"
+  | "cost"
+  | "databricks"
+  | "secrets"
+  | "vault"
+  | "accounts"
+  | "family";
+export type AttentionTone = "urgent" | "review";
+export type AttentionAction = "review" | "fix" | "merge" | "dismiss" | "cleanup";
+
+/** The box cleanup an item can run: BoxActionOffer's fields the panel needs. */
+export interface AttentionOffer {
+  id: BoxCleanupActionId;
+  owner: string;
+  where?: "box" | "container" | "all";
+  label: string;
+  confirm: string;
+  can_run: boolean;
+  why_not: string | null;
+  hint: string;
+}
+
+export interface AttentionItem {
+  id: string;
+  source: AttentionSource;
+  kind: string;
+  tone: AttentionTone;
+  title: string;
+  meta: string;
+  /** "" for a box item. */
+  url: string;
+  fingerprint: string;
+  dismissible: boolean;
+  actions: AttentionAction[];
+  /** The worse rule in words: "a new commit still fails". */
+  back_if: string;
+  expires_days: number;
+  offer?: AttentionOffer | null;
+  /** What a Fix does to shared state, in the server's words: the Fix button's tooltip. */
+  fix_note?: string;
+  /** "command": the Fix ends in one command for the owner (a failed unit). */
+  fix_mode?: "chat" | "command";
+  /**
+   * A chat holds this item and it stays listed. "working" (or no status, from an older server):
+   * the chat is on it, so it is not counted. "waiting": the chat blocked or finished, so the
+   * owner has to act and it is counted.
+   */
+  working?: { session_id: string; title: string; path: string; status?: "working" | "waiting" };
+  /** Why a dismissed item came back, e.g. "3 days passed". */
+  back?: string | null;
+  dismissed?: { at: string; reason: string; expires_at: string };
+}
+
+/** True when a chat that is still working holds *item* (a waiting chat leaves it counted). */
+export function heldByWorkingChat(item: Pick<AttentionItem, "working">): boolean {
+  return Boolean(item.working) && item.working?.status !== "waiting";
+}
+
+export interface AttentionCounts {
+  urgent: number;
+  review: number;
+  by_source: Record<string, { urgent: number; review: number }>;
+}
+
+export interface AttentionOverview {
+  sources: AttentionSource[];
+  can_chat: boolean;
+  items: AttentionItem[];
+  dismissed: AttentionItem[];
+  counts: AttentionCounts;
+  /** Words for each source that could not be read, e.g. "Git repos could not be read; the count may be low". */
+  unknown: string[];
+  /** Items left out so the answer fits the page; the counts above stay full. */
+  more?: number;
+  read_at: string;
+}
+
+export const fetchAttention = (context: ExtensionContext) =>
+  call<AttentionOverview>(context, "GET", "/v1/ae/attention");
+
+export interface AttentionDismissed {
+  id: string;
+  expires_at: string;
+  reason: string;
+}
+
+export const dismissAttention = (context: ExtensionContext, id: string, reason: string) =>
+  call<AttentionDismissed>(
+    context,
+    "POST",
+    "/v1/ae/attention/dismiss",
+    reason ? { id, reason } : { id },
+  );
+
+export const restoreAttention = (context: ExtensionContext, id: string) =>
+  call<{ id: string; restored: boolean }>(
+    context,
+    "POST",
+    "/v1/ae/attention/restore",
+    { id },
+  );
+
+export interface AttentionSession {
+  session_id: string;
+  path: string;
+  existing: boolean;
+  item_id: string;
+  /** Which button started the chat that holds the item (set when `existing`). */
+  holder_action?: AttentionChatAction;
+}
+
+/** Which button opens the chat: Review reads and reports, Fix changes what the item needs. */
+export type AttentionChatAction = "review" | "fix";
+
+/** `POST /v1/ae/attention/session`: a Review or Fix chat on one item (2026-11-05: Fix). */
+export const startAttentionChat = (
+  context: ExtensionContext,
+  id: string,
+  action: AttentionChatAction,
+  rideUnparked = false,
+) =>
+  call<AttentionSession>(
+    context,
+    "POST",
+    "/v1/ae/attention/session",
+    rideUnparked ? { id, action, ride_unparked: true } : { id, action },
+  );
+
+export const startAttentionReview = (
+  context: ExtensionContext,
+  id: string,
+  rideUnparked = false,
+) => startAttentionChat(context, id, "review", rideUnparked);
+
+/** `POST /v1/ae/attention/batch`: the chat a Review all opened, and the items it took. */
+export interface AttentionBatchStarted {
+  session_id: string;
+  path: string;
+  existing?: boolean;
+  title?: string;
+  /** The items the chat reviews (the server drops dismissed, gone or held ones). */
+  item_ids?: string[];
+}
+
+/** What a Review all covers: one kind line (its key) or every line of one source (2026-11-07). */
+export type AttentionBatchTarget = { line: string } | { source: string };
+
+/** Review all (2026-11-04): one chat on every item of one kind line, or of one whole source. */
+export const startAttentionBatch = (
+  context: ExtensionContext,
+  target: AttentionBatchTarget,
+  ids: string[],
+  rideUnparked = false,
+) =>
+  call<AttentionBatchStarted>(
+    context,
+    "POST",
+    "/v1/ae/attention/batch",
+    rideUnparked ? { ...target, ids, ride_unparked: true } : { ...target, ids },
+  );
+
+/** What a 409 slots_full carries: who holds the slots, the limit and the brief to copy. */
+export interface SlotsFull {
+  working: Array<{ session_id?: string; id?: string; title: string; path?: string }>;
+  limit: number;
+  brief: string;
+}
+
+/** The slots_full detail of a failed `startAttentionReview`, or null for any other failure. */
+export function slotsFullOf(error: unknown): SlotsFull | null {
+  if (!(error instanceof AeRequestError) || error.status !== 409 || error.code !== "slots_full") {
+    return null;
+  }
+  const detail = (error.body as { error?: Record<string, unknown> } | null)?.error ?? {};
+  return {
+    working: Array.isArray(detail.working) ? (detail.working as SlotsFull["working"]) : [],
+    limit: typeof detail.limit === "number" ? detail.limit : 0,
+    brief: typeof detail.brief === "string" ? detail.brief : "",
+  };
+}
 
 export const fetchAzureCost = (context: ExtensionContext) =>
   call<AzureCostAnswer>(context, "GET", "/v1/ae/azure-cost");
@@ -1813,7 +2227,8 @@ export interface FamilyRow {
   cost_usd: number;
   /** `input` includes cache writes: the session keeps no separate figure. */
   tokens: { input: number; output: number; cache_read: number; total: number };
-  today: { cost_usd: number; tokens_total: number };
+  /** `flag_tokens` is input plus output (no cache reads): what the token flag checks. */
+  today: { cost_usd: number; tokens_total: number; flag_tokens?: number };
   by_role: FamilyRole[];
   sessions: number;
   lead_context_tokens: number | null;

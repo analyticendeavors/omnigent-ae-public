@@ -71,6 +71,7 @@ class SwrCache[K: Hashable, V]:
         self._errors: dict[K, str] = {}
         self._tasks: set[asyncio.Task[V]] = set()
         self._generation = 0
+        self._key_generation: dict[K, int] = {}
 
     async def get(self, key: K, load: Callable[[], Awaitable[V]], *, fresh: bool = False) -> V:
         """The value for *key*: held, held while a refresh runs, or awaited.
@@ -98,6 +99,11 @@ class SwrCache[K: Hashable, V]:
         held = self._entries.get(key)
         return held[1] if held is not None else None
 
+    def age_s(self, key: K) -> float | None:
+        """Seconds since the held value for *key* was stored, or ``None`` with nothing held."""
+        held = self._entries.get(key)
+        return None if held is None else max(0.0, self._clock() - held[0])
+
     def refreshing(self, key: K) -> bool:
         task = self._inflight.get(key)
         return task is not None and not task.done()
@@ -108,6 +114,14 @@ class SwrCache[K: Hashable, V]:
         self._entries.clear()
         self._inflight.clear()
         self._errors.clear()
+
+    def forget(self, key: K) -> None:
+        """Forget the value, error and running load of one *key*; a load already running
+        finishes but stores nothing. Other keys are untouched."""
+        self._key_generation[key] = self._key_generation.get(key, 0) + 1
+        self._entries.pop(key, None)
+        self._inflight.pop(key, None)
+        self._errors.pop(key, None)
 
     def mark_stale(self) -> None:
         """Keep every value but refresh it on the next read."""
@@ -128,7 +142,10 @@ class SwrCache[K: Hashable, V]:
         running = self._inflight.get(key)
         if running is not None and not running.done() and running.get_loop() is loop:
             return running
-        generation = self._generation
+        generation = (self._generation, self._key_generation.get(key, 0))
+
+        def current() -> bool:
+            return generation == (self._generation, self._key_generation.get(key, 0))
 
         async def run() -> V:
             try:
@@ -136,10 +153,10 @@ class SwrCache[K: Hashable, V]:
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if generation == self._generation:
+                if current():
                     self._errors[key] = self._describe(exc)
                 raise
-            if generation == self._generation:
+            if current():
                 self._entries[key] = (self._clock(), value)
                 self._errors.pop(key, None)
             return value

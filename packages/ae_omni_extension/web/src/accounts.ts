@@ -23,6 +23,7 @@
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { type AccountRow, type AccountWindow, describeError, fetchAccounts } from "./api";
+import { liveNeedsLink } from "./attentionStore";
 import { el, notice, replaceChildren } from "./dom";
 import { tone } from "./limits";
 import { type Health, registerRefresh, setTile, staleTile, type Tile } from "./tiles";
@@ -278,7 +279,7 @@ function render(root: Parts, state: SectionState): void {
     replaceChildren(root.list, [el("p", { class: "meta" }, "No account has signed in yet.")]);
   } else {
     // The last good rows stay, with the failure said above them.
-    replaceChildren(root.list, accountsList(state.rows, now));
+    replaceChildren(root.list, [...accountsList(state.rows, now), liveNeedsLink("accounts")]);
   }
   root.refreshed.textContent = state.at
     ? `Updated ${new Date(state.at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`

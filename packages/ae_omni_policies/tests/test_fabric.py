@@ -2136,3 +2136,36 @@ async def test_a_bug_in_the_refresh_is_logged_by_class_and_never_sticks(
     _age_last(fabric.STATUS_TTL_S + 1)
     await fabric.overview(env, transport=transport)  # a new refresh may start
     assert fabric.refresh_task() is not task
+
+
+async def test_a_price_saved_in_the_panel_reaches_the_next_fleet_answer(
+    client: httpx.AsyncClient, ae_admins: set[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    owner = {"X-Forwarded-Email": "owner@example.com", "Sec-Fetch-Site": "same-origin"}
+    _configure(monkeypatch)
+    _configure_fleet(monkeypatch)
+    monkeypatch.delenv("AE_FABRIC_USD_PER_CU_HOUR", raising=False)
+
+    async def read() -> dict[str, dict[str, object]]:
+        with respx.mock(assert_all_called=False) as mock:
+            mock.post(url__startswith=FLEET_INVOKE).respond(200, json=_fleet_answer())
+            mock.get(url__startswith=INVOKE).respond(200, json=_rich_probe())
+            response = await client.get("/v1/ae/fabric", headers=owner)
+        assert response.status_code == 200, response.text
+        return {row["name"]: row for row in response.json()["capacities"]}
+
+    before = await read()
+    assert before["aetraining"]["hourlyUsd"] == 0.72  # F4 at the default 0.18
+    assert fabric._last is not None and fabric._fleet_cache is not None
+    generations = (fabric._last_generation, fabric._fleet_generation)
+    saved = await client.post(
+        "/v1/ae/cards/settings",
+        json={"id": "compute", "values": {"AE_FABRIC_USD_PER_CU_HOUR": "0.25"}, "revision": 0},
+        headers=owner,
+    )
+    assert saved.status_code == 200, saved.text
+    assert fabric._last is None and fabric._fleet_cache is None
+    assert fabric._last_generation > generations[0] and fabric._fleet_generation > generations[1]
+    after = await read()
+    assert after["aetraining"]["hourlyUsd"] == 1.0  # F4 at 0.25
+    assert after["salesdemo"]["hourlyUsd"] == 2.0  # F8 at 0.25

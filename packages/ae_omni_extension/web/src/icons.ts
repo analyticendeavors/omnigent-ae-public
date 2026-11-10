@@ -548,6 +548,19 @@ export function pencilIcon(): SVGElement {
   return decorative(TABLER_PENCIL, "icon-pencil", 14);
 }
 
+// The Decision model card (2026-11-07, decision.ts): Tabler scale for its badge and tile.
+const TABLER_SCALE: IconNode = [
+  ["path", { d: "M7 20l10 0" }],
+  ["path", { d: "M6 6l6 -1l6 1" }],
+  ["path", { d: "M12 3l0 17" }],
+  ["path", { d: "M9 12l-3 -6l-3 6a3 3 0 0 0 6 0" }],
+  ["path", { d: "M21 12l-3 -6l-3 6a3 3 0 0 0 6 0" }],
+];
+
+export function scaleIcon(size = 14): SVGElement {
+  return decorative(TABLER_SCALE, "icon-scale", size);
+}
+
 // The Git repos card (2026-10-24, git.ts): Tabler git-branch for its badge and tile.
 const TABLER_GIT_BRANCH: IconNode = [
   ["path", { d: "M7 18m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
@@ -646,4 +659,220 @@ const TABLER_CIRCLE_DASHED: IconNode = [
 
 export function circleDashedIcon(): SVGElement {
   return decorative(TABLER_CIRCLE_DASHED, "icon-circle-dashed", 15);
+}
+
+// Tabler's `message` and `eye-off` outline icons, @tabler/icons 3.46.0: a Needs you
+// row's Review and Dismiss buttons (attention.ts, 2026-11-03).
+const TABLER_MESSAGE: IconNode = [
+  ["path", { d: "M8 9h8" }],
+  ["path", { d: "M8 13h6" }],
+  [
+    "path",
+    {
+      d: "M18 4a3 3 0 0 1 3 3v8a3 3 0 0 1 -3 3h-5l-5 3v-3h-3a3 3 0 0 1 -3 -3v-8a3 3 0 0 1 3 -3h12z",
+    },
+  ],
+];
+const TABLER_EYE_OFF: IconNode = [
+  ["path", { d: "M10.585 10.587a2 2 0 0 0 2.829 2.828" }],
+  [
+    "path",
+    {
+      d: "M16.681 16.673a8.717 8.717 0 0 1 -4.681 1.327c-3.6 0 -6.6 -2 -9 -6c1.272 -2.12 2.712 -3.678 4.32 -4.674m2.86 -1.146a9.055 9.055 0 0 1 1.82 -.18c3.6 0 6.6 2 9 6c-.666 1.11 -1.379 2.067 -2.138 2.87",
+    },
+  ],
+  ["path", { d: "M3 3l18 18" }],
+];
+
+// Tabler's `list-check` outline icon, @tabler/icons 3.46.0: a Needs you line's Review all button.
+const TABLER_LIST_CHECK: IconNode = [
+  ["path", { d: "M3.5 5.5l1.5 1.5l2.5 -2.5" }],
+  ["path", { d: "M3.5 11.5l1.5 1.5l2.5 -2.5" }],
+  ["path", { d: "M3.5 17.5l1.5 1.5l2.5 -2.5" }],
+  ["path", { d: "M11 6l9 0" }],
+  ["path", { d: "M11 12l9 0" }],
+  ["path", { d: "M11 18l9 0" }],
+];
+
+export function listCheckIcon(size = 16): SVGElement {
+  return decorative(TABLER_LIST_CHECK, "icon-list-check", size);
+}
+
+export function messageIcon(size = 16): SVGElement {
+  return decorative(TABLER_MESSAGE, "icon-message", size);
+}
+
+// Tabler's `eye` and `layout-grid` outline icons, @tabler/icons 3.46.0: the Cards panel's Hide for
+// me eye and the page header's Cards button (2026-11-07).
+const TABLER_EYE: IconNode = [
+  ["path", { d: "M10 12a2 2 0 1 0 4 0a2 2 0 0 0 -4 0" }],
+  [
+    "path",
+    { d: "M21 12c-2.4 4 -5.4 6 -9 6c-3.6 0 -6.6 -2 -9 -6c2.4 -4 5.4 -6 9 -6c3.6 0 6.6 2 9 6" },
+  ],
+];
+const TABLER_LAYOUT_GRID: IconNode = [
+  ["path", { d: "M4 4m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+  ["path", { d: "M14 4m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+  ["path", { d: "M4 14m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+  ["path", { d: "M14 14m0 1a1 1 0 0 1 1 -1h4a1 1 0 0 1 1 1v4a1 1 0 0 1 -1 1h-4a1 1 0 0 1 -1 -1z" }],
+];
+
+export function eyeIcon(size = 16): SVGElement {
+  return decorative(TABLER_EYE, "icon-eye", size);
+}
+
+export function layoutGridIcon(size = 16): SVGElement {
+  return decorative(TABLER_LAYOUT_GRID, "icon-layout-grid", size);
+}
+
+export function eyeOffIcon(size = 16): SVGElement {
+  return decorative(TABLER_EYE_OFF, "icon-eye-off", size);
+}
+
+// Tabler's `tool`, `terminal` and `git-merge` outline icons, @tabler/icons 3.46.0: a Needs you row's
+// Fix button (a chat; a terminal for a failed unit, whose Fix ends in a command) and its Merge
+// button on a ready pull request (attention.ts, 2026-11-05).
+const TABLER_TOOL: IconNode = [
+  [
+    "path",
+    { d: "M7 10h3v-3l-3.5 -3.5a6 6 0 0 1 8 8l6 6a2 2 0 0 1 -3 3l-6 -6a6 6 0 0 1 -8 -8l3.5 3.5" },
+  ],
+];
+const TABLER_TERMINAL: IconNode = [
+  ["path", { d: "M5 7l5 5l-5 5" }],
+  ["path", { d: "M12 19l7 0" }],
+];
+const TABLER_GIT_MERGE: IconNode = [
+  ["path", { d: "M7 18m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M7 6m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M17 12m-2 0a2 2 0 1 0 4 0a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M7 8l0 8" }],
+  ["path", { d: "M7 8a4 4 0 0 0 4 4h4" }],
+];
+
+export function toolIcon(size = 16): SVGElement {
+  return decorative(TABLER_TOOL, "icon-tool", size);
+}
+
+export function terminalIcon(size = 16): SVGElement {
+  return decorative(TABLER_TERMINAL, "icon-terminal", size);
+}
+
+export function gitMergeIcon(size = 16): SVGElement {
+  return decorative(TABLER_GIT_MERGE, "icon-git-merge", size);
+}
+
+// The Social card (2026-11-06, social.ts): Tabler calendar-event for its badge and tile,
+// brand-linkedin and brand-youtube for a post's platform, and flame for the streak.
+const TABLER_CALENDAR_EVENT: IconNode = [
+  ["path", { d: "M4 5m0 2a2 2 0 0 1 2 -2h12a2 2 0 0 1 2 2v12a2 2 0 0 1 -2 2h-12a2 2 0 0 1 -2 -2z" }],
+  ["path", { d: "M16 3l0 4" }],
+  ["path", { d: "M8 3l0 4" }],
+  ["path", { d: "M4 11l16 0" }],
+  ["path", { d: "M8 15h2v2h-2z" }],
+];
+const TABLER_BRAND_LINKEDIN: IconNode = [
+  ["path", { d: "M8 11v5" }],
+  ["path", { d: "M8 8v.01" }],
+  ["path", { d: "M12 16v-5" }],
+  ["path", { d: "M16 16v-3a2 2 0 1 0 -4 0" }],
+  ["path", { d: "M3 7a4 4 0 0 1 4 -4h10a4 4 0 0 1 4 4v10a4 4 0 0 1 -4 4h-10a4 4 0 0 1 -4 -4z" }],
+];
+const TABLER_BRAND_YOUTUBE: IconNode = [
+  ["path", { d: "M2 8a4 4 0 0 1 4 -4h12a4 4 0 0 1 4 4v8a4 4 0 0 1 -4 4h-12a4 4 0 0 1 -4 -4v-8z" }],
+  ["path", { d: "M10 9l5 3l-5 3z" }],
+];
+const TABLER_FLAME: IconNode = [
+  [
+    "path",
+    {
+      d: "M12 12c2 -2.96 0 -7 -1 -8c0 3.038 -1.773 4.741 -3 6c-1.226 1.26 -2 3.24 -2 5a6 6 0 1 0 12 0c0 -1.532 -1.056 -3.94 -2 -5c-1.786 3 -2.791 3 -4 2z",
+    },
+  ],
+];
+
+export function calendarEventIcon(size = 14): SVGElement {
+  return decorative(TABLER_CALENDAR_EVENT, "icon-calendar-event", size);
+}
+
+export function linkedinIcon(size = 15): SVGElement {
+  return decorative(TABLER_BRAND_LINKEDIN, "icon-linkedin", size);
+}
+
+export function youtubeIcon(size = 15): SVGElement {
+  return decorative(TABLER_BRAND_YOUTUBE, "icon-youtube", size);
+}
+
+export function flameIcon(size = 14): SVGElement {
+  return decorative(TABLER_FLAME, "icon-flame", size);
+}
+
+// The Social card's pop-out (2026-11-06, socialView.ts): Tabler arrows-maximize, settings and
+// the two chevrons for the week and month arrows.
+const TABLER_ARROWS_MAXIMIZE: IconNode = [
+  ["path", { d: "M16 4l4 0l0 4" }],
+  ["path", { d: "M14 10l6 -6" }],
+  ["path", { d: "M8 20l-4 0l0 -4" }],
+  ["path", { d: "M4 20l6 -6" }],
+  ["path", { d: "M16 20l4 0l0 -4" }],
+  ["path", { d: "M14 14l6 6" }],
+  ["path", { d: "M8 4l-4 0l0 4" }],
+  ["path", { d: "M4 4l6 6" }],
+];
+const TABLER_SETTINGS: IconNode = [
+  [
+    "path",
+    {
+      d: "M10.325 4.317c.426 -1.756 2.924 -1.756 3.35 0a1.724 1.724 0 0 0 2.573 1.066c1.543 -.94 3.31 .826 2.37 2.37a1.724 1.724 0 0 0 1.065 2.572c1.756 .426 1.756 2.924 0 3.35a1.724 1.724 0 0 0 -1.066 2.573c.94 1.543 -.826 3.31 -2.37 2.37a1.724 1.724 0 0 0 -2.572 1.065c-.426 1.756 -2.924 1.756 -3.35 0a1.724 1.724 0 0 0 -2.573 -1.066c-1.543 .94 -3.31 -.826 -2.37 -2.37a1.724 1.724 0 0 0 -1.065 -2.572c-1.756 -.426 -1.756 -2.924 0 -3.35a1.724 1.724 0 0 0 1.066 -2.573c-.94 -1.543 .826 -3.31 2.37 -2.37c1 .608 2.296 .07 2.572 -1.065z",
+    },
+  ],
+  ["path", { d: "M9 12a3 3 0 1 0 6 0a3 3 0 0 0 -6 0" }],
+];
+const TABLER_CHEVRON_LEFT: IconNode = [["path", { d: "M15 6l-6 6l6 6" }]];
+const TABLER_CHEVRON_RIGHT: IconNode = [["path", { d: "M9 6l6 6l-6 6" }]];
+
+export function arrowsMaximizeIcon(size = 16): SVGElement {
+  return decorative(TABLER_ARROWS_MAXIMIZE, "icon-arrows-maximize", size);
+}
+
+export function settingsIcon(size = 16): SVGElement {
+  return decorative(TABLER_SETTINGS, "icon-settings", size);
+}
+
+export function chevronLeftIcon(size = 16): SVGElement {
+  return decorative(TABLER_CHEVRON_LEFT, "icon-chevron-left", size);
+}
+
+export function chevronRightIcon(size = 16): SVGElement {
+  return decorative(TABLER_CHEVRON_RIGHT, "icon-chevron-right", size);
+}
+
+// Needs you's two header tools on a phone (2026-11-07): Tabler chevrons-down and chevrons-up.
+const TABLER_CHEVRONS_DOWN: IconNode = [
+  ["path", { d: "M7 7l5 5l5 -5" }],
+  ["path", { d: "M7 13l5 5l5 -5" }],
+];
+const TABLER_CHEVRONS_UP: IconNode = [
+  ["path", { d: "M7 11l5 -5l5 5" }],
+  ["path", { d: "M7 17l5 -5l5 5" }],
+];
+
+export function chevronsDownIcon(): SVGElement {
+  return decorative(TABLER_CHEVRONS_DOWN, "icon-chevrons-down", 18);
+}
+
+export function chevronsUpIcon(): SVGElement {
+  return decorative(TABLER_CHEVRONS_UP, "icon-chevrons-up", 18);
+}
+
+// Tabler's `arrow-back-up` outline icon, @tabler/icons 3.46.0: the Restore button on a dismissed
+// Needs you row (2026-11-08).
+const TABLER_ARROW_BACK_UP: IconNode = [
+  ["path", { d: "M9 14l-4 -4l4 -4" }],
+  ["path", { d: "M5 10h11a4 4 0 1 1 0 8h-1" }],
+];
+
+export function restoreIcon(size = 14): SVGElement {
+  return decorative(TABLER_ARROW_BACK_UP, "icon-restore", size);
 }

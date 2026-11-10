@@ -34,8 +34,10 @@ results, never instead of them.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -76,6 +78,49 @@ _logins: dict[tuple[str, str], str] = {}
 
 def reset_login_cache() -> None:
     _logins.clear()
+
+
+# Conditional reads (2026-11-08). The PR cards read the pull, its reviews and the
+# head's check runs and statuses about once a minute per card on screen; a 304
+# does not count against the token's 5,000 calls an hour, and those four calls
+# used it up on 2026-11-08 (the card cache in ``prs.py`` has the story). Per
+# process: (API origin, path, sorted params) to (GitHub's ETag, the raw body).
+# The raw bytes are parsed again on every 304, so no caller can change what
+# another one is served. Least recently used entries go first past the cap.
+ETAG_CACHE_MAX_BYTES = 16 * 1024 * 1024
+_EtagKey = tuple[str, str, tuple[tuple[str, str], ...]]
+_etags: OrderedDict[_EtagKey, tuple[str, bytes]] = OrderedDict()
+_etag_bytes = 0
+
+
+def reset_etag_cache() -> None:
+    """Forget every stored ETag and body (tests, a changed setting)."""
+    global _etag_bytes
+    _etags.clear()
+    _etag_bytes = 0
+
+
+def _etag_key(api_url: str, path: str, params: Mapping[str, Any] | None) -> _EtagKey:
+    return (api_url, path, tuple(sorted((str(k), str(v)) for k, v in (params or {}).items())))
+
+
+def _forget_etag(key: _EtagKey) -> None:
+    global _etag_bytes
+    held = _etags.pop(key, None)
+    if held is not None:
+        _etag_bytes -= len(held[1])
+
+
+def _remember_etag(key: _EtagKey, etag: str, body: bytes) -> None:
+    global _etag_bytes
+    _forget_etag(key)
+    if len(body) > ETAG_CACHE_MAX_BYTES:
+        return
+    _etags[key] = (etag, body)
+    _etag_bytes += len(body)
+    while _etag_bytes > ETAG_CACHE_MAX_BYTES:
+        _, (_, dropped) = _etags.popitem(last=False)
+        _etag_bytes -= len(dropped)
 
 
 NO_REPOS = (
@@ -233,17 +278,49 @@ class GitHubClient:
     async def __aexit__(self, *_exc: object) -> None:
         await self._http.aclose()
 
-    async def _get(self, path: str, params: dict[str, Any] | None = None) -> Any:
+    async def _get(
+        self,
+        path: str,
+        params: dict[str, Any] | None = None,
+        *,
+        conditional: bool = False,
+        remember: bool = False,
+    ) -> Any:
+        """GET *path* as JSON; raises :class:`GitHubError` on anything but a 200.
+
+        *conditional* sends the ETag stored from the last 200 (``If-None-Match``)
+        and serves that answer's body again on a 304, which GitHub answers only
+        when the body is unchanged. Without a stored ETag it is a plain GET.
+        *remember* stores a 200's ETag without sending one, so an unconditional
+        read still lets the next conditional read answer 304.
+        """
+        keyed = conditional or remember
+        key = _etag_key(self._settings.api_url, path, params) if keyed else None
+        held = _etags.get(key) if key is not None and conditional else None
+        headers = {"If-None-Match": held[0]} if held is not None else None
         try:
-            response = await self._http.get(path, params=params)
+            response = await self._http.get(path, params=params, headers=headers)
         except httpx.HTTPError as exc:
             raise GitHubError(f"GET {path} failed: {type(exc).__name__}") from exc
-        if response.status_code != 200:
+        if response.status_code == 304 and held is not None and key is not None:
+            body = held[1]
+            if _etags.get(key) is held:
+                _etags.move_to_end(key)
+        elif response.status_code != 200:
             raise GitHubError(f"GET {path} answered {_why(response)}")
+        else:
+            body = response.content
         try:
-            return response.json()
+            payload = json.loads(body)
         except ValueError as exc:
             raise GitHubError(f"GET {path} answered invalid JSON") from exc
+        if key is not None and response.status_code == 200:
+            etag = response.headers.get("etag")
+            if etag:
+                _remember_etag(key, etag, body)
+            else:
+                _forget_etag(key)
+        return payload
 
     async def tag_names(self, repo: str, prefix: str) -> list[str]:
         """Every tag name starting with *prefix*, through the matching-refs call.
@@ -261,9 +338,16 @@ class GitHubClient:
                 names.append(name.removeprefix("refs/tags/"))
         return names
 
-    async def pull(self, repo: str, number: int) -> dict[str, Any]:
-        """``GET /repos/{repo}/pulls/{number}``: the one call that carries mergeability."""
-        payload = await self._get(f"/repos/{repo}/pulls/{number}")
+    async def pull(self, repo: str, number: int, *, conditional: bool = True) -> dict[str, Any]:
+        """``GET /repos/{repo}/pulls/{number}``: the one call that carries mergeability.
+
+        Conditional by default; pass ``conditional=False`` to always get GitHub's
+        latest 200 (a fresh card read, a write's gate, and the card's retry while
+        mergeability is being computed). Either way a 200's ETag is stored.
+        """
+        payload = await self._get(
+            f"/repos/{repo}/pulls/{number}", conditional=conditional, remember=True
+        )
         if not isinstance(payload, dict):
             raise GitHubError(f"GET /repos/{repo}/pulls/{number} answered a non-object")
         return payload
@@ -297,9 +381,16 @@ class GitHubClient:
             raise GitHubError(f"GET {path} answered a non-object")
         return ConditionalPull(200, response.headers.get("etag"), payload, rate)
 
-    async def reviews(self, repo: str, number: int) -> list[dict[str, Any]]:
+    async def reviews(
+        self, repo: str, number: int, *, conditional: bool = True
+    ) -> list[dict[str, Any]]:
         """Every review on the pull request, oldest first (GitHub's order)."""
-        payload = await self._get(f"/repos/{repo}/pulls/{number}/reviews", {"per_page": 100})
+        payload = await self._get(
+            f"/repos/{repo}/pulls/{number}/reviews",
+            {"per_page": 100},
+            conditional=conditional,
+            remember=True,
+        )
         rows = payload if isinstance(payload, list) else []
         return [row for row in rows if isinstance(row, dict)]
 
@@ -336,15 +427,29 @@ class GitHubClient:
             )
         return UpdateBranchOutcome(response.status_code, False, _why(response))
 
-    async def check_runs(self, repo: str, sha: str) -> list[dict[str, Any]]:
+    async def check_runs(
+        self, repo: str, sha: str, *, conditional: bool = True
+    ) -> list[dict[str, Any]]:
         """The latest check run per check on *sha* (GitHub's default ``filter=latest``)."""
-        payload = await self._get(f"/repos/{repo}/commits/{sha}/check-runs", {"per_page": 100})
+        payload = await self._get(
+            f"/repos/{repo}/commits/{sha}/check-runs",
+            {"per_page": 100},
+            conditional=conditional,
+            remember=True,
+        )
         runs = payload.get("check_runs") if isinstance(payload, dict) else None
         return [run for run in runs or [] if isinstance(run, dict)]
 
-    async def statuses(self, repo: str, sha: str) -> list[dict[str, Any]]:
+    async def statuses(
+        self, repo: str, sha: str, *, conditional: bool = True
+    ) -> list[dict[str, Any]]:
         """Commit statuses on *sha*, one per context (the combined status's rows)."""
-        payload = await self._get(f"/repos/{repo}/commits/{sha}/status", {"per_page": 100})
+        payload = await self._get(
+            f"/repos/{repo}/commits/{sha}/status",
+            {"per_page": 100},
+            conditional=conditional,
+            remember=True,
+        )
         rows = payload.get("statuses") if isinstance(payload, dict) else None
         return [row for row in rows or [] if isinstance(row, dict)]
 

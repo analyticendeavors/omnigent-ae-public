@@ -15,7 +15,7 @@
 #                                  OMNIGENT_OIDC_CLIENT_SECRET, OMNIGENT_OIDC_COOKIE_SECRET, optional: AE_GITHUB_TOKEN,
 #                                  AE_FABRIC_WAKE_URL_AETRAINING, AE_FABRIC_SUSPEND_KEY_AETRAINING, AE_FABRIC_CAPACITIES_URL,
 #                                  AE_FABRIC_CAPACITIES_KEY, AE_DATABRICKS_CLIENT_ID, AE_DATABRICKS_CLIENT_SECRET,
-#                                  AE_AZURE_COST_TENANT_ID, AE_AZURE_COST_CLIENT_ID, AE_AZURE_COST_CLIENT_SECRET, AE_SHARED_ACCOUNTS_KEY  (the server)
+#                                  AE_AZURE_COST_TENANT_ID, AE_AZURE_COST_CLIENT_ID, AE_AZURE_COST_CLIENT_SECRET, AE_SHARED_ACCOUNTS_KEY, AE_CARD_SECRETS_KEY, AE_DECISION_API_KEY, AE_DECISION_ENDPOINT, AE_SPEECH_KEY  (the server)
 #   /secure/env/omnigent-host.env  CLAUDE_CODE_OAUTH_TOKEN      (the host)
 #
 # The non-secret settings live in config/server.env and config/host.env (from
@@ -73,6 +73,14 @@ KV_CLAUDE_CODE_OAUTH_TOKEN="${KV_CLAUDE_CODE_OAUTH_TOKEN:-claude-code-oauth-toke
 # it and says so, and the page says how to add it (deploy/README.md, "The
 # GitHub token").
 KV_GITHUB_TOKEN="${KV_GITHUB_TOKEN:-omnigent-ae-github-token}"
+# Optional (2026-11-06, the Decision-1 preset advisor, docs/features/decision-advisor.md): the
+# judge model's key and its base URL. The URL is a secret too so the host name stays out of the
+# repository. Absent, the advisor stays off and the lead picks as before.
+KV_DECISION_API_KEY="${KV_DECISION_API_KEY:-foundry-decision-api-key}"
+KV_DECISION_ENDPOINT="${KV_DECISION_ENDPOINT:-foundry-decision-endpoint}"
+# Optional (2026-11-09, the natural voices in Speak replies): the Azure Speech key. The region is
+# plain config (AE_SPEECH_REGION in config/server.env). Absent, replies use the device's voices.
+KV_AZURE_SPEECH_KEY="${KV_AZURE_SPEECH_KEY:-azure-speech-key}"
 # Optional (2026-10-16, the Admin Center's Fabric section): the aetraining capacity's
 # Logic App wake URL (the shared wake link; its query carries the trigger's
 # signature) and the suspend key that turns on Off for it. Absent, the page
@@ -99,6 +107,10 @@ KV_AZURE_COST_CLIENT_SECRET="${KV_AZURE_COST_CLIENT_SECRET:-azure-cost-client-se
 # shared accounts' tokens at rest (deploy/README.md, "Shared Claude accounts").
 # Absent, the Admin Center's section says so and no shared account can be added or used.
 KV_SHARED_ACCOUNTS_KEY="${KV_SHARED_ACCOUNTS_KEY:-omnigent-ae-shared-accounts-key}"
+# Optional (2026-11-08, Admin Center card setup): the Fernet key that encrypts the GitHub
+# tokens typed into the Cards panel (company and personal), at rest. Absent, the panel says
+# so and no token can be saved there; the environment's tokens keep working.
+KV_CARD_SECRETS_KEY="${KV_CARD_SECRETS_KEY:-ae-card-secrets-key}"
 
 ENV_DIR="${AE_SECURE_ENV_DIR:-/secure/env}"
 SERVER_ENV="$ENV_DIR/omnigent-ae.env"
@@ -118,7 +130,7 @@ HOST_KEYS=(CLAUDE_CODE_OAUTH_TOKEN)
 # (packages/ae_omni_policies/src/ae_omni_policies/secrets_health.py, with what
 # each key turns on); a test fails when the two differ, so a new key goes there too.
 # Written when the vault has them, reported but never required by --check.
-SERVER_OPTIONAL_KEYS=(AE_GITHUB_TOKEN AE_FABRIC_WAKE_URL_AETRAINING AE_FABRIC_SUSPEND_KEY_AETRAINING AE_FABRIC_CAPACITIES_URL AE_FABRIC_CAPACITIES_KEY AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_AZURE_COST_TENANT_ID AE_AZURE_COST_CLIENT_ID AE_AZURE_COST_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY)
+SERVER_OPTIONAL_KEYS=(AE_GITHUB_TOKEN AE_FABRIC_WAKE_URL_AETRAINING AE_FABRIC_SUSPEND_KEY_AETRAINING AE_FABRIC_CAPACITIES_URL AE_FABRIC_CAPACITIES_KEY AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_AZURE_COST_TENANT_ID AE_AZURE_COST_CLIENT_ID AE_AZURE_COST_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY AE_CARD_SECRETS_KEY AE_DECISION_API_KEY AE_DECISION_ENDPOINT AE_SPEECH_KEY)
 
 usage() {
   # The header comment, up to the first blank-free `set` line.
@@ -205,7 +217,7 @@ fetch_optional() {
   # holding one would reach the server altered (2026-10-16). Refuse it by name;
   # the value is never printed.
   case "$var:$value" in
-    AE_FABRIC_*:*'$'*|AE_DATABRICKS_*:*'$'*) die "secret '$name' contains a '\$'; Compose interpolates the env file and would change it. Store a value without one (a Logic App URL has none; use a hex suspend key), then rerun." ;;
+    AE_FABRIC_*:*'$'*|AE_DATABRICKS_*:*'$'*|AE_DECISION_*:*'$'*) die "secret '$name' contains a '\$'; Compose interpolates the env file and would change it. Store a value without one (a Logic App URL has none; use a hex suspend key), then rerun." ;;
   esac
   printf -v "$var" '%s' "$value"
 }
@@ -250,8 +262,9 @@ main() {
   local AE_GITHUB_TOKEN OMNIGENT_OIDC_CLIENT_SECRET OMNIGENT_OIDC_COOKIE_SECRET
   local AE_FABRIC_WAKE_URL_AETRAINING AE_FABRIC_SUSPEND_KEY_AETRAINING
   local AE_FABRIC_CAPACITIES_URL AE_FABRIC_CAPACITIES_KEY
-  local AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY
+  local AE_DATABRICKS_CLIENT_ID AE_DATABRICKS_CLIENT_SECRET AE_SHARED_ACCOUNTS_KEY AE_CARD_SECRETS_KEY
   local AE_AZURE_COST_TENANT_ID AE_AZURE_COST_CLIENT_ID AE_AZURE_COST_CLIENT_SECRET
+  local AE_DECISION_API_KEY AE_DECISION_ENDPOINT AE_SPEECH_KEY
   note "reading ${#SERVER_KEYS[@]} + ${#HOST_KEYS[@]} secrets from vault '$VAULT'"
   fetch POSTGRES_PASSWORD "$KV_POSTGRES_PASSWORD"
   fetch AE_CF_ACCESS_CLIENT_ID "$KV_CF_ACCESS_CLIENT_ID"
@@ -270,6 +283,10 @@ main() {
   fetch_optional AE_AZURE_COST_CLIENT_ID "$KV_AZURE_COST_CLIENT_ID" "the Admin Center's Azure card"
   fetch_optional AE_AZURE_COST_CLIENT_SECRET "$KV_AZURE_COST_CLIENT_SECRET" "the Admin Center's Azure card"
   fetch_optional AE_SHARED_ACCOUNTS_KEY "$KV_SHARED_ACCOUNTS_KEY" "shared Claude accounts"
+  fetch_optional AE_CARD_SECRETS_KEY "$KV_CARD_SECRETS_KEY" "GitHub tokens saved in the Cards panel"
+  fetch_optional AE_DECISION_API_KEY "$KV_DECISION_API_KEY" "the Decision-1 preset advisor"
+  fetch_optional AE_DECISION_ENDPOINT "$KV_DECISION_ENDPOINT" "the Decision-1 preset advisor"
+  fetch_optional AE_SPEECH_KEY "$KV_AZURE_SPEECH_KEY" "the natural voices in Speak replies"
 
   local stamp
   stamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -313,6 +330,18 @@ main() {
     fi
     if [ -n "$AE_SHARED_ACCOUNTS_KEY" ]; then
       printf '%s=%s\n' AE_SHARED_ACCOUNTS_KEY "$AE_SHARED_ACCOUNTS_KEY"
+    fi
+    if [ -n "$AE_CARD_SECRETS_KEY" ]; then
+      printf '%s=%s\n' AE_CARD_SECRETS_KEY "$AE_CARD_SECRETS_KEY"
+    fi
+    if [ -n "$AE_DECISION_API_KEY" ]; then
+      printf '%s=%s\n' AE_DECISION_API_KEY "$AE_DECISION_API_KEY"
+    fi
+    if [ -n "$AE_DECISION_ENDPOINT" ]; then
+      printf '%s=%s\n' AE_DECISION_ENDPOINT "$AE_DECISION_ENDPOINT"
+    fi
+    if [ -n "$AE_SPEECH_KEY" ]; then
+      printf '%s=%s\n' AE_SPEECH_KEY "$AE_SPEECH_KEY"
     fi
   } > "$tmp/server.env"
   {

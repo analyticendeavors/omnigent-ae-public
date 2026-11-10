@@ -57,7 +57,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from ae_omni_policies import fabric, key_health, secrets_meta, taskstore
+from ae_omni_policies import admin_cards, fabric, key_health, secrets_meta, taskstore
 
 # Each key, with what it turns on, in pull-secrets.sh's order.
 REQUIRED: dict[str, str] = {
@@ -77,6 +77,10 @@ OPTIONAL: dict[str, str] = {
     "AE_AZURE_COST_CLIENT_ID": "Azure card",
     "AE_AZURE_COST_CLIENT_SECRET": "Azure card",
     "AE_SHARED_ACCOUNTS_KEY": "Shared Claude accounts",
+    "AE_CARD_SECRETS_KEY": "Saved GitHub tokens",
+    "AE_DECISION_API_KEY": "Decision-1 preset advisor",
+    "AE_DECISION_ENDPOINT": "Decision-1 preset advisor",
+    "AE_SPEECH_KEY": "Natural voices in Speak replies",
 }
 
 
@@ -265,13 +269,28 @@ def view(environ: Mapping[str, str] | None = None, auth_source: str | None = Non
     reading = secrets_meta.store().read()
     required = _rows(needed, env, reading, now)
     host = _host_rows(reading, now)
-    return SecretsView(
-        required=required + host,
-        optional=(
+    # A key only switched-off cards use no longer shows as missing (2026-11-07, card setup),
+    # but a key that is present keeps its row and its expiry: off must never hide an expiring key.
+    dropped, dropped_prefixes = admin_cards.keys_dropped_when_off(env)
+
+    def keep(row: SecretKey) -> bool:
+        if row.present:
+            return True
+        return row.key not in dropped and not row.key.startswith(dropped_prefixes)
+
+    required = [row for row in required if keep(row)]
+    optional = [
+        row
+        for row in (
             _rows(OPTIONAL, env, reading, now)
             + _capacity_rows(env, reading, now)
             + _rows(unused, env, reading, now)
-        ),
+        )
+        if keep(row)
+    ]
+    return SecretsView(
+        required=required + host,
+        optional=optional,
         missing=[row.key for row in required if not row.present],
         host_missing=[row.key for row in host if not row.present],
         failing=[row.key for row in required if row.present and row.check == "failed"],

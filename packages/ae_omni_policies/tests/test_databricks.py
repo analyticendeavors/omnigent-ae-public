@@ -22,7 +22,7 @@ import httpx
 import pytest
 import respx
 
-from ae_omni_policies import auth, databricks
+from ae_omni_policies import admin_cards, auth, card_config, databricks
 
 # A credit for the tests that need one; the server has no built-in credit.
 CREDIT_ENV = {
@@ -1820,3 +1820,112 @@ async def test_new_totals_never_show_beside_the_last_readings_rows(tmp_path: Pat
     await task
     after = databricks.spend_view(databricks.credit(CREDIT_ENV))
     assert after["products"] == [{"product": "SQL", "usd": 100.0}]
+
+
+# ── a credit saved in the Cards panel (2026-11-07) ───────────────────────────────────────────
+
+
+def _panel_credit(monkeypatch: pytest.MonkeyPatch, usd: str, start: str, end: str) -> None:
+    """Credit settings typed in the panel: the environment has none, the store has these."""
+    for key in CREDIT_ENV:
+        monkeypatch.delenv(key, raising=False)
+    store = admin_cards.store()
+    store.set_settings(
+        "credit",
+        {
+            "AE_DATABRICKS_CREDIT_USD": usd,
+            "AE_DATABRICKS_CREDIT_START": start,
+            "AE_DATABRICKS_CREDIT_END": end,
+        },
+        "owner@example.com",
+        store.snapshot()["revision"],
+    )
+    card_config.invalidate("credit")
+
+
+async def test_a_saved_credit_window_is_read_at_once_not_after_the_hour(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        if request.method == "POST" and _sql_of(request) == databricks.SPEND_SQL:
+            return httpx.Response(200, json=_succeeded())
+        return httpx.Response(200, json=_breakdown())
+
+    _panel_credit(monkeypatch, "500", "2030-01-01", "2030-12-31")
+    await databricks._read_spend(
+        ws, databricks.credit(), WID, transport=httpx.MockTransport(handler)
+    )
+    assert databricks._stale() is False  # a fresh reading waits out the hour
+    _panel_credit(monkeypatch, "900", "2031-01-01", "2031-12-31")
+    assert databricks._stale() is True
+    spend = databricks.spend_view(databricks.credit())
+    assert spend["creditUsd"] == 900.0 and spend["creditStart"] == "2031-01-01"
+    assert spend["totalUsd"] is None  # totals read for the old window are not shown
+
+
+async def test_a_reading_in_flight_for_the_old_credit_window_is_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+    asked = asyncio.Event()
+    gate = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        if request.method == "POST" and _sql_of(request) == databricks.SPEND_SQL:
+            asked.set()
+            await gate.wait()
+            return httpx.Response(200, json=_succeeded())
+        return httpx.Response(200, json=_breakdown())
+
+    _panel_credit(monkeypatch, "500", "2030-01-01", "2030-12-31")
+    task = asyncio.create_task(
+        databricks._read_spend(
+            ws, databricks.credit(), WID, transport=httpx.MockTransport(handler)
+        )
+    )
+    await asked.wait()
+    _panel_credit(monkeypatch, "900", "2031-01-01", "2031-12-31")  # saved mid-read
+    gate.set()
+    await task
+    state = databricks._state()
+    assert state["status"] != "ok" and state["creditStart"] is None
+    assert state["monthUsd"] is None and state["attemptedAt"] is None
+    assert databricks._stale() is True
+
+
+async def test_a_cancelled_reading_for_the_old_credit_window_writes_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = databricks.Workspace(HOST, CLIENT_ID, CLIENT_SECRET)
+    asked = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/oidc/v1/token":
+            return httpx.Response(200, json=_token_answer())
+        if request.method == "POST" and _sql_of(request) == databricks.SPEND_SQL:
+            asked.set()
+            await asyncio.sleep(60)  # never answers
+        return httpx.Response(200, json=_breakdown())
+
+    _panel_credit(monkeypatch, "500", "2030-01-01", "2030-12-31")
+    before = (databricks._state()["status"], databricks._state()["attemptedAt"])
+    task = asyncio.create_task(
+        databricks._read_spend(
+            ws, databricks.credit(), WID, transport=httpx.MockTransport(handler)
+        )
+    )
+    await asked.wait()
+    _panel_credit(monkeypatch, "900", "2031-01-01", "2031-12-31")  # saved mid-read
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    state = databricks._state()
+    assert (state["status"], state["attemptedAt"]) == before
+    assert state["attemptedAt"] is None and "stopped" not in str(state["message"])
+    assert databricks._stale() is True  # the next overview reads the new window

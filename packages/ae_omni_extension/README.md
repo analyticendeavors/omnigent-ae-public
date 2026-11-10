@@ -255,15 +255,15 @@ page: the SDK's `navigation.openPage` opens only the extension's own pages.
 ### Dashboard layout (2026-10-20)
 
 The owner approved concept C. The page uses the pane's width. Under the header (title,
-"Updated", one refresh button that runs every section's normal read) sits a tile strip
-(`tiles.ts`): Release, Deploy hold, Box host, Fabric, Databricks, Secrets and Shared
-accounts, each with a coloured left edge by health. Each section builds its own tile from
-the state it already has, so the strip makes no requests. The cards (`board.ts`) are
+"Updated", one refresh button that runs every section's normal read) sit four status pills
+(`tiles.ts`, 2026-11-06; first a strip of ten tiles): Ship, Box, Cloud and Accounts and
+spend, each the worst health of its member tiles. Each section builds its own tile from
+the state it already has, so the pills make no requests. The cards (`board.ts`) are
 Deploys, Compute (Fabric rows, then Databricks warehouses), Databricks credit and Box
 health (host, then secrets). They sit in fixed column stacks, and the last card in each
 column stretches. At 1040 px and wider there are three columns: Deploys over credit,
 then Compute, then Box health. From 520 px there are two: Deploys over Compute, and
-credit over Box health. Below 520 px there is one column, with no tiles, and each card
+credit over Box health. Below 520 px there is one column (the pills stay, two by two), and each card
 folds to its header line. Deploys starts open; the other cards start folded unless
 they need attention, and each card remembers its fold in `sections.open` under an
 `admin-` id.

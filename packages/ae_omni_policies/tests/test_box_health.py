@@ -272,6 +272,14 @@ def test_failed_units_and_unread_parts() -> None:
     assert any(n.text.startswith("The box could not read: docker") for n in view.needs)
 
 
+def test_user_units_are_tagged_and_a_name_in_both_managers_stays_system() -> None:
+    post = make_post(units=["ae-both.service"]).model_copy(
+        update={"failed_user_units": ["ae-both.service", "ae-watch-pr1.service"]}
+    )
+    need = next(n for n in view_of(post).needs if n.key == "units")
+    assert need.facts["user_units"] == ["ae-watch-pr1.service"]
+
+
 def test_the_guard_not_running_is_an_amber_line_and_running_is_counted() -> None:
     down = view_of(make_post(guard=Guard(running=False)))
     assert down.needs[0].key == "guard" and tone_of(down, "bloat") == "amber"
@@ -360,15 +368,18 @@ async def test_access_tells_each_caller_what_they_may_see(
     assert (await client.get("/v1/ae/access", headers=OWNER)).json() == {
         "admin": True,
         "box_admin": True,
+        "box_on": True,
     }
     assert (await client.get("/v1/ae/access", headers=MEMBER)).json() == {
         "admin": False,
         "box_admin": False,
+        "box_on": True,
     }
     monkeypatch.setenv("AE_BOX_ADMINS", "MEMBER@example.com")
     assert (await client.get("/v1/ae/access", headers=MEMBER)).json() == {
         "admin": False,
         "box_admin": True,
+        "box_on": True,
     }
 
 
@@ -405,7 +416,11 @@ async def test_post_checks_the_origin_and_the_limits(client: httpx.AsyncClient) 
 
 
 async def test_a_single_user_runtime_is_everything(client: httpx.AsyncClient) -> None:
-    assert (await client.get("/v1/ae/access")).json() == {"admin": True, "box_admin": True}
+    assert (await client.get("/v1/ae/access")).json() == {
+        "admin": True,
+        "box_admin": True,
+        "box_on": True,
+    }
     assert (await client.post("/v1/ae/box-health", json=body())).status_code == 200
 
 
@@ -413,7 +428,9 @@ async def test_a_single_user_runtime_is_everything(client: httpx.AsyncClient) ->
 
 
 def test_the_worst_case_view_stays_under_the_bridge_cap() -> None:
-    """The extension bridge refuses an answer over 32,768 characters; stay under 30,000.
+    """The extension bridge refuses an answer over 32,768 characters; stay under 31,000.
+
+    (Raised from 30,000 on 2026-11-06, when the group share setting added a row.)
 
     Every posted string is at its longest the model allows (48 characters, 32 for labels),
     and every list is full."""
@@ -485,7 +502,7 @@ def test_the_worst_case_view_stays_under_the_bridge_cap() -> None:
     size = len(json.dumps(dump))
     parts = {key: len(json.dumps(value)) for key, value in dump.items()}
     parts.update({f"details.{k}": len(json.dumps(v)) for k, v in dump["details"].items()})
-    assert size < 30_000, (size, parts)
+    assert size < 31_000, (size, parts)
 
 
 @pytest.mark.parametrize(
@@ -600,3 +617,87 @@ def test_a_tmp_group_outside_the_fixed_set_is_refused() -> None:
     for name in ("acme-*", "client", "sec-appr-acme", "ok"):
         with pytest.raises(ValueError):
             LitterGroup(group=name, entries=1)
+
+
+# ── one rule for scan certainty (2026-11-06) ────────────────────────────────
+
+
+def _capped_user() -> UserHealth:
+    return UserHealth(
+        label="Owner",
+        uid=1000,
+        claude=[ClaudeRoot(where="cache", sessions=3, files=500_000, partial=True)],
+    )
+
+
+def test_scan_certainty_has_five_answers() -> None:
+    def certainty(post: BoxHealthPost, at: datetime = NOW) -> str:
+        return box_health.scan_certainty(stored(post), at)
+
+    assert certainty(make_post()) == "ok"
+    assert certainty(make_post(users=[_capped_user()])) == "capped"
+    assert certainty(make_post(), NOW + timedelta(hours=4)) == "late"
+    assert certainty(make_post(failed=["slow scans cut short"])) == "cut"
+    assert certainty(make_post(failed=["units"])) == "ok"  # a fast part
+    missing = make_post()
+    missing.slow = None
+    assert certainty(missing) == "missing"
+    # Precedence: cut beats late beats capped.
+    both = make_post(users=[_capped_user()], failed=["docker"])
+    assert certainty(both, NOW + timedelta(hours=4)) == "cut"
+    assert certainty(make_post(users=[_capped_user()]), NOW + timedelta(hours=4)) == "late"
+
+
+def test_a_capped_scan_adds_one_named_amber_need() -> None:
+    view = view_of(make_post(users=[_capped_user()]))
+    assert tone_of(view, "bloat") == "amber"
+    needs = [n for n in view.all_needs if n.key.startswith("scan:")]
+    assert [n.key for n in needs] == ["scan:capped"]
+    assert needs[0].text == "Temp folder count stopped early"
+    assert needs[0].area == "bloat" and needs[0].tone == "amber"
+    assert "metric" not in needs[0].facts
+
+
+def test_a_late_scan_adds_one_named_amber_need() -> None:
+    # A fresh fast reading beside an old slow scan, so this is a late scan, not a stale reading.
+    post = make_post()
+    assert post.slow is not None
+    post.slow.read_at = NOW - timedelta(hours=4)
+    view = view_of(post)
+    assert view.state == "ok"
+    keys = [n.key for n in view.all_needs if n.key.startswith("scan:")]
+    assert keys == ["scan:late"]
+    late = next(n for n in view.all_needs if n.key == "scan:late")
+    assert late.text == "Cleanup scan is late" and "ago" in late.detail
+    assert "below" not in late.detail
+    assert tone_of(view, "bloat") == "amber"
+
+
+def test_an_unreadable_row_is_not_a_read_failure_or_a_need() -> None:
+    post = make_post(
+        users=[
+            box_health.UserHealth(
+                label="alice",
+                claude=[box_health.ClaudeRoot(where="cache", sessions=3, had_unreadable=True)],
+            )
+        ]
+    )
+    assert post.slow is not None
+    assert box_health.scan_unreadable(post.slow)
+    assert box_health.scan_certainty(stored(post), NOW) == "ok"
+    assert not [n for n in view_of(post).all_needs if n.key.startswith("scan:")]
+    assert not box_health.scan_unreadable(make_post().slow)
+
+
+def test_a_clean_scan_adds_no_scan_need() -> None:
+    view = view_of(make_post())
+    assert not [n for n in view.all_needs if n.key.startswith("scan:")]
+
+
+def test_the_scan_needs_name_no_folder_or_person() -> None:
+    capped = view_of(make_post(users=[_capped_user()]))
+    late = view_of(make_post(), now=NOW + timedelta(hours=4))
+    for need in (*capped.all_needs, *late.all_needs):
+        if need.key.startswith("scan:"):
+            text = f"{need.key} {need.text} {need.detail} {need.facts}"
+            assert "Owner" not in text and "cache" not in text

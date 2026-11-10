@@ -3,7 +3,7 @@
 // /targets/{id} (save) and /targets/{id}/delete, because the extension host sends no
 // PUT or DELETE.
 import type { ExtensionContext } from "@omnigent/extension-sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { CostTarget, CostTargetsAnswer } from "../src/api";
 import {
   ALLOWED_KINDS,
@@ -32,6 +32,8 @@ import {
   withMeasure,
 } from "../src/azureTargets";
 import { isOpen, resetSectionState } from "../src/sections";
+import { resetAttention, setAttention } from "../src/attentionStore";
+import { item as needItem, overview as needOverview } from "./attentionFixtures";
 
 const sdk = vi.hoisted(() => ({ defineExtension: vi.fn() }));
 vi.mock("@omnigent/extension-sdk", () => sdk);
@@ -609,5 +611,22 @@ describe("order and meters", () => {
     const meters = [...root.querySelectorAll<HTMLElement>(".azure-meter")];
     expect(meters.map((item) => item.dataset.tone)).toEqual(["near", "ok"]);
     expect(meters[0].querySelector("i")?.getAttribute("style")).toBe("width:80%");
+  });
+});
+
+
+describe("the Needs you link (2026-11-06)", () => {
+  afterEach(() => resetAttention());
+
+  it("shows its source's count and follows the panel's reads", async () => {
+    resetAttention();
+    const { context } = stub(() => ok(answer([rule({ id: "a", name: "A", limit: 50, value: 61 })])));
+    const { root: node } = await mount(context);
+    const link = () => node.querySelector(".needs-link");
+    expect(link()?.textContent).toBe("Reading Needs you...");
+    setAttention(needOverview([needItem("cost-1", { source: "cost", kind: "cost-over" })]));
+    expect(link()?.textContent).toBe("1 in Needs you");
+    setAttention(needOverview([]));
+    expect(link()?.textContent).toBe("Nothing needs you.");
   });
 });

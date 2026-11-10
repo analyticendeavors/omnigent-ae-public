@@ -128,14 +128,29 @@ export function resetLotState(): void {
   drawn = null;
 }
 
-/** Copy through the clipboard API, else the selection fallback the sandbox still allows. */
+/**
+ * Copy the text. The selection copy (a hidden textarea and `execCommand`) runs first and
+ * synchronously, inside the tap, and the clipboard API is tried only if it returned false.
+ *
+ * Root cause of the 2026-11-07 iPhone report ("Copied, opened" but nothing to paste in
+ * LinkedIn): the frame's sandbox gives `navigator.clipboard.writeText` no grant, so it always
+ * rejects, and awaiting it first pushed the working fallback behind that rejection. The Open
+ * button had already sent `openExternal` by then, the app switched away, and the copy never
+ * landed. An async function runs up to its first `await` at once, so doing the sync copy first
+ * keeps it inside the tap, ahead of any host call the caller makes next.
+ */
 export async function copyText(text: string): Promise<boolean> {
+  if (copyBySelection(text)) return true;
   try {
     await navigator.clipboard.writeText(text);
     return true;
   } catch {
     // Not available in a sandboxed frame without a clipboard-write grant.
   }
+  return false;
+}
+
+function copyBySelection(text: string): boolean {
   const area = el("textarea", { class: "clip", "aria-hidden": "true" });
   area.value = text;
   document.body.appendChild(area);

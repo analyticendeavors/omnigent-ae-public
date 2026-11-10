@@ -1,0 +1,1062 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 15:57:55 -0800
+Subject: [PATCH 314/333] [ae-patch] Fix the review findings on Speak replies
+ (0313)
+
+Three reviewers and a live browser run found these, fixed here.
+
+Repeats: a persisted final was spoken again after its preview because its text
+did not start with the exact spoken prefix, a second message in one response was
+silenced by a per-response done flag, and a second SDK final with no item id was
+skipped. The hook now tracks the sentences spoken this turn and per-source
+offsets (a live preview, or a run of SDK chunks after the last final), speaks
+only sentences not yet spoken, and accepts a refetched final only for a response
+streamed live.
+
+Boundaries: an end mark as the last character of the text is no longer a
+sentence boundary, so "costs 3." no longer splits before "5 dollars".
+
+Sends: a send is a new user message or a growing pending queue, not a status
+flip, so a stray status change no longer cancels speech or loses text.
+
+Utterances: the speaker keeps every queued utterance referenced until it ends,
+because Chrome collects an unreferenced one mid-speech and the speaking flag
+stuck on.
+
+Fast answers: the effort is lowered first and the old one stored only after that
+succeeds; restoring leaves an effort the user changed by hand, keeps the stored
+state when the restore fails, and applies late when effort levels arrive.
+Read-only chats hide Fast answers but keep the trigger usable.
+
+Menu: Voice and Speed hints wrap, Voice names the voice that will speak, and a
+chat switch remounts the control.
+
+Speech text: link reference definitions are skipped, spaced pipes read as
+commas, and asterisks inside words and globs are left alone.
+
+Added 2026-11-08.
+---
+ .../components/AeSpeakRepliesButton.test.tsx  | 110 +++++++++-
+ web/src/components/AeSpeakRepliesButton.tsx   |  85 +++++---
+ web/src/hooks/useAeSpeakReplies.test.ts       | 121 ++++++++++-
+ web/src/hooks/useAeSpeakReplies.ts            | 190 ++++++++++++------
+ web/src/lib/aeSpeakReplies.test.ts            |  19 ++
+ web/src/lib/aeSpeakReplies.ts                 |   8 +
+ web/src/lib/aeSpeechText.test.ts              |  24 +++
+ web/src/lib/aeSpeechText.ts                   |  33 ++-
+ web/src/pages/ChatPage.tsx                    |   2 +-
+ web/src/test/fakeSpeech.ts                    |  10 +-
+ 10 files changed, 487 insertions(+), 115 deletions(-)
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index e6f20ada436f0fa67f76a1efec70b6109f0cbe71..cd308762b3cc996f2415994567daff779835afec 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -1,4 +1,4 @@
+-import { render, screen } from "@testing-library/react";
++import { render, screen, waitFor } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { AE_SETTING_HINTS } from "@/lib/aeSettingHints";
+@@ -9,8 +9,12 @@ import { AeSpeakRepliesButton } from "./AeSpeakRepliesButton";
+ const setEffort = vi.fn(() => Promise.resolve());
+ const originalSetEffort = useChatStore.getState().setEffort;
+ 
++function Button(props: Partial<React.ComponentProps<typeof AeSpeakRepliesButton>>) {
++  return <AeSpeakRepliesButton chatId="c1" canSetEffort currentEffort="high" {...props} />;
++}
++
+ function renderButton(props: Partial<React.ComponentProps<typeof AeSpeakRepliesButton>> = {}) {
+-  return render(<AeSpeakRepliesButton chatId="c1" canSetEffort currentEffort="high" {...props} />);
++  return render(<Button {...props} />);
+ }
+ 
+ async function openMenu() {
+@@ -69,20 +73,110 @@ describe("AeSpeakRepliesButton", () => {
+   });
+ 
+   it("turns on, lowers the effort and remembers the old one, then restores it", async () => {
+-    renderButton();
++    const view = renderButton();
+     const user = await openMenu();
+     await user.click(screen.getByTestId("ae-speak-toggle"));
+     expect(window.localStorage.getItem("omnigent:ae-speak-replies:c1")).toBe("true");
+-    expect(setEffort).toHaveBeenLastCalledWith("low");
+-    expect(JSON.parse(window.localStorage.getItem("omnigent:ae-speak-fast:c1") ?? "null")).toEqual({
+-      previousEffort: "high",
+-    });
++    await waitFor(() => expect(setEffort).toHaveBeenLastCalledWith("low"));
++    await waitFor(() =>
++      expect(
++        JSON.parse(window.localStorage.getItem("omnigent:ae-speak-fast:c1") ?? "null"),
++      ).toEqual({
++        previousEffort: "high",
++      }),
++    );
+     expect(screen.getByTestId("ae-speak-replies")).toHaveAttribute("aria-pressed", "true");
+ 
++    view.rerender(<Button currentEffort="low" />);
+     await user.click(screen.getByTestId("ae-speak-toggle"));
+-    expect(setEffort).toHaveBeenLastCalledWith("high");
++    await waitFor(() => expect(setEffort).toHaveBeenLastCalledWith("high"));
++    await waitFor(() =>
++      expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).toBeNull(),
++    );
+     expect(window.localStorage.getItem("omnigent:ae-speak-replies:c1")).toBeNull();
++  });
++
++  it("stores nothing when lowering the effort is rejected", async () => {
++    setEffort.mockRejectedValueOnce(new Error("no"));
++    renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, 10);
++    });
+     expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).toBeNull();
++    expect(screen.getByTestId("ae-speak-replies")).toHaveAttribute("aria-pressed", "true");
++  });
++
++  it("restores a null effort", async () => {
++    const view = renderButton({ currentEffort: null });
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() =>
++      expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).toBe(
++        '{"previousEffort":null}',
++      ),
++    );
++    view.rerender(<Button currentEffort="low" />);
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() => expect(setEffort).toHaveBeenLastCalledWith(null));
++  });
++
++  it("leaves an effort the user changed by hand", async () => {
++    const view = renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() =>
++      expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).not.toBeNull(),
++    );
++    setEffort.mockClear();
++    view.rerender(<Button currentEffort="high" />);
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() =>
++      expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).toBeNull(),
++    );
++    expect(setEffort).not.toHaveBeenCalled();
++  });
++
++  it("keeps the stored state when restoring is rejected", async () => {
++    const view = renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() =>
++      expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).not.toBeNull(),
++    );
++    view.rerender(<Button currentEffort="low" />);
++    setEffort.mockRejectedValueOnce(new Error("no"));
++    await user.click(screen.getByTestId("ae-speak-toggle"));
++    await waitFor(() => expect(setEffort).toHaveBeenLastCalledWith("high"));
++    await new Promise<void>((resolve) => {
++      setTimeout(resolve, 10);
++    });
++    expect(window.localStorage.getItem("omnigent:ae-speak-fast:c1")).not.toBeNull();
++  });
++
++  it("applies Fast answers once effort levels arrive", async () => {
++    window.localStorage.setItem("omnigent:ae-speak-replies:c1", "true");
++    const view = renderButton({ canSetEffort: false });
++    expect(setEffort).not.toHaveBeenCalled();
++    view.rerender(<Button canSetEffort />);
++    await waitFor(() => expect(setEffort).toHaveBeenCalledWith("low"));
++  });
++
++  it("hides Fast answers in a read-only chat but keeps the trigger enabled", async () => {
++    renderButton({ readOnly: true });
++    await openMenu();
++    expect(screen.queryByTestId("ae-speak-fast")).toBeNull();
++    expect(screen.getByTestId("ae-speak-replies")).not.toBeDisabled();
++    expect(setEffort).not.toHaveBeenCalled();
++  });
++
++  it("shows the voice that will speak when none is chosen", async () => {
++    renderButton();
++    const user = await openMenu();
++    expect(screen.getByTestId("ae-speak-voice-trigger")).toHaveTextContent("Aria (Natural)");
++    await user.keyboard("{Escape}");
+   });
+ 
+   it("leaves the effort alone when Fast answers is off", async () => {
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 2fcacb86ddf5180f604e223a7c1ebf35ef41dcba..e32e9ce92ff7465a960e59f64bf252ba36ba36fb 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -4,7 +4,7 @@
+ // the voice and speed choices, Read last reply and Stop speaking.
+ 
+ import { RotateCcwIcon, SquareIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
+-import { type ReactNode, useCallback, useEffect, useState } from "react";
++import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+ import { Button } from "@/components/ui/button";
+ import {
+   DropdownMenu,
+@@ -27,6 +27,7 @@ import {
+   isSpeechSupported,
+   listVoices,
+   onVoicesChanged,
++  pickDefaultVoice,
+   RATE_FASTER,
+   rankVoices,
+   readFastAnswersState,
+@@ -46,12 +47,15 @@ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ const MAX_VOICES = 12;
+-const HINT_CLASS = "block max-w-[20rem] text-xs font-normal text-muted-foreground";
++const HINT_CLASS =
++  "block max-w-[20rem] text-xs font-normal whitespace-normal break-words text-muted-foreground";
+ 
+ export interface AeSpeakRepliesButtonProps {
+   chatId: string | null;
+   className?: string;
+   disabled?: boolean;
++  /** A viewer can still listen and stop, but cannot change the chat's effort. */
++  readOnly?: boolean;
+   canSetEffort: boolean;
+   currentEffort: string | null;
+ }
+@@ -65,22 +69,20 @@ function Described({ label, hint }: { label: ReactNode; hint: string }) {
+   );
+ }
+ 
+-function setChatEffort(level: string | null) {
+-  void useChatStore
+-    .getState()
+-    .setEffort(level)
+-    .catch(() => {});
++function setChatEffort(level: string | null): Promise<void> {
++  return useChatStore.getState().setEffort(level);
+ }
+ 
+ export function AeSpeakRepliesButton(props: AeSpeakRepliesButtonProps) {
+   if (!isSpeechSupported() || props.chatId === null) return null;
+-  return <SpeakRepliesControl {...props} chatId={props.chatId} />;
++  return <SpeakRepliesControl key={props.chatId} {...props} chatId={props.chatId} />;
+ }
+ 
+ function SpeakRepliesControl({
+   chatId,
+   className,
+   disabled,
++  readOnly,
+   canSetEffort,
+   currentEffort,
+ }: AeSpeakRepliesButtonProps & { chatId: string }) {
+@@ -101,40 +103,68 @@ function SpeakRepliesControl({
+ 
+   const { speaking, stop, readLast } = useAeSpeakReplies({ chatId, enabled: on, voiceURI, rate });
+ 
+-  const applyFast = useCallback(() => {
+-    if (!canSetEffort || readFastAnswersState(chatId)) return;
+-    writeFastAnswersState(chatId, { previousEffort: currentEffort });
+-    setChatEffort(FAST_EFFORT);
+-  }, [canSetEffort, chatId, currentEffort]);
++  const fastAvailable = canSetEffort && !readOnly;
++  const wanted = useRef({ on, fastEnabled });
++  wanted.current = { on, fastEnabled };
++  const effortRef = useRef(currentEffort);
++  effortRef.current = currentEffort;
++  const busyRef = useRef(false);
+ 
+-  const revertFast = useCallback(() => {
++  const applyFast = useCallback(async () => {
++    if (busyRef.current || readFastAnswersState(chatId)) return;
++    const previousEffort = effortRef.current;
++    busyRef.current = true;
++    try {
++      await setChatEffort(FAST_EFFORT);
++    } catch {
++      return;
++    } finally {
++      busyRef.current = false;
++    }
++    if (wanted.current.on && wanted.current.fastEnabled) {
++      writeFastAnswersState(chatId, { previousEffort });
++    } else {
++      // Turned off while the change was in flight: put the effort back.
++      await setChatEffort(previousEffort).catch(() => {});
++    }
++  }, [chatId]);
++
++  const revertFast = useCallback(async () => {
+     const state = readFastAnswersState(chatId);
+     if (!state) return;
+-    setChatEffort(state.previousEffort);
++    // An effort the user changed by hand since stays as they left it.
++    if (effortRef.current === FAST_EFFORT) {
++      try {
++        await setChatEffort(state.previousEffort);
++      } catch {
++        return;
++      }
++    }
+     clearFastAnswersState(chatId);
+   }, [chatId]);
+ 
++  // Effort levels can arrive after the toggle, so apply whenever it is wanted and not yet applied.
++  useEffect(() => {
++    if (on && fastEnabled && fastAvailable && currentEffort !== FAST_EFFORT) void applyFast();
++  }, [on, fastEnabled, fastAvailable, currentEffort, applyFast]);
++
+   const toggleSpeak = (next: boolean) => {
+     writeSpeakReplies(chatId, next);
+     setOn(next);
+-    if (next) {
+-      if (fastEnabled) applyFast();
+-    } else {
++    if (!next) {
+       stop();
+-      revertFast();
++      void revertFast();
+     }
+   };
+ 
+   const toggleFast = (next: boolean) => {
+     writeFastEnabled(next);
+     setFastEnabled(next);
+-    if (!on) return;
+-    if (next) applyFast();
+-    else revertFast();
++    if (!next && on) void revertFast();
+   };
+ 
+   const ranked = rankVoices(voices).slice(0, MAX_VOICES);
+-  const chosen = voices.find((v) => v.voiceURI === voiceURI);
++  const chosen = voices.find((v) => v.voiceURI === voiceURI) ?? pickDefaultVoice(voices);
+   const Icon = on ? Volume2Icon : VolumeXIcon;
+ 
+   return (
+@@ -164,7 +194,7 @@ function SpeakRepliesControl({
+         >
+           <Described label="Speak replies" hint={aeHint("voice.speak")} />
+         </DropdownMenuCheckboxItem>
+-        {canSetEffort ? (
++        {fastAvailable ? (
+           <DropdownMenuCheckboxItem
+             checked={fastEnabled}
+             onCheckedChange={toggleFast}
+@@ -176,7 +206,10 @@ function SpeakRepliesControl({
+           </DropdownMenuCheckboxItem>
+         ) : null}
+         <DropdownMenuSub>
+-          <DropdownMenuSubTrigger data-testid="ae-speak-voice-trigger">
++          <DropdownMenuSubTrigger
++            className="whitespace-normal"
++            data-testid="ae-speak-voice-trigger"
++          >
+             <span className="flex flex-col">
+               <span className="flex items-center justify-between gap-3">
+                 <span>Voice</span>
+@@ -214,7 +247,7 @@ function SpeakRepliesControl({
+             )}
+           </DropdownMenuSubContent>
+         </DropdownMenuSub>
+-        <div className="px-2 py-1.5 text-sm">
++        <div className="px-2 py-1.5 text-sm whitespace-normal">
+           <Described label="Speed" hint={aeHint("voice.rate")} />
+         </div>
+         <DropdownMenuRadioGroup
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 981c3e5e51d8af2b3eb9ab24a28d9bab7f910fc4..8472b2d8c154a7f6c3a01f7cb977d61b95d70601 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -30,6 +30,9 @@ function final(responseId: string, itemId: string, fullText: string, extra = {})
+ function chunk(responseId: string, text: string, depth = 0): AnyBlock {
+   return { type: "text_chunk", ctx: { ...ctx(responseId, null), depth }, text } as AnyBlock;
+ }
++function send(n = 1) {
++  return { pendingUserMessages: Array.from({ length: n }, (_, i) => ({ tempId: `p${i}` })) };
++}
+ function setStore(patch: Record<string, unknown>) {
+   act(() => {
+     useChatStore.setState(patch as never);
+@@ -52,7 +55,12 @@ function mount(enabled = true, chatId: string | null = "c1") {
+ beforeEach(() => {
+   vi.useFakeTimers();
+   synth = installFakeSpeech();
+-  useChatStore.setState({ conversationId: "c1", blocks: [], status: "idle" } as never);
++  useChatStore.setState({
++    conversationId: "c1",
++    blocks: [],
++    status: "idle",
++    pendingUserMessages: [],
++  } as never);
+ });
+ 
+ afterEach(() => {
+@@ -102,7 +110,7 @@ describe("useAeSpeakReplies", () => {
+     setStore({
+       blocks: [
+         final("r0", "item-0", "Old reply."),
+-        live("r1", "Half sentence. Still going. More."),
++        live("r1", "Half sentence. Still going. More. Next"),
+       ],
+     });
+     flush();
+@@ -127,13 +135,13 @@ describe("useAeSpeakReplies", () => {
+     setStore({ blocks: [final("r1", "item-1", "Talking now.")] });
+     flush();
+     const cancels = synth.cancelCount;
+-    setStore({ status: "streaming" });
++    setStore({ status: "streaming", ...send() });
+     expect(synth.cancelCount).toBeGreaterThan(cancels);
+   });
+ 
+   it("says the working cue once after six seconds of silence", () => {
+     mount();
+-    setStore({ status: "streaming" });
++    setStore({ status: "streaming", ...send() });
+     act(() => {
+       vi.advanceTimersByTime(WORKING_CUE_DELAY_MS - 1);
+     });
+@@ -150,8 +158,8 @@ describe("useAeSpeakReplies", () => {
+ 
+   it("skips the working cue when text arrives first", () => {
+     mount();
+-    setStore({ status: "streaming" });
+-    setStore({ blocks: [live("r1", "Quick start.")] });
++    setStore({ status: "streaming", ...send() });
++    setStore({ blocks: [live("r1", "Quick start. ")] });
+     act(() => {
+       vi.advanceTimersByTime(WORKING_CUE_DELAY_MS + 10);
+     });
+@@ -189,4 +197,105 @@ describe("useAeSpeakReplies", () => {
+     flush();
+     expect(synth.texts()).toEqual(["Second reply."]);
+   });
++
++  it("speaks both messages of one response once each", () => {
++    mount();
++    setStore({ blocks: [live("r1", "First message. ")] });
++    flush();
++    setStore({ blocks: [final("r1", "m1", "First message.")] });
++    flush();
++    setStore({ blocks: [final("r1", "m1", "First message."), live("r1", "Second message. ")] });
++    flush();
++    setStore({
++      blocks: [final("r1", "m1", "First message."), final("r1", "m2", "Second message.")],
++    });
++    flush();
++    expect(synth.texts()).toEqual(["First message.", "Second message."]);
++  });
++
++  it("speaks an SDK run with two null-itemId finals once each", () => {
++    mount();
++    const f1 = final("r1", null as never, "Alpha. Beta.");
++    const f2 = final("r1", null as never, "Gamma. Delta.");
++    setStore({ blocks: [chunk("r1", "Alpha. Beta. ")] });
++    flush();
++    setStore({ blocks: [chunk("r1", "Alpha. Beta. "), f1] });
++    flush();
++    setStore({ blocks: [chunk("r1", "Alpha. Beta. "), f1, chunk("r1", "Gamma. Delta. ")] });
++    flush();
++    setStore({ blocks: [chunk("r1", "Alpha. Beta. "), f1, chunk("r1", "Gamma. Delta. "), f2] });
++    flush();
++    expect(synth.texts()).toEqual(["Alpha. Beta.", "Gamma. Delta."]);
++  });
++
++  it("does not repeat a final that differs from the preview in whitespace", () => {
++    mount();
++    setStore({ blocks: [live("r1", "One two.  Three four. ")] });
++    flush();
++    setStore({ blocks: [final("r1", "i1", "One two.   Three four.\n")] });
++    flush();
++    expect(synth.texts()).toEqual(["One two. Three four."]);
++  });
++
++  it("speaks only the sentence a final adds", () => {
++    mount();
++    setStore({ blocks: [live("r1", "One. Two. Thr")] });
++    flush();
++    setStore({ blocks: [final("r1", "i1", "One. Two. Three. Four.")] });
++    flush();
++    expect(synth.texts()).toEqual(["One. Two.", "Three. Four."]);
++  });
++
++  it("accepts a refetched final only for a response streamed live", () => {
++    mount();
++    setStore({ blocks: [live("r1", "Live part. ")] });
++    flush();
++    setStore({
++      blocks: [
++        final("r1", "i1", "Live part. And the rest.", { createdAtS: 50 }),
++        final("r9", "i9", "Unseen history.", { createdAtS: 51 }),
++      ],
++    });
++    flush();
++    expect(synth.texts()).toEqual(["Live part.", "And the rest."]);
++  });
++
++  it("leaves speech alone on a status flip with no new user message", () => {
++    mount();
++    setStore({ blocks: [live("r1", "One. Two")] });
++    flush();
++    const cancels = synth.cancelCount;
++    setStore({ status: "streaming" });
++    setStore({ status: "idle" });
++    setStore({ status: "streaming" });
++    expect(synth.cancelCount).toBe(cancels);
++    setStore({ blocks: [live("r1", "One. Two. Three. ")] });
++    flush();
++    expect(synth.texts()).toEqual(["One.", "Two. Three."]);
++  });
++
++  it("stops speech on a queued send while streaming", () => {
++    mount();
++    setStore({ status: "streaming", blocks: [live("r1", "One. Two")] });
++    flush();
++    const cancels = synth.cancelCount;
++    setStore(send(1));
++    expect(synth.cancelCount).toBeGreaterThan(cancels);
++    setStore(send(2));
++    expect(synth.cancelCount).toBeGreaterThan(cancels + 1);
++  });
++
++  it("does not treat a promoted pending message as a send", () => {
++    mount();
++    setStore({ status: "streaming", ...send(1) });
++    flush();
++    const cancels = synth.cancelCount;
++    const userBlock = {
++      type: "user_message",
++      ctx: ctx("u1", "u1"),
++      content: [],
++    } as unknown as AnyBlock;
++    setStore({ ...send(0), blocks: [userBlock] });
++    expect(synth.cancelCount).toBe(cancels);
++  });
+ });
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 472a16aef8ffd76323400d39ed15bb8eb8304fcf..9346b0f755c90b806ab560891868be8973c4e48a 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -8,8 +8,15 @@ import {
+   WORKING_CUE_DELAY_MS,
+   WORKING_CUE_TEXT,
+ } from "@/lib/aeSpeakReplies";
+-import { completeSentences, speechTextFromMarkdown, stripTldr } from "@/lib/aeSpeechText";
+-import { type AnyBlock, LIVE_ITEM_PREFIX, type TextDone } from "@/lib/blocks";
++import {
++  CODE_BLOCK_PHRASE,
++  completeSentences,
++  normalizeSentence,
++  speechTextFromMarkdown,
++  splitSentences,
++  stripTldr,
++} from "@/lib/aeSpeechText";
++import { type AnyBlock, LIVE_ITEM_PREFIX } from "@/lib/blocks";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ let sharedSpeaker: Speaker | null = null;
+@@ -18,39 +25,59 @@ function getSpeaker(): Speaker {
+   return sharedSpeaker;
+ }
+ 
+-interface ResponseTrack {
+-  /** Raw markdown characters of this response already handed to the speaker. */
+-  spokenRawEnd: number;
+-  raw: string;
+-  done: boolean;
+-}
++const CODE_BLOCK_KEY = normalizeSentence(CODE_BLOCK_PHRASE);
+ 
+-interface ResponseGroup {
+-  chunks: string[];
+-  live: TextDone | null;
+-  finals: TextDone[];
++interface FinalText {
++  key: string;
++  responseId: string;
++  fullText: string;
++  fromHistory: boolean;
+ }
+ 
+-function isSpeakable(b: AnyBlock): b is AnyBlock & { type: "text_chunk" | "text_done" } {
+-  if (b.type !== "text_chunk" && b.type !== "text_done") return false;
+-  if (b.ctx.depth !== 0 || b.ctx.createdAtS !== undefined) return false;
+-  return !(b.type === "text_done" && b.interrupted);
++interface Scan {
++  /** Streaming sources: a native live preview, or a run of SDK chunks after the last final. */
++  sources: Map<string, { responseId: string; raw: string }>;
++  finals: FinalText[];
++  userBlocks: number;
+ }
+ 
+-function groupByResponse(blocks: readonly AnyBlock[]): Map<string, ResponseGroup> {
+-  const groups = new Map<string, ResponseGroup>();
+-  for (const b of blocks) {
+-    if (!isSpeakable(b)) continue;
+-    let g = groups.get(b.ctx.responseId);
+-    if (!g) {
+-      g = { chunks: [], live: null, finals: [] };
+-      groups.set(b.ctx.responseId, g);
++function scanBlocks(blocks: readonly AnyBlock[]): Scan {
++  const sources: Scan["sources"] = new Map();
++  const finals: FinalText[] = [];
++  const lastFinalAt = new Map<string, number>();
++  let userBlocks = 0;
++  blocks.forEach((b, index) => {
++    if (b.type === "user_message") {
++      if (b.ctx.depth === 0 && b.ctx.createdAtS === undefined) userBlocks++;
++      return;
++    }
++    if (b.type !== "text_chunk" && b.type !== "text_done") return;
++    if (b.ctx.depth !== 0) return;
++    const rid = b.ctx.responseId;
++    if (b.type === "text_chunk") {
++      if (b.ctx.createdAtS !== undefined) return;
++      const key = `${rid}#${lastFinalAt.get(rid) ?? -1}`;
++      const source = sources.get(key);
++      if (source) source.raw += b.text;
++      else sources.set(key, { responseId: rid, raw: b.text });
++      return;
+     }
+-    if (b.type === "text_chunk") g.chunks.push(b.text);
+-    else if (b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX)) g.live = b;
+-    else g.finals.push(b);
+-  }
+-  return groups;
++    if (b.interrupted) return;
++    if (b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX)) {
++      if (b.ctx.createdAtS === undefined) {
++        sources.set(b.ctx.itemId, { responseId: rid, raw: b.fullText });
++      }
++      return;
++    }
++    lastFinalAt.set(rid, index);
++    finals.push({
++      key: b.ctx.itemId ?? `${rid}:final:${index}`,
++      responseId: rid,
++      fullText: b.fullText,
++      fromHistory: b.ctx.createdAtS !== undefined,
++    });
++  });
++  return { sources, finals, userBlocks };
+ }
+ 
+ export interface UseAeSpeakRepliesArgs {
+@@ -78,32 +105,61 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+     if (!enabled || !chatId) return;
+     const speaker = getSpeaker();
+     const handled = new Set<string>();
+-    let responses = new Map<string, ResponseTrack>();
++    const knownResponses = new Set<string>();
++    const offsets = new Map<string, number>();
++    // Sentences already spoken this turn, so a final never repeats its preview.
++    const spoken = new Set<string>();
+     let cueTimer: ReturnType<typeof setTimeout> | null = null;
+     let spokenThisTurn = false;
+     let synced = false;
+     let prevStatus: "idle" | "streaming" = "idle";
++    let prevPending = 0;
++    let prevUserBlocks = 0;
+ 
+     const clearCue = () => {
+       if (cueTimer !== null) clearTimeout(cueTimer);
+       cueTimer = null;
+     };
+-    const say = (markdown: string) => {
++    const speakNew = (markdown: string) => {
+       // A reply joined mid-sentence leaves the sentence's end mark at the start.
+       const text = speechTextFromMarkdown(markdown.replace(/^[.!?\s]+/, ""));
+-      if (text === "") return;
++      const fresh: string[] = [];
++      for (const sentence of splitSentences(text)) {
++        const key = normalizeSentence(sentence);
++        if (key === "") continue;
++        if (key === CODE_BLOCK_KEY) {
++          fresh.push(sentence);
++        } else if (!spoken.has(key)) {
++          spoken.add(key);
++          fresh.push(sentence);
++        }
++      }
++      if (fresh.length === 0) return;
+       spokenThisTurn = true;
+       clearCue();
+-      speaker.speak(text, optsRef.current);
++      speaker.speak(fresh.join(" "), optsRef.current);
+     };
+     // Everything already on screen counts as handled so it is never read back.
+     const snapshot = (blocks: readonly AnyBlock[]) => {
+       handled.clear();
+-      responses = new Map();
++      knownResponses.clear();
++      offsets.clear();
++      spoken.clear();
+       for (const b of blocks) if (b.ctx.itemId) handled.add(b.ctx.itemId);
+-      for (const [rid, g] of groupByResponse(blocks)) {
+-        const raw = g.live?.fullText ?? g.chunks.join("");
+-        if (raw !== "") responses.set(rid, { spokenRawEnd: raw.length, raw, done: false });
++      const scan = scanBlocks(blocks);
++      for (const f of scan.finals) handled.add(f.key);
++      for (const [key, source] of scan.sources) {
++        knownResponses.add(source.responseId);
++        offsets.set(key, source.raw.length);
++        const { ready } = completeSentences(stripTldr(source.raw));
++        for (const sentence of splitSentences(speechTextFromMarkdown(ready))) {
++          spoken.add(normalizeSentence(sentence));
++        }
++      }
++      for (const f of scan.finals) {
++        for (const sentence of splitSentences(speechTextFromMarkdown(stripTldr(f.fullText)))) {
++          spoken.add(normalizeSentence(sentence));
++        }
+       }
+     };
+ 
+@@ -112,13 +168,22 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+         synced = false;
+         return;
+       }
++      const scan = scanBlocks(state.blocks);
++      const pending = state.pendingUserMessages.length;
+       if (!synced) {
+         synced = true;
+         prevStatus = state.status;
++        prevPending = pending;
++        prevUserBlocks = scan.userBlocks;
+         snapshot(state.blocks);
+         return;
+       }
+-      if (prevStatus === "idle" && state.status === "streaming") {
++      // A promoted pending message shrinks the queue as its bubble appears; that is not a send.
++      const sent =
++        pending > prevPending || (scan.userBlocks > prevUserBlocks && pending >= prevPending);
++      prevPending = pending;
++      prevUserBlocks = scan.userBlocks;
++      if (sent) {
+         speaker.stop();
+         snapshot(state.blocks);
+         spokenThisTurn = false;
+@@ -130,33 +195,27 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+             speaker.speak(WORKING_CUE_TEXT, optsRef.current);
+           }
+         }, WORKING_CUE_DELAY_MS);
+-      } else if (prevStatus === "streaming" && state.status === "idle") {
+-        clearCue();
++        prevStatus = state.status;
++        return;
+       }
++      if (state.status === "idle" && prevStatus === "streaming") clearCue();
+       prevStatus = state.status;
+ 
+-      for (const [rid, g] of groupByResponse(state.blocks)) {
+-        const track = responses.get(rid) ?? { spokenRawEnd: 0, raw: "", done: false };
+-        responses.set(rid, track);
+-        for (const f of g.finals) {
+-          const key = f.ctx.itemId ?? `${rid}:final`;
+-          if (handled.has(key)) continue;
+-          handled.add(key);
+-          const stripped = stripTldr(f.fullText);
+-          const spokenPrefix = track.raw.slice(0, track.spokenRawEnd);
+-          const continues = track.spokenRawEnd > 0 && f.fullText.startsWith(spokenPrefix);
+-          say(continues ? stripped.slice(track.spokenRawEnd) : stripped);
+-          track.done = true;
+-        }
+-        if (track.done) continue;
+-        const raw = g.live?.fullText ?? g.chunks.join("");
+-        if (raw === "") continue;
+-        track.raw = raw;
+-        const { ready } = completeSentences(stripTldr(raw).slice(track.spokenRawEnd));
+-        if (ready !== "") {
+-          track.spokenRawEnd += ready.length;
+-          say(ready);
+-        }
++      for (const [key, source] of scan.sources) {
++        knownResponses.add(source.responseId);
++        const offset = offsets.get(key) ?? 0;
++        const stripped = stripTldr(source.raw);
++        const { ready } = completeSentences(stripped.slice(offset));
++        if (ready === "") continue;
++        offsets.set(key, offset + ready.length);
++        speakNew(ready);
++      }
++      for (const f of scan.finals) {
++        if (handled.has(f.key)) continue;
++        // A final from a refetch counts only when part of it was streamed live here.
++        if (f.fromHistory && !knownResponses.has(f.responseId)) continue;
++        handled.add(f.key);
++        speakNew(stripTldr(f.fullText));
+       }
+     };
+ 
+@@ -167,7 +226,9 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+       clearCue();
+       speaker.stop();
+       handled.clear();
+-      responses = new Map();
++      knownResponses.clear();
++      offsets.clear();
++      spoken.clear();
+     };
+   }, [enabled, chatId]);
+ 
+@@ -177,7 +238,8 @@ export function useAeSpeakReplies({ chatId, enabled, voiceURI, rate }: UseAeSpea
+     const blocks = useChatStore.getState().blocks;
+     for (let i = blocks.length - 1; i >= 0; i--) {
+       const b = blocks[i];
+-      if (b.type !== "text_done" || b.ctx.depth !== 0 || b.fullText.trim() === "") continue;
++      if (b.type !== "text_done" || b.ctx.depth !== 0 || b.interrupted) continue;
++      if (b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) || b.fullText.trim() === "") continue;
+       const text = speechTextFromMarkdown(stripTldr(b.fullText));
+       if (text === "") continue;
+       const speaker = getSpeaker();
+diff --git a/web/src/lib/aeSpeakReplies.test.ts b/web/src/lib/aeSpeakReplies.test.ts
+index 84c65bd76f196c67ae29fcde4937df103254d17e..6e4412a8fbd86fcdaf01b4521a988087337463df 100644
+--- a/web/src/lib/aeSpeakReplies.test.ts
++++ b/web/src/lib/aeSpeakReplies.test.ts
+@@ -61,6 +61,25 @@ describe("the speaker", () => {
+     expect(seen).toEqual([true, false]);
+   });
+ 
++  it("keeps queued utterances referenced until they end", () => {
++    synth.retain = false;
++    const speaker = createSpeaker();
++    speaker.speak("One. " + "z".repeat(230) + ".", OPTS);
++    vi.runAllTimers();
++    const count = synth.ends.length;
++    expect(count).toBeGreaterThan(1);
++    expect(speaker.retained()).toBe(count);
++    synth.ends[0]();
++    expect(speaker.retained()).toBe(count - 1);
++    synth.ends.slice(1).forEach((end) => end());
++    expect(speaker.retained()).toBe(0);
++    speaker.speak("Again.", OPTS);
++    vi.runAllTimers();
++    expect(speaker.retained()).toBe(1);
++    speaker.stop();
++    expect(speaker.retained()).toBe(0);
++  });
++
+   it("stop cancels and drops utterances not yet queued", () => {
+     const speaker = createSpeaker();
+     speaker.speak("Hello there.", OPTS);
+diff --git a/web/src/lib/aeSpeakReplies.ts b/web/src/lib/aeSpeakReplies.ts
+index 1653414e32b0c9d3141d68bd91632ff4a0b3ea3f..8b129149e98ff6240d4784e70e9667ea19b195c6 100644
+--- a/web/src/lib/aeSpeakReplies.ts
++++ b/web/src/lib/aeSpeakReplies.ts
+@@ -166,6 +166,8 @@ export interface Speaker {
+   stop: () => void;
+   speaking: () => boolean;
+   subscribe: (cb: () => void) => () => void;
++  /** Utterances queued and not yet ended; the speaker keeps them referenced. */
++  retained: () => number;
+ }
+ 
+ export function createSpeaker(): Speaker {
+@@ -174,6 +176,8 @@ export function createSpeaker(): Speaker {
+   let generation = 0;
+   let pending = 0;
+   let isSpeaking = false;
++  // Chrome collects an unreferenced utterance mid-speech and never fires its end.
++  const utterances = new Set<SpeechSynthesisUtterance>();
+ 
+   const notify = () => listeners.forEach((cb) => cb());
+   const setSpeaking = (next: boolean) => {
+@@ -205,7 +209,9 @@ export function createSpeaker(): Speaker {
+             utterance.lang = voice.lang;
+           }
+           utterance.rate = opts.rate;
++          utterances.add(utterance);
+           const done = () => {
++            utterances.delete(utterance);
+             if (gen !== generation) return;
+             pending = Math.max(0, pending - 1);
+             if (pending === 0) setSpeaking(false);
+@@ -223,6 +229,7 @@ export function createSpeaker(): Speaker {
+     stop() {
+       generation++;
+       pending = 0;
++      utterances.clear();
+       if (isSpeechSupported()) {
+         try {
+           window.speechSynthesis.cancel();
+@@ -233,6 +240,7 @@ export function createSpeaker(): Speaker {
+       setSpeaking(false);
+     },
+     speaking: () => isSpeaking,
++    retained: () => utterances.size,
+     subscribe(cb) {
+       listeners.add(cb);
+       return () => {
+diff --git a/web/src/lib/aeSpeechText.test.ts b/web/src/lib/aeSpeechText.test.ts
+index 5fed5fccd07d478c7058be25bab68cc5b6f44b96..bd480a83ca65f3ec77451fa5ef36f5d149f74ede 100644
+--- a/web/src/lib/aeSpeechText.test.ts
++++ b/web/src/lib/aeSpeechText.test.ts
+@@ -67,6 +67,21 @@ describe("speechTextFromMarkdown", () => {
+   });
+ });
+ 
++describe("speech text, review fixes", () => {
++  it("drops link reference definitions", () => {
++    expect(speechTextFromMarkdown("See [a][1].\n\n[1]: https://example.org/a")).toBe("See [a][1].");
++  });
++
++  it("reads spaced pipes as commas on any line", () => {
++    expect(speechTextFromMarkdown("Name | Value")).toBe("Name, Value.");
++  });
++
++  it("guards asterisks inside words and globs", () => {
++    expect(speechTextFromMarkdown("a*b*c and **/*.ts here")).toBe("a*b*c and **/*.ts here.");
++    expect(speechTextFromMarkdown("**bold** and *em*")).toBe("bold and em.");
++  });
++});
++
+ describe("stripTldr", () => {
+   it("cuts the recap", () => {
+     expect(stripTldr("Body.\n\n**TLDR**\nDone.")).toBe("Body.");
+@@ -102,6 +117,15 @@ describe("completeSentences", () => {
+     expect(completeSentences("Done. See [a](http://x.org/a. b").ready).toBe("Done.");
+   });
+ 
++  it("waits when an end mark is the last character", () => {
++    expect(completeSentences("costs 3.").ready).toBe("");
++    expect(completeSentences("v0.18.").ready).toBe("");
++    expect(completeSentences("costs 3.5 dollars. Next")).toEqual({
++      ready: "costs 3.5 dollars.",
++      rest: " Next",
++    });
++  });
++
+   it("does not cut inside a number or a list marker", () => {
+     expect(completeSentences("Cost is 3.5 tons").ready).toBe("");
+     expect(completeSentences("1. First").ready).toBe("");
+diff --git a/web/src/lib/aeSpeechText.ts b/web/src/lib/aeSpeechText.ts
+index 6dc0fb98f2e8c265bf17dc80769a8fcaac03462d..5b5c6258a745583781ef07be764b08f2103fd339 100644
+--- a/web/src/lib/aeSpeechText.ts
++++ b/web/src/lib/aeSpeechText.ts
+@@ -28,10 +28,10 @@ function replaceFences(markdown: string): string {
+ 
+ function stripEmphasis(line: string): string {
+   return line
+-    .replace(/\*\*(?=\S)(.+?)(?<=\S)\*\*/g, "$1")
++    .replace(/(?<![\w*])\*\*(?=[^\s*])(.+?)(?<=[^\s*])\*\*(?![\w])/g, "$1")
+     .replace(/(?<![\w])__(?=\S)(.+?)(?<=\S)__(?![\w])/g, "$1")
+     .replace(/~~(?=\S)(.+?)(?<=\S)~~/g, "$1")
+-    .replace(/\*(?=\S)([^*\n]+?)(?<=\S)\*/g, "$1")
++    .replace(/(?<![\w*])\*(?=[^\s*])([^*\n]+?)(?<=\S)\*(?![\w*])/g, "$1")
+     .replace(/(?<![\w])_(?=\S)([^_\n]+?)(?<=\S)_(?![\w])/g, "$1");
+ }
+ 
+@@ -49,6 +49,7 @@ export function speechTextFromMarkdown(markdown: string): string {
+     let line = raw.trim();
+     if (line === "") continue;
+     if (/^([-*_])(\s*\1){2,}$/.test(line)) continue;
++    if (/^\[[^\]]+\]:\s/.test(line)) continue;
+     if (line.includes("|") && /^[\s|:-]+$/.test(line) && line.includes("-")) continue;
+     line = line
+       .replace(/^#{1,6}\s+/, "")
+@@ -62,6 +63,8 @@ export function speechTextFromMarkdown(markdown: string): string {
+         .map((cell) => cell.trim())
+         .filter((cell) => cell !== "")
+         .join(", ");
++    } else {
++      line = line.replace(/\s+\|\s+/g, ", ");
+     }
+     line = stripEmphasis(line.replace(/`([^`\n]*)`/g, "$1")).trim();
+     if (line === "") continue;
+@@ -139,10 +142,9 @@ export function completeSentences(markdown: string): { ready: string; rest: stri
+     } else if ((ch === "." || ch === "!" || ch === "?") && bracket === 0) {
+       let j = i + 1;
+       while (j < text.length && SENTENCE_CLOSERS.includes(text[j])) j++;
+-      const atEnd = j >= text.length;
+       const before = text.slice(lineStart, i);
+       const isListMarker = ch === "." && /^\s*\d+$/.test(before);
+-      if ((atEnd || /\s/.test(text[j])) && !isListMarker) {
++      if (j < text.length && /\s/.test(text[j]) && !isListMarker) {
+         boundary = j;
+       }
+     }
+@@ -151,12 +153,27 @@ export function completeSentences(markdown: string): { ready: string; rest: stri
+   return { ready: text.slice(0, boundary), rest: text.slice(boundary) };
+ }
+ 
++/** Splits spoken text into trimmed sentences. */
++export function splitSentences(text: string): string[] {
++  return text
++    .split(/(?<=[.!?]["')\]]*)\s+/)
++    .map((sentence) => sentence.trim())
++    .filter((sentence) => sentence !== "");
++}
++
++/** Sentence key for repeat detection: case, spacing, end marks and quotes ignored. */
++export function normalizeSentence(sentence: string): string {
++  return sentence
++    .toLowerCase()
++    .replace(/\s+/g, " ")
++    .replace(/^["'\u201c\u2018\s]+|["'\u201d\u2019\s]+$/g, "")
++    .replace(/[.!?]+["'\u201d\u2019]*$/, "")
++    .trim();
++}
++
+ /** Sentence-sized chunks, because Chrome stops an utterance past about 15 seconds. */
+ export function splitForSpeech(text: string, maxLen = 220): string[] {
+-  const sentences = text
+-    .split(/(?<=[.!?]["')\]]*)\s+/)
+-    .map((s) => s.trim())
+-    .filter((s) => s !== "");
++  const sentences = splitSentences(text);
+   const pieces: string[] = [];
+   for (let sentence of sentences) {
+     while (sentence.length > maxLen) {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 45ef5c2cc64b9231f4ca270c03a05f5546c04aa4..ee7fbaae085a221bec42c80393e1b8458af763e6 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3975,7 +3975,7 @@ function ComposerImpl(
+                 chatId={composerSessionId}
+                 canSetEffort={showEffort && effortLevels.includes("low")}
+                 currentEffort={speakEffort}
+-                disabled={isReadOnly}
++                readOnly={isReadOnly}
+                 className={cn("size-8 md:size-7", COMPOSER_TIGHT_SPEAKER_CLASS)}
+               />
+               <ComposerMicButton
+diff --git a/web/src/test/fakeSpeech.ts b/web/src/test/fakeSpeech.ts
+index 96c72bbedf2b2fd2c1ad24786f1bd4a97dab3608..6f8b2569211b38fe9f663ede28fba798aa6fe63e 100644
+--- a/web/src/test/fakeSpeech.ts
++++ b/web/src/test/fakeSpeech.ts
+@@ -20,13 +20,19 @@ export interface FakeVoiceInit {
+ }
+ 
+ export class FakeSynth {
++  /** Set false to keep only texts and end callbacks, so the speaker alone holds utterances. */
++  retain = true;
+   spoken: FakeUtterance[] = [];
++  spokenTexts: string[] = [];
++  ends: (() => void)[] = [];
+   cancelCount = 0;
+   voices: SpeechSynthesisVoice[] = [];
+   private listeners = new Set<() => void>();
+ 
+   speak = (u: FakeUtterance) => {
+-    this.spoken.push(u);
++    this.spokenTexts.push(u.text);
++    if (u.onend) this.ends.push(u.onend);
++    if (this.retain) this.spoken.push(u);
+   };
+   cancel = () => {
+     this.cancelCount++;
+@@ -42,7 +48,7 @@ export class FakeSynth {
+     this.listeners.forEach((cb) => cb());
+   }
+   texts() {
+-    return this.spoken.map((u) => u.text);
++    return this.spokenTexts;
+   }
+   /** Finish the oldest queued utterance, as the engine does. */
+   finishNext() {

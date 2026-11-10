@@ -64,6 +64,18 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends shellcheck webp curl ca-certificates git
 
+# 3b. Each runner's tool cache appears at the path the prebuilt Pythons expect.
+# actions/setup-python's Linux builds carry RUNPATH /opt/hostedtoolcache/Python/<ver>/x64/lib,
+# so a Python unpacked anywhere else finds libpython only through LD_LIBRARY_PATH, and every
+# test that starts it with a clean environment fails (2026-11-07 parity drill:
+# test_host_relink, test_omni and test_ae_context_usage, "libpython3.12.so.1.0: cannot open
+# shared object file"). Each unit bind-mounts its own toolcache-N over this path (step 5), so
+# no two runners write one cache: setup actions replace a version directory without a lock,
+# and a shared cache could end up with a complete marker beside a half-copied tree.
+# On the host this stays an empty, root-owned mount point.
+TOOL_CACHE=/opt/hostedtoolcache
+install -d -m 0755 "$TOOL_CACHE"
+
 # 4. The job-started hook. Each runner has its own HOME, so this clears only its own
 # tools: no job inherits another job's, and no job loses a tool to a neighbour.
 hooks="${RUNNER_HOME}/hooks"
@@ -94,6 +106,7 @@ UNIT
 
 # ProtectHome=tmpfs hides every home directory; BindPaths puts the runner user's
 # back. A job can reach the runner home, /usr, /opt and a private /tmp, nothing else.
+# The second BindPaths shows this runner's own toolcache-N at /opt/hostedtoolcache.
 cat >"${work}/ghrunner@.service" <<UNIT
 [Unit]
 Description=GitHub Actions runner %i (omnigent-ae)
@@ -111,6 +124,7 @@ Nice=10
 Slice=ghrunner.slice
 ProtectHome=tmpfs
 BindPaths=${RUNNER_HOME}
+BindPaths=${RUNNER_HOME}/toolcache-%i:${TOOL_CACHE}
 ProtectSystem=full
 PrivateTmp=yes
 NoNewPrivileges=yes
@@ -145,6 +159,7 @@ for i in $(seq 1 "$COUNT"); do
   dir="${RUNNER_HOME}/runner-${i}"
   home="${RUNNER_HOME}/home-${i}"
   install -d -m 0700 -o "$RUNNER_USER" -g "$RUNNER_USER" "$home"
+  install -d -m 0700 -o "$RUNNER_USER" -g "$RUNNER_USER" "${RUNNER_HOME}/toolcache-${i}"
 
   have=""
   if [ -x "${dir}/bin/Runner.Listener" ]; then
@@ -176,10 +191,17 @@ for i in $(seq 1 "$COUNT"); do
     changed[i]=1
   fi
 
-  # Point the runner at the hook (rewrite the one line, keep the rest of .env).
+  # Point the runner at the hook and its tool cache mount (rewrite those lines, keep the
+  # rest of .env). The runner resolves its tool directory from RUNNER_TOOL_CACHE, then
+  # AGENT_TOOLSDIRECTORY; setup-python reads AGENT_TOOLSDIRECTORY.
   touch "${dir}/.env"
-  grep -v '^ACTIONS_RUNNER_HOOK_JOB_STARTED=' "${dir}/.env" >"${dir}/.env.new" || true
-  echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=${hooks}/job-started.sh" >>"${dir}/.env.new"
+  grep -v -e '^ACTIONS_RUNNER_HOOK_JOB_STARTED=' -e '^AGENT_TOOLSDIRECTORY=' -e '^RUNNER_TOOL_CACHE=' \
+    "${dir}/.env" >"${dir}/.env.new" || true
+  {
+    echo "ACTIONS_RUNNER_HOOK_JOB_STARTED=${hooks}/job-started.sh"
+    echo "AGENT_TOOLSDIRECTORY=${TOOL_CACHE}"
+    echo "RUNNER_TOOL_CACHE=${TOOL_CACHE}"
+  } >>"${dir}/.env.new"
   if ! cmp -s "${dir}/.env.new" "${dir}/.env"; then
     changed[i]=1
   fi

@@ -1,0 +1,478 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 21:50:37 -0800
+Subject: [PATCH 322/333] [ae-patch] Fix the Voice mode fix-check findings:
+ stuck mic start, stale withdraw, done trimming
+
+The fix check on the previous Voice mode patch found three problems its fixes introduced.
+
+A mic start could get stuck: when the mic handle turned a start away (a take still finishing, a guard), nothing was reported, so the request flag stayed set and Voice mode sat on "Starting the mic" with no retry. The handle now reports whether a start began, tells Voice mode when it did not, and Voice mode treats a start that stays silent for 5 s as failed (one retry, then "Mic unavailable"). It also makes the start again when the mic is wanted before its own stop has finished.
+
+A cancel flag left by a withdrawn start could make the next manual click on the mic button start a stream that was dropped at once. The flag is now cleared when the start ends either way, and a manual start ignores one left over.
+
+On a multi-select card, trimming filler words ate the end of a label such as "Merge it". The whole remainder is now tried against the labels first and filler is trimmed only when nothing matched.
+
+Also reverts a formatting-only change to the effort picker line in ChatPage so the patch touches only Voice mode lines.
+---
+ web/src/components/ComposerMicButton.test.tsx | 54 +++++++++++++++++++
+ web/src/components/ComposerMicButton.tsx      | 36 ++++++++++---
+ web/src/hooks/useAeSpeakReplies.test.ts       | 21 ++++++++
+ web/src/hooks/useAeVoiceMode.test.tsx         | 51 ++++++++++++++++++
+ web/src/hooks/useAeVoiceMode.ts               | 44 ++++++++++++---
+ web/src/lib/aeVoiceMode.test.ts               | 16 ++++--
+ web/src/lib/aeVoiceMode.ts                    |  7 +--
+ web/src/pages/ChatPage.tsx                    |  3 +-
+ 8 files changed, 209 insertions(+), 23 deletions(-)
+
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index 6de1224fe6532c446a70be31d45333fb1b7b956b..2d35e1db0ca38d7ebfb2dc7502a2f01444610c95 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -548,6 +548,60 @@ describe("ComposerMicButton (server dictation)", () => {
+     expect(sessionStartMock).toHaveBeenCalledTimes(2);
+   });
+ 
++  it("a start turned away by a take still finishing is reported, and the next start works", async () => {
++    let resolveStart!: (s: SessionStub) => void;
++    sessionStartMock = vi.fn((events: DictationSessionEvents) => {
++      sessionEvents = events;
++      return new Promise<SessionStub>((resolve) => {
++        resolveStart = resolve;
++      });
++    });
++    const controller = { current: null as AeMicController | null };
++    const onListeningChange = vi.fn();
++    renderServerMode({ controller, onListeningChange });
++    await act(async () => controller.current?.start());
++    act(() => controller.current?.stop());
++    // The first take is still connecting, so this start is turned away and reported.
++    act(() => controller.current?.start());
++    expect(onListeningChange).toHaveBeenCalledWith(false);
++    expect(sessionStartMock).toHaveBeenCalledTimes(1);
++    await act(async () => {
++      resolveStart({ stop: sessionStopMock, cancel: sessionCancelMock });
++    });
++    expect(sessionCancelMock).toHaveBeenCalledTimes(1);
++    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++      sessionEvents = events;
++      return { stop: sessionStopMock, cancel: sessionCancelMock };
++    });
++    await act(async () => controller.current?.start());
++    expect(controller.current?.isListening()).toBe(true);
++  });
++
++  it("a withdraw left by a start that then failed does not cancel the next manual click", async () => {
++    let rejectStart!: (e: unknown) => void;
++    sessionStartMock = vi.fn(
++      () =>
++        new Promise<SessionStub>((_resolve, reject) => {
++          rejectStart = reject;
++        }),
++    );
++    const controller = { current: null as AeMicController | null };
++    renderServerMode({ controller });
++    await act(async () => controller.current?.start());
++    act(() => controller.current?.stop());
++    await act(async () => rejectStart(new Error("down")));
++    sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++      sessionEvents = events;
++      return { stop: sessionStopMock, cancel: sessionCancelMock };
++    });
++    await clickMic();
++    expect(sessionCancelMock).not.toHaveBeenCalled();
++    expect(screen.getByRole("button", { name: "Voice dictation" })).toHaveAttribute(
++      "aria-pressed",
++      "true",
++    );
++  });
++
+   it("tells Voice mode when the mic is stopped from the button", async () => {
+     const controller = { current: null as AeMicController | null };
+     const onListeningChange = vi.fn();
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index ff804810bb3e02266e74462a117297ae2d11e055..4410d8a55ae989fc7850374f8b2b019a2a455cd4 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -145,6 +145,8 @@ export const ComposerMicButton = ({
+   // Voice mode: a start asked for but not yet listening, and a stop that arrived meanwhile.
+   const requestedRef = useRef(false);
+   const withdrawRef = useRef(false);
++  // Set by the controller's start so the server start knows the withdraw flag is its own.
++  const controllerStartRef = useRef(false);
+   const onListeningChangeRef = useRef(onListeningChange);
+   onListeningChangeRef.current = onListeningChange;
+   // Synced refs so the mount-time listeners call the latest callbacks.
+@@ -392,6 +394,10 @@ export const ComposerMicButton = ({
+     try {
+       // Snapshot point: let the parent record the text so Esc can revert to it.
+       discardingRef.current = false;
++      // A manual click or the shortcut owns this start: a withdraw left over from an
++      // earlier Voice mode start must not cancel it.
++      if (!controllerStartRef.current) withdrawRef.current = false;
++      controllerStartRef.current = false;
+       interimRef.current = "";
+       setConnecting(true);
+       onVoiceStartRef.current?.();
+@@ -453,16 +459,19 @@ export const ComposerMicButton = ({
+     // Reached only by the start path (the stop branch returns earlier), so this
+     // clears the handshake spinner on both success and failure.
+     setConnecting(false);
++    withdrawRef.current = false;
+     serverBusyRef.current = false;
+   }, [reportError]);
+   toggleServerRef.current = toggleServer;
+ 
+-  const toggle = useCallback(() => {
++  // Returns whether anything began: false when a guard turned the call away.
++  const toggle = useCallback((): boolean => {
+     // An active (or starting) server take is owned by the server path,
+     // whichever mode started it.
+     if (sessionRef.current || serverBusyRef.current) {
++      const busy = serverBusyRef.current;
+       void toggleServer();
+-      return;
++      return !busy;
+     }
+     // In Electron the SpeechRecognition constructor exists but has no backend,
+     // so a Web Speech take always fails with "network" and only THEN falls back
+@@ -470,13 +479,14 @@ export const ComposerMicButton = ({
+     // When the server can serve, go straight to it and skip the doomed attempt.
+     // (Real browsers keep Web Speech primary; it genuinely works there.)
+     if (!Ctor || (serverAvailable && isElectronShell())) {
+-      if (serverAvailable) void toggleServer();
+-      return;
++      if (!serverAvailable) return false;
++      void toggleServer();
++      return true;
+     }
+     // Guard against rapid clicks landing before start/end event fires.
+-    if (transitionRef.current) return;
++    if (transitionRef.current) return false;
+     const recognition = recognitionRef.current;
+-    if (!recognition) return;
++    if (!recognition) return false;
+     transitionRef.current = true;
+     try {
+       if (isListening) recognition.stop();
+@@ -485,7 +495,9 @@ export const ComposerMicButton = ({
+       // InvalidStateError from a double-call — drop the guard so the
+       // user can try again, and let the next event reconcile state.
+       transitionRef.current = false;
++      return false;
+     }
++    return true;
+   }, [isListening, Ctor, serverAvailable, toggleServer]);
+ 
+   // Voice mode drives the mic through this handle; the button keeps working alone.
+@@ -497,8 +509,16 @@ export const ComposerMicButton = ({
+       start: () => {
+         if (listeningRef.current || requestedRef.current) return;
+         requestedRef.current = true;
+-        withdrawRef.current = false;
+-        toggle();
++        controllerStartRef.current = true;
++        if (toggle()) {
++          // A new start replaces any earlier withdrawn one.
++          withdrawRef.current = false;
++        } else {
++          // Nothing began (a start still connecting, a guard): say so, so Voice mode retries.
++          requestedRef.current = false;
++          controllerStartRef.current = false;
++          onListeningChangeRef.current?.(false);
++        }
+       },
+       stop: () => {
+         if (listeningRef.current) {
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 018d1b89918805160c0f66f3d88c45c6237e6ced..441b5f44e9c8c92ce1e7bd621e8a65c98a72b171 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -477,4 +477,25 @@ describe("useAeSpeakReplies after a tap on the speaker", () => {
+     flush();
+     expect(synth.texts()).toEqual(["One.", "Next one."]);
+   });
++
++  it("a tap during sentence one of a three-sentence streaming reply silences sentences two and three", () => {
++    mount();
++    setStore({ blocks: [live("r1", "First sentence. Sec")] });
++    flush();
++    expect(synth.texts()).toEqual(["First sentence."]);
++    act(() => setVoiceBarged("c1", true));
++    setStore({ blocks: [live("r1", "First sentence. Second sentence. Third sentence. Fo")] });
++    flush();
++    setStore({
++      blocks: [final("r1", "item-1", "First sentence. Second sentence. Third sentence.")],
++    });
++    flush();
++    expect(synth.texts()).toEqual(["First sentence."]);
++    setStore(send(1));
++    flush();
++    expect(getVoiceSnapshot("c1").barged).toBe(false);
++    setStore({ blocks: [live("r2", "Fresh reply. More")] });
++    flush();
++    expect(synth.texts()).toEqual(["First sentence.", "Fresh reply."]);
++  });
+ });
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 1c4bba528ba4cecc779304c78c861dd3d99050dc..dbb70bacfbc3636302ee08b035981b2f21e93527 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -454,4 +454,55 @@ describe("useAeVoiceMode", () => {
+     mount({ labels: { "ae.voice": "on" } });
+     expect(fetch).not.toHaveBeenCalled();
+   });
++
++  it("treats a start that stays silent for 5 s as failed, retries once, then gives up", () => {
++    autoConnect = false;
++    mount();
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++    act(() => void vi.advanceTimersByTime(5000));
++    expect(getVoiceSnapshot("c1").phase).not.toBe("listening");
++    act(() => void vi.advanceTimersByTime(1000));
++    expect(controller.current.start).toHaveBeenCalledTimes(2);
++    act(() => void vi.advanceTimersByTime(5000));
++    expect(getVoiceSnapshot("c1").phase).toBe("unavailable");
++  });
++
++  it("makes the start again when the mic is wanted before its own stop has finished", () => {
++    const { result, rerender } = mount();
++    act(() => void result.current.onListening(true));
++    // The stop takes a moment: the mic stays "listening" until it reports back.
++    controller.current.stop.mockImplementation(() => {});
++    rerender({ chatId: "c1", value: "", status: "streaming", canSend: true, submit });
++    rerender({ chatId: "c1", value: "", status: "idle", canSend: true, submit });
++    act(() => void vi.advanceTimersByTime(RESUME_MS));
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++    controller.current.start.mockClear();
++    act(() => {
++      listening = false;
++      result.current.onListening(false);
++    });
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++    expect(getVoiceSnapshot("c1").phase).not.toBe("paused");
++  });
++
++  it("picks an option whose label ends in a filler word on a multi-select card", () => {
++    const labelled = {
++      ...CARD,
++      askUserQuestion: {
++        questions: [
++          {
++            question: "What now?",
++            multiSelect: true,
++            options: [{ label: "Merge it" }, { label: "Hold" }],
++          },
++        ],
++      },
++    };
++    useChatStore.setState({ blocks: [labelled] } as never);
++    const { result } = mount();
++    act(() => void result.current.onFinal("merge it done"));
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
++      "What now?": ["Merge it"],
++    });
++  });
+ });
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index db22f6bc634e8f80c076c4f3f8dbf5fe7336f572..c736ae864c1011a028e4d4131c7bacc388aeee62 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -26,6 +26,8 @@ import { useChatStore } from "@/store/chatStore";
+ const SEND_WAIT_MS = 5000;
+ /** One retry of a mic start that failed. */
+ const MIC_RETRY_MS = 1000;
++/** A start that has neither succeeded nor failed by now counts as failed. */
++const MIC_START_NET_MS = 5000;
+ const LABEL_KEY = "ae.voice";
+ 
+ export interface UseAeVoiceModeArgs {
+@@ -90,6 +92,8 @@ export function useAeVoiceMode({
+   const sendTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const graceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const netTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
++  const onListeningRef = useRef<(listening: boolean) => void>(() => {});
+   const card = useRef<CardState | null>(null);
+   // The mic's own report of a start in flight, our stop, and failures so far this cycle.
+   const startPending = useRef(false);
+@@ -139,8 +143,10 @@ export function useAeVoiceMode({
+       clearGrace();
+       if (sendTimer.current !== null) clearTimeout(sendTimer.current);
+       if (retryTimer.current !== null) clearTimeout(retryTimer.current);
++      if (netTimer.current !== null) clearTimeout(netTimer.current);
+       sendTimer.current = null;
+       retryTimer.current = null;
++      netTimer.current = null;
+       card.current = null;
+       startPending.current = false;
+       stopAsked.current = false;
+@@ -182,13 +188,26 @@ export function useAeVoiceMode({
+     return () => clearTimeout(t);
+   }, [muted]);
+ 
++  const clearNet = useCallback(() => {
++    if (netTimer.current !== null) clearTimeout(netTimer.current);
++    netTimer.current = null;
++  }, []);
++
+   const startMic = useCallback(() => {
+     const mic = controller.current;
+     if (!mic || mic.isListening()) return;
+     startPending.current = true;
+     stopAsked.current = false;
++    clearNet();
++    // If the mic never answers, call it a failed start so the retry path runs.
++    netTimer.current = setTimeout(() => {
++      netTimer.current = null;
++      if (!startPending.current) return;
++      controller.current?.stop();
++      onListeningRef.current(false);
++    }, MIC_START_NET_MS);
+     mic.start();
+-  }, [controller]);
++  }, [controller, clearNet]);
+ 
+   const wasOn = useRef(on);
+   useEffect(() => {
+@@ -222,14 +241,16 @@ export function useAeVoiceMode({
+       startPending.current = false;
+       if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+       retryTimer.current = null;
++      clearNet();
+       // A start still connecting is withdrawn too, not only a live stream.
+       mic.stop();
+     }
+-  }, [on, wantListen, chatId, controller, clearGrace, startMic]);
++  }, [on, wantListen, chatId, controller, clearGrace, clearNet, startMic]);
+ 
+   const onListening = useCallback(
+     (listening: boolean) => {
+       if (listening) {
++        clearNet();
+         startPending.current = false;
+         failures.current = 0;
+         setMicFailed(false);
+@@ -238,6 +259,7 @@ export function useAeVoiceMode({
+         return;
+       }
+       setMicListening(false);
++      clearNet();
+       if (startPending.current) {
+         // The start never reached listening: try once more, then say so.
+         startPending.current = false;
+@@ -250,14 +272,21 @@ export function useAeVoiceMode({
+         } else {
+           setMicFailed(true);
+         }
+-      } else if (!stopAsked.current && latest.current.wantListen) {
++      } else if (stopAsked.current) {
++        // Our own stop finished. If the mic is wanted again by now (stop and start inside
++        // a second), the start that was turned away is made again.
++        stopAsked.current = false;
++        if (latest.current.wantListen) startMic();
++        return;
++      } else if (latest.current.wantListen) {
+         // Stopped from outside (the mic button, the hotkey): leave it stopped.
+         setMicStopped(true);
+       }
+       stopAsked.current = false;
+     },
+-    [startMic],
++    [startMic, clearNet],
+   );
++  onListeningRef.current = onListening;
+ 
+   useEffect(() => {
+     if (!chatId) return;
+@@ -342,8 +371,11 @@ export function useAeVoiceMode({
+           if (!state.picked.includes(names[whole])) state.picked.push(names[whole]);
+           return;
+         }
+-        const { done, rest } = splitDone(text);
+-        const hits = matchSpokenOptions(rest, names).map((i) => names[i]);
++        const { done, rest, raw } = splitDone(text);
++        // The whole remainder first ("merge it done" for a "Merge it" option); filler is
++        // trimmed only when nothing matched.
++        let hits = matchSpokenOptions(raw, names).map((i) => names[i]);
++        if (hits.length === 0) hits = matchSpokenOptions(rest, names).map((i) => names[i]);
+         if (hits.length === 0 && rest.trim() !== "" && mayCustom) {
+           state.custom = `${state.custom} ${rest}`.trim();
+         }
+diff --git a/web/src/lib/aeVoiceMode.test.ts b/web/src/lib/aeVoiceMode.test.ts
+index d18591e41d0f422dceb3cc7f7dc3e96f21c46409..4a1e539eb708428ab61cf3b58baf539982192754 100644
+--- a/web/src/lib/aeVoiceMode.test.ts
++++ b/web/src/lib/aeVoiceMode.test.ts
+@@ -76,19 +76,27 @@ describe("matchSpokenOptions and done", () => {
+     expect(isDoneWord("done")).toBe(true);
+     expect(isDoneWord("Okay, that's all")).toBe(true);
+     expect(isDoneWord("one")).toBe(false);
+-    expect(splitDone("one and three done")).toEqual({ done: true, rest: "one and three" });
+-    expect(splitDone("two")).toEqual({ done: false, rest: "two" });
++    expect(splitDone("one and three done")).toMatchObject({ done: true, rest: "one and three" });
++    expect(splitDone("two")).toMatchObject({ done: false, rest: "two" });
+   });
+ 
+   it.each(["ok done", "all done", "I'm done", "okay, that's all", "right, that's it"])(
+     "leaves no words behind %s",
+     (said) => {
+-      expect(splitDone(said)).toEqual({ done: true, rest: "" });
++      expect(splitDone(said)).toMatchObject({ done: true, rest: "" });
+     },
+   );
+ 
++  it("hands back the remainder untrimmed too, so a label ending in a filler word survives", () => {
++    expect(splitDone("merge it done")).toMatchObject({ rest: "merge", raw: "merge it" });
++    expect(matchSpokenOptions("merge it", ["Merge it", "Hold"])).toEqual([0]);
++  });
++
+   it("keeps the picks that come before the closing words", () => {
+-    expect(splitDone("one and three, ok I'm done")).toEqual({ done: true, rest: "one and three" });
++    expect(splitDone("one and three, ok I'm done")).toMatchObject({
++      done: true,
++      rest: "one and three",
++    });
+   });
+ });
+ 
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index 971cffe606fea9f8cce7c85a2655651824a35ef9..04077a4cf5b7dc948d300a5bd1caa72f8ffeb04c 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -366,19 +366,20 @@ const DONE_FILLER = new Set([
+ ]);
+ 
+ /** The transcript without a closing "done" and the filler around it, and whether it had one. */
+-export function splitDone(transcript: string): { done: boolean; rest: string } {
++export function splitDone(transcript: string): { done: boolean; rest: string; raw: string } {
+   const said = words(transcript);
+   for (const phrase of DONE_PHRASES) {
+     const p = phrase.split(" ");
+     const end = said.length - p.length;
+     if (end >= 0 && p.every((w, i) => said[end + i] === w)) {
++      const raw = said.slice(0, end).join(" ");
+       const rest = said.slice(0, end);
+       while (rest.length > 0 && DONE_FILLER.has(rest[rest.length - 1])) rest.pop();
+       while (rest.length > 0 && DONE_FILLER.has(rest[0])) rest.shift();
+-      return { done: true, rest: rest.join(" ") };
++      return { done: true, rest: rest.join(" "), raw };
+     }
+   }
+-  return { done: false, rest: transcript };
++  return { done: false, rest: transcript, raw: transcript };
+ }
+ 
+ /** True when the transcript ends the picking on a multi-select card. */
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index b1d217bc5ea7eae890c785bb77f596f3bf66f554..16895599d137c0f64d0906fb15c118519287805a 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -4928,8 +4928,7 @@ function SessionHarnessPicker({
+                     ) : (
+                       (effortWord(effort) ?? effort)
+                     ),
+-                  checked:
+-                    !routingOn && effort === (selectedEffort ?? effortResolved?.level ?? null),
++                  checked: !routingOn && effort === (selectedEffort ?? effortResolved?.level ?? null),
+                   disabled: routingOn || picksBusy || pendingModelChange !== null,
+                   onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
+                   testId: `composer-agent-effort-${effort}`,

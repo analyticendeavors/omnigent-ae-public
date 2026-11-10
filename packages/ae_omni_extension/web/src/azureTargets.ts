@@ -33,6 +33,7 @@ import {
   fetchCostTargets,
   saveCostTarget,
 } from "./api";
+import { liveNeedsLink } from "./attentionStore";
 import { button, type Child, el, notice, replaceChildren } from "./dom";
 import { chevronIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
@@ -615,6 +616,7 @@ export function mountTargets(context: ExtensionContext, root: HTMLElement): Targ
     if (answer?.note) children.push(el("p", { class: "meta azure-targets-meta" }, `${answer.note}.`));
     const shared = answer ? sharedReason(answer.rules) : null;
     if (shared) children.push(el("p", { class: "azure-targets-shared", role: "note" }, shared));
+    if (answer) children.push(liveNeedsLink("cost"));
     replaceChildren(status as HTMLElement, children);
   }
 

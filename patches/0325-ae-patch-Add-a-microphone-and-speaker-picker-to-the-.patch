@@ -1,0 +1,731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 10:36:35 -0800
+Subject: [PATCH 325/333] [ae-patch] Add a microphone and speaker picker to the
+ Speak replies menu
+
+---
+ .../components/AeSpeakRepliesButton.test.tsx  |  70 ++++++++
+ web/src/components/AeSpeakRepliesButton.tsx   |  98 ++++++++++-
+ web/src/components/ComposerMicButton.tsx      |   3 +-
+ web/src/lib/aeAudioDevices.test.ts            | 138 +++++++++++++++
+ web/src/lib/aeAudioDevices.ts                 | 166 ++++++++++++++++++
+ web/src/lib/aeCloudVoice.test.ts              |  32 ++++
+ web/src/lib/aeCloudVoice.ts                   |  30 +++-
+ web/src/lib/aeSettingHints.ts                 |  10 ++
+ web/src/lib/dictation.ts                      |   7 +-
+ 9 files changed, 545 insertions(+), 9 deletions(-)
+ create mode 100644 web/src/lib/aeAudioDevices.test.ts
+ create mode 100644 web/src/lib/aeAudioDevices.ts
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index e6b3a838e41d9547bb76ae8c8220eb343b699105..6f636968291f98c0ed919109ab8e5dc1f5719201 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -337,6 +337,76 @@ describe("AeSpeakRepliesButton", () => {
+     expect(window.localStorage.getItem("omnigent:ae-speak-rate")).toBe("1.25");
+   });
+ 
++  describe("Microphone and Speaker rows", () => {
++    const setSinkId = vi.fn();
++    const mediaDevices = (list: Partial<MediaDeviceInfo>[]) =>
++      Object.defineProperty(navigator, "mediaDevices", {
++        configurable: true,
++        value: {
++          enumerateDevices: () => Promise.resolve(list),
++          addEventListener: () => {},
++        },
++      });
++    const LIST = [
++      { kind: "audioinput", deviceId: "mic1", label: "USB Mic" },
++      { kind: "audiooutput", deviceId: "spk1", label: "Desk Speaker" },
++    ];
++    afterEach(() => {
++      Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: undefined });
++      delete (HTMLMediaElement.prototype as { setSinkId?: unknown }).setSinkId;
++    });
++
++    it("renders both rows under Speed and saves a pick", async () => {
++      mediaDevices(LIST);
++      (HTMLMediaElement.prototype as { setSinkId?: unknown }).setSinkId = setSinkId;
++      renderButton();
++      const user = await openMenu();
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("System default");
++      expect(screen.getByTestId("ae-speak-speaker-trigger")).toHaveTextContent("System default");
++      await user.click(screen.getByTestId("ae-speak-mic-trigger"));
++      const options = await screen.findAllByTestId("ae-speak-mic-option");
++      expect(options.map((o) => o.textContent)).toEqual(["System default", "USB Mic"]);
++      options[1].focus();
++      await user.keyboard("{Enter}");
++      expect(window.localStorage.getItem("omnigent:ae-mic-device")).toBe("mic1");
++    });
++
++    it("saves a speaker pick", async () => {
++      mediaDevices(LIST);
++      (HTMLMediaElement.prototype as { setSinkId?: unknown }).setSinkId = setSinkId;
++      renderButton();
++      const user = await openMenu();
++      await user.click(screen.getByTestId("ae-speak-speaker-trigger"));
++      const options = await screen.findAllByTestId("ae-speak-speaker-option");
++      options[1].focus();
++      await user.keyboard("{Enter}");
++      expect(window.localStorage.getItem("omnigent:ae-speaker-device")).toBe("spk1");
++    });
++
++    it("hides both rows without enumerateDevices, and Speaker without setSinkId", async () => {
++      renderButton();
++      await openMenu();
++      expect(screen.queryByTestId("ae-speak-mic-trigger")).toBeNull();
++      expect(screen.queryByTestId("ae-speak-speaker-trigger")).toBeNull();
++    });
++
++    it("hides Speaker alone when setSinkId is missing", async () => {
++      mediaDevices(LIST);
++      renderButton();
++      await openMenu();
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toBeInTheDocument();
++      expect(screen.queryByTestId("ae-speak-speaker-trigger")).toBeNull();
++    });
++
++    it("shows a gone saved device as System default", async () => {
++      window.localStorage.setItem("omnigent:ae-mic-device", "gone");
++      mediaDevices(LIST);
++      renderButton();
++      await openMenu();
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("System default");
++    });
++  });
++
+   it("disables Stop speaking while idle", async () => {
+     renderButton();
+     await openMenu();
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 6f2b3c04e85e5aa3f86dc6cbee800845d3074f25..9495e91e733dc375c5b37d822e54d3556ea10953 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -22,6 +22,16 @@ import {
+ } from "@/components/ui/dropdown-menu";
+ import { Switch } from "@/components/ui/switch";
+ import { useAeSpeakReplies } from "@/hooks/useAeSpeakReplies";
++import {
++  micDevicesSupported,
++  readMicDevice,
++  readSpeakerDevice,
++  speakerSelectionSupported,
++  useAudioDevices,
++  writeMicDevice,
++  writeSpeakerDevice,
++  type AudioDevice,
++} from "@/lib/aeAudioDevices";
+ import { type CloudVoice, fetchCloudVoices } from "@/lib/aeCloudVoice";
+ import {
+   clearFastAnswersState,
+@@ -87,7 +97,14 @@ function choiceKey(choice: VoiceChoice | null): string {
+ function RowHint({
+   id,
+ }: {
+-  id: "voice.mode" | "voice.speak" | "voice.fast" | "voice.voice" | "voice.rate";
++  id:
++    | "voice.mode"
++    | "voice.speak"
++    | "voice.fast"
++    | "voice.voice"
++    | "voice.rate"
++    | "voice.microphone"
++    | "voice.speaker";
+ }) {
+   const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
+   return (
+@@ -97,6 +114,56 @@ function RowHint({
+   );
+ }
+ 
++const SYSTEM_DEFAULT = "";
++
++/** A device row: current value on the row, radio items in the sub-menu. */
++function DeviceRow({
++  label,
++  hint,
++  testId,
++  devices,
++  saved,
++  onChoose,
++}: {
++  label: string;
++  hint: "voice.microphone" | "voice.speaker";
++  testId: string;
++  devices: AudioDevice[];
++  saved: string | null;
++  onChoose: (id: string | null) => void;
++}) {
++  // A saved device that is gone reads as System default; the saved value stays for its return.
++  const current = devices.find((d) => d.id === saved);
++  const value = current ? current.id : SYSTEM_DEFAULT;
++  const name = current ? current.label : "System default";
++  return (
++    <DropdownMenuSub>
++      <DropdownMenuSubTrigger data-testid={`${testId}-trigger`}>
++        <span>{label}</span>
++        <span className="ml-auto max-w-[28ch] truncate text-xs text-muted-foreground" title={name}>
++          {name}
++        </span>
++        <RowHint id={hint} />
++      </DropdownMenuSubTrigger>
++      <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
++        <DropdownMenuRadioGroup
++          value={value}
++          onValueChange={(v) => onChoose(v === SYSTEM_DEFAULT ? null : v)}
++        >
++          <DropdownMenuRadioItem value={SYSTEM_DEFAULT} data-testid={`${testId}-option`}>
++            System default
++          </DropdownMenuRadioItem>
++          {devices.map((d) => (
++            <DropdownMenuRadioItem key={d.id} value={d.id} data-testid={`${testId}-option`}>
++              {d.label}
++            </DropdownMenuRadioItem>
++          ))}
++        </DropdownMenuRadioGroup>
++      </DropdownMenuSubContent>
++    </DropdownMenuSub>
++  );
++}
++
+ function SwitchRow({
+   label,
+   checked,
+@@ -158,6 +225,9 @@ function SpeakRepliesControl({
+   const [cloudVoices, setCloudVoices] = useState<CloudVoice[]>([]);
+   const [rate, setRate] = useState(readRate);
+   const [voices, setVoices] = useState(listVoices);
++  const [micId, setMicId] = useState(readMicDevice);
++  const [speakerId, setSpeakerId] = useState(readSpeakerDevice);
++  const audioDevices = useAudioDevices();
+ 
+   useEffect(() => {
+     setOn(readSpeakReplies(chatId));
+@@ -447,6 +517,32 @@ function SpeakRepliesControl({
+             </DropdownMenuRadioGroup>
+           </DropdownMenuSubContent>
+         </DropdownMenuSub>
++        {micDevicesSupported() ? (
++          <DeviceRow
++            label="Microphone"
++            hint="voice.microphone"
++            testId="ae-speak-mic"
++            devices={audioDevices.inputs}
++            saved={micId}
++            onChoose={(id) => {
++              writeMicDevice(id);
++              setMicId(id);
++            }}
++          />
++        ) : null}
++        {speakerSelectionSupported() ? (
++          <DeviceRow
++            label="Speaker"
++            hint="voice.speaker"
++            testId="ae-speak-speaker"
++            devices={audioDevices.outputs}
++            saved={speakerId}
++            onChoose={(id) => {
++              writeSpeakerDevice(id);
++              setSpeakerId(id);
++            }}
++          />
++        ) : null}
+         <DropdownMenuSeparator />
+         <DropdownMenuItem onSelect={readLast} data-testid="ae-speak-read-last">
+           <RotateCcwIcon className="size-4" />
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index d1f817fbfd68d45f6bcd9f1ec809c5328a64a07a..ec2d3328edd2ef2c280458585e97694fa49b274a 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -4,6 +4,7 @@ import { Button } from "@/components/ui/button";
+ import { showToast } from "@/components/ui/toast";
+ import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
++import { getMicStream } from "@/lib/aeAudioDevices";
+ import { DictationBusyError, DictationSession } from "@/lib/dictation";
+ import { isElectronShell } from "@/lib/nativeBridge";
+ import { cn } from "@/lib/utils";
+@@ -317,7 +318,7 @@ export const ComposerMicButton = ({
+ 
+     const start = async () => {
+       try {
+-        stream = await navigator.mediaDevices.getUserMedia({ audio: true });
++        stream = await getMicStream(true);
+       } catch {
+         // Mic permission denied just for the visualization stream — leave
+         // the bars at baseline. The speech recognition error handler will
+diff --git a/web/src/lib/aeAudioDevices.test.ts b/web/src/lib/aeAudioDevices.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..e42891655426aad415e3809e7125e0fb4316f149
+--- /dev/null
++++ b/web/src/lib/aeAudioDevices.test.ts
+@@ -0,0 +1,138 @@
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  getMicStream,
++  listAudioDevices,
++  micConstraint,
++  readMicDevice,
++  readSpeakerDevice,
++  refreshAudioDevices,
++  speakerSinkId,
++  subscribeAudioDevices,
++  writeMicDevice,
++  writeSpeakerDevice,
++} from "./aeAudioDevices";
++
++const dev = (kind: MediaDeviceKind, deviceId: string, label: string) =>
++  ({ kind, deviceId, label, groupId: "" }) as MediaDeviceInfo;
++
++const DEVICES = [
++  dev("audioinput", "default", "Default - Mic"),
++  dev("audioinput", "communications", "Communications - Mic"),
++  dev("audioinput", "mic1", "USB Mic"),
++  dev("audioinput", "mic2", ""),
++  dev("audiooutput", "default", "Default - Speaker"),
++  dev("audiooutput", "spk1", "Desk Speaker"),
++  dev("audiooutput", "spk2", ""),
++];
++
++let listeners: Record<string, () => void>;
++let getUserMedia: ReturnType<typeof vi.fn>;
++
++beforeEach(() => {
++  window.localStorage.clear();
++  listeners = {};
++  getUserMedia = vi.fn(() => Promise.resolve({} as MediaStream));
++  Object.defineProperty(navigator, "mediaDevices", {
++    configurable: true,
++    value: {
++      enumerateDevices: vi.fn(() => Promise.resolve(DEVICES)),
++      getUserMedia,
++      addEventListener: (name: string, cb: () => void) => {
++        listeners[name] = cb;
++      },
++    },
++  });
++});
++
++afterEach(() => {
++  Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: undefined });
++});
++
++describe("listAudioDevices", () => {
++  it("skips pseudo entries and names unlabeled devices by position", async () => {
++    const list = await listAudioDevices();
++    expect(list.inputs).toEqual([
++      { id: "mic1", label: "USB Mic" },
++      { id: "mic2", label: "Microphone 2" },
++    ]);
++    expect(list.outputs).toEqual([
++      { id: "spk1", label: "Desk Speaker" },
++      { id: "spk2", label: "Speaker 2" },
++    ]);
++  });
++
++  it("returns nothing without the api", async () => {
++    Object.defineProperty(navigator, "mediaDevices", { configurable: true, value: undefined });
++    expect(await listAudioDevices()).toEqual({ inputs: [], outputs: [] });
++  });
++});
++
++describe("saved ids", () => {
++  it("round-trips and clears", () => {
++    writeMicDevice("mic1");
++    writeSpeakerDevice("spk1");
++    expect(window.localStorage.getItem("omnigent:ae-mic-device")).toBe("mic1");
++    expect(readMicDevice()).toBe("mic1");
++    expect(readSpeakerDevice()).toBe("spk1");
++    writeMicDevice(null);
++    expect(window.localStorage.getItem("omnigent:ae-mic-device")).toBeNull();
++  });
++});
++
++describe("constraints", () => {
++  it("uses a saved device that exists, else the system default, keeping the saved value", async () => {
++    await refreshAudioDevices();
++    writeMicDevice("mic1");
++    writeSpeakerDevice("spk1");
++    expect(micConstraint()).toEqual({ deviceId: { exact: "mic1" } });
++    expect(speakerSinkId()).toBe("spk1");
++    writeMicDevice("gone");
++    writeSpeakerDevice("gone");
++    expect(micConstraint()).toBeUndefined();
++    expect(speakerSinkId()).toBe("");
++    expect(readMicDevice()).toBe("gone");
++  });
++
++  it("re-lists on devicechange", async () => {
++    const cb = vi.fn();
++    const off = subscribeAudioDevices(cb);
++    await refreshAudioDevices();
++    cb.mockClear();
++    listeners.devicechange?.();
++    await vi.waitFor(() => expect(cb).toHaveBeenCalled());
++    off();
++  });
++});
++
++describe("getMicStream", () => {
++  it("spreads the saved device into the audio constraints", async () => {
++    await refreshAudioDevices();
++    writeMicDevice("mic1");
++    await getMicStream({ channelCount: 1 });
++    expect(getUserMedia).toHaveBeenCalledWith({
++      audio: { channelCount: 1, deviceId: { exact: "mic1" } },
++    });
++  });
++
++  it("sends the plain constraints with no saved device", async () => {
++    await getMicStream(true);
++    expect(getUserMedia).toHaveBeenCalledWith({ audio: {} });
++  });
++
++  it.each(["OverconstrainedError", "NotFoundError"])("retries once without the id on %s", async (name) => {
++    await refreshAudioDevices();
++    writeMicDevice("mic1");
++    getUserMedia.mockRejectedValueOnce(Object.assign(new Error("x"), { name }));
++    await getMicStream({ channelCount: 1 });
++    expect(getUserMedia).toHaveBeenCalledTimes(2);
++    expect(getUserMedia).toHaveBeenLastCalledWith({ audio: { channelCount: 1 } });
++  });
++
++  it("does not retry a permission error", async () => {
++    await refreshAudioDevices();
++    writeMicDevice("mic1");
++    getUserMedia.mockRejectedValueOnce(Object.assign(new Error("x"), { name: "NotAllowedError" }));
++    await expect(getMicStream(true)).rejects.toThrow("x");
++    expect(getUserMedia).toHaveBeenCalledTimes(1);
++  });
++});
+diff --git a/web/src/lib/aeAudioDevices.ts b/web/src/lib/aeAudioDevices.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..559e332ac0b645bf1da7632d0780cbc5aedbd208
+--- /dev/null
++++ b/web/src/lib/aeAudioDevices.ts
+@@ -0,0 +1,166 @@
++// Microphone and speaker choice for the Speak replies menu: the device list (re-listed on
++// devicechange), the two saved ids, and the helpers dictation and cloud voice read.
++
++import { useSyncExternalStore } from "react";
++
++export interface AudioDevice {
++  id: string;
++  label: string;
++}
++
++export interface AudioDeviceList {
++  inputs: AudioDevice[];
++  outputs: AudioDevice[];
++}
++
++export const MIC_KEY = "omnigent:ae-mic-device";
++export const SPEAKER_KEY = "omnigent:ae-speaker-device";
++
++const EMPTY: AudioDeviceList = { inputs: [], outputs: [] };
++const PSEUDO = new Set(["default", "communications"]);
++
++function getItem(key: string): string | null {
++  if (typeof window === "undefined") return null;
++  try {
++    return window.localStorage.getItem(key);
++  } catch {
++    return null;
++  }
++}
++
++function setItem(key: string, value: string | null): void {
++  if (typeof window === "undefined") return;
++  try {
++    if (value === null) window.localStorage.removeItem(key);
++    else window.localStorage.setItem(key, value);
++  } catch {
++    // A storage failure must not break the composer.
++  }
++}
++
++export function readMicDevice(): string | null {
++  return getItem(MIC_KEY) || null;
++}
++
++export function writeMicDevice(id: string | null): void {
++  setItem(MIC_KEY, id || null);
++  notify();
++}
++
++export function readSpeakerDevice(): string | null {
++  return getItem(SPEAKER_KEY) || null;
++}
++
++export function writeSpeakerDevice(id: string | null): void {
++  setItem(SPEAKER_KEY, id || null);
++  notify();
++}
++
++export function micDevicesSupported(): boolean {
++  return typeof navigator !== "undefined" && !!navigator.mediaDevices?.enumerateDevices;
++}
++
++export function speakerSelectionSupported(): boolean {
++  return (
++    micDevicesSupported() &&
++    typeof HTMLMediaElement !== "undefined" &&
++    typeof HTMLMediaElement.prototype.setSinkId === "function"
++  );
++}
++
++/** Lists inputs and outputs; an empty label becomes "Microphone 2" / "Speaker 2" by position. */
++export async function listAudioDevices(): Promise<AudioDeviceList> {
++  if (!micDevicesSupported()) return EMPTY;
++  let all: MediaDeviceInfo[];
++  try {
++    all = await navigator.mediaDevices.enumerateDevices();
++  } catch {
++    return EMPTY;
++  }
++  const pick = (kind: MediaDeviceKind, fallback: string): AudioDevice[] =>
++    all
++      .filter((d) => d.kind === kind && !PSEUDO.has(d.deviceId))
++      .map((d, i) => ({ id: d.deviceId, label: d.label || `${fallback} ${i + 1}` }));
++  return { inputs: pick("audioinput", "Microphone"), outputs: pick("audiooutput", "Speaker") };
++}
++
++let cache: AudioDeviceList | null = null;
++let snapshot: AudioDeviceList = EMPTY;
++let version = 0;
++const listeners = new Set<() => void>();
++let watched: MediaDevices | null = null;
++
++function notify(): void {
++  version++;
++  listeners.forEach((cb) => cb());
++}
++
++export async function refreshAudioDevices(): Promise<void> {
++  cache = await listAudioDevices();
++  snapshot = cache;
++  notify();
++}
++
++function watch(): void {
++  if (!micDevicesSupported() || watched === navigator.mediaDevices) return;
++  watched = navigator.mediaDevices;
++  watched.addEventListener?.("devicechange", () => void refreshAudioDevices());
++  void refreshAudioDevices();
++}
++
++export function subscribeAudioDevices(cb: () => void): () => void {
++  listeners.add(cb);
++  watch();
++  return () => {
++    listeners.delete(cb);
++  };
++}
++
++export function useAudioDevices(): AudioDeviceList {
++  return useSyncExternalStore(
++    subscribeAudioDevices,
++    () => snapshot,
++    () => EMPTY,
++  );
++}
++
++/** Version counter, for tests. */
++export function audioDevicesVersion(): number {
++  return version;
++}
++
++/** Saved id when it is in the list. Before the first listing the saved id is trusted (callers retry). */
++function present(saved: string | null, list: AudioDevice[] | undefined): string | null {
++  if (!saved) return null;
++  if (!list) return saved;
++  return list.some((d) => d.id === saved) ? saved : null;
++}
++
++export function micConstraint(): { deviceId: { exact: string } } | undefined {
++  watch();
++  const id = present(readMicDevice(), cache?.inputs);
++  return id ? { deviceId: { exact: id } } : undefined;
++}
++
++export function speakerSinkId(): string {
++  watch();
++  return present(readSpeakerDevice(), cache?.outputs) ?? "";
++}
++
++/**
++ * getUserMedia with the saved microphone. A missing or over-constrained saved device
++ * retries once on the system default.
++ */
++export async function getMicStream(audio: MediaTrackConstraints | true): Promise<MediaStream> {
++  const wanted = micConstraint();
++  const base = audio === true ? {} : audio;
++  try {
++    return await navigator.mediaDevices.getUserMedia({ audio: { ...base, ...wanted } });
++  } catch (err) {
++    const name = (err as { name?: string } | null)?.name;
++    if (wanted && (name === "OverconstrainedError" || name === "NotFoundError")) {
++      return navigator.mediaDevices.getUserMedia({ audio });
++    }
++    throw err;
++  }
++}
+diff --git a/web/src/lib/aeCloudVoice.test.ts b/web/src/lib/aeCloudVoice.test.ts
+index 1923c704f897e9f26d5bd3f8fd444a839e56b576..32cd85d3e4da3a886a7cebdd9fac134fc8a5a582 100644
+--- a/web/src/lib/aeCloudVoice.test.ts
++++ b/web/src/lib/aeCloudVoice.test.ts
+@@ -11,6 +11,15 @@ class FakeAudio {
+   onerror: (() => void) | null = null;
+   played: string[] = [];
+   pauses = 0;
++  sinkId = "";
++  sinks: string[] = [];
++  static sinkFail = false;
++  setSinkId(id: string) {
++    if (FakeAudio.sinkFail && id !== "") return Promise.reject(new Error("sink"));
++    this.sinks.push(id);
++    this.sinkId = id;
++    return Promise.resolve();
++  }
+   constructor() {
+     FakeAudio.last = this;
+   }
+@@ -115,6 +124,7 @@ beforeEach(() => {
+ });
+ 
+ afterEach(() => {
++  window.localStorage.clear();
+   vi.unstubAllGlobals();
+ });
+ 
+@@ -271,4 +281,26 @@ describe("createCloudSpeaker", () => {
+     await settle();
+     expect(speaker.speaking()).toBe(false);
+   });
++
++  it("routes to the saved speaker before play and falls back to the default on a sink failure", async () => {
++    window.localStorage.setItem("omnigent:ae-speaker-device", "spk1");
++    const speaker = createCloudSpeaker(new FakeDevice());
++    speaker.speak(sentence("a"), OPTS);
++    await settle();
++    pending[0].resolve(mp3());
++    await settle();
++    expect(FakeAudio.last?.sinks).toEqual(["spk1"]);
++    expect(FakeAudio.last?.played).toEqual(["blob:0"]);
++    FakeAudio.last?.end();
++    await settle();
++    FakeAudio.sinkFail = true;
++    window.localStorage.setItem("omnigent:ae-speaker-device", "spk2");
++    speaker.speak(sentence("b"), OPTS);
++    await settle();
++    pending[pending.length - 1].resolve(mp3());
++    await settle();
++    expect(FakeAudio.last?.sinkId).toBe("");
++    expect(FakeAudio.last?.played.length).toBe(2);
++    FakeAudio.sinkFail = false;
++  });
+ });
+diff --git a/web/src/lib/aeCloudVoice.ts b/web/src/lib/aeCloudVoice.ts
+index 29314785a1bada4602c8c16b8b877004dd58625f..e5c3bc3e34264eba527b13809168021f3285a598 100644
+--- a/web/src/lib/aeCloudVoice.ts
++++ b/web/src/lib/aeCloudVoice.ts
+@@ -4,6 +4,7 @@
+ 
+ import type { Speaker, SpeakOptions } from "./aeSpeakReplies";
+ import { splitForSpeech } from "./aeSpeechText";
++import { speakerSinkId } from "./aeAudioDevices";
+ import { withBasePath } from "./basePath";
+ import { authenticatedFetch } from "./identity";
+ 
+@@ -94,6 +95,22 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+     }
+   };
+ 
++  // Route to the saved speaker; a sink failure falls back to the default and never drops a sentence.
++  const applySink = async (el: HTMLAudioElement): Promise<void> => {
++    if (typeof el.setSinkId !== "function") return;
++    const want = speakerSinkId();
++    if (want === el.sinkId) return;
++    try {
++      await el.setSinkId(want);
++    } catch {
++      try {
++        await el.setSinkId("");
++      } catch {
++        // Keep playing on whatever sink the element has.
++      }
++    }
++  };
++
+   let playToken = 0;
+   const play = (blob: Blob): Promise<boolean> => {
+     audio ??= new Audio();
+@@ -118,11 +135,14 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+       el.onended = () => finish(true);
+       el.onerror = () => finish(false);
+       el.src = url;
+-      try {
+-        void Promise.resolve(el.play()).catch(() => finish(false));
+-      } catch {
+-        finish(false);
+-      }
++      void applySink(el).then(() => {
++        if (settled) return;
++        try {
++          void Promise.resolve(el.play()).catch(() => finish(false));
++        } catch {
++          finish(false);
++        }
++      });
+     });
+   };
+ 
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index f85c7b768a2968d29eba646781293b59968eb268..ef42bf231015fb867a816f549897fdce63d0f7e7 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -260,6 +260,16 @@ export const AE_SETTING_HINTS = {
+     hint: "How fast replies are read. Normal is the default; Faster is 1.25 times.",
+     source: "existing",
+   },
++  "voice.microphone": {
++    label: "Microphone",
++    hint: "Which microphone dictation and the level meter use. Saved per device. Default: System default.",
++    source: "tooltip",
++  },
++  "voice.speaker": {
++    label: "Speaker",
++    hint: "Where Natural (cloud) voices play. This device voices always use the system default. Saved per device. Default: System default.",
++    source: "tooltip",
++  },
+ } as const satisfies Record<string, AeSettingHint>;
+ 
+ export type AeSettingHintId = keyof typeof AE_SETTING_HINTS;
+diff --git a/web/src/lib/dictation.ts b/web/src/lib/dictation.ts
+index 3c6d077c4f2364dc6c47ddaa446d838be18a57c2..d8848ca9187fdbdc1eae5ab428ad99b60630081f 100644
+--- a/web/src/lib/dictation.ts
++++ b/web/src/lib/dictation.ts
+@@ -14,6 +14,7 @@
+ // Vite dev proxy keep working. Identity rides the ingress/dev proxy on the
+ // handshake, as with those sockets.
+ 
++import { getMicStream } from "@/lib/aeAudioDevices";
+ import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+ import { modalHostId } from "@/lib/sessionHost";
+ 
+@@ -245,8 +246,10 @@ export class DictationSession {
+    * ({@link DictationBusyError}), or the engine never comes up.
+    */
+   static async start(events: DictationSessionEvents): Promise<DictationSession> {
+-    const mediaStream = await navigator.mediaDevices.getUserMedia({
+-      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
++    const mediaStream = await getMicStream({
++      channelCount: 1,
++      echoCancellation: true,
++      noiseSuppression: true,
+     });
+ 
+     let ws: WebSocket | null = null;

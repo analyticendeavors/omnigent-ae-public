@@ -20,12 +20,24 @@ export function loadFold(id: string): boolean {
   return foldMemory.get(id) ?? false;
 }
 
+/** What the viewer left *id* as, or null when they never opened or closed it (the Needs you panel). */
+export function rememberedFold(id: string): boolean | null {
+  try {
+    const raw = window.localStorage.getItem(FOLD_KEY + id);
+    if (raw === "open") return true;
+    if (raw === "closed") return false;
+  } catch {
+    // No storage in this frame: the state kept in memory.
+  }
+  return foldMemory.get(id) ?? null;
+}
+
 /** Forget the in-memory states (a deactivated page and the tests). */
 export function resetFolds(): void {
   foldMemory.clear();
 }
 
-function saveFold(id: string, open: boolean): void {
+export function saveFold(id: string, open: boolean): void {
   foldMemory.set(id, open);
   try {
     window.localStorage.setItem(FOLD_KEY + id, open ? "open" : "closed");

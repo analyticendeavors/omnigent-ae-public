@@ -344,7 +344,7 @@ def pick_host(hosts: list[Any], wanted: str | None) -> dict[str, Any] | None:
 BUSY_STATES = ("sending", "sent", "restarting")
 
 
-def _state(online: bool | None, status: Status | None, now: int) -> State:
+def state_of(online: bool | None, status: Status | None, now: int) -> State:
     if online:
         return "connected"
     if status is not None:
@@ -356,6 +356,9 @@ def _state(online: bool | None, status: Status | None, now: int) -> State:
         if status.phase == "failed" and age < STALE_FAILED_S:
             return "failed"
     return "offline" if online is False else "unknown"
+
+
+_state = state_of  # the old name, kept for any caller that still uses it
 
 
 def view(
@@ -370,7 +373,7 @@ def view(
     the list failed, with the reason in *error*)."""
     at = _now(now)
     online = None if host is None else host.get("status") == "online"
-    state = _state(online, status, at)
+    state = state_of(online, status, at)
     shown = status if status is not None and state not in ("connected", "offline") else None
     busy = state in BUSY_STATES
     expires = shown.expires_at if shown is not None and state == "sent" else 0

@@ -95,7 +95,7 @@ from urllib.parse import urlencode
 import httpx
 from fastapi import APIRouter, FastAPI
 
-from ae_omni_policies import key_health
+from ae_omni_policies import card_config, key_health
 
 _logger = logging.getLogger(__name__)
 
@@ -160,7 +160,9 @@ def _subscriptions(raw: str) -> tuple[tuple[str, str], ...]:
 
 def config(environ: Mapping[str, str] | None = None) -> Config | None:
     env = _env(environ)
+    # The subscription list can be typed in the panel (2026-11-07); the environment still wins.
     values = [(env.get(key) or "").strip() for key in _KEYS]
+    values[0] = (card_config.value(_KEYS[0], environ) or "").strip()
     subs = _subscriptions(values[0])
     if not subs or not all(values[1:]):
         return None
@@ -178,8 +180,9 @@ _KEYS = (
 def not_configured_note() -> str:
     return (
         "Azure spend is not configured: put azure-cost-tenant-id, azure-cost-client-id and "
-        "azure-cost-client-secret in Key Vault, set AE_AZURE_COST_SUBSCRIPTIONS in "
-        "config/server.env, and run deploy/pull-secrets.sh."
+        "azure-cost-client-secret in Key Vault and run deploy/pull-secrets.sh, then list the "
+        "subscriptions in the Cards panel (Azure spend, Setup) or set "
+        "AE_AZURE_COST_SUBSCRIPTIONS in config/server.env, which overrides the panel."
     )
 
 
@@ -691,6 +694,9 @@ _state: dict[str, Any] = {
     "good_at": None,
 }
 _task: asyncio.Task[None] | None = None
+# Bumped by invalidate(): a reading that began under an older generation (an older subscription
+# list) discards its result instead of writing over the state of the new one (2026-11-07).
+_generation = 0
 # Whether this process has looked at the state file yet (once, on the first overview or at boot).
 _loaded = False
 # The saved view's parts and their types, as _assemble builds them: the page reads them as is.
@@ -915,6 +921,7 @@ def _restore(cfg: Config) -> None:
 async def _read(cfg: Config) -> None:
     transport = _shared_transport()
     today = _now().date()
+    generation = _generation
     signature = (cfg.key(), cfg.subscriptions)
     if _state["key"] != signature:
         # A new principal or subscription list: nothing cached under the old one applies.
@@ -971,6 +978,9 @@ async def _read(cfg: Config) -> None:
     except Exception as exc:  # noqa: BLE001  a bug must show on the card, not leave it reading for good
         _logger.warning("azure cost reading failed unexpectedly: %s", type(exc).__name__)
         errors = unread("The reading failed unexpectedly.")
+    if generation != _generation:
+        # The list changed while this pass ran: its numbers belong to the old list.
+        return
     _state["errors"] = errors
     _state["mono"] = _monotonic()
     # A transient failure is tried again in two minutes, a rate limit after its wait, a good
@@ -1052,6 +1062,22 @@ def snapshot(environ: Mapping[str, str] | None = None) -> dict[str, Any] | None:
         "goodAt": _state["good_at"],
         "rateLimit": _rate_limit(),
     }
+
+
+def invalidate() -> None:
+    """After the subscription list is saved in the panel (2026-11-07): the next read is due.
+
+    A reading already in flight is discarded when it ends (the generation), so it cannot write
+    the old list's numbers over the new state. A rate-limited card keeps its wait.
+    """
+    global _generation
+    _generation += 1
+    # Whatever is cached was read under the old list, so the next pass starts clean.
+    _state["key"] = None
+    if not _state["limited"]:
+        _state["mono"] = None
+        _state["due"] = None
+    # A saved rate-limit wait is kept: asking sooner only extends the limit.
 
 
 def reset() -> None:

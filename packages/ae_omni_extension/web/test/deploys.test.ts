@@ -159,7 +159,7 @@ const mutedLines = (node: ParentNode) =>
 
 /** The card's buttons, not its header's fold toggle (board.ts). */
 const buttons = (node: ParentNode) => [
-  ...node.querySelectorAll<HTMLButtonElement>("button:not(.admin-card-toggle):not(.admin-grip)"),
+  ...node.querySelectorAll<HTMLButtonElement>("button:not(.admin-card-toggle):not(.admin-grip):not(.admin-gear)"),
 ];
 
 /** A segment of the hold control reads "1 h" and is named "Hold 1 h". */
@@ -283,11 +283,11 @@ describe("the section on the page", () => {
     });
     await activateFabric(context);
     await flush();
-    // Since the dashboard redesign (2026-10-20): the first card of the first column.
-    const first = document.querySelector<HTMLElement>(".admin-board > .admin-col .admin-card");
+    // Since the dashboard redesign (2026-10-20): the first card of the Ship group, which leads the packed board (2026-11-07).
+    const first = document.querySelector<HTMLElement>('.admin-card[data-card="deploys"]');
     expect(first?.dataset.card).toBe("deploys");
     const heading = document.getElementById("admin-deploys-h");
-    expect(heading?.tagName).toBe("H2");
+    expect(heading?.tagName).toBe("H3");
     expect(heading?.textContent).toBe("Deploys");
     expect(first?.querySelector<HTMLElement>(".deploy-pill")?.hidden).toBe(true);
     expect(lines(first as HTMLElement)).toEqual([

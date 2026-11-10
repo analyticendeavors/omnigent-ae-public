@@ -113,13 +113,19 @@ async def _post_item(client: httpx.AsyncClient, session_id: str, role: str, text
 async def test_lists_the_worker_tools_and_ours(omni: OmniClient) -> None:
     async with connect(omni) as session:
         listed = await session.list_tools()
-        assert [tool.name for tool in listed.tools] == list(TOOL_NAMES)
+        # The judge model is not set up in this app, so its two tools are hidden (2026-11-07).
+        assert [tool.name for tool in listed.tools] == [
+            n for n in TOOL_NAMES if n not in mcp_module.JUDGE_TOOLS
+        ]
         assert TOOL_NAMES == (
             "park_fork",
             "list_tags",
             "link_issue",
             "list_parked",
             "complete_task",
+            "create_task",
+            "list_lists",
+            "cancel_task",
             "omni_capacity",
             "omni_set_status",
             "omni_transcript",
@@ -132,6 +138,8 @@ async def test_lists_the_worker_tools_and_ours(omni: OmniClient) -> None:
             "ask_user",
             "set_session_model",
             "report_review",
+            "advise_preset",
+            "ask_judge",
             "preset_insights_read",
             "submit_preset_suggestions",
         )
@@ -314,6 +322,81 @@ async def test_complete_task_posts_to_the_complete_route(omni: OmniClient) -> No
         "task_id": "T-GONE",
         "reason": "404 no task T-GONE",
     }
+
+
+async def test_create_task_posts_to_the_create_route(omni: OmniClient) -> None:
+    created = {"id": "T-REM", "title": "Check scan", "quadrant": "q4", "tags": ["ae"]}
+    async with connect(omni) as session:
+        with respx.mock(base_url=BASE) as mock:
+            mock.get("/api/buckets").respond(
+                200, json={"buckets": [{"id": "B1", "name": "AE Work", "kind": "list"}]}
+            )
+            post = mock.post("/api/tasks").respond(201, json=created)
+            made = _payload(
+                await session.call_tool(
+                    "create_task",
+                    {
+                        "title": "Check scan",
+                        "due_date": "2026-11-09",
+                        "due_time": "10:00",
+                        "tags": ["AE"],
+                        "list": "AE Work",
+                    },
+                )
+            )
+            body = json.loads(post.calls[0].request.content)
+            # A refused input never reaches the store; the agent gets the worker's shape back.
+            refused = _payload(
+                await session.call_tool("create_task", {"title": "x", "due_time": "10:00"})
+            )
+    assert made["outcome"] == "created"
+    assert made["task_id"] == "T-REM"
+    assert body["reminder_at"] == body["due_at"]
+    assert body["origin_surface"] == "omnigent-ae"
+    assert body["tags"] == ["ae"]
+    # The worker's field name `list` reaches the store as the list's id.
+    assert body["bucket_id"] == "B1"
+    assert refused["outcome"] == "not_created"
+    assert refused["reason"].endswith("due_time needs a due_date.")
+    assert post.call_count == 1
+
+
+async def test_list_lists_hides_hidden_lists(omni: OmniClient) -> None:
+    buckets = {
+        "buckets": [
+            {"id": "B1", "name": "AE Work", "kind": "list", "surface": "tasks"},
+            {"id": "B2", "name": "Secret", "kind": "list", "surface": "tasks", "hidden": 1},
+        ]
+    }
+    async with connect(omni) as session:
+        with respx.mock(base_url=BASE) as mock:
+            mock.get("/api/buckets").respond(200, json=buckets)
+            listed = _payload(await session.call_tool("list_lists", {}))
+    assert listed["count"] == 1
+    assert [row["name"] for row in listed["lists"]] == ["AE Work"]
+
+
+async def test_cancel_task_drops_only_what_this_server_created(omni: OmniClient) -> None:
+    ours = {
+        "id": "T-OURS",
+        "title": "x",
+        "kind": "task",
+        "status": "open",
+        "origin_surface": "omnigent-ae",
+    }
+    theirs = {**ours, "id": "T-THEIRS", "origin_surface": "todo"}
+    async with connect(omni) as session:
+        with respx.mock(base_url=BASE, assert_all_called=False) as mock:
+            mock.get("/api/tasks/T-OURS").respond(200, json=ours)
+            mock.get("/api/tasks/T-THEIRS").respond(200, json=theirs)
+            patched = mock.patch("/api/tasks/T-OURS").respond(200, json=ours)
+            other = mock.patch("/api/tasks/T-THEIRS").respond(200, json=theirs)
+            done = _payload(await session.call_tool("cancel_task", {"task_id": "T-OURS"}))
+            refused = _payload(await session.call_tool("cancel_task", {"task_id": "T-THEIRS"}))
+    assert json.loads(patched.calls[0].request.content) == {"status": "dropped"}
+    assert done["outcome"] == "cancelled"
+    assert refused["outcome"] == "not_cancelled"
+    assert other.call_count == 0
 
 
 async def test_link_issue_not_linked_keeps_the_url(omni: OmniClient) -> None:
@@ -577,7 +660,9 @@ async def test_stdio_entry_point(tmp_path: Path) -> None:
     async with stdio_client(params) as (read, write), ClientSession(read, write) as remote:
         await remote.initialize()
         listed = await remote.list_tools()
-        assert [tool.name for tool in listed.tools] == list(TOOL_NAMES)
+        assert [tool.name for tool in listed.tools] == [
+            n for n in TOOL_NAMES if n not in mcp_module.JUDGE_TOOLS
+        ]
         body = _payload(await remote.call_tool("omni_capacity", {}))
     assert SERVER_URL_ENV in body["error"]
 

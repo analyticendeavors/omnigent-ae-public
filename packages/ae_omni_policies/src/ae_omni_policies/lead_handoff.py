@@ -684,6 +684,35 @@ def make_repair(
     return repair
 
 
+def _store() -> Any:
+    from omnigent.runtime import get_conversation_store
+
+    return get_conversation_store()
+
+
+async def snooze(session_id: str) -> tuple[int, str, str] | int:
+    """Snooze the compact suggestion: the snoozed size on success, else (status, code, message)."""
+    async with lead_lock(session_id):
+        # Read inside the lock: a handoff may have committed while this waited.
+        conv = await asyncio.to_thread(_store().get_conversation, session_id)
+        if conv is None:
+            return 404, "not_found", f"no session {session_id}"
+        if handoff_target(conv) is not None:
+            return 409, "handoff_refused", "this chat already handed off"
+        if not is_lead(conv):
+            return 409, "handoff_refused", "only a working Claude chat you opened can be snoozed"
+        tokens = context_tokens(conv) or 0
+        if tokens <= 0:
+            # A size of 0 would bring the card back at 100k tokens.
+            return 409, "handoff_refused", "this chat has no context reading to snooze"
+        await asyncio.to_thread(
+            _store().set_labels,
+            session_id,
+            {labels.HANDOFF: labels.HANDOFF_SNOOZED, labels.HANDOFF_AT: str(tokens)},
+        )
+        return tokens
+
+
 def start(app: FastAPI) -> asyncio.Task[None] | None:
     """Start the sweep on the running loop, or ``None`` when it is off or cannot start."""
     if not enabled():

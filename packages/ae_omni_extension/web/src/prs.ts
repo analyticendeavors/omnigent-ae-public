@@ -152,7 +152,7 @@ export function confirmLabel(method: MergeMethod, base: string | null): string {
 }
 
 /** The section a merge started in; its merged card stays there. */
-export type MergeOrigin = "prs" | "your-move";
+export type MergeOrigin = "prs" | "your-move" | "needs-you";
 
 /** What a card needs from its section to merge: where it sits, and how to redraw it. */
 export interface MergeHooks {
@@ -161,6 +161,11 @@ export interface MergeHooks {
   rebuild: (fresh: PrCard) => HTMLElement;
   /** Called once the merge went through, before the merged card replaces the open one. */
   onMerged?: () => void;
+  /**
+   * What replaces the open node once the merge went through, when a section is not a list of
+   * cards (the Needs you row, 2026-11-05). Without it the node becomes a merged card.
+   */
+  merged?: (card: PrCard, result: MergeResult) => HTMLElement;
 }
 
 /**
@@ -198,6 +203,16 @@ export function wasMerged(url: string): boolean {
 /** The card node whose merge is in flight for *url*, to re-insert as it is. */
 export function mergingNode(url: string): HTMLElement | undefined {
   return inFlight.get(urlKey(url));
+}
+
+/** Whether *url*'s confirm step is open (a redraw reopens it from this). */
+export function confirmIsOpen(url: string): boolean {
+  return confirming.has(urlKey(url));
+}
+
+/** Forget *url*'s open confirm, so no other section opens it by surprise. */
+export function dropConfirm(url: string): void {
+  confirming.delete(urlKey(url));
 }
 
 /** Open the confirm step on the card's next render (Your move, after its tap read the card). */
@@ -473,7 +488,7 @@ function confirmRow(
         merged.set(key, { card, result, origin: hooks.origin });
         tombstones.set(key, Date.now());
         hooks.onMerged?.();
-        node.replaceWith(mergedCard(deps, card, result));
+        node.replaceWith(hooks.merged?.(card, result) ?? mergedCard(deps, card, result));
         announce(`Merged ${card.repo}#${card.number}.`);
         await deps.refresh(true);
       } catch (error) {

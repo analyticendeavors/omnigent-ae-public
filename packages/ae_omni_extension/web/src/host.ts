@@ -40,6 +40,7 @@ import {
   requestHostRelink,
 } from "./api";
 import { whenText } from "./databricks";
+import { liveNeedsLink } from "./attentionStore";
 import { button, el, notice, replaceChildren } from "./dom";
 import type { FabricTone } from "./icons";
 import { registerRefresh, setTile, staleTile, type Tile } from "./tiles";
@@ -273,6 +274,7 @@ function card(section: Section, status: HostStatus, now: number): HTMLElement {
         : null,
     ),
   );
+  node.appendChild(liveNeedsLink("host"));
   for (const item of noticeTexts(status)) node.appendChild(notice(item.text, item.kind));
   return node;
 }
@@ -328,6 +330,8 @@ function render(section: Section): void {
   if (state.adminOnly) {
     replaceChildren(section.list, [el("p", { class: "meta" }, "The box host is for admins.")]);
     section.refreshed.textContent = "";
+    // Idle, so the tile has reported (the verdict waits on every tile) and the pill line skips it.
+    setTile({ id: "host", value: "Admins only", note: "", health: "idle" });
     return;
   }
   if (!state.status) {

@@ -68,6 +68,13 @@ Typing `triage off`, `triage capture` or `triage on` sets the session's `ae.tria
 **Where:** Any chat.<br>
 **Built from:** [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
+## A pop-up guard that was removed
+
+Patches 0318 and 0319 refused a question card that arrived with no reply text above it, by reading the Claude transcript when the tool call started. On 2026-11-09 patch 0324 removed them: interactive Claude Code writes the reply text to the transcript, and fires its MessageDisplay hook, only after the tool-call check has returned, so the check could never see the text and always read "none". The rule now lives as an agent instruction: write the answer or proposal as reply text before asking.
+
+**Where:** Nothing to find; the policy and the transcript check are gone.<br>
+**Built from:** core patches [`0318`](../../patches/0318-ae-patch-Stamp-whether-reply-text-came-before-a-pop-.patch), [`0319`](../../patches/0319-ae-patch-Fix-the-review-findings-on-the-pop-up-reply.patch), [`0324`](../../patches/0324-ae-patch-Remove-the-pop-up-reply-text-stamp-interact.patch)
+
 ## Agents that ship with it
 
 Four agent specs come with the fork, each a single `agent.yaml` with a short list of tools, and none of them merges anything. Two run on a schedule: a steward writes a brief each weekday morning (what to merge, what resurfaces from the lot today), and a shutdown agent writes a resume note for each working session at the end of the day. The orchestrator starts and briefs sessions when you talk to it, from the phone for example, and checks in on them hourly. `reviewer-codex` reviews on request and is off by default.

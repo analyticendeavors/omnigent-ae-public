@@ -15,6 +15,8 @@ A preset decides which model and effort each role in a chat runs on, so the lead
 
 - [Roles presets](roles-presets.md): Presets in Settings > Roles, Newer models offered, never applied, The lead reads its preset every turn, Pick a preset per chat, Start a new chat on a preset, Who works on this, Independent reviewers, one verdict, Rules for model changes and helpers, Model changes you can undo, Families of sessions, A family at a glance, Preset insights, Session links read as titles, A helper's questions reach the lead
 
+- [Decision-1 preset advisor](decision-advisor.md): a judge model's second opinion for a lead that picks its own preset, with what leaves the server and how to turn it off
+
 ## Triage and policies
 
 Beneath the screens sits a way of working, built from Omnigent policies: a cap on working sessions, a gate for new work that shows up mid-task, and notes that make parked work resumable.
@@ -26,7 +28,7 @@ Beneath the screens sits a way of working, built from Omnigent policies: a cap o
 </tr>
 </table>
 
-- [Triage and policies](triage-and-policies.md): A cap on working sessions, The fork gate, Absorbed and Unfiled notes, The parking lot, Handoffs that open their own chat, Closed chats leave the list, The rabbit-hole check, Hurry modes, Agents that ship with it, Policies you can edit
+- [Triage and policies](triage-and-policies.md): A cap on working sessions, The fork gate, Absorbed and Unfiled notes, The parking lot, Handoffs that open their own chat, Closed chats leave the list, The rabbit-hole check, Hurry modes, A pop-up guard that was removed, Agents that ship with it, Policies you can edit
 
 ## Many sessions
 
@@ -63,7 +65,7 @@ Inside one chat, the fork puts the session's details in a rail beside it, has th
 </table>
 
 - [Session rail](session-rail.md): A rail beside the chat, Its own toggle, Choose what a session shows when it opens, Triage card, Context that waits for Claude, Context categories, Connectors, Agents, Child chats, Usage for this session's account
-- [Composer](composer.md): Prompt suggestions, Ranked alternatives, Model versions and Previous models, A one-column model menu, The effort a session runs at, Fast mode, Blurred command and file menus, Token defrag while compacting, Queued notes survive a reload
+- [Composer](composer.md): Prompt suggestions, Ranked alternatives, Model versions and Previous models, A one-column model menu, The effort a session runs at, Fast mode, Blurred command and file menus, Token defrag while compacting, Queued notes survive a reload, Speak replies, Voice mode
 - [Action dock](action-dock.md): One strip in the composer bar, The opened list, A waiting question, Questions from sessions this chat started, Compact a big chat, One button per choice, Usage gate, Every usage window on hover, Every open pull request with its state, Update branch, Drafts with Mark ready, Hover preview, Merge from the dock, The confirm, shown whole, Deploy tracking
 
 ## Agents and pull requests
@@ -92,7 +94,7 @@ Running many sessions means watching plan limits and accounts. The fork shows us
 </table>
 
 - [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login, A relaunch keeps Claude's transcript, Pin a scheduled task to one login
-- [Admin Center](admin-center.md): One board for the server, Status tiles, Drag cards to rearrange, Hold deploys, Box health, Key Vault, Git repos, Every account's limits, Compute and spend, Spend card: presets, Spend card: families, Edit a global policy's parameters, Open tabs hear about an update
+- [Admin Center](admin-center.md): One board for the server, Status pills, Drag cards to rearrange, Cards: turn a card on or off, or hide it, Not set up on this server, Hold deploys, Box health, Key Vault, Git repos, Git: company and personal lists, Needs you, Social card, Every account's limits, Compute and spend, Decision model (2026-11-07), Home security (2026-11-08), Spend card: presets, Spend card: families, Edit a global policy's parameters, Open tabs hear about an update
 
 ## On the phone
 

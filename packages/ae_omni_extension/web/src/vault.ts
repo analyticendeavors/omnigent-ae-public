@@ -55,6 +55,7 @@ import {
   type VaultSecret,
   type VaultView,
 } from "./api";
+import { liveNeedsLink } from "./attentionStore";
 import { el, notice, replaceChildren } from "./dom";
 import { fromText, shortDay } from "./secrets";
 import { chevronIcon, pencilIcon, searchIcon, serverIcon } from "./icons";
@@ -189,6 +190,43 @@ export function vaultNeedsLook(view: VaultView): boolean {
   );
 }
 
+/** How many needs the card's answer carries per vault (vault_inventory.py NEEDS_YOU_SHOWN). */
+const NEEDS_YOU_SHOWN = 6;
+
+/**
+ * Secrets across the vaults whose copies changed apart or that are disabled yet in use, as
+ * words ("4", or "6+"), or null when there are none. The card's answer carries only the first
+ * NEEDS_YOU_SHOWN needs, worst first (expired, soon, disabled, both, untouched), so when a
+ * vault's list was cut and holds no untouched need, more checks may sit past the cut and the
+ * count gets a "+" (2026-11-07, "6 to check" read as exact with seven disabled).
+ */
+function vaultChecks(inventory: VaultInventory): string | null {
+  let n = 0;
+  let more = false;
+  for (const v of inventory.vaults) {
+    n += v.needs_you.filter((need) => need.kind === "both" || need.kind === "disabled").length;
+    const cut = v.needs_you.length >= NEEDS_YOU_SHOWN && v.needs_you_total > v.needs_you.length;
+    if (cut && !v.needs_you.some((need) => need.kind === "untouched")) more = true;
+  }
+  // With none shown there is nothing to claim: the cut list is all expired or expiring, which
+  // the note already leads with.
+  if (n === 0) return null;
+  return more ? `${n}+` : String(n);
+}
+
+/**
+ * The status pill's words for the vault (2026-11-06): the reason it needs a
+ * look, so an amber pill never reads "0 expiring" when the cause is a secret
+ * whose copies changed apart, a disabled secret still in use, or an old reading.
+ */
+function vaultBrief(inventory: VaultInventory, expiring: number): string {
+  if (expiring > 0) return `${expiring} expiring`;
+  const checks = vaultChecks(inventory);
+  if (checks) return `${checks} ${checks === "1" ? "secret" : "secrets"} to check`;
+  if (inventory.stale) return "vault reading old";
+  return "0 expiring";
+}
+
 const VAULT_UNSET_NOTE = "vault not configured (AE_VAULT_NAME)";
 
 /**
@@ -207,8 +245,12 @@ export function vaultTile(inventory: VaultInventory | null, error: unknown): Til
       health: error && !forbidden ? "attention" : "idle",
     };
   }
+  if (!inventory.vaults.length && inventory.configured === false) {
+    // Not configured is not a fault: idle, and the card leaves the board (2026-11-06).
+    return { id: "vault", value: "Not set up", summary: "Not set up", note: VAULT_UNSET_NOTE, health: "idle", notSetUp: true };
+  }
   if (!inventory.vaults.length) {
-    const note = inventory.configured === false ? VAULT_UNSET_NOTE : "the box has not reported";
+    const note = "the box has not reported";
     return { id: "vault", value: "Not read", note, health: "attention" };
   }
   const expiring = inventory.vaults.reduce((n, v) => n + v.counts.soon + v.counts.expired, 0);
@@ -217,6 +259,8 @@ export function vaultTile(inventory: VaultInventory | null, error: unknown): Til
   const look = inventory.vaults.some(vaultNeedsLook) || inventory.stale;
   const noOwner = inventory.vaults.reduce((n, v) => n + (v.counts.no_owner ?? 0), 0);
   const next = inventory.alerts?.next ? new Date(inventory.alerts.next.alarm_at) : null;
+  const checks = vaultChecks(inventory);
+  const lead = checks ? [`${checks} to check`] : [];
   const extras = [
     next && !Number.isNaN(next.getTime()) ? `alarm set ${monthDay(next)}` : null,
     noOwner > 0 ? `${noOwner} ${noOwner === 1 ? "has" : "have"} no owner` : null,
@@ -226,9 +270,10 @@ export function vaultTile(inventory: VaultInventory | null, error: unknown): Til
     id: "vault",
     value,
     summary: `${value} vault secrets`,
+    brief: vaultBrief(inventory, expiring),
     note: extras.length
-      ? [`${expiring} expiring`, ...extras].join(" · ")
-      : `${expiring} expiring, ${old} untouched 180d+`,
+      ? [...lead, `${expiring} expiring`, ...extras].join(" · ")
+      : [...lead, `${expiring} expiring, ${old} untouched 180d+`].join(" · "),
     health: look ? "attention" : "ok",
     title: extras.length ? `${counts}; ${old} untouched 180d+` : counts,
   };
@@ -597,6 +642,7 @@ function drawNeeds(parts: Parts, view: VaultView): void {
           "Nothing in this vault needs you.",
         ),
     more > 0 ? el("p", { class: "meta vault-more" }, `and ${more} more in the full list`) : null,
+    liveNeedsLink("vault"),
   ]);
 }
 

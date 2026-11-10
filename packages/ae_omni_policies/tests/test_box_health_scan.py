@@ -372,3 +372,175 @@ def test_a_claude_name_that_is_not_one_to_ten_ascii_digits_is_litter(
     result = scan.scan_tmp(str(tmp_path), now=NOW, stale_days=2, budget=Budget(100, 30))
     assert not result.claude_dirs
     assert sum(a.entries for g in result.litter.values() for a in g.values()) == 1
+
+
+# ── each chat folder gets its own share of the cap (2026-11-06) ─────────────
+
+SHARE = 100
+ROOT_CAP = 500
+BIG = 1280
+
+
+def uuid_n(n: int) -> str:
+    return f"3f2a1c00-1111-4222-8333-{n:012d}"
+
+
+def fill(session: Path, count: int, days: float) -> None:
+    """*count* files under the session's tasks folder, all aged *days*."""
+    tasks = session / "tasks"
+    tasks.mkdir(parents=True, exist_ok=True)
+    for i in range(count):
+        (tasks / f"f{i}").write_text("x")
+    for path in (*tasks.iterdir(), tasks, session, session.parent):
+        age(path, days)
+
+
+def build_root(root: Path, *, big_first: bool) -> Path:
+    """One old BIG-entry group among 40 old small ones; the big one sorts first or last."""
+    for i in range(40):
+        fill(root / "-p" / uuid_n(10 + i), 1, 6)
+    big = root / "-p" / (uuid_n(0) if big_first else uuid_n(99))
+    fill(big, BIG, 6)
+    return big
+
+
+@pytest.fixture
+def sorted_scandir(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Make scandir order deterministic (by name) so 'the big folder first' is real."""
+    real = os.scandir
+
+    class Sorted:
+        def __init__(self, path: str) -> None:
+            with real(path) as handle:
+                self.items = sorted(handle, key=lambda e: e.name)
+
+        def __enter__(self) -> Sorted:
+            return self
+
+        def __exit__(self, *_a: object) -> None:
+            return None
+
+        def __iter__(self):
+            return iter(self.items)
+
+    monkeypatch.setattr(os, "scandir", Sorted)
+
+
+def share_scan(root: Path, budget: Budget, **kw) -> scan.TreeScan:
+    return scan.scan_claude_root(
+        str(root), now=NOW, stale_days=2, budget=budget, group_max_entries=SHARE, **kw
+    )
+
+
+@pytest.mark.parametrize("big_first", [True, False])
+def test_one_huge_folder_only_marks_itself_unproven(
+    tmp_path: Path, sorted_scandir: None, big_first: bool
+) -> None:
+    root = tmp_path / "claude-1000"
+    build_root(root, big_first=big_first)
+    budget = Budget(ROOT_CAP, 30)
+    result = share_scan(root, budget)
+    assert result.sessions == 41 and result.stale_sessions == 40
+    assert result.partial
+    assert not budget.exhausted and 0 <= budget.entries_left < ROOT_CAP
+    assert result.files < ROOT_CAP
+
+
+def test_the_root_cap_still_ends_the_walk(tmp_path: Path, sorted_scandir: None) -> None:
+    root = tmp_path / "claude-1000"
+    build_root(root, big_first=False)
+    budget = Budget(60, 30)
+    result = share_scan(root, budget)
+    assert budget.exhausted and result.partial
+    assert result.sessions < 41 and result.stale_sessions < 40
+
+
+def test_the_seconds_cap_still_ends_the_walk(tmp_path: Path, sorted_scandir: None) -> None:
+    root = tmp_path / "claude-1000"
+    build_root(root, big_first=False)
+    ticks = iter(range(100000))
+    budget = Budget(ROOT_CAP, 40, clock=lambda: float(next(ticks)))
+    result = share_scan(root, budget)
+    assert budget.exhausted and result.partial
+    assert result.sessions < 41
+
+
+def test_a_share_hit_never_exhausts_the_parent_or_spends_it_on_a_refusal() -> None:
+    parent = Budget(10, 30)
+    kid = parent.child(3)
+    assert [kid.spend() for _ in range(3)] == [True, True, True]
+    assert parent.entries_left == 7
+    assert kid.spend() is False and kid.spend() is False
+    assert kid.exhausted and kid.partial and kid.capped
+    assert not parent.exhausted and not parent.partial and parent.entries_left == 7
+    assert parent.child(2).spend() is True and parent.entries_left == 6
+
+
+def test_the_parents_cap_ends_a_child_that_still_has_share() -> None:
+    parent = Budget(2, 30)
+    kid = parent.child(50)
+    assert kid.spend() and kid.spend()
+    assert kid.spend() is False
+    assert parent.exhausted and kid.exhausted and kid.partial and not kid.capped
+
+
+def test_a_pytest_run_over_its_share_is_capped_alone(tmp_path: Path) -> None:
+    root = tmp_path / "pytest-of-owner"
+    for i in range(300):
+        make(root / "pytest-1" / f"a{i}", 5)
+    make(root / "pytest-2" / "a.txt", 5)
+    for folder in (root / "pytest-1", root / "pytest-2", root):
+        age(folder, 5)
+    budget = Budget(ROOT_CAP, 30)
+    result = scan.scan_pytest_root(
+        str(root), now=NOW, stale_days=2, budget=budget, group_max_entries=SHARE
+    )
+    assert result.sessions == 2 and result.stale_sessions == 1 and result.partial
+    assert not budget.exhausted
+
+
+def test_a_held_or_live_group_inside_its_share_is_never_stale(tmp_path: Path) -> None:
+    root = tmp_path / "claude-1000"
+    held = root / "-p" / uuid_n(1)
+    plain = root / "-p" / uuid_n(2)
+    fill(held, 5, 6)
+    fill(plain, 5, 6)
+    assert share_scan(root, Budget(ROOT_CAP, 30)).stale_sessions == 2
+    live = share_scan(root, Budget(ROOT_CAP, 30), live={str(held)})
+    assert live.stale_sessions == 1
+    info = held.stat()
+    ident = (os.major(info.st_dev), os.minor(info.st_dev), info.st_ino)
+    locked = share_scan(root, Budget(ROOT_CAP, 30), locks=frozenset({ident}))
+    assert locked.stale_sessions == 1
+
+
+def test_a_huge_folder_that_is_not_a_pytest_run_is_a_loose_tree(tmp_path: Path) -> None:
+    root = tmp_path / "pytest-of-owner"
+    for i in range(300):
+        make(root / "other" / f"a{i}", 5)
+    make(root / "pytest-1" / "a.txt", 5)
+    for folder in (root / "pytest-1", root):
+        age(folder, 5)
+    result = scan.scan_pytest_root(
+        str(root), now=NOW, stale_days=2, budget=Budget(ROOT_CAP, 30), group_max_entries=SHARE
+    )
+    assert result.sessions == 1 and result.files == 303 and not result.partial
+
+
+def test_a_non_session_folder_under_a_claude_project_is_a_loose_tree(tmp_path: Path) -> None:
+    root = tmp_path / "claude-1000"
+    for i in range(300):
+        make(root / "-p" / "not-a-session" / f"a{i}", 0)
+    make_session(root, "-p", UUID_A, 6)
+    result = share_scan(root, Budget(ROOT_CAP, 30))
+    assert result.sessions == 1 and result.stale_sessions == 1 and not result.partial
+    assert result.files > 300
+
+
+def test_a_loose_tree_keeps_using_the_whole_budget(tmp_path: Path) -> None:
+    root = tmp_path / "claude-1000"
+    for i in range(150):
+        make(root / "bundled-skills" / f"s{i}", 0)
+    budget = Budget(ROOT_CAP, 30)
+    result = share_scan(root, budget)
+    assert result.files == 151 and not result.partial

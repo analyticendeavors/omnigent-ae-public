@@ -1,0 +1,251 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 10:23:12 -0800
+Subject: [PATCH 304/333] [ae-patch] Fix the review findings on
+ navigation.share: a long timeout, a probe, and a fixed file name
+
+---
+ sdks/web-extension/src/index.ts               |  8 ++--
+ web/src/extensions/ExtensionViewHost.test.tsx | 40 +++++++++++++++++++
+ web/src/extensions/ExtensionViewHost.tsx      |  5 ++-
+ .../extensions/rpc/validation.aeShare.test.ts | 11 +++++
+ web/src/extensions/rpc/validation.ts          | 11 ++++-
+ web/src/extensions/services/aeShare.ts        | 20 +++++++---
+ .../useExtensionHostServices.aeShare.test.tsx | 16 +++++++-
+ 7 files changed, 100 insertions(+), 11 deletions(-)
+
+diff --git a/sdks/web-extension/src/index.ts b/sdks/web-extension/src/index.ts
+index c589105b29eae8fbbc4a4e097e351625bfd05813..15349eef35c82d5d0ac7036d845b66b24c7b0e18 100644
+--- a/sdks/web-extension/src/index.ts
++++ b/sdks/web-extension/src/index.ts
+@@ -90,6 +90,8 @@ export interface ExtensionContext {
+       title?: string;
+       files?: Blob[];
+     }): Promise<{ shared: true; files_dropped?: true }>;
++    /** Asks whether the browser has a share sheet; shares nothing. */
++    share(options: { probe: true }): Promise<{ available: boolean }>;
+   };
+   theme: {
+     getCurrent(): Promise<ThemeInfo>;
+@@ -225,7 +227,7 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
+         reject(
+           new ExtensionApiError("Timeout", `Host method ${method} timed out`),
+         );
+-      }, 10_000);
++      }, method === "navigation.share" ? 10 * 60_000 : 10_000);
+       pending.set(requestId, {
+         resolve: (value) => resolve(value as T),
+         reject,
+@@ -263,8 +265,8 @@ export function defineExtension(lifecycle: ExtensionLifecycle): void {
+       async openExternal(url) {
+         await request("navigation.openExternal", { url });
+       },
+-      share(options) {
+-        return request<{ shared: true; files_dropped?: true }>("navigation.share", options);
++      share(options: object) {
++        return request("navigation.share", options);
+       },
+     },
+     theme: {
+diff --git a/web/src/extensions/ExtensionViewHost.test.tsx b/web/src/extensions/ExtensionViewHost.test.tsx
+index ec8c5ee13728c2dcb34ace7152fb6388a5d1257d..fcb242f06cdfffdefead192b9500c124dd36ed26 100644
+--- a/web/src/extensions/ExtensionViewHost.test.tsx
++++ b/web/src/extensions/ExtensionViewHost.test.tsx
+@@ -395,6 +395,46 @@ describe("ExtensionViewHost", () => {
+     );
+   });
+ 
++  it("gives navigation.share ten minutes, not ten seconds (omnigent-ae patch 0301)", async () => {
++    vi.useFakeTimers();
++    const pending = vi.fn(() => new Promise<void>(() => {}));
++    render(
++      <ExtensionViewHost
++        extension={extension}
++        page={page}
++        refresh={refresh}
++        methods={{ "navigation.share": pending }}
++      />,
++    );
++    await act(async () => {
++      await Promise.resolve();
++      await Promise.resolve();
++    });
++    act(() => {
++      FakeMessageChannel.latest!.port1.onmessage?.({
++        data: { ...identity, source: EXTENSION_RPC_SOURCE, type: "ready" },
++      } as MessageEvent<unknown>);
++      FakeMessageChannel.latest!.port1.onmessage?.({
++        data: {
++          ...identity,
++          source: EXTENSION_RPC_SOURCE,
++          type: "request",
++          requestId: "request-1",
++          method: "navigation.share",
++          params: {},
++        },
++      } as MessageEvent<unknown>);
++      vi.advanceTimersByTime(60_000);
++    });
++    const timedOut = (call: unknown[]) =>
++      (call[0] as { error?: { code?: string } }).error?.code === "RequestTimeout";
++    expect(FakeMessageChannel.latest!.port1.postMessage.mock.calls.some(timedOut)).toBe(false);
++    act(() => {
++      vi.advanceTimersByTime(10 * 60_000);
++    });
++    expect(FakeMessageChannel.latest!.port1.postMessage.mock.calls.some(timedOut)).toBe(true);
++  });
++
+   it("does not let one failed extension prevent another from mounting", async () => {
+     const healthy = { ...extension, id: "acme.healthy" };
+     const healthyIdentity = { ...identity, extensionId: healthy.id };
+diff --git a/web/src/extensions/ExtensionViewHost.tsx b/web/src/extensions/ExtensionViewHost.tsx
+index 8d8eab1115381ba8b36ff34e10a0402546fc72aa..df137aa042f2777ba9c1809afe99ef5f44231efd 100644
+--- a/web/src/extensions/ExtensionViewHost.tsx
++++ b/web/src/extensions/ExtensionViewHost.tsx
+@@ -19,6 +19,9 @@ import { ExtensionHostServiceError } from "./services/errors";
+ 
+ const ACTIVATION_TIMEOUT_MS = 10_000;
+ const REQUEST_TIMEOUT_MS = 10_000;
++// omnigent-ae patch: `navigation.share` stays pending while the share sheet is open, so it gets
++// its own long limit; at 10 s a share that took longer ended as a timeout though it went through.
++const SHARE_REQUEST_TIMEOUT_MS = 10 * 60_000;
+ const MAX_PENDING_HOST_REQUESTS = 32;
+ 
+ type HostMethod = (params: unknown, signal: AbortSignal) => unknown | Promise<unknown>;
+@@ -220,7 +223,7 @@ export function ExtensionViewHost({
+           ...response,
+           error: { code: "RequestTimeout", message: "Host request timed out" },
+         });
+-      }, REQUEST_TIMEOUT_MS);
++      }, message.method === "navigation.share" ? SHARE_REQUEST_TIMEOUT_MS : REQUEST_TIMEOUT_MS);
+       pendingRef.current.set(message.requestId, { controller, timeout: requestTimeout });
+       void Promise.resolve()
+         .then(() => method(message.params, controller.signal))
+diff --git a/web/src/extensions/rpc/validation.aeShare.test.ts b/web/src/extensions/rpc/validation.aeShare.test.ts
+index 72f3d37b0bb3aa17b690d3c5c99d2d6982140a5d..418893fe6ac833b520d438b4953095414484e1f0 100644
+--- a/web/src/extensions/rpc/validation.aeShare.test.ts
++++ b/web/src/extensions/rpc/validation.aeShare.test.ts
+@@ -44,6 +44,17 @@ describe("navigation.share files", () => {
+     ).toBe(false);
+   });
+ 
++  it("refuses a Blob over 5 MB or of a type other than jpeg or png", () => {
++    const big = new Blob([new Uint8Array(5 * 1024 * 1024 + 1)], { type: "image/jpeg" });
++    const gif = new Blob([new Uint8Array(10)], { type: "image/gif" });
++    const png = new Blob([new Uint8Array(10)], { type: "image/png" });
++    const check = (file: Blob) =>
++      isExtensionInboundMessage(request("navigation.share", { text: "a", files: [file] }), identity);
++    expect(check(big)).toBe(false);
++    expect(check(gif)).toBe(false);
++    expect(check(png)).toBe(true);
++  });
++
+   it("holds the rest of the share request to the usual budget", () => {
+     expect(
+       isExtensionInboundMessage(
+diff --git a/web/src/extensions/rpc/validation.ts b/web/src/extensions/rpc/validation.ts
+index 61a5fe6b069e8ee5047532cc94958257b9fbb1d2..d074f3670cc15b328aaf6362cd52a85c9cf99de9 100644
+--- a/web/src/extensions/rpc/validation.ts
++++ b/web/src/extensions/rpc/validation.ts
+@@ -1,3 +1,4 @@
++import { AE_SHARE_FILE_TYPES, AE_SHARE_MAX_FILE_BYTES } from "../services/aeShare";
+ import {
+   EXTENSION_RPC_SOURCE,
+   MAX_EXTENSION_MESSAGE_BYTES,
+@@ -72,7 +73,15 @@ function isRequestWithinBudget(message: Record<string, unknown>): boolean {
+     typeof params === "object" &&
+     Array.isArray(params.files)
+   ) {
+-    if (params.files.length > 1 || !params.files.every((file) => file instanceof Blob)) {
++    if (
++      params.files.length > 1 ||
++      !params.files.every(
++        (file) =>
++          file instanceof Blob &&
++          file.size <= AE_SHARE_MAX_FILE_BYTES &&
++          AE_SHARE_FILE_TYPES.has(file.type),
++      )
++    ) {
+       return false;
+     }
+     return isExtensionPayloadWithinBudget({ ...message, params: { ...params, files: [] } });
+diff --git a/web/src/extensions/services/aeShare.ts b/web/src/extensions/services/aeShare.ts
+index 6eb95dbe1f206e66bd93158cd7d142b41305e6f6..c3b18136e907c71af374924c5a18ed22364ea62b 100644
+--- a/web/src/extensions/services/aeShare.ts
++++ b/web/src/extensions/services/aeShare.ts
+@@ -12,7 +12,7 @@ export const AE_SHARE_MAX_TEXT = 3000;
+ export const AE_SHARE_MAX_TITLE = 200;
+ /** The largest image, in bytes. */
+ export const AE_SHARE_MAX_FILE_BYTES = 5 * 1024 * 1024;
+-const FILE_TYPES = new Set(["image/jpeg", "image/png"]);
++export const AE_SHARE_FILE_TYPES: ReadonlySet<string> = new Set(["image/jpeg", "image/png"]);
+ 
+ export interface AeShareResult {
+   shared: true;
+@@ -37,18 +37,28 @@ function textField(value: unknown, name: string, max: number): string | undefine
+   return value;
+ }
+ 
+-/** The File to share: a Blob of an allowed type under the size cap, named for the sheet. */
++/**
++ * The File to share: a Blob of an allowed type under the size cap, always wrapped in a new File
++ * named image.jpg or image.png, so an extension cannot choose the file name the sheet shows.
++ */
+ function fileFrom(value: unknown): File {
+   if (!(value instanceof Blob)) throw invalid("files must hold a File or Blob");
+-  if (!FILE_TYPES.has(value.type)) throw invalid("the image must be image/jpeg or image/png");
++  if (!AE_SHARE_FILE_TYPES.has(value.type)) throw invalid("the image must be image/jpeg or image/png");
+   if (value.size > AE_SHARE_MAX_FILE_BYTES) throw invalid("the image is larger than 5 MB");
+-  if (value instanceof File) return value;
+   return new File([value], value.type === "image/png" ? "image.png" : "image.jpg", {
+     type: value.type,
+   });
+ }
+ 
+-export async function aeShare(params: Record<string, unknown>): Promise<AeShareResult> {
++/**
++ * `{probe: true}` asks whether a share sheet exists and shares nothing, so the card can choose
++ * between the sheet and a link inside the tap (a fallback after a failed share runs outside the
++ * tap, where iOS can refuse to open a link).
++ */
++export async function aeShare(
++  params: Record<string, unknown>,
++): Promise<AeShareResult | { available: boolean }> {
++  if (params.probe === true) return { available: typeof navigator.share === "function" };
+   const text = textField(params.text, "text", AE_SHARE_MAX_TEXT);
+   const title = textField(params.title, "title", AE_SHARE_MAX_TITLE);
+   const rawFiles = params.files;
+diff --git a/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx b/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx
+index 7fd93127e3902be457bee98771dbc4d7490e6a8f..022ee153a34e5aa54df7c72a231015399aee0347 100644
+--- a/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx
++++ b/web/src/extensions/services/useExtensionHostServices.aeShare.test.tsx
+@@ -77,7 +77,13 @@ describe("navigation.share", () => {
+     await expect(
+       share()?.({ text: "Hello", title: "T", files: [file] }, signal()),
+     ).resolves.toEqual({ shared: true });
+-    expect(sheet).toHaveBeenCalledWith({ text: "Hello", title: "T", files: [file] });
++    // Always a new File with a fixed name: an extension cannot choose what the sheet shows.
++    const sent = sheet.mock.calls[0][0] as ShareData;
++    expect(sent.text).toBe("Hello");
++    expect(sent.files).toHaveLength(1);
++    expect(sent.files?.[0]).not.toBe(file);
++    expect(sent.files?.[0].name).toBe("image.jpg");
++    expect(sent.files?.[0].type).toBe("image/jpeg");
+   });
+ 
+   it("shares the text alone and says the image was dropped when canShare refuses files", async () => {
+@@ -121,6 +127,14 @@ describe("navigation.share", () => {
+     expect(sheet).not.toHaveBeenCalled();
+   });
+ 
++  it("answers a probe with whether there is a share sheet, and shares nothing", async () => {
++    await expect(share()?.({ probe: true }, signal())).resolves.toEqual({ available: false });
++    const sheet = vi.fn().mockResolvedValue(undefined);
++    setNavigator(sheet, () => true);
++    await expect(share()?.({ probe: true }, signal())).resolves.toEqual({ available: true });
++    expect(sheet).not.toHaveBeenCalled();
++  });
++
+   it("counts code points, not UTF-16 units", async () => {
+     const sheet = vi.fn().mockResolvedValue(undefined);
+     setNavigator(sheet, () => true);

@@ -565,6 +565,7 @@ class Settings:
     stale_days: float
     slow_minutes: int
     max_entries: int
+    group_max_entries: int
     max_seconds: float
     dirs: list[tuple[str, str]]
     """(label, path) for each folder to size; only the label is posted."""
@@ -637,6 +638,7 @@ def settings_from_env(env: Mapping[str, str] | None = None, home: str | None = N
         stale_days=_float(env, "AE_BOX_HEALTH_STALE_DAYS", 2, 0.01, 3650),
         slow_minutes=int(_float(env, "AE_BOX_HEALTH_SLOW_MINUTES", 60, 1, 10080)),
         max_entries=int(_float(env, "AE_BOX_HEALTH_WALK_MAX_ENTRIES", 500000, 100, 10**8)),
+        group_max_entries=int(_float(env, "AE_BOX_HEALTH_GROUP_MAX_ENTRIES", 100000, 100, 10**8)),
         max_seconds=_float(env, "AE_BOX_HEALTH_WALK_MAX_SECONDS", 30, 1, 3600),
         dirs=parse_dirs(text("AE_BOX_HEALTH_DIRS")),
         worktrees=text("AE_BOX_HEALTH_WORKTREES"),
@@ -1941,6 +1943,7 @@ def run_cleanup_request(
                     now=now,
                     stale_days=settings.stale_days,
                     max_entries=settings.max_entries,
+                    group_max_entries=settings.group_max_entries,
                     max_seconds=settings.max_seconds,
                     docker_run=docker_run,
                     expected=None if action == "docker_prune" else expected,
@@ -1966,6 +1969,69 @@ def run_cleanup_request(
         finished_at=datetime.fromtimestamp(time.time(), UTC).isoformat(),
     )
     return result
+
+
+AUTO_CLEAN_ACTIONS: tuple[str, ...] = ("claude_scratch", "tmp_litter")
+"""Host actions the relay runs by itself on the hourly pass. Each is the same guarded plan a
+button runs (live sessions, locks and the age rule included). Docker prune (it clears the
+shared deploy build cache) and review checkouts stay buttons."""
+AUTO_CLEAN_DEADLINE_S = 40.0
+AUTO_CLEAN_MIN_DAYS = 2.0
+
+
+def auto_clean_host(
+    settings: Settings,
+    runner: Runner,
+    *,
+    now: float,
+    home: str,
+    tmp_root: str = "/tmp",
+) -> dict[str, int]:
+    """Run the safe host cleanups without a button. Never raises; returns removed counts by
+    action. A refused or failed action is logged by kind only and left for the next pass."""
+    removed: dict[str, int] = {}
+    if not settings.cleanup or settings.dry_run:
+        return removed
+    deadline = Deadline(AUTO_CLEAN_DEADLINE_S)
+    guarded = DeadlineRunner(runner, deadline)
+
+    def docker_run(argv: Sequence[str], timeout: float) -> tuple[int, str]:
+        done = guarded.run(argv, timeout)
+        return done.returncode, done.out
+
+    for action in AUTO_CLEAN_ACTIONS:
+        if deadline.expired:
+            break  # the budget is spent; the next hourly pass continues
+        try:
+            outcome = box_cleanup.host_run(
+                action,  # type: ignore[arg-type]
+                roots=host_roots(settings, home),
+                tmp=tmp_root,
+                now=now,
+                stale_days=max(AUTO_CLEAN_MIN_DAYS, settings.stale_days),
+                max_entries=settings.max_entries,
+                group_max_entries=settings.group_max_entries,
+                max_seconds=min(10.0, settings.max_seconds),
+                docker_run=docker_run,
+                remove_seconds=max(1.0, deadline.remaining()),
+            )
+            removed[action] = outcome.removed
+            # A warning, not info: the unit logs at WARNING, and an hourly line is how the
+            # journal shows the feature ran (removed, and why the rest was kept).
+            kept = ", ".join(
+                f"{k} {v}" for k, v in sorted(outcome.skipped.items()) if v and k in REASON_SET
+            )
+            _logger.warning(
+                "auto clean %s: removed %d%s",
+                action,
+                outcome.removed,
+                f"; kept: {kept}" if kept else "",
+            )
+        except box_cleanup.Refused:
+            _logger.warning("auto clean %s refused", action)
+        except Exception as exc:  # noqa: BLE001 (one action failing must not stop the pass)
+            _logger.warning("auto clean %s: %s", action, exc.__class__.__name__)
+    return removed
 
 
 class Deadline:
@@ -2143,6 +2209,7 @@ def slow_scan(
                     now=now,
                     stale_days=settings.stale_days,
                     budget=budget(),
+                    group_max_entries=settings.group_max_entries,
                     locks=locks,
                     live=live,
                 )
@@ -2155,6 +2222,7 @@ def slow_scan(
                         now=now,
                         stale_days=settings.stale_days,
                         budget=budget(),
+                        group_max_entries=settings.group_max_entries,
                     )
                 )
             health.claude = health.claude[:3]
@@ -2224,6 +2292,7 @@ def slow_scan(
             "AE_BOX_HEALTH_STALE_DAYS": f"{settings.stale_days:g}",
             "AE_BOX_HEALTH_SLOW_MINUTES": str(settings.slow_minutes),
             "AE_BOX_HEALTH_WALK_MAX_ENTRIES": str(settings.max_entries),
+            "AE_BOX_HEALTH_GROUP_MAX_ENTRIES": str(settings.group_max_entries),
             "AE_BOX_HEALTH_WALK_MAX_SECONDS": f"{settings.max_seconds:g}",
         },
     )
@@ -2583,6 +2652,16 @@ async def run(
                 print(f"box-health: {exc}", file=out)
             # Rescan now so the next post carries the new numbers.
             cached, due = None, True
+        if due and not queued and client is not None:
+            # No button needed: the hourly pass cleans this user's old leftovers itself.
+            await asyncio.to_thread(
+                auto_clean_host,
+                settings,
+                runner,
+                now=time.time(),
+                home=home or str(Path.home()),
+                tmp_root=(roots.tmp if roots else "/tmp"),
+            )
         if due:
             left = max(0.0, min(SLOW_DEADLINE_S, PASS_DEADLINE_S - (time.monotonic() - began)))
             slow, slow_failed = await asyncio.to_thread(

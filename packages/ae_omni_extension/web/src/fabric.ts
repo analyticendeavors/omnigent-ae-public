@@ -120,7 +120,13 @@ import {
 } from "./api";
 import { accountsSection, activateAccounts, deactivateAccounts } from "./accounts";
 import { activateAzure, azureSection, deactivateAzure } from "./azure";
-import { adminCard, mountBoard } from "./board";
+import { activateAttention, attentionSection, deactivateAttention } from "./attention";
+import { resetAttention } from "./attentionStore";
+import { adminCard, CARD_SETTINGS_EVENT, cardNotSetUp, type CardId, mountBoard } from "./board";
+import { loadCardPrefs } from "./cardPrefs";
+import { getCards, onCardState, resetCardState, setCards } from "./cardState";
+import { fetchCards } from "./cardsApi";
+import { openCardsPanel } from "./cardsPanel";
 import { layoutResetButton } from "./boardDrag";
 import { loadBoardLayout } from "./boardLayout";
 import { holdMenus, rowMenu } from "./cards";
@@ -140,10 +146,13 @@ import {
   cloudIcon,
   coinIcon,
   type FabricTone,
+  calendarEventIcon,
   gitBranchIcon,
+  layoutGridIcon,
   chartBarIcon,
   linksIcon,
   lockIcon,
+  scaleIcon,
   powerIcon,
   refreshIcon,
   sharedIcon,
@@ -152,8 +161,11 @@ import {
 import { copyText } from "./lot";
 import { activateSecrets, deactivateSecrets, secretsSection } from "./secrets";
 import { activateGit, deactivateGit, gitSection } from "./git";
+import { activateSocial, deactivateSocial, socialPill, socialPopout, socialSection } from "./social";
 import { activateFamilyCost, deactivateFamilyCost } from "./familyCost";
 import { activatePresets, deactivatePresets, presetsSection } from "./presets";
+import { activateHomeSecurity, deactivateHomeSecurity, homeSecurityPill, homeSecuritySection } from "./homeSecurity";
+import { activateDecision, deactivateDecision, decisionPill, decisionSection } from "./decision";
 import { activateVault, deactivateVault, loadVaultView, vaultSection } from "./vault";
 import { loadSectionState } from "./sections";
 import {
@@ -167,6 +179,7 @@ import {
   type Tile,
   worst,
 } from "./tiles";
+import { mountVerdict } from "./verdict";
 
 export const POLL_BUSY_MS = 15_000;
 export const POLL_IDLE_MS = 60_000;
@@ -355,6 +368,10 @@ export function fabricTile(data: FabricOverview | null, error: unknown, now: num
       health: error ? "attention" : "idle",
       dot: true,
     };
+  }
+  // The server said Fabric is not configured: the Compute card leaves the board (board.ts) unless Databricks is set up.
+  if (data.configured === false) {
+    return { id: "fabric", value: "Not set up", note: "", health: "idle", dot: true, notSetUp: true };
   }
   const rows = data.capacities;
   if (rows.length === 0) return { id: "fabric", value: "None", note: "", health: "idle", dot: true };
@@ -1092,6 +1109,7 @@ function render(page: Page): void {
     replaceChildren(page.status, []);
     replaceChildren(page.list, [el("p", { class: "meta" }, "Fabric capacities are for admins.")]);
     restoreMenus();
+    setTile({ id: "fabric", value: "Admins only", note: "", health: "idle" });
     return;
   }
   replaceChildren(page.status, [
@@ -1138,6 +1156,7 @@ function render(page: Page): void {
 
 let themeSubscription: Disposable | null = null;
 let stopBoard: (() => void) | null = null;
+let stopCardChanges: (() => void) | null = null;
 let timer: ReturnType<typeof setTimeout> | null = null;
 let onFocus: (() => void) | null = null;
 let active = false;
@@ -1192,7 +1211,12 @@ async function followTheme(context: ExtensionContext, mine: number): Promise<voi
 }
 
 /** A page for someone who may see nothing of the Admin Center. */
-async function activateNoAccess(context: ExtensionContext, root: HTMLElement, mine: number) {
+async function activateNoAccess(
+  context: ExtensionContext,
+  root: HTMLElement,
+  mine: number,
+  message = "The Admin Center is for admins. Ask an admin if you need access.",
+) {
   stopBoard?.();
   stopBoard = null;
   resetTiles();
@@ -1204,7 +1228,7 @@ async function activateNoAccess(context: ExtensionContext, root: HTMLElement, mi
       el(
         "p",
         { class: "meta admin-noaccess" },
-        "The Admin Center is for admins. Ask an admin if you need access.",
+        message,
       ),
     ),
   );
@@ -1224,7 +1248,9 @@ async function activateBoxOnly(
 ): Promise<void> {
   stopBoard?.();
   resetTiles();
+  resetAttention();
   const monitor = boxHealthSection();
+  const attention = attentionSection();
   const box = adminCard(
     "box",
     "Box health",
@@ -1233,6 +1259,7 @@ async function activateBoxOnly(
     monitor,
   );
   const updated = el("p", { class: "meta admin-updated" });
+  const verdict = el("p", { class: "admin-verdict", "aria-live": "polite" });
   const tiles = el("div", { class: "admin-tiles" });
   // One card: nothing to drag, so the grip and Reset layout stay out (style.css).
   const board = el("div", { class: "admin-board", "data-single": "true" });
@@ -1243,12 +1270,21 @@ async function activateBoxOnly(
   const main = el(
     "main",
     { class: "fabric admin" },
-    el("header", { class: "fabric-top" }, el("h1", { class: "fabric-h" }, "Admin Center"), updated, again),
+    el(
+      "header",
+      { class: "fabric-top" },
+      el("h1", { class: "fabric-h" }, "Admin Center"),
+      verdict,
+      updated,
+      again,
+    ),
     tiles,
+    attention,
     board,
   );
   root.replaceChildren(main);
   mountTiles(tiles, updated);
+  mountVerdict(verdict, { fine: false });
   const layout = mountBoard(main, board, { box });
   stopBoard = layout.stop;
   active = true;
@@ -1257,6 +1293,7 @@ async function activateBoxOnly(
   await followTheme(context, mine);
   if (!active || mine !== activations) return;
   activateBoxHealth(context, box);
+  activateAttention(context, attention, { waiting: false });
 }
 
 export async function activateFabric(context: ExtensionContext): Promise<void> {
@@ -1266,11 +1303,22 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const access = await readAccess(context);
   if (mine !== activations) return;
   if (access && !access.admin) {
+    if (access.box_admin && access.box_on === false) {
+      return activateNoAccess(
+        context,
+        root,
+        mine,
+        "Box health is turned off on this server. Ask an admin to turn it back on.",
+      );
+    }
     if (access.box_admin) return activateBoxOnly(context, root, mine);
     return activateNoAccess(context, root, mine);
   }
   stopBoard?.();
   resetTiles();
+  resetAttention();
+  resetCardState();
+  const attention = attentionSection();
   const status = el("div", { class: "page-status", "aria-live": "polite" });
   const toast = el("div", { class: "page-status", id: "toast", "aria-live": "assertive" });
   // A section with an id, so a redraw finds an open menu's card (cards.ts whereOf).
@@ -1281,8 +1329,19 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   });
   const refreshed = el("p", { class: "meta refreshed" });
   const updated = el("p", { class: "meta admin-updated" });
+  const verdict = el("p", { class: "admin-verdict", "aria-live": "polite" });
   const tiles = el("div", { class: "admin-tiles" });
   const board = el("div", { class: "admin-board" });
+  const openPanel = (opener: HTMLElement | null, focus?: CardId): void => {
+    openCardsPanel(context, { focus, opener, notSetUp: (id) => cardNotSetUp(id as CardId) });
+  };
+  const cardsButton = button("", {
+    title:
+      "Open the Cards panel: switch a card on or off for everyone, hide one for yourself, or see how to set one up",
+    onClick: (node) => openPanel(node),
+  });
+  cardsButton.classList.add("admin-cards-btn");
+  cardsButton.replaceChildren(layoutGridIcon(16), " Cards");
   const deploys = deploysSection();
   const databricks = databricksSection();
   const strip = databricksStrip();
@@ -1292,7 +1351,10 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const accountsBody = accountsSection();
   const azureBody = azureSection();
   const vaultBody = vaultSection();
+  const decisionBody = decisionSection();
+  const homeSecurityBody = homeSecuritySection();
   const gitBody = gitSection();
+  const socialBody = socialSection();
   const presetsBody = presetsSection();
   // The card headers carry one "Updated" each: Fabric's on Compute, the host's on Box health.
   databricks.querySelector(".dbx-refreshed")?.remove();
@@ -1328,6 +1390,14 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     [vaultBody.querySelector(".vault-refreshed")],
     vaultBody,
   );
+  const decision = adminCard("decision", "Decision model", scaleIcon(16), [decisionPill()], decisionBody);
+  const homeSecurity = adminCard(
+    "home-security",
+    "Home security",
+    shieldCheckIcon(),
+    [homeSecurityPill()],
+    homeSecurityBody,
+  );
   const git = adminCard(
     "git",
     "Git repos",
@@ -1335,6 +1405,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     [gitBody.querySelector(".git-refreshed")],
     gitBody,
   );
+  const social = adminCard("social", "Social", calendarEventIcon(16), [socialPill(), socialPopout()], socialBody);
   const presets = adminCard(
     "presets",
     "Spend",
@@ -1362,15 +1433,24 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
       "header",
       { class: "fabric-top" },
       el("h1", { class: "fabric-h" }, "Admin Center"),
+      verdict,
       updated,
       layoutResetButton(board),
+      cardsButton,
       again,
     ),
     tiles,
+    attention,
     board,
   );
   root.replaceChildren(main);
+  // Each card's gear and the footer's Cards settings raise this event; open the panel there.
+  main.addEventListener(CARD_SETTINGS_EVENT, (event) => {
+    const detail = (event as CustomEvent<CardId | null>).detail;
+    openPanel(event.target as HTMLElement | null, detail ?? undefined);
+  });
   mountTiles(tiles, updated);
+  mountVerdict(verdict);
   const layout = mountBoard(main, board, {
     deploys,
     accounts,
@@ -1379,9 +1459,12 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     azure,
     box,
     vault,
+    decision,
+    "home-security": homeSecurity,
     git,
     presets,
-  });
+    social,
+  }, attention);
   stopBoard = layout.stop;
   active = true;
   const state: PageState = {
@@ -1469,7 +1552,22 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     loadSectionState(context),
     loadBoardLayout(context),
     loadVaultView(context),
+    // Which cards are off, and which this viewer hid. Admins only: this page is the admin one, so
+    // a non-admin or box admin never reaches here and never calls /cards. A failed read leaves
+    // every card showing, as before.
+    loadCardPrefs(context),
+    fetchCards(context).then(setCards, () => undefined),
   ]);
+  // A card switched on starts reading again at once (an off card's sections wait quietly); a hide
+  // or an unrelated change does not.
+  const onSet = (): string =>
+    (getCards()?.cards ?? []).filter((card) => card.on).map((card) => card.id).join(",");
+  let lastOn = onSet();
+  stopCardChanges = onCardState(() => {
+    const now = onSet();
+    if (now !== lastOn) refreshAll();
+    lastOn = now;
+  });
   layout.refold();
   document.documentElement.dataset.theme = theme.theme;
   const subscription = await context.theme.subscribe((next) => {
@@ -1494,9 +1592,13 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   activateAccounts(context, accounts);
   activateAzure(context, azure);
   activateVault(context, vault);
+  activateDecision(context, decision);
+  activateHomeSecurity(context, homeSecurity);
   activateGit(context, git);
+  activateSocial(context, social);
   activatePresets(context, presets);
   activateFamilyCost(context, presets);
+  activateAttention(context, attention);
   const live = () => active && mine === activations;
   registerRefresh("fabric", () => (live() ? refresh() : undefined));
   onFocus = () => {
@@ -1518,12 +1620,19 @@ export function deactivateFabric(): void {
   deactivateAccounts();
   deactivateAzure();
   deactivateVault();
+  deactivateDecision();
+  deactivateHomeSecurity();
   deactivateGit();
+  deactivateSocial();
   deactivatePresets();
   deactivateFamilyCost();
+  deactivateAttention();
   stopBoard?.();
   stopBoard = null;
+  stopCardChanges?.();
+  stopCardChanges = null;
   resetTiles();
+  resetCardState();
   themeSubscription?.dispose();
   themeSubscription = null;
   if (timer) clearTimeout(timer);

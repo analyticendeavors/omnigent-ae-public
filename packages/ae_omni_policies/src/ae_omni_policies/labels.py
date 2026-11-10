@@ -30,6 +30,8 @@ ABSORBED = "ae.absorbed"
 UNFILED = "ae.unfiled"
 FORK_SUSPECT = "ae.fork_suspect"
 TRIAGE = "ae.triage"
+# Voice mode (2026-11-09): "on" while the chat is hands-free; the voice policy reads it.
+VOICE = "ae.voice"
 TASK = "ae.task"
 OVERFLOW = "ae.overflow"
 # Sessions the orchestrator agent started (POST /v1/ae/sessions, 2026-09-25):
@@ -76,6 +78,16 @@ HANDOFF_NUDGED = "nudged"
 HANDOFF_SNOOZED = "snoozed"
 # The runner id an automatic resume was last tried for (auto_resume.py, 2026-10-13).
 AUTORESUME = "ae.autoresume"
+# The Needs you item a chat was started on (``attention.py``, 2026-11-03): the item's id, how the
+# list finds "Claude is on it"; and the fingerprint of the item's state when the chat started.
+ATTENTION = "ae.attention"
+ATTENTION_FP = "ae.attention_fp"
+# Which button started the chat (2026-11-05): "fix" for a Fix chat; a Review sets none.
+ATTENTION_ACTION = "ae.attention_action"
+# A Review all chat (2026-11-04) holds up to BATCH_MAX items: ``ae.attention.1`` .. ``.N``, one
+# item id each, and ``ae.attention_batch`` is how many it was started on.
+ATTENTION_BATCH = "ae.attention_batch"
+BATCH_MAX = 20
 
 WORKING = "working"
 BLOCKED = "blocked"
@@ -142,7 +154,8 @@ TEXT_CAP = 200
 # kind are kept, since every label rides in each sidebar row: at most about 8 KB a
 # session. Past the cap the card shows what the loaded messages hold.
 NOTE_CAP = 20
-_NOTE_KEY = re.compile(r"^ae\.(?:absorbed|unfiled)\.\d+$")
+_NOTE_KEY = re.compile(r"^ae\.(?:absorbed|unfiled|attention)\.\d+$")
+_ATTENTION_KEY = re.compile(r"^ae\.attention\.(\d+)$")
 
 
 def label(labels: Mapping[str, str] | None, key: str) -> str | None:
@@ -219,3 +232,25 @@ def is_note_key(key: str) -> bool:
 def ae_labels_without_notes(labels: Mapping[str, str]) -> dict[str, str]:
     """The ``ae.*`` labels minus the saved notes, for answers that echo a session's labels."""
     return {k: v for k, v in labels.items() if k.startswith(NAMESPACE) and not is_note_key(k)}
+
+
+def attention_key(number: int) -> str:
+    """The label holding item *number* of a Review all chat, e.g. ``"ae.attention.3"``."""
+    return f"{ATTENTION}.{number}"
+
+
+def attention_ids(labels: Mapping[str, str] | None) -> list[str]:
+    """Every Needs you id a session's labels hold: the single ``ae.attention`` and the batch's."""
+    if not labels:
+        return []
+    out: list[str] = []
+    single = label(labels, ATTENTION)
+    if single:
+        out.append(single)
+    for key in labels:
+        match = _ATTENTION_KEY.match(key)
+        if match and 1 <= int(match.group(1)) <= BATCH_MAX:
+            value = label(labels, key)
+            if value:
+                out.append(value)
+    return out

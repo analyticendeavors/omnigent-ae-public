@@ -18,7 +18,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Literal
 from zoneinfo import ZoneInfo
 
@@ -59,6 +59,10 @@ _DOT_GIT = re.compile(r"\.git$", re.IGNORECASE)
 # Python's Unicode-aware ``\w``.
 _SLUG_PART = re.compile(r"^[A-Za-z0-9_.\-]+$")
 _WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
+# HH:MM on a 24-hour clock, the one shape ``create_task`` accepts for a time.
+TIME_ONLY = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+# The store's own estimate values, which ``create_task`` passes through untouched.
+_STORE_ESTIMATES = frozenset({"15", "30", "45", "60plus"})
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,65 @@ def estimate_for(est: str | None) -> Literal["15", "60plus"] | None:
     if not est or not est.strip():
         return None
     return "15" if _MINUTES.search(est) else "60plus"
+
+
+def normalize_task_tags(supplied: Iterable[str] | None) -> list[str]:
+    """The supplied tags lowercased, trimmed and deduped; ``parked`` is not added.
+
+    ``create_task`` rows are ordinary tasks, so unlike :func:`normalize_tags`
+    nothing is forced onto them.
+    """
+    out: list[str] = []
+    for raw in supplied or []:
+        tag = raw.strip().lower()
+        if tag and tag not in out:
+            out.append(tag)
+    return out
+
+
+def task_estimate(est: str | None) -> str | None:
+    """The store's estimate for ``create_task``: its own values pass, size words are mapped."""
+    raw = (est or "").strip()
+    if not raw:
+        return None
+    return raw if raw in _STORE_ESTIMATES else estimate_for(raw)
+
+
+def home_clock_instant(day: str, clock: str, tz: str) -> str:
+    """The UTC instant at which *tz*'s wall clock reads *day* *clock*, as ``...Z``.
+
+    The store keeps a "My clock" time as exactly this instant, and a timed task's
+    alarm is the same instant. ``zoneinfo`` with ``fold=0`` matches the worker on
+    both daylight-saving edges: an autumn time the fold repeats takes its first
+    occurrence, and a spring time the gap skips lands an hour later.
+
+    :param day: ``YYYY-MM-DD``, already checked with :func:`is_real_date`.
+    :param clock: ``HH:MM``, already checked against :data:`TIME_ONLY`.
+    :param tz: IANA zone name.
+    """
+    year, month, dom = (int(part) for part in day.split("-"))
+    hour, minute = (int(part) for part in clock.split(":"))
+    local = datetime(year, month, dom, hour, minute, tzinfo=ZoneInfo(tz))
+    return local.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def build_task_notes(notes: str | None, checklist: Iterable[str] | None = None) -> str:
+    """A plain task's note: an optional checklist first, then the caller's own text.
+
+    The checklist must be the leading run of ``- [ ]`` lines, so it goes first and
+    nothing is put above it. The text keeps its own line breaks.
+    """
+    out: list[str] = []
+    for item in checklist or []:
+        step = one_line(item)
+        if step:
+            out.append(f"- [ ] {step}")
+    text = (notes or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if text:
+        if out:
+            out.append("")
+        out.append(text)
+    return "\n".join(out)
 
 
 def one_line(value: str) -> str:

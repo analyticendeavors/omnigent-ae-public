@@ -179,6 +179,8 @@ class Box:
             "AE_AUTO_UPDATE_HOST_REBUILD": str(bin_dir / "rebuild-host"),
             "AE_AUTO_UPDATE_BUSY": str(bin_dir / "busy"),
             "AE_AUTO_UPDATE_DEPLOY_HOLD": str(bin_dir / "hold"),
+            # Tests run failing passes back to back; the backoff has its own tests.
+            "AE_AUTO_UPDATE_FAIL_BACKOFF": "0",
             "FAKE_CALLS": str(self.calls_log),
             "FAKE_CURL_PLAN": str(self.curl_plan),
         }
@@ -540,6 +542,87 @@ def test_a_failed_host_rebuild_is_retried_by_a_noop_pass(box: Box) -> None:
     box.calls_log.unlink()
     assert box.run().returncode == 0
     assert box.calls() == []
+
+
+def _last_failure(box: Box, *, ago: int, result: str = "pull-failed") -> str:
+    box.state.mkdir(parents=True, exist_ok=True)
+    when = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - ago))
+    line = f"{when} from=ae-v0.13.0.1 to=ae-v0.13.0.2 result={result} detail=x\n"
+    (box.state / "last").write_text(line)
+    return line
+
+
+def test_a_pass_soon_after_a_failure_backs_off_and_keeps_the_record(box: Box) -> None:
+    box.release("ae-v0.13.0.2")
+    line = _last_failure(box, ago=60)
+    result = box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="600")
+    assert result.returncode == 1, "the unit stays failed while it backs off"
+    assert "backing off" in result.stderr and "pull-failed" in result.stderr
+    assert box.last() == line, "the failure stays in last"
+    assert box.calls() == [], "nothing is fetched, pulled or deployed"
+    assert box.tag() == "ae-v0.13.0.1"
+    assert (box.state / "last-pass").exists(), "the heartbeat still beats"
+
+
+def test_a_pass_after_the_backoff_retries(box: Box) -> None:
+    box.release("ae-v0.13.0.2")
+    _last_failure(box, ago=601)
+    result = box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="600")
+    assert result.returncode == 0, result.stderr
+    assert box.tag() == "ae-v0.13.0.2"
+
+
+@pytest.mark.parametrize(
+    "result", ["refused", "busy", "git-failed", "pull-failed", "dump-failed", "host-failed"]
+)
+def test_every_repeating_failure_backs_off(box: Box, result: str) -> None:
+    box.release("ae-v0.13.0.2")
+    _last_failure(box, ago=30, result=result)
+    run = box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="600")
+    assert run.returncode == 1 and "backing off" in run.stderr
+    assert box.tag() == "ae-v0.13.0.1"
+
+
+# fetch-failed is usually a blip; after rolled-back or rollback-failed a hotfix
+# tag must deploy at once, so none of them hold the next pass back.
+@pytest.mark.parametrize(
+    "result",
+    ["noop", "waiting", "deferred", "ok", "fetch-failed", "rolled-back", "rollback-failed"],
+)
+def test_other_results_do_not_back_off(box: Box, result: str) -> None:
+    box.release("ae-v0.13.0.2")
+    _last_failure(box, ago=30, result=result)
+    assert box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="600").returncode == 0
+    assert box.tag() == "ae-v0.13.0.2"
+
+
+@pytest.mark.parametrize(
+    "record",
+    ["", "garbage\n", "not-a-time from=x to=y result=busy\n"],
+    ids=["empty", "one-word", "bad-time"],
+)
+def test_a_malformed_last_record_never_backs_off(box: Box, record: str) -> None:
+    box.release("ae-v0.13.0.2")
+    box.state.mkdir(parents=True, exist_ok=True)
+    (box.state / "last").write_text(record)
+    run = box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="600")
+    assert run.returncode == 0, run.stderr
+    assert box.tag() == "ae-v0.13.0.2"
+
+
+def test_a_failure_stamped_in_the_future_does_not_back_off(box: Box) -> None:
+    # The clock was stepped back after the failure was recorded.
+    box.release("ae-v0.13.0.2")
+    _last_failure(box, ago=-300, result="dump-failed")
+    assert box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="600").returncode == 0
+    assert box.tag() == "ae-v0.13.0.2"
+
+
+def test_a_zero_backoff_retries_at_once(box: Box) -> None:
+    box.release("ae-v0.13.0.2")
+    _last_failure(box, ago=10, result="dump-failed")
+    assert box.run(AE_AUTO_UPDATE_FAIL_BACKOFF="0").returncode == 0
+    assert box.tag() == "ae-v0.13.0.2"
 
 
 # ── waiting for quiet (2026-10-17) ─────────────────────────────────────────
@@ -1184,7 +1267,30 @@ def test_user_units_are_the_expected_set() -> None:
         "ae-omnigent-limits.timer",
         "ae-omnigent-secrets-meta.service",
         "ae-omnigent-secrets-meta.timer",
+        "ae-omnigent-social.service",
+        "ae-omnigent-social.timer",
+        "ae-tmp-litter-sweep.service",
+        "ae-tmp-litter-sweep.timer",
     ]
+
+
+def test_tmp_litter_sweep_units_run_only_the_sweep_every_six_hours() -> None:
+    # The /tmp leftover sweep (deploy/README.md "/tmp leftover sweep", 2026-11-05): the
+    # unit runs the one fixed --sweep mode and nothing else, as the user, never root.
+    s = _unit(USER_UNITS / "ae-tmp-litter-sweep.service")
+    assert s.get("Service", "Type") == "oneshot"
+    assert s.get("Service", "ExecStart") == (
+        "%h/.omnigent-host/venv/bin/python -m ae_omni_policies.box_cleanup --sweep"
+    )
+    assert s.get("Service", "EnvironmentFile") == "-%h/deploy/omnigent-ae/config/host.env"
+    assert not s.has_option("Service", "User"), "a user unit names no User="
+    assert not s.has_section("Install"), "the timer starts it"
+    path = USER_UNITS / "ae-tmp-litter-sweep.timer"
+    t = _unit(path)
+    assert t.get("Timer", "OnCalendar") == "00/6:15"
+    assert t.get("Timer", "Persistent") == "true"
+    assert t.get("Install", "WantedBy") == "timers.target"
+    assert "local time" in path.read_text()
 
 
 def test_limits_relay_units_run_the_module_every_five_minutes() -> None:
@@ -1249,6 +1355,27 @@ def test_secrets_meta_relay_units_run_the_module_daily() -> None:
     assert "local time" in path.read_text()
 
 
+def test_social_relay_units_run_the_module_every_two_hours() -> None:
+    # The Admin Center's Social card (deploy/README.md "Social card", 2026-11-06).
+    s = _unit(USER_UNITS / "ae-omnigent-social.service")
+    assert s.get("Service", "Type") == "oneshot"
+    assert s.get("Service", "ExecStart") == (
+        "%h/.omnigent-host/venv/bin/python -m ae_omni_policies.social_relay"
+    )
+    # node lives in ~/.local/node/bin, which a systemd user session does not have.
+    assert "%h/.local/node/bin" in s.get("Service", "Environment")
+    assert s.get("Service", "EnvironmentFile") == "-%h/deploy/omnigent-ae/config/host.env"
+    assert not s.has_option("Service", "User"), "a user unit names no User="
+    assert not s.has_section("Install"), "the timer starts it"
+    path = USER_UNITS / "ae-omnigent-social.timer"
+    t = _unit(path)
+    assert t.get("Timer", "OnCalendar") == "*-*-* 00/2:05:00"
+    assert t.get("Timer", "RandomizedDelaySec") == "5min"
+    assert t.get("Timer", "Persistent") == "true"
+    assert t.get("Install", "WantedBy") == "timers.target"
+    assert "local time" in path.read_text()
+
+
 def test_auto_update_service_is_a_user_oneshot_running_the_script() -> None:
     s = _unit(USER_UNITS / "ae-omnigent-auto-update.service")
     assert s.get("Unit", "Description")
@@ -1260,11 +1387,13 @@ def test_auto_update_service_is_a_user_oneshot_running_the_script() -> None:
     assert not s.has_section("Install"), "the timer starts it"
 
 
-def test_auto_update_timer_every_ten_minutes_with_jitter() -> None:
+def test_auto_update_timer_every_minute_off_the_minute() -> None:
     path = USER_UNITS / "ae-omnigent-auto-update.timer"
     t = _unit(path)
-    assert t.get("Timer", "OnCalendar") == "*:0/10"
-    assert 0 < int(t.get("Timer", "RandomizedDelaySec")) <= 120
+    assert t.get("Timer", "OnCalendar") == "*-*-* *:*:30"
+    # The systemd default AccuracySec (1min) would let one-minute passes merge.
+    assert t.get("Timer", "AccuracySec") == "5s"
+    assert not t.has_option("Timer", "RandomizedDelaySec")
     assert t.get("Install", "WantedBy") == "timers.target"
     assert "local time" in path.read_text(), "the schedule comment names the local time"
 

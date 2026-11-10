@@ -21,7 +21,7 @@ from urllib.parse import parse_qs
 import httpx
 import pytest
 
-from ae_omni_policies import azure_cost
+from ae_omni_policies import admin_cards, azure_cost, card_config
 
 SUB_A = "11111111-1111-4111-8111-111111111111"
 SUB_B = "22222222-2222-4222-8222-222222222222"
@@ -1267,3 +1267,86 @@ async def test_a_saved_limited_wait_with_a_gbp_reading_is_not_made_due_now(
     assert azure_cost._state["limited"] is True
     assert azure_cost._state["due"] == datetime(2026, 10, 21, 12, 15, tzinfo=UTC)
     assert not azure_cost._stale()
+
+
+# ── a subscription list saved in the Cards panel (2026-11-07) ────────────────────────────────
+
+
+def _panel_subs(monkeypatch: pytest.MonkeyPatch, subs: str) -> None:
+    """The list typed in the panel (the environment has none), then the card's cache dropped."""
+    monkeypatch.delenv("AE_AZURE_COST_SUBSCRIPTIONS", raising=False)
+    store = admin_cards.store()
+    store.set_settings(
+        "azure",
+        {"AE_AZURE_COST_SUBSCRIPTIONS": subs},
+        "owner@example.com",
+        store.snapshot()["revision"],
+    )
+    card_config.invalidate("azure")
+
+
+def _principal(monkeypatch: pytest.MonkeyPatch) -> None:
+    _configure(monkeypatch)
+    monkeypatch.delenv("AE_AZURE_COST_SUBSCRIPTIONS")
+
+
+async def test_a_saved_subscription_list_is_read_on_the_next_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _principal(monkeypatch)
+    calls: list[httpx.Request] = []
+    _mock(monkeypatch, _azure(calls))
+    _panel_subs(monkeypatch, f"{SUB_A}=Production")
+    await _read(monkeypatch)
+    snap = azure_cost.snapshot()
+    assert snap is not None and set(snap["readings"]) == {SUB_A}
+    assert azure_cost._stale() is False
+    _panel_subs(monkeypatch, f"{SUB_B}=Dev")
+    assert azure_cost._stale() is True
+    await _read(monkeypatch)
+    snap = azure_cost.snapshot()
+    assert snap is not None and set(snap["readings"]) == {SUB_B}
+
+
+async def test_a_reading_in_flight_for_the_old_list_is_discarded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    _principal(monkeypatch)
+    asked = asyncio.Event()
+    gate = asyncio.Event()
+    inner = _azure([])
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.host != "login.microsoftonline.com":
+            asked.set()
+            await gate.wait()
+        return inner(request)
+
+    _mock(monkeypatch, handler)  # type: ignore[arg-type]  # an async handler is accepted
+    _panel_subs(monkeypatch, f"{SUB_A}=Production")
+    await azure_cost.overview()
+    task = azure_cost.reading_task()
+    assert task is not None
+    await asked.wait()
+    _panel_subs(monkeypatch, f"{SUB_B}=Dev")  # saved mid-read
+    gate.set()
+    await task
+    assert azure_cost._state["view"] is None and azure_cost._stale() is True
+    await _read(monkeypatch)
+    snap = azure_cost.snapshot()
+    assert snap is not None and set(snap["readings"]) == {SUB_B}
+
+
+async def test_a_saved_rate_limit_wait_survives_a_settings_save(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _principal(monkeypatch)
+    _mock(monkeypatch, _azure([], subscription=_limited("120")))
+    _panel_subs(monkeypatch, f"{SUB_A}=Production")
+    await _read(monkeypatch)
+    assert azure_cost._state["limited"] is True
+    due = azure_cost._state["due"]
+    _panel_subs(monkeypatch, f"{SUB_B}=Dev")
+    assert azure_cost._state["due"] == due and azure_cost._stale() is False

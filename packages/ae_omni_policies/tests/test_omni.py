@@ -257,4 +257,6 @@ async def test_stdio_subprocess_on_the_sdk_default_env_reaches_the_server(
         result = await remote.call_tool("omni_capacity", {})
     assert result.content and isinstance(result.content[0], types.TextContent)
     assert json.loads(result.content[0].text) == {"cap": 3, "open": 1}
-    assert _Recorder.seen == [{"path": "/v1/ae/capacity", "auth": "Bearer tok-host"}]
+    # Listing tools also asks /v1/ae/decision whether to show the judge tools (2026-11-07).
+    seen = [hit for hit in _Recorder.seen if hit["path"] != "/v1/ae/decision"]
+    assert seen == [{"path": "/v1/ae/capacity", "auth": "Bearer tok-host"}]

@@ -70,16 +70,25 @@ REVIEW_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}-review\.[A-Za-z0-9]{6,}$")
 # The only top-level /tmp names tmp_litter may remove (2026-10-29, tightened to the shapes
 # the box really has: mktemp's six-character suffix, never a looser tail). The group is the
 # label the card already shows.
+#
+# Names are a heuristic, not proof. The backstop is that /tmp on the box is a RAM tmpfs wiped
+# at every boot, and systemd's tmp.conf (``q /tmp 1777 root root 10d``) already removes any
+# entry unread for 10 days regardless of name, so this sweep only shortens that to two days
+# for these shapes. Still, a pattern must never match a name a person would choose: the
+# six-character groups need a digit anywhere in the six, or a capital letter in positions 2 to
+# 6 (a capital in position 1 alone does not count, so media-Photos is kept), and tmp* needs a
+# digit (2026-11-05).
+_SUFFIX6 = r"(?=[A-Za-z0-9]{0,5}[0-9]|[A-Za-z0-9][A-Za-z0-9]{0,4}[A-Z])[A-Za-z0-9]{6}"
 LITTER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("sec-appr-*", re.compile(r"^sec-appr-[A-Za-z0-9]{6}$")),
-    ("sec-push-*", re.compile(r"^sec-push-(?:get-)?[A-Za-z0-9]{6}$")),
-    ("sec-*", re.compile(r"^sec-[A-Za-z0-9]{6}$")),
-    ("media-*", re.compile(r"^media-[A-Za-z0-9]{6}$")),
-    ("dfs-*", re.compile(r"^dfs-[A-Za-z0-9]{6}$")),
-    ("plex-*", re.compile(r"^plex-[A-Za-z0-9]{6}$")),
-    ("tmp*", re.compile(r"^tmp[a-z0-9_]{8}$")),
-    ("omnigent-codex-skills-*", re.compile(r"^omnigent-codex-skills-[A-Za-z0-9]{6}$")),
-    ("omnigent-osenv-*", re.compile(r"^omnigent-osenv-[A-Za-z0-9]{6}$")),
+    ("sec-appr-*", re.compile(rf"^sec-appr-{_SUFFIX6}$")),
+    ("sec-push-*", re.compile(rf"^sec-push-(?:get-)?{_SUFFIX6}$")),
+    ("sec-*", re.compile(rf"^sec-{_SUFFIX6}$")),
+    ("media-*", re.compile(rf"^media-{_SUFFIX6}$")),
+    ("dfs-*", re.compile(rf"^dfs-{_SUFFIX6}$")),
+    ("plex-*", re.compile(rf"^plex-{_SUFFIX6}$")),
+    ("tmp*", re.compile(r"^tmp(?=[a-z0-9_]{0,7}[0-9])[a-z0-9_]{8}$")),
+    ("omnigent-codex-skills-*", re.compile(rf"^omnigent-codex-skills-{_SUFFIX6}$")),
+    ("omnigent-osenv-*", re.compile(rf"^omnigent-osenv-{_SUFFIX6}$")),
     ("dotnet-diagnostic-*", re.compile(r"^dotnet-diagnostic-(?P<pid>[0-9]{1,10})-[0-9]+-socket$")),
     (
         "clr-debug-pipe-*",
@@ -170,6 +179,7 @@ class Outcome:
     removed: int = 0
     bytes_freed: int = 0
     skipped: Counter[str] = field(default_factory=Counter)
+    removed_groups: Counter[str] = field(default_factory=Counter)
     errors: list[str] = field(default_factory=list)
     partial: bool = False
 
@@ -352,10 +362,12 @@ def plan_claude_scratch(
     locks: frozenset[tuple[int, int, int]] = frozenset(),
     live: frozenset[str] | set[str] = frozenset(),
     targets: Sequence[str] = (),
+    group_max_entries: int = box_health_scan.GROUP_MAX_ENTRIES,
 ) -> Plan:
     """Session folders ``<root>/<project>/<session uuid>`` that are provably older than the
-    stale age and not in use. A walk that hits its cap leaves the folder alone (its age
-    cannot be proven)."""
+    stale age and not in use. Each session walks under its own share of *budget*
+    (*group_max_entries*): one past its share is left alone (its age cannot be proven) and
+    planning goes on with the next; only *budget* or *clock* running out ends planning."""
     plan = Plan()
     cutoff = now - stale_days * box_health_scan.DAY_S
     for root in roots:
@@ -380,10 +392,18 @@ def plan_claude_scratch(
                 if not _owned(pinfo, uid):
                     plan.skipped["foreign"] += 1
                     continue
-                _plan_sessions(
-                    plan, project.path, cutoff, uid, budget, clock, locks, live, targets
-                )
-                if plan.partial:
+                if _plan_sessions(
+                    plan,
+                    project.path,
+                    cutoff,
+                    uid,
+                    budget,
+                    clock,
+                    locks,
+                    live,
+                    targets,
+                    group_max_entries,
+                ):
                     return plan
     return plan
 
@@ -398,18 +418,21 @@ def _plan_sessions(
     locks: frozenset[tuple[int, int, int]],
     live: frozenset[str] | set[str],
     targets: Sequence[str],
-) -> None:
+    group_max_entries: int,
+) -> bool:
+    """Plan the sessions of one project. ``True`` when the whole plan must stop (the scan
+    budget or the item clock ran out); a session over its own share only sets ``partial``."""
     try:
         sessions = os.scandir(project_path)
     except OSError:
-        return
+        return False
     with sessions:
         for session in sessions:
             if not SESSION_RE.match(session.name):
                 continue
             if not clock.spend():
                 plan.partial = True
-                return
+                return True
             try:
                 info = session.stat(follow_symlinks=False)
             except OSError:
@@ -424,11 +447,16 @@ def _plan_sessions(
             if session.path in live or ident in locks:
                 plan.skipped["locked"] += 1
                 continue
-            proof = prove_tree(session.path, uid, budget=budget)
+            share = budget.child(group_max_entries)
+            proof = prove_tree(session.path, uid, budget=share)
             if budget.exhausted:
                 plan.skipped["unproven"] += 1
                 plan.partial = True
-                return
+                return True
+            if share.capped:
+                plan.skipped["unproven"] += 1
+                plan.partial = True
+                continue
             if reason := proof.reason(cutoff):
                 plan.skipped[reason] += 1
                 continue
@@ -447,6 +475,7 @@ def _plan_sessions(
                     newest=proof.newest,
                 )
             )
+    return False
 
 
 def plan_tmp_litter(
@@ -460,8 +489,9 @@ def plan_tmp_litter(
     alive: Callable[[int], bool] = pid_alive,
 ) -> Plan:
     """Top-level entries of *root* that match :data:`LITTER_PATTERNS`, owned by *uid* and
-    older than the stale age. A folder is never opened (its mtime is its own); a debug
-    socket or pipe whose process is still alive is kept."""
+    older than the stale age. A folder's own mtime is not trusted: ``prove_tree`` walks the
+    whole tree and keeps it when any file is newer; a debug socket or pipe whose process is
+    still alive is kept."""
     plan = Plan()
     cutoff = now - stale_days * box_health_scan.DAY_S
     if not check_root(root):
@@ -652,7 +682,9 @@ class Remover:
         *,
         status: GitStatus | None = None,
         proc: str = "/proc",
+        walk_entries: int = WALK_ENTRIES,
     ) -> None:
+        self._walk_entries = max(WALK_ENTRIES, walk_entries)
         self._roots = tuple(r.rstrip("/") for r in roots)
         self._uid = uid
         self._clock = clock or Clock()
@@ -688,11 +720,28 @@ class Remover:
             if info.st_mtime >= candidate.cutoff:
                 outcome.skipped["recent"] += 1
                 return False
+            # Checked again by name against the parent's descriptor, then unlinked through it.
+            # This narrows the window to a same-user rename between the check and the call;
+            # other users cannot rename an entry in sticky /tmp.
+            parent_fd = -1
             try:
-                os.unlink(path)
+                parent_fd = os.open(
+                    os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+                )
+                now_info = os.stat(os.path.basename(path), dir_fd=parent_fd, follow_symlinks=False)
+                if (now_info.st_dev, now_info.st_ino) != (candidate.dev, candidate.ino):
+                    outcome.skipped["changed"] += 1
+                    return False
+                os.unlink(os.path.basename(path), dir_fd=parent_fd)
+            except FileNotFoundError:
+                outcome.skipped["changed"] += 1
+                return False
             except OSError as exc:
                 outcome.error(exc)
                 return False
+            finally:
+                if parent_fd >= 0:
+                    os.close(parent_fd)
             return True
         fd = -1
         try:
@@ -710,9 +759,13 @@ class Remover:
                 return False
             # The tree is proven old again now, under the lock: a file written since the
             # scan (a nested edit does not move a folder's own mtime) keeps it.
-            if reason := prove_tree(path, self._uid, top_git=candidate.top_git).reason(
-                candidate.cutoff
-            ):
+            proof = prove_tree(
+                path,
+                self._uid,
+                top_git=candidate.top_git,
+                budget=box_health_scan.Budget(self._walk_entries, WALK_SECONDS),
+            )
+            if reason := proof.reason(candidate.cutoff):
                 outcome.skipped[reason] += 1
                 return False
             # Live use and, for a review checkout, the git checks are repeated now too: a
@@ -724,7 +777,25 @@ class Remover:
                 outcome.skipped["changes"] += 1
                 return False
             failures: list[OSError] = []
-            shutil.rmtree(path, onexc=lambda _fn, _p, exc: failures.append(exc))  # type: ignore[arg-type]
+            # Removed by name against the parent's descriptor opened without following links,
+            # after a check that the name still points at the folder held open. This narrows
+            # the window to a same-user rename between the check and the call; other users
+            # cannot rename an entry in sticky /tmp.
+            parent_fd = os.open(
+                os.path.dirname(path), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            )
+            try:
+                same = os.stat(os.path.basename(path), dir_fd=parent_fd, follow_symlinks=False)
+                if (same.st_dev, same.st_ino) != (held.st_dev, held.st_ino):
+                    outcome.skipped["changed"] += 1
+                    return False
+                shutil.rmtree(
+                    os.path.basename(path),
+                    dir_fd=parent_fd,
+                    onexc=lambda _fn, _p, exc: failures.append(exc),  # type: ignore[arg-type]
+                )
+            finally:
+                os.close(parent_fd)
             for exc in failures:
                 if isinstance(exc, OSError):
                     outcome.error(exc)
@@ -748,6 +819,8 @@ def run_plan(plan: Plan, remover: Remover, clock: Clock | None = None) -> Outcom
         if remover.remove(candidate, outcome):
             outcome.removed += 1
             outcome.bytes_freed += candidate.bytes
+            if candidate.group:
+                outcome.removed_groups[candidate.group] += 1
     return outcome
 
 
@@ -818,6 +891,7 @@ def host_run(
     locks_path: str = "/proc/locks",
     expected: int | None = None,
     remove_seconds: float = MAX_SECONDS,
+    group_max_entries: int = box_health_scan.GROUP_MAX_ENTRIES,
 ) -> Outcome:
     """One host-side action, start to finish.
 
@@ -847,6 +921,7 @@ def host_run(
             locks=box_health_scan.read_locks(locks_path),
             live=live,
             targets=targets,
+            group_max_entries=group_max_entries,
         )
     elif action == "tmp_litter":
         plan = plan_tmp_litter(
@@ -868,6 +943,7 @@ def host_run(
         uid,
         status=git_status if action == "review_checkouts" else None,
         proc=proc,
+        walk_entries=group_max_entries,
     )
     return run_plan(plan, remover, Clock(MAX_ITEMS, remove_seconds))
 
@@ -883,6 +959,7 @@ def dry_run_counts(
     uid: int | None = None,
     proc: str = "/proc",
     locks_path: str = "/proc/locks",
+    group_max_entries: int = box_health_scan.GROUP_MAX_ENTRIES,
 ) -> dict[str, dict[str, object]]:
     """What each host action would remove, as counts only. Deletes nothing."""
     uid = os.getuid() if uid is None else uid
@@ -898,6 +975,7 @@ def dry_run_counts(
         locks=box_health_scan.read_locks(locks_path),
         live=box_health_scan.live_session_dirs(roots, uid, proc),
         targets=targets,
+        group_max_entries=group_max_entries,
     )
     litter = plan_tmp_litter(
         tmp,
@@ -933,17 +1011,84 @@ def dry_run_counts(
     return out
 
 
+def sweep(
+    *,
+    tmp: str = "/tmp",
+    stale_days: float = 2,
+    now: float | None = None,
+    max_entries: int = MAX_ITEMS,
+    max_seconds: float = MAX_SECONDS,
+) -> Outcome:
+    """The unattended sweep: ``tmp_litter`` only (the action is a literal, never an argument),
+    with the age floored at two days. *tmp* is a keyword so tests run on a temp folder.
+
+    :raises Refused: When the preflight checks fail, or *tmp* is missing or not a real folder.
+    """
+    if not check_root(tmp):
+        raise Refused(
+            "the temp folder is missing or not a real folder (a link, or not an absolute "
+            "path); check that /tmp exists and is a plain directory"
+        )
+    return host_run(
+        "tmp_litter",
+        roots=[],
+        tmp=tmp,
+        now=time.time() if now is None else now,
+        stale_days=max(2.0, stale_days),
+        max_entries=max_entries,
+        max_seconds=max_seconds,
+        expected=None,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m ae_omni_policies.box_cleanup",
-        description="Print what the box cleanups would remove now. Deletes nothing; counts only.",
+        description=(
+            "--dry-run prints what the box cleanups would remove now (counts only, deletes "
+            "nothing). --sweep removes the old test leftovers at the top of /tmp, as the "
+            "ae-tmp-litter-sweep timer does."
+        ),
     )
-    parser.add_argument("--dry-run", action="store_true", required=True)
-    parser.add_argument("--stale-days", type=float, default=2)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--sweep", action="store_true")
+    parser.add_argument(
+        "--stale-days",
+        type=float,
+        default=2,
+        help="age in days; --sweep never uses less than 2",
+    )
     args = parser.parse_args(argv)
     from ae_omni_policies import box_health_relay
 
     settings = box_health_relay.settings_from_env()
+    if args.sweep:
+        try:
+            outcome = sweep(
+                stale_days=args.stale_days,
+                max_entries=settings.max_entries,
+                max_seconds=settings.max_seconds,
+            )
+        except Refused as exc:
+            sys.stderr.write(
+                f"box_cleanup --sweep refused: {exc} (deploy/README.md, /tmp leftover sweep)\n"
+            )
+            return 2
+        errors = Counter(outcome.errors)
+        json.dump(
+            {
+                "removed": outcome.removed,
+                "bytes_freed": outcome.bytes_freed,
+                "partial": outcome.partial,
+                "skipped": dict(outcome.skipped),
+                "groups": dict(outcome.removed_groups),
+                "errors": dict(errors),
+            },
+            sys.stdout,
+        )
+        sys.stdout.write("\n")
+        return 1 if outcome.errors and outcome.removed == 0 else 0
     home = str(Path.home())
     uid = os.getuid()
     roots = [
@@ -956,6 +1101,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         stale_days=args.stale_days,
         max_entries=settings.max_entries,
         max_seconds=settings.max_seconds,
+        group_max_entries=settings.group_max_entries,
     )
     json.dump(counts, sys.stdout, indent=2)
     sys.stdout.write("\n")
@@ -982,6 +1128,7 @@ __all__ = [
     "preflight",
     "prune_docker",
     "run_plan",
+    "sweep",
 ]
 
 if __name__ == "__main__":

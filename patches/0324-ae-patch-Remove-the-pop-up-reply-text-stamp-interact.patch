@@ -1,0 +1,498 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 23:31:22 -0800
+Subject: [PATCH 324/333] [ae-patch] Remove the pop-up reply text stamp;
+ interactive Claude writes the text after PreToolUse
+
+---
+ .../harnesses/claude_native/ae_reply_text.py  | 139 ---------
+ omnigent/native/native_policy_hook.py         |  44 ---
+ .../claude_native/test_ae_reply_text.py       | 271 ------------------
+ 3 files changed, 454 deletions(-)
+ delete mode 100644 omnigent/harnesses/claude_native/ae_reply_text.py
+ delete mode 100644 tests/harnesses/claude_native/test_ae_reply_text.py
+
+diff --git a/omnigent/harnesses/claude_native/ae_reply_text.py b/omnigent/harnesses/claude_native/ae_reply_text.py
+deleted file mode 100644
+index 37e2e4b386e78193dca28b74d4e7adb419a46e79..0000000000000000000000000000000000000000
+--- a/omnigent/harnesses/claude_native/ae_reply_text.py
++++ /dev/null
+@@ -1,139 +0,0 @@
+-"""Whether a native Claude turn wrote visible reply text before a pop-up.
+-
+-On 2026-11-09 a native chat raised an AskUserQuestion card ("Apply the proposed
+-copy from the assistant's message?") in a turn that wrote no text block at all: only a
+-redacted thinking block, a one-line summary and the tool call. The user saw the
+-card and nothing it referred to. The policy hook calls
+-:func:`reply_text_since_last_prompt` for a pop-up tool call and stamps the answer
+-on the call's arguments, where ``ae_omni_policies.popup_text`` reads it.
+-"""
+-
+-from __future__ import annotations
+-
+-import json
+-from collections.abc import Iterator
+-from pathlib import Path
+-from typing import BinaryIO
+-
+-#: Bytes read per step while walking the transcript backward.
+-_CHUNK_BYTES = 1024 * 1024
+-
+-#: Most of the transcript's tail the walk may read; past it the answer is unknown.
+-_MAX_BYTES = 16 * 1024 * 1024
+-
+-#: Pop-up tools the flag is computed for.
+-POPUP_TOOLS = frozenset({"AskUserQuestion", "mcp__ae__ask_user"})
+-
+-#: Key stamped on the tool call's ``arguments`` for the policy to read.
+-FLAG_KEY = "ae_reply_text_before"
+-
+-
+-class _TooLarge(Exception):
+-    """The walk reached the read cap before it found a boundary."""
+-
+-
+-def _reverse_lines(handle: BinaryIO, size: int) -> Iterator[bytes]:
+-    """Yield the file's lines newest first, reading backward in chunks.
+-
+-    Splits on ``\\n`` only: JSON writes U+2028, U+2029 and U+0085 raw, and
+-    ``splitlines`` would cut a valid line there.
+-
+-    :raises _TooLarge: When more than the read cap is needed.
+-    """
+-    pos = size
+-    buf = b""
+-    while pos > 0:
+-        if size - pos >= _MAX_BYTES:
+-            raise _TooLarge
+-        step = min(_CHUNK_BYTES, pos)
+-        pos -= step
+-        handle.seek(pos)
+-        buf = handle.read(step) + buf
+-        parts = buf.split(b"\n")
+-        buf = parts[0]
+-        yield from reversed(parts[1:])
+-    yield buf
+-
+-
+-def _blocks(message: object) -> list[object]:
+-    """A message's content as blocks; a plain string becomes one text block."""
+-    if not isinstance(message, dict):
+-        return []
+-    content = message.get("content")
+-    if isinstance(content, str):
+-        return [{"type": "text", "text": content}]
+-    return content if isinstance(content, list) else []
+-
+-
+-def _is_human_prompt(message: object) -> bool:
+-    """A user message that is a typed prompt: a string, or text blocks and no tool_result."""
+-    blocks = _blocks(message)
+-    if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks):
+-        return False
+-    return any(isinstance(b, dict) and b.get("type") == "text" for b in blocks)
+-
+-
+-def _walk(lines: Iterator[bytes], tool_use_id: str | None) -> bool | None:
+-    """Walk newest to oldest; True on reply text, False on a boundary, None when neither."""
+-    newest_assistant = True
+-    for raw in lines:
+-        if not raw.strip():
+-            continue
+-        try:
+-            entry = json.loads(raw.decode("utf-8", errors="replace"))
+-        except ValueError:
+-            continue  # a garbage line, or the cut-off first line of the file
+-        if not isinstance(entry, dict):
+-            continue
+-        if entry.get("isSidechain") or entry.get("isMeta") or entry.get("isCompactSummary"):
+-            continue
+-        kind = entry.get("type")
+-        if kind == "assistant":
+-            first = newest_assistant
+-            newest_assistant = False
+-            for block in reversed(_blocks(entry.get("message"))):
+-                if not isinstance(block, dict):
+-                    continue
+-                if block.get("type") == "text":
+-                    text = block.get("text")
+-                    if isinstance(text, str) and text.strip():
+-                        return True
+-                elif block.get("type") == "tool_use" and block.get("name") in POPUP_TOOLS:
+-                    # The pop-up being checked may already be on disk: skip it.
+-                    if tool_use_id is not None:
+-                        if block.get("id") == tool_use_id:
+-                            continue
+-                    elif first:
+-                        continue
+-                    return False  # an earlier, already answered pop-up
+-        elif kind == "user" and _is_human_prompt(entry.get("message")):
+-            return False
+-    return None
+-
+-
+-def reply_text_since_last_prompt(
+-    transcript_path: str, tool_use_id: str | None = None
+-) -> bool | None:
+-    """Report whether the assistant wrote reply text since the user's last prompt.
+-
+-    The walk also stops at an earlier pop-up, which the user already answered.
+-
+-    :param transcript_path: Claude's JSONL transcript, e.g.
+-        ``"~/.claude/projects/-x/abc.jsonl"`` (from the hook payload).
+-    :param tool_use_id: The id of the pop-up call being checked, e.g.
+-        ``"toolu_01abc"``; its own tool_use block is not a boundary. When absent,
+-        pop-up blocks in the newest assistant message are skipped instead.
+-    :returns: ``True`` when a visible text block follows the last boundary,
+-        ``False`` when none does, ``None`` when the file cannot be read, holds no
+-        boundary within the 16 MiB read cap, or anything else goes wrong (unknown,
+-        so no policy should act on it).
+-    """
+-    try:
+-        path = Path(transcript_path)
+-        size = path.stat().st_size
+-        with path.open("rb") as handle:
+-            return _walk(_reverse_lines(handle, size), tool_use_id)
+-    except _TooLarge:
+-        return None
+-    except Exception:  # noqa: BLE001 (a broken guard must never block a pop-up)
+-        return None
+diff --git a/omnigent/native/native_policy_hook.py b/omnigent/native/native_policy_hook.py
+index d7cff0bed83def9117022428dc64e4c3d9e096a6..43e0320515ca1fd4f931fda396ae49dde7aa3487 100644
+--- a/omnigent/native/native_policy_hook.py
++++ b/omnigent/native/native_policy_hook.py
+@@ -284,49 +284,6 @@ def _is_login_redirect_or_unauthorized(response: httpx.Response) -> bool:
+     return "/oidc/" in location or "/.auth/" in location
+ 
+ 
+-#: Seconds to wait before re-reading a transcript that said "no reply text".
+-_REPLY_TEXT_RETRY_S = 0.3
+-
+-
+-def _with_reply_text_flag(
+-    tool_name: object, tool_input: object, payload: dict[str, object]
+-) -> object:
+-    """
+-    Stamp whether reply text came before a pop-up tool call (AE patch).
+-
+-    The evaluation context and ``data`` are rebuilt server-side from only
+-    ``name`` and ``arguments``, so the flag rides on a copy of ``arguments``
+-    (the hook's verdict never rewrites the tool's real input). Any flag the
+-    model supplied itself is dropped first, so only the transcript decides.
+-    A "no text" answer is read once more after a short wait, in case the
+-    transcript flush lands just after PreToolUse.
+-    """
+-    from omnigent.harnesses.claude_native.ae_reply_text import (
+-        FLAG_KEY,
+-        POPUP_TOOLS,
+-        reply_text_since_last_prompt,
+-    )
+-
+-    if not (isinstance(tool_name, str) and tool_name in POPUP_TOOLS):
+-        return tool_input
+-    if not isinstance(tool_input, dict):
+-        return tool_input
+-    clean = {k: v for k, v in tool_input.items() if k != FLAG_KEY}
+-    path = payload.get("transcript_path")
+-    if not isinstance(path, str):
+-        return clean
+-    raw_id = payload.get("tool_use_id")
+-    use_id = raw_id if isinstance(raw_id, str) and raw_id else None
+-    try:
+-        flag = reply_text_since_last_prompt(path, use_id)
+-        if flag is False:
+-            time.sleep(_REPLY_TEXT_RETRY_S)
+-            flag = reply_text_since_last_prompt(path, use_id)
+-    except Exception:  # noqa: BLE001 (a broken guard must never block a pop-up)
+-        return clean
+-    return clean if flag is None else {**clean, FLAG_KEY: flag}
+-
+-
+ def hook_payload_to_evaluation_request(
+     hook_event: str,
+     payload: dict[str, object],
+@@ -377,7 +334,6 @@ def hook_payload_to_evaluation_request(
+         return None
+     tool_input = payload.get("tool_input") or {}
+     if hook_event == _PRE_TOOL_USE:
+-        tool_input = _with_reply_text_flag(tool_name, tool_input, payload)
+         return {
+             "event": {
+                 "type": "PHASE_TOOL_CALL",
+diff --git a/tests/harnesses/claude_native/test_ae_reply_text.py b/tests/harnesses/claude_native/test_ae_reply_text.py
+deleted file mode 100644
+index 5518f11c3d22fb516908824e31c34e58c244e012..0000000000000000000000000000000000000000
+--- a/tests/harnesses/claude_native/test_ae_reply_text.py
++++ /dev/null
+@@ -1,271 +0,0 @@
+-"""Tests for the reply-text check behind the pop-up guard (AE patch)."""
+-
+-from __future__ import annotations
+-
+-import json
+-from pathlib import Path
+-
+-import pytest
+-
+-from omnigent.harnesses.claude_native import ae_reply_text
+-from omnigent.harnesses.claude_native.ae_reply_text import reply_text_since_last_prompt
+-from omnigent.native import native_policy_hook
+-from omnigent.native.native_policy_hook import hook_payload_to_evaluation_request
+-
+-
+-def _write(path: Path, entries: list[object]) -> str:
+-    path.write_text("\n".join(e if isinstance(e, str) else json.dumps(e) for e in entries) + "\n")
+-    return str(path)
+-
+-
+-def _human(text: str = "go") -> dict:
+-    return {"type": "user", "message": {"role": "user", "content": text}}
+-
+-
+-def _assistant(*blocks: dict) -> dict:
+-    return {"type": "assistant", "message": {"role": "assistant", "content": list(blocks)}}
+-
+-
+-_THINK = {"type": "thinking", "thinking": ""}
+-_TEXT = {"type": "text", "text": "Here is my proposal."}
+-_TOOL = {"type": "tool_use", "id": "t1", "name": "AskUserQuestion", "input": {}}
+-_BASH = {"type": "tool_use", "id": "b1", "name": "Bash", "input": {}}
+-_RESULT = {"type": "user", "message": {"content": [{"type": "tool_result", "content": "ok"}]}}
+-
+-
+-def test_thinking_and_tool_use_only_is_false(tmp_path: Path) -> None:
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_THINK), _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is False
+-
+-
+-def test_text_then_tool_use_is_true(tmp_path: Path) -> None:
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_TEXT), _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is True
+-
+-
+-def test_tool_results_do_not_end_the_walk(tmp_path: Path) -> None:
+-    p = _write(
+-        tmp_path / "t.jsonl",
+-        [_human(), _assistant(_TEXT), _assistant(_BASH), _RESULT, _assistant(_TOOL)],
+-    )
+-    assert reply_text_since_last_prompt(p) is True
+-
+-
+-def test_text_before_last_human_prompt_is_false(tmp_path: Path) -> None:
+-    p = _write(
+-        tmp_path / "t.jsonl", [_human(), _assistant(_TEXT), _human("next"), _assistant(_TOOL)]
+-    )
+-    assert reply_text_since_last_prompt(p) is False
+-
+-
+-def test_text_block_human_prompt_counts(tmp_path: Path) -> None:
+-    prompt = {"type": "user", "message": {"content": [{"type": "text", "text": "hi"}]}}
+-    p = _write(tmp_path / "t.jsonl", [_assistant(_TEXT), prompt, _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is False
+-
+-
+-def test_whitespace_text_is_not_visible(tmp_path: Path) -> None:
+-    blank = {"type": "text", "text": "  \n"}
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(blank), _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is False
+-
+-
+-def test_missing_file_and_no_prompt_are_unknown(tmp_path: Path) -> None:
+-    assert reply_text_since_last_prompt(str(tmp_path / "nope.jsonl")) is None
+-    p = _write(tmp_path / "t.jsonl", ["garbage", _assistant(_THINK)])
+-    assert reply_text_since_last_prompt(p) is None
+-
+-
+-def test_garbage_lines_are_ignored(tmp_path: Path) -> None:
+-    p = _write(
+-        tmp_path / "t.jsonl", [_human(), _assistant(_TEXT), "{not json", "[1]", _assistant(_TOOL)]
+-    )
+-    assert reply_text_since_last_prompt(p) is True
+-
+-
+-def test_meta_and_sidechain_lines_are_ignored(tmp_path: Path) -> None:
+-    side = {**_assistant(_TEXT), "isSidechain": True}
+-    meta_human = {**_human("meta"), "isMeta": True}
+-    summary = {**_assistant(_TEXT), "isCompactSummary": True}
+-    p = _write(tmp_path / "t.jsonl", [_human(), side, summary, _assistant(_TOOL), meta_human])
+-    assert reply_text_since_last_prompt(p) is False
+-
+-
+-def _popup(tool_id: str, name: str = "AskUserQuestion") -> dict:
+-    return _assistant({"type": "tool_use", "id": tool_id, "name": name, "input": {}})
+-
+-
+-def test_raw_line_separators_do_not_cut_a_line(tmp_path: Path) -> None:
+-    text = {"type": "text", "text": "one\u2028two\u2029three\u0085four"}
+-    p = tmp_path / "t.jsonl"
+-    lines = [
+-        json.dumps(e, ensure_ascii=False) for e in (_human(), _assistant(text), _assistant(_TOOL))
+-    ]
+-    p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+-    assert "\u2028" in lines[1]
+-    assert reply_text_since_last_prompt(str(p)) is True
+-
+-
+-def test_user_line_with_tool_result_and_text_is_not_a_prompt(tmp_path: Path) -> None:
+-    mixed = {
+-        "type": "user",
+-        "message": {
+-            "content": [{"type": "tool_result", "content": "ok"}, {"type": "text", "text": "x"}]
+-        },
+-    }
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_TEXT), mixed, _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is True
+-
+-
+-def test_assistant_string_content_counts_as_text(tmp_path: Path) -> None:
+-    string_reply = {
+-        "type": "assistant",
+-        "message": {"role": "assistant", "content": "Plain reply."},
+-    }
+-    p = _write(tmp_path / "t.jsonl", [_human(), string_reply, _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is True
+-
+-
+-def test_an_earlier_popup_is_a_boundary(tmp_path: Path) -> None:
+-    p = _write(
+-        tmp_path / "t.jsonl",
+-        [_human(), _assistant(_TEXT), _popup("a"), _RESULT, _popup("b")],
+-    )
+-    assert reply_text_since_last_prompt(p, "b") is False
+-    assert reply_text_since_last_prompt(p) is False
+-
+-
+-def test_new_text_after_an_earlier_popup_counts(tmp_path: Path) -> None:
+-    p = _write(
+-        tmp_path / "t.jsonl",
+-        [_human(), _assistant(_TEXT), _popup("a"), _RESULT, _assistant(_TEXT), _popup("b")],
+-    )
+-    assert reply_text_since_last_prompt(p, "b") is True
+-    assert reply_text_since_last_prompt(p) is True
+-
+-
+-def test_the_current_popup_already_on_disk_is_skipped(tmp_path: Path) -> None:
+-    both = _assistant(
+-        _TEXT, {"type": "tool_use", "id": "cur", "name": "AskUserQuestion", "input": {}}
+-    )
+-    p = _write(tmp_path / "t.jsonl", [_human(), both])
+-    assert reply_text_since_last_prompt(p, "cur") is True
+-    assert reply_text_since_last_prompt(p) is True
+-    # With the id known, a different pop-up in the same message is a boundary.
+-    assert reply_text_since_last_prompt(p, "other") is False
+-
+-
+-def _big_result(size: int) -> dict:
+-    return {
+-        "type": "user",
+-        "message": {"content": [{"type": "tool_result", "content": "x" * size}]},
+-    }
+-
+-
+-def test_a_large_tool_result_between_prompt_and_popup(tmp_path: Path) -> None:
+-    big = 3 * 1024 * 1024
+-    p = _write(tmp_path / "t.jsonl", [_human(), _big_result(big), _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is False
+-    q = _write(
+-        tmp_path / "u.jsonl", [_human(), _assistant(_TEXT), _big_result(big), _assistant(_TOOL)]
+-    )
+-    assert reply_text_since_last_prompt(q) is True
+-
+-
+-def test_past_the_read_cap_is_unknown(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+-    monkeypatch.setattr(ae_reply_text, "_MAX_BYTES", 2 * 1024 * 1024)
+-    p = _write(tmp_path / "t.jsonl", [_human(), _big_result(3 * 1024 * 1024), _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) is None
+-
+-
+-def test_a_deeply_nested_line_never_raises(tmp_path: Path) -> None:
+-    deep = "[" * 100000 + "]" * 100000
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_TEXT), deep, _assistant(_TOOL)])
+-    assert reply_text_since_last_prompt(p) in (True, None)
+-
+-
+-def test_a_failed_read_is_dropped_not_raised(
+-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+-) -> None:
+-    def boom(*_a: object, **_k: object) -> bool:
+-        raise RuntimeError("broken")
+-
+-    monkeypatch.setattr(ae_reply_text, "reply_text_since_last_prompt", boom)
+-    out = native_policy_hook._with_reply_text_flag(
+-        "AskUserQuestion", {"q": 1, "ae_reply_text_before": True}, {"transcript_path": "x"}
+-    )
+-    assert out == {"q": 1}
+-
+-
+-def test_a_model_supplied_flag_is_dropped(tmp_path: Path) -> None:
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_THINK)])
+-    forged = hook_payload_to_evaluation_request(
+-        "PreToolUse",
+-        {
+-            "tool_name": "AskUserQuestion",
+-            "tool_input": {"ae_reply_text_before": True},
+-            "transcript_path": p,
+-        },
+-    )
+-    assert forged is not None
+-    assert forged["event"]["data"]["arguments"] == {"ae_reply_text_before": False}
+-    unreadable = hook_payload_to_evaluation_request(
+-        "PreToolUse",
+-        {
+-            "tool_name": "AskUserQuestion",
+-            "tool_input": {"ae_reply_text_before": True},
+-            "transcript_path": str(tmp_path / "missing.jsonl"),
+-        },
+-    )
+-    assert unreadable is not None
+-    assert unreadable["event"]["data"]["arguments"] == {}
+-
+-
+-def test_ask_user_tool_is_stamped(tmp_path: Path) -> None:
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_TEXT)])
+-    result = hook_payload_to_evaluation_request(
+-        "PreToolUse",
+-        {"tool_name": "mcp__ae__ask_user", "tool_input": {"q": 1}, "transcript_path": p},
+-    )
+-    assert result is not None
+-    assert result["event"]["data"]["arguments"] == {"q": 1, "ae_reply_text_before": True}
+-
+-
+-def test_a_late_flush_is_read_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+-    p = tmp_path / "t.jsonl"
+-    _write(p, [_human(), _assistant(_THINK)])
+-    slept: list[float] = []
+-
+-    def late_flush(seconds: float) -> None:
+-        slept.append(seconds)
+-        _write(p, [_human(), _assistant(_TEXT)])
+-
+-    monkeypatch.setattr(native_policy_hook.time, "sleep", late_flush)
+-    out = native_policy_hook._with_reply_text_flag(
+-        "AskUserQuestion", {}, {"transcript_path": str(p)}
+-    )
+-    assert slept == [native_policy_hook._REPLY_TEXT_RETRY_S]
+-    assert out == {"ae_reply_text_before": True}
+-
+-
+-def test_hook_payload_stamps_flag_for_popup_tools_only(tmp_path: Path) -> None:
+-    p = _write(tmp_path / "t.jsonl", [_human(), _assistant(_THINK)])
+-    popup = hook_payload_to_evaluation_request(
+-        "PreToolUse",
+-        {"tool_name": "AskUserQuestion", "tool_input": {"questions": []}, "transcript_path": p},
+-    )
+-    assert popup is not None
+-    assert popup["event"]["data"]["arguments"] == {
+-        "questions": [],
+-        "ae_reply_text_before": False,
+-    }
+-    other = hook_payload_to_evaluation_request(
+-        "PreToolUse", {"tool_name": "Bash", "tool_input": {"command": "ls"}, "transcript_path": p}
+-    )
+-    assert other is not None
+-    assert other["event"]["data"]["arguments"] == {"command": "ls"}
+-    unknown = hook_payload_to_evaluation_request(
+-        "PreToolUse", {"tool_name": "AskUserQuestion", "tool_input": {}}
+-    )
+-    assert unknown is not None
+-    assert unknown["event"]["data"]["arguments"] == {}

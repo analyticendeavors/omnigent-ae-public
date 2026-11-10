@@ -8,7 +8,9 @@
 #
 # It reruns only for a lost box, never for an ordinary test failure:
 #   (a) the watchdog job's step "Cancel: box jobs never started" ran, or
-#   (b) a failed box-eligible job carries a lost-runner annotation.
+#   (b) a failed box-eligible job carries a lost-runner annotation, or
+#   (c) in a run that concluded failure, a box job concluded failure with only
+#       "The operation was canceled." (its runner was stopped cleanly mid-job).
 # And only while the run's commit is still current (a newer push supersedes it).
 #
 # The job-level `if:` keeps this free while routing is off: no job starts, so
@@ -47,6 +49,7 @@ jobs:
           REPO: ${{ github.repository }}
           RUN_ID: ${{ github.event.workflow_run.id }}
           RUN_EVENT: ${{ github.event.workflow_run.event }}
+          RUN_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
@@ -69,10 +72,19 @@ jobs:
           fi
 
           # (b) A failed box-eligible job whose annotations show a lost runner.
+          # (c) A box runner stopped cleanly mid-job (systemctl stop, a reboot or a shutdown):
+          # GitHub then records only "The operation was canceled." on a job that concludes
+          # failure (2026-11-07 drill 4). Only in a run that concluded failure: a manual
+          # cancel concludes the run cancelled. A job past its time limit also says
+          # "exceeded the maximum execution time" and is not rerun. A stopped runner leaves its
+          # running step cancelled, so a job with a failed step (a test that failed before the
+          # stop) is a real red and is not rerun either. The same line also marks
+          # a runner-side network timeout on the box; one rerun on GitHub suits that too.
           if [ -z "$reason" ]; then
-            urls="$(jq -r --argjson names "$names" '.[] | select(.name as $n | $names | index($n)) | select(.conclusion == "failure" or .conclusion == "cancelled") | .check_run_url' <<<"$jobs_json")"
-            for url in $urls; do
-              if ! notes="$(gh api --paginate "${url#https://api.github.com/}/annotations" --jq '.[].message')"; then
+            rows="$(jq -r --argjson names "$names" '.[] | select(.name as $n | $names | index($n)) | select(.conclusion == "failure" or .conclusion == "cancelled") | "\(.check_run_url) \(.conclusion) \(any(.steps[]?; .conclusion == "failure")) \(.runner_name // "-")"' <<<"$jobs_json")"
+            while read -r url conclusion failed_step runner; do
+              [ -n "$url" ] || continue
+              if ! notes="$(gh api --paginate "${url#https://api.github.com/}/annotations" --jq '.[].message' </dev/null)"; then
                 say "Warning: could not read the annotations of ${url##*/}; treating it as an ordinary failure."
                 notes=""
               fi
@@ -80,7 +92,14 @@ jobs:
                 reason="a box job lost its runner (${url##*/})"
                 break
               fi
-            done
+              if [ "$RUN_CONCLUSION" = "failure" ] && [ "$conclusion" = "failure" ] && [ "$failed_step" = "false" ] \
+                && [[ "$runner" == ae-box-* ]] \
+                && grep -qiF 'The operation was canceled.' <<<"$notes" \
+                && ! grep -qiF 'exceeded the maximum execution time' <<<"$notes"; then
+                reason="box runner ${runner} stopped mid-job (${url##*/})"
+                break
+              fi
+            done <<<"$rows"
           fi
 
           if [ -z "$reason" ]; then

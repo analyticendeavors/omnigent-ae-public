@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Deploy the newest ae-v* image tag on the box by itself, with a health check
-# and a rollback. Run every ten minutes by the user timer
+# and a rollback. Run every minute by the user timer
 # deploy/systemd/user/ae-omnigent-auto-update.timer, as the deploy user, no sudo.
 # Added 2026-09-24 so that pushing a tag is the whole release: before this,
 # every release ended with a sudo line typed on the box, which a three-week
@@ -86,8 +86,9 @@ GIT_TRIES="${AE_AUTO_UPDATE_GIT_TRIES:-5}"
 GIT_RETRY_DELAY="${AE_AUTO_UPDATE_GIT_RETRY_DELAY:-2}"
 BUSY_CMD="${AE_AUTO_UPDATE_BUSY:-}"
 MAX_DEFER="${AE_AUTO_UPDATE_MAX_DEFER:-7200}"
-# Three timer periods: a longer silence between two passes is a pause. A value
-# that is not a whole number, or is under two timer periods (1200), would make
+# Half an hour of silence between two passes is a pause (three timer periods
+# when the timer ran every ten minutes; thirty since it runs every minute,
+# 2026-11-09). A value that is not a whole number, or is under 1200, would make
 # an ordinary slow pass look like a pause, so it falls back to 1800.
 PAUSE_GAP="${AE_AUTO_UPDATE_PAUSE_GAP:-1800}"
 if ! [[ "$PAUSE_GAP" =~ ^[0-9]+$ ]] || [ "$PAUSE_GAP" -lt 1200 ]; then
@@ -173,7 +174,7 @@ db_may_migrate() {
 mkdir -p "$STATE_DIR"
 
 # One pass at a time: a slow pull or a long migration can outlast the timer's
-# ten minutes, and two passes editing server.env at once would race.
+# minute, and two passes editing server.env at once would race.
 exec 9>"$STATE_DIR/lock"
 if ! flock -n 9; then
   note "another auto-update pass is running; skipping this one"
@@ -190,9 +191,38 @@ PASS_GAP=0
 [[ "$PREV_PASS" =~ ^[0-9]+$ ]] && PASS_GAP=$((PASS_START - PREV_PASS))
 printf '%s\n' "$PASS_START" >"$STATE_DIR/last-pass.tmp" && mv "$STATE_DIR/last-pass.tmp" "$STATE_DIR/last-pass"
 
+# Failure backoff, added 2026-11-09 with the one-minute timer: after a pass
+# that failed in a way that repeats until someone acts (refused, busy,
+# git-failed, pull-failed, dump-failed, host-failed), the passes in the next
+# FAIL_BACKOFF seconds stop here, after the heartbeat, so a stuck failure
+# retries its pg_dump, pull or host build and logs about as often as on the
+# ten-minute timer. Left out on purpose: fetch-failed (usually a blip),
+# rolled-back (the next pass skips that tag through $STATE_DIR/failed, and a
+# hotfix tag should deploy within a minute) and rollback-failed (the server
+# is down; any newer tag should go out at once). They exit 1 without a new record: `last`
+# keeps the failure and the unit stays failed. AE_AUTO_UPDATE_FAIL_BACKOFF=0
+# retries at once (a hand run after fixing the cause).
+FAIL_BACKOFF="${AE_AUTO_UPDATE_FAIL_BACKOFF:-600}"
+[[ "$FAIL_BACKOFF" =~ ^[0-9]+$ ]] || FAIL_BACKOFF=600
+LAST_TIME="" LAST_RESULT=""
+if [ "$FAIL_BACKOFF" -gt 0 ] && [ -r "$STATE_DIR/last" ]; then
+  read -r LAST_TIME _ _ LAST_RESULT _ <"$STATE_DIR/last" || true
+  case "${LAST_RESULT#result=}" in
+    refused | busy | git-failed | pull-failed | dump-failed | host-failed)
+      LAST_EPOCH="$(date -u -d "$LAST_TIME" +%s 2>/dev/null || echo 0)"
+      # A clock stepped back past the failure (a negative age) is no reason to wait.
+      if [ $((PASS_START - LAST_EPOCH)) -ge 0 ] && [ $((PASS_START - LAST_EPOCH)) -lt "$FAIL_BACKOFF" ]; then
+        printf 'AUTO-UPDATE backing off: the pass at %s ended %s; the next try is %ss after it (AE_AUTO_UPDATE_FAIL_BACKOFF=0 retries now)\n' \
+          "$LAST_TIME" "${LAST_RESULT#result=}" "$FAIL_BACKOFF" >&2
+        exit 1
+      fi
+      ;;
+  esac
+fi
+
 # status RESULT [DETAIL]: the one-line record. noop, waiting, skipped, held,
 # deferred and on-hold go to `last` only, so the log keeps the deploys and
-# the failures, not 144 lines a day.
+# the failures, not 1440 lines a day.
 status() {
   local line detail="${2:-}"
   line="$(date -u +%Y-%m-%dT%H:%M:%SZ) from=${FROM:-none} to=${TO:-none} result=$1"

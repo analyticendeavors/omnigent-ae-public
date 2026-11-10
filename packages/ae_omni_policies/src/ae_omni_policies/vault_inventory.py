@@ -33,7 +33,7 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ae_omni_policies import secret_alerts, secret_owners, secrets_meta
 
@@ -79,6 +79,8 @@ class VaultSecret(BaseModel):
     box_key: str | None
     """The env key the box pulls this secret into, when it does."""
     both_vaults: bool
+    apart: bool = Field(default=False, exclude=True)
+    """The two copies were changed more than a day apart; for the Needs you list, not the card."""
     rotate_url: str | None = None
     """The issuer's rotate page; ``None`` when it is the vault's own, which the page
     builds itself. Rows leave out ``edit_url`` and the default hint for the same reason:
@@ -124,6 +126,9 @@ class VaultView(BaseModel):
     needs_you: list[Need]
     """The first :data:`NEEDS_YOU_SHOWN`, worst first."""
     needs_you_total: int
+    uncapped: list[Need] = Field(default_factory=list, exclude=True)
+    """Every need before the cut to :data:`NEEDS_YOU_SHOWN`, for the Needs you list (2026-11-06).
+    Not part of the card's answer: ``exclude`` keeps it out of ``model_dump``."""
     groups: list[VaultGroup]
     secrets: list[VaultSecret]
 
@@ -207,6 +212,7 @@ def _rows(
             on_box=on_box,
             box_key=_BOX_KEY.get(name) if on_box else None,
             both_vaults=twin is not None,
+            apart=twin is not None and _apart(meta, twin),
             rotate_url=None if own_page else rotate_url,
             rotate_hint=None if own_page else rotate_hint,
             owner=owners.get(key),
@@ -274,6 +280,7 @@ def _view(
         counts=counts,
         needs_you=needs[:NEEDS_YOU_SHOWN],
         needs_you_total=len(needs),
+        uncapped=list(needs),
         groups=[
             VaultGroup(
                 id=group,

@@ -1,0 +1,153 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 17:16:58 -0800
+Subject: [PATCH 312/333] [ae-patch] Fix the review findings on the fast
+ session switch patch
+
+Tracing now starts before the first boot request: initBrowserTelemetry returns a promise
+that main.tsx awaits, and a failed start warns and resolves instead of leaving an
+unhandled rejection. The telemetry test counts loads of the on-demand module.
+---
+ web/src/lib/telemetry.test.ts | 59 +++++++++++++++++++++++++++++++----
+ web/src/lib/telemetry.ts      | 15 ++++++---
+ web/src/main.tsx              |  2 +-
+ 3 files changed, 65 insertions(+), 11 deletions(-)
+
+diff --git a/web/src/lib/telemetry.test.ts b/web/src/lib/telemetry.test.ts
+index 6d06dc1f2fcd5ba92cace74954b7ae9c199ff4b6..e9b61501fbdc592f0ae4ac622d43dd81cf9bba5e 100644
+--- a/web/src/lib/telemetry.test.ts
++++ b/web/src/lib/telemetry.test.ts
+@@ -1,4 +1,5 @@
+ import { afterEach, describe, expect, it, vi } from "vitest";
++import type { startBrowserTelemetry as StartFn } from "./telemetryOtel";
+ 
+ // Mock the OpenTelemetry SDK so the test is deterministic and free of
+ // zone.js / network side effects. `vi.hoisted` builds the spies before the
+@@ -19,6 +20,22 @@ const m = vi.hoisted(() => {
+     OTLPTraceExporter: vi.fn(),
+     ZoneContextManager: vi.fn(),
+     resourceFromAttributes: vi.fn(() => ({})),
++    otelModuleLoads: vi.fn(),
++    startFails: false,
++  };
++});
++
++// Counts how often the on-demand module is evaluated.
++vi.mock("./telemetryOtel", async () => {
++  m.otelModuleLoads();
++  const actual = await vi.importActual<{ startBrowserTelemetry: typeof StartFn }>(
++    "./telemetryOtel",
++  );
++  return {
++    startBrowserTelemetry: (endpoint: string, serviceName: string) => {
++      if (m.startFails) throw new Error("start boom");
++      actual.startBrowserTelemetry(endpoint, serviceName);
++    },
+   };
+ });
+ 
+@@ -51,6 +68,7 @@ vi.mock("@opentelemetry/semantic-conventions", () => ({
+ afterEach(() => {
+   vi.unstubAllEnvs();
+   vi.clearAllMocks();
++  m.startFails = false;
+   vi.resetModules();
+ });
+ 
+@@ -74,16 +92,45 @@ describe("initBrowserTelemetry", () => {
+     expect(m.registerInstrumentations).not.toHaveBeenCalled();
+   });
+ 
+-  it("does not load the OpenTelemetry module when no endpoint is configured", async () => {
++  it("loads the OpenTelemetry module only when an endpoint is set", async () => {
+     vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "");
++    const off = await import("./telemetry");
++    await off.initBrowserTelemetry();
++    await flushImports();
++    // zone.js loads with the SDK, so the module must stay unloaded.
++    expect(m.otelModuleLoads).not.toHaveBeenCalled();
++
++    vi.resetModules();
++    vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
++    const on = await import("./telemetry");
++    await on.initBrowserTelemetry();
++    expect(m.otelModuleLoads).toHaveBeenCalledTimes(1);
++  });
++
++  it("resolves only after instrumentation is registered", async () => {
++    vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
+     const { initBrowserTelemetry } = await import("./telemetry");
+ 
+-    initBrowserTelemetry();
+-    await flushImports();
++    await initBrowserTelemetry();
+ 
+-    // zone.js loads with the SDK, so the module must stay unloaded.
+-    expect(m.ZoneContextManager).not.toHaveBeenCalled();
+-    expect(m.OTLPTraceExporter).not.toHaveBeenCalled();
++    expect(m.registerInstrumentations).toHaveBeenCalledTimes(1);
++  });
++
++  it("warns, resets and resolves when tracing fails to start", async () => {
++    vi.stubEnv("VITE_OTEL_EXPORTER_OTLP_ENDPOINT", "http://localhost:4318");
++    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
++    m.startFails = true;
++    const { initBrowserTelemetry } = await import("./telemetry");
++
++    await expect(initBrowserTelemetry()).resolves.toBeUndefined();
++    expect(warn).toHaveBeenCalledTimes(1);
++    expect(String(warn.mock.calls[0][0])).toContain("failed to start");
++
++    // `initialized` was reset, so a later call tries again.
++    m.startFails = false;
++    await initBrowserTelemetry();
++    expect(m.registerInstrumentations).toHaveBeenCalledTimes(1);
++    warn.mockRestore();
+   });
+ 
+   it("registers a provider + fetch/XHR instrumentation when an endpoint is set", async () => {
+diff --git a/web/src/lib/telemetry.ts b/web/src/lib/telemetry.ts
+index d605585ce48a0fef5fa6d0409432d999496debd0..5beb19d5ef64a21f08b86a6820ecbbd4428e4c9c 100644
+--- a/web/src/lib/telemetry.ts
++++ b/web/src/lib/telemetry.ts
+@@ -18,10 +18,11 @@ let initialized = false;
+  * Initialize browser tracing if a collector endpoint is configured.
+  *
+  * Idempotent and safe to call once at app startup. No-op when
+- * `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is unset. The SDK loads on demand, so with
+- * tracing on, requests made before the import resolves are not traced.
++ * `VITE_OTEL_EXPORTER_OTLP_ENDPOINT` is unset. The SDK loads on demand, so the
++ * promise resolves once instrumentation is registered; await it before the first
++ * request. It never rejects: a failed start warns and boot goes on untraced.
+  */
+-export function initBrowserTelemetry(): void {
++export async function initBrowserTelemetry(): Promise<void> {
+   if (initialized) return;
+ 
+   const endpoint = import.meta.env.VITE_OTEL_EXPORTER_OTLP_ENDPOINT?.trim();
+@@ -29,5 +30,11 @@ export function initBrowserTelemetry(): void {
+   initialized = true;
+ 
+   const serviceName = import.meta.env.VITE_OTEL_SERVICE_NAME?.trim() || "omni-web";
+-  void import("./telemetryOtel").then((mod) => mod.startBrowserTelemetry(endpoint, serviceName));
++  try {
++    const mod = await import("./telemetryOtel");
++    mod.startBrowserTelemetry(endpoint, serviceName);
++  } catch (error) {
++    initialized = false;
++    console.warn("Browser tracing failed to start; continuing without it.", error);
++  }
+ }
+diff --git a/web/src/main.tsx b/web/src/main.tsx
+index c0cf2068155fd0515859a23e2728c0d10ef4ebb6..6972b31fc83c538f873d14d5f7f14600f7ba8b11 100644
+--- a/web/src/main.tsx
++++ b/web/src/main.tsx
+@@ -38,7 +38,7 @@ import "./index.css";
+ // Start tracing before any request fires so fetch/XHR are patched in time
+ // and a trace begins in the browser. No-op unless a collector endpoint is
+ // configured (VITE_OTEL_EXPORTER_OTLP_ENDPOINT).
+-initBrowserTelemetry();
++await initBrowserTelemetry();
+ 
+ // Single client at module scope — shared across the whole app.
+ //
