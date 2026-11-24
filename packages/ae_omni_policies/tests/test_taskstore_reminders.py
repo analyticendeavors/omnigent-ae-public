@@ -72,6 +72,7 @@ def test_task_helpers() -> None:
     assert notes.task_estimate("about an hour") == "60plus"
     assert notes.task_estimate("5 minutes") == "15"
     assert notes.task_estimate(" ") is None
+    assert notes.task_estimate("whenever") is None
     assert notes.build_task_notes("Read the log.", ["Open it", "  "]) == (
         "- [ ] Open it\n\nRead the log."
     )
@@ -121,14 +122,17 @@ async def test_date_only_is_all_day_with_no_alarm() -> None:
         post = mock.post("/api/tasks").respond(201, json=_task())
         async with TaskStoreClient(SETTINGS) as client:
             out = await client.create_reminder(
-                ReminderFields(title="Check scan", due_date="2026-11-09"), now=NOW
+                ReminderFields(
+                    quadrant="neither", est="15", title="Check scan", due_date="2026-11-09"
+                ),
+                now=NOW,
             )
     body = json.loads(post.calls[0].request.content)
     assert body["due_at"] == "2026-11-09T00:00:00Z"
     assert body["due_is_all_day"] == 1
     assert body["reminder_at"] is None
     assert body["bucket_id"] is None
-    assert "estimate" not in body and "urgent" not in body
+    assert body["estimate"] == "15" and (body["urgent"], body["important"]) == (0, 0)
     assert out["reminder"] == "none: no time was given"
 
 
@@ -159,10 +163,11 @@ async def test_unknown_or_ambiguous_list_comes_back_with_the_real_names() -> Non
         post = mock.post("/api/tasks").respond(201, json=_task())
         async with TaskStoreClient(SETTINGS) as client:
             missing = await client.create_reminder(
-                ReminderFields(title="x", list_name="Nope"), now=NOW
+                ReminderFields(quadrant="neither", est="15", title="x", list_name="Nope"), now=NOW
             )
             twice = await client.create_reminder(
-                ReminderFields(title="x", list_name="AE Work"), now=NOW
+                ReminderFields(quadrant="neither", est="15", title="x", list_name="AE Work"),
+                now=NOW,
             )
     assert missing["outcome"] == "not_created"
     assert missing["lists"] == ["AE Work", "AE WORK", "Home"]
@@ -176,7 +181,14 @@ async def test_a_time_already_past_warns_but_still_files() -> None:
         mock.post("/api/tasks").respond(201, json=_task())
         async with TaskStoreClient(SETTINGS) as client:
             out = await client.create_reminder(
-                ReminderFields(title="x", due_date="2026-11-03", due_time="01:00"), now=NOW
+                ReminderFields(
+                    quadrant="neither",
+                    est="15",
+                    title="x",
+                    due_date="2026-11-03",
+                    due_time="01:00",
+                ),
+                now=NOW,
             )
     assert out["outcome"] == "created"
     assert out["warnings"] and "already passed" in out["warnings"][0]
@@ -191,7 +203,13 @@ async def test_a_timed_out_create_is_reread_and_never_resent() -> None:
         )
         async with TaskStoreClient(SETTINGS) as client:
             out = await client.create_reminder(
-                ReminderFields(title="Check scan", due_date="2026-11-09", due_time="10:00"),
+                ReminderFields(
+                    quadrant="neither",
+                    est="15",
+                    title="Check scan",
+                    due_date="2026-11-09",
+                    due_time="10:00",
+                ),
                 now=NOW,
             )
     assert post.call_count == 1
@@ -207,7 +225,13 @@ async def test_a_5xx_create_that_landed_is_found_and_not_resent() -> None:
         mock.get("/api/tasks", params={"status": "open"}).respond(200, json={"tasks": [landed]})
         async with TaskStoreClient(SETTINGS) as client:
             out = await client.create_reminder(
-                ReminderFields(title="Check scan", due_date="2026-11-09", due_time="10:00"),
+                ReminderFields(
+                    quadrant="neither",
+                    est="15",
+                    title="Check scan",
+                    due_date="2026-11-09",
+                    due_time="10:00",
+                ),
                 now=NOW,
             )
     assert post.call_count == 1
@@ -220,7 +244,9 @@ async def test_a_5xx_create_that_did_not_land_is_reported_not_resent() -> None:
         post = mock.post("/api/tasks").respond(502, json={"error": "bad gateway"})
         mock.get("/api/tasks", params={"status": "open"}).respond(200, json={"tasks": []})
         async with TaskStoreClient(SETTINGS) as client:
-            out = await client.create_reminder(ReminderFields(title="Check scan"), now=NOW)
+            out = await client.create_reminder(
+                ReminderFields(quadrant="neither", est="15", title="Check scan"), now=NOW
+            )
     assert post.call_count == 1
     assert out["outcome"] == "not_created"
     assert "add by hand" in out["instruction"]
@@ -237,7 +263,10 @@ async def test_the_reread_ignores_an_older_or_other_list_look_alike() -> None:
         )
         async with TaskStoreClient(SETTINGS) as client:
             out = await client.create_reminder(
-                ReminderFields(title="Check scan", list_name="AE Work"), now=NOW
+                ReminderFields(
+                    quadrant="neither", est="15", title="Check scan", list_name="AE Work"
+                ),
+                now=NOW,
             )
     assert post.call_count == 1
     assert out["outcome"] == "not_created"
@@ -247,7 +276,9 @@ async def test_a_failed_create_tells_the_agent_to_hand_it_to_the_user() -> None:
     with respx.mock(base_url=BASE) as mock:
         mock.post("/api/tasks").respond(400, json={"error": "bad due_at"})
         async with TaskStoreClient(SETTINGS) as client:
-            out = await client.create_reminder(ReminderFields(title="x"), now=NOW)
+            out = await client.create_reminder(
+                ReminderFields(quadrant="neither", est="15", title="x"), now=NOW
+            )
     assert out["outcome"] == "not_created"
     assert "add by hand" in out["instruction"]
 
@@ -321,3 +352,41 @@ async def test_cancel_reports_a_missing_task_and_a_failed_patch() -> None:
     }
     assert stale["outcome"] == "not_cancelled"
     assert "stale" in stale["reason"]
+
+
+async def test_quadrant_and_est_are_required_and_est_must_map() -> None:
+    cases = [
+        (ReminderFields(title="x", est="15"), "quadrant is required: one of hotfix, "),
+        (ReminderFields(title="x", quadrant="admin"), "est is required: "),
+        (
+            ReminderFields(title="x", quadrant="admin", est="whenever"),
+            'est "whenever" maps to no estimate. Use 15, 30, 45 or 60plus',
+        ),
+    ]
+    with respx.mock(base_url=BASE) as mock:
+        async with TaskStoreClient(SETTINGS) as client:
+            for fields, reason in cases:
+                out = await client.create_reminder(fields, now=NOW)
+                assert out["outcome"] == "not_created", fields
+                assert reason in out["reason"], (fields, out["reason"])
+        assert mock.calls.call_count == 0
+
+
+async def test_neither_maps_to_urgent_0_important_0() -> None:
+    assert notes.TASK_QUADRANT_AXES["neither"] == {"urgent": 0, "important": 0}
+    assert "neither" not in notes.QUADRANT_AXES  # park_fork keeps three values
+    for quadrant, axes in [("hotfix", (1, 1)), ("feature", (0, 1)), ("admin", (1, 0))]:
+        assert (
+            notes.TASK_QUADRANT_AXES[quadrant]["urgent"],
+            notes.TASK_QUADRANT_AXES[quadrant]["important"],
+        ) == axes
+    with respx.mock(base_url=BASE) as mock:
+        post = mock.post("/api/tasks").respond(201, json=_task())
+        async with TaskStoreClient(SETTINGS) as client:
+            out = await client.create_reminder(
+                ReminderFields(title="x", quadrant="neither", est="about an hour"), now=NOW
+            )
+    body = json.loads(post.calls[0].request.content)
+    assert (body["urgent"], body["important"]) == (0, 0)
+    assert body["estimate"] == "60plus"
+    assert out["outcome"] == "created"

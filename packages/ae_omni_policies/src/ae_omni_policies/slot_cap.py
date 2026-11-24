@@ -331,7 +331,8 @@ def slot_cap(
                 # Only on a session that has a status, so a first prompt cannot use
                 # the words to take a slot unseen (review, 2026-10-21).
                 return {"result": "ALLOW"}
-            rows = sessions.list_top_level()
+            # A side chat whose source was archived or deleted holds no slot (2026-11-17).
+            rows = sessions.drop_orphan_side_chats(sessions.list_top_level())
         except STORE_ERRORS:
             _logger.warning(
                 "slot_cap could not read the store; allowing the prompt", exc_info=True

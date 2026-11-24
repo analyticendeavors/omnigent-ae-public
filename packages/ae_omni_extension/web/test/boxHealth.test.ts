@@ -413,12 +413,12 @@ describe("who sees what", () => {
     await flush();
     expect(document.querySelectorAll("[data-card]")).toHaveLength(1);
     expect(document.querySelector("[data-card]")?.getAttribute("data-card")).toBe("box");
-    // The pill strip shows only the Box pill, from the one tile the page has.
-    expect(document.querySelectorAll("[data-pill]")).toHaveLength(1);
-    expect(document.querySelector("[data-pill]")?.getAttribute("data-pill")).toBe("box");
+    // No tabs and no rail: the table, and the Box health card beside it.
+    expect(document.querySelector('[role="tablist"]')?.hasAttribute("hidden")).toBe(true);
+    expect(document.querySelector(".rail-block")).toBeNull();
     expect(new Set(paths())).toEqual(new Set(["/v1/ae/access", "/v1/ae/box-health", "/v1/ae/attention"]));
     expect(document.querySelector("#needs-you")).not.toBeNull();
-    expect(document.querySelector(".admin-grip")).not.toBeNull();
+    expect(document.querySelector(".admin-grip")).toBeNull();
     expect(document.querySelector(".admin-board")?.hasAttribute("data-single")).toBe(true);
     expect(document.querySelector(".admin-reset")).toBeNull();
     expect(document.querySelector(".host-list")).toBeNull();
@@ -509,7 +509,7 @@ describe("who sees what", () => {
     expect(document.querySelectorAll("[data-card]").length).toBeGreaterThan(5);
     const body = document.querySelector('[data-card="box"] .admin-card-body')!;
     expect(body.firstElementChild?.className).toContain("admin-boxhealth");
-    expect(document.querySelector('[data-pill="box"]')).not.toBeNull();
+    expect(document.querySelector('.rail-block[data-area="box"]')).not.toBeNull();
   });
 
   it("draws the page as before when /v1/ae/access cannot be read, even on a second try", async () => {

@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:20:49 -0800
+Subject: [PATCH 398/443] [ae-patch] Give family children the 250000 compact
+ window: decide child with the family rule (ae.orch label), not only
+ parent_session_id
+
+---
+ omnigent/inner/ae_roles.py                    | 24 +++++--
+ omnigent/runner/ae_child_compact_window.py    | 15 +++--
+ omnigent/runner/native/orchestration.py       | 10 ++-
+ tests/runner/test_ae_child_compact_window.py  | 50 +++++++++++---
+ .../test_app_claude_native_launch_args.py     | 67 +++++++++++++++++--
+ 5 files changed, 138 insertions(+), 28 deletions(-)
+
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index 00d503022c8c6c3bd31ab13cffed6c4bdae68a29..81b5500192137d2181b360ab4b2988c1efe3f973 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -301,21 +301,33 @@ def _agent_lookup(store: ConversationStore) -> Callable[[str], str | None]:
+     return lookup
+ 
+ 
+-def _is_child(conv: Conversation) -> bool:
++def is_family_child(labels: object, parent_session_id: object = None) -> bool:
+     """True for a session with a parent or an ``ae.orch`` label holding a session id.
+ 
+     A fork (``omnigent.fork.source_id``, no parent) copies its source's labels
+-    but is a top-level session, so it is never a child.
++    but is a top-level session, so it is never a child. ``ae.orch`` of ``"1"``
++    marks a standalone handoff chat or an unknown orchestrator, which leads its
++    own family. The family view and the child auto-compact window both decide
++    with this one rule.
++
++    :param labels: The session's labels, e.g. ``{"ae.orch": "conv_lead"}``; any
++        non-dict reads as no labels.
++    :param parent_session_id: The session's parent id, or ``None``.
+     """
+-    if getattr(conv, "parent_conversation_id", None):
++    if parent_session_id:
+         return True
+-    labels = conv.labels if isinstance(conv.labels, dict) else {}
+-    if labels.get(FORK_SOURCE_LABEL):
++    label_map = labels if isinstance(labels, dict) else {}
++    if label_map.get(FORK_SOURCE_LABEL):
+         return False
+-    orch = labels.get(ORCH_LABEL)
++    orch = label_map.get(ORCH_LABEL)
+     return isinstance(orch, str) and orch.strip() not in ("", "1")
+ 
+ 
++def _is_child(conv: Conversation) -> bool:
++    """True when *conv* is a family child (see :func:`is_family_child`)."""
++    return is_family_child(conv.labels, getattr(conv, "parent_conversation_id", None))
++
++
+ def with_roles(
+     notice: dict[str, object] | None, conv: Conversation, store: ConversationStore
+ ) -> dict[str, object]:
+diff --git a/omnigent/runner/ae_child_compact_window.py b/omnigent/runner/ae_child_compact_window.py
+index eed3206399679ce4b3bbc9b611c2f5628b13cbab..e06665699c118c03334798235a8f836be0b2b986 100644
+--- a/omnigent/runner/ae_child_compact_window.py
++++ b/omnigent/runner/ae_child_compact_window.py
+@@ -1,8 +1,9 @@
+ """Give a child Claude session a smaller auto-compact window than its parent.
+ 
+ Parent and standalone sessions use the user's ``autoCompactWindow`` setting in
+-Claude Code's settings. A child session (one with a parent session, made by
+-another session in a family) gets :data:`CHILD_AUTO_COMPACT_WINDOW` through
++Claude Code's settings. A child session (made by another session in a family; decided by
++:func:`omnigent.inner.ae_roles.is_family_child`, the rule the family view uses)
++gets :data:`CHILD_AUTO_COMPACT_WINDOW` through
+ ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` so it compacts earlier. The variable
+ outranks the setting, so a parent never gets it.
+ """
+@@ -19,21 +20,21 @@ CHILD_AUTO_COMPACT_WINDOW = "250000"
+ def apply_child_auto_compact_window(
+     env: MutableMapping[str, str],
+     *,
+-    parent_session_id: str | None,
++    is_family_child: bool,
+     inherited_env: Mapping[str, str],
+ ) -> None:
+     """
+     Set the child auto-compact window in a launch env, in place.
+ 
+-    Does nothing for a session without a parent, and never replaces a value the
++    Does nothing for a lead or standalone session, and never replaces a value the
+     launch env or the runner env it inherits already carries.
+ 
+     :param env: The Claude pane's launch env overrides, changed in place.
+-    :param parent_session_id: The session's parent, e.g. ``"conv_abc123"``, or
+-        ``None`` for a parent or standalone session.
++    :param is_family_child: Whether the session is a family child, from a parent
++        session id or an ``ae.orch`` label (see ``ae_roles.is_family_child``).
+     :param inherited_env: The runner environment the pane inherits.
+     """
+-    if not parent_session_id:
++    if not is_family_child:
+         return
+     if AUTO_COMPACT_WINDOW_ENV in env or AUTO_COMPACT_WINDOW_ENV in inherited_env:
+         return
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 689ff7c04f38fc46d1ed809b80470795e6d3cf17..ddbbae9bb1d559e8126224e6389de09138f85159 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -8084,6 +8084,10 @@ class _ClaudeSessionLaunchMetadata:
+     #: The session's parent (``parent_session_id``), set for a family child; read from
+     #: the init envelope or, when launch carries none, the fetched snapshot (AE patch).
+     parent_session_id: str | None = None
++    #: The session is a family child: a parent id, or an ``ae.orch`` label naming its
++    #: lead (family children made by ``create_session`` set no parent id). Same rule as
++    #: the family view, ``ae_roles.is_family_child``.
++    is_family_child: bool = False
+ 
+ 
+ def _claude_launch_metadata_from_envelope(
+@@ -8091,6 +8095,7 @@ def _claude_launch_metadata_from_envelope(
+ ) -> _ClaudeSessionLaunchMetadata:
+     """Project Claude launch metadata without server callbacks."""
+     from omnigent.harnesses.claude_native.ae_launch_account import ACCOUNT_LIVE_LABEL
++    from omnigent.inner.ae_roles import is_family_child
+     from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.runner.subagent_routing import routing_class_from_snapshot
+     from omnigent.stores.conversation_store import (
+@@ -8120,6 +8125,7 @@ def _claude_launch_metadata_from_envelope(
+         claude_account=snapshot.labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
+         live_claude_account=snapshot.labels.get(ACCOUNT_LIVE_LABEL),
+         parent_session_id=snapshot.parent_session_id or None,
++        is_family_child=is_family_child(snapshot.labels, snapshot.parent_session_id),
+     )
+ 
+ 
+@@ -8129,6 +8135,7 @@ async def _load_legacy_claude_launch_metadata(
+ ) -> _ClaudeSessionLaunchMetadata:
+     """Fetch Claude launch metadata for servers predating the init envelope."""
+     from omnigent.harnesses.claude_native.ae_launch_account import ACCOUNT_LIVE_LABEL
++    from omnigent.inner.ae_roles import is_family_child
+     from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
+     from omnigent.runner.subagent_routing import routing_class_from_snapshot
+     from omnigent.stores.conversation_store import (
+@@ -8192,6 +8199,7 @@ async def _load_legacy_claude_launch_metadata(
+         claude_account=labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
+         live_claude_account=labels.get(ACCOUNT_LIVE_LABEL),
+         parent_session_id=parent_session_id if isinstance(parent_session_id, str) else None,
++        is_family_child=is_family_child(labels, parent_session_id),
+     )
+     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
+     _logger.info(
+@@ -9063,7 +9071,7 @@ async def _auto_create_claude_terminal(
+ 
+     apply_child_auto_compact_window(
+         claude_terminal_env,
+-        parent_session_id=launch_metadata.parent_session_id,
++        is_family_child=launch_metadata.is_family_child,
+         inherited_env=os.environ,
+     )
+     # Name the account before the first render, so usage readers do not wait for the shim.
+diff --git a/tests/runner/test_ae_child_compact_window.py b/tests/runner/test_ae_child_compact_window.py
+index 773004af8ecb7b1177dc5111dd669dc255000ea1..0212b0ff2ae1b436b626c9a75092f31cb116b3e2 100644
+--- a/tests/runner/test_ae_child_compact_window.py
++++ b/tests/runner/test_ae_child_compact_window.py
+@@ -2,6 +2,9 @@
+ 
+ from __future__ import annotations
+ 
++import pytest
++
++from omnigent.inner.ae_roles import is_family_child
+ from omnigent.runner.ae_child_compact_window import (
+     AUTO_COMPACT_WINDOW_ENV,
+     CHILD_AUTO_COMPACT_WINDOW,
+@@ -11,23 +14,54 @@ from omnigent.runner.ae_child_compact_window import (
+ 
+ def test_child_session_gets_the_window() -> None:
+     env: dict[str, str] = {"A": "1"}
+-    apply_child_auto_compact_window(env, parent_session_id="conv_p", inherited_env={})
++    apply_child_auto_compact_window(env, is_family_child=True, inherited_env={})
+     assert env == {"A": "1", AUTO_COMPACT_WINDOW_ENV: CHILD_AUTO_COMPACT_WINDOW}
+     assert CHILD_AUTO_COMPACT_WINDOW == "250000"
+ 
+ 
+-def test_parent_or_standalone_session_gets_nothing() -> None:
+-    for parent in (None, ""):
+-        env: dict[str, str] = {}
+-        apply_child_auto_compact_window(env, parent_session_id=parent, inherited_env={})
+-        assert env == {}
++def test_lead_or_standalone_session_gets_nothing() -> None:
++    env: dict[str, str] = {}
++    apply_child_auto_compact_window(env, is_family_child=False, inherited_env={})
++    assert env == {}
+ 
+ 
+ def test_existing_value_is_kept() -> None:
+     env = {AUTO_COMPACT_WINDOW_ENV: "100000"}
+-    apply_child_auto_compact_window(env, parent_session_id="conv_p", inherited_env={})
++    apply_child_auto_compact_window(env, is_family_child=True, inherited_env={})
+     assert env == {AUTO_COMPACT_WINDOW_ENV: "100000"}
+     inherited = {AUTO_COMPACT_WINDOW_ENV: "300000"}
+     env2: dict[str, str] = {}
+-    apply_child_auto_compact_window(env2, parent_session_id="conv_p", inherited_env=inherited)
++    apply_child_auto_compact_window(env2, is_family_child=True, inherited_env=inherited)
+     assert env2 == {}
++
++
++@pytest.mark.parametrize(
++    "labels,parent,expected",
++    [
++        pytest.param({}, None, None, id="lead-no-env-var"),
++        pytest.param({"ae.orch": "1"}, None, None, id="standalone-orch-one-no-env-var"),
++        pytest.param(
++            {"ae.orch": "conv_lead", "omnigent.fork.source_id": "conv_src"},
++            None,
++            None,
++            id="fork-with-orch-label-no-env-var",
++        ),
++        pytest.param({"ae.orch": "conv_lead"}, None, "250000", id="family-child-orch-label"),
++        pytest.param({}, "conv_p", "250000", id="parent-session-id"),
++    ],
++)
++def test_launch_decision_follows_the_family_rule(
++    labels: dict[str, str], parent: str | None, expected: str | None
++) -> None:
++    """The launch decision is the family view's rule, so the two cannot disagree."""
++    env: dict[str, str] = {}
++    apply_child_auto_compact_window(
++        env, is_family_child=is_family_child(labels, parent), inherited_env={}
++    )
++    assert env.get(AUTO_COMPACT_WINDOW_ENV) == expected
++
++
++def test_is_family_child_ignores_non_dict_labels_and_blank_orch() -> None:
++    assert is_family_child(None, None) is False
++    assert is_family_child({"ae.orch": "  "}, None) is False
++    assert is_family_child({"ae.orch": 7}, None) is False
+diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
+index a9bd6ff20ef6d20b2d6e829096e5fa0a32258926..eb37db167afde937f85d4dfcb5e1885c8ab72a38 100644
+--- a/tests/runner/test_app_claude_native_launch_args.py
++++ b/tests/runner/test_app_claude_native_launch_args.py
+@@ -1505,11 +1505,29 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
+ 
+ 
+ @pytest.mark.parametrize(
+-    "init_parent,snapshot_parent,expected",
++    "init_parent,snapshot_parent,labels,expected",
+     [
+-        pytest.param("conv_p", None, "250000", id="envelope-parent"),
+-        pytest.param(None, "conv_p", "250000", id="ensure-path-snapshot-parent"),
+-        pytest.param(None, None, None, id="no-parent-anywhere"),
++        pytest.param("conv_p", None, {}, "250000", id="envelope-parent"),
++        pytest.param(None, "conv_p", {}, "250000", id="ensure-path-snapshot-parent"),
++        pytest.param(None, None, {}, None, id="no-parent-anywhere"),
++        pytest.param("", None, {"ae.orch": "conv_lead"}, "250000", id="envelope-orch-label"),
++        pytest.param(None, None, {"ae.orch": "conv_lead"}, "250000", id="ensure-path-orch-label"),
++        pytest.param("", None, {"ae.orch": "1"}, None, id="envelope-standalone-orch-one"),
++        pytest.param(None, None, {"ae.orch": "1"}, None, id="ensure-path-standalone-orch-one"),
++        pytest.param(
++            "",
++            None,
++            {"ae.orch": "conv_lead", "omnigent.fork.source_id": "conv_src"},
++            None,
++            id="envelope-fork-with-orch-label",
++        ),
++        pytest.param(
++            None,
++            None,
++            {"ae.orch": "conv_lead", "omnigent.fork.source_id": "conv_src"},
++            None,
++            id="ensure-path-fork-with-orch-label",
++        ),
+     ],
+ )
+ async def test_auto_create_claude_terminal_caps_only_a_child_sessions_compact_window(
+@@ -1517,10 +1535,14 @@ async def test_auto_create_claude_terminal_caps_only_a_child_sessions_compact_wi
+     monkeypatch: pytest.MonkeyPatch,
+     init_parent: str | None,
+     snapshot_parent: str | None,
++    labels: dict[str, str],
+     expected: str | None,
+ ) -> None:
+     """
+-    A child's launch env carries the auto-compact window; a parent's does not.
++    A child's launch env carries the auto-compact window; a lead's does not.
++
++    A family child made by ``create_session`` has no parent id, only an
++    ``ae.orch`` label naming its lead; a fork copies that label but is no child.
+ 
+     The explicit ensure route (first turn, idle-pane recovery, resume, account
+     relaunch) passes no init envelope, so the parent there comes from the
+@@ -1529,6 +1551,7 @@ async def test_auto_create_claude_terminal_caps_only_a_child_sessions_compact_wi
+     :param init_parent: ``parent_session_id`` in the init envelope; ``None`` runs the
+         ensure path with no envelope at all.
+     :param snapshot_parent: ``parent_session_id`` the session snapshot answers with.
++    :param labels: The session's labels in the envelope and in the snapshot answer.
+     :param expected: The ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` the pane env should carry.
+     """
+     from unittest.mock import AsyncMock, Mock
+@@ -1553,11 +1576,12 @@ async def test_auto_create_claude_terminal_caps_only_a_child_sessions_compact_wi
+     monkeypatch.setattr(ae_launch_account, "write_launch_account", stop_after_env)
+ 
+     def handler(_request: httpx.Request) -> httpx.Response:
+-        return httpx.Response(200, json={"parent_session_id": snapshot_parent})
++        return httpx.Response(200, json={"parent_session_id": snapshot_parent, "labels": labels})
+ 
+     session_id = "conv_child_compact"
+     session_init = _claude_auto_create_session_init(session_id, bridge_dir)
+     session_init.snapshot.parent_session_id = init_parent
++    session_init.snapshot.labels = dict(labels)
+     async with httpx.AsyncClient(
+         transport=httpx.MockTransport(handler), base_url="http://runner"
+     ) as client:
+@@ -1574,3 +1598,34 @@ async def test_auto_create_claude_terminal_caps_only_a_child_sessions_compact_wi
+ 
+     assert len(seen) == 1
+     assert seen[0].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected
++
++
++@pytest.mark.parametrize(
++    "labels,parent,expected",
++    [
++        pytest.param({}, None, False, id="lead"),
++        pytest.param({"ae.orch": "conv_lead"}, None, True, id="orch-label"),
++        pytest.param({"ae.orch": "1"}, None, False, id="standalone"),
++        pytest.param({"ae.orch": "conv_lead"}, "conv_p", True, id="parent-and-label"),
++        pytest.param(
++            {"ae.orch": "conv_lead", "omnigent.fork.source_id": "c"}, None, False, id="fork"
++        ),
++    ],
++)
++async def test_legacy_launch_metadata_reads_the_family_child_flag(
++    labels: dict[str, str], parent: str | None, expected: bool
++) -> None:
++    """The snapshot-fetch loader projects ``is_family_child`` from labels and parent."""
++    import httpx
++
++    from omnigent.runner.native import orchestration
++
++    def handler(_request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, json={"parent_session_id": parent, "labels": labels})
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://runner"
++    ) as client:
++        metadata = await orchestration._load_legacy_claude_launch_metadata(client, "conv_x")
++
++    assert metadata.is_family_child is expected

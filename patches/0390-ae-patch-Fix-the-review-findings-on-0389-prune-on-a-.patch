@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 22:57:05 -0800
+Subject: [PATCH 390/443] [ae-patch] Fix the review findings on 0389: prune on
+ a failed ownership check, stop on a failed root re-read, close the archive
+ and side chat race
+
+A failed read or ownership check on a side chat now prunes its subtree; only a
+write failure after ownership was established walks on. A failed re-read of
+the archived root stops the walk. The fork route re-reads the source after a
+side chat is committed and, when the source is archived by then, archives the
+new side chat under the same root, stops it and refuses the request, which
+closes the window between the pre-check and the archive cascade. The refusal
+now runs before the agent-binding check.
+---
+ .../routes/sessions/ae_side_chat_archive.py   | 92 ++++++++++++++---
+ .../server/routes/sessions/routes_core.py     | 10 +-
+ tests/server/routes/test_side_chat_archive.py | 99 ++++++++++++++++++-
+ 3 files changed, 186 insertions(+), 15 deletions(-)
+
+diff --git a/omnigent/server/routes/sessions/ae_side_chat_archive.py b/omnigent/server/routes/sessions/ae_side_chat_archive.py
+index 0facdea34691093a76e1322ab050e5bc60ed423b..0bed7f34da2d8e2139fb219b0d33fd439c8ac7ed 100644
+--- a/omnigent/server/routes/sessions/ae_side_chat_archive.py
++++ b/omnigent/server/routes/sessions/ae_side_chat_archive.py
+@@ -30,6 +30,8 @@ _logger = logging.getLogger(__name__)
+ 
+ SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY = "ae.side_chat.archived_with"
+ 
++_ARCHIVED_SOURCE_MESSAGE = "This chat is archived. Unarchive it to open a side chat."
++
+ # Side chats of side chats are legal; the cap keeps a corrupt cycle finite.
+ _MAX_DEPTH = 8
+ 
+@@ -114,15 +116,68 @@ def refuse_side_chat_of_archived(source: Any, side_chat: bool) -> None:
+     """
+     if side_chat and getattr(source, "archived", False):
+         raise OmnigentError(
+-            "This chat is archived. Unarchive it to open a side chat.",
++            _ARCHIVED_SOURCE_MESSAGE,
+             code=ErrorCode.INVALID_INPUT,
+         )
+ 
+ 
++async def archive_side_chat_if_source_archived(
++    side_id: str,
++    source_id: str,
++    conversation_store: Any,
++    runner_router: Any,
++    host_registry: Any,
++) -> None:
++    """Close the race between opening a side chat and archiving its source.
++
++    Runs after the fork row is committed. The archive cascade reads the side
++    chats only after the archive commits, so either it already sees this fork,
++    or this re-read sees the source archived; then the new side chat is archived
++    under the same root (so Undo restores it), stopped like the others, and the
++    request is refused as the pre-check would have refused it. Added 2026-11-18.
++
++    :param side_id: The side chat just created.
++    :param source_id: Its source session.
++    :param conversation_store: The conversation store.
++    :param runner_router: Runner router for the deferred stop, or ``None``.
++    :param host_registry: Host registry for the deferred stop, or ``None``.
++    :raises OmnigentError: When the source is archived by now.
++    """
++    from omnigent.server.routes._sessions.orchestration import _spawn_archive_stop
++
++    source = await asyncio.to_thread(conversation_store.get_conversation, source_id)
++    if source is None or not source.archived:
++        return
++    root_id = source.labels.get(SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY) or source_id
++    if await asyncio.to_thread(_archive_one, conversation_store, side_id, root_id, None) == (
++        "archived"
++    ):
++        _spawn_archive_stop(
++            side_id, conversation_store, runner_router, host_registry, delete_worktree=False
++        )
++    raise OmnigentError(_ARCHIVED_SOURCE_MESSAGE, code=ErrorCode.INVALID_INPUT)
++
++
+ def _owned(owns: OwnerCheck | None, side_id: str) -> bool:
+     return owns is None or owns(side_id)
+ 
+ 
++def _load_owned(conversation_store: Any, side_id: str, owns: OwnerCheck | None) -> Any:
++    """The side chat row when it exists and the caller owns it, else ``None``.
++
++    A failed read or ownership check also gives ``None``: the walk descends only
++    below a node whose ownership was established, never past an unknown one.
++    """
++    try:
++        conv = conversation_store.get_conversation(side_id)
++        if conv is None or not _owned(owns, side_id):
++            return None
++    except Exception:  # unknown owner: prune rather than guess
++        _logger.warning("Side chat %s lookup or ownership check failed", side_id, exc_info=True)
++        return None
++    return conv
++
++
+ def _archive_one(
+     conversation_store: Any, side_id: str, root_id: str, owns: OwnerCheck | None
+ ) -> str:
+@@ -132,8 +187,8 @@ def _archive_one(
+         ``"present"`` (already archived: keep walking, change nothing) or
+         ``"archived"``.
+     """
+-    conv = conversation_store.get_conversation(side_id)
+-    if conv is None or not _owned(owns, side_id):
++    conv = _load_owned(conversation_store, side_id, owns)
++    if conv is None:
+         return "skip"
+     if conv.archived:
+         return "present"
+@@ -191,6 +246,7 @@ async def cascade_archive(
+     seen = {session_id}
+     level = [session_id]
+     undone = False
++    halted = False
+     for _depth in range(_MAX_DEPTH):
+         next_level: list[str] = []
+         for parent_id in level:
+@@ -204,9 +260,21 @@ async def cascade_archive(
+                     continue
+                 seen.add(side_id)
+                 try:
+-                    if not await asyncio.to_thread(_root_archived, conversation_store, session_id):
+-                        undone = True
+-                        break
++                    root_still_archived = await asyncio.to_thread(
++                        _root_archived, conversation_store, session_id
++                    )
++                except Exception:  # cannot tell whether an Undo landed: stop here
++                    _logger.warning(
++                        "Root re-read failed for %s; stopping the side chat walk",
++                        session_id,
++                        exc_info=True,
++                    )
++                    halted = True
++                    break
++                if not root_still_archived:
++                    undone = True
++                    break
++                try:
+                     outcome = await asyncio.to_thread(
+                         _archive_one, conversation_store, side_id, session_id, owns
+                     )
+@@ -223,13 +291,13 @@ async def cascade_archive(
+                         )
+                         archived.append(side_id)
+                 except Exception:  # best effort per side chat
+-                    # Still walk its children (each is checked on its own), so one
+-                    # failed write never leaves nested side chats running.
++                    # Ownership was established (a failed check returns "skip"), so a
++                    # failed write still walks its children, each checked on its own.
+                     _logger.warning("Archiving side chat %s failed", side_id, exc_info=True)
+                 next_level.append(side_id)
+-            if undone:
++            if undone or halted:
+                 break
+-        if undone or not next_level:
++        if undone or halted or not next_level:
+             break
+         level = next_level
+     try:
+@@ -251,8 +319,8 @@ def _restore_one(
+     :returns: ``"skip"`` (missing or not owned: prune), ``"present"`` (not ours:
+         keep walking) or ``"restored"``.
+     """
+-    conv = conversation_store.get_conversation(side_id)
+-    if conv is None or not _owned(owns, side_id):
++    conv = _load_owned(conversation_store, side_id, owns)
++    if conv is None:
+         return "skip"
+     if not conv.archived or conv.labels.get(SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY) != root_id:
+         return "present"
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index e1723f6515b9a28e42e9bb66832cc25bfad8c353..d9c114988a9b9e54537b682898d1adeffde8eb22 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -3363,12 +3363,12 @@ def register_core_routes(
+                     f"Session not found: {source_id!r}",
+                     code=ErrorCode.NOT_FOUND,
+                 )
++        ae_side_chat_archive.refuse_side_chat_of_archived(source, body.side_chat)
+         if source.agent_id is None:
+             raise OmnigentError(
+                 "Source session has no agent binding — cannot fork.",
+                 code=ErrorCode.INVALID_INPUT,
+             )
+-        ae_side_chat_archive.refuse_side_chat_of_archived(source, body.side_chat)
+ 
+         from omnigent.server.routes.sandbox_inference import (
+             actual_harness,
+@@ -3867,6 +3867,14 @@ def register_core_routes(
+         if permission_store is not None and user_id is not None:
+             await asyncio.to_thread(permission_store.ensure_user, user_id)
+             await asyncio.to_thread(permission_store.grant, user_id, new_conv.id, LEVEL_OWNER)
++        if body.side_chat:
++            await ae_side_chat_archive.archive_side_chat_if_source_archived(
++                new_conv.id,
++                source_id,
++                conversation_store,
++                runner_router,
++                getattr(request.app.state, "host_registry", None),
++            )
+         # Push the forked session to this user's other open tabs — but NOT a
+         # side chat: it surfaces only as a Workspace-rail tab, never a sidebar
+         # row, so announcing it would leak it into every open sidebar (the
+diff --git a/tests/server/routes/test_side_chat_archive.py b/tests/server/routes/test_side_chat_archive.py
+index fc90256ff910681a75a7d09446e12894173251f0..20282706aaf38d3c425d0c0a7fdd01f18bff352f 100644
+--- a/tests/server/routes/test_side_chat_archive.py
++++ b/tests/server/routes/test_side_chat_archive.py
+@@ -12,6 +12,7 @@ import pytest
+ import pytest_asyncio
+ 
+ from omnigent.db.utils import generate_agent_id
++from omnigent.errors import OmnigentError
+ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, UnifiedAuthProvider
+ from omnigent.server.routes import sessions as sessions_facade
+ from omnigent.server.routes._sessions import orchestration
+@@ -439,5 +440,99 @@ def test_the_refusal_applies_only_to_side_chats_of_archived_sessions(
+     live = store.create_conversation(agent_id=agent_id)
+     gone = store.create_conversation(agent_id=agent_id)
+     store.update_conversation_with_changes(gone.id, archived=True)
+-    ae_side_chat_archive.refuse_side_chat_of_archived(_row(store, live.id), True)
+-    ae_side_chat_archive.refuse_side_chat_of_archived(_row(store, gone.id), False)
++    assert ae_side_chat_archive.refuse_side_chat_of_archived(_row(store, live.id), True) is None
++    assert ae_side_chat_archive.refuse_side_chat_of_archived(_row(store, gone.id), False) is None
++    with pytest.raises(OmnigentError):
++        ae_side_chat_archive.refuse_side_chat_of_archived(_row(store, gone.id), True)
++
++
++async def test_a_failed_ownership_check_prunes_the_subtree(
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    root = store.create_conversation(agent_id=agent_id)
++    side = _side_chat(store, root.id)
++    nested = _side_chat(store, side.id)
++
++    def owns_raises_on_side(session_id: str) -> bool:
++        if session_id == side.id:
++            raise RuntimeError("permission store blip")
++        return True
++
++    store.update_conversation_with_changes(root.id, archived=True)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
++        archived = await ae_side_chat_archive.cascade_archive(
++            root.id, store, None, None, owns_raises_on_side
++        )
++        assert archived == []
++        assert _row(store, nested.id).archived is False
++        # Restore: archive both normally, then a raising check keeps N archived.
++        await ae_side_chat_archive.cascade_archive(root.id, store, None, None, None)
++        store.update_conversation_with_changes(root.id, archived=False)
++        restored = await ae_side_chat_archive.cascade_unarchive(
++            root.id, store, owns_raises_on_side
++        )
++        await _drain()
++    assert restored == []
++    assert _row(store, nested.id).archived is True
++
++
++async def test_a_failed_root_reread_stops_the_walk(
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    root = store.create_conversation(agent_id=agent_id)
++    sides = [_side_chat(store, root.id) for _ in range(2)]
++    store.update_conversation_with_changes(root.id, archived=True)
++
++    def boom(*_a, **_k):
++        raise RuntimeError("store blip")
++
++    with patch.object(ae_side_chat_archive, "_root_archived", boom):
++        archived = await ae_side_chat_archive.cascade_archive(root.id, store, None, None)
++    assert archived == []
++    assert all(_row(store, s.id).archived is False for s in sides)
++
++
++async def test_a_side_chat_opened_as_its_source_is_archived_is_archived_and_refused(
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    root = store.create_conversation(agent_id=agent_id)
++    side = _side_chat(store, root.id)
++    late = _side_chat(store, side.id)
++    other = _side_chat(store, root.id)
++    # side was archived by root's cascade; late was created after that walk.
++    store.update_conversation_with_changes(root.id, archived=True)
++    store.set_labels(side.id, {MARKER: root.id})
++    store.update_conversation_with_changes(side.id, archived=True)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
++        with pytest.raises(OmnigentError, match="Unarchive it to open a side chat"):
++            await ae_side_chat_archive.archive_side_chat_if_source_archived(
++                late.id, side.id, store, None, None
++            )
++        row = _row(store, late.id)
++        assert row.archived is True
++        assert row.labels.get(MARKER) == root.id
++        assert late.id in orchestration._pending_archive_stops
++        # A live source leaves the new side chat alone.
++        store.update_conversation_with_changes(root.id, archived=False)
++        await ae_side_chat_archive.archive_side_chat_if_source_archived(
++            other.id, root.id, store, None, None
++        )
++        assert _row(store, other.id).archived is False
++        await ae_side_chat_archive.cascade_unarchive(root.id, store)
++        await _drain()
++    assert _row(store, late.id).archived is False
++
++
++async def test_an_archived_unbound_source_gets_the_archived_message(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, _agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=None)
++    store.update_conversation_with_changes(parent.id, archived=True)
++    response = await client.post(f"/v1/sessions/{parent.id}/fork", json={"side_chat": True})
++    assert response.status_code == 400, response.text
++    assert "Unarchive it to open a side chat" in response.text

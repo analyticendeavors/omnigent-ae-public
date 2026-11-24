@@ -1,0 +1,177 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <bot@example.invalid>
+Date: Fri, 13 Nov 2026 09:45:13 -0800
+Subject: [PATCH 370/443] [ae-patch] Send a PostToolUse allow's ae_note line to
+ the native harness as additional context
+
+A policy that allows a tool result with data {ae_note: line} now reaches Claude Code and Codex as hookSpecificOutput.additionalContext through the shared hook converter, which the claude-native relay, the Codex hook and the other native hooks all call. The tool output is never rewritten.
+---
+ omnigent/native/native_policy_hook.py         | 11 +++++
+ .../test_claude_native_bridge.py              | 29 ++++++++++++
+ .../codex_native/test_codex_native_hook.py    | 35 +++++++++++++++
+ tests/test_native_policy_hook.py              | 44 +++++++++++++++++++
+ 4 files changed, 119 insertions(+)
+
+diff --git a/omnigent/native/native_policy_hook.py b/omnigent/native/native_policy_hook.py
+index 6e5b193ce35fbd7f2f7d89e3a3cfe080beae66c8..6392de053777c8cace41bf74f40921fdca15afc3 100644
+--- a/omnigent/native/native_policy_hook.py
++++ b/omnigent/native/native_policy_hook.py
+@@ -512,6 +512,17 @@ def evaluation_response_to_hook_output(
+                     "additionalContext": f"[Policy violation] {reason}",
+                 },
+             }
++        # An ALLOW whose data is ``{"ae_note": <line>}`` asks for one line of context after
++        # the result (the Decision-1 nudge); the tool output itself is never rewritten here.
++        data = eval_response.get("data")
++        note = data.get("ae_note") if isinstance(data, dict) else None
++        if action == "POLICY_ACTION_ALLOW" and isinstance(note, str) and note.strip():
++            return {
++                "hookSpecificOutput": {
++                    "hookEventName": _POST_TOOL_USE,
++                    "additionalContext": note.strip(),
++                },
++            }
+         return None
+ 
+     return None
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index df409218e271d3d7784b9b41311ced79559f90d7..9d0678dcdb6f1d81abfc8ce9304dd61e5b15632a 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -12057,6 +12057,35 @@ async def test_hook_evaluate_endpoint_passes_prompt_for_spoken_style_suffix(
+         relay.close()
+ 
+ 
++@pytest.mark.asyncio
++async def test_hook_evaluate_endpoint_passes_an_ae_note_after_a_tool_result(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    """A PostToolUse ALLOW carrying ``data.ae_note`` reaches Claude as additionalContext."""
++    payload = {
++        "hook_event_name": "PostToolUse",
++        "tool_name": "Bash",
++        "tool_input": {"command": "pytest -q"},
++        "tool_response": "ok",
++    }
++    client = _ScriptedPolicyClient(
++        {"result": "POLICY_ACTION_ALLOW", "data": {"ae_note": "Ask the judge."}}
++    )
++    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
++    try:
++        body = await asyncio.to_thread(
++            _relay_request_raw, bridge_dir, "/hook/claude/evaluate-policy", payload
++        )
++        assert json.loads(body) == {
++            "hookSpecificOutput": {
++                "hookEventName": "PostToolUse",
++                "additionalContext": "Ask the judge.",
++            }
++        }
++    finally:
++        relay.close()
++
++
+ @pytest.mark.asyncio
+ async def test_hook_evaluate_endpoint_bare_allow_on_prompt_is_no_opinion(
+     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+diff --git a/tests/harnesses/codex_native/test_codex_native_hook.py b/tests/harnesses/codex_native/test_codex_native_hook.py
+index 3f65bfdb64f675b1473fa6789be997ad2215c3b4..af4c66e6df9e14258924e1b1c6528584488f6b27 100644
+--- a/tests/harnesses/codex_native/test_codex_native_hook.py
++++ b/tests/harnesses/codex_native/test_codex_native_hook.py
+@@ -486,6 +486,41 @@ def test_post_tool_use_fails_open_on_error(
+     assert captured.out == ""
+ 
+ 
++def test_post_tool_use_ae_note_reaches_codex_as_additional_context(
++    bridge_dir: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    """A PostToolUse ALLOW carrying ``data.ae_note`` is printed as additionalContext."""
++
++    class _NoteClient(_DenyHttpxClient):
++        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
++            del url, json
++            return httpx.Response(
++                200,
++                json={"result": "POLICY_ACTION_ALLOW", "data": {"ae_note": "Ask the judge."}},
++                request=httpx.Request("POST", "http://127.0.0.1:8787"),
++            )
++
++    write_policy_hook_config(bridge_dir, ap_server_url="http://127.0.0.1:8787", ap_auth_headers={})
++    monkeypatch.setattr(native_policy_hook.httpx, "Client", _NoteClient)
++    payload: dict[str, object] = {
++        "hook_event_name": "PostToolUse",
++        "tool_name": "Bash",
++        "tool_input": {"command": "pytest -q"},
++        "tool_output": "ok",
++    }
++
++    assert _run_hook(bridge_dir, payload, monkeypatch) == 0
++
++    assert json.loads(capsys.readouterr().out) == {
++        "hookSpecificOutput": {
++            "hookEventName": "PostToolUse",
++            "additionalContext": "Ask the judge.",
++        }
++    }
++
++
+ def test_pre_tool_use_uses_relay_when_tool_relay_json_has_session_id(
+     bridge_dir: Path,
+     monkeypatch: pytest.MonkeyPatch,
+diff --git a/tests/test_native_policy_hook.py b/tests/test_native_policy_hook.py
+index 381b9e62020129c14bc7dc9b875516eb42b0a201..726e7a059406e647208e979b224f4871aceed778 100644
+--- a/tests/test_native_policy_hook.py
++++ b/tests/test_native_policy_hook.py
+@@ -238,6 +238,50 @@ def test_post_tool_use_allow_returns_none() -> None:
+     assert output is None
+ 
+ 
++def test_post_tool_use_allow_with_an_ae_note_becomes_additional_context() -> None:
++    """An ALLOW carrying ``data.ae_note`` sends only that line as additionalContext."""
++    output = evaluation_response_to_hook_output(
++        "PostToolUse",
++        {"result": "POLICY_ACTION_ALLOW", "data": {"ae_note": "  Ask the judge.  "}},
++    )
++    assert output == {
++        "hookSpecificOutput": {
++            "hookEventName": "PostToolUse",
++            "additionalContext": "Ask the judge.",
++        }
++    }
++
++
++@pytest.mark.parametrize(
++    "data",
++    [{"ae_note": ""}, {"ae_note": 3}, {"result": "rewritten output"}, "rewritten", None, []],
++)
++def test_post_tool_use_allow_without_a_usable_ae_note_stays_silent(data: object) -> None:
++    """A rewrite or an empty note is ignored: the hook never replaces a tool result."""
++    assert (
++        evaluation_response_to_hook_output(
++            "PostToolUse", {"result": "POLICY_ACTION_ALLOW", "data": data}
++        )
++        is None
++    )
++
++
++def test_post_tool_use_ae_note_is_ignored_on_deny_and_other_events() -> None:
++    """DENY keeps the policy-violation text; PreToolUse never reads the note."""
++    denied = evaluation_response_to_hook_output(
++        "PostToolUse",
++        {"result": "POLICY_ACTION_DENY", "reason": "no", "data": {"ae_note": "hint"}},
++    )
++    assert denied is not None
++    assert denied["hookSpecificOutput"]["additionalContext"] == "[Policy violation] no"  # type: ignore[index]
++    assert (
++        evaluation_response_to_hook_output(
++            "PreToolUse", {"result": "POLICY_ACTION_ALLOW", "data": {"ae_note": "hint"}}
++        )
++        is None
++    )
++
++
+ def test_user_prompt_submit_maps_to_phase_request() -> None:
+     """
+     A UserPromptSubmit payload becomes a PHASE_REQUEST EvaluationRequest.

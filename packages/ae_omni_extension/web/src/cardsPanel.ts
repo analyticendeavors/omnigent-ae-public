@@ -5,7 +5,7 @@
 // set (never a value). The switch is the admin's: it turns the card on or off for everyone on
 // the server. The eye is the viewer's own: it hides the card for them only (cardPrefs.ts).
 //
-// fabric.ts opens it (the header's Cards button and each card's gear); `notSetUp` is the hook for
+// adminShell.ts opens it as the Services tab (the drawer is kept for tests and older callers); `notSetUp` is the hook for
 // the "Needs setup" chip (board.ts cardNotSetUp).
 
 import type { ExtensionContext } from "@omnigent/extension-sdk";
@@ -22,7 +22,7 @@ import {
 import { conflictAnswer, fetchCards, setCardSettings, setCardState } from "./cardsApi";
 import { el } from "./dom";
 import { createGitSetup } from "./gitSetup";
-import { closeIcon, copyIcon, eyeIcon, eyeOffIcon, infoIcon, settingsIcon } from "./icons";
+import { chevronIcon, closeIcon, copyIcon, eyeIcon, eyeOffIcon, infoIcon, settingsIcon } from "./icons";
 import { closeOpenHint, hasOpenHint, hint } from "./hint";
 import { copyText } from "./lot";
 import { DOMAINS } from "./tiles";
@@ -41,12 +41,24 @@ export interface CardsPanelOptions {
   notSetUp?: (id: string) => boolean;
   /** The control that opened the panel; focus returns here on close (default: the active element). */
   opener?: HTMLElement | null;
+  /** What a card is doing now, in a few words (the page mode's "Doing" column); the card's description otherwise. */
+  doing?: (id: string) => string;
+  /**
+   * Draw the same list as a page inside this element (the Admin Center's Services tab, 2026-11-14)
+   * instead of a drawer: no scrim, no Close button, no focus trap and no Escape handling.
+   */
+  into?: HTMLElement;
 }
 
 export interface OpenCardsPanel {
   close: () => void;
   node: HTMLElement;
+  /** Unfold a card's Setup and scroll to it (the gear on a card, in page mode). */
+  show: (id: string) => void;
 }
+
+/** Cards whose server routes keep answering when they are off (admin-center.md: scripts and sessions depend on them). */
+const ROUTES_STAY = new Set(["deploys", "accounts", "presets", "decision", "box"]);
 
 const FOCUSABLE = "button, [href], input, select, textarea, [tabindex]";
 
@@ -64,6 +76,7 @@ export function openCardsPanel(
   context: ExtensionContext,
   options: CardsPanelOptions = {},
 ): OpenCardsPanel {
+  const page = options.into !== undefined;
   const opener = options.opener ?? (document.activeElement as HTMLElement | null);
   const unfolded = new Set<string>(options.focus ? [options.focus] : []);
   let busy = false;
@@ -82,11 +95,13 @@ export function openCardsPanel(
   closeButton.appendChild(closeIcon());
   const note = el("p", { class: "ae-cards-note", role: "status", "aria-live": "polite", hidden: true });
   const list = el("div", { class: "ae-cards-list" });
-  const title = el("h3", { id: "ae-cards-title" }, settingsIcon(16), "Cards");
+  const title = el("h3", { id: "ae-cards-title" }, settingsIcon(16), page ? "Services" : "Cards");
   const drawer = el(
-    "aside",
-    { class: "ae-cards-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": "ae-cards-title" },
-    el("div", { class: "ae-cards-top" }, title, closeButton),
+    page ? "div" : "aside",
+    page
+      ? { class: "ae-cards-drawer ae-cards-page", role: "region", "aria-labelledby": "ae-cards-title" }
+      : { class: "ae-cards-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": "ae-cards-title" },
+    el("div", { class: "ae-cards-top" }, title, page ? null : closeButton),
     el(
       "div",
       { class: "ae-cards-body" },
@@ -95,7 +110,7 @@ export function openCardsPanel(
       list,
     ),
   );
-  const scrim = el("div", { class: "ae-cards-scrim" }, drawer);
+  const scrim = page ? drawer : el("div", { class: "ae-cards-scrim" }, drawer);
   // The Git entry's tokens (gitSetup.ts). One object for the panel's life: render() rebuilds every
   // row, and a token typed there must survive that, so its node is moved into each new Git row.
   const gitSetup = createGitSetup(context, {
@@ -311,16 +326,37 @@ export function openCardsPanel(
     );
   }
 
+  /** What the card is doing, or why it is not: its Doing cell on the Services page. */
+  function doingText(row: CardRow): string {
+    if (!row.on) return turnedOffLine(row) ?? "Turned off for everyone";
+    if (options.notSetUp?.(row.id)) {
+      const missing = row.fields.filter((field) => field.status === "missing").map((field) => field.env);
+      const names = missing.slice(0, 2).join(", ");
+      return missing.length ? `Not set up. Needs ${names}${missing.length > 2 ? ` and ${missing.length - 2} more` : ""}.` : "Not set up on this server.";
+    }
+    return options.doing?.(row.id) || row.description;
+  }
+
   function rowNode(answer: CardsAnswer, row: CardRow): HTMLElement {
     const open = unfolded.has(row.id);
     const chip = chipFor(row);
     const setupId = `ae-card-setup-${row.id}`;
-    const head = el(
-      "button",
-      { type: "button", class: "ae-card-row-head", "aria-expanded": String(open), "aria-controls": setupId },
-      el("span", { class: "ae-card-row-name" }, row.name, el("span", { class: "ae-card-chip", "data-chip": chip.key }, chip.text)),
-      el("span", { class: "ae-card-row-desc" }, row.description),
-    );
+    const chipNode = el("span", { class: "ae-card-chip", "data-chip": chip.key }, chip.text);
+    // The page lays a card out as one row of cells; its Setup button is the fold's control. The drawer
+    // keeps the name, the chip and the description in one button.
+    const head = page
+      ? el(
+          "button",
+          { type: "button", class: "btn btn-quiet ae-card-row-head ae-card-setup-btn", "aria-expanded": String(open), "aria-controls": setupId },
+          el("span", {}, "Setup"),
+          chevronIcon(),
+        )
+      : el(
+          "button",
+          { type: "button", class: "ae-card-row-head", "aria-expanded": String(open), "aria-controls": setupId },
+          el("span", { class: "ae-card-row-name" }, row.name, chipNode),
+          el("span", { class: "ae-card-row-desc" }, row.description),
+        );
     head.title = `Show how ${row.name} is set up`;
     head.addEventListener("click", () => {
       if (unfolded.has(row.id)) unfolded.delete(row.id);
@@ -394,8 +430,20 @@ export function openCardsPanel(
     return el(
       "article",
       { class: "ae-card-row", "data-card": row.id, "data-focus": options.focus === row.id ? "" : undefined },
-      el("div", { class: "ae-card-row-top" }, head, eye, toggle),
-      off ? el("p", { class: "ae-card-off-by" }, off) : null,
+      page
+        ? el(
+            "div",
+            { class: "ae-card-row-top ae-card-cells" },
+            el("span", { class: "ae-card-name" }, row.name),
+            chipNode,
+            el("span", { class: "ae-card-doing" }, doingText(row)),
+            el("span", { class: "ae-card-offmeans" }, ROUTES_STAY.has(row.id) ? "Hides it here. Its server routes keep answering." : "Hides it here and stops its background reads."),
+            eye,
+            toggle,
+            head,
+          )
+        : el("div", { class: "ae-card-row-top" }, head, eye, toggle),
+      off && !page ? el("p", { class: "ae-card-off-by" }, off) : null,
       setup,
     );
   }
@@ -404,6 +452,15 @@ export function openCardsPanel(
     const answer = getCards();
     if (!answer) return;
     list.replaceChildren();
+    if (page) {
+      list.appendChild(
+        el(
+          "div",
+          { class: "ae-cards-cols", "aria-hidden": "true" },
+          ...["Card", "State", "Doing", "What Off means", "Hide", "Everyone", ""].map((label) => el("span", {}, label)),
+        ),
+      );
+    }
     for (const domain of DOMAINS) {
       const rows = domain.cards
         .map((id) => answer.cards.find((row) => row.id === id))
@@ -469,12 +526,13 @@ export function openCardsPanel(
     closeOpenHint();
     document.removeEventListener("keydown", onKey, true);
     scrim.remove();
-    // The opener can be gone (hiding its card removes the gear): fall back to the header's Cards
-    // button, then the board, so focus never drops to the page body.
+    if (page) return;
+    // The opener can be gone (hiding its card removes the gear): 
+    // Services tab, then the board, so focus never drops to the page body.
     if (opener?.isConnected) opener.focus();
     else {
       const fallback =
-        document.querySelector<HTMLElement>(".admin-cards-btn") ??
+        document.querySelector<HTMLElement>("#as-tab-services") ??
         document.querySelector<HTMLElement>(".admin-board");
       if (fallback) {
         if (!fallback.matches("button")) fallback.tabIndex = -1;
@@ -483,13 +541,17 @@ export function openCardsPanel(
     }
   }
 
-  document.addEventListener("keydown", onKey, true);
-  scrim.addEventListener("click", (event) => {
-    if (event.target === scrim) close();
-  });
-  closeButton.addEventListener("click", close);
-  document.body.appendChild(scrim);
-  closeButton.focus();
+  if (page) {
+    options.into!.replaceChildren(drawer);
+  } else {
+    document.addEventListener("keydown", onKey, true);
+    scrim.addEventListener("click", (event) => {
+      if (event.target === scrim) close();
+    });
+    closeButton.addEventListener("click", close);
+    document.body.appendChild(scrim);
+    closeButton.focus();
+  }
 
   const settle = (): void => {
     render();
@@ -524,5 +586,10 @@ export function openCardsPanel(
         ),
       );
     });
-  return { close, node: scrim };
+  const show = (id: string): void => {
+    unfolded.add(id);
+    render();
+    list.querySelector<HTMLElement>(`[data-card="${id}"]`)?.scrollIntoView?.({ block: "center" });
+  };
+  return { close, node: scrim, show };
 }

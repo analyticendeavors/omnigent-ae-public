@@ -1792,6 +1792,16 @@ async def test_route_ignores_a_live_label_for_a_login_the_host_does_not_list(
     assert body["account"] == "Backup"
 
 
+async def test_route_takes_a_live_label_for_a_shared_account_the_host_does_not_list(
+    client: httpx.AsyncClient, _two_logins: dict[str, Any]
+) -> None:
+    # conv_b's relay entry says Backup; its terminal has since relaunched on a shared login.
+    _two_logins["labels"] = {limits.ACCOUNT_LIVE_LABEL: "shared:Team"}
+    body = await _claude(client, "session_id=conv_b&account=Backup")
+    assert body["account"] == "shared:Team" and body["windows"] == []
+    assert body["note"] == limits.NO_ACCOUNT_READING_NOTE.format(account="Team")
+
+
 def test_a_stale_relay_entry_never_answers_for_another_live_login() -> None:
     # The relay saw conv_b on Backup; the terminal has since relaunched on the default login.
     host = _default_host(_own("conv_b", account="Backup", windows=[_window("five_hour", 33)]))
@@ -1812,6 +1822,29 @@ def test_a_stale_relay_entry_never_answers_for_another_live_login() -> None:
     # The entry still answers when it names the live login.
     same = limits.session_view(host, "conv_b", live="Backup", readings={})
     assert [w.used_percent for w in same.windows] == [33]
+
+
+def test_a_live_shared_login_the_host_does_not_list_beats_a_stale_relay_entry() -> None:
+    # The relay saw conv_d on the default login; the chat was then switched to a shared
+    # login that is not the pick for new chats, so the host's list does not name it.
+    held = limits.AccountUsage(
+        harness="claude",
+        account="shared:Team",
+        label="Team (shared)",
+        windows=[_window("five_hour", 55)],
+        observed_at=NOW,
+    )
+    seen_default = _default_host(_own("conv_d", windows=[_window("five_hour", 25)]))
+    assert "shared:Team" not in {k.account for k in seen_default.known_accounts}
+    moved = limits.session_view(
+        seen_default, "conv_d", live="shared:Team", readings=_readings(held)
+    )
+    assert (moved.account, [w.used_percent for w in moved.windows]) == ("shared:Team", [55])
+    bare = limits.session_view(seen_default, "conv_d", live="shared:Team", readings={})
+    assert bare.windows == [] and bare.account == "shared:Team"
+    # A host login the host does not list is still no answer: the relay's entry stands.
+    gone = limits.session_view(seen_default, "conv_d", live="Gone", readings={})
+    assert gone is seen_default
 
 
 def test_a_label_for_an_unlisted_shared_account_is_trusted() -> None:

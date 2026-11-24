@@ -1,0 +1,593 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 18:30:27 -0800
+Subject: [PATCH 408/443] [ae-patch] Reactivate the iOS audio session before a
+ Voice mode mic start
+
+On iOS 18 WebKit sets the audio session inactive when an audio clip longer than 0.95 s ends, and webkitSpeech recognition never reactivates it, so every later take heard nothing. A long clip's end now marks the session, and the next WebKit recognizer start (the toggle path and the silent restart) first opens a throwaway microphone stream, stops its tracks and logs, capped at 1.5 s. The mic start log gains sessionState and reactivated. The keyboard button in the Voice approval row now matches the height of the text buttons beside it.
+---
+ web/src/components/AeVoicePanel.test.tsx      |  24 ++++
+ web/src/components/AeVoicePanel.tsx           |   5 +-
+ .../ComposerMicButton.stall.test.tsx          |  78 ++++++++++++
+ web/src/components/ComposerMicButton.tsx      |  66 ++++++++--
+ web/src/lib/aeAudioSession.test.ts            | 117 ++++++++++++++++++
+ web/src/lib/aeAudioSession.ts                 |  77 ++++++++++++
+ web/src/lib/aeCloudVoice.test.ts              |  44 +++++++
+ web/src/lib/aeCloudVoice.ts                   |  10 +-
+ 8 files changed, 408 insertions(+), 13 deletions(-)
+
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index fade23554c7b213bec78f2725fc87c3df1c52915..f2e3e7b39f8ee5cd683f4d6d8dc5340ffe94820f 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -302,3 +302,27 @@ describe("AeVoicePanel (sheet controls)", () => {
+     expect(screen.getByTestId("ae-voice-approval-run")).toBeTruthy();
+   });
+ });
++
++describe("AeVoicePanel approval row alignment", () => {
++  it("the keyboard button is the same height as the text buttons and centered", () => {
++    panel({
++      layout: "sheet",
++      phase: "approval",
++      approvalActive: true,
++      onApproval: vi.fn(),
++      onKeyboard: vi.fn(),
++    });
++    const row = screen.getByTestId("ae-voice-approval");
++    expect(row.className).toContain("items-center");
++    const keyboard = screen.getByLabelText("Type instead");
++    expect(keyboard.className).toContain("size-7");
++    expect(keyboard.className).toContain("self-center");
++    expect(keyboard.className).not.toContain("size-10");
++    expect(screen.getByTestId("ae-voice-approval-run").className).toContain("h-7");
++  });
++
++  it("keeps the full-size keyboard button when no approval is pending", () => {
++    panel({ layout: "sheet", phase: "listening", onKeyboard: vi.fn() });
++    expect(screen.getByLabelText("Type instead").className).toContain("size-10");
++  });
++});
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index 516d935227db1b086aba834f0c59fa99c38e7d7a..805f117a97a5ce95895b14ce5fa4a9c1a4c2d5d2 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -317,13 +317,16 @@ export function AeVoicePanel({
+       </div>
+     ) : null;
+ 
++  // In the approval row the keyboard button matches the h-7 text buttons beside it.
++  const inApprovalRow = approvalActive && Boolean(onApproval);
+   const sheetControls = (
+     <>
+       {onKeyboard ? (
+         <Button
+           type="button"
+           variant="ghost"
+-          size="icon"
++          size={inApprovalRow ? "icon-sm" : "icon"}
++          className={cn(inApprovalRow && "self-center text-muted-foreground hover:text-foreground")}
+           aria-label="Type instead"
+           onClick={onKeyboard}
+         >
+diff --git a/web/src/components/ComposerMicButton.stall.test.tsx b/web/src/components/ComposerMicButton.stall.test.tsx
+index 89ab0de2cd4d97e67ecad91398af5dabcf1eff85..db8e1e959dd713fc9ed4cc5d8ba07b36147bb9b6 100644
+--- a/web/src/components/ComposerMicButton.stall.test.tsx
++++ b/web/src/components/ComposerMicButton.stall.test.tsx
+@@ -3,6 +3,7 @@
+ import type { AeMicController } from "@/lib/aeVoiceMode";
+ import { act, cleanup, render } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { markSessionMayBeInactive, resetAudioSessionState } from "@/lib/aeAudioSession";
+ import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
+ import { ComposerMicButton } from "./ComposerMicButton";
+ 
+@@ -380,3 +381,80 @@ describe("ComposerMicButton (WebKit recycle after a final)", () => {
+     expect(formatVoiceLog()).not.toContain("mic recycle after final");
+   });
+ });
++
++describe("ComposerMicButton (audio session reactivation before start)", () => {
++  const IPHONE =
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1";
++
++  let release: (() => void) | null;
++  beforeEach(() => {
++    resetAudioSessionState();
++    release = null;
++    // The first stream request is held until the test releases it.
++    (navigator.mediaDevices.getUserMedia as ReturnType<typeof vi.fn>).mockImplementation(
++      () =>
++        new Promise((resolve) => {
++          release = () => resolve(new FakeStream());
++        }),
++    );
++  });
++  afterEach(() => resetAudioSessionState());
++
++  function mount() {
++    const controller = { current: null as AeMicController | null };
++    render(
++      <ComposerMicButton
++        onTranscript={vi.fn()}
++        onVoiceStart={vi.fn()}
++        controller={controller}
++        onListeningChange={vi.fn()}
++      />,
++    );
++    return controller;
++  }
++
++  it("awaits the reactivation before recognition.start()", async () => {
++    setUserAgent(IPHONE);
++    markSessionMayBeInactive();
++    const controller = mount();
++    act(() => controller.current?.start());
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(10);
++    });
++    expect(startSpy).not.toHaveBeenCalled();
++    await act(async () => {
++      release?.();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(formatVoiceLog()).toContain("reactivated=yes");
++    expect(formatVoiceLog()).toContain("reactivate ok");
++  });
++
++  it("starts at once when no long clip played", async () => {
++    setUserAgent(IPHONE);
++    const controller = mount();
++    act(() => controller.current?.start());
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(10);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(formatVoiceLog()).toContain("reactivated=no");
++  });
++
++  it("does not start when the take was stopped during the await", async () => {
++    setUserAgent(IPHONE);
++    markSessionMayBeInactive();
++    const controller = mount();
++    act(() => controller.current?.start());
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(10);
++    });
++    act(() => controller.current?.stop());
++    await act(async () => {
++      release?.();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(startSpy).not.toHaveBeenCalled();
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index c668b24bad600a1c9c8d258fb8634590979c54af..f13c1b1c45d531fe462b12235106e22c18d56419 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -9,7 +9,13 @@ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+ import { publishVoiceBins, resetVoiceBins, syntheticVoiceBins } from "@/lib/aeVoiceLevel";
+ import { useVoiceMeter } from "@/lib/aeVoiceMeter";
+ import { logVoice } from "@/lib/aeVoiceLog";
+-import { assertVoiceAudioSession, audioSessionType } from "@/lib/aeAudioSession";
++import {
++  assertVoiceAudioSession,
++  audioSessionState,
++  audioSessionType,
++  reactivateAudioSessionForMic,
++  reactivationPending,
++} from "@/lib/aeAudioSession";
+ import { whenSynthIdle } from "@/lib/aeSpeakReplies";
+ import { createEventStallDetector, createStallDetector, isWebKitSpeech } from "@/lib/aeVoiceStall";
+ import { DictationBusyError, DictationSession } from "@/lib/dictation";
+@@ -473,7 +479,7 @@ export const ComposerMicButton = ({
+       eventStallRef.current.reset(Date.now());
+       // A fresh recognizer gets the whole no-audiostart allowance before that check judges it.
+       takeStartRef.current = Date.now();
+-      const begin = (): boolean => {
++      const startNext = (): boolean => {
+         neverStarted.delete(next);
+         waitingOn.delete(next);
+         silentRestartAt = Date.now();
+@@ -487,6 +493,26 @@ export const ComposerMicButton = ({
+         armLiveness();
+         return true;
+       };
++      // True while this restart is still the live one (checked again after an await).
++      const stillLive = (): boolean =>
++        recognitionRef.current === next &&
++        !disabledRef.current &&
++        listeningRef.current &&
++        !discardingRef.current &&
++        !transitionRef.current &&
++        !(wasVoiceTake && !voiceTakeRef.current);
++      const begin = (): boolean => {
++        if (!reactivationPending()) return startNext();
++        // A long clip may have deactivated the iOS audio session: reactivate, then start.
++        void reactivateAudioSessionForMic().then(() => {
++          if (!stillLive()) {
++            silentStartRef.current = false;
++            return;
++          }
++          if (!startNext()) reportDeaf("stall restart failed");
++        });
++        return true;
++      };
+       if (!old || !isWebKitSpeech() || endedRecognizers.has(old)) return begin();
+       // WebKit: starting now makes the server abort the old recognizer, and that abort lands on
+       // the new one. Wait for the old end (capped), unless the take stopped meanwhile.
+@@ -1437,7 +1463,7 @@ export const ComposerMicButton = ({
+       } else {
+         logVoice(
+           "mic start browser",
+-          `${speechSynthesisState()} audioSession=${audioSessionType()}`,
++          `${speechSynthesisState()} audioSession=${audioSessionType()} sessionState=${audioSessionState()} reactivated=${reactivationPending() ? "yes" : "no"}`,
+         );
+         startSeenRef.current = false;
+         audioStartSeenRef.current = false;
+@@ -1456,15 +1482,33 @@ export const ComposerMicButton = ({
+           synthWaitCancelRef.current = null;
+           // A replaced recognizer owns the start now; this one must not start late.
+           if (recognitionRef.current !== recognition) return;
+-          try {
+-            stallRef.current.reset(Date.now());
+-            eventStallRef.current.reset(Date.now());
+-            assertVoiceAudioSession();
+-            recognition.start();
+-          } catch {
+-            transitionRef.current = false;
+-            browserStartPendingRef.current = false;
++          const startNow = () => {
++            try {
++              stallRef.current.reset(Date.now());
++              eventStallRef.current.reset(Date.now());
++              assertVoiceAudioSession();
++              recognition.start();
++            } catch {
++              transitionRef.current = false;
++              browserStartPendingRef.current = false;
++            }
++          };
++          if (!reactivationPending()) {
++            startNow();
++            return;
+           }
++          // A long clip may have deactivated the iOS audio session: put it back first. A stop
++          // during the await cancels through the same ref a synth wait uses.
++          let stoppedDuringAwait = false;
++          synthWaitCancelRef.current = () => {
++            stoppedDuringAwait = true;
++          };
++          void reactivateAudioSessionForMic().then(() => {
++            if (stoppedDuringAwait) return;
++            synthWaitCancelRef.current = null;
++            if (recognitionRef.current !== recognition) return;
++            startNow();
++          });
+         });
+         // go() may have run at once (no wait): then there is nothing to cancel later.
+         if (!waitDone) synthWaitCancelRef.current = cancelWait;
+diff --git a/web/src/lib/aeAudioSession.test.ts b/web/src/lib/aeAudioSession.test.ts
+index 94b9c8b8a63480b3f22dd2c0fb90d87b86a1ba07..c3601421ad2970d03d68f4169f67dc1654b73648 100644
+--- a/web/src/lib/aeAudioSession.test.ts
++++ b/web/src/lib/aeAudioSession.test.ts
+@@ -4,7 +4,11 @@ import {
+   audioSessionType,
+   enterVoiceAudioSession,
+   leaveVoiceAudioSession,
++  markSessionMayBeInactive,
+   PENDING_HOLD_MS,
++  reactivateAudioSessionForMic,
++  reactivationPending,
++  REACTIVATE_TIMEOUT_MS,
+   resetAudioSessionState,
+ } from "./aeAudioSession";
+ import { formatVoiceLog, resetVoiceLog } from "./aeVoiceLog";
+@@ -155,3 +159,116 @@ describe("audio session pinning", () => {
+     }
+   });
+ });
++
++describe("reactivating the audio session for the mic", () => {
++  class Track {
++    stop = vi.fn();
++  }
++  let tracks: Track[];
++  let gum: ReturnType<typeof vi.fn>;
++  beforeEach(() => {
++    tracks = [];
++    gum = vi.fn(() => {
++      const t = new Track();
++      tracks.push(t);
++      return Promise.resolve({ getTracks: () => [t] });
++    });
++    Object.defineProperty(navigator, "mediaDevices", {
++      configurable: true,
++      value: {
++        getUserMedia: gum,
++        enumerateDevices: vi.fn().mockResolvedValue([]),
++        addEventListener: vi.fn(),
++        removeEventListener: vi.fn(),
++      },
++    });
++  });
++  afterEach(() => {
++    vi.useRealTimers();
++    delete (navigator as { mediaDevices?: unknown }).mediaDevices;
++  });
++
++  it("does nothing while the flag is clear", async () => {
++    setUa(IOS_UA);
++    expect(await reactivateAudioSessionForMic()).toBe(false);
++    expect(gum).not.toHaveBeenCalled();
++  });
++
++  it("does nothing off WebKit even when the flag is set", async () => {
++    setUa(CHROME_UA);
++    markSessionMayBeInactive();
++    expect(reactivationPending()).toBe(false);
++    expect(await reactivateAudioSessionForMic()).toBe(false);
++    expect(gum).not.toHaveBeenCalled();
++  });
++
++  it("opens a mic stream, stops every track, clears the flag and logs", async () => {
++    setUa(IOS_UA);
++    setSession("play-and-record");
++    markSessionMayBeInactive();
++    expect(reactivationPending()).toBe(true);
++    expect(await reactivateAudioSessionForMic()).toBe(true);
++    expect(gum).toHaveBeenCalledTimes(1);
++    expect(tracks).toHaveLength(1);
++    expect(tracks[0].stop).toHaveBeenCalledTimes(1);
++    expect(reactivationPending()).toBe(false);
++    expect(formatVoiceLog()).toContain("reactivate ok");
++    // Clear flag: a second call does not open another stream.
++    await reactivateAudioSessionForMic();
++    expect(gum).toHaveBeenCalledTimes(1);
++  });
++
++  it("logs the audio session state changes once a reactivation has run", async () => {
++    setUa(IOS_UA);
++    const listeners: (() => void)[] = [];
++    Object.defineProperty(navigator, "audioSession", {
++      configurable: true,
++      writable: true,
++      value: {
++        type: "play-and-record",
++        state: "inactive",
++        addEventListener: (_: string, cb: () => void) => listeners.push(cb),
++      },
++    });
++    markSessionMayBeInactive();
++    await reactivateAudioSessionForMic();
++    expect(listeners).toHaveLength(1);
++    markSessionMayBeInactive();
++    await reactivateAudioSessionForMic();
++    expect(listeners).toHaveLength(1);
++    (navigator as unknown as { audioSession: { state: string } }).audioSession.state = "active";
++    listeners[0]();
++    expect(formatVoiceLog()).toContain("audio session state active");
++  });
++
++  it("gives up after the timeout, keeps the flag and stops a late stream", async () => {
++    vi.useFakeTimers();
++    setUa(IOS_UA);
++    let release: (v: unknown) => void = () => {};
++    const late = new Track();
++    gum.mockImplementationOnce(
++      () =>
++        new Promise((resolve) => {
++          release = resolve;
++        }),
++    );
++    markSessionMayBeInactive();
++    const done = reactivateAudioSessionForMic();
++    await vi.advanceTimersByTimeAsync(REACTIVATE_TIMEOUT_MS);
++    expect(await done).toBe(false);
++    expect(reactivationPending()).toBe(true);
++    expect(formatVoiceLog()).toContain("reactivate failed timeout");
++    release({ getTracks: () => [late] });
++    await vi.advanceTimersByTimeAsync(0);
++    expect(late.stop).toHaveBeenCalledTimes(1);
++  });
++
++  it("logs a refusal and carries on", async () => {
++    setUa(IOS_UA);
++    gum.mockRejectedValueOnce(new Error("denied"));
++    markSessionMayBeInactive();
++    expect(await reactivateAudioSessionForMic()).toBe(false);
++    expect(formatVoiceLog()).toContain("reactivate failed denied");
++    expect(reactivationPending()).toBe(true);
++  });
++});
+diff --git a/web/src/lib/aeAudioSession.ts b/web/src/lib/aeAudioSession.ts
+index 9df02db79b8f2645c89cd47acbe02ed95edd9ed2..1aacf4167656176e030c47b0d5fbbbd1fe1ef9f5 100644
+--- a/web/src/lib/aeAudioSession.ts
++++ b/web/src/lib/aeAudioSession.ts
+@@ -4,11 +4,14 @@
+ // "No speech detected". While Voice mode is on, the session is pinned to "play-and-record".
+ // WebKit only, feature-detected, and a no-op everywhere else. Nothing here throws.
+ 
++import { getMicStream, micConstraint } from "./aeAudioDevices";
+ import { logVoice } from "./aeVoiceLog";
+ import { isWebKitSpeech } from "./aeVoiceStall";
+ 
+ interface AudioSessionLike {
+   type: string;
++  state?: string;
++  addEventListener?: (type: "statechange", listener: () => void) => void;
+ }
+ 
+ const VOICE_TYPE = "play-and-record";
+@@ -122,4 +125,78 @@ export function resetAudioSessionState(): void {
+   pendingHold = false;
+   if (pendingTimer !== null) clearTimeout(pendingTimer);
+   pendingTimer = null;
++  sessionMayBeInactive = false;
++  stateListenerInstalled = false;
++}
++
++// iOS 18 WebKit sets the audio session inactive when an <audio> clip longer than about 0.95 s
++// ends, and webkitSpeechRecognition never reactivates it, so the next recognizer start hears
++// nothing. Every resolved getUserMedia({ audio }) reactivates it, so a throwaway mic stream
++// right before the start puts the session back.
++let sessionMayBeInactive = false;
++let stateListenerInstalled = false;
++/** The longest a reactivation may take before the recognizer starts anyway. */
++export const REACTIVATE_TIMEOUT_MS = 1500;
++
++/** A long clip just ended: the next mic start needs a reactivation first. */
++export function markSessionMayBeInactive(): void {
++  sessionMayBeInactive = true;
++}
++
++/** Whether the next mic start will reactivate the audio session first. */
++export function reactivationPending(): boolean {
++  return sessionMayBeInactive && isWebKitSpeech();
++}
++
++/** The Audio Session API state ("active", "inactive", ...), or "none" where it is missing. */
++export function audioSessionState(): string {
++  const session = getSession();
++  if (!session || typeof session.state !== "string") return "none";
++  return session.state;
++}
++
++function watchSessionState(): void {
++  if (stateListenerInstalled) return;
++  const session = getSession();
++  if (!session || typeof session.addEventListener !== "function") return;
++  stateListenerInstalled = true;
++  try {
++    session.addEventListener("statechange", () => {
++      logVoice(`audio session state ${audioSessionState()}`);
++    });
++  } catch {
++    // Observation only.
++  }
++}
++
++/**
++ * Before a WebKit recognizer start: when a long clip may have deactivated the audio session,
++ * open a throwaway mic stream and stop its tracks at once. Never throws; a timeout or a refusal
++ * is logged and the start goes on.
++ */
++export async function reactivateAudioSessionForMic(): Promise<boolean> {
++  if (!sessionMayBeInactive || !isWebKitSpeech()) return false;
++  watchSessionState();
++  logVoice(`audio session state before reactivate ${audioSessionState()}`);
++  const t0 = Date.now();
++  let timer: ReturnType<typeof setTimeout> | null = null;
++  try {
++    const open = getMicStream(micConstraint() ?? true).then((stream) => {
++      stream.getTracks().forEach((track) => track.stop());
++    });
++    const timeout = new Promise<never>((_, reject) => {
++      timer = setTimeout(() => reject(new Error("timeout")), REACTIVATE_TIMEOUT_MS);
++    });
++    // A stream that arrives after the timeout is still stopped by the handler above.
++    await Promise.race([open, timeout]);
++    sessionMayBeInactive = false;
++    logVoice("reactivate ok", `${Date.now() - t0} ms`);
++    return true;
++  } catch (err) {
++    const msg = (err as { message?: string; name?: string } | null)?.message ?? "error";
++    logVoice(`reactivate failed ${msg}`);
++    return false;
++  } finally {
++    if (timer !== null) clearTimeout(timer);
++  }
+ }
+diff --git a/web/src/lib/aeCloudVoice.test.ts b/web/src/lib/aeCloudVoice.test.ts
+index ade49d8a63b3da8a20500657509b750a64373279..7ce61afe627ea63982b0808e3deef502e76dc63e 100644
+--- a/web/src/lib/aeCloudVoice.test.ts
++++ b/web/src/lib/aeCloudVoice.test.ts
+@@ -15,6 +15,7 @@ import {
+   type SpeakOptions,
+   whenSynthIdle,
+ } from "./aeSpeakReplies";
++import { reactivationPending, resetAudioSessionState } from "./aeAudioSession";
+ import { clearPlaybackBlocked, isPlaybackBlocked, resumePlayback } from "./aeVoicePlayback";
+ 
+ const OPTS: SpeakOptions = { voiceURI: null, rate: 1, cloudVoiceId: "en-US-AvaMultilingualNeural" };
+@@ -729,3 +730,46 @@ describe("cloud playback refused by the browser", () => {
+     expect(el.src).toBe(src);
+   });
+ });
++
++describe("marking the iOS audio session after a clip", () => {
++  const IOS_UA =
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1";
++  let originalUa: PropertyDescriptor | undefined;
++  beforeEach(() => {
++    originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++    Object.defineProperty(navigator, "userAgent", { configurable: true, value: IOS_UA });
++    resetAudioSessionState();
++  });
++  afterEach(() => {
++    if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++    else delete (navigator as { userAgent?: unknown }).userAgent;
++    resetAudioSessionState();
++  });
++
++  async function playClip(duration: number, stopFirst = false) {
++    const speaker = createCloudSpeaker(new FakeDevice());
++    speaker.speak("Hello there.", OPTS);
++    await settle();
++    pending[0].resolve(mp3());
++    await settle();
++    const el = FakeAudio.last as FakeAudio & { duration: number };
++    el.duration = duration;
++    if (stopFirst) speaker.stop();
++    else el.end();
++  }
++
++  it("marks the session after a clip longer than 0.95 s ends", async () => {
++    await playClip(2.4);
++    expect(reactivationPending()).toBe(true);
++  });
++
++  it("does not mark after a short clip", async () => {
++    await playClip(0.6);
++    expect(reactivationPending()).toBe(false);
++  });
++
++  it("does not mark when playback is stopped", async () => {
++    await playClip(2.4, true);
++    expect(reactivationPending()).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeCloudVoice.ts b/web/src/lib/aeCloudVoice.ts
+index 786658a198c14fb1c048ecc07a1f3d735cfe8f8e..f475d1c83b38db9b8cdb59a5da151bcb0042bbbf 100644
+--- a/web/src/lib/aeCloudVoice.ts
++++ b/web/src/lib/aeCloudVoice.ts
+@@ -13,11 +13,14 @@ import { splitForSpeech } from "./aeSpeechText";
+ import { speakerSinkId } from "./aeAudioDevices";
+ import { clearPlaybackBlocked, markPlaybackBlocked } from "./aeVoicePlayback";
+ import { logVoice } from "./aeVoiceLog";
+-import { assertVoiceAudioSession } from "./aeAudioSession";
++import { assertVoiceAudioSession, markSessionMayBeInactive } from "./aeAudioSession";
+ import { isWebKitSpeech } from "./aeVoiceStall";
+ import { withBasePath } from "./basePath";
+ import { authenticatedFetch } from "./identity";
+ 
++/** WebKit deactivates the iOS audio session when a clip longer than this ends. */
++const LONG_CLIP_SECONDS = 0.95;
++
+ export interface CloudVoice {
+   id: string;
+   name: string;
+@@ -213,6 +216,11 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+       release = () => finish(true);
+       el.onended = () => {
+         logVoice("play end");
++        // WebKit deactivates the iOS audio session when a clip longer than this ends.
++        if (isWebKitSpeech() && el.duration > LONG_CLIP_SECONDS) {
++          markSessionMayBeInactive();
++          logVoice(`play end dur=${el.duration.toFixed(2)}`);
++        }
+         finish(true);
+       };
+       el.onerror = () => {

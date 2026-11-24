@@ -1,0 +1,140 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 18:38:41 -0800
+Subject: [PATCH 386/443] [ae-patch] Fix the review findings on 0385: read a
+ child's parent from the launch snapshot on every launch path
+
+---
+ omnigent/runner/native/orchestration.py       | 10 ++-
+ .../test_app_claude_native_launch_args.py     | 72 +++++++++++++++++++
+ 2 files changed, 79 insertions(+), 3 deletions(-)
+
+diff --git a/omnigent/runner/native/orchestration.py b/omnigent/runner/native/orchestration.py
+index 9c0771692ca5a02796702644086ca87542d2220f..689ff7c04f38fc46d1ed809b80470795e6d3cf17 100644
+--- a/omnigent/runner/native/orchestration.py
++++ b/omnigent/runner/native/orchestration.py
+@@ -8081,6 +8081,9 @@ class _ClaudeSessionLaunchMetadata:
+     #: session carries a routing decision — a web create routes the model
+     #: before the pane launches — so no prompt is ever held and replayed.
+     turn_routing: bool = False
++    #: The session's parent (``parent_session_id``), set for a family child; read from
++    #: the init envelope or, when launch carries none, the fetched snapshot (AE patch).
++    parent_session_id: str | None = None
+ 
+ 
+ def _claude_launch_metadata_from_envelope(
+@@ -8116,6 +8119,7 @@ def _claude_launch_metadata_from_envelope(
+         fork_carry_history=snapshot.labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+         claude_account=snapshot.labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
+         live_claude_account=snapshot.labels.get(ACCOUNT_LIVE_LABEL),
++        parent_session_id=snapshot.parent_session_id or None,
+     )
+ 
+ 
+@@ -8152,6 +8156,7 @@ async def _load_legacy_claude_launch_metadata(
+     model_override = snapshot.get("model_override")
+     launch_args = snapshot.get("terminal_launch_args")
+     external_session_id = snapshot.get("external_session_id")
++    parent_session_id = snapshot.get("parent_session_id") or None
+     labels = snapshot.get("labels")
+     labels = labels if isinstance(labels, dict) else {}
+     fork_source = labels.get(FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY)
+@@ -8186,6 +8191,7 @@ async def _load_legacy_claude_launch_metadata(
+         fork_carry_history=labels.get(FORK_CARRY_HISTORY_LABEL_KEY) == "1",
+         claude_account=labels.get(CLAUDE_ACCOUNT_LABEL_KEY),
+         live_claude_account=labels.get(ACCOUNT_LIVE_LABEL),
++        parent_session_id=parent_session_id if isinstance(parent_session_id, str) else None,
+     )
+     permission_mode = _claude_launch_permission_mode(metadata.terminal_launch_args)
+     _logger.info(
+@@ -9057,9 +9063,7 @@ async def _auto_create_claude_terminal(
+ 
+     apply_child_auto_compact_window(
+         claude_terminal_env,
+-        parent_session_id=(
+-            session_init.snapshot.parent_session_id if session_init is not None else None
+-        ),
++        parent_session_id=launch_metadata.parent_session_id,
+         inherited_env=os.environ,
+     )
+     # Name the account before the first render, so usage readers do not wait for the shim.
+diff --git a/tests/runner/test_app_claude_native_launch_args.py b/tests/runner/test_app_claude_native_launch_args.py
+index b4cfbdc9026e3f7336bd8468173cc095d9a5cf17..a9bd6ff20ef6d20b2d6e829096e5fa0a32258926 100644
+--- a/tests/runner/test_app_claude_native_launch_args.py
++++ b/tests/runner/test_app_claude_native_launch_args.py
+@@ -1502,3 +1502,75 @@ async def test_auto_create_claude_terminal_rejects_missing_env_chdir_target(
+     assert sorted(path.name for path in workspace.iterdir()) == []
+     assert not (Path.cwd() / config_dir).exists()
+     registry.launch_required_terminal.assert_not_called()
++
++
++@pytest.mark.parametrize(
++    "init_parent,snapshot_parent,expected",
++    [
++        pytest.param("conv_p", None, "250000", id="envelope-parent"),
++        pytest.param(None, "conv_p", "250000", id="ensure-path-snapshot-parent"),
++        pytest.param(None, None, None, id="no-parent-anywhere"),
++    ],
++)
++async def test_auto_create_claude_terminal_caps_only_a_child_sessions_compact_window(
++    bridge_dir: Path,
++    monkeypatch: pytest.MonkeyPatch,
++    init_parent: str | None,
++    snapshot_parent: str | None,
++    expected: str | None,
++) -> None:
++    """
++    A child's launch env carries the auto-compact window; a parent's does not.
++
++    The explicit ensure route (first turn, idle-pane recovery, resume, account
++    relaunch) passes no init envelope, so the parent there comes from the
++    fetched session snapshot.
++
++    :param init_parent: ``parent_session_id`` in the init envelope; ``None`` runs the
++        ensure path with no envelope at all.
++    :param snapshot_parent: ``parent_session_id`` the session snapshot answers with.
++    :param expected: The ``CLAUDE_CODE_AUTO_COMPACT_WINDOW`` the pane env should carry.
++    """
++    from unittest.mock import AsyncMock, Mock
++
++    import httpx
++
++    from omnigent.harnesses.claude_native import ae_launch_account, diagnostics
++    from omnigent.runner.native import orchestration
++    from omnigent.runner.resource_registry import SessionResourceRegistry
++
++    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
++    monkeypatch.setattr("omnigent.inference_config.load_runtime_inference_config", dict)
++    monkeypatch.setattr("omnigent.config.load_effective_config", dict)
++    monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
++    monkeypatch.setattr(diagnostics, "ClaudeDebugLogFollower", lambda _: Mock())
++    seen: list[dict[str, str]] = []
++
++    def stop_after_env(_bridge: Path, env: dict[str, str]) -> None:
++        seen.append(dict(env))
++        raise RuntimeError("stop after env")
++
++    monkeypatch.setattr(ae_launch_account, "write_launch_account", stop_after_env)
++
++    def handler(_request: httpx.Request) -> httpx.Response:
++        return httpx.Response(200, json={"parent_session_id": snapshot_parent})
++
++    session_id = "conv_child_compact"
++    session_init = _claude_auto_create_session_init(session_id, bridge_dir)
++    session_init.snapshot.parent_session_id = init_parent
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://runner"
++    ) as client:
++        with pytest.raises(RuntimeError, match="stop after env"):
++            await orchestration._auto_create_claude_terminal(
++                session_id,
++                Mock(spec=SessionResourceRegistry),
++                Mock(),
++                server_client=client,
++                session_init=session_init if init_parent is not None else None,
++                auth_token_factory=lambda: None,
++                resolve_launch_config=AsyncMock(return_value=None),
++            )
++
++    assert len(seen) == 1
++    assert seen[0].get("CLAUDE_CODE_AUTO_COMPACT_WINDOW") == expected

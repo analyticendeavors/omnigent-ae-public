@@ -1665,10 +1665,18 @@ def _subject(text: str) -> str:
     return text[: _ID_SUBJECT_MAX - 9] + "~" + hashlib.sha1(text.encode()).hexdigest()[:8]
 
 
-def _package_list(alerts: list[dict[str, Any]]) -> str:
-    names = list(dict.fromkeys(str(a.get("package") or "") for a in alerts))
-    shown = ", ".join(names[:3])
-    return f"{shown} and {len(names) - 3} more" if len(names) > 3 else shown
+def _alerts_title(alerts: list[dict[str, Any]]) -> str:
+    """ "61 Dependabot alerts: Pillow and 12 more packages" (names merged by case)."""
+    seen: dict[str, str] = {}
+    for a in alerts:
+        name = str(a.get("package") or "").strip()
+        if name:
+            seen.setdefault(name.lower(), name)
+    names = list(seen.values())
+    first = names[0] if names else "unknown package"
+    head = f"{_plural(len(alerts), 'Dependabot alert')}: {first}"
+    more = len(names) - 1
+    return f"{head} and {_plural(more, 'more package')}" if more > 0 else head
 
 
 def error_code(note: str | None) -> str:
@@ -1825,7 +1833,7 @@ def needs(
                     "urgent",
                     repo["repo"],
                     scope,
-                    title=f"{_plural(len(fix), 'alert')} to fix: {_package_list(fix)}",
+                    title=_alerts_title(fix),
                     meta=f"{name} · worst is {worst.lower()}" if worst else name,
                     url=f"https://github.com/{repo['repo']}/security/dependabot",
                     state={

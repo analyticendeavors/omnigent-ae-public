@@ -1,0 +1,1068 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:08:55 -0800
+Subject: [PATCH 381/443] [ae-patch] Fix the voice log, meter and approval
+ review findings (0381)
+
+Meter off: a take with no recognizer activity for 10 s after audiostart gets a fresh recognizer silently (log "mic idle recycle", never reported deaf), at most 6 a minute, then "mic idle recycle capped" until the next result. The event stall detector counts speech only on speechstart or a soundstart that lasted 600 ms before its soundend, also fires 6 s after the last sound or speech event when no end event came, and restarts silently without ever escalating to "stalled repeatedly". The Level meter setting is a dependency of the meter effect, so a change mid-take opens or closes the second stream.
+Approvals: the voice answer is marked only after the POST went through (a card that is pending again is a failure: the id is forgotten and "approval answer failed" is logged), and approvalOf matches the registered ae_slot_cap policy name exactly.
+Voice log: a throttled Voice-end upload shows no toast; page-hide uploads use the new reason page_hidden with a 60 s budget of their own; a keepalive request is retried without keepalive only after a non-abort failure while the page is visible.
+Server: the resolve route logs after a successful resolve, with ids as %r capped at 120 characters.
+---
+ .../routes/sessions/routes_elicitations.py    |   8 +-
+ .../test_sessions_elicitation_resolve_url.py  |  32 +++-
+ .../ComposerMicButton.meterOff.test.tsx       | 147 +++++++++++++++++-
+ web/src/components/ComposerMicButton.tsx      |  64 ++++++--
+ web/src/hooks/useAeVoiceMode.test.tsx         |  41 +++++
+ web/src/hooks/useAeVoiceMode.ts               |  50 ++++--
+ web/src/lib/aeVoiceLog.test.ts                |  42 ++++-
+ web/src/lib/aeVoiceLog.ts                     |  44 ++++--
+ web/src/lib/aeVoiceMode.test.ts               |  21 ++-
+ web/src/lib/aeVoiceMode.ts                    |   5 +-
+ web/src/lib/aeVoiceStall.test.ts              |  68 +++++++-
+ web/src/lib/aeVoiceStall.ts                   |  65 ++++++--
+ 12 files changed, 517 insertions(+), 70 deletions(-)
+
+diff --git a/omnigent/server/routes/sessions/routes_elicitations.py b/omnigent/server/routes/sessions/routes_elicitations.py
+index 8a0645930e411ee804f0ecd1e53a7b6060df5fdb..0e7c8870b967de448cf46c22cb1d420171f240c9 100644
+--- a/omnigent/server/routes/sessions/routes_elicitations.py
++++ b/omnigent/server/routes/sessions/routes_elicitations.py
+@@ -153,15 +153,17 @@ def register_elicitations_routes(
+             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+             if conv is None:
+                 raise _session_not_found()
++        _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
++        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
++        # After the resolve succeeded, with ids as ``%r`` capped at 120 characters: a path id
++        # holding a newline must not forge a second log record.
+         _logger.info(
+-            "elicitation resolve: session=%s elicitation=%s action=%s source=%s",
++            "elicitation resolve: session=%.120r elicitation=%.120r action=%s source=%s",
+             session_id,
+             elicitation_id,
+             body.action,
+             sanitize_resolve_source(body.meta),
+         )
+-        _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+-        await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+         # Apply any policy writes deferred by the relay tool-call ASK gate
+         # (e.g. a cost-budget checkpoint) now that the verdict is in.
+         await _apply_pending_policy_ask_writes(
+diff --git a/tests/server/integration/test_sessions_elicitation_resolve_url.py b/tests/server/integration/test_sessions_elicitation_resolve_url.py
+index aa50eb0c7d66a600f5fc728a52e2287f9237d4dd..1519e48d08d4820802ab554f95751ed0fb3f1f72 100644
+--- a/tests/server/integration/test_sessions_elicitation_resolve_url.py
++++ b/tests/server/integration/test_sessions_elicitation_resolve_url.py
+@@ -1274,7 +1274,7 @@ async def test_resolve_url_logs_one_line_with_sanitized_source(
+ 
+     lines = [r.getMessage() for r in caplog.records if "elicitation resolve:" in r.getMessage()]
+     assert lines == [
+-        f"elicitation resolve: session={session_id} elicitation={elicitation_id} "
++        f"elicitation resolve: session={session_id!r} elicitation={elicitation_id!r} "
+         "action=decline source=unknown"
+     ]
+     assert "SECRET" not in caplog.text
+@@ -1301,6 +1301,36 @@ async def test_resolve_url_logs_known_source(
+     assert "action=accept source=voice_panel" in caplog.text
+ 
+ 
++async def test_resolve_url_log_line_cannot_be_forged_by_a_newline_in_the_id(
++    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
++) -> None:
++    """
++    An elicitation id with an encoded newline never reaches the log as a forged record: ids are
++    logged as ``%r`` (escaped, capped at 120 characters), after the resolve succeeded.
++    """
++    import logging
++
++    agent = await create_test_agent(client, "test-resolve-url-log-forge")
++    session_id = await _create_session(client, agent["id"])
++    forged = "x%0AINFO%20omnigent:%20elicitation%20resolve:%20session=forged"
++    with caplog.at_level(logging.INFO):
++        resp = await client.post(
++            f"/v1/sessions/{session_id}/elicitations/{forged}/resolve",
++            json={"action": "accept"},
++        )
++    assert resp.status_code == 202, resp.text
++    messages = [r.getMessage() for r in caplog.records if "elicitation resolve:" in r.getMessage()]
++    # One record, the newline escaped by %r: no raw newline, so no second forged line.
++    assert len(messages) == 1
++    assert "\n" not in messages[0]
++    assert "x\\nINFO" in messages[0]
++    assert not any(
++        line.startswith(("INFO", "elicitation resolve:"))
++        for record in caplog.records
++        for line in record.getMessage().splitlines()[1:]
++    )
++
++
+ async def test_resolve_url_cancel_round_trip(client: httpx.AsyncClient) -> None:
+     """
+     A ``cancel`` verdict at the URL endpoint maps to Claude's
+diff --git a/web/src/components/ComposerMicButton.meterOff.test.tsx b/web/src/components/ComposerMicButton.meterOff.test.tsx
+index 1a1fab2e1488de3052a4dca710192478ba037542..a94871fdf6074c51c1608040baa9e0e96746f004 100644
+--- a/web/src/components/ComposerMicButton.meterOff.test.tsx
++++ b/web/src/components/ComposerMicButton.meterOff.test.tsx
+@@ -8,7 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { getMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+ import { getVoiceBins, resetVoiceBins } from "@/lib/aeVoiceLevel";
+ import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
+-import { VOICE_METER_KEY } from "@/lib/aeVoiceMeter";
++import { VOICE_METER_KEY, writeVoiceMeter } from "@/lib/aeVoiceMeter";
+ import { ComposerMicButton } from "./ComposerMicButton";
+ 
+ type Handlers = Record<string, (event: unknown) => void>;
+@@ -178,10 +178,16 @@ describe("ComposerMicButton (level meter off)", () => {
+     expect(getMicLevel()).toBeLessThan(0.05);
+   });
+ 
+-  it("has no meter deaf reasons: a quiet take with life from the recognizer is never called deaf", async () => {
++  it("has no meter deaf reasons: a take with some life from the recognizer is never called deaf", async () => {
+     setUserAgent(IOS_UA);
+     const { onListeningChange } = await listenVoice();
+-    await run(20_000);
++    for (let i = 0; i < 6; i += 1) {
++      // oxlint-disable-next-line no-await-in-loop -- one beat of fake time per round
++      await run(4000);
++      act(() => instances[0].handlers.soundstart?.({}));
++      act(() => instances[0].handlers.soundend?.({}));
++    }
++    expect(instances).toHaveLength(1);
+     expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
+     const log = formatVoiceLog();
+     for (const reason of ["track muted", "context not running", "analyser silent"]) {
+@@ -189,6 +195,71 @@ describe("ComposerMicButton (level meter off)", () => {
+     }
+   });
+ 
++  it("recycles a recognizer with no activity 10 s after audiostart, silently and without calling it deaf", async () => {
++    setUserAgent(IOS_UA);
++    const { controller, onListeningChange } = await listenVoice();
++    await run(9500);
++    expect(instances).toHaveLength(1);
++    await run(1000);
++    expect(instances).toHaveLength(2);
++    const log = formatVoiceLog();
++    expect(log).toContain("mic idle recycle");
++    expect(log).not.toContain("mic deaf");
++    expect(log).not.toContain("mic stalled");
++    expect(onListeningChange).not.toHaveBeenCalledWith(false);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    expect(controller.current?.isListening()).toBe(true);
++    expect(startSpy).toHaveBeenCalledTimes(2);
++    // The fresh recognizer is given the no-audiostart allowance, not judged at once.
++    await run(3000);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++  });
++
++  it("any recognizer activity restarts the 10 s idle wait", async () => {
++    setUserAgent(IOS_UA);
++    await listenVoice();
++    await run(8000);
++    act(() => instances[0].handlers.soundstart?.({}));
++    act(() => instances[0].handlers.soundend?.({}));
++    await run(8000);
++    expect(instances).toHaveLength(1);
++  });
++
++  it("stops after 6 idle recycles in a minute, logs it, and resumes after the next result", async () => {
++    setUserAgent(IOS_UA);
++    await listenVoice();
++    let seen = 1;
++    const reviveLatest = () => {
++      const latest = instances[instances.length - 1];
++      latest.handlers.start?.({});
++      latest.handlers.audiostart?.({});
++    };
++    // Half-second beats keep every recycle exactly 10 s after the audiostart that followed the last.
++    for (let beat = 0; beat < 180; beat += 1) {
++      // oxlint-disable-next-line no-await-in-loop -- fake time advances one beat at a time
++      await act(async () => {
++        await vi.advanceTimersByTimeAsync(500);
++        if (instances.length > seen) {
++          seen = instances.length;
++          reviveLatest();
++        }
++      });
++    }
++    expect(instances).toHaveLength(7);
++    const log = formatVoiceLog();
++    expect(log.match(/mic idle recycle capped/g)).toHaveLength(1);
++    expect(log.match(/mic idle recycle(?! capped)/g)).toHaveLength(6);
++    // A result lifts the cap.
++    act(() =>
++      instances[6].handlers.result?.({
++        resultIndex: 0,
++        results: { length: 1, 0: { length: 1, isFinal: false, 0: { transcript: "hi" } } },
++      }),
++    );
++    await run(11_000);
++    expect(instances).toHaveLength(8);
++  });
++
+   it("calls a stall from recognizer events: sound heard, then 3.5 s with no result after it ends", async () => {
+     setUserAgent(IOS_UA);
+     const { controller, onListeningChange } = await listenVoice();
+@@ -226,6 +297,76 @@ describe("ComposerMicButton (level meter off)", () => {
+     expect(instances).toHaveLength(1);
+   });
+ 
++  it("a cough (a short sound, then its end) with no result never stalls the take", async () => {
++    setUserAgent(IOS_UA);
++    await listenVoice();
++    for (let i = 0; i < 3; i += 1) {
++      act(() => instances[0].handlers.soundstart?.({}));
++      // oxlint-disable-next-line no-await-in-loop -- one beat of fake time per round
++      await run(300);
++      act(() => instances[0].handlers.soundend?.({}));
++      // oxlint-disable-next-line no-await-in-loop -- one beat of fake time per round
++      await run(5000);
++    }
++    expect(instances).toHaveLength(1);
++    expect(formatVoiceLog()).not.toContain("mic stalled");
++  });
++
++  it("speech heard and then nothing at all stalls after 6 s, with no end event", async () => {
++    setUserAgent(IOS_UA);
++    const { controller, onListeningChange } = await listenVoice();
++    act(() => instances[0].handlers.speechstart?.({}));
++    await run(5500);
++    expect(instances).toHaveLength(1);
++    await run(1000);
++    expect(instances).toHaveLength(2);
++    expect(formatVoiceLog()).toContain("mic stalled");
++    expect(onListeningChange).not.toHaveBeenCalledWith(false);
++    expect(controller.current?.isListening()).toBe(true);
++  });
++
++  it("event stalls restart silently every time and never call the mic deaf", async () => {
++    setUserAgent(IOS_UA);
++    const { onListeningChange } = await listenVoice();
++    for (let i = 0; i < 6; i += 1) {
++      const latest = instances[instances.length - 1];
++      act(() => {
++        latest.handlers.start?.({});
++        latest.handlers.audiostart?.({});
++        latest.handlers.speechstart?.({});
++      });
++      // oxlint-disable-next-line no-await-in-loop -- one stall per round
++      await run(6500);
++      expect(instances).toHaveLength(i + 2);
++    }
++    const log = formatVoiceLog();
++    expect(log).not.toContain("stalled repeatedly");
++    expect(log).not.toContain("mic deaf");
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++  });
++
++  it("turning the Level meter on mid-take opens the second stream, and off closes it", async () => {
++    setUserAgent(CHROME_UA);
++    window.localStorage.setItem(VOICE_METER_KEY, "off");
++    await listenVoice();
++    expect(getUserMedia).not.toHaveBeenCalled();
++    await act(async () => {
++      writeVoiceMeter(true);
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(getUserMedia).toHaveBeenCalledTimes(1);
++    expect(audioContexts).toBe(1);
++    expect(formatVoiceLog()).toContain("meter on");
++    const stream = (await getUserMedia.mock.results[0].value) as FakeStream;
++    await act(async () => {
++      writeVoiceMeter(false);
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(stream.track.stop).toHaveBeenCalled();
++    expect(getUserMedia).toHaveBeenCalledTimes(1);
++    expect(formatVoiceLog().match(/meter off/g)).toHaveLength(2);
++  });
++
+   it("an explicit On on an iPhone runs the meter; an explicit Off elsewhere does not", async () => {
+     setUserAgent(IOS_UA);
+     window.localStorage.setItem(VOICE_METER_KEY, "on");
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index adb88e7413ac8d247833aca8b7253c1cdf2a12d1..8840e4334916cc1ee2b5e3bf113b45b018192954 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -7,7 +7,7 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { getMicStream } from "@/lib/aeAudioDevices";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+ import { publishVoiceBins, resetVoiceBins, syntheticVoiceBins } from "@/lib/aeVoiceLevel";
+-import { readVoiceMeter } from "@/lib/aeVoiceMeter";
++import { useVoiceMeter } from "@/lib/aeVoiceMeter";
+ import { logVoice } from "@/lib/aeVoiceLog";
+ import { createEventStallDetector, createStallDetector, isWebKitSpeech } from "@/lib/aeVoiceStall";
+ import { DictationBusyError, DictationSession } from "@/lib/dictation";
+@@ -104,6 +104,12 @@ const MIC_METER_FRESH_MS = 1500;
+ // Stall restarts (speech heard, no result) allowed per minute before the take is called deaf.
+ const MIC_STALL_MAX_PER_MIN = 3;
+ const MIC_STALL_WINDOW_MS = 60_000;
++// With the level meter off nothing else watches the mic: no recognizer activity (soundstart,
++// speechstart, result) this long after audiostart gets a fresh recognizer, so a capture another
++// app or tab took is reacquired. It is not "deaf": the user may just be quiet. At most this many
++// idle recycles per minute, then none until the next result.
++const MIC_IDLE_RECYCLE_MS = 10_000;
++const MIC_IDLE_RECYCLE_MAX_PER_MIN = 6;
+ // The assistant's own voice reaching the mic is not the user: no stall checks while it plays
+ // and for this long after.
+ const MIC_STALL_AUDIBLE_TAIL_MS = 1500;
+@@ -176,6 +182,8 @@ export const ComposerMicButton = ({
+   const serverAvailableRef = useRef(serverAvailable);
+   serverAvailableRef.current = serverAvailable;
+   const [isListening, setIsListening] = useState(false);
++  // The Level meter setting: turning it on or off mid-take starts or stops the second stream.
++  const meterSetting = useVoiceMeter();
+   // Server-path only: the take has started but audio isn't flowing yet (the
+   // first take cold-loads the model, up to ~40s). Shows a spinner so the click
+   // isn't a dead-looking button until it flips to listening.
+@@ -247,6 +255,8 @@ export const ComposerMicButton = ({
+   const eventStallRef = useRef(createEventStallDetector());
+   const pulseTargetRef = useRef(0);
+   const stallTimesRef = useRef<number[]>([]);
++  const idleRecycleTimesRef = useRef<number[]>([]);
++  const idleRecycleCappedRef = useRef(false);
+   // Voice mode's assistant is speaking (or just did): the stall detector is off.
+   const assistantAudibleRef = useRef(false);
+   const audibleUntilRef = useRef(0);
+@@ -374,8 +384,14 @@ export const ComposerMicButton = ({
+       return true;
+     };
+ 
+-    const handleStall = (sinceResultMs: number, now: number) => {
++    const handleStall = (sinceResultMs: number, now: number, fromEvents: boolean) => {
+       logVoice("mic stalled", String(sinceResultMs));
++      // A stall seen only through recognizer events (meter off) restarts silently, every time:
++      // those events are weaker evidence than the meter, so they never call the mic deaf.
++      if (fromEvents) {
++        if (!silentRestart(true)) reportDeaf("stall restart failed");
++        return;
++      }
+       const recent = stallTimesRef.current.filter((t) => now - t < MIC_STALL_WINDOW_MS);
+       if (recent.length >= MIC_STALL_MAX_PER_MIN) {
+         stallTimesRef.current = recent;
+@@ -386,6 +402,28 @@ export const ComposerMicButton = ({
+       if (!silentRestart(true)) reportDeaf("stall restart failed");
+     };
+ 
++    // Meter off, recognizer silent since audiostart: start a fresh one in place (no report).
++    const idleRecycle = (now: number) => {
++      if (!audioStartSeenRef.current || idleRecycleCappedRef.current) return;
++      if (assistantAudibleRef.current || now < audibleUntilRef.current) return;
++      if (now - lastRecognizerActivityRef.current < MIC_IDLE_RECYCLE_MS) return;
++      const recent = idleRecycleTimesRef.current.filter((t) => now - t <= MIC_STALL_WINDOW_MS);
++      if (recent.length >= MIC_IDLE_RECYCLE_MAX_PER_MIN) {
++        idleRecycleTimesRef.current = recent;
++        idleRecycleCappedRef.current = true;
++        logVoice("mic idle recycle capped");
++        return;
++      }
++      idleRecycleTimesRef.current = [...recent, now];
++      logVoice("mic idle recycle");
++      if (!silentRestart()) {
++        reportDeaf("idle recycle failed");
++        return;
++      }
++      // The fresh recognizer gets the whole no-audiostart allowance before that check judges it.
++      takeStartRef.current = now;
++    };
++
+     const checkLiveness = () => {
+       if (!voiceTakeRef.current || !listeningRef.current) return;
+       const now = Date.now();
+@@ -410,12 +448,15 @@ export const ComposerMicButton = ({
+           ? stallRef.current.evaluate(now)
+           : eventStallRef.current.evaluate(now);
+         if (stalledFor !== null) {
+-          handleStall(stalledFor, now);
++          handleStall(stalledFor, now, !meterOnRef.current);
+           return;
+         }
+       }
+       // No meter, no meter-based deaf reasons (track muted, context stalled, analyser zeros).
+-      if (!meterOnRef.current) return;
++      if (!meterOnRef.current) {
++        idleRecycle(now);
++        return;
++      }
+       // The meter never decides alone: it counts only after the recognizer itself has shown
+       // no activity for a while (an early soundstart does not switch the checks off for good).
+       if (now - lastRecognizerActivityRef.current < MIC_RECOGNIZER_QUIET_MS) return;
+@@ -548,7 +589,7 @@ export const ComposerMicButton = ({
+         if (!current()) return;
+         logVoice("mic event soundstart");
+         pulseTargetRef.current = 0.5;
+-        eventStallRef.current.heard(Date.now());
++        eventStallRef.current.soundStart(Date.now());
+         recognizerSoundSeenRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+       };
+@@ -556,7 +597,7 @@ export const ComposerMicButton = ({
+         if (!current()) return;
+         logVoice("mic event speechstart");
+         pulseTargetRef.current = 0.8;
+-        eventStallRef.current.heard(Date.now());
++        eventStallRef.current.speechStart(Date.now());
+         recognizerSoundSeenRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+       };
+@@ -578,13 +619,14 @@ export const ComposerMicButton = ({
+         if (!current()) return;
+         logVoice("mic event soundend");
+         pulseTargetRef.current = 0;
+-        eventStallRef.current.ended(Date.now());
++        eventStallRef.current.soundEnd(Date.now());
+       };
+       const handleResult = (event: Event) => {
+         if (!current()) return;
+         recognizerSoundSeenRef.current = true;
+         resultSinceStopRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
++        idleRecycleCappedRef.current = false;
+         stallRef.current.result(Date.now());
+         eventStallRef.current.result(Date.now());
+         pulseTargetRef.current = 0.65;
+@@ -750,7 +792,7 @@ export const ComposerMicButton = ({
+   // hides its audio buffer. Chrome batches the permission to one prompt.
+   useEffect(() => {
+     if (!isListening) return;
+-    const meterOn = readVoiceMeter();
++    const meterOn = meterSetting;
+     meterOnRef.current = meterOn;
+     logVoice(meterOn ? "meter on" : "meter off");
+     if (!meterOn) {
+@@ -1007,7 +1049,7 @@ export const ComposerMicButton = ({
+         if (el) el.style.transform = `scaleY(${BAR_BASELINE})`;
+       }
+     };
+-  }, [isListening]);
++  }, [isListening, meterSetting]);
+ 
+   // Server-dictation toggle. Start resolves only once the mic + socket
+   // handshake are up, so isListening flips exactly when audio flows.
+@@ -1259,6 +1301,8 @@ export const ComposerMicButton = ({
+         voiceTakeRef.current = true;
+         // A new Voice mode take: the stall budget is whole again.
+         stallTimesRef.current = [];
++        idleRecycleTimesRef.current = [];
++        idleRecycleCappedRef.current = false;
+         if (browserStartPendingRef.current) {
+           watchPermission();
+           armWatchdog();
+@@ -1281,6 +1325,8 @@ export const ComposerMicButton = ({
+         if (pathRef.current === "browser") {
+           logVoice("mic restart", listeningRef.current ? "while listening" : undefined);
+           stallTimesRef.current = [];
++          idleRecycleTimesRef.current = [];
++          idleRecycleCappedRef.current = false;
+           silentStartRef.current = false;
+           clearStartWatchdog();
+           clearStopWatchdog();
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 8af03511e9b180280e4ef4729b7c3018df78beca..136b707a3197e535ec3820f9381b7b5a5d1ad109 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -1000,6 +1000,47 @@ describe("useAeVoiceMode", () => {
+       expect(submitApproval).toHaveBeenCalledTimes(1);
+     });
+ 
++    it("a failed POST frees the card: the panel can answer again", async () => {
++      const { result } = mountApproval();
++      // The store rolls a failed POST back to a pending card and resolves; the mock leaves it pending.
++      act(() => result.current.answerApproval("accept"));
++      await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
++      expect(formatVoiceLog()).toContain("approval answer failed");
++      act(() => result.current.answerApproval("accept"));
++      expect(submitApproval).toHaveBeenCalledTimes(2);
++    });
++
++    it("a failed POST frees the card: a spoken answer retries", async () => {
++      const { result } = mountApproval();
++      act(() => void result.current.onFinal("run it"));
++      await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).toHaveBeenCalledTimes(2);
++    });
++
++    it("a rejected POST frees the card too", async () => {
++      const { result } = mountApproval();
++      submitApproval.mockImplementationOnce(() => Promise.reject(new Error("offline")));
++      act(() => result.current.answerApproval("decline"));
++      await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
++      expect(formatVoiceLog()).toContain("approval answer failed");
++      act(() => result.current.answerApproval("decline"));
++      expect(submitApproval).toHaveBeenCalledTimes(2);
++    });
++
++    it("a POST that went through keeps the card answered", async () => {
++      const { result } = mountApproval();
++      submitApproval.mockImplementationOnce(() => {
++        useChatStore.setState({ blocks: [{ ...APPROVAL, status: "responded" }] } as never);
++        return Promise.resolve();
++      });
++      act(() => result.current.answerApproval("accept"));
++      await act(async () => void (await vi.advanceTimersByTimeAsync(0)));
++      expect(formatVoiceLog()).not.toContain("approval answer failed");
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++    });
++
+     it("answerApproval declines with the panel as its source and does nothing with no card", () => {
+       const { result } = mountApproval();
+       act(() => result.current.answerApproval("decline"));
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 948c32585ac0bc0760ff6fd99ec482ee0afc0acf..03cc52eb138a9f3d57bb07a965ee4b7d7ab77286 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -152,6 +152,8 @@ export function useAeVoiceMode({
+   // Approval answers: the cards already answered by voice, when the recognition of the
+   // current utterance began, and the moment before which a heard final is the line's echo.
+   const approvalAnswered = useRef<Set<string>>(new Set());
++  /** Approvals whose POST is on its way, so a second answer cannot double-submit. */
++  const approvalInFlight = useRef<Set<string>>(new Set());
+   const utteranceStartedAt = useRef<number | null>(null);
+   const approvalReadyAt = useRef(0);
+   const approvalPlaybackSeen = useRef(false);
+@@ -654,6 +656,40 @@ export function useAeVoiceMode({
+     [on, bargeIn],
+   );
+ 
++  /**
++   * Submits one approval and marks the id answered only once the POST went through. The store
++   * rolls a failed POST back to a pending card without throwing, so a card that is pending again
++   * after the call is a failure: the id is forgotten and the panel and a spoken answer can retry.
++   */
++  const sendApproval = useCallback(
++    (id: string, action: "accept" | "decline", source: "voice" | "voice_panel") => {
++      if (approvalInFlight.current.has(id)) return;
++      approvalInFlight.current.add(id);
++      void (async () => {
++        let failed: boolean;
++        try {
++          await useChatStore
++            .getState()
++            .submitApproval(id, action, undefined, withApprovalSource(source));
++          const pending = useChatStore
++            .getState()
++            .blocks.find((b) => b.type === "elicitation" && b.elicitationId === id);
++          failed = pending?.type === "elicitation" && pending.status === "pending";
++        } catch {
++          failed = true;
++        }
++        approvalInFlight.current.delete(id);
++        if (failed) {
++          approvalAnswered.current.delete(id);
++          logVoice("approval answer failed");
++        } else {
++          approvalAnswered.current.add(id);
++        }
++      })();
++    },
++    [],
++  );
++
+   const onFinal = useCallback(
+     (text: string): boolean => {
+       if (!on) return false;
+@@ -676,12 +712,9 @@ export function useAeVoiceMode({
+         if (!now.quiet && clear && !approvalAnswered.current.has(id)) {
+           const verdict = matchApprovalReply(text);
+           if (verdict !== null) {
+-            approvalAnswered.current.add(id);
+             logVoice("approval answer", verdict);
+             clearGrace();
+-            void useChatStore
+-              .getState()
+-              .submitApproval(id, verdict, undefined, withApprovalSource("voice"));
++            sendApproval(id, verdict, "voice");
+           }
+         }
+         return true;
+@@ -700,7 +733,7 @@ export function useAeVoiceMode({
+       }, GRACE_MS);
+       return false;
+     },
+-    [on, onCardFinal, clearGrace, send],
++    [on, onCardFinal, clearGrace, send, sendApproval],
+   );
+ 
+   const onPartial = useCallback(
+@@ -722,14 +755,11 @@ export function useAeVoiceMode({
+     (action: "accept" | "decline") => {
+       const pending = latest.current.approval;
+       if (!pending || approvalAnswered.current.has(pending.id)) return;
+-      approvalAnswered.current.add(pending.id);
+       logVoice("approval answer", `${action} panel`);
+       clearGrace();
+-      void useChatStore
+-        .getState()
+-        .submitApproval(pending.id, action, undefined, withApprovalSource("voice_panel"));
++      sendApproval(pending.id, action, "voice_panel");
+     },
+-    [clearGrace],
++    [clearGrace, sendApproval],
+   );
+ 
+   return {
+diff --git a/web/src/lib/aeVoiceLog.test.ts b/web/src/lib/aeVoiceLog.test.ts
+index 201b32210c57c576dc40f5e67a5f079ec41f107c..be6025861d58745232241890d5847728645f4146 100644
+--- a/web/src/lib/aeVoiceLog.test.ts
++++ b/web/src/lib/aeVoiceLog.test.ts
+@@ -240,6 +240,41 @@ describe("uploadVoiceLog on a phone", () => {
+     expect(formatVoiceLog()).toContain("keepalive rejected, retry");
+   });
+ 
++  it("a timed-out keepalive request is not retried", async () => {
++    fetchMock.mockImplementationOnce(() => {
++      const e = new Error("aborted");
++      e.name = "AbortError";
++      return Promise.reject(e);
++    });
++    await expect(uploadVoiceLog("page_hidden", null, { keepalive: true })).resolves.toBe("failed");
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("a rejected keepalive request is not retried once the page is hidden", async () => {
++    const spy = vi.spyOn(document, "visibilityState", "get").mockReturnValue("hidden");
++    try {
++      fetchMock.mockImplementationOnce(() => Promise.reject(new TypeError("dropped")));
++      await expect(uploadVoiceLog("page_hidden", null, { keepalive: true })).resolves.toBe(
++        "failed",
++      );
++      expect(fetchMock).toHaveBeenCalledTimes(1);
++    } finally {
++      spy.mockRestore();
++    }
++  });
++
++  it("page_hidden uploads keep their own budget, apart from the automatic one", async () => {
++    await expect(uploadVoiceLog("mic_failed")).resolves.toBe("sent");
++    await expect(uploadVoiceLog("page_hidden", null, { keepalive: true })).resolves.toBe("sent");
++    await expect(uploadVoiceLog("page_hidden", null, { keepalive: true })).resolves.toBe(
++      "throttled",
++    );
++    await expect(uploadVoiceLog("mic_deaf")).resolves.toBe("throttled");
++    vi.advanceTimersByTime(UPLOAD_MIN_GAP_MS);
++    await expect(uploadVoiceLog("page_hidden", null, { keepalive: true })).resolves.toBe("sent");
++    expect(fetchMock.mock.calls.at(-1)?.[1].body).toContain('"reason":"page_hidden"');
++  });
++
+   it("a request that never answers is aborted after 10 s and the auto budget is released", async () => {
+     fetchMock.mockImplementationOnce(
+       (_url: string, init: RequestInit) =>
+@@ -282,8 +317,10 @@ describe("uploadVoiceLog on a phone", () => {
+     expect(showToast).toHaveBeenLastCalledWith("Voice log not sent: network error");
+     await uploadVoiceLog("voice_end");
+     expect(showToast).toHaveBeenLastCalledWith("Voice log sent");
+-    await uploadVoiceLog("voice_end");
+-    expect(showToast).toHaveBeenLastCalledWith("Voice log not sent: sent a moment ago");
++    // Throttled: the failure upload just sent the log, so there is nothing to report.
++    vi.mocked(showToast).mockClear();
++    await expect(uploadVoiceLog("voice_end")).resolves.toBe("throttled");
++    expect(showToast).not.toHaveBeenCalled();
+     vi.mocked(showToast).mockClear();
+     await uploadVoiceLog("mic_failed");
+     await uploadVoiceLog("manual");
+@@ -327,6 +364,7 @@ describe("useVoiceLogOnHide", () => {
+     const init = fetchMock.mock.calls[0][1] as RequestInit;
+     expect(init.keepalive).toBe(true);
+     expect(JSON.parse(String(init.body)).chat_id).toBe("c9");
++    expect(JSON.parse(String(init.body)).reason).toBe("page_hidden");
+     unmount();
+     act(() => hide());
+     window.dispatchEvent(new Event("pagehide"));
+diff --git a/web/src/lib/aeVoiceLog.ts b/web/src/lib/aeVoiceLog.ts
+index f18747ace824e5a8be52ab8858b5aff9283f9285..091aaf16258f87c0beacffae3228bdfe684f643f 100644
+--- a/web/src/lib/aeVoiceLog.ts
++++ b/web/src/lib/aeVoiceLog.ts
+@@ -34,11 +34,13 @@ export function resetVoiceLog(): void {
+   entries = [];
+   lastAutoUpload = null;
+   autoInFlight = false;
++  lastHideUpload = null;
++  hideInFlight = false;
+ }
+ 
+ /** Why a log is sent; the server accepts exactly these. */
+ export type VoiceLogReason =
+-  "mic_failed" | "mic_deaf" | "mic_stalled" | "mic_paused" | "voice_end" | "manual";
++  "mic_failed" | "mic_deaf" | "mic_stalled" | "mic_paused" | "page_hidden" | "voice_end" | "manual";
+ 
+ /** The last two minutes: what "Add voice log to message" shows and what an upload carries. */
+ export const VOICE_LOG_WINDOW_MS = 120_000;
+@@ -51,6 +53,9 @@ const UPLOAD_MAX_EVENT = 64;
+ /** When the last automatic upload was accepted by the server (null: none yet). */
+ let lastAutoUpload: number | null = null;
+ let autoInFlight = false;
++/** Page-hide uploads keep their own budget, so a backgrounded phone never spends the failure one. */
++let lastHideUpload: number | null = null;
++let hideInFlight = false;
+ const encoder = new TextEncoder();
+ /** An in-page upload that has not answered by now is given up, so the budget never stays claimed. */
+ export const UPLOAD_TIMEOUT_MS = 10_000;
+@@ -83,7 +88,10 @@ async function postVoiceLog(body: string, keepalive: boolean): Promise<Response>
+   if (!keepalive) return attempt(false);
+   try {
+     return await attempt(true);
+-  } catch {
++  } catch (error) {
++    // A timeout is not a rejected keepalive, and a page that is going away cannot retry.
++    if (errName(error) === "AbortError") throw error;
++    if (typeof document !== "undefined" && document.visibilityState !== "visible") throw error;
+     logVoice("log upload", "keepalive rejected, retry");
+     return attempt(false);
+   }
+@@ -94,8 +102,7 @@ function errName(error: unknown): string {
+ }
+ 
+ /** The short reason shown when a voice_end upload did not go. */
+-function failureReason(result: "throttled" | "failed", name: string): string {
+-  if (result === "throttled") return "sent a moment ago";
++function failureReason(name: string): string {
+   if (name === "AbortError") return "timed out";
+   return name.startsWith("http") ? `server answered ${name.slice(4)}` : "network error";
+ }
+@@ -119,12 +126,11 @@ export async function uploadVoiceLog(
+     errorName = n;
+   });
+   logVoice("log upload", `${reason} ${result} ${errorName}`);
+-  if (reason === "voice_end") {
++  // A throttled End means the failure upload just sent the log: no toast either way.
++  if (reason === "voice_end" && result !== "throttled") {
+     try {
+       showToast(
+-        result === "sent"
+-          ? "Voice log sent"
+-          : `Voice log not sent: ${failureReason(result, errorName)}`,
++        result === "sent" ? "Voice log sent" : `Voice log not sent: ${failureReason(errorName)}`,
+       );
+     } catch {
+       // A toast must never break voice.
+@@ -140,11 +146,18 @@ async function uploadVoiceLogInner(
+   setError: (name: string) => void,
+ ): Promise<"sent" | "throttled" | "failed"> {
+   const automatic = reason !== "manual";
++  const hide = reason === "page_hidden";
+   let claimed = false;
+   try {
+     if (typeof window === "undefined") return "failed";
+     const now = Date.now();
+-    if (automatic) {
++    if (hide) {
++      if (hideInFlight || (lastHideUpload !== null && now - lastHideUpload < UPLOAD_MIN_GAP_MS)) {
++        return "throttled";
++      }
++      hideInFlight = true;
++      claimed = true;
++    } else if (automatic) {
+       if (autoInFlight || (lastAutoUpload !== null && now - lastAutoUpload < UPLOAD_MIN_GAP_MS)) {
+         return "throttled";
+       }
+@@ -175,13 +188,17 @@ async function uploadVoiceLogInner(
+       setError(`http${response.status}`);
+       return "failed";
+     }
+-    if (automatic) lastAutoUpload = now;
++    if (hide) lastHideUpload = now;
++    else if (automatic) lastAutoUpload = now;
+     return "sent";
+   } catch (error) {
+     setError(errName(error));
+     return "failed";
+   } finally {
+-    if (claimed) autoInFlight = false;
++    if (claimed) {
++      if (hide) hideInFlight = false;
++      else autoInFlight = false;
++    }
+   }
+ }
+ 
+@@ -227,7 +244,8 @@ export function useVoiceLogInsert(value: string, setValue: (next: string) => voi
+ /**
+  * While `active` (a voice session is on), sends the log when the page is hidden or closing, the
+  * one place a keepalive request is used: the page may be gone before a plain request answers.
+- * It shares the automatic budget, so a backgrounded phone sends at most one a minute.
++ * It has its own budget (reason page_hidden), so a backgrounded phone sends at most one a minute
++ * and never spends the automatic failure budget.
+  */
+ export function useVoiceLogOnHide(active: boolean, chatId: () => string | null | undefined): void {
+   const chatRef = useRef(chatId);
+@@ -236,7 +254,7 @@ export function useVoiceLogOnHide(active: boolean, chatId: () => string | null |
+     if (!active || typeof document === "undefined") return;
+     const send = () => {
+       logVoice("page hidden");
+-      void uploadVoiceLog("mic_paused", chatRef.current(), { keepalive: true });
++      void uploadVoiceLog("page_hidden", chatRef.current(), { keepalive: true });
+     };
+     const onVisibility = () => {
+       if (document.visibilityState === "hidden") send();
+diff --git a/web/src/lib/aeVoiceMode.test.ts b/web/src/lib/aeVoiceMode.test.ts
+index 9c8cdab0408530c2328bcf2f672a4beb44187720..cb9c09e04c16a50e82012263fa87a852d0f74e78 100644
+--- a/web/src/lib/aeVoiceMode.test.ts
++++ b/web/src/lib/aeVoiceMode.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
++  AE_SLOT_CAP_POLICY,
+   approvalOf,
+   armVoiceForNextChat,
+   customAllowed,
+@@ -303,15 +304,21 @@ describe("approvalOf", () => {
+     requestedSchema: {},
+   };
+   it("takes only the session-limit card", () => {
+-    expect(approvalOf({ ...base, policyName: "ae_slot_cap" } as never)).toEqual({
++    expect(approvalOf({ ...base, policyName: AE_SLOT_CAP_POLICY } as never)).toEqual({
+       id: "a1",
+       slotCap: true,
+     });
+   });
+-  it.each([undefined, "", "bash_permission", "write_policy", "web_fetch"])(
+-    "never takes a tool-permission card (policy %s)",
+-    (policyName) => {
+-      expect(approvalOf({ ...base, policyName } as never)).toBeNull();
+-    },
+-  );
++  it.each([
++    undefined,
++    "",
++    "bash_permission",
++    "write_policy",
++    "web_fetch",
++    "my_slot_cap_lookalike",
++    "slot_cap",
++    "ae_slot_cap_2",
++  ])("never takes a tool-permission card (policy %s)", (policyName) => {
++    expect(approvalOf({ ...base, policyName } as never)).toBeNull();
++  });
+ });
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index 86976634a86fc729efaefea0ab995717a6fc52f9..b263439b42afb1651d336a1a711a1d520326c883 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -540,10 +540,13 @@ export interface VoiceApproval {
+   slotCap: boolean;
+ }
+ 
++/** The registered name of the session-limit policy (`config/server.yaml`). Exact match only. */
++export const AE_SLOT_CAP_POLICY = "ae_slot_cap";
++
+ /** The pending session-limit card, or null for any other block. */
+ export function approvalOf(block: ElicitationBlock | undefined): VoiceApproval | null {
+   if (!block || block.status !== "pending") return null;
+-  if (!/slot_cap/.test(block.policyName ?? "")) return null;
++  if (block.policyName !== AE_SLOT_CAP_POLICY) return null;
+   const askPayload =
+     castAskUserQuestionPayload(block.askUserQuestion) ??
+     parseAskUserQuestionPreview(block.contentPreview);
+diff --git a/web/src/lib/aeVoiceStall.test.ts b/web/src/lib/aeVoiceStall.test.ts
+index bbf529076890cc309d9a676e7c5c5b2111a7b9bd..f05bca0b06ae2782865e2b039f5dc4bdd3fd88a1 100644
+--- a/web/src/lib/aeVoiceStall.test.ts
++++ b/web/src/lib/aeVoiceStall.test.ts
+@@ -1,6 +1,8 @@
+ import { afterEach, describe, expect, it } from "vitest";
+ import {
+   createEventStallDetector,
++  EVENT_HEARD_MIN_SOUND_MS,
++  EVENT_NO_END_STALL_MS,
+   createStallDetector,
+   isWebKitSpeech,
+   MAX_FRAME_MS,
+@@ -163,37 +165,87 @@ describe("isWebKitSpeech", () => {
+ });
+ 
+ describe("event stall detector (meter off)", () => {
+-  it("fires once: sound heard, sound ended, then STALL_QUIET_MS with no result", () => {
++  it("fires once: speech heard, speech ended, then STALL_QUIET_MS with no result", () => {
+     const d = createEventStallDetector();
+     d.reset(0);
+-    d.heard(1000);
+-    expect(d.evaluate(1000 + STALL_QUIET_MS + 5000)).toBeNull();
++    d.speechStart(1000);
+     d.ended(2000);
+     expect(d.evaluate(2000 + STALL_QUIET_MS - 1)).toBeNull();
+     expect(d.evaluate(2000 + STALL_QUIET_MS)).toBe(2000 + STALL_QUIET_MS);
+     expect(d.evaluate(2000 + STALL_QUIET_MS + 1000)).toBeNull();
+   });
+ 
+-  it("a result clears it, and an end with no sound heard is nothing", () => {
++  it("a soundstart that lasted long enough counts as heard at its soundend", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.soundStart(1000);
++    d.soundEnd(1000 + EVENT_HEARD_MIN_SOUND_MS);
++    const end = 1000 + EVENT_HEARD_MIN_SOUND_MS;
++    expect(d.evaluate(end + STALL_QUIET_MS - 1)).toBeNull();
++    expect(d.evaluate(end + STALL_QUIET_MS)).toBe(end + STALL_QUIET_MS);
++  });
++
++  it("a cough-like soundstart and soundend with no result never stalls", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.soundStart(1000);
++    d.soundEnd(1000 + EVENT_HEARD_MIN_SOUND_MS - 1);
++    for (const t of [5000, 20_000, 120_000]) expect(d.evaluate(t)).toBeNull();
++    // Repeated coughs in a long quiet take are no different.
++    for (let i = 0; i < 20; i += 1) {
++      d.soundStart(130_000 + i * 5000);
++      d.soundEnd(130_000 + i * 5000 + 200);
++      expect(d.evaluate(130_000 + i * 5000 + 200 + EVENT_NO_END_STALL_MS)).toBeNull();
++    }
++  });
++
++  it("a soundstart with no soundend yet is not heard", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.soundStart(1000);
++    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS + STALL_QUIET_MS)).toBeNull();
++  });
++
++  it("speechstart and then nothing stalls, even with no end event", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.speechStart(1000);
++    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS - 1)).toBeNull();
++    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS)).toBe(1000 + EVENT_NO_END_STALL_MS);
++    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS + 1000)).toBeNull();
++  });
++
++  it("the no-end window counts from the last sound or speech event", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.speechStart(1000);
++    d.soundStart(5000);
++    expect(d.evaluate(5000 + EVENT_NO_END_STALL_MS - 1)).toBeNull();
++    expect(d.evaluate(5000 + EVENT_NO_END_STALL_MS)).not.toBeNull();
++  });
++
++  it("a result clears it, and an end with nothing heard is nothing", () => {
+     const d = createEventStallDetector();
+     d.reset(0);
+     d.ended(500);
+     expect(d.evaluate(500 + STALL_QUIET_MS + 1)).toBeNull();
+-    d.heard(1000);
++    d.speechStart(1000);
+     d.ended(2000);
+     d.result(3000);
+     expect(d.evaluate(2000 + STALL_QUIET_MS + 1)).toBeNull();
++    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS + 1)).toBeNull();
+   });
+ 
+-  it("new sound after an end cancels the pending stall; reset forgets everything", () => {
++  it("new speech after an end cancels the pending quiet stall; reset forgets everything", () => {
+     const d = createEventStallDetector();
+     d.reset(0);
+-    d.heard(1000);
++    d.speechStart(1000);
+     d.ended(2000);
+-    d.heard(3000);
++    d.speechStart(3000);
+     expect(d.evaluate(2000 + STALL_QUIET_MS + 1)).toBeNull();
+     d.ended(4000);
+     d.reset(5000);
+     expect(d.evaluate(4000 + STALL_QUIET_MS + 1)).toBeNull();
++    expect(d.evaluate(60_000)).toBeNull();
+   });
+ });
+diff --git a/web/src/lib/aeVoiceStall.ts b/web/src/lib/aeVoiceStall.ts
+index c7032b159800a0d49bd2e06ed845b5075039bb70..344c704538ef05f4e6f7aa948a4bb180e6c89494 100644
+--- a/web/src/lib/aeVoiceStall.ts
++++ b/web/src/lib/aeVoiceStall.ts
+@@ -108,15 +108,28 @@ export function createStallDetector(): StallDetector {
+   };
+ }
+ 
++/** A soundstart counts as speech only when the sound lasted this long before its soundend. */
++export const EVENT_HEARD_MIN_SOUND_MS = 600;
++/** Speech heard and no result this long after the last sound or speech event is a stall, even
++ *  when no soundend, speechend or audioend ever came (a recognizer that hung mid-take). */
++export const EVENT_NO_END_STALL_MS = 6000;
++
+ /**
+  * The stall detector for a take with no level meter (the meter is off): the recognizer's own
+- * events are the only signal. A stall is soundstart or speechstart seen, then STALL_QUIET_MS
+- * with no result after a soundend, speechend or audioend. It never reads audio levels.
++ * events are the only signal. "Heard" means a speechstart, or a soundstart that lasted at least
++ * EVENT_HEARD_MIN_SOUND_MS before its soundend (a cough or a click is not speech). A stall is
++ * speech heard and then either STALL_QUIET_MS with no result after a soundend, speechend or
++ * audioend, or EVENT_NO_END_STALL_MS with no result after the last sound or speech event when no
++ * end event came. It never reads audio levels.
+  */
+ export interface EventStallDetector {
+-  /** soundstart or speechstart: the recognizer heard something. */
+-  heard: (now: number) => void;
+-  /** soundend, speechend or audioend. */
++  /** speechstart: the recognizer heard speech. */
++  speechStart: (now: number) => void;
++  /** soundstart: not speech until it has lasted long enough (see soundEnd). */
++  soundStart: (now: number) => void;
++  /** soundend: a sound that lasted EVENT_HEARD_MIN_SOUND_MS counts as heard. */
++  soundEnd: (now: number) => void;
++  /** speechend or audioend. */
+   ended: (now: number) => void;
+   /** A result, interim or final. */
+   result: (now: number) => void;
+@@ -129,30 +142,56 @@ export interface EventStallDetector {
+ export function createEventStallDetector(): EventStallDetector {
+   let heardAt: number | null = null;
+   let endAt: number | null = null;
++  let soundAt: number | null = null;
++  let lastEventAt = 0;
+   let lastResult = 0;
++  const clear = () => {
++    heardAt = null;
++    endAt = null;
++    soundAt = null;
++  };
+   return {
+-    heard(now) {
++    speechStart(now) {
+       heardAt = now;
+       endAt = null;
++      lastEventAt = now;
++    },
++    soundStart(now) {
++      soundAt = now;
++      endAt = null;
++      lastEventAt = now;
++    },
++    soundEnd(now) {
++      lastEventAt = now;
++      const started = soundAt;
++      soundAt = null;
++      if (started !== null && now - started >= EVENT_HEARD_MIN_SOUND_MS) {
++        heardAt = started;
++        endAt = now;
++      } else if (heardAt !== null) {
++        endAt = now;
++      }
+     },
+     ended(now) {
++      lastEventAt = now;
+       if (heardAt !== null) endAt = now;
+     },
+     result(now) {
+       lastResult = now;
+-      heardAt = null;
+-      endAt = null;
++      clear();
+     },
+     evaluate(now) {
+-      if (heardAt === null || endAt === null || now - endAt < STALL_QUIET_MS) return null;
+-      heardAt = null;
+-      endAt = null;
++      if (heardAt === null) return null;
++      const quietAfterEnd = endAt !== null && now - endAt >= STALL_QUIET_MS;
++      const hungNoEnd = now - lastEventAt >= EVENT_NO_END_STALL_MS;
++      if (!quietAfterEnd && !hungNoEnd) return null;
++      clear();
+       return Math.max(0, now - lastResult);
+     },
+     reset(now) {
+       lastResult = now;
+-      heardAt = null;
+-      endAt = null;
++      lastEventAt = now;
++      clear();
+     },
+   };
+ }

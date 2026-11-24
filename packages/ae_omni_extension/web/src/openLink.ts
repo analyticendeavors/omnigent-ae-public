@@ -40,12 +40,13 @@ export const OPEN_LABEL = "Open on GitHub";
 export const COPY_LABEL = "Copy link";
 
 /** The card's status line with *lead* and the URL as selectable text. */
-function showLink(card: HTMLElement, lead: string, url: string): void {
-  card.querySelector(".flash")?.remove();
+function showLink(card: HTMLElement, lead: string, url: string, sink?: MessageSink): void {
+  if (!sink) card.querySelector(".flash")?.remove();
   const line = notice(`${lead} Tap and hold to copy: `, "info");
   line.classList.add("flash");
   line.appendChild(el("code", { class: "link-copy" }, url));
-  card.appendChild(line);
+  if (sink) sink(line);
+  else card.appendChild(line);
 }
 
 function say(card: HTMLElement, text: string): void {
@@ -55,13 +56,25 @@ function say(card: HTMLElement, text: string): void {
   card.appendChild(line);
 }
 
-/** Ask the host to open *url*; a refusal puts the URL in *card*'s status line. */
-export async function openOrShow(context: ExtensionContext, url: string, card: HTMLElement) {
-  card.querySelector(".flash")?.remove();
+/**
+ * Where a message goes when it must not land in *card* itself (the Needs you table's row is a CSS grid,
+ * so a message appended to it becomes a grid item): called with the message, or with null to clear it.
+ */
+export type MessageSink = (line: HTMLElement | null) => void;
+
+/** Ask the host to open *url*; a refusal puts the URL in *card*'s status line (or in *sink*). */
+export async function openOrShow(
+  context: ExtensionContext,
+  url: string,
+  card: HTMLElement,
+  sink?: MessageSink,
+) {
+  if (sink) sink(null);
+  else card.querySelector(".flash")?.remove();
   try {
     await context.navigation.openExternal(url);
   } catch (error) {
-    showLink(card, `Could not open GitHub from here (${describeError(error)}).`, url);
+    showLink(card, `Could not open GitHub from here (${describeError(error)}).`, url, sink);
   }
 }
 

@@ -38,6 +38,7 @@ import { forgetFullDraft } from "./socialDrafts";
 import { attachPopover, type Popover } from "./socialMenu";
 import { forgetPost, rememberPost } from "./socialPosted";
 import { probeShare, shareAvailable, shareToLinkedin, usesShareSheet } from "./socialShare";
+import { HINT_DESKTOP, HINT_SHEET, buildPicker } from "./socialPicker";
 import { loadVisual, loadedVisual, visualState, visualUrl } from "./socialVisual";
 import {
   CHANNEL_NAMES,
@@ -324,12 +325,12 @@ function draw(host: HTMLElement, detail: SocialSlotDetail, hooks: EditorHooks, f
       // Saved: the post now has a draft, so the starter text is no longer on offer, and the
       // compact card's cached full draft for it is stale.
       starter = "";
-      slot = {
-        ...slot,
+      // In place, so the picture picker (which holds this object) keeps editing the same post.
+      Object.assign(slot, {
         has_draft: true,
         draft_preview: value.slice(0, 160),
         draft: { text: value, topic: slot.topic, by: "reid", edited: true },
-      };
+      });
       forgetFullDraft(slot.id);
       return true;
     } catch (error) {
@@ -441,39 +442,72 @@ function draw(host: HTMLElement, detail: SocialSlotDetail, hooks: EditorHooks, f
   });
   post.prepend(externalLinkIcon());
   needs(post, "limit");
-  const readyHint = slot.visual ? "Opens your phone's share sheet with the text and the image" : "Opens your phone's share sheet with the text";
+  // A picture can change while the editor is open (the picker, 2026-11-15), so the hint is asked.
+  const readyHint = () =>
+    slot.visual ? "Opens your phone's share sheet with the text and the image" : "Opens your phone's share sheet with the text";
   const failedHint = "The image could not load; this shares the text only.";
-  const shareHint = sheet ? el("p", { class: "meta sv-ed-hint" }, readyHint) : null;
+  const shareHint = sheet ? el("p", { class: "meta sv-ed-hint" }, readyHint()) : null;
   const setPostLabel = (label: string) => {
     post.textContent = label;
     post.prepend(externalLinkIcon());
   };
   // The button waits for the picture (at most IMAGE_WAIT_MS) so a share never goes out as text
-  // only by accident; a picture that failed or is late says so under the button.
-  if (sheet && slot.visual && visualState(slot) === "loading") {
-    imageWaiting = true;
-    setPostLabel("Loading image...");
-    const settle = () => {
-      if (!imageWaiting) return;
-      imageWaiting = false;
-      if (host.dataset.slot !== slot.id) return;
-      setPostLabel("Share to LinkedIn");
-      if (shareHint && visualState(slot) !== "ready") shareHint.textContent = failedHint;
-      sync();
-    };
-    void loadVisual(hooks.context, slot).then(() => {
-      settle();
-      // A picture that arrives after the wait ended makes the hint true again.
-      if (shareHint && visualState(slot) === "ready") shareHint.textContent = readyHint;
-    });
-    setTimeout(settle, IMAGE_WAIT_MS);
-  } else if (sheet && slot.visual && visualState(slot) === "failed" && shareHint) {
-    shareHint.textContent = failedHint;
-  }
+  // only by accident; a picture that failed or is late says so under the button. It runs when the
+  // editor opens and again after each pick in the picker.
+  let waitRound = 0;
+  const waitForImage = () => {
+    const round = ++waitRound;
+    if (shareHint) shareHint.textContent = readyHint();
+    if (sheet && slot.visual && visualState(slot) === "loading") {
+      imageWaiting = true;
+      setPostLabel("Loading image...");
+      const settle = () => {
+        if (round !== waitRound || !imageWaiting) return;
+        imageWaiting = false;
+        if (host.dataset.slot !== slot.id) return;
+        setPostLabel("Share to LinkedIn");
+        if (shareHint && visualState(slot) !== "ready") shareHint.textContent = failedHint;
+        sync();
+      };
+      void loadVisual(hooks.context, slot).then(() => {
+        settle();
+        // A picture that arrives after the wait ended makes the hint true again.
+        if (round === waitRound && shareHint && visualState(slot) === "ready") shareHint.textContent = readyHint();
+      });
+      setTimeout(settle, IMAGE_WAIT_MS);
+    } else {
+      if (imageWaiting) {
+        imageWaiting = false;
+        if (sheet) setPostLabel("Share to LinkedIn");
+      }
+      if (sheet && slot.visual && visualState(slot) === "failed" && shareHint) shareHint.textContent = failedHint;
+    }
+  };
+  waitForImage();
 
   // ── the picture that goes in the share sheet with the text ──
   // Loaded now, so the File is ready before the tap; the server fetches it (the frame cannot).
   const visualRow = ((): HTMLElement | null => {
+    // Made pictures (2026-11-15): every candidate in rank order, the chosen one full width.
+    if (slot.visuals?.length) {
+      return buildPicker({
+        context: hooks.context,
+        slot,
+        sheet,
+        picked: () => {
+          waitForImage();
+          sync();
+        },
+        settling: () => {
+          // Share waits while the picks settle, so a quick tap never shares the old picture.
+          imageWaiting = true;
+          if (sheet) setPostLabel("Loading image...");
+          sync();
+        },
+        saved: () => void hooks.changed(),
+        failed: (message) => say(message, "error"),
+      });
+    }
     if (!slot.visual) return slot.visual_note ? el("p", { class: "meta sv-ed-vis-note" }, slot.visual_note) : null;
     const thumb = el("div", { class: "sv-ed-thumb is-loading" }, "Loading image...");
     const row = el(
@@ -487,7 +521,7 @@ function draw(host: HTMLElement, detail: SocialSlotDetail, hooks: EditorHooks, f
         el(
           "span",
           {},
-          sheet ? "Goes into the share sheet with the text. Long-press to save it." : "Long-press or right-click to save it, then attach it in LinkedIn.",
+          sheet ? HINT_SHEET : HINT_DESKTOP,
         ),
       ),
     );

@@ -280,7 +280,7 @@ export function gitTile(data: GitOverview | null, error: unknown): Tile {
     };
   }
   if (!data.configured) {
-    return { id: "git", value: "Not set up", note: "no repos listed", health: "idle", notSetUp: true };
+    return { id: "git", value: "Not set up", note: "no repos listed", health: "idle", notSetUp: true, ...(error ? { failed: true as const } : {}) };
   }
   // The count is the panel's (the server's rules); before its first read the tile waits for it.
   const n = attentionCount("git");

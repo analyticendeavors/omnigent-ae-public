@@ -10,6 +10,7 @@ pushed with GITHUB_TOKEN starts no workflow run by itself).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -254,6 +255,364 @@ def test_script_is_executable_and_parses() -> None:
     subprocess.run(["bash", "-n", str(SCRIPT)], check=True)
 
 
+# ── the fast path: same tree as a PR head that passed CI ───────────────────
+
+TREE_SCRIPT = ROOT / "scripts" / "tree-match-release.sh"
+
+FAKE_GH = r"""#!/usr/bin/env python3
+# A stand-in for gh: answers from JSON fixtures in $FAKE_GH_DIR, applying the
+# caller's --jq program with the real jq, and logs every call.
+import json, os, subprocess, sys
+d = os.environ["FAKE_GH_DIR"]
+args = sys.argv[1:]
+with open(os.path.join(d, "calls.log"), "a") as log:
+    log.write(json.dumps(args) + "\n")
+path = args[1] if args[0] == "api" else ""
+if path.endswith("/pulls"):
+    name = "pulls"
+elif "/actions/workflows/ci.yml/runs?" in path:
+    name = "runs"
+elif "/check-suites/" in path:
+    name = "suite"
+elif path.split("?")[0].endswith("/annotations"):
+    name = "annotations"
+elif "/check-runs?check_name=leaks" in path:
+    name = "checks"
+else:
+    sys.exit("fake gh: unexpected call " + " ".join(args))
+if os.path.exists(os.path.join(d, name + ".fail")):
+    sys.exit("fake gh: " + name + " lookup failed")
+program = args[args.index("--jq") + 1]
+with open(os.path.join(d, name + ".json")) as f:
+    data = f.read()
+sys.exit(subprocess.run(["jq", "-r", program], input=data, text=True).returncode)
+"""
+
+PATCHES_JOB = "Patch series matches and applies"
+
+
+class FastPath:
+    """A main branch with one pull request squashed onto it, and a fake gh."""
+
+    def __init__(self, repo: Repo, tmp_path: Path) -> None:
+        self.repo = repo
+        self.base = repo.git("rev-parse", "HEAD")
+        repo.git("switch", "--quiet", "-c", "topic")
+        self.head = repo.change("packages/ae_omni_policies/x.py")
+        repo.git("switch", "--quiet", "main")
+        self.tree = repo.git("rev-parse", f"{self.head}^{{tree}}")
+        self.squash = repo.git("commit-tree", self.tree, "-p", self.base, "-m", "Squash (#7)")
+        repo.git("update-ref", "refs/heads/main", self.squash)
+        self.dir = tmp_path / "gh"
+        self.dir.mkdir()
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        gh = bin_dir / "gh"
+        gh.write_text(FAKE_GH)
+        gh.chmod(0o755)
+        self.env = {
+            **repo.env,
+            "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+            "FAKE_GH_DIR": str(self.dir),
+            "GH_REPO": "owner/repo",
+            "TREE_MATCH_RETRY_SLEEP": "0",
+        }
+        self.pulls([self.pr(7, self.head, self.squash)])
+        self.runs([self.run_(1, "completed", "success")])
+        self.suite(
+            [{"id": 11, "name": PATCHES_JOB}, {"id": 12, "name": "AE package lint and tests"}]
+        )
+        self.annotations([self.tested(self.tree)])
+        self.checks(
+            [
+                {
+                    "id": 21,
+                    "status": "completed",
+                    "conclusion": "success",
+                    "app": {"slug": "github-actions"},
+                }
+            ]
+        )
+
+    @staticmethod
+    def pr(
+        number: int,
+        head: str,
+        merge: str,
+        *,
+        merged: bool = True,
+        base: str = "main",
+        repo: str = "owner/repo",
+    ) -> dict:
+        return {
+            "number": number,
+            "merged_at": "2026-11-10T00:00:00Z" if merged else None,
+            "merge_commit_sha": merge,
+            "base": {"ref": base},
+            "head": {"sha": head, "repo": {"full_name": repo}},
+        }
+
+    @staticmethod
+    def run_(run_id: int, status: str, conclusion: str | None) -> dict:
+        return {
+            "id": run_id,
+            "status": status,
+            "conclusion": conclusion,
+            "check_suite_id": 900 + run_id,
+        }
+
+    @staticmethod
+    def tested(tree: str) -> dict:
+        return {"title": "tested-tree", "message": tree, "annotation_level": "notice"}
+
+    def _fixture(self, name: str, data: Any) -> None:
+        (self.dir / f"{name}.json").write_text(json.dumps(data))
+
+    def pulls(self, data: list[dict]) -> None:
+        self._fixture("pulls", data)
+
+    def runs(self, data: list[dict]) -> None:
+        self._fixture("runs", {"total_count": len(data), "workflow_runs": data})
+
+    def suite(self, data: list[dict]) -> None:
+        self._fixture("suite", {"total_count": len(data), "check_runs": data})
+
+    def annotations(self, data: list[dict]) -> None:
+        self._fixture("annotations", data)
+
+    def checks(self, data: list[dict]) -> None:
+        self._fixture("checks", {"total_count": len(data), "check_runs": data})
+
+    def fail(self, name: str) -> None:
+        (self.dir / f"{name}.fail").write_text("")
+
+    def calls(self) -> list[list[str]]:
+        log = self.dir / "calls.log"
+        return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+
+    def run(
+        self, *args: str, env: dict[str, str] | None = None
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(TREE_SCRIPT), *args],
+            cwd=self.repo.path,
+            env=env or self.env,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+    def answer(self, sha: str | None = None) -> dict[str, str]:
+        result = self.run(sha or self.squash)
+        assert result.returncode == 0, result.stdout + result.stderr
+        out = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        assert set(out) == {"fast", "reason"}, result.stdout
+        return out
+
+
+@pytest.fixture
+def fast(repo: Repo, tmp_path: Path) -> FastPath:
+    return FastPath(repo, tmp_path)
+
+
+def test_a_squash_whose_tree_ci_tested_with_green_checks_is_fast(fast: FastPath) -> None:
+    out = fast.answer()
+    assert out["fast"] == "true", out
+    assert "PR 7" in out["reason"]
+    paths = [c[1] for c in fast.calls()]
+    assert (
+        f"repos/owner/repo/actions/workflows/ci.yml/runs?head_sha={fast.head}&event=pull_request&per_page=100"
+        in paths
+    ), "CI is read for the PR head, pull_request runs of ci.yml only"
+    assert "repos/owner/repo/check-suites/901/check-runs?per_page=100" in paths, (
+        "the newest run's suite"
+    )
+    assert "repos/owner/repo/check-runs/11/annotations?per_page=100" in paths, (
+        "only the patches job"
+    )
+    assert not any("/check-runs/12/" in p for p in paths)
+    assert (
+        f"repos/owner/repo/commits/{fast.head}/check-runs?check_name=leaks&per_page=100" in paths
+    )
+
+
+def test_ci_records_the_tested_tree_in_the_patches_job() -> None:
+    """The fast path reads the tree a pull request's CI tested from this annotation."""
+    ci = yaml.safe_load((WORKFLOWS / "ci.yml").read_text())
+    job = ci["jobs"]["patches"]
+    assert job["name"] == PATCHES_JOB, "tree-match-release.sh looks the job up by this name"
+    names = [s.get("name") for s in job["steps"]]
+    record = job["steps"][names.index("Record the tested tree")]
+    assert (
+        names.index("Record the tested tree")
+        == names.index("Checkout with the upstream submodule") + 1
+    )
+    assert "git rev-parse 'HEAD^{tree}'" in record["run"]
+    assert 'echo "::notice title=tested-tree::${tree}"' in record["run"]
+    script = TREE_SCRIPT.read_text()
+    assert f'select(.name == "{PATCHES_JOB}")' in script
+    assert 'select(.title == "tested-tree")' in script
+
+
+def test_a_squash_onto_a_moved_main_waits_for_ci(fast: FastPath) -> None:
+    fast.repo.git("switch", "--quiet", "--detach", fast.squash)
+    moved = fast.repo.change("packages/ae_omni_policies/y.py")
+    fast.pulls([fast.pr(7, fast.head, moved)])
+    out = fast.answer(moved)
+    assert out["fast"] == "false"
+    assert "main moved" in out["reason"]
+    assert not any("/runs?" in c[1] for c in fast.calls()), "no CI lookup once the trees differ"
+
+
+def test_ci_that_tested_another_tree_waits(fast: FastPath) -> None:
+    """A run against an older main, or another base before a retarget, tested other code."""
+    fast.annotations([fast.tested("a" * 40)])
+    out = fast.answer()
+    assert out["fast"] == "false"
+    assert "tested a different tree" in out["reason"]
+
+
+def test_two_tested_trees_in_one_run_wait(fast: FastPath) -> None:
+    fast.annotations([fast.tested(fast.tree), fast.tested("a" * 40)])
+    assert fast.answer()["fast"] == "false"
+
+
+@pytest.mark.parametrize(
+    ("suite", "annotations"),
+    [
+        ([{"id": 12, "name": "AE package lint and tests"}], None),
+        (None, []),
+        (None, [{"title": "something else", "message": "x"}]),
+    ],
+    ids=["no-patches-job", "no-annotation", "other-annotation"],
+)
+def test_ci_without_a_recorded_tree_waits(
+    fast: FastPath, suite: list[dict] | None, annotations: list[dict] | None
+) -> None:
+    if suite is not None:
+        fast.suite(suite)
+    if annotations is not None:
+        fast.annotations(annotations)
+    out = fast.answer()
+    assert out["fast"] == "false"
+    assert "recorded no tested tree" in out["reason"]
+
+
+@pytest.mark.parametrize(
+    "runs",
+    [
+        [],
+        [FastPath.run_(1, "completed", "failure")],
+        [FastPath.run_(1, "in_progress", None)],
+        [FastPath.run_(2, "completed", "cancelled"), FastPath.run_(1, "completed", "success")],
+        [FastPath.run_(1, "completed", "success"), FastPath.run_(2, "queued", None)],
+    ],
+    ids=["no-run", "red", "running", "newest-cancelled", "newest-queued-listed-last"],
+)
+def test_ci_not_green_on_the_head_waits(fast: FastPath, runs: list[dict]) -> None:
+    fast.runs(runs)
+    out = fast.answer()
+    assert out["fast"] == "false"
+    assert "CI run" in out["reason"]
+    assert "null null" not in out["reason"]
+
+
+def test_an_older_red_ci_run_does_not_block_a_newer_green_one(fast: FastPath) -> None:
+    fast.runs([fast.run_(1, "completed", "failure"), fast.run_(2, "completed", "success")])
+    assert fast.answer()["fast"] == "true"
+    assert any(c[1].startswith("repos/owner/repo/check-suites/902/") for c in fast.calls())
+
+
+def _leaks(
+    check_id: int, status: str, conclusion: str | None, app: str = "github-actions"
+) -> dict:
+    return {"id": check_id, "status": status, "conclusion": conclusion, "app": {"slug": app}}
+
+
+@pytest.mark.parametrize(
+    "checks",
+    [
+        [],
+        [_leaks(21, "completed", "failure")],
+        [_leaks(22, "completed", "failure"), _leaks(21, "completed", "success")],
+        [_leaks(21, "completed", "success"), _leaks(22, "queued", None)],
+        [_leaks(21, "completed", "success", app="some-other-app")],
+    ],
+    ids=["no-check", "red", "newer-red-listed-first", "newer-queued", "other-app-only"],
+)
+def test_leaks_not_green_on_the_head_waits(fast: FastPath, checks: list[dict]) -> None:
+    fast.checks(checks)
+    out = fast.answer()
+    assert out["fast"] == "false"
+    assert "leaks" in out["reason"]
+
+
+def test_an_older_red_leaks_check_does_not_block_a_newer_green_one(fast: FastPath) -> None:
+    fast.checks([_leaks(22, "completed", "success"), _leaks(21, "completed", "failure")])
+    assert fast.answer()["fast"] == "true"
+
+
+def test_a_push_that_merged_no_pull_request_from_this_repo_waits(fast: FastPath) -> None:
+    for pulls in (
+        [],
+        [FastPath.pr(7, fast.head, fast.squash, merged=False)],
+        [FastPath.pr(7, fast.head, "f" * 40)],
+        [FastPath.pr(7, fast.head, fast.squash, base="dev")],
+        [FastPath.pr(7, fast.head, fast.squash, repo="someone/fork")],
+    ):
+        fast.pulls(pulls)
+        out = fast.answer()
+        assert out["fast"] == "false", pulls
+        assert "no merged pull request" in out["reason"]
+
+
+def test_an_empty_pull_request_list_is_asked_three_times(fast: FastPath) -> None:
+    fast.pulls([])
+    assert fast.answer()["fast"] == "false"
+    assert sum(1 for c in fast.calls() if c[1].endswith("/pulls")) == 3
+
+
+def test_a_found_pull_request_is_asked_once(fast: FastPath) -> None:
+    fast.answer()
+    assert sum(1 for c in fast.calls() if c[1].endswith("/pulls")) == 1
+
+
+def test_two_pull_requests_on_one_merge_commit_waits(fast: FastPath) -> None:
+    fast.pulls([fast.pr(7, fast.head, fast.squash), fast.pr(8, fast.head, fast.squash)])
+    out = fast.answer()
+    assert out["fast"] == "false"
+    assert "2 merged pull requests" in out["reason"]
+
+
+@pytest.mark.parametrize("name", ["pulls", "runs", "suite", "annotations", "checks"])
+def test_a_failed_lookup_waits_for_ci_instead_of_failing(fast: FastPath, name: str) -> None:
+    fast.fail(name)
+    out = fast.answer()
+    assert out["fast"] == "false"
+    assert "could not" in out["reason"]
+
+
+def test_tree_match_broken_inputs_fail_loudly(fast: FastPath) -> None:
+    for args in ([], ["HEAD"], ["deadbeef" * 5], [fast.squash, "extra"]):
+        result = fast.run(*args)
+        assert result.returncode != 0, args
+        assert result.stdout == "", (
+            "a broken run must not print an answer the workflow could act on"
+        )
+        assert result.stderr.strip(), args
+    for repo_value in (None, "", "owner", 'owner/repo" or true'):
+        env = {k: v for k, v in fast.env.items() if k != "GH_REPO"}
+        if repo_value is not None:
+            env["GH_REPO"] = repo_value
+        result = fast.run(fast.squash, env=env)
+        assert result.returncode != 0 and result.stdout == "", repo_value
+
+
+def test_tree_match_script_is_executable_and_parses() -> None:
+    assert os.access(TREE_SCRIPT, os.X_OK)
+    subprocess.run(["bash", "-n", str(TREE_SCRIPT)], check=True)
+
+
 # ── the workflow ───────────────────────────────────────────────────────────
 
 
@@ -287,12 +646,40 @@ def test_release_workflow_runs_after_ci_on_main_or_by_hand() -> None:
     assert condition.startswith("vars.AE_IMAGE != '' && ("), (
         "a repository without the AE_IMAGE variable never tags itself"
     )
+    assert on["push"] == {"branches": ["main"]}, "the push to main starts the fast path"
+    assert "github.event_name == 'push'" in condition
+
+
+def test_a_push_releases_only_through_the_tree_match() -> None:
+    """The push run tags only when its PR head passed CI with the same tree."""
+    steps = _steps()
+    names = list(steps)
+    pick = steps["Pick the commit to release"]
+    assert pick["env"]["PUSH_SHA"] == "${{ github.sha }}"
+    assert '"$EVENT" = "push"' in pick["run"] and 'sha="$PUSH_SHA"' in pick["run"]
+    tree = steps["Same tree as a PR head that passed CI"]
+    assert tree["id"] == "tree"
+    assert tree["if"] == "github.event_name == 'push'"
+    assert tree["env"]["GH_TOKEN"] == "${{ secrets.GITHUB_TOKEN }}"
+    assert 'scripts/tree-match-release.sh "$SHA" | tee -a "$GITHUB_OUTPUT"' in tree["run"]
+    decide = steps["Decide the tag"]
+    assert decide["if"] == "github.event_name != 'push' || steps.tree.outputs.fast == 'true'"
+    assert names.index("Same tree as a PR head that passed CI") < names.index("Decide the tag")
+    nothing = steps["Nothing to release"]
+    assert nothing["env"]["REASON"] == (
+        "${{ steps.decide.outputs.reason || steps.tree.outputs.reason }}"
+    ), "a push that waits for CI says why"
 
 
 def test_release_workflow_permissions_and_concurrency() -> None:
     wf = _workflow()
     assert wf["permissions"] == {"contents": "read"}
-    assert wf["jobs"]["tag"]["permissions"] == {"contents": "write", "actions": "write"}
+    assert wf["jobs"]["tag"]["permissions"] == {
+        "contents": "write",
+        "actions": "write",
+        "checks": "read",
+        "pull-requests": "read",
+    }
     assert wf["concurrency"]["group"] == "release"
     assert wf["concurrency"]["cancel-in-progress"] is False, "a half-done release must finish"
 

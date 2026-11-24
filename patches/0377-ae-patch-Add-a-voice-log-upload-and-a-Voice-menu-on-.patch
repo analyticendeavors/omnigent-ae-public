@@ -1,0 +1,1894 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 13:50:45 -0800
+Subject: [PATCH 377/443] [ae-patch] Add a voice log upload and a Voice menu on
+ the new-chat page
+
+Voice mode now sends its recent voice events to the server when the mic fails, goes deaf, stalls or stops on its own, and when Voice mode ends, in a chat and on the new-chat page. A Send voice log row in the speaker menu and in a new menu beside the new-chat Voice button sends them on demand. The menu rows move into AeVoiceMenuRows so both menus share them.
+---
+ .../components/AeSpeakRepliesButton.test.tsx  |  44 +-
+ web/src/components/AeSpeakRepliesButton.tsx   | 446 +--------------
+ web/src/components/AeVoiceMenuRows.tsx        | 526 ++++++++++++++++++
+ .../components/AeVoiceStartButton.test.tsx    | 129 ++++-
+ web/src/components/AeVoiceStartButton.tsx     |  61 +-
+ web/src/hooks/useAeVoiceMode.test.tsx         |  71 +++
+ web/src/hooks/useAeVoiceMode.ts               |  15 +-
+ web/src/hooks/useAeVoiceStart.test.ts         |  67 +++
+ web/src/hooks/useAeVoiceStart.ts              |  15 +-
+ web/src/lib/aeSettingHints.ts                 |   7 +-
+ web/src/lib/aeVoiceLog.test.ts                |  78 +++
+ web/src/lib/aeVoiceLog.ts                     |  62 ++-
+ 12 files changed, 1074 insertions(+), 447 deletions(-)
+ create mode 100644 web/src/components/AeVoiceMenuRows.tsx
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 71ab441741f21df2d0cda41333fc6b132678c73a..974d087d611054f77f3369840f1da911ad597925 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
+ import { toast } from "sonner";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { resetCloudVoicesCache } from "@/lib/aeCloudVoice";
++import { resetVoiceLog } from "@/lib/aeVoiceLog";
+ import {
+   getVoiceSnapshot,
+   resetVoiceStore,
+@@ -48,6 +49,7 @@ function serveCloudVoices(voices: { id: string; name: string }[]) {
+ }
+ 
+ beforeEach(() => {
++  resetVoiceLog();
+   serveCloudVoices([]);
+   window.localStorage.clear();
+   resetSnipsStore();
+@@ -613,12 +615,12 @@ describe("AeSpeakRepliesButton", () => {
+     renderButton();
+     await openMenu();
+     const triggers = document.querySelectorAll("[data-slot=tooltip-trigger]");
+-    expect(triggers).toHaveLength(11);
++    expect(triggers).toHaveLength(12);
+     for (const el of triggers) {
+       const group = el.closest("span.items-center.gap-1\\.5");
+       expect(group).not.toBeNull();
+       expect(group?.textContent).toMatch(
+-        /Voice mode|Speak replies|Fast answers|Send snips|Mic while speaking|Voice|Speed|Microphone|Speaker|Add voice log/,
++        /Voice mode|Speak replies|Fast answers|Send snips|Mic while speaking|Voice|Speed|Microphone|Speaker|Add voice log|Send voice log/,
+       );
+     }
+     const actions = screen.getByTestId("ae-speak-actions");
+@@ -638,6 +640,44 @@ describe("AeSpeakRepliesButton", () => {
+     expect(seen[0]).toMatch(/^Voice log /);
+   });
+ 
++  it("Send voice log uploads the log for this chat and says so", async () => {
++    const toastSpy = vi.spyOn(toast, "success").mockImplementation(() => "");
++    renderButton();
++    const user = await openMenu();
++    expect(
++      within(screen.getByTestId("ae-voice-log-send")).getByTestId("ae-hint-voice.log_send"),
++    ).toBeInTheDocument();
++    await user.click(screen.getByTestId("ae-voice-log-send"));
++    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith("Voice log sent"));
++    const post = vi
++      .mocked(fetch)
++      .mock.calls.find(([url]) => String(url).includes("/v1/ae/voice-log"));
++    expect(post).toBeDefined();
++    const body = JSON.parse(String(((post as unknown[])[1] as RequestInit).body));
++    expect(body.reason).toBe("manual");
++    expect(body.chat_id).toBe("c1");
++    toastSpy.mockRestore();
++  });
++
++  it("Send voice log says so when the server refuses it", async () => {
++    const errorSpy = vi.spyOn(toast, "error").mockImplementation(() => "");
++    vi.stubGlobal(
++      "fetch",
++      vi.fn((url: unknown) =>
++        Promise.resolve(
++          String(url).includes("/v1/ae/voice-log")
++            ? new Response("{}", { status: 429 })
++            : new Response(JSON.stringify({ voices: [] }), { status: 200 }),
++        ),
++      ),
++    );
++    renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-voice-log-send"));
++    await waitFor(() => expect(errorSpy).toHaveBeenCalledWith("Could not send the voice log"));
++    errorSpy.mockRestore();
++  });
++
+   it("Read last reply speaks the last reply and Stop speaking cancels it", async () => {
+     const synth = installFakeSpeech();
+     synth.voices = [makeVoice({ name: "Plain", lang: "en-US", default: true })];
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 858af965750f88304980175b1b17cdae0a28bbbf..7577fa647b4aee6c91992c6fc1c1093bad7f60bd 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -6,13 +6,11 @@
+ import { ChevronDownIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
+ import { useCallback, useEffect, useRef, useState } from "react";
+ import { toast } from "sonner";
+-import { AeHint } from "@/components/AeHint";
+ import { Button } from "@/components/ui/button";
+ import {
+   DropdownMenu,
+   DropdownMenuContent,
+   DropdownMenuItem,
+-  DropdownMenuLabel,
+   DropdownMenuRadioGroup,
+   DropdownMenuRadioItem,
+   DropdownMenuSeparator,
+@@ -21,20 +19,18 @@ import {
+   DropdownMenuSubTrigger,
+   DropdownMenuTrigger,
+ } from "@/components/ui/dropdown-menu";
+-import { Switch } from "@/components/ui/switch";
+ import { useAeSpeakReplies } from "@/hooks/useAeSpeakReplies";
+-import { logVoice, requestVoiceLogInsert } from "@/lib/aeVoiceLog";
+ import {
+-  micDevicesSupported,
+-  speakerSelectionSupported,
+-  shortDeviceName,
+-  useAudioDevices,
+-  useSavedAudioDevices,
+-  writeMicDevice,
+-  writeSpeakerDevice,
+-  type AudioDevice,
+-} from "@/lib/aeAudioDevices";
+-import { type CloudVoice, fetchCloudVoiceList } from "@/lib/aeCloudVoice";
++  MicWhileSpeakingRow,
++  RowHint,
++  ROW_LABEL_CLASS,
++  ROW_VALUE_CLASS,
++  SendVoiceLogRow,
++  SwitchRow,
++  useVoiceChoices,
++  VoiceChoiceRows,
++} from "@/components/AeVoiceMenuRows";
++import { logVoice, requestVoiceLogInsert } from "@/lib/aeVoiceLog";
+ import {
+   clearVoiceModelState,
+   effectiveModelId,
+@@ -54,26 +50,13 @@ import {
+   clearFastAnswersState,
+   FAST_EFFORT,
+   isSpeechSupported,
+-  listVoices,
+   primeVoicePlayback,
+-  onVoicesChanged,
+-  pickDefaultVoice,
+-  RATE_FASTER,
+-  RATE_FASTEST,
+-  rankVoices,
+   readFastAnswersState,
+   readFastEnabled,
+-  readRate,
+   readSpeakReplies,
+-  isLegacyVoiceChoice,
+-  readVoiceChoice,
+-  type VoiceChoice,
+-  voiceLabel,
+   writeFastAnswersState,
+   writeFastEnabled,
+-  writeRate,
+   writeSpeakReplies,
+-  writeVoiceChoice,
+ } from "@/lib/aeSpeakReplies";
+ import {
+   registerVoiceSpeaker,
+@@ -85,22 +68,10 @@ import {
+   useVoiceSnapshot,
+   type VoicePhase,
+ } from "@/lib/aeVoiceMode";
+-import {
+-  readVoiceChatVoicePick,
+-  resolveVoiceChatVoice,
+-  VOICE_CHAT_VOICE_SAME,
+-  voiceChatVoiceKey,
+-  writeVoiceChatVoicePick,
+-} from "@/lib/aeVoiceChatVoice";
+-import { useMicWhileSpeaking, writeMicWhileSpeaking } from "@/lib/aeVoiceMic";
+ import { useSendSnips, writeSendSnips } from "@/lib/aeVoiceSnips";
+ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
+ 
+-const MAX_VOICES = 12;
+-const VOICE_LIST_RETRIES = 3;
+-const VOICE_LIST_RETRY_MS = 2000;
+-
+ const PHASE_WORD: Record<VoicePhase, string> = {
+   off: "",
+   starting: "Starting the mic",
+@@ -130,145 +101,6 @@ export interface AeSpeakRepliesButtonProps {
+   canResetModel?: boolean;
+ }
+ 
+-function choiceKey(choice: VoiceChoice | null): string {
+-  return choice ? `${choice.kind}:${choice.id}` : "";
+-}
+-
+-/** The "i" sits inside a menu row: pressing it must not toggle or close the row. */
+-function RowHint({
+-  id,
+-}: {
+-  id:
+-    | "voice.mode"
+-    | "voice.speak"
+-    | "voice.fast"
+-    | "voice.fast_model"
+-    | "voice.snips"
+-    | "voice.mic_while_speaking"
+-    | "voice.chat_voice"
+-    | "voice.voice"
+-    | "voice.rate"
+-    | "voice.microphone"
+-    | "voice.speaker"
+-    | "voice.log";
+-}) {
+-  const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
+-  return (
+-    <span className="flex shrink-0" onPointerDown={stop} onPointerUp={stop} onClick={stop}>
+-      <AeHint id={id} />
+-    </span>
+-  );
+-}
+-
+-const SYSTEM_DEFAULT = "";
+-
+-/** Value rows: the label group keeps its size, the value takes the rest and truncates. */
+-const ROW_LABEL_CLASS = "flex shrink-0 items-center gap-1.5";
+-const ROW_VALUE_CLASS = "min-w-0 flex-1 truncate pl-2 text-right text-xs text-muted-foreground";
+-
+-/** A device row: current value on the row, radio items in the sub-menu. */
+-function DeviceRow({
+-  label,
+-  hint,
+-  testId,
+-  devices,
+-  known,
+-  saved,
+-  onChoose,
+-}: {
+-  label: string;
+-  hint: "voice.microphone" | "voice.speaker";
+-  testId: string;
+-  devices: AudioDevice[];
+-  known: boolean;
+-  saved: string | null;
+-  onChoose: (id: string | null) => void;
+-}) {
+-  // A saved device that is gone reads as System default; the saved value stays for its return.
+-  const current = devices.find((d) => d.id === saved);
+-  // Before ids are known the saved id ticks no radio; System default clears it.
+-  const value = current ? current.id : !known && saved ? saved : SYSTEM_DEFAULT;
+-  // Before the browser shares device ids a saved choice cannot be named.
+-  const name = current ? current.label : !known && saved ? "Saved device" : "System default";
+-  // The row value is short so it fits the phone-width menu; the radio item keeps the full name.
+-  const rowValue = current ? shortDeviceName(name) : name === "System default" ? "Default" : name;
+-  return (
+-    <DropdownMenuSub>
+-      <DropdownMenuSubTrigger data-testid={`${testId}-trigger`}>
+-        <span className={ROW_LABEL_CLASS}>
+-          {label}
+-          <RowHint id={hint} />
+-        </span>
+-        <span className={ROW_VALUE_CLASS} title={name}>
+-          {rowValue}
+-        </span>
+-      </DropdownMenuSubTrigger>
+-      <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
+-        <DropdownMenuRadioGroup
+-          value={value}
+-          onValueChange={(v) => onChoose(v === SYSTEM_DEFAULT ? null : v)}
+-        >
+-          <DropdownMenuRadioItem value={SYSTEM_DEFAULT} data-testid={`${testId}-option`}>
+-            System default
+-          </DropdownMenuRadioItem>
+-          {!known ? (
+-            <div
+-              className="px-2 py-1.5 text-xs text-muted-foreground"
+-              data-testid={`${testId}-unknown`}
+-            >
+-              Use the mic once to list devices.
+-            </div>
+-          ) : null}
+-          {devices.map((d) => (
+-            <DropdownMenuRadioItem key={d.id} value={d.id} data-testid={`${testId}-option`}>
+-              {d.label}
+-            </DropdownMenuRadioItem>
+-          ))}
+-        </DropdownMenuRadioGroup>
+-      </DropdownMenuSubContent>
+-    </DropdownMenuSub>
+-  );
+-}
+-
+-function SwitchRow({
+-  label,
+-  checked,
+-  onChange,
+-  hint,
+-  testId,
+-}: {
+-  label: string;
+-  checked: boolean;
+-  onChange: (next: boolean) => void;
+-  hint: "voice.mode" | "voice.speak" | "voice.fast" | "voice.snips" | "voice.mic_while_speaking";
+-  testId: string;
+-}) {
+-  return (
+-    <DropdownMenuItem
+-      role="menuitemcheckbox"
+-      aria-checked={checked}
+-      onSelect={(e) => {
+-        e.preventDefault();
+-        onChange(!checked);
+-      }}
+-      data-testid={testId}
+-      className="min-h-8"
+-    >
+-      <span className="flex min-w-0 flex-1 items-center gap-1.5">
+-        {label}
+-        <RowHint id={hint} />
+-      </span>
+-      <Switch
+-        size="sm"
+-        checked={checked}
+-        tabIndex={-1}
+-        aria-label={label}
+-        className="pointer-events-none"
+-      />
+-    </DropdownMenuItem>
+-  );
+-}
+-
+ const NO_MODEL_OPTIONS: readonly NativeModelOption[] = [];
+ 
+ function setChatEffort(level: string | null): Promise<void> {
+@@ -294,82 +126,14 @@ function SpeakRepliesControl({
+   const [on, setOn] = useState(() => readSpeakReplies(chatId));
+   const [fastEnabled, setFastEnabled] = useState(readFastEnabled);
+   const snips = useSendSnips();
+-  const micWhileSpeaking = useMicWhileSpeaking();
+-  const [stored, setStored] = useState(readVoiceChoice);
+-  const [legacy, setLegacy] = useState(isLegacyVoiceChoice);
+-  const [cloudVoices, setCloudVoices] = useState<CloudVoice[]>([]);
+-  // True once the server answered, even with an empty list (an empty list is then real).
+-  const [cloudLoaded, setCloudLoaded] = useState(false);
+-  const [rate, setRate] = useState(readRate);
+-  const [voices, setVoices] = useState(listVoices);
+-  const savedDevices = useSavedAudioDevices();
+-  const audioDevices = useAudioDevices();
++  const choices = useVoiceChoices();
++  const { voice, chatVoice, rate } = choices;
+ 
+   useEffect(() => {
+     setOn(readSpeakReplies(chatId));
+   }, [chatId]);
+-  useEffect(() => {
+-    let live = true;
+-    let timer: ReturnType<typeof setTimeout> | null = null;
+-    let attempts = 0;
+-    const load = () => {
+-      void fetchCloudVoiceList().then((list) => {
+-        if (!live) return;
+-        if (list !== null) {
+-          setCloudLoaded(true);
+-          setCloudVoices(list);
+-          return;
+-        }
+-        // A failed fetch: retry a few times (a successful list is cached).
+-        attempts += 1;
+-        if (attempts <= VOICE_LIST_RETRIES)
+-          timer = setTimeout(load, VOICE_LIST_RETRY_MS * attempts);
+-      });
+-    };
+-    load();
+-    return () => {
+-      live = false;
+-      if (timer) clearTimeout(timer);
+-    };
+-  }, []);
+-  useEffect(() => {
+-    const refresh = () => setVoices(listVoices());
+-    refresh();
+-    return onVoicesChanged(refresh);
+-  }, []);
+-
+-  // A stored cloud voice the server no longer offers, or none stored: first cloud voice, else the device's.
+-  const deviceDefault = pickDefaultVoice(voices);
+-  // A bare value from before the prefixes is no choice once the server has cloud voices.
+-  // A stored cloud voice is never silently swapped for the device voice while the list is empty
+-  // (not loaded yet, or the fetch failed): the server knows the id, and the cloud speaker falls
+-  // back to the device per sentence if it cannot play.
+-  const voice: VoiceChoice | null =
+-    stored?.kind === "device" && !(legacy && cloudVoices.length > 0)
+-      ? { kind: "device", id: stored.id }
+-      : stored?.kind === "cloud" &&
+-          (cloudVoices.length === 0 || cloudVoices.some((v) => v.id === stored.id))
+-        ? { kind: "cloud", id: stored.id }
+-        : cloudVoices[0]
+-          ? { kind: "cloud", id: cloudVoices[0].id }
+-          : deviceDefault
+-            ? { kind: "device", id: deviceDefault.voiceURI }
+-            : null;
+-  const replacedCloud = stored?.kind === "cloud" && voice?.kind === "device";
+-  useEffect(() => {
+-    if (replacedCloud) logVoice("cloud voice replaced", `${choiceKey(stored)} -> device`);
+-  }, [replacedCloud, stored]);
+-
+   // While Voice mode is on, the Voice chat voice speaks (replies, Read last reply, approval line).
+   const voiceMode = useVoiceSnapshot(chatId);
+-  const [chatVoicePick, setChatVoicePick] = useState(readVoiceChatVoicePick);
+-  const chatVoice = resolveVoiceChatVoice(
+-    chatVoicePick,
+-    cloudLoaded ? cloudVoices : null,
+-    voice,
+-    deviceDefault ? { kind: "device", id: deviceDefault.voiceURI } : null,
+-    voices.map((v) => v.voiceURI),
+-  );
+   const { speaking, stop, readLast, speak } = useAeSpeakReplies({
+     chatId,
+     enabled: on,
+@@ -591,21 +355,6 @@ function SpeakRepliesControl({
+     if (!next && on) void revertFast();
+   };
+ 
+-  const ranked = rankVoices(voices).slice(0, MAX_VOICES);
+-  const chosenDevice =
+-    voice?.kind === "device" ? voices.find((v) => v.voiceURI === voice.id) : null;
+-  const chosenName =
+-    (voice?.kind === "cloud"
+-      ? cloudVoices.find((v) => v.id === voice.id)?.name
+-      : chosenDevice && voiceLabel(chosenDevice)) ?? "Default";
+-  const chatDevice =
+-    chatVoice?.kind === "device" ? voices.find((v) => v.voiceURI === chatVoice.id) : null;
+-  const chatVoiceName =
+-    chatVoicePick === VOICE_CHAT_VOICE_SAME
+-      ? "Same"
+-      : ((chatVoice?.kind === "cloud"
+-          ? cloudVoices.find((v) => v.id === chatVoice.id)?.name
+-          : chatDevice && voiceLabel(chatDevice)) ?? "Default");
+   const Icon = on ? Volume2Icon : VolumeXIcon;
+ 
+   const phaseWord =
+@@ -713,174 +462,8 @@ function SpeakRepliesControl({
+           hint="voice.snips"
+           testId="ae-voice-snips"
+         />
+-        <SwitchRow
+-          label="Mic while speaking"
+-          checked={micWhileSpeaking === "always"}
+-          onChange={(next) => writeMicWhileSpeaking(next ? "always" : "wait")}
+-          hint="voice.mic_while_speaking"
+-          testId="ae-voice-mic-while-speaking"
+-        />
+-        <DropdownMenuSub>
+-          <DropdownMenuSubTrigger data-testid="ae-speak-voice-trigger">
+-            <span className={ROW_LABEL_CLASS}>
+-              Voice
+-              <RowHint id="voice.voice" />
+-            </span>
+-            <span className={ROW_VALUE_CLASS} title={chosenName}>
+-              {chosenName}
+-            </span>
+-          </DropdownMenuSubTrigger>
+-          <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
+-            <DropdownMenuRadioGroup
+-              value={choiceKey(voice)}
+-              onValueChange={(key) => {
+-                const [kind, ...rest] = key.split(":");
+-                const next = { kind: kind as VoiceChoice["kind"], id: rest.join(":") };
+-                writeVoiceChoice(next);
+-                setLegacy(false);
+-                setStored(next);
+-              }}
+-            >
+-              {cloudVoices.length > 0 ? (
+-                <>
+-                  <DropdownMenuLabel>Natural (cloud)</DropdownMenuLabel>
+-                  {cloudVoices.map((v) => (
+-                    <DropdownMenuRadioItem
+-                      key={v.id}
+-                      value={`cloud:${v.id}`}
+-                      data-testid="ae-speak-voice-option"
+-                    >
+-                      {v.name}
+-                    </DropdownMenuRadioItem>
+-                  ))}
+-                </>
+-              ) : null}
+-              <DropdownMenuLabel>This device</DropdownMenuLabel>
+-              {ranked.length === 0 ? (
+-                <DropdownMenuItem disabled>No voices on this device</DropdownMenuItem>
+-              ) : (
+-                ranked.map((v) => (
+-                  <DropdownMenuRadioItem
+-                    key={v.voiceURI}
+-                    value={`device:${v.voiceURI}`}
+-                    data-testid="ae-speak-voice-option"
+-                  >
+-                    {voiceLabel(v)}
+-                  </DropdownMenuRadioItem>
+-                ))
+-              )}
+-            </DropdownMenuRadioGroup>
+-          </DropdownMenuSubContent>
+-        </DropdownMenuSub>
+-        <DropdownMenuSub>
+-          <DropdownMenuSubTrigger data-testid="ae-voice-chat-voice-trigger">
+-            <span className={ROW_LABEL_CLASS}>
+-              Voice chat voice
+-              <RowHint id="voice.chat_voice" />
+-            </span>
+-            <span className={ROW_VALUE_CLASS} title={chatVoiceName}>
+-              {chatVoiceName}
+-            </span>
+-          </DropdownMenuSubTrigger>
+-          <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
+-            <DropdownMenuRadioGroup
+-              value={voiceChatVoiceKey(chatVoicePick, chatVoice)}
+-              onValueChange={(key) => {
+-                writeVoiceChatVoicePick(key);
+-                setChatVoicePick(key);
+-              }}
+-            >
+-              <DropdownMenuRadioItem
+-                value={VOICE_CHAT_VOICE_SAME}
+-                data-testid="ae-voice-chat-voice-same"
+-              >
+-                Same as Speak replies
+-              </DropdownMenuRadioItem>
+-              {cloudVoices.length > 0 ? (
+-                <>
+-                  <DropdownMenuLabel>Natural (cloud)</DropdownMenuLabel>
+-                  {cloudVoices.map((v) => (
+-                    <DropdownMenuRadioItem
+-                      key={v.id}
+-                      value={`cloud:${v.id}`}
+-                      data-testid="ae-voice-chat-voice-option"
+-                    >
+-                      {v.name}
+-                    </DropdownMenuRadioItem>
+-                  ))}
+-                </>
+-              ) : null}
+-              <DropdownMenuLabel>This device</DropdownMenuLabel>
+-              {ranked.map((v) => (
+-                <DropdownMenuRadioItem
+-                  key={v.voiceURI}
+-                  value={`device:${v.voiceURI}`}
+-                  data-testid="ae-voice-chat-voice-option"
+-                >
+-                  {voiceLabel(v)}
+-                </DropdownMenuRadioItem>
+-              ))}
+-            </DropdownMenuRadioGroup>
+-          </DropdownMenuSubContent>
+-        </DropdownMenuSub>
+-        <DropdownMenuSub>
+-          <DropdownMenuSubTrigger data-testid="ae-speak-rate-trigger">
+-            <span className={ROW_LABEL_CLASS}>
+-              Speed
+-              <RowHint id="voice.rate" />
+-            </span>
+-            <span className={ROW_VALUE_CLASS}>
+-              {rate === RATE_FASTEST ? "Fastest" : rate === RATE_FASTER ? "Faster" : "Normal"}
+-            </span>
+-          </DropdownMenuSubTrigger>
+-          <DropdownMenuSubContent>
+-            <DropdownMenuRadioGroup
+-              value={String(rate)}
+-              onValueChange={(v) => {
+-                const next = Number(v);
+-                writeRate(next);
+-                setRate(next);
+-              }}
+-            >
+-              <DropdownMenuRadioItem value="1" data-testid="ae-speak-rate-normal">
+-                Normal
+-              </DropdownMenuRadioItem>
+-              <DropdownMenuRadioItem value={String(RATE_FASTER)} data-testid="ae-speak-rate-faster">
+-                Faster
+-                <span className="ml-auto pl-3 text-xs text-muted-foreground">1.25x</span>
+-              </DropdownMenuRadioItem>
+-              <DropdownMenuRadioItem
+-                value={String(RATE_FASTEST)}
+-                data-testid="ae-speak-rate-fastest"
+-              >
+-                Fastest
+-                <span className="ml-auto pl-3 text-xs text-muted-foreground">1.5x</span>
+-              </DropdownMenuRadioItem>
+-            </DropdownMenuRadioGroup>
+-          </DropdownMenuSubContent>
+-        </DropdownMenuSub>
+-        {micDevicesSupported() ? (
+-          <DeviceRow
+-            label="Microphone"
+-            hint="voice.microphone"
+-            testId="ae-speak-mic"
+-            devices={audioDevices.inputs}
+-            known={audioDevices.inputsKnown}
+-            saved={savedDevices.mic}
+-            onChoose={writeMicDevice}
+-          />
+-        ) : null}
+-        {speakerSelectionSupported() ? (
+-          <DeviceRow
+-            label="Speaker"
+-            hint="voice.speaker"
+-            testId="ae-speak-speaker"
+-            devices={audioDevices.outputs}
+-            known={audioDevices.outputsKnown}
+-            saved={savedDevices.speaker}
+-            onChoose={writeSpeakerDevice}
+-          />
+-        ) : null}
++        <MicWhileSpeakingRow />
++        <VoiceChoiceRows choices={choices} />
+         <DropdownMenuSeparator />
+         <div className="flex gap-1.5 px-1 pb-1 pt-0.5" data-testid="ae-speak-actions">
+           <DropdownMenuItem
+@@ -908,6 +491,7 @@ function SpeakRepliesControl({
+             <RowHint id="voice.log" />
+           </span>
+         </DropdownMenuItem>
++        <SendVoiceLogRow chatId={chatId} />
+       </DropdownMenuContent>
+     </DropdownMenu>
+   );
+diff --git a/web/src/components/AeVoiceMenuRows.tsx b/web/src/components/AeVoiceMenuRows.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..45da1bf9d354aa01d79c7c2c47751a3f2defe6e6
+--- /dev/null
++++ b/web/src/components/AeVoiceMenuRows.tsx
+@@ -0,0 +1,526 @@
++"use client";
++
++// Menu rows shared by the speaker menu in a chat (AeSpeakRepliesButton) and the Voice menu
++// on the new-chat page (AeVoiceStartButton): the row pieces, the per-device voice choices
++// that need no chat, and Send voice log.
++
++import { toast } from "sonner";
++import { useEffect, useState } from "react";
++import { AeHint } from "@/components/AeHint";
++import {
++  DropdownMenuItem,
++  DropdownMenuLabel,
++  DropdownMenuRadioGroup,
++  DropdownMenuRadioItem,
++  DropdownMenuSub,
++  DropdownMenuSubContent,
++  DropdownMenuSubTrigger,
++} from "@/components/ui/dropdown-menu";
++import { Switch } from "@/components/ui/switch";
++import {
++  micDevicesSupported,
++  speakerSelectionSupported,
++  shortDeviceName,
++  useAudioDevices,
++  useSavedAudioDevices,
++  writeMicDevice,
++  writeSpeakerDevice,
++  type AudioDevice,
++} from "@/lib/aeAudioDevices";
++import { type CloudVoice, fetchCloudVoiceList } from "@/lib/aeCloudVoice";
++import {
++  isLegacyVoiceChoice,
++  listVoices,
++  onVoicesChanged,
++  pickDefaultVoice,
++  RATE_FASTER,
++  RATE_FASTEST,
++  rankVoices,
++  readRate,
++  readVoiceChoice,
++  type VoiceChoice,
++  voiceLabel,
++  writeRate,
++  writeVoiceChoice,
++} from "@/lib/aeSpeakReplies";
++import {
++  readVoiceChatVoicePick,
++  resolveVoiceChatVoice,
++  VOICE_CHAT_VOICE_SAME,
++  voiceChatVoiceKey,
++  writeVoiceChatVoicePick,
++} from "@/lib/aeVoiceChatVoice";
++import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
++import { useMicWhileSpeaking, writeMicWhileSpeaking } from "@/lib/aeVoiceMic";
++
++const MAX_VOICES = 12;
++const VOICE_LIST_RETRIES = 3;
++const VOICE_LIST_RETRY_MS = 2000;
++
++export function choiceKey(choice: VoiceChoice | null): string {
++  return choice ? `${choice.kind}:${choice.id}` : "";
++}
++
++/** The "i" sits inside a menu row: pressing it must not toggle or close the row. */
++export function RowHint({
++  id,
++}: {
++  id:
++    | "voice.mode"
++    | "voice.speak"
++    | "voice.fast"
++    | "voice.fast_model"
++    | "voice.snips"
++    | "voice.mic_while_speaking"
++    | "voice.chat_voice"
++    | "voice.voice"
++    | "voice.rate"
++    | "voice.microphone"
++    | "voice.speaker"
++    | "voice.log"
++    | "voice.log_send"
++    | "voice.start";
++}) {
++  const stop = (e: { stopPropagation: () => void }) => e.stopPropagation();
++  return (
++    <span className="flex shrink-0" onPointerDown={stop} onPointerUp={stop} onClick={stop}>
++      <AeHint id={id} />
++    </span>
++  );
++}
++
++const SYSTEM_DEFAULT = "";
++
++/** Value rows: the label group keeps its size, the value takes the rest and truncates. */
++export const ROW_LABEL_CLASS = "flex shrink-0 items-center gap-1.5";
++export const ROW_VALUE_CLASS =
++  "min-w-0 flex-1 truncate pl-2 text-right text-xs text-muted-foreground";
++
++/** A device row: current value on the row, radio items in the sub-menu. */
++export function DeviceRow({
++  label,
++  hint,
++  testId,
++  devices,
++  known,
++  saved,
++  onChoose,
++}: {
++  label: string;
++  hint: "voice.microphone" | "voice.speaker";
++  testId: string;
++  devices: AudioDevice[];
++  known: boolean;
++  saved: string | null;
++  onChoose: (id: string | null) => void;
++}) {
++  // A saved device that is gone reads as System default; the saved value stays for its return.
++  const current = devices.find((d) => d.id === saved);
++  // Before ids are known the saved id ticks no radio; System default clears it.
++  const value = current ? current.id : !known && saved ? saved : SYSTEM_DEFAULT;
++  // Before the browser shares device ids a saved choice cannot be named.
++  const name = current ? current.label : !known && saved ? "Saved device" : "System default";
++  // The row value is short so it fits the phone-width menu; the radio item keeps the full name.
++  const rowValue = current ? shortDeviceName(name) : name === "System default" ? "Default" : name;
++  return (
++    <DropdownMenuSub>
++      <DropdownMenuSubTrigger data-testid={`${testId}-trigger`}>
++        <span className={ROW_LABEL_CLASS}>
++          {label}
++          <RowHint id={hint} />
++        </span>
++        <span className={ROW_VALUE_CLASS} title={name}>
++          {rowValue}
++        </span>
++      </DropdownMenuSubTrigger>
++      <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
++        <DropdownMenuRadioGroup
++          value={value}
++          onValueChange={(v) => onChoose(v === SYSTEM_DEFAULT ? null : v)}
++        >
++          <DropdownMenuRadioItem value={SYSTEM_DEFAULT} data-testid={`${testId}-option`}>
++            System default
++          </DropdownMenuRadioItem>
++          {!known ? (
++            <div
++              className="px-2 py-1.5 text-xs text-muted-foreground"
++              data-testid={`${testId}-unknown`}
++            >
++              Use the mic once to list devices.
++            </div>
++          ) : null}
++          {devices.map((d) => (
++            <DropdownMenuRadioItem key={d.id} value={d.id} data-testid={`${testId}-option`}>
++              {d.label}
++            </DropdownMenuRadioItem>
++          ))}
++        </DropdownMenuRadioGroup>
++      </DropdownMenuSubContent>
++    </DropdownMenuSub>
++  );
++}
++
++export function SwitchRow({
++  label,
++  checked,
++  onChange,
++  hint,
++  testId,
++}: {
++  label: string;
++  checked: boolean;
++  onChange: (next: boolean) => void;
++  hint:
++    | "voice.mode"
++    | "voice.speak"
++    | "voice.fast"
++    | "voice.snips"
++    | "voice.mic_while_speaking"
++    | "voice.start";
++  testId: string;
++}) {
++  return (
++    <DropdownMenuItem
++      role="menuitemcheckbox"
++      aria-checked={checked}
++      onSelect={(e) => {
++        e.preventDefault();
++        onChange(!checked);
++      }}
++      data-testid={testId}
++      className="min-h-8"
++    >
++      <span className="flex min-w-0 flex-1 items-center gap-1.5">
++        {label}
++        <RowHint id={hint} />
++      </span>
++      <Switch
++        size="sm"
++        checked={checked}
++        tabIndex={-1}
++        aria-label={label}
++        className="pointer-events-none"
++      />
++    </DropdownMenuItem>
++  );
++}
++
++/** The per-device voice choices and what they resolve to; none of it needs a chat. */
++export function useVoiceChoices() {
++  const [stored, setStored] = useState(readVoiceChoice);
++  const [legacy, setLegacy] = useState(isLegacyVoiceChoice);
++  const [cloudVoices, setCloudVoices] = useState<CloudVoice[]>([]);
++  // True once the server answered, even with an empty list (an empty list is then real).
++  const [cloudLoaded, setCloudLoaded] = useState(false);
++  const [rate, setRate] = useState(readRate);
++  const [voices, setVoices] = useState(listVoices);
++  const [chatVoicePick, setChatVoicePick] = useState(readVoiceChatVoicePick);
++  const savedDevices = useSavedAudioDevices();
++  const audioDevices = useAudioDevices();
++
++  useEffect(() => {
++    let live = true;
++    let timer: ReturnType<typeof setTimeout> | null = null;
++    let attempts = 0;
++    const load = () => {
++      void fetchCloudVoiceList().then((list) => {
++        if (!live) return;
++        if (list !== null) {
++          setCloudLoaded(true);
++          setCloudVoices(list);
++          return;
++        }
++        // A failed fetch: retry a few times (a successful list is cached).
++        attempts += 1;
++        if (attempts <= VOICE_LIST_RETRIES)
++          timer = setTimeout(load, VOICE_LIST_RETRY_MS * attempts);
++      });
++    };
++    load();
++    return () => {
++      live = false;
++      if (timer) clearTimeout(timer);
++    };
++  }, []);
++  useEffect(() => {
++    const refresh = () => setVoices(listVoices());
++    refresh();
++    return onVoicesChanged(refresh);
++  }, []);
++
++  // A stored cloud voice the server no longer offers, or none stored: first cloud voice, else the device's.
++  const deviceDefault = pickDefaultVoice(voices);
++  // A bare value from before the prefixes is no choice once the server has cloud voices.
++  // A stored cloud voice is never silently swapped for the device voice while the list is empty
++  // (not loaded yet, or the fetch failed): the server knows the id, and the cloud speaker falls
++  // back to the device per sentence if it cannot play.
++  const voice: VoiceChoice | null =
++    stored?.kind === "device" && !(legacy && cloudVoices.length > 0)
++      ? { kind: "device", id: stored.id }
++      : stored?.kind === "cloud" &&
++          (cloudVoices.length === 0 || cloudVoices.some((v) => v.id === stored.id))
++        ? { kind: "cloud", id: stored.id }
++        : cloudVoices[0]
++          ? { kind: "cloud", id: cloudVoices[0].id }
++          : deviceDefault
++            ? { kind: "device", id: deviceDefault.voiceURI }
++            : null;
++  const replacedCloud = stored?.kind === "cloud" && voice?.kind === "device";
++  useEffect(() => {
++    if (replacedCloud) logVoice("cloud voice replaced", `${choiceKey(stored)} -> device`);
++  }, [replacedCloud, stored]);
++
++  const chatVoice = resolveVoiceChatVoice(
++    chatVoicePick,
++    cloudLoaded ? cloudVoices : null,
++    voice,
++    deviceDefault ? { kind: "device", id: deviceDefault.voiceURI } : null,
++    voices.map((v) => v.voiceURI),
++  );
++  return {
++    stored,
++    setStored,
++    setLegacy,
++    cloudVoices,
++    rate,
++    setRate,
++    voices,
++    chatVoicePick,
++    setChatVoicePick,
++    savedDevices,
++    audioDevices,
++    voice,
++    chatVoice,
++  };
++}
++
++export type VoiceChoices = ReturnType<typeof useVoiceChoices>;
++
++/** Voice, Voice chat voice, Speed, Microphone and Speaker: per-device rows that need no chat. */
++export function VoiceChoiceRows({ choices }: { choices: VoiceChoices }) {
++  const {
++    setStored,
++    setLegacy,
++    cloudVoices,
++    rate,
++    setRate,
++    voices,
++    chatVoicePick,
++    setChatVoicePick,
++    savedDevices,
++    audioDevices,
++    voice,
++    chatVoice,
++  } = choices;
++  const ranked = rankVoices(voices).slice(0, MAX_VOICES);
++  const chosenDevice =
++    voice?.kind === "device" ? voices.find((v) => v.voiceURI === voice.id) : null;
++  const chosenName =
++    (voice?.kind === "cloud"
++      ? cloudVoices.find((v) => v.id === voice.id)?.name
++      : chosenDevice && voiceLabel(chosenDevice)) ?? "Default";
++  const chatDevice =
++    chatVoice?.kind === "device" ? voices.find((v) => v.voiceURI === chatVoice.id) : null;
++  const chatVoiceName =
++    chatVoicePick === VOICE_CHAT_VOICE_SAME
++      ? "Same"
++      : ((chatVoice?.kind === "cloud"
++          ? cloudVoices.find((v) => v.id === chatVoice.id)?.name
++          : chatDevice && voiceLabel(chatDevice)) ?? "Default");
++  return (
++    <>
++      <DropdownMenuSub>
++        <DropdownMenuSubTrigger data-testid="ae-speak-voice-trigger">
++          <span className={ROW_LABEL_CLASS}>
++            Voice
++            <RowHint id="voice.voice" />
++          </span>
++          <span className={ROW_VALUE_CLASS} title={chosenName}>
++            {chosenName}
++          </span>
++        </DropdownMenuSubTrigger>
++        <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
++          <DropdownMenuRadioGroup
++            value={choiceKey(voice)}
++            onValueChange={(key) => {
++              const [kind, ...rest] = key.split(":");
++              const next = { kind: kind as VoiceChoice["kind"], id: rest.join(":") };
++              writeVoiceChoice(next);
++              setLegacy(false);
++              setStored(next);
++            }}
++          >
++            {cloudVoices.length > 0 ? (
++              <>
++                <DropdownMenuLabel>Natural (cloud)</DropdownMenuLabel>
++                {cloudVoices.map((v) => (
++                  <DropdownMenuRadioItem
++                    key={v.id}
++                    value={`cloud:${v.id}`}
++                    data-testid="ae-speak-voice-option"
++                  >
++                    {v.name}
++                  </DropdownMenuRadioItem>
++                ))}
++              </>
++            ) : null}
++            <DropdownMenuLabel>This device</DropdownMenuLabel>
++            {ranked.length === 0 ? (
++              <DropdownMenuItem disabled>No voices on this device</DropdownMenuItem>
++            ) : (
++              ranked.map((v) => (
++                <DropdownMenuRadioItem
++                  key={v.voiceURI}
++                  value={`device:${v.voiceURI}`}
++                  data-testid="ae-speak-voice-option"
++                >
++                  {voiceLabel(v)}
++                </DropdownMenuRadioItem>
++              ))
++            )}
++          </DropdownMenuRadioGroup>
++        </DropdownMenuSubContent>
++      </DropdownMenuSub>
++      <DropdownMenuSub>
++        <DropdownMenuSubTrigger data-testid="ae-voice-chat-voice-trigger">
++          <span className={ROW_LABEL_CLASS}>
++            Voice chat voice
++            <RowHint id="voice.chat_voice" />
++          </span>
++          <span className={ROW_VALUE_CLASS} title={chatVoiceName}>
++            {chatVoiceName}
++          </span>
++        </DropdownMenuSubTrigger>
++        <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
++          <DropdownMenuRadioGroup
++            value={voiceChatVoiceKey(chatVoicePick, chatVoice)}
++            onValueChange={(key) => {
++              writeVoiceChatVoicePick(key);
++              setChatVoicePick(key);
++            }}
++          >
++            <DropdownMenuRadioItem
++              value={VOICE_CHAT_VOICE_SAME}
++              data-testid="ae-voice-chat-voice-same"
++            >
++              Same as Speak replies
++            </DropdownMenuRadioItem>
++            {cloudVoices.length > 0 ? (
++              <>
++                <DropdownMenuLabel>Natural (cloud)</DropdownMenuLabel>
++                {cloudVoices.map((v) => (
++                  <DropdownMenuRadioItem
++                    key={v.id}
++                    value={`cloud:${v.id}`}
++                    data-testid="ae-voice-chat-voice-option"
++                  >
++                    {v.name}
++                  </DropdownMenuRadioItem>
++                ))}
++              </>
++            ) : null}
++            <DropdownMenuLabel>This device</DropdownMenuLabel>
++            {ranked.map((v) => (
++              <DropdownMenuRadioItem
++                key={v.voiceURI}
++                value={`device:${v.voiceURI}`}
++                data-testid="ae-voice-chat-voice-option"
++              >
++                {voiceLabel(v)}
++              </DropdownMenuRadioItem>
++            ))}
++          </DropdownMenuRadioGroup>
++        </DropdownMenuSubContent>
++      </DropdownMenuSub>
++      <DropdownMenuSub>
++        <DropdownMenuSubTrigger data-testid="ae-speak-rate-trigger">
++          <span className={ROW_LABEL_CLASS}>
++            Speed
++            <RowHint id="voice.rate" />
++          </span>
++          <span className={ROW_VALUE_CLASS}>
++            {rate === RATE_FASTEST ? "Fastest" : rate === RATE_FASTER ? "Faster" : "Normal"}
++          </span>
++        </DropdownMenuSubTrigger>
++        <DropdownMenuSubContent>
++          <DropdownMenuRadioGroup
++            value={String(rate)}
++            onValueChange={(v) => {
++              const next = Number(v);
++              writeRate(next);
++              setRate(next);
++            }}
++          >
++            <DropdownMenuRadioItem value="1" data-testid="ae-speak-rate-normal">
++              Normal
++            </DropdownMenuRadioItem>
++            <DropdownMenuRadioItem value={String(RATE_FASTER)} data-testid="ae-speak-rate-faster">
++              Faster
++              <span className="ml-auto pl-3 text-xs text-muted-foreground">1.25x</span>
++            </DropdownMenuRadioItem>
++            <DropdownMenuRadioItem value={String(RATE_FASTEST)} data-testid="ae-speak-rate-fastest">
++              Fastest
++              <span className="ml-auto pl-3 text-xs text-muted-foreground">1.5x</span>
++            </DropdownMenuRadioItem>
++          </DropdownMenuRadioGroup>
++        </DropdownMenuSubContent>
++      </DropdownMenuSub>
++      {micDevicesSupported() ? (
++        <DeviceRow
++          label="Microphone"
++          hint="voice.microphone"
++          testId="ae-speak-mic"
++          devices={audioDevices.inputs}
++          known={audioDevices.inputsKnown}
++          saved={savedDevices.mic}
++          onChoose={writeMicDevice}
++        />
++      ) : null}
++      {speakerSelectionSupported() ? (
++        <DeviceRow
++          label="Speaker"
++          hint="voice.speaker"
++          testId="ae-speak-speaker"
++          devices={audioDevices.outputs}
++          known={audioDevices.outputsKnown}
++          saved={savedDevices.speaker}
++          onChoose={writeSpeakerDevice}
++        />
++      ) : null}
++    </>
++  );
++}
++
++/** Mic while speaking: a per-device switch. */
++export function MicWhileSpeakingRow() {
++  const micWhileSpeaking = useMicWhileSpeaking();
++  return (
++    <SwitchRow
++      label="Mic while speaking"
++      checked={micWhileSpeaking === "always"}
++      onChange={(next) => writeMicWhileSpeaking(next ? "always" : "wait")}
++      hint="voice.mic_while_speaking"
++      testId="ae-voice-mic-while-speaking"
++    />
++  );
++}
++
++/** Sends the recent voice events to the server so a mic problem can be read afterwards. */
++export function SendVoiceLogRow({ chatId }: { chatId?: string | null }) {
++  return (
++    <DropdownMenuItem
++      onSelect={() => {
++        void uploadVoiceLog("manual", chatId).then((result) => {
++          if (result === "failed") toast.error("Could not send the voice log");
++          else toast.success("Voice log sent");
++        });
++      }}
++      data-testid="ae-voice-log-send"
++    >
++      <span className={ROW_LABEL_CLASS}>
++        Send voice log
++        <RowHint id="voice.log_send" />
++      </span>
++    </DropdownMenuItem>
++  );
++}
+diff --git a/web/src/components/AeVoiceStartButton.test.tsx b/web/src/components/AeVoiceStartButton.test.tsx
+index d5a9057d5662d19dcf8e3d44206235fecb589dc6..1282646ddb5fbab2a79ee550c4f9c7cd0d2fe75c 100644
+--- a/web/src/components/AeVoiceStartButton.test.tsx
++++ b/web/src/components/AeVoiceStartButton.test.tsx
+@@ -1,11 +1,36 @@
+-import { render, screen } from "@testing-library/react";
++import { render, screen, waitFor, within } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
++import { toast } from "sonner";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { installFakeSpeech, removeFakeSpeech } from "@/test/fakeSpeech";
++import { resetCloudVoicesCache } from "@/lib/aeCloudVoice";
++import { resetVoiceLog } from "@/lib/aeVoiceLog";
++import { installFakeSpeech, makeVoice, removeFakeSpeech } from "@/test/fakeSpeech";
+ import { AeVoiceStartButton } from "./AeVoiceStartButton";
+ 
+-beforeEach(() => installFakeSpeech());
+-afterEach(() => removeFakeSpeech());
++function serveFetch() {
++  resetCloudVoicesCache();
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(() => Promise.resolve(new Response(JSON.stringify({ voices: [] }), { status: 200 }))),
++  );
++}
++
++async function openMenu() {
++  const user = userEvent.setup();
++  await user.click(screen.getByTestId("ae-voice-start-menu"));
++  return user;
++}
++
++beforeEach(() => {
++  window.localStorage.clear();
++  resetVoiceLog();
++  serveFetch();
++  installFakeSpeech().voices = [makeVoice({ name: "Plain", lang: "en-US", default: true })];
++});
++afterEach(() => {
++  vi.unstubAllGlobals();
++  removeFakeSpeech();
++});
+ 
+ describe("AeVoiceStartButton", () => {
+   it("renders the button and reports a tap", async () => {
+@@ -27,5 +52,101 @@ describe("AeVoiceStartButton", () => {
+     removeFakeSpeech();
+     render(<AeVoiceStartButton armed={false} onToggle={() => {}} />);
+     expect(screen.queryByTestId("ae-voice-start")).toBeNull();
++    expect(screen.queryByTestId("ae-voice-start-menu")).toBeNull();
++  });
++
++  it("has a menu chevron with the speaker menu's touch sizing, and no separate hint icon", () => {
++    render(<AeVoiceStartButton armed={false} onToggle={() => {}} />);
++    const chevron = screen.getByTestId("ae-voice-start-menu");
++    expect(chevron.getAttribute("aria-label")).toBe("Voice mode menu");
++    expect(chevron.className).toContain("pointer-coarse:h-11");
++    expect(chevron.className).toContain("pointer-coarse:w-9");
++    expect(screen.queryByTestId("ae-hint-voice.start")).toBeNull();
++  });
++
++  it("disables the chevron with the button", () => {
++    render(<AeVoiceStartButton armed={false} onToggle={() => {}} disabled />);
++    expect(screen.getByTestId("ae-voice-start-menu")).toBeDisabled();
++  });
++
++  it("opens a menu with the chat-free rows, each with its hint, and none that need a chat", async () => {
++    render(<AeVoiceStartButton armed={false} onToggle={() => {}} />);
++    await openMenu();
++    const toggle = screen.getByTestId("ae-voice-start-toggle");
++    expect(toggle).toHaveTextContent("Voice mode");
++    // The voice.start hint moved into the Voice mode row.
++    expect(within(toggle).getByTestId("ae-hint-voice.start")).toBeInTheDocument();
++    for (const id of [
++      "ae-voice-mic-while-speaking",
++      "ae-speak-voice-trigger",
++      "ae-voice-chat-voice-trigger",
++      "ae-speak-rate-trigger",
++      "ae-voice-log-send",
++    ]) {
++      const row = screen.getByTestId(id);
++      expect(row, id).toBeInTheDocument();
++      expect(row.querySelector("[data-slot=tooltip-trigger]"), id).not.toBeNull();
++    }
++    for (const id of [
++      "ae-speak-fast",
++      "ae-voice-model-trigger",
++      "ae-speak-read-last",
++      "ae-voice-log",
++      "ae-speak-toggle",
++    ]) {
++      expect(screen.queryByTestId(id), id).toBeNull();
++    }
++  });
++
++  it("lists the microphone and speaker rows when the browser can choose them", async () => {
++    Object.defineProperty(navigator, "mediaDevices", {
++      configurable: true,
++      value: {
++        enumerateDevices: () => Promise.resolve([]),
++        addEventListener: () => {},
++        removeEventListener: () => {},
++        getUserMedia: () => Promise.resolve({ getTracks: () => [] }),
++      },
++    });
++    Object.defineProperty(HTMLMediaElement.prototype, "setSinkId", {
++      configurable: true,
++      writable: true,
++      value: () => Promise.resolve(),
++    });
++    try {
++      render(<AeVoiceStartButton armed={false} onToggle={() => {}} />);
++      await openMenu();
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toBeInTheDocument();
++      expect(screen.getByTestId("ae-speak-speaker-trigger")).toBeInTheDocument();
++    } finally {
++      Reflect.deleteProperty(navigator, "mediaDevices");
++      Reflect.deleteProperty(HTMLMediaElement.prototype, "setSinkId");
++    }
++  });
++
++  it("the Voice mode row toggles and reflects the armed state", async () => {
++    const onToggle = vi.fn();
++    const { rerender } = render(<AeVoiceStartButton armed={false} onToggle={onToggle} />);
++    const user = await openMenu();
++    expect(screen.getByTestId("ae-voice-start-toggle")).toHaveAttribute("aria-checked", "false");
++    await user.click(screen.getByTestId("ae-voice-start-toggle"));
++    expect(onToggle).toHaveBeenCalledTimes(1);
++    rerender(<AeVoiceStartButton armed onToggle={onToggle} />);
++    expect(screen.getByTestId("ae-voice-start-toggle")).toHaveAttribute("aria-checked", "true");
++  });
++
++  it("Send voice log uploads without a chat id and says so", async () => {
++    const toastSpy = vi.spyOn(toast, "success").mockImplementation(() => "");
++    render(<AeVoiceStartButton armed={false} onToggle={() => {}} />);
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-voice-log-send"));
++    await waitFor(() => expect(toastSpy).toHaveBeenCalledWith("Voice log sent"));
++    const post = vi
++      .mocked(fetch)
++      .mock.calls.find(([url]) => String(url).includes("/v1/ae/voice-log"));
++    const body = JSON.parse(String(((post as unknown[])[1] as RequestInit).body));
++    expect(body.reason).toBe("manual");
++    expect(body.chat_id).toBeUndefined();
++    toastSpy.mockRestore();
+   });
+ });
+diff --git a/web/src/components/AeVoiceStartButton.tsx b/web/src/components/AeVoiceStartButton.tsx
+index 2a5ac66e198289fb7edf4fc06191260d840966bf..c24535ee40e42e4a0c07af88ed135616a80162fd 100644
+--- a/web/src/components/AeVoiceStartButton.tsx
++++ b/web/src/components/AeVoiceStartButton.tsx
+@@ -1,9 +1,22 @@
+ // The Voice button on the new-chat page (omnigent-ae, 2026-11-10): tap to talk, and the
+-// first sentence starts a chat that opens with Voice mode on.
++// first sentence starts a chat that opens with Voice mode on. The chevron beside it
++// (2026-11-16) opens the per-device voice choices that need no chat, and Send voice log.
+ 
+-import { Volume2Icon } from "lucide-react";
+-import { AeHint } from "@/components/AeHint";
++import { ChevronDownIcon, Volume2Icon } from "lucide-react";
++import {
++  MicWhileSpeakingRow,
++  SendVoiceLogRow,
++  SwitchRow,
++  useVoiceChoices,
++  VoiceChoiceRows,
++} from "@/components/AeVoiceMenuRows";
+ import { Button } from "@/components/ui/button";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuSeparator,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
+ import { isSpeechSupported } from "@/lib/aeSpeakReplies";
+ import { aeHint } from "@/lib/aeSettingHints";
+ import { cn } from "@/lib/utils";
+@@ -15,6 +28,27 @@ export interface AeVoiceStartButtonProps {
+   className?: string;
+ }
+ 
++/** Mounted only while the menu is open, so the voice lists load on demand. */
++function VoiceStartMenuRows({ armed, onToggle }: { armed: boolean; onToggle: () => void }) {
++  const choices = useVoiceChoices();
++  return (
++    <>
++      <SwitchRow
++        label="Voice mode"
++        checked={armed}
++        onChange={onToggle}
++        hint="voice.start"
++        testId="ae-voice-start-toggle"
++      />
++      <DropdownMenuSeparator />
++      <MicWhileSpeakingRow />
++      <VoiceChoiceRows choices={choices} />
++      <DropdownMenuSeparator />
++      <SendVoiceLogRow />
++    </>
++  );
++}
++
+ export function AeVoiceStartButton({
+   armed,
+   onToggle,
+@@ -23,7 +57,7 @@ export function AeVoiceStartButton({
+ }: AeVoiceStartButtonProps) {
+   if (!isSpeechSupported()) return null;
+   return (
+-    <>
++    <DropdownMenu>
+       <Button
+         type="button"
+         size="icon"
+@@ -38,7 +72,22 @@ export function AeVoiceStartButton({
+       >
+         <Volume2Icon />
+       </Button>
+-      <AeHint id="voice.start" />
+-    </>
++      <DropdownMenuTrigger asChild>
++        <Button
++          type="button"
++          size="icon"
++          variant="ghost"
++          className="-ml-1 h-7 w-4 text-muted-foreground pointer-coarse:ml-0 pointer-coarse:h-11 pointer-coarse:w-9"
++          aria-label="Voice mode menu"
++          data-testid="ae-voice-start-menu"
++          disabled={disabled}
++        >
++          <ChevronDownIcon className="size-4" />
++        </Button>
++      </DropdownMenuTrigger>
++      <DropdownMenuContent align="end" className="max-h-[70vh] w-61 overflow-y-auto">
++        <VoiceStartMenuRows armed={armed} onToggle={onToggle} />
++      </DropdownMenuContent>
++    </DropdownMenu>
+   );
+ }
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 1e73f206b7d80184160783c5ab2e2a69c27238d5..8afbc2477680bc0c9620eff9dd2177de55cc1954 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -1050,3 +1050,74 @@ describe("useAeVoiceMode", () => {
+     expect(getVoiceSnapshot("c1").phase).not.toBe("unavailable");
+   });
+ });
++
++describe("voice log upload", () => {
++  /** The reasons posted to the voice log route so far, in order. */
++  function reasons(): string[] {
++    return vi
++      .mocked(fetch)
++      .mock.calls.filter(([url]) => String(url).includes("/v1/ae/voice-log"))
++      .map(([, init]) => JSON.parse(String((init as RequestInit).body)).reason);
++  }
++
++  it("sends the log with the chat id when the mic fails to start twice", () => {
++    autoConnect = false;
++    const { result } = mount();
++    act(() => void result.current.onListening(false));
++    act(() => void vi.advanceTimersByTime(1000));
++    expect(reasons()).toEqual([]);
++    act(() => void result.current.onListening(false));
++    expect(reasons()).toEqual(["mic_failed"]);
++    const [, init] = vi
++      .mocked(fetch)
++      .mock.calls.find(([url]) => String(url).includes("/v1/ae/voice-log")) as [
++      unknown,
++      RequestInit,
++    ];
++    expect(JSON.parse(String(init.body)).chat_id).toBe("c1");
++  });
++
++  it("sends the log when the mic goes deaf twice", () => {
++    const { result } = mount();
++    act(() => void result.current.onListening(true));
++    for (let i = 0; i < 2; i += 1) {
++      act(() => {
++        listening = false;
++        result.current.onListening(false, "deaf");
++      });
++      act(() => void vi.advanceTimersByTime(1000));
++      act(() => void result.current.onListening(true));
++    }
++    expect(reasons()).toEqual(["mic_deaf"]);
++  });
++
++  it("sends the log when a start never answers", () => {
++    autoConnect = false;
++    mount();
++    act(() => void vi.advanceTimersByTime(MIC_START_NET_MS));
++    expect(reasons()).toContain("mic_stalled");
++  });
++
++  it("sends the log when the mic is stopped from outside", () => {
++    const { result } = mount();
++    act(() => void result.current.onListening(true));
++    act(() => {
++      listening = false;
++      result.current.onListening(false);
++    });
++    expect(reasons()).toEqual(["mic_paused"]);
++  });
++
++  it("sends the log when Voice mode ends, and not before", () => {
++    mount();
++    expect(reasons()).toEqual([]);
++    act(() => setVoiceOn("c1", false));
++    expect(reasons()).toEqual(["voice_end"]);
++  });
++
++  it("sends nothing when Voice mode was never on", () => {
++    setVoiceOn("c1", false);
++    mount();
++    expect(reasons()).toEqual([]);
++  });
++});
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 598efa4875e1f8d8e777d1e019343cf27969c3c4..72a78849eea54e3b4edb74e9dcf4a4682a62462d 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -27,7 +27,7 @@ import {
+   type VoicePhase,
+ } from "@/lib/aeVoiceMode";
+ import { activeEchoWords, resetEcho, splitEcho } from "@/lib/aeVoiceEcho";
+-import { logVoice } from "@/lib/aeVoiceLog";
++import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
+ import { useMicWhileSpeaking } from "@/lib/aeVoiceMic";
+ import { useChatStore } from "@/store/chatStore";
+ 
+@@ -194,6 +194,9 @@ export function useAeVoiceMode({
+   };
+   const readyRef = useRef(ready);
+   readyRef.current = ready;
++  // The voice log goes to the server with the chat it belongs to (see uploadVoiceLog).
++  const chatIdRef = useRef(chatId);
++  chatIdRef.current = chatId;
+ 
+   const clearGrace = useCallback(() => {
+     if (graceTimer.current !== null) clearTimeout(graceTimer.current);
+@@ -275,6 +278,8 @@ export function useAeVoiceMode({
+     netTimer.current = setTimeout(() => {
+       netTimer.current = null;
+       if (!startPending.current) return;
++      logVoice("mic stalled", "no answer to start");
++      void uploadVoiceLog("mic_stalled", chatIdRef.current);
+       controller.current?.stop();
+       onListeningRef.current(false);
+     }, MIC_START_NET_MS);
+@@ -287,6 +292,10 @@ export function useAeVoiceMode({
+     if (!on) {
+       clearGrace();
+       // Turning the switch off hands the mic back, quiet.
++      if (wasOn.current) {
++        logVoice("voice end");
++        void uploadVoiceLog("voice_end", chatIdRef.current);
++      }
+       if (wasOn.current && mic) {
+         stopAsked.current = mic.isListening() || startPending.current;
+         startPending.current = false;
+@@ -354,6 +363,7 @@ export function useAeVoiceMode({
+           }, MIC_RETRY_MS);
+         } else {
+           logVoice("mic failed");
++          void uploadVoiceLog("mic_deaf", chatIdRef.current);
+           setMicDetail(MIC_DEAF_DETAIL);
+           setMicFailed(true);
+         }
+@@ -371,6 +381,7 @@ export function useAeVoiceMode({
+           }, MIC_RETRY_MS);
+         } else {
+           logVoice("mic failed");
++          void uploadVoiceLog("mic_failed", chatIdRef.current);
+           setMicFailed(true);
+         }
+       } else if (stopAsked.current) {
+@@ -381,6 +392,8 @@ export function useAeVoiceMode({
+         return;
+       } else if (latest.current.wantListen) {
+         // Stopped from outside (the mic button, the hotkey): leave it stopped.
++        logVoice("mic paused", "stopped from outside");
++        void uploadVoiceLog("mic_paused", chatIdRef.current);
+         setMicStopped(true);
+       }
+       stopAsked.current = false;
+diff --git a/web/src/hooks/useAeVoiceStart.test.ts b/web/src/hooks/useAeVoiceStart.test.ts
+index b11afe35ecb5e6b6b999a9ac127e9dd7794d4009..bc2f95553371bceba07d0df23d20ecbee3bc2202 100644
+--- a/web/src/hooks/useAeVoiceStart.test.ts
++++ b/web/src/hooks/useAeVoiceStart.test.ts
+@@ -1,5 +1,6 @@
+ import { act, renderHook } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { resetVoiceLog } from "@/lib/aeVoiceLog";
+ import { disarmVoiceForNextChat, GRACE_MS, takeVoiceArm } from "@/lib/aeVoiceMode";
+ import { installFakeSpeech, removeFakeSpeech } from "@/test/fakeSpeech";
+ import {
+@@ -25,10 +26,16 @@ function setup(over: { value?: string; canSubmit?: boolean } = {}) {
+ 
+ beforeEach(() => {
+   vi.useFakeTimers();
++  resetVoiceLog();
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(() => Promise.resolve(new Response("{}", { status: 200 }))),
++  );
+   installFakeSpeech();
+ });
+ afterEach(() => {
+   vi.useRealTimers();
++  vi.unstubAllGlobals();
+   removeFakeSpeech();
+   disarmVoiceForNextChat();
+ });
+@@ -206,3 +213,63 @@ describe("useAeVoiceStart deaf takes and held messages", () => {
+     expect(result.current.armed).toBe(false);
+   });
+ });
++
++describe("useAeVoiceStart voice log upload", () => {
++  /** The reasons posted to the voice log route so far, in order. */
++  function reasons(): { reason: string; chat_id?: string }[] {
++    return vi
++      .mocked(fetch)
++      .mock.calls.filter(([url]) => String(url).includes("/v1/ae/voice-log"))
++      .map(([, init]) => JSON.parse(String((init as RequestInit).body)));
++  }
++
++  it("sends the log when the mic never started, with no chat id", () => {
++    const { result } = setup();
++    act(() => result.current.toggle());
++    act(() => result.current.onListening(false));
++    expect(reasons()).toHaveLength(1);
++    expect(reasons()[0].reason).toBe("mic_failed");
++    expect(reasons()[0].chat_id).toBeUndefined();
++  });
++
++  it("sends the log when a mic that listened stops on its own", () => {
++    const { result } = setup();
++    act(() => result.current.toggle());
++    act(() => result.current.onListening(true));
++    act(() => result.current.onListening(false));
++    expect(reasons().map((r) => r.reason)).toEqual(["mic_paused"]);
++  });
++
++  it("sends the log when the mic goes deaf twice", () => {
++    const { result } = setup();
++    act(() => result.current.toggle());
++    act(() => result.current.onListening(true));
++    act(() => result.current.onListening(false, "deaf"));
++    expect(reasons()).toEqual([]);
++    act(() => void vi.advanceTimersByTime(DEAF_RETRY_MS));
++    act(() => result.current.onListening(false, "deaf"));
++    expect(reasons().map((r) => r.reason)).toEqual(["mic_deaf"]);
++  });
++
++  it("sends the log when the held message gives up waiting for the chat", () => {
++    const { result } = setup({ canSubmit: false });
++    act(() => result.current.toggle());
++    act(() => result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS + READY_WAIT_MS + READY_POLL_MS));
++    expect(reasons().map((r) => r.reason)).toEqual(["mic_stalled"]);
++  });
++
++  it("sends the log when the user ends it, but not when a message goes out", () => {
++    const sent = setup();
++    act(() => sent.result.current.toggle());
++    act(() => sent.result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS + 10));
++    expect(sent.submit).toHaveBeenCalledTimes(1);
++    expect(reasons()).toEqual([]);
++
++    const ended = setup();
++    act(() => ended.result.current.toggle());
++    act(() => ended.result.current.toggle());
++    expect(reasons().map((r) => r.reason)).toEqual(["voice_end"]);
++  });
++});
+diff --git a/web/src/hooks/useAeVoiceStart.ts b/web/src/hooks/useAeVoiceStart.ts
+index 8d9866fc74a0b3f7669434ba7d5138a7e419999f..e086a5ae724b471587945ec655ff2e729d25edbf 100644
+--- a/web/src/hooks/useAeVoiceStart.ts
++++ b/web/src/hooks/useAeVoiceStart.ts
+@@ -4,7 +4,7 @@
+ 
+ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
+ import { primeVoicePlayback } from "@/lib/aeSpeakReplies";
+-import { logVoice } from "@/lib/aeVoiceLog";
++import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
+ import {
+   type AeMicController,
+   armVoiceForNextChat,
+@@ -86,6 +86,9 @@ export function useAeVoiceStart({
+   }, [clearTimer, clearRetry, controller]);
+ 
+   const disarm = useCallback(() => {
++    // The user ended it (End or a second tap): send the log, no chat exists yet.
++    logVoice("voice end", "new chat");
++    void uploadVoiceLog("voice_end");
+     disarmVoiceForNextChat();
+     release();
+   }, [release]);
+@@ -113,11 +116,20 @@ export function useAeVoiceStart({
+           }, DEAF_RETRY_MS);
+         } else {
+           logVoice("start mic failed");
++          void uploadVoiceLog("mic_deaf");
+           setMicDetail(START_MIC_DEAF_DETAIL);
+           setPhase((p) => (held(p) ? p : "unavailable"));
+         }
+         return;
+       }
++      // The mic stopped without being asked: before it ever listened it never started.
++      if (everListened.current) {
++        logVoice("start mic paused");
++        void uploadVoiceLog("mic_paused");
++      } else {
++        logVoice("start mic unavailable");
++        void uploadVoiceLog("mic_failed");
++      }
+       setPhase((p) => (held(p) ? p : everListened.current ? "paused" : "unavailable"));
+     },
+     [armed, clearRetry, controller],
+@@ -186,6 +198,7 @@ export function useAeVoiceStart({
+           // moment the chat is ready, without a new utterance.
+           if (waited === READY_WAIT_MS) {
+             logVoice("start gave up", "chat not ready");
++            void uploadVoiceLog("mic_stalled");
+             setPhase("stalled");
+           }
+           timer.current = setTimeout(() => tryNow(waited + STALLED_POLL_MS), STALLED_POLL_MS);
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 5649570551d062df6f2c7a89137b054442a443a5..7d790d29b4f8b04fe5bd01e001def53701020d6a 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -297,7 +297,12 @@ export const AE_SETTING_HINTS = {
+   },
+   "voice.log": {
+     label: "Add voice log to message",
+-    hint: "Puts the last two minutes of voice events into the message box to send to the agent. Nothing leaves this device until you send.",
++    hint: "Puts the last two minutes of voice events into the message box to send to the agent. Nothing goes to the chat until you send.",
++    source: "tooltip",
++  },
++  "voice.log_send": {
++    label: "Send voice log",
++    hint: "Sends the last two minutes of voice events to the server so a mic problem can be read later. Also sent when Voice mode hits trouble or ends.",
+     source: "tooltip",
+   },
+ } as const satisfies Record<string, AeSettingHint>;
+diff --git a/web/src/lib/aeVoiceLog.test.ts b/web/src/lib/aeVoiceLog.test.ts
+index 212ffebb41eab96e06e9511e982679aa74b935e2..7e8ab71a35279afaed6de88407a2a83899e7962e 100644
+--- a/web/src/lib/aeVoiceLog.test.ts
++++ b/web/src/lib/aeVoiceLog.test.ts
+@@ -7,6 +7,8 @@ import {
+   logVoice,
+   requestVoiceLogInsert,
+   resetVoiceLog,
++  UPLOAD_MIN_GAP_MS,
++  uploadVoiceLog,
+   useVoiceLogInsert,
+ } from "./aeVoiceLog";
+ 
+@@ -69,3 +71,79 @@ describe("voice log", () => {
+     expect(setValue).toHaveBeenLastCalledWith(expect.stringMatching(/^Voice log [\s\S]*\n\n {2}\/review the diff$/));
+   });
+ });
++
++describe("uploadVoiceLog", () => {
++  const fetchMock = vi.fn();
++  beforeEach(() => {
++    fetchMock.mockReset();
++    fetchMock.mockImplementation(() => Promise.resolve(new Response("{}", { status: 200 })));
++    vi.stubGlobal("fetch", fetchMock);
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  function lastBody() {
++    const [url, init] = fetchMock.mock.calls.at(-1) as [string, RequestInit];
++    return { url, init, body: JSON.parse(String(init.body)) };
++  }
++
++  it("posts the buffer with the reason and chat id, keepalive, as JSON", async () => {
++    logVoice("mic start", "browser");
++    logVoice("final", "hello");
++    await expect(uploadVoiceLog("manual", "c1")).resolves.toBe("sent");
++    const { url, init, body } = lastBody();
++    expect(url).toContain("/v1/ae/voice-log");
++    expect(init.method).toBe("POST");
++    expect(init.keepalive).toBe(true);
++    expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
++    expect(body.reason).toBe("manual");
++    expect(body.chat_id).toBe("c1");
++    expect(body.lines[0].event).toBe("client");
++    expect(body.lines.map((l: { event: string }) => l.event)).toEqual([
++      "client",
++      "mic start",
++      "final",
++    ]);
++    expect(body.lines[2]).toEqual({ t: expect.any(Number), event: "final", detail: "hello" });
++  });
++
++  it("leaves chat_id out when there is none", async () => {
++    await uploadVoiceLog("voice_end");
++    expect("chat_id" in lastBody().body).toBe(false);
++  });
++
++  it("sends the same reason at most once per 20 s, and other reasons freely", async () => {
++    await expect(uploadVoiceLog("mic_failed")).resolves.toBe("sent");
++    await expect(uploadVoiceLog("mic_failed")).resolves.toBe("throttled");
++    await expect(uploadVoiceLog("mic_deaf")).resolves.toBe("sent");
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    vi.advanceTimersByTime(UPLOAD_MIN_GAP_MS - 1);
++    await expect(uploadVoiceLog("mic_failed")).resolves.toBe("throttled");
++    vi.advanceTimersByTime(1);
++    await expect(uploadVoiceLog("mic_failed")).resolves.toBe("sent");
++    expect(fetchMock).toHaveBeenCalledTimes(3);
++  });
++
++  it("never throws: a rejected fetch and a refused answer both come back failed", async () => {
++    fetchMock.mockImplementationOnce(() => Promise.reject(new Error("offline")));
++    await expect(uploadVoiceLog("mic_failed")).resolves.toBe("failed");
++    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response("{}", { status: 429 })));
++    await expect(uploadVoiceLog("mic_deaf")).resolves.toBe("failed");
++    fetchMock.mockImplementationOnce(() => {
++      throw new Error("sync throw");
++    });
++    await expect(uploadVoiceLog("mic_paused")).resolves.toBe("failed");
++  });
++
++  it("keeps the request under 60 KB by dropping the oldest events, and the line cap", async () => {
++    for (let i = 0; i < 400; i += 1) logVoice("e".repeat(90), "d".repeat(200));
++    await uploadVoiceLog("manual");
++    const { init, body } = lastBody();
++    expect(String(init.body).length).toBeLessThanOrEqual(60_000);
++    expect(body.lines.length).toBeLessThanOrEqual(500);
++    expect(body.lines[0].event).toBe("client");
++    for (const line of body.lines) {
++      expect(line.event.length).toBeLessThanOrEqual(64);
++      expect((line.detail ?? "").length).toBeLessThanOrEqual(300);
++    }
++  });
++});
+diff --git a/web/src/lib/aeVoiceLog.ts b/web/src/lib/aeVoiceLog.ts
+index 4e5841c44374014ccaddebcce8d057586c30e29e..2c92a98beed413c57fd382a655b0385e3bbdd8d0 100644
+--- a/web/src/lib/aeVoiceLog.ts
++++ b/web/src/lib/aeVoiceLog.ts
+@@ -1,8 +1,11 @@
+ // A small in-memory log of voice events (mic, sentences, replies, browser errors) so a
+ // phone's voice session can be diagnosed: the menu row "Add voice log to message" puts the
+-// last two minutes into the message box. Nothing leaves the device until the user sends.
++// last two minutes into the message box. The log goes to the server only when Voice mode
++// hits trouble or ends, or when the user taps "Send voice log" (uploadVoiceLog, below).
+ 
+ import { useEffect, useRef } from "react";
++import { authenticatedFetch } from "./identity";
++import { withBasePath } from "./basePath";
+ 
+ interface VoiceLogEntry {
+   t: number;
+@@ -28,6 +31,63 @@ export function logVoice(event: string, detail?: string): void {
+ 
+ export function resetVoiceLog(): void {
+   entries = [];
++  lastUpload.clear();
++}
++
++/** Why a log is sent; the server accepts exactly these. */
++export type VoiceLogReason =
++  "mic_failed" | "mic_deaf" | "mic_stalled" | "mic_paused" | "voice_end" | "manual";
++
++/** The same reason is sent at most this often. */
++export const UPLOAD_MIN_GAP_MS = 20_000;
++/** The server refuses a body over 64 KB (and so does a keepalive fetch); stay under it. */
++const UPLOAD_MAX_BYTES = 60_000;
++const UPLOAD_MAX_EVENT = 64;
++
++const lastUpload = new Map<VoiceLogReason, number>();
++
++/**
++ * Sends the current log to the server, best effort: never throws, and a failed or refused
++ * send is only a "failed" answer. The same reason goes at most once per UPLOAD_MIN_GAP_MS
++ * ("throttled" means the last one just went). keepalive lets it finish while the page closes.
++ */
++export async function uploadVoiceLog(
++  reason: VoiceLogReason,
++  chatId?: string | null,
++): Promise<"sent" | "throttled" | "failed"> {
++  try {
++    if (typeof window === "undefined") return "failed";
++    const now = Date.now();
++    const last = lastUpload.get(reason);
++    if (last !== undefined && now - last < UPLOAD_MIN_GAP_MS) return "throttled";
++    lastUpload.set(reason, now);
++    const ua = typeof navigator === "undefined" ? "" : navigator.userAgent;
++    const head = { t: now, event: "client", detail: ua.slice(0, 200) };
++    let lines = [
++      head,
++      ...entries.map((e) => ({
++        t: e.t,
++        event: e.event.slice(0, UPLOAD_MAX_EVENT),
++        ...(e.detail ? { detail: e.detail.slice(0, MAX_DETAIL) } : {}),
++      })),
++    ];
++    const build = () => JSON.stringify({ reason, ...(chatId ? { chat_id: chatId } : {}), lines });
++    let body = build();
++    // Oldest events go first when the buffer is too big for one request.
++    while (body.length > UPLOAD_MAX_BYTES && lines.length > 1) {
++      lines = [head, ...lines.slice(Math.ceil((lines.length - 1) / 4) + 1)];
++      body = build();
++    }
++    const response = await authenticatedFetch(withBasePath("/v1/ae/voice-log"), {
++      method: "POST",
++      headers: { "Content-Type": "application/json" },
++      body,
++      keepalive: true,
++    });
++    return response.ok ? "sent" : "failed";
++  } catch {
++    return "failed";
++  }
+ }
+ 
+ export function formatVoiceLog(windowMs = 120_000): string {

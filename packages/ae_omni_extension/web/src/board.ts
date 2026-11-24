@@ -55,6 +55,12 @@
 // The width comes from a ResizeObserver on the page (the window's resize where
 // there is none); moving a card keeps the focus on the control that had it.
 //
+// 2026-11-14 (concept D2, Reid's pick): the packed board and the drag are gone. adminShell.ts puts each
+// area's cards in a plain grid on that area's tab (or on the Overview when the server has four cards or
+// fewer), the cards no longer move, and the width only tells a phone (one column) from the rest. The
+// arrangement code (boardLayout.ts, boardDrag.ts) and the status pills left with it; ring, adminCard,
+// mountBoard and the helpers other files import stay. A card still folds to its header line on a phone.
+//
 // On a phone each card folds to its header line (tap to open), with the
 // card's tile values on that line so a folded card still says how it is.
 // Open or folded is remembered per card through sections.ts (ids "admin-*").
@@ -62,11 +68,9 @@
 // they need attention (a tile amber or red: the host not connected, a secret
 // missing). On a wider page every card is open and the header is not a toggle.
 
-import { type Layout, onLayoutChange, packedArrangement } from "./boardLayout";
-import { enableDrag } from "./boardDrag";
 import { type Child, el } from "./dom";
 import { cardGone, cardHidden, CARD_TILES, getCards, onCardState } from "./cardState";
-import { foldIcon, gripIcon, settingsIcon } from "./icons";
+import { foldIcon, settingsIcon } from "./icons";
 import { isOpen, setOpen } from "./sections";
 import { DOMAINS, type DomainId, getTile, type Health, onTiles, worst } from "./tiles";
 
@@ -78,16 +82,6 @@ export type CardSet = Partial<Record<CardId, HTMLElement>>;
 export const FOUR_COLUMNS_PX = 1720;
 export const THREE_COLUMNS_PX = 1040;
 export const TWO_COLUMNS_PX = 520;
-
-/** The cards in each group on a phone (one column); wider pages pack the board instead. */
-export const GROUP_LAYOUTS: Record<1, Record<DomainId, Layout>> = {
-  1: {
-    ship: [["deploys", "git", "social"]],
-    box: [["box", "home-security"]],
-    cloud: [["compute", "credit", "azure", "vault", "decision"]],
-    money: [["accounts", "presets"]],
-  },
-};
 
 /** The group a card is in (tiles.ts DOMAINS.cards). */
 export function groupOf(id: CardId): DomainId {
@@ -102,6 +96,12 @@ export function cardNotSetUp(id: CardId): boolean {
 }
 
 export { CARD_TILES };
+
+/**
+ * The event a card's title raises (bubbles) while the card sits on the Overview wall (2026-11-17):
+ * the shell shows the card's own tab and goes to the card. detail is the card id.
+ */
+export const WALL_OPEN_EVENT = "admin-wall-open";
 
 /** The event a card's gear raises (bubbles); fabric.ts opens the Cards panel at that card. */
 export const CARD_SETTINGS_EVENT = "admin-card-settings";
@@ -202,14 +202,6 @@ export function adminCard(
     el("span", { class: "admin-card-sum" }),
     foldIcon(),
   );
-  // Drag handle, shown on two and three columns only (style.css).
-  const grip = el("button", {
-    type: "button",
-    class: "admin-grip",
-    title: `Drag to move ${title}`,
-    "aria-label": `Move ${title}. Drag, or use the arrow keys.`,
-  });
-  grip.appendChild(gripIcon());
   // The gear opens the Cards panel at this card (2026-11-07); the board needs no context, so it
   // only raises an event that fabric.ts listens for.
   const gear = el("button", {
@@ -236,11 +228,14 @@ export function adminCard(
       el("h3", { class: "admin-card-h", id: `admin-${id}-h` }, toggle),
       ...extra,
       gear,
-      grip,
     ),
     el("div", { class: "admin-card-body", id: `admin-${id}-body` }, ...body),
   );
   toggle.addEventListener("click", () => {
+    if (node.dataset.wall === "1") {
+      toggle.dispatchEvent(new CustomEvent(WALL_OPEN_EVENT, { bubbles: true, detail: id }));
+      return;
+    }
     const board = node.closest<HTMLElement>(".admin-board");
     if (board?.dataset.columns !== "1") return;
     setOpen(storageId(id), node.classList.contains("is-folded"));
@@ -257,7 +252,8 @@ export function adminCard(
  */
 export function pairShelf(board: HTMLElement): void {
   const one = board.dataset.columns === "1";
-  for (const col of board.querySelectorAll<HTMLElement>(".admin-col")) {
+  const columns = board.querySelectorAll<HTMLElement>(".admin-col");
+  for (const col of columns.length ? [...columns] : [board]) {
     const run: HTMLElement[] = [];
     const flush = () => {
       for (let i = 0; i + 1 < run.length; i += 2) {
@@ -275,15 +271,37 @@ export function pairShelf(board: HTMLElement): void {
   }
 }
 
+/**
+ * Put a card on, or take it off, the Overview wall (wall.ts): its title becomes the control that opens
+ * the card on its tab. Decided here because applyFold runs on every tile change and must not undo it.
+ */
+export function setCardWall(card: HTMLElement, on: boolean): void {
+  if (on) card.dataset.wall = "1";
+  else delete card.dataset.wall;
+  applyFold(card, false);
+}
+
 /** Fold or open one card for the current layout. */
 function applyFold(card: HTMLElement, phone: boolean): void {
   const id = card.dataset.card as CardId;
-  const open = !phone || isOpen(storageId(id), openByDefault(id));
+  // On the Overview wall (wall.ts) the card is always open and its title opens the card on its own tab.
+  const wall = card.dataset.wall === "1";
+  const open = wall || !phone || isOpen(storageId(id), openByDefault(id));
   card.classList.toggle("is-folded", !open);
   const toggle = card.querySelector<HTMLButtonElement>(".admin-card-toggle");
   const content = card.querySelector<HTMLElement>(".admin-card-body");
   if (content) content.hidden = !open;
-  if (toggle) {
+  if (toggle && wall) {
+    const words = `Open the ${titleText(card)} card on the ${domainLabel(groupOf(id))} tab`;
+    toggle.removeAttribute("aria-expanded");
+    toggle.removeAttribute("aria-controls");
+    toggle.removeAttribute("tabindex");
+    toggle.title = words;
+    toggle.setAttribute("aria-label", words);
+  } else if (toggle) {
+    toggle.removeAttribute("title");
+    toggle.removeAttribute("aria-label");
+    toggle.setAttribute("aria-controls", `admin-${id}-body`);
     if (phone) {
       toggle.setAttribute("aria-expanded", String(open));
       toggle.removeAttribute("tabindex");
@@ -311,8 +329,8 @@ function applyFold(card: HTMLElement, phone: boolean): void {
  * through here (mountBoard refolds), only a width change does.
  */
 /** The title a card shows, for the footer line. */
-const titleOf = (cards: CardSet, id: CardId): string =>
-  cards[id]?.querySelector(".admin-card-title")?.textContent ?? id;
+const titleText = (card: HTMLElement | undefined): string => card?.querySelector(".admin-card-title")?.textContent ?? "";
+const titleOf = (cards: CardSet, id: CardId): string => titleText(cards[id]) || id;
 
 function shortDate(iso: string | null): string {
   const when = iso ? new Date(iso) : null;
@@ -362,92 +380,113 @@ export function footerNote(cards: CardSet): HTMLElement {
   return note;
 }
 
+/** An area tab's lane: at least 620 px wide, 14 px apart (style.css, .as-board). */
+const LANE_PX = 620;
+const LANE_GAP_PX = 14;
+
+/**
+ * How many lanes an area tab's board (.as-board) gets: as many 620 px lanes as its width holds, never more
+ * than it has cards. Any other board, and a phone, keeps one column. A hidden board reads its page's width.
+ */
+function laneCount(board: HTMLElement, n: number, pageWidth: number, cardCount: number): number {
+  if (n === 1 || !board.classList.contains("as-board")) return 1;
+  const width = board.clientWidth || pageWidth;
+  return Math.max(1, Math.min(cardCount, Math.floor((width + LANE_GAP_PX) / (LANE_PX + LANE_GAP_PX))));
+}
+
+/**
+ * 2026-11-22: the cards take turns across the lanes in page order (first card left, second right, third
+ * left again), and each lane stacks its cards with no space between them. So a short card leaves no hole
+ * beside a tall one, the order reads left to right, and a card that grows moves only the cards under it
+ * in its own lane. Why not the shortest lane by height: the cards are still loading when they are placed,
+ * so their heights say nothing yet, and choosing again later would move cards while they are being read.
+ *
+ * The cards stay in one column element in page order, so Tab and a screen reader go left to right too
+ * (Deploys, Git, Social), not down one lane and then the next. style.css sets each card's lane from
+ * --lane and --lanes; placeLanes sets its top from the heights of the cards above it in that lane.
+ */
+const placers = new WeakMap<HTMLElement, ResizeObserver>();
+
+function placeLanes(col: HTMLElement, lanes: number): void {
+  const bottoms = Array.from({ length: lanes }, () => 0);
+  let i = 0;
+  for (const card of col.querySelectorAll<HTMLElement>(":scope > .admin-card")) {
+    const lane = i++ % lanes;
+    card.style.setProperty("--lane", String(lane));
+    card.style.top = `${bottoms[lane]}px`;
+    // The exact height, not offsetHeight: whole pixels would add up to a 1 px overlap down a long lane.
+    bottoms[lane]! += card.getBoundingClientRect().height + LANE_GAP_PX;
+  }
+  col.style.height = `${Math.max(0, Math.max(...bottoms) - LANE_GAP_PX)}px`;
+}
+
+function intoLanes(board: HTMLElement, cards: HTMLElement[], lanes: number): HTMLElement {
+  placers.get(board)?.disconnect();
+  placers.delete(board);
+  const col = el("div", { class: "admin-col" }, ...cards);
+  for (const card of cards) {
+    card.style.removeProperty("--lane");
+    card.style.removeProperty("top");
+  }
+  if (lanes < 2) return col;
+  col.style.setProperty("--lanes", String(lanes));
+  placeLanes(col, lanes);
+  // A card that loads, grows, folds or is first shown (a hidden tab measures 0 px) places the lanes again.
+  // It runs after layout and before paint, so a card is never drawn over another; moving a card's top
+  // changes no card's size, so it does not loop.
+  if (typeof ResizeObserver !== "undefined") {
+    const observer = new ResizeObserver(() => {
+      if (col.isConnected) placeLanes(col, lanes);
+    });
+    for (const card of cards) observer.observe(card);
+    placers.set(board, observer);
+  }
+  return col;
+}
+
+/** Stop placing *board*'s lanes (its mount stopped). */
+function stopLanes(board: HTMLElement): void {
+  placers.get(board)?.disconnect();
+  placers.delete(board);
+}
+
 export function arrange(
   board: HTMLElement,
   cards: CardSet,
   n: 1 | 2 | 3 | 4,
   force = false,
   attention?: HTMLElement,
+  width = 0,
 ): void {
-  const rebuilt = force || board.dataset.columns !== String(n);
+  const here = (Object.keys(cards) as CardId[]).filter((id) => !cardNotSetUp(id) && !cardGone(id));
+  // The page's group order (tiles.ts DOMAINS), then any card a group does not name.
+  const order = DOMAINS.flatMap((domain) => domain.cards.filter((id): id is CardId => here.includes(id as CardId)));
+  for (const id of here) if (!order.includes(id)) order.push(id);
+  const placed = order.filter((id) => cards[id]!.dataset.wall !== "1");
+  const lanes = laneCount(board, n, width, placed.length);
+  const rebuilt = force || board.dataset.columns !== String(n) || board.dataset.lanes !== String(lanes);
   if (rebuilt) {
     const focused = document.activeElement as HTMLElement | null;
     const inAttention = !!focused && !!attention?.contains(focused);
     const wasInside = !!focused && board.contains(focused) && !inAttention;
-    const here = (Object.keys(cards) as CardId[]).filter(
-      (id) => !cardNotSetUp(id) && !cardGone(id),
-    );
-    const refocus = (note: HTMLElement) => {
-      if (wasInside && focused && !board.contains(focused)) {
-        // The old footer or card is gone: the new footer takes the focus, or the board when it
-        // is hidden (nothing is left unset), so it never falls back to the page body.
-        note.tabIndex = -1;
-        if (!note.hidden) note.focus({ preventScroll: true });
-        else {
-          board.tabIndex = -1;
-          board.focus({ preventScroll: true });
-        }
-      }
-    };
-    if (board.dataset.single !== undefined) {
-      // A box admin's board: n columns, the card in the first, no groups (2026-11-06).
-      const columns = Array.from({ length: n }, (_, at) =>
-        el("div", { class: "admin-col" }, ...(at === 0 ? here.map((id) => cards[id]) : [])),
-      );
-      board.replaceChildren(...columns);
-    } else if (n !== 1) {
-      // Packed (2026-11-07): n column stacks, Needs you first in column 1, then the footer.
-      const order = DOMAINS.flatMap((domain) => domain.cards.filter((id): id is CardId => here.includes(id as CardId)));
-      for (const id of here) if (!order.includes(id)) order.push(id);
-      const columns = packedArrangement(n, order).map((ids, at) =>
-        el(
-          "div",
-          { class: "admin-col" },
-          ...(at === 0 && attention ? [attention] : []),
-          ...ids.map((id) => cards[id]),
-        ),
-      );
-      const note = footerNote(cards);
-      board.replaceChildren(...columns, note);
-      board.dataset.packed = "";
-      refocus(note);
-    } else {
-      // A phone: the group sections as before, and Needs you right before the board.
-      if (attention && attention.nextElementSibling !== board) board.before(attention);
-      const sections: HTMLElement[] = [];
-      for (const domain of DOMAINS) {
-        const known = here.filter((id) => groupOf(id) === domain.id);
-        if (!known.length) continue;
-        const columns = GROUP_LAYOUTS[1][domain.id]
-          .map((ids) => ids.filter((id) => known.includes(id)))
-          .filter((ids) => ids.length > 0)
-          .map((ids) => el("div", { class: "admin-col" }, ...ids.map((id) => cards[id])));
-        const groupNode = el(
-          "section",
-          { class: "admin-group", "data-group": domain.id },
-          el(
-            "h2",
-            { class: "admin-group-h" },
-            domain.icon(),
-            domain.label,
-            el("span", { class: "admin-group-line" }),
-          ),
-          el("div", { class: "admin-group-cols" }, ...columns),
-        );
-        // It spans (and divides into) only its own columns; the board packs the rest around it.
-        groupNode.style.gridColumn = `span ${columns.length}`;
-        (groupNode.querySelector(".admin-group-cols") as HTMLElement).style.setProperty(
-          "--cols",
-          String(columns.length),
-        );
-        sections.push(groupNode);
-      }
-      const note = footerNote(cards);
-      board.replaceChildren(...sections, note);
-      delete board.dataset.packed;
-      refocus(note);
-    }
+    const note = footerNote(cards);
+    // A box admin's one-card board (data-single) has no footer: nothing there can be turned off.
+    const single = board.dataset.single !== undefined;
+    // A card the Overview wall holds stays where it is (2026-11-17): moving it would drop the focus a
+    // control in it holds. The shell's give-back lays this board out again when the cards return.
+    board.replaceChildren(intoLanes(board, placed.map((id) => cards[id]!), lanes), ...(single ? [] : [note]));
     board.dataset.columns = String(n);
+    board.dataset.lanes = String(lanes);
+    if (wasInside && focused && !board.contains(focused) && !single) {
+      // The old footer or card is gone: the new footer takes the focus, or the board when it
+      // is hidden (nothing is left unset), so it never falls back to the page body.
+      note.tabIndex = -1;
+      if (!note.hidden) note.focus({ preventScroll: true });
+      else {
+        board.tabIndex = -1;
+        board.focus({ preventScroll: true });
+      }
+    }
     if (
       focused &&
       focused !== document.activeElement &&
@@ -458,12 +497,11 @@ export function arrange(
   }
   for (const card of Object.values(cards)) applyFold(card, n === 1);
   pairShelf(board);
-  // The Reset layout button shows or hides with the column count (fabric.ts).
   if (rebuilt) board.dispatchEvent(new Event("admin-arranged"));
 }
 
 /**
- * Lay the cards out in *board* by the width of *page*, again whenever it
+ * Lay the cards out in *board* by the width of *page* (a phone folds them), again whenever it
  * changes and whenever a tile changes (a card that turns red unfolds unless
  * the owner folded it themselves). `refold` applies the remembered folds once they are
  * read; `stop` stops listening.
@@ -473,16 +511,20 @@ export function mountBoard(
   board: HTMLElement,
   cards: CardSet,
   attention?: HTMLElement,
-): { stop: () => void; refold: () => void } {
+): { stop: () => void; refold: () => void; layout: (force?: boolean) => void } {
   let width = page.clientWidth || window.innerWidth;
   const notSet = () =>
     (Object.keys(cards) as CardId[]).filter((id) => cardNotSetUp(id) || cardGone(id)).sort().join(",");
   let lastNotSet = notSet();
+  // A listener already queued when stop() ran must not move cards back into a board that is gone.
+  let stopped = false;
   const layout = (force = false) => {
+    if (stopped) return;
     lastNotSet = notSet();
-    arrange(board, cards, columnsFor(width), force, attention);
+    arrange(board, cards, columnsFor(width), force, attention, width);
   };
   const refold = () => {
+    if (stopped) return;
     for (const card of Object.values(cards)) applyFold(card, board.dataset.columns === "1");
     pairShelf(board);
   };
@@ -492,15 +534,13 @@ export function mountBoard(
     if (notSet() !== lastNotSet) layout(true);
     else refold();
   });
-  const stopLayout = onLayoutChange(() => layout(true));
   // A card turned off, switched back on, hidden or shown joins or leaves the board (2026-11-07).
   const stopCards = onCardState(() => layout(true));
-  const stopDrag = enableDrag(board, cards);
   const stopAll = () => {
+    stopped = true;
+    stopLanes(board);
     stopTiles();
-    stopLayout();
     stopCards();
-    stopDrag();
   };
   if (typeof ResizeObserver !== "undefined") {
     const observer = new ResizeObserver((entries) => {
@@ -516,6 +556,7 @@ export function mountBoard(
         stopAll();
       },
       refold,
+      layout,
     };
   }
   const onResize = () => {
@@ -529,5 +570,6 @@ export function mountBoard(
       stopAll();
     },
     refold,
+    layout,
   };
 }

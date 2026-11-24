@@ -73,6 +73,7 @@ def make_post(
     cpu_c: float = 70,
     nvme_c: float = 45,
     load15: float = 5.0,
+    load1: float | None = None,
     used_pct: float = 40,
     mounts: list[Mount] | None = None,
     users: list[UserHealth] | None = None,
@@ -90,7 +91,7 @@ def make_post(
         failed=failed or [],
         sensors=sensors(cpu_c, nvme_c),
         gpu_power_w=100,
-        cpu=Cpu(threads=32, load1=load15, load5=load15, load15=load15),
+        cpu=Cpu(threads=32, load1=load15 if load1 is None else load1, load5=load15, load15=load15),
         memory=Memory(total_b=total, available_b=int(total * (1 - used_pct / 100))),
         mounts=mounts if mounts is not None else [mount()],
         failed_units=units or [],
@@ -102,15 +103,20 @@ def make_post(
 
 def stored(
     post: BoxHealthPost,
-    history_c: list[float] | None = None,
+    history_c: list[float | None] | None = None,
     received_at: datetime | None = None,
+    loads: list[float | None] | None = None,
 ) -> box_health.Stored:
     """A stored reading whose history is *history_c*, five minutes apart, ending at the post."""
     samples = []
+    default_load = post.cpu.load1 if post.cpu else None
     for step, temp in enumerate(reversed(history_c or [])):
+        load = default_load if loads is None else list(reversed(loads))[step]
         samples.append(
             box_health.Sample(
-                t=(post.read_at - timedelta(minutes=5 * step)).timestamp(), cpu_c=temp
+                t=(post.read_at - timedelta(minutes=5 * step)).timestamp(),
+                cpu_c=temp,
+                load1=load,
             )
         )
     samples.reverse()
@@ -123,8 +129,13 @@ def tone_of(view: box_health.BoxHealthView, area: str) -> str:
     return next(a.tone for a in view.areas if a.id == area)
 
 
-def view_of(post: BoxHealthPost, history: list[float] | None = None, now: datetime = NOW):
-    return box_health.view(stored(post, history), now, box_health.config({}))
+def view_of(
+    post: BoxHealthPost,
+    history: list[float | None] | None = None,
+    now: datetime = NOW,
+    loads: list[float | None] | None = None,
+):
+    return box_health.view(stored(post, history, loads=loads), now, box_health.config({}))
 
 
 # ── the colour rules ────────────────────────────────────────────────────────
@@ -152,27 +163,91 @@ def test_a_reading_older_than_fifteen_minutes_is_amber() -> None:
 
 
 def test_one_hot_cpu_reading_stays_green() -> None:
-    view = view_of(make_post(cpu_c=91), [70, 72, 91])
+    view = view_of(make_post(cpu_c=91, load15=98), [70, 72, 91])
     assert tone_of(view, "heat") == "green"
-    assert "not sustained" in next(a.title for a in view.areas if a.id == "heat")
+    assert "hot under load, normal for this chip" in next(
+        a.title for a in view.areas if a.id == "heat"
+    )
 
 
-def test_cpu_is_amber_only_when_every_sample_in_the_window_is_hot() -> None:
-    assert tone_of(view_of(make_post(cpu_c=90), [90, 90, 90, 90]), "heat") == "amber"
+def test_a_hot_reading_at_light_load_not_yet_sustained_says_so() -> None:
+    view = view_of(make_post(cpu_c=95, load15=1), [95, 95])
+    assert tone_of(view, "heat") == "green"
+    title = next(a.title for a in view.areas if a.id == "heat")
+    assert "hot at light load, not yet sustained" in title
+    assert "normal for this chip" not in title
+
+
+def test_a_hot_reading_with_no_load_read_does_not_claim_heavy_load() -> None:
+    post = make_post(cpu_c=95).model_copy(update={"cpu": None})
+    title = next(a.title for a in view_of(post, [95]).areas if a.id == "heat")
+    assert "hot, load not read" in title
+
+
+def test_a_failed_cpu_read_does_not_block_the_light_load_alert() -> None:
+    # One sample with no CPU reading and no load; three valid hot readings at light load remain.
+    view = view_of(make_post(cpu_c=92, load15=5), [92, None, 92, 92], loads=[5, None, 5, 5])
+    assert tone_of(view, "heat") == "amber"
+
+
+def _needs(view: box_health.BoxHealthView, key: str):
+    return [n for n in view.needs if n.key == key]
+
+
+def test_cpu_is_amber_only_when_hot_at_light_load_for_the_whole_window() -> None:
+    amber = view_of(make_post(cpu_c=92, load15=5), [92, 92, 92, 92])
+    assert tone_of(amber, "heat") == "amber"
+    need = _needs(amber, "heat:cpu")[0]
+    assert need.text == "CPU 92C at light load"
+    assert need.detail == (
+        "Every reading in the last 15 minutes was 90C or more while load stayed under half "
+        "the 32 threads; check the fan and vents."
+    )
     assert tone_of(view_of(make_post(cpu_c=90), [90, 89.9, 90, 90]), "heat") == "green"
-    assert tone_of(view_of(make_post(cpu_c=90), [90, 90]), "heat") == "green"
+    # Fewer than three readings never alerts.
+    assert _needs(view_of(make_post(cpu_c=92), [92, 92]), "heat:cpu") == []
+    # One sample at or over half the threads (16) breaks the light-load signature.
+    busy = stored(make_post(cpu_c=92), [92, 92, 92, 92], loads=[1, 16, 1, 1])
+    assert _needs(box_health.view(busy, NOW, box_health.config({})), "heat:cpu") == []
 
 
-def test_cpu_is_red_when_sustained_five_degrees_higher_or_at_98() -> None:
-    assert tone_of(view_of(make_post(cpu_c=95), [95, 95, 96, 95]), "heat") == "red"
-    assert tone_of(view_of(make_post(cpu_c=98), [60]), "heat") == "red"
-    assert tone_of(view_of(make_post(cpu_c=97.9), [60]), "heat") == "green"
+def test_hot_under_heavy_load_is_green_with_a_note_and_no_alert() -> None:
+    view = view_of(make_post(cpu_c=99, load1=98, load15=98), [98, 99, 99, 100])
+    assert tone_of(view, "heat") == "green"
+    assert _needs(view, "heat:cpu") == []
+    heat = next(a for a in view.areas if a.id == "heat")
+    assert heat.title.endswith("; hot under load, normal for this chip")
+
+
+def test_a_none_load_sample_does_not_count_as_light() -> None:
+    post = make_post(cpu_c=92)
+    st = stored(post, [92, 92, 92, 92], loads=[1, None, 1, 1])
+    view = box_health.view(st, NOW, box_health.config({}))
+    assert _needs(view, "heat:cpu") == []
+    assert tone_of(view, "heat") == "green"
+
+
+def test_cpu_is_red_when_every_reading_is_past_100c_at_any_load() -> None:
+    for load in (2.0, 98.0):
+        view = view_of(make_post(cpu_c=101, load1=load, load15=load), [101, 102, 101, 101])
+        assert tone_of(view, "heat") == "red"
+        need = _needs(view, "heat:cpu")[0]
+        assert need.tone == "red"
+        assert "normally holds itself at 100C" in need.detail
+    # Exactly 100C is the chip's own limit, not a fault.
+    assert _needs(view_of(make_post(cpu_c=100, load1=98, load15=98), [100] * 4), "heat:cpu") == []
+    assert _needs(view_of(make_post(cpu_c=101), [101, 101]), "heat:cpu") == []
 
 
 def test_ssd_edges() -> None:
-    assert tone_of(view_of(make_post(nvme_c=59.9)), "heat") == "green"
-    assert tone_of(view_of(make_post(nvme_c=60)), "heat") == "amber"
-    assert tone_of(view_of(make_post(nvme_c=68)), "heat") == "red"
+    assert tone_of(view_of(make_post(nvme_c=57)), "heat") == "green"
+    assert tone_of(view_of(make_post(nvme_c=74)), "heat") == "green"
+    assert _needs(view_of(make_post(nvme_c=74)), "heat:nvme") == []
+    assert tone_of(view_of(make_post(nvme_c=75)), "heat") == "amber"
+    assert tone_of(view_of(make_post(nvme_c=82.9)), "heat") == "amber"
+    red = view_of(make_post(nvme_c=83))
+    assert tone_of(red, "heat") == "red"
+    assert "near 83C" in _needs(red, "heat:nvme")[0].detail
 
 
 @pytest.mark.parametrize(
@@ -180,6 +255,22 @@ def test_ssd_edges() -> None:
 )
 def test_load_edges(load15: float, tone: str) -> None:
     assert tone_of(view_of(make_post(load15=load15)), "cpu") == tone
+
+
+def test_load_stays_off_red_once_the_one_minute_load_has_fallen() -> None:
+    """2026-11-23: a 15-minute load of 85 kept the card red after real load fell to 25."""
+    assert tone_of(view_of(make_post(load1=25, load15=85)), "cpu") == "green"
+    assert tone_of(view_of(make_post(load1=40, load15=85)), "cpu") == "amber"
+    assert tone_of(view_of(make_post(load1=70, load15=85)), "cpu") == "red"
+    # A burst of load1 alone, over a calm 15 minutes, is not an alert either.
+    assert tone_of(view_of(make_post(load1=70, load15=25)), "cpu") == "green"
+    view = view_of(make_post(load1=100, load15=40))
+    assert _needs(view, "cpu:load") == []
+    heavy = view_of(make_post(load1=98, load15=98))
+    assert tone_of(heavy, "cpu") == "red"
+    assert _needs(heavy, "cpu:load") == []
+    cpu_area = next(a for a in view.areas if a.id == "cpu")
+    assert cpu_area.title == "Load 100.0, 40.0, 40.0 on 32 threads"
 
 
 @pytest.mark.parametrize(

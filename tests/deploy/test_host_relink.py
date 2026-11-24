@@ -416,3 +416,34 @@ def test_the_unit_runs_the_watcher_from_the_deploy_clone() -> None:
     assert service["Type"] == "simple" and service["Restart"] == "always"
     assert service["EnvironmentFile"] == "-%h/deploy/omnigent-ae/config/host.env"
     assert unit["Install"]["WantedBy"] == "default.target"
+
+
+def test_with_the_gate_installed_the_cli_and_the_hosts_check_go_through_it(box: Box) -> None:
+    gate = (box.tmp / "bin") / "ae-gate"
+    gate.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "gate %s\\n" "$*" >>"$FAKE_GATE_CALLS"\n'
+        '[ "$1 $2" = "omnigent host-online" ] && echo online\n'
+        '[ "$1 $2 $3" = "omnigent host-relink take" ] && echo "request button"\n'
+        "exit 0\n"
+    )
+    gate.chmod(0o755)
+    ((box.tmp / "bin") / "sudo").write_text(
+        '#!/usr/bin/env bash\n[ "$1" = -n ] && shift\nexec "$@"\n'
+    )
+    ((box.tmp / "bin") / "sudo").chmod(0o755)
+    calls = box.tmp / "gate-calls"
+    env = {k: v for k, v in box.env.items() if k not in ("AE_RELINK_CLI", "AE_RELINK_HOST_ONLINE")}
+    env |= {
+        "AE_GATE": str(gate),
+        "FAKE_GATE_CALLS": str(calls),
+        "AE_RELINK_HOST_NAME": "steve-host",
+    }
+    env["PATH"] = f"{box.tmp / 'bin'}:{env['PATH']}"
+    box.lines(FIRST)
+    subprocess.run(
+        [str(SCRIPT), "watch"], env=env, capture_output=True, text=True, timeout=120, check=False
+    )
+    seen = calls.read_text().splitlines()
+    assert any(c.startswith("gate omnigent host-relink ") for c in seen), seen
+    assert "gate omnigent host-online steve-host" in seen, seen

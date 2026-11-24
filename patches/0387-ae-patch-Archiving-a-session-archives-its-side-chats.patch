@@ -1,0 +1,432 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 17 Nov 2026 21:34:57 -0800
+Subject: [PATCH 387/443] [ae-patch] Archiving a session archives its side
+ chats too, and Undo restores only the ones it archived
+
+Side chats are hidden from the session list, so archiving the parent left them running and still counted as working. The session PATCH route now walks the side chats (nested ones included, depth capped at 8), archives each, defers its runner teardown like the parent's, and marks it with ae.side_chat.archived_with. Undo restores exactly the marked ones, so a side chat archived by hand stays archived. Logic lives in the new ae_side_chat_archive.py; routes_core.py gains the call sites.
+---
+ .../routes/sessions/ae_side_chat_archive.py   | 198 ++++++++++++++++++
+ .../server/routes/sessions/routes_core.py     |   9 +
+ tests/server/routes/test_side_chat_archive.py | 173 +++++++++++++++
+ 3 files changed, 380 insertions(+)
+ create mode 100644 omnigent/server/routes/sessions/ae_side_chat_archive.py
+ create mode 100644 tests/server/routes/test_side_chat_archive.py
+
+diff --git a/omnigent/server/routes/sessions/ae_side_chat_archive.py b/omnigent/server/routes/sessions/ae_side_chat_archive.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d8e31d997516af505079483fd42e45a8149d3bed
+--- /dev/null
++++ b/omnigent/server/routes/sessions/ae_side_chat_archive.py
+@@ -0,0 +1,198 @@
++"""Archive and restore a session's side chats together with the session.
++
++A side chat is a fork created with ``side_chat: true``. The session list hides
++it, so it only shows as a Workspace-rail tab of its parent. Archiving the
++parent used to leave those side chats unarchived and running, invisible yet
++still counted as working. Archiving now walks the side chats (nested ones
++included), archives each and defers its runner teardown the same way the
++parent's is deferred. Each one archived this way carries
++``ae.side_chat.archived_with`` naming the root session, so Undo on the parent
++restores exactly those and never a side chat the user archived by hand.
++
++Every archive path (UI, Undo, auto-archive, a runner closing its session) goes
++through the session PATCH route, so the route is the one place that calls this.
++"""
++
++from __future__ import annotations
++
++import asyncio
++import logging
++from typing import Any
++
++from sqlalchemy import select
++
++from omnigent.db.db_models import SqlConversationLabel, current_workspace_id
++from omnigent.stores.conversation_store import SIDE_CHAT_SOURCE_LABEL_KEY
++
++_logger = logging.getLogger(__name__)
++
++SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY = "ae.side_chat.archived_with"
++
++# Side chats of side chats are legal; the cap keeps a corrupt cycle finite.
++_MAX_DEPTH = 8
++
++
++def side_chat_ids(conversation_store: Any, source_id: str) -> list[str]:
++    """Return the ids of the side chats forked from *source_id*.
++
++    One indexed query on the label table. A store that is not the SQLAlchemy
++    one has no label table to query, so it reports no side chats.
++
++    :param conversation_store: The conversation store.
++    :param source_id: The session whose side chats to find, e.g. ``"conv_abc"``.
++    :returns: Side chat conversation ids, possibly empty.
++    """
++    session_maker = getattr(conversation_store, "_conv_session", None)
++    if session_maker is None:
++        _logger.debug("Side chat lookup skipped: store has no label table")
++        return []
++    with session_maker("select_side_chat_ids") as session:
++        rows = session.execute(
++            select(SqlConversationLabel.conversation_id).where(
++                SqlConversationLabel.workspace_id == current_workspace_id(),
++                SqlConversationLabel.key == SIDE_CHAT_SOURCE_LABEL_KEY,
++                SqlConversationLabel.value == source_id,
++            )
++        ).scalars()
++        return list(rows)
++
++
++def _archive_one(conversation_store: Any, side_id: str, root_id: str) -> bool:
++    """Archive one side chat and mark it; ``False`` when it must be skipped."""
++    conv = conversation_store.get_conversation(side_id)
++    if conv is None or conv.archived:
++        return False
++    conversation_store.update_conversation_with_changes(side_id, archived=True)
++    conversation_store.set_labels(side_id, {SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY: root_id})
++    return True
++
++
++async def cascade_archive(
++    session_id: str,
++    conversation_store: Any,
++    runner_router: Any,
++    host_registry: Any,
++) -> list[str]:
++    """Archive the side chats of *session_id*, nested ones included.
++
++    Breadth first, depth capped, cycle safe. A side chat already archived is
++    skipped together with its subtree: it was handled when it was archived.
++    Each side chat is best effort, so one failure never blocks the others or
++    the archive of the parent. The worktree belongs to the parent, so the
++    deferred stops never delete it.
++
++    :param session_id: The session just archived.
++    :param conversation_store: The conversation store.
++    :param runner_router: Runner router for the deferred stop, or ``None``.
++    :param host_registry: Host registry for the deferred stop, or ``None``.
++    :returns: Ids of the side chats archived by this call.
++    """
++    from omnigent.server.routes import sessions as facade
++    from omnigent.server.routes._sessions.orchestration import _spawn_archive_stop
++
++    archived: list[str] = []
++    seen = {session_id}
++    level = [session_id]
++    for _depth in range(_MAX_DEPTH):
++        next_level: list[str] = []
++        for parent_id in level:
++            try:
++                children = await asyncio.to_thread(side_chat_ids, conversation_store, parent_id)
++            except Exception:  # best effort: the parent's archive already succeeded
++                _logger.warning("Side chat lookup failed for %s", parent_id, exc_info=True)
++                continue
++            for side_id in children:
++                if side_id in seen:
++                    continue
++                seen.add(side_id)
++                try:
++                    changed = await asyncio.to_thread(
++                        _archive_one, conversation_store, side_id, session_id
++                    )
++                    if not changed:
++                        continue
++                    facade._prune_session_read_state(side_id)
++                    _spawn_archive_stop(
++                        side_id,
++                        conversation_store,
++                        runner_router,
++                        host_registry,
++                        delete_worktree=False,
++                    )
++                except Exception:  # best effort per side chat
++                    _logger.warning("Archiving side chat %s failed", side_id, exc_info=True)
++                    continue
++                archived.append(side_id)
++                next_level.append(side_id)
++        if not next_level:
++            break
++        level = next_level
++    return archived
++
++
++def _restore_one(conversation_store: Any, side_id: str, root_id: str) -> bool:
++    """Unarchive one side chat marked with *root_id*; ``False`` when not ours."""
++    conv = conversation_store.get_conversation(side_id)
++    if conv is None or not conv.archived:
++        return False
++    if conv.labels.get(SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY) != root_id:
++        return False
++    conversation_store.update_conversation_with_changes(side_id, archived=False)
++    conversation_store.delete_label(side_id, SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY)
++    return True
++
++
++async def cascade_unarchive(session_id: str, conversation_store: Any) -> list[str]:
++    """Restore the side chats that archiving *session_id* archived.
++
++    Only side chats marked with this session as the archive root are restored;
++    one the user archived by hand stays archived and its subtree is not
++    walked. Best effort per side chat.
++
++    :param session_id: The session just unarchived.
++    :param conversation_store: The conversation store.
++    :returns: Ids of the side chats restored.
++    """
++    from omnigent.server.routes import sessions as facade
++
++    restored: list[str] = []
++    seen = {session_id}
++    level = [session_id]
++    for _depth in range(_MAX_DEPTH):
++        next_level: list[str] = []
++        for parent_id in level:
++            try:
++                children = await asyncio.to_thread(side_chat_ids, conversation_store, parent_id)
++            except Exception:  # best effort: the parent's unarchive already succeeded
++                _logger.warning("Side chat lookup failed for %s", parent_id, exc_info=True)
++                continue
++            for side_id in children:
++                if side_id in seen:
++                    continue
++                seen.add(side_id)
++                try:
++                    changed = await asyncio.to_thread(
++                        _restore_one, conversation_store, side_id, session_id
++                    )
++                    if not changed:
++                        continue
++                    facade._cancel_pending_archive_stop(side_id)
++                except Exception:  # best effort per side chat
++                    _logger.warning("Restoring side chat %s failed", side_id, exc_info=True)
++                    continue
++                restored.append(side_id)
++                next_level.append(side_id)
++        if not next_level:
++            break
++        level = next_level
++    return restored
++
++
++async def clear_archived_with(session_id: str, conversation_store: Any) -> None:
++    """Delete the archive-root marker on *session_id* (no-op when absent)."""
++    try:
++        await asyncio.to_thread(
++            conversation_store.delete_label, session_id, SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY
++        )
++    except Exception:  # best effort: a stale marker is harmless
++        _logger.warning("Clearing archive marker on %s failed", session_id, exc_info=True)
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 476c8cf4f51decf85c515f1848f8264b9326b20f..7514c4a312ebb62f810557910494445c227ae9dc 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -188,6 +188,7 @@ from omnigent.server.routes._sessions.orchestration import (
+     _validate_session_model_selection,
+     ensure_runner_connected,
+ )
++from omnigent.server.routes.sessions import ae_side_chat_archive
+ from omnigent.server.routes.sessions.ae_bypass_switch import (
+     SwitchOutcome,
+     relaunch_unconfirmed,
+@@ -2871,6 +2872,12 @@ def register_core_routes(
+                 getattr(request.app.state, "host_registry", None),
+                 delete_worktree=body.delete_worktree,
+             )
++            await ae_side_chat_archive.cascade_archive(
++                session_id,
++                conversation_store,
++                runner_router,
++                getattr(request.app.state, "host_registry", None),
++            )
+         elif body.archived is False:
+             # Unarchive (including Undo, which re-PATCHes archived=false within
+             # the pill's window): cancel a still-pending archive stop so the
+@@ -2878,6 +2885,8 @@ def register_core_routes(
+             # decided to keep. Same-replica fast path; the deferred stop's
+             # archived-flag re-check covers a cross-replica Undo.
+             _cancel_pending_archive_stop(session_id)
++            await ae_side_chat_archive.cascade_unarchive(session_id, conversation_store)
++            await ae_side_chat_archive.clear_archived_with(session_id, conversation_store)
+         # The runner applies native settings live. Silent startup metadata
+         # writes skip both recovery and forwarding to avoid recursive launches.
+         live_forward = not body.silent
+diff --git a/tests/server/routes/test_side_chat_archive.py b/tests/server/routes/test_side_chat_archive.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..87224f51a86fed6d7af80119f3377eb812d7dfb7
+--- /dev/null
++++ b/tests/server/routes/test_side_chat_archive.py
+@@ -0,0 +1,173 @@
++"""Archiving a session archives its side chats; Undo restores only those."""
++
++from __future__ import annotations
++
++import asyncio
++from collections.abc import Iterator
++from unittest.mock import AsyncMock, patch
++
++import httpx
++import pytest
++
++from omnigent.db.utils import generate_agent_id
++from omnigent.server.routes import sessions as sessions_facade
++from omnigent.server.routes._sessions import orchestration
++from omnigent.server.routes.sessions.ae_side_chat_archive import (
++    SIDE_CHAT_ARCHIVED_WITH_LABEL_KEY as MARKER,
++)
++from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
++from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++
++pytestmark = pytest.mark.asyncio
++
++
++@pytest.fixture
++def store_and_agent(db_uri: str) -> tuple[SqlAlchemyConversationStore, str]:
++    agent_id = generate_agent_id()
++    SqlAlchemyAgentStore(db_uri).create(agent_id, name="test", bundle_location="test:///bundle")
++    return SqlAlchemyConversationStore(db_uri), agent_id
++
++
++@pytest.fixture(autouse=True)
++def _stub_stop() -> Iterator[AsyncMock]:
++    stop = AsyncMock(return_value=True)
++    with patch.object(sessions_facade, "_best_effort_stop", stop):
++        yield stop
++
++
++def _side_chat(store: SqlAlchemyConversationStore, source_id: str):
++    return store.fork_conversation(
++        source_id,
++        extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source_id},
++    )
++
++
++def _row(store: SqlAlchemyConversationStore, session_id: str):
++    row = store.get_conversation(session_id)
++    assert row is not None
++    return row
++
++
++async def _patch(client: httpx.AsyncClient, session_id: str, archived: bool) -> None:
++    response = await client.patch(f"/v1/sessions/{session_id}", json={"archived": archived})
++    assert response.status_code == 200, response.text
++
++
++async def _drain() -> None:
++    await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
++
++
++async def test_archive_parent_archives_side_chats_and_undo_restores(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=agent_id)
++    side_a = _side_chat(store, parent.id)
++    side_b = _side_chat(store, parent.id)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
++        await _patch(client, parent.id, True)
++        for side in (side_a, side_b):
++            row = _row(store, side.id)
++            assert row.archived is True
++            assert row.labels[MARKER] == parent.id
++            assert side.id in orchestration._pending_archive_stops
++        await _patch(client, parent.id, False)
++        for side in (side_a, side_b):
++            row = _row(store, side.id)
++            assert row.archived is False
++            assert MARKER not in row.labels
++            assert side.id not in orchestration._pending_archive_stops
++        await _drain()
++
++
++async def test_archive_stop_runs_for_side_chats(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++    _stub_stop: AsyncMock,
++) -> None:
++    store, agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=agent_id)
++    side = _side_chat(store, parent.id)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0):
++        await _patch(client, parent.id, True)
++        await _drain()
++    stopped = {call.args[0] for call in _stub_stop.await_args_list}
++    assert {parent.id, side.id} <= stopped
++
++
++async def test_hand_archived_side_chat_stays_archived_after_undo(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=agent_id)
++    by_hand = _side_chat(store, parent.id)
++    other = _side_chat(store, parent.id)
++    store.update_conversation_with_changes(by_hand.id, archived=True)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
++        await _patch(client, parent.id, True)
++        assert MARKER not in _row(store, by_hand.id).labels
++        assert _row(store, other.id).archived is True
++        await _patch(client, parent.id, False)
++        await _drain()
++    assert _row(store, by_hand.id).archived is True
++    assert _row(store, other.id).archived is False
++
++
++async def test_nested_side_chats_archive_and_restore(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=agent_id)
++    side = _side_chat(store, parent.id)
++    nested = _side_chat(store, side.id)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
++        await _patch(client, parent.id, True)
++        assert _row(store, nested.id).archived is True
++        assert _row(store, nested.id).labels[MARKER] == parent.id
++        await _patch(client, parent.id, False)
++        await _drain()
++    assert _row(store, side.id).archived is False
++    assert _row(store, nested.id).archived is False
++    assert MARKER not in _row(store, nested.id).labels
++
++
++async def test_cross_replica_undo_skips_side_chat_teardown(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++    _stub_stop: AsyncMock,
++) -> None:
++    store, agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=agent_id)
++    side = _side_chat(store, parent.id)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 1.5):
++        await _patch(client, parent.id, True)
++        # Another replica undoes through the store; this one's timers stay armed.
++        store.update_conversation_with_changes(side.id, archived=False)
++        store.update_conversation_with_changes(parent.id, archived=False)
++        await _drain()
++    stopped = {call.args[0] for call in _stub_stop.await_args_list}
++    assert side.id not in stopped
++    assert parent.id not in stopped
++
++
++async def test_unrelated_sessions_are_untouched(
++    client: httpx.AsyncClient,
++    store_and_agent: tuple[SqlAlchemyConversationStore, str],
++) -> None:
++    store, agent_id = store_and_agent
++    parent = store.create_conversation(agent_id=agent_id)
++    plain_fork = store.fork_conversation(parent.id)
++    stranger = store.create_conversation(agent_id=agent_id)
++    stranger_side = _side_chat(store, stranger.id)
++    with patch.object(sessions_facade, "_ARCHIVE_STOP_UNDO_GRACE_S", 30.0):
++        await _patch(client, parent.id, True)
++        for untouched in (plain_fork, stranger, stranger_side):
++            row = _row(store, untouched.id)
++            assert row.archived is False
++            assert MARKER not in row.labels
++        await _patch(client, parent.id, False)
++        await _drain()

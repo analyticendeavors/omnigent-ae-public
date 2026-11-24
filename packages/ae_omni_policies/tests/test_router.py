@@ -17,6 +17,7 @@ from fastapi import FastAPI, Request
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.onboarding.claude_accounts import CLAUDE_ACCOUNT_LABEL_KEY
 from omnigent.runtime import get_conversation_store
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from tests.server.helpers import create_test_session
 
 from ae_omni_policies import __version__, auth, deploy_hold, labels, limits, slot_limit
@@ -2618,3 +2619,33 @@ async def test_voice_route_refuses_a_caller_who_does_not_own_the_session(
     refused = await client.post(f"/v1/ae/sessions/{sid}/voice", json={"on": True})
     assert refused.status_code == 403, refused.text
     assert labels.VOICE not in _labels(sid)
+
+
+async def test_capacity_leaves_out_side_chats_of_an_archived_or_deleted_source(
+    client: httpx.AsyncClient,
+) -> None:
+    # 2026-11-17: a side chat inherits ae.status=working from its lead and stayed counted,
+    # hidden, after the lead was archived.
+    store = get_conversation_store()
+    live = await _session(client, "Live lead", {labels.STATUS: "working"})
+    gone = await _session(client, "Archived lead", {labels.STATUS: "working"})
+    live_side = store.fork_conversation(
+        live, extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: live}
+    )
+    gone_side = store.fork_conversation(
+        gone, extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: gone}
+    )
+    deleted_side = store.fork_conversation(
+        live, extra_labels={SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: "f" * 32}
+    )
+    store.update_conversation_with_changes(gone, archived=True)
+
+    resp = await client.get("/v1/ae/capacity")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    listed = {row["id"] for row in body["working"]}
+    assert live in listed
+    assert live_side.id in listed
+    assert gone_side.id not in listed
+    assert deleted_side.id not in listed
+    assert body["slots_used"] == len(body["working"])

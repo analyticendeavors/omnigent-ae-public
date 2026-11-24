@@ -16,8 +16,13 @@ from ae_omni_policies.slot_cap import STORE_ERRORS
 
 ON = "on"
 SPOKEN_STYLE = (
-    "Spoken reply: lead with the answer, short plain sentences, "
-    "no tables, code, links or headers unless asked."
+    "Voice mode is on: the user hears this reply and never reads it. "
+    "Answer the way you would say it out loud: the answer first, in one to three "
+    "short plain sentences, then stop or ask one short question. "
+    "While Voice mode is on this overrides every formatting rule you have: "
+    "no bullets, bold labels, headers, tables, code blocks, links, file paths or a TLDR. "
+    "Names and numbers stay exact; say a link or path in words only when it matters; "
+    "give detail only when asked."
 )
 
 

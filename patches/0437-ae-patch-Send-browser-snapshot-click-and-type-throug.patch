@@ -1,0 +1,239 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Sat, 21 Nov 2026 15:07:47 -0800
+Subject: [PATCH 437/443] [ae-patch] Send browser snapshot, click and type
+ through the desktop's typed bridge
+
+Desktop shells from 0.21 on build every page script in the main process.
+Their legacy browserExecute path still runs a v0.18 relay's scripts, but only
+when a script matches the shell's built-in template exactly
+(web/electron/src/browserLegacyAction.js upstream). Patch 0216 changed
+SNAPSHOT_JS, so a 0.21 shell refused every agent snapshot with "Unsupported
+legacy browser action; update the server UI".
+
+The relay now calls browserPerformAction(conversationId, action, params) when
+the shell has it, sending only ref, snapshot_id, selector and text with null
+values dropped, because the shell refuses any other key. Shells without the
+typed bridge keep browserExecute and the AE snapshot walk. This is the relay
+half of upstream ce8066dd7 (#10178), kept in new file
+web/src/lib/aeBrowserTypedAction.ts.
+
+A 0.21 shell captures a view that was never on screen as an empty image, so
+browser_screenshot returned "data:image/png;base64,". An empty payload is now
+an error that tells the agent to have the Browser pane opened on that chat.
+---
+ web/src/hooks/useBrowserAgentRelay.test.tsx | 46 ++++++++++++++
+ web/src/hooks/useBrowserAgentRelay.ts       | 24 +++++---
+ web/src/lib/aeBrowserTypedAction.ts         | 68 +++++++++++++++++++++
+ 3 files changed, 131 insertions(+), 7 deletions(-)
+ create mode 100644 web/src/lib/aeBrowserTypedAction.ts
+
+diff --git a/web/src/hooks/useBrowserAgentRelay.test.tsx b/web/src/hooks/useBrowserAgentRelay.test.tsx
+index 08d8db7d10a7cfa772ae55e2711ba87f7a8c6efc..336a0660db71815a8aba6f01773a51ae4558925e 100644
+--- a/web/src/hooks/useBrowserAgentRelay.test.tsx
++++ b/web/src/hooks/useBrowserAgentRelay.test.tsx
+@@ -745,6 +745,52 @@ describe("useBrowserAgentRelay — action dispatch", () => {
+     await runAction(actionEvent("click", { selector: "x" }));
+     expect((postedResult().result as { ok: boolean; error: string }).error).toBe("execute blew up");
+   });
++
++  it("AE: snapshot uses the typed bridge when the shell has one, never browserExecute", async () => {
++    const browserPerformAction = vi
++      .fn()
++      .mockResolvedValue({ ok: true, result: JSON.stringify({ snapshot_id: "t1", tree: "x" }) });
++    const bridge = installBridge({ browserPerformAction });
++    await runAction(actionEvent("snapshot", { stray: 1 }));
++    expect(browserPerformAction).toHaveBeenCalledWith(CONV, "snapshot", {});
++    expect(bridge.browserExecute).not.toHaveBeenCalled();
++    expect((postedResult().result as { data: { snapshot_id: string } }).data.snapshot_id).toBe(
++      "t1",
++    );
++  });
++
++  it("AE: click and type send only the keys the shell accepts, without nulls", async () => {
++    const browserPerformAction = vi.fn().mockResolvedValue({ ok: true, result: "ok" });
++    installBridge({ browserPerformAction, browserExecute: undefined });
++    await runAction(actionEvent("type", { ref: 3, snapshot_id: "s", selector: null, text: "hi" }));
++    expect(browserPerformAction).toHaveBeenCalledWith(CONV, "type", {
++      ref: 3,
++      snapshot_id: "s",
++      text: "hi",
++    });
++    expect((postedResult().result as { ok: boolean }).ok).toBe(true);
++  });
++
++  it("AE: click surfaces the typed bridge's error", async () => {
++    installBridge({
++      browserPerformAction: vi
++        .fn()
++        .mockResolvedValue({ ok: false, error: "ref 9 not in snapshot" }),
++    });
++    await runAction(actionEvent("click", { ref: 9, text: "dropped" }));
++    expect((postedResult().result as { error: string }).error).toBe("ref 9 not in snapshot");
++  });
++
++  it("AE: screenshot reports a blank capture as an error that names the Browser pane", async () => {
++    installBridge({
++      browserScreenshot: vi.fn().mockResolvedValue({ ok: true, dataUrl: "data:image/png;base64," }),
++    });
++    await runAction(actionEvent("screenshot"));
++    const result = postedResult().result as { ok: boolean; error: string; data_url?: string };
++    expect(result.ok).toBe(false);
++    expect(result.data_url).toBeUndefined();
++    expect(result.error).toMatch(/Browser pane/);
++  });
+ });
+ 
+ describe("useBrowserAgentRelay — result POST resilience", () => {
+diff --git a/web/src/hooks/useBrowserAgentRelay.ts b/web/src/hooks/useBrowserAgentRelay.ts
+index 18f1a9c2e079b021b9deb8c252ee5a29e1283d88..1d1c531c5a0332359c1769672ee8f897c5549d04 100644
+--- a/web/src/hooks/useBrowserAgentRelay.ts
++++ b/web/src/hooks/useBrowserAgentRelay.ts
+@@ -9,6 +9,12 @@
+  *  desktop build that predates the `browser*` bridge is treated as unsupported,
+  *  so the relay never claims an action it couldn't fulfill. */
+ import { useEffect } from "react";
++import {
++  AE_BLANK_CAPTURE_ERROR,
++  aeIsBlankCapture,
++  aeTypedBrowserAction,
++  type AeTypedBrowserBridge,
++} from "@/lib/aeBrowserTypedAction";
+ import { onBrowserActionRequest } from "@/lib/browserActionBus";
+ import type { BrowserActionRequestEvent } from "@/lib/events";
+ import { supportsBrowser } from "@/lib/nativeBridge";
+@@ -23,7 +29,7 @@ import type { Session } from "@/lib/types";
+ /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
+  *  nativeBridge). All optional — an older shell may predate the feature, so the
+  *  relay feature-detects before calling. */
+-interface BrowserDesktopBridge {
++interface BrowserDesktopBridge extends AeTypedBrowserBridge {
+   browserOpenOrNavigate?: (
+     conversationId: string,
+     url: string,
+@@ -303,13 +309,15 @@ async function dispatch(
+         }
+         const r = await desktop.browserScreenshot(conversationId);
+         if (!r?.ok || !r.dataUrl) return { ok: false, error: r?.error ?? "No browser open" };
++        if (aeIsBlankCapture(r.dataUrl)) return { ok: false, error: AE_BLANK_CAPTURE_ERROR };
+         return { ok: true, data_url: r.dataUrl };
+       }
+       case "snapshot": {
+-        if (!desktop.browserExecute) {
++        const typed = aeTypedBrowserAction(desktop, conversationId, "snapshot", args);
++        if (!typed && !desktop.browserExecute) {
+           return { ok: false, error: "this desktop shell does not support the browser pane" };
+         }
+-        const r = await desktop.browserExecute(conversationId, SNAPSHOT_JS);
++        const r = await (typed ?? desktop.browserExecute?.(conversationId, SNAPSHOT_JS));
+         if (!r?.ok) return { ok: false, error: r?.error ?? "snapshot failed" };
+         try {
+           const parsed = JSON.parse(r.result ?? "{}") as Record<string, unknown>;
+@@ -319,19 +327,21 @@ async function dispatch(
+         }
+       }
+       case "click": {
+-        if (!desktop.browserExecute) {
++        const typed = aeTypedBrowserAction(desktop, conversationId, "click", args);
++        if (!typed && !desktop.browserExecute) {
+           return { ok: false, error: "this desktop shell does not support the browser pane" };
+         }
+         const js =
+           `(() => { ${findElJs(args)} ` +
+           `el.scrollIntoView({ block: 'center', inline: 'center' }); ` +
+           `el.click(); return 'ok'; })()`;
+-        const r = await desktop.browserExecute(conversationId, js);
++        const r = await (typed ?? desktop.browserExecute?.(conversationId, js));
+         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
+         return { ok: true };
+       }
+       case "type": {
+-        if (!desktop.browserExecute) {
++        const typed = aeTypedBrowserAction(desktop, conversationId, "type", args);
++        if (!typed && !desktop.browserExecute) {
+           return { ok: false, error: "this desktop shell does not support the browser pane" };
+         }
+         const text = String(args.text ?? "");
+@@ -343,7 +353,7 @@ async function dispatch(
+           `el.dispatchEvent(new Event('input', { bubbles: true })); ` +
+           `el.dispatchEvent(new Event('change', { bubbles: true })); ` +
+           `return 'ok'; })()`;
+-        const r = await desktop.browserExecute(conversationId, js);
++        const r = await (typed ?? desktop.browserExecute?.(conversationId, js));
+         if (!r?.ok) return { ok: false, error: r?.error ?? "type failed" };
+         return { ok: true };
+       }
+diff --git a/web/src/lib/aeBrowserTypedAction.ts b/web/src/lib/aeBrowserTypedAction.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..f380e4ea8b7c4531f078b52762c1f941fe92d6e5
+--- /dev/null
++++ b/web/src/lib/aeBrowserTypedAction.ts
+@@ -0,0 +1,68 @@
++/**
++ * AE: route the agent's browser snapshot, click and type through the desktop
++ * shell's typed `browserPerformAction` bridge when the shell has one.
++ *
++ * Why (2026-11-21): desktop shells from 0.21 on build every page script in the
++ * main process. Their legacy `browserExecute` path still runs a v0.18 relay's
++ * scripts, but only when a script matches the shell's built-in template byte
++ * for byte (`web/electron/src/browserLegacyAction.js` upstream). The AE
++ * snapshot walk (dialogs in portals, shadow roots, frames) differs from that
++ * template, so a 0.21 shell refused every snapshot with "Unsupported legacy
++ * browser action; update the server UI". The typed bridge takes the action
++ * name and its arguments instead. Shells without it (0.18, and this tree's own
++ * desktop build) keep the `browserExecute` path and the AE snapshot walk.
++ */
++
++export type AeTypedBrowserAction = "snapshot" | "click" | "type";
++
++export interface AeTypedBrowserBridge {
++  browserPerformAction?: (
++    conversationId: string,
++    action: AeTypedBrowserAction,
++    params?: Record<string, unknown>,
++  ) => Promise<{ ok: boolean; result?: string; error?: string }>;
++}
++
++/** The argument keys the shell accepts per action; it refuses any other key. */
++const TYPED_ACTION_KEYS: Record<AeTypedBrowserAction, readonly string[]> = {
++  snapshot: [],
++  click: ["ref", "snapshot_id", "selector"],
++  type: ["ref", "snapshot_id", "selector", "text"],
++};
++
++/** Keep only the keys the shell accepts, and drop null or missing values. */
++export function aeTypedActionParams(
++  action: AeTypedBrowserAction,
++  args: Record<string, unknown>,
++): Record<string, unknown> {
++  const params: Record<string, unknown> = {};
++  for (const key of TYPED_ACTION_KEYS[action]) {
++    const value = args[key];
++    if (value !== undefined && value !== null) params[key] = value;
++  }
++  return params;
++}
++
++/** Run the action through the typed bridge, or return undefined when the shell
++ *  has none, so the caller falls back to `browserExecute`. */
++export function aeTypedBrowserAction(
++  desktop: AeTypedBrowserBridge,
++  conversationId: string,
++  action: AeTypedBrowserAction,
++  args: Record<string, unknown>,
++): Promise<{ ok: boolean; result?: string; error?: string }> | undefined {
++  if (typeof desktop.browserPerformAction !== "function") return undefined;
++  return desktop.browserPerformAction(conversationId, action, aeTypedActionParams(action, args));
++}
++
++/** The shell captures a page that was never on screen as an empty image, which
++ *  arrives as a data URL with no payload. */
++export function aeIsBlankCapture(dataUrl: string): boolean {
++  const comma = dataUrl.indexOf(",");
++  return comma === -1 || dataUrl.slice(comma + 1).trim() === "";
++}
++
++export const AE_BLANK_CAPTURE_ERROR =
++  "The desktop app returned a blank screenshot because this chat's browser page is not on " +
++  "screen. Ask the user to open the Browser pane on this chat, then call browser_screenshot " +
++  "again.";

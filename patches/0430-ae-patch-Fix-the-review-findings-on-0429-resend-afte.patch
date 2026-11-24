@@ -1,0 +1,736 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 22:23:53 -0800
+Subject: [PATCH 430/443] [ae-patch] Fix the review findings on 0429: resend
+ after a rewind, say when the notice is withdrawn, lock the gate state, key
+ the turn flag to the transcript
+
+A rewind or fork fires no SessionStart, so the hook now records the transcript's line count and last message uuid at each full send and sends in full again when the transcript is shorter or no longer holds that uuid. When auto collaboration is switched off after a full send the model gets one "Omnigent notice withdrawn" line and the gate resets, so switching it back on sends the full block; the bridge now writes an empty context file when a message carries no notice, so a prompt typed into the pane is not mistaken for that. The auto paragraph keeps "routine work does not need a team". An Esc interrupt (no Stop) is read from the transcript's interrupt line, or from a full send older than 30 minutes, so it cannot block the every 20th prompt refresh. State is read, decided and written under an flock on a lock file in the bridge dir, failing open to a full send. The marker leaves out the preset clause when the notice names none. The golden test now checks a preserved baseline of the old wording, and both new test files run in upstream-smoke.
+---
+ omnigent/harnesses/claude_native/bridge.py    |   1 +
+ omnigent/harnesses/claude_native/hook.py      | 202 ++++++++++++++----
+ omnigent/inner/ae_team.py                     |   3 +-
+ omnigent/inner/claude_native_executor.py      |  11 +-
+ .../test_framework_context_gate.py            | 193 ++++++++++++++++-
+ tests/inner/test_ae_notice_golden.py          |  89 ++++++--
+ tests/inner/test_claude_native_executor.py    |   2 +-
+ 7 files changed, 430 insertions(+), 71 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index b9ee8ab57648976f2268c8c611f8e1f8583f8be4..d7f942b49a3f9a615bdb95b5e4591cf9652a7f41 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -108,6 +108,7 @@ CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+ # full, so it can send a one-line marker in between (see ``hook._main_framework_context``).
+ CLAUDE_FRAMEWORK_STATE_FILE = "framework_context_state.json"
+ CLAUDE_FRAMEWORK_LAST_FILE = "framework_context_last.txt"
++CLAUDE_FRAMEWORK_LOCK_FILE = "framework_context.lock"
+ # The notice goes out in full on the first prompt, whenever it changes, and on every Nth
+ # prompt after, so a long chat never drifts from it.
+ FRAMEWORK_REFRESH_EVERY = 20
+diff --git a/omnigent/harnesses/claude_native/hook.py b/omnigent/harnesses/claude_native/hook.py
+index 370ab601d0cc6fdbac4fafd08803173b6aa4ffa5..3075d3c8e1723fbf7aa3cd185e41e12e41d598a2 100644
+--- a/omnigent/harnesses/claude_native/hook.py
++++ b/omnigent/harnesses/claude_native/hook.py
+@@ -12,7 +12,7 @@ import re
+ import secrets
+ import sys
+ import time
+-from collections.abc import Callable
++from collections.abc import Callable, Iterator
+ from pathlib import Path
+ from typing import TYPE_CHECKING
+ 
+@@ -20,6 +20,7 @@ from omnigent.harnesses.claude_native.bridge import (
+     BRIDGE_ID_LABEL_KEY,
+     CLAUDE_FRAMEWORK_CONTEXT_FILE,
+     CLAUDE_FRAMEWORK_LAST_FILE,
++    CLAUDE_FRAMEWORK_LOCK_FILE,
+     CLAUDE_FRAMEWORK_STATE_FILE,
+     FRAMEWORK_REFRESH_EVERY,
+     approval_wait_marker_path,
+@@ -1130,6 +1131,10 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
+ 
+ 
+ _LEAD_LINE = re.compile(r"^- Lead: .*$\n?", re.MULTILINE)
++_INTERRUPT_MARK = b"[Request interrupted by user"
++NOTICE_WITHDRAWN = "Omnigent notice withdrawn: auto collaboration is off for this chat."
++# A full send older than this no longer counts as "this turn" (Stop never fired).
++FRAMEWORK_TURN_STALE_SECONDS = 1800
+ _PRESET_LINE = re.compile(r"Roles preset: (.+?)\. (?:Name a role|Pick the preset)")
+ _SOLO_PRESET = re.compile(r'preset \("(.+?)"\) keeps work in house')
+ 
+@@ -1155,18 +1160,23 @@ def _notice_hash(notice: str) -> str:
+     return hashlib.sha256(_LEAD_LINE.sub("", notice).encode("utf-8")).hexdigest()
+ 
+ 
+-def _notice_marker(notice: str, digest: str) -> str:
+-    """The one line sent in place of an unchanged notice."""
++def _preset_name(notice: str) -> str | None:
++    """The roles preset the notice names, read from its prose; ``None`` when it names none."""
+     from omnigent.inner.ae_roles import HELPER_NOTICE
+ 
+     if HELPER_NOTICE in notice:
+-        preset = "helper"
+-    else:
+-        found = _PRESET_LINE.search(notice) or _SOLO_PRESET.search(notice)
+-        preset = found.group(1) if found else "none"
++        return "helper"
++    found = _PRESET_LINE.search(notice) or _SOLO_PRESET.search(notice)
++    return found.group(1) if found else None
++
++
++def _notice_marker(notice: str, digest: str) -> str:
++    """The one line sent in place of an unchanged notice."""
++    preset = _preset_name(notice)
++    preset_part = f"; preset {preset}" if preset else ""
+     lead = re.search(r"^- Lead: (.*?)\.?$", notice, re.MULTILINE)
+     lead_part = f"; Lead: {lead.group(1)}." if lead else "."
+-    return f"Omnigent notice v{digest[:8]} still in force; preset {preset}{lead_part}"
++    return f"Omnigent notice v{digest[:8]} still in force{preset_part}{lead_part}"
+ 
+ 
+ def _read_framework_state(bridge_dir: Path) -> dict[str, object]:
+@@ -1185,12 +1195,126 @@ def _write_framework_state(bridge_dir: Path, state: dict[str, object]) -> None:
+         tmp.replace(path)
+ 
+ 
++@contextlib.contextmanager
++def _framework_lock(bridge_dir: Path) -> Iterator[bool]:
++    """
++    Hold an exclusive lock on the gate's state; yield ``False`` when it cannot be taken.
++
++    Overlapping hooks (a queued prompt, a Stop) would otherwise read the same state and
++    each decide to send in full, or lose a counter increment. Callers fail open: a ``False``
++    means send the notice in full.
++    """
++    try:
++        import fcntl
++
++        handle = (bridge_dir / CLAUDE_FRAMEWORK_LOCK_FILE).open("a+")
++    except (ImportError, OSError):
++        yield False
++        return
++    try:
++        try:
++            fcntl.flock(handle, fcntl.LOCK_EX)
++        except OSError:
++            yield False
++            return
++        yield True
++    finally:
++        handle.close()
++
++
++def _scan_transcript(
++    path: object, since_lines: int, uuid: object
++) -> tuple[int, bool, bool] | None:
++    """
++    Read the Claude transcript: its line count, whether *uuid* is in it, and whether an
++    interrupt marker follows line *since_lines*. ``None`` when it cannot be read.
++    """
++    if not isinstance(path, str) or not path:
++        return None
++    try:
++        data = Path(path).read_bytes()
++    except OSError:
++        return None
++    lines = data.splitlines()
++    has_uuid = not isinstance(uuid, str) or not uuid or uuid.encode("utf-8") in data
++    interrupted = any(_INTERRUPT_MARK in line for line in lines[since_lines:])
++    return len(lines), has_uuid, interrupted
++
++
++def _transcript_tail(path: object) -> dict[str, object]:
++    """The transcript position to remember at a full send: line count and last message uuid."""
++    if not isinstance(path, str) or not path:
++        return {}
++    try:
++        lines = Path(path).read_bytes().splitlines()
++    except OSError:
++        return {}
++    last_uuid = None
++    for line in reversed(lines[-20:]):
++        try:
++            found = json.loads(line).get("uuid")
++        except (ValueError, AttributeError):
++            continue
++        if isinstance(found, str) and found:
++            last_uuid = found
++            break
++    return {"transcript_lines": len(lines), "transcript_uuid": last_uuid}
++
++
+ def _end_framework_turn(bridge_dir: Path) -> None:
+     """A turn ended: a drift refresh may go out again on a later prompt."""
++    with _framework_lock(bridge_dir):
++        state = _read_framework_state(bridge_dir)
++        if state.get("full_in_turn"):
++            state["full_in_turn"] = False
++            _write_framework_state(bridge_dir, state)
++
++
++def _gate_notice(
++    bridge_dir: Path, notice: str, session_id: object, transcript_path: object, locked: bool
++) -> str:
++    """Return the full *notice* or its marker, and record what was sent."""
++    digest = _notice_hash(notice)
+     state = _read_framework_state(bridge_dir)
+-    if state.get("full_in_turn"):
+-        state["full_in_turn"] = False
+-        _write_framework_state(bridge_dir, state)
++    since = state.get("prompts_since_full")
++    since = since if isinstance(since, int) and not isinstance(since, bool) else 0
++    changed = state.get("hash") != digest or state.get("session_id") != session_id
++    lines = state.get("transcript_lines")
++    lines = lines if isinstance(lines, int) and not isinstance(lines, bool) else 0
++    scan = _scan_transcript(transcript_path, lines, state.get("transcript_uuid"))
++    # /rewind and a fork fire no SessionStart: the full block is gone from the conversation
++    # when the transcript is shorter than at the send or no longer holds its last message.
++    rewound = scan is not None and (not scan[1] or scan[0] < lines)
++    # Stop does not fire on an Esc interrupt: the transcript's interrupt line (or an old
++    # enough send) ends the turn, so a drift refresh is not blocked for good.
++    in_turn = bool(state.get("full_in_turn"))
++    sent_at = state.get("full_at")
++    if in_turn and (
++        (scan is not None and scan[2])
++        or not isinstance(sent_at, (int, float))
++        or time.time() - sent_at > FRAMEWORK_TURN_STALE_SECONDS
++    ):
++        in_turn = False
++    refresh = since + 1 >= FRAMEWORK_REFRESH_EVERY and not bool(state.get("full_in_turn"))
++    if changed or rewound or refresh or not locked:
++        with contextlib.suppress(OSError):
++            (bridge_dir / CLAUDE_FRAMEWORK_LAST_FILE).write_text(notice, encoding="utf-8")
++        _write_framework_state(
++            bridge_dir,
++            {
++                "hash": digest,
++                "session_id": session_id,
++                "prompts_since_full": 0,
++                "full_in_turn": True,
++                "full_at": time.time(),
++                **_transcript_tail(transcript_path),
++            },
++        )
++        return notice
++    _write_framework_state(
++        bridge_dir, {**state, "prompts_since_full": since + 1, "full_in_turn": in_turn}
++    )
++    return _notice_marker(notice, digest)
+ 
+ 
+ def _main_framework_context(argv: list[str]) -> int:
+@@ -1198,50 +1322,41 @@ def _main_framework_context(argv: list[str]) -> int:
+     Add pending framework context to one submitted prompt.
+ 
+     The team and roles notice goes out in full on the first prompt of a Claude session,
+-    when its text changes (the ``- Lead:`` line aside) and on every
++    when its text changes (the ``- Lead:`` line aside), after a rewind, and on every
+     ``FRAMEWORK_REFRESH_EVERY``th prompt; every other prompt gets a one-line marker. A
+     drift refresh never lands in the same turn as a full send, so a prompt queued
+-    mid-turn gets the marker only.
++    mid-turn gets the marker only. When the notice disappears after a full send (auto
++    collaboration turned off), one line says it is withdrawn and the gate resets.
++
++    The bridge writes the context file on every message it sends, empty when there is
++    nothing to add; no file at all means a prompt typed straight into the pane.
+     """
+     args = _parse_evaluate_policy_args(argv)
+     try:
+         payload = json.loads(sys.stdin.read() or "{}")
+     except ValueError:
+         payload = {}
+-    session_id = payload.get("session_id") if isinstance(payload, dict) else None
++    payload = payload if isinstance(payload, dict) else {}
++    session_id = payload.get("session_id")
++    transcript_path = payload.get("transcript_path")
+     bridge_dir = Path(args.bridge_dir)
+     path = bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+-    try:
+-        text = path.read_text(encoding="utf-8")
+-        path.unlink(missing_ok=True)
+-    except OSError:
+-        return 0
++    with _framework_lock(bridge_dir) as locked:
++        try:
++            text = path.read_text(encoding="utf-8")
++            path.unlink(missing_ok=True)
++        except OSError:
++            return 0
++        other, notice = _split_notice(text)
++        if notice:
++            notice = _gate_notice(bridge_dir, notice, session_id, transcript_path, locked)
++            text = f"{other}\n\n{notice}" if other else notice
++        elif _read_framework_state(bridge_dir).get("hash"):
++            (bridge_dir / CLAUDE_FRAMEWORK_STATE_FILE).unlink(missing_ok=True)
++            (bridge_dir / CLAUDE_FRAMEWORK_LAST_FILE).unlink(missing_ok=True)
++            text = f"{other}\n\n{NOTICE_WITHDRAWN}" if other else NOTICE_WITHDRAWN
+     if not text:
+         return 0
+-    other, notice = _split_notice(text)
+-    if notice:
+-        digest = _notice_hash(notice)
+-        state = _read_framework_state(bridge_dir)
+-        since = state.get("prompts_since_full")
+-        since = since if isinstance(since, int) and not isinstance(since, bool) else 0
+-        changed = state.get("hash") != digest or state.get("session_id") != session_id
+-        refresh = since + 1 >= FRAMEWORK_REFRESH_EVERY and not state.get("full_in_turn")
+-        if changed or refresh:
+-            with contextlib.suppress(OSError):
+-                (bridge_dir / CLAUDE_FRAMEWORK_LAST_FILE).write_text(notice, encoding="utf-8")
+-            _write_framework_state(
+-                bridge_dir,
+-                {
+-                    "hash": digest,
+-                    "session_id": session_id,
+-                    "prompts_since_full": 0,
+-                    "full_in_turn": True,
+-                },
+-            )
+-        else:
+-            _write_framework_state(bridge_dir, {**state, "prompts_since_full": since + 1})
+-            notice = _notice_marker(notice, digest)
+-        text = f"{other}\n\n{notice}" if other else notice
+     output = {"hookEventName": "UserPromptSubmit", "additionalContext": text}
+     sys.stdout.write(json.dumps({"hookSpecificOutput": output}))
+     return 0
+@@ -1279,6 +1394,7 @@ def _main_framework_session_start(argv: list[str]) -> int:
+             "session_id": payload.get("session_id"),
+             "prompts_since_full": 0,
+             "full_in_turn": False,
++            **_transcript_tail(payload.get("transcript_path")),
+         },
+     )
+     sys.stdout.write(
+diff --git a/omnigent/inner/ae_team.py b/omnigent/inner/ae_team.py
+index 0cf1c24919c02a4cdf742d836d8864585b876b6e..a2f93983127635c81832fedbc30e821edcfeb9c7 100644
+--- a/omnigent/inner/ae_team.py
++++ b/omnigent/inner/ae_team.py
+@@ -84,7 +84,8 @@ def _render_team(metadata: Any) -> str | None:
+         return (
+             "Auto collaboration is enabled for this chat. You are the lead and give one "
+             "integrated answer. Work yourself, use native in-harness subagents, or bring in "
+-            "another configured agent, in the smallest useful group. Before cross-agent work, "
++            "another configured agent, in the smallest useful group; routine work does not need a "
++            "team. Before cross-agent work, "
+             "check agent and host readiness; use only configured, reachable agents. Reuse "
+             "suitable child sessions. Delegate bounded tasks with context and file ownership, "
+             "then inspect results. If cross-agent tools are missing, use native helpers and "
+diff --git a/omnigent/inner/claude_native_executor.py b/omnigent/inner/claude_native_executor.py
+index c94c16fcfab143d20183c9634e8fc8c7d2a6abc4..68d96665686087ee370b9c0a996deb72cc39fc05 100644
+--- a/omnigent/inner/claude_native_executor.py
++++ b/omnigent/inner/claude_native_executor.py
+@@ -134,11 +134,16 @@ class ClaudeNativeExecutor(Executor):
+         """Inject user text with one-shot context while holding the injection lock."""
+         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+         context_path.unlink(missing_ok=True)
++        # The team and roles notice goes last: the framework-context hook gates it (full
++        # once, then a marker) and passes the other notices through whole. The file is
++        # written empty when there are no notices, so the hook can tell "nothing to add"
++        # (say a withdrawn notice is gone) from a prompt typed straight into the pane.
++        notices = sorted(notices, key=lambda notice: notice.startswith(NOTICE_PREFIX))
+         if notices:
+-            # The team and roles notice goes last: the framework-context hook gates it
+-            # (full once, then a marker) and passes the other notices through whole.
+-            notices = sorted(notices, key=lambda notice: notice.startswith(NOTICE_PREFIX))
+             context_path.write_text("\n\n".join(notices), encoding="utf-8")
++        else:
++            with contextlib.suppress(OSError):
++                context_path.write_text("", encoding="utf-8")
+         try:
+             await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+         except BaseException:
+diff --git a/tests/harnesses/claude_native/test_framework_context_gate.py b/tests/harnesses/claude_native/test_framework_context_gate.py
+index 1b7580a0d7172d9e44d2e913e36c70f005c25ba8..2952d2551d68bc22418206779087e793e68c7dc8 100644
+--- a/tests/harnesses/claude_native/test_framework_context_gate.py
++++ b/tests/harnesses/claude_native/test_framework_context_gate.py
+@@ -4,6 +4,7 @@ from __future__ import annotations
+ 
+ import io
+ import json
++import re
+ import sys
+ from pathlib import Path
+ 
+@@ -13,10 +14,13 @@ from omnigent.harnesses.claude_native import hook as claude_native_hook
+ from omnigent.harnesses.claude_native.bridge import (
+     CLAUDE_FRAMEWORK_CONTEXT_FILE,
+     CLAUDE_FRAMEWORK_LAST_FILE,
++    CLAUDE_FRAMEWORK_LOCK_FILE,
+     CLAUDE_FRAMEWORK_STATE_FILE,
+     FRAMEWORK_REFRESH_EVERY,
+ )
++from omnigent.harnesses.claude_native.hook import NOTICE_WITHDRAWN
+ from omnigent.inner.ae_roles import NOTICE_PREFIX
++from omnigent.inner.ae_team import render_team_notice
+ 
+ BODY = (
+     f"{NOTICE_PREFIX} Auto collaboration is enabled for this chat. Be the lead.\n\n"
+@@ -33,11 +37,20 @@ def _prompt(
+     bridge: Path,
+     text: str | None = BODY,
+     session_id: str = "claude-1",
++    transcript: Path | None = None,
+ ) -> str:
+-    """Run one UserPromptSubmit through the hook; return the context it added ('' for none)."""
++    """
++    Run one UserPromptSubmit through the hook; return the context it added ('' for none).
++
++    ``text=None`` writes no context file (a prompt typed into the pane); ``""`` writes the
++    empty file the bridge leaves when a message carries no notice.
++    """
+     if text is not None:
+         (bridge / CLAUDE_FRAMEWORK_CONTEXT_FILE).write_text(text, encoding="utf-8")
+-    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"session_id": session_id})))
++    payload = {"session_id": session_id}
++    if transcript is not None:
++        payload["transcript_path"] = str(transcript)
++    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(payload)))
+     assert claude_native_hook.main(["framework-context", "--bridge-dir", str(bridge)]) == 0
+     out = capsys.readouterr().out
+     return json.loads(out)["hookSpecificOutput"]["additionalContext"] if out else ""
+@@ -169,11 +182,151 @@ def test_other_notices_pass_through_whole(monkeypatch, capsys, tmp_path) -> None
+     second = _prompt(monkeypatch, capsys, tmp_path, both)
+     assert second.startswith(resize + "\n\n")
+     assert _is_marker(second.split("\n\n", 1)[1])
+-    assert _prompt(monkeypatch, capsys, tmp_path, resize) == resize
++    # With the team notice gone, the other notice goes alone with the withdrawal line.
++    assert _prompt(monkeypatch, capsys, tmp_path, resize) == f"{resize}\n\n{NOTICE_WITHDRAWN}"
+ 
+ 
+-def test_a_prompt_with_no_notice_adds_nothing(monkeypatch, capsys, tmp_path) -> None:
++def test_a_prompt_with_no_context_file_adds_nothing(monkeypatch, capsys, tmp_path) -> None:
+     assert _prompt(monkeypatch, capsys, tmp_path, None) == ""
++    _prompt(monkeypatch, capsys, tmp_path)
++    # A prompt typed into the pane carries no file: the notice is not withdrawn.
++    assert _prompt(monkeypatch, capsys, tmp_path, None) == ""
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
++
++
++def test_an_empty_context_file_before_any_notice_adds_nothing(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    assert _prompt(monkeypatch, capsys, tmp_path, "") == ""
++
++
++def test_turning_collaboration_off_withdraws_the_notice_once(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    _prompt(monkeypatch, capsys, tmp_path)
++    assert _prompt(monkeypatch, capsys, tmp_path, "") == NOTICE_WITHDRAWN
++    assert not (tmp_path / CLAUDE_FRAMEWORK_STATE_FILE).exists()
++    assert _prompt(monkeypatch, capsys, tmp_path, "") == ""
++
++
++def test_turning_collaboration_back_on_sends_the_full_block(monkeypatch, capsys, tmp_path) -> None:
++    _prompt(monkeypatch, capsys, tmp_path)
++    _prompt(monkeypatch, capsys, tmp_path, "")
++    assert _prompt(monkeypatch, capsys, tmp_path) == BODY
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
++
++
++def test_withdrawal_keeps_other_notices(monkeypatch, capsys, tmp_path) -> None:
++    resize = "Note: the attached image was downscaled."
++    _prompt(monkeypatch, capsys, tmp_path)
++    assert _prompt(monkeypatch, capsys, tmp_path, resize) == f"{resize}\n\n{NOTICE_WITHDRAWN}"
++
++
++def test_a_compact_after_withdrawal_resends_nothing(monkeypatch, capsys, tmp_path) -> None:
++    _prompt(monkeypatch, capsys, tmp_path)
++    _prompt(monkeypatch, capsys, tmp_path, "")
++    assert _start(monkeypatch, capsys, tmp_path, "compact") == ""
++
++
++def _transcript(path: Path, uuids: list[str]) -> Path:
++    path.write_text("".join(json.dumps({"uuid": u, "type": "user"}) + "\n" for u in uuids))
++    return path
++
++
++def test_a_rewind_to_a_shorter_transcript_forces_a_full_send(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    log = _transcript(tmp_path / "t.jsonl", ["a", "b", "c", "d"])
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path, transcript=log))
++    _transcript(log, ["a", "b"])  # /rewind: no SessionStart fires
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++
++
++def test_a_rewind_that_drops_the_last_message_forces_a_full_send(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    log = _transcript(tmp_path / "t.jsonl", ["a", "b", "c"])
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++    _transcript(log, ["a", "b", "x", "y", "z"])  # longer, but the recorded uuid is gone
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++
++
++def test_a_growing_transcript_is_not_a_rewind(monkeypatch, capsys, tmp_path) -> None:
++    log = _transcript(tmp_path / "t.jsonl", ["a", "b"])
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++    _transcript(log, ["a", "b", "c", "d"])
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path, transcript=log))
++
++
++def test_an_unreadable_transcript_is_not_a_rewind(monkeypatch, capsys, tmp_path) -> None:
++    missing = tmp_path / "gone.jsonl"
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=missing) == BODY
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path, transcript=missing))
++
++
++def test_an_interrupted_turn_does_not_block_the_refresh(monkeypatch, capsys, tmp_path) -> None:
++    log = _transcript(tmp_path / "t.jsonl", ["a"])
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++    # Esc: Stop never fires, so full_in_turn stays set; the transcript records the interrupt.
++    with log.open("a") as handle:
++        handle.write(json.dumps({"uuid": "b", "text": "[Request interrupted by user]"}) + "\n")
++    for _ in range(FRAMEWORK_REFRESH_EVERY - 1):
++        assert _is_marker(_prompt(monkeypatch, capsys, tmp_path, transcript=log))
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++
++
++def test_a_stale_turn_flag_does_not_block_the_refresh(monkeypatch, capsys, tmp_path) -> None:
++    assert _prompt(monkeypatch, capsys, tmp_path) == BODY
++    state_path = tmp_path / CLAUDE_FRAMEWORK_STATE_FILE
++    state = json.loads(state_path.read_text())
++    state["full_at"] -= claude_native_hook.FRAMEWORK_TURN_STALE_SECONDS + 1
++    state_path.write_text(json.dumps(state))
++    for _ in range(FRAMEWORK_REFRESH_EVERY - 1):
++        assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
++    assert _prompt(monkeypatch, capsys, tmp_path) == BODY
++
++
++@pytest.mark.parametrize("garbage", ["{not json", "[1, 2]", '"text"', "", "\x00\xff"])
++def test_a_corrupt_state_file_falls_back_to_a_full_send(
++    monkeypatch, capsys, tmp_path, garbage
++) -> None:
++    _prompt(monkeypatch, capsys, tmp_path)
++    (tmp_path / CLAUDE_FRAMEWORK_STATE_FILE).write_text(garbage, errors="ignore")
++    assert _prompt(monkeypatch, capsys, tmp_path) == BODY
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
++
++
++def test_state_with_wrong_field_types_falls_back_to_a_full_send(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    _prompt(monkeypatch, capsys, tmp_path)
++    bad = {"hash": 7, "session_id": [], "prompts_since_full": "x", "transcript_lines": "y"}
++    (tmp_path / CLAUDE_FRAMEWORK_STATE_FILE).write_text(json.dumps(bad))
++    assert _prompt(monkeypatch, capsys, tmp_path) == BODY
++
++
++def test_a_lock_failure_sends_in_full(monkeypatch, capsys, tmp_path) -> None:
++    import fcntl
++
++    _prompt(monkeypatch, capsys, tmp_path)
++
++    def refuse(*_args: object) -> None:
++        raise OSError("no locks here")
++
++    monkeypatch.setattr(fcntl, "flock", refuse)
++    assert _prompt(monkeypatch, capsys, tmp_path) == BODY
++
++
++def test_a_prompt_takes_the_lock(monkeypatch, capsys, tmp_path) -> None:
++    import fcntl
++
++    calls = []
++    real = fcntl.flock
++    monkeypatch.setattr(fcntl, "flock", lambda handle, op: (calls.append(op), real(handle, op))[1])
++    _prompt(monkeypatch, capsys, tmp_path)
++    assert calls == [fcntl.LOCK_EX]
++    assert (tmp_path / CLAUDE_FRAMEWORK_LOCK_FILE).exists()
+ 
+ 
+ def test_the_helper_notice_marks_itself_a_helper(monkeypatch, capsys, tmp_path) -> None:
+@@ -184,3 +337,35 @@ def test_the_helper_notice_marks_itself_a_helper(monkeypatch, capsys, tmp_path)
+     out = _prompt(monkeypatch, capsys, tmp_path, helper)
+     assert _is_marker(out)
+     assert "preset helper" in out
++
++
++def test_the_marker_format_is_pinned_for_the_real_notice(monkeypatch, capsys, tmp_path) -> None:
++    from tests.inner.test_ae_roles import BALANCED, CURRENT, PERSONAS
++
++    meta = {
++        "ae_team": {"mode": "auto", "members": []},
++        "ae_roles": {
++            "preset": BALANCED,
++            "custom": False,
++            "current": CURRENT,
++            "personas": PERSONAS,
++        },
++    }
++    notice = render_team_notice(meta) or ""
++    assert _prompt(monkeypatch, capsys, tmp_path, notice) == notice
++    marker = _prompt(monkeypatch, capsys, tmp_path, notice)
++    assert _is_marker(marker)
++    assert re.fullmatch(
++        r"Omnigent notice v[0-9a-f]{8} still in force; preset Balanced; Lead: .+\.", marker
++    ), marker
++
++
++def test_a_notice_naming_no_preset_gets_a_marker_without_one(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    bare = f"{NOTICE_PREFIX} Auto collaboration is enabled for this chat.\n\nSomething new."
++    assert _prompt(monkeypatch, capsys, tmp_path, bare) == bare
++    marker = _prompt(monkeypatch, capsys, tmp_path, bare)
++    assert _is_marker(marker)
++    assert "preset" not in marker
++    assert re.fullmatch(r"Omnigent notice v[0-9a-f]{8} still in force\.", marker), marker
+diff --git a/tests/inner/test_ae_notice_golden.py b/tests/inner/test_ae_notice_golden.py
+index fc27e8a48dfce7f6f90d9707adc07ecee394c9cf..83973cec45ed4db15fbe746881ee698ccd450d1b 100644
+--- a/tests/inner/test_ae_notice_golden.py
++++ b/tests/inner/test_ae_notice_golden.py
+@@ -1,8 +1,10 @@
+ """Every rule of the team and roles notice survives, in every mode (golden table).
+ 
+-The framework-context hook sends the notice in full once per session and a marker after, and
+-the auto paragraph was shortened with it. Each rule below is pinned by a substring of the full
+-block, so a trim that drops a rule fails here.
++The rule lists are a preserved baseline, not a copy of the current wording. The auto
++paragraph's entries are phrases from the notice as it stood before the once-per-session change
++(``OLD_AUTO_PARAGRAPH`` below is that text, kept whole); an entry is a tuple of the old phrase
++followed by any exact equivalents the new text may use instead. Every other list holds phrases
++that are word for word in the old text of its mode. A trim that drops a rule fails here.
+ """
+ 
+ from __future__ import annotations
+@@ -25,17 +27,54 @@ from tests.inner.test_ae_roles import (
+     _with_reviewers,
+ )
+ 
+-AUTO_RULES = (
+-    "Auto collaboration is enabled for this chat",
+-    "You are the lead and give one integrated answer",
+-    "Work yourself, use native in-harness subagents, or bring in another configured agent",
+-    "smallest useful group",
+-    "check agent and host readiness; use only configured, reachable agents",
+-    "Reuse suitable child sessions",
+-    "Delegate bounded tasks with context and file ownership, then inspect results",
+-    "If cross-agent tools are missing, use native helpers and say what you used",
+-    "Never claim a collaborator or model worked unless you invoked it",
+-    "Follow the user's permissions and limits",
++OLD_AUTO_PARAGRAPH = (
++    "Auto collaboration is enabled for this message. You are the lead and give one "
++    "integrated answer. Decide whether to work yourself, use your native in-harness "
++    "subagents, or bring in another configured agent. Use the smallest useful group; "
++    "routine work does not need a team. Before starting cross-agent work, inspect the "
++    "available agents and host readiness and use only configured, reachable agents. "
++    "Reuse suitable existing child sessions where possible. Delegate bounded tasks "
++    "with the relevant context, coordinate file ownership, and inspect the results. "
++    "If cross-agent tools are unavailable, use your normal native helpers and say "
++    "what you could actually use. Do not claim a collaborator or model worked "
++    "unless you invoked it. Follow the user's permissions and limits."
++)
++# (old phrase, *exact equivalents in the shortened wording). Case-insensitive.
++AUTO_RULES: tuple[tuple[str, ...], ...] = (
++    (
++        "Auto collaboration is enabled for this message",
++        "Auto collaboration is enabled for this chat",
++    ),
++    ("You are the lead and give one integrated answer",),
++    (
++        "work yourself, use your native in-harness subagents, or bring in another "
++        "configured agent",
++        "Work yourself, use native in-harness subagents, or bring in another configured agent",
++    ),
++    ("Use the smallest useful group", "in the smallest useful group"),
++    ("routine work does not need a team",),
++    (
++        "Before starting cross-agent work, inspect the available agents and host readiness and "
++        "use only configured, reachable agents",
++        "Before cross-agent work, check agent and host readiness; use only configured, "
++        "reachable agents",
++    ),
++    ("Reuse suitable existing child sessions where possible", "Reuse suitable child sessions"),
++    (
++        "Delegate bounded tasks with the relevant context, coordinate file ownership, and "
++        "inspect the results",
++        "Delegate bounded tasks with context and file ownership, then inspect results",
++    ),
++    (
++        "If cross-agent tools are unavailable, use your normal native helpers and say what you "
++        "could actually use",
++        "If cross-agent tools are missing, use native helpers and say what you used",
++    ),
++    (
++        "Do not claim a collaborator or model worked unless you invoked it",
++        "Never claim a collaborator or model worked unless you invoked it",
++    ),
++    ("Follow the user's permissions and limits",),
+ )
+ SOLO_RULES = (
+     "keeps work in house",
+@@ -132,6 +171,18 @@ def _full(mode: str, preset: dict[str, Any] | None = None) -> str:
+     return render_team_notice(meta) or ""
+ 
+ 
++def _assert_has(text: str, rule: str | tuple[str, ...], mode: str) -> None:
++    """Assert *text* holds the rule's old phrase or one of its listed equivalents."""
++    options = (rule,) if isinstance(rule, str) else rule
++    lowered = text.lower()
++    assert any(option.lower() in lowered for option in options), f"{mode}: lost {options[0]!r}"
++
++
++def test_the_baseline_phrases_come_from_the_old_text() -> None:
++    for rule in AUTO_RULES:
++        assert rule[0].lower() in OLD_AUTO_PARAGRAPH.lower(), rule[0]
++
++
+ @pytest.mark.parametrize(
+     ("mode", "mode_rules"), [("auto", AUTO_RULES), ("solo", SOLO_RULES), ("team", TEAM_RULES)]
+ )
+@@ -139,7 +190,7 @@ def test_every_rule_is_in_the_full_block(mode: str, mode_rules: tuple[str, ...])
+     text = _full(mode)
+     assert text.startswith(NOTICE_PREFIX)
+     for rule in (*mode_rules, *ROLE_RULES):
+-        assert rule in text, f"{mode}: lost {rule!r}"
++        _assert_has(text, rule, mode)
+ 
+ 
+ @pytest.mark.parametrize("mode", ["auto", "solo", "team"])
+@@ -147,7 +198,7 @@ def test_every_reviewer_rule_is_in_the_full_block(mode: str) -> None:
+     text = _full(mode, _reviewing_preset())
+     assert "Roles preset: Balanced." in text
+     for rule in REVIEWER_RULES:
+-        assert rule in text, f"{mode}: lost {rule!r}"
++        _assert_has(text, rule, mode)
+ 
+ 
+ def test_lead_picks_keeps_every_rule() -> None:
+@@ -163,16 +214,16 @@ def test_lead_picks_keeps_every_rule() -> None:
+     text = render_team_notice(meta) or ""
+     assert text.startswith(NOTICE_PREFIX)
+     for rule in (*AUTO_RULES, *LEAD_PICKS_RULES):
+-        assert rule in text, f"lead-picks: lost {rule!r}"
++        _assert_has(text, rule, "lead-picks")
+ 
+ 
+ def test_helper_keeps_every_rule() -> None:
+     text = render_team_notice({"ae_helper": True}) or ""
+     assert text.startswith(NOTICE_PREFIX)
+     for rule in HELPER_RULES:
+-        assert rule in text, f"helper: lost {rule!r}"
++        _assert_has(text, rule, "helper")
+ 
+ 
+ def test_the_auto_paragraph_is_short() -> None:
+     text = _full("auto").split("\n\nRoles preset")[0]
+-    assert len(text) < 640
++    assert len(text) < len(OLD_AUTO_PARAGRAPH)
+diff --git a/tests/inner/test_claude_native_executor.py b/tests/inner/test_claude_native_executor.py
+index a9327d22fe5a9d1ff5c9ae8d5900dfcf405aec76..0111b4a99bd579169b25b3384a9dde2dafea7419 100644
+--- a/tests/inner/test_claude_native_executor.py
++++ b/tests/inner/test_claude_native_executor.py
+@@ -1011,7 +1011,7 @@ async def test_enqueue_session_message_materializes_image(
+     assert len(written) == 1
+     assert written[0].name == "steering_img.png"
+     assert await executor.enqueue_session_message("session-key", "follow-up")
+-    assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
++    assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == ""
+ 
+ 
+ @pytest.mark.asyncio

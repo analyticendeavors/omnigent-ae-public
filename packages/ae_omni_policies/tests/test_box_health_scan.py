@@ -227,6 +227,29 @@ def test_scan_tmp_counts_by_owner_without_opening_a_litter_folder(
     assert result.pytest_dirs[me].endswith("pytest-of-owner")
 
 
+def test_scan_tmp_does_not_count_harmless_tool_files_as_stale(tmp_path: Path) -> None:
+    for name in (
+        "uv-abc.lock",
+        "uv-setuptools-abc.lock",
+        "pi-usage-1.json",
+        "pi-reauth-2.json",
+        "ae-review-3.md",
+        "other-old-file",
+    ):
+        make(tmp_path / name, 5)
+    result = scan.scan_tmp(str(tmp_path), now=NOW, stale_days=2, budget=Budget(10_000, 30))
+    other = result.litter[os.getuid()]["other"]
+    assert (other.entries, other.stale) == (6, 1)
+
+
+def test_a_harmless_name_with_a_trailing_newline_is_still_stale(tmp_path: Path) -> None:
+    make(tmp_path / "uv-a.lock\n", 5)
+    make(tmp_path / "uv-.lock", 5)
+    result = scan.scan_tmp(str(tmp_path), now=NOW, stale_days=2, budget=Budget(10_000, 30))
+    other = result.litter[os.getuid()]["other"]
+    assert (other.entries, other.stale) == (2, 1)
+
+
 # ── live sessions ───────────────────────────────────────────────────────────
 
 

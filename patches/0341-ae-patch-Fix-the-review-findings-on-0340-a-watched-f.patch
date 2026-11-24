@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 00:55:45 -0800
+Subject: [PATCH 341/443] [ae-patch] Fix the review findings on 0340: a watched
+ family the catalog lacks gets a row, and an open app rereads the watch hourly
+
+---
+ web/src/hooks/useAeModelWatch.test.tsx | 11 ++++++++++
+ web/src/hooks/useAeModelWatch.ts       |  4 +++-
+ web/src/lib/aeClaudeModels.test.ts     | 30 ++++++++++++++++++++++++++
+ web/src/lib/aeClaudeModels.ts          | 16 +++++++++++++-
+ 4 files changed, 59 insertions(+), 2 deletions(-)
+
+diff --git a/web/src/hooks/useAeModelWatch.test.tsx b/web/src/hooks/useAeModelWatch.test.tsx
+index d1a14bf01fcfd6b5f750a285935728371337a7a1..070fe57d5f1d47cae7f35515ee112ee7d7166b40 100644
+--- a/web/src/hooks/useAeModelWatch.test.tsx
++++ b/web/src/hooks/useAeModelWatch.test.tsx
+@@ -71,6 +71,17 @@ describe("useAeModelWatch", () => {
+     expect(aeWatchedModels()).toEqual([]);
+   });
+ 
++  it("rereads hourly and on focus, so an open app learns of a new model", async () => {
++    mocks.fetch.mockResolvedValue(json({ served_ids: [] }));
++    renderHook(() => useAeModelWatch(), { wrapper });
++    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
++    const options = client.getQueryCache().find({ queryKey: ["ae", "model-watch"] })?.observers[0]
++      ?.options;
++    expect(options?.refetchInterval).toBe(60 * 60 * 1000);
++    expect(options?.refetchOnWindowFocus).toBe(true);
++    expect(options?.staleTime).toBe(60 * 60 * 1000);
++  });
++
+   it("does not throw when the read itself rejects", async () => {
+     mocks.fetch.mockRejectedValue(new Error("offline"));
+     const { result } = renderHook(() => useAeModelWatch(), { wrapper });
+diff --git a/web/src/hooks/useAeModelWatch.ts b/web/src/hooks/useAeModelWatch.ts
+index 74449fe650f9c07c816486a4e5a0dff92b313184..201c2c569af16b1c268e81b1102b41c041588345 100644
+--- a/web/src/hooks/useAeModelWatch.ts
++++ b/web/src/hooks/useAeModelWatch.ts
+@@ -32,7 +32,9 @@ export function useAeModelWatch(): void {
+     queryFn: fetchServedIds,
+     staleTime: STALE_MS,
+     retry: false,
+-    refetchOnWindowFocus: false,
++    // An app left open still learns of a new model: hourly, and on focus once the data is stale.
++    refetchInterval: STALE_MS,
++    refetchOnWindowFocus: true,
+   });
+   const ids = query.data;
+   useEffect(() => {
+diff --git a/web/src/lib/aeClaudeModels.test.ts b/web/src/lib/aeClaudeModels.test.ts
+index 20811e4cfc23ee048f86ecd2d68d7e69d5a89f57..34451f8de567d295f150057913b15ace355c5534 100644
+--- a/web/src/lib/aeClaudeModels.test.ts
++++ b/web/src/lib/aeClaudeModels.test.ts
+@@ -303,3 +303,33 @@ describe("the watched known list", () => {
+     );
+   });
+ });
++
++describe("a watched family the catalog does not list", () => {
++  afterEach(() => aeSetWatchedModels([]));
++  const SUB = { kind: "subscription", label: "Subscription", name: "claude" };
++  const FABLE_ONLY: NativeModelOption[] = [
++    { id: "claude-fable-5-2[1m]", model: "claude-fable-5-2", displayName: "Fable", source: SUB },
++  ];
++
++  it("adds one subscription row for a watched Mythos id", () => {
++    aeSetWatchedModels(["claude-mythos-5-2"]);
++    const row = aeWithClaudeVersions(FABLE_ONLY).find((r) => r.id === "claude-mythos-5-2");
++    expect(row).toEqual({
++      id: "claude-mythos-5-2",
++      model: "claude-mythos-5-2",
++      displayName: "Mythos 5.2",
++      source: SUB,
++    });
++  });
++
++  it("adds nothing from the static list alone", () => {
++    const rows = aeWithClaudeVersions(FABLE_ONLY);
++    expect(rows.some((r) => r.id.includes("opus") || r.id.includes("mythos"))).toBe(false);
++  });
++
++  it("adds nothing when the catalog has no subscription row", () => {
++    aeSetWatchedModels(["claude-mythos-5-2"]);
++    const other: NativeModelOption[] = [{ id: "x", model: "x", displayName: "X" }];
++    expect(aeWithClaudeVersions(other)).toBe(other);
++  });
++});
+diff --git a/web/src/lib/aeClaudeModels.ts b/web/src/lib/aeClaudeModels.ts
+index faa5d51ce3917a5761f170fa4c960576b2bb11d8..b5a6d4148445763940a59f39177574393a4f80ff 100644
+--- a/web/src/lib/aeClaudeModels.ts
++++ b/web/src/lib/aeClaudeModels.ts
+@@ -231,7 +231,21 @@ export function aeMergeKnownClaudeModels(
+     )?.source;
+     older.push({ id, model: id, displayName: aeClaudeVersionLabel(id) ?? id, source });
+   }
+-  return [...relabeled, ...older];
++  // A watched id (the box saw it answer) whose family the catalog does not list at all would never
++  // show; it gets one subscription row of its own. The static list never adds a family.
++  const fresh = new Map<string, { version: AeClaudeVersion; id: string }>();
++  for (const id of new Set([...extraKnown, ...watched])) {
++    const version = WATCHED_ID.test(id) ? aeClaudeVersion(id) : null;
++    if (!version || newest.has(version.family)) continue;
++    const held = fresh.get(version.family);
++    if (!held || compareVersions(version, held.version) > 0)
++      fresh.set(version.family, { version, id });
++  }
++  const source = subscriptionRows[0]?.source;
++  const added: NativeModelOption[] = [...fresh.values()]
++    .filter(({ id }) => !rows.some((row) => row.id === id))
++    .map(({ id }) => ({ id, model: id, displayName: aeClaudeVersionLabel(id) ?? id, source }));
++  return [...relabeled, ...older, ...added];
+ }
+ 
+ /** {@link aeMergeKnownClaudeModels} with the built-in known list. */

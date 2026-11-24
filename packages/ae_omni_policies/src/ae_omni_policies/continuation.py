@@ -22,8 +22,14 @@ sweep no longer posts one, so it is no longer recognized: a prompt that starts w
 words is an ordinary prompt.)
 
 The queued Compact (:mod:`ae_omni_policies.compact_queue`, 2026-11-06) posts a third kind: the
-save-your-notes prompt (:data:`COMPACT_PREP_TEXT`) it sends before the compact. It is matched
-whole, so words added before it make it an ordinary prompt.
+save-your-notes prompt (:data:`COMPACT_PREP_TEXT`) it sends before the compact, plus a resume
+note (:data:`COMPACT_RESUME_TEXT`) after it and a cancelled note (:data:`COMPACT_CANCELLED_TEXT`)
+when it gives up after the save prompt went in. Each is matched whole, so words added before
+it make it an ordinary prompt.
+
+Auto-resume (:mod:`ae_omni_policies.background_shells`, 2026-11-23) posts a fourth kind,
+:data:`BACKGROUND_RESUME_TEXT`, into an idle chat whose background shell a host restart killed.
+It is matched whole as well.
 
 A merge note is neither a new task nor another turn of the owner's, so the slot cap
 lets it through without claiming a slot, and the rabbit hole and the fork
@@ -60,8 +66,30 @@ _CHILD_WAKE = re.compile(
 #: The prompt the queued Compact posts so the chat saves its notes before compacting.
 COMPACT_PREP_TEXT = (
     "Compaction runs right after this turn. Save anything worth keeping to memory or a handoff "
-    "note now: decisions and why, open work, file paths, what to do next. Start no new work and "
-    "do not compact yourself. Reply with one line, 'ready', when you are done."
+    "note now: decisions and why, open work, file paths, what to do next. Do not start new "
+    "steps in this turn and do not compact yourself; your work resumes after the compact. "
+    "Start your reply with 'ready' on its own line if nothing is in flight, or 'ready, resume' "
+    "if work is still running (subagents, builders, open steps)."
+)
+#: Reply the chat gives to ask for the resume note.
+COMPACT_RESUME_REPLY = "ready, resume"
+#: Posted once after the compact, only when the chat answered :data:`COMPACT_RESUME_REPLY`.
+COMPACT_RESUME_TEXT = (
+    "Compaction finished. Carry on with the work that was in flight; "
+    "your saved notes have the detail."
+)
+#: Posted when a compact is cancelled after the save prompt already reached the chat.
+COMPACT_CANCELLED_TEXT = (
+    "Compaction was cancelled and nothing was compacted; carry on with the work you had."
+)
+#: Posted by auto-resume into an idle chat whose background shell a host restart killed
+#: (:mod:`ae_omni_policies.background_shells`, 2026-11-23).
+BACKGROUND_RESUME_TEXT = (
+    "The host restarted after your last turn and killed the background shell work it left "
+    "running. Check what finished, rerun what did not, and carry on."
+)
+_COMPACT_NOTES = frozenset(
+    {COMPACT_PREP_TEXT, COMPACT_RESUME_TEXT, COMPACT_CANCELLED_TEXT, BACKGROUND_RESUME_TEXT}
 )
 
 
@@ -69,19 +97,24 @@ def is_system_continuation(text: str) -> bool:
     """Whether *text* is a note the server posted to continue existing work.
 
     :param text: The request's user text (``request_user_text``).
-    :returns: ``True`` for a merge watcher note, a child wake note or the Compact save prompt.
+    :returns: ``True`` for a merge watcher note, a child wake note, one of the Compact notes
+        or the background resume note.
     """
     head = text.strip()
     return (
         _MERGE_WATCH.match(head) is not None
         or _CHILD_WAKE.match(head) is not None
-        or head == COMPACT_PREP_TEXT
+        or head in _COMPACT_NOTES
     )
 
 
 __all__ = [
+    "BACKGROUND_RESUME_TEXT",
     "CHILD_WAKE_PREFIX",
+    "COMPACT_CANCELLED_TEXT",
     "COMPACT_PREP_TEXT",
+    "COMPACT_RESUME_REPLY",
+    "COMPACT_RESUME_TEXT",
     "MERGE_WATCH_PREFIX",
     "PICK_CAP",
     "TITLE_CAP",

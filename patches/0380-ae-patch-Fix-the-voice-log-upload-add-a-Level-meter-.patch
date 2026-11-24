@@ -1,0 +1,2544 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 17:48:46 -0800
+Subject: [PATCH 380/443] [ae-patch] Fix the voice log upload, add a Level
+ meter setting, and show the approval on the voice sheet (0380)
+
+The voice log upload no longer uses keepalive from an open page (iOS WebKit drops it): in-page uploads are plain requests with a 10 s timeout, so a hung request can no longer leave every later automatic upload throttled. Keepalive is used only when the page is hidden or closing, and a rejected keepalive request is retried once without it. Every upload result lands in the log buffer and a Voice-end result is toasted. A release no longer lets a synchronous stop upload mic_failed at chat creation.
+A per-device Level meter setting in the speaker menu and the new-chat Voice menu. It is off by default on iPhone and Safari, where the meter's second microphone capture can take the mic from the recognizer; with it off, the ring and bars follow the recognizer's events and the stall check uses them too.
+While a voice-answerable approval is pending, the Voice panel shows Waiting for your OK with Run it and Decline buttons in every phase, including while the line plays. Every client caller of an approval now passes _meta.source, and the resolve route logs one INFO line with the session, elicitation, action and an allowlisted source.
+---
+ .../routes/sessions/routes_elicitations.py    |  29 ++
+ .../test_sessions_elicitation_resolve_url.py  |  75 +++++
+ .../components/AeSpeakRepliesButton.test.tsx  |  21 +-
+ web/src/components/AeSpeakRepliesButton.tsx   |   2 +
+ web/src/components/AeVoiceMenuRows.tsx        |  17 ++
+ web/src/components/AeVoicePanel.test.tsx      |  34 +++
+ web/src/components/AeVoicePanel.tsx           |  36 +++
+ .../components/AeVoiceStartButton.test.tsx    |  13 +
+ web/src/components/AeVoiceStartButton.tsx     |   2 +
+ .../ComposerMicButton.meterOff.test.tsx       | 256 ++++++++++++++++++
+ web/src/components/ComposerMicButton.tsx      |  84 +++++-
+ .../components/blocks/ApprovalCard.test.tsx   | 156 ++++++++---
+ web/src/components/blocks/ApprovalCard.tsx    |  12 +-
+ web/src/hooks/useAeVoiceMode.test.tsx         | 121 +++++++--
+ web/src/hooks/useAeVoiceMode.ts               |  29 +-
+ web/src/hooks/useAeVoiceStart.test.ts         |  33 +++
+ web/src/hooks/useAeVoiceStart.ts              |  11 +-
+ web/src/hooks/useApproveHotkey.test.tsx       |  14 +-
+ web/src/hooks/useApproveHotkey.ts             |   3 +-
+ web/src/lib/aeApprovalSource.ts               |  23 ++
+ web/src/lib/aeSettingHints.ts                 |   5 +
+ web/src/lib/aeVoiceLevel.test.ts              |  19 ++
+ web/src/lib/aeVoiceLevel.ts                   |  16 ++
+ web/src/lib/aeVoiceLog.test.ts                | 149 +++++++++-
+ web/src/lib/aeVoiceLog.ts                     | 119 +++++++-
+ web/src/lib/aeVoiceMeter.test.ts              |  79 ++++++
+ web/src/lib/aeVoiceMeter.ts                   |  52 ++++
+ web/src/lib/aeVoiceStall.test.ts              |  37 +++
+ web/src/lib/aeVoiceStall.ts                   |  49 ++++
+ web/src/pages/ApprovePage.test.tsx            |  10 +-
+ web/src/pages/ApprovePage.tsx                 |   3 +-
+ web/src/pages/ChatPage.tsx                    |   1 +
+ web/src/pages/InboxPage.test.tsx              |  11 +-
+ web/src/pages/InboxPage.tsx                   |   4 +-
+ 34 files changed, 1413 insertions(+), 112 deletions(-)
+ create mode 100644 web/src/components/ComposerMicButton.meterOff.test.tsx
+ create mode 100644 web/src/lib/aeApprovalSource.ts
+ create mode 100644 web/src/lib/aeVoiceMeter.test.ts
+ create mode 100644 web/src/lib/aeVoiceMeter.ts
+
+diff --git a/omnigent/server/routes/sessions/routes_elicitations.py b/omnigent/server/routes/sessions/routes_elicitations.py
+index ba44ee69d2c3db95ab9b5726abdb44b086097777..8a0645930e411ee804f0ecd1e53a7b6060df5fdb 100644
+--- a/omnigent/server/routes/sessions/routes_elicitations.py
++++ b/omnigent/server/routes/sessions/routes_elicitations.py
+@@ -59,6 +59,28 @@ from omnigent.stores.permission_store import PermissionStore
+ # decision that needs a "waiting for the owner" UI state first.
+ ELICITATION_RESOLVE_LEVEL: int = LEVEL_EDIT
+ 
++# Who resolved a card, as the web client names it in ``_meta.source`` (see
++# web/src/lib/aeApprovalSource.ts). Only these reach the log; anything else is "unknown".
++KNOWN_RESOLVE_SOURCES: frozenset[str] = frozenset(
++    {"card", "voice", "voice_panel", "hotkey", "inbox", "approve_page"}
++)
++
++
++def sanitize_resolve_source(meta: dict[str, Any] | None) -> str:
++    """
++    Return the allowlisted ``_meta.source`` of a resolve body, else ``"unknown"``.
++
++    Never returns a value the client chose freely: an unlisted, missing or non-string source
++    is ``"unknown"``, so nothing from the request body reaches the log.
++
++    :param meta: The body's ``_meta`` dict, e.g. ``{"source": "voice_panel"}``, or ``None``.
++    :returns: A member of :data:`KNOWN_RESOLVE_SOURCES` or ``"unknown"``.
++    """
++    source = meta.get("source") if isinstance(meta, dict) else None
++    if isinstance(source, str) and source in KNOWN_RESOLVE_SOURCES:
++        return source
++    return "unknown"
++
+ 
+ def register_elicitations_routes(
+     router: APIRouter,
+@@ -131,6 +153,13 @@ def register_elicitations_routes(
+             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+             if conv is None:
+                 raise _session_not_found()
++        _logger.info(
++            "elicitation resolve: session=%s elicitation=%s action=%s source=%s",
++            session_id,
++            elicitation_id,
++            body.action,
++            sanitize_resolve_source(body.meta),
++        )
+         _resolve_data = {"elicitation_id": elicitation_id, **body.model_dump(exclude_none=True)}
+         await _resolve_elicitation(session_id, _resolve_data, runner_router, conversation_store)
+         # Apply any policy writes deferred by the relay tool-call ASK gate
+diff --git a/tests/server/integration/test_sessions_elicitation_resolve_url.py b/tests/server/integration/test_sessions_elicitation_resolve_url.py
+index ec63887ce2e3c35ad357b0cffcbc5a43ce8bc599..aa50eb0c7d66a600f5fc728a52e2287f9237d4dd 100644
+--- a/tests/server/integration/test_sessions_elicitation_resolve_url.py
++++ b/tests/server/integration/test_sessions_elicitation_resolve_url.py
+@@ -1226,6 +1226,81 @@ async def test_resolve_url_decline_round_trip(client: httpx.AsyncClient) -> None
+     assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+ 
+ 
++@pytest.mark.parametrize(
++    ("meta", "expected"),
++    [
++        ({"source": "voice_panel"}, "voice_panel"),
++        ({"source": "card", "persist": "session"}, "card"),
++        ({"source": "Voice"}, "unknown"),
++        ({"source": "x" * 500}, "unknown"),
++        ({"source": ["card"]}, "unknown"),
++        ({"source": None}, "unknown"),
++        ({"other": 1}, "unknown"),
++        (None, "unknown"),
++    ],
++)
++async def test_sanitize_resolve_source(meta: dict[str, Any] | None, expected: str) -> None:
++    """Only the known source names pass; everything else is logged as ``unknown``."""
++    from omnigent.server.routes.sessions.routes_elicitations import sanitize_resolve_source
++
++    assert sanitize_resolve_source(meta) == expected
++
++
++async def test_resolve_url_logs_one_line_with_sanitized_source(
++    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
++) -> None:
++    """
++    The resolve route logs one INFO line (session, elicitation, action, source) and never
++    writes request content values: an unknown source is ``unknown`` and the form content and
++    free-text source stay out of the log.
++    """
++    import logging
++
++    agent = await create_test_agent(client, "test-resolve-url-log")
++    session_id = await _create_session(client, agent["id"])
++    hook_task, elicitation_id = await _park_permission_hook(client, session_id, tool_name="Bash")
++
++    with caplog.at_level(logging.INFO):
++        verdict = await client.post(
++            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
++            json={
++                "action": "decline",
++                "content": {"feedback": "SECRET-CONTENT-VALUE"},
++                "_meta": {"source": "SECRET-SOURCE-VALUE"},
++            },
++        )
++    assert verdict.status_code == 202, verdict.text
++    await hook_task
++
++    lines = [r.getMessage() for r in caplog.records if "elicitation resolve:" in r.getMessage()]
++    assert lines == [
++        f"elicitation resolve: session={session_id} elicitation={elicitation_id} "
++        "action=decline source=unknown"
++    ]
++    assert "SECRET" not in caplog.text
++
++
++async def test_resolve_url_logs_known_source(
++    client: httpx.AsyncClient, caplog: pytest.LogCaptureFixture
++) -> None:
++    """A known ``_meta.source`` is logged as sent."""
++    import logging
++
++    agent = await create_test_agent(client, "test-resolve-url-log-known")
++    session_id = await _create_session(client, agent["id"])
++    hook_task, elicitation_id = await _park_permission_hook(client, session_id, tool_name="Bash")
++
++    with caplog.at_level(logging.INFO):
++        verdict = await client.post(
++            f"/v1/sessions/{session_id}/elicitations/{elicitation_id}/resolve",
++            json={"action": "accept", "_meta": {"source": "voice_panel"}},
++        )
++    assert verdict.status_code == 202, verdict.text
++    resp = await hook_task
++    assert resp.json()["hookSpecificOutput"]["decision"]["behavior"] == "allow"
++    assert "action=accept source=voice_panel" in caplog.text
++
++
+ async def test_resolve_url_cancel_round_trip(client: httpx.AsyncClient) -> None:
+     """
+     A ``cancel`` verdict at the URL endpoint maps to Claude's
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 974d087d611054f77f3369840f1da911ad597925..c6a6be181769bbf9b1ccc8bafca4ccf20952e1bf 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -249,6 +249,23 @@ describe("AeSpeakRepliesButton", () => {
+     expect(window.localStorage.getItem("omnigent:ae-voice-mic-while-speaking")).toBeNull();
+   });
+ 
++  it("has a Level meter row in the speaker menu, default by platform, saved per device, with a hint", async () => {
++    renderButton();
++    const user = await openMenu();
++    const row = screen.getByTestId("ae-voice-meter");
++    expect(row).toHaveAttribute("aria-checked", "true");
++    expect(within(row).getByTestId("ae-hint-voice.meter")).toBeInTheDocument();
++    const hint = AE_SETTING_HINTS["voice.meter"].hint;
++    expect(hint.trim()).not.toBe("");
++    expect(hint.length).toBeLessThanOrEqual(140);
++    expect(hint).toContain("iPhone");
++    await user.click(row);
++    expect(screen.getByTestId("ae-voice-meter")).toHaveAttribute("aria-checked", "false");
++    expect(window.localStorage.getItem("omnigent:ae-voice-meter")).toBe("off");
++    await user.click(screen.getByTestId("ae-voice-meter"));
++    expect(window.localStorage.getItem("omnigent:ae-voice-meter")).toBe("on");
++  });
++
+   it("applies Fast answers once effort levels arrive", async () => {
+     window.localStorage.setItem("omnigent:ae-speak-replies:c1", "true");
+     const view = renderButton({ canSetEffort: false });
+@@ -615,12 +632,12 @@ describe("AeSpeakRepliesButton", () => {
+     renderButton();
+     await openMenu();
+     const triggers = document.querySelectorAll("[data-slot=tooltip-trigger]");
+-    expect(triggers).toHaveLength(12);
++    expect(triggers).toHaveLength(13);
+     for (const el of triggers) {
+       const group = el.closest("span.items-center.gap-1\\.5");
+       expect(group).not.toBeNull();
+       expect(group?.textContent).toMatch(
+-        /Voice mode|Speak replies|Fast answers|Send snips|Mic while speaking|Voice|Speed|Microphone|Speaker|Add voice log|Send voice log/,
++        /Voice mode|Speak replies|Fast answers|Send snips|Mic while speaking|Level meter|Voice|Speed|Microphone|Speaker|Add voice log|Send voice log/,
+       );
+     }
+     const actions = screen.getByTestId("ae-speak-actions");
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 7577fa647b4aee6c91992c6fc1c1093bad7f60bd..0bd17bcb7076388d0f49449862fa95c5e84c61ee 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -22,6 +22,7 @@ import {
+ import { useAeSpeakReplies } from "@/hooks/useAeSpeakReplies";
+ import {
+   MicWhileSpeakingRow,
++  VoiceMeterRow,
+   RowHint,
+   ROW_LABEL_CLASS,
+   ROW_VALUE_CLASS,
+@@ -463,6 +464,7 @@ function SpeakRepliesControl({
+           testId="ae-voice-snips"
+         />
+         <MicWhileSpeakingRow />
++        <VoiceMeterRow />
+         <VoiceChoiceRows choices={choices} />
+         <DropdownMenuSeparator />
+         <div className="flex gap-1.5 px-1 pb-1 pt-0.5" data-testid="ae-speak-actions">
+diff --git a/web/src/components/AeVoiceMenuRows.tsx b/web/src/components/AeVoiceMenuRows.tsx
+index b82f4e7c18f03ab432c3603318522102a8fd771c..278765e62177ff6d61a9fc778b5b7cc4d0f68418 100644
+--- a/web/src/components/AeVoiceMenuRows.tsx
++++ b/web/src/components/AeVoiceMenuRows.tsx
+@@ -52,6 +52,7 @@ import {
+ } from "@/lib/aeVoiceChatVoice";
+ import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
+ import { useMicWhileSpeaking, writeMicWhileSpeaking } from "@/lib/aeVoiceMic";
++import { useVoiceMeter, writeVoiceMeter } from "@/lib/aeVoiceMeter";
+ 
+ const MAX_VOICES = 12;
+ const VOICE_LIST_RETRIES = 3;
+@@ -72,6 +73,7 @@ export function RowHint({
+     | "voice.fast_model"
+     | "voice.snips"
+     | "voice.mic_while_speaking"
++    | "voice.meter"
+     | "voice.chat_voice"
+     | "voice.voice"
+     | "voice.rate"
+@@ -176,6 +178,7 @@ export function SwitchRow({
+     | "voice.fast"
+     | "voice.snips"
+     | "voice.mic_while_speaking"
++    | "voice.meter"
+     | "voice.start";
+   testId: string;
+ }) {
+@@ -505,6 +508,20 @@ export function MicWhileSpeakingRow() {
+   );
+ }
+ 
++/** Level meter: a per-device switch (default off on iPhone, where it can take the mic). */
++export function VoiceMeterRow() {
++  const meter = useVoiceMeter();
++  return (
++    <SwitchRow
++      label="Level meter"
++      checked={meter}
++      onChange={writeVoiceMeter}
++      hint="voice.meter"
++      testId="ae-voice-meter"
++    />
++  );
++}
++
+ /** Sends the recent voice events to the server so a mic problem can be read afterwards. */
+ export function SendVoiceLogRow({ chatId }: { chatId?: string | null }) {
+   return (
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index eb858f72ca194cf6b0b3a05f0a8709694ececa04..20987bd8a93556297a2c600d2514b7c22c2a120d 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -47,6 +47,40 @@ describe("AeVoicePanel", () => {
+     expect(onRestartMic).toHaveBeenCalledTimes(1);
+   });
+ 
++  it.each(["bar", "sheet"] as const)(
++    "%s: shows Run it and Decline while the line is speaking, and they answer the card",
++    async (layout) => {
++      const onApproval = vi.fn();
++      panel({
++        layout,
++        phase: "speaking",
++        caption: "Slots full.",
++        approvalActive: true,
++        onApproval,
++      });
++      expect(screen.getByText("Speaking, tap to stop")).toBeTruthy();
++      expect(screen.getByText("Waiting for your OK")).toBeTruthy();
++      await userEvent.click(screen.getByRole("button", { name: "Run it" }));
++      expect(onApproval).toHaveBeenLastCalledWith("accept");
++      await userEvent.click(screen.getByRole("button", { name: "Decline" }));
++      expect(onApproval).toHaveBeenLastCalledWith("decline");
++    },
++  );
++
++  it("the approval phase word is not repeated beside the buttons", () => {
++    panel({ phase: "approval", approvalActive: true, onApproval: vi.fn() });
++    expect(screen.getAllByText("Waiting for your OK")).toHaveLength(1);
++    expect(screen.getByTestId("ae-voice-approval-run")).toBeTruthy();
++  });
++
++  it("shows no approval buttons without a pending approval or without a handler", () => {
++    const { unmount } = panel({ phase: "speaking", approvalActive: false, onApproval: vi.fn() });
++    expect(screen.queryByTestId("ae-voice-approval")).toBeNull();
++    unmount();
++    panel({ phase: "speaking", approvalActive: true });
++    expect(screen.queryByTestId("ae-voice-approval")).toBeNull();
++  });
++
+   it("renders nothing when Voice mode is off", () => {
+     panel({ phase: "off" });
+     expect(screen.queryByTestId("ae-voice-panel")).toBeNull();
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index e50d2da66e722796f3a75bb6db3953077994da45..3dc96b93841bc8c21ecd340fe1d0be59c0ecca76 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -38,6 +38,8 @@ export interface AeVoicePanelProps {
+   micDetail?: string | null;
+   /** A yes-or-no card is waiting, even when the mic cannot hear the answer. */
+   approvalActive?: boolean;
++  /** Run it or Decline from the panel; with approvalActive the two buttons show in every phase. */
++  onApproval?: (action: "accept" | "decline") => void;
+   /** Turn Voice mode off. */
+   onEnd: () => void;
+   /** Stop the current reply. */
+@@ -226,6 +228,7 @@ export function AeVoicePanel({
+   caption,
+   micDetail,
+   approvalActive = false,
++  onApproval,
+   onEnd,
+   onStop,
+   onResume,
+@@ -279,6 +282,37 @@ export function AeVoicePanel({
+     </Button>
+   );
+ 
++  // A pending yes-or-no card needs an answer even while the line plays, and the sheet covers
++  // the card on a phone: the label (when the phase word is not already it) and two buttons.
++  const approvalStrip =
++    approvalActive && onApproval ? (
++      <div
++        data-testid="ae-voice-approval"
++        className="relative z-10 flex flex-wrap items-center justify-center gap-2"
++      >
++        {key !== "approval" ? (
++          <span className="text-xs font-medium text-amber-500">Waiting for your OK</span>
++        ) : null}
++        <Button
++          type="button"
++          size="sm"
++          data-testid="ae-voice-approval-run"
++          onClick={() => onApproval("accept")}
++        >
++          Run it
++        </Button>
++        <Button
++          type="button"
++          variant="outline"
++          size="sm"
++          data-testid="ae-voice-approval-decline"
++          onClick={() => onApproval("decline")}
++        >
++          Decline
++        </Button>
++      </div>
++    ) : null;
++
+   if (layout === "sheet") {
+     return (
+       <div
+@@ -319,6 +353,7 @@ export function AeVoicePanel({
+         <div className="relative z-10 min-h-10 line-clamp-2 text-sm text-muted-foreground">
+           {sub}
+         </div>
++        {approvalStrip ? <div className="mt-2">{approvalStrip}</div> : null}
+         <div className="mt-3 flex gap-3">
+           {onKeyboard ? (
+             <Button
+@@ -358,6 +393,7 @@ export function AeVoicePanel({
+         <div className={cn("text-sm font-medium", tone.text)}>{label}</div>
+         {sub ? <div className="truncate text-xs text-muted-foreground">{sub}</div> : null}
+       </button>
++      {approvalStrip}
+       {endButton}
+     </div>
+   );
+diff --git a/web/src/components/AeVoiceStartButton.test.tsx b/web/src/components/AeVoiceStartButton.test.tsx
+index 03547189c8a5cb315f8197e736d36949555efec0..a7976a00f76da76721cd786392e4afb490740f62 100644
+--- a/web/src/components/AeVoiceStartButton.test.tsx
++++ b/web/src/components/AeVoiceStartButton.test.tsx
+@@ -78,6 +78,7 @@ describe("AeVoiceStartButton", () => {
+     expect(within(toggle).getByTestId("ae-hint-voice.start")).toBeInTheDocument();
+     for (const id of [
+       "ae-voice-mic-while-speaking",
++      "ae-voice-meter",
+       "ae-speak-voice-trigger",
+       "ae-voice-chat-voice-trigger",
+       "ae-speak-rate-trigger",
+@@ -98,6 +99,18 @@ describe("AeVoiceStartButton", () => {
+     }
+   });
+ 
++  it("has a Level meter row in the new-chat voice menu, with a hint, saved per device", async () => {
++    render(<AeVoiceStartButton armed={false} onToggle={() => {}} />);
++    const user = await openMenu();
++    const row = screen.getByTestId("ae-voice-meter");
++    // The test browser is not WebKit, so the default is on.
++    expect(row).toHaveAttribute("aria-checked", "true");
++    expect(within(row).getByTestId("ae-hint-voice.meter")).toBeInTheDocument();
++    await user.click(row);
++    expect(screen.getByTestId("ae-voice-meter")).toHaveAttribute("aria-checked", "false");
++    expect(window.localStorage.getItem("omnigent:ae-voice-meter")).toBe("off");
++  });
++
+   it("lists the microphone and speaker rows when the browser can choose them", async () => {
+     Object.defineProperty(navigator, "mediaDevices", {
+       configurable: true,
+diff --git a/web/src/components/AeVoiceStartButton.tsx b/web/src/components/AeVoiceStartButton.tsx
+index 92c0eb90321d31532651e428eb317695827d4d6d..c2d45f80e4118dacbe799acfe4e1f595c593d984 100644
+--- a/web/src/components/AeVoiceStartButton.tsx
++++ b/web/src/components/AeVoiceStartButton.tsx
+@@ -6,6 +6,7 @@ import { AeHint } from "@/components/AeHint";
+ import { ChevronDownIcon, Volume2Icon } from "lucide-react";
+ import {
+   MicWhileSpeakingRow,
++  VoiceMeterRow,
+   SendVoiceLogRow,
+   SwitchRow,
+   useVoiceChoices,
+@@ -43,6 +44,7 @@ function VoiceStartMenuRows({ armed, onToggle }: { armed: boolean; onToggle: ()
+       />
+       <DropdownMenuSeparator />
+       <MicWhileSpeakingRow />
++      <VoiceMeterRow />
+       <VoiceChoiceRows choices={choices} />
+       <DropdownMenuSeparator />
+       <SendVoiceLogRow />
+diff --git a/web/src/components/ComposerMicButton.meterOff.test.tsx b/web/src/components/ComposerMicButton.meterOff.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..1a1fab2e1488de3052a4dca710192478ba037542
+--- /dev/null
++++ b/web/src/components/ComposerMicButton.meterOff.test.tsx
+@@ -0,0 +1,256 @@
++// @vitest-environment jsdom
++// The level meter setting (omnigent-ae): off on iOS WebKit by default, where a second capture
++// can take the mic from the recognizer. Off means no getUserMedia or AudioContext for the
++// meter, the ring and bars driven by recognizer events, and the stall check on those events.
++import type { AeMicController } from "@/lib/aeVoiceMode";
++import { act, cleanup, render } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { getMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
++import { getVoiceBins, resetVoiceBins } from "@/lib/aeVoiceLevel";
++import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
++import { VOICE_METER_KEY } from "@/lib/aeVoiceMeter";
++import { ComposerMicButton } from "./ComposerMicButton";
++
++type Handlers = Record<string, (event: unknown) => void>;
++const IOS_UA =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
++const CHROME_UA =
++  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
++
++let instances: { handlers: Handlers }[];
++let startSpy: ReturnType<typeof vi.fn>;
++let frames: (() => void)[];
++let getUserMedia: ReturnType<typeof vi.fn>;
++let audioContexts: number;
++let originalUa: PropertyDescriptor | undefined;
++
++class FakeTrack {
++  muted = false;
++  stop = vi.fn();
++  addEventListener() {}
++}
++class FakeStream {
++  track = new FakeTrack();
++  getTracks() {
++    return [this.track];
++  }
++}
++class FakeCtx {
++  state = "running";
++  resume = vi.fn(() => Promise.resolve());
++  close = vi.fn();
++  constructor() {
++    audioContexts += 1;
++  }
++  addEventListener() {}
++  createMediaStreamSource() {
++    return { connect: vi.fn(), disconnect: vi.fn() };
++  }
++  createAnalyser() {
++    return {
++      fftSize: 0,
++      smoothingTimeConstant: 0,
++      frequencyBinCount: 32,
++      getByteFrequencyData: (data: Uint8Array) => data.fill(0),
++    };
++  }
++}
++
++function setUserAgent(ua: string) {
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++}
++
++beforeEach(() => {
++  instances = [];
++  startSpy = vi.fn();
++  frames = [];
++  audioContexts = 0;
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  class FakeRecognition {
++    continuous = false;
++    interimResults = false;
++    lang = "en-US";
++    start = startSpy;
++    stop = vi.fn();
++    abort = vi.fn();
++    own: Handlers = {};
++    constructor() {
++      instances.push({ handlers: this.own });
++    }
++    addEventListener(type: string, handler: (event: unknown) => void) {
++      this.own[type] = handler;
++    }
++    removeEventListener() {}
++  }
++  getUserMedia = vi.fn(() => Promise.resolve(new FakeStream()));
++  vi.stubGlobal("SpeechRecognition", FakeRecognition);
++  vi.stubGlobal("AudioContext", FakeCtx);
++  vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
++    frames.push(cb);
++    return frames.length;
++  });
++  vi.stubGlobal("cancelAnimationFrame", vi.fn());
++  Object.defineProperty(navigator, "mediaDevices", {
++    configurable: true,
++    value: {
++      getUserMedia,
++      enumerateDevices: vi.fn().mockResolvedValue([]),
++      addEventListener: vi.fn(),
++      removeEventListener: vi.fn(),
++    },
++  });
++  vi.useFakeTimers();
++  resetVoiceLog();
++  resetMicLevel();
++  resetVoiceBins();
++  window.localStorage.removeItem(VOICE_METER_KEY);
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++  window.localStorage.removeItem(VOICE_METER_KEY);
++  delete (navigator as { mediaDevices?: unknown }).mediaDevices;
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++async function listenVoice() {
++  const controller = { current: null as AeMicController | null };
++  const onListeningChange = vi.fn();
++  render(
++    <ComposerMicButton
++      onTranscript={vi.fn()}
++      controller={controller}
++      onListeningChange={onListeningChange}
++    />,
++  );
++  act(() => controller.current?.start());
++  await act(async () => {
++    instances[0].handlers.start?.({});
++    instances[0].handlers.audiostart?.({});
++    await vi.advanceTimersByTimeAsync(0);
++  });
++  return { controller, onListeningChange };
++}
++
++/** Animation frames every 100 ms for `ms` of fake time. */
++async function run(ms: number) {
++  for (let t = 0; t < ms; t += 100) {
++    // oxlint-disable-next-line no-await-in-loop -- fake time advances one frame at a time
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(100);
++      for (const cb of frames.splice(0)) cb();
++    });
++  }
++}
++
++function binsSum() {
++  return getVoiceBins().reduce((a, b) => a + b, 0);
++}
++
++describe("ComposerMicButton (level meter off)", () => {
++  it("on an iPhone user agent never opens a second capture or an AudioContext", async () => {
++    setUserAgent(IOS_UA);
++    await listenVoice();
++    await run(1000);
++    expect(getUserMedia).not.toHaveBeenCalled();
++    expect(audioContexts).toBe(0);
++    expect(formatVoiceLog()).toContain("meter off");
++    expect(formatVoiceLog()).not.toContain("meter on");
++  });
++
++  it("publishes synthetic bins and a level from recognizer events, and lets them decay", async () => {
++    setUserAgent(IOS_UA);
++    await listenVoice();
++    await run(300);
++    expect(binsSum()).toBe(0);
++    act(() => instances[0].handlers.speechstart?.({}));
++    await run(500);
++    expect(binsSum()).toBeGreaterThan(0);
++    expect(getMicLevel()).toBeGreaterThan(0.2);
++    act(() => {
++      instances[0].handlers.speechend?.({});
++      instances[0].handlers.soundend?.({});
++    });
++    await run(3000);
++    expect(getMicLevel()).toBeLessThan(0.05);
++  });
++
++  it("has no meter deaf reasons: a quiet take with life from the recognizer is never called deaf", async () => {
++    setUserAgent(IOS_UA);
++    const { onListeningChange } = await listenVoice();
++    await run(20_000);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    const log = formatVoiceLog();
++    for (const reason of ["track muted", "context not running", "analyser silent"]) {
++      expect(log).not.toContain(reason);
++    }
++  });
++
++  it("calls a stall from recognizer events: sound heard, then 3.5 s with no result after it ends", async () => {
++    setUserAgent(IOS_UA);
++    const { controller, onListeningChange } = await listenVoice();
++    act(() => instances[0].handlers.soundstart?.({}));
++    await run(1000);
++    act(() => instances[0].handlers.soundend?.({}));
++    await run(3000);
++    expect(instances).toHaveLength(1);
++    await run(1500);
++    expect(instances).toHaveLength(2);
++    expect(formatVoiceLog()).toContain("mic stalled");
++    expect(onListeningChange).not.toHaveBeenCalledWith(false);
++    expect(controller.current?.isListening()).toBe(true);
++  });
++
++  it("a result before the quiet window ends means no stall, and no sound means none either", async () => {
++    setUserAgent(IOS_UA);
++    await listenVoice();
++    act(() => instances[0].handlers.speechstart?.({}));
++    await run(500);
++    act(() => instances[0].handlers.speechend?.({}));
++    await run(2000);
++    act(() =>
++      instances[0].handlers.result?.({
++        resultIndex: 0,
++        results: { length: 1, 0: { length: 1, isFinal: false, 0: { transcript: "hi" } } },
++      }),
++    );
++    await run(6000);
++    expect(instances).toHaveLength(1);
++    cleanup();
++    instances.length = 0;
++    await listenVoice();
++    await run(8000);
++    expect(instances).toHaveLength(1);
++  });
++
++  it("an explicit On on an iPhone runs the meter; an explicit Off elsewhere does not", async () => {
++    setUserAgent(IOS_UA);
++    window.localStorage.setItem(VOICE_METER_KEY, "on");
++    await listenVoice();
++    expect(getUserMedia).toHaveBeenCalled();
++    expect(formatVoiceLog()).toContain("meter on");
++    cleanup();
++    getUserMedia.mockClear();
++    resetVoiceLog();
++    instances.length = 0;
++    setUserAgent(CHROME_UA);
++    window.localStorage.setItem(VOICE_METER_KEY, "off");
++    await listenVoice();
++    expect(getUserMedia).not.toHaveBeenCalled();
++    expect(formatVoiceLog()).toContain("meter off");
++  });
++});
++
++describe("ComposerMicButton (level meter on elsewhere)", () => {
++  it("a desktop browser keeps the meter: second capture, context and the meter log line", async () => {
++    setUserAgent(CHROME_UA);
++    await listenVoice();
++    await run(300);
++    expect(getUserMedia).toHaveBeenCalled();
++    expect(audioContexts).toBe(1);
++    expect(formatVoiceLog()).toContain("meter on");
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 4f8404a5cc71ee0a4ce183d87d0b30dcb86a4ff3..adb88e7413ac8d247833aca8b7253c1cdf2a12d1 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -6,9 +6,10 @@ import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { getMicStream } from "@/lib/aeAudioDevices";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+-import { publishVoiceBins, resetVoiceBins } from "@/lib/aeVoiceLevel";
++import { publishVoiceBins, resetVoiceBins, syntheticVoiceBins } from "@/lib/aeVoiceLevel";
++import { readVoiceMeter } from "@/lib/aeVoiceMeter";
+ import { logVoice } from "@/lib/aeVoiceLog";
+-import { createStallDetector, isWebKitSpeech } from "@/lib/aeVoiceStall";
++import { createEventStallDetector, createStallDetector, isWebKitSpeech } from "@/lib/aeVoiceStall";
+ import { DictationBusyError, DictationSession } from "@/lib/dictation";
+ import { isElectronShell } from "@/lib/nativeBridge";
+ import { cn } from "@/lib/utils";
+@@ -73,6 +74,8 @@ const BAR_BINS: readonly (readonly [number, number])[] = [
+ ];
+ 
+ const BAR_BASELINE = 0.2;
++// One animation frame never moves the event-driven pulse by more than this (a throttled tab).
++const MAX_PULSE_FRAME_MS = 100;
+ // A Voice mode Web Speech start that fires no start, end or error in this long is given up on.
+ // The first take of the page gets longer: a permission prompt or a slow Bluetooth route is not stuck.
+ const MIC_START_WATCHDOG_MS = 4000;
+@@ -238,6 +241,11 @@ export const ComposerMicButton = ({
+   // Speech energy from the meter against recognizer results: a take that heard the user and
+   // then produced nothing is stalled and gets a fresh recognizer without Voice mode noticing.
+   const stallRef = useRef(createStallDetector());
++  // Without the level meter the recognizer's events are the only signal: a second stall
++  // detector fed by them, and a pulse level they drive for the bars and the ring.
++  const meterOnRef = useRef(true);
++  const eventStallRef = useRef(createEventStallDetector());
++  const pulseTargetRef = useRef(0);
+   const stallTimesRef = useRef<number[]>([]);
+   // Voice mode's assistant is speaking (or just did): the stall detector is off.
+   const assistantAudibleRef = useRef(false);
+@@ -354,6 +362,7 @@ export const ComposerMicButton = ({
+       recognizerSoundSeenRef.current = false;
+       lastRecognizerActivityRef.current = Date.now();
+       stallRef.current.reset(Date.now());
++      eventStallRef.current.reset(Date.now());
+       try {
+         next.start();
+       } catch {
+@@ -389,19 +398,24 @@ export const ComposerMicButton = ({
+         reportDeaf("no audiostart");
+         return;
+       }
+-      // Speech heard, then quiet, and no result since: the recognizer stalled.
++      // Speech heard, then quiet, and no result since: the recognizer stalled. With the meter
++      // off the recognizer's own events say so (soundstart, then soundend and a quiet spell).
+       // (armLiveness already refuses a take whose permission is in doubt.)
+       if (
+         !assistantAudibleRef.current &&
+         now >= audibleUntilRef.current &&
+-        now - meterTickRef.current <= MIC_METER_FRESH_MS
++        (!meterOnRef.current || now - meterTickRef.current <= MIC_METER_FRESH_MS)
+       ) {
+-        const stalledFor = stallRef.current.evaluate(now);
++        const stalledFor = meterOnRef.current
++          ? stallRef.current.evaluate(now)
++          : eventStallRef.current.evaluate(now);
+         if (stalledFor !== null) {
+           handleStall(stalledFor, now);
+           return;
+         }
+       }
++      // No meter, no meter-based deaf reasons (track muted, context stalled, analyser zeros).
++      if (!meterOnRef.current) return;
+       // The meter never decides alone: it counts only after the recognizer itself has shown
+       // no activity for a while (an early soundstart does not switch the checks off for good).
+       if (now - lastRecognizerActivityRef.current < MIC_RECOGNIZER_QUIET_MS) return;
+@@ -526,30 +540,45 @@ export const ComposerMicButton = ({
+       const handleAudioStart = () => {
+         if (!current()) return;
+         logVoice("mic event audiostart");
++        pulseTargetRef.current = Math.max(pulseTargetRef.current, 0.2);
+         audioStartSeenRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+       };
+       const handleSoundStart = () => {
+         if (!current()) return;
+         logVoice("mic event soundstart");
++        pulseTargetRef.current = 0.5;
++        eventStallRef.current.heard(Date.now());
+         recognizerSoundSeenRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+       };
+       const handleSpeechStart = () => {
+         if (!current()) return;
+         logVoice("mic event speechstart");
++        pulseTargetRef.current = 0.8;
++        eventStallRef.current.heard(Date.now());
+         recognizerSoundSeenRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+       };
+       const handleAudioEnd = () => {
+         if (!current()) return;
+         logVoice("mic event audioend");
++        pulseTargetRef.current = 0;
+         stallRef.current.speechEnd(Date.now());
++        eventStallRef.current.ended(Date.now());
+       };
+       const handleSpeechEnd = () => {
+         if (!current()) return;
+         logVoice("mic event speechend");
++        pulseTargetRef.current = 0.2;
+         stallRef.current.speechEnd(Date.now());
++        eventStallRef.current.ended(Date.now());
++      };
++      const handleSoundEnd = () => {
++        if (!current()) return;
++        logVoice("mic event soundend");
++        pulseTargetRef.current = 0;
++        eventStallRef.current.ended(Date.now());
+       };
+       const handleResult = (event: Event) => {
+         if (!current()) return;
+@@ -557,6 +586,8 @@ export const ComposerMicButton = ({
+         resultSinceStopRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+         stallRef.current.result(Date.now());
++        eventStallRef.current.result(Date.now());
++        pulseTargetRef.current = 0.65;
+         // Drop late events that arrive after the composer went disabled, or after
+         // an Esc discard the parent has already reverted.
+         if (disabledRef.current || discardingRef.current) return;
+@@ -602,6 +633,7 @@ export const ComposerMicButton = ({
+       recognition.addEventListener("speechstart", handleSpeechStart);
+       recognition.addEventListener("audioend", handleAudioEnd);
+       recognition.addEventListener("speechend", handleSpeechEnd);
++      recognition.addEventListener("soundend", handleSoundEnd);
+       detachers.set(recognition, () => {
+         recognition.removeEventListener("start", handleStart);
+         recognition.removeEventListener("end", handleEnd);
+@@ -612,6 +644,7 @@ export const ComposerMicButton = ({
+         recognition.removeEventListener("speechstart", handleSpeechStart);
+         recognition.removeEventListener("audioend", handleAudioEnd);
+         recognition.removeEventListener("speechend", handleSpeechEnd);
++        recognition.removeEventListener("soundend", handleSoundEnd);
+       });
+       return recognition;
+     };
+@@ -717,6 +750,45 @@ export const ComposerMicButton = ({
+   // hides its audio buffer. Chrome batches the permission to one prompt.
+   useEffect(() => {
+     if (!isListening) return;
++    const meterOn = readVoiceMeter();
++    meterOnRef.current = meterOn;
++    logVoice(meterOn ? "meter on" : "meter off");
++    if (!meterOn) {
++      // No second capture: iOS WebKit lets the newest one win, which would take the mic from
++      // the recognizer. The bars and the ring follow the recognizer's events instead.
++      const bars = barRefs.current;
++      let level = 0;
++      let rafId: number | null = null;
++      let last = Date.now();
++      pulseTargetRef.current = 0;
++      const tick = () => {
++        const now = Date.now();
++        const dt = Math.min(MAX_PULSE_FRAME_MS, Math.max(0, now - last));
++        last = now;
++        const target = pulseTargetRef.current;
++        // Quick attack, slow decay; the target itself falls back to rest after a beat.
++        level += (target - level) * (1 - Math.exp(-dt / (target > level ? 60 : 220)));
++        pulseTargetRef.current = Math.max(0, target - dt / 900);
++        for (let i = 0; i < BAR_BINS.length; i += 1) {
++          const wobble = 0.8 + 0.2 * Math.sin(now / 130 + i * 1.9);
++          const scale = Math.max(BAR_BASELINE, Math.min(1, level * wobble * 1.4));
++          const el = bars[i];
++          if (el) el.style.transform = `scaleY(${scale})`;
++        }
++        publishMicLevel(level);
++        publishVoiceBins(syntheticVoiceBins(level, now));
++        rafId = requestAnimationFrame(tick);
++      };
++      rafId = requestAnimationFrame(tick);
++      return () => {
++        if (rafId !== null) cancelAnimationFrame(rafId);
++        resetMicLevel();
++        resetVoiceBins();
++        for (const el of bars) {
++          if (el) el.style.transform = `scaleY(${BAR_BASELINE})`;
++        }
++      };
++    }
+     let cancelled = false;
+     let stream: MediaStream | null = null;
+     let audioCtx: AudioContext | null = null;
+@@ -1100,6 +1172,7 @@ export const ComposerMicButton = ({
+         browserStartPendingRef.current = true;
+         silentStartRef.current = false;
+         stallRef.current.reset(Date.now());
++        eventStallRef.current.reset(Date.now());
+         recognition.start();
+       }
+     } catch {
+@@ -1254,6 +1327,7 @@ export const ComposerMicButton = ({
+         // Both edges forget what the meter heard: playback energy is not the user's speech.
+         if (!audible) audibleUntilRef.current = now + MIC_STALL_AUDIBLE_TAIL_MS;
+         stallRef.current.reset(now);
++        eventStallRef.current.reset(now);
+       },
+     };
+     return () => {
+diff --git a/web/src/components/blocks/ApprovalCard.test.tsx b/web/src/components/blocks/ApprovalCard.test.tsx
+index 1f0b3e4df9efefdc9595ab8c399a4baf6ad53edb..da968d67d52c4a5ce0a5dd0ee223efd759cd585c 100644
+--- a/web/src/components/blocks/ApprovalCard.test.tsx
++++ b/web/src/components/blocks/ApprovalCard.test.tsx
+@@ -198,9 +198,14 @@ describe("ApprovalCard — binary approve/reject", () => {
+ 
+     fireEvent.click(rememberButton);
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_cmd_policy", "accept", {
+-      execpolicy_amendment: [".venv/bin/python", "-m", "pytest"],
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_cmd_policy",
++      "accept",
++      {
++        execpolicy_amendment: [".venv/bin/python", "-m", "pytest"],
++      },
++      { source: "card" },
++    );
+   });
+ });
+ 
+@@ -255,9 +260,14 @@ describe("ApprovalCard — approve & switch to auto mode", () => {
+     render(<ElicitationCard item={item} />);
+     fireEvent.click(screen.getByRole("button", { name: /approve & switch to auto mode/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(props.elicitationId, "accept", {
+-      allow_auto_mode: true,
+-    });
++    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(
++      props.elicitationId,
++      "accept",
++      {
++        allow_auto_mode: true,
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("keeps ordinary approval and rejection separate from the mode switch", () => {
+@@ -382,9 +392,14 @@ describe("ApprovalCard — accept & allow all edits", () => {
+ 
+     fireEvent.click(screen.getByRole("button", { name: /accept & allow all edits/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_edit_click", "accept", {
+-      allow_all_edits: true,
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_edit_click",
++      "accept",
++      {
++        allow_all_edits: true,
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("renders the auto-accepting-edits label in the responded state", () => {
+@@ -508,9 +523,14 @@ describe("ApprovalCard — approve & don't ask again (persistent allow rule)", (
+ 
+     fireEvent.click(screen.getByTestId("approval-card-remember"));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_wf_click", "accept", {
+-      remember: true,
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_wf_click",
++      "accept",
++      {
++        remember: true,
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("renders the won't-ask-again label in the responded state", () => {
+@@ -640,7 +660,12 @@ describe("ApprovalCard — multi-choice options", () => {
+ 
+     fireEvent.click(screen.getByRole("button", { name: "Beta" }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_pick", "accept", { answer: "Beta" });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_pick",
++      "accept",
++      { answer: "Beta" },
++      { source: "card" },
++    );
+   });
+ 
+   it("renders 'Selected: <label>' on the responded card when content carries an answer", () => {
+@@ -811,9 +836,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)",
+     fireEvent.click(screen.getByLabelText("Vue"));
+     fireEvent.click(screen.getByRole("button", { name: /submit/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_submit", "accept", {
+-      "Which framework?": "Vue",
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_submit",
++      "accept",
++      {
++        "Which framework?": "Vue",
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("submits structured question answers keyed by id when present", () => {
+@@ -853,9 +883,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)",
+     fireEvent.click(screen.getByLabelText("React"));
+     fireEvent.click(screen.getByRole("button", { name: /submit/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_codex_id", "accept", {
+-      framework: "React",
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_codex_id",
++      "accept",
++      {
++        framework: "React",
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("labels Codex structured input prompts as Codex prompts", () => {
+@@ -975,9 +1010,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)",
+     fireEvent.click(screen.getByLabelText("Pretzels"));
+     fireEvent.click(screen.getByRole("button", { name: /submit/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_multi_submit", "accept", {
+-      "Pick snacks": ["Popcorn", "Pretzels"],
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_multi_submit",
++      "accept",
++      {
++        "Pick snacks": ["Popcorn", "Pretzels"],
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("prefers the server-stamped askUserQuestion payload over content_preview", () => {
+@@ -1130,9 +1170,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)",
+     });
+     fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_custom_single", "accept", {
+-      "Which framework?": "Solid",
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_custom_single",
++      "accept",
++      {
++        "Which framework?": "Solid",
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("appends custom-text answer to multi-select checkbox selections", () => {
+@@ -1163,9 +1208,14 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)",
+     });
+     fireEvent.click(screen.getByTestId("ask-user-question-submit"));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_custom_multi", "accept", {
+-      "Pick snacks": ["Popcorn", "Chips"],
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_custom_multi",
++      "accept",
++      {
++        "Pick snacks": ["Popcorn", "Chips"],
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("auto-checks the custom radio when the user starts typing", () => {
+@@ -1342,9 +1392,14 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
+ 
+     fireEvent.click(screen.getByRole("button", { name: /yes, and use auto mode/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_plan_auto", "accept", {
+-      allow_all_edits: true,
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_plan_auto",
++      "accept",
++      {
++        allow_all_edits: true,
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("submits a plain accept for 'Yes, manually approve edits'", () => {
+@@ -1367,7 +1422,9 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
+     fireEvent.click(screen.getByRole("button", { name: /yes, manually approve edits/i }));
+ 
+     // Third arg is the content slot — explicitly undefined (no flags).
+-    expect(submitSpy).toHaveBeenCalledWith("elic_plan_manual", "accept", undefined);
++    expect(submitSpy).toHaveBeenCalledWith("elic_plan_manual", "accept", undefined, {
++      source: "card",
++    });
+   });
+ 
+   it("reveals a feedback textarea and submits decline with the typed feedback", () => {
+@@ -1393,9 +1450,14 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
+     fireEvent.change(textarea, { target: { value: "Use a feature flag instead." } });
+     fireEvent.click(screen.getByRole("button", { name: /reject plan/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_plan_reject", "decline", {
+-      feedback: "Use a feature flag instead.",
+-    });
++    expect(submitSpy).toHaveBeenCalledWith(
++      "elic_plan_reject",
++      "decline",
++      {
++        feedback: "Use a feature flag instead.",
++      },
++      { source: "card" },
++    );
+   });
+ 
+   it("submits a plain decline when the feedback is left empty", () => {
+@@ -1420,7 +1482,9 @@ describe("ApprovalCard — ExitPlanMode plan review", () => {
+     });
+     fireEvent.click(screen.getByRole("button", { name: /reject plan/i }));
+ 
+-    expect(submitSpy).toHaveBeenCalledWith("elic_plan_reject_bare", "decline", undefined);
++    expect(submitSpy).toHaveBeenCalledWith("elic_plan_reject_bare", "decline", undefined, {
++      source: "card",
++    });
+   });
+ 
+   it("renders plan-specific responded labels and echoes rejection feedback", () => {
+@@ -1811,9 +1875,14 @@ describe("ApprovalCard — AE single-choice form shows one button per choice", (
+     expect(screen.queryByRole("button", { name: /submit|reject/i })).toBeNull();
+ 
+     fireEvent.click(continueBtn);
+-    expect(submitSpy).toHaveBeenCalledExactlyOnceWith("elic_confirm", "accept", {
+-      "Confirm the operation": "Yes",
+-    });
++    expect(submitSpy).toHaveBeenCalledExactlyOnceWith(
++      "elic_confirm",
++      "accept",
++      {
++        "Confirm the operation": "Yes",
++      },
++      { source: "card" },
++    );
+   });
+ 
+   const renderChoice = (schema: Record<string, unknown>, submitSpy = vi.fn()) => {
+@@ -1858,7 +1927,7 @@ describe("ApprovalCard — AE single-choice form shows one button per choice", (
+     const spy = renderChoice(envSchema());
+     expect(screen.getByRole("button", { name: "dev" })).toBeDefined();
+     fireEvent.click(screen.getByRole("button", { name: "Reject" }));
+-    expect(spy).toHaveBeenCalledExactlyOnceWith("elic_c", "decline", undefined);
++    expect(spy).toHaveBeenCalledExactlyOnceWith("elic_c", "decline", undefined, { source: "card" });
+   });
+ 
+   it("shows no Reject for a Yes/No confirmation", () => {
+@@ -1878,7 +1947,12 @@ describe("ApprovalCard — AE single-choice form shows one button per choice", (
+     const dev = screen.getByRole("button", { name: "dev" });
+     fireEvent.click(dev);
+     fireEvent.click(dev);
+-    expect(spy).toHaveBeenCalledExactlyOnceWith("elic_c", "accept", { Env: "dev" });
++    expect(spy).toHaveBeenCalledExactlyOnceWith(
++      "elic_c",
++      "accept",
++      { Env: "dev" },
++      { source: "card" },
++    );
+     expect(screen.getByRole("button", { name: "prod" }).hasAttribute("disabled")).toBe(true);
+     expect(screen.getByRole("button", { name: "Reject" }).hasAttribute("disabled")).toBe(true);
+   });
+diff --git a/web/src/components/blocks/ApprovalCard.tsx b/web/src/components/blocks/ApprovalCard.tsx
+index dc117b0eb5e5773d718dd432b30de655430e43ca..b000b29717019b313a465d221438bedb0cf7eea7 100644
+--- a/web/src/components/blocks/ApprovalCard.tsx
++++ b/web/src/components/blocks/ApprovalCard.tsx
+@@ -47,6 +47,7 @@ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+ import { Button } from "@/components/ui/button";
+ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
+ import { useDescendantSession } from "@/hooks/useChildSessions";
++import { withApprovalSource } from "@/lib/aeApprovalSource";
+ import { aeChoiceField, aeShortChoiceLabels } from "@/lib/aeChoiceButtons";
+ import { parseAeSlotsFull } from "@/lib/aeSlotsFull";
+ import {
+@@ -271,14 +272,13 @@ export function ApprovalCard({
+     onSubmit ??
+     ((id, action, content, meta) => {
+       const store = useChatStore.getState();
+-      // Keep the exact call shape for the main chat (no scope); pass the child
+-      // id only when scoped so a side-chat verdict targets the child.
++      // The card is the source of every verdict it submits (the server logs it).
++      const withSource = withApprovalSource("card", meta);
++      // Pass the child id only when scoped so a side-chat verdict targets the child.
+       if (scopedConversationId) {
+-        void store.submitApproval(id, action, content, meta, scopedConversationId);
+-      } else if (meta === undefined) {
+-        void store.submitApproval(id, action, content);
++        void store.submitApproval(id, action, content, withSource, scopedConversationId);
+       } else {
+-        void store.submitApproval(id, action, content, meta);
++        void store.submitApproval(id, action, content, withSource);
+       }
+     });
+   const submitBinary = (action: "accept" | "decline") => {
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index ea2774ce06721e0121cbb135f5abb046eba0f3c4..8af03511e9b180280e4ef4729b7c3018df78beca 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -441,9 +441,14 @@ describe("useAeVoiceMode", () => {
+       used = result.current.onFinal("option two");
+     });
+     expect(used).toBe(true);
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "How should it deploy?": "Let the timer do it",
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "How should it deploy?": "Let the timer do it",
++      },
++      { source: "voice" },
++    );
+     expect(submit).not.toHaveBeenCalled();
+   });
+ 
+@@ -453,9 +458,14 @@ describe("useAeVoiceMode", () => {
+     act(() => void result.current.onFinal("ask me tomorrow"));
+     expect(submitApproval).not.toHaveBeenCalled();
+     act(() => void vi.advanceTimersByTime(GRACE_MS));
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "How should it deploy?": "ask me tomorrow",
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "How should it deploy?": "ask me tomorrow",
++      },
++      { source: "voice" },
++    );
+   });
+ 
+   it("never answers a card on silence", () => {
+@@ -479,9 +489,14 @@ describe("useAeVoiceMode", () => {
+     act(() => void result.current.onFinal("three"));
+     expect(submitApproval).not.toHaveBeenCalled();
+     act(() => void result.current.onFinal("done"));
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "How should it deploy?": ["Force it", "Hold it"],
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "How should it deploy?": ["Force it", "Hold it"],
++      },
++      { source: "voice" },
++    );
+   });
+ 
+   it("stays out of the way when off", () => {
+@@ -640,9 +655,14 @@ describe("useAeVoiceMode", () => {
+     act(() => void vi.advanceTimersByTime(10_000));
+     expect(submitApproval).not.toHaveBeenCalled();
+     act(() => void result.current.onFinal("hold it"));
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "How should it deploy?": "Hold it",
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "How should it deploy?": "Hold it",
++      },
++      { source: "voice" },
++    );
+   });
+ 
+   it("a card answered by a click leaves the pending custom answer inert", () => {
+@@ -668,9 +688,14 @@ describe("useAeVoiceMode", () => {
+       act(() => void result.current.onFinal("one"));
+       act(() => void result.current.onFinal("three"));
+       act(() => void result.current.onFinal(ending));
+-      expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-        "How should it deploy?": ["Force it", "Hold it"],
+-      });
++      expect(submitApproval).toHaveBeenCalledWith(
++        "e1",
++        "accept",
++        {
++          "How should it deploy?": ["Force it", "Hold it"],
++        },
++        { source: "voice" },
++      );
+     },
+   );
+ 
+@@ -694,10 +719,15 @@ describe("useAeVoiceMode", () => {
+     act(() => void vi.advanceTimersByTime(50));
+     expect(synth.texts().at(-1)).toBe("Question. Which branch? One, Main. Two, Dev.");
+     act(() => void result.current.onFinal("dev"));
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "How should it deploy?": "Force it",
+-      "Which branch?": "Dev",
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "How should it deploy?": "Force it",
++        "Which branch?": "Dev",
++      },
++      { source: "voice" },
++    );
+   });
+ 
+   it("posts the switch when the session's label disagrees with it", () => {
+@@ -750,9 +780,14 @@ describe("useAeVoiceMode", () => {
+     useChatStore.setState({ blocks: [three] } as never);
+     const { result } = mount();
+     act(() => void result.current.onFinal("one and three, I'm done"));
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "How should it deploy?": ["Force it", "Hold it"],
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "How should it deploy?": ["Force it", "Hold it"],
++      },
++      { source: "voice" },
++    );
+   });
+ 
+   it("makes the start again when the mic is wanted before its own stop has finished", () => {
+@@ -789,9 +824,14 @@ describe("useAeVoiceMode", () => {
+     useChatStore.setState({ blocks: [labelled] } as never);
+     const { result } = mount();
+     act(() => void result.current.onFinal("merge it done"));
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", {
+-      "What now?": ["Merge it"],
+-    });
++    expect(submitApproval).toHaveBeenCalledWith(
++      "e1",
++      "accept",
++      {
++        "What now?": ["Merge it"],
++      },
++      { source: "voice" },
++    );
+   });
+ 
+   describe("an approval card without a question", () => {
+@@ -824,14 +864,14 @@ describe("useAeVoiceMode", () => {
+         used = result.current.onFinal(said);
+       });
+       expect(used).toBe(true);
+-      expect(submitApproval).toHaveBeenCalledWith("a1", "accept");
++      expect(submitApproval).toHaveBeenCalledWith("a1", "accept", undefined, { source: "voice" });
+       expect(submit).not.toHaveBeenCalled();
+     });
+ 
+     it.each(["decline", "no", "cancel"])("declines when %s is said", (said) => {
+       const { result } = mountApproval();
+       act(() => void result.current.onFinal(said));
+-      expect(submitApproval).toHaveBeenCalledWith("a1", "decline");
++      expect(submitApproval).toHaveBeenCalledWith("a1", "decline", undefined, { source: "voice" });
+     });
+ 
+     it("ignores talk that is not an answer and never sends it as a message", () => {
+@@ -884,7 +924,7 @@ describe("useAeVoiceMode", () => {
+       act(() => void vi.advanceTimersByTime(8100));
+       act(() => void result.current.onFinal("run it"));
+       expect(submitApproval).toHaveBeenCalledTimes(1);
+-      expect(submitApproval).toHaveBeenCalledWith("a2", "accept");
++      expect(submitApproval).toHaveBeenCalledWith("a2", "accept", undefined, { source: "voice" });
+     });
+ 
+     it("submits once when the same answer arrives twice", () => {
+@@ -947,6 +987,31 @@ describe("useAeVoiceMode", () => {
+       expect(result.current.micDetail).toBe(MIC_DEAF_DETAIL);
+     });
+ 
++    it("answerApproval resolves the pending card once, with the panel as its source, while the line speaks", () => {
++      const { result } = mountApproval();
++      act(() => setVoiceSpeaking("c1", true));
++      act(() => result.current.answerApproval("accept"));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++      expect(submitApproval).toHaveBeenCalledWith("a1", "accept", undefined, {
++        source: "voice_panel",
++      });
++      act(() => result.current.answerApproval("decline"));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++    });
++
++    it("answerApproval declines with the panel as its source and does nothing with no card", () => {
++      const { result } = mountApproval();
++      act(() => result.current.answerApproval("decline"));
++      expect(submitApproval).toHaveBeenCalledWith("a1", "decline", undefined, {
++        source: "voice_panel",
++      });
++      act(() => useChatStore.setState({ blocks: [] } as never));
++      submitApproval.mockClear();
++      act(() => result.current.answerApproval("accept"));
++      expect(submitApproval).not.toHaveBeenCalled();
++    });
++
+     it("leaves the approval phase when the card is answered", () => {
+       mountApproval();
+       act(() => {
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 6777b46b58ffd8c0a4a72c0801c8a8816b981364..948c32585ac0bc0760ff6fd99ec482ee0afc0acf 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -27,7 +27,8 @@ import {
+   type VoicePhase,
+ } from "@/lib/aeVoiceMode";
+ import { activeEchoWords, resetEcho, splitEcho } from "@/lib/aeVoiceEcho";
+-import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
++import { withApprovalSource } from "@/lib/aeApprovalSource";
++import { logVoice, uploadVoiceLog, useVoiceLogOnHide } from "@/lib/aeVoiceLog";
+ import { useMicWhileSpeaking } from "@/lib/aeVoiceMic";
+ import { useChatStore } from "@/store/chatStore";
+ 
+@@ -65,6 +66,8 @@ export interface AeVoiceMode {
+   cardActive: boolean;
+   /** A yes-or-no card (such as the session limit) waits for a spoken answer; the mic stays live. */
+   approvalActive: boolean;
++  /** The panel's Run it / Decline buttons: resolves the pending yes-or-no card. */
++  answerApproval: (action: "accept" | "decline") => void;
+   /** Why the mic is unavailable, when Voice mode knows ("" otherwise). */
+   micDetail: string | null;
+   /** A final sentence arrived; true when Voice mode used it (the draft should not take it). */
+@@ -197,6 +200,7 @@ export function useAeVoiceMode({
+   // The voice log goes to the server with the chat it belongs to (see uploadVoiceLog).
+   const chatIdRef = useRef(chatId);
+   chatIdRef.current = chatId;
++  useVoiceLogOnHide(on, () => chatIdRef.current);
+ 
+   const clearGrace = useCallback(() => {
+     if (graceTimer.current !== null) clearTimeout(graceTimer.current);
+@@ -545,7 +549,9 @@ export function useAeVoiceMode({
+       );
+       return;
+     }
+-    void useChatStore.getState().submitApproval(state.id, "accept", state.answers);
++    void useChatStore
++      .getState()
++      .submitApproval(state.id, "accept", state.answers, withApprovalSource("voice"));
+   }, []);
+ 
+   const onCardFinal = useCallback(
+@@ -673,7 +679,9 @@ export function useAeVoiceMode({
+             approvalAnswered.current.add(id);
+             logVoice("approval answer", verdict);
+             clearGrace();
+-            void useChatStore.getState().submitApproval(id, verdict);
++            void useChatStore
++              .getState()
++              .submitApproval(id, verdict, undefined, withApprovalSource("voice"));
+           }
+         }
+         return true;
+@@ -710,11 +718,26 @@ export function useAeVoiceMode({
+     [on, clearGrace],
+   );
+ 
++  const answerApproval = useCallback(
++    (action: "accept" | "decline") => {
++      const pending = latest.current.approval;
++      if (!pending || approvalAnswered.current.has(pending.id)) return;
++      approvalAnswered.current.add(pending.id);
++      logVoice("approval answer", `${action} panel`);
++      clearGrace();
++      void useChatStore
++        .getState()
++        .submitApproval(pending.id, action, undefined, withApprovalSource("voice_panel"));
++    },
++    [clearGrace],
++  );
++
+   return {
+     on,
+     phase: voice.phase,
+     cardActive,
+     approvalActive,
++    answerApproval,
+     micDetail,
+     filterHeard,
+     bargeIn,
+diff --git a/web/src/hooks/useAeVoiceStart.test.ts b/web/src/hooks/useAeVoiceStart.test.ts
+index bc2f95553371bceba07d0df23d20ecbee3bc2202..f747f08330506bc018c58087f1b1abe244d11424 100644
+--- a/web/src/hooks/useAeVoiceStart.test.ts
++++ b/web/src/hooks/useAeVoiceStart.test.ts
+@@ -251,6 +251,39 @@ describe("useAeVoiceStart voice log upload", () => {
+     expect(reasons().map((r) => r.reason)).toEqual(["mic_deaf"]);
+   });
+ 
++  it("a stop reported synchronously by the release does not upload mic_failed", () => {
++    const { result, mic, submit } = setup();
++    // The controller reports not-listening from inside its own stop(), as a browser can.
++    mic.stop.mockImplementation(() => result.current.onListening(false));
++    act(() => result.current.toggle());
++    act(() => result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS));
++    expect(submit).toHaveBeenCalledTimes(1);
++    expect(mic.stop).toHaveBeenCalled();
++    expect(reasons()).toEqual([]);
++  });
++
++  it("a stale onListening(false) after the user ended it uploads only the voice_end", () => {
++    const { result, mic } = setup();
++    mic.stop.mockImplementation(() => result.current.onListening(false));
++    act(() => result.current.toggle());
++    act(() => result.current.toggle());
++    expect(reasons().map((r) => r.reason)).toEqual(["voice_end"]);
++  });
++
++  it("arming again after a release listens to the mic once more", async () => {
++    const { result } = setup();
++    act(() => result.current.toggle());
++    act(() => result.current.toggle());
++    // The upload budget is shared: let the voice_end one's minute pass.
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(60_000);
++    });
++    act(() => result.current.toggle());
++    act(() => result.current.onListening(false));
++    expect(reasons().map((r) => r.reason)).toContain("mic_failed");
++  });
++
+   it("sends the log when the held message gives up waiting for the chat", () => {
+     const { result } = setup({ canSubmit: false });
+     act(() => result.current.toggle());
+diff --git a/web/src/hooks/useAeVoiceStart.ts b/web/src/hooks/useAeVoiceStart.ts
+index e086a5ae724b471587945ec655ff2e729d25edbf..711490ecfb54ec49ddeb08ca9b7e958e3f38df15 100644
+--- a/web/src/hooks/useAeVoiceStart.ts
++++ b/web/src/hooks/useAeVoiceStart.ts
+@@ -4,7 +4,7 @@
+ 
+ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
+ import { primeVoicePlayback } from "@/lib/aeSpeakReplies";
+-import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
++import { logVoice, uploadVoiceLog, useVoiceLogOnHide } from "@/lib/aeVoiceLog";
+ import {
+   type AeMicController,
+   armVoiceForNextChat,
+@@ -57,6 +57,9 @@ export function useAeVoiceStart({
+   const [phase, setPhase] = useState<VoicePhase>("off");
+   const [micDetail, setMicDetail] = useState<string | null>(null);
+   const everListened = useRef(false);
++  // Set by release(): the controller's own stop() may report not-listening at once, and that
++  // is the end of the take, not a mic that failed to start.
++  const released = useRef(false);
+   const deafStreak = useRef(0);
+   const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+@@ -75,6 +78,7 @@ export function useAeVoiceStart({
+   // After a submit the module flag stays set: the session is created asynchronously and
+   // takeVoiceArm reads it once the id is known.
+   const release = useCallback(() => {
++    released.current = true;
+     clearTimer();
+     clearRetry();
+     setArmed(false);
+@@ -95,7 +99,7 @@ export function useAeVoiceStart({
+ 
+   const onListening = useCallback(
+     (listening: boolean, reason?: "deaf") => {
+-      if (!armed) return;
++      if (!armed || released.current) return;
+       // A held message that is waiting for the chat keeps its own word on screen.
+       const held = (p: VoicePhase) => p === "preparing" || p === "stalled";
+       if (listening) {
+@@ -150,6 +154,7 @@ export function useAeVoiceStart({
+     // Inside the tap, so the browser lets the reply play later.
+     primeVoicePlayback();
+     armVoiceForNextChat();
++    released.current = false;
+     everListened.current = false;
+     deafStreak.current = 0;
+     setMicDetail(null);
+@@ -215,6 +220,8 @@ export function useAeVoiceStart({
+     [armed, clearTimer, release],
+   );
+ 
++  useVoiceLogOnHide(armed, () => null);
++
+   // Leaving the page must not leave the next chat armed.
+   useEffect(
+     () => () => {
+diff --git a/web/src/hooks/useApproveHotkey.test.tsx b/web/src/hooks/useApproveHotkey.test.tsx
+index 1281f57a6f5ec058d581f0240ec112a717706f5e..557b97335f254e8e25e021c06c310b844812b411 100644
+--- a/web/src/hooks/useApproveHotkey.test.tsx
++++ b/web/src/hooks/useApproveHotkey.test.tsx
+@@ -57,7 +57,7 @@ describe("useApproveHotkey", () => {
+     renderHook(() => useApproveHotkey(true));
+     press();
+     expect(submitApproval).toHaveBeenCalledTimes(1);
+-    expect(submitApproval).toHaveBeenCalledWith("own", "accept");
++    expect(submitApproval).toHaveBeenCalledWith("own", "accept", undefined, { source: "hotkey" });
+     submitApproval.mockClear();
+     blocks = [blocks[1]];
+     press();
+@@ -90,21 +90,21 @@ describe("useApproveHotkey", () => {
+     blocks = [{ ...pending, requestedSchema: { type: "object" } }];
+     renderHook(() => useApproveHotkey(true));
+     press();
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", undefined, { source: "hotkey" });
+   });
+ 
+   it("Cmd+Enter accepts the pending approval (macOS)", () => {
+     blocks = [pending];
+     renderHook(() => useApproveHotkey(true));
+     press();
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", undefined, { source: "hotkey" });
+   });
+ 
+   it("Ctrl+Enter accepts on Windows/Linux", () => {
+     blocks = [pending];
+     renderHook(() => useApproveHotkey(false));
+     press({ ctrlKey: true });
+-    expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
++    expect(submitApproval).toHaveBeenCalledWith("e1", "accept", undefined, { source: "hotkey" });
+   });
+ 
+   it("ignores Ctrl+Enter on macOS (only ⌘↵ fires there)", () => {
+@@ -122,7 +122,7 @@ describe("useApproveHotkey", () => {
+     ];
+     renderHook(() => useApproveHotkey(true));
+     press();
+-    expect(submitApproval).toHaveBeenCalledWith("new", "accept");
++    expect(submitApproval).toHaveBeenCalledWith("new", "accept", undefined, { source: "hotkey" });
+   });
+ 
+   it("ignores already-responded prompts", () => {
+@@ -214,7 +214,7 @@ describe("useApproveHotkey", () => {
+           cancelable: true,
+         }),
+       );
+-      expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
++      expect(submitApproval).toHaveBeenCalledWith("e1", "accept", undefined, { source: "hotkey" });
+     } finally {
+       box.remove();
+     }
+@@ -236,7 +236,7 @@ describe("useApproveHotkey", () => {
+           cancelable: true,
+         }),
+       );
+-      expect(submitApproval).toHaveBeenCalledWith("e1", "accept");
++      expect(submitApproval).toHaveBeenCalledWith("e1", "accept", undefined, { source: "hotkey" });
+     } finally {
+       ta.remove();
+     }
+diff --git a/web/src/hooks/useApproveHotkey.ts b/web/src/hooks/useApproveHotkey.ts
+index d31166278fea73898a0cbd7f8dd564970e3a15fe..ce9d3b20eefbaf83ce3b79a361399eb494121d57 100644
+--- a/web/src/hooks/useApproveHotkey.ts
++++ b/web/src/hooks/useApproveHotkey.ts
+@@ -28,6 +28,7 @@ import { schemaFields } from "@/components/blocks/ElicitationSchemaForm";
+ import { hasCommandModifier, isMacPlatform } from "@/lib/hotkeys";
+ import type { ElicitationBlock } from "@/lib/blocks";
+ import { useChatStore } from "@/store/chatStore";
++import { withApprovalSource } from "@/lib/aeApprovalSource";
+ 
+ /**
+  * Whether the keystroke landed in a text field that holds a draft — the
+@@ -89,7 +90,7 @@ export function useApproveHotkey(isMac = isMacPlatform()): void {
+       // Intercept before the composer's Enter-to-send handler runs.
+       e.preventDefault();
+       e.stopPropagation();
+-      void submitApproval(pending.elicitationId, "accept");
++      void submitApproval(pending.elicitationId, "accept", undefined, withApprovalSource("hotkey"));
+     };
+ 
+     window.addEventListener("keydown", handler, true);
+diff --git a/web/src/lib/aeApprovalSource.ts b/web/src/lib/aeApprovalSource.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1c29ba6de23f3e13f23072b10cc62a7c3eb8be5
+--- /dev/null
++++ b/web/src/lib/aeApprovalSource.ts
+@@ -0,0 +1,23 @@
++// Who resolved an approval card (omnigent-ae). Each client caller of submitApproval passes one
++// of these in the resolve body's `_meta.source`; the server logs it next to the verdict so a
++// card that resolved by itself can be traced to the control that did it. The server accepts
++// only these values and logs anything else as "unknown".
++
++export const APPROVAL_SOURCES = [
++  "card",
++  "voice",
++  "voice_panel",
++  "hotkey",
++  "inbox",
++  "approve_page",
++] as const;
++
++export type ApprovalSource = (typeof APPROVAL_SOURCES)[number];
++
++/** `meta` with the source added; a source the caller already set is overwritten. */
++export function withApprovalSource(
++  source: ApprovalSource,
++  meta?: Record<string, unknown>,
++): Record<string, unknown> {
++  return { ...(meta ?? {}), source };
++}
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 7d790d29b4f8b04fe5bd01e001def53701020d6a..6aa84794828b35f7a355b92c5ab26a598fc237a7 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -270,6 +270,11 @@ export const AE_SETTING_HINTS = {
+     hint: "On: the mic stays open while a reply plays; speaking stops it, as does Ctrl+Alt+V (Cmd+Opt+V on Mac). Default: off. Per device.",
+     source: "tooltip",
+   },
++  "voice.meter": {
++    label: "Level meter",
++    hint: "Draws live mic levels. On iPhone it can stop the mic hearing you, so it is off there. Default: off on iPhone, on elsewhere. Per device.",
++    source: "tooltip",
++  },
+   "voice.voice": {
+     label: "Voice",
+     hint: "Natural voices come from the server when it has them; others are this device's. Saved per device. Default: first natural voice, else best.",
+diff --git a/web/src/lib/aeVoiceLevel.test.ts b/web/src/lib/aeVoiceLevel.test.ts
+index 178fef4248ea39a74d8e36a6adf147d9f4789f3d..af17770a647e5a376e435cfc63b4267746d8129d 100644
+--- a/web/src/lib/aeVoiceLevel.test.ts
++++ b/web/src/lib/aeVoiceLevel.test.ts
+@@ -4,6 +4,7 @@ import {
+   publishVoiceBins,
+   resetVoiceBins,
+   subscribeVoiceBins,
++  syntheticVoiceBins,
+   VOICE_BIN_COUNT,
+ } from "./aeVoiceLevel";
+ 
+@@ -34,3 +35,21 @@ describe("aeVoiceLevel", () => {
+     expect(cb).toHaveBeenCalledTimes(2);
+   });
+ });
++
++describe("syntheticVoiceBins", () => {
++  it("is silent at level 0 and bumps the voice range at level 1, all within bytes", () => {
++    expect(Array.from(syntheticVoiceBins(0, 123)).every((v) => v === 0)).toBe(true);
++    const loud = syntheticVoiceBins(1, 123);
++    expect(loud).toHaveLength(VOICE_BIN_COUNT);
++    expect(Math.max(...loud)).toBeGreaterThan(120);
++    expect(loud[6]).toBeGreaterThan(loud[VOICE_BIN_COUNT - 1]);
++  });
++
++  it("scales with the level, moves with time, and survives a bad level", () => {
++    const quiet = syntheticVoiceBins(0.2, 0);
++    const loud = syntheticVoiceBins(0.8, 0);
++    expect(quiet.reduce((a, b) => a + b, 0)).toBeLessThan(loud.reduce((a, b) => a + b, 0));
++    expect(Array.from(syntheticVoiceBins(0.8, 500))).not.toEqual(Array.from(loud));
++    expect(Array.from(syntheticVoiceBins(Number.NaN, 0)).every((v) => v === 0)).toBe(true);
++  });
++});
+diff --git a/web/src/lib/aeVoiceLevel.ts b/web/src/lib/aeVoiceLevel.ts
+index 31ae3dd176a47dbc1ea858a1cf094e05b911d029..67f078612259bb7126197f54bfdfc609e9abdf07 100644
+--- a/web/src/lib/aeVoiceLevel.ts
++++ b/web/src/lib/aeVoiceLevel.ts
+@@ -35,3 +35,19 @@ export function subscribeVoiceBins(cb: () => void): () => void {
+     listeners.delete(cb);
+   };
+ }
++
++/**
++ * Stand-in bins for a take with no level meter: a smooth bump per bin, tallest in the voice
++ * range, scaled by `level` (0 to 1, driven by recognizer events). `t` is the time in ms.
++ * Returns byte-style values (0 to 255) so it goes through publishVoiceBins like real data.
++ */
++export function syntheticVoiceBins(level: number, t: number): Uint8Array {
++  const out = new Uint8Array(VOICE_BIN_COUNT);
++  const l = Number.isFinite(level) ? Math.min(1, Math.max(0, level)) : 0;
++  for (let i = 0; i < VOICE_BIN_COUNT; i += 1) {
++    const shape = Math.exp(-(((i - 6) / 9) ** 2));
++    const wobble = 0.75 + 0.25 * Math.sin(t / 140 + i * 1.7);
++    out[i] = Math.round(255 * l * shape * wobble);
++  }
++  return out;
++}
+diff --git a/web/src/lib/aeVoiceLog.test.ts b/web/src/lib/aeVoiceLog.test.ts
+index 24a5b87d547801ce7609f68b36723435740ff7e6..201b32210c57c576dc40f5e67a5f079ec41f107c 100644
+--- a/web/src/lib/aeVoiceLog.test.ts
++++ b/web/src/lib/aeVoiceLog.test.ts
+@@ -2,16 +2,21 @@
+ 
+ import { act, renderHook } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { showToast } from "@/components/ui/toast";
+ import {
+   formatVoiceLog,
+   logVoice,
+   requestVoiceLogInsert,
+   resetVoiceLog,
+   UPLOAD_MIN_GAP_MS,
++  UPLOAD_TIMEOUT_MS,
+   uploadVoiceLog,
+   useVoiceLogInsert,
++  useVoiceLogOnHide,
+ } from "./aeVoiceLog";
+ 
++vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
++
+ beforeEach(() => {
+   vi.useFakeTimers();
+   vi.setSystemTime(new Date("2026-11-10T12:00:00.000Z"));
+@@ -86,14 +91,14 @@ describe("uploadVoiceLog", () => {
+     return { url, init, body: JSON.parse(String(init.body)) };
+   }
+ 
+-  it("posts the buffer with the reason and chat id, keepalive, as JSON", async () => {
++  it("posts the buffer with the reason and chat id, without keepalive, as JSON", async () => {
+     logVoice("mic start", "browser");
+     logVoice("final", "hello");
+     await expect(uploadVoiceLog("manual", "c1")).resolves.toBe("sent");
+     const { url, init, body } = lastBody();
+     expect(url).toContain("/v1/ae/voice-log");
+     expect(init.method).toBe("POST");
+-    expect(init.keepalive).toBe(true);
++    expect(init.keepalive).toBeUndefined();
+     expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+     expect(body.reason).toBe("manual");
+     expect(body.chat_id).toBe("c1");
+@@ -198,3 +203,143 @@ describe("uploadVoiceLog", () => {
+     expect(new TextEncoder().encode(text).length).toBeLessThanOrEqual(60_000);
+   });
+ });
++
++describe("uploadVoiceLog on a phone", () => {
++  const fetchMock = vi.fn();
++  beforeEach(() => {
++    fetchMock.mockReset();
++    fetchMock.mockImplementation(() => Promise.resolve(new Response("{}", { status: 200 })));
++    vi.stubGlobal("fetch", fetchMock);
++    vi.mocked(showToast).mockClear();
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  const lastInit = () => fetchMock.mock.calls.at(-1)?.[1] as RequestInit;
++
++  it("an in-page upload is a plain request: no keepalive, with an abort signal", async () => {
++    for (const reason of ["voice_end", "mic_failed", "mic_deaf", "mic_stalled", "manual"] as const) {
++      resetVoiceLog();
++      // oxlint-disable-next-line no-await-in-loop -- one reason per upload
++      await uploadVoiceLog(reason);
++      expect(lastInit().keepalive).toBeUndefined();
++      expect(lastInit().signal).toBeInstanceOf(AbortSignal);
++    }
++  });
++
++  it("keepalive is only used when the caller says the page is going away", async () => {
++    await uploadVoiceLog("mic_paused", null, { keepalive: true });
++    expect(lastInit().keepalive).toBe(true);
++  });
++
++  it("a rejected keepalive request is retried once without keepalive", async () => {
++    fetchMock.mockImplementationOnce(() => Promise.reject(new TypeError("dropped")));
++    await expect(uploadVoiceLog("mic_paused", null, { keepalive: true })).resolves.toBe("sent");
++    expect(fetchMock).toHaveBeenCalledTimes(2);
++    expect(fetchMock.mock.calls[0][1].keepalive).toBe(true);
++    expect(fetchMock.mock.calls[1][1].keepalive).toBeUndefined();
++    expect(formatVoiceLog()).toContain("keepalive rejected, retry");
++  });
++
++  it("a request that never answers is aborted after 10 s and the auto budget is released", async () => {
++    fetchMock.mockImplementationOnce(
++      (_url: string, init: RequestInit) =>
++        new Promise<Response>((_res, rej) => {
++          init.signal?.addEventListener("abort", () => {
++            const e = new Error("aborted");
++            e.name = "AbortError";
++            rej(e);
++          });
++        }),
++    );
++    const first = uploadVoiceLog("mic_failed");
++    await expect(uploadVoiceLog("mic_deaf")).resolves.toBe("throttled");
++    await vi.advanceTimersByTimeAsync(UPLOAD_TIMEOUT_MS);
++    await expect(first).resolves.toBe("failed");
++    // The slot is free again: the next automatic upload goes.
++    await expect(uploadVoiceLog("mic_deaf")).resolves.toBe("sent");
++  });
++
++  it("writes every result into the log buffer with the reason and the error name", async () => {
++    await uploadVoiceLog("mic_failed");
++    await uploadVoiceLog("mic_failed");
++    fetchMock.mockImplementationOnce(() => Promise.reject(new TypeError("offline")));
++    await uploadVoiceLog("manual");
++    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response("{}", { status: 503 })));
++    await uploadVoiceLog("manual");
++    const text = formatVoiceLog();
++    expect(text).toContain("log upload mic_failed sent ok");
++    expect(text).toContain("log upload mic_failed throttled ok");
++    expect(text).toContain("log upload manual failed TypeError");
++    expect(text).toContain("log upload manual failed http503");
++  });
++
++  it("toasts the voice_end result, and nothing for the other reasons", async () => {
++    await uploadVoiceLog("voice_end");
++    expect(showToast).toHaveBeenLastCalledWith("Voice log sent");
++    fetchMock.mockImplementationOnce(() => Promise.reject(new TypeError("offline")));
++    vi.advanceTimersByTime(UPLOAD_MIN_GAP_MS);
++    await uploadVoiceLog("voice_end");
++    expect(showToast).toHaveBeenLastCalledWith("Voice log not sent: network error");
++    await uploadVoiceLog("voice_end");
++    expect(showToast).toHaveBeenLastCalledWith("Voice log sent");
++    await uploadVoiceLog("voice_end");
++    expect(showToast).toHaveBeenLastCalledWith("Voice log not sent: sent a moment ago");
++    vi.mocked(showToast).mockClear();
++    await uploadVoiceLog("mic_failed");
++    await uploadVoiceLog("manual");
++    expect(showToast).not.toHaveBeenCalled();
++  });
++
++  it("names a timeout and a server refusal in the voice_end toast", async () => {
++    fetchMock.mockImplementationOnce(() => {
++      const e = new Error("aborted");
++      e.name = "AbortError";
++      return Promise.reject(e);
++    });
++    await uploadVoiceLog("voice_end");
++    expect(showToast).toHaveBeenLastCalledWith("Voice log not sent: timed out");
++    fetchMock.mockImplementationOnce(() => Promise.resolve(new Response("{}", { status: 429 })));
++    await uploadVoiceLog("voice_end");
++    expect(showToast).toHaveBeenLastCalledWith("Voice log not sent: server answered 429");
++  });
++});
++
++describe("useVoiceLogOnHide", () => {
++  const fetchMock = vi.fn();
++  beforeEach(() => {
++    fetchMock.mockReset();
++    fetchMock.mockImplementation(() => Promise.resolve(new Response("{}", { status: 200 })));
++    vi.stubGlobal("fetch", fetchMock);
++  });
++  afterEach(() => vi.unstubAllGlobals());
++
++  function hide() {
++    Object.defineProperty(document, "visibilityState", { configurable: true, value: "hidden" });
++    document.dispatchEvent(new Event("visibilitychange"));
++    Object.defineProperty(document, "visibilityState", { configurable: true, value: "visible" });
++  }
++
++  it("sends a keepalive upload with the chat id when the page is hidden or closing", async () => {
++    const { unmount } = renderHook(() => useVoiceLogOnHide(true, () => "c9"));
++    act(() => hide());
++    await vi.advanceTimersByTimeAsync(0);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    const init = fetchMock.mock.calls[0][1] as RequestInit;
++    expect(init.keepalive).toBe(true);
++    expect(JSON.parse(String(init.body)).chat_id).toBe("c9");
++    unmount();
++    act(() => hide());
++    window.dispatchEvent(new Event("pagehide"));
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++  });
++
++  it("does nothing while voice is not on, and nothing on a page that is shown again", async () => {
++    renderHook(() => useVoiceLogOnHide(false, () => null));
++    act(() => hide());
++    window.dispatchEvent(new Event("pagehide"));
++    document.dispatchEvent(new Event("visibilitychange"));
++    await vi.advanceTimersByTimeAsync(0);
++    expect(fetchMock).not.toHaveBeenCalled();
++  });
++});
++
+diff --git a/web/src/lib/aeVoiceLog.ts b/web/src/lib/aeVoiceLog.ts
+index 201f4e75172cc532dad1448d21282f878cf6085a..f18747ace824e5a8be52ab8858b5aff9283f9285 100644
+--- a/web/src/lib/aeVoiceLog.ts
++++ b/web/src/lib/aeVoiceLog.ts
+@@ -4,6 +4,7 @@
+ // hits trouble or ends, or when the user taps "Send voice log" (uploadVoiceLog, below).
+ 
+ import { useEffect, useRef } from "react";
++import { showToast } from "@/components/ui/toast";
+ import { authenticatedFetch } from "./identity";
+ import { withBasePath } from "./basePath";
+ 
+@@ -51,17 +52,92 @@ const UPLOAD_MAX_EVENT = 64;
+ let lastAutoUpload: number | null = null;
+ let autoInFlight = false;
+ const encoder = new TextEncoder();
++/** An in-page upload that has not answered by now is given up, so the budget never stays claimed. */
++export const UPLOAD_TIMEOUT_MS = 10_000;
++
++export interface UploadVoiceLogOptions {
++  /**
++   * Let the request outlive the page (pagehide). Only for a page that is going away: iOS WebKit
++   * drops a keepalive request made from a page that stays open, so in-page uploads leave it off.
++   */
++  keepalive?: boolean;
++}
++
++/** One POST with a timeout; a keepalive request that is rejected is retried once without it. */
++async function postVoiceLog(body: string, keepalive: boolean): Promise<Response> {
++  const attempt = async (withKeepalive: boolean): Promise<Response> => {
++    const controller = new AbortController();
++    const timer = setTimeout(() => controller.abort(), UPLOAD_TIMEOUT_MS);
++    try {
++      return await authenticatedFetch(withBasePath("/v1/ae/voice-log"), {
++        method: "POST",
++        headers: { "Content-Type": "application/json" },
++        body,
++        signal: controller.signal,
++        ...(withKeepalive ? { keepalive: true } : {}),
++      });
++    } finally {
++      clearTimeout(timer);
++    }
++  };
++  if (!keepalive) return attempt(false);
++  try {
++    return await attempt(true);
++  } catch {
++    logVoice("log upload", "keepalive rejected, retry");
++    return attempt(false);
++  }
++}
++
++function errName(error: unknown): string {
++  return error instanceof Error && error.name ? error.name : "error";
++}
++
++/** The short reason shown when a voice_end upload did not go. */
++function failureReason(result: "throttled" | "failed", name: string): string {
++  if (result === "throttled") return "sent a moment ago";
++  if (name === "AbortError") return "timed out";
++  return name.startsWith("http") ? `server answered ${name.slice(4)}` : "network error";
++}
+ 
+ /**
+  * Sends the last two minutes of the log to the server, best effort: never throws, and a
+  * failed or refused send is only a "failed" answer. Automatic reasons share one budget of one
+  * upload per UPLOAD_MIN_GAP_MS ("throttled" means one just went or is on its way); the budget
+  * is spent only when the server accepted the upload, so a failure can be retried. "manual"
+- * (the user tapped Send) skips that budget. keepalive lets it finish while the page closes.
++ * (the user tapped Send) skips that budget. In-page uploads are plain requests (no keepalive, which
++ * iOS drops) with a 10 s timeout; `keepalive` is for a page that is going away. Every result lands
++ * in the log buffer, and a voice_end result is also toasted.
+  */
+ export async function uploadVoiceLog(
+   reason: VoiceLogReason,
+   chatId?: string | null,
++  opts?: UploadVoiceLogOptions,
++): Promise<"sent" | "throttled" | "failed"> {
++  let errorName = "ok";
++  const result = await uploadVoiceLogInner(reason, chatId, opts, (n) => {
++    errorName = n;
++  });
++  logVoice("log upload", `${reason} ${result} ${errorName}`);
++  if (reason === "voice_end") {
++    try {
++      showToast(
++        result === "sent"
++          ? "Voice log sent"
++          : `Voice log not sent: ${failureReason(result, errorName)}`,
++      );
++    } catch {
++      // A toast must never break voice.
++    }
++  }
++  return result;
++}
++
++async function uploadVoiceLogInner(
++  reason: VoiceLogReason,
++  chatId: string | null | undefined,
++  opts: UploadVoiceLogOptions | undefined,
++  setError: (name: string) => void,
+ ): Promise<"sent" | "throttled" | "failed"> {
+   const automatic = reason !== "manual";
+   let claimed = false;
+@@ -94,16 +170,15 @@ export async function uploadVoiceLog(
+       lines = [head, ...lines.slice(Math.ceil((lines.length - 1) / 4) + 1)];
+       body = build();
+     }
+-    const response = await authenticatedFetch(withBasePath("/v1/ae/voice-log"), {
+-      method: "POST",
+-      headers: { "Content-Type": "application/json" },
+-      body,
+-      keepalive: true,
+-    });
+-    if (!response.ok) return "failed";
++    const response = await postVoiceLog(body, opts?.keepalive === true);
++    if (!response.ok) {
++      setError(`http${response.status}`);
++      return "failed";
++    }
+     if (automatic) lastAutoUpload = now;
+     return "sent";
+-  } catch {
++  } catch (error) {
++    setError(errName(error));
+     return "failed";
+   } finally {
+     if (claimed) autoInFlight = false;
+@@ -148,3 +223,29 @@ export function useVoiceLogInsert(value: string, setValue: (next: string) => voi
+     return () => window.removeEventListener(INSERT_EVENT, onInsert);
+   }, []);
+ }
++
++/**
++ * While `active` (a voice session is on), sends the log when the page is hidden or closing, the
++ * one place a keepalive request is used: the page may be gone before a plain request answers.
++ * It shares the automatic budget, so a backgrounded phone sends at most one a minute.
++ */
++export function useVoiceLogOnHide(active: boolean, chatId: () => string | null | undefined): void {
++  const chatRef = useRef(chatId);
++  chatRef.current = chatId;
++  useEffect(() => {
++    if (!active || typeof document === "undefined") return;
++    const send = () => {
++      logVoice("page hidden");
++      void uploadVoiceLog("mic_paused", chatRef.current(), { keepalive: true });
++    };
++    const onVisibility = () => {
++      if (document.visibilityState === "hidden") send();
++    };
++    document.addEventListener("visibilitychange", onVisibility);
++    window.addEventListener("pagehide", send);
++    return () => {
++      document.removeEventListener("visibilitychange", onVisibility);
++      window.removeEventListener("pagehide", send);
++    };
++  }, [active]);
++}
+diff --git a/web/src/lib/aeVoiceMeter.test.ts b/web/src/lib/aeVoiceMeter.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..c327bead0c4fd5c1197cef1b32bbdd0801c76f21
+--- /dev/null
++++ b/web/src/lib/aeVoiceMeter.test.ts
+@@ -0,0 +1,79 @@
++// The level meter setting: default by platform, saved choice wins, storage failures fall back.
++import { act, renderHook } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import {
++  readVoiceMeter,
++  useVoiceMeter,
++  VOICE_METER_KEY,
++  voiceMeterDefault,
++  writeVoiceMeter,
++} from "./aeVoiceMeter";
++
++const IOS_UA =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1";
++const CHROME_UA =
++  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
++let originalUa: PropertyDescriptor | undefined;
++
++function setUserAgent(ua: string) {
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++}
++
++beforeEach(() => {
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  window.localStorage.removeItem(VOICE_METER_KEY);
++});
++afterEach(() => {
++  vi.restoreAllMocks();
++  window.localStorage.removeItem(VOICE_METER_KEY);
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++describe("level meter setting", () => {
++  it("defaults off on iPhone and WebKit, on elsewhere", () => {
++    setUserAgent(IOS_UA);
++    expect(voiceMeterDefault()).toBe(false);
++    expect(readVoiceMeter()).toBe(false);
++    setUserAgent(CHROME_UA);
++    expect(voiceMeterDefault()).toBe(true);
++    expect(readVoiceMeter()).toBe(true);
++  });
++
++  it("a saved choice beats the platform default and persists", () => {
++    setUserAgent(IOS_UA);
++    writeVoiceMeter(true);
++    expect(window.localStorage.getItem(VOICE_METER_KEY)).toBe("on");
++    expect(readVoiceMeter()).toBe(true);
++    setUserAgent(CHROME_UA);
++    writeVoiceMeter(false);
++    expect(window.localStorage.getItem(VOICE_METER_KEY)).toBe("off");
++    expect(readVoiceMeter()).toBe(false);
++  });
++
++  it("an unknown saved value falls back to the default", () => {
++    setUserAgent(CHROME_UA);
++    window.localStorage.setItem(VOICE_METER_KEY, "maybe");
++    expect(readVoiceMeter()).toBe(true);
++  });
++
++  it("a storage that throws falls back to the default and never throws on write", () => {
++    setUserAgent(IOS_UA);
++    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => {
++      throw new Error("blocked");
++    });
++    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
++      throw new Error("blocked");
++    });
++    expect(readVoiceMeter()).toBe(false);
++    expect(() => writeVoiceMeter(true)).not.toThrow();
++  });
++
++  it("the hook follows a write", () => {
++    setUserAgent(CHROME_UA);
++    const { result } = renderHook(() => useVoiceMeter());
++    expect(result.current).toBe(true);
++    act(() => writeVoiceMeter(false));
++    expect(result.current).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeVoiceMeter.ts b/web/src/lib/aeVoiceMeter.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..468c882b327c46df3aee6846154f918550f043a8
+--- /dev/null
++++ b/web/src/lib/aeVoiceMeter.ts
+@@ -0,0 +1,52 @@
++// "Level meter": per device, whether the mic button opens a second microphone stream to draw
++// live levels. On iOS WebKit the newest capture wins, so that second stream can take the mic
++// from the speech recognizer and leave it deaf; the default there is off. Elsewhere it is on.
++// With it off, the ring and bars follow the recognizer's own events instead.
++
++import { useSyncExternalStore } from "react";
++import { isWebKitSpeech } from "./aeVoiceStall";
++
++export const VOICE_METER_KEY = "omnigent:ae-voice-meter";
++
++/** The saved choice: "on", "off", or null when the user never chose. */
++function readSaved(): "on" | "off" | null {
++  if (typeof window === "undefined") return null;
++  try {
++    const v = window.localStorage.getItem(VOICE_METER_KEY);
++    return v === "on" || v === "off" ? v : null;
++  } catch {
++    return null;
++  }
++}
++
++/** The meter's default on this device: off on WebKit/iOS browser recognition, on elsewhere. */
++export function voiceMeterDefault(): boolean {
++  return !isWebKitSpeech();
++}
++
++export function readVoiceMeter(): boolean {
++  const saved = readSaved();
++  return saved === null ? voiceMeterDefault() : saved === "on";
++}
++
++const listeners = new Set<() => void>();
++
++export function subscribeVoiceMeter(cb: () => void): () => void {
++  listeners.add(cb);
++  return () => listeners.delete(cb);
++}
++
++export function writeVoiceMeter(on: boolean): void {
++  if (typeof window !== "undefined") {
++    try {
++      window.localStorage.setItem(VOICE_METER_KEY, on ? "on" : "off");
++    } catch {
++      // A storage failure must not break the composer.
++    }
++  }
++  listeners.forEach((cb) => cb());
++}
++
++export function useVoiceMeter(): boolean {
++  return useSyncExternalStore(subscribeVoiceMeter, readVoiceMeter, () => true);
++}
+diff --git a/web/src/lib/aeVoiceStall.test.ts b/web/src/lib/aeVoiceStall.test.ts
+index a1aeeac4ada13b6006cec0767642fb6f659f0508..bbf529076890cc309d9a676e7c5c5b2111a7b9bd 100644
+--- a/web/src/lib/aeVoiceStall.test.ts
++++ b/web/src/lib/aeVoiceStall.test.ts
+@@ -1,5 +1,6 @@
+ import { afterEach, describe, expect, it } from "vitest";
+ import {
++  createEventStallDetector,
+   createStallDetector,
+   isWebKitSpeech,
+   MAX_FRAME_MS,
+@@ -160,3 +161,39 @@ describe("isWebKitSpeech", () => {
+     });
+   }
+ });
++
++describe("event stall detector (meter off)", () => {
++  it("fires once: sound heard, sound ended, then STALL_QUIET_MS with no result", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.heard(1000);
++    expect(d.evaluate(1000 + STALL_QUIET_MS + 5000)).toBeNull();
++    d.ended(2000);
++    expect(d.evaluate(2000 + STALL_QUIET_MS - 1)).toBeNull();
++    expect(d.evaluate(2000 + STALL_QUIET_MS)).toBe(2000 + STALL_QUIET_MS);
++    expect(d.evaluate(2000 + STALL_QUIET_MS + 1000)).toBeNull();
++  });
++
++  it("a result clears it, and an end with no sound heard is nothing", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.ended(500);
++    expect(d.evaluate(500 + STALL_QUIET_MS + 1)).toBeNull();
++    d.heard(1000);
++    d.ended(2000);
++    d.result(3000);
++    expect(d.evaluate(2000 + STALL_QUIET_MS + 1)).toBeNull();
++  });
++
++  it("new sound after an end cancels the pending stall; reset forgets everything", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.heard(1000);
++    d.ended(2000);
++    d.heard(3000);
++    expect(d.evaluate(2000 + STALL_QUIET_MS + 1)).toBeNull();
++    d.ended(4000);
++    d.reset(5000);
++    expect(d.evaluate(4000 + STALL_QUIET_MS + 1)).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeVoiceStall.ts b/web/src/lib/aeVoiceStall.ts
+index 85fee8b31aaeed170fc8b3e57252ec0be34fa0e1..c7032b159800a0d49bd2e06ed845b5075039bb70 100644
+--- a/web/src/lib/aeVoiceStall.ts
++++ b/web/src/lib/aeVoiceStall.ts
+@@ -108,6 +108,55 @@ export function createStallDetector(): StallDetector {
+   };
+ }
+ 
++/**
++ * The stall detector for a take with no level meter (the meter is off): the recognizer's own
++ * events are the only signal. A stall is soundstart or speechstart seen, then STALL_QUIET_MS
++ * with no result after a soundend, speechend or audioend. It never reads audio levels.
++ */
++export interface EventStallDetector {
++  /** soundstart or speechstart: the recognizer heard something. */
++  heard: (now: number) => void;
++  /** soundend, speechend or audioend. */
++  ended: (now: number) => void;
++  /** A result, interim or final. */
++  result: (now: number) => void;
++  /** Milliseconds since the last result when stalled, else null. Fires once. */
++  evaluate: (now: number) => number | null;
++  /** A new take or a fresh recognizer. */
++  reset: (now: number) => void;
++}
++
++export function createEventStallDetector(): EventStallDetector {
++  let heardAt: number | null = null;
++  let endAt: number | null = null;
++  let lastResult = 0;
++  return {
++    heard(now) {
++      heardAt = now;
++      endAt = null;
++    },
++    ended(now) {
++      if (heardAt !== null) endAt = now;
++    },
++    result(now) {
++      lastResult = now;
++      heardAt = null;
++      endAt = null;
++    },
++    evaluate(now) {
++      if (heardAt === null || endAt === null || now - endAt < STALL_QUIET_MS) return null;
++      heardAt = null;
++      endAt = null;
++      return Math.max(0, now - lastResult);
++    },
++    reset(now) {
++      lastResult = now;
++      heardAt = null;
++      endAt = null;
++    },
++  };
++}
++
+ /** iOS (every browser there is WebKit) and desktop Safari. Chrome and Edge are not. */
+ export function isWebKitSpeech(): boolean {
+   try {
+diff --git a/web/src/pages/ApprovePage.test.tsx b/web/src/pages/ApprovePage.test.tsx
+index 20b3cc8c60f7e662b631a0ebe9e5d12161534dee..c59c7051de0d82124153891bdad963c9e3a4352c 100644
+--- a/web/src/pages/ApprovePage.test.tsx
++++ b/web/src/pages/ApprovePage.test.tsx
+@@ -134,7 +134,10 @@ describe("ApprovePage submission", () => {
+       .mock.calls.find(([url]) => String(url).includes("/resolve"));
+     expect(resolveCall).toBeDefined();
+     expect(String(resolveCall![0])).toContain("/v1/sessions/sess_a/elicitations/eli_a/resolve");
+-    expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "accept" });
++    expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({
++      action: "accept",
++      _meta: { source: "approve_page" },
++    });
+   });
+ 
+   it("rejects: posts decline and shows the Rejected confirmation", async () => {
+@@ -147,7 +150,10 @@ describe("ApprovePage submission", () => {
+     const resolveCall = vi
+       .mocked(identity.authenticatedFetch)
+       .mock.calls.find(([url]) => String(url).includes("/resolve"));
+-    expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({ action: "decline" });
++    expect(JSON.parse(String(resolveCall![1]!.body))).toEqual({
++      action: "decline",
++      _meta: { source: "approve_page" },
++    });
+   });
+ 
+   it("shows a resolve error when the POST returns a non-ok status", async () => {
+diff --git a/web/src/pages/ApprovePage.tsx b/web/src/pages/ApprovePage.tsx
+index 9fb8e183901558aa7de8cb5b767b73220d5f5e3c..b4e3af8523c6a5747a61e80665f178d4b47800be 100644
+--- a/web/src/pages/ApprovePage.tsx
++++ b/web/src/pages/ApprovePage.tsx
+@@ -21,6 +21,7 @@ import { CheckIcon, MessageCircleQuestionMark, XIcon } from "lucide-react";
+ import { ElicitationMessage } from "@/components/blocks/ElicitationMessage";
+ import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
+ import { Button } from "@/components/ui/button";
++import { withApprovalSource } from "@/lib/aeApprovalSource";
+ import { authenticatedFetch } from "@/lib/identity";
+ import { formatPreview } from "@/lib/previewFormat";
+ 
+@@ -89,7 +90,7 @@ export function ApprovePage() {
+           {
+             method: "POST",
+             headers: { "Content-Type": "application/json" },
+-            body: JSON.stringify({ action }),
++            body: JSON.stringify({ action, _meta: withApprovalSource("approve_page") }),
+           },
+         );
+         if (!res.ok) {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 6f829446fe626407179a921489d92e2f7df6ce3e..6c9ddc11b84774f442b43d0e9a5a8933a41fb646 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3832,6 +3832,7 @@ function ComposerImpl(
+                   onKeyboard={voiceSheet ? voiceTyping.startTyping : undefined}
+                   onRestartMic={voice.restartMic}
+                   approvalActive={voice.approvalActive}
++                  onApproval={voice.answerApproval}
+                   micStartPath={() => micController.current?.startPath() ?? null}
+                 />
+               ) : null}
+diff --git a/web/src/pages/InboxPage.test.tsx b/web/src/pages/InboxPage.test.tsx
+index 32296d9b1f08195fb1f3d9d8848fb3246685fdad..56cb0799242a769fe0f408093278e0204cffd1c3 100644
+--- a/web/src/pages/InboxPage.test.tsx
++++ b/web/src/pages/InboxPage.test.tsx
+@@ -350,7 +350,10 @@ describe("InboxPage approval items", () => {
+     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+ 
+     await waitFor(() =>
+-      expect(sessionsApi.approve).toHaveBeenCalledWith("sess_1", "eli_1", { action: "accept" }),
++      expect(sessionsApi.approve).toHaveBeenCalledWith("sess_1", "eli_1", {
++        action: "accept",
++        _meta: { source: "inbox" },
++      }),
+     );
+     await waitFor(() =>
+       expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded"),
+@@ -375,6 +378,7 @@ describe("InboxPage approval items", () => {
+       expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_auto", {
+         action: "accept",
+         content: { allow_auto_mode: true },
++        _meta: { source: "inbox" },
+       }),
+     );
+     expect(screen.getByTestId("approval-card")).toHaveAttribute("data-status", "responded");
+@@ -466,7 +470,10 @@ describe("InboxPage approval items", () => {
+ 
+     fireEvent.click(await screen.findByRole("button", { name: "Stub Accept" }));
+     await waitFor(() =>
+-      expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", { action: "accept" }),
++      expect(sessionsApi.approve).toHaveBeenCalledWith("child", "eli_child", {
++        action: "accept",
++        _meta: { source: "inbox" },
++      }),
+     );
+     // The card names the child, since the row it surfaced under is the parent.
+     expect(screen.getByTestId("approval-card-requester")).toHaveTextContent("child under parent");
+diff --git a/web/src/pages/InboxPage.tsx b/web/src/pages/InboxPage.tsx
+index 266b915fd5d56a4be588ce397560ffca8cc1c88f..1800f6976c949e3da36e08388dfb7d6dd15f2aed 100644
+--- a/web/src/pages/InboxPage.tsx
++++ b/web/src/pages/InboxPage.tsx
+@@ -82,6 +82,7 @@ import {
+   writeInboxFilter,
+   type InboxFilter,
+ } from "@/lib/inboxFilterPreferences";
++import { withApprovalSource } from "@/lib/aeApprovalSource";
+ import { latestOutputPreview } from "@/lib/lastAssistantText";
+ import { relativeTime } from "@/lib/relativeTime";
+ import { Link } from "@/lib/routing";
+@@ -289,7 +290,8 @@ export function InboxPage() {
+   // rollback on error. Success invalidates the session list so the row's
+   // count (and the sidebar badge) drop without waiting for the socket.
+   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
+-    return (elicitationId, action, content, meta) => {
++    return (elicitationId, action, content, cardMeta) => {
++      const meta = withApprovalSource("inbox", cardMeta);
+       setResponded((prev) => ({
+         ...prev,
+         [elicitationId]: {

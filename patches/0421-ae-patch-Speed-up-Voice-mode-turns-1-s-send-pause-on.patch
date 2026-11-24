@@ -1,0 +1,293 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 16:21:02 -0800
+Subject: [PATCH 421/443] [ae-patch] Speed up Voice mode turns: 1 s send pause
+ on server dictation, mic and socket opened together, reply first text log
+
+---
+ web/src/hooks/useAeSpeakReplies.ts    |  2 +
+ web/src/hooks/useAeVoiceMode.test.tsx | 17 ++++++-
+ web/src/hooks/useAeVoiceMode.ts       | 15 ++++--
+ web/src/lib/aeVoiceMode.ts            |  7 ++-
+ web/src/lib/dictation.test.ts         | 69 ++++++++++++++++++++++++++-
+ web/src/lib/dictation.ts              | 33 +++++++++----
+ 6 files changed, 126 insertions(+), 17 deletions(-)
+
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 84ce812d4fc07cfafc8cc5944ab13f4dba0cbade..edc0aea211a6f47a2b78b9c1d5b5d6b433ca126a 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -273,6 +273,8 @@ export function useAeSpeakReplies({
+       if (fresh.length === 0) return;
+       // A tap on the speaker silenced this turn: the sentences count as read, none is spoken.
+       if (getVoiceSnapshot(chatId).barged) return;
++      // Once per turn: with the send and first audio logs it splits model time from TTS time.
++      if (!spokenThisTurn) logVoice("reply first text");
+       spokenThisTurn = true;
+       clearCue();
+       // The cue must not delay the real reply, nor queue ahead of its first chunk.
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 0ca1159bb132c199dc3b0ab9a7db4a1be815a026..3b9b12a886fd6d28475c322209a9424a4a9a2909 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -5,6 +5,7 @@ import { activeEchoWords, notePlayback, recordSpoken, resetEcho } from "@/lib/ae
+ import { MIC_WHILE_SPEAKING_KEY } from "@/lib/aeVoiceMic";
+ import {
+   GRACE_MS,
++  SERVER_STT_GRACE_MS,
+   registerVoiceSpeaker,
+   registerVoiceStop,
+   RESUME_MS,
+@@ -60,6 +61,7 @@ let synth: FakeSynth;
+ let listening = false;
+ // False leaves a start "connecting": isListening stays false until the test says otherwise.
+ let autoConnect = true;
++let micPath: "browser" | "server" = "browser";
+ const controller = {
+   current: {
+     start: vi.fn(() => {
+@@ -70,7 +72,7 @@ const controller = {
+     }),
+     restart: vi.fn(),
+     isListening: () => listening,
+-    startPath: () => "browser" as const,
++    startPath: () => micPath,
+   },
+ };
+ const submit = vi.fn();
+@@ -102,6 +104,7 @@ beforeEach(() => {
+   vi.useFakeTimers();
+   window.localStorage.clear();
+   resetVoiceLog();
++  micPath = "browser";
+   resetEcho();
+   resetVoiceStore();
+   listening = false;
+@@ -146,6 +149,18 @@ describe("useAeVoiceMode", () => {
+     expect(controller.current.stop).toHaveBeenCalled();
+   });
+ 
++  it("sends after 1 s on the server dictation path and 2 s on the browser path", () => {
++    expect(SERVER_STT_GRACE_MS).toBe(1000);
++    expect(GRACE_MS).toBe(2000);
++    micPath = "server";
++    const { result } = mount({ value: "hello there" });
++    act(() => void result.current.onFinal("hello there"));
++    act(() => void vi.advanceTimersByTime(SERVER_STT_GRACE_MS - 1));
++    expect(submit).not.toHaveBeenCalled();
++    act(() => void vi.advanceTimersByTime(1));
++    expect(submit).toHaveBeenCalledTimes(1);
++  });
++
+   it("a new partial inside the grace cancels the send", () => {
+     const { result } = mount({ value: "hello" });
+     act(() => void result.current.onFinal("hello"));
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 91ba2363f026092e000701c1c04b82f75514558c..97920ecfe4a8ad523202529998b5f1537861b4d0 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -15,6 +15,7 @@ import {
+   approvalSpeech,
+   customAllowed,
+   GRACE_MS,
++  SERVER_STT_GRACE_MS,
+   isPendingElicitation,
+   matchApprovalReply,
+   matchSpokenOption,
+@@ -286,6 +287,12 @@ export function useAeVoiceMode({
+     return () => clearTimeout(t);
+   }, [muted]);
+ 
++  /** The send pause for the live mic path: server dictation already waited out the silence. */
++  const graceMs = useCallback(
++    () => (controller.current?.startPath() === "server" ? SERVER_STT_GRACE_MS : GRACE_MS),
++    [controller],
++  );
++
+   const clearNet = useCallback(() => {
+     if (netTimer.current !== null) clearTimeout(netTimer.current);
+     netTimer.current = null;
+@@ -622,9 +629,9 @@ export function useAeVoiceMode({
+       graceTimer.current = setTimeout(() => {
+         graceTimer.current = null;
+         if (card.current === state && state.custom !== "") answerCard(state, state.custom);
+-      }, GRACE_MS);
++      }, graceMs());
+     },
+-    [answerCard, clearGrace],
++    [answerCard, clearGrace, graceMs],
+   );
+ 
+   const bargeIn = useCallback((): boolean => {
+@@ -750,10 +757,10 @@ export function useAeVoiceMode({
+         const current = latest.current;
+         if (current.quiet || current.value.trim() === "") return;
+         send();
+-      }, GRACE_MS);
++      }, graceMs());
+       return false;
+     },
+-    [on, onCardFinal, clearGrace, send, sendApproval],
++    [on, onCardFinal, clearGrace, send, sendApproval, graceMs],
+   );
+ 
+   const onPartial = useCallback(
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index 124a05176eb6bd4a84d5b876901dc975274ce5d8..9673e53a761487192b711581fec04868adfd1bd0 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -17,8 +17,13 @@ import { authenticatedFetch } from "./identity";
+ 
+ /** Quiet time after a finished sentence before the draft is sent. */
+ export const GRACE_MS = 2000;
++/**
++ * The same pause when the mic uses server dictation (iPhone, iPad): the server already waited
++ * 1.6 s of silence before it finalized, so a second 2 s wait only adds dead air.
++ */
++export const SERVER_STT_GRACE_MS = 1000;
+ /** Gap after the last spoken sentence before the mic comes back. */
+-export const RESUME_MS = 300;
++export const RESUME_MS = 100;
+ 
+ export type VoicePhase =
+   | "off"
+diff --git a/web/src/lib/dictation.test.ts b/web/src/lib/dictation.test.ts
+index 0e7c3c1ac83b0ff748ab987ef816d1fcf9e6a5e7..f6979e562bd7c3fdd5222efd752734194ccd5db0 100644
+--- a/web/src/lib/dictation.test.ts
++++ b/web/src/lib/dictation.test.ts
+@@ -4,8 +4,73 @@
+ // with a mocked session, and the full loop runs in the Playwright e2e test
+ // against the server's fake engine.
+ 
+-import { describe, expect, it } from "vitest";
+-import { parseDictationEvent } from "./dictation";
++import { afterEach, describe, expect, it, vi } from "vitest";
++import { getMicStream } from "@/lib/aeAudioDevices";
++import { DictationSession, parseDictationEvent } from "./dictation";
++
++vi.mock("@/lib/aeAudioDevices", () => ({ getMicStream: vi.fn() }));
++
++class FakeSocket {
++  static last: FakeSocket | null = null;
++  static OPEN = 1;
++  binaryType = "";
++  readyState = 0;
++  closed = false;
++  onmessage: ((m: { data: string }) => void) | null = null;
++  onerror: (() => void) | null = null;
++  onclose: ((e: { code: number }) => void) | null = null;
++  constructor(_url: string) {
++    FakeSocket.last = this;
++  }
++  close() {
++    this.closed = true;
++  }
++  addEventListener() {}
++  removeEventListener() {}
++}
++
++const events = { onPartial: vi.fn(), onFinal: vi.fn(), onError: vi.fn() };
++
++function fakeStream() {
++  const track = { stop: vi.fn() };
++  return { stream: { getTracks: () => [track] } as unknown as MediaStream, track };
++}
++
++describe("DictationSession.start opens the mic and the socket together", () => {
++  afterEach(() => {
++    vi.unstubAllGlobals();
++    vi.mocked(getMicStream).mockReset();
++    FakeSocket.last = null;
++  });
++
++  it("asks for the mic before the socket is ready", async () => {
++    vi.stubGlobal("WebSocket", FakeSocket);
++    vi.mocked(getMicStream).mockReturnValue(new Promise(() => {}));
++    void DictationSession.start(events).catch(() => {});
++    expect(getMicStream).toHaveBeenCalledTimes(1);
++    expect(FakeSocket.last).not.toBeNull();
++  });
++
++  it("a denied mic rejects and closes the socket", async () => {
++    vi.stubGlobal("WebSocket", FakeSocket);
++    vi.mocked(getMicStream).mockRejectedValue(new Error("denied"));
++    const started = DictationSession.start(events);
++    FakeSocket.last?.onmessage?.({ data: '{"type":"ready"}' });
++    await expect(started).rejects.toThrow("denied");
++    expect(FakeSocket.last?.closed).toBe(true);
++  });
++
++  it("a failed socket rejects and stops the mic that did open", async () => {
++    vi.stubGlobal("WebSocket", FakeSocket);
++    const { stream, track } = fakeStream();
++    vi.mocked(getMicStream).mockResolvedValue(stream);
++    const started = DictationSession.start(events);
++    FakeSocket.last?.onerror?.();
++    await expect(started).rejects.toThrow("dictation connection failed");
++    expect(track.stop).toHaveBeenCalled();
++    expect(FakeSocket.last?.closed).toBe(true);
++  });
++});
+ 
+ describe("parseDictationEvent", () => {
+   it("parses the transcript event shapes", () => {
+diff --git a/web/src/lib/dictation.ts b/web/src/lib/dictation.ts
+index dce29be41e54a39aea36aed32983fbb43b7e6752..8cc7f36193c91c4b3779c238f730276be7865a4f 100644
+--- a/web/src/lib/dictation.ts
++++ b/web/src/lib/dictation.ts
+@@ -315,23 +315,38 @@ export class DictationSession {
+     events: DictationSessionEvents,
+     options: DictationStartOptions = {},
+   ): Promise<DictationSession> {
++    // The mic and the socket are opened together: each takes a few hundred ms and neither
++    // needs the other. allSettled keeps a late failure of one half from going unhandled.
+     const t0 = Date.now();
+-    const mediaStream = await getMicStream({
++    const micPromise = getMicStream({
+       channelCount: 1,
+       echoCancellation: true,
+       noiseSuppression: true,
++    }).then((stream) => {
++      logVoice("dictation mic", `${Date.now() - t0} ms`);
++      return stream;
+     });
+-    logVoice("dictation mic", `${Date.now() - t0} ms`);
++    const ws = new WebSocket(buildDictationUrl());
++    ws.binaryType = "arraybuffer";
++    const readyPromise = waitForReady(ws).then(() => {
++      logVoice("dictation ws ready", `${Date.now() - t0} ms`);
++    });
++    const [micResult, readyResult] = await Promise.allSettled([micPromise, readyPromise]);
++    if (micResult.status === "rejected" || readyResult.status === "rejected") {
++      // Close whichever half succeeded; the failure that surfaces is the mic's first.
++      if (micResult.status === "fulfilled") {
++        for (const track of micResult.value.getTracks()) track.stop();
++      }
++      ws.close();
++      throw micResult.status === "rejected"
++        ? micResult.reason
++        : (readyResult as PromiseRejectedResult).reason;
++    }
++    const mediaStream = micResult.value;
+ 
+-    let ws: WebSocket | null = null;
+     let audioContext: AudioContext | null = null;
+     let shared = false;
+     try {
+-      const wsAt = Date.now();
+-      ws = new WebSocket(buildDictationUrl());
+-      ws.binaryType = "arraybuffer";
+-      await waitForReady(ws);
+-      logVoice("dictation ws ready", `${Date.now() - wsAt} ms`);
+       // Detect a close during the async audio-graph setup below: the
+       // handler-swap in the constructor would otherwise never see it and
+       // start() would resolve a dead session that silently drops audio.
+@@ -402,7 +417,7 @@ export class DictationSession {
+     } catch (error) {
+       for (const track of mediaStream.getTracks()) track.stop();
+       if (audioContext && !shared && audioContext.state !== "closed") void audioContext.close();
+-      ws?.close();
++      ws.close();
+       throw error;
+     }
+   }

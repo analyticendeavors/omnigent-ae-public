@@ -1,0 +1,1278 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 11 Nov 2026 16:00:22 -0800
+Subject: [PATCH 361/443] [ae-patch] Fix the review findings on 0360:
+ session-limit approvals answered only by an exact spoken phrase outside the
+ echo tail, recognizer-gated deaf mic checks, a 4 s stop watchdog that keeps a
+ late final, and a retry and held-message recovery on the new-chat page
+
+---
+ web/src/components/AeVoicePanel.test.tsx      |  14 ++
+ web/src/components/AeVoicePanel.tsx           |  13 +-
+ web/src/components/ComposerMicButton.test.tsx | 102 ++++++++++++--
+ web/src/components/ComposerMicButton.tsx      | 123 +++++++++++++----
+ web/src/hooks/useAeVoiceMode.test.tsx         | 129 +++++++++++++++++-
+ web/src/hooks/useAeVoiceMode.ts               |  90 +++++++++---
+ web/src/hooks/useAeVoiceStart.test.ts         |  62 ++++++++-
+ web/src/hooks/useAeVoiceStart.ts              |  74 ++++++++--
+ web/src/lib/aeVoiceMode.test.ts               |  60 ++++++++
+ web/src/lib/aeVoiceMode.ts                    |  40 ++++--
+ web/src/pages/ChatPage.tsx                    |   3 +-
+ web/src/shell/NewChatDialog.tsx               |   1 +
+ 12 files changed, 624 insertions(+), 87 deletions(-)
+
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index dd3e15980b7bd38dedc0886b2b8c71f49e49e939..eb858f72ca194cf6b0b3a05f0a8709694ececa04 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -33,6 +33,20 @@ const WORDS: [VoicePhase, string, string][] = [
+ ];
+ 
+ describe("AeVoicePanel", () => {
++  it("offers the restart and still names the approval when the mic went quiet during one", async () => {
++    const onRestartMic = vi.fn();
++    panel({
++      phase: "unavailable",
++      micDetail: "Mic went quiet, tap to restart",
++      approvalActive: true,
++      onRestartMic,
++    });
++    expect(screen.getByText("Mic unavailable")).toBeTruthy();
++    expect(screen.getByText(/Mic went quiet, tap to restart\. Approval waiting/)).toBeTruthy();
++    await userEvent.click(screen.getByRole("button", { name: "Listen again" }));
++    expect(onRestartMic).toHaveBeenCalledTimes(1);
++  });
++
+   it("renders nothing when Voice mode is off", () => {
+     panel({ phase: "off" });
+     expect(screen.queryByTestId("ae-voice-panel")).toBeNull();
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index 4a9c3a3a8d44b2c98ac6a3f2df679d29a4af2579..9a1cb2415ca65af13bfa3832a86cd5f29262e30c 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -35,6 +35,8 @@ export interface AeVoicePanelProps {
+   caption: string;
+   /** Why the mic is unavailable, when known. */
+   micDetail?: string | null;
++  /** A yes-or-no card is waiting, even when the mic cannot hear the answer. */
++  approvalActive?: boolean;
+   /** Turn Voice mode off. */
+   onEnd: () => void;
+   /** Stop the current reply. */
+@@ -171,6 +173,7 @@ function words(
+   heard: string,
+   caption: string,
+   micDetail: string | null | undefined,
++  approvalActive: boolean,
+ ): { label: string; sub: string } {
+   switch (key) {
+     case "starting":
+@@ -180,7 +183,12 @@ function words(
+     case "paused":
+       return { label: "Mic stopped", sub: "Tap the mic to listen again" };
+     case "unavailable":
+-      return { label: "Mic unavailable", sub: micDetail || "Check the microphone permission" };
++      return {
++        label: "Mic unavailable",
++        sub: approvalActive
++          ? `${micDetail || "Check the microphone permission"}. Approval waiting: run it, or decline.`
++          : micDetail || "Check the microphone permission",
++      };
+     case "thinking":
+       return { label: "Working on it", sub: "Mic muted until the reply ends" };
+     case "speaking":
+@@ -206,6 +214,7 @@ export function AeVoicePanel({
+   heard,
+   caption,
+   micDetail,
++  approvalActive = false,
+   onEnd,
+   onStop,
+   onResume,
+@@ -231,7 +240,7 @@ export function AeVoicePanel({
+     key === "starting" && startStuck && Boolean(onRestartMic) && micStartPath?.() === "browser";
+   const { label, sub } = tapToStart
+     ? { label: "Tap to start the mic", sub: "" }
+-    : words(key, heard, caption, micDetail);
++    : words(key, heard, caption, micDetail, approvalActive);
+   const restartable = key === "paused" || key === "unavailable" || tapToStart;
+   const action =
+     key === "speaking"
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index 289db4baaac153a99076e8690b7b2d5817bdd5e6..f4d3eafa211bbb4bc7629cd327f44d4f5b11d811 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -1331,6 +1331,7 @@ describe("ComposerMicButton (level meter)", () => {
+     /** Runs the meter's frames once a second for `seconds`, as a visible tab would. */
+     async function runFrames(seconds: number) {
+       for (let i = 0; i < seconds; i += 1) {
++        // oxlint-disable-next-line no-await-in-loop -- fake time must advance one second at a time
+         await act(async () => {
+           await vi.advanceTimersByTimeAsync(1000);
+           const run = frames.splice(0);
+@@ -1352,9 +1353,10 @@ describe("ComposerMicButton (level meter)", () => {
+       const { controller, onListeningChange } = await listenVoice();
+       streams[0].track.muted = true;
+       act(() => streams[0].track.listeners.mute?.());
+-      await runFrames(1);
++      await runFrames(4);
++      // The meter alone never decides: the recognizer has been quiet for under 6 s.
+       expect(onListeningChange).not.toHaveBeenLastCalledWith(false, "deaf");
+-      await runFrames(2);
++      await runFrames(3);
+       expect(onListeningChange).toHaveBeenLastCalledWith(false, "deaf");
+       expect(onListeningChange.mock.calls.filter((c) => c[0] === false)).toHaveLength(1);
+       expect(instances).toHaveLength(2);
+@@ -1395,10 +1397,35 @@ describe("ComposerMicButton (level meter)", () => {
+       expect(formatVoiceLog()).toContain("mic deaf analyser silent");
+     });
+ 
+-    it("sound the recognizer itself heard means the mic works, whatever the meter reads", async () => {
++    it("a healthy take whose meter is muted and zero but whose results keep arriving is not deaf", async () => {
++      const { onListeningChange } = await listenVoice();
++      streams[0].track.muted = true;
++      act(() => streams[0].track.listeners.mute?.());
++      for (let i = 0; i < 6; i += 1) {
++        // oxlint-disable-next-line no-await-in-loop -- results arrive between stretches of fake time
++        await runFrames(4);
++        act(() => handlers.result?.(resultEvent("hello there")));
++      }
++      expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    });
++
++    it("an early soundstart then 6 s of recognizer silence with a muted meter is deaf", async () => {
+       const { onListeningChange } = await listenVoice();
+       act(() => handlers.soundstart?.({}));
+-      await runFrames(10);
++      streams[0].track.muted = true;
++      act(() => streams[0].track.listeners.mute?.());
++      await runFrames(5);
++      expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++      await runFrames(3);
++      expect(onListeningChange).toHaveBeenLastCalledWith(false, "deaf");
++      expect(formatVoiceLog()).toContain("mic deaf track muted");
++    });
++
++    it("recognizer silence for 6 s with a healthy meter is not deaf", async () => {
++      const { onListeningChange } = await listenVoice();
++      act(() => ctxs[0].listeners.statechange?.());
++      // A live signal on the analyser, no mute, a running context: the meter has no complaint.
++      await runFrames(1);
+       expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
+     });
+   });
+@@ -1426,7 +1453,7 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     vi.useRealTimers();
+   });
+ 
+-  it("a stop that gets no end replaces the recognizer, frees the guard and reports not listening", () => {
++  it("a stop that gets no end in 4 s replaces the recognizer, frees the guard and reports not listening", () => {
+     const { controller, onListeningChange } = mountVoice();
+     act(() => controller.current?.start());
+     act(() => handlers.start?.({}));
+@@ -1434,11 +1461,12 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     expect(controller.current?.isListening()).toBe(true);
+     act(() => controller.current?.stop());
+     expect(stopSpy).toHaveBeenCalledTimes(1);
+-    act(() => void vi.advanceTimersByTime(1499));
++    act(() => void vi.advanceTimersByTime(3999));
+     expect(abortSpy).not.toHaveBeenCalled();
+     expect(controller.current?.isListening()).toBe(true);
+     act(() => void vi.advanceTimersByTime(1));
+-    expect(abortSpy).toHaveBeenCalledTimes(1);
++    // The old recognizer was already stopped, so a late final can still arrive: no abort.
++    expect(abortSpy).not.toHaveBeenCalled();
+     expect(instances).toHaveLength(2);
+     expect(controller.current?.isListening()).toBe(false);
+     expect(onListeningChange).toHaveBeenLastCalledWith(false);
+@@ -1448,6 +1476,54 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     expect(startSpy).toHaveBeenCalledTimes(2);
+   });
+ 
++  it("a final that arrives from the old recognizer within 1 s of the watchdog is still delivered once", () => {
++    const onTranscript = vi.fn();
++    const controller = { current: null as AeMicController | null };
++    render(<ComposerMicButton onTranscript={onTranscript} controller={controller} />);
++    act(() => controller.current?.start());
++    act(() => handlers.start?.({}));
++    act(() => handlers.audiostart?.({}));
++    act(() => controller.current?.stop());
++    act(() => void vi.advanceTimersByTime(4000));
++    expect(instances).toHaveLength(2);
++    act(() => void vi.advanceTimersByTime(900));
++    act(() => instances[0].handlers.result?.(resultEvent("send it now")));
++    expect(onTranscript).toHaveBeenCalledTimes(1);
++    expect(onTranscript).toHaveBeenCalledWith("send it now");
++    // One shot: a second final from the old recognizer is not delivered.
++    act(() => instances[0].handlers.result?.(resultEvent("again")));
++    expect(onTranscript).toHaveBeenCalledTimes(1);
++  });
++
++  it("a final after the 1 s late window is dropped", () => {
++    const onTranscript = vi.fn();
++    const controller = { current: null as AeMicController | null };
++    render(<ComposerMicButton onTranscript={onTranscript} controller={controller} />);
++    act(() => controller.current?.start());
++    act(() => handlers.start?.({}));
++    act(() => handlers.audiostart?.({}));
++    act(() => controller.current?.stop());
++    act(() => void vi.advanceTimersByTime(4000));
++    act(() => void vi.advanceTimersByTime(1100));
++    act(() => instances[0].handlers.result?.(resultEvent("too late")));
++    expect(onTranscript).not.toHaveBeenCalled();
++  });
++
++  it("a result that arrives after stop() holds the watchdog back instead of replacing the recognizer", () => {
++    const { controller } = mountVoice();
++    act(() => controller.current?.start());
++    act(() => handlers.start?.({}));
++    act(() => handlers.audiostart?.({}));
++    act(() => controller.current?.stop());
++    act(() => void vi.advanceTimersByTime(2000));
++    act(() => handlers.result?.(resultEvent("still talking")));
++    act(() => void vi.advanceTimersByTime(2000));
++    expect(instances).toHaveLength(1);
++    expect(formatVoiceLog()).toContain("result seen, waiting");
++    act(() => void vi.advanceTimersByTime(4000));
++    expect(instances).toHaveLength(2);
++  });
++
+   it("a stop answered by end in time leaves the recognizer alone", () => {
+     const { controller } = mountVoice();
+     act(() => controller.current?.start());
+@@ -1471,11 +1547,11 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     expect(formatVoiceLog()).toContain("mic stop refused");
+   });
+ 
+-  it("a take with no audiostart for 3 s is deaf: replaced and reported once", () => {
++  it("a take with no audiostart or sound for 5 s is deaf: replaced and reported once", () => {
+     const { controller, onListeningChange } = mountVoice();
+     act(() => controller.current?.start());
+     act(() => handlers.start?.({}));
+-    act(() => void vi.advanceTimersByTime(2999));
++    act(() => void vi.advanceTimersByTime(4999));
+     expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
+     act(() => void vi.advanceTimersByTime(500));
+     expect(onListeningChange.mock.calls.filter((c) => c[0] === false)).toEqual([[false, "deaf"]]);
+@@ -1557,8 +1633,8 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     });
+     expect(onListeningChange).not.toHaveBeenCalled();
+     expect(controller.current?.isListening()).toBe(true);
+-    // The old take's audiostart did not count for the new one: it is deaf at 3 s.
+-    act(() => void vi.advanceTimersByTime(3500));
++    // The old take's audiostart did not count for the new one: it is deaf at 5 s.
++    act(() => void vi.advanceTimersByTime(5500));
+     expect(onListeningChange).toHaveBeenLastCalledWith(false, "deaf");
+   });
+ 
+@@ -1595,7 +1671,7 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     act(() => handlers.start?.({}));
+     expect(getVoiceSnapshot("c1").phase).toBe("listening");
+     // First deaf take: the phase leaves listening and the mic is started again after 1 s.
+-    act(() => void vi.advanceTimersByTime(3500));
++    act(() => void vi.advanceTimersByTime(5500));
+     expect(getVoiceSnapshot("c1").phase).not.toBe("listening");
+     expect(getVoiceSnapshot("c1").phase).not.toBe("unavailable");
+     act(() => void vi.advanceTimersByTime(1000));
+@@ -1603,7 +1679,7 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     act(() => instances[instances.length - 1].handlers.start?.({}));
+     expect(getVoiceSnapshot("c1").phase).toBe("listening");
+     // Second deaf take: no third try, the panel gets the restartable phase and a reason.
+-    act(() => void vi.advanceTimersByTime(3500));
++    act(() => void vi.advanceTimersByTime(5500));
+     expect(getVoiceSnapshot("c1").phase).toBe("unavailable");
+     expect(screen.getByTestId("detail").textContent).toBe("Mic went quiet, tap to restart");
+     act(() => void vi.advanceTimersByTime(5000));
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 66a05e6f48c180c47473e08ec90c7cf44d1874a2..5a48953e0453b5e0454b41d9e13bc30bb52f1d03 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -80,11 +80,16 @@ const METER_STABLE_MS = 30_000;
+ const METER_MAX_REACQUIRES = 3;
+ const METER_RETRY_MS = 1000;
+ // A browser stop that gets no `end` in this long is given up on: the recognizer is replaced.
+-const MIC_STOP_WATCHDOG_MS = 1500;
++const MIC_STOP_WATCHDOG_MS = 4000;
++// After a stop watchdog replaced the recognizer, a final result from the old one still counts this long.
++const MIC_LATE_FINAL_MS = 1000;
+ // Voice mode liveness: a take that listens but hears nothing is replaced. Checked this often.
+ const MIC_LIVENESS_TICK_MS = 500;
+-// No audiostart this long after the take started.
+-const MIC_NO_AUDIO_MS = 3000;
++// No audiostart, soundstart, speechstart or result this long after the take started (a slow
++// Bluetooth route switch can take several seconds).
++const MIC_NO_AUDIO_MS = 5000;
++// The meter's deaf reasons only count once the recognizer itself showed no activity this long.
++const MIC_RECOGNIZER_QUIET_MS = 6000;
+ // The meter's track stays muted this long.
+ const MIC_TRACK_MUTED_MS = 2000;
+ // The meter's AudioContext is not running, or its analyser reads all zeros, this long.
+@@ -210,7 +215,12 @@ export const ComposerMicButton = ({
+   const livenessTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+   const takeStartRef = useRef(0);
+   const audioStartSeenRef = useRef(false);
+-  const heardSoundRef = useRef(false);
++  // When the recognizer last showed any life (audiostart, soundstart, speechstart, a result),
++  // and whether it ever heard sound or produced a result this take.
++  const lastRecognizerActivityRef = useRef(0);
++  const recognizerSoundSeenRef = useRef(false);
++  // A result arrived since the last stop(): the stop watchdog waits instead of replacing.
++  const resultSinceStopRef = useRef(false);
+   // Written by the meter: since when its track is muted, its context stalled, its analyser
+   // all zeros, and when its last frame ran. null means "not so".
+   const meterMutedSinceRef = useRef<number | null>(null);
+@@ -231,7 +241,7 @@ export const ComposerMicButton = ({
+   const pathRef = useRef<"browser" | "server">("browser");
+   pathRef.current = !Ctor || (serverAvailable && isElectronShell()) ? "server" : "browser";
+   // Swaps the recognizer for a fresh one (set by the mount effect).
+-  const replaceRecognitionRef = useRef<() => void>(() => {});
++  const replaceRecognitionRef = useRef<(keepLateFinal?: boolean) => void>(() => {});
+   const clearStartWatchdog = useCallback(() => {
+     if (startWatchdogRef.current !== null) clearTimeout(startWatchdogRef.current);
+     startWatchdogRef.current = null;
+@@ -309,12 +319,18 @@ export const ComposerMicButton = ({
+     const checkLiveness = () => {
+       if (!voiceTakeRef.current || !listeningRef.current) return;
+       const now = Date.now();
+-      if (!audioStartSeenRef.current && now - takeStartRef.current >= MIC_NO_AUDIO_MS) {
++      // Recognizer activity first: no audiostart counts only when nothing else showed life.
++      if (
++        !audioStartSeenRef.current &&
++        !recognizerSoundSeenRef.current &&
++        now - takeStartRef.current >= MIC_NO_AUDIO_MS
++      ) {
+         reportDeaf("no audiostart");
+         return;
+       }
+-      // Sound the recognizer itself heard means the mic works, whatever the meter says.
+-      if (heardSoundRef.current) return;
++      // The meter never decides alone: it counts only after the recognizer itself has shown
++      // no activity for a while (an early soundstart does not switch the checks off for good).
++      if (now - lastRecognizerActivityRef.current < MIC_RECOGNIZER_QUIET_MS) return;
+       const muted = meterMutedSinceRef.current;
+       if (muted !== null && now - muted >= MIC_TRACK_MUTED_MS) {
+         reportDeaf("track muted");
+@@ -343,6 +359,7 @@ export const ComposerMicButton = ({
+         return;
+       }
+       takeStartRef.current = Date.now();
++      lastRecognizerActivityRef.current = takeStartRef.current;
+       livenessTimerRef.current = setInterval(checkLiveness, MIC_LIVENESS_TICK_MS);
+     };
+     armLivenessRef.current = armLiveness;
+@@ -420,16 +437,19 @@ export const ComposerMicButton = ({
+         if (!current()) return;
+         logVoice("mic event audiostart");
+         audioStartSeenRef.current = true;
++        lastRecognizerActivityRef.current = Date.now();
+       };
+       const handleSoundStart = () => {
+         if (!current()) return;
+         logVoice("mic event soundstart");
+-        heardSoundRef.current = true;
++        recognizerSoundSeenRef.current = true;
++        lastRecognizerActivityRef.current = Date.now();
+       };
+       const handleSpeechStart = () => {
+         if (!current()) return;
+         logVoice("mic event speechstart");
+-        heardSoundRef.current = true;
++        recognizerSoundSeenRef.current = true;
++        lastRecognizerActivityRef.current = Date.now();
+       };
+       const handleAudioEnd = () => {
+         if (!current()) return;
+@@ -437,7 +457,9 @@ export const ComposerMicButton = ({
+       };
+       const handleResult = (event: Event) => {
+         if (!current()) return;
+-        heardSoundRef.current = true;
++        recognizerSoundSeenRef.current = true;
++        resultSinceStopRef.current = true;
++        lastRecognizerActivityRef.current = Date.now();
+         // Drop late events that arrive after the composer went disabled, or after
+         // an Esc discard the parent has already reverted.
+         if (disabledRef.current || discardingRef.current) return;
+@@ -476,17 +498,46 @@ export const ComposerMicButton = ({
+ 
+     // WebKit stays in Aborting until the old recognizer's end, so start() on it throws.
+     // A new instance can start inside the same tap: discard the old one, abort it, build anew.
+-    const replace = () => {
++    // `keepLateFinal` (the stop watchdog): the old recognizer was already stopped, so it is
++    // not aborted, and a final result it still delivers within a second is passed on once.
++    const replace = (keepLateFinal = false) => {
+       clearLiveness();
+       clearStopWatchdog();
+       const old = recognitionRef.current;
+       if (old) {
+         detachers.get(old)?.();
+         detachers.delete(old);
+-        try {
+-          old.abort();
+-        } catch {
+-          // Nothing to abort.
++        if (keepLateFinal) {
++          let lateDone = false;
++          const onLate = (event: Event) => {
++            if (lateDone) return;
++            const speechEvent = event as SpeechRecognitionEventLike;
++            let finalTranscript = "";
++            for (let i = speechEvent.resultIndex; i < speechEvent.results.length; i += 1) {
++              const result = speechEvent.results[i];
++              if (result.isFinal) finalTranscript += result[0]?.transcript ?? "";
++            }
++            const trimmed = finalTranscript.trim();
++            if (!trimmed) return;
++            lateDone = true;
++            old.removeEventListener("result", onLate);
++            clearTimeout(lateTimer);
++            if (!disabledRef.current && !discardingRef.current) {
++              logVoice("mic late final delivered");
++              onTranscriptRef.current(trimmed);
++            }
++          };
++          const lateTimer = setTimeout(() => {
++            lateDone = true;
++            old.removeEventListener("result", onLate);
++          }, MIC_LATE_FINAL_MS);
++          old.addEventListener("result", onLate);
++        } else {
++          try {
++            old.abort();
++          } catch {
++            // Nothing to abort.
++          }
+         }
+       }
+       recognitionRef.current = build();
+@@ -843,19 +894,30 @@ export const ComposerMicButton = ({
+   toggleServerRef.current = toggleServer;
+ 
+   // A browser stop that gets no `end`: swap the recognizer and call the take over.
+-  const armStopWatchdog = useCallback(() => {
+-    clearStopWatchdog();
+-    stopWatchdogRef.current = setTimeout(() => {
+-      stopWatchdogRef.current = null;
+-      logVoice("mic stop watchdog");
+-      clearLiveness();
+-      voiceTakeRef.current = false;
+-      replaceRecognitionRef.current();
+-      transitionRef.current = false;
+-      listeningRef.current = false;
+-      setIsListening(false);
+-    }, MIC_STOP_WATCHDOG_MS);
+-  }, [clearStopWatchdog, clearLiveness]);
++  const armStopWatchdog = useCallback(
++    (extended = false): void => {
++      clearStopWatchdog();
++      resultSinceStopRef.current = false;
++      stopWatchdogRef.current = setTimeout(() => {
++        stopWatchdogRef.current = null;
++        // A result since the stop means the recognizer is still delivering: give it one more
++        // window instead of replacing it under a final that is on its way.
++        if (resultSinceStopRef.current && !extended) {
++          logVoice("mic stop watchdog", "result seen, waiting");
++          armStopWatchdog(true);
++          return;
++        }
++        logVoice("mic stop watchdog");
++        clearLiveness();
++        voiceTakeRef.current = false;
++        replaceRecognitionRef.current(true);
++        transitionRef.current = false;
++        listeningRef.current = false;
++        setIsListening(false);
++      }, MIC_STOP_WATCHDOG_MS);
++    },
++    [clearStopWatchdog, clearLiveness],
++  );
+ 
+   // Returns whether anything began: false when a guard turned the call away.
+   const toggle = useCallback((): boolean => {
+@@ -895,7 +957,8 @@ export const ComposerMicButton = ({
+         logVoice("mic start browser");
+         startSeenRef.current = false;
+         audioStartSeenRef.current = false;
+-        heardSoundRef.current = false;
++        recognizerSoundSeenRef.current = false;
++        lastRecognizerActivityRef.current = 0;
+         browserStartPendingRef.current = true;
+         recognition.start();
+       }
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 630d12fc6402c92a6a8ffa6b66aa46be4048fb05..1e73f206b7d80184160783c5ab2e2a69c27238d5 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -800,7 +800,8 @@ describe("useAeVoiceMode", () => {
+       registerVoiceSpeaker("c1", speak);
+       useChatStore.setState({ blocks: [APPROVAL], sessionStatus: "running" } as never);
+       const hook = mount({ status: "streaming", ...over });
+-      act(() => void vi.advanceTimersByTime(RESUME_MS + 50));
++      // Past the window in which the approval line may still be playing, plus its echo tail.
++      act(() => void vi.advanceTimersByTime(8100));
+       return { speak, ...hook };
+     }
+ 
+@@ -845,6 +846,107 @@ describe("useAeVoiceMode", () => {
+       expect(submit).not.toHaveBeenCalled();
+     });
+ 
++    it.each([
++      "don't say yes",
++      "do not approve",
++      "never run it",
++      "run it or decline",
++      "please run it for me",
++      "yesterday",
++    ])("ignores %s", (said) => {
++      const { result } = mountApproval();
++      act(() => void result.current.onFinal(said));
++      expect(submitApproval).not.toHaveBeenCalled();
++    });
++
++    it("never answers a tool-permission card by voice", () => {
++      useChatStore.setState({
++        blocks: [{ ...APPROVAL, policyName: "bash_permission", elicitationId: "bash1" }],
++        sessionStatus: "running",
++      } as never);
++      const speak = vi.fn();
++      registerVoiceSpeaker("c1", speak);
++      const { result } = mount({ status: "streaming" });
++      act(() => void vi.advanceTimersByTime(9000));
++      expect(result.current.approvalActive).toBe(false);
++      expect(speak).not.toHaveBeenCalled();
++      act(() => void result.current.onFinal("yes"));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).not.toHaveBeenCalled();
++    });
++
++    it("answers the newest pending card when several wait", () => {
++      useChatStore.setState({
++        blocks: [APPROVAL, { ...APPROVAL, elicitationId: "a2" }],
++        sessionStatus: "running",
++      } as never);
++      const { result } = mount({ status: "streaming" });
++      act(() => void vi.advanceTimersByTime(8100));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++      expect(submitApproval).toHaveBeenCalledWith("a2", "accept");
++    });
++
++    it("submits once when the same answer arrives twice", () => {
++      const { result } = mountApproval();
++      act(() => void result.current.onFinal("run it"));
++      act(() => void result.current.onFinal("yes"));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++    });
++
++    it("ignores a final while the approval line plays and for 2.5 s after it ends", () => {
++      const { result } = mountApproval();
++      act(() => {
++        setVoiceSpeaking("c1", true);
++        setVoicePlaying("c1", true);
++      });
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).not.toHaveBeenCalled();
++      act(() => {
++        setVoicePlaying("c1", false);
++        setVoiceSpeaking("c1", false);
++      });
++      act(() => void vi.advanceTimersByTime(2400));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).not.toHaveBeenCalled();
++      act(() => void vi.advanceTimersByTime(200));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++    });
++
++    it("ignores a final whose recognition began inside the echo tail", () => {
++      const { result } = mountApproval();
++      act(() => {
++        setVoiceSpeaking("c1", true);
++        setVoicePlaying("c1", true);
++      });
++      act(() => {
++        setVoicePlaying("c1", false);
++        setVoiceSpeaking("c1", false);
++      });
++      act(() => void vi.advanceTimersByTime(1000));
++      act(() => void result.current.onPartial("run"));
++      act(() => void vi.advanceTimersByTime(2000));
++      act(() => void result.current.onFinal("run it"));
++      expect(submitApproval).not.toHaveBeenCalled();
++    });
++
++    it("shows the unavailable phase with a restart when the mic went quiet during an approval", () => {
++      const { result } = mountApproval();
++      act(() => void result.current.onListening(true));
++      for (let i = 0; i < 2; i += 1) {
++        act(() => {
++          listening = false;
++          result.current.onListening(false, "deaf");
++        });
++        act(() => void vi.advanceTimersByTime(1000));
++        if (i === 0) act(() => void result.current.onListening(true));
++      }
++      expect(result.current.approvalActive).toBe(true);
++      expect(getVoiceSnapshot("c1").phase).toBe("unavailable");
++      expect(result.current.micDetail).toBe(MIC_DEAF_DETAIL);
++    });
++
+     it("leaves the approval phase when the card is answered", () => {
+       mountApproval();
+       act(() => {
+@@ -904,6 +1006,31 @@ describe("useAeVoiceMode", () => {
+     expect(result.current.micDetail).toBeNull();
+   });
+ 
++  it("a tap-restart after Mic went quiet gives a fresh retry", () => {
++    const { result } = mount();
++    const goDeaf = () =>
++      act(() => {
++        listening = false;
++        result.current.onListening(false, "deaf");
++      });
++    act(() => void result.current.onListening(true));
++    goDeaf();
++    act(() => void vi.advanceTimersByTime(1000));
++    act(() => void result.current.onListening(true));
++    goDeaf();
++    expect(getVoiceSnapshot("c1").phase).toBe("unavailable");
++    act(() => result.current.restartMic());
++    expect(controller.current.restart).toHaveBeenCalledTimes(1);
++    expect(result.current.micDetail).toBeNull();
++    act(() => void result.current.onListening(true));
++    goDeaf();
++    // The count started over: this deaf take is retried, not shown as failed.
++    expect(getVoiceSnapshot("c1").phase).not.toBe("unavailable");
++    controller.current.start.mockClear();
++    act(() => void vi.advanceTimersByTime(1000));
++    expect(controller.current.start).toHaveBeenCalledTimes(1);
++  });
++
+   it("heard words give a deaf mic its retry back", () => {
+     const { result } = mount({ value: "" });
+     act(() => void result.current.onListening(true));
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 81445c2557427a5352ef8988945b9b7f783993c1..6c2450cf19bd023f8b26cf44b67ba6833c0395cb 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -4,6 +4,7 @@
+ 
+ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
+ import {
++  APPROVAL_TAIL_MS,
+   type AeMicController,
+   approvalOf,
+   approvalSpeech,
+@@ -40,6 +41,8 @@ const MIC_RETRY_MS = 1000;
+  */
+ export const MIC_START_NET_MS = 60_000;
+ const LABEL_KEY = "ae.voice";
++/** If the approval line never starts to play, the mic answer opens after this long. */
++const APPROVAL_NO_PLAY_MS = 8000;
+ 
+ export interface UseAeVoiceModeArgs {
+   chatId: string | null;
+@@ -79,6 +82,8 @@ export interface AeVoiceMode {
+   bargeIn: () => boolean;
+   /** The mic reports it started or stopped listening (or failed to start). */
+   onListening: (listening: boolean, reason?: "deaf") => void;
++  /** A tap on the unavailable or paused panel: a fresh retry budget, then a new recognizer. */
++  restartMic: () => void;
+ }
+ 
+ /** Shown on the unavailable panel after the mic went quiet twice in a row. */
+@@ -104,9 +109,14 @@ export function useAeVoiceMode({
+   const voice = useVoiceSnapshot(chatId);
+   const { on, speaking, barged, playing } = voice;
+   const micMode = useMicWhileSpeaking();
+-  const block = useChatStore((s) =>
+-    s.blocks.find((b) => isPendingElicitation(b, s.conversationId)),
+-  );
++  // The newest pending card is the one on screen (as the approve hotkey reads it).
++  const block = useChatStore((s) => {
++    for (let i = s.blocks.length - 1; i >= 0; i -= 1) {
++      const b = s.blocks[i];
++      if (isPendingElicitation(b, s.conversationId)) return b;
++    }
++    return undefined;
++  });
+   const sessionRunning = useChatStore((s) => s.sessionStatus === "running");
+   const queued = useChatStore((s) => s.pendingUserMessages.length > 0);
+   const questions = on ? questionsOf(block?.type === "elicitation" ? block : undefined) : null;
+@@ -136,6 +146,12 @@ export function useAeVoiceMode({
+   // that held two or more new words.
+   const utteranceWords = useRef<readonly string[] | null>(null);
+   const personInterims = useRef(0);
++  // Approval answers: the cards already answered by voice, when the recognition of the
++  // current utterance began, and the moment before which a heard final is the line's echo.
++  const approvalAnswered = useRef<Set<string>>(new Set());
++  const utteranceStartedAt = useRef<number | null>(null);
++  const approvalReadyAt = useRef(0);
++  const approvalPlaybackSeen = useRef(false);
+ 
+   // A turn is under way once the chat streams, the session runs, or the message is queued.
+   const busy = status === "streaming" || sessionRunning || queued;
+@@ -202,6 +218,10 @@ export function useAeVoiceMode({
+       resetEcho();
+       utteranceWords.current = null;
+       personInterims.current = 0;
++      approvalAnswered.current = new Set();
++      utteranceStartedAt.current = null;
++      approvalReadyAt.current = 0;
++      approvalPlaybackSeen.current = false;
+       setAwaiting(false);
+       setMicFailed(false);
+       setMicStopped(false);
+@@ -308,6 +328,7 @@ export function useAeVoiceMode({
+       // A mic start or stop ends the utterance: an interim with no final leaves no pin behind.
+       utteranceWords.current = null;
+       personInterims.current = 0;
++      utteranceStartedAt.current = null;
+       if (listening) {
+         clearNet();
+         startPending.current = false;
+@@ -374,20 +395,20 @@ export function useAeVoiceMode({
+       ? "off"
+       : speaking
+         ? "speaking"
+-        : approvalActive
+-          ? "approval"
+-          : waiting
+-            ? "thinking"
+-            : micListening
+-              ? "listening"
+-              : micFailed
+-                ? "unavailable"
++        : micFailed
++          ? "unavailable"
++          : approvalActive
++            ? "approval"
++            : waiting
++              ? "thinking"
++              : micListening
++                ? "listening"
+                 : micStopped
+                   ? "paused"
+                   : "starting";
+     logVoice(`phase ${phase}`);
+     setVoicePhase(chatId, phase);
+-  }, [chatId, on, speaking, approvalActive, waiting, micListening, micFailed, micStopped]);
++  }, [chatId, on, speaking, micFailed, approvalActive, waiting, micListening, micStopped]);
+ 
+   const send = useCallback(() => {
+     const now = latest.current;
+@@ -445,9 +466,36 @@ export function useAeVoiceMode({
+     if (!a || !say || approvalSpoken.current === approvalId) return;
+     approvalSpoken.current = approvalId;
+     logVoice("approval pending");
++    // Nothing heard before the line has played and its tail has passed counts as an answer.
++    approvalReadyAt.current = Math.max(approvalReadyAt.current, Date.now() + APPROVAL_NO_PLAY_MS);
+     say(approvalSpeech(a));
+   }, [approvalId, voice.speak]);
+ 
++  // The approval line, or any voice, playing: its own sound reaching the mic is never an answer.
++  // Playback ending starts a tail in which a heard final is still taken for its echo.
++  const audible = speaking || playing;
++  useEffect(() => {
++    if (audible) {
++      approvalPlaybackSeen.current = true;
++      approvalReadyAt.current = Number.POSITIVE_INFINITY;
++    } else if (approvalPlaybackSeen.current) {
++      approvalPlaybackSeen.current = false;
++      approvalReadyAt.current = Date.now() + APPROVAL_TAIL_MS;
++    }
++  }, [audible]);
++
++  const restartMic = useCallback(() => {
++    // A tap is a fresh start: the retry budget is whole again.
++    deafStreak.current = 0;
++    failures.current = 0;
++    if (retryTimer.current !== null) clearTimeout(retryTimer.current);
++    retryTimer.current = null;
++    setMicFailed(false);
++    setMicStopped(false);
++    setMicDetail(null);
++    controller.current?.restart();
++  }, [controller]);
++
+   const answerCard = useCallback((state: CardState, answer: string | string[]) => {
+     const qs = latest.current.questions;
+     if (!qs) return;
+@@ -572,6 +620,10 @@ export function useAeVoiceMode({
+     (text: string): boolean => {
+       if (!on) return false;
+       logVoice("final", text.slice(0, 60));
++      // Something was heard: the mic is not deaf, whatever else this final does.
++      deafStreak.current = 0;
++      const startedAt = utteranceStartedAt.current ?? Date.now();
++      utteranceStartedAt.current = null;
+       const now = latest.current;
+       const state = card.current;
+       if (state && now.questions) {
+@@ -579,18 +631,21 @@ export function useAeVoiceMode({
+         return true;
+       }
+       if (now.approval) {
+-        // The card is answered by a short spoken verdict; anything else is ignored.
+-        if (!now.quiet) {
++        // The card is answered by a whole spoken "run it" or "decline", never while the line
++        // (or any voice) plays, never inside its echo tail, and once per card.
++        const id = now.approval.id;
++        const clear = !now.speaking && !now.playing && startedAt >= approvalReadyAt.current;
++        if (!now.quiet && clear && !approvalAnswered.current.has(id)) {
+           const verdict = matchApprovalReply(text);
+           if (verdict !== null) {
++            approvalAnswered.current.add(id);
+             logVoice("approval answer", verdict);
+             clearGrace();
+-            void useChatStore.getState().submitApproval(now.approval.id, verdict);
++            void useChatStore.getState().submitApproval(id, verdict);
+           }
+         }
+         return true;
+       }
+-      deafStreak.current = 0;
+       // Sound heard while the chat is busy or the voice is talking never reaches the draft.
+       if (now.quiet) {
+         clearGrace();
+@@ -612,6 +667,8 @@ export function useAeVoiceMode({
+     (_text: string): boolean => {
+       clearGrace();
+       if (!on) return false;
++      deafStreak.current = 0;
++      if (utteranceStartedAt.current === null) utteranceStartedAt.current = Date.now();
+       return (
+         latest.current.quiet ||
+         (card.current !== null && latest.current.questions !== null) ||
+@@ -632,5 +689,6 @@ export function useAeVoiceMode({
+     onFinal,
+     onPartial,
+     onListening,
++    restartMic,
+   };
+ }
+diff --git a/web/src/hooks/useAeVoiceStart.test.ts b/web/src/hooks/useAeVoiceStart.test.ts
+index eb1c0c8b591a7704197fbdcfcf810ddc2f69b19f..b11afe35ecb5e6b6b999a9ac127e9dd7794d4009 100644
+--- a/web/src/hooks/useAeVoiceStart.test.ts
++++ b/web/src/hooks/useAeVoiceStart.test.ts
+@@ -2,7 +2,14 @@ import { act, renderHook } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { disarmVoiceForNextChat, GRACE_MS, takeVoiceArm } from "@/lib/aeVoiceMode";
+ import { installFakeSpeech, removeFakeSpeech } from "@/test/fakeSpeech";
+-import { READY_POLL_MS, READY_WAIT_MS, useAeVoiceStart } from "./useAeVoiceStart";
++import {
++  DEAF_RETRY_MS,
++  READY_POLL_MS,
++  READY_WAIT_MS,
++  STALLED_POLL_MS,
++  START_MIC_DEAF_DETAIL,
++  useAeVoiceStart,
++} from "./useAeVoiceStart";
+ 
+ function setup(over: { value?: string; canSubmit?: boolean } = {}) {
+   const mic = { start: vi.fn(), stop: vi.fn(), restart: vi.fn(), isListening: () => false, startPath: () => "browser" as const };
+@@ -146,3 +153,56 @@ describe("useAeVoiceStart with a mic that is already listening", () => {
+     expect(mic.start).toHaveBeenCalledTimes(1);
+   });
+ });
++
++describe("useAeVoiceStart deaf takes and held messages", () => {
++  it("retries once on a deaf take, then says the mic went quiet", () => {
++    const { result, mic } = setup();
++    act(() => result.current.toggle());
++    act(() => result.current.onListening(true));
++    act(() => result.current.onListening(false, "deaf"));
++    expect(result.current.phase).toBe("starting");
++    expect(mic.start).toHaveBeenCalledTimes(1);
++    act(() => void vi.advanceTimersByTime(DEAF_RETRY_MS));
++    expect(mic.start).toHaveBeenCalledTimes(2);
++    act(() => result.current.onListening(true));
++    act(() => result.current.onListening(false, "deaf"));
++    expect(result.current.phase).toBe("unavailable");
++    expect(result.current.micDetail).toBe(START_MIC_DEAF_DETAIL);
++    act(() => void vi.advanceTimersByTime(5000));
++    expect(mic.start).toHaveBeenCalledTimes(2);
++    // A tap is a fresh budget.
++    act(() => result.current.restart());
++    expect(result.current.micDetail).toBeNull();
++    act(() => result.current.onListening(true));
++    act(() => result.current.onListening(false, "deaf"));
++    expect(result.current.phase).toBe("starting");
++  });
++
++  it("does not let listening or paused overwrite a held message that is waiting", () => {
++    const { result } = setup({ canSubmit: false });
++    act(() => result.current.toggle());
++    act(() => result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS + 10));
++    expect(result.current.phase).toBe("preparing");
++    act(() => result.current.onListening(true));
++    expect(result.current.phase).toBe("preparing");
++    act(() => result.current.onListening(false));
++    expect(result.current.phase).toBe("preparing");
++    act(() => result.current.onListening(false, "deaf"));
++    expect(result.current.phase).toBe("preparing");
++  });
++
++  it("a stalled message keeps a slow poll and goes the moment the chat is ready", () => {
++    const { result, submit, rerender } = setup({ canSubmit: false });
++    act(() => result.current.toggle());
++    act(() => result.current.onFinal("hello"));
++    act(() => void vi.advanceTimersByTime(GRACE_MS + READY_WAIT_MS + READY_POLL_MS));
++    expect(result.current.phase).toBe("stalled");
++    act(() => void vi.advanceTimersByTime(STALLED_POLL_MS * 3));
++    expect(submit).not.toHaveBeenCalled();
++    rerender({ value: "hello", canSubmit: true });
++    act(() => void vi.advanceTimersByTime(STALLED_POLL_MS));
++    expect(submit).toHaveBeenCalledTimes(1);
++    expect(result.current.armed).toBe(false);
++  });
++});
+diff --git a/web/src/hooks/useAeVoiceStart.ts b/web/src/hooks/useAeVoiceStart.ts
+index d6546abec5de7a7c07f0cd8d51d92afe91ce70c6..8d9866fc74a0b3f7669434ba7d5138a7e419999f 100644
+--- a/web/src/hooks/useAeVoiceStart.ts
++++ b/web/src/hooks/useAeVoiceStart.ts
+@@ -17,6 +17,12 @@ import {
+ export const READY_POLL_MS = 500;
+ /** How long it waits before it says the chat was not ready. */
+ export const READY_WAIT_MS = 10_000;
++/** A held message that gave up waiting still checks this often and goes the moment the chat is ready. */
++export const STALLED_POLL_MS = 2000;
++/** One retry of a take that listened but heard nothing. */
++export const DEAF_RETRY_MS = 1000;
++/** Shown on the unavailable panel after the mic went quiet twice in a row. */
++export const START_MIC_DEAF_DETAIL = "Mic went quiet, tap to restart";
+ 
+ export interface UseAeVoiceStartArgs {
+   controller: MutableRefObject<AeMicController | null>;
+@@ -34,7 +40,9 @@ export interface AeVoiceStart {
+   toggle: () => void;
+   /** Listen again after the mic paused or was unavailable. */
+   restart: () => void;
+-  onListening: (listening: boolean) => void;
++  /** Why the mic is unavailable, when known. */
++  micDetail: string | null;
++  onListening: (listening: boolean, reason?: "deaf") => void;
+   onFinal: (text: string) => void;
+   disarm: () => void;
+ }
+@@ -47,7 +55,10 @@ export function useAeVoiceStart({
+ }: UseAeVoiceStartArgs): AeVoiceStart {
+   const [armed, setArmed] = useState(false);
+   const [phase, setPhase] = useState<VoicePhase>("off");
++  const [micDetail, setMicDetail] = useState<string | null>(null);
+   const everListened = useRef(false);
++  const deafStreak = useRef(0);
++  const retryTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   const latest = useRef({ value, canSubmit, submit });
+   latest.current = { value, canSubmit, submit };
+@@ -56,16 +67,23 @@ export function useAeVoiceStart({
+     if (timer.current !== null) clearTimeout(timer.current);
+     timer.current = null;
+   }, []);
++  const clearRetry = useCallback(() => {
++    if (retryTimer.current !== null) clearTimeout(retryTimer.current);
++    retryTimer.current = null;
++  }, []);
+ 
+   // After a submit the module flag stays set: the session is created asynchronously and
+   // takeVoiceArm reads it once the id is known.
+   const release = useCallback(() => {
+     clearTimer();
++    clearRetry();
+     setArmed(false);
+     setPhase("off");
++    setMicDetail(null);
+     everListened.current = false;
++    deafStreak.current = 0;
+     controller.current?.stop();
+-  }, [clearTimer, controller]);
++  }, [clearTimer, clearRetry, controller]);
+ 
+   const disarm = useCallback(() => {
+     disarmVoiceForNextChat();
+@@ -73,14 +91,36 @@ export function useAeVoiceStart({
+   }, [release]);
+ 
+   const onListening = useCallback(
+-    (listening: boolean) => {
++    (listening: boolean, reason?: "deaf") => {
+       if (!armed) return;
++      // A held message that is waiting for the chat keeps its own word on screen.
++      const held = (p: VoicePhase) => p === "preparing" || p === "stalled";
+       if (listening) {
+         everListened.current = true;
+-        setPhase("listening");
+-      } else setPhase(everListened.current ? "paused" : "unavailable");
++        setPhase((p) => (held(p) ? p : "listening"));
++        return;
++      }
++      if (reason === "deaf") {
++        // A take that listened but heard nothing: one retry on a new recognizer, then say so.
++        deafStreak.current += 1;
++        if (deafStreak.current === 1) {
++          logVoice("start mic retry");
++          setPhase((p) => (held(p) ? p : "starting"));
++          clearRetry();
++          retryTimer.current = setTimeout(() => {
++            retryTimer.current = null;
++            controller.current?.start();
++          }, DEAF_RETRY_MS);
++        } else {
++          logVoice("start mic failed");
++          setMicDetail(START_MIC_DEAF_DETAIL);
++          setPhase((p) => (held(p) ? p : "unavailable"));
++        }
++        return;
++      }
++      setPhase((p) => (held(p) ? p : everListened.current ? "paused" : "unavailable"));
+     },
+-    [armed],
++    [armed, clearRetry, controller],
+   );
+ 
+   // start() returns early on a mic that is already listening, so no event follows.
+@@ -99,6 +139,8 @@ export function useAeVoiceStart({
+     primeVoicePlayback();
+     armVoiceForNextChat();
+     everListened.current = false;
++    deafStreak.current = 0;
++    setMicDetail(null);
+     setArmed(true);
+     setPhase("starting");
+     controller.current?.start();
+@@ -109,15 +151,21 @@ export function useAeVoiceStart({
+   const restart = useCallback(() => {
+     // A fresh recognizer inside the tap: a start that is stuck (iOS) ignores a second start().
+     const c = controller.current;
++    deafStreak.current = 0;
++    clearRetry();
++    setMicDetail(null);
++    setPhase((p) => (p === "unavailable" || p === "paused" ? "starting" : p));
+     if (c?.restart) c.restart();
+     else c?.start();
+     reportIfListening();
+-  }, [controller, reportIfListening]);
++  }, [controller, reportIfListening, clearRetry]);
+ 
+   const onFinal = useCallback(
+     (_text: string) => {
+       if (!armed) return;
+       clearTimer();
++      // Something was heard: the mic is not deaf.
++      deafStreak.current = 0;
+       // Something new was said: the held message is not waiting any more.
+       setPhase((p) => (p === "preparing" || p === "stalled" ? "listening" : p));
+       // A pause after the sentence means it is finished; anything said sooner extends it.
+@@ -134,8 +182,13 @@ export function useAeVoiceStart({
+           return;
+         }
+         if (waited >= READY_WAIT_MS) {
+-          logVoice("start gave up", "chat not ready");
+-          setPhase("stalled");
++          // After the window it says so, but keeps a slow check: the message goes the
++          // moment the chat is ready, without a new utterance.
++          if (waited === READY_WAIT_MS) {
++            logVoice("start gave up", "chat not ready");
++            setPhase("stalled");
++          }
++          timer.current = setTimeout(() => tryNow(waited + STALLED_POLL_MS), STALLED_POLL_MS);
+           return;
+         }
+         if (waited === 0) {
+@@ -153,10 +206,11 @@ export function useAeVoiceStart({
+   useEffect(
+     () => () => {
+       if (timer.current !== null) clearTimeout(timer.current);
++      if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+       disarmVoiceForNextChat();
+     },
+     [],
+   );
+ 
+-  return { armed, phase, toggle, restart, onListening, onFinal, disarm };
++  return { armed, phase, micDetail, toggle, restart, onListening, onFinal, disarm };
+ }
+diff --git a/web/src/lib/aeVoiceMode.test.ts b/web/src/lib/aeVoiceMode.test.ts
+index 8752c603a5edbbb3b414cc6e9aafdd5994024282..9c8cdab0408530c2328bcf2f672a4beb44187720 100644
+--- a/web/src/lib/aeVoiceMode.test.ts
++++ b/web/src/lib/aeVoiceMode.test.ts
+@@ -1,10 +1,12 @@
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
++  approvalOf,
+   armVoiceForNextChat,
+   customAllowed,
+   disarmVoiceForNextChat,
+   getVoiceSnapshot,
+   isDoneWord,
++  matchApprovalReply,
+   matchSpokenOption,
+   matchSpokenOptions,
+   questionSpeech,
+@@ -255,3 +257,61 @@ describe("arming the next chat", () => {
+     expect(takeVoiceArm()).toBe(false);
+   });
+ });
++
++describe("matchApprovalReply", () => {
++  it.each(["run it", "Run it.", "yes", "yeah", "okay", "OK", "approve", "go ahead"])(
++    "accepts exactly %s",
++    (said) => {
++      expect(matchApprovalReply(said)).toBe("accept");
++    },
++  );
++  it.each(["decline", "no", "cancel", "don't run it", "do not run it", "stop"])(
++    "declines exactly %s",
++    (said) => {
++      expect(matchApprovalReply(said)).toBe("decline");
++    },
++  );
++  it.each([
++    "don't say yes",
++    "do not approve",
++    "never run it",
++    "not okay",
++    "no way, yes",
++    "yes but don't",
++    "I would not go ahead",
++  ])("never accepts the negated sentence %s", (said) => {
++    expect(matchApprovalReply(said)).not.toBe("accept");
++  });
++  it("matches nothing for two phrases together", () => {
++    expect(matchApprovalReply("run it or decline")).toBeNull();
++    expect(matchApprovalReply("Say run it, or decline.")).toBeNull();
++  });
++  it.each(["please run it for me", "yesterday", "okay then let's talk", "nobody", "stopwatch"])(
++    "does nothing for the substring in %s",
++    (said) => {
++      expect(matchApprovalReply(said)).toBeNull();
++    },
++  );
++});
++
++describe("approvalOf", () => {
++  const base = {
++    type: "elicitation",
++    elicitationId: "a1",
++    status: "pending",
++    contentPreview: "",
++    requestedSchema: {},
++  };
++  it("takes only the session-limit card", () => {
++    expect(approvalOf({ ...base, policyName: "ae_slot_cap" } as never)).toEqual({
++      id: "a1",
++      slotCap: true,
++    });
++  });
++  it.each([undefined, "", "bash_permission", "write_policy", "web_fetch"])(
++    "never takes a tool-permission card (policy %s)",
++    (policyName) => {
++      expect(approvalOf({ ...base, policyName } as never)).toBeNull();
++    },
++  );
++});
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index a3866857a9afdc3b6ffabb364a8b2bcf17694982..285128a86670472f2958f6f922f629c4f4391113 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -527,16 +527,21 @@ export function questionsOf(
+   return questions;
+ }
+ 
+-/** A pending yes-or-no card (not a question, a plan, a form or a link) Voice mode can answer. */
++/**
++ * A pending yes-or-no card Voice mode can answer. Only the session-limit card qualifies: a
++ * tool-permission card (Bash, Write, WebFetch) is never answered by a spoken word, because a
++ * prompt-injected call could be approved without the person looking at it.
++ */
+ export interface VoiceApproval {
+   id: string;
+-  /** True for the session-limit card, which has its own spoken line. */
++  /** Always true: the session-limit card is the only card with a spoken answer. */
+   slotCap: boolean;
+ }
+ 
+-/** The pending approval card, or null when the block is not a plain accept or decline card. */
++/** The pending session-limit card, or null for any other block. */
+ export function approvalOf(block: ElicitationBlock | undefined): VoiceApproval | null {
+   if (!block || block.status !== "pending") return null;
++  if (!/slot_cap/.test(block.policyName ?? "")) return null;
+   const askPayload =
+     castAskUserQuestionPayload(block.askUserQuestion) ??
+     parseAskUserQuestionPreview(block.contentPreview);
+@@ -549,7 +554,7 @@ export function approvalOf(block: ElicitationBlock | undefined): VoiceApproval |
+   }
+   const props = (block.requestedSchema as { properties?: unknown } | undefined)?.properties;
+   if (props && typeof props === "object" && Object.keys(props).length > 0) return null;
+-  return { id: block.elicitationId, slotCap: /slot_cap/.test(block.policyName ?? "") };
++  return { id: block.elicitationId, slotCap: true };
+ }
+ 
+ /** The line read aloud when an approval card appears. */
+@@ -559,18 +564,27 @@ export function approvalSpeech(approval: VoiceApproval): string {
+     : "Approval needed. Say run it, or decline.";
+ }
+ 
+-const APPROVE_WORDS = new Set(["yes", "ok", "okay", "yeah", "approve", "accept", "proceed"]);
+-const DECLINE_WORDS = new Set(["decline", "no", "cancel", "reject", "deny", "nope"]);
++/** How long after the approval line stops playing a heard final still counts as its echo. */
++export const APPROVAL_TAIL_MS = 2500;
++
++const ACCEPT_PHRASES = new Set(["run it", "yes", "yeah", "okay", "ok", "approve", "go ahead"]);
++const DECLINE_PHRASES = new Set([
++  "decline",
++  "no",
++  "cancel",
++  "dont run it",
++  "do not run it",
++  "stop",
++]);
+ 
+ /**
+- * The verdict a short spoken reply gives: "run it", "yes" and "ok" accept; "decline", "no" and
+- * "cancel" decline. A decline word wins; a long sentence is conversation, not an answer.
++ * The verdict a spoken reply gives. Only a whole utterance that is exactly one of the listed
++ * phrases counts ("run it", "yes", "decline", "no"); a longer sentence, a negation or two
++ * phrases together ("run it or decline") match nothing.
+  */
+ export function matchApprovalReply(text: string): "accept" | "decline" | null {
+-  const said = words(text);
+-  if (said.length === 0 || said.length > 5) return null;
+-  if (said.some((w) => DECLINE_WORDS.has(w))) return "decline";
+-  const joined = said.join(" ");
+-  if (said.some((w) => APPROVE_WORDS.has(w)) || /\brun it\b/.test(joined)) return "accept";
++  const said = words(text).join(" ");
++  if (DECLINE_PHRASES.has(said)) return "decline";
++  if (ACCEPT_PHRASES.has(said)) return "accept";
+   return null;
+ }
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 1308cf18dba98e46ce5a6aa07c7c8861d810536c..6f829446fe626407179a921489d92e2f7df6ce3e 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3830,7 +3830,8 @@ function ComposerImpl(
+                     resumePlayback();
+                   }}
+                   onKeyboard={voiceSheet ? voiceTyping.startTyping : undefined}
+-                  onRestartMic={() => micController.current?.restart()}
++                  onRestartMic={voice.restartMic}
++                  approvalActive={voice.approvalActive}
+                   micStartPath={() => micController.current?.startPath() ?? null}
+                 />
+               ) : null}
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 1121cb55877ccac491dd9f4e895c49ea9493d7c8..fb107f47cec31e00480c7c7be84a9c94c22afd0e 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -6682,6 +6682,7 @@ export function NewChatLandingScreen() {
+                         blocked={false}
+                         heard={message}
+                         caption=""
++                        micDetail={voiceStart.micDetail}
+                         onEnd={voiceStart.disarm}
+                         onStop={() => {}}
+                         onResume={() => {}}

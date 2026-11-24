@@ -36,6 +36,7 @@ def on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         "AE_DECISION_SHADOW_FILE": str(tmp_path / "shadow.jsonl"),
     }.items():
         monkeypatch.setenv(k, v)
+    monkeypatch.setenv("AE_DECISION_CALLS_FILE", str(tmp_path / "calls.json"))
     return deny
 
 
@@ -67,6 +68,15 @@ async def test_agent_ask_kill_switch(
 ) -> None:
     monkeypatch.setenv("AE_DECISION_POINTS", "agent_ask:off")
     modes = {p["name"]: p["mode"] for p in (await get(client))["points"]}
+    assert modes["agent_ask"] == ds.OFF and modes["advisor"] == ds.LIVE
+
+
+async def test_a_legacy_nudge_setting_does_not_bring_the_point_back(
+    client: httpx.AsyncClient, on: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_DECISION_POINTS", "nudge:off,agent_ask:off")
+    modes = {p["name"]: p["mode"] for p in (await get(client))["points"]}
+    assert "nudge" not in modes
     assert modes["agent_ask"] == ds.OFF and modes["advisor"] == ds.LIVE
 
 
@@ -176,8 +186,8 @@ async def test_shadow_counts_and_usage(
     (tmp_path / "shadow.jsonl").write_text(
         "\n".join(json.dumps(r) for r in rows) + "\nnot json\n", encoding="utf-8"
     )
-    ds._limits.day_count = 3
-    ds._limits.day = ds.datetime.fromtimestamp(ds._now(), ds.UTC).strftime("%Y-%m-%d")
+    for _ in range(3):
+        ds.note_call()
     ds._limits.open_until = ds._mono() + 120
     body = await get(client)
     assert body["shadow"] == {"would_act_7d": 1, "lines_7d": 2}
@@ -294,3 +304,82 @@ async def test_a_slow_read_times_out_and_hides_the_tools(
     monkeypatch.setattr(omni, "call", slow)
     assert not set(await _names(omni)) & JUDGE_TOOLS
     assert omni.judge_seen is not None and omni.judge_seen[1] is False
+
+
+def test_calls_today_is_the_saved_counter_and_survives_a_restart(
+    on: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [1_800_000_000.0]  # 2027-01-15 08:00 UTC
+    monkeypatch.setattr(ds, "_now", lambda: now[0])
+    assert st.build("local")["calls_today"] == 0
+    for _ in range(3):
+        ds.note_call()
+    out = st.build("local")
+    assert out["calls_today"] == 3 and out["daily_cap"] == ds.DEFAULT_DAILY_CAP
+    assert json.loads((tmp_path / "calls.json").read_text()) == {"day": "2027-01-15", "count": 3}
+    # a restart: memory gone, the count comes back from the file, and it keeps counting
+    ds.reset()
+    monkeypatch.setattr(ds, "_now", lambda: now[0])
+    assert st.build("local")["calls_today"] == 3
+    ds.note_call()
+    assert st.build("local")["calls_today"] == 4
+    # the cap still counts from memory only: nothing was admitted since the restart
+    assert ds._limits.day_count == 0
+
+
+def test_the_counter_rolls_over_at_utc_midnight(
+    on: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    now = [1_800_000_000.0 + 15 * 3600 + 59 * 60]  # 23:59 UTC
+    monkeypatch.setattr(ds, "_now", lambda: now[0])
+    ds.note_call()
+    ds.note_call()
+    assert ds.calls_today() == 2
+    now[0] += 120  # 00:01 the next day
+    assert ds.calls_today() == 0
+    ds.note_call()
+    assert ds.calls_today() == 1
+    assert json.loads((tmp_path / "calls.json").read_text())["count"] == 1
+    # yesterday's file is ignored after a restart on the new day
+    (tmp_path / "calls.json").write_text('{"day": "2027-01-15", "count": 9}')
+    ds.reset()
+    monkeypatch.setattr(ds, "_now", lambda: now[0])
+    assert ds.calls_today() == 0
+
+
+def test_a_missing_or_unwritable_counter_file_keeps_the_memory_count(
+    on: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ds.note_call()
+    ds.reset()
+    (tmp_path / "calls.json").write_text("not json")  # unreadable: starts from zero
+    assert ds.calls_today() == 0
+    blocker = tmp_path / "blocker"
+    blocker.write_text("a file, so the directory cannot be made")
+    monkeypatch.setenv("AE_DECISION_CALLS_FILE", str(blocker / "calls.json"))
+    ds.reset()
+    ds.note_call()
+    ds.note_call()
+    assert st.build("local")["calls_today"] == 2  # the failed save kept the count
+    monkeypatch.setenv("AE_DECISION_CALLS_FILE", "")  # no file: memory only
+    ds.reset()
+    ds.note_call()
+    assert ds.calls_today() == 1
+
+
+REPORT_URL = "/v1/ae/decision/report"
+OWNER_H = {"X-Forwarded-Email": "owner@example.com"}
+MEMBER_H = {"X-Forwarded-Email": "member@example.com"}
+
+
+async def test_report_is_admin_only_and_holds_counts(
+    client: httpx.AsyncClient, ae_admins: set[str], on: Path
+) -> None:
+    assert (await client.get(REPORT_URL, headers=MEMBER_H)).status_code == 403
+    resp = await client.get(REPORT_URL, headers=OWNER_H)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["days"] == 7 and body["asks"]["total"] == 0 and body["nudges"]["total"] == 0
+    assert (await client.get(REPORT_URL + "?days=30", headers=OWNER_H)).json()["days"] == 30
+    for bad in ("0", "31"):
+        assert (await client.get(f"{REPORT_URL}?days={bad}", headers=OWNER_H)).status_code == 422

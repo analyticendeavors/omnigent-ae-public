@@ -130,6 +130,9 @@ class Decision1Judge:
         if not state_ok(point, state):
             return None, Verdict(None, error="bad_state", judge=self.name), started
         body = {"model": cfg.deployment, "state": dict(state), "questions": {"q": question}}
+        from . import decision_shadow  # circular import
+
+        decision_shadow.note_call()  # the request goes out now; a timeout or error still counts
         try:
             data = await da._post(cfg, body)
         except da.AdvisorError as exc:

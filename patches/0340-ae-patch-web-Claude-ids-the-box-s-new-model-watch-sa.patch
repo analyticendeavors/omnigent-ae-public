@@ -1,0 +1,465 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 00:35:10 -0800
+Subject: [PATCH 340/443] [ae-patch] web: Claude ids the box's new-model watch
+ saw answer join the model pickers, and Mythos counts as a family
+
+A small external store holds the watched ids (aeSetWatchedModels, aeKnownModels, useAeWatchedModels);
+the promotion and Previous-models steps read the static list plus the watched ids, and the three
+picker callers rerun when they change. useAeModelWatch reads GET /v1/ae/model-watch once an hour from
+the app shell; a failed read leaves the built-in list in place.
+---
+ web/src/hooks/useAeModelWatch.test.tsx | 93 ++++++++++++++++++++++++++
+ web/src/hooks/useAeModelWatch.ts       | 41 ++++++++++++
+ web/src/hooks/useAeRoleModels.ts       |  7 +-
+ web/src/lib/aeClaudeModels.test.ts     | 50 +++++++++++++-
+ web/src/lib/aeClaudeModels.ts          | 87 ++++++++++++++++++++++--
+ web/src/shell/AppShell.tsx             |  4 ++
+ web/src/shell/NewChatDialog.tsx        |  6 +-
+ 7 files changed, 275 insertions(+), 13 deletions(-)
+ create mode 100644 web/src/hooks/useAeModelWatch.test.tsx
+ create mode 100644 web/src/hooks/useAeModelWatch.ts
+
+diff --git a/web/src/hooks/useAeModelWatch.test.tsx b/web/src/hooks/useAeModelWatch.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..d1a14bf01fcfd6b5f750a285935728371337a7a1
+--- /dev/null
++++ b/web/src/hooks/useAeModelWatch.test.tsx
+@@ -0,0 +1,93 @@
++// The new-model watch's read: served ids feed the Claude model pickers, a failed read leaves the
++// built-in list alone, and a picker rerenders when the ids arrive.
++
++import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
++import { act, renderHook, waitFor } from "@testing-library/react";
++import type { ReactNode } from "react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++
++const mocks = vi.hoisted(() => ({ fetch: vi.fn() }));
++vi.mock("@/lib/identity", () => ({ authenticatedFetch: mocks.fetch }));
++
++import type { NativeModelOption } from "@/lib/types";
++import { aeSetWatchedModels, aeWatchedModels, useAeClaudeVersions } from "@/lib/aeClaudeModels";
++import { aeParseModelWatch, useAeModelWatch } from "./useAeModelWatch";
++
++const json = (body: unknown, status = 200) =>
++  new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
++
++const SUBSCRIPTION = { kind: "subscription", label: "Subscription", name: "claude" };
++const CATALOG: NativeModelOption[] = [
++  {
++    id: "claude-fable-5-2[1m]",
++    model: "claude-fable-5-2",
++    displayName: "Fable",
++    source: SUBSCRIPTION,
++  },
++];
++
++let client: QueryClient;
++
++beforeEach(() => {
++  client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
++  mocks.fetch.mockReset();
++  aeSetWatchedModels([]);
++});
++
++afterEach(() => {
++  client.clear();
++  aeSetWatchedModels([]);
++});
++
++function wrapper({ children }: { children: ReactNode }) {
++  return <QueryClientProvider client={client}>{children}</QueryClientProvider>;
++}
++
++describe("aeParseModelWatch", () => {
++  it("reads served_ids and nothing else", () => {
++    expect(aeParseModelWatch({ served_ids: ["claude-fable-5-3", 7] })).toEqual([
++      "claude-fable-5-3",
++    ]);
++    expect(aeParseModelWatch({ models: [] })).toBeNull();
++    expect(aeParseModelWatch(null)).toBeNull();
++  });
++});
++
++describe("useAeModelWatch", () => {
++  it("puts the served ids into the known list", async () => {
++    mocks.fetch.mockResolvedValue(json({ served_ids: ["claude-fable-5-3"] }));
++    renderHook(() => useAeModelWatch(), { wrapper });
++    await waitFor(() => expect(aeWatchedModels()).toEqual(["claude-fable-5-3"]));
++    expect(mocks.fetch.mock.calls[0][0]).toBe("/v1/ae/model-watch");
++  });
++
++  it("leaves the built-in list in place when the read fails", async () => {
++    mocks.fetch.mockResolvedValue(json({}, 500));
++    renderHook(() => useAeModelWatch(), { wrapper });
++    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
++    await new Promise((resolve) => {
++      setTimeout(resolve, 0);
++    });
++    expect(aeWatchedModels()).toEqual([]);
++  });
++
++  it("does not throw when the read itself rejects", async () => {
++    mocks.fetch.mockRejectedValue(new Error("offline"));
++    const { result } = renderHook(() => useAeModelWatch(), { wrapper });
++    await waitFor(() => expect(mocks.fetch).toHaveBeenCalled());
++    expect(result.current).toBeUndefined();
++    expect(aeWatchedModels()).toEqual([]);
++  });
++});
++
++describe("useAeClaudeVersions with watched ids", () => {
++  it("reruns when a watched id arrives and takes the row's place", () => {
++    const { result } = renderHook(() => useAeClaudeVersions(CATALOG, true));
++    expect(result.current.some((row) => row.id === "claude-fable-5-3[1m]")).toBe(false);
++    act(() => aeSetWatchedModels(["claude-fable-5-3"]));
++    expect(result.current.find((row) => row.id === "claude-fable-5-3[1m]")?.displayName).toBe(
++      "Fable 5.3 (1M context)",
++    );
++    expect(result.current.some((row) => row.id === "claude-fable-5-2")).toBe(true);
++  });
++});
+diff --git a/web/src/hooks/useAeModelWatch.ts b/web/src/hooks/useAeModelWatch.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..74449fe650f9c07c816486a4e5a0dff92b313184
+--- /dev/null
++++ b/web/src/hooks/useAeModelWatch.ts
+@@ -0,0 +1,41 @@
++// The ids the box's new-model watch saw answer on the plan (omnigent-ae, 2026-11-10):
++// `GET /v1/ae/model-watch` feeds the Claude model pickers' known list, so a new model such
++// as Fable 5.2 shows up without a release. Mounted once, in the app shell. A failed fetch
++// leaves the built-in list in place; the pickers never wait on it.
++
++import { useQuery } from "@tanstack/react-query";
++import { useEffect } from "react";
++import { aeSetWatchedModels } from "@/lib/aeClaudeModels";
++import { authenticatedFetch } from "@/lib/identity";
++
++export const AE_MODEL_WATCH_QUERY_KEY = ["ae", "model-watch"] as const;
++const STALE_MS = 60 * 60 * 1000;
++
++/** The served ids in the route's answer, or null when it is not the expected shape. */
++export function aeParseModelWatch(value: unknown): string[] | null {
++  const ids = (value as { served_ids?: unknown } | null)?.served_ids;
++  if (!Array.isArray(ids)) return null;
++  return ids.filter((id): id is string => typeof id === "string");
++}
++
++async function fetchServedIds(): Promise<string[]> {
++  const res = await authenticatedFetch("/v1/ae/model-watch", { method: "GET" });
++  if (!res.ok) throw new Error(`GET /v1/ae/model-watch answered ${res.status}`);
++  const ids = aeParseModelWatch(await res.json());
++  if (!ids) throw new Error("GET /v1/ae/model-watch answered without served_ids");
++  return ids;
++}
++
++export function useAeModelWatch(): void {
++  const query = useQuery({
++    queryKey: AE_MODEL_WATCH_QUERY_KEY,
++    queryFn: fetchServedIds,
++    staleTime: STALE_MS,
++    retry: false,
++    refetchOnWindowFocus: false,
++  });
++  const ids = query.data;
++  useEffect(() => {
++    if (ids) aeSetWatchedModels(ids);
++  }, [ids]);
++}
+diff --git a/web/src/hooks/useAeRoleModels.ts b/web/src/hooks/useAeRoleModels.ts
+index d097efbcad6210bc9f22f81d529bb0676b50ead3..261f8515b361d76da2037d2fcdbcd31699541a7f 100644
+--- a/web/src/hooks/useAeRoleModels.ts
++++ b/web/src/hooks/useAeRoleModels.ts
+@@ -3,7 +3,7 @@
+ 
+ import { useMemo } from "react";
+ import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+-import { aeWithClaudeVersions } from "@/lib/aeClaudeModels";
++import { aeWithClaudeVersions, useAeWatchedModels } from "@/lib/aeClaudeModels";
+ import { aeModelLabel } from "@/lib/aeRoles";
+ 
+ /** The Claude catalog the role table offers. */
+@@ -27,10 +27,11 @@ export function useAeRoleModels(): {
+   const host =
+     online.find((h) => h.configured_harnesses?.[CLAUDE_HARNESS] === true) ?? online[0] ?? null;
+   const catalog = useHostModelOptions(host?.host_id ?? null, CLAUDE_HARNESS, true, { poll: false });
++  const watchedIds = useAeWatchedModels();
+   return useMemo(() => {
+     const seen = new Set<string>();
+     const models: AeRoleModelChoice[] = [];
+-    for (const row of aeWithClaudeVersions(catalog.data ?? [])) {
++    for (const row of aeWithClaudeVersions(catalog.data ?? [], watchedIds)) {
+       const value = (row.model ?? row.id).replace(/\[[^\]]*\]$/, "");
+       if (seen.has(value)) continue;
+       seen.add(value);
+@@ -44,5 +45,5 @@ export function useAeRoleModels(): {
+           ? "The model list is unavailable right now; the models already in this preset still save."
+           : null;
+     return { models, ids: models.map((m) => m.value), note };
+-  }, [catalog.data, catalog.isError, host, hostsLoaded]);
++  }, [catalog.data, catalog.isError, host, hostsLoaded, watchedIds]);
+ }
+diff --git a/web/src/lib/aeClaudeModels.test.ts b/web/src/lib/aeClaudeModels.test.ts
+index a2bd105d3f9bd31a054bbea85576e629ba233037..20811e4cfc23ee048f86ecd2d68d7e69d5a89f57 100644
+--- a/web/src/lib/aeClaudeModels.test.ts
++++ b/web/src/lib/aeClaudeModels.test.ts
+@@ -1,11 +1,13 @@
+ // Tests for Claude version labels and older models (omnigent-ae, 2026-10-19).
+ 
+-import { describe, expect, it } from "vitest";
++import { afterEach, describe, expect, it } from "vitest";
+ import type { NativeModelOption } from "@/lib/types";
+ import {
+   AE_CLAUDE_KNOWN_MODELS,
+   aeClaudeVersion,
+   aeClaudeVersionLabel,
++  aeKnownModels,
++  aeSetWatchedModels,
+   aeSplitPrevious,
+   aeMergeKnownClaudeModels,
+   aeWithClaudeVersions,
+@@ -255,3 +257,49 @@ describe("promotion of a newer known model", () => {
+     expect(rows.some((row) => row.id === "claude-fable-5-2")).toBe(true);
+   });
+ });
++
++describe("the watched known list", () => {
++  afterEach(() => aeSetWatchedModels([]));
++
++  it("is the static list, unchanged, when nothing is watched", () => {
++    expect(aeKnownModels()).toEqual(AE_CLAUDE_KNOWN_MODELS);
++  });
++
++  it("adds valid ids, sorted by family then newest version, and drops the rest", () => {
++    aeSetWatchedModels([
++      "claude-fable-5-3",
++      "claude-mythos-5-2",
++      "claude-opus-5-5[1m]",
++      "gpt-5",
++      "claude-opus-4-20250514",
++      7,
++    ]);
++    const known = aeKnownModels();
++    expect(known.indexOf("claude-fable-5-3")).toBeLessThan(known.indexOf("claude-fable-5-2"));
++    expect(known).toContain("claude-mythos-5-2");
++    expect(known.some((id) => id.includes("[1m]") || id.includes("2025") || id === "gpt-5")).toBe(
++      false,
++    );
++    expect(known.indexOf("claude-opus-5-5")).toBeLessThan(known.indexOf("claude-sonnet-5-5"));
++  });
++
++  it("keeps one array until the ids change", () => {
++    aeSetWatchedModels(["claude-fable-5-3"]);
++    const first = aeKnownModels();
++    aeSetWatchedModels(["claude-fable-5-3"]);
++    expect(aeKnownModels()).toBe(first);
++  });
++
++  it("reads Mythos ids as a family", () => {
++    expect(aeClaudeVersionLabel("claude-mythos-5-2")).toBe("Mythos 5.2");
++    expect(aeClaudeVersion("claude-mythos-5")?.family).toBe("mythos");
++  });
++
++  it("promotes a watched id over the catalog's newest row", () => {
++    aeSetWatchedModels(["claude-fable-5-3"]);
++    const rows = aeWithClaudeVersions(CATALOG);
++    expect(rows.find((row) => row.id === "claude-fable-5-3[1m]")?.displayName).toBe(
++      "Fable 5.3 (1M context)",
++    );
++  });
++});
+diff --git a/web/src/lib/aeClaudeModels.ts b/web/src/lib/aeClaudeModels.ts
+index fa6a420947a7ffa4168f00dde5f7b1969acb4488..faa5d51ce3917a5761f170fa4c960576b2bb11d8 100644
+--- a/web/src/lib/aeClaudeModels.ts
++++ b/web/src/lib/aeClaudeModels.ts
+@@ -2,8 +2,9 @@
+ // 2026-10-19). A subscription catalog lists only each family's newest model, so the
+ // older ids it still serves come from AE_CLAUDE_KNOWN_MODELS, each checked to answer.
+ // 2026-11-10: a known id newer than the catalog's newest row of its family now takes that row's place (Fable 5.2).
++// 2026-11-10: ids the box's new-model watch saw answer on the plan join the known list at run time.
+ 
+-import { useMemo } from "react";
++import { useMemo, useSyncExternalStore } from "react";
+ import type { NativeModelOption } from "@/lib/types";
+ 
+ /** Full Claude ids a Claude subscription serves, newest first within each family. */
+@@ -35,9 +36,9 @@ export interface AeClaudeVersion {
+ // never read as a version. Matches ids ("claude-opus-4-8"), alias ids
+ // ("opus-4-10") and labels ("Sonnet 4.6").
+ const CLAUDE_VERSION =
+-  /(?:^|[-_.])(fable|opus|sonnet|haiku)[-_ ](\d{1,2})(?:[-_.](\d{1,2}))?(?=$|[-_[\s])/i;
++  /(?:^|[-_.])(fable|opus|sonnet|haiku|mythos)[-_ ](\d{1,2})(?:[-_.](\d{1,2}))?(?=$|[-_[\s])/i;
+ 
+-const BARE_CLAUDE_LABEL = /^(fable|opus|sonnet|haiku)(?:[\s_-]\d+(?:[.\-_]\d+)?)?$/i;
++const BARE_CLAUDE_LABEL = /^(fable|opus|sonnet|haiku|mythos)(?:[\s_-]\d+(?:[.\-_]\d+)?)?$/i;
+ 
+ /** The family and version in a Claude id or label, or null when it has none. */
+ export function aeClaudeVersion(value: string): AeClaudeVersion | null {
+@@ -79,6 +80,71 @@ function newestByFamily<T>(rows: readonly T[], versionOf: (row: T) => AeClaudeVe
+   return newest;
+ }
+ 
++// Ids the box's new-model watch saw answer on the plan (GET /v1/ae/model-watch), kept outside React
++// so the pure merge below reads them and the pickers' memos rerun when they arrive.
++const WATCHED_ID = /^claude-(?:fable|opus|sonnet|haiku|mythos)-\d{1,2}(?:-\d{1,2})?$/;
++let watched: readonly string[] = [];
++let knownCache: { source: readonly string[]; list: readonly string[] } | null = null;
++const watchListeners = new Set<() => void>();
++
++/** Replaces the watched ids; anything that is not a bare Claude id is dropped. A same set is a no-op. */
++export function aeSetWatchedModels(ids: readonly unknown[]): void {
++  const next = [
++    ...new Set(ids.filter((id): id is string => typeof id === "string" && WATCHED_ID.test(id))),
++  ].sort();
++  if (next.length === watched.length && next.every((id, index) => id === watched[index])) return;
++  watched = next;
++  knownCache = null;
++  for (const listener of watchListeners) listener();
++}
++
++/** The ids the watch holds right now (a new array only when they change). */
++export function aeWatchedModels(): readonly string[] {
++  return watched;
++}
++
++function subscribeWatched(listener: () => void): () => void {
++  watchListeners.add(listener);
++  return () => {
++    watchListeners.delete(listener);
++  };
++}
++
++/** Rerenders the caller when the watched ids change; returns them. */
++export function useAeWatchedModels(): readonly string[] {
++  return useSyncExternalStore(subscribeWatched, aeWatchedModels, aeWatchedModels);
++}
++
++/**
++ * The static known ids plus the watched ones, newest first within each family, families in the
++ * order they first appear. With nothing watched this is `AE_CLAUDE_KNOWN_MODELS` unchanged.
++ */
++export function aeKnownModels(): readonly string[] {
++  if (knownCache?.source === watched) return knownCache.list;
++  const ids = [...new Set([...AE_CLAUDE_KNOWN_MODELS, ...watched])];
++  const order: string[] = [];
++  for (const id of ids) {
++    const family = aeClaudeVersion(id)?.family;
++    if (family && !order.includes(family)) order.push(family);
++  }
++  const rank = (id: string) => {
++    const family = aeClaudeVersion(id)?.family;
++    return family ? order.indexOf(family) : order.length;
++  };
++  const list = ids
++    .map((id, index) => ({ id, index, version: aeClaudeVersion(id) }))
++    .sort(
++      (a, b) =>
++        rank(a.id) - rank(b.id) ||
++        (b.version?.major ?? 0) - (a.version?.major ?? 0) ||
++        (b.version?.minor ?? 0) - (a.version?.minor ?? 0) ||
++        a.index - b.index,
++    )
++    .map((entry) => entry.id);
++  knownCache = { source: watched, list };
++  return list;
++}
++
+ const CONTEXT_SUFFIX = /\[1m\]$/i;
+ 
+ function isSubscription(row: NativeModelOption): boolean {
+@@ -135,7 +201,7 @@ export function aeMergeKnownClaudeModels(
+   catalog: NativeModelOption[],
+   extraKnown: readonly string[] = [],
+ ): NativeModelOption[] {
+-  const known = [...new Set([...extraKnown, ...AE_CLAUDE_KNOWN_MODELS])];
++  const known = [...new Set([...extraKnown, ...aeKnownModels()])];
+   const rows = promoteKnown(catalog, known);
+   const subscriptionRows = rows.filter(isSubscription);
+   const newest = newestByFamily(subscriptionRows, rowVersion);
+@@ -169,8 +235,11 @@ export function aeMergeKnownClaudeModels(
+ }
+ 
+ /** {@link aeMergeKnownClaudeModels} with the built-in known list. */
+-export function aeWithClaudeVersions(rows: NativeModelOption[]): NativeModelOption[] {
+-  return aeMergeKnownClaudeModels(rows);
++export function aeWithClaudeVersions(
++  rows: NativeModelOption[],
++  extraKnown: readonly string[] = [],
++): NativeModelOption[] {
++  return aeMergeKnownClaudeModels(rows, extraKnown);
+ }
+ 
+ /** {@link aeWithClaudeVersions} for a picker, memoized; `rows` unchanged when not Claude. */
+@@ -178,7 +247,11 @@ export function useAeClaudeVersions<T extends NativeModelOption[] | undefined>(
+   rows: T,
+   claude: boolean,
+ ): T {
+-  return useMemo(() => (claude && rows ? (aeWithClaudeVersions(rows) as T) : rows), [rows, claude]);
++  const watchedIds = useAeWatchedModels();
++  return useMemo(
++    () => (claude && rows ? (aeWithClaudeVersions(rows, watchedIds) as T) : rows),
++    [rows, claude, watchedIds],
++  );
+ }
+ 
+ /**
+diff --git a/web/src/shell/AppShell.tsx b/web/src/shell/AppShell.tsx
+index 8cbb07843d5b72b101b4dfcd925b92555f38aac4..c707721d729f9116ed2a1d019f71f58dc59cb0c7 100644
+--- a/web/src/shell/AppShell.tsx
++++ b/web/src/shell/AppShell.tsx
+@@ -22,6 +22,7 @@ import { PROJECT_LABEL_KEY, type Conversation, useProjects } from "@/hooks/useCo
+ import { conversationDisplayLabel, UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
+ import { useSessionAgent } from "@/hooks/useAgents";
+ import { useApproveHotkey } from "@/hooks/useApproveHotkey";
++import { useAeModelWatch } from "@/hooks/useAeModelWatch";
+ import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
+ import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
+ import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
+@@ -222,6 +223,9 @@ function resolveTerminalViewKey(stored: string | null, agentKey: string): string
+ }
+ 
+ export function AppShell() {
++  // Claude model ids the box's new-model watch saw answer join the model pickers.
++  useAeModelWatch();
++
+   // Cmd/Ctrl+Enter accepts the pending harness approval prompt. Bound once
+   // here so it works on every chat route, regardless of where focus sits.
+   useApproveHotkey();
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 6aef999519d20c6529a87fff2e3c05dbeef351b7..8d728d1511e808601bc81d6f51ac1d315a72e2be 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -43,7 +43,7 @@ import { AeCompactSessionChoices } from "@/components/composer/AeCompactSessionC
+ import { aeWithPreviousModels } from "@/components/composer/AePreviousModelsSub";
+ import { buildFusionSections } from "@/components/composer/fusionSections";
+ import { compactModelTriggerLabel, normalizeEffortLabel } from "@/lib/composerModelLabel";
+-import { aeSplitPrevious, aeWithClaudeVersions } from "@/lib/aeClaudeModels";
++import { aeSplitPrevious, aeWithClaudeVersions, useAeWatchedModels } from "@/lib/aeClaudeModels";
+ import { AE_MENU_NOTE_CLASS, AE_MENU_WIDTH_CLASS } from "@/lib/aeMenuRow";
+ import { aeModelRowForDigit } from "@/lib/aeModelShortcut";
+ import { AeClaudeAccountSubmenu } from "./AeClaudeAccountSubmenu";
+@@ -3252,6 +3252,7 @@ export function NewChatLandingScreen() {
+       sandboxModels.data,
+     ],
+   );
++  const watchedClaudeIds = useAeWatchedModels();
+   const claudeModelOptions = useMemo(
+     () =>
+       sandboxSelected
+@@ -3259,7 +3260,7 @@ export function NewChatLandingScreen() {
+           (sandboxCatalogPending || sandboxCatalogError
+             ? []
+             : CLAUDE_NATIVE_MODELS.map((model) => ({ id: model.id, displayName: model.id }))))
+-        : aeWithClaudeVersions(availableClaudeModels ?? []).map((option) => ({
++        : aeWithClaudeVersions(availableClaudeModels ?? [], watchedClaudeIds).map((option) => ({
+             id: option.id,
+             model: option.model,
+             displayName: nativeModelLabel(option),
+@@ -3274,6 +3275,7 @@ export function NewChatLandingScreen() {
+       sandboxCatalog,
+       sandboxCatalogPending,
+       sandboxCatalogError,
++      watchedClaudeIds,
+     ],
+   );
+   const codexModelOptions = useMemo(

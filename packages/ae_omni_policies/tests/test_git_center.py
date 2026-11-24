@@ -619,7 +619,7 @@ async def test_the_held_answer_is_whole_and_the_needs_list_reads_all_of_it() -> 
     assert (len(repo["prs"]), len(repo["alerts"]), len(repo["branches"])) == (60, 130, 60)
     items = git_center.needs(full, 1_800_000_000.0)
     fix = next(i for i in items if i["kind"] == "alerts-fix")
-    assert fix["title"].startswith("130 alerts to fix")
+    assert fix["title"].startswith("130 Dependabot alerts: ")
     assert any(i["kind"] == "branch" for i in items)
     assert all(s["ok"] for s in git_center.scope_ids(full))
     assert not any("_full_" in k for a in repo["alerts"] for k in a)
@@ -1292,3 +1292,23 @@ def test_error_codes_are_short_and_carry_no_sentence() -> None:
     )
     assert git_center.error_code("GitHub did not answer for a/b (X); try again.") == "no_answer"
     assert git_center.error_code("something else") == "error"
+
+
+def test_alerts_title_counts_alerts_and_other_packages_once_each() -> None:
+    mixed = [
+        {"package": "Pillow"},
+        {"package": "pillow"},
+        {"package": "lodash"},
+        {"package": "ws"},
+    ]
+    assert git_center._alerts_title(mixed) == "4 Dependabot alerts: Pillow and 2 more packages"
+    assert git_center._alerts_title([{"package": "Pillow"}]) == "1 Dependabot alert: Pillow"
+    same = [{"package": "Pillow"}, {"package": "pillow"}]
+    assert git_center._alerts_title(same) == "2 Dependabot alerts: Pillow"
+    two = [{"package": "a"}, {"package": "b"}]
+    assert git_center._alerts_title(two) == "2 Dependabot alerts: a and 1 more package"
+    assert git_center._alerts_title([{"package": ""}]) == "1 Dependabot alert: unknown package"
+    odd = [{}, {"package": "a"}, {"package": " "}]
+    assert git_center._alerts_title(odd) == "3 Dependabot alerts: a"
+    blanks = [{"package": ""}, {"package": "a"}, {"package": "b"}, {}]
+    assert git_center._alerts_title(blanks) == "4 Dependabot alerts: a and 1 more package"

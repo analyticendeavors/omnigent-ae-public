@@ -1,0 +1,531 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 13:30:00 -0800
+Subject: [PATCH 397/443] [ae-patch] Fix the review findings on 0396: a stop
+ during the synth wait ends the take
+
+A Stop (toggle, controller stop, Esc, composer disabled) while the mic start waits for the priming utterance now drops the wait and ends the take, so the mic never starts afterwards. Restart, the start watchdog and a recognizer replace drop a pending wait first and never overwrite a live cancel; the wait callback bails when its recognizer was replaced. whenSynthIdle waits only for the prime utterance (tracked by a module flag cleared on its end or error) and never cancels a real reply. Adds wiring tests and a doc comment on the WebKit cloud path skipping the synth unlock.
+---
+ web/src/components/AeVoicePanel.test.tsx      |  24 ++++-
+ web/src/components/ComposerMicButton.test.tsx | 100 ++++++++++++++++++
+ web/src/components/ComposerMicButton.tsx      |  80 +++++++++++++-
+ web/src/lib/aeSpeakReplies.test.ts            |  43 ++++++++
+ web/src/lib/aeSpeakReplies.ts                 |  51 +++++++--
+ 5 files changed, 287 insertions(+), 11 deletions(-)
+
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index 85f433384d1916adae829483e9dff217b78c8cee..794843123aa8f05416eb6f4c1cefe1e623546e4a 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -1,4 +1,4 @@
+-import { act, render, screen } from "@testing-library/react";
++import { act, cleanup, render, screen } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
+ import { afterEach, describe, expect, it, vi } from "vitest";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+@@ -278,3 +278,25 @@ describe("AeVoicePanel (stuck start)", () => {
+     expect(screen.queryByText("Tap to start the mic")).toBeNull();
+   });
+ });
++
++describe("AeVoicePanel (sheet controls)", () => {
++  it("the sheet without an approval shows the keyboard and End as before", async () => {
++    const onKeyboard = vi.fn();
++    const { onEnd } = panel({ layout: "sheet", onKeyboard });
++    expect(screen.queryByTestId("ae-voice-approval")).toBeNull();
++    await userEvent.click(screen.getByRole("button", { name: "Type instead" }));
++    expect(onKeyboard).toHaveBeenCalledTimes(1);
++    await userEvent.click(screen.getByRole("button", { name: "End voice mode" }));
++    expect(onEnd).toHaveBeenCalledTimes(1);
++  });
++
++  it("an undefined onKeyboard hides the keyboard button, with and without an approval", () => {
++    panel({ layout: "sheet" });
++    expect(screen.queryByRole("button", { name: "Type instead" })).toBeNull();
++    expect(screen.getByRole("button", { name: "End voice mode" })).toBeTruthy();
++    cleanup();
++    panel({ layout: "sheet", approvalActive: true, onApproval: vi.fn() });
++    expect(screen.queryByRole("button", { name: "Type instead" })).toBeNull();
++    expect(screen.getByTestId("ae-voice-approval-run")).toBeTruthy();
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index ce2ad21276a91b40f8316b073a8cafc872b173e2..c36ab3f64c1ea0df6a7b416604b2fb329d34a45a 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -28,6 +28,8 @@ import { getVoiceBins } from "@/lib/aeVoiceLevel";
+ import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
+ import { getVoiceSnapshot, resetVoiceStore, setVoiceOn } from "@/lib/aeVoiceMode";
+ import { useAeVoiceMode } from "@/hooks/useAeVoiceMode";
++import { MIC_SYNTH_WAIT_CAP_MS, primeVoicePlayback, resetPrimeSpeaking } from "@/lib/aeSpeakReplies";
++import { installFakeSpeech, removeFakeSpeech, type FakeSynth } from "@/test/fakeSpeech";
+ import { ComposerMicButton } from "./ComposerMicButton";
+ 
+ // Controllable DictationSession stand-in for the server-mode tests. The
+@@ -1690,3 +1692,101 @@ describe("ComposerMicButton (stop and liveness watchdogs)", () => {
+     expect(startSpy).toHaveBeenCalledTimes(2);
+   });
+ });
++
++describe("ComposerMicButton (WebKit synth wait)", () => {
++  const IPHONE_UA =
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
++  let synth: FakeSynth;
++
++  function mountVoice() {
++    const controller = { current: null as AeMicController | null };
++    const onListeningChange = vi.fn();
++    const view = render(
++      <ComposerMicButton
++        onTranscript={vi.fn()}
++        controller={controller}
++        onListeningChange={onListeningChange}
++      />,
++    );
++    return { controller, onListeningChange, view };
++  }
++
++  beforeEach(() => {
++    vi.useFakeTimers();
++    resetVoiceLog();
++    Object.defineProperty(navigator, "userAgent", { configurable: true, value: IPHONE_UA });
++    synth = installFakeSpeech();
++    window.localStorage.clear();
++    // The silent prime is speaking, as right after the Voice mode tap on a device voice.
++    primeVoicePlayback();
++    synth.speaking = true;
++  });
++  afterEach(() => {
++    vi.useRealTimers();
++    resetPrimeSpeaking();
++    delete (navigator as { userAgent?: unknown }).userAgent;
++    removeFakeSpeech();
++  });
++
++  it("a controller stop during the wait starts nothing and ends the take", () => {
++    const { controller } = mountVoice();
++    act(() => controller.current?.start());
++    expect(startSpy).not.toHaveBeenCalled();
++    act(() => controller.current?.stop());
++    synth.speaking = false;
++    act(() => void vi.advanceTimersByTime(MIC_SYNTH_WAIT_CAP_MS + 500));
++    expect(startSpy).not.toHaveBeenCalled();
++    expect(formatVoiceLog()).toContain("mic stop during synth wait");
++    // The guards are free: the next start reaches recognition.start().
++    act(() => controller.current?.start());
++    expect(startSpy).toHaveBeenCalledTimes(1);
++  });
++
++  it("a button tap during the wait stops: no start later", () => {
++    const { controller } = mountVoice();
++    act(() => controller.current?.start());
++    fireEvent.click(screen.getByRole("button", { name: /Voice dictation/ }));
++    act(() => void vi.advanceTimersByTime(MIC_SYNTH_WAIT_CAP_MS + 500));
++    expect(startSpy).not.toHaveBeenCalled();
++    expect(controller.current?.isListening()).toBe(false);
++  });
++
++  it("Esc during the wait starts nothing", () => {
++    const { controller } = mountVoice();
++    act(() => controller.current?.start());
++    act(() => {
++      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
++    });
++    act(() => void vi.advanceTimersByTime(MIC_SYNTH_WAIT_CAP_MS + 500));
++    expect(startSpy).not.toHaveBeenCalled();
++  });
++
++  it("a restart during the wait starts once, on the new recognizer", () => {
++    const { controller } = mountVoice();
++    act(() => controller.current?.start());
++    act(() => controller.current?.restart());
++    expect(instances).toHaveLength(2);
++    expect(startSpy).not.toHaveBeenCalled();
++    synth.speaking = false;
++    act(() => void vi.advanceTimersByTime(MIC_SYNTH_WAIT_CAP_MS + 500));
++    expect(startSpy).toHaveBeenCalledTimes(1);
++  });
++
++  it("an unmount during the wait cancels the start", () => {
++    const { controller, view } = mountVoice();
++    act(() => controller.current?.start());
++    view.unmount();
++    synth.speaking = false;
++    act(() => void vi.advanceTimersByTime(MIC_SYNTH_WAIT_CAP_MS + 500));
++    expect(startSpy).not.toHaveBeenCalled();
++  });
++
++  it("a real reply speaking (prime over) lets the mic start at once, with no cancel", () => {
++    synth.finishNext();
++    synth.speaking = true;
++    const { controller } = mountVoice();
++    act(() => controller.current?.start());
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(synth.cancelCount).toBe(0);
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 0036b3b592ef1e7fac4f7d92f137366c52085862..c1120e566e8002e6d585b9b81fc3da3abf2c9614 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -324,6 +324,33 @@ export const ComposerMicButton = ({
+     if (livenessTimerRef.current !== null) clearInterval(livenessTimerRef.current);
+     livenessTimerRef.current = null;
+   }, []);
++  // Drops a pending synth wait (a browser start waiting for the priming utterance) without
++  // touching any take state. Never leaves a live cancel behind. True when one was pending.
++  const dropSynthWait = useCallback((): boolean => {
++    const cancel = synthWaitCancelRef.current;
++    synthWaitCancelRef.current = null;
++    if (!cancel) return false;
++    cancel();
++    return true;
++  }, []);
++  // A user stop (toggle, controller stop, Esc, disabled) while the mic start waits for the
++  // synth: the recognizer was never started, so no end event will come. Drops the wait and
++  // ends the take here. True when a wait was pending.
++  const stopSynthWait = useCallback(
++    (why: string): boolean => {
++      if (!dropSynthWait()) return false;
++      logVoice("mic stop during synth wait", why);
++      clearStartWatchdog();
++      transitionRef.current = false;
++      browserStartPendingRef.current = false;
++      requestedRef.current = false;
++      controllerStartRef.current = false;
++      voiceTakeRef.current = false;
++      silentStartRef.current = false;
++      return true;
++    },
++    [dropSynthWait, clearStartWatchdog],
++  );
+   // Server-take guard, deliberately separate from transitionRef: a failed
+   // Web Speech attempt fires a late "end" event that resets transitionRef,
+   // which must not unlock a second server take mid-handshake.
+@@ -861,6 +888,11 @@ export const ComposerMicButton = ({
+     // `keepLateFinal` (the stop watchdog): the old recognizer was already stopped, so it is
+     // not aborted, and a final result it still delivers within the stop watchdog time is passed on once.
+     const replace = (keepLateFinal = false): SpeechRecognitionLike | null => {
++      // A start waiting for the synth belongs to the recognizer being replaced.
++      if (synthWaitCancelRef.current) {
++        synthWaitCancelRef.current();
++        synthWaitCancelRef.current = null;
++      }
+       cancelPendingStart?.();
+       clearLiveness();
+       clearStopWatchdog();
+@@ -945,6 +977,8 @@ export const ComposerMicButton = ({
+   // cancelled outright (no tail flush) — the take is moot once the
+   // composer can't accept text.
+   useEffect(() => {
++    // Disabled during the synth wait: the mic must not start into a disabled composer.
++    if (disabled && stopSynthWait("disabled")) return;
+     if (!(disabled && isListening)) return;
+     if (sessionRef.current) {
+       sessionRef.current.cancel();
+@@ -960,7 +994,7 @@ export const ComposerMicButton = ({
+       // .stop() on an already-stopped recognizer can throw in some
+       // browsers; safe to ignore — the end event will reconcile state.
+     }
+-  }, [disabled, isListening]);
++  }, [disabled, isListening, stopSynthWait]);
+ 
+   // Release the mic if the component unmounts mid-take (e.g. the
+   // new-chat dialog closes while dictating).
+@@ -1381,6 +1415,8 @@ export const ComposerMicButton = ({
+     }
+     // Guard against rapid clicks landing before start/end event fires.
+     if (transitionRef.current) {
++      // A click during the synth wait is a stop: the mic must not start afterwards.
++      if (stopSynthWait("toggle")) return true;
+       if (listeningRef.current) logVoice("mic stop refused");
+       return false;
+     }
+@@ -1408,8 +1444,14 @@ export const ComposerMicButton = ({
+         stallRef.current.reset(Date.now());
+         eventStallRef.current.reset(Date.now());
+         // WebKit: the priming utterance holds the audio session; start once it has ended.
+-        synthWaitCancelRef.current = whenSynthIdle(() => {
++        // Never overwrite a live cancel: drop any earlier wait first.
++        dropSynthWait();
++        let waitDone = false;
++        const cancelWait = whenSynthIdle(() => {
++          waitDone = true;
+           synthWaitCancelRef.current = null;
++          // A replaced recognizer owns the start now; this one must not start late.
++          if (recognitionRef.current !== recognition) return;
+           try {
+             stallRef.current.reset(Date.now());
+             eventStallRef.current.reset(Date.now());
+@@ -1419,6 +1461,8 @@ export const ComposerMicButton = ({
+             browserStartPendingRef.current = false;
+           }
+         });
++        // go() may have run at once (no wait): then there is nothing to cancel later.
++        if (!waitDone) synthWaitCancelRef.current = cancelWait;
+       }
+     } catch {
+       // InvalidStateError from a double-call — drop the guard so the
+@@ -1428,7 +1472,7 @@ export const ComposerMicButton = ({
+       return false;
+     }
+     return true;
+-  }, [serverAvailable, toggleServer, armStopWatchdog]);
++  }, [serverAvailable, toggleServer, armStopWatchdog, stopSynthWait, dropSynthWait]);
+ 
+   // Voice mode drives the mic through this handle; the button keeps working alone.
+   listeningRef.current = isListening;
+@@ -1483,6 +1527,7 @@ export const ComposerMicButton = ({
+         }
+         browserStartPendingRef.current = false;
+         logVoice("mic start watchdog");
++        dropSynthWait();
+         // A fresh recognizer, so the retry's start() is not refused by one still aborting.
+         replaceRecognitionRef.current();
+         transitionRef.current = false;
+@@ -1535,6 +1580,8 @@ export const ComposerMicButton = ({
+           eventRestartTimesRef.current = [];
+           eventRestartCappedRef.current = false;
+           silentStartRef.current = false;
++          // A start still waiting for the synth is dropped before the new one begins.
++          dropSynthWait();
+           clearStartWatchdog();
+           clearStopWatchdog();
+           clearLiveness();
+@@ -1556,6 +1603,8 @@ export const ComposerMicButton = ({
+       stop: () => {
+         voiceTakeRef.current = false;
+         clearLiveness();
++        // Stop while the start waits for the synth: no mic start later.
++        if (stopSynthWait("controller")) return;
+         if (listeningRef.current) {
+           requestedRef.current = false;
+           toggle();
+@@ -1586,7 +1635,15 @@ export const ComposerMicButton = ({
+     return () => {
+       controller.current = null;
+     };
+-  }, [controller, toggle, clearStartWatchdog, clearStopWatchdog, clearLiveness]);
++  }, [
++    controller,
++    toggle,
++    clearStartWatchdog,
++    clearStopWatchdog,
++    clearLiveness,
++    dropSynthWait,
++    stopSynthWait,
++  ]);
+   const prevListening = useRef(isListening);
+   useEffect(() => {
+     if (isListening) requestedRef.current = false;
+@@ -1611,6 +1668,21 @@ export const ComposerMicButton = ({
+     onHotkeyBarge,
+   );
+ 
++  // Esc during the synth wait (not yet listening): end the take, no mic start later. Inert
++  // when no wait is pending, so other Esc handlers are untouched.
++  useEffect(() => {
++    if (isListening) return;
++    const handler = (e: globalThis.KeyboardEvent): void => {
++      if (e.key !== "Escape" || !synthWaitCancelRef.current) return;
++      if (stopSynthWait("esc")) {
++        e.preventDefault();
++        e.stopPropagation();
++      }
++    };
++    window.addEventListener("keydown", handler, true);
++    return () => window.removeEventListener("keydown", handler, true);
++  }, [isListening, stopSynthWait]);
++
+   // While listening, Enter commits (end the take, keep the text) and Esc
+   // cancels (end the take, discard back to the pre-dictation snapshot). Bound in
+   // the capture phase so it preempts the composer's own Enter-sends / Esc-stops.
+diff --git a/web/src/lib/aeSpeakReplies.test.ts b/web/src/lib/aeSpeakReplies.test.ts
+index 0d5f6bebf5b49063fda864a6747f2c757bd4bb6e..01af034d30efa0ff0d9caa0f67a0bf4ad2b8a94f 100644
+--- a/web/src/lib/aeSpeakReplies.test.ts
++++ b/web/src/lib/aeSpeakReplies.test.ts
+@@ -8,6 +8,7 @@ import {
+   onVoicesChanged,
+   pickDefaultVoice,
+   primeVoicePlayback,
++  resetPrimeSpeaking,
+   rankVoices,
+   registerCloudPrimer,
+   setCaptionHandler,
+@@ -265,8 +266,15 @@ describe("priming and the mic on WebKit", () => {
+   afterEach(() => {
+     delete (navigator as { userAgent?: unknown }).userAgent;
+     registerCloudPrimer(null);
++    resetPrimeSpeaking();
+   });
+ 
++  /** Speak the silent prime on a WebKit device voice, as a tap does. */
++  function primeDeviceVoice(): void {
++    writeVoiceChoice({ kind: "device", id: "x" });
++    primeVoicePlayback();
++  }
++
+   it("WebKit with the cloud voice speaks no silent utterance", () => {
+     setUserAgent(IPHONE_UA);
+     writeVoiceChoice({ kind: "cloud", id: "v1" });
+@@ -293,6 +301,7 @@ describe("priming and the mic on WebKit", () => {
+ 
+   it("WebKit mic start waits until the synthesizer stops speaking", () => {
+     setUserAgent(IPHONE_UA);
++    primeDeviceVoice();
+     synth.speaking = true;
+     const go = vi.fn();
+     whenSynthIdle(go);
+@@ -306,6 +315,7 @@ describe("priming and the mic on WebKit", () => {
+ 
+   it("WebKit mic start gives up at the cap and cancels the synthesizer", () => {
+     setUserAgent(IPHONE_UA);
++    primeDeviceVoice();
+     synth.speaking = true;
+     const go = vi.fn();
+     whenSynthIdle(go);
+@@ -318,6 +328,7 @@ describe("priming and the mic on WebKit", () => {
+ 
+   it("a cancelled wait never starts", () => {
+     setUserAgent(IPHONE_UA);
++    primeDeviceVoice();
+     synth.speaking = true;
+     const go = vi.fn();
+     whenSynthIdle(go)();
+@@ -325,6 +336,38 @@ describe("priming and the mic on WebKit", () => {
+     expect(go).not.toHaveBeenCalled();
+   });
+ 
++  it("a real reply speaking (no prime) starts at once and is never cancelled", () => {
++    setUserAgent(IPHONE_UA);
++    synth.speaking = true;
++    const go = vi.fn();
++    whenSynthIdle(go);
++    expect(go).toHaveBeenCalledTimes(1);
++    expect(synth.cancelCount).toBe(0);
++  });
++
++  it("after the prime ends, a later real reply is not waited for", () => {
++    setUserAgent(IPHONE_UA);
++    primeDeviceVoice();
++    synth.finishNext();
++    synth.speaking = true;
++    const go = vi.fn();
++    whenSynthIdle(go);
++    expect(go).toHaveBeenCalledTimes(1);
++    expect(synth.cancelCount).toBe(0);
++  });
++
++  it("a real reply that starts during the wait is not cancelled at the cap", () => {
++    setUserAgent(IPHONE_UA);
++    primeDeviceVoice();
++    synth.speaking = true;
++    const go = vi.fn();
++    whenSynthIdle(go);
++    synth.finishNext();
++    vi.advanceTimersByTime(MIC_SYNTH_WAIT_CAP_MS + 100);
++    expect(go).toHaveBeenCalledTimes(1);
++    expect(synth.cancelCount).toBe(0);
++  });
++
+   it("Chrome and an idle WebKit synthesizer start at once", () => {
+     setUserAgent(CHROME_UA);
+     synth.speaking = true;
+diff --git a/web/src/lib/aeSpeakReplies.ts b/web/src/lib/aeSpeakReplies.ts
+index df42fe5b607e38f9652876a0f935ea320312f029..628b910057b523d63a6ea075a22a9039a0425f75 100644
+--- a/web/src/lib/aeSpeakReplies.ts
++++ b/web/src/lib/aeSpeakReplies.ts
+@@ -225,6 +225,15 @@ export function registerCloudPrimer(primer: (() => void) | null): void {
+   cloudPrimer = primer;
+ }
+ 
++/** True from the moment the silent priming utterance is spoken until it ends, errors or is cancelled. */
++let primeSpeaking = false;
++const PRIME_FLAG_MAX_MS = 12_000;
++
++/** Test hook: forget a prime in flight. */
++export function resetPrimeSpeaking(): void {
++  primeSpeaking = false;
++}
++
+ /**
+  * Unlocks audio for later replies. Call only inside a click or pointer handler:
+  * iOS refuses playback that no tap started. Never throws.
+@@ -240,6 +249,8 @@ export function primeVoicePlayback(): void {
+     if (!isSpeechSupported()) return;
+     // WebKit keeps a zero-volume utterance speaking for about 10 s and holds the audio session,
+     // so a recognizer started meanwhile hears nothing. The cloud voice never needs it.
++    // Known gap (doc only): this WebKit cloud path also skips the synth unlock, so if the cloud
++    // voice later fails and the device-voice fallback speaks, iOS may need one more tap first.
+     if (isWebKitSpeech() && readVoiceChoice()?.kind === "cloud") {
+       logVoice("prime skipped synth (webkit cloud)");
+       return;
+@@ -248,7 +259,24 @@ export function primeVoicePlayback(): void {
+     if (synth.speaking) return;
+     const utterance = new window.SpeechSynthesisUtterance(" ");
+     utterance.volume = 0;
+-    synth.speak(utterance);
++    primeSpeaking = true;
++    // The engine may never report the end (iOS can drop it): a safety timer clears the flag so
++    // a later real reply is never mistaken for the prime.
++    const safety = setTimeout(() => {
++      primeSpeaking = false;
++    }, PRIME_FLAG_MAX_MS);
++    const clear = () => {
++      clearTimeout(safety);
++      primeSpeaking = false;
++    };
++    utterance.onend = clear;
++    utterance.onerror = clear;
++    try {
++      synth.speak(utterance);
++    } catch (err) {
++      primeSpeaking = false;
++      throw err;
++    }
+   } catch {
+     // Priming is best effort.
+   }
+@@ -260,14 +288,22 @@ export const MIC_SYNTH_WAIT_CAP_MS = 1500;
+ 
+ /**
+  * Runs `go` once the device synthesizer is idle. Only WebKit waits (its priming utterance holds
+- * the audio session); elsewhere `go` runs at once. At the cap the synthesizer is cancelled and
+- * `go` runs. Returns a cancel that drops a pending `go`. Never throws.
++ * the audio session); elsewhere, and whenever a real reply is speaking instead of the prime, `go`
++ * runs at once and nothing is cancelled. At the cap the prime is cancelled and `go` runs. Returns a cancel that drops a pending `go`. Never throws.
+  */
+ export function whenSynthIdle(go: () => void): () => void {
+   let synth: SpeechSynthesis | null = null;
+   try {
+-    if (isWebKitSpeech() && isSpeechSupported() && window.speechSynthesis.speaking) {
++    // Wait only for the priming utterance, never for a real reply that is speaking.
++    if (
++      primeSpeaking &&
++      isWebKitSpeech() &&
++      isSpeechSupported() &&
++      window.speechSynthesis.speaking
++    ) {
+       synth = window.speechSynthesis;
++    } else if (primeSpeaking && isSpeechSupported() && !window.speechSynthesis.speaking) {
++      primeSpeaking = false;
+     }
+   } catch {
+     synth = null;
+@@ -288,11 +324,14 @@ export function whenSynthIdle(go: () => void): () => void {
+       }
+     })();
+     const waited = Date.now() - started;
+-    if (speaking && waited < MIC_SYNTH_WAIT_CAP_MS) {
++    if (!speaking) primeSpeaking = false;
++    if (primeSpeaking && waited < MIC_SYNTH_WAIT_CAP_MS) {
+       timer = setTimeout(tick, MIC_SYNTH_POLL_MS);
+       return;
+     }
+-    if (speaking) {
++    if (primeSpeaking && speaking) {
++      // Only the prime is speaking here (the flag), so a real reply is never cancelled.
++      primeSpeaking = false;
+       try {
+         synth.cancel();
+       } catch {

@@ -47,6 +47,7 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.setenv("AE_AUTO_ARCHIVE", "0")
     # The family cost sweep likewise; its tests build a Sweeper and call it directly.
     monkeypatch.setenv("AE_FAMILY_COST", "0")
+    monkeypatch.setenv("AE_DECISION_CALLS_FILE", "")  # memory only: never write a real /data
     monkeypatch.setenv("AE_FAMILY_COST_FILE", "")
     # Expiry alerts run after every vault reading; only their own tests run them.
     monkeypatch.setenv("AE_SECRET_ALERTS", "off")
@@ -78,6 +79,7 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     from ae_omni_policies import (
         admin_cards,
         attention_dismissals,
+        attention_log,
         auth,
         box_health,
         box_health_cleanup,
@@ -94,6 +96,7 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         secrets_meta,
         slot_cap,
         social,
+        social_made,
         taskstore,
     )
 
@@ -116,8 +119,10 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     secret_alerts.reset_store()
     cost_targets.reset_stores()
     attention_dismissals.reset_store()
+    attention_log.reset_store()
     git_center.reset_cache()
     social.reset_store()
+    social_made.reset_store()
     admin_cards.reset_store()
     card_secrets.reset_store()
     git_personal.reset_store()
@@ -135,6 +140,7 @@ def _ae_environment(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     secret_alerts.reset_store()
     cost_targets.reset_stores()
     attention_dismissals.reset_store()
+    attention_log.reset_store()
     git_center.reset_cache()
     admin_cards.reset_store()
     card_secrets.reset_store()

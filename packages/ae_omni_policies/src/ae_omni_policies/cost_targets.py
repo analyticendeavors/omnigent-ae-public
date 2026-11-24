@@ -112,6 +112,7 @@ FABRIC_ALARM_DELAY = timedelta(minutes=3)
 STARTUP_DELAY_S = 30.0
 POLL_S = 60.0
 FABRIC_EVERY_S = 3600.0
+FABRIC_RETRY_S = 300.0
 FABRIC_REFRESH_WAIT_S = 60.0
 LIST_SCOPE_MAX = 100
 SERVICE_LIST_MAX = 50
@@ -1558,6 +1559,18 @@ async def tick(*, fabric_due: bool, now: datetime | None = None) -> None:
             await run("fabric", rules=data.rules, rows=rows, note=note, now=at, cfg=cfg)
 
 
+def _fabric_unread() -> bool:
+    """Whether the last Fabric pass left a capacity or the fleet list unread (a Logic App
+    timeout, often the first pass after a restart). The loop then looks again in
+    :data:`FABRIC_RETRY_S` instead of holding the failed reading for the hour."""
+    if _last_fabric is None:
+        return False
+    rows, note = _last_fabric[1], _last_fabric[2]
+    if rows is None:
+        return False  # Fabric is not configured
+    return bool(note) or any(r.get("error") for r in rows)
+
+
 async def _loop() -> None:
     await asyncio.sleep(STARTUP_DELAY_S)
     next_fabric = 0.0
@@ -1566,13 +1579,14 @@ async def _loop() -> None:
         try:
             await tick(fabric_due=due)
             if due:
-                next_fabric = time.monotonic() + FABRIC_EVERY_S
+                wait = FABRIC_RETRY_S if _fabric_unread() else FABRIC_EVERY_S
+                next_fabric = time.monotonic() + wait
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001  the loop must outlive any one bad pass
             _logger.warning("cost targets: tick failed (%s)", type(exc).__name__)
             if due:
-                next_fabric = time.monotonic() + FABRIC_EVERY_S
+                next_fabric = time.monotonic() + FABRIC_RETRY_S
         await asyncio.sleep(POLL_S)
 
 

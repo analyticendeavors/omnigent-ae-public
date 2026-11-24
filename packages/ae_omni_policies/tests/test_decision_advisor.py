@@ -9,7 +9,9 @@ from typing import Any
 import httpx
 import pytest
 
+from ae_omni_policies import agent_judge as aj
 from ae_omni_policies import decision_advisor as da
+from ae_omni_policies import decision_shadow as ds
 from ae_omni_policies import preset_runs
 
 ENDPOINT = "https://decision.example.com"
@@ -61,8 +63,10 @@ LIVE_SIZE_PROBS = {"0": 0.0014, "1": 0.0049, "2": 0.346, "3": 0.647}
 
 
 @pytest.fixture(autouse=True)
-def _fresh_rate_limit() -> None:
+def _fresh_rate_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     da._calls.clear()
+    monkeypatch.setenv("AE_DECISION_CALLS_FILE", str(tmp_path / "calls.json"))
+    ds.reset()
 
 
 def answer(
@@ -557,3 +561,120 @@ def test_a_busy_run_log_skips_the_advisor_entry_instead_of_waiting(tmp_path: Pat
     assert preset_runs.record_advice(advisor, "lead", {"n": 2}) is True  # free again
     with advisor.locked() as data:
         assert [e["n"] for e in data["reports"]["lead"]["advisor"]] == [2]
+
+
+async def test_only_a_request_that_went_out_is_counted(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    seen = mock(monkeypatch, lambda r: answer("deep", {"deep": 0.9}))
+    await run({})  # advisor_off
+    await run(env, "Fix the Zorbex report")  # refused_denylist
+    await da.advise(request(), [], (), owner="owner@example.com", environ=env)  # no_presets
+    await da.advise(request(), PRESETS, (), owner="other@example.com", environ=env)  # not allowed
+    assert seen == [] and ds.calls_today() == 0
+    reply, _ = await run(env)
+    assert reply["verdict"] == "use" and len(seen) == 1
+    assert ds.calls_today() == 1
+
+
+async def test_a_failed_request_still_counts_once_it_went_out(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    seen = mock(monkeypatch, lambda r: httpx.Response(500))
+    reply, _ = await run(env)
+    assert reply["verdict"] == "decide_yourself" and len(seen) == 1
+    assert ds.calls_today() == 1
+
+
+async def test_a_rate_limited_advisor_call_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    seen = mock(monkeypatch, lambda r: answer("deep", {"deep": 0.9}))
+    for _ in range(da.MAX_PER_RUN):
+        await da.advise(
+            request(), PRESETS, (), owner="owner@example.com", environ=env, session="s1"
+        )
+    assert len(seen) == da.MAX_PER_RUN and ds.calls_today() == da.MAX_PER_RUN
+    reply, _ = await da.advise(
+        request(), PRESETS, (), owner="owner@example.com", environ=env, session="s1"
+    )
+    assert reply["reason"] == "rate_limited"
+    assert len(seen) == da.MAX_PER_RUN and ds.calls_today() == da.MAX_PER_RUN
+
+
+async def test_the_retry_after_wait_is_enforced_at_dispatch(
+    monkeypatch: pytest.MonkeyPatch, env: dict[str, str]
+) -> None:
+    """A call already past admission (queued for a permit) sends nothing during a 429 wait."""
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+    seen = mock(monkeypatch, lambda r: httpx.Response(429, headers={"Retry-After": "9"}))
+    cfg = da.config(env)
+    with pytest.raises(da.AdvisorError) as first:
+        await da._post(cfg, {"questions": {}})
+    assert str(first.value) == da.RATE_LIMITED and len(seen) == 1
+    # the wait now holds every later dispatch back, with no request on the wire
+    for _ in range(3):
+        with pytest.raises(da.AdvisorError) as again:
+            await da._post(cfg, {"questions": {}})
+        assert str(again.value) == da.RATE_LIMITED
+    assert len(seen) == 1
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+
+
+def test_the_agent_reading_is_off_for_the_advisor() -> None:
+    """2026-11-18: advise_preset keeps its rules; only ask_judge text gets the wider reading."""
+    deny = ["zorbex"]
+    allow = da.DEFAULT_TERM_ALLOW
+    assert da.check_summary("Fix it. It was slow", deny, allow, []) == "proper_noun"
+    lead = aj.AGENT_LEADING
+    assert (
+        da.check_summary("Fix it. It was slow", deny, allow, [], leading=lead, agent=True) is None
+    )
+    assert da.check_summary("Use SSH", deny, allow, []) == "proper_noun"
+    assert da.check_summary("don't wait", deny, allow, []) == "quote"
+    assert da.check_summary("don't wait", deny, allow, [], leading=lead, agent=True) is None
+    for text in ("fix. Fabrikam next", "Ask Dom first"):
+        assert da.check_summary(text, deny, allow, [], leading=lead, agent=True) == "proper_noun"
+
+
+def test_opening_free_frees_only_the_first_word() -> None:
+    """2026-11-18: an agent's question may open with any word; nothing after it is freed."""
+    deny = ["zorbex"]
+    allow = da.DEFAULT_TERM_ALLOW
+    lead = aj.AGENT_LEADING
+
+    def check(text: str, **kw: bool) -> str | None:
+        return da.check_summary(text, deny, allow, [], leading=lead, agent=True, **kw)
+
+    assert check("Rerun the suite?") == "proper_noun"
+    assert check("Rerun the suite?", opening_free=True) is None
+    assert check("Rerun now? Fabrikam asked for it.", opening_free=True) == "proper_noun"
+    assert check("Ship it? Northwind.", opening_free=True) == "proper_noun"
+    assert check("Is Northwind ready?", opening_free=True) == "proper_noun"
+    assert check("Rerun now? Rebase later", opening_free=True) == "proper_noun"
+    assert check("Zorbex needs a retry?", opening_free=True) == "denylist"
+    # the default stays strict in non-agent mode too
+    assert da.check_summary("Rerun the suite?", deny, allow, []) == "proper_noun"
+    assert da.guard_summary("Rerun the suite?", deny, allow, [], agent=True) is None
+    assert (
+        da.guard_summary("Rerun the suite?", deny, allow, [], agent=True, opening_free=True)
+        is not None
+    )
+
+
+def test_opening_free_ignores_allowed_phrases_and_glued_tokens() -> None:
+    allow = da.DEFAULT_TERM_ALLOW | {"power bi", "key vault"}
+    lead = aj.AGENT_LEADING
+
+    def check(text: str) -> str | None:
+        return da.check_summary(
+            text, ["zorbex"], allow, [], leading=lead, agent=True, opening_free=True
+        )
+
+    assert check("Power BI Fabrikam stalled?") == "proper_noun"
+    assert check("Key Vault Northwind rotation") == "proper_noun"
+    assert check("Power BI refresh failed?") is None
+    for glued in ("Contoso_Sales", "ContosoNorthwind", "Contoso+Northwind", "Contoso#Northwind"):
+        assert check(f"{glued} needs a retry?") == "proper_noun"
+    for plain in ("Rerun", "Bump", "Revert"):
+        assert check(f"{plain} it now?") is None

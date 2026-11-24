@@ -13,7 +13,7 @@ A preset decides which model and effort each role in a chat runs on, so the lead
 </tr>
 </table>
 
-- [Roles presets](roles-presets.md): Presets in Settings > Roles, Newer models offered, never applied, The lead reads its preset every turn, Pick a preset per chat, Start a new chat on a preset, Who works on this, Independent reviewers, one verdict, Rules for model changes and helpers, Model changes you can undo, Families of sessions, A family at a glance, Preset insights, Session links read as titles, A helper's questions reach the lead
+- [Roles presets](roles-presets.md): Presets in Settings > Roles, Newer models offered, never applied, New models found by the box, The lead reads its preset every turn, Pick a preset per chat, Start a new chat on a preset, Who works on this, Independent reviewers, one verdict, Rules for model changes and helpers, Model changes you can undo, Families of sessions, A family at a glance, Preset insights, Session links read as titles, A helper's questions reach the lead
 
 - [Decision-1 preset advisor](decision-advisor.md): a judge model's second opinion for a lead that picks its own preset, with what leaves the server and how to turn it off
 
@@ -28,7 +28,7 @@ Beneath the screens sits a way of working, built from Omnigent policies: a cap o
 </tr>
 </table>
 
-- [Triage and policies](triage-and-policies.md): A cap on working sessions, The fork gate, Absorbed and Unfiled notes, The parking lot, Handoffs that open their own chat, Closed chats leave the list, The rabbit-hole check, Hurry modes, A pop-up guard that was removed, Agents that ship with it, Policies you can edit
+- [Triage and policies](triage-and-policies.md): A cap on working sessions, Long approval messages fold, The fork gate, Absorbed and Unfiled notes, The parking lot, Handoffs that open their own chat, Closed chats leave the list, The rabbit-hole check, Hurry modes, A pop-up guard that was removed, Agents that ship with it, Policies you can edit
 
 ## Many sessions
 
@@ -46,7 +46,7 @@ Stock Omnigent lists sessions in a sidebar and opens one at a time. The fork add
 </table>
 
 - [Session Dashboard](session-dashboard.md): A Session Dashboard row with the slot count, A header in Flow or Brief, Your move, Answer a gate from the Dashboard, Open PRs, each with the reason it waits, The Parking Lot with Resume, Reopen a closed session
-- [Sidebar](sidebar.md): Every row shows what its session is doing, A hover card that says what is happening now, Status icons and the Status menu, Group and order sessions by status, Drag to reorder, Bulk select in a narrow sidebar, Create a project from Add to project
+- [Sidebar](sidebar.md): Every row shows what its session is doing, A hover card that says what is happening now, Status icons and the Status menu, Group and order sessions by status, Drag to reorder, Bulk select in a narrow sidebar, Create a project from Add to project, Archiving a session archives its side chats
 - [Split view](split-view.md): Open in split view, Pane pickers that show session names, Four live sessions at once, Layout presets, Dividers in both directions, Swap panes by the grip, One right-hand pane at a time
 
 ## Inside a session
@@ -93,8 +93,8 @@ Running many sessions means watching plan limits and accounts. The fork shows us
 </tr>
 </table>
 
-- [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login, A relaunch keeps Claude's transcript, Pin a scheduled task to one login
-- [Admin Center](admin-center.md): One board for the server, Status pills, Drag cards to rearrange, Cards: turn a card on or off, or hide it, Not set up on this server, Hold deploys, Box health, Key Vault, Git repos, Git: company and personal lists, Needs you, Social card, Every account's limits, Compute and spend, Decision model (2026-11-07), Home security (2026-11-08), Spend card: presets, Spend card: families, Edit a global policy's parameters, Open tabs hear about an update
+- [Usage and accounts](usage-and-accounts.md): A context ring that changes color, The usage popover, Limits for the session's own account, Check any login's limits, Several Claude logins per host, Remove a personal login, Shared Claude accounts, Move a chat to another login, Copy a chat to another login, A relaunch keeps Claude's transcript, Spend keeps counting across relaunches, Pin a scheduled task to one login
+- [Admin Center](admin-center.md): One page for the server, Health rail and the verdict, Cards on the tabs (no more dragging), Cards: turn a card on or off, or hide it, Not set up on this server, Hold deploys, Box health, Key Vault, Git repos, Git: company and personal lists, Needs you, Social card, Every account's limits, Compute and spend, Decision model (2026-11-07), Home security (2026-11-08), Spend card: presets, Spend card: families, Edit a global policy's parameters, Open tabs hear about an update
 
 ## On the phone
 

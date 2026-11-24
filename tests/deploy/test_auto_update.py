@@ -650,6 +650,120 @@ def test_a_session_mid_turn_defers_the_deploy_until_quiet(box: Box) -> None:
     assert not (box.state / "deferred").exists()
 
 
+def _claude_status(
+    box: Box,
+    pid: int,
+    status: str,
+    *,
+    runner: bool = True,
+    recorded_start: int | None = 5000,
+    actual_start: int = 5000,
+    json_pid: int | None = None,
+    env_pad: int = 0,
+) -> dict[str, str]:
+    """Write a Claude status file for PID and its /proc entries; returns the env pointing at them.
+
+    ``recorded_start`` is the file's ``procStart`` (``None`` leaves it out), ``actual_start``
+    field 22 of the fake ``/proc/<pid>/stat``, ``json_pid`` the file's ``pid`` (PID by
+    default) and ``env_pad`` bytes of padding after the launch variable in the environ.
+    """
+    sessions, proc = box.tmp / "claude-sessions", box.tmp / "proc"
+    sessions.mkdir(exist_ok=True)
+    started = "" if recorded_start is None else f',"procStart":"{recorded_start}"'
+    (sessions / f"{pid}.json").write_text(
+        f'{{"pid":{pid if json_pid is None else json_pid}{started},'
+        f'"pidDomain":"linux:x","kind":"interactive","status":"{status}"}}'
+    )
+    (proc / str(pid)).mkdir(parents=True, exist_ok=True)
+    launch = "OMNIGENT_TERMINAL_LAUNCH_SESSION_ID=conv1\0" if runner else ""
+    pad = f"PAD={'x' * env_pad}\0" if env_pad else ""
+    (proc / str(pid) / "environ").write_text(f"{launch}{pad}HOME=/home/x\0TERM=xterm\0")
+    fields = " ".join(["0"] * 18)
+    (proc / str(pid) / "stat").write_text(f"{pid} (claude (x)) S {fields} {actual_start} 0 0\n")
+    (proc / "stat").write_text(f"cpu 1 2 3\nbtime {int(time.time()) - 600}\n")
+    return {"AE_AUTO_UPDATE_CLAUDE_SESSIONS": str(sessions), "AE_AUTO_UPDATE_PROC": str(proc)}
+
+
+def test_a_background_shell_defers_a_deploy_that_restarts_the_host(box: Box) -> None:
+    # 2026-11-23: a planner ended its turn waiting on a run_in_background render,
+    # read idle, and the 00:57Z host restart killed the render.
+    _release_touching(box, "upstream.lock", "ae-v0.13.0.2")
+    env = _claude_status(box, 4242, "shell")
+    result = box.run(**env)
+    assert result.returncode == 0, result.stderr
+    assert "to=ae-v0.13.0.2 result=deferred" in box.last()
+    assert "1 session(s) mid-turn (1 of them waiting on a background shell" in box.last()
+    assert box.tag() == "ae-v0.13.0.1"
+
+    (box.tmp / "claude-sessions" / "4242.json").write_text('{"pid":4242,"status":"idle"}')
+    quiet = box.run(**env)
+    assert quiet.returncode == 0, quiet.stderr
+    assert box.tag() == "ae-v0.13.0.2"
+
+
+@pytest.mark.parametrize("case", ["server-only", "not-runner", "dead", "busy-status"])
+def test_a_background_shell_does_not_count_when_it_would_survive(box: Box, case: str) -> None:
+    # A server-only deploy leaves runners alone; a Claude started by hand does not die
+    # with the host; a dead pid's file is stale; a busy turn is the database's to count.
+    if case == "server-only":
+        box.release("ae-v0.13.0.2")
+    else:
+        _release_touching(box, "upstream.lock", "ae-v0.13.0.2")
+    env = _claude_status(
+        box, 4242, "busy" if case == "busy-status" else "shell", runner=case != "not-runner"
+    )
+    if case == "dead":
+        shutil.rmtree(box.tmp / "proc" / "4242")
+    result = box.run(**env)
+    assert result.returncode == 0, result.stderr
+    assert box.tag() == "ae-v0.13.0.2", box.last()
+
+
+@pytest.mark.parametrize("case", ["other-start", "other-pid", "written-before-start"])
+def test_a_stale_status_file_on_a_reused_pid_does_not_count(box: Box, case: str) -> None:
+    # A Claude that died left "shell" in its file; a newer process got the same pid.
+    _release_touching(box, "upstream.lock", "ae-v0.13.0.2")
+    if case == "other-start":
+        env = _claude_status(box, 4242, "shell", recorded_start=5000, actual_start=9000)
+    elif case == "other-pid":
+        env = _claude_status(box, 4242, "shell", json_pid=4243)
+    else:
+        # No procStart: the file is older than the process (btime is 600 s ago, start 590 s).
+        env = _claude_status(box, 4242, "shell", recorded_start=None, actual_start=1000)
+        old = time.time() - 3600
+        os.utime(box.tmp / "claude-sessions" / "4242.json", (old, old))
+    result = box.run(**env)
+    assert result.returncode == 0, result.stderr
+    assert box.tag() == "ae-v0.13.0.2", box.last()
+
+
+@pytest.mark.parametrize("case", ["no-proc-start", "large-environ"])
+def test_a_live_background_shell_still_counts(box: Box, case: str) -> None:
+    # A file without procStart written after its process started; an environ far past a
+    # pipe buffer, where a reader that stops at the first match must not lose the count.
+    _release_touching(box, "upstream.lock", "ae-v0.13.0.2")
+    if case == "no-proc-start":
+        env = _claude_status(box, 4242, "shell", recorded_start=None, actual_start=1000)
+    else:
+        env = _claude_status(box, 4242, "shell", env_pad=300_000)
+    result = box.run(**env)
+    assert result.returncode == 0, result.stderr
+    assert "result=deferred" in box.last()
+    assert box.tag() == "ae-v0.13.0.1"
+
+
+def test_a_background_shell_defers_the_pending_host_retry(box: Box) -> None:
+    _release_touching(box, "upstream.lock", "ae-v0.13.0.2")
+    broken = box.run(AE_AUTO_UPDATE_HOST_REBUILD=str(box.bin / "rebuild-host-broken"))
+    assert "result=host-failed" in box.last(), broken.stderr
+    box.calls_log.unlink()
+    result = box.run(**_claude_status(box, 4242, "shell"))
+    assert result.returncode == 0, result.stderr
+    out = result.stdout + result.stderr
+    assert "result=deferred" in out and "waiting on a background shell" in out
+    assert not any(c.startswith("rebuild-host") for c in box.calls())
+
+
 def test_a_tag_that_waited_past_the_limit_deploys_anyway(box: Box) -> None:
     box.release("ae-v0.13.0.2")
     started = int(time.time()) - 7201
@@ -1092,7 +1206,9 @@ def test_overlapping_pass_exits_at_once(box: Box) -> None:
 def test_script_never_uses_sudo_or_reads_the_secrets_itself() -> None:
     code = [line for line in SCRIPT.read_text().splitlines() if not line.lstrip().startswith("#")]
     body = "\n".join(code)
-    assert "sudo" not in body
+    # The one sudo is the root hardening gate, called as `sudo -n "$AE_GATE" VERB` and only when
+    # /usr/local/sbin/ae-gate is installed.
+    assert all('sudo -n "$AE_GATE"' in line for line in code if "sudo" in line)
     assert "/secure/env" not in body
     assert "flock -n" in body
 
@@ -1265,10 +1381,13 @@ def test_user_units_are_the_expected_set() -> None:
         "ae-omnigent-host-relink.service",
         "ae-omnigent-limits.service",
         "ae-omnigent-limits.timer",
+        "ae-omnigent-model-watch.service",
+        "ae-omnigent-model-watch.timer",
         "ae-omnigent-secrets-meta.service",
         "ae-omnigent-secrets-meta.timer",
         "ae-omnigent-social.service",
         "ae-omnigent-social.timer",
+        "ae-rocky-tts.service",
         "ae-tmp-litter-sweep.service",
         "ae-tmp-litter-sweep.timer",
     ]
@@ -1331,6 +1450,28 @@ def test_box_health_relay_units_run_the_module_every_five_minutes() -> None:
     assert t.get("Timer", "OnCalendar") == "*:0/5"
     assert t.get("Timer", "RandomizedDelaySec") == "30"
     assert t.get("Timer", "OnBootSec") == "2min"
+    assert t.get("Install", "WantedBy") == "timers.target"
+    assert "local time" in path.read_text()
+
+
+def test_model_watch_relay_units_run_the_module_every_six_hours() -> None:
+    # The new-model watch (deploy/README.md "New-model watch", 2026-11-10).
+    s = _unit(USER_UNITS / "ae-omnigent-model-watch.service")
+    assert s.get("Service", "Type") == "oneshot"
+    assert s.get("Service", "ExecStart") == (
+        "%h/.omnigent-host/venv/bin/python -m ae_omni_policies.model_watch_relay"
+    )
+    assert s.get("Service", "Environment").startswith(
+        "PATH=%h/.omnigent-host/venv/bin:%h/.local/node/bin:"
+    )
+    assert s.get("Service", "EnvironmentFile") == "-%h/deploy/omnigent-ae/config/host.env"
+    assert not s.has_option("Service", "User"), "a user unit names no User="
+    assert not s.has_section("Install"), "the timer starts it"
+    path = USER_UNITS / "ae-omnigent-model-watch.timer"
+    t = _unit(path)
+    assert t.get("Timer", "OnCalendar") == "00/6:17"
+    assert t.get("Timer", "RandomizedDelaySec") == "10min"
+    assert t.get("Timer", "Persistent") == "true"
     assert t.get("Install", "WantedBy") == "timers.target"
     assert "local time" in path.read_text()
 
@@ -1448,3 +1589,95 @@ def test_a_busy_checkout_with_nothing_to_deploy_stays_a_noop(box: Box) -> None:
     box.git(box.box, "checkout", "--quiet", "-b", "work")
     assert box.run().returncode == 0
     assert "result=noop" in box.last()
+
+
+def _gate_run(
+    box: Box, check_tag_exit: int = 0, deploy_exit: int = 0, rollback_exit: int = 0
+) -> subprocess.CompletedProcess[str]:
+    """One pass with a fake ae-gate and a sudo that drops -n; every gate call is logged."""
+    gate = box.bin / "ae-gate"
+    gate.write_text(
+        "#!/usr/bin/env bash\n"
+        'printf "gate %s\\n" "$*" >>"$FAKE_CALLS"\n'
+        '[ "$1 $2" = "omnigent busy" ] && echo 0\n'
+        '[ "$1 $2" = "omnigent deploy-hold" ] && echo none\n'
+        '[ "$1 $2 $3" = "omnigent pg-dump --stdout" ] && echo "CREATE TABLE t (id int);"\n'
+        f'[ "$1 $2" = "omnigent check-tag" ] && exit {check_tag_exit}\n'
+        f'[ "$1 $2" = "omnigent deploy" ] && exit {deploy_exit}\n'
+        f'[ "$1 $2" = "omnigent rollback" ] && exit {rollback_exit}\n'
+        "exit 0\n"
+    )
+    gate.chmod(0o755)
+    (box.bin / "sudo").write_text('#!/usr/bin/env bash\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    (box.bin / "sudo").chmod(0o755)
+    env = {
+        k: v
+        for k, v in box.env.items()
+        if k not in ("AE_AUTO_UPDATE_BUSY", "AE_AUTO_UPDATE_DEPLOY_HOLD")
+    }
+    return subprocess.run(
+        [str(SCRIPT)],
+        env={**env, "AE_GATE": str(gate)},
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+
+
+def test_with_the_gate_installed_busy_check_tag_and_deploy_go_through_it(box: Box) -> None:
+    # Root hardening: no docker pull, no compose up; busy is `omnigent busy`, the published check
+    # is `omnigent check-tag`, the pull and the up are one `omnigent deploy TAG`.
+    _release_touching(box, "upstream.lock", "ae-v0.13.0.2")
+    result = _gate_run(box)
+    assert result.returncode == 0, result.stderr
+    calls = box.calls()
+    assert "gate omnigent busy" in calls
+    assert "gate omnigent deploy-hold" in calls
+    assert "gate omnigent pg-dump --stdout" in calls
+    assert "gate omnigent check-tag ae-v0.13.0.2" in calls
+    assert "gate omnigent deploy ae-v0.13.0.2" in calls
+    assert calls.index("gate omnigent check-tag ae-v0.13.0.2") < calls.index(
+        "gate omnigent deploy ae-v0.13.0.2"
+    )
+    assert not any(c.startswith("docker") for c in calls)
+
+
+def test_with_the_gate_an_unpublished_tag_is_waiting_and_nothing_is_deployed(box: Box) -> None:
+    box.release("ae-v0.13.0.2")
+    result = _gate_run(box, check_tag_exit=3)
+    assert result.returncode == 0, result.stderr
+    assert "result=waiting" in box.last()
+    assert box.tag() == "ae-v0.13.0.1"
+    assert not any("omnigent deploy " in c for c in box.calls())
+
+
+def test_with_the_gate_a_failed_health_check_calls_rollback(box: Box) -> None:
+    box.release("ae-v0.13.0.2")
+    box.curl_plan.write_text("22\n0\n")
+    result = _gate_run(box)
+    assert result.returncode == 1
+    assert "AUTO-UPDATE rolled-back" in result.stderr
+    assert "gate omnigent rollback" in box.calls()
+    assert box.tag() == "ae-v0.13.0.1"
+    assert not any(c.startswith("docker") for c in box.calls())
+
+
+def test_with_the_gate_a_deploy_refused_before_the_stack_is_not_rolled_back(box: Box) -> None:
+    # Exit 4: the gate refused before touching the stack (unsigned, lower tag, pull failure); the
+    # server is still on the old tag, so rollback would only restore a stale previous pin.
+    box.release("ae-v0.13.0.2")
+    result = _gate_run(box, deploy_exit=4)
+    assert result.returncode == 1
+    assert "result=pull-failed" in box.last()
+    assert box.tag() == "ae-v0.13.0.1"
+    assert "gate omnigent rollback" not in box.calls()
+
+
+def test_with_the_gate_no_previous_pin_reports_rollback_failed(box: Box) -> None:
+    box.release("ae-v0.13.0.2")
+    box.curl_plan.write_text("22\n22\n")
+    result = _gate_run(box, rollback_exit=5)
+    assert result.returncode == 1
+    assert "no previous pin" in result.stderr
+    assert "AUTO-UPDATE rollback-failed" in result.stderr

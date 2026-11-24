@@ -1400,3 +1400,40 @@ def test_the_example_scrub_file_parses_and_holds_only_placeholders() -> None:
     scrub = h.load_scrub(ROOT / "config" / "host-scrub.txt.example")
     assert scrub["markers"] and scrub["allowed"]
     assert "owner@example.com" not in scrub["markers"]
+
+
+def _fake_gate(tmp_path: Path, status_exit: int, ps_out: str) -> dict[str, str]:
+    bindir = tmp_path / "gatebin"
+    bindir.mkdir()
+    (bindir / "ae-gate").write_text(
+        "#!/bin/sh\n"
+        f'[ "$1" = status ] && {{ echo "Error: no such container" >&2; exit {status_exit}; }}\n'
+        f'[ "$1" = ps ] && printf "%s" "{ps_out}"\n'
+        "exit 0\n"
+    )
+    (bindir / "sudo").write_text('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    for f in bindir.iterdir():
+        f.chmod(0o755)
+    return {
+        "AE_GATE": str(bindir / "ae-gate"),
+        "PATH": f"{bindir}:{os.environ['PATH']}",
+        "AE_SYNC_CONTAINER": "",
+    }
+
+
+def test_under_the_gate_a_never_created_container_is_the_one_line_skip(
+    tmp_path: Path, lock_dir: Path
+) -> None:
+    env = _fake_gate(tmp_path, 1, "")
+    r = run_sync(make_repo(tmp_path, {}), "omnigent-host-steve", user="steve", env=env)
+    assert r.returncode == 0, r.stderr
+    assert "not running; sync skipped" in r.stdout
+
+
+def test_under_the_gate_a_status_failure_for_a_listed_container_is_an_error(
+    tmp_path: Path, lock_dir: Path
+) -> None:
+    env = _fake_gate(tmp_path, 1, "omnigent-host-steve\trunning\tUp\ti\tnow\n")
+    r = run_sync(make_repo(tmp_path, {}), "omnigent-host-steve", user="steve", env=env)
+    assert r.returncode != 0
+    assert "ae-gate status omnigent-host-steve failed" in r.stderr

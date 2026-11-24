@@ -91,6 +91,16 @@ POLICY_REGISTRY: list[dict[str, object]] = [
         ),
     },
     {
+        # Retired 2026-11-19. Hidden from the page, but registered so a stored row that still
+        # names this handler can be edited: the default-policy routes refuse any handler that is
+        # not in the registry. The handler abstains on every event.
+        "handler": "ae_omni_policies.decision_nudge.nudge",
+        "kind": "callable",
+        "name": "AE Decision-1 Nudges (retired)",
+        "description": "Retired. Does nothing; delete this policy.",
+        "internal_only": True,
+    },
+    {
         "handler": "ae_omni_policies.fork_suspect.fork_suspect",
         "kind": "factory",
         "name": "AE Fork Suspect",

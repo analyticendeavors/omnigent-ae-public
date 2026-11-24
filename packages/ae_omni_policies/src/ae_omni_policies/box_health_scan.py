@@ -666,6 +666,13 @@ LITTER_GROUPS: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("*-review.*", re.compile(r"^.+-review\..+$")),
 )
 OTHER_GROUP = "other"
+HARMLESS_LITTER_RE = re.compile(
+    r"uv-.*\.lock|pi-usage-.*\.json|pi-reauth-.*\.json|ae-review-.*\.md"
+)
+"""Small tool leftovers (lock, usage and review files) that are counted as entries but never
+as stale: 2026-11-23, thousands of them kept the old-/tmp alert on. ``uv-setuptools-*.lock``
+is covered by ``uv-*.lock``. Match with ``fullmatch``: ``$`` would take a trailing newline.
+What the cleanup removes is unchanged (see ``box_cleanup``)."""
 CLAUDE_TOP_RE = re.compile(r"claude-[0-9]{1,10}")
 """Matched with ``fullmatch``: ``\\d`` takes Unicode digits and ``$`` a trailing newline."""
 PYTEST_TOP_RE = re.compile(r"pytest-of-.+")
@@ -741,7 +748,7 @@ def scan_tmp(root: str, *, now: float, stale_days: float, budget: Budget) -> Tmp
                 continue
             agg = out.litter.setdefault(uid, {}).setdefault(group_of(entry.name), LitterAgg())
             agg.entries += 1
-            if info.st_mtime < cutoff:
+            if info.st_mtime < cutoff and not HARMLESS_LITTER_RE.fullmatch(entry.name):
                 agg.stale += 1
             if not is_dir:
                 agg.bytes += info.st_blocks * 512
@@ -750,6 +757,7 @@ def scan_tmp(root: str, *, now: float, stale_days: float, budget: Budget) -> Tmp
 
 __all__ = [
     "GROUP_MAX_ENTRIES",
+    "HARMLESS_LITTER_RE",
     "LITTER_GROUPS",
     "Accumulator",
     "Budget",

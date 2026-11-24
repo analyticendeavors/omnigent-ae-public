@@ -62,6 +62,20 @@ if [ "$SERVER_SECRETS" = "$ROOT/config/secrets.env" ]; then
   note "compose.sh: secrets from $SERVER_SECRETS (delete it, or set AE_SERVER_SECRETS, to use /secure/env/omnigent-ae.env)" >&2
 fi
 
+# Root hardening: with the root-owned gate installed (reid is out of the docker group), the two
+# lifecycle commands the units run go through its fixed verbs. The gate runs only the
+# owner-installed snapshot, so it never reads the compose files above and the checkout-owner
+# check below does not apply. Any other compose command has no verb. The else branch is the old
+# direct call and is removed after the cutover.
+AE_GATE="${AE_GATE:-/usr/local/sbin/ae-gate}"
+if [ -x "$AE_GATE" ]; then
+  case "$*" in
+    "up -d --remove-orphans") exec sudo -n "$AE_GATE" stack-up "${COMPOSE_PROJECT_NAME:-omnigent}" ;;
+    "down") exec sudo -n "$AE_GATE" stack-stop "${COMPOSE_PROJECT_NAME:-omnigent}" ;;
+    *) die "compose.sh $*: the gate has no verb for this (only 'up -d --remove-orphans' and 'down')" ;;
+  esac
+fi
+
 # The project name decides which containers a command touches, and upstream's
 # compose file names it `omnigent` for every checkout. A second checkout on a
 # machine that already runs the stack (a Quick start beside the full deploy)

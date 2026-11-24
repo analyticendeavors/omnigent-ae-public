@@ -1,0 +1,335 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:57:20 -0800
+Subject: [PATCH 403/443] [ae-patch] Fix the review findings on 0402
+
+A background compaction spinner now has a 15-minute staleness cap, a persisted compaction marker clears a spinner whose completion was missed in a stream gap, and an explicit Stop removes every compaction spinner.
+---
+ .../server/routes/sessions/routes_events.py   |   5 +-
+ web/src/lib/aeTokenDefrag.ts                  |  10 +-
+ web/src/store/chatStore.test.ts               | 118 +++++++++++++++++-
+ web/src/store/chatStore.ts                    |  65 +++++++---
+ 4 files changed, 177 insertions(+), 21 deletions(-)
+
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index cdef9b2695ed7dfcbf171369a6c9083af7191b7d..3e211512d5f194e0bcf41eecd9fac1d023751ef2 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -2166,8 +2166,9 @@ def register_events_routes(
+                     code=ErrorCode.INVALID_INPUT,
+                 )
+             if compaction_status == "in_progress":
+-                # The terminal harness owns this compaction and always
+-                # brackets it with completed or failed; it can outlive the turn.
++                # The terminal harness owns this compaction and can outlive
++                # the turn. It normally ends it with completed or failed; the
++                # page drops a spinner older than 15 minutes if neither came.
+                 _publish_compaction_in_progress(session_id, background=True)
+             elif compaction_status == "completed":
+                 _publish_compaction_completed(session_id, None)
+diff --git a/web/src/lib/aeTokenDefrag.ts b/web/src/lib/aeTokenDefrag.ts
+index 7cd57e521c8e6c1f699d09865a56d71c9c9aad17..4506cdcff84ba7f6b2666d3caac162ab3593d49b 100644
+--- a/web/src/lib/aeTokenDefrag.ts
++++ b/web/src/lib/aeTokenDefrag.ts
+@@ -117,8 +117,14 @@ export function aeLiveMarkerStamps(blocks: readonly AnyBlock[]): Map<string, num
+ /** Compaction reports only its start and finish, so progress is a time estimate. */
+ export const AE_DEFRAG_TAU_MS = 40_000;
+ 
+-/** Past this, a run with no finish or failure is given up (a dropped stream). */
+-export const AE_DEFRAG_STALE_MS = 15 * 60_000;
++/**
++ * Past this, a run with no finish or failure is given up (a dropped stream).
++ * Also the age at which a harness-owned background "Compacting…" spinner is
++ * dropped on the next turn settle, when the harness never reported an end
++ * (Esc during an auto-compaction, a crash, a failed OpenCode compaction).
++ */
++export const AE_BACKGROUND_COMPACTION_STALE_MS = 15 * 60_000;
++export const AE_DEFRAG_STALE_MS = AE_BACKGROUND_COMPACTION_STALE_MS;
+ 
+ /** Eases toward 97%, so the last pills wait for the real finish. */
+ export function aeDefragEstimate(elapsedMs: number, tauMs = AE_DEFRAG_TAU_MS): number {
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 19deae792af5f19ce1f213fb67b50cdf7a3b3c63..29801036b5bc243e86d2f509b4d10f44efd004a2 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -20,6 +20,7 @@ import type * as IdentityModule from "@/lib/identity";
+ 
+ import { type InfiniteData, QueryClient } from "@tanstack/react-query";
+ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
++import { AE_BACKGROUND_COMPACTION_STALE_MS } from "@/lib/aeTokenDefrag";
+ import { toast } from "sonner";
+ import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+ import type {
+@@ -85,7 +86,10 @@ import {
+   pumpStreamEvents,
+   SSE_STALE_RECYCLE_MS,
+   setPendingInitialPrompt,
++  snapshotCompactionSpinners,
+   startStreamPump,
++  withoutEndedBackgroundSpinners,
++  withoutSettledCompactionSpinners,
+   useChatStore,
+   type ConversationState,
+   type FrameScheduler,
+@@ -18203,7 +18207,10 @@ describe("chatStore — compaction spinner follows its turn", () => {
+   it("a harness compaction keeps its spinner when the turn ends and a user message arrives mid-compaction", async () => {
+     const { sink, controller } = startPump("conv_bg_compact");
+     sink.push(turnEvent("response.created", "resp_a"));
+-    sink.push(sse("response.compaction.in_progress", { started_at: 1_700_000_000, background: true }));
++    sink.push(sse("response.compaction.in_progress", {
++        started_at: Math.floor(Date.now() / 1000),
++        background: true,
++      }));
+     await tick();
+     sink.push(turnEvent("response.completed", "resp_a"));
+     await tick();
+@@ -18242,6 +18249,115 @@ describe("chatStore — compaction spinner follows its turn", () => {
+     controller.abort();
+   });
+ 
++  const bgSpinner = (responseId: string, startedAtS?: number): AnyBlock => ({
++    type: "compaction_loading",
++    ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId, itemId: null },
++    background: true,
++    ...(startedAtS !== undefined ? { startedAtS } : {}),
++  });
++
++  describe("background spinner staleness and recovery", () => {
++    const NOW_S = 1_700_000_000;
++    const NOW_MS = NOW_S * 1000;
++    const marker = (itemId: string, createdAtS?: number): AnyBlock => ({
++      type: "compaction",
++      ctx: {
++        agent: null,
++        depth: 0,
++        turn: 0,
++        timestamp: 0,
++        responseId: "",
++        itemId,
++        ...(createdAtS !== undefined ? { createdAtS } : {}),
++      },
++    });
++
++    afterEach(() => {
++      vi.useRealTimers();
++    });
++
++    it("drops a background spinner older than the stale cap on turn settle, keeps a fresh one", () => {
++      vi.useFakeTimers();
++      vi.setSystemTime(NOW_MS);
++      const stale = bgSpinner("resp_a", NOW_S - AE_BACKGROUND_COMPACTION_STALE_MS / 1000 - 1);
++      const fresh = bgSpinner("resp_a", NOW_S - 60);
++      const noStart = bgSpinner("resp_a");
++      useChatStore.setState({
++        conversationId: "conv_bg_stale",
++        activeResponse: { responseId: "resp_a", state: "streaming", error: null },
++        blocks: [stale, fresh, noStart],
++      });
++
++      handleSessionEvent({
++        type: "session_status",
++        conversationId: "conv_bg_stale",
++        status: "idle",
++        responseId: "resp_a",
++      });
++
++      expect(useChatStore.getState().blocks).toEqual([fresh, noStart]);
++    });
++
++    it("snapshotCompactionSpinners settling a turn keeps a fresh background spinner", () => {
++      vi.useFakeTimers();
++      vi.setSystemTime(NOW_MS);
++      const fresh = bgSpinner("resp_a", NOW_S - 60);
++      const plain = spinner("resp_a");
++      const out = snapshotCompactionSpinners(
++        [fresh, plain],
++        { responseId: "resp_a", state: "streaming", error: null },
++        { responseId: "resp_a", state: "completed", error: null },
++      );
++      expect(out).toEqual([fresh]);
++      expect(withoutSettledCompactionSpinners([fresh], "resp_a", NOW_MS)).toBeNull();
++    });
++
++    it("compaction_failed removes a background spinner", () => {
++      useChatStore.setState({
++        conversationId: "conv_bg_failed",
++        blocks: [bgSpinner("resp_a", NOW_S)],
++      });
++      handleSessionEvent({ type: "compaction_failed" });
++      expect(spinnerIds()).toEqual([]);
++    });
++
++    it("a persisted compaction item after a background spinner leaves no loading block", () => {
++      const out = withoutEndedBackgroundSpinners([
++        bgSpinner("resp_a", NOW_S - 300),
++        marker("item_c", NOW_S),
++      ]);
++      expect(out?.map((b) => b.type)).toEqual(["compaction"]);
++      // Unknown times still count: a marker after a spinner means it ended.
++      expect(
++        withoutEndedBackgroundSpinners([bgSpinner("resp_a"), marker("item_c")])?.map((b) => b.type),
++      ).toEqual(["compaction"]);
++    });
++
++    it("keeps a background spinner that started after the persisted marker", () => {
++      expect(
++        withoutEndedBackgroundSpinners([marker("item_c", NOW_S - 600), bgSpinner("resp_a", NOW_S)]),
++      ).toBeNull();
++    });
++
++    it("explicit Stop removes a spinner whose responseId does not match, and with no active turn", () => {
++      useChatStore.setState({
++        conversationId: "conv_bg_stop_mismatch",
++        activeResponse: { responseId: "resp_b", state: "streaming", error: null },
++        blocks: [bgSpinner("", NOW_S), spinner("resp_other")],
++      });
++      handleSessionEvent({ type: "session_interrupted", requestedAt: 1, responseId: "resp_b" });
++      expect(spinnerIds()).toEqual([]);
++
++      useChatStore.setState({
++        conversationId: "conv_bg_stop_null",
++        activeResponse: null,
++        blocks: [bgSpinner("", NOW_S)],
++      });
++      handleSessionEvent({ type: "session_interrupted", requestedAt: 1 });
++      expect(spinnerIds()).toEqual([]);
++    });
++  });
++
+   it("a server-run (non-background) spinner is still removed when its turn settles", async () => {
+     const { sink, controller } = startPump("conv_nonbg_compact");
+     sink.push(turnEvent("response.created", "resp_a"));
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 0e257012973656592e5cee7511c21e52ccd2a8df..c625b737a03c0c463507ae43c34dbf3a994d5d15 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -58,6 +58,7 @@ import type {
+ import { userInputElicitationKey } from "@/lib/askUserQuestion";
+ import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
+ import { BlockStream } from "@/lib/blockStream";
++import { AE_BACKGROUND_COMPACTION_STALE_MS } from "@/lib/aeTokenDefrag";
+ import { itemsToBlocks } from "@/lib/itemsToBlocks";
+ import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+ import { buildBubbles } from "@/lib/renderItems";
+@@ -4433,11 +4434,12 @@ async function bindStream(
+       // branches that used to live here served the transcript LRU's revisit
+       // path, which no longer exists — a revisit finds a live entry and never
+       // re-binds.)
+-      const allBlocks = [
++      const allBlocksRaw = [
+         ...unique,
+         ...withoutRebuiltUserInputCards(currentBlocks, unique),
+         ...uniquePendingElicitations,
+       ];
++      const allBlocks = withoutEndedBackgroundSpinners(allBlocksRaw) ?? allBlocksRaw;
+       const hasErrorBlock = allBlocks.some((b) => b.type === "error");
+       // Decide the optimistic user bubbles to render after this bind, and
+       // (on cold load) keep the per-conversation stash consistent.
+@@ -5163,13 +5165,14 @@ async function rehydrateWindowOnReconnect(
+         preGapElicitations.pending,
+         preGapElicitations.autoResolved,
+       ) ?? merged;
++    const settledBlocks =
++      snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks;
+     return {
+       ...statusPatch,
+       // Same persisted-item evidence as the reconnect path: a rehydrated item
+       // can be a send whose POST died in the gap.
+       ...reconcileSendDraftWithSnapshot(s, freshItemIds, session),
+-      blocks:
+-        snapshotCompactionSpinners(blocks, s.activeResponse, statusPatch.activeResponse) ?? blocks,
++      blocks: withoutEndedBackgroundSpinners(settledBlocks) ?? settledBlocks,
+       hasMoreHistory: fresh.hasMore,
+       oldestItemId: fresh.items[0]?.id ?? null,
+       loadingMoreHistory: false,
+@@ -5358,6 +5361,7 @@ async function reconcileOnReconnect(
+     if (reconciled !== null) nextBlocks = reconciled;
+     nextBlocks =
+       snapshotCompactionSpinners(nextBlocks, s.activeResponse, patch.activeResponse) ?? nextBlocks;
++    nextBlocks = withoutEndedBackgroundSpinners(nextBlocks) ?? nextBlocks;
+     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
+     return patch;
+   });
+@@ -6128,21 +6132,52 @@ export function adoptCompactionSpinners(blocks: AnyBlock[], responseId: string):
+  * compaction terminal is not replayed.
+  *
+  * Harness-owned (`background`) spinners survive a turn settle, because that
+- * compaction outlives the turn; only `includeBackground` (explicit Stop) removes them.
++ * compaction outlives the turn, unless they are older than
++ * `AE_BACKGROUND_COMPACTION_STALE_MS` (the harness never reported an end);
++ * a stale one goes on any settle, whoever owns it. A spinner with no
++ * `startedAtS` counts as fresh.
+  *
+- * @returns the remaining blocks, or `null` when the turn owned no spinner.
++ * @returns the remaining blocks, or `null` when nothing is removed.
+  */
+ export function withoutSettledCompactionSpinners(
+   blocks: AnyBlock[],
+   responseId: string,
+-  opts?: { includeBackground?: boolean },
++  nowMs: number = Date.now(),
+ ): AnyBlock[] | null {
+-  const owned = (b: AnyBlock) =>
++  const drop = (b: AnyBlock) => {
++    if (b.type !== "compaction_loading") return false;
++    if (b.background !== true) return b.ctx.responseId === responseId;
++    return b.startedAtS !== undefined && nowMs - b.startedAtS * 1000 > AE_BACKGROUND_COMPACTION_STALE_MS;
++  };
++  if (!blocks.some(drop)) return null;
++  return blocks.filter((b) => !drop(b));
++}
++
++/**
++ * Drop background "Compacting…" spinners that a persisted `compaction` marker
++ * proves ended (the completion was missed during a stream gap). A marker whose
++ * time, or a spinner whose start, is unknown still counts: a marker after a
++ * spinner means that compaction finished.
++ *
++ * @returns the remaining blocks, or `null` when nothing is removed.
++ */
++export function withoutEndedBackgroundSpinners(blocks: AnyBlock[]): AnyBlock[] | null {
++  const markers = blocks.filter(
++    (b): b is Extract<AnyBlock, { type: "compaction" }> =>
++      b.type === "compaction" && Boolean(b.ctx.itemId),
++  );
++  if (markers.length === 0) return null;
++  const ended = (b: AnyBlock) =>
+     b.type === "compaction_loading" &&
+-    b.ctx.responseId === responseId &&
+-    (opts?.includeBackground === true || b.background !== true);
+-  if (!blocks.some(owned)) return null;
+-  return blocks.filter((b) => !owned(b));
++    b.background === true &&
++    markers.some(
++      (m) =>
++        m.ctx.createdAtS === undefined ||
++        b.startedAtS === undefined ||
++        b.startedAtS <= m.ctx.createdAtS,
++    );
++  if (!blocks.some(ended)) return null;
++  return blocks.filter((b) => !ended(b));
+ }
+ 
+ /**
+@@ -6155,7 +6190,7 @@ export function withoutSettledCompactionSpinners(
+  *   snapshot left it unchanged.
+  * @returns the rewritten blocks, or `null` when nothing changes.
+  */
+-function snapshotCompactionSpinners(
++export function snapshotCompactionSpinners(
+   blocks: AnyBlock[],
+   before: ActiveResponse | null,
+   after: ActiveResponse | null | undefined,
+@@ -7889,10 +7924,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+       // Stopping the turn stops its compaction, and the idle that follows a
+       // native stop may name no turn, so the stop itself retires the spinner.
+       applyToConversation((s) => {
+-        const stopped = s.activeResponse?.responseId;
+-        const blocks = stopped ? withoutSettledCompactionSpinners(s.blocks, stopped, { includeBackground: true })
+-          : null;
+-        return blocks === null ? {} : { blocks };
++        if (!s.blocks.some((b) => b.type === "compaction_loading")) return {};
++        return { blocks: s.blocks.filter((b) => b.type !== "compaction_loading") };
+       });
+       return;
+     case "session_created":

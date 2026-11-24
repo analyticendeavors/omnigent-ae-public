@@ -1,0 +1,590 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 08:38:28 -0800
+Subject: [PATCH 368/443] [ae-patch] Voice mode: restart a stalled mic in
+ place, and recycle the WebKit recognizer after each final
+
+---
+ .../ComposerMicButton.stall.test.tsx          | 258 ++++++++++++++++++
+ web/src/components/ComposerMicButton.tsx      |  81 +++++-
+ web/src/lib/aeVoiceStall.test.ts              |  48 ++++
+ web/src/lib/aeVoiceStall.ts                   |  95 +++++++
+ 4 files changed, 481 insertions(+), 1 deletion(-)
+ create mode 100644 web/src/components/ComposerMicButton.stall.test.tsx
+ create mode 100644 web/src/lib/aeVoiceStall.test.ts
+ create mode 100644 web/src/lib/aeVoiceStall.ts
+
+diff --git a/web/src/components/ComposerMicButton.stall.test.tsx b/web/src/components/ComposerMicButton.stall.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..ef037d7a2634ebca4534515654ec18e43d466213
+--- /dev/null
++++ b/web/src/components/ComposerMicButton.stall.test.tsx
+@@ -0,0 +1,258 @@
++// @vitest-environment jsdom
++// Voice mode stall watchdog and the WebKit recycle after a final (omnigent-ae).
++import type { AeMicController } from "@/lib/aeVoiceMode";
++import { act, cleanup, render } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
++import { ComposerMicButton } from "./ComposerMicButton";
++
++type Handlers = Record<string, (event: unknown) => void>;
++let instances: { handlers: Handlers }[];
++let startSpy: ReturnType<typeof vi.fn>;
++let abortSpy: ReturnType<typeof vi.fn>;
++let frames: (() => void)[];
++/** The byte every analyser bin reads: ~140 is speech, ~5 is a quiet room. */
++let binValue: number;
++const SPEECH = 140;
++const QUIET = 5;
++let originalUa: PropertyDescriptor | undefined;
++
++class FakeTrack {
++  muted = false;
++  stop = vi.fn();
++  addEventListener() {}
++}
++class FakeStream {
++  track = new FakeTrack();
++  getTracks() {
++    return [this.track];
++  }
++}
++class FakeCtx {
++  state = "running";
++  resume = vi.fn(() => Promise.resolve());
++  close = vi.fn();
++  addEventListener() {}
++  createMediaStreamSource() {
++    return { connect: vi.fn(), disconnect: vi.fn() };
++  }
++  createAnalyser() {
++    return {
++      fftSize: 0,
++      smoothingTimeConstant: 0,
++      frequencyBinCount: 32,
++      getByteFrequencyData: (data: Uint8Array) => data.fill(binValue),
++    };
++  }
++}
++
++function resultEvent(transcript: string) {
++  return {
++    resultIndex: 0,
++    results: { length: 1, 0: { length: 1, isFinal: true, 0: { transcript } } },
++  };
++}
++
++function setUserAgent(ua: string) {
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++}
++
++beforeEach(() => {
++  instances = [];
++  startSpy = vi.fn();
++  abortSpy = vi.fn();
++  frames = [];
++  binValue = QUIET;
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  class FakeRecognition {
++    continuous = false;
++    interimResults = false;
++    lang = "en-US";
++    start = startSpy;
++    stop = vi.fn();
++    abort = abortSpy;
++    own: Handlers = {};
++    constructor() {
++      instances.push({ handlers: this.own });
++    }
++    addEventListener(type: string, handler: (event: unknown) => void) {
++      this.own[type] = handler;
++    }
++    removeEventListener() {}
++  }
++  vi.stubGlobal("SpeechRecognition", FakeRecognition);
++  vi.stubGlobal("AudioContext", FakeCtx);
++  vi.stubGlobal("requestAnimationFrame", (cb: () => void) => {
++    frames.push(cb);
++    return frames.length;
++  });
++  vi.stubGlobal("cancelAnimationFrame", vi.fn());
++  Object.defineProperty(navigator, "mediaDevices", {
++    configurable: true,
++    value: {
++      getUserMedia: vi.fn(() => Promise.resolve(new FakeStream())),
++      enumerateDevices: vi.fn().mockResolvedValue([]),
++      addEventListener: vi.fn(),
++      removeEventListener: vi.fn(),
++    },
++  });
++  vi.useFakeTimers();
++  resetVoiceLog();
++});
++
++afterEach(() => {
++  cleanup();
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++  delete (navigator as { mediaDevices?: unknown }).mediaDevices;
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++async function listenVoice() {
++  const controller = { current: null as AeMicController | null };
++  const onListeningChange = vi.fn();
++  const onTranscript = vi.fn();
++  const onVoiceStart = vi.fn();
++  render(
++    <ComposerMicButton
++      onTranscript={onTranscript}
++      onVoiceStart={onVoiceStart}
++      controller={controller}
++      onListeningChange={onListeningChange}
++    />,
++  );
++  act(() => controller.current?.start());
++  await act(async () => {
++    instances[0].handlers.start?.({});
++    instances[0].handlers.audiostart?.({});
++    await vi.advanceTimersByTimeAsync(0);
++  });
++  return { controller, onListeningChange, onTranscript, onVoiceStart };
++}
++
++/** Meter frames every 100 ms at `value`, for `ms`. */
++async function run(value: number, ms: number) {
++  binValue = value;
++  for (let t = 0; t < ms; t += 100) {
++    // oxlint-disable-next-line no-await-in-loop -- fake time advances one frame at a time
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(100);
++      for (const cb of frames.splice(0)) cb();
++    });
++  }
++}
++
++/** The live recognizer shows life, as a healthy fresh one does. */
++function revive() {
++  const live = instances[instances.length - 1].handlers;
++  act(() => {
++    live.start?.({});
++    live.audiostart?.({});
++  });
++}
++
++describe("ComposerMicButton (stall watchdog)", () => {
++  it("speech energy then 2.5 s quiet with no result swaps the recognizer without a stop report", async () => {
++    const { controller, onListeningChange, onVoiceStart } = await listenVoice();
++    await run(SPEECH, 1000);
++    await run(QUIET, 3000);
++    expect(instances).toHaveLength(2);
++    expect(startSpy).toHaveBeenCalledTimes(2);
++    expect(abortSpy).toHaveBeenCalledTimes(1);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    expect(controller.current?.isListening()).toBe(true);
++    expect(formatVoiceLog()).toContain("mic stalled");
++    // The new recognizer's start is not a new take: no second snapshot for Esc.
++    revive();
++    expect(onVoiceStart).toHaveBeenCalledTimes(1);
++  });
++
++  it("a result inside the window means no restart", async () => {
++    const { onTranscript } = await listenVoice();
++    await run(SPEECH, 1000);
++    await run(QUIET, 1500);
++    act(() => instances[0].handlers.result?.(resultEvent("hello there")));
++    await run(QUIET, 4000);
++    expect(onTranscript).toHaveBeenCalledWith("hello there");
++    expect(instances).toHaveLength(1);
++    expect(formatVoiceLog()).not.toContain("mic stalled");
++  });
++
++  it("a quiet room with no speech energy never restarts", async () => {
++    await listenVoice();
++    await run(QUIET, 4500);
++    expect(instances).toHaveLength(1);
++  });
++
++  it("a short noise blip is not speech", async () => {
++    await listenVoice();
++    await run(SPEECH, 300);
++    await run(QUIET, 4000);
++    expect(instances).toHaveLength(1);
++  });
++
++  it("the fourth stall inside a minute goes the deaf way", async () => {
++    const { onListeningChange } = await listenVoice();
++    for (let i = 0; i < 3; i += 1) {
++      // oxlint-disable-next-line no-await-in-loop -- each stall needs its own clock
++      await run(SPEECH, 1000);
++      // oxlint-disable-next-line no-await-in-loop
++      await run(QUIET, 3000);
++      expect(instances).toHaveLength(i + 2);
++      revive();
++    }
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    await run(SPEECH, 1000);
++    await run(QUIET, 3000);
++    expect(onListeningChange.mock.calls.filter((c) => c[0] === false)).toEqual([[false, "deaf"]]);
++    expect(formatVoiceLog()).toContain("mic deaf stalled repeatedly");
++  });
++});
++
++describe("ComposerMicButton (WebKit recycle after a final)", () => {
++  const IPHONE =
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1";
++  const CHROME =
++    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
++
++  it("a final on WebKit starts a fresh recognizer, delivers once and reports nothing", async () => {
++    setUserAgent(IPHONE);
++    const { controller, onListeningChange, onTranscript } = await listenVoice();
++    act(() => instances[0].handlers.result?.(resultEvent("How's")));
++    expect(onTranscript).toHaveBeenCalledTimes(1);
++    expect(onTranscript).toHaveBeenCalledWith("How's");
++    expect(instances).toHaveLength(2);
++    expect(startSpy).toHaveBeenCalledTimes(2);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false);
++    expect(controller.current?.isListening()).toBe(true);
++    const log = formatVoiceLog();
++    expect(log).toContain("mic result final 5");
++    expect(log).toContain("mic recycle after final");
++    // Events from the recycled recognizer change nothing.
++    act(() => {
++      instances[0].handlers.result?.(resultEvent("stale"));
++      instances[0].handlers.end?.({});
++      instances[0].handlers.error?.({ error: "aborted" });
++    });
++    expect(onTranscript).toHaveBeenCalledTimes(1);
++    expect(controller.current?.isListening()).toBe(true);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false);
++    // The fresh recognizer carries on and delivers the next phrase.
++    revive();
++    act(() => instances[1].handlers.result?.(resultEvent("are you")));
++    expect(onTranscript).toHaveBeenCalledTimes(2);
++    expect(instances).toHaveLength(3);
++  });
++
++  it("Chrome keeps one recognizer after a final", async () => {
++    setUserAgent(CHROME);
++    const { onTranscript } = await listenVoice();
++    act(() => instances[0].handlers.result?.(resultEvent("How's")));
++    expect(onTranscript).toHaveBeenCalledTimes(1);
++    expect(instances).toHaveLength(1);
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(formatVoiceLog()).not.toContain("mic recycle after final");
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index e9a7de74d47322836138e38b5f6196386eb15034..7a5dac273abb1faf9f0918359704d8fd56cd904c 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -8,6 +8,7 @@ import { getMicStream } from "@/lib/aeAudioDevices";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+ import { publishVoiceBins, resetVoiceBins } from "@/lib/aeVoiceLevel";
+ import { logVoice } from "@/lib/aeVoiceLog";
++import { createStallDetector, isWebKitSpeech } from "@/lib/aeVoiceStall";
+ import { DictationBusyError, DictationSession } from "@/lib/dictation";
+ import { isElectronShell } from "@/lib/nativeBridge";
+ import { cn } from "@/lib/utils";
+@@ -97,6 +98,9 @@ const MIC_TRACK_MUTED_MS = 2000;
+ const MIC_METER_STALL_MS = 6000;
+ // The analyser is only believed while its animation frames keep arriving.
+ const MIC_METER_FRESH_MS = 1500;
++// Stall restarts (speech heard, no result) allowed per minute before the take is called deaf.
++const MIC_STALL_MAX_PER_MIN = 3;
++const MIC_STALL_WINDOW_MS = 60_000;
+ 
+ export interface ComposerMicButtonProps {
+   onTranscript: (text: string) => void;
+@@ -228,6 +232,12 @@ export const ComposerMicButton = ({
+   const ctxStallSinceRef = useRef<number | null>(null);
+   const silentSinceRef = useRef<number | null>(null);
+   const meterTickRef = useRef(0);
++  // Speech energy from the meter against recognizer results: a take that heard the user and
++  // then produced nothing is stalled and gets a fresh recognizer without Voice mode noticing.
++  const stallRef = useRef(createStallDetector());
++  const stallTimesRef = useRef<number[]>([]);
++  // The next `start` event belongs to a recognizer we swapped in ourselves: no snapshot.
++  const silentStartRef = useRef(false);
+   // The next listening change was made by us (a deaf replace or a forced restart): Voice mode
+   // was told another way, or needs no word.
+   const quietStopRef = useRef(false);
+@@ -317,6 +327,41 @@ export const ComposerMicButton = ({
+       failPendingStart("deaf");
+     };
+ 
++    // A fresh recognizer started in place while the take stays "listening": Voice mode is told
++    // nothing, and the transcript already delivered is kept. False when start() threw.
++    const silentRestart = (): boolean => {
++      replace();
++      const next = recognitionRef.current;
++      if (!next) return false;
++      silentStartRef.current = true;
++      startSeenRef.current = false;
++      audioStartSeenRef.current = false;
++      recognizerSoundSeenRef.current = false;
++      lastRecognizerActivityRef.current = Date.now();
++      stallRef.current.reset(Date.now());
++      try {
++        next.start();
++      } catch {
++        silentStartRef.current = false;
++        return false;
++      }
++      // If the new recognizer never answers, the no-audiostart check still catches it.
++      armLiveness();
++      return true;
++    };
++
++    const handleStall = (sinceResultMs: number, now: number) => {
++      logVoice("mic stalled", String(sinceResultMs));
++      const recent = stallTimesRef.current.filter((t) => now - t < MIC_STALL_WINDOW_MS);
++      if (recent.length >= MIC_STALL_MAX_PER_MIN) {
++        stallTimesRef.current = recent;
++        reportDeaf("stalled repeatedly");
++        return;
++      }
++      stallTimesRef.current = [...recent, now];
++      if (!silentRestart()) reportDeaf("stall restart failed");
++    };
++
+     const checkLiveness = () => {
+       if (!voiceTakeRef.current || !listeningRef.current) return;
+       const now = Date.now();
+@@ -329,6 +374,14 @@ export const ComposerMicButton = ({
+         reportDeaf("no audiostart");
+         return;
+       }
++      // Speech heard, then quiet, and no result since: the recognizer stalled.
++      if (permissionRef.current !== "other" && now - meterTickRef.current <= MIC_METER_FRESH_MS) {
++        const stalledFor = stallRef.current.evaluate(now);
++        if (stalledFor !== null) {
++          handleStall(stalledFor, now);
++          return;
++        }
++      }
+       // The meter never decides alone: it counts only after the recognizer itself has shown
+       // no activity for a while (an early soundstart does not switch the checks off for good).
+       if (now - lastRecognizerActivityRef.current < MIC_RECOGNIZER_QUIET_MS) return;
+@@ -386,7 +439,8 @@ export const ComposerMicButton = ({
+         setError(null);
+         setIsListening(true);
+         // Snapshot point: let the parent record the text so Esc can revert to it.
+-        onVoiceStartRef.current?.();
++        if (silentStartRef.current) silentStartRef.current = false;
++        else onVoiceStartRef.current?.();
+       };
+       const handleEnd = () => {
+         if (!current() || serverTakeOwnsState()) return;
+@@ -461,6 +515,7 @@ export const ComposerMicButton = ({
+         recognizerSoundSeenRef.current = true;
+         resultSinceStopRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
++        stallRef.current.result(Date.now());
+         // Drop late events that arrive after the composer went disabled, or after
+         // an Esc discard the parent has already reverted.
+         if (disabledRef.current || discardingRef.current) return;
+@@ -474,6 +529,27 @@ export const ComposerMicButton = ({
+         }
+         const trimmed = finalTranscript.trim();
+         if (trimmed) onTranscriptRef.current(trimmed);
++        let interimChars = 0;
++        for (let i = speechEvent.resultIndex; i < speechEvent.results.length; i += 1) {
++          if (!speechEvent.results[i].isFinal) {
++            interimChars += (speechEvent.results[i][0]?.transcript ?? "").length;
++          }
++        }
++        if (trimmed) logVoice("mic result", `final ${trimmed.length}`);
++        else if (interimChars > 0) logVoice("mic result", `interim ${interimChars}`);
++        // WebKit's continuous mode stops delivering after its first final: take a fresh
++        // recognizer straight away so it never has to deliver a second one. Not while a stop
++        // is under way, and not on Chrome.
++        if (
++          trimmed &&
++          voiceTakeRef.current &&
++          listeningRef.current &&
++          stopWatchdogRef.current === null &&
++          isWebKitSpeech()
++        ) {
++          logVoice("mic recycle after final");
++          if (!silentRestart()) reportDeaf("recycle failed");
++        }
+       };
+ 
+       recognition.addEventListener("start", handleStart);
+@@ -769,6 +845,7 @@ export const ComposerMicButton = ({
+           const el = bars[i];
+           if (el) el.style.transform = `scaleY(${scale})`;
+         }
++        stallRef.current.feed(total / BAR_BINS.length, frameAt);
+         publishMicLevel((total / BAR_BINS.length) * 1.6);
+         publishVoiceBins(data);
+         rafId = requestAnimationFrame(tick);
+@@ -963,6 +1040,8 @@ export const ComposerMicButton = ({
+         recognizerSoundSeenRef.current = false;
+         lastRecognizerActivityRef.current = 0;
+         browserStartPendingRef.current = true;
++        silentStartRef.current = false;
++        stallRef.current.reset(Date.now());
+         recognition.start();
+       }
+     } catch {
+diff --git a/web/src/lib/aeVoiceStall.test.ts b/web/src/lib/aeVoiceStall.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..919f61f91bcb2e2062cf7c726bdd2ff6ca6bd42d
+--- /dev/null
++++ b/web/src/lib/aeVoiceStall.test.ts
+@@ -0,0 +1,48 @@
++import { describe, expect, it } from "vitest";
++import { createStallDetector, isWebKitSpeech, STALL_QUIET_MS } from "./aeVoiceStall";
++
++function feedFor(
++  d: ReturnType<typeof createStallDetector>,
++  level: number,
++  from: number,
++  ms: number,
++) {
++  let t = from;
++  for (; t < from + ms; t += 50) d.feed(level, t);
++  return t;
++}
++
++describe("stall detector", () => {
++  it("fires once after sustained speech and a quiet spell", () => {
++    const d = createStallDetector();
++    d.reset(0);
++    let t = feedFor(d, 0.6, 50, 1000);
++    t = feedFor(d, 0.02, t, STALL_QUIET_MS - 200);
++    expect(d.evaluate(t)).toBeNull();
++    t = feedFor(d, 0.02, t, 400);
++    expect(d.evaluate(t)).toBe(t);
++    expect(d.evaluate(t + 100)).toBeNull();
++  });
++
++  it("a result clears the unanswered speech", () => {
++    const d = createStallDetector();
++    d.reset(0);
++    let t = feedFor(d, 0.6, 50, 1000);
++    d.result(t);
++    t = feedFor(d, 0.02, t, 4000);
++    expect(d.evaluate(t)).toBeNull();
++  });
++
++  it("a loud room raises the threshold above its own floor", () => {
++    const d = createStallDetector();
++    d.reset(0);
++    feedFor(d, 0.1, 50, 20_000);
++    expect(d.threshold()).toBeGreaterThan(0.12);
++  });
++});
++
++describe("isWebKitSpeech", () => {
++  it("is false in plain jsdom", () => {
++    expect(isWebKitSpeech()).toBe(false);
++  });
++});
+diff --git a/web/src/lib/aeVoiceStall.ts b/web/src/lib/aeVoiceStall.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..badf3f6c20f9a9f9764eb7d91db3e73817d95511
+--- /dev/null
++++ b/web/src/lib/aeVoiceStall.ts
+@@ -0,0 +1,95 @@
++// Voice mode stall detector (omnigent-ae). A Web Speech take can stay "listening" while the
++// recognizer has stopped delivering results (WebKit does this after a final). The mic meter
++// still hears the user, so the sign of a stall is: sustained speech energy, then a quiet
++// spell, and no recognizer result since the speech began. Pure and clock-free: the caller
++// passes `now`, so a test can seed levels and time.
++
++/** Speech energy must add up to this long before a quiet spell can count as a stall. */
++export const STALL_MIN_SPEECH_MS = 600;
++/** Quiet this long after the speech, with no result, is a stall. Browser takes only deliver a
++ *  final after a pause, so this is deliberately longer than the usual wait. */
++export const STALL_QUIET_MS = 2500;
++/** Energy blips further apart than this are noise, not one stretch of speech. */
++const STALL_BLIP_RESET_MS = 1500;
++/** One animation frame never counts for more than this (a throttled tab is not speech). */
++const MAX_FRAME_MS = 100;
++const MIN_THRESHOLD = 0.12;
++const MAX_THRESHOLD = 0.35;
++
++export interface StallDetector {
++  /** One meter frame: the mean level of the voice bins, 0 to 1. */
++  feed: (level: number, now: number) => void;
++  /** The recognizer produced a result, interim or final. */
++  result: (now: number) => void;
++  /** Milliseconds since the last result when the take is stalled, else null. Fires once. */
++  evaluate: (now: number) => number | null;
++  /** A new take or a fresh recognizer: forget unanswered speech, keep the noise floor. */
++  reset: (now: number) => void;
++  /** The level above which the meter counts a frame as speech. */
++  threshold: () => number;
++}
++
++export function createStallDetector(): StallDetector {
++  let floor = 0.03;
++  let lastFeed = 0;
++  let aboveMs = 0;
++  let lastAbove: number | null = null;
++  let lastResult = 0;
++
++  const threshold = () => Math.min(MAX_THRESHOLD, Math.max(MIN_THRESHOLD, floor * 2 + 0.06));
++  const clear = () => {
++    aboveMs = 0;
++    lastAbove = null;
++  };
++
++  return {
++    feed(level, now) {
++      const dt = lastFeed === 0 ? 0 : Math.min(MAX_FRAME_MS, Math.max(0, now - lastFeed));
++      lastFeed = now;
++      if (level >= threshold()) {
++        aboveMs += dt;
++        lastAbove = now;
++        return;
++      }
++      // Quiet frame: the noise floor follows the room, slowly.
++      floor += (level - floor) * 0.02;
++      if (
++        lastAbove !== null &&
++        aboveMs < STALL_MIN_SPEECH_MS &&
++        now - lastAbove > STALL_BLIP_RESET_MS
++      ) {
++        clear();
++      }
++    },
++    result(now) {
++      lastResult = now;
++      clear();
++    },
++    evaluate(now) {
++      if (lastAbove === null || aboveMs < STALL_MIN_SPEECH_MS) return null;
++      if (now - lastAbove < STALL_QUIET_MS) return null;
++      clear();
++      return Math.max(0, now - lastResult);
++    },
++    reset(now) {
++      lastResult = now;
++      lastFeed = 0;
++      clear();
++    },
++    threshold,
++  };
++}
++
++/** iOS (every browser there is WebKit) and desktop Safari. Chrome and Edge are not. */
++export function isWebKitSpeech(): boolean {
++  try {
++    const nav = navigator;
++    const ua = nav.userAgent ?? "";
++    if (/iPad|iPhone|iPod/.test(ua)) return true;
++    // iPadOS asks for the desktop site and says Macintosh.
++    if (/Macintosh/.test(ua) && nav.maxTouchPoints > 1) return true;
++    return /Safari\//.test(ua) && !/Chrome|Chromium|CriOS|FxiOS|Edg|OPR|Android/.test(ua);
++  } catch {
++    return false;
++  }
++}

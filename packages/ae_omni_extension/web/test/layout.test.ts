@@ -223,57 +223,9 @@ describe("Needs you folding survives the stylesheet", () => {
   });
 });
 
-// 2026-11-06: four status pills replaced the ten tiles.
-describe("status pills", () => {
-  it("lays four pills in one row, and two by two under 760 px of the page", () => {
-    expect(block(".admin-tiles")).toContain("repeat(4, minmax(0, 1fr))");
-    const at = css.indexOf("@container admin (max-width: 760px) {\n  .admin-tiles {");
-    expect(at).toBeGreaterThanOrEqual(0);
-    expect(css.slice(at, css.indexOf("}\n}", at))).toContain("repeat(2, minmax(0, 1fr))");
-  });
-
-  it("keeps the strip on a phone: nothing hides .admin-tiles any more", () => {
-    expect(css).not.toMatch(/@container admin \(width < 520px\) \{\s*\.admin-tiles \{\s*display: none/);
-  });
-
-  it("drops the rules that only served the old tiles, and keeps the Deploy hold bar", () => {
-    for (const gone of [".admin-tiles > .tile", ".tile-value", ".tile-label", ".tile-note", ".tile-dot"]) {
-      expect(css, gone).not.toContain(`${gone} {`);
-    }
-    expect(css).toContain(".tile-bar {");
-  });
-
-  it("tints a problem pill from --err, with no hard-coded colour", () => {
-    expect(block(".pill-problem")).toContain("color-mix(in srgb, var(--err)");
-    expect(block(".pill-attention")).toContain("var(--warn-bg)");
-  });
-
-  it("opens the popover on hover and keyboard focus only, and never clips it", () => {
-    expect(block(".pill-pop")).toContain("display: none");
-    expect(css).toContain(".pill:focus-visible + .pill-pop {");
-    const at = css.indexOf("@media (hover: hover) {\n  .pill-wrap:hover .pill-pop {");
-    expect(at, "the hover rule sits inside @media (hover: hover)").toBeGreaterThanOrEqual(0);
-    expect(css.indexOf(".pill-wrap:hover")).toBeGreaterThan(css.indexOf("@media (hover: hover)"));
-    expect(block(".pill-wrap")).not.toMatch(/overflow/);
-    expect(block(".pill")).not.toMatch(/overflow/);
-  });
-
-  it("wraps the pill line to two lines instead of one ellipsized line", () => {
-    const rule = block(".pill-line");
-    expect(rule).toContain("-webkit-line-clamp: 2");
-    expect(rule).toContain("line-clamp: 2");
-    expect(rule).not.toContain("white-space: nowrap");
-    // Under 520 px the brief is one line (2026-11-07).
-    const at = css.indexOf("@container admin (width < 520px) {\n  .pill-line {");
-    expect(at).toBeGreaterThanOrEqual(0);
-    expect(css.slice(at, css.indexOf("\n}\n", at))).toContain("-webkit-line-clamp: 1");
-  });
-
-  it("makes the status boxes one height and leaves the host to reserve the phone's top band", () => {
-    expect(block(".pill")).toContain("height: 100%");
-    expect(css).not.toContain("padding-top: 52px");
-  });
-
+// 2026-11-14 (concept D2): the pill strip, the packed board and the drag are gone; the page is tabs,
+// one Needs you table and a rail. These hold the rules that keep it readable.
+describe("the Admin Center page", () => {
   it("puts the verdict on its own line under the title on a narrow page", () => {
     const at = css.indexOf("@container admin (max-width: 519px) {\n  .fabric.admin .fabric-top {");
     expect(at).toBeGreaterThanOrEqual(0);
@@ -282,44 +234,194 @@ describe("status pills", () => {
     expect(rules).toContain("flex: 1 0 100%");
   });
 
-  // 2026-11-06 (phase 4): the cards sit under group headings.
-  it("lays the board out as groups, each with the column grid, and wraps the Not set up line", () => {
-    const board = block(".admin-board");
-    // 2026-11-07 (D1): a grid of the page's columns that packs groups first-fit.
-    expect(board).toContain("display: grid");
-    expect(board).toContain("grid-auto-flow: row dense");
-    expect(board).toContain("gap: 22px 14px");
-    expect(css).not.toContain(".admin-col > .admin-card:last-child {\n  flex: 1;");
-    // The group's stacks and the box-admin board keep today's grid.
-    const start = css.indexOf(".admin-group-cols,");
-    expect(start).toBeGreaterThanOrEqual(0);
-    const grid = css.slice(start, css.indexOf("}", start));
-    expect(grid).toContain(".admin-board[data-single]");
-    expect(grid).toContain("grid-template-columns: repeat(var(--cols), minmax(0, 1fr))");
-    expect(grid).toContain("gap: 14px");
-    expect(grid).toContain("align-items: start");
-    const heading = block(".admin-group-h");
-    expect(heading).toContain("letter-spacing: 0.07em");
-    expect(heading).toContain("text-transform: uppercase");
-    expect(heading).toContain("var(--muted)");
-    expect(block(".admin-group-line")).toContain("var(--line)");
+  it("drops the rules that only served the pills, the packed board and the drag", () => {
+    for (const gone of [".admin-tiles {", ".pill {", ".pill-pop {", ".admin-grip {", ".admin-group-h {", ".tile-bar {"]) {
+      expect(css, gone).not.toContain(gone);
+    }
+    expect(css).not.toContain("data-packed");
+    expect(css).not.toContain("is-dragging");
+  });
+
+  it("wraps the Not set up line and hides the packed board's group tag", () => {
     const notset = block(".admin-notset");
     expect(notset).toContain("overflow-wrap: anywhere");
     expect(notset).toContain("1px dashed var(--line)");
+    expect(block(".admin-card-tag")).toContain("display: none");
   });
 
-  // 2026-11-07 (packed board): four columns, the group tag, Needs you as a tile, the flash ring.
-  it("has a fourth column, a tag shown only when packed, and no 360 px Needs you grid", () => {
-    expect(block('.admin-board[data-columns="4"]')).toContain("--cols: 4");
-    expect(block(".admin-card-tag")).toContain("display: none");
-    const tag = block(".admin-board[data-packed] .admin-card-tag");
-    expect(tag).toContain("font-size: 11px");
-    expect(tag).toContain("font-weight: 650");
-    expect(tag).toContain("letter-spacing: 0.08em");
-    expect(tag).toContain("var(--muted)");
-    expect(css).not.toContain("minmax(360px, 1fr)");
-    expect(block(".admin-board[data-packed] .attn-tree")).toContain("flex-direction: column");
-    expect(block(".admin-board[data-packed] .attn-review-source")).toContain("margin-left: auto");
-    expect(block(".admin-card.is-flash")).toContain("var(--accent)");
+  it("puts the rail beside the table from 1,700 px of page, at 500 px, and folds it to chips below", () => {
+    const at = css.indexOf("@container admin (min-width: 1700px) {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const wide = css.slice(at, css.indexOf("\n}\n\n", at));
+    expect(wide).toContain("minmax(0, 1fr) 500px");
+    expect(wide).toContain(".as-chips");
+    expect(block(".as-rail")).toContain("display: none");
+  });
+
+  it("folds the Age and Checked columns into the row's second line under 1,700 px", () => {
+    const at = css.indexOf("@container admin (max-width: 1699px) {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const narrow = css.slice(at, css.indexOf("\n}\n\n", at));
+    expect(narrow).toContain(".nt-row > .nt-age");
+    expect(narrow).toContain(".nt-row > .nt-checked");
+    expect(narrow).toContain("display: none");
+    expect(narrow).toContain("attr(data-fold)");
+  });
+
+  it("gives the phone two-line rows, 44 px targets and an opened item as a body-level sheet with pinned actions", () => {
+    const at = css.indexOf("@container admin (max-width: 520px) {\n  .nt-head,");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const phone = css.slice(at, css.indexOf("\n}\n\n", at));
+    expect(phone).toContain("min-height: 44px");
+    // The sheet is a <dialog> in the top layer, outside the page container's containing block, not a
+    // fixed row inside it (a container makes its descendants' fixed boxes relative to itself).
+    expect(phone).not.toContain("position: fixed");
+    const sheetRule = (() => {
+      const at = css.indexOf(".nt-sheet {\n  position: fixed");
+      expect(at).toBeGreaterThanOrEqual(0);
+      return css.slice(at, css.indexOf("}", at));
+    })();
+    expect(sheetRule).toContain("position: fixed");
+    expect(sheetRule).toContain("inset: 0");
+    // Below the shared dialogs (.ae-dialog, 60) so a confirmation opened from the sheet stacks on top.
+    const dialogZ = Number(/z-index: (\d+)/.exec(block(".ae-dialog"))![1]);
+    expect(Number(/z-index: (\d+)/.exec(sheetRule)![1])).toBeLessThan(dialogZ);
+    expect(block(".nt-sheet .nt-acts")).toContain("position: sticky");
+    // The pinned bar is a step lighter than the sheet, and its buttons one more.
+    expect(sheetRule).toContain("background: var(--s2)");
+    expect(block(".nt-sheet .nt-acts")).toContain("background: var(--s3)");
+    expect(block(".nt-sheet .nt-acts")).toContain("--btn-bg: var(--s4)");
+    // The sheet lives on body, outside .fabric.admin, so it carries the ramp's variables itself.
+    expect(css).toContain(".fabric.admin,\n.nt-sheet {");
+    expect(css).toContain(':root[data-theme="dark"] .nt-sheet {');
+  });
+
+  it("drops the checkboxes, the selection bar and the composition bar on a phone page, and shows Snooze's word", () => {
+    const at = css.indexOf("@container admin (max-width: 520px) {\n  .nt-head,");
+    const phone = css.slice(at, css.indexOf("\n}\n\n", at));
+    const hidden = phone.slice(0, phone.indexOf("}"));
+    for (const selector of [".nt-pick", ".nt-pick-group", ".nt-bulk", ".nt-comp-slot"]) expect(hidden, selector).toContain(selector);
+    expect(hidden).toContain("display: none");
+    // The word is a real label in the DOM, shown here and hidden elsewhere.
+    expect(phone).toContain(".nt-snooze-word");
+    expect(css).toContain(".nt-snooze-menu .nt-snooze-word {\n  display: none;");
+  });
+
+  it("builds one button system: tokens, 13 px 600 labels, and 44 px / 14 px on a coarse pointer", () => {
+    expect(css).toContain("--ctl-h: 32px;");
+    expect(css).toContain("--ctl-fs: 13px;");
+    expect(css).toContain("--ctl-fw: 600;");
+    expect(css).toContain("--ctl-fs: 14px;");
+    // The three complaints: Review N is no longer muted 12 px / 28 px text, the area link is no plain text.
+    expect(block(".attn-review-all")).not.toContain("font-size: 12px");
+    expect(block(".attn-review-all")).not.toContain("min-height: 28px");
+    expect(block(".nt-go")).not.toContain("color: var(--muted)");
+  });
+
+  it("shows the toast above a phone's sheet, on phone widths only", () => {
+    const at = css.indexOf("@media (max-width: 520px) {\n  body:has(.nt-sheet) #toast {");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const rule = css.slice(at, css.indexOf("\n}\n", at));
+    expect(rule).toContain("position: fixed");
+    const sheetZ = Number(/z-index: (\d+)/.exec(css.slice(css.indexOf(".nt-sheet {\n  position: fixed")))![1]);
+    expect(Number(/z-index: (\d+)/.exec(rule)![1])).toBeGreaterThan(sheetZ);
+    // No rule moves the toast without a phone width and an open sheet.
+    expect(css.match(/#toast/g)!.length).toBeLessThanOrEqual(2);
+  });
+
+  it("gives every coarse pointer 44 px targets on the tabs, rows, groups, bar, rail and chips", () => {
+    const at = css.lastIndexOf("@media (pointer: coarse) {\n  .as-tab,");
+    expect(at).toBeGreaterThanOrEqual(0);
+    const coarse = css.slice(at, css.indexOf("\n}\n", at));
+    for (const selector of [".as-tab", ".nt-toggle", ".nt-grp-btn", ".nt-seg", ".rail-h", ".as-chip"]) {
+      expect(coarse, selector).toContain(selector);
+    }
+    expect(coarse).toContain("min-height: 44px");
+    // Buttons (Close, the area tab button, the toolbar) take their 44 px from the button system's token.
+    const tokens = css.slice(css.indexOf("@media (pointer: coarse) {\n  .fabric.admin,\n  .nt-sheet {"));
+    expect(tokens.slice(0, 200)).toContain("--ctl-h: 44px");
+  });
+
+  it("fills the width: area cards in lanes, Services one wide row per card, a quiet day's tiles", () => {
+    // Columns, not a grid row (2026-11-22): a short card sits straight under the card above it.
+    // Lanes side by side, cards kept in page order (2026-11-22): a short card sits straight under the card above it.
+    const laned = '.as-board[data-lanes]:not([data-lanes="1"]) > .admin-col';
+    expect(block(laned)).toContain("position: relative");
+    expect(block(`${laned} > .admin-card`)).toContain("position: absolute");
+    expect(block(`${laned} > .admin-card`)).toContain("left: calc(var(--lane, 0) * (100% + 14px) / var(--lanes, 1))");
+    expect(css).not.toContain(".as-board .admin-col {");
+    expect(css).toContain(".ae-cards-page .ae-card-cells {");
+    // Only where there is no wall (2026-11-17): under 760 px, and on a server with four cards or fewer.
+    expect(block('.as-ov.is-quiet:not([data-wall="wide"], [data-wall="stack"]) .as-tiles')).toContain("display: grid");
+    expect(block(".as-tiles")).toContain("display: none");
+  });
+
+  it("holds the light theme's pills and small labels at 4.5:1 or better (measured in the round 2 report)", () => {
+    const lum = (hex: string): number => {
+      const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16) / 255).map((c) => (c <= 0.03928 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4));
+      return 0.2126 * r! + 0.7152 * g! + 0.0722 * b!;
+    };
+    const ratio = (a: string, b: string): number => {
+      const [hi, lo] = [lum(a), lum(b)].sort((x, y) => y - x);
+      return (hi! + 0.05) / (lo! + 0.05);
+    };
+    const light = css.slice(css.indexOf(".fabric.admin,\n.nt-sheet {\n  --s0"));
+    const rule = light.slice(0, light.indexOf("}"));
+    const muted = /--muted: (#[0-9a-f]{6})/.exec(rule)![1]!;
+    const warn = /--warn: (#[0-9a-f]{6})/.exec(rule)![1]!;
+    const steps = ["#ffffff", "#f6f7f9", "#eceff3", "#e2e6ec"];
+    for (const step of steps) expect(ratio(muted, step), `muted on ${step}`).toBeGreaterThanOrEqual(4.5);
+    for (const step of steps.slice(1)) expect(ratio(warn, step), `warn on ${step}`).toBeGreaterThanOrEqual(4.5);
+    // The amber pill is white on the darker amber; the red one white on --err; the blue one white on --accent.
+    expect(ratio("#ffffff", warn)).toBeGreaterThanOrEqual(4.5);
+    expect(ratio("#ffffff", "#b91c1c")).toBeGreaterThanOrEqual(4.5);
+    expect(ratio("#ffffff", "#2563eb")).toBeGreaterThanOrEqual(4.5);
+    expect(block(".nt-pill-review")).toContain("color: #ffffff");
+  });
+
+  it("holds the surface ramp for the dark theme and a darker one for the light theme", () => {
+    const dark = css.slice(css.indexOf(':root[data-theme="dark"] .fabric.admin,'));
+    for (const step of ["#111827", "#1a2538", "#25344f", "#304262", "#2c3a54", "#3d4f72", "#4d6189"]) {
+      expect(dark.slice(0, dark.indexOf("}")), step).toContain(step);
+    }
+    const light = css.slice(css.indexOf(".fabric.admin,\n.nt-sheet {\n  --s0"));
+    for (const step of ["#f6f7f9", "#eceff3", "#e2e6ec"]) expect(light.slice(0, light.indexOf("}")), step).toContain(step);
+    // The opened row's panel is one step lighter than the table card, its facts one more.
+    expect(block(".nt-panel")).toContain("background: var(--s2)");
+    expect(css).toContain("--inner: var(--s3);");
+  });
+
+  it("keeps a closed row's non-primary actions out of the row, and the panel's grid ready for a second column", () => {
+    expect(css).toContain(".nt-row:not(.is-open) .attn-actions > button[data-focus]:not([data-primary])");
+    expect(css).toContain(".nt-panel:has(> .nt-panel-side)");
+  });
+});
+
+describe("the status chip beside the action buttons (2026-11-18)", () => {
+  const ruleAt = (selector: string): string => {
+    const at = css.indexOf(`${selector} {`);
+    return css.slice(at, css.indexOf("}", at));
+  };
+
+  it("matches its neighbours' height, centre and radius in the Admin Center and the sheet, and never looks pressable", () => {
+    const rule = ruleAt(".fabric.admin .attn-status,\n.nt-sheet .attn-status");
+    expect(rule).toContain("align-self: stretch");
+    expect(rule).toContain("align-items: center");
+    expect(rule).toContain("border-radius: 8px");
+    expect(rule).toContain("min-height: var(--ctl-h, 32px)");
+    expect(rule).toContain("cursor: default");
+    expect(css).toMatch(/\.fabric\.admin \.attn-status,\n\s+\.nt-sheet \.attn-status \{\n\s+min-height: 44px;/);
+    expect(css).not.toMatch(/\.attn-status[^{]*:hover/);
+  });
+
+  it("leaves the chip's size alone on other surfaces", () => {
+    const base = ruleAt(".attn-status");
+    expect(base).toContain("padding: 2px 8px");
+    expect(base).toContain("border-radius: 6px");
+    expect(base).not.toContain("min-height");
+  });
+
+  it("insets the empty text like the header, banners and strip", () => {
+    expect(ruleAt(".attn.nt > .attn-body > .attn-empty")).toContain("padding: 0 18px");
   });
 });

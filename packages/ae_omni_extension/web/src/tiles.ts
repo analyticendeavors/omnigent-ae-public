@@ -27,14 +27,16 @@
 // first, and a hover or focus popover lists every member. Clicking a pill goes to the its
 // group's heading on a phone and rings the group's cards on the packed board (cardNav.ts goToGroup), the first card when the board has no groups. The tile store and setTile are unchanged, so no section moved.
 //
+// 2026-11-14 (concept D2, Reid's pick): the pill strip is gone. rail.ts draws each area's members from this
+// store beside the Needs you table, and verdict.ts still asks pillStates() whether every area is ok.
+// The store, setTile and the "Updated" time are unchanged.
+//
 // The cards' folded header lines carry the same values on a phone (board.ts). The page header's
 // "Updated" time and its refresh button live here too: every section reports
 // when it last answered and registers its normal read, and the button runs
 // those reads (never the Databricks spend Refresh, which wakes a warehouse).
 
-import { onCardState, tileGone } from "./cardState";
-import { goToCard, goToGroup } from "./cardNav";
-import { el, replaceChildren } from "./dom";
+import { tileGone } from "./cardState";
 import {
   boltIcon,
   cloudIcon,
@@ -96,6 +98,11 @@ export interface Tile {
    * pills leave the tile out; the health stays idle.
    */
   notSetUp?: true;
+  /**
+   * The read behind this tile failed or only partly came back (2026-11-18). A not-set-up tile that carries it is
+   * not a clean answer: the wall keeps a card it has already drawn instead of dropping it on a bad read.
+   */
+  failed?: true;
 }
 
 /** The strip's order and each tile's label and icon. */
@@ -212,16 +219,13 @@ const listeners = new Set<() => void>();
 const refreshers = new Map<string, () => unknown>();
 /** The newest answer any section reported, for the page header's "Updated". */
 let updatedAt = 0;
-let strip: HTMLElement | null = null;
-/** Redraws the pills when a card is switched off or hidden (2026-11-07). */
-let stopCards: (() => void) | null = null;
 let updated: HTMLElement | null = null;
 
 /** A section's tile after a draw; *at* is when its answer arrived, if it did. */
 export function setTile(tile: Tile, at?: number): void {
   tiles.set(tile.id, tile);
   if (at && at > updatedAt) updatedAt = at;
-  draw();
+  drawUpdated();
   for (const listener of listeners) listener();
 }
 
@@ -250,19 +254,11 @@ export function refreshAll(): void {
   for (const read of refreshers.values()) void read();
 }
 
-/** Draw the strip into *node* and the newest answer's time into *time* from now on. */
-export function mountTiles(node: HTMLElement, time: HTMLElement): void {
-  strip = node;
+/** Keep the newest answer's time in *time* from now on (the page header's "Updated"). */
+export function mountUpdated(time: HTMLElement): void {
   updated = time;
-  stopCards?.();
-  stopCards = onCardState(() => draw());
-  pills.clear();
-  node.replaceChildren();
-  node.tabIndex = -1;
-  draw();
+  drawUpdated();
 }
-
-const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export interface PillState {
   domain: Domain;
@@ -283,162 +279,21 @@ export function pillStates(): PillState[] {
   });
 }
 
-/** The count at a pill's right edge: "1 to check", "2 problems", nothing when ok. */
-export function pillCount(state: PillState): string {
-  const n = (health: Health) => state.members.filter((tile) => tile.health === health).length;
-  if (state.health === "problem") return plural(n("problem"), "problem");
-  if (state.health === "attention") return `${n("attention")} to check`;
-  return "";
-}
-
-/** The compact number in the pill's header: how many members are not ok ("" when ok). */
-export function pillNumber(state: PillState): string {
-  if (state.health === "ok") return "";
-  const bad = state.members.filter((tile) => tile.health === state.health).length;
-  return String(bad);
-}
-
-/** What the pill's line says for a member: its brief, else summary, else value (never the note). */
+/** What a member reads as in the rail: its brief, else summary, else value (never the note). */
 export const memberText = (tile: Tile) => tile.brief ?? tile.summary ?? tile.value;
 
-/** "Release v1, up to date; Deploy hold: Off" for the pill's title and aria-label. */
-export function pillDescription(state: PillState): string {
-  const members = state.members.map((tile) =>
-    tile.note ? `${tileLabel(tile.id)}: ${tile.value}, ${tile.note}` : `${tileLabel(tile.id)}: ${tile.value}`,
-  );
-  const count = pillCount(state);
-  return `${state.domain.label}${count ? `, ${count}` : ""}: ${members.join("; ")}`;
-}
-
-/**
- * The pill's one line: problem members first, then attention (both bold), then the ok ones.
- * Idle members are skipped, and a part whose text repeats an earlier one is dropped.
- */
-function pillLine(state: PillState): Node[] {
-  const live = state.members.filter((tile) => tile.health !== "idle");
-  const order: Health[] = ["problem", "attention", "ok"];
-  const sorted = order.flatMap((health) => live.filter((tile) => tile.health === health));
-  const seen = new Set<string>();
-  const parts: Node[] = [];
-  for (const tile of sorted) {
-    const words = memberText(tile);
-    const key = words.trim().toLowerCase();
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    parts.push(tile.health === "ok" ? document.createTextNode(words) : el("b", {}, words));
-  }
-  return parts.flatMap((part, at) => (at ? [document.createTextNode(" \u00b7 "), part] : [part]));
-}
-
-function popoverRows(state: PillState): HTMLElement[] {
-  return state.members.map((tile) =>
-    el(
-      "div",
-      { class: `pill-pop-row tile-${tile.health}`, title: tile.title },
-      el("span", { class: "pill-dot" }),
-      el("span", { class: "pill-pop-name" }, tileLabel(tile.id)),
-      el("span", { class: "pill-pop-value" }, tile.note ? `${tile.value} \u00b7 ${tile.note}` : tile.value),
-    ),
-  );
-}
-
-/** One pill's nodes, built once per mount and patched by patchPill (2026-11-06, review). */
-interface PillNodes {
-  wrap: HTMLElement;
-  button: HTMLButtonElement;
-  count: HTMLElement;
-  line: HTMLElement;
-  pop: HTMLElement;
-  bar: HTMLElement;
-  fill: HTMLElement;
-}
-
-const pills = new Map<DomainId, PillNodes>();
-
-function buildPill(domain: Domain): PillNodes {
-  const count = el("span", { class: "pill-count" });
-  const line = el("span", { class: "pill-line" });
-  const fill = el("i", {});
-  const bar = el("div", { class: "tile-bar", "aria-hidden": "true" }, fill);
-  const pop = el("div", { class: "pill-pop", "aria-hidden": "true" });
-  const button = el(
-    "button",
-    { type: "button", class: "pill", "data-pill": domain.id },
-    el(
-      "span",
-      { class: "pill-h" },
-      el("span", { class: "pill-dot", "aria-hidden": "true" }),
-      domain.icon(),
-      el("span", { class: "pill-name" }, domain.label),
-      count,
-    ),
-    line,
-    bar,
-  );
-  button.addEventListener("click", () => {
-    if (goToGroup(domain.id)) return;
-    for (const card of domain.cards) if (goToCard(card)) return;
-  });
-  return { wrap: el("div", { class: "pill-wrap" }, button, pop), button, count, line, pop, bar, fill };
-}
-
-/** Update a pill's text, class and popover in place, so focus and an open popover survive a draw. */
-function patchPill(nodes: PillNodes, state: PillState): void {
-  const number = pillNumber(state);
-  const description = pillDescription(state);
-  const hold = state.members.find((tile) => tile.id === "hold" && tile.bar != null);
-  nodes.button.className = `pill pill-${state.health}`;
-  if (nodes.button.getAttribute("aria-label") !== description) nodes.button.setAttribute("aria-label", description);
-  nodes.count.textContent = number;
-  nodes.count.hidden = !number;
-  replaceChildren(nodes.line, pillLine(state));
-  replaceChildren(nodes.pop, popoverRows(state));
-  nodes.bar.hidden = !hold;
-  nodes.fill.style.width = hold ? `${hold.bar}%` : "0%";
-}
-
-function draw(): void {
-  if (strip) {
-    const states = pillStates();
-    const wanted = states.map((state) => {
-      let nodes = pills.get(state.domain.id);
-      if (!nodes) {
-        nodes = buildPill(state.domain);
-        pills.set(state.domain.id, nodes);
-      }
-      patchPill(nodes, state);
-      return nodes.wrap;
-    });
-    const drawn = new Set(states.map((state) => state.domain.id));
-    for (const [id, nodes] of pills) {
-      if (drawn.has(id)) continue;
-      // A focused pill that goes away hands focus to the strip, not to the body.
-      const hadFocus = nodes.wrap.contains(document.activeElement);
-      nodes.wrap.remove();
-      if (hadFocus) strip.focus({ preventScroll: true });
-    }
-    // Only move a node that is out of place, so a focused pill is never torn out of the page.
-    wanted.forEach((wrap, at) => {
-      if (strip!.children[at] !== wrap) strip!.insertBefore(wrap, strip!.children[at] ?? null);
-    });
-    while (strip.children.length > wanted.length) strip.lastElementChild?.remove();
-  }
-  if (updated) {
-    updated.textContent = updatedAt
-      ? `Updated ${new Date(updatedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
-      : "";
-  }
+function drawUpdated(): void {
+  if (!updated) return;
+  updated.textContent = updatedAt
+    ? `Updated ${new Date(updatedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}`
+    : "";
 }
 
 /** Forget every tile, reader and listener (deactivate, and tests). */
 export function resetTiles(): void {
-  stopCards?.();
-  stopCards = null;
   tiles.clear();
   listeners.clear();
   refreshers.clear();
   updatedAt = 0;
-  strip = null;
   updated = null;
-  pills.clear();
 }

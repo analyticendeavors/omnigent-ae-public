@@ -3,7 +3,13 @@
 // Every call is mocked: the route is GET /v1/ae/presets?days=N.
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PresetRow, PresetsAnswer, PresetSuggestion } from "../src/api";
+import type {
+  ModelWatchAnswer,
+  ModelWatchModel,
+  PresetRow,
+  PresetsAnswer,
+  PresetSuggestion,
+} from "../src/api";
 import {
   activatePresets,
   loadDismissed,
@@ -39,6 +45,14 @@ import {
   updatedText,
   WARMING_POLL_MS,
 } from "../src/presets";
+import {
+  MODEL_WATCH_HELP,
+  MODEL_WATCH_STALE,
+  modelWatchLine,
+  reviewText,
+  servedModels,
+  unservedModels,
+} from "../src/modelWatch";
 import { resetSpend } from "../src/spend";
 import { getTile, resetTiles } from "../src/tiles";
 
@@ -140,6 +154,7 @@ const failed = (status: number, code: string, message: string): Reply => ({
 });
 
 let newerReply: Reply = failed(404, "x", "no newer models here");
+let watchReply: Reply = failed(404, "x", "no model watch here");
 
 function stubContext(replies: Reply[]) {
   const request = vi.fn(
@@ -158,7 +173,9 @@ function stubContext(replies: Reply[]) {
       request: async (args: { method: string; path: string }) =>
         args.path === "/v1/ae/roles/newer-models"
           ? newerReply
-          : args.path.startsWith("/v1/ae/preset-suggestions")
+          : args.path === "/v1/ae/model-watch"
+            ? watchReply
+            : args.path.startsWith("/v1/ae/preset-suggestions")
             ? failed(404, "x", "no suggestions here")
             : request(args),
     },
@@ -191,6 +208,7 @@ beforeEach(() => {
   window.localStorage.clear();
   resetSpend();
   newerReply = failed(404, "x", "no newer models here");
+  watchReply = failed(404, "x", "no model watch here");
   resetTiles();
 });
 
@@ -621,6 +639,7 @@ function suggestionContext(
       if (method === "GET" && path === "/v1/ae/preset-suggestions?all=false") {
         return ok({ suggestions: own, reviews: [review] });
       }
+      if (method === "GET" && path === "/v1/ae/model-watch") return watchReply;
       if (method === "POST") {
         posted.push(path);
         return actions[path] ?? ok({ ok: true, suggestion: suggestion() });
@@ -1232,5 +1251,126 @@ describe("the insight and suggestion folds", () => {
     expect(suggestionsLine(at, 2, NOW)).toBe("Oct 24 review: 2 suggestions, today");
     expect(suggestionsLine("2026-10-23T07:30:00Z", 1, NOW)).toBe("Oct 23 review: 1 suggestion, 1 day old");
     expect(suggestionsLine(null, 1, NOW)).toBe("Latest review: 1 suggestion");
+  });
+});
+
+// ── the New models fold (2026-11-10) ────────────────────────────────────────
+
+function watched(overrides: Partial<ModelWatchModel> = {}): ModelWatchModel {
+  return {
+    id: "claude-fable-5-2",
+    label: "Fable 5.2",
+    family: "fable",
+    first_seen: "2026-11-10T12:00:00Z",
+    probe: "served",
+    last_probed: "2026-11-10T12:00:00Z",
+    detail: "answered ok",
+    notes: { url: "https://platform.claude.com/docs/en/models/overview.md", excerpt: "x", status: "ok" },
+    review: { state: "done", at: "2026-11-10T12:05:00Z", review_id: "rev1", count: 2, why: null },
+    ...overrides,
+  };
+}
+
+function watchAnswer(models: ModelWatchModel[], extra: Partial<ModelWatchAnswer> = {}): ModelWatchAnswer {
+  return {
+    models,
+    served_ids: models.filter((m) => m.probe === "served").map((m) => m.id),
+    last_report: { at: "2026-11-10T12:00:00Z", host: "box", claude_code_version: "2.1.322", scanned_at: "2026-11-10T12:00:00Z" },
+    report_stale: false,
+    ...extra,
+  };
+}
+
+describe("the New models fold", () => {
+  it("is left out until the watch answers", async () => {
+    const { context } = stubContext([ok(answer())]);
+    expect(head(await mount(context), "models")).toBeNull();
+  });
+
+  it("lists the served model with its date, review, notes link and the helper text", async () => {
+    watchReply = ok(watchAnswer([watched(), watched({ id: "claude-mythos-5-2", label: "Mythos 5.2", probe: "not_served", notes: null, review: null })]));
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const button = head(node, "models")!;
+    expect(button.textContent).toBe("New models: 1 on your plan");
+    expect(button.getAttribute("aria-expanded")).toBe("false");
+    const body = bodyOf(button);
+    expect(body.querySelector(".modelwatch-help")?.textContent).toBe(MODEL_WATCH_HELP);
+    // The head is a button, so the help is the body's first line, not a nested hint button.
+    expect(button.querySelector("button")).toBeNull();
+    const rowText = body.querySelector(".modelwatch-row")?.textContent ?? "";
+    expect(rowText).toContain("Fable 5.2 claude-fable-5-2");
+    expect(rowText).toContain("First seen Nov 10");
+    expect(rowText).toContain("Review done, 2 suggestions");
+    const link = body.querySelector<HTMLAnchorElement>(".modelwatch-row a")!;
+    expect(link.href).toBe("https://platform.claude.com/docs/en/models/overview.md");
+    expect(link.rel).toBe("noopener noreferrer");
+    expect(body.querySelector(".modelwatch-unserved")?.textContent).toBe(
+      "Seen in Claude Code, not served on your plan yet: Mythos 5.2.",
+    );
+    expect(body.querySelector(".presets-error")).toBeNull();
+  });
+
+  it("warns by name when the timer has gone quiet", async () => {
+    watchReply = ok(watchAnswer([], { report_stale: true }));
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const button = head(node, "models")!;
+    expect(button.textContent).toContain("New models: none yet");
+    expect(button.textContent).toContain("timer silent");
+    expect(bodyOf(button).querySelector(".presets-error")?.textContent).toBe(MODEL_WATCH_STALE);
+    expect(MODEL_WATCH_STALE).toContain("ae-omnigent-model-watch.timer");
+  });
+
+  it("opens the Suggestions fold from See N suggestions", async () => {
+    watchReply = ok(watchAnswer([watched()]));
+    const { context } = suggestionContext([suggestion()]);
+    const node = await mount(context);
+    await flush();
+    expect(head(node, "suggestions")!.getAttribute("aria-expanded")).toBe("false");
+    const see = bodyOf(head(node, "models")!).querySelector<HTMLButtonElement>(".modelwatch-row button")!;
+    expect(see.textContent).toBe("See 2 suggestions");
+    see.click();
+    expect(head(node, "suggestions")!.getAttribute("aria-expanded")).toBe("true");
+  });
+
+  it("says why a review did not run and that notes could not be read", async () => {
+    watchReply = ok(
+      watchAnswer([
+        watched({
+          review: { state: "not_run", at: null, review_id: null, count: null, why: "Preset insights are off" },
+          notes: { url: "https://platform.claude.com/docs/en/models/overview.md", excerpt: null, status: "fetch_failed" },
+        }),
+      ]),
+    );
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    const text = bodyOf(head(node, "models")!).querySelector(".modelwatch-row")?.textContent ?? "";
+    expect(text).toContain("Review did not run: Preset insights are off");
+    expect(text).toContain("(could not be read)");
+    expect(bodyOf(head(node, "models")!).querySelector(".modelwatch-row button")).toBeNull();
+  });
+
+  it("never links a release-notes URL that is not https", async () => {
+    watchReply = ok(watchAnswer([watched({ notes: { url: "javascript:alert(1)", excerpt: null, status: "ok" } })]));
+    const { context } = stubContext([ok(answer())]);
+    const node = await mount(context);
+    expect(bodyOf(head(node, "models")!).querySelector(".modelwatch-row a")).toBeNull();
+  });
+
+  it("is not drawn for a non-admin viewer", async () => {
+    watchReply = ok(watchAnswer([watched()]));
+    const { context } = stubContext([failed(403, "admin_only", "Only an admin")]);
+    expect(head(await mount(context), "models")).toBeNull();
+  });
+
+  it("reads the lines and lists without the DOM", () => {
+    const data = watchAnswer([watched(), watched({ id: "claude-opus-5-6", label: "Opus 5.6", first_seen: "2026-11-11T00:00:00Z" }), watched({ id: "claude-mythos-5-2", probe: "error" })]);
+    expect(modelWatchLine(data)).toBe("New models: 2 on your plan");
+    expect(modelWatchLine(watchAnswer([watched()]))).toBe("New models: 1 on your plan");
+    expect(servedModels(data).map((m) => m.id)).toEqual(["claude-opus-5-6", "claude-fable-5-2"]);
+    expect(unservedModels(data).map((m) => m.id)).toEqual(["claude-mythos-5-2"]);
+    expect(reviewText(watched({ review: { state: "started", at: null, review_id: null, count: null, why: null } }))).toBe("Review running");
+    expect(reviewText(watched({ review: null }))).toBe("No review yet");
   });
 });

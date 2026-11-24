@@ -74,8 +74,37 @@ trap 'rm -rf "$TMP"' EXIT
 
 # true, false or absent; any other docker failure (daemon down, no permission) is an
 # error, not a skipped sync.
+# Root hardening: with the root-owned gate installed, the state read is `status` and the sync is
+# `steve sync-config`, for the steve host only (the gate has no other host's container, and its
+# in-container driver comes from the owner's manifest, which must match DRIVER below). The else
+# branches are the old direct calls and are removed after the cutover.
+AE_GATE="${AE_GATE:-/usr/local/sbin/ae-gate}"
+if [ -x "$AE_GATE" ] && [ "$HOST_USER" != steve ]; then
+  die "the gate syncs the steve host only; no verb for $HOST_USER"
+fi
+# The gate's sync-config always targets omnigent-host-steve, so a test override would check
+# one container's state and sync another.
+if [ -x "$AE_GATE" ] && [ -n "${AE_SYNC_CONTAINER:-}" ]; then
+  die "AE_SYNC_CONTAINER is for tests without the gate; the gate always syncs omnigent-host-steve"
+fi
+
 container_state() {
   local out rc=0
+  if [ -x "$AE_GATE" ]; then
+    if ! out="$(sudo -n "$AE_GATE" status "$CONTAINER" 2>&1)"; then
+      # A container that was never created is the one-line skip, as with docker inspect; the
+      # gate's `ps --all` tells it apart from a real failure.
+      local listed
+      listed="$(sudo -n "$AE_GATE" ps --all 2>&1)" || die "ae-gate status and ps both failed: $out"
+      if printf '%s\n' "$listed" | cut -f1 | grep -qxF -- "$CONTAINER"; then
+        die "ae-gate status $CONTAINER failed: $out"
+      fi
+      echo absent
+      return 0
+    fi
+    case "$out" in *'"status": "running"'*) echo true ;; *) echo false ;; esac
+    return 0
+  fi
   out="$(docker inspect -f '{{.State.Running}}' "$CONTAINER" 2>&1)" || rc=$?
   if [ "$rc" -eq 0 ]; then
     echo "$out"
@@ -183,7 +212,12 @@ DRIVER_EOF
 
 rc=0
 tar -c -C "$TMP/payload" -f "$TMP/payload.tar" .
-docker exec -i -u agent "$CONTAINER" bash -c "$DRIVER" <"$TMP/payload.tar" || rc=$?
+if [ -x "$AE_GATE" ]; then
+  # shellcheck disable=SC2024  # reid reads his own tar on purpose; only the gate runs as root
+  sudo -n "$AE_GATE" steve sync-config <"$TMP/payload.tar" || rc=$?
+else
+  docker exec -i -u agent "$CONTAINER" bash -c "$DRIVER" <"$TMP/payload.tar" || rc=$?
+fi
 case "$rc" in
   0) ;;
   3) die "safety scan failed inside $CONTAINER; the extracted copy was removed, nothing was placed. The offending paths are listed above" ;;

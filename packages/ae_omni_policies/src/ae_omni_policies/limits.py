@@ -72,6 +72,15 @@ the default login (or the backup account it names), each ``sessions`` entry
 fills its own account, and Codex fills its one login. The relay also posts the
 host's signed-in Claude logins (``known_accounts``, labels only), so
 ``GET /v1/ae/limits/accounts`` lists an account before its first reading.
+
+Idle accounts (2026-11-16): an account other than the default login used to be
+read only when a chat on it replied, so an idle one showed a day-old reading.
+The relay now also reads each account that has a *usage login* on the host (a
+full ``claude auth login`` of that account in its own config directory, which
+only the relay touches) through the same ``get_usage`` request, and posts the
+result as ``account_probes`` on the Claude snapshot. Each one becomes that
+account's reading; nothing else about the answer changes
+(``docs/PLAN-LIMITS.md``, "Idle accounts").
 """
 
 from __future__ import annotations
@@ -110,6 +119,9 @@ SHARED_PREFIX = "shared:"
 # What upstream's account picker calls the CLI's own login (claude_accounts.account_descriptors).
 DEFAULT_LABEL = "Default CLI account"
 CODEX_LABEL = "Codex"
+# A Claude post that carries only usage-login readings (no status line or usage reply
+# was found): its account readings are kept, the snapshot itself never is.
+PROBES_SOURCE = "usage-login"
 
 # Claude Code's statusLine keys, in the order /usage lists them, with the label
 # the panel shows and the window's length (the spend limit has no fixed one).
@@ -203,6 +215,26 @@ class KnownAccount(BaseModel):
     label: str = Field(min_length=1, max_length=120)
 
 
+class AccountProbe(BaseModel):
+    """One account's windows, read through its usage login on the host (2026-11-16).
+
+    ``account`` names the account (never the default login, which the relay
+    already reads every tick); ``observed_at`` is when the usage endpoint
+    answered. Plan and credits are left out, as for every account but the
+    default login.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    # The host's and the server's account alphabet (claude_accounts._valid_name, with
+    # ``shared:`` before a shared account), checked here too (2026-11-16 security review).
+    account: str = Field(
+        min_length=1, max_length=120, pattern=r"^(shared:)?[A-Za-z0-9][A-Za-z0-9 _-]{0,63}$"
+    )
+    observed_at: datetime
+    windows: list[LimitWindow] = Field(default_factory=list, max_length=16)
+
+
 class LimitSnapshot(BaseModel):
     """The latest reading for one harness, as the host relay posts it.
 
@@ -216,6 +248,9 @@ class LimitSnapshot(BaseModel):
     ``sessions`` carries each session's own windows and account.
     ``known_accounts`` (Claude only, 2026-10-21) lists the host's signed-in
     logins, so the Accounts card can show one that has no reading yet.
+    ``account_probes`` (Claude only, 2026-11-16) carries the readings the
+    relay took through usage logins; only the store's per-account readings use
+    them, and no view answers them.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -233,6 +268,7 @@ class LimitSnapshot(BaseModel):
     account_label: str | None = Field(default=None, max_length=120)
     sessions: list[SessionLimits] = Field(default_factory=list, max_length=MAX_CONTEXTS)
     known_accounts: list[KnownAccount] = Field(default_factory=list, max_length=MAX_ACCOUNTS)
+    account_probes: list[AccountProbe] = Field(default_factory=list, max_length=MAX_ACCOUNTS)
 
 
 class AccountUsage(BaseModel):
@@ -597,15 +633,19 @@ def _resolve_account(
 ) -> tuple[bool, str | None]:
     """Which account *session_id* runs on, if it can be told: (known, account).
 
-    The runner's live label (*live*) wins when it names a login the host lists
-    (or the default); then the relay's entry for the session, then the label or
+    The runner's live label (*live*) wins when it names a login the host lists,
+    the default or a ``shared:`` account; then the relay's entry for the session, then the label or
     hint the caller passed (``UNSET`` when it passed none). A hint for an
     account the host does not list as signed in is no answer; a label
     (*trusted*) was checked when the session was forked and stands as it is.
     With no *session_id* (the card viewing another login) only *account* counts.
     """
     signed_in = {k.account for k in snapshot.known_accounts}
-    if live is not UNSET and (live is None or live in signed_in):
+    # A ``shared:`` login is the server's own account, not a host login: the
+    # host lists one only while it is the pick for new chats, so a chat switched
+    # to another shared login kept the old login's numbers until the relay's
+    # next tick (2026-11-16). Only the bound runner or the server writes the label.
+    if live is not UNSET and (live is None or live in signed_in or live.startswith(SHARED_PREFIX)):
         return True, live
     own = _own_entry(snapshot, session_id)
     if own is not None:
@@ -764,6 +804,8 @@ def member_view(view: dict[str, Any], *, session_id: str | None, relayed: bool) 
         account = claude.get("account")
         shared = isinstance(account, str) and account.startswith(SHARED_PREFIX)
         claude = dict(claude)
+        # Never in a view (LimitStore.view drops it); popped again so no caller can leak it.
+        claude.pop("account_probes", None)
         if not shared and not (session_id is not None and relayed):
             claude.update(
                 windows=[],
@@ -879,6 +921,16 @@ def _key(harness: str, account: str | None) -> AccountKey:
     return (harness, account or "")
 
 
+def _probe_label(account: str) -> str:
+    """A label for a usage-login reading; :func:`merge_accounts` may put a better one over it.
+
+    A shared account reads as upstream's ``shared_label`` does ("<name> (shared)").
+    """
+    if account.startswith(SHARED_PREFIX):
+        return f"{account[len(SHARED_PREFIX) :]} (shared)"[:120]
+    return account
+
+
 def account_readings(snapshot: LimitSnapshot) -> list[AccountUsage]:
     """What one snapshot says about each account, host reading first.
 
@@ -886,7 +938,9 @@ def account_readings(snapshot: LimitSnapshot) -> list[AccountUsage]:
     names), with the plan and credits only for the default login; each
     session's own windows are its account's. Codex: the one login. A reading
     without windows says nothing about an account and is left out, so a
-    status line from before a session's first reply cannot blank one.
+    status line from before a session's first reply cannot blank one. Each
+    usage-login reading (``account_probes``) is its account's, with no plan or
+    credits.
     """
     if snapshot.harness == "codex":
         if not snapshot.windows:
@@ -924,6 +978,18 @@ def account_readings(snapshot: LimitSnapshot) -> list[AccountUsage]:
                 label=session.account_label or session.account or DEFAULT_LABEL,
                 windows=list(session.windows),
                 observed_at=session.observed_at,
+            )
+        )
+    for probe in snapshot.account_probes:
+        if not probe.windows:
+            continue
+        out.append(
+            AccountUsage(
+                harness="claude",
+                account=probe.account,
+                label=_probe_label(probe.account),
+                windows=list(probe.windows),
+                observed_at=probe.observed_at,
             )
         )
     return out
@@ -1035,7 +1101,11 @@ def merge_accounts(
 
 
 def _newest(snapshot: LimitSnapshot) -> datetime:
-    """The newest reading *snapshot* carries: its own, or any session's."""
+    """The newest reading *snapshot* carries: its own, or any session's.
+
+    Never a usage-login reading (``account_probes``): those are other accounts'
+    and must not decide which host snapshot is held.
+    """
     times = [snapshot.observed_at]
     times.extend(c.observed_at for c in snapshot.contexts)
     times.extend(s.observed_at for s in snapshot.sessions)
@@ -1134,7 +1204,9 @@ class LimitStore:
             return
         body: dict[str, Any] = {
             harness: {
-                "snapshot": entry["snapshot"].model_dump(mode="json"),
+                # The probes already live in the account rows; left out, the file still
+                # loads in a server from before 2026-11-16 (a rollback keeps the panel).
+                "snapshot": entry["snapshot"].model_dump(mode="json", exclude={"account_probes"}),
                 "received_at": entry["received_at"].isoformat(),
             }
             for harness, entry in self._entries.items()
@@ -1154,10 +1226,18 @@ class LimitStore:
                     os.unlink(tmp)
 
     def put(self, snapshot: LimitSnapshot, *, now: datetime | None = None) -> bool:
-        """Keep *snapshot* unless a newer one is held; returns whether it was kept."""
+        """Keep *snapshot* unless a newer one is held; returns whether it was kept.
+
+        A probes-only post (:data:`PROBES_SOURCE`) updates the account readings
+        and is never held: it has no host reading to show.
+        """
         with self._lock:
             self._load()
             noted = self._note(snapshot)
+            if snapshot.source == PROBES_SOURCE:
+                if noted:
+                    self._save()
+                return False
             held = self._entries.get(snapshot.harness)
             if held is not None and _newest(held["snapshot"]) > _newest(snapshot):
                 if noted:
@@ -1210,7 +1290,9 @@ class LimitStore:
                 # label names the login the answer describes (2026-10-21): the
                 # default login's reading carries none of its own.
                 label = snapshot.account_label or _known_label(snapshot)
-                body = snapshot.model_dump(mode="json", exclude={"known_accounts"})
+                body = snapshot.model_dump(
+                    mode="json", exclude={"known_accounts", "account_probes"}
+                )
                 body["account_label"] = label
                 body["received_at"] = entry["received_at"].isoformat()
                 harnesses[harness] = body
@@ -1291,9 +1373,11 @@ __all__ = [
     "NOT_SHARED_NOTE",
     "NO_ACCOUNT_READING_NOTE",
     "NO_WINDOWS_NOTE",
+    "PROBES_SOURCE",
     "PROFILE_HINT",
     "STATE_FILE_ENV",
     "UNSET",
+    "AccountProbe",
     "AccountUsage",
     "Credits",
     "Harness",

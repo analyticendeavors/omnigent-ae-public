@@ -1,5 +1,5 @@
 // The Cards wiring (2026-11-07): the gear, off and hidden cards leaving the board, the footer line,
-// the status pill, Needs you, and the Cards button on the page.
+// the tiles, Needs you, and the Services tab on the page.
 import type { ExtensionContext } from "@omnigent/extension-sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { buildBlocks } from "../src/attention";
@@ -7,11 +7,10 @@ import { attentionView } from "../src/attentionView";
 import { resetAttention, setAttention } from "../src/attentionStore";
 import { verdictParts } from "../src/verdict";
 import { openCardsPanel } from "../src/cardsPanel";
-import { mountTiles } from "../src/tiles";
 import { adminCard, arrange, type CardId, CARD_SETTINGS_EVENT, mountBoard } from "../src/board";
-import { resetBoardLayoutState } from "../src/boardLayout";
 import { type CardRow, cardOff, resetCardState, setCards, setHidden } from "../src/cardState";
 import { activateFabric, deactivateFabric } from "../src/fabric";
+import { mountRail } from "../src/rail";
 import { pillStates, resetTiles, setTile } from "../src/tiles";
 
 vi.mock("@omnigent/extension-sdk", () => ({ defineExtension: vi.fn() }));
@@ -47,7 +46,6 @@ const shown = (node: HTMLElement) => [...node.querySelectorAll<HTMLElement>(".ad
 beforeEach(() => {
   document.body.replaceChildren();
   resetCardState();
-  resetBoardLayoutState();
   resetTiles();
 });
 afterEach(() => {
@@ -114,7 +112,7 @@ describe("off and hidden cards", () => {
     mounted.stop();
   });
 
-  it("take their tiles out of the status pill", () => {
+  it("take their tiles out of the area's health", () => {
     setTile({ id: "vault", value: "2", note: "", health: "problem" });
     expect(pillStates().some((p) => p.members.some((t) => t.id === "vault"))).toBe(true);
     setCards(answer(ids.map((id) => row(id, { on: id !== "vault" }))));
@@ -125,12 +123,12 @@ describe("off and hidden cards", () => {
 describe("Needs you", () => {
   const item = (source: string, id: string) =>
     ({ id, source, kind: "x", tone: "urgent", label: id, working: null }) as never;
-  it("drops the lines of a source whose card this viewer hid", () => {
+  it("keeps the lines of a source whose card this viewer hid (2026-11-14: hiding hides only the card)", () => {
     setCards(answer([row("git")]));
     const items = [item("git", "git:1"), item("box", "box:1")];
     expect(buildBlocks(items).map((b) => b.source)).toContain("git");
     setHidden(["git"]);
-    expect(buildBlocks(items).map((b) => b.source)).not.toContain("git");
+    expect(buildBlocks(items).map((b) => b.source)).toContain("git");
   });
 });
 
@@ -148,7 +146,7 @@ describe("hiding a card and the counts", () => {
       sources: ["git"],
     }) as never;
 
-  it("recounts without the hidden source, so the verdict and the empty test agree with the list", () => {
+  it("counts a hidden card's items in the verdict, so a hidden card never hides an urgent item", () => {
     setCards(answer([row("git")]));
     expect(attentionView(data()).urgent).toBe(2);
     resetAttention();
@@ -156,10 +154,9 @@ describe("hiding a card and the counts", () => {
     expect(verdictParts()!.urgent).toBe(2);
     setHidden(["git"]);
     const view = attentionView(data());
-    expect(view.empty).toBe(true);
-    expect([view.urgent, view.review]).toEqual([0, 0]);
-    expect(verdictParts()!.rest).toContain("Nothing needs you");
-    expect(verdictParts()!.urgent).toBe(0);
+    expect(view.empty).toBe(false);
+    expect([view.urgent, view.review]).toEqual([2, 0]);
+    expect(verdictParts()!.urgent).toBe(2);
   });
 });
 
@@ -173,7 +170,7 @@ describe("answers that arrive out of order", () => {
   });
 });
 
-describe("the footer and pills in the DOM", () => {
+describe("the footer and the rail in the DOM", () => {
   it("mentions no Social card on a server that never named it", () => {
     setCards(answer(ids.filter((id) => id !== "social").map((id) => row(id))));
     const { node } = board();
@@ -181,27 +178,26 @@ describe("the footer and pills in the DOM", () => {
     expect(node.querySelector<HTMLElement>(".admin-notset")!.hidden).toBe(true);
   });
 
-  it("redraws a mounted pill when the only live card of its group is hidden", () => {
-    const strip = document.createElement("div");
-    const time = document.createElement("span");
-    document.body.append(strip, time);
-    mountTiles(strip, time);
+  it("redraws a mounted rail when the only live card of its area is hidden", () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    setCards(answer([row("vault")]));
+    const stop = mountRail(host, { openTab: () => undefined, tabs: () => true });
     setTile({ id: "vault", value: "2", note: "", health: "problem" });
-    expect(strip.children.length).toBe(1);
-    setCards(answer(ids.map((id) => row(id))));
-    expect(strip.children.length).toBe(1);
+    expect(host.querySelectorAll(".rail-block").length).toBe(1);
     setHidden(["vault"]);
-    expect(strip.children.length).toBe(0);
+    expect(host.querySelectorAll(".rail-block").length).toBe(0);
     setHidden([]);
-    expect(strip.children.length).toBe(1);
+    expect(host.querySelectorAll(".rail-block").length).toBe(1);
+    stop();
   });
 });
 
 describe("focus after the opener goes away", () => {
-  it("falls back to the header Cards button", () => {
+  it("falls back to the Services tab", () => {
     setCards(answer(ids.map((id) => row(id))));
     const cardsBtn = document.createElement("button");
-    cardsBtn.className = "admin-cards-btn";
+    cardsBtn.id = "as-tab-services";
     const gear = document.createElement("button");
     document.body.append(cardsBtn, gear);
     const ctx = {
@@ -241,19 +237,21 @@ describe("the page", () => {
     await activateFabric(ctx);
     await flush();
     expect(request.mock.calls.some(([c]) => c.path === "/v1/ae/cards")).toBe(true);
-    const cardsOnBoard = shown(document.querySelector<HTMLElement>(".admin-board")!);
+    const cardsOnBoard = [...document.querySelectorAll<HTMLElement>(".admin-board")].flatMap(shown);
     expect(cardsOnBoard).not.toContain("social");
     expect(cardsOnBoard).not.toContain("presets");
-    const button = document.querySelector<HTMLButtonElement>(".admin-cards-btn")!;
-    expect(button.textContent).toContain("Cards");
-    expect(button.title.length).toBeGreaterThan(10);
-    expect(button.title.length).toBeLessThanOrEqual(200);
-    button.click();
-    expect(document.querySelector(".ae-cards-drawer")).not.toBeNull();
-    document.querySelector<HTMLButtonElement>('[aria-label="Close the Cards panel"]')!.click();
+    // Services is a tab, not a drawer; a card's gear opens it at that card.
+    const services = document.querySelector<HTMLButtonElement>("#as-tab-services")!;
+    expect(services.textContent).toContain("Services");
+    services.click();
+    await flush();
+    expect(document.querySelector(".ae-cards-page")).not.toBeNull();
+    expect(document.querySelector(".ae-cards-scrim")).toBeNull();
+    document.querySelector<HTMLButtonElement>("#as-tab-overview")!.click();
     document.querySelector<HTMLButtonElement>('[data-card="vault"] .admin-gear')!.click();
     await flush();
-    const open = document.querySelector<HTMLElement>('.ae-cards-drawer [data-card="vault"] .ae-card-setup')!;
+    expect(document.querySelector<HTMLElement>("#as-panel-services")!.hidden).toBe(false);
+    const open = document.querySelector<HTMLElement>('.ae-cards-page [data-card="vault"] .ae-card-setup')!;
     expect(open.hidden).toBe(false);
   });
 
@@ -281,6 +279,6 @@ describe("the page", () => {
     await activateFabric(ctx);
     await flush();
     expect(request.mock.calls.some(([c]) => c.path === "/v1/ae/cards")).toBe(false);
-    expect(document.querySelector(".admin-cards-btn")).toBeNull();
+    expect(document.querySelector("#as-tab-services")).toBeNull();
   });
 });

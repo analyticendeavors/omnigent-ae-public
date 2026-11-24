@@ -45,11 +45,13 @@ import httpx
 
 from ae_omni_policies import USER_AGENT, key_health
 from ae_omni_policies.notes import (
+    ACCEPTED_ESTIMATES,
     DEFAULT_TZ,
     PARKING_LOT_NAME,
     PARKING_SURFACE,
     QUADRANT_AXES,
     RESURFACE_DAYS,
+    TASK_QUADRANT_AXES,
     TIME_ONLY,
     NoteFields,
     build_notes,
@@ -960,10 +962,16 @@ class TaskStoreClient:
             return refuse(f'due_date "{fields.due_date}" is not a real YYYY-MM-DD date.')
         if clock and not TIME_ONLY.match(clock):
             return refuse(f'due_time "{fields.due_time}" is not HH:MM on a 24-hour clock.')
-        if fields.quadrant is not None and fields.quadrant not in QUADRANT_AXES:
-            return refuse(
-                f'quadrant "{fields.quadrant}" is not one of {", ".join(QUADRANT_AXES)}.'
-            )
+        valid = ", ".join(TASK_QUADRANT_AXES)
+        if not fields.quadrant:
+            return refuse(f"quadrant is required: one of {valid}.")
+        if fields.quadrant not in TASK_QUADRANT_AXES:
+            return refuse(f'quadrant "{fields.quadrant}" is not one of {valid}.')
+        if not (fields.est or "").strip():
+            return refuse(f"est is required: {ACCEPTED_ESTIMATES}.")
+        estimate = task_estimate(fields.est)
+        if estimate is None:
+            return refuse(f'est "{fields.est}" maps to no estimate. Use {ACCEPTED_ESTIMATES}.')
 
         bucket: dict[str, Any] | None = None
         wanted = (fields.list_name or "").strip()
@@ -1018,11 +1026,8 @@ class TaskStoreClient:
             "reminder_at": reminder_at,
             "floating": 1,
         }
-        if fields.quadrant:
-            body.update(QUADRANT_AXES[fields.quadrant])
-        estimate = task_estimate(fields.est)
-        if estimate:
-            body["estimate"] = estimate
+        body.update(TASK_QUADRANT_AXES[fields.quadrant])
+        body["estimate"] = estimate
 
         sent_at = datetime.now(UTC)
         created = await self.create_task(body)

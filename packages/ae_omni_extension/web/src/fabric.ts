@@ -120,15 +120,13 @@ import {
 } from "./api";
 import { accountsSection, activateAccounts, deactivateAccounts } from "./accounts";
 import { activateAzure, azureSection, deactivateAzure } from "./azure";
-import { activateAttention, attentionSection, deactivateAttention } from "./attention";
+import { createShell, type Shell } from "./adminShell";
+import { activateAttention, deactivateAttention } from "./attention";
 import { resetAttention } from "./attentionStore";
-import { adminCard, CARD_SETTINGS_EVENT, cardNotSetUp, type CardId, mountBoard } from "./board";
+import { adminCard } from "./board";
 import { loadCardPrefs } from "./cardPrefs";
 import { getCards, onCardState, resetCardState, setCards } from "./cardState";
 import { fetchCards } from "./cardsApi";
-import { openCardsPanel } from "./cardsPanel";
-import { layoutResetButton } from "./boardDrag";
-import { loadBoardLayout } from "./boardLayout";
 import { holdMenus, rowMenu } from "./cards";
 import {
   activateDatabricks,
@@ -148,13 +146,11 @@ import {
   type FabricTone,
   calendarEventIcon,
   gitBranchIcon,
-  layoutGridIcon,
   chartBarIcon,
   linksIcon,
   lockIcon,
   scaleIcon,
   powerIcon,
-  refreshIcon,
   sharedIcon,
   shieldCheckIcon,
 } from "./icons";
@@ -170,7 +166,6 @@ import { activateVault, deactivateVault, loadVaultView, vaultSection } from "./v
 import { loadSectionState } from "./sections";
 import {
   type Health,
-  mountTiles,
   refreshAll,
   registerRefresh,
   resetTiles,
@@ -179,7 +174,6 @@ import {
   type Tile,
   worst,
 } from "./tiles";
-import { mountVerdict } from "./verdict";
 
 export const POLL_BUSY_MS = 15_000;
 export const POLL_IDLE_MS = 60_000;
@@ -1250,7 +1244,6 @@ async function activateBoxOnly(
   resetTiles();
   resetAttention();
   const monitor = boxHealthSection();
-  const attention = attentionSection();
   const box = adminCard(
     "box",
     "Box health",
@@ -1258,42 +1251,17 @@ async function activateBoxOnly(
     [monitor.querySelector(".bh-refreshed")],
     monitor,
   );
-  const updated = el("p", { class: "meta admin-updated" });
-  const verdict = el("p", { class: "admin-verdict", "aria-live": "polite" });
-  const tiles = el("div", { class: "admin-tiles" });
-  // One card: nothing to drag, so the grip and Reset layout stay out (style.css).
-  const board = el("div", { class: "admin-board", "data-single": "true" });
-  const again = button("", { title: "Read everything again", onClick: () => refreshAll() });
-  again.classList.add("btn-icon", "admin-refresh");
-  again.setAttribute("aria-label", "Read everything again");
-  again.replaceChildren(refreshIcon());
-  const main = el(
-    "main",
-    { class: "fabric admin" },
-    el(
-      "header",
-      { class: "fabric-top" },
-      el("h1", { class: "fabric-h" }, "Admin Center"),
-      verdict,
-      updated,
-      again,
-    ),
-    tiles,
-    attention,
-    board,
-  );
-  root.replaceChildren(main);
-  mountTiles(tiles, updated);
-  mountVerdict(verdict, { fine: false });
-  const layout = mountBoard(main, board, { box });
-  stopBoard = layout.stop;
+  // No tabs: the table with Box health only, and the Box health card beside it (adminShell.ts).
+  const shell = createShell({ context, mode: "box", cards: { box } });
+  root.replaceChildren(shell.main);
+  stopBoard = shell.stop;
   active = true;
-  await Promise.all([loadSectionState(context), loadBoardLayout(context)]);
-  layout.refold();
+  await loadSectionState(context);
+  shell.layout();
   await followTheme(context, mine);
   if (!active || mine !== activations) return;
   activateBoxHealth(context, box);
-  activateAttention(context, attention, { waiting: false });
+  activateAttention(context, shell.attention, { waiting: false, table: shell.table.hooks });
 }
 
 export async function activateFabric(context: ExtensionContext): Promise<void> {
@@ -1318,7 +1286,6 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   resetTiles();
   resetAttention();
   resetCardState();
-  const attention = attentionSection();
   const status = el("div", { class: "page-status", "aria-live": "polite" });
   const toast = el("div", { class: "page-status", id: "toast", "aria-live": "assertive" });
   // A section with an id, so a redraw finds an open menu's card (cards.ts whereOf).
@@ -1328,20 +1295,6 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     "aria-label": "Fabric capacities",
   });
   const refreshed = el("p", { class: "meta refreshed" });
-  const updated = el("p", { class: "meta admin-updated" });
-  const verdict = el("p", { class: "admin-verdict", "aria-live": "polite" });
-  const tiles = el("div", { class: "admin-tiles" });
-  const board = el("div", { class: "admin-board" });
-  const openPanel = (opener: HTMLElement | null, focus?: CardId): void => {
-    openCardsPanel(context, { focus, opener, notSetUp: (id) => cardNotSetUp(id as CardId) });
-  };
-  const cardsButton = button("", {
-    title:
-      "Open the Cards panel: switch a card on or off for everyone, hide one for yourself, or see how to set one up",
-    onClick: (node) => openPanel(node),
-  });
-  cardsButton.classList.add("admin-cards-btn");
-  cardsButton.replaceChildren(layoutGridIcon(16), " Cards");
   const deploys = deploysSection();
   const databricks = databricksSection();
   const strip = databricksStrip();
@@ -1393,7 +1346,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const decision = adminCard("decision", "Decision model", scaleIcon(16), [decisionPill()], decisionBody);
   const homeSecurity = adminCard(
     "home-security",
-    "Home security",
+    "Home security · Firewalla",
     shieldCheckIcon(),
     [homeSecurityPill()],
     homeSecurityBody,
@@ -1422,50 +1375,28 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     host,
     secrets,
   );
-  const again = button("", { title: "Read everything again", onClick: () => refreshAll() });
-  again.classList.add("btn-icon", "admin-refresh");
-  again.setAttribute("aria-label", "Read everything again");
-  again.replaceChildren(refreshIcon());
-  const main = el(
-    "main",
-    { class: "fabric admin" },
-    el(
-      "header",
-      { class: "fabric-top" },
-      el("h1", { class: "fabric-h" }, "Admin Center"),
-      verdict,
-      updated,
-      layoutResetButton(board),
-      cardsButton,
-      again,
-    ),
-    tiles,
-    attention,
-    board,
-  );
-  root.replaceChildren(main);
-  // Each card's gear and the footer's Cards settings raise this event; open the panel there.
-  main.addEventListener(CARD_SETTINGS_EVENT, (event) => {
-    const detail = (event as CustomEvent<CardId | null>).detail;
-    openPanel(event.target as HTMLElement | null, detail ?? undefined);
+  // The page: header, tabs, the Needs you table with the rail, the area tabs and Services
+  // (adminShell.ts). The cards below are the same ones as before; the shell places them.
+  const shell: Shell = createShell({
+    context,
+    mode: "full",
+    cards: {
+      deploys,
+      accounts,
+      compute,
+      credit,
+      azure,
+      box,
+      vault,
+      decision,
+      "home-security": homeSecurity,
+      git,
+      presets,
+      social,
+    },
   });
-  mountTiles(tiles, updated);
-  mountVerdict(verdict);
-  const layout = mountBoard(main, board, {
-    deploys,
-    accounts,
-    compute,
-    credit,
-    azure,
-    box,
-    vault,
-    decision,
-    "home-security": homeSecurity,
-    git,
-    presets,
-    social,
-  }, attention);
-  stopBoard = layout.stop;
+  root.replaceChildren(shell.main);
+  stopBoard = shell.stop;
   active = true;
   const state: PageState = {
     data: null,
@@ -1550,7 +1481,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   const [theme] = await Promise.all([
     context.theme.getCurrent(),
     loadSectionState(context),
-    loadBoardLayout(context),
+    shell.loadPrefs(),
     loadVaultView(context),
     // Which cards are off, and which this viewer hid. Admins only: this page is the admin one, so
     // a non-admin or box admin never reaches here and never calls /cards. A failed read leaves
@@ -1568,7 +1499,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
     if (now !== lastOn) refreshAll();
     lastOn = now;
   });
-  layout.refold();
+  shell.layout();
   document.documentElement.dataset.theme = theme.theme;
   const subscription = await context.theme.subscribe((next) => {
     document.documentElement.dataset.theme = next.theme;
@@ -1598,7 +1529,7 @@ export async function activateFabric(context: ExtensionContext): Promise<void> {
   activateSocial(context, social);
   activatePresets(context, presets);
   activateFamilyCost(context, presets);
-  activateAttention(context, attention);
+  activateAttention(context, shell.attention, { table: shell.table.hooks });
   const live = () => active && mine === activations;
   registerRefresh("fabric", () => (live() ? refresh() : undefined));
   onFocus = () => {

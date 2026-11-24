@@ -311,7 +311,7 @@ def test_only_one_process_sweeps(tmp_path: Path) -> None:
 
 def test_roles_store_holds_the_cost_settings(tmp_path: Path) -> None:
     store = role_prefs.RolePrefsStore(tmp_path / "roles.json")
-    assert store.family_cost_settings("a@x.test") == ("tokens", 5_000_000, 25.0)
+    assert store.family_cost_settings("a@x.test") == ("tokens", 50_000_000, 25.0, "either")
     state = store.get("a@x.test")
     body = role_prefs.RolesPut.model_validate(
         {
@@ -321,13 +321,13 @@ def test_roles_store_holds_the_cost_settings(tmp_path: Path) -> None:
         }
     )
     store.put("a@x.test", body)
-    assert store.family_cost_settings("a@x.test") == ("dollars", 5_000_000, 12.5)
+    assert store.family_cost_settings("a@x.test") == ("dollars", 50_000_000, 12.5, "either")
     # A later save that leaves the fields out keeps them.
     again = role_prefs.RolesPut.model_validate(
         {
             k: v
             for k, v in store.get("a@x.test").model_dump().items()
-            if not k.startswith(("family_cost", "runaway"))
+            if not k.startswith(("family_", "runaway"))
         }
     )
     store.put("a@x.test", again)
@@ -369,22 +369,48 @@ def test_settings_post_saves_the_unit_and_threshold_and_the_route_reads_them(
     assert first["unit_default"] == "tokens"
     assert first["settings"] == {
         "unit": "tokens",
-        "runaway_tokens": 5_000_000,
+        "runaway_tokens": 50_000_000,
         "runaway_usd": 25.0,
+        "flag_on": "either",
     }
     saved = client.post(
         "/v1/ae/family-cost/settings",
         json={"family_cost_unit": "dollars", "runaway_family_usd": 12.5},
     )
     assert saved.status_code == 200, saved.text
-    assert saved.json() == {"unit": "dollars", "runaway_tokens": 5_000_000, "runaway_usd": 12.5}
+    assert saved.json() == {
+        "unit": "dollars",
+        "runaway_tokens": 50_000_000,
+        "runaway_usd": 12.5,
+        "flag_on": "either",
+    }
     after = client.get("/v1/ae/family-cost?days=7").json()
     assert after["unit_default"] == "dollars"
     assert [f["lead_id"] for f in after["families"]] == ["theirs", "mine"]
     # Only the tokens limit changes; the rest is kept.
     again = client.post("/v1/ae/family-cost/settings", json={"runaway_family_tokens": 0})
-    assert again.json() == {"unit": "dollars", "runaway_tokens": 0, "runaway_usd": 12.5}
-    for bad in ({}, {"family_cost_unit": "euros"}, {"runaway_family_usd": -1}, {"nope": 1}):
+    assert again.json() == {
+        "unit": "dollars",
+        "runaway_tokens": 0,
+        "runaway_usd": 12.5,
+        "flag_on": "either",
+    }
+    # An old client that sends no flag_on still validates, and the new field saves on its own.
+    mode = client.post("/v1/ae/family-cost/settings", json={"family_flag_on": "tokens"})
+    assert mode.json()["flag_on"] == "tokens"
+    assert client.post("/v1/ae/family-cost/settings", json={"runaway_family_usd": 5}).json() == {
+        "unit": "dollars",
+        "runaway_tokens": 0,
+        "runaway_usd": 5,
+        "flag_on": "tokens",
+    }
+    for bad in (
+        {},
+        {"family_cost_unit": "euros"},
+        {"runaway_family_usd": -1},
+        {"family_flag_on": "both"},
+        {"nope": 1},
+    ):
         assert client.post("/v1/ae/family-cost/settings", json=bad).status_code == 422, bad
     role_prefs.reset_store()
 
@@ -678,3 +704,171 @@ def test_token_flag_leaves_cache_reads_out() -> None:
 
     assert not flagged(1_000)  # cache reads alone would have passed 1,000
     assert flagged(150)
+
+
+# ---- 2026-11-23: delta counting, the one-time rebase and the flag mode
+
+
+def _fed(rig: Rig, samples: list[tuple[int, int]], *, start: float = NOW - 3 * DAY) -> None:
+    """Sweep one lead through (input, cache_read) samples, a day apart, the last one at NOW."""
+    old = NOW - 40 * DAY
+    for n, (inp, cache) in enumerate(samples):
+        rig.now = start + n * (NOW - start) / max(1, len(samples) - 1)
+        rig.tops = [Row("lead", usage(0.0, inp, 0, cache), {}, created_at=old)]
+        rig.sweep()
+
+
+def test_a_one_percent_dip_then_recovery_counts_once() -> None:
+    rig = Rig()
+    # 1000 -> 990 (a restart's small dip) -> 1100: 110 of growth from the low point, where the
+    # old rule counted the whole 990 again (2,090).
+    _fed(rig, [(1000, 0), (1000, 0), (990, 0), (1100, 0)])
+    [fam] = rig.families(7)
+    assert fam["tokens"]["input"] == 110
+
+
+def test_a_late_restart_above_half_still_counts_growth_from_the_low_point() -> None:
+    rig = Rig()
+    _fed(rig, [(1000, 0), (1000, 0), (600, 0), (700, 0)])
+    [fam] = rig.families(7)
+    assert fam["tokens"]["input"] == 100  # 600 -> 700; the 400 dip is not spend
+
+
+def test_a_fall_below_half_is_a_reset_counted_from_zero() -> None:
+    rig = Rig()
+    _fed(rig, [(1000, 0), (1000, 0), (400, 0), (500, 0)])
+    [fam] = rig.families(7)
+    assert fam["tokens"]["input"] == 500  # 400 from zero, then 100 more
+
+
+def test_each_field_is_judged_on_its_own() -> None:
+    rig = Rig()
+    # Input dips 2% while cache_read resets to nothing: only the second is a reset.
+    _fed(rig, [(5000, 8000), (5000, 8000), (4900, 100), (5000, 200)])
+    [fam] = rig.families(7)
+    assert fam["tokens"]["input"] == 100
+    assert fam["tokens"]["cache_read"] == 200
+
+
+def test_a_fall_from_a_tiny_sample_is_a_reset() -> None:
+    rig = Rig()
+    _fed(rig, [(500, 0), (500, 0), (400, 0), (450, 0)])
+    [fam] = rig.families(7)
+    assert fam["tokens"]["input"] == 450  # 400 is only 20% down, but 500 is under the floor
+
+
+def test_a_native_row_goes_through_the_same_rule() -> None:
+    rig = Rig()
+    old = NOW - 40 * DAY
+    for n, inp in enumerate((1000, 1000, 990, 1100)):
+        rig.now = NOW - 3 * DAY + n * DAY
+        rig.tops = [Row("lead", usage(1.0, 10, 0, 0), {}, created_at=old)]
+        rig.natives = [
+            Row("sub", usage(9.0, inp, 0, 0), {}, parent_conversation_id="lead", created_at=old)
+        ]
+        rig.sweep()
+    [fam] = rig.families(7)
+    assert fam["tokens"]["input"] == 110
+    assert fam["cost_usd"] == pytest.approx(0.0)  # a native row never adds cost
+
+
+def test_the_one_time_rebase_restarts_today_and_keeps_older_days(tmp_path: Path) -> None:
+    path = tmp_path / "fc.json"
+    rig = Rig(path)
+    old = NOW - 40 * DAY
+    for back, tokens in ((2 * DAY, 1000), (0.0, 5000)):
+        rig.now = NOW - back
+        rig.tops = [Row("lead", usage(0.0, tokens, 0, 0), {}, created_at=old)]
+        rig.sweep()
+    yesterday = _day(NOW - 2 * DAY)
+    assert json.loads(path.read_text())["rule"] == family_cost.STATE_RULE
+    # Make the file look like one an older server wrote: no "rule", an inflated "today".
+    saved = json.loads(path.read_text())
+    del saved["rule"]
+    saved["days"][_day(NOW)] = {"lead": [0.0, 1.0, 0.0, 0.0]}
+    path.write_text(json.dumps(saved))
+    later = Rig(path)
+    later.now = NOW + 600
+    later.tops = [Row("lead", usage(0.0, 5200, 0, 0), {}, created_at=old)]
+    later.sweep()
+    after = json.loads(path.read_text())
+    assert after["rule"] == family_cost.STATE_RULE
+    assert after["days"][_day(NOW)] == {"lead": [0.0, 5200.0, 0.0, 0.0]}  # today restarts at 0
+    assert after["days"][yesterday] == saved["days"][yesterday]  # older days are untouched
+    assert after["last"] == {"lead": [0.0, 5200.0, 0.0, 0.0]}
+    # The reading is there at once, and nothing was set aside.
+    assert not list(tmp_path.glob("*.bad-*"))
+    assert later.families(7)[0]["today"]["tokens_total"] == 0
+    # A second sweep under the new rule leaves today alone.
+    later.now = NOW + 1200
+    later.tops = [Row("lead", usage(0.0, 5300, 0, 0), {}, created_at=old)]
+    later.sweep()
+    assert later.families(7)[0]["today"]["tokens_total"] == 100
+
+
+def test_the_one_time_rebase_drops_the_old_rule_inflated_offsets(tmp_path: Path) -> None:
+    path = tmp_path / "fc.json"
+    rig = Rig(path)
+    started = NOW - 3 * DAY  # inside the 7-day window, so it counts from zero
+    for back, tokens in ((2 * DAY, 1000), (0.0, 5000)):
+        rig.now = NOW - back
+        rig.tops = [Row("lead", usage(0.0, tokens, 0, 0), {}, created_at=started)]
+        rig.sweep()
+    # An older server's file: no "rule", and an offset of false resets in it and in its days.
+    saved = json.loads(path.read_text())
+    del saved["rule"]
+    saved["offsets"] = {"lead": [0.0, 90000.0, 0.0, 0.0]}
+    for day in saved["days"]:
+        vals = saved["days"][day].get("lead")
+        if vals:
+            saved["days"][day]["lead"] = [vals[0], vals[1] + 90000.0, vals[2], vals[3]]
+    path.write_text(json.dumps(saved))
+    later = Rig(path)
+    later.now = NOW + 600
+    later.tops = [Row("lead", usage(0.0, 5200, 0, 0), {}, created_at=started)]
+    later.sweep()
+    after = json.loads(path.read_text())
+    assert "lead" not in after["offsets"]
+    assert all(v["lead"][1] <= 5200.0 for v in after["days"].values() if "lead" in v)
+    [fam] = later.families(7)
+    assert fam["tokens"]["input"] == 5200  # the real total, not 95,200
+    assert fam["today"]["tokens_total"] == 0
+
+
+def _mode_answer(mode: str, tokens: float, usd: float) -> dict[str, Any]:
+    rig = two_owners()
+    rig.now = NOW + 3600
+    rig.tops = [Row("mine", usage(8.0, 400, 100, 0), {}, title="mine")]
+    rig.sweep()
+    return answer(rig, admin=True, runaway_tokens=tokens, runaway_usd=usd, flag_on=mode)[
+        "families"
+    ][0]
+
+
+def test_flag_modes() -> None:
+    # "mine" spent 3 dollars and 400 tokens today beyond its first snapshot (see two_owners).
+    fam = _mode_answer("either", 1, 1)
+    assert (fam["flagged"], fam["over_tokens"], fam["over_usd"]) == (True, True, True)
+    fam = _mode_answer("tokens", 1, 1)
+    assert (fam["flagged"], fam["over_tokens"], fam["over_usd"]) == (True, True, False)
+    fam = _mode_answer("dollars", 1, 1)
+    assert (fam["flagged"], fam["over_tokens"], fam["over_usd"]) == (True, False, True)
+    # A mode ignores the other limit even when that one is passed, and a 0 limit never flags.
+    assert not _mode_answer("dollars", 1, 0)["flagged"]
+    assert not _mode_answer("tokens", 0, 1)["flagged"]
+    assert not _mode_answer("either", 0, 0)["flagged"]
+    # An unknown mode reads as "either".
+    assert _mode_answer("bogus", 1, 0)["flagged"]
+
+
+def test_a_saved_token_threshold_is_kept_and_the_default_is_50m(tmp_path: Path) -> None:
+    assert family_cost.DEFAULT_RUNAWAY_TOKENS == 50_000_000
+    store = role_prefs.RolePrefsStore(tmp_path / "roles.json")
+    state = store.get("a@x.test")
+    store.put(
+        "a@x.test",
+        role_prefs.RolesPut.model_validate(
+            {**state.model_dump(), "runaway_family_tokens": 5_000_000}
+        ),
+    )
+    assert store.family_cost_settings("a@x.test").runaway_tokens == 5_000_000

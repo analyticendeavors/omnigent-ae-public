@@ -76,7 +76,7 @@ def test_starters_use_real_catalog_ids() -> None:
     }
     assert balanced["helper"] == {"mode": "fixed", "model": "claude-haiku-5-5", "effort": "low"}
     yolo = by_id["yolo"]
-    fable = {"mode": "fixed", "model": "claude-fable-5-1", "effort": "max"}
+    fable = {"mode": "fixed", "model": "claude-fable-5-2", "effort": "max"}
     assert all(r == fable for role, r in yolo["roles"].items() if role != "reviewer")
     assert yolo["roles"]["reviewer"] == {
         "mode": "multi",

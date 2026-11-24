@@ -118,3 +118,15 @@ def test_a_dict_keeps_its_other_keys(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_any_other_shape_abstains(monkeypatch: pytest.MonkeyPatch, data: Any) -> None:
     _on(monkeypatch)
     assert voice_style(_with_data(data)) is None
+
+
+def test_native_hook_request_shape_gets_the_line_and_keeps_text() -> None:
+    event = {
+        "type": "request",
+        "data": {"text": "What next?", "user_content": "What next?", "attachments": []},
+        "context": {"labels": {labels.VOICE: "on"}, "conversation_id": "conv_x"},
+    }
+    got = voice_style(event)
+    assert got is not None
+    assert got["data"]["user_content"].endswith(SPOKEN_STYLE)
+    assert got["data"]["text"] == "What next?"

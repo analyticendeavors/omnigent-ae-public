@@ -1,0 +1,348 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:21:38 -0800
+Subject: [PATCH 336/443] [ae-patch] Hand the spoken-style line to native chats
+ as prompt context and fit the speaker menu to a phone
+
+---
+ omnigent/harnesses/claude_native/hook.py      | 10 +++-
+ omnigent/harnesses/codex_native/hook.py       | 10 +++-
+ omnigent/native/native_policy_hook.py         | 56 ++++++++++++++++--
+ .../codex_native/test_codex_native_hook.py    |  6 +-
+ tests/test_native_policy_hook.py              | 59 ++++++++++++++++++-
+ .../components/AeSpeakRepliesButton.test.tsx  | 17 ++++--
+ web/src/components/AeSpeakRepliesButton.tsx   |  6 +-
+ 7 files changed, 148 insertions(+), 16 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/hook.py b/omnigent/harnesses/claude_native/hook.py
+index 72885fb911341bb3de2cb0534674554c184dfbb9..f13a587f5011bfc0fb10ae2243bf2bfc40a700aa 100644
+--- a/omnigent/harnesses/claude_native/hook.py
++++ b/omnigent/harnesses/claude_native/hook.py
+@@ -1092,7 +1092,15 @@ def _main_evaluate_policy(argv: list[str]) -> int:
+         print("omnigent evaluate-policy hook: malformed Omnigent response", file=sys.stderr)
+         return _fail_closed()
+ 
+-    hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
++    hook_output = evaluation_response_to_hook_output(
++        hook_event,
++        eval_response,
++        prompt=(
++            payload["prompt"]
++            if hook_event == "UserPromptSubmit" and isinstance(payload.get("prompt"), str)
++            else None
++        ),
++    )
+     if hook_output is not None:
+         sys.stdout.write(json.dumps(hook_output))
+     return 0
+diff --git a/omnigent/harnesses/codex_native/hook.py b/omnigent/harnesses/codex_native/hook.py
+index b2e70ecd8216d10e2c4d5b2865f8454004308e08..8ee3d0eb58940cb1aa5dac9329d8d93e82111779 100644
+--- a/omnigent/harnesses/codex_native/hook.py
++++ b/omnigent/harnesses/codex_native/hook.py
+@@ -195,7 +195,15 @@ def _main_evaluate_policy(argv: list[str]) -> int:
+         )
+         return _fail_closed()
+ 
+-    hook_output = evaluation_response_to_hook_output(hook_event, eval_response)
++    hook_output = evaluation_response_to_hook_output(
++        hook_event,
++        eval_response,
++        prompt=(
++            payload["prompt"]
++            if hook_event == "UserPromptSubmit" and isinstance(payload.get("prompt"), str)
++            else None
++        ),
++    )
+     if hook_output is not None:
+         sys.stdout.write(json.dumps(hook_output))
+     return 0
+diff --git a/omnigent/native/native_policy_hook.py b/omnigent/native/native_policy_hook.py
+index 43e0320515ca1fd4f931fda396ae49dde7aa3487..baa97af16ab209bffb2fc05eb5b1517f723cb03a 100644
+--- a/omnigent/native/native_policy_hook.py
++++ b/omnigent/native/native_policy_hook.py
+@@ -313,14 +313,17 @@ def hook_payload_to_evaluation_request(
+     """
+     if hook_event == _USER_PROMPT_SUBMIT:
+         # Request-phase gate for native sessions. The server reads REQUEST
+-        # content from ``data.text`` (see ``_build_evaluation_context``).
++        # content from ``data.text``; policies read ``data.user_content``.
+         prompt = payload.get("prompt", "")
++        prompt_text = prompt if isinstance(prompt, str) else json.dumps(prompt)
+         return {
+             "event": {
+                 "type": "PHASE_REQUEST",
+                 "target": "",
+                 "data": {
+-                    "text": prompt if isinstance(prompt, str) else json.dumps(prompt),
++                    "text": prompt_text,
++                    "user_content": prompt_text,
++                    "attachments": [],
+                 },
+                 "context": {},
+             },
+@@ -364,9 +367,50 @@ def hook_payload_to_evaluation_request(
+     return None
+ 
+ 
++def _prompt_additional_context(
++    eval_response: dict[str, object],
++    prompt: str | None,
++) -> dict[str, object] | None:
++    """
++    Turn a request-phase rewrite that appended text into ``additionalContext``.
++
++    :param eval_response: Parsed ``EvaluationResponse``, e.g.
++        ``{"result": "POLICY_ACTION_ALLOW", "data": {"user_content": "hi\\n\\nbe brief"}}``.
++    :param prompt: The submitted prompt, e.g. ``"hi"``.
++    :returns: ``{"hookSpecificOutput": ...}`` carrying only the appended part,
++        or ``None`` when there is no data, no prompt, or the policy rewrote
++        rather than appended.
++    """
++    data = eval_response.get("data")
++    if isinstance(data, dict):
++        rewritten = data.get("user_content")
++    else:
++        rewritten = data
++    if not isinstance(rewritten, str) or prompt is None:
++        return None
++    if not rewritten.startswith(prompt):
++        print(
++            "omnigent evaluate-policy hook: policy rewrote the prompt instead of "
++            "appending; leaving the prompt unchanged",
++            file=sys.stderr,
++        )
++        return None
++    appended = rewritten[len(prompt) :].strip()
++    if not appended:
++        return None
++    return {
++        "hookSpecificOutput": {
++            "hookEventName": _USER_PROMPT_SUBMIT,
++            "additionalContext": appended,
++        }
++    }
++
++
+ def evaluation_response_to_hook_output(
+     hook_event: str,
+     eval_response: dict[str, object],
++    *,
++    prompt: str | None = None,
+ ) -> dict[str, object] | None:
+     """
+     Convert an ``EvaluationResponse`` into native-harness hook output JSON.
+@@ -401,7 +445,9 @@ def evaluation_response_to_hook_output(
+     to a hard ALLOW/DENY before the response reaches the hook), so the hook
+     should never see ASK; if it somehow does, it fails closed by blocking.
+     ALLOW (and the engine's no-match default) returns ``None`` so the prompt
+-    proceeds. Unlike ``PreToolUse``, there is no separate user-consent gate
++    proceeds, unless the policy appended text to the prompt (``data``): that
++    appended part is returned as ``hookSpecificOutput.additionalContext``.
++    Unlike ``PreToolUse``, there is no separate user-consent gate
+     on a prompt, so ALLOW need not preserve one.
+ 
+     Both Claude Code and Codex consume these exact output shapes, so the
+@@ -411,6 +457,8 @@ def evaluation_response_to_hook_output(
+         ``"PostToolUse"``, or ``"UserPromptSubmit"``.
+     :param eval_response: Parsed ``EvaluationResponse`` from AP, e.g.
+         ``{"result": "POLICY_ACTION_DENY", "reason": "blocked by policy"}``.
++    :param prompt: The submitted prompt text for ``UserPromptSubmit``, used to
++        find what a policy appended; ``None`` for other events.
+     :returns: Hook output dict for the harness to read on stdout, or
+         ``None`` when there is no verdict to express (allow with no
+         rewrite on PostToolUse, or an unknown action).
+@@ -429,7 +477,7 @@ def evaluation_response_to_hook_output(
+                 "decision": "block",
+                 "reason": reason or "Denied by policy",
+             }
+-        return None
++        return _prompt_additional_context(eval_response, prompt)
+ 
+     if hook_event == _PRE_TOOL_USE:
+         # ALLOW (the engine default when no policy matches) is omitted → None,
+diff --git a/tests/harnesses/codex_native/test_codex_native_hook.py b/tests/harnesses/codex_native/test_codex_native_hook.py
+index 3f65bfdb64f675b1473fa6789be997ad2215c3b4..6af43c9f3e59e1d0ffab731e107dfdde8e5b2900 100644
+--- a/tests/harnesses/codex_native/test_codex_native_hook.py
++++ b/tests/harnesses/codex_native/test_codex_native_hook.py
+@@ -266,7 +266,11 @@ def test_user_prompt_submit_converts_posts_and_blocks(
+     assert exit_code == 0
+     sent = _DenyHttpxClient.captured["json"]
+     assert sent["event"]["type"] == "PHASE_REQUEST"
+-    assert sent["event"]["data"] == {"text": "delete the prod database"}
++    assert sent["event"]["data"] == {
++        "text": "delete the prod database",
++        "user_content": "delete the prod database",
++        "attachments": [],
++    }
+     # DENY → top-level decision/reason block (not permissionDecision).
+     result = json.loads(captured.out)
+     assert result == {"decision": "block", "reason": "rm blocked by admin policy"}
+diff --git a/tests/test_native_policy_hook.py b/tests/test_native_policy_hook.py
+index b1f6d100e35c4814789d0fd5f258f9ad4e4d00a4..abd09df74af7ad75ab212f53842916330cc00ee3 100644
+--- a/tests/test_native_policy_hook.py
++++ b/tests/test_native_policy_hook.py
+@@ -254,7 +254,11 @@ def test_user_prompt_submit_maps_to_phase_request() -> None:
+     assert result is not None
+     event = result["event"]
+     assert event["type"] == "PHASE_REQUEST"
+-    assert event["data"] == {"text": "delete the prod database"}
++    assert event["data"] == {
++        "text": "delete the prod database",
++        "user_content": "delete the prod database",
++        "attachments": [],
++    }
+     # A context dict must exist so the per-harness hook can stamp model/harness.
+     assert event["context"] == {}
+ 
+@@ -268,7 +272,7 @@ def test_user_prompt_submit_missing_prompt_yields_empty_text() -> None:
+     """
+     result = hook_payload_to_evaluation_request("UserPromptSubmit", {})
+     assert result is not None
+-    assert result["event"]["data"] == {"text": ""}
++    assert result["event"]["data"] == {"text": "", "user_content": "", "attachments": []}
+ 
+ 
+ @pytest.mark.parametrize("action", ["POLICY_ACTION_DENY", "POLICY_ACTION_ASK"])
+@@ -318,6 +322,57 @@ def test_user_prompt_submit_non_blocking_actions_return_none(action: str) -> Non
+     assert output is None
+ 
+ 
++def test_user_prompt_submit_allow_with_appended_data_yields_suffix_only() -> None:
++    """A policy that appended a line to the prompt returns only that line as context."""
++    output = evaluation_response_to_hook_output(
++        "UserPromptSubmit",
++        {
++            "result": "POLICY_ACTION_ALLOW",
++            "data": {"user_content": "hello\n\nSpeak plainly."},
++        },
++        prompt="hello",
++    )
++    assert output == {
++        "hookSpecificOutput": {
++            "hookEventName": "UserPromptSubmit",
++            "additionalContext": "Speak plainly.",
++        }
++    }
++
++
++def test_user_prompt_submit_allow_without_data_returns_none() -> None:
++    """No ``data`` means no context, even when the prompt is known."""
++    assert (
++        evaluation_response_to_hook_output(
++            "UserPromptSubmit", {"result": "POLICY_ACTION_ALLOW"}, prompt="hello"
++        )
++        is None
++    )
++
++
++def test_user_prompt_submit_rewrite_not_prefixed_by_prompt_returns_none(
++    capsys: pytest.CaptureFixture[str],
++) -> None:
++    """A policy that rewrote rather than appended leaves the prompt unchanged."""
++    output = evaluation_response_to_hook_output(
++        "UserPromptSubmit",
++        {"result": "POLICY_ACTION_ALLOW", "data": {"user_content": "something else"}},
++        prompt="hello",
++    )
++    assert output is None
++    assert "rewrote the prompt" in capsys.readouterr().err
++
++
++def test_user_prompt_submit_deny_ignores_data() -> None:
++    """DENY still blocks, whatever ``data`` carries."""
++    output = evaluation_response_to_hook_output(
++        "UserPromptSubmit",
++        {"result": "POLICY_ACTION_DENY", "reason": "no", "data": "hello more"},
++        prompt="hello",
++    )
++    assert output == {"decision": "block", "reason": "no"}
++
++
+ def test_fail_closed_pre_tool_use_denies() -> None:
+     """
+     An unobtainable verdict on PreToolUse fails CLOSED with ``deny``.
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 991dfc1c1c895808891568a62070a0b3653eb45b..41905f4bc9f3a314dfd30395eec777cbe0586a7d 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -382,13 +382,20 @@ describe("AeSpeakRepliesButton", () => {
+       delete (HTMLMediaElement.prototype as { setSinkId?: unknown }).setSinkId;
+     });
+ 
++    it("gives the menu caret a 44 px hit area on coarse pointers", async () => {
++      renderButton();
++      const trigger = screen.getByTestId("ae-speak-replies-menu");
++      expect(trigger.className).toContain("pointer-coarse:before:-inset-x-3.5");
++      expect(trigger.className).toContain("pointer-coarse:before:-inset-y-2");
++    });
++
+     it("renders both rows under Speed and saves a pick", async () => {
+       mediaDevices(LIST);
+       (HTMLMediaElement.prototype as { setSinkId?: unknown }).setSinkId = setSinkId;
+       renderButton();
+       const user = await openMenu();
+-      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("System default");
+-      expect(screen.getByTestId("ae-speak-speaker-trigger")).toHaveTextContent("System default");
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("Default");
++      expect(screen.getByTestId("ae-speak-speaker-trigger")).toHaveTextContent("Default");
+       await user.click(screen.getByTestId("ae-speak-mic-trigger"));
+       const options = await screen.findAllByTestId("ae-speak-mic-option");
+       expect(options.map((o) => o.textContent)).toEqual(["System default", "USB Mic"]);
+@@ -447,7 +454,7 @@ describe("AeSpeakRepliesButton", () => {
+       mediaDevices(LIST);
+       renderButton();
+       await openMenu();
+-      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("System default");
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("Default");
+     });
+   });
+ 
+@@ -513,7 +520,7 @@ describe("AeSpeakRepliesButton", () => {
+       await user.click(screen.getByTestId("ae-speak-mic-trigger"));
+       expect(await screen.findByText("Use the mic once to list devices.")).toBeInTheDocument();
+       expect(screen.getAllByTestId("ae-speak-mic-option")).toHaveLength(1);
+-      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("System default");
++      expect(screen.getByTestId("ae-speak-mic-trigger")).toHaveTextContent("Default");
+     });
+ 
+     it("reads a saved microphone as Saved device", async () => {
+@@ -534,7 +541,7 @@ describe("AeSpeakRepliesButton", () => {
+       await user.keyboard("{Enter}");
+       expect(window.localStorage.getItem("omnigent:ae-mic-device")).toBeNull();
+       await openMenu();
+-      expect(await screen.findByTestId("ae-speak-mic-trigger")).toHaveTextContent("System default");
++      expect(await screen.findByTestId("ae-speak-mic-trigger")).toHaveTextContent("Default");
+     });
+ 
+     it("gives the value rows the shared shrink classes", async () => {
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index b1932ed49d5964d5aeb76a61b00c988765d899b5..c8a2948f71e63b0f18f876bc72fcb3215021faf7 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -146,6 +146,8 @@ function DeviceRow({
+   const value = current ? current.id : !known && saved ? saved : SYSTEM_DEFAULT;
+   // Before the browser shares device ids a saved choice cannot be named.
+   const name = current ? current.label : !known && saved ? "Saved device" : "System default";
++  // The row value is short so it fits the phone-width menu; the radio item keeps the full name.
++  const rowValue = current ? shortDeviceName(name) : name === "System default" ? "Default" : name;
+   return (
+     <DropdownMenuSub>
+       <DropdownMenuSubTrigger data-testid={`${testId}-trigger`}>
+@@ -154,7 +156,7 @@ function DeviceRow({
+           <RowHint id={hint} />
+         </span>
+         <span className={ROW_VALUE_CLASS} title={name}>
+-          {current ? shortDeviceName(name) : name}
++          {rowValue}
+         </span>
+       </DropdownMenuSubTrigger>
+       <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
+@@ -428,7 +430,7 @@ function SpeakRepliesControl({
+           type="button"
+           size="icon"
+           variant="ghost"
+-          className="-ml-1 h-7 w-4 text-muted-foreground"
++          className="relative -ml-1 h-7 w-4 text-muted-foreground pointer-coarse:before:absolute pointer-coarse:before:-inset-x-3.5 pointer-coarse:before:-inset-y-2 pointer-coarse:before:content-['']"
+           aria-label="Speak replies menu"
+           data-testid="ae-speak-replies-menu"
+           disabled={disabled}

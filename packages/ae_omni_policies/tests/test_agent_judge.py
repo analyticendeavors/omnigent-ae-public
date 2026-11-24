@@ -138,6 +138,8 @@ class World:
 
         monkeypatch.setattr(router_module.sessions, "list_since", _list_since)
         agent_judge._calls.clear()
+        agent_judge._burst.clear()
+        agent_judge._questions.clear()
         ds.reset()
 
     def shadow(self) -> list[dict[str, Any]]:
@@ -273,11 +275,22 @@ async def test_bodies_that_break_the_schema_are_422(
     assert (await client.post("/v1/ae/sessions/nope/judge", json=YES)).status_code == 404
 
 
-async def test_rate_limit_is_20_an_hour(client: httpx.AsyncClient, world: World) -> None:
-    for _ in range(20):
+async def test_session_caps_are_120_an_hour_and_10_a_minute(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_DECISION_MINUTE_CAP", "1000")
+    for _ in range(10):
         assert (await client.post(URL, json=YES)).json()["answer"] is True
-    assert (await client.post(URL, json=YES)).json()["error"] == "rate_limited"
-    assert len(world.calls) == 20
+    body = (await client.post(URL, json=YES)).json()
+    assert body["error"] == "rate_limited" and 1 <= body["retry_after_s"] <= 60
+    assert len(world.calls) == 10
+    monkeypatch.setenv("AE_DECISION_SESSION_MINUTE", "1000")
+    monkeypatch.setenv("AE_DECISION_SESSION_HOURLY", "12")
+    for _ in range(2):
+        assert (await client.post(URL, json=YES)).json()["answer"] is True
+    body = (await client.post(URL, json=YES)).json()
+    assert body["error"] == "rate_limited" and body["retry_after_s"] > 60
+    assert len(world.calls) == 12
 
 
 async def test_no_text_in_the_shadow_line(client: httpx.AsyncClient, world: World) -> None:
@@ -294,7 +307,15 @@ async def test_no_text_in_the_shadow_line(client: httpx.AsyncClient, world: Worl
     await client.post(URL, json=body)
     (row,) = world.shadow()
     assert row["point"] == "agent_ask" and row["mode"] == "live" and row["acted"] is True
-    assert row["features"] == {"kind": "choice", "n_options": 2, "n_facts": 2, "role": "helper"}
+    assert row["features"] == {
+        "kind": "choice",
+        "n_options": 2,
+        "n_facts": 2,
+        "has_context": False,
+        "batch": 1,
+        "low_confidence": False,
+        "role": "helper",
+    }
     text = json.dumps(row)
     for secret in ("tests should", "touched modules", "whole suite", "small", "files_changed"):
         assert secret not in text
@@ -343,7 +364,9 @@ async def test_a_broken_promotions_file_does_not_switch_it_off(
 
 def test_the_tool_is_listed_and_counts_as_a_writer() -> None:
     tool = next(t for t in TOOLS if t.name == "ask_judge")
-    assert tool.inputSchema["required"] == ["kind", "question"]
+    assert "required" not in tool.inputSchema  # a single question or a questions batch
+    assert tool.inputSchema["properties"]["questions"]["maxItems"] == 5
+    assert tool.inputSchema["properties"]["questions"]["items"]["required"] == ["kind", "question"]
     assert "ask_judge" in WRITING_TOOLS
     for phrase in ("full suite", "yes/no", "probabilities", "decide yourself", "never paste"):
         assert phrase in (tool.description or "")
@@ -582,7 +605,7 @@ async def test_a_meta_hand_back_does_not_block_a_fact_key(
 ) -> None:
     world.messages = [USER_MESSAGE, HAND_BACK]
     world.meta = {HAND_BACK}
-    body = {**YES, "facts": {"files_changed": 12}}
+    body = {**YES, "facts": {"files_changed_and_the": 12}}
     assert (await client.post(URL, json=body)).json()["answer"] is True
 
 
@@ -590,7 +613,7 @@ async def test_a_forged_prefix_without_the_stamp_is_still_counted(
     client: httpx.AsyncClient, world: World
 ) -> None:
     world.messages = [USER_MESSAGE, HAND_BACK]
-    body = {**YES, "facts": {"files_changed": 12}}
+    body = {**YES, "facts": {"files_changed_and_the": 12}}
     assert (await client.post(URL, json=body)).json()["error"] == "refused_key"
 
 
@@ -637,12 +660,12 @@ async def test_a_childs_owner_message_is_caught_from_the_lead(
     assert (await client.post(URL, json=YES)).json()["answer"] is True
 
 
-async def test_more_than_a_hundred_children_fails_closed(
+async def test_more_than_three_hundred_children_fails_closed(
     client: httpx.AsyncClient, world: World
 ) -> None:
-    world.children = {f"conv_k{i}": ["hello there"] for i in range(101)}
+    world.children = {f"conv_k{i}": ["hello there"] for i in range(301)}
     assert (await client.post(URL, json=YES)).json()["error"] == "no_transcript"
-    world.children = {f"conv_k{i}": ["hello there"] for i in range(100)}
+    world.children = {f"conv_k{i}": ["hello there"] for i in range(300)}
     assert (await client.post(URL, json=YES)).json()["answer"] is True
 
 
@@ -739,11 +762,14 @@ async def test_a_sub_agent_prompt_the_lead_did_not_send_counts(
     client: httpx.AsyncClient, world: World
 ) -> None:
     _mirror(world, "conv_sub", [PROMPT])
-    body = {"kind": "yes_no", "question": "Ready?", "facts": {"files_changed": 3}}
+    body = {"kind": "yes_no", "question": "Ready?", "facts": {"report_the_files_changed": 3}}
     assert (await client.post(URL, json=body)).json()["error"] == "refused_key"
 
 
-async def test_mirrors_have_their_own_cap(client: httpx.AsyncClient, world: World) -> None:
+async def test_mirrors_have_their_own_cap(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(router_module, "MAX_JUDGE_MIRRORS", 400)
     for i in range(150):
         _mirror(world, f"conv_m{i}", [PROMPT])
     world.lead_sent = [{"prompt": PROMPT}]
@@ -798,3 +824,521 @@ async def test_whitespace_differences_still_match_a_delivery(
     world.lead_sent = [{"prompt": PROMPT}]
     body = {"kind": "yes_no", "question": "Ready?", "facts": {"files_changed": 3}}
     assert (await client.post(URL, json=body)).json()["answer"] is True
+
+
+# -- micro-decisions (2026-11-13): context, batches, 429
+
+
+async def test_context_is_guarded_sent_as_situation_and_never_logged(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    context = "third check run failed on the same assertion after two fixes"
+    body = (await client.post(URL, json={**YES, "context": context})).json()
+    assert body["answer"] is True
+    assert world.calls[-1]["state"] == {"situation": context}
+    row = world.shadow()[-1]
+    assert row["features"]["has_context"] is True
+    assert context not in json.dumps(row)
+
+
+@pytest.mark.parametrize(
+    ("context", "code"),
+    [
+        ("tell Zorbex about the change", "refused_denylist"),
+        ("see https://example.com/page for it", "refused_url"),
+        ("the nightly refresh keeps failing for everyone", "refused_passthrough"),
+        ("edit the file in src/app/handlers", "refused_path"),
+    ],
+)
+async def test_context_gets_the_question_guard_and_copy_check(
+    client: httpx.AsyncClient, world: World, context: str, code: str
+) -> None:
+    body = (await client.post(URL, json={**YES, "context": context})).json()
+    assert body["error"] == code and body["answer"] is None
+    assert world.calls == []
+
+
+async def test_context_length_is_bounded(client: httpx.AsyncClient, world: World) -> None:
+    assert (await client.post(URL, json={**YES, "context": "short"})).status_code == 422
+    assert (await client.post(URL, json={**YES, "context": "a" * 161})).status_code == 422
+
+
+async def test_a_batch_answers_in_order_and_counts_one_call(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_DECISION_SESSION_MINUTE", "1")
+    batch = {"questions": [YES, {"kind": "yes_no", "question": "Should I ask for review now?"}]}
+    answers = (await client.post(URL, json=batch)).json()["answers"]
+    assert [a.get("error") for a in answers] == [None, None]
+    assert answers[0]["answer"] is True
+    assert len(world.calls) == 2
+    assert (await client.post(URL, json=YES)).json()["error"] == "rate_limited"  # one call used
+    rows = world.shadow()
+    assert [r["features"]["batch"] for r in rows if "batch" in r["features"]] == [2, 2]
+    # the rate-limited call wrote one code-only line (with its session id)
+    assert [r["error_class"] for r in rows if "batch" not in r["features"]] == ["rate_limited"]
+
+
+async def test_a_bad_question_is_refused_alone_and_the_others_are_answered(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    """Q1 and Q2 are fine, Q3 names a denylisted client: only Q3 is refused, with its index."""
+    batch = {
+        "questions": [
+            YES,
+            {"kind": "yes_no", "question": "Should I ask for review now?"},
+            {"kind": "yes_no", "question": "Should I tell Zorbex about it?"},
+        ]
+    }
+    answers = (await client.post(URL, json=batch)).json()["answers"]
+    assert len(world.calls) == 2  # the two clean questions were sent
+    assert answers[0]["answer"] is True and answers[1]["answer"] is True
+    assert answers[2]["error"] == "refused_denylist" and answers[2]["index"] == 2
+    assert answers[2]["answer"] is None and answers[2]["low_confidence"] is True
+    assert "Zorbex" not in answers[2]["hint"] and answers[2]["hint"]
+    # only the refusal wrote a code-only line, with the session id
+    refused = [r for r in world.shadow() if r.get("error_class")]
+    assert [r["error_class"] for r in refused] == ["refused_denylist"]
+    assert refused[0]["session"] == "conv_a"
+
+
+async def test_a_bad_fact_or_context_in_a_later_question_is_refused_alone(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    later = {
+        "kind": "yes_no",
+        "question": "Should I ask for review now?",
+        "facts": {"note": "ask Zorbex today"},
+    }
+    answers = (await client.post(URL, json={"questions": [YES, later]})).json()["answers"]
+    assert len(world.calls) == 1 and answers[1]["error"].startswith("refused_")
+    assert answers[0]["answer"] is True and "error" not in answers[0]
+
+
+async def test_a_batch_counts_as_one_failure_toward_the_breaker(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    world.status = 503
+    batch = {"questions": [YES] * 5}
+    answers = (await client.post(URL, json=batch)).json()["answers"]
+    assert len(world.calls) == 5 and all(a["error"] for a in answers)
+    assert ds._limits.errors == 1 and ds._limits.open_until == 0.0
+
+
+def test_the_concurrency_lets_a_full_batch_run_at_once() -> None:
+    assert ds.CONCURRENCY >= agent_judge.MAX_BATCH
+
+
+async def test_a_session_may_not_send_more_questions_than_its_minute_cap(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_DECISION_SESSION_QUESTIONS_MINUTE", "6")
+    assert len((await client.post(URL, json={"questions": [YES] * 5})).json()["answers"]) == 5
+    body = (await client.post(URL, json={"questions": [YES] * 2})).json()
+    assert all(a["error"] == "rate_limited" and a["retry_after_s"] >= 1 for a in body["answers"])
+    assert len(world.calls) == 5
+    assert (await client.post(URL, json=YES)).json()["answer"] is True  # the sixth still fits
+    # the refusal wrote one line per question in the refused batch
+    refused = [r for r in world.shadow() if r.get("error_class") == "rate_limited"]
+    assert len(refused) == 2 and all(r["session"] == "conv_a" for r in refused)
+
+
+def test_the_question_cap_counts_questions_not_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    agent_judge._calls.clear()
+    agent_judge._burst.clear()
+    agent_judge._questions.clear()
+    env = {"AE_DECISION_SESSION_QUESTIONS_MINUTE": "20"}
+    for i in range(4):
+        assert agent_judge.check_call("s", now=100.0 + i, environ=env, questions=5) is None
+    wait = agent_judge.check_call("s", now=105.0, environ=env, questions=1)
+    assert wait is not None and 50 <= wait <= 60
+    assert agent_judge.check_call("s", now=161.0, environ=env, questions=5) is None
+
+
+async def test_the_shadow_line_logs_the_final_low_confidence(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    await client.post(URL, json=YES)
+    world.answer = {"choice": "yes", "probabilities": {"yes": 0.55, "no": 0.45}}
+    body = (await client.post(URL, json=YES)).json()
+    rows = world.shadow()
+    assert [r["features"]["low_confidence"] for r in rows] == [False, body["low_confidence"]]
+    assert body["low_confidence"] is True
+
+
+async def test_a_batch_is_one_to_five_questions(client: httpx.AsyncClient, world: World) -> None:
+    assert (await client.post(URL, json={"questions": []})).status_code == 422
+    assert (await client.post(URL, json={"questions": [YES] * 6})).status_code == 422
+    assert (await client.post(URL, json={"questions": [YES] * 5})).status_code == 200
+    assert (await client.post(URL, json={"questions": [YES], **YES})).status_code == 422
+
+
+async def test_every_question_in_a_batch_is_copy_checked(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    batch = {
+        "questions": [
+            YES,
+            {
+                "kind": "yes_no",
+                "question": "check why the nightly refresh keeps failing for everyone",
+            },
+        ]
+    }
+    answers = (await client.post(URL, json=batch)).json()["answers"]
+    assert answers[0]["answer"] is True and answers[1]["error"] == "refused_passthrough"
+    assert len(world.calls) == 1
+
+
+async def test_a_429_answers_rate_limited_with_retry_after_and_spares_the_breaker(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+
+    def limited(req: httpx.Request) -> httpx.Response:
+        world.calls.append(json.loads(req.content))
+        return httpx.Response(429, headers={"Retry-After": "7"}, text="slow down")
+
+    monkeypatch.setattr(da, "_shared_transport", lambda: httpx.MockTransport(limited))
+    body = (await client.post(URL, json=YES)).json()
+    assert body["error"] == "rate_limited" and 1 <= body["retry_after_s"] <= 7
+    assert len(world.calls) == 1
+    # the wait holds the next calls back without a request, and never opens the breaker
+    for _ in range(6):
+        again = (await client.post(URL, json=YES)).json()
+        assert again["error"] == "rate_limited"
+    assert len(world.calls) == 1
+    assert ds._limits.errors == 0 and ds._limits.open_until == 0.0
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+
+
+def test_a_missing_or_bad_retry_after_uses_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+    da._note_rate_limit("soon")
+    assert 1 <= da.retry_after_s() <= da.DEFAULT_RETRY_S
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+    da._note_rate_limit("9999")
+    assert da.retry_after_s() <= da.MAX_RETRY_S
+    monkeypatch.setattr(da, "_throttle_until", 0.0)
+
+
+async def test_a_refusal_writes_one_line_with_the_code_and_role_only(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    await client.post(
+        URL, json={"kind": "yes_no", "question": "Should I use the key in `config`?"}
+    )
+    (row,) = world.shadow()
+    assert row["point"] == "agent_ask" and row["error_class"] == "refused_backtick"
+    assert set(row) == {"at", "point", "session", "features", "error_class"}
+    assert row["session"] == "conv_a"
+    assert set(row["features"]) == {"role"}
+
+
+# --- 2026-11-18: neutral questions are answered; risky ones stay refused ---------------------
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Retry the flaky test once? It failed on a timeout.",
+        "Pick the wall widget layout: grid or list?",
+        "Where should the fix be built?",
+        "Use the API or SSH to check the device?",
+        "Should I skip it? It's a small change and we don't need a review.",
+    ],
+)
+async def test_neutral_questions_are_answered(
+    client: httpx.AsyncClient, world: World, question: str
+) -> None:
+    body = {"kind": "yes_no", "question": question}
+    assert (await client.post(URL, json=body)).json()["answer"] is True
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Deploy now. Northwind. Fabrikam. Tailspin?",
+        "Ship it now? e.g. Fabrikam is waiting.",
+        "Is it ready... Fabrikam next?",
+        "Should I ask Dom before merge?",
+        "Should I ask O'Brien about it?",
+        "Should I read pass/fail from the log?",
+        "Should I open package.json now?",
+    ],
+)
+async def test_risky_questions_stay_refused(
+    client: httpx.AsyncClient, world: World, question: str
+) -> None:
+    body = {"kind": "yes_no", "question": question}
+    out = (await client.post(URL, json=body)).json()
+    assert out["error"].startswith("refused_") and out["hint"]
+    assert world.calls == []
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"kind": "yes_no", "question": "Rerun the slow suite now? it stalled on a network wait."},
+        {"kind": "yes_no", "question": "Bump the pin first, or rebase?"},
+        {
+            "kind": "yes_no",
+            "question": "Should I go on?",
+            "context": "Revert the last change before a retry",
+        },
+    ],
+)
+async def test_the_first_word_of_a_question_or_context_is_free(
+    client: httpx.AsyncClient, world: World, body: dict[str, Any]
+) -> None:
+    assert (await client.post(URL, json=body)).json()["answer"] is True
+
+
+@pytest.mark.parametrize(
+    ("body", "error"),
+    [
+        (
+            {"kind": "yes_no", "question": "Rerun now? Fabrikam asked for it."},
+            "refused_proper_noun",
+        ),
+        ({"kind": "yes_no", "question": "Ship it? Northwind."}, "refused_proper_noun"),
+        ({"kind": "yes_no", "question": "Is Northwind ready?"}, "refused_proper_noun"),
+        ({"kind": "yes_no", "question": "Zorbex needs a retry?"}, "refused_denylist"),
+        (
+            {"kind": "yes_no", "question": "Should I go on?", "context": "Rerun now? Fabrikam."},
+            "refused_proper_noun",
+        ),
+        (
+            {
+                "kind": "choice",
+                "question": "Which one fits?",
+                "options": [
+                    {"key": "a", "description": "Fabrikam"},
+                    {"key": "b", "description": "Skip it"},
+                ],
+            },
+            "refused_proper_noun",
+        ),
+        (
+            {"kind": "yes_no", "question": "Should I go on?", "facts": {"vendor": "Fabrikam"}},
+            "refused_proper_noun",
+        ),
+    ],
+)
+async def test_only_the_opening_word_is_free(
+    client: httpx.AsyncClient, world: World, body: dict[str, Any], error: str
+) -> None:
+    assert (await client.post(URL, json=body)).json()["error"] == error
+    assert world.calls == []
+
+
+async def test_a_level_of_a_name_stays_refused(client: httpx.AsyncClient, world: World) -> None:
+    body = {"kind": "score", "question": "How big is the risk?", "levels": ["low", "Fabrikam"]}
+    assert (await client.post(URL, json=body)).json()["error"] == "refused_proper_noun"
+
+
+async def test_a_contraction_passes_but_a_denylisted_possessive_does_not(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    ok = {"kind": "yes_no", "question": "Is it safe? It doesn't need the full suite."}
+    assert (await client.post(URL, json=ok)).json()["answer"] is True
+    bad = {"kind": "yes_no", "question": "Should I rebill zorbex's account?"}
+    assert (await client.post(URL, json=bad)).json()["error"] == "refused_denylist"
+
+
+async def test_a_key_inside_an_owner_message_passes_but_a_long_copy_does_not(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    world.messages = ["use the best model (opus, high) for the builder and keep going now"]
+    options = [
+        {"key": "opus_high", "description": "The strongest model"},
+        {"key": "sonnet_medium", "description": "The cheaper model"},
+    ]
+    body = {
+        "kind": "choice",
+        "question": "Which model should the builder use?",
+        "options": options,
+    }
+    assert not (await client.post(URL, json=body)).json().get("error", "").startswith("refused_")
+    copied = [
+        {"key": "use_the_best_model", "description": "Strong"},
+        {"key": "other", "description": "Cheaper"},
+    ]
+    body = {**body, "options": copied}
+    assert (await client.post(URL, json=body)).json()["error"] == "refused_key"
+
+
+async def test_a_long_transcript_is_read_and_answered(
+    client: httpx.AsyncClient, world: World
+) -> None:
+    world.messages = [f"owner message number {i}" for i in range(1500)]
+    assert (await client.post(URL, json=YES)).json()["answer"] is True
+
+
+async def test_a_read_past_the_budget_answers_no_transcript_and_logs_it(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(router_module, "JUDGE_READ_BUDGET_S", -1.0)
+    out = (await client.post(URL, json=YES)).json()
+    assert out["error"] == "no_transcript" and world.calls == []
+    assert [r["error_class"] for r in world.shadow()] == ["refused_no_transcript"]
+
+
+async def test_a_rate_limited_call_never_reads_the_transcript(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_DECISION_SESSION_MINUTE", "1")
+    assert (await client.post(URL, json=YES)).json()["answer"] is True
+    reads: list[str] = []
+
+    def spy(*_a: Any, **_k: Any) -> list[str]:
+        reads.append("read")
+        return ["x"]
+
+    monkeypatch.setattr(router_module, "_user_texts", spy)
+    assert (await client.post(URL, json=YES)).json()["error"] == "rate_limited"
+    assert reads == []
+
+
+async def test_a_judge_off_call_never_reads_the_transcript_or_logs(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("AE_DECISION_USERS", "someone-else")
+    reads: list[str] = []
+    monkeypatch.setattr(router_module, "_user_texts", lambda *_a, **_k: reads.append("r") or [])
+    assert (await client.post(URL, json=YES)).json()["error"] == "judge_off"
+    assert reads == [] and world.shadow() == []
+
+
+def test_the_owner_index_matches_the_old_rule_and_the_key_minimum() -> None:
+    index = da.OwnerIndex(["use the best model (opus, high) for it"])
+    assert da.passthrough("opus high", index)  # old rule (b)
+    assert not da.passthrough("opus high", index, inside_min=4)
+    assert da.passthrough("use the best model", index, inside_min=4)
+
+
+# --- review round 1 (2026-11-18) ---------------------------------------------------------
+
+
+class _Clock:
+    """A stand-in for ``router.time`` whose monotonic clock only moves when a test says so."""
+
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def __getattr__(self, name: str) -> Any:
+        import time as real
+
+        return getattr(real, name)
+
+
+async def test_a_failed_read_in_a_batch_answers_in_the_batch_shape(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(router_module, "JUDGE_READ_BUDGET_S", -1.0)
+    out = (await client.post(URL, json={"questions": [YES, YES]})).json()
+    assert [a["error"] for a in out["answers"]] == ["no_transcript", "no_transcript"]
+    assert world.calls == []
+
+
+async def test_the_clock_passing_the_deadline_during_the_last_page_read_fails_closed(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(router_module, "time", clock)
+    real = router_module.get_conversation_store()
+
+    class Slow:
+        def __getattr__(self, name: str) -> Any:
+            return getattr(real, name)
+
+        def list_items(self, sid: str, **kw: Any) -> Any:
+            page = real.list_items(sid, **kw)
+            clock.now += 100.0  # the read itself ran past the 8 second budget
+            return page
+
+    monkeypatch.setattr(router_module, "get_conversation_store", lambda: Slow())
+    out = (await client.post(URL, json=YES)).json()
+    assert out["error"] == "no_transcript" and world.calls == []
+
+
+async def test_the_clock_passing_the_deadline_during_an_ancestor_lookup_fails_closed(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = _Clock()
+    monkeypatch.setattr(router_module, "time", clock)
+    world.child_labels = {"ae.orch": "conv_lead"}
+    inner = router_module._conversation
+
+    async def slow(sid: str) -> Any:
+        conv = await inner(sid)
+        if sid == "conv_lead":
+            clock.now += 100.0
+        return conv
+
+    monkeypatch.setattr(router_module, "_conversation", slow)
+    out = (await client.post(URL, json=YES)).json()
+    assert out["error"] == "no_transcript" and world.calls == []
+
+
+async def test_repeated_failed_reads_never_become_rate_limited(
+    client: httpx.AsyncClient, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(router_module, "JUDGE_READ_BUDGET_S", -1.0)
+    monkeypatch.setenv("AE_DECISION_SESSION_MINUTE", "2")
+    monkeypatch.setenv("AE_DECISION_SESSION_QUESTIONS_MINUTE", "2")
+    for _ in range(6):
+        out = (await client.post(URL, json={"questions": [YES, YES]})).json()
+        assert out["answers"][0]["error"] == "no_transcript"
+    monkeypatch.setattr(router_module, "JUDGE_READ_BUDGET_S", 8.0)
+    assert (await client.post(URL, json=YES)).json()["answer"] is True
+
+
+def test_refund_call_undoes_one_check_call() -> None:
+    agent_judge._calls.clear()
+    agent_judge._burst.clear()
+    agent_judge._questions.clear()
+    env = {"AE_DECISION_SESSION_MINUTE": "1"}
+    assert agent_judge.check_call("s", now=1.0, environ=env, questions=3) is None
+    assert agent_judge.check_call("s", now=2.0, environ=env) is not None
+    agent_judge.refund_call("s", questions=3)
+    assert agent_judge.check_call("s", now=3.0, environ=env, questions=3) is None
+    agent_judge.refund_call("nobody")  # an unknown session is a no-op
+
+
+async def test_the_read_lock_table_is_bounded_and_busy_entries_stay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(router_module, "MAX_JUDGE_READ_LOCKS", 2)
+    router_module._JUDGE_READ_LOCKS.clear()
+    async with router_module._judge_read_slot("a"):
+        async with router_module._judge_read_slot("b"):
+            assert set(router_module._JUDGE_READ_LOCKS) == {"a", "b"}
+            async with router_module._judge_read_slot("c"):  # full of busy entries: no lock
+                assert set(router_module._JUDGE_READ_LOCKS) == {"a", "b"}
+    assert {k: v[1] for k, v in router_module._JUDGE_READ_LOCKS.items()} == {"a": 0, "b": 0}
+    async with router_module._judge_read_slot("c"):  # idle entries are evicted to make room
+        assert "c" in router_module._JUDGE_READ_LOCKS and len(router_module._JUDGE_READ_LOCKS) <= 2
+    router_module._JUDGE_READ_LOCKS.clear()
+
+
+def test_guard_summary_is_safe_from_many_threads() -> None:
+    import concurrent.futures
+
+    allow = da.DEFAULT_TERM_ALLOW
+
+    def work(i: int) -> bool:
+        return (
+            da.guard_summary(f"fix the {'x' * (i % 7)} thing", ["zorbex"], allow, []) is not None
+        )
+
+    old = da.MINTED_MAX
+    da.MINTED_MAX = 3
+    try:
+        with concurrent.futures.ThreadPoolExecutor(16) as pool:
+            assert all(pool.map(work, range(400)))
+    finally:
+        da.MINTED_MAX = old

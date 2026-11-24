@@ -6,7 +6,7 @@
 // cards cannot import the panel without a cycle. They read this module instead, and the panel
 // writes it.
 
-import { heldByWorkingChat, type AttentionItem, type AttentionOverview, type AttentionSource } from "./api";
+import { notCounted, type AttentionItem, type AttentionOverview, type AttentionSource } from "./api";
 import { el } from "./dom";
 
 /** The words for each source, as the panel's parent lines and the filter chip say them. */
@@ -15,12 +15,14 @@ export const SOURCE_NAMES: Record<AttentionSource, string> = {
   "git-mine": "My Git repos",
   box: "Box health",
   host: "Box host",
+  home: "Home security",
   cost: "Cost targets",
   databricks: "Databricks credit",
   secrets: "Secrets on box",
   vault: "Key Vault",
   accounts: "Accounts",
   family: "Spend families",
+  social: "Social posts",
 };
 
 interface Store {
@@ -91,6 +93,12 @@ export function sourceItems(source: AttentionSource): AttentionItem[] | null {
   return store.data ? store.data.items.filter((item) => item.source === source) : null;
 }
 
+/** The viewer's own login from the newest read (what an assignment's `to` is compared with), or undefined. */
+export const viewerLogin = (): string | undefined => store.data?.me;
+
+/** True when the page does not count *item* (a working chat holds it, or another admin has it). */
+export const uncounted = (item: AttentionItem): boolean => notCounted(item, viewerLogin());
+
 /** How many items *source* has in the panel list, held ones included, or null before the first read. */
 export function listedCount(source: AttentionSource): number | null {
   return sourceItems(source)?.length ?? null;
@@ -105,7 +113,7 @@ export function attentionCount(source: AttentionSource): number | null {
   const bucket = serverCounts(source);
   if (bucket) return bucket.urgent + bucket.review;
   const items = sourceItems(source);
-  return items ? items.filter((item) => !heldByWorkingChat(item)).length : null;
+  return items ? items.filter((item) => !uncounted(item)).length : null;
 }
 
 /** How many of *source*'s items are urgent (not held by a working chat), or null before the first read. */
@@ -113,7 +121,7 @@ export function urgentCount(source: AttentionSource): number | null {
   const bucket = serverCounts(source);
   if (bucket) return bucket.urgent;
   const items = sourceItems(source);
-  return items ? items.filter((item) => item.tone === "urgent" && !heldByWorkingChat(item)).length : null;
+  return items ? items.filter((item) => item.tone === "urgent" && !uncounted(item)).length : null;
 }
 
 /**

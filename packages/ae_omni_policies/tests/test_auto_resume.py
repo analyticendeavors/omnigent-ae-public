@@ -21,7 +21,7 @@ from omnigent.server.routes._sessions.common import (
     _session_status_cache,
 )
 
-from ae_omni_policies import auto_resume, labels
+from ae_omni_policies import auto_resume, background_shells, labels
 
 HOST = "a" * 32
 OTHER_HOST = "b" * 32
@@ -43,6 +43,13 @@ class World:
             return {"recovered": True}
 
         monkeypatch.setattr(auto_resume, "resume_interrupted_session", _resume)
+        self.woken: list[str] = []
+
+        async def _wake(session_id: str) -> str:
+            self.woken.append(session_id)
+            return "posted"
+
+        monkeypatch.setattr(background_shells, "wake", _wake)
 
         self.connected: set[str] = set()
 
@@ -198,6 +205,66 @@ async def test_the_deploy_sequence_resumes_on_the_restart_that_kills_the_runner(
     assert await world.connect() == [sid]
     assert world.resumed == [sid]
     assert world.store.get_conversation(sid).labels[labels.AUTORESUME] == "runner_old"
+
+
+@pytest.mark.asyncio
+async def test_an_idle_session_waiting_on_background_shells_gets_the_note_once(
+    world: World,
+) -> None:
+    # 2026-11-23: a planner's render shell died with the host while its session read idle.
+    waiting = world.session(status="idle", session_labels={labels.BG_SHELLS: "1"})
+    world.session(status="idle", session_labels={labels.BG_SHELLS: "0"})
+
+    assert await world.connect() == [waiting]
+    assert world.woken == [waiting]
+    assert world.resumed == []
+    assert world.store.get_conversation(waiting).labels[labels.AUTORESUME] == "runner_old"
+    assert await world.connect() == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("outcome", ["off", "HTTP 503: starting", "raise"])
+async def test_a_background_note_that_did_not_go_out_gives_the_try_back(
+    world: World,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    outcome: str,
+) -> None:
+    sid = world.session(status="idle", session_labels={labels.BG_SHELLS: "1"})
+
+    async def _failing(session_id: str) -> str:
+        if outcome == "raise":
+            raise RuntimeError("loopback refused")
+        return outcome
+
+    monkeypatch.setattr(background_shells, "wake", _failing)
+    with caplog.at_level(logging.WARNING, logger=auto_resume.__name__):
+        assert await world.connect() == [sid]
+    assert labels.AUTORESUME not in (world.store.get_conversation(sid).labels or {})
+    warned = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any(sid in line and "did not go out" in line for line in warned)
+
+    # The next connect, with the server up, posts the note and spends the try.
+    monkeypatch.setattr(background_shells, "wake", world_wake(world))
+    assert await world.connect() == [sid]
+    assert world.woken == [sid]
+    assert world.store.get_conversation(sid).labels[labels.AUTORESUME] == "runner_old"
+
+
+def world_wake(world: World) -> Any:
+    async def _wake(session_id: str) -> str:
+        world.woken.append(session_id)
+        return "posted"
+
+    return _wake
+
+
+@pytest.mark.asyncio
+async def test_background_shells_that_survived_the_restart_are_left_alone(world: World) -> None:
+    sid = world.session(status="idle", session_labels={labels.BG_SHELLS: "2"})
+    world.connected.add(sid)
+    assert await world.connect() == []
+    assert world.woken == []
 
 
 class Fakes:

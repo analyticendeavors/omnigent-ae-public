@@ -1,0 +1,436 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 17:09:02 -0800
+Subject: [PATCH 407/443] [ae-patch] Fix the review findings on 0406: own the
+ iOS audio session in the Voice hook
+
+The audio session was entered and left from the Voice store, so the new-chat start path released it when the start page unmounted, leaving a Voice chat that restored the session, and a plain snapshot read pinned it. It is now a reference count held by each mounted Voice chat through useAeVoiceMode; the start tap (new-chat Voice button, Voice switch) holds it inside the tap and the chat's hook adopts that hold, which expires after 30 seconds if no chat does. Leaving a Voice chat restores, and one chat turning Voice off no longer restores while another is on.
+---
+ web/src/components/AeSpeakRepliesButton.tsx   |   6 +-
+ .../useAeVoiceMode.audioSession.test.tsx      | 116 ++++++++++++++++++
+ web/src/hooks/useAeVoiceMode.ts               |  16 +++
+ web/src/lib/aeAudioSession.test.ts            |  48 +++++++-
+ web/src/lib/aeAudioSession.ts                 |  52 ++++++--
+ web/src/lib/aeVoiceMode.ts                    |  13 +-
+ 6 files changed, 230 insertions(+), 21 deletions(-)
+ create mode 100644 web/src/hooks/useAeVoiceMode.audioSession.test.tsx
+
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 0bd17bcb7076388d0f49449862fa95c5e84c61ee..bc710a3c516917e8d68d0c9f0db285b3a0154eb0 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -31,6 +31,7 @@ import {
+   useVoiceChoices,
+   VoiceChoiceRows,
+ } from "@/components/AeVoiceMenuRows";
++import { holdVoiceAudioSession } from "@/lib/aeAudioSession";
+ import { logVoice, requestVoiceLogInsert } from "@/lib/aeVoiceLog";
+ import {
+   clearVoiceModelState,
+@@ -333,7 +334,10 @@ function SpeakRepliesControl({
+   // Voice mode needs Speak replies, so turning it on turns that on too.
+   const toggleVoice = (next: boolean) => {
+     // Inside the tap: iOS refuses later playback unless a tap started audio.
+-    if (next) primeVoicePlayback();
++    if (next) {
++      primeVoicePlayback();
++      holdVoiceAudioSession();
++    }
+     if (next && !on) toggleSpeak(true);
+     setVoiceOn(chatId, next);
+   };
+diff --git a/web/src/hooks/useAeVoiceMode.audioSession.test.tsx b/web/src/hooks/useAeVoiceMode.audioSession.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7cc7f97376a97cbfd3175132644fd678c1592af7
+--- /dev/null
++++ b/web/src/hooks/useAeVoiceMode.audioSession.test.tsx
+@@ -0,0 +1,116 @@
++import { renderHook } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { resetAudioSessionState } from "@/lib/aeAudioSession";
++import { resetVoiceLog } from "@/lib/aeVoiceLog";
++import {
++  armVoiceForNextChat,
++  disarmVoiceForNextChat,
++  resetVoiceStore,
++  setVoiceOn,
++  takeVoiceArm,
++} from "@/lib/aeVoiceMode";
++import { useChatStore } from "@/store/chatStore";
++import { installFakeSpeech, removeFakeSpeech } from "@/test/fakeSpeech";
++import { useAeVoiceMode } from "./useAeVoiceMode";
++
++const IOS_UA =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1";
++
++const controller = {
++  current: {
++    start: vi.fn(),
++    stop: vi.fn(),
++    restart: vi.fn(),
++    isListening: () => false,
++    startPath: () => "browser" as const,
++  },
++};
++const submit = vi.fn();
++const session = () => (navigator as unknown as { audioSession: { type: string } }).audioSession;
++
++function mount(chatId: string) {
++  return renderHook(() =>
++    useAeVoiceMode({ controller, chatId, value: "", status: "idle", canSend: true, submit }),
++  );
++}
++
++let originalUa: PropertyDescriptor | undefined;
++beforeEach(() => {
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: IOS_UA });
++  Object.defineProperty(navigator, "audioSession", {
++    configurable: true,
++    writable: true,
++    value: { type: "auto" },
++  });
++  window.localStorage.clear();
++  resetAudioSessionState();
++  resetVoiceStore();
++  resetVoiceLog();
++  vi.stubGlobal(
++    "fetch",
++    vi.fn(() => Promise.resolve(new Response("{}", { status: 200 }))),
++  );
++  installFakeSpeech();
++  useChatStore.setState({ conversationId: "c1", blocks: [], status: "idle" } as never);
++});
++afterEach(() => {
++  vi.unstubAllGlobals();
++  removeFakeSpeech();
++  delete (navigator as { audioSession?: unknown }).audioSession;
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++describe("useAeVoiceMode audio session", () => {
++  it("new-chat path: arm, setVoiceOn, start page unmount keeps play-and-record while the new chat's Voice runs", () => {
++    armVoiceForNextChat();
++    // handleCreate reads the arm, the chat is created, Voice goes on, the landing unmounts.
++    takeVoiceArm();
++    setVoiceOn("new1", true);
++    disarmVoiceForNextChat();
++    expect(session().type).toBe("play-and-record");
++    const chat = mount("new1");
++    expect(session().type).toBe("play-and-record");
++    session().type = "playback";
++    chat.rerender();
++    chat.unmount();
++    expect(session().type).toBe("auto");
++  });
++
++  it("two mounted Voice chats: the first leaving does not restore", () => {
++    setVoiceOn("a", true);
++    setVoiceOn("b", true);
++    const a = mount("a");
++    const b = mount("b");
++    expect(session().type).toBe("play-and-record");
++    a.unmount();
++    expect(session().type).toBe("play-and-record");
++    b.unmount();
++    expect(session().type).toBe("auto");
++  });
++
++  it("turning chat B off while chat A is still on does not restore", () => {
++    setVoiceOn("a", true);
++    setVoiceOn("b", true);
++    mount("a");
++    const b = mount("b");
++    setVoiceOn("b", false);
++    b.rerender();
++    expect(session().type).toBe("play-and-record");
++  });
++
++  it("leaving a Voice-on chat (unmount) restores the type", () => {
++    setVoiceOn("a", true);
++    const a = mount("a");
++    expect(session().type).toBe("play-and-record");
++    a.unmount();
++    expect(session().type).toBe("auto");
++  });
++
++  it("a chat with Voice off holds nothing", () => {
++    const a = mount("off");
++    expect(session().type).toBe("auto");
++    a.unmount();
++  });
++});
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 03cc52eb138a9f3d57bb07a965ee4b7d7ab77286..c7f7d8fb07ca6bf8cf8565e809c126c03215394c 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -2,6 +2,11 @@
+ // grace sends the draft, the mic is muted from send until the reply has been spoken,
+ // and a pending question card is read aloud and answered by voice.
+ 
++import {
++  enterVoiceAudioSession,
++  leaveVoiceAudioSession,
++  releaseVoiceAudioHold,
++} from "@/lib/aeAudioSession";
+ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
+ import {
+   APPROVAL_TAIL_MS,
+@@ -209,6 +214,17 @@ export function useAeVoiceMode({
+     graceTimer.current = null;
+   }, []);
+ 
++  // This mounted chat's Voice mode holds the audio session (a count, so two Voice chats or a
++  // remount never restore it early). A start tap's hold (new-chat Voice button, Voice switch)
++  // is released only after this chat has entered, so the count never reaches zero between them.
++  // Reading a snapshot enters nothing; only a chat whose Voice runs here does.
++  useEffect(() => {
++    if (!on || chatId === null) return;
++    enterVoiceAudioSession();
++    releaseVoiceAudioHold();
++    return () => leaveVoiceAudioSession();
++  }, [on, chatId]);
++
+   // Another chat: nothing started for the old one may fire for the new one.
+   useEffect(
+     () => () => {
+diff --git a/web/src/lib/aeAudioSession.test.ts b/web/src/lib/aeAudioSession.test.ts
+index 39d0378beca91790fc5d30eb9d3b775d81dbf6a9..94b9c8b8a63480b3f22dd2c0fb90d87b86a1ba07 100644
+--- a/web/src/lib/aeAudioSession.test.ts
++++ b/web/src/lib/aeAudioSession.test.ts
+@@ -1,16 +1,19 @@
+-import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import {
+   assertVoiceAudioSession,
+   audioSessionType,
+   enterVoiceAudioSession,
+   leaveVoiceAudioSession,
++  PENDING_HOLD_MS,
+   resetAudioSessionState,
+ } from "./aeAudioSession";
+ import { formatVoiceLog, resetVoiceLog } from "./aeVoiceLog";
+ import {
+   armVoiceForNextChat,
+   disarmVoiceForNextChat,
++  getVoiceSnapshot,
+   resetVoiceStore,
++  takeVoiceArm,
+   setVoiceOn,
+ } from "./aeVoiceMode";
+ 
+@@ -67,7 +70,6 @@ describe("audio session pinning", () => {
+     setUa(IOS_UA);
+     setSession("ambient");
+     enterVoiceAudioSession();
+-    enterVoiceAudioSession();
+     leaveVoiceAudioSession();
+     expect(session().type).toBe("ambient");
+   });
+@@ -102,16 +104,54 @@ describe("audio session pinning", () => {
+     expect(audioSessionType()).toBe("none");
+   });
+ 
+-  it("follows Voice mode on and off, and the new-chat arm", () => {
++  it("restores only when the last holder leaves (two Voice chats)", () => {
+     setUa(IOS_UA);
+     setSession("auto");
+-    setVoiceOn("c1", true);
++    enterVoiceAudioSession();
++    enterVoiceAudioSession();
++    leaveVoiceAudioSession();
+     expect(session().type).toBe("play-and-record");
++    session().type = "playback";
++    assertVoiceAudioSession();
++    expect(session().type).toBe("play-and-record");
++    leaveVoiceAudioSession();
++    expect(session().type).toBe("auto");
++  });
++
++  it("setVoiceOn and a plain snapshot read never touch the session", () => {
++    setUa(IOS_UA);
++    setSession("auto");
++    window.localStorage.setItem("ae.voiceMode.c9", "1");
++    getVoiceSnapshot("c9");
++    getVoiceSnapshot("c1");
++    setVoiceOn("c1", true);
+     setVoiceOn("c1", false);
+     expect(session().type).toBe("auto");
++    expect(formatVoiceLog()).not.toContain("audio session");
++  });
++
++  it("the arm holds the session; disarm before a chat exists releases it", () => {
++    setUa(IOS_UA);
++    setSession("auto");
+     armVoiceForNextChat();
+     expect(session().type).toBe("play-and-record");
+     disarmVoiceForNextChat();
+     expect(session().type).toBe("auto");
+   });
++
++  it("a taken arm keeps its hold through the page's unmount disarm, and expires if unadopted", () => {
++    vi.useFakeTimers();
++    try {
++      setUa(IOS_UA);
++      setSession("auto");
++      armVoiceForNextChat();
++      takeVoiceArm();
++      disarmVoiceForNextChat();
++      expect(session().type).toBe("play-and-record");
++      vi.advanceTimersByTime(PENDING_HOLD_MS + 1);
++      expect(session().type).toBe("auto");
++    } finally {
++      vi.useRealTimers();
++    }
++  });
+ });
+diff --git a/web/src/lib/aeAudioSession.ts b/web/src/lib/aeAudioSession.ts
+index 632ab94fe0b8db1e94e290668705d27038a24337..9df02db79b8f2645c89cd47acbe02ed95edd9ed2 100644
+--- a/web/src/lib/aeAudioSession.ts
++++ b/web/src/lib/aeAudioSession.ts
+@@ -13,8 +13,15 @@ interface AudioSessionLike {
+ 
+ const VOICE_TYPE = "play-and-record";
+ 
+-let active = false;
++// Reference count of holders: each mounted Voice chat holds one, and a start tap holds one
++// (the "pending hold") until the chat's hook adopts it. The previous type is restored only when
++// the count returns to zero.
++let holders = 0;
+ let previousType: string | null = null;
++let pendingHold = false;
++let pendingTimer: ReturnType<typeof setTimeout> | null = null;
++/** A start tap's hold that no Voice chat adopted gives itself back after this long. */
++export const PENDING_HOLD_MS = 30_000;
+ 
+ function getSession(): AudioSessionLike | null {
+   try {
+@@ -46,24 +53,24 @@ export function audioSessionType(): string {
+   }
+ }
+ 
+-/** Voice mode started: remember the current type once and pin play-and-record. */
++/** One more holder: remember the current type on the first one and pin play-and-record. */
+ export function enterVoiceAudioSession(): void {
++  holders += 1;
+   const session = getSession();
+   if (!session) return;
+-  if (!active) {
++  if (holders === 1) {
+     try {
+       previousType = session.type;
+     } catch {
+       previousType = null;
+     }
+-    active = true;
+   }
+   setType(session, VOICE_TYPE);
+ }
+ 
+ /** Set it again (before a mic start, after a reply ends); WebKit may have changed it. */
+ export function assertVoiceAudioSession(): void {
+-  if (!active) return;
++  if (holders === 0) return;
+   const session = getSession();
+   if (!session) return;
+   try {
+@@ -74,18 +81,45 @@ export function assertVoiceAudioSession(): void {
+   setType(session, VOICE_TYPE);
+ }
+ 
+-/** Voice mode ended: put the type back as it was. */
++/** One holder fewer; the earlier type comes back only when the last one leaves. */
+ export function leaveVoiceAudioSession(): void {
+-  if (!active) return;
+-  active = false;
++  if (holders === 0) return;
++  holders -= 1;
++  if (holders > 0) return;
+   const session = getSession();
+   const restore = previousType ?? "auto";
+   previousType = null;
+   if (session) setType(session, restore);
+ }
+ 
++/**
++ * Called inside a user tap that will start Voice mode (the new-chat Voice button, the Voice
++ * switch), where iOS accepts the type change. The chat's Voice hook does not exist yet (or has
++ * not seen the switch), so this holds the session on its behalf; useAeVoiceMode enters for the
++ * chat and then calls releaseVoiceAudioHold, so the count never touches zero in between. A hold
++ * nobody adopts is released after PENDING_HOLD_MS.
++ */
++export function holdVoiceAudioSession(): void {
++  if (pendingHold) return;
++  pendingHold = true;
++  enterVoiceAudioSession();
++  pendingTimer = setTimeout(releaseVoiceAudioHold, PENDING_HOLD_MS);
++}
++
++/** Give back the tap's hold, if one is pending. */
++export function releaseVoiceAudioHold(): void {
++  if (!pendingHold) return;
++  pendingHold = false;
++  if (pendingTimer !== null) clearTimeout(pendingTimer);
++  pendingTimer = null;
++  leaveVoiceAudioSession();
++}
++
+ /** Test hook. */
+ export function resetAudioSessionState(): void {
+-  active = false;
++  holders = 0;
+   previousType = null;
++  pendingHold = false;
++  if (pendingTimer !== null) clearTimeout(pendingTimer);
++  pendingTimer = null;
+ }
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index c156cb3c28354878368904cd431acdc2f8289fee..124a05176eb6bd4a84d5b876901dc975274ce5d8 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -9,7 +9,7 @@ import {
+   parseAskUserQuestionPreview,
+ } from "./askUserQuestion";
+ import { notePlayback } from "./aeVoiceEcho";
+-import { enterVoiceAudioSession, leaveVoiceAudioSession } from "./aeAudioSession";
++import { holdVoiceAudioSession, releaseVoiceAudioHold } from "./aeAudioSession";
+ import { logVoice } from "./aeVoiceLog";
+ import { withBasePath } from "./basePath";
+ import type { AnyBlock, ElicitationBlock } from "./blocks";
+@@ -112,8 +112,6 @@ export function getVoiceSnapshot(chatId: string | null): VoiceSnapshot {
+   let state = states.get(chatId);
+   if (!state) {
+     const on = readVoiceMode(chatId);
+-    // A chat reopened with Voice mode still on needs the audio session pinned too.
+-    if (on) enterVoiceAudioSession();
+     state = { ...OFF, on, phase: on ? "starting" : "off" };
+     states.set(chatId, state);
+   }
+@@ -190,8 +188,6 @@ export function syncVoiceLabel(chatId: string, labelOn: boolean): void {
+ 
+ export function setVoiceOn(chatId: string, on: boolean): void {
+   logVoice(on ? "voice on" : "voice off");
+-  if (on) enterVoiceAudioSession();
+-  else leaveVoiceAudioSession();
+   writeVoiceMode(chatId, on);
+   patch(chatId, { on, phase: on ? "starting" : "off", barged: false });
+   void postVoiceLabel(chatId, on);
+@@ -234,12 +230,15 @@ let voiceArmed = false;
+ 
+ export function armVoiceForNextChat(): void {
+   voiceArmed = true;
+-  enterVoiceAudioSession();
++  // The audio session is held for the chat the page creates; its Voice hook adopts the hold.
++  holdVoiceAudioSession();
+ }
+ 
+ export function disarmVoiceForNextChat(): void {
++  // After takeVoiceArm the flag is already clear and the created chat owns the hold.
++  if (!voiceArmed) return;
+   voiceArmed = false;
+-  leaveVoiceAudioSession();
++  releaseVoiceAudioHold();
+ }
+ 
+ /** True once when the flag was armed; clears it. */

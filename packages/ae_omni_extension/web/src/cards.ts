@@ -266,7 +266,8 @@ function place(trigger: HTMLElement, menu: HTMLElement): void {
 
 /** How a menu's button looks and is named, when not the "..." of a session row. */
 export interface RowMenuTrigger {
-  icon?: SVGElement;
+  /** What the button shows: an icon, or a small span of icon, word and caret (the opened row's Snooze). */
+  icon?: SVGElement | HTMLElement;
   /** The button's accessible name; the menu takes it too. */
   label?: string;
   /** The tooltip; the items' names by default. */

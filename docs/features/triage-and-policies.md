@@ -13,6 +13,13 @@ Every session carries a status (working, blocked, review, parked or reference) a
 **Where:** The slots strip on the Session Dashboard, and Status on any session's menu.<br>
 **Built from:** core patches [`0001`](../../patches/0001-ae-patch-Show-the-ae.status-label-on-session-rows-an.patch), [`0004`](../../patches/0004-ae-patch-Add-a-Status-submenu-to-the-sidebar-session.patch), [`0035`](../../patches/0035-ae-patch-Count-only-unblocked-unfailed-working-sessi.patch), [`0190`](../../patches/0190-ae-patch-Count-working-helper-sessions-toward-the-sl.patch), [`0252`](../../patches/0252-ae-patch-Lay-the-slots-full-approval-card-out-as-a-d.patch), [`0253`](../../patches/0253-ae-patch-Fix-the-review-findings-on-the-slots-full-c.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
+## Long approval messages fold
+
+A policy's approval message can run to 15 lines, which pushed Approve and Reject off a phone screen. Since 2026-11-20 an approval card shows the first three lines with a Show more toggle when the message is longer, and Approve and Reject sit right under it; a message that fits shows no toggle. The answered card and the standalone approve page fold the same way. The slot cap's ask shows as its own card again instead of plain text.
+
+**Where:** Any approval card in a chat, and the approve page a notification opens.<br>
+**Built from:** core patches [`0433`](../../patches/0433-ae-patch-Fold-a-long-approval-message-to-three-lines.patch), [`0434`](../../patches/0434-ae-patch-Fix-the-review-findings-on-0433-show-the-ap.patch), [`0435`](../../patches/0435-ae-patch-Fold-a-long-approval-message-on-the-approve.patch)
+
 ## The fork gate
 
 <p align="center"><img src="../media/dashboard-your-move.webp" alt="The fork gate"></p>

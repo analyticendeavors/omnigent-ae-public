@@ -1,0 +1,700 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 20:15:55 -0800
+Subject: [PATCH 365/443] [ae-patch] Voice ring: teal bars while you talk, an
+ amber liquid ring while Rocky talks
+
+The Voice sheet circle gets a canvas ring. Bars follow the composer meter's frequency bins through a small bins store (no second mic stream); the liquid ring follows a synthetic envelope while the reply plays (the reply audio is not routed through an AudioContext). Honours reduced motion and stops while the page is hidden.
+---
+ web/src/components/AeVoicePanel.tsx      |  18 ++-
+ web/src/components/AeVoiceRing.test.tsx  | 149 +++++++++++++++++++++++
+ web/src/components/AeVoiceRing.tsx       | 131 ++++++++++++++++++++
+ web/src/components/ComposerMicButton.tsx |   3 +
+ web/src/index.css                        |   5 +
+ web/src/lib/aeVoiceLevel.test.ts         |  36 ++++++
+ web/src/lib/aeVoiceLevel.ts              |  37 ++++++
+ web/src/lib/aeVoiceRing.test.ts          |  39 ++++++
+ web/src/lib/aeVoiceRing.ts               | 145 ++++++++++++++++++++++
+ 9 files changed, 561 insertions(+), 2 deletions(-)
+ create mode 100644 web/src/components/AeVoiceRing.test.tsx
+ create mode 100644 web/src/components/AeVoiceRing.tsx
+ create mode 100644 web/src/lib/aeVoiceLevel.test.ts
+ create mode 100644 web/src/lib/aeVoiceLevel.ts
+ create mode 100644 web/src/lib/aeVoiceRing.test.ts
+ create mode 100644 web/src/lib/aeVoiceRing.ts
+
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index 9a1cb2415ca65af13bfa3832a86cd5f29262e30c..f08792d776ac93c5b2f88f9c2cee2ebf62230421 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -4,6 +4,7 @@
+ 
+ import { KeyboardIcon } from "lucide-react";
+ import { useEffect, useState } from "react";
++import { AeVoiceRing } from "@/components/AeVoiceRing";
+ import { Button } from "@/components/ui/button";
+ import { useMicLevel } from "@/lib/aeMicLevel";
+ import type { VoicePhase } from "@/lib/aeVoiceMode";
+@@ -136,6 +137,16 @@ const TONE: Record<VoicePhaseKey, { text: string; panel: string; ring: string; d
+   },
+ };
+ 
++/** The sheet circle's disc radius (size-20), in CSS px; the ring is drawn around it. */
++const SHEET_DISC_RADIUS = 40;
++
++/** The sheet draws the reply in amber, to match its liquid ring; the bar keeps blue. */
++const SHEET_SPEAKING = {
++  text: "text-amber-500",
++  ring: "border-amber-500/40",
++  disc: "bg-amber-500",
++};
++
+ const BAR_WEIGHTS = [0.6, 1, 0.8, 1, 0.7];
+ const BAR_MIN_PX = 4;
+ const BAR_MAX_PX = 16;
+@@ -234,7 +245,9 @@ export function AeVoicePanel({
+     return () => clearTimeout(t);
+   }, [key]);
+   if (key === "off") return null;
+-  const tone = TONE[key];
++  const tone =
++    layout === "sheet" && key === "speaking" ? { ...TONE[key], ...SHEET_SPEAKING } : TONE[key];
++  const ringMode = key === "listening" ? "bars" : key === "speaking" ? "liquid" : "idle";
+   // A server start is a model cold start that can take 40 s; a tap there would only get in its way.
+   const tapToStart =
+     key === "starting" && startStuck && Boolean(onRestartMic) && micStartPath?.() === "browser";
+@@ -279,8 +292,9 @@ export function AeVoicePanel({
+           type="button"
+           aria-label={actionLabel}
+           onClick={action}
+-          className="my-3 flex size-24 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
++          className="relative my-6 flex size-24 items-center justify-center rounded-full outline-none focus-visible:ring-2 focus-visible:ring-ring"
+         >
++          <AeVoiceRing mode={ringMode} radius={SHEET_DISC_RADIUS} pulseKey={caption} />
+           <span
+             data-testid="ae-voice-ring"
+             className={cn(
+diff --git a/web/src/components/AeVoiceRing.test.tsx b/web/src/components/AeVoiceRing.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7cefc452cecf12e053d0947ee76b500a46957d02
+--- /dev/null
++++ b/web/src/components/AeVoiceRing.test.tsx
+@@ -0,0 +1,149 @@
++import { act, render, screen } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { publishVoiceBins, resetVoiceBins } from "@/lib/aeVoiceLevel";
++import { AeVoiceRing } from "./AeVoiceRing";
++import { AeVoicePanel } from "./AeVoicePanel";
++
++function makeCtx() {
++  return {
++    setTransform: vi.fn(),
++    clearRect: vi.fn(),
++    beginPath: vi.fn(),
++    moveTo: vi.fn(),
++    lineTo: vi.fn(),
++    closePath: vi.fn(),
++    arc: vi.fn(),
++    stroke: vi.fn(),
++    lineCap: "",
++    strokeStyle: "",
++    lineWidth: 0,
++    globalAlpha: 1,
++  };
++}
++
++let ctx: ReturnType<typeof makeCtx>;
++let rafCallbacks: Map<number, FrameRequestCallback>;
++let nextId: number;
++let cancelSpy: ReturnType<typeof vi.fn>;
++
++function runFrame(now = 16) {
++  const entries = [...rafCallbacks.entries()];
++  rafCallbacks.clear();
++  for (const [, cb] of entries) cb(now);
++}
++
++function setReducedMotion(on: boolean) {
++  window.matchMedia = ((query: string) => ({
++    matches: on && query.includes("prefers-reduced-motion"),
++    media: query,
++    addEventListener: () => {},
++    removeEventListener: () => {},
++    addListener: () => {},
++    removeListener: () => {},
++    dispatchEvent: () => false,
++    onchange: null,
++  })) as typeof window.matchMedia;
++}
++
++beforeEach(() => {
++  ctx = makeCtx();
++  rafCallbacks = new Map();
++  nextId = 1;
++  cancelSpy = vi.fn((id: number) => rafCallbacks.delete(id));
++  vi.stubGlobal("requestAnimationFrame", (cb: FrameRequestCallback) => {
++    const id = nextId++;
++    rafCallbacks.set(id, cb);
++    return id;
++  });
++  vi.stubGlobal("cancelAnimationFrame", cancelSpy);
++  vi.spyOn(HTMLCanvasElement.prototype, "getContext").mockImplementation(
++    () => ctx as unknown as CanvasRenderingContext2D,
++  );
++  setReducedMotion(false);
++});
++
++afterEach(() => {
++  vi.unstubAllGlobals();
++  vi.restoreAllMocks();
++  resetVoiceBins();
++});
++
++describe("AeVoiceRing", () => {
++  it("draws on a canvas sized to the ring and keeps drawing frame after frame", () => {
++    render(<AeVoiceRing mode="bars" radius={40} />);
++    const canvas = screen.getByTestId("ae-voice-ring-canvas") as HTMLCanvasElement;
++    expect(canvas.style.width).toBe("168px");
++    expect(canvas).toHaveAttribute("data-mode", "bars");
++    expect(rafCallbacks.size).toBe(1);
++    runFrame();
++    expect(ctx.stroke).toHaveBeenCalled();
++    expect(rafCallbacks.size).toBe(1);
++  });
++
++  it("cancels its frame on unmount and stops scheduling", () => {
++    const { unmount } = render(<AeVoiceRing mode="liquid" radius={40} />);
++    runFrame();
++    expect(rafCallbacks.size).toBe(1);
++    unmount();
++    expect(cancelSpy).toHaveBeenCalled();
++    expect(rafCallbacks.size).toBe(0);
++  });
++
++  it("stops while the page is hidden and resumes when visible again", () => {
++    render(<AeVoiceRing mode="bars" radius={40} />);
++    Object.defineProperty(document, "hidden", { configurable: true, value: true });
++    document.dispatchEvent(new Event("visibilitychange"));
++    expect(rafCallbacks.size).toBe(0);
++    Object.defineProperty(document, "hidden", { configurable: true, value: false });
++    document.dispatchEvent(new Event("visibilitychange"));
++    expect(rafCallbacks.size).toBe(1);
++  });
++
++  it("reduced motion: no loop, one still ring whose brightness follows the mic", () => {
++    setReducedMotion(true);
++    const alphas: number[] = [];
++    ctx.stroke.mockImplementation(() => alphas.push(ctx.globalAlpha));
++    render(<AeVoiceRing mode="bars" radius={40} />);
++    expect(rafCallbacks.size).toBe(0);
++    expect(ctx.arc).toHaveBeenCalled();
++    expect(alphas[0]).toBeCloseTo(0.3);
++    act(() => publishVoiceBins(new Float32Array(32).fill(255)));
++    expect(rafCallbacks.size).toBe(0);
++    expect(alphas[alphas.length - 1]).toBeGreaterThan(0.9);
++  });
++});
++
++describe("AeVoicePanel ring", () => {
++  function sheet(phase: "listening" | "speaking" | "thinking") {
++    return render(
++      <AeVoicePanel
++        layout="sheet"
++        phase={phase}
++        blocked={false}
++        heard=""
++        caption="Hi."
++        onEnd={() => {}}
++        onStop={() => {}}
++        onResume={() => {}}
++      />,
++    );
++  }
++
++  it("chooses bars while listening, the liquid ring while speaking, idle otherwise", () => {
++    const first = sheet("listening");
++    expect(screen.getByTestId("ae-voice-ring-canvas")).toHaveAttribute("data-mode", "bars");
++    first.unmount();
++    const second = sheet("speaking");
++    expect(screen.getByTestId("ae-voice-ring-canvas")).toHaveAttribute("data-mode", "liquid");
++    second.unmount();
++    sheet("thinking");
++    expect(screen.getByTestId("ae-voice-ring-canvas")).toHaveAttribute("data-mode", "idle");
++  });
++
++  it("the canvas is inert: hidden from readers and never takes taps", () => {
++    sheet("listening");
++    const canvas = screen.getByTestId("ae-voice-ring-canvas");
++    expect(canvas).toHaveAttribute("aria-hidden", "true");
++    expect(canvas.className).toContain("pointer-events-none");
++  });
++});
+diff --git a/web/src/components/AeVoiceRing.tsx b/web/src/components/AeVoiceRing.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..492dd2e8535ddc4247184314553b96a289962005
+--- /dev/null
++++ b/web/src/components/AeVoiceRing.tsx
+@@ -0,0 +1,131 @@
++// The Voice circle's animated ring (omnigent-ae). Canvas only: it sits behind the
++// circle, takes no space and no taps. Bars follow the real mic bins, the liquid
++// ring follows a synthetic reply envelope (the reply <audio> is never routed
++// through an AudioContext). It draws only while mounted, visible and motion is allowed.
++
++import { useEffect, useRef } from "react";
++import { getVoiceBins, subscribeVoiceBins } from "@/lib/aeVoiceLevel";
++import {
++  binsLevel,
++  drawRing,
++  drawStaticRing,
++  newRingState,
++  RING_EXTENT,
++  type RingColors,
++  stepRing,
++  type VoiceRingMode,
++} from "@/lib/aeVoiceRing";
++
++export interface AeVoiceRingProps {
++  mode: VoiceRingMode;
++  /** Radius of the circle the ring surrounds, in CSS px. */
++  radius: number;
++  /** Changes when the reply moves to a new sentence; gives the ring a small bump. */
++  pulseKey?: string;
++}
++
++const COLOR_REFRESH_FRAMES = 60;
++
++function readColors(el: Element): RingColors {
++  const cs = getComputedStyle(el);
++  return {
++    teal: cs.getPropertyValue("--ae-voice-teal").trim() || "#3fa58e",
++    amber: cs.getPropertyValue("--ae-voice-amber").trim() || "#d98a2b",
++  };
++}
++
++export function AeVoiceRing({ mode, radius, pulseKey }: AeVoiceRingProps) {
++  const canvasRef = useRef<HTMLCanvasElement>(null);
++  const modeRef = useRef(mode);
++  modeRef.current = mode;
++  const stateRef = useRef(newRingState());
++  const pulseSeen = useRef(pulseKey);
++  if (pulseSeen.current !== pulseKey) {
++    pulseSeen.current = pulseKey;
++    stateRef.current.pulse = 1;
++  }
++  const size = Math.round(radius * RING_EXTENT * 2);
++
++  useEffect(() => {
++    const canvas = canvasRef.current;
++    if (!canvas) return;
++    const ctx = canvas.getContext("2d");
++    if (!ctx) return;
++    const dpr = Math.max(1, window.devicePixelRatio || 1);
++    canvas.width = Math.round(size * dpr);
++    canvas.height = Math.round(size * dpr);
++    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
++
++    const mq = window.matchMedia?.("(prefers-reduced-motion: reduce)");
++    let reduced = Boolean(mq?.matches);
++    let colors = readColors(canvas);
++    let raf: number | null = null;
++    let frames = 0;
++    const t0 = performance.now();
++
++    const drawStill = () => {
++      colors = readColors(canvas);
++      drawStaticRing(ctx, modeRef.current, binsLevel(getVoiceBins()), radius, colors);
++    };
++    const frame = (now: number) => {
++      raf = null;
++      if (document.hidden || reduced) return;
++      if (frames++ % COLOR_REFRESH_FRAMES === 0) colors = readColors(canvas);
++      const t = (now - t0) / 1000;
++      stepRing(stateRef.current, modeRef.current, t, getVoiceBins());
++      drawRing(ctx, stateRef.current, t, radius, colors);
++      raf = requestAnimationFrame(frame);
++    };
++    const start = () => {
++      if (raf !== null || document.hidden) return;
++      if (reduced) {
++        drawStill();
++        return;
++      }
++      raf = requestAnimationFrame(frame);
++    };
++    const stop = () => {
++      if (raf !== null) cancelAnimationFrame(raf);
++      raf = null;
++    };
++    const onVisibility = () => (document.hidden ? stop() : start());
++    const onMotion = () => {
++      reduced = Boolean(mq?.matches);
++      stop();
++      start();
++    };
++    // Reduced motion has no loop: a new mic frame or a mode change redraws the still ring.
++    const unsubscribe = subscribeVoiceBins(() => {
++      if (reduced && !document.hidden) drawStill();
++    });
++    document.addEventListener("visibilitychange", onVisibility);
++    mq?.addEventListener?.("change", onMotion);
++    start();
++    return () => {
++      stop();
++      unsubscribe();
++      document.removeEventListener("visibilitychange", onVisibility);
++      mq?.removeEventListener?.("change", onMotion);
++    };
++  }, [radius, size]);
++
++  // A mode change while still: redraw once. (Animated mode reads modeRef each frame.)
++  useEffect(() => {
++    const canvas = canvasRef.current;
++    const mq = window.matchMedia?.("(prefers-reduced-motion: reduce)");
++    if (!canvas || !mq?.matches) return;
++    const ctx = canvas.getContext("2d");
++    if (ctx) drawStaticRing(ctx, mode, binsLevel(getVoiceBins()), radius, readColors(canvas));
++  }, [mode, radius]);
++
++  return (
++    <canvas
++      ref={canvasRef}
++      aria-hidden
++      data-testid="ae-voice-ring-canvas"
++      data-mode={mode}
++      style={{ width: size, height: size }}
++      className="pointer-events-none absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"
++    />
++  );
++}
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 5a48953e0453b5e0454b41d9e13bc30bb52f1d03..e9a7de74d47322836138e38b5f6196386eb15034 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -6,6 +6,7 @@ import { useVoiceDictationHotkey } from "@/hooks/useVoiceDictationHotkey";
+ import { useServerInfo } from "@/lib/CapabilitiesContext";
+ import { getMicStream } from "@/lib/aeAudioDevices";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
++import { publishVoiceBins, resetVoiceBins } from "@/lib/aeVoiceLevel";
+ import { logVoice } from "@/lib/aeVoiceLog";
+ import { DictationBusyError, DictationSession } from "@/lib/dictation";
+ import { isElectronShell } from "@/lib/nativeBridge";
+@@ -769,6 +770,7 @@ export const ComposerMicButton = ({
+           if (el) el.style.transform = `scaleY(${scale})`;
+         }
+         publishMicLevel((total / BAR_BINS.length) * 1.6);
++        publishVoiceBins(data);
+         rafId = requestAnimationFrame(tick);
+       };
+       rafId = requestAnimationFrame(tick);
+@@ -785,6 +787,7 @@ export const ComposerMicButton = ({
+       if (stableTimer !== null) clearTimeout(stableTimer);
+       if (retryTimer !== null) clearTimeout(retryTimer);
+       resetMicLevel();
++      resetVoiceBins();
+       if (rafId !== null) cancelAnimationFrame(rafId);
+       if (stream) {
+         for (const track of stream.getTracks()) track.stop();
+diff --git a/web/src/index.css b/web/src/index.css
+index 897f8e542953ce04b621e9310cf3525a169cc765..7957608e9c0ec9a6efcd4160f097515ecade3da2 100644
+--- a/web/src/index.css
++++ b/web/src/index.css
+@@ -237,6 +237,9 @@
+      * that harmonizes with the brand blues (#2272b4 / #3b8ff5) and reads
+      * with strong contrast on the white card surface. */
+   --session-active: #2f7fd4;
++  /* Voice mode ring (omnigent-ae): teal for the user's voice, amber for the reply. */
++  --ae-voice-teal: #3fa58e;
++  --ae-voice-amber: #d98a2b;
+   /* Weaker panel border for low-contrast dividers. */
+   --border-weak: #ececee;
+   --button-icon-hover-color: #27272a;
+@@ -280,6 +283,8 @@
+      * the small dot keeps adequate contrast against the dark canvas (the
+      * light-mode #2f7fd4 reads too dim here). */
+   --session-active: #5ca4f5;
++  --ae-voice-teal: #5fd0b6;
++  --ae-voice-amber: #f0a85a;
+   /* Pink tag surface — a heavier wash than light, since 6% all but vanishes
+      * against the dark canvas. */
+   --tag-pink: rgba(240, 1, 150, 0.15);
+diff --git a/web/src/lib/aeVoiceLevel.test.ts b/web/src/lib/aeVoiceLevel.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..178fef4248ea39a74d8e36a6adf147d9f4789f3d
+--- /dev/null
++++ b/web/src/lib/aeVoiceLevel.test.ts
+@@ -0,0 +1,36 @@
++import { afterEach, describe, expect, it, vi } from "vitest";
++import {
++  getVoiceBins,
++  publishVoiceBins,
++  resetVoiceBins,
++  subscribeVoiceBins,
++  VOICE_BIN_COUNT,
++} from "./aeVoiceLevel";
++
++afterEach(() => resetVoiceBins());
++
++describe("aeVoiceLevel", () => {
++  it("stores byte data as 0 to 1 and clamps", () => {
++    publishVoiceBins(Uint8Array.from([255, 51, 0]));
++    const bins = getVoiceBins();
++    expect(bins.length).toBe(VOICE_BIN_COUNT);
++    expect(bins[0]).toBe(1);
++    expect(bins[1]).toBeCloseTo(0.2);
++    expect(bins[2]).toBe(0);
++    publishVoiceBins([999, Number.NaN]);
++    expect(getVoiceBins()[0]).toBe(1);
++    expect(getVoiceBins()[1]).toBe(0);
++  });
++
++  it("notifies subscribers on write and reset, and stops after unsubscribe", () => {
++    const cb = vi.fn();
++    const off = subscribeVoiceBins(cb);
++    publishVoiceBins([10]);
++    resetVoiceBins();
++    expect(cb).toHaveBeenCalledTimes(2);
++    expect(getVoiceBins()[0]).toBe(0);
++    off();
++    publishVoiceBins([10]);
++    expect(cb).toHaveBeenCalledTimes(2);
++  });
++});
+diff --git a/web/src/lib/aeVoiceLevel.ts b/web/src/lib/aeVoiceLevel.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..31ae3dd176a47dbc1ea858a1cf094e05b911d029
+--- /dev/null
++++ b/web/src/lib/aeVoiceLevel.ts
+@@ -0,0 +1,37 @@
++// The mic's frequency bins for the Voice ring (omnigent-ae). The composer's mic
++// meter already reads an AnalyserNode every frame; it writes the bins here and the
++// ring reads them in its own animation frame, so there is one mic stream only.
++// Not throttled and not a React store: the ring pulls, nothing re-renders.
++
++/** The analyser runs fftSize 64, so 32 bins. */
++export const VOICE_BIN_COUNT = 32;
++
++const bins = new Float32Array(VOICE_BIN_COUNT);
++const listeners = new Set<() => void>();
++
++/** Write one frame of byte frequency data (0 to 255 per bin); stored as 0 to 1. */
++export function publishVoiceBins(data: ArrayLike<number>): void {
++  for (let i = 0; i < VOICE_BIN_COUNT; i += 1) {
++    const v = i < data.length ? data[i] / 255 : 0;
++    bins[i] = Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0;
++  }
++  listeners.forEach((cb) => cb());
++}
++
++/** The mic stopped: every bin back to zero. */
++export function resetVoiceBins(): void {
++  bins.fill(0);
++  listeners.forEach((cb) => cb());
++}
++
++/** The live bins. Read-only by convention; copy before keeping. */
++export function getVoiceBins(): Readonly<Float32Array> {
++  return bins;
++}
++
++export function subscribeVoiceBins(cb: () => void): () => void {
++  listeners.add(cb);
++  return () => {
++    listeners.delete(cb);
++  };
++}
+diff --git a/web/src/lib/aeVoiceRing.test.ts b/web/src/lib/aeVoiceRing.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..98d648891359c4e1dfa4cea523bf81e83068f298
+--- /dev/null
++++ b/web/src/lib/aeVoiceRing.test.ts
+@@ -0,0 +1,39 @@
++import { describe, expect, it } from "vitest";
++import { binsLevel, newRingState, RING_BARS, replyEnvelopeTarget, stepRing } from "./aeVoiceRing";
++
++const loud = new Float32Array(32).fill(0.8);
++const quiet = new Float32Array(32);
++
++describe("aeVoiceRing", () => {
++  it("bars rise with mic bins in bars mode and stay flat otherwise", () => {
++    const s = newRingState();
++    for (let i = 0; i < 40; i += 1) stepRing(s, "bars", i / 60, loud);
++    expect(s.bars[0]).toBeGreaterThan(0.5);
++    expect(s.barsAlpha).toBeGreaterThan(0.95);
++    const t = newRingState();
++    for (let i = 0; i < 40; i += 1) stepRing(t, "liquid", i / 60, loud);
++    expect(Math.max(...t.bars)).toBeLessThan(0.01);
++  });
++
++  it("the bars are mirrored about the vertical axis", () => {
++    const s = newRingState();
++    const ramp = Float32Array.from({ length: 32 }, (_, i) => i / 40);
++    for (let i = 0; i < 40; i += 1) stepRing(s, "bars", i / 60, ramp);
++    expect(s.bars[3]).toBeCloseTo(s.bars[RING_BARS - 1 - 3]);
++  });
++
++  it("the reply envelope runs only in liquid mode and a pulse lifts it", () => {
++    const s = newRingState();
++    for (let i = 0; i < 60; i += 1) stepRing(s, "idle", i / 60, quiet);
++    expect(s.env).toBeLessThan(0.01);
++    for (let i = 0; i < 60; i += 1) stepRing(s, "liquid", i / 60, quiet);
++    expect(s.env).toBeGreaterThan(0.2);
++    expect(replyEnvelopeTarget(0, 1)).toBeGreaterThan(replyEnvelopeTarget(0, 0));
++    expect(replyEnvelopeTarget(1.3, 1)).toBeLessThanOrEqual(1);
++  });
++
++  it("binsLevel is the clamped voice-band mean", () => {
++    expect(binsLevel(quiet)).toBe(0);
++    expect(binsLevel(new Float32Array(32).fill(1))).toBe(1);
++  });
++});
+diff --git a/web/src/lib/aeVoiceRing.ts b/web/src/lib/aeVoiceRing.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac8092c5a088aac94550fd5b5ccb943ee08d2695
+--- /dev/null
++++ b/web/src/lib/aeVoiceRing.ts
+@@ -0,0 +1,145 @@
++// Drawing for the Voice ring (omnigent-ae): teal radial bars that rise from the
++// circle edge while you talk, an amber liquid ring while Rocky talks. Pure
++// functions of a state object, so the component only owns the loop.
++
++import { VOICE_BIN_COUNT } from "@/lib/aeVoiceLevel";
++
++export type VoiceRingMode = "bars" | "liquid" | "idle";
++
++export const RING_BARS = 48;
++/** Usable bins: voice sits below about 12 kHz of the 32. */
++const USABLE_BINS = 20;
++
++export interface RingColors {
++  teal: string;
++  amber: string;
++}
++
++export interface RingState {
++  /** Smoothed bar heights, 0 to 1. */
++  bars: Float32Array;
++  /** Smoothed synthetic reply envelope, 0 to 1. */
++  env: number;
++  /** Bump from a new caption sentence, decays on its own. */
++  pulse: number;
++  /** Eased layer opacities. */
++  barsAlpha: number;
++  liquidAlpha: number;
++}
++
++export function newRingState(): RingState {
++  return { bars: new Float32Array(RING_BARS), env: 0, pulse: 0, barsAlpha: 0.3, liquidAlpha: 0.2 };
++}
++
++/** Mean voice-band level of the mic bins, 0 to 1. */
++export function binsLevel(bins: ArrayLike<number>): number {
++  let sum = 0;
++  const n = Math.min(USABLE_BINS, bins.length, VOICE_BIN_COUNT);
++  for (let i = 1; i < n; i += 1) sum += bins[i];
++  return n > 1 ? Math.min(1, (sum / (n - 1)) * 1.6) : 0;
++}
++
++/** The synthetic reply envelope: smooth noise plus the sentence bump. */
++export function replyEnvelopeTarget(t: number, pulse: number): number {
++  return Math.min(
++    1,
++    0.35 + 0.45 * Math.abs(Math.sin(t * 2.3) * Math.sin(t * 0.9 + 1)) + 0.25 * pulse,
++  );
++}
++
++/** One animation step; t is seconds. Mutates the state. */
++export function stepRing(
++  s: RingState,
++  mode: VoiceRingMode,
++  t: number,
++  bins: ArrayLike<number>,
++): void {
++  // The ring is symmetric about the vertical axis: bar i and its mirror share a bin.
++  for (let i = 0; i < RING_BARS; i += 1) {
++    const k = i < RING_BARS / 2 ? i : RING_BARS - 1 - i;
++    const bin = 1 + Math.floor((k / (RING_BARS / 2)) * (USABLE_BINS - 1));
++    const raw = mode === "bars" ? Math.min(0.85, (bins[bin] ?? 0) * 1.5) : 0;
++    s.bars[i] += (raw - s.bars[i]) * 0.3;
++  }
++  const target = mode === "liquid" ? replyEnvelopeTarget(t, s.pulse) : 0;
++  s.env += (target - s.env) * 0.12;
++  s.pulse *= 0.94;
++  const barsTarget = mode === "bars" ? 1 : 0.3;
++  const liquidTarget = mode === "liquid" ? 1 : 0.2;
++  s.barsAlpha += (barsTarget - s.barsAlpha) * 0.12;
++  s.liquidAlpha += (liquidTarget - s.liquidAlpha) * 0.12;
++}
++
++/** Sizes in units of the disc radius R. */
++const BAR_INNER = 1.275;
++const BAR_MAX = 0.55;
++const LIQUID_BASE = 1.55;
++const LIQUID_AMP = 0.22;
++const LIQUID_GAP = 0.1;
++/** Half the canvas, in R. */
++export const RING_EXTENT = 2.1;
++
++export function drawRing(
++  ctx: CanvasRenderingContext2D,
++  s: RingState,
++  t: number,
++  R: number,
++  colors: RingColors,
++): void {
++  const cx = R * RING_EXTENT;
++  const cy = cx;
++  ctx.clearRect(0, 0, cx * 2, cy * 2);
++  const spin = t * 0.25;
++  ctx.lineCap = "round";
++  ctx.strokeStyle = colors.teal;
++  ctx.globalAlpha = s.barsAlpha;
++  ctx.lineWidth = Math.max(2, R * 0.075);
++  for (let i = 0; i < RING_BARS; i += 1) {
++    const a = spin + (i / RING_BARS) * Math.PI * 2;
++    const r0 = R * BAR_INNER;
++    const r1 = r0 + 2 + s.bars[i] * R * BAR_MAX;
++    ctx.beginPath();
++    ctx.moveTo(cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
++    ctx.lineTo(cx + Math.cos(a) * r1, cy + Math.sin(a) * r1);
++    ctx.stroke();
++  }
++  ctx.strokeStyle = colors.amber;
++  for (let layer = 0; layer < 2; layer += 1) {
++    ctx.beginPath();
++    const steps = 120;
++    for (let j = 0; j <= steps; j += 1) {
++      const b = (j / steps) * Math.PI * 2;
++      const wob = Math.sin(b * 5 + t * (layer ? -1.6 : 2.1)) * 0.5 + Math.sin(b * 3 - t) * 0.5;
++      const rr =
++        R * (LIQUID_BASE + layer * LIQUID_GAP) + s.env * R * LIQUID_AMP * (0.6 + 0.4 * wob);
++      const x = cx + Math.cos(b) * rr;
++      const y = cy + Math.sin(b) * rr;
++      if (j === 0) ctx.moveTo(x, y);
++      else ctx.lineTo(x, y);
++    }
++    ctx.closePath();
++    ctx.globalAlpha = s.liquidAlpha * (layer ? 0.38 : 1);
++    ctx.lineWidth = layer ? Math.max(1.5, R * 0.05) : Math.max(2, R * 0.065);
++    ctx.stroke();
++  }
++  ctx.globalAlpha = 1;
++}
++
++/** Reduced motion: one still circle whose brightness carries the state. */
++export function drawStaticRing(
++  ctx: CanvasRenderingContext2D,
++  mode: VoiceRingMode,
++  level: number,
++  R: number,
++  colors: RingColors,
++): void {
++  const cx = R * RING_EXTENT;
++  ctx.clearRect(0, 0, cx * 2, cx * 2);
++  ctx.beginPath();
++  ctx.arc(cx, cx, R * (mode === "liquid" ? LIQUID_BASE : BAR_INNER + 0.1), 0, Math.PI * 2);
++  ctx.strokeStyle = mode === "liquid" ? colors.amber : colors.teal;
++  ctx.lineWidth = Math.max(2, R * 0.07);
++  ctx.globalAlpha = mode === "idle" ? 0.25 : mode === "liquid" ? 0.9 : 0.3 + 0.7 * level;
++  ctx.stroke();
++  ctx.globalAlpha = 1;
++}

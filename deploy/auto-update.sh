@@ -96,10 +96,15 @@ if ! [[ "$PAUSE_GAP" =~ ^[0-9]+$ ]] || [ "$PAUSE_GAP" -lt 1200 ]; then
   PAUSE_GAP=1800
 fi
 BUSY_TIMEOUT="${AE_AUTO_UPDATE_BUSY_TIMEOUT:-30}"
+# Where Claude Code keeps its per-process status files, and the /proc to read
+# (both test overrides; background_shell_count, below).
+CLAUDE_SESSIONS="${AE_AUTO_UPDATE_CLAUDE_SESSIONS:-$HOME/.claude/sessions}"
+PROC_ROOT="${AE_AUTO_UPDATE_PROC:-/proc}"
 # The deploy hold's reader (a test override, like BUSY_CMD; empty means the
 # compose exec in read_deploy_hold). It shares BUSY_TIMEOUT.
 HOLD_CMD="${AE_AUTO_UPDATE_DEPLOY_HOLD:-}"
 COMPOSE="$ROOT/deploy/compose.sh"
+AE_GATE="${AE_GATE:-/usr/local/sbin/ae-gate}"
 # The image comes from config/server.env (AE_IMAGE, the same line the compose
 # overlay interpolates), read once setting() exists.
 IMAGE=""
@@ -334,11 +339,71 @@ busy_count() {
     timeout "$BUSY_TIMEOUT" "$BUSY_CMD"
     return
   fi
+  # Root hardening: with the root-owned gate installed this is its `omnigent busy` verb (the
+  # query is fixed in the gate). The direct call below is removed after the cutover.
+  if [ -x "$AE_GATE" ]; then
+    timeout "$BUSY_TIMEOUT" sudo -n "$AE_GATE" omnigent busy
+    return
+  fi
   # shellcheck disable=SC2016
   timeout "$BUSY_TIMEOUT" "$COMPOSE" exec -T postgres sh -c 'exec psql -X -At -v ON_ERROR_STOP=1 -U "$POSTGRES_USER" -d "$POSTGRES_DB" -c "SELECT count(*) FROM omnigent_conversation_metadata WHERE live_status IN (2, 3) AND runner_last_seen >= extract(epoch from now())::bigint - 300"'
 }
 
-# wait_for_quiet FILE KEY: added 2026-10-17. A deploy that restarts the
+# background_shell_count: added 2026-11-23. How many runner-launched Claude
+# sessions ended their turn with a background shell still running (Claude's
+# status file reads "shell"), on stdout. Those sessions read idle to the
+# server, so busy_count leaves them out, but a host restart kills the shell
+# and its completion notice never arrives: on 2026-11-23 a planner that
+# launched a 20-minute render with run_in_background and ended its turn
+# sat dead for five hours after the 00:57Z restart. A file counts when its
+# process is alive and was started by an omnigent runner (its environment
+# carries OMNIGENT_TERMINAL_LAUNCH_SESSION_ID); a Claude started by hand in
+# a terminal does not die with the host and does not count. A server-only
+# deploy leaves runners and their shells alone, so only a pass that restarts
+# the host asks (wait_for_quiet's third argument). A reused pid must not
+# revive a stale file: the file's "pid" must name its own process, and its
+# "procStart" (Claude writes the process start time in clock ticks) must equal
+# field 22 of /proc/<pid>/stat; a file without procStart counts only when it
+# was written after that process started.
+background_shell_count() {
+  local f pid n=0 stat rest start want tick btime
+  local -a fields
+  for f in "$CLAUDE_SESSIONS"/*.json; do
+    [ -r "$f" ] || continue
+    grep -Eq '"status" *: *"shell"' "$f" || continue
+    pid="$(basename "$f" .json)"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    if grep -Eq '"pid" *: *[0-9]' "$f" && ! grep -Eq "\"pid\" *: *$pid([^0-9]|\$)" "$f"; then
+      continue
+    fi
+    stat="$(cat "$PROC_ROOT/$pid/stat" 2>/dev/null)" || continue
+    rest="${stat##*) }"
+    read -ra fields <<<"$rest"
+    start="${fields[19]:-}"
+    [[ "$start" =~ ^[0-9]+$ ]] || continue
+    want="$(grep -Eo '"procStart" *: *"?[0-9]+' "$f" | grep -Eo '[0-9]+$')" || want=""
+    if [ -n "$want" ]; then
+      [ "$want" = "$start" ] || continue
+    else
+      tick="$(getconf CLK_TCK 2>/dev/null)" || tick=100
+      btime="$(awk '$1 == "btime" { print $2 }' "$PROC_ROOT/stat" 2>/dev/null)" || btime=""
+      [[ "$btime" =~ ^[0-9]+$ ]] || continue
+      [ "$(stat -c %Y "$f")" -ge $((btime + start / tick)) ] || continue
+    fi
+    grep -qz '^OMNIGENT_TERMINAL_LAUNCH_SESSION_ID=' <"$PROC_ROOT/$pid/environ" 2>/dev/null \
+      || continue
+    n=$((n + 1))
+  done
+  printf '%s\n' "$n"
+}
+
+# host_restart_due: whether this pass's deploy rebuilds and restarts the host
+# (step 10): the host code moved between the tags, or a rebuild is pending.
+host_restart_due() {
+  [ -n "$HOST_REBUILD" ] && { [ -e "$HOST_PENDING" ] || host_moved; }
+}
+
+# wait_for_quiet FILE KEY [host]: added 2026-10-17. A deploy that restarts the
 # host ends every turn in flight ("The connection to the host dropped
 # unexpectedly"), and the server restart may as well; on 2026-10-17 three
 # merges between 06:30 and 07:10 PDT cut every live session three times.
@@ -361,13 +426,20 @@ busy_count() {
 # so a pass that fails after the go-ahead (an image not published yet, a
 # failed pull or rebuild) does not buy busy sessions another two hours. A
 # count that fails or is not a number goes ahead as before, with a note: a
-# broken query must not stall every release.
+# broken query must not stall every release. With a third argument `host`
+# (the pass restarts the host), sessions waiting on a background shell count
+# too (background_shell_count).
 DEFER_DETAIL=""
 wait_for_quiet() {
-  local file="$1" key="$2" count now since held_key="" held_since=""
+  local file="$1" key="$2" count now since held_key="" held_since="" shells=0 shell_note=""
   if ! count="$(busy_count)" || ! [[ "$count" =~ ^[0-9]+$ ]]; then
     note "could not count the sessions mid-turn (got: ${count:-nothing}); going ahead as before the wait existed"
     return 0
+  fi
+  if [ "${3:-}" = host ]; then
+    shells="$(background_shell_count)"
+    count=$((count + shells))
+    [ "$shells" -eq 0 ] || shell_note=" ($shells of them waiting on a background shell the host restart would kill)"
   fi
   if [ "$count" -eq 0 ]; then
     rm -f "$file"
@@ -387,10 +459,10 @@ wait_for_quiet() {
     printf '%s %s\n' "$key" "$now" >"$file.tmp" && mv "$file.tmp" "$file"
   fi
   if [ $((now - since)) -ge "$MAX_DEFER" ]; then
-    note "$count session(s) still mid-turn after $(((now - since) / 60)) minutes of waiting on $key; going ahead anyway"
+    note "$count session(s) still mid-turn$shell_note after $(((now - since) / 60)) minutes of waiting on $key; going ahead anyway"
     return 0
   fi
-  DEFER_DETAIL="$count session(s) mid-turn; waiting since $(date -u -d "@$since" +%H:%MZ) on $key, and it goes ahead anyway at $(date -u -d "@$((since + MAX_DEFER))" +%H:%MZ)"
+  DEFER_DETAIL="$count session(s) mid-turn$shell_note; waiting since $(date -u -d "@$since" +%H:%MZ) on $key, and it goes ahead anyway at $(date -u -d "@$((since + MAX_DEFER))" +%H:%MZ)"
   return 1
 }
 
@@ -400,6 +472,11 @@ wait_for_quiet() {
 read_deploy_hold() {
   if [ -n "$HOLD_CMD" ]; then
     timeout "$BUSY_TIMEOUT" "$HOLD_CMD"
+    return
+  fi
+  # Root hardening: under the gate this is `omnigent deploy-hold` (same output, same exit 2).
+  if [ -x "$AE_GATE" ]; then
+    timeout "$BUSY_TIMEOUT" sudo -n "$AE_GATE" omnigent deploy-hold
     return
   fi
   timeout "$BUSY_TIMEOUT" "$COMPOSE" exec -T omnigent python -m ae_omni_policies.deploy_hold
@@ -474,7 +551,7 @@ retry_host_pending() {
     status host-deferred "host-pending (${tag:-no tag named}) not retried: the host code in $REPO (${HOST_PATHS[*]}) is not the running tag $FROM's, and building it would put the host ahead of the server; the pass that deploys the checkout's tag rebuilds it"
     return 0
   fi
-  if ! wait_for_quiet "$DEFERRED_HOST" "${tag:-unnamed}"; then
+  if ! wait_for_quiet "$DEFERRED_HOST" "${tag:-unnamed}" host; then
     status deferred "the host rebuild pending for ${tag:-no tag named} is not retried yet: $DEFER_DETAIL"
     return 0
   fi
@@ -531,6 +608,11 @@ finish() {
 run_dump() {
   if [ -n "$DUMP_CMD" ]; then
     "$DUMP_CMD"
+    return
+  fi
+  # Root hardening: under the gate the same pg_dump streams from `omnigent pg-dump --stdout`.
+  if [ -x "$AE_GATE" ]; then
+    sudo -n "$AE_GATE" omnigent pg-dump --stdout
     return
   fi
   # shellcheck disable=SC2016
@@ -637,7 +719,11 @@ if busy="$(checkout_busy)"; then
   fail busy "$busy; nothing was deployed or reset. Commit, stash or switch back to $BRANCH there (it should be a clone nobody works in, deploy/README.md), and the next pass deploys $TO"
 fi
 
-if ! wait_for_quiet "$DEFERRED" "$FROM"; then
+RESTARTS_HOST=""
+if host_restart_due; then
+  RESTARTS_HOST=host
+fi
+if ! wait_for_quiet "$DEFERRED" "$FROM" "$RESTARTS_HOST"; then
   finish deferred "$DEFER_DETAIL"
 fi
 
@@ -646,7 +732,19 @@ run_git merge --ff-only --quiet "refs/remotes/origin/$BRANCH" \
 run_git submodule update --init --quiet \
   || fail git-failed "git submodule update --init failed in $REPO: $GIT_ERROR"
 
-if ! pull_out="$(docker pull --quiet "$IMAGE:$TO" 2>&1)"; then
+# Root hardening: with the root-owned gate installed this is `omnigent check-tag TO` (exit 0
+# published, 3 not published yet, anything else an error; no pull, no restart), here where the old
+# pull ran. The pull itself happens inside `omnigent deploy` below, before it stops anything. The
+# docker pull arm is removed after the cutover.
+if [ -x "$AE_GATE" ]; then
+  check_rc=0
+  sudo -n "$AE_GATE" omnigent check-tag "$TO" >/dev/null 2>&1 || check_rc=$?
+  case "$check_rc" in
+    0) ;;
+    3) finish waiting "$IMAGE:$TO is not published yet (image.yml still running?)" ;;
+    *) fail pull-failed "ae-gate omnigent check-tag $TO failed (exit $check_rc)" ;;
+  esac
+elif ! pull_out="$(docker pull --quiet "$IMAGE:$TO" 2>&1)"; then
   case "$pull_out" in
     *"manifest unknown"* | *"not found"* | *"manifest for"*)
       finish waiting "$IMAGE:$TO is not published yet (image.yml still running?)"
@@ -665,7 +763,7 @@ fi
 
 # Asked again here: the pull and the dump can take minutes, and a turn
 # started meanwhile would be cut by the restart below.
-if ! wait_for_quiet "$DEFERRED" "$FROM"; then
+if ! wait_for_quiet "$DEFERRED" "$FROM" "$RESTARTS_HOST"; then
   finish deferred "$DEFER_DETAIL"
 fi
 
@@ -683,7 +781,21 @@ fi
 printf '%s\n' "$FROM" >"$STATE_DIR/previous"
 note "deploying $TO (was $FROM)"
 set_tag "$TO"
-if "$COMPOSE" up -d --remove-orphans && healthy; then
+# Root hardening: the gate's `omnigent deploy` exits 4 when it refused before touching the stack
+# (not signed, not on main, tag lower than the pin, pull failure). The server is still on $FROM
+# with its pin unchanged, so there is nothing to roll back: put the settings file back and report
+# it as a pull failure, which backs off like one.
+deploy_rc=0
+if [ -x "$AE_GATE" ]; then
+  sudo -n "$AE_GATE" omnigent deploy "$TO" || deploy_rc=$?
+else
+  "$COMPOSE" up -d --remove-orphans || deploy_rc=$?
+fi
+if [ "$deploy_rc" -eq 4 ] && [ -x "$AE_GATE" ]; then
+  set_tag "$FROM"
+  fail pull-failed "ae-gate omnigent deploy $TO refused before touching the stack (exit 4); still on $FROM (journalctl --user -u ae-omnigent-auto-update for the E_ code)"
+fi
+if [ "$deploy_rc" -eq 0 ] && healthy; then
   rm -f "$STATE_DIR/failed" "$DEFERRED"
   if [ -n "$HOST_REBUILD" ] && { [ -e "$HOST_PENDING" ] || host_moved; }; then
     note "the host's code moved between $FROM and $TO (or a rebuild was pending); rebuilding the host to match the server"
@@ -698,7 +810,20 @@ fi
 printf 'AUTO-UPDATE: %s is unhealthy; rolling back to %s\n' "$TO" "$FROM" >&2
 printf '%s\n' "$TO" >"$STATE_DIR/failed"
 set_tag "$FROM"
-if "$COMPOSE" up -d --remove-orphans && healthy; then
+# Root hardening: the gate's `omnigent rollback` restores the previous pin and brings it up. The
+# settings file above is still put back, so the next pass reads the right running tag.
+# Exit 5 means the gate holds no previous pin (the first deploy after the cutover), so there is
+# nothing it can bring back.
+rollback_rc=0
+if [ -x "$AE_GATE" ]; then
+  sudo -n "$AE_GATE" omnigent rollback || rollback_rc=$?
+else
+  "$COMPOSE" up -d --remove-orphans || rollback_rc=$?
+fi
+if [ "$rollback_rc" -eq 0 ] && healthy; then
   fail rolled-back "$TO failed its health check; back on $FROM (deploy/compose.sh logs omnigent for why)"
+fi
+if [ "$rollback_rc" -eq 5 ] && [ -x "$AE_GATE" ]; then
+  fail rollback-failed "$TO failed its health check and the gate holds no previous pin to roll back to; the server may be DOWN (deploy/README.md, Rollback)"
 fi
 fail rollback-failed "$TO failed its health check and $FROM did not come back healthy either; the server is DOWN (deploy/README.md, Rollback)"

@@ -1,0 +1,404 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 14:48:49 -0800
+Subject: [PATCH 417/443] [ae-patch] Fix the review findings on 0414: skip the
+ refusal dismissal for a stale auto token, normalize the trigger, add tests
+
+A PreCompact trigger=auto token can sit unused for hours, so a refused manual /compact armed a dismissal that posted a spurious failed. The pending token now carries its trigger and the refusal path skips auto tokens. The hook record keeps only auto and manual triggers. Tests cover auto then a transcript summary, a synchronous auto compaction, auto then manual, trigger parsing and the state round trip. Comments updated.
+---
+ omnigent/harnesses/claude_native/bridge.py    |  17 ++-
+ omnigent/harnesses/claude_native/forwarder.py |  25 ++-
+ .../forwarder/test_compaction_hooks.py        | 144 ++++++++++++++++++
+ .../forwarder/test_compaction_recovery.py     |  34 +++++
+ .../test_claude_native_bridge.py              |  27 ++++
+ 5 files changed, 237 insertions(+), 10 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 1e0931806dac00e9fc738d1fef8e5ef171810afa..092b71cbfd55377662b11931894f56d121c5994e 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -2463,12 +2463,13 @@ def build_hook_settings(
+             {"matcher": "EnterWorktree|ExitWorktree", "hooks": [hook]},
+         ],
+         # ``PreCompact`` fires right before Claude compacts its own
+-        # context — for both a manual ``/compact`` (web-UI button or
+-        # typed) and an automatic context-overflow compaction. The
+-        # forwarder translates it into a
+-        # ``response.compaction.in_progress`` SSE so the web UI shows
+-        # its "Compacting conversation…" spinner while Claude runs the
+-        # real compaction in the terminal. The matching completion
++        # context — for a manual ``/compact`` (web-UI button or typed)
++        # and also, with ``trigger=auto``, when Claude starts
++        # precomputing a summary in the background. Only a non-auto
++        # ``PreCompact`` is translated into a
++        # ``response.compaction.in_progress`` SSE (the web UI's
++        # "Compacting conversation…" spinner); an auto one posts no
++        # status but still mints the pending boundary token. The matching completion
+         # signal is ``SessionStart`` with ``source == "compact"`` (no
+         # dedicated PreCompact-done hook exists), already wired above.
+         "PreCompact": [{"hooks": [hook]}],
+@@ -4022,7 +4023,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+         else None,
+         source=raw_source if isinstance(raw_source, str) and raw_source else None,
+         trigger=(
+-            raw_trigger if event_name == "PreCompact" and isinstance(raw_trigger, str) else None
++            raw_trigger
++            if event_name == "PreCompact" and raw_trigger in ("auto", "manual")
++            else None
+         ),
+         claude_session_id=(
+             raw_claude_session_id
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 24e777150aa05ea08f6042845773b8f3c9c9dca6..9a8669a2a1f1c8393fa9105634ba75cd5cefab05 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -543,12 +543,18 @@ class _PendingCompaction:
+         correlation with wildcard semantics.
+     :param seen_at: Unix timestamp the ``PreCompact`` was observed, e.g.
+         ``1779922393.2``. Diagnostic only.
++    :param trigger: ``PreCompact`` trigger the token was minted from, e.g.
++        ``"auto"`` or ``"manual"``; ``None`` when unknown. An ``auto`` token
++        may sit unused for hours (Claude's background precompute is never
++        applied), so it must not arm a spinner dismissal on a refused manual
++        ``/compact``.
+     """
+ 
+     seq: int
+     claude_session_id: str | None = None
+     transcript_path: str | None = None
+     seen_at: float | None = None
++    trigger: str | None = None
+ 
+ 
+ @dataclass(frozen=True)
+@@ -4141,8 +4147,8 @@ async def _forward_available_status_events(
+                             extra={"session_id": session_id},
+                         )
+                 if record.event_name == "PreCompact":
+-                    # Every ``PreCompact`` (manual or auto) mints a durable pending token that the
+-                    # completion signal (transcript ``isCompactSummary`` or
++                    # Every ``PreCompact`` (manual or auto) mints a durable
++                    # pending token that the completion signal (transcript ``isCompactSummary`` or
+                     # this hook's ``SessionStart source=compact``) consumes,
+                     # so exactly one boundary persists per compaction. Keyed
+                     # by ``event_cursor`` so the pre-items prescan (which may
+@@ -4157,6 +4163,7 @@ async def _forward_available_status_events(
+                             else None
+                         ),
+                         event_cursor=record.event_cursor,
++                        trigger=record.trigger,
+                     )
+                 elif compaction_status == "completed":
+                     # Secondary, best-effort persist. The transcript's
+@@ -4886,7 +4893,10 @@ async def _forward_available_items(
+         # forwards below as a ``slash_command`` bubble carrying the text.
+         if item.is_compact_noop:
+             refused = _read_compaction_state(bridge_dir).pending
+-            if refused is not None:
++            # An ``auto`` token is Claude's background precompute: it raised
++            # no spinner, so a refused manual ``/compact`` has nothing of its
++            # own to dismiss and must not post a spurious ``failed``.
++            if refused is not None and refused.trigger != "auto":
+                 dedupe.pending_compaction_dismiss_seq = refused.seq
+         if skip_user_messages and item.item_type == "message" and item.data.get("role") == "user":
+             seen_source_ids.append(item.source_id)
+@@ -5199,6 +5209,7 @@ async def _prescan_precompact_edges(
+                 str(record.transcript_path) if record.transcript_path is not None else None
+             ),
+             event_cursor=record.event_cursor,
++            trigger=record.trigger,
+         )
+ 
+ 
+@@ -6734,11 +6745,13 @@ def _read_compaction_state(bridge_dir: Path) -> CompactionForwardState:
+             sid = pending_raw.get("claude_session_id")
+             tpath = pending_raw.get("transcript_path")
+             seen_at = pending_raw.get("seen_at")
++            ptrigger = pending_raw.get("trigger")
+             pending = _PendingCompaction(
+                 seq=seq,
+                 claude_session_id=sid if isinstance(sid, str) else None,
+                 transcript_path=tpath if isinstance(tpath, str) else None,
+                 seen_at=seen_at if isinstance(seen_at, (int, float)) else None,
++                trigger=ptrigger if isinstance(ptrigger, str) else None,
+             )
+     return CompactionForwardState(
+         pending=pending,
+@@ -6775,6 +6788,8 @@ def _write_compaction_state(bridge_dir: Path, state: CompactionForwardState) ->
+             pending_payload["transcript_path"] = state.pending.transcript_path
+         if state.pending.seen_at is not None:
+             pending_payload["seen_at"] = state.pending.seen_at
++        if state.pending.trigger is not None:
++            pending_payload["trigger"] = state.pending.trigger
+         payload["pending"] = pending_payload
+     _write_json_atomic(bridge_dir / _COMPACTION_STATE_FILE, payload)
+ 
+@@ -6785,6 +6800,7 @@ async def _note_precompact(
+     claude_session_id: str | None,
+     transcript_path: str | None,
+     event_cursor: int | None = None,
++    trigger: str | None = None,
+ ) -> None:
+     """
+     Record that a ``PreCompact`` fired, minting a fresh pending token.
+@@ -6809,6 +6825,8 @@ async def _note_precompact(
+     :param transcript_path: Claude transcript path from the hook, or ``None``.
+     :param event_cursor: Hook ``event_cursor`` of this ``PreCompact`` record,
+         or ``None`` to always mint (no idempotency key).
++    :param trigger: ``PreCompact`` trigger from the hook (``"auto"`` or
++        ``"manual"``), or ``None`` when absent.
+     :returns: None.
+     """
+ 
+@@ -6827,6 +6845,7 @@ async def _note_precompact(
+                     claude_session_id=claude_session_id,
+                     transcript_path=transcript_path,
+                     seen_at=time.time(),
++                    trigger=trigger,
+                 ),
+                 last_seq=next_seq,
+                 persisted_seqs=state.persisted_seqs,
+diff --git a/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py b/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py
+index e5da231488e43b6cf0d3dd49028550e76030a3c2..c667f12eac9f4a074b2bdc7bc3b5bf5c45ddf15f 100644
+--- a/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py
++++ b/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py
+@@ -493,8 +493,11 @@ async def test_auto_precompact_posts_no_status_but_mints_token_and_persists_once
+                 if state.pending is not None:
+                     break
+             state = forwarder._read_compaction_state(bridge_dir)
++            # Settle: a late status post (a regression) would land within a few polls.
++            await asyncio.sleep(0.2)
+             # The token is minted even though no status was posted.
+             assert state.pending is not None
++            assert state.pending.trigger == "auto"
+             assert state.last_seq == 1
+             assert not any(
+                 r["body"].get("type") == "external_compaction_status"
+@@ -578,3 +581,144 @@ async def test_manual_precompact_still_posts_in_progress_and_mints_token(
+         "data": {"status": "in_progress"},
+     }
+     assert forwarder._read_compaction_state(bridge_dir).pending is not None
++
++
++async def _run_forwarder_until_settled(
++    bridge_dir: Path, session_id: str, persist_mock: AsyncMock
++) -> list[dict[str, object]]:
++    """
++    Run the forwarder over the hooks already written, then return posted statuses.
++
++    :param bridge_dir: Bridge directory holding the hook records.
++    :param session_id: Omnigent session id to forward into.
++    :param persist_mock: Mock standing in for ``_persist_native_compaction_item``.
++    :returns: The ``data["status"]`` values of every posted compaction status, in order.
++    """
++    server, thread, base_url = _start_recording_server()
++    with patch(
++        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
++        persist_mock,
++    ):
++        task = asyncio.create_task(
++            forwarder.forward_claude_transcript_to_session(
++                base_url=base_url,
++                headers={},
++                session_id=session_id,
++                bridge_dir=bridge_dir,
++                agent_name="claude-native-ui",
++                start_at_end=False,
++                poll_interval_s=0.01,
++            )
++        )
++        try:
++            await asyncio.sleep(0.5)
++        finally:
++            task.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await task
++            server.shutdown()
++            server.server_close()
++            thread.join(timeout=5.0)
++    return [
++        r["body"]["data"]["status"]
++        for r in list(server.requests.queue)
++        if r["body"].get("type") == "external_compaction_status"
++    ]
++
++
++def _write_session_start(bridge_dir: Path, transcript_path: Path) -> None:
++    """
++    Record a plain ``SessionStart`` so the forwarder learns the transcript path.
++
++    :param bridge_dir: Bridge directory.
++    :param transcript_path: Empty transcript file path.
++    :returns: None.
++    """
++    transcript_path.write_text("", encoding="utf-8")
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "SessionStart",
++            "session_id": "claude-session",
++            "transcript_path": str(transcript_path),
++        },
++    )
++
++
++@pytest.mark.asyncio
++async def test_synchronous_auto_compaction_in_one_poll_persists_once(tmp_path: Path) -> None:
++    """
++    ``PreCompact`` auto plus ``SessionStart source=compact`` in one poll persists once.
++
++    When Claude compacts synchronously at the window, both hooks can land in
++    the same poll. The auto ``PreCompact`` posts no ``in_progress``, the
++    ``SessionStart`` posts ``completed``, and exactly one boundary persists.
++    """
++    bridge_dir = tmp_path / "bridge"
++    _write_session_start(bridge_dir, tmp_path / "session.jsonl")
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "PreCompact", "trigger": "auto", "session_id": "claude-session"},
++    )
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "SessionStart", "source": "compact", "session_id": "claude-session"},
++    )
++    persist_mock = AsyncMock(return_value=None)
++
++    statuses = await _run_forwarder_until_settled(bridge_dir, "conv_sync_auto", persist_mock)
++
++    assert statuses == ["completed"]
++    persist_mock.assert_called_once()
++
++
++@pytest.mark.asyncio
++async def test_auto_token_then_manual_compact_yields_one_boundary(tmp_path: Path) -> None:
++    """
++    An unused auto token followed by a manual ``/compact`` is one compaction.
++
++    The manual ``PreCompact`` supersedes the stale auto token, so the strip
++    shows one ``in_progress`` and one ``completed`` and a single boundary
++    persists.
++    """
++    bridge_dir = tmp_path / "bridge"
++    _write_session_start(bridge_dir, tmp_path / "session.jsonl")
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "PreCompact", "trigger": "auto", "session_id": "claude-session"},
++    )
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "PreCompact", "trigger": "manual", "session_id": "claude-session"},
++    )
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "SessionStart", "source": "compact", "session_id": "claude-session"},
++    )
++    persist_mock = AsyncMock(return_value=None)
++
++    statuses = await _run_forwarder_until_settled(bridge_dir, "conv_auto_manual", persist_mock)
++
++    assert statuses == ["in_progress", "completed"]
++    persist_mock.assert_called_once()
++
++
++def test_pending_compaction_trigger_round_trips_through_state(tmp_path: Path) -> None:
++    """
++    The pending token keeps its trigger across the durable state file.
++
++    The refusal path reads the token back from disk, so a lost trigger would
++    re-arm the spurious dismissal for an auto token.
++    """
++    bridge_dir = tmp_path / "bridge"
++    forwarder._write_compaction_state(
++        bridge_dir,
++        forwarder.CompactionForwardState(
++            pending=forwarder._PendingCompaction(seq=1, trigger="auto"),
++            last_seq=1,
++        ),
++    )
++
++    assert forwarder._read_compaction_state(bridge_dir).pending == forwarder._PendingCompaction(
++        seq=1, trigger="auto"
++    )
+diff --git a/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py b/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py
+index be026209735349eb815bdf030272fa7bec981de6..cf7e8a4b6449ccfe0cc4a0471d0bb968b87075da 100644
+--- a/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py
++++ b/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py
+@@ -348,6 +348,40 @@ async def test_missing_compact_session_start_still_persists_from_transcript(
+     assert 1 in state.persisted_seqs
+ 
+ 
++@pytest.mark.asyncio
++async def test_auto_precompact_then_transcript_summary_persists_once(tmp_path: Path) -> None:
++    """
++    An auto ``PreCompact`` token plus a transcript summary persists one boundary.
++
++    No ``SessionStart source=compact`` hook fires; the transcript's
++    ``isCompactSummary`` record alone consumes the auto token, and a second
++    delivery of the same summary does not persist again.
++    """
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    await forwarder._note_precompact(
++        bridge_dir, claude_session_id="claude-1", transcript_path=None, trigger="auto"
++    )
++
++    persist = _persist_mock()
++    with patch(
++        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item", persist
++    ):
++        for _ in range(2):
++            await forwarder._handle_compact_summary_item(
++                AsyncMock(),
++                session_id="conv_auto_summary",
++                bridge_dir=bridge_dir,
++                item=_compact_summary_item("auto summary"),
++                retry_tracker=forwarder._PostRetryTracker(),
++            )
++
++    persist.assert_called_once()
++    state = forwarder._read_compaction_state(bridge_dir)
++    assert state.pending is None
++    assert 1 in state.persisted_seqs
++
++
+ @pytest.mark.asyncio
+ async def test_normal_hook_after_transcript_does_not_double_persist(tmp_path: Path) -> None:
+     """
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 9d0678dcdb6f1d81abfc8ce9304dd61e5b15632a..f4cd27858ce3f819bf6e903365885464e6234dd2 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -2564,6 +2564,33 @@ def test_read_transcript_items_since_parses_interruption_queued_prompt(tmp_path:
+     assert current_response_id == items[5].response_id
+ 
+ 
++@pytest.mark.parametrize(
++    ("raw_trigger", "expected"),
++    [("auto", "auto"), ("manual", "manual"), ("", None), (None, None), ("weird", None), (7, None)],
++)
++def test_precompact_trigger_parsing(
++    tmp_path: Path, raw_trigger: object, expected: str | None
++) -> None:
++    """
++    A ``PreCompact`` record keeps only the known ``auto`` and ``manual`` triggers.
++
++    Empty, missing, non-string and unknown values parse to ``None`` so callers
++    never branch on a value Claude Code might add later.
++    """
++    bridge_dir = tmp_path / "bridge"
++    bridge_dir.mkdir()
++    payload: dict[str, object] = {"hook_event_name": "PreCompact"}
++    if raw_trigger is not None:
++        payload["trigger"] = raw_trigger
++    (bridge_dir / "hooks.jsonl").write_text(
++        json.dumps({"payload": payload}) + "\n", encoding="utf-8"
++    )
++
++    result = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0)
++
++    assert [record.trigger for record in result.records] == [expected]
++
++
+ def test_read_hook_events_from_offset_skips_existing_prefix(
+     tmp_path: Path,
+     monkeypatch: pytest.MonkeyPatch,

@@ -33,8 +33,10 @@ import asyncio
 import hashlib
 import json
 import logging
+import math
 import os
 import re
+import threading
 import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
@@ -68,6 +70,16 @@ DEFAULT_TERM_ALLOW = frozenset(
      "readme", "python", "javascript", "typescript", "github", "docker", "linux"}
 )  # fmt: skip
 
+# Generic tech acronyms an agent may write in all capitals ("SSH", "CLI"). Lower-case words never
+# trip the name check, and a capitalised "Dom" is still a name; only the all-caps form passes
+# (2026-11-18).
+ACRONYM_ALLOW = frozenset(
+    {"ssh", "http", "https", "cli", "sdk", "dns", "tls", "ssl", "jwt", "oauth", "oidc", "csv",
+     "pdf", "svg", "png", "npm", "pnpm", "git", "cdn", "vm", "gpu", "cpu", "os", "id", "ids",
+     "ip", "tcp", "db", "qa", "dom", "aria", "js", "ts", "jsx", "tsx", "toml", "env", "cron",
+     "regex", "utc", "ok", "todo", "api", "apis"}
+)  # fmt: skip
+
 # A scheme, www, or any domain-shaped token (two letters or more per label, so "e.g." and
 # versions such as "v1.2" or "3.11" pass).
 _URL = re.compile(r"(https?:|www\.|\b[^\W\d_]{2,}(?:\.[^\W\d_]{2,})+\b)", re.IGNORECASE)
@@ -76,6 +88,8 @@ _PATH = re.compile(r"(^|\s)[~.]?/\w|\\\w|\w/\w")
 _DIGITS = re.compile(r"\d{4,}")
 _DIGIT_GROUP = re.compile(r"\d+(?:[ .\-]\d+)+")  # "555 12 34", "12-34-56-78"
 _QUOTES = re.compile(r"[\"'‘’“”]")
+# An apostrophe between two letters is a contraction (don't, it's), not a quote.
+_CONTRACTION = re.compile(r"(?<=[^\W\d_])['’](?=[^\W\d_])")
 _WORD = re.compile(r"[^\W\d_][\w+#-]*")
 # Words that may start a summary without being names (lower case).
 LEADING_WORDS = frozenset(
@@ -194,26 +208,48 @@ def _name_like(
     *,
     first_word_free: bool = False,
     leading: frozenset[str] = LEADING_WORDS,
+    sentence_starts: bool = False,
+    acronyms: frozenset[str] = frozenset(),
+    opening_free: bool = False,
 ) -> bool:
     """True when *text* holds a capitalized word that is not an allowed term.
 
     The first word of the text is checked too, unless it is a common leading word or allowed
     (``first_word_free`` skips it, and the first word after a full stop, for owner-written
     preset text). A one-letter token is never a name. A capital after a hyphen counts.
+    ``sentence_starts`` lets the first word after a sentence end pass too, but only when it is
+    a *leading* word (never a free pass); ``acronyms`` pass only when written in all capitals.
+    ``opening_free`` frees only the first word of the whole text, whatever it is, when it is a
+    plain word (a capital, then lower case only; the part before any hyphen). Later sentence
+    starts keep their rule. A word reached only by masking an allowed phrase is never the
+    opener. For an agent's question.
     """
+    # The opener is found on the original text: a word reached only by masking an allowed
+    # phrase ("Power BI Fabrikam") is never the opener. Masking keeps every offset.
+    head = _WORD.search(text)
+    opener = head.start() if head and not text[: head.start()].strip() else -1
     for phrase in sorted((a for a in allow if " " in a), key=len, reverse=True):
-        text = re.sub(rf"(?<!\w){re.escape(phrase)}(?!\w)", " ", text, flags=re.IGNORECASE)
+        text = re.sub(
+            rf"(?<!\w){re.escape(phrase)}(?!\w)",
+            lambda m: " " * len(m.group(0)),
+            text,
+            flags=re.IGNORECASE,
+        )
     for match in _WORD.finditer(text):
         word = match.group(0)
+        opening = match.start() == opener
         first = not text[: match.start()].strip() or (
-            first_word_free and SENTENCE_END.search(text[: match.start()]) is not None
+            (first_word_free or sentence_starts)
+            and SENTENCE_END.search(text[: match.start()]) is not None
         )
         parts = word.split("-")
         for n, part in enumerate(parts):
             if len(part) < 2 or not part[0].isupper():
                 continue
             lowered = part.lower()
-            if lowered in allow:
+            if lowered in allow or (lowered in acronyms and part.isupper()):
+                continue
+            if n == 0 and opening and opening_free and part.isalpha() and part[1:].islower():
                 continue
             if n == 0 and first and (first_word_free or lowered in leading):
                 continue
@@ -238,41 +274,72 @@ def _words(text: str) -> list[str]:
     return _NON_WORD.sub(" ", text.lower()).split()
 
 
-def passthrough(field: str, user_messages: Iterable[str]) -> bool:
+class OwnerIndex:
+    """The owner's words, split once per call so each field is checked against a prepared set.
+
+    ``blob`` holds every message as padded words joined by ``|`` (a field has no ``|``, so a
+    match never spans two messages); ``wholes`` are the padded messages of two or more words;
+    ``grams`` are every :data:`PASSTHROUGH_RUN`-word run.
+    """
+
+    def __init__(self, messages: Iterable[str]) -> None:
+        padded: set[str] = set()
+        self.wholes: set[str] = set()
+        self.grams: set[tuple[str, ...]] = set()
+        for message in messages:
+            theirs = _words(message)
+            if not theirs:
+                continue
+            text = f" {' '.join(theirs)} "
+            padded.add(text)
+            if len(theirs) >= 2:
+                self.wholes.add(text)
+            self.grams.update(
+                tuple(theirs[i : i + PASSTHROUGH_RUN])
+                for i in range(len(theirs) - PASSTHROUGH_RUN + 1)
+            )
+        self.blob = "|".join(padded)
+
+
+def passthrough(
+    field: str, user_messages: Iterable[str] | OwnerIndex, *, inside_min: int = 2
+) -> bool:
     """Whether *field* copies the user, on lower-case words with punctuation, ``_`` and ``-`` gone.
 
     True when (a) a whole user message of two or more words sits inside the field, (b) a field
-    of two or more words sits inside a user message, or (c) they share a run of
-    :data:`PASSTHROUGH_RUN` or more words. A one-word field is never a copy under (b).
+    of ``inside_min`` (default two) or more words sits inside a user message, or (c) they share
+    a run of :data:`PASSTHROUGH_RUN` or more words. A one-word field is never a copy under (b).
     """
     mine = _words(field)
     if not mine:
         return False
+    index = user_messages if isinstance(user_messages, OwnerIndex) else OwnerIndex(user_messages)
     padded = f" {' '.join(mine)} "
+    if any(whole in padded for whole in index.wholes):
+        return True
+    if len(mine) >= max(2, inside_min) and padded in index.blob:
+        return True
     grams = {tuple(mine[i : i + PASSTHROUGH_RUN]) for i in range(len(mine) - PASSTHROUGH_RUN + 1)}
-    for message in user_messages:
-        theirs = _words(message)
-        if len(theirs) >= 2 and f" {' '.join(theirs)} " in padded:
-            return True
-        if len(mine) >= 2 and padded in f" {' '.join(theirs)} ":
-            return True
-        if grams and any(
-            tuple(theirs[i : i + PASSTHROUGH_RUN]) in grams
-            for i in range(len(theirs) - PASSTHROUGH_RUN + 1)
-        ):
-            return True
-    return False
+    return bool(grams & index.grams)
 
 
 def check_summary(
     summary: str,
     deny: list[str],
     allow: frozenset[str],
-    user_messages: Iterable[str],
+    user_messages: Iterable[str] | OwnerIndex,
     *,
     leading: frozenset[str] = LEADING_WORDS,
+    agent: bool = False,
+    inside_min: int = 2,
+    opening_free: bool = False,
 ) -> str | None:
-    """A refusal code for *summary*, or ``None`` when it may be sent."""
+    """A refusal code for *summary*, or ``None`` when it may be sent.
+
+    ``agent`` is the ``ask_judge`` reading of agent-written text (2026-11-18): a contraction's
+    apostrophe is not a quote, a leading word may start any sentence, and generic acronyms pass
+    in capitals. ``advise_preset`` leaves it off and keeps its own rules.
+    """
     if not deny:
         return "no_denylist"
     if "\n" in summary or "\r" in summary:
@@ -285,7 +352,7 @@ def check_summary(
         return "path"
     if "`" in summary:
         return "backtick"
-    if _QUOTES.search(summary):
+    if _QUOTES.search(_CONTRACTION.sub("", summary) if agent else summary):
         return "quote"
     if _DIGITS.search(summary) or any(
         sum(c.isdigit() for c in m.group(0)) > 3 for m in _DIGIT_GROUP.finditer(summary)
@@ -293,14 +360,22 @@ def check_summary(
         return "digits"
     if denylist_hit(summary, deny):
         return "denylist"
-    if _name_like(summary, allow, leading=leading):
+    if _name_like(
+        summary,
+        allow,
+        leading=leading,
+        sentence_starts=agent,
+        acronyms=ACRONYM_ALLOW if agent else frozenset(),
+        opening_free=opening_free,
+    ):
         return "proper_noun"
-    if passthrough(summary, user_messages):
+    if passthrough(summary, user_messages, inside_min=inside_min):
         return "passthrough"
     return None
 
 
 _minted: dict[str, None] = {}
+_minted_lock = threading.Lock()
 MINTED_MAX = 4096
 
 
@@ -308,26 +383,43 @@ def guard_summary(
     summary: str,
     deny: list[str],
     allow: frozenset[str],
-    user_messages: Iterable[str],
+    user_messages: Iterable[str] | OwnerIndex,
     *,
     leading: frozenset[str] = LEADING_WORDS,
+    agent: bool = False,
+    inside_min: int = 2,
+    opening_free: bool = False,
 ) -> GuardedSummary | None:
     """*summary* as a :data:`GuardedSummary` when :func:`check_summary` passes, else ``None``.
 
     The only place one is made. The value is remembered (the last :data:`MINTED_MAX`) so a judge
     adapter can tell a guarded string from a plain one at run time with :func:`is_guarded`.
     """
-    if check_summary(summary, deny, allow, user_messages, leading=leading) is not None:
+    if (
+        check_summary(
+            summary,
+            deny,
+            allow,
+            user_messages,
+            leading=leading,
+            agent=agent,
+            inside_min=inside_min,
+            opening_free=opening_free,
+        )
+        is not None
+    ):
         return None
-    _minted.pop(summary, None)
-    _minted[summary] = None
-    while len(_minted) > MINTED_MAX:
-        del _minted[next(iter(_minted))]
+    with _minted_lock:  # guard_summary runs in worker threads (2026-11-18)
+        _minted.pop(summary, None)
+        _minted[summary] = None
+        while len(_minted) > MINTED_MAX:
+            _minted.pop(next(iter(_minted)), None)
     return GuardedSummary(summary)
 
 
 def is_guarded(value: str) -> bool:
-    return value in _minted
+    with _minted_lock:
+        return value in _minted
 
 
 # ---------------------------------------------------------------------------
@@ -397,6 +489,32 @@ class AdvisorError(Exception):
     """A failed call; the message names a class or status, never a body or a key."""
 
 
+#: A 429 from the endpoint (2026-11-13): the monotonic time before which no call goes out, and
+#: the default wait when the answer carries no Retry-After. Quota is not an outage, so a 429
+#: never counts toward the circuit breaker (``decision_shadow``).
+RATE_LIMITED = "http_429"
+DEFAULT_RETRY_S = 20.0
+MAX_RETRY_S = 120.0
+_throttle_until = 0.0
+
+
+def retry_after_s() -> float:
+    """Seconds until a call may go out again after a 429 (0 when none is pending)."""
+    return max(0.0, _throttle_until - time.monotonic())
+
+
+def _note_rate_limit(header: str | None) -> None:
+    global _throttle_until
+    try:
+        wait = float(header) if header else DEFAULT_RETRY_S
+    except ValueError:
+        wait = DEFAULT_RETRY_S
+    if not math.isfinite(wait):
+        wait = DEFAULT_RETRY_S
+    wait = min(max(wait, 1.0), MAX_RETRY_S)
+    _throttle_until = max(_throttle_until, time.monotonic() + wait)
+
+
 _transport: httpx.AsyncHTTPTransport | None = None
 _transport_loop: asyncio.AbstractEventLoop | None = None
 
@@ -411,6 +529,10 @@ def _shared_transport() -> httpx.AsyncBaseTransport:
 
 
 async def _post(cfg: Config, body: dict[str, Any]) -> dict[str, Any]:
+    # The Retry-After wait is enforced here, at dispatch, not only when a call is admitted: a
+    # call that queued for a permit before another got a 429 must not go out during the wait.
+    if retry_after_s() > 0:
+        raise AdvisorError(RATE_LIMITED)
     request = httpx.Request(
         "POST",
         cfg.endpoint + PATH,
@@ -430,6 +552,9 @@ async def _post(cfg: Config, body: dict[str, Any]) -> dict[str, Any]:
         raise AdvisorError("timeout") from None
     except httpx.HTTPError as exc:
         raise AdvisorError(type(exc).__name__) from None
+    if response.status_code == 429:
+        _note_rate_limit(response.headers.get("retry-after"))
+        raise AdvisorError(RATE_LIMITED)
     if response.status_code != 200:
         raise AdvisorError(f"http_{response.status_code}")
     try:
@@ -559,6 +684,9 @@ async def advise(
     }
     if cfg.log_summary:  # only a summary that is actually sent is kept
         entry["summary"] = request.summary
+    from . import decision_shadow  # local: decision_shadow imports this module
+
+    decision_shadow.note_call()  # the request goes out now; a timeout or error still counts
     try:
         data = await _post(cfg, body)
     except AdvisorError as exc:

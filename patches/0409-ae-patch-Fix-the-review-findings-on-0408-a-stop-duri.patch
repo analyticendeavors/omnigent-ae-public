@@ -1,0 +1,514 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 18:35:38 -0800
+Subject: [PATCH 409/443] [ae-patch] Fix the review findings on 0408: a stop
+ during the reactivation wait ends the take
+
+A restart that waited for the audio session reactivation could not be cancelled, so Esc or a disabled composer in that window left the take listening with no recognizer. The wait now cancels like the old-end wait. A newer restart keeps its own start flag, a mark set during an in-flight reactivation survives, the stall clocks start at the real recognizer start, and the voice log field is now reactivatePending.
+---
+ .../ComposerMicButton.meterOff.test.tsx       |   3 +
+ .../ComposerMicButton.stall.test.tsx          | 186 +++++++++++++++++-
+ web/src/components/ComposerMicButton.tsx      |  40 +++-
+ web/src/lib/aeAudioSession.test.ts            |  69 ++++++-
+ web/src/lib/aeAudioSession.ts                 |  44 ++++-
+ 5 files changed, 328 insertions(+), 14 deletions(-)
+
+diff --git a/web/src/components/ComposerMicButton.meterOff.test.tsx b/web/src/components/ComposerMicButton.meterOff.test.tsx
+index 9bf8822d7f5a07de9a411976debac628d6186235..c5c5dee59243269fe51ff6e29c4c7380ad6fc8f6 100644
+--- a/web/src/components/ComposerMicButton.meterOff.test.tsx
++++ b/web/src/components/ComposerMicButton.meterOff.test.tsx
+@@ -446,6 +446,7 @@ describe("ComposerMicButton (level meter off)", () => {
+ 
+   async function stallRound() {
+     const latest = instances[instances.length - 1];
++    const before = instances.length;
+     act(() => {
+       latest.own.start?.({});
+       latest.own.audiostart?.({});
+@@ -454,6 +455,8 @@ describe("ComposerMicButton (level meter off)", () => {
+     await run(300);
+     act(() => latest.own.speechend?.({}));
+     await run(4000);
++    // WebKit starts the swapped-in recognizer once the old one has ended.
++    if (instances.length > before) act(() => latest.own.end?.({}));
+   }
+ 
+   it("caps event stall restarts at 4 a minute, never calls the mic deaf, and resumes after a result", async () => {
+diff --git a/web/src/components/ComposerMicButton.stall.test.tsx b/web/src/components/ComposerMicButton.stall.test.tsx
+index db8e1e959dd713fc9ed4cc5d8ba07b36147bb9b6..fa12189dd109be39f32fcf2abb4da0ab2683a488 100644
+--- a/web/src/components/ComposerMicButton.stall.test.tsx
++++ b/web/src/components/ComposerMicButton.stall.test.tsx
+@@ -3,7 +3,11 @@
+ import type { AeMicController } from "@/lib/aeVoiceMode";
+ import { act, cleanup, render } from "@testing-library/react";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+-import { markSessionMayBeInactive, resetAudioSessionState } from "@/lib/aeAudioSession";
++import {
++  REACTIVATE_HARD_CAP_MS,
++  markSessionMayBeInactive,
++  resetAudioSessionState,
++} from "@/lib/aeAudioSession";
+ import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
+ import { ComposerMicButton } from "./ComposerMicButton";
+ 
+@@ -427,7 +431,7 @@ describe("ComposerMicButton (audio session reactivation before start)", () => {
+       await vi.advanceTimersByTimeAsync(0);
+     });
+     expect(startSpy).toHaveBeenCalledTimes(1);
+-    expect(formatVoiceLog()).toContain("reactivated=yes");
++    expect(formatVoiceLog()).toContain("reactivatePending=yes");
+     expect(formatVoiceLog()).toContain("reactivate ok");
+   });
+ 
+@@ -439,7 +443,7 @@ describe("ComposerMicButton (audio session reactivation before start)", () => {
+       await vi.advanceTimersByTimeAsync(10);
+     });
+     expect(startSpy).toHaveBeenCalledTimes(1);
+-    expect(formatVoiceLog()).toContain("reactivated=no");
++    expect(formatVoiceLog()).toContain("reactivatePending=no");
+   });
+ 
+   it("does not start when the take was stopped during the await", async () => {
+@@ -458,3 +462,179 @@ describe("ComposerMicButton (audio session reactivation before start)", () => {
+     expect(startSpy).not.toHaveBeenCalled();
+   });
+ });
++
++describe("ComposerMicButton (silent restart awaiting the reactivation)", () => {
++  const IPHONE =
++    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.7 Mobile/15E148 Safari/604.1";
++
++  let release: (() => void)[];
++  beforeEach(() => {
++    resetAudioSessionState();
++    release = [];
++  });
++  afterEach(() => resetAudioSessionState());
++
++  /** Listening on WebKit; a final then recycles and the restart waits on the held reactivation. */
++  async function restartAwaitingReactivation(disabled = false) {
++    setUserAgent(IPHONE);
++    const controller = { current: null as AeMicController | null };
++    const onListeningChange = vi.fn();
++    const props = {
++      onTranscript: vi.fn(),
++      onVoiceStart: vi.fn(),
++      controller,
++      onListeningChange,
++    };
++    const view = render(<ComposerMicButton {...props} disabled={disabled} />);
++    act(() => controller.current?.start());
++    await act(async () => {
++      instances[0].handlers.start?.({});
++      instances[0].handlers.audiostart?.({});
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    markSessionMayBeInactive();
++    (navigator.mediaDevices.getUserMedia as ReturnType<typeof vi.fn>).mockImplementation(
++      () =>
++        new Promise((resolve) => {
++          release.push(() => resolve(new FakeStream()));
++        }),
++    );
++    act(() => instances[0].handlers.result?.(resultEvent("Hello")));
++    await act(async () => {
++      instances[0].handlers.end?.({});
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(instances).toHaveLength(2);
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(release).toHaveLength(1);
++    return { controller, view, props };
++  }
++
++  it("Esc during the await ends the take and never starts", async () => {
++    const { controller } = await restartAwaitingReactivation();
++    expect(controller.current?.isListening()).toBe(true);
++    act(() => {
++      window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
++    });
++    expect(controller.current?.isListening()).toBe(false);
++    await act(async () => {
++      release[0]();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(controller.current?.isListening()).toBe(false);
++  });
++
++  it("a controller stop during the await resets the take and never starts", async () => {
++    const { controller } = await restartAwaitingReactivation();
++    act(() => controller.current?.stop());
++    expect(controller.current?.isListening()).toBe(false);
++    await act(async () => {
++      release[0]();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(controller.current?.isListening()).toBe(false);
++  });
++
++  it("disabled during the await ends the take and never starts", async () => {
++    const { controller, view, props } = await restartAwaitingReactivation();
++    view.rerender(<ComposerMicButton {...props} disabled />);
++    expect(controller.current?.isListening()).toBe(false);
++    await act(async () => {
++      release[0]();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(controller.current?.isListening()).toBe(false);
++  });
++
++  it("a second restart during the await keeps listening and starts the newer recognizer once", async () => {
++    const { controller } = await restartAwaitingReactivation();
++    // A stall swap while the first restart awaits: the first never starts.
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(10);
++    });
++    act(() => instances[1].handlers.result?.(resultEvent("again")));
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    // The fake keeps one handler per event, so the old end is not seen: the capped wait ends.
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(2000);
++    });
++    expect(release).toHaveLength(2);
++    await act(async () => {
++      for (const r of release) r();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(controller.current?.isListening()).toBe(true);
++    // The first restart's recognizer never starts; only the newest does (plus the first take's own start).
++    expect(instances).toHaveLength(3);
++    expect(startSpy).toHaveBeenCalledTimes(2);
++  });
++
++  async function startPastHardCap() {
++    setUserAgent(IPHONE);
++    markSessionMayBeInactive();
++    const controller = { current: null as AeMicController | null };
++    render(
++      <ComposerMicButton
++        onTranscript={vi.fn()}
++        onVoiceStart={vi.fn()}
++        controller={controller}
++        onListeningChange={vi.fn()}
++      />,
++    );
++    (navigator.mediaDevices.getUserMedia as ReturnType<typeof vi.fn>).mockImplementation(
++      () =>
++        new Promise((resolve) => {
++          release.push(() => resolve(new FakeStream()));
++        }),
++    );
++    act(() => controller.current?.start());
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(3000);
++    });
++    // Still waiting at 3 s: the recognizer has not started.
++    expect(startSpy).not.toHaveBeenCalled();
++    await act(async () => {
++      await vi.advanceTimersByTimeAsync(REACTIVATE_HARD_CAP_MS);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    return controller;
++  }
++
++  it("a stream arriving after the hard cap swaps in one fresh recognizer", async () => {
++    const controller = await startPastHardCap();
++    await act(async () => {
++      instances[0].handlers.start?.({});
++      instances[0].handlers.audiostart?.({});
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    await act(async () => {
++      release[0]();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(formatVoiceLog()).toContain("reactivate late stream, restarting mic");
++    expect(instances).toHaveLength(2);
++    expect(controller.current?.isListening()).toBe(true);
++  });
++
++  it("no restart for a late stream when the take was stopped", async () => {
++    const controller = await startPastHardCap();
++    await act(async () => {
++      instances[0].handlers.start?.({});
++      instances[0].handlers.audiostart?.({});
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    act(() => controller.current?.stop());
++    await act(async () => {
++      instances[0].handlers.end?.({});
++      release[0]();
++      await vi.advanceTimersByTimeAsync(0);
++    });
++    expect(startSpy).toHaveBeenCalledTimes(1);
++    expect(controller.current?.isListening()).toBe(false);
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index f13c1b1c45d531fe462b12235106e22c18d56419..ee4c87308b9850e68d8647e7674e4fb6a3aedd49 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -14,6 +14,7 @@ import {
+   audioSessionState,
+   audioSessionType,
+   reactivateAudioSessionForMic,
++  onLateReactivationStream,
+   reactivationPending,
+ } from "@/lib/aeAudioSession";
+ import { whenSynthIdle } from "@/lib/aeSpeakReplies";
+@@ -475,14 +476,15 @@ export const ComposerMicButton = ({
+       audioStartSeenRef.current = false;
+       recognizerSoundSeenRef.current = false;
+       lastRecognizerActivityRef.current = Date.now();
+-      stallRef.current.reset(Date.now());
+-      eventStallRef.current.reset(Date.now());
+-      // A fresh recognizer gets the whole no-audiostart allowance before that check judges it.
+-      takeStartRef.current = Date.now();
+       const startNext = (): boolean => {
+         neverStarted.delete(next);
+         waitingOn.delete(next);
+         silentRestartAt = Date.now();
++        // The stall clocks and the no-audiostart allowance run from the real start, so a
++        // reactivation or old-end wait does not shorten them.
++        stallRef.current.reset(Date.now());
++        eventStallRef.current.reset(Date.now());
++        takeStartRef.current = Date.now();
+         try {
+           next.start();
+         } catch {
+@@ -504,9 +506,19 @@ export const ComposerMicButton = ({
+       const begin = (): boolean => {
+         if (!reactivationPending()) return startNext();
+         // A long clip may have deactivated the iOS audio session: reactivate, then start.
++        // userStop and replace cancel through cancelPendingStart, as for the old-end wait.
++        let cancelled = false;
++        const cancel = () => {
++          cancelled = true;
++          if (cancelPendingStart === cancel) cancelPendingStart = null;
++        };
++        cancelPendingStart = cancel;
+         void reactivateAudioSessionForMic().then(() => {
++          if (cancelled) return;
++          if (cancelPendingStart === cancel) cancelPendingStart = null;
+           if (!stillLive()) {
+-            silentStartRef.current = false;
++            // Only reset when no newer restart owns the flag.
++            if (recognitionRef.current === next) silentStartRef.current = false;
+             return;
+           }
+           if (!startNext()) reportDeaf("stall restart failed");
+@@ -984,7 +996,23 @@ export const ComposerMicButton = ({
+     recognitionRef.current = build();
+     replaceRecognitionRef.current = replace;
+ 
++    // The reactivation stream arrived after the start went ahead anyway: it took the
++    // recognizer's input, so swap in a fresh one. Not for a stopped, disabled or discarded take.
++    const offLateStream = onLateReactivationStream(() => {
++      if (
++        !recognitionRef.current ||
++        disabledRef.current ||
++        discardingRef.current ||
++        !listeningRef.current ||
++        transitionRef.current
++      ) {
++        return;
++      }
++      if (!silentRestart(true)) reportDeaf("stall restart failed");
++    });
++
+     return () => {
++      offLateStream();
+       cancelPendingStart?.();
+       userStopRef.current = () => false;
+       const old = recognitionRef.current;
+@@ -1463,7 +1491,7 @@ export const ComposerMicButton = ({
+       } else {
+         logVoice(
+           "mic start browser",
+-          `${speechSynthesisState()} audioSession=${audioSessionType()} sessionState=${audioSessionState()} reactivated=${reactivationPending() ? "yes" : "no"}`,
++          `${speechSynthesisState()} audioSession=${audioSessionType()} sessionState=${audioSessionState()} reactivatePending=${reactivationPending() ? "yes" : "no"}`,
+         );
+         startSeenRef.current = false;
+         audioStartSeenRef.current = false;
+diff --git a/web/src/lib/aeAudioSession.test.ts b/web/src/lib/aeAudioSession.test.ts
+index c3601421ad2970d03d68f4169f67dc1654b73648..3178918aa2fb283d4b093d62866281372e4f650b 100644
+--- a/web/src/lib/aeAudioSession.test.ts
++++ b/web/src/lib/aeAudioSession.test.ts
+@@ -6,8 +6,10 @@ import {
+   leaveVoiceAudioSession,
+   markSessionMayBeInactive,
+   PENDING_HOLD_MS,
++  onLateReactivationStream,
+   reactivateAudioSessionForMic,
+   reactivationPending,
++  REACTIVATE_HARD_CAP_MS,
+   REACTIVATE_TIMEOUT_MS,
+   resetAudioSessionState,
+ } from "./aeAudioSession";
+@@ -241,6 +243,71 @@ describe("reactivating the audio session for the mic", () => {
+     expect(formatVoiceLog()).toContain("audio session state active");
+   });
+ 
++  it("keeps a mark set while the reactivation is in flight", async () => {
++    setUa(IOS_UA);
++    let release: (v: unknown) => void = () => {};
++    gum.mockImplementationOnce(
++      () =>
++        new Promise((resolve) => {
++          release = resolve;
++        }),
++    );
++    markSessionMayBeInactive();
++    const done = reactivateAudioSessionForMic();
++    markSessionMayBeInactive();
++    release({ getTracks: () => [new Track()] });
++    expect(await done).toBe(true);
++    expect(reactivationPending()).toBe(true);
++  });
++
++  it("keeps waiting past the soft timeout for a stream that settles in time", async () => {
++    vi.useFakeTimers();
++    setUa(IOS_UA);
++    gum.mockImplementationOnce(
++      () =>
++        new Promise((resolve) => {
++          setTimeout(() => resolve({ getTracks: () => [new Track()] }), 3000);
++        }),
++    );
++    markSessionMayBeInactive();
++    let resolved = false;
++    const done = reactivateAudioSessionForMic().then((v) => {
++      resolved = true;
++      return v;
++    });
++    await vi.advanceTimersByTimeAsync(REACTIVATE_TIMEOUT_MS + 100);
++    expect(resolved).toBe(false);
++    await vi.advanceTimersByTimeAsync(2000);
++    expect(await done).toBe(true);
++    expect(reactivationPending()).toBe(false);
++  });
++
++  it("signals one restart when the stream arrives after the hard cap", async () => {
++    vi.useFakeTimers();
++    setUa(IOS_UA);
++    let release: (v: unknown) => void = () => {};
++    const late = new Track();
++    gum.mockImplementationOnce(
++      () =>
++        new Promise((resolve) => {
++          release = resolve;
++        }),
++    );
++    const listener = vi.fn();
++    const off = onLateReactivationStream(listener);
++    markSessionMayBeInactive();
++    const done = reactivateAudioSessionForMic();
++    await vi.advanceTimersByTimeAsync(REACTIVATE_HARD_CAP_MS);
++    expect(await done).toBe(false);
++    expect(listener).not.toHaveBeenCalled();
++    release({ getTracks: () => [late] });
++    await vi.advanceTimersByTimeAsync(0);
++    expect(late.stop).toHaveBeenCalled();
++    expect(listener).toHaveBeenCalledTimes(1);
++    expect(formatVoiceLog()).toContain("reactivate late stream, restarting mic");
++    off();
++  });
++
+   it("gives up after the timeout, keeps the flag and stops a late stream", async () => {
+     vi.useFakeTimers();
+     setUa(IOS_UA);
+@@ -254,7 +321,7 @@ describe("reactivating the audio session for the mic", () => {
+     );
+     markSessionMayBeInactive();
+     const done = reactivateAudioSessionForMic();
+-    await vi.advanceTimersByTimeAsync(REACTIVATE_TIMEOUT_MS);
++    await vi.advanceTimersByTimeAsync(REACTIVATE_HARD_CAP_MS);
+     expect(await done).toBe(false);
+     expect(reactivationPending()).toBe(true);
+     expect(formatVoiceLog()).toContain("reactivate failed timeout");
+diff --git a/web/src/lib/aeAudioSession.ts b/web/src/lib/aeAudioSession.ts
+index 1aacf4167656176e030c47b0d5fbbbd1fe1ef9f5..b5902b2d3fa5b1815cb9a65b1d29c3146f4bad80 100644
+--- a/web/src/lib/aeAudioSession.ts
++++ b/web/src/lib/aeAudioSession.ts
+@@ -135,12 +135,31 @@ export function resetAudioSessionState(): void {
+ // right before the start puts the session back.
+ let sessionMayBeInactive = false;
+ let stateListenerInstalled = false;
+-/** The longest a reactivation may take before the recognizer starts anyway. */
++// Counts marks, so a reactivation clears only the mark it started under.
++let markCount = 0;
++/** A reactivation slower than this is logged; the start still waits for the stream to settle. */
+ export const REACTIVATE_TIMEOUT_MS = 1500;
++/**
++ * The longest the start waits for the throwaway stream to settle. A stream that arrives after
++ * the recognizer started becomes the newest capture on iOS and steals its input, so the wait
++ * is long; only past this cap does the start go ahead.
++ */
++export const REACTIVATE_HARD_CAP_MS = 5000;
++
++const lateStreamListeners = new Set<() => void>();
++/**
++ * Called when the throwaway stream arrives after the hard cap (the recognizer already started
++ * and may now be deaf): the mic button swaps in a fresh recognizer. Returns an unsubscribe.
++ */
++export function onLateReactivationStream(listener: () => void): () => void {
++  lateStreamListeners.add(listener);
++  return () => lateStreamListeners.delete(listener);
++}
+ 
+ /** A long clip just ended: the next mic start needs a reactivation first. */
+ export function markSessionMayBeInactive(): void {
+   sessionMayBeInactive = true;
++  markCount += 1;
+ }
+ 
+ /** Whether the next mic start will reactivate the audio session first. */
+@@ -179,17 +198,33 @@ export async function reactivateAudioSessionForMic(): Promise<boolean> {
+   watchSessionState();
+   logVoice(`audio session state before reactivate ${audioSessionState()}`);
+   const t0 = Date.now();
++  const markAtStart = markCount;
+   let timer: ReturnType<typeof setTimeout> | null = null;
++  let slowTimer: ReturnType<typeof setTimeout> | null = null;
++  let capped = false;
+   try {
+     const open = getMicStream(micConstraint() ?? true).then((stream) => {
+       stream.getTracks().forEach((track) => track.stop());
++      if (capped) {
++        // The recognizer started meanwhile and this stream just took its input.
++        logVoice("reactivate late stream, restarting mic");
++        for (const listener of [...lateStreamListeners]) listener();
++      }
+     });
+     const timeout = new Promise<never>((_, reject) => {
+-      timer = setTimeout(() => reject(new Error("timeout")), REACTIVATE_TIMEOUT_MS);
++      timer = setTimeout(() => {
++        capped = true;
++        reject(new Error("timeout"));
++      }, REACTIVATE_HARD_CAP_MS);
+     });
+-    // A stream that arrives after the timeout is still stopped by the handler above.
++    slowTimer = setTimeout(
++      () => logVoice("reactivate slow", "still waiting"),
++      REACTIVATE_TIMEOUT_MS,
++    );
++    // A stream that arrives after the cap is stopped by the handler above.
+     await Promise.race([open, timeout]);
+-    sessionMayBeInactive = false;
++    // A clip that ended during the call set a newer mark: keep it.
++    if (markCount === markAtStart) sessionMayBeInactive = false;
+     logVoice("reactivate ok", `${Date.now() - t0} ms`);
+     return true;
+   } catch (err) {
+@@ -198,5 +233,6 @@ export async function reactivateAudioSessionForMic(): Promise<boolean> {
+     return false;
+   } finally {
+     if (timer !== null) clearTimeout(timer);
++    if (slowTimer !== null) clearTimeout(slowTimer);
+   }
+ }

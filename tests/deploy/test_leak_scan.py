@@ -1764,6 +1764,61 @@ def test_commit_messages_of_a_push_range_are_scanned(tmp_path: Path) -> None:
     assert proc.returncode == 1 and re.search(r"commit [0-9a-f]{10}:1: lan-ip", proc.stdout)
 
 
+ORG = "analytic" + "endeavors"
+
+
+def _merged(repo: Repo, subject: str, *, merge: bool = True) -> str:
+    """A topic branch landed on main, as a merge commit (GitHub's "Create a merge commit") or
+    as a single commit carrying the same subject."""
+    base = repo.commit("Base", a="x\n")
+    if merge:
+        repo.git("checkout", "-q", "-b", "topic")
+        repo.commit("Topic", t="fine\n")
+        repo.git("checkout", "-q", "main")
+        repo.git("merge", "-q", "--no-ff", "-m", subject + "\n\nTopic", "topic")
+    else:
+        repo.commit(subject, t="fine\n")
+    return base
+
+
+def test_githubs_merge_subject_is_not_a_repository_link(tmp_path: Path) -> None:
+    """2026-11-10: "Merge pull request #N from <owner>/<branch>" names a branch, not a repo."""
+    repo = Repo(tmp_path / "r")
+    base = _merged(repo, f"Merge pull request #530 from {ORG}/docs/release-late")
+    proc = scan(*diff_args(repo, base), cwd=repo.path)
+    assert proc.returncode == 0, proc.stdout
+
+
+@pytest.mark.parametrize(
+    ("subject", "merge"),
+    [
+        (f"Merge pull request #7 from {ORG}/fix/{ORG}/secret-repo-x", True),  # inside the branch
+        (f"Merge pull request #7 from {ORG}/docs/{ORG}/docs", True),  # the owner link, twice
+        (f"Merge pull request #7 from {ORG}/secret-repo-x", True),  # a bare name may be a repo
+        (f"Merge pull request #7 from {ORG}/docs/x", False),  # not a merge commit
+        (f"Land {ORG}/docs/x", True),  # a merge, but not GitHub's subject
+    ],
+)
+def test_the_merge_subject_rule_excuses_only_the_owner_of_a_namespaced_branch(
+    tmp_path: Path, subject: str, merge: bool
+) -> None:
+    repo = Repo(tmp_path / "r")
+    base = _merged(repo, subject, merge=merge)
+    proc = scan(*diff_args(repo, base), cwd=repo.path)
+    assert proc.returncode == 1
+    assert re.search(r"commit [0-9a-f]{10}:1: private-repo-link", proc.stdout), proc.stdout
+
+
+def test_the_denylist_still_reads_the_merge_subject(tmp_path: Path) -> None:
+    """The rule drops one private-repo-link hit; it never hides the subject from the denylist."""
+    repo = Repo(tmp_path / "r")
+    base = _merged(repo, f"Merge pull request #7 from {ORG}/zq-secret/topic")
+    deny = bundle(tmp_path, f"{ORG}/zq-secret")
+    proc = scan("--denylist-bundle", str(deny), *diff_args(repo, base), cwd=repo.path)
+    assert proc.returncode == 1
+    assert re.search(r"commit [0-9a-f]{10}:1: denylist", proc.stdout), proc.stdout
+
+
 # --- 14. placeholders must be the host or the tailnet label ----------------------------------------
 
 

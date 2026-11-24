@@ -1,0 +1,187 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 12 Nov 2026 23:26:54 -0800
+Subject: [PATCH 367/443] [ae-patch] Forward the claude-native UserPromptSubmit
+ hook as a turn-open edge that publishes no status
+
+---
+ .../harnesses/claude_native/ae_prompt_edge.py | 30 +++++++++++++++++++
+ omnigent/harnesses/claude_native/forwarder.py |  2 ++
+ omnigent/server/ae_turn_edges.py              |  3 +-
+ .../server/routes/sessions/routes_events.py   |  4 +++
+ .../claude_native/forwarder/test_status.py    | 20 ++++++++-----
+ tests/server/test_ae_turn_edges.py            | 24 +++++++++++++++
+ 6 files changed, 74 insertions(+), 9 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_prompt_edge.py
+
+diff --git a/omnigent/harnesses/claude_native/ae_prompt_edge.py b/omnigent/harnesses/claude_native/ae_prompt_edge.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..0435776a146f7f8173c5dabcfd02c29e973ede95
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_prompt_edge.py
+@@ -0,0 +1,30 @@
++"""Forward a claude-native UserPromptSubmit hook as a turn-open edge.
++
++Claude's status file publishes only on change, so a turn that starts while the
++file still reads busy never reaches the server as ``running``. The hook fires on
++every prompt, so the forwarder posts it as a ``prompt`` edge. The server hands it
++to turn-edge observers and publishes no status.
++"""
++
++from __future__ import annotations
++
++import logging
++
++import httpx
++
++_logger = logging.getLogger(__name__)
++
++
++async def post_prompt_edge(client: httpx.AsyncClient, session_id: str) -> None:
++    """Post one prompt edge for *session_id*; best effort, never raises."""
++    try:
++        resp = await client.post(
++            f"/v1/sessions/{session_id}/events",
++            json={
++                "type": "external_session_status",
++                "data": {"status": "running", "ae_prompt_edge": True},
++            },
++        )
++        resp.raise_for_status()
++    except Exception as exc:  # noqa: BLE001 (a missed edge must not stall the hook stream)
++        _logger.debug("prompt edge post failed: %s", type(exc).__name__)
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 71683f07f71b91a83f9037c248851e6f55e5df8d..d9476bdb716235fcae69965f55f80f27b5124e0b 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -33,6 +33,7 @@ from omnigent.harnesses.claude_native.ae_prompt_suggest import (
+     clear_prompt_suggestion,
+     schedule_prompt_suggestion,
+ )
++from omnigent.harnesses.claude_native.ae_prompt_edge import post_prompt_edge
+ from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
+ from omnigent.harnesses.claude_native.ae_transcript_tokens import TranscriptTokenTally
+ from omnigent.harnesses.claude_native.bridge import (
+@@ -4082,6 +4083,7 @@ async def _forward_available_status_events(
+                 record, parent_claude_session_ids=parent_claude_session_ids
+             ):
+                 await clear_prompt_suggestion(client, state=dedupe.prompt_suggest)
++                await post_prompt_edge(client, session_id)
+                 with contextlib.suppress(Exception):
+                     # This proves Claude saw a submit; later hooks can still block the turn.
+                     _logger.info(
+diff --git a/omnigent/server/ae_turn_edges.py b/omnigent/server/ae_turn_edges.py
+index 5091b23a6375da3a468b9bb8b515ebdd0375bb86..ed1e0ee843a9506ba99c02a3d7a839a796c125ce 100644
+--- a/omnigent/server/ae_turn_edges.py
++++ b/omnigent/server/ae_turn_edges.py
+@@ -32,7 +32,8 @@ class TurnEdge:
+     """One turn-state edge of a session.
+ 
+     :param session_id: The conversation id, e.g. ``"conv_abc123"``.
+-    :param status: ``running``, ``waiting``, ``idle``, ``failed`` or ``interrupted``.
++    :param status: ``running``, ``waiting``, ``idle``, ``failed``, ``interrupted`` or
++        ``prompt`` (a claude-native UserPromptSubmit: a turn opened, no status published).
+     :param response_id: The response id the edge carried, if any.
+     :param turn_completed: ``True`` only for the Stop hook's idle edge.
+     """
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 156f080b73ba1f36f616d7e9ea47a7670a8f1e56..f42f2452372dabb4b4b9d1949bc51b82209cad4e 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -1905,6 +1905,10 @@ def register_events_routes(
+             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
+             return {"queued": False}
+         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
++            if body.type == _EXTERNAL_SESSION_STATUS_TYPE and body.data.get("ae_prompt_edge") is True:
++                # A prompt was submitted: a turn-open edge for observers, no status change.
++                ae_turn_edges.notify_turn_edge(session_id, "prompt")
++                return {"queued": False}
+             status = body.data.get("status")
+             if body.type == _SUBAGENT_STATUS_TYPE:
+                 if body.data.get("idle") is not True:
+diff --git a/tests/harnesses/claude_native/forwarder/test_status.py b/tests/harnesses/claude_native/forwarder/test_status.py
+index 151b829634553b3b209708ce1538d17eec7e4231..3f230e5ff53f2bab07de6b7a217b5e2b34c54e0f 100644
+--- a/tests/harnesses/claude_native/forwarder/test_status.py
++++ b/tests/harnesses/claude_native/forwarder/test_status.py
+@@ -127,21 +127,21 @@ async def test_forwarder_mirrors_interrupt_marker_for_ui(tmp_path: Path) -> None
+ 
+ @pytest.mark.asyncio
+ @pytest.mark.parametrize("submit_log_fails", [False, True])
+-async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
++async def test_forwarder_posts_idle_on_stop_and_only_a_prompt_edge_for_user_prompt_submit(
+     tmp_path: Path,
+     caplog: pytest.LogCaptureFixture,
+     monkeypatch: pytest.MonkeyPatch,
+     submit_log_fails: bool,
+ ) -> None:
+     """
+-    ``Stop`` → idle (the authoritative turn-end); ``UserPromptSubmit`` ignored.
++    ``Stop`` → idle (the authoritative turn-end); ``UserPromptSubmit`` posts a prompt edge only.
+ 
+     ``Stop`` is the fire-once turn-end edge that drives sub-agent terminal
+     delivery (via ``external_session_status``, the codex-shared path). The
+-    ``running`` edge stays PTY-derived, so ``UserPromptSubmit`` must NOT post a
+-    status. We record ``UserPromptSubmit`` ahead of ``Stop``: the first (and
+-    only) ``external_session_status`` POST must be the ``idle`` from ``Stop``.
+-    A ``running`` arriving first would mean ``UserPromptSubmit`` still maps.
++    ``running`` edge stays PTY-derived, so ``UserPromptSubmit`` must NOT map to a
++    status. It posts one ``ae_prompt_edge`` (main session only, none for the
++    subagent), which the server turns into a turn-open edge with no status.
++    The ``idle`` from ``Stop`` follows.
+     """
+     caplog.set_level("INFO", logger="omnigent.harnesses.claude_native.forwarder")
+     from omnigent.harnesses.claude_native import forwarder
+@@ -198,6 +198,7 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
+         )
+     )
+     try:
++        prompt_edge = await _get_recorded_request(server)
+         request = await _get_recorded_request(server)
+     finally:
+         task.cancel()
+@@ -207,8 +208,11 @@ async def test_forwarder_posts_idle_on_stop_and_ignores_user_prompt_submit(
+         server.server_close()
+         thread.join(timeout=5.0)
+ 
+-    # The first (and only) status POST is the Stop → idle. A ``running``
+-    # arriving first would mean UserPromptSubmit is still wrongly mapped.
++    assert prompt_edge["body"] == {
++        "type": "external_session_status",
++        "data": {"status": "running", "ae_prompt_edge": True},
++    }
++    # The next POST is the Stop idle: the subagent's submit posted no edge.
+     assert request["path"] == "/v1/sessions/conv_abc/events"
+     # The Stop hook carries its authoritative background-shell count (0 here,
+     # no background tasks) so a finished shell clears the indicator.
+diff --git a/tests/server/test_ae_turn_edges.py b/tests/server/test_ae_turn_edges.py
+index ecfc7e043c6bbc90d9bbb29e53bb60de887c197c..99a36311bcfabfdf4dced2d14a6af3838f19e3fd 100644
+--- a/tests/server/test_ae_turn_edges.py
++++ b/tests/server/test_ae_turn_edges.py
+@@ -132,3 +132,27 @@ async def test_an_idle_without_the_flag_is_not_a_completed_turn(client: httpx.As
+     assert resp.status_code in (200, 202, 204), resp.text
+ 
+     assert [edge.turn_completed for edge in seen if edge.session_id == session_id] == [False]
++
++
++@pytest.mark.usefixtures("_no_runner")
++async def test_a_prompt_edge_notifies_observers_and_publishes_no_status(
++    client: httpx.AsyncClient,
++) -> None:
++    agent = await create_test_agent(client, name="edges-route-prompt")
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    session_id = created.json()["id"]
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++
++    resp = await client.post(
++        f"/v1/sessions/{session_id}/events",
++        json={
++            "type": "external_session_status",
++            "data": {"status": "running", "ae_prompt_edge": True},
++        },
++    )
++    assert resp.status_code in (200, 202, 204), resp.text
++
++    assert [(e.status, e.turn_completed) for e in seen if e.session_id == session_id] == [
++        ("prompt", False)
++    ]

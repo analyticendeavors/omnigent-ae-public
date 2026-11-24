@@ -1,0 +1,340 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 20 Nov 2026 00:04:32 -0800
+Subject: [PATCH 431/443] [ae-patch] Fix the check findings on 0430: use the
+ computed turn state for the refresh, withdraw the notice only on an explicit
+ off marker
+
+The every 20th prompt refresh read the saved full_in_turn flag instead of the value that accounts for an interrupt, so an interrupted turn still delayed it by one prompt. The withdrawal line no longer comes from an empty or missing context file, which a pane-typed, queued or system prompt can produce while the notice is on: the server attaches an explicit off block only when it has no team notice, the Claude executor turns it into a marker line in the context file, and the hook withdraws a sent notice only on that marker. The executor no longer writes an empty context file.
+---
+ omnigent/harnesses/claude_native/bridge.py    |  3 ++
+ omnigent/harnesses/claude_native/hook.py      | 14 +++++--
+ omnigent/inner/claude_native_executor.py      | 25 +++++++-----
+ omnigent/inner/native_attachments.py          | 21 ++++++++++
+ .../server/routes/_sessions/orchestration.py  | 27 ++++++++-----
+ .../test_framework_context_gate.py            | 40 +++++++++++++++----
+ tests/inner/test_claude_native_executor.py    | 13 +++++-
+ 7 files changed, 112 insertions(+), 31 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index d7f942b49a3f9a615bdb95b5e4591cf9652a7f41..dfadea02ad6c9a51ff54c463980d36fb408d3733 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -109,6 +109,9 @@ CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
+ CLAUDE_FRAMEWORK_STATE_FILE = "framework_context_state.json"
+ CLAUDE_FRAMEWORK_LAST_FILE = "framework_context_last.txt"
+ CLAUDE_FRAMEWORK_LOCK_FILE = "framework_context.lock"
++# Written into the context file by the executor, only when the server says the team notice
++# is off; the hook withdraws an earlier full notice on it and never on an empty file.
++CLAUDE_NOTICE_OFF_MARKER = "Omnigent notice off."
+ # The notice goes out in full on the first prompt, whenever it changes, and on every Nth
+ # prompt after, so a long chat never drifts from it.
+ FRAMEWORK_REFRESH_EVERY = 20
+diff --git a/omnigent/harnesses/claude_native/hook.py b/omnigent/harnesses/claude_native/hook.py
+index 3075d3c8e1723fbf7aa3cd185e41e12e41d598a2..f3ed7e81e06c936fc87d1cbc2e064ce458bac6eb 100644
+--- a/omnigent/harnesses/claude_native/hook.py
++++ b/omnigent/harnesses/claude_native/hook.py
+@@ -22,6 +22,7 @@ from omnigent.harnesses.claude_native.bridge import (
+     CLAUDE_FRAMEWORK_LAST_FILE,
+     CLAUDE_FRAMEWORK_LOCK_FILE,
+     CLAUDE_FRAMEWORK_STATE_FILE,
++    CLAUDE_NOTICE_OFF_MARKER,
+     FRAMEWORK_REFRESH_EVERY,
+     approval_wait_marker_path,
+     hold_approval_wait_marker,
+@@ -1295,7 +1296,7 @@ def _gate_notice(
+         or time.time() - sent_at > FRAMEWORK_TURN_STALE_SECONDS
+     ):
+         in_turn = False
+-    refresh = since + 1 >= FRAMEWORK_REFRESH_EVERY and not bool(state.get("full_in_turn"))
++    refresh = since + 1 >= FRAMEWORK_REFRESH_EVERY and not in_turn
+     if changed or rewound or refresh or not locked:
+         with contextlib.suppress(OSError):
+             (bridge_dir / CLAUDE_FRAMEWORK_LAST_FILE).write_text(notice, encoding="utf-8")
+@@ -1328,8 +1329,8 @@ def _main_framework_context(argv: list[str]) -> int:
+     mid-turn gets the marker only. When the notice disappears after a full send (auto
+     collaboration turned off), one line says it is withdrawn and the gate resets.
+ 
+-    The bridge writes the context file on every message it sends, empty when there is
+-    nothing to add; no file at all means a prompt typed straight into the pane.
++    The notice is withdrawn only when the context file carries ``CLAUDE_NOTICE_OFF_MARKER``,
++    which the executor writes when the server says the notice is off.
+     """
+     args = _parse_evaluate_policy_args(argv)
+     try:
+@@ -1347,11 +1348,16 @@ def _main_framework_context(argv: list[str]) -> int:
+             path.unlink(missing_ok=True)
+         except OSError:
+             return 0
++        # Withdraw only on the executor's explicit marker, never on an empty or missing file:
++        # a pane-typed, queued or system prompt can arrive with no notice while it is on.
++        notice_off = CLAUDE_NOTICE_OFF_MARKER in text
++        if notice_off:
++            text = text.replace(CLAUDE_NOTICE_OFF_MARKER, "").strip()
+         other, notice = _split_notice(text)
+         if notice:
+             notice = _gate_notice(bridge_dir, notice, session_id, transcript_path, locked)
+             text = f"{other}\n\n{notice}" if other else notice
+-        elif _read_framework_state(bridge_dir).get("hash"):
++        elif notice_off and _read_framework_state(bridge_dir).get("hash"):
+             (bridge_dir / CLAUDE_FRAMEWORK_STATE_FILE).unlink(missing_ok=True)
+             (bridge_dir / CLAUDE_FRAMEWORK_LAST_FILE).unlink(missing_ok=True)
+             text = f"{other}\n\n{NOTICE_WITHDRAWN}" if other else NOTICE_WITHDRAWN
+diff --git a/omnigent/inner/claude_native_executor.py b/omnigent/inner/claude_native_executor.py
+index 68d96665686087ee370b9c0a996deb72cc39fc05..50e41bd40373b16610403be1811081dccea753e3 100644
+--- a/omnigent/inner/claude_native_executor.py
++++ b/omnigent/inner/claude_native_executor.py
+@@ -14,6 +14,7 @@ from pathlib import Path
+ from omnigent.harnesses.claude_native.bridge import (
+     BRIDGE_DIR_ENV_VAR,
+     CLAUDE_FRAMEWORK_CONTEXT_FILE,
++    CLAUDE_NOTICE_OFF_MARKER,
+     REQUEST_SESSION_ID_ENV_VAR,
+     SWITCH_MODEL_DIALOG_HINT,
+     ClaudePromptTimeout,
+@@ -48,6 +49,7 @@ from omnigent.inner.executor import (
+ from omnigent.inner.native_attachments import (
+     FRAMEWORK_NOTICE_BLOCK_TYPE,
+     attachment_reference_line,
++    framework_notice_off,
+     framework_notices,
+ )
+ from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+@@ -125,7 +127,7 @@ class ClaudeNativeExecutor(Executor):
+             return False
+         try:
+             async with self._inject_lock:
+-                await self._inject_prompt(text, framework_notices(content))
++                await self._inject_prompt(text, _notices_and_off(content))
+         except RuntimeError:
+             return False
+         return True
+@@ -134,16 +136,11 @@ class ClaudeNativeExecutor(Executor):
+         """Inject user text with one-shot context while holding the injection lock."""
+         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+         context_path.unlink(missing_ok=True)
+-        # The team and roles notice goes last: the framework-context hook gates it (full
+-        # once, then a marker) and passes the other notices through whole. The file is
+-        # written empty when there are no notices, so the hook can tell "nothing to add"
+-        # (say a withdrawn notice is gone) from a prompt typed straight into the pane.
+-        notices = sorted(notices, key=lambda notice: notice.startswith(NOTICE_PREFIX))
+         if notices:
++            # The team and roles notice goes last: the framework-context hook gates it (full
++            # once, then a marker) and passes the other notices through whole.
++            notices = sorted(notices, key=lambda notice: notice.startswith(NOTICE_PREFIX))
+             context_path.write_text("\n\n".join(notices), encoding="utf-8")
+-        else:
+-            with contextlib.suppress(OSError):
+-                context_path.write_text("", encoding="utf-8")
+         try:
+             await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
+         except BaseException:
+@@ -573,5 +570,13 @@ def _latest_framework_notices(messages: list[Message]) -> list[str]:
+     """Return framework context attached to the latest user turn."""
+     for message in reversed(messages):
+         if message.get("role") == "user":
+-            return framework_notices(message.get("content"))
++            return _notices_and_off(message.get("content"))
+     return []
++
++
++def _notices_and_off(content: object) -> list[str]:
++    """Framework notices in *content*, plus the off marker when the server says it is off."""
++    notices = framework_notices(content)
++    if framework_notice_off(content):
++        notices.append(CLAUDE_NOTICE_OFF_MARKER)
++    return notices
+diff --git a/omnigent/inner/native_attachments.py b/omnigent/inner/native_attachments.py
+index c8a8bb498afcb9d6fe057cd717a8c4d34832c5d5..3e83019150c9f0323aa6977c6656ec8229866861 100644
+--- a/omnigent/inner/native_attachments.py
++++ b/omnigent/inner/native_attachments.py
+@@ -470,6 +470,27 @@ def framework_notice_block(source_metadata: Mapping[str, object]) -> dict[str, o
+     return {"type": FRAMEWORK_NOTICE_BLOCK_TYPE, "source_metadata": dict(source_metadata)}
+ 
+ 
++NOTICE_OFF_KEY = "ae_notice_off"
++
++
++def framework_notice_off_block() -> dict[str, object]:
++    """The block the server attaches when a message carries no team notice because it is off."""
++    return framework_notice_block({NOTICE_OFF_KEY: True})
++
++
++def framework_notice_off(content: object) -> bool:
++    """Whether *content* carries the explicit "team notice is off" block."""
++    if not isinstance(content, list):
++        return False
++    return any(
++        isinstance(block, dict)
++        and block.get("type") == FRAMEWORK_NOTICE_BLOCK_TYPE
++        and isinstance(block.get("source_metadata"), dict)
++        and block["source_metadata"].get(NOTICE_OFF_KEY) is True
++        for block in content
++    )
++
++
+ def framework_notices(content: object) -> list[str]:
+     """Extract transient framework notices from structured content."""
+     if not isinstance(content, list):
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 34501b5268c170f8b7e7b2ab797409faad7d2870..efb765845e4c41177d5b7a43077ab2a367a33efa 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -5806,11 +5806,17 @@ async def _forward_native_terminal_message(
+     )
+     if conversation_store is not None:
+         from omnigent.inner.ae_team import team_notice
+-        from omnigent.inner.native_attachments import framework_notice_block
++        from omnigent.inner.native_attachments import (
++            framework_notice_block,
++            framework_notice_off_block,
++        )
+ 
+         notice = await asyncio.to_thread(team_notice, conv, conversation_store)
+-        if notice is not None:
+-            event["content"] = [*event["content"], framework_notice_block(notice)]
++        # No notice means it is off: say so, so the native hook can withdraw one it sent.
++        event["content"] = [
++            *event["content"],
++            framework_notice_block(notice) if notice is not None else framework_notice_off_block(),
++        ]
+     _logger.info(
+         "%s terminal message forward starting: session=%s block_types=%s model_override=%s",
+         display_name,
+@@ -6449,14 +6455,17 @@ async def _forward_event_to_runner(
+     forwarded_data = dict(body.data)
+     if body.type == "message" and body.data.get("role") == "user":
+         from omnigent.inner.ae_team import team_notice
+-        from omnigent.inner.native_attachments import framework_notice_block
++        from omnigent.inner.native_attachments import (
++            framework_notice_block,
++            framework_notice_off_block,
++        )
+ 
+         notice = await asyncio.to_thread(team_notice, conv, conversation_store)
+-        if notice is not None:
+-            forwarded_data["content"] = [
+-                *forwarded_data.get("content", []),
+-                framework_notice_block(notice),
+-            ]
++        # No notice means it is off: say so, so the native hook can withdraw one it sent.
++        forwarded_data["content"] = [
++            *forwarded_data.get("content", []),
++            framework_notice_block(notice) if notice is not None else framework_notice_off_block(),
++        ]
+     if (
+         file_store is not None
+         and artifact_store is not None
+diff --git a/tests/harnesses/claude_native/test_framework_context_gate.py b/tests/harnesses/claude_native/test_framework_context_gate.py
+index 2952d2551d68bc22418206779087e793e68c7dc8..4d8114704fb201629948bc9ec5d5348ac8f5ac4b 100644
+--- a/tests/harnesses/claude_native/test_framework_context_gate.py
++++ b/tests/harnesses/claude_native/test_framework_context_gate.py
+@@ -18,6 +18,7 @@ from omnigent.harnesses.claude_native.bridge import (
+     CLAUDE_FRAMEWORK_STATE_FILE,
+     FRAMEWORK_REFRESH_EVERY,
+ )
++from omnigent.harnesses.claude_native.bridge import CLAUDE_NOTICE_OFF_MARKER as OFF
+ from omnigent.harnesses.claude_native.hook import NOTICE_WITHDRAWN
+ from omnigent.inner.ae_roles import NOTICE_PREFIX
+ from omnigent.inner.ae_team import render_team_notice
+@@ -182,8 +183,10 @@ def test_other_notices_pass_through_whole(monkeypatch, capsys, tmp_path) -> None
+     second = _prompt(monkeypatch, capsys, tmp_path, both)
+     assert second.startswith(resize + "\n\n")
+     assert _is_marker(second.split("\n\n", 1)[1])
+-    # With the team notice gone, the other notice goes alone with the withdrawal line.
+-    assert _prompt(monkeypatch, capsys, tmp_path, resize) == f"{resize}\n\n{NOTICE_WITHDRAWN}"
++    # A message with no team notice and no off marker (queued, system or pane-typed) leaves
++    # the gate alone.
++    assert _prompt(monkeypatch, capsys, tmp_path, resize) == resize
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
+ 
+ 
+ def test_a_prompt_with_no_context_file_adds_nothing(monkeypatch, capsys, tmp_path) -> None:
+@@ -204,14 +207,14 @@ def test_turning_collaboration_off_withdraws_the_notice_once(
+     monkeypatch, capsys, tmp_path
+ ) -> None:
+     _prompt(monkeypatch, capsys, tmp_path)
+-    assert _prompt(monkeypatch, capsys, tmp_path, "") == NOTICE_WITHDRAWN
++    assert _prompt(monkeypatch, capsys, tmp_path, OFF) == NOTICE_WITHDRAWN
+     assert not (tmp_path / CLAUDE_FRAMEWORK_STATE_FILE).exists()
+-    assert _prompt(monkeypatch, capsys, tmp_path, "") == ""
++    assert _prompt(monkeypatch, capsys, tmp_path, OFF) == ""
+ 
+ 
+ def test_turning_collaboration_back_on_sends_the_full_block(monkeypatch, capsys, tmp_path) -> None:
+     _prompt(monkeypatch, capsys, tmp_path)
+-    _prompt(monkeypatch, capsys, tmp_path, "")
++    _prompt(monkeypatch, capsys, tmp_path, OFF)
+     assert _prompt(monkeypatch, capsys, tmp_path) == BODY
+     assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
+ 
+@@ -219,12 +222,13 @@ def test_turning_collaboration_back_on_sends_the_full_block(monkeypatch, capsys,
+ def test_withdrawal_keeps_other_notices(monkeypatch, capsys, tmp_path) -> None:
+     resize = "Note: the attached image was downscaled."
+     _prompt(monkeypatch, capsys, tmp_path)
+-    assert _prompt(monkeypatch, capsys, tmp_path, resize) == f"{resize}\n\n{NOTICE_WITHDRAWN}"
++    both = f"{resize}\n\n{OFF}"
++    assert _prompt(monkeypatch, capsys, tmp_path, both) == f"{resize}\n\n{NOTICE_WITHDRAWN}"
+ 
+ 
+ def test_a_compact_after_withdrawal_resends_nothing(monkeypatch, capsys, tmp_path) -> None:
+     _prompt(monkeypatch, capsys, tmp_path)
+-    _prompt(monkeypatch, capsys, tmp_path, "")
++    _prompt(monkeypatch, capsys, tmp_path, OFF)
+     assert _start(monkeypatch, capsys, tmp_path, "compact") == ""
+ 
+ 
+@@ -369,3 +373,25 @@ def test_a_notice_naming_no_preset_gets_a_marker_without_one(
+     assert _is_marker(marker)
+     assert "preset" not in marker
+     assert re.fullmatch(r"Omnigent notice v[0-9a-f]{8} still in force\.", marker), marker
++
++
++def test_no_notice_without_the_off_marker_never_withdraws(monkeypatch, capsys, tmp_path) -> None:
++    _prompt(monkeypatch, capsys, tmp_path)
++    # Pane-typed: no context file at all.
++    assert _prompt(monkeypatch, capsys, tmp_path, None) == ""
++    # Queued or system prompt that reached the hook with an empty file.
++    assert _prompt(monkeypatch, capsys, tmp_path, "") == ""
++    assert (tmp_path / CLAUDE_FRAMEWORK_STATE_FILE).exists()
++    assert _is_marker(_prompt(monkeypatch, capsys, tmp_path))
++
++
++def test_an_interrupt_just_before_the_boundary_gets_the_refresh(
++    monkeypatch, capsys, tmp_path
++) -> None:
++    log = _transcript(tmp_path / "t.jsonl", ["a"])
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
++    for _ in range(FRAMEWORK_REFRESH_EVERY - 1):
++        assert _is_marker(_prompt(monkeypatch, capsys, tmp_path, transcript=log))
++    with log.open("a") as handle:
++        handle.write(json.dumps({"uuid": "b", "text": "[Request interrupted by user]"}) + "\n")
++    assert _prompt(monkeypatch, capsys, tmp_path, transcript=log) == BODY
+diff --git a/tests/inner/test_claude_native_executor.py b/tests/inner/test_claude_native_executor.py
+index 0111b4a99bd579169b25b3384a9dde2dafea7419..e1fca454b43c5a8d9cb4db5592ae31e3bec7525f 100644
+--- a/tests/inner/test_claude_native_executor.py
++++ b/tests/inner/test_claude_native_executor.py
+@@ -1011,7 +1011,7 @@ async def test_enqueue_session_message_materializes_image(
+     assert len(written) == 1
+     assert written[0].name == "steering_img.png"
+     assert await executor.enqueue_session_message("session-key", "follow-up")
+-    assert (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).read_text() == ""
++    assert not (tmp_path / CLAUDE_FRAMEWORK_CONTEXT_FILE).exists()
+ 
+ 
+ @pytest.mark.asyncio
+@@ -2089,3 +2089,14 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
+ 
+     assert isinstance(events[0], ExecutorError)
+     assert events[0].message == "terminal did not become ready"
++
++
++def test_the_off_marker_rides_only_an_explicit_off_block() -> None:
++    from omnigent.harnesses.claude_native.bridge import CLAUDE_NOTICE_OFF_MARKER
++    from omnigent.inner.claude_native_executor import _notices_and_off
++    from omnigent.inner.native_attachments import framework_notice_off_block
++
++    assert _notices_and_off([{"type": "input_text", "text": "hi"}]) == []
++    assert _notices_and_off("plain text") == []
++    off = [{"type": "input_text", "text": "hi"}, framework_notice_off_block()]
++    assert _notices_and_off(off) == [CLAUDE_NOTICE_OFF_MARKER]

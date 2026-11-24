@@ -6,7 +6,7 @@ Admin Center shows the list, and the preset review turns it into suggestions a p
 
 Families:
 
-* Claude ``opus``, ``sonnet``, ``haiku`` and ``fable``, parsed from ids such as
+* Claude ``opus``, ``sonnet``, ``haiku``, ``fable`` and ``mythos``, parsed from ids such as
   ``claude-opus-5-5`` (major, then minor; a date suffix such as ``-20250514`` is not a version).
 * Codex by the words after the generation number (``gpt-6-astra``: ``astra``; ``gpt-5-astra-mini``:
   ``astra-mini``, its own family) and the generation (``gpt-6-astra`` beats ``gpt-5.6-astra``).
@@ -48,7 +48,7 @@ CLAUDE_HARNESSES = ("claude-native", "claude-sdk")
 CODEX_HARNESSES = ("codex-native", "codex")
 
 _CLAUDE = re.compile(
-    r"(?:^|[-_./])(fable|opus|sonnet|haiku)[-_ ](\d{1,2})(?:[-_.](\d{1,2}))?(?=$|[-_\[\s])",
+    r"(?:^|[-_./])(fable|opus|sonnet|haiku|mythos)[-_ ](\d{1,2})(?:[-_.](\d{1,2}))?(?=$|[-_\[\s])",
     re.IGNORECASE,
 )
 _CODEX = re.compile(
@@ -56,6 +56,25 @@ _CODEX = re.compile(
     re.IGNORECASE,
 )
 _SUFFIX = re.compile(r"\[[^\]]{1,20}\]$")
+
+# Claude ids a subscription serves, newest first per family (same list as the web's
+# AE_CLAUDE_KNOWN_MODELS, 2026-11-10). A host catalog lists only each family's newest model and
+# can lag a release (Claude Code 2.1.322 still reports Fable 5.1 while 5.2 answers), so
+# :func:`find` counts these ids, and their ``[1m]`` variants, as available next to the catalog.
+KNOWN_CLAUDE_MODELS: tuple[str, ...] = (
+    "claude-opus-5-5",
+    "claude-opus-5",
+    "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-5-5",
+    "claude-sonnet-5",
+    "claude-sonnet-4-6",
+    "claude-haiku-5-5",
+    "claude-haiku-4-5",
+    "claude-fable-5-2",
+    "claude-fable-5-1",
+    "claude-fable-5",
+)
 
 Version = tuple[int, ...]
 Parsed = tuple[str, str, Version]  # (vendor, family, version)
@@ -198,6 +217,7 @@ def find(
     presets: Iterable[role_prefs.Preset],
     catalog: Iterable[dict[str, Any]],
     not_moved: list[dict[str, Any]] | None = None,
+    known: Iterable[str] = KNOWN_CLAUDE_MODELS,
 ) -> list[dict[str, Any]]:
     """The preset rows with a newer model in the same family, one dict per preset.
 
@@ -208,8 +228,16 @@ def find(
 
     :param not_moved: when given, rows that have a newer model but no matching variant are
         appended as ``{"preset", "title", "role", "reason"}`` and left out of the answer.
+    :param known: Claude ids that count as available next to the catalog, each with its ``[1m]``
+        variant; defaults to :data:`KNOWN_CLAUDE_MODELS`. Ignored when the catalog is empty (no
+        host answered, so nothing is suggested).
     """
-    best = newest(catalog)
+    catalog = list(catalog)
+    if not catalog:
+        return []
+    best = newest(
+        [*catalog, *({"model": m} for k in known for m in (k, k + "[1m]") if parse(k) is not None)]
+    )
     if not best:
         return []
     out: list[dict[str, Any]] = []
@@ -291,9 +319,10 @@ def for_users(
     states: dict[str, list[role_prefs.Preset]],
     catalog: list[dict[str, Any]],
     not_moved: list[dict[str, Any]] | None = None,
+    known: Iterable[str] = KNOWN_CLAUDE_MODELS,
 ) -> dict[str, list[dict[str, Any]]]:
     """:func:`find` per user, users with nothing newer left out."""
-    found = {user: find(presets, catalog, not_moved) for user, presets in states.items()}
+    found = {user: find(presets, catalog, not_moved, known) for user, presets in states.items()}
     return {user: rows for user, rows in found.items() if rows}
 
 
@@ -493,6 +522,7 @@ async def catalog_soft(
 
 __all__ = [
     "CACHE_SECONDS",
+    "KNOWN_CLAUDE_MODELS",
     "catalog_soft",
     "fetch_catalog",
     "find",

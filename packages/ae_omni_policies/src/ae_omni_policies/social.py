@@ -249,6 +249,33 @@ class Draft(BaseModel):
     edited: bool = False
 
 
+VisualKind = Literal["diagram", "picture", "screenshot"]
+VISUAL_KINDS_FOR = ("tool", "expert")
+"""The post kinds that get made pictures; an upload post keeps its video's thumbnail."""
+MAX_VISUAL_LABEL = 60
+MAX_VISUALS = 5
+CANDIDATE_ID = r"^c[1-5]$"
+
+
+class MadeVisual(BaseModel):
+    """One made picture: its rank is its place in :attr:`VisualSet.candidates`."""
+
+    id: str = Field(pattern=CANDIDATE_ID)
+    kind: VisualKind
+    label: str = Field(min_length=1, max_length=MAX_VISUAL_LABEL)
+    sha: str = Field(pattern=r"^[0-9a-f]{16}$")
+
+
+class VisualSet(BaseModel):
+    """The made pictures of one post (2026-11-15), best first, and which one it shares."""
+
+    candidates: list[MadeVisual] = Field(min_length=1, max_length=MAX_VISUALS)
+    chosen: str = Field(pattern=r"^(c[1-5]|none)$")
+    """A candidate id, or ``none`` for no picture at all (not even a tool's site card)."""
+    by: Literal["auto", "reid"] = "auto"
+    at: datetime
+
+
 class Posted(BaseModel):
     at: datetime
     url: str | None = Field(default=None, pattern=r"^https://\S{1,490}$")
@@ -266,6 +293,8 @@ class State(BaseModel):
     slots: dict[str, Slot] = Field(default_factory=dict)
     drafts: dict[str, Draft] = Field(default_factory=dict)
     posted: dict[str, Posted] = Field(default_factory=dict)
+    visuals: dict[str, VisualSet] = Field(default_factory=dict)
+    """Made pictures per post (2026-11-15); the files live in :mod:`.social_made`."""
     best_streak: int = 0
     week_posted: dict[str, int] = Field(default_factory=dict)
     """LinkedIn posts marked posted per local ISO week, keyed by that week's Monday (kept 104
@@ -549,7 +578,7 @@ def plan(state: State, now: datetime) -> State:
     for sid, slot in list(state.slots.items()):
         if slot.due < cutoff:
             del state.slots[sid]
-    for table in (state.drafts, state.posted):
+    for table in (state.drafts, state.posted, state.visuals):
         for sid in [sid for sid in table if sid not in state.slots]:
             del table[sid]
 
@@ -886,6 +915,21 @@ def _slot_row(state: State, slot: Slot, now: datetime | None = None) -> dict[str
             row["visual_note"] = "The thumbnail shows once the video is public."
     elif tool is not None and social_visual.tool_image_ok(tool.image):
         row["visual"] = {"kind": "tool", "key": tool.image}
+    made = state.visuals.get(slot.id)
+    if made is not None:
+        # Made pictures (2026-11-15) replace a tool's site card; the card lists them best
+        # first for the picker, and `visual` follows the choice.
+        row["visuals"] = [
+            {"id": c.id, "kind": c.kind, "label": c.label, "key": c.sha} for c in made.candidates
+        ]
+        row["visual_choice"] = made.chosen
+        row["visual_choice_by"] = made.by
+        chosen = next((c for c in made.candidates if c.id == made.chosen), None)
+        row.pop("visual", None)
+        if chosen is not None:
+            row["visual"] = {"kind": "made", "key": f"{chosen.id}:{chosen.sha}"}
+        else:
+            row["visual_note"] = "No picture: you picked none."
     if draft is not None:
         # A fingerprint of the whole text: the preview stops at PREVIEW characters, so the
         # compact card's cached full draft is keyed on this and an edit past that is seen.
@@ -989,6 +1033,27 @@ def visual_source(
     return f"tool:{tool.image}", [tool.image or ""], social_visual.tool_image_hosts()
 
 
+def made_target(state: State, slot_id: str, candidate: str | None) -> str:
+    """The sha of the made picture the visual route serves: *candidate*, else the chosen one.
+
+    :raises SocialError: 404 when the slot is unknown, has no made pictures, or no such
+        candidate (or none is chosen and none was asked for).
+    """
+    slot = state.slots.get(slot_id)
+    if slot is None:
+        raise SocialError(404, f"no social slot {slot_id!r}; reload the card and try again")
+    made = state.visuals.get(slot_id)
+    if made is None:
+        raise SocialError(404, "this post has no made pictures yet")
+    wanted = candidate or made.chosen
+    if wanted == "none":
+        raise SocialError(404, "No picture: you picked none.")
+    found = next((c for c in made.candidates if c.id == wanted), None)
+    if found is None:
+        raise SocialError(404, f"this post has no picture {wanted!r}; reload the card")
+    return found.sha
+
+
 def week_context(state: State, now: datetime, *, redraft: bool = False) -> dict[str, Any]:
     """``GET /social/week``: open slots due within a week (overdue too) that lack a draft.
 
@@ -1059,10 +1124,37 @@ def week_context(state: State, now: datetime, *, redraft: bool = False) -> dict[
         "slot_count": len(due),
         "truncated": True,
         "recent_topics": topics[-12:],
+        "needs_visuals": [],
     }
     kept = _fill_slots(payload, (lean(slot) for slot in due))
     payload["slots"] = kept
     payload["truncated"] = len(kept) < len(due)
+    # Posts that should get made pictures and have none (2026-11-15): open tool and expert
+    # posts due within the week. The text rides along when there is a draft; a post being
+    # drafted in the same run gets its new text from the drafter itself.
+    wanting = sorted(
+        (
+            slot
+            for slot in state.slots.values()
+            if slot.state == "planned"
+            and slot.kind in VISUAL_KINDS_FOR
+            and slot.platform == "linkedin"
+            and slot.due <= end
+            and slot.id not in state.visuals
+        ),
+        key=lambda s: s.due,
+    )
+
+    def needing(slot: Slot) -> dict[str, Any]:
+        row = lean(slot)
+        row.pop("redraft", None)
+        draft = state.drafts.get(slot.id)
+        row["text"] = draft.text if draft is not None else None
+        return row
+
+    payload["needs_visuals"] = _fill_slots(payload, (needing(slot) for slot in wanting))
+    # The drafter makes the rest on a later daily run; this says the list was cut.
+    payload["needs_visuals_truncated"] = len(payload["needs_visuals"]) < len(wanting)
     return payload
 
 
@@ -1228,6 +1320,80 @@ def apply_drafts(
     return {"written": written, "kept": kept, "errors_set": flagged}
 
 
+class VisualIn(BaseModel):
+    """One candidate from the drafter: the full JPEG and its picker preview, in base64."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    kind: VisualKind
+    label: str = Field(min_length=1, max_length=MAX_VISUAL_LABEL)
+    full: str = Field(min_length=8, max_length=820_000)
+    preview: str = Field(min_length=8, max_length=82_000)
+
+
+class VisualsIn(BaseModel):
+    """``POST /social/visuals``: one post's candidates, best first (the first is preselected)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=SLOT_ID)
+    candidates: list[VisualIn] = Field(min_length=1, max_length=MAX_VISUALS)
+
+
+class VisualChoiceIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    id: str = Field(pattern=SLOT_ID)
+    choice: str = Field(pattern=r"^(c[1-5]|none)$")
+
+
+def visuals_allowed(state: State, slot_id: str) -> Slot:
+    """The slot, when it may take made pictures: open, a tool or expert post, none yet.
+
+    :raises SocialError: 404 unknown, 409 closed or already has a set, 422 the wrong kind.
+    """
+    slot = _slot(state, slot_id)
+    if slot.kind not in VISUAL_KINDS_FOR or slot.platform != "linkedin":
+        raise SocialError(422, "only LinkedIn tool and expert posts take made pictures")
+    if slot.state != "planned":
+        raise SocialError(409, "that post is closed; reopen it first")
+    if slot_id in state.visuals:
+        raise SocialError(409, "that post already has its pictures")
+    return slot
+
+
+def apply_visuals(
+    state: State, slot_id: str, made: list[tuple[str, str, str]], now: datetime
+) -> VisualSet:
+    """Record a post's made pictures, ``(kind, label, sha)`` best first; the first is chosen."""
+    visuals_allowed(state, slot_id)
+    candidates = [
+        MadeVisual(id=f"c{n}", kind=kind, label=label, sha=sha)  # type: ignore[arg-type]
+        for n, (kind, label, sha) in enumerate(made, 1)
+    ]
+    chosen = VisualSet(candidates=candidates, chosen="c1", at=now)
+    state.visuals[slot_id] = chosen
+    return chosen
+
+
+def choose_visual(state: State, slot_id: str, choice: str, now: datetime) -> None:
+    """Reid's pick of a post's picture, or ``none``."""
+    _slot(state, slot_id)
+    made = state.visuals.get(slot_id)
+    if made is None:
+        raise SocialError(404, "this post has no made pictures yet; reload the card")
+    if choice != "none" and all(c.id != choice for c in made.candidates):
+        raise SocialError(404, f"this post has no picture {choice!r}; reload the card")
+    made.chosen = choice
+    made.by = "reid"
+    made.at = now
+
+
+def kept_shas(state: State) -> dict[str, set[str]]:
+    """Every stored picture still referenced, per slot (the store deletes the rest)."""
+    return {sid: {c.sha for c in made.candidates} for sid, made in state.visuals.items()}
+
+
 class RulesPatch(BaseModel):
     """``POST /v1/ae/social/rules``: any subset of the rules, validated as a whole."""
 
@@ -1339,6 +1505,11 @@ def _default_path() -> Path | None:
     return None
 
 
+def state_file() -> Path | None:
+    """Where the state is saved (None: memory only); the made pictures sit beside it."""
+    return _default_path()
+
+
 _store: SocialStore | None = None
 _store_lock = threading.Lock()
 
@@ -1369,6 +1540,7 @@ __all__ = [
     "DraftErrorIn",
     "DraftIn",
     "Item",
+    "MadeVisual",
     "Posted",
     "Rules",
     "RulesPatch",
@@ -1380,13 +1552,21 @@ __all__ = [
     "Tool",
     "ToolsPost",
     "UploadsPost",
+    "VisualChoiceIn",
+    "VisualIn",
+    "VisualSet",
+    "VisualsIn",
     "add_expert",
     "apply_drafts",
     "apply_rules",
     "apply_uploads",
+    "apply_visuals",
     "channel_ids",
+    "choose_visual",
     "edit_draft",
     "gaps",
+    "kept_shas",
+    "made_target",
     "mark_posted",
     "plan",
     "reopen",
@@ -1395,8 +1575,10 @@ __all__ = [
     "score",
     "skip",
     "slot_detail",
+    "state_file",
     "store",
     "utcnow",
     "view",
+    "visuals_allowed",
     "week_context",
 ]

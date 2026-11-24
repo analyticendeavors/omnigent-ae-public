@@ -429,10 +429,40 @@ def test_a_review_dir_with_a_git_file_or_no_git_is_kept(tmp_path: Path) -> None:
     assert plan.count == 0 and plan.skipped["git"] == 2
 
 
+@pytest.fixture(autouse=True)
+def _no_installed_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests run the direct docker path unless one installs a fake gate."""
+    monkeypatch.setattr(box_cleanup, "AE_GATE", "/nonexistent/ae-gate")
+
+
 # ── docker, host_run and the dry run ────────────────────────────────────────
 
 
-def test_docker_prune_runs_dangling_only_with_the_age_filter() -> None:
+def test_docker_prune_uses_the_gate_prune_verbs_when_it_is_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = tmp_path / "ae-gate"
+    gate.write_text("#!/bin/sh\n")
+    gate.chmod(0o755)
+    monkeypatch.setattr(box_cleanup, "AE_GATE", str(gate))
+    calls: list[tuple[str, ...]] = []
+
+    def fake(argv: object, _timeout: float) -> tuple[int, str]:
+        calls.append(tuple(argv))  # type: ignore[arg-type]
+        return 0, "Total reclaimed space: 1.5GB\n"
+
+    outcome = box_cleanup.prune_docker(fake, 48)
+    assert calls == [
+        ("sudo", "-n", str(gate), "prune-images"),
+        ("sudo", "-n", str(gate), "prune-builder"),
+    ]
+    assert outcome.bytes_freed == 3_000_000_000
+
+
+def test_docker_prune_runs_dangling_only_with_the_age_filter(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(box_cleanup, "AE_GATE", "/nonexistent/ae-gate")
     calls: list[tuple[str, ...]] = []
 
     def fake(argv: object, _timeout: float) -> tuple[int, str]:

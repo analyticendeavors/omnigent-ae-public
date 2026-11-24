@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:37:47 -0800
+Subject: [PATCH 338/443] [ae-patch] Queue the spoken-style line per web
+ message and clear it when a message appends nothing
+
+---
+ omnigent/runtime/pending_inputs.py            | 52 ++++++++++++++-----
+ .../server/routes/_sessions/orchestration.py  | 11 ++--
+ tests/runtime/test_pending_inputs.py          | 37 +++++++++++--
+ tests/server/routes/test_sessions_policy.py   |  3 ++
+ 4 files changed, 82 insertions(+), 21 deletions(-)
+
+diff --git a/omnigent/runtime/pending_inputs.py b/omnigent/runtime/pending_inputs.py
+index c3cbaa3976e538a1d1a4f1084711ba558dd2f281..80129becaaaf89bc642684a5b77653ab3bef3c3a 100644
+--- a/omnigent/runtime/pending_inputs.py
++++ b/omnigent/runtime/pending_inputs.py
+@@ -111,6 +111,7 @@ import re
+ import threading
+ import time
+ import uuid
++from collections import deque
+ from collections.abc import Iterable
+ from dataclasses import dataclass, field
+ from typing import Any, Literal
+@@ -749,40 +750,65 @@ def resolve_matching_text(
+         )
+ 
+ 
+-# One request-context slot per conversation: the text a request-phase policy appended
+-# to a web-composer message, kept for the native hook's dedup answer (see routes_hooks).
++# A small FIFO of request-context texts per conversation: what a request-phase policy
++# appended to each web-composer message, kept for the native hook's dedup answer
++# (see routes_hooks). Each entry carries its own timestamp.
+ _REQUEST_CONTEXT_TTL_S = 600.0
+-_request_context: dict[str, tuple[float, str]] = {}
++_REQUEST_CONTEXT_CAP = 8
++_request_context: dict[str, deque[tuple[float, str]]] = {}
+ 
+ 
+ def set_request_context(conversation_id: str, text: str) -> None:
+     """
+-    Keep the text a request-phase policy appended to a web message.
++    Queue the text a request-phase policy appended to a web message.
+ 
+-    The ingest gate drops a policy's rewrite on ALLOW; this slot carries the
++    The ingest gate drops a policy's rewrite on ALLOW; this queue carries the
+     appended part to the native hook route, which hands it back to the hook.
+-    One slot per session, overwritten by a newer call, dropped after 10 minutes.
++    Entries expire after 10 minutes; past 8 queued the oldest is dropped.
+ 
+     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+     :param text: The appended part, e.g. ``"Voice mode is on: ..."``.
+     """
+     with _lock:
+-        _request_context[conversation_id] = (_now(), text)
++        queue = _request_context.setdefault(conversation_id, deque(maxlen=_REQUEST_CONTEXT_CAP))
++        queue.append((_now(), text))
+ 
+ 
+ def take_request_context(conversation_id: str) -> str | None:
+     """
+-    Return and clear the session's request-context slot.
++    Pop the oldest unexpired request-context text for the session.
+ 
+     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
+-    :returns: The stored text, or ``None`` when the slot is empty or older than
+-        10 minutes.
++    :returns: The oldest stored text younger than 10 minutes (older entries are
++        dropped on the way), or ``None`` when nothing is left.
+     """
+     with _lock:
+-        entry = _request_context.pop(conversation_id, None)
+-        if entry is None or _now() - entry[0] > _REQUEST_CONTEXT_TTL_S:
++        queue = _request_context.get(conversation_id)
++        if queue is None:
+             return None
+-        return entry[1]
++        now = _now()
++        result: str | None = None
++        while queue:
++            stamp, text = queue.popleft()
++            if now - stamp <= _REQUEST_CONTEXT_TTL_S:
++                result = text
++                break
++        if not queue:
++            _request_context.pop(conversation_id, None)
++        return result
++
++
++def clear_request_context(conversation_id: str) -> None:
++    """
++    Empty the session's request-context queue.
++
++    Called when a message is allowed with nothing appended, so a line left by an
++    earlier message cannot ride on a later one.
++
++    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
++    """
++    with _lock:
++        _request_context.pop(conversation_id, None)
+ 
+ 
+ def has_pending(conversation_id: str) -> bool:
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 8c8bbbf700c4704b29a03b5c82a04e18ae018afb..7a6d7fe7508483377fa28b141eb85f96b1265ee6 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -9412,7 +9412,8 @@ def _keep_appended_request_text(session_id: str, user_text: str, data: object) -
+ 
+     A native session's hook re-evaluates the prompt and the hook route answers a
+     web prompt with a bare ALLOW; this slot lets it hand the appended part back.
+-    A rewrite that does not start with the original text is ignored.
++    A message with nothing appended (or a rewrite that does not start with the
++    original text) clears the session's queue so an earlier line cannot ride on it.
+ 
+     :param session_id: Session id, e.g. ``"conv_abc123"``.
+     :param user_text: The message text the policy saw.
+@@ -9420,11 +9421,13 @@ def _keep_appended_request_text(session_id: str, user_text: str, data: object) -
+         ``{"user_content": "hi\\n\\nbe brief"}``.
+     """
+     rewritten = data.get("user_content") if isinstance(data, dict) else data
+-    if not isinstance(rewritten, str) or not user_text or not rewritten.startswith(user_text):
+-        return
+-    suffix = rewritten[len(user_text) :].strip()
++    suffix = ""
++    if isinstance(rewritten, str) and user_text and rewritten.startswith(user_text):
++        suffix = rewritten[len(user_text) :].strip()
+     if suffix:
+         pending_inputs.set_request_context(session_id, suffix)
++    else:
++        pending_inputs.clear_request_context(session_id)
+ 
+ 
+ async def _evaluate_input_policy(
+diff --git a/tests/runtime/test_pending_inputs.py b/tests/runtime/test_pending_inputs.py
+index 73a4ec2aa1d14b90ae4aa80bc4028e33093be93d..9966440c95ee1511b45f0505a17050cccd7915df 100644
+--- a/tests/runtime/test_pending_inputs.py
++++ b/tests/runtime/test_pending_inputs.py
+@@ -1002,11 +1002,40 @@ def test_request_context_is_taken_once() -> None:
+     assert pending_inputs.take_request_context("conv_a") is None
+ 
+ 
+-def test_request_context_newer_set_replaces_older() -> None:
+-    """One slot per session: a newer set overwrites the older text."""
++def test_request_context_is_a_fifo() -> None:
++    """Two sets then two takes return both texts in order; a third take is None."""
++    pending_inputs.set_request_context("conv_a", "first")
++    pending_inputs.set_request_context("conv_a", "second")
++    assert pending_inputs.take_request_context("conv_a") == "first"
++    assert pending_inputs.take_request_context("conv_a") == "second"
++    assert pending_inputs.take_request_context("conv_a") is None
++
++
++def test_request_context_expired_head_is_skipped(monkeypatch: pytest.MonkeyPatch) -> None:
++    """An expired oldest entry is dropped and the next unexpired one is returned."""
++    clock = {"t": 1000.0}
++    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
+     pending_inputs.set_request_context("conv_a", "old")
+-    pending_inputs.set_request_context("conv_a", "new")
+-    assert pending_inputs.take_request_context("conv_a") == "new"
++    clock["t"] = 1500.0
++    pending_inputs.set_request_context("conv_a", "fresh")
++    clock["t"] = 1650.0
++    assert pending_inputs.take_request_context("conv_a") == "fresh"
++
++
++def test_request_context_cap_drops_the_oldest() -> None:
++    """Past the cap the oldest entry is dropped."""
++    cap = pending_inputs._REQUEST_CONTEXT_CAP
++    for i in range(cap + 1):
++        pending_inputs.set_request_context("conv_a", f"t{i}")
++    assert pending_inputs.take_request_context("conv_a") == "t1"
++
++
++def test_clear_request_context_on_empty_and_filled_queue() -> None:
++    """Clear is a no-op on an empty queue and empties a filled one."""
++    pending_inputs.clear_request_context("conv_a")
++    pending_inputs.set_request_context("conv_a", "x")
++    pending_inputs.clear_request_context("conv_a")
++    assert pending_inputs.take_request_context("conv_a") is None
+ 
+ 
+ def test_request_context_expires_after_ten_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+diff --git a/tests/server/routes/test_sessions_policy.py b/tests/server/routes/test_sessions_policy.py
+index d2a7e82efd4f75a1bb75a380f070cc887ac004dc..10a7b89905af3b61e74e63abd54efed1523a84c7 100644
+--- a/tests/server/routes/test_sessions_policy.py
++++ b/tests/server/routes/test_sessions_policy.py
+@@ -561,6 +561,9 @@ async def test_input_allow_keeps_only_an_appended_rewrite(data: Any, expected: s
+     from omnigent.runtime import pending_inputs
+ 
+     pending_inputs.reset_for_tests()
++    if expected is None:
++        # An earlier message left a line behind; an ALLOW with nothing appended clears it.
++        pending_inputs.set_request_context("sess_1", "stale line")
+     conv_store = _FakeConversationStore()
+     agent_store = _FakeAgentStore(agent=_make_agent())
+     conv = conv_store.get_conversation("sess_1")

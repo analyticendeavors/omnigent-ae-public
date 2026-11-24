@@ -579,6 +579,16 @@ CGNAT = ipaddress.ip_network("100.64.0.0/10")
 # workflow ``uses:`` or ``repository:``, an API path. 2026-10-29: the personal-account handle is
 # not listed here; the private denylist blocks it as a hard hit wherever the denylist runs.
 REPO_LINK = re.compile(r"(?i)(?<![A-Za-z0-9_.@-])(analyticendeavors)/([A-Za-z0-9][A-Za-z0-9._-]*)")
+# The subject GitHub writes on a merge commit: "Merge pull request #<n> from <owner>/<branch>".
+# After "from" come the head branch's owner and the branch name, not a repository, so REPO_LINK
+# read the branch's first segment as a private repository: on 2026-11-10 a merge commit (branch
+# docs/...) failed main's push scan and stopped that release tag. Only a namespaced branch
+# (<segment>/<rest>) is excused, and only that one owner link on the first line of a commit with
+# two or more parents: a bare name after the owner could be a private repository, so it still
+# hits. The denylist and every other class still read the original text.
+GITHUB_MERGE_SUBJECT = re.compile(
+    r"\AMerge pull request #\d+ from (analyticendeavors)/([A-Za-z0-9][A-Za-z0-9._-]*)/[^\s/]"
+)
 TAILNET_LABELS = {
     "tailnet",
     "example",
@@ -821,12 +831,34 @@ def generic_matches(
             if not _is_placeholder_guid(m.group(1)) and GUID_CONTEXT.search(line):
                 found.append(("cloud-id", "hex32", m.group(1), m.start()))
     for m in REPO_LINK.finditer(text):
-        name = m.group(2).rstrip(".-")
-        if name.lower().endswith(".git"):
-            name = name[:-4]
-        if name:
-            found.append(("private-repo-link", "repo", f"{m.group(1)}/{name}", m.start()))
+        key = repo_link_key(m.group(1), m.group(2))
+        if key:
+            found.append(("private-repo-link", "repo", key, m.start()))
     return found
+
+
+def repo_link_key(owner: str, raw: str) -> str:
+    """The value a REPO_LINK match is keyed on (``owner/name``), or "" when no name is left."""
+    name = raw.rstrip(".-")
+    if name.lower().endswith(".git"):
+        name = name[:-4]
+    return f"{owner}/{name}" if name else ""
+
+
+def merge_subject_link(body: str) -> str:
+    """The owner link GitHub's merge subject makes of a namespaced branch, keyed as REPO_LINK keys
+    it, when it is the only link with that key on the first line; else ""."""
+    m = GITHUB_MERGE_SUBJECT.match(body)
+    if not m:
+        return ""
+    key = repo_link_key(m.group(1), m.group(2))
+    first = body.split("\n", 1)[0]
+    same = [
+        x
+        for x in REPO_LINK.finditer(first)
+        if repo_link_key(x.group(1), x.group(2)).lower() == key.lower()
+    ]
+    return key if len(same) == 1 else ""
 
 
 # ---------------------------------------------------------------------------
@@ -1842,16 +1874,24 @@ def raw_changes(git: Git, old: str, new: str) -> dict[str, tuple[str, str, str, 
 
 
 def commit_message_hits(git: Git, scanner: Scanner, sha: str) -> list[Hit]:
-    out = git.run("log", "-1", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1f%B", sha)
-    parts = out.decode(errors="replace").split("\x1f", 4)
-    if len(parts) != 5:
+    out = git.run("log", "-1", "--format=%an%x1f%ae%x1f%cn%x1f%ce%x1f%P%x1f%B", sha)
+    parts = out.decode(errors="replace").split("\x1f", 5)
+    if len(parts) != 6:
         raise ScanError("A commit's author fields did not parse, so it was not checked.")
-    an, ae, cn, ce, body = parts
+    an, ae, cn, ce, parents, body = parts
     hits = []
     if scanner.check_identity:
         hits += scanner.scan_identity(sha, "author", an, ae)
         hits += scanner.scan_identity(sha, "committer", cn, ce)
     hits += scanner.scan_text("commit", body, is_patch=False, label=f"commit {sha[:10]}")
+    branch_link = merge_subject_link(body) if len(parents.split()) > 1 else ""
+    if branch_link:
+        drop = digest_of(branch_link)
+        hits = [
+            h
+            for h in hits
+            if not (h.cls == "private-repo-link" and h.line == 1 and h.digest == drop)
+        ]
     return hits
 
 

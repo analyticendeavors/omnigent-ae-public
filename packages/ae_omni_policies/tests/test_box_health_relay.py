@@ -10,6 +10,7 @@ import os
 import re
 import time
 from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -156,6 +157,8 @@ class FakeRunner:
             return "ps"
         if argv[:2] == ["docker", "inspect"]:
             return "inspect"
+        if argv[:3] == ["docker", "image", "ls"]:
+            return "docker_dangling"
         if argv[:4] == ["docker", "system", "df", "-v"]:
             return "volumes"
         if argv[:3] == ["docker", "system", "df"]:
@@ -358,6 +361,13 @@ def test_mounts_keep_local_filesystems_and_drop_skipped_ones(tmp_path: Path) -> 
     assert used.used_b == (1000 - 400) * 4096 and used.avail_b == 300 * 4096
 
 
+@pytest.fixture(autouse=True)
+def _no_installed_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests run the direct docker path unless one installs a fake gate."""
+    monkeypatch.setattr(relay, "AE_GATE", "/nonexistent/ae-gate")
+    monkeypatch.setitem(relay._GATE_HEALTH, "t", 0.0)
+
+
 def test_docker_and_journal_sizes_parse() -> None:
     assert relay.parse_docker_size("98.01GB") == 98_010_000_000
     assert relay.parse_docker_size("5.82GB (5%)") == 5_820_000_000
@@ -373,6 +383,190 @@ def test_docker_and_journal_sizes_parse() -> None:
     )
     with pytest.raises(relay.RelayError):
         relay.read_docker(FakeRunner({"docker_df": RunResult(127)}))
+
+
+def test_docker_image_reclaim_counts_only_what_the_prune_button_frees() -> None:
+    now = datetime(2026, 11, 23, 12, tzinfo=UTC).timestamp()
+
+    def row(containers: str, created: str, size: str) -> str:
+        return json.dumps({"Containers": containers, "CreatedAt": created, "Size": size})
+
+    dangling = "\n".join(
+        (
+            row("0", "2026-11-07 15:34:10 -0800 PST", "1.5GB"),  # old and unused: counted
+            row("1", "2026-11-07 15:34:10 -0800 PST", "5.67GB"),  # a container uses it
+            row("0", "2026-11-23 03:00:00 +0000 UTC", "2GB"),  # newer than the 48 h filter
+            row("N/A", "2026-11-01 00:00:00 +0000 UTC", "3GB"),  # use unknown
+            "not json",
+        )
+    )
+    runner = FakeRunner({"docker_df": DOCKER_DF, "docker_dangling": dangling})
+    docker = relay.read_docker(runner, now=now, stale_days=2)
+    assert docker.images_reclaim_b == 1_500_000_000
+    assert docker.build_reclaim_b == 24_370_000
+    # The cutoff is inclusive and floors at one hour, as the prune's until filter does.
+    edge = json.dumps(
+        {"Containers": "0", "CreatedAt": "2026-11-23 11:00:00 +0000 UTC", "Size": "1GB"}
+    )
+    floor = relay.read_docker(
+        FakeRunner({"docker_df": DOCKER_DF, "docker_dangling": edge}), now=now, stale_days=0.01
+    )
+    assert floor.images_reclaim_b == 1_000_000_000
+    # A listing that fails keeps the rest of the df reading and claims nothing for images.
+    failed = relay.read_docker(
+        FakeRunner({"docker_df": DOCKER_DF, "docker_dangling": RunResult(1)}),
+        now=now,
+        stale_days=2,
+    )
+    assert (failed.images_reclaim_b, failed.volumes_b) == (0, 193_400_000_000)
+    # Without now and stale_days the df figure stays and no listing runs.
+    plain = FakeRunner({"docker_df": DOCKER_DF})
+    assert relay.read_docker(plain).images_reclaim_b == 5_820_000_000
+    assert all(c[:3] != ["docker", "image", "ls"] for c in plain.calls)
+
+
+def test_docker_df_goes_through_the_gate_when_it_is_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = tmp_path / "ae-gate"
+    gate.write_text("#!/bin/sh\n")
+    gate.chmod(0o755)
+    monkeypatch.setattr(relay, "AE_GATE", str(gate))
+    table = (
+        "TYPE            TOTAL     ACTIVE    SIZE      RECLAIMABLE\n"
+        "Images          210       5         98.01GB   5.82GB (5%)\n"
+        "Containers      12        3         392.5MB   0B (0%)\n"
+        "Local Volumes   13        4         193.4GB   0B (0%)\n"
+        "Build Cache     0         0         0B        0B\n"
+    )
+
+    class GateRunner(FakeRunner):
+        def key(self, argv: Sequence[str]) -> str:
+            if list(argv[:4]) == ["sudo", "-n", str(gate), "df"]:
+                return "gate_df"
+            return super().key(argv)
+
+    runner = GateRunner({"gate_df": RunResult(0, table)})
+    docker = relay.read_docker(runner)
+    assert runner.calls == [["sudo", "-n", str(gate), "df"]]
+    assert (docker.images, docker.images_reclaim_b, docker.volumes_b) == (
+        210,
+        5_820_000_000,
+        193_400_000_000,
+    )
+
+
+def test_container_ps_inspect_and_volumes_come_from_the_gate_health_json(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = tmp_path / "ae-gate"
+    gate.write_text("#!/bin/sh\n")
+    gate.chmod(0o755)
+    monkeypatch.setattr(relay, "AE_GATE", str(gate))
+    monkeypatch.setitem(relay._GATE_HEALTH, "t", 0.0)
+    health = {
+        "containers": [
+            {
+                "name": "omnigent-host-example",
+                "state": "running",
+                "status": "Up",
+                "image": "i",
+                "size": "293MB (virtual 5.15GB)",
+                "mounts": [
+                    {"Type": "volume", "Name": VOL_T, "Source": "/x", "Destination": "/home/agent"}
+                ],
+            }
+        ],
+        "volumes": [{"Name": VOL_T, "Size": "1.2GB"}],
+    }
+
+    class GateRunner(FakeRunner):
+        def key(self, argv: Sequence[str]) -> str:
+            if list(argv[:4]) == ["sudo", "-n", str(gate), "health"]:
+                return "gate_health"
+            return super().key(argv)
+
+    runner = GateRunner({"gate_health": RunResult(0, json.dumps(health))})
+    settings = settings_for(tmp_path)
+    name = "omnigent-host-example"
+    ps = relay._container_run(
+        runner, relay.container_argv("ps", container=name, user="agent"), settings, 60
+    )
+    assert json.loads(ps.out) == {"State": "running", "Size": "293MB (virtual 5.15GB)"}
+    ins = relay._container_run(
+        runner, relay.container_argv("inspect", container=name, user="agent"), settings, 30
+    )
+    assert json.loads(ins.out)[0]["Destination"] == "/home/agent"
+    sizes = relay.volume_sizes(runner, {}, NOW)
+    assert sizes == {relay._volume_key(VOL_T): 1_200_000_000}
+    assert runner.calls == [
+        ["sudo", "-n", str(gate), "health"],
+        ["sudo", "-n", str(gate), "health", "--volumes"],
+    ], "fast passes ask without volumes; the volume read asks once with them"
+
+
+def test_a_failed_gate_health_is_cached_for_the_pass(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = tmp_path / "ae-gate"
+    gate.write_text("#!/bin/sh\n")
+    gate.chmod(0o755)
+    monkeypatch.setattr(relay, "AE_GATE", str(gate))
+    monkeypatch.setitem(relay._GATE_HEALTH, "t", 0.0)
+    runner = FakeRunner({"sudo": RunResult(1)})
+    assert relay.gate_health(runner) is None
+    assert relay.gate_health(runner) is None
+    assert relay.gate_health(runner) is None
+    assert len(runner.calls) == 1
+
+
+def test_container_scans_and_removals_use_the_gate_when_it_is_installed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    gate = tmp_path / "ae-gate"
+    gate.write_text("#!/bin/sh\n")
+    gate.chmod(0o755)
+    monkeypatch.setattr(relay, "AE_GATE", str(gate))
+    name, user = "omnigent-host-example", "agent"
+    mapped = [name]
+    base = ["sudo", "-n", str(gate)]
+    uuid_path = f"/tmp/claude-1001/-slug/{UUID_A}"
+
+    def to_gate(argv: list[str]) -> list[str] | None:
+        return relay.gate_exec_argv(argv, mapped, user)
+
+    for key in (
+        "tmp_list",
+        "pytest_tree",
+        "worktrees_list",
+        "worktrees_du",
+        "procs",
+        "uid",
+        "uids",
+        "cmdlines",
+    ):
+        argv = relay.container_argv(key, container=name, user=user)
+        assert to_gate(argv) == [*base, "host-scan", name, key]
+    tree = relay.container_argv("claude_tree", container=name, user=user, n="1001")
+    assert to_gate(tree) == [*base, "host-scan", name, "claude_tree", "1001"]
+    fresh = relay.container_fresh_argv(name, user, [uuid_path], 1700000000)
+    assert to_gate(fresh) == [*base, "host-scan", name, "fresh", "1700000000", uuid_path]
+    rm = relay.container_rm_argv(name, user, [uuid_path])
+    assert to_gate(rm) == [*base, "host-clean", name, uuid_path]
+    assert to_gate(["docker", "exec", "-u", user, "other", "id", "-u"]) is None
+
+    settings = settings_for(tmp_path)
+    runner = FakeRunner({})
+    relay._container_stream(
+        runner, relay.container_argv("tmp_list", container=name, user=user), settings, 10
+    )
+    relay._container_run(
+        runner, relay.container_argv("uid", container=name, user=user), settings, 10
+    )
+    assert runner.calls == [
+        [*base, "host-scan", name, "tmp_list"],
+        [*base, "host-scan", name, "uid"],
+    ]
 
 
 def test_failed_units_are_named_only_from_the_allowlist() -> None:
@@ -534,6 +728,15 @@ def test_a_stopped_container_runs_nothing_else(tmp_path: Path) -> None:
     userb = next(u for u in post.slow.users if u.kind == "container")
     assert userb.running is False and userb.claude == []
     assert [runner.key(c) for c in runner.container_calls()] == ["ps"]
+
+
+def test_a_harmless_old_container_file_is_an_entry_but_not_stale(tmp_path: Path) -> None:
+    answers = container_answers()
+    answers["tmp_list"] = ["f\t1001\t1\tpi-usage-1.json\n"]
+    post, _, failed, _runner = full_run(tmp_path, answers)
+    userb = next(u for u in post.slow.users if u.kind == "container")
+    assert [(g.entries, g.stale) for g in userb.litter] == [(1, 0)]
+    assert "container UserB" not in failed
 
 
 def test_the_container_is_measured_as_counts(tmp_path: Path) -> None:

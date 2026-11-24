@@ -33,6 +33,17 @@ Patch P34 gives the seam: an observer run after a host connects, and
   host's brief reconnect spent the one try, and the real restart three seconds
   later was skipped as "already tried for this runner".
 
+An idle session counts as interrupted too when its last turn ended with background shells
+still running (the ``ae.bg_shells`` label, :mod:`ae_omni_policies.background_shells`,
+2026-11-23): the host restart killed them, and the session was waiting on their output. The
+same rules apply, but it is revived with a posted note
+(:func:`ae_omni_policies.background_shells.wake`) instead of upstream's continue turn, which
+only continues a turn that was cut off. A note that does not go out (the server still
+warming, say) is logged at WARNING and gives the try back, so the next connect retries.
+Upstream leaves an idle session idle when its runner dies after running (only a mid-turn
+session, or a runner that never connected, is marked failed), so this path, not upstream's
+recovery, is the one such a session takes.
+
 Interrupted sessions that are skipped are logged: "runner still alive" and
 "already tried for this runner" at INFO, "too old" at DEBUG (it repeats on every
 reconnect); other skips are silent.
@@ -78,6 +89,15 @@ def enabled(environ: Mapping[str, str] | None = None) -> bool:
     return value.strip().lower() not in {"0", "false", "off", "no"}
 
 
+def waiting_on_shells(conv: Conversation) -> bool:
+    """Whether idle *conv* ended its last turn with background shells still running."""
+    from omnigent.server.routes._sessions.common import _session_status_cache
+
+    from ae_omni_policies.background_shells import pending
+
+    return _session_status_cache.get(conv.id, conv.live_status) == "idle" and pending(conv)
+
+
 def skip_reason(conv: Conversation, *, host_id: str, now: float) -> str | None:
     """Why *conv* is not resumed on *host_id* connecting, or ``None`` to resume it."""
     from omnigent.server.child_session_recovery import _interrupted, _restorable
@@ -88,7 +108,7 @@ def skip_reason(conv: Conversation, *, host_id: str, now: float) -> str | None:
         return "sub-agent"
     if not _restorable(conv):
         return "not restorable"
-    if not _interrupted(conv):
+    if not _interrupted(conv) and not waiting_on_shells(conv):
         return "not interrupted"
     if now - conv.updated_at > MAX_AGE_S:
         return "too old"
@@ -154,6 +174,39 @@ _LOGGED_SKIPS = {
 }
 
 
+async def _wake_for_shells(store: Any, session_id: str, host_id: str) -> None:
+    """Post the background resume note; a note that did not go out gives the try back.
+
+    The server is often still warming when the host connects, so a failed post must not
+    spend the runner's one try: the ``ae.autoresume`` stamp is removed and the next connect
+    tries again.
+    """
+    import asyncio
+
+    from ae_omni_policies.background_shells import wake
+
+    try:
+        result = await wake(session_id)
+    except Exception as exc:  # noqa: BLE001 (logged below, and the try is given back)
+        result = repr(exc)
+    if result == "posted":
+        _logger.info(
+            "auto-resume: session %s on host %s: background note posted", session_id, host_id
+        )
+        return
+    _logger.warning(
+        "auto-resume: the background note for session %s on host %s did not go out (%s); "
+        "the next host connect tries again",
+        session_id,
+        host_id,
+        result,
+    )
+    try:
+        await asyncio.to_thread(store.delete_label, session_id, labels.AUTORESUME)
+    except Exception:  # noqa: BLE001 (the stamp stays; only a later runner gets a try)
+        _logger.warning("auto-resume: could not clear %s on %s", labels.AUTORESUME, session_id)
+
+
 async def resume_after_host_connect(event: HostConnectEvent) -> list[str]:
     """Resume the connecting host's interrupted sessions; returns the ids tried."""
     import asyncio
@@ -186,6 +239,9 @@ async def resume_after_host_connect(event: HostConnectEvent) -> list[str]:
             store.set_labels, conv.id, {labels.AUTORESUME: conv.runner_id or ""}
         )
         tried.append(conv.id)
+        if waiting_on_shells(conv):
+            await _wake_for_shells(store, conv.id, event.host_id)
+            continue
         try:
             result = await resume_interrupted_session(event.app_state, store, conv.id)
             _logger.info("auto-resume: session %s on host %s: %s", conv.id, event.host_id, result)
@@ -217,4 +273,5 @@ __all__ = [
     "resume_after_host_connect",
     "runner_alive",
     "skip_reason",
+    "waiting_on_shells",
 ]
