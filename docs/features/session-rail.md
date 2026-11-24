@@ -44,10 +44,10 @@ Triage comes first: the session's status as a switch (Working, Blocked, Review, 
 
 <p align="center"><img src="../media/rail-context-retry.webp" alt="Context that waits for Claude"></p>
 
-While Claude Code is still starting, Context shows a loading line and retries quietly instead of an error. If the runner is out of reach, it says so at once and offers Try again. An answer that retrying can never fix shows its reason straight away, with no Try again.
+While Claude Code is still starting, Context shows a loading line and retries quietly instead of an error. If the runner is out of reach, it says so at once and offers Try again. Try again (and the refresh button) wakes a sleeping runner before it reads; the automatic reloads never do. An answer that retrying can never fix shows its reason straight away, with no Try again.
 
 **Where:** The Context section of the session rail.<br>
-**Built from:** core patches [`0091`](../../patches/0091-ae-patch-Show-the-rail-s-context-and-connectors-as-l.patch), [`0092`](../../patches/0092-ae-patch-Show-a-permanent-context-answer-at-once-ins.patch), [`0093`](../../patches/0093-ae-patch-Fix-the-review-findings-on-the-rail-s-conte.patch)
+**Built from:** core patches [`0091`](../../patches/0091-ae-patch-Show-the-rail-s-context-and-connectors-as-l.patch), [`0092`](../../patches/0092-ae-patch-Show-a-permanent-context-answer-at-once-ins.patch), [`0093`](../../patches/0093-ae-patch-Fix-the-review-findings-on-the-rail-s-conte.patch), [`0345`](../../patches/0345-ae-patch-Context-breakdown-Try-again-wakes-a-sleepin.patch)
 
 ## Context categories
 

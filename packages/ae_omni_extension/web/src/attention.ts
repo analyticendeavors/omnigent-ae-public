@@ -14,6 +14,13 @@
 // fold.ts (browser storage, a convenience only), and a line that gains an urgent item it has
 // not shown before opens again by itself, so a remembered "closed" never hides something new.
 //
+// 2026-11-14 (concept D2): the Admin Center page draws this list as a table (needsTable.ts) instead of
+// the tree below. This file still loads, counts and acts (Review, Fix, Merge, Dismiss, Clean up and their
+// dialogs); when `activateAttention` is given `table` hooks it hands the drawing to them and builds each
+// row with the table's frame, so the buttons and the Merge confirm are the same ones. Called without
+// hooks (the tests, and any older caller) it draws the tree as before. Hide for me no longer removes a
+// hidden card's items from the list (attentionView.ts, buildBlocks): hiding hides only the card.
+//
 // The groups are a WAI-ARIA tree: role="tree", each source and kind a treeitem with
 // aria-expanded, each kind's rows a group, one roving tab stop, and the arrow keys.
 //
@@ -41,6 +48,7 @@ import {
   type SlotsFull,
   describeError,
   dismissAttention,
+  assignedElsewhere,
   heldByWorkingChat,
   fetchAttention,
   fetchCompliance,
@@ -50,6 +58,7 @@ import {
   slotsFullOf,
   startAttentionBatch,
   startAttentionChat,
+  startAttentionReviewMany,
 } from "./api";
 import {
   getAttention,
@@ -60,13 +69,16 @@ import {
   setFilter,
   setRereader,
   SOURCE_NAMES,
+  uncounted,
+  viewerLogin,
 } from "./attentionStore";
 import { openCleanup } from "./boxHealth";
 import { rowMenu } from "./cards";
 import { openDialog } from "./dialog";
 import { button, el, flash, notice, replaceChildren } from "./dom";
+import { sayInRow } from "./rowMessages";
 import { attentionView } from "./attentionView";
-import { onCardState, sourceHidden } from "./cardState";
+import { onCardState } from "./cardState";
 import { rememberedFold, saveFold } from "./fold";
 import {
   checkIcon,
@@ -79,11 +91,14 @@ import {
   listCheckIcon,
   messageIcon,
   restoreIcon,
+  skipIcon,
   terminalIcon,
   toolIcon,
 } from "./icons";
+import { forgetHistory } from "./historyCache";
+import { changePlan, registerPlanButton, resetPosts } from "./needsPost";
 import { copyText } from "./lot";
-import { openOrShow } from "./openLink";
+import { type MessageSink, openOrShow } from "./openLink";
 import {
   type MergeHooks,
   confirmIsOpen,
@@ -103,6 +118,10 @@ export const ROWS_SHOWN = 3;
 export const ROWS_SHOWN_PHONE = 1;
 /** How long the Undo toast stays after a dismissal. */
 export const UNDO_MS = 8_000;
+
+/** The Investigate button's note on a home security row: read-only, nothing is changed. */
+export const INVESTIGATE_HINT =
+  "Open a chat that checks this alert and posts a verdict. It archives, mutes and blocks nothing.";
 /** The page's phone breakpoint (style.css `@media (pointer: coarse), (max-width: 520px)`). */
 const PHONE_QUERY = "(max-width: 520px)";
 const DAY = 86_400_000;
@@ -148,6 +167,10 @@ export const GROUPS: Record<AttentionSource, GroupSpec[]> = {
     { key: "readings", name: "Monitor and readings", kinds: ["guard", "unread", "stale"] },
   ],
   host: [{ key: "host", name: "Not connected", kinds: ["host-failed"] }],
+  home: [
+    { key: "home-alarms", name: "Firewalla alarms", kinds: ["home-alarm"] },
+    { key: "home-alerts", name: "Sentinel alerts", kinds: ["home-alert"] },
+  ],
   cost: [{ key: "cost-over", name: "Over target", kinds: ["cost-over"] }],
   databricks: [{ key: "credit", name: "Credit used up", kinds: ["credit-over"] }],
   secrets: [
@@ -164,48 +187,54 @@ export const GROUPS: Record<AttentionSource, GroupSpec[]> = {
   ],
   accounts: [{ key: "accounts-full", name: "Weekly window full", kinds: ["account-full"] }],
   family: [{ key: "family-over", name: "Over the runaway flag today", kinds: ["family-over"] }],
+  social: [
+    { key: "post-overdue", name: "Posts past their slot", kinds: ["post-overdue"] },
+    { key: "post-today", name: "Posts due today", kinds: ["post-today"] },
+  ],
 };
 
 /** The panel's parent order: the same as `SOURCES` in attention.py. */
-const SOURCE_ORDER: AttentionSource[] = [
+export const SOURCE_ORDER: AttentionSource[] = [
   "git",
   "git-mine",
   "box",
   "host",
+  "home",
   "cost",
   "databricks",
   "secrets",
   "vault",
   "accounts",
   "family",
+  "social",
 ];
 
-interface Line {
+export interface Line {
   /** The fold id, and the roving key. */
   id: string;
   name: string;
   items: AttentionItem[];
   urgent: number;
   review: number;
-  /** Items in the line that a working chat holds (listed, not counted). */
+  /** Items in the line that a working chat holds (listed, not counted); one assigned to another admin is neither. */
   working: number;
   /** The item to name when the line is closed: the worst one not held by a chat. */
   worst: AttentionItem | null;
 }
 
-interface Group extends Line {
+export interface Group extends Line {
   key: string;
   source: AttentionSource;
 }
 
-interface Block extends Line {
+export interface Block extends Line {
   source: AttentionSource;
   groups: Group[];
 }
 
 /** A chat that is still working holds the item: it stays listed but does not count. A waiting
  * chat (blocked or finished) does not hold it in this sense, because the owner has to act. */
-const held = (item: AttentionItem) => heldByWorkingChat(item);
+export const held = (item: AttentionItem) => heldByWorkingChat(item);
 
 /**
  * A personal Git item (source "git-mine") takes Dismiss and Open on GitHub only (2026-11-08).
@@ -217,7 +246,7 @@ export const actionsOf = (item: AttentionItem): AttentionItem["actions"] =>
   isPersonal(item) ? item.actions.filter((action) => action === "dismiss") : item.actions;
 
 function lineOf(id: string, name: string, items: AttentionItem[]): Line {
-  const counted = items.filter((item) => !held(item));
+  const counted = items.filter((item) => !uncounted(item));
   const urgent = counted.filter((item) => item.tone === "urgent");
   return {
     id,
@@ -225,22 +254,52 @@ function lineOf(id: string, name: string, items: AttentionItem[]): Line {
     items,
     urgent: urgent.length,
     review: counted.length - urgent.length,
-    working: items.length - counted.length,
+    working: items.filter(held).length,
     worst: urgent[0] ?? counted[0] ?? items[0] ?? null,
   };
 }
 
-/** Urgent items first, otherwise the server's order (worst first) stands. */
-const byTone = (items: AttentionItem[]) =>
-  [...items].sort((a, b) => Number(b.tone === "urgent") - Number(a.tone === "urgent"));
+/**
+ * Rows keep their place while the page is open (2026-11-16, Reid's fixed-order pick). Each item id gets a
+ * sequence number the first time it is seen, in the server's order, and a source lists its rows by it: a
+ * row that stays keeps its spot through every redraw (a poll, an action, a tone change), a new row joins
+ * at the end, and a reload starts fresh. Kept in memory per page, never in storage.
+ */
+const rowSeq = new Map<string, number>();
+let nextSeq = 0;
+
+/**
+ * Track the whole answer: number new rows in the order given and forget the ones that left the list.
+ * Only the table calls this, with the full answer, so the map is pruned wherever it is numbered. An item
+ * that is dismissed or snoozed leaves the list, so one that is restored or woken joins the end of its source.
+ */
+export function trackRowOrder(items: AttentionItem[]): void {
+  for (const item of items) {
+    if (!rowSeq.has(item.id)) rowSeq.set(item.id, nextSeq++);
+  }
+  const live = new Set(items.map((item) => item.id));
+  for (const id of [...rowSeq.keys()]) {
+    if (!live.has(id)) rowSeq.delete(id);
+  }
+}
+
+/** For tests: start the order fresh, as a reload does. */
+export function resetRowOrder(): void {
+  rowSeq.clear();
+  nextSeq = 0;
+}
+
+/** Numbered rows by their number; a row not numbered yet follows them in the order given (the sort is stable). */
+const inFixedOrder = (items: AttentionItem[]) =>
+  [...items].sort((a, b) => (rowSeq.get(a.id) ?? Infinity) - (rowSeq.get(b.id) ?? Infinity));
 
 export function buildBlocks(items: AttentionItem[], only: AttentionSource | null = null): Block[] {
   const blocks: Block[] = [];
   for (const source of SOURCE_ORDER) {
     if (only && only !== source) continue;
-    // A source whose card this viewer hid leaves the list (off ones are already absent).
-    if (sourceHidden(source)) continue;
-    const mine = byTone(items.filter((item) => item.source === source));
+    // 2026-11-14: a source whose card this viewer hid stays in the list. Hiding hides the card
+    // only (Reid's D2 pick); a card turned off for everyone is already absent from the answer.
+    const mine = inFixedOrder(items.filter((item) => item.source === source));
     if (!mine.length) continue;
     const specs = GROUPS[source];
     const known = new Set(specs.flatMap((spec) => spec.kinds));
@@ -253,14 +312,13 @@ export function buildBlocks(items: AttentionItem[], only: AttentionSource | null
     }
     const other = mine.filter((item) => !known.has(item.kind));
     if (other.length) groups.push({ key: "other", source, ...lineOf(`attn.${source}.other`, "Other", other) });
-    // A kind with an urgent item first; the table's order inside each half.
-    groups.sort((a, b) => Number(b.urgent > 0) - Number(a.urgent > 0));
+    // Kinds stay in the order GROUPS lists them: one fixed order, so "Review N" sends items the way the table shows them.
     blocks.push({ source, groups, ...lineOf(`attn.${source}`, SOURCE_NAMES[source], mine) });
   }
   return blocks;
 }
 
-const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+export const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
 export function countsText(urgent: number, review: number, working = 0): string {
   const parts = [urgent ? `${urgent} urgent` : "", review ? `${review} to review` : ""].filter(Boolean);
@@ -271,7 +329,7 @@ export function countsText(urgent: number, review: number, working = 0): string 
 
 // ── folding ─────────────────────────────────────────────────────────────────
 
-function isPhone(): boolean {
+export function isPhone(): boolean {
   return typeof window.matchMedia === "function" && window.matchMedia(PHONE_QUERY).matches;
 }
 
@@ -287,8 +345,30 @@ export function defaultOpen(blocks: Block[], phone: boolean): Map<string, boolea
 }
 
 const seenMemory = new Map<string, string[]>();
+const SEEDED_KEY = `${SEEN_KEY}__seeded`;
+let seededMemory = false;
 
-function loadSeen(id: string): Set<string> {
+/** True once this browser has drawn any line: after that a line it never saw starts with nothing seen. */
+function isSeeded(): boolean {
+  if (seededMemory) return true;
+  try {
+    return window.localStorage.getItem(SEEDED_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+function markSeeded(): void {
+  seededMemory = true;
+  try {
+    window.localStorage.setItem(SEEDED_KEY, "1");
+  } catch {
+    // Kept in memory until the page closes.
+  }
+}
+
+/** The urgent ids a line last showed open, or null when this browser never drew the line. */
+function loadSeen(id: string): Set<string> | null {
   try {
     const raw = window.localStorage.getItem(SEEN_KEY + id);
     if (raw) {
@@ -298,7 +378,8 @@ function loadSeen(id: string): Set<string> {
   } catch {
     // No storage in this frame: the list kept in memory.
   }
-  return new Set(seenMemory.get(id) ?? []);
+  const kept = seenMemory.get(id);
+  return kept ? new Set(kept) : null;
 }
 
 function saveSeen(id: string, ids: string[]): void {
@@ -311,23 +392,44 @@ function saveSeen(id: string, ids: string[]): void {
 }
 
 /**
- * A line that shows an urgent item it has not shown before opens again, even when the viewer
- * left it closed. Each line remembers the urgent ids it last showed.
+ * A closed line that holds an urgent item it has not shown open since the person last opened it gets a
+ * small "new" marker; it never reopens the line (2026-11-17, the owner wants the page to stay collapsed).
+ * Each line remembers the urgent ids it last showed open. The first draw in a browser counts the current
+ * ids as seen, so a first visit shows no markers. Returns the ids of the lines to mark.
  */
-function reopenForNewUrgent(blocks: Block[]): void {
-  const lines: Line[] = blocks.flatMap((block) => [block, ...block.groups]);
+export function markNewUrgent(lines: Pick<Line, "id" | "items">[], isOpen: (id: string) => boolean): Set<string> {
+  const marked = new Set<string>();
+  // First draw in this browser (once per browser, not per line): every current id counts as seen. A line
+  // that first appears later starts with nothing seen, so its first urgent item shows the dot.
+  const seeded = isSeeded() || lines.some((line) => loadSeen(line.id) !== null);
   for (const line of lines) {
-    const ids = line.items.filter((item) => item.tone === "urgent" && !held(item)).map((item) => item.id);
-    const seen = loadSeen(line.id);
-    if (ids.some((id) => !seen.has(id)) && rememberedFold(line.id) === false) saveFold(line.id, true);
-    // Only the current urgent ids are kept: one that goes away and returns is new again.
-    saveSeen(line.id, ids);
+    const ids = line.items.filter((item) => item.tone === "urgent" && !uncounted(item)).map((item) => item.id);
+    const stored = loadSeen(line.id);
+    if (stored === null && seeded && !isOpen(line.id)) {
+      if (ids.length) marked.add(line.id);
+      saveSeen(line.id, []);
+      continue;
+    }
+    const seen = stored;
+    if (seen === null || isOpen(line.id)) {
+      // First draw, or the line is open: the person sees every current id.
+      saveSeen(line.id, ids);
+      continue;
+    }
+    if (ids.some((id) => !seen.has(id))) marked.add(line.id);
+    // Only ids still present are kept: one that goes away and returns is new again.
+    const kept = ids.filter((id) => seen.has(id));
+    if (kept.length !== seen.size) saveSeen(line.id, kept);
   }
+  if (lines.length) markSeeded();
+  return marked;
 }
 
 /** For tests: forget the urgent ids each line has shown. */
 export function resetAttentionSeen(): void {
   seenMemory.clear();
+  seededMemory = false;
+  resetRowOrder();
   readCards.clear();
   mergedRows.clear();
 }
@@ -339,7 +441,7 @@ export function comesBackOn(days: number, now = Date.now()): string {
   return new Date(now + days * DAY).toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
-const dateOf = (iso: string | undefined): string => {
+export const dateOf = (iso: string | undefined): string => {
   const ms = iso ? Date.parse(iso) : Number.NaN;
   return Number.isNaN(ms) ? "" : new Date(ms).toLocaleDateString([], { month: "short", day: "numeric" });
 };
@@ -350,7 +452,7 @@ export const REASON_MAX = 200;
 
 // ── the panel ───────────────────────────────────────────────────────────────
 
-interface Worked {
+export interface Worked {
   session_id: string;
   title: string;
   path: string;
@@ -375,9 +477,25 @@ export function emptyText(readAt: string): string {
   return `Nothing needs you. Checked ${new Date(at).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })}.`;
 }
 
-interface Panel {
+/** What the table view (needsTable.ts) plugs into the panel: its own drawing and its row frame. */
+export interface TableHooks {
+  /** Draws the whole panel for one read; the panel has already checked the signature. */
+  draw: (p: Panel, input: { data: AttentionOverview | null; error: unknown; filter: AttentionSource | null; phone: boolean }) => void;
+  /** A row-level message (null clears it): the table shows it in the opened row's own message line, not in the row grid. */
+  message: (p: Panel, id: string, line: HTMLElement | null) => void;
+  /** The row's frame in the table: the same three parts as `rowShell`, with the table's cells. */
+  shell: (p: Panel, item: AttentionItem, meta: string) => { row: HTMLElement; text: HTMLElement; actions: HTMLElement };
+  /** Called on every finished row (a rebuilt one too): the opened panel, the primary button. */
+  finish: (p: Panel, row: HTMLElement, item: AttentionItem, data: AttentionOverview) => void;
+}
+
+export interface Panel {
   context: ExtensionContext;
   root: HTMLElement;
+  /** Set when the panel draws the table (needsTable.ts) instead of the tree. */
+  table: TableHooks | null;
+  /** The id of the row opened in place, if any (table only). */
+  openRow: string | null;
   /** Rows past the limit shown for these kinds. */
   more: Set<string>;
   /** Chats started from this page, until the server lists the item as held. */
@@ -419,7 +537,7 @@ export function attentionSection(): HTMLElement {
   );
 }
 
-function part(p: Panel, selector: string): HTMLElement {
+export function part(p: Panel, selector: string): HTMLElement {
   const found = p.root.querySelector<HTMLElement>(selector);
   if (!found) throw new Error(`Needs you panel is missing ${selector}`);
   return found;
@@ -440,7 +558,7 @@ function refresh(p: Panel): Promise<void> {
  * A header tool: the words on a desktop, a 44 px icon on a phone (style.css swaps them). The
  * label also sits on aria-label, so a screen reader hears the same on both.
  */
-function toolButton(
+export function toolButton(
   label: string,
   icon: SVGElement,
   options: { title: string; onClick: () => void },
@@ -452,7 +570,7 @@ function toolButton(
 }
 
 /** Read Your move once and show the "N chats waiting on you" link, or nothing at 0 or on a failure. */
-function readWaiting(p: Panel): Promise<void> {
+export function readWaiting(p: Panel): Promise<void> {
   const line = p.root.querySelector<HTMLElement>(".attn-wait");
   const seq = ++p.waitSeq;
   const hide = () => {
@@ -479,7 +597,7 @@ function readWaiting(p: Panel): Promise<void> {
   }).catch(hide);
 }
 
-const slug = (text: string) => text.replace(/[^A-Za-z0-9_-]+/g, "-");
+export const slug = (text: string) => text.replace(/[^A-Za-z0-9_-]+/g, "-");
 
 // ── rows ────────────────────────────────────────────────────────────────────
 
@@ -498,6 +616,12 @@ function iconButton(
   return node;
 }
 
+/** Where a row's own messages go: the table's message line, or (the tree) the row itself. */
+function rowSink(p: Panel, row: HTMLElement): MessageSink | undefined {
+  const table = p.table;
+  return table ? (line) => table.message(p, row.dataset.id ?? "", line) : undefined;
+}
+
 function titleNode(p: Panel, item: AttentionItem, row: HTMLElement): HTMLElement {
   if (!item.url.startsWith("https://github.com/")) {
     return el("span", { class: "attn-title" }, item.title);
@@ -509,7 +633,7 @@ function titleNode(p: Panel, item: AttentionItem, row: HTMLElement): HTMLElement
   );
   link.addEventListener("click", (event) => {
     event.preventDefault();
-    void openOrShow(p.context, item.url, row);
+    void openOrShow(p.context, item.url, row, rowSink(p, row));
   });
   return link;
 }
@@ -521,7 +645,7 @@ function workingOf(p: Panel, item: AttentionItem): Worked | null {
   return p.worked.get(item.id) ?? null;
 }
 
-function workingNode(p: Panel, work: Worked, text: HTMLElement): HTMLElement {
+function workingNode(p: Panel, work: Worked, text: HTMLElement, id: string): HTMLElement {
   const open = el(
     "button",
     {
@@ -533,7 +657,7 @@ function workingNode(p: Panel, work: Worked, text: HTMLElement): HTMLElement {
   );
   open.addEventListener("click", () => {
     Promise.resolve(p.context.navigation.openSession(work.session_id)).catch((error: unknown) =>
-      flash(text, `Could not open the chat (${describeError(error)}). It is at ${work.path}.`, "error"),
+      sayInRow(p, id, `Could not open the chat (${describeError(error)}). It is at ${work.path}.`, "error", text),
     );
   });
   if (work.status === "waiting") {
@@ -574,6 +698,11 @@ export function originOf(item: Pick<AttentionItem, "source" | "kind">): string {
 
 /** The row's frame: dot, text column and the empty actions column. */
 function rowShell(p: Panel, item: AttentionItem, meta: string) {
+  if (p.table) {
+    const made = p.table.shell(p, item, meta);
+    made.text.append(titleNode(p, item, made.row));
+    return made;
+  }
   const tone = item.tone === "urgent" ? "red" : "amber";
   const text = el("div", { class: "attn-text" });
   const actions = el("div", { class: "attn-actions" });
@@ -599,13 +728,21 @@ function rowShell(p: Panel, item: AttentionItem, meta: string) {
   return { row, text, actions };
 }
 
-function rowNode(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLElement {
+export function rowNode(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLElement {
+  const row = rowNodeBuilt(p, item, data);
+  // The table fits the opened state and the primary button to the finished row, a rebuilt one included.
+  if (p.table && row.classList.contains("nt-row")) p.table.finish(p, row, item, data);
+  return row;
+}
+
+function rowNodeBuilt(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLElement {
   // A merge in flight is not drawn again: its result lands on the node that asked for it.
   const live = item.url ? mergingNode(item.url) : undefined;
   if (live) return live;
   const merged = item.url ? mergedRows.get(urlKey(item.url)) : undefined;
   if (merged) return mergedRowNode(p, item, merged);
-  const meta = [originOf(item), item.meta, item.back ? `back: ${item.back}` : ""]
+  // The table's group rows already name the source and the group, so its rows leave them out.
+  const meta = [p.table ? "" : originOf(item), item.meta, item.back ? `back: ${item.back}` : ""]
     .filter(Boolean)
     .join(" · ");
   const { row, text, actions } = rowShell(p, item, meta);
@@ -613,8 +750,9 @@ function rowNode(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLEl
   text.append(el("span", { class: "attn-meta" }, meta));
   const work = workingOf(p, item);
   const waiting = !work || work.status === "waiting";
-  actions.appendChild(statusChip(waiting ? "waiting" : "working"));
-  if (work) text.append(workingNode(p, work, text));
+  // The table says "waiting on you" by being in the list; only a chat at work gets a chip there.
+  if (!p.table || !waiting) actions.appendChild(statusChip(waiting ? "waiting" : "working"));
+  if (work) text.append(workingNode(p, work, text, item.id));
   // A chat still working keeps the row; one that finished hands it back with every action.
   if (!waiting) return row;
   const offer = item.offer;
@@ -633,17 +771,18 @@ function rowNode(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLEl
     );
     clean.addEventListener("click", () => {
       if (!openCleanup(offer, clean)) {
-        flash(text, "Box health has not listed that cleanup now. Read again and try once more.", "error");
+        sayInRow(p, item.id, "Box health has not listed that cleanup now. Read again and try once more.", "error", text);
       }
     });
     actions.appendChild(clean);
   }
   if (data.can_chat && actionsOf(item).includes("review")) {
+    const investigate = item.source === "home";
     actions.appendChild(
       iconButton(
-        `Review ${item.title}`,
-        "Open a chat that reviews this item and reports back",
-        messageIcon(),
+        investigate ? `Investigate ${item.title}` : `Review ${item.title}`,
+        investigate ? INVESTIGATE_HINT : "Open a chat that reviews this item and reports back",
+        investigate ? toolIcon() : messageIcon(),
         `${item.id}:review`,
         (self) => startChat(p, item, "review", self, text),
       ),
@@ -678,7 +817,7 @@ function rowNode(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLEl
     actions.appendChild(
       rowMenu(
         { title: item.title },
-        [button("Open on GitHub", { onClick: () => openOrShow(p.context, item.url, row) })],
+        [button("Open on GitHub", { onClick: () => openOrShow(p.context, item.url, row, rowSink(p, row)) })],
         {
           icon: dotsIcon(),
           label: `More actions for ${item.title}`,
@@ -698,7 +837,7 @@ function rowNode(p: Panel, item: AttentionItem, data: AttentionOverview): HTMLEl
 const CARD_TTL_MS = 60_000;
 
 /** What the review record read says; shown under a Merge row, never a gate. */
-type Record_ = { report: ComplianceReport | null } | { error: string };
+export type Record_ = { report: ComplianceReport | null } | { error: string };
 
 /** Pull request cards read by a Merge click, with their review record, until they age out. */
 const readCards = new Map<string, { card: PrCard; at: number; record: Record_ }>();
@@ -706,6 +845,12 @@ const readCards = new Map<string, { card: PrCard; at: number; record: Record_ }>
 const rereading = new Set<string>();
 /** Rows merged from this panel: the note that replaces the row until the list drops it. */
 const mergedRows = new Map<string, string>();
+
+/** The pull request card a Merge click last read for *item*, while it is fresh enough to show. */
+export function readCardOf(item: AttentionItem): { card: PrCard; record: Record_ } | null {
+  const read = item.url ? readCards.get(urlKey(item.url)) : undefined;
+  return read && Date.now() - read.at < CARD_TTL_MS ? { card: read.card, record: read.record } : null;
+}
 
 /** The repo and number of a pull request item's GitHub link, or null. */
 function pullOf(item: AttentionItem): { repo: string; number: number } | null {
@@ -837,7 +982,7 @@ function mergeControls(
         if (fresh.merge.allowed) openConfirm(fresh);
       } catch (error) {
         self.disabled = false;
-        flash(text, `Could not check whether it can merge (${describeError(error)}).`, "error");
+        sayInRow(p, item.id, `Could not check whether it can merge (${describeError(error)}).`, "error", text);
         return;
       }
       draw(p, true);
@@ -852,7 +997,7 @@ function mergeControls(
   }
   return () => {
     if (card) keepConfirm(deps, card, row, actions, hooks);
-    if (lostConfirm) flash(text, "The merge confirm closed; press Merge again.", "info");
+    if (lostConfirm) sayInRow(p, item.id, "The merge confirm closed; press Merge again.", "info", text);
   };
 }
 
@@ -959,12 +1104,53 @@ function batchStarter(
   };
 }
 
+/**
+ * Review N (2026-11-16): one chat on the selected items from any sources. The server leaves out
+ * what is gone, dismissed, snoozed, personal or held by another chat and names them; the note
+ * says how many.
+ */
+function manyStarter(p: Panel, items: AttentionItem[]): Starter {
+  return async (rideUnparked) => {
+    const made = await startAttentionReviewMany(
+      p.context,
+      items.map((item) => item.id),
+      rideUnparked,
+    );
+    const took = made.item_ids ?? items.map((item) => item.id);
+    for (const item of items) {
+      if (!took.includes(item.id)) continue;
+      p.worked.set(item.id, {
+        session_id: made.session_id,
+        title: made.title || `Review ${plural(took.length, "item")}`,
+        path: made.path,
+        started: !made.existing,
+      });
+    }
+    const skipped = made.skipped ?? [];
+    if (!skipped.length) return undefined;
+    // Say which were left out and why (a home item or a failed unit is kept apart on purpose).
+    const titles = new Map(items.map((item) => [item.id, item.title]));
+    const named = skipped.slice(0, 3).map((s) => `${titles.get(s.id) ?? "An item"} (${s.why})`);
+    const more = skipped.length > 3 ? ` and ${skipped.length - 3} more` : "";
+    return `Left out of the review: ${named.join("; ")}${more}.`;
+  };
+}
+
+/** Start a Review N over *items* (already filtered to the ones Review can take). */
+export function reviewMany(p: Panel, items: AttentionItem[], opener: HTMLElement, host: HTMLElement): Promise<void> {
+  return runStart(p, manyStarter(p, items.slice(0, BATCH_MAX)), opener, host);
+}
+
+/** Read the list again and draw it (the table's actions call this after a change). */
+export const reloadPanel = (p: Panel): Promise<void> => refresh(p);
+
 async function runStart(
   p: Panel,
   start: Starter,
   opener: HTMLElement,
   host: HTMLElement,
   what = "review",
+  rowId: string | null = null,
 ): Promise<void> {
   try {
     const note = await start(false);
@@ -972,13 +1158,16 @@ async function runStart(
     void refresh(p);
     if (note) {
       const row = [...p.root.querySelectorAll<HTMLElement>(".attn-row")].find(
-        (r) => r.dataset.id === host.closest<HTMLElement>(".attn-row")?.dataset.id,
+        (r) => r.dataset.id === (rowId ?? host.closest<HTMLElement>(".attn-row")?.dataset.id),
       );
-      flash(row?.querySelector<HTMLElement>(".attn-text") ?? p.root, note, "info");
+      const into = row?.querySelector<HTMLElement>(".attn-text") ?? p.root;
+      if (rowId) sayInRow(p, rowId, note, "info", into);
+      else flash(into, note, "info");
     }
   } catch (error) {
     const full = slotsFullOf(error);
     if (full) openSlotsFull(p, full, opener, start, what);
+    else if (rowId) sayInRow(p, rowId, `Could not start the ${what} (${describeError(error)}).`, "error", host);
     else flash(host, `Could not start the ${what} (${describeError(error)}).`, "error");
   }
 }
@@ -990,13 +1179,14 @@ function startChat(
   opener: HTMLElement,
   text: HTMLElement,
 ) {
-  return runStart(p, chatStarter(p, item, action), opener, text, action === "fix" ? "Fix chat" : "review");
+  return runStart(p, chatStarter(p, item, action), opener, text, action === "fix" ? "Fix chat" : "review", item.id);
 }
 
 /** The items a line's Review all would take: Review offered, not held, not just started. */
 export function reviewable(p: { worked: Map<string, unknown> }, items: AttentionItem[]): AttentionItem[] {
   return items.filter(
-    (item) => actionsOf(item).includes("review") && !held(item) && !p.worked.has(item.id),
+    (item) =>
+      actionsOf(item).includes("review") && !held(item) && !assignedElsewhere(item, viewerLogin()) && !p.worked.has(item.id),
   );
 }
 
@@ -1004,7 +1194,7 @@ export function reviewable(p: { worked: Map<string, unknown> }, items: Attention
  * A Review all button over `pool` (a line's items, or a source's items across its lines). The
  * source form posts `{source}` and reads "Review N" (the line form says "Review all N").
  */
-function reviewAllNode(
+export function reviewAllNode(
   p: Panel,
   line: Line,
   target: AttentionBatchTarget,
@@ -1021,7 +1211,7 @@ function reviewAllNode(
     all.length > BATCH_MAX ? `Review ${BATCH_MAX} of ${all.length}` : `${noun} ${all.length}`;
   const node = el("button", {
     type: "button",
-    class: scope === "source" ? "attn-review-all attn-review-source" : "attn-review-all",
+    class: scope === "source" ? "btn btn-secondary attn-review-all attn-review-source" : "btn btn-secondary attn-review-all",
     title: `Opens one chat that reads every item in this ${scope === "source" ? "source" : "line"} and reports one root cause per item. It changes nothing.`,
     "aria-label": `${words} in ${line.name}`,
     "data-focus": `${line.id}:review-all`,
@@ -1134,6 +1324,7 @@ function openDismiss(p: Panel, item: AttentionItem, opener: HTMLElement): void {
       replaceChildren(status, []);
       try {
         await dismissAttention(p.context, item.id, field.value.trim().slice(0, REASON_MAX));
+        forgetHistory(item.id);
       } catch (error) {
         replaceChildren(status, [notice(`Could not dismiss (${describeError(error)}).`, "error")]);
         return;
@@ -1183,6 +1374,7 @@ function showUndo(p: Panel, item: AttentionItem): void {
       if (p.undo) clearTimeout(p.undo);
       try {
         await restoreAttention(p.context, item.id);
+        forgetHistory(item.id);
         clear();
         await refresh(p);
       } catch (error) {
@@ -1196,24 +1388,27 @@ function showUndo(p: Panel, item: AttentionItem): void {
   p.undo = setTimeout(clear, UNDO_MS);
 }
 
-function dismissedNode(p: Panel, items: AttentionItem[]): HTMLElement | null {
-  if (!items.length) return null;
-  const listId = "attn-dismissed-list";
-  const head = el(
-    "button",
-    {
-      type: "button",
-      class: "attn-dismissed-head",
-      "aria-expanded": String(p.dismissedOpen),
-      "aria-controls": listId,
-      title: "Items you hid. Restore brings one back.",
-    },
-    chevronIcon(),
-    `Dismissed (${items.length})`,
-  );
-  const list = el(
+function skipFromFold(p: Panel, item: AttentionItem): HTMLButtonElement {
+  const skip = el("button", {
+    type: "button",
+    class: "attn-review-all attn-restore attn-skip",
+    title: "Skip this post: it leaves the Social plan and stops counting toward the week",
+    "aria-label": `Skip post ${item.title}`,
+  });
+  skip.append(skipIcon(), el("span", {}, "Skip post"));
+  registerPlanButton(item.slot as string, skip);
+  skip.addEventListener("click", () => {
+    if (skip.disabled) return;
+    void changePlan(p, item, "skip");
+  });
+  return skip;
+}
+
+/** The dismissed items as a list with their Restore actions (the old fold and the Needs you table share it). */
+export function dismissedList(p: Panel, items: AttentionItem[], listId: string, hidden: boolean): HTMLElement {
+  return el(
     "ul",
-    { class: "attn-dismissed-list", id: listId, hidden: !p.dismissedOpen },
+    { class: "attn-dismissed-list", id: listId, hidden },
     ...items.map((item) => {
       const reason = item.dismissed?.reason ?? "";
       const until = dateOf(item.dismissed?.expires_at);
@@ -1232,13 +1427,16 @@ function dismissedNode(p: Panel, items: AttentionItem[]): HTMLElement | null {
         restore.disabled = true;
         try {
           await restoreAttention(p.context, item.id);
+          forgetHistory(item.id);
           await refresh(p);
         } catch (error) {
-          flash(row, `Could not restore (${describeError(error)}).`, "error");
+          sayInRow(p, item.id, `Could not restore (${describeError(error)}).`, "error", row);
         } finally {
           restore.disabled = false;
         }
       });
+      // A Social post hidden before Skip existed: Skip post turns the old hide into a real skip (the plan changes).
+      const skip: HTMLElement | null = item.source === "social" && item.slot ? skipFromFold(p, item) : null;
       const why: HTMLElement | null = reason
         ? el(
             "button",
@@ -1254,7 +1452,8 @@ function dismissedNode(p: Panel, items: AttentionItem[]): HTMLElement | null {
         "li",
         { class: "attn-dismissed-row", "data-id": item.id },
         el("span", { class: "attn-title" }, item.title),
-        restore,
+        // Skip post and Restore side by side in the button column (a row with no Skip keeps Restore alone).
+        skip ? el("span", { class: "attn-fold-acts" }, skip, restore) : restore,
         el(
           "span",
           { class: "attn-meta" },
@@ -1265,6 +1464,24 @@ function dismissedNode(p: Panel, items: AttentionItem[]): HTMLElement | null {
       return row;
     }),
   );
+}
+
+export function dismissedNode(p: Panel, items: AttentionItem[]): HTMLElement | null {
+  if (!items.length) return null;
+  const listId = "attn-dismissed-list";
+  const head = el(
+    "button",
+    {
+      type: "button",
+      class: "attn-dismissed-head",
+      "aria-expanded": String(p.dismissedOpen),
+      "aria-controls": listId,
+      title: "Items you hid. Restore brings one back.",
+    },
+    chevronIcon(),
+    `Dismissed (${items.length})`,
+  );
+  const list = dismissedList(p, items, listId, !p.dismissedOpen);
   head.addEventListener("click", () => {
     p.dismissedOpen = !p.dismissedOpen;
     head.setAttribute("aria-expanded", String(p.dismissedOpen));
@@ -1523,8 +1740,19 @@ function restoreMark(p: Panel, mark: string | null): void {
   target?.focus({ preventScroll: true });
 }
 
+/** A confirm for a pull request the list no longer has must not wait for Your move to open it. */
+function forgetUnlisted(data: AttentionOverview): void {
+  const listed = new Set(data.items.map((entry) => urlKey(entry.url)));
+  for (const key of [...readCards.keys()]) {
+    if (!listed.has(key) && !mergingNode(key) && !mergedRows.has(key)) {
+      dropConfirm(key);
+      readCards.delete(key);
+    }
+  }
+}
+
 /** Draw the whole panel from the store; *force* redraws even when the data is unchanged. */
-function draw(p: Panel, force = false): void {
+export function draw(p: Panel, force = false): void {
   const { data, error } = getAttention();
   const filter = getFilter();
   const phone = isPhone();
@@ -1532,6 +1760,13 @@ function draw(p: Panel, force = false): void {
   if (!force && signature === p.drawn) return;
   p.drawn = signature;
   const mark = focusMark(p);
+  if (p.table) {
+    // A confirm for a pull request the list no longer has must not wait for Your move to open it.
+    if (data) forgetUnlisted(data);
+    p.table.draw(p, { data, error, filter, phone });
+    restoreMark(p, mark);
+    return;
+  }
   const counts = part(p, ".attn-counts");
   const tools = part(p, ".attn-tools");
   const notes = part(p, ".attn-notes");
@@ -1575,19 +1810,13 @@ function draw(p: Panel, force = false): void {
   }
   replaceChildren(notes, notesList);
 
-  // A confirm for a pull request the list no longer has must not wait for Your move to open it.
-  const listed = new Set(data.items.map((entry) => urlKey(entry.url)));
-  for (const key of [...readCards.keys()]) {
-    if (!listed.has(key) && !mergingNode(key) && !mergedRows.has(key)) {
-      dropConfirm(key);
-      readCards.delete(key);
-    }
-  }
+  forgetUnlisted(data);
   const all = buildBlocks(data.items);
-  reopenForNewUrgent(all);
   const blocks = filter ? all.filter((block) => block.source === filter) : all;
   const defaults = defaultOpen(blocks, phone);
   const openOf = (id: string) => rememberedFold(id) ?? defaults.get(id) ?? false;
+  // This older list view shows no marker; it only keeps the seen ids and never reopens a line.
+  markNewUrgent(all.flatMap((block) => [block, ...block.groups]), openOf);
   const view = attentionView(data);
   const dismissed = view.dismissed.filter((item) => !filter || item.source === filter);
   const redraw = () => draw(p, true);
@@ -1665,7 +1894,7 @@ function stopListening(): void {
 export function activateAttention(
   context: ExtensionContext,
   root: HTMLElement,
-  options: { waiting?: boolean } = {},
+  options: { waiting?: boolean; table?: TableHooks } = {},
 ): void {
   // A box admin who is not an OmniGent admin is not sent to the Dashboard's Your move read.
   const waiting = options.waiting !== false;
@@ -1674,6 +1903,8 @@ export function activateAttention(
   const p: Panel = {
     context,
     root,
+    table: options.table ?? null,
+    openRow: null,
     more: new Set(),
     worked: new Map(),
     dismissedOpen: false,
@@ -1738,4 +1969,6 @@ export function deactivateAttention(): void {
   if (panel?.undo) clearTimeout(panel.undo);
   panel = null;
   resetAttention();
+  // A Social row's loaded posts and picture URLs go with the page.
+  resetPosts();
 }

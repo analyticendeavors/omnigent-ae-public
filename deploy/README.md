@@ -20,7 +20,7 @@ What is in this directory:
 | File | What it is |
 |---|---|
 | `Dockerfile` | stage 2 of the image: the AE layer on upstream's server image |
-| `docker-compose.override.yml` | the overlay on upstream's compose file: the published image, loopback `:8010`, the two env files, bind mounts under `AE_DATA_DIR` (default `/secure/omnigent`) |
+| `docker-compose.override.yml` | the overlay on upstream's compose file: the published image, loopback `:8010`, the two env files, bind mounts under `AE_DATA_DIR` (default `/secure/omnigent`), plus `/data/ae-voice-logs` from `AE_VOICE_LOG_HOST_DIR` |
 | `compose.sh` | `docker compose` with the compose files and both env files filled in, plus `config/compose.local.yml` when it exists (this machine's own additions); everything else here calls it |
 | `auto-update.sh` | one pass of the automatic deploy: the newest `ae-v*` tag on `main`, pulled, started, health-checked, rolled back on failure |
 | `pull-secrets.sh` | one way to fill the two secrets files: Azure Key Vault to `/secure/env/omnigent-ae.env` and `/secure/env/omnigent-host.env`, atomically |
@@ -195,8 +195,22 @@ restart). The server writes it atomically and never deletes a dismissal because 
 not be read. An unreadable file is shown as "Dismissals could not be read" and left exactly as
 it is until it reads again: fix or remove the file, then dismiss again. For a Box health item
 the file holds keys, tones, steps and counts only, and its reason is one of "Known", "Fix
-planned" or "Not a problem". `AE_ATTENTION_TIDY=0` turns off the five-minute cleanup that drops
+planned" or "Not a problem". Since 2026-11-16 a snooze is a record in the same file. `AE_ATTENTION_TIDY=0` turns off the five-minute cleanup that drops
 a dismissal an hour after its item has been gone from a clean read (tests set it).
+
+#### Needs you activity log (optional)
+
+Since 2026-11-16 the server also keeps when each Needs you item was first listed (the Admin
+Center's Age column), what people did to it (dismissed, snoozed, woke, restored, started a
+chat) and which items stopped being reported (the Activity tab's "Done", which means "no longer
+reported", not "fixed"). It is one JSON file on the data volume, `/data/ae-attention-log.json`;
+set `AE_ATTENTION_LOG_FILE` to move it (an empty value keeps it in memory only, lost on
+restart). It is written with the same atomic replace and one lock as the dismissals file, and
+kept 30 days and 2,000 events. It holds item ids, labels, times and sign-in logins, and an
+item's title; a Box health or Box host item has no title in it, only the source's name and the
+kind's label. An unreadable file is shown as "The activity log could not be read" in the
+Activity tab and the history box, left exactly as it is, and never stops Needs you from
+working: fix or remove the file and it reads again.
 
 That cleanup is also the one thing that calls GitHub with no page open: when the Git answer
 is missing or past its 300 s TTL it starts a background load, at most every 15 minutes. One
@@ -532,6 +546,33 @@ docker cp <extracted punct dir> omnigent-omnigent-1:/data/models/dictation/punct
 
 After editing `config/server.env`, recreate the server with `deploy/compose.sh up -d --force-recreate omnigent` (a plain restart does not reload the file). `GET /v1/info` shows `dictation_available: true` when it worked. The WebSocket path `/v1/dictation/stream` needs the app's origin in `OMNIGENT_WS_ALLOWED_ORIGINS` (already set on the box). The engine loads on the first take (a few seconds of CPU) and stays loaded.
 
+### Rocky voice (optional)
+
+The Voice picker offers Rocky when the separate [Rocky TTS](https://github.com/Kuberwastaken/rocky-tts) engine is running on the box. This bridge uses that repository's XTTS v2 model, reference audio, text transform, and speed filter. The engine and film audio are not included in the OmniGent image. Rocky TTS and its voice assets allow personal, noncommercial use only; check the upstream license before enabling it.
+
+The box needs Python 3.11, `uv`, and an `ffmpeg` executable on the service's PATH. Install the engine under the path used by the unit:
+
+```bash
+git clone https://github.com/Kuberwastaken/rocky-tts.git "$HOME/.local/share/rocky-tts"
+git -C "$HOME/.local/share/rocky-tts" switch --detach bf5ad30eb214cdf757403ff484804a3ed0a062c3
+uv venv --python 3.11 "$HOME/.local/share/rocky-tts/venv"
+uv pip install --python "$HOME/.local/share/rocky-tts/venv/bin/python" TTS==0.22.0 transformers==4.44.0 torch==2.5.1 torchaudio==2.5.1
+mkdir -p "$HOME/.local/share/rocky-tts/assets"
+curl -L --fail -o "$HOME/.local/share/rocky-tts/assets/rocky_training_audio_scrubbed.wav" https://pedramamini.com/dropbox/rocky_training_audio_scrubbed.wav
+```
+
+The RVC model is not needed. The first launch downloads XTTS weights into the user's model cache. The unit sets `COQUI_TOS_AGREED=1` after the operator has accepted the upstream noncommercial terms. On a host without `ffmpeg`, install it through the OS package manager or put an executable named `ffmpeg` in the Rocky venv's `bin` directory.
+
+Copy `deploy/systemd/user/ae-rocky-tts.service` to `~/.config/systemd/user/`, run `systemctl --user daemon-reload`, then `systemctl --user enable --now ae-rocky-tts.service`. The unit uses the deploy checkout and creates a private socket at `~/.local/state/ae-rocky-tts/rocky.sock`. It keeps temporary speech files private too.
+
+Add this volume under `services.omnigent.volumes` in this machine's gitignored `config/compose.local.yml`, replacing `<user>` with the account running the Rocky service:
+
+```yaml
+      - /home/<user>/.local/state/ae-rocky-tts:/run/ae-rocky-tts:ro
+```
+
+Set `AE_ROCKY_TTS_SOCKET=/run/ae-rocky-tts/rocky.sock` in `config/server.env`, then recreate the OmniGent container with `deploy/compose.sh up -d --force-recreate omnigent`. The bridge accepts connections only through the Unix socket. `GET /v1/ae/tts/voices` includes Rocky once the model is loaded. Select Rocky in the Voice submenu for Speak replies or Voice mode. The device voice reads a sentence if synthesis fails.
+
 ### 4. The server's config and agents
 
 Nothing to copy. The image carries `config/server.yaml` at
@@ -817,7 +858,10 @@ an AE counter). The merge is the deploy and tags are made for you: when CI passe
 on `main`, `.github/workflows/release.yml` tags the tip with the next number if
 anything that ships changed (`packages/`, `config/`, `agents/`,
 `deploy/Dockerfile`, `patches/`, `upstream.lock`, the `upstream` pointer) and
-publishes it. A docs-only or tests-only merge makes no tag; to ship one anyway,
+publishes it. A PR merged up to date with `main` (its squash has exactly the
+tree its own CI tested and passed, and `leaks` passed on its head) is tagged at once
+on the push, without waiting for CI on `main`; README.md, "CI", has
+the rule. A docs-only or tests-only merge makes no tag; to ship one anyway,
 or to re-ship, run the Release workflow on `main` (Actions, Release, Run
 workflow) with `force` on. A tag is published by `.github/workflows/image.yml`,
 which builds the two stages the way CI does, runs the same smoke checks, and
@@ -865,6 +909,48 @@ Config and agents ride the image (step 4), so nothing else is copied.
 
 A dry run of the workflow (build and smoke, no push) is `workflow_dispatch` on
 any ref with `push` left off.
+
+## Signing the release image
+
+The box's root wrapper deploys an image only when it carries a cosign signature
+made by the release workflow. The signature uses a key pair, not keyless
+signing: artifact attestations are unavailable to a private repository, and
+keyless signing would write the repository name to the public transparency log
+(the workflow signs with `--tlog-upload=false`). The owner does this once:
+
+1. On the desktop, never on the box, make the pair in an empty folder:
+   `cosign generate-key-pair`. It asks for a password and writes `cosign.key`
+   and `cosign.pub`.
+2. In the repository, Settings, Environments, create `release-signing`. Under
+   "Deployment branches and tags" choose selected branches and tags and add a
+   tag rule `ae-v*`, so only release tags can read its secrets.
+3. In that environment add two secrets: `COSIGN_PRIVATE_KEY` (the whole text of
+   `cosign.key`) and `COSIGN_PASSWORD` (the password from step 1). Then delete
+   `cosign.key` from the desktop or keep it only in the vault.
+4. Commit `cosign.pub` as `deploy/omnigent-cosign.pub`; the sign job checks
+   each new signature against it. Copy the same file to the box as
+   `/etc/aeroot/omnigent-cosign.pub`, root owned, mode 0644. The public key is
+   safe to share.
+5. Publish a release. To check a pushed tag by hand:
+   `cosign verify --key /etc/aeroot/omnigent-cosign.pub --insecure-ignore-tlog <image>:<tag>`.
+
+Signing runs in its own job (`sign`) after the push, so the dry run on any ref
+never touches the environment or the key. The sign job signs only the digest
+the image job's own `docker push` reported, and the image job stops if the tag
+in the registry already names another image. The tag is pushed before it is signed: if signing fails,
+the tag exists unsigned, the box refuses it (check-tag exit 3), and re-running
+only the failed `sign` job signs that digest. A full re-run rebuilds and pushes
+a new digest instead. Until step 3 is done the sign job fails on
+purpose. To rotate, repeat steps 1 to 4; the box accepts only the key at that
+path.
+
+The tag rule limits which refs can read the key, not who can create an
+`ae-v*` tag. Anyone who can push such a tag runs that tag's copy of this
+workflow with the key in reach, so the environment's protection settings
+decide who can release (2026-11-19). The owner accepted that a repository
+admin, including the box's own GitHub login, can still do this: the box's root
+wrapper runs every image without host privileges, so a stolen key yields a bad
+Omnigent deploy, not root on the box.
 
 ## Automatic updates
 
@@ -916,7 +1002,16 @@ records `on-hold` and stops. Nothing is fetched, deployed or rebuilt.
    Then the pass waits while a session is mid-turn: its last relay-observed
    `live_status` is running or waiting (a turn held on an approval prompt) and
    its runner checked in within five minutes, from one `psql` count through
-   `compose.sh exec` given 30 seconds (`AE_AUTO_UPDATE_BUSY_TIMEOUT`). Nothing
+   `compose.sh exec` given 30 seconds (`AE_AUTO_UPDATE_BUSY_TIMEOUT`). When the
+   pass would restart the host (the upstream code moved, or a host rebuild is
+   pending), the count also takes each Claude Code chat whose turn ended with a
+   background shell still running: a status file under `~/.claude/sessions/`
+   that reads `shell`, from a Claude process a runner launched (the file's
+   `pid` and `procStart` must match that live process, so a stale file on a
+   reused pid does not count). The host
+   restart kills those shells; a server-only deploy does not, so it ignores
+   them (2026-11-23: a forced deploy killed a planner's 20-minute render this
+   way, and the planner read idle). Nothing
    moves, `last` records `deferred` with the count and when it goes ahead
    anyway, and the next pass asks again. The pass asks a second time just
    before step 8 writes the new tag, because the pull and the dump can take
@@ -1102,6 +1197,40 @@ systemctl --user enable --now ae-omnigent-limits.timer
 ~/.omnigent-host/venv/bin/python -m ae_omni_policies.limits_relay --dry-run
 journalctl --user -u ae-omnigent-limits -n 20
 ```
+
+## New-model watch
+
+When Anthropic ships a model (Fable 5.2 on 2026-11-10 was found by hand), the box now
+notices on its own. Every six hours a host timer scans the installed Claude Code binary for
+`claude-<family>-<major>[-<minor>]` ids, keeps the ones newer than anything it knows of that
+family, sends the newest one per family a one-word question through `claude -p` (no tools,
+MCP servers, settings or saved session; at most three a pass, a miss is asked again after 24
+hours), and posts what answered to `POST /v1/ae/model-watch`. It runs on the host because the
+server image has no `claude` binary. For each id that starts answering, the server reads the
+release notes (default `https://platform.claude.com/docs/en/models/overview.md`, override
+with `AE_MODEL_WATCH_NOTES_URLS`), runs the preset review now with the notes' excerpt in the
+read, and files one phone reminder when the suggestions are stored. Presets are never changed.
+Once, as `<user>` (the admin login must be stored: `omnigent login`):
+
+```
+# 1. the relay module in the host venv (the auto-update does this on a release
+#    that changes packages/ae_omni_policies)
+deploy/install-host.sh
+# 2. look before it posts
+~/.omnigent-host/venv/bin/python -m ae_omni_policies.model_watch_relay --dry-run
+# 3. the timer, every six hours
+cp deploy/systemd/user/ae-omnigent-model-watch.{service,timer} ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now ae-omnigent-model-watch.timer
+# 4. once, to prove the whole path on an id that already answers
+~/.omnigent-host/venv/bin/python -m ae_omni_policies.model_watch_relay --seed claude-fable-5-2
+journalctl --user -u ae-omnigent-model-watch -n 20
+```
+
+State: the server keeps `AE_MODEL_WATCH_FILE` (default `/data/ae-model-watch.json`); the relay
+keeps `~/.omnigent/ae/model-watch.json` (binary size and mtime, ids still waiting). The Admin
+Center's Spend card shows a "New models" fold, and warns when the last report is older than 13
+hours.
 
 ## Box health relay
 

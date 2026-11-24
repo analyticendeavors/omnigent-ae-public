@@ -8,10 +8,10 @@ Stock Omnigent's sidebar marks a session as running, or as waiting on you. In th
 
 <p align="center"><img src="../media/sidebar-activity.webp" alt="Every row shows what its session is doing"></p>
 
-A spinner means working. An hourglass with a count means the session's own turn is over and it waits on that many helper agents, and the count drops live as they report back. An amber spinner means no new output for five minutes or more, and an alarm shows when a scheduled check-in will wake a paused session. Every row shows this, not only the one you have open.
+A spinner means working. An hourglass with a count means the session's own turn is over and it waits on that many helper agents, and the count drops live as they report back. An amber spinner means no new output for five minutes or more, and an alarm shows when a scheduled check-in will wake a paused session. Every row shows this, not only the one you have open. A Claude Code chat shows the spinner as soon as a new turn starts, even while background helpers keep Claude's own status at busy; a stop, a failure or an interrupt clears it.
 
 **Where:** Every session row in the sidebar.<br>
-**Built from:** core patches [`0074`](../../patches/0074-ae-patch-Show-when-a-session-is-working-quiet-waitin.patch), [`0088`](../../patches/0088-ae-patch-Show-every-sidebar-row-s-waiting-state-and-.patch), [`0089`](../../patches/0089-ae-patch-Fix-the-review-findings-on-the-sidebar-rows.patch)
+**Built from:** core patches [`0074`](../../patches/0074-ae-patch-Show-when-a-session-is-working-quiet-waitin.patch), [`0088`](../../patches/0088-ae-patch-Show-every-sidebar-row-s-waiting-state-and-.patch), [`0089`](../../patches/0089-ae-patch-Fix-the-review-findings-on-the-sidebar-rows.patch), [`0372`](../../patches/0372-ae-patch-Show-claude-native-chats-running-when-a-tur.patch), [`0373`](../../patches/0373-ae-patch-Fix-the-review-findings-on-0372-prompt-edge.patch)
 
 ## A hover card that says what is happening now
 
@@ -66,6 +66,13 @@ The Add to project lists end in a Create project row. Picking it turns the row i
 
 **Where:** Add to project in a session's menu, its right-click menu, or the chat header's project tag.<br>
 **Built from:** core patch [`0176`](../../patches/0176-ae-patch-Add-a-Create-project-row-at-the-foot-of-the.patch)
+
+## Archiving a session archives its side chats
+
+A side chat is a fork you open from a session; the list hides it and it shows as a tab beside its session. Archiving the session now archives its side chats too (nested ones included), and each one's runner is stopped after the same Undo window as the session's. Undo on the session restores exactly the side chats that archive took; one you archived by hand stays archived. Each side chat archived this way carries the `ae.side_chat.archived_with` label while it is archived, naming the session. Before this, a side chat of an archived session kept running unseen and still counted as a working slot; the capacity route and the slot cap now also leave out any side chat whose session is archived or gone.
+
+**Where:** Archive on a session row, or Undo in the pill that follows.<br>
+**Built from:** core patches [`0387`](../../patches/0387-ae-patch-Archiving-a-session-archives-its-side-chats.patch), [`0388`](../../patches/0388-ae-patch-Fix-the-review-findings-on-0387-side-chat-a.patch), [`0389`](../../patches/0389-ae-patch-Side-chats-a-failed-write-mid-cascade-still.patch), [`0390`](../../patches/0390-ae-patch-Fix-the-review-findings-on-0389-prune-on-a-.patch); [`packages/ae_omni_policies`](../../packages/ae_omni_policies)
 
 ---
 

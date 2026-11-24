@@ -19,7 +19,6 @@ import {
   describeError,
   fetchSocial,
   fetchSocialSlot,
-  markSocialPosted,
   type SocialSlot,
   type SocialView,
 } from "./api";
@@ -35,23 +34,22 @@ import {
   linkedinIcon,
   youtubeIcon,
 } from "./icons";
-import { copyText } from "./lot";
 import {
   ago,
   CHANNEL_NAMES,
   dueLabel,
   dueTodayCount,
   headerPill,
-  openUrl,
   overdueCount,
   slotTitle,
   upNext,
   warnings,
 } from "./socialWords";
+import { copyDraft, openNeedsEditor, openPost, postPosted } from "./socialActions";
 import { loadedDraft, rememberDraft, resetDrafts } from "./socialDrafts";
-import { probeShare, shareAvailable, shareToLinkedin, usesShareSheet } from "./socialShare";
-import { loadVisual, visualState } from "./socialVisual";
-import { activeBanner, bannerNode, forgetPost, noteReturn, onBannerChange, rememberPost } from "./socialPosted";
+import { probeShare, usesShareSheet } from "./socialShare";
+import { loadVisual } from "./socialVisual";
+import { activeBanner, bannerNode, noteReturn, onBannerChange } from "./socialPosted";
 import { closeSocialView, openSocialView, pushSocialView, socialViewOpen } from "./socialView";
 import { type Health, registerRefresh, setTile, staleTile, type Tile } from "./tiles";
 
@@ -233,9 +231,9 @@ function actions(slot: SocialSlot, view: SocialView, run: Runner): HTMLElement {
         return;
       }
       // The clipboard write starts here, inside the tap, before any await.
-      const copying = copyText(text);
+      const copying = copyDraft(text);
       await run.go(async () => {
-        self.textContent = (await copying) ? "Copied" : "Copy failed";
+        self.textContent = await copying;
       }, "note");
     },
   });
@@ -246,63 +244,19 @@ function actions(slot: SocialSlot, view: SocialView, run: Runner): HTMLElement {
       // Never disabled: with no draft it opens the editor, where the starter text and the Post
       // button are; with a draft it copies and opens the site.
       const text = noDraft ? null : loadedDraft(slot);
-      if (text === null) {
+      if (openNeedsEditor(slot, text)) {
+        // The picture is still loading: the editor's button waits for it, so open that instead of
+        // sharing the text alone by accident.
         run.openEditor(slot, self);
         return;
       }
-      const url = openUrl(slot, view, text);
-      if (usesShareSheet(slot) && shareAvailable() !== false) {
-        // The picture is still loading: the editor's button waits for it, so open that instead of
-        // sharing the text alone by accident.
-        if (visualState(slot) === "loading") {
-          run.openEditor(slot, self);
-          return;
-        }
-        // The share sheet (socialShare.ts): its copy, the remembered tap and the host call start
-        // here, inside the tap, before run.go awaits anything.
-        const sharing = shareToLinkedin({ context, slot, text });
-        await run.go(async () => {
-          const outcome = await sharing;
-          if (outcome.kind === "shared") {
-            self.textContent = "Shared";
-            if (outcome.filesDropped) setNote("Shared the text. This phone's share sheet could not take the image.", "info");
-          } else if (outcome.kind === "unavailable") {
-            setNote(`${outcome.copied ? "Draft copied" : "Could not copy"}. This browser has no share sheet; paste it at linkedin.com/feed.`, "info");
-          } else if (outcome.kind === "failed") {
-            setNote(
-              `${outcome.copied ? "Draft copied" : "Could not copy"}. Could not open the share sheet from here (${describeError(outcome.error)}); paste it at linkedin.com/feed.`,
-              "info",
-            );
-          }
-        }, "note");
-        return;
-      }
-      const copying = copyText(text); // inside the tap, before any await
+      // socialActions.ts: its copy, the remembered tap and the host call start here, inside the
+      // tap, before run.go awaits anything.
+      const opening = openPost(context, slot, view, text as string);
       await run.go(async () => {
-        if (!url) {
-          const copied = await copying;
-          setNote(`${copied ? "Draft copied. " : ""}No channel link for this post.`, "info");
-          return;
-        }
-        // Armed before the host call: on iOS the app switch happens while openExternal is still
-        // pending, so the first visible or focus event can come before it resolves.
-        const armed = Date.now();
-        rememberPost(slot.id, slot.platform, armed);
-        try {
-          await context.navigation.openExternal(url);
-        } catch (error) {
-          forgetPost(slot.id, armed);
-          // The host opens only links on its list; the draft is on the clipboard either way.
-          const copied = await copying;
-          const where = slot.platform === "linkedin" ? "linkedin.com/feed" : "the channel's Posts tab";
-          setNote(
-            `${copied ? "Draft copied" : "Could not copy"}. Could not open the site from here (${describeError(error)}); paste it at ${where}.`,
-            "info",
-          );
-          return;
-        }
-        const copied = await copying;
-        self.textContent = copied ? "Copied, opened" : "Opened";
+        const result = await opening;
+        if (result.label) self.textContent = result.label;
+        if (result.note) setNote(result.note.text, result.note.tone);
       }, "note");
     },
   });
@@ -311,7 +265,7 @@ function actions(slot: SocialSlot, view: SocialView, run: Runner): HTMLElement {
     title: "Mark this post as posted",
     onClick: async () => {
       await run.go(async () => {
-        await markSocialPosted(context, slot.id);
+        await postPosted(context, slot.id);
       }, "refresh");
     },
   });

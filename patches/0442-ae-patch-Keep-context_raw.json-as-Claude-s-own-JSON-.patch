@@ -1,0 +1,323 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:50:43 -0800
+Subject: [PATCH 442/443] [ae-patch] Keep context_raw.json as Claude's own
+ JSON, hold tokens until the cost is known, and never step the cost carry back
+
+---
+ .../harnesses/claude_native/ae_cost_carry.py  |  9 +-
+ omnigent/harnesses/claude_native/bridge.py    | 14 ++-
+ omnigent/harnesses/claude_native/forwarder.py |  6 +-
+ omnigent/harnesses/claude_native/status.py    | 20 +++--
+ .../claude_native/test_ae_cost_carry.py       | 86 ++++++++++++++++---
+ .../test_claude_native_bridge.py              |  8 +-
+ 6 files changed, 110 insertions(+), 33 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/ae_cost_carry.py b/omnigent/harnesses/claude_native/ae_cost_carry.py
+index b5e51e224ad8d00098aa00acd5191f88e2710c46..a5c549f997df1dc85f241cced258688ec07bab4d 100644
+--- a/omnigent/harnesses/claude_native/ae_cost_carry.py
++++ b/omnigent/harnesses/claude_native/ae_cost_carry.py
+@@ -11,8 +11,9 @@ Fold rule, keyed on process identity and never on a bare fall in ``S``:
+ 
+ * ``proc`` is ``<pid>-<starttime>`` of the Claude process that rendered the statusLine
+   (field 22 of ``/proc/<pid>/stat``, read after the last ``)`` because the command name may
+-  hold spaces). The statusLine shim writes it as the first line of the same atomically
+-  written capture as ``S`` (``context_raw.json``); ``sync_raw_status_context`` copies it to
++  hold spaces). The statusLine shim writes it as the first line of ``ae_context_proc``, an
++  atomically written copy of the same capture as ``S`` (``context_raw.json`` itself stays
++  Claude's JSON for its other readers); ``sync_raw_status_context`` copies it to
+   ``context.json`` as ``ae_proc``. Identity and cost therefore come from one read and can
+   never be paired across two renders. A relaunch is a new process; a ``/clear``,
+   ``/compact`` or sub-agent run stays in one.
+@@ -35,7 +36,7 @@ child that grows in between can only make ``own`` slightly high, never low. Only
+ sub-agents have no usage and read as zero. The ``max`` keeps the running process's ``S``,
+ which the server may already hold, from counting twice. A failed or timed-out read, a child's
+ included, or a child list past the page cap, posts no cost and backs the seed off
+-(1 s, doubling to 30 s); tokens still post without a cost meanwhile.
++(1 s, doubling to 30 s); tokens post only with a known cost, so they wait until it recovers.
+ 
+ Rotation (``/clear`` or ``/fork`` to a new session id): a carry file written for another
+ session id starts a fresh carry for the new id, and the cost post is held until the
+@@ -353,7 +354,7 @@ def _adopt_stored(bridge_dir: Path, carry: CostCarry) -> None:
+     :param carry: The in-memory carry, updated in place when a seeded one is on disk.
+     """
+     stored = load_carry(bridge_dir, carry.session_id)
+-    if stored.seeded:
++    if stored.seeded and (not carry.seeded or stored.total() >= carry.total()):
+         carry.offset, carry.last, carry.proc, carry.seeded = (
+             stored.offset,
+             stored.last,
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index c9cb4024134ffacb22ffc5014cf5ed268eea80dc..292924e950fce9610d56691cdfc9149cb00a1cd6 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -80,7 +80,11 @@ from omnigent.harnesses.claude_native.ae_pane_progress import (
+ )
+ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
+ from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
+-from omnigent.harnesses.claude_native.status import CLAUDE_ACCOUNT_FILE, CONTEXT_RAW_FILE
++from omnigent.harnesses.claude_native.status import (
++    CLAUDE_ACCOUNT_FILE,
++    CONTEXT_PROC_FILE,
++    CONTEXT_RAW_FILE,
++)
+ from omnigent.harnesses.diagnostics import detect_sign_in_prompt, sign_in_next_step
+ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
+ from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
+@@ -2697,6 +2701,7 @@ def build_hook_settings(
+     # ``context.json``) and chains to whatever the user had globally so
+     # claude-hud / their bar still renders.
+     raw_quoted = shlex.quote(str(bridge_dir / CONTEXT_RAW_FILE))
++    proc_quoted = shlex.quote(str(bridge_dir / CONTEXT_PROC_FILE))
+     # The account sidecar records which Claude login renders this bar
+     # (empty for the default one) so usage readers can key limits by account.
+     account_quoted = shlex.quote(str(bridge_dir / CLAUDE_ACCOUNT_FILE))
+@@ -2704,12 +2709,15 @@ def build_hook_settings(
+     # the previous launch's account.
+     status_command = (
+         # Claude's pid and starttime (field 22 of /proc/<pid>/stat, read after the last ")"
+-        # because the command name may hold spaces); rides in the capture's first line.
++        # because the command name may hold spaces). The raw file stays Claude's JSON only;
++        # the identity pairs with a copy of it in the proc file.
+         "p=$(cat); i=\"$PPID-$(sed 's/.*) //' /proc/$PPID/stat 2>/dev/null | cut -d' ' -f20)\""
+         f"; printf '%s' \"${{OMNIGENT_CLAUDE_ACCOUNT-}}\" > {account_quoted}.$$.tmp"
+         f" && mv -f {account_quoted}.$$.tmp {account_quoted}"
+-        f'; printf \'%s\\n%s\' "$i" "$p" > {raw_quoted}.$$.tmp'
++        f"; printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
+         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
++        f'; printf \'%s\\n%s\' "$i" "$p" > {proc_quoted}.$$.tmp'
++        f" && mv -f {proc_quoted}.$$.tmp {proc_quoted}"
+     )
+     chain_command = read_user_status_line_command()
+     if chain_command is not None:
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 9830ee442166117c5489d766e4314a110a0cef8c..0971c6e58dc890b232b6278f0dee06f4c50bf7aa 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -3094,15 +3094,13 @@ async def _forward_session_cost(
+     # Never post a cost below the one already posted (the server also clamps).
+     known = [c for c in (display_cost, dedupe.posted_cost) if c is not None]
+     cost_known = max(known) if known else None
+-    # While the carry is unknown (seed failed or held) tokens still post, without a cost.
+-    if cost_known is not None or status_cost is not None:
++    if cost_known is not None:
+         tokens = await asyncio.to_thread(dedupe.token_tally.update, parent_transcript_path)
+         if tokens != (dedupe.posted_tokens or _ZERO_TOKENS):
+             payload["cumulative_input_tokens"] = tokens[0]
+             payload["cumulative_output_tokens"] = tokens[1]
+             payload["cumulative_cache_read_input_tokens"] = tokens[2]
+-            if cost_known is not None:
+-                payload["cumulative_cost_usd"] = cost_known
++            payload["cumulative_cost_usd"] = cost_known
+     if display_cost is not None and (
+         dedupe.posted_cost is None or display_cost > dedupe.posted_cost
+     ):
+diff --git a/omnigent/harnesses/claude_native/status.py b/omnigent/harnesses/claude_native/status.py
+index 21f9eeb4787074086e650263eb8dd0ff5f7d3acf..8383e49e8460b3f4c8efa41af4cd876e1369a363 100644
+--- a/omnigent/harnesses/claude_native/status.py
++++ b/omnigent/harnesses/claude_native/status.py
+@@ -28,8 +28,10 @@ CONTEXT_RAW_FILE = "context_raw.json"
+ # Backup account name the session runs on, rewritten on every statusLine
+ # render; empty for the box's default login.
+ CLAUDE_ACCOUNT_FILE = "claude_account"
+-# The shim's first capture line is the Claude process identity, ``<pid>-<starttime>``
+-# (starttime empty where /proc is missing), so identity and cost share one atomic write.
++# The shim also writes ``<pid>-<starttime>\n<the same raw JSON>`` here in one atomic write
++# (starttime empty where /proc is missing), so identity and cost are read as a pair.
++# ``context_raw.json`` itself stays Claude's JSON only, for its other readers.
++CONTEXT_PROC_FILE = "ae_context_proc"
+ PROC_ID_RE = re.compile(r"[0-9]+-[0-9]*")
+ 
+ 
+@@ -99,7 +101,9 @@ def sync_raw_status_context(
+     :returns: The new signature to carry forward (unchanged on a miss or
+         an unparseable file, so the next poll retries).
+     """
+-    raw_path = bridge_dir / CONTEXT_RAW_FILE
++    raw_path = bridge_dir / CONTEXT_PROC_FILE
++    if not raw_path.exists():
++        raw_path = bridge_dir / CONTEXT_RAW_FILE
+     try:
+         stat = raw_path.stat()
+     except OSError:
+@@ -111,11 +115,11 @@ def sync_raw_status_context(
+         text = raw_path.read_text(encoding="utf-8")
+     except OSError:
+         return last_sig
+-    proc_id, _, rest = text.partition("\n")
+-    if PROC_ID_RE.fullmatch(proc_id):
+-        text = rest
+-    else:
+-        proc_id = ""
++    proc_id = ""
++    if raw_path.name == CONTEXT_PROC_FILE:
++        first, _, rest = text.partition("\n")
++        if PROC_ID_RE.fullmatch(first):
++            proc_id, text = first, rest
+     try:
+         payload = json.loads(text)
+     except json.JSONDecodeError:
+diff --git a/tests/harnesses/claude_native/test_ae_cost_carry.py b/tests/harnesses/claude_native/test_ae_cost_carry.py
+index c4184579dae25bf5626bdd9be953e62eeee46e13..7f9cfd9355aa0e0f29befa26740229d0b87738c1 100644
+--- a/tests/harnesses/claude_native/test_ae_cost_carry.py
++++ b/tests/harnesses/claude_native/test_ae_cost_carry.py
+@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native.ae_cost_carry import (
+     carried_cost,
+     carry_lock,
+     load_carry,
++    save_carry,
+ )
+ from omnigent.harnesses.claude_native.bridge import build_hook_settings
+ from omnigent.harnesses.claude_native.status import sync_raw_status_context
+@@ -294,15 +295,15 @@ async def test_lead_without_children_seeds_from_its_own_total(tmp_path: Path) ->
+ 
+ 
+ def test_identity_and_cost_come_from_one_capture(tmp_path: Path) -> None:
+-    raw = tmp_path / "context_raw.json"
++    proc = tmp_path / "ae_context_proc"
+     payload = {"context_window": {"context_window_size": 200000}, "cost": {"total_cost_usd": 4.0}}
+-    raw.write_text("123-456\n" + json.dumps(payload), encoding="utf-8")
++    proc.write_text("123-456\n" + json.dumps(payload), encoding="utf-8")
+     sync_raw_status_context(tmp_path, None)
+     state = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
+     assert (state["ae_proc"], state["total_cost_usd"]) == ("123-456", 4.0)
+     # A poll between two renders sees either the old pair or the new pair, never a mix.
+-    raw.write_text("999-1\n" + json.dumps(payload | {"cost": {"total_cost_usd": 0.1}}))
+-    os.utime(raw, ns=(raw.stat().st_mtime_ns + 5_000_000,) * 2)
++    proc.write_text("999-1\n" + json.dumps(payload | {"cost": {"total_cost_usd": 0.1}}))
++    os.utime(proc, ns=(proc.stat().st_mtime_ns + 5_000_000,) * 2)
+     sync_raw_status_context(tmp_path, None)
+     state = json.loads((tmp_path / "context.json").read_text(encoding="utf-8"))
+     assert (state["ae_proc"], state["total_cost_usd"]) == ("999-1", 0.1)
+@@ -327,9 +328,8 @@ def test_shim_writes_starttime_even_when_the_command_name_has_parens(tmp_path: P
+         subprocess.run(["sh", "-c", command], input=b'{"x": 1}', check=True, timeout=20)
+         stat = Path("/proc/self/stat").read_text(encoding="utf-8")
+         starttime = stat.rpartition(")")[2].split()[19]
+-        first, _, rest = (
+-            (tmp_path / "context_raw.json").read_text(encoding="utf-8").partition("\n")
+-        )
++        first, _, rest = (tmp_path / "ae_context_proc").read_text(encoding="utf-8").partition("\n")
++        assert (tmp_path / "context_raw.json").read_text(encoding="utf-8") == '{"x": 1}'
+     finally:
+         libc.prctl(15, old.value)
+     assert first == f"{os.getpid()}-{starttime}"
+@@ -372,8 +372,12 @@ async def test_policy_figure_after_a_restart_is_the_carried_total(
+     assert posted[0]["policy_cost_usd"] == pytest.approx(110.5)
+ 
+ 
++def _held(posted: list[dict[str, Any]]) -> list[dict[str, Any]]:
++    return [p for p in posted if any(k.startswith("cumulative_") for k in p)]
++
++
+ @pytest.mark.asyncio
+-async def test_failed_seed_still_posts_tokens_and_backs_off(
++async def test_failed_seed_holds_tokens_and_backs_off(
+     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+ ) -> None:
+     bridge = tmp_path / "bridge"
+@@ -408,15 +412,75 @@ async def test_failed_seed_still_posts_tokens_and_backs_off(
+         transport=httpx.MockTransport(handler), base_url="http://ap"
+     ) as client:
+         await _forward(client, bridge, dedupe, parent)
+-        assert gets and len(posted) == 1
+-        assert posted[0]["cumulative_input_tokens"] == 10
+-        assert "cumulative_cost_usd" not in posted[0]
++        assert gets and not _held(posted)
+         tried = len(gets)
+         await _forward(client, bridge, dedupe, parent)  # inside the backoff: no new read
+         assert len(gets) == tried
+         clock["now"] += 2.0
+         await _forward(client, bridge, dedupe, parent)
+         assert len(gets) > tried
++        assert not _held(posted)  # tokens wait for a known cost
++
++
++@pytest.mark.asyncio
++async def test_tokens_post_with_the_cost_once_the_seed_recovers(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    bridge = tmp_path / "bridge"
++    bridge.mkdir()
++    parent = tmp_path / "sess.jsonl"
++    line = {
++        "type": "assistant",
++        "requestId": "r1",
++        "message": {
++            "id": "m1",
++            "role": "assistant",
++            "model": "claude-opus-4-8",
++            "usage": {"input_tokens": 10, "output_tokens": 5},
++        },
++    }
++    parent.write_text(json.dumps(line) + "\n", encoding="utf-8")
++    monkeypatch.setattr(forwarder, "read_claude_context_state", lambda _b: _state("1", 3.0))
++    monkeypatch.setattr(carry_mod.time, "monotonic", lambda: 1000.0)
++    dedupe = forwarder._ForwardDedupeState()
++    up = {"ok": False}
++    posted: list[dict[str, Any]] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.method == "GET":
++            if not up["ok"]:
++                return httpx.Response(503, request=request)
++            if request.url.path.endswith("/child_sessions"):
++                body: dict[str, Any] = {"data": [], "has_more": False}
++            else:
++                body = {"total_cost_usd": 50.0}
++            return httpx.Response(200, json=body, request=request)
++        posted.append(json.loads(request.content)["data"])
++        return httpx.Response(200, json={}, request=request)
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://ap"
++    ) as client:
++        await _forward(client, bridge, dedupe, parent)
++        assert not _held(posted)
++        up["ok"] = True
++        assert dedupe.cost_carry is not None
++        dedupe.cost_carry.seed_retry_not_before = 0.0
++        await _forward(client, bridge, dedupe, parent)
++    final = [p for p in posted if "cumulative_cost_usd" in p]
++    assert final[0]["cumulative_input_tokens"] == 10
++    assert final[0]["cumulative_cost_usd"] == pytest.approx(50.0)
++
++
++@pytest.mark.asyncio
++async def test_adopt_never_steps_the_carry_back(tmp_path: Path) -> None:
++    save_carry(tmp_path, CostCarry("c", offset=1.0, last=2.0, proc="1-1", seeded=True))
++    carry = CostCarry("c", offset=10.0, last=5.0, proc="1-1", seeded=True)
++    carry_mod._adopt_stored(tmp_path, carry)
++    assert (carry.offset, carry.last) == (10.0, 5.0)
++    save_carry(tmp_path, CostCarry("c", offset=20.0, last=1.0, proc="2-2", seeded=True))
++    carry_mod._adopt_stored(tmp_path, carry)
++    assert (carry.offset, carry.last, carry.proc) == (20.0, 1.0, "2-2")
+ 
+ 
+ @pytest.mark.asyncio
+diff --git a/tests/harnesses/claude_native/test_claude_native_bridge.py b/tests/harnesses/claude_native/test_claude_native_bridge.py
+index 7847ad2c5c6224e3ceffe95d974af4edc931b148..de7fb99e314692722b00c5e4c5345d656050e483 100644
+--- a/tests/harnesses/claude_native/test_claude_native_bridge.py
++++ b/tests/harnesses/claude_native/test_claude_native_bridge.py
+@@ -11875,6 +11875,7 @@ def test_statusline_shell_command_captures_and_chains(
+     """
+     from omnigent.harnesses.claude_native.status import (
+         CLAUDE_ACCOUNT_FILE,
++        CONTEXT_PROC_FILE,
+         CONTEXT_RAW_FILE,
+         sync_raw_status_context,
+     )
+@@ -11904,10 +11905,11 @@ def test_statusline_shell_command_captures_and_chains(
+         env=default_env,
+     )
+     assert result.returncode == 0, result.stderr
+-    # First line is the Claude process identity; the rest is the exact stdin.
+-    proc_id, _, raw_payload = (tmp_path / CONTEXT_RAW_FILE).read_text("utf-8").partition("\n")
++    # The raw file is the exact stdin; the identity pairs with a copy in the proc file.
++    assert (tmp_path / CONTEXT_RAW_FILE).read_text("utf-8") == payload
++    proc_id, _, proc_payload = (tmp_path / CONTEXT_PROC_FILE).read_text("utf-8").partition("\n")
+     assert re.fullmatch(r"[0-9]+-[0-9]*", proc_id)
+-    assert raw_payload == payload
++    assert proc_payload == payload
+     assert chain_out.read_text("utf-8") == payload
+     # The default login records an empty account sidecar on every render.
+     assert (tmp_path / CLAUDE_ACCOUNT_FILE).read_text("utf-8") == ""

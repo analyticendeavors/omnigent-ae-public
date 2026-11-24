@@ -1,0 +1,584 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 09:01:47 -0800
+Subject: [PATCH 345/443] [ae-patch] Context breakdown: Try again wakes a
+ sleeping runner before reading context
+
+---
+ .../sessions/routes_ae_context_usage.py       |  91 ++++++-
+ .../server/routes/sessions/routes_core.py     |   3 +-
+ .../routes/test_ae_context_usage_routes.py    | 256 ++++++++++++++++++
+ web/src/components/aeContextUsage.test.tsx    |  25 +-
+ web/src/components/aeContextUsage.ts          |  27 +-
+ .../components/aeRail/AeRailContext.test.tsx  |   3 +
+ 6 files changed, 390 insertions(+), 15 deletions(-)
+
+diff --git a/omnigent/server/routes/sessions/routes_ae_context_usage.py b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+index 24c7b0bfc8c7ae015652e4ecf3094eb8551db2fe..086f2998f8d290a099478d5b46465ebcc83b24c8 100644
+--- a/omnigent/server/routes/sessions/routes_ae_context_usage.py
++++ b/omnigent/server/routes/sessions/routes_ae_context_usage.py
+@@ -2,16 +2,57 @@
+ 
+ from __future__ import annotations
+ 
++import asyncio
++import time
++from collections.abc import Coroutine
++
+ from fastapi import APIRouter, Request
+ 
++from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.runner.routing import RunnerRouter
+ from omnigent.server.auth import LEVEL_EDIT, AuthProvider
+ from omnigent.server.routes._auth_helpers import get_user_id, require_access
+-from omnigent.server.routes._sessions.helpers import _forward_session_change_to_runner
++from omnigent.server.routes._sessions.helpers import (
++    _forward_session_change_to_runner,
++    _get_runner_client,
++)
+ from omnigent.server.routes.sessions.routes_ae_fast_mode import _runner_answer
++from omnigent.server.routes.sessions.routes_core import (
++    _is_native_terminal_session,
++    _wake_runner_for_model_change,
++)
+ from omnigent.stores import ConversationStore
+ from omnigent.stores.permission_store import PermissionStore
+ 
++# How long one Try again waits for a sleeping runner to wake before answering `pending`.
++WAKE_BUDGET_S = 45
++# The whole request (wake plus read) stays under this many seconds.
++REQUEST_BUDGET_S = 75
++# A wake still running after this long is given up, so a hung launch never pins the panel.
++WAKE_LIMIT_S = 120
++
++# Wakes in flight, by session, so a retry joins one instead of starting another.
++_wakes: dict[str, asyncio.Task[object]] = {}
++
++
++def _wake_done(session_id: str, task: asyncio.Task[object]) -> None:
++    """Forget a finished wake and read its outcome so a late failure is never unretrieved."""
++    if _wakes.get(session_id) is task:
++        del _wakes[session_id]
++    if not task.cancelled():
++        task.exception()
++
++
++async def _bounded_wake(wake: Coroutine[object, object, object]) -> object:
++    """Run one wake under WAKE_LIMIT_S; a hung wake ends as an offline answer, not forever."""
++    try:
++        return await asyncio.wait_for(wake, WAKE_LIMIT_S)
++    except TimeoutError:
++        raise OmnigentError(
++            "Waking the session's runner took too long. Try again.",
++            code=ErrorCode.RUNNER_UNAVAILABLE,
++        ) from None
++
+ 
+ def register_context_usage_routes(
+     router: APIRouter,
+@@ -23,7 +64,7 @@ def register_context_usage_routes(
+ ) -> None:
+     @router.get("/sessions/{session_id}/context-usage")
+     async def context_usage(
+-        request: Request, session_id: str, fresh: bool = False
++        request: Request, session_id: str, fresh: bool = False, wake: bool = False
+     ) -> dict[str, object]:
+         await require_access(
+             get_user_id(request, auth_provider),
+@@ -32,12 +73,54 @@ def register_context_usage_routes(
+             permission_store,
+             conversation_store,
+         )
++        task = _wakes.get(session_id)
++        if task is not None and task.done():
++            task = None
++        if task is None and wake and await _get_runner_client(session_id, runner_router) is None:
++            # Only the user's own refresh starts a wake.
++            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
++            if conv is not None and conv.host_id is not None and _is_native_terminal_session(conv):
++                task = _wakes.get(session_id)
++                if task is None or task.done():
++                    task = asyncio.ensure_future(
++                        _bounded_wake(
++                            _wake_runner_for_model_change(
++                                request,
++                                conv,
++                                conversation_store,
++                                runner_router,
++                                action="read context",
++                            )
++                        )
++                    )
++                    _wakes[session_id] = task
++                    task.add_done_callback(lambda t, sid=session_id: _wake_done(sid, t))
++        timeout_s: float = 35
++        if task is not None:
++            # A wake that outlives the budget keeps running and later requests join it.
++            began = time.monotonic()
++            try:
++                await asyncio.wait_for(asyncio.shield(task), WAKE_BUDGET_S)
++            except TimeoutError:
++                return {
++                    "available": False,
++                    "pending": True,
++                    "reason": "Waking the session's runner\u2026",
++                }
++            except OmnigentError as exc:
++                if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
++                    return {"available": False, "offline": True, "reason": exc.message}
++                if exc.code in (ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCode.WORKSPACE_MISSING):
++                    # Retryable: the user may fix the host, so Try again stays.
++                    return {"available": False, "reason": exc.message}
++                raise
++            timeout_s = max(5.0, REQUEST_BUDGET_S - (time.monotonic() - began))
+         result = await _forward_session_change_to_runner(
+             session_id,
+             runner_router,
+             # `fresh` asks the runner to skip its snapshot cache (turn end, refresh).
+             {"type": "context_usage", "fresh": True} if fresh else {"type": "context_usage"},
+-            timeout_s=35,
++            timeout_s=timeout_s,
+         )
+         if result is None:
+             # `offline` tells the web this is a lost connection, shown at once, not a
+@@ -45,6 +128,6 @@ def register_context_usage_routes(
+             return {
+                 "available": False,
+                 "offline": True,
+-                "reason": "Context request timed out or the runner is offline. Try again shortly.",
++                "reason": "The session's runner is asleep or did not answer. Try again wakes it.",
+             }
+         return _runner_answer(result, action="read context breakdown")
+diff --git a/omnigent/server/routes/sessions/routes_core.py b/omnigent/server/routes/sessions/routes_core.py
+index 22e21e25116cf2e340927c53d48f308645e5e48d..476c8cf4f51decf85c515f1848f8264b9326b20f 100644
+--- a/omnigent/server/routes/sessions/routes_core.py
++++ b/omnigent/server/routes/sessions/routes_core.py
+@@ -289,6 +289,7 @@ async def _wake_runner_for_model_change(
+     conv: Conversation,
+     conversation_store: ConversationStore,
+     runner_router: RunnerRouter | None,
++    action: str = "switch models",
+ ) -> Conversation:
+     """Restore a sleeping native session before applying an explicit model pick."""
+     if await _get_runner_client(conv.id, runner_router) is not None:
+@@ -303,7 +304,7 @@ async def _wake_runner_for_model_change(
+     )
+     if runner_client is None:
+         raise OmnigentError(
+-            "Cannot switch models while the session host is offline. Reconnect the host and retry.",
++            f"Cannot {action} while the session host is offline. Reconnect the host and retry.",
+             code=ErrorCode.RUNNER_UNAVAILABLE,
+         )
+     terminal_ready = await _ensure_runner_session_initialized(
+diff --git a/tests/server/routes/test_ae_context_usage_routes.py b/tests/server/routes/test_ae_context_usage_routes.py
+index 0ce2c07a6c3655b2955df7db06aa4f60ffc3038e..4b747a0e4bf84684bdd1e9900364748aff870378 100644
+--- a/tests/server/routes/test_ae_context_usage_routes.py
++++ b/tests/server/routes/test_ae_context_usage_routes.py
+@@ -6,8 +6,11 @@ from unittest.mock import AsyncMock
+ import pytest
+ from fastapi.testclient import TestClient
+ 
++from omnigent.errors import ErrorCode, OmnigentError
+ from omnigent.server.routes._sessions.helpers import _RunnerForwardResult
+ from omnigent.server.routes.sessions import routes_ae_context_usage as routes
++from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
++from omnigent.stores.host_store import HostStore
+ from tests.server.routes.test_ae_fast_mode_routes import OWNER, VIEWER, _app, _seed_session
+ 
+ 
+@@ -30,6 +33,16 @@ def test_access(db_uri, monkeypatch, user, expected):
+     assert forward.await_count == (1 if expected == 200 else 0)
+ 
+ 
++@pytest.fixture(autouse=True)
++def _clear_wakes():
++    """Each TestClient runs its own loop, so no wake task may outlive its test."""
++    routes._wakes.clear()
++    yield
++    for task in routes._wakes.values():
++        task.cancel()
++    routes._wakes.clear()
++
++
+ def test_offline_runner_answers_offline(db_uri, monkeypatch):
+     session = _seed_session(db_uri)
+     monkeypatch.setattr(routes, "_forward_session_change_to_runner", AsyncMock(return_value=None))
+@@ -61,3 +74,246 @@ def test_fresh_query_reaches_the_runner(db_uri, monkeypatch, query, payload):
+         )
+     assert response.status_code == 200
+     assert forward.await_args.args[2] == payload
++
++
++def _ok_forward():
++    return AsyncMock(
++        return_value=_RunnerForwardResult(
++            status_code=200, body=json.dumps({"available": True}).encode()
++        )
++    )
++
++
++def _get(db_uri, session, query, user=OWNER):
++    with TestClient(_app(db_uri)) as client:
++        return client.get(
++            f"/v1/sessions/{session}/context-usage{query}", headers={"X-Forwarded-Email": user}
++        )
++
++
++def test_wake_flag_wakes_a_sleeping_runner_then_reads(db_uri, monkeypatch):
++    session = _seed_session(db_uri)
++    _with_host(db_uri, session)
++    forward = _ok_forward()
++    wake = AsyncMock()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", wake)
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    response = _get(db_uri, session, "?fresh=true&wake=true")
++    assert response.status_code == 200
++    assert wake.await_count == 1
++    assert wake.await_args.kwargs["action"] == "read context"
++    assert forward.await_count == 1
++
++
++def test_wake_flag_with_a_runner_client_does_not_wake(db_uri, monkeypatch):
++    session = _seed_session(db_uri)
++    wake = AsyncMock()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", _ok_forward())
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=object()))
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", wake)
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    assert _get(db_uri, session, "?wake=true").status_code == 200
++    assert wake.await_count == 0
++
++
++def test_no_wake_flag_never_wakes_and_gives_the_new_reason(db_uri, monkeypatch):
++    session = _seed_session(db_uri)
++    wake = AsyncMock()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", wake)
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    body = _get(db_uri, session, "?fresh=true").json()
++    assert wake.await_count == 0
++    assert body["offline"] is True
++    assert (
++        body["reason"] == "The session's runner is asleep or did not answer. Try again wakes it."
++    )
++
++
++def _with_host(db_uri, session):
++    host = HostStore(db_uri).upsert_on_connect("6b9c07bfb42f687d53af44f018adebec", "laptop", OWNER)
++    SqlAlchemyConversationStore(db_uri).set_host_id(
++        session, host_id=host.host_id, workspace="/tmp/ctx"
++    )
++
++
++def _failing(monkeypatch, code, message="boom"):
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    monkeypatch.setattr(
++        routes,
++        "_wake_runner_for_model_change",
++        AsyncMock(side_effect=OmnigentError(message, code=code)),
++    )
++    forward = _ok_forward()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    return forward
++
++
++def test_runner_unavailable_passes_the_helper_message_through(db_uri, monkeypatch):
++    session = _seed_session(db_uri)
++    _with_host(db_uri, session)
++    forward = _failing(monkeypatch, ErrorCode.RUNNER_UNAVAILABLE, "Session init failed.")
++    body = _get(db_uri, session, "?wake=true").json()
++    assert body == {"available": False, "offline": True, "reason": "Session init failed."}
++    assert forward.await_count == 0
++
++
++@pytest.mark.parametrize("code", [ErrorCode.HARNESS_NOT_CONFIGURED, ErrorCode.WORKSPACE_MISSING])
++def test_host_refusals_give_a_final_answer(db_uri, monkeypatch, code):
++    session = _seed_session(db_uri)
++    _with_host(db_uri, session)
++    forward = _failing(monkeypatch, code, "Refused.")
++    body = _get(db_uri, session, "?wake=true").json()
++    assert body == {"available": False, "reason": "Refused."}
++    assert "final" not in body
++    assert forward.await_count == 0
++
++
++@pytest.mark.parametrize("has_host,native", [(False, True), (True, False)])
++def test_no_host_or_non_native_session_never_wakes_and_still_forwards(
++    db_uri, monkeypatch, has_host, native
++):
++    session = _seed_session(db_uri)
++    if has_host:
++        _with_host(db_uri, session)
++    wake = AsyncMock()
++    forward = _ok_forward()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: native)
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", wake)
++    assert _get(db_uri, session, "?wake=true").status_code == 200
++    assert wake.await_count == 0
++    assert forward.await_count == 1
++
++
++def test_wake_over_budget_answers_pending(db_uri, monkeypatch):
++    import asyncio
++
++    session = _seed_session(db_uri)
++    _with_host(db_uri, session)
++    done = []
++
++    async def slow(*args, **kwargs):
++        await asyncio.sleep(0.2)
++        done.append(True)
++
++    forward = _ok_forward()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", slow)
++    monkeypatch.setattr(routes, "WAKE_BUDGET_S", 0.01)
++    body = _get(db_uri, session, "?wake=true").json()
++    assert body["pending"] is True
++    assert body["available"] is False
++    assert forward.await_count == 0
++
++
++@pytest.mark.parametrize("user,expected", [(VIEWER, 403), ("stranger@example.com", 404)])
++def test_access_check_runs_before_the_wake(db_uri, monkeypatch, user, expected):
++    session = _seed_session(db_uri)
++    wake = AsyncMock()
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", wake)
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    assert _get(db_uri, session, "?wake=true", user=user).status_code == expected
++    assert wake.await_count == 0
++
++
++def _wake_setup(db_uri, monkeypatch, wake):
++    routes._wakes.clear()
++    session = _seed_session(db_uri)
++    _with_host(db_uri, session)
++    forward = _ok_forward()
++    monkeypatch.setattr(routes, "_forward_session_change_to_runner", forward)
++    monkeypatch.setattr(routes, "_get_runner_client", AsyncMock(return_value=None))
++    monkeypatch.setattr(routes, "_is_native_terminal_session", lambda conv: True)
++    monkeypatch.setattr(routes, "_wake_runner_for_model_change", wake)
++    return session, forward
++
++
++def test_non_wake_read_joins_a_wake_in_flight_and_never_starts_one(db_uri, monkeypatch):
++    import asyncio
++
++    calls = []
++
++    async def slow(*args, **kwargs):
++        calls.append(1)
++        await asyncio.sleep(0.3)
++
++    session, forward = _wake_setup(db_uri, monkeypatch, slow)
++    monkeypatch.setattr(routes, "WAKE_BUDGET_S", 0.05)
++    with TestClient(_app(db_uri)) as client:
++        h = {"X-Forwarded-Email": OWNER}
++        first = client.get(f"/v1/sessions/{session}/context-usage?wake=true", headers=h).json()
++        joined = client.get(f"/v1/sessions/{session}/context-usage", headers=h).json()
++        assert first["pending"] is True and joined["pending"] is True
++        assert forward.await_count == 0
++        monkeypatch.setattr(routes, "WAKE_BUDGET_S", 5)
++        done = client.get(f"/v1/sessions/{session}/context-usage", headers=h)
++        assert done.json() == {"available": True}
++    assert len(calls) == 1
++    assert forward.await_count == 1
++
++
++def test_two_concurrent_wake_requests_call_the_helper_once(db_uri, monkeypatch):
++    import asyncio
++    from concurrent.futures import ThreadPoolExecutor
++
++    calls = []
++
++    async def slow(*args, **kwargs):
++        calls.append(1)
++        await asyncio.sleep(0.3)
++
++    session, _ = _wake_setup(db_uri, monkeypatch, slow)
++    with TestClient(_app(db_uri)) as client:
++        h = {"X-Forwarded-Email": OWNER}
++
++        def go():
++            return client.get(f"/v1/sessions/{session}/context-usage?wake=true", headers=h)
++
++        with ThreadPoolExecutor(2) as pool:
++            results = [f.result() for f in [pool.submit(go), pool.submit(go)]]
++    assert [r.status_code for r in results] == [200, 200]
++    assert len(calls) == 1
++
++
++@pytest.mark.parametrize("fails", [False, True])
++def test_wake_map_is_cleared_after_completion_and_failure(db_uri, monkeypatch, fails):
++    wake = AsyncMock(
++        side_effect=OmnigentError("x", code=ErrorCode.RUNNER_UNAVAILABLE) if fails else None
++    )
++    session, _ = _wake_setup(db_uri, monkeypatch, wake)
++    _get(db_uri, session, "?wake=true")
++    assert routes._wakes == {}
++
++
++def test_forward_timeout_shrinks_after_a_wake(db_uri, monkeypatch):
++    session, forward = _wake_setup(db_uri, monkeypatch, AsyncMock())
++    _get(db_uri, session, "?wake=true")
++    assert 5.0 <= forward.await_args.kwargs["timeout_s"] <= routes.REQUEST_BUDGET_S
++    assert forward.await_args.kwargs["timeout_s"] > 35
++    forward.reset_mock()
++    _get(db_uri, session, "")
++    assert forward.await_args.kwargs["timeout_s"] == 35
++
++
++def test_a_hung_wake_ends_offline_and_leaves_the_map(db_uri, monkeypatch):
++    import asyncio
++
++    async def hung(*args, **kwargs):
++        await asyncio.sleep(60)
++
++    session, forward = _wake_setup(db_uri, monkeypatch, hung)
++    monkeypatch.setattr(routes, "WAKE_LIMIT_S", 0.05)
++    body = _get(db_uri, session, "?wake=true").json()
++    assert body["offline"] is True
++    assert "took too long" in body["reason"]
++    assert routes._wakes == {}
++    assert forward.await_count == 0
+diff --git a/web/src/components/aeContextUsage.test.tsx b/web/src/components/aeContextUsage.test.tsx
+index 44b0bfc8d06c7c2227ffffbf8ac3952cd92b59cb..a9aa591e76b94cc62d35dc305121fdcba01b9ad9 100644
+--- a/web/src/components/aeContextUsage.test.tsx
++++ b/web/src/components/aeContextUsage.test.tsx
+@@ -283,7 +283,30 @@ describe("while Claude starts", () => {
+     await advance(0);
+     expect(vi.mocked(authenticatedFetch).mock.calls.map(([url]) => url)).toEqual([
+       "/v1/sessions/conv_a/context-usage",
+-      "/v1/sessions/conv_a/context-usage?fresh=true",
++      "/v1/sessions/conv_a/context-usage?fresh=true&wake=true",
++    ]);
++  });
++
++  it("sends wake only for the user's own refresh, never for loads, retries or turn ends", async () => {
++    vi.mocked(authenticatedFetch)
++      .mockImplementationOnce(() => ok(PENDING))
++      .mockImplementation(() => ok());
++    useChatStore.setState({ conversationId: "conv_w", sessionStatus: "running" });
++    const { result } = renderHook(() =>
++      useAeContextSnapshot("conv_w", { enabled: true, identity }),
++    );
++    await advance(0);
++    await advance(AE_CONTEXT_RETRY_DELAYS_MS[0]);
++    act(() => useChatStore.setState({ sessionStatus: "idle" }));
++    await advance(0);
++    act(() => result.current.refresh());
++    await advance(0);
++    const urls = vi.mocked(authenticatedFetch).mock.calls.map(([url]) => String(url));
++    expect(urls).toEqual([
++      "/v1/sessions/conv_w/context-usage",
++      "/v1/sessions/conv_w/context-usage",
++      "/v1/sessions/conv_w/context-usage?fresh=true",
++      "/v1/sessions/conv_w/context-usage?fresh=true&wake=true",
+     ]);
+   });
+ 
+diff --git a/web/src/components/aeContextUsage.ts b/web/src/components/aeContextUsage.ts
+index 4b43ecaef13432fbc72b807a50e4f854ebe05847..df52f8e72dd5f1f202f0b17d1f9f4a2f352c38fd 100644
+--- a/web/src/components/aeContextUsage.ts
++++ b/web/src/components/aeContextUsage.ts
+@@ -102,6 +102,8 @@ interface Entry {
+   retryExhausted?: boolean;
+   /** A runner-cache-skipping read was asked for while another request was in flight. */
+   wantFresh?: boolean;
++  /** The user's own refresh (which wakes a sleeping runner) came in while a request was in flight. */
++  wantWake?: boolean;
+   /** The session status last handled for this entry, so every subscriber acts on an edge once. */
+   lastStatus?: string | null;
+ }
+@@ -199,9 +201,14 @@ function settle(entry: Entry, data: ContextUsage): void {
+   update(entry, { ...shown, error: undefined, inFlight: false, pending: retry });
+ }
+ 
+-async function readSnapshot(sessionId: string, fresh: boolean): Promise<ContextUsage> {
++async function readSnapshot(
++  sessionId: string,
++  fresh: boolean,
++  wake: boolean,
++): Promise<ContextUsage> {
++  const query = wake ? "?fresh=true&wake=true" : fresh ? "?fresh=true" : "";
+   const response = await authenticatedFetch(
+-    `/v1/sessions/${encodeURIComponent(sessionId)}/context-usage${fresh ? "?fresh=true" : ""}`,
++    `/v1/sessions/${encodeURIComponent(sessionId)}/context-usage${query}`,
+   );
+   if (!response.ok) {
+     throw new Error(
+@@ -211,15 +218,17 @@ async function readSnapshot(sessionId: string, fresh: boolean): Promise<ContextU
+   return (await response.json()) as ContextUsage;
+ }
+ 
+-/** `fresh` skips the runner's own three-minute cache. */
+-function load(entry: Entry, fresh = false): void {
++/** `fresh` skips the runner's own three-minute cache; `wake` (user refresh only) wakes a sleeping runner. */
++function load(entry: Entry, fresh = false, wake = false): void {
+   if (entry.value.inFlight) {
+     if (fresh) entry.wantFresh = true;
++    if (wake) entry.wantWake = true;
+     return;
+   }
+   entry.wantFresh = false;
++  entry.wantWake = false;
+   update(entry, { inFlight: true });
+-  readSnapshot(entry.sessionId, fresh)
++  readSnapshot(entry.sessionId, fresh, wake)
+     .then(
+       (data) => settle(entry, data),
+       (error: unknown) => {
+@@ -237,7 +246,7 @@ function load(entry: Entry, fresh = false): void {
+     .finally(() => {
+       entry.settledAt = Date.now();
+       schedule(entry);
+-      if (entry.wantFresh) load(entry, true);
++      if (entry.wantFresh) load(entry, true, entry.wantWake);
+     });
+ }
+ 
+@@ -260,10 +269,10 @@ function watch(entry: Entry): () => void {
+ }
+ 
+ /** Read anew past the runner's cache, with a new retry window: refresh and turn end. */
+-function reload(entry: Entry): void {
++function reload(entry: Entry, wake = false): void {
+   resetRetry(entry);
+   entry.retryExhausted = false;
+-  load(entry, true);
++  load(entry, true, wake);
+ }
+ 
+ /** Drops every cached snapshot and timer; tests call it between cases. */
+@@ -317,7 +326,7 @@ export function useAeContextSnapshot(
+     if (wasActive && (status === "idle" || status === "failed")) reload(entry);
+   }, [enabled, id, identity, status]);
+   const refresh = useCallback(() => {
+-    if (id) reload(entryFor(id, identity));
++    if (id) reload(entryFor(id, identity), true);
+   }, [id, identity]);
+   const pending = value.pending === true;
+   return {
+diff --git a/web/src/components/aeRail/AeRailContext.test.tsx b/web/src/components/aeRail/AeRailContext.test.tsx
+index 12b4daad5d230b2853b98092a145c842d04a088c..516ee3bfac40625d009a5c25af93b35703950b16 100644
+--- a/web/src/components/aeRail/AeRailContext.test.tsx
++++ b/web/src/components/aeRail/AeRailContext.test.tsx
+@@ -160,6 +160,9 @@ describe("AeRailContext", () => {
+     fireEvent.click(screen.getByRole("button", { name: "Try again" }));
+     await waitFor(() => expect(screen.getByTestId("ae-category-bar")).toBeTruthy());
+     expect(screen.queryByText(/Could not load/)).toBeNull();
++    const urls = vi.mocked(authenticatedFetch).mock.calls.map(([url]) => String(url));
++    expect(urls[0]).not.toContain("wake=true");
++    expect(urls[1]).toContain("?fresh=true&wake=true");
+   });
+ 
+   it("shows Try again at once when the runner is offline", async () => {

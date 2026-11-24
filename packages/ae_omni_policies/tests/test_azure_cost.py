@@ -1350,3 +1350,165 @@ async def test_a_saved_rate_limit_wait_survives_a_settings_save(
     due = azure_cost._state["due"]
     _panel_subs(monkeypatch, f"{SUB_B}=Dev")
     assert azure_cost._state["due"] == due and azure_cost._stale() is False
+
+
+SUB_C = "55555555-5555-4555-8555-555555555555"
+SUB_D = "66666666-6666-4666-8666-666666666666"
+_FOUR = ((SUB_A, "A"), (SUB_B, "B"), (SUB_C, "C"), (SUB_D, "D"))
+
+
+def _seed_four(monkeypatch: pytest.MonkeyPatch, read_at: dict[str, str | None]) -> None:
+    _configure(monkeypatch, ",".join(f"{sid}={name}" for sid, name in _FOUR))
+    cfg = azure_cost.Config(TENANT, CLIENT_ID, CLIENT_SECRET, _FOUR)
+    readings = {}
+    for sid, at in read_at.items():
+        if at is not None:
+            readings[sid] = {**_GOOD_READING, "readAt": at}
+    _state_file().write_text(
+        _saved_file(
+            subscriptions=[[sid, name] for sid, name in _FOUR],
+            principal=cfg.principal(),
+            readings=readings,
+            at="2026-10-21T11:00:00Z",
+            due="2026-10-21T11:30:00Z",
+            goodAt="2026-10-21T11:00:00Z",
+        ),
+        encoding="utf-8",
+    )
+
+
+def _limit_after_two(touched: list[str]) -> Handler:
+    def handler(request: httpx.Request) -> httpx.Response:
+        sid = next(s for s, _ in _FOUR if s in request.url.path)
+        if sid not in touched:
+            touched.append(sid)
+        if len(touched) > 2:
+            return httpx.Response(429, headers={"retry-after": "300"})
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return _answer(_resource_rows(), RESOURCE_COLUMNS)
+
+    return handler
+
+
+async def _one_pass() -> dict[str, Any]:
+    await azure_cost.overview()
+    task = azure_cost.reading_task()
+    assert task is not None
+    await task
+    snap = azure_cost.snapshot()
+    assert snap is not None
+    return snap
+
+
+async def test_a_rate_limit_reads_the_subscriptions_read_longest_ago_first(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old, new = "2026-10-21T09:00:00Z", "2026-10-21T10:00:00Z"
+    _seed_four(monkeypatch, {SUB_A: new, SUB_B: new, SUB_C: old, SUB_D: old})
+    touched: list[str] = []
+    _mock(monkeypatch, _azure([], subscription=_limit_after_two(touched)))
+    snap = await _one_pass()
+    assert touched[:2] == [SUB_C, SUB_D]
+    assert snap["readings"][SUB_C]["readAt"] == "2026-10-21T12:00:00Z"
+    assert snap["readings"][SUB_D]["readAt"] == "2026-10-21T12:00:00Z"
+    assert snap["readings"][SUB_A]["readAt"] == new
+    assert snap["readings"][SUB_B]["readAt"] == new
+    assert snap["readings"][SUB_A]["readAt"] != "2026-10-21T12:00:00Z"
+    # Read order never changes what the card shows: readings stay in configured order.
+    assert list(snap["readings"]) == [SUB_A, SUB_B, SUB_C, SUB_D]
+
+
+async def test_a_subscription_never_read_is_read_before_the_read_ones(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    new = "2026-10-21T10:00:00Z"
+    _seed_four(monkeypatch, {SUB_A: new, SUB_B: None, SUB_C: new, SUB_D: None})
+    touched: list[str] = []
+    _mock(monkeypatch, _azure([], subscription=_limit_after_two(touched)))
+    snap = await _one_pass()
+    assert touched[:2] == [SUB_B, SUB_D]
+    assert snap["readings"][SUB_B]["readAt"] == "2026-10-21T12:00:00Z"
+    assert snap["readings"][SUB_D]["readAt"] == "2026-10-21T12:00:00Z"
+    assert snap["readings"][SUB_A]["readAt"] == new
+
+
+async def _next_pass(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
+    clock = [azure_cost._monotonic()]
+    monkeypatch.setattr(
+        azure_cost, "_monotonic", lambda: clock[0] + azure_cost.CACHE_TTL_S + 99999
+    )
+    return await _one_pass()
+
+
+async def test_a_second_pass_reaches_the_subscriptions_the_first_pass_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = "2026-10-21T09:00:00Z"
+    _seed_four(monkeypatch, {sid: old for sid, _ in _FOUR})
+    touched: list[str] = []
+    _mock(monkeypatch, _azure([], subscription=_limit_after_two(touched)))
+    wall = _clock(monkeypatch)
+    await _one_pass()
+    assert touched[:2] == [SUB_A, SUB_B]
+    wall[0] = NOW + timedelta(hours=1)
+    touched.clear()
+    snap = await _next_pass(monkeypatch)
+    assert touched[:2] == [SUB_C, SUB_D]
+    assert snap["readings"][SUB_C]["readAt"] == "2026-10-21T13:00:00Z"
+    assert snap["readings"][SUB_D]["readAt"] == "2026-10-21T13:00:00Z"
+
+
+async def test_a_subscription_that_keeps_failing_does_not_lead_every_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    old = "2026-10-21T09:00:00Z"
+    _seed_four(monkeypatch, {SUB_A: old, SUB_B: old, SUB_C: old, SUB_D: old})
+    touched: list[str] = []
+    ok = _limit_after_two([])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if SUB_A in request.url.path:
+            touched.append(SUB_A) if SUB_A not in touched else None
+            return httpx.Response(403, text="no")
+        sid = next(s for s, _ in _FOUR if s in request.url.path)
+        if sid not in touched:
+            touched.append(sid)
+        return (
+            ok(request)
+            if len(touched) <= 3
+            else httpx.Response(429, headers={"retry-after": "300"})
+        )
+
+    _mock(monkeypatch, _azure([], subscription=handler))
+    wall = _clock(monkeypatch)
+    await _one_pass()
+    assert touched[0] == SUB_A
+    wall[0] = NOW + timedelta(hours=1)
+    touched.clear()
+    await _next_pass(monkeypatch)
+    assert touched[0] != SUB_A
+
+
+async def test_errors_are_kept_in_configured_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    _seed_four(
+        monkeypatch,
+        {
+            SUB_A: "2026-10-21T10:00:00Z",
+            SUB_B: "2026-10-21T10:00:00Z",
+            SUB_C: "2026-10-21T09:00:00Z",
+        },
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if SUB_C in request.url.path or SUB_A in request.url.path:
+            return httpx.Response(403, text="no")
+        grouping = json.loads(request.content)["dataset"]["grouping"][0]["name"]
+        if grouping == "ServiceName":
+            return _answer(_service_rows(), SERVICE_COLUMNS)
+        return _answer(_resource_rows(), RESOURCE_COLUMNS)
+
+    _mock(monkeypatch, _azure([], subscription=handler))
+    snap = await _one_pass()
+    assert list(snap["errors"]) == [SUB_A, SUB_C]

@@ -216,9 +216,13 @@ async def test_route_returns_the_compact_object(
     assert out["reachable"] is True and out["alerts"] == 2 and out["portalUrl"] == PORTAL
 
 
-def test_the_catalog_names_both_settings_with_short_hints() -> None:
+def test_the_catalog_names_three_settings_with_short_hints() -> None:
     card = next(c for c in admin_cards.CATALOG if c.id == "home-security")
-    assert [f.env for f in card.fields] == ["AE_HOME_SECURITY_URL", "AE_HOME_SECURITY_LINK"]
+    assert [f.env for f in card.fields] == [
+        "AE_HOME_SECURITY_URL",
+        "AE_HOME_SECURITY_LINK",
+        "AE_HOME_SECURITY_RUNBOOK",
+    ]
     for field in card.fields:
         assert 0 < len(field.hint) <= admin_cards.HINT_MAX and field.env_only
 
@@ -366,3 +370,116 @@ async def test_concurrent_callers_share_one_read(monkeypatch: pytest.MonkeyPatch
     answers = await asyncio.gather(*(home_security.overview(ENV) for _ in range(5)))
     assert len(seen) == 1
     assert all(answer is answers[0] for answer in answers)
+
+
+# ── Home security rows in Needs you (2026-11-13) ──────────────────────────────────────────────
+
+
+def _row(n: int, **over: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "id": f"alert:{n:08x}ab",
+        "severity": "notable",
+        "kind": "firewalla-alarm",
+        "text": f"device-a reached site{n}.example",
+        "at": f"2026-11-13T09:{n % 60:02d}:00Z",
+    }
+    base.update(over)
+    return base
+
+
+def _with(alerts: list[Any], **extra: Any) -> dict[str, Any]:
+    body = _body(**extra)
+    body["summary"]["alerts"] = alerts
+    return body
+
+
+def test_open_alerts_follow_the_hiding_rule_and_keep_the_newest_twenty() -> None:
+    hidden = {**_row(99), "requests": {"reviewed": {"status": "requested"}}}
+    alerts = [_row(n) for n in range(1, 26)] + [hidden]
+    kept, cut = home_security.open_alerts(_with(alerts))
+    assert cut is True and len(kept) == home_security.MAX_ALERTS
+    assert all(a["id"] != hidden["id"] for a in kept)
+    stamps = [a["at"] for a in kept]
+    assert stamps == sorted(stamps, reverse=True) and kept[0]["id"] == _row(25)["id"]
+    few, cut = home_security.open_alerts(_with([_row(1), _row(2)]))
+    assert cut is False and len(few) == 2
+    assert home_security.open_alerts("not a body") == ([], False)
+    assert home_security.open_alerts({"summary": {"alerts": "x"}}) == ([], False)
+
+
+def test_an_alert_with_a_bad_id_or_odd_fields_is_skipped_or_tamed() -> None:
+    odd = _row(7, severity="severe", kind="k" * 200, text="t" * 900, at="not a time")
+    bad = [_row(1, id="a1"), _row(2, id=5), _row(3, id="alert:XYZ"), "x", {"id": None}]
+    kept, cut = home_security.open_alerts(_with([*bad, odd, _row(8, text=3, kind=None, at=None)]))
+    assert cut is True and len(kept) == 2
+    by = {a["id"]: a for a in kept}
+    tamed = by[odd["id"]]
+    assert tamed["severity"] == "other" and len(tamed["kind"]) == home_security.KIND_MAX
+    assert len(tamed["text"]) == home_security.TEXT_MAX
+    blank = by[_row(8)["id"]]
+    assert blank["text"] == "" and blank["kind"] == "" and blank["at"] == ""
+
+
+async def test_the_card_answer_still_carries_no_alert_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _serve(monkeypatch, _json(_with([_row(1), _row(2)])))
+    out = await home_security.overview(ENV)
+    assert out["alerts"] == 2
+    dumped = repr(out)
+    assert "device-a" not in dumped and "firewalla-alarm" not in dumped
+    assert "alert:" not in dumped
+
+
+async def test_overview_and_snapshot_share_one_cached_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _serve(monkeypatch, _json(_with([_row(1)])))
+    snap = await home_security.snapshot(ENV)
+    again = await home_security.overview(ENV)
+    assert snap is not None and len(seen) == 1
+    assert again is snap.answer and [a["id"] for a in snap.alerts] == [_row(1)["id"]]
+    home_security.reset()
+    assert await home_security.snapshot({}) is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["notes/runbook.md", "/a/../b", "~/a b", "/a`b`", "/a\nb", "/" + "a" * 200, "", "  "],
+)
+def test_runbook_is_kept_only_as_one_plain_path(raw: str) -> None:
+    assert home_security.runbook({"AE_HOME_SECURITY_RUNBOOK": raw}) is None
+
+
+def test_runbook_accepts_a_home_or_absolute_path() -> None:
+    env = {"AE_HOME_SECURITY_RUNBOOK": "  ~/notes/runbook.md \n"}
+    assert home_security.runbook(env) == "~/notes/runbook.md"
+    assert home_security.runbook({"AE_HOME_SECURITY_RUNBOOK": "/srv/rb.md"}) == "/srv/rb.md"
+    assert home_security.runbook({}) is None
+
+
+def test_an_alert_time_out_of_range_is_not_given_and_the_others_still_list() -> None:
+    far = _row(1, at="9999-12-31T23:59:59Z")
+    far_offset = _row(2, at="9999-12-31T23:59:59-12:00")
+    old = _row(3, at="1969-12-31T00:00:00Z")
+    kept, cut = home_security.open_alerts(_with([far, far_offset, old, _row(4)]))
+    assert cut is False and len(kept) == 4
+    by = {a["id"]: a for a in kept}
+    assert by[far["id"]]["at"] == "" and by[far_offset["id"]]["at"] == ""
+    assert by[old["id"]]["at"] == "" and by[_row(4)["id"]]["at"] != ""
+    assert kept[0]["id"] == _row(4)["id"]
+
+
+def test_the_same_alert_id_twice_keeps_only_the_newest() -> None:
+    older = _row(1, text="older", at="2026-11-13T08:00:00Z")
+    newer = _row(1, text="newer", at="2026-11-13T09:30:00Z")
+    for order in ([older, newer], [newer, older]):
+        kept, cut = home_security.open_alerts(_with(order))
+        assert cut is False and [a["text"] for a in kept] == ["newer"]
+
+
+def test_a_visible_alert_skipped_for_its_id_marks_the_list_cut() -> None:
+    kept, cut = home_security.open_alerts(_with([_row(1), {"id": "a1", "text": "x"}]))
+    assert cut is True and len(kept) == 1
+    kept, cut = home_security.open_alerts(_with([_row(1), {"text": "no id"}]))
+    assert cut is True and len(kept) == 1

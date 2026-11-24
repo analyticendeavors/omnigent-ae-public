@@ -14,15 +14,19 @@ usage and the parent's *cost* already includes them but its *tokens* do not, so 
 adds tokens and never cost. ``session_usage`` has no cache-write figure: ``input`` here is
 the input total, which includes cache writes.
 
-**A window is a subtraction.** A session's total only grows, except when a restarted status line
-resets it; the sweep then adds the sample before the fall to a per-session offset, so what a
-session has spent is its offset plus its current total. A window's spend is that figure now minus
-the figure at the window's start. A sweep every :data:`SWEEP_INTERVAL_S` stores, for each
-Pacific-time day (kept :data:`KEEP_DAYS` days, in :data:`FILE_ENV`), the last sample taken before
-that day began; a session started inside the window counts from zero, an older one from its entry
-in the snapshot of the window's first day (or the oldest snapshot there is, which the answer
-reports as ``history_since``). A session that was deleted (not archived) drops out of its
-family's totals.
+**A window is a subtraction.** A session's total only grows. The sweep counts deltas per field
+against the last raw sample (2026-11-23): a rise adds the rise; a fall to under half the sample
+before it (or any fall from a sample under :data:`RESET_FLOOR`) is a real reset, so the new
+sample counts from zero; a smaller fall adds nothing and later growth counts from that low
+point. Claude-native token totals dip partially and per field as the forwarder restarts, and the
+old rule (every fall is a reset) turned 187M real tokens into 2.8B. What a session has spent is
+a per-session offset plus its current total, the offset absorbing each fall. A window's spend is
+that figure now minus the figure at the window's start. A sweep every :data:`SWEEP_INTERVAL_S`
+stores, for each Pacific-time day (kept :data:`KEEP_DAYS` days, in :data:`FILE_ENV`), the last
+sample taken before that day began; a session started inside the window counts from zero, an
+older one from its entry in the snapshot of the window's first day (or the oldest snapshot there
+is, which the answer reports as ``history_since``). A session that was deleted (not archived)
+drops out of its family's totals.
 
 **Never blocks.** The route answers the last sweep's families; before the first sweep has
 finished, and with the state file empty, it answers ``{"state": "warming"}`` (the pattern of
@@ -43,7 +47,7 @@ from collections.abc import Callable, Mapping
 from contextlib import asynccontextmanager
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, NamedTuple
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter
@@ -75,8 +79,17 @@ TIME_ZONE = ZoneInfo("America/Los_Angeles")
 _LIST_PAGE = 100
 _LIST_MAX_PAGES = 200
 #: Defaults for "Runaway family" (spend today across the family): the unit's own number.
-DEFAULT_RUNAWAY_TOKENS = 5_000_000
+DEFAULT_RUNAWAY_TOKENS = 50_000_000
 DEFAULT_RUNAWAY_USD = 25.0
+FLAG_MODES = ("tokens", "dollars", "either")
+DEFAULT_FLAG_ON = "either"
+#: A fall is a real reset when the new sample is under this share of the one before it.
+RESET_SHARE = 0.5
+#: Per field ([cost, input, output, cache_read]): a fall from a sample under this is a reset,
+#: because a figure that small has nothing worth keeping.
+RESET_FLOOR = (0.01, 1000.0, 1000.0, 1000.0)
+#: Written into the state file once the old rule's offsets were dropped and today rebased.
+STATE_RULE = 2
 
 RESUME_COUNT = "ae.claude_native.resume_count"
 LAST_CONTEXT = "omnigent.last_context_tokens"
@@ -162,6 +175,13 @@ def role_of(row: Any, *, lead: bool) -> str:
 # The state file
 
 
+def _less(vals: Any, off: list[float] | None) -> Any:
+    """A stored day sample without a dropped offset, never below zero (the one-time migration)."""
+    if off is None or not isinstance(vals, list) or len(vals) != 4:
+        return vals
+    return [round(max(0.0, _num(v) - o), 6) for v, o in zip(vals, off, strict=True)]
+
+
 class StateFile:
     """The sweep's state: day snapshots, rollover offsets, the last sample and the families.
 
@@ -212,6 +232,7 @@ class StateFile:
             "last": {},
             "at": None,
             "families": {},
+            "rule": None,
         }
         if self.path is None:
             return empty
@@ -239,6 +260,7 @@ class StateFile:
             "last": table("last"),
             "at": data.get("at") if isinstance(data.get("at"), (int, float)) else None,
             "families": table("families"),
+            "rule": data.get("rule") if isinstance(data.get("rule"), int) else None,
         }
 
     def save(self, data: dict[str, Any]) -> None:
@@ -479,6 +501,14 @@ class Sweeper:
             for sid, off in data["offsets"].items()
             if isinstance(off, list) and len(off) == 4
         }
+        # One-time move to the delta rule: the old rule's offsets are mostly false resets (a dip
+        # re-added the whole prior total), so they are dropped here and taken out of the stored
+        # days below. A session's spend then reads as its current total, which the old offsets
+        # inflated many times over; a real reset counted before this sweep is lost (the safe side).
+        migrating = data.get("rule") != STATE_RULE
+        dropped: dict[str, list[float]] = {}
+        if migrating:
+            dropped, offsets = offsets, {}
         last = data["last"]
         totals: Totals = {}
         for sid, cur in raw.items():
@@ -486,8 +516,13 @@ class Sweeper:
             before = last.get(sid)
             if isinstance(before, list) and len(before) == 4:
                 for i in range(4):
-                    if cur[i] < _num(before[i]):
-                        off[i] += _num(before[i])
+                    prev = _num(before[i])
+                    if cur[i] >= prev:
+                        continue
+                    if prev < RESET_FLOOR[i] or cur[i] < RESET_SHARE * prev:
+                        off[i] += prev  # a real reset: the new sample counts from zero
+                    else:
+                        off[i] += prev - cur[i]  # a dip: nothing added, growth counts from here
             totals[sid] = [o + c for o, c in zip(off, cur, strict=True)]
         # An offset is kept for a session in this sweep or the last, not for a deleted one.
         offsets = {
@@ -503,6 +538,13 @@ class Sweeper:
             # The day starts at the last sample before local midnight, so nothing spent in the
             # minutes after midnight is lost to the day before.
             days[today] = _rounded(data["eff"])
+        if migrating:
+            # One-time, in place (a version bump would set the whole file aside): every stored day
+            # loses the dropped offsets (never below zero), and today's spend restarts at zero.
+            for day, snap in list(days.items()):
+                if isinstance(snap, dict):
+                    days[day] = {sid: _less(vals, dropped.get(sid)) for sid, vals in snap.items()}
+            days[today] = _rounded(totals)
         for day in sorted(days)[: max(0, len(days) - KEEP_DAYS)]:
             del days[day]
 
@@ -517,6 +559,7 @@ class Sweeper:
                 "last": raw,
                 "at": now,
                 "families": result,
+                "rule": STATE_RULE,
             }
         )
         return True
@@ -641,6 +684,27 @@ class Sweeper:
 # The answer
 
 
+class _Limits(NamedTuple):
+    runaway_tokens: float
+    runaway_usd: float
+    flag_on: str
+
+
+def flagged(tokens: float, cost: float, settings: Any) -> tuple[bool, bool, bool]:
+    """``(flagged, over_tokens, over_usd)`` for one family's spend today.
+
+    *settings* has ``runaway_tokens``, ``runaway_usd`` and ``flag_on`` (``tokens``, ``dollars`` or
+    ``either``; anything else reads as ``either``). A limit of 0, or one the mode leaves out, never
+    flags. The one copy of the rule: the Attention feed and the card both use it.
+    """
+    mode = getattr(settings, "flag_on", None) or DEFAULT_FLAG_ON
+    limit_tokens = getattr(settings, "runaway_tokens", 0) or 0
+    limit_usd = getattr(settings, "runaway_usd", 0) or 0
+    over_tokens = mode != "dollars" and limit_tokens > 0 and tokens >= limit_tokens
+    over_usd = mode != "tokens" and limit_usd > 0 and cost >= limit_usd
+    return over_tokens or over_usd, over_tokens, over_usd
+
+
 def _echo(settings: Mapping[str, Any] | None) -> dict[str, Any]:
     return {"settings": dict(settings)} if settings else {}
 
@@ -654,21 +718,25 @@ def build_answer(
     unit: str,
     runaway_tokens: float,
     runaway_usd: float,
+    flag_on: str = DEFAULT_FLAG_ON,
     settings: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The route's answer from the last sweep's *data*: scoped to the viewer, ranked by *unit*.
 
     A family is flagged when its spend today passes *runaway_tokens* or *runaway_usd*, whichever
-    comes first (0 turns that one off); *unit* only picks the ranking. 2026-10-30: either amount
-    flags, because the unit shown first used to pick the one threshold that applied and a runaway
-    in the other unit went unflagged. *settings* is the viewer's three saved values, echoed so the
-    card can show them.
+    comes first (0 turns that one off), as far as *flag_on* allows (2026-11-23: ``tokens`` or
+    ``dollars`` ignore the other limit); *unit* only picks the ranking. Each row carries
+    ``flagged``, ``over_tokens`` and ``over_usd`` so the card never recomputes them. 2026-10-30:
+    either amount flags, because the unit shown first used to pick the one threshold that
+    applied and a runaway in the other unit went unflagged. *settings* is the viewer's saved
+    values, echoed so the card can show them.
     """
     entry = (data.get("families") or {}).get(str(days))
     at = data.get("at")
     if not isinstance(entry, dict) or not isinstance(at, (int, float)):
         return {"state": "warming", "days": days, "unit_default": unit, **_echo(settings)}
     dollars = unit == "dollars"
+    limits = _Limits(runaway_tokens, runaway_usd, flag_on)
     rows: list[dict[str, Any]] = []
     for fam in entry.get("families", []):
         if not admin and (viewer is None or fam.get("owner") != viewer):
@@ -676,9 +744,8 @@ def build_answer(
         today = fam["today"]
         # A snapshot written before "flag_tokens" existed falls back to the full total.
         flag_tokens = today.get("flag_tokens", today["tokens_total"])
-        over_tokens = runaway_tokens > 0 and flag_tokens >= runaway_tokens
-        over_usd = runaway_usd > 0 and today["cost_usd"] >= runaway_usd
-        rows.append({**fam, "flagged": over_tokens or over_usd})
+        hit, over_tokens, over_usd = flagged(flag_tokens, today["cost_usd"], limits)
+        rows.append({**fam, "flagged": hit, "over_tokens": over_tokens, "over_usd": over_usd})
     rows.sort(key=lambda f: -(f["cost_usd"] if dollars else f["tokens"]["total"]))
     totals = {
         "families": len(rows),
@@ -712,6 +779,7 @@ def view(
     unit: str,
     runaway_tokens: float,
     runaway_usd: float,
+    flag_on: str = DEFAULT_FLAG_ON,
     settings: Mapping[str, Any] | None = None,
     state: StateFile | None = None,
 ) -> dict[str, Any]:
@@ -724,6 +792,7 @@ def view(
         unit=unit,
         runaway_tokens=runaway_tokens,
         runaway_usd=runaway_usd,
+        flag_on=flag_on,
         settings=settings,
     )
 
@@ -789,6 +858,7 @@ __all__ = [
     "StateFile",
     "Sweeper",
     "build_answer",
+    "flagged",
     "lifespan_router",
     "view",
 ]

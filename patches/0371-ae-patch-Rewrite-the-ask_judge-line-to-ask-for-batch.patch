@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <bot@example.invalid>
+Date: Fri, 13 Nov 2026 09:45:48 -0800
+Subject: [PATCH 371/443] [ae-patch] Rewrite the ask_judge line to ask for
+ batches with context, and give it to helpers too
+
+The roles line now tells agents to ask every small choice with clear options in one call of up to five questions, each with a neutral context line, and to load the tool once at the start. A child session's helper marker carries ae_helper_judge when the judge is available to its owner, and its notice then renders the same line after the helper text.
+---
+ omnigent/inner/ae_roles.py   | 23 ++++++++++++++------
+ tests/inner/test_ae_roles.py | 41 +++++++++++++++++++++++++++++++++++-
+ 2 files changed, 56 insertions(+), 8 deletions(-)
+
+diff --git a/omnigent/inner/ae_roles.py b/omnigent/inner/ae_roles.py
+index 6fb945e60d5c157810f112c69141166f2ada2c72..00d503022c8c6c3bd31ab13cffed6c4bdae68a29 100644
+--- a/omnigent/inner/ae_roles.py
++++ b/omnigent/inner/ae_roles.py
+@@ -105,6 +105,9 @@ BALANCED: dict[str, Any] = {
+ }
+ SOLO = "solo"
+ HELPER_KEY = "ae_helper"
++#: Set beside :data:`HELPER_KEY` when the judge is available to the helper's owner: the
++#: helper notice then also carries :data:`_JUDGE_LINE`.
++HELPER_JUDGE_KEY = "ae_helper_judge"
+ HELPER_NOTICE = (
+     "You are a helper session started by a lead session. Do the task you were given and "
+     "report back to it; do not start other sessions or bring in other agents. Use your own "
+@@ -324,7 +327,10 @@ def with_roles(
+     :func:`effective_mode`).
+     """
+     if _is_child(conv):
+-        return {HELPER_KEY: True}
++        helper: dict[str, object] = {HELPER_KEY: True}
++        if _judge_available(_owner(conv, store)):
++            helper[HELPER_JUDGE_KEY] = True
++        return helper
+     try:
+         roles = resolve_roles(conv, store)
+     except Exception:  # noqa: BLE001 (the notice must never break a message)
+@@ -591,12 +597,13 @@ def _judge_available(owner: str) -> bool:
+ 
+ 
+ _JUDGE_LINE = (
+-    "Decision-1 judge: before you settle one of these yourself, call ask_judge: picking "
+-    "between two or more approaches, full test suite or scoped tests, asking for review now "
+-    "or fixing more, or whether work is ready to hand off. In Claude Code it is a deferred "
+-    'tool: load it first with ToolSearch query "select:mcp__ae__ask_judge" (Codex: call it '
+-    "directly). Write the question in neutral words with no names, paths or quoted text. If "
+-    "it answers with low_confidence, errors, or is missing, decide yourself."
++    "Decision-1 judge: for every small choice with clear options (which approach, which file "
++    "or step first, scoped or full tests, retry or change tack, fix more or ask for review, "
++    "ask the user or go on, ready to hand off), call ask_judge, then act on its answer unless "
++    "it says low_confidence. Gather the open choices and ask up to five in one call, each "
++    "with a neutral context line saying what it is about; a call takes about half a second. "
++    'Load it once at the start: ToolSearch query "select:mcp__ae__ask_judge" (Codex: call it '
++    "directly). No names, paths or quoted text; if it errors or is missing, decide yourself."
+ )
+ 
+ 
+@@ -703,6 +710,8 @@ def append_roles(text: str | None, metadata: Any) -> str | None:
+     :data:`HELPER_NOTICE` alone.
+     """
+     if isinstance(metadata, dict) and metadata.get(HELPER_KEY) is True:
++        if metadata.get(HELPER_JUDGE_KEY) is True:
++            return f"{HELPER_NOTICE} {_JUDGE_LINE}"
+         return HELPER_NOTICE
+     block = render_roles(metadata.get("ae_roles")) if isinstance(metadata, dict) else None
+     if text and block:
+diff --git a/tests/inner/test_ae_roles.py b/tests/inner/test_ae_roles.py
+index a82da2baa3be4317e2da53e64c89902367205e3d..766a09295f5987239258a457186af266020e8a96 100644
+--- a/tests/inner/test_ae_roles.py
++++ b/tests/inner/test_ae_roles.py
+@@ -438,6 +438,44 @@ def test_a_child_session_gets_only_the_helper_line(
+     assert "do not start other sessions" in ae_roles.HELPER_NOTICE
+ 
+ 
++def test_a_helper_hears_the_judge_line_only_when_the_flag_is_set(
++    prefs: dict[str, Any], monkeypatch: pytest.MonkeyPatch
++) -> None:
++    from ae_omni_policies import decision_status
++
++    seen: list[str | None] = []
++
++    def reason(caller: str | None) -> str | None:
++        seen.append(caller)
++        return None
++
++    monkeypatch.setattr(decision_status, "reason", reason)
++    notice = team_notice(conversation(parent_conversation_id="lead"), owner_store())
++    assert notice == {"ae_helper": True, "ae_helper_judge": True}
++    assert seen == ["local"]
++    text = render_team_notice(notice) or ""
++    assert text.startswith(ae_roles.HELPER_NOTICE)
++    assert text.count("Decision-1 judge: for every small choice") == 1
++    assert "select:mcp__ae__ask_judge" in text
++    # the flag alone changes nothing: no marker, no line
++    assert render_team_notice({"ae_helper": True}) == ae_roles.HELPER_NOTICE
++    assert render_team_notice({"ae_helper": True, "ae_helper_judge": "yes"}) == (
++        ae_roles.HELPER_NOTICE
++    )
++    monkeypatch.setattr(decision_status, "reason", lambda caller: "not_allowed")
++    assert team_notice(conversation(parent_conversation_id="lead"), owner_store()) == {
++        "ae_helper": True
++    }
++
++    def boom(caller: str | None) -> str | None:
++        raise RuntimeError("broken")
++
++    monkeypatch.setattr(decision_status, "reason", boom)
++    assert team_notice(conversation(parent_conversation_id="lead"), owner_store()) == {
++        "ae_helper": True
++    }
++
++
+ @pytest.mark.parametrize("orch", ["1", "", " "])
+ def test_a_lead_with_a_flag_orch_label_keeps_the_block(prefs: dict[str, Any], orch: str) -> None:
+     notice = team_notice(conversation(labels={"ae.orch": orch}), owner_store()) or {}
+@@ -1245,8 +1283,9 @@ def test_the_judge_line_renders_only_when_the_flag_is_true(prefs: dict[str, Any]
+         base = render_roles(roles) or ""
+         assert "ask_judge" not in base
+         on = render_roles({**roles, "judge": True}) or ""
+-        assert on.count("Decision-1 judge: before you settle one of these yourself") == 1
++        assert on.count("Decision-1 judge: for every small choice with clear options") == 1
+         assert 'ToolSearch query "select:mcp__ae__ask_judge"' in on
++        assert "ask up to five in one call" in on
+         assert "decide yourself." in on
+         assert len(on.splitlines()) == len(base.splitlines())  # folded in, no extra line
+         assert "ask_judge" not in (render_roles({**roles, "judge": False}) or "")

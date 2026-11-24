@@ -22,7 +22,11 @@ from omnigent.spec.types import FunctionPolicySpec, FunctionRef
 from tests.server.helpers import create_test_session
 
 from ae_omni_policies import labels
-from ae_omni_policies.continuation import COMPACT_PREP_TEXT
+from ae_omni_policies.continuation import (
+    COMPACT_CANCELLED_TEXT,
+    COMPACT_PREP_TEXT,
+    COMPACT_RESUME_TEXT,
+)
 from ae_omni_policies.fork_suspect import ANNOTATION, CACHE_PREFIX, fork_suspect, message_hash
 
 FORK_TEXT = "Oh, and we should build a customer testimonials section for the home page."
@@ -141,6 +145,14 @@ async def test_a_plain_message_clears_a_stale_chip() -> None:
         (
             _event(COMPACT_PREP_TEXT, client=_Client()),
             "the queued Compact's save prompt (2026-11-06), no model call",
+        ),
+        (
+            _event(COMPACT_RESUME_TEXT, client=_Client()),
+            "the queued Compact's resume note, no model call",
+        ),
+        (
+            _event(COMPACT_CANCELLED_TEXT, client=_Client()),
+            "the queued Compact's cancelled note, no model call",
         ),
         (
             {"type": "tool_call", "data": {"name": "x"}, "context": {}, "llm_client": _Client()},

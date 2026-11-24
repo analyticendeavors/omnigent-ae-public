@@ -28,16 +28,17 @@ past ``keep_runs`` and the skipped checks are pruned beyond :data:`KEEP_RUNS`.
 from __future__ import annotations
 
 import asyncio
+import json
+import logging
 import re
+import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta, tzinfo
-from typing import Any
+from typing import Any, NamedTuple
 
 import httpx
 
 from ae_omni_policies import (
-    model_log,
-    preset_log,
     preset_runs,
     preset_stats,
     preset_suggestions,
@@ -64,10 +65,16 @@ RRULE = WEEKLY_RRULE
 MIN_GAP_DAYS = FREQUENCIES[DEFAULT_FREQUENCY][1]
 MAX_COST_USD = 2.0
 KEEP_RUNS = 6
-MAX_RUNS = 400
+#: Newest-first cap on raw run-log lines aggregated per read; bounds compute on a huge log, not
+#: the answer's content: the aggregate is one row per (owner, preset) regardless of run count,
+#: so this is set high enough that an admin review rarely hits it and biases which runs its
+#: per-preset medians rest on.
+MAX_RUNS = 20_000
+#: The read's answer stays under the scheduled reviewer's tool-result cap (it has no Read or
+#: Bash tool to open a spilled file): build_read drops admin presets.users entries from the
+#: tail until the whole answer fits, flagging "truncated" when it does.
+MAX_RESPONSE_CHARS = 40_000
 MAX_SUGGESTIONS = 5
-MAX_REASON = 120
-MAX_TITLE = 80
 MAX_USER_TEXT = 200
 _CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\u2028\u2029]+")
 PROMPT = "Run the preset review now. Nobody is present: never ask, never edit a preset."
@@ -353,11 +360,38 @@ def _clean(text: Any, limit: int) -> str:
     return _CONTROL.sub(" ", str(text)).strip()[:limit]
 
 
-def _trim_reason(line: dict[str, Any]) -> dict[str, Any]:
-    reason = line.get("reason")
-    if isinstance(reason, str):
-        return {**line, "reason": _clean(reason, MAX_REASON)}
-    return line
+def _preset_aggregate(owner: str, pid: str, runs: list[dict[str, Any]]) -> dict[str, Any]:
+    """One owner's one preset's compact stats over *runs* (already scoped to the window).
+
+    Numbers only: run count, median cost/wall time/tokens, raises and step-downs (counted per
+    run from the run-log line's own embedded ``model_changes``, so they need no separate read
+    of the model-change log), hung roles, and the review findings/fixed/reported counts.
+
+    Grouped by ``(owner, preset id)``, never by preset id alone: two users' own copies of the
+    same starter, or two users who both picked "balanced", are unrelated runs and would
+    otherwise be averaged together under one row that a suggestion could misattribute.
+    """
+    costs = [r["cost"] for r in runs if r.get("cost") is not None]
+    walls = [r["wall_s"] for r in runs if r.get("wall_s") is not None]
+    tokens = [r["tokens"] for r in runs if r.get("tokens") is not None]
+    hangs: dict[str, int] = {}
+    for r in runs:
+        for role in r.get("hung_roles") or []:
+            hangs[role] = hangs.get(role, 0) + 1
+    return {
+        "owner": owner,
+        "id": pid,
+        "runs": len(runs),
+        "median_cost_usd": preset_stats._median(costs),
+        "median_wall_s": preset_stats._median(walls),
+        "median_tokens": preset_stats._median(tokens),
+        "raises": sum(r["raises"] for r in runs),
+        "step_downs": sum(r["step_downs"] for r in runs),
+        "hangs": hangs,
+        "review_findings": sum(r.get("review_findings") or 0 for r in runs),
+        "review_fixed": sum(r.get("review_fixed") or 0 for r in runs),
+        "reviews_reported": sum(1 for r in runs if r.get("review_reported")),
+    }
 
 
 def build_read(
@@ -381,48 +415,54 @@ def build_read(
     runs = [r for r in preset_stats.read_log_runs(since, until) if admin or r.get("user") == owner]
     runs.sort(key=lambda r: r.get("at") or 0.0, reverse=True)
     truncated = len(runs) > MAX_RUNS
-    runs = [
-        {**r, "title": _clean(r["title"], MAX_TITLE)} if isinstance(r.get("title"), str) else r
-        for r in runs[:MAX_RUNS]
-    ]
-    ids = {r["session"] for r in runs if r.get("session")}
-    raw = [
-        line
-        for line in preset_stats._read_jsonl(preset_runs.log_path())
-        if line.get("session") in ids
-    ]
-    family = set(ids)
-    for line in raw:
-        for agent in line.get("agents") or []:
-            if isinstance(agent, dict) and agent.get("session"):
-                family.add(str(agent["session"]))
-    model_changes = [
-        _trim_reason(model_log.normalize(line))
-        for line in preset_stats._read_jsonl(model_log.log_path())
-        if line.get("session") in family and (line.get("at") or 0) >= since
-    ]
-    switches = [
-        line
-        for line in preset_stats._read_jsonl(preset_log.log_path())
-        if line.get("session") in ids and (line.get("at") or 0) >= since
-    ]
-    users: dict[str, Any]
+    runs = runs[:MAX_RUNS]
+    groups: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for run in runs:
+        key = (str(run.get("user") or owner), str(run.get("preset") or preset_stats.LEAD_PICKS_ID))
+        groups.setdefault(key, []).append(run)
+    stats = sorted(
+        (_preset_aggregate(o, pid, rows) for (o, pid), rows in groups.items()),
+        key=lambda a: (-a["runs"], a["owner"], a["id"]),
+    )
+    # Owner's own entry first (it is the one that can never be dropped below), the rest sorted
+    # for stable output; dropped from the tail when the whole answer runs over budget.
+    other_users = sorted(u for u in roles.all_states() if u != owner) if admin else []
+    users: dict[str, Any] = {owner: _user_presets(roles.get(owner))}
     if admin:
-        users = {u: _user_presets(s) for u, s in roles.all_states().items()}
-    else:
-        users = {owner: _user_presets(roles.get(owner))}
-    return {
+        users.update((u, _user_presets(roles.get(u))) for u in other_users)
+    answer = {
         **state,
         "scope": "admin" if admin else "own",
         "owner": owner,
         "since": preset_stats._iso(since),
-        "runs": runs,
+        "stats": stats,
         "truncated": truncated,
-        "model_changes": model_changes,
-        "preset_switches": switches,
         "presets": {"starters": role_prefs.starters(), "users": users},
         "limits": {"max_suggestions": MAX_SUGGESTIONS},
     }
+
+    # Two parts of this answer still scale with how much there is to aggregate: the admin
+    # presets.users block (user count times MAX_PRESETS each) and stats (one row per distinct
+    # owner, preset pair MAX_RUNS runs touch). Neither alone is always the oversized one, so
+    # both get a turn before the owner's own presets.users entry, the thing kept longest,
+    # is sacrificed: other users' presets first (the family-cost card's own truncation
+    # pattern, family_cost.py), then stats from its tail (sorted busiest-first, so the rows
+    # dropped are always the ones with the least evidence behind them), then, only as a last
+    # resort, the owner's own presets.
+    def over_budget() -> bool:
+        return len(json.dumps(answer)) > MAX_RESPONSE_CHARS
+
+    other_drop = list(reversed(other_users))
+    while other_drop and over_budget():
+        del answer["presets"]["users"][other_drop.pop(0)]
+        answer["truncated"] = True
+    while answer["stats"] and over_budget():
+        answer["stats"].pop()
+        answer["truncated"] = True
+    if over_budget() and owner in answer["presets"]["users"]:
+        del answer["presets"]["users"][owner]
+        answer["truncated"] = True
+    return answer
 
 
 __all__ = [
@@ -448,3 +488,75 @@ __all__ = [
     "remove_task",
     "reviewer_model",
 ]
+
+
+class RunNow(NamedTuple):
+    """The outcome of :func:`run_now`: started, or the status, code and text of the refusal."""
+
+    status: int
+    code: str | None = None
+    message: str | None = None
+
+    @property
+    def started(self) -> bool:
+        return self.code is None
+
+
+_run_locks: dict[tuple[int, str], asyncio.Lock] = {}
+_logger = logging.getLogger("ae.preset_review")
+
+
+async def _clear_forced(store: preset_suggestions.SuggestionStore, who: str) -> None:
+    """Drop the Run now flag this call set; a store failure is logged, not raised."""
+    try:
+        await asyncio.to_thread(store.take_forced, who, time.time())
+    except preset_suggestions.SuggestionError:
+        _logger.warning("could not clear the Run now flag for %s", who, exc_info=True)
+
+
+async def run_now(http: httpx.AsyncClient, who: str) -> RunNow:
+    """Run the preset review now: make sure the task exists, flag the read due, fire the task.
+
+    *http* is this server's own API as *who*. Shared by ``POST /preset-review/run`` and the
+    new-model watch (:mod:`model_watch`).
+    """
+    store = preset_suggestions.store()
+    lock = _run_locks.setdefault((id(asyncio.get_running_loop()), who), asyncio.Lock())
+    async with lock:
+        # Read the roles inside the lock: a save that switched insights off while this call
+        # waited must win, and the task is built from the live state, not one read earlier.
+        state = await asyncio.to_thread(role_prefs.store().get, who)
+        if not (state.insights and state.insights.enabled):
+            return RunNow(409, "insights_off", "Preset insights are off; switch them on first.")
+        ensured = await ensure_task(http, lambda: role_prefs.store().get(who), who)
+        if not ensured.get("ok"):
+            return RunNow(502, "task_failed", str(ensured.get("error") or "the task failed"))
+        row = await find_task(http, who)
+        if row is None:
+            return RunNow(
+                409, "task_missing", "The review task is gone; switch insights off and on again."
+            )
+        if row.get("state") not in (None, "active"):
+            return RunNow(
+                409,
+                "task_paused",
+                "The review task is paused. Resume it in Scheduled tasks, then run again.",
+            )
+        mine = not await asyncio.to_thread(store.peek_forced, who, time.time())
+        try:
+            await asyncio.to_thread(store.force, who, time.time())
+        except preset_suggestions.SuggestionError as exc:
+            return RunNow(exc.status, exc.code, exc.message)
+        try:
+            response = await http.post(f"/v1/scheduled-tasks/{ensured['id']}/run")
+        except httpx.HTTPError as exc:
+            if mine:
+                await _clear_forced(store, who)
+            return RunNow(502, "run_failed", f"starting the review failed: {type(exc).__name__}")
+    if response.status_code not in (200, 202):
+        if mine:
+            await _clear_forced(store, who)
+        if response.status_code == 409:
+            return RunNow(409, "review_running", "A review is already running.")
+        return RunNow(502, "run_failed", f"starting the review answered {response.status_code}")
+    return RunNow(202)

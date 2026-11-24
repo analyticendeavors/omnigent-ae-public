@@ -60,8 +60,20 @@ ensure_tag_commit() {
 }
 
 # Exporting the series needs the commits between the tag and HEAD. A shallow
-# checkout at the pointer has none of them, so deepen from the shallow boundary
-# just far enough (the series plus a margin) before giving up.
+# checkout at the pointer has none of them, so fetch HEAD's own history just far
+# enough (the series plus a margin) before giving up.
+#
+# HEAD is deepened by sha, not with a bare `fetch --deepen origin`: that walks
+# back from origin's branch tips, so it never reaches the pinned commit when no
+# fork branch contains it (the series branch lags main's pin and merged topic
+# branches get deleted). That failed patches-check on PRs 619 and 620 on
+# 2026-11-20 with the pin a4ac5b3 on no branch. --depth never asks for less than
+# the history already fetched, since it can also shorten a shallow checkout (a
+# --deepen by sha fetched nothing in testing, because HEAD is already present).
+# When HEAD runs more than the margin past the lock's
+# count (a stale lock, extra local commits), HEAD's whole history is fetched. A
+# HEAD origin does not have (an unpushed local commit) falls back to the old
+# deepen from origin's branches.
 ensure_history() {
   ensure_tag_commit
   if git -C "$UPSTREAM_DIR" merge-base --is-ancestor "$UPSTREAM_SHA" HEAD 2>/dev/null; then
@@ -69,7 +81,19 @@ ensure_history() {
   fi
   if [ -f "$(git -C "$UPSTREAM_DIR" rev-parse --git-dir)/shallow" ]; then
     note "deepening the shallow checkout to reach $UPSTREAM_TAG"
-    git -C "$UPSTREAM_DIR" fetch --deepen=$((PATCH_COUNT + 5)) origin
+    local head have depth=$((PATCH_COUNT + 5))
+    head="$(git -C "$UPSTREAM_DIR" rev-parse HEAD)"
+    have="$(git -C "$UPSTREAM_DIR" rev-list --count HEAD)"
+    if [ "$have" -gt "$depth" ]; then depth="$have"; fi
+    if git -C "$UPSTREAM_DIR" fetch --depth="$depth" origin "$head" 2>/dev/null; then
+      if ! git -C "$UPSTREAM_DIR" merge-base --is-ancestor "$UPSTREAM_SHA" HEAD 2>/dev/null; then
+        note "HEAD runs more than $depth commits past $UPSTREAM_TAG; fetching its whole history"
+        git -C "$UPSTREAM_DIR" fetch --unshallow origin "$head" || true
+      fi
+    else
+      note "origin has no commit $head (unpushed?); deepening from origin's branches instead"
+      git -C "$UPSTREAM_DIR" fetch --deepen="$depth" origin || true
+    fi
     git -C "$UPSTREAM_DIR" merge-base --is-ancestor "$UPSTREAM_SHA" HEAD 2>/dev/null && return 0
   fi
   die "upstream/ HEAD $(git -C "$UPSTREAM_DIR" rev-parse HEAD) does not descend from $UPSTREAM_TAG ($UPSTREAM_SHA)"

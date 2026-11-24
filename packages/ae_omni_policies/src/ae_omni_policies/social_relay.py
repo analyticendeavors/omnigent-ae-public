@@ -9,14 +9,17 @@ holds the YouTube login; the box does, so the box reads.
 ``--dry-run`` prints what it would post; ``--from-file FILE`` reads a saved lister output
 instead of running node, and with ``--dry-run`` also plans and scores it locally. ``week``
 prints ``GET /social/week`` (the open posts that still need a draft) and ``put-drafts FILE``
-posts a drafts file to ``/social/drafts``, both for the weekly drafting run. No token is ever
-printed.
+posts a drafts file to ``/social/drafts``, both for the weekly drafting run. ``put-visuals FILE``
+posts one post's made pictures to ``/social/visuals`` (2026-11-15): FILE is
+``{"id": slot, "candidates": [{"kind", "label", "full", "preview"}]}``, best first, where
+``full`` and ``preview`` are JPEG paths relative to FILE's folder. No token is ever printed.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import json
 import os
 import shutil
@@ -224,6 +227,65 @@ async def run_put_drafts(
     return 0
 
 
+def visuals_body(path: Path) -> dict[str, Any]:
+    """The ``POST /social/visuals`` body for the visuals file at *path* (pictures in base64).
+
+    :raises RelayError: When the file is not the expected shape or a picture cannot be read.
+    """
+    data = _parse(path.read_text(encoding="utf-8"), str(path))
+    slot = data.get("id")
+    items = data.get("candidates")
+    if not isinstance(slot, str) or not isinstance(items, list) or not items:
+        raise RelayError(f"{path} needs an id and a non-empty candidates list")
+    folder = path.parent
+    candidates: list[dict[str, Any]] = []
+    for n, item in enumerate(items, 1):
+        if not isinstance(item, dict):
+            raise RelayError(f"{path}: candidate {n} is not an object")
+        entry: dict[str, Any] = {"kind": item.get("kind"), "label": item.get("label")}
+        for field in ("full", "preview"):
+            rel = item.get(field)
+            if not isinstance(rel, str) or not rel:
+                raise RelayError(f"{path}: candidate {n} has no {field} picture")
+            try:
+                entry[field] = base64.b64encode((folder / rel).read_bytes()).decode("ascii")
+            except OSError as exc:
+                raise RelayError(f"{path}: candidate {n} {field}: {exc}") from exc
+        candidates.append(entry)
+    return {"id": slot, "candidates": candidates}
+
+
+async def run_put_visuals(
+    path: Path,
+    settings: omni.Settings,
+    *,
+    transport: httpx.AsyncBaseTransport | None = None,
+    out: Any = None,
+) -> int:
+    """Post one post's pictures; a post that already has its set (409) is not a failure."""
+    out = out or sys.stdout
+    try:
+        body = visuals_body(path)
+    except (RelayError, OSError) as exc:
+        print(f"social: {exc}", file=out)
+        return 1
+    if not settings.configured:
+        print(settings.problem, file=out)
+        return 1
+    async with omni.http_client(settings, transport=transport) as client:
+        try:
+            answer = await _call(client, "POST", "/v1/ae/social/visuals", body)
+        except RelayError as exc:
+            if "answered 409" in str(exc):
+                # Not a failure of the run: the post already has its set, or was closed meanwhile.
+                print(f"social: {body['id']} took no pictures: {exc}", file=out)
+                return 0
+            print(f"social: {exc}", file=out)
+            return 1
+    print(json.dumps(answer, indent=2), file=out)
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m ae_omni_policies.social_relay",
@@ -247,12 +309,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     put = sub.add_parser("put-drafts", help="post a drafts JSON file to the server")
     put.add_argument("file")
+    vis = sub.add_parser("put-visuals", help="post one post's made pictures to the server")
+    vis.add_argument("file")
     args = parser.parse_args(argv)
     settings = omni.Settings.from_env()
     if args.command == "week":
         return asyncio.run(run_week(settings, redraft=args.redraft))
     if args.command == "put-drafts":
         return asyncio.run(run_put_drafts(Path(args.file), settings))
+    if args.command == "put-visuals":
+        return asyncio.run(run_put_visuals(Path(args.file), settings))
     script = Path(args.lister or os.environ.get(LISTER_ENV) or DEFAULT_LISTER)
     return asyncio.run(
         run(

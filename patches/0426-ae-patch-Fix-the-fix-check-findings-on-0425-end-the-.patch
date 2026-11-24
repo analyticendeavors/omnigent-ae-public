@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:12:48 -0800
+Subject: [PATCH 426/443] [ae-patch] Fix the fix-check findings on 0425: end
+ the Send now settle on unmount or chat switch, skip Esc from other controls
+
+The settle timer is cleared and its flags reset when the chat changes or the hook unmounts, and a flush only sends in the chat and Voice mode it started in. Esc from a terminal, editor or button, or with an overlay open, is left to that control instead of discarding the take.
+---
+ web/src/components/ComposerMicButton.test.tsx | 12 +++++++
+ web/src/hooks/useAeVoiceMode.test.tsx         | 35 +++++++++++++++++++
+ web/src/hooks/useAeVoiceMode.ts               |  9 ++++-
+ web/src/pages/ChatPage.composer.test.tsx      | 14 ++++++++
+ web/src/pages/ChatPage.tsx                    | 10 ++++--
+ 5 files changed, 77 insertions(+), 3 deletions(-)
+
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index 0cd4263a8f6ffce9fd03b6b143ed57f546abcff4..9d97847e08daec4bce3124f1ae09d6b5227a53e1 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -448,6 +448,18 @@ describe("ComposerMicButton", () => {
+     expect(onVoiceDiscard).not.toHaveBeenCalled();
+   });
+ 
++  it("onTakeKey null on Enter with nothing to send ends the take and adds no newline", () => {
++    render(<ComposerMicButton onTranscript={vi.fn()} onTakeKey={() => null} />);
++    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
++    act(() => handlers.start?.({}));
++    const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
++    act(() => {
++      window.dispatchEvent(e);
++    });
++    expect(e.defaultPrevented).toBe(true);
++    expect(stopSpy).toHaveBeenCalledTimes(1);
++  });
++
+   it("drops a late transcript that arrives after an Esc discard", () => {
+     const onTranscript = vi.fn();
+     render(<ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={vi.fn()} />);
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 0065b028fe0ec1ca8e3bb05b7787ac9e150308be..8844ad19040232843a893beda75af80307b027f7 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -521,6 +521,41 @@ describe("useAeVoiceMode", () => {
+       expect(getVoiceSnapshot("c1").phase).toBe("listening");
+     });
+ 
++    it("a chat switch mid-settle sends nothing into the new chat", () => {
++      const { result, rerender } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.sendNow());
++      setVoiceOn("c2", true);
++      rerender({ chatId: "c2", value: "other draft", status: "idle", canSend: true, submit });
++      act(() => void vi.advanceTimersByTime(SEND_NOW_CAP_MS * 2 + GRACE_MS));
++      expect(submit).not.toHaveBeenCalled();
++    });
++
++    it("an unmount mid-settle sends nothing", () => {
++      const { result, unmount } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.sendNow());
++      unmount();
++      act(() => void vi.advanceTimersByTime(SEND_NOW_CAP_MS * 2));
++      expect(submit).not.toHaveBeenCalled();
++    });
++
++    it("Enter works again right after a chat switch", () => {
++      const { result, rerender } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.sendNow());
++      setVoiceOn("c2", true);
++      rerender({ chatId: "c2", value: "next", status: "idle", canSend: true, submit });
++      act(() => result.current.onListening(true));
++      let handled = false;
++      act(() => {
++        handled = result.current.sendNow();
++      });
++      expect(handled).toBe(true);
++      act(() => void vi.advanceTimersByTime(SEND_NOW_CAP_MS));
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
++
+     it("returns false and leaves the take alone with no draft", () => {
+       const { result } = mount({ value: "  " });
+       act(() => result.current.onListening(true));
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index c047858821c995fb6b6003f8dd0a24e2e7541e87..feebf766f655a51c508753541198ecf93bf011da 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -151,6 +151,7 @@ export function useAeVoiceMode({
+   const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+   // Finals for the take Send now stopped never arm a grace; cleared when the mic listens again.
+   const sentNowTake = useRef(false);
++  const flushChat = useRef<string | null>(null);
+   // Set inside send() and cleared after the next render: two presses in one render send once.
+   const sendLock = useRef(false);
+   const [ready, setReady] = useState(true);
+@@ -227,6 +228,8 @@ export function useAeVoiceMode({
+   // The voice log goes to the server with the chat it belongs to (see uploadVoiceLog).
+   const chatIdRef = useRef(chatId);
+   chatIdRef.current = chatId;
++  const voiceOnRef = useRef(on);
++  voiceOnRef.current = on;
+   useVoiceLogOnHide(on, () => chatIdRef.current);
+ 
+   const clearGrace = useCallback(() => {
+@@ -275,6 +278,7 @@ export function useAeVoiceMode({
+     if (!flushRef.current) return;
+     endFlush();
+     const now = latest.current;
++    if (flushChat.current !== chatIdRef.current || !voiceOnRef.current) return;
+     if (now.value.trim() === "" || now.quiet) return;
+     send();
+   }, [endFlush, send]);
+@@ -294,6 +298,8 @@ export function useAeVoiceMode({
+   useEffect(
+     () => () => {
+       clearGrace();
++      endFlush();
++      sentNowTake.current = false;
+       if (sendTimer.current !== null) clearTimeout(sendTimer.current);
+       if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+       if (netTimer.current !== null) clearTimeout(netTimer.current);
+@@ -317,7 +323,7 @@ export function useAeVoiceMode({
+       setMicStopped(false);
+       setMicDetail(null);
+     },
+-    [chatId, clearGrace],
++    [chatId, clearGrace, endFlush],
+   );
+ 
+   // Make the server's label agree with this browser's switch, once per chat.
+@@ -846,6 +852,7 @@ export function useAeVoiceMode({
+     clearGrace();
+     logVoice("send now");
+     flushRef.current = true;
++    flushChat.current = chatIdRef.current;
+     sentNowTake.current = true;
+     setFlushing(true);
+     const mic = controller.current;
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 21e792c18e32de4227c116447d9670caf0460c55..0e0d59fc49ad7dfc225233d7eb408574fae3844e 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -440,6 +440,20 @@ describe("Composer Voice mode keys", () => {
+     }
+   });
+ 
++  it("Esc from a terminal during a take is skipped so the take and draft stay", () => {
++    voiceComposer("listening");
++    fireEvent.change(textarea(), { target: { value: "keep me" } });
++    const take = micStub.props!.onTakeKey!;
++    const term = extra('<div class="xterm"><textarea></textarea></div>').querySelector("textarea")!;
++    const e = new KeyboardEvent("keydown", { key: "Escape", bubbles: true });
++    term.dispatchEvent(e);
++    expect(take(e)).toBe("skip");
++    const dialog = extra('<div role="dialog"></div>');
++    expect(take(new KeyboardEvent("keydown", { key: "Escape" }))).toBe("skip");
++    dialog.remove();
++    expect(textarea()).toHaveValue("keep me");
++  });
++
+   it("Enter sends the heard draft once, even pressed twice", async () => {
+     const props = voiceComposer("listening");
+     fireEvent.change(textarea(), { target: { value: "open the file" } });
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index caea80e23aa90b1366de8daf739b012470711df9..461b18c14ca0fc5ec82a6be4035575a996eaefe3 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3613,8 +3613,14 @@ function ComposerImpl(
+       setVoiceOn(composerSessionId, false);
+       return "handled";
+     }
+-    // Enter on a focused button or menu item belongs to that control, not to the take.
+-    if (e.key === "Enter" && voice.on && !voiceSheet && !targetOk) return "skip";
++    // Enter or Esc from a focused control, or with an overlay open, is not the take's.
++    if (
++      voice.on &&
++      !voiceSheet &&
++      (e.key === "Enter" ? !targetOk : e.key === "Escape" && (!targetOk || overlayIsOpen()))
++    ) {
++      return "skip";
++    }
+     return null;
+   };
+   const voiceTakeKey = useCallback((e: globalThis.KeyboardEvent) => voiceKeyRef.current(e), []);

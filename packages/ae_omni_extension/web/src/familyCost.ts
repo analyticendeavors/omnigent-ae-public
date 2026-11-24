@@ -28,6 +28,7 @@ import {
   type CostUnit,
   type FamilyCostAnswer,
   type FamilyCostSettings,
+  type FlagOn,
   type FamilyRole,
   type FamilyRow,
 } from "./api";
@@ -66,6 +67,12 @@ export const UNIT_HINT =
   "Which number each family row shows, and how they rank; the other appears on hover.";
 export const RUNAWAY_HINT =
   "Either amount flags a family whose spend today passes it. Tokens skip cache reads. Counts the lead and helpers. 0 or blank turns it off.";
+export const FLAG_ON_HINT = "Which limit raises a Spend families alert. Tokens skip cache reads.";
+export const FLAG_ON_CHOICES: { value: FlagOn; label: string }[] = [
+  { value: "tokens", label: "Tokens" },
+  { value: "dollars", label: "Dollars" },
+  { value: "either", label: "Either" },
+];
 export const COST_NOTE =
   "Dollars are estimated at API rates. On a subscription they show where usage goes, not what the invoice says.";
 export const TOKENS_NOTE =
@@ -74,8 +81,9 @@ export const TODAY_NOTE = "Today means Pacific time (the day the flag amounts ar
 export const TRUNCATED_NOTE = "The list is cut to the biggest families.";
 export const DEFAULT_SETTINGS: FamilyCostSettings = {
   unit: "tokens",
-  runaway_tokens: 5_000_000,
+  runaway_tokens: 50_000_000,
   runaway_usd: 25,
+  flag_on: "either",
 };
 
 const ROLE_NAMES: Record<string, string> = {
@@ -259,19 +267,52 @@ export function shortDollars(value: number): string {
 
 // ── the flag ────────────────────────────────────────────────────────────────
 
-/** Which of the two amounts *row*'s spend today has passed (an amount of 0 is off). */
-export function passed(row: FamilyRow, settings: FamilyCostSettings): { tokens: boolean; usd: boolean } {
+/**
+ * True when the server's answer was worked out under the amounts and mode the viewer has now, so
+ * its per-row verdicts can be used as they are. Right after a local edit the echo is older and
+ * the rows are judged here with the same rule until the next poll.
+ */
+function echoMatches(answer: FamilyCostAnswer | null | undefined, settings: FamilyCostSettings): boolean {
+  const echoed = answer?.settings;
+  return (
+    answer?.state === "ready" &&
+    !!echoed &&
+    echoed.runaway_tokens === settings.runaway_tokens &&
+    echoed.runaway_usd === settings.runaway_usd &&
+    (echoed.flag_on ?? "either") === (settings.flag_on ?? "either")
+  );
+}
+
+/**
+ * Which of the two amounts *row*'s spend today has passed (an amount of 0 is off, and the "Flag on"
+ * mode leaves the other one out). The server's `over_tokens` and `over_usd` when *answer* matches
+ * the settings; otherwise worked out here.
+ */
+export function passed(
+  row: FamilyRow,
+  settings: FamilyCostSettings,
+  answer?: FamilyCostAnswer | null,
+): { tokens: boolean; usd: boolean } {
+  if (echoMatches(answer, settings) && row.over_tokens !== undefined && row.over_usd !== undefined) {
+    return { tokens: row.over_tokens, usd: row.over_usd };
+  }
+  const mode = settings.flag_on ?? "either";
   return {
     tokens:
+      mode !== "dollars" &&
       settings.runaway_tokens > 0 &&
       (row.today.flag_tokens ?? row.today.tokens_total) >= settings.runaway_tokens,
-    usd: settings.runaway_usd > 0 && row.today.cost_usd >= settings.runaway_usd,
+    usd: mode !== "tokens" && settings.runaway_usd > 0 && row.today.cost_usd >= settings.runaway_usd,
   };
 }
 
-/** Whether *row* is flagged: either amount passed today. */
-export function isFlagged(row: FamilyRow, settings: FamilyCostSettings): boolean {
-  const over = passed(row, settings);
+/** Whether *row* is flagged: a limit its mode counts was passed today. */
+export function isFlagged(
+  row: FamilyRow,
+  settings: FamilyCostSettings,
+  answer?: FamilyCostAnswer | null,
+): boolean {
+  const over = passed(row, settings, answer);
   return over.tokens || over.usd;
 }
 
@@ -281,7 +322,7 @@ export function flaggedFamilies(
   settings: FamilyCostSettings,
 ): FamilyRow[] {
   if (!answer || answer.state !== "ready") return [];
-  return (answer.families ?? []).filter((row) => isFlagged(row, settings));
+  return (answer.families ?? []).filter((row) => isFlagged(row, settings, answer));
 }
 
 /**
@@ -294,19 +335,13 @@ export function flaggedTotal(answer: FamilyCostAnswer | null, settings: FamilyCo
   const local = flaggedFamilies(answer, settings).length;
   const echoed = answer?.settings;
   const counted = answer?.totals?.flagged;
-  if (
-    answer?.state === "ready" &&
-    echoed &&
-    typeof counted === "number" &&
-    echoed.runaway_tokens === settings.runaway_tokens &&
-    echoed.runaway_usd === settings.runaway_usd
-  ) {
+  if (echoed && typeof counted === "number" && echoMatches(answer, settings)) {
     return Math.max(counted, local);
   }
   return local;
 }
 
-/** "5M tokens" or "$25": a flag amount as the Needs you line says it. */
+/** "50M tokens" or "$25": a flag amount as the Needs you line says it. */
 export function tokenLimitText(settings: FamilyCostSettings): string {
   return `${shortTokens(settings.runaway_tokens)} tokens`;
 }
@@ -322,13 +357,22 @@ export function needsYou(
   const over = flaggedFamilies(answer, settings);
   const total = flaggedTotal(answer, settings);
   if (!total) return null;
-  // Name the amounts that were actually passed, so "5M tokens or $25" says which one tripped.
+  // Name the amounts that were actually passed, so "50M tokens or $25" says which one tripped.
   // When the flagged families were all cut from the list, name the amounts that are on.
   const amounts: string[] = [];
-  if (over.length ? over.some((row) => passed(row, settings).tokens) : settings.runaway_tokens > 0) {
+  const mode = settings.flag_on ?? "either";
+  if (
+    over.length
+      ? over.some((row) => passed(row, settings, answer).tokens)
+      : mode !== "dollars" && settings.runaway_tokens > 0
+  ) {
     amounts.push(tokenLimitText(settings));
   }
-  if (over.length ? over.some((row) => passed(row, settings).usd) : settings.runaway_usd > 0) {
+  if (
+    over.length
+      ? over.some((row) => passed(row, settings, answer).usd)
+      : mode !== "tokens" && settings.runaway_usd > 0
+  ) {
     amounts.push(dollarLimitText(settings));
   }
   const head = `${plural(total, "family", "families")} passed ${amounts.join(" or ")} today`;
@@ -611,7 +655,7 @@ function drawBody(parts: Parts, state: State, redraw: () => void): void {
           ...shown.map((row) =>
             familyRow(row, all, unit, {
               open: state.open === row.lead_id,
-              hot: isFlagged(row, state.settings),
+              hot: isFlagged(row, state.settings, state.answer),
               showHost,
               onToggle: () => {
                 state.open = state.open === row.lead_id ? null : row.lead_id;
@@ -870,8 +914,44 @@ function thresholdField(state: State, kind: keyof typeof FLAG_FIELDS, redraw: ()
   };
 }
 
+/** The "Flag on" select: which of the two limits raises an alert. */
+function flagOnField(state: State, redraw: () => void): Field {
+  const select = el(
+    "select",
+    { class: "family-flag-on", "aria-label": "Flag on" },
+    ...FLAG_ON_CHOICES.map((choice) => el("option", { value: choice.value }, choice.label)),
+  ) as HTMLSelectElement;
+  const show = () => {
+    select.value = state.settings.flag_on ?? "either";
+  };
+  show();
+  select.addEventListener("change", () => {
+    const choice = select.value as FlagOn;
+    if ((state.settings.flag_on ?? "either") === choice) return;
+    void persist(state, redraw, { flag_on: choice }, { family_flag_on: choice }, {
+      settled: (error) => {
+        if (error) state.saveError = describeError(error);
+      },
+    });
+  });
+  const node = el(
+    "div",
+    { class: "family-limits family-flag-row" },
+    el("span", { class: "family-label" }, "Flag on"),
+    select,
+    hint(FLAG_ON_HINT, "Flag on"),
+  );
+  return {
+    node,
+    sync: () => {
+      if (document.activeElement !== select) show();
+    },
+  };
+}
+
 function buildSettings(parts: Parts, state: State, redraw: () => void): Field[] {
   const fields = [thresholdField(state, "tokens", redraw), thresholdField(state, "usd", redraw)];
+  const flagOn = flagOnField(state, redraw);
   // Line 1 is the label; line 2 is the two boxes with "or" between and "a day" and the hint after,
   // which wrap together when the card is narrow.
   replaceChildren(parts.settings, [
@@ -885,8 +965,9 @@ function buildSettings(parts: Parts, state: State, redraw: () => void): Field[] 
       el("span", { class: "family-label" }, "a day"),
       hint(RUNAWAY_HINT, "the flag amounts"),
     ),
+    flagOn.node,
   ]);
-  return fields;
+  return [...fields, flagOn];
 }
 
 let timer: ReturnType<typeof setTimeout> | null = null;

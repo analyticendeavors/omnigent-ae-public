@@ -556,6 +556,15 @@ export function updateSummary(root: HTMLElement, view: BoxHealthView): void {
 
 // ── the Details dialog ──────────────────────────────────────────────────────
 
+/**
+ * The CPU temperature readings of the last day from the newest answer, or null before one
+ * (the Admin Center rail draws its heat line from them, 2026-11-14).
+ */
+export function lastCpuHistory(): Array<number | null> | null {
+  const readings = lastView?.history?.cpu_c;
+  return readings && readings.some((value) => value != null) ? readings : null;
+}
+
 /** A sparkline: an inline SVG polyline (120 by 24); a missing point breaks the line. */
 export function sparkline(values: Array<number | null>, label: string): SVGElement {
   const ns = "http://www.w3.org/2000/svg";

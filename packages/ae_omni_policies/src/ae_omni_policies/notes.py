@@ -34,6 +34,13 @@ QUADRANT_AXES: dict[str, dict[str, int]] = {
     "admin": {"urgent": 1, "important": 0},  # Q2
 }
 
+# ``create_task`` also takes ``neither`` (urgent 0, important 0: Q4), so a caller can pick
+# Q4 on purpose. ``park_fork`` keeps the three above.
+TASK_QUADRANT_AXES: dict[str, dict[str, int]] = {
+    **QUADRANT_AXES,
+    "neither": {"urgent": 0, "important": 0},  # Q4
+}
+
 # Days until a parked fork resurfaces (the owner, 2026-08-30). "Come back and
 # decide", not "do it by then".
 RESURFACE_DAYS: dict[str, int] = {"hotfix": 3, "feature": 30, "admin": 14}
@@ -63,6 +70,13 @@ _WORD_CHAR = re.compile(r"[A-Za-z0-9_]")
 TIME_ONLY = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 # The store's own estimate values, which ``create_task`` passes through untouched.
 _STORE_ESTIMATES = frozenset({"15", "30", "45", "60plus"})
+# Size words beyond minutes that ``create_task`` maps to ``60plus``: the gate's own sizes.
+_LARGER_SIZES = re.compile(r"\b(hours?|blocks?|multi-block|days?|weeks?)\b", re.IGNORECASE)
+# What the refusal tells the caller to use.
+ACCEPTED_ESTIMATES = (
+    "15, 30, 45 or 60plus (the store's own), or a size in words: 'minutes' (15), "
+    "'about an hour', 'a block' or 'multi-block' (60plus)"
+)
 
 
 @dataclass(frozen=True)
@@ -155,11 +169,22 @@ def normalize_task_tags(supplied: Iterable[str] | None) -> list[str]:
 
 
 def task_estimate(est: str | None) -> str | None:
-    """The store's estimate for ``create_task``: its own values pass, size words are mapped."""
+    """The store's estimate for ``create_task``, or ``None`` when *est* maps to nothing.
+
+    The store's own values pass; minutes become ``15``; hours, blocks and days
+    become ``60plus``. Anything else is unmapped and the caller refuses it
+    rather than dropping it (see :data:`ACCEPTED_ESTIMATES`).
+    """
     raw = (est or "").strip()
     if not raw:
         return None
-    return raw if raw in _STORE_ESTIMATES else estimate_for(raw)
+    if raw in _STORE_ESTIMATES:
+        return raw
+    if _MINUTES.search(raw):
+        return "15"
+    if _LARGER_SIZES.search(raw):
+        return "60plus"
+    return None
 
 
 def home_clock_instant(day: str, clock: str, tz: str) -> str:

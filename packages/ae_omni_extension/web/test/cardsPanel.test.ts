@@ -302,3 +302,44 @@ describe("the Cards panel", () => {
     expect(document.body.textContent).toContain("Only an OmniGent admin");
   });
 });
+
+describe("the Services page (2026-11-15)", () => {
+  it("draws one wide row per card, with its state, what it is doing, what Off means, the eye, the switch and the Setup fold", async () => {
+    const { openCardsPanel } = await import("../src/cardsPanel");
+    const { setCards: put } = await import("../src/cardState");
+    const mk = (id: string, over: object = {}) => ({
+      id, name: `Card ${id}`, group: "ship", description: `${id} description`, sources: [], on: true, default_on: true,
+      changed_by: null, changed_at: null, fields: [], ...over,
+    });
+    put({ revision: 1, state_ok: true, cards: [mk("deploys"), mk("git", { fields: [{ label: "Repos", env: "AE_GIT_REPOS", kind: "list", hint: "h", env_only: false, status: "missing" }] }), mk("social", { on: false, changed_by: "owner" })] as never });
+    const host = document.createElement("div");
+    document.body.append(host);
+    const ctx = {
+      server: { request: vi.fn(async () => ({ ok: true, status: 200, body: { revision: 1, state_ok: true, cards: [mk("deploys"), mk("git", { fields: [{ label: "Repos", env: "AE_GIT_REPOS", kind: "list", hint: "h", env_only: false, status: "missing" }] }), mk("social", { on: false, changed_by: "owner" })] } })) },
+      storage: { user: { get: vi.fn(), set: vi.fn().mockResolvedValue(undefined) } },
+      navigation: {},
+    } as never;
+    const panel = openCardsPanel(ctx, { into: host, notSetUp: (id) => id === "git", doing: (id) => `${id} is doing fine` });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(host.querySelector(".ae-cards-scrim")).toBeNull();
+    expect(host.querySelector(".ae-cards-cols")).not.toBeNull();
+    const rowOf = (id: string) => host.querySelector<HTMLElement>(`[data-card="${id}"]`)!;
+    const cells = (id: string) => [...rowOf(id).querySelectorAll(".ae-card-cells > *")].map((n) => n.className.split(" ")[0]);
+    expect(cells("deploys")).toEqual(["ae-card-name", "ae-card-chip", "ae-card-doing", "ae-card-offmeans", "ae-card-eye", "ae-card-switch", "btn"]);
+    expect(rowOf("deploys").querySelector(".ae-card-doing")!.textContent).toBe("deploys is doing fine");
+    // Deploys keeps answering its routes when off; Git's reads stop.
+    expect(rowOf("deploys").querySelector(".ae-card-offmeans")!.textContent).toContain("routes keep answering");
+    expect(rowOf("git").querySelector(".ae-card-offmeans")!.textContent).toContain("stops its background reads");
+    expect(rowOf("git").querySelector(".ae-card-doing")!.textContent).toBe("Not set up. Needs AE_GIT_REPOS.");
+    expect(rowOf("social").querySelector(".ae-card-doing")!.textContent).toBe("Turned off by owner");
+    // No second line that repeats the name or the description.
+    expect(rowOf("deploys").querySelector(".ae-card-row-desc")).toBeNull();
+    expect(rowOf("deploys").textContent).not.toContain("deploys description");
+    // The Setup button folds the setup.
+    const setup = rowOf("deploys").querySelector<HTMLElement>(".ae-card-setup-btn")!;
+    expect(setup.getAttribute("aria-expanded")).toBe("false");
+    setup.click();
+    expect(rowOf("deploys").querySelector<HTMLElement>(".ae-card-setup")!.hidden).toBe(false);
+    panel.close();
+  });
+});

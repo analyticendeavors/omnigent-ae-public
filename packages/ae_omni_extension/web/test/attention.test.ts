@@ -18,6 +18,7 @@ import {
   emptyText,
   resetAttentionSeen,
   GROUPS,
+  INVESTIGATE_HINT,
   ROWS_SHOWN,
   UNDO_MS,
   waitingText,
@@ -125,7 +126,7 @@ const BOX_OFFER = {
 function sample(extra: AttentionItem[] = []): AttentionOverview {
   return overview([
     ...many(2, "pr-failing"),
-    item("alerts-fix-1", { kind: "alerts-fix", title: "1 alert to fix: lodash" }),
+    item("alerts-fix-1", { kind: "alerts-fix", title: "1 Dependabot alert: lodash" }),
     item("pr-ready-1", { kind: "pr-ready", tone: "review", title: "Merge #12 Bump thing" }),
     item("box-temp-1", {
       source: "box",
@@ -166,7 +167,7 @@ afterEach(() => {
 });
 
 describe("the groups", () => {
-  it("makes one block per source and one group per kind, urgent kinds first", () => {
+  it("makes one block per source and one group per kind, in the fixed kind order", () => {
     const blocks = buildBlocks(sample().items);
     expect(blocks.map((b) => b.name)).toEqual(["Git repos", "Box health"]);
     expect(blocks[0]!.groups.map((g) => g.name)).toEqual(["Alerts to fix", "Failing PRs", "Ready to merge"]);
@@ -299,7 +300,7 @@ describe("folding", () => {
     expect(expanded(node, "attn.git.pr-failing")).toBe("false");
   });
 
-  it("opens a line again by itself when it gains an urgent item it has not shown", async () => {
+  it("never reopens a line by itself when it gains an urgent item (the new-urgent marker is the table's, 2026-11-17)", async () => {
     const first = overview([item("p1"), item("a1", { kind: "alerts-fix" })]);
     let answer = first;
     const { context } = stubContext({ [LIST]: () => ok(answer) });
@@ -310,12 +311,12 @@ describe("folding", () => {
     window.dispatchEvent(new Event("focus"));
     await flush();
     expect(expanded(node, "attn.git")).toBe("false");
-    // A new urgent failing PR: its source and its kind open; the alerts kind (nothing new) stays closed.
+    // A new urgent failing PR: nothing opens, the person decides.
     answer = overview([item("p1"), item("a1", { kind: "alerts-fix" }), item("p2")]);
     window.dispatchEvent(new Event("focus"));
     await flush();
-    expect(expanded(node, "attn.git")).toBe("true");
-    expect(expanded(node, "attn.git.pr-failing")).toBe("true");
+    expect(expanded(node, "attn.git")).toBe("false");
+    expect(expanded(node, "attn.git.pr-failing")).toBe("false");
     expect(expanded(node, "attn.git.alerts-fix")).toBe("false");
   });
 
@@ -1248,7 +1249,7 @@ describe("Review all", () => {
       const folded = expanded(node, "attn.box");
       await click(sourceButton(node));
       const post = calls.find((c) => c.path.endsWith("/batch"))!;
-      expect(post.body).toEqual({ source: "box", ids: ["units-1", "scan-1"] });
+      expect(post.body).toEqual({ source: "box", ids: ["scan-1", "units-1"] });
       expect(expanded(node, "attn.box")).toBe(folded);
     });
   });
@@ -1324,6 +1325,28 @@ describe("Fix", () => {
     expect(fix.getAttribute("title")).toBe(NOTE);
     expect(fix.getAttribute("aria-label")).toMatch(/^Fix /);
     expect(q(fix, ".icon-tool")).not.toBeNull();
+  });
+
+  it("draws Investigate with the wrench on a home row, and one chat button", async () => {
+    const home = (n: number) =>
+      item(`home:alert:0000000${n}abcd`, {
+        source: "home",
+        kind: "home-alarm",
+        url: "",
+        title: `Device device-a reached site${n}.example`,
+        actions: ["review", "dismiss"],
+      });
+    const { context } = stubContext({ [LIST]: ok(overview([home(1), home(2)])) });
+    const node = await mount(context);
+    const row = q(node, ".attn-row")!;
+    const buttons = all(row, ".attn-actions > button");
+    expect(buttons.map((b) => b.dataset.focus!.split(":").pop())).toEqual(["review", "dismiss"]);
+    const go = q(row, '[data-focus$=":review"]')!;
+    expect(go.getAttribute("aria-label")).toMatch(/^Investigate Device device-a/);
+    expect(go.getAttribute("title")).toBe(INVESTIGATE_HINT);
+    expect(q(go, ".icon-tool")).not.toBeNull();
+    expect(q(row, '[data-focus$=":fix"]')).toBeNull();
+    expect(q(node, '[data-focus="attn.home:review-all"]')).not.toBeNull();
   });
 
   it("uses the terminal icon for a Fix that ends in a command", async () => {
@@ -1421,7 +1444,7 @@ describe("Fix", () => {
     expect(text(node, ".attn-row .flash")).toMatch(/Could not start the Fix chat \(.*could not start it/);
   });
 
-  it("keeps four icon buttons and the menu on a phone row, which wraps under the text", async () => {
+  it("keeps four icon buttons and the menu on a phone row, on their own line under the text", async () => {
     setPhone(true);
     const { context } = stubContext({ [LIST]: ok(overview([fixable()])) });
     const node = await mount(context);
@@ -1435,10 +1458,26 @@ describe("Fix", () => {
     };
     expect(rule(".attn-actions")).toContain("flex-wrap: wrap");
     const phone = css.slice(css.indexOf("@media (pointer: coarse), (max-width: 520px) {\n  .attn .btn,"));
-    expect(phone).toContain("grid-column: 2");
     expect(phone).toMatch(/width: 44px/);
+    // The actions take their own line under the text, so the title keeps the row's width
+    // (2026-11-13: on the title line they left it 36 px on a 440 px phone).
+    expect(phone).toMatch(/\.attn-row \.attn-actions \{\s*grid-column: 2 \/ -1;\s*justify-content: flex-start;/);
+    expect(phone).not.toMatch(/\.attn-row \.attn-actions \{\s*grid-column: 3;/);
+    expect(phone).toMatch(/\.attn-row \.attn-actions:empty \{\s*display: none;/);
     // 4 buttons at 44 px with 4 px gaps are 188 px, inside a 360 px screen's row.
     expect(4 * 44 + 3 * 4).toBeLessThan(360 - 2 * 16 - 8);
+  });
+
+  it("wraps a wider row so its actions drop under the text before the title is squeezed", () => {
+    // jsdom does no layout: the rule is read as text. A 312 px Needs you tile on a 1,440 px
+    // board left the title 14 px while the actions held a grid column of their own.
+    const start = css.indexOf("@media (width > 520px) {\n  .attn-row {");
+    expect(start).toBeGreaterThanOrEqual(0);
+    const wide = css.slice(start, css.indexOf("\n}\n", start));
+    expect(wide).toMatch(/\.attn-row \{\s*display: flex;\s*flex-wrap: wrap;/);
+    expect(wide).toMatch(/\.attn-row \.attn-text \{\s*flex: 1 1 min\(16em, 100% - 18px\);/);
+    expect(wide).toMatch(/\.attn-row \.attn-actions \{\s*flex: 0 1 auto;\s*margin-left: auto;/);
+    expect(wide).toMatch(/\.attn-row \.pr-confirm \{\s*flex: 1 0 100%;/);
   });
 });
 
@@ -1906,10 +1945,10 @@ describe("the verdict, the Dashboard link and the empty state (2026-11-06)", () 
   });
 });
 
-describe("the ten sources (2026-11-06, git-mine 2026-11-08)", () => {
-  const SOURCES = ["git", "git-mine", "box", "host", "cost", "databricks", "secrets", "vault", "accounts", "family"] as const;
+describe("the twelve sources (2026-11-06, git-mine 2026-11-08, home 2026-11-13, social 2026-11-16)", () => {
+  const SOURCES = ["git", "git-mine", "box", "host", "home", "cost", "databricks", "secrets", "vault", "accounts", "family", "social"] as const;
 
-  it("names every source, and the groups and the names cover the same ten", () => {
+  it("names every source, and the groups and the names cover the same twelve", () => {
     expect(Object.keys(SOURCE_NAMES).sort()).toEqual([...SOURCES].sort());
     expect(Object.keys(GROUPS).sort()).toEqual([...SOURCES].sort());
     expect(SOURCE_NAMES).toMatchObject({
@@ -1919,6 +1958,7 @@ describe("the ten sources (2026-11-06, git-mine 2026-11-08)", () => {
       cost: "Cost targets",
       databricks: "Databricks credit",
       host: "Box host",
+      home: "Home security",
       accounts: "Accounts",
       family: "Spend families",
     });
@@ -1930,12 +1970,14 @@ describe("the ten sources (2026-11-06, git-mine 2026-11-08)", () => {
       "git-mine": "pr-failing",
       box: "heat",
       host: "host-failed",
+      home: "home-alarm",
       cost: "cost-over",
       databricks: "credit-over",
       secrets: "secret-soon",
       vault: "vault-apart",
       accounts: "account-full",
       family: "family-over",
+      social: "post-overdue",
     };
     // Built in reverse, to prove the order is the table's and not the input's.
     const items = [...SOURCES].reverse().map((source) => item(`${source}-1`, { source, kind: kinds[source]! }));

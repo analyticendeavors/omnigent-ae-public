@@ -1,0 +1,437 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 13:58:17 -0800
+Subject: [PATCH 350/443] [ae-patch] Fix the review findings on 0347 to 0349
+
+1. Read the voice arm flag at the start of handleCreate so a voice-started chat keeps it and a failed create cannot leak it.
+2. The paused and unavailable sheet and bar call onRestartMic (Listen again); the landing gets restart().
+3. The sheet keeps the actions row visible; only the input area hides.
+4. Turning Voice off calls the registered stop, which clears a refused reply.
+5. The voice log goes before a draft that is a slash command.
+6. A late NotAllowedError after stop() no longer marks playback blocked.
+7. The landing reports listening when the mic was already listening.
+8. Tests: the blocked mirror and chat switch in useAeSpeakReplies.
+---
+ web/src/components/AeVoicePanel.test.tsx      | 12 ++++++
+ web/src/components/AeVoicePanel.tsx           | 21 +++++++++-
+ .../components/composer/ChatComposer.test.tsx |  4 +-
+ web/src/components/composer/ChatComposer.tsx  |  2 +-
+ web/src/hooks/useAeSpeakReplies.test.ts       |  8 ++++
+ web/src/hooks/useAeVoiceStart.test.ts         | 21 ++++++++++
+ web/src/hooks/useAeVoiceStart.ts              | 40 +++++++++++++------
+ web/src/lib/aeCloudVoice.test.ts              | 17 ++++++++
+ web/src/lib/aeCloudVoice.ts                   |  2 +
+ web/src/lib/aeComposerTight.test.tsx          |  6 +--
+ web/src/lib/aeVoiceLog.test.ts                |  8 ++++
+ web/src/lib/aeVoiceLog.ts                     |  5 ++-
+ web/src/lib/aeVoiceMode.test.ts               | 12 ++++++
+ web/src/lib/aeVoiceMode.ts                    |  2 +
+ web/src/pages/ChatPage.tsx                    |  1 +
+ web/src/shell/NewChatDialog.tsx               |  7 +++-
+ 16 files changed, 145 insertions(+), 23 deletions(-)
+
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index 578669af4bd033545e36b6ae30ca81d958dfaca7..aa711d9cd760adc3c42c23feb8240d9d3b382a8b 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -149,4 +149,16 @@ describe("AeVoicePanel", () => {
+     expect(AE_VOICE_RING.blocked).toBe("border-red-500");
+     expect(AE_VOICE_RING.paused).toBe("border-border");
+   });
++
++  for (const layout of ["bar", "sheet"] as const) {
++    it.each(["paused", "unavailable"] as const)(
++      `${layout}: a tap while %s restarts the mic`,
++      async (phase) => {
++        const onRestartMic = vi.fn();
++        panel({ layout, phase, onRestartMic });
++        await userEvent.click(screen.getByRole("button", { name: "Listen again" }));
++        expect(onRestartMic).toHaveBeenCalledTimes(1);
++      },
++    );
++  }
+ });
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index 458458effb5e913808b6379375ef4073728f4d30..b1f9210e24a033bc09300d96ee30aaf5f261bc41 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -30,6 +30,8 @@ export interface AeVoicePanelProps {
+   onResume: () => void;
+   /** Sheet only: show the text box for one message. */
+   onKeyboard?: () => void;
++  /** Start the mic again when it is paused or unavailable; runs inside the tap. */
++  onRestartMic?: () => void;
+   className?: string;
+ }
+ 
+@@ -166,6 +168,7 @@ export function AeVoicePanel({
+   onStop,
+   onResume,
+   onKeyboard,
++  onRestartMic,
+   className,
+ }: AeVoicePanelProps) {
+   const level = useMicLevel();
+@@ -173,9 +176,23 @@ export function AeVoicePanel({
+   if (key === "off") return null;
+   const tone = TONE[key];
+   const { label, sub } = words(key, heard, caption, micDetail);
+-  const action = key === "speaking" ? onStop : key === "blocked" ? onResume : undefined;
++  const restartable = key === "paused" || key === "unavailable";
++  const action =
++    key === "speaking"
++      ? onStop
++      : key === "blocked"
++        ? onResume
++        : restartable
++          ? onRestartMic
++          : undefined;
+   const actionLabel =
+-    key === "speaking" ? "Stop speaking" : key === "blocked" ? "Play the reply" : label;
++    key === "speaking"
++      ? "Stop speaking"
++      : key === "blocked"
++        ? "Play the reply"
++        : restartable
++          ? "Listen again"
++          : label;
+   const endButton = (
+     <Button type="button" variant="outline" size="sm" aria-label="End voice mode" onClick={onEnd}>
+       End
+diff --git a/web/src/components/composer/ChatComposer.test.tsx b/web/src/components/composer/ChatComposer.test.tsx
+index cf29b6ce4c74850c163936f131bbd9b92f0f2b2b..0b709117641f00319f327aa24c12b93d613880f8 100644
+--- a/web/src/components/composer/ChatComposer.test.tsx
++++ b/web/src/components/composer/ChatComposer.test.tsx
+@@ -9,7 +9,7 @@ import {
+ } from "./ChatComposer";
+ 
+ describe("ChatComposer Voice sheet hooks", () => {
+-  it("names its card as a group and lets the sheet hide the input and the actions", () => {
++  it("names its card as a group and lets the sheet hide the input and keeps the actions", () => {
+     const { container } = render(
+       <ChatComposer
+         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
+@@ -23,7 +23,7 @@ describe("ChatComposer Voice sheet hooks", () => {
+     expect(card.className).toContain("group/composer-card");
+     const hide = "group-data-[ae-voice-sheet]/composer-card:hidden";
+     expect(card.querySelector(".composer-input-text")?.className).toContain(hide);
+-    expect(screen.getByTestId("actions").className).toContain(hide);
++    expect(screen.getByTestId("actions").className).not.toContain(hide);
+   });
+ });
+ 
+diff --git a/web/src/components/composer/ChatComposer.tsx b/web/src/components/composer/ChatComposer.tsx
+index d9c0956e4a7cb335750847aca4d9b066d3fe7985..2641b77e5d880e1a5325aca2359ea43ba888e88d 100644
+--- a/web/src/components/composer/ChatComposer.tsx
++++ b/web/src/components/composer/ChatComposer.tsx
+@@ -521,7 +521,7 @@ export const ComposerActionRow = forwardRef<HTMLDivElement, ComponentPropsWithou
+       <div
+         ref={ref}
+         className={cn(
+-          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 data-[snug]:gap-0 pt-1 pb-2 group-data-[ae-voice-sheet]/composer-card:hidden",
++          "group/composer-actions @container/composer-actions relative flex min-w-0 flex-nowrap items-center justify-between gap-2 data-[snug]:gap-0 pt-1 pb-2",
+           COMPOSER_CONTENT_INSET_CLASS,
+           className,
+         )}
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 7552c83290b9e1d60b6d862ef559da78fad0a8a3..77ae950a13b73ebe4920b4ba1acf69aedf8ad866 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -522,4 +522,12 @@ describe("the voice snapshot mirrors", () => {
+     act(() => clearPlaybackBlocked());
+     expect(getVoiceSnapshot("c1").blocked).toBe(false);
+   });
++
++  it("a chat switch leaves the new chat's snapshot unblocked", () => {
++    const { rerender } = mount(true);
++    act(() => markPlaybackBlocked(() => {}));
++    expect(getVoiceSnapshot("c1").blocked).toBe(true);
++    act(() => rerender({ enabled: true, chatId: "c2" }));
++    expect(getVoiceSnapshot("c2").blocked).toBe(false);
++  });
+ });
+diff --git a/web/src/hooks/useAeVoiceStart.test.ts b/web/src/hooks/useAeVoiceStart.test.ts
+index bdef65c78a78383f9d97c4623ceb889c95786bbc..54cf7fb1ca91beba8ffe14558d3235dc9feab372 100644
+--- a/web/src/hooks/useAeVoiceStart.test.ts
++++ b/web/src/hooks/useAeVoiceStart.test.ts
+@@ -96,3 +96,24 @@ describe("useAeVoiceStart", () => {
+     expect(takeVoiceArm()).toBe(false);
+   });
+ });
++
++describe("useAeVoiceStart with a mic that is already listening", () => {
++  it("toggle reports listening at once, since start fires no event", () => {
++    const { result, mic } = setup();
++    mic.isListening = () => true;
++    act(() => result.current.toggle());
++    expect(result.current.phase).toBe("listening");
++  });
++
++  it("restart starts the mic again and reports listening when it already is", () => {
++    const { result, mic } = setup();
++    act(() => result.current.toggle());
++    act(() => result.current.onListening(false));
++    expect(result.current.phase).toBe("unavailable");
++    act(() => result.current.restart());
++    expect(mic.start).toHaveBeenCalledTimes(2);
++    mic.isListening = () => true;
++    act(() => result.current.restart());
++    expect(result.current.phase).toBe("listening");
++  });
++});
+diff --git a/web/src/hooks/useAeVoiceStart.ts b/web/src/hooks/useAeVoiceStart.ts
+index fd2891cdb8f7b123948d1387169c9a84aa12cff2..aa74a54317d3a5d6c4e6bc1718065cf8d714a42c 100644
+--- a/web/src/hooks/useAeVoiceStart.ts
++++ b/web/src/hooks/useAeVoiceStart.ts
+@@ -26,6 +26,8 @@ export interface AeVoiceStart {
+   armed: boolean;
+   phase: VoicePhase;
+   toggle: () => void;
++  /** Listen again after the mic paused or was unavailable. */
++  restart: () => void;
+   onListening: (listening: boolean) => void;
+   onFinal: (text: string) => void;
+   disarm: () => void;
+@@ -64,6 +66,24 @@ export function useAeVoiceStart({
+     release();
+   }, [release]);
+ 
++  const onListening = useCallback(
++    (listening: boolean) => {
++      if (!armed) return;
++      if (listening) {
++        everListened.current = true;
++        setPhase("listening");
++      } else setPhase(everListened.current ? "paused" : "unavailable");
++    },
++    [armed],
++  );
++
++  // start() returns early on a mic that is already listening, so no event follows.
++  const reportIfListening = useCallback(() => {
++    if (!controller.current?.isListening()) return;
++    everListened.current = true;
++    setPhase("listening");
++  }, [controller]);
++
+   const toggle = useCallback(() => {
+     if (armed) {
+       disarm();
+@@ -76,18 +96,14 @@ export function useAeVoiceStart({
+     setArmed(true);
+     setPhase("starting");
+     controller.current?.start();
+-  }, [armed, controller, disarm]);
++    // A mic that was already listening fires no event; report it.
++    reportIfListening();
++  }, [armed, controller, disarm, reportIfListening]);
+ 
+-  const onListening = useCallback(
+-    (listening: boolean) => {
+-      if (!armed) return;
+-      if (listening) {
+-        everListened.current = true;
+-        setPhase("listening");
+-      } else setPhase(everListened.current ? "paused" : "unavailable");
+-    },
+-    [armed],
+-  );
++  const restart = useCallback(() => {
++    controller.current?.start();
++    reportIfListening();
++  }, [controller, reportIfListening]);
+ 
+   const onFinal = useCallback(
+     (_text: string) => {
+@@ -114,5 +130,5 @@ export function useAeVoiceStart({
+     [],
+   );
+ 
+-  return { armed, phase, toggle, onListening, onFinal, disarm };
++  return { armed, phase, toggle, restart, onListening, onFinal, disarm };
+ }
+diff --git a/web/src/lib/aeCloudVoice.test.ts b/web/src/lib/aeCloudVoice.test.ts
+index bdc0cd0ac5ca4a7aa2bb4ad0737dc670681e6e47..9bc0d321d2101769ebb4d3ab1e3c7134b8298737 100644
+--- a/web/src/lib/aeCloudVoice.test.ts
++++ b/web/src/lib/aeCloudVoice.test.ts
+@@ -397,6 +397,23 @@ describe("cloud playback refused by the browser", () => {
+     expect(speaker.speaking()).toBe(false);
+   });
+ 
++  it("a late refusal after stop does not mark blocked again", async () => {
++    const device = new FakeDevice();
++    const speaker = createCloudSpeaker(device);
++    speaker.speak(sentence("a"), OPTS);
++    await settle();
++    let reject: (e: unknown) => void = () => {};
++    FakeAudio.plays.push(new Promise<void>((_, r) => {
++      reject = r;
++    }));
++    pending[0].resolve(mp3());
++    await settle();
++    speaker.stop();
++    reject(Object.assign(new Error("x"), { name: "NotAllowedError" }));
++    await settle();
++    expect(isPlaybackBlocked()).toBe(false);
++  });
++
+   it("another play error still falls back to the device", async () => {
+     const device = new FakeDevice();
+     const speaker = createCloudSpeaker(device);
+diff --git a/web/src/lib/aeCloudVoice.ts b/web/src/lib/aeCloudVoice.ts
+index 42ffe340d0a6bd13cfbce2f43809c391f79d46fd..1b51924ff0c8c1f948d018e37546ae20c8685e23 100644
+--- a/web/src/lib/aeCloudVoice.ts
++++ b/web/src/lib/aeCloudVoice.ts
+@@ -182,6 +182,8 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+       logVoice("play start");
+       // A refused play() is not a failure: the item stays current until a tap plays it again.
+       const refuse = (e: unknown): boolean => {
++        // A late rejection after stop() must not mark blocked again with a dead resume.
++        if (settled) return true;
+         const name = (e as { name?: string } | null)?.name;
+         if (name !== "NotAllowedError") {
+           logVoice("play error", String(name));
+diff --git a/web/src/lib/aeComposerTight.test.tsx b/web/src/lib/aeComposerTight.test.tsx
+index 897da3780716e4872ba0c48694cfc684214fbdee..3af6a398fba300850161b047816e6b42f0acf2e3 100644
+--- a/web/src/lib/aeComposerTight.test.tsx
++++ b/web/src/lib/aeComposerTight.test.tsx
+@@ -116,7 +116,7 @@ describe("the Voice sheet variant", () => {
+     render(
+       <div className="group/composer-card" {...(sheet ? { "data-ae-voice-sheet": "" } : {})}>
+         <div aria-label="Input" className={VOICE_SHEET_HIDE} />
+-        <div aria-label="Actions" className={`flex ${VOICE_SHEET_HIDE}`} />
++        <div aria-label="Actions" className="flex" />
+       </div>,
+     );
+     const shown = (name: string) =>
+@@ -124,8 +124,8 @@ describe("the Voice sheet variant", () => {
+     return { input: shown("Input"), actions: shown("Actions") };
+   }
+ 
+-  it("hides the input and the actions when the card carries data-ae-voice-sheet", () => {
+-    expect(card(true)).toEqual({ input: false, actions: false });
++  it("hides the input but keeps the actions when the card carries data-ae-voice-sheet", () => {
++    expect(card(true)).toEqual({ input: false, actions: true });
+   });
+ 
+   it("shows them otherwise", () => {
+diff --git a/web/src/lib/aeVoiceLog.test.ts b/web/src/lib/aeVoiceLog.test.ts
+index 3b4364bc1d267e3085b426d9f799deafb55fcac1..212ffebb41eab96e06e9511e982679aa74b935e2 100644
+--- a/web/src/lib/aeVoiceLog.test.ts
++++ b/web/src/lib/aeVoiceLog.test.ts
+@@ -60,4 +60,12 @@ describe("voice log", () => {
+     act(() => requestVoiceLogInsert());
+     expect(setValue).toHaveBeenLastCalledWith(expect.stringMatching(/^draft\n\nVoice log /));
+   });
++
++  it("puts the log before a draft that is a slash command", () => {
++    logVoice("voice on");
++    const setValue = vi.fn();
++    renderHook(() => useVoiceLogInsert("  /review the diff", setValue));
++    act(() => requestVoiceLogInsert());
++    expect(setValue).toHaveBeenLastCalledWith(expect.stringMatching(/^Voice log [\s\S]*\n\n {2}\/review the diff$/));
++  });
+ });
+diff --git a/web/src/lib/aeVoiceLog.ts b/web/src/lib/aeVoiceLog.ts
+index 7c7584fd8300d71c3e9be22aa3eaf40cf5bbb86b..4e5841c44374014ccaddebcce8d057586c30e29e 100644
+--- a/web/src/lib/aeVoiceLog.ts
++++ b/web/src/lib/aeVoiceLog.ts
+@@ -59,7 +59,10 @@ export function useVoiceLogInsert(value: string, setValue: (next: string) => voi
+       const text = (e as CustomEvent<{ text: string }>).detail?.text;
+       if (!text) return;
+       const current = valueRef.current;
+-      setRef.current(current ? `${current}\n\n${text}` : text);
++      // A slash command takes what follows as arguments, so the log goes before it.
++      if (!current) setRef.current(text);
++      else if (current.trimStart().startsWith("/")) setRef.current(`${text}\n\n${current}`);
++      else setRef.current(`${current}\n\n${text}`);
+     };
+     window.addEventListener(INSERT_EVENT, onInsert);
+     return () => window.removeEventListener(INSERT_EVENT, onInsert);
+diff --git a/web/src/lib/aeVoiceMode.test.ts b/web/src/lib/aeVoiceMode.test.ts
+index 9e0563c368366bd417d3e048a5a233be1a8dac94..8752c603a5edbbb3b414cc6e9aafdd5994024282 100644
+--- a/web/src/lib/aeVoiceMode.test.ts
++++ b/web/src/lib/aeVoiceMode.test.ts
+@@ -227,6 +227,18 @@ describe("caption, blocked and stop", () => {
+   });
+ });
+ 
++describe("turning Voice off", () => {
++  it("calls the registered stop; turning on does not", () => {
++    const stop = vi.fn();
++    const off = registerVoiceStop("c1", stop);
++    setVoiceOn("c1", true);
++    expect(stop).not.toHaveBeenCalled();
++    setVoiceOn("c1", false);
++    expect(stop).toHaveBeenCalledTimes(1);
++    off();
++  });
++});
++
+ describe("arming the next chat", () => {
+   afterEach(() => disarmVoiceForNextChat());
+ 
+diff --git a/web/src/lib/aeVoiceMode.ts b/web/src/lib/aeVoiceMode.ts
+index 823b93d1be6b5855ebcee04f1ca73af6fc63c194..69e769a7ad752b4a7991c34af6b1d351c0158e31 100644
+--- a/web/src/lib/aeVoiceMode.ts
++++ b/web/src/lib/aeVoiceMode.ts
+@@ -168,6 +168,8 @@ export function setVoiceOn(chatId: string, on: boolean): void {
+   writeVoiceMode(chatId, on);
+   patch(chatId, { on, phase: on ? "starting" : "off", barged: false });
+   void postVoiceLabel(chatId, on);
++  // End clears a refused reply and the queue through the speakers' stop().
++  if (!on) stopVoice(chatId);
+ }
+ 
+ export function setVoicePhase(chatId: string, phase: VoicePhase): void {
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 2c4266cbe1d52a457bfbd3ef851e28077848a4cd..34d3b4a9983a545fdb3ee060125fd3e794d8ab82 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -3828,6 +3828,7 @@ function ComposerImpl(
+                     resumePlayback();
+                   }}
+                   onKeyboard={voiceSheet ? voiceTyping.startTyping : undefined}
++                  onRestartMic={() => micController.current?.start()}
+                 />
+               ) : null}
+               {/* Slash-command suggestions — floats above the composer box */}
+diff --git a/web/src/shell/NewChatDialog.tsx b/web/src/shell/NewChatDialog.tsx
+index 151b11c96d321b05fd890fabc187eaf0589cb7c9..23c39a0e7439c38924bc1db290992359261a42b4 100644
+--- a/web/src/shell/NewChatDialog.tsx
++++ b/web/src/shell/NewChatDialog.tsx
+@@ -5428,6 +5428,8 @@ export function NewChatLandingScreen() {
+     // and form-submit paths that call this directly can't create a session with
+     // a blank message, host, agent, or workspace.
+     if (!canSubmit) return;
++    // Read the arm flag now: the landing unmounts (and clears it) when the temp chat opens.
++    const voiceRequested = takeVoiceArm();
+     // A create is actually happening: report it for pointer clicks (via the
+     // form submit) and Enter-key sends alike. After the guard so guarded no-ops
+     // don't emit, matching the disabled Start button.
+@@ -5657,7 +5659,7 @@ export function NewChatLandingScreen() {
+           metadata as Parameters<typeof createBundledSession>[1],
+         );
+         data = { id: bundled.id };
+-        if (takeVoiceArm()) setVoiceOn(data.id, true);
++        if (voiceRequested) setVoiceOn(data.id, true);
+         // Register create_session for the custom-agent (bundled) path too —
+         // otherwise both sandbox and computer bundled creates emit nothing. Split
+         // by the picked host; interactionTelemetry completes/settles the span.
+@@ -5861,7 +5863,7 @@ export function NewChatLandingScreen() {
+           return;
+         }
+         data = { id: created.id };
+-        if (takeVoiceArm()) setVoiceOn(data.id, true);
++        if (voiceRequested) setVoiceOn(data.id, true);
+         // Register create_session (created → first AI activity), split by host.
+         // New Chat is the only create path that can produce a managed sandbox;
+         // interactionTelemetry completes/settles the span once the session runs.
+@@ -6683,6 +6685,7 @@ export function NewChatLandingScreen() {
+                         onEnd={voiceStart.disarm}
+                         onStop={() => {}}
+                         onResume={() => {}}
++                        onRestartMic={voiceStart.restart}
+                       />
+                     ) : null}
+                     {/* Skill suggestions — floats above the composer box. */}

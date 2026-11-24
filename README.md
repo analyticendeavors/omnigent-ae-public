@@ -236,7 +236,7 @@ config/server.yaml        the server config that loads the AE layer (policy_modu
 config/*.env.example      every variable the server (server.env.example) and the box host (host.env.example) read; the box copies them to config/*.env, gitignored
 scripts/                  fork-push (leak scan, then push to the public fork), check-lock, apply-patches, export-patches, rebase-patches, sync-upstream, next-release-tag, regen-golden-note, port-triage-fixtures, backfill-triage-notes, claude-effort-defaults, seed-schedules, leak-scan (with leak-allowlist.txt and the hooks/pre-push hook; docs/LEAK-SCAN.md), ae-health, docs-coverage (plus _lib.sh)
 justfile                  every command in one place; CI calls the same recipes
-deploy/                   the box: Dockerfile (stage 2 of the image), docker-compose.override.yml, compose.sh, auto-update.sh, systemd/ (four units, plus the auto-update and plan limits timers under user/), ae-limits-statusline.sh, pull-secrets.sh, backup-omnigent.sh, install-host.sh, host-container.sh and host-container/ (the second user's host), host-relink.sh, README.md (the deploy guide)
+deploy/                   the box: Dockerfile (stage 2 of the image), docker-compose.override.yml, compose.sh, auto-update.sh, systemd/ (four units, plus the auto-update and plan limits timers under user/), ae-limits-statusline.sh, ae-usage-login.sh (signs an idle Claude account in for the usage read), pull-secrets.sh, backup-omnigent.sh, install-host.sh, host-container.sh and host-container/ (the second user's host), host-relink.sh, README.md (the deploy guide)
 tests/deploy/             what a machine with no Docker daemon and no systemd can prove about deploy/ and the release workflow (run by `just test`)
 ruff.toml                 the package rule set for tests/ and scripts/ae-health.py
 docs/LABELS.md            the ae.* session label vocabulary
@@ -248,7 +248,7 @@ docs/CHANGELOG.md         the history, newest first
 docs/design/              design notes (dashboard-review.md)
 docs/features/            the feature gallery: one page per area, each feature with its clip or screenshot, where to find it, and the core patch or package that builds it
 docs/media/               the gallery's animated WebP clips, screenshots and the README banner, cut from renders of the fork's real UI on made-up data
-.github/workflows/        ci.yml (patches, upstream-smoke, python, web, image, rules, leaks) leak-pr.yml (the `leaks` check of a pull request, re-run on edits and on the allowlist approval label) fork-backstop.yml (hourly scan of the public fork's branches) image.yml (publish on an ae-v* tag), release.yml (tag main after green CI) and patch-rebase.yml (rebase open patch PRs after a merge)
+.github/workflows/        ci.yml (patches, upstream-smoke, python, web, image, rules, leaks) leak-pr.yml (the `leaks` check of a pull request, re-run on edits and on the allowlist approval label) fork-backstop.yml (hourly scan of the public fork's branches) image.yml (publish on an ae-v* tag), release.yml (tag main after green CI, or at once when a merge matches its tested PR head) and patch-rebase.yml (rebase open patch PRs after a merge)
 CLAUDE.md                 rules for Claude sessions here, plus the managed branch-discipline block
 ```
 
@@ -369,7 +369,7 @@ reachability checks and the known gaps) is "Second user's host (container)" in
 |---|---|
 | `patches` | the committed `patches/` match a fresh export, and the series applies onto the pristine tag and reproduces the fork branch tree |
 | `upstream-smoke` | upstream's `tests/policies` and `tests/extensions` pass in the pinned tree, plus `tests/server/test_item_observers.py`, the suite patch P3 adds |
-| `python` | `just lint`, `just test` and `just ext-doctor`: both AE packages against the pinned tree, on upstream's fixtures (the MCP server over the memory transport and a real stdio subprocess, the agent YAMLs through upstream's loader, the schedule seed against the app with the agents registered); `tests/deploy` over the compose override (`docker compose config` on the merged files), the systemd units, the scripts (`bash -n`, shellcheck), `image.yml` and `release.yml` (the repo's standards, actionlint) and the release tag decision in `scripts/next-release-tag.sh`; the extension installs and its bundle resolves |
+| `python` | `just lint`, `just test` and `just ext-doctor`: both AE packages against the pinned tree, on upstream's fixtures (the MCP server over the memory transport and a real stdio subprocess, the agent YAMLs through upstream's loader, the schedule seed against the app with the agents registered); `tests/deploy` over the compose override (`docker compose config` on the merged files), the systemd units, the scripts (`bash -n`, shellcheck), `image.yml` and `release.yml` (the repo's standards, actionlint), the release tag decision in `scripts/next-release-tag.sh` and the fast-path check in `scripts/tree-match-release.sh`; the extension installs and its bundle resolves |
 | `web` | `just web-lint`, `just web-test` and `just ext-build`: upstream's web workspace, patches applied, passes its own lint and type-check, the vitest suites the patch series adds or touches are green, and the Parking Lot page's committed bundle matches a fresh build (node 22, pnpm 11.15.1 pinned). The vitest suites ran as four parallel jobs from 2026-10-20 to 2026-11-01; each repeated the install and cost more billed minutes than it saved |
 | `image` | the two-stage image builds; `omni --version` prints the pinned version; the extension catalog lists `analyticendeavors.parking-lot` and `doctor` resolves its bundle; both AE packages import; the agent specs are at `/opt/ae/agents` |
 | `rules` | the managed block in `CLAUDE.md` matches its source in ae-claude-skills |
@@ -411,7 +411,21 @@ exception), so the job then runs `gh workflow run image.yml --ref <tag> -f
 push=true` itself. By hand, `workflow_dispatch` on `main` makes the same decision
 after checking CI is green on the tip; `force: true` tags it even when only docs or
 tests changed, to ship or re-ship on purpose. Permissions: `contents: write` for the
-tag, `actions: write` for the dispatch; no secret.
+tag, `actions: write` for the dispatch, `checks: read` and `pull-requests: read` for
+the fast path below; no secret.
+
+The fast path (2026-11-10): the push to `main` also starts the workflow, and
+`scripts/tree-match-release.sh` asks whether the pushed commit is a pull request's
+squash with exactly the PR head's tree, whose newest CI run (`pull_request`) passed
+and tested exactly that tree, and whose `leaks` check passed. A pull request run
+tests GitHub's merge of the head into the base as it stood then, so CI's patches job
+records that tree as a `tested-tree` notice annotation ("Record the tested tree"),
+and the script compares it. If so, the same tag decision runs at once instead of after
+CI on `main`, which could only repeat what the PR's run proved; that saves 3.5 to 7
+minutes on the box runners. A PR merged after `main` moved on has a different tree
+and releases after CI as before (10 of the last 20 merges matched when this was
+written). CI on `main` still runs either way, and its release run finds the commit
+tagged.
 
 `.github/workflows/patch-rebase.yml` (2026-10-20) keeps open patch PRs current. Each
 patch PR claims the next patch number when it is written, so once one merges, every

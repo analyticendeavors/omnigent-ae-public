@@ -1,0 +1,487 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:19:24 -0800
+Subject: [PATCH 373/443] [ae-patch] Fix the review findings on 0372: prompt
+ edge before same-poll items, no flip on replays, every interrupt clears, flag
+ expires (0373)
+
+---
+ omnigent/harnesses/claude_native/forwarder.py |  52 ++++++++-
+ omnigent/server/ae_prompt_running.py          |  23 ++--
+ omnigent/server/routes/_sessions/helpers.py   |  14 +++
+ .../server/routes/_sessions/orchestration.py  |   4 +
+ .../server/routes/sessions/routes_events.py   |  28 +----
+ .../claude_native/forwarder/test_status.py    | 100 ++++++++++++++++++
+ tests/server/test_ae_prompt_running.py        |  53 ++++++++++
+ 7 files changed, 239 insertions(+), 35 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index d9476bdb716235fcae69965f55f80f27b5124e0b..f535d2ba1b95802efdb9786144d00dee050da405 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -27,13 +27,13 @@ from omnigent.harnesses.claude_native.ae_pane_progress import (
+     clear_progress_on_rotation,
+     relay_progress,
+ )
++from omnigent.harnesses.claude_native.ae_prompt_edge import post_prompt_edge
+ from omnigent.harnesses.claude_native.ae_prompt_suggest import (
+     SuggestionState,
+     cancel_prompt_suggestion,
+     clear_prompt_suggestion,
+     schedule_prompt_suggestion,
+ )
+-from omnigent.harnesses.claude_native.ae_prompt_edge import post_prompt_edge
+ from omnigent.harnesses.claude_native.ae_subagent_model import report_subagent_model
+ from omnigent.harnesses.claude_native.ae_transcript_tokens import TranscriptTokenTally
+ from omnigent.harnesses.claude_native.bridge import (
+@@ -897,6 +897,7 @@ class _ForwardDedupeState:
+     # ``[System: scheduled prompt fired]`` marker (see the bridge parser).
+     pending_settled_response_id: str | None = None
+     settled_response_id: str | None = None
++    prompt_edge_cursors: set[int] = field(default_factory=set)
+     # Failed cost posts are retried by this long-running poll loop. Without a
+     # retry gate, an edge 429 turns the poll interval into a request storm and
+     # prevents the limiter from recovering.
+@@ -1495,6 +1496,12 @@ async def forward_claude_transcript_to_session(
+                         # the same poll would lose the boundary. Cursor-keyed, so
+                         # the main hook phase below does not re-mint.
+                         await _prescan_precompact_edges(bridge_dir, hook_state)
++                        # The turn's prompt edge must reach the server before this
++                        # poll's transcript items, or its first tool call finds no
++                        # open prompt and the chat stays idle.
++                        await _prescan_prompt_edges(
++                            client, current_session_id, bridge_dir, hook_state, dedupe
++                        )
+                         state = await _forward_available_items(
+                             client=client,
+                             session_id=current_session_id,
+@@ -4083,7 +4090,10 @@ async def _forward_available_status_events(
+                 record, parent_claude_session_ids=parent_claude_session_ids
+             ):
+                 await clear_prompt_suggestion(client, state=dedupe.prompt_suggest)
+-                await post_prompt_edge(client, session_id)
++                if record.event_cursor in dedupe.prompt_edge_cursors:
++                    dedupe.prompt_edge_cursors.discard(record.event_cursor)
++                else:
++                    await post_prompt_edge(client, session_id)
+                 with contextlib.suppress(Exception):
+                     # This proves Claude saw a submit; later hooks can still block the turn.
+                     _logger.info(
+@@ -5185,6 +5195,44 @@ async def _prescan_precompact_edges(
+         )
+ 
+ 
++async def _prescan_prompt_edges(
++    client: httpx.AsyncClient,
++    session_id: str,
++    bridge_dir: Path,
++    hook_state: HookForwardState | None,
++    dedupe: _ForwardDedupeState,
++) -> None:
++    """
++    Post this poll's main-session ``UserPromptSubmit`` edges before its transcript items.
++
++    Items run before hooks within a poll, so a turn's first tool call could reach the
++    server before its prompt edge. Each posted cursor is recorded on *dedupe* so the
++    hook phase does not post it again. The hook cursor is not advanced.
++
++    :param client: Omnigent HTTP client.
++    :param session_id: Omnigent session/conversation id.
++    :param bridge_dir: Native Claude bridge directory.
++    :param hook_state: Current hook cursor, or ``None`` before it is seeded.
++    :param dedupe: Per-session baseline holding the posted prompt-edge cursors.
++    :returns: None.
++    """
++    if hook_state is None:
++        return
++    result = await asyncio.to_thread(_read_hook_events_for_state, bridge_dir, hook_state)
++    parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
++    for record in result.records:
++        if record.event_name != "UserPromptSubmit" or _is_subagent_hook_record(
++            record, parent_claude_session_ids=parent_claude_session_ids
++        ):
++            continue
++        if record.event_cursor in dedupe.prompt_edge_cursors:
++            continue
++        if len(dedupe.prompt_edge_cursors) > 1000:
++            dedupe.prompt_edge_cursors.clear()
++        dedupe.prompt_edge_cursors.add(record.event_cursor)
++        await post_prompt_edge(client, session_id)
++
++
+ def _validated_hook_state(
+     bridge_dir: Path,
+     state: HookForwardState,
+diff --git a/omnigent/server/ae_prompt_running.py b/omnigent/server/ae_prompt_running.py
+index adb299d24da87b52dfabaae7bc9eb2223df4d1c0..c81738c937437d96d5cea67bc4569f7269108d8f 100644
+--- a/omnigent/server/ae_prompt_running.py
++++ b/omnigent/server/ae_prompt_running.py
+@@ -13,19 +13,26 @@ never leaves a stuck spinner.
+ from __future__ import annotations
+ 
+ import threading
++import time
+ from collections import OrderedDict
++from collections.abc import Callable
+ 
+ # Most sessions remembered at once; the oldest is dropped past this.
+ MAX_TRACKED_SESSIONS = 1024
+ 
++# A prompt open longer than this is dropped: a hook-blocked prompt must not be
++# taken by an unrelated item much later.
++OPEN_PROMPT_TTL_S = 600.0
++
+ _lock = threading.Lock()
+-_open: OrderedDict[str, None] = OrderedDict()
++_open: OrderedDict[str, float] = OrderedDict()
++_clock: Callable[[], float] = time.monotonic
+ 
+ 
+ def note_prompt(session_id: str) -> None:
+     """Remember that a prompt opened a turn for *session_id*."""
+     with _lock:
+-        _open[session_id] = None
++        _open[session_id] = _clock()
+         _open.move_to_end(session_id)
+         while len(_open) > MAX_TRACKED_SESSIONS:
+             _open.popitem(last=False)
+@@ -38,9 +45,10 @@ def note_turn_end(session_id: str) -> None:
+ 
+ 
+ def take_if_open(session_id: str) -> bool:
+-    """Return ``True`` once if a prompt is open, and clear it."""
++    """Return ``True`` once if a fresh prompt is open, and clear it."""
+     with _lock:
+-        return _open.pop(session_id, "absent") is None
++        opened = _open.pop(session_id, None)
++        return opened is not None and _clock() - opened <= OPEN_PROMPT_TTL_S
+ 
+ 
+ def is_real_work(item_type: str, role: str | None = None) -> bool:
+@@ -48,14 +56,17 @@ def is_real_work(item_type: str, role: str | None = None) -> bool:
+     return item_type == "function_call" or (item_type == "message" and role == "assistant")
+ 
+ 
+-def reset() -> None:
+-    """Drop all state (tests)."""
++def reset(clock: Callable[[], float] | None = None) -> None:
++    """Drop all state and set the clock (tests)."""
++    global _clock
+     with _lock:
+         _open.clear()
++        _clock = clock or time.monotonic
+ 
+ 
+ __all__ = [
+     "MAX_TRACKED_SESSIONS",
++    "OPEN_PROMPT_TTL_S",
+     "is_real_work",
+     "note_prompt",
+     "note_turn_end",
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 6b4e10575948b7ec9ba9c90e5388ae98989e4bf3..043e24da974cf6baf6a52abd5f4dc6b689a192b8 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -104,6 +104,7 @@ from omnigent.runtime.policies.engine import PolicyEngine
+ from omnigent.runtime.tool_output import cap_tool_output
+ from omnigent.server import (
+     ae_family_prompts,
++    ae_prompt_running,
+     ae_turn_edges,
+     presence,
+     session_live_state,
+@@ -3363,6 +3364,7 @@ async def _persist_external_assistant_message(
+         response_id=response_id,
+         agent_name=agent_name,
+     )
++    _flip_running_on_work(session_id, "message", "assistant")
+     return persisted.id
+ 
+ 
+@@ -5455,6 +5457,17 @@ def _publish_changed_files_invalidated(session_id: str, environment_id: str = "d
+     )
+ 
+ 
++def _flip_running_on_work(session_id: str, item_type: str, role: str | None) -> None:
++    """Publish ``running`` for the first assistant or tool item after an open prompt edge."""
++    if not ae_prompt_running.is_real_work(item_type, role):
++        return
++    if not ae_prompt_running.take_if_open(session_id):
++        return
++    if _session_status_cache.get(session_id) == "running":
++        return
++    _publish_status(session_id, "running")
++
++
+ def _publish_interrupted(session_id: str, response_id: str | None = None) -> None:
+     """
+     Publish a ``session.interrupted`` event to the live stream.
+@@ -5471,6 +5484,7 @@ def _publish_interrupted(session_id: str, response_id: str | None = None) -> Non
+         interrupted turns, e.g. ``"codex_turn_abc123"``.
+     """
+     ae_turn_edges.notify_turn_edge(session_id, "interrupted", response_id=response_id)
++    ae_prompt_running.note_turn_end(session_id)
+     event = SessionInterruptedEvent(
+         type="session.interrupted",
+         data=SessionInterruptedPayload(
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index 7a6d7fe7508483377fa28b141eb85f96b1265ee6..34501b5268c170f8b7e7b2ab797409faad7d2870 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -276,6 +276,7 @@ from omnigent.server.routes._sessions.helpers import (
+     _find_codex_native_subagent_child,
+     _find_devin_native_subagent_child,
+     _find_subagent_child_by_title,
++    _flip_running_on_work,
+     _flush_relay_text,
+     _forward_approval_to_runner,
+     _forward_session_change_to_runner,
+@@ -3199,6 +3200,9 @@ def _publish_persisted_external_item(
+         message_id=message_id if isinstance(message_id, str) else None,
+     )
+     _drive_terminal_resolved_elicitation(session_id, persisted)
++    # Only newly persisted items reach here, so a replayed item never opens the turn.
++    role = getattr(persisted.data, "role", None)
++    _flip_running_on_work(session_id, persisted.type, role if isinstance(role, str) else None)
+ 
+ 
+ async def _persist_external_conversation_items(
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 646c8f912c2e559626db1648286112651e5eeed4..760f5e8d68cefe9d53f88fef35076f5515dc5a89 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -346,17 +346,6 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
+ )
+ 
+ 
+-def _flip_running_on_work(session_id: str, item_type: str, role: str | None) -> None:
+-    """Publish ``running`` for the first assistant or tool item after an open prompt edge."""
+-    if not ae_prompt_running.is_real_work(item_type, role):
+-        return
+-    if not ae_prompt_running.take_if_open(session_id):
+-        return
+-    if _session_status_cache.get(session_id) == "running":
+-        return
+-    _publish_status(session_id, "running")
+-
+-
+ def _is_batchable_external_item(event: SessionEventInput) -> bool:
+     """
+     Whether a batch entry can skip :func:`_post_event_impl` and be appended
+@@ -817,18 +806,10 @@ def register_events_routes(
+                         continue
+                     await _authorized_conversation(request, session_id)
+                     add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
+-                    run_events = list(run)
+                     item_ids = await _persist_external_conversation_items(
+-                        session_id, run_events, conversation_store
++                        session_id, list(run), conversation_store
+                     )
+                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
+-                    for event in run_events:
+-                        item_data = event.data.get("item_data")
+-                        _flip_running_on_work(
+-                            session_id,
+-                            str(event.data.get("item_type")),
+-                            item_data.get("role") if isinstance(item_data, dict) else None,
+-                        )
+                 return acks
+             return await _post_event_impl(
+                 request,
+@@ -1841,7 +1822,6 @@ def register_events_routes(
+                 body,
+                 conversation_store,
+             )
+-            _flip_running_on_work(session_id, "message", "assistant")
+             return {"queued": False, "item_id": item_id}
+         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+             item_id = await _persist_external_conversation_item(
+@@ -1853,12 +1833,6 @@ def register_events_routes(
+                 background_title_coordinator=background_title_coordinator,
+                 enabled=background_session_titles_enabled(request.headers),
+             )
+-            item_data = body.data.get("item_data")
+-            _flip_running_on_work(
+-                session_id,
+-                str(body.data.get("item_type")),
+-                item_data.get("role") if isinstance(item_data, dict) else None,
+-            )
+             return {"queued": False, "item_id": item_id}
+         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
+             _publish_external_output_text_delta(session_id, body)
+diff --git a/tests/harnesses/claude_native/forwarder/test_status.py b/tests/harnesses/claude_native/forwarder/test_status.py
+index 3f230e5ff53f2bab07de6b7a217b5e2b34c54e0f..422cbc81d6d19e0a24ad6ab47f3daf9f1bdd5b88 100644
+--- a/tests/harnesses/claude_native/forwarder/test_status.py
++++ b/tests/harnesses/claude_native/forwarder/test_status.py
+@@ -870,3 +870,103 @@ async def test_forwarder_does_not_leave_running_open_for_slash_command_only_turn
+         request["data"] for request in requests if request["type"] == "external_conversation_item"
+     ]
+     assert any(item["item_type"] == "slash_command" for item in forwarded)
++
++
++@pytest.mark.asyncio
++async def test_forwarder_posts_the_prompt_edge_before_the_same_poll_items(tmp_path: Path) -> None:
++    """
++    A UserPromptSubmit and the turn's first tool call landing in one poll.
++
++    Items post before hooks within a poll, so without the prompt-edge prescan the
++    function_call reaches the server before the edge and the chat stays idle
++    while the tool runs. The edge is posted once, ahead of every item.
++    """
++    bridge_dir = tmp_path / "bridge"
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text(
++        "\n".join(
++            [
++                json.dumps(
++                    {
++                        "type": "user",
++                        "uuid": "user-1",
++                        "message": {"role": "user", "content": "run it"},
++                    }
++                ),
++                json.dumps(
++                    {
++                        "type": "assistant",
++                        "uuid": "assistant-1",
++                        "message": {
++                            "role": "assistant",
++                            "content": [
++                                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}
++                            ],
++                        },
++                    }
++                ),
++            ]
++        )
++        + "\n",
++        encoding="utf-8",
++    )
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "SessionStart",
++            "session_id": "claude-session",
++            "transcript_path": str(transcript_path),
++        },
++    )
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "UserPromptSubmit", "session_id": "claude-session"},
++    )
++    server, thread, base_url = _start_recording_server()
++    task = asyncio.create_task(
++        forwarder.forward_claude_transcript_to_session(
++            base_url=base_url,
++            headers={},
++            session_id="conv_abc",
++            bridge_dir=bridge_dir,
++            agent_name="claude-native-ui",
++            start_at_end=False,
++            poll_interval_s=0.01,
++        )
++    )
++    bodies: list[dict[str, Any]] = []
++    try:
++        while not any(
++            b.get("type") == "external_conversation_item"
++            and b["data"].get("item_type") == "function_call"
++            for b in bodies
++        ):
++            bodies.append((await asyncio.wait_for(_get_recorded_request(server), 10))["body"])
++        # Let a later poll run so a double post of the edge would show up.
++        await asyncio.sleep(0.3)
++        while True:
++            try:
++                bodies.append((await asyncio.wait_for(_get_recorded_request(server), 0.2))["body"])
++            except TimeoutError:
++                break
++    finally:
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=5.0)
++
++    edges = [
++        i
++        for i, b in enumerate(bodies)
++        if b.get("type") == "external_session_status" and b["data"].get("ae_prompt_edge") is True
++    ]
++    first_call = next(
++        i
++        for i, b in enumerate(bodies)
++        if b.get("type") == "external_conversation_item"
++        and b["data"].get("item_type") == "function_call"
++    )
++    assert len(edges) == 1, f"the prompt edge must post exactly once; got {bodies!r}"
++    assert edges[0] < first_call
+diff --git a/tests/server/test_ae_prompt_running.py b/tests/server/test_ae_prompt_running.py
+index dc7bcea189eeb04076623a7799720fedacd59eee..dee004cb7d1c2130e919b96ed300513d13e9eea2 100644
+--- a/tests/server/test_ae_prompt_running.py
++++ b/tests/server/test_ae_prompt_running.py
+@@ -73,6 +73,20 @@ def test_only_assistant_text_and_tool_calls_are_real_work() -> None:
+     assert not ae_prompt_running.is_real_work("compaction")
+ 
+ 
++def test_an_open_prompt_expires_after_the_limit() -> None:
++    now = [1000.0]
++    ae_prompt_running.reset(clock=lambda: now[0])
++    ae_prompt_running.note_prompt("ttl1")
++    now[0] += ae_prompt_running.OPEN_PROMPT_TTL_S - 1
++    assert ae_prompt_running.take_if_open("ttl1") is True
++
++    ae_prompt_running.note_prompt("ttl2")
++    now[0] += ae_prompt_running.OPEN_PROMPT_TTL_S + 1
++    assert ae_prompt_running.take_if_open("ttl2") is False
++    # The stale entry was dropped, not kept for a later item.
++    assert ae_prompt_running.take_if_open("ttl2") is False
++
++
+ # ---- route ----
+ 
+ 
+@@ -210,3 +224,42 @@ async def test_interrupt_clears_the_open_prompt(client: httpx.AsyncClient) -> No
+     await _prompt(client, sid)
+     await _post(client, sid, {"type": "stop_session", "data": {}})
+     assert ae_prompt_running.take_if_open(sid) is False
++
++
++async def test_a_replayed_item_does_not_flip_and_keeps_the_prompt_open(
++    client: httpx.AsyncClient,
++) -> None:
++    sid = await _session(client, "pr-replay")
++    _session_status_cache[sid] = "idle"
++    # The item is already persisted when the prompt opens (a forwarder retry).
++    await _post(client, sid, _assistant_item("old", "dup1"))
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++
++    await _post(client, sid, _assistant_item("old", "dup1"))
++    assert _session_status_cache.get(sid) == "idle"
++    await _post(client, sid, [_assistant_item("old", "dup1")])
++    assert _session_status_cache.get(sid) == "idle"
++
++    await _post(client, sid, _assistant_item("new", "new1"))
++    assert _session_status_cache.get(sid) == "running"
++
++
++async def test_the_interrupt_route_clears_the_open_prompt(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-int-route")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, {"type": "interrupt", "data": {}})
++    await _post(client, sid, _assistant_item("late", "int1"))
++    assert _session_status_cache.get(sid) == "idle"
++
++
++async def test_an_external_interrupt_event_clears_the_open_prompt(
++    client: httpx.AsyncClient,
++) -> None:
++    sid = await _session(client, "pr-int-ext")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, {"type": "external_session_interrupted", "data": {}})
++    await _post(client, sid, _assistant_item("late", "int2"))
++    assert _session_status_cache.get(sid) == "idle"

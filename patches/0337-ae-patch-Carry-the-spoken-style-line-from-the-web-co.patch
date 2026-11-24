@@ -1,0 +1,433 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 9 Nov 2026 23:32:57 -0800
+Subject: [PATCH 337/443] [ae-patch] Carry the spoken-style line from the web
+ composer gate to the native hook, size the caret for a thumb, and guard an
+ empty prompt
+
+---
+ omnigent/native/native_policy_hook.py         | 16 +++---
+ omnigent/runtime/pending_inputs.py            | 37 +++++++++++++
+ .../server/routes/_sessions/orchestration.py  | 22 ++++++++
+ .../server/routes/sessions/routes_hooks.py    | 14 +++++
+ .../codex_native/test_codex_native_hook.py    |  6 +--
+ tests/runtime/test_pending_inputs.py          | 23 ++++++++
+ ...test_sessions_policy_evaluate_read_only.py | 53 +++++++++++++++++++
+ tests/server/routes/test_sessions_policy.py   | 45 ++++++++++++++++
+ tests/test_native_policy_hook.py              | 18 ++++---
+ .../components/AeSpeakRepliesButton.test.tsx  |  8 +--
+ web/src/components/AeSpeakRepliesButton.tsx   |  2 +-
+ 11 files changed, 221 insertions(+), 23 deletions(-)
+
+diff --git a/omnigent/native/native_policy_hook.py b/omnigent/native/native_policy_hook.py
+index baa97af16ab209bffb2fc05eb5b1517f723cb03a..6e5b193ce35fbd7f2f7d89e3a3cfe080beae66c8 100644
+--- a/omnigent/native/native_policy_hook.py
++++ b/omnigent/native/native_policy_hook.py
+@@ -313,17 +313,14 @@ def hook_payload_to_evaluation_request(
+     """
+     if hook_event == _USER_PROMPT_SUBMIT:
+         # Request-phase gate for native sessions. The server reads REQUEST
+-        # content from ``data.text``; policies read ``data.user_content``.
++        # content from ``data.text`` (see ``_build_evaluation_context``).
+         prompt = payload.get("prompt", "")
+-        prompt_text = prompt if isinstance(prompt, str) else json.dumps(prompt)
+         return {
+             "event": {
+                 "type": "PHASE_REQUEST",
+                 "target": "",
+                 "data": {
+-                    "text": prompt_text,
+-                    "user_content": prompt_text,
+-                    "attachments": [],
++                    "text": prompt if isinstance(prompt, str) else json.dumps(prompt),
+                 },
+                 "context": {},
+             },
+@@ -378,15 +375,15 @@ def _prompt_additional_context(
+         ``{"result": "POLICY_ACTION_ALLOW", "data": {"user_content": "hi\\n\\nbe brief"}}``.
+     :param prompt: The submitted prompt, e.g. ``"hi"``.
+     :returns: ``{"hookSpecificOutput": ...}`` carrying only the appended part,
+-        or ``None`` when there is no data, no prompt, or the policy rewrote
+-        rather than appended.
++        or ``None`` when there is no data, no (or an empty) prompt, or the
++        policy rewrote rather than appended.
+     """
+     data = eval_response.get("data")
+     if isinstance(data, dict):
+         rewritten = data.get("user_content")
+     else:
+         rewritten = data
+-    if not isinstance(rewritten, str) or prompt is None:
++    if not isinstance(rewritten, str) or not prompt:
+         return None
+     if not rewritten.startswith(prompt):
+         print(
+@@ -447,6 +444,9 @@ def evaluation_response_to_hook_output(
+     ALLOW (and the engine's no-match default) returns ``None`` so the prompt
+     proceeds, unless the policy appended text to the prompt (``data``): that
+     appended part is returned as ``hookSpecificOutput.additionalContext``.
++    For a message typed in the web composer the server evaluates policies at
++    ingest, keeps the appended part for the session, and the hook route returns
++    it here as the rewritten prompt (instead of a bare ALLOW).
+     Unlike ``PreToolUse``, there is no separate user-consent gate
+     on a prompt, so ALLOW need not preserve one.
+ 
+diff --git a/omnigent/runtime/pending_inputs.py b/omnigent/runtime/pending_inputs.py
+index 92d1f12c6bb5a74804ce8eb04ada9848fd68912d..c3cbaa3976e538a1d1a4f1084711ba558dd2f281 100644
+--- a/omnigent/runtime/pending_inputs.py
++++ b/omnigent/runtime/pending_inputs.py
+@@ -749,6 +749,42 @@ def resolve_matching_text(
+         )
+ 
+ 
++# One request-context slot per conversation: the text a request-phase policy appended
++# to a web-composer message, kept for the native hook's dedup answer (see routes_hooks).
++_REQUEST_CONTEXT_TTL_S = 600.0
++_request_context: dict[str, tuple[float, str]] = {}
++
++
++def set_request_context(conversation_id: str, text: str) -> None:
++    """
++    Keep the text a request-phase policy appended to a web message.
++
++    The ingest gate drops a policy's rewrite on ALLOW; this slot carries the
++    appended part to the native hook route, which hands it back to the hook.
++    One slot per session, overwritten by a newer call, dropped after 10 minutes.
++
++    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
++    :param text: The appended part, e.g. ``"Voice mode is on: ..."``.
++    """
++    with _lock:
++        _request_context[conversation_id] = (_now(), text)
++
++
++def take_request_context(conversation_id: str) -> str | None:
++    """
++    Return and clear the session's request-context slot.
++
++    :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
++    :returns: The stored text, or ``None`` when the slot is empty or older than
++        10 minutes.
++    """
++    with _lock:
++        entry = _request_context.pop(conversation_id, None)
++        if entry is None or _now() - entry[0] > _REQUEST_CONTEXT_TTL_S:
++            return None
++        return entry[1]
++
++
+ def has_pending(conversation_id: str) -> bool:
+     """
+     Report whether a session still holds an un-consumed message.
+@@ -949,3 +985,4 @@ def reset_for_tests() -> None:
+     """
+     with _lock:
+         _pending.clear()
++        _request_context.clear()
+diff --git a/omnigent/server/routes/_sessions/orchestration.py b/omnigent/server/routes/_sessions/orchestration.py
+index e0a08db02192b21fdf4fc9bfafa30ec62cd39e7f..8c8bbbf700c4704b29a03b5c82a04e18ae018afb 100644
+--- a/omnigent/server/routes/_sessions/orchestration.py
++++ b/omnigent/server/routes/_sessions/orchestration.py
+@@ -9406,6 +9406,27 @@ async def _evaluate_tool_call_policy(
+     }
+ 
+ 
++def _keep_appended_request_text(session_id: str, user_text: str, data: object) -> None:
++    """
++    Remember text a request-phase policy appended to a message, for the native hook.
++
++    A native session's hook re-evaluates the prompt and the hook route answers a
++    web prompt with a bare ALLOW; this slot lets it hand the appended part back.
++    A rewrite that does not start with the original text is ignored.
++
++    :param session_id: Session id, e.g. ``"conv_abc123"``.
++    :param user_text: The message text the policy saw.
++    :param data: The policy's replacement payload (``result.data``), e.g.
++        ``{"user_content": "hi\\n\\nbe brief"}``.
++    """
++    rewritten = data.get("user_content") if isinstance(data, dict) else data
++    if not isinstance(rewritten, str) or not user_text or not rewritten.startswith(user_text):
++        return
++    suffix = rewritten[len(user_text) :].strip()
++    if suffix:
++        pending_inputs.set_request_context(session_id, suffix)
++
++
+ async def _evaluate_input_policy(
+     request: Request,
+     session_id: str,
+@@ -9516,6 +9537,7 @@ async def _evaluate_input_policy(
+     if result.action == PolicyAction.ALLOW:
+         if result.set_labels:
+             await asyncio.to_thread(engine.apply_label_writes, result.set_labels)
++        _keep_appended_request_text(session_id, user_text, result.data)
+         return None
+ 
+     if result.action == PolicyAction.DENY:
+diff --git a/omnigent/server/routes/sessions/routes_hooks.py b/omnigent/server/routes/sessions/routes_hooks.py
+index 37a3eb2cf68c468785c34aa622ebb65885f82613..1e2fbd17ef4c7549153e88347bcfacd1edf043ab 100644
+--- a/omnigent/server/routes/sessions/routes_hooks.py
++++ b/omnigent/server/routes/sessions/routes_hooks.py
+@@ -807,6 +807,20 @@ def register_hooks_routes(
+         # is "is a web prompt in flight", not text correlation (the native
+         # transcript gives no reliable id channel — see ``pending_inputs``).
+         if phase == Phase.REQUEST and pending_inputs.snapshot_for(session_id):
++            # Hand back the text the ingest gate's policies appended, as a rewrite of
++            # the prompt, so the hook can pass it to the model as context.
++            suffix = pending_inputs.take_request_context(session_id)
++            raw = raw_data.get("text") if isinstance(raw_data, dict) else raw_data
++            if suffix and isinstance(raw, str) and raw:
++                return Response(
++                    content=json.dumps(
++                        {
++                            "result": "POLICY_ACTION_ALLOW",
++                            "data": {"user_content": f"{raw}\n\n{suffix}"},
++                        }
++                    ),
++                    media_type="application/json",
++                )
+             return Response(
+                 content=json.dumps({"result": "POLICY_ACTION_ALLOW"}),
+                 media_type="application/json",
+diff --git a/tests/harnesses/codex_native/test_codex_native_hook.py b/tests/harnesses/codex_native/test_codex_native_hook.py
+index 6af43c9f3e59e1d0ffab731e107dfdde8e5b2900..3f65bfdb64f675b1473fa6789be997ad2215c3b4 100644
+--- a/tests/harnesses/codex_native/test_codex_native_hook.py
++++ b/tests/harnesses/codex_native/test_codex_native_hook.py
+@@ -266,11 +266,7 @@ def test_user_prompt_submit_converts_posts_and_blocks(
+     assert exit_code == 0
+     sent = _DenyHttpxClient.captured["json"]
+     assert sent["event"]["type"] == "PHASE_REQUEST"
+-    assert sent["event"]["data"] == {
+-        "text": "delete the prod database",
+-        "user_content": "delete the prod database",
+-        "attachments": [],
+-    }
++    assert sent["event"]["data"] == {"text": "delete the prod database"}
+     # DENY → top-level decision/reason block (not permissionDecision).
+     result = json.loads(captured.out)
+     assert result == {"decision": "block", "reason": "rm blocked by admin policy"}
+diff --git a/tests/runtime/test_pending_inputs.py b/tests/runtime/test_pending_inputs.py
+index ec7605ff76c615a2e8ab33f0a3033463762c95a1..73a4ec2aa1d14b90ae4aa80bc4028e33093be93d 100644
+--- a/tests/runtime/test_pending_inputs.py
++++ b/tests/runtime/test_pending_inputs.py
+@@ -993,3 +993,26 @@ def test_interrupted_entries_expire_with_the_ttl(monkeypatch: pytest.MonkeyPatch
+ 
+     clock["t"] = 1000.0 + pending_inputs._TTL_S + 0.1
+     assert pending_inputs.pending_ids("conv_a") == []
++
++
++def test_request_context_is_taken_once() -> None:
++    """The appended text comes back once, then the slot is empty."""
++    pending_inputs.set_request_context("conv_a", "be brief")
++    assert pending_inputs.take_request_context("conv_a") == "be brief"
++    assert pending_inputs.take_request_context("conv_a") is None
++
++
++def test_request_context_newer_set_replaces_older() -> None:
++    """One slot per session: a newer set overwrites the older text."""
++    pending_inputs.set_request_context("conv_a", "old")
++    pending_inputs.set_request_context("conv_a", "new")
++    assert pending_inputs.take_request_context("conv_a") == "new"
++
++
++def test_request_context_expires_after_ten_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
++    """A slot older than 10 minutes is dropped."""
++    clock = {"t": 1000.0}
++    monkeypatch.setattr(pending_inputs, "_now", lambda: clock["t"])
++    pending_inputs.set_request_context("conv_a", "stale")
++    clock["t"] = 1000.0 + 601.0
++    assert pending_inputs.take_request_context("conv_a") is None
+diff --git a/tests/server/integration/test_sessions_policy_evaluate_read_only.py b/tests/server/integration/test_sessions_policy_evaluate_read_only.py
+index 93396006053faafec9e4681db2421f4aaa65099b..ea681596dff167a4bd83e204fdd09a6a80d83621 100644
+--- a/tests/server/integration/test_sessions_policy_evaluate_read_only.py
++++ b/tests/server/integration/test_sessions_policy_evaluate_read_only.py
+@@ -491,3 +491,56 @@ async def test_request_phase_gate_runs_when_the_only_queued_web_prompt_was_inter
+     # The gate was entered at the REQUEST phase and its decline applied.
+     assert held.get("phase") == Phase.REQUEST
+     assert resp.json()["result"] == "POLICY_ACTION_DENY"
++
++
++async def test_request_phase_dedup_returns_the_text_the_ingest_gate_appended(
++    auth_client: httpx.AsyncClient,
++    db_uri: str,
++) -> None:
++    """
++    With a web prompt in flight and a kept request context, the answer is the
++    rewritten prompt, so the native hook can pass the appended part on.
++    """
++    from omnigent.runtime import pending_inputs
++
++    agent = await create_test_agent(auth_client, user=OWNER)
++    session_id = await _create_session_as(auth_client, OWNER, agent["id"])
++    pending_inputs.record(session_id, [{"type": "input_text", "text": "hello"}])
++    pending_inputs.set_request_context(session_id, "Speak plainly.")
++    try:
++        resp = await auth_client.post(
++            f"/v1/sessions/{session_id}/policies/evaluate",
++            json=_request_request("hello"),
++            headers={"X-Forwarded-Email": OWNER},
++        )
++    finally:
++        pending_inputs.reset_for_tests()
++
++    assert resp.status_code == 200, resp.text
++    assert resp.json() == {
++        "result": "POLICY_ACTION_ALLOW",
++        "data": {"user_content": "hello\n\nSpeak plainly."},
++    }
++
++
++async def test_request_phase_dedup_without_request_context_is_a_bare_allow(
++    auth_client: httpx.AsyncClient,
++    db_uri: str,
++) -> None:
++    """With no kept request context the dedup answer carries no ``data``."""
++    from omnigent.runtime import pending_inputs
++
++    agent = await create_test_agent(auth_client, user=OWNER)
++    session_id = await _create_session_as(auth_client, OWNER, agent["id"])
++    pending_inputs.record(session_id, [{"type": "input_text", "text": "hello"}])
++    try:
++        resp = await auth_client.post(
++            f"/v1/sessions/{session_id}/policies/evaluate",
++            json=_request_request("hello"),
++            headers={"X-Forwarded-Email": OWNER},
++        )
++    finally:
++        pending_inputs.reset_for_tests()
++
++    assert resp.status_code == 200, resp.text
++    assert resp.json() == {"result": "POLICY_ACTION_ALLOW"}
+diff --git a/tests/server/routes/test_sessions_policy.py b/tests/server/routes/test_sessions_policy.py
+index 1856c687cf62cbbecea1829b0569a0c12d6294fe..d2a7e82efd4f75a1bb75a380f070cc887ac004dc 100644
+--- a/tests/server/routes/test_sessions_policy.py
++++ b/tests/server/routes/test_sessions_policy.py
+@@ -546,6 +546,51 @@ async def test_input_allow_verdict():
+     assert result is None
+ 
+ 
++@pytest.mark.asyncio
++@pytest.mark.parametrize(
++    ("data", "expected"),
++    [
++        ({"user_content": "hello tell me about canada\n\nSpeak plainly."}, "Speak plainly."),
++        ("hello tell me about canada\n\nSpeak plainly.", "Speak plainly."),
++        ({"user_content": "something else entirely"}, None),
++        (None, None),
++    ],
++)
++async def test_input_allow_keeps_only_an_appended_rewrite(data: Any, expected: str | None):
++    """ALLOW with an appended rewrite stores the suffix for the hook; else nothing."""
++    from omnigent.runtime import pending_inputs
++
++    pending_inputs.reset_for_tests()
++    conv_store = _FakeConversationStore()
++    agent_store = _FakeAgentStore(agent=_make_agent())
++    conv = conv_store.get_conversation("sess_1")
++    body = _make_user_message_body()
++    loaded = LoadedAgent(spec=_make_spec_with_guardrails(), workdir="/tmp/fake")
++    allow_result = PolicyResult(action=PolicyAction.ALLOW, data=data)
++
++    async def _eval(_ctx: Any) -> PolicyResult:
++        return allow_result
++
++    try:
++        with (
++            patch(_CACHE_PATCH) as mock_cache,
++            patch(_ENGINE_PATCH) as mock_build,
++        ):
++            mock_cache.return_value.load.return_value = loaded
++            mock_engine = mock_build.return_value
++            mock_engine.evaluate = _eval
++            mock_engine.apply_label_writes = lambda x: None
++
++            result = await _evaluate_input_policy(
++                _FakeRequest(), "sess_1", conv, body, conv_store, agent_store, None
++            )
++
++        assert result is None
++        assert pending_inputs.take_request_context("sess_1") == expected
++    finally:
++        pending_inputs.reset_for_tests()
++
++
+ @pytest.mark.asyncio
+ async def test_input_deny_verdict():
+     """INPUT policy evaluation returns deny when the engine DENYs."""
+diff --git a/tests/test_native_policy_hook.py b/tests/test_native_policy_hook.py
+index abd09df74af7ad75ab212f53842916330cc00ee3..381b9e62020129c14bc7dc9b875516eb42b0a201 100644
+--- a/tests/test_native_policy_hook.py
++++ b/tests/test_native_policy_hook.py
+@@ -254,11 +254,7 @@ def test_user_prompt_submit_maps_to_phase_request() -> None:
+     assert result is not None
+     event = result["event"]
+     assert event["type"] == "PHASE_REQUEST"
+-    assert event["data"] == {
+-        "text": "delete the prod database",
+-        "user_content": "delete the prod database",
+-        "attachments": [],
+-    }
++    assert event["data"] == {"text": "delete the prod database"}
+     # A context dict must exist so the per-harness hook can stamp model/harness.
+     assert event["context"] == {}
+ 
+@@ -272,7 +268,7 @@ def test_user_prompt_submit_missing_prompt_yields_empty_text() -> None:
+     """
+     result = hook_payload_to_evaluation_request("UserPromptSubmit", {})
+     assert result is not None
+-    assert result["event"]["data"] == {"text": "", "user_content": "", "attachments": []}
++    assert result["event"]["data"] == {"text": ""}
+ 
+ 
+ @pytest.mark.parametrize("action", ["POLICY_ACTION_DENY", "POLICY_ACTION_ASK"])
+@@ -363,6 +359,16 @@ def test_user_prompt_submit_rewrite_not_prefixed_by_prompt_returns_none(
+     assert "rewrote the prompt" in capsys.readouterr().err
+ 
+ 
++def test_user_prompt_submit_empty_prompt_never_injects_the_rewrite() -> None:
++    """An empty prompt would prefix-match anything; no context comes back."""
++    output = evaluation_response_to_hook_output(
++        "UserPromptSubmit",
++        {"result": "POLICY_ACTION_ALLOW", "data": {"user_content": "anything"}},
++        prompt="",
++    )
++    assert output is None
++
++
+ def test_user_prompt_submit_deny_ignores_data() -> None:
+     """DENY still blocks, whatever ``data`` carries."""
+     output = evaluation_response_to_hook_output(
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 41905f4bc9f3a314dfd30395eec777cbe0586a7d..0d30ac949cbe692def804ae91608d73c27c52a66 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -382,11 +382,13 @@ describe("AeSpeakRepliesButton", () => {
+       delete (HTMLMediaElement.prototype as { setSinkId?: unknown }).setSinkId;
+     });
+ 
+-    it("gives the menu caret a 44 px hit area on coarse pointers", async () => {
++    it("gives the menu caret a real 44 px box on coarse pointers", async () => {
+       renderButton();
+       const trigger = screen.getByTestId("ae-speak-replies-menu");
+-      expect(trigger.className).toContain("pointer-coarse:before:-inset-x-3.5");
+-      expect(trigger.className).toContain("pointer-coarse:before:-inset-y-2");
++      for (const cls of ["pointer-coarse:h-11", "pointer-coarse:w-11", "pointer-coarse:ml-0"]) {
++        expect(trigger.className).toContain(cls);
++      }
++      expect(trigger.className).not.toContain("before:");
+     });
+ 
+     it("renders both rows under Speed and saves a pick", async () => {
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index c8a2948f71e63b0f18f876bc72fcb3215021faf7..486d1c9c6f7f00f450164ba61b81e7b10a55f00d 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -430,7 +430,7 @@ function SpeakRepliesControl({
+           type="button"
+           size="icon"
+           variant="ghost"
+-          className="relative -ml-1 h-7 w-4 text-muted-foreground pointer-coarse:before:absolute pointer-coarse:before:-inset-x-3.5 pointer-coarse:before:-inset-y-2 pointer-coarse:before:content-['']"
++          className="-ml-1 h-7 w-4 text-muted-foreground pointer-coarse:ml-0 pointer-coarse:h-11 pointer-coarse:w-11"
+           aria-label="Speak replies menu"
+           data-testid="ae-speak-replies-menu"
+           disabled={disabled}

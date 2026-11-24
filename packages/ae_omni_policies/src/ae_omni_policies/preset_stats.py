@@ -259,6 +259,7 @@ def run_from_line(line: Mapping[str, Any]) -> dict[str, Any]:
     changes = [c for c in (line.get("model_changes") or []) if isinstance(c, dict)]
     rule = _num(line.get("hang_rule")) or 0
     hung = [_role_name(a) for a in agents if a.get("hung")] if rule >= MIN_HANG_RULE else []
+    review = line.get("review") if isinstance(line.get("review"), dict) else {}
     return {
         "session": line.get("session"),
         "title": line.get("title") or "",
@@ -277,6 +278,9 @@ def run_from_line(line: Mapping[str, Any]) -> dict[str, Any]:
         "step_downs": sum(1 for c in changes if c.get("kind") == "lower"),
         "model_changes": [_change_text(c, roles) for c in changes],
         "review": _review_text(line.get("review")),
+        "review_findings": int(_num(review.get("findings_returned")) or 0),
+        "review_fixed": int(_num(review.get("findings_fixed")) or 0),
+        "review_reported": bool(review.get("reported")),
         "flags": [f"{name} hung" for name in dict.fromkeys(hung)],
         "hung_roles": list(dict.fromkeys(hung)),
     }

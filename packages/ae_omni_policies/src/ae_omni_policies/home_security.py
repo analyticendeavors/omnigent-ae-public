@@ -11,6 +11,10 @@ it, and two links. A link passes through only when it is a plain web link; the f
 link only when it is https on a ``.firewalla.net`` host. Nothing from the home app's body is
 passed on beyond those fields: never an alert's text, a device name or an address.
 
+2026-11-13: the server now also keeps, for the Needs you list only, up to ``MAX_ALERTS`` visible
+alerts (id, severity, kind, text, time). They never reach ``GET /home-security``; that route
+still answers labels and one count.
+
 The read is cached for 60 s (a failed read too, so a dead home app is asked once a minute, not
 once a request), has a 5 s timeout, and never raises: a failure is ``reachable: false``. Without
 ``AE_HOME_SECURITY_URL`` the card is off and the answer is ``{"off": true}``.
@@ -24,8 +28,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import re
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
@@ -42,8 +48,28 @@ TIMEOUT_S = 5.0
 MAX_BODY = 1_000_000
 PORTAL_SUFFIX = ".firewalla.net"
 API_STATES = ("up", "down", "unknown")
+RUNBOOK_ENV = "AE_HOME_SECURITY_RUNBOOK"
+MAX_ALERTS = 20
+TEXT_MAX = 300
+KIND_MAX = 60
+ALERT_ID = re.compile(r"alert:[0-9a-f]{8,64}")
+SEVERITIES = ("critical", "notable")
+#: An alert time outside these bounds (2000-01-01 and 2100-01-01 UTC) is read as not given.
+TIME_MIN = 946_684_800.0
+TIME_MAX = 4_102_444_800.0
+RUNBOOK_PATH = re.compile(r"(?:~|/)[A-Za-z0-9._/+-]{1,199}")
 
-_cache: tuple[str, float, dict[str, Any]] | None = None
+
+@dataclass(frozen=True)
+class Snapshot:
+    """One read of the home app: the card's compact answer plus the alerts Needs you lists."""
+
+    answer: dict[str, Any]
+    alerts: tuple[dict[str, str], ...] = field(default=())
+    cut: bool = False
+
+
+_cache: tuple[str, float, Snapshot] | None = None
 _lock: tuple[asyncio.AbstractEventLoop, asyncio.Lock] | None = None
 
 
@@ -179,6 +205,57 @@ def visible_alerts(alerts: list[Any], received_at: object) -> int:
     return sum(1 for alert in alerts if not _hidden(alert, received))
 
 
+def open_alerts(body: object) -> tuple[list[dict[str, str]], bool]:
+    """The visible alerts of the home app's body for Needs you, newest first, and whether cut.
+
+    Only alerts with a well-formed id are kept (one per id, the newest); each field is typed and
+    cut, and a time outside :data:`TIME_MIN` to :data:`TIME_MAX` is not given. At most
+    ``MAX_ALERTS`` come back; ``cut`` says more were visible, or a visible alert was skipped for
+    its id (the list is then unknown, as the card's count may differ).
+    """
+    if not isinstance(body, Mapping):
+        return [], False
+    summary = body.get("summary")
+    alerts = summary.get("alerts") if isinstance(summary, Mapping) else None
+    if not isinstance(alerts, list):
+        return [], False
+    received = _time(body.get("receivedAt"))
+    found: dict[str, tuple[float, dict[str, str]]] = {}
+    skipped = False
+    for alert in alerts:
+        if isinstance(alert, Mapping) and _hidden(alert, received):
+            continue
+        ident = alert.get("id") if isinstance(alert, Mapping) else None
+        if not isinstance(ident, str) or not ALERT_ID.fullmatch(ident):
+            skipped = True
+            continue
+        severity = alert.get("severity")
+        kind = alert.get("kind")
+        text = alert.get("text")
+        when = _time(alert.get("at"))
+        if not TIME_MIN <= when <= TIME_MAX:
+            when = float("nan")
+        newest = found.get(ident)
+        if newest is not None and not when > newest[0]:
+            continue
+        found[ident] = (
+            when,
+            {
+                "id": ident,
+                "severity": severity if severity in SEVERITIES else "other",
+                "kind": kind[:KIND_MAX] if isinstance(kind, str) else "",
+                "text": text[:TEXT_MAX] if isinstance(text, str) else "",
+                "at": (_stamp(alert.get("at")) or "") if when == when else "",
+            },
+        )
+    kept = sorted(
+        found.values(),
+        key=lambda pair: float("-inf") if pair[0] != pair[0] else pair[0],
+        reverse=True,
+    )
+    return [item for _, item in kept[:MAX_ALERTS]], skipped or len(kept) > MAX_ALERTS
+
+
 def shape(body: object, link: str | None, read_at: str) -> dict[str, Any]:
     """The compact answer from the home app's body; a body of the wrong shape is unreachable."""
     out: dict[str, Any] = {
@@ -242,16 +319,17 @@ def request_url(base: str) -> str:
     return urlunsplit((parts.scheme, parts.netloc, path, "lite=1", ""))
 
 
-async def read(base: str, link: str | None) -> dict[str, Any]:
+async def read(base: str, link: str | None) -> Snapshot:
     """One uncached read of the home app at *base*; never raises."""
     read_at = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     url = request_url(base)
     transport = _make_transport()
     try:
         body = await asyncio.wait_for(_get_json(url, transport), TIMEOUT_S + 1)
-        return shape(body, link, read_at)
+        alerts, cut = open_alerts(body)
+        return Snapshot(shape(body, link, read_at), tuple(alerts), cut)
     except Exception:  # noqa: BLE001 (a failed read is "unreachable", never an error to the route)
-        return shape(None, link, read_at)
+        return Snapshot(shape(None, link, read_at))
     finally:
         with contextlib.suppress(Exception):  # closing a transport must not hide the answer
             await transport.aclose()
@@ -266,23 +344,23 @@ def _get_lock() -> asyncio.Lock:
     return _lock[1]
 
 
-def _fresh(base: str, link: str | None) -> dict[str, Any] | None:
+def _fresh(base: str, link: str | None) -> Snapshot | None:
     hit = _cache
     if hit is not None and hit[0] == base and hit[1] > time.monotonic():
-        if hit[2].get("link") == link:
+        if hit[2].answer.get("link") == link:
             return hit[2]
     return None
 
 
-async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
-    """The card's answer: ``{"off": true}`` without a base URL, else the cached compact read.
+async def snapshot(environ: Mapping[str, str] | None = None) -> Snapshot | None:
+    """The cached read, or ``None`` without a base URL (the card is off).
 
     One read at a time: callers that arrive while one is running wait for it and share its answer.
     """
     global _cache
     base = _base_url(card_config.value(URL_ENV, environ))
     if base is None:
-        return {"off": True, "card": CARD_ID}
+        return None
     raw_link = card_config.value(LINK_ENV, environ)
     link = web_link(raw_link.strip() if raw_link else raw_link)
     if (hit := _fresh(base, link)) is not None:
@@ -290,6 +368,25 @@ async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
     async with _get_lock():
         if (hit := _fresh(base, link)) is not None:
             return hit
-        answer = await read(base, link)
-        _cache = (base, time.monotonic() + CACHE_S, answer)
-        return answer
+        snap = await read(base, link)
+        _cache = (base, time.monotonic() + CACHE_S, snap)
+        return snap
+
+
+async def overview(environ: Mapping[str, str] | None = None) -> dict[str, Any]:
+    """The card's answer: ``{"off": true}`` without a base URL, else the cached compact read."""
+    snap = await snapshot(environ)
+    if snap is None:
+        return {"off": True, "card": CARD_ID}
+    return snap.answer
+
+
+def runbook(environ: Mapping[str, str] | None = None) -> str | None:
+    """The runbook path the Investigate chat reads first, or ``None`` unless one plain path."""
+    raw = card_config.value(RUNBOOK_ENV, environ)
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip()
+    if not RUNBOOK_PATH.fullmatch(text) or ".." in text.split("/"):
+        return None
+    return text

@@ -17,12 +17,10 @@ import {
   CARD_TILES,
   columnsFor,
   cardNotSetUp,
-  GROUP_LAYOUTS,
   groupOf,
   openByDefault,
 } from "../src/board";
-import { packedArrangement, packLayout } from "../src/boardLayout";
-import { FLASH_MS, goToGroup } from "../src/cardNav";
+import { mountRail } from "../src/rail";
 import { creditHealth, creditTile, databricksTile } from "../src/databricks";
 import { holdTile, releaseTile } from "../src/deploys";
 import { fabricTile } from "../src/fabric";
@@ -34,7 +32,8 @@ import {
   DOMAINS,
   getTile,
   type Health,
-  mountTiles,
+  mountUpdated,
+  pillStates,
   refreshAll,
   registerRefresh,
   resetTiles,
@@ -301,13 +300,7 @@ describe("the words", () => {
   });
 });
 
-describe("the pills and the header", () => {
-  const mount = () => {
-    const strip = document.createElement("div");
-    const time = document.createElement("p");
-    mountTiles(strip, time);
-    return { strip, time };
-  };
+describe("the tile store, the header time and the rail", () => {
   const tile = (id: TileId, health: Health, value: string = id, note = "", extra: Partial<Tile> = {}): Tile => ({
     id,
     value,
@@ -315,19 +308,21 @@ describe("the pills and the header", () => {
     health,
     ...extra,
   });
-  const pill = (strip: HTMLElement, id: string) => strip.querySelector<HTMLElement>(`[data-pill="${id}"]`);
+  const rail = () => {
+    const host = document.createElement("div");
+    document.body.append(host);
+    const stop = mountRail(host, { openTab: () => undefined, tabs: () => true });
+    return { host, stop };
+  };
+  const block = (host: HTMLElement, id: string) => host.querySelector<HTMLElement>(`.rail-block[data-area="${id}"]`);
 
-  it("draws one pill per group in order, the worst member's health, and the newest time", () => {
-    const { strip, time } = mount();
+  it("keeps the newest answer's time for the header, and the credit tile for its card's fold", () => {
+    const time = document.createElement("p");
+    mountUpdated(time);
     setTile(secretsTile(secrets(["A"]), null), NOW);
     setTile(releaseTile(release(), null), NOW - 60_000);
-    // The credit tile belongs to no pill; it carries a card's fold.
+    // The credit tile belongs to no area; it carries a card's fold.
     setTile(creditTile(databricks("STOPPED", 12.4)));
-    const pills = [...strip.querySelectorAll<HTMLElement>(".pill")];
-    expect(pills.map((node) => node.dataset.pill)).toEqual(["ship", "box"]);
-    expect(pills[0].classList.contains("pill-ok")).toBe(true);
-    expect(pills[1].classList.contains("pill-problem")).toBe(true);
-    expect(pills[1].querySelector(".pill-h svg")?.getAttribute("aria-hidden")).toBe("true");
     expect(time.textContent).toMatch(/^Updated /);
     expect(getTile("credit")?.value).toBe("$487.60 left");
   });
@@ -354,221 +349,53 @@ describe("the pills and the header", () => {
     }
   });
 
-  it("leaves out a pill whose members are all missing or idle", () => {
-    const { strip } = mount();
+  it("leaves out an area whose members are all missing or idle, and takes the worst health of the rest", () => {
     setTile(tile("accounts", "idle"));
     setTile(tile("presets", "idle"));
-    expect(strip.querySelector(".pill")).toBeNull();
+    expect(pillStates()).toEqual([]);
     setTile(tile("family", "ok", "Fine"));
-    expect(pill(strip, "money")).not.toBeNull();
-  });
-
-  it("takes the worst health of the members", () => {
-    const { strip } = mount();
+    expect(pillStates().map((state) => state.domain.id)).toEqual(["money"]);
     setTile(tile("fabric", "ok"));
     setTile(tile("databricks", "attention", "Down", "check"));
-    expect(pill(strip, "cloud")!.classList.contains("pill-attention")).toBe(true);
+    expect(pillStates().find((state) => state.domain.id === "cloud")!.health).toBe("attention");
     setTile(tile("vault", "problem", "Bad", "broken"));
-    expect(pill(strip, "cloud")!.classList.contains("pill-problem")).toBe(true);
+    expect(pillStates().find((state) => state.domain.id === "cloud")!.health).toBe("problem");
   });
 
-  it("says brief first, never the note, problems before attention before ok, and skips idle ones", () => {
-    const { strip } = mount();
+  it("draws a rail block per area with a card, each member as a dot, its name and its short value", () => {
+    const { host, stop } = rail();
     setTile(tile("release", "ok", "v1", "up to date", { summary: "Release v1" }));
-    setTile(tile("hold", "attention", "2 h", "held by someone", { brief: "Held 2 h", summary: "Hold on" }));
-    setTile(tile("git", "problem", "9 need you", "1 to fix, 3 waiting", { brief: "9 need you" }));
-    const line = pill(strip, "ship")!.querySelector(".pill-line")!;
-    expect(line.textContent).toBe("9 need you \u00b7 Held 2 h \u00b7 Release v1");
-    expect([...line.querySelectorAll("b")].map((b) => b.textContent)).toEqual(["9 need you", "Held 2 h"]);
-    expect(line.textContent).not.toContain("held by someone");
-    setTile(tile("git", "idle", "Not set up", "no repos", { brief: "9 need you" }));
-    expect(line.textContent).toBe("Held 2 h \u00b7 Release v1");
+    setTile(tile("hold", "attention", "2 h", "held by someone", { brief: "Held 2 h", bar: 40 }));
+    const ship = block(host, "ship")!;
+    expect([...ship.querySelectorAll(".rail-mname")].map((n) => n.textContent)).toEqual(["Release", "Deploy hold"]);
+    // The short value is the brief, else the summary, else the value: never the note.
+    expect([...ship.querySelectorAll(".rail-mval")].map((n) => n.textContent)).toEqual(["Release v1", "Held 2 h"]);
+    expect(ship.textContent).not.toContain("held by someone");
+    expect(ship.querySelector(".tile-attention .rail-dot")).not.toBeNull();
+    // The Deploy hold's bar is the Ship block's one meter.
+    expect(ship.querySelector<HTMLElement>(".rail-bar > i")!.style.width).toBe("40%");
+    expect(block(host, "cloud")).toBeNull();
+    stop();
   });
 
-  it("drops a part whose text repeats an earlier one", () => {
-    const { strip } = mount();
-    setTile(tile("accounts", "attention", "6.7B tokens", "", { brief: "6.7B tokens in 30 d" }));
-    setTile(tile("presets", "ok", "x", "", { brief: "6.7B tokens in 30 d" }));
-    setTile(tile("family", "ok", "x", "", { brief: "249 families" }));
-    const line = pill(strip, "money")!.querySelector(".pill-line")!;
-    expect(line.textContent).toBe("6.7B tokens in 30 d \u00b7 249 families");
-  });
-
-  it("hands focus to the strip when the focused pill goes idle and is removed", () => {
-    const { strip } = mount();
-    document.body.append(strip);
-    setTile(tile("host", "ok", "Connected"));
-    pill(strip, "box")!.focus();
-    setTile(tile("host", "idle", "Admins only"));
-    expect(pill(strip, "box")).toBeNull();
-    expect(document.activeElement).toBe(strip);
-    strip.remove();
-  });
-
-  it("shows a compact number in the header, and the full count in the accessible name", () => {
-    const { strip } = mount();
-    const number = () => pill(strip, "cloud")!.querySelector<HTMLElement>(".pill-count")!;
-    const name = () => pill(strip, "cloud")!.getAttribute("aria-label")!;
-    setTile(tile("fabric", "attention"));
-    expect(number().textContent).toBe("1");
-    expect(name()).toMatch(/^Cloud, 1 to check: /);
-    setTile(tile("databricks", "attention"));
-    expect(number().textContent).toBe("2");
-    expect(name()).toMatch(/^Cloud, 2 to check: /);
-    setTile(tile("vault", "problem"));
-    expect(number().textContent).toBe("1");
-    expect(name()).toMatch(/^Cloud, 1 problem: /);
-    setTile(tile("azure", "problem"));
-    expect(name()).toMatch(/^Cloud, 2 problems: /);
-    setTile(tile("host", "ok"));
-    expect(pill(strip, "box")!.querySelector<HTMLElement>(".pill-count")!.hidden).toBe(true);
-    expect(pill(strip, "box")!.getAttribute("aria-label")).toMatch(/^Box: /);
-  });
-
-  it("keeps focus and the same nodes across a setTile, and gives the button no title", () => {
-    const { strip } = mount();
-    setTile(tile("host", "ok", "Connected"));
-    const before = pill(strip, "box")!;
-    document.body.append(strip);
-    before.focus();
-    expect(document.activeElement).toBe(before);
-    setTile(tile("host", "attention", "Down", "check"));
-    setTile(tile("secrets", "ok", "8 of 8"));
-    expect(pill(strip, "box")).toBe(before);
-    expect(document.activeElement).toBe(before);
-    expect(before.classList.contains("pill-attention")).toBe(true);
-    expect(before.hasAttribute("title")).toBe(false);
-    strip.remove();
-  });
-
-  it("lists every member in the label, the title and the popover", () => {
-    const { strip } = mount();
-    setTile(releaseTile(release(), null));
-    setTile(tile("hold", "ok", "Off", "deploys go ahead"));
-    const node = pill(strip, "ship")!;
-    expect(node.getAttribute("aria-label")).toMatch(/^Ship: Release: .*; Deploy hold: /);
-    const rows = [...strip.querySelectorAll(".pill-pop .pill-pop-row")];
-    expect(rows).toHaveLength(2);
-    expect(rows[0].textContent).toContain("Release");
-    expect(strip.querySelector(".pill-pop")?.getAttribute("aria-hidden")).toBe("true");
-  });
-
-  it("shows the Deploy hold's bar inside the Ship pill", () => {
-    const { strip } = mount();
-    setTile(tile("hold", "attention", "On", "1 h left", { bar: 40 }));
-    const bar = pill(strip, "ship")!.querySelector<HTMLElement>(".tile-bar > i");
-    expect(bar?.style.width).toBe("40%");
-  });
-
-  it("scrolls to its group's heading and focuses the first card, opening it on a phone", () => {
-    const { strip } = mount();
-    const group = document.createElement("section");
-    group.className = "admin-group";
-    group.dataset.group = "box";
-    const box = document.createElement("article");
-    box.className = "admin-card is-folded";
-    box.dataset.card = "box";
-    const toggle = document.createElement("button");
-    toggle.className = "admin-card-toggle";
-    toggle.addEventListener("click", () => box.classList.remove("is-folded"));
-    box.append(toggle);
-    group.append(box);
-    const scroll = vi.fn();
-    group.scrollIntoView = scroll;
-    document.body.append(group);
-    setTile(tile("host", "ok", "Connected"));
-    pill(strip, "box")!.click();
-    expect(box.classList.contains("is-folded")).toBe(false);
-    expect(scroll).toHaveBeenCalled();
-    expect(document.activeElement).toBe(toggle);
-    group.remove();
-  });
-
-  it("on the packed board scrolls to the group's first card, focuses its header and rings every card of the group", () => {
-    vi.useFakeTimers();
-    try {
-      const { strip } = mount();
-      const board = document.createElement("div");
-      board.className = "admin-board";
-      board.dataset.packed = "";
-      const make = (id: string, group: string) => {
-        const card = document.createElement("section");
-        card.className = "admin-card";
-        card.dataset.card = id;
-        card.dataset.group = group;
-        card.append(Object.assign(document.createElement("button"), { className: "admin-card-toggle" }));
-        card.scrollIntoView = vi.fn();
-        return card;
-      };
-      const compute = make("compute", "cloud");
-      const azure = make("azure", "cloud");
-      const deploys = make("deploys", "ship");
-      board.append(deploys, compute, azure);
-      document.body.append(board);
-      setTile(tile("fabric", "ok", "Active"));
-      pill(strip, "cloud")!.click();
-      expect(compute.scrollIntoView).toHaveBeenCalled();
-      expect(deploys.scrollIntoView).not.toHaveBeenCalled();
-      expect(document.activeElement).toBe(compute.querySelector(".admin-card-toggle"));
-      expect([compute, azure].map((c) => c.classList.contains("is-flash"))).toEqual([true, true]);
-      expect(deploys.classList.contains("is-flash")).toBe(false);
-      vi.advanceTimersByTime(FLASH_MS - 1);
-      expect(compute.classList.contains("is-flash")).toBe(true);
-      vi.advanceTimersByTime(1);
-      expect([compute, azure].map((c) => c.classList.contains("is-flash"))).toEqual([false, false]);
-      // A second click while the ring shows restarts it for the full time.
-      pill(strip, "cloud")!.click();
-      vi.advanceTimersByTime(1000);
-      pill(strip, "cloud")!.click();
-      vi.advanceTimersByTime(FLASH_MS - 1);
-      expect([compute, azure].map((c) => c.classList.contains("is-flash"))).toEqual([true, true]);
-      vi.advanceTimersByTime(1);
-      expect([compute, azure].map((c) => c.classList.contains("is-flash"))).toEqual([false, false]);
-      board.remove();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("goToGroup says false when no card of the group is on the page", () => {
-    expect(goToGroup("cloud")).toBe(false);
-    const board = document.createElement("div");
-    board.className = "admin-board";
-    board.dataset.packed = "";
-    document.body.append(board);
-    expect(goToGroup("cloud")).toBe(false);
-    board.remove();
-  });
-
-  it("falls back to the first card when the board has no groups (the box-only view)", () => {
-    const { strip } = mount();
-    const box = document.createElement("article");
-    box.className = "admin-card";
-    box.dataset.card = "box";
-    const toggle = document.createElement("button");
-    toggle.className = "admin-card-toggle";
-    box.append(toggle);
-    const scroll = vi.fn();
-    box.scrollIntoView = scroll;
-    document.body.append(box);
-    setTile(tile("host", "ok", "Connected"));
-    pill(strip, "box")!.click();
-    expect(scroll).toHaveBeenCalled();
-    expect(document.activeElement).toBe(toggle);
-    box.remove();
-  });
-
-  it("leaves a not-set-up member out of its pill, and hides the pill when every member is out", () => {
-    const { strip } = mount();
+  it("leaves a not-set-up member out of the rail, and the block out when every member is out", () => {
+    const { host, stop } = rail();
     setTile(tile("fabric", "ok", "Active"));
     setTile({ ...tile("databricks", "idle", "Not set up"), notSetUp: true });
     setTile({ ...tile("vault", "idle", "Not set up"), notSetUp: true });
-    const rows = [...strip.querySelectorAll('[data-pill="cloud"] ~ .pill-pop .pill-pop-name')].map(
-      (row) => row.textContent,
-    );
-    expect(rows).toEqual(["Fabric"]);
+    expect([...block(host, "cloud")!.querySelectorAll(".rail-mname")].map((n) => n.textContent)).toEqual(["Fabric"]);
     setTile({ ...tile("fabric", "idle", "Not set up"), notSetUp: true });
-    expect(pill(strip, "cloud")).toBeNull();
+    expect(block(host, "cloud")).toBeNull();
+    stop();
+  });
+
+  it("keeps focus on a block's header across a tile change", () => {
+    const { host, stop } = rail();
+    setTile(tile("host", "ok", "Connected"));
+    block(host, "box")!.querySelector<HTMLElement>(".rail-h")!.focus();
+    setTile(tile("host", "attention", "Down", "check"));
+    expect(document.activeElement).toBe(block(host, "box")!.querySelector(".rail-h"));
+    stop();
   });
 
   it("runs every registered read from the refresh button", () => {
@@ -599,11 +426,9 @@ describe("the board", () => {
       ]),
     ) as Record<CardId, HTMLElement>;
 
-  /** The board's columns of card ids (Needs you is no card), for a packed board. */
-  const columns = (board: HTMLElement) =>
-    [...board.querySelectorAll(":scope > .admin-col")].map((column) =>
-      [...column.children].flatMap((card) => ((card as HTMLElement).dataset.card ? [(card as HTMLElement).dataset.card] : [])),
-    );
+  /** The card ids on the board, in order. */
+  const shownIds = (board: HTMLElement) =>
+    [...board.querySelectorAll<HTMLElement>(".admin-card")].map((card) => card.dataset.card);
   const order = DOMAINS.flatMap((d) => d.cards as CardId[]);
 
   it("picks four, three, two or one column by the page's width", () => {
@@ -615,40 +440,23 @@ describe("the board", () => {
     expect(columnsFor(390)).toBe(1);
   });
 
-  it("packs the cards into the board's columns on a wide page and keeps four group headings on a phone", () => {
+  it("puts every card in the group order in one grid, with no group headings, the drag grip or the packed board", () => {
     const board = document.createElement("div");
     board.className = "admin-board";
     document.body.appendChild(board);
     const all = cards();
     arrange(board, all, 3);
-    expect(columns(board)).toEqual(packLayout(3, order));
+    expect(shownIds(board)).toEqual(order);
     expect(board.querySelector(".admin-group-h")).toBeNull();
+    expect(board.querySelector(".admin-grip")).toBeNull();
+    expect(board.dataset.packed).toBeUndefined();
     // Card headings are still h3s.
     expect(board.querySelectorAll("h3.admin-card-h")).toHaveLength(12);
+    // The width only tells a phone from the rest: the same order at any column count.
     arrange(board, all, 2);
-    expect(columns(board)).toEqual(packLayout(2, order));
-    arrange(board, all, 4);
-    expect(columns(board)).toEqual(packLayout(4, order));
-    expect(packedArrangement(4, order)).toEqual(packLayout(4, order));
+    expect(shownIds(board)).toEqual(order);
     arrange(board, all, 1);
-    expect(board.dataset.packed).toBeUndefined();
-    const groups = [...board.querySelectorAll<HTMLElement>(".admin-group")].map((g) => ({
-      group: g.dataset.group,
-      cards: [...g.querySelectorAll<HTMLElement>(".admin-card")].map((c) => c.dataset.card),
-    }));
-    expect(groups).toEqual([
-      { group: "ship", cards: ["deploys", "git", "social"] },
-      { group: "box", cards: ["box", "home-security"] },
-      { group: "cloud", cards: ["compute", "credit", "azure", "vault", "decision"] },
-      { group: "money", cards: ["accounts", "presets"] },
-    ]);
-    expect([...board.querySelectorAll(".admin-group-h")].map((h) => h.textContent)).toEqual([
-      "Ship",
-      "Box",
-      "Cloud",
-      "Accounts",
-    ]);
-    expect(board.querySelectorAll("h2.admin-group-h")).toHaveLength(4);
+    expect(shownIds(board)).toEqual(order);
     arrange(board, all, 3);
     // Every card is open on a wide page, and its header is not a toggle.
     expect(all.box.classList.contains("is-folded")).toBe(false);
@@ -656,6 +464,41 @@ describe("the board", () => {
     // No server said anything is missing: no footer line.
     expect(board.querySelector<HTMLElement>(".admin-notset")?.hidden).toBe(true);
     expect(board.lastElementChild?.className).toBe("admin-notset");
+  });
+
+  it("deals an area tab's cards into 620 px lanes in turn, kept in page order for the keyboard, one lane on a phone", () => {
+    const board = document.createElement("div");
+    board.className = "admin-board as-board";
+    document.body.appendChild(board);
+    const all = cards();
+    const lanesOf = () =>
+      [...board.querySelectorAll<HTMLElement>(":scope > .admin-col > .admin-card")].map((card) =>
+        card.style.getPropertyValue("--lane"),
+      );
+    // 1,300 px holds two lanes: the first card left, the second right, the third left again.
+    arrange(board, all, 3, true, undefined, 1300);
+    expect(board.dataset.lanes).toBe("2");
+    // One column element in page order, so Tab and a screen reader go left to right.
+    expect(board.querySelectorAll(":scope > .admin-col")).toHaveLength(1);
+    expect(shownIds(board)).toEqual(order);
+    expect(board.querySelector<HTMLElement>(".admin-col")!.style.getPropertyValue("--lanes")).toBe("2");
+    expect(lanesOf()).toEqual(order.map((_, i) => String(i % 2)));
+    // A wider page adds a lane without a forced rebuild.
+    arrange(board, all, 4, false, undefined, 1920);
+    expect(board.dataset.lanes).toBe("3");
+    expect(lanesOf()).toEqual(order.map((_, i) => String(i % 3)));
+    // A phone keeps one plain column in page order, with no lane left on any card.
+    arrange(board, all, 1, false, undefined, 390);
+    expect(board.dataset.lanes).toBe("1");
+    expect(shownIds(board)).toEqual(order);
+    expect(lanesOf().every((lane) => lane === "")).toBe(true);
+    expect(all.box.style.top).toBe("");
+    // A board that is not an area tab's keeps one column at any width.
+    const plain = document.createElement("div");
+    plain.className = "admin-board";
+    document.body.appendChild(plain);
+    arrange(plain, cards(), 3, true, undefined, 1920);
+    expect(plain.dataset.lanes).toBe("1");
   });
 
   it("drops a card only when every tile behind it reported not set up", () => {
@@ -685,10 +528,6 @@ describe("the board", () => {
     for (const id of Object.keys(cards()) as CardId[]) {
       expect(DOMAINS.filter((d) => d.cards.includes(id))).toHaveLength(1);
       expect(DOMAINS.find((d) => d.id === groupOf(id))?.cards).toContain(id);
-    }
-    // And the phone layout holds exactly the group's cards.
-    for (const d of DOMAINS) {
-      expect(GROUP_LAYOUTS[1][d.id].flat().sort()).toEqual([...d.cards].sort());
     }
   });
 

@@ -12,7 +12,14 @@ from typing import Any
 import httpx
 import pytest
 
-from ae_omni_policies import omni, social, social_relay, social_visual
+from ae_omni_policies import (
+    attention,
+    attention_dismissals,
+    omni,
+    social,
+    social_relay,
+    social_visual,
+)
 
 EXAMPLE_TOOLS = [
     {
@@ -1634,3 +1641,204 @@ def test_a_saved_tool_without_an_image_takes_the_env_picture_by_id(
         social.Tool.model_validate({**saved, "id": "omnigent"}).image
         == "https://opengraph.githubassets.com/1/example/repo"
     )
+
+
+# ── Social as a Needs you source (2026-11-16, D2 phase 2) ─────────────────────
+
+
+def _slot(sid: str, due: datetime, **over: Any) -> social.Slot:
+    base: dict[str, Any] = {
+        "id": sid,
+        "kind": "tool",
+        "platform": "linkedin",
+        "anchor": "diagram",
+        "due": due,
+    }
+    return social.Slot(**{**base, **over})
+
+
+def _fresh_uploads(state: social.State, read_at: datetime) -> None:
+    for channel in social.CHANNELS:
+        state.uploads[channel] = social.ChannelReading(read_at=read_at, ok=True)
+
+
+def _saved(tmp_path: Path, state: social.State) -> social.SocialStore:
+    path = tmp_path / "social.json"
+    path.write_text(state.model_dump_json())
+    store = social.SocialStore(path)
+    social.reset_store(store)
+    return store
+
+
+def _late_state() -> social.State:
+    state = _state()
+    _fresh_uploads(state, NOW - timedelta(hours=1))
+    for sid, due in (
+        ("li-tool-late1", NOW - timedelta(days=1)),
+        ("li-tool-late4", NOW - timedelta(days=4)),
+        ("li-tool-late9", NOW - timedelta(days=9)),
+        ("li-tool-today", NOW + timedelta(hours=3)),
+        ("li-tool-later", NOW + timedelta(days=2)),
+    ):
+        state.slots[sid] = _slot(sid, due)
+    state.slots["li-tool-posted"] = _slot("li-tool-posted", NOW - timedelta(days=2))
+    _post(state, "li-tool-posted", NOW - timedelta(days=1))
+    state.slots["li-tool-skipped"] = _slot(
+        "li-tool-skipped", NOW - timedelta(days=2), state="skipped"
+    )
+    return state
+
+
+def test_late_posts_and_posts_due_today_become_items() -> None:
+    items = {i["id"]: i for i in attention.social_items(_late_state(), NOW, sure=True)}
+    assert set(items) == {
+        "social:li-tool-late1",
+        "social:li-tool-late4",
+        "social:li-tool-late9",
+        "social:li-tool-today",
+    }
+    tiers = {k: v["state"].get("tier") for k, v in items.items()}
+    assert tiers["social:li-tool-late1"] == 1 and tiers["social:li-tool-late4"] == 2
+    assert tiers["social:li-tool-late9"] == 3 and tiers["social:li-tool-today"] is None
+    late = items["social:li-tool-late4"]
+    assert late["kind"] == "post-overdue" and late["tone"] == "urgent"
+    assert late["slot"] == "li-tool-late4" and late["title"] == "Diagram tool"
+    assert late["meta"] == "4 days late" and late["url"] == ""
+    assert late["visual"] == {"kind": "tool", "key": EXAMPLE_TOOLS[0]["image"]}
+    today = items["social:li-tool-today"]
+    assert today["kind"] == "post-today" and today["tone"] == "review"
+    assert all(i["dismissible"] and "dismiss" in i["actions"] for i in items.values())
+    assert all("review" not in i["actions"] for i in items.values())
+
+
+def test_a_video_title_is_cleaned_and_never_becomes_a_link() -> None:
+    state = _state(_lister(ae=[_item("aaaaaaaaaaa", "long", NOW, "Hi `there`\nnow")]))
+    state.slots["li-video-aaaaaaaaaaa"] = _slot(
+        "li-video-aaaaaaaaaaa",
+        NOW - timedelta(days=1),
+        kind="video",
+        anchor="aaaaaaaaaaa",
+        channel="ae",
+    )
+    [item] = attention.social_items(state, NOW, sure=True)
+    assert item["title"] == "Hi 'there' now" and item["url"] == ""
+
+
+def test_the_late_comparators_use_tiers_and_say_why() -> None:
+    worse = attention_dismissals.worse
+    assert worse("post-overdue", {"tier": 1}, {"tier": 1}) is None
+    assert worse("post-overdue", {"tier": 1}, {"tier": 2}) == "it is more overdue"
+    assert worse("post-overdue", {}, {"tier": 1}) == "it is now past its slot"
+    assert worse("post-today", {"due": "a"}, {"due": "b"}) == "its time moved"
+    assert (
+        attention_dismissals.BACK_IF["post-overdue"] and attention_dismissals.BACK_IF["post-today"]
+    )
+
+
+async def test_a_stale_or_failed_youtube_read_makes_social_unknown_and_not_dismissible(
+    tmp_path: Path,
+) -> None:
+    state = _late_state()
+    _saved(tmp_path, state)
+    clean = await attention.read_social(NOW)
+    assert not clean.unknown and clean.scopes[0].ok and clean.scopes[0].read_at
+    assert all(i["dismissible"] for i in clean.items)
+    # Older than STALE_HOURS: the items stay listed but nothing can be dismissed or tidied on them.
+    stale = await attention.read_social(NOW + timedelta(hours=social.STALE_HOURS + 2))
+    assert stale.unknown and not stale.scopes[0].ok and stale.items
+    assert not any(i["dismissible"] for i in stale.items)
+    assert not any("dismiss" in i["actions"] for i in stale.items)
+    # One channel's read failed: partial, so unknown too.
+    state.uploads["hc"] = social.ChannelReading(read_at=NOW, ok=False, error="quota")
+    _saved(tmp_path, state)
+    partial = await attention.read_social(NOW)
+    assert partial.unknown and not any(i["dismissible"] for i in partial.items)
+
+
+async def test_social_with_no_plan_reads_clean_and_a_broken_file_reads_unknown(
+    tmp_path: Path,
+) -> None:
+    _saved(tmp_path, social.State())
+    empty = await attention.read_social(NOW)
+    assert empty.items == [] and not empty.unknown and empty.scopes[0].ok
+    (tmp_path / "social.json").write_text("{broken")
+    broken = await attention.read_social(NOW)
+    assert broken.unknown and broken.items == [] and not broken.scopes[0].ok
+
+
+async def test_social_shows_to_admins_only_and_a_dismissal_hides_it_until_it_is_later(
+    client: httpx.AsyncClient,
+    ae_admins: set[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = datetime.now(UTC)
+    state = social.State()
+    _fresh_uploads(state, now - timedelta(minutes=5))
+    state.slots["li-tool-late4"] = _slot("li-tool-late4", now - timedelta(days=4))
+    _saved(tmp_path, state)
+    seen = (await client.get("/v1/ae/attention", headers=OWNER)).json()
+    assert "social" in seen["sources"]
+    row = next(i for i in seen["items"] if i["id"] == "social:li-tool-late4")
+    assert row["slot"] == "li-tool-late4" and "state" not in row
+    assert row["back_if"] == attention_dismissals.BACK_IF["post-overdue"]
+    # A box admin sees Box health only, so no Social item and a guessed id is a 404.
+    monkeypatch.setenv("AE_BOX_ADMINS", "box@example.com")
+    boxer = {"X-Forwarded-Email": "box@example.com"}
+    listed = (await client.get("/v1/ae/attention", headers=boxer)).json()
+    assert listed["sources"] == ["box"] and not listed["items"]
+    refused = await client.post(
+        "/v1/ae/attention/dismiss", json={"id": "social:li-tool-late4"}, headers=boxer
+    )
+    assert refused.status_code == 404
+    ok = await client.post(
+        "/v1/ae/attention/dismiss", json={"id": "social:li-tool-late4"}, headers=OWNER
+    )
+    assert ok.status_code == 200
+    after = (await client.get("/v1/ae/attention", headers=OWNER)).json()
+    assert "social:li-tool-late4" in {d["id"] for d in after["dismissed"]}
+
+
+async def test_a_social_card_that_is_off_or_not_opted_in_adds_no_source(
+    client: httpx.AsyncClient,
+    ae_admins: set[str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = social.State()
+    _fresh_uploads(state, datetime.now(UTC))
+    state.slots["li-tool-late4"] = _slot("li-tool-late4", datetime.now(UTC) - timedelta(days=4))
+    _saved(tmp_path, state)
+    monkeypatch.delenv("AE_PRIVATE_CARDS")
+    seen = (await client.get("/v1/ae/attention", headers=OWNER)).json()
+    assert "social" not in seen["sources"]
+    assert not [i for i in seen["items"] if i["source"] == "social"]
+
+
+async def test_a_missing_channel_an_empty_read_or_a_future_read_is_never_fresh(
+    tmp_path: Path,
+) -> None:
+    now = NOW
+    # One channel read fresh, the other never: the post may already be up on it.
+    state = _late_state()
+    state.uploads = {"ae": social.ChannelReading(read_at=now - timedelta(hours=1), ok=True)}
+    _saved(tmp_path, state)
+    missing = await attention.read_social(now)
+    assert missing.unknown and not missing.scopes[0].ok and missing.items
+    assert not any(i["dismissible"] for i in missing.items)
+    # No readings at all while planned slots exist.
+    state.uploads = {}
+    _saved(tmp_path, state)
+    empty = await attention.read_social(now)
+    assert empty.unknown and not empty.scopes[0].ok
+    assert not any(i["dismissible"] for i in empty.items)
+    # A read dated in the future (a clock or file fault) is not in range.
+    state.uploads = {
+        ch: social.ChannelReading(read_at=now + timedelta(hours=3), ok=True)
+        for ch in social.CHANNELS
+    }
+    _saved(tmp_path, state)
+    future = await attention.read_social(now)
+    assert future.unknown and not future.scopes[0].ok
+    # And a vanished item is then never counted as done: its scope is not clean.
+    assert "social:all" not in {s.id for s in future.scopes if s.ok}

@@ -1,0 +1,1248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 18:08:07 -0800
+Subject: [PATCH 425/443] [ae-patch] Fix the review findings on 0424: scope
+ Enter and Esc, send after the take settles, light-safe colours, approval row
+
+Enter and Esc act only from the composer or the page, never while the chat is busy or a menu, dialog or overlay is open. Send now stops the take first, sends the settled draft once, and lets Enter fall through when it cannot send. The sheet gets light and dark safe state colours, the desktop bar moves the approval buttons to their own row when narrow, and the disabled Stop stays visible.
+---
+ web/src/components/AeVoicePanel.test.tsx      |  55 ++++-
+ web/src/components/AeVoicePanel.tsx           |  94 +++++---
+ web/src/components/ComposerMicButton.test.tsx |  63 ++++-
+ web/src/components/ComposerMicButton.tsx      |  20 +-
+ web/src/hooks/useAeVoiceMode.test.tsx         | 152 ++++++++++--
+ web/src/hooks/useAeVoiceMode.ts               | 142 +++++++++---
+ web/src/lib/aeVoiceKeys.test.ts               |  39 +++-
+ web/src/lib/aeVoiceKeys.ts                    |  30 ++-
+ web/src/pages/ChatPage.composer.test.tsx      | 219 +++++++++++++++++-
+ web/src/pages/ChatPage.tsx                    |  29 ++-
+ 10 files changed, 721 insertions(+), 122 deletions(-)
+
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index 56f004f9c8ef50841edeb9b83e51aabac8d02a38..b8b348235b62555015980989676b2da8822f9b0c 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -365,12 +365,20 @@ describe("AeVoicePanel car-mode sheet", () => {
+     expect(onSendNow).toHaveBeenCalledTimes(1);
+   });
+ 
+-  it.each(["thinking", "preparing"] as const)("%s: Stop is disabled and dimmed", (phase) => {
+-    sheet({ phase });
+-    expect(button()).toHaveTextContent("Stop");
+-    expect(button()).toBeDisabled();
+-    expect(button().className).toContain("opacity-50");
+-  });
++  it.each(["thinking", "preparing"] as const)(
++    "%s: Stop stays visible, dimmed, aria-disabled and out of the tab order",
++    async (phase) => {
++      const { onStop } = sheet({ phase });
++      expect(button()).toHaveTextContent("Stop");
++      expect(button()).toHaveAttribute("aria-disabled", "true");
++      expect(button()).toHaveAccessibleName("Stop (nothing playing yet)");
++      expect(button()).toHaveAttribute("tabindex", "-1");
++      expect(button()).not.toBeDisabled();
++      expect(button().className).toContain("opacity-50");
++      await userEvent.click(button());
++      expect(onStop).not.toHaveBeenCalled();
++    },
++  );
+ 
+   it("speaking: Stop is solid and calls onStop", async () => {
+     const { onStop } = sheet({ phase: "speaking", caption: "Hello." });
+@@ -413,6 +421,20 @@ describe("AeVoicePanel car-mode sheet", () => {
+     expect(screen.getByText("Listening").className).toContain("text-[30px]");
+   });
+ 
++  it("the state word and outline buttons use light-safe shades, with dark mode kept", () => {
++    sheet({ phase: "listening" });
++    expect(screen.getByText("Listening").className).toContain("text-teal-700");
++    expect(screen.getByText("Listening").className).toContain("dark:text-teal-500");
++    expect(button().className).toContain("dark:border-teal-500");
++    expect(button().className).toContain("dark:bg-transparent");
++    cleanup();
++    sheet({ phase: "thinking" });
++    expect(screen.getByText("Working").className).toContain("var(--ae-voice-amber)");
++    cleanup();
++    sheet({ phase: "paused", onRestartMic: vi.fn() });
++    expect(button().className).toContain("border-foreground/50");
++  });
++
+   it("the level bars show only while listening", () => {
+     const { unmount } = sheet({ phase: "listening" });
+     expect(screen.getByTestId("ae-voice-level")).toBeTruthy();
+@@ -454,6 +476,27 @@ describe("AeVoicePanel bar words and keys", () => {
+     expect(screen.getByTestId("ae-voice-panel").className).toContain("@container");
+   });
+ 
++  it("hides the Enter hint while an approval or question card is pending", () => {
++    expect(barHints("listening", false, false)).toEqual([{ keys: ["Esc"], word: "end" }]);
++    const { unmount } = panel({ phase: "listening", cardPending: true });
++    expect(screen.getByTestId("ae-voice-hints")).not.toHaveTextContent("Enter");
++    expect(screen.getByTestId("ae-voice-hints")).toHaveTextContent("Escend");
++    unmount();
++    panel({ phase: "listening", approvalActive: true, onApproval: vi.fn() });
++    expect(screen.getByTestId("ae-voice-hints")).not.toHaveTextContent("Enter");
++  });
++
++  it("puts the approval buttons on their own row below the container width", () => {
++    panel({ phase: "speaking", caption: "Slots full.", approvalActive: true, onApproval: vi.fn() });
++    const approval = screen.getByTestId("ae-voice-approval");
++    expect(approval.className).toContain("basis-full");
++    expect(approval.className).toContain("order-last");
++    expect(approval.className).toContain("@[560px]:basis-auto");
++    expect(screen.getByTestId("ae-voice-panel").className).toContain("flex-wrap");
++    expect(screen.getByText("Speaking, tap to stop").className).toContain("truncate");
++    expect(screen.getByText("Slots full.").className).toContain("line-clamp-2");
++  });
++
+   it("shows no hints while thinking", () => {
+     panel({ phase: "thinking" });
+     expect(screen.queryByTestId("ae-voice-hints")).toBeNull();
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index 71a0a75c7a62ca423744d9d94f8574247220154f..df9c29f8f75deced18e2d3f38116b4d51661e560 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -42,6 +42,8 @@ export interface AeVoicePanelProps {
+   onApproval?: (action: "accept" | "decline") => void;
+   /** Turn Voice mode off. */
+   onEnd: () => void;
++  /** A yes-or-no or question card waits: Enter cannot send, so its hint is hidden. */
++  cardPending?: boolean;
+   /** Sheet only: send the heard draft now instead of waiting out the send pause. */
+   onSendNow?: () => void;
+   /** Stop the current reply. */
+@@ -150,37 +152,49 @@ const SHEET_SPEAKING = {
+   top: "border-t-[color:var(--ae-voice-amber)]",
+   solid: "bg-[color:var(--ae-voice-amber)] text-white hover:bg-[color:var(--ae-voice-amber)]/90",
+   outline:
+-    "border-[color:var(--ae-voice-amber)] text-[color:var(--ae-voice-amber)] hover:bg-[color:var(--ae-voice-amber)]/10",
++    "border-[color:var(--ae-voice-amber)] text-[color:var(--ae-voice-amber)] hover:bg-[color:var(--ae-voice-amber)]/10 dark:bg-transparent",
++  word: "text-[color:var(--ae-voice-amber)]",
+ };
+ 
+ /** The sheet's top border and button fills per state colour (static strings so Tailwind sees them). */
+-const SHEET_COLOURS: Record<string, { top: string; solid: string; outline: string }> = {
+-  "text-teal-500": {
+-    top: "border-t-teal-500",
+-    solid: "bg-teal-500 text-white hover:bg-teal-500/90",
+-    outline: "border-teal-500 text-teal-500 hover:bg-teal-500/10",
+-  },
+-  "text-amber-500": {
+-    top: "border-t-amber-500",
+-    solid: "bg-amber-500 text-white hover:bg-amber-500/90",
+-    outline: "border-amber-500 text-amber-500 hover:bg-amber-500/10",
+-  },
+-  "text-blue-500": {
+-    top: "border-t-blue-500",
+-    solid: "bg-blue-500 text-white hover:bg-blue-500/90",
+-    outline: "border-blue-500 text-blue-500 hover:bg-blue-500/10",
+-  },
+-  "text-red-500": {
+-    top: "border-t-red-500",
+-    solid: "bg-red-500 text-white hover:bg-red-500/90",
+-    outline: "border-red-500 text-red-500 hover:bg-red-500/10",
+-  },
+-  "text-muted-foreground": {
+-    top: "border-t-border",
+-    solid: "bg-foreground text-background hover:bg-foreground/90",
+-    outline: "border-border text-foreground hover:bg-muted",
+-  },
+-};
++const SHEET_COLOURS: Record<string, { top: string; solid: string; outline: string; word: string }> =
++  {
++    "text-teal-500": {
++      top: "border-t-teal-500",
++      solid: "bg-teal-500 text-white hover:bg-teal-500/90",
++      outline:
++        "border-teal-600 text-teal-700 hover:bg-teal-500/10 dark:border-teal-500 dark:bg-transparent dark:text-teal-500",
++      word: "text-teal-700 dark:text-teal-500",
++    },
++    "text-amber-500": {
++      top: "border-t-amber-500",
++      solid: "bg-amber-500 text-white hover:bg-amber-500/90",
++      outline:
++        "border-[color:var(--ae-voice-amber)] text-[color:var(--ae-voice-amber)] hover:bg-amber-500/10 dark:bg-transparent",
++      word: "text-[color:var(--ae-voice-amber)]",
++    },
++    "text-blue-500": {
++      top: "border-t-blue-500",
++      solid: "bg-blue-500 text-white hover:bg-blue-500/90",
++      outline:
++        "border-blue-600 text-blue-700 hover:bg-blue-500/10 dark:border-blue-500 dark:bg-transparent dark:text-blue-500",
++      word: "text-blue-700 dark:text-blue-500",
++    },
++    "text-red-500": {
++      top: "border-t-red-500",
++      solid: "bg-red-500 text-white hover:bg-red-500/90",
++      outline:
++        "border-red-600 text-red-700 hover:bg-red-500/10 dark:border-red-500 dark:bg-transparent dark:text-red-500",
++      word: "text-red-700 dark:text-red-500",
++    },
++    "text-muted-foreground": {
++      top: "border-t-border",
++      solid: "bg-foreground text-background hover:bg-foreground/90",
++      outline:
++        "border-foreground/50 text-foreground hover:bg-muted dark:border-foreground/50 dark:bg-transparent",
++      word: "text-muted-foreground",
++    },
++  };
+ 
+ /** The sheet's short state words; the bar keeps `words()`. */
+ const SHEET_LABEL: Partial<Record<VoicePhaseKey, string>> = {
+@@ -194,10 +208,14 @@ export function micChordKeys(isMac: boolean): string[] {
+ }
+ 
+ /** Key hints on the bar: only keys that do this in the phase. */
+-export function barHints(key: VoicePhaseKey, isMac: boolean): { keys: string[]; word: string }[] {
++export function barHints(
++  key: VoicePhaseKey,
++  isMac: boolean,
++  canSendWithEnter = true,
++): { keys: string[]; word: string }[] {
+   if (key === "listening") {
+     return [
+-      { keys: ["Enter"], word: "send" },
++      ...(canSendWithEnter ? [{ keys: ["Enter"], word: "send" }] : []),
+       { keys: ["Esc"], word: "end" },
+     ];
+   }
+@@ -291,6 +309,7 @@ export function AeVoicePanel({
+   caption,
+   micDetail,
+   approvalActive = false,
++  cardPending = false,
+   onApproval,
+   onEnd,
+   onSendNow,
+@@ -407,7 +426,10 @@ export function AeVoicePanel({
+           variant="outline"
+           data-testid="ae-voice-action"
+           className={cn(big, "opacity-50")}
+-          disabled
++          aria-disabled="true"
++          aria-label="Stop (nothing playing yet)"
++          tabIndex={-1}
++          onClick={(e) => e.preventDefault()}
+         >
+           Stop
+         </Button>
+@@ -486,7 +508,7 @@ export function AeVoicePanel({
+             {endButton}
+           </div>
+         </div>
+-        <div className={cn("text-[30px] leading-tight font-bold", tone.text)}>
++        <div className={cn("text-[30px] leading-tight font-bold", colours.word)}>
+           {SHEET_LABEL[key] && !tapToStart ? SHEET_LABEL[key] : label}
+         </div>
+         <div className="min-h-10 line-clamp-2 text-sm text-muted-foreground">{sheetSub}</div>
+@@ -495,14 +517,14 @@ export function AeVoicePanel({
+     );
+   }
+ 
+-  const hints = barHints(key, isMacPlatform());
++  const hints = barHints(key, isMacPlatform(), !(cardPending || approvalActive));
+   return (
+     <div
+       data-testid="ae-voice-panel"
+       data-layout="bar"
+       data-phase={key}
+       className={cn(
+-        "@container mx-3 mt-3 flex items-center gap-3 rounded-lg border px-3 py-2",
++        "@container mx-3 mt-3 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border px-3 py-2",
+         tone.panel,
+         className,
+       )}
+@@ -514,7 +536,7 @@ export function AeVoicePanel({
+         onClick={action}
+         className="min-w-0 flex-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+       >
+-        <div className={cn("text-sm font-medium", tone.text)}>{label}</div>
++        <div className={cn("truncate text-sm font-medium", tone.text)}>{label}</div>
+         {sub ? (
+           <div
+             className={cn(
+@@ -548,7 +570,7 @@ export function AeVoicePanel({
+       {approvalPending && onApproval ? (
+         <div
+           data-testid="ae-voice-approval"
+-          className="relative z-10 flex flex-wrap items-center justify-center gap-2"
++          className="relative z-10 order-last flex basis-full flex-wrap items-center justify-end gap-2 @[560px]:order-none @[560px]:basis-auto @[560px]:justify-center"
+         >
+           {key !== "approval" ? (
+             <span className="text-xs font-medium text-amber-500">Waiting for your OK</span>
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index 9f3d68b52a77f58c34427a033190e87fd01716dc..0cd4263a8f6ffce9fd03b6b143ed57f546abcff4 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -28,7 +28,11 @@ import { getVoiceBins } from "@/lib/aeVoiceLevel";
+ import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
+ import { getVoiceSnapshot, resetVoiceStore, setVoiceOn } from "@/lib/aeVoiceMode";
+ import { useAeVoiceMode } from "@/hooks/useAeVoiceMode";
+-import { MIC_SYNTH_WAIT_CAP_MS, primeVoicePlayback, resetPrimeSpeaking } from "@/lib/aeSpeakReplies";
++import {
++  MIC_SYNTH_WAIT_CAP_MS,
++  primeVoicePlayback,
++  resetPrimeSpeaking,
++} from "@/lib/aeSpeakReplies";
+ import { installFakeSpeech, removeFakeSpeech, type FakeSynth } from "@/test/fakeSpeech";
+ import { ComposerMicButton } from "./ComposerMicButton";
+ 
+@@ -387,6 +391,63 @@ describe("ComposerMicButton", () => {
+     expect(e.defaultPrevented).toBe(true);
+   });
+ 
++  it("onTakeKey handled: Enter and Esc leave the take alone and are consumed", () => {
++    const onVoiceDiscard = vi.fn();
++    const onTakeKey = vi.fn(() => "handled" as const);
++    render(
++      <ComposerMicButton
++        onTranscript={vi.fn()}
++        onVoiceDiscard={onVoiceDiscard}
++        onTakeKey={onTakeKey}
++      />,
++    );
++    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
++    act(() => handlers.start?.({}));
++    for (const key of ["Enter", "Escape"]) {
++      const e = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
++      act(() => {
++        window.dispatchEvent(e);
++      });
++      expect(e.defaultPrevented).toBe(true);
++    }
++    expect(onTakeKey).toHaveBeenCalledTimes(2);
++    expect(stopSpy).not.toHaveBeenCalled();
++    expect(onVoiceDiscard).not.toHaveBeenCalled();
++  });
++
++  it("onTakeKey skip: Enter is left to the focused control, the take goes on", () => {
++    const onTakeKey = vi.fn(() => "skip" as const);
++    render(<ComposerMicButton onTranscript={vi.fn()} onTakeKey={onTakeKey} />);
++    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
++    act(() => handlers.start?.({}));
++    const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true });
++    act(() => {
++      window.dispatchEvent(e);
++    });
++    expect(e.defaultPrevented).toBe(false);
++    expect(stopSpy).not.toHaveBeenCalled();
++  });
++
++  it("onTakeKey null: Enter commits and Esc discards as before", () => {
++    const onVoiceDiscard = vi.fn();
++    render(
++      <ComposerMicButton
++        onTranscript={vi.fn()}
++        onVoiceDiscard={onVoiceDiscard}
++        onTakeKey={() => null}
++      />,
++    );
++    fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
++    act(() => handlers.start?.({}));
++    act(() => {
++      window.dispatchEvent(
++        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
++      );
++    });
++    expect(stopSpy).toHaveBeenCalledTimes(1);
++    expect(onVoiceDiscard).not.toHaveBeenCalled();
++  });
++
+   it("drops a late transcript that arrives after an Esc discard", () => {
+     const onTranscript = vi.fn();
+     render(<ComposerMicButton onTranscript={onTranscript} onVoiceDiscard={vi.fn()} />);
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 1a785ad395dff15bfd64ca12a85deddcd9302b05..c0f0b19e82118687f3e2e4fb0de4b671fd530306 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -170,8 +170,11 @@ export interface ComposerMicButtonProps {
+   enableHotkey?: boolean;
+   /** The hotkey runs this first; true means handled (Voice mode stopped a spoken reply). */
+   onHotkeyBarge?: () => boolean;
+-  /** Runs first on Enter or Esc during a take; true means handled (Voice mode sends or ends). */
+-  onTakeKey?: (e: globalThis.KeyboardEvent) => boolean;
++  /**
++   * Runs first on Enter or Esc during a take: "handled" means Voice mode sent or ended, "skip"
++   * leaves the key to the focused control, null keeps the take behavior.
++   */
++  onTakeKey?: (e: globalThis.KeyboardEvent) => "handled" | "skip" | null;
+   /** Fired when dictation begins. The parent should snapshot the composer text
+    *  here so {@link onVoiceDiscard} can revert to it. */
+   onVoiceStart?: () => void;
+@@ -1881,10 +1884,15 @@ export const ComposerMicButton = ({
+     if (!isListening) return;
+     const handler = (e: globalThis.KeyboardEvent): void => {
+       if (e.repeat || e.metaKey || e.ctrlKey || e.altKey) return;
+-      if ((e.key === "Enter" || e.key === "Escape") && onTakeKeyRef.current?.(e)) {
+-        e.preventDefault();
+-        e.stopPropagation();
+-        return;
++      if (e.key === "Enter" || e.key === "Escape") {
++        const verdict = onTakeKeyRef.current?.(e);
++        if (verdict === "skip") return;
++        if (verdict === "handled") {
++          e.preventDefault();
++          e.stopPropagation();
++          e.stopImmediatePropagation();
++          return;
++        }
+       }
+       if (e.key === "Enter" && !e.shiftKey) {
+         // Commit: end the take and keep the text. toggle() routes to the right
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index c2afd0859c5c789cd0e05ceca535cde89ac58d40..0065b028fe0ec1ca8e3bb05b7787ac9e150308be 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -19,7 +19,12 @@ import {
+ import { useChatStore } from "@/store/chatStore";
+ import { installFakeSpeech, removeFakeSpeech, type FakeSynth } from "@/test/fakeSpeech";
+ import { formatVoiceLog, resetVoiceLog } from "@/lib/aeVoiceLog";
+-import { MIC_DEAF_DETAIL, MIC_START_NET_MS, useAeVoiceMode } from "./useAeVoiceMode";
++import {
++  MIC_DEAF_DETAIL,
++  MIC_START_NET_MS,
++  SEND_NOW_CAP_MS,
++  useAeVoiceMode,
++} from "./useAeVoiceMode";
+ 
+ const CARD = {
+   type: "elicitation",
+@@ -422,27 +427,134 @@ describe("useAeVoiceMode", () => {
+     expect(result.current.filterHeard("anything at all", "final")).toBe("anything at all");
+   });
+ 
+-  it("sendNow sends the draft at once and clears the pending grace", () => {
+-    const { result } = mount({ value: "hello there" });
+-    act(() => void result.current.onFinal("hello there"));
+-    act(() => void vi.advanceTimersByTime(500));
+-    act(() => result.current.sendNow());
+-    expect(submit).toHaveBeenCalledTimes(1);
+-    act(() => void vi.advanceTimersByTime(GRACE_MS * 2));
+-    expect(submit).toHaveBeenCalledTimes(1);
+-  });
++  describe("sendNow", () => {
++    it("stops the take, lets its last words land, then sends once and clears the grace", () => {
++      const { result, rerender } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.onFinal("hello"));
++      let handled = false;
++      act(() => {
++        handled = result.current.sendNow();
++      });
++      expect(handled).toBe(true);
++      expect(controller.current.stop).toHaveBeenCalled();
++      expect(submit).not.toHaveBeenCalled();
++      // The stopped take's tail arrives as a final and goes into the draft.
++      let used = true;
++      act(() => {
++        used = result.current.onFinal("there");
++      });
++      expect(used).toBe(false);
++      rerender({
++        chatId: "c1",
++        value: "hello there",
++        status: "idle",
++        canSend: true,
++        submit,
++      });
++      act(() => void vi.advanceTimersByTime(200));
++      expect(submit).toHaveBeenCalledTimes(1);
++      act(() => void vi.advanceTimersByTime(GRACE_MS * 3));
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
+ 
+-  it("sendNow does nothing without a draft", () => {
+-    const { result } = mount({ value: "  " });
+-    act(() => result.current.sendNow());
+-    expect(submit).not.toHaveBeenCalled();
+-  });
++    it("sends what is there after the cap when no final arrives", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.sendNow());
++      act(() => void vi.advanceTimersByTime(SEND_NOW_CAP_MS - 1));
++      expect(submit).not.toHaveBeenCalled();
++      act(() => void vi.advanceTimersByTime(1));
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
+ 
+-  it("sendNow does nothing while the reply plays", () => {
+-    const { result } = mount({ value: "hello" });
+-    act(() => setVoiceSpeaking("c1", true));
+-    act(() => result.current.sendNow());
+-    expect(submit).not.toHaveBeenCalled();
++    it("sends at once when the mic is not listening", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      listening = false;
++      act(() => void result.current.sendNow());
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
++
++    it("a second press while the first is sending sends nothing more", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      let first = false;
++      let second = false;
++      act(() => {
++        first = result.current.sendNow();
++        second = result.current.sendNow();
++      });
++      expect(first).toBe(true);
++      expect(second).toBe(true);
++      act(() => void vi.advanceTimersByTime(SEND_NOW_CAP_MS));
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
++
++    it("two sends in one render send once", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      listening = false;
++      act(() => {
++        result.current.sendNow();
++        result.current.sendNow();
++      });
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
++
++    it("a final that arrives after the send never starts a second message", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.sendNow());
++      act(() => void vi.advanceTimersByTime(SEND_NOW_CAP_MS));
++      expect(submit).toHaveBeenCalledTimes(1);
++      act(() => void result.current.onFinal("late words"));
++      act(() => void vi.advanceTimersByTime(GRACE_MS * 3));
++      expect(submit).toHaveBeenCalledTimes(1);
++    });
++
++    it("does not say Mic stopped while the take is stopping", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => result.current.onListening(true));
++      act(() => void result.current.sendNow());
++      act(() => result.current.onListening(false));
++      expect(getVoiceSnapshot("c1").phase).toBe("listening");
++    });
++
++    it("returns false and leaves the take alone with no draft", () => {
++      const { result } = mount({ value: "  " });
++      act(() => result.current.onListening(true));
++      let handled = true;
++      act(() => {
++        handled = result.current.sendNow();
++      });
++      expect(handled).toBe(false);
++      expect(controller.current.stop).not.toHaveBeenCalled();
++      expect(submit).not.toHaveBeenCalled();
++    });
++
++    it("returns false when the composer refuses (a card is pending), grace untouched", () => {
++      const { result } = mount({ value: "hello", canSend: false });
++      act(() => result.current.onListening(true));
++      let handled = true;
++      act(() => {
++        handled = result.current.sendNow();
++      });
++      expect(handled).toBe(false);
++      expect(controller.current.stop).not.toHaveBeenCalled();
++      expect(submit).not.toHaveBeenCalled();
++    });
++
++    it("returns false while the reply plays", () => {
++      const { result } = mount({ value: "hello" });
++      act(() => setVoiceSpeaking("c1", true));
++      let handled = true;
++      act(() => {
++        handled = result.current.sendNow();
++      });
++      expect(handled).toBe(false);
++      expect(submit).not.toHaveBeenCalled();
++    });
+   });
+ 
+   it("does not send an empty draft", () => {
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index ac8b3260cadd1254d41ef857df4b40d84ed418b3..c047858821c995fb6b6003f8dd0a24e2e7541e87 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -41,6 +41,10 @@ import { useChatStore } from "@/store/chatStore";
+ 
+ /** If the chat never shows a turn after a send, stop waiting for it. */
+ const SEND_WAIT_MS = 5000;
++/** Send now: the longest wait for the stopped take's last words before sending what is there. */
++export const SEND_NOW_CAP_MS = 1500;
++/** Send now: after the last final, how long the draft takes to settle before it is sent. */
++const SEND_NOW_SETTLE_MS = 150;
+ /** One retry of a mic start that failed. */
+ const MIC_RETRY_MS = 1000;
+ /**
+@@ -88,8 +92,12 @@ export interface AeVoiceMode {
+    * a final result.
+    */
+   filterHeard: (text: string, kind: "interim" | "final") => string;
+-  /** Sends the heard draft at once instead of waiting out the send pause; no-op without a draft. */
+-  sendNow: () => void;
++  /**
++   * Sends the heard draft at once instead of waiting out the send pause: stops the take, lets its
++   * last words land, then sends once. False when it cannot send (no draft, a card is pending, the
++   * composer refuses), so the key can do what it did before.
++   */
++  sendNow: () => boolean;
+   /** Stops the reply being spoken (the hotkey); true when it did. The mic stays on. */
+   bargeIn: () => boolean;
+   /** The mic reports it started or stopped listening (or failed to start). */
+@@ -137,6 +145,14 @@ export function useAeVoiceMode({
+   const approvalActive = approval !== null;
+ 
+   const [awaiting, setAwaiting] = useState(false);
++  // Send now: the take is stopping so its tail can land before the draft is sent.
++  const [flushing, setFlushing] = useState(false);
++  const flushRef = useRef(false);
++  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
++  // Finals for the take Send now stopped never arm a grace; cleared when the mic listens again.
++  const sentNowTake = useRef(false);
++  // Set inside send() and cleared after the next render: two presses in one render send once.
++  const sendLock = useRef(false);
+   const [ready, setReady] = useState(true);
+   const [micListening, setMicListening] = useState(false);
+   const [micFailed, setMicFailed] = useState(false);
+@@ -218,6 +234,51 @@ export function useAeVoiceMode({
+     graceTimer.current = null;
+   }, []);
+ 
++  useEffect(() => {
++    sendLock.current = false;
++  });
++
++  const send = useCallback(() => {
++    const now = latest.current;
++    if (sendLock.current) return;
++    if (!now.canSend) {
++      logVoice(
++        "send refused",
++        now.approval !== null
++          ? "approval pending"
++          : now.questions !== null
++            ? "card pending"
++            : "composer",
++      );
++      return;
++    }
++    sendLock.current = true;
++    logVoice("send");
++    setAwaiting(true);
++    if (sendTimer.current !== null) clearTimeout(sendTimer.current);
++    sendTimer.current = setTimeout(() => {
++      sendTimer.current = null;
++      setAwaiting(false);
++    }, SEND_WAIT_MS);
++    now.submit();
++  }, []);
++
++  const endFlush = useCallback(() => {
++    if (flushTimer.current !== null) clearTimeout(flushTimer.current);
++    flushTimer.current = null;
++    flushRef.current = false;
++    setFlushing(false);
++  }, []);
++
++  // Send now: the stopped take is done (or the cap passed); send the settled draft once.
++  const finishFlush = useCallback(() => {
++    if (!flushRef.current) return;
++    endFlush();
++    const now = latest.current;
++    if (now.value.trim() === "" || now.quiet) return;
++    send();
++  }, [endFlush, send]);
++
+   // This mounted chat's Voice mode holds the audio session (a count, so two Voice chats or a
+   // remount never restore it early). A start tap's hold (new-chat Voice button, Voice switch)
+   // is released only after this chat has entered, so the count never reaches zero between them.
+@@ -339,6 +400,7 @@ export function useAeVoiceMode({
+     chatSwitched.current = false;
+     if (!on) {
+       clearGrace();
++      endFlush();
+       // Turning the switch off hands the mic back, quiet.
+       if (wasOn.current) {
+         logVoice("voice end");
+@@ -379,7 +441,7 @@ export function useAeVoiceMode({
+       // A start still connecting is withdrawn too, not only a live stream.
+       mic.stop();
+     }
+-  }, [on, wantListen, chatId, controller, clearGrace, clearNet, startMic]);
++  }, [on, wantListen, chatId, controller, clearGrace, clearNet, startMic, endFlush]);
+ 
+   const onListening = useCallback(
+     (listening: boolean, reason?: "deaf") => {
+@@ -388,6 +450,7 @@ export function useAeVoiceMode({
+       personInterims.current = 0;
+       utteranceStartedAt.current = null;
+       if (listening) {
++        sentNowTake.current = false;
+         clearNet();
+         startPending.current = false;
+         failures.current = 0;
+@@ -439,7 +502,7 @@ export function useAeVoiceMode({
+         stopAsked.current = false;
+         if (latest.current.wantListen) startMic();
+         return;
+-      } else if (latest.current.wantListen) {
++      } else if (latest.current.wantListen && !flushRef.current) {
+         // Stopped from outside (the mic button, the hotkey): leave it stopped.
+         logVoice("mic paused", "stopped from outside");
+         // Not uploaded: this stop is also the user's own (the mic button, the hotkey) and the
+@@ -464,37 +527,24 @@ export function useAeVoiceMode({
+             ? "approval"
+             : waiting
+               ? "thinking"
+-              : micListening
++              : micListening || flushing
+                 ? "listening"
+                 : micStopped
+                   ? "paused"
+                   : "starting";
+     logVoice(`phase ${phase}`);
+     setVoicePhase(chatId, phase);
+-  }, [chatId, on, speaking, micFailed, approvalActive, waiting, micListening, micStopped]);
+-
+-  const send = useCallback(() => {
+-    const now = latest.current;
+-    if (!now.canSend) {
+-      logVoice(
+-        "send refused",
+-        now.approval !== null
+-          ? "approval pending"
+-          : now.questions !== null
+-            ? "card pending"
+-            : "composer",
+-      );
+-      return;
+-    }
+-    logVoice("send");
+-    setAwaiting(true);
+-    if (sendTimer.current !== null) clearTimeout(sendTimer.current);
+-    sendTimer.current = setTimeout(() => {
+-      sendTimer.current = null;
+-      setAwaiting(false);
+-    }, SEND_WAIT_MS);
+-    now.submit();
+-  }, []);
++  }, [
++    chatId,
++    on,
++    speaking,
++    micFailed,
++    approvalActive,
++    waiting,
++    micListening,
++    micStopped,
++    flushing,
++  ]);
+ 
+   // A new question card: read it aloud, one question at a time.
+   const cardId = block?.type === "elicitation" ? block.elicitationId : null;
+@@ -754,6 +804,14 @@ export function useAeVoiceMode({
+         return true;
+       }
+       clearGrace();
++      if (flushRef.current) {
++        // Send now: the take's last words go in the draft, then it is sent once, settled.
++        if (flushTimer.current !== null) clearTimeout(flushTimer.current);
++        flushTimer.current = setTimeout(finishFlush, SEND_NOW_SETTLE_MS);
++        return false;
++      }
++      // A final of the take Send now already sent never starts a second send.
++      if (sentNowTake.current) return false;
+       graceTimer.current = setTimeout(() => {
+         graceTimer.current = null;
+         const current = latest.current;
+@@ -762,7 +820,7 @@ export function useAeVoiceMode({
+       }, graceMs());
+       return false;
+     },
+-    [on, onCardFinal, clearGrace, send, sendApproval, graceMs],
++    [on, onCardFinal, clearGrace, send, sendApproval, graceMs, finishFlush],
+   );
+ 
+   const onPartial = useCallback(
+@@ -780,12 +838,28 @@ export function useAeVoiceMode({
+     [on, clearGrace],
+   );
+ 
+-  const sendNow = useCallback(() => {
++  const sendNow = useCallback((): boolean => {
++    // A second press while the first is sending is spent, not passed on.
++    if (flushRef.current || sendLock.current) return true;
+     const current = latest.current;
+-    if (current.quiet || current.value.trim() === "") return;
++    if (!current.canSend || current.quiet || current.value.trim() === "") return false;
+     clearGrace();
+-    send();
+-  }, [clearGrace, send]);
++    logVoice("send now");
++    flushRef.current = true;
++    sentNowTake.current = true;
++    setFlushing(true);
++    const mic = controller.current;
++    if (mic && (mic.isListening() || startPending.current)) {
++      // Our own stop: the take flushes its tail as a final before it ends.
++      stopAsked.current = false;
++      startPending.current = false;
++      mic.stop();
++      flushTimer.current = setTimeout(finishFlush, SEND_NOW_CAP_MS);
++    } else {
++      finishFlush();
++    }
++    return true;
++  }, [clearGrace, controller, finishFlush]);
+ 
+   const answerApproval = useCallback(
+     (action: "accept" | "decline") => {
+diff --git a/web/src/lib/aeVoiceKeys.test.ts b/web/src/lib/aeVoiceKeys.test.ts
+index 14637cf0fe6c48a53989b30943321cc49a559916..0bb22cd9e2b7690b3b4f9f60fa7e3e463a5ca817 100644
+--- a/web/src/lib/aeVoiceKeys.test.ts
++++ b/web/src/lib/aeVoiceKeys.test.ts
+@@ -1,5 +1,10 @@
+ import { afterEach, describe, expect, it } from "vitest";
+-import { overlayIsOpen, voiceKeyAction, type VoiceKeyContext } from "./aeVoiceKeys";
++import {
++  isComposerKeyTarget,
++  overlayIsOpen,
++  voiceKeyAction,
++  type VoiceKeyContext,
++} from "./aeVoiceKeys";
+ 
+ const base: VoiceKeyContext = {
+   voiceOn: true,
+@@ -7,6 +12,7 @@ const base: VoiceKeyContext = {
+   phase: "listening",
+   busy: false,
+   overlayOpen: false,
++  targetOk: true,
+ };
+ const key = (k: string, extra: Record<string, boolean> = {}) => ({
+   key: k,
+@@ -44,17 +50,46 @@ describe("voiceKeyAction", () => {
+     expect(voiceKeyAction(key("Escape"), { ...base, voiceOn: false })).toBeNull();
+   });
+ 
+-  it("Esc does nothing while the chat is working or a menu or the /btw overlay is open", () => {
++  it("Esc and Enter do nothing while the chat is working or a menu or the /btw overlay is open", () => {
+     expect(voiceKeyAction(key("Escape"), { ...base, busy: true })).toBeNull();
++    expect(voiceKeyAction(key("Enter"), { ...base, busy: true })).toBeNull();
++  });
++
++  it("neither key acts from a button, link, other input or editor", () => {
++    expect(voiceKeyAction(key("Escape"), { ...base, targetOk: false })).toBeNull();
++    expect(voiceKeyAction(key("Enter"), { ...base, targetOk: false })).toBeNull();
+   });
+ 
+   it("Esc does nothing with a dialog, menu or listbox open", () => {
+     expect(voiceKeyAction(key("Escape"), { ...base, overlayOpen: true })).toBeNull();
++    expect(voiceKeyAction(key("Enter"), { ...base, overlayOpen: true })).toBeNull();
+     expect(overlayIsOpen()).toBe(false);
+     document.body.innerHTML = '<div role="dialog"></div>';
+     expect(overlayIsOpen()).toBe(true);
+   });
+ 
++  it("a closed or hidden overlay does not count", () => {
++    document.body.innerHTML =
++      '<div role="menu" data-state="closed"></div><div aria-hidden="true"><div role="listbox"></div></div>';
++    expect(overlayIsOpen()).toBe(false);
++  });
++
++  it("only the composer text box or the page itself is a key target", () => {
++    const composer = document.createElement("textarea");
++    const button = document.createElement("button");
++    const term = document.createElement("div");
++    term.className = "xterm";
++    const editable = document.createElement("div");
++    document.body.append(composer, button, term, editable);
++    expect(isComposerKeyTarget(composer, composer)).toBe(true);
++    expect(isComposerKeyTarget(document.body, composer)).toBe(true);
++    expect(isComposerKeyTarget(null, composer)).toBe(true);
++    expect(isComposerKeyTarget(button, composer)).toBe(false);
++    expect(isComposerKeyTarget(term, composer)).toBe(false);
++    expect(isComposerKeyTarget(editable, composer)).toBe(false);
++    expect(isComposerKeyTarget(document.createElement("textarea"), composer)).toBe(false);
++  });
++
+   it("the phone sheet has no key change", () => {
+     expect(voiceKeyAction(key("Escape"), { ...base, sheet: true })).toBeNull();
+     expect(voiceKeyAction(key("Enter"), { ...base, sheet: true })).toBeNull();
+diff --git a/web/src/lib/aeVoiceKeys.ts b/web/src/lib/aeVoiceKeys.ts
+index 4dc5c85d577ad862d8b6f9fb3e5cff326f3f9cc6..5748fbcda2ae96b7a5c87d2b27ca50395e7f7d7d 100644
+--- a/web/src/lib/aeVoiceKeys.ts
++++ b/web/src/lib/aeVoiceKeys.ts
+@@ -13,15 +13,32 @@ export interface VoiceKeyContext {
+   busy: boolean;
+   /** A dialog, menu or listbox is open in the document. */
+   overlayOpen: boolean;
++  /** The key came from the composer text box or the page itself, not a button, menu or editor. */
++  targetOk: boolean;
+ }
+ 
+ export type VoiceKeyAction = "send" | "end" | null;
+ 
+ const OVERLAY_SELECTOR = '[role="dialog"], [role="menu"], [role="listbox"]';
+ 
+-/** True when a dialog, menu or listbox is open. */
++/** True when a dialog, menu or listbox is open (a closed or hidden one does not count). */
+ export function overlayIsOpen(doc: Document = document): boolean {
+-  return doc.querySelector(OVERLAY_SELECTOR) !== null;
++  for (const el of doc.querySelectorAll(OVERLAY_SELECTOR)) {
++    if (el.closest('[hidden], [aria-hidden="true"], [data-state="closed"]')) continue;
++    return true;
++  }
++  return false;
++}
++
++/** True for a key from the composer's own text box, or from the page when nothing is focused. */
++export function isComposerKeyTarget(
++  target: EventTarget | null,
++  composer: HTMLElement | null,
++  doc: Document = document,
++): boolean {
++  if (target === null) return true;
++  if (composer !== null && target === composer) return true;
++  return target === doc.body || target === doc.documentElement || target === doc;
+ }
+ 
+ /** What a key press does in Voice mode, or null to leave it to the other handlers. */
+@@ -32,14 +49,9 @@ export function voiceKeyAction(
+   ctx: VoiceKeyContext,
+ ): VoiceKeyAction {
+   if (!ctx.voiceOn || ctx.sheet || e.repeat || e.metaKey || e.ctrlKey || e.altKey) return null;
+-  if (e.isComposing) return null;
++  if (e.isComposing || !ctx.targetOk || ctx.busy || ctx.overlayOpen) return null;
+   if (e.key === "Enter" && !e.shiftKey && ctx.phase === "listening") return "send";
+-  if (
+-    e.key === "Escape" &&
+-    (ctx.phase === "listening" || ctx.phase === "speaking") &&
+-    !ctx.busy &&
+-    !ctx.overlayOpen
+-  ) {
++  if (e.key === "Escape" && (ctx.phase === "listening" || ctx.phase === "speaking")) {
+     return "end";
+   }
+   return null;
+diff --git a/web/src/pages/ChatPage.composer.test.tsx b/web/src/pages/ChatPage.composer.test.tsx
+index 349c0fb86f80684c5de221aa92ff4536af7310fe..21e792c18e32de4227c116447d9670caf0460c55 100644
+--- a/web/src/pages/ChatPage.composer.test.tsx
++++ b/web/src/pages/ChatPage.composer.test.tsx
+@@ -19,6 +19,8 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+ import { SideChatPane } from "@/components/chat/SideChatPane";
+ import { toast } from "sonner";
+ import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
++import { getVoiceSnapshot, resetVoiceStore, setVoiceOn, setVoicePhase } from "@/lib/aeVoiceMode";
++import type { VoicePhase } from "@/lib/aeVoiceMode";
+ import { handleSessionEvent, useChatStore, type ChatState } from "@/store/chatStore";
+ import {
+   clearSessionDrafts,
+@@ -182,6 +184,7 @@ import type { ElicitationBlock, UserMessageBlock } from "@/lib/blocks";
+ import { getGoal } from "@/lib/goalApi";
+ import { TooltipProvider } from "@/components/ui/tooltip";
+ import { changeAeFastMode, resetAeFastModeStore } from "@/lib/aeFastMode";
++import type * as ComposerMicModule from "@/components/ComposerMicButton";
+ import { Composer, computeIsWorking } from "./ChatPage";
+ import { readAlwaysSteer, writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+ import { appendPromptHistoryEntry } from "@/hooks/usePromptHistory";
+@@ -284,6 +287,217 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
+   );
+ }
+ 
++type MicModule = typeof ComposerMicModule;
++const micStub = vi.hoisted(() => ({
++  on: false,
++  props: null as null | {
++    onTakeKey?: (e: KeyboardEvent) => "handled" | "skip" | null;
++    controller?: { current: unknown };
++  },
++  listening: true,
++  stop: null as null | (() => void),
++}));
++vi.mock("@/components/ComposerMicButton", async (importOriginal) => {
++  const real = await importOriginal<MicModule>();
++  return {
++    ...real,
++    ComposerMicButton: (props: Parameters<typeof real.ComposerMicButton>[0]) => {
++      if (!micStub.on) return <real.ComposerMicButton {...props} />;
++      micStub.props = props as never;
++      const stop = vi.fn();
++      micStub.stop = stop;
++      if (props.controller) {
++        props.controller.current = {
++          start: vi.fn(),
++          stop,
++          restart: vi.fn(),
++          isListening: () => micStub.listening,
++          startPath: () => "browser",
++          takePath: () => "browser",
++        };
++      }
++      return <button type="button" data-testid="mic-stub" />;
++    },
++  };
++});
++
++describe("Composer Voice mode keys", () => {
++  const CHAT = "conv_voice_keys";
++  beforeEach(() => {
++    clearSessionDrafts();
++    micStub.on = true;
++    micStub.listening = false;
++    useChatStore.setState({ conversationId: CHAT, blocks: [] });
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() => Promise.resolve(new Response("{}", { status: 200 }))),
++    );
++    resetVoiceStore();
++  });
++  afterEach(() => {
++    cleanup();
++    micStub.on = false;
++    micStub.props = null;
++    document.body.querySelectorAll("[data-test-extra]").forEach((el) => el.remove());
++    resetVoiceStore();
++    vi.unstubAllGlobals();
++  });
++
++  function voiceComposer(
++    phase: VoicePhase,
++    overrides: Partial<Parameters<typeof Composer>[0]> = {},
++  ) {
++    const props = composerProps(overrides);
++    render(<Composer {...props} />);
++    act(() => setVoiceOn(CHAT, true));
++    act(() => setVoicePhase(CHAT, phase));
++    return props;
++  }
++  const keyOn = (target: EventTarget, key: string) => {
++    const e = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
++    act(() => {
++      target.dispatchEvent(e);
++    });
++    return e;
++  };
++  const extra = (html: string) => {
++    const wrap = document.createElement("div");
++    wrap.setAttribute("data-test-extra", "");
++    wrap.innerHTML = html;
++    document.body.append(wrap);
++    return wrap.firstElementChild as HTMLElement;
++  };
++
++  it.each(["listening", "speaking"] as const)("Esc ends Voice mode while %s", (phase) => {
++    voiceComposer(phase);
++    expect(getVoiceSnapshot(CHAT).on).toBe(true);
++    const e = keyOn(document.body, "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(false);
++    expect(e.defaultPrevented).toBe(true);
++  });
++
++  it("Esc from the composer text box ends Voice mode and keeps the draft", () => {
++    voiceComposer("listening");
++    fireEvent.change(textarea(), { target: { value: "half a thought" } });
++    keyOn(textarea(), "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(false);
++    expect(textarea()).toHaveValue("half a thought");
++  });
++
++  it("no menu, listbox or dialog role is mounted while Voice mode runs", () => {
++    voiceComposer("listening");
++    expect(document.querySelector('[role="menu"], [role="listbox"], [role="dialog"]')).toBeNull();
++  });
++
++  it("Esc does not end Voice mode while thinking, or with Voice mode off", () => {
++    voiceComposer("thinking");
++    keyOn(document.body, "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(true);
++    act(() => setVoiceOn(CHAT, false));
++    const e = keyOn(document.body, "Escape");
++    expect(e.defaultPrevented).toBe(false);
++  });
++
++  it("Esc keeps stopping a working chat and leaves Voice mode on", () => {
++    const props = voiceComposer("listening", { isWorking: true, status: "streaming" });
++    fireEvent.keyDown(textarea(), { key: "Escape" });
++    expect(props.onStop).toHaveBeenCalledTimes(1);
++    keyOn(document.body, "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(true);
++  });
++
++  it("Esc leaves an open dialog, the slash menu and the /btw overlay alone", () => {
++    voiceComposer("listening");
++    const dialog = extra('<div role="dialog"></div>');
++    keyOn(document.body, "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(true);
++    dialog.remove();
++    fireEvent.change(textarea(), { target: { value: "/" } });
++    expect(activeRow()).not.toBeNull();
++    keyOn(document.body, "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(true);
++    fireEvent.change(textarea(), { target: { value: "" } });
++    act(() => {
++      useChatStore.setState({ btwSidechat: { question: "q" } } as never);
++    });
++    keyOn(document.body, "Escape");
++    expect(getVoiceSnapshot(CHAT).on).toBe(true);
++    act(() => {
++      useChatStore.setState({ btwSidechat: null } as never);
++    });
++  });
++
++  it("Esc from a button, a terminal or an editor is left to that control", () => {
++    voiceComposer("listening");
++    for (const target of [
++      screen.getByRole("button", { name: "End voice mode" }),
++      extra('<div class="xterm"><textarea></textarea></div>').querySelector("textarea")!,
++      extra('<div contenteditable="true"></div>'),
++      extra("<input />"),
++    ]) {
++      keyOn(target, "Escape");
++      expect(getVoiceSnapshot(CHAT).on).toBe(true);
++    }
++  });
++
++  it("Enter sends the heard draft once, even pressed twice", async () => {
++    const props = voiceComposer("listening");
++    fireEvent.change(textarea(), { target: { value: "open the file" } });
++    const take = micStub.props!.onTakeKey!;
++    let first: string | null = null;
++    let second: string | null = null;
++    act(() => {
++      first = take(new KeyboardEvent("keydown", { key: "Enter" }));
++      second = take(new KeyboardEvent("keydown", { key: "Enter" }));
++    });
++    expect(first).toBe("handled");
++    expect(second).toBe("handled");
++    // The stopped take settles for up to SEND_NOW_CAP_MS before the draft goes.
++    await waitFor(() => expect(props.onSend).toHaveBeenCalledTimes(1), { timeout: 3000 });
++  });
++
++  it("Enter with no draft, or a composer that refuses, falls through to the take", () => {
++    const props = voiceComposer("listening");
++    const take = micStub.props!.onTakeKey!;
++    expect(take(new KeyboardEvent("keydown", { key: "Enter" }))).toBeNull();
++    cleanup();
++    resetVoiceStore();
++    const refusing = voiceComposer("listening", { sendDisabledReason: "Start the session first" });
++    fireEvent.change(textarea(), { target: { value: "hello" } });
++    expect(micStub.props!.onTakeKey!(new KeyboardEvent("keydown", { key: "Enter" }))).toBeNull();
++    expect(props.onSend).not.toHaveBeenCalled();
++    expect(refusing.onSend).not.toHaveBeenCalled();
++  });
++
++  it("Enter with the slash menu open does not send", () => {
++    const props = voiceComposer("listening");
++    fireEvent.change(textarea(), { target: { value: "/" } });
++    expect(activeRow()).not.toBeNull();
++    const out = micStub.props!.onTakeKey!(new KeyboardEvent("keydown", { key: "Enter" }));
++    expect(out).toBeNull();
++    expect(props.onSend).not.toHaveBeenCalled();
++  });
++
++  it("Enter on the focused End button, or in a terminal, is skipped so it clicks End", () => {
++    voiceComposer("listening");
++    fireEvent.change(textarea(), { target: { value: "hello" } });
++    const take = micStub.props!.onTakeKey!;
++    const end = screen.getByRole("button", { name: "End voice mode" });
++    const term = extra('<div class="xterm"><textarea></textarea></div>').querySelector("textarea")!;
++    for (const target of [end, term]) {
++      const e = new KeyboardEvent("keydown", { key: "Enter", bubbles: true });
++      target.dispatchEvent(e);
++      expect(take(e)).toBe("skip");
++    }
++  });
++
++  it("Enter does nothing special on the phone-less speaking phase", () => {
++    voiceComposer("speaking");
++    fireEvent.change(textarea(), { target: { value: "hello" } });
++    expect(micStub.props!.onTakeKey!(new KeyboardEvent("keydown", { key: "Enter" }))).toBeNull();
++  });
++});
++
+ describe("Composer Escape interrupt", () => {
+   beforeEach(() => {
+     clearSessionDrafts();
+@@ -2382,7 +2596,10 @@ describe("Composer model/effort label", () => {
+     // From the Effort row too, not only from a model row.
+     fireEvent.keyDown(screen.getByTestId("composer-agent-effort-trigger"), { key: "2" });
+     await waitFor(() =>
+-      expect(setModel).toHaveBeenCalledWith(rows[1].getAttribute("data-model-id"), expect.anything()),
++      expect(setModel).toHaveBeenCalledWith(
++        rows[1].getAttribute("data-model-id"),
++        expect.anything(),
++      ),
+     );
+     // The current model's own digit is not a pick either.
+     setModel.mockClear();
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index e70e73d6c45001759d5399b3fd770d857710f534..caea80e23aa90b1366de8daf739b012470711df9 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -234,7 +234,7 @@ import {
+ import { AeSpeakRepliesButton } from "@/components/AeSpeakRepliesButton";
+ import { ComposerMicButton } from "@/components/ComposerMicButton";
+ import { useAeVoiceMode } from "@/hooks/useAeVoiceMode";
+-import { overlayIsOpen, voiceKeyAction } from "@/lib/aeVoiceKeys";
++import { isComposerKeyTarget, overlayIsOpen, voiceKeyAction } from "@/lib/aeVoiceKeys";
+ import { useAeVoiceSnips } from "@/hooks/useAeVoiceSnips";
+ import { useVoiceLogInsert } from "@/lib/aeVoiceLog";
+ import { AE_VOICE_RING, AeVoicePanel, voicePhaseKey } from "@/components/AeVoicePanel";
+@@ -3594,25 +3594,39 @@ function ComposerImpl(
+     slashCompletion.open ||
+     mentionOpen ||
+     mentionListingPending;
+-  const voiceKeyRef = useRef<(e: globalThis.KeyboardEvent) => boolean>(() => false);
++  const voiceKeyRef = useRef<(e: globalThis.KeyboardEvent) => "handled" | "skip" | null>(
++    () => null,
++  );
+   voiceKeyRef.current = (e) => {
++    const targetOk = isComposerKeyTarget(e.target, textareaRef.current);
+     const act = voiceKeyAction(e, {
+       voiceOn: voice.on,
+       sheet: voiceSheet,
+       phase: voice.phase,
+       busy: voiceKeyBusy,
+       overlayOpen: overlayIsOpen(),
++      targetOk,
+     });
+-    if (act === "send") voice.sendNow();
+-    else if (act === "end" && composerSessionId) setVoiceOn(composerSessionId, false);
+-    return act !== null;
++    // Enter that cannot send (no draft, a card waits) is left to end the take as before.
++    if (act === "send") return voice.sendNow() ? "handled" : null;
++    if (act === "end" && composerSessionId) {
++      setVoiceOn(composerSessionId, false);
++      return "handled";
++    }
++    // Enter on a focused button or menu item belongs to that control, not to the take.
++    if (e.key === "Enter" && voice.on && !voiceSheet && !targetOk) return "skip";
++    return null;
+   };
+   const voiceTakeKey = useCallback((e: globalThis.KeyboardEvent) => voiceKeyRef.current(e), []);
+   useEffect(() => {
+     if (!voice.on) return;
+     const handler = (e: globalThis.KeyboardEvent): void => {
+       if (e.key !== "Escape" || e.defaultPrevented) return;
+-      if (voiceKeyRef.current(e)) e.preventDefault();
++      if (voiceKeyRef.current(e) === "handled") {
++        e.preventDefault();
++        e.stopPropagation();
++        e.stopImmediatePropagation();
++      }
+     };
+     window.addEventListener("keydown", handler, true);
+     return () => window.removeEventListener("keydown", handler, true);
+@@ -3854,7 +3868,8 @@ function ComposerImpl(
+                   caption={voiceSnap.caption}
+                   micDetail={voice.micDetail}
+                   onEnd={() => setVoiceOn(composerSessionId, false)}
+-                  onSendNow={voice.sendNow}
++                  onSendNow={() => void voice.sendNow()}
++                  cardPending={voice.cardActive || voice.approvalActive}
+                   onStop={() => {
+                     setVoiceBarged(composerSessionId, true);
+                     stopVoice(composerSessionId);

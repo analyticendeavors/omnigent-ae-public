@@ -1,0 +1,642 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 14:46:56 -0800
+Subject: [PATCH 439/443] [ae-patch] Carry a Claude-native session's cost
+ across Claude restarts so the total keeps rising
+
+---
+ .../harnesses/claude_native/ae_cost_carry.py  | 286 ++++++++++++++++++
+ omnigent/harnesses/claude_native/bridge.py    |   8 +-
+ omnigent/harnesses/claude_native/forwarder.py |  14 +-
+ .../claude_native/forwarder/test_usage.py     |   6 +
+ .../claude_native/test_ae_cost_carry.py       | 201 ++++++++++++
+ 5 files changed, 510 insertions(+), 5 deletions(-)
+ create mode 100644 omnigent/harnesses/claude_native/ae_cost_carry.py
+ create mode 100644 tests/harnesses/claude_native/test_ae_cost_carry.py
+
+diff --git a/omnigent/harnesses/claude_native/ae_cost_carry.py b/omnigent/harnesses/claude_native/ae_cost_carry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..118c1b0b7a3ceeb1b44f20d115d90cc69f30836d
+--- /dev/null
++++ b/omnigent/harnesses/claude_native/ae_cost_carry.py
+@@ -0,0 +1,286 @@
++"""
++Carry a Claude-native session's cost across Claude restarts.
++
++Claude Code's statusLine ``total_cost_usd`` (``S``) is per process: it restarts near
++zero after every ``--resume``. The server keeps ``max(old, posted)``, so each new
++process's spend vanished until its own ``S`` passed the old peak. This module turns the
++per-process ``S`` into a session total: ``offset + last``, persisted in the bridge
++directory as ``ae_cost_carry.json``.
++
++Fold rule, keyed on process identity and never on a bare fall in ``S``:
++
++* ``proc`` is the pid of the Claude process that rendered the statusLine. The statusLine
++  shim writes ``<pid>-<start time>`` to ``ae_claude_pid`` before each capture, so the pid a reader
++  sees is never older than the capture it pairs with. A relaunch is a new process and
++  always a new pid; a ``/clear``, ``/compact`` or sub-agent run stays in one process.
++* Same process: ``last = max(last, S)``. A lower read is stale or out of order and is
++  ignored, never folded.
++* New process: ``offset += last``, ``last = S``, ``proc = new``.
++* The figure to post is ``offset + last``. It never decreases.
++* No pid yet (Claude launched before the shim wrote it): nothing folds. The first pid
++  seen is adopted without a fold.
++
++Seeding, when no carry file exists for the session (first run after a deploy, a lost
++bridge directory, a session moved host): ``offset = max(0, server_total - S)`` where
++``server_total`` is ``total_cost_usd`` from ``GET /v1/sessions/{id}``. The ``max`` keeps
++the running process's ``S``, which the server may already hold, from counting twice. That
++field is the session's subtree total (own spend plus any sub-agent children); the server
++exposes no own-only figure, so a session whose children carry priced cost seeds a little
++high, once. A failed read posts nothing and is retried on the next poll.
++
++Rotation (``/clear`` or ``/fork`` to a new session id): a carry file written for another
++session id starts a fresh carry for the new id, and the cost post is held until the
++statusLine capture changes, so the old session's last ``S`` is never posted to the new one.
++A first ``S`` of zero after the capture changes is a real value.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import json
++import logging
++import os
++import re
++import tempfile
++from dataclasses import dataclass
++from pathlib import Path
++from typing import Any
++
++import httpx
++
++_logger = logging.getLogger(__name__)
++
++CARRY_FILE = "ae_cost_carry.json"
++# Written by the statusLine shim: the pid of the Claude process that rendered the bar.
++CLAUDE_PID_FILE = "ae_claude_pid"
++_CONTEXT_FILE = "context.json"
++
++_Sig = tuple[int, int]
++# ``<pid>-<start time>``; the start time is empty when /proc is unreadable.
++_PID_RE = re.compile(r"[0-9]+-[0-9]*")
++
++
++@dataclass
++class CostCarry:
++    """
++    One session's carried cost.
++
++    :param session_id: Omnigent session the figures belong to, e.g. ``"conv_abc123"``.
++    :param offset: Cost of every earlier Claude process, in USD.
++    :param last: Highest ``S`` seen from the current process, in USD.
++    :param proc: Identity of the current process, e.g. ``"48211-1763900000"``; ``None`` unknown.
++    :param seeded: ``False`` until the offset has been set from the server.
++    :param hold_sig: ``context.json`` signature to wait out after a rotation; ``None`` when
++        nothing is held.
++    """
++
++    session_id: str
++    offset: float = 0.0
++    last: float = 0.0
++    proc: str | None = None
++    seeded: bool = False
++    hold_sig: _Sig | None = None
++
++    def total(self) -> float:
++        """
++        Return the session total to post.
++
++        :returns: ``offset + last`` in USD.
++        """
++        return self.offset + self.last
++
++    def seed(self, server_total: float | None, status_cost: float, proc: str | None) -> None:
++        """
++        Set the offset from the server's total and start tracking this process.
++
++        :param server_total: ``total_cost_usd`` the server holds, or ``None`` when unpriced.
++        :param status_cost: The running process's ``S``, e.g. ``2.5``.
++        :param proc: Current process identity, or ``None``.
++        """
++        self.offset = max(0.0, (server_total or 0.0) - status_cost)
++        self.last = status_cost
++        self.proc = proc
++        self.seeded = True
++
++    def observe(self, status_cost: float, proc: str | None) -> None:
++        """
++        Fold one statusLine reading into the carry.
++
++        :param status_cost: ``S`` from the capture, e.g. ``0.4``.
++        :param proc: Pid of the process that rendered it, or ``None`` when unknown.
++        """
++        if proc is None or proc == self.proc:
++            self.last = max(self.last, status_cost)
++            return
++        if self.proc is not None:
++            self.offset += self.last
++            self.last = status_cost
++        else:
++            self.last = max(self.last, status_cost)
++        self.proc = proc
++
++    def to_json(self) -> dict[str, Any]:
++        """
++        Serialize for the carry file.
++
++        :returns: A JSON-ready dict.
++        """
++        return {
++            "session_id": self.session_id,
++            "offset": self.offset,
++            "last": self.last,
++            "proc": self.proc,
++            "hold_sig": list(self.hold_sig) if self.hold_sig else None,
++        }
++
++
++def context_signature(bridge_dir: Path) -> _Sig | None:
++    """
++    Return ``(mtime_ns, size)`` of the statusLine capture.
++
++    :param bridge_dir: Native Claude bridge directory.
++    :returns: The signature, or ``None`` when no capture exists.
++    """
++    try:
++        stat = (bridge_dir / _CONTEXT_FILE).stat()
++    except OSError:
++        return None
++    return (stat.st_mtime_ns, stat.st_size)
++
++
++def read_claude_pid(bridge_dir: Path) -> str | None:
++    """
++    Read the pid the statusLine shim recorded.
++
++    :param bridge_dir: Native Claude bridge directory.
++    :returns: The identity text, e.g. ``"48211-1763900000"``, or ``None`` when absent or malformed.
++    """
++    try:
++        text = (bridge_dir / CLAUDE_PID_FILE).read_text(encoding="utf-8").strip()
++    except OSError:
++        return None
++    return text if _PID_RE.fullmatch(text) else None
++
++
++def load_carry(bridge_dir: Path, session_id: str) -> CostCarry:
++    """
++    Load the carry for a session, or start an unseeded one.
++
++    :param bridge_dir: Native Claude bridge directory.
++    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
++    :returns: The stored carry when it belongs to *session_id*. A file for another session
++        id means a rotation: an unseeded carry holding the cost post until the capture
++        changes. A missing or corrupt file gives an unseeded carry with no hold.
++    """
++    try:
++        raw = json.loads((bridge_dir / CARRY_FILE).read_text(encoding="utf-8"))
++    except (OSError, ValueError):
++        return CostCarry(session_id=session_id)
++    if not isinstance(raw, dict):
++        return CostCarry(session_id=session_id)
++    if raw.get("session_id") != session_id:
++        return CostCarry(session_id=session_id, hold_sig=context_signature(bridge_dir))
++    offset, last = raw.get("offset"), raw.get("last")
++    if not all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in (offset, last)):
++        return CostCarry(session_id=session_id)
++    if offset < 0 or last < 0:
++        return CostCarry(session_id=session_id)
++    proc = raw.get("proc")
++    hold = raw.get("hold_sig")
++    hold_sig: _Sig | None = None
++    if isinstance(hold, list) and len(hold) == 2 and all(isinstance(v, int) for v in hold):
++        hold_sig = (hold[0], hold[1])
++    return CostCarry(
++        session_id=session_id,
++        offset=float(offset),
++        last=float(last),
++        proc=proc if isinstance(proc, str) else None,
++        seeded=True,
++        hold_sig=hold_sig,
++    )
++
++
++def save_carry(bridge_dir: Path, carry: CostCarry) -> None:
++    """
++    Write the carry file atomically (temp file, then replace).
++
++    :param bridge_dir: Native Claude bridge directory.
++    :param carry: The carry to persist.
++    """
++    bridge_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
++    fd, tmp = tempfile.mkstemp(dir=bridge_dir, prefix=f".{CARRY_FILE}.", suffix=".tmp")
++    try:
++        with os.fdopen(fd, "w", encoding="utf-8") as handle:
++            json.dump(carry.to_json(), handle)
++        os.replace(tmp, bridge_dir / CARRY_FILE)
++    except BaseException:
++        with contextlib.suppress(OSError):
++            os.unlink(tmp)
++        raise
++
++
++async def _server_total(client: httpx.AsyncClient, session_id: str) -> float | None:
++    """
++    Read the session's ``total_cost_usd`` from the server.
++
++    :param client: Omnigent HTTP client.
++    :param session_id: Omnigent session id, e.g. ``"conv_abc123"``.
++    :returns: The total in USD, or ``None`` when the session is unpriced.
++    :raises httpx.HTTPError: When the read fails.
++    """
++    resp = await client.get(f"/v1/sessions/{session_id}")
++    resp.raise_for_status()
++    body = resp.json()
++    value = body.get("total_cost_usd") if isinstance(body, dict) else None
++    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
++        return None
++    return float(value)
++
++
++async def carried_cost(
++    *,
++    client: httpx.AsyncClient,
++    carry: CostCarry,
++    bridge_dir: Path,
++    status_cost: float | None,
++) -> float | None:
++    """
++    Turn this poll's ``S`` into the session total to post, persisting the carry.
++
++    :param client: Omnigent HTTP client, used once to seed.
++    :param carry: The session's carry, mutated in place.
++    :param bridge_dir: Native Claude bridge directory.
++    :param status_cost: ``S`` from the statusLine capture, or ``None`` when absent.
++    :returns: ``offset + last`` in USD, or ``None`` when there is nothing to post yet: no
++        ``S``, a rotation hold still waiting for a fresh capture, or a failed seed read
++        (retried next poll).
++    """
++    if status_cost is None:
++        return None
++    before = carry.to_json()
++    if carry.hold_sig is not None:
++        if context_signature(bridge_dir) == carry.hold_sig:
++            return None
++        carry.hold_sig = None
++    proc = read_claude_pid(bridge_dir)
++    if carry.seeded:
++        carry.observe(status_cost, proc)
++    else:
++        try:
++            total = await _server_total(client, carry.session_id)
++        except (httpx.HTTPError, ValueError):
++            _logger.warning(
++                "Could not read the session total to seed the cost carry; session=%s",
++                carry.session_id,
++                exc_info=True,
++            )
++            return None
++        carry.seed(total, status_cost, proc)
++    if carry.to_json() != before or not (bridge_dir / CARRY_FILE).exists():
++        try:
++            save_carry(bridge_dir, carry)
++        except OSError:
++            _logger.warning(
++                "Could not save the cost carry; session=%s", carry.session_id, exc_info=True
++            )
++    return carry.total()
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index dfadea02ad6c9a51ff54c463980d36fb408d3733..17e4078d946d555f23008f68ff533778b7911b5b 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -73,6 +73,7 @@ from omnigent.harnesses.claude_native import (
+     delivery_diagnostics,
+     transcript_filters,
+ )
++from omnigent.harnesses.claude_native.ae_cost_carry import CLAUDE_PID_FILE
+ from omnigent.harnesses.claude_native.ae_pane_progress import (
+     PROGRESS_UNKNOWN,
+     PaneProgressRead,
+@@ -2700,10 +2701,15 @@ def build_hook_settings(
+     # The account sidecar records which Claude login renders this bar
+     # (empty for the default one) so usage readers can key limits by account.
+     account_quoted = shlex.quote(str(bridge_dir / CLAUDE_ACCOUNT_FILE))
++    # The Claude process (this shim's parent) as pid-starttime, so the forwarder
++    # tells a relaunch from a render even when a pid namespace reuses the pid.
++    pid_quoted = shlex.quote(str(bridge_dir / CLAUDE_PID_FILE))
+     # Written before the capture, so a reader never pairs a new capture with
+     # the previous launch's account.
+     status_command = (
+-        f"p=$(cat); printf '%s' \"${{OMNIGENT_CLAUDE_ACCOUNT-}}\" > {account_quoted}.$$.tmp"
++        f'p=$(cat); printf \'%s-%s\' "$PPID" "$(stat -c %Y /proc/$PPID 2>/dev/null)"'
++        f" > {pid_quoted}.$$.tmp && mv -f {pid_quoted}.$$.tmp {pid_quoted}"
++        f"; printf '%s' \"${{OMNIGENT_CLAUDE_ACCOUNT-}}\" > {account_quoted}.$$.tmp"
+         f" && mv -f {account_quoted}.$$.tmp {account_quoted}"
+         f"; printf '%s' \"$p\" > {raw_quoted}.$$.tmp"
+         f" && mv -f {raw_quoted}.$$.tmp {raw_quoted}"
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index 9a8669a2a1f1c8393fa9105634ba75cd5cefab05..a100c040d0aa3d40690f6285ceb2a767228b19fc 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -21,7 +21,7 @@ import httpx
+ from omnigent.debug_logging import debug_event
+ from omnigent.entities.session_resources import terminal_resource_id
+ from omnigent.errors import ErrorCode
+-from omnigent.harnesses.claude_native import ae_resume_keep
++from omnigent.harnesses.claude_native import ae_cost_carry, ae_resume_keep
+ from omnigent.harnesses.claude_native.ae_pane_progress import (
+     ProgressRelayState,
+     clear_progress_on_rotation,
+@@ -873,6 +873,8 @@ class _ForwardDedupeState:
+     # statusLine total ``S`` verbatim (matches /cost in the Claude TUI).
+     # Kept to suppress duplicate posts when S hasn't advanced.
+     posted_cost: float | None = None
++    # Carried cost across Claude restarts (omnigent-ae); loaded on the first cost poll.
++    cost_carry: ae_cost_carry.CostCarry | None = None
+     # Session token totals tally and the last totals POSTed with the cost (omnigent-ae).
+     token_tally: TranscriptTokenTally = field(default_factory=TranscriptTokenTally)
+     posted_tokens: tuple[int, int, int] | None = None
+@@ -3054,8 +3056,12 @@ async def _forward_session_cost(
+     active_subagents = [
+         entry for entry in subagent_state.subagents.values() if entry.child_conversation_id
+     ]
+-    # Display cost: the statusLine total S verbatim (matches /cost).
+-    display_cost = status_cost
++    # Display cost: S plus the cost of earlier Claude processes (omnigent-ae).
++    if dedupe.cost_carry is None:
++        dedupe.cost_carry = ae_cost_carry.load_carry(bridge_dir, session_id)
++    display_cost = await ae_cost_carry.carried_cost(
++        client=client, carry=dedupe.cost_carry, bridge_dir=bridge_dir, status_cost=status_cost
++    )
+     # Policy/budget cost: with no sub-agent it equals S; with a sub-agent
+     # running it is max(S, real-time transcript estimate) so the gate sees
+     # in-flight spend while S is frozen.
+@@ -3079,7 +3085,7 @@ async def _forward_session_cost(
+     # instead of pricing the tokens from the catalog; none before a first cost.
+     tokens = _ZERO_TOKENS
+     # Never post a cost below the one already posted (the server also clamps).
+-    known = [c for c in (status_cost, dedupe.posted_cost) if c is not None]
++    known = [c for c in (display_cost, dedupe.posted_cost) if c is not None]
+     cost_known = max(known) if known else None
+     if cost_known is not None:
+         tokens = await asyncio.to_thread(dedupe.token_tally.update, parent_transcript_path)
+diff --git a/tests/harnesses/claude_native/forwarder/test_usage.py b/tests/harnesses/claude_native/forwarder/test_usage.py
+index 97ed2aea69afadd63e2798866ad87749f721f954..b85c31779b235fcfb08022b03fcd5d2966ac9361 100644
+--- a/tests/harnesses/claude_native/forwarder/test_usage.py
++++ b/tests/harnesses/claude_native/forwarder/test_usage.py
+@@ -16,6 +16,7 @@ from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+ from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+ 
+ import omnigent.harnesses.claude_native.forwarder as forwarder
++from omnigent.harnesses.claude_native.ae_cost_carry import CostCarry
+ 
+ 
+ def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
+@@ -445,6 +446,7 @@ async def test_forward_session_cost_splits_display_and_policy(
+         }
+     )
+     dedupe = forwarder._ForwardDedupeState()
++    dedupe.cost_carry = CostCarry("conv_parent", seeded=True)
+ 
+     posted: list[dict[str, Any]] = []
+ 
+@@ -540,6 +542,7 @@ async def test_forward_session_cost_posts_status_when_no_subagents(
+ 
+     monkeypatch.setattr(forwarder, "_session_cost_estimate", _fail_estimate)
+     dedupe = forwarder._ForwardDedupeState()
++    dedupe.cost_carry = CostCarry("conv_parent", seeded=True)
+     posted: list[dict[str, Any]] = []
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+@@ -594,6 +597,7 @@ async def test_forward_session_cost_backs_off_after_rate_limit(
+         return httpx.Response(200, json={}, request=request)
+ 
+     dedupe = forwarder._ForwardDedupeState()
++    dedupe.cost_carry = CostCarry("conv_parent", seeded=True)
+     transport = httpx.MockTransport(handler)
+     async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+         kwargs = {
+@@ -660,6 +664,7 @@ async def test_forward_session_cost_tags_display_advance_with_model(
+         }
+     )
+     dedupe = forwarder._ForwardDedupeState()
++    dedupe.cost_carry = CostCarry("conv_parent", seeded=True)
+     posted: list[dict[str, Any]] = []
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+@@ -748,6 +753,7 @@ async def test_forward_session_cost_posts_transcript_tokens_with_cost(
+         _assistant("s1", 1, 2, cr=3, side=True), encoding="utf-8"
+     )
+     dedupe = forwarder._ForwardDedupeState()
++    dedupe.cost_carry = CostCarry("conv_parent", seeded=True)
+     posted: list[dict[str, Any]] = []
+ 
+     def handler(request: httpx.Request) -> httpx.Response:
+diff --git a/tests/harnesses/claude_native/test_ae_cost_carry.py b/tests/harnesses/claude_native/test_ae_cost_carry.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..5ef3fd441b55b0d1a3fcf89d9e8813c2ee9f8108
+--- /dev/null
++++ b/tests/harnesses/claude_native/test_ae_cost_carry.py
+@@ -0,0 +1,201 @@
++"""Tests for the cost carry that keeps a session total rising across Claude restarts."""
++
++from __future__ import annotations
++
++import json
++import os
++from pathlib import Path
++from typing import Any
++
++import httpx
++import pytest
++
++import omnigent.harnesses.claude_native.forwarder as forwarder
++from omnigent.harnesses.claude_native import ae_cost_carry as carry_mod
++from omnigent.harnesses.claude_native.ae_cost_carry import (
++    CARRY_FILE,
++    CLAUDE_PID_FILE,
++    CostCarry,
++    carried_cost,
++    load_carry,
++)
++
++
++def _client(total: float | None, status: int = 200) -> tuple[httpx.AsyncClient, list[str]]:
++    gets: list[str] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        gets.append(request.url.path)
++        if status != 200:
++            return httpx.Response(status, request=request)
++        body = {} if total is None else {"total_cost_usd": total}
++        return httpx.Response(200, json=body, request=request)
++
++    return httpx.AsyncClient(transport=httpx.MockTransport(handler), base_url="http://ap"), gets
++
++
++def _set_pid(bridge: Path, pid: str) -> None:
++    (bridge / CLAUDE_PID_FILE).write_text(f"{pid}-100", encoding="utf-8")
++
++
++def _touch_context(bridge: Path, text: str) -> None:
++    path = bridge / "context.json"
++    path.write_text(text, encoding="utf-8")
++    stamp = path.stat().st_mtime_ns + 1_000_000
++    os.utime(path, ns=(stamp, stamp))
++
++
++def test_same_process_lower_read_is_ignored() -> None:
++    carry = CostCarry("c", seeded=True, proc="1-100")
++    carry.observe(3.0, "1-100")
++    carry.observe(1.0, "1-100")
++    assert (carry.offset, carry.last, carry.total()) == (0.0, 3.0, 3.0)
++
++
++def test_new_process_folds_once_and_restarts_sum() -> None:
++    carry = CostCarry("c", seeded=True, proc="1-100")
++    carry.observe(5.0, "1-100")
++    carry.observe(0.5, "2-200")
++    assert carry.total() == pytest.approx(5.5)
++    carry.observe(2.0, "2-200")
++    carry.observe(0.1, "3-300")
++    assert carry.offset == pytest.approx(7.0)
++    assert carry.total() == pytest.approx(7.1)
++
++
++def test_alternating_readers_with_one_process_never_grow_the_offset() -> None:
++    carry = CostCarry("c", seeded=True, proc="1-100")
++    for value in (4.0, 1.0, 4.5, 0.0, 4.5):
++        carry.observe(value, "1-100")
++    assert carry.offset == 0.0
++    assert carry.total() == pytest.approx(4.5)
++
++
++def test_unknown_process_never_folds_and_first_pid_is_adopted() -> None:
++    carry = CostCarry("c", seeded=True)
++    carry.observe(2.0, None)
++    carry.observe(0.5, None)
++    carry.observe(2.5, "9-900")
++    assert (carry.offset, carry.proc, carry.total()) == (0.0, "9-900", 2.5)
++    carry.observe(0.2, None)
++    assert carry.proc == "9-900"
++    assert carry.total() == pytest.approx(2.5)
++
++
++def test_seed_never_double_counts_the_running_process() -> None:
++    low = CostCarry("c")
++    low.seed(460.0, 2.0, "1-1")
++    assert low.total() == pytest.approx(460.0)
++    high = CostCarry("c")
++    high.seed(1.0, 2.0, "1-1")
++    assert high.total() == pytest.approx(2.0)
++    unpriced = CostCarry("c")
++    unpriced.seed(None, 2.0, "1-1")
++    assert unpriced.total() == pytest.approx(2.0)
++
++
++@pytest.mark.asyncio
++async def test_missing_file_seeds_from_server_then_survives_reload(tmp_path: Path) -> None:
++    _set_pid(tmp_path, "1")
++    client, gets = _client(460.0)
++    async with client:
++        carry = load_carry(tmp_path, "conv_a")
++        assert await carried_cost(
++            client=client, carry=carry, bridge_dir=tmp_path, status_cost=2.0
++        ) == pytest.approx(460.0)
++        assert await carried_cost(
++            client=client, carry=carry, bridge_dir=tmp_path, status_cost=3.0
++        ) == pytest.approx(461.0)
++        assert len(gets) == 1
++        reloaded = load_carry(tmp_path, "conv_a")
++        assert reloaded.seeded
++        _set_pid(tmp_path, "2")
++        assert await carried_cost(
++            client=client, carry=reloaded, bridge_dir=tmp_path, status_cost=0.4
++        ) == pytest.approx(461.4)
++        assert len(gets) == 1
++
++
++@pytest.mark.asyncio
++async def test_failed_seed_posts_nothing_and_retries(tmp_path: Path) -> None:
++    carry = load_carry(tmp_path, "conv_a")
++    client, _ = _client(None, status=503)
++    async with client:
++        assert (
++            await carried_cost(client=client, carry=carry, bridge_dir=tmp_path, status_cost=1.0)
++            is None
++        )
++    assert not carry.seeded
++    assert not (tmp_path / CARRY_FILE).exists()
++
++
++def test_corrupt_file_starts_unseeded(tmp_path: Path) -> None:
++    (tmp_path / CARRY_FILE).write_text("{not json", encoding="utf-8")
++    assert not load_carry(tmp_path, "conv_a").seeded
++    (tmp_path / CARRY_FILE).write_text(
++        json.dumps({"session_id": "conv_a", "offset": -1, "last": 2}), encoding="utf-8"
++    )
++    assert not load_carry(tmp_path, "conv_a").seeded
++
++
++@pytest.mark.asyncio
++async def test_rotation_holds_cost_until_the_capture_changes(tmp_path: Path) -> None:
++    _touch_context(tmp_path, '{"total_cost_usd": 9}')
++    carry_mod.save_carry(tmp_path, CostCarry("conv_old", offset=1.0, last=8.0, seeded=True))
++    carry = load_carry(tmp_path, "conv_new")
++    assert carry.hold_sig is not None and not carry.seeded
++    client, gets = _client(0.0)
++    async with client:
++        held = await carried_cost(client=client, carry=carry, bridge_dir=tmp_path, status_cost=9.0)
++        assert held is None and gets == []
++        _touch_context(tmp_path, '{"total_cost_usd": 0}')
++        fresh = await carried_cost(
++            client=client, carry=carry, bridge_dir=tmp_path, status_cost=0.0
++        )
++    assert fresh == 0.0
++    assert load_carry(tmp_path, "conv_new").seeded
++
++
++def _forward(client: httpx.AsyncClient, bridge: Path, dedupe: Any, parent: Path) -> Any:
++    return forwarder._forward_session_cost(
++        client=client,
++        session_id="conv_parent",
++        bridge_dir=bridge,
++        parent_transcript_path=parent,
++        subagent_state=forwarder.SubagentForwardState(subagents={}),
++        dedupe=dedupe,
++        cost_cache={},
++    )
++
++
++@pytest.mark.asyncio
++async def test_forwarder_restart_sequence_posts_a_rising_total(
++    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
++) -> None:
++    bridge = tmp_path / "bridge"
++    bridge.mkdir()
++    parent = tmp_path / "sess.jsonl"
++    parent.write_text("parent", encoding="utf-8")
++    box = {"cost": 0.0}
++    monkeypatch.setattr(
++        forwarder, "read_claude_context_state", lambda _b: {"total_cost_usd": box["cost"]}
++    )
++    dedupe = forwarder._ForwardDedupeState()
++    posted: list[float] = []
++
++    def handler(request: httpx.Request) -> httpx.Response:
++        if request.method == "GET":
++            return httpx.Response(200, json={"total_cost_usd": 100.0}, request=request)
++        data = json.loads(request.content)["data"]
++        if "cumulative_cost_usd" in data:
++            posted.append(data["cumulative_cost_usd"])
++        return httpx.Response(200, json={}, request=request)
++
++    async with httpx.AsyncClient(
++        transport=httpx.MockTransport(handler), base_url="http://ap"
++    ) as client:
++        for pid, cost in (("1", 10.0), ("1", 12.0), ("2", 0.5), ("2", 1.5), ("3", 0.2)):
++            _set_pid(bridge, pid)
++            box["cost"] = cost
++            await _forward(client, bridge, dedupe, parent)
++    assert posted == pytest.approx([100.0, 102.0, 102.5, 103.5, 103.7])

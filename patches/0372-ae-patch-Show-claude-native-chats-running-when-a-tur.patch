@@ -1,0 +1,406 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Fri, 13 Nov 2026 12:19:24 -0800
+Subject: [PATCH 372/443] [ae-patch] Show claude-native chats running when a
+ turn starts while background helpers run (0372)
+
+---
+ omnigent/server/ae_prompt_running.py          |  64 ++++++
+ .../server/routes/sessions/routes_events.py   |  39 +++-
+ tests/server/test_ae_prompt_running.py        | 212 ++++++++++++++++++
+ 3 files changed, 312 insertions(+), 3 deletions(-)
+ create mode 100644 omnigent/server/ae_prompt_running.py
+ create mode 100644 tests/server/test_ae_prompt_running.py
+
+diff --git a/omnigent/server/ae_prompt_running.py b/omnigent/server/ae_prompt_running.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..adb299d24da87b52dfabaae7bc9eb2223df4d1c0
+--- /dev/null
++++ b/omnigent/server/ae_prompt_running.py
+@@ -0,0 +1,64 @@
++"""Show a claude-native chat as running when a prompt opens a turn the status file hides.
++
++Claude Code's status file stays ``busy`` across a Stop while a background
++helper is alive, so the next turn changes nothing in it and the poller
++publishes no ``running``. The forwarder's prompt edge does arrive, but it
++publishes no status. This module remembers that a prompt opened since the last
++turn end; the first real work item (assistant text or a tool call) after it
++flips the chat to ``running``. A Stop, a failure or an interrupt clears the
++memory, so late items of an ended turn never flip it back and a blocked prompt
++never leaves a stuck spinner.
++"""
++
++from __future__ import annotations
++
++import threading
++from collections import OrderedDict
++
++# Most sessions remembered at once; the oldest is dropped past this.
++MAX_TRACKED_SESSIONS = 1024
++
++_lock = threading.Lock()
++_open: OrderedDict[str, None] = OrderedDict()
++
++
++def note_prompt(session_id: str) -> None:
++    """Remember that a prompt opened a turn for *session_id*."""
++    with _lock:
++        _open[session_id] = None
++        _open.move_to_end(session_id)
++        while len(_open) > MAX_TRACKED_SESSIONS:
++            _open.popitem(last=False)
++
++
++def note_turn_end(session_id: str) -> None:
++    """Forget the open prompt: the turn ended (Stop, failure or interrupt)."""
++    with _lock:
++        _open.pop(session_id, None)
++
++
++def take_if_open(session_id: str) -> bool:
++    """Return ``True`` once if a prompt is open, and clear it."""
++    with _lock:
++        return _open.pop(session_id, "absent") is None
++
++
++def is_real_work(item_type: str, role: str | None = None) -> bool:
++    """Whether an item is assistant text or a tool call, not a user or bookkeeping item."""
++    return item_type == "function_call" or (item_type == "message" and role == "assistant")
++
++
++def reset() -> None:
++    """Drop all state (tests)."""
++    with _lock:
++        _open.clear()
++
++
++__all__ = [
++    "MAX_TRACKED_SESSIONS",
++    "is_real_work",
++    "note_prompt",
++    "note_turn_end",
++    "reset",
++    "take_if_open",
++]
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index f42f2452372dabb4b4b9d1949bc51b82209cad4e..646c8f912c2e559626db1648286112651e5eeed4 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -68,7 +68,7 @@ from omnigent.runtime import (
+ )
+ from omnigent.runtime.agent_cache import AgentCache
+ from omnigent.runtime.policies.approval import _ELICITATION_MODE
+-from omnigent.server import ae_turn_edges, presence
++from omnigent.server import ae_prompt_running, ae_turn_edges, presence
+ from omnigent.server._elicitation_registry import (
+     _harness_elicitation_owners,
+     _harness_elicitation_registry,
+@@ -346,6 +346,17 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
+ )
+ 
+ 
++def _flip_running_on_work(session_id: str, item_type: str, role: str | None) -> None:
++    """Publish ``running`` for the first assistant or tool item after an open prompt edge."""
++    if not ae_prompt_running.is_real_work(item_type, role):
++        return
++    if not ae_prompt_running.take_if_open(session_id):
++        return
++    if _session_status_cache.get(session_id) == "running":
++        return
++    _publish_status(session_id, "running")
++
++
+ def _is_batchable_external_item(event: SessionEventInput) -> bool:
+     """
+     Whether a batch entry can skip :func:`_post_event_impl` and be appended
+@@ -806,10 +817,18 @@ def register_events_routes(
+                         continue
+                     await _authorized_conversation(request, session_id)
+                     add_audit_attrs(event_type=_EXTERNAL_CONVERSATION_ITEM_TYPE)
++                    run_events = list(run)
+                     item_ids = await _persist_external_conversation_items(
+-                        session_id, list(run), conversation_store
++                        session_id, run_events, conversation_store
+                     )
+                     acks.extend({"queued": False, "item_id": item_id} for item_id in item_ids)
++                    for event in run_events:
++                        item_data = event.data.get("item_data")
++                        _flip_running_on_work(
++                            session_id,
++                            str(event.data.get("item_type")),
++                            item_data.get("role") if isinstance(item_data, dict) else None,
++                        )
+                 return acks
+             return await _post_event_impl(
+                 request,
+@@ -1551,6 +1570,7 @@ def register_events_routes(
+             # Fence the cancelled turn, same as interrupt.
+             _interrupt_fenced_sessions.add(session_id)
+             ae_turn_edges.notify_turn_edge(session_id, "interrupted")
++            ae_prompt_running.note_turn_end(session_id)
+             # Harness-agnostic forward: the runner kills the external
+             # process for harnesses that have one (claude-native
+             # hard-kills its tmux pane) and 204s otherwise. Unlike the
+@@ -1821,6 +1841,7 @@ def register_events_routes(
+                 body,
+                 conversation_store,
+             )
++            _flip_running_on_work(session_id, "message", "assistant")
+             return {"queued": False, "item_id": item_id}
+         if body.type == _EXTERNAL_CONVERSATION_ITEM_TYPE:
+             item_id = await _persist_external_conversation_item(
+@@ -1832,6 +1853,12 @@ def register_events_routes(
+                 background_title_coordinator=background_title_coordinator,
+                 enabled=background_session_titles_enabled(request.headers),
+             )
++            item_data = body.data.get("item_data")
++            _flip_running_on_work(
++                session_id,
++                str(body.data.get("item_type")),
++                item_data.get("role") if isinstance(item_data, dict) else None,
++            )
+             return {"queued": False, "item_id": item_id}
+         if body.type == _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE:
+             _publish_external_output_text_delta(session_id, body)
+@@ -1905,9 +1932,13 @@ def register_events_routes(
+             _signal_harness_elicitation_resolved_by_id(session_id, elicitation_id)
+             return {"queued": False}
+         if body.type in (_EXTERNAL_SESSION_STATUS_TYPE, _SUBAGENT_STATUS_TYPE):
+-            if body.type == _EXTERNAL_SESSION_STATUS_TYPE and body.data.get("ae_prompt_edge") is True:
++            if (
++                body.type == _EXTERNAL_SESSION_STATUS_TYPE
++                and body.data.get("ae_prompt_edge") is True
++            ):
+                 # A prompt was submitted: a turn-open edge for observers, no status change.
+                 ae_turn_edges.notify_turn_edge(session_id, "prompt")
++                ae_prompt_running.note_prompt(session_id)
+                 return {"queued": False}
+             status = body.data.get("status")
+             if body.type == _SUBAGENT_STATUS_TYPE:
+@@ -2051,6 +2082,8 @@ def register_events_routes(
+                 background_tasks=bg_tasks,
+                 blocked_on=blocked_on,
+             )
++            if status == "failed" or (status == "idle" and data.get("turn_completed") is True):
++                ae_prompt_running.note_turn_end(session_id)
+             if status == "idle" and data.get("turn_completed") is True:
+                 ae_turn_edges.notify_turn_edge(
+                     session_id, "idle", response_id=response_id, turn_completed=True
+diff --git a/tests/server/test_ae_prompt_running.py b/tests/server/test_ae_prompt_running.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc7bcea189eeb04076623a7799720fedacd59eee
+--- /dev/null
++++ b/tests/server/test_ae_prompt_running.py
+@@ -0,0 +1,212 @@
++"""A prompt edge plus the first real work item flips a claude-native chat to running.
++
++The Claude status file stays ``busy`` across a Stop while a background helper
++lives, so the next turn publishes nothing. The server opens a prompt on the
++forwarder's prompt edge and publishes ``running`` on the first assistant or
++tool item; a Stop, failure or interrupt closes it.
++"""
++
++from __future__ import annotations
++
++from collections.abc import Iterator
++
++import httpx
++import pytest
++
++from omnigent.server import ae_prompt_running
++from omnigent.server.ae_turn_edges import (
++    TurnEdge,
++    register_turn_edge_observer,
++    reset_turn_edge_observers,
++)
++from omnigent.server.routes._sessions.helpers import _session_status_cache
++from omnigent.server.routes.sessions import routes_events
++from tests.server.helpers import create_test_agent
++
++pytestmark = pytest.mark.timeout(30)
++
++
++@pytest.fixture(autouse=True)
++def _clean() -> Iterator[None]:
++    reset_turn_edge_observers()
++    ae_prompt_running.reset()
++    yield
++    reset_turn_edge_observers()
++    ae_prompt_running.reset()
++
++
++@pytest.fixture(autouse=True)
++def _no_runner(monkeypatch: pytest.MonkeyPatch) -> None:
++    async def forward(*args: object, **kwargs: object) -> dict[str, object]:
++        return {}
++
++    monkeypatch.setattr(routes_events, "_forward_session_change_to_runner", forward)
++
++
++# ---- module ----
++
++
++def test_take_if_open_returns_true_once() -> None:
++    ae_prompt_running.note_prompt("s1")
++    assert ae_prompt_running.take_if_open("s1") is True
++    assert ae_prompt_running.take_if_open("s1") is False
++
++
++def test_turn_end_clears_the_open_prompt() -> None:
++    ae_prompt_running.note_prompt("s2")
++    ae_prompt_running.note_turn_end("s2")
++    assert ae_prompt_running.take_if_open("s2") is False
++
++
++def test_map_is_bounded_and_drops_the_oldest() -> None:
++    for i in range(ae_prompt_running.MAX_TRACKED_SESSIONS + 10):
++        ae_prompt_running.note_prompt(f"b{i}")
++    assert ae_prompt_running.take_if_open("b0") is False
++    assert ae_prompt_running.take_if_open(f"b{ae_prompt_running.MAX_TRACKED_SESSIONS + 9}") is True
++
++
++def test_only_assistant_text_and_tool_calls_are_real_work() -> None:
++    assert ae_prompt_running.is_real_work("message", "assistant")
++    assert ae_prompt_running.is_real_work("function_call")
++    assert not ae_prompt_running.is_real_work("message", "user")
++    assert not ae_prompt_running.is_real_work("resource_event")
++    assert not ae_prompt_running.is_real_work("compaction")
++
++
++# ---- route ----
++
++
++async def _session(client: httpx.AsyncClient, name: str) -> str:
++    agent = await create_test_agent(client, name=name)
++    created = await client.post("/v1/sessions", json={"agent_id": agent["id"]})
++    assert created.status_code == 201, created.text
++    return created.json()["id"]
++
++
++async def _post(client: httpx.AsyncClient, sid: str, payload: object) -> None:
++    resp = await client.post(f"/v1/sessions/{sid}/events", json=payload)
++    assert resp.status_code in (200, 202, 204), resp.text
++
++
++async def _prompt(client: httpx.AsyncClient, sid: str) -> None:
++    await _post(
++        client,
++        sid,
++        {"type": "external_session_status", "data": {"status": "running", "ae_prompt_edge": True}},
++    )
++
++
++def _assistant_item(text: str = "hi", source: str = "a1") -> dict[str, object]:
++    return {
++        "type": "external_conversation_item",
++        "data": {
++            "item_type": "message",
++            "item_data": {
++                "role": "assistant",
++                "agent": "claude",
++                "content": [{"type": "output_text", "text": text}],
++            },
++            "source_id": source,
++        },
++    }
++
++
++def _tool_item(source: str = "t1") -> dict[str, object]:
++    return {
++        "type": "external_conversation_item",
++        "data": {
++            "item_type": "function_call",
++            "item_data": {
++                "agent": "claude",
++                "name": "Bash",
++                "arguments": "{}",
++                "call_id": f"call_{source}",
++            },
++            "source_id": source,
++        },
++    }
++
++
++def _user_item(source: str = "u1") -> dict[str, object]:
++    return {
++        "type": "external_conversation_item",
++        "data": {
++            "item_type": "message",
++            "item_data": {"role": "user", "content": [{"type": "input_text", "text": "x"}]},
++            "source_id": source,
++        },
++    }
++
++
++def _stop() -> dict[str, object]:
++    return {
++        "type": "external_session_status",
++        "data": {"status": "idle", "turn_completed": True},
++    }
++
++
++async def test_prompt_then_assistant_item_publishes_running(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-assistant")
++    _session_status_cache[sid] = "idle"
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++
++    await _prompt(client, sid)
++    assert _session_status_cache.get(sid) == "idle"
++    await _post(client, sid, _assistant_item())
++
++    assert _session_status_cache.get(sid) == "running"
++    assert "running" in [e.status for e in seen if e.session_id == sid]
++
++
++async def test_batched_tool_item_publishes_running(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-batch")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, [_tool_item()])
++    assert _session_status_cache.get(sid) == "running"
++
++
++async def test_user_item_leaves_the_chat_idle(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-user")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, _user_item())
++    assert _session_status_cache.get(sid) == "idle"
++
++
++async def test_late_items_after_stop_stay_idle(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-late")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, _stop())
++    await _post(client, sid, _assistant_item("late", "late1"))
++    assert _session_status_cache.get(sid) == "idle"
++
++
++async def test_already_running_publishes_nothing_new(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-running")
++    _session_status_cache[sid] = "running"
++    await _prompt(client, sid)
++    seen: list[TurnEdge] = []
++    register_turn_edge_observer(seen.append)
++    await _post(client, sid, _assistant_item())
++    assert [e for e in seen if e.session_id == sid] == []
++
++
++async def test_failed_clears_the_open_prompt(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-failed")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, {"type": "external_session_status", "data": {"status": "failed"}})
++    _session_status_cache[sid] = "idle"
++    await _post(client, sid, _assistant_item())
++    assert _session_status_cache.get(sid) == "idle"
++
++
++async def test_interrupt_clears_the_open_prompt(client: httpx.AsyncClient) -> None:
++    sid = await _session(client, "pr-int")
++    _session_status_cache[sid] = "idle"
++    await _prompt(client, sid)
++    await _post(client, sid, {"type": "stop_session", "data": {}})
++    assert ae_prompt_running.take_if_open(sid) is False

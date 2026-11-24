@@ -138,7 +138,11 @@ async def test_every_lot_route_is_admin_only(
         ("POST", "/v1/ae/lot/T1/link", {"url": "https://github.com/a/b/issues/1"}),
         ("POST", "/v1/ae/lot/T1/complete", {"status": "done"}),
         ("GET", "/v1/ae/lot/lists", None),
-        ("POST", "/v1/ae/lot/create", {"title": "Check the scan"}),
+        (
+            "POST",
+            "/v1/ae/lot/create",
+            {"title": "Check the scan", "quadrant": "neither", "est": "15"},
+        ),
         ("POST", "/v1/ae/lot/T1/cancel", None),
         ("POST", "/v1/ae/lot/T1/resume", None),
         ("POST", "/v1/ae/lot/T1/session", None),

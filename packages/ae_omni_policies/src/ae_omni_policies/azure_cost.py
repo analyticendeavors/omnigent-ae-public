@@ -36,7 +36,9 @@ Management Reader role, a refused principal, too many pages) waits the hour like
 reading, because retrying cannot fix it and spends the shared rate limit (2026-10-22). A 429
 stops the pass and waits Azure's own retry time (one minute to one hour), or
 :data:`RATE_LIMIT_TTL_S` (15 minutes) without one, because every query made while limited
-only extends the limit. The limit is one fact about the pass, not an error on each unread
+only extends the limit. Each pass starts with the subscription read longest ago, so a limit
+that admits only part of the list rotates through all of them instead of starving the last
+ones (2026-11-11). The limit is one fact about the pass, not an error on each unread
 subscription (2026-10-23): ``overview()`` carries ``rateLimit`` (``retryAt`` and ``goodAt``,
 the last pass that read anything) and the card says it once under the month total.
 The newest day with data is ``through``, and the pace is computed up to it.
@@ -682,6 +684,9 @@ def _assemble(
 _state: dict[str, Any] = {
     "view": None,
     "readings": {},
+    # When each subscription was last tried to the end (read, or failed with an error other
+    # than a 429); in memory only, after a restart ``readAt`` alone orders the pass.
+    "tried": {},
     "errors": {},
     "at": None,
     "mono": None,
@@ -926,6 +931,7 @@ async def _read(cfg: Config) -> None:
     if _state["key"] != signature:
         # A new principal or subscription list: nothing cached under the old one applies.
         _state["readings"] = {}
+        _state["tried"] = {}
         _state["key"] = signature
     errors: dict[str, str] = {}
     done: set[str] = set()
@@ -941,7 +947,7 @@ async def _read(cfg: Config) -> None:
     try:
         async with asyncio.timeout(READING_DEADLINE_S):
             token = await _token(cfg, transport)
-            for sid, _ in cfg.subscriptions:
+            for sid in _stalest_first(cfg):
                 try:
                     reading = await _read_subscription(
                         cfg, transport, token, sid, today, _state["readings"].get(sid)
@@ -951,6 +957,7 @@ async def _read(cfg: Config) -> None:
                     # (or a later pass) does not make the whole snapshot look unread.
                     reading["readAt"] = iso(_now())
                     _state["readings"][sid] = reading
+                    _state["tried"][sid] = reading["readAt"]
                     done.add(sid)
                 except RateLimitedError as exc:
                     # Stop asking: more queries while limited only extend the limit.
@@ -967,6 +974,7 @@ async def _read(cfg: Config) -> None:
                     break
                 except AzureCostError as exc:
                     errors[sid] = _scrub(str(exc), cfg)
+                    _state["tried"][sid] = iso(_now())
                     if exc.permanent:
                         permanent.add(sid)
     except AzureCostError as exc:
@@ -981,7 +989,12 @@ async def _read(cfg: Config) -> None:
     if generation != _generation:
         # The list changed while this pass ran: its numbers belong to the old list.
         return
-    _state["errors"] = errors
+    # Read order is not display order: keep the readings in configured order, as before.
+    order = {sid: i for i, (sid, _) in enumerate(cfg.subscriptions)}
+    _state["readings"] = dict(
+        sorted(_state["readings"].items(), key=lambda item: order.get(item[0], len(order)))
+    )
+    _state["errors"] = {sid: errors[sid] for sid, _ in cfg.subscriptions if sid in errors}
     _state["mono"] = _monotonic()
     # A transient failure is tried again in two minutes, a rate limit after its wait, a good
     # reading after the hour. So is a pass whose every error is permanent (no role, a refused
@@ -1000,6 +1013,23 @@ async def _read(cfg: Config) -> None:
     _save(cfg, _state_path())
     if errors:
         _logger.warning("azure cost reading had %d failing subscription(s)", len(errors))
+
+
+def _stalest_first(cfg: Config) -> list[str]:
+    """The configured subscription ids, the one tried longest ago first (never tried first).
+
+    Attempts, not successes, order the pass: a subscription that keeps failing with a 403 or a
+    transient error has no newer ``readAt`` and would otherwise lead every pass and eat the
+    requests the limit admits. A subscription that got the 429 itself is not marked tried.
+
+    ``readAt`` is a fixed-width UTC string, so it sorts as text; the sort is stable, so ties
+    keep the configured order."""
+    return sorted(
+        (sid for sid, _ in cfg.subscriptions),
+        key=lambda sid: max(
+            _state["tried"].get(sid) or "", _state["readings"].get(sid, {}).get("readAt") or ""
+        ),
+    )
 
 
 def _stale() -> bool:
@@ -1094,6 +1124,7 @@ def reset() -> None:
         {
             "view": None,
             "readings": {},
+            "tried": {},
             "errors": {},
             "at": None,
             "mono": None,

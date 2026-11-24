@@ -35,6 +35,9 @@ const POINT_LABELS: Record<string, string> = {
   advisor: "Preset advisor (Lead picks)",
 };
 
+const POINT_HINTS: Record<string, string> = {
+};
+
 /** A point's plain label; a point the card does not know shows its raw name. */
 export function pointLabel(name: string): string {
   return POINT_LABELS[name] ?? name;
@@ -177,6 +180,7 @@ function pointRows(data: DecisionStatus): HTMLElement {
         "div",
         { class: "decision-pt", "data-point": point.name },
         el("span", { class: "decision-pt-name" }, pointLabel(point.name)),
+        ...(POINT_HINTS[point.name] ? [hint(POINT_HINTS[point.name], pointLabel(point.name))] : []),
         el("span", { class: `decision-chip decision-chip-${point.mode}` }, point.mode),
       ),
     ),

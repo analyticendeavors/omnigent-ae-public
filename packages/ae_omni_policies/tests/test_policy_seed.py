@@ -1,6 +1,6 @@
 """The Global Policies page owns the AE policies; config/server.yaml only seeds them.
 
-Since 2026-10-18 the six AE policies sit under ``ae_seed_policies:`` and
+Since 2026-10-18 the seven AE policies sit under ``ae_seed_policies:`` and
 ``ae_omni_policies.policy_seed`` inserts them into the policy store when it
 holds none of them, matched by name or handler (the container runs it through
 ``docker_entrypoint``). These tests pin the real config's seed, that rule, the
@@ -174,8 +174,8 @@ def test_a_value_the_factory_rejects_fails_and_writes_nothing(
 def test_a_failed_insert_leaves_no_partial_seed(
     store: SqlAlchemyPolicyStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The inserts share one transaction, so the next boot still seeds all six."""
-    clash = ["c" * 32, "d" * 32, "c" * 32, "e" * 32, "f" * 32, "1" * 32]
+    """The inserts share one transaction, so the next boot still seeds all seven."""
+    clash = ["c" * 32, "d" * 32, "c" * 32, "e" * 32, "f" * 32, "1" * 32, "2" * 32]
     monkeypatch.setattr(policy_seed, "seed_ids", lambda count: clash[:count])
     with pytest.raises(Exception, match=r"(?i)unique|identity|conflict"):
         seed_policies(store, _server_config(), MODULES)

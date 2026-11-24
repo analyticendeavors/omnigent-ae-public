@@ -24,15 +24,17 @@ summary may be sent to the judge but is never written to the log.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import math
 import os
 import re
+import tempfile
 import threading
 import time
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -53,6 +55,8 @@ MINUTE_CAP_ENV = "AE_DECISION_MINUTE_CAP"
 DATA_DIR = preset_runs.DATA_DIR
 POINTS_FILE_NAME = "ae-decision-points.json"
 SHADOW_FILE_NAME = "ae-decision-shadow.jsonl"
+CALLS_FILE_ENV = "AE_DECISION_CALLS_FILE"
+CALLS_FILE_NAME = "ae-decision-calls.json"
 MAX_BYTES = preset_runs.MAX_BYTES
 RETENTION = timedelta(days=30)
 PRUNE_EVERY_S = 86400.0
@@ -61,12 +65,15 @@ OFF, SHADOW, LIVE = "off", "shadow", "live"
 _RANK = {OFF: 0, SHADOW: 1, LIVE: 2}
 METHODS = ("yes_no", "choice", "score")
 
-CONCURRENCY = 4
+CONCURRENCY = 8
 BREAKER_ERRORS = 5
 BREAKER_OPEN_S = 600.0
 DEFAULT_TIMEOUT_S = 3.0
-DEFAULT_DAILY_CAP = 400
-DEFAULT_MINUTE_CAP = 30
+# Sized from the deployment's quota (read 2026-11-13 with `az cognitiveservices account
+# deployment list`): decision-1 allows 50 requests and 50,000 tokens per 60 s. The minute cap
+# is 70% of the request limit (35); the daily cap is a spend and runaway ceiling.
+DEFAULT_DAILY_CAP = 3000
+DEFAULT_MINUTE_CAP = 35
 
 #: A feature spec: ``bool``, ``int``, ``float``, a tuple of allowed enum strings, or
 #: :data:`~ae_omni_policies.judge.GuardedSummary`.
@@ -179,6 +186,15 @@ def points_file(environ: Mapping[str, str] | None = None) -> Path | None:
         return Path(raw) if raw else None
     base = _data_dir()
     return base / POINTS_FILE_NAME if base else None
+
+
+def calls_file(environ: Mapping[str, str] | None = None) -> Path | None:
+    env = os.environ if environ is None else environ
+    if CALLS_FILE_ENV in env:
+        raw = (env[CALLS_FILE_ENV] or "").strip()
+        return Path(raw) if raw else None
+    base = _data_dir()
+    return base / CALLS_FILE_NAME if base else None
 
 
 def shadow_path(environ: Mapping[str, str] | None = None) -> Path | None:
@@ -300,6 +316,8 @@ class _Limits:
         per_minute = int(da._number(environ.get(MINUTE_CAP_ENV), DEFAULT_MINUTE_CAP))
         while self.recent and now_mono - self.recent[0] >= 60.0:
             self.recent.popleft()
+        if da.retry_after_s() > 0:
+            return "rate_limited"  # the endpoint said 429 and named a wait
         if self.day_count >= daily:
             return "daily_cap"
         if len(self.recent) >= per_minute:
@@ -323,10 +341,88 @@ _mono = time.monotonic
 _tasks: set[asyncio.Task[Any]] = set()
 
 
+# ---------------------------------------------------------------------------
+# The saved daily call counter (2026-11-11): "Decision-1 was actually asked", so the Admin
+# Center card survives a restart and counts the lead's advisor as well as agent calls.
+
+_calls_lock = threading.Lock()
+_calls: dict[str, Any] = {"day": "", "count": 0, "loaded": False}
+
+
+def _utc_day() -> str:
+    return datetime.fromtimestamp(_now(), UTC).strftime("%Y-%m-%d")
+
+
+def _load_calls_locked() -> None:
+    """First use only: take the saved count when it is for today (caller holds the lock)."""
+    _calls["loaded"] = True
+    path = calls_file()
+    if path is None:
+        return
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return
+    count = raw.get("count") if isinstance(raw, dict) else None
+    if (
+        isinstance(raw, dict)
+        and raw.get("day") == _utc_day()
+        and isinstance(count, int)
+        and not isinstance(count, bool)
+        and count >= 0
+    ):
+        _calls.update(day=raw["day"], count=count)
+
+
+def _save_calls_locked() -> None:
+    path = calls_file()
+    if path is None:
+        return
+    tmp: str | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name, suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump({"day": _calls["day"], "count": _calls["count"]}, handle)
+        os.replace(tmp, path)
+        tmp = None
+    except OSError as exc:
+        _logger.warning("decision call counter not saved (%s): %s", path, type(exc).__name__)
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
+def note_call() -> None:
+    """Count one request that really went to the Decision-1 endpoint (never raises)."""
+    try:
+        with _calls_lock:
+            if not _calls["loaded"]:
+                _load_calls_locked()
+            today = _utc_day()
+            if _calls["day"] != today:
+                _calls.update(day=today, count=0)
+            _calls["count"] += 1
+            _save_calls_locked()
+    except Exception:  # noqa: BLE001 (counting never breaks a decision)
+        _logger.warning("decision call counter failed", exc_info=True)
+
+
+def calls_today() -> int:
+    """Today's (UTC) count of real Decision-1 requests; reads the disk only on first use."""
+    with _calls_lock:
+        if not _calls["loaded"]:
+            _load_calls_locked()
+        return int(_calls["count"]) if _calls["day"] == _utc_day() else 0
+
+
 def reset() -> None:
-    """Forget limits, caches and registered points (tests)."""
+    """Forget limits, caches, the call counter and registered points (tests)."""
     global _limits
     _limits = _Limits()
+    with _calls_lock:
+        _calls.update(day="", count=0, loaded=False)
     _promo_cache.update(key=None, data=None)
     _points.clear()
 
@@ -504,6 +600,8 @@ async def ask(
     environ: Mapping[str, str] | None = None,
     log_features: Mapping[str, Any] | None = None,
     order: Sequence[str] | None = None,
+    batch_failures: list[bool] | None = None,
+    late_features: Callable[[Verdict], Mapping[str, Any]] | None = None,
     **args: Any,
 ) -> Outcome:
     """Ask *judge* at decision point *point*. Never raises; any failure returns the baseline.
@@ -511,6 +609,11 @@ async def ask(
     *order* is the option keys or levels in the order the caller gave them; a dynamic point logs
     the answer as an index into it and the probabilities as a list in that order, never the
     names (they are written by the agent).
+
+    *batch_failures* is one shared list for the questions of one batch: only the first failure
+    in it counts toward the circuit breaker, so a five-question batch is one failure, not five.
+    *late_features* builds extra declared log features from a good verdict (a dynamic point
+    only), for a value known only after the judge answered.
     """
     mode = OFF
     try:
@@ -558,8 +661,24 @@ async def ask(
             if verdict is not None and verdict.error:
                 error = verdict.error
             # bad_state is our bug, not the service failing, so it does not trip the breaker
-            _limits.record(failed=error is not None and error != "bad_state")
+            # a 429 and our own wait after one are quota, not an outage: never trip the breaker
+            failed_now = error is not None and error not in (
+                "bad_state",
+                da.RATE_LIMITED,
+                "rate_limited",
+            )
+            repeat = failed_now and batch_failures is not None and bool(batch_failures)
+            if failed_now and batch_failures is not None:
+                batch_failures.append(True)
+            if not repeat:  # a batch's second and later failures are the same outage
+                _limits.record(failed=failed_now)
         failed = error is not None
+        if registered.dynamic and late_features is not None and verdict is not None and not failed:
+            with contextlib.suppress(Exception):
+                extra, more = filter_state(
+                    replace(registered, dynamic=False), late_features(verdict)
+                )
+                shown, dropped = {**shown, **extra}, dropped + more
         would_act = (
             not failed
             and verdict is not None

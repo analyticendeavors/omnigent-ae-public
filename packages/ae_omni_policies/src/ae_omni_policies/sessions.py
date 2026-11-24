@@ -26,6 +26,7 @@ from typing import Any
 from omnigent.debug_logging import current_session_id
 from omnigent.entities.conversation import Conversation
 from omnigent.runtime import get_conversation_store
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 
 from ae_omni_policies import labels
 
@@ -47,13 +48,20 @@ FRESH_HELPER_S = 60
 
 
 def list_top_level(
-    store: Any | None = None, *, accessible_by: str | None = None
+    store: Any | None = None,
+    *,
+    accessible_by: str | None = None,
+    include_archived: bool = False,
 ) -> list[Conversation]:
-    """Every top-level, non-archived conversation, newest first, capped at :data:`MAX_ROWS`.
+    """Every top-level conversation, newest first, capped at :data:`MAX_ROWS`.
+
+    Non-archived unless *include_archived* (added 2026-11-13 for the Claude login move-all,
+    which must reach archived chats too: reopening one relaunches it on its stored login).
 
     :param store: A conversation store; defaults to the runtime's.
     :param accessible_by: Only the sessions this user has a grant on (upstream's
         ``GET /v1/sessions`` filter); ``None`` lists every user's sessions.
+    :param include_archived: Also list archived rows.
     :returns: Conversation rows with labels hydrated.
     """
     store = store if store is not None else get_conversation_store()
@@ -64,7 +72,7 @@ def list_top_level(
             limit=PAGE_SIZE,
             after=after,
             kind="default",
-            include_archived=False,
+            include_archived=include_archived,
             order="desc",
             sort_by="created_at",
             accessible_by=accessible_by,
@@ -74,6 +82,45 @@ def list_top_level(
             break
         after = page.last_id
     return rows[:MAX_ROWS]
+
+
+# move-all pages through every row; past this many it stops and says so (never a silent cut).
+EVERY_ROW_HARD_CAP = 20000
+
+
+def list_every_top_level(
+    store: Any | None = None,
+    *,
+    accessible_by: str | None = None,
+    include_archived: bool = False,
+    hard_cap: int = EVERY_ROW_HARD_CAP,
+) -> tuple[list[Conversation], bool]:
+    """Every top-level conversation the user can reach, paged to the end: ``(rows, truncated)``.
+
+    Added 2026-11-13: :func:`list_top_level` stops at :data:`MAX_ROWS` newest rows, which is
+    right for a slot check but left a 1,100-chat account's older chats out of the Claude login
+    move-all. This pages on until the store has no more rows; only past *hard_cap* does it stop,
+    with ``truncated`` true so the caller can say so.
+    """
+    store = store if store is not None else get_conversation_store()
+    rows: list[Conversation] = []
+    after: str | None = None
+    while True:
+        page = store.list_conversations(
+            limit=PAGE_SIZE,
+            after=after,
+            kind="default",
+            include_archived=include_archived,
+            order="desc",
+            sort_by="created_at",
+            accessible_by=accessible_by,
+        )
+        rows.extend(page.data)
+        if len(rows) >= hard_cap:
+            return rows[:hard_cap], bool(page.has_more or len(rows) > hard_cap)
+        if not page.has_more or not page.last_id:
+            return rows, False
+        after = page.last_id
 
 
 class ScanTooLong(Exception):
@@ -111,6 +158,62 @@ def list_since(
         if not page.has_more or not page.last_id:
             return rows
         after = page.last_id
+
+
+def drop_orphan_side_chats(
+    rows: Sequence[Conversation], store: Any | None = None
+) -> list[Conversation]:
+    """Rows without the side chats whose source session is archived or gone.
+
+    A side chat is hidden from the session list and lives as a tab of its source session; it
+    inherits the source's ``ae.status`` label, so one left running after its source was archived
+    (or deleted) would count as a working slot nobody can see (2026-11-17). *rows* are the
+    non-archived top-level rows, but :func:`list_top_level` stops at :data:`MAX_ROWS`, so a source
+    missing from *rows* is looked up before its side chat is called an orphan. A side chat
+    with no source label is kept.
+
+    :param rows: Non-archived top-level rows, e.g. from :func:`list_top_level`.
+    :param store: A conversation store; defaults to the runtime's.
+    :returns: *rows* in order, minus the orphan side chats.
+    """
+    by_id = {row.id: row for row in rows}
+    live: dict[str, bool] = {}
+
+    def source_of(row: Conversation) -> str | None:
+        if SIDE_CHAT_LABEL_KEY not in row.labels:
+            return None
+        return row.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY) or None
+
+    def source_is_live(source: str) -> bool:
+        # A malformed label must never fail /capacity: an unreadable source keeps the row.
+        nonlocal store
+        if source not in live:
+            try:
+                store = store if store is not None else get_conversation_store()
+                found = store.get_conversation(source)
+                live[source] = found is not None and not found.archived
+            except Exception:  # noqa: BLE001 - any store error keeps the row
+                _logger.debug("Side chat source lookup failed for %r; keeping the row", source)
+                live[source] = True
+        return live[source]
+
+    # Rows whose source is outside *rows* are decided by one lookup; rows whose source is a row
+    # are kept only while that row is kept, so a chain hanging off an archived session goes
+    # whole. Iterate until stable (a chain can be as long as the nesting cap).
+    dropped: set[str] = set()
+    for row in rows:
+        source = source_of(row)
+        if source and source not in by_id and not source_is_live(source):
+            dropped.add(row.id)
+    changed = True
+    while changed:
+        changed = False
+        for row in rows:
+            source = source_of(row)
+            if row.id not in dropped and source in dropped:
+                dropped.add(row.id)
+                changed = True
+    return [row for row in rows if row.id not in dropped]
 
 
 def current_conversation_id() -> str | None:
@@ -369,6 +472,7 @@ __all__ = [
     "children_of",
     "current_conversation_id",
     "display_title",
+    "drop_orphan_side_chats",
     "family_children_working",
     "family_key",
     "family_keys",

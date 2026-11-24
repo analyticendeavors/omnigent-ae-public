@@ -1,0 +1,693 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:42:01 -0800
+Subject: [PATCH 356/443] [ae-patch] Fix the review findings on 0355: keep a
+ stored cloud voice while the voice list is empty, prime after stop, and make
+ the Fast model restore retry and tab-safe
+
+---
+ .../components/AeSpeakRepliesButton.test.tsx  | 186 ++++++++++++++++++
+ web/src/components/AeSpeakRepliesButton.tsx   | 104 ++++++++--
+ web/src/hooks/useAeSpeakReplies.test.ts       |  19 ++
+ web/src/hooks/useAeSpeakReplies.ts            |   3 +
+ web/src/lib/aeVoiceModel.test.ts              |  51 +++++
+ web/src/lib/aeVoiceModel.ts                   |  87 +++++++-
+ 6 files changed, 437 insertions(+), 13 deletions(-)
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 3fb103932a88ff9cca9432fb65f00b4c7846a04b..8453d4ccd82536af997ae0fc4d470ea572ded146 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -1,6 +1,7 @@
+ import { AE_SETTING_HINTS } from "@/lib/aeSettingHints";
+ import { act, render, screen, waitFor, within } from "@testing-library/react";
+ import userEvent from "@testing-library/user-event";
++import { toast } from "sonner";
+ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+ import { resetCloudVoicesCache } from "@/lib/aeCloudVoice";
+ import {
+@@ -590,6 +591,40 @@ describe("AeSpeakRepliesButton", () => {
+     });
+   });
+ 
++  it("keeps a stored cloud voice while the voice list is empty", async () => {
++    const calls: string[] = [];
++    resetCloudVoicesCache();
++    vi.stubGlobal(
++      "fetch",
++      vi.fn((url: string, init?: RequestInit) => {
++        if (String(url).includes("/tts/voices")) {
++          return Promise.resolve(new Response(JSON.stringify({ voices: [] }), { status: 200 }));
++        }
++        calls.push(String(init?.body));
++        return new Promise<Response>(() => {});
++      }),
++    );
++    window.localStorage.setItem("omnigent:ae-speak-voice", "cloud:rocky-xtts");
++    useChatStore.setState({
++      blocks: [
++        {
++          type: "text_done",
++          ctx: { agent: null, depth: 0, turn: 1, timestamp: 1, responseId: "r1", itemId: "i1" },
++          fullText: "The last reply.",
++          hasCodeBlocks: false,
++        },
++      ],
++    } as never);
++    const synth = installFakeSpeech();
++    synth.voices = [makeVoice({ name: "Plain", lang: "en-US", default: true })];
++    renderButton();
++    const user = await openMenu();
++    await user.click(screen.getByTestId("ae-speak-read-last"));
++    await waitFor(() => expect(calls).toHaveLength(1));
++    expect(JSON.parse(calls[0]).voice).toBe("rocky-xtts");
++    expect(synth.texts()).toEqual([]);
++  });
++
+   describe("Fast model", () => {
+     const MODELS = [
+       { id: "opus", model: "claude-opus-5-5" },
+@@ -748,6 +783,157 @@ describe("AeSpeakRepliesButton", () => {
+       );
+     });
+ 
++    const STATE_KEY = "omnigent:ae-voice-model-state:c1";
++    function saveState(extra: Record<string, unknown> = {}) {
++      window.localStorage.setItem(
++        STATE_KEY,
++        JSON.stringify({
++          previous: "opus",
++          fallback: "opus",
++          fast: "claude-sonnet-5-5",
++          owner: null,
++          at: Date.now(),
++          ...extra,
++        }),
++      );
++    }
++
++    it("retries a refused restore once the turn is idle, then shows a toast", async () => {
++      const toastSpy = vi.spyOn(toast, "error").mockImplementation(() => "");
++      followStore();
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      setModel.mockImplementation(() => Promise.reject(new Error("no")));
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(3));
++      await waitFor(() => expect(toastSpy).toHaveBeenCalledTimes(1));
++      // The state stays so a later pass can still put the model back.
++      expect(window.localStorage.getItem(STATE_KEY)).not.toBeNull();
++      toastSpy.mockRestore();
++    });
++
++    it("clears the state when the retry of a refused restore succeeds", async () => {
++      const toastSpy = vi.spyOn(toast, "error").mockImplementation(() => "");
++      followStore();
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      setModel.mockImplementationOnce(() => Promise.reject(new Error("no")));
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(3));
++      await waitFor(() => expect(window.localStorage.getItem(STATE_KEY)).toBeNull());
++      expect(toastSpy).not.toHaveBeenCalled();
++      toastSpy.mockRestore();
++    });
++
++    it("switches again when Voice mode comes back on during an in-flight restore", async () => {
++      followStore();
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      let release: () => void = () => {};
++      setModel.mockImplementationOnce((m: string | null) => {
++        return new Promise<void>((resolve) => {
++          release = () => {
++            useChatStore.setState({ sessionModelOverride: m } as never);
++            resolve();
++          };
++        });
++      });
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(2));
++      voiceOn(true);
++      await act(async () => release());
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(3));
++      expect(setModel).toHaveBeenLastCalledWith("claude-sonnet-5-5", expect.anything());
++    });
++
++    it.each([
++      ["no override yet", null],
++      ["the previous model (a switch may be in flight)", "opus"],
++      ["a model this chat does not list", "mystery"],
++    ])("keeps the saved state after a reload while the override is %s", async (_n, override) => {
++      useChatStore.setState({ sessionModelOverride: override } as never);
++      saveState();
++      renderModelButton();
++      await Promise.resolve();
++      await Promise.resolve();
++      expect(setModel).not.toHaveBeenCalled();
++      expect(window.localStorage.getItem(STATE_KEY)).not.toBeNull();
++    });
++
++    it("forgets the saved state once a known third model is the override", async () => {
++      useChatStore.setState({ sessionModelOverride: "claude-sonnet-5" } as never);
++      saveState();
++      renderModelButton();
++      await waitFor(() => expect(window.localStorage.getItem(STATE_KEY)).toBeNull());
++      expect(setModel).not.toHaveBeenCalled();
++    });
++
++    it("switches to a new Fast model pick while Voice mode runs and records it", async () => {
++      followStore();
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      const user = await openMenu();
++      await user.click(screen.getByTestId("ae-voice-model-trigger"));
++      const option = (await screen.findAllByTestId("ae-voice-model-option")).find(
++        (el) => el.textContent === "Sonnet 5",
++      ) as HTMLElement;
++      option.focus();
++      await user.keyboard("{Enter}");
++      await waitFor(() =>
++        expect(setModel).toHaveBeenLastCalledWith("claude-sonnet-5", { expectConfirmation: true }),
++      );
++      await waitFor(() =>
++        expect(JSON.parse(window.localStorage.getItem(STATE_KEY) ?? "{}")).toMatchObject({
++          fast: "claude-sonnet-5",
++          previous: "opus",
++        }),
++      );
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenLastCalledWith("opus", expect.anything()));
++    });
++
++    describe("another tab's switch", () => {
++      beforeEach(() => {
++        followStore();
++        useChatStore.setState({ sessionModelOverride: "claude-sonnet-5-5" } as never);
++        // This tab's Voice mode is off while the other tab keeps it on for the chat.
++        getVoiceSnapshot("c1");
++      });
++      it("is left alone while its Voice mode is on and the state is fresh", async () => {
++        window.localStorage.setItem("omnigent:ae-voice-mode:c1", "true");
++        saveState({ owner: "some-other-tab" });
++        renderModelButton();
++        await Promise.resolve();
++        await Promise.resolve();
++        expect(setModel).not.toHaveBeenCalled();
++        expect(window.localStorage.getItem(STATE_KEY)).not.toBeNull();
++      });
++      it("is put back when Voice mode is persisted off for the chat", async () => {
++        saveState({ owner: "some-other-tab" });
++        renderModelButton();
++        await waitFor(() => expect(setModel).toHaveBeenCalledWith("opus", expect.anything()));
++        await waitFor(() => expect(window.localStorage.getItem(STATE_KEY)).toBeNull());
++      });
++      it("is put back when the state is stale", async () => {
++        window.localStorage.setItem("omnigent:ae-voice-mode:c1", "true");
++        saveState({ owner: "some-other-tab", at: Date.now() - 7 * 3_600_000 });
++        renderModelButton();
++        await waitFor(() => expect(setModel).toHaveBeenCalledWith("opus", expect.anything()));
++      });
++    });
++
++    it("skips setModel(null) and clears the state when there is nothing to restore", async () => {
++      useChatStore.setState({ sessionModelOverride: "claude-sonnet-5-5" } as never);
++      saveState({ previous: null, fallback: null });
++      renderModelButton({ canResetModel: false });
++      await waitFor(() => expect(window.localStorage.getItem(STATE_KEY)).toBeNull());
++      expect(setModel).not.toHaveBeenCalled();
++    });
++
+     it("uses the model picked in the menu, and Off keeps the chat's model", async () => {
+       followStore();
+       renderModelButton();
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 9dcc5cf62b1d23752a9f34045cdbde85e8b954aa..0687f08afa37968044df28aa4f026eb5aad772a7 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -5,6 +5,7 @@
+ 
+ import { ChevronDownIcon, Volume2Icon, VolumeXIcon } from "lucide-react";
+ import { useCallback, useEffect, useRef, useState } from "react";
++import { toast } from "sonner";
+ import { AeHint } from "@/components/AeHint";
+ import { Button } from "@/components/ui/button";
+ import {
+@@ -37,11 +38,13 @@ import { type CloudVoice, fetchCloudVoices } from "@/lib/aeCloudVoice";
+ import {
+   clearVoiceModelState,
+   effectiveModelId,
++  mayRevertVoiceModel,
+   readVoiceModelPick,
+   readVoiceModelState,
+   resolveFastModel,
+   VOICE_MODEL_OFF,
+   voiceModelLabel,
++  voiceModelVerdict,
+   writeVoiceModelPick,
+   writeVoiceModelState,
+ } from "@/lib/aeVoiceModel";
+@@ -52,7 +55,6 @@ import {
+   FAST_EFFORT,
+   isSpeechSupported,
+   listVoices,
+-  primeCloudPlayback,
+   primeVoicePlayback,
+   onVoicesChanged,
+   pickDefaultVoice,
+@@ -74,6 +76,7 @@ import {
+ } from "@/lib/aeSpeakReplies";
+ import {
+   registerVoiceSpeaker,
++  readVoiceMode,
+   registerVoiceStop,
+   setVoiceBarged,
+   setVoiceOn,
+@@ -87,6 +90,8 @@ import { cn } from "@/lib/utils";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ const MAX_VOICES = 12;
++const VOICE_LIST_RETRIES = 3;
++const VOICE_LIST_RETRY_MS = 2000;
+ 
+ const PHASE_WORD: Record<VoicePhase, string> = {
+   off: "",
+@@ -288,11 +293,25 @@ function SpeakRepliesControl({
+   }, [chatId]);
+   useEffect(() => {
+     let live = true;
+-    void fetchCloudVoices().then((list) => {
+-      if (live) setCloudVoices(list);
+-    });
++    let timer: ReturnType<typeof setTimeout> | null = null;
++    let attempts = 0;
++    const load = () => {
++      void fetchCloudVoices().then((list) => {
++        if (!live) return;
++        if (list.length > 0) {
++          setCloudVoices(list);
++          return;
++        }
++        // An empty list may be a failed fetch: retry a few times (a successful list is cached).
++        attempts += 1;
++        if (attempts <= VOICE_LIST_RETRIES)
++          timer = setTimeout(load, VOICE_LIST_RETRY_MS * attempts);
++      });
++    };
++    load();
+     return () => {
+       live = false;
++      if (timer) clearTimeout(timer);
+     };
+   }, []);
+   useEffect(() => {
+@@ -304,16 +323,24 @@ function SpeakRepliesControl({
+   // A stored cloud voice the server no longer offers, or none stored: first cloud voice, else the device's.
+   const deviceDefault = pickDefaultVoice(voices);
+   // A bare value from before the prefixes is no choice once the server has cloud voices.
++  // A stored cloud voice is never silently swapped for the device voice while the list is empty
++  // (not loaded yet, or the fetch failed): the server knows the id, and the cloud speaker falls
++  // back to the device per sentence if it cannot play.
+   const voice: VoiceChoice | null =
+     stored?.kind === "device" && !(legacy && cloudVoices.length > 0)
+       ? { kind: "device", id: stored.id }
+-      : stored?.kind === "cloud" && cloudVoices.some((v) => v.id === stored.id)
++      : stored?.kind === "cloud" &&
++          (cloudVoices.length === 0 || cloudVoices.some((v) => v.id === stored.id))
+         ? { kind: "cloud", id: stored.id }
+         : cloudVoices[0]
+           ? { kind: "cloud", id: cloudVoices[0].id }
+           : deviceDefault
+             ? { kind: "device", id: deviceDefault.voiceURI }
+             : null;
++  const replacedCloud = stored?.kind === "cloud" && voice?.kind === "device";
++  useEffect(() => {
++    if (replacedCloud) logVoice("cloud voice replaced", `${choiceKey(stored)} -> device`);
++  }, [replacedCloud, stored]);
+ 
+   const { speaking, stop, readLast, speak } = useAeSpeakReplies({
+     chatId,
+@@ -395,30 +422,80 @@ function SpeakRepliesControl({
+     [chatId],
+   );
+ 
+-  const revertModel = useCallback(async () => {
++  // A refused restore is retried once when the turn goes idle (or on the next render that wants it).
++  const revertFailures = useRef(0);
++  const [revertRetry, setRevertRetry] = useState(false);
++  const chatStatus = useChatStore((st) => st.status);
++  const applyRef = useRef<() => Promise<void>>(() => Promise.resolve());
++
++  const revertModel = useCallback(async (): Promise<void> => {
+     const state = readVoiceModelState(chatId);
+     if (!state || modelBusyRef.current || !mayTouchModel()) return;
++    // Another tab's live switch is not this tab's to put back.
++    if (!mayRevertVoiceModel(state, readVoiceMode(chatId))) return;
+     const store = useChatStore.getState();
++    const verdict = voiceModelVerdict(
++      state,
++      store.sessionModelOverride,
++      modelRefs.current.modelOptions,
++    );
++    // Not hydrated yet, or a switch may still be in flight: keep the state for a later pass.
++    if (verdict === "keep") return;
+     // A model picked by hand since Voice mode switched stays as the person left it.
+-    if (store.sessionModelOverride === state.fast) {
+-      const target = state.previous ?? (modelRefs.current.canResetModel ? null : state.fallback);
++    if (verdict === "revert") {
++      const canReset = modelRefs.current.canResetModel;
++      const target = state.previous ?? (canReset ? null : state.fallback);
++      if (target === null && state.previous === null && !canReset) {
++        // Nothing to restore and no way to reset: setModel(null) would be refused.
++        logVoice("model restore skipped", "no previous model and no reset");
++        clearVoiceModelState(chatId);
++        return;
++      }
+       modelBusyRef.current = true;
+       try {
+         await store.setModel(target, { expectConfirmation: true });
+       } catch {
++        revertFailures.current += 1;
++        logVoice("model restore failed", `attempt ${revertFailures.current}`);
++        if (revertFailures.current === 1) setRevertRetry(true);
++        else {
++          setRevertRetry(false);
++          toast.error("Could not switch the model back. Pick it in the model menu.");
++        }
+         return;
+       } finally {
+         modelBusyRef.current = false;
+       }
+     }
++    revertFailures.current = 0;
++    setRevertRetry(false);
+     clearVoiceModelState(chatId);
++    // Voice mode came back on while the restore was in flight: switch again.
++    if (modelRefs.current.wanted) void applyRef.current();
+   }, [chatId, mayTouchModel]);
+ 
+   const applyModel = useCallback(async () => {
+     const { fastModel: fast, modelOptions: options } = modelRefs.current;
+-    if (modelBusyRef.current || readVoiceModelState(chatId) || fast === null) return;
++    if (modelBusyRef.current || fast === null) return;
+     const store = useChatStore.getState();
+     if (store.conversationId !== chatId) return;
++    const existing = readVoiceModelState(chatId);
++    if (existing && store.sessionModelOverride === existing.fast) {
++      // Already switched. A new Fast model pick while Voice mode runs switches again.
++      if (existing.fast === fast || !mayRevertVoiceModel(existing, readVoiceMode(chatId))) return;
++      writeVoiceModelState(chatId, { ...existing, fast, owner: existing.owner, at: existing.at });
++      modelBusyRef.current = true;
++      try {
++        await store.setModel(fast, { expectConfirmation: true });
++      } catch {
++        writeVoiceModelState(chatId, existing);
++        return;
++      } finally {
++        modelBusyRef.current = false;
++      }
++      if (!modelRefs.current.wanted && mayTouchModel()) await revertModel();
++      return;
++    }
+     if (effectiveModelId(options, store.sessionModelOverride, store.llmModel) === fast) return;
+     // Saved before the switch, so a reload or crash in the middle still puts the model back.
+     writeVoiceModelState(chatId, {
+@@ -438,12 +515,18 @@ function SpeakRepliesControl({
+     // Voice mode ended while the switch was in flight: put the model back now.
+     if (!modelRefs.current.wanted && mayTouchModel()) await revertModel();
+   }, [chatId, mayTouchModel, revertModel]);
++  applyRef.current = applyModel;
+ 
+   useEffect(() => {
+     if (modelWanted) void applyModel();
+     else void revertModel();
+   }, [modelWanted, fastModel, applyModel, revertModel]);
+ 
++  // The one retry of a refused restore waits for the turn to go idle.
++  useEffect(() => {
++    if (revertRetry && chatStatus === "idle" && !modelWanted) void revertModel();
++  }, [revertRetry, chatStatus, modelWanted, revertModel]);
++
+   const toggleSpeak = (next: boolean) => {
+     writeSpeakReplies(chatId, next);
+     setOn(next);
+@@ -708,8 +791,7 @@ function SpeakRepliesControl({
+         <div className="flex gap-1.5 px-1 pb-1 pt-0.5" data-testid="ae-speak-actions">
+           <DropdownMenuItem
+             onSelect={() => {
+-              // Inside the tap, like Voice mode: a cloud voice plays after its fetch, outside any tap.
+-              primeCloudPlayback();
++              // readLast primes a cloud voice itself, after its stop(), still inside this tap.
+               readLast();
+             }}
+             data-testid="ae-speak-read-last"
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index fb2003b884cf05e679d54b8a7e731362d22a9d7b..177565817584f76a36e3d13465925d0a472f4161 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -4,6 +4,7 @@ import { activeEchoWords, resetEcho } from "@/lib/aeVoiceEcho";
+ import {
+   emitCaption,
+   emitPlaying,
++  registerCloudPrimer,
+   WORKING_CUE_DELAY_MS,
+   WORKING_CUE_TEXT,
+ } from "@/lib/aeSpeakReplies";
+@@ -207,6 +208,24 @@ describe("useAeSpeakReplies", () => {
+     vi.unstubAllGlobals();
+   });
+ 
++  it("readLast primes the cloud playback after stop(), not before", () => {
++    vi.stubGlobal(
++      "fetch",
++      vi.fn(() => new Promise<Response>(() => {})),
++    );
++    const order: string[] = [];
++    registerCloudPrimer(() => order.push(`prime@cancel${synth.cancelCount}`));
++    const { result } = mount(false, "c1", { kind: "cloud", id: "rocky-xtts" });
++    setStore({ blocks: [final("r1", "a", "Last reply.", { createdAtS: 1 })] });
++    const before = synth.cancelCount;
++    act(() => result.current.readLast());
++    // stop() cancels the device speaker first; the prime comes after it.
++    expect(synth.cancelCount).toBeGreaterThan(before);
++    expect(order).toEqual([`prime@cancel${synth.cancelCount}`]);
++    registerCloudPrimer(null);
++    vi.unstubAllGlobals();
++  });
++
+   it("speaks a growing live preview, then only the remainder on the final", () => {
+     mount();
+     setStore({ blocks: [live("r1", "One. Two")] });
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 973e77fdb3ca6dc9e8926a48d946ac373acf0afc..ebe96cd60ee06a02c3b5728016968d2cdc139e76 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -5,6 +5,7 @@ import { useCallback, useEffect, useRef, useSyncExternalStore } from "react";
+ import { createCloudSpeaker } from "@/lib/aeCloudVoice";
+ import {
+   createSpeaker,
++  primeCloudPlayback,
+   registerCloudPrimer,
+   setCaptionHandler,
+   setPlaybackHandler,
+@@ -373,6 +374,8 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+       // The voice log shows which voice a manual read used, to compare with the spoken replies.
+       logVoice("read last", picked ? `${picked.kind}:${picked.id} x${pickedRate}` : "default");
+       getSpeaker().stop();
++      // After stop(), which pauses and clears a primed element; still synchronous inside the tap.
++      if (picked?.kind === "cloud") primeCloudPlayback();
+       say(text, picked, pickedRate);
+       return;
+     }
+diff --git a/web/src/lib/aeVoiceModel.test.ts b/web/src/lib/aeVoiceModel.test.ts
+index 2db357cb97404dbf510f1f0f2de33a213e62e79a..1cb67eddd7d76dd5dab9bc6fe78534377a9be047 100644
+--- a/web/src/lib/aeVoiceModel.test.ts
++++ b/web/src/lib/aeVoiceModel.test.ts
+@@ -7,7 +7,11 @@ import {
+   readVoiceModelState,
+   resolveFastModel,
+   VOICE_MODEL_OFF,
++  mayRevertVoiceModel,
+   voiceModelLabel,
++  voiceModelVerdict,
++  voiceTabId,
++  type VoiceModelState,
+   writeVoiceModelPick,
+   writeVoiceModelState,
+ } from "./aeVoiceModel";
+@@ -68,6 +72,8 @@ describe("aeVoiceModel", () => {
+       previous: "opus",
+       fallback: "opus",
+       fast: "claude-sonnet-5-5",
++      owner: voiceTabId(),
++      at: expect.any(Number),
+     });
+     expect(readVoiceModelState("c2")).toBeNull();
+     clearVoiceModelState("c1");
+@@ -75,4 +81,49 @@ describe("aeVoiceModel", () => {
+     window.localStorage.setItem("omnigent:ae-voice-model-state:c3", "{nope");
+     expect(readVoiceModelState("c3")).toBeNull();
+   });
++
++  describe("restore verdicts", () => {
++    const NOW = 1_000_000_000;
++    const base: VoiceModelState = {
++      previous: "opus",
++      fallback: "opus",
++      fast: "claude-sonnet-5-5",
++      owner: "tab-a",
++      at: NOW,
++    };
++    it("reverts while still on the fast model", () => {
++      expect(voiceModelVerdict(base, "claude-sonnet-5-5", OPTIONS, NOW)).toBe("revert");
++    });
++    it("keeps the state while the override is empty, unknown or the previous model", () => {
++      expect(voiceModelVerdict(base, null, OPTIONS, NOW)).toBe("keep");
++      expect(voiceModelVerdict(base, "opus", OPTIONS, NOW)).toBe("keep");
++      expect(voiceModelVerdict(base, "mystery", OPTIONS, NOW)).toBe("keep");
++    });
++    it("treats a known third model as hand-picked", () => {
++      expect(voiceModelVerdict(base, "claude-haiku-4-5", OPTIONS, NOW)).toBe("hand-picked");
++    });
++    it("treats an abandoned state as hand-picked", () => {
++      expect(voiceModelVerdict(base, null, OPTIONS, NOW + 7 * 3_600_000)).toBe("hand-picked");
++    });
++  });
++
++  describe("tab ownership", () => {
++    const NOW = 1_000_000_000;
++    const state: VoiceModelState = {
++      previous: null,
++      fallback: null,
++      fast: "f",
++      owner: "other-tab",
++      at: NOW,
++    };
++    it("lets the owner, an ownerless state, a persisted-off chat or a stale state revert", () => {
++      expect(mayRevertVoiceModel({ ...state, owner: voiceTabId() }, true, NOW)).toBe(true);
++      expect(mayRevertVoiceModel({ ...state, owner: null }, true, NOW)).toBe(true);
++      expect(mayRevertVoiceModel(state, false, NOW)).toBe(true);
++      expect(mayRevertVoiceModel(state, true, NOW + 7 * 3_600_000)).toBe(true);
++    });
++    it("leaves another live tab's state alone", () => {
++      expect(mayRevertVoiceModel(state, true, NOW + 1000)).toBe(false);
++    });
++  });
+ });
+diff --git a/web/src/lib/aeVoiceModel.ts b/web/src/lib/aeVoiceModel.ts
+index 527ff1d8a024d5cbf676438089bc183b7039779d..c8d0a0993b607c0f100b0044aae43e182ac1f2e5 100644
+--- a/web/src/lib/aeVoiceModel.ts
++++ b/web/src/lib/aeVoiceModel.ts
+@@ -89,6 +89,42 @@ export interface VoiceModelState {
+   fallback: string | null;
+   /** The model Voice mode switched to. */
+   fast: string;
++  /** The tab that applied the switch (null for a state saved before tabs were recorded). */
++  owner: string | null;
++  /** When the switch was recorded, epoch ms (0 when unknown). */
++  at: number;
++}
++
++/** Another tab's state counts as abandoned after this long. */
++export const VOICE_MODEL_STALE_MS = 6 * 60 * 60 * 1000;
++
++const TAB_KEY = "omnigent:ae-voice-tab-id";
++let memoryTabId: string | null = null;
++
++/** An id for this browser tab (kept in sessionStorage, so a reload keeps it). */
++export function voiceTabId(): string {
++  if (memoryTabId) return memoryTabId;
++  let id: string | null;
++  try {
++    id = typeof window === "undefined" ? null : window.sessionStorage.getItem(TAB_KEY);
++  } catch {
++    id = null;
++  }
++  if (!id) {
++    id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
++    try {
++      window.sessionStorage.setItem(TAB_KEY, id);
++    } catch {
++      // The id then lives for this page only.
++    }
++  }
++  memoryTabId = id;
++  return id;
++}
++
++/** Test hook: forget the cached tab id. */
++export function resetVoiceTabId(): void {
++  memoryTabId = null;
+ }
+ 
+ export function readVoiceModelState(chatId: string): VoiceModelState | null {
+@@ -101,16 +137,63 @@ export function readVoiceModelState(chatId: string): VoiceModelState | null {
+       previous: typeof parsed.previous === "string" ? parsed.previous : null,
+       fallback: typeof parsed.fallback === "string" ? parsed.fallback : null,
+       fast: parsed.fast,
++      owner: typeof parsed.owner === "string" ? parsed.owner : null,
++      at: typeof parsed.at === "number" ? parsed.at : 0,
+     };
+   } catch {
+     return null;
+   }
+ }
+ 
+-export function writeVoiceModelState(chatId: string, state: VoiceModelState): void {
+-  setItem(STATE_KEY + chatId, JSON.stringify(state));
++export function writeVoiceModelState(
++  chatId: string,
++  state: Omit<VoiceModelState, "owner" | "at"> & Partial<Pick<VoiceModelState, "owner" | "at">>,
++): void {
++  setItem(
++    STATE_KEY + chatId,
++    JSON.stringify({ ...state, owner: state.owner ?? voiceTabId(), at: state.at ?? Date.now() }),
++  );
+ }
+ 
+ export function clearVoiceModelState(chatId: string): void {
+   setItem(STATE_KEY + chatId, null);
+ }
++
++function stale(state: VoiceModelState, now: number): boolean {
++  return state.at === 0 || now - state.at > VOICE_MODEL_STALE_MS;
++}
++
++/**
++ * May this tab revert and clear the state? The tab that applied the switch may; so may any tab for
++ * a state saved before owners were recorded, an abandoned one, or one whose chat has Voice mode
++ * persisted off. Another live tab's state is left alone.
++ */
++export function mayRevertVoiceModel(
++  state: VoiceModelState,
++  voicePersistedOn: boolean,
++  now: number = Date.now(),
++): boolean {
++  return (
++    state.owner === null || state.owner === voiceTabId() || !voicePersistedOn || stale(state, now)
++  );
++}
++
++export type VoiceModelVerdict = "revert" | "hand-picked" | "keep";
++
++/**
++ * What the chat's current model says about the saved state. `revert`: still on the fast model.
++ * `hand-picked`: a known model that is neither the fast nor the previous one (or the state is
++ * abandoned): leave it and forget the state. `keep`: not hydrated yet, or a switch to the fast
++ * model may still be in flight (the override is unknown, empty or the previous one).
++ */
++export function voiceModelVerdict(
++  state: VoiceModelState,
++  override: string | null,
++  options: readonly NativeModelOption[],
++  now: number = Date.now(),
++): VoiceModelVerdict {
++  if (override === state.fast) return "revert";
++  if (stale(state, now)) return "hand-picked";
++  if (override === null || override === state.previous) return "keep";
++  return options.some((o) => o.id === override) ? "hand-picked" : "keep";
++}

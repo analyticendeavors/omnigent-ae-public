@@ -149,6 +149,14 @@ async def test_lists_the_worker_tools_and_ours(omni: OmniClient) -> None:
         assert park["required"] == ["thread", "state", "next", "slot", "quadrant", "est", "from"]
         assert park["properties"]["slot"]["enum"] == ["never opened", "freed", "swapped-back"]
         assert park["properties"]["quadrant"]["enum"] == ["hotfix", "feature", "admin"]
+        create = by_name["create_task"].inputSchema
+        assert create["required"] == ["title", "quadrant", "est"]
+        assert create["properties"]["quadrant"]["enum"] == [
+            "hotfix",
+            "feature",
+            "admin",
+            "neither",
+        ]
         assert set(park["properties"]) == {
             "summary",
             "thread",
@@ -341,14 +349,31 @@ async def test_create_task_posts_to_the_create_route(omni: OmniClient) -> None:
                         "due_time": "10:00",
                         "tags": ["AE"],
                         "list": "AE Work",
+                        "quadrant": "neither",
+                        "est": "minutes",
                     },
                 )
             )
             body = json.loads(post.calls[0].request.content)
             # A refused input never reaches the store; the agent gets the worker's shape back.
             refused = _payload(
-                await session.call_tool("create_task", {"title": "x", "due_time": "10:00"})
+                await session.call_tool(
+                    "create_task",
+                    {"title": "x", "due_time": "10:00", "quadrant": "admin", "est": "15"},
+                )
             )
+            # The SDK checks the schema first, so a missing field never reaches the handler.
+            no_quadrant = await session.call_tool("create_task", {"title": "x", "est": "15"})
+            no_est = await session.call_tool("create_task", {"title": "x", "quadrant": "admin"})
+            bad_est = _payload(
+                await session.call_tool(
+                    "create_task", {"title": "x", "quadrant": "admin", "est": "soon"}
+                )
+            )
+            bad_quadrant = await session.call_tool(
+                "create_task", {"title": "x", "quadrant": "urgent", "est": "15"}
+            )
+            posts_after = len(post.calls)
     assert made["outcome"] == "created"
     assert made["task_id"] == "T-REM"
     assert body["reminder_at"] == body["due_at"]
@@ -358,6 +383,13 @@ async def test_create_task_posts_to_the_create_route(omni: OmniClient) -> None:
     assert body["bucket_id"] == "B1"
     assert refused["outcome"] == "not_created"
     assert refused["reason"].endswith("due_time needs a due_date.")
+    assert (body["urgent"], body["important"]) == (0, 0)
+    assert no_quadrant.isError and "quadrant" in no_quadrant.content[0].text
+    assert no_est.isError and "est" in no_est.content[0].text
+    assert 'est "soon" maps to no estimate' in bad_est["reason"]
+    assert bad_quadrant.isError and "urgent" in bad_quadrant.content[0].text
+    assert bad_est["outcome"] == "not_created"
+    assert posts_after == 1
     assert post.call_count == 1
 
 
@@ -445,7 +477,22 @@ async def test_omni_capacity_and_transcript(omni: OmniClient, client: httpx.Asyn
         )["id"]
         get_conversation_store().set_session_live_status(crashed, "failed")
 
-        capacity = _payload(await session.call_tool("omni_capacity", {}))
+        summary = _payload(await session.call_tool("omni_capacity", {}))
+        assert summary["slots_used"] == 1
+        assert summary["slots_free"] == summary["limit"] - 1
+        assert [row["id"] for row in summary["holders"]] == [working]
+        assert set(summary["holders"][0]) <= {"id", "title", "elapsed"}
+        assert summary["helpers_working"] == 0
+        assert [row["id"] for row in summary["blocked"]] == [crashed]
+        assert summary["blocked"][0]["failed"] is True
+        assert summary["counts"] == {
+            "review": 0,
+            "parked": 0,
+            "reference": 0,
+            "unlabelled_running": 0,
+        }
+        assert "started" not in summary["holders"][0] and "today" not in summary
+        capacity = _payload(await session.call_tool("omni_capacity", {"detail": "full"}))
         assert capacity["slots_used"] == 1, "a failed session holds no slot"
         assert [row["id"] for row in capacity["working"]] == [working]
         assert [row["id"] for row in capacity["blocked"]] == [crashed]
@@ -1429,3 +1476,18 @@ async def test_hand_off_posts_the_packet_as_the_calling_session(
     async with connect(_stub(handler)) as session:
         refused = _payload(await session.call_tool("hand_off", {"packet": "x"}))
     assert "nothing was handed off" in refused["error"]
+
+
+async def test_create_task_handler_refuses_a_missing_quadrant_or_est(omni: OmniClient) -> None:
+    # The handler's own check, for a caller that skips the schema.
+    from ae_omni_policies import mcp
+
+    with respx.mock(base_url=BASE) as mock:
+        for args, text in [
+            ({"title": "x", "est": "15"}, "quadrant is required: one of hotfix, feature, admin, "),
+            ({"title": "x", "quadrant": "neither"}, "est is required: 15, 30, 45 or 60plus"),
+        ]:
+            out = await mcp.create_task(omni, args)
+            assert out["outcome"] == "not_created"
+            assert text in out["reason"]
+        assert mock.calls.call_count == 0

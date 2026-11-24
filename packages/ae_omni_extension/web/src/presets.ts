@@ -24,10 +24,12 @@ import {
   applySuggestion,
   describeError,
   dismissSuggestion,
+  fetchModelWatch,
   fetchNewerModels,
   fetchPresets,
   fetchPresetSuggestions,
   openSuggestionIssue,
+  type ModelWatchAnswer,
   type NewerModel,
   type NewerModelsAnswer,
   type PresetReview,
@@ -43,6 +45,7 @@ import { sparkline, money } from "./azure";
 import { button, type Child, el, notice, replaceChildren } from "./dom";
 import { familyCostSection } from "./familyCost";
 import { hint } from "./hint";
+import { modelWatchFold } from "./modelWatch";
 import { closeIcon } from "./icons";
 import { fold, foldLine } from "./fold";
 
@@ -350,6 +353,8 @@ interface State {
   adminOnly: boolean;
   /** Newer models in the catalog (null until read, or when the read failed). */
   newer: NewerModelsAnswer | null;
+  /** The new-model watch (null until read, or when the read failed: the fold is left out). */
+  watch: ModelWatchAnswer | null;
   /** Every user's suggestions (null until read, or when the read failed: the card still draws). */
   suggestions: PresetSuggestionsAnswer | null;
   /** Ids of the viewer's own suggestions, so "For <owner>" shows only on someone else's. */
@@ -893,11 +898,21 @@ function drawBody(parts: Parts, state: State): void {
     );
     noted.push(footnote(showOf(view)));
   }
+  if (!state.adminOnly) lines.push(modelWatchFold(state.watch, () => showSuggestions(parts.body)));
   setNotes("presets", noted);
   replaceChildren(parts.body, lines);
   if (focusedFold) {
     parts.body.querySelector<HTMLElement>(`[data-fold="${focusedFold}"]`)?.focus();
   }
+}
+
+/** Open the Suggestions fold and bring it into view (the New models rows point at it). */
+function showSuggestions(body: HTMLElement): void {
+  const head = body.querySelector<HTMLButtonElement>('.presets-fold-head[data-fold="suggestions"]');
+  if (!head) return;
+  if (head.getAttribute("aria-expanded") !== "true") head.click();
+  head.scrollIntoView?.({ block: "start", behavior: "smooth" });
+  head.focus();
 }
 
 function drawToggle(
@@ -1286,6 +1301,7 @@ export function activatePresets(
     error: null,
     adminOnly: false,
     newer: null,
+    watch: null,
     suggestions: null,
     mine: new Set(),
     busy: new Set(),
@@ -1371,6 +1387,16 @@ export function activatePresets(
       },
       () => undefined,
     );
+    // The new-model watch is a side read too: a failure leaves the fold out.
+    void fetchModelWatch(context).then(
+      (answer) => {
+        if (!live()) return;
+        const same = JSON.stringify(answer) === JSON.stringify(state.watch);
+        state.watch = answer;
+        if (!same && state.answer) state.redraw();
+      },
+      () => undefined,
+    );
     // The suggestions are a side read: a failure leaves the card as it was.
     const side = Promise.all([
       fetchPresetSuggestions(context, true),
@@ -1413,6 +1439,7 @@ export function activatePresets(
           state.error ? describeError(state.error) : null,
           state.adminOnly,
           state.suggestions,
+          state.watch,
           [...state.mine],
         ]);
         if (key !== drawn) {

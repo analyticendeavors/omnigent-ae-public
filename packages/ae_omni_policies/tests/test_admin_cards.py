@@ -469,6 +469,31 @@ async def test_attention_skips_an_off_cards_source_and_never_skips_secrets(
     assert "secrets" in called and "vault" in called
 
 
+async def test_home_security_off_removes_the_home_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import UTC, datetime
+
+    called: list[str] = []
+
+    def reader(source: str) -> Any:
+        async def read(_now: Any, _login: Any, **_k: Any) -> attention.Reading:
+            called.append(source)
+            return attention.Reading(source)
+
+        return read
+
+    monkeypatch.setattr(attention, "_READERS", {s: reader(s) for s in attention.SOURCES})
+    admin_cards.reset_store(admin_cards.CardStore(None))
+    await attention.read_sources(attention.SOURCES, datetime.now(UTC))
+    assert "home" in called
+    called.clear()
+    admin_cards.store().set_on("home-security", False, "owner@example.com", 0)
+    assert "home" in admin_cards.off_sources()
+    await attention.read_sources(attention.SOURCES, datetime.now(UTC))
+    assert "home" not in called and "box" in called
+
+
 async def test_the_cleanup_starts_no_git_refresh_while_git_is_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -726,6 +751,7 @@ def test_every_card_row_names_its_sources() -> None:
     assert rows["git"]["sources"] == ["git", "git-mine"]
     assert rows["box"]["sources"] == ["box", "host"]
     assert rows["deploys"]["sources"] == []
+    assert rows["home-security"]["sources"] == ["home"]
     for card in admin_cards.visible():
         assert rows[card.id]["sources"] == list(card.sources)
 

@@ -78,6 +78,10 @@ HANDOFF_NUDGED = "nudged"
 HANDOFF_SNOOZED = "snoozed"
 # The runner id an automatic resume was last tried for (auto_resume.py, 2026-10-13).
 AUTORESUME = "ae.autoresume"
+# Background shells a claude-native turn left running at its Stop (background_shells.py,
+# 2026-11-23): the count, set while above zero, so auto-resume can revive the idle session a
+# host restart killed them in.
+BG_SHELLS = "ae.bg_shells"
 # The Needs you item a chat was started on (``attention.py``, 2026-11-03): the item's id, how the
 # list finds "Claude is on it"; and the fingerprint of the item's state when the chat started.
 ATTENTION = "ae.attention"

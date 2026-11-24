@@ -55,7 +55,7 @@ shape is ``{"version": 1, "users": {"<user>": {"revision": n, "updated_at":
 (``insights``, added 2026-10-24, is optional and left out until set; ``preset_runs`` reads it).
 The Family cost card's settings (2026-10-29) sit beside it, top level and left out until set:
 ``family_cost_unit`` (``tokens`` or ``dollars``), ``runaway_family_tokens`` and
-``runaway_family_usd``.
+``runaway_family_usd`` and ``family_flag_on`` (``tokens``, ``dollars`` or ``either``, 2026-11-23).
 Where it lives: :data:`STATE_FILE_ENV` when set; else ``/data/ae-roles.json``
 when ``/data`` is a directory; else memory only.
 """
@@ -71,7 +71,7 @@ import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, NamedTuple
 
 from pydantic import (
     BaseModel,
@@ -101,7 +101,7 @@ MAX_HANDOFF_TOKENS = 5_000_000
 #: Family cost card (2026-10-29): the unit it leads with, and the largest runaway amounts saved.
 MAX_RUNAWAY_TOKENS = 1_000_000_000
 MAX_RUNAWAY_USD = 100_000
-DEFAULT_RUNAWAY_TOKENS = 5_000_000
+DEFAULT_RUNAWAY_TOKENS = 50_000_000
 DEFAULT_RUNAWAY_USD = 25.0
 CODE_NOT_SAVED = "roles_not_saved"
 DEFAULT_PRESET = "balanced"
@@ -122,11 +122,13 @@ AgentEffort = Literal["low", "medium", "high", "xhigh", "max", "ultra"]
 Color = Literal["green", "teal", "blue", "violet", "amber", "red", "pink", "slate"]
 
 # Catalog ids as the claude-native harness reports them (checked 2026-10-23
-# against ~/.omnigent/cache/model-catalogs/claude-native-*.json on the box).
+# against ~/.omnigent/cache/model-catalogs/claude-native-*.json on the box; Fable moved to
+# 5.2 on 2026-11-10, which the subscription answers although Claude Code 2.1.322's catalog
+# still lists 5.1).
 OPUS = "claude-opus-5-5"
 SONNET = "claude-sonnet-5-5"
 HAIKU = "claude-haiku-5-5"
-FABLE = "claude-fable-5-1"
+FABLE = "claude-fable-5-2"
 
 # Free text reaches the lead's prompt, one line per preset: no control characters.
 _NO_CONTROL = r"^[^\x00-\x1f\x7f-\x9f\u2028\u2029]*$"
@@ -409,12 +411,15 @@ class _PresetList(_Strict):
     lead_handoff_tokens: StrictInt | None = Field(default=None, ge=0, le=MAX_HANDOFF_TOKENS)
     # Family cost card (2026-10-29): the number it shows first ("tokens" when absent), and the
     # spend today that flags a family as a runaway, one value per unit so switching the unit does
-    # not turn 5M tokens into $5M. Absent reads as 5M tokens or $25; 0 turns the flag off.
+    # not turn 50M tokens into $50M. Absent reads as 50M tokens or $25 (5M before 2026-11-23); 0
+    # turns the flag off. ``family_flag_on`` (2026-11-23) picks which limit raises it: absent
+    # reads as "either".
     family_cost_unit: Literal["tokens", "dollars"] | None = None
     runaway_family_tokens: StrictInt | None = Field(default=None, ge=0, le=MAX_RUNAWAY_TOKENS)
     runaway_family_usd: StrictInt | StrictFloat | None = Field(
         default=None, ge=0, le=MAX_RUNAWAY_USD
     )
+    family_flag_on: Literal["tokens", "dollars", "either"] | None = None
     # The user's own reviewer personas (2026-11-01, ``personas.py``); the built-in ones are
     # not stored. Absent until the user adds one, and left out of the stored JSON while None.
     personas: list[persona_defs.Persona] | None = Field(
@@ -432,6 +437,7 @@ class _PresetList(_Strict):
             "family_cost_unit",
             "runaway_family_tokens",
             "runaway_family_usd",
+            "family_flag_on",
             "personas",
         ):
             if data.get(key) is None:
@@ -464,6 +470,15 @@ class _PresetList(_Strict):
         return self
 
 
+class FamilyCostPrefs(NamedTuple):
+    """What :meth:`RolePrefsStore.family_cost_settings` returns for one user."""
+
+    unit: str
+    runaway_tokens: float
+    runaway_usd: float
+    flag_on: str
+
+
 class FamilyCostSettings(_Strict):
     """The body of ``POST /family-cost/settings``: the Family cost card's own fields.
 
@@ -477,6 +492,7 @@ class FamilyCostSettings(_Strict):
     runaway_family_usd: StrictInt | StrictFloat | None = Field(
         default=None, ge=0, le=MAX_RUNAWAY_USD
     )
+    family_flag_on: Literal["tokens", "dollars", "either"] | None = None
 
     @model_validator(mode="after")
     def _something_to_save(self) -> FamilyCostSettings:
@@ -891,8 +907,8 @@ class RolePrefsStore:
             return DEFAULT_HANDOFF_TOKENS
         return state.lead_handoff_tokens
 
-    def family_cost_settings(self, user: str) -> tuple[str, float, float]:
-        """*user*'s ``(unit, runaway tokens, runaway dollars)``; the defaults when never set.
+    def family_cost_settings(self, user: str) -> FamilyCostPrefs:
+        """*user*'s ``(unit, runaway tokens, runaway dollars, flag on)``; defaults when never set.
 
         Read by the Family cost card's route (:mod:`ae_omni_policies.family_cost`), so it skips the
         starters work :meth:`get` does.
@@ -901,13 +917,14 @@ class RolePrefsStore:
             self._load()
             state = self._states.get(user)
         if state is None:
-            return "tokens", DEFAULT_RUNAWAY_TOKENS, DEFAULT_RUNAWAY_USD
-        return (
+            return FamilyCostPrefs("tokens", DEFAULT_RUNAWAY_TOKENS, DEFAULT_RUNAWAY_USD, "either")
+        return FamilyCostPrefs(
             state.family_cost_unit or "tokens",
             DEFAULT_RUNAWAY_TOKENS
             if state.runaway_family_tokens is None
             else state.runaway_family_tokens,
             DEFAULT_RUNAWAY_USD if state.runaway_family_usd is None else state.runaway_family_usd,
+            state.family_flag_on or "either",
         )
 
     def all_states(self) -> dict[str, RolesState]:
@@ -990,6 +1007,11 @@ class RolePrefsStore:
                         body.runaway_family_usd
                         if "runaway_family_usd" in body.model_fields_set
                         else current.runaway_family_usd
+                    ),
+                    family_flag_on=(
+                        body.family_flag_on
+                        if "family_flag_on" in body.model_fields_set
+                        else current.family_flag_on
                     ),
                     # Absent keeps the saved personas; a list (even empty) replaces them.
                     personas=(

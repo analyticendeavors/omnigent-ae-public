@@ -1,6 +1,6 @@
 // Needs you fixtures (2026-11-03): items and answers shaped like `GET /v1/ae/attention`
 // (ae_omni_policies/attention.py), shared by the panel's, the Git card's and the Box card's tests.
-import { heldByWorkingChat, type AttentionItem, type AttentionOverview, type AttentionSource } from "../src/api";
+import { notCounted, type AttentionItem, type AttentionOverview, type AttentionSource } from "../src/api";
 
 let counter = 0;
 
@@ -29,7 +29,7 @@ export function overview(
   items: AttentionItem[],
   fields: Partial<AttentionOverview> = {},
 ): AttentionOverview {
-  const counted = items.filter((entry) => !heldByWorkingChat(entry));
+  const counted = items.filter((entry) => !notCounted(entry, fields.me));
   const by_source: Record<string, { urgent: number; review: number }> = {};
   for (const entry of counted) {
     const row = (by_source[entry.source] ??= { urgent: 0, review: 0 });

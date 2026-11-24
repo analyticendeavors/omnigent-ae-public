@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 18:28:03 -0800
+Subject: [PATCH 383/443] [ae-patch] Fix the voice stall review findings: long
+ speech, restart cap, fresh start window (0383)
+
+Browser takes run with interimResults off, so a speechstart with no end event now
+gets a 20 s hung limit instead of 6 s (the 3.5 s rule still applies after any end
+event), and the idle recycle waits while speech is open. Event-detector restarts
+are capped at 4 a minute (log: mic stall restart capped, no deaf report) until the
+next result or new take. silentRestart restarts the no-audiostart window so a slow
+audiostart after any silent restart is not reported deaf.
+---
+ .../ComposerMicButton.meterOff.test.tsx       | 62 +++++++++++++++----
+ web/src/components/ComposerMicButton.tsx      | 27 +++++++-
+ web/src/lib/aeVoiceStall.test.ts              | 28 +++++++--
+ web/src/lib/aeVoiceStall.ts                   | 17 ++++-
+ 4 files changed, 115 insertions(+), 19 deletions(-)
+
+diff --git a/web/src/components/ComposerMicButton.meterOff.test.tsx b/web/src/components/ComposerMicButton.meterOff.test.tsx
+index a94871fdf6074c51c1608040baa9e0e96746f004..4fe0305fff10d46be80f9432832b495982a1348c 100644
+--- a/web/src/components/ComposerMicButton.meterOff.test.tsx
++++ b/web/src/components/ComposerMicButton.meterOff.test.tsx
+@@ -312,11 +312,13 @@ describe("ComposerMicButton (level meter off)", () => {
+     expect(formatVoiceLog()).not.toContain("mic stalled");
+   });
+ 
+-  it("speech heard and then nothing at all stalls after 6 s, with no end event", async () => {
++  it("speech heard and then nothing at all stalls only after 20 s, with no end event", async () => {
+     setUserAgent(IOS_UA);
+     const { controller, onListeningChange } = await listenVoice();
+     act(() => instances[0].handlers.speechstart?.({}));
+-    await run(5500);
++    await run(12_000);
++    expect(instances).toHaveLength(1);
++    await run(7500);
+     expect(instances).toHaveLength(1);
+     await run(1000);
+     expect(instances).toHaveLength(2);
+@@ -325,24 +327,62 @@ describe("ComposerMicButton (level meter off)", () => {
+     expect(controller.current?.isListening()).toBe(true);
+   });
+ 
+-  it("event stalls restart silently every time and never call the mic deaf", async () => {
++  async function stallRound() {
++    const latest = instances[instances.length - 1];
++    act(() => {
++      latest.handlers.start?.({});
++      latest.handlers.audiostart?.({});
++      latest.handlers.speechstart?.({});
++    });
++    await run(300);
++    act(() => latest.handlers.speechend?.({}));
++    await run(4000);
++  }
++
++  it("caps event stall restarts at 4 a minute, never calls the mic deaf, and resumes after a result", async () => {
+     setUserAgent(IOS_UA);
+     const { onListeningChange } = await listenVoice();
+-    for (let i = 0; i < 6; i += 1) {
+-      const latest = instances[instances.length - 1];
+-      act(() => {
+-        latest.handlers.start?.({});
+-        latest.handlers.audiostart?.({});
+-        latest.handlers.speechstart?.({});
+-      });
++    for (let i = 0; i < 4; i += 1) {
+       // oxlint-disable-next-line no-await-in-loop -- one stall per round
+-      await run(6500);
++      await stallRound();
+       expect(instances).toHaveLength(i + 2);
+     }
++    await stallRound();
++    expect(instances).toHaveLength(5);
++    await stallRound();
++    expect(instances).toHaveLength(5);
+     const log = formatVoiceLog();
++    expect(log.match(/mic stall restart capped/g)).toHaveLength(1);
+     expect(log).not.toContain("stalled repeatedly");
+     expect(log).not.toContain("mic deaf");
+     expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    // A result lifts the cap.
++    act(() =>
++      instances[4].handlers.result?.({
++        resultIndex: 0,
++        results: { length: 1, 0: { length: 1, isFinal: false, 0: { transcript: "hi" } } },
++      }),
++    );
++    await stallRound();
++    expect(instances).toHaveLength(6);
++  });
++
++  it("an event stall restart followed by a slow audiostart (4 s) does not report deaf", async () => {
++    setUserAgent(IOS_UA);
++    const { onListeningChange } = await listenVoice();
++    await run(2000);
++    act(() => instances[0].handlers.speechstart?.({}));
++    await run(300);
++    act(() => instances[0].handlers.speechend?.({}));
++    await run(4000);
++    expect(instances).toHaveLength(2);
++    // The fresh recognizer is silent for 4 s, inside its own 5 s no-audiostart window.
++    await run(4000);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    expect(formatVoiceLog()).not.toContain("no audiostart");
++    act(() => instances[1].handlers.audiostart?.({}));
++    await run(1000);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
+   });
+ 
+   it("turning the Level meter on mid-take opens the second stream, and off closes it", async () => {
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 8840e4334916cc1ee2b5e3bf113b45b018192954..d92b27a051845cbd15660e347f68bbafcce4818b 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -104,6 +104,8 @@ const MIC_METER_FRESH_MS = 1500;
+ // Stall restarts (speech heard, no result) allowed per minute before the take is called deaf.
+ const MIC_STALL_MAX_PER_MIN = 3;
+ const MIC_STALL_WINDOW_MS = 60_000;
++/** Event-detector restarts (meter off) per minute before they stop until the next result. */
++const MIC_EVENT_RESTART_MAX_PER_MIN = 4;
+ // With the level meter off nothing else watches the mic: no recognizer activity (soundstart,
+ // speechstart, result) this long after audiostart gets a fresh recognizer, so a capture another
+ // app or tab took is reacquired. It is not "deaf": the user may just be quiet. At most this many
+@@ -257,6 +259,8 @@ export const ComposerMicButton = ({
+   const stallTimesRef = useRef<number[]>([]);
+   const idleRecycleTimesRef = useRef<number[]>([]);
+   const idleRecycleCappedRef = useRef(false);
++  const eventRestartTimesRef = useRef<number[]>([]);
++  const eventRestartCappedRef = useRef(false);
+   // Voice mode's assistant is speaking (or just did): the stall detector is off.
+   const assistantAudibleRef = useRef(false);
+   const audibleUntilRef = useRef(0);
+@@ -373,6 +377,8 @@ export const ComposerMicButton = ({
+       lastRecognizerActivityRef.current = Date.now();
+       stallRef.current.reset(Date.now());
+       eventStallRef.current.reset(Date.now());
++      // A fresh recognizer gets the whole no-audiostart allowance before that check judges it.
++      takeStartRef.current = Date.now();
+       try {
+         next.start();
+       } catch {
+@@ -389,6 +395,17 @@ export const ComposerMicButton = ({
+       // A stall seen only through recognizer events (meter off) restarts silently, every time:
+       // those events are weaker evidence than the meter, so they never call the mic deaf.
+       if (fromEvents) {
++        if (eventRestartCappedRef.current) return;
++        const recentEvents = eventRestartTimesRef.current.filter(
++          (t) => now - t < MIC_STALL_WINDOW_MS,
++        );
++        if (recentEvents.length >= MIC_EVENT_RESTART_MAX_PER_MIN) {
++          eventRestartTimesRef.current = recentEvents;
++          eventRestartCappedRef.current = true;
++          logVoice("mic stall restart capped");
++          return;
++        }
++        eventRestartTimesRef.current = [...recentEvents, now];
+         if (!silentRestart(true)) reportDeaf("stall restart failed");
+         return;
+       }
+@@ -407,6 +424,8 @@ export const ComposerMicButton = ({
+       if (!audioStartSeenRef.current || idleRecycleCappedRef.current) return;
+       if (assistantAudibleRef.current || now < audibleUntilRef.current) return;
+       if (now - lastRecognizerActivityRef.current < MIC_IDLE_RECYCLE_MS) return;
++      // Open speech is a user still talking; the event stall detector owns that case (20 s).
++      if (eventStallRef.current.speechOpen()) return;
+       const recent = idleRecycleTimesRef.current.filter((t) => now - t <= MIC_STALL_WINDOW_MS);
+       if (recent.length >= MIC_IDLE_RECYCLE_MAX_PER_MIN) {
+         idleRecycleTimesRef.current = recent;
+@@ -420,8 +439,6 @@ export const ComposerMicButton = ({
+         reportDeaf("idle recycle failed");
+         return;
+       }
+-      // The fresh recognizer gets the whole no-audiostart allowance before that check judges it.
+-      takeStartRef.current = now;
+     };
+ 
+     const checkLiveness = () => {
+@@ -627,6 +644,8 @@ export const ComposerMicButton = ({
+         resultSinceStopRef.current = true;
+         lastRecognizerActivityRef.current = Date.now();
+         idleRecycleCappedRef.current = false;
++        eventRestartTimesRef.current = [];
++        eventRestartCappedRef.current = false;
+         stallRef.current.result(Date.now());
+         eventStallRef.current.result(Date.now());
+         pulseTargetRef.current = 0.65;
+@@ -1303,6 +1322,8 @@ export const ComposerMicButton = ({
+         stallTimesRef.current = [];
+         idleRecycleTimesRef.current = [];
+         idleRecycleCappedRef.current = false;
++        eventRestartTimesRef.current = [];
++        eventRestartCappedRef.current = false;
+         if (browserStartPendingRef.current) {
+           watchPermission();
+           armWatchdog();
+@@ -1327,6 +1348,8 @@ export const ComposerMicButton = ({
+           stallTimesRef.current = [];
+           idleRecycleTimesRef.current = [];
+           idleRecycleCappedRef.current = false;
++          eventRestartTimesRef.current = [];
++          eventRestartCappedRef.current = false;
+           silentStartRef.current = false;
+           clearStartWatchdog();
+           clearStopWatchdog();
+diff --git a/web/src/lib/aeVoiceStall.test.ts b/web/src/lib/aeVoiceStall.test.ts
+index f05bca0b06ae2782865e2b039f5dc4bdd3fd88a1..08a8e1e6b7ddec50bd53ff319f517aaee569f74b 100644
+--- a/web/src/lib/aeVoiceStall.test.ts
++++ b/web/src/lib/aeVoiceStall.test.ts
+@@ -3,6 +3,7 @@ import {
+   createEventStallDetector,
+   EVENT_HEARD_MIN_SOUND_MS,
+   EVENT_NO_END_STALL_MS,
++  EVENT_OPEN_SPEECH_STALL_MS,
+   createStallDetector,
+   isWebKitSpeech,
+   MAX_FRAME_MS,
+@@ -206,19 +207,38 @@ describe("event stall detector (meter off)", () => {
+     expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS + STALL_QUIET_MS)).toBeNull();
+   });
+ 
+-  it("speechstart and then nothing stalls, even with no end event", () => {
++  it("speechstart and then nothing stalls after the open-speech limit, with no end event", () => {
+     const d = createEventStallDetector();
+     d.reset(0);
+     d.speechStart(1000);
+-    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS - 1)).toBeNull();
+-    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS)).toBe(1000 + EVENT_NO_END_STALL_MS);
+-    expect(d.evaluate(1000 + EVENT_NO_END_STALL_MS + 1000)).toBeNull();
++    expect(d.evaluate(1000 + EVENT_OPEN_SPEECH_STALL_MS - 1)).toBeNull();
++    expect(d.evaluate(1000 + EVENT_OPEN_SPEECH_STALL_MS)).toBe(1000 + EVENT_OPEN_SPEECH_STALL_MS);
++    expect(d.evaluate(1000 + EVENT_OPEN_SPEECH_STALL_MS + 1000)).toBeNull();
++  });
++
++  it("12 s of continuous speech with no events does not stall; 21 s does", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.speechStart(1000);
++    expect(d.evaluate(13_000)).toBeNull();
++    expect(d.evaluate(20_999)).toBeNull();
++    expect(d.evaluate(21_000)).toBe(21_000);
++  });
++
++  it("a speechend after a long open speech returns to the 3.5 s rule", () => {
++    const d = createEventStallDetector();
++    d.reset(0);
++    d.speechStart(1000);
++    d.ended(13_000);
++    expect(d.evaluate(13_000 + STALL_QUIET_MS - 1)).toBeNull();
++    expect(d.evaluate(13_000 + STALL_QUIET_MS)).toBe(13_000 + STALL_QUIET_MS);
+   });
+ 
+   it("the no-end window counts from the last sound or speech event", () => {
+     const d = createEventStallDetector();
+     d.reset(0);
+     d.speechStart(1000);
++    d.ended(2000);
+     d.soundStart(5000);
+     expect(d.evaluate(5000 + EVENT_NO_END_STALL_MS - 1)).toBeNull();
+     expect(d.evaluate(5000 + EVENT_NO_END_STALL_MS)).not.toBeNull();
+diff --git a/web/src/lib/aeVoiceStall.ts b/web/src/lib/aeVoiceStall.ts
+index 344c704538ef05f4e6f7aa948a4bb180e6c89494..2510012f29324403dd9350ca917a68749bd73040 100644
+--- a/web/src/lib/aeVoiceStall.ts
++++ b/web/src/lib/aeVoiceStall.ts
+@@ -113,6 +113,10 @@ export const EVENT_HEARD_MIN_SOUND_MS = 600;
+ /** Speech heard and no result this long after the last sound or speech event is a stall, even
+  *  when no soundend, speechend or audioend ever came (a recognizer that hung mid-take). */
+ export const EVENT_NO_END_STALL_MS = 6000;
++/** While a speechstart is open (no speechend, soundend or audioend since), the user may still be
++ *  talking: browser takes run with interimResults off, so a long utterance sends no result until
++ *  the pause. The hung-recognizer limit is this longer one for that case. */
++export const EVENT_OPEN_SPEECH_STALL_MS = 20_000;
+ 
+ /**
+  * The stall detector for a take with no level meter (the meter is off): the recognizer's own
+@@ -120,7 +124,7 @@ export const EVENT_NO_END_STALL_MS = 6000;
+  * EVENT_HEARD_MIN_SOUND_MS before its soundend (a cough or a click is not speech). A stall is
+  * speech heard and then either STALL_QUIET_MS with no result after a soundend, speechend or
+  * audioend, or EVENT_NO_END_STALL_MS with no result after the last sound or speech event when no
+- * end event came. It never reads audio levels.
++ * end event came (EVENT_OPEN_SPEECH_STALL_MS while a speechstart is still open). It never reads audio levels.
+  */
+ export interface EventStallDetector {
+   /** speechstart: the recognizer heard speech. */
+@@ -137,22 +141,27 @@ export interface EventStallDetector {
+   evaluate: (now: number) => number | null;
+   /** A new take or a fresh recognizer. */
+   reset: (now: number) => void;
++  /** A speechstart is open: no speechend, soundend or audioend since. */
++  speechOpen: () => boolean;
+ }
+ 
+ export function createEventStallDetector(): EventStallDetector {
+   let heardAt: number | null = null;
+   let endAt: number | null = null;
+   let soundAt: number | null = null;
++  let speechOpen = false;
+   let lastEventAt = 0;
+   let lastResult = 0;
+   const clear = () => {
+     heardAt = null;
+     endAt = null;
+     soundAt = null;
++    speechOpen = false;
+   };
+   return {
+     speechStart(now) {
+       heardAt = now;
++      speechOpen = true;
+       endAt = null;
+       lastEventAt = now;
+     },
+@@ -163,6 +172,7 @@ export function createEventStallDetector(): EventStallDetector {
+     },
+     soundEnd(now) {
+       lastEventAt = now;
++      speechOpen = false;
+       const started = soundAt;
+       soundAt = null;
+       if (started !== null && now - started >= EVENT_HEARD_MIN_SOUND_MS) {
+@@ -174,6 +184,7 @@ export function createEventStallDetector(): EventStallDetector {
+     },
+     ended(now) {
+       lastEventAt = now;
++      speechOpen = false;
+       if (heardAt !== null) endAt = now;
+     },
+     result(now) {
+@@ -183,7 +194,8 @@ export function createEventStallDetector(): EventStallDetector {
+     evaluate(now) {
+       if (heardAt === null) return null;
+       const quietAfterEnd = endAt !== null && now - endAt >= STALL_QUIET_MS;
+-      const hungNoEnd = now - lastEventAt >= EVENT_NO_END_STALL_MS;
++      const hungNoEnd =
++        now - lastEventAt >= (speechOpen ? EVENT_OPEN_SPEECH_STALL_MS : EVENT_NO_END_STALL_MS);
+       if (!quietAfterEnd && !hungNoEnd) return null;
+       clear();
+       return Math.max(0, now - lastResult);
+@@ -193,6 +205,7 @@ export function createEventStallDetector(): EventStallDetector {
+       lastEventAt = now;
+       clear();
+     },
++    speechOpen: () => speechOpen,
+   };
+ }
+ 

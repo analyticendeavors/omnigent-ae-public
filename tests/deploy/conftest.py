@@ -28,3 +28,10 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
         in_sync_tests = item.path.name == "test_host_config_sync.py"
         if in_sync_tests and _DOCKER_FIXTURES & set(getattr(item, "fixturenames", ())):
             item.add_marker(pytest.mark.docker)
+
+
+@pytest.fixture(autouse=True)
+def _no_installed_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The deploy scripts use /usr/local/sbin/ae-gate when it exists; tests run the direct path
+    unless one points AE_GATE at a fake."""
+    monkeypatch.setenv("AE_GATE", "/nonexistent/ae-gate")

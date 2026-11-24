@@ -1,0 +1,349 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 14:45:42 -0800
+Subject: [PATCH 399/443] [ae-patch] Voice mode on iPhone: release the cloud
+ audio element before the mic starts
+
+On WebKit, after a cloud reply plays through the shared audio element, the element kept holding the iOS audio session, so every later recognizer heard nothing ("No speech detected") until Voice ended. The cloud speaker now fully releases the element (pause, no src, load) on a stop, a barge-in and a play error as well as when the queue drains, and the mic start (whenSynthIdle, which also covers the approval phase) asks the speaker to release first and waits a named 150 ms settle (MIC_AUDIO_SETTLE_MS) before the recognizer starts. A reply that is still speaking is never released, the element instance is kept so the tap-unlock stays, and the next sentence sets src again. Non-WebKit is unchanged.
+---
+ web/src/hooks/useAeSpeakReplies.ts |  2 +
+ web/src/lib/aeCloudVoice.test.ts   | 85 ++++++++++++++++++++++++++++++
+ web/src/lib/aeCloudVoice.ts        | 52 +++++++++++++-----
+ web/src/lib/aeSpeakReplies.test.ts | 40 ++++++++++++++
+ web/src/lib/aeSpeakReplies.ts      | 33 ++++++++++++
+ 5 files changed, 200 insertions(+), 12 deletions(-)
+
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 15be4dae088f164b4e4e4c73f203412b115f38a3..9495746c76a3aa8cbf0db3106afa38b95497a681 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -7,6 +7,7 @@ import {
+   createSpeaker,
+   primeCloudPlayback,
+   registerCloudPrimer,
++  registerCloudReleaser,
+   setCaptionHandler,
+   setPlaybackHandler,
+   type Speaker,
+@@ -49,6 +50,7 @@ function getCloud(): Speaker {
+ 
+ // primeVoicePlayback (lib/aeSpeakReplies.ts) reaches the cloud speaker through this.
+ registerCloudPrimer(() => getCloud().prime?.());
++registerCloudReleaser(() => getCloud().releaseForMic?.() ?? 0);
+ 
+ /** One speaker face over both: `speak` goes to the voice's engine, `stop` to both. */
+ function getSpeaker(): Speaker {
+diff --git a/web/src/lib/aeCloudVoice.test.ts b/web/src/lib/aeCloudVoice.test.ts
+index f9e8e585017eb20fd77ba92124a40a77c51907bc..6daa07edeb1ed0b0fb0f672bef6128a4bebb9541 100644
+--- a/web/src/lib/aeCloudVoice.test.ts
++++ b/web/src/lib/aeCloudVoice.test.ts
+@@ -248,6 +248,91 @@ describe("createCloudSpeaker", () => {
+     expect(el?.played).toHaveLength(2);
+   });
+ 
++  describe("release before the mic", () => {
++    const IPHONE =
++      "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1";
++    const CHROME =
++      "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
++    const setUa = (ua: string) =>
++      Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++    afterEach(() => {
++      delete (navigator as { userAgent?: unknown }).userAgent;
++    });
++
++    async function playOne(speaker: ReturnType<typeof createCloudSpeaker>) {
++      speaker.speak("Hello there.", OPTS);
++      await settle();
++      pending[0].resolve(mp3());
++      await settle();
++    }
++
++    it("WebKit: after play end the source is cleared and load() ran before the mic callback", async () => {
++      setUa(IPHONE);
++      const speaker = createCloudSpeaker(new FakeDevice());
++      await playOne(speaker);
++      const el = FakeAudio.last;
++      FakeAudio.last?.end();
++      await settle();
++      expect(el?.src).toBe("");
++      expect(el?.loads).toBe(1);
++      const order: string[] = [];
++      const loadsAtMic = el?.loads;
++      const left = speaker.releaseForMic?.() ?? -1;
++      order.push(`mic after ${loadsAtMic} load`);
++      expect(left).toBeGreaterThanOrEqual(0);
++      expect(order).toEqual(["mic after 1 load"]);
++    });
++
++    it("WebKit: a barge-in stop clears the source and calls load()", async () => {
++      setUa(IPHONE);
++      const speaker = createCloudSpeaker(new FakeDevice());
++      await playOne(speaker);
++      const el = FakeAudio.last;
++      speaker.stop();
++      expect(el?.src).toBe("");
++      expect(el?.loads).toBe(1);
++      expect(speaker.releaseForMic?.()).toBeGreaterThan(0);
++    });
++
++    it("WebKit: a play error releases the element", async () => {
++      setUa(IPHONE);
++      const speaker = createCloudSpeaker(new FakeDevice());
++      await playOne(speaker);
++      const el = FakeAudio.last;
++      el?.onerror?.();
++      await settle();
++      expect(el?.loads).toBeGreaterThanOrEqual(1);
++      expect(el?.src).toBe("");
++    });
++
++    it("Chrome: a stop does not call load()", async () => {
++      setUa(CHROME);
++      const speaker = createCloudSpeaker(new FakeDevice());
++      await playOne(speaker);
++      const el = FakeAudio.last;
++      speaker.stop();
++      expect(el?.loads).toBe(0);
++    });
++
++    it("never releases a reply that is still speaking, and the next sentence plays again", async () => {
++      setUa(IPHONE);
++      const speaker = createCloudSpeaker(new FakeDevice());
++      await playOne(speaker);
++      const el = FakeAudio.last;
++      expect(speaker.releaseForMic?.()).toBe(0);
++      expect(el?.loads).toBe(0);
++      el?.end();
++      await settle();
++      speaker.speak("Again.", OPTS);
++      await settle();
++      pending[1].resolve(mp3());
++      await settle();
++      expect(FakeAudio.last).toBe(el);
++      expect(el?.played).toHaveLength(2);
++      expect(el?.src).not.toBe("");
++    });
++  });
++
+   it("sends the text, voice and rate as JSON", async () => {
+     const speaker = createCloudSpeaker(new FakeDevice());
+     speaker.speak("Hello there.", { ...OPTS, rate: 1.25 });
+diff --git a/web/src/lib/aeCloudVoice.ts b/web/src/lib/aeCloudVoice.ts
+index b8f77e163f9856f444793051f57a74cec147dd53..77ad78a068691e2b9012ee7af651d81e92683f40 100644
+--- a/web/src/lib/aeCloudVoice.ts
++++ b/web/src/lib/aeCloudVoice.ts
+@@ -2,11 +2,18 @@
+ // one server-made mp3 per sentence in order. A sentence the server cannot make is
+ // read by the device speaker instead, so an outage still speaks.
+ 
+-import { emitCaption, emitPlaying, type Speaker, type SpeakOptions } from "./aeSpeakReplies";
++import {
++  emitCaption,
++  emitPlaying,
++  MIC_AUDIO_SETTLE_MS,
++  type Speaker,
++  type SpeakOptions,
++} from "./aeSpeakReplies";
+ import { splitForSpeech } from "./aeSpeechText";
+ import { speakerSinkId } from "./aeAudioDevices";
+ import { clearPlaybackBlocked, markPlaybackBlocked } from "./aeVoicePlayback";
+ import { logVoice } from "./aeVoiceLog";
++import { isWebKitSpeech } from "./aeVoiceStall";
+ import { withBasePath } from "./basePath";
+ import { authenticatedFetch } from "./identity";
+ 
+@@ -104,6 +111,22 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+   let audio: HTMLAudioElement | null = null;
+   // Releases whatever the run is waiting on (the audio, or the device speaker).
+   let release: (() => void) | null = null;
++  // When the element last let go of its source (0 = never), so a mic start can wait out the settle.
++  let releasedAt = 0;
++
++  // Fully lets go of the clip (pause, no source, load) so WebKit frees the audio session.
++  // The element instance stays, so its tap-unlock stays; the next sentence sets src again.
++  const releaseElement = () => {
++    if (!audio) return;
++    try {
++      audio.pause();
++      audio.removeAttribute("src");
++      audio.load();
++      releasedAt = Date.now();
++    } catch {
++      // Releasing is best effort.
++    }
++  };
+ 
+   const setSpeaking = (next: boolean) => {
+     if (isSpeaking === next) return;
+@@ -188,6 +211,7 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+       };
+       el.onerror = () => {
+         logVoice("play error", `media ${el.error?.code}`);
++        if (isWebKitSpeech()) releaseElement();
+         finish(false);
+       };
+       // The audio is really playing now, not just queued or still being made.
+@@ -249,15 +273,7 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+       setSpeaking(false);
+       emitCaption("");
+       // Drained: let go of the last clip. The element stays, so its unlock does too.
+-      if (audio) {
+-        try {
+-          audio.pause();
+-          audio.removeAttribute("src");
+-          audio.load();
+-        } catch {
+-          // Releasing is best effort.
+-        }
+-      }
++      releaseElement();
+       return;
+     }
+     pump();
+@@ -299,8 +315,12 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+       clearPlaybackBlocked();
+       emitCaption("");
+       if (audio) {
+-        audio.pause();
+-        audio.removeAttribute("src");
++        // A barge-in or cancel: WebKit also needs load() or the element keeps the audio session.
++        if (isWebKitSpeech()) releaseElement();
++        else {
++          audio.pause();
++          audio.removeAttribute("src");
++        }
+       }
+       fallback.stop();
+       setSpeaking(false);
+@@ -328,6 +348,14 @@ export function createCloudSpeaker(fallback: Speaker): Speaker {
+         // Priming is best effort.
+       }
+     },
++    // Called just before the mic starts (WebKit): makes sure no clip is held, and returns how many
++    // ms are still left of the settle after the release. Never touches a reply that is speaking.
++    releaseForMic() {
++      if (isSpeaking || !audio || releasedAt === 0) return 0;
++      if (audio.src) releaseElement();
++      logVoice("audio released before mic");
++      return Math.max(0, MIC_AUDIO_SETTLE_MS - (Date.now() - releasedAt));
++    },
+     speaking: () => isSpeaking,
+     retained: () => fallback.retained(),
+     subscribe(cb) {
+diff --git a/web/src/lib/aeSpeakReplies.test.ts b/web/src/lib/aeSpeakReplies.test.ts
+index 01af034d30efa0ff0d9caa0f67a0bf4ad2b8a94f..96402f93c841a575a80e0c1c1af71b57c111ea37 100644
+--- a/web/src/lib/aeSpeakReplies.test.ts
++++ b/web/src/lib/aeSpeakReplies.test.ts
+@@ -11,6 +11,8 @@ import {
+   resetPrimeSpeaking,
+   rankVoices,
+   registerCloudPrimer,
++  registerCloudReleaser,
++  MIC_AUDIO_SETTLE_MS,
+   setCaptionHandler,
+   readFastAnswersState,
+   readFastEnabled,
+@@ -368,6 +370,44 @@ describe("priming and the mic on WebKit", () => {
+     expect(synth.cancelCount).toBe(0);
+   });
+ 
++  it("WebKit mic start releases the cloud audio first and waits the settle", () => {
++    setUserAgent(IPHONE_UA);
++    const order: string[] = [];
++    registerCloudReleaser(() => {
++      order.push("release");
++      return MIC_AUDIO_SETTLE_MS;
++    });
++    const go = vi.fn(() => order.push("mic"));
++    whenSynthIdle(go);
++    expect(order).toEqual(["release"]);
++    vi.advanceTimersByTime(MIC_AUDIO_SETTLE_MS - 1);
++    expect(go).not.toHaveBeenCalled();
++    vi.advanceTimersByTime(1);
++    expect(order).toEqual(["release", "mic"]);
++    registerCloudReleaser(null);
++  });
++
++  it("a cancelled settle never starts the mic", () => {
++    setUserAgent(IPHONE_UA);
++    registerCloudReleaser(() => MIC_AUDIO_SETTLE_MS);
++    const go = vi.fn();
++    whenSynthIdle(go)();
++    vi.advanceTimersByTime(MIC_AUDIO_SETTLE_MS + 500);
++    expect(go).not.toHaveBeenCalled();
++    registerCloudReleaser(null);
++  });
++
++  it("Chrome never calls the cloud release and starts at once", () => {
++    setUserAgent(CHROME_UA);
++    const release = vi.fn(() => MIC_AUDIO_SETTLE_MS);
++    registerCloudReleaser(release);
++    const go = vi.fn();
++    whenSynthIdle(go);
++    expect(release).not.toHaveBeenCalled();
++    expect(go).toHaveBeenCalledTimes(1);
++    registerCloudReleaser(null);
++  });
++
+   it("Chrome and an idle WebKit synthesizer start at once", () => {
+     setUserAgent(CHROME_UA);
+     synth.speaking = true;
+diff --git a/web/src/lib/aeSpeakReplies.ts b/web/src/lib/aeSpeakReplies.ts
+index 628b910057b523d63a6ea075a22a9039a0425f75..367f7525c5cadbc08f3c844ea751485ad52a8fbd 100644
+--- a/web/src/lib/aeSpeakReplies.ts
++++ b/web/src/lib/aeSpeakReplies.ts
+@@ -225,6 +225,16 @@ export function registerCloudPrimer(primer: (() => void) | null): void {
+   cloudPrimer = primer;
+ }
+ 
++let cloudReleaser: (() => number) | null = null;
++
++/** The cloud speaker's mic-start release: frees its audio element and returns the settle ms left. */
++export function registerCloudReleaser(releaser: (() => number) | null): void {
++  cloudReleaser = releaser;
++}
++
++/** On WebKit, how long after the cloud audio element is released the recognizer may start. */
++export const MIC_AUDIO_SETTLE_MS = 150;
++
+ /** True from the moment the silent priming utterance is spoken until it ends, errors or is cancelled. */
+ let primeSpeaking = false;
+ const PRIME_FLAG_MAX_MS = 12_000;
+@@ -292,6 +302,27 @@ export const MIC_SYNTH_WAIT_CAP_MS = 1500;
+  * runs at once and nothing is cancelled. At the cap the prime is cancelled and `go` runs. Returns a cancel that drops a pending `go`. Never throws.
+  */
+ export function whenSynthIdle(go: () => void): () => void {
++  // WebKit: the cloud audio element must have let go of the audio session before the mic starts.
++  let settleMs = 0;
++  try {
++    if (isWebKitSpeech()) settleMs = cloudReleaser?.() ?? 0;
++  } catch {
++    settleMs = 0;
++  }
++  if (settleMs > 0) {
++    let inner: (() => void) | null = null;
++    const settle = setTimeout(() => {
++      inner = whenSynthIdleNow(go);
++    }, settleMs);
++    return () => {
++      clearTimeout(settle);
++      inner?.();
++    };
++  }
++  return whenSynthIdleNow(go);
++}
++
++function whenSynthIdleNow(go: () => void): () => void {
+   let synth: SpeechSynthesis | null = null;
+   try {
+     // Wait only for the priming utterance, never for a real reply that is speaking.
+@@ -363,6 +394,8 @@ export interface Speaker {
+   stop: () => void;
+   /** Unlocks playback inside a tap (the cloud speaker's audio element). */
+   prime?: () => void;
++  /** WebKit: frees the audio element before the mic starts; returns the settle ms still to wait. */
++  releaseForMic?: () => number;
+   speaking: () => boolean;
+   subscribe: (cb: () => void) => () => void;
+   /** Utterances queued and not yet ended; the speaker keeps them referenced. */

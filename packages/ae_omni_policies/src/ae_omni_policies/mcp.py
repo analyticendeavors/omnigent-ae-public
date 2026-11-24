@@ -66,7 +66,15 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from ae_omni_policies import gh, labels, prs, schedules
-from ae_omni_policies.notes import NoteFields, build_notes, repo_slug, summary_for
+from ae_omni_policies.notes import (
+    ACCEPTED_ESTIMATES,
+    TASK_QUADRANT_AXES,
+    NoteFields,
+    build_notes,
+    repo_slug,
+    summary_for,
+    task_estimate,
+)
 from ae_omni_policies.omni import Settings, http_client
 from ae_omni_policies.taskstore import UNFILED_INSTRUCTION
 
@@ -251,7 +259,17 @@ LIST_PARKED_SCHEMA: dict[str, Any] = {
 
 OMNI_CAPACITY_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "properties": {},
+    "properties": {
+        "detail": {
+            "type": "string",
+            "enum": ["summary", "full"],
+            "description": (
+                "summary (the default): slots used and free, who holds them, who is blocked "
+                "and a count per other status. full: every session in every status, "
+                "several thousand tokens."
+            ),
+        },
+    },
     "additionalProperties": False,
 }
 
@@ -557,50 +575,90 @@ ADVISE_PRESET_SCHEMA: dict[str, Any] = {
     "additionalProperties": False,
 }
 
+_JUDGE_QUESTION_PROPERTIES: dict[str, Any] = {
+    "kind": {"type": "string", "enum": ["yes_no", "choice", "score"]},
+    "question": {
+        "type": "string",
+        "minLength": 5,
+        "maxLength": 160,
+        "description": (
+            "One or two short sentences in plain words of your own, lower case apart from a "
+            "common first word (should, is, pick, use, where) or a tech acronym in capitals "
+            "(API, SSH, CLI). Never the user's message, names, client or company names, paths "
+            "or slashes (write pass or fail, not pass/fail), dotted names such as file names, "
+            "links, quotes, secrets or numbers of 4 or more digits."
+        ),
+    },
+    "options": {
+        "type": "array",
+        "maxItems": 6,
+        "description": (
+            "For choice: two to six options, each a lower_snake_case key label and a one-line "
+            "text in plain lower-case words (same rules as the question)."
+        ),
+        "items": {
+            "type": "object",
+            "properties": {
+                "key": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"},
+                "description": {"type": "string", "maxLength": 100},
+            },
+            "required": ["key", "description"],
+            "additionalProperties": False,
+        },
+    },
+    "levels": {
+        "type": "array",
+        "maxItems": 8,
+        "items": {"type": "string", "maxLength": 40},
+        "description": (
+            "For score: two to eight ordered levels in lower case, lowest first (small, "
+            "medium, large)."
+        ),
+    },
+    "facts": {
+        "type": "object",
+        "maxProperties": 12,
+        "description": (
+            "Optional context: lower_snake_case keys with number, boolean or short neutral "
+            "word values."
+        ),
+        "additionalProperties": {"type": ["integer", "number", "boolean", "string"]},
+    },
+    "context": {
+        "type": "string",
+        "minLength": 10,
+        "maxLength": 160,
+        "description": (
+            "Optional: one neutral line saying what the choice is about, in your own words "
+            "(for example: third test run failed on the same check after two fixes). Same "
+            "rules as the question: plain lower-case words, no names, paths, slashes, dotted "
+            "names, links or quotes."
+        ),
+    },
+}
+
 ASK_JUDGE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "kind": {"type": "string", "enum": ["yes_no", "choice", "score"]},
-        "question": {
-            "type": "string",
-            "minLength": 5,
-            "maxLength": 160,
-            "description": (
-                "One neutral line of your own words. Never the user's message, names, client or "
-                "company names, paths, links, quotes or secrets."
-            ),
-        },
-        "options": {
+        **_JUDGE_QUESTION_PROPERTIES,
+        "questions": {
             "type": "array",
-            "maxItems": 6,
-            "description": "For choice: two to six options, each a key and a one-line text.",
+            "minItems": 1,
+            "maxItems": 5,
+            "description": (
+                "One to five questions answered in one call (preferred: gather the open "
+                "choices and ask them together). Each has the same fields as a single "
+                "question; when you send questions, leave the top-level kind and question "
+                "out. The answers come back in order."
+            ),
             "items": {
                 "type": "object",
-                "properties": {
-                    "key": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,31}$"},
-                    "description": {"type": "string", "maxLength": 100},
-                },
-                "required": ["key", "description"],
+                "properties": _JUDGE_QUESTION_PROPERTIES,
+                "required": ["kind", "question"],
                 "additionalProperties": False,
             },
         },
-        "levels": {
-            "type": "array",
-            "maxItems": 8,
-            "items": {"type": "string", "maxLength": 40},
-            "description": "For score: two to eight ordered levels, lowest first.",
-        },
-        "facts": {
-            "type": "object",
-            "maxProperties": 12,
-            "description": (
-                "Optional context: lower_snake_case keys with number, boolean or short neutral "
-                "word values."
-            ),
-            "additionalProperties": {"type": ["integer", "number", "boolean", "string"]},
-        },
     },
-    "required": ["kind", "question"],
     "additionalProperties": False,
 }
 
@@ -808,22 +866,23 @@ CREATE_TASK_SCHEMA: dict[str, Any] = {
         },
         "quadrant": {
             "type": "string",
-            "enum": ["hotfix", "feature", "admin"],
+            "enum": ["hotfix", "feature", "admin", "neither"],
             "description": (
-                "Optional urgent x important call, mapped as in park_fork: both is hotfix, "
-                "important only is feature, urgent only is admin. Left out, the store files it "
-                "in Q4, its answer for 'nothing was said'."
+                "Required. The urgent x important call: hotfix is urgent and important, feature "
+                "is important only, admin is urgent only, neither is neither (Q4). Pick neither "
+                "on purpose when that is the answer; there is no default."
             ),
         },
         "est": {
             "type": "string",
             "description": (
-                "Optional size: 'minutes', 'about an hour', or the store's own 15, 30, 45 or "
-                "60plus."
+                "Required. The size: 'minutes' (15), 'about an hour', 'a block' or 'multi-block' "
+                "(60plus), or the store's own 15, 30, 45 or 60plus. A value that maps to none "
+                "of these is refused."
             ),
         },
     },
-    "required": ["title"],
+    "required": ["title", "quadrant", "est"],
     "additionalProperties": False,
 }
 
@@ -944,7 +1003,8 @@ TOOLS: list[types.Tool] = [
             "with its title, elapsed time, NEXT line and open gate, plus the current date "
             "and time in the lot's timezone. A working session waiting on an approval "
             "(blocked: true) or whose last turn failed (failed: true) is listed under blocked "
-            "and holds no slot. Read only."
+            "and holds no slot. Answers a short summary (slots, who holds them, who is "
+            "blocked, a count per other status) unless detail is full. Read only."
         ),
         inputSchema=OMNI_CAPACITY_SCHEMA,
     ),
@@ -1075,10 +1135,18 @@ TOOLS: list[types.Tool] = [
             "or being ready to hand off (kind yes_no), or to score a size or risk on ordered "
             "levels (kind score). Write the question in neutral words of your own: never paste "
             "the user's message, and never include names, client or company names, paths, links "
-            "or secrets; the server refuses the call and names a reason code. Put numbers and "
-            "booleans in facts. It returns answer and probs (probabilities, not reasons). "
-            "low_confidence true, or an error, means decide yourself. At most 20 calls an hour "
-            "per session."
+            "or secrets; the server refuses the question and names a reason code with a hint. "
+            "Accepted shape: plain lower-case words, one or two short sentences, capitals only "
+            "on the first word or tech acronyms (API, SSH), no slashes (write pass or fail), no "
+            "dotted names, no quotes, no numbers of 4 or more digits, keys as lower_snake_case "
+            "labels. In a batch each question is answered or refused on its own. Put numbers "
+            "and booleans in facts and a one-line context saying what the choice is about. "
+            "Send one question (kind, question, ...) or one to five in questions; a call is a "
+            "full model step for you, so gather the open choices and ask them together. It "
+            "returns answer and probs (probabilities, not reasons), or answers in order for "
+            "questions. low_confidence true, or an error, means decide yourself; rate_limited "
+            "carries retry_after_s, so decide yourself and do not retry sooner. Limits apply per "
+            "call, per session, per hour and per minute."
         ),
         inputSchema=ASK_JUDGE_SCHEMA,
     ),
@@ -1278,7 +1346,32 @@ async def complete_task(client: OmniClient, args: dict[str, Any]) -> Any:
     return {"outcome": "not_completed", "task_id": task_id, "reason": _message(status, data)}
 
 
+def _task_input_refusal(args: dict[str, Any]) -> str | None:
+    """Why ``create_task`` cannot run, or ``None``: quadrant and est are both required."""
+    valid = ", ".join(TASK_QUADRANT_AXES)
+    quadrant = args.get("quadrant")
+    if not isinstance(quadrant, str) or not quadrant.strip():
+        return f"quadrant is required: one of {valid}."
+    if quadrant not in TASK_QUADRANT_AXES:
+        return f'quadrant "{quadrant}" is not one of {valid}.'
+    est = args.get("est")
+    if not isinstance(est, str) or not est.strip():
+        return f"est is required: {ACCEPTED_ESTIMATES}."
+    if task_estimate(est) is None:
+        return f'est "{est}" maps to no estimate. Use {ACCEPTED_ESTIMATES}.'
+    return None
+
+
 async def create_task(client: OmniClient, args: dict[str, Any]) -> Any:
+    # Refused here, before any request, so the agent is told what to supply.
+    if refusal := _task_input_refusal(args):
+        return {
+            "outcome": "not_created",
+            "reason": refusal,
+            "instruction": (
+                "Call create_task again with quadrant and est both set. Nothing was created."
+            ),
+        }
     status, data = await client.call("POST", "/v1/ae/lot/create", json_body=args)
     if status == 200 and isinstance(data, dict):
         return data
@@ -1311,10 +1404,57 @@ async def cancel_task(client: OmniClient, args: dict[str, Any]) -> Any:
     return {"outcome": "not_cancelled", "task_id": task_id, "reason": _message(status, data)}
 
 
-async def omni_capacity(client: OmniClient, args: dict[str, Any]) -> Any:  # noqa: ARG001
+#: Statuses the summary reports as a count only; the rows are in ``detail: full``.
+_CAPACITY_COUNTED = ("review", "parked", "reference", "unlabelled_running")
+_CAPACITY_TITLE_CHARS = 40
+
+
+def capacity_summary(data: dict[str, Any]) -> dict[str, Any]:
+    """The few fields a lead reads from the capacity answer: slots, holders, blocked, counts.
+
+    Holders are the working leads that hold a slot (helpers too when the Settings count them);
+    the other working sessions are a count. Titles are cut and the NEXT and gate lines left
+    out; ``detail: full`` has them.
+    """
+
+    def short(row: Any, *keep: str) -> dict[str, Any]:
+        row = row if isinstance(row, dict) else {}
+        out: dict[str, Any] = {"id": row.get("id"), "title": str(row.get("title") or "")}
+        if len(out["title"]) > _CAPACITY_TITLE_CHARS:
+            out["title"] = out["title"][: _CAPACITY_TITLE_CHARS - 3] + "..."
+        out.update({key: row[key] for key in keep if row.get(key) not in (None, False)})
+        return out
+
+    limit = data.get("limit")
+    used = data.get("slots_used")
+    free = limit - used if isinstance(limit, int) and isinstance(used, int) else None
+    counts_helpers = data.get("helpers_count") is True
+    working = [row for row in data.get("working") or [] if isinstance(row, dict)]
+    holders = [row for row in working if counts_helpers or not row.get("helper")]
+    return {
+        "limit": limit,
+        "slots_used": used,
+        "slots_free": max(0, free) if free is not None else None,
+        "helpers_count": data.get("helpers_count"),
+        "others_working": data.get("others_working"),
+        "now": data.get("now"),
+        "timezone": data.get("timezone"),
+        "holders": [short(row, "elapsed") for row in holders],
+        "helpers_working": len(working) - len(holders),
+        "blocked": [short(row, "failed") for row in data.get("blocked") or []],
+        "counts": {
+            name: len(data.get(name) or [])
+            for name in _CAPACITY_COUNTED
+            if isinstance(data.get(name), list)
+        },
+        "detail": 'Call omni_capacity with detail "full" for every session, NEXT line and gate.',
+    }
+
+
+async def omni_capacity(client: OmniClient, args: dict[str, Any]) -> Any:
     status, data = await client.call("GET", "/v1/ae/capacity")
     if status == 200 and isinstance(data, dict):
-        return data
+        return data if args.get("detail") == "full" else capacity_summary(data)
     return {"error": f"Could not read the capacity: {_message(status, data)}"}
 
 

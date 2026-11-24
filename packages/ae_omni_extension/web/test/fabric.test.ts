@@ -762,7 +762,10 @@ describe("the compact row on the page (second pass)", () => {
     ]);
     const up = upPercent(full(), NOW);
     expect(up).not.toBeNull();
-    expect(row.querySelector<HTMLElement>(".fabric-upbar > i")?.style.width).toBe(`${up}%`);
+    // jsdom 31 rounds a serialized percentage, so compare the number, not the string.
+    const width = row.querySelector<HTMLElement>(".fabric-upbar > i")?.style.width ?? "";
+    expect(width.endsWith("%")).toBe(true);
+    expect(Number.parseFloat(width)).toBeCloseTo(up!, 3);
     expect(row.querySelector(".fabric-state")?.textContent).toBe("Active");
     expect([...row.querySelectorAll(".fabric-meta-item")].map((node) => node.textContent)).toEqual(
       metaItems(full(), NOW),
@@ -807,6 +810,8 @@ describe("the compact row on the page (second pass)", () => {
     const { context, openExternal } = stubContext({ "/v1/ae/fabric": [ok(overview([full()]))] });
     await activateFabric(context);
     await flush();
+    // The Compute card is on the Cloud tab; a hidden tab holds nothing to focus.
+    document.querySelector<HTMLElement>("#as-tab-cloud")?.click();
     const trigger = buttonNamed(cardOf("aetraining"), "Links for aetraining");
     const menu = document.getElementById(trigger.getAttribute("aria-controls")!)!;
     expect(trigger.getAttribute("aria-haspopup")).toBe("menu");
@@ -955,6 +960,7 @@ describe("the compact row on the page (second pass)", () => {
     });
     await activateFabric(context);
     await flush();
+    document.querySelector<HTMLElement>("#as-tab-cloud")?.click();
     const first = cardOf("aetraining");
     // The cards are their own stacking contexts (container queries).
     expect(css).toMatch(/\.card-fabric \{[^}]*container-type: inline-size;/);
@@ -1262,7 +1268,11 @@ describe("a false admin_only answer (2026-10-28)", () => {
 describe("integrations the server says are not configured (2026-11-06)", () => {
   const cardIds = () =>
     [...document.querySelectorAll<HTMLElement>(".admin-card")].map((card) => card.dataset.card);
-  const footer = () => document.querySelector<HTMLElement>(".admin-notset");
+  // Each area's board has its own footer line (2026-11-14): the one that says something, else the first.
+  const footer = () => {
+    const all = [...document.querySelectorAll<HTMLElement>(".admin-notset")];
+    return all.find((node) => !node.hidden) ?? all[0] ?? null;
+  };
   const denied: Reply = {
     ok: false,
     status: 403,
@@ -1281,7 +1291,7 @@ describe("integrations the server says are not configured (2026-11-06)", () => {
     expect(footer()?.hidden).toBe(false);
     expect(footer()?.textContent).toContain("Not set up on this server: Azure spend");
     expect(footer()?.querySelector("button")?.textContent).toBe("Cards settings");
-    expect(document.querySelector(".admin-board")?.lastElementChild).toBe(footer());
+    expect(footer()?.parentElement?.lastElementChild).toBe(footer());
     // The Cloud group still has Compute, which keeps its tag.
     expect(document.querySelector('.admin-card[data-card="compute"] .admin-card-tag')?.textContent).toBe("Cloud");
   });
@@ -1319,14 +1329,16 @@ describe("integrations the server says are not configured (2026-11-06)", () => {
     });
     await activateFabric(context);
     await flush();
+    // The footer is on the Cloud tab; a hidden tab holds nothing to focus.
+    document.querySelector<HTMLElement>("#as-tab-cloud")?.click();
     const old = footer() as HTMLElement;
     old.tabIndex = -1;
     old.focus();
     expect(document.activeElement).toBe(old);
     window.dispatchEvent(new Event("resize"));
-    // A saved layout arriving rebuilds the board.
-    const { resetArrangement } = await import("../src/boardLayout");
-    resetArrangement();
+    // A hide or a card turned off or on rebuilds the board around the footer.
+    const { setHidden } = await import("../src/cardState");
+    setHidden([]);
     expect(footer()).not.toBe(old);
     expect(document.activeElement).toBe(footer());
   });
@@ -1338,13 +1350,14 @@ describe("integrations the server says are not configured (2026-11-06)", () => {
     });
     await activateFabric(context);
     await flush();
+    document.querySelector<HTMLElement>("#as-tab-cloud")?.click();
     const old = footer() as HTMLElement;
     old.tabIndex = -1;
     old.focus();
     window.dispatchEvent(new Event("focus"));
     await flush();
     expect(footer()?.hidden).toBe(true);
-    expect(document.activeElement).toBe(document.querySelector(".admin-board"));
+    expect((document.activeElement as HTMLElement).classList.contains("admin-board")).toBe(true);
   });
 
   it("keeps Compute when only Fabric is not configured", async () => {

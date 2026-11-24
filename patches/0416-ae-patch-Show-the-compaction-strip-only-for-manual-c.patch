@@ -1,0 +1,320 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Thu, 19 Nov 2026 12:41:00 -0800
+Subject: [PATCH 416/443] [ae-patch] Show the compaction strip only for manual
+ compact, not Claude's background auto precompute
+
+Claude Code fires PreCompact with trigger=auto when it starts precomputing a summary in the background at about 85 percent of the auto-compact window, and applies it only when context reaches the window, possibly never. The forwarder treated every PreCompact as a compaction in progress, so the web strip eased to about 97 percent and hung. Parse the trigger from the hook payload; an auto PreCompact now posts no status but still mints the pending token, so the boundary persists once when SessionStart source=compact arrives. Manual /compact keeps the strip.
+---
+ omnigent/harnesses/claude_native/bridge.py    |   9 ++
+ omnigent/harnesses/claude_native/forwarder.py |  51 +++---
+ .../forwarder/test_compaction_hooks.py        | 145 +++++++++++++++++-
+ .../forwarder/test_compaction_recovery.py     |   4 +-
+ 4 files changed, 184 insertions(+), 25 deletions(-)
+
+diff --git a/omnigent/harnesses/claude_native/bridge.py b/omnigent/harnesses/claude_native/bridge.py
+index 7ee07efbc5e645640a769243073cc0adc6fbdf0e..1e0931806dac00e9fc738d1fef8e5ef171810afa 100644
+--- a/omnigent/harnesses/claude_native/bridge.py
++++ b/omnigent/harnesses/claude_native/bridge.py
+@@ -918,6 +918,10 @@ class ClaudeHookRecord:
+         advance past it.
+     :param source: Claude ``SessionStart`` source, e.g. ``"clear"``,
+         or ``None`` for hook records without a source field.
++    :param trigger: ``PreCompact`` trigger from the hook payload, e.g.
++        ``"manual"`` or ``"auto"``. Claude Code fires ``auto`` when it starts
++        precomputing a summary in the background, long before it applies it.
++        ``None`` for other events or when absent.
+     :param claude_session_id: Claude-native session uuid from the hook
+         payload, e.g. ``"a1b2c3d4-1234-5678-9abc-def012345678"``,
+         or ``None`` when absent.
+@@ -983,6 +987,7 @@ class ClaudeHookRecord:
+     event_name: str | None
+     recorded_at: float | None = None
+     source: str | None = None
++    trigger: str | None = None
+     claude_session_id: str | None = None
+     transcript_path: Path | None = None
+     agent_id: str | None = None
+@@ -3906,6 +3911,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+     if isinstance(raw_event_name, str) and raw_event_name:
+         event_name = raw_event_name
+     raw_source = payload.get("source") if isinstance(payload, dict) else None
++    raw_trigger = payload.get("trigger") if isinstance(payload, dict) else None
+     raw_recorded_at = envelope.get("recorded_at") if isinstance(envelope, dict) else None
+     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
+     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
+@@ -4015,6 +4021,9 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
+         if isinstance(raw_recorded_at, (int, float)) and not isinstance(raw_recorded_at, bool)
+         else None,
+         source=raw_source if isinstance(raw_source, str) and raw_source else None,
++        trigger=(
++            raw_trigger if event_name == "PreCompact" and isinstance(raw_trigger, str) else None
++        ),
+         claude_session_id=(
+             raw_claude_session_id
+             if isinstance(raw_claude_session_id, str) and raw_claude_session_id
+diff --git a/omnigent/harnesses/claude_native/forwarder.py b/omnigent/harnesses/claude_native/forwarder.py
+index f535d2ba1b95802efdb9786144d00dee050da405..24e777150aa05ea08f6042845773b8f3c9c9dca6 100644
+--- a/omnigent/harnesses/claude_native/forwarder.py
++++ b/omnigent/harnesses/claude_native/forwarder.py
+@@ -3931,8 +3931,14 @@ def _compaction_status_for_record(record: ClaudeHookRecord) -> str | None:
+     Claude Code brackets a compaction with two hooks the forwarder
+     translates into ``external_compaction_status`` events:
+ 
+-    * ``PreCompact`` → ``"in_progress"`` — fires right before Claude
+-      compacts (manual ``/compact`` or automatic context overflow).
++    * ``PreCompact`` with a manual trigger → ``"in_progress"`` — fires right
++      before ``/compact`` runs synchronously. An ``auto`` ``PreCompact`` is
++      NOT a compaction in progress: Claude fires it when it starts
++      precomputing a summary in the background (about 85% of the auto-compact
++      window) and applies that summary only when context reaches the window,
++      possibly never. Forwarding it would pin the strip for the whole
++      precompute, so it returns ``None`` here (the caller still mints the
++      pending token for it).
+     * ``SessionStart`` with ``source == "compact"`` → ``"completed"``
+       — fires when Claude resumes on the freshly-compacted context.
+       (Claude Code has no dedicated post-compaction hook, so the
+@@ -3945,7 +3951,7 @@ def _compaction_status_for_record(record: ClaudeHookRecord) -> str | None:
+     :returns: ``"in_progress"``, ``"completed"``, or ``None`` when the
+         record is not a compaction boundary.
+     """
+-    if record.event_name == "PreCompact":
++    if record.event_name == "PreCompact" and record.trigger != "auto":
+         return "in_progress"
+     if record.event_name == "SessionStart" and record.source == "compact":
+         return "completed"
+@@ -4116,25 +4122,26 @@ async def _forward_available_status_events(
+             # advance the cursor on failure so one failed post doesn't stall
+             # the rest of the hook stream.
+             compaction_status = _compaction_status_for_record(record)
+-            if compaction_status is not None:
+-                try:
+-                    await _post_external_compaction_status(
+-                        client,
+-                        session_id=session_id,
+-                        status=compaction_status,
+-                    )
+-                except httpx.HTTPError:
+-                    _logger.warning(
+-                        "Failed to forward Claude compaction status; "
+-                        "session=%s event_cursor=%s status=%s",
+-                        session_id,
+-                        record.event_cursor,
+-                        compaction_status,
+-                        exc_info=True,
+-                        extra={"session_id": session_id},
+-                    )
+-                if compaction_status == "in_progress":
+-                    # ``PreCompact`` mints a durable pending token that the
++            if compaction_status is not None or record.event_name == "PreCompact":
++                if compaction_status is not None:
++                    try:
++                        await _post_external_compaction_status(
++                            client,
++                            session_id=session_id,
++                            status=compaction_status,
++                        )
++                    except httpx.HTTPError:
++                        _logger.warning(
++                            "Failed to forward Claude compaction status; "
++                            "session=%s event_cursor=%s status=%s",
++                            session_id,
++                            record.event_cursor,
++                            compaction_status,
++                            exc_info=True,
++                            extra={"session_id": session_id},
++                        )
++                if record.event_name == "PreCompact":
++                    # Every ``PreCompact`` (manual or auto) mints a durable pending token that the
+                     # completion signal (transcript ``isCompactSummary`` or
+                     # this hook's ``SessionStart source=compact``) consumes,
+                     # so exactly one boundary persists per compaction. Keyed
+diff --git a/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py b/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py
+index 68fa7e053ff7f4294b8f95af57c51150904b2696..e5da231488e43b6cf0d3dd49028550e76030a3c2 100644
+--- a/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py
++++ b/tests/harnesses/claude_native/forwarder/test_compaction_hooks.py
+@@ -5,6 +5,7 @@ from __future__ import annotations
+ import asyncio
+ import json
+ from pathlib import Path
++from unittest.mock import AsyncMock, patch
+ 
+ import httpx
+ import pytest
+@@ -50,7 +51,7 @@ async def test_forwarder_posts_compaction_in_progress_on_precompact_hook(
+     )
+     record_hook_event(
+         bridge_dir,
+-        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
++        {"hook_event_name": "PreCompact", "trigger": "manual", "session_id": "claude-session"},
+     )
+     server, thread, base_url = _start_recording_server()
+     task = asyncio.create_task(
+@@ -435,3 +436,145 @@ async def test_compact_refusal_swallows_post_failure(tmp_path: Path) -> None:
+     assert len(captured) == 1
+     assert captured[0].method == "POST"
+     assert forwarder._read_compaction_state(bridge_dir).pending is None
++
++
++@pytest.mark.asyncio
++async def test_auto_precompact_posts_no_status_but_mints_token_and_persists_once(
++    tmp_path: Path,
++) -> None:
++    """
++    An ``auto`` ``PreCompact`` shows no strip, yet the boundary still lands once.
++
++    Claude fires ``PreCompact`` with ``trigger=auto`` when it starts
++    precomputing a summary in the background (about 85% of the auto-compact
++    window) and applies it only when context reaches the window, possibly
++    never. Treating that as ``in_progress`` pinned the web strip near 97%. The
++    forwarder must post nothing for it, still mint the pending token, and let
++    the later ``SessionStart source=compact`` post ``completed`` and persist
++    exactly one boundary.
++    """
++    bridge_dir = tmp_path / "bridge"
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text("", encoding="utf-8")
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "SessionStart",
++            "session_id": "claude-session",
++            "transcript_path": str(transcript_path),
++        },
++    )
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "PreCompact", "trigger": "auto", "session_id": "claude-session"},
++    )
++    server, thread, base_url = _start_recording_server()
++    persist_mock = AsyncMock(return_value=None)
++    with patch(
++        "omnigent.harnesses.claude_native.forwarder._persist_native_compaction_item",
++        persist_mock,
++    ):
++        task = asyncio.create_task(
++            forwarder.forward_claude_transcript_to_session(
++                base_url=base_url,
++                headers={},
++                session_id="conv_auto",
++                bridge_dir=bridge_dir,
++                agent_name="claude-native-ui",
++                start_at_end=False,
++                poll_interval_s=0.01,
++            )
++        )
++        try:
++            # Let the forwarder consume the auto PreCompact over several polls.
++            for _ in range(30):
++                await asyncio.sleep(0.02)
++                state = forwarder._read_compaction_state(bridge_dir)
++                if state.pending is not None:
++                    break
++            state = forwarder._read_compaction_state(bridge_dir)
++            # The token is minted even though no status was posted.
++            assert state.pending is not None
++            assert state.last_seq == 1
++            assert not any(
++                r["body"].get("type") == "external_compaction_status"
++                for r in list(server.requests.queue)
++            ), "an auto PreCompact must not post any compaction status"
++            persist_mock.assert_not_called()
++
++            # The summary is applied: SessionStart source=compact completes it.
++            record_hook_event(
++                bridge_dir,
++                {
++                    "hook_event_name": "SessionStart",
++                    "source": "compact",
++                    "session_id": "claude-session",
++                },
++            )
++            request = await _get_recorded_request(server)
++            await asyncio.sleep(0.2)
++        finally:
++            task.cancel()
++            with pytest.raises(asyncio.CancelledError):
++                await task
++            server.shutdown()
++            server.server_close()
++            thread.join(timeout=5.0)
++
++    assert request["body"] == {
++        "type": "external_compaction_status",
++        "data": {"status": "completed"},
++    }
++    persist_mock.assert_called_once()
++    assert forwarder._read_compaction_state(bridge_dir).last_seq == 1
++
++
++@pytest.mark.asyncio
++async def test_manual_precompact_still_posts_in_progress_and_mints_token(
++    tmp_path: Path,
++) -> None:
++    """
++    A ``manual`` ``PreCompact`` keeps the strip: ``/compact`` runs synchronously.
++    """
++    bridge_dir = tmp_path / "bridge"
++    transcript_path = tmp_path / "session.jsonl"
++    transcript_path.write_text("", encoding="utf-8")
++    record_hook_event(
++        bridge_dir,
++        {
++            "hook_event_name": "SessionStart",
++            "session_id": "claude-session",
++            "transcript_path": str(transcript_path),
++        },
++    )
++    record_hook_event(
++        bridge_dir,
++        {"hook_event_name": "PreCompact", "trigger": "manual", "session_id": "claude-session"},
++    )
++    server, thread, base_url = _start_recording_server()
++    task = asyncio.create_task(
++        forwarder.forward_claude_transcript_to_session(
++            base_url=base_url,
++            headers={},
++            session_id="conv_manual",
++            bridge_dir=bridge_dir,
++            agent_name="claude-native-ui",
++            start_at_end=False,
++            poll_interval_s=0.01,
++        )
++    )
++    try:
++        request = await _get_recorded_request(server)
++    finally:
++        task.cancel()
++        with pytest.raises(asyncio.CancelledError):
++            await task
++        server.shutdown()
++        server.server_close()
++        thread.join(timeout=5.0)
++
++    assert request["body"] == {
++        "type": "external_compaction_status",
++        "data": {"status": "in_progress"},
++    }
++    assert forwarder._read_compaction_state(bridge_dir).pending is not None
+diff --git a/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py b/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py
+index c8ae0ebd87d70e4c1c03355e14bc79800e5ce8f4..be026209735349eb815bdf030272fa7bec981de6 100644
+--- a/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py
++++ b/tests/harnesses/claude_native/forwarder/test_compaction_recovery.py
+@@ -154,7 +154,7 @@ async def test_compaction_completed_triggers_persist(tmp_path: Path) -> None:
+     # SessionStart; the hook path only persists when that token exists.
+     record_hook_event(
+         bridge_dir,
+-        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
++        {"hook_event_name": "PreCompact", "trigger": "manual", "session_id": "claude-session"},
+     )
+     # Post-compaction SessionStart — the completion signal.
+     record_hook_event(
+@@ -242,7 +242,7 @@ async def test_compaction_in_progress_does_not_persist(tmp_path: Path) -> None:
+     )
+     record_hook_event(
+         bridge_dir,
+-        {"hook_event_name": "PreCompact", "session_id": "claude-session"},
++        {"hook_event_name": "PreCompact", "trigger": "manual", "session_id": "claude-session"},
+     )
+     server, thread, base_url = _start_recording_server()
+     persist_mock = AsyncMock()

@@ -41,6 +41,15 @@ missing Codex login never hides the Claude reading:
   (``known_accounts``: each one's name and label from upstream's
   ``account_descriptors``, never a token), which only the host can read,
   for the Admin Center's Accounts card.
+- Claude accounts other than the default login (2026-11-16): each one that has
+  a *usage login* (``~/.omnigent/ae/usage-logins/slot-<n>/``, made once by
+  ``deploy/ae-usage-login.sh``: an ``account`` file naming the account and a
+  ``config`` directory holding a full ``claude auth login`` of it) is read
+  through the same ``get_usage`` request with ``CLAUDE_CONFIG_DIR`` set to that
+  directory, at most every 12 minutes, and posted as ``account_probes``. Only
+  the relay ever opens a slot, so its login's token refresh can rotate nothing
+  a chat holds: chats on such an account run on its setup token, which never
+  refreshes. The journal line counts slots, never names one.
 - Codex: a short-lived ``codex app-server`` on stdio (newline-delimited
   JSON-RPC: ``initialize``, ``initialized``, ``account/rateLimits/read``),
   killed as soon as it answers. No ``codex`` on ``PATH`` posts nothing.
@@ -60,8 +69,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import json
 import os
+import re
 import shutil
 import signal
 import sys
@@ -77,6 +88,8 @@ from ae_omni_policies import __version__, omni
 from ae_omni_policies.limits import (
     MAX_ACCOUNTS,
     MAX_CONTEXTS,
+    PROBES_SOURCE,
+    AccountProbe,
     KnownAccount,
     LimitSnapshot,
     SessionContext,
@@ -114,6 +127,8 @@ _PROBE_UNSET = (
     "ANTHROPIC_API_KEY",
     "ANTHROPIC_AUTH_TOKEN",
 )
+# Also never inherited by a usage-login probe or check: where requests go.
+_SLOT_UNSET = ("ANTHROPIC_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS", "CLAUDE_CONFIG_DIR")
 # The probe runs no hooks, MCP servers, skills or settings file and writes no
 # transcript: a bare CLI answering one control request.
 _PROBE_ARGS = (
@@ -129,6 +144,22 @@ _PROBE_ARGS = (
     "--no-session-persistence",
     "--disable-slash-commands",
 )
+# Usage logins (2026-11-16): where the slots live, how often one is read, and how long
+# one read may take. Slots are read side by side, so the unit's 2-minute limit holds:
+# 45 s for the default login's get_usage, 30 s for the slots, 30 s for Codex.
+USAGE_LOGINS_ENV = "AE_LIMITS_USAGE_LOGINS"
+DEFAULT_USAGE_LOGINS = Path("~/.omnigent/ae/usage-logins")
+USAGE_LOGIN_EVERY_S = 12 * 60
+USAGE_LOGIN_TIMEOUT_S = 30.0
+SLOT_NAME = re.compile(r"slot-[0-9]{1,3}")
+SLOT_ACCOUNT = "account"
+SLOT_CONFIG = "config"
+SLOT_STAMP = "last-read"
+SLOT_LOCK = "lock"
+# An account id as the host and the server spell one (claude_accounts._valid_name,
+# with ``shared:`` before a shared account). Never empty: the default login is
+# already read every tick and never gets a slot.
+ACCOUNT_ID = re.compile(r"(shared:)?[A-Za-z0-9][A-Za-z0-9 _-]{0,63}")
 # A status line older than this is still posted (its time is shown), but the
 # relay says so, since Claude Code refreshes it only while a session is active.
 STALE_AFTER_S = 6 * 60 * 60
@@ -411,6 +442,22 @@ def _probe_env(environ: Mapping[str, str] | None = None) -> dict[str, str]:
     return env
 
 
+def usage_login_env(slot: Path, environ: Mapping[str, str] | None = None) -> dict[str, str]:
+    """The probe's environment for one usage login: its own config directory, nothing else.
+
+    ``CLAUDE_CONFIG_DIR`` replaces ``~/.claude`` as a whole, so the CLI reads
+    only the slot's login (an empty slot answers "unavailable"; it never falls
+    back to the default login, checked against the 2.1.325 CLI on 2026-11-16).
+    """
+    env = _probe_env(environ)
+    # A gateway URL would receive the slot's full-scope login (2026-11-16 security review).
+    for key in _SLOT_UNSET:
+        env.pop(key, None)
+    env["CLAUDE_CONFIG_DIR"] = str(slot / SLOT_CONFIG)
+    env["DISABLE_AUTOUPDATER"] = "1"
+    return env
+
+
 @contextlib.asynccontextmanager
 async def _child(*argv: str, **kwargs: Any) -> AsyncIterator[asyncio.subprocess.Process]:
     """A CLI on stdin and stdout pipes, torn down completely while the loop still runs.
@@ -455,9 +502,12 @@ async def _reap(proc: asyncio.subprocess.Process) -> None:
         await proc.wait()
 
 
-async def _claude_usage_exchange(claude_bin: str) -> dict[str, Any]:
+async def _claude_usage_exchange(
+    claude_bin: str, env: dict[str, str] | None = None
+) -> dict[str, Any]:
     request_id = "ae-limits-usage"
-    async with _child(claude_bin, *_PROBE_ARGS, env=_probe_env(), cwd=str(Path.home())) as proc:
+    env = _probe_env() if env is None else env
+    async with _child(claude_bin, *_PROBE_ARGS, env=env, cwd=str(Path.home())) as proc:
         assert proc.stdin is not None and proc.stdout is not None
         request = {
             "type": "control_request",
@@ -485,14 +535,19 @@ async def _claude_usage_exchange(claude_bin: str) -> dict[str, Any]:
 
 
 async def read_claude_usage(
-    claude_bin: str, *, timeout: float = CLAUDE_USAGE_TIMEOUT_S
+    claude_bin: str,
+    *,
+    timeout: float = CLAUDE_USAGE_TIMEOUT_S,
+    env: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Ask the Claude CLI for ``/usage``'s structured data (``get_usage``).
 
+    :param env: The CLI's environment; the relay's own minus the credential
+        variables when ``None`` (the default login).
     :raises RelayError: When the CLI cannot start, refuses, or times out.
     """
     try:
-        return await asyncio.wait_for(_claude_usage_exchange(claude_bin), timeout)
+        return await asyncio.wait_for(_claude_usage_exchange(claude_bin, env), timeout)
     except TimeoutError as exc:
         raise RelayError(f"claude did not answer get_usage within {timeout:.0f}s") from exc
     except OSError as exc:
@@ -577,20 +632,220 @@ async def read_codex(codex_bin: str, *, timeout: float | None = None) -> LimitSn
     return codex_snapshot(result, datetime.now(UTC))
 
 
-async def post(client: httpx.AsyncClient, snapshot: LimitSnapshot) -> None:
-    """``POST /v1/ae/limits/{harness}``.
+def usage_logins_root(environ: Mapping[str, str] | None = None) -> Path:
+    """Where the usage-login slots live (``AE_LIMITS_USAGE_LOGINS`` overrides it)."""
+    env = os.environ if environ is None else environ
+    raw = (env.get(USAGE_LOGINS_ENV) or "").strip()
+    return Path(raw).expanduser() if raw else DEFAULT_USAGE_LOGINS.expanduser()
+
+
+def _slot_account(slot: Path) -> str | None:
+    try:
+        name = (slot / SLOT_ACCOUNT).read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return name if ACCOUNT_ID.fullmatch(name) else None
+
+
+def scan_usage_logins(root: Path) -> list[tuple[Path, str]]:
+    """Each usage-login slot under *root* and the account it reads, by slot name.
+
+    A slot is a real directory named ``slot-<n>`` that this user owns, with a
+    valid ``account`` file; anything else is skipped. An account named by two
+    slots is read through the first only.
+    """
+    try:
+        entries = sorted(root.iterdir(), key=lambda p: p.name)
+    except OSError:
+        return []
+    found: list[tuple[Path, str]] = []
+    seen: set[str] = set()
+    for slot in entries:
+        if not SLOT_NAME.fullmatch(slot.name) or slot.is_symlink() or not slot.is_dir():
+            continue
+        try:
+            if slot.stat().st_uid != os.getuid():
+                continue
+        except OSError:
+            continue
+        if (slot / SLOT_CONFIG).is_symlink():
+            continue
+        account = _slot_account(slot)
+        if account is None or account in seen:
+            continue
+        seen.add(account)
+        found.append((slot, account))
+    return found[:MAX_ACCOUNTS]
+
+
+# What one slot read came to: a reading, a skip (read recently, or another run holds it), a miss.
+_SKIPPED = "skipped"
+
+
+async def _read_slot(
+    claude_bin: str, slot: Path, account: str, now: datetime
+) -> AccountProbe | str | None:
+    """Read one slot under its lock, unless it was read less than 12 minutes ago.
+
+    The lock comes before the age check, so two runs (the timer and a hand run)
+    never read, and so never refresh, the same login at once; the sign-in
+    script holds it too. The stamp is written by :func:`stamp_usage_logins`
+    only once the reading has reached the server, so a failed post or a dry
+    run never hides an account for 12 minutes (2026-11-16 Codex review).
+    """
+    try:
+        fd = os.open(slot / SLOT_LOCK, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        return None
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return _SKIPPED
+        stamp = slot / SLOT_STAMP
+        with contextlib.suppress(OSError):
+            # A stamp in the future (the clock stepped back) counts as due.
+            if 0 <= now.timestamp() - stamp.stat().st_mtime < USAGE_LOGIN_EVERY_S:
+                return _SKIPPED
+        try:
+            reply = await read_claude_usage(
+                claude_bin, timeout=USAGE_LOGIN_TIMEOUT_S, env=usage_login_env(slot)
+            )
+        except RelayError:
+            return None
+        observed = datetime.now(UTC)
+        merged = with_usage(None, reply, observed, now=observed)
+        windows = merged.windows if merged is not None else []
+        if not reply.get("rate_limits_available") or not windows:
+            return None
+        return AccountProbe(account=account, observed_at=observed, windows=windows[:16])
+    finally:
+        os.close(fd)
+
+
+def stamp_usage_logins(stamps: Sequence[tuple[Path, datetime]]) -> None:
+    """Mark each slot read at its reading's time, once the reading was delivered.
+
+    One clock for the stamp and the reading (2026-11-16 plan review).
+    """
+    for slot, observed in stamps:
+        stamp = slot / SLOT_STAMP
+        with contextlib.suppress(OSError):
+            stamp.touch(mode=0o600)
+            os.utime(stamp, (observed.timestamp(), observed.timestamp()))
+
+
+async def read_usage_logins(
+    claude_bin: str,
+    root: Path,
+    *,
+    known: set[str | None] | None = None,
+    now: datetime | None = None,
+) -> tuple[list[AccountProbe], str | None, list[tuple[Path, datetime]]]:
+    """Read every due usage login side by side; readings, one journal line, stamps.
+
+    :param known: The host's signed-in Claude logins, or ``None`` when that
+        list is empty or unreadable (nothing is skipped then). A slot for a
+        host login that has left the list is skipped; a ``shared:`` account is
+        always read, and the server hides one its shared store dropped.
+    :returns: The readings; a line that counts slots and never names one
+        (``None`` when there is no slot); and the stamps to write with
+        :func:`stamp_usage_logins` once the readings are delivered.
+    """
+    now = now or datetime.now(UTC)
+    slots = scan_usage_logins(root)
+    if not slots:
+        return [], None, []
+    due = [
+        (slot, account)
+        for slot, account in slots
+        if known is None or account.startswith("shared:") or account in known
+    ]
+    unlisted = len(slots) - len(due)
+    # One slot's surprise (an odd reply, a validation error) is that slot's miss;
+    # it must never cost the default login's and Codex's posts (2026-11-16 review).
+    raw = await asyncio.gather(
+        *(_read_slot(claude_bin, slot, account, now) for slot, account in due),
+        return_exceptions=True,
+    )
+    for result in raw:
+        if isinstance(result, asyncio.CancelledError):
+            raise result
+    results = [None if isinstance(r, BaseException) else r for r in raw]
+    probes = [r for r in results if isinstance(r, AccountProbe)]
+    stamps = [
+        (slot, r.observed_at)
+        for (slot, _), r in zip(due, results, strict=True)
+        if isinstance(r, AccountProbe)
+    ]
+    skipped = sum(1 for r in results if r == _SKIPPED)
+    missed = sum(1 for r in results if r is None)
+    line = (
+        f"claude: usage logins: {len(probes)} read, {skipped} read under "
+        f"{USAGE_LOGIN_EVERY_S // 60} min ago, {missed} unreadable"
+    )
+    if unlisted:
+        line += f", {unlisted} for a login no longer on this host"
+    if missed:
+        line += (
+            "; sign an unreadable one in again with deploy/ae-usage-login.sh (docs/PLAN-LIMITS.md)"
+        )
+    return probes, line, stamps
+
+
+def _post_body(snapshot: LimitSnapshot) -> dict[str, Any]:
+    """The JSON posted: ``account_probes`` only when there are some.
+
+    A server older than 2026-11-16 refuses the field (its models forbid extra
+    keys), so a relay with no usage login keeps posting to it as before.
+    """
+    exclude = None if snapshot.account_probes else {"account_probes"}
+    return snapshot.model_dump(mode="json", exclude=exclude)
+
+
+async def post(client: httpx.AsyncClient, snapshot: LimitSnapshot) -> bool:
+    """``POST /v1/ae/limits/{harness}``; whether its usage-login readings were delivered.
+
+    A server older than 2026-11-16 answers 422 to ``account_probes``: the post
+    is sent once more without them, so the default login's reading still
+    lands, and the answer is ``False`` (the slots are read again next tick).
 
     :raises RelayError: On a transport failure or a non-2xx answer.
     """
     path = f"/v1/ae/limits/{snapshot.harness}"
+    response = await _send(client, path, _post_body(snapshot))
+    if (
+        response.status_code == 422
+        and snapshot.account_probes
+        and snapshot.source != PROBES_SOURCE
+    ):
+        bare = snapshot.model_copy(update={"account_probes": []})
+        response = await _send(client, path, _post_body(bare))
+        _check(response, path, client)
+        return False
+    _check(response, path, client)
+    return bool(snapshot.account_probes)
+
+
+async def _send(client: httpx.AsyncClient, path: str, body: dict[str, Any]) -> httpx.Response:
     try:
-        response = await client.post(path, json=snapshot.model_dump(mode="json"))
+        return await client.post(path, json=body)
     except httpx.HTTPError as exc:
         raise RelayError(f"POST {path} failed: {exc}") from exc
+
+
+def _check(response: httpx.Response, path: str, client: httpx.AsyncClient) -> None:
     if response.status_code == 401:
         raise RelayError(
             f"POST {path} answered 401: the stored login expired; run `omnigent login "
             f"{client.base_url}` as this user"
+        )
+    if response.status_code == 422:
+        # A validation answer echoes the posted values, account names among them,
+        # and this line goes to the journal: the status alone (2026-11-16).
+        raise RelayError(
+            f"POST {path} answered 422: the server refused the reading's shape; deploy "
+            "the server before the relay (docs/PLAN-LIMITS.md)"
         )
     if response.status_code >= 300:
         raise RelayError(f"POST {path} answered {response.status_code}: {response.text[:200]}")
@@ -604,6 +859,7 @@ async def run(
     bridges: Path | None = None,
     claude_bin: str | None = None,
     plan_label: str | None = None,
+    usage_logins: Path | None = None,
     dry_run: bool = False,
     transport: httpx.AsyncBaseTransport | None = None,
     out: Any = None,
@@ -613,7 +869,9 @@ async def run(
     A failed ``get_usage`` probe is reported but is not a failure: the status
     line reading still posts, and the panel's hint says what the probe needs.
     A failed Codex read is a soft miss: reported, and a failure only when
-    nothing else was posted either.
+    nothing else was posted either. Usage logins under *usage_logins* ride the
+    Claude post, or a probes-only Claude post when there is no other Claude
+    reading; an unreadable one is reported, never a failure.
     """
     out = out or sys.stdout
     failures = 0
@@ -661,8 +919,40 @@ async def run(
         claude = with_usage(claude, reply, datetime.now(UTC), plan_label=plan_label)
         if bridges is not None:
             claude = with_live(claude, scan_live(bridges))
-        if claude is not None:
-            snapshots.append(claude.model_copy(update={"known_accounts": known_accounts()}))
+    else:
+        claude = None
+
+    known = known_accounts()
+    probes: list[AccountProbe] = []
+    stamps: list[tuple[Path, datetime]] = []
+    if usage_logins is not None and claude_bin is not None:
+        if dry_run:
+            # A read would refresh the slot's login: a dry run only counts the slots.
+            count = len(scan_usage_logins(usage_logins))
+            if count:
+                print(f"claude: usage logins: {count} found, not read in a dry run", file=out)
+        else:
+            probes, line, stamps = await read_usage_logins(
+                claude_bin,
+                usage_logins,
+                known={k.account for k in known} or None,
+                now=now,
+            )
+            if line is not None:
+                print(line, file=out)
+    if claude is not None:
+        snapshots.append(
+            claude.model_copy(update={"known_accounts": known, "account_probes": probes})
+        )
+    elif probes:
+        snapshots.append(
+            LimitSnapshot(
+                harness="claude",
+                source=PROBES_SOURCE,
+                observed_at=max(p.observed_at for p in probes),
+                account_probes=probes,
+            )
+        )
 
     if codex_bin is None:
         print("codex: no codex on PATH; nothing to read", file=out)
@@ -675,7 +965,9 @@ async def run(
 
     if dry_run:
         for snapshot in snapshots:
-            print(json.dumps(snapshot.model_dump(mode="json"), indent=2), file=out)
+            # Account names stay out of the output: the host's login list too.
+            body = snapshot.model_dump(mode="json", exclude={"account_probes", "known_accounts"})
+            print(json.dumps(body, indent=2), file=out)
         return 1 if failures or (codex_missed and not snapshots) else 0
     if not snapshots:
         return 1 if failures or codex_missed else 0
@@ -686,16 +978,31 @@ async def run(
     async with omni.http_client(settings, transport=transport) as client:
         for snapshot in snapshots:
             try:
-                await post(client, snapshot)
+                delivered = await post(client, snapshot)
             except RelayError as exc:
                 print(f"{snapshot.harness}: {exc}", file=out)
                 failures += 1
-            else:
-                posted += 1
-                summary = ", ".join(
-                    f"{w.label} {w.used_percent:.0f}%" for w in snapshot.windows
-                ) or (snapshot.note or "no windows")
-                print(f"{snapshot.harness}: posted ({summary})", file=out)
+                continue
+            if delivered:
+                stamp_usage_logins(stamps)
+            elif snapshot.account_probes:
+                print(
+                    "claude: the server refused the usage-login readings (422); deploy "
+                    "the server before the relay (docs/PLAN-LIMITS.md)",
+                    file=out,
+                )
+            if snapshot.source == PROBES_SOURCE:
+                # Not a reading of the default login or Codex: it never makes the run pass.
+                print(
+                    f"claude: posted ({len(snapshot.account_probes)} usage-login readings only)",
+                    file=out,
+                )
+                continue
+            posted += 1
+            summary = ", ".join(f"{w.label} {w.used_percent:.0f}%" for w in snapshot.windows) or (
+                snapshot.note or "no windows"
+            )
+            print(f"{snapshot.harness}: posted ({summary})", file=out)
     return 1 if failures or (codex_missed and not posted) else 0
 
 
@@ -735,6 +1042,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             bridges=args.claude_bridges or claude_bridges(),
             claude_bin=claude_bin,
             plan_label=plan_label,
+            usage_logins=usage_logins_root(),
             settings=omni.Settings.from_env(),
             dry_run=args.dry_run,
         )

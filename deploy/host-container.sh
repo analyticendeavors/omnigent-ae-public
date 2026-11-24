@@ -24,7 +24,7 @@ set -euo pipefail
 # shellcheck source=scripts/_lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/../scripts/_lib.sh"
 
-usage() { die "usage: deploy/host-container.sh <user> build|login|shell|<docker compose args>"; }
+usage() { die "usage: deploy/host-container.sh <user> build|login|shell|<docker compose args> (under the gate only: build and login for steve, 'up -d --remove-orphans' and 'down'; shell, ps, logs and other compose commands are unsupported)"; }
 
 [ $# -ge 2 ] || usage
 HOST_USER="$1"
@@ -57,7 +57,22 @@ if [ -r "$USER_ENV" ]; then
   export AE_HOST_ENV_FILE="$USER_ENV"
 fi
 
-compose() { docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"; }
+# Root hardening: with the root-owned gate installed, the two lifecycle commands the unit runs go
+# through its fixed verbs, and build goes through `steve build` (steve only). Everything else
+# (login, shell, ps, exec) has no verb. The else branches are the old direct calls and are removed
+# after the cutover.
+AE_GATE="${AE_GATE:-/usr/local/sbin/ae-gate}"
+compose() {
+  if [ -x "$AE_GATE" ]; then
+    case "$*" in
+      "up -d --remove-orphans") sudo -n "$AE_GATE" stack-up "$PROJECT" ;;
+      "down") sudo -n "$AE_GATE" stack-stop "$PROJECT" ;;
+      *) die "host-container.sh $HOST_USER $*: the gate has no verb for this (only 'up -d --remove-orphans' and 'down')" ;;
+    esac
+  else
+    docker compose -p "$PROJECT" -f "$COMPOSE_FILE" "$@"
+  fi
+}
 
 build() {
   load_lock
@@ -75,11 +90,16 @@ build() {
   [ "$tagged" = "$AE_BRANCH_SHA" ] \
     || die "the server runs $TAG (upstream pin $tagged) but this checkout pins $AE_BRANCH_SHA; wait for the deploy to settle, or check out $TAG, so the host matches the server"
   note "building omnigent-ae-host:$TAG from upstream $UPSTREAM_TAG with $PATCH_COUNT AE patches"
-  docker build -q -f "$UPSTREAM_DIR/deploy/docker/Dockerfile" --target host \
-    -t "omnigent-ae-host-base:$TAG" "$UPSTREAM_DIR" >/dev/null
-  docker build -q -f "$CONTEXT/Dockerfile" --build-arg "BASE=omnigent-ae-host-base:$TAG" \
-    -t "omnigent-ae-host:$TAG" "$CONTEXT" >/dev/null
-  docker build -q -f "$CONTEXT/egress.Dockerfile" -t "omnigent-ae-host-egress:$TAG" "$CONTEXT" >/dev/null
+  if [ -x "$AE_GATE" ]; then
+    [ "$HOST_USER" = steve ] || die "the gate builds the host images for steve only; no verb for $HOST_USER"
+    sudo -n "$AE_GATE" steve build "$TAG" >/dev/null
+  else
+    docker build -q -f "$UPSTREAM_DIR/deploy/docker/Dockerfile" --target host \
+      -t "omnigent-ae-host-base:$TAG" "$UPSTREAM_DIR" >/dev/null
+    docker build -q -f "$CONTEXT/Dockerfile" --build-arg "BASE=omnigent-ae-host-base:$TAG" \
+      -t "omnigent-ae-host:$TAG" "$CONTEXT" >/dev/null
+    docker build -q -f "$CONTEXT/egress.Dockerfile" -t "omnigent-ae-host-egress:$TAG" "$CONTEXT" >/dev/null
+  fi
   note "built omnigent-ae-host:$TAG and omnigent-ae-host-egress:$TAG"
 }
 
@@ -94,14 +114,28 @@ images_present() {
 # Cloudflare name, where the Microsoft callback lands) completes it, and the
 # CLI's poll over the internal network picks the login up. The link is good
 # for five minutes; whoever signs in with it owns the host.
+login_stream() {
+  if [ -x "$AE_GATE" ]; then
+    sudo -n "$AE_GATE" steve login
+  else
+    compose exec -T -e PYTHONUNBUFFERED=1 host omnigent login http://omnigent:8000
+  fi
+}
+
 login() {
   local public
   public="$(setting OMNIGENT_OIDC_REDIRECT_URI | sed -E 's#^(https?://[^/]+).*#\1#')"
   [ -n "$public" ] || die "OMNIGENT_OIDC_REDIRECT_URI is not set in $SERVER_SETTINGS; the sign-in link needs the public origin"
-  compose ps --status running --services 2>/dev/null | grep -qx host \
-    || die "the host container is not running; start it first: deploy/host-container.sh $HOST_USER up -d"
+  # Root hardening: under the gate, `steve login` checks the container is running and runs the
+  # same login inside it (steve only). The else arm is the old direct call, removed after the cutover.
+  if [ -x "$AE_GATE" ]; then
+    [ "$HOST_USER" = steve ] || die "the gate signs in the steve host only; no verb for $HOST_USER"
+  else
+    compose ps --status running --services 2>/dev/null | grep -qx host \
+      || die "the host container is not running; start it first: deploy/host-container.sh $HOST_USER up -d"
+  fi
   note "signing in the $HOST_USER host; the link below is good for five minutes"
-  compose exec -T -e PYTHONUNBUFFERED=1 host omnigent login http://omnigent:8000 2>&1 \
+  login_stream 2>&1 \
     | while IFS= read -r line; do
         case "$line" in
           *"/auth/login?ticket="*)
@@ -122,10 +156,28 @@ case "$1" in
   shell)
     compose exec host bash -l ;;
   up)
-    docker network inspect "$NETWORK" >/dev/null 2>&1 \
+    # The gate has no network inspect verb; stack-up checks the snapshot's networks itself.
+    [ -x "$AE_GATE" ] || docker network inspect "$NETWORK" >/dev/null 2>&1 \
       || die "network $NETWORK does not exist. It belongs to the server stack: add it to config/compose.local.yml (copy config/compose.local.yml.example; the omnigent service's networks and the top-level networks block) and run deploy/compose.sh up -d, which recreates the server container"
-    images_present || build
-    compose "$@" ;;
+    if [ -x "$AE_GATE" ]; then
+      # Under the gate images are never built on every start: build when the release tag changed
+      # since the last build, or when stack-up fails (a missing image), then retry once.
+      built_file="${XDG_STATE_HOME:-$HOME/.local/state}/ae-host-container/built-$HOST_USER"
+      mkdir -p "$(dirname "$built_file")"
+      if [ "$(cat "$built_file" 2>/dev/null || true)" != "$TAG" ]; then
+        build
+        printf '%s\n' "$TAG" >"$built_file"
+      fi
+      compose "$@" || {
+        note "stack-up failed; building the host images for $TAG and trying once more"
+        build
+        printf '%s\n' "$TAG" >"$built_file"
+        compose "$@"
+      }
+    else
+      images_present || build
+      compose "$@"
+    fi ;;
   *)
     compose "$@" ;;
 esac

@@ -161,7 +161,12 @@ def test_override_binds_data_and_postgres_under_the_data_dir() -> None:
     # AE_DATA_DIR moves both (2026-10-22, README.md "Quick start"); unset, the
     # box's /secure/omnigent as before.
     services = _override()["services"]
-    assert services["omnigent"]["volumes"] == ["${AE_DATA_DIR:-/secure/omnigent}/data:/data"]
+    assert services["omnigent"]["volumes"] == [
+        "${AE_DATA_DIR:-/secure/omnigent}/data:/data",
+        # The voice logs get their own mount so one host user can own that directory.
+        "${AE_VOICE_LOG_HOST_DIR:-${AE_DATA_DIR:-/secure/omnigent}/data/ae-voice-logs}"
+        ":/data/ae-voice-logs",
+    ]
     assert services["postgres"]["volumes"] == [
         "${AE_DATA_DIR:-/secure/omnigent}/postgres:/var/lib/postgresql/data"
     ]
@@ -324,7 +329,10 @@ def test_merged_compose_config(tmp_path: Path) -> None:
     port = svc["ports"][0]
     assert (port["host_ip"], str(port["published"]), port["target"]) == ("127.0.0.1", "8010", 8000)
     mounts = {(v["type"], v["source"], v["target"]) for v in svc["volumes"]}
-    assert mounts == {("bind", "/secure/omnigent/data", "/data")}
+    assert mounts == {
+        ("bind", "/secure/omnigent/data", "/data"),
+        ("bind", "/secure/omnigent/data/ae-voice-logs", "/data/ae-voice-logs"),
+    }
     pg_mounts = {
         (v["type"], v["source"], v["target"]) for v in merged["services"]["postgres"]["volumes"]
     }
@@ -450,6 +458,7 @@ def test_dump_units_run_before_restic_and_outside_the_collision_map() -> None:
 def test_scripts_are_the_expected_set_and_executable() -> None:
     assert [s.name for s in SCRIPTS] == [
         "ae-limits-statusline.sh",
+        "ae-usage-login.sh",
         "auto-update.sh",
         "backup-omnigent.sh",
         "compose.sh",
@@ -1309,7 +1318,49 @@ def test_image_workflow_attests_only_a_pushed_public_image() -> None:
     }
     push = steps[names.index("Push the tag")]["run"]
     assert 'docker buildx imagetools inspect "$IMAGE:$IMAGE_TAG"' in push
-    assert 'echo "IMAGE_DIGEST=$digest" >> "$GITHUB_ENV"' in push
+    assert 'echo "IMAGE_DIGEST=$pushed" >> "$GITHUB_ENV"' in push
+
+
+def test_image_workflow_signs_a_pushed_image_with_a_key() -> None:
+    jobs = _workflow()["jobs"]
+    assert "environment" not in jobs["image"], "a branch dry run must never need the key"
+    image_steps = {s.get("name"): s for s in jobs["image"]["steps"]}
+    push = image_steps["Push the tag"]
+    assert push["id"] == "push"
+    assert 'out="$(docker push "$IMAGE:$IMAGE_TAG")"' in push["run"]
+    assert '[ "$digest" != "$pushed" ]' in push["run"], "sign only the digest this job pushed"
+    assert "image-ref=$IMAGE@$pushed" in push["run"]
+    assert jobs["image"]["outputs"] == {
+        "push": "${{ steps.push.outputs.push }}",
+        "image-ref": "${{ steps.push.outputs.image-ref }}",
+    }
+    sign_job = jobs["sign"]
+    assert sign_job["needs"] == "image"
+    assert sign_job["if"] == "needs.image.outputs.push == 'true'"
+    assert sign_job["environment"] == "release-signing"
+    assert sign_job["permissions"] == {"contents": "read", "packages": "write"}
+    steps = sign_job["steps"]
+    names = [s.get("name") for s in steps]
+    assert (
+        names.index("Install cosign")
+        < names.index("Sign the image digest with the release key")
+        < names.index("Verify the signature with the committed public key")
+    )
+    assert steps[names.index("Install cosign")]["uses"].startswith("sigstore/cosign-installer@")
+    sign = steps[names.index("Sign the image digest with the release key")]
+    assert sign["env"]["COSIGN_PRIVATE_KEY"] == "${{ secrets.COSIGN_PRIVATE_KEY }}"
+    assert sign["env"]["COSIGN_PASSWORD"] == "${{ secrets.COSIGN_PASSWORD }}"
+    assert sign["env"]["IMAGE_REF"] == "${{ needs.image.outputs.image-ref }}"
+    assert "--tlog-upload=false --key env://COSIGN_PRIVATE_KEY" in sign["run"]
+    assert '"$IMAGE_REF"' in sign["run"]
+    verify = steps[names.index("Verify the signature with the committed public key")]
+    assert "COSIGN_PRIVATE_KEY" not in verify.get("env", {})
+    assert "--key deploy/omnigent-cosign.pub" in verify["run"]
+    assert (
+        (ROOT / "deploy" / "omnigent-cosign.pub")
+        .read_text()
+        .startswith("-----BEGIN PUBLIC KEY-----")
+    )
 
 
 # Every third-party action is pinned to a commit, with its release in a
@@ -1449,3 +1500,155 @@ def test_system_units_render_to_absolute_paths_with_no_token_left(tmp_path: Path
         for key in ("ExecStart", "ExecStop"):
             for exe in _unit_values(out, "Service", key):
                 assert exe.startswith(str(tmp_path) + "/"), f"{unit.name}: {key}: {exe}"
+
+
+def test_compose_wrapper_uses_the_gate_for_up_and_down_when_it_is_installed(
+    tmp_path: Path,
+) -> None:
+    # Root hardening: with ae-gate installed, up and down are its stack verbs; the compose
+    # files are never handed to docker, and any other command is refused.
+    gate = tmp_path / "ae-gate"
+    gate.write_text("#!/bin/sh\nprintf 'gate %s\\n' \"$*\"\n")
+    gate.chmod(0o755)
+    sudo_dir = tmp_path / "sudobin"
+    sudo_dir.mkdir()
+    (sudo_dir / "sudo").write_text('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    (sudo_dir / "sudo").chmod(0o755)
+    env = {
+        "AE_GATE": str(gate),
+        "PATH": f"{sudo_dir}:{os.environ['PATH']}",
+        "config/secrets.env": "POSTGRES_PASSWORD=test-only\n",
+    }
+    up = _compose_args(tmp_path / "a", env, command=("up", "-d", "--remove-orphans"))
+    assert up == ["gate stack-up omnigent"]
+    down = _compose_args(tmp_path / "b", env, command=("down",))
+    assert down == ["gate stack-stop omnigent"]
+    refused = _compose_args(tmp_path / "c", env, command=("ps",), expect_refusal=True)
+    assert "no verb" in refused[0]
+
+
+def _fake_gate_env(tmp_path: Path, body: str) -> dict[str, str]:
+    """A fake ae-gate and a sudo that drops `-n`, for the scripts' gate branches."""
+    bindir = tmp_path / "gatebin"
+    bindir.mkdir()
+    (bindir / "ae-gate").write_text("#!/bin/sh\n" + body)
+    (bindir / "ae-gate").chmod(0o755)
+    (bindir / "sudo").write_text('#!/bin/sh\n[ "$1" = -n ] && shift\nexec "$@"\n')
+    (bindir / "sudo").chmod(0o755)
+    return {"AE_GATE": str(bindir / "ae-gate"), "PATH": f"{bindir}:{os.environ['PATH']}"}
+
+
+def test_host_container_login_and_lifecycle_use_the_gate_when_it_is_installed(
+    tmp_path: Path,
+) -> None:
+    settings = tmp_path / "server.env"
+    settings.write_text(
+        "OMNIGENT_IMAGE_TAG=ae-v0.1.0.1\nOMNIGENT_OIDC_REDIRECT_URI=https://omni.example/auth/cb\n"
+    )
+    env = {
+        **os.environ,
+        **_fake_gate_env(
+            tmp_path,
+            'echo "gate $*" >&2\n'
+            '[ "$1 $2" = "steve login" ] && echo "go http://omnigent:8000/auth/login?ticket=ABC"\n'
+            "exit 0\n",
+        ),
+        "AE_SERVER_SETTINGS": str(settings),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+    (tmp_path / "state" / "ae-host-container").mkdir(parents=True)
+    (tmp_path / "state" / "ae-host-container" / "built-steve").write_text("ae-v0.1.0.1\n")
+
+    def host(*args: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(DEPLOY / "host-container.sh"), *args],
+            capture_output=True,
+            text=True,
+            check=False,
+            env=env,
+        )
+
+    login = host("steve", "login")
+    assert login.returncode == 0, login.stderr
+    assert "gate steve login" in login.stdout
+    assert "https://omni.example/auth/login?ticket=ABC" in login.stdout
+    up = host("steve", "up", "-d", "--remove-orphans")
+    assert up.returncode == 0, up.stderr
+    assert "gate stack-up omnigent-host-steve" in up.stderr
+    refused = host("steve", "ps")
+    assert refused.returncode != 0 and "no verb" in refused.stderr
+    other = host("member", "login")
+    assert other.returncode != 0 and "steve host only" in other.stderr
+
+
+def test_backup_script_dumps_through_the_gate_when_it_is_installed(tmp_path: Path) -> None:
+    env = _fake_gate_env(
+        tmp_path,
+        'echo "gate $*" >>"$GATE_LOG"\n[ "$1 $2 $3" = "omnigent pg-dump --stdout" ] && echo "SELECT 1;"\nexit 0\n',
+    )
+    (tmp_path / "gatebin" / "mountpoint").write_text("#!/bin/sh\nexit 0\n")
+    (tmp_path / "gatebin" / "mountpoint").chmod(0o755)
+    log = tmp_path / "gate.log"
+    result = subprocess.run(
+        [str(DEPLOY / "backup-omnigent.sh")],
+        capture_output=True,
+        text=True,
+        check=False,
+        env={
+            **os.environ,
+            **env,
+            "GATE_LOG": str(log),
+            "AE_BACKUP_DIR": str(tmp_path / "vol" / "omnigent" / "backups"),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "omnigent pg-dump --stdout" in log.read_text()
+    assert len(list((tmp_path / "vol" / "omnigent" / "backups").glob("omnigent-*.sql.gz"))) == 1
+
+
+def test_host_container_up_builds_on_a_new_tag_or_a_failed_stack_up_only(tmp_path: Path) -> None:
+    settings = tmp_path / "server.env"
+    settings.write_text("OMNIGENT_IMAGE_TAG=ae-v0.1.0.1\n")
+    log = tmp_path / "gate.log"
+    env = {
+        **os.environ,
+        **_fake_gate_env(
+            tmp_path,
+            'echo "gate $*" >>"$GATE_LOG"\n'
+            '[ "$1" = stack-up ] && [ -n "$FAIL_FIRST_UP" ] && [ ! -e "$GATE_LOG.failed" ] '
+            '&& touch "$GATE_LOG.failed" && exit 1\n'
+            "exit 0\n",
+        ),
+        "AE_SERVER_SETTINGS": str(settings),
+        "GATE_LOG": str(log),
+        "XDG_STATE_HOME": str(tmp_path / "state"),
+    }
+
+    def up(**extra: str) -> subprocess.CompletedProcess[str]:
+        log.write_text("")
+        return subprocess.run(
+            [str(DEPLOY / "host-container.sh"), "steve", "up", "-d", "--remove-orphans"],
+            capture_output=True,
+            text=True,
+            check=False,
+            env={**env, **extra},
+        )
+
+    # build() checks the checkout's tag against upstream.lock, which a throwaway settings file
+    # cannot satisfy, so "build ran" shows as that check refusing; "build did not run" as success.
+    no_marker = up()
+    assert no_marker.returncode != 0 and "cannot read upstream.lock at tag" in no_marker.stderr
+    marker = tmp_path / "state" / "ae-host-container" / "built-steve"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("ae-v0.1.0.1\n")
+    same_tag = up()
+    assert same_tag.returncode == 0, same_tag.stderr
+    assert log.read_text().splitlines() == ["gate stack-up omnigent-host-steve"]
+    failed_up = up(FAIL_FIRST_UP="1")
+    assert (
+        failed_up.returncode != 0
+        and "stack-up failed; building" in failed_up.stdout + failed_up.stderr
+    )
+    marker.write_text("ae-v0.0.9.9\n")
+    new_tag = up()
+    assert new_tag.returncode != 0 and "cannot read upstream.lock at tag" in new_tag.stderr

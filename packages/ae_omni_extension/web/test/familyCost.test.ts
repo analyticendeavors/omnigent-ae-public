@@ -27,6 +27,7 @@ import {
   readDollarAmount,
   readTokenAmount,
   RUNAWAY_HINT,
+  FLAG_ON_HINT,
   SAVED_MS,
   settingsOf,
   sharePct,
@@ -346,6 +347,73 @@ describe("Needs you", () => {
   });
 });
 
+describe("Flag on", () => {
+  const settings = { unit: "tokens" as const, runaway_tokens: 1_000_000, runaway_usd: 25 };
+  // lead-a: 4M tokens today (passes 1M), $2. lead-b: 115K tokens, $30 (passes $25).
+  const ids = (a: FamilyCostAnswer, s: typeof settings & { flag_on?: "tokens" | "dollars" | "either" }) =>
+    flaggedFamilies(a, s).map((r) => r.lead_id);
+
+  it("counts a limit only when the mode lets it", () => {
+    expect(ids(answer(), { ...settings, flag_on: "either" })).toEqual(["lead-a", "lead-b"]);
+    expect(ids(answer(), { ...settings, flag_on: "tokens" })).toEqual(["lead-a"]);
+    expect(ids(answer(), { ...settings, flag_on: "dollars" })).toEqual(["lead-b"]);
+    // An older server sends no mode: it reads as either.
+    expect(ids(answer(), settings)).toEqual(["lead-a", "lead-b"]);
+  });
+
+  it("never mentions the other unit in the Needs you line", () => {
+    const tokens = needsYou(answer(), { ...settings, flag_on: "tokens" });
+    expect(tokens).toBe("1 family passed 1M tokens today: Session token audit.");
+    const dollars = needsYou(answer(), { ...settings, flag_on: "dollars" });
+    expect(dollars).toBe("1 family passed $25 today: Quick fix.");
+    // Every flagged family cut from the list: the line still names only the mode's limit.
+    const cut = answer({ families: [], totals: { families: 0, cost_usd: 0, tokens_total: 0, flagged: 2 } });
+    const echoed = { ...settings, flag_on: "dollars" as const };
+    expect(needsYou({ ...cut, settings: echoed }, echoed)).toBe("2 families passed $25 today.");
+  });
+
+  it("uses the server's verdicts when the echo matches the settings", () => {
+    const echoed = { ...settings, flag_on: "tokens" as const };
+    const rows = (answer().families ?? []).map((r) => ({
+      ...r,
+      flagged: r.lead_id === "lead-b",
+      over_tokens: false,
+      over_usd: r.lead_id === "lead-b",
+    }));
+    const served = answer({ settings: echoed, families: rows });
+    // The rows say lead-b, which the viewer's amounts alone would not (tokens mode, 115K tokens).
+    expect(ids(served, echoed)).toEqual(["lead-b"]);
+    // After a local edit the echo is older, so the rows are judged by the viewer's own settings.
+    expect(ids(served, { ...echoed, runaway_tokens: 2_000_000 })).toEqual(["lead-a"]);
+  });
+
+  it("saves the mode through the settings post and keeps it", async () => {
+    const { context, posts } = stubContext(
+      [ok(answer())],
+      [ok({ unit: "tokens", runaway_tokens: 5_000_000, runaway_usd: 25, flag_on: "dollars" })],
+    );
+    const node = await mount(context);
+    const select = node.querySelector<HTMLSelectElement>(".family-flag-on")!;
+    expect([...select.options].map((o) => o.textContent)).toEqual(["Tokens", "Dollars", "Either"]);
+    select.value = "dollars";
+    select.dispatchEvent(new Event("change"));
+    await flush();
+    expect(posts).toEqual([{ family_flag_on: "dollars" }]);
+    expect(select.value).toBe("dollars");
+  });
+
+  it("puts the mode back and says so when the save fails", async () => {
+    const { context } = stubContext([ok(answer())], [failed(503, "not_saved", "could not write")]);
+    const node = await mount(context);
+    const select = node.querySelector<HTMLSelectElement>(".family-flag-on")!;
+    select.value = "tokens";
+    select.dispatchEvent(new Event("change"));
+    await flush();
+    expect(select.value).toBe("either");
+    expect(node.querySelector(".family-status")?.textContent).toContain("could not write");
+  });
+});
+
 describe("the tile", () => {
   it("is reading, then ok, then amber for a runaway or an old answer", () => {
     expect(familyTile(null, null, "tokens").value).toBe("Reading...");
@@ -510,7 +578,9 @@ describe("the card", () => {
     const hints = [...settings.querySelectorAll<HTMLElement>("[data-hint]")].map((h) =>
       h.getAttribute("data-hint"),
     );
-    expect(hints).toEqual([RUNAWAY_HINT]);
+    expect(hints).toEqual([RUNAWAY_HINT, FLAG_ON_HINT]);
+    expect(FLAG_ON_HINT.length).toBeLessThanOrEqual(HINT_MAX);
+    expect(settings.querySelector<HTMLSelectElement>(".family-flag-on")!.value).toBe("either");
     expect(
       [...node.querySelectorAll<HTMLElement>(".family-unit [data-hint]")].map((h) =>
         h.getAttribute("data-hint"),

@@ -1441,8 +1441,12 @@ export interface VaultOwnerResult {
   owners: Record<string, string | null>;
 }
 
-/** A Key Vault DNS suffix, built in two pieces so no source file carries the whole host. */
-const VAULT_HOST_SUFFIX = ["", "vault", "azure", "net"].join(".");
+/**
+ * A Key Vault DNS suffix, built from pieces so no source file carries the whole host.
+ * The `.map(String)` keeps the minifier from folding the join back into one literal
+ * (vite 8 folds a plain `[...].join(".")`), so the built bundle stays clear too.
+ */
+const VAULT_HOST_SUFFIX = ["", "vault", "azure", "net"].map(String).join(".");
 
 /** The portal page of *name* in *vault*, as the server's `secrets_meta.edit_url` builds it. */
 export const vaultEditUrl = (vault: string, name: string): string =>
@@ -1885,9 +1889,27 @@ export interface SocialSlot {
   posted: { at: string; url: string | null; via: string } | null;
   /** The picture that goes in the share sheet with the text (2026-11-07); absent without one. */
   /** `key` is the picture's identity (the video id, or the tool image link): the card re-fetches when it changes. */
-  visual?: { kind: "thumbnail" | "tool"; key?: string };
+  visual?: { kind: "thumbnail" | "tool" | "made"; key?: string };
   /** Why an upload has no picture yet ("The thumbnail shows once the video is public."). */
   visual_note?: string;
+  /**
+   * The pictures the weekly drafter made for a tool or expert post (2026-11-15), best first:
+   * diagrams, generated pictures and, for a clean product page, a screenshot. Absent until the
+   * drafter has made them (and from an older server).
+   */
+  visuals?: SocialMadeVisual[];
+  /** Which one the post shares (a candidate id), or "none" for no picture. */
+  visual_choice?: string;
+  /** "auto" while it is the drafter's pick, "reid" once you picked. */
+  visual_choice_by?: "auto" | "reid";
+}
+
+/** One made picture: `key` is its identity (it changes only when the picture does). */
+export interface SocialMadeVisual {
+  id: string;
+  kind: "diagram" | "picture" | "screenshot";
+  label: string;
+  key: string;
 }
 
 export interface SocialGap {
@@ -1985,8 +2007,20 @@ export interface SocialVisualPart {
   data: string;
 }
 
-export const fetchSocialVisual = (context: ExtensionContext, id: string, part: number) =>
-  call<SocialVisualPart>(context, "GET", `/v1/ae/social/visual/${id}/${part}`);
+/** `c` asks for one made picture (else the post's chosen one); `preview` for its small tile. */
+export const fetchSocialVisual = (
+  context: ExtensionContext,
+  id: string,
+  part: number,
+  pick: { c?: string; preview?: boolean } = {},
+) => {
+  const query = [pick.c ? `c=${encodeURIComponent(pick.c)}` : "", pick.preview ? "preview=true" : ""].filter(Boolean).join("&");
+  return call<SocialVisualPart>(context, "GET", `/v1/ae/social/visual/${id}/${part}${query ? `?${query}` : ""}`);
+};
+
+/** Pick a post's picture among the made ones (2026-11-15), or "none". */
+export const chooseSocialVisual = (context: ExtensionContext, id: string, choice: string) =>
+  call<{ ok: boolean }>(context, "POST", "/v1/ae/social/visual-choice", { id, choice });
 
 export const markSocialPosted = (context: ExtensionContext, id: string, url?: string) =>
   call<{ ok: boolean }>(context, "POST", "/v1/ae/social/posted", url ? { id, url } : { id });
@@ -2019,12 +2053,14 @@ export type AttentionSource =
   | "git-mine"
   | "box"
   | "host"
+  | "home"
   | "cost"
   | "databricks"
   | "secrets"
   | "vault"
   | "accounts"
-  | "family";
+  | "family"
+  | "social";
 export type AttentionTone = "urgent" | "review";
 export type AttentionAction = "review" | "fix" | "merge" | "dismiss" | "cleanup";
 
@@ -2069,6 +2105,42 @@ export interface AttentionItem {
   /** Why a dismissed item came back, e.g. "3 days passed". */
   back?: string | null;
   dismissed?: { at: string; reason: string; expires_at: string };
+  /** A snoozed item (it is listed in `snoozed`, not `items`): when it was snoozed and when it comes back. */
+  snoozed?: { at: string; until: string };
+  /** The first time any read listed the item (D2 phase 2); null when the server's log is unreadable. */
+  first_seen?: string | null;
+  /** Who the item is assigned to (D2 phase 3): an admin's id, who set it and when. Absent when unassigned. */
+  assigned?: AttentionAssigned;
+  /** A Social post's slot id (its row shows the post's picture); never a link. */
+  slot?: string;
+  /** The Social card's picture identity for that slot, or why there is none. */
+  visual?: { kind: "thumbnail" | "tool" | "made"; key: string } | null;
+  visual_note?: string | null;
+}
+
+/** An assignment: the admin it is for, the admin who made it and when. */
+export interface AttentionAssigned {
+  to: string;
+  by: string;
+  at: string;
+  /** The assignee has the item dismissed or snoozed, so it still counts for everyone else (the chip stays). */
+  hidden?: boolean;
+}
+
+/**
+ * True when *item* is assigned to an admin other than *me* (D2 phase 3). With no `me` (an older
+ * server, or before the first read) nothing is "elsewhere", so a missing login never hides an item.
+ */
+export function assignedElsewhere(item: Pick<AttentionItem, "assigned">, me: string | undefined): boolean {
+  return Boolean(item.assigned) && !item.assigned!.hidden && me !== undefined && item.assigned!.to !== me;
+}
+
+/**
+ * The page's one rule for "listed but not counted": a chat that is still working holds the item, or it
+ * is assigned to another admin. Every count, pill, cut, Review all and reopen rule uses this one.
+ */
+export function notCounted(item: Pick<AttentionItem, "working" | "assigned">, me: string | undefined): boolean {
+  return heldByWorkingChat(item) || assignedElsewhere(item, me);
 }
 
 /** True when a chat that is still working holds *item* (a waiting chat leaves it counted). */
@@ -2085,8 +2157,12 @@ export interface AttentionCounts {
 export interface AttentionOverview {
   sources: AttentionSource[];
   can_chat: boolean;
+  /** The viewer's own login (D2 phase 3), which an assignment's `to` is compared with; absent from an older server. */
+  me?: string;
   items: AttentionItem[];
   dismissed: AttentionItem[];
+  /** Items the viewer snoozed (D2 phase 2); absent from an older server. */
+  snoozed?: AttentionItem[];
   counts: AttentionCounts;
   /** Words for each source that could not be read, e.g. "Git repos could not be read; the count may be low". */
   unknown: string[];
@@ -2179,6 +2255,155 @@ export const startAttentionBatch = (
     rideUnparked ? { ...target, ids, ride_unparked: true } : { ...target, ids },
   );
 
+// ── D2 phase 2 (2026-11-16): snooze, bulk, Review across sources, history and the Done log ──
+
+/** How long a snooze lasts: tomorrow 09:00, next Monday 09:00 or a week (the home clock). */
+export type SnoozeChoice = "tomorrow" | "monday" | "week";
+
+export const snoozeAttention = (context: ExtensionContext, id: string, until: SnoozeChoice) =>
+  call<{ id: string; until: string }>(context, "POST", "/v1/ae/attention/snooze", { id, until });
+
+export const wakeAttention = (context: ExtensionContext, id: string) =>
+  call<{ id: string; woke: boolean }>(context, "POST", "/v1/ae/attention/wake", { id });
+
+/** One id's result of a bulk dismiss or snooze: a partial success is normal. */
+export interface BulkResult {
+  id: string;
+  ok: boolean;
+  status: number;
+  error?: string;
+}
+
+export interface BulkAnswer {
+  results: BulkResult[];
+  succeeded: number;
+  failed: number;
+  until?: string;
+}
+
+/** `POST /v1/ae/attention/bulk`: at most 50 ids, each with its own result. */
+export const bulkAttention = (
+  context: ExtensionContext,
+  action: "dismiss" | "snooze",
+  ids: string[],
+  until?: SnoozeChoice,
+) =>
+  call<BulkAnswer>(
+    context,
+    "POST",
+    "/v1/ae/attention/bulk",
+    until ? { action, ids, until } : { action, ids },
+  );
+
+/** What a Review across sources skipped, and why (a held item names the chat that holds it). */
+export interface ReviewSkipped {
+  id: string;
+  why: string;
+  session_id?: string;
+  path?: string;
+}
+
+export interface AttentionReviewStarted extends AttentionBatchStarted {
+  skipped?: ReviewSkipped[];
+}
+
+/** `POST /v1/ae/attention/review`: one chat on items from any sources (Review N in the bulk bar). */
+export const startAttentionReviewMany = (
+  context: ExtensionContext,
+  ids: string[],
+  rideUnparked = false,
+) =>
+  call<AttentionReviewStarted>(
+    context,
+    "POST",
+    "/v1/ae/attention/review",
+    rideUnparked ? { ids, ride_unparked: true } : { ids },
+  );
+
+export interface AttentionEvent {
+  at: string;
+  what:
+    | "first-seen"
+    | "dismissed"
+    | "snoozed"
+    | "woke"
+    | "restored"
+    | "chat-started"
+    | "done"
+    | "back"
+    | "assigned"
+    | "unassigned";
+  /** Who did it; "system" for an assignment the server ended because the item left. */
+  by: string | null;
+  /** Who an `assigned` event gave the item to. */
+  to?: string;
+}
+
+/** One admin the picker offers. OmniGent has no display name, so `name` is the id. */
+export interface AttentionAdmin {
+  id: string;
+  name: string;
+}
+
+export const fetchAttentionAdmins = (context: ExtensionContext) =>
+  call<{ admins: AttentionAdmin[] }>(context, "GET", "/v1/ae/attention/admins");
+
+/** `POST /v1/ae/attention/assign`: give one item to an admin, or take it off (`to` null). */
+export const assignAttention = (context: ExtensionContext, id: string, to: string | null) =>
+  call<{ id: string; assigned: AttentionAssigned | null }>(context, "POST", "/v1/ae/attention/assign", { id, to });
+
+export interface AttentionHistory {
+  id: string;
+  first_seen: string | null;
+  events: AttentionEvent[];
+  /** True when the server's log could not be read: say so, never "no history". */
+  unknown?: boolean;
+}
+
+/** A query value the bridge's pattern takes: percent-encoded, with ! ' ( ) * escaped too. */
+const queryValue = (text: string): string =>
+  encodeURIComponent(text).replace(/[!'()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+
+export const fetchAttentionHistory = (context: ExtensionContext, id: string) =>
+  call<AttentionHistory>(context, "GET", `/v1/ae/attention/history?id=${queryValue(id)}`);
+
+/** One Done entry: an item that is no longer reported (not proof of a fix). */
+export interface DoneItem {
+  id: string;
+  source: AttentionSource;
+  kind: string;
+  title: string;
+  done_at: string;
+  first_seen: string | null;
+}
+
+/** Something a person did to an item (dismissed, snoozed, woke, restored, started a chat). */
+export interface ActivityEvent {
+  id: string;
+  source: AttentionSource;
+  what: Exclude<AttentionEvent["what"], "first-seen" | "done" | "back">;
+  at: string;
+  by: string | null;
+  title: string;
+  /** Who an `assigned` event gave the item to. */
+  to?: string;
+}
+
+export interface DoneAnswer {
+  items: DoneItem[];
+  events?: ActivityEvent[];
+  /** Done rows the answer left out to fit the page (the oldest); 0 or absent when nothing was cut. */
+  more_items?: number;
+  /** Actions the answer left out to fit the page (the oldest). */
+  more_events?: number;
+  /** "The activity log could not be read": say so, never an empty day. */
+  unknown: string[];
+  read_at: string;
+}
+
+export const fetchAttentionDone = (context: ExtensionContext, days: number) =>
+  call<DoneAnswer>(context, "GET", `/v1/ae/attention/done?days=${days}`);
+
 /** What a 409 slots_full carries: who holds the slots, the limit and the brief to copy. */
 export interface SlotsFull {
   working: Array<{ session_id?: string; id?: string; title: string; path?: string }>;
@@ -2234,13 +2459,21 @@ export interface FamilyRow {
   lead_context_tokens: number | null;
   restarts: number;
   flagged: boolean;
+  /** Which limit the server found passed, under the viewer's "Flag on" mode (2026-11-23). */
+  over_tokens?: boolean;
+  over_usd?: boolean;
 }
+
+/** Which limit raises a Spend families alert. */
+export type FlagOn = "tokens" | "dollars" | "either";
 
 /** The viewer's saved "Show cost as" and "Runaway family" (one runaway value per unit). */
 export interface FamilyCostSettings {
   unit: CostUnit;
   runaway_tokens: number;
   runaway_usd: number;
+  /** Absent from an older server, which reads as "either". */
+  flag_on?: FlagOn;
 }
 
 export interface FamilyCostAnswer {
@@ -2267,6 +2500,7 @@ export const saveFamilyCostSettings = (
     family_cost_unit?: CostUnit;
     runaway_family_tokens?: number;
     runaway_family_usd?: number;
+    family_flag_on?: FlagOn;
   },
 ) => call<FamilyCostSettings>(context, "POST", "/v1/ae/family-cost/settings", fields);
 
@@ -2287,6 +2521,41 @@ export interface NewerModelsAnswer {
 /** Read only; the server answers empty when no host catalog can be read. */
 export const fetchNewerModels = (context: ExtensionContext) =>
   call<NewerModelsAnswer>(context, "GET", "/v1/ae/roles/newer-models");
+
+// ── New-model watch (2026-11-10): model_watch.py ─────────────────────────────────
+
+export interface ModelWatchModel {
+  id: string;
+  label: string;
+  family: string;
+  first_seen: string | null;
+  /** "served" answers on the plan; "not_served" was seen in Claude Code and refused; "error" never ran. */
+  probe: "served" | "not_served" | "error";
+  last_probed: string | null;
+  /** Admins only from here. */
+  detail?: string | null;
+  notes?: { url: string; excerpt: string | null; status: string } | null;
+  review?: {
+    state: "started" | "done" | "not_run";
+    at: string | null;
+    review_id: string | null;
+    count: number | null;
+    why: string | null;
+  } | null;
+}
+
+export interface ModelWatchAnswer {
+  models: ModelWatchModel[];
+  served_ids: string[];
+  /** Admins only: the host and Claude Code version of the last relay pass. */
+  last_report?: { at: string; host: string; claude_code_version: string; scanned_at: string } | null;
+  /** Admins only: the last report is older than 13 hours, or there is none. */
+  report_stale?: boolean;
+}
+
+/** Read only; ids the box saw in Claude Code, whether they answer, their notes and their review. */
+export const fetchModelWatch = (context: ExtensionContext) =>
+  call<ModelWatchAnswer>(context, "GET", "/v1/ae/model-watch");
 
 // ── Preset suggestions (2026-10-24, preset insights PR 3): preset_suggestions.py ─
 

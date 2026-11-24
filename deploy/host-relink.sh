@@ -60,6 +60,7 @@ UNIT="${AE_RELINK_UNIT:-ae-omnigent-host.service}"
 HOST_NAME="${AE_RELINK_HOST_NAME:-$(hostname)}"
 OMNIGENT_BIN="${AE_RELINK_OMNIGENT:-$HOME/.omnigent-host/venv/bin/omnigent}"
 SYSTEMCTL="${AE_RELINK_SYSTEMCTL:-systemctl}"
+AE_GATE="${AE_GATE:-/usr/local/sbin/ae-gate}"
 STATE_DIR="${AE_RELINK_STATE_DIR:-$HOME/.local/state/ae-host-relink}"
 THRESHOLD="${AE_RELINK_THRESHOLD:-30}"
 COOLDOWN="${AE_RELINK_COOLDOWN:-900}"
@@ -83,6 +84,10 @@ die() { note "error: $*"; exit 1; }
 cli() {
   if [ -n "${AE_RELINK_CLI:-}" ]; then
     "$AE_RELINK_CLI" "$@" </dev/null
+  elif [ -x "$AE_GATE" ]; then
+    # Root hardening: `omnigent host-relink take|status|push|giveup ...`. The else arm is the old
+    # direct call and is removed after the cutover.
+    sudo -n "$AE_GATE" omnigent host-relink "$@" </dev/null
   else
     "$ROOT/deploy/compose.sh" exec -T omnigent python -m ae_omni_policies.host_relink "$@" </dev/null
   fi
@@ -114,6 +119,8 @@ host_online() {
   local out
   if [ -n "${AE_RELINK_HOST_ONLINE:-}" ]; then
     out="$("$AE_RELINK_HOST_ONLINE" </dev/null 2>/dev/null || true)"
+  elif [ -x "$AE_GATE" ]; then
+    out="$(timeout 30 sudo -n "$AE_GATE" omnigent host-online "$HOST_NAME" </dev/null 2>/dev/null || true)"
   else
     # The variables expand inside the postgres container, not here.
     # shellcheck disable=SC2016

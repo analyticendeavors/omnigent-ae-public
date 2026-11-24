@@ -75,7 +75,12 @@ def test_yaml_parses_with_harness_allowlist_and_seeded_status(name: str, tmp_pat
     assert server.transport == "stdio"
     assert server.command == "python"
     assert server.args == ["-m", "ae_omni_policies.mcp"]
-    assert server.env == {}, "the subprocess inherits the host's environment; no secrets in YAML"
+    if name == "preset-reviewer":
+        # Needs OMNIGENT_RUNNER_PRIMARY_SESSION_ID forwarded so preset_insights_read and
+        # submit_preset_suggestions can post as the calling session; see agent.yaml's comment.
+        assert server.env == {"AE_AGENT_NAME": "preset-reviewer"}
+    else:
+        assert server.env == {}, "the subprocess inherits the host's env; no secrets in YAML"
     assert server.tools == allowlist
 
 
@@ -151,6 +156,18 @@ def test_prompts_are_plain_english() -> None:
         text = path.read_text(encoding="utf-8")
         for token in banned:
             assert token not in text, f"{path.name} carries {token!r}"
+
+
+def test_the_preset_reviewer_prompt_reads_new_models_from_the_notes_only() -> None:
+    """Step 5b: new_models, the excerpt as the only source, and the Retention sentence."""
+    text = (AGENTS / "preset-reviewer" / "agent.yaml").read_text(encoding="utf-8")
+    for needle in (
+        "new_models",
+        "release_notes_excerpt",
+        "release notes unavailable",
+        "Retention:",
+    ):
+        assert needle in text, needle
 
 
 def test_reviewer_is_read_only_by_policy(tmp_path: Path) -> None:

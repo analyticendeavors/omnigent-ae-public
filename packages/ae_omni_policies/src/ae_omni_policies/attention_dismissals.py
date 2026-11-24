@@ -8,6 +8,11 @@ cleanup (:meth:`DismissalStore.tidy`, run every five minutes by ``attention.py``
 clock for an item missing from a scope that read fresh and clean, and drops the record after
 an hour of that, so a problem that was fixed and later recurs shows again.
 
+Snooze (2026-11-16, D2 phase 2) lives in the same file under the same lock: a record with
+``kind: "snooze"`` and ``until`` hides the item until that time, or sooner when the item gets
+worse (the same comparators), and a dismissal and a snooze of one item replace each other.
+A record without ``kind`` is a dismissal.
+
 The file is one JSON document on the data volume (``AE_ATTENTION_DISMISSALS_FILE``, default
 ``/data/ae-attention-dismissals.json``), written with the same atomic replace as
 ``cost_targets``. Keyed by sign-in login, then item id. Every write takes one asyncio lock and
@@ -37,6 +42,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
+
+from ae_omni_policies import taskstore
 
 _logger = logging.getLogger(__name__)
 
@@ -188,6 +196,24 @@ def _family(old: Mapping[str, Any], now: Mapping[str, Any]) -> str | None:
     return "over the flag again today" if now.get("day") != old.get("day") else None
 
 
+def _home(old: Mapping[str, Any], now: Mapping[str, Any]) -> str | None:
+    critical = now.get("severity") == "critical" and old.get("severity") != "critical"
+    return "it turned critical" if critical else None
+
+
+def _post_late(old: Mapping[str, Any], now: Mapping[str, Any]) -> str | None:
+    # Tiers (1 to 2 days late, 3 to 6, a week or more) instead of a daily count, so a dismissed
+    # late post does not come back every morning. A post that was only due today had no tier.
+    before, after = int(old.get("tier") or 0), int(now.get("tier") or 0)
+    if after > before:
+        return "it is now past its slot" if before == 0 else "it is more overdue"
+    return None
+
+
+def _post_today(old: Mapping[str, Any], now: Mapping[str, Any]) -> str | None:
+    return "its time moved" if now.get("due") != old.get("due") else None
+
+
 #: Kind to comparator. A kind with none (a stale or unreadable box reading) is never dismissible.
 COMPARATORS: dict[str, Callable[[Mapping[str, Any], Mapping[str, Any]], str | None]] = {
     "pr-failing": _pr_failing,
@@ -211,6 +237,8 @@ COMPARATORS: dict[str, Callable[[Mapping[str, Any], Mapping[str, Any]], str | No
     "units": _units,
     "scan": _scan,
     "host-failed": _host,
+    "home-alarm": _home,
+    "home-alert": _home,
     "cost-over": _cost,
     "credit-over": _credit,
     "secret-missing": _secret,
@@ -223,6 +251,8 @@ COMPARATORS: dict[str, Callable[[Mapping[str, Any], Mapping[str, Any]], str | No
     "vault-apart": _secret,
     "account-full": _account,
     "family-over": _family,
+    "post-overdue": _post_late,
+    "post-today": _post_today,
 }
 
 _SECRET_BACK = "it expires, goes missing or is refused, or its date moves"
@@ -238,6 +268,8 @@ BACK_IF = {
     "sweep": "a later run also fails or runs late",
     "account": "the error changes",
     "repo-error": "the error changes",
+    "home-alarm": "it turns critical",
+    "home-alert": "it turns critical",
     "heat": "it turns red",
     "cpu": "it turns red",
     "memory": "it turns red",
@@ -262,6 +294,8 @@ BACK_IF = {
     "vault-apart": _SECRET_BACK,
     "account-full": "the next weekly window fills too",
     "family-over": "it is over the flag again on another day",
+    "post-overdue": "it is 3 days late, or a week late",
+    "post-today": "its time moves",
 }
 
 
@@ -312,6 +346,46 @@ def judge(
     return (why is None), why
 
 
+#: The three snooze choices, as the page sends them.
+SNOOZE_CHOICES = ("tomorrow", "monday", "week")
+SNOOZE_HOUR = 9
+
+
+def is_snooze(record: Mapping[str, Any]) -> bool:
+    return record.get("kind") == "snooze"
+
+
+def snooze_until(choice: str, now: datetime, tz: str | None = None) -> datetime:
+    """When a snooze of *choice* ends, as a UTC instant.
+
+    ``tomorrow`` is 09:00 the next day and ``monday`` is 09:00 on the next Monday (a week away
+    when today is Monday), both on the home clock (``AE_TASK_STORE_TZ``, read the way
+    ``secret_alerts`` reads it); ``week`` is seven days from now.
+
+    :raises ValueError: for a choice that is not one of :data:`SNOOZE_CHOICES`.
+    """
+    if choice not in SNOOZE_CHOICES:
+        raise ValueError(f"snooze until one of: {', '.join(SNOOZE_CHOICES)}")
+    if choice == "week":
+        return now + timedelta(days=7)
+    zone = ZoneInfo(tz or taskstore.Settings.from_env().tz)
+    today = now.astimezone(zone).date()
+    days = 1 if choice == "tomorrow" else 7 - today.weekday()
+    day = today + timedelta(days=days)
+    return datetime(day.year, day.month, day.day, SNOOZE_HOUR, 0, tzinfo=zone).astimezone(UTC)
+
+
+def judge_snooze(
+    record: Mapping[str, Any], kind: str, state: Mapping[str, Any], now: datetime
+) -> tuple[bool, str | None]:
+    """(still hidden, why it came back) for a snoozed item seen with *state* at *now*."""
+    until = parse(record.get("until"))
+    if until is None or now >= until:
+        return False, "the snooze ended"
+    why = worse(kind, record.get("state") or {}, state)
+    return (why is None), why
+
+
 def clean_reason(source: str, reason: str | None) -> str:
     """*reason* as it may be stored, or :class:`ReasonRefused`."""
     text = " ".join((reason or "").split())
@@ -324,6 +398,45 @@ def clean_reason(source: str, reason: str | None) -> str:
     if len(text) > REASON_MAX:
         raise ReasonRefused(f"The reason is {len(text)} characters; the limit is {REASON_MAX}.")
     return text
+
+
+def dismissal_record(
+    source: str, scope: str, tone: str, state: Mapping[str, Any], reason: str, now: datetime
+) -> dict[str, Any]:
+    return {
+        "source": source,
+        "scope": scope,
+        "tone": tone,
+        "state": dict(state),
+        "reason": reason,
+        "at": iso(now),
+        "expires_at": iso(expiry_of(tone, now)),
+        "absent_at": None,
+    }
+
+
+def snooze_record(
+    source: str,
+    scope: str,
+    tone: str,
+    state: Mapping[str, Any],
+    until: datetime,
+    now: datetime,
+) -> dict[str, Any]:
+    """A snooze record: the dismissal's fields plus ``kind`` and ``until`` (``expires_at`` is the
+    same instant, so the eviction order and the tidy treat it like any other record)."""
+    return {
+        "kind": "snooze",
+        "source": source,
+        "scope": scope,
+        "tone": tone,
+        "state": dict(state),
+        "reason": "",
+        "at": iso(now),
+        "until": iso(until),
+        "expires_at": iso(until),
+        "absent_at": None,
+    }
 
 
 @dataclass
@@ -434,16 +547,7 @@ class DismissalStore:
         now: datetime,
     ) -> dict[str, Any]:
         """Hide *item_id* for *login*; replaces an older record of the same item."""
-        record = {
-            "source": source,
-            "scope": scope,
-            "tone": tone,
-            "state": dict(state),
-            "reason": reason,
-            "at": iso(now),
-            "expires_at": iso(expiry_of(tone, now)),
-            "absent_at": None,
-        }
+        record = dismissal_record(source, scope, tone, state, reason, now)
 
         def change(people: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
             rows = people.setdefault(login, {})
@@ -453,12 +557,68 @@ class DismissalStore:
 
         return await self._edit(change)
 
-    async def restore(self, login: str, item_id: str) -> bool:
-        """Show *item_id* again for *login*; ``False`` when it was not dismissed."""
+    async def snooze(
+        self,
+        login: str,
+        item_id: str,
+        *,
+        source: str,
+        scope: str,
+        tone: str,
+        state: Mapping[str, Any],
+        until: datetime,
+        now: datetime,
+    ) -> dict[str, Any]:
+        """Hide *item_id* for *login* until *until*; replaces a dismissal or snooze of it."""
+        record = snooze_record(source, scope, tone, state, until, now)
+
+        def change(people: dict[str, dict[str, dict[str, Any]]]) -> dict[str, Any]:
+            rows = people.setdefault(login, {})
+            rows[item_id] = record
+            _evict(rows, now, keep=item_id)
+            return record
+
+        return await self._edit(change)
+
+    async def put_many(
+        self, login: str, records: Mapping[str, Mapping[str, Any]], now: datetime
+    ) -> None:
+        """Write several dismissal or snooze records for *login* in one locked write."""
+
+        def change(people: dict[str, dict[str, dict[str, Any]]]) -> None:
+            rows = people.setdefault(login, {})
+            for item_id, record in records.items():
+                rows[item_id] = dict(record)
+            for item_id in records:
+                _evict(rows, now, keep=item_id)
+
+        await self._edit(change)
+
+    async def wake(self, login: str, item_id: str) -> bool:
+        """End a snooze early; ``False`` when *item_id* is not snoozed by *login*."""
 
         def change(people: dict[str, dict[str, dict[str, Any]]]) -> bool:
             rows = people.get(login, {})
-            found = rows.pop(item_id, None) is not None
+            record = rows.get(item_id)
+            if record is None or not is_snooze(record):
+                return False
+            del rows[item_id]
+            if not rows:
+                people.pop(login, None)
+            return True
+
+        return await self._edit(change)
+
+    async def restore(self, login: str, item_id: str) -> bool:
+        """Show *item_id* again for *login*; ``False`` if it is not dismissed (not a snooze)."""
+
+        def change(people: dict[str, dict[str, dict[str, Any]]]) -> bool:
+            rows = people.get(login, {})
+            # A snooze is ended by Wake, never by Restore (which answers "not dismissed").
+            record = rows.get(item_id)
+            found = record is not None and not is_snooze(record)
+            if found:
+                del rows[item_id]
             if not rows:
                 people.pop(login, None)
             return found

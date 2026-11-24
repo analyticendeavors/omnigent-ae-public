@@ -233,6 +233,7 @@ CATALOG: tuple[Card, ...] = (
         "ship",
         "A plan for what to post on LinkedIn and YouTube, and when.",
         private=True,
+        sources=("social",),
         fields=(
             Field_(
                 "Channel ids",
@@ -288,7 +289,9 @@ CATALOG: tuple[Card, ...] = (
         "home-security",
         "Home security",
         "box",
-        "The home network's health and its firewall, read from the home app.",
+        "The home network's health and its firewall, read from the home app. Open alerts are rows "
+        "in Needs you.",
+        sources=("home",),
         fields=(
             Field_(
                 "Home app address",
@@ -302,6 +305,14 @@ CATALOG: tuple[Card, ...] = (
                 "AE_HOME_SECURITY_LINK",
                 "url",
                 "The web address people open for the home app's Security tab.",
+                env_only=True,
+            ),
+            Field_(
+                "Investigate runbook",
+                "AE_HOME_SECURITY_RUNBOOK",
+                "text",
+                "A file on the box the Investigate chat reads first: how to read the firewall "
+                "and which hosts it may reach. Env only.",
                 env_only=True,
             ),
         ),

@@ -85,6 +85,7 @@ async def test_bad_state_is_rejected_and_nothing_is_sent(
     bodies = mock(monkeypatch, {"choice": "yes"})
     v = await Decision1Judge(CFG).yes_no("p_yes", state, "Q?")
     assert v.error == "bad_state" and v.answer is None and bodies == []
+    assert ds.calls_today() == 0  # nothing went out, so nothing is counted
 
 
 async def test_unguarded_string_is_rejected_and_guarded_passes(
@@ -119,11 +120,13 @@ async def test_http_error_is_a_class_not_a_body(monkeypatch: pytest.MonkeyPatch)
     )
     v = await Decision1Judge(CFG).yes_no("p_yes", {"files": 1}, "Q?")
     assert v.error == "http_500" and "secret" not in repr(v)
+    assert ds.calls_today() == 1  # the request went out, so a failed answer still counts
 
 
 async def test_not_configured() -> None:
     v = await Decision1Judge(da.config({})).yes_no("p_yes", {"files": 1}, "Q?")
     assert v.error == "not_configured"
+    assert ds.calls_today() == 0
 
 
 async def test_rule_judge() -> None:

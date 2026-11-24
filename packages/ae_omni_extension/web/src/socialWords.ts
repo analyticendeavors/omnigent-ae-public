@@ -166,7 +166,7 @@ export function warnings(view: SocialView, now: number): Warning[] {
 }
 
 /** LinkedIn's share box with the draft in it, or the channel's Community tab. */
-export function openUrl(slot: SocialSlot, view: SocialView, text: string): string | null {
+export function openUrl(slot: SocialSlot, view: Pick<SocialView, "channel_ids"> | null, text: string): string | null {
   if (slot.platform === "linkedin") {
     const base = "https://www.linkedin.com/feed/?shareActive=true";
     if (!text) return base;
@@ -177,7 +177,7 @@ export function openUrl(slot: SocialSlot, view: SocialView, text: string): strin
       return base; // a lone surrogate cannot be encoded; the clipboard still has the draft
     }
   }
-  const id = slot.channel ? view.channel_ids[slot.channel] : null;
+  const id = slot.channel && view ? view.channel_ids[slot.channel] : null;
   return id ? `https://www.youtube.com/channel/${id}/posts` : null;
 }
 

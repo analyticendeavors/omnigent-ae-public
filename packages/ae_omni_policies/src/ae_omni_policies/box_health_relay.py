@@ -326,6 +326,15 @@ def container_path_ok(path: str, user: str) -> bool:
 
 HOST_COMMANDS: dict[str, tuple[str, ...]] = {
     "docker_df": ("docker", "system", "df", "--format", "{{json .}}"),
+    "docker_dangling": (
+        "docker",
+        "image",
+        "ls",
+        "--filter",
+        "dangling=true",
+        "--format",
+        "{{json .}}",
+    ),
     "journal": ("journalctl", "--disk-usage"),
     "failed_system": ("systemctl", "--failed", "--no-legend", "--plain"),
     "failed_user": ("systemctl", "--user", "--failed", "--no-legend", "--plain"),
@@ -944,15 +953,78 @@ def parse_journal_usage(text: str) -> int | None:
     return int(float(match.group(1)) * _BIN_UNITS.get(match.group(2), 1))
 
 
-def read_docker(runner: Runner) -> box_health.Docker:
-    """``docker system df`` totals. :raises RelayError: When docker does not answer."""
-    result = runner.run(HOST_COMMANDS["docker_df"], 60)
+# Root hardening: once reid is out of the docker group, `docker system df` goes through the
+# root-owned gate. The gate prints the plain table, so its rows are read from text. The fallback
+# to the direct call is removed after the cutover.
+AE_GATE = "/usr/local/sbin/ae-gate"
+_DF_TEXT_ROW = re.compile(
+    r"^(Images|Containers|Local Volumes|Build Cache)\s+(\d+)\s+\d+\s+(\S+)\s+(.+?)\s*$"
+)
+
+
+def _df_rows_from_text(text: str) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for line in text.splitlines():
+        hit = _DF_TEXT_ROW.match(line.strip())
+        if hit:
+            kind = hit.group(1)
+            rows[kind] = {
+                "Type": kind,
+                "TotalCount": hit.group(2),
+                "Size": hit.group(3),
+                "Reclaimable": hit.group(4),
+            }
+    return rows
+
+
+def _parse_image_created(text: str) -> float | None:
+    """``2026-11-07 15:34:10 -0800 PST`` (``docker image ls`` CreatedAt) as epoch seconds."""
+    try:
+        return datetime.strptime(" ".join(text.split()[:3]), "%Y-%m-%d %H:%M:%S %z").timestamp()
+    except ValueError:
+        return None
+
+
+def read_prunable_images(runner: Runner, *, now: float, stale_days: float) -> int:
+    """Bytes of the images the Prune Docker button removes: dangling, used by no container and
+    older than its ``until`` filter. ``docker system df`` Reclaimable is not used: on the
+    containerd image store it counts images that running containers use, which no prune frees.
+    :raises RelayError: When docker does not answer."""
+    result = runner.run(HOST_COMMANDS["docker_dangling"], 60)
+    if result.returncode != 0:
+        raise RelayError("docker image ls did not answer")
+    cutoff = now - max(1, int(stale_days * 24)) * 3600
+    total = 0
+    for line in result.out.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict) or str(row.get("Containers", "")) != "0":
+            continue
+        created = _parse_image_created(str(row.get("CreatedAt", "")))
+        if created is not None and created <= cutoff:
+            total += parse_docker_size(str(row.get("Size", ""))) or 0
+    return total
+
+
+def read_docker(
+    runner: Runner, *, now: float | None = None, stale_days: float | None = None
+) -> box_health.Docker:
+    """``docker system df`` totals. With *now* and *stale_days* (the direct path only), the image
+    reclaim is what the prune button can free (:func:`read_prunable_images`).
+    :raises RelayError: When docker does not answer."""
+    use_gate = os.access(AE_GATE, os.X_OK)
+    argv = ("sudo", "-n", AE_GATE, "df") if use_gate else HOST_COMMANDS["docker_df"]
+    result = runner.run(argv, 60)
     if result.returncode != 0:
         raise RelayError(
             "docker system df did not answer; check that this user is in the docker group"
         )
     rows: dict[str, dict[str, Any]] = {}
-    for line in result.out.splitlines():
+    if use_gate:
+        rows = _df_rows_from_text(result.out)
+    for line in [] if use_gate else result.out.splitlines():
         try:
             row = json.loads(line)
         except ValueError:
@@ -967,10 +1039,18 @@ def read_docker(runner: Runner) -> box_health.Docker:
         raw = str(rows.get(kind, {}).get("TotalCount", "0"))
         return int(raw) if raw.isdigit() else 0
 
+    images_reclaim_b = size("Images", "Reclaimable")
+    if not use_gate and now is not None and stale_days is not None:
+        try:
+            images_reclaim_b = read_prunable_images(runner, now=now, stale_days=stale_days)
+        except RelayError as exc:
+            # Keep the df reading; 0 rather than df's figure, which counts in-use images.
+            _logger.warning("docker reclaim: %s", exc)
+            images_reclaim_b = 0
     return box_health.Docker(
         images=count("Images"),
         images_b=size("Images", "Size"),
-        images_reclaim_b=size("Images", "Reclaimable"),
+        images_reclaim_b=images_reclaim_b,
         volumes=count("Local Volumes"),
         volumes_b=size("Local Volumes", "Size"),
         build_cache_b=size("Build Cache", "Size"),
@@ -1126,6 +1206,41 @@ def scan_worktrees(
     )
 
 
+def gate_exec_argv(argv: Sequence[str], mapped: Sequence[str], user: str) -> list[str] | None:
+    """The ``ae-gate`` form of a fixed in-container command, or None when the gate is not
+    installed or *argv* is not one. Root hardening: ``host-scan`` runs the read-only templates
+    (and the freshness check), ``host-clean`` the removal, as the container user; the gate holds
+    the same fixed lists. Call this only on an *argv* that already matched the fixed table. The
+    direct ``docker exec`` is removed after the cutover."""
+    if not os.access(AE_GATE, os.X_OK) or argv[:3] != ["docker", "exec", "-u"] or len(argv) < 6:
+        return None
+    name = argv[4]
+    if name not in mapped:
+        return None
+    gate = ["sudo", "-n", AE_GATE]
+    if "-newermt" in argv:
+        head = len(CONTAINER_FRESH)
+        cutoff = argv[-2].removeprefix("@")
+        return [*gate, "host-scan", name, "fresh", cutoff, *argv[head:-3]]
+    if "rm" in argv:
+        return [*gate, "host-clean", name, *argv[len(CONTAINER_RM) :]]
+    digits = ""
+    for part in argv:
+        match = re.fullmatch(r"/tmp/claude-([0-9]{1,10})", part)
+        if match:
+            digits = match.group(1)
+    for key, template in CONTAINER_COMMANDS.items():
+        if template[1] != "exec":
+            continue
+        try:
+            expected = container_argv(key, container=name, user=user, n=digits)
+        except ValueError:
+            continue
+        if list(argv) == expected:
+            return [*gate, "host-scan", name, key, *([digits] if key == "claude_tree" else [])]
+    return None
+
+
 def _container_stream(
     runner: Runner, argv: list[str], settings: Settings, max_lines: int
 ) -> StreamResult:
@@ -1133,7 +1248,67 @@ def _container_stream(
         argv, list(settings.users.containers), settings.container_user
     ):
         raise RelayError("refused a container command that is not in the fixed table")
-    return runner.stream(argv, CONTAINER_TIMEOUT_S + 10, max_lines)
+    gated = gate_exec_argv(argv, list(settings.users.containers), settings.container_user)
+    return runner.stream(gated or argv, CONTAINER_TIMEOUT_S + 10, max_lines)
+
+
+_GATE_HEALTH: dict[str, Any] = {"t": 0.0, "data": None, "failed": False, "volumes": False}
+GATE_HEALTH_TTL_S = 30.0
+
+
+def gate_health(runner: Runner, *, volumes: bool = False) -> dict[str, Any] | None:
+    """The gate's ``health`` JSON (containers with state, size and mounts), held for a few
+    seconds so one pass asks once, a failure included (no re-run per container). With
+    *volumes* it asks ``health --volumes`` for the volume sizes too, which the relay needs only
+    when its daily volume cache expires. None when the gate is not installed or does not
+    answer. Root hardening: this replaces the direct ``docker ps``, ``docker inspect`` and
+    ``docker system df -v`` reads; the direct reads are removed after the cutover."""
+    if not os.access(AE_GATE, os.X_OK):
+        return None
+    now = time.monotonic()
+    held = _GATE_HEALTH
+    if now - float(held["t"]) < GATE_HEALTH_TTL_S and (
+        held["failed"] or (held["data"] is not None and (held["volumes"] or not volumes))
+    ):
+        data: dict[str, Any] | None = held["data"]
+        return data
+    argv = ("sudo", "-n", AE_GATE, "health", *(("--volumes",) if volumes else ()))
+    result = runner.run(argv, DF_TIMEOUT_S)
+    parsed: Any = None
+    if result.returncode == 0:
+        try:
+            parsed = json.loads(result.out)
+        except ValueError:
+            parsed = None
+    if not isinstance(parsed, dict):
+        held.update(t=now, data=None, failed=True, volumes=volumes)
+        return None
+    held.update(t=now, data=parsed, failed=False, volumes=volumes)
+    return parsed
+
+
+def _gate_container_run(runner: Runner, argv: list[str]) -> RunResult | None:
+    """Answer a fixed ``ps`` or ``inspect`` template from the gate's health JSON, in the shape
+    the docker command prints, or None when the gate is not in use for this command."""
+    if argv[:2] not in (["docker", "ps"], ["docker", "inspect"]) or not os.access(
+        AE_GATE, os.X_OK
+    ):
+        return None
+    health = gate_health(runner)
+    if health is None:
+        return RunResult(1)
+    if argv[1] == "ps":
+        wanted = argv[4].removeprefix("name=^").removesuffix("$")
+    else:
+        wanted = argv[-1]
+    for row in health.get("containers", []):
+        if isinstance(row, dict) and row.get("name") == wanted:
+            if argv[1] == "inspect":
+                return RunResult(0, json.dumps(row.get("mounts", [])))
+            return RunResult(
+                0, json.dumps({"State": row.get("state", ""), "Size": row.get("size", "")})
+            )
+    return RunResult(0, "")
 
 
 def _container_run(
@@ -1143,7 +1318,10 @@ def _container_run(
         argv, list(settings.users.containers), settings.container_user
     ):
         raise RelayError("refused a container command that is not in the fixed table")
-    return runner.run(argv, timeout)
+    if (answer := _gate_container_run(runner, argv)) is not None:
+        return answer
+    gated = gate_exec_argv(argv, list(settings.users.containers), settings.container_user)
+    return runner.run(gated or argv, timeout)
 
 
 def _part(label: str, suffix: str = "") -> str:
@@ -1167,7 +1345,15 @@ def volume_sizes(runner: Runner, cache: dict[str, Any], now: float) -> dict[str,
     fresh = isinstance(held, dict) and now - float(held.get("t", 0)) < VOLUMES_TTL_S
     if fresh:
         return {str(k): int(v) for k, v in held["sizes"].items()}
-    df = runner.run(CONTAINER_COMMANDS["volumes"], DF_TIMEOUT_S)
+    if os.access(AE_GATE, os.X_OK):
+        health = gate_health(runner, volumes=True)
+        if health is None:
+            df = RunResult(1)
+        else:
+            rows = [v for v in health.get("volumes", []) if isinstance(v, dict)]
+            df = RunResult(0, json.dumps({"Volumes": rows}))
+    else:
+        df = runner.run(CONTAINER_COMMANDS["volumes"], DF_TIMEOUT_S)
     if df.returncode != 0:
         if isinstance(held, dict):
             return {str(k): int(v) for k, v in held["sizes"].items()}
@@ -1276,7 +1462,9 @@ def scan_container(
         agg = groups.setdefault(box_health_scan.group_of(entry), box_health_scan.LitterAgg())
         agg.entries += 1
         with contextlib.suppress(ValueError):
-            if float(mtime) < now - stale_s:
+            if float(mtime) < now - stale_s and not box_health_scan.HARMLESS_LITTER_RE.fullmatch(
+                entry
+            ):
                 agg.stale += 1
     health.litter = litter_rows(groups)
 
@@ -1672,7 +1860,8 @@ def container_remove(
             argv, list(settings.users.containers), settings.container_user
         ):
             raise RelayError("refused a container command that is not in the fixed table")
-        if runner.run(argv, CONTAINER_TIMEOUT_S * 4).returncode == 0:
+        gated = gate_exec_argv(argv, list(settings.users.containers), settings.container_user)
+        if runner.run(gated or argv, CONTAINER_TIMEOUT_S * 4).returncode == 0:
             result.done.update(send)
         else:
             result.failed = True
@@ -2262,7 +2451,7 @@ def slow_scan(
     docker: box_health.Docker | None = None
     if not over():
         with _guard(failed, "docker"):
-            docker = read_docker(runner)
+            docker = read_docker(runner, now=now, stale_days=settings.stale_days)
     journal_b: int | None = None
     if not over():
         with _guard(failed, "journal"):

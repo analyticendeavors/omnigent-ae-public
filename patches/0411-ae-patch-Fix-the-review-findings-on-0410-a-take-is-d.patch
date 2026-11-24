@@ -1,0 +1,536 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 20:02:47 -0800
+Subject: [PATCH 411/443] [ae-patch] Fix the review findings on 0410: a take is
+ deaf only if it never heard a sample, loading routes to the server
+
+A server take is called deaf only when no non-zero sample ever arrived (or the track is muted, or the audio context is not running at the 4 s check), so a quiet room under iOS voice processing no longer trips it. A Voice start on iOS while the server info is still loading goes to the server recognizer. A start with no Voice tap logs that the audio context was not unlocked, and an auto-armed start resumes the context a tap made earlier. A stop then an immediate start during a quiet deaf restart is no longer swallowed.
+---
+ .../ComposerMicButton.meterOff.test.tsx       |   3 +
+ .../ComposerMicButton.serverStt.test.tsx      | 149 +++++++++++++++++-
+ .../ComposerMicButton.stall.test.tsx          |   3 +
+ web/src/components/ComposerMicButton.test.tsx |   1 +
+ web/src/components/ComposerMicButton.tsx      |  43 ++++-
+ web/src/hooks/useAeVoiceMode.test.tsx         |   9 ++
+ web/src/hooks/useAeVoiceMode.ts               |   4 +-
+ web/src/lib/aeVoiceServerStt.ts               |  14 ++
+ web/src/lib/dictation.ios.test.ts             |  50 +++++-
+ web/src/lib/dictation.ts                      |  16 +-
+ 10 files changed, 274 insertions(+), 18 deletions(-)
+
+diff --git a/web/src/components/ComposerMicButton.meterOff.test.tsx b/web/src/components/ComposerMicButton.meterOff.test.tsx
+index c5c5dee59243269fe51ff6e29c4c7380ad6fc8f6..85d604a1ff435fc6f122083995c1d97833323677 100644
+--- a/web/src/components/ComposerMicButton.meterOff.test.tsx
++++ b/web/src/components/ComposerMicButton.meterOff.test.tsx
+@@ -133,6 +133,8 @@ beforeEach(() => {
+   resetMicLevel();
+   resetVoiceBins();
+   window.localStorage.removeItem(VOICE_METER_KEY);
++  // These tests cover the browser path on iOS; the server path has its own file.
++  window.localStorage.setItem("omnigent:ae-voice-server-stt", "off");
+ });
+ 
+ afterEach(() => {
+@@ -141,6 +143,7 @@ afterEach(() => {
+   vi.useRealTimers();
+   vi.unstubAllGlobals();
+   window.localStorage.removeItem(VOICE_METER_KEY);
++  window.localStorage.removeItem("omnigent:ae-voice-server-stt");
+   delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+   if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
+   else delete (navigator as { userAgent?: unknown }).userAgent;
+diff --git a/web/src/components/ComposerMicButton.serverStt.test.tsx b/web/src/components/ComposerMicButton.serverStt.test.tsx
+index 99dd21b27f9d6c018c9782f101c40ab5ad39b7e4..9f68e493395c2522811ae85af4b0589bae9735af 100644
+--- a/web/src/components/ComposerMicButton.serverStt.test.tsx
++++ b/web/src/components/ComposerMicButton.serverStt.test.tsx
+@@ -81,11 +81,11 @@ afterEach(() => {
+   else delete (navigator as { userAgent?: unknown }).userAgent;
+ });
+ 
+-function setup() {
++function setup(info: ServerInfo | "loading" = INFO) {
+   const controller = { current: null as AeMicController | null };
+   const onListeningChange = vi.fn();
+   const view = render(
+-    <CapabilitiesContext.Provider value={INFO}>
++    <CapabilitiesContext.Provider value={info as ServerInfo}>
+       <ComposerMicButton
+         onTranscript={vi.fn()}
+         controller={controller}
+@@ -167,4 +167,149 @@ describe("ComposerMicButton (Voice mode on the server recognizer, iOS)", () => {
+     expect(formatVoiceLog()).toContain("server deaf");
+     expect(controller.current?.isListening()).toBe(false);
+   });
++
++  it("routes a Voice start on iOS to the server while serverInfo is loading", async () => {
++    setUserAgent(IOS_UA);
++    const { controller } = setup("loading");
++    expect(controller.current?.startPath()).toBe("server");
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).toHaveBeenCalledTimes(1);
++    expect(startSpy).not.toHaveBeenCalled();
++  });
++
++  it("keeps the browser path while loading when the setting is off", async () => {
++    setUserAgent(IOS_UA);
++    window.localStorage.setItem(VOICE_SERVER_STT_KEY, "off");
++    const { controller } = setup("loading");
++    expect(controller.current?.startPath()).toBe("browser");
++  });
++
++  it("resets the deaf restart budget on the next controller start", async () => {
++    setUserAgent(IOS_UA);
++    const { controller } = setup();
++    await act(async () => controller.current?.start());
++    await act(async () => sessionEvents?.onDeaf?.("silent"));
++    expect(sessionStartMock).toHaveBeenCalledTimes(2);
++    await act(async () => sessionEvents?.onDeaf?.("silent"));
++    expect(controller.current?.isListening()).toBe(false);
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).toHaveBeenCalledTimes(3);
++    // The new take gets its quiet restart again.
++    await act(async () => sessionEvents?.onDeaf?.("silent"));
++    expect(sessionStartMock).toHaveBeenCalledTimes(4);
++    expect(formatVoiceLog()).toContain("server deaf restart");
++  });
++
++  describe("a quiet deaf restart that is still connecting", () => {
++    function slowRestart() {
++      let release: () => void = () => {};
++      let calls = 0;
++      sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++        sessionEvents = events;
++        calls += 1;
++        if (calls === 2) {
++          await new Promise<void>((resolve) => {
++            release = resolve;
++          });
++        }
++        return { stop: vi.fn(async () => ""), cancel: cancelMock };
++      });
++      return () => release();
++    }
++
++    it("a stop during the connect drops the stream and ends the take", async () => {
++      setUserAgent(IOS_UA);
++      const release = slowRestart();
++      const { controller, onListeningChange } = setup();
++      await act(async () => controller.current?.start());
++      await act(async () => {
++        void sessionEvents?.onDeaf?.("silent");
++      });
++      cancelMock.mockClear();
++      act(() => controller.current?.stop());
++      expect(controller.current?.isListening()).toBe(false);
++      await act(async () => release());
++      expect(cancelMock).toHaveBeenCalledTimes(1);
++      expect(controller.current?.isListening()).toBe(false);
++      expect(onListeningChange).toHaveBeenCalledWith(false);
++    });
++
++    it("a start right after that stop is not swallowed and keeps the connection", async () => {
++      setUserAgent(IOS_UA);
++      const release = slowRestart();
++      const { controller } = setup();
++      await act(async () => controller.current?.start());
++      await act(async () => {
++        void sessionEvents?.onDeaf?.("silent");
++      });
++      cancelMock.mockClear();
++      act(() => controller.current?.stop());
++      act(() => controller.current?.start());
++      await act(async () => release());
++      expect(cancelMock).not.toHaveBeenCalled();
++      expect(controller.current?.isListening()).toBe(true);
++    });
++
++    it("a failed restart reports the take ended quietly", async () => {
++      setUserAgent(IOS_UA);
++      let calls = 0;
++      sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++        sessionEvents = events;
++        calls += 1;
++        if (calls === 2) throw new Error("ws closed");
++        return { stop: vi.fn(async () => ""), cancel: cancelMock };
++      });
++      const { controller, onListeningChange } = setup();
++      await act(async () => controller.current?.start());
++      await act(async () => sessionEvents?.onDeaf?.("silent"));
++      expect(controller.current?.isListening()).toBe(false);
++      expect(onListeningChange).toHaveBeenCalledTimes(2); // listening(true), then the failure
++      expect(onListeningChange).toHaveBeenLastCalledWith(false);
++    });
++  });
++
++  describe("unmounting while a take connects", () => {
++    function slowStart(nth: number) {
++      let release: () => void = () => {};
++      let calls = 0;
++      sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++        sessionEvents = events;
++        calls += 1;
++        if (calls === nth) {
++          await new Promise<void>((resolve) => {
++            release = resolve;
++          });
++        }
++        return { stop: vi.fn(async () => ""), cancel: cancelMock };
++      });
++      return () => release();
++    }
++
++    it("cancels a first take whose handshake resolves after unmount", async () => {
++      setUserAgent(IOS_UA);
++      const release = slowStart(1);
++      const { controller, view } = setup();
++      await act(async () => controller.current?.start());
++      view.unmount();
++      expect(cancelMock).not.toHaveBeenCalled();
++      await act(async () => release());
++      expect(cancelMock).toHaveBeenCalledTimes(1);
++      expect(formatVoiceLog()).toContain("dictation start after unmount, cancelled");
++    });
++
++    it("cancels a quiet deaf restart whose handshake resolves after unmount", async () => {
++      setUserAgent(IOS_UA);
++      const release = slowStart(2);
++      const { controller, view } = setup();
++      await act(async () => controller.current?.start());
++      await act(async () => {
++        void sessionEvents?.onDeaf?.("silent");
++      });
++      cancelMock.mockClear();
++      view.unmount();
++      await act(async () => release());
++      expect(cancelMock).toHaveBeenCalledTimes(1);
++      expect(formatVoiceLog()).toContain("dictation start after unmount, cancelled");
++    });
++  });
+ });
+diff --git a/web/src/components/ComposerMicButton.stall.test.tsx b/web/src/components/ComposerMicButton.stall.test.tsx
+index fa12189dd109be39f32fcf2abb4da0ab2683a488..7223bf107bbc4e02b9f0c716fb87d286968997a2 100644
+--- a/web/src/components/ComposerMicButton.stall.test.tsx
++++ b/web/src/components/ComposerMicButton.stall.test.tsx
+@@ -71,6 +71,8 @@ beforeEach(() => {
+   frames = [];
+   binValue = QUIET;
+   originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  // These tests cover the browser path on iOS; the server path has its own file.
++  window.localStorage.setItem("omnigent:ae-voice-server-stt", "off");
+   class FakeRecognition {
+     continuous = false;
+     interimResults = false;
+@@ -111,6 +113,7 @@ afterEach(() => {
+   cleanup();
+   vi.useRealTimers();
+   vi.unstubAllGlobals();
++  window.localStorage.removeItem("omnigent:ae-voice-server-stt");
+   delete (navigator as { mediaDevices?: unknown }).mediaDevices;
+   if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
+   else delete (navigator as { userAgent?: unknown }).userAgent;
+diff --git a/web/src/components/ComposerMicButton.test.tsx b/web/src/components/ComposerMicButton.test.tsx
+index c36ab3f64c1ea0df6a7b416604b2fb329d34a45a..9f3d68b52a77f58c34427a033190e87fd01716dc 100644
+--- a/web/src/components/ComposerMicButton.test.tsx
++++ b/web/src/components/ComposerMicButton.test.tsx
+@@ -1717,6 +1717,7 @@ describe("ComposerMicButton (WebKit synth wait)", () => {
+     Object.defineProperty(navigator, "userAgent", { configurable: true, value: IPHONE_UA });
+     synth = installFakeSpeech();
+     window.localStorage.clear();
++    window.localStorage.setItem("omnigent:ae-voice-server-stt", "off");
+     // The silent prime is speaking, as right after the Voice mode tap on a device voice.
+     primeVoicePlayback();
+     synth.speaking = true;
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index 89bb9e30b03d5e7cf875a63632a19a34dbc77869..773b37c1bb4e0a3640c8aedac5ce30acebb7f2ad 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -8,7 +8,7 @@ import { getMicStream } from "@/lib/aeAudioDevices";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+ import { publishVoiceBins, resetVoiceBins, syntheticVoiceBins } from "@/lib/aeVoiceLevel";
+ import { useVoiceMeter } from "@/lib/aeVoiceMeter";
+-import { useVoiceServerStt } from "@/lib/aeVoiceServerStt";
++import { isIosDevice, useVoiceServerStt } from "@/lib/aeVoiceServerStt";
+ import { logVoice } from "@/lib/aeVoiceLog";
+ import {
+   assertVoiceAudioSession,
+@@ -328,7 +328,10 @@ export const ComposerMicButton = ({
+   pathRef.current = !Ctor || (serverAvailable && isElectronShell()) ? "server" : "browser";
+   // True when a Voice mode (controller) start goes to the server recognizer on this device.
+   const voiceServerRef = useRef(false);
+-  voiceServerRef.current = serverAvailable && voiceServerSetting;
++  // While GET /v1/info is still loading, a Voice tap on iOS goes to the server anyway: the
++  // browser recognizer there is the deaf path, and a failed server start already falls back.
++  voiceServerRef.current =
++    (serverAvailable || (serverInfo === "loading" && isIosDevice())) && voiceServerSetting;
+   // Swaps the recognizer for a fresh one (set by the mount effect).
+   const replaceRecognitionRef = useRef<(keepLateFinal?: boolean) => void>(() => {});
+   const clearStartWatchdog = useCallback(() => {
+@@ -1065,6 +1068,13 @@ export const ComposerMicButton = ({
+ 
+   // Release the mic if the component unmounts mid-take (e.g. the
+   // new-chat dialog closes while dictating).
++  const mountedRef = useRef(true);
++  useEffect(() => {
++    mountedRef.current = true;
++    return () => {
++      mountedRef.current = false;
++    };
++  }, []);
+   useEffect(
+     () => () => {
+       sessionRef.current?.cancel();
+@@ -1454,6 +1464,13 @@ export const ComposerMicButton = ({
+         },
+         { deafCheck: voiceServerTakeRef.current },
+       );
++      if (!mountedRef.current) {
++        // Unmounted while the handshake ran (a first take or a quiet restart): nothing is left
++        // to own this session, so close it and release the mic.
++        logVoice("dictation start after unmount, cancelled");
++        next.cancel();
++        return;
++      }
+       if (withdrawRef.current) {
+         // Voice mode stopped the mic while it was still connecting: drop the stream at once.
+         withdrawRef.current = false;
+@@ -1530,7 +1547,8 @@ export const ComposerMicButton = ({
+     // A Voice mode start on iPhone or iPad also goes straight to the server: Apple's
+     // recognizer goes deaf after a spoken reply. Manual mic taps keep the browser path.
+     if (pathRef.current === "server" || (voiceServerRef.current && controllerStartRef.current)) {
+-      if (!serverAvailable) return false;
++      const serverUsable = pathRef.current === "server" ? serverAvailable : voiceServerRef.current;
++      if (!serverUsable) return false;
+       void toggleServer();
+       return true;
+     }
+@@ -1685,9 +1703,17 @@ export const ComposerMicButton = ({
+ 
+     const start = () => {
+       if (listeningRef.current || requestedRef.current) return;
++      serverDeafRestartsRef.current = 0;
++      if (serverRestartingRef.current && withdrawRef.current) {
++        // A stop withdrew the quiet restart that is still connecting, and now a start came:
++        // keep that connection as the new take instead of cancelling it.
++        requestedRef.current = true;
++        withdrawRef.current = false;
++        voiceTakeRef.current = true;
++        return;
++      }
+       requestedRef.current = true;
+       controllerStartRef.current = true;
+-      serverDeafRestartsRef.current = 0;
+       if (toggle()) {
+         // A new start replaces any earlier withdrawn one.
+         withdrawRef.current = false;
+@@ -1757,8 +1783,13 @@ export const ComposerMicButton = ({
+         if (listeningRef.current) {
+           requestedRef.current = false;
+           // A quiet deaf restart still connecting: drop its stream the moment it arrives.
+-          if (serverRestartingRef.current) withdrawRef.current = true;
+-          else toggle();
++          if (serverRestartingRef.current) {
++            withdrawRef.current = true;
++            // The old take is already gone: the mic is stopped now, so a start right after
++            // this stop is not swallowed by a stale "listening".
++            listeningRef.current = false;
++            setIsListening(false);
++          } else toggle();
+         } else if (requestedRef.current) {
+           // Still connecting: cancel the start, or drop the stream the moment it connects.
+           requestedRef.current = false;
+diff --git a/web/src/hooks/useAeVoiceMode.test.tsx b/web/src/hooks/useAeVoiceMode.test.tsx
+index 136b707a3197e535ec3820f9381b7b5a5d1ad109..0ca1159bb132c199dc3b0ab9a7db4a1be815a026 100644
+--- a/web/src/hooks/useAeVoiceMode.test.tsx
++++ b/web/src/hooks/useAeVoiceMode.test.tsx
+@@ -868,6 +868,15 @@ describe("useAeVoiceMode", () => {
+       expect(submit).not.toHaveBeenCalled();
+     });
+ 
++    it("accepts a punctuated server-recognizer final and sends no message after it", () => {
++      const { result } = mountApproval();
++      act(() => void result.current.onFinal("Run it."));
++      expect(submitApproval).toHaveBeenCalledTimes(1);
++      expect(submitApproval).toHaveBeenCalledWith("a1", "accept", undefined, { source: "voice" });
++      act(() => void vi.advanceTimersByTime(5000));
++      expect(submit).not.toHaveBeenCalled();
++    });
++
+     it.each(["decline", "no", "cancel"])("declines when %s is said", (said) => {
+       const { result } = mountApproval();
+       act(() => void result.current.onFinal(said));
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index 875604b5eace56c7b2333c9b928832378788c238..91ba2363f026092e000701c1c04b82f75514558c 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -35,7 +35,7 @@ import { activeEchoWords, resetEcho, splitEcho } from "@/lib/aeVoiceEcho";
+ import { withApprovalSource } from "@/lib/aeApprovalSource";
+ import { logVoice, uploadVoiceLog, useVoiceLogOnHide } from "@/lib/aeVoiceLog";
+ import { useMicWhileSpeaking } from "@/lib/aeVoiceMic";
+-import { unlockVoiceAudioContext } from "@/lib/aeVoiceServerStt";
++import { resumeVoiceAudioContext, unlockVoiceAudioContext } from "@/lib/aeVoiceServerStt";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ /** If the chat never shows a turn after a send, stop waiting for it. */
+@@ -306,6 +306,8 @@ export function useAeVoiceMode({
+       controller.current?.stop();
+       onListeningRef.current(false);
+     }, MIC_START_NET_MS);
++    // No tap here (auto-arm, chat switch): wake the context a tap made earlier, if any.
++    resumeVoiceAudioContext();
+     mic.start();
+   }, [controller, clearNet]);
+ 
+diff --git a/web/src/lib/aeVoiceServerStt.ts b/web/src/lib/aeVoiceServerStt.ts
+index 839cc9a56c6e7e0d70e981e17137743d243b0d83..08733d79df856dd737884943dc8fa68cff8b67cd 100644
+--- a/web/src/lib/aeVoiceServerStt.ts
++++ b/web/src/lib/aeVoiceServerStt.ts
+@@ -91,6 +91,20 @@ export function unlockVoiceAudioContext(): void {
+   }
+ }
+ 
++/**
++ * Resumes the tap-unlocked context when one exists, without making one. For a Voice mode start
++ * with no gesture (auto-arm, chat switch): a context made outside a tap would start suspended.
++ */
++export function resumeVoiceAudioContext(): void {
++  const ctx = getSharedVoiceAudioContext();
++  if (!ctx || ctx.state === "running") return;
++  try {
++    void Promise.resolve(ctx.resume?.()).catch(() => {});
++  } catch {
++    // Best effort; DictationSession logs a context that is still not running.
++  }
++}
++
+ /** Test seam: forget the shared context. */
+ export function resetSharedVoiceAudioContext(): void {
+   sharedCtx = null;
+diff --git a/web/src/lib/dictation.ios.test.ts b/web/src/lib/dictation.ios.test.ts
+index 099207281bacd827ff31da6799633a24c2162384..c55e7cab24516a7f4a58f14aeea380e064899c44 100644
+--- a/web/src/lib/dictation.ios.test.ts
++++ b/web/src/lib/dictation.ios.test.ts
+@@ -200,7 +200,7 @@ describe("DictationSession on iOS", () => {
+ });
+ 
+ describe("DictationSession deaf check", () => {
+-  it("reports silence after the constant, but not while sound arrives", async () => {
++  it("reports a take that never heard a non-zero sample", async () => {
+     setUserAgent(IOS_UA);
+     vi.useFakeTimers();
+     const ev = events();
+@@ -208,17 +208,55 @@ describe("DictationSession deaf check", () => {
+     await vi.advanceTimersByTimeAsync(0);
+     const session = await p;
+     const port = nodes[0].port;
+-    // Sound at 3 s keeps the take alive past 4 s.
+-    await vi.advanceTimersByTimeAsync(3000);
+-    port.onmessage?.(chunk(0, 5, 0));
+-    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS - 1000);
++    const tick = setInterval(() => port.onmessage?.(chunk(0, 0, 0)), 100);
++    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS - 600);
+     expect(ev.onDeaf).not.toHaveBeenCalled();
+-    await vi.advanceTimersByTimeAsync(2000);
++    await vi.advanceTimersByTimeAsync(1200);
++    clearInterval(tick);
+     expect(ev.onDeaf).toHaveBeenCalledWith("silent");
+     expect(ev.onDeaf).toHaveBeenCalledTimes(1);
+     session.cancel();
+   });
+ 
++  it("is never deaf once any non-zero sample arrived, even tiny ones then long zeros", async () => {
++    setUserAgent(IOS_UA);
++    vi.useFakeTimers();
++    const ev = events();
++    const p = DictationSession.start(ev, { deafCheck: true });
++    await vi.advanceTimersByTimeAsync(0);
++    const session = await p;
++    const port = nodes[0].port;
++    await vi.advanceTimersByTimeAsync(1000);
++    port.onmessage?.(chunk(0, 1, 0));
++    // A quiet room: exact zeros for far longer than the deaf window.
++    const tick = setInterval(() => port.onmessage?.(chunk(0, 0, 0)), 100);
++    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS * 3);
++    clearInterval(tick);
++    expect(ev.onDeaf).not.toHaveBeenCalled();
++    session.cancel();
++  });
++
++  it("reports a context that is not running at the check", async () => {
++    setUserAgent(IOS_UA);
++    vi.useFakeTimers();
++    const ev = events();
++    const p = DictationSession.start(ev, { deafCheck: true });
++    await vi.advanceTimersByTimeAsync(0);
++    const session = await p;
++    contexts[0].state = "suspended";
++    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS + 600);
++    expect(ev.onDeaf).toHaveBeenCalledWith("silent");
++    expect(formatVoiceLog()).toContain("dictation deaf ctx");
++    session.cancel();
++  });
++
++  it("logs when no tap made the shared context", async () => {
++    setUserAgent(IOS_UA);
++    const session = await DictationSession.start(events());
++    expect(formatVoiceLog()).toContain("dictation ctx not unlocked");
++    session.cancel();
++  });
++
+   it("reports a track that stays muted", async () => {
+     setUserAgent(IOS_UA);
+     vi.useFakeTimers();
+diff --git a/web/src/lib/dictation.ts b/web/src/lib/dictation.ts
+index 066358eba433f1ed16ee6efe7a048b49b1cb76f0..dce29be41e54a39aea36aed32983fbb43b7e6752 100644
+--- a/web/src/lib/dictation.ts
++++ b/web/src/lib/dictation.ts
+@@ -241,7 +241,6 @@ export class DictationSession {
+   private samplesSent = 0;
+   private peak = 0;
+   private firstSoundAt: number | null = null;
+-  private lastSoundAt = Date.now();
+   private mutedSince: number | null = null;
+   private deafTimer: ReturnType<typeof setInterval> | null = null;
+ 
+@@ -351,6 +350,8 @@ export class DictationSession {
+         shared = true;
+       } else if (ios) {
+         // iOS runs at its native rate; the worklet downsamples. The rate hint is not asked for.
++        // No Voice tap made a context (an auto-arm or chat switch): this one may stay suspended.
++        logVoice("dictation ctx not unlocked", "no shared context, making one");
+         audioContext = new AudioContext();
+       } else {
+         // Ask for the target rate directly — Chrome/Firefox resample the
+@@ -363,6 +364,9 @@ export class DictationSession {
+         }
+       }
+       await resumeCapped(audioContext);
++      if (ios && audioContext.state !== "running") {
++        logVoice("dictation ctx not unlocked", audioContext.state);
++      }
+       logVoice(
+         "dictation ctx",
+         `${audioContext.state} ${audioContext.sampleRate} Hz${shared ? " shared" : ""}`,
+@@ -422,7 +426,6 @@ export class DictationSession {
+         this.firstSoundAt = now;
+         logVoice("dictation first sound", `${now - this.createdAt} ms`);
+       }
+-      this.lastSoundAt = now;
+       if (peak > this.peak) this.peak = peak;
+     }
+     this.events.onLevel?.(peak / 0x8000);
+@@ -433,7 +436,14 @@ export class DictationSession {
+     const now = Date.now();
+     let reason: "silent" | "muted" | null = null;
+     if (this.mutedSince !== null && now - this.mutedSince >= DEAF_SILENT_MS) reason = "muted";
+-    else if (now - this.lastSoundAt >= DEAF_SILENT_MS) reason = "silent";
++    else if (this.firstSoundAt === null && now - this.createdAt >= DEAF_SILENT_MS) {
++      // Deaf only while no non-zero sample has ever arrived (this also covers a context that is
++      // not running at the check). iOS voice processing can send runs of exact zeros in a quiet
++      // room, so a take that heard anything is never deaf for its lifetime.
++      reason = "silent";
++      if (this.audioContext.state !== "running")
++        logVoice("dictation deaf ctx", this.audioContext.state);
++    }
+     if (reason === null) return;
+     this.clearDeafTimer();
+     logVoice("dictation deaf", reason);

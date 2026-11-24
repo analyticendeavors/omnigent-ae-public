@@ -1,0 +1,311 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:34:57 -0800
+Subject: [PATCH 402/443] [ae-patch] Keep a harness compaction's spinner
+ through turn ends
+
+A claude-native harness compaction can outlive the turn that started it, but the page deleted its spinner (and the defrag strip hid) when that turn settled. The server now marks harness-reported in_progress events background=true, and the page keeps background spinners through turn settles until completed, failed, or an explicit Stop.
+---
+ omnigent/server/routes/_sessions/helpers.py   | 16 ++++--
+ .../server/routes/sessions/routes_events.py   |  4 +-
+ omnigent/server/schemas.py                    |  4 ++
+ .../integration/test_sessions_compact.py      | 31 +++++++++++
+ web/src/lib/blockStream.ts                    |  1 +
+ web/src/lib/blocks.ts                         |  5 ++
+ web/src/lib/events.ts                         |  5 ++
+ web/src/lib/sse.test.ts                       | 10 ++++
+ web/src/lib/sse.ts                            |  1 +
+ web/src/store/chatStore.test.ts               | 54 +++++++++++++++++++
+ web/src/store/chatStore.ts                    | 12 ++++-
+ 11 files changed, 135 insertions(+), 8 deletions(-)
+
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index bc226bb58b28916dca0a98da94646b5388763989..88b61d19fa3ff46ea84289f2bf3f1124a0d7d776 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -1746,7 +1746,7 @@ def _publish_input_consumed(
+ _compaction_started_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
+ 
+ 
+-def _publish_compaction_in_progress(session_id: str) -> None:
++def _publish_compaction_in_progress(session_id: str, *, background: bool = False) -> None:
+     """
+     Publish the standard compaction progress event to a session stream.
+ 
+@@ -1756,12 +1756,18 @@ def _publish_compaction_in_progress(session_id: str) -> None:
+ 
+     :param session_id: Session/conversation identifier,
+         e.g. ``"conv_abc123"``.
++    :param background: ``True`` when a terminal harness owns the compaction
++        and it can outlive the turn; adds ``"background": True`` so clients
++        keep the spinner through turn ends.
+     """
+     started_at = _compaction_started_at.setdefault(session_id, int(time.time()))
+-    session_stream.publish(
+-        session_id,
+-        {"type": "response.compaction.in_progress", "started_at": started_at},
+-    )
++    payload: dict[str, object] = {
++        "type": "response.compaction.in_progress",
++        "started_at": started_at,
++    }
++    if background:
++        payload["background"] = True
++    session_stream.publish(session_id, payload)
+ 
+ 
+ def _publish_compaction_completed(session_id: str, total_tokens: int | None) -> None:
+diff --git a/omnigent/server/routes/sessions/routes_events.py b/omnigent/server/routes/sessions/routes_events.py
+index 760f5e8d68cefe9d53f88fef35076f5515dc5a89..cdef9b2695ed7dfcbf171369a6c9083af7191b7d 100644
+--- a/omnigent/server/routes/sessions/routes_events.py
++++ b/omnigent/server/routes/sessions/routes_events.py
+@@ -2166,7 +2166,9 @@ def register_events_routes(
+                     code=ErrorCode.INVALID_INPUT,
+                 )
+             if compaction_status == "in_progress":
+-                _publish_compaction_in_progress(session_id)
++                # The terminal harness owns this compaction and always
++                # brackets it with completed or failed; it can outlive the turn.
++                _publish_compaction_in_progress(session_id, background=True)
+             elif compaction_status == "completed":
+                 _publish_compaction_completed(session_id, None)
+             else:
+diff --git a/omnigent/server/schemas.py b/omnigent/server/schemas.py
+index 9605f844b056517ebdcd53815785650a5cb385d8..542a1720767bb689025309a847a0a298138bb46f 100644
+--- a/omnigent/server/schemas.py
++++ b/omnigent/server/schemas.py
+@@ -4556,10 +4556,14 @@ class CompactionInProgressEvent(_SSEEventBase):
+         events for the same compaction, so clients can anchor an elapsed
+         counter to the true start — including after a page reload. ``None``
+         when the emitter does not track it.
++    :param background: ``True`` when a terminal harness owns the compaction;
++        it can outlive the turn, so clients keep the indicator through turn
++        ends until completed or failed arrives. Omitted otherwise.
+     """
+ 
+     type: Literal["response.compaction.in_progress"]
+     started_at: int | None = None
++    background: bool | None = None
+ 
+ 
+ class CompactionCompletedEvent(_SSEEventBase):
+diff --git a/tests/server/integration/test_sessions_compact.py b/tests/server/integration/test_sessions_compact.py
+index 082d759feb2663bdcb693a77ff461dbd191a99c2..dcb40aa8b417544a2ebdaf78795b81faf6780b64 100644
+--- a/tests/server/integration/test_sessions_compact.py
++++ b/tests/server/integration/test_sessions_compact.py
+@@ -359,6 +359,37 @@ async def test_external_compaction_status_publishes_compaction_sse(
+         assert "total_tokens" not in published[0][1], (
+             f"completed from the hook path must omit total_tokens; got {published[0][1]!r}."
+         )
++    # The terminal harness owns this compaction and it can outlive the turn,
++    # so in_progress is flagged background; the other edges carry no flag.
++    if status == "in_progress":
++        assert published[0][1].get("background") is True, (
++            f"harness in_progress must carry background=True; got {published[0][1]!r}."
++        )
++    else:
++        assert "background" not in published[0][1]
++
++
++async def test_server_run_compaction_in_progress_has_no_background_key(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A server-run compaction's in_progress payload carries no background key."""
++    from omnigent.server.routes._sessions import helpers
++
++    published: list[dict[str, Any]] = []
++
++    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
++        """Capture session-stream events emitted by the helpers."""
++        published.append(event)
++
++    monkeypatch.setattr(
++        "omnigent.server.routes.sessions.session_stream.publish",
++        capture_publish,
++    )
++    helpers._publish_compaction_in_progress("conv_server_run_bg_test")
++    helpers._publish_compaction_completed("conv_server_run_bg_test", None)
++    assert len(published) == 2
++    assert published[0]["type"] == "response.compaction.in_progress"
++    assert "background" not in published[0], published[0]
+ 
+ 
+ async def test_external_compaction_status_anchors_started_at_to_first_report(
+diff --git a/web/src/lib/blockStream.ts b/web/src/lib/blockStream.ts
+index f844a9ed646ba0b57c32c2c99e3e9cded2b1f57c..ae69811677b71611bcdc37f06156d1d35cc3cf59 100644
+--- a/web/src/lib/blockStream.ts
++++ b/web/src/lib/blockStream.ts
+@@ -804,6 +804,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
+         type: "compaction_loading",
+         ctx: ctx(state),
+         ...(event.startedAtS !== undefined ? { startedAtS: event.startedAtS } : {}),
++        ...(event.background === true ? { background: true as const } : {}),
+       } satisfies CompactionInProgressBlock;
+       return;
+     }
+diff --git a/web/src/lib/blocks.ts b/web/src/lib/blocks.ts
+index bfc653a8ca0afa8db7543429da396bcea49836c1..bd9a9f2675f576d03b9e4248ad424b5424c64fcf 100644
+--- a/web/src/lib/blocks.ts
++++ b/web/src/lib/blocks.ts
+@@ -575,6 +575,11 @@ export interface CompactionInProgressBlock {
+    * when the emitter doesn't track it (fall back to client receive time).
+    */
+   startedAtS?: number;
++  /**
++   * Harness-owned compaction: it outlives the turn, so a turn settle keeps
++   * this spinner; only completed, failed, or an explicit Stop clears it.
++   */
++  background?: true;
+ }
+ 
+ /** Conversation compaction finished. Emitted from `response.compaction.completed`. */
+diff --git a/web/src/lib/events.ts b/web/src/lib/events.ts
+index 3d720deaca9dce8ca913d72387d7a82bfba30904..21124e2b6d02572144b0d600176f00f003042572 100644
+--- a/web/src/lib/events.ts
++++ b/web/src/lib/events.ts
+@@ -464,6 +464,11 @@ export interface ErrorEvent {
+ /** `response.compaction.in_progress` — server started compacting. */
+ export interface CompactionInProgress {
+   type: "compaction_in_progress";
++  /**
++   * Harness-owned compaction: it outlives the turn and is cleared only by
++   * completed, failed, or an explicit Stop.
++   */
++  background?: boolean;
+   /**
+    * Unix epoch seconds when the server first saw this compaction in
+    * progress. Stable across the repeated progress events a long compaction
+diff --git a/web/src/lib/sse.test.ts b/web/src/lib/sse.test.ts
+index 4494dbcee20fd9bb9203c0cea106068184bd61ce..37f3d3e981f62db82bf9ce32bcd72f2b38c9d7c9 100644
+--- a/web/src/lib/sse.test.ts
++++ b/web/src/lib/sse.test.ts
+@@ -443,6 +443,16 @@ describe("parseEvent — response.compaction.in_progress", () => {
+     expect(ev).toEqual({ type: "compaction_in_progress", startedAtS: 1_700_000_123 });
+   });
+ 
++  it("parses background:true and omits it otherwise", () => {
++    expect(parseEvent("response.compaction.in_progress", { background: true })).toEqual({
++      type: "compaction_in_progress",
++      background: true,
++    });
++    expect(parseEvent("response.compaction.in_progress", { background: false })).toEqual({
++      type: "compaction_in_progress",
++    });
++  });
++
+   it("omits startedAtS when the emitter does not track a start", () => {
+     const ev = parseEvent("response.compaction.in_progress", {});
+     expect(ev).toEqual({ type: "compaction_in_progress" });
+diff --git a/web/src/lib/sse.ts b/web/src/lib/sse.ts
+index 3de7cd377eb3089e65bd83e6e2f9c147ffd2a1da..e0c3df21493df7bf485e14fdf420272da00c09ac 100644
+--- a/web/src/lib/sse.ts
++++ b/web/src/lib/sse.ts
+@@ -515,6 +515,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
+     return {
+       type: "compaction_in_progress",
+       ...(typeof startedAt === "number" ? { startedAtS: startedAt } : {}),
++      ...(data.background === true ? { background: true } : {}),
+     } satisfies CompactionInProgress;
+   }
+   if (eventType === "response.compaction.completed") {
+diff --git a/web/src/store/chatStore.test.ts b/web/src/store/chatStore.test.ts
+index 618878dc2c4de159ae778e2754fc1832b560ffe3..19deae792af5f19ce1f213fb67b50cdf7a3b3c63 100644
+--- a/web/src/store/chatStore.test.ts
++++ b/web/src/store/chatStore.test.ts
+@@ -18200,6 +18200,60 @@ describe("chatStore — compaction spinner follows its turn", () => {
+     controller.abort();
+   });
+ 
++  it("a harness compaction keeps its spinner when the turn ends and a user message arrives mid-compaction", async () => {
++    const { sink, controller } = startPump("conv_bg_compact");
++    sink.push(turnEvent("response.created", "resp_a"));
++    sink.push(sse("response.compaction.in_progress", { started_at: 1_700_000_000, background: true }));
++    await tick();
++    sink.push(turnEvent("response.completed", "resp_a"));
++    await tick();
++    expect(useChatStore.getState().activeResponse?.state).toBe("completed");
++    expect(spinnerIds()).toEqual(["resp_a"]);
++
++    sink.push(turnEvent("response.created", "resp_b"));
++    sink.push(turnEvent("response.completed", "resp_b"));
++    await tick();
++    expect(spinnerIds().length).toBe(1);
++
++    sink.push(sse("response.compaction.completed", {}));
++    await tick();
++    const blocks = useChatStore.getState().blocks;
++    expect(blocks.some((b) => b.type === "compaction")).toBe(true);
++    const bubbles = buildBubbles(blocks, useChatStore.getState().activeResponse);
++    expect(bubbles.some((b) => b.kind === "compaction_loading")).toBe(false);
++    expect(bubbles.some((b) => b.kind === "compaction")).toBe(true);
++
++    controller.abort();
++  });
++
++  it("an explicit Stop removes a harness compaction's spinner", async () => {
++    const { sink, controller } = startPump("conv_bg_compact_stop");
++    sink.push(turnEvent("response.created", "resp_a"));
++    sink.push(sse("response.compaction.in_progress", { background: true }));
++    await tick();
++    expect(spinnerIds()).toEqual(["resp_a"]);
++
++    sink.push(
++      sse("session.interrupted", { data: { requested_at: 1, response_id: "resp_a" } }),
++    );
++    await tick();
++    expect(spinnerIds()).toEqual([]);
++
++    controller.abort();
++  });
++
++  it("a server-run (non-background) spinner is still removed when its turn settles", async () => {
++    const { sink, controller } = startPump("conv_nonbg_compact");
++    sink.push(turnEvent("response.created", "resp_a"));
++    sink.push(sse("response.compaction.in_progress", {}));
++    await tick();
++    sink.push(turnEvent("response.completed", "resp_a"));
++    await tick();
++    expect(spinnerIds()).toEqual([]);
++
++    controller.abort();
++  });
++
+   it("keeps a spinner published after its turn settled when that terminal repeats", async () => {
+     const { sink, controller } = startPump("conv_turn_repeat");
+     sink.push(turnEvent("response.created", "resp_done"));
+diff --git a/web/src/store/chatStore.ts b/web/src/store/chatStore.ts
+index 4edcc1f4368c17c0ffbbe6c97f97e4413177de12..0e257012973656592e5cee7511c21e52ccd2a8df 100644
+--- a/web/src/store/chatStore.ts
++++ b/web/src/store/chatStore.ts
+@@ -6127,13 +6127,20 @@ export function adoptCompactionSpinners(blocks: AnyBlock[], responseId: string):
+  * Remove "Compacting…" spinners owned by the just-settled turn; a lost
+  * compaction terminal is not replayed.
+  *
++ * Harness-owned (`background`) spinners survive a turn settle, because that
++ * compaction outlives the turn; only `includeBackground` (explicit Stop) removes them.
++ *
+  * @returns the remaining blocks, or `null` when the turn owned no spinner.
+  */
+ export function withoutSettledCompactionSpinners(
+   blocks: AnyBlock[],
+   responseId: string,
++  opts?: { includeBackground?: boolean },
+ ): AnyBlock[] | null {
+-  const owned = (b: AnyBlock) => b.type === "compaction_loading" && b.ctx.responseId === responseId;
++  const owned = (b: AnyBlock) =>
++    b.type === "compaction_loading" &&
++    b.ctx.responseId === responseId &&
++    (opts?.includeBackground === true || b.background !== true);
+   if (!blocks.some(owned)) return null;
+   return blocks.filter((b) => !owned(b));
+ }
+@@ -7883,7 +7890,8 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
+       // native stop may name no turn, so the stop itself retires the spinner.
+       applyToConversation((s) => {
+         const stopped = s.activeResponse?.responseId;
+-        const blocks = stopped ? withoutSettledCompactionSpinners(s.blocks, stopped) : null;
++        const blocks = stopped ? withoutSettledCompactionSpinners(s.blocks, stopped, { includeBackground: true })
++          : null;
+         return blocks === null ? {} : { blocks };
+       });
+       return;

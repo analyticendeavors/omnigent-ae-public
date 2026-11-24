@@ -26,6 +26,7 @@ set -euo pipefail
 BACKUP_DIR="${AE_BACKUP_DIR:-/secure/omnigent/backups}"
 KEEP="${AE_BACKUP_KEEP:-7}"
 COMPOSE="$ROOT/deploy/compose.sh"
+AE_GATE="${AE_GATE:-/usr/local/sbin/ae-gate}"
 
 # Without this an unmounted /secure means the dump lands in the plain directory
 # underneath the mountpoint and the run reports success, the one failure mode a
@@ -50,9 +51,20 @@ trap 'rm -f -- "${tmp:?}"' EXIT
 # POSTGRES_USER and POSTGRES_DB compose set. pipefail makes a pg_dump failure
 # fail the whole line even though gzip would exit 0. The single quotes are
 # deliberate: the variables expand inside the container, not here.
-# shellcheck disable=SC2016
-"$COMPOSE" exec -T postgres sh -c 'exec pg_dump --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
-  | gzip -9 > "$tmp"
+# Root hardening: with the root-owned gate installed the same pg_dump streams from
+# `omnigent pg-dump --stdout`. This unit runs as root, which the gate accepts without sudo; any
+# other user goes through sudo -n. The compose arm is removed after the cutover.
+if [ -x "$AE_GATE" ]; then
+  if [ "$(id -u)" -eq 0 ]; then
+    "$AE_GATE" omnigent pg-dump --stdout | gzip -9 > "$tmp"
+  else
+    sudo -n "$AE_GATE" omnigent pg-dump --stdout | gzip -9 > "$tmp"
+  fi
+else
+  # shellcheck disable=SC2016
+  "$COMPOSE" exec -T postgres sh -c 'exec pg_dump --no-owner --no-privileges -U "$POSTGRES_USER" -d "$POSTGRES_DB"' \
+    | gzip -9 > "$tmp"
+fi
 
 gzip -t "$tmp" || die "$tmp is not a valid gzip stream; the dump was cut short"
 [ -s "$tmp" ] || die "$tmp is empty; is the stack up? (deploy/compose.sh ps)"

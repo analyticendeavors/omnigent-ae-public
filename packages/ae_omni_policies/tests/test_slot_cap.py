@@ -7,6 +7,7 @@ from typing import Any
 import pytest
 from omnigent.entities import PagedList
 from omnigent.entities.conversation import Conversation
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from sqlalchemy.exc import OperationalError
 
 from ae_omni_policies import labels, sessions
@@ -387,14 +388,19 @@ def test_the_compact_save_prompt_passes_full_slots_and_words_before_it_do_not(
     store: _Store, mode: str
 ) -> None:
     # 2026-11-06: the queued Compact's save prompt continues work; it must not turn into a card.
-    from ae_omni_policies.continuation import COMPACT_PREP_TEXT
+    from ae_omni_policies.continuation import (
+        COMPACT_CANCELLED_TEXT,
+        COMPACT_PREP_TEXT,
+        COMPACT_RESUME_TEXT,
+    )
 
     store.rows = THREE
     own = {labels.STATUS: "review"}
     store.own[OWN] = _conv(OWN, "Ship the card", own)
-    assert slot_cap(mode=mode)(_request(COMPACT_PREP_TEXT, own)) == {"result": "ALLOW"}
-    typed = slot_cap(mode=mode)(_request("Also do this. " + COMPACT_PREP_TEXT, own))
-    assert typed is not None and typed["result"] in ("ASK", "DENY")
+    for note in (COMPACT_PREP_TEXT, COMPACT_RESUME_TEXT, COMPACT_CANCELLED_TEXT):
+        assert slot_cap(mode=mode)(_request(note, own)) == {"result": "ALLOW"}
+        typed = slot_cap(mode=mode)(_request("Also do this. " + note, own))
+        assert typed is not None and typed["result"] in ("ASK", "DENY")
 
 
 @pytest.mark.parametrize("mode", ["warn", "block"])
@@ -913,3 +919,88 @@ def test_the_warn_text_keeps_the_shape_the_web_card_parses() -> None:
         "Accept to run it as overflow, or decline, then "
         "park one in the Parking Lot (https://lot.example/p) or flip one to review."
     )
+
+
+def _side_chat(id: str, source: str) -> Conversation:
+    """A working side chat: it inherited ``ae.status`` from its source when forked."""
+    return _working(
+        id,
+        "Side chat",
+        NOW - 60,
+        **{SIDE_CHAT_LABEL_KEY: "1", SIDE_CHAT_SOURCE_LABEL_KEY: source},
+    )
+
+
+def test_a_side_chat_of_an_archived_source_holds_no_slot(store: _Store) -> None:
+    # 2026-11-17: archiving a lead left its side chats working and counted, but hidden.
+    archived = _conv("c_gone", "Archived lead")
+    archived.archived = True
+    store.own["c_gone"] = archived
+    store.rows = [*THREE[:2], _side_chat("side1", "c_gone")]
+    result = slot_cap(mode="block")(_request())
+    assert result is not None and result["result"] == "ALLOW"
+
+
+def test_a_side_chat_of_a_deleted_source_holds_no_slot(store: _Store) -> None:
+    store.rows = [*THREE[:2], _side_chat("side1", "c_deleted")]
+    result = slot_cap(mode="block")(_request())
+    assert result is not None and result["result"] == "ALLOW"
+
+
+def test_a_side_chat_of_a_listed_source_still_counts(store: _Store) -> None:
+    store.rows = [*THREE[:2], _side_chat("side1", "c1")]
+    result = slot_cap(mode="block")(_request())
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_a_side_chat_of_a_live_source_outside_the_row_cap_still_counts(store: _Store) -> None:
+    # list_top_level stops at MAX_ROWS, so a live source can be missing from the rows.
+    store.own["c_old"] = _conv("c_old", "Old lead")
+    store.rows = [*THREE[:2], _side_chat("side1", "c_old")]
+    result = slot_cap(mode="block")(_request())
+    assert result is not None and result["result"] == "DENY"
+
+
+def test_drop_orphan_side_chats_keeps_unsourced_and_looks_each_source_up_once(
+    store: _Store,
+) -> None:
+    unsourced = _working("side0", "No source", NOW - 60, **{SIDE_CHAT_LABEL_KEY: "1"})
+    rows = [
+        THREE[0],
+        unsourced,
+        _side_chat("side1", "c_deleted"),
+        _side_chat("side2", "c_deleted"),
+    ]
+    lookups: list[str] = []
+    real_get = store.get_conversation
+    store.get_conversation = lambda cid: (lookups.append(cid), real_get(cid))[1]  # type: ignore[method-assign]
+    kept = sessions.drop_orphan_side_chats(rows)
+    assert [row.id for row in kept] == ["c1", "side0"]
+    assert lookups == ["c_deleted"]
+
+
+def test_a_nested_chain_off_an_archived_source_holds_no_slot(store: _Store) -> None:
+    # Archived R, live side chat A of R, live side chat B of A: B's source is a row, but A goes.
+    archived = _conv("c_gone", "Archived lead")
+    archived.archived = True
+    store.own["c_gone"] = archived
+    a = _side_chat("sideA", "c_gone")
+    b = _side_chat("sideB", "sideA")
+    store.rows = [*THREE[:2], a, b]
+    assert [row.id for row in sessions.drop_orphan_side_chats(store.rows)] == ["c1", "c2"]
+    result = slot_cap(mode="block")(_request())
+    assert result is not None and result["result"] == "ALLOW"
+
+
+def test_a_nested_chain_off_a_listed_source_still_counts(store: _Store) -> None:
+    rows = [THREE[0], _side_chat("sideA", "c1"), _side_chat("sideB", "sideA")]
+    assert [row.id for row in sessions.drop_orphan_side_chats(rows)] == ["c1", "sideA", "sideB"]
+
+
+def test_a_malformed_source_label_keeps_the_row_and_does_not_raise(store: _Store) -> None:
+    def boom(_cid: str) -> None:
+        raise ValueError("bad id")
+
+    store.get_conversation = boom  # type: ignore[method-assign]
+    rows = [THREE[0], _side_chat("side1", "not a session")]
+    assert [row.id for row in sessions.drop_orphan_side_chats(rows)] == ["c1", "side1"]

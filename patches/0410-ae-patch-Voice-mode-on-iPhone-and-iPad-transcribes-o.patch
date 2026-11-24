@@ -1,0 +1,1497 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 19:55:20 -0800
+Subject: [PATCH 410/443] [ae-patch] Voice mode on iPhone and iPad transcribes
+ on the box instead of Apple's recognizer
+
+Apple's recognizer goes deaf after any spoken reply on iOS 18. A Voice mode start on iPhone or iPad now uses the server dictation stream (default on, per-device switch Transcribe on the box). Manual mic taps keep the browser path. The dictation session skips the sample-rate hint on iOS, resumes its audio context, reuses one context unlocked inside the Voice tap, logs timings and levels, and restarts once (then reports deaf) when a take hears only silence. The level meter no longer opens a second capture on such a take. The Voice sheet's keyboard button now lines up with End.
+---
+ web/src/components/AeSpeakRepliesButton.tsx   |   4 +
+ .../AeVoiceMenuRows.serverStt.test.tsx        |  75 +++++
+ web/src/components/AeVoiceMenuRows.tsx        |  24 ++
+ web/src/components/AeVoicePanel.test.tsx      |  18 +-
+ web/src/components/AeVoicePanel.tsx           |   9 +-
+ web/src/components/AeVoiceStartButton.tsx     |   2 +
+ .../ComposerMicButton.serverStt.test.tsx      | 170 ++++++++++++
+ web/src/components/ComposerMicButton.tsx      | 156 ++++++++---
+ web/src/hooks/useAeVoiceMode.ts               |   2 +
+ web/src/hooks/useAeVoiceStart.ts              |   4 +
+ web/src/lib/aeSettingHints.ts                 |   5 +
+ web/src/lib/aeVoiceServerStt.ts               |  97 +++++++
+ web/src/lib/dictation.ios.test.ts             | 260 ++++++++++++++++++
+ web/src/lib/dictation.ts                      | 199 +++++++++++++-
+ 14 files changed, 963 insertions(+), 62 deletions(-)
+ create mode 100644 web/src/components/AeVoiceMenuRows.serverStt.test.tsx
+ create mode 100644 web/src/components/ComposerMicButton.serverStt.test.tsx
+ create mode 100644 web/src/lib/aeVoiceServerStt.ts
+ create mode 100644 web/src/lib/dictation.ios.test.ts
+
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index bc710a3c516917e8d68d0c9f0db285b3a0154eb0..49585279550837d59ed88249a98000b10f53faf6 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -23,6 +23,7 @@ import { useAeSpeakReplies } from "@/hooks/useAeSpeakReplies";
+ import {
+   MicWhileSpeakingRow,
+   VoiceMeterRow,
++  VoiceServerSttRow,
+   RowHint,
+   ROW_LABEL_CLASS,
+   ROW_VALUE_CLASS,
+@@ -32,6 +33,7 @@ import {
+   VoiceChoiceRows,
+ } from "@/components/AeVoiceMenuRows";
+ import { holdVoiceAudioSession } from "@/lib/aeAudioSession";
++import { unlockVoiceAudioContext } from "@/lib/aeVoiceServerStt";
+ import { logVoice, requestVoiceLogInsert } from "@/lib/aeVoiceLog";
+ import {
+   clearVoiceModelState,
+@@ -337,6 +339,7 @@ function SpeakRepliesControl({
+     if (next) {
+       primeVoicePlayback();
+       holdVoiceAudioSession();
++      unlockVoiceAudioContext();
+     }
+     if (next && !on) toggleSpeak(true);
+     setVoiceOn(chatId, next);
+@@ -469,6 +472,7 @@ function SpeakRepliesControl({
+         />
+         <MicWhileSpeakingRow />
+         <VoiceMeterRow />
++        <VoiceServerSttRow />
+         <VoiceChoiceRows choices={choices} />
+         <DropdownMenuSeparator />
+         <div className="flex gap-1.5 px-1 pb-1 pt-0.5" data-testid="ae-speak-actions">
+diff --git a/web/src/components/AeVoiceMenuRows.serverStt.test.tsx b/web/src/components/AeVoiceMenuRows.serverStt.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..7222342be881b26ee3d5d602eabda75238cfd161
+--- /dev/null
++++ b/web/src/components/AeVoiceMenuRows.serverStt.test.tsx
+@@ -0,0 +1,75 @@
++// @vitest-environment jsdom
++// "Transcribe on the box" menu row: only on iPhone or iPad, and only when the server has dictation.
++import { render, screen } from "@testing-library/react";
++import userEvent from "@testing-library/user-event";
++import { afterEach, beforeEach, describe, expect, it } from "vitest";
++import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
++import type { ServerInfo } from "@/lib/capabilities";
++import { VOICE_SERVER_STT_KEY } from "@/lib/aeVoiceServerStt";
++import {
++  DropdownMenu,
++  DropdownMenuContent,
++  DropdownMenuTrigger,
++} from "@/components/ui/dropdown-menu";
++import { VoiceServerSttRow } from "./AeVoiceMenuRows";
++
++const IOS_UA =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
++const CHROME_UA =
++  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
++const INFO_ON = { dictation_available: true } as unknown as ServerInfo;
++const INFO_OFF = { dictation_available: false } as unknown as ServerInfo;
++let originalUa: PropertyDescriptor | undefined;
++
++function setUserAgent(ua: string) {
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++}
++
++async function open(dictation: boolean) {
++  const info = dictation ? INFO_ON : INFO_OFF;
++  render(
++    <CapabilitiesContext.Provider value={info}>
++      <DropdownMenu>
++        <DropdownMenuTrigger>menu</DropdownMenuTrigger>
++        <DropdownMenuContent>
++          <VoiceServerSttRow />
++        </DropdownMenuContent>
++      </DropdownMenu>
++    </CapabilitiesContext.Provider>,
++  );
++  await userEvent.setup().click(screen.getByText("menu"));
++}
++
++beforeEach(() => {
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  window.localStorage.removeItem(VOICE_SERVER_STT_KEY);
++});
++afterEach(() => {
++  window.localStorage.removeItem(VOICE_SERVER_STT_KEY);
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++describe("VoiceServerSttRow", () => {
++  it("shows on iOS with dictation available, on by default, and toggles", async () => {
++    setUserAgent(IOS_UA);
++    await open(true);
++    const row = screen.getByTestId("ae-voice-server-stt");
++    expect(row.getAttribute("aria-checked")).toBe("true");
++    expect(row.textContent).toContain("Transcribe on the box");
++    await userEvent.setup().click(row);
++    expect(window.localStorage.getItem(VOICE_SERVER_STT_KEY)).toBe("off");
++  });
++
++  it("is hidden on iOS when the server has no dictation", async () => {
++    setUserAgent(IOS_UA);
++    await open(false);
++    expect(screen.queryByTestId("ae-voice-server-stt")).toBeNull();
++  });
++
++  it("is hidden off iOS", async () => {
++    setUserAgent(CHROME_UA);
++    await open(true);
++    expect(screen.queryByTestId("ae-voice-server-stt")).toBeNull();
++  });
++});
+diff --git a/web/src/components/AeVoiceMenuRows.tsx b/web/src/components/AeVoiceMenuRows.tsx
+index 278765e62177ff6d61a9fc778b5b7cc4d0f68418..5fbbaab130367602dd776ac1351b98016a5bdc0c 100644
+--- a/web/src/components/AeVoiceMenuRows.tsx
++++ b/web/src/components/AeVoiceMenuRows.tsx
+@@ -53,6 +53,8 @@ import {
+ import { logVoice, uploadVoiceLog } from "@/lib/aeVoiceLog";
+ import { useMicWhileSpeaking, writeMicWhileSpeaking } from "@/lib/aeVoiceMic";
+ import { useVoiceMeter, writeVoiceMeter } from "@/lib/aeVoiceMeter";
++import { isIosDevice, useVoiceServerStt, writeVoiceServerStt } from "@/lib/aeVoiceServerStt";
++import { useServerInfo } from "@/lib/CapabilitiesContext";
+ 
+ const MAX_VOICES = 12;
+ const VOICE_LIST_RETRIES = 3;
+@@ -74,6 +76,7 @@ export function RowHint({
+     | "voice.snips"
+     | "voice.mic_while_speaking"
+     | "voice.meter"
++    | "voice.server_stt"
+     | "voice.chat_voice"
+     | "voice.voice"
+     | "voice.rate"
+@@ -179,6 +182,7 @@ export function SwitchRow({
+     | "voice.snips"
+     | "voice.mic_while_speaking"
+     | "voice.meter"
++    | "voice.server_stt"
+     | "voice.start";
+   testId: string;
+ }) {
+@@ -522,6 +526,26 @@ export function VoiceMeterRow() {
+   );
+ }
+ 
++/**
++ * Transcribe on the box: a per-device switch, shown only on iPhone and iPad when the server has
++ * dictation. Default on there: Apple's recognizer goes deaf after a spoken reply on iOS 18.
++ */
++export function VoiceServerSttRow() {
++  const serverInfo = useServerInfo();
++  const on = useVoiceServerStt();
++  const available = serverInfo !== "loading" && serverInfo.dictation_available;
++  if (!available || !isIosDevice()) return null;
++  return (
++    <SwitchRow
++      label="Transcribe on the box"
++      checked={on}
++      onChange={writeVoiceServerStt}
++      hint="voice.server_stt"
++      testId="ae-voice-server-stt"
++    />
++  );
++}
++
+ /** Sends the recent voice events to the server so a mic problem can be read afterwards. */
+ export function SendVoiceLogRow({ chatId }: { chatId?: string | null }) {
+   return (
+diff --git a/web/src/components/AeVoicePanel.test.tsx b/web/src/components/AeVoicePanel.test.tsx
+index f2e3e7b39f8ee5cd683f4d6d8dc5340ffe94820f..4d21b38d061334ce3b75561f336c84fd3d86f259 100644
+--- a/web/src/components/AeVoicePanel.test.tsx
++++ b/web/src/components/AeVoicePanel.test.tsx
+@@ -292,6 +292,18 @@ describe("AeVoicePanel (sheet controls)", () => {
+     expect(onEnd).toHaveBeenCalledTimes(1);
+   });
+ 
++  it("the sheet's keyboard and End share one centered row at one height", () => {
++    panel({ layout: "sheet", onKeyboard: vi.fn() });
++    const keyboard = screen.getByRole("button", { name: "Type instead" });
++    const end = screen.getByRole("button", { name: "End voice mode" });
++    expect(keyboard.parentElement).toBe(end.parentElement);
++    expect(keyboard.parentElement?.className).toContain("items-center");
++    expect(keyboard.className).toContain("self-center");
++    // icon-sm (size-7) matches the small End button (h-7).
++    expect(keyboard.className).toContain("size-7");
++    expect(end.className).toContain("h-7");
++  });
++
+   it("an undefined onKeyboard hides the keyboard button, with and without an approval", () => {
+     panel({ layout: "sheet" });
+     expect(screen.queryByRole("button", { name: "Type instead" })).toBeNull();
+@@ -321,8 +333,10 @@ describe("AeVoicePanel approval row alignment", () => {
+     expect(screen.getByTestId("ae-voice-approval-run").className).toContain("h-7");
+   });
+ 
+-  it("keeps the full-size keyboard button when no approval is pending", () => {
++  it("uses the same small keyboard button when no approval is pending", () => {
+     panel({ layout: "sheet", phase: "listening", onKeyboard: vi.fn() });
+-    expect(screen.getByLabelText("Type instead").className).toContain("size-10");
++    const keyboard = screen.getByLabelText("Type instead");
++    expect(keyboard.className).toContain("size-7");
++    expect(keyboard.className).not.toContain("size-10");
+   });
+ });
+diff --git a/web/src/components/AeVoicePanel.tsx b/web/src/components/AeVoicePanel.tsx
+index 805f117a97a5ce95895b14ce5fa4a9c1a4c2d5d2..e1a37ea37bb401730e9ab23602434da692a5f877 100644
+--- a/web/src/components/AeVoicePanel.tsx
++++ b/web/src/components/AeVoicePanel.tsx
+@@ -317,16 +317,15 @@ export function AeVoicePanel({
+       </div>
+     ) : null;
+ 
+-  // In the approval row the keyboard button matches the h-7 text buttons beside it.
+-  const inApprovalRow = approvalActive && Boolean(onApproval);
++  // The keyboard button matches the h-7 End button beside it, in the approval row and out of it.
+   const sheetControls = (
+     <>
+       {onKeyboard ? (
+         <Button
+           type="button"
+           variant="ghost"
+-          size={inApprovalRow ? "icon-sm" : "icon"}
+-          className={cn(inApprovalRow && "self-center text-muted-foreground hover:text-foreground")}
++          size="icon-sm"
++          className="self-center text-muted-foreground hover:text-foreground"
+           aria-label="Type instead"
+           onClick={onKeyboard}
+         >
+@@ -381,7 +380,7 @@ export function AeVoicePanel({
+         {sheetRow ? (
+           <div className="mt-3">{sheetRow}</div>
+         ) : (
+-          <div className="mt-3 flex gap-3">{sheetControls}</div>
++          <div className="mt-3 flex items-center gap-3">{sheetControls}</div>
+         )}
+       </div>
+     );
+diff --git a/web/src/components/AeVoiceStartButton.tsx b/web/src/components/AeVoiceStartButton.tsx
+index c2d45f80e4118dacbe799acfe4e1f595c593d984..d29b36ee91a20fbb49899d4da053c8c3856c9905 100644
+--- a/web/src/components/AeVoiceStartButton.tsx
++++ b/web/src/components/AeVoiceStartButton.tsx
+@@ -7,6 +7,7 @@ import { ChevronDownIcon, Volume2Icon } from "lucide-react";
+ import {
+   MicWhileSpeakingRow,
+   VoiceMeterRow,
++  VoiceServerSttRow,
+   SendVoiceLogRow,
+   SwitchRow,
+   useVoiceChoices,
+@@ -45,6 +46,7 @@ function VoiceStartMenuRows({ armed, onToggle }: { armed: boolean; onToggle: ()
+       <DropdownMenuSeparator />
+       <MicWhileSpeakingRow />
+       <VoiceMeterRow />
++      <VoiceServerSttRow />
+       <VoiceChoiceRows choices={choices} />
+       <DropdownMenuSeparator />
+       <SendVoiceLogRow />
+diff --git a/web/src/components/ComposerMicButton.serverStt.test.tsx b/web/src/components/ComposerMicButton.serverStt.test.tsx
+new file mode 100644
+index 0000000000000000000000000000000000000000..99dd21b27f9d6c018c9782f101c40ab5ad39b7e4
+--- /dev/null
++++ b/web/src/components/ComposerMicButton.serverStt.test.tsx
+@@ -0,0 +1,170 @@
++// @vitest-environment jsdom
++// Voice mode on iPhone and iPad (omnigent-ae): the controller's start uses the server recognizer
++// (DictationSession) because Apple's goes deaf after a spoken reply. Manual taps, other browsers
++// and the setting turned off keep the browser path. A silent server take restarts once, then
++// reports "deaf".
++import type { AeMicController } from "@/lib/aeVoiceMode";
++import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
++import { afterEach, beforeEach, describe, expect, it, vi, type Mock } from "vitest";
++import { CapabilitiesContext } from "@/lib/CapabilitiesContext";
++import type { ServerInfo } from "@/lib/capabilities";
++import type { DictationSessionEvents, DictationStartOptions } from "@/lib/dictation";
++import { resetVoiceLog, formatVoiceLog } from "@/lib/aeVoiceLog";
++import { VOICE_SERVER_STT_KEY } from "@/lib/aeVoiceServerStt";
++import { ComposerMicButton } from "./ComposerMicButton";
++
++let sessionStartMock: Mock<
++  (events: DictationSessionEvents, options?: DictationStartOptions) => Promise<unknown>
++>;
++let sessionEvents: DictationSessionEvents | null;
++let cancelMock: Mock<() => void>;
++const getMicStreamMock = vi.fn();
++
++vi.mock("@/lib/dictation", () => ({
++  DictationBusyError: class extends Error {},
++  DictationSession: {
++    start: (events: DictationSessionEvents, options?: DictationStartOptions) =>
++      sessionStartMock(events, options),
++  },
++}));
++vi.mock("@/lib/aeAudioDevices", async (orig) => ({
++  ...(await orig<Record<string, unknown>>()),
++  getMicStream: (...args: unknown[]) => getMicStreamMock(...args),
++}));
++
++const IOS_UA =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
++const CHROME_UA =
++  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
++const MAC_SAFARI_UA =
++  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15";
++const INFO = { dictation_available: true } as unknown as ServerInfo;
++
++let startSpy: Mock<() => void>;
++let originalUa: PropertyDescriptor | undefined;
++
++function setUserAgent(ua: string) {
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++}
++
++beforeEach(() => {
++  startSpy = vi.fn();
++  sessionEvents = null;
++  cancelMock = vi.fn();
++  getMicStreamMock.mockReset();
++  getMicStreamMock.mockRejectedValue(new Error("no mic"));
++  sessionStartMock = vi.fn(async (events: DictationSessionEvents) => {
++    sessionEvents = events;
++    return { stop: vi.fn(async () => ""), cancel: cancelMock };
++  });
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  class FakeRecognition {
++    continuous = false;
++    interimResults = false;
++    lang = "en-US";
++    start = startSpy;
++    stop = vi.fn();
++    abort = vi.fn();
++    addEventListener() {}
++    removeEventListener() {}
++  }
++  vi.stubGlobal("SpeechRecognition", FakeRecognition);
++  window.localStorage.removeItem(VOICE_SERVER_STT_KEY);
++  resetVoiceLog();
++});
++
++afterEach(() => {
++  cleanup();
++  vi.unstubAllGlobals();
++  window.localStorage.removeItem(VOICE_SERVER_STT_KEY);
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++function setup() {
++  const controller = { current: null as AeMicController | null };
++  const onListeningChange = vi.fn();
++  const view = render(
++    <CapabilitiesContext.Provider value={INFO}>
++      <ComposerMicButton
++        onTranscript={vi.fn()}
++        controller={controller}
++        onListeningChange={onListeningChange}
++      />
++    </CapabilitiesContext.Provider>,
++  );
++  return { controller, onListeningChange, view };
++}
++
++describe("ComposerMicButton (Voice mode on the server recognizer, iOS)", () => {
++  it("sends a Voice controller start on an iPhone to the DictationSession", async () => {
++    setUserAgent(IOS_UA);
++    const { controller } = setup();
++    expect(controller.current?.startPath()).toBe("server");
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).toHaveBeenCalledTimes(1);
++    expect(sessionStartMock.mock.calls[0][1]).toEqual({ deafCheck: true });
++    expect(startSpy).not.toHaveBeenCalled();
++    expect(controller.current?.isListening()).toBe(true);
++  });
++
++  it("keeps the browser path when the setting is off", async () => {
++    setUserAgent(IOS_UA);
++    window.localStorage.setItem(VOICE_SERVER_STT_KEY, "off");
++    const { controller } = setup();
++    expect(controller.current?.startPath()).toBe("browser");
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).not.toHaveBeenCalled();
++  });
++
++  it("keeps the browser path for a manual mic tap on an iPhone", async () => {
++    setUserAgent(IOS_UA);
++    setup();
++    await act(async () => {
++      fireEvent.click(screen.getByRole("button", { name: "Voice dictation" }));
++    });
++    expect(sessionStartMock).not.toHaveBeenCalled();
++  });
++
++  it.each([CHROME_UA, MAC_SAFARI_UA])("leaves %s unchanged", async (ua) => {
++    setUserAgent(ua);
++    const { controller } = setup();
++    expect(controller.current?.startPath()).toBe("browser");
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).not.toHaveBeenCalled();
++  });
++
++  it("never opens a second capture for the meter on a server take", async () => {
++    setUserAgent(IOS_UA);
++    window.localStorage.setItem("omnigent:ae-voice-meter", "on");
++    const { controller } = setup();
++    await act(async () => controller.current?.start());
++    await act(async () => {
++      await new Promise<void>((resolve) => {
++        setTimeout(resolve, 20);
++      });
++    });
++    expect(getMicStreamMock).not.toHaveBeenCalled();
++    window.localStorage.removeItem("omnigent:ae-voice-meter");
++  });
++
++  it("restarts a deaf server take once, then reports deaf", async () => {
++    setUserAgent(IOS_UA);
++    const { controller, onListeningChange } = setup();
++    await act(async () => controller.current?.start());
++    expect(sessionStartMock).toHaveBeenCalledTimes(1);
++    // First hit: a quiet restart (cancel, a fresh session), Voice mode is told nothing.
++    await act(async () => sessionEvents?.onDeaf?.("silent"));
++    expect(cancelMock).toHaveBeenCalledTimes(1);
++    expect(sessionStartMock).toHaveBeenCalledTimes(2);
++    expect(onListeningChange).not.toHaveBeenCalledWith(false, "deaf");
++    expect(formatVoiceLog()).toContain("server deaf restart");
++    // Second hit: reported as deaf.
++    await act(async () => sessionEvents?.onDeaf?.("silent"));
++    expect(sessionStartMock).toHaveBeenCalledTimes(2);
++    expect(onListeningChange).toHaveBeenCalledWith(false, "deaf");
++    expect(onListeningChange).toHaveBeenCalledTimes(2); // listening(true), then deaf
++    expect(formatVoiceLog()).toContain("server deaf");
++    expect(controller.current?.isListening()).toBe(false);
++  });
++});
+diff --git a/web/src/components/ComposerMicButton.tsx b/web/src/components/ComposerMicButton.tsx
+index ee4c87308b9850e68d8647e7674e4fb6a3aedd49..89bb9e30b03d5e7cf875a63632a19a34dbc77869 100644
+--- a/web/src/components/ComposerMicButton.tsx
++++ b/web/src/components/ComposerMicButton.tsx
+@@ -8,6 +8,7 @@ import { getMicStream } from "@/lib/aeAudioDevices";
+ import { publishMicLevel, resetMicLevel } from "@/lib/aeMicLevel";
+ import { publishVoiceBins, resetVoiceBins, syntheticVoiceBins } from "@/lib/aeVoiceLevel";
+ import { useVoiceMeter } from "@/lib/aeVoiceMeter";
++import { useVoiceServerStt } from "@/lib/aeVoiceServerStt";
+ import { logVoice } from "@/lib/aeVoiceLog";
+ import {
+   assertVoiceAudioSession,
+@@ -220,6 +221,8 @@ export const ComposerMicButton = ({
+   const [isListening, setIsListening] = useState(false);
+   // The Level meter setting: turning it on or off mid-take starts or stops the second stream.
+   const meterSetting = useVoiceMeter();
++  // iPhone and iPad: Voice mode starts use the server recognizer (Apple's goes deaf after a reply).
++  const voiceServerSetting = useVoiceServerStt();
+   // Server-path only: the take has started but audio isn't flowing yet (the
+   // first take cold-loads the model, up to ~40s). Shows a spinner so the click
+   // isn't a dead-looking button until it flips to listening.
+@@ -237,6 +240,12 @@ export const ComposerMicButton = ({
+   const withdrawRef = useRef(false);
+   // Set by the controller's start so the server start knows the withdraw flag is its own.
+   const controllerStartRef = useRef(false);
++  // The live server take is a Voice mode take on the server recognizer (iPhone, iPad).
++  const voiceServerTakeRef = useRef(false);
++  // A quiet restart of that take (the deaf check) is connecting.
++  const serverRestartingRef = useRef(false);
++  // How many quiet restarts this Voice mode start has used; one is allowed.
++  const serverDeafRestartsRef = useRef(0);
+   const onListeningChangeRef = useRef(onListeningChange);
+   onListeningChangeRef.current = onListeningChange;
+   // Synced refs so the mount-time listeners call the latest callbacks.
+@@ -317,6 +326,9 @@ export const ComposerMicButton = ({
+   // Which path the controller's start would take right now.
+   const pathRef = useRef<"browser" | "server">("browser");
+   pathRef.current = !Ctor || (serverAvailable && isElectronShell()) ? "server" : "browser";
++  // True when a Voice mode (controller) start goes to the server recognizer on this device.
++  const voiceServerRef = useRef(false);
++  voiceServerRef.current = serverAvailable && voiceServerSetting;
+   // Swaps the recognizer for a fresh one (set by the mount effect).
+   const replaceRecognitionRef = useRef<(keepLateFinal?: boolean) => void>(() => {});
+   const clearStartWatchdog = useCallback(() => {
+@@ -1070,7 +1082,9 @@ export const ComposerMicButton = ({
+   // hides its audio buffer. Chrome batches the permission to one prompt.
+   useEffect(() => {
+     if (!isListening) return;
+-    const meterOn = meterSetting;
++    // A server take of Voice mode on iOS has no second capture: the newest one wins there and
++    // would take the mic from the take. Its own chunk levels drive the bars instead.
++    const meterOn = meterSetting && !voiceServerTakeRef.current;
+     meterOnRef.current = meterOn;
+     logVoice(meterOn ? "meter on" : "meter off");
+     if (!meterOn) {
+@@ -1329,6 +1343,39 @@ export const ComposerMicButton = ({
+     };
+   }, [isListening, meterSetting]);
+ 
++  // The server take heard only silence (or a muted track): restart it quietly once, then tell
++  // Voice mode the take is deaf so its own retry and "tap to listen" paths take over.
++  const handleServerDeaf = useCallback((reason: "silent" | "muted") => {
++    const session = sessionRef.current;
++    if (!session || !voiceServerTakeRef.current) return;
++    sessionRef.current = null;
++    session.cancel();
++    // Words spoken but not finalized are kept, as on a crash.
++    const pending = interimRef.current.trim();
++    interimRef.current = "";
++    if (pending && !disabledRef.current && !discardingRef.current) {
++      onTranscriptRef.current(pending);
++    } else {
++      onInterimRef.current?.("");
++    }
++    if (serverDeafRestartsRef.current < 1) {
++      serverDeafRestartsRef.current += 1;
++      logVoice("server deaf restart", reason);
++      serverRestartingRef.current = true;
++      void toggleServerRef.current();
++      return;
++    }
++    logVoice("server deaf", reason);
++    voiceServerTakeRef.current = false;
++    voiceTakeRef.current = false;
++    quietStopRef.current = true;
++    listeningRef.current = false;
++    setIsListening(false);
++    requestedRef.current = false;
++    controllerStartRef.current = false;
++    onListeningChangeRef.current?.(false, "deaf");
++  }, []);
++
+   // Server-dictation toggle. Start resolves only once the mic + socket
+   // handshake are up, so isListening flips exactly when audio flows.
+   const toggleServer = useCallback(async () => {
+@@ -1354,44 +1401,59 @@ export const ComposerMicButton = ({
+       discardingRef.current = false;
+       // A manual click or the shortcut owns this start: a withdraw left over from an
+       // earlier Voice mode start must not cancel it.
+-      if (!controllerStartRef.current) withdrawRef.current = false;
++      const quiet = serverRestartingRef.current;
++      if (!quiet) {
++        if (!controllerStartRef.current) withdrawRef.current = false;
++        // Only a Voice mode start on a device that uses the server for it gets the deaf check.
++        voiceServerTakeRef.current = controllerStartRef.current && voiceServerRef.current;
++      }
+       controllerStartRef.current = false;
+       interimRef.current = "";
+       setConnecting(true);
+-      onVoiceStartRef.current?.();
+-      const next = await DictationSession.start({
+-        onPartial: (text) => {
+-          // Drop late partials after an Esc discard — they'd repopulate the
+-          // composer the parent just reverted.
+-          if (!disabledRef.current && !discardingRef.current) {
+-            interimRef.current = text;
+-            onInterimRef.current?.(text);
+-          }
+-        },
+-        onFinal: (text) => {
+-          interimRef.current = "";
+-          const trimmed = text.trim();
+-          if (trimmed && !disabledRef.current && !discardingRef.current) {
+-            onTranscriptRef.current(trimmed);
+-          }
+-        },
+-        onError: () => {
+-          sessionRef.current = null;
+-          // Preserve anything spoken but not yet finalized: pin the pending
+-          // partial as a final rather than blanking it, so a crash mid-take
+-          // doesn't discard the user's words.
+-          const pending = interimRef.current.trim();
+-          interimRef.current = "";
+-          if (pending && !disabledRef.current && !discardingRef.current) {
+-            onTranscriptRef.current(pending);
+-          } else {
+-            onInterimRef.current?.("");
+-          }
+-          reportError("Voice input failed. Please try again.");
+-          setIsListening(false);
+-          requestedRef.current = false;
++      if (!quiet) onVoiceStartRef.current?.();
++      const next = await DictationSession.start(
++        {
++          onPartial: (text) => {
++            // Drop late partials after an Esc discard — they'd repopulate the
++            // composer the parent just reverted.
++            if (!disabledRef.current && !discardingRef.current) {
++              interimRef.current = text;
++              onInterimRef.current?.(text);
++            }
++          },
++          onFinal: (text) => {
++            interimRef.current = "";
++            const trimmed = text.trim();
++            if (trimmed && !disabledRef.current && !discardingRef.current) {
++              onTranscriptRef.current(trimmed);
++            }
++          },
++          onError: () => {
++            sessionRef.current = null;
++            // Preserve anything spoken but not yet finalized: pin the pending
++            // partial as a final rather than blanking it, so a crash mid-take
++            // doesn't discard the user's words.
++            const pending = interimRef.current.trim();
++            interimRef.current = "";
++            if (pending && !disabledRef.current && !discardingRef.current) {
++              onTranscriptRef.current(pending);
++            } else {
++              onInterimRef.current?.("");
++            }
++            reportError("Voice input failed. Please try again.");
++            setIsListening(false);
++            requestedRef.current = false;
++          },
++          onLevel: (level) => {
++            // The bars and ring of a take that has no second capture follow the chunk levels.
++            if (voiceServerTakeRef.current) {
++              pulseTargetRef.current = Math.max(pulseTargetRef.current, Math.min(1, level * 4));
++            }
++          },
++          onDeaf: (reason) => handleServerDeaf(reason),
+         },
+-      });
++        { deafCheck: voiceServerTakeRef.current },
++      );
+       if (withdrawRef.current) {
+         // Voice mode stopped the mic while it was still connecting: drop the stream at once.
+         withdrawRef.current = false;
+@@ -1404,6 +1466,7 @@ export const ComposerMicButton = ({
+       }
+     } catch (startError) {
+       logVoice("mic error", `${(startError as Error)?.name}: ${(startError as Error)?.message}`);
++      if (serverRestartingRef.current) quietStopRef.current = true;
+       requestedRef.current = false;
+       onListeningChangeRef.current?.(false);
+       reportError(
+@@ -1419,8 +1482,9 @@ export const ComposerMicButton = ({
+     // clears the handshake spinner on both success and failure.
+     setConnecting(false);
+     withdrawRef.current = false;
++    serverRestartingRef.current = false;
+     serverBusyRef.current = false;
+-  }, [reportError]);
++  }, [reportError, handleServerDeaf]);
+   toggleServerRef.current = toggleServer;
+ 
+   // A browser stop that gets no `end`: swap the recognizer and call the take over.
+@@ -1463,7 +1527,9 @@ export const ComposerMicButton = ({
+     // to the server — a visible ~1s "fail then recover" on every first take.
+     // When the server can serve, go straight to it and skip the doomed attempt.
+     // (Real browsers keep Web Speech primary; it genuinely works there.)
+-    if (pathRef.current === "server") {
++    // A Voice mode start on iPhone or iPad also goes straight to the server: Apple's
++    // recognizer goes deaf after a spoken reply. Manual mic taps keep the browser path.
++    if (pathRef.current === "server" || (voiceServerRef.current && controllerStartRef.current)) {
+       if (!serverAvailable) return false;
+       void toggleServer();
+       return true;
+@@ -1482,6 +1548,7 @@ export const ComposerMicButton = ({
+     transitionRef.current = true;
+     // The Web Speech path has no server start to consume the controller's flag.
+     controllerStartRef.current = false;
++    voiceServerTakeRef.current = false;
+     try {
+       if (listeningRef.current) {
+         userStopRef.current();
+@@ -1620,6 +1687,7 @@ export const ComposerMicButton = ({
+       if (listeningRef.current || requestedRef.current) return;
+       requestedRef.current = true;
+       controllerStartRef.current = true;
++      serverDeafRestartsRef.current = 0;
+       if (toggle()) {
+         // A new start replaces any earlier withdrawn one.
+         withdrawRef.current = false;
+@@ -1643,13 +1711,17 @@ export const ComposerMicButton = ({
+     };
+     controller.current = {
+       start,
+-      startPath: () => (serverBusyRef.current || sessionRef.current ? "server" : pathRef.current),
++      startPath: () =>
++        serverBusyRef.current || sessionRef.current || voiceServerRef.current
++          ? "server"
++          : pathRef.current,
+       // A tap on a stuck "starting": discard the pending browser start, then start again
+       // inside the tap. A server start still connecting is never withdrawn: it is healthy.
+       restart: () => {
+         if (serverBusyRef.current || sessionRef.current) return;
+-        if (listeningRef.current && pathRef.current !== "browser") return;
+-        if (pathRef.current === "browser") {
++        const browserPath = pathRef.current === "browser" && !voiceServerRef.current;
++        if (listeningRef.current && !browserPath) return;
++        if (browserPath) {
+           logVoice("mic restart", listeningRef.current ? "while listening" : undefined);
+           stallTimesRef.current = [];
+           idleRecycleTimesRef.current = [];
+@@ -1684,7 +1756,9 @@ export const ComposerMicButton = ({
+         if (stopSynthWait("controller")) return;
+         if (listeningRef.current) {
+           requestedRef.current = false;
+-          toggle();
++          // A quiet deaf restart still connecting: drop its stream the moment it arrives.
++          if (serverRestartingRef.current) withdrawRef.current = true;
++          else toggle();
+         } else if (requestedRef.current) {
+           // Still connecting: cancel the start, or drop the stream the moment it connects.
+           requestedRef.current = false;
+diff --git a/web/src/hooks/useAeVoiceMode.ts b/web/src/hooks/useAeVoiceMode.ts
+index c7f7d8fb07ca6bf8cf8565e809c126c03215394c..875604b5eace56c7b2333c9b928832378788c238 100644
+--- a/web/src/hooks/useAeVoiceMode.ts
++++ b/web/src/hooks/useAeVoiceMode.ts
+@@ -35,6 +35,7 @@ import { activeEchoWords, resetEcho, splitEcho } from "@/lib/aeVoiceEcho";
+ import { withApprovalSource } from "@/lib/aeApprovalSource";
+ import { logVoice, uploadVoiceLog, useVoiceLogOnHide } from "@/lib/aeVoiceLog";
+ import { useMicWhileSpeaking } from "@/lib/aeVoiceMic";
++import { unlockVoiceAudioContext } from "@/lib/aeVoiceServerStt";
+ import { useChatStore } from "@/store/chatStore";
+ 
+ /** If the chat never shows a turn after a send, stop waiting for it. */
+@@ -540,6 +541,7 @@ export function useAeVoiceMode({
+ 
+   const restartMic = useCallback(() => {
+     // A tap is a fresh start: the retry budget is whole again.
++    unlockVoiceAudioContext();
+     deafStreak.current = 0;
+     failures.current = 0;
+     if (retryTimer.current !== null) clearTimeout(retryTimer.current);
+diff --git a/web/src/hooks/useAeVoiceStart.ts b/web/src/hooks/useAeVoiceStart.ts
+index 711490ecfb54ec49ddeb08ca9b7e958e3f38df15..7c5cc0fed6fb4a9f9b9e322f80a15a4f5f24d876 100644
+--- a/web/src/hooks/useAeVoiceStart.ts
++++ b/web/src/hooks/useAeVoiceStart.ts
+@@ -4,6 +4,7 @@
+ 
+ import { type MutableRefObject, useCallback, useEffect, useRef, useState } from "react";
+ import { primeVoicePlayback } from "@/lib/aeSpeakReplies";
++import { unlockVoiceAudioContext } from "@/lib/aeVoiceServerStt";
+ import { logVoice, uploadVoiceLog, useVoiceLogOnHide } from "@/lib/aeVoiceLog";
+ import {
+   type AeMicController,
+@@ -153,6 +154,7 @@ export function useAeVoiceStart({
+     }
+     // Inside the tap, so the browser lets the reply play later.
+     primeVoicePlayback();
++    unlockVoiceAudioContext();
+     armVoiceForNextChat();
+     released.current = false;
+     everListened.current = false;
+@@ -168,6 +170,8 @@ export function useAeVoiceStart({
+   const restart = useCallback(() => {
+     // A fresh recognizer inside the tap: a start that is stuck (iOS) ignores a second start().
+     const c = controller.current;
++    // The paused panel's tap: unlock the shared audio context for the server recognizer.
++    unlockVoiceAudioContext();
+     deafStreak.current = 0;
+     clearRetry();
+     setMicDetail(null);
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index 6aa84794828b35f7a355b92c5ab26a598fc237a7..c9fc6e703e158c6ea7c30d76058b9cd2ad2f7ef4 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -275,6 +275,11 @@ export const AE_SETTING_HINTS = {
+     hint: "Draws live mic levels. On iPhone it can stop the mic hearing you, so it is off there. Default: off on iPhone, on elsewhere. Per device.",
+     source: "tooltip",
+   },
++  "voice.server_stt": {
++    label: "Transcribe on the box",
++    hint: "On iPhone, the box turns your voice into text. Turn off to use Apple's recognizer.",
++    source: "tooltip",
++  },
+   "voice.voice": {
+     label: "Voice",
+     hint: "Natural voices come from the server when it has them; others are this device's. Saved per device. Default: first natural voice, else best.",
+diff --git a/web/src/lib/aeVoiceServerStt.ts b/web/src/lib/aeVoiceServerStt.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..839cc9a56c6e7e0d70e981e17137743d243b0d83
+--- /dev/null
++++ b/web/src/lib/aeVoiceServerStt.ts
+@@ -0,0 +1,97 @@
++// "Transcribe on the box": per device, whether Voice mode on an iPhone or iPad sends the mic to
++// the server's dictation (WS /v1/dictation/stream) instead of Apple's webkitSpeechRecognition.
++// On iOS 18 the browser recognizer goes deaf after any spoken reply, so the default there is on.
++// Elsewhere the setting does not exist: it is off and not shown. Manual mic taps keep their path.
++//
++// This file also holds the one AudioContext a Voice tap unlocks. iOS only lets a context run
++// when it was created or resumed inside a user gesture, and a dictation take builds its audio
++// graph long after the tap (once the socket is ready), so the tap makes the context and the take
++// reuses it.
++
++import { useSyncExternalStore } from "react";
++
++export const VOICE_SERVER_STT_KEY = "omnigent:ae-voice-server-stt";
++
++/** iPhone, iPad and iPod, including iPadOS asking for the desktop site. Not desktop Safari. */
++export function isIosDevice(): boolean {
++  try {
++    const nav = navigator;
++    const ua = nav.userAgent ?? "";
++    if (/iPad|iPhone|iPod/.test(ua)) return true;
++    return /Macintosh/.test(ua) && nav.maxTouchPoints > 1;
++  } catch {
++    return false;
++  }
++}
++
++/** The saved choice: "on", "off", or null when the user never chose. */
++function readSaved(): "on" | "off" | null {
++  if (typeof window === "undefined") return null;
++  try {
++    const v = window.localStorage.getItem(VOICE_SERVER_STT_KEY);
++    return v === "on" || v === "off" ? v : null;
++  } catch {
++    return null;
++  }
++}
++
++/** The setting's value: the saved choice, else on for iOS and off elsewhere. */
++export function readVoiceServerStt(): boolean {
++  const saved = readSaved();
++  return saved === null ? isIosDevice() : saved === "on";
++}
++
++/** True when a Voice mode start on this device should use the server recognizer. */
++export function voiceServerStt(): boolean {
++  return isIosDevice() && readVoiceServerStt();
++}
++
++const listeners = new Set<() => void>();
++
++export function subscribeVoiceServerStt(cb: () => void): () => void {
++  listeners.add(cb);
++  return () => listeners.delete(cb);
++}
++
++export function writeVoiceServerStt(on: boolean): void {
++  if (typeof window !== "undefined") {
++    try {
++      window.localStorage.setItem(VOICE_SERVER_STT_KEY, on ? "on" : "off");
++    } catch {
++      // A storage failure must not break the composer.
++    }
++  }
++  listeners.forEach((cb) => cb());
++}
++
++/** Reactive {@link voiceServerStt}. */
++export function useVoiceServerStt(): boolean {
++  return useSyncExternalStore(subscribeVoiceServerStt, voiceServerStt, () => false);
++}
++
++let sharedCtx: AudioContext | null = null;
++
++/** The tap-unlocked context, or null when none exists or it was closed. */
++export function getSharedVoiceAudioContext(): AudioContext | null {
++  if (sharedCtx && sharedCtx.state === "closed") sharedCtx = null;
++  return sharedCtx;
++}
++
++/**
++ * Call inside a Voice tap (next to primeVoicePlayback): makes the shared context if needed and
++ * resumes it. A no-op unless the server recognizer will be used on this device.
++ */
++export function unlockVoiceAudioContext(): void {
++  if (!voiceServerStt()) return;
++  try {
++    if (!getSharedVoiceAudioContext()) sharedCtx = new AudioContext();
++    void Promise.resolve(sharedCtx?.resume?.()).catch(() => {});
++  } catch {
++    // Unlocking is best effort; the take falls back to its own context.
++  }
++}
++
++/** Test seam: forget the shared context. */
++export function resetSharedVoiceAudioContext(): void {
++  sharedCtx = null;
++}
+diff --git a/web/src/lib/dictation.ios.test.ts b/web/src/lib/dictation.ios.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..099207281bacd827ff31da6799633a24c2162384
+--- /dev/null
++++ b/web/src/lib/dictation.ios.test.ts
+@@ -0,0 +1,260 @@
++// @vitest-environment jsdom
++// DictationSession on iOS (omnigent-ae): no sample-rate hint, a capped resume() on the context,
++// the tap-unlocked shared context reused and parked between takes, and the deaf check.
++import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
++import { formatVoiceLog, resetVoiceLog } from "./aeVoiceLog";
++import {
++  resetSharedVoiceAudioContext,
++  unlockVoiceAudioContext,
++  VOICE_SERVER_STT_KEY,
++} from "./aeVoiceServerStt";
++import { DEAF_SILENT_MS, DictationSession } from "./dictation";
++
++const IOS_UA =
++  "Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1";
++const CHROME_UA =
++  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
++
++const getMicStreamMock = vi.fn();
++vi.mock("@/lib/aeAudioDevices", () => ({
++  getMicStream: (...args: unknown[]) => getMicStreamMock(...args),
++}));
++vi.mock("@/lib/host", () => ({
++  getOmnigentHostConfig: () => ({}),
++  resolveWebSocketUrl: (p: string) => `ws://test${p}`,
++}));
++vi.mock("@/lib/sessionHost", () => ({ modalHostId: () => null }));
++
++let ctxArgs: unknown[][];
++let contexts: FakeCtx[];
++let nodes: FakeWorklet[];
++let sockets: FakeWs[];
++let originalUa: PropertyDescriptor | undefined;
++
++class FakeCtx {
++  state = "suspended";
++  sampleRate = 48000;
++  destination = {};
++  resume = vi.fn(() => {
++    this.state = "running";
++    return Promise.resolve();
++  });
++  suspend = vi.fn(() => {
++    this.state = "suspended";
++    return Promise.resolve();
++  });
++  close = vi.fn(() => {
++    this.state = "closed";
++    return Promise.resolve();
++  });
++  audioWorklet = { addModule: vi.fn(() => Promise.resolve()) };
++  constructor(...args: unknown[]) {
++    ctxArgs.push(args);
++    contexts.push(this);
++  }
++  createMediaStreamSource() {
++    return { connect: vi.fn(), disconnect: vi.fn() };
++  }
++  createGain() {
++    return { gain: { value: 1 }, connect: vi.fn(), disconnect: vi.fn() };
++  }
++}
++class FakeWorklet {
++  port: { onmessage: ((m: { data: unknown }) => void) | null; postMessage: () => void } = {
++    onmessage: null,
++    postMessage: vi.fn(),
++  };
++  connect = vi.fn();
++  disconnect = vi.fn();
++  constructor() {
++    nodes.push(this);
++  }
++}
++class FakeWs {
++  static OPEN = 1;
++  readyState = 1;
++  binaryType = "";
++  onmessage: ((m: { data: string }) => void) | null = null;
++  onclose: (() => void) | null = null;
++  onerror: (() => void) | null = null;
++  sent: unknown[] = [];
++  constructor() {
++    sockets.push(this);
++    queueMicrotask(() => this.onmessage?.({ data: '{"type":"ready"}' }));
++  }
++  addEventListener() {}
++  removeEventListener() {}
++  send(d: unknown) {
++    this.sent.push(d);
++  }
++  close() {
++    this.readyState = 3;
++  }
++}
++
++class FakeTrack {
++  muted = false;
++  listeners: Record<string, () => void> = {};
++  stop = vi.fn();
++  addEventListener(type: string, cb: () => void) {
++    this.listeners[type] = cb;
++  }
++}
++function makeStream() {
++  const track = new FakeTrack();
++  return { track, getTracks: () => [track] };
++}
++
++function setUserAgent(ua: string) {
++  Object.defineProperty(navigator, "userAgent", { configurable: true, value: ua });
++}
++const events = () => ({
++  onPartial: vi.fn(),
++  onFinal: vi.fn(),
++  onError: vi.fn(),
++  onDeaf: vi.fn(),
++});
++const chunk = (...samples: number[]) => ({ data: new Int16Array(samples) });
++
++beforeEach(() => {
++  ctxArgs = [];
++  contexts = [];
++  nodes = [];
++  sockets = [];
++  getMicStreamMock.mockReset();
++  getMicStreamMock.mockImplementation(() => Promise.resolve(makeStream()));
++  originalUa = Object.getOwnPropertyDescriptor(navigator, "userAgent");
++  vi.stubGlobal("AudioContext", FakeCtx);
++  vi.stubGlobal("AudioWorkletNode", FakeWorklet);
++  vi.stubGlobal("WebSocket", FakeWs);
++  vi.stubGlobal("URL", Object.assign(URL, { createObjectURL: () => "blob:x" }));
++  window.localStorage.removeItem(VOICE_SERVER_STT_KEY);
++  resetSharedVoiceAudioContext();
++  resetVoiceLog();
++});
++
++afterEach(() => {
++  vi.useRealTimers();
++  vi.unstubAllGlobals();
++  window.localStorage.removeItem(VOICE_SERVER_STT_KEY);
++  if (originalUa) Object.defineProperty(navigator, "userAgent", originalUa);
++  else delete (navigator as { userAgent?: unknown }).userAgent;
++});
++
++describe("DictationSession on iOS", () => {
++  it("skips the sample-rate hint, resumes the context and logs its state", async () => {
++    setUserAgent(IOS_UA);
++    const session = await DictationSession.start(events());
++    expect(ctxArgs[0]).toEqual([]);
++    expect(contexts[0].resume).toHaveBeenCalled();
++    expect(formatVoiceLog()).toContain("dictation ctx");
++    expect(formatVoiceLog()).toContain("running 48000 Hz");
++    expect(session.stream).toBeDefined();
++    session.cancel();
++    expect(contexts[0].close).toHaveBeenCalled();
++  });
++
++  it("still asks for 16 kHz elsewhere", async () => {
++    setUserAgent(CHROME_UA);
++    await DictationSession.start(events());
++    expect(ctxArgs[0]).toEqual([{ sampleRate: 16000 }]);
++  });
++
++  it("does not wait past the cap on a context whose resume never settles", async () => {
++    setUserAgent(IOS_UA);
++    vi.useFakeTimers();
++    vi.stubGlobal(
++      "AudioContext",
++      class extends FakeCtx {
++        override resume = vi.fn(() => new Promise<void>(() => {}));
++      },
++    );
++    const p = DictationSession.start(events());
++    await vi.advanceTimersByTimeAsync(600);
++    await expect(p).resolves.toBeDefined();
++  });
++
++  it("reuses the tap-unlocked context and parks it between takes", async () => {
++    setUserAgent(IOS_UA);
++    unlockVoiceAudioContext();
++    expect(contexts).toHaveLength(1);
++    const first = await DictationSession.start(events());
++    expect(contexts).toHaveLength(1);
++    first.cancel();
++    expect(contexts[0].close).not.toHaveBeenCalled();
++    expect(contexts[0].suspend).toHaveBeenCalled();
++    const second = await DictationSession.start(events());
++    expect(contexts).toHaveLength(1);
++    // The module is added once per context; resume() ran again for the second take.
++    expect(contexts[0].audioWorklet.addModule).toHaveBeenCalledTimes(1);
++    expect(contexts[0].resume.mock.calls.length).toBeGreaterThanOrEqual(3);
++    second.cancel();
++  });
++
++  it("makes no shared context when the setting is off", () => {
++    setUserAgent(IOS_UA);
++    window.localStorage.setItem(VOICE_SERVER_STT_KEY, "off");
++    unlockVoiceAudioContext();
++    expect(contexts).toHaveLength(0);
++  });
++});
++
++describe("DictationSession deaf check", () => {
++  it("reports silence after the constant, but not while sound arrives", async () => {
++    setUserAgent(IOS_UA);
++    vi.useFakeTimers();
++    const ev = events();
++    const p = DictationSession.start(ev, { deafCheck: true });
++    await vi.advanceTimersByTimeAsync(0);
++    const session = await p;
++    const port = nodes[0].port;
++    // Sound at 3 s keeps the take alive past 4 s.
++    await vi.advanceTimersByTimeAsync(3000);
++    port.onmessage?.(chunk(0, 5, 0));
++    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS - 1000);
++    expect(ev.onDeaf).not.toHaveBeenCalled();
++    await vi.advanceTimersByTimeAsync(2000);
++    expect(ev.onDeaf).toHaveBeenCalledWith("silent");
++    expect(ev.onDeaf).toHaveBeenCalledTimes(1);
++    session.cancel();
++  });
++
++  it("reports a track that stays muted", async () => {
++    setUserAgent(IOS_UA);
++    vi.useFakeTimers();
++    const ev = events();
++    const stream = makeStream();
++    getMicStreamMock.mockResolvedValueOnce(stream);
++    const p = DictationSession.start(ev, { deafCheck: true });
++    await vi.advanceTimersByTimeAsync(0);
++    const session = await p;
++    stream.track.listeners.mute?.();
++    // Keep audio non-zero so only the mute can trigger it.
++    const tick = setInterval(() => nodes[0].port.onmessage?.(chunk(1, 2)), 200);
++    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS + 600);
++    clearInterval(tick);
++    expect(ev.onDeaf).toHaveBeenCalledWith("muted");
++    session.cancel();
++  });
++
++  it("is off unless asked for", async () => {
++    setUserAgent(IOS_UA);
++    vi.useFakeTimers();
++    const ev = events();
++    const p = DictationSession.start(ev);
++    await vi.advanceTimersByTimeAsync(0);
++    await p;
++    await vi.advanceTimersByTimeAsync(DEAF_SILENT_MS * 2);
++    expect(ev.onDeaf).not.toHaveBeenCalled();
++  });
++
++  it("logs the take's counts and peak at cancel", async () => {
++    setUserAgent(IOS_UA);
++    const session = await DictationSession.start(events());
++    nodes[0].port.onmessage?.(chunk(0, 16384, 0));
++    session.cancel();
++    expect(formatVoiceLog()).toContain("dictation take");
++    expect(formatVoiceLog()).toContain("peak=0.500");
++    expect(formatVoiceLog()).toContain("dictation first sound");
++  });
++});
+diff --git a/web/src/lib/dictation.ts b/web/src/lib/dictation.ts
+index d8848ca9187fdbdc1eae5ab428ad99b60630081f..066358eba433f1ed16ee6efe7a048b49b1cb76f0 100644
+--- a/web/src/lib/dictation.ts
++++ b/web/src/lib/dictation.ts
+@@ -15,6 +15,8 @@
+ // handshake, as with those sockets.
+ 
+ import { getMicStream } from "@/lib/aeAudioDevices";
++import { logVoice } from "@/lib/aeVoiceLog";
++import { getSharedVoiceAudioContext, isIosDevice } from "@/lib/aeVoiceServerStt";
+ import { getOmnigentHostConfig, resolveWebSocketUrl } from "@/lib/host";
+ import { modalHostId } from "@/lib/sessionHost";
+ 
+@@ -58,8 +60,23 @@ export interface DictationSessionEvents {
+   onFinal: (text: string) => void;
+   /** Fatal error after start. The session has already cleaned itself up. */
+   onError: (message: string) => void;
++  /** Peak level (0..1) of each 100 ms chunk, for a meter that must not open a second capture. */
++  onLevel?: (level: number) => void;
++  /** The deaf check fired: the take heard only silence (or a muted track) for too long. */
++  onDeaf?: (reason: "silent" | "muted") => void;
+ }
+ 
++export interface DictationStartOptions {
++  /** Watch the take for silence or a muted track and report it through `onDeaf`. */
++  deafCheck?: boolean;
++}
++
++/** All-zero audio, or a muted track, for this long means the take is deaf. */
++export const DEAF_SILENT_MS = 4_000;
++const DEAF_TICK_MS = 500;
++/** How long start() waits for a resumed AudioContext to run before going on. */
++const CTX_RESUME_CAP_MS = 500;
++
+ /**
+  * The server was reachable but at its concurrent-take cap (WS close 1013).
+  * Transient by definition — callers should message "busy, try again",
+@@ -117,6 +134,22 @@ const WS_CLOSE_TRY_AGAIN_LATER = 1013;
+ 
+ const TARGET_RATE = 16_000;
+ 
++/** Wait for a context's resume(), but never longer than the cap (iOS may leave it pending). */
++async function resumeCapped(ctx: AudioContext): Promise<void> {
++  try {
++    await Promise.race([
++      Promise.resolve(ctx.resume?.()),
++      new Promise<void>((resolve) => {
++        setTimeout(resolve, CTX_RESUME_CAP_MS);
++      }),
++    ]);
++  } catch {
++    // Best effort: the state is logged by the caller.
++  }
++}
++
++const workletReady = new WeakSet<AudioContext>();
++
+ // AudioWorklet processor, inlined as a Blob module so no separate asset has
+ // to survive the Vite build. Linear-interpolation downsample from the
+ // context capture rate to 16 kHz, Float32 → Int16, posted in 100 ms chunks.
+@@ -199,6 +232,18 @@ export class DictationSession {
+   private stopResolve: ((tail: string) => void) | null = null;
+   private flushResolve: (() => void) | null = null;
+   private closed = false;
++  private readonly shared: boolean;
++  private readonly graph: AudioNode[];
++  private readonly createdAt = Date.now();
++  // Take stats, logged at stop.
++  private partials = 0;
++  private finals = 0;
++  private samplesSent = 0;
++  private peak = 0;
++  private firstSoundAt: number | null = null;
++  private lastSoundAt = Date.now();
++  private mutedSince: number | null = null;
++  private deafTimer: ReturnType<typeof setInterval> | null = null;
+ 
+   private constructor(
+     events: DictationSessionEvents,
+@@ -206,12 +251,29 @@ export class DictationSession {
+     mediaStream: MediaStream,
+     audioContext: AudioContext,
+     workletNode: AudioWorkletNode,
++    shared: boolean,
++    graph: AudioNode[],
++    deafCheck: boolean,
+   ) {
+     this.events = events;
+     this.ws = ws;
+     this.mediaStream = mediaStream;
+     this.audioContext = audioContext;
+     this.workletNode = workletNode;
++    this.shared = shared;
++    this.graph = graph;
++    for (const track of mediaStream.getTracks()) {
++      track.addEventListener?.("mute", () => {
++        logVoice("dictation track mute");
++        if (this.mutedSince === null) this.mutedSince = Date.now();
++      });
++      track.addEventListener?.("unmute", () => {
++        logVoice("dictation track unmute");
++        this.mutedSince = null;
++      });
++      if (track.muted) this.mutedSince = Date.now();
++    }
++    if (deafCheck) this.deafTimer = setInterval(() => this.checkDeaf(), DEAF_TICK_MS);
+ 
+     workletNode.port.onmessage = (msg: MessageEvent<Int16Array<ArrayBuffer> | null>) => {
+       if (msg.data === null) {
+@@ -220,15 +282,20 @@ export class DictationSession {
+         this.flushResolve = null;
+         return;
+       }
++      this.noteChunk(msg.data);
+       if (ws.readyState === WebSocket.OPEN) ws.send(msg.data.buffer);
+     };
+     ws.onmessage = (msg) => {
+       if (typeof msg.data !== "string") return;
+       const event = parseDictationEvent(msg.data);
+       if (event === null) return;
+-      if (event.type === "partial") this.events.onPartial(event.text);
+-      else if (event.type === "final") this.events.onFinal(event.text);
+-      else if (event.type === "stopped") this.resolveStop(event.text);
++      if (event.type === "partial") {
++        this.partials += 1;
++        this.events.onPartial(event.text);
++      } else if (event.type === "final") {
++        this.finals += 1;
++        this.events.onFinal(event.text);
++      } else if (event.type === "stopped") this.resolveStop(event.text);
+       else if (event.type === "error") this.fail(event.message);
+     };
+     ws.onclose = () => {
+@@ -245,19 +312,27 @@ export class DictationSession {
+    * denied, the socket fails, the server is at capacity
+    * ({@link DictationBusyError}), or the engine never comes up.
+    */
+-  static async start(events: DictationSessionEvents): Promise<DictationSession> {
++  static async start(
++    events: DictationSessionEvents,
++    options: DictationStartOptions = {},
++  ): Promise<DictationSession> {
++    const t0 = Date.now();
+     const mediaStream = await getMicStream({
+       channelCount: 1,
+       echoCancellation: true,
+       noiseSuppression: true,
+     });
++    logVoice("dictation mic", `${Date.now() - t0} ms`);
+ 
+     let ws: WebSocket | null = null;
+     let audioContext: AudioContext | null = null;
++    let shared = false;
+     try {
++      const wsAt = Date.now();
+       ws = new WebSocket(buildDictationUrl());
+       ws.binaryType = "arraybuffer";
+       await waitForReady(ws);
++      logVoice("dictation ws ready", `${Date.now() - wsAt} ms`);
+       // Detect a close during the async audio-graph setup below: the
+       // handler-swap in the constructor would otherwise never see it and
+       // start() would resolve a dead session that silently drops audio.
+@@ -267,15 +342,35 @@ export class DictationSession {
+       };
+       ws.addEventListener("close", markClosed);
+ 
+-      // Ask for the target rate directly — Chrome/Firefox resample the
+-      // capture for us and the worklet's downsampler becomes a no-op.
+-      // Some platforms reject the hint; the worklet handles any rate.
+-      try {
+-        audioContext = new AudioContext({ sampleRate: TARGET_RATE });
+-      } catch {
++      const ios = isIosDevice();
++      // On iOS a Voice tap made one context; reuse it (a new one made now, outside the tap,
++      // would start suspended).
++      const tapContext = ios ? getSharedVoiceAudioContext() : null;
++      if (tapContext) {
++        audioContext = tapContext;
++        shared = true;
++      } else if (ios) {
++        // iOS runs at its native rate; the worklet downsamples. The rate hint is not asked for.
+         audioContext = new AudioContext();
++      } else {
++        // Ask for the target rate directly — Chrome/Firefox resample the
++        // capture for us and the worklet's downsampler becomes a no-op.
++        // Some platforms reject the hint; the worklet handles any rate.
++        try {
++          audioContext = new AudioContext({ sampleRate: TARGET_RATE });
++        } catch {
++          audioContext = new AudioContext();
++        }
++      }
++      await resumeCapped(audioContext);
++      logVoice(
++        "dictation ctx",
++        `${audioContext.state} ${audioContext.sampleRate} Hz${shared ? " shared" : ""}`,
++      );
++      if (!workletReady.has(audioContext)) {
++        await audioContext.audioWorklet.addModule(workletUrl());
++        workletReady.add(audioContext);
+       }
+-      await audioContext.audioWorklet.addModule(workletUrl());
+       const source = audioContext.createMediaStreamSource(mediaStream);
+       const node = new AudioWorkletNode(audioContext, "omnigent-pcm16-downsampler");
+       // The worklet only renders while it reaches the destination; route
+@@ -290,15 +385,73 @@ export class DictationSession {
+       if (closedDuringSetup || ws.readyState !== WebSocket.OPEN) {
+         throw new Error("dictation connection closed during setup");
+       }
+-      return new DictationSession(events, ws, mediaStream, audioContext, node);
++      return new DictationSession(
++        events,
++        ws,
++        mediaStream,
++        audioContext,
++        node,
++        shared,
++        [source, node, mute],
++        options.deafCheck === true,
++      );
+     } catch (error) {
+       for (const track of mediaStream.getTracks()) track.stop();
+-      if (audioContext && audioContext.state !== "closed") void audioContext.close();
++      if (audioContext && !shared && audioContext.state !== "closed") void audioContext.close();
+       ws?.close();
+       throw error;
+     }
+   }
+ 
++  /** The take's microphone stream, for anything that must not open a second capture. */
++  get stream(): MediaStream {
++    return this.mediaStream;
++  }
++
++  /** Counts a worklet chunk: seconds sent, peak level, and the first and latest non-zero audio. */
++  private noteChunk(chunk: Int16Array): void {
++    this.samplesSent += chunk.length;
++    let peak = 0;
++    for (let i = 0; i < chunk.length; i += 1) {
++      const v = Math.abs(chunk[i]);
++      if (v > peak) peak = v;
++    }
++    if (peak > 0) {
++      const now = Date.now();
++      if (this.firstSoundAt === null) {
++        this.firstSoundAt = now;
++        logVoice("dictation first sound", `${now - this.createdAt} ms`);
++      }
++      this.lastSoundAt = now;
++      if (peak > this.peak) this.peak = peak;
++    }
++    this.events.onLevel?.(peak / 0x8000);
++  }
++
++  private checkDeaf(): void {
++    if (this.closed) return;
++    const now = Date.now();
++    let reason: "silent" | "muted" | null = null;
++    if (this.mutedSince !== null && now - this.mutedSince >= DEAF_SILENT_MS) reason = "muted";
++    else if (now - this.lastSoundAt >= DEAF_SILENT_MS) reason = "silent";
++    if (reason === null) return;
++    this.clearDeafTimer();
++    logVoice("dictation deaf", reason);
++    this.events.onDeaf?.(reason);
++  }
++
++  private clearDeafTimer(): void {
++    if (this.deafTimer !== null) clearInterval(this.deafTimer);
++    this.deafTimer = null;
++  }
++
++  private logStats(): void {
++    logVoice(
++      "dictation take",
++      `partials=${this.partials} finals=${this.finals} sent=${(this.samplesSent / TARGET_RATE).toFixed(1)}s peak=${(this.peak / 0x8000).toFixed(3)}`,
++    );
++  }
++
+   /**
+    * End the take: flush the worklet's trailing samples (so the last words
+    * make it to the recognizer), release the mic, ask the server to flush,
+@@ -306,7 +459,9 @@ export class DictationSession {
+    */
+   async stop(): Promise<string> {
+     if (this.closed) return "";
++    this.clearDeafTimer();
+     await this.flushWorklet();
++    this.logStats();
+     this.teardownAudio();
+     if (this.ws.readyState !== WebSocket.OPEN) {
+       this.closed = true;
+@@ -321,6 +476,8 @@ export class DictationSession {
+ 
+   /** Immediate teardown without waiting for the tail (unmount, disable). */
+   cancel(): void {
++    this.clearDeafTimer();
++    this.logStats();
+     this.teardownAudio();
+     this.closed = true;
+     this.ws.close();
+@@ -350,6 +507,7 @@ export class DictationSession {
+ 
+   private fail(message: string): void {
+     this.closed = true;
++    this.clearDeafTimer();
+     this.teardownAudio();
+     this.ws.close();
+     this.events.onError(message);
+@@ -357,7 +515,20 @@ export class DictationSession {
+ 
+   private teardownAudio(): void {
+     for (const track of this.mediaStream.getTracks()) track.stop();
+-    if (this.audioContext.state !== "closed") void this.audioContext.close();
++    if (this.shared) {
++      // The tap-unlocked context outlives the take: unplug this take's graph and park it.
++      for (const node of this.graph) {
++        try {
++          node.disconnect();
++        } catch {
++          // Already disconnected.
++        }
++      }
++      if (this.audioContext.state === "running")
++        void Promise.resolve(this.audioContext.suspend?.()).catch(() => {});
++    } else if (this.audioContext.state !== "closed") {
++      void this.audioContext.close();
++    }
+   }
+ }
+ 

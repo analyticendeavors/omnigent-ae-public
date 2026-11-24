@@ -824,16 +824,29 @@ def run_plan(plan: Plan, remover: Remover, clock: Clock | None = None) -> Outcom
     return outcome
 
 
+AE_GATE = "/usr/local/sbin/ae-gate"
+
+
 def prune_docker(run: Callable[[Sequence[str], float], tuple[int, str]], hours: int) -> Outcome:
     """Dangling images and build cache older than *hours*; never volumes or containers.
 
     *run* runs an argument list (no shell) and gives (status, output)."""
     outcome = Outcome()
     until = f"until={max(1, int(hours))}h"
-    for argv in (
-        ("docker", "image", "prune", "-f", "--filter", until),
-        ("docker", "builder", "prune", "-f", "--filter", until),
-    ):
+    # Root hardening: with the root-owned gate installed, its fixed prunes (dangling images and
+    # build cache older than 168h) run. The age is fixed in the gate, so *hours* is ignored under
+    # it. The direct calls are removed after the cutover.
+    if os.access(AE_GATE, os.X_OK):
+        argvs: tuple[tuple[str, ...], ...] = (
+            ("sudo", "-n", AE_GATE, "prune-images"),
+            ("sudo", "-n", AE_GATE, "prune-builder"),
+        )
+    else:
+        argvs = (
+            ("docker", "image", "prune", "-f", "--filter", until),
+            ("docker", "builder", "prune", "-f", "--filter", until),
+        )
+    for argv in argvs:
         code, out = run(argv, DOCKER_TIMEOUT_S)
         if code != 0:
             outcome.errors.append("ETIMEDOUT" if code == 124 else "EIO")

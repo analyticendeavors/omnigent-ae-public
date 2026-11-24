@@ -27,6 +27,7 @@ import {
   Flame,
   FolderGit2,
   Funnel,
+  UserPlus,
   LayoutDashboard,
   MessageCircleQuestion,
   Play,
@@ -95,6 +96,10 @@ export type FabricTone = "on" | "off" | "busy" | "failed" | "unknown";
  */
 export function powerIcon(): SVGElement {
   return decorative(Power, "icon-power", 16);
+}
+
+export function userPlusIcon(): SVGElement {
+  return decorative(UserPlus, "icon-user-plus", 16);
 }
 
 export function clockIcon(): SVGElement {
@@ -199,6 +204,18 @@ const TABLER_EXTERNAL_LINK: IconNode = [
 
 export function externalLinkIcon(): SVGElement {
   return decorative(TABLER_EXTERNAL_LINK, "icon-external", 16);
+}
+
+// Tabler's `arrow-right` outline icon, @tabler/icons 3.46.0: the area tab button on a Needs you
+// area line (2026-11-17), drawn after its label.
+const TABLER_ARROW_RIGHT: IconNode = [
+  ["path", { d: "M5 12l14 0" }],
+  ["path", { d: "M13 18l6 -6" }],
+  ["path", { d: "M13 6l6 6" }],
+];
+
+export function arrowRightIcon(): SVGElement {
+  return decorative(TABLER_ARROW_RIGHT, "icon-arrow-right", 16);
 }
 
 // Tabler's `copy` outline icon, @tabler/icons 3.46.0: the Copy link button is
@@ -858,6 +875,21 @@ const TABLER_CHEVRONS_UP: IconNode = [
   ["path", { d: "M7 17l5 -5l5 5" }],
 ];
 
+// Tabler's `square` and `square-check` outline icons: the tick box in the Assigned to me chip (2026-11-18).
+const TABLER_SQUARE: IconNode = [["path", { d: "M3 5a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2z" }]];
+const TABLER_SQUARE_CHECK: IconNode = [
+  ["path", { d: "M3 5a2 2 0 0 1 2 -2h14a2 2 0 0 1 2 2v14a2 2 0 0 1 -2 2h-14a2 2 0 0 1 -2 -2z" }],
+  ["path", { d: "M9 12l2 2l4 -4" }],
+];
+
+export function squareIcon(): SVGElement {
+  return decorative(TABLER_SQUARE, "icon-square", 16);
+}
+
+export function squareCheckIcon(): SVGElement {
+  return decorative(TABLER_SQUARE_CHECK, "icon-square-check", 16);
+}
+
 export function chevronsDownIcon(): SVGElement {
   return decorative(TABLER_CHEVRONS_DOWN, "icon-chevrons-down", 18);
 }
@@ -875,4 +907,34 @@ const TABLER_ARROW_BACK_UP: IconNode = [
 
 export function restoreIcon(size = 14): SVGElement {
   return decorative(TABLER_ARROW_BACK_UP, "icon-restore", size);
+}
+
+// Tabler `download`, `photo` and `player-skip-forward` outline icons, @tabler/icons 3.46.0: the opened
+// Social row's Download picture, Copy picture and Skip post (2026-11-16).
+const TABLER_DOWNLOAD: IconNode = [
+  ["path", { d: "M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2 -2v-2" }],
+  ["path", { d: "M7 11l5 5l5 -5" }],
+  ["path", { d: "M12 4l0 12" }],
+];
+const TABLER_PHOTO: IconNode = [
+  ["path", { d: "M15 8h.01" }],
+  ["path", { d: "M3 6a3 3 0 0 1 3 -3h12a3 3 0 0 1 3 3v12a3 3 0 0 1 -3 3h-12a3 3 0 0 1 -3 -3v-12" }],
+  ["path", { d: "M3 16l5 -5c.928 -.893 2.072 -.893 3 0l5 5" }],
+  ["path", { d: "M14 14l1 -1c.928 -.893 2.072 -.893 3 0l3 3" }],
+];
+const TABLER_SKIP: IconNode = [
+  ["path", { d: "M4 5v14l12 -9z" }],
+  ["path", { d: "M20 5l0 14" }],
+];
+
+export function downloadIcon(): SVGElement {
+  return decorative(TABLER_DOWNLOAD, "icon-download", 16);
+}
+
+export function photoIcon(): SVGElement {
+  return decorative(TABLER_PHOTO, "icon-photo", 16);
+}
+
+export function skipIcon(): SVGElement {
+  return decorative(TABLER_SKIP, "icon-skip", 16);
 }

@@ -172,6 +172,18 @@ async def test_ask_never_raises(env: dict[str, str], monkeypatch: pytest.MonkeyP
     assert out.baseline is False and not out.acted
 
 
+async def test_only_a_request_the_judge_sends_is_counted(env: dict[str, str]) -> None:
+    # ask() never counts: Decision1Judge counts right before its HTTP send (test_judge.py),
+    # so a refusal here or a judge that sends nothing (rule, fake) adds nothing.
+    env["AE_DECISION_DAILY_CAP"] = "1"
+    j = FakeJudge()
+    await run(env, j)
+    assert j.calls == 1 and ds.calls_today() == 0
+    await run(env, j)  # daily_cap: refused before the judge
+    await ds.ask("step_down", j, "choice", {}, baseline="x", environ=env, options={})  # bad_method
+    assert j.calls == 1 and ds.calls_today() == 0
+
+
 async def test_daily_cap(env: dict[str, str]) -> None:
     env["AE_DECISION_DAILY_CAP"] = "2"
     j = FakeJudge()

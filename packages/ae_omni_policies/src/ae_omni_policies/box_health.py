@@ -61,6 +61,11 @@ BUCKET_S = 900
 """The view sends 96 points of 15 minutes, the highest value in each."""
 
 GIB = 1024**3
+# 2026-11-23: the box (32 threads) sits at 98 to 100C under sustained full load by design; the
+# chip limits itself at 100C and takes no damage. Heat is a fault only when it is hot at light
+# load (load1 under this fraction of the threads) or past the chip's own limit.
+CPU_LIGHT_LOAD_FRACTION = 0.5
+CPU_CHIP_LIMIT_C = 100.0
 
 Tone = Literal["green", "amber", "red", "grey"]
 State = Literal["ok", "missing", "stale"]
@@ -508,19 +513,21 @@ SETTINGS: tuple[Setting, ...] = (
     Setting(
         "AE_BOX_HEALTH_CPU_HOT_C",
         "90",
-        "CPU temperature in C that counts as hot. Short boost bursts are normal and do not warn.",
+        "CPU temperature in C that counts as hot. It warns only while load stays under half "
+        "the threads; hot under load is normal.",
         "server",
     ),
     Setting(
         "AE_BOX_HEALTH_CPU_SUSTAINED_MINUTES",
         "15",
-        "How many minutes every CPU reading must stay hot before the card warns.",
+        "How many minutes every CPU reading must stay hot, at light load, before the card warns.",
         "server",
     ),
     Setting(
         "AE_BOX_HEALTH_NVME_WARN_C",
-        "60",
-        "SSD temperature in C that turns the card amber. The drive slows itself near 70.",
+        "75",
+        "SSD temperature in C that turns the card amber. Red at this plus 8; NVMe drives "
+        "report their own warning line near 80 to 85C.",
         "server",
     ),
     Setting(
@@ -696,7 +703,7 @@ def config(environ: Mapping[str, str] | None = None) -> Config:
         stale_minutes=int(_number(env, "AE_BOX_HEALTH_STALE_MINUTES", 15, 1, 1440)),
         cpu_hot_c=_number(env, "AE_BOX_HEALTH_CPU_HOT_C", 90, 40, 120),
         cpu_sustained_minutes=int(_number(env, "AE_BOX_HEALTH_CPU_SUSTAINED_MINUTES", 15, 5, 240)),
-        nvme_warn_c=_number(env, "AE_BOX_HEALTH_NVME_WARN_C", 60, 30, 120),
+        nvme_warn_c=_number(env, "AE_BOX_HEALTH_NVME_WARN_C", 75, 30, 120),
         disk_warn_pct=_number(env, "AE_BOX_HEALTH_DISK_WARN_PCT", 85, 1, 100),
         disk_crit_pct=_number(env, "AE_BOX_HEALTH_DISK_CRIT_PCT", 95, 1, 100),
         mem_warn_pct=_number(env, "AE_BOX_HEALTH_MEM_WARN_PCT", 90, 1, 100),
@@ -1182,34 +1189,59 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
     if cpu_c is not None:
         window = _window(stored.history, post.read_at.timestamp(), cfg.cpu_sustained_minutes)
         temps = [s.cpu_c for s in window if s.cpu_c is not None]
-        sustained = len(temps) >= 3 and all(t >= cfg.cpu_hot_c for t in temps)
-        sustained_red = len(temps) >= 3 and all(t >= cfg.cpu_hot_c + 5 for t in temps)
-        if cpu_c >= 98 or sustained_red:
+        hot_window = len(temps) >= 3
+        # 2026-11-20: one reading at 98C used to turn the card red, but this chip boosts to about
+        # 100C under heavy load by design (40 of 288 readings in a day), so a reading at the hot
+        # line proves nothing alone. 2026-11-23: it holds 98 to 100C for as long as the load
+        # lasts and limits itself at 100C without damage, so heat alerts now need a fault
+        # signature: hot while the load is light (dead fan, blocked vent, dust), or readings
+        # past the chip's own limit at any load. Hot under heavy load is normal and silent.
+        light_load = (
+            post.cpu is not None
+            and bool(window)
+            and all(
+                s.load1 is not None and s.load1 < post.cpu.threads * CPU_LIGHT_LOAD_FRACTION
+                for s in window
+                # Judged on the same samples as the temperatures: a failed CPU read is skipped.
+                if s.cpu_c is not None
+            )
+        )
+        if hot_window and all(t > CPU_CHIP_LIMIT_C for t in temps):
             heat_tone = "red"
             add(
                 cpu_c / cfg.cpu_hot_c,
                 "heat:cpu",
                 "heat",
                 "red",
-                f"CPU {cpu_c:.0f}C",
-                f"CPU temperature {cpu_c:.0f}C"
-                + (", hot for the whole window" if sustained_red else "")
-                + "; the chip throttles near 100C.",
+                f"CPU {cpu_c:.0f}C, past the chip limit",
+                f"Every reading in the last {cfg.cpu_sustained_minutes} minutes was above "
+                f"{CPU_CHIP_LIMIT_C:.0f}C. The chip normally holds itself at "
+                f"{CPU_CHIP_LIMIT_C:.0f}C, so this points to a cooling or sensor fault.",
             )
-        elif sustained:
+        elif hot_window and light_load and all(t >= cfg.cpu_hot_c for t in temps):
             heat_tone = "amber"
             add(
                 cpu_c / cfg.cpu_hot_c,
                 "heat:cpu",
                 "heat",
                 "amber",
-                f"CPU {cpu_c:.0f}C for {cfg.cpu_sustained_minutes} m",
+                f"CPU {cpu_c:.0f}C at light load",
                 f"Every reading in the last {cfg.cpu_sustained_minutes} minutes was "
-                f"{cfg.cpu_hot_c:.0f}C or more.",
+                f"{cfg.cpu_hot_c:.0f}C or more while load stayed under half the "
+                f"{post.cpu.threads if post.cpu else 0} threads; check the fan and vents.",
             )
         elif cpu_c >= cfg.cpu_hot_c:
-            heat_note = "; one hot reading, not sustained"
+            # The note names the latest load, so it never claims a heavy load it did not read.
+            if post.cpu is None:
+                heat_note = "; hot, load not read"
+            elif post.cpu.load1 >= post.cpu.threads * CPU_LIGHT_LOAD_FRACTION:
+                heat_note = "; hot under load, normal for this chip"
+            else:
+                heat_note = "; hot at light load, not yet sustained"
     if nvme_c is not None:
+        # 2026-11-23: the drive reports its own warning line at 82.85C and critical at 84.85C
+        # and reads about 57C in normal use, so the old 60C line warned 25C early. Amber at 75C,
+        # red at 83C (the drive's own warning line).
         nvme_tone = _band(nvme_c, cfg.nvme_warn_c, cfg.nvme_warn_c + 8)
         if nvme_tone in ("amber", "red"):
             add(
@@ -1218,7 +1250,7 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
                 "heat",
                 nvme_tone,  # type: ignore[arg-type]
                 f"SSD {nvme_c:.0f}C",
-                f"The SSD is at {nvme_c:.0f}C; it slows itself near 70C.",
+                f"The SSD is at {nvme_c:.0f}C; the drive's own warning line is near 83C.",
             )
         heat_tone = _worse(heat_tone, nvme_tone)
     chassis = next((s.c for s in post.sensors if s.chip.startswith("acpitz")), None)
@@ -1278,17 +1310,13 @@ def view(stored: Stored | None, now: datetime, cfg: Config | None = None) -> Box
             id="cpu", label="CPU", tone="grey", value="not read", title="No CPU reading"
         )
     else:
-        per_thread = cpu.load15 / cpu.threads
+        # 2026-11-23: the 15-minute load alone kept the card red long after load fell (85 when
+        # the real load was 25). Red needs both the 1- and 15-minute load over the line; the
+        # tone otherwise follows the lower of the two.
+        per_thread = min(cpu.load1, cpu.load15) / cpu.threads
         cpu_tone = _band(per_thread, 1.0, 2.0)
-        if cpu_tone in ("amber", "red"):
-            add(
-                per_thread / 1.0,
-                "cpu:load",
-                "cpu",
-                cpu_tone,  # type: ignore[arg-type]
-                f"Load {cpu.load15:.0f} of {cpu.threads}",
-                f"The 15-minute load is {cpu.load15:.1f} on {cpu.threads} threads.",
-            )
+        # 2026-11-23: load is work, not a fault (a load of 98 on 32 threads is the box doing its
+        # job), so it colours the card but never adds a Needs you line.
         areas["cpu"] = Area(
             id="cpu",
             label="CPU",

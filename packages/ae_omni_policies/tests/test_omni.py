@@ -254,9 +254,36 @@ async def test_stdio_subprocess_on_the_sdk_default_env_reaches_the_server(
     )
     async with stdio_client(params) as (read, write), ClientSession(read, write) as remote:
         await remote.initialize()
-        result = await remote.call_tool("omni_capacity", {})
+        result = await remote.call_tool("omni_capacity", {"detail": "full"})
     assert result.content and isinstance(result.content[0], types.TextContent)
     assert json.loads(result.content[0].text) == {"cap": 3, "open": 1}
     # Listing tools also asks /v1/ae/decision whether to show the judge tools (2026-11-07).
     seen = [hit for hit in _Recorder.seen if hit["path"] != "/v1/ae/decision"]
     assert seen == [{"path": "/v1/ae/capacity", "auth": "Bearer tok-host"}]
+
+
+def test_capacity_summary_shape() -> None:
+    from ae_omni_policies.mcp import capacity_summary
+
+    data = {
+        "limit": 3,
+        "slots_used": 1,
+        "helpers_count": False,
+        "working": [
+            {"id": "a", "title": "x" * 60, "elapsed": "5m", "next": "do it"},
+            {"id": "h", "title": "helper", "helper": True},
+        ],
+        "blocked": [{"id": "b", "title": "blocked", "failed": True}],
+        "review": [{"id": "r"}, {"id": "s"}],
+    }
+    summary = capacity_summary(data)
+    assert summary["slots_free"] == 2
+    assert [row["id"] for row in summary["holders"]] == ["a"]
+    assert (
+        summary["holders"][0]["title"].endswith("...")
+        and len(summary["holders"][0]["title"]) == 40
+    )
+    assert "next" not in summary["holders"][0]
+    assert summary["helpers_working"] == 1
+    assert summary["blocked"] == [{"id": "b", "title": "blocked", "failed": True}]
+    assert summary["counts"] == {"review": 2}

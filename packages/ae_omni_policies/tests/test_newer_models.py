@@ -662,3 +662,39 @@ def test_review_check_gives_up_quickly_and_says_unchecked(
         router_module._newer_for_review(None, "u", 0.1)  # type: ignore[arg-type]
     )
     assert (found, checked) == ({}, False)
+
+
+def test_known_fable_52_beats_a_catalog_that_still_says_51() -> None:
+    preset = _preset(planner=_fixed("claude-fable-5-1"))
+    found = newer_models.find([preset], _claude("claude-fable-5-1", SONNET))
+    [row] = found[0]["rows"]
+    assert (row["current_name"], row["newer"], row["newer_name"]) == (
+        "Fable 5.1",
+        "claude-fable-5-2",
+        "Fable 5.2",
+    )
+
+
+def test_known_fable_52_keeps_the_1m_variant() -> None:
+    preset = _preset(planner=_fixed("claude-fable-5-1[1m]"))
+    not_moved: list[dict[str, Any]] = []
+    found = newer_models.find([preset], _claude("claude-fable-5-1"), not_moved)
+    [row] = found[0]["rows"]
+    assert row["newer"] == "claude-fable-5-2[1m]"
+    assert row["value"]["model"] == "claude-fable-5-2[1m]"
+    assert not_moved == []
+
+
+def test_newest_known_opus_gives_nothing() -> None:
+    assert newer_models.find([_preset()], _claude(OPUS, SONNET)) == []
+
+
+def test_an_extra_known_id_is_a_candidate() -> None:
+    preset = _preset(planner=_fixed("claude-fable-5-2"))
+    assert newer_models.find([preset], _claude(SONNET)) == []
+    found = newer_models.find([preset], _claude(SONNET), known=["claude-fable-5-3"])
+    assert found[0]["rows"][0]["newer"] == "claude-fable-5-3"
+
+
+def test_known_ids_do_not_make_an_empty_catalog_answer() -> None:
+    assert newer_models.find([_preset(planner=_fixed("claude-fable-5-1"))], []) == []

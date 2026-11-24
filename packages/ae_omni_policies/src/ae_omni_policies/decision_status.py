@@ -20,8 +20,9 @@ from . import decision_shadow as ds
 
 CACHE_S = 60.0
 #: The points the card always lists, even before one has been asked (registration is lazy).
-#: Only points that call the judge: the lead step-down was dropped after its replay on
-#: 2026-11-07 (docs/features/decision-advisor.md), and the review loop stop is a rule.
+#: Points that call the judge: the lead step-down was dropped after its replay on 2026-11-07
+#: (docs/features/decision-advisor.md), and the review loop stop is a rule. The ``nudge`` point
+#: was retired on 2026-11-19 (the reminder policy sends nothing now).
 KNOWN_POINTS = ("agent_ask", "advisor")
 RETIRES_ENV = "AE_DECISION_RETIRES"
 _DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
@@ -63,9 +64,15 @@ def _retires(env: Mapping[str, str]) -> str | None:
     return raw
 
 
+#: Points that no longer exist; an old ``AE_DECISION_POINTS=nudge:off`` must not bring one back.
+RETIRED_POINTS = frozenset({"nudge"})
+
+
 def _point_names(env: Mapping[str, str]) -> list[str]:
     names = list(KNOWN_POINTS)
     for name in [*ds.point_names(), *ds.ceilings(env)]:
+        if name in RETIRED_POINTS:
+            continue
         if name not in names:
             names.append(name)
     return names
@@ -122,6 +129,7 @@ def build(caller: str | None, environ: Mapping[str, str] | None = None) -> dict[
         if why is not None:
             out["reason"] = why
         out.update(ds.usage(env))
+        out["calls_today"] = ds.calls_today()
         out["points"] = [{"name": n, "mode": _mode(n, why, env)} for n in _point_names(env)]
         out["shadow"] = ds.shadow_counts(7, env)
     except Exception as exc:  # noqa: BLE001 (a status read never fails the card)

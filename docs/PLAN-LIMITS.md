@@ -692,6 +692,23 @@ is in flight) before their first request, so neither the default login's numbers
 previous pick shows first. A session launched before 0202 has no file
 until its first render, as before.
 
+### A chat switched to a shared login (2026-11-16)
+
+The runner's live label (`ae.claude_account`, stamped at every terminal launch) outranks
+the relay's entry for the session, which can be one relay tick (5 minutes) old. Until
+2026-11-16 the label counted only when it named a login in the host's list
+(`known_accounts`) or the default login. The host lists a `shared:` account only while it
+is the pick for new chats, so a chat switched in place to another shared login kept
+answering from its old relay entry: the dock's usage item and the Usage card showed the
+login it had just left (seen live at 91% weekly on the default login, on a chat already
+running on a shared one) until the next tick. `limits._resolve_account` now takes a live
+label that names a `shared:` account as it is. Only the session's bound runner or the
+server's switch route writes that label, and a shared account is the server's own, so no
+host list has to confirm it. A live label for a host login the host does not list is
+still ignored. Until the chat's first reading on the new login, the answer is that
+login's newest stored reading with the note that says so, or empty windows with "No
+reading yet".
+
 ## Accounts summary (2026-10-21)
 
 The owner runs several Claude logins (the default, personal ones, shared ones) and one
@@ -744,13 +761,98 @@ account in one place.
   just that bar, and "No reading" shows only when a read row has neither), live sessions and the reading's age ("as of 3h ago", "no
   reading yet"). It reads every minute while visible and on focus.
 
-Gaps: an idle account's numbers are as old as its last status line; nothing probes an
-account without a session (the owner's call, 2026-10-21). The login list rides the Claude
+Gaps: an idle account's numbers are as old as its last status line, unless it has a
+usage login ("Idle accounts" below; until 2026-11-16 nothing read an account without a
+session, the owner's call of 2026-10-21). The login list rides the Claude
 post, so a host with no Claude reading at all (no status line, no usage answer) posts
 no list either, and only the shared accounts show. The live session counts are as old
 as the relay's last post. A relay newer than its server gets 422 for every Claude post
 until the server runs this version (the `known_accounts` field): deploy the server
 first, as `auto-update.sh` does, and never roll the server back alone.
+
+## Idle accounts (2026-11-16, the owner)
+
+The owner asked that every subscription always have a reading. On 2026-11-16 the
+desk strip showed "n/a" for the shared Claude account: its last reading was 20 hours
+old, because an account other than the default login was read only when a chat on it
+replied. The default login and Codex were already read every relay tick.
+
+**Why a sign-in is needed.** Chats on such an account run on its `claude setup-token`
+token (scope `user:inference` only, no refresh token). That token cannot read the
+usage endpoint (`get_usage` answers `rate_limits_available: false`). Checked on
+2026-11-16 against the live account: `POST /v1/messages/count_tokens` with it answers
+200 with no `anthropic-ratelimit-unified-*` headers, so the windows exist only in a
+model reply's headers or in the usage endpoint. A full `claude auth login` of the
+account carries `user:profile`, and the usage endpoint answers it with no model call.
+
+**The owner's call (2026-11-16).** He reversed the 2026-10-21 call above for this
+timer read only, and signs each account in once.
+
+**How it works.**
+
+- `bash deploy/ae-usage-login.sh` (the server's only shared account) or
+  `bash deploy/ae-usage-login.sh '<account id>'` makes
+  `~/.omnigent/ae/usage-logins/slot-<n>/` (0700) with an `account` file and a `config`
+  folder. It runs `claude auth login --claudeai` with `CLAUDE_CONFIG_DIR` set to that
+  folder. It refuses any folder that overlaps `~/.claude` or `~/.claude-acct2`, and it
+  unsets the credential variables first. Then it runs two checks, each printing PASS or
+  FAIL: the usage read works through the new sign-in, and a chat on the account still
+  replies on the token chats use (one short Haiku reply, in an empty config folder).
+  The script holds the slot's lock throughout, so the relay leaves the slot alone
+  while it is written. A failed chat check removes the slot, whenever it was made; any
+  other failure or a Ctrl-C removes it only if this run made it. It also refuses a
+  symlinked `config` folder.
+- The relay (`limits_relay.read_usage_logins`) reads each slot whose `last-read` stamp
+  is 12 minutes old or more. The timer runs every 5 minutes, so a reading is at most
+  about 17 minutes old while reads succeed. It sends the same `get_usage` request with
+  `CLAUDE_CONFIG_DIR` set to the slot, `DISABLE_AUTOUPDATER=1` and the credential
+  variables plus `ANTHROPIC_BASE_URL` unset. Slots are read side by side, each with a
+  30-second limit, so the unit's 2-minute limit holds; one slot's error is that slot's
+  miss and never costs the other posts. The stamp is written only once the reading has
+  reached the server, so a failed read or a failed post tries again on the next tick
+  (2026-11-16 Codex review); a stamp in the future counts as due. `--dry-run` counts
+  the slots and reads none, since a read could refresh the slot's login, and prints no
+  account names. One journal line counts slots ("1 read, 0 read under 12 min ago, 0
+  unreadable"); it never names an account, a slot's account or a CLI error.
+- The readings ride the Claude post as `account_probes` (account, time, windows; no
+  plan, no credits, as for every account but the default login). When there is no
+  other Claude reading, they ride a Claude post of their own (`source: "usage-login"`)
+  that the store notes but never holds, and that never makes the relay's run count as a
+  success. The server checks each account id against the host's alphabet too. `LimitStore._note` makes each one its account's
+  reading, and the newest reading still wins. `_newest` ignores them, so they never
+  decide which host snapshot is held. `GET /v1/ae/limits` and the member view never
+  answer them. `GET /v1/ae/limits/accounts` changes in one way: the account's row is
+  fresher. A slot for a host login that has left the host is skipped. A shared account
+  the server's store dropped is still read, and the route hides it as before.
+
+**Why no chat can be signed out by it.** Only an OAuth login with a refresh token can
+rotate. The setup token chats use never refreshes. The usage login is its own grant
+in a folder nothing else opens, so its refresh rotates only its own token. The
+relay takes the slot's `flock` before the age check, so two runs never refresh one
+login at once. No credentials file is ever copied (two holders of one rotating refresh
+token is the race that signs one out). `~/.claude` keeps today's read, unchanged.
+An empty slot answers "unavailable" and never falls back to `~/.claude` (2.1.325 CLI,
+2026-11-16).
+
+**Deploy order.** The server must run this version before the relay posts
+`account_probes`: an older server answers 422 to the field (its models forbid extra
+keys). The relay leaves the field out when it has no readings, so a new relay and an
+old server work as before until a slot exists. If an old server refuses a post that
+carries readings, the relay sends it again without them, so the default login's reading
+still lands, and says so in one line. `auto-update.sh` deploys the server first. A 422
+is logged by its status only, because its body echoes the posted values. The state
+file keeps the readings only in the account rows, never in the held snapshot, so an
+older server still loads it after a rollback; roll the relay back with the server, or
+its posts with readings are refused (and resent without them) until it is.
+
+Gaps: the 30-minute promise holds only while reads succeed and the relay and server
+are up. An account with no usage login is as stale as its last chat reply. In the
+Admin Center, a usage-login reading carries the per-model weekly rows and a later
+status line does not, so those rows can come and go between readings. The headline
+5-hour and weekly numbers do not. `remove` deletes a slot but does not sign the grant
+out at claude.ai, since a sign-out could reach the account's other tokens. A
+`GET /v1/ae/limits?session_id=` for a chat on the account that has no windows of its
+own now shows the fresher usage-login reading.
 
 ## Who sees which readings (2026-10-28, the owner)
 

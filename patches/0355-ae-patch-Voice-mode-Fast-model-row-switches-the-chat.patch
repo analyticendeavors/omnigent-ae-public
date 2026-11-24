@@ -1,0 +1,822 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Tue, 10 Nov 2026 23:27:32 -0800
+Subject: [PATCH 355/443] [ae-patch] Voice mode: Fast model row switches the
+ chat to Sonnet while voice runs, and Read last reply logs its voice and
+ unlocks audio
+
+---
+ .../components/AeSpeakRepliesButton.test.tsx  | 246 +++++++++++++++++-
+ web/src/components/AeSpeakRepliesButton.tsx   | 131 +++++++++-
+ web/src/hooks/useAeSpeakReplies.test.ts       |  17 ++
+ web/src/hooks/useAeSpeakReplies.ts            |   6 +-
+ web/src/lib/aeSettingHints.ts                 |   5 +
+ web/src/lib/aeSpeakReplies.ts                 |  10 +
+ web/src/lib/aeVoiceModel.test.ts              |  78 ++++++
+ web/src/lib/aeVoiceModel.ts                   | 116 +++++++++
+ web/src/pages/ChatPage.tsx                    |   8 +
+ 9 files changed, 612 insertions(+), 5 deletions(-)
+ create mode 100644 web/src/lib/aeVoiceModel.test.ts
+ create mode 100644 web/src/lib/aeVoiceModel.ts
+
+diff --git a/web/src/components/AeSpeakRepliesButton.test.tsx b/web/src/components/AeSpeakRepliesButton.test.tsx
+index 08a786064cda42f2f6702a1278228b38bb1bf462..3fb103932a88ff9cca9432fb65f00b4c7846a04b 100644
+--- a/web/src/components/AeSpeakRepliesButton.test.tsx
++++ b/web/src/components/AeSpeakRepliesButton.test.tsx
+@@ -6,6 +6,7 @@ import { resetCloudVoicesCache } from "@/lib/aeCloudVoice";
+ import {
+   getVoiceSnapshot,
+   resetVoiceStore,
++  setVoiceOn,
+   setVoiceBlocked,
+   setVoicePhase,
+   stopVoice,
+@@ -432,7 +433,11 @@ describe("AeSpeakRepliesButton", () => {
+ 
+     it("shows the device model on the row and the full label in the title and sub-menu", async () => {
+       mediaDevices([
+-        { kind: "audioinput", deviceId: "mic1", label: "Microphone (Logitech BRIO 4K Stream Edition)" },
++        {
++          kind: "audioinput",
++          deviceId: "mic1",
++          label: "Microphone (Logitech BRIO 4K Stream Edition)",
++        },
+       ]);
+       window.localStorage.setItem("omnigent:ae-mic-device", "mic1");
+       renderButton();
+@@ -493,7 +498,9 @@ describe("AeSpeakRepliesButton", () => {
+     for (const el of triggers) {
+       const group = el.closest("span.items-center.gap-1\\.5");
+       expect(group).not.toBeNull();
+-      expect(group?.textContent).toMatch(/Voice mode|Speak replies|Fast answers|Send snips|Mic while speaking|Voice|Speed|Microphone|Speaker|Add voice log/);
++      expect(group?.textContent).toMatch(
++        /Voice mode|Speak replies|Fast answers|Send snips|Mic while speaking|Voice|Speed|Microphone|Speaker|Add voice log/,
++      );
+     }
+     const actions = screen.getByTestId("ae-speak-actions");
+     expect(within(actions).getByTestId("ae-speak-read-last")).toBeInTheDocument();
+@@ -531,12 +538,245 @@ describe("AeSpeakRepliesButton", () => {
+     await user.click(screen.getByTestId("ae-speak-read-last"));
+     await waitFor(() => expect(synth.texts()).toEqual(["The last reply."]));
+     const user2 = await openMenu();
+-    await waitFor(() => expect(screen.getByTestId("ae-speak-stop")).not.toHaveAttribute("data-disabled"));
++    await waitFor(() =>
++      expect(screen.getByTestId("ae-speak-stop")).not.toHaveAttribute("data-disabled"),
++    );
+     const cancels = synth.cancelCount;
+     await user2.click(screen.getByTestId("ae-speak-stop"));
+     expect(synth.cancelCount).toBeGreaterThan(cancels);
+   });
+ 
++  it("Read last reply uses the picked cloud voice and the picked speed", async () => {
++    const calls: { url: string; body: string }[] = [];
++    resetCloudVoicesCache();
++    vi.stubGlobal(
++      "fetch",
++      vi.fn((url: string, init?: RequestInit) => {
++        if (String(url).includes("/tts/voices")) {
++          return Promise.resolve(
++            new Response(
++              JSON.stringify({ voices: [...CLOUD, { id: "rocky-xtts", name: "Rocky" }] }),
++              {
++                status: 200,
++              },
++            ),
++          );
++        }
++        calls.push({ url: String(url), body: String(init?.body) });
++        return new Promise<Response>(() => {});
++      }),
++    );
++    window.localStorage.setItem("omnigent:ae-speak-voice", "cloud:rocky-xtts");
++    window.localStorage.setItem("omnigent:ae-speak-rate", "1.25");
++    useChatStore.setState({
++      blocks: [
++        {
++          type: "text_done",
++          ctx: { agent: null, depth: 0, turn: 1, timestamp: 1, responseId: "r1", itemId: "i1" },
++          fullText: "The last reply.",
++          hasCodeBlocks: false,
++        },
++      ],
++    } as never);
++    renderButton();
++    const user = await openMenu();
++    expect(await screen.findByText("Rocky")).toBeInTheDocument();
++    await user.click(screen.getByTestId("ae-speak-read-last"));
++    await waitFor(() => expect(calls).toHaveLength(1));
++    expect(JSON.parse(calls[0].body)).toEqual({
++      text: "The last reply.",
++      voice: "rocky-xtts",
++      rate: 1.25,
++    });
++  });
++
++  describe("Fast model", () => {
++    const MODELS = [
++      { id: "opus", model: "claude-opus-5-5" },
++      { id: "claude-sonnet-5", model: "claude-sonnet-5" },
++      { id: "claude-sonnet-5-5", model: "claude-sonnet-5-5" },
++    ];
++    const setModel = vi.fn((_m: string | null, _o?: unknown) => Promise.resolve());
++    const originalSetModel = useChatStore.getState().setModel;
++
++    function renderModelButton(
++      extra: Partial<React.ComponentProps<typeof AeSpeakRepliesButton>> = {},
++    ) {
++      return renderButton({
++        modelOptions: MODELS,
++        canSetModel: true,
++        canResetModel: true,
++        ...extra,
++      });
++    }
++    function voiceOn(on: boolean) {
++      act(() => setVoiceOn("c1", on));
++    }
++    // A mock that, like the store, records the override it was given.
++    function followStore() {
++      setModel.mockImplementation((m: string | null) => {
++        useChatStore.setState({ sessionModelOverride: m } as never);
++        return Promise.resolve();
++      });
++    }
++
++    beforeEach(() => {
++      setModel.mockReset();
++      setModel.mockImplementation(() => Promise.resolve());
++      useChatStore.setState({
++        setModel,
++        sessionModelOverride: "opus",
++        llmModel: "claude-opus-5-5",
++      } as never);
++    });
++    afterEach(() => {
++      useChatStore.setState({
++        setModel: originalSetModel,
++        sessionModelOverride: null,
++        llmModel: null,
++      } as never);
++    });
++
++    it.each([
++      ["a viewer", { readOnly: true }],
++      ["a non-Claude chat", { canSetModel: false }],
++      ["a chat without model rows", { modelOptions: [] }],
++    ])("has no row for %s", async (_name, extra) => {
++      renderModelButton(extra);
++      await openMenu();
++      expect(screen.queryByTestId("ae-voice-model-trigger")).toBeNull();
++    });
++
++    it("shows the row with its hint, the newest Sonnet as the default", async () => {
++      renderModelButton();
++      await openMenu();
++      const row = screen.getByTestId("ae-voice-model-trigger");
++      expect(within(row).getByText("Sonnet 5.5")).toBeInTheDocument();
++      expect(screen.getByTestId("ae-hint-voice.fast_model")).toBeInTheDocument();
++    });
++
++    it("switches to the fast model when Voice mode starts and back when it ends", async () => {
++      followStore();
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() =>
++        expect(setModel).toHaveBeenCalledWith("claude-sonnet-5-5", { expectConfirmation: true }),
++      );
++      expect(
++        JSON.parse(window.localStorage.getItem("omnigent:ae-voice-model-state:c1") ?? "null"),
++      ).toMatchObject({
++        previous: "opus",
++        fast: "claude-sonnet-5-5",
++      });
++      voiceOn(false);
++      await waitFor(() =>
++        expect(setModel).toHaveBeenLastCalledWith("opus", { expectConfirmation: true }),
++      );
++      await waitFor(() =>
++        expect(window.localStorage.getItem("omnigent:ae-voice-model-state:c1")).toBeNull(),
++      );
++      expect(setModel).toHaveBeenCalledTimes(2);
++    });
++
++    it("sends a chat that followed the default back to the default", async () => {
++      followStore();
++      useChatStore.setState({ sessionModelOverride: null, llmModel: "claude-opus-5-5" } as never);
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() =>
++        expect(setModel).toHaveBeenCalledWith("claude-sonnet-5-5", expect.anything()),
++      );
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenLastCalledWith(null, expect.anything()));
++    });
++
++    it("restores the reported model when the session cannot reset to its default", async () => {
++      followStore();
++      useChatStore.setState({ sessionModelOverride: null, llmModel: "claude-opus-5-5" } as never);
++      renderModelButton({ canResetModel: false });
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenLastCalledWith("opus", expect.anything()));
++    });
++
++    it("leaves a model the person picked by hand during Voice mode", async () => {
++      followStore();
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      act(() => useChatStore.setState({ sessionModelOverride: "claude-sonnet-5" } as never));
++      voiceOn(false);
++      await waitFor(() =>
++        expect(window.localStorage.getItem("omnigent:ae-voice-model-state:c1")).toBeNull(),
++      );
++      expect(setModel).toHaveBeenCalledTimes(1);
++    });
++
++    it("does nothing when the chat already runs the fast model", async () => {
++      useChatStore.setState({ sessionModelOverride: "claude-sonnet-5-5" } as never);
++      renderModelButton();
++      voiceOn(true);
++      await Promise.resolve();
++      expect(setModel).not.toHaveBeenCalled();
++      expect(window.localStorage.getItem("omnigent:ae-voice-model-state:c1")).toBeNull();
++    });
++
++    it("puts the model back after a reload that lost Voice mode", async () => {
++      followStore();
++      useChatStore.setState({ sessionModelOverride: "claude-sonnet-5-5" } as never);
++      window.localStorage.setItem(
++        "omnigent:ae-voice-model-state:c1",
++        JSON.stringify({ previous: "opus", fallback: "opus", fast: "claude-sonnet-5-5" }),
++      );
++      renderModelButton();
++      await waitFor(() =>
++        expect(setModel).toHaveBeenCalledWith("opus", { expectConfirmation: true }),
++      );
++      await waitFor(() =>
++        expect(window.localStorage.getItem("omnigent:ae-voice-model-state:c1")).toBeNull(),
++      );
++    });
++
++    it("forgets the switch when it is refused", async () => {
++      setModel.mockImplementation(() => Promise.reject(new Error("no")));
++      renderModelButton();
++      voiceOn(true);
++      await waitFor(() => expect(setModel).toHaveBeenCalledTimes(1));
++      await waitFor(() =>
++        expect(window.localStorage.getItem("omnigent:ae-voice-model-state:c1")).toBeNull(),
++      );
++    });
++
++    it("uses the model picked in the menu, and Off keeps the chat's model", async () => {
++      followStore();
++      renderModelButton();
++      const user = await openMenu();
++      await user.click(screen.getByTestId("ae-voice-model-trigger"));
++      const option = (await screen.findAllByTestId("ae-voice-model-option")).find(
++        (el) => el.textContent === "Sonnet 5",
++      ) as HTMLElement;
++      option.focus();
++      await user.keyboard("{Enter}");
++      expect(window.localStorage.getItem("omnigent:ae-voice-fast-model")).toBe("claude-sonnet-5");
++      voiceOn(true);
++      await waitFor(() =>
++        expect(setModel).toHaveBeenCalledWith("claude-sonnet-5", expect.anything()),
++      );
++      voiceOn(false);
++      await waitFor(() => expect(setModel).toHaveBeenLastCalledWith("opus", expect.anything()));
++      const user2 = await openMenu();
++      await user2.click(screen.getByTestId("ae-voice-model-trigger"));
++      screen.getByTestId("ae-voice-model-off").focus();
++      await user2.keyboard("{Enter}");
++      expect(window.localStorage.getItem("omnigent:ae-voice-fast-model")).toBe("off");
++      setModel.mockClear();
++      voiceOn(true);
++      await Promise.resolve();
++      expect(setModel).not.toHaveBeenCalled();
++    });
++  });
++
+   describe("device ids hidden before permission", () => {
+     const HIDDEN: Partial<MediaDeviceInfo>[] = [
+       { kind: "audioinput", deviceId: "", label: "" },
+diff --git a/web/src/components/AeSpeakRepliesButton.tsx b/web/src/components/AeSpeakRepliesButton.tsx
+index 19b1157a4cff4c9d823619eba40982cadd125df1..9dcc5cf62b1d23752a9f34045cdbde85e8b954aa 100644
+--- a/web/src/components/AeSpeakRepliesButton.tsx
++++ b/web/src/components/AeSpeakRepliesButton.tsx
+@@ -34,11 +34,25 @@ import {
+   type AudioDevice,
+ } from "@/lib/aeAudioDevices";
+ import { type CloudVoice, fetchCloudVoices } from "@/lib/aeCloudVoice";
++import {
++  clearVoiceModelState,
++  effectiveModelId,
++  readVoiceModelPick,
++  readVoiceModelState,
++  resolveFastModel,
++  VOICE_MODEL_OFF,
++  voiceModelLabel,
++  writeVoiceModelPick,
++  writeVoiceModelState,
++} from "@/lib/aeVoiceModel";
++import { findNativeModelOption } from "@/lib/codexNativeModels";
++import type { NativeModelOption } from "@/lib/types";
+ import {
+   clearFastAnswersState,
+   FAST_EFFORT,
+   isSpeechSupported,
+   listVoices,
++  primeCloudPlayback,
+   primeVoicePlayback,
+   onVoicesChanged,
+   pickDefaultVoice,
+@@ -92,6 +106,12 @@ export interface AeSpeakRepliesButtonProps {
+   readOnly?: boolean;
+   canSetEffort: boolean;
+   currentEffort: string | null;
++  /** The chat's Claude model rows; the Fast model row needs a Claude chat with rows. */
++  modelOptions?: readonly NativeModelOption[];
++  /** False for a viewer, a non-Claude chat or a chat on cost routing. */
++  canSetModel?: boolean;
++  /** The session can go back to its default model (a null pick). */
++  canResetModel?: boolean;
+ }
+ 
+ function choiceKey(choice: VoiceChoice | null): string {
+@@ -106,6 +126,7 @@ function RowHint({
+     | "voice.mode"
+     | "voice.speak"
+     | "voice.fast"
++    | "voice.fast_model"
+     | "voice.snips"
+     | "voice.mic_while_speaking"
+     | "voice.voice"
+@@ -228,6 +249,8 @@ function SwitchRow({
+   );
+ }
+ 
++const NO_MODEL_OPTIONS: readonly NativeModelOption[] = [];
++
+ function setChatEffort(level: string | null): Promise<void> {
+   return useChatStore.getState().setEffort(level);
+ }
+@@ -244,6 +267,9 @@ function SpeakRepliesControl({
+   readOnly,
+   canSetEffort,
+   currentEffort,
++  modelOptions = NO_MODEL_OPTIONS,
++  canSetModel = false,
++  canResetModel = false,
+ }: AeSpeakRepliesButtonProps & { chatId: string }) {
+   const [on, setOn] = useState(() => readSpeakReplies(chatId));
+   const [fastEnabled, setFastEnabled] = useState(readFastEnabled);
+@@ -352,6 +378,72 @@ function SpeakRepliesControl({
+     if (on && fastEnabled && fastAvailable && currentEffort !== FAST_EFFORT) void applyFast();
+   }, [on, fastEnabled, fastAvailable, currentEffort, applyFast]);
+ 
++  // Fast model: Voice mode runs a Claude chat on a quick model and puts the old one back at the end.
++  const [modelPick, setModelPick] = useState(readVoiceModelPick);
++  const fastModel = resolveFastModel(modelPick, modelOptions);
++  const modelAvailable = canSetModel && !readOnly && modelOptions.length > 0;
++  const fastRow = modelOptions.find((o) => o.id === fastModel);
++  const fastModelName = fastRow ? voiceModelLabel(fastRow) : "Off";
++  const modelWanted = voiceMode.on && fastModel !== null && modelAvailable;
++  const modelRefs = useRef({ wanted: modelWanted, fastModel, modelOptions, canResetModel });
++  modelRefs.current = { wanted: modelWanted, fastModel, modelOptions, canResetModel };
++  const modelAvailableRef = useRef(modelAvailable);
++  modelAvailableRef.current = modelAvailable;
++  const modelBusyRef = useRef(false);
++  const mayTouchModel = useCallback(
++    () => modelAvailableRef.current && useChatStore.getState().conversationId === chatId,
++    [chatId],
++  );
++
++  const revertModel = useCallback(async () => {
++    const state = readVoiceModelState(chatId);
++    if (!state || modelBusyRef.current || !mayTouchModel()) return;
++    const store = useChatStore.getState();
++    // A model picked by hand since Voice mode switched stays as the person left it.
++    if (store.sessionModelOverride === state.fast) {
++      const target = state.previous ?? (modelRefs.current.canResetModel ? null : state.fallback);
++      modelBusyRef.current = true;
++      try {
++        await store.setModel(target, { expectConfirmation: true });
++      } catch {
++        return;
++      } finally {
++        modelBusyRef.current = false;
++      }
++    }
++    clearVoiceModelState(chatId);
++  }, [chatId, mayTouchModel]);
++
++  const applyModel = useCallback(async () => {
++    const { fastModel: fast, modelOptions: options } = modelRefs.current;
++    if (modelBusyRef.current || readVoiceModelState(chatId) || fast === null) return;
++    const store = useChatStore.getState();
++    if (store.conversationId !== chatId) return;
++    if (effectiveModelId(options, store.sessionModelOverride, store.llmModel) === fast) return;
++    // Saved before the switch, so a reload or crash in the middle still puts the model back.
++    writeVoiceModelState(chatId, {
++      previous: store.sessionModelOverride,
++      fallback: findNativeModelOption(options, store.llmModel)?.id ?? store.llmModel,
++      fast,
++    });
++    modelBusyRef.current = true;
++    try {
++      await store.setModel(fast, { expectConfirmation: true });
++    } catch {
++      clearVoiceModelState(chatId);
++      return;
++    } finally {
++      modelBusyRef.current = false;
++    }
++    // Voice mode ended while the switch was in flight: put the model back now.
++    if (!modelRefs.current.wanted && mayTouchModel()) await revertModel();
++  }, [chatId, mayTouchModel, revertModel]);
++
++  useEffect(() => {
++    if (modelWanted) void applyModel();
++    else void revertModel();
++  }, [modelWanted, fastModel, applyModel, revertModel]);
++
+   const toggleSpeak = (next: boolean) => {
+     writeSpeakReplies(chatId, next);
+     setOn(next);
+@@ -462,6 +554,39 @@ function SpeakRepliesControl({
+             testId="ae-speak-fast"
+           />
+         ) : null}
++        {modelAvailable ? (
++          <DropdownMenuSub>
++            <DropdownMenuSubTrigger data-testid="ae-voice-model-trigger">
++              <span className={ROW_LABEL_CLASS}>
++                Fast model
++                <RowHint id="voice.fast_model" />
++              </span>
++              <span className={ROW_VALUE_CLASS}>{fastModelName}</span>
++            </DropdownMenuSubTrigger>
++            <DropdownMenuSubContent className="max-h-[60vh] overflow-y-auto">
++              <DropdownMenuRadioGroup
++                value={fastModel ?? VOICE_MODEL_OFF}
++                onValueChange={(next) => {
++                  writeVoiceModelPick(next);
++                  setModelPick(next);
++                }}
++              >
++                <DropdownMenuRadioItem value={VOICE_MODEL_OFF} data-testid="ae-voice-model-off">
++                  Off (keep the chat's model)
++                </DropdownMenuRadioItem>
++                {modelOptions.map((option) => (
++                  <DropdownMenuRadioItem
++                    key={option.id}
++                    value={option.id}
++                    data-testid="ae-voice-model-option"
++                  >
++                    {voiceModelLabel(option)}
++                  </DropdownMenuRadioItem>
++                ))}
++              </DropdownMenuRadioGroup>
++            </DropdownMenuSubContent>
++          </DropdownMenuSub>
++        ) : null}
+         <SwitchRow
+           label="Send snips"
+           checked={snips}
+@@ -582,7 +707,11 @@ function SpeakRepliesControl({
+         <DropdownMenuSeparator />
+         <div className="flex gap-1.5 px-1 pb-1 pt-0.5" data-testid="ae-speak-actions">
+           <DropdownMenuItem
+-            onSelect={readLast}
++            onSelect={() => {
++              // Inside the tap, like Voice mode: a cloud voice plays after its fetch, outside any tap.
++              primeCloudPlayback();
++              readLast();
++            }}
+             data-testid="ae-speak-read-last"
+             className="min-h-8 flex-1 justify-center rounded-md border border-border/60 text-[13px]"
+           >
+diff --git a/web/src/hooks/useAeSpeakReplies.test.ts b/web/src/hooks/useAeSpeakReplies.test.ts
+index 098f57957e608ac53c7cfe705f16c77d61ee4240..fb2003b884cf05e679d54b8a7e731362d22a9d7b 100644
+--- a/web/src/hooks/useAeSpeakReplies.test.ts
++++ b/web/src/hooks/useAeSpeakReplies.test.ts
+@@ -190,6 +190,23 @@ describe("useAeSpeakReplies", () => {
+     vi.unstubAllGlobals();
+   });
+ 
++  it("readLast sends the chosen cloud voice and rate to the server", () => {
++    const fetchMock = vi.fn(() => new Promise<Response>(() => {}));
++    vi.stubGlobal("fetch", fetchMock);
++    const { result } = mount(false, "c1", { kind: "cloud", id: "rocky-xtts" });
++    setStore({ blocks: [final("r1", "a", "Last reply.", { createdAtS: 1 })] });
++    act(() => result.current.readLast());
++    expect(synth.texts()).toEqual([]);
++    expect(fetchMock).toHaveBeenCalledTimes(1);
++    const [, init] = fetchMock.mock.calls[0] as unknown as [string, RequestInit];
++    expect(JSON.parse(String(init.body))).toEqual({
++      text: "Last reply.",
++      voice: "rocky-xtts",
++      rate: 1,
++    });
++    vi.unstubAllGlobals();
++  });
++
+   it("speaks a growing live preview, then only the remainder on the final", () => {
+     mount();
+     setStore({ blocks: [live("r1", "One. Two")] });
+diff --git a/web/src/hooks/useAeSpeakReplies.ts b/web/src/hooks/useAeSpeakReplies.ts
+index 8fea98656dce280ac6577a4063c13f19ea1322a7..973e77fdb3ca6dc9e8926a48d946ac373acf0afc 100644
+--- a/web/src/hooks/useAeSpeakReplies.ts
++++ b/web/src/hooks/useAeSpeakReplies.ts
+@@ -29,6 +29,7 @@ import {
+   setVoicePlaying,
+ } from "@/lib/aeVoiceMode";
+ import { recordSpoken, resetEcho } from "@/lib/aeVoiceEcho";
++import { logVoice } from "@/lib/aeVoiceLog";
+ import { usePlaybackBlocked } from "@/lib/aeVoicePlayback";
+ import { type AnyBlock, LIVE_ITEM_PREFIX } from "@/lib/blocks";
+ import { useChatStore } from "@/store/chatStore";
+@@ -368,8 +369,11 @@ export function useAeSpeakReplies({ chatId, enabled, voice, rate }: UseAeSpeakRe
+       if (b.ctx.itemId?.startsWith(LIVE_ITEM_PREFIX) || b.fullText.trim() === "") continue;
+       const text = speechTextFromMarkdown(stripTldr(b.fullText));
+       if (text === "") continue;
++      const { voice: picked, rate: pickedRate } = optsRef.current;
++      // The voice log shows which voice a manual read used, to compare with the spoken replies.
++      logVoice("read last", picked ? `${picked.kind}:${picked.id} x${pickedRate}` : "default");
+       getSpeaker().stop();
+-      say(text, optsRef.current.voice, optsRef.current.rate);
++      say(text, picked, pickedRate);
+       return;
+     }
+   }, []);
+diff --git a/web/src/lib/aeSettingHints.ts b/web/src/lib/aeSettingHints.ts
+index a5d3a9aa8527dadacb2036d9fe357798af8ad8ea..ef79d24d5fff2a553b73d02b0960c8fbc61e82cb 100644
+--- a/web/src/lib/aeSettingHints.ts
++++ b/web/src/lib/aeSettingHints.ts
+@@ -250,6 +250,11 @@ export const AE_SETTING_HINTS = {
+     hint: "While replies are spoken this chat answers at low effort, then goes back to its old effort when speaking turns off. On by default.",
+     source: "existing",
+   },
++  "voice.fast_model": {
++    label: "Fast model",
++    hint: "Voice mode runs this chat on this model, then back on its own when Voice mode ends; a model you pick yourself stays. Default: newest Sonnet.",
++    source: "tooltip",
++  },
+   "voice.snips": {
+     label: "Send snips",
+     hint: "Voice mode only: a picture you attach gets a spoken Got it. and goes with your next sentence, or alone after 10 s as Note this. Per device.",
+diff --git a/web/src/lib/aeSpeakReplies.ts b/web/src/lib/aeSpeakReplies.ts
+index 3ef4393ce0d1d65aa6cdb6ffd812b511e77fe2ac..7c279ced45469f417006197ef5cd7e27f35c41e5 100644
+--- a/web/src/lib/aeSpeakReplies.ts
++++ b/web/src/lib/aeSpeakReplies.ts
+@@ -241,6 +241,16 @@ export function primeVoicePlayback(): void {
+   }
+ }
+ 
++/** Unlocks the cloud voices' audio element only; call inside a tap. Never throws. */
++export function primeCloudPlayback(): void {
++  logVoice("prime cloud");
++  try {
++    cloudPrimer?.();
++  } catch {
++    // Priming is best effort.
++  }
++}
++
+ export interface Speaker {
+   speak: (text: string, opts: SpeakOptions) => void;
+   stop: () => void;
+diff --git a/web/src/lib/aeVoiceModel.test.ts b/web/src/lib/aeVoiceModel.test.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..2db357cb97404dbf510f1f0f2de33a213e62e79a
+--- /dev/null
++++ b/web/src/lib/aeVoiceModel.test.ts
+@@ -0,0 +1,78 @@
++import { beforeEach, describe, expect, it } from "vitest";
++import {
++  clearVoiceModelState,
++  defaultFastModel,
++  effectiveModelId,
++  readVoiceModelPick,
++  readVoiceModelState,
++  resolveFastModel,
++  VOICE_MODEL_OFF,
++  voiceModelLabel,
++  writeVoiceModelPick,
++  writeVoiceModelState,
++} from "./aeVoiceModel";
++
++const OPTIONS = [
++  { id: "opus", model: "claude-opus-5-5" },
++  { id: "claude-sonnet-5", model: "claude-sonnet-5" },
++  { id: "claude-sonnet-5-5", model: "claude-sonnet-5-5" },
++  { id: "claude-haiku-4-5", model: "claude-haiku-4-5" },
++];
++
++beforeEach(() => window.localStorage.clear());
++
++describe("aeVoiceModel", () => {
++  it("defaults to the newest Sonnet row", () => {
++    expect(defaultFastModel(OPTIONS)?.id).toBe("claude-sonnet-5-5");
++  });
++
++  it("takes an alias row that names Sonnet when no row carries a version", () => {
++    expect(defaultFastModel([{ id: "opus" }, { id: "sonnet" }])?.id).toBe("sonnet");
++  });
++
++  it("has no default without a Sonnet row", () => {
++    expect(defaultFastModel([{ id: "opus" }, { id: "haiku" }])).toBeNull();
++    expect(resolveFastModel(null, [{ id: "opus" }])).toBeNull();
++  });
++
++  it("resolves a saved pick, off, and a pick the catalog no longer has", () => {
++    expect(resolveFastModel("claude-haiku-4-5", OPTIONS)).toBe("claude-haiku-4-5");
++    expect(resolveFastModel(VOICE_MODEL_OFF, OPTIONS)).toBeNull();
++    expect(resolveFastModel("claude-gone", OPTIONS)).toBe("claude-sonnet-5-5");
++  });
++
++  it("stores the pick per device", () => {
++    expect(readVoiceModelPick()).toBeNull();
++    writeVoiceModelPick("opus");
++    expect(readVoiceModelPick()).toBe("opus");
++    writeVoiceModelPick(null);
++    expect(readVoiceModelPick()).toBeNull();
++  });
++
++  it("labels a row by its version, else its name", () => {
++    expect(voiceModelLabel({ id: "claude-sonnet-5-5", model: "claude-sonnet-5-5" })).toBe(
++      "Sonnet 5.5",
++    );
++    expect(voiceModelLabel({ id: "weird", displayName: "Weird One" })).toBe("Weird One");
++  });
++
++  it("names the running model from the request, else the reported row", () => {
++    expect(effectiveModelId(OPTIONS, "opus", "claude-sonnet-5")).toBe("opus");
++    expect(effectiveModelId(OPTIONS, null, "claude-sonnet-5-5")).toBe("claude-sonnet-5-5");
++    expect(effectiveModelId(OPTIONS, null, null)).toBeNull();
++  });
++
++  it("keeps the remembered model per chat and drops a damaged value", () => {
++    writeVoiceModelState("c1", { previous: "opus", fallback: "opus", fast: "claude-sonnet-5-5" });
++    expect(readVoiceModelState("c1")).toEqual({
++      previous: "opus",
++      fallback: "opus",
++      fast: "claude-sonnet-5-5",
++    });
++    expect(readVoiceModelState("c2")).toBeNull();
++    clearVoiceModelState("c1");
++    expect(readVoiceModelState("c1")).toBeNull();
++    window.localStorage.setItem("omnigent:ae-voice-model-state:c3", "{nope");
++    expect(readVoiceModelState("c3")).toBeNull();
++  });
++});
+diff --git a/web/src/lib/aeVoiceModel.ts b/web/src/lib/aeVoiceModel.ts
+new file mode 100644
+index 0000000000000000000000000000000000000000..527ff1d8a024d5cbf676438089bc183b7039779d
+--- /dev/null
++++ b/web/src/lib/aeVoiceModel.ts
+@@ -0,0 +1,116 @@
++// Voice mode's fast model (omnigent-ae, 2026-11-11): while Voice mode is on, a Claude chat runs on a
++// quick model (newest Sonnet unless the person picked another), and the chat's own model comes back
++// when Voice mode ends. Fast answers (low effort) is a separate setting and stays as it was.
++
++import { aeClaudeVersion, aeClaudeVersionLabel } from "@/lib/aeClaudeModels";
++import { findNativeModelOption } from "@/lib/codexNativeModels";
++import type { NativeModelOption } from "@/lib/types";
++
++export const VOICE_MODEL_KEY = "omnigent:ae-voice-fast-model";
++const STATE_KEY = "omnigent:ae-voice-model-state:";
++/** Stored value for "keep the chat's own model". */
++export const VOICE_MODEL_OFF = "off";
++
++function getItem(key: string): string | null {
++  if (typeof window === "undefined") return null;
++  try {
++    return window.localStorage.getItem(key);
++  } catch {
++    return null;
++  }
++}
++
++function setItem(key: string, value: string | null): void {
++  if (typeof window === "undefined") return;
++  try {
++    if (value === null) window.localStorage.removeItem(key);
++    else window.localStorage.setItem(key, value);
++  } catch {
++    // A storage failure must not break the composer.
++  }
++}
++
++/** The saved pick: a model id, `off`, or null when none was made (the default applies). */
++export function readVoiceModelPick(): string | null {
++  const raw = getItem(VOICE_MODEL_KEY);
++  return raw === null || raw === "" ? null : raw;
++}
++
++export function writeVoiceModelPick(pick: string | null): void {
++  setItem(VOICE_MODEL_KEY, pick);
++}
++
++/** The newest Sonnet row, else null (a family without a Sonnet row has no default). */
++export function defaultFastModel(options: readonly NativeModelOption[]): NativeModelOption | null {
++  let best: { option: NativeModelOption; score: number } | null = null;
++  for (const option of options) {
++    const text = `${option.model ?? ""} ${option.id}`;
++    const version = aeClaudeVersion(option.model ?? option.id) ?? aeClaudeVersion(option.id);
++    const family = version?.family ?? (/sonnet/i.test(text) ? "sonnet" : null);
++    if (family !== "sonnet") continue;
++    const score = version ? version.major * 1000 + version.minor : 0;
++    if (best === null || score > best.score) best = { option, score };
++  }
++  return best?.option ?? null;
++}
++
++/** The model id Voice mode should switch to, or null for off, an unknown pick or no Sonnet row. */
++export function resolveFastModel(
++  pick: string | null,
++  options: readonly NativeModelOption[],
++): string | null {
++  if (pick === VOICE_MODEL_OFF) return null;
++  if (pick !== null) {
++    const chosen = options.find((option) => option.id === pick);
++    if (chosen) return chosen.id;
++  }
++  return defaultFastModel(options)?.id ?? null;
++}
++
++export function voiceModelLabel(option: NativeModelOption): string {
++  const version =
++    aeClaudeVersionLabel(option.model ?? option.id) ?? aeClaudeVersionLabel(option.id);
++  return version ?? option.displayName ?? option.id;
++}
++
++/** The model the chat runs on now: the pick it was given, else the harness's reported row. */
++export function effectiveModelId(
++  options: readonly NativeModelOption[],
++  override: string | null,
++  reported: string | null,
++): string | null {
++  return override ?? findNativeModelOption(options, reported)?.id ?? reported;
++}
++
++export interface VoiceModelState {
++  /** The chat's model request before Voice mode (null: it followed the default). */
++  previous: string | null;
++  /** The model the chat reported then, for a session that cannot reset to its default. */
++  fallback: string | null;
++  /** The model Voice mode switched to. */
++  fast: string;
++}
++
++export function readVoiceModelState(chatId: string): VoiceModelState | null {
++  const raw = getItem(STATE_KEY + chatId);
++  if (raw === null) return null;
++  try {
++    const parsed = JSON.parse(raw) as Partial<VoiceModelState>;
++    if (typeof parsed.fast !== "string" || parsed.fast === "") return null;
++    return {
++      previous: typeof parsed.previous === "string" ? parsed.previous : null,
++      fallback: typeof parsed.fallback === "string" ? parsed.fallback : null,
++      fast: parsed.fast,
++    };
++  } catch {
++    return null;
++  }
++}
++
++export function writeVoiceModelState(chatId: string, state: VoiceModelState): void {
++  setItem(STATE_KEY + chatId, JSON.stringify(state));
++}
++
++export function clearVoiceModelState(chatId: string): void {
++  setItem(STATE_KEY + chatId, null);
++}
+diff --git a/web/src/pages/ChatPage.tsx b/web/src/pages/ChatPage.tsx
+index 83a01560e901608f4d867d0f34166fd34b40de2d..81f0d1cbd744a7988c42e63e96b326a13a4e638b 100644
+--- a/web/src/pages/ChatPage.tsx
++++ b/web/src/pages/ChatPage.tsx
+@@ -2464,6 +2464,7 @@ function ComposerImpl(
+   // the create window issues no `/v1/sessions/temp:*` requests.
+   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
+   const speakEffort = useSessionEffort();
++  const speakCostRouting = useChatStore((s) => s.costControlModeOverride);
+   const { session: composerSession } = useSession(composerSessionId);
+   const composerBranch = useChatStore((s) => s.gitBranch);
+   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+@@ -4055,6 +4056,13 @@ function ComposerImpl(
+                 canSetEffort={showEffort && effortLevels.includes("low")}
+                 currentEffort={speakEffort}
+                 readOnly={isReadOnly}
++                modelOptions={codexModelOptions}
++                canSetModel={
++                  modelPickerKind === "claude" &&
++                  showModels &&
++                  !(costRoutingEligible && speakCostRouting === "on")
++                }
++                canResetModel={supportsModelReset}
+                 className={cn("size-8 md:size-7", COMPOSER_TIGHT_SPEAKER_CLASS)}
+               />
+               <ComposerMicButton

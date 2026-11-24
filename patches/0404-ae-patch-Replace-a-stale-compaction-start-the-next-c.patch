@@ -1,0 +1,120 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ae-automation-bot <ae-automation-bot@users.noreply.github.com>
+Date: Wed, 18 Nov 2026 15:54:32 -0800
+Subject: [PATCH 404/443] [ae-patch] Replace a stale compaction start the next
+ compaction would inherit
+
+A harness that never sends completed or failed (Esc or a crash during a
+compaction) left its start time recorded, so the next compaction published
+that old start and the page dropped its spinner as stale. A start older than
+15 minutes is now replaced with the current time.
+---
+ omnigent/server/routes/_sessions/helpers.py   | 15 +++++-
+ .../integration/test_sessions_compact.py      | 46 +++++++++++++++++--
+ 2 files changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/omnigent/server/routes/_sessions/helpers.py b/omnigent/server/routes/_sessions/helpers.py
+index 88b61d19fa3ff46ea84289f2bf3f1124a0d7d776..7629d985d59c780e7b8c6c6378d0b3f242c57bad 100644
+--- a/omnigent/server/routes/_sessions/helpers.py
++++ b/omnigent/server/routes/_sessions/helpers.py
+@@ -1744,6 +1744,9 @@ def _publish_input_consumed(
+ # started_at lets clients anchor their elapsed counter to the true start,
+ # even across a page reload (the live stream has no replay).
+ _compaction_started_at: WorkspaceScopedCache[str, int] = WorkspaceScopedCache()
++#: A recorded compaction start older than this (seconds) lost its end edge;
++#: matches the page's 15-minute background compaction cap.
++_COMPACTION_START_STALE_S = 900
+ 
+ 
+ def _publish_compaction_in_progress(session_id: str, *, background: bool = False) -> None:
+@@ -1752,7 +1755,8 @@ def _publish_compaction_in_progress(session_id: str, *, background: bool = False
+ 
+     Repeated calls while the same compaction runs reuse the ``started_at``
+     recorded on the first call; ``completed``/``failed`` clear it so the
+-    next compaction starts a fresh clock.
++    next compaction starts a fresh clock. A start older than
++    :data:`_COMPACTION_START_STALE_S` is replaced, since its end was lost.
+ 
+     :param session_id: Session/conversation identifier,
+         e.g. ``"conv_abc123"``.
+@@ -1760,7 +1764,14 @@ def _publish_compaction_in_progress(session_id: str, *, background: bool = False
+         and it can outlive the turn; adds ``"background": True`` so clients
+         keep the spinner through turn ends.
+     """
+-    started_at = _compaction_started_at.setdefault(session_id, int(time.time()))
++    now = int(time.time())
++    started_at = _compaction_started_at.get(session_id)
++    if started_at is None or now - started_at > _COMPACTION_START_STALE_S:
++        # A harness that never sent completed or failed (Esc, a crash) left an
++        # old start behind; the next compaction must not inherit it, or the
++        # page drops its spinner as stale (2026-11-18).
++        started_at = now
++        _compaction_started_at[session_id] = started_at
+     payload: dict[str, object] = {
+         "type": "response.compaction.in_progress",
+         "started_at": started_at,
+diff --git a/tests/server/integration/test_sessions_compact.py b/tests/server/integration/test_sessions_compact.py
+index dcb40aa8b417544a2ebdaf78795b81faf6780b64..d0d51b2aed12e4dcc04ec6218810f4e123e06e29 100644
+--- a/tests/server/integration/test_sessions_compact.py
++++ b/tests/server/integration/test_sessions_compact.py
+@@ -392,6 +392,44 @@ async def test_server_run_compaction_in_progress_has_no_background_key(
+     assert "background" not in published[0], published[0]
+ 
+ 
++async def test_stale_compaction_start_is_not_inherited(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    """A start whose compaction lost its end edge is replaced by the next compaction's own.
++
++    Esc or a crash during a harness compaction sends no completed or failed, so the
++    recorded start stays behind. A compaction past the stale window publishes a fresh
++    start, so the page does not drop its spinner as stale (2026-11-18); a repeat inside
++    the window keeps the first start.
++    """
++    from omnigent.server.routes._sessions import helpers
++
++    published: list[dict[str, Any]] = []
++
++    def capture_publish(session_id: str, event: dict[str, Any]) -> None:
++        """Capture session-stream events emitted by the helpers."""
++        published.append(event)
++
++    monkeypatch.setattr(
++        "omnigent.server.routes.sessions.session_stream.publish",
++        capture_publish,
++    )
++    session_id = "conv_stale_start_test"
++    clock = [1_000_000.0]
++    monkeypatch.setattr(helpers.time, "time", lambda: clock[0])
++    try:
++        helpers._publish_compaction_in_progress(session_id, background=True)
++        clock[0] += 60
++        helpers._publish_compaction_in_progress(session_id, background=True)
++        clock[0] += helpers._COMPACTION_START_STALE_S + 1
++        helpers._publish_compaction_in_progress(session_id, background=True)
++    finally:
++        helpers._compaction_started_at.pop(session_id, None)
++    starts = [event["started_at"] for event in published]
++    assert starts[0] == starts[1] == 1_000_000
++    assert starts[2] == int(clock[0])
++
++
+ async def test_external_compaction_status_anchors_started_at_to_first_report(
+     client: httpx.AsyncClient,
+     monkeypatch: pytest.MonkeyPatch,
+@@ -443,10 +481,12 @@ async def test_external_compaction_status_anchors_started_at_to_first_report(
+     )
+ 
+     # A repeated poll of the SAME compaction reuses the recorded anchor. Pin
+-    # it to a sentinel so the reuse is observable without sleeping a second.
+-    sessions_helpers._compaction_started_at[sid] = 123
++    # it to a sentinel a minute back (inside the stale window) so the reuse is
++    # observable without sleeping a second.
++    sentinel = first_start - 60
++    sessions_helpers._compaction_started_at[sid] = sentinel
+     await post("in_progress")
+-    assert last_started_at() == 123, (
++    assert last_started_at() == sentinel, (
+         "a repeated in_progress must reuse the recorded compaction start, "
+         "not re-anchor to the current clock."
+     )

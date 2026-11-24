@@ -864,6 +864,54 @@ async def test_the_loop_survives_a_failing_pass(monkeypatch: pytest.MonkeyPatch)
     task.cancel()
 
 
+def test_an_unread_fabric_pass_is_retried_soon(monkeypatch: pytest.MonkeyPatch) -> None:
+    def remember(rows: Any, note: str | None) -> None:
+        monkeypatch.setattr(cost_targets, "_last_fabric", (NOW, rows, note))
+
+    monkeypatch.setattr(cost_targets, "_last_fabric", None)
+    assert not cost_targets._fabric_unread()
+    remember(None, "Fabric is not configured on this server.")
+    assert not cost_targets._fabric_unread()
+    remember([{"name": "a"}, {"name": "b"}], None)
+    assert not cost_targets._fabric_unread()
+    remember([{"name": "a"}, {"name": "b", "error": "the Logic App did not answer"}], None)
+    assert cost_targets._fabric_unread()
+    remember([], "the capacities Logic App did not answer the list call within 8 s.")
+    assert cost_targets._fabric_unread()
+
+
+async def test_the_loop_looks_again_soon_after_an_unread_fabric_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    passes: list[str] = []
+    # First pass raises, second reads a capacity as unread, third is clean.
+    outcomes = ["raise", "unread", "clean"]
+
+    async def fake_tick(*, fabric_due: bool) -> None:
+        if fabric_due:
+            passes.append(outcomes[len(passes)])
+            if passes[-1] == "raise":
+                raise RuntimeError("cold start")
+
+    monkeypatch.setattr(cost_targets, "tick", fake_tick)
+    monkeypatch.setattr(cost_targets, "_fabric_unread", lambda: passes[-1] == "unread")
+    monkeypatch.setattr(cost_targets, "STARTUP_DELAY_S", 0.0)
+    monkeypatch.setattr(cost_targets, "POLL_S", 0.01)
+    monkeypatch.setattr(cost_targets, "FABRIC_RETRY_S", 0.03)
+    monkeypatch.setattr(cost_targets, "FABRIC_EVERY_S", 3600.0)
+    task = asyncio.get_running_loop().create_task(cost_targets._loop())
+    deadline = asyncio.get_running_loop().time() + 5.0
+    while len(passes) < 3 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.01)
+    await asyncio.sleep(0.1)
+    task.cancel()
+    # A pass that raised and a pass that left a capacity unread are each retried soon; the
+    # clean third pass goes back to the hourly wait, so no fourth pass follows.
+    assert passes == ["raise", "unread", "clean"]
+
+
 # ── routes ──────────────────────────────────────────────────────────────────
 
 
